@@ -278,7 +278,7 @@ pub(crate) async fn generate_session_title_via_model(
     .await
     {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
+        Ok(Err(_)) => {
             // eprintln!("[session-title] request error: {e}");
             return None;
         }
@@ -304,7 +304,7 @@ pub(crate) async fn generate_session_title_via_model(
     .await
     {
         Ok(Ok(t)) => t,
-        Ok(Err(e)) => {
+        Ok(Err(_)) => {
             // eprintln!("[session-title] body read error: {e}");
             return None;
         }
@@ -319,7 +319,7 @@ pub(crate) async fn generate_session_title_via_model(
 
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
-        Err(e) => {
+        Err(_) => {
             // eprintln!("[session-title] JSON parse error: {e}");
             return None;
         }

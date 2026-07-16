@@ -67,6 +67,82 @@ pub(super) fn normalize_inline_tool_call_markup(text: &str) -> std::borrow::Cow<
     )
 }
 
+/// 流式场景下的有状态命名空间标签归一化器。
+///
+/// `normalize_inline_tool_call_markup` 是无状态的整段归一化，无法处理被切到两个
+/// delta chunk 边界的 marker（例如 chunk A 收到 `<｜｜DS`，chunk B 收到
+/// `ML｜｜tool_calls>`）。这种情况下原始 marker 会泄漏成正文，且后续解析失效。
+///
+/// 该结构缓存可能是「半个 marker」的尾部前缀，等下一个 chunk 补齐后再一起归一化。
+#[derive(Default)]
+pub(super) struct InlineMarkupNormalizer {
+    pending: String,
+}
+
+impl InlineMarkupNormalizer {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂入一个 chunk，返回可安全下发的归一化文本。若尾部可能是被截断的
+    /// marker 前缀，则暂存到 `pending`，等待下一次 `push` 补齐。
+    pub(super) fn push(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+        self.pending.push_str(chunk);
+        // 找到最后一个 `<`：它之后的内容可能是尚未闭合的（命名空间）标签，
+        // 一旦这段可能是被切断的 marker，就整体保留到下一个 chunk。
+        let hold_from = self
+            .pending
+            .rfind('<')
+            .filter(|&pos| Self::maybe_partial_marker(&self.pending[pos..]));
+        let emit = match hold_from {
+            Some(pos) => {
+                let tail = self.pending.split_off(pos);
+                let head = std::mem::replace(&mut self.pending, tail);
+                head
+            }
+            None => std::mem::take(&mut self.pending),
+        };
+        normalize_inline_tool_call_markup(&emit).into_owned()
+    }
+
+    /// 流结束时冲刷剩余缓存（可能是一个完整但结尾没有 `>` 的 marker，或普通文本）。
+    pub(super) fn flush(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let rest = std::mem::take(&mut self.pending);
+        normalize_inline_tool_call_markup(&rest).into_owned()
+    }
+
+    /// 判断从某个 `<` 开始的片段是否可能是「尚未接收完整」的命名空间 marker，
+    /// 即 `<|...` / `<｜｜...` / `</|...` / `</｜｜...` 且还没出现闭合 `>`。
+    /// 若片段里已经出现 `>`，说明标签已完整，无需保留。
+    fn maybe_partial_marker(frag: &str) -> bool {
+        if frag.contains('>') {
+            return false;
+        }
+        // 逐字符判断前缀是否仍可能长成命名空间 marker 的开头。
+        // 允许的开头：`<`、`</`，随后跟半角 `|` 或全角 `｜`。
+        const HALF: char = '|';
+        const FULL: char = '｜';
+        let mut chars = frag.chars();
+        debug_assert_eq!(chars.next(), Some('<'));
+        let mut rest = chars.as_str();
+        if let Some(after) = rest.strip_prefix('/') {
+            rest = after;
+        }
+        // 空（刚好停在 `<` 或 `</`）也算可能是 marker 前缀。
+        if rest.is_empty() {
+            return true;
+        }
+        // 允许 marker 前缀里出现半角/全角竖线；只要没闭合 `>`，就当作可能的半截 marker。
+        rest.starts_with(HALF) || rest.starts_with(FULL)
+    }
+}
+
 /// 尝试把整段 assistant 文本反向识别为一个/多个 tool_call。
 /// 通过 parser 注册表 + 前置 XML 命名空间归一化，统一处理不同模型产出的
 /// inline tool call 形态（Hermes XML、Anthropic XML、JSON、`<|PREFIX|>` 包装）。

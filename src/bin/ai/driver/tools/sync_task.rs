@@ -551,7 +551,7 @@ mod tests {
         let output = format_subagent_output(
             subagent_wait_error_status("subagent task exceeded hard timeout of 600s"),
             "verify behavior",
-            "explore",
+            "build",
             "qwen3.7-max",
             600.0,
             "model_reason=auto-selected",

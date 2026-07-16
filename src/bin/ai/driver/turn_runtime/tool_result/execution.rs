@@ -1242,6 +1242,17 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                     reasoning_content: None,
                 });
             }
+            // 收尾 veto 仅在 iteration < max_iterations 时打回；到达硬上限后
+            // reopen 被跳过，模型最终回答可能完全忽略未回收的子任务。此处把
+            // 未回收子任务状态附进最终回答做可见性兜底（不再打回，避免活锁）。
+            if iteration >= max_iterations {
+                if let Ok(Some(notice)) =
+                    task_tools::build_abandoned_tasks_notice(&app.session_id, max_iterations)
+                {
+                    final_assistant_text.push_str("\n\n");
+                    final_assistant_text.push_str(&notice);
+                }
+            }
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::ToolCall(tool_call_execution) => {
@@ -1308,9 +1319,19 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
 
             if iteration >= max_iterations {
                 if *force_final_response {
-                    *final_assistant_text = format!(
+                    let mut text = format!(
                         "Agent reached the tool iteration limit ({max_iterations}) without producing a final answer."
                     );
+                    // 到达硬上限放行收尾：把仍未回收的子任务状态附进最终回答做
+                    // 可见性兜底。此处不再打回模型（避免子任务永不到终态时无限
+                    // 活锁），仅确保未回收结果不被静默抛弃。
+                    if let Ok(Some(notice)) =
+                        task_tools::build_abandoned_tasks_notice(&app.session_id, max_iterations)
+                    {
+                        text.push_str("\n\n");
+                        text.push_str(&notice);
+                    }
+                    *final_assistant_text = text;
                     return Ok(TurnLoopStep::Break);
                 }
                 *force_final_response = true;
@@ -1948,7 +1969,7 @@ mod tests {
                 result_channel_id,
                 completion_futex_addr: aios_kernel::primitives::FutexAddr(1),
                 description: "inspect parser".to_string(),
-                agent_name: "explore".to_string(),
+                agent_name: "build".to_string(),
                 model: "qwen3.7-max".to_string(),
                 is_model_auto_selected: false,
                 auto_model_fallback: None,
@@ -2065,7 +2086,7 @@ mod tests {
                 result_channel_id,
                 completion_futex_addr: aios_kernel::primitives::FutexAddr(1),
                 description: "inspect parser".to_string(),
-                agent_name: "explore".to_string(),
+                agent_name: "build".to_string(),
                 model: "qwen3.7-max".to_string(),
                 is_model_auto_selected: false,
                 auto_model_fallback: None,

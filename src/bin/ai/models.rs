@@ -941,10 +941,10 @@ mod tests {
     }
 
     #[test]
-    fn explore_agents_default_to_light_tier() {
+    fn light_tier_agents_resolve_to_light_strength() {
         let agent = manifest(
-            "explore",
-            "Read-only codebase exploration agent",
+            "light-agent",
+            "Generic light-tier agent",
             Some(AgentModelTier::Light),
         );
         assert_eq!(agent_model_tier(&agent), ModelStrengthTier::Light);

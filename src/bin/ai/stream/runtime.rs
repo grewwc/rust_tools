@@ -17,7 +17,7 @@ use crate::commonw::configw;
 
 use super::{
     MarkdownStreamRenderer,
-    extract::{StreamTextEvent, extract_chunk_events_streaming},
+    extract::{StreamTextEvent, extract_chunk_events_streaming, normalize_stream_text},
     framing, normalize,
     render::markdown::{clamp_line_to_terminal_row, live_preview_cursor_rows},
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
@@ -364,6 +364,8 @@ fn finalize_stream_response(
     if state.render.subagent_fold.active {
         finalize_subagent_preview_fold(&mut state)?;
     }
+
+    flush_inline_markup_normalizer(app, markers, &mut state)?;
 
     flush_terminal_splitter(&mut state, markers)?;
 
@@ -871,6 +873,37 @@ fn normalize_end_thinking_boundary(
     }
 }
 
+/// 流结束时冲刷 `InlineMarkupNormalizer` 缓存的尾部（可能是一个完整但收尾没
+/// 补齐的 marker，或普通文本），经与流式相同的解析链处理：识别成的 tool call
+/// 进入 tool_calls_map，剩余可见文本追加到 assistant_text，避免半截 marker 或
+/// 被暂存的内容丢失。
+fn flush_inline_markup_normalizer(
+    app: &mut App,
+    markers: &StreamMarkers,
+    state: &mut StreamProcessingState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let normalized = state.content.inline_markup_normalizer.flush();
+    if normalized.is_empty() {
+        return Ok(());
+    }
+    let (cleaned, mut tool_events) = state.content.hermes_tool_call_streamer.push(&normalized);
+    let (cleaned, anthropic_events) = state.content.anthropic_tool_call_streamer.push(&cleaned);
+    let (cleaned, bare_xml_events) = state.content.bare_xml_tool_call_streamer.push(&cleaned);
+    tool_events.extend(anthropic_events);
+    tool_events.extend(bare_xml_events);
+    if !tool_events.is_empty() {
+        process_internal_tool_calls(app, markers, state, tool_events);
+    }
+    if !cleaned.is_empty() {
+        let content = normalize_stream_text(cleaned);
+        if !content.is_empty() {
+            let mut current_history = String::new();
+            commit_visible_content(app, &mut current_history, markers, state, content)?;
+        }
+    }
+    Ok(())
+}
+
 fn flush_terminal_splitter(
     state: &mut StreamProcessingState,
     markers: &StreamMarkers,
@@ -1311,6 +1344,7 @@ fn process_stream_payload(
         &mut state.content.hermes_tool_call_streamer,
         &mut state.content.anthropic_tool_call_streamer,
         &mut state.content.bare_xml_tool_call_streamer,
+        &mut state.content.inline_markup_normalizer,
     );
     process_internal_tool_calls(app, markers, state, internal_tool_call_events);
 

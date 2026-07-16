@@ -70,7 +70,7 @@ fn thinking_fold_defaults_to_configured_lines_for_tty() {
 #[test]
 fn subagent_preview_suppresses_thinking_markers_and_reuses_visible_text() {
     let mut markers = StreamMarkers::new();
-    markers.enable_subagent_preview("explore");
+    markers.enable_subagent_preview("build");
 
     assert_eq!(
         stream_text_event_to_content(

@@ -89,7 +89,7 @@ fn encoded_background_task_goal_rejects_corrupt_payload() {
         completion_futex_addr: 9,
         description: "inspect".to_string(),
         prompt: "look around".to_string(),
-        agent_name: "explore".to_string(),
+        agent_name: "build".to_string(),
         model: "qwen3.7-max-alibaba".to_string(),
         is_model_auto_selected: false,
         auto_model_fallback: None,
@@ -111,17 +111,17 @@ fn encoded_background_task_goal_rejects_corrupt_payload() {
 
 #[test]
 fn background_subagent_override_requires_known_enabled_agent() {
-    let mut explore = primary_agent(
-        "explore",
-        "Read-only codebase exploration agent",
-        &["find", "search"],
+    let mut plan = primary_agent(
+        "plan",
+        "Read-only planning agent",
+        &["plan", "analyze"],
     );
-    explore.mode = AgentMode::Subagent;
-    explore.disabled = true;
+    plan.mode = AgentMode::Subagent;
+    plan.disabled = true;
     let build = primary_agent("build", "Default agent", &["implement"]);
 
     let err =
-        resolve_background_subagent_override(&[build.clone(), explore.clone()], Some("explore"))
+        resolve_background_subagent_override(&[build.clone(), plan.clone()], Some("plan"))
             .unwrap_err();
     assert!(err.contains("disabled"));
 
@@ -137,7 +137,7 @@ fn background_task_wakeup_prompt_prefers_mailbox_and_decoded_goal() {
         completion_futex_addr: 9,
         description: "inspect".to_string(),
         prompt: "inspect codebase state".to_string(),
-        agent_name: "explore".to_string(),
+        agent_name: "build".to_string(),
         model: "qwen3.7-max-alibaba".to_string(),
         is_model_auto_selected: false,
         auto_model_fallback: None,
@@ -757,8 +757,8 @@ fn startup_choice_rejects_resume_and_new_session_together() {
 #[test]
 fn auto_route_switches_to_build_for_code_question_when_enabled() {
     // auto-routing 默认禁用（见 auto_agent_routing_enabled）。这里通过临时
-    // config 打开 heuristic 策略，验证一个明显匹配 build 的代码问题会从
-    // 当前 prompt-skill agent 切到 build。
+    // config 打开 heuristic 策略，验证一个明显匹配 build 的代码问题会
+    // 正确选择 build agent。
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|err| err.into_inner());
@@ -779,18 +779,20 @@ fn auto_route_switches_to_build_for_code_question_when_enabled() {
     let build = primary_agent(
         "build",
         "Default agent for development work",
-        &["fix", "debug", "build", "compile", "test"],
+        &["fix", "debug", "build", "compile", "test", "implement", "refactor", "execute", "coding", "run", "search", "locate", "inspect", "understand", "test", "debug", "build", "debug", "compile", "explain", "planning", "review", "analyze", "analysis", "summarize", "architecture", "engineer", "design"],
     );
-    let prompt_skill = primary_agent(
-        "prompt-skill",
-        "Specialized agent for optimizing and generating prompts and skills",
-        &["prompt", "skill", "optimize"],
+    let plan = primary_agent(
+        "plan",
+        "Read-only planning agent",
+        &["plan", "analyze", "review"],
     );
-    let mut app = test_app("prompt-skill");
+    // 起始 agent 必须不同于目标，否则 choose_semantic_route 会因
+    // best.agent.name == current_agent 而直接返回 None。
+    let mut app = test_app("plan");
 
     maybe_auto_route_agent(
         &mut app,
-        &[build.clone(), prompt_skill.clone()],
+        &[build.clone(), plan.clone()],
         "帮我 fix 这个 bug，debug 一下编译错误",
     );
 

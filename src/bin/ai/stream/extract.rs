@@ -107,6 +107,7 @@ pub(super) fn extract_chunk_events_streaming(
     hermes_streamer: &mut HermesXmlToolCallStreamer,
     anthropic_streamer: &mut AnthropicXmlToolCallStreamer,
     bare_xml_streamer: &mut BareXmlToolCallStreamer,
+    inline_markup_normalizer: &mut super::inline_recovery::InlineMarkupNormalizer,
 ) -> (Vec<StreamTextEvent>, Vec<InternalToolCallStreamEvent>) {
     let Some(choice) = chunk.choices.first() else {
         return (Vec::new(), Vec::new());
@@ -149,7 +150,11 @@ pub(super) fn extract_chunk_events_streaming(
         events.push(StreamTextEvent::CloseThinking);
     }
     if !delta.content.is_empty() {
-        let normalized = super::inline_recovery::normalize_inline_tool_call_markup(&delta.content);
+        let normalized = inline_markup_normalizer.push(&delta.content);
+        if normalized.is_empty() {
+            // 整段被判定为「可能截断的 marker 前缀」而暂存，等待下一个 chunk。
+            return (events, all_tool_events);
+        }
         let (cleaned, mut hermes_events) = hermes_streamer.push(&normalized);
         // 再把 Hermes 抽离后的可见文本交给 Anthropic（`<invoke name=...>`）解析器，
         // 兼容 deepseek-v4-flash 等用该格式输出工具调用的模型。
@@ -489,6 +494,7 @@ mod tests {
             &mut hermes_streamer,
             &mut anthropic_streamer,
             &mut bare_xml_streamer,
+            &mut super::super::inline_recovery::InlineMarkupNormalizer::new(),
         );
 
         assert_eq!(
@@ -545,6 +551,7 @@ mod tests {
             &mut hermes_streamer,
             &mut anthropic_streamer,
             &mut bare_xml_streamer,
+            &mut super::super::inline_recovery::InlineMarkupNormalizer::new(),
         );
 
         assert_eq!(
@@ -591,6 +598,7 @@ mod tests {
             &mut hermes_streamer,
             &mut anthropic_streamer,
             &mut bare_xml_streamer,
+            &mut super::super::inline_recovery::InlineMarkupNormalizer::new(),
         );
 
         assert_eq!(
@@ -609,6 +617,76 @@ mod tests {
                 assert_eq!(v["command"], "pwd");
             }
             other => panic!("unexpected tool events: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_dsml_marker_across_chunks_is_recovered_not_leaked() {
+        // 回归：全角 DSML marker（`<｜｜DSML｜｜…>`）被拆到两个 delta chunk 边界时，
+        // 逐 chunk 无状态归一化无法还原，会把原始 marker 泄漏成正文且解析失效。
+        // 有状态的 InlineMarkupNormalizer 应把半截 marker 暂存到下一个 chunk 再归一化。
+        let full = "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"><｜｜DSML｜｜parameter name=\"file_path\" string=\"true\">/tmp/x</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>";
+        // 在多个字符边界切开，覆盖 marker 中间被截断的各种位置。
+        for cut_char in [1usize, 3, 5, 8, 20] {
+            let Some((cut, _)) = full.char_indices().nth(cut_char) else {
+                continue;
+            };
+            let (a, b) = full.split_at(cut);
+
+            let mut thinking_open = false;
+            let mut hidden_meta_parse = HiddenMetaParseState::default();
+            let mut streamer = InternalToolCallStreamer::new();
+            let mut hermes_streamer = HermesXmlToolCallStreamer::new();
+            let mut anthropic_streamer = AnthropicXmlToolCallStreamer::new();
+            let mut bare_xml_streamer = BareXmlToolCallStreamer::new();
+            let mut inline_markup_normalizer =
+                super::super::inline_recovery::InlineMarkupNormalizer::new();
+
+            let mut visible = String::new();
+            let mut tool_events_total = Vec::new();
+            for piece in [a, b] {
+                let chunk = StreamChunk {
+                    choices: vec![StreamChoice {
+                        delta: StreamDelta {
+                            content: piece.to_string(),
+                            reasoning_content: String::new(),
+                            reasoning_details: String::new(),
+                            tool_calls: Vec::new(),
+                        },
+                        finish_reason: None,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let (events, tool_events) = extract_chunk_events_streaming(
+                    &chunk,
+                    "<meta:self_note>",
+                    "</meta:self_note>",
+                    &mut thinking_open,
+                    &mut hidden_meta_parse,
+                    &mut streamer,
+                    &mut hermes_streamer,
+                    &mut anthropic_streamer,
+                    &mut bare_xml_streamer,
+                    &mut inline_markup_normalizer,
+                );
+                for ev in &events {
+                    if let StreamTextEvent::AppendContent(t) = ev {
+                        visible.push_str(t);
+                    }
+                }
+                tool_events_total.extend(tool_events);
+            }
+            assert!(
+                !visible.contains("DSML") && !visible.contains("invoke"),
+                "DSML markup leaked to visible content (cut={cut_char}): {visible:?}"
+            );
+            assert!(
+                tool_events_total
+                    .iter()
+                    .any(|ev| matches!(ev, InternalToolCallStreamEvent::Begin(name) if name == "read_file")),
+                "tool call should be recovered from split chunks (cut={cut_char}): {tool_events_total:?}"
+            );
         }
     }
 }
@@ -693,7 +771,7 @@ fn push_text_with_hidden_meta(
     flush_hidden(events, &mut hidden);
 }
 
-fn normalize_stream_text(text: String) -> String {
+pub(super) fn normalize_stream_text(text: String) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 

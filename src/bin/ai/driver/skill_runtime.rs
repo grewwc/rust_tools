@@ -1034,8 +1034,9 @@ fn build_system_prompt(
         if has_tool(available_tools, "task_spawn") {
             lines.push("Use `task_spawn` to launch a subagent task and fan out parallel independent subtasks.".to_string());
             lines.push("If N subtasks have no data dependency, spawn ALL of them in the same response (multiple task_spawn calls in one turn), then a single task_wait. Do NOT spawn-wait-spawn-wait serially.".to_string());
-            lines.push("Delegate only when the task is genuinely complex and the expected parallelism benefit clearly exceeds subagent startup and coordination cost. Do not delegate simple tasks, single-file changes, or work you can finish directly with a few tool calls.".to_string());
-            lines.push("Delegation test: ask both 'can this part run independently?' and 'will delegation materially reduce latency or context pressure?' Delegate only when both answers are yes.".to_string());
+            lines.push("Delegate when there are multiple independent, non-trivial work streams and parallel execution is likely to reduce latency or main-agent context pressure. A subtask does not need to be complex on its own when several branches can be investigated concurrently.".to_string());
+            lines.push("Do not delegate simple tasks, single-file localized changes, strongly sequential work, or work you can finish directly with a few tool calls.".to_string());
+            lines.push("Delegation test: ask whether the work can run independently and whether delegation is likely to reduce latency or context pressure. When both are plausible, delegate; certainty is not required.".to_string());
         }
         if has_tool(available_tools, "task_wait") {
             lines.push("Use `task_wait` to collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.".to_string());
@@ -1319,7 +1320,7 @@ mod tests {
     #[test]
     fn active_agent_max_steps_override_default_iterations() {
         let agent = AgentManifest {
-            name: "executor".to_string(),
+            name: "build".to_string(),
             description: String::new(),
             mode: AgentMode::Primary,
             model: None,
@@ -1593,6 +1594,25 @@ mod tests {
         assert!(prompt.contains("Lead with answer"));
         // 必须保留"简洁不能换错"的安全垫，避免过度精简导致错误判断
         assert!(prompt.contains("concise but not at the cost of correctness"));
+    }
+
+    #[test]
+    fn system_prompt_encourages_bounded_parallel_delegation() {
+        let mut available = SkipSet::new(16);
+        available.insert("task_spawn".to_string());
+        available.insert("task_wait".to_string());
+        available.insert("task_status".to_string());
+
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+
+        // 多个独立、非琐碎分支应允许积极并行，但仍禁止琐碎任务滥用子 agent。
+        assert!(prompt.contains("multiple independent, non-trivial work streams"));
+        assert!(prompt.contains("does not need to be complex on its own"));
+        assert!(prompt.contains("latency or main-agent context pressure"));
+        assert!(prompt.contains("Do not delegate simple tasks"));
+        assert!(prompt.contains("certainty is not required"));
+        assert!(!prompt.contains("genuinely complex"));
+        assert!(!prompt.contains("both answers are yes"));
     }
 
     #[test]

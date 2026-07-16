@@ -188,7 +188,7 @@ pub(crate) struct AsyncTaskEntry {
     /// 描述性文本；与 kernel `Process.goal` 不同——后者会带 TASK_GOAL_PREFIX
     /// 前缀和完整 prompt。
     pub(crate) description: String,
-    /// 子 agent 的逻辑名（"explore" / "plan" 等）；与 kernel `Process.name` 同源
+    /// 子 agent 的逻辑名（"build" / "plan" 等）；与 kernel `Process.name` 同源
     /// 但 kernel 端 name 仅作显示。
     pub(crate) agent_name: String,
     pub(crate) model: String,
@@ -1023,7 +1023,7 @@ fn params_tool_cancel() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_wait",
-        description: "Wait for one or more asynchronously spawned subagent tasks to complete and collect their results. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. The `timeout_secs` argument is a per-call wait budget — when it elapses without satisfying the policy, the call returns with already-collected results AND a clear note that the remaining subagents are still running; you can call task_wait again with the same task_ids to keep waiting (or pass `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
+        description: "Wait for one or more asynchronously spawned subagent tasks (started by task_spawn) to complete and collect their results. Do NOT pass tool_spawn task_ids here -- use tool_wait for those. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. The `timeout_secs` argument is a per-call wait budget — when it elapses without satisfying the policy, the call returns with already-collected results AND a clear note that the remaining subagents are still running; you can call task_wait again with the same task_ids to keep waiting (or pass `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
         parameters: params_task_wait,
         execute: execute_task_wait,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -1053,7 +1053,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "tool_wait",
-        description: "Wait for one or more async tool tasks started by tool_spawn. When running inside AIOS process scheduling, this tool suspends the current process by calling wait_on_events and yields control until the wait condition is satisfied or timeout_ticks is reached. When AIOS process context is unavailable, it falls back to a short non-blocking wait window and returns partial progress. Use wait_policy=all to join a batch, or wait_policy=any when you want to resume as soon as any branch finishes.",
+        description: "Wait for one or more async tool tasks started by tool_spawn. Do NOT pass task_spawn (subagent) task_ids here -- use task_wait for those. When running inside AIOS process scheduling, this tool suspends the current process by calling wait_on_events and yields control until the wait condition is satisfied or timeout_ticks is reached. When AIOS process context is unavailable, it falls back to a short non-blocking wait window and returns partial progress. Use wait_policy=all to join a batch, or wait_policy=any when you want to resume as soon as any branch finishes.",
         parameters: params_tool_wait,
         execute: execute_tool_wait_placeholder,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -1521,6 +1521,36 @@ pub(crate) fn build_outstanding_task_anchor(session_id: &str) -> Result<Option<S
         return Ok(None);
     }
     Ok(Some(render_outstanding_task_anchor(&snapshots)))
+}
+
+/// 已到达迭代硬上限、不再打回模型时，把仍未回收的子任务状态拼进最终回答，
+/// 避免未回收结果被静默抛弃。与 `build_outstanding_task_anchor` 共用 snapshot
+/// 收集，但文案面向最终输出：此时不会再给模型继续的机会，因此不再要求模型
+/// “下一步调用 task_wait”，而是告知用户哪些子任务结果未被回收、需要重跑收集。
+pub(crate) fn build_abandoned_tasks_notice(
+    session_id: &str,
+    iteration_limit: usize,
+) -> Result<Option<String>, String> {
+    let snapshots = collect_outstanding_task_snapshots(session_id)?;
+    if snapshots.is_empty() {
+        return Ok(None);
+    }
+    let mut lines = vec![format!(
+        "The following {} spawned subagent task(s) were still outstanding when the tool iteration limit ({}) was reached; their results were NOT collected and are not reflected in this answer:",
+        snapshots.len(),
+        iteration_limit
+    )];
+    for snapshot in &snapshots {
+        lines.push(format!(
+            "- task_id={} status={} agent={} model={} desc={}",
+            snapshot.task_id, snapshot.status, snapshot.agent_name, snapshot.model, snapshot.description
+        ));
+    }
+    lines.push(
+        "Required follow-up: re-run this turn and collect these results with `task_wait` / `task_status` for the listed task_ids."
+            .to_string(),
+    );
+    Ok(Some(lines.join("\n")))
 }
 
 pub(crate) fn outstanding_task_anchor_prefix() -> &'static str {

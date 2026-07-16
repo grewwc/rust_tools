@@ -14,11 +14,7 @@
 //   - model_tier: light/standard/heavy preference
 //
 // Builtin agents:
-//   - build: Default code-writing agent
-//   - executor: Background task execution
-//   - plan: Multi-step planning
-//   - explore: Codebase exploration
-//   - prompt-skill: Skill creation
+//   - build: Default unified development agent (planning, code-writing, execution, prompt engineering, exploration)
 // =============================================================================
 
 use rust_tools::cw::SkipMap;
@@ -32,19 +28,6 @@ use crate::commonw::{configw, utils::expanduser};
 
 const BUILTIN_AGENTS: &[(&str, &str)] = &[
     ("build.agent", include_str!("builtin_agents/build.agent")),
-    (
-        "executor.agent",
-        include_str!("builtin_agents/executor.agent"),
-    ),
-    ("plan.agent", include_str!("builtin_agents/plan.agent")),
-    (
-        "explore.agent",
-        include_str!("builtin_agents/explore.agent"),
-    ),
-    (
-        "prompt-skill.agent",
-        include_str!("builtin_agents/prompt-skill.agent"),
-    ),
 ];
 const PROJECT_INSTRUCTION_FILENAMES: &[&str] = &[
     "AGENTS.md",
@@ -572,10 +555,7 @@ pub(super) fn find_agent_by_name<'a>(
 }
 
 pub(super) fn canonical_agent_name(name: &str) -> &str {
-    match name {
-        "openclaw" => "executor",
-        other => other,
-    }
+    name
 }
 
 pub(crate) fn agents_dir() -> PathBuf {
@@ -587,19 +567,6 @@ pub(crate) fn agents_dir() -> PathBuf {
         raw
     };
     PathBuf::from(expanduser(&path).as_ref())
-}
-
-/// 返回 builtin agent 的文件名集合（如 "build.agent"）。供 save_agent
-/// 工具校验，禁止覆盖编译进二进制的 builtin。
-pub(crate) fn builtin_agent_filenames() -> &'static [&'static str] {
-    const NAMES: &[&str] = &[
-        "build.agent",
-        "executor.agent",
-        "plan.agent",
-        "explore.agent",
-        "prompt-skill.agent",
-    ];
-    NAMES
 }
 
 fn looks_like_front_matter_agent(content: &str) -> bool {
@@ -866,7 +833,7 @@ mod tests {
     #[test]
     fn parses_routing_tags_and_model_tier_from_front_matter() {
         let content = r#"---
-name: explore
+name: test-agent
 description: Fast read-only codebase exploration
 mode: subagent
 model_tier: light
@@ -880,7 +847,7 @@ Read the codebase and summarize findings.
 "#;
 
         let agent = parse_agent_front_matter(content).unwrap();
-        assert_eq!(agent.name, "explore");
+        assert_eq!(agent.name, "test-agent");
         assert_eq!(agent.model_tier, Some(AgentModelTier::Light));
         assert_eq!(
             agent.routing_tags,
@@ -932,20 +899,6 @@ Build things.
                 "{filename} should use progressive MCP loading instead of mounting every MCP tool"
             );
         }
-    }
-
-    #[test]
-    fn prompt_skill_builtin_uses_explicit_tools_not_whole_builtin_group() {
-        let prompt_skill = BUILTIN_AGENTS
-            .iter()
-            .find_map(|(filename, content)| {
-                (*filename == "prompt-skill.agent")
-                    .then(|| parse_agent_front_matter(content).unwrap())
-            })
-            .unwrap();
-
-        assert!(!prompt_skill.tools.is_empty());
-        assert!(prompt_skill.tool_groups.is_empty());
     }
 
     #[test]

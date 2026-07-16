@@ -9,6 +9,7 @@ use crate::ai::{
 
 use super::{
     MarkdownStreamRenderer,
+    inline_recovery::InlineMarkupNormalizer,
     splitter::{
         AnthropicXmlToolCallStreamer, BareXmlToolCallStreamer, HermesXmlToolCallStreamer,
         InternalToolCallStreamer, StreamSplitter,
@@ -236,6 +237,8 @@ pub(super) struct StreamContentState {
     pub(super) hermes_tool_call_streamer: HermesXmlToolCallStreamer,
     pub(super) anthropic_tool_call_streamer: AnthropicXmlToolCallStreamer,
     pub(super) bare_xml_tool_call_streamer: BareXmlToolCallStreamer,
+    /// 有状态命名空间 marker 归一化器：跨 chunk 复原被截断的 `<｜｜DSML｜｜…>`。
+    pub(super) inline_markup_normalizer: InlineMarkupNormalizer,
 }
 
 impl StreamContentState {
@@ -258,6 +261,7 @@ impl StreamContentState {
             hermes_tool_call_streamer: HermesXmlToolCallStreamer::new(),
             anthropic_tool_call_streamer: AnthropicXmlToolCallStreamer::new(),
             bare_xml_tool_call_streamer: BareXmlToolCallStreamer::new(),
+            inline_markup_normalizer: InlineMarkupNormalizer::new(),
         }
     }
 }

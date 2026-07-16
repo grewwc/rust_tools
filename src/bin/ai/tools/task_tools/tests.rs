@@ -95,26 +95,26 @@ fn test_app_with_model(current_model: String) -> App {
 }
 
 #[test]
-fn auto_select_prefers_explore_for_codebase_investigation() {
+fn auto_select_prefers_navigator_for_codebase_investigation() {
     let mut build = manifest("build", "Main build agent", AgentMode::Primary);
     build.routing_tags = vec!["implement".to_string(), "fix".to_string()];
     build.model_tier = Some(AgentModelTier::Heavy);
-    let mut explore = manifest(
-        "explore",
-        "Read-only codebase exploration agent",
+    let mut navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
         AgentMode::Subagent,
     );
-    explore.routing_tags = vec![
+    navigator.routing_tags = vec![
         "find".to_string(),
         "search".to_string(),
         "read-only".to_string(),
         "understand".to_string(),
     ];
-    explore.model_tier = Some(AgentModelTier::Light);
+    navigator.model_tier = Some(AgentModelTier::Light);
     let mut review = manifest("review", "Read-only review agent", AgentMode::Subagent);
     review.routing_tags = vec!["review".to_string(), "audit".to_string()];
 
-    let all_agents = vec![build, explore, review];
+    let all_agents = vec![build, navigator, review];
 
     let selected = select_subagent(
         &all_agents,
@@ -124,7 +124,7 @@ fn auto_select_prefers_explore_for_codebase_investigation() {
     )
     .unwrap();
 
-    assert_eq!(selected.agent.name, "explore");
+    assert_eq!(selected.agent.name, "navigator");
     assert!(selected.auto_selected);
     assert!(!selected.matched_tags.is_empty());
 }
@@ -135,22 +135,22 @@ fn prepare_subagent_task_inherits_parent_model_without_auto_fallback() {
         .first()
         .map(|model| crate::ai::model_names::model_handle(model))
         .expect("models.json must contain at least one model");
-    let mut explore = manifest(
-        "explore",
-        "Read-only codebase exploration agent",
+    let mut navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
         AgentMode::Subagent,
     );
-    explore.routing_tags = vec!["find".to_string(), "search".to_string()];
+    navigator.routing_tags = vec!["find".to_string(), "search".to_string()];
     let ctx = DriverContext::new(
         test_app_with_model(parent_model.clone()),
         Arc::new(std::sync::Mutex::new(McpClient::new())),
         Arc::new(Vec::new()),
-        Arc::new(vec![explore]),
+        Arc::new(vec![navigator]),
     );
     let args = serde_json::json!({
         "description": "Locate task tool",
         "prompt": "Find where task spawning is implemented.",
-        "agent": "explore"
+        "agent": "navigator"
     });
 
     let prepared = DRIVER_CTX
@@ -171,13 +171,13 @@ fn prepare_subagent_task_inherits_parent_model_without_auto_fallback() {
 fn explicit_primary_agent_is_rejected_for_task_tool() {
     let mut build = manifest("build", "Main build agent", AgentMode::Primary);
     build.routing_tags = vec!["implement".to_string()];
-    let mut explore = manifest(
-        "explore",
-        "Read-only codebase exploration agent",
+    let mut navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
         AgentMode::Subagent,
     );
-    explore.routing_tags = vec!["find".to_string(), "search".to_string()];
-    let all_agents = vec![build, explore];
+    navigator.routing_tags = vec!["find".to_string(), "search".to_string()];
+    let all_agents = vec![build, navigator];
 
     let err =
         select_subagent(&all_agents, Some("build"), "Inspect code", "Look up files").unwrap_err();
