@@ -50,6 +50,10 @@ pub(super) enum ModelQualityTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ReasoningEffort {
+    /// 显式最低档：下发 `reasoning_effort: "none"`。注意与「不下发字段」
+    /// （`override = Some(None)`，服务端默认档位接管）语义不同——`None` 是真正
+    /// 的推理下限。新一代 gpt-5.6 用它取代已被移除的 `minimal`。
+    None,
     Minimal,
     Low,
     Medium,
@@ -59,6 +63,7 @@ pub(super) enum ReasoningEffort {
 impl ReasoningEffort {
     pub(super) fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
@@ -171,6 +176,15 @@ mod tests {
         ] {
             assert_eq!(ReasoningEffort::parse(level.as_str()), Some(level));
         }
+    }
+
+    #[test]
+    fn reasoning_effort_none_is_explicit_low_bound_not_user_parseable() {
+        // `None` 是显式最低档，下发 `reasoning_effort: "none"`。
+        assert_eq!(ReasoningEffort::None.as_str(), "none");
+        // 但 `"none"` 作为用户/config 输入仍保留「省略字段」的控制语义，
+        // 不映射到 `None` 档位——该档位仅由截断降档阶梯内部使用。
+        assert_eq!(ReasoningEffort::parse("none"), None);
     }
 
     #[test]

@@ -1873,6 +1873,7 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     if let Some(editor) = app.prompt_editor.as_mut() {
         crate::ai::prompt::completion::CommandCompleter::set_current_model_hint(&app.current_model);
         editor.set_current_model_label(crate::ai::models::model_display_label(&app.current_model));
+        editor.set_session_id(app.session_id.clone());
         // 设置 session 主题：从当前 session 的首条用户消息生成概括性标题。
         // 若 session 尚无用户消息（新 session），显示 "new session"。
         // SessionStore 需要 session 文件所在目录（而非 history 文件本身）。

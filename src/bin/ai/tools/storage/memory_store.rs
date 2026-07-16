@@ -432,9 +432,19 @@ impl MemoryStore {
                     archives.push((entry.path(), modified));
                 }
                 archives.sort_by_key(|(_, modified)| *modified);
-                let take_from = archives.len().saturating_sub(keep_last_archives);
-                for (path, _) in archives.into_iter().skip(take_from) {
-                    files.push(path);
+                if include_archives {
+                    // 显式请求扫描归档（如 -ns memo 检索）：不截断，
+                    // 确保被 rotation 移入旧归档的历史 memo 仍可检索。
+                    // keep_last_archives 截断仅用于 search_archives.enable
+                    // 全局配置开启时的全量搜索性能优化。
+                    for (path, _) in archives {
+                        files.push(path);
+                    }
+                } else {
+                    let take_from = archives.len().saturating_sub(keep_last_archives);
+                    for (path, _) in archives.into_iter().skip(take_from) {
+                        files.push(path);
+                    }
                 }
             }
         }
@@ -1838,6 +1848,64 @@ mod retention_tests {
         let _ = std::fs::remove_file(&path);
         for a in archives {
             let _ = std::fs::remove_file(a);
+        }
+    }
+
+    /// P0 回归：-ns memo 检索（include_archives=true）必须扫描全部归档，
+    /// 不受 keep_last_archives 截断。否则被 rotation 移入旧归档的历史 memo
+    /// 会永久不可检索（用户报告"二次分析问题排查"搜不到的根因）。
+    #[test]
+    fn entries_by_category_include_archives_scans_all_archives() {
+        let path = unique_path("memo_arch_scan");
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let base = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+
+        // 主文件：1 条 memo
+        write_lines(&path, &[entry("memo", "main memo", "2026-07-16T00:00:00Z", 100)]);
+
+        // 创建 5 个归档文件（超出默认 keep_last_archives=3 窗口）。
+        // 最旧归档中放 "二次分析"，模拟被 rotation 移走的用户记录。
+        let archive_notes = [
+            "oldest: 二次分析问题排查",
+            "archive2 memo",
+            "archive3 memo",
+            "archive4 memo",
+            "archive5 memo",
+        ];
+        let mut archive_paths = Vec::new();
+        for (i, note) in archive_notes.iter().enumerate() {
+            let ap = parent.join(format!("{base}.2026070{}170000", i + 1));
+            write_lines(&ap, &[entry("memo", note, "2026-07-01T00:00:00Z", 100)]);
+            // 设置递增 mtime，确保排序确定（最旧 -> 最新）
+            let mut times = std::fs::FileTimes::new();
+            times.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + i as u64));
+            std::fs::File::open(&ap).unwrap().set_times(times).unwrap();
+            archive_paths.push(ap);
+        }
+
+        let store = MemoryStore::for_tests_with_path(path.clone());
+        let memos = store.entries_by_category("memo", 100_000, true).unwrap();
+
+        // 主文件 1 + 归档 5 = 6 条，包括最旧归档中的 "二次分析"
+        assert_eq!(
+            memos.len(),
+            6,
+            "include_archives=true 必须扫描全部归档，不应被 keep_last 截断"
+        );
+        assert!(
+            memos.iter().any(|m| m.note.contains("二次分析")),
+            "最旧归档中的 memo 必须可检索"
+        );
+
+        // 清理
+        let _ = std::fs::remove_file(&path);
+        for p in archive_paths {
+            let _ = std::fs::remove_file(p);
         }
     }
 }

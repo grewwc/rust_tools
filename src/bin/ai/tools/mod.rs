@@ -40,7 +40,6 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "read_file",
     "list_directory",
     "find_path",
-    "text_grep",
     "code_search",
     "task",
     "task_spawn",

@@ -240,7 +240,10 @@ fn maybe_spawn_critic_revise_background(app: &App, question: &str, final_assista
     });
 }
 
-fn should_generate_session_title_in_background(one_shot_mode: bool, should_quit: bool) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn should_generate_session_title_in_background(
+    one_shot_mode: bool,
+    should_quit: bool,
+) -> bool {
     !one_shot_mode && !should_quit
 }
 
@@ -385,7 +388,10 @@ pub(super) async fn finalize_turn(
 
 /// 在 turn 结束后尝试用 LLM 生成 session 概括性标题。
 /// 条件：至少有 1 个 user turn 且尚未生成过标题。
-async fn maybe_generate_session_title(app: &App, run_in_background: bool) {
+pub(in crate::ai::driver::turn_runtime) async fn maybe_generate_session_title(
+    app: &App,
+    run_in_background: bool,
+) {
     if !mark_session_title_generation_started(&app.session_id) {
         return;
     }

@@ -24,7 +24,9 @@ use super::{
     MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
     MID_TURN_LLM_SUMMARY_MAX_CHARS,
     finalize::finalize_turn,
+    finalize::{maybe_generate_session_title, should_generate_session_title_in_background},
     iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
+    persistence::persist_pending_turn_messages,
     mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
     prepare::prepare_turn,
     tool_result::handle_iteration_execution,
@@ -78,7 +80,7 @@ const LONG_LOOP_COMPRESS_ITERATION_THRESHOLD: usize = 12;
 /// 这是叠加在 exact / coarse 循环检测之上的第三层，用于治理「参数每轮都变、
 /// 但整体不推进任务」的发散型 loop——前两层按「签名重复」判定，结构上抓不到
 /// 每轮都在搜新符号 / 读新文件却始终零收敛的膨胀（真实案例：一个「删除方法」
-/// 的变更请求连续 60+ 轮只 read_file/text_grep、零 apply_patch）。
+/// 的变更请求连续 60+ 轮只 read_file/code_search、零 apply_patch）。
 ///
 /// 核心理念：不按「动作次数」计费，按「信息增益 / 意图对齐度」计费。早期探索
 /// 几乎免费；越往后，「继续但没进展」越要付出显式理由。惩罚对象是「说不出理由
@@ -1975,6 +1977,21 @@ async fn run_turn_body(
         Err(err) => return Err(err),
     };
 
+    // 首轮用户消息已就绪：立即落盘并后台异步生成 session 标题，
+    // 不必等第一轮对话结束。后续 finalize_turn 里的 in-flight /
+    // has_generated_title 检查会自动跳过，无需额外同步。
+    if history_count == 0
+        && should_generate_session_title_in_background(one_shot_mode, should_quit)
+    {
+        persist_pending_turn_messages(
+            app,
+            one_shot_mode,
+            &turn_messages,
+            &mut persisted_turn_messages,
+        );
+        maybe_generate_session_title(app, true).await;
+    }
+
     let mut supervisor = TurnSupervisor::default();
     let mut force_final_response = false;
     let mut final_assistant_text = String::new();
@@ -2154,11 +2171,17 @@ async fn run_turn_body(
                         // resolve_reasoning_effort 每次迭代实时读该字段，改了立即对下一次生效。
                         //
                         // 1 次截断 → Low（减半推理开销）
-                        // 2 次截断 → Minimal（仅保留最低推理）
-                        // 3 次以上 → 完全禁用 reasoning（把全部输出预算让给可见内容）
+                        // 2 次截断 → None（显式最低档，真正的推理下限）
+                        // 3 次以上 → 完全禁用 reasoning（不下发 effort 字段）+ 关 thinking
+                        //
+                        // 用显式 `None`（下发 `reasoning_effort: "none"`）而非省略字段：
+                        // 省略字段会让服务端回退到自身默认档（gpt-5.x 默认 medium），
+                        // 反而把推理预算调高，破坏阶梯单调性。`None` 是各 gpt-5.x 版本
+                        // 都支持的真正下限，取代已被 gpt-5.6 系列移除、会触发 400 的
+                        // `Minimal`。
                         app.cli.reasoning_effort_override = Some(match consecutive_truncations {
                             1 => Some(crate::ai::provider::ReasoningEffort::Low),
-                            2 => Some(crate::ai::provider::ReasoningEffort::Minimal),
+                            2 => Some(crate::ai::provider::ReasoningEffort::None),
                             _ => None, // Some(None) = 禁用 reasoning，不下发 effort 字段
                         });
                         // effort 阶梯走到第 3 档仍截断，说明仅靠降 effort 已不足以收敛，

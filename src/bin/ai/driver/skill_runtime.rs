@@ -220,12 +220,27 @@ fn merge_with_runtime_enabled_tools(
         .iter()
         .map(|tool| tool.function.name.clone())
         .collect();
-    let runtime_extra = current_tools
+    let mut runtime_extra = current_tools
         .iter()
         .filter(|tool| explicit_enabled.contains(&tool.function.name))
         .filter(|tool| !known_names.contains(&tool.function.name))
         .cloned()
         .collect::<Vec<_>>();
+    let runtime_extra_names = runtime_extra
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Box<SkipSet<_>>>();
+    let missing_builtin_names = explicit_enabled
+        .iter()
+        .filter(|name| !known_names.contains(*name))
+        .filter(|name| !runtime_extra_names.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    // enable_tools 的执行结果与下一次 skill 刷新之间不应依赖 ctx.tools 恰好已写回。
+    // 内置工具可直接从注册表恢复；MCP 工具仍由 current_tools 保留。
+    runtime_extra.extend(super::super::tools::get_tool_definitions_by_names(
+        &missing_builtin_names,
+    ));
     if runtime_extra.is_empty() {
         return filter_subagent_hidden_tools(merged);
     }
@@ -2148,6 +2163,22 @@ mod tests {
     }
 
     #[test]
+    fn runtime_enabled_builtin_is_restored_when_current_context_missed_writeback() {
+        let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
+        set_explicit_enabled_tool_names(vec!["knowledge_rebuild_index".to_string()]);
+
+        let merged = merge_with_runtime_enabled_tools(vec![tool("code_search")], vec![], &[]);
+        let names = merged
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"code_search".to_string()));
+        assert!(names.contains(&"knowledge_rebuild_index".to_string()));
+        set_explicit_enabled_tool_names(Vec::new());
+    }
+
+    #[test]
     fn non_explicit_skill_tools_do_not_leak_into_next_context() {
         let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
         set_explicit_enabled_tool_names(vec!["web_search".to_string()]);
@@ -2181,7 +2212,6 @@ mod tests {
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"list_directory".to_string()));
         assert!(names.contains(&"find_path".to_string()));
-        assert!(names.contains(&"text_grep".to_string()));
         // 子 Agent 编排能力应作为 baseline 常驻补回，避免 skill 白名单把 task_*
         // 全部剔除导致主 Agent 失去委派子 Agent 的能力。
         assert!(names.contains(&"task".to_string()));

@@ -22,6 +22,8 @@ const MAX_INPUT_CHARS: usize = 4000;
 pub(super) struct PromptEditor {
     editor: Option<LineEditor>,
     pub(super) history_path: PathBuf,
+    session_id: String,
+    session_store: SessionStore,
     session_image_dir: PathBuf,
     /// 下一次 `read_multi_line` 的预填文本（用于编辑已有内容场景，读取后清空）。
     pending_prefill: Option<String>,
@@ -48,10 +50,13 @@ impl PromptEditor {
         {
             let _ = editor.load_history(&history_path);
         }
-        let session_image_dir = SessionStore::new(history_file).session_assets_dir(session_id);
+        let session_store = SessionStore::new(history_file);
+        let session_image_dir = session_store.session_assets_dir(session_id);
         Self {
             editor,
             history_path,
+            session_id: session_id.to_string(),
+            session_store,
             session_image_dir,
             pending_prefill: None,
             pending_status_msg: None,
@@ -75,9 +80,30 @@ impl PromptEditor {
         self.current_model_label = label.into();
     }
 
+    /// 更新当前绑定的 session。`PromptEditor` 生命周期跨 `/session` 切换，
+    /// 进入输入框前需要同步到 app 的当前 session。
+    pub(super) fn set_session_id(&mut self, session_id: impl Into<String>) {
+        self.session_id = session_id.into();
+    }
+
     /// 设置当前 session 主题，下一次 `read_multi_line` 会在模型提示同行展示。
     pub(super) fn set_session_topic(&mut self, topic: Option<String>) {
         self.session_topic = topic;
+    }
+
+    /// 轮询后台生成的 LLM 标题；返回 `Some(changed)` 表示已读到生成标题。
+    fn refresh_generated_session_topic(&mut self) -> io::Result<Option<bool>> {
+        let Some(title) = self.session_store.read_session_title(&self.session_id)? else {
+            return Ok(None);
+        };
+        if title.trim().is_empty() {
+            return Ok(None);
+        }
+        let changed = self.session_topic.as_deref() != Some(title.as_str());
+        if changed {
+            self.session_topic = Some(title);
+        }
+        Ok(Some(changed))
     }
 
     pub(super) fn read_multi_line(&mut self) -> io::Result<Option<String>> {
@@ -132,6 +158,44 @@ impl PromptEditor {
             let _ = fs::create_dir_all(parent);
         }
         let _ = editor.save_history(&self.history_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn refresh_generated_session_topic_replaces_fallback_topic() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rust_tools_prompt_topic_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let history_file = root.join("history.jsonl");
+        let session_id = "topic-test";
+
+        let store = SessionStore::new(&history_file);
+        store.ensure_root_dir().unwrap();
+        store
+            .write_session_title(session_id, "生成后的标题")
+            .unwrap();
+
+        let mut editor = PromptEditor::new(session_id, &history_file);
+        editor.set_session_topic(Some("首条消息摘要".to_string()));
+
+        assert_eq!(
+            editor.refresh_generated_session_topic().unwrap(),
+            Some(true)
+        );
+        assert_eq!(editor.session_topic.as_deref(), Some("生成后的标题"));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
 

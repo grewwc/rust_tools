@@ -68,6 +68,7 @@ fn print_model_list(app: &App) {
             model.tools_default_enabled.then_some("tools"),
             model.enable_thinking.then_some("thinking"),
             model.reasoning_effort.map(|e| match e {
+                ReasoningEffort::None => "effort:none",
                 ReasoningEffort::Minimal => "effort:minimal",
                 ReasoningEffort::Low => "effort:low",
                 ReasoningEffort::Medium => "effort:medium",

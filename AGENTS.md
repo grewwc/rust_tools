@@ -33,18 +33,38 @@ docs/agent-guides/          # long-form on-demand subsystem docs
 ## Build / Test
 
 ```bash
-cargo check --bin a          # fast type-check
-cargo test --lib --bin a     # run lib + a's tests
-cargo test --bin a test_name # run one test
+cargo check --bin a                  # fast type-check for the main binary
+cargo check -p aios_kernel           # type-check one workspace crate
+cargo test --bin a test_name         # run one targeted test in `a`
+cargo test -p aios_kernel test_name  # run one targeted test in a crate
+cargo test --lib --bin a test_name   # only when one named test spans lib + bin
 ```
 
-**Only verify what you changed.** Always scope with `--bin`, `--lib`, `-p`, or a
-specific test name. Never bare `cargo test` / `cargo build --release`.
+**Scope every verification.** Always use `--bin`, `--lib`, `-p`, or a specific
+test name. Never run bare `cargo test`, bare `cargo build --release`, or broad
+workspace-wide commands for routine verification.
 
-**Non-essential, no `cargo test`.** Do not run `cargo test` as a verification
-step unless the change is specifically about test logic or the test is needed
-to confirm correctness. Prefer `cargo check` for type-checking. Never run
-the same `cargo test` command repeatedly without a code change in between.
+**Verification ladder:**
+
+1. **No code change / docs-only / comments-only**: no Cargo command required.
+   Say that verification was not run because no executable code changed.
+2. **Type-level, compile-risk, or mechanical refactor**: run the narrowest
+   relevant `cargo check` command.
+3. **Runtime behavior changed**: run the narrowest relevant existing test
+   (`cargo test ... test_name`) if one clearly covers the changed path.
+4. **Runtime behavior changed but no focused test exists**: run the narrowest
+   relevant `cargo check`, then explicitly say no targeted test was found. Do
+   not run broad tests just to satisfy this rule.
+5. **Bug fix with a known regression test or newly added test**: run that named
+   test. If it fails, fix the code and re-run the same test after the code
+   change.
+
+**Do not run tests speculatively.** Prefer reading the affected code and locating
+an existing focused test before choosing a Cargo command.
+
+**Avoid repeated test loops.** Never run the same `cargo test` command repeatedly
+without a code change in between. After one successful focused test, stop unless
+the user asks for broader verification.
 
 ## Global Engineering Rules
 

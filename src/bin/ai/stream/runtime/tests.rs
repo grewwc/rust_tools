@@ -24,6 +24,26 @@ fn prompt_cache_metrics_reports_hit_rate() {
 }
 
 #[test]
+fn degenerate_reasoning_repetition_requires_three_long_contentful_copies() {
+    let phrase = "需要先确认当前上下文是否仍然有效，然后再继续执行。";
+    assert!(!has_degenerate_reasoning_repetition(&phrase.repeat(2)));
+    assert!(has_degenerate_reasoning_repetition(&phrase.repeat(3)));
+    assert!(!has_degenerate_reasoning_repetition(
+        &"----------------".repeat(3)
+    ));
+}
+
+#[test]
+fn degenerate_reasoning_repetition_detects_suffix_after_normal_progress() {
+    let phrase = "I need to inspect the existing implementation before changing it. ";
+    let reasoning = format!(
+        "First I will locate the relevant module. {}",
+        phrase.repeat(3)
+    );
+    assert!(has_degenerate_reasoning_repetition(&reasoning));
+}
+
+#[test]
 fn thinking_fold_defaults_to_configured_lines_for_tty() {
     assert_eq!(
         resolve_thinking_fold_max_visible_lines(true, None),

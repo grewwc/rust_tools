@@ -446,8 +446,8 @@ fn execute_content_text_search(
         context_lines: 2,
         max_results: 200,
         file_pattern,
-        // code_search 追求"最强代码搜索"：不按扩展名白名单过滤，覆盖面与
-        // text_grep 一致；调用方仍可用可选的 file_pattern 收窄范围。
+        // code_search 追求"最强代码搜索"：不按扩展名白名单过滤，覆盖面
+        // 与直接内容搜索一致；调用方仍可用可选的 file_pattern 收窄范围。
         extensions: None,
         display_root: Some(&cwd),
     };

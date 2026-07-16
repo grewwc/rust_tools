@@ -13,8 +13,9 @@ use std::{
 
 use super::super::persistence::persist_pending_turn_messages;
 use super::super::{
-    MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS, max_tool_result_inline_chars,
+    MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
     iteration::no_tool_handoff_note,
+    max_tool_result_inline_chars,
     types::{IterationExecution, PreparedToolResult, ToolCallExecution, TurnLoopStep},
 };
 use super::{
@@ -792,7 +793,10 @@ fn clear_no_tool_handoff_note(messages: &mut Vec<Message>) {
     });
 }
 
-fn reopen_turn_for_outstanding_subagent_tasks(messages: &mut Vec<Message>, session_id: &str) -> bool {
+fn reopen_turn_for_outstanding_subagent_tasks(
+    messages: &mut Vec<Message>,
+    session_id: &str,
+) -> bool {
     let outstanding_anchor = match task_tools::build_outstanding_task_anchor(session_id) {
         Ok(Some(note)) => note,
         Ok(None) => return false,
@@ -838,6 +842,8 @@ fn requested_only_discover_skills(tool_calls: &[ToolCall]) -> bool {
 }
 
 const TRUNCATION_RETRY_NOTE_PREFIX: &str = "tool_followup:output_truncated\n";
+const DEGENERATE_REPETITION_RETRY_NOTE_PREFIX: &str = "tool_followup:degenerate_repetition\n";
+const DEGENERATE_REPETITION_FINISH_REASON: &str = "degenerate_repetition";
 
 /// 在检测到本轮响应被截断后，把已产出的可见文本（若有）作为部分进展保留，并追加
 /// 一条收缩重写提示，指导模型下一轮缩小单次输出规模后重发被截断的操作。
@@ -849,6 +855,11 @@ fn append_truncation_retry_note(
     consecutive_truncations: usize,
 ) {
     use serde_json::Value;
+
+    let degenerate_repetition = stream_result
+        .finish_reason_value
+        .as_deref()
+        .is_some_and(|reason| reason == DEGENERATE_REPETITION_FINISH_REASON);
 
     // 保留模型已输出的可见文本作为"部分进展"，让重试时不至于完全丢失上下文。
     // 截断场景下这段文本往往是半截的意图说明，仅作参考，不当作最终回答。
@@ -869,18 +880,37 @@ fn append_truncation_retry_note(
         });
     }
 
-    // 移除上一轮的截断提示（如有），替换为携带最新计数的新提示。
+    // 移除上一轮的截断/重复退化提示（如有），替换为携带最新计数的新提示。
     // 早期版本是幂等的——只注入一次后跳过。但连续截断时模型得不到
     // "已再次截断"的反馈，只看到和上次一样的上下文，大概率产出相似
     // 长度的内容再被截断，陷入盲循环。改为每次更新计数，让模型感知
     // 到严重程度在递增。
     messages.retain(|message| {
         !(message.role == ROLE_INTERNAL_NOTE
-            && message
-                .content
-                .as_str()
-                .is_some_and(|content| content.starts_with(TRUNCATION_RETRY_NOTE_PREFIX)))
+            && message.content.as_str().is_some_and(|content| {
+                content.starts_with(TRUNCATION_RETRY_NOTE_PREFIX)
+                    || content.starts_with(DEGENERATE_REPETITION_RETRY_NOTE_PREFIX)
+            }))
     });
+
+    if degenerate_repetition {
+        let note = format!(
+            "{}上一轮推理流出现了连续重复片段，运行时已提前终止该次生成，避免继续消耗 token。\n\
+             不要续写或复述那段推理。请从最近的工具结果重新判断当前状态：\n\
+             - 不要重试已被策略拒绝的同一命令；改用当前可用的专用工具；\n\
+             - 只执行完成任务所需的下一步，避免重复搜索或重复解释；\n\
+             - 若已有足够证据，直接给出结论。",
+            DEGENERATE_REPETITION_RETRY_NOTE_PREFIX
+        );
+        messages.push(Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(note),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        return;
+    }
 
     let mut note = String::from(TRUNCATION_RETRY_NOTE_PREFIX);
     if consecutive_truncations > 1 {
@@ -1056,12 +1086,23 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 // 简单重试即可。日志已在 orchestrator 层打印。
                 Ok(TurnLoopStep::Continue)
             } else {
-                // 真截断：模型撞输出上限或工具 JSON 半截。保留已产出的
-                // 可见文本作为上下文，并注入一条收缩重写提示后自动重试。
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "  ⚠ 模型响应被截断（疑似输出上限），提示收缩后自动重试…"
-                );
+                let degenerate_repetition = stream_result
+                    .finish_reason_value
+                    .as_deref()
+                    .is_some_and(|reason| reason == DEGENERATE_REPETITION_FINISH_REASON);
+                if degenerate_repetition {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ⚠ 检测到模型推理内容持续重复，已中止本次生成并纠偏重试…"
+                    );
+                } else {
+                    // 真截断：模型撞输出上限或工具 JSON 半截。保留已产出的
+                    // 可见文本作为上下文，并注入一条收缩重写提示后自动重试。
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ⚠ 模型响应被截断（疑似输出上限），提示收缩后自动重试…"
+                    );
+                }
                 // 打印截断诊断信息，便于排查截断原因。
                 let partial = stream_result.assistant_text.trim();
                 let reasoning = stream_result.reasoning_text.trim();
@@ -1888,8 +1929,13 @@ mod tests {
         let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
         let (pid, result_channel_id) = {
             let mut os = app.os.lock().unwrap();
-            let pid =
-                os.begin_foreground("child".to_string(), "goal".to_string(), 10, usize::MAX, None);
+            let pid = os.begin_foreground(
+                "child".to_string(),
+                "goal".to_string(),
+                10,
+                usize::MAX,
+                None,
+            );
             let channel = os.channel_create(Some(pid), 1, "task-result".to_string());
             (pid, channel.raw())
         };
@@ -1912,7 +1958,8 @@ mod tests {
             },
         );
 
-        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let shared_mcp =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
         let mut messages = vec![Message {
             role: ROLE_INTERNAL_NOTE.to_string(),
             content: Value::String(no_tool_handoff_note().to_string()),
@@ -1999,8 +2046,13 @@ mod tests {
         let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
         let (pid, result_channel_id) = {
             let mut os = app.os.lock().unwrap();
-            let pid =
-                os.begin_foreground("child".to_string(), "goal".to_string(), 10, usize::MAX, None);
+            let pid = os.begin_foreground(
+                "child".to_string(),
+                "goal".to_string(),
+                10,
+                usize::MAX,
+                None,
+            );
             let channel = os.channel_create(Some(pid), 1, "task-result".to_string());
             (pid, channel.raw())
         };
@@ -2023,7 +2075,8 @@ mod tests {
             },
         );
 
-        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let shared_mcp =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
         let mut messages = Vec::new();
         let mut turn_messages = Vec::new();
         let mut persisted_turn_messages = 0usize;

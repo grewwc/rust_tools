@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor,
@@ -52,6 +52,18 @@ fn clear_inline_viewport_preserving_cursor<B: ratatui::backend::Backend>(
     if let Some(cursor_before_clear) = cursor_before_clear {
         let _ = terminal.set_cursor_position(cursor_before_clear);
     }
+}
+
+fn move_cursor_to_viewport_bottom<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    viewport_top_row: u16,
+    viewport_height: u16,
+) {
+    let mut bottom_row = viewport_top_row.saturating_add(viewport_height.saturating_sub(1));
+    if let Ok(size) = terminal.size() {
+        bottom_row = bottom_row.min(size.height.saturating_sub(1));
+    }
+    let _ = terminal.set_cursor_position((0, bottom_row));
 }
 
 fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
@@ -122,7 +134,11 @@ fn resize_inline_viewport(terminal: &mut MultilineTerminal, new_height: u16) -> 
 /// 处理 `Event::Resize` 连续触发的情况：终端窗口拖动时 Resize 事件会快速连发，
 /// 如果每次都重绘 inline viewport，会导致"画面撕裂"或闪烁。
 /// 本函数先 drain 掉后续堆积的 Resize 事件，再做一次 full redraw。
-fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
+fn handle_resize_burst<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    last_viewport_top_row: Option<u16>,
+    viewport_height: u16,
+) -> io::Result<()> {
     // 1) drain 掉所有后续的 Resize 事件，避免重复触发重绘
     while event::poll(Duration::ZERO).unwrap_or(false) {
         match event::read() {
@@ -134,14 +150,18 @@ fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>)
     }
 
     // 2) 先按 ratatui 记录的旧 inline viewport 擦掉上一帧，再通知 ratatui
-    //    终端尺寸已变化（宽度变化影响文本折行）。如果先 autoresize，inline
-    //    viewport 可能为了重新锚定而 append_lines，把上一帧的 model/help 行推入
-    //    VSCode/Trae 终端 scrollback；之后再 clear 只能擦到新 viewport，旧内容就会
-    //    形成重复渲染。最后再擦一次新 viewport，保证下一帧从干净区域重绘。
-    //    不手动 MoveUp + Clear：viewport_height 是启动时快照，resize 后手动行数
-    //    与 ratatui 内部光标状态不一致，容易清错区域。
+    //    终端尺寸已变化（宽度变化影响文本折行）。inline autoresize 会按
+    //    last_known_cursor_pos 相对旧 viewport 的行偏移重新锚定；编辑态真实光标
+    //    通常在 textarea 第一行，下面还有 model/help。如果直接 autoresize，ratatui
+    //    会 append_lines 保留“光标下方行数”，把上一帧的 model/help 推入
+    //    VSCode/Trae 终端 scrollback，形成重复渲染。清旧 viewport 后把 cursor
+    //    临时钉到上一帧 viewport 底部，让 autoresize 的“光标下方行数”为 0。
+    //    下一轮 draw 会重新把 cursor 放回 textarea 的真实编辑位置。
     let _ = terminal.hide_cursor();
     clear_inline_viewport_preserving_cursor(terminal);
+    if let Some(top_row) = last_viewport_top_row {
+        move_cursor_to_viewport_bottom(terminal, top_row, viewport_height.max(1));
+    }
     let _ = terminal.autoresize();
     clear_inline_viewport_preserving_cursor(terminal);
     Ok(())
@@ -199,6 +219,7 @@ impl PromptEditor {
         // 退出时按“最后一次实际渲染到哪里”来清理 viewport；不能依赖创建 Terminal
         // 那一刻的 cursor 位置，因为补全面板/textarea 扩容会重建 inline viewport。
         let mut last_viewport_top_row: Option<u16> = None;
+        let mut last_viewport_height = base_viewport_height;
 
         let result: io::Result<Option<String>> = (|| {
             // 预填内容（编辑已有 memo 场景）：按行载入 textarea，读取后清空。
@@ -211,12 +232,26 @@ impl PromptEditor {
             let mut pending_tab_completion: Option<PendingTabCompletion> = None;
             let mut completion_panel: Option<CompletionPanel> = None;
             let mut recent_text_input: Option<RecentTextInput> = None;
+            let mut generated_title_seen = false;
+            let mut next_title_refresh = Instant::now();
             // 记录当前 viewport 已适配的补全候选数：None 表示无面板（base 高度）。
             // 面板出现/消失/候选数变化时，据此重建 viewport 让面板获得足够高度，
             // 而输入框行数保持不变。
             let mut fitted_completion_items: Option<usize> = None;
 
             loop {
+                // 首轮 user message 落盘后，session 标题会在后台生成。输入框已经打开时
+                // 不能只依赖下一轮 prompt 初始化，否则底部会一直停留在首条消息摘要。
+                if !generated_title_seen {
+                    let now = Instant::now();
+                    if now >= next_title_refresh {
+                        if let Ok(Some(_)) = self.refresh_generated_session_topic() {
+                            generated_title_seen = true;
+                        }
+                        next_title_refresh = now + Duration::from_millis(500);
+                    }
+                }
+
                 // 面板状态变化时，重建 inline viewport 以匹配面板所需高度。
                 let current_items = completion_panel.as_ref().map(|p| p.items.len());
                 if current_items != fitted_completion_items {
@@ -248,7 +283,9 @@ impl PromptEditor {
 
                 terminal
                     .draw(|f| {
-                        last_viewport_top_row = Some(f.area().y);
+                        let area = f.area();
+                        last_viewport_top_row = Some(area.y);
+                        last_viewport_height = area.height;
                         render_multiline_popup(
                             f,
                             &mut textarea,
@@ -260,9 +297,18 @@ impl PromptEditor {
                     })
                     .map_err(|e| io::Error::other(e.to_string()))?;
 
+                if !event::poll(Duration::from_millis(250))
+                    .map_err(|e| io::Error::other(e.to_string()))?
+                {
+                    continue;
+                }
                 let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
                 if let Event::Resize(_, _) = &event {
-                    handle_resize_burst(&mut terminal)?;
+                    handle_resize_burst(
+                        &mut terminal,
+                        last_viewport_top_row,
+                        last_viewport_height,
+                    )?;
                 }
 
                 match handle_multiline_event(

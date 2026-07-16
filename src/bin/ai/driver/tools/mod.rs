@@ -217,29 +217,11 @@ fn equivalent_tools(
         }],
         "code_search" => &[
             ToolAlternative {
-                name: "text_grep",
-                description: "regex over file contents",
-            },
-            ToolAlternative {
-                name: "find_path",
-                description: "filename or glob match",
-            },
-        ],
-        "text_grep" => &[
-            ToolAlternative {
-                name: "code_search",
-                description: "semantic or structural search",
-            },
-            ToolAlternative {
                 name: "find_path",
                 description: "filename or glob match",
             },
         ],
         "find_path" => &[
-            ToolAlternative {
-                name: "text_grep",
-                description: "content search",
-            },
             ToolAlternative {
                 name: "code_search",
                 description: "semantic or structural search",

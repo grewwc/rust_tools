@@ -41,6 +41,11 @@ fn params_semantic_search() -> Value {
 }
 
 fn execute_semantic_search(args: &Value) -> Result<String, String> {
+    // 确保 embedding provider 已初始化（与 note_search 一致：在入口处调用 warm_up）。
+    // GLOBAL_PROVIDER 是 OnceLock，重复调用无副作用；未配置 key 时 is_ready() 仍为 false，
+    // 下面会自动降级为 BM25/lexical 检索。
+    crate::ai::knowledge::indexing::embedder::warm_up();
+
     ensure_rag_store()?;
     let guard = get_rag_store()?;
     let store = guard.as_ref().ok_or("RAG store not initialized")?;
@@ -180,6 +185,17 @@ fn params_rebuild_index() -> Value {
 }
 
 fn execute_rebuild_index(_args: &Value) -> Result<String, String> {
+    // 确保 embedding provider 已初始化（与 note_search / semantic_search 一致）。
+    // 向量索引重建本质上依赖 embedding，无法降级；未配置 key 时给出明确提示。
+    crate::ai::knowledge::indexing::embedder::warm_up();
+    if !crate::ai::knowledge::indexing::embedder::is_ready() {
+        return Err(
+            "Embedding provider not available — vector index rebuild requires embeddings. \
+             Configure embedding.api_key (or model.aliyun_api_key) to enable."
+                .to_string(),
+        );
+    }
+
     ensure_rag_store()?;
     let guard = get_rag_store()?;
     let store = guard.as_ref().ok_or("RAG store not initialized")?;

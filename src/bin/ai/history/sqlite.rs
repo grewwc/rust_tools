@@ -652,6 +652,7 @@ pub(in crate::ai) fn read_session_title_sqlite(path: &Path) -> io::Result<Option
 /// 写入 LLM 生成的 session 标题到 meta 表。
 pub(in crate::ai) fn write_session_title_sqlite(path: &Path, title: &str) -> io::Result<()> {
     let conn = open_history_db(path)?;
+    init_history_schema(&conn)?;
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES ('session_title', ?1, unixepoch())",
         rusqlite::params![title],

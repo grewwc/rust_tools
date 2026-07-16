@@ -634,7 +634,7 @@ mod history_policy_tests {
 
     #[test]
     fn read_and_search_tools_block_lossy_but_allow_prune() {
-        for name in ["read_file", "find_path", "text_grep", "code_search"] {
+        for name in ["read_file", "find_path", "code_search"] {
             let policy = tool_history_policy(name);
             assert!(
                 !policy.allows_lossy_compress(),

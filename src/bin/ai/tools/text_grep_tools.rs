@@ -3,12 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use regex::{Regex, RegexBuilder};
+#[cfg(test)]
 use serde_json::Value;
-
-use crate::ai::tools::common::{
-    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
-    ToolRegistration, ToolSpec,
-};
 
 const MAX_OUTPUT_CHARS: usize = 32_000;
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
@@ -70,15 +66,15 @@ pub(crate) fn validate_search_root(root: &Path, cwd: &Path) -> Result<(), String
 // ============================================================================
 // 共享内容搜索引擎
 //
-// `run_content_search` 是 text_grep 与 code_search.text_search 共用的内容搜索
-// 核心：BFS 递归收集文件 → 逐行正则匹配 → 相关性重排 → 按文件聚合（每文件
+// `run_content_search` 是 code_search.text_search operation 调用的内容搜索核心：
+// BFS 递归收集文件 → 逐行正则匹配 → 相关性重排 → 按文件聚合（每文件
 // top-N snippet + context + `>` 标记匹配行）。
 //
 // 设计要点：
 // - 文件收集走 BFS（保留 `*.rs` 递归语义；`terminalw::glob_paths` 非递归，
 //   不能直接替代）。
-// - `extensions=None` 表示不按扩展名过滤（text_grep 的默认行为）；
-//   `Some(&[...])` 表示只搜白名单扩展名（旧 code_search 行为，但现在默认放开）。
+// - `extensions=None` 表示不按扩展名过滤（text_search 的默认行为）；
+//   `Some(&[...])` 表示只搜白名单扩展名（保留给未来按语言过滤用）。
 // - 相关性评分：whole-word 命中 > 子串命中；大小写一致优先；命中出现在
 //   文件名/路径中的文件整体加权；行内匹配靠前的优先。
 // ============================================================================
@@ -598,68 +594,10 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
     out
 }
 
-// ============================================================================
-// text_grep 工具注册与入口
-// ============================================================================
-
-fn params_text_grep() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "pattern": {
-                "type": "string",
-                "description": "Search pattern (literal substring by default, or regex when is_regex=true)."
-            },
-            "path": {
-                "type": "string",
-                "description": "Root directory or file to search in. Defaults to the current project (\".\"). Passing the filesystem root \"/\" or system paths like \"/System\", \"/Library\", \"/usr\" is rejected. Prefer a relative path or a subdirectory of the project."
-            },
-            "file_pattern": {
-                "type": "string",
-                "description": "Optional glob to filter files (e.g. \"*.rs\", \"*.{ts,tsx}\")."
-            },
-            "is_regex": {
-                "type": "boolean",
-                "description": "Treat pattern as a regular expression (default: false)."
-            },
-            "case_sensitive": {
-                "type": "boolean",
-                "description": "Case-sensitive matching (default: true)."
-            },
-            "context_lines": {
-                "type": "integer",
-                "description": "Number of context lines before and after each match (default: 2, max: 5)."
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Maximum number of matching lines to return (default: 50, max: 200)."
-            }
-        },
-        "required": ["pattern"]
-    })
-}
-
-inventory::submit!(ToolRegistration {
-    spec: ToolSpec {
-        name: "text_grep",
-        description: "Search file contents for a pattern (literal or regex) under a directory. Returns matching lines grouped by file with line numbers and configurable context, ranked by relevance (whole-word and filename/path hits first). Respects .gitignore-style skip directories. Use this when you need to find where specific text or patterns appear in source code.",
-        parameters: params_text_grep,
-        execute: execute_text_grep,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
-        groups: &["builtin", "core"],
-    }
-});
-
-// text_grep 是检索类结果：复现代价高，禁止有损压缩；过时旧结果允许被 LLM 裁剪。
-inventory::submit!(ToolHistoryPolicyRegistration {
-    name: "text_grep",
-    policy: ToolHistoryPolicy {
-        lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Allow,
-    },
-});
-
-pub(crate) fn execute_text_grep(args: &Value) -> Result<String, String> {
+// execute_text_grep 保留为测试专用入口：text_grep 工具已退役，但共享引擎
+// run_content_search 的回归测试仍通过这条 arg-parsing 路径驱动。
+#[cfg(test)]
+fn execute_text_grep(args: &Value) -> Result<String, String> {
     let pattern = args["pattern"]
         .as_str()
         .ok_or("Missing 'pattern' parameter")?;

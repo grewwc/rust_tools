@@ -41,6 +41,12 @@ const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
 /// terminal 下 thinking 可见窗口的默认高度。只影响展示，不影响 reasoning 累积。
 const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 4;
+/// 推理流连续重复的最短片段和判定次数。只检测 reasoning，避免把用户要求生成的重复
+/// 正文（表格、代码、测试数据等）误判为模型退化。
+const MIN_REASONING_REPEAT_CHARS: usize = 16;
+const MAX_REASONING_REPEAT_CHARS: usize = 512;
+const REASONING_REPEAT_COUNT: usize = 3;
+const DEGENERATE_REPETITION_FINISH_REASON: &str = "degenerate_repetition";
 
 pub(super) async fn stream_response(
     app: &mut App,
@@ -423,6 +429,11 @@ fn finalize_stream_response(
         .finish_reason_value
         .as_deref()
         .is_some_and(|reason| reason.eq_ignore_ascii_case("length"));
+    let degenerate_repetition = state
+        .content
+        .finish_reason_value
+        .as_deref()
+        .is_some_and(|reason| reason == DEGENERATE_REPETITION_FINISH_REASON);
 
     let outcome = if !tool_calls.is_empty() {
         StreamOutcome::ToolCall
@@ -438,7 +449,9 @@ fn finalize_stream_response(
         // assistant_text 实际上已完整。若同时有可见文本和 finish_reason=length，按
         // Completed 处理，避免无意义的重试循环。只有在完全没有可见输出时，length 截断
         // 才作为 Truncated 重试（此时模型可能刚开始输出就被掐断）。
-        if state.content.dropped_malformed_tool_call {
+        if degenerate_repetition {
+            StreamOutcome::Truncated
+        } else if state.content.dropped_malformed_tool_call {
             StreamOutcome::Truncated
         } else if truncated_by_length && !has_text {
             // finish_reason=length 且没有可见文本：模型可能只产出了 reasoning
@@ -1273,6 +1286,16 @@ fn process_stream_payload(
                 .content
                 .reasoning_text
                 .push_str(&choice.delta.reasoning_content);
+
+            // 某些长工具链上下文会诱发模型在 thinking 中逐字复读同一句话。继续读取只会
+            // 消耗输出预算并让终端看似卡死；升级为可重试截断，交给上层降低推理档位。
+            if has_degenerate_reasoning_repetition(&state.content.reasoning_text) {
+                state.content.finish_reason_seen = true;
+                state.content.finish_reason_value =
+                    Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
+                eprintln!("\n  ⚠ 检测到模型推理重复循环，停止当前响应并自动重试…");
+                return Ok(true);
+            }
         }
     }
 
@@ -1320,6 +1343,41 @@ fn process_stream_payload(
     // short post-finish grace window expires. Some providers can set
     // finish_reason before all visible content chunks are delivered.
     Ok(false)
+}
+
+/// 检测 reasoning 尾部是否出现三次连续、完全相同的长片段。
+///
+/// 使用字符而非字节比较以正确处理中文；要求片段包含足够多的字母、数字或中文等实际
+/// 内容，避免把分隔线、空白或 Markdown 标点误判为退化循环。
+fn has_degenerate_reasoning_repetition(text: &str) -> bool {
+    // 每个流 chunk 都会调用该检测，因此只保留足以覆盖最大候选片段的尾部，避免长推理
+    // 随上下文增长退化成反复扫描整段文本。
+    let mut chars = text
+        .chars()
+        .rev()
+        .take(MAX_REASONING_REPEAT_CHARS * REASONING_REPEAT_COUNT)
+        .collect::<Vec<_>>();
+    chars.reverse();
+    let max_pattern_len = (chars.len() / REASONING_REPEAT_COUNT).min(MAX_REASONING_REPEAT_CHARS);
+    if max_pattern_len < MIN_REASONING_REPEAT_CHARS {
+        return false;
+    }
+
+    for pattern_len in MIN_REASONING_REPEAT_CHARS..=max_pattern_len {
+        let repeated_len = pattern_len * REASONING_REPEAT_COUNT;
+        let repeated = &chars[chars.len() - repeated_len..];
+        let pattern = &repeated[..pattern_len];
+        if pattern.iter().filter(|ch| ch.is_alphanumeric()).count() < MIN_REASONING_REPEAT_CHARS / 2
+        {
+            continue;
+        }
+        if repeated[pattern_len..pattern_len * 2] == *pattern
+            && repeated[pattern_len * 2..] == *pattern
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
