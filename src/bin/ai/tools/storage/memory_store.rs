@@ -1866,7 +1866,10 @@ mod retention_tests {
             .to_string();
 
         // 主文件：1 条 memo
-        write_lines(&path, &[entry("memo", "main memo", "2026-07-16T00:00:00Z", 100)]);
+        write_lines(
+            &path,
+            &[entry("memo", "main memo", "2026-07-16T00:00:00Z", 100)],
+        );
 
         // 创建 5 个归档文件（超出默认 keep_last_archives=3 窗口）。
         // 最旧归档中放 "二次分析"，模拟被 rotation 移走的用户记录。
@@ -1883,7 +1886,9 @@ mod retention_tests {
             write_lines(&ap, &[entry("memo", note, "2026-07-01T00:00:00Z", 100)]);
             // 设置递增 mtime，确保排序确定（最旧 -> 最新）
             let mut times = std::fs::FileTimes::new();
-            times.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + i as u64));
+            times.set_modified(
+                UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + i as u64),
+            );
             std::fs::File::open(&ap).unwrap().set_times(times).unwrap();
             archive_paths.push(ap);
         }

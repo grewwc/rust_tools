@@ -14,14 +14,14 @@ fn params_apply_patch() -> Value {
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "Preferred absolute path to the file to patch (some sensitive paths are blocked). The runtime also accepts `path` as a compatibility alias."
+                "description": "Preferred absolute path to the file to patch (some sensitive paths are blocked). Optional when the patch is wrapped in a single-file `*** Begin Patch` envelope that already names the target. The runtime also accepts `path` as a compatibility alias."
             },
             "patch": {
                 "type": "string",
-                "description": "Patch text. Accepted formats: raw unified-diff hunks starting with @@, or a single-file `*** Begin Patch` envelope with `*** Update File:` / `*** Add File:`. In unified-diff hunks every content line MUST start with a prefix: ` ` (space) for context, `-` for removal, `+` for addition; do NOT wrap the patch in a code fence and do NOT copy line-number prefixes from read tools."
+                "description": "Patch text. Accepted formats: raw unified-diff hunks starting with @@, or a single-file `*** Begin Patch` envelope with `*** Update File:` / `*** Add File:` / `*** Replace in line:`. In unified-diff hunks every content line MUST start with a prefix: ` ` (space) for context, `-` for removal, `+` for addition; do NOT wrap the patch in a code fence and do NOT copy line-number prefixes from read tools."
             }
         },
-        "required": ["file_path", "patch"]
+        "required": ["patch"]
     })
 }
 
@@ -58,6 +58,9 @@ enum UnifiedLine {
 enum PatchEnvelopeOp {
     Update,
     Add,
+    /// 行内子串替换：用 `anchor:` 定位行，在该行内将 `old:` 精确替换为 `new:`。
+    /// 不走 unified-diff 路径，由 `apply_inline_replace` 直接处理。
+    ReplaceInLine,
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +73,10 @@ struct PatchEnvelope {
 fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
     let mut hunks = Vec::new();
     let mut iter = patch.lines().peekable();
+    let mut patch_line_no: usize = 0; // 1-based，用于错误信息定位
     let mut saw_content_before_header = false;
     while let Some(line) = iter.next() {
+        patch_line_no += 1;
         let Some(rest) = line.strip_prefix("@@") else {
             if hunks.is_empty()
                 && (line.starts_with('+')
@@ -104,6 +109,7 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
                 break;
             }
             let l = iter.next().unwrap_or_default();
+            patch_line_no += 1;
             if l.starts_with("\\ No newline at end of file") {
                 continue;
             }
@@ -116,7 +122,7 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             let mut chars = l.chars();
             let prefix = chars
                 .next()
-                .ok_or_else(|| "invalid hunk line: empty".to_string())?;
+                .ok_or_else(|| format!("invalid hunk line at patch line {patch_line_no}: empty"))?;
             // 容忍 CRLF：剥离行尾 \r，避免 Add 行把 \r 写入文件内容。
             let body = chars.as_str().strip_suffix('\r').unwrap_or(chars.as_str());
             match prefix {
@@ -125,7 +131,7 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
                 '+' => lines.push(UnifiedLine::Add(body.to_string())),
                 _ => {
                     return Err(format!(
-                        "invalid hunk line: every line in a hunk must start with ` ` (context), `-` (remove), or `+` (add), but got: {:?}",
+                        "invalid hunk line at patch line {patch_line_no}: every line in a hunk must start with ` ` (context), `-` (remove), or `+` (add), but got: {:?}",
                         l
                     ));
                 }
@@ -156,37 +162,11 @@ fn optional_file_path_arg(args: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn normalize_lexical(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            std::path::Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
-}
-
-fn effective_base_dir() -> PathBuf {
-    crate::ai::driver::runtime_ctx::effective_cwd()
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-}
-
-fn resolve_patch_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return normalize_lexical(path);
-    }
-    normalize_lexical(&effective_base_dir().join(path))
-}
-
 fn ensure_patch_target_matches(target_path: &Path, envelope_path: &str) -> Result<(), String> {
-    let resolved_target = resolve_patch_path(target_path);
-    let resolved_envelope = resolve_patch_path(Path::new(envelope_path));
+    let resolved_target = FileStore::new(target_path.to_path_buf()).path().to_path_buf();
+    let resolved_envelope = FileStore::new(PathBuf::from(envelope_path))
+        .path()
+        .to_path_buf();
     if resolved_target == resolved_envelope {
         return Ok(());
     }
@@ -213,11 +193,15 @@ fn parse_patch_envelope(patch: &str) -> Result<Option<PatchEnvelope>, String> {
         (PatchEnvelopeOp::Update, path.trim())
     } else if let Some(path) = header.strip_prefix("*** Add File: ") {
         (PatchEnvelopeOp::Add, path.trim())
+    } else if let Some(path) = header.strip_prefix("*** Replace in line: ") {
+        (PatchEnvelopeOp::ReplaceInLine, path.trim())
     } else if header.starts_with("*** Delete File: ") {
         return Err("apply_patch does not support Delete File envelopes".to_string());
     } else {
         return Err(
-            "invalid patch envelope: expected `*** Update File:` or `*** Add File:`".to_string(),
+            "invalid patch envelope: expected `*** Update File:`, `*** Add File:`, \
+             or `*** Replace in line:`"
+                .to_string(),
         );
     };
 
@@ -233,6 +217,7 @@ fn parse_patch_envelope(patch: &str) -> Result<Option<PatchEnvelope>, String> {
         }
         if line.starts_with("*** Update File: ")
             || line.starts_with("*** Add File: ")
+            || line.starts_with("*** Replace in line: ")
             || line.starts_with("*** Delete File: ")
         {
             return Err(
@@ -258,7 +243,23 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
 
     ensure_patch_target_matches(path, &envelope.target_path)?;
     let normalized_patch = match envelope.op {
+        PatchEnvelopeOp::ReplaceInLine => {
+            // ReplaceInLine 不走 unified-diff 路径，由 apply_inline_replace 直接处理。
+            // 走到这里说明 execute_apply_patch 的分流逻辑有 bug——提前返回明确错误，
+            // 避免被当成 unified-diff 误处理（那会把 anchor:/old:/new: 当 context 行）。
+            return Err(
+                "internal error: ReplaceInLine envelope should be handled by \
+                 apply_inline_replace, not normalize_patch_text"
+                    .to_string(),
+            );
+        }
         PatchEnvelopeOp::Update => {
+            if !path.exists() {
+                return Err(format!(
+                    "Update File patch targets a missing file: {}. Use Add File to create a new file, or correct the target path before retrying.",
+                    path.display()
+                ));
+            }
             // *** Begin Patch 的 Update 格式允许省略 hunk header（Cursor/Aider 风格），
             // 模型常只写 +/−/space 前缀行而不带 hunk header。如果 body 中没有任何
             // hunk header，合成一个，让 parse_unified_hunks 能识别。old_start=0 表示
@@ -272,7 +273,9 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
                 .map(|line| {
                     if line.starts_with("@@") || line.is_empty() {
                         line.clone()
-                    } else if line.starts_with('+') || line.starts_with('-') || line.starts_with(' ')
+                    } else if line.starts_with('+')
+                        || line.starts_with('-')
+                        || line.starts_with(' ')
                     {
                         line.clone()
                     } else {
@@ -316,7 +319,7 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
                         "invalid Add File line: {:?}. Every content line in an Add File envelope must \
                          start with `+`. Hint: prefix each file line with `+`, or use `*** Update File` \
                          with a unified diff hunk instead.",
-                         line
+                        line
                     ));
                 }
             }
@@ -329,6 +332,141 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
         }
     };
     Ok((envelope.target_path, normalized_patch))
+}
+
+/// 行内子串替换：用 `anchor:` 定位行，在该行内将 `old:` 精确替换为 `new:`。
+///
+/// 专为"长单行字符串里换几个词"这种最常见的编辑场景设计，避免整行重写。
+///
+/// 安全设计（杜绝"执行成功但替换错位置"）：
+/// - `anchor` 用归一化子串匹配（容忍 confusable）定位行，但**只用于定位**；
+/// - `old` 用**精确**子串匹配（不归一化）确定替换的 byte range，杜绝位置偏移；
+/// - `anchor` 必须唯一匹配到一行，否则报错（避免改错地方）；
+/// - `old` 必须在该行中唯一出现，否则报错（避免改错位置）；
+/// - 若 `old == new`（替换前后相同），报错提示无操作，避免误以为成功。
+fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<String, String> {
+    // --- 解析 anchor / old / new 三个字段 ---
+    let mut anchor: Option<String> = None;
+    let mut old: Option<String> = None;
+    let mut new: Option<String> = None;
+    for line in &envelope.body_lines {
+        if let Some(rest) = line.strip_prefix("anchor: ") {
+            anchor = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("old: ") {
+            old = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("new: ") {
+            new = Some(rest.to_string());
+        }
+        // 忽略无关行（空行、注释等），保持宽容
+    }
+    let anchor = anchor.ok_or_else(|| {
+        "Replace in line: missing `anchor:` field. \
+         Expected `anchor: <unique substring of target line>`."
+            .to_string()
+    })?;
+    let old = old.ok_or_else(|| {
+        "Replace in line: missing `old:` field. \
+         Expected `old: <exact substring to replace>`."
+            .to_string()
+    })?;
+    let new = new.ok_or_else(|| {
+        "Replace in line: missing `new:` field. \
+         Expected `new: <replacement substring>`."
+            .to_string()
+    })?;
+    if old.is_empty() {
+        return Err("Replace in line: `old` field must not be empty.".to_string());
+    }
+    if old == new {
+        return Err(format!(
+            "Replace in line: `old` and `new` are identical ({:?}). \
+             Nothing would change; fix the patch or remove it.",
+            old
+        ));
+    }
+
+    // --- 用归一化子串匹配定位行（容忍 confusable），但只用于定位 ---
+    let norm_anchor = normalize_confusables(&anchor);
+    let matched_lines: Vec<usize> = original
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| normalize_confusables(line).contains(norm_anchor.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+
+    let line_idx = match matched_lines.len() {
+        0 => {
+            return Err(format!(
+                "Replace in line: anchor not found. \
+                 No line contains {:?} (after Unicode normalization).",
+                anchor
+            ));
+        }
+        1 => matched_lines[0],
+        n => {
+            let positions = matched_lines
+                .iter()
+                .map(|i| format!("{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Replace in line: anchor matched {n} lines (1-based: {positions}). \
+                 Anchor must uniquely identify one line. Make `anchor` more specific."
+            ));
+        }
+    };
+
+    let original_lines: Vec<&str> = original.lines().collect();
+    let target_line = original_lines[line_idx];
+
+    // --- old 用精确子串匹配确定替换位置（不归一化），杜绝位置偏移 ---
+    let occurrences: Vec<usize> = target_line.match_indices(&old).map(|(i, _)| i).collect();
+    let pos = match occurrences.len() {
+        0 => {
+            return Err(format!(
+                "Replace in line: `old` substring not found in matched line {}. \
+                 The anchor matched this line, but `old` must appear verbatim \
+                 (no Unicode normalization). Line content: {:?}",
+                line_idx + 1,
+                target_line
+            ));
+        }
+        1 => occurrences[0],
+        n => {
+            return Err(format!(
+                "Replace in line: `old` substring appears {n} times in line {}. \
+                 It must be unique within the line. Make `old` longer to disambiguate. \
+                 Line content: {:?}",
+                line_idx + 1,
+                target_line
+            ));
+        }
+    };
+
+    // 精确替换：byte range [pos, pos+old.len())。
+    // pos 是 str::find 返回的 byte index，old 是有效 UTF-8，
+    // 所以 pos 和 pos+old.len() 都在 char boundary 上，切片安全。
+    let replaced_line = format!(
+        "{}{}{}",
+        &target_line[..pos],
+        new,
+        &target_line[pos + old.len()..]
+    );
+
+    // 重建文件，保留原始行尾换行行为
+    let trailing_newline = original.ends_with('\n');
+    let mut result = String::with_capacity(original.len() + new.len());
+    for (i, line) in original_lines.iter().enumerate() {
+        if i == line_idx {
+            result.push_str(&replaced_line);
+        } else {
+            result.push_str(line);
+        }
+        if i < original_lines.len() - 1 || trailing_newline {
+            result.push('\n');
+        }
+    }
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,7 +509,31 @@ fn strip_line_number_prefix(s: &str) -> &str {
     s
 }
 
-fn lines_match(actual: &str, expected: &str, mode: MatchMode) -> bool {
+/// 将常见的 Unicode "confusable" 字符归一化为 ASCII 等价形式。
+///
+/// 仅用于 patch 匹配的 **定位判定**（lines_match），绝不参与输出内容构造。
+/// 处理的字符都是纯排版差异，不影响语义：
+/// - dash 系（— – ― 等）-> '-'
+/// - smart quotes（" " ' ' ‛ ‟）-> '"' / "'"
+/// - 不间断空格（NBSP U+00A0、NNBSP U+202F 等）-> 普通空格
+fn normalize_confusables(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            // --- dash 系 ---
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            // --- smart double quotes ---
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{2033}' => '"',
+            // --- smart single quotes ---
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2032}' => '\'',
+            // --- 不间断空格系 ---
+            '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{2060}' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+fn lines_match_exact(actual: &str, expected: &str, mode: MatchMode) -> bool {
     if actual == expected || actual.trim_end() == expected.trim_end() {
         return true;
     }
@@ -391,6 +553,35 @@ fn lines_match(actual: &str, expected: &str, mode: MatchMode) -> bool {
         MatchMode::IgnoreIndent => {
             // 同样剥离行号前缀再 trim，覆盖缩进+行号双重差异的场景。
             strip_line_number_prefix(actual).trim() == strip_line_number_prefix(expected).trim()
+        }
+    }
+}
+
+/// lines_match 的公共入口：先做精确匹配，失败后对 confusable 字符归一化再比较。
+///
+/// 归一化只影响"能否定位到"的判定。输出内容由 try_apply_hunk_at 构造：
+/// - Context 行输出 actual（原文件内容）
+/// - Remove 行匹配后丢弃
+/// - Add 行直接用 patch 内容
+/// 因此归一化匹配成功时，写入文件的仍是原文件的 Unicode 字符，不会"替换错内容"。
+fn lines_match(actual: &str, expected: &str, mode: MatchMode) -> bool {
+    if lines_match_exact(actual, expected, mode) {
+        return true;
+    }
+    let actual_n = normalize_confusables(actual);
+    let expected_n = normalize_confusables(expected);
+    if actual_n == expected_n || actual_n.trim_end() == expected_n.trim_end() {
+        return true;
+    }
+    match mode {
+        MatchMode::Strict => {
+            let a = strip_line_number_prefix(&actual_n);
+            let e = strip_line_number_prefix(&expected_n);
+            a == e || a.trim_end() == e.trim_end()
+        }
+        MatchMode::IgnoreIndent => {
+            strip_line_number_prefix(&actual_n).trim()
+                == strip_line_number_prefix(&expected_n).trim()
         }
     }
 }
@@ -1085,6 +1276,24 @@ pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
         .validate_write_access()
         .map_err(|err| err.to_string())?;
     let path = store.path().to_path_buf();
+    // ReplaceInLine 不走 unified-diff 路径，提前分流到 apply_inline_replace。
+    // 这样原有 unified-diff 逻辑完全不受影响，零回归风险。
+    if let Some(ref envelope) = envelope {
+        if envelope.op == PatchEnvelopeOp::ReplaceInLine {
+            ensure_patch_target_matches(&path, &envelope.target_path)?;
+            let original = if path.exists() {
+                store.read_to_string().map_err(|err| err.to_string())?
+            } else {
+                return Err(format!(
+                    "Replace in line: target file does not exist: {}",
+                    path.display()
+                ));
+            };
+            let next = apply_inline_replace(&original, envelope)?;
+            store.write_all(&next).map_err(|err| err.to_string())?;
+            return Ok(format!("Successfully patched {}", path.display()));
+        }
+    }
     let (_, normalized_patch) = if let Some(envelope) = envelope {
         ensure_patch_target_matches(&path, &envelope.target_path)?;
         normalize_patch_text(&path, &patch)?
@@ -1141,6 +1350,28 @@ pub(crate) fn execute_apply_patch_streaming(
         .map_err(|err| err.to_string())?;
 
     let path = store.path().to_path_buf();
+    // ReplaceInLine 不走 unified-diff 路径，提前分流到 apply_inline_replace。
+    if let Some(ref envelope) = envelope {
+        if envelope.op == PatchEnvelopeOp::ReplaceInLine {
+            ensure_patch_target_matches(&path, &envelope.target_path)?;
+            emit_stream_line(on_chunk, "applying inline replacement");
+            let original = if path.exists() {
+                emit_stream_line(on_chunk, "reading current file");
+                store.read_to_string().map_err(|err| err.to_string())?
+            } else {
+                return Err(format!(
+                    "Replace in line: target file does not exist: {}",
+                    path.display()
+                ));
+            };
+            let next = apply_inline_replace(&original, envelope)?;
+            emit_stream_line(on_chunk, &format!("writing {} byte(s)", next.len()));
+            store.write_all(&next).map_err(|err| err.to_string())?;
+            let result = format!("Successfully patched {}", path.display());
+            emit_stream_line(on_chunk, &result);
+            return Ok(result);
+        }
+    }
     let (_, normalized_patch) = if let Some(envelope) = envelope {
         ensure_patch_target_matches(&path, &envelope.target_path)?;
         normalize_patch_text(&path, &patch)?
@@ -1174,7 +1405,10 @@ pub(crate) fn execute_apply_patch_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_unified_patch, execute_apply_patch, parse_unified_hunks, strip_code_fence};
+    use super::{
+        PatchEnvelopeOp, apply_inline_replace, apply_unified_patch, execute_apply_patch,
+        parse_patch_envelope, parse_unified_hunks, strip_code_fence,
+    };
     use crate::ai::test_support::ENV_LOCK;
     use std::{fs, path::PathBuf};
 
@@ -1288,12 +1522,33 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_context_mismatch_reports_unicode_code_points() {
-        let original = "let quote = \"hi\";\n";
-        let patch = "@@ -1,1 +1,1 @@\n-let quote = “hi”;\n+let quote = \"changed\";\n";
+        // 用真正"非 confusable"的 Unicode 差异触发 mismatch，验证错误里回显 code point。
+        // 注意：smart quotes（U+201C/U+201D）与 ASCII 引号已由 normalize_confusables 归一化容忍
+        // （见 apply_unified_patch_tolerates_confusable_quotes），不能再当作 mismatch 样例。
+        // 这里用带重音字母 é (U+00E9) vs e (U+0065)--不在 confusable 归一化范围内，是真差异。
+        let original = "let label = \"café\";\n";
+        let patch = "@@ -1,1 +1,1 @@\n-let label = \"cafe\";\n+let label = \"changed\";\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("context mismatch"), "err was: {err}");
-        assert!(err.contains("U+201C"), "err was: {err}");
-        assert!(err.contains("U+0022"), "err was: {err}");
+        assert!(err.contains("U+00E9"), "err was: {err}");
+        assert!(err.contains("U+0065"), "err was: {err}");
+    }
+
+    #[test]
+    fn apply_unified_patch_tolerates_confusable_quotes() {
+        // P0: 模型常把 ASCII 引号/连字符自动替换为排版用 smart quote / en-dash。
+        // 这类纯排版差异不应导致 context mismatch--normalize_confusables 归一化后应能匹配。
+        // 关键安全属性：context 行输出原文件内容（actual），而非 patch 里的 smart quote，
+        // 所以文件里的 ASCII 字符不会被"替换"成 smart quote。
+        let original = "let quote = \"hi\";\nlet dash = a - b;\n";
+        // context 行用 smart quotes（“ ”），remove 行用 en-dash（– U+2013），
+        // 文件里对应是 ASCII 引号 / ASCII hyphen--归一化后均应匹配。
+        let patch = "@@ -1,2 +1,2 @@\n let quote = “hi”;\n-let dash = a – b;\n+let dash = a - b;\n";
+        let result = apply_unified_patch(original, patch)
+            .expect("confusable smart quotes / en-dash should be tolerated");
+        // context 行保留原文件 ASCII 引号；remove 的 en-dash 匹配文件 ASCII hyphen 后删除；
+        // add 行写入 patch 内容（ASCII hyphen）。
+        assert_eq!(result, "let quote = \"hi\";\nlet dash = a - b;\n");
     }
 
     #[test]
@@ -1636,6 +1891,63 @@ mod tests {
         });
 
         assert!(err.contains("patch target mismatch"), "err was: {err}");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_update_envelope_rejects_missing_target_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("update_missing_parent");
+        let path = base.join("missing.txt");
+        fs::create_dir_all(&base).unwrap();
+
+        let err = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {}\n+hello\n*** End Patch\n",
+                    path.display()
+                )
+            });
+            execute_apply_patch(&args).expect_err("Update File must not create a missing file")
+        });
+
+        assert!(
+            err.contains("Update File patch targets a missing file"),
+            "err was: {err}"
+        );
+        assert!(!path.exists(), "missing target must not be created");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_tilde_path_matches_between_arg_and_envelope() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME must be set"));
+        let unique = format!("ai_patch_tools_home_{}", uuid::Uuid::new_v4());
+        let base = home.join(&unique);
+        let path = base.join("tilde.txt");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "alpha\nbeta\n").unwrap();
+
+        let rel = path
+            .strip_prefix(&home)
+            .expect("test path should be under HOME");
+        let tilde_path = format!("~/{}", rel.display());
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "path": tilde_path.clone(),
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+changed\n*** End Patch\n",
+                    tilde_path
+                )
+            });
+            execute_apply_patch(&args)
+                .expect("matching `~` paths in arg and envelope should resolve to the same file");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\n");
         let _ = fs::remove_dir_all(base);
     }
 
@@ -2001,6 +2313,215 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "alpha\nchanged\ngamma\n"
         );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    // ======================== ReplaceInLine (P2) 测试 ========================
+
+    fn make_envelope(op: PatchEnvelopeOp, target: &str, body: &[&str]) -> super::PatchEnvelope {
+        super::PatchEnvelope {
+            op,
+            target_path: target.to_string(),
+            body_lines: body.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn inline_replace_basic() {
+        // 基本：anchor 定位行，old->new 精确替换
+        let original = "fn foo() {\n    let x = 42;\n    println!(\"{}\", x);\n}\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.rs",
+            &["anchor: let x = 42;", "old: 42", "new: 99"],
+        );
+        let result = apply_inline_replace(original, &envelope).expect("basic replace should work");
+        assert_eq!(
+            result,
+            "fn foo() {\n    let x = 99;\n    println!(\"{}\", x);\n}\n"
+        );
+    }
+
+    #[test]
+    fn inline_replace_preserves_no_trailing_newline() {
+        // 文件不以 \n 结尾时，替换后也不加 \n
+        let original = "hello world";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.txt",
+            &["anchor: hello", "old: world", "new: rust"],
+        );
+        let result = apply_inline_replace(original, &envelope).expect("should work");
+        assert_eq!(result, "hello rust");
+    }
+
+    #[test]
+    fn inline_replace_preserves_trailing_newline() {
+        let original = "hello world\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.txt",
+            &["anchor: hello", "old: world", "new: rust"],
+        );
+        let result = apply_inline_replace(original, &envelope).expect("should work");
+        assert_eq!(result, "hello rust\n");
+    }
+
+    #[test]
+    fn inline_replace_anchor_tolerates_confusable() {
+        // anchor 里用了 em-dash (—, U+2014)，文件里是 ASCII hyphen (-)。
+        // anchor 归一化匹配应容忍，但 old 仍需精确匹配。
+        let original = "the quick—brown fox\njumps over\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.txt",
+            &["anchor: the quick—brown fox", "old: fox", "new: dog"],
+        );
+        let result =
+            apply_inline_replace(original, &envelope).expect("confusable anchor should match");
+        assert_eq!(result, "the quick—brown dog\njumps over\n");
+    }
+
+    #[test]
+    fn inline_replace_old_must_match_verbatim() {
+        // old 里有 em-dash，但文件里是 ASCII hyphen -> old 精确匹配失败
+        let original = "the quick-brown fox\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.txt",
+            &["anchor: quick", "old: quick—brown", "new: slow—brown"],
+        );
+        let err = apply_inline_replace(original, &envelope)
+            .expect_err("old with em-dash should not match ASCII hyphen");
+        assert!(
+            err.contains("not found in matched line"),
+            "error should mention old not found: {err}"
+        );
+    }
+
+    #[test]
+    fn inline_replace_anchor_not_unique() {
+        // anchor 匹配多行 -> 报错
+        let original = "duplicate line\nduplicate line\nunique here\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.txt",
+            &["anchor: duplicate line", "old: duplicate", "new: unique"],
+        );
+        let err =
+            apply_inline_replace(original, &envelope).expect_err("non-unique anchor should fail");
+        assert!(
+            err.contains("matched 2 lines"),
+            "error should mention 2 matched lines: {err}"
+        );
+    }
+
+    #[test]
+    fn inline_replace_anchor_not_found() {
+        let original = "hello world\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.txt",
+            &["anchor: nonexistent", "old: world", "new: rust"],
+        );
+        let err =
+            apply_inline_replace(original, &envelope).expect_err("missing anchor should fail");
+        assert!(err.contains("anchor not found"), "error: {err}");
+    }
+
+    #[test]
+    fn inline_replace_old_not_unique_in_line() {
+        // old 在行内出现多次 -> 报错
+        let original = "foo bar foo baz\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.txt",
+            &["anchor: foo bar", "old: foo", "new: qux"],
+        );
+        let err =
+            apply_inline_replace(original, &envelope).expect_err("non-unique old should fail");
+        assert!(
+            err.contains("appears 2 times"),
+            "error should mention 2 occurrences: {err}"
+        );
+    }
+
+    #[test]
+    fn inline_replace_old_equals_new() {
+        let original = "hello world\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.txt",
+            &["anchor: hello", "old: world", "new: world"],
+        );
+        let err = apply_inline_replace(original, &envelope).expect_err("old==new should fail");
+        assert!(err.contains("identical"), "error: {err}");
+    }
+
+    #[test]
+    fn inline_replace_missing_field() {
+        let original = "hello world\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.txt",
+            &["anchor: hello", "old: world"],
+        );
+        let err = apply_inline_replace(original, &envelope).expect_err("missing new should fail");
+        assert!(err.contains("missing `new:`"), "error: {err}");
+    }
+
+    #[test]
+    fn inline_replace_unicode_content() {
+        // 替换包含多字节 UTF-8 的内容，验证 byte index 切片安全
+        let original = "let greeting = \"你好世界\";\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.rs",
+            &["anchor: greeting", "old: 你好", "new: 再见"],
+        );
+        let result =
+            apply_inline_replace(original, &envelope).expect("unicode replace should work");
+        assert_eq!(result, "let greeting = \"再见世界\";\n");
+    }
+
+    #[test]
+    fn inline_replace_parse_envelope() {
+        // 验证 parse_patch_envelope 能识别 *** Replace in line: header
+        let patch = "*** Begin Patch\n\
+            *** Replace in line: src/main.rs\n\
+            anchor: fn main()\n\
+            old: println!\n\
+            new: eprintln!\n\
+            *** End Patch\n";
+        let envelope = parse_patch_envelope(patch)
+            .expect("should parse")
+            .expect("should be Some");
+        assert_eq!(envelope.op, PatchEnvelopeOp::ReplaceInLine);
+        assert_eq!(envelope.target_path, "src/main.rs");
+        assert_eq!(envelope.body_lines.len(), 3);
+    }
+
+    #[test]
+    fn inline_replace_via_execute_apply_patch() {
+        // 端到端：通过 execute_apply_patch 调用，验证完整路径（含 sandbox）
+        let _guard = ENV_LOCK.lock();
+        let path = make_temp_path("inline_e2e");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "the answer is 42\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "patch": format!(
+                    "*** Begin Patch\n*** Replace in line: {}\nanchor: the answer\nold: 42\nnew: 99\n*** End Patch\n",
+                    path.to_string_lossy()
+                ),
+                "path": path.to_string_lossy(),
+            });
+            execute_apply_patch(&args).expect("e2e should succeed");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the answer is 99\n");
         let _ = fs::remove_dir_all(base);
     }
 }

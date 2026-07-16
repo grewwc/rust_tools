@@ -24,6 +24,10 @@ use super::{
     value_to_string,
 };
 
+const PRESERVED_TOOL_OVERFLOW_STUB_PREFIX: &str = "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]";
+const LEGACY_PRESERVED_TOOL_OVERFLOW_STUB_PREFIX: &str =
+    "Output preserved for non-compressible tool `";
+
 pub(super) async fn build_persisted_summary_text_with_app(
     app: &App,
     messages: &[Message],
@@ -93,6 +97,12 @@ pub(super) fn prepare_tool_messages_structured(
         if text.trim().is_empty() {
             continue;
         }
+        // 已外溢的 precision 工具结果是稳定指针，不能再把 stub 当成原始结果
+        // 外溢一次。否则每轮压缩都会写出 `stub -> stub` 新文件，既泄漏磁盘，
+        // 也让模型必须沿多层指针才能回到原始证据。
+        if is_preserved_tool_overflow_stub(&text) {
+            continue;
+        }
 
         let tool_name = message
             .tool_call_id
@@ -142,6 +152,72 @@ pub(super) fn build_tool_call_name_index(messages: &[Message]) -> FxHashMap<Stri
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::types::{FunctionCall, ToolCall};
+
+    fn assistant_call(id: &str, name: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn tool_result(id: &str, content: &str) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn preserved_tool_overflow_stub_is_not_spilled_again() {
+        let overflow_dir =
+            std::env::temp_dir().join(format!("ai-tool-overflow-stub-{}", uuid::Uuid::new_v4()));
+        let mut messages = vec![
+            assistant_call("old", "read_file"),
+            tool_result("old", &"x".repeat(1_000)),
+            assistant_call("recent", "read_file"),
+            tool_result("recent", "recent result"),
+        ];
+
+        prepare_tool_messages_structured(&mut messages, 80, 1, Some(&overflow_dir));
+        let first_stub = value_to_string(&messages[1].content);
+        assert!(is_preserved_tool_overflow_stub(&first_stub));
+        let overflow_path = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+        assert_eq!(std::fs::read_dir(&overflow_path).unwrap().count(), 1);
+
+        prepare_tool_messages_structured(&mut messages, 80, 1, Some(&overflow_dir));
+        assert_eq!(value_to_string(&messages[1].content), first_stub);
+        assert_eq!(std::fs::read_dir(&overflow_path).unwrap().count(), 1);
+
+        let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
+    fn legacy_tool_overflow_stub_is_recognized() {
+        let legacy = "Output preserved for non-compressible tool `read_file`.\n\
+            - file_path: /tmp/result.txt\n\
+            - use read_file to inspect exact content.\n\
+            Preview (for recall; not exhaustive):";
+        assert!(is_preserved_tool_overflow_stub(legacy));
+    }
+}
+
 /// 「读取/检索」类工具的输出零压缩（不行裁剪、不去重折叠、不整组删除），
 /// 超阈值时只做"零压缩外溢到会话文件 + 留指针 stub"。这类输出复现代价高，
 /// 一旦被压掉模型就会反复重跑同一次检索（典型失忆/原地打转症状）。
@@ -189,9 +265,19 @@ fn build_preserved_tool_overflow_stub(path: &Path, tool_name: &str, full_content
     // 避免早期读到的代码被搬走后出现"失忆/反复重读"。
     let preview = build_overflow_content_preview(full_content);
     format!(
-        "Output preserved for non-compressible tool `{tool_name}`. Full result moved to session temp file:\n- file_path: {}\n- use read_file to inspect exact content.\n{preview}",
+        "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
+         Output preserved for non-compressible tool `{tool_name}`. Full result moved to session temp file:\n\
+         - file_path: {}\n- use read_file to inspect exact content.\n{preview}",
         path.display()
     )
+}
+
+fn is_preserved_tool_overflow_stub(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with(PRESERVED_TOOL_OVERFLOW_STUB_PREFIX)
+        || (text.starts_with(LEGACY_PRESERVED_TOOL_OVERFLOW_STUB_PREFIX)
+            && text.contains("\n- file_path: ")
+            && text.contains("\n- use read_file to inspect exact content."))
 }
 
 /// 为外溢内容生成 head+tail 预览。短内容直接全量保留；长内容保留前后各若干行，

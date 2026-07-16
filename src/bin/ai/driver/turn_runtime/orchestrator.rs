@@ -24,9 +24,7 @@ use super::{
     MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
     MID_TURN_LLM_SUMMARY_MAX_CHARS,
     finalize::finalize_turn,
-    finalize::{maybe_generate_session_title, should_generate_session_title_in_background},
     iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
-    persistence::persist_pending_turn_messages,
     mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
     prepare::prepare_turn,
     tool_result::handle_iteration_execution,
@@ -97,10 +95,10 @@ const READ_ONLY_BREADTH_CHECK_TARGETS: usize = 32;
 /// 变化），则在该窗口内不升级，给它继续探索的空间。
 const PROGRESS_GRACE_WINDOW: usize = 6;
 /// 从「软提示 / 记账」升级到「硬停收口」额外需要的连续无进展轮数。
-const PROGRESS_NO_PROGRESS_HARD_MARGIN: usize = 3;
+const PROGRESS_NO_PROGRESS_HARD_MARGIN: usize = 16;
 /// 变更类工具：对 Mutation 意图的任务，只有这些动作（或产出 final text）才算
 /// 「任务收敛」，纯读取 / 检索无论目标多新都不计进展。
-const MUTATION_TOOL_NAMES: &[&str] = &["apply_patch", "write_file", "delete_path"];
+const MUTATION_TOOL_NAMES: &[&str] = &["apply_patch", "write_file", "delete_path", "plan", "task_spawn", "task_wait", "task_cancel", "task_status", "execute_command"];
 
 /// 单轮工具迭代软阈值：取 max_iterations 的一半与绝对上限的较小值，保证一定
 /// 早于硬上限触发；对默认 2048 这类超大 ceiling，也要在明显失控前提醒收敛。
@@ -1976,21 +1974,6 @@ async fn run_turn_body(
         Ok(prep) => prep,
         Err(err) => return Err(err),
     };
-
-    // 首轮用户消息已就绪：立即落盘并后台异步生成 session 标题，
-    // 不必等第一轮对话结束。后续 finalize_turn 里的 in-flight /
-    // has_generated_title 检查会自动跳过，无需额外同步。
-    if history_count == 0
-        && should_generate_session_title_in_background(one_shot_mode, should_quit)
-    {
-        persist_pending_turn_messages(
-            app,
-            one_shot_mode,
-            &turn_messages,
-            &mut persisted_turn_messages,
-        );
-        maybe_generate_session_title(app, true).await;
-    }
 
     let mut supervisor = TurnSupervisor::default();
     let mut force_final_response = false;

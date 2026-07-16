@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, fs, io::Write, path::Path};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
@@ -9,7 +9,7 @@ use crate::ai::{
         priority_for_confidence, render_record, should_persist,
     },
     driver::tools::ExecuteToolCallsResult,
-    history::{Message, ROLE_INTERNAL_NOTE, is_system_like_role},
+    history::{Message, ROLE_INTERNAL_NOTE, SessionStore, is_system_like_role},
     types::App,
     types::ToolCall,
 };
@@ -20,6 +20,9 @@ use super::execution::prepare_recent_tool_result;
 const CODE_INSPECTION_MEMORY_PREFIX: &str = "Current code-inspection working memory:";
 const CODE_DISCOVERY_PREFIX: &str = "code_discovery:";
 const CODE_DISCOVERY_CATEGORY: &str = "code_discovery";
+const CONTEXT_CHECKPOINT_OPEN: &str = "<context_checkpoint>";
+const CONTEXT_CHECKPOINT_CLOSE: &str = "</context_checkpoint>";
+const CONTEXT_CHECKPOINT_SUMMARY_MAX_CHARS: usize = 240;
 
 #[derive(Debug, Clone)]
 struct RepoInspectionFinding {
@@ -42,6 +45,43 @@ pub(super) fn record_hidden_self_note(
     turn_messages: &mut Vec<Message>,
     hidden_meta: &str,
 ) {
+    let hidden_meta = hidden_meta.trim();
+    if hidden_meta.is_empty() {
+        return;
+    }
+
+    let (checkpoints, hidden_meta) = extract_context_checkpoints(hidden_meta);
+    for (index, checkpoint) in checkpoints.into_iter().enumerate() {
+        let summary = truncate_checkpoint_summary(&checkpoint.summary);
+        let marker = match save_context_checkpoint(app, index, &summary, &checkpoint.body) {
+            Ok(path) => format!("[context_checkpoint path={}] {}", path.display(), summary),
+            Err(error) => {
+                eprintln!("failed to save context checkpoint: {error}");
+                turn_messages.push(Message {
+                    role: ROLE_INTERNAL_NOTE.to_string(),
+                    content: Value::String(format!(
+                        "self_note:\n[context_checkpoint save_failed] {summary}\n{}",
+                        checkpoint.body
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+                format!(
+                    "[context_checkpoint save_failed] {} (正文已作为 self_note 保留)",
+                    summary
+                )
+            }
+        };
+        turn_messages.push(Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(marker),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
+
     let hidden_meta = hidden_meta.trim();
     if hidden_meta.is_empty() {
         return;
@@ -71,6 +111,111 @@ pub(super) fn record_hidden_self_note(
     let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
     let _ = store.append(&entry);
     store.maintain_after_append();
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ContextCheckpoint {
+    summary: String,
+    body: String,
+}
+
+/// 从隐藏元信息中摘出模型主动保存的长期结论。格式刻意保持纯文本，避免模型为
+/// 生成 checkpoint 还要学习 JSON 转义规则：首行是 `summary: ...`，其余为正文。
+fn extract_context_checkpoints(hidden_meta: &str) -> (Vec<ContextCheckpoint>, String) {
+    let mut checkpoints = Vec::new();
+    let mut remaining = String::new();
+    let mut cursor = hidden_meta;
+
+    while let Some(start) = cursor.find(CONTEXT_CHECKPOINT_OPEN) {
+        remaining.push_str(&cursor[..start]);
+        let after_open = &cursor[start + CONTEXT_CHECKPOINT_OPEN.len()..];
+        let Some(end) = after_open.find(CONTEXT_CHECKPOINT_CLOSE) else {
+            // 标签不完整时不要吞掉模型笔记，按普通 self_note 保存。
+            remaining.push_str(&cursor[start..]);
+            return (checkpoints, remaining);
+        };
+        let raw = after_open[..end].trim();
+        let (summary, body) = raw.split_once('\n').unwrap_or((raw, ""));
+        let summary = summary
+            .trim()
+            .strip_prefix("summary:")
+            .unwrap_or(summary.trim())
+            .trim();
+        let body = body.trim();
+        if !summary.is_empty() && !body.is_empty() {
+            checkpoints.push(ContextCheckpoint {
+                summary: summary.to_string(),
+                body: body.to_string(),
+            });
+        } else {
+            // 不完整 checkpoint 同样退化为普通笔记，避免悄悄丢失结论。
+            remaining.push_str(
+                &cursor[start
+                    ..start + CONTEXT_CHECKPOINT_OPEN.len() + end + CONTEXT_CHECKPOINT_CLOSE.len()],
+            );
+        }
+        cursor = &after_open[end + CONTEXT_CHECKPOINT_CLOSE.len()..];
+    }
+    remaining.push_str(cursor);
+    (checkpoints, remaining)
+}
+
+fn truncate_checkpoint_summary(summary: &str) -> String {
+    let mut out = String::new();
+    for ch in summary.chars().filter(|ch| !ch.is_control()) {
+        if out.chars().count() == CONTEXT_CHECKPOINT_SUMMARY_MAX_CHARS {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
+fn save_context_checkpoint(
+    app: &App,
+    index: usize,
+    summary: &str,
+    body: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let assets_dir = SessionStore::new(&app.session_history_file)
+        .session_assets_dir(&app.session_id)
+        .join("context-checkpoints");
+    save_context_checkpoint_in_dir(&assets_dir, index, summary, body)
+}
+
+/// 先把 checkpoint 写入同目录临时文件并 fsync，再原子改名。
+/// marker 只会在此函数成功后写入 history，因此模型不会拿到半写入或不存在的正文路径。
+fn save_context_checkpoint_in_dir(
+    assets_dir: &Path,
+    index: usize,
+    summary: &str,
+    body: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    fs::create_dir_all(&assets_dir)?;
+    let timestamp = chrono::Local::now().format("%Y%m%dT%H%M%S%3f");
+    let file_name = format!(
+        "context-checkpoint-{timestamp}-{index}-{}.md",
+        uuid::Uuid::new_v4()
+    );
+    let path = assets_dir.join(&file_name);
+    let temporary_path = assets_dir.join(format!(".{file_name}.tmp"));
+    let contents = format!("# Context checkpoint\n\n摘要：{summary}\n\n---\n\n{body}\n");
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary_path, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result?;
+    Ok(path)
 }
 
 pub(super) fn parse_prune_meta_and_update_marks(
@@ -662,6 +807,30 @@ fn classify_code_discovery(finding: &RepoInspectionFinding) -> Option<CodeDiscov
     should_persist(record.confidence).then_some(record)
 }
 
+fn infer_apply_patch_target(args: &Value) -> Option<String> {
+    args.get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            let patch = args.get("patch").and_then(|v| v.as_str())?;
+            extract_apply_patch_target_from_patch(patch)
+        })
+}
+
+fn extract_apply_patch_target_from_patch(patch: &str) -> Option<String> {
+    let mut lines = patch.lines();
+    lines.find(|line| line.trim() == "*** Begin Patch")?;
+    let header = lines.find(|line| !line.trim().is_empty())?;
+    [
+        "*** Update File: ",
+        "*** Add File: ",
+        "*** Replace in line: ",
+    ]
+    .iter()
+    .find_map(|prefix| header.strip_prefix(prefix).map(|path| path.trim().to_string()))
+}
+
 fn describe_tool_call(tool_call: &ToolCall) -> String {
     let Ok(args) = serde_json::from_str::<Value>(&tool_call.function.arguments) else {
         return String::new();
@@ -717,11 +886,8 @@ fn describe_tool_call(tool_call: &ToolCall) -> String {
             .map(|path| format!("(path={})", truncate_inline(path, 64)))
             .unwrap_or_default(),
         "apply_patch" => {
-            let path = args
-                .get("file_path")
-                .or_else(|| args.get("path"))
-                .and_then(|v| v.as_str())
-                .map(|v| truncate_inline(v, 64))
+            let path = infer_apply_patch_target(&args)
+                .map(|v| truncate_inline(&v, 64))
                 .unwrap_or_else(|| "?".to_string());
             format!("(file={})", path)
         }
@@ -807,12 +973,15 @@ fn truncate_note(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::smart_truncate_to_sentence;
     use super::{
         RepoInspectionFinding, build_code_inspection_working_memory,
-        build_persistent_code_discoveries, classify_code_discovery,
+        build_persistent_code_discoveries, classify_code_discovery, describe_tool_call,
         collect_repo_inspection_findings, is_repo_inspection_tool,
         persistent_code_discovery_already_present,
+    };
+    use super::{
+        extract_context_checkpoints, save_context_checkpoint_in_dir, smart_truncate_to_sentence,
+        truncate_checkpoint_summary,
     };
     use crate::ai::code_discovery_policy::{CodeDiscoveryConfidence, CodeDiscoveryKind};
     use crate::ai::history::Message;
@@ -837,6 +1006,19 @@ mod tests {
     #[test]
     fn repo_inspection_tools_include_code_search() {
         assert!(is_repo_inspection_tool("code_search"));
+    }
+
+    #[test]
+    fn describe_tool_call_infers_apply_patch_target_from_envelope() {
+        let call = tool_call(
+            "1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch\n"
+            }),
+        );
+
+        assert_eq!(describe_tool_call(&call), "(file=src/main.rs)");
     }
 
     #[test]
@@ -1132,5 +1314,71 @@ mod tests {
         let record = classify_code_discovery(&finding).expect("record");
         assert_eq!(record.kind, CodeDiscoveryKind::CallChain);
         assert_eq!(record.confidence, CodeDiscoveryConfidence::Medium);
+    }
+
+    #[test]
+    fn context_checkpoint_is_extracted_and_ordinary_note_is_preserved() {
+        let input = "before\n<context_checkpoint>\nsummary: 已确认根因\n证据：src/lib.rs:42。\n</context_checkpoint>\nafter";
+        let (checkpoints, remainder) = extract_context_checkpoints(input);
+
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].summary, "已确认根因");
+        assert_eq!(checkpoints[0].body, "证据：src/lib.rs:42。");
+        assert_eq!(remainder, "before\n\nafter");
+    }
+
+    #[test]
+    fn incomplete_context_checkpoint_remains_a_self_note() {
+        let input = "<context_checkpoint>\nsummary: 只有摘要\n</context_checkpoint>";
+        let (checkpoints, remainder) = extract_context_checkpoints(input);
+
+        assert!(checkpoints.is_empty());
+        assert_eq!(remainder, input);
+    }
+
+    #[test]
+    fn context_checkpoint_summary_is_short_and_single_line() {
+        let summary = format!("abc\ndef{}", "x".repeat(300));
+        let short = truncate_checkpoint_summary(&summary);
+
+        assert!(!short.contains('\n'));
+        assert!(short.ends_with('…'));
+        assert!(short.chars().count() <= 241);
+    }
+
+    #[test]
+    fn context_checkpoint_write_is_unique_complete_and_leaves_no_temporary_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "ai-context-checkpoint-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let first = save_context_checkpoint_in_dir(&directory, 0, "first", "first body")
+            .expect("first checkpoint should save");
+        let second = save_context_checkpoint_in_dir(&directory, 0, "second", "second body")
+            .expect("second checkpoint should save");
+
+        assert_ne!(first, second);
+        assert_eq!(
+            std::fs::read_to_string(&first).expect("first checkpoint should be readable"),
+            "# Context checkpoint\n\n摘要：first\n\n---\n\nfirst body\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).expect("second checkpoint should be readable"),
+            "# Context checkpoint\n\n摘要：second\n\n---\n\nsecond body\n"
+        );
+        let entries = std::fs::read_dir(&directory)
+            .expect("checkpoint directory should be readable")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("checkpoint directory entries should be readable");
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| { !entry.file_name().to_string_lossy().contains(".tmp") })
+        );
+
+        std::fs::remove_dir_all(&directory)
+            .expect("temporary checkpoint directory should clean up");
     }
 }

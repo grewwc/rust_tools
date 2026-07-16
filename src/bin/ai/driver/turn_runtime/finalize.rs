@@ -387,7 +387,7 @@ pub(super) async fn finalize_turn(
 }
 
 /// 在 turn 结束后尝试用 LLM 生成 session 概括性标题。
-/// 条件：至少有 1 个 user turn 且尚未生成过标题。
+/// 条件：至少有 1 个 user turn，且没有已生成标题或现有标题质量过低。
 pub(in crate::ai::driver::turn_runtime) async fn maybe_generate_session_title(
     app: &App,
     run_in_background: bool,
@@ -411,7 +411,9 @@ pub(in crate::ai::driver::turn_runtime) async fn maybe_generate_session_title(
 }
 
 async fn generate_session_title_if_missing(app: &App) {
-    use crate::ai::history::SessionStore;
+    use crate::ai::history::{
+        SessionStore, is_low_quality_session_title, normalize_generated_session_title,
+    };
     // eprintln!("[session-title] checking: session_id={} history_file={}", app.session_id, app.session_history_file.display());
 
     let sessions_dir = app
@@ -420,8 +422,10 @@ async fn generate_session_title_if_missing(app: &App) {
         .unwrap_or_else(|| app.session_history_file.as_path());
     let store = SessionStore::new(sessions_dir);
 
-    if store.has_generated_title(&app.session_id) {
-        return;
+    if let Some(existing_title) = store.read_session_title(&app.session_id).ok().flatten() {
+        if !is_low_quality_session_title(&existing_title) {
+            return;
+        }
     }
 
     let all_messages = match store.read_all_messages(&app.session_id) {
@@ -451,8 +455,11 @@ async fn generate_session_title_if_missing(app: &App) {
     // eprintln!("[session-title] LLM returned: {:?}", title.as_deref().unwrap_or("None"));
 
     if let Some(t) = title {
+        let t = normalize_generated_session_title(&t);
         if !t.is_empty() {
-            if store.has_generated_title(&app.session_id) {
+            if let Some(existing_title) = store.read_session_title(&app.session_id).ok().flatten()
+                && !is_low_quality_session_title(&existing_title)
+            {
                 return;
             }
             if let Err(_) = store.write_session_title(&app.session_id, &t) {

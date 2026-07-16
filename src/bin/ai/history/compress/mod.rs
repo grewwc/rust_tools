@@ -52,6 +52,7 @@ pub(in crate::ai) fn persisted_history_keep_recent_turns() -> usize {
 /// messages 里那条仅是同 turn 内被 LLM 看到的"冗余 inline 副本"。
 /// 长 session 累计上千 turn 时这些 inline 副本会单调膨胀，需要滑窗剪裁。
 const MAX_SELF_NOTES_IN_MESSAGES: usize = 8;
+const CONTEXT_CHECKPOINT_MARKER_PREFIX: &str = "[context_checkpoint";
 
 /// 仅保留最近 `keep_recent` 条 internal_note 中的 `self_note:` 条目。
 /// 其他 internal_note（如 cache 提示、loop-breaker、历史摘要）不在剪裁范围。
@@ -81,6 +82,15 @@ fn is_self_note_message(m: &Message) -> bool {
     }
     let s = value_to_string(&m.content);
     s.trim_start().starts_with("self_note:")
+}
+
+/// checkpoint 正文已写入会话 asset；这里的短标记是模型在压缩后重新找到正文的
+/// 唯一索引，因此既不能被摘要吞掉，也不能被普通裁剪删掉。
+pub(super) fn is_context_checkpoint_marker(m: &Message) -> bool {
+    m.role == ROLE_INTERNAL_NOTE
+        && value_to_string(&m.content)
+            .trim_start()
+            .starts_with(CONTEXT_CHECKPOINT_MARKER_PREFIX)
 }
 const PERSISTED_HISTORY_SUMMARY_MAX_CHARS: usize = 8_000;
 const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
@@ -228,7 +238,12 @@ pub(in crate::ai) fn compress_messages_for_context(
 
     let mut out = Vec::new();
     if summary_max_chars > 0 {
-        let summary = build_persisted_summary_text(older, summary_max_chars);
+        let summary_source: Vec<Message> = older
+            .iter()
+            .filter(|message| !is_context_checkpoint_marker(message))
+            .cloned()
+            .collect();
+        let summary = build_persisted_summary_text(&summary_source, summary_max_chars);
         if !summary.trim().is_empty() {
             out.push(Message {
                 role: ROLE_INTERNAL_NOTE.to_string(),
@@ -241,6 +256,12 @@ pub(in crate::ai) fn compress_messages_for_context(
             });
         }
     }
+    out.extend(
+        older
+            .iter()
+            .filter(|message| is_context_checkpoint_marker(message))
+            .cloned(),
+    );
     out.extend_from_slice(recent);
     shrink_messages_to_fit_with_summary(out, max_chars, summary_max_chars, overflow_dir.as_deref())
 }
@@ -291,8 +312,18 @@ pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Me
         return messages;
     }
 
+    let checkpoint_markers: Vec<Message> = messages[..split_at]
+        .iter()
+        .filter(|message| is_context_checkpoint_marker(message))
+        .cloned()
+        .collect();
+    let summary_source: Vec<Message> = messages[..split_at]
+        .iter()
+        .filter(|message| !is_context_checkpoint_marker(message))
+        .cloned()
+        .collect();
     let summary =
-        build_persisted_summary_text(&messages[..split_at], PERSISTED_HISTORY_SUMMARY_MAX_CHARS);
+        build_persisted_summary_text(&summary_source, PERSISTED_HISTORY_SUMMARY_MAX_CHARS);
     let mut out = Vec::with_capacity(messages.len() - split_at + 1);
     if !summary.is_empty() {
         out.push(Message {
@@ -305,6 +336,7 @@ pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Me
             reasoning_content: None,
         });
     }
+    out.extend(checkpoint_markers);
     out.extend_from_slice(&messages[split_at..]);
     out
 }
@@ -348,9 +380,19 @@ async fn compact_persisted_history_with_app_inner(
         return messages;
     }
 
+    let checkpoint_markers: Vec<Message> = messages[..split_at]
+        .iter()
+        .filter(|message| is_context_checkpoint_marker(message))
+        .cloned()
+        .collect();
+    let summary_source: Vec<Message> = messages[..split_at]
+        .iter()
+        .filter(|message| !is_context_checkpoint_marker(message))
+        .cloned()
+        .collect();
     let summary = build_persisted_summary_text_with_app(
         app,
-        &messages[..split_at],
+        &summary_source,
         PERSISTED_HISTORY_SUMMARY_MAX_CHARS,
     )
     .await;
@@ -366,6 +408,7 @@ async fn compact_persisted_history_with_app_inner(
             reasoning_content: None,
         });
     }
+    out.extend(checkpoint_markers);
     out.extend_from_slice(&messages[split_at..]);
     out
 }

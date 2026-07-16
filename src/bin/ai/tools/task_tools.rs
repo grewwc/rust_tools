@@ -39,8 +39,7 @@ pub(crate) const MAX_SUBAGENT_SPAWN_DEPTH: usize = 1;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 /// 子代理结果只是主 agent 的证据输入，不是最终对用户的直接回答。
 /// 主 agent 拿到 payload 后仍需自行汇总结论、风险与下一步，再面向用户输出。
-pub(crate) const SUBAGENT_PARENT_SUMMARY_REMINDER: &str =
-    "Parent-agent follow-up: summarize the confirmed subagent conclusions in your own response to the user. Do not rely on the raw subagent transcript or terminal fold as the final user-facing answer.";
+pub(crate) const SUBAGENT_PARENT_SUMMARY_REMINDER: &str = "Parent-agent follow-up: summarize the confirmed subagent conclusions in your own response to the user. Do not rely on the raw subagent transcript or terminal fold as the final user-facing answer.";
 /// 单次 `task_wait` 调用的默认等待预算（秒）。这只是 **本次调用的最长阻塞时间**，
 /// 不是 subagent 的总寿命：超时仅意味着"这次没等到结果"，主 agent 可以继续调
 /// `task_wait` 续等，subagent 仍在后台运行，channel/futex 也不会被销毁。
@@ -53,6 +52,13 @@ const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 600;
 /// `params_task_wait` schema 中标称的 `[1, 900]` 保持一致）。超时只表示本次调用
 /// 没等到、subagent 仍在跑，因此单次阻塞不宜过长，以保证对中断/事件的响应性。
 const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 900;
+
+/// Subagent 的 wall-clock 总寿命上限。与单次 task_wait 的 `timeout_secs`（默认
+/// 600s）不同，这是进程级硬上限：subagent 存活超过此值（典型如卡在单个永不
+/// 返回的工具执行里、单 turn 内无 wall-clock 超时），task_wait 入口会主动
+/// 终止它并写入 timeout 终态结果，避免主 agent 陷入"超时->续等->再超时"空转
+/// 或后台进程永久占用资源。30 分钟远大于正常完成时长，仅在真正卡死时兜底。
+const SUBAGENT_WALL_CLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Granular control over which slices of the parent agent's execution
 /// context are inherited by a spawned sub-agent. Defaults are cwd+skills=true
@@ -570,7 +576,7 @@ pub(crate) fn epoll_wait_many_channels(
 }
 
 fn task_inherit_schema_description() -> &'static str {
-    "Optional inheritance control. Accepts 'all' (inherit history, memory, cwd, skills), 'none' (fresh sub-agent context), or a comma-separated list selecting some of: history, memory, cwd, skills. If omitted, defaults to history+cwd+skills with private memory (memory not inherited). For narrow leaf tasks, prefer 'none' or 'cwd' to give the subagent a focused context; only use 'all' when the subtask genuinely depends on the full conversation."
+    "Optional inheritance control. Accepts 'all' (inherit history, memory, cwd, skills), 'none' (fresh sub-agent context), or a comma-separated list selecting some of: history, memory, cwd, skills. If omitted, defaults to cwd+skills only, with both history and memory kept private. For narrow leaf tasks, prefer 'none' or 'cwd' to give the subagent a focused context; only use 'all' when the subtask genuinely depends on the full conversation."
 }
 
 fn params_task() -> Value {
@@ -1100,6 +1106,7 @@ fn execute_tool_cancel_placeholder(_args: &Value) -> Result<String, String> {
 }
 
 pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
+    let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let task_ids = args["task_ids"]
         .as_array()
         .ok_or("Missing 'task_ids' array parameter")?
@@ -1138,20 +1145,31 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     };
 
     let mut registry = TASK_REGISTRY.lock().unwrap();
+    let mut foreign_task_ids = Vec::new();
+    let mut already_collected = 0usize;
+    let mut task_ids_filtered = Vec::new();
+    for tid in task_ids {
+        match registry.get_ref(&tid) {
+            Some(entry) if entry.session_id == current_session_id => {
+                task_ids_filtered.push(tid);
+            }
+            Some(_) => foreign_task_ids.push(tid),
+            None => already_collected += 1,
+        }
+    }
+    if !foreign_task_ids.is_empty() {
+        return Err(format!(
+            "Refusing to wait on task_id(s) owned by another session: {}",
+            foreign_task_ids.join(", ")
+        ));
+    }
     // task_id 不在 registry 中，说明它在 *上一次* task_wait 调用里已经被收集并清理
     // 掉了（ready 任务一旦读到结果就会从 registry 删除）。PARKED / BUDGET-ELAPSED
     // 提示以及 driver 唤醒消息都让模型"用 same task_ids 继续调"，所以"已收集 +
     // 仍 pending"混合的一组 id 是预期输入，**绝不能**整调用 hard-fail（否则多子任务
     // 编排会在第二次 task_wait 时因 Unknown task_id 直接崩掉）。这里静默丢弃已收集
     // 的 id，只对仍被跟踪的 id 继续等待。
-    let already_collected = task_ids
-        .iter()
-        .filter(|tid| !registry.contains_key(*tid))
-        .count();
-    let task_ids: Vec<String> = task_ids
-        .into_iter()
-        .filter(|tid| registry.contains_key(tid))
-        .collect();
+    let task_ids = task_ids_filtered;
     if task_ids.is_empty() {
         // 所有引用的 task 都已在之前的调用里收集完毕——模型其实已经拿到这些结果。
         // 返回中性提示而非报错，让它停止重复等待、直接基于已有结果继续推理。
@@ -1184,6 +1202,25 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             // 真正的"等待预算耗尽"只在 epoll_wait_many 的 wait.suspended /
             // 返回空 ready 时体现，并且 **绝不销毁 channel/futex**，主 agent
             // 可以继续调 task_wait 续等。
+            // wall-clock 总寿命检查：subagent 若超过 SUBAGENT_WALL_CLOCK_TIMEOUT
+            // 仍无结果（典型如卡在单个永不返回的工具执行里），主动终止并写入
+            // timeout 终态，使紧随其后的 read_task_result 立即读到结果，避免主
+            // agent 陷入"超时->续等->再超时"空转。区别于历史上用 started_at 对比
+            // 单次 timeout_secs 的 bug：这里用独立的、远大于单次 wait 预算的总
+            // 寿命上限，且写入失败结果而非销毁 channel，结果不会丢失。
+            if entry.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT {
+                write_terminal_subagent_result(
+                    os,
+                    entry.pid,
+                    entry.result_channel_id,
+                    entry.completion_futex_addr,
+                    "timeout",
+                    &format!(
+                        "Subagent exceeded wall-clock lifetime of {}s (likely stuck in a non-returning tool execution)",
+                        SUBAGENT_WALL_CLOCK_TIMEOUT.as_secs()
+                    ),
+                );
+            }
             if let Some(result) = read_task_result(os, entry.result_channel_id, true)? {
                 ready.push(format_task_result(entry, result));
                 let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
@@ -1360,6 +1397,95 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     Ok(ready.join("\n\n---\n\n"))
 }
 
+/// 向 subagent 的 result channel 写入一条终态结果并终止其 kernel 进程。用于
+/// task_cancel（主动取消）与 wall-clock 总寿命超时。结果采用与
+/// `publish_background_task_failure` 相同的 status/output/error 格式，使
+/// task_wait / task_status 的收集路径能正常读到。本函数只释放 producer 端命名
+/// 所有权并 store futex 唤醒等待方；channel/futex 的 destroy 留给收集方（task_wait
+/// 的 ready 路径或 task_cancel 自身）完成，避免重复释放。
+fn write_terminal_subagent_result(
+    os: &mut dyn aios_kernel::kernel::Kernel,
+    pid: u64,
+    result_channel_id: u64,
+    completion_futex_addr: aios_kernel::primitives::FutexAddr,
+    status: &str,
+    error: &str,
+) {
+    // 先以主 agent 身份终止进程：kill_process 同步返回后进程已 terminated，其
+    // tokio future 不再被调度，不会再向 result channel 写入，避免与我们的终态
+    // 结果产生竞态。kill 需要 manage_children 权限（主 agent 持有）。
+    let _ = os.kill_process(pid, format!("{}: {}", status, error));
+    // 再以 subagent 身份写终态结果并释放 producer 端（result channel 的 producer
+    // 所有权校验要求 current == pid）。进程虽已 terminated，但 channel/futex 资源
+    // 尚未回收（回收发生在 drop_terminated），故仍可写入。
+    let original = os.current_process_id();
+    os.set_current_pid(Some(pid));
+    let payload = serde_json::json!({
+        "status": status,
+        "output": "",
+        "error": error,
+    })
+    .to_string();
+    let _ = os.channel_send(Some(pid), ChannelId(result_channel_id), payload);
+    let _ = os.channel_close(Some(pid), ChannelId(result_channel_id));
+    let _ = os.channel_release_named(ChannelId(result_channel_id), "task_result.producer");
+    let _ = os.futex_store(completion_futex_addr, 1);
+    os.set_current_pid(original);
+}
+
+/// 调度器每 epoch 调用：扫描 TASK_REGISTRY 中超过 wall-clock 总寿命上限且仍在
+/// 运行的 subagent，终止其进程并写入 timeout 终态结果。
+///
+/// 与 `task_wait` 内的 wall-clock 检查互补：task_wait 只在主 agent 主动调用时触发；
+/// 本函数在 driver run_loop 每 epoch 主动扫描，即使主 agent 去做别的事（长期不调
+/// task_wait），卡死的 subagent 进程也能被及时终止，避免永久占用调度器资源。
+///
+/// 资源语义：只 kill 进程 + 写终态结果，**不**销毁 channel/futex、**不**从 registry
+/// 移除——这些留给收集方（task_wait 的 ready 路径）完成，避免重复释放。进程被 kill
+/// 后 `is_task_pending` 返回 false，后续 epoch 扫描到同一 entry 会跳过，不会重复 kill。
+///
+/// 锁顺序：分两步以避免与 task_wait（registry -> kernel）形成锁环——
+/// 1. 仅锁 TASK_REGISTRY 收集候选，立即释放；
+/// 2. 仅锁 kernel（via with_os_kernel）执行 kill + 写结果。
+/// 两步绝不同时持有 registry 与 kernel（GLOBAL_OS 与 App.os 是同一把锁，参见
+/// os_tools.rs 的重入死锁警告）。
+pub(crate) fn reap_timed_out_subagents() {
+    // Step 1：仅持 registry 锁，收集超时候选（pid / channel / futex），立即释放。
+    let candidates = {
+        let registry = TASK_REGISTRY.lock().unwrap();
+        registry
+            .iter()
+            .filter(|(_, e)| e.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT)
+            .map(|(_, e)| (e.pid, e.result_channel_id, e.completion_futex_addr))
+            .collect::<Vec<_>>()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    // Step 2：仅持 kernel 锁，逐个检查是否仍在运行，是则 kill + 写 timeout 终态。
+    let _ = with_os_kernel(|os| {
+        for (pid, result_channel_id, completion_futex_addr) in candidates {
+            if !is_task_pending(os, pid)? {
+                // 进程已结束（正常完成 / 失败 / 被他人 kill），跳过；其结果与资源
+                // 清理交给收集方处理。
+                continue;
+            }
+            write_terminal_subagent_result(
+                os,
+                pid,
+                result_channel_id,
+                completion_futex_addr,
+                "timeout",
+                &format!(
+                    "Subagent exceeded wall-clock lifetime of {}s (reaped by scheduler; likely stuck in a non-returning tool execution)",
+                    SUBAGENT_WALL_CLOCK_TIMEOUT.as_secs()
+                ),
+            );
+        }
+        Ok(())
+    });
+}
+
 fn params_task_status() -> Value {
     serde_json::json!({
         "type": "object",
@@ -1370,7 +1496,7 @@ fn params_task_status() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_status",
-        description: "Show status of all asynchronously spawned tasks. Lists task_id, agent, model, and current state (running/completed/failed) without blocking. For tasks that have already finished, their output is included inline so you can use completed results immediately without calling task_wait.",
+        description: "Show status of all asynchronously spawned tasks. Lists task_id, agent, model, and current state (running/completed/failed) without blocking. For tasks that have already finished, their output is included inline and collected immediately, so you can use completed results right away without calling task_wait.",
         parameters: params_task_status,
         execute: execute_task_status,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -1386,14 +1512,158 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
+fn params_task_cancel() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "task_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Array of async subagent task ids (from task_spawn) to cancel."
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional reason for canceling these tasks."
+            }
+        },
+        "required": ["task_ids"]
+    })
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "task_cancel",
+        description: "Cancel one or more asynchronously spawned subagent tasks (started by task_spawn) that are still running. Do NOT pass tool_spawn task_ids here -- use tool_cancel for those. Cancelling terminates the subagent process and fills its result slot with a 'cancelled' terminal result, so a subsequent task_wait/task_status reports it as cancelled rather than hanging. Use this to abandon a stuck or no-longer-needed background subagent instead of repeatedly calling task_wait.",
+        parameters: params_task_cancel,
+        execute: execute_task_cancel,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "task_cancel",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Never,
+    },
+});
+
+pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
+    let task_ids = args["task_ids"]
+        .as_array()
+        .ok_or("Missing 'task_ids' array parameter")?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect::<Vec<_>>();
+    if task_ids.is_empty() {
+        return Err("task_ids array cannot be empty".to_string());
+    }
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .unwrap_or_else(|| "cancelled by parent agent".to_string());
+    let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+
+    let registry = TASK_REGISTRY.lock().unwrap();
+    let mut cancelled: Vec<String> = Vec::new();
+    let mut already_finished: Vec<String> = Vec::new();
+    let mut not_found: Vec<String> = Vec::new();
+    for tid in &task_ids {
+        let (pid, result_channel_id, completion_futex_addr) = match registry.get_ref(tid) {
+            Some(e) if e.session_id == current_session_id => {
+                (e.pid, e.result_channel_id, e.completion_futex_addr)
+            }
+            _ => {
+                not_found.push(tid.clone());
+                continue;
+            }
+        };
+        // 仅对仍在运行的 subagent 执行取消。已结束（正常完成 / 失败 / 进程终止）的
+        // 任务不再 kill、也不再写终态结果——否则会向 channel 追加一条 "cancelled"
+        // 消息并销毁 channel，遮蔽/丢弃 subagent 的真实结果，且让后续 task_wait 拿
+        // 到错误的 cancelled 状态。已结束任务的 channel/futex/registry 清理留给收集
+        // 方（task_wait 的 ready / 失败路径，或 task_status 后的 task_wait）。
+        let was_pending = with_os_kernel(|os| {
+            if !is_task_pending(os, pid)? {
+                return Ok(false);
+            }
+            write_terminal_subagent_result(
+                os,
+                pid,
+                result_channel_id,
+                completion_futex_addr,
+                "cancelled",
+                &reason,
+            );
+            Ok(true)
+        })?;
+        if was_pending {
+            cancelled.push(tid.clone());
+        } else {
+            already_finished.push(tid.clone());
+        }
+    }
+    drop(registry);
+
+    let mut msg = String::new();
+    if !cancelled.is_empty() {
+        msg.push_str(&format!(
+            "[task_cancel] Cancelled {} task(s): {}. The subagent processes were terminated and \
+             their result slots were filled with a 'cancelled' terminal result. Required next step: \
+             collect these terminal results with task_wait or task_status so the runtime can clean up \
+             their registry entries and IPC resources.",
+            cancelled.len(),
+            cancelled.join(", ")
+        ));
+    }
+    if !already_finished.is_empty() {
+        if !msg.is_empty() {
+            msg.push('\n');
+        }
+        msg.push_str(&format!(
+            "[task_cancel] {} task_id(s) were already finished (completed/failed/cancelled) and \
+             were left untouched - use task_wait/task_status to collect their real terminal results: {}",
+            already_finished.len(),
+            already_finished.join(", ")
+        ));
+    }
+    if !not_found.is_empty() {
+        if !msg.is_empty() {
+            msg.push('\n');
+        }
+        msg.push_str(&format!(
+            "[task_cancel] {} task_id(s) not found or not owned by this session (already \
+             collected or never spawned): {}",
+            not_found.len(),
+            not_found.join(", ")
+        ));
+    }
+    Ok(msg)
+}
+
 pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
-    let registry = TASK_REGISTRY.lock().unwrap();
-    let tracked = registry
-        .iter()
-        .filter(|(_, entry)| entry.session_id == current_session_id)
-        .map(|(tid, entry)| (tid.clone(), entry))
-        .collect::<Vec<_>>();
+    let tracked = {
+        let registry = TASK_REGISTRY.lock().unwrap();
+        registry
+            .iter()
+            .filter(|(_, entry)| entry.session_id == current_session_id)
+            .map(|(tid, entry)| {
+                (
+                    tid.clone(),
+                    entry.pid,
+                    entry.result_channel_id,
+                    entry.completion_futex_addr,
+                    entry.description.clone(),
+                    entry.agent_name.clone(),
+                    entry.model.clone(),
+                    entry.started_at,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     if tracked.is_empty() {
         return Ok("No async tasks currently tracked.".to_string());
     }
@@ -1402,41 +1672,69 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
         "TaskID              PID      Agent          Model          State       Description"
             .to_string(),
     ];
-    // 对已经把结果写回 channel 的子任务，额外用 **非消费式 peek** 读出正文，附在
-    // 表格后面。否则模型即使看到 state=completed，也只能回头再调 task_wait 才能拿到
-    // 输出——而 task_wait 在协作让出时又只会回一条 PARKED 提示，形成"看得到完成、
-    // 拿不到结果"的踢皮球，是诱发"子任务卡住"误判的次要原因。peek 不消费消息，
-    // 后续 task_wait 仍能正常 consume 并清理资源。
+    // 对已经把结果写回 channel 的子任务，直接 **消费并清理** 正文，附在表格后面。
+    // 否则模型即使看到 state=completed，也只能回头再调 task_wait 才能拿到输出；
+    // 更糟的是如果它把"seen completed in task_status"视为已处理，就会绕过收口守卫，
+    // 留下 registry 条目和 channel/futex 资源。这里既然已经把结果返回给模型，
+    // 就应视为已收集完成。
     let mut completed_outputs: Vec<String> = Vec::new();
-    let mut observed_ids: Vec<String> = Vec::new();
+    let mut finished_ids: Vec<String> = Vec::new();
     with_os_kernel(|os| {
-        for (tid, entry) in &tracked {
-            let state_str = task_state_string(os, entry.result_channel_id, entry.pid)?;
+        for (
+            tid,
+            pid,
+            result_channel_id,
+            completion_futex_addr,
+            description,
+            agent_name,
+            model,
+            started_at,
+        ) in &tracked
+        {
+            let state_str = task_state_string(os, *result_channel_id, *pid)?;
             let short_id = if tid.len() > 19 { &tid[..19] } else { tid };
             lines.push(format!(
                 "{:<19} {:<8} {:<14} {:<14} {:<11} {}",
-                short_id, entry.pid, entry.agent_name, entry.model, state_str, entry.description
+                short_id, pid, agent_name, model, state_str, description
             ));
-            if let Some(result) = read_task_result(os, entry.result_channel_id, false)? {
-                completed_outputs.push(format_task_result(entry, result));
-                observed_ids.push(tid.clone());
+            if let Some(result) = read_task_result(os, *result_channel_id, true)? {
+                let entry = AsyncTaskEntry {
+                    session_id: current_session_id.clone(),
+                    result_observed: false,
+                    pid: *pid,
+                    result_channel_id: *result_channel_id,
+                    completion_futex_addr: *completion_futex_addr,
+                    description: description.clone(),
+                    agent_name: agent_name.clone(),
+                    model: model.clone(),
+                    is_model_auto_selected: false,
+                    auto_model_fallback: None,
+                    selection_explanation: String::new(),
+                    inherit: InheritOptions::default(),
+                    started_at: *started_at,
+                };
+                completed_outputs.push(format_task_result(&entry, result));
+                let _ = os.channel_close(None, ChannelId(*result_channel_id));
+                let _ =
+                    os.channel_release_named(ChannelId(*result_channel_id), "task_result.consumer");
+                let _ = os.channel_destroy(None, ChannelId(*result_channel_id));
+                let _ = os.futex_destroy(*completion_futex_addr);
+                finished_ids.push(tid.clone());
             }
         }
         Ok(())
     })?;
-    if !observed_ids.is_empty() {
+    if !finished_ids.is_empty() {
         let mut registry = TASK_REGISTRY.lock().unwrap();
-        for task_id in &observed_ids {
-            if let Some(entry) = registry.get_mut(task_id) {
-                entry.result_observed = true;
-            }
+        for task_id in &finished_ids {
+            registry.remove(task_id);
         }
     }
 
     if !completed_outputs.is_empty() {
         lines.push(String::new());
         lines.push(
-            "Completed task results below (already available — no need to wait for these):"
+            "Completed task results below (already collected — no need to wait for these):"
                 .to_string(),
         );
         lines.push(completed_outputs.join("\n\n---\n\n"));
@@ -1445,7 +1743,9 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-fn collect_outstanding_task_snapshots(session_id: &str) -> Result<Vec<OutstandingTaskSnapshot>, String> {
+fn collect_outstanding_task_snapshots(
+    session_id: &str,
+) -> Result<Vec<OutstandingTaskSnapshot>, String> {
     let registry = TASK_REGISTRY.lock().unwrap();
     let tracked = registry
         .iter()
@@ -1543,7 +1843,11 @@ pub(crate) fn build_abandoned_tasks_notice(
     for snapshot in &snapshots {
         lines.push(format!(
             "- task_id={} status={} agent={} model={} desc={}",
-            snapshot.task_id, snapshot.status, snapshot.agent_name, snapshot.model, snapshot.description
+            snapshot.task_id,
+            snapshot.status,
+            snapshot.agent_name,
+            snapshot.model,
+            snapshot.description
         ));
     }
     lines.push(

@@ -214,10 +214,17 @@ pub(super) fn strip_unavailable_tool_hints_from_messages(
     }
 }
 
-pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
-    const MERGED_NOTES_MAX_CHARS: usize = 4_000;
-    const MERGED_SINGLE_NOTE_MAX_CHARS: usize = 1_200;
+const MERGED_NOTES_MAX_CHARS: usize = 4_000;
+const MERGED_SINGLE_NOTE_MAX_CHARS: usize = 1_200;
+/// 持久化 checkpoint 全部保存在 history 中；请求只投影最近有限条，避免 marker
+/// 本身随着长期会话无限增长。
+const REQUEST_CONTEXT_CHECKPOINT_LIMIT: usize = 8;
 
+fn is_context_checkpoint_marker(text: &str) -> bool {
+    text.trim_start().starts_with("[context_checkpoint ")
+}
+
+pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum InternalNoteKind {
         WorkingMemory,
@@ -515,17 +522,32 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         .position(|m| !is_system_like_role(&m.role))
         .unwrap_or(messages.len());
 
+    let checkpoint_markers = messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .content
+                .as_str()
+                .map(str::trim)
+                .filter(|text| is_context_checkpoint_marker(text))
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+
     let mut merged_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
     for (idx, message) in messages.iter().enumerate().take(first_body_idx) {
-        if idx == first_system_idx {
-            continue;
-        }
         let text = message
             .content
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
+        if is_context_checkpoint_marker(text) {
+            continue;
+        }
+        if idx == first_system_idx {
+            continue;
+        }
         if !text.is_empty() {
             merged_notes.push((
                 idx,
@@ -539,6 +561,13 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     let mut merged_first = messages[first_system_idx].clone();
     merged_first.role = ROLE_SYSTEM.to_string();
     merged_first.content = normalize_system_like_content_for_request(&merged_first.content);
+    if merged_first
+        .content
+        .as_str()
+        .is_some_and(is_context_checkpoint_marker)
+    {
+        merged_first.content = Value::String(String::new());
+    }
     if let Some(base) = merged_first.content.as_str() {
         let mut content = base.to_string();
         if !merged_notes.is_empty() {
@@ -558,14 +587,45 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         merged_first.content = Value::String(content);
     }
 
-    let mut out = Vec::with_capacity(messages.len());
+    let checkpoint_markers = checkpoint_markers
+        .into_iter()
+        .rev()
+        .take(REQUEST_CONTEXT_CHECKPOINT_LIMIT)
+        .collect::<Vec<_>>();
+
+    let mut out = Vec::with_capacity(messages.len() + usize::from(!checkpoint_markers.is_empty()));
     out.push(merged_first);
+    if !checkpoint_markers.is_empty() {
+        let mut checkpoint_context =
+            String::from("[Persistent context checkpoints: the most recent durable records]\n");
+        for marker in checkpoint_markers.iter().rev() {
+            checkpoint_context.push_str(marker);
+            checkpoint_context.push('\n');
+        }
+        out.push(Message {
+            role: ROLE_SYSTEM.to_string(),
+            content: Value::String(checkpoint_context),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
     for (idx, message) in messages.iter().enumerate() {
         if idx == first_system_idx {
             continue;
         }
+        if message
+            .content
+            .as_str()
+            .is_some_and(is_context_checkpoint_marker)
+        {
+            // 所有 checkpoint 都集中投影到请求前缀并限量，不能让历史尾部的 marker
+            // 随会话增长；持久化 history 保留完整记录，后续请求只带最近若干条。
+            continue;
+        }
         if idx < first_body_idx {
-            // Already folded into merged_first above.
+            // 普通 note 已折叠进 merged_first；checkpoint 已作为独立、无截断的
+            // system 消息投影，避免被普通 note 的字符预算截断。
             continue;
         }
         if is_system_like_role(&message.role) {

@@ -870,8 +870,8 @@ fn build_system_prompt(
     }
 
     b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
-    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Prefer tool-backed evidence over speculation: inspect the relevant sources, artifacts, or system state and use the available tools before concluding.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- Work in batches: when several independent read-only lookups are needed, issue them together in one message so they run in parallel instead of one-at-a-time round trips.\n- Read in large chunks: prefer one broad read (raise read_file's limit) or a single targeted search over paging through the same file in tiny slices. Do not re-read content you already have; reuse earlier tool output.\n- Locate before reading: use search/navigation tools to pinpoint the region, then read that region once — avoid repeated near-identical searches with only slightly tweaked queries.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
-    b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.");
+    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Prefer tool-backed evidence over speculation: inspect the relevant sources, artifacts, or system state and use the available tools before concluding.\n- Every tool call must have a specific information, verification, or change goal. Avoid open-ended exploration; before continuing a search, know what question the next tool result should answer.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- Work in batches: when several independent read-only lookups are needed, issue them together in one message so they run in parallel instead of one-at-a-time round trips.\n- Read in large chunks: prefer one broad read (raise read_file's limit) or a single targeted search over paging through the same file in tiny slices. Do not re-read content you already have; reuse earlier tool output.\n- Locate before reading: use search/navigation tools to pinpoint the region, then read that region once — avoid repeated near-identical searches with only slightly tweaked queries.\n- Stop exploratory loops once you have enough evidence for a decision or answer; converge promptly instead of gathering redundant context.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
+    b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- Do not treat pressure to converge as permission to guess; if the conclusion is not yet justified, say what is missing or continue with the smallest targeted check.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.");
     b.push(ContextKind::Behavior, "Git safety:\n- Never use `git reset`, `git checkout`, `git restore`, `git stash drop`, or any other git command to discard or roll back existing changes (including staged changes) solely for testing or verification.\n- For a clean test state, use a temporary branch, a worktree, or `git stash push` (then `pop` to restore).\n- If rolling back is genuinely necessary (e.g., the change itself is wrong), first explain the reason to the user and obtain confirmation.");
 
     if has_tool(available_tools, "enable_tools") {
@@ -1042,9 +1042,13 @@ fn build_system_prompt(
             lines.push("Use `task_wait` to collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.".to_string());
         }
         if has_tool(available_tools, "task_status") {
-            lines.push("Use `task_status` for a non-blocking peek. There is no `task_cancel`; let orphaned tasks finish.".to_string());
+            lines.push("Use `task_status` for a non-blocking peek.".to_string());
             lines.push("Before finishing your answer, call `task_status` to confirm no spawned subagent is still running. For every task_id you spawned, you MUST have collected its result (via task_wait or seen completed in task_status) and handled its output — including errors. Never silently drop a spawned task.".to_string());
         }
+        if has_tool(available_tools, "task_cancel") {
+            lines.push("Use `task_cancel` to abandon a stuck or no-longer-needed background subagent instead of repeatedly calling `task_wait` - it terminates the subagent process and writes a cancelled terminal result, but you still must collect that result later with `task_wait` or `task_status`.".to_string());
+        }
+
         if has_tool(available_tools, "task_spawn") {
             lines.push("By default a subagent reuses your (parent) model; only override the `model` field when the subtask is clearly lighter or heavier than your own.".to_string());
             lines.push("Give each subagent a focused context: for narrow leaf tasks prefer `inherit=\"none\"` or `inherit=\"cwd\"`; only use `inherit=\"all\"` when the subtask genuinely needs the full conversation.".to_string());
@@ -1622,8 +1626,18 @@ mod tests {
         assert!(prompt.contains("Correctness guardrails:"));
         assert!(prompt.contains("Do not hallucinate"));
         assert!(prompt.contains("gather sufficient evidence"));
+        assert!(prompt.contains("Do not treat pressure to converge as permission to guess"));
         assert!(prompt.contains("instead of guessing"));
         assert!(prompt.contains("verified facts, working hypotheses, and open questions"));
+    }
+
+    #[test]
+    fn system_prompt_bounds_tool_exploration() {
+        let available = SkipSet::new(16);
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        assert!(prompt.contains("Every tool call must have a specific"));
+        assert!(prompt.contains("Avoid open-ended exploration"));
+        assert!(prompt.contains("Stop exploratory loops once you have enough evidence"));
     }
 
     #[test]

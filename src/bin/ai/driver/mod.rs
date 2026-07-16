@@ -658,6 +658,13 @@ async fn run_loop(
             os.advance_tick();
         }
 
+        // 主动回收超过 wall-clock 总寿命的卡死 subagent 进程。task_wait 内的同名检查
+        // 只在主 agent 主动调用时触发；此处每 epoch 扫描，确保主 agent 去做别的事、
+        // 长期不调 task_wait 时，卡死的后台 subagent 也能被及时终止，避免永久占用
+        // 调度器资源。函数内分两步取锁（先 registry 后 kernel），不与 task_wait 的
+        // 锁顺序（registry -> kernel）形成环；且此处已释放 app.os 锁，无重入死锁。
+        crate::ai::tools::task_tools::reap_timed_out_subagents();
+
         if let Some(counter) = app.agent_reload_counter.as_mut() {
             *counter += 1;
             if manifests_loaded && *counter % 5 == 0 {

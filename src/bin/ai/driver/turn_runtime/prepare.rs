@@ -574,7 +574,8 @@ pub(super) async fn prepare_turn(
                 final_question, ocr.tool_name, ocr.content
             );
         }
-        let content = request::build_content(next_model, &final_question, &app.attached_image_files)?;
+        let content =
+            request::build_content(next_model, &final_question, &app.attached_image_files)?;
         (content, final_question)
     };
     let user_message = Message {
@@ -859,15 +860,14 @@ mod tests {
         QuestionShape, collect_session_code_discovery_records, detect_complex_task,
         extract_existing_code_discoveries, filter_suggested_tool_calls_for_tool_names,
         high_confidence_project_memory_policy, looks_like_code_or_repo_question,
-        persisted_user_turn_message,
-        recalled_knowledge_usage_policy, render_session_code_discovery_recall,
-        should_inject_integrated_reflection, should_run_general_recall,
-        should_run_session_code_discovery_recall,
+        persisted_user_turn_message, recalled_knowledge_usage_policy,
+        render_session_code_discovery_recall, should_inject_integrated_reflection,
+        should_run_general_recall, should_run_session_code_discovery_recall,
     };
     use crate::ai::code_discovery_policy::parse_record_line;
-    use crate::ai::history::ROLE_INTERNAL_NOTE;
     use crate::ai::driver::observer::SuggestedToolCall;
     use crate::ai::history::Message;
+    use crate::ai::history::ROLE_INTERNAL_NOTE;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use serde_json::Value;
     use std::collections::BTreeSet;

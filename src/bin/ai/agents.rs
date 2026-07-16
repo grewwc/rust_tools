@@ -26,9 +26,8 @@ use std::time::SystemTime;
 
 use crate::commonw::{configw, utils::expanduser};
 
-const BUILTIN_AGENTS: &[(&str, &str)] = &[
-    ("build.agent", include_str!("builtin_agents/build.agent")),
-];
+const BUILTIN_AGENTS: &[(&str, &str)] =
+    &[("build.agent", include_str!("builtin_agents/build.agent"))];
 const PROJECT_INSTRUCTION_FILENAMES: &[&str] = &[
     "AGENTS.md",
     "Agent.md",

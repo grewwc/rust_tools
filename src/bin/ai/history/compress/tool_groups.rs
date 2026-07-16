@@ -3,13 +3,16 @@
 //! 把消息序列中较早的 `assistant(tool_calls) + 配套 tool` 组整组折叠成
 //! 单条 `internal_note` stub，逐字保留最近的工具组。
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
 use super::text_utils::truncate_to_chars;
 use super::tool_overflow::{is_non_compressible_tool, is_preserved_user_or_image_stub};
-use super::{keep_recent_user_turns_when_trimming, normalize_whitespace, value_to_string};
+use super::{
+    is_context_checkpoint_marker, keep_recent_user_turns_when_trimming, normalize_whitespace,
+    value_to_string,
+};
 
 pub(super) fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
     let assistant_idx = messages.iter().position(|m| {
@@ -73,6 +76,13 @@ pub(super) fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
 
     while index < protected_tail_start {
         let message = &messages[index];
+
+        // checkpoint 的正文已落盘，短标记是回读正文的唯一入口。它不应因位于
+        // 早期对话中而被兜底裁剪掉。
+        if is_context_checkpoint_marker(message) {
+            index += 1;
+            continue;
+        }
 
         // 已外溢到会话文件的 user/image 占位 stub 不删：它只是一个指向归档
         // 文件的指针（原文零压缩保存在磁盘上），删掉会让模型彻底失去线索。
@@ -221,6 +231,97 @@ fn recent_tool_message_protection_anchor(
         .or_else(|| group_anchors.first().copied())
 }
 
+/// 从工具调用的 JSON `arguments` 里取 `file_path`（或兼容的 `path`）。
+/// `apply_patch` 还可能把目标写在 `patch` 正文 `*** Update File: <path>` /
+/// `*** Add File: <path>` 信封里，做兜底解析。
+fn extract_file_path_arg(arguments: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(arguments).ok()?;
+    if let Some(p) = v.get("file_path").and_then(|x| x.as_str()) {
+        return Some(p.to_string());
+    }
+    if let Some(p) = v.get("path").and_then(|x| x.as_str()) {
+        return Some(p.to_string());
+    }
+    if let Some(patch) = v.get("patch").and_then(|x| x.as_str()) {
+        for line in patch.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("*** Update File:") {
+                return Some(rest.trim().to_string());
+            }
+            if let Some(rest) = trimmed.strip_prefix("*** Add File:") {
+                return Some(rest.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 扫描整条消息流，找出"最近一次 `apply_patch` 失败、且之后同路径没有成功"
+/// 的目标文件路径集合。
+///
+/// 折叠器遇到 `read_file` 这些路径的工具组时跳过折叠，让模型在重试 patch 时
+/// 仍能看到原始文件内容以构造精确 context。判定：按消息顺序记录每个路径最近
+/// 一次 `apply_patch` 的结果；结果 content 以 `Successfully patched` 开头视为成功，
+/// 否则视为失败。只保留最终状态为"失败"的路径——一旦后续同路径 patch 成功即
+/// 自动解除。当失败的 `apply_patch` 调用本身被压缩移出历史后，该路径也随之
+/// 消失，保护范围天然有界（通常 1–3 个文件）。
+fn collect_pending_patch_paths(messages: &[Message]) -> FxHashSet<String> {
+    // tool_call_id → tool 结果文本
+    let mut result_by_id: FxHashMap<String, String> = FxHashMap::default();
+    for m in messages {
+        if m.role == "tool" {
+            if let Some(id) = m.tool_call_id.clone() {
+                result_by_id.insert(id, value_to_string(&m.content));
+            }
+        }
+    }
+    // path → 最近一次 apply_patch 是否成功
+    let mut last_state: FxHashMap<String, bool> = FxHashMap::default();
+    for m in messages {
+        if m.role != "assistant" {
+            continue;
+        }
+        let Some(tcs) = m.tool_calls.as_ref() else { continue; };
+        for tc in tcs {
+            if tc.function.name != "apply_patch" {
+                continue;
+            }
+            let Some(path) = extract_file_path_arg(&tc.function.arguments) else {
+                continue;
+            };
+            let result = result_by_id.get(&tc.id).map(String::as_str).unwrap_or("");
+            let succeeded = result.trim_start().starts_with("Successfully patched");
+            last_state.insert(path, succeeded);
+        }
+    }
+    last_state
+        .into_iter()
+        .filter(|(_, ok)| !*ok)
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// 本工具组是否含 `read_file` 调用，且其 `file_path` 正是某个尚未成功的
+/// `apply_patch` 目标。若是，折叠器应跳过折叠以保留模型重试 patch 所需的
+/// 原始文件内容。
+fn group_reads_pending_patch_target(
+    messages: &[Message],
+    group: &[usize],
+    pending_paths: &FxHashSet<String>,
+) -> bool {
+    let Some(assistant) = messages.get(group[0]) else {
+        return false;
+    };
+    let Some(tcs) = assistant.tool_calls.as_ref() else {
+        return false;
+    };
+    tcs.iter().any(|tc| {
+        tc.function.name == "read_file"
+            && extract_file_path_arg(&tc.function.arguments)
+                .is_some_and(|p| pending_paths.contains(&p))
+    })
+}
+
 /// 把消息序列中较早的 `assistant(tool_calls) + 配套 tool` 组整组折叠成单条
 /// `internal_note` stub，逐字保留最近 `keep_recent_groups` 个工具组以及所有
 /// 非工具组消息（user / system / internal_note / 纯文本 assistant）。
@@ -271,6 +372,14 @@ pub(super) fn fold_early_tool_groups(
         fold_before_anchor = fold_before_anchor.min(protected_anchor);
     }
 
+    // 方向二：pending-patch 定向保留。扫描历史中"最近一次 apply_patch 失败、
+    // 且之后同路径没有成功"的目标文件路径；折叠器遇到读这些路径的 read_file
+    // 组时跳过折叠，让模型在重试 patch 时仍能看到原始文件内容以构造精确
+    // context，避免"内容被 offload → patch context mismatch → 重读 → 被判
+    // 无进展 → 硬停"的死结。保护范围天然有界：patch 成功或失败的 apply_patch
+    // 调用本身被压缩移出历史后，该路径自动解除。
+    let pending_patch_paths = collect_pending_patch_paths(messages);
+
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut folded_groups = 0usize;
     let mut idx = 0usize;
@@ -301,6 +410,14 @@ pub(super) fn fold_early_tool_groups(
                 cursor += 1;
             }
             if let Some(stub) = fold_tool_call_group_to_stub(messages, &group) {
+                // pending-patch 目标路径的 read_file 组跳过折叠，逐字保留。
+                if group_reads_pending_patch_target(messages, &group, &pending_patch_paths) {
+                    for &gi in &group {
+                        out.push(messages[gi].clone());
+                    }
+                    idx = cursor;
+                    continue;
+                }
                 out.push(stub);
                 folded_groups += 1;
                 idx = cursor;

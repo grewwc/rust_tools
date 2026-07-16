@@ -1,10 +1,12 @@
 use super::{
-    AsyncTaskEntry, InheritOptions, OsTaskGoal, SUBAGENT_PARENT_SUMMARY_REMINDER,
-    OutstandingTaskSnapshot, SelectedSubagent, StoredTaskResult, TASK_REGISTRY, WaitManySource,
-    append_current_process_cancel_source, build_selection_explanation, encode_os_task_goal,
-    epoll_wait_many, epoll_wait_many_channels, format_task_result, is_encoded_task_goal,
-    prepare_subagent_task, remove_task_entry, render_outstanding_task_anchor, select_subagent,
-    wait_sources_for_channel_and_futex, with_task_entry_by_pid,
+    AsyncTaskEntry, InheritOptions, OsTaskGoal, OutstandingTaskSnapshot,
+    SUBAGENT_PARENT_SUMMARY_REMINDER, SelectedSubagent, StoredTaskResult, TASK_REGISTRY,
+    WaitManySource, append_current_process_cancel_source, build_selection_explanation,
+    encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels, execute_task_cancel,
+    execute_task_status, execute_task_wait, format_task_result, insert_task_entry_for_test,
+    is_encoded_task_goal, prepare_subagent_task, remove_task_entry,
+    render_outstanding_task_anchor, select_subagent, wait_sources_for_channel_and_futex,
+    with_task_entry_by_pid,
 };
 use super::{ToolRegistration, ToolSpec};
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
@@ -16,7 +18,7 @@ use crate::ai::types::{App, AppConfig};
 use aios_kernel::{
     kernel::{EventId, KernelInternal, Syscall, WaitPolicy},
     local::LocalOS,
-    primitives::{FutexAddr, FutexOps, IpcOps},
+    primitives::{ChannelId, FutexAddr, FutexOps, IpcOps},
 };
 use serde_json::Value;
 use std::sync::{Arc, atomic::AtomicBool};
@@ -485,6 +487,219 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
     assert!(output.contains("Error: request timed out waiting for response headers"));
     assert!(output.contains("(subagent did not produce any final assistant text)"));
     assert!(output.contains(SUBAGENT_PARENT_SUMMARY_REMINDER));
+}
+
+#[test]
+fn task_wait_rejects_foreign_session_task_ids() {
+    let own_task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let foreign_task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let own_task_id_for_call = own_task_id.clone();
+    let foreign_task_id_for_call = foreign_task_id.clone();
+    insert_task_entry_for_test(
+        own_task_id.clone(),
+        AsyncTaskEntry {
+            session_id: "session-a".to_string(),
+            result_observed: false,
+            pid: 1,
+            result_channel_id: 11,
+            completion_futex_addr: FutexAddr(21),
+            description: "own task".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            started_at: Instant::now(),
+        },
+    );
+    insert_task_entry_for_test(
+        foreign_task_id.clone(),
+        AsyncTaskEntry {
+            session_id: "session-b".to_string(),
+            result_observed: false,
+            pid: 2,
+            result_channel_id: 12,
+            completion_futex_addr: FutexAddr(22),
+            description: "foreign task".to_string(),
+            agent_name: "build".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            started_at: Instant::now(),
+        },
+    );
+
+    let result = crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+        ("session-a".to_string(), 0usize),
+        || {
+            execute_task_wait(
+                &serde_json::json!({ "task_ids": [own_task_id_for_call, foreign_task_id_for_call] }),
+            )
+        },
+    );
+
+    let err = result.expect_err("foreign task_id should be rejected");
+    assert!(err.contains("owned by another session"));
+    assert!(remove_task_entry(&own_task_id).is_some());
+    assert!(remove_task_entry(&foreign_task_id).is_some());
+}
+
+#[test]
+fn task_status_collects_completed_results_and_cleans_up_resources() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (pid, result_channel_id, completion_futex_addr) = {
+        let mut os = app.os.lock().unwrap();
+        let pid = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        let channel = os.channel_create(Some(pid), 1, "task-result".to_string());
+        let completion_futex = os.futex_create(0, "task-complete".to_string());
+        os.channel_send(
+            Some(pid),
+            channel,
+            serde_json::json!({
+                "status": "completed",
+                "output": "subagent final answer",
+                "error": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (pid, channel.raw(), completion_futex)
+    };
+
+    insert_task_entry_for_test(
+        task_id.clone(),
+        AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            result_observed: false,
+            pid,
+            result_channel_id,
+            completion_futex_addr,
+            description: "inspect parser".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            started_at: Instant::now(),
+        },
+    );
+
+    let output = crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .sync_scope((app.session_id.clone(), 0usize), || {
+            execute_task_status(&serde_json::json!({}))
+        })
+        .expect("task_status should succeed");
+
+    assert!(output.contains("Completed task results below (already collected"));
+    assert!(output.contains("subagent final answer"));
+    assert!(output.contains("COMPLETED"));
+    assert!(remove_task_entry(&task_id).is_none());
+
+    let os = app.os.lock().unwrap();
+    assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
+    assert!(os.futex_event_id(completion_futex_addr).is_none());
+
+    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        *guard = None;
+    }
+}
+
+#[test]
+fn task_cancel_leaves_cancelled_result_collectable_via_task_wait() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (pid, result_channel_id, completion_futex_addr) = {
+        let mut os = app.os.lock().unwrap();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        let pid = os
+            .spawn(
+                Some(root),
+                "child".to_string(),
+                "goal".to_string(),
+                20,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        let channel = os.channel_create_tagged_with_holders(
+            Some(root),
+            1,
+            "task-result".to_string(),
+            aios_kernel::primitives::ChannelOwnerTag::TaskResult,
+            vec![
+                "task_result.producer".to_string(),
+                "task_result.consumer".to_string(),
+            ],
+        );
+        let completion_futex = os.futex_create(0, "task-complete".to_string());
+        (pid, channel.raw(), completion_futex)
+    };
+
+    insert_task_entry_for_test(
+        task_id.clone(),
+        AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            result_observed: false,
+            pid,
+            result_channel_id,
+            completion_futex_addr,
+            description: "cancel branch".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            started_at: Instant::now(),
+        },
+    );
+
+    let cancel_output = crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+        (app.session_id.clone(), 0usize),
+        || execute_task_cancel(&serde_json::json!({ "task_ids": [task_id.clone()] })),
+    )
+    .expect("task_cancel should succeed");
+    assert!(cancel_output.contains("Required next step: collect these terminal results"));
+    assert!(
+        crate::ai::tools::task_tools::with_task_entry(&task_id, |_| ()).is_some(),
+        "cancelled task must stay collectable until task_wait/task_status consumes it"
+    );
+
+    let wait_output = crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+        (app.session_id.clone(), 0usize),
+        || execute_task_wait(&serde_json::json!({ "task_ids": [task_id.clone()] })),
+    )
+    .expect("task_wait should collect cancelled result");
+
+    assert!(wait_output.contains("CANCELLED"));
+    assert!(wait_output.contains("Error: cancelled by parent agent"));
+    assert!(remove_task_entry(&task_id).is_none());
+
+    let os = app.os.lock().unwrap();
+    assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
+    assert!(os.futex_event_id(completion_futex_addr).is_none());
+
+    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        *guard = None;
+    }
 }
 
 #[test]

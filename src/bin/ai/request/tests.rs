@@ -1874,6 +1874,72 @@ fn normalize_messages_truncates_long_internal_notes_structurally() {
 }
 
 #[test]
+fn normalize_messages_projects_only_recent_context_checkpoints_without_truncating_them() {
+    let mut messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("base system".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(format!("self_note:\n{}", "x".repeat(8_000))),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("question".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+    for index in 0..10 {
+        messages.push(Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(format!(
+                "[context_checkpoint path=/tmp/checkpoint-{index}.md] checkpoint {index}"
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
+
+    let normalized = normalize_messages_for_request(&messages);
+    let checkpoint_context = normalized
+        .iter()
+        .filter_map(|message| message.content.as_str())
+        .find(|content| content.starts_with("[Persistent context checkpoints:"))
+        .expect("recent checkpoints should be projected into one system message");
+    let checkpoints = checkpoint_context
+        .lines()
+        .filter(|line| line.starts_with("[context_checkpoint "))
+        .collect::<Vec<_>>();
+
+    assert_eq!(checkpoints.len(), 8);
+    let expected = (2..10)
+        .map(|index| {
+            format!("[context_checkpoint path=/tmp/checkpoint-{index}.md] checkpoint {index}")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checkpoints,
+        expected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert!(normalized.iter().any(|message| {
+        message
+            .content
+            .as_str()
+            .is_some_and(|content| content.contains("[truncated:"))
+    }));
+}
+
+#[test]
 fn openai_image_content_uses_object_image_url_shape() {
     // 仅当 models.json 中存在一个 OpenAi-provider 且 is_vl=true 的模型时
     // 才能验证"以 {image_url:{url:...}} 对象形状下发图像"的协议契约。

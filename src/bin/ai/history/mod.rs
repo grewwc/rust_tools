@@ -46,6 +46,14 @@ pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE};
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
 pub(in crate::ai) const ROLE_INTERNAL_NOTE: &str = types::ROLE_INTERNAL_NOTE;
 
+pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
+    sessions::normalize_generated_session_title(title)
+}
+
+pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
+    sessions::is_low_quality_session_title(title)
+}
+
 const CONTEXT_HISTORY_CACHE_LIMIT: usize = 8;
 
 static CONTEXT_HISTORY_CACHE: LazyLock<Mutex<Vec<ContextHistoryCacheEntry>>> =

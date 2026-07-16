@@ -111,18 +111,13 @@ fn encoded_background_task_goal_rejects_corrupt_payload() {
 
 #[test]
 fn background_subagent_override_requires_known_enabled_agent() {
-    let mut plan = primary_agent(
-        "plan",
-        "Read-only planning agent",
-        &["plan", "analyze"],
-    );
+    let mut plan = primary_agent("plan", "Read-only planning agent", &["plan", "analyze"]);
     plan.mode = AgentMode::Subagent;
     plan.disabled = true;
     let build = primary_agent("build", "Default agent", &["implement"]);
 
-    let err =
-        resolve_background_subagent_override(&[build.clone(), plan.clone()], Some("plan"))
-            .unwrap_err();
+    let err = resolve_background_subagent_override(&[build.clone(), plan.clone()], Some("plan"))
+        .unwrap_err();
     assert!(err.contains("disabled"));
 
     let err = resolve_background_subagent_override(&[build], Some("missing")).unwrap_err();
@@ -779,7 +774,36 @@ fn auto_route_switches_to_build_for_code_question_when_enabled() {
     let build = primary_agent(
         "build",
         "Default agent for development work",
-        &["fix", "debug", "build", "compile", "test", "implement", "refactor", "execute", "coding", "run", "search", "locate", "inspect", "understand", "test", "debug", "build", "debug", "compile", "explain", "planning", "review", "analyze", "analysis", "summarize", "architecture", "engineer", "design"],
+        &[
+            "fix",
+            "debug",
+            "build",
+            "compile",
+            "test",
+            "implement",
+            "refactor",
+            "execute",
+            "coding",
+            "run",
+            "search",
+            "locate",
+            "inspect",
+            "understand",
+            "test",
+            "debug",
+            "build",
+            "debug",
+            "compile",
+            "explain",
+            "planning",
+            "review",
+            "analyze",
+            "analysis",
+            "summarize",
+            "architecture",
+            "engineer",
+            "design",
+        ],
     );
     let plan = primary_agent(
         "plan",

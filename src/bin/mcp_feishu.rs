@@ -321,7 +321,6 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
     }
 }
 
-
 fn feishu_messages_search(args: &Value) -> Result<String, JsonRpcErr> {
     let search_key = args
         .get("search_key")

@@ -313,3 +313,81 @@ fn summary_model_input_drops_ephemeral_internal_notes() {
     assert!(!note.contains("tool_followup"), "{note}");
     assert!(!note.contains("应去重"), "{note}");
 }
+
+fn assistant_call_args(id: &str, name: &str, arguments: &str) -> Message {
+    let mut m = assistant_call(id, name);
+    if let Some(calls) = &mut m.tool_calls {
+        calls[0].function.arguments = arguments.to_string();
+    }
+    m
+}
+
+fn assistant_call_args_multi(id: &str, calls: &[(&str, &str)]) -> Message {
+    Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(
+            calls
+                .iter()
+                .map(|(name, args)| ToolCall {
+                    id: id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: name.to_string(),
+                        arguments: args.to_string(),
+                    },
+                })
+                .collect(),
+        ),
+        tool_call_id: None,
+        reasoning_content: None,
+    }
+}
+
+/// apply_patch 失败后，该路径最近的 read_file 结果不得被折叠——否则模型
+/// 会因拿不到精确 context 再次 patch 失败、陷入"重读→再失败"循环。
+#[test]
+fn preserves_read_file_for_pending_patch_path() {
+    let mut messages = vec![msg("system", "s"), msg("user", "改代码")];
+    // 早期：read_file 读 /a.rs（将被 apply_patch 引用）。
+    messages.push(assistant_call_args(
+        "call-rf",
+        "read_file",
+        r#"{"file_path":"/a.rs"}"#,
+    ));
+    messages.push(tool_result(
+        "call-rf",
+        "Output preserved for non-compressible tool `read_file`.\n- file_path: /a.rs\n- use read_file to inspect exact content.",
+    ));
+    // apply_patch 针对 /a.rs 失败（pending）。
+    messages.push(assistant_call_args(
+        "call-ap",
+        "apply_patch",
+        r#"{"file_path":"/a.rs","patch":"@@ @@\n-x\n+y\n"}"#,
+    ));
+    messages.push(tool_result(
+        "call-ap",
+        "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+    ));
+    // 追加足够多近端组把上面挤进折叠区。
+    for i in 0..6 {
+        let id = format!("call-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "recent"));
+    }
+
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+    assert!(folded_groups >= 1, "应至少折叠 apply_patch/grep 组");
+    // read_file 组必须逐字保留（不是 ROLE_INTERNAL_NOTE stub）。
+    let rf = folded
+        .iter()
+        .find(|m| m.role == "assistant"
+            && m.tool_calls
+                .as_ref()
+                .and_then(|cs| cs.first())
+                .map(|c| c.function.name == "read_file")
+                .unwrap_or(false))
+        .expect("pending-patch 路径的 read_file 组不应被折叠");
+    let _ = rf; // 仅断言其存在且 role 仍为 assistant
+    assert_tool_pairs_consistent(&folded);
+}

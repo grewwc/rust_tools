@@ -35,13 +35,29 @@ progressive loading.
    failed, and incomplete output. Include shown-vs-total counts and a concrete
    narrow/page hint when output is cut.
 9. **Patch/read/search contracts.** `apply_patch` anchors on remove lines and
-   tolerates stale context only when the removal is unique. `read_file` paginates
-   by line and by character cap, computing continuation offsets from rendered
-   lines. `code_search` is the single entry point for LSP, file, text, and
-   structural navigation.
+   tolerates stale context only when the removal is unique; line matching
+   normalizes confusable typographic characters (smart quotes, dashes, NBSP) so
+   model-introduced variants still match without corrupting output (context
+   lines emit the original file text). A `ReplaceInLine` envelope op
+   (`anchor:`/`old:`/`new:`) does anchored inline substring replacement outside
+   the unified-diff path. `read_file` paginates by line and by character cap,
+   computing continuation offsets from rendered lines. `code_search` is the
+   single entry point for LSP, file, text, and structural navigation.
 10. **Subagent tools.** `task`/`task_spawn` enforce the depth cap, results are
     session-scoped, and surfaced child outputs must remind the parent to produce
     its own summary.
+
+11. **Wall-clock safety net.** Stuck subagents are reaped after
+    `SUBAGENT_WALL_CLOCK_TIMEOUT` (30 min) via two paths: `task_wait`'s per-call
+    check and the driver `run_loop`'s per-epoch `reap_timed_out_subagents()`
+    scan (so a subagent is killed even if the parent never calls `task_wait`).
+    The reaper kills the process and writes a `timeout`/`cancelled` terminal
+    result but never destroys the channel/futex or removes the registry entry -
+    that is left to the collecting `task_wait` ready path. `reap_timed_out_subagents`
+    takes locks in two non-overlapping steps (registry-only then kernel-only) to
+    avoid a lock cycle with `task_wait` (which holds registry -> kernel).
+    `task_cancel` skips already-finished tasks (via `is_task_pending`) so it
+    never overwrites/discards a real result.
 
 ## Related detailed guide
 

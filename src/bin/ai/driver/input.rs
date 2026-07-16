@@ -1884,7 +1884,10 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
         let store = crate::ai::history::SessionStore::new(sessions_dir);
         // 优先使用 LLM 生成的标题，fallback 到首条消息摘要
         let topic = match store.read_session_title(&app.session_id).ok().flatten() {
-            Some(t) => Some(t),
+            Some(t) => {
+                let t = crate::ai::history::normalize_generated_session_title(&t);
+                (!t.is_empty()).then_some(t)
+            }
             None => store
                 .first_user_prompt(&app.session_id)
                 .ok()

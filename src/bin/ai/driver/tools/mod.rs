@@ -215,18 +215,14 @@ fn equivalent_tools(
             name: "code_search",
             description: "locate the relevant region first",
         }],
-        "code_search" => &[
-            ToolAlternative {
-                name: "find_path",
-                description: "filename or glob match",
-            },
-        ],
-        "find_path" => &[
-            ToolAlternative {
-                name: "code_search",
-                description: "semantic or structural search",
-            },
-        ],
+        "code_search" => &[ToolAlternative {
+            name: "find_path",
+            description: "filename or glob match",
+        }],
+        "find_path" => &[ToolAlternative {
+            name: "code_search",
+            description: "semantic or structural search",
+        }],
         _ => &[],
     };
 

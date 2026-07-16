@@ -19,6 +19,24 @@ use super::{
     types::Message,
 };
 
+/// 递归复制目录树 `src` -> `dst`（`dst` 不应已存在）。
+/// fork_session 时用于完整复制 assets 目录：checkpoint 正文位于嵌套目录中，
+/// 浅复制会让 fork 后的 marker 指向缺失文件。
+fn copy_dir_recursively(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursively(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::ai) struct SessionStore {
     root: PathBuf,
@@ -96,11 +114,11 @@ impl SessionStore {
             let id = stem.to_string();
             // 优先使用 LLM 生成的标题（存储在 meta 表中），fallback 到首条消息摘要
             let generated_title = read_session_title_sqlite(&path).unwrap_or(None);
-            let summary = if let Some(ref title) = generated_title {
-                Some(title.clone())
-            } else {
-                first_user_prompt.as_deref().map(generate_session_summary)
-            };
+            let summary = generated_title
+                .as_deref()
+                .map(normalize_generated_session_title)
+                .filter(|title| !title.is_empty())
+                .or_else(|| first_user_prompt.as_deref().map(generate_session_summary));
             let timestamp = modified_local
                 .map(|dt| dt.timestamp_millis() as u64)
                 .unwrap_or(0);
@@ -208,7 +226,7 @@ impl SessionStore {
     }
 
     /// 把 `src` session 整体复制到 `dst` 作为新分支。原 session 不动。
-    /// 拒绝覆盖已有 dst（避免误覆盖）。assets 目录如果存在也一并复制。
+    /// 拒绝覆盖已有 dst（避免误覆盖）。assets 目录如果存在也递归复制。
     pub(in crate::ai) fn fork_session(&self, src: &str, dst: &str) -> io::Result<()> {
         let src_path = self.session_history_file(src);
         if !src_path.exists() {
@@ -218,7 +236,9 @@ impl SessionStore {
             ));
         }
         let dst_path = self.session_history_file(dst);
-        if dst_path.exists() {
+        let src_assets = self.session_assets_dir(src);
+        let dst_assets = self.session_assets_dir(dst);
+        if dst_path.exists() || dst_assets.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("destination session '{dst}' already exists"),
@@ -227,19 +247,13 @@ impl SessionStore {
         self.ensure_root_dir()?;
         fs::copy(&src_path, &dst_path)?;
 
-        // assets 目录是可选的；存在则尽力浅复制
-        let src_assets = self.session_assets_dir(src);
+        // assets 目录是可选的；若存在则必须完整复制。checkpoint 正文位于嵌套
+        // 目录中，浅复制会让 fork 后的 marker 指向缺失文件。
         if src_assets.is_dir() {
-            let dst_assets = self.session_assets_dir(dst);
-            let _ = fs::create_dir_all(&dst_assets);
-            if let Ok(entries) = fs::read_dir(&src_assets) {
-                for entry in entries.flatten() {
-                    let from = entry.path();
-                    if let Some(name) = entry.file_name().to_str() {
-                        let to = dst_assets.join(name);
-                        let _ = fs::copy(&from, &to);
-                    }
-                }
+            if let Err(error) = copy_dir_recursively(&src_assets, &dst_assets) {
+                let _ = fs::remove_file(&dst_path);
+                let _ = fs::remove_dir_all(&dst_assets);
+                return Err(error);
             }
         }
         Ok(())
@@ -581,6 +595,74 @@ fn truncate_summary(s: &str, max_len: usize) -> String {
     out
 }
 
+/// 清洗模型生成的 session 标题，避免把“帮我/请问”等请求壳写进标题。
+pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
+    let first_line = title.lines().next().unwrap_or("").trim();
+    let without_agent = strip_agent_prefix(first_line);
+    let without_request = strip_request_filler_prefixes(without_agent).0;
+    truncate_summary(without_request.trim(), 30)
+}
+
+/// 判断已有标题是否像原始用户请求片段；这类旧标题允许后续 turn 重新生成覆盖。
+pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
+        return true;
+    }
+    let without_agent = strip_agent_prefix(trimmed);
+    let (_, stripped_request_prefix) = strip_request_filler_prefixes(without_agent);
+    stripped_request_prefix || trimmed.chars().count() > 40
+}
+
+fn strip_request_filler_prefixes(mut text: &str) -> (&str, bool) {
+    let fillers = [
+        "你帮我看一下",
+        "你帮我给",
+        "请帮我给",
+        "麻烦帮我给",
+        "帮我看一下",
+        "帮我给",
+        "能不能帮我",
+        "可以帮我",
+        "麻烦帮我",
+        "请帮我",
+        "你帮我",
+        "帮我",
+        "请",
+        "麻烦",
+        "拜托",
+        "求",
+        "我想",
+        "我想要",
+        "我需要",
+        "希望",
+        "希望能",
+        "想问一下",
+        "问一下",
+        "请问",
+        "想知道",
+        "看一下",
+        "帮看看",
+        "看看",
+    ];
+    let mut stripped_any = false;
+    loop {
+        let mut stripped = false;
+        let trimmed = text.trim_start();
+        for filler in &fillers {
+            if let Some(rest) = trimmed.strip_prefix(filler) {
+                text = rest.trim_start();
+                stripped = true;
+                stripped_any = true;
+                break;
+            }
+        }
+        if !stripped {
+            return (trimmed, stripped_any);
+        }
+    }
+}
+
 /// 去掉 agent/命令前缀（如 "a "、"a:"、"agent:"、"/" 等）。
 fn strip_agent_prefix(text: &str) -> &str {
     let t = text.trim_start();
@@ -647,11 +729,18 @@ fn extract_first_sentence(text: &str) -> String {
 /// 去掉常见的冗余前缀，使标题更简洁概括。
 fn strip_filler_prefixes(text: &str) -> String {
     let fillers = [
-        "帮我",
-        "请帮我",
-        "麻烦帮我",
+        "你帮我看一下",
+        "你帮我给",
+        "请帮我给",
+        "麻烦帮我给",
+        "帮我看一下",
+        "帮我给",
         "能不能帮我",
         "可以帮我",
+        "麻烦帮我",
+        "请帮我",
+        "你帮我",
+        "帮我",
         "请",
         "麻烦",
         "拜托",
@@ -666,7 +755,6 @@ fn strip_filler_prefixes(text: &str) -> String {
         "请问",
         "想知道",
         "看一下",
-        "帮我看一下",
         "帮看看",
         "看看",
         "如何",
@@ -688,4 +776,35 @@ fn strip_filler_prefixes(text: &str) -> String {
         }
     }
     t.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        generate_session_summary, is_low_quality_session_title, normalize_generated_session_title,
+    };
+
+    #[test]
+    fn session_title_fallback_strips_compound_filler_prefixes() {
+        assert_eq!(
+            generate_session_summary("你帮我给a.rs这个agent的system prompt加一个限制吧"),
+            "a.rs这个agent的system prompt加一个限制吧"
+        );
+        assert_eq!(
+            generate_session_summary("帮我给 session title 问题排查一下"),
+            "session title 问题排查一下"
+        );
+    }
+
+    #[test]
+    fn low_quality_session_titles_are_normalized_or_regenerated() {
+        let bad_title = "你帮我给a.rs这个agent的system prompt加一个限制吧";
+        assert!(is_low_quality_session_title(bad_title));
+        assert_eq!(
+            normalize_generated_session_title(bad_title),
+            "a.rs这个agent的system prompt加一个限制…"
+        );
+
+        assert!(!is_low_quality_session_title("session title 问题排查"));
+    }
 }

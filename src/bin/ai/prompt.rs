@@ -96,6 +96,7 @@ impl PromptEditor {
         let Some(title) = self.session_store.read_session_title(&self.session_id)? else {
             return Ok(None);
         };
+        let title = crate::ai::history::normalize_generated_session_title(&title);
         if title.trim().is_empty() {
             return Ok(None);
         }
