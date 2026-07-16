@@ -92,6 +92,7 @@ fn test_app() -> App {
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
         prune_marks: Default::default(),
+        turn_reasoning_items: Default::default(),
     }
 }
 
@@ -569,6 +570,54 @@ fn thinking_fold_keeps_reasoning_buffer_intact() {
     assert_eq!(state.content.assistant_text, "final answer");
     assert!(!state.content.thinking_open);
     assert!(!state.render.thinking_fold.active);
+}
+
+#[test]
+fn reasoning_summary_done_snapshot_does_not_duplicate_thinking() {
+    // Responses 协议先流式发 `.delta` 增量，再用 `.done` 事件重发整段推理摘要
+    // （SnapshotChunk）。若不对 snapshot 做未见后缀去重，thinking 会被打印两遍。
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    for delta in ["I'm considering ", "inspecting the task_tools."] {
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            Some("response.reasoning_summary_text.delta"),
+            &format!(
+                r#"{{"delta":{}}}"#,
+                serde_json::Value::String(delta.to_string())
+            ),
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        state.content.reasoning_text,
+        "I'm considering inspecting the task_tools."
+    );
+
+    // `.done` 事件携带完整摘要（全量）——去重后不应再追加任何内容。
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.reasoning_summary_text.done"),
+        r#"{"text":"I'm considering inspecting the task_tools."}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        state.content.reasoning_text, "I'm considering inspecting the task_tools.",
+        "snapshot 不应重复追加已流式过的推理摘要"
+    );
 }
 
 #[test]

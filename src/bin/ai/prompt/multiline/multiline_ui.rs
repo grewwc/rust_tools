@@ -122,7 +122,9 @@ fn resize_inline_viewport(terminal: &mut MultilineTerminal, new_height: u16) -> 
 /// 处理 `Event::Resize` 连续触发的情况：终端窗口拖动时 Resize 事件会快速连发，
 /// 如果每次都重绘 inline viewport，会导致"画面撕裂"或闪烁。
 /// 本函数先 drain 掉后续堆积的 Resize 事件，再做一次 full redraw。
-fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
+fn handle_resize_burst<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+) -> io::Result<()> {
     // 1) drain 掉所有后续的 Resize 事件，避免重复触发重绘
     while event::poll(Duration::ZERO).unwrap_or(false) {
         match event::read() {
@@ -133,12 +135,15 @@ fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>)
         }
     }
 
-    // 2) 通知 ratatui 终端尺寸已变化（宽度变化影响文本折行），
-    //    然后清除 inline viewport。不再手动 MoveUp + Clear：
-    //    viewport_height 是启动时的快照，resize 后手动 MoveUp 的行数
-    //    与 ratatui 内部光标状态不一致，导致 clear() 清错区域，旧
-    //    viewport 内容（包括 cursor 块 ▌）残留在 scrollback 中反复堆叠。
+    // 2) 先按 ratatui 记录的旧 inline viewport 擦掉上一帧，再通知 ratatui
+    //    终端尺寸已变化（宽度变化影响文本折行）。如果先 autoresize，inline
+    //    viewport 可能为了重新锚定而 append_lines，把上一帧的 model/help 行推入
+    //    VSCode/Trae 终端 scrollback；之后再 clear 只能擦到新 viewport，旧内容就会
+    //    形成重复渲染。最后再擦一次新 viewport，保证下一帧从干净区域重绘。
+    //    不手动 MoveUp + Clear：viewport_height 是启动时快照，resize 后手动行数
+    //    与 ratatui 内部光标状态不一致，容易清错区域。
     let _ = terminal.hide_cursor();
+    clear_inline_viewport_preserving_cursor(terminal);
     let _ = terminal.autoresize();
     clear_inline_viewport_preserving_cursor(terminal);
     Ok(())
@@ -204,7 +209,7 @@ impl PromptEditor {
                 None => TextArea::default(),
             };
             let mut history = MultilineHistoryState::new(self.multiline_history_entries());
-            let mut status_msg: Option<String> = None;
+            let mut status_msg: Option<String> = self.pending_status_msg.take();
             let mut pending_tab_completion: Option<PendingTabCompletion> = None;
             let mut completion_panel: Option<CompletionPanel> = None;
             let mut recent_text_input: Option<RecentTextInput> = None;

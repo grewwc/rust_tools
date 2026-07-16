@@ -250,11 +250,13 @@
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
+    "request_protocol": "responses",
     "default_reasoning_effort": "high",
     "reasoning_effort_conflicts_with_tools": false,
+    "reasoning_encrypted_replay": true,
     "subagent_priority": 50,
     "max_output_tokens": 128000,
-    "request_tpm_limit": 500000
+    "request_tpm_limit": 600000
   },
   {
     "key": "gpt-5.6-sol",
@@ -267,10 +269,12 @@
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
+    "request_protocol": "responses",
     "default_reasoning_effort": "high",
     "reasoning_effort_conflicts_with_tools": false,
+    "reasoning_encrypted_replay": true,
     "subagent_priority": 50,
     "max_output_tokens": 128000,
-    "request_tpm_limit": 550000
+    "request_tpm_limit": 650000
   }
 ]

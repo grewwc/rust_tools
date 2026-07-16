@@ -1887,6 +1887,9 @@ async fn run_turn_body(
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
     // 每轮开始清除上一轮的打断标记，确保它只反映「本轮」是否被 Ctrl+C 打断。
     app.last_turn_interrupted = false;
+    // reasoning items 侧信道是 turn 级内存态：每轮开始清空，避免上一轮的
+    // encrypted reasoning 泄漏到本轮请求（call_id 也不会再匹配）。
+    app.turn_reasoning_items.clear();
     let TurnPreparation {
         mut skill_turn,
         mut messages,

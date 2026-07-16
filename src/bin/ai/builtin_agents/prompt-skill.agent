@@ -21,7 +21,7 @@ tools:
   - write_file
   - apply_patch
   - code_search
-  - search_files
+  - find_path
 disable_mcp_tools: true
 ---
 

@@ -148,6 +148,7 @@ pub(crate) async fn summarize_history_via_model(
         None,
         None,
         None,
+        None,
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
@@ -260,6 +261,7 @@ pub(crate) async fn generate_session_title_via_model(
         None,
         None,
         None,
+        None,
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
@@ -282,8 +284,8 @@ pub(crate) async fn generate_session_title_via_model(
         }
         Err(_) => {
             // eprintln!(
-                // "[session-title] timeout ({}s) sending request, skipping",
-                // SESSION_TITLE_REQUEST_TIMEOUT_SECS
+            // "[session-title] timeout ({}s) sending request, skipping",
+            // SESSION_TITLE_REQUEST_TIMEOUT_SECS
             // );
             return None;
         }
@@ -308,8 +310,8 @@ pub(crate) async fn generate_session_title_via_model(
         }
         Err(_) => {
             // eprintln!(
-                // "[session-title] timeout ({}s) reading body, skipping",
-                // SESSION_TITLE_BODY_TIMEOUT_SECS
+            // "[session-title] timeout ({}s) reading body, skipping",
+            // SESSION_TITLE_BODY_TIMEOUT_SECS
             // );
             return None;
         }

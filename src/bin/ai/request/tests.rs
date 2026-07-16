@@ -353,6 +353,7 @@ fn test_app() -> App {
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
         prune_marks: Default::default(),
+        turn_reasoning_items: Default::default(),
     }
 }
 
@@ -600,6 +601,7 @@ fn build_request_body_wire_format_is_byte_stable_per_adapter() {
         Some("high"),
         None,
         None,
+        None,
     );
     // wire 里的 model 字段是解析后的 request_model_name（provider 实际模型名），
     // 与用于定位的 key 可能不同。
@@ -633,6 +635,7 @@ fn build_request_body_wire_format_is_byte_stable_per_adapter() {
             None,
             None,
             Some("medium"),
+            None,
             None,
             None,
         );
@@ -712,6 +715,7 @@ fn build_request_body_sends_provider_model_name_for_key_handle() {
         None,
         None,
         None,
+        None,
     );
     let json = serde_json::to_value(&body).unwrap();
 
@@ -750,6 +754,7 @@ fn opencode_deepseek_reasoning_effort_suppresses_thinking_object() {
             Some("high"),
             None,
             None,
+            None,
         );
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
@@ -781,6 +786,10 @@ fn modelhub_models_support_reasoning_with_tools_via_responses() {
     for model in ["gpt-5.5", "gpt-5.6-sol"] {
         assert!(!models::reasoning_effort_conflicts_with_tools(model));
         assert!(models::endpoint_for_model(model, "").ends_with("/v1/responses"));
+        assert_eq!(
+            models::request_protocol_dialect(model, &models::endpoint_for_model(model, "")),
+            RequestProtocolDialect::Responses
+        );
     }
 }
 
@@ -812,9 +821,10 @@ fn responses_request_body_uses_function_tools_and_nested_reasoning() {
         Some("high"),
         None,
         None,
+        None,
     );
 
-    let body = super::builder::build_responses_request_body(&request);
+    let body = super::build_responses_request_body(&request);
     assert_eq!(body["reasoning"]["effort"], "high");
     assert_eq!(body["reasoning"]["summary"], "auto");
     assert_eq!(body["tools"][0]["type"], "function");
@@ -824,6 +834,298 @@ fn responses_request_body_uses_function_tools_and_nested_reasoning() {
     assert_eq!(body["input"][0]["role"], "user");
     assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
     assert_eq!(body["input"][0]["content"][0]["text"], "hi");
+}
+
+#[test]
+fn responses_protocol_dialect_infers_from_endpoint_when_unspecified() {
+    assert_eq!(
+        RequestProtocolDialect::infer_from_endpoint("https://api.example.com/v1/chat/completions"),
+        RequestProtocolDialect::ChatCompletions
+    );
+    assert_eq!(
+        RequestProtocolDialect::infer_from_endpoint("https://api.example.com/v1/responses"),
+        RequestProtocolDialect::Responses
+    );
+}
+
+#[test]
+fn responses_request_body_omits_assistant_reasoning_from_message_content() {
+    // Responses message content 只接受 output_text/refusal；reasoning_content 不得
+    // 被回放成 summary_text（会 400），只保留可见回答文本。
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::String("final answer".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: Some("step summary".to_string()),
+    }];
+    let request = RequestBody {
+        model: "gpt-5.5".to_string(),
+        messages: &messages,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: Some("high"),
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: None,
+        reasoning_encrypted_replay: false,
+    };
+
+    let body = super::build_responses_request_body(&request);
+    let content = body["input"][0]["content"]
+        .as_array()
+        .expect("assistant content should be encoded as array");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "output_text");
+    assert_eq!(content[0]["text"], "final answer");
+    assert!(
+        !content.iter().any(|item| item["type"] == "summary_text"),
+        "message content must not contain summary_text"
+    );
+}
+
+#[test]
+fn responses_request_body_emits_bare_function_call_for_tool_turn() {
+    // assistant 只带 tool_calls（无可见文本）时，直接产出扁平 function_call，
+    // 不再补 assistant message item，也不注入 reasoning summary_text。
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{\"path\":\"src/main.rs\"}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: Some("need to inspect the file first".to_string()),
+    }];
+    let request = RequestBody {
+        model: "gpt-5.5".to_string(),
+        messages: &messages,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: Some("high"),
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: None,
+        reasoning_encrypted_replay: false,
+    };
+
+    let body = super::build_responses_request_body(&request);
+    let input = body["input"]
+        .as_array()
+        .expect("responses request should contain input items");
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0]["type"], "function_call");
+    assert_eq!(input[0]["call_id"], "call_1");
+    assert!(
+        !input
+            .iter()
+            .any(|item| item["type"] == "summary_text"
+                || item["content"][0]["type"] == "summary_text"),
+        "tool-call turn must not replay reasoning as summary_text"
+    );
+}
+
+#[test]
+fn responses_request_body_drops_empty_text_content_items() {
+    // 空串文本会被 Responses API 拒绝（400 invalid_value），必须过滤掉。
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let request = RequestBody {
+        model: "gpt-5.5".to_string(),
+        messages: &messages,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: None,
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: None,
+        reasoning_encrypted_replay: false,
+    };
+
+    let body = super::build_responses_request_body(&request);
+    let content = body["input"][0]["content"]
+        .as_array()
+        .expect("content should be an array");
+    assert!(
+        content.is_empty(),
+        "empty-text content item should be filtered out, got: {content:?}"
+    );
+}
+
+#[test]
+fn responses_request_body_includes_encrypted_reasoning_flag_for_capable_model() {
+    // 声明了 reasoning_encrypted_replay 的模型：请求必须带
+    // include: ["reasoning.encrypted_content"]，否则服务端不下发 encrypted_content。
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let request = build_request_body(
+        "gpt-5.5", &messages, false, false, None, None, None, None, None, None, None,
+    );
+    assert!(
+        request.reasoning_encrypted_replay,
+        "gpt-5.5 declares reasoning_encrypted_replay=true in models.json"
+    );
+
+    let body = super::build_responses_request_body(&request);
+    assert_eq!(
+        body["include"],
+        json!(["reasoning.encrypted_content"]),
+        "capable model must request encrypted reasoning include"
+    );
+}
+
+#[test]
+fn responses_request_body_omits_include_without_encrypted_replay() {
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let request = RequestBody {
+        model: "gpt-5.5".to_string(),
+        messages: &messages,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: Some("high"),
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: None,
+        reasoning_encrypted_replay: false,
+    };
+
+    let body = super::build_responses_request_body(&request);
+    assert!(
+        body.get("include").is_none(),
+        "include must be omitted when encrypted replay is off"
+    );
+}
+
+#[test]
+fn responses_request_body_replays_reasoning_items_before_function_call() {
+    // 侧信道命中：以首个 tool_call id 为 key 的 reasoning items 必须原样 splice
+    // 到对应 function_call 之前，供模型保留上一跳推理上下文。
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let mut items = rustc_hash::FxHashMap::default();
+    items.insert(
+        "call_1".to_string(),
+        vec![json!({
+            "type": "reasoning",
+            "id": "rs_abc",
+            "encrypted_content": "ENC",
+            "summary": [],
+        })],
+    );
+    let request = RequestBody {
+        model: "gpt-5.5".to_string(),
+        messages: &messages,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: Some("high"),
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: Some(&items),
+        reasoning_encrypted_replay: true,
+    };
+
+    let body = super::build_responses_request_body(&request);
+    let input = body["input"].as_array().expect("input array");
+    assert_eq!(input.len(), 2, "reasoning item + function_call");
+    assert_eq!(input[0]["type"], "reasoning");
+    assert_eq!(input[0]["id"], "rs_abc");
+    assert_eq!(input[0]["encrypted_content"], "ENC");
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_1");
+}
+
+#[test]
+fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items() {
+    // 侧信道未命中（拿不到 encrypted_content）：退化为扁平 function_call，零 regression。
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let empty = rustc_hash::FxHashMap::default();
+    let request = RequestBody {
+        model: "gpt-5.5".to_string(),
+        messages: &messages,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: Some("high"),
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: Some(&empty),
+        reasoning_encrypted_replay: true,
+    };
+
+    let body = super::build_responses_request_body(&request);
+    let input = body["input"].as_array().expect("input array");
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0]["type"], "function_call");
+    assert_eq!(input[0]["call_id"], "call_1");
 }
 
 #[test]
@@ -842,6 +1144,7 @@ fn deepseek_request_body_uses_thinking_object() {
         &messages,
         false,
         false,
+        None,
         None,
         None,
         None,
@@ -869,6 +1172,7 @@ fn deepseek_request_body_uses_thinking_object() {
         None,
         None,
         None,
+        None,
     );
     let enabled = serde_json::to_value(&enabled).unwrap();
     assert_eq!(enabled.get("thinking"), Some(&json!({ "type": "enabled" })));
@@ -888,6 +1192,7 @@ fn non_deepseek_request_body_omits_thinking_object() {
         &messages,
         true,
         false,
+        None,
         None,
         None,
         None,
@@ -963,6 +1268,7 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
         Some("high"),
         None,
         None,
+        None,
     );
     let value = serde_json::to_value(&body).unwrap();
     assert_eq!(
@@ -995,7 +1301,7 @@ fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
     for model in ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.7-code"] {
         // gate 关闭 → enable_thinking:false
         let disabled = build_request_body(
-            model, &messages, false, false, None, None, None, None, None, None,
+            model, &messages, false, false, None, None, None, None, None, None, None,
         );
         let disabled = serde_json::to_value(&disabled).unwrap();
         assert_eq!(
@@ -1008,7 +1314,7 @@ fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
 
         // gate 开启 → enable_thinking:true
         let enabled = build_request_body(
-            model, &messages, false, true, None, None, None, None, None, None,
+            model, &messages, false, true, None, None, None, None, None, None, None,
         );
         let enabled = serde_json::to_value(&enabled).unwrap();
         assert_eq!(
@@ -1077,6 +1383,7 @@ fn openai_request_body_omits_nonstandard_flags() {
         Some("high"),
         None,
         None,
+        None,
     );
     let value = serde_json::to_value(&body).unwrap();
 
@@ -1112,6 +1419,7 @@ fn alibaba_request_body_keeps_extension_flags() {
         None,
         None,
         Some("high"),
+        None,
         None,
         None,
     );
@@ -1637,9 +1945,11 @@ fn responses_request_body_converts_chat_multimodal_content_to_input_items() {
         reasoning: None,
         stream_options: None,
         max_tokens: None,
+        reasoning_items: None,
+        reasoning_encrypted_replay: false,
     };
 
-    let body = super::builder::build_responses_request_body(&request);
+    let body = super::build_responses_request_body(&request);
     let content = body
         .get("input")
         .and_then(Value::as_array)

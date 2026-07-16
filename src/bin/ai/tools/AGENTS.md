@@ -63,8 +63,9 @@ execution policy, sandboxing, path resolution, or progressive loading.
     `structural`. Legacy `lsp` maps to `code_search` via
     `canonical_tool_name`.
 14. **Subagent spawn depth**: `task_spawn`/`task` reject when
-    `child_depth > MAX_SUBAGENT_SPAWN_DEPTH` (2). Prevents unbounded
-    recursive fanout.
+    `child_depth > MAX_SUBAGENT_SPAWN_DEPTH` (1). Only the top-level agent may
+    delegate to a child subagent; child subagents must do work directly and do
+    not see task orchestration tools in their visible tool set.
 
 ## Related detailed guide
 

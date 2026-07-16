@@ -11,7 +11,7 @@ use crate::ai::tools::common::{
     ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
     ToolRegistration, ToolSpec,
 };
-use crate::ai::tools::search_tools::execute_search_files;
+use crate::ai::tools::search_tools::execute_find_path;
 use crate::ai::tools::text_grep_tools::{ContentSearchOptions, run_content_search};
 
 const CODE_EXTENSIONS: &[&str] = &[
@@ -344,16 +344,16 @@ fn execute_code_find_file(args: &Value) -> Result<String, String> {
         "pattern": pattern,
         "path": path,
     });
-    let result = execute_search_files(&forwarded)?;
+    let result = execute_find_path(&forwarded)?;
     if result.trim().is_empty() {
         let guidance = render_guidance_lines(&find_file_guidance(pattern, path));
         Ok(format!(
-            "code_search route=search_files operation=find_file\nsummary: No files matched '{}' under '{}'.\nNo files matched '{}' under '{}'.\n{}",
+            "code_search route=file_search operation=find_file\nsummary: No files matched '{}' under '{}'.\nNo files matched '{}' under '{}'.\n{}",
             pattern, path, pattern, path, guidance
         ))
     } else {
         Ok(format!(
-            "code_search route=search_files operation=find_file\n{}",
+            "code_search route=file_search operation=find_file\n{}",
             result
         ))
     }
@@ -1362,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn find_file_behavior_still_routes_to_search_files() {
+    fn find_file_behavior_routes_to_find_path() {
         let dir = make_temp_dir("find_file");
         let file = dir.join("Cargo.toml");
         fs::write(&file, "[package]\nname = \"demo\"\n").unwrap();
@@ -1374,7 +1374,7 @@ mod tests {
         });
         let result = execute_code_find_file(&args).unwrap();
 
-        assert!(result.contains("code_search route=search_files operation=find_file"));
+        assert!(result.contains("code_search route=file_search operation=find_file"));
         assert!(result.contains("Cargo.toml"));
 
         let _ = fs::remove_dir_all(&dir);

@@ -31,7 +31,7 @@ Read `docs/agent-guides/ai-driver.md` before changing the run loop, turn prepara
 
 3. **Turn preparation.** `push_project_context()` keeps repo-local instruction docs available and must not silently drop scoped instruction docs. `build_project_instruction_prompt()` materializes auto-discovered `AGENTS.md`/`CLAUDE.md`. One-shot knowledge maintenance runs before interactive `run_loop()`.
 
-4. **Subagent spawn depth.** `runtime_ctx::SUBAGENT_DEPTH` (task-local) tracks nesting; `MAX_SUBAGENT_SPAWN_DEPTH` (=2) caps the chain. Subagent at depth ≥2 calling `task`/`task_spawn` gets an error. Depth carried in `OsTaskGoal.spawn_depth`, scoped by both dispatch paths.
+4. **Subagent spawn depth.** `runtime_ctx::SUBAGENT_DEPTH` (task-local) tracks nesting; `MAX_SUBAGENT_SPAWN_DEPTH` (=1) allows only top-level agent → child subagent. Child subagents do not receive task orchestration tools (`task`/`task_spawn`/`task_wait`/`task_status`/`agent_team`) in their visible tool set, and direct calls still fail by depth guard. Depth carried in `OsTaskGoal.spawn_depth`, scoped by both dispatch paths.
 
 5. **Background dispatch notes.** Process/correction notes (truncation-retry hints, cache-hit notes, `discover_skills` followups) are turn-scoped: push to `messages` only, never via `append_message_pair`, so they don't persist into `turn_messages` and can't accumulate across turns. 同理，assistant 的 tool-call narration / `reasoning_content` 仅保留在本 turn 的 `messages` 轨道；写入 `turn_messages` 时必须使用瘦身后的持久化副本（tool-call assistant 置空 content、移除 reasoning），避免单个 user turn 把历史污染成数百条过程消息。
 

@@ -1,3 +1,4 @@
+pub(crate) mod audit;
 pub(crate) mod command;
 pub(crate) mod delete;
 pub(crate) mod file;

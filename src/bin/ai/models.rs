@@ -8,6 +8,7 @@ use super::cli::ParsedCli;
 use super::config_schema::AiConfig;
 use super::model_names::{self, ModelDef};
 use super::provider::{self, ApiProvider, ModelQualityTier, ReasoningEffort};
+use super::request_protocol::RequestProtocolDialect;
 use crate::commonw::configw;
 
 fn model_def(model: &str) -> Option<&'static ModelDef> {
@@ -85,6 +86,25 @@ pub(super) fn request_tpm_limit(model: &str) -> Option<u64> {
     model_def(model)
         .and_then(|m| m.request_tpm_limit)
         .filter(|limit| *limit > 0)
+}
+
+/// 返回该模型当前生效的请求协议方言。
+///
+/// 优先使用 models.json 中显式声明的 `request_protocol`；未声明时按 endpoint
+/// 做兼容推断，以便历史配置在不改文件时也维持原有 wire 行为。
+pub(super) fn request_protocol_dialect(model: &str, endpoint: &str) -> RequestProtocolDialect {
+    model_def(model)
+        .and_then(|m| m.request_protocol)
+        .unwrap_or_else(|| RequestProtocolDialect::infer_from_endpoint(endpoint))
+}
+
+/// 该模型是否启用「加密推理项回放」（仅 `responses` 协议有意义）。
+/// 缺省关闭；开启后请求带 `include: ["reasoning.encrypted_content"]`，并在同
+/// turn 工具链中回放服务端返回的 reasoning item。
+pub(super) fn reasoning_encrypted_replay_enabled(model: &str) -> bool {
+    model_def(model)
+        .map(|m| m.reasoning_encrypted_replay)
+        .unwrap_or(false)
 }
 
 pub(super) fn model_adapter(model: &str) -> ApiProvider {
@@ -822,7 +842,7 @@ mod tests {
         determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
         endpoint_supports_anonymous_auth, initial_model, merge_agent_tier_with_difficulty,
         model_adapter, model_matches_disabled_tokens, model_platform_label, model_quality_tier,
-        parse_disabled_model_tokens, request_model_name,
+        parse_disabled_model_tokens, request_model_name, request_protocol_dialect,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
@@ -832,6 +852,7 @@ mod tests {
         ALIBABA_DEFAULT_ENDPOINT, ApiProvider, ModelQualityTier, OPENCODE_DEFAULT_ENDPOINT,
         OPENROUTER_ENDPOINT,
     };
+    use crate::ai::request_protocol::RequestProtocolDialect;
     use serde_json::json;
 
     fn manifest(
@@ -980,6 +1001,66 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(def.request_tpm_limit, None);
+    }
+
+    #[test]
+    fn model_def_parses_request_protocol_when_present() {
+        let def: ModelDef = serde_json::from_value(json!({
+            "key": "demo",
+            "name": "demo-model",
+            "adapter": "compatible",
+            "quality_tier": "strong",
+            "is_vl": false,
+            "search_enabled": true,
+            "tools_default_enabled": true,
+            "enable_thinking": false,
+            "request_protocol": "responses"
+        }))
+        .unwrap();
+        assert_eq!(
+            def.request_protocol,
+            Some(RequestProtocolDialect::Responses)
+        );
+    }
+
+    #[test]
+    fn model_def_defaults_request_protocol_to_none() {
+        let def: ModelDef = serde_json::from_value(json!({
+            "key": "demo",
+            "name": "demo-model",
+            "adapter": "compatible",
+            "quality_tier": "strong",
+            "is_vl": false,
+            "search_enabled": true,
+            "tools_default_enabled": true,
+            "enable_thinking": false
+        }))
+        .unwrap();
+        assert_eq!(def.request_protocol, None);
+    }
+
+    #[test]
+    fn request_protocol_dialect_prefers_model_declared_protocol() {
+        let endpoint = endpoint_for_model("gpt-5.5", "");
+        assert_eq!(
+            request_protocol_dialect("gpt-5.5", &endpoint),
+            RequestProtocolDialect::Responses
+        );
+    }
+
+    #[test]
+    fn request_protocol_dialect_falls_back_to_endpoint_inference_for_unknown_model() {
+        assert_eq!(
+            request_protocol_dialect("unknown-model", "https://api.example.com/v1/responses"),
+            RequestProtocolDialect::Responses
+        );
+        assert_eq!(
+            request_protocol_dialect(
+                "unknown-model",
+                "https://api.example.com/v1/chat/completions"
+            ),
+            RequestProtocolDialect::ChatCompletions
+        );
     }
 
     #[test]

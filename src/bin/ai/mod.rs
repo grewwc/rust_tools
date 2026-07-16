@@ -17,6 +17,7 @@ mod persona;
 mod prompt;
 mod provider;
 mod request;
+mod request_protocol;
 mod skills;
 mod stream;
 mod theme;

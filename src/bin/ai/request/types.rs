@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::ai::history::Message;
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct RequestBody<'a> {
@@ -41,6 +42,18 @@ pub(crate) struct RequestBody<'a> {
     /// 缺省不下发，沿用 provider 默认补全上限；显式指定可缓解长输出被截断。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
+    /// 当前 turn 捕获的 Responses `reasoning` output items 侧信道（key = 带
+    /// tool_calls 的 assistant 消息首个 tool_call id）。仅 Responses 方言读取，
+    /// 用于在对应 function_call 前原样回放 encrypted reasoning。`#[serde(skip)]`：
+    /// 不参与 chat-completions 序列化，也绝不落盘。
+    #[serde(skip)]
+    pub(crate) reasoning_items: Option<&'a FxHashMap<String, Vec<Value>>>,
+    /// 模型能力位（来自 models.json `reasoning_encrypted_replay`）：开启后
+    /// Responses 请求带 `include: ["reasoning.encrypted_content"]` 索取加密推理项。
+    /// 在 builder 阶段用原始 model key 解析，避免 protocol 层用（可能加密的）
+    /// request model name 反查失败。`#[serde(skip)]`：非 chat-completions 字段。
+    #[serde(skip)]
+    pub(crate) reasoning_encrypted_replay: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

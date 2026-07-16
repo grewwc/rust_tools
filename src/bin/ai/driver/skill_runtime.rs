@@ -214,7 +214,7 @@ fn merge_with_runtime_enabled_tools(
         .into_iter()
         .collect::<Box<SkipSet<_>>>();
     if explicit_enabled.is_empty() {
-        return merged;
+        return filter_subagent_hidden_tools(merged);
     }
     let known_names: Box<SkipSet<String>> = merged
         .iter()
@@ -227,11 +227,11 @@ fn merge_with_runtime_enabled_tools(
         .cloned()
         .collect::<Vec<_>>();
     if runtime_extra.is_empty() {
-        return merged;
+        return filter_subagent_hidden_tools(merged);
     }
     merged.extend(runtime_extra);
     rust_tools::sortw::stable_sort_by(&mut merged, |a, b| a.function.name.cmp(&b.function.name));
-    dedupe_tools_by_name(merged)
+    filter_subagent_hidden_tools(dedupe_tools_by_name(merged))
 }
 
 fn dedupe_tools_by_name(tools: Vec<ToolDef>) -> Vec<ToolDef> {
@@ -271,6 +271,25 @@ fn ensure_required_baseline_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
     let extra = super::super::tools::get_tool_definitions_by_names(&missing);
     tools.extend(extra);
     dedupe_tools_by_name(tools)
+}
+
+const SUBAGENT_HIDDEN_TASK_TOOLS: &[&str] = &[
+    "task",
+    "task_spawn",
+    "task_wait",
+    "task_status",
+    "agent_team",
+];
+
+fn should_hide_task_tools_for_subagent() -> bool {
+    super::runtime_ctx::current_subagent_depth() > 0
+}
+
+fn filter_subagent_hidden_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
+    if should_hide_task_tools_for_subagent() {
+        tools.retain(|tool| !SUBAGENT_HIDDEN_TASK_TOOLS.contains(&tool.function.name.as_str()));
+    }
+    tools
 }
 
 fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option<Vec<ToolDef>> {
@@ -341,19 +360,21 @@ fn builtin_tools_for_skill(
     active_agent: Option<&AgentManifest>,
 ) -> Vec<ToolDef> {
     if skill.is_some_and(|skill| skill.disable_builtin_tools) {
-        return Vec::new();
+        return filter_subagent_hidden_tools(Vec::new());
     }
     if let Some(skill) = skill {
         if let Some(tool_defs) = manifest_tool_definitions(&skill.tool_groups, &skill.tools) {
-            return tool_defs;
+            return filter_subagent_hidden_tools(tool_defs);
         }
     }
     if let Some(agent) = active_agent
         && let Some(tool_defs) = manifest_tool_definitions(&agent.tool_groups, &agent.tools)
     {
-        return tool_defs;
+        return filter_subagent_hidden_tools(tool_defs);
     }
-    super::super::tools::tool_definitions_for_groups(DEFAULT_TURN_TOOL_GROUPS)
+    filter_subagent_hidden_tools(super::super::tools::tool_definitions_for_groups(
+        DEFAULT_TURN_TOOL_GROUPS,
+    ))
 }
 
 fn available_tool_names(builtin_tools: &[ToolDef], mcp_tools: &[ToolDef]) -> Box<SkipSet<String>> {
@@ -1289,7 +1310,7 @@ mod tests {
         push_project_context, resolve_max_iterations, select_mcp_tools, tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
-    use crate::ai::driver::runtime_ctx::SUBAGENT_CWD;
+    use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
     use crate::ai::skills::SkillManifest;
     use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
     use crate::ai::types::{FunctionDefinition, ToolDefinition};
@@ -1358,6 +1379,25 @@ mod tests {
         assert!(names.iter().any(|name| name == "knowledge_save"));
         assert!(names.iter().any(|name| name == "knowledge_search"));
         assert!(!names.iter().any(|name| name == "web_search"));
+    }
+
+    #[tokio::test]
+    async fn subagent_builtin_tools_hide_task_orchestration_family() {
+        SUBAGENT_DEPTH
+            .scope(1, async {
+                let tools = builtin_tools_for_skill(None, None);
+                let names = tools
+                    .into_iter()
+                    .map(|tool| tool.function.name)
+                    .collect::<Box<SkipSet<_>>>();
+
+                for hidden in ["task", "task_spawn", "task_wait", "task_status", "agent_team"] {
+                    assert!(!names.contains_str(hidden), "{hidden} should be hidden");
+                }
+                assert!(names.contains_str("read_file"));
+                assert!(names.contains_str("code_search"));
+            })
+            .await;
     }
 
     fn executor_group_agent(name: &str) -> AgentManifest {

@@ -25,6 +25,8 @@ pub(super) struct PromptEditor {
     session_image_dir: PathBuf,
     /// 下一次 `read_multi_line` 的预填文本（用于编辑已有内容场景，读取后清空）。
     pending_prefill: Option<String>,
+    /// 下一次 `read_multi_line` 初始展示的状态消息（读取后清空）。
+    pending_status_msg: Option<String>,
     /// 当前模型显示名，用于在输入框顶部展示模型提示（输入时即可看到将使用的模型）。
     current_model_label: String,
     /// 当前 session 主题，用于在输入框顶部与模型提示同行展示。
@@ -52,6 +54,7 @@ impl PromptEditor {
             history_path,
             session_image_dir,
             pending_prefill: None,
+            pending_status_msg: None,
             current_model_label: String::new(),
             session_topic: None,
         }
@@ -60,6 +63,11 @@ impl PromptEditor {
     /// 设置下一次多行输入的预填内容（编辑已有 memo 时用，读取一次后自动清空）。
     pub(super) fn set_prefill(&mut self, text: impl Into<String>) {
         self.pending_prefill = Some(text.into());
+    }
+
+    /// 设置下一次多行输入初始展示的状态消息，避免在 TUI 外直接打印打乱输入框。
+    pub(super) fn set_status_message(&mut self, message: impl Into<String>) {
+        self.pending_status_msg = Some(message.into());
     }
 
     /// 设置当前模型显示名，下一次 `read_multi_line` 会在输入框顶部展示。
@@ -83,6 +91,7 @@ impl PromptEditor {
     fn read_multi_line_no_tty(&mut self) -> io::Result<Option<String>> {
         // 非 TTY 无法交互编辑：有预填且无管道输入时，直接返回预填原文。
         let prefill = self.pending_prefill.take();
+        let _ = self.pending_status_msg.take();
         let stdin = io::stdin();
         let mut lines = Vec::new();
         for line in stdin.lock().lines() {

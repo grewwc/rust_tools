@@ -175,6 +175,21 @@ fn parse_output_item_event(
         .trim()
         .to_ascii_lowercase();
 
+    // 完整的 reasoning output item 只在 `.done` 落地（`.added` 时 encrypted_content
+    // 尚未填充）。只捕获真正带 `encrypted_content` 的 item：没有加密载荷就无法
+    // 忠实回放，交回上层退化为不回传，避免送半截 item 触发 400。
+    if item_type == "reasoning" {
+        if event_type == "response.output_item.done"
+            && item
+                .get("encrypted_content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|content| !content.is_empty())
+        {
+            return Some(ParsedStreamPayload::ReasoningItem(item.clone()));
+        }
+        return Some(ParsedStreamPayload::Ignore);
+    }
+
     if item_type != "function_call" && item_type != "function" {
         return Some(ParsedStreamPayload::Ignore);
     }

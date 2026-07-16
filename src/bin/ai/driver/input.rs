@@ -195,7 +195,7 @@ fn handle_local_command_inner(app: &mut App, input: &str) -> Result<bool, Box<dy
         LocalCommand::RewindHistory(target) => {
             let plan = plan_history_rewind(app, target)?;
             if plan.removed_messages == 0 {
-                println!("[history] Nothing to rewind.");
+                show_prompt_status_or_print(app, "[history] Nothing to rewind.");
                 return Ok(true);
             }
             let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(&format!(
@@ -203,10 +203,11 @@ fn handle_local_command_inner(app: &mut App, input: &str) -> Result<bool, Box<dy
                 plan.user_ordinal, plan.removed_messages
             ));
             if confirm != Some(true) {
-                println!("canceled by user.");
+                show_prompt_status_or_print(app, "canceled by user.");
                 return Ok(true);
             }
-            apply_history_rewind(app, plan)?;
+            let message = apply_history_rewind(app, plan)?;
+            show_prompt_status_or_print(app, message);
         }
     }
     Ok(true)
@@ -534,21 +535,27 @@ fn plan_history_rewind(
     })
 }
 
-fn apply_history_rewind(app: &mut App, plan: HistoryRewindPlan) -> Result<(), Box<dyn Error>> {
+fn apply_history_rewind(app: &mut App, plan: HistoryRewindPlan) -> Result<String, Box<dyn Error>> {
     let history_file = active_history_path(app);
     history::replace_history_messages(&history_file, &plan.keep_messages)?;
     history::invalidate_context_history_cache_for(&history_file);
     crate::ai::driver::commands::session::clear_session_local_runtime_state(app);
-    println!(
-        "[history] Rewound from u{}: {}",
-        plan.user_ordinal, plan.preview
-    );
-    println!(
-        "[history] Removed {} message(s); kept {} message(s).",
+    Ok(format!(
+        "[history] Rewound from u{}: {} · removed {} message(s); kept {} message(s).",
+        plan.user_ordinal,
+        plan.preview,
         plan.removed_messages,
         plan.keep_messages.len()
-    );
-    Ok(())
+    ))
+}
+
+fn show_prompt_status_or_print(app: &mut App, message: impl Into<String>) {
+    let message = message.into();
+    if let Some(editor) = app.prompt_editor.as_mut() {
+        editor.set_status_message(message);
+    } else {
+        println!("{message}");
+    }
 }
 
 fn resolve_rewind_target(
@@ -1176,6 +1183,7 @@ mod tests {
             last_turn_had_tool_calls: false,
             last_turn_interrupted: false,
             prune_marks: Default::default(),
+            turn_reasoning_items: Default::default(),
         }
     }
 

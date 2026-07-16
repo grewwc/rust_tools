@@ -214,6 +214,7 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
         assistant_text: String::new(),
         hidden_meta: String::new(),
         reasoning_text: String::new(),
+        reasoning_items: Vec::new(),
         skip_response_drain: true,
         truncated_by_length: false,
         stream_error: false,
@@ -436,6 +437,7 @@ fn finalize_stream_response(
         assistant_text: state.content.assistant_text,
         hidden_meta: state.content.hidden_meta,
         reasoning_text: state.content.reasoning_text,
+        reasoning_items: std::mem::take(&mut state.content.reasoning_items),
         skip_response_drain: true,
         truncated_by_length,
         stream_error: false,
@@ -572,6 +574,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         assistant_text: std::mem::take(&mut state.content.assistant_text),
         hidden_meta: String::new(),
         reasoning_text: std::mem::take(&mut state.content.reasoning_text),
+        reasoning_items: std::mem::take(&mut state.content.reasoning_items),
         skip_response_drain: true,
         truncated_by_length: false,
         // 流读取失败导致的截断，不是模型输出过长。
@@ -1112,17 +1115,26 @@ fn process_stream_payload(
     event_type: Option<&str>,
     payload: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let (chunk, merge_mode) = match normalize::parse_stream_payload(adapter, payload, event_type) {
-        super::state::ParsedStreamPayload::Ignore => return Ok(false),
-        super::state::ParsedStreamPayload::Done => return Ok(true),
-        super::state::ParsedStreamPayload::Error(msg) => {
-            return Err(format!("provider stream error: {msg}").into());
-        }
-        super::state::ParsedStreamPayload::Chunk(chunk) => (chunk, StreamEventMergeMode::Append),
-        super::state::ParsedStreamPayload::SnapshotChunk(chunk) => {
-            (chunk, StreamEventMergeMode::AppendMissingSuffix)
-        }
-    };
+    let (mut chunk, merge_mode) =
+        match normalize::parse_stream_payload(adapter, payload, event_type) {
+            super::state::ParsedStreamPayload::Ignore => return Ok(false),
+            super::state::ParsedStreamPayload::Done => return Ok(true),
+            super::state::ParsedStreamPayload::Error(msg) => {
+                return Err(format!("provider stream error: {msg}").into());
+            }
+            super::state::ParsedStreamPayload::ReasoningItem(item) => {
+                // 捕获完整 reasoning item（含 encrypted_content）供同 turn 工具链回放。
+                // 不产生可见输出，也不进持久化历史。
+                state.content.reasoning_items.push(item);
+                return Ok(false);
+            }
+            super::state::ParsedStreamPayload::Chunk(chunk) => {
+                (chunk, StreamEventMergeMode::Append)
+            }
+            super::state::ParsedStreamPayload::SnapshotChunk(chunk) => {
+                (chunk, StreamEventMergeMode::AppendMissingSuffix)
+            }
+        };
 
     // AIOS: capture usage block from whichever chunk carries it. OpenAI emits
     // the final `usage` on a chunk with `choices: []`, so we must pull it *before*
@@ -1161,6 +1173,23 @@ fn process_stream_payload(
     }
 
     state.content.empty_choice_chunks = 0;
+
+    // `.done` reasoning 事件会把整段推理摘要作为 SnapshotChunk 再发一次（见
+    // normalize::textual_event_chunk）。可见 assistant 文本靠 stream_text_event_to_content
+    // 的 unseen_suffix 去重，但 reasoning 文本在累积（下方 reasoning_text.push_str）与
+    // extract_chunk_events_streaming 里都按 Append 处理，snapshot 会导致 thinking 重复
+    // 输出。这里在两处消费前，把 snapshot 的 reasoning_content 收敛为未见后缀。
+    if matches!(merge_mode, StreamEventMergeMode::AppendMissingSuffix) {
+        if let Some(choice) = chunk.choices.first_mut() {
+            if !choice.delta.reasoning_content.is_empty() {
+                let suffix = unseen_suffix(
+                    &state.content.reasoning_text,
+                    &choice.delta.reasoning_content,
+                );
+                choice.delta.reasoning_content = suffix;
+            }
+        }
+    }
 
     if let Some(choice) = chunk.choices.first() {
         if !choice.delta.reasoning_content.is_empty() {

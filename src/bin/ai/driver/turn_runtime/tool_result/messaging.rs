@@ -157,6 +157,7 @@ pub(super) fn append_tool_result_messages(
     app: &mut App,
     stream_assistant_text: &str,
     stream_reasoning_text: &str,
+    stream_reasoning_items: &[serde_json::Value],
     exec_result: &ExecuteToolCallsResult,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
@@ -183,6 +184,20 @@ pub(super) fn append_tool_result_messages(
     messages.push(assistant_msg.clone());
     turn_messages
         .push(crate::ai::history::compress::sanitize_message_for_persisted_history(&assistant_msg));
+
+    // 侧信道：把本轮捕获的 reasoning items 挂到「首个 tool_call id」上，供
+    // Responses 协议回放时在对应 function_call 前原样 splice。仅内存态、不落盘。
+    // 空时不写入——拿不到 encrypted_content 自动退化为不回放，零 regression。
+    if !stream_reasoning_items.is_empty() {
+        if let Some(first_call_id) = exec_result
+            .executed_tool_calls
+            .first()
+            .map(|call| call.id.clone())
+        {
+            app.turn_reasoning_items
+                .insert(first_call_id, stream_reasoning_items.to_vec());
+        }
+    }
 
     for (tool_call, result) in exec_result
         .executed_tool_calls
@@ -614,7 +629,6 @@ fn is_repo_inspection_tool(tool_name: &str) -> bool {
             | "read_file"
             // 兼容旧会话历史里残留的 read_file_lines（已并入 read_file）。
             | "read_file_lines"
-            | "search_files"
             | "find_path"
             | "list_directory"
             | "apply_patch"
@@ -625,7 +639,7 @@ fn is_repo_inspection_tool(tool_name: &str) -> bool {
 fn is_raw_repo_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "read_file" | "read_file_lines" | "search_files" | "find_path" | "list_directory"
+        "read_file" | "read_file_lines" | "find_path" | "list_directory"
     )
 }
 
@@ -688,7 +702,7 @@ fn describe_tool_call(tool_call: &ToolCall) -> String {
                 format!("(file={path})")
             }
         }
-        "find_path" | "search_files" => {
+        "find_path" => {
             let query = args
                 .get("query")
                 .or_else(|| args.get("pattern"))

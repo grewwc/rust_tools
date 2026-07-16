@@ -89,11 +89,8 @@ fn parallel_batch_stops_at_mutating_tool() {
 #[test]
 fn parallel_batch_excludes_barriering_tools() {
     let mcp = McpClient::new();
-    // search_files / list_directory / web_search 会触发 barrier，必须顺序执行。
-    assert!(!is_parallel_safe_tool_call(
-        &mcp,
-        &tool_call("search_files")
-    ));
+    // find_path / list_directory / web_search 会触发 barrier，必须顺序执行。
+    assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("find_path")));
     assert!(!is_parallel_safe_tool_call(
         &mcp,
         &tool_call("list_directory")

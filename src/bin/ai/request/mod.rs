@@ -5,6 +5,7 @@ mod aux;
 mod builder;
 mod error;
 mod normalize;
+mod protocol;
 mod reasoning;
 mod routing;
 mod thinking;
@@ -110,6 +111,14 @@ use reasoning::{
 #[cfg(test)]
 #[allow(unused_imports)]
 use builder::build_request_body;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::ai::request_protocol::RequestProtocolDialect;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use protocol::build_responses_request_body;
 
 #[cfg(test)]
 mod tests;

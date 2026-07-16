@@ -30,9 +30,9 @@ use uuid::Uuid;
 const MAX_TASK_REGISTRY_SIZE: usize = 100;
 const DEFAULT_TASK_PRIORITY: u8 = 20;
 const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
-/// 子代理最大嵌套深度。depth=1 是顶层 agent 直接 spawn 的子代理，
-/// depth=2 是子代理再 spawn 的孙代理。超过此值拒绝继续委派。
-pub(crate) const MAX_SUBAGENT_SPAWN_DEPTH: usize = 2;
+/// 子代理最大嵌套深度。depth=1 是顶层 agent 直接 spawn 的子代理。
+/// 子代理不允许继续 spawn 孙代理，避免递归扇出与结果无人收集。
+pub(crate) const MAX_SUBAGENT_SPAWN_DEPTH: usize = 1;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 const MAX_AGENT_TEAM_MEMBERS: usize = 8;
 /// 单次 `task_wait` 调用的默认等待预算（秒）。这只是 **本次调用的最长阻塞时间**，
@@ -49,9 +49,9 @@ const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 600;
 const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 900;
 
 /// Granular control over which slices of the parent agent's execution
-/// context are inherited by a spawned sub-agent. Defaults are
-/// history+cwd+skills=true and memory=false (private memory) unless the
-/// caller specifies an `inherit` argument on the tool call.
+/// context are inherited by a spawned sub-agent. Defaults are cwd+skills=true
+/// and history+memory=false unless the caller specifies an `inherit` argument
+/// on the tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InheritOptions {
     pub(crate) history: bool,
@@ -62,14 +62,12 @@ pub(crate) struct InheritOptions {
 
 impl Default for InheritOptions {
     fn default() -> Self {
-        // 修复点：sub-agent 默认私有 memory。
-        // 历史默认 `memory: true` 会让所有 sub-agent 直接写到主 memory 文件，
-        // 一次大型 sub-agent run 产生的 task_event/log 会污染主记忆，
-        // 也削弱了召回准确性。现在默认私有：sub-agent 写入独立 jsonl，
-        // finalize 时只把白名单条目（is_permanent_memory）merge 回主文件。
-        // 调用方仍可显式传 `inherit: "all"` 或 `inherit: "memory"` 退回旧行为。
+        // 默认只继承执行所需的 cwd/skills，不继承整段对话历史与 memory。
+        // 窄任务由父 agent 在 prompt 中显式传入必要上下文，避免 token 膨胀、注意力偏移，
+        // 以及 sub-agent 直接污染主 memory 文件。调用方仍可显式传 `inherit: "all"`
+        // 或 `inherit: "history,cwd,skills"` 退回旧行为。
         Self {
-            history: true,
+            history: false,
             memory: false,
             cwd: true,
             skills: true,
@@ -80,7 +78,7 @@ impl Default for InheritOptions {
 impl InheritOptions {
     /// Parse the optional `inherit` field from a tool call.
     /// Recognised forms:
-    ///   - missing / null -> default (history+cwd+skills, **memory private**)
+    ///   - missing / null -> default (cwd+skills, history/memory private)
     ///   - "all"          -> full inheritance (incl. memory)
     ///   - "none"         -> no inheritance (fresh sub-agent)
     ///   - comma-separated list of: history, memory, cwd, skills

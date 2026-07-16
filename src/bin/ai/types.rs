@@ -68,6 +68,7 @@ impl Clone for App {
             last_turn_had_tool_calls: self.last_turn_had_tool_calls,
             last_turn_interrupted: self.last_turn_interrupted,
             prune_marks: self.prune_marks.clone(),
+            turn_reasoning_items: self.turn_reasoning_items.clone(),
         }
     }
 }
@@ -127,6 +128,17 @@ pub(super) struct App {
 
     /// LLM 引导的上下文裁剪计数表（tool_call_id → 连续被标记次数）
     pub(super) prune_marks: FxHashMap<String, u8>,
+
+    /// 当前 turn 内存态侧信道：Responses 协议捕获的完整 `reasoning` output items
+    /// （含 encrypted_content），以带 tool_calls 的 assistant 消息「首个
+    /// tool_call id」为 key。回放时在对应 function_call 前原样 splice，让模型保留
+    /// 上一跳推理上下文。
+    ///
+    /// 刻意不放进 `Message` 结构：reasoning items 只在同 turn 工具链回放时有用、
+    /// 跨 turn 会被 sqlite 剥离；放进共享 `Message` 会污染 295 处字面量且需
+    /// `#[serde(skip)]` 才能挡住落盘。用 turn 级旁路 map（同 `prune_marks` 模式）
+    /// 天然按轮对齐、纯内存态、物理上不可能落盘。
+    pub(super) turn_reasoning_items: FxHashMap<String, Vec<Value>>,
 }
 
 impl App {
@@ -321,6 +333,9 @@ pub(super) struct StreamResult {
     /// 模型在 thinking 模式下输出的 reasoning_content 原文，
     /// 用于多轮请求时按服务端要求回传给后端。
     pub(super) reasoning_text: String,
+    /// 本轮从 Responses 流捕获的完整 `reasoning` output items（含 encrypted_content）。
+    /// 仅用于同 turn 工具链回放，透传给内存态 assistant 消息，不进持久化历史。
+    pub(super) reasoning_items: Vec<serde_json::Value>,
     pub(super) skip_response_drain: bool,
     /// 服务端返回 finish_reason=length（撞输出上限）。即使 outcome 是 Completed
     /// （有可见文本），该标志仍保留，供上层决定是否注入"输出可能不完整"提示。

@@ -180,6 +180,9 @@ pub(super) struct StreamContentState {
     /// 终轮结束后通过 StreamResult 透传给 history，
     /// 以便下一轮请求把它原样回传给后端（DeepSeek thinking-mode 必须）。
     pub(super) reasoning_text: String,
+    /// 本轮从 Responses 流捕获的完整 `reasoning` output items（含 encrypted_content）。
+    /// 仅用于同 turn 工具链回放，不落持久化历史。
+    pub(super) reasoning_items: Vec<serde_json::Value>,
     pub(super) hidden_meta_parse: HiddenMetaParseState,
     pub(super) internal_tool_call_idx: usize,
     pub(super) internal_tool_call_streamer: InternalToolCallStreamer,
@@ -201,6 +204,7 @@ impl StreamContentState {
             assistant_text: String::new(),
             hidden_meta: String::new(),
             reasoning_text: String::new(),
+            reasoning_items: Vec::new(),
             hidden_meta_parse: HiddenMetaParseState::default(),
             internal_tool_call_idx: 0,
             internal_tool_call_streamer: InternalToolCallStreamer::new(),
@@ -229,6 +233,10 @@ pub(in crate::ai) enum ParsedStreamPayload {
     Done,
     Chunk(StreamChunk),
     SnapshotChunk(StreamChunk),
+    /// Responses 协议返回的完整 `reasoning` output item（含 `id` /
+    /// `encrypted_content` / `summary`）。用于同 turn 工具链回放：原样透传给
+    /// 后续请求的 input，使模型保留上一跳推理上下文。不进持久化历史。
+    ReasoningItem(serde_json::Value),
     /// provider 在流中途返回了 error 对象或 error 事件，携带可读错误信息。
     Error(String),
 }

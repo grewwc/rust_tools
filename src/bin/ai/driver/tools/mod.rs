@@ -221,12 +221,8 @@ fn equivalent_tools(
                 description: "regex over file contents",
             },
             ToolAlternative {
-                name: "search_files",
-                description: "filename or glob match",
-            },
-            ToolAlternative {
                 name: "find_path",
-                description: "path-suffix or glob match",
+                description: "filename or glob match",
             },
         ],
         "text_grep" => &[
@@ -235,33 +231,11 @@ fn equivalent_tools(
                 description: "semantic or structural search",
             },
             ToolAlternative {
-                name: "search_files",
-                description: "filename or glob match",
-            },
-            ToolAlternative {
                 name: "find_path",
-                description: "path-only discovery",
+                description: "filename or glob match",
             },
         ],
         "find_path" => &[
-            ToolAlternative {
-                name: "search_files",
-                description: "filename or glob match",
-            },
-            ToolAlternative {
-                name: "text_grep",
-                description: "content search",
-            },
-            ToolAlternative {
-                name: "code_search",
-                description: "semantic or structural search",
-            },
-        ],
-        "search_files" => &[
-            ToolAlternative {
-                name: "find_path",
-                description: "path-suffix or glob match",
-            },
             ToolAlternative {
                 name: "text_grep",
                 description: "content search",

@@ -408,7 +408,6 @@ fn is_precision_tool(tool_name: &str) -> bool {
             | "read_file_lines"
             | "find_path"
             | "text_grep"
-            | "search_files"
             | "code_search"
             | "web_search"
             | "web_fetch"
@@ -536,6 +535,7 @@ mod tests {
             last_turn_had_tool_calls: false,
             last_turn_interrupted: false,
             prune_marks: Default::default(),
+            turn_reasoning_items: Default::default(),
         }
     }
 

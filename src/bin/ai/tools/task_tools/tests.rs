@@ -91,6 +91,7 @@ fn test_app_with_model(current_model: String) -> App {
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
         prune_marks: Default::default(),
+        turn_reasoning_items: Default::default(),
     }
 }
 

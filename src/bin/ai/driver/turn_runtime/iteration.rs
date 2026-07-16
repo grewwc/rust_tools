@@ -687,6 +687,7 @@ pub(super) async fn execute_turn_iteration(
                     assistant_text: "[响应解析失败，请重试]".to_string(),
                     hidden_meta: String::new(),
                     reasoning_text: String::new(),
+                    reasoning_items: Vec::new(),
                     skip_response_drain: false,
                     truncated_by_length: false,
                     stream_error: false,

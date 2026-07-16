@@ -62,9 +62,30 @@ in `driver/thinking/orchestrator.rs` reinforce this.
    Do not rely on history compression or turn-loop limits as the primary
    rate-limit guard; those only reduce token volume, while the request budget
    controls send rate.
-7. Responses API wire differs from chat-completions for multimodal content:
-   internal `{"type":"text"}` / `{"type":"image_url"}` items must be remapped
-   to Responses `input_text` / `input_image` shapes before send.
+7. Endpoint-level request protocol dialects (for example `/v1/chat/completions`
+   vs `/v1/responses`) are centralized in `request/protocol.rs`, with the
+   primary selection coming from `models.json.request_protocol` (fallback:
+   endpoint inference for legacy entries). Do not scatter
+   `ends_with("/responses")` checks through transport/builders. Responses wire
+   differs from chat-completions for multimodal content: internal
+   `{"type":"text"}` / `{"type":"image_url"}` items must be remapped to Responses
+   `input_text` / `input_image`, and empty-text items must be dropped (the API
+   rejects blank `output_text`/`input_text` with 400 invalid_value). **Do not**
+   replay assistant `reasoning_content` as a `summary_text` message-content part:
+   Responses message content only accepts `output_text`/`refusal`, and reasoning
+   summaries belong to standalone `reasoning` output items whose faithful replay
+   needs the server-issued item id / encrypted_content we do not persist. Persisted
+   cross-turn reasoning is therefore re-requested via the `reasoning` request param,
+   not echoed back. **Same-turn** encrypted reasoning replay is a separate mechanism:
+   models declaring `reasoning_encrypted_replay` in `models.json` send
+   `include: ["reasoning.encrypted_content"]`; the stream layer captures full
+   `reasoning` output items (only those with non-empty `encrypted_content`, on
+   `response.output_item.done`) and stashes them in the turn-scoped side channel
+   `App.turn_reasoning_items` (keyed by the assistant message's first `tool_call.id`,
+   never on `Message` — it must not touch the 295 struct literals nor ever persist).
+   `RequestBody` borrows this map and `responses_input` splices the raw items in
+   front of the matching `function_call`. Missing items degrade to a bare
+   function_call (zero regression); the map is cleared at each turn start.
 
 ## On-Demand Guides
 

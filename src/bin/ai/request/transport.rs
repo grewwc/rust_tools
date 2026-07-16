@@ -125,10 +125,8 @@ async fn request_messages_with_key(
     retry_policy: &RequestRetryPolicy,
     endpoint: &str,
 ) -> Result<Response, RequestError> {
-    let responses_body = endpoint
-        .trim_end_matches('/')
-        .ends_with("/v1/responses")
-        .then(|| super::builder::build_responses_request_body(request_body));
+    let protocol = models::request_protocol_dialect(model, endpoint);
+    let http_body = protocol.build_http_body(request_body);
     let estimated_prompt_tokens = token_budget::calibrate_prompt_tokens_for_budget(
         estimate_request_prompt_tokens(request_body.messages, request_body.tools.as_ref()),
         app.last_known_prompt_tokens,
@@ -137,13 +135,9 @@ async fn request_messages_with_key(
     for attempt in 1..=retry_policy.max_attempts {
         let client = app.client.clone();
         let build_request = || {
-            let request = apply_request_auth(client.post(endpoint), endpoint, api_key)
-                .header("Content-Type", "application/json");
-            if let Some(body) = &responses_body {
-                request.json(body)
-            } else {
-                request.json(request_body)
-            }
+            apply_request_auth(client.post(endpoint), endpoint, api_key)
+                .header("Content-Type", "application/json")
+                .json(&http_body)
         };
         let response = match tokio::time::timeout(
             Duration::from_secs(retry_policy.header_timeout_secs),
@@ -316,6 +310,9 @@ pub(crate) async fn do_request_messages(
     } else {
         reasoning_effort
     };
+    // 把 reasoning items 侧信道快照到局部，避免 `request_body` 长期持有对 `app`
+    // 的不可变借用（后续 key 轮换循环需要 `&mut app`）。
+    let turn_reasoning_items = app.turn_reasoning_items.clone();
     let request_body = build_request_body(
         model,
         &normalized_messages,
@@ -327,6 +324,7 @@ pub(crate) async fn do_request_messages(
         reasoning_effort,
         app.cli.max_tokens_override,
         app.last_known_prompt_tokens,
+        Some(&turn_reasoning_items),
     );
     let retry_policy = request_retry_policy_for_current_context();
 

@@ -25,7 +25,7 @@ struct BarrierSpec {
 const BARRIER_SPECS: &[BarrierSpec] = &[
     BarrierSpec {
         route: ToolRouteKind::Builtin,
-        tool_name: "search_files",
+        tool_name: "find_path",
         rule: BarrierRule::OnSuccessNonEmptyOutput,
     },
     BarrierSpec {
@@ -97,8 +97,8 @@ mod tests {
     }
 
     #[test]
-    fn barrier_builtin_search_files_requires_non_empty_success_output() {
-        let tc = tool_call("search_files");
+    fn barrier_builtin_find_path_requires_non_empty_success_output() {
+        let tc = tool_call("find_path");
         assert!(!should_barrier_after(&ToolRoute::Builtin, &tc, true, "   "));
         assert!(!should_barrier_after(
             &ToolRoute::Builtin,

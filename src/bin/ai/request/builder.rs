@@ -19,146 +19,6 @@ use crate::ai::{
     provider::{adapter_for, compatible_wire_shapes},
 };
 
-fn responses_content_type_for_role(role: &str) -> &'static str {
-    if role.eq_ignore_ascii_case("assistant") {
-        "output_text"
-    } else {
-        "input_text"
-    }
-}
-
-fn responses_message_content(role: &str, content: &Value) -> Value {
-    let Some(items) = content.as_array() else {
-        return match content {
-            Value::String(text) => Value::Array(vec![json!({
-                "type": responses_content_type_for_role(role),
-                "text": text,
-            })]),
-            _ => content.clone(),
-        };
-    };
-
-    Value::Array(
-        items
-            .iter()
-            .map(|item| {
-                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
-                if matches!(
-                    item_type,
-                    "input_text"
-                        | "input_image"
-                        | "output_text"
-                        | "refusal"
-                        | "input_file"
-                        | "computer_screenshot"
-                        | "summary_text"
-                        | "tether_browsing_display"
-                ) {
-                    return item.clone();
-                }
-
-                if let Some(url) = item
-                    .get("image_url")
-                    .and_then(|v| v.get("url").or(Some(v)))
-                    .and_then(|v| v.as_str())
-                {
-                    return json!({
-                        "type": "input_image",
-                        "image_url": url,
-                    });
-                }
-
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    return json!({
-                        "type": responses_content_type_for_role(role),
-                        "text": text,
-                    });
-                }
-
-                item.clone()
-            })
-            .collect(),
-    )
-}
-
-fn responses_input(messages: &[Message]) -> Vec<Value> {
-    let mut input = Vec::new();
-    for message in messages {
-        if let Some(tool_calls) = &message.tool_calls {
-            for tool_call in tool_calls {
-                input.push(json!({
-                    "type": "function_call",
-                    "call_id": tool_call.id,
-                    "name": tool_call.function.name,
-                    "arguments": tool_call.function.arguments,
-                }));
-            }
-        } else if message.role == "tool" {
-            if let Some(call_id) = &message.tool_call_id {
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": message.content,
-                }));
-            }
-        } else {
-            input.push(json!({
-                "role": message.role,
-                "content": responses_message_content(&message.role, &message.content),
-            }));
-        }
-    }
-    input
-}
-
-fn responses_tools(tools: &Value) -> Value {
-    Value::Array(
-        tools
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|tool| {
-                let function = tool.get("function").unwrap_or(tool);
-                json!({
-                    "type": "function",
-                    "name": function.get("name").cloned().unwrap_or(Value::Null),
-                    "description": function.get("description").cloned().unwrap_or(Value::Null),
-                    "parameters": function.get("parameters").cloned().unwrap_or(Value::Null),
-                })
-            })
-            .collect(),
-    )
-}
-
-pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
-    let mut body = json!({
-        "model": request.model,
-        "input": responses_input(request.messages),
-        "stream": request.stream,
-    });
-    let object = body.as_object_mut().expect("responses body is an object");
-    if let Some(tools) = &request.tools {
-        object.insert("tools".to_string(), responses_tools(tools));
-    }
-    if let Some(tool_choice) = &request.tool_choice {
-        object.insert("tool_choice".to_string(), tool_choice.clone());
-    }
-    if let Some(effort) = request.reasoning_effort {
-        // Responses API 默认不会返回推理文本；显式索取 reasoning summary，
-        // provider 才会发送 response.reasoning_summary_text.* 事件。
-        object.insert(
-            "reasoning".to_string(),
-            json!({ "effort": effort, "summary": "auto" }),
-        );
-    } else if let Some(reasoning) = &request.reasoning {
-        object.insert("reasoning".to_string(), reasoning.clone());
-    }
-    if let Some(max_tokens) = request.max_tokens {
-        object.insert("max_output_tokens".to_string(), max_tokens.into());
-    }
-    body
-}
-
 /// 构建消息 content：纯文本模型或无图片时返回字符串；多模态模型返回
 /// `[{image_url}, {text}]` 数组。图片以 base64 data URI 内联。
 pub(crate) fn build_content(
@@ -282,6 +142,7 @@ pub(super) fn build_request_body<'a>(
     reasoning_effort: Option<&'a str>,
     max_tokens_override: Option<u32>,
     known_prompt_tokens: Option<u64>,
+    reasoning_items: Option<&'a rustc_hash::FxHashMap<String, Vec<Value>>>,
 ) -> RequestBody<'a> {
     let adapter_kind = models::model_adapter(model);
     let endpoint = models::endpoint_for_model(model, "");
@@ -332,5 +193,7 @@ pub(super) fn build_request_body<'a>(
         reasoning,
         stream_options,
         max_tokens,
+        reasoning_items,
+        reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
     }
 }

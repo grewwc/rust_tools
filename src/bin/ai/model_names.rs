@@ -6,6 +6,7 @@ use rust_tools::cw::SkipMap;
 use rust_tools::cw::SkipSet;
 
 use super::provider::{ApiProvider, ModelQualityTier, ReasoningEffort};
+use super::request_protocol::RequestProtocolDialect;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelDef {
@@ -55,6 +56,18 @@ pub struct ModelDef {
     /// TPM 预检，避免用错误的默认值误伤不同 provider / key。
     #[serde(default)]
     pub request_tpm_limit: Option<u64>,
+    /// 可选：请求所使用的 HTTP 协议方言。绝大多数模型默认走
+    /// `chat_completions`；只有少数模型（如 modelhub 的 GPT-5.x）显式走
+    /// `responses`。缺省时会按 endpoint 形状做兼容推断，供历史配置平滑升级。
+    #[serde(default)]
+    pub request_protocol: Option<RequestProtocolDialect>,
+    /// 可选：仅对 `responses` 协议生效。开启后，请求会带
+    /// `include: ["reasoning.encrypted_content"]` 索取加密推理项，并在同一
+    /// turn 的工具调用回合把服务端返回的 `reasoning` output item 原样回放到
+    /// input，使模型在多步工具链中保留上一跳推理上下文。缺省关闭：未声明的
+    /// 模型行为不变，网关不透传 `encrypted_content` 时回放自动退化为不回传。
+    #[serde(default)]
+    pub reasoning_encrypted_replay: bool,
     /// 子 agent 模型选择优先级（越大越优先）。同 tier 内按此值降序排列。
     /// 缺省为 0，用户可在 ~/.config/rust_tools/models.json 中覆盖以调整偏好，
     /// 无需重新编译。

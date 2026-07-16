@@ -28,7 +28,7 @@ use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
 /// 适合"中段按行裁剪"的非精确概览工具。
 ///
-/// find_path / code_search / search_files / read_file(_lines) 的每一行都可能是
+/// find_path / code_search / read_file(_lines) 的每一行都可能是
 /// agent 后续判断需要引用的精确证据，不能做有损中段抽样；这些工具只允许在
 /// 超过 inline 上限后 offload 到 session 文件，并在模型上下文里保留 path + stub。
 fn supports_line_trim(tool_name: &str) -> bool {
@@ -635,6 +635,7 @@ fn handle_tool_call_round(
         app,
         &tool_call_execution.stream_result.assistant_text,
         &tool_call_execution.stream_result.reasoning_text,
+        &tool_call_execution.stream_result.reasoning_items,
         &exec_result,
         messages,
         turn_messages,
@@ -1222,6 +1223,7 @@ mod tests {
             last_turn_had_tool_calls: false,
             last_turn_interrupted: false,
             prune_marks: Default::default(),
+            turn_reasoning_items: Default::default(),
         }
     }
 
@@ -1433,6 +1435,7 @@ mod tests {
                 assistant_text: String::new(),
                 hidden_meta: String::new(),
                 reasoning_text: "I should read both files first.".to_string(),
+                reasoning_items: Vec::new(),
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
@@ -1490,6 +1493,7 @@ mod tests {
                 assistant_text: String::new(),
                 hidden_meta: String::new(),
                 reasoning_text: "I should read both files first.".to_string(),
+                reasoning_items: Vec::new(),
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
@@ -1549,6 +1553,7 @@ mod tests {
                 assistant_text: "现在让我来编写一个综合脚本".to_string(),
                 hidden_meta: String::new(),
                 reasoning_text: String::new(),
+                reasoning_items: Vec::new(),
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
@@ -1624,6 +1629,7 @@ mod tests {
                     assistant_text: String::new(),
                     hidden_meta: String::new(),
                     reasoning_text: String::new(),
+                    reasoning_items: Vec::new(),
                     skip_response_drain: true,
                     truncated_by_length: false,
                     stream_error: false,
@@ -1705,6 +1711,7 @@ mod tests {
                 assistant_text: "partial content from broken stream".to_string(),
                 hidden_meta: String::new(),
                 reasoning_text: String::new(),
+                reasoning_items: Vec::new(),
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: true,
@@ -1799,6 +1806,7 @@ mod tests {
                     assistant_text: String::new(),
                     hidden_meta: String::new(),
                     reasoning_text: String::new(),
+                    reasoning_items: Vec::new(),
                     skip_response_drain: true,
                     truncated_by_length: false,
                     stream_error: false,
@@ -1927,6 +1935,7 @@ mod tests {
                         assistant_text: String::new(),
                         hidden_meta: String::new(),
                         reasoning_text: String::new(),
+                        reasoning_items: Vec::new(),
                         skip_response_drain: true,
                         truncated_by_length: false,
                         stream_error: false,

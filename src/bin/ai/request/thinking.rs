@@ -343,6 +343,7 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
         None,
         None,
         None,
+        None,
     );
 
     let endpoint = endpoint_for_request_model(app, &control_model);

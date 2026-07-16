@@ -327,6 +327,7 @@ mod tests {
             last_turn_had_tool_calls: false,
             last_turn_interrupted: false,
             prune_marks: Default::default(),
+            turn_reasoning_items: Default::default(),
         }
     }
 
