@@ -183,6 +183,9 @@ fn auto_subagent_retry_policy_fails_fast_for_fallback() {
         auto_subagent.header_timeout_secs,
         AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS
     );
+    // 自动选型失败会切换模型，不能再同时复制同一子 agent 请求。
+    assert_eq!(auto_subagent.hedged_max_sends(), 1);
+    assert_eq!(regular.hedged_max_sends(), 3);
 }
 
 #[test]
@@ -1930,6 +1933,10 @@ fn normalize_messages_projects_only_recent_context_checkpoints_without_truncatin
     assert_eq!(
         checkpoints,
         expected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert!(
+        checkpoint_context.contains("read_file"),
+        "checkpoint projection must tell the model how to fetch the full body"
     );
     assert!(normalized.iter().any(|message| {
         message

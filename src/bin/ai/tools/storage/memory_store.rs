@@ -216,6 +216,12 @@ pub(crate) struct MemoryBatchUpdateReport {
     pub(crate) appended: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KnowledgeAppendOutcome {
+    Appended,
+    Duplicate { existing_id: Option<String> },
+}
+
 impl MemoryStore {
     pub(crate) fn from_env_or_config() -> Self {
         Self {
@@ -228,92 +234,148 @@ impl MemoryStore {
     }
 
     pub(crate) fn append(&self, entry: &AgentMemoryEntry) -> Result<(), String> {
-        // 单条 note 字节 cap：避免 LLM 把巨型 tool 输出整段写进 long-term memory，
-        // 导致下次 recall 时把 8KB+ 单条直接拉回上下文。
-        const MAX_NOTE_BYTES: usize = 4_096;
-        let mut entry_owned;
-        let entry_ref: &AgentMemoryEntry = if entry.note.len() > MAX_NOTE_BYTES {
-            entry_owned = entry.clone();
-            // 按字符边界裁剪到大约 MAX_NOTE_BYTES，并加省略提示
-            let mut truncated = String::with_capacity(MAX_NOTE_BYTES + 64);
-            let mut used = 0usize;
-            for ch in entry_owned.note.chars() {
-                let extra = ch.len_utf8();
-                if used + extra > MAX_NOTE_BYTES {
-                    break;
-                }
-                truncated.push(ch);
-                used += extra;
-            }
-            truncated.push_str("\n…[note truncated to fit memory store cap]");
-            entry_owned.note = truncated;
-            &entry_owned
-        } else {
-            entry
-        };
-        if should_dedup_learning_entry(entry_ref)
-            && self.has_recent_duplicate(entry_ref, 200).unwrap_or(false)
-        {
-            return Ok(());
-        }
-
+        let entry = cap_memory_entry(entry);
         super::with_memory_file_lock(&self.path, || {
-            if let Some(parent) = self.path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create memory dir: {e}"))?;
+            if should_dedup_learning_entry(&entry)
+                && self.has_recent_duplicate(&entry, 200).unwrap_or(false)
+            {
+                return Ok(());
             }
-            let serialized = serde_json::to_string(entry_ref)
-                .map_err(|e| format!("Failed to serialize memory entry: {e}"))?;
-
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&self.path)
-                .map_err(|e| format!("Failed to open memory file: {e}"))?;
-
-            let needs_newline = file
-                .metadata()
-                .map_err(|e| format!("Failed to read memory file metadata: {e}"))?
-                .len()
-                > 0
-                && {
-                    file.seek(SeekFrom::End(-1))
-                        .map_err(|e| format!("Failed to seek memory file: {e}"))?;
-                    let mut last = [0u8; 1];
-                    file.read_exact(&mut last)
-                        .map_err(|e| format!("Failed to read memory file: {e}"))?;
-                    last[0] != b'\n'
-                };
-
-            if needs_newline {
-                file.write_all(b"\n")
-                    .map_err(|e| format!("Failed to write memory file: {e}"))?;
-            }
-            file.write_all(serialized.as_bytes())
-                .and_then(|_| file.write_all(b"\n"))
-                .map_err(|e| format!("Failed to write memory file: {e}"))?;
-
-            // JSONL 是 source of truth；下面的 SQLite 索引同步是 best-effort，
-            // 失败只 trace 不冒泡。这样即使 rusqlite 出问题也不会阻断主存储。
-            if let Some(idx) = memory_index_for(&self.path) {
-                if let Err(e) = idx.upsert_entry(entry_ref) {
-                    trace_memory_event(
-                        "memory.index.upsert_failed",
-                        "MemoryIndex upsert failed; index may drift",
-                        &[
-                            ("path", self.path.display().to_string()),
-                            ("entry_id", entry_ref.id.clone().unwrap_or_default()),
-                            ("error", e),
-                        ],
-                    );
-                } else {
-                    let _ = idx.refresh_signature();
-                }
-            }
-
-            Ok(())
+            self.append_entry_while_locked(&entry)
         })
+    }
+
+    /// 对用户可见的长期知识执行原子幂等写入。`knowledge_save` 的重试和重复
+    /// tool call 不应制造多条 JSONL 记录或重复 RAG upsert；自动反思等其它
+    /// MemoryStore 调用仍保留各自原有语义。
+    pub(crate) fn append_idempotent_knowledge(
+        &self,
+        entry: &AgentMemoryEntry,
+    ) -> Result<KnowledgeAppendOutcome, String> {
+        let entry = cap_memory_entry(entry);
+        self.ensure_memory_file_for_lock()?;
+        super::with_memory_file_lock(&self.path, || {
+            if let Some(existing) = self.find_equivalent_knowledge(&entry)? {
+                return Ok(KnowledgeAppendOutcome::Duplicate {
+                    existing_id: existing.id,
+                });
+            }
+            self.append_entry_while_locked(&entry)?;
+            Ok(KnowledgeAppendOutcome::Appended)
+        })
+    }
+
+    fn ensure_memory_file_for_lock(&self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("Failed to create memory dir: {e}"))?;
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| format!("Failed to initialize memory file: {e}"))?;
+        Ok(())
+    }
+
+    fn append_entry_while_locked(&self, entry: &AgentMemoryEntry) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("Failed to create memory dir: {e}"))?;
+        }
+        let serialized = serde_json::to_string(entry)
+            .map_err(|e| format!("Failed to serialize memory entry: {e}"))?;
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&self.path)
+            .map_err(|e| format!("Failed to open memory file: {e}"))?;
+
+        let needs_newline = file
+            .metadata()
+            .map_err(|e| format!("Failed to read memory file metadata: {e}"))?
+            .len()
+            > 0
+            && {
+                file.seek(SeekFrom::End(-1))
+                    .map_err(|e| format!("Failed to seek memory file: {e}"))?;
+                let mut last = [0u8; 1];
+                file.read_exact(&mut last)
+                    .map_err(|e| format!("Failed to read memory file: {e}"))?;
+                last[0] != b'\n'
+            };
+
+        if needs_newline {
+            file.write_all(b"\n")
+                .map_err(|e| format!("Failed to write memory file: {e}"))?;
+        }
+        file.write_all(serialized.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .map_err(|e| format!("Failed to write memory file: {e}"))?;
+
+        // JSONL 是 source of truth；下面的 SQLite 索引同步是 best-effort，
+        // 失败只 trace 不冒泡。这样即使 rusqlite 出问题也不会阻断主存储。
+        if let Some(idx) = memory_index_for(&self.path) {
+            if let Err(e) = idx.upsert_entry(entry) {
+                trace_memory_event(
+                    "memory.index.upsert_failed",
+                    "MemoryIndex upsert failed; index may drift",
+                    &[
+                        ("path", self.path.display().to_string()),
+                        ("entry_id", entry.id.clone().unwrap_or_default()),
+                        ("error", e),
+                    ],
+                );
+            } else {
+                let _ = idx.refresh_signature();
+            }
+        }
+        Ok(())
+    }
+
+    fn find_equivalent_knowledge(
+        &self,
+        target: &AgentMemoryEntry,
+    ) -> Result<Option<AgentMemoryEntry>, String> {
+        let file = match fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("Failed to read memory file: {error}")),
+        };
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = line.map_err(|error| format!("Failed to read memory file: {error}"))?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(existing) = serde_json::from_str::<AgentMemoryEntry>(line) else {
+                continue;
+            };
+            if equivalent_knowledge_entry(&existing, target) {
+                return Ok(Some(existing));
+            }
+        }
+        Ok(None)
+    }
+
+    fn has_recent_duplicate(
+        &self,
+        target: &AgentMemoryEntry,
+        recent_limit: usize,
+    ) -> Result<bool, String> {
+        let target_norm = normalize_learning_note(&target.note);
+        let target_source = target.source.as_deref().unwrap_or("");
+        let recent = self.recent(recent_limit)?;
+        Ok(recent.into_iter().any(|entry| {
+            if entry.category != target.category {
+                return false;
+            }
+            if entry.source.as_deref().unwrap_or("") != target_source {
+                return false;
+            }
+            normalize_learning_note(&entry.note) == target_norm
+        }))
     }
 
     /// 批量应用“删除 + 新增”变更并一次性原子重写 JSONL。
@@ -375,25 +437,6 @@ impl MemoryStore {
                 appended: new_entries.len(),
             })
         })
-    }
-
-    fn has_recent_duplicate(
-        &self,
-        target: &AgentMemoryEntry,
-        recent_limit: usize,
-    ) -> Result<bool, String> {
-        let target_norm = normalize_learning_note(&target.note);
-        let target_source = target.source.as_deref().unwrap_or("");
-        let recent = self.recent(recent_limit)?;
-        Ok(recent.into_iter().any(|entry| {
-            if entry.category != target.category {
-                return false;
-            }
-            if entry.source.as_deref().unwrap_or("") != target_source {
-                return false;
-            }
-            normalize_learning_note(&entry.note) == target_norm
-        }))
     }
 
     fn memory_files_to_scan(&self, include_archives: bool) -> Result<Vec<PathBuf>, String> {
@@ -705,6 +748,51 @@ fn should_dedup_learning_entry(entry: &AgentMemoryEntry) -> bool {
     )
 }
 
+fn cap_memory_entry(entry: &AgentMemoryEntry) -> AgentMemoryEntry {
+    const MAX_NOTE_BYTES: usize = 4_096;
+    if entry.note.len() <= MAX_NOTE_BYTES {
+        return entry.clone();
+    }
+
+    let mut capped = entry.clone();
+    let mut truncated = String::with_capacity(MAX_NOTE_BYTES + 64);
+    let mut used = 0usize;
+    for ch in capped.note.chars() {
+        let extra = ch.len_utf8();
+        if used + extra > MAX_NOTE_BYTES {
+            break;
+        }
+        truncated.push(ch);
+        used += extra;
+    }
+    truncated.push_str("\n…[note truncated to fit memory store cap]");
+    capped.note = truncated;
+    capped
+}
+
+fn equivalent_knowledge_entry(left: &AgentMemoryEntry, right: &AgentMemoryEntry) -> bool {
+    normalize_knowledge_field(&left.category) == normalize_knowledge_field(&right.category)
+        && normalize_learning_note(&left.note) == normalize_learning_note(&right.note)
+        && normalize_knowledge_field(left.source.as_deref().unwrap_or(""))
+            == normalize_knowledge_field(right.source.as_deref().unwrap_or(""))
+        && normalized_knowledge_tags(&left.tags) == normalized_knowledge_tags(&right.tags)
+}
+
+fn normalize_knowledge_field(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+fn normalized_knowledge_tags(tags: &[String]) -> Vec<String> {
+    let mut normalized = tags
+        .iter()
+        .map(|tag| normalize_knowledge_field(tag))
+        .filter(|tag| !tag.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
 fn normalize_learning_note(note: &str) -> String {
     note.lines()
         .map(str::trim)
@@ -860,6 +948,55 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn idempotent_knowledge_write_returns_existing_entry_without_appending() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_mem_knowledge_dedup_{ts}.jsonl"));
+        let store = MemoryStore::for_tests_with_path(path.clone());
+        let first = AgentMemoryEntry {
+            id: Some("mem_existing".to_string()),
+            timestamp: "2025-01-05T00:00:00Z".to_string(),
+            category: "user_memory".to_string(),
+            note: "Keep project decisions in the architecture log.".to_string(),
+            tags: vec!["architecture".to_string(), "decision".to_string()],
+            source: Some("project:demo".to_string()),
+            priority: Some(150),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+        let retry = AgentMemoryEntry {
+            id: Some("mem_retry".to_string()),
+            timestamp: "2025-01-06T00:00:00Z".to_string(),
+            category: " USER_MEMORY ".to_string(),
+            note: "  keep project decisions in the architecture log.  ".to_string(),
+            tags: vec!["decision".to_string(), "ARCHITECTURE".to_string()],
+            source: Some(" PROJECT:DEMO ".to_string()),
+            priority: Some(200),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+
+        assert_eq!(
+            store.append_idempotent_knowledge(&first).unwrap(),
+            KnowledgeAppendOutcome::Appended
+        );
+        assert_eq!(
+            store.append_idempotent_knowledge(&retry).unwrap(),
+            KnowledgeAppendOutcome::Duplicate {
+                existing_id: Some("mem_existing".to_string())
+            }
+        );
+        assert_eq!(store.recent(10).unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db"));
     }
 
     #[test]

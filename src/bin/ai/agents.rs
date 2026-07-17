@@ -10,7 +10,6 @@
 //   - model: Override default model
 //   - temperature: Override default temperature
 //   - tools/tool_groups/mcp_servers/disable_mcp_tools: Available tools
-//   - routing_tags: For ML-based routing
 //   - model_tier: light/standard/heavy preference
 //
 // Builtin agents:
@@ -198,8 +197,6 @@ pub(super) struct AgentManifest {
     #[serde(default)]
     pub(super) disable_mcp_tools: bool,
     #[serde(default)]
-    pub(super) routing_tags: Vec<String>,
-    #[serde(default)]
     pub(super) model_tier: Option<AgentModelTier>,
     #[serde(default)]
     pub(super) disabled: bool,
@@ -233,13 +230,6 @@ impl AgentManifest {
         matches!(self.mode, AgentMode::Subagent | AgentMode::All)
     }
 
-    pub(super) fn routing_tags_normalized(&self) -> Vec<String> {
-        self.routing_tags
-            .iter()
-            .map(|tag| tag.trim().to_ascii_lowercase())
-            .filter(|tag| !tag.is_empty())
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -596,7 +586,6 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
     let mut tool_groups: Vec<String> = Vec::new();
     let mut mcp_servers: Vec<String> = Vec::new();
     let mut disable_mcp_tools = false;
-    let mut routing_tags: Vec<String> = Vec::new();
 
     let mut body = String::new();
     let mut in_front_matter = true;
@@ -627,7 +616,6 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
                     "tools" => tools.push(v),
                     "tool_groups" => tool_groups.push(v),
                     "mcp_servers" => mcp_servers.push(v),
-                    "routing_tags" => routing_tags.push(v),
                     _ => {}
                 }
                 continue;
@@ -673,7 +661,6 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
                 "tools" => tools = parse_list_value(unquoted),
                 "tool_groups" => tool_groups = parse_list_value(unquoted),
                 "mcp_servers" => mcp_servers = parse_list_value(unquoted),
-                "routing_tags" => routing_tags = parse_list_value(unquoted),
                 _ => {}
             }
         } else {
@@ -722,7 +709,6 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
         tool_groups,
         mcp_servers,
         disable_mcp_tools,
-        routing_tags,
         model_tier: agent_model_tier,
         disabled,
         hidden,
@@ -830,16 +816,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_routing_tags_and_model_tier_from_front_matter() {
+    fn parses_model_tier_from_front_matter() {
         let content = r#"---
 name: test-agent
 description: Fast read-only codebase exploration
 mode: subagent
 model_tier: light
-routing_tags:
-  - find
-  - search
-  - read-only
 ---
 
 Read the codebase and summarize findings.
@@ -848,14 +830,6 @@ Read the codebase and summarize findings.
         let agent = parse_agent_front_matter(content).unwrap();
         assert_eq!(agent.name, "test-agent");
         assert_eq!(agent.model_tier, Some(AgentModelTier::Light));
-        assert_eq!(
-            agent.routing_tags,
-            vec![
-                "find".to_string(),
-                "search".to_string(),
-                "read-only".to_string()
-            ]
-        );
     }
 
     #[test]

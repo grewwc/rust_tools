@@ -9,6 +9,12 @@ pub(super) enum InternalToolCallStreamEvent {
     Begin(String),
     Args(String),
     End,
+    /// 模型在可见正文里吐出的系统内部工具协议标记（如 `<function_results>`）。
+    /// 系统自身从不生成这类结果标记——它是模型退化、自编自演「工具调用→工具结果」
+    /// 循环的确定性指纹。streamer 已把整块剥离不外显；此事件通知上层：本轮已退化，
+    /// 应停流并降档重试（复用 degenerate_repetition 路径），而非把幻觉正文落盘毒化
+    /// 下一轮请求。相比文本统计阈值，这是零误伤信号：合法重复代码/措辞永不含此标记。
+    HallucinatedProtocolMarker,
 }
 
 #[derive(Default)]
@@ -327,6 +333,10 @@ enum AnthropicXmlPhase {
         key: String,
         value: String,
     },
+    /// 正在吞除一个模型幻觉的「工具结果」块，直到遇到匹配的闭标签或流结束。
+    /// 块内所有内容（嵌套标签、幻觉结果文本、散文）一律不外显。上层会在收到
+    /// HallucinatedProtocolMarker 后立即停流降档重试，因此块通常只吞到停流为止。
+    InResultBlock,
 }
 
 #[derive(Default)]
@@ -342,9 +352,26 @@ enum AnthropicTagClass {
     InvokeClose,
     ParamOpen(String),
     ParamClose,
+    /// 系统内部「工具结果」协议标记（`function_results` / `tool_result` 等）。
+    /// 系统自身从不生成这类标记；出现即模型幻觉。开标签启动整块吞除，直到匹配的闭标签
+    /// （或流结束），块内所有幻觉「结果」文本一律不外显。
+    ResultBlockOpen,
+    /// 上述结果块的闭标签，用于结束整块吞除。
+    ResultBlockClose,
     /// 非工具标签（普通散文里的 `<...>`），原样外显。
     Other,
 }
+
+/// 模型幻觉的「工具结果」协议标记本地名集合（不含尖括号与命名空间前缀）。
+/// 系统真实的工具结果绝不会以这种内联 XML 形式进入 assistant 可见正文——模型一旦
+/// 吐出，即是自编自演「调用→结果」退化循环的确定性指纹。开标签触发整块吞除，同时
+/// 上报 HallucinatedProtocolMarker 供上层降档重试。名单覆盖单/复数与常见幻觉变体。
+const HALLUCINATED_RESULT_TAG_NAMES: &[&str] = &[
+    "function_results",
+    "function_result",
+    "tool_results",
+    "tool_result",
+];
 
 impl AnthropicXmlToolCallStreamer {
     pub(super) fn new() -> Self {
@@ -361,6 +388,7 @@ impl AnthropicXmlToolCallStreamer {
                 AnthropicXmlPhase::Idle => 0,
                 AnthropicXmlPhase::InInvoke { .. } => 1,
                 AnthropicXmlPhase::InParamValue { .. } => 2,
+                AnthropicXmlPhase::InResultBlock => 3,
             };
 
             match phase_kind {
@@ -413,6 +441,16 @@ impl AnthropicXmlToolCallStreamer {
                                 params: serde_json::Map::new(),
                             };
                         }
+                        AnthropicTagClass::ResultBlockOpen => {
+                            // 模型幻觉的「工具结果」块：进入整块吞除，并上报退化指纹。
+                            self.phase = AnthropicXmlPhase::InResultBlock;
+                            events.push(InternalToolCallStreamEvent::HallucinatedProtocolMarker);
+                        }
+                        AnthropicTagClass::ResultBlockClose => {
+                            // Idle 下遇到孤立闭标签（复读打乱了配对）：标签已被抑制，
+                            // 同样上报指纹——普通正文永不含 `</function_results>`。
+                            events.push(InternalToolCallStreamEvent::HallucinatedProtocolMarker);
+                        }
                         // Wrapper / 空名 invoke / 杂散闭合标签 / Other：已处理，继续。
                         _ => {}
                     }
@@ -459,7 +497,7 @@ impl AnthropicXmlToolCallStreamer {
                     }
                     continue;
                 }
-                _ => {
+                2 => {
                     // InParamValue：累积原始值，直到遇到 `</parameter>` 闭合标签。
                     let Some(lt) = self.pending.find('<') else {
                         if let AnthropicXmlPhase::InParamValue { value, .. } = &mut self.phase {
@@ -501,6 +539,36 @@ impl AnthropicXmlToolCallStreamer {
                         }
                         self.pending.drain(..=gt_rel);
                     }
+                    continue;
+                }
+                _ => {
+                    // InResultBlock：吞除幻觉「工具结果」块内的所有内容，直到匹配的闭标签
+                    // （`</function_results>` 等）；块内嵌套标签、结果文本、散文一律不外显。
+                    let Some(lt) = self.pending.find('<') else {
+                        // 没有标签起始：全是块内文本，丢弃。
+                        self.pending.clear();
+                        break;
+                    };
+                    // `<` 前的内容仍是块内文本，丢弃。
+                    if lt > 0 {
+                        self.pending.drain(..lt);
+                    }
+                    let Some(gt_rel) = self.pending.find('>') else {
+                        // 标签未闭合：可能是块内文本里的 `<`，也可能是半截闭标签。
+                        // 若还可能是标签名前缀就 hold 等待下一 chunk；否则丢弃这个 `<`。
+                        if could_be_tag_name_prefix(&self.pending) {
+                            break;
+                        }
+                        self.pending.drain(..'<'.len_utf8());
+                        continue;
+                    };
+                    let tag = self.pending[..=gt_rel].to_string();
+                    self.pending.drain(..=gt_rel);
+                    if matches!(classify_anthropic_tag(&tag), AnthropicTagClass::ResultBlockClose) {
+                        // 块结束，回到 Idle。闭标签本身也被吞除，不外显。
+                        self.phase = AnthropicXmlPhase::Idle;
+                    }
+                    // 其它标签（含嵌套 open/未知）在结果块内一律抑制。
                     continue;
                 }
             }
@@ -663,6 +731,13 @@ fn classify_anthropic_tag(tag: &str) -> AnthropicTagClass {
         None => (inner, ""),
     };
     let local = raw_name.rsplit(':').next().unwrap_or(raw_name);
+    if HALLUCINATED_RESULT_TAG_NAMES.contains(&local) {
+        return if is_close {
+            AnthropicTagClass::ResultBlockClose
+        } else {
+            AnthropicTagClass::ResultBlockOpen
+        };
+    }
     match local {
         "function_calls" | "tool_calls" => AnthropicTagClass::Wrapper,
         "invoke" => {
@@ -1121,6 +1196,92 @@ mod tests {
         let (cleaned, events) = s.push("a <div>demo</div> b");
         assert_eq!(cleaned, "a <div>demo</div> b");
         assert!(events.is_empty());
+    }
+
+    // ── 幻觉「工具结果」协议标记（漏洞A/B 修复）──────────────────────────
+
+    #[test]
+    fn anthropic_streamer_swallows_hallucinated_result_block_and_signals() {
+        // 模型自编自演的「工具结果」：整块（标签+内含幻觉结果文本）不外显，
+        // 且上报 HallucinatedProtocolMarker 供上层降档重试。
+        let mut s = super::AnthropicXmlToolCallStreamer::new();
+        let (cleaned, events) = s.push(
+            "正在读取文件<function_results>File: a.rs\n3 matches found</function_results>完成",
+        );
+        assert_eq!(cleaned, "正在读取文件完成", "幻觉结果块不得进入可见正文");
+        assert!(
+            events.contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker),
+            "必须上报幻觉标记指纹，events={events:?}"
+        );
+    }
+
+    #[test]
+    fn anthropic_streamer_swallows_result_block_split_across_chunks() {
+        // 跨-chunk：开标签、结果文本、闭标签分散在多个 chunk 里，仍整块吞除。
+        let mut s = super::AnthropicXmlToolCallStreamer::new();
+        let mut all_cleaned = String::new();
+        let mut all_events = Vec::new();
+        for chunk in [
+            "pre <function_res",
+            "ults>File: x.rs\n1 match",
+            " found</function_",
+            "results> post",
+        ] {
+            let (cleaned, events) = s.push(chunk);
+            all_cleaned.push_str(&cleaned);
+            all_events.extend(events);
+        }
+        assert_eq!(all_cleaned, "pre  post");
+        assert!(
+            all_events.contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker),
+            "跨 chunk 也必须上报幻觉标记，events={all_events:?}"
+        );
+    }
+
+    #[test]
+    fn anthropic_streamer_signals_on_orphan_result_close_tag() {
+        // 复读打乱配对时会出现孤立闭标签；它同样是零误伤指纹，需抑制并上报。
+        let mut s = super::AnthropicXmlToolCallStreamer::new();
+        let (cleaned, events) = s.push("尾部残留</function_results>之后");
+        assert_eq!(cleaned, "尾部残留之后");
+        assert!(events.contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker));
+    }
+
+    #[test]
+    fn anthropic_streamer_handles_namespaced_result_tag() {
+        // 带命名空间前缀（如 `antml:`）的幻觉标记同样命中本地名。
+        let mut s = super::AnthropicXmlToolCallStreamer::new();
+        let (cleaned, events) =
+            s.push("x<tool_result>garbage</tool_result>y");
+        assert_eq!(cleaned, "xy");
+        assert!(events.contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker));
+    }
+
+    #[test]
+    fn anthropic_streamer_keeps_legit_html_and_normal_invoke_untouched() {
+        // 零误伤回归：普通 HTML 原样保留、不产生幻觉信号。
+        let mut s = super::AnthropicXmlToolCallStreamer::new();
+        let (cleaned, events) = s.push("see <div>result</div> and <span>ok</span>");
+        assert_eq!(cleaned, "see <div>result</div> and <span>ok</span>");
+        assert!(
+            !events
+                .contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker),
+            "普通 HTML 不得触发幻觉信号"
+        );
+        // 合法 invoke 工具调用仍正常解析，不受结果块逻辑影响。
+        let mut s2 = super::AnthropicXmlToolCallStreamer::new();
+        let (cleaned2, events2) = s2.push(
+            r#"go<invoke name="read_file"><parameter name="path">/x</parameter></invoke>done"#,
+        );
+        assert_eq!(cleaned2, "godone");
+        assert_eq!(
+            events2.first(),
+            Some(&InternalToolCallStreamEvent::Begin("read_file".to_string()))
+        );
+        assert!(
+            !events2
+                .contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker)
+        );
     }
 
     #[test]

@@ -1,4 +1,8 @@
-use std::{fs, io, path::Path, time::Duration};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
@@ -103,12 +107,52 @@ fn bump_history_revision(conn: &Connection) -> io::Result<()> {
     Ok(())
 }
 
-/// 对 SQLite 数据库执行 WAL checkpoint（TRUNCATE），把 -wal 日志合并进主库。
-/// 用于导出归档前确保主库文件包含全部数据，避免跨机器迁移时丢失未 checkpoint 的 WAL。
-pub(in crate::ai) fn checkpoint_wal(path: &Path) -> io::Result<()> {
-    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
-    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-        .map_err(|e| io::Error::other(e.to_string()))?;
+/// 用 SQLite Online Backup API 创建一致快照，并以原子替换的方式写入目标。
+/// 直接复制 WAL 主文件会遗漏尚未 checkpoint 的页；backup API 会从 source 的同一
+/// SQLite 快照读取主库和 WAL。主库替换成功后会移除旧侧车文件，避免旧 WAL/SHM
+/// 与新主库混用。
+pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<()> {
+    if !source.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("SQLite source does not exist: {}", source.display()),
+        ));
+    }
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("history.sqlite");
+    let temporary = parent.join(format!(".{file_name}.backup-{}.tmp", uuid::Uuid::new_v4()));
+
+    let result = (|| {
+        let source_conn = Connection::open(source).map_err(|e| io::Error::other(e.to_string()))?;
+        source_conn
+            .backup(rusqlite::DatabaseName::Main, &temporary, None)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        drop(source_conn);
+
+        fs::rename(&temporary, target)?;
+        remove_sqlite_sidecars(target)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+        let _ = remove_sqlite_sidecars(&temporary);
+    }
+    result
+}
+
+fn remove_sqlite_sidecars(path: &Path) -> io::Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+        match fs::remove_file(sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     Ok(())
 }
 
@@ -540,6 +584,165 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
         }
     }
     Ok(None)
+}
+
+/// 读取滑动窗口之前最近的 context checkpoint markers。它们是正文 asset 的唯一
+/// 索引，不能因为 SQLite fast path 只加载 recent turns 而从请求上下文静默消失。
+/// 请求正规化层仍会将最终投影限制为最近 8 条。
+pub(in crate::ai) fn read_context_checkpoint_markers_before_id_sqlite(
+    history_file: &Path,
+    before_message_id: i64,
+) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    let conn = match open_history_db(history_file) {
+        Ok(c) => c,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    init_history_schema(&conn)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT role, content, tool_calls, tool_call_id, reasoning_content
+         FROM messages
+         WHERE id < ?1
+           AND role = ?2
+           AND instr(content, '[context_checkpoint') > 0
+         ORDER BY id DESC
+         LIMIT 8",
+    )?;
+    let rows = stmt.query_map(params![before_message_id, ROLE_INTERNAL_NOTE], |row| {
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let tool_calls: Option<String> = row.get(2)?;
+        let tool_call_id: Option<String> = row.get(3)?;
+        let reasoning_content: Option<String> = row.get(4)?;
+        Ok(Message {
+            role,
+            content: decode_message_content(&content),
+            tool_calls: decode_tool_calls(tool_calls.as_deref()),
+            tool_call_id,
+            reasoning_content,
+        })
+    })?;
+
+    let mut markers = Vec::new();
+    for row in rows {
+        let message = row?;
+        if message
+            .content
+            .as_str()
+            .is_some_and(|text| text.trim_start().starts_with("[context_checkpoint "))
+        {
+            markers.push(message);
+        }
+    }
+    markers.reverse();
+    Ok(markers)
+}
+
+/// 把 history 中 context checkpoint marker 的 assets 路径重定位到新 session。
+/// fork 时传入源 assets 目录做精确前缀替换；归档导入时源路径未知，会仅接受
+/// `context-checkpoints/<file>` 的受控相对尾部，避免把普通文本或任意绝对路径改写。
+pub(in crate::ai) fn remap_context_checkpoint_paths_sqlite(
+    history_file: &Path,
+    source_assets: Option<&Path>,
+    target_assets: &Path,
+) -> io::Result<usize> {
+    let mut conn = open_history_db(history_file)?;
+    init_history_schema(&conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let rows = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, content
+                 FROM messages
+                 WHERE role = ?1
+                   AND instr(content, '[context_checkpoint path=') > 0",
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let rows = stmt
+            .query_map([ROLE_INTERNAL_NOTE], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::other(e.to_string()))?
+    };
+
+    let mut remapped = 0usize;
+    for (id, encoded_content) in rows {
+        let content = decode_message_content(&encoded_content);
+        let Some(text) = content.as_str() else {
+            continue;
+        };
+        let Some(remapped_text) =
+            remap_context_checkpoint_marker(text, source_assets, target_assets)
+        else {
+            continue;
+        };
+        let encoded = serde_json::to_string(&Value::String(remapped_text))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        tx.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            params![encoded, id],
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+        remapped += 1;
+    }
+    if remapped > 0 {
+        bump_history_revision(&tx)?;
+    }
+    tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(remapped)
+}
+
+fn remap_context_checkpoint_marker(
+    text: &str,
+    source_assets: Option<&Path>,
+    target_assets: &Path,
+) -> Option<String> {
+    const PREFIX: &str = "[context_checkpoint path=";
+    let leading_len = text.len().checked_sub(text.trim_start().len())?;
+    let (leading, trimmed) = text.split_at(leading_len);
+    let rest = trimmed.strip_prefix(PREFIX)?;
+    let closing = rest.find(']')?;
+    let recorded = Path::new(&rest[..closing]);
+    let relative = source_assets
+        .and_then(|source| recorded.strip_prefix(source).ok())
+        .and_then(checked_context_checkpoint_relative)
+        .or_else(|| checked_context_checkpoint_relative(recorded))?;
+    let remapped = target_assets.join(relative);
+    Some(format!(
+        "{leading}{PREFIX}{}{}",
+        remapped.display(),
+        &rest[closing..]
+    ))
+}
+
+fn checked_context_checkpoint_relative(path: &Path) -> Option<PathBuf> {
+    let mut found_checkpoint_dir = false;
+    let mut relative = PathBuf::new();
+    let mut has_file = false;
+    for component in path.components() {
+        if !found_checkpoint_dir {
+            if let std::path::Component::Normal(part) = component
+                && part == "context-checkpoints"
+            {
+                relative.push(part);
+                found_checkpoint_dir = true;
+            }
+            continue;
+        };
+        match component {
+            std::path::Component::Normal(part) => {
+                relative.push(part);
+                has_file = true;
+            }
+            _ => return None,
+        }
+    }
+    (found_checkpoint_dir && has_file).then_some(relative)
 }
 
 pub(in crate::ai) fn clear_session_history_sqlite(path: &Path) -> io::Result<()> {

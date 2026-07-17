@@ -5,7 +5,7 @@ use crate::ai::types::App;
 /// 构造 goal 模式的初始 prompt——把用户的目标包装成一条明确的、带有持续执行指令的 user message。
 pub(crate) fn build_goal_prompt(goal: &str) -> String {
     format!(
-        "你正在 GOAL MODE 下工作。你的目标是：\n\
+        "你正在 GOAL MODE 下工作。这是一个长期自主任务，目标是：\n\
          ---\n\
          {goal}\n\
          ---\n\
@@ -19,8 +19,7 @@ pub(crate) fn build_goal_prompt(goal: &str) -> String {
 /// 构造 goal 模式的后续 continuation prompt——在上一轮结束后自动注入，驱动 agent 继续推进。
 pub(crate) fn build_goal_continuation_prompt(goal: &str) -> String {
     format!(
-        "[GOAL MODE - 继续]\n\
-         你的目标是：{goal}\n\
+        "[GOAL MODE - 继续] 你的目标是：{goal}\n\
          \n\
          请回顾你目前的进展，继续推进目标的实现。\n\
          - 如果目标已经完全达成，不要再调用工具，直接用文字总结你的工作成果。\n\

@@ -49,13 +49,16 @@ pub fn try_handle_checkpoint_command(
                 println!("No checkpoints for the current session.");
             } else {
                 println!("Checkpoints (current session):");
+                let mut total_size = 0u64;
                 for cp in checkpoints {
                     let when = cp
                         .modified_local
                         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| "-".to_string());
                     println!("  {:<24} {:>8} bytes  {}", cp.name, cp.size_bytes, when);
+                    total_size = total_size.saturating_add(cp.size_bytes);
                 }
+                println!("Total: {total_size} bytes (limit: 20 checkpoints, 512 MiB).");
             }
         }
         "rollback" | "restore" | "rb" => {
@@ -98,5 +101,6 @@ fn print_help() {
     println!("  /checkpoint rollback <name>   restore history from a checkpoint");
     println!("  /checkpoint delete <name>     delete a checkpoint");
     println!();
+    println!("  Limit: 20 checkpoints / 512 MiB per session; saving an existing name replaces it.");
     println!("  Alias: /cp");
 }

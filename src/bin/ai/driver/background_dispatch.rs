@@ -349,6 +349,7 @@ pub(super) fn dispatch_background_batch(
             let _guard = inflight_guard;
             wrapped.await
         };
-        tokio::spawn(runtime_ctx::DRIVER_CTX.scope(task_driver_ctx, guarded_fut));
+        let handle = tokio::spawn(runtime_ctx::DRIVER_CTX.scope(task_driver_ctx, guarded_fut));
+        crate::ai::tools::task_tools::set_task_abort_handle(&scope_task_id, handle.abort_handle());
     }
 }

@@ -230,7 +230,11 @@ fn parse_content_part_event(
         return Some(ParsedStreamPayload::Ignore);
     }
     if part_type == "summary_text" {
-        return Some(textual_event_chunk(event_type, "", &text));
+        // summary_text 的 content_part 事件（added/done）都是已流式输出过的推理
+        // 摘要重发，而非模型增量。统一按 SnapshotChunk 处理，走未见后缀去重，
+        // 避免 added 事件携带的完整文本按 Append 模式用原文重复累积 reasoning_text，
+        // 污染退化检测并可能诱发 thinking 重复渲染（gpt-5.5/5.6 多发此路径）。
+        return Some(ParsedStreamPayload::SnapshotChunk(single_delta_chunk("", &text)));
     }
     Some(textual_event_chunk(event_type, &text, ""))
 }
@@ -732,18 +736,21 @@ mod tests {
     }
 
     #[test]
-    fn content_part_summary_text_maps_to_reasoning_chunk() {
+    fn content_part_summary_text_maps_to_reasoning_snapshot_chunk() {
+        // summary_text 的 content_part 事件（added/done）是对已流式输出的推理
+        // 摘要重发，统一按 SnapshotChunk 处理以走未见后缀去重，避免重复累积
+        // reasoning_text（gpt-5.5/5.6 多发此路径）。
         let payload = r#"{"part":{"type":"summary_text","text":"step summary"}}"#;
         match parse_stream_payload(
             provider::openai_adapter(),
             payload,
             Some("response.content_part.added"),
         ) {
-            ParsedStreamPayload::Chunk(chunk) => {
+            ParsedStreamPayload::SnapshotChunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.content, "");
                 assert_eq!(chunk.choices[0].delta.reasoning_content, "step summary");
             }
-            _ => panic!("expected reasoning content-part chunk"),
+            _ => panic!("expected reasoning content-part snapshot chunk"),
         }
     }
 

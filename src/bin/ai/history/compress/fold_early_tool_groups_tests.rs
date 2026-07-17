@@ -381,13 +381,69 @@ fn preserves_read_file_for_pending_patch_path() {
     // read_file 组必须逐字保留（不是 ROLE_INTERNAL_NOTE stub）。
     let rf = folded
         .iter()
-        .find(|m| m.role == "assistant"
-            && m.tool_calls
-                .as_ref()
-                .and_then(|cs| cs.first())
-                .map(|c| c.function.name == "read_file")
-                .unwrap_or(false))
+        .find(|m| {
+            m.role == "assistant"
+                && m.tool_calls
+                    .as_ref()
+                    .and_then(|cs| cs.first())
+                    .map(|c| c.function.name == "read_file")
+                    .unwrap_or(false)
+        })
         .expect("pending-patch 路径的 read_file 组不应被折叠");
     let _ = rf; // 仅断言其存在且 role 仍为 assistant
+    assert_tool_pairs_consistent(&folded);
+}
+
+#[test]
+fn preserves_read_file_for_each_pending_path_from_multi_file_patch() {
+    let mut messages = vec![msg("system", "s"), msg("user", "批量改代码")];
+    messages.push(assistant_call_args(
+        "call-rf-a",
+        "read_file",
+        r#"{"file_path":"/a.rs"}"#,
+    ));
+    messages.push(tool_result(
+        "call-rf-a",
+        "Output preserved for non-compressible tool `read_file`.\n- file_path: /a.rs\n- use read_file to inspect exact content.",
+    ));
+    messages.push(assistant_call_args(
+        "call-rf-b",
+        "read_file",
+        r#"{"file_path":"/b.rs"}"#,
+    ));
+    messages.push(tool_result(
+        "call-rf-b",
+        "Output preserved for non-compressible tool `read_file`.\n- file_path: /b.rs\n- use read_file to inspect exact content.",
+    ));
+    messages.push(assistant_call_args(
+        "call-ap",
+        "apply_patch",
+        r#"{"patch":"*** Begin Patch\n*** Update File: /a.rs\n@@\n-old_a\n+new_a\n*** Update File: /b.rs\n@@\n-old_b\n+new_b\n*** End Patch"}"#,
+    ));
+    messages.push(tool_result(
+        "call-ap",
+        "Error: apply_patch failed: failed while preparing patch for /b.rs: context mismatch: patch hunk could not be located.",
+    ));
+    for i in 0..6 {
+        let id = format!("call-multi-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "recent"));
+    }
+
+    let (folded, _) = fold_early_tool_groups(&messages, 4);
+    for target in ["/a.rs", "/b.rs"] {
+        let preserved = folded.iter().any(|m| {
+            m.role == "assistant"
+                && m.tool_calls
+                    .as_ref()
+                    .and_then(|cs| cs.first())
+                    .map(|c| {
+                        c.function.name == "read_file"
+                            && c.function.arguments.contains(&format!("\"{target}\""))
+                    })
+                    .unwrap_or(false)
+        });
+        assert!(preserved, "pending multi-file patch path {target} should be preserved");
+    }
     assert_tool_pairs_consistent(&folded);
 }

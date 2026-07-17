@@ -1,6 +1,6 @@
 use crate::ai::{
-    driver::McpInitReport,
     driver::model::OcrExtraction,
+    driver::McpInitReport,
     mcp::McpClient,
     skills::SkillManifest,
     theme::{
@@ -119,6 +119,17 @@ pub(in crate::ai) fn format_tool_status(status: &str, tool_name: &str, accent: &
     format!(
         "{}{}{} {}{}{}",
         accent, status, RESET, ACCENT_PRIMARY, tool_name, RESET
+    )
+}
+
+pub(in crate::ai) fn format_tool_status_with_file_target(
+    status_line: String,
+    target: &str,
+) -> String {
+    let target = sanitize_for_terminal(target);
+    format!(
+        "{}  {}file:{} {}{}{}",
+        status_line, ACCENT_MUTED, RESET, ACCENT_SECONDARY, target, RESET
     )
 }
 
@@ -247,6 +258,68 @@ pub(in crate::ai) fn format_tool_output_block(content: &str) -> Vec<String> {
     }
 
     content.lines().map(format_tool_output_line).collect()
+}
+
+/// 从文件类工具的 arguments JSON 中提取目标文件名，用于终端提示。
+/// - `read_file` / `write_file`: `file_path` 字段
+/// - `apply_patch`: 优先 `file_path` / `path`，否则从 patch 文本的 `*** Update File:` 等行提取
+pub(in crate::ai) fn format_file_tool_target(tool_name: &str, args_json: &str) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(args_json.trim()).ok()?;
+    match tool_name {
+        "read_file" | "write_file" => args
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(short_path),
+        "delete_path" => args.get("path").and_then(|v| v.as_str()).map(short_path),
+        "apply_patch" => {
+            // 优先从 file_path / path 参数取
+            for key in &["file_path", "path"] {
+                if let Some(p) = args.get(*key).and_then(|v| v.as_str()) {
+                    return Some(short_path(p));
+                }
+            }
+            // 其次从 patch 文本中提取第一个目标文件
+            let patch = args.get("patch").and_then(|v| v.as_str())?;
+            extract_first_patch_target(patch).map(|s| short_path(&s))
+        }
+        _ => None,
+    }
+}
+
+/// 从 patch 文本中提取第一个 `*** Update File:` / `*** Add File:` 行的目标路径。
+fn extract_first_patch_target(patch: &str) -> Option<String> {
+    for line in patch.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed
+            .strip_prefix("*** Update File:")
+            .or_else(|| trimmed.strip_prefix("*** Add File:"))
+        {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// 只保留路径最后两段（目录+文件名），截断过长的路径。
+fn short_path(p: &str) -> String {
+    // 优先取最后两段 /a/b/c/foo.rs → b/foo.rs
+    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    let short = if parts.len() >= 2 {
+        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        p.to_string()
+    };
+    let char_count = short.chars().count();
+    if char_count > 50 {
+        let byte_idx = short
+            .char_indices()
+            .nth(char_count - 48)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        format!("…{}", &short[byte_idx..])
+    } else {
+        short
+    }
 }
 
 /// 若工具配置了 `print_args`，把调用入参回显到终端；否则为空操作。
@@ -403,10 +476,11 @@ mod tests {
         format_assistant_banner, format_empty_state, format_ocr_summary_block,
         format_section_header, format_section_item, format_section_note, format_tool_command_line,
         format_tool_header, format_tool_output_block, format_tool_output_line,
-        format_tool_output_prefix, sanitize_for_terminal,
+        format_tool_output_prefix, format_tool_status_completed,
+        format_tool_status_with_file_target, sanitize_for_terminal,
     };
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
-    use crate::ai::theme::ACCENT_COMMAND;
+    use crate::ai::theme::{ACCENT_COMMAND, ACCENT_SECONDARY};
 
     fn strip_ansi_for_test(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -527,6 +601,18 @@ mod tests {
         let visible = strip_ansi_for_test(&rendered);
         assert_eq!(visible, "  │ cmd: cargo check --bin a");
         assert!(rendered.contains(ACCENT_COMMAND));
+    }
+
+    #[test]
+    fn tool_status_file_target_stays_on_status_line_with_distinct_accent() {
+        let rendered = format_tool_status_with_file_target(
+            format_tool_status_completed("read_file"),
+            "tool_result/execution.rs",
+        );
+        let visible = strip_ansi_for_test(&rendered);
+
+        assert_eq!(visible, "✓ read_file  file: tool_result/execution.rs");
+        assert!(rendered.contains(&format!("{ACCENT_SECONDARY}tool_result/execution.rs")));
     }
 
     #[test]

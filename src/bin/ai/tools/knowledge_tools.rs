@@ -57,7 +57,9 @@ use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::service::memory::{
     MemoryOwnerScope, next_memory_id, prepare_memory_save_entry,
 };
-use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
+use crate::ai::tools::storage::memory_store::{
+    AgentMemoryEntry, KnowledgeAppendOutcome, MemoryStore,
+};
 use crate::ai::tools::storage::rag_store::{
     RagEntry, ensure_rag_store, get_rag_store, legacy_rag_id_for_memory_entry,
     legacy_rebuild_rag_id_for_memory_entry,
@@ -119,7 +121,20 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
     } = prepared;
 
     let store = MemoryStore::from_env_or_config();
-    store.append(&entry)?;
+    let outcome = store.append_idempotent_knowledge(&entry)?;
+    if let KnowledgeAppendOutcome::Duplicate { existing_id } = outcome {
+        let mut result = format!(
+            "Knowledge already exists and was not saved again [{}]:\n  {}\n",
+            entry.category, entry.note
+        );
+        if let Some(existing_id) = existing_id {
+            result.push_str(&format!("  Existing ID: {existing_id}\n"));
+        }
+        result.push_str(
+            "  Reuse this durable fact; do not call `knowledge_save` again for the same content in this turn.\n",
+        );
+        return Ok(result);
+    }
 
     // Sync to RAG vector index. Failure here is non-fatal (the entry is already
     // persisted to the JSONL store above), but it must not be silent: if the
@@ -1001,6 +1016,36 @@ mod tests {
         let forget_msg = execute_knowledge_forget(&serde_json::json!({ "id": id })).unwrap();
         assert!(forget_msg.contains("Forgotten knowledge entry"));
         assert!(read_entries(&path).is_empty());
+
+        cleanup_memory_artifacts(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn test_knowledge_save_is_idempotent_and_skips_duplicate_rag_sync() {
+        let _guard = env_lock_guard();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_knowledge_save_idempotent_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+        let args = serde_json::json!({
+            "content": "The project requires targeted Cargo verification only.",
+            "category": "project_info",
+            "tags": ["test", "workflow"],
+            "source": "project:rust_tools"
+        });
+
+        let first = execute_knowledge_save(&args).unwrap();
+        let duplicate = execute_knowledge_save(&args).unwrap();
+        assert!(first.contains("Saved to knowledge"));
+        assert!(duplicate.contains("already exists and was not saved again"));
+        assert_eq!(read_entries(&path).len(), 1);
 
         cleanup_memory_artifacts(&path);
         unsafe {

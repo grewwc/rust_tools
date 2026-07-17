@@ -136,7 +136,9 @@ pub(crate) fn request_retry_policy(auto_model_fallback: bool) -> RequestRetryPol
             max_attempts: AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS,
             max_attempts_429: AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS,
             header_timeout_secs: AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
-            hedged_max_sends: 2, // 子 agent 超时短（30s），1 primary + 1 backup 足够
+            // 自动选型的模型 fallback 已是备用请求。若再在 3 秒后发送 hedged
+            // backup，会复制同一个子 agent 推理，造成重复调度和额外消耗。
+            hedged_max_sends: 1,
         }
     } else {
         RequestRetryPolicy {

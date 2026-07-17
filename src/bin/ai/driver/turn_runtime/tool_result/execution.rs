@@ -3,12 +3,13 @@ use crate::ai::{
     history::{Message, ROLE_INTERNAL_NOTE},
     mcp::{McpClient, SharedMcpClient},
     stream::clamp_line_to_terminal_row_with_reserve,
-    tools::task_tools,
+    tools::{storage::file_store::FileStore, task_tools},
     types::{App, ToolCall},
 };
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     io::Write,
+    path::PathBuf,
 };
 
 use super::super::persistence::persist_pending_turn_messages;
@@ -21,7 +22,7 @@ use super::super::{
 use super::{
     messaging::{
         append_cached_tool_results_note, append_message_pair, append_tool_result_messages,
-        parse_prune_meta_and_update_marks, record_final_stream_response,
+        parse_prune_meta_and_update_marks, record_final_stream_response, record_hidden_self_note,
         record_tool_inspection_artifacts,
     },
     overflow::{build_model_overflow_stub, summarize_large_tool_output, write_tool_overflow_file},
@@ -251,6 +252,7 @@ fn execute_tool_calls_for_round(
 enum ToolCallRejectionReason {
     NoToolHandoff,
     RepeatedReadOnlyCall,
+    PatchRetryNeedsFreshRead,
 }
 
 fn reject_tool_calls(
@@ -280,6 +282,10 @@ Do not call '{tool_name}' again; instead summarize confirmed facts, answer what 
         ToolCallRejectionReason::RepeatedReadOnlyCall => format!(
             "Error: this exact repeated read-only tool call was suppressed. \
 Tools remain available, but do not call '{tool_name}' again with the same arguments. Reuse the previous result; if more evidence is necessary, call a different tool or change arguments so the next tool call can produce new information."
+        ),
+        ToolCallRejectionReason::PatchRetryNeedsFreshRead => format!(
+            "Error: apply_patch retry blocked. The previous patch for this file failed with `context mismatch` or `ambiguous patch`, which means the file content you are working from is stale or the context is not unique. \
+Do NOT retry patches in this batch — doing so will only fail again. Required recovery steps: (1) call `read_file` (or `read_file_lines`) on the SAME target path to get the current truth state; (2) copy context lines DIRECTLY from that fresh output, including function names or distinctive surrounding lines to ensure each hunk matches exactly ONE location; (3) do NOT copy line-number prefixes (like `  42| `) into the patch; (4) call `apply_patch` only in a LATER tool round after you have successfully read the file."
         ),
     }
 }
@@ -358,6 +364,230 @@ fn repeat_guarded_read_only_tool_name(name: &str) -> bool {
         "search", "find", "read", "get", "list", "view", "fetch", "export",
     ];
     reusable.iter().any(|needle| lower.contains(needle))
+}
+
+/// `knowledge_search` 在一个 user turn 内是可复用的只读事实。通用重复保护只会
+/// 比较整批调用；这里按单条语义签名抑制重搜，因此同批的其它有效工具不会被连带
+/// 拒绝。任何知识写入都会使旧搜索失效，随后允许再次搜索。
+fn duplicate_knowledge_search_call_ids(
+    messages: &[Message],
+    tool_calls: &[ToolCall],
+) -> HashSet<String> {
+    if tool_calls.iter().any(knowledge_store_mutated) {
+        return HashSet::new();
+    }
+
+    let mut result_by_id: HashMap<&str, &str> = HashMap::new();
+    for message in messages {
+        if message.role != "tool" {
+            continue;
+        }
+        if let (Some(id), Some(content)) =
+            (message.tool_call_id.as_deref(), message.content.as_str())
+        {
+            result_by_id.insert(id, content);
+        }
+    }
+
+    let mut completed_searches = HashSet::new();
+    for message in messages.iter().rev() {
+        if message.role == "user" {
+            break;
+        }
+        let Some(previous_calls) = message.tool_calls.as_ref() else {
+            continue;
+        };
+        if previous_calls.iter().any(knowledge_store_mutated) {
+            break;
+        }
+        for previous in previous_calls {
+            let Some(signature) = knowledge_search_signature(previous) else {
+                continue;
+            };
+            let Some(result) = result_by_id.get(previous.id.as_str()).copied() else {
+                continue;
+            };
+            if !result.trim_start().starts_with("Error:") {
+                completed_searches.insert(signature);
+            }
+        }
+    }
+
+    let mut duplicate_ids = HashSet::new();
+    for tool_call in tool_calls {
+        let Some(signature) = knowledge_search_signature(tool_call) else {
+            continue;
+        };
+        if !completed_searches.insert(signature) {
+            duplicate_ids.insert(tool_call.id.clone());
+        }
+    }
+    duplicate_ids
+}
+
+fn knowledge_search_signature(tool_call: &ToolCall) -> Option<String> {
+    if tool_call.function.name != "knowledge_search" {
+        return None;
+    }
+    let args = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments).ok()?;
+    let query = args.get("query")?.as_str()?.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let category = args
+        .get("category")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|category| !category.is_empty())
+        .unwrap_or("");
+    let limit = args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(10);
+    Some(format!(
+        "{}\n{}\n{limit}",
+        query.to_lowercase(),
+        category.to_lowercase()
+    ))
+}
+
+fn knowledge_store_mutated(tool_call: &ToolCall) -> bool {
+    match tool_call.function.name.as_str() {
+        "knowledge_save" | "knowledge_forget" => true,
+        "knowledge_consolidate" => {
+            serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+                .ok()
+                .is_some_and(|args| {
+                    args.get("action").and_then(serde_json::Value::as_str) == Some("execute")
+                })
+        }
+        _ => false,
+    }
+}
+
+fn duplicate_knowledge_search_message() -> String {
+    "Error: this knowledge_search was already completed with the same query in the current user turn. Reuse its result; search again only after knowledge changes or with a materially different query.".to_string()
+}
+
+fn extract_apply_patch_target_paths_from_patch(patch: &str) -> Vec<PathBuf> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            [
+                "*** Update File: ",
+                "*** Add File: ",
+                "*** Replace in line: ",
+            ]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+            .map(|path| {
+                FileStore::new(PathBuf::from(path.trim()))
+                    .path()
+                    .to_path_buf()
+            })
+        })
+        .collect()
+}
+
+/// `apply_patch` 的 context mismatch / ambiguity 说明模型当前持有的文件事实已过期，
+/// 继续微调旧 patch 只会重复失败。这里以实际工具消息为准：目标文件在失败后必须有
+/// 一次成功的 `read_file`，才允许再次 patch。路径统一经 FileStore 归一化，避免
+/// 相对路径、`~` 和绝对路径写法不同而绕过门控。
+fn patch_retry_requires_fresh_read(messages: &[Message], tool_calls: &[ToolCall]) -> bool {
+    let mut result_by_id: HashMap<&str, &str> = HashMap::new();
+    for message in messages {
+        if message.role != "tool" {
+            continue;
+        }
+        if let (Some(id), Some(content)) =
+            (message.tool_call_id.as_deref(), message.content.as_str())
+        {
+            result_by_id.insert(id, content);
+        }
+    }
+
+    let mut stale_patch_targets = HashSet::new();
+    for message in messages {
+        let Some(previous_calls) = message.tool_calls.as_ref() else {
+            continue;
+        };
+        for tool_call in previous_calls {
+            let Some(result) = result_by_id.get(tool_call.id.as_str()).copied() else {
+                continue;
+            };
+            match tool_call.function.name.as_str() {
+                "apply_patch" => {
+                    let paths = patch_target_paths(tool_call);
+                    if paths.is_empty() {
+                        continue;
+                    }
+                    if result.trim_start().starts_with("Successfully patched") {
+                        for path in paths {
+                            stale_patch_targets.remove(&path);
+                        }
+                    } else if patch_failure_requires_fresh_read(result) {
+                        stale_patch_targets.extend(paths);
+                    }
+                }
+                "read_file" | "read_file_lines" => {
+                    let Some(path) = file_tool_target_path(tool_call) else {
+                        continue;
+                    };
+                    if !result.trim_start().starts_with("Error:") {
+                        stale_patch_targets.remove(&path);
+                    }
+                }
+                "write_file" => {
+                    let Some(path) = file_tool_target_path(tool_call) else {
+                        continue;
+                    };
+                    if result.trim_start().starts_with("Successfully wrote to") {
+                        stale_patch_targets.remove(&path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    tool_calls.iter().any(|tool_call| {
+        tool_call.function.name == "apply_patch"
+            && patch_target_paths(tool_call)
+                .into_iter()
+                .any(|path| stale_patch_targets.contains(&path))
+    })
+}
+
+fn patch_failure_requires_fresh_read(result: &str) -> bool {
+    let result = result.to_ascii_lowercase();
+    result.contains("context mismatch") || result.contains("ambiguous patch")
+}
+
+fn patch_target_paths(tool_call: &ToolCall) -> Vec<PathBuf> {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments) else {
+        return Vec::new();
+    };
+    if let Some(target) = args
+        .get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return vec![FileStore::new(PathBuf::from(target)).path().to_path_buf()];
+    }
+    args.get("patch")
+        .and_then(serde_json::Value::as_str)
+        .map(extract_apply_patch_target_paths_from_patch)
+        .unwrap_or_default()
+}
+
+fn file_tool_target_path(tool_call: &ToolCall) -> Option<PathBuf> {
+    let args = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments).ok()?;
+    let target = args
+        .get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(serde_json::Value::as_str)?;
+    Some(FileStore::new(PathBuf::from(target)).path().to_path_buf())
 }
 
 /// 前台同步工具执行（尤其是 `execute_command` 的流式输出）也属于“当前 turn 的可中断
@@ -617,8 +847,6 @@ fn format_command_input(arguments: &str) -> Option<String> {
 
 impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
     fn on_tool_started(&mut self, tool_call: &ToolCall) {
-        // 命令类工具：在终端打印其输入（命令行），输出仍按既定策略忽略。
-        // 其它工具保持「只显示状态行」的既有行为。
         if matches!(
             tool_call.function.name.as_str(),
             "execute_command" | "run_command" | "shell" | "bash"
@@ -707,9 +935,10 @@ fn handle_tool_call_round(
     persisted_turn_messages: &mut usize,
     iteration: usize,
     rejection_reason: Option<ToolCallRejectionReason>,
+    suppressed_knowledge_search_call_ids: &HashSet<String>,
     turn_had_tool_error: &mut bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let _remaining_meta = parse_prune_meta_and_update_marks(
+    let remaining_meta = parse_prune_meta_and_update_marks(
         app,
         messages,
         &tool_call_execution.stream_result.hidden_meta,
@@ -719,7 +948,7 @@ fn handle_tool_call_round(
     } else {
         let mut observer = TerminalToolObserver::new(app);
         let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
-        execute_tool_calls_for_round(
+        execute_tool_calls_with_suppressed_knowledge_search(
             &app.session_id,
             mcp_client,
             shared_mcp_client,
@@ -727,6 +956,7 @@ fn handle_tool_call_round(
             &tool_call_execution.allowed_tool_names,
             Some(&mut observer),
             iteration,
+            suppressed_knowledge_search_call_ids,
         )?
     };
     *turn_had_tool_error |= exec_result.had_error;
@@ -740,6 +970,7 @@ fn handle_tool_call_round(
         messages,
         turn_messages,
     );
+    record_hidden_self_note(app, turn_messages, &remaining_meta);
     record_tool_inspection_artifacts(
         app,
         messages,
@@ -750,6 +981,88 @@ fn handle_tool_call_round(
     persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
 
     Ok(None)
+}
+
+fn execute_tool_calls_with_suppressed_knowledge_search(
+    session_id: &str,
+    mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
+    tool_calls: &[ToolCall],
+    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
+    observer: Option<&mut dyn tools::ToolExecutionObserver>,
+    iteration: usize,
+    suppressed_call_ids: &HashSet<String>,
+) -> Result<ExecuteToolCallsResult, Box<dyn std::error::Error>> {
+    if suppressed_call_ids.is_empty() {
+        return execute_tool_calls_for_round(
+            session_id,
+            mcp_client,
+            shared_mcp_client,
+            tool_calls,
+            allowed_tool_names,
+            observer,
+            iteration,
+        );
+    }
+
+    let executable = tool_calls
+        .iter()
+        .filter(|tool_call| !suppressed_call_ids.contains(&tool_call.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let executed = if executable.is_empty() {
+        ExecuteToolCallsResult {
+            executed_tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            cached_hits: Vec::new(),
+            had_error: false,
+        }
+    } else {
+        execute_tool_calls_for_round(
+            session_id,
+            mcp_client,
+            shared_mcp_client,
+            &executable,
+            allowed_tool_names,
+            observer,
+            iteration,
+        )?
+    };
+
+    let mut result_by_id = HashMap::new();
+    for (index, result) in executed.tool_results.into_iter().enumerate() {
+        let cached = executed.cached_hits.get(index).copied().unwrap_or(false);
+        result_by_id.insert(result.tool_call_id.clone(), (result, cached));
+    }
+    let mut tool_results = Vec::with_capacity(tool_calls.len());
+    let mut cached_hits = Vec::with_capacity(tool_calls.len());
+    for tool_call in tool_calls {
+        if suppressed_call_ids.contains(&tool_call.id) {
+            tool_results.push(crate::ai::types::ToolResult {
+                tool_call_id: tool_call.id.clone(),
+                content: duplicate_knowledge_search_message(),
+            });
+            cached_hits.push(false);
+            continue;
+        }
+        let Some((result, cached)) = result_by_id.remove(&tool_call.id) else {
+            tool_results.push(crate::ai::types::ToolResult {
+                tool_call_id: tool_call.id.clone(),
+                content: "Error: tool execution returned no result for this call.".to_string(),
+            });
+            cached_hits.push(false);
+            continue;
+        };
+        tool_results.push(result);
+        cached_hits.push(cached);
+    }
+
+    Ok(ExecuteToolCallsResult {
+        executed_tool_calls: tool_calls.to_vec(),
+        tool_results,
+        cached_hits,
+        had_error: executed.had_error || !suppressed_call_ids.is_empty(),
+    })
 }
 
 const DISCOVER_SKILLS_FOLLOWUP_PREFIX: &str = "tool_followup:discover_skills\n";
@@ -1263,12 +1576,27 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                     messages,
                     &tool_call_execution.stream_result.tool_calls,
                 );
+            let patch_retry_needs_fresh_read = !*force_final_response
+                && patch_retry_requires_fresh_read(
+                    messages,
+                    &tool_call_execution.stream_result.tool_calls,
+                );
             let rejection_reason = if *force_final_response {
                 Some(ToolCallRejectionReason::NoToolHandoff)
             } else if repeated_read_only_call {
                 Some(ToolCallRejectionReason::RepeatedReadOnlyCall)
+            } else if patch_retry_needs_fresh_read {
+                Some(ToolCallRejectionReason::PatchRetryNeedsFreshRead)
             } else {
                 None
+            };
+            let suppressed_knowledge_search_call_ids = if rejection_reason.is_none() {
+                duplicate_knowledge_search_call_ids(
+                    messages,
+                    &tool_call_execution.stream_result.tool_calls,
+                )
+            } else {
+                HashSet::new()
             };
             let image_read_paths = if rejection_reason.is_none() {
                 extract_image_paths_from_file_read_tool_calls(
@@ -1288,6 +1616,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 persisted_turn_messages,
                 iteration,
                 rejection_reason,
+                &suppressed_knowledge_search_call_ids,
                 turn_had_tool_error,
             )?;
             if discover_skills_only {
@@ -1550,6 +1879,249 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_knowledge_search_is_suppressed_inside_mixed_tool_batch() {
+        let previous = test_tool_call(
+            "call_search_previous",
+            "knowledge_search",
+            serde_json::json!({ "query": "durable preference" }),
+        );
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_search_previous", "1. matching preference"),
+        ];
+        let current = vec![
+            test_tool_call(
+                "call_command",
+                "execute_command",
+                serde_json::json!({ "command": "pwd" }),
+            ),
+            test_tool_call(
+                "call_search_retry",
+                "knowledge_search",
+                serde_json::json!({
+                    "query": "  DURABLE PREFERENCE ",
+                    "category": "",
+                    "limit": 10
+                }),
+            ),
+        ];
+
+        let suppressed = duplicate_knowledge_search_call_ids(&messages, &current);
+        assert_eq!(suppressed, HashSet::from(["call_search_retry".to_string()]));
+    }
+
+    #[test]
+    fn knowledge_change_allows_the_same_search_again() {
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_search_previous",
+                "knowledge_search",
+                serde_json::json!({ "query": "durable preference" }),
+            )),
+            tool_result_message("call_search_previous", "1. matching preference"),
+            assistant_tool_call_message(test_tool_call(
+                "call_save",
+                "knowledge_save",
+                serde_json::json!({ "content": "new durable preference" }),
+            )),
+            tool_result_message("call_save", "Saved to knowledge"),
+        ];
+        let current = test_tool_call(
+            "call_search_retry",
+            "knowledge_search",
+            serde_json::json!({ "query": "durable preference" }),
+        );
+
+        assert!(duplicate_knowledge_search_call_ids(&messages, &[current]).is_empty());
+    }
+
+    #[test]
+    fn failed_knowledge_search_does_not_block_retry() {
+        let previous = test_tool_call(
+            "call_search_previous",
+            "knowledge_search",
+            serde_json::json!({ "query": "durable preference" }),
+        );
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message(
+                "call_search_previous",
+                "Error: knowledge database unavailable",
+            ),
+        ];
+        let current = test_tool_call(
+            "call_search_retry",
+            "knowledge_search",
+            serde_json::json!({ "query": "durable preference" }),
+        );
+
+        assert!(duplicate_knowledge_search_call_ids(&messages, &[current]).is_empty());
+    }
+
+    #[test]
+    fn patch_retry_requires_fresh_read_after_context_mismatch() {
+        let path = "/tmp/patch-target.rs";
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_patch",
+                "apply_patch",
+                serde_json::json!({ "file_path": path, "patch": "@@\n-old\n+new" }),
+            )),
+            tool_result_message(
+                "call_failed_patch",
+                "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+            ),
+        ];
+        let retry = test_tool_call(
+            "call_retry",
+            "apply_patch",
+            serde_json::json!({ "path": path, "patch": "@@\n-old\n+newer" }),
+        );
+
+        assert!(patch_retry_requires_fresh_read(&messages, &[retry]));
+    }
+
+    #[test]
+    fn patch_retry_is_released_by_successful_read_of_same_target() {
+        let path = "/tmp/patch-target.rs";
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_patch",
+                "apply_patch",
+                serde_json::json!({ "file_path": path, "patch": "@@\n-old\n+new" }),
+            )),
+            tool_result_message(
+                "call_failed_patch",
+                "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.",
+            ),
+            assistant_tool_call_message(test_tool_call(
+                "call_fresh_read",
+                "read_file",
+                serde_json::json!({ "path": path }),
+            )),
+            tool_result_message("call_fresh_read", "fn current() {}\n"),
+        ];
+        let retry = test_tool_call(
+            "call_retry",
+            "apply_patch",
+            serde_json::json!({ "file_path": path, "patch": "@@\n-old\n+newer" }),
+        );
+
+        assert!(!patch_retry_requires_fresh_read(&messages, &[retry]));
+    }
+
+    #[test]
+    fn patch_retry_is_not_released_by_read_of_another_target() {
+        let patch_path = "/tmp/patch-target.rs";
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_patch",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": format!(
+                        "*** Begin Patch\n*** Update File: {patch_path}\n@@\n-old\n+new\n*** End Patch"
+                    )
+                }),
+            )),
+            tool_result_message(
+                "call_failed_patch",
+                "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+            ),
+            assistant_tool_call_message(test_tool_call(
+                "call_other_read",
+                "read_file",
+                serde_json::json!({ "file_path": "/tmp/another-target.rs" }),
+            )),
+            tool_result_message("call_other_read", "unrelated current content\n"),
+        ];
+        let retry = test_tool_call(
+            "call_retry",
+            "apply_patch",
+            serde_json::json!({ "file_path": patch_path, "patch": "@@\n-old\n+newer" }),
+        );
+
+        assert!(patch_retry_requires_fresh_read(&messages, &[retry]));
+    }
+
+    #[test]
+    fn patch_retry_multi_file_failure_blocks_all_targets_until_each_is_re_read() {
+        let a = "/tmp/patch-a.rs";
+        let b = "/tmp/patch-b.rs";
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_patch",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": format!(
+                        "*** Begin Patch\n*** Update File: {a}\n@@\n-old_a\n+new_a\n*** Update File: {b}\n@@\n-old_b\n+new_b\n*** End Patch"
+                    )
+                }),
+            )),
+            tool_result_message(
+                "call_failed_patch",
+                &format!(
+                    "Error: apply_patch failed: failed while preparing patch for {b}: context mismatch: patch hunk could not be located."
+                ),
+            ),
+            assistant_tool_call_message(test_tool_call(
+                "call_read_a",
+                "read_file",
+                serde_json::json!({ "file_path": a }),
+            )),
+            tool_result_message("call_read_a", "fn current_a() {}\n"),
+        ];
+        let retry = test_tool_call(
+            "call_retry_b",
+            "apply_patch",
+            serde_json::json!({ "file_path": b, "patch": "@@\n-old_b\n+newer_b" }),
+        );
+
+        assert!(patch_retry_requires_fresh_read(&messages, &[retry]));
+    }
+
+    #[test]
+    fn patch_retry_multi_file_failure_is_released_after_all_targets_are_re_read() {
+        let a = "/tmp/patch-a.rs";
+        let b = "/tmp/patch-b.rs";
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_patch",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": format!(
+                        "*** Begin Patch\n*** Update File: {a}\n@@\n-old_a\n+new_a\n*** Update File: {b}\n@@\n-old_b\n+new_b\n*** End Patch"
+                    )
+                }),
+            )),
+            tool_result_message(
+                "call_failed_patch",
+                &format!(
+                    "Error: apply_patch failed: failed while preparing patch for {b}: ambiguous patch: hunk context matches 2 locations."
+                ),
+            ),
+            assistant_tool_call_message(test_tool_call(
+                "call_read_a",
+                "read_file",
+                serde_json::json!({ "file_path": a }),
+            )),
+            tool_result_message("call_read_a", "fn current_a() {}\n"),
+            assistant_tool_call_message(test_tool_call(
+                "call_read_b",
+                "read_file_lines",
+                serde_json::json!({ "path": b }),
+            )),
+            tool_result_message("call_read_b", "1| fn current_b() {}\n"),
+        ];
+        let retry = test_tool_call(
+            "call_retry_b",
+            "apply_patch",
+            serde_json::json!({ "file_path": b, "patch": "@@\n-old_b\n+newer_b" }),
+        );
+
+        assert!(!patch_retry_requires_fresh_read(&messages, &[retry]));
+    }
+
+    #[test]
     fn repeated_read_only_tool_call_is_rejected_without_forcing_final_response() {
         let mut app = test_app_with_tools(&["read_file"]);
         let shared_mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
@@ -1634,6 +2206,158 @@ mod tests {
                 .unwrap_or_default()
                 .contains("call a different tool or change arguments")
         );
+    }
+
+    #[test]
+    fn patch_retry_without_fresh_read_is_rejected() {
+        let mut app = test_app_with_tools(&["apply_patch", "read_file"]);
+        let shared_mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
+        let path = "/tmp/patch-target.rs";
+        let current_call = test_tool_call(
+            "call_retry",
+            "apply_patch",
+            serde_json::json!({ "file_path": path, "patch": "@@\n-old\n+new" }),
+        );
+        let mut messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_patch",
+                "apply_patch",
+                serde_json::json!({ "file_path": path, "patch": "@@\n-old\n+new" }),
+            )),
+            tool_result_message(
+                "call_failed_patch",
+                "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+            ),
+        ];
+        let mut turn_messages = Vec::new();
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut terminal_dedupe_candidate = None;
+        let consecutive_truncations = 0;
+        let mut force_final_response = false;
+        let mut persisted_turn_messages = 0;
+        let mut turn_had_tool_error = false;
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "update the file",
+            &shared_mcp_client.lock().unwrap(),
+            &shared_mcp_client,
+            IterationExecution::ToolCall(ToolCallExecution {
+                stream_result: crate::ai::types::StreamResult {
+                    tool_calls: vec![current_call],
+                    ..Default::default()
+                },
+                allowed_tool_names: rust_tools::commonw::FastSet::from_iter([
+                    "apply_patch".to_string(),
+                    "read_file".to_string(),
+                ]),
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            false,
+            1,
+            16,
+            consecutive_truncations,
+            &mut turn_had_tool_error,
+        )
+        .unwrap();
+
+        assert!(matches!(step, TurnLoopStep::Continue));
+        assert!(turn_had_tool_error);
+        let rejected_tool_result = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "tool")
+            .expect("rejection should append a tool result");
+        assert!(
+            rejected_tool_result
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .contains("apply_patch retry blocked")
+        );
+    }
+
+    #[test]
+    fn tool_call_round_persists_hidden_context_checkpoint() {
+        let session_root =
+            std::env::temp_dir().join(format!("ai-tool-round-checkpoint-{}", uuid::Uuid::new_v4()));
+        let history_file = session_root.join("history.sqlite");
+        let mut app = test_app_with_tools(&["read_file"]);
+        app.session_history_file = history_file.clone();
+        app.session_id = "checkpoint-test".to_string();
+
+        let shared_mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut terminal_dedupe_candidate = None;
+        let mut force_final_response = false;
+        let mut persisted_turn_messages = 0;
+        let mut turn_had_tool_error = false;
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "read the file and continue",
+            &shared_mcp_client.lock().unwrap(),
+            &shared_mcp_client,
+            IterationExecution::ToolCall(ToolCallExecution {
+                stream_result: crate::ai::types::StreamResult {
+                    assistant_text: "先读文件。".to_string(),
+                    hidden_meta: "<meta:self_note>\n<context_checkpoint>\nsummary: 已确认根因\n证据：src/lib.rs:42。\n</context_checkpoint>\n</meta:self_note>".to_string(),
+                    tool_calls: vec![test_tool_call(
+                        "call_read",
+                        "read_file",
+                        serde_json::json!({ "file_path": "Cargo.toml" }),
+                    )],
+                    ..Default::default()
+                },
+                allowed_tool_names: rust_tools::commonw::FastSet::from_iter(["read_file".to_string()]),
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            false,
+            1,
+            16,
+            0,
+            &mut turn_had_tool_error,
+        )
+        .unwrap();
+
+        assert!(matches!(step, TurnLoopStep::Continue));
+        let checkpoint_marker = turn_messages
+            .iter()
+            .find_map(|message| {
+                (message.role == ROLE_INTERNAL_NOTE)
+                    .then(|| message.content.as_str())
+                    .flatten()
+                    .filter(|content| content.starts_with("[context_checkpoint path="))
+            })
+            .expect("tool-call hidden checkpoint should be persisted");
+        let marker_path = checkpoint_marker
+            .strip_prefix("[context_checkpoint path=")
+            .and_then(|rest| rest.split(']').next())
+            .expect("marker should include checkpoint path");
+        assert!(
+            std::path::Path::new(marker_path).is_file(),
+            "checkpoint file should exist: {marker_path}"
+        );
+
+        let _ = std::fs::remove_dir_all(session_root.join("history.sessions"));
     }
 
     #[test]
@@ -1975,6 +2699,7 @@ mod tests {
                 auto_model_fallback: None,
                 selection_explanation: "explicit override".to_string(),
                 inherit: crate::ai::tools::task_tools::InheritOptions::default(),
+                abort_handle: None,
                 started_at: Instant::now(),
             },
         );
@@ -2092,6 +2817,7 @@ mod tests {
                 auto_model_fallback: None,
                 selection_explanation: "explicit override".to_string(),
                 inherit: crate::ai::tools::task_tools::InheritOptions::default(),
+                abort_handle: None,
                 started_at: Instant::now(),
             },
         );
@@ -2146,7 +2872,10 @@ mod tests {
 
         // 到达硬上限：不再打回，允许收尾。
         assert!(matches!(step, TurnLoopStep::Break));
-        assert_eq!(final_assistant_text, "done");
+        assert!(final_assistant_text.starts_with("done\n\n"));
+        assert!(final_assistant_text.contains("1 spawned subagent task(s) were still outstanding"));
+        assert!(final_assistant_text.contains(&task_id));
+        assert!(final_assistant_text.contains("Required follow-up: re-run this turn"));
         let joined = messages
             .iter()
             .map(|message| message.content.to_string())
@@ -2593,6 +3322,7 @@ mod tests {
                 &mut persisted_turn_messages,
                 1,
                 None,
+                &HashSet::new(),
                 &mut turn_had_tool_error,
             );
             (

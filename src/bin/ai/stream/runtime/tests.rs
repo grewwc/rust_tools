@@ -26,11 +26,9 @@ fn prompt_cache_metrics_reports_hit_rate() {
 #[test]
 fn degenerate_reasoning_repetition_requires_three_long_contentful_copies() {
     let phrase = "需要先确认当前上下文是否仍然有效，然后再继续执行。";
-    assert!(!has_degenerate_reasoning_repetition(&phrase.repeat(2)));
-    assert!(has_degenerate_reasoning_repetition(&phrase.repeat(3)));
-    assert!(!has_degenerate_reasoning_repetition(
-        &"----------------".repeat(3)
-    ));
+    assert!(!has_degenerate_repetition(&phrase.repeat(2)));
+    assert!(has_degenerate_repetition(&phrase.repeat(3)));
+    assert!(!has_degenerate_repetition(&"----------------".repeat(3)));
 }
 
 #[test]
@@ -40,7 +38,18 @@ fn degenerate_reasoning_repetition_detects_suffix_after_normal_progress() {
         "First I will locate the relevant module. {}",
         phrase.repeat(3)
     );
-    assert!(has_degenerate_reasoning_repetition(&reasoning));
+    assert!(has_degenerate_repetition(&reasoning));
+}
+
+#[test]
+fn degenerate_repetition_catches_visible_content_runaway() {
+    // 复现事故：模型在**可见输出**里逐字复读同一短语直到撑满预算，
+    // 产出巨型垃圾消息落盘并触发下一轮 provider 400。退化守卫必须对
+    // 可见 assistant 文本同样生效（此前仅覆盖 reasoning_content）。
+    let phrase = "我再重新读一遍修复区域，以确保我掌握的是当前状态。";
+    assert!(has_degenerate_repetition(&phrase.repeat(3)));
+    // 单字复读（如事故里的 8 万个「再」）也应命中。
+    assert!(has_degenerate_repetition(&"再".repeat(64)));
 }
 
 #[test]
@@ -693,6 +702,46 @@ fn process_stream_payload_suppresses_bare_registered_xml_tool_markup() {
 }
 
 #[test]
+fn process_stream_payload_halts_and_downshifts_on_hallucinated_result_marker() {
+    // 复现本次事故：模型在可见正文里自编自演「工具调用→工具结果」，吐出系统从不
+    // 生成的 `<function_results>` 协议标记。要求：(1) 幻觉结果块整块剥离，不落盘；
+    // (2) 停流（should_stop=true）；(3) 置 degenerate_repetition finish_reason 走
+    // 降档重试路径，避免幻觉正文毒化下一轮请求。
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    let should_stop = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"我再读一遍<function_results>File: a.rs\n3 matches found</function_results>"}"#,
+    )
+    .unwrap();
+
+    assert!(should_stop, "检出幻觉标记必须停流");
+    assert_eq!(
+        state.content.finish_reason_value.as_deref(),
+        Some("degenerate_repetition"),
+        "必须走 degenerate_repetition 降档重试路径"
+    );
+    assert!(
+        !state.content.assistant_text.contains("function_results"),
+        "幻觉协议标记不得落入 assistant_text：{}",
+        state.content.assistant_text
+    );
+    assert!(
+        !state.content.assistant_text.contains("matches found"),
+        "幻觉结果文本不得落盘：{}",
+        state.content.assistant_text
+    );
+}
+
+#[test]
 fn thinking_fold_keeps_reasoning_buffer_intact() {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
@@ -779,6 +828,76 @@ fn reasoning_summary_done_snapshot_does_not_duplicate_thinking() {
     assert_eq!(
         state.content.reasoning_text, "I'm considering inspecting the task_tools.",
         "snapshot 不应重复追加已流式过的推理摘要"
+    );
+}
+
+#[test]
+fn content_part_summary_text_events_never_replay_streamed_reasoning() {
+    // gpt-5.5/5.6 的 Responses API 对同一段推理摘要会通过 content_part.added /
+    // content_part.done 的 summary_text 重发已流式输出过的内容。这些事件是
+    // 快照重发而非模型增量，必须按未见后缀去重，否则 reasoning_text 会被
+    // 重复累积，污染退化检测并可能诱发 thinking 重复渲染。
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    // 第一段摘要：先 delta 流式，再用 content_part.added/done 重发同一段
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.reasoning_summary_text.delta"),
+        r#"{"delta":"Analyzing task cancellation"}"#,
+    )
+    .unwrap();
+    for ev in ["response.content_part.added", "response.content_part.done"] {
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            Some(ev),
+            r#"{"part":{"type":"summary_text","text":"Analyzing task cancellation"}}"#,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        state.content.reasoning_text,
+        "Analyzing task cancellation",
+        "content_part 的 summary_text 重发不应重复累积 reasoning_text"
+    );
+
+    // 第二段摘要：同样验证 delta + content_part 重发不污染
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.reasoning_summary_text.delta"),
+        r#"{"delta":"Collecting and inspecting tasks"}"#,
+    )
+    .unwrap();
+    for ev in ["response.content_part.added", "response.content_part.done"] {
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            Some(ev),
+            r#"{"part":{"type":"summary_text","text":"Collecting and inspecting tasks"}}"#,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        state.content.reasoning_text,
+        "Analyzing task cancellationCollecting and inspecting tasks",
+        "多段摘要的 content_part 重发仍不应重复累积"
     );
 }
 

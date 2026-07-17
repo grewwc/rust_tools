@@ -2156,6 +2156,16 @@ fn sqlite_context_fastpath_keeps_existing_history_summary() {
             reasoning_content: None,
         },
         Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: serde_json::Value::String(
+                "[context_checkpoint path=/tmp/older-checkpoint.md] durable earlier finding"
+                    .to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
             role: "user".to_string(),
             content: serde_json::Value::String("u1".to_string()),
             tool_calls: None,
@@ -2195,6 +2205,12 @@ fn sqlite_context_fastpath_keeps_existing_history_summary() {
             .unwrap_or_default()
             .contains("older summary")
     );
+    assert!(context.iter().any(|message| {
+        message
+            .content
+            .as_str()
+            .is_some_and(|content| content.contains("durable earlier finding"))
+    }));
 
     let _ = std::fs::remove_file(path);
 }
@@ -2212,14 +2228,18 @@ fn session_delete_removes_sqlite_sidecars() {
     std::fs::write(PathBuf::from(format!("{}-shm", db.display())), b"test").unwrap();
     std::fs::write(PathBuf::from(format!("{}-journal", db.display())), b"test").unwrap();
     let assets = store.session_assets_dir("abc");
+    let checkpoints = store.checkpoints_dir("abc");
     std::fs::create_dir_all(&assets).unwrap();
     std::fs::write(assets.join("paste.png"), b"test").unwrap();
+    std::fs::create_dir_all(&checkpoints).unwrap();
+    std::fs::write(checkpoints.join("saved.sqlite"), b"test").unwrap();
 
     assert!(db.exists());
     assert!(PathBuf::from(format!("{}-wal", db.display())).exists());
     assert!(PathBuf::from(format!("{}-shm", db.display())).exists());
     assert!(PathBuf::from(format!("{}-journal", db.display())).exists());
     assert!(assets.exists());
+    assert!(checkpoints.exists());
 
     assert!(store.delete_session("abc").unwrap());
 
@@ -2228,6 +2248,40 @@ fn session_delete_removes_sqlite_sidecars() {
     assert!(!PathBuf::from(format!("{}-shm", db.display())).exists());
     assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
     assert!(!assets.exists());
+    assert!(!checkpoints.exists());
+}
+
+#[test]
+fn session_clear_history_removes_checkpoint_snapshots() {
+    let history_file =
+        std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+    let store = SessionStore::new(history_file.as_path());
+    store.ensure_root_dir().unwrap();
+
+    let db = store.session_history_file("abc");
+    append_history_messages(
+        &db,
+        &[Message {
+            role: "user".to_string(),
+            content: Value::String("clear this".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }],
+    )
+    .unwrap();
+    let assets = store.session_assets_dir("abc");
+    let checkpoints = store.checkpoints_dir("abc");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("paste.png"), b"test").unwrap();
+    std::fs::create_dir_all(&checkpoints).unwrap();
+    std::fs::write(checkpoints.join("saved.sqlite"), b"test").unwrap();
+
+    store.clear_session_history("abc").unwrap();
+
+    assert!(build_message_arr(10, &db).unwrap().is_empty());
+    assert!(!assets.exists());
+    assert!(!checkpoints.exists());
 }
 
 #[test]
@@ -2246,7 +2300,13 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
         let assets = store.session_assets_dir(id);
         std::fs::create_dir_all(&assets).unwrap();
         std::fs::write(assets.join("paste.png"), b"test").unwrap();
+        let checkpoints = store.checkpoints_dir(id);
+        std::fs::create_dir_all(&checkpoints).unwrap();
+        std::fs::write(checkpoints.join("saved.sqlite"), b"test").unwrap();
     }
+    let orphan_checkpoints = store.checkpoints_dir("orphan");
+    std::fs::create_dir_all(&orphan_checkpoints).unwrap();
+    std::fs::write(orphan_checkpoints.join("saved.sqlite"), b"test").unwrap();
 
     let deleted = store.clear_all_sessions().unwrap();
     assert_eq!(deleted, 3);
@@ -2259,7 +2319,9 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
         assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
         let assets = store.session_assets_dir(id);
         assert!(!assets.exists());
+        assert!(!store.checkpoints_dir(id).exists());
     }
+    assert!(!orphan_checkpoints.exists());
 }
 
 #[test]

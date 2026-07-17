@@ -289,14 +289,14 @@ pub(in crate::ai) async fn run_with_cli(
     let session_id = startup_choice.session_id.clone();
     let startup_notice = startup_choice.startup_notice.clone();
 
-    // 处理 --clear --session <id>：启动前清空指定 session 的 history
+    // 处理 --clear --session <id>：启动前清空指定 session 的 history 与 checkpoint。
     if cli.clear {
         let target = cli.session.as_deref().map(str::trim).unwrap_or("");
         if target.is_empty() {
             eprintln!("[clear] --clear 需要配合 --session <id> 使用");
         } else {
             match session_store.clear_session_history(target) {
-                Ok(()) => println!("[clear] session {} 的历史已清空", target),
+                Ok(()) => println!("[clear] session {} 的历史和 checkpoint 已清空", target),
                 Err(err) => eprintln!("[clear] 清空 session {} 失败: {}", target, err),
             }
         }
@@ -306,6 +306,9 @@ pub(in crate::ai) async fn run_with_cli(
     if let Err(err) = session_store.ensure_root_dir() {
         eprintln!("[Warning] Failed to create sessions dir: {}", err);
     }
+    // 崩溃可能发生在 checkpoint rollback 发布 live SQLite 与 assets 之间；先完成
+    // 事务恢复，避免后续 turn 读取到跨版本的状态。
+    session_store.recover_checkpoint_state(&session_id)?;
 
     // 注册当前进程的 PID 到 sessions 目录，供 `/proc` 命令发现活跃 session。
     // guard 在函数退出（正常返回 / panic）时自动删除 PID 文件；

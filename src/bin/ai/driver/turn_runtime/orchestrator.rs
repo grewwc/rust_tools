@@ -23,9 +23,12 @@ use super::{
     MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
     MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
     MID_TURN_LLM_SUMMARY_MAX_CHARS,
-    finalize::finalize_turn,
+    finalize::{
+        finalize_turn, maybe_generate_session_title, should_generate_session_title_in_background,
+    },
     iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
     mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
+    persistence::persist_pending_turn_messages,
     prepare::prepare_turn,
     tool_result::handle_iteration_execution,
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
@@ -33,7 +36,7 @@ use super::{
 
 /// 工具调用循环检测窗口：
 /// - soft: 连续 4 轮调用 (tool_name, normalized_args) 完全一致，先注入反思提示
-/// - hard: 连续 6 轮完全一致，直接强制收敛，不再继续工具循环
+/// - hard: 收到 soft 提示后仍连续 6 轮完全一致，直接强制收敛，不再继续工具循环
 const TOOL_LOOP_SOFT_WINDOW: usize = 4;
 const TOOL_LOOP_HARD_WINDOW: usize = 6;
 /// 近似低收益重复窗口：连续 N 轮对「同一目标资源」调用同一工具（忽略
@@ -98,7 +101,17 @@ const PROGRESS_GRACE_WINDOW: usize = 6;
 const PROGRESS_NO_PROGRESS_HARD_MARGIN: usize = 16;
 /// 变更类工具：对 Mutation 意图的任务，只有这些动作（或产出 final text）才算
 /// 「任务收敛」，纯读取 / 检索无论目标多新都不计进展。
-const MUTATION_TOOL_NAMES: &[&str] = &["apply_patch", "write_file", "delete_path", "plan", "task_spawn", "task_wait", "task_cancel", "task_status", "execute_command"];
+const MUTATION_TOOL_NAMES: &[&str] = &[
+    "apply_patch",
+    "write_file",
+    "delete_path",
+    "plan",
+    "task_spawn",
+    "task_wait",
+    "task_cancel",
+    "task_status",
+    "execute_command",
+];
 
 /// 单轮工具迭代软阈值：取 max_iterations 的一半与绝对上限的较小值，保证一定
 /// 早于硬上限触发；对默认 2048 这类超大 ceiling，也要在明显失控前提醒收敛。
@@ -733,9 +746,15 @@ struct ProgressLedger {
 }
 
 impl ProgressLedger {
-    fn reset_for_truncation(&mut self) {
-        // 截断重试期间的重复读取是预期行为，清空无进展计数与一次性标志，
-        // 与 exact/coarse 检测的 mark_truncation_skip 语义保持一致。
+    /// 重置升级阶梯：清空无进展计数与 soft/ledger/hard/grace 等一次性状态，
+    /// 让计费从零重新开始。两类场景共用：
+    /// 1. 截断重试（mark_truncation_skip）：截断清空历史后，重复读取是预期行为，
+    ///    与 exact/coarse 检测的 mark_truncation_skip 语义保持一致，避免截断恢复后的
+    ///    新循环跳过 soft 提示直接到 hard-stop。
+    /// 2. 实质进展（assess_progress 的 made_progress 分支）：软提示后模型给出真正推进
+    ///    任务的动作，应视为「这一轮提醒生效了」，给予完整的新预算而非继续累加，否则
+    ///    模型在长任务中只要早期发散过一次，后续每次收敛提醒都会更快滑向硬停。
+    fn reset_escalation(&mut self) {
         self.consecutive_no_progress = 0;
         self.soft_injected = false;
         self.ledger_injected = false;
@@ -782,6 +801,17 @@ impl TurnSupervisor {
         self.last_compress_after_chars = after_chars;
     }
 
+    /// 任务出现实质进展后，丢弃此前无效循环的样本并恢复 soft → hard 升级阶梯。
+    /// 否则模型已经响应 soft 提示而改做有效动作时，后续一次新的重复会跳过 soft，
+    /// 直接沿用旧标志进入 hard-stop。
+    fn reset_tool_loop_escalation(&mut self) {
+        self.tool_signature_history.clear();
+        self.tool_signature_history_coarse.clear();
+        self.hard_loop_stop_injected = false;
+        self.loop_breaker_injected = false;
+        self.coarse_loop_note_injected = false;
+    }
+
     /// 截断重试时重置工具循环检测状态：截断是外部约束（输出上限 / 模型可用性波动），
     /// 重试时重复调用相同工具属于预期行为，不应计入循环检测窗口。
     /// 截断本身已有独立的 `consecutive_truncations` 上限兜底，不需要循环检测再叠加。
@@ -790,13 +820,9 @@ impl TurnSupervisor {
     /// 重置所有一次性标志：截断清空历史后，soft/coarse/hard 的完整升级阶梯
     /// 应从零重新开始，否则截断恢复后形成的新循环会跳过 soft 提示直接到 hard-stop。
     fn mark_truncation_skip(&mut self) {
-        self.tool_signature_history.clear();
-        self.tool_signature_history_coarse.clear();
+        self.reset_tool_loop_escalation();
         self.skip_tool_signature_rounds += 1;
-        self.hard_loop_stop_injected = false;
-        self.loop_breaker_injected = false;
-        self.coarse_loop_note_injected = false;
-        self.progress.reset_for_truncation();
+        self.progress.reset_escalation();
     }
 
     fn record_tool_signatures(
@@ -837,6 +863,10 @@ impl TurnSupervisor {
             && detect_tool_loop(&self.tool_signature_history, TOOL_LOOP_SOFT_WINDOW)
         {
             self.loop_breaker_injected = true;
+            // Soft 提示已明确要求停止重复调用。清空此前用于触发 soft 的样本，
+            // 让模型有完整的 hard window 来响应提示，而不是只再重复两轮就被强制
+            // 收口（旧逻辑中 soft=4、hard=6，实际恢复窗口只有两轮）。
+            self.tool_signature_history.clear();
             return ToolLoopSignal::Soft;
         }
         if !self.hard_loop_stop_injected
@@ -900,6 +930,26 @@ impl TurnSupervisor {
 
         let reasoning_fp = extract_round_reasoning_fingerprint(messages);
         if made_progress {
+            // 实质进展：清零无进展计数，并重置已注入的升级阶梯标志（soft / grace /
+            // hard / grace_until），让模型在「被提醒收敛 -> 真正推进」后获得完整的新
+            // 预算。否则 soft 注入后即使模型真的推进了任务，下一轮 consecutive 再次达
+            // 阈值也会因 soft_injected 仍为 true 直接跳到 ledger/hard，长任务被误杀。
+            // seen_targets / intent / last_reasoning_fp 不动，保持跨轮累积（last_reasoning_fp
+            // 随后用本轮指纹覆写，作为后续 grace 比较的新基线）。
+            if self.progress.soft_injected
+                || self.progress.ledger_injected
+                || self.progress.hard_injected
+                || self.progress.grace_consumed
+                || self.progress.grace_until_iteration > 0
+            {
+                self.progress.reset_escalation();
+            }
+            if self.hard_loop_stop_injected
+                || self.loop_breaker_injected
+                || self.coarse_loop_note_injected
+            {
+                self.reset_tool_loop_escalation();
+            }
             self.progress.consecutive_no_progress = 0;
             self.progress.last_reasoning_fp = reasoning_fp;
             if matches!(self.progress.intent, TaskIntent::ReadOnly)
@@ -1016,9 +1066,11 @@ fn print_compress_status(stage: &str, before: usize, after: usize) {
 fn inject_loop_breaker_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[loop-detected] 你最近 4 轮都在用相同参数调用相同工具，明显在打转。\n\
-        请立刻：(a) 停止该工具调用 (b) 总结已收集到的信息并直接回答用户 \
-        (c) 如果信息确实不足，向用户说明卡住的原因。";
+    let note = "[loop-detected] 你最近 4 轮都在用相同参数调用相同工具；此前的工具结果仍在上下文中，重复调用不会产生新信息。\n\
+        不要再次调用这一组相同参数。先基于已有证据决定下一步：\n\
+        (a) 信息已足够时，直接执行实质动作或回答用户；\n\
+        (b) 信息不足时，只能选择一个不同且具体的动作（例如读取未覆盖的行范围、搜索新的符号/目标，或修改文件）；\n\
+        (c) 确实无法继续时，说明缺少的唯一关键信息及原因。";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
@@ -1031,7 +1083,7 @@ fn inject_loop_breaker_note(messages: &mut Vec<crate::ai::history::Message>) {
 fn inject_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[loop-hard-stop] 你已连续 3 轮用相同参数调用相同工具，判定为无效循环。\n\
+    let note = "[loop-hard-stop] 你在收到重复调用提示后，仍连续 6 轮用相同参数调用相同工具，判定为无效循环。\n\
         从现在起进入无工具收口模式：不要再发起任何工具调用；\n\
         请基于已有信息给出阶段总结与当前结论；若任务仍未完成，明确说明缺口、剩余工作与建议的下一步。";
     messages.push(Message {
@@ -1268,10 +1320,10 @@ mod tests {
             reasoning_content: None,
         };
 
-        // 收集每一轮的信号：前 SOFT_WINDOW-1 轮不触发，第 SOFT_WINDOW 轮触发 Soft，
-        // 第 HARD_WINDOW 轮触发 Hard。
+        // 收集每一轮的信号：前 SOFT_WINDOW-1 轮不触发，第 SOFT_WINDOW 轮触发 Soft。
+        // Soft 会清空旧样本，因此必须在提示后再次重复 HARD_WINDOW 轮才触发 Hard。
         let mut signals = Vec::new();
-        for i in 0..TOOL_LOOP_HARD_WINDOW {
+        for i in 0..(TOOL_LOOP_SOFT_WINDOW + TOOL_LOOP_HARD_WINDOW) {
             messages.push(assistant_with_same_read(&format!("tc-{i}")));
             signals.push(supervisor.record_tool_signatures(
                 &messages,
@@ -1290,9 +1342,54 @@ mod tests {
             ToolLoopSignal::Soft
         ));
         assert!(matches!(
-            signals[TOOL_LOOP_HARD_WINDOW - 1],
+            signals[TOOL_LOOP_SOFT_WINDOW + TOOL_LOOP_HARD_WINDOW - 1],
             ToolLoopSignal::Hard
         ));
+    }
+
+    #[test]
+    fn task_progress_after_loop_soft_restarts_tool_loop_ladder() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let question = "修复登录接口的空指针 bug";
+
+        // 同一只读调用重复到 soft 阈值。
+        for i in 0..TOOL_LOOP_SOFT_WINDOW {
+            messages.push(pb_read_msg("src/main.rs", &format!("read-{i}")));
+            let signal = supervisor.record_tool_signatures(
+                &messages,
+                question,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+            if i == TOOL_LOOP_SOFT_WINDOW - 1 {
+                assert!(matches!(signal, ToolLoopSignal::Soft));
+            }
+        }
+        assert!(supervisor.loop_breaker_injected);
+
+        // soft 后的实际变更表示任务在推进，必须清除旧循环状态。
+        messages.push(pb_apply_patch_msg("patch-1"));
+        assert!(matches!(
+            supervisor.record_tool_signatures(&messages, question, PROGRESS_FREE_EXPLORE_ROUNDS,),
+            ToolLoopSignal::None
+        ));
+        assert!(!supervisor.loop_breaker_injected);
+        assert!(supervisor.tool_signature_history.is_empty());
+
+        // 新的一轮重复必须重新先得到 soft，而不是沿用旧状态直接 hard-stop。
+        for i in 0..TOOL_LOOP_SOFT_WINDOW {
+            messages.push(pb_read_msg("src/other.rs", &format!("retry-{i}")));
+            let signal = supervisor.record_tool_signatures(
+                &messages,
+                question,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+            if i == TOOL_LOOP_SOFT_WINDOW - 1 {
+                assert!(matches!(signal, ToolLoopSignal::Soft));
+            } else {
+                assert!(matches!(signal, ToolLoopSignal::None));
+            }
+        }
     }
 
     #[test]
@@ -1354,13 +1451,13 @@ mod tests {
             }
         }
 
-        // 继续积累到 hard 触发，验证完整升级阶梯恢复。
-        for i in 0..(TOOL_LOOP_HARD_WINDOW - TOOL_LOOP_SOFT_WINDOW) {
+        // soft 后需重新积累完整 hard window，验证完整升级阶梯恢复。
+        for i in 0..TOOL_LOOP_HARD_WINDOW {
             messages.push(assistant_with_read(&format!("tc3-{i}")));
             let signal =
                 supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
-            if i == (TOOL_LOOP_HARD_WINDOW - TOOL_LOOP_SOFT_WINDOW - 1) {
-                // 第 6 次应触发 hard。
+            if i == TOOL_LOOP_HARD_WINDOW - 1 {
+                // 收到 soft 后又重复 6 次，才应触发 hard。
                 assert!(matches!(signal, ToolLoopSignal::Hard));
                 assert!(supervisor.hard_loop_stop_injected);
             }
@@ -1794,14 +1891,68 @@ mod tests {
     }
 
     #[test]
+    fn progress_budget_real_progress_after_soft_resets_escalation_ladder() {
+        // 软提示注入后，若模型给出真正推进任务的动作，应重置整个升级阶梯
+        // （soft_injected / ledger_injected / hard_injected / grace），使下一轮无进展
+        // 重新从 soft 开始，而非因 soft_injected 残留直接跳级到 ledger/hard。
+        // 否则长任务中模型只要早期发散过一次，每次收敛提醒都会更快滑向硬停。
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let question = "修复登录接口的空指针 bug";
+        // 固定在计费区（iteration=30 -> over=10 -> soft_threshold=5）。
+        supervisor.iteration = 30;
+
+        // 阶段一：连续 5 轮只读（无进展）累计到 soft_threshold=5，触发软提示。
+        let mut last = ToolLoopSignal::None;
+        for i in 0..5 {
+            messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("r-{i}")));
+            last = supervisor.record_tool_signatures(
+                &messages,
+                question,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+        }
+        assert!(matches!(last, ToolLoopSignal::LowProgressSoft));
+        assert!(supervisor.progress.soft_injected);
+
+        // 阶段二：一次真正的变更动作（apply_patch）-> 实质进展，重置整个升级阶梯。
+        messages.push(pb_apply_patch_msg("patch-1"));
+        let signal =
+            supervisor.record_tool_signatures(&messages, question, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(matches!(signal, ToolLoopSignal::None));
+        assert!(!supervisor.progress.soft_injected);
+        assert!(!supervisor.progress.ledger_injected);
+        assert!(!supervisor.progress.hard_injected);
+        assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+
+        // 阶段三：再次连续 5 轮只读 -> 应重新触发软提示，而非跳级到 ledger/hard。
+        // 若 soft_injected 未被重置，第 5 轮会因 soft_injected 仍为 true 直接走 ledger。
+        for i in 0..5 {
+            messages.push(pb_read_msg(&format!("src/g{i}.rs"), &format!("r2-{i}")));
+            last = supervisor.record_tool_signatures(
+                &messages,
+                question,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+        }
+        assert!(
+            matches!(last, ToolLoopSignal::LowProgressSoft),
+            "软提示后真正推进任务应重置升级阶梯，使下一轮无进展重新从 soft 开始"
+        );
+        assert!(supervisor.progress.soft_injected);
+        assert!(!supervisor.progress.ledger_injected);
+    }
+
+    #[test]
     fn progress_budget_escalates_soft_then_ledger_then_hard() {
         let mut supervisor = TurnSupervisor::default();
         let mut messages = Vec::new();
         let question = "重构这个函数拆成多个小函数";
-        // 固定 iteration=50 → over=30 → soft_threshold=3, hard_threshold=6。
+        // 固定 iteration=50 → over=30 → soft_threshold=3；硬停阈值由额外
+        // margin 决定，确保修改 margin 后测试仍覆盖完整的升级阶梯。
         supervisor.iteration = 50;
         let mut signals = Vec::new();
-        for i in 0..6 {
+        for i in 0..(3 + PROGRESS_NO_PROGRESS_HARD_MARGIN) {
             messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("r-{i}")));
             signals.push(supervisor.record_tool_signatures(
                 &messages,
@@ -1809,14 +1960,16 @@ mod tests {
                 PROGRESS_FREE_EXPLORE_ROUNDS,
             ));
         }
-        // consecutive 递增 1..6：round2 触发 Soft，round3 触发 Ledger，
-        // round4（5<hard=6）静默，round5（6>=6）触发 Hard。
+        // consecutive 递增：达到 soft_threshold 时依次触发 Soft 与 Ledger，
+        // 到达 soft_threshold + margin 时才触发 Hard。
         assert!(matches!(signals[0], ToolLoopSignal::None));
         assert!(matches!(signals[1], ToolLoopSignal::None));
         assert!(matches!(signals[2], ToolLoopSignal::LowProgressSoft));
         assert!(matches!(signals[3], ToolLoopSignal::LowProgressLedger));
-        assert!(matches!(signals[4], ToolLoopSignal::None));
-        assert!(matches!(signals[5], ToolLoopSignal::LowProgressHard));
+        assert!(signals[4..signals.len() - 1]
+            .iter()
+            .all(|signal| matches!(signal, ToolLoopSignal::None)));
+        assert!(matches!(signals.last(), Some(ToolLoopSignal::LowProgressHard)));
         assert!(supervisor.progress.hard_injected);
     }
 
@@ -1974,6 +2127,19 @@ async fn run_turn_body(
         Ok(prep) => prep,
         Err(err) => return Err(err),
     };
+
+    // 第一条用户消息一落盘就启动标题生成，不再等到完整回答结束。
+    // PromptEditor 会在输入框 TUI 中轮询 session title 文件；后台任务完成后，
+    // 下一次 500ms 刷新即可把新标题展示给终端前端。
+    persist_pending_turn_messages(
+        app,
+        one_shot_mode,
+        &turn_messages,
+        &mut persisted_turn_messages,
+    );
+    if should_generate_session_title_in_background(one_shot_mode, should_quit) {
+        maybe_generate_session_title(app, true).await;
+    }
 
     let mut supervisor = TurnSupervisor::default();
     let mut force_final_response = false;

@@ -24,57 +24,6 @@ use super::error::{
 };
 use super::routing::{extract_router_content, strip_json_fence};
 
-// #region debug-point A:resolve-thinking-reporter
-fn report_resolve_thinking_debug(
-    run_id: &'static str,
-    hypothesis_id: &'static str,
-    location: &'static str,
-    msg: &'static str,
-    data: Value,
-) {
-    static DEBUG_TARGET: std::sync::LazyLock<Option<(String, String)>> =
-        std::sync::LazyLock::new(|| {
-            let env_text = std::fs::read_to_string(".dbg/resolve-thinking-slow.env").ok()?;
-            let mut debug_server_url = "http://127.0.0.1:7777/event".to_string();
-            let mut debug_session_id = "resolve-thinking-slow".to_string();
-            for line in env_text.lines() {
-                if let Some(value) = line.strip_prefix("DEBUG_SERVER_URL=") {
-                    if !value.trim().is_empty() {
-                        debug_server_url = value.trim().to_string();
-                    }
-                } else if let Some(value) = line.strip_prefix("DEBUG_SESSION_ID=")
-                    && !value.trim().is_empty()
-                {
-                    debug_session_id = value.trim().to_string();
-                }
-            }
-            Some((debug_server_url, debug_session_id))
-        });
-
-    let Some((debug_server_url, debug_session_id)) = DEBUG_TARGET.as_ref().cloned() else {
-        return;
-    };
-
-    std::thread::spawn(move || {
-        let payload = serde_json::json!({
-            "sessionId": debug_session_id,
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "msg": msg,
-            "data": data,
-            "ts": chrono::Utc::now().timestamp_millis(),
-        });
-        if let Ok(client) = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_millis(300))
-            .build()
-        {
-            let _ = client.post(debug_server_url).json(&payload).send();
-        }
-    });
-}
-// #endregion
-
 /// Resolve whether to enable thinking mode for this request.
 ///
 /// Decision order:
@@ -120,21 +69,6 @@ pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message
     // 只用用户真正输入的内容做意图与 thinking 判定。
     let question = strip_system_reminders(&raw_question);
     let question = question.trim();
-    // #region debug-point D:resolve-thinking-input
-    report_resolve_thinking_debug(
-        "pre-fix",
-        "D",
-        "request::resolve_thinking:prepared_input",
-        "[DEBUG] resolve_thinking prepared input",
-        serde_json::json!({
-            "raw_question_len": raw_question.chars().count(),
-            "clean_question_len": question.chars().count(),
-            "reminder_removed": raw_question.len() != question.len(),
-            "message_count": messages.len(),
-            "model": model,
-        }),
-    );
-    // #endregion
     if !question.is_empty() {
         if let Some(local_decision) = local_thinking_decision(question) {
             crate::ai::agent_hang_debug!(
@@ -147,35 +81,11 @@ pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message
                     "decision": local_decision,
                 },
             );
-            // #region debug-point A:local-decision
-            report_resolve_thinking_debug(
-                "pre-fix",
-                "A",
-                "request::resolve_thinking:local_decision",
-                "[DEBUG] resolve_thinking decided locally",
-                serde_json::json!({
-                    "question_len": question.chars().count(),
-                    "decision": local_decision,
-                }),
-            );
-            // #endregion
             return local_decision;
         }
     }
 
     // Model-only decision path: if gate fails/uncertain, default to disabled.
-    // #region debug-point B:gate-fallback
-    report_resolve_thinking_debug(
-        "pre-fix",
-        "B",
-        "request::resolve_thinking:gate_fallback",
-        "[DEBUG] resolve_thinking fell back to model gate",
-        serde_json::json!({
-            "question_len": question.chars().count(),
-            "model": model,
-        }),
-    );
-    // #endregion
     decide_thinking_via_model(app, model, messages)
         .await
         .unwrap_or(false)
@@ -296,7 +206,6 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     } else {
         question.to_string()
     };
-    let clipped_len = clipped.chars().count();
 
     let gate_messages = vec![
         Message {
@@ -319,19 +228,6 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     ];
 
     let control_model = control_model_for_aux_tasks(app);
-    // #region debug-point C:gate-request-prep
-    report_resolve_thinking_debug(
-        "pre-fix",
-        "C",
-        "request::decide_thinking_via_model:request_prep",
-        "[DEBUG] thinking gate request prepared",
-        serde_json::json!({
-            "control_model": control_model,
-            "question_len": question.chars().count(),
-            "clipped_len": clipped_len,
-        }),
-    );
-    // #endregion
     let request_body = build_request_body(
         &control_model,
         &gate_messages,
@@ -350,44 +246,13 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     let api_key = api_key_for_request_model(app, &control_model);
     // 辅助请求（thinking gate），15 秒超时兜底：主 client 无整体 timeout，
     // 仅 connect_timeout 不覆盖“连上但服务端不回响应头”的永久阻塞。
-    let send_start = Instant::now();
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send();
     let response = match tokio::time::timeout(Duration::from_secs(15), send_future).await {
-        Ok(r) => {
-            let outcome = if r.is_ok() { "ok" } else { "err" };
-            // #region debug-point B:gate-send
-            report_resolve_thinking_debug(
-                "pre-fix",
-                "B",
-                "request::decide_thinking_via_model:send",
-                "[DEBUG] thinking gate send finished",
-                serde_json::json!({
-                    "elapsed_ms": send_start.elapsed().as_secs_f64() * 1000.0,
-                    "outcome": outcome,
-                    "endpoint": endpoint,
-                }),
-            );
-            // #endregion
-            r.ok()?
-        }
-        Err(_) => {
-            // #region debug-point B:gate-send-timeout
-            report_resolve_thinking_debug(
-                "pre-fix",
-                "B",
-                "request::decide_thinking_via_model:send_timeout",
-                "[DEBUG] thinking gate send timed out",
-                serde_json::json!({
-                    "elapsed_ms": send_start.elapsed().as_secs_f64() * 1000.0,
-                    "endpoint": endpoint,
-                }),
-            );
-            // #endregion
-            return None;
-        }
+        Ok(r) => r.ok()?,
+        Err(_) => return None,
     };
 
     if !response.status().is_success() {
@@ -403,38 +268,9 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
         return None;
     }
 
-    let body_start = Instant::now();
     let text = match tokio::time::timeout(Duration::from_secs(15), response.text()).await {
-        Ok(r) => {
-            let outcome = if r.is_ok() { "ok" } else { "err" };
-            // #region debug-point B:gate-body
-            report_resolve_thinking_debug(
-                "pre-fix",
-                "B",
-                "request::decide_thinking_via_model:body",
-                "[DEBUG] thinking gate body read finished",
-                serde_json::json!({
-                    "elapsed_ms": body_start.elapsed().as_secs_f64() * 1000.0,
-                    "outcome": outcome,
-                }),
-            );
-            // #endregion
-            r.ok()?
-        }
-        Err(_) => {
-            // #region debug-point B:gate-body-timeout
-            report_resolve_thinking_debug(
-                "pre-fix",
-                "B",
-                "request::decide_thinking_via_model:body_timeout",
-                "[DEBUG] thinking gate body read timed out",
-                serde_json::json!({
-                    "elapsed_ms": body_start.elapsed().as_secs_f64() * 1000.0,
-                }),
-            );
-            // #endregion
-            return None;
-        }
+        Ok(r) => r.ok()?,
+        Err(_) => return None,
     };
     let v: Value = serde_json::from_str(&text).ok()?;
     let content = extract_router_content(&v)?;
@@ -445,27 +281,11 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(DEFAULT_AUTO_THINKING_THRESHOLD);
 
-    let result = if confidence >= threshold {
+    if confidence >= threshold {
         Some(thinking)
     } else {
         None
-    };
-    // #region debug-point B:gate-result
-    report_resolve_thinking_debug(
-        "pre-fix",
-        "B",
-        "request::decide_thinking_via_model:result",
-        "[DEBUG] thinking gate parsed result",
-        serde_json::json!({
-            "elapsed_ms": gate_start.elapsed().as_secs_f64() * 1000.0,
-            "thinking": thinking,
-            "confidence": confidence,
-            "threshold": threshold,
-            "accepted": result.is_some(),
-        }),
-    );
-    // #endregion
-    result
+    }
 }
 
 pub(crate) fn parse_thinking_gate_output(s: &str) -> Option<(bool, f64)> {

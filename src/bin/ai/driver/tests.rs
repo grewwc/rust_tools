@@ -111,10 +111,10 @@ fn encoded_background_task_goal_rejects_corrupt_payload() {
 
 #[test]
 fn background_subagent_override_requires_known_enabled_agent() {
-    let mut plan = primary_agent("plan", "Read-only planning agent", &["plan", "analyze"]);
+    let mut plan = primary_agent("plan", "Read-only planning agent");
     plan.mode = AgentMode::Subagent;
     plan.disabled = true;
-    let build = primary_agent("build", "Default agent", &["implement"]);
+    let build = primary_agent("build", "Default agent");
 
     let err = resolve_background_subagent_override(&[build.clone(), plan.clone()], Some("plan"))
         .unwrap_err();
@@ -219,7 +219,7 @@ fn terminate_and_cleanup_removes_scheduler_meta_entry() {
     assert!(!map.contains_key(&pid));
 }
 
-fn primary_agent(name: &str, description: &str, routing_tags: &[&str]) -> AgentManifest {
+fn primary_agent(name: &str, description: &str) -> AgentManifest {
     AgentManifest {
         name: name.to_string(),
         description: description.to_string(),
@@ -233,7 +233,6 @@ fn primary_agent(name: &str, description: &str, routing_tags: &[&str]) -> AgentM
         tool_groups: Vec::new(),
         mcp_servers: Vec::new(),
         disable_mcp_tools: false,
-        routing_tags: routing_tags.iter().map(|tag| (*tag).to_string()).collect(),
         model_tier: Some(AgentModelTier::Heavy),
         disabled: false,
         hidden: false,
@@ -773,42 +772,11 @@ fn auto_route_switches_to_build_for_code_question_when_enabled() {
 
     let build = primary_agent(
         "build",
-        "Default agent for development work",
-        &[
-            "fix",
-            "debug",
-            "build",
-            "compile",
-            "test",
-            "implement",
-            "refactor",
-            "execute",
-            "coding",
-            "run",
-            "search",
-            "locate",
-            "inspect",
-            "understand",
-            "test",
-            "debug",
-            "build",
-            "debug",
-            "compile",
-            "explain",
-            "planning",
-            "review",
-            "analyze",
-            "analysis",
-            "summarize",
-            "architecture",
-            "engineer",
-            "design",
-        ],
+        "Build agent for code development, compilation, debugging, bug fixing, and feature implementation",
     );
     let plan = primary_agent(
         "plan",
-        "Read-only planning agent",
-        &["plan", "analyze", "review"],
+        "Planning agent for analysis, code review, strategy, and architecture",
     );
     // 起始 agent 必须不同于目标，否则 choose_semantic_route 会因
     // best.agent.name == current_agent 而直接返回 None。
@@ -817,7 +785,7 @@ fn auto_route_switches_to_build_for_code_question_when_enabled() {
     maybe_auto_route_agent(
         &mut app,
         &[build.clone(), plan.clone()],
-        "帮我 fix 这个 bug，debug 一下编译错误",
+        "fix the bug and debug the compilation error",
     );
 
     // 恢复 config，避免污染其它测试。

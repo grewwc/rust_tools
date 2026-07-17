@@ -183,36 +183,102 @@ pub(crate) async fn summarize_history_via_model(
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn session_title_text_content(content: &Value) -> String {
+    match content {
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) != Some("image_url"))
+            .filter_map(|part| {
+                let text = super::types::extract_displayable_text(part);
+                let text = text.trim();
+                (!text.is_empty()).then(|| text.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::String(text) => text.trim().to_string(),
+        other => crate::ai::history::value_to_string(other).trim().to_string(),
+    }
+}
+
+fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| !crate::ai::history::is_system_like_role(&message.role))
+        .filter_map(|message| {
+            let content = session_title_text_content(&message.content);
+            if content.is_empty() {
+                return None;
+            }
+
+            let role = match message.role.as_str() {
+                "user" => "用户",
+                "assistant" => "助手",
+                "tool" => "工具",
+                _ => message.role.as_str(),
+            };
+            Some(format!("{role}: {content}"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod session_title_tests {
+    use super::*;
+    use crate::ai::history::Message;
+
+    #[test]
+    fn title_transcript_keeps_text_and_omits_images() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::Array(vec![
+                serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": "data:image/png;base64,abc" }
+                }),
+                serde_json::json!({ "type": "text", "text": "优化图片请求的 session title" }),
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        let dialog = session_title_dialog_lines(&messages);
+
+        assert_eq!(dialog, vec!["用户: 优化图片请求的 session title"]);
+        assert!(!dialog[0].contains("image_url"));
+        assert!(!dialog[0].contains("base64"));
+    }
+
+    #[test]
+    fn title_transcript_skips_image_only_messages() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+            "type": "image_url",
+            "image_url": { "url": "data:image/png;base64,abc" }
+        }]),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        assert!(session_title_dialog_lines(&messages).is_empty());
+    }
+}
+
 /// 用 LLM 为当前对话生成一个简短的概括性标题（不超过 20 字）。
 /// 供 session 列表和输入框顶部展示使用。
 pub(crate) async fn generate_session_title_via_model(
     app: &App,
     messages: &[crate::ai::history::Message],
 ) -> Option<String> {
-    use crate::ai::history::{is_system_like_role, value_to_string};
-
     if messages.is_empty() {
         return None;
     }
 
-    // 只取最近的对话内容用于生成标题（最多 8000 字符）
-    let dialog: Vec<String> = messages
-        .iter()
-        .filter(|m| !is_system_like_role(&m.role))
-        .map(|m| {
-            let role = match m.role.as_str() {
-                "user" => "用户",
-                "assistant" => "助手",
-                "tool" => "工具",
-                _ => m.role.as_str(),
-            };
-            // 去掉图片内容，只保留文本，避免 LLM 看到 base64 数据生成无意义的标题
-            let text_only =
-                super::normalize::normalize_message_content_for_text_only_model(&m.content);
-            let content = value_to_string(&text_only);
-            format!("{role}: {content}")
-        })
-        .collect();
+    // 只取最近的文本对话内容用于生成标题（最多 8000 字符）。图片内容不参与标题生成，
+    // 避免模型被截图里的无关 UI 文案干扰；图片请求依赖用户同时输入的文字来概括主题。
+    let dialog = session_title_dialog_lines(messages);
 
     if dialog.is_empty() {
         return None;
@@ -227,10 +293,15 @@ pub(crate) async fn generate_session_title_via_model(
 要求：\n\
 - 只输出标题本身，不要引号，不要解释，不要前缀。\n\
 - 标题要具体、有信息量，不要太笼统。\n\
+- 如果对话附带图片，基于用户同时输入的文字概括主题，不要只复述‘看截图’、‘图片问题’等泛化表述。\n\
 - 优先用名词短语或动宾短语。\n\
 - 如果是编程相关，提到关键技术或文件名。";
 
     let user_prompt = format!("对话内容：\n\n{transcript}\n\n请生成标题：");
+
+    let control_model = control_model_for_aux_tasks(app);
+    let title_model = control_model;
+    let user_content = Value::String(user_prompt);
 
     let title_messages = vec![
         crate::ai::history::Message {
@@ -242,16 +313,15 @@ pub(crate) async fn generate_session_title_via_model(
         },
         crate::ai::history::Message {
             role: "user".to_string(),
-            content: serde_json::Value::String(user_prompt),
+            content: user_content,
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
         },
     ];
 
-    let control_model = control_model_for_aux_tasks(app);
     let request_body = build_request_body(
-        &control_model,
+        &title_model,
         &title_messages,
         false,
         false,
@@ -263,8 +333,8 @@ pub(crate) async fn generate_session_title_via_model(
         None,
         None,
     );
-    let endpoint = endpoint_for_request_model(app, &control_model);
-    let api_key = api_key_for_request_model(app, &control_model);
+    let endpoint = endpoint_for_request_model(app, &title_model);
+    let api_key = api_key_for_request_model(app, &title_model);
 
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")

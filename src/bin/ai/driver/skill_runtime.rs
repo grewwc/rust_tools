@@ -12,6 +12,14 @@ use super::{DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS};
 
 type ToolDef = ToolDefinition;
 
+/// 运行时上下文，传入 build_system_prompt 实现条件渲染。
+/// 当前只有 goal_mode；未来可扩展 task_type / persona 等。
+#[derive(Clone, Default)]
+pub(super) struct PromptContext {
+    /// 非 None 表示处于 goal 模式，值为目标描述文本。
+    pub goal_mode: Option<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ContextKind {
     Identity,
@@ -817,6 +825,7 @@ fn build_system_prompt(
     active_agent: Option<&AgentManifest>,
     skill: Option<&SkillManifest>,
     available_tools: &Box<SkipSet<String>>,
+    ctx: &PromptContext,
 ) -> SystemPromptBuilder {
     let mut b = SystemPromptBuilder::new();
 
@@ -871,8 +880,48 @@ fn build_system_prompt(
 
     b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
     b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Prefer tool-backed evidence over speculation: inspect the relevant sources, artifacts, or system state and use the available tools before concluding.\n- Every tool call must have a specific information, verification, or change goal. Avoid open-ended exploration; before continuing a search, know what question the next tool result should answer.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- Work in batches: when several independent read-only lookups are needed, issue them together in one message so they run in parallel instead of one-at-a-time round trips.\n- Read in large chunks: prefer one broad read (raise read_file's limit) or a single targeted search over paging through the same file in tiny slices. Do not re-read content you already have; reuse earlier tool output.\n- Locate before reading: use search/navigation tools to pinpoint the region, then read that region once — avoid repeated near-identical searches with only slightly tweaked queries.\n- Stop exploratory loops once you have enough evidence for a decision or answer; converge promptly instead of gathering redundant context.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
-    b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- Do not treat pressure to converge as permission to guess; if the conclusion is not yet justified, say what is missing or continue with the smallest targeted check.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.");
+    b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- Do not treat pressure to converge as permission to guess. If evidence is not yet sufficient, clearly state what you know and what remains uncertain.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain and what it would take to resolve it.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.");
     b.push(ContextKind::Behavior, "Git safety:\n- Never use `git reset`, `git checkout`, `git restore`, `git stash drop`, or any other git command to discard or roll back existing changes (including staged changes) solely for testing or verification.\n- For a clean test state, use a temporary branch, a worktree, or `git stash push` (then `pop` to restore).\n- If rolling back is genuinely necessary (e.g., the change itself is wrong), first explain the reason to the user and obtain confirmation.");
+
+    // ── 行为规则：根据 goal 模式条件渲染 ──
+    // 普通模式：注入 scope discipline + autonomous execution + completion 规则，
+    // 治理 agent 的无限探索倾向。
+    // Goal 模式：替换为自主执行规则，不注入停止条件，让 agent 持续推进。
+    if ctx.goal_mode.is_some() {
+        // Goal 模式：覆盖默认停止规则，强调持续推进
+        b.push(
+            ContextKind::Behavior,
+            "Goal Mode — Autonomous Execution:\n\
+             - This is a long-running autonomous task. Do NOT stop midway to report progress.\n\
+             - Do NOT stop because you have \"enough evidence\" — your job is to act, not analyze.\n\
+             - You may explore, refactor, and improve — this is a long-term task, not a Q&A.\n\
+             - Only stop calling tools when you are confident every detail of the goal is complete.\n\
+             - After every tool result, decide the next concrete action immediately.\n\
+             - If a check fails, diagnose, fix, and re-run verification before finishing.\n\
+             - If verification fails 3 consecutive times on the same issue, report what you tried and the current error.",
+        );
+    } else {
+        // 普通模式：scope discipline — 治理无限探索
+        b.push(
+            ContextKind::Behavior,
+            "Scope Discipline & Stopping Criteria:\n\
+             - Only investigate what the user explicitly asked. Do not proactively read unrelated files, run tangential searches, or make changes beyond the request's scope.\n\
+             - Stop when confident. When you have 3+ pieces of converging evidence or have completed the requested change + verification, STOP exploring and deliver your answer. State what you know vs what remains uncertain rather than continuing to \"be thorough.\"\n\
+             - No unsolicited improvements. Do not suggest refactors, optimizations, or related fixes unless the user explicitly asked. Exception: you MAY flag critical risks that would cause data loss or security issues — but do not propose solutions, just state the risk.\n\
+             - Triage before diving. For broad requests, quickly state what you will investigate and what you will NOT, then proceed narrowly.",
+        );
+        // 普通模式：autonomous execution
+        b.push(
+            ContextKind::Behavior,
+            "Autonomous Execution:\n\
+             - Treat the user's request as a goal to finish, not just a question to discuss.\n\
+             - Prefer acting with tools over describing what you might do next.\n\
+             - Keep working until the task is complete, verification has passed, or you are blocked by a specific, named missing input. Do NOT keep exploring \"just in case\" — once the request is addressed, STOP.\n\
+             - Start from the loaded core toolset and progressively enable extra tools only when they become necessary.\n\
+             - After every tool result, decide the next concrete action immediately.\n\
+             - If a check fails, diagnose, fix, and re-run verification before finishing. Same 3-strike limit applies.",
+        );
+    }
 
     if has_tool(available_tools, "enable_tools") {
         // Capability catalog（如有）按 trigger→tool 给出事实性精确映射；
@@ -929,6 +978,7 @@ fn build_system_prompt(
             "If the user asks to remember or states a durable preference/constraint, call `knowledge_save`.".to_string(),
             "When saving a durable principle, preference, safety rule, or coding rule, choose a guideline category such as `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` so it participates in persistent recall.".to_string(),
             "Use `user_memory` / `project_info` / `architecture` / `decision_log` for factual knowledge.".to_string(),
+            "Save each distinct durable fact at most once per turn. Do not save temporary work notes, raw tool output, or speculative conclusions as global knowledge.".to_string(),
         ];
         let retrieval_tools =
             available_tool_names_in_order(available_tools, &["knowledge_search", "knowledge_list"]);
@@ -1084,6 +1134,10 @@ fn build_system_prompt(
                 "Before answering from memory, search with {}.",
                 format_tool_names(&search_tools)
             ));
+            lines.push(
+                "Reuse a successful knowledge search for the rest of the turn. Search again only after knowledge changes or when the query is materially different."
+                    .to_string(),
+            );
         }
         if has_tool(available_tools, "knowledge_list") {
             lines.push("Use `knowledge_list` when asked what is remembered.".to_string());
@@ -1152,7 +1206,10 @@ fn build_skill_turn_guard(
     let builtin_tools = builtin_tools_for_skill(skill, active_agent.as_ref());
     let mcp_tools = select_mcp_tools(all_mcp_tools.clone(), skill, active_agent.as_ref());
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
-    let mut builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
+    let ctx = PromptContext {
+        goal_mode: app.goal_mode.clone(),
+    };
+    let mut builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools, &ctx);
     if has_tool(&available_tools, "enable_tools")
         && let Some(catalog) = build_hidden_mcp_tool_catalog(&all_mcp_tools, &mcp_tools)
     {
@@ -1293,7 +1350,7 @@ pub(super) fn prepare_skill_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextKind, SystemPromptBuilder, available_tool_names,
+        ContextKind, PromptContext, SystemPromptBuilder, available_tool_names,
         build_hidden_execution_primitive_catalog, build_hidden_mcp_tool_catalog,
         build_project_instruction_prompt, build_system_prompt, builtin_tools_for_skill,
         declares_executor_group, ensure_required_baseline_tools,
@@ -1336,7 +1393,6 @@ mod tests {
             tool_groups: vec!["builtin".to_string(), "executor".to_string()],
             mcp_servers: Vec::new(),
             disable_mcp_tools: false,
-            routing_tags: Vec::new(),
             model_tier: None,
             disabled: false,
             hidden: false,
@@ -1579,7 +1635,9 @@ mod tests {
         available.insert("enable_tools".to_string());
         available.insert("discover_skills".to_string());
 
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         assert!(prompt.contains("Tool usage:"));
         assert!(prompt.contains("Tool discovery:"));
         assert!(!prompt.contains("Web search:"));
@@ -1592,7 +1650,9 @@ mod tests {
     #[test]
     fn system_prompt_enforces_concise_response_style_with_correctness_safeguard() {
         let available = SkipSet::new(16);
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         // 风格段必须存在，且要求"先答后说、不啰嗦"
         assert!(prompt.contains("Response style:"));
         assert!(prompt.contains("Lead with answer"));
@@ -1607,7 +1667,9 @@ mod tests {
         available.insert("task_wait".to_string());
         available.insert("task_status".to_string());
 
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
 
         // 多个独立、非琐碎分支应允许积极并行，但仍禁止琐碎任务滥用子 agent。
         assert!(prompt.contains("multiple independent, non-trivial work streams"));
@@ -1622,7 +1684,9 @@ mod tests {
     #[test]
     fn system_prompt_forbids_guessing_without_sufficient_evidence() {
         let available = SkipSet::new(16);
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         assert!(prompt.contains("Correctness guardrails:"));
         assert!(prompt.contains("Do not hallucinate"));
         assert!(prompt.contains("gather sufficient evidence"));
@@ -1634,7 +1698,9 @@ mod tests {
     #[test]
     fn system_prompt_bounds_tool_exploration() {
         let available = SkipSet::new(16);
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         assert!(prompt.contains("Every tool call must have a specific"));
         assert!(prompt.contains("Avoid open-ended exploration"));
         assert!(prompt.contains("Stop exploratory loops once you have enough evidence"));
@@ -1643,7 +1709,9 @@ mod tests {
     #[test]
     fn generic_system_prompt_does_not_hardcode_repo_specific_tool_names() {
         let available = SkipSet::new(16);
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         assert!(!prompt.contains("cargo_test"));
         assert!(!prompt.contains("execute_command / cargo_test"));
         assert!(!prompt.contains("execute_command"));
@@ -1656,7 +1724,9 @@ mod tests {
     fn system_prompt_mentions_mcp_discovery_when_enable_tools_available() {
         let mut available = SkipSet::new(16);
         available.insert("enable_tools".to_string());
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         assert!(prompt.contains("discover and enable matching `mcp_*` tools first"));
     }
 
@@ -1747,7 +1817,9 @@ mod tests {
         let mut available = SkipSet::new(16);
         available.insert("enable_tools".to_string());
         available.insert("discover_skills".to_string());
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         assert!(prompt.contains("discover_skills"));
         assert!(prompt.contains("enable_tools"));
     }
@@ -1757,7 +1829,9 @@ mod tests {
         let mut available = SkipSet::new(16);
         available.insert("enable_tools".to_string());
         available.insert("discover_skills".to_string());
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         assert!(prompt.contains("discover_skills"));
         assert!(prompt.contains("No skill is active yet"));
         assert!(prompt.contains("only when the task is specialized, tool-heavy"));
@@ -1768,7 +1842,9 @@ mod tests {
     fn system_prompt_omits_discover_skills_guidance_when_tool_is_unavailable() {
         let mut available = SkipSet::new(16);
         available.insert("enable_tools".to_string());
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         assert!(prompt.contains("enable_tools(operation=list)"));
         assert!(!prompt.contains("call `discover_skills` with the named keyword"));
         assert!(!prompt.contains("After `discover_skills`"));
@@ -1831,9 +1907,13 @@ mod tests {
         let mut humanizer = skill("humanizer", "Rewrite text naturally");
         humanizer.prompt = "You are a writing editor.".to_string();
 
-        let prompt =
-            build_system_prompt(Some(&build_agent), Some(&humanizer), &Box::new(available))
-                .render_system_prompt();
+        let prompt = build_system_prompt(
+            Some(&build_agent),
+            Some(&humanizer),
+            &Box::new(available),
+            &PromptContext::default(),
+        )
+        .render_system_prompt();
 
         let skill_pos = prompt.find("Active skill: humanizer").unwrap();
         let agent_pos = prompt.find("[Agent instructions]").unwrap();
@@ -1849,12 +1929,16 @@ mod tests {
         available.insert("knowledge_search".to_string());
         available.insert("knowledge_list".to_string());
 
-        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         assert!(prompt.contains("Knowledge save:"));
         assert!(prompt.contains("call `knowledge_save`"));
         assert!(prompt.contains("`common_sense`, `coding_guideline`"));
+        assert!(prompt.contains("Save each distinct durable fact at most once per turn"));
         assert!(prompt.contains("Knowledge retrieval:"));
         assert!(prompt.contains("search with `knowledge_search`"));
+        assert!(prompt.contains("Reuse a successful knowledge search"));
         assert!(prompt.contains("Use `knowledge_list` when asked what is remembered"));
         assert!(!prompt.contains("call `memory_save`"));
     }
@@ -1920,7 +2004,12 @@ mod tests {
         let (base_prompt, enriched_prompt, reminder) =
             SUBAGENT_CWD.sync_scope(nested.clone(), || {
                 let available = SkipSet::new(16);
-                let mut builder = build_system_prompt(None, None, &Box::new(available));
+                let mut builder = build_system_prompt(
+                    None,
+                    None,
+                    &Box::new(available),
+                    &PromptContext::default(),
+                );
                 let base_prompt = builder.render_system_prompt();
                 push_project_context(&mut builder);
                 let enriched_prompt = builder.render_system_prompt();
@@ -1950,7 +2039,8 @@ mod tests {
 
         let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), || {
             let available = SkipSet::new(16);
-            let mut builder = build_system_prompt(None, None, &Box::new(available));
+            let mut builder =
+                build_system_prompt(None, None, &Box::new(available), &PromptContext::default());
             push_project_context(&mut builder);
             builder.render_system_prompt()
         });
@@ -1975,7 +2065,8 @@ mod tests {
 
         let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), || {
             let available = SkipSet::new(16);
-            let mut builder = build_system_prompt(None, None, &Box::new(available));
+            let mut builder =
+                build_system_prompt(None, None, &Box::new(available), &PromptContext::default());
             push_project_context(&mut builder);
             builder.render_system_prompt()
         });
@@ -2000,7 +2091,8 @@ mod tests {
 
         let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), || {
             let available = SkipSet::new(16);
-            let mut builder = build_system_prompt(None, None, &Box::new(available));
+            let mut builder =
+                build_system_prompt(None, None, &Box::new(available), &PromptContext::default());
             push_project_context(&mut builder);
             builder.render_system_prompt()
         });
@@ -2063,7 +2155,6 @@ mod tests {
             tool_groups: Vec::new(),
             mcp_servers: mcp_servers.into_iter().map(|s| s.to_string()).collect(),
             disable_mcp_tools: false,
-            routing_tags: Vec::new(),
             model_tier: None,
             disabled: false,
             hidden: false,

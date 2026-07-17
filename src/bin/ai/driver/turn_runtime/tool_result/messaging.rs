@@ -807,28 +807,35 @@ fn classify_code_discovery(finding: &RepoInspectionFinding) -> Option<CodeDiscov
     should_persist(record.confidence).then_some(record)
 }
 
-fn infer_apply_patch_target(args: &Value) -> Option<String> {
-    args.get("file_path")
+fn infer_apply_patch_targets(args: &Value) -> Vec<String> {
+    if let Some(target) = args
+        .get("file_path")
         .or_else(|| args.get("path"))
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            let patch = args.get("patch").and_then(|v| v.as_str())?;
-            extract_apply_patch_target_from_patch(patch)
-        })
+    {
+        return vec![target.to_string()];
+    }
+    args.get("patch")
+        .and_then(|v| v.as_str())
+        .map(extract_apply_patch_targets_from_patch)
+        .unwrap_or_default()
 }
 
-fn extract_apply_patch_target_from_patch(patch: &str) -> Option<String> {
-    let mut lines = patch.lines();
-    lines.find(|line| line.trim() == "*** Begin Patch")?;
-    let header = lines.find(|line| !line.trim().is_empty())?;
-    [
-        "*** Update File: ",
-        "*** Add File: ",
-        "*** Replace in line: ",
-    ]
-    .iter()
-    .find_map(|prefix| header.strip_prefix(prefix).map(|path| path.trim().to_string()))
+fn extract_apply_patch_targets_from_patch(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            [
+                "*** Update File: ",
+                "*** Add File: ",
+                "*** Replace in line: ",
+            ]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+            .map(|path| path.trim().to_string())
+        })
+        .collect()
 }
 
 fn describe_tool_call(tool_call: &ToolCall) -> String {
@@ -886,10 +893,16 @@ fn describe_tool_call(tool_call: &ToolCall) -> String {
             .map(|path| format!("(path={})", truncate_inline(path, 64)))
             .unwrap_or_default(),
         "apply_patch" => {
-            let path = infer_apply_patch_target(&args)
-                .map(|v| truncate_inline(&v, 64))
-                .unwrap_or_else(|| "?".to_string());
-            format!("(file={})", path)
+            let targets = infer_apply_patch_targets(&args);
+            match targets.as_slice() {
+                [] => "(file=?)".to_string(),
+                [path] => format!("(file={})", truncate_inline(path, 64)),
+                _ => format!(
+                    "(files={}, targets={})",
+                    targets.len(),
+                    truncate_inline(&targets.join(", "), 96)
+                ),
+            }
         }
         "write_file" => {
             let path = args
@@ -975,8 +988,8 @@ fn truncate_note(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         RepoInspectionFinding, build_code_inspection_working_memory,
-        build_persistent_code_discoveries, classify_code_discovery, describe_tool_call,
-        collect_repo_inspection_findings, is_repo_inspection_tool,
+        build_persistent_code_discoveries, classify_code_discovery,
+        collect_repo_inspection_findings, describe_tool_call, is_repo_inspection_tool,
         persistent_code_discovery_already_present,
     };
     use super::{
@@ -1019,6 +1032,22 @@ mod tests {
         );
 
         assert_eq!(describe_tool_call(&call), "(file=src/main.rs)");
+    }
+
+    #[test]
+    fn describe_tool_call_shows_multi_file_apply_patch_targets() {
+        let call = tool_call(
+            "1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old_a\n+new_a\n*** Add File: src/b.rs\n+hello\n*** End Patch\n"
+            }),
+        );
+
+        let described = describe_tool_call(&call);
+        assert!(described.contains("files=2"), "described: {described}");
+        assert!(described.contains("src/a.rs"), "described: {described}");
+        assert!(described.contains("src/b.rs"), "described: {described}");
     }
 
     #[test]

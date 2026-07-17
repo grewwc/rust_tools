@@ -429,6 +429,15 @@ async fn request_model_response(
         store_last_pre_request_summary_chars(&session_id, llm_after);
     }
 
+    let auto_model_fallback_spec = crate::ai::driver::runtime_ctx::auto_model_fallback_spec();
+    if auto_model_fallback_spec.is_some()
+        && crate::ai::models::subagent_model_needs_probe(next_model)
+    {
+        eprintln!(
+            "[model] validating auto-selected model '{}' with the first real subagent request",
+            next_model
+        );
+    }
     let mut actual_model = next_model.to_string();
     let mut request_result = if force_final_response {
         do_request_messages_without_tools(app, next_model, messages, true).await
@@ -436,7 +445,7 @@ async fn request_model_response(
         do_request_messages(app, next_model, messages, true).await
     };
     if let Err(err) = &request_result
-        && let Some(fallback_spec) = crate::ai::driver::runtime_ctx::auto_model_fallback_spec()
+        && let Some(fallback_spec) = auto_model_fallback_spec
         && request::should_try_model_fallback(err)
     {
         if request::should_temporarily_disable_auto_selected_model(err) {
@@ -466,7 +475,12 @@ async fn request_model_response(
         }
     }
 
-    request_result.map(|response| (response, actual_model))
+    request_result.map(|response| {
+        if auto_model_fallback_spec.is_some() {
+            crate::ai::models::mark_subagent_model_verified(&actual_model);
+        }
+        (response, actual_model)
+    })
 }
 
 #[crate::ai::agent_hang_span(

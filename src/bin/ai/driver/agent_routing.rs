@@ -215,11 +215,6 @@ pub(super) fn agent_manifests_fingerprint(agents: &[AgentManifest]) -> [u8; 32] 
         hasher.update(b"\0");
         hasher.update([m.disable_mcp_tools as u8]);
         hasher.update(b"\0");
-        for tag in &m.routing_tags {
-            hasher.update(tag.as_bytes());
-            hasher.update(b",");
-        }
-        hasher.update(b"\0");
         hasher.update([m.disabled as u8, m.hidden as u8]);
         hasher.update(b"\0");
         hasher.update(m.color.as_deref().unwrap_or("").as_bytes());

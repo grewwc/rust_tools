@@ -596,8 +596,9 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     let mut out = Vec::with_capacity(messages.len() + usize::from(!checkpoint_markers.is_empty()));
     out.push(merged_first);
     if !checkpoint_markers.is_empty() {
-        let mut checkpoint_context =
-            String::from("[Persistent context checkpoints: the most recent durable records]\n");
+        let mut checkpoint_context = String::from(
+            "[Persistent context checkpoints: durable intermediate results you saved earlier so they survive compression. Each entry is a one-line summary followed by the file path holding the full details; read_file that path when you need the complete conclusion or evidence instead of rediscovering it.]\n",
+        );
         for marker in checkpoint_markers.iter().rev() {
             checkpoint_context.push_str(marker);
             checkpoint_context.push('\n');

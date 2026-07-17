@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use rustc_hash::FxHashSet;
 use serde_json::Value;
 
 use crate::ai::tools::common::ToolRegistration;
@@ -14,11 +15,11 @@ fn params_apply_patch() -> Value {
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "Preferred absolute path to the file to patch (some sensitive paths are blocked). Optional when the patch is wrapped in a single-file `*** Begin Patch` envelope that already names the target. The runtime also accepts `path` as a compatibility alias."
+                "description": "Preferred absolute path to the file to patch (some sensitive paths are blocked). Optional when the patch is wrapped in a `*** Begin Patch` envelope that already names its target path(s). The runtime also accepts `path` as a compatibility alias. For multi-file Begin Patch envelopes, do NOT also pass `file_path` / `path` — each section must declare its own target."
             },
             "patch": {
                 "type": "string",
-                "description": "Patch text. Accepted formats: raw unified-diff hunks starting with @@, or a single-file `*** Begin Patch` envelope with `*** Update File:` / `*** Add File:` / `*** Replace in line:`. In unified-diff hunks every content line MUST start with a prefix: ` ` (space) for context, `-` for removal, `+` for addition; do NOT wrap the patch in a code fence and do NOT copy line-number prefixes from read tools."
+                "description": "Patch text. Accepted formats: raw unified-diff hunks starting with @@ (single target via `file_path` / `path`), or a `*** Begin Patch` envelope with one or more `*** Update File:` / `*** Add File:` / `*** Replace in line:` sections. In unified-diff hunks every content line MUST start with a prefix: ` ` (space) for context, `-` for removal, `+` for addition. Critical rules: (1) do NOT wrap the patch in a code fence; (2) do NOT copy line-number prefixes from read tools; (3) to avoid `ambiguous patch`, include function names or unique surrounding lines as anchor context so each hunk matches exactly one location; (4) to avoid `context mismatch` after a previous edit to the same file, ALWAYS re-read the file with read_file/read_file_lines first and rebuild the patch from the fresh content — patches based on stale content WILL fail; (5) if one Begin Patch envelope edits multiple files, each target path may appear only once in that envelope."
             }
         },
         "required": ["patch"]
@@ -28,7 +29,7 @@ fn params_apply_patch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply a localized patch to one file. Supports raw unified-diff hunks and the common single-file `*** Begin Patch` envelope. Prefer this for updating an existing document or source file with the smallest localized change instead of rewriting the entire file. Creates missing parent directories; removals must match, while context may be fuzzed only when removals uniquely anchor the hunk.",
+        description: "Apply a localized patch. Supports raw unified-diff hunks for a single target file, or a `*** Begin Patch` envelope with one or more `*** Update File:`, `*** Add File:`, or `*** Replace in line:` sections. Prefer this over rewriting entire files. Multi-file Begin Patch envelopes are prepared first and written only after every section validates, so one failing section does not leave a half-applied batch. Creates missing parent directories; removals must match exactly, context is fuzzed only when removals uniquely anchor the hunk. Common pitfalls and how to avoid them: (1) `ambiguous patch` → add more unique surrounding context (function names, distinctive lines) so each hunk matches exactly one location; (2) `context mismatch` after a prior edit to the same file → you MUST re-read the file with read_file/read_file_lines first and rebuild the patch from fresh content; (3) in a multi-file Begin Patch envelope, do not also pass `file_path` / `path`, and do not mention the same target path twice.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -70,13 +71,26 @@ struct PatchEnvelope {
     body_lines: Vec<String>,
 }
 
+#[derive(Debug)]
+struct PreparedPatchWrite {
+    path: PathBuf,
+    next: String,
+}
+
 fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
     let mut hunks = Vec::new();
     let mut iter = patch.lines().peekable();
     let mut patch_line_no: usize = 0; // 1-based，用于错误信息定位
     let mut saw_content_before_header = false;
+    let mut saw_envelope_marker = false; // 检测到 *** Begin Patch / *** Update File: 等 envelope 标记
     while let Some(line) = iter.next() {
         patch_line_no += 1;
+        // 残缺 envelope 信号：parse_patch_envelopes 因首行非 `*** Begin Patch`
+        // 返回 None 后会误入 unified-diff 路径。记录是否出现过 envelope 开头/分节
+        // 标记，用于下方决定是否静默容忍尾部 `*** End Patch`。
+        if line == "*** Begin Patch" || is_patch_section_header(line) {
+            saw_envelope_marker = true;
+        }
         let Some(rest) = line.strip_prefix("@@") else {
             if hunks.is_empty()
                 && (line.starts_with('+')
@@ -108,6 +122,18 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             if next.starts_with("@@") {
                 break;
             }
+            // 容忍格式混用：模型常在纯 unified-diff hunk 末尾误带 `*** End Patch`
+            // 等 envelope 尾标记。这些标记不属于 unified-diff 内容，遇到即结束
+            // 当前 hunk（交由外层循环跳过），避免误报 invalid hunk line。
+            // 但若已检测到 envelope 开头/分节标记（saw_envelope_marker），说明这是
+            // 残缺 envelope 误入 unified-diff 路径，目标文件由 file_path 决定、而非
+            // envelope 声明--此时静默应用可能写到错误文件。故不 break，让该行落入
+            // 下方 _ => 分支报"格式混用"错误，由模型重建，绝不静默错写。
+            if (next == "*** End Patch" || next == "*** End of File")
+                && !saw_envelope_marker
+            {
+                break;
+            }
             let l = iter.next().unwrap_or_default();
             patch_line_no += 1;
             if l.starts_with("\\ No newline at end of file") {
@@ -130,6 +156,20 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
                 '-' => lines.push(UnifiedLine::Remove(body.to_string())),
                 '+' => lines.push(UnifiedLine::Add(body.to_string())),
                 _ => {
+                    // 特判 envelope 风格标记：说明 unified-diff 与 Begin/End Patch
+                    // 格式混用。结尾标记（*** End Patch / *** End of File）已在上方
+                    // break 容错；走到这里的是 *** Begin Patch / *** Update File: 等
+                    // 开头或分节标记，表示 patch 结构混乱，明确报错引导模型重建。
+                    if l.starts_with("*** ") {
+                        return Err(format!(
+                            "invalid hunk line at patch line {patch_line_no}: detected mixed \
+                             patch formats. Line {:?} is a `*** Begin/End Patch` envelope marker, \
+                             but the patch was parsed as unified diff (it has `@@` hunks). Use ONE \
+                             format only: either unified-diff hunks (`@@ ... @@` with ` `/`-`/`+` \
+                             prefixed lines) OR a `*** Begin Patch` envelope, not both.",
+                            l
+                        ));
+                    }
                     return Err(format!(
                         "invalid hunk line at patch line {patch_line_no}: every line in a hunk must start with ` ` (context), `-` (remove), or `+` (add), but got: {:?}",
                         l
@@ -177,72 +217,111 @@ fn ensure_patch_target_matches(target_path: &Path, envelope_path: &str) -> Resul
     ))
 }
 
-fn parse_patch_envelope(patch: &str) -> Result<Option<PatchEnvelope>, String> {
-    let mut lines = patch.lines();
-    let Some(first) = lines.find(|line| !line.trim().is_empty()) else {
-        return Ok(None);
-    };
-    if first.trim() != "*** Begin Patch" {
-        return Ok(None);
-    }
-
-    let header = lines
-        .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| "invalid patch envelope: missing file header".to_string())?;
-    let (op, target_path) = if let Some(path) = header.strip_prefix("*** Update File: ") {
-        (PatchEnvelopeOp::Update, path.trim())
+fn parse_patch_header(header: &str) -> Result<(PatchEnvelopeOp, &str), String> {
+    if let Some(path) = header.strip_prefix("*** Update File: ") {
+        Ok((PatchEnvelopeOp::Update, path.trim()))
     } else if let Some(path) = header.strip_prefix("*** Add File: ") {
-        (PatchEnvelopeOp::Add, path.trim())
+        Ok((PatchEnvelopeOp::Add, path.trim()))
     } else if let Some(path) = header.strip_prefix("*** Replace in line: ") {
-        (PatchEnvelopeOp::ReplaceInLine, path.trim())
+        Ok((PatchEnvelopeOp::ReplaceInLine, path.trim()))
     } else if header.starts_with("*** Delete File: ") {
-        return Err("apply_patch does not support Delete File envelopes".to_string());
+        Err("apply_patch does not support Delete File envelopes".to_string())
     } else {
-        return Err(
+        Err(
             "invalid patch envelope: expected `*** Update File:`, `*** Add File:`, \
              or `*** Replace in line:`"
                 .to_string(),
-        );
-    };
-
-    let mut body_lines = Vec::new();
-    let mut ended = false;
-    for line in lines {
-        if line == "*** End Patch" {
-            ended = true;
-            break;
-        }
-        if line == "*** End of File" {
-            continue;
-        }
-        if line.starts_with("*** Update File: ")
-            || line.starts_with("*** Add File: ")
-            || line.starts_with("*** Replace in line: ")
-            || line.starts_with("*** Delete File: ")
-        {
-            return Err(
-                "multi-file patch not supported: apply_patch edits one file per call".to_string(),
-            );
-        }
-        body_lines.push(line.to_string());
+        )
     }
-    if !ended {
-        return Err("invalid patch envelope: missing `*** End Patch`".to_string());
-    }
-    Ok(Some(PatchEnvelope {
-        op,
-        target_path: target_path.to_string(),
-        body_lines,
-    }))
 }
 
-fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), String> {
-    let Some(envelope) = parse_patch_envelope(patch)? else {
-        return Ok((path.display().to_string(), patch.to_string()));
-    };
+fn is_patch_section_header(line: &str) -> bool {
+    line.starts_with("*** Update File: ")
+        || line.starts_with("*** Add File: ")
+        || line.starts_with("*** Replace in line: ")
+        || line.starts_with("*** Delete File: ")
+}
 
-    ensure_patch_target_matches(path, &envelope.target_path)?;
-    let normalized_patch = match envelope.op {
+fn parse_patch_envelopes(patch: &str) -> Result<Option<Vec<PatchEnvelope>>, String> {
+    let lines: Vec<&str> = patch.lines().collect();
+    let Some(mut idx) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if lines[idx].trim() != "*** Begin Patch" {
+        return Ok(None);
+    }
+    idx += 1;
+
+    let mut envelopes = Vec::new();
+    loop {
+        while idx < lines.len() && lines[idx].trim().is_empty() {
+            idx += 1;
+        }
+        if idx >= lines.len() {
+            return Err("invalid patch envelope: missing `*** End Patch`".to_string());
+        }
+        if lines[idx] == "*** End Patch" {
+            break;
+        }
+
+        let (op, target_path) = parse_patch_header(lines[idx])?;
+        idx += 1;
+
+        let mut body_lines = Vec::new();
+        while idx < lines.len() {
+            let line = lines[idx];
+            if line == "*** End Patch" || is_patch_section_header(line) {
+                break;
+            }
+            if line == "*** End of File" {
+                idx += 1;
+                continue;
+            }
+            if line.trim().is_empty() {
+                let mut lookahead = idx + 1;
+                while lookahead < lines.len() && lines[lookahead].trim().is_empty() {
+                    lookahead += 1;
+                }
+                if lookahead < lines.len()
+                    && (lines[lookahead] == "*** End Patch"
+                        || is_patch_section_header(lines[lookahead]))
+                {
+                    idx = lookahead;
+                    continue;
+                }
+            }
+            body_lines.push(line.to_string());
+            idx += 1;
+        }
+
+        envelopes.push(PatchEnvelope {
+            op,
+            target_path: target_path.to_string(),
+            body_lines,
+        });
+    }
+
+    if envelopes.is_empty() {
+        return Err("invalid patch envelope: missing file header".to_string());
+    }
+    Ok(Some(envelopes))
+}
+
+fn parse_patch_envelope(patch: &str) -> Result<Option<PatchEnvelope>, String> {
+    let Some(mut envelopes) = parse_patch_envelopes(patch)? else {
+        return Ok(None);
+    };
+    if envelopes.len() != 1 {
+        return Err(format!(
+            "parse_patch_envelope expected exactly 1 file section, found {}",
+            envelopes.len()
+        ));
+    }
+    Ok(envelopes.pop())
+}
+
+fn normalize_patch_envelope(path: &Path, envelope: &PatchEnvelope) -> Result<String, String> {
+    Ok(match envelope.op {
         PatchEnvelopeOp::ReplaceInLine => {
             // ReplaceInLine 不走 unified-diff 路径，由 apply_inline_replace 直接处理。
             // 走到这里说明 execute_apply_patch 的分流逻辑有 bug——提前返回明确错误，
@@ -330,8 +409,7 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
             }
             normalized
         }
-    };
-    Ok((envelope.target_path, normalized_patch))
+    })
 }
 
 /// 行内子串替换：用 `anchor:` 定位行，在该行内将 `old:` 精确替换为 `new:`。
@@ -1244,75 +1322,50 @@ fn strip_code_fence(patch: &str) -> String {
     lines[1..last_nonempty].join("\n").trim().to_string()
 }
 
-pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
-    let raw_patch = args["patch"].as_str().ok_or_else(|| {
-        let actual = match args.get("patch") {
-            None => "missing".to_string(),
-            Some(Value::String(_)) => "string (should not happen)".to_string(),
-            Some(Value::Object(_)) => "object".to_string(),
-            Some(Value::Array(_)) => "array".to_string(),
-            Some(Value::Number(_)) => "number".to_string(),
-            Some(Value::Bool(_)) => "boolean".to_string(),
-            Some(Value::Null) => "null".to_string(),
-        };
-        format!(
-            "patch parameter has wrong type ({actual}): expected a string. \
-             Pass the patch text as a string value, not a JSON object or array."
-        )
-    })?;
-    let patch = strip_code_fence(raw_patch);
-    let initial_file_path = optional_file_path_arg(args);
-    let envelope = parse_patch_envelope(&patch)?;
-    let file_path = initial_file_path
-        .map(str::to_string)
-        .or_else(|| envelope.as_ref().map(|parsed| parsed.target_path.clone()))
-        .ok_or(
-            "missing file_path: provide `file_path` (or `path`) arg, \
-             or wrap the patch in a `*** Begin Patch` / `*** Update File: <path>` envelope.",
-        )?;
-
-    let store = FileStore::new(PathBuf::from(&file_path));
-    store
-        .validate_write_access()
-        .map_err(|err| err.to_string())?;
-    let path = store.path().to_path_buf();
-    // ReplaceInLine 不走 unified-diff 路径，提前分流到 apply_inline_replace。
-    // 这样原有 unified-diff 逻辑完全不受影响，零回归风险。
-    if let Some(ref envelope) = envelope {
-        if envelope.op == PatchEnvelopeOp::ReplaceInLine {
-            ensure_patch_target_matches(&path, &envelope.target_path)?;
-            let original = if path.exists() {
-                store.read_to_string().map_err(|err| err.to_string())?
-            } else {
-                return Err(format!(
-                    "Replace in line: target file does not exist: {}",
-                    path.display()
-                ));
-            };
-            let next = apply_inline_replace(&original, envelope)?;
-            store.write_all(&next).map_err(|err| err.to_string())?;
-            return Ok(format!("Successfully patched {}", path.display()));
-        }
+fn format_patch_success(paths: &[PathBuf]) -> String {
+    if paths.len() == 1 {
+        return format!("Successfully patched {}", paths[0].display());
     }
-    let (_, normalized_patch) = if let Some(envelope) = envelope {
-        ensure_patch_target_matches(&path, &envelope.target_path)?;
-        normalize_patch_text(&path, &patch)?
-    } else {
-        (file_path.clone(), patch.clone())
-    };
-    let original = if path.exists() {
-        store.read_to_string().map_err(|err| err.to_string())?
-    } else {
-        String::new()
-    };
-    let next = apply_unified_patch(&original, &normalized_patch)?;
-    store.write_all(&next).map_err(|err| err.to_string())?;
-    Ok(format!("Successfully patched {}", path.display()))
+    let mut message = format!("Successfully patched {} files:", paths.len());
+    for path in paths {
+        message.push_str(&format!("\n- {}", path.display()));
+    }
+    message
 }
 
-pub(crate) fn execute_apply_patch_streaming(
+fn prepare_patch_write(
+    path: &Path,
+    store: &FileStore,
+    envelope: &PatchEnvelope,
+) -> Result<PreparedPatchWrite, String> {
+    let next = if envelope.op == PatchEnvelopeOp::ReplaceInLine {
+        let original = if path.exists() {
+            store.read_to_string().map_err(|err| err.to_string())?
+        } else {
+            return Err(format!(
+                "Replace in line: target file does not exist: {}",
+                path.display()
+            ));
+        };
+        apply_inline_replace(&original, envelope)?
+    } else {
+        let normalized_patch = normalize_patch_envelope(path, envelope)?;
+        let original = if path.exists() {
+            store.read_to_string().map_err(|err| err.to_string())?
+        } else {
+            String::new()
+        };
+        apply_unified_patch(&original, &normalized_patch)?
+    };
+    Ok(PreparedPatchWrite {
+        path: path.to_path_buf(),
+        next,
+    })
+}
+
+fn execute_apply_patch_impl(
     args: &Value,
-    on_chunk: &mut ToolStreamWriter<'_>,
+    mut emit: impl FnMut(&str),
 ) -> Result<String, String> {
     let raw_patch = args["patch"].as_str().ok_or_else(|| {
         let actual = match args.get("patch") {
@@ -1330,84 +1383,116 @@ pub(crate) fn execute_apply_patch_streaming(
         )
     })?;
     let patch = strip_code_fence(raw_patch);
-    emit_stream_line(on_chunk, "parsing patch envelope");
-
+    emit("parsing patch envelope");
     let initial_file_path = optional_file_path_arg(args);
-    let envelope = parse_patch_envelope(&patch)?;
-    let file_path = initial_file_path
-        .map(str::to_string)
-        .or_else(|| envelope.as_ref().map(|parsed| parsed.target_path.clone()))
-        .ok_or(
-            "missing file_path: provide `file_path` (or `path`) arg, \
-             or wrap the patch in a `*** Begin Patch` / `*** Update File: <path>` envelope.",
-        )?;
+    if let Some(envelopes) = parse_patch_envelopes(&patch)? {
+        if envelopes.len() > 1 && initial_file_path.is_some() {
+            return Err(
+                "multi-file Begin Patch envelopes must not also pass `file_path` / `path`. \
+                 Remove the top-level target arg and let each section declare its own file."
+                    .to_string(),
+            );
+        }
+        emit(&format!("parsed {} patch section(s)", envelopes.len()));
+        let mut seen_targets = FxHashSet::default();
+        let mut writes = Vec::with_capacity(envelopes.len());
+        let mut paths = Vec::with_capacity(envelopes.len());
+        for (idx, envelope) in envelopes.iter().enumerate() {
+            let target_arg = initial_file_path.unwrap_or(envelope.target_path.as_str());
+            let store = FileStore::new(PathBuf::from(target_arg));
+            emit(&format!(
+                "target [{}/{}]: {}",
+                idx + 1,
+                envelopes.len(),
+                store.path().display()
+            ));
+            emit("validating write access");
+            store
+                .validate_write_access()
+                .map_err(|err| err.to_string())?;
+            let path = store.path().to_path_buf();
+            ensure_patch_target_matches(&path, &envelope.target_path)?;
+            if !seen_targets.insert(path.clone()) {
+                return Err(format!(
+                    "duplicate target in Begin Patch envelope: {}. Mention each file at most once per apply_patch call.",
+                    path.display()
+                ));
+            }
+            if envelope.op == PatchEnvelopeOp::ReplaceInLine {
+                emit("applying inline replacement");
+            } else {
+                let hunk_count = envelope
+                    .body_lines
+                    .iter()
+                    .filter(|line| line.starts_with("@@"))
+                    .count()
+                    .max(1);
+                emit(&format!("applying {hunk_count} hunk(s)"));
+            }
+            let write = prepare_patch_write(&path, &store, envelope).map_err(|err| {
+                format!(
+                    "failed while preparing patch for {}: {err}",
+                    path.display()
+                )
+            })?;
+            paths.push(path);
+            writes.push(write);
+        }
+        for write in &writes {
+            emit(&format!("writing {} byte(s)", write.next.len()));
+            FileStore::new(write.path.clone())
+                .write_all(&write.next)
+                .map_err(|err| err.to_string())?;
+        }
+        let success = format_patch_success(&paths);
+        emit(&success);
+        return Ok(success);
+    }
 
-    let store = FileStore::new(PathBuf::from(&file_path));
-    emit_stream_line(on_chunk, &format!("target: {}", store.path().display()));
-    emit_stream_line(on_chunk, "validating write access");
+    let file_path = initial_file_path.ok_or(
+        "missing file_path: provide `file_path` (or `path`) arg, \
+         or wrap the patch in a `*** Begin Patch` / `*** Update File: <path>` envelope.",
+    )?;
+    let store = FileStore::new(PathBuf::from(file_path));
+    emit(&format!("target: {}", store.path().display()));
+    emit("validating write access");
     store
         .validate_write_access()
         .map_err(|err| err.to_string())?;
-
     let path = store.path().to_path_buf();
-    // ReplaceInLine 不走 unified-diff 路径，提前分流到 apply_inline_replace。
-    if let Some(ref envelope) = envelope {
-        if envelope.op == PatchEnvelopeOp::ReplaceInLine {
-            ensure_patch_target_matches(&path, &envelope.target_path)?;
-            emit_stream_line(on_chunk, "applying inline replacement");
-            let original = if path.exists() {
-                emit_stream_line(on_chunk, "reading current file");
-                store.read_to_string().map_err(|err| err.to_string())?
-            } else {
-                return Err(format!(
-                    "Replace in line: target file does not exist: {}",
-                    path.display()
-                ));
-            };
-            let next = apply_inline_replace(&original, envelope)?;
-            emit_stream_line(on_chunk, &format!("writing {} byte(s)", next.len()));
-            store.write_all(&next).map_err(|err| err.to_string())?;
-            let result = format!("Successfully patched {}", path.display());
-            emit_stream_line(on_chunk, &result);
-            return Ok(result);
-        }
-    }
-    let (_, normalized_patch) = if let Some(envelope) = envelope {
-        ensure_patch_target_matches(&path, &envelope.target_path)?;
-        normalize_patch_text(&path, &patch)?
-    } else {
-        (file_path.clone(), patch.clone())
-    };
-
-    let hunk_count = normalized_patch
-        .lines()
-        .filter(|line| line.starts_with("@@"))
-        .count()
-        .max(1);
-    emit_stream_line(on_chunk, &format!("applying {hunk_count} hunk(s)"));
-
+    let hunk_count = patch.lines().filter(|line| line.starts_with("@@")).count().max(1);
+    emit(&format!("applying {hunk_count} hunk(s)"));
     let original = if path.exists() {
-        emit_stream_line(on_chunk, "reading current file");
+        emit("reading current file");
         store.read_to_string().map_err(|err| err.to_string())?
     } else {
-        emit_stream_line(on_chunk, "creating new file from patch");
+        emit("creating new file from patch");
         String::new()
     };
-    let next = apply_unified_patch(&original, &normalized_patch)?;
-
-    emit_stream_line(on_chunk, &format!("writing {} byte(s)", next.len()));
+    let next = apply_unified_patch(&original, &patch)?;
+    emit(&format!("writing {} byte(s)", next.len()));
     store.write_all(&next).map_err(|err| err.to_string())?;
+    let success = format_patch_success(&[path]);
+    emit(&success);
+    Ok(success)
+}
 
-    let result = format!("Successfully patched {}", path.display());
-    emit_stream_line(on_chunk, &result);
-    Ok(result)
+pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
+    execute_apply_patch_impl(args, |_| {})
+}
+
+pub(crate) fn execute_apply_patch_streaming(
+    args: &Value,
+    on_chunk: &mut ToolStreamWriter<'_>,
+) -> Result<String, String> {
+    execute_apply_patch_impl(args, |line| emit_stream_line(on_chunk, line))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         PatchEnvelopeOp, apply_inline_replace, apply_unified_patch, execute_apply_patch,
-        parse_patch_envelope, parse_unified_hunks, strip_code_fence,
+        parse_patch_envelope, parse_patch_envelopes, parse_unified_hunks, strip_code_fence,
     };
     use crate::ai::test_support::ENV_LOCK;
     use std::{fs, path::PathBuf};
@@ -1498,6 +1583,44 @@ mod tests {
         let result = apply_unified_patch(original, patch)
             .expect("trailing blank line in patch should be tolerated");
         assert_eq!(result, "line1\nchanged\nline3\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_tolerates_envelope_end_marker() {
+        // 模型常在 unified-diff hunk 末尾误带 `*** End Patch` 等 envelope 尾标记
+        // （格式混用）。这些标记不属于 unified-diff 内容，应静默结束当前 hunk，
+        // 而不是报 invalid hunk line。
+        let original = "line1\nline2\nline3\n";
+        let patch = "@@ -2,1 +2,1 @@\n-line2\n+changed\n*** End Patch\n";
+        let result = apply_unified_patch(original, patch)
+            .expect("trailing `*** End Patch` marker should be tolerated");
+        assert_eq!(result, "line1\nchanged\nline3\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_rejects_envelope_section_marker_with_hint() {
+        // unified-diff hunk 中混入 `*** Begin Patch` / `*** Update File:` 等开头或
+        // 分节标记，说明 patch 结构混乱。应报错并明确提示"格式混用"，引导模型
+        // 二选一重建，而非笼统的 invalid hunk line。
+        let original = "line1\nline2\nline3\n";
+        let patch = "@@ -2,1 +2,1 @@\n-line2\n+changed\n*** Begin Patch\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("mixed patch formats"), "err was: {err}");
+        assert!(err.contains("*** Begin Patch"), "err was: {err}");
+    }
+
+    #[test]
+    fn apply_unified_patch_rejects_malformed_envelope_trailer_not_silently_applied() {
+        // 安全属性：当 patch 含 `*** Begin Patch` / `*** Update File:` 等 envelope
+        // 标记（即残缺 envelope 误入 unified-diff 路径）时，尾部 `*** End Patch`
+        // 绝不能被静默容忍并把 hunk 应用到 file_path 指定、却非 envelope 声明的
+        // 文件上。必须报"格式混用"错误，由模型重建。即便这里 original 恰好含相同
+        // 上下文（最危险的巧合情形），也必须报错而非写入。
+        let original = "line1\nline2\nline3\n";
+        let patch = "*** Begin Patch\n*** Update File: other.rs\n@@ -2,1 +2,1 @@\n-line2\n+changed\n*** End Patch\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("mixed patch formats"), "err was: {err}");
+        assert!(err.contains("*** End Patch"), "err was: {err}");
     }
 
     #[test]
@@ -2522,6 +2645,70 @@ mod tests {
         });
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "the answer is 99\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn parse_patch_envelopes_accepts_multiple_sections() {
+        let patch = "*** Begin Patch\n\
+            *** Update File: src/a.rs\n\
+            @@\n\
+            -old_a\n\
+            +new_a\n\
+            \n\
+            *** Add File: src/b.rs\n\
+            +hello\n\
+            *** End Patch\n";
+        let envelopes = parse_patch_envelopes(patch)
+            .expect("should parse")
+            .expect("should be Some");
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(envelopes[0].target_path, "src/a.rs");
+        assert_eq!(envelopes[1].target_path, "src/b.rs");
+    }
+
+    #[test]
+    fn execute_apply_patch_supports_multi_file_begin_patch_atomically() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("multi_file_batch");
+        let a = base.join("a.txt");
+        let b = base.join("b.txt");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&a, "old_a\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-old_a\n+new_a\n*** Add File: b.txt\n+hello\n+world\n*** End Patch\n"
+            });
+            let result = execute_apply_patch(&args).expect("multi-file Begin Patch should succeed");
+            assert!(result.starts_with("Successfully patched 2 files:"), "result: {result}");
+        });
+
+        assert_eq!(fs::read_to_string(&a).unwrap(), "new_a\n");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "hello\nworld");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_multi_file_batch_is_atomic_on_failure() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("multi_file_atomic");
+        let a = base.join("a.txt");
+        let b = base.join("b.txt");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&a, "old_a\n").unwrap();
+        fs::write(&b, "current_b\n").unwrap();
+
+        let err = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-old_a\n+new_a\n*** Update File: b.txt\n@@\n-missing_b\n+new_b\n*** End Patch\n"
+            });
+            execute_apply_patch(&args).expect_err("second file mismatch should abort whole batch")
+        });
+
+        assert!(err.contains("failed while preparing patch for"), "err was: {err}");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "old_a\n");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "current_b\n");
         let _ = fs::remove_dir_all(base);
     }
 }

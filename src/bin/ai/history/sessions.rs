@@ -13,8 +13,9 @@ use super::{
     blob::{delete_assets_dir, delete_history_artifacts},
     markdown::messages_to_markdown,
     sqlite::{
-        checkpoint_wal, read_all_messages_sqlite, read_first_user_prompt_sqlite,
-        read_session_title_sqlite, write_session_title_sqlite,
+        backup_sqlite, read_all_messages_sqlite, read_first_user_prompt_sqlite,
+        read_session_title_sqlite, remap_context_checkpoint_paths_sqlite,
+        write_session_title_sqlite,
     },
     types::Message,
 };
@@ -22,7 +23,7 @@ use super::{
 /// 递归复制目录树 `src` -> `dst`（`dst` 不应已存在）。
 /// fork_session 时用于完整复制 assets 目录：checkpoint 正文位于嵌套目录中，
 /// 浅复制会让 fork 后的 marker 指向缺失文件。
-fn copy_dir_recursively(src: &Path, dst: &Path) -> io::Result<()> {
+pub(super) fn copy_dir_recursively(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -139,39 +140,76 @@ impl SessionStore {
     pub(in crate::ai) fn delete_session(&self, session_id: &str) -> io::Result<bool> {
         let path = self.session_history_file(session_id);
         let assets = self.session_assets_dir(session_id);
-        let existed = path.exists();
-        delete_history_artifacts(&path)?;
-        let _ = delete_assets_dir(&assets);
-        Ok(existed)
+        let checkpoints = self.checkpoints_dir(session_id);
+        super::checkpoint::with_checkpoint_lock(&checkpoints, || {
+            let existed = path.exists();
+            delete_history_artifacts(&path)?;
+            delete_assets_dir(&assets)?;
+            remove_dir_if_exists(&checkpoints)?;
+            Ok(existed)
+        })
     }
 
     pub(in crate::ai) fn clear_session(&self, session_id: &str) -> io::Result<()> {
         let path = self.session_history_file(session_id);
         let assets = self.session_assets_dir(session_id);
-        let _ = delete_history_artifacts(&path);
-        let _ = delete_assets_dir(&assets);
-        Ok(())
+        let checkpoints = self.checkpoints_dir(session_id);
+        super::checkpoint::with_checkpoint_lock(&checkpoints, || {
+            delete_history_artifacts(&path)?;
+            delete_assets_dir(&assets)?;
+            remove_dir_if_exists(&checkpoints)?;
+            Ok(())
+        })
     }
 
     pub(in crate::ai) fn clear_session_history(&self, session_id: &str) -> io::Result<()> {
         let path = self.session_history_file(session_id);
-        if path.exists() {
-            super::sqlite::clear_session_history_sqlite(&path)?;
-        }
         let assets = self.session_assets_dir(session_id);
-        let _ = delete_assets_dir(&assets);
-        Ok(())
+        let checkpoints = self.checkpoints_dir(session_id);
+        super::checkpoint::with_checkpoint_lock(&checkpoints, || {
+            if path.exists() {
+                super::sqlite::clear_session_history_sqlite(&path)?;
+            }
+            delete_assets_dir(&assets)?;
+            remove_dir_if_exists(&checkpoints)?;
+            Ok(())
+        })
+    }
+
+    /// 在读取 live session 前恢复被中断的 checkpoint rollback 事务。
+    pub(in crate::ai) fn recover_checkpoint_state(&self, session_id: &str) -> io::Result<()> {
+        super::checkpoint::CheckpointStore::from_session_paths(
+            self.session_history_file(session_id),
+            self.session_assets_dir(session_id),
+            self.checkpoints_dir(session_id),
+        )
+        .recover()
     }
 
     pub(in crate::ai) fn clear_all_sessions(&self) -> io::Result<usize> {
-        let sessions = self.list_sessions()?;
-        let mut deleted = 0usize;
-        for s in sessions {
-            if self.delete_session(&s.id).is_ok() {
-                deleted += 1;
+        let checkpoints_root = self.root.join("checkpoints");
+        super::checkpoint::with_checkpoint_root_exclusive_lock(&checkpoints_root, || {
+            let sessions = self.list_sessions()?;
+            let mut deleted = 0usize;
+            for session in sessions {
+                let path = self.session_history_file(&session.id);
+                let assets = self.session_assets_dir(&session.id);
+                let checkpoints = self.checkpoints_dir(&session.id);
+                let existed = path.exists();
+                let result = (|| {
+                    delete_history_artifacts(&path)?;
+                    delete_assets_dir(&assets)?;
+                    remove_dir_if_exists(&checkpoints)
+                })();
+                if result.is_ok() && existed {
+                    deleted += 1;
+                }
             }
-        }
-        Ok(deleted)
+            // 兼容旧版本留下的孤立 checkpoint 目录：它们没有对应的 `.sqlite`，不会被
+            // `list_sessions` 枚举，但 clear-all 的语义仍应清空全部会话数据。
+            remove_dir_if_exists(&checkpoints_root)?;
+            Ok(deleted)
+        })
     }
 
     pub(in crate::ai) fn first_user_prompt(&self, session_id: &str) -> io::Result<Option<String>> {
@@ -225,38 +263,65 @@ impl SessionStore {
         read_all_messages_sqlite(&path)
     }
 
-    /// 把 `src` session 整体复制到 `dst` 作为新分支。原 session 不动。
-    /// 拒绝覆盖已有 dst（避免误覆盖）。assets 目录如果存在也递归复制。
-    pub(in crate::ai) fn fork_session(&self, src: &str, dst: &str) -> io::Result<()> {
+    /// 在持有源、目标 session 锁时复制完整 state，并允许调用者继续修改新分支。
+    /// 多 session 锁按目录排序获取，避免两个反向 fork 互相等待。
+    fn fork_session_with<T>(
+        &self,
+        src: &str,
+        dst: &str,
+        after_fork: impl FnOnce(&Path) -> io::Result<T>,
+    ) -> io::Result<T> {
         let src_path = self.session_history_file(src);
-        if !src_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("source session '{src}' not found"),
-            ));
-        }
         let dst_path = self.session_history_file(dst);
         let src_assets = self.session_assets_dir(src);
         let dst_assets = self.session_assets_dir(dst);
-        if dst_path.exists() || dst_assets.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("destination session '{dst}' already exists"),
-            ));
-        }
+        let src_checkpoints = self.checkpoints_dir(src);
+        let dst_checkpoints = self.checkpoints_dir(dst);
         self.ensure_root_dir()?;
-        fs::copy(&src_path, &dst_path)?;
+        super::checkpoint::with_checkpoint_locks(
+            &[src_checkpoints.as_path(), dst_checkpoints.as_path()],
+            || {
+                if !src_path.exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("source session '{src}' not found"),
+                    ));
+                }
+                if dst_path.exists() || dst_assets.exists() || dst_checkpoints.exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("destination session '{dst}' already exists"),
+                    ));
+                }
+                backup_sqlite(&src_path, &dst_path)?;
 
-        // assets 目录是可选的；若存在则必须完整复制。checkpoint 正文位于嵌套
-        // 目录中，浅复制会让 fork 后的 marker 指向缺失文件。
-        if src_assets.is_dir() {
-            if let Err(error) = copy_dir_recursively(&src_assets, &dst_assets) {
-                let _ = fs::remove_file(&dst_path);
-                let _ = fs::remove_dir_all(&dst_assets);
-                return Err(error);
-            }
-        }
-        Ok(())
+                // assets 目录是可选的；若存在则必须完整复制。checkpoint 正文位于嵌套
+                // 目录中，浅复制会让 fork 后的 marker 指向缺失文件。
+                if src_assets.is_dir() {
+                    if let Err(error) = copy_dir_recursively(&src_assets, &dst_assets) {
+                        let _ = delete_history_artifacts(&dst_path);
+                        let _ = fs::remove_dir_all(&dst_assets);
+                        return Err(error);
+                    }
+                    if let Err(error) = remap_context_checkpoint_paths_sqlite(
+                        &dst_path,
+                        Some(&src_assets),
+                        &dst_assets,
+                    ) {
+                        let _ = delete_history_artifacts(&dst_path);
+                        let _ = fs::remove_dir_all(&dst_assets);
+                        return Err(error);
+                    }
+                }
+                after_fork(&dst_path)
+            },
+        )
+    }
+
+    /// 把 `src` session 整体复制到 `dst` 作为新分支。原 session 不动。
+    /// 拒绝覆盖已有 dst（避免误覆盖）。assets 目录如果存在也递归复制。
+    pub(in crate::ai) fn fork_session(&self, src: &str, dst: &str) -> io::Result<()> {
+        self.fork_session_with(src, dst, |_| Ok(()))
     }
 
     /// 在 `src` 之上分支，并把分支保留到第 `keep_messages` 条消息（按 id 升序）。
@@ -267,10 +332,9 @@ impl SessionStore {
         dst: &str,
         keep_messages: usize,
     ) -> io::Result<()> {
-        self.fork_session(src, dst)?;
-        let dst_path = self.session_history_file(dst);
-        super::sqlite::truncate_messages_sqlite(&dst_path, keep_messages)?;
-        Ok(())
+        self.fork_session_with(src, dst, |dst_path| {
+            super::sqlite::truncate_messages_sqlite(dst_path, keep_messages)
+        })
     }
 
     pub(in crate::ai) fn export_session_to_markdown(
@@ -310,49 +374,58 @@ impl SessionStore {
         output_path: &Path,
     ) -> io::Result<()> {
         let sqlite_path = self.session_history_file(session_id);
-        if !sqlite_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("session '{session_id}' not found"),
-            ));
-        }
+        let checkpoints = self.checkpoints_dir(session_id);
+        super::checkpoint::with_checkpoint_lock(&checkpoints, || {
+            if !sqlite_path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("session '{session_id}' not found"),
+                ));
+            }
 
-        // WAL checkpoint：把 -wal 中的数据合并进主库，确保 zip 里的 .sqlite 是完整的。
-        let _ = checkpoint_wal(&sqlite_path);
+            let snapshot = self
+                .root
+                .join(format!(".session-archive-{}.sqlite", uuid::Uuid::new_v4()));
+            backup_sqlite(&sqlite_path, &snapshot)?;
 
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+            let result = (|| {
+                if let Some(parent) = output_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
 
-        let file = File::create(output_path)?;
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+                let file = File::create(output_path)?;
+                let mut zip = zip::ZipWriter::new(file);
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
 
-        // manifest.json
-        let manifest = json!({
-            "version": 1u32,
-            "session_id": session_id,
-            "created_at": Local::now().to_rfc3339(),
-        });
-        zip.start_file("manifest.json", options)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        zip.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
+                // manifest.json
+                let manifest = json!({
+                    "version": 1u32,
+                    "session_id": session_id,
+                    "created_at": Local::now().to_rfc3339(),
+                });
+                zip.start_file("manifest.json", options)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                zip.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
 
-        // session.sqlite
-        zip.start_file("session.sqlite", options)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let mut sqlite_file = File::open(&sqlite_path)?;
-        std::io::copy(&mut sqlite_file, &mut zip)?;
+                // session.sqlite
+                zip.start_file("session.sqlite", options)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut sqlite_file = File::open(&snapshot)?;
+                std::io::copy(&mut sqlite_file, &mut zip)?;
 
-        // assets/（可选）
-        let assets_dir = self.session_assets_dir(session_id);
-        if assets_dir.is_dir() {
-            add_dir_to_zip(&mut zip, &assets_dir, "assets", options)?;
-        }
+                // assets/（可选）
+                let assets_dir = self.session_assets_dir(session_id);
+                if assets_dir.is_dir() {
+                    add_dir_to_zip(&mut zip, &assets_dir, "assets", options)?;
+                }
 
-        zip.finish().map_err(|e| io::Error::other(e.to_string()))?;
-        Ok(())
+                zip.finish().map_err(|e| io::Error::other(e.to_string()))?;
+                Ok(())
+            })();
+            let _ = delete_history_artifacts(&snapshot);
+            result
+        })
     }
 
     /// 从 zip 归档导入 session。
@@ -381,54 +454,72 @@ impl SessionStore {
         let _ = manifest; // 仅用于校验，不强制使用原 id
 
         let dst_sqlite = self.session_history_file(dst_id);
-        if dst_sqlite.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("destination session '{dst_id}' already exists"),
-            ));
-        }
-
-        self.ensure_root_dir()?;
-
-        // 解压 session.sqlite
-        {
-            let mut entry = archive.by_name("session.sqlite").map_err(|e| {
-                io::Error::other(format!("session.sqlite not found in archive: {e}"))
-            })?;
-            let mut out = File::create(&dst_sqlite)?;
-            std::io::copy(&mut entry, &mut out)?;
-        }
-
-        // 解压 assets/（如果存在）
         let dst_assets = self.session_assets_dir(dst_id);
-        for i in 0..archive.len() {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let name = entry.name().to_string();
-            if name == "manifest.json" || name == "session.sqlite" {
-                continue;
+        let dst_checkpoints = self.checkpoints_dir(dst_id);
+        self.ensure_root_dir()?;
+        super::checkpoint::with_checkpoint_lock(&dst_checkpoints, || {
+            if dst_sqlite.exists() || dst_assets.exists() || dst_checkpoints.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("destination session '{dst_id}' already exists"),
+                ));
             }
-            // 只处理 assets/ 前缀的条目
-            let Some(rel) = name.strip_prefix("assets/") else {
-                continue;
-            };
-            if rel.is_empty() || rel.ends_with('/') {
-                continue;
-            }
-            let out_path = dst_assets.join(rel);
-            if entry.is_dir() {
-                fs::create_dir_all(&out_path)?;
-                continue;
-            }
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut out = File::create(&out_path)?;
-            std::io::copy(&mut entry, &mut out)?;
-        }
 
-        Ok(dst_id.to_string())
+            let result = (|| {
+                // 解压 session.sqlite
+                {
+                    let mut entry = archive.by_name("session.sqlite").map_err(|e| {
+                        io::Error::other(format!("session.sqlite not found in archive: {e}"))
+                    })?;
+                    let mut out = File::create(&dst_sqlite)?;
+                    std::io::copy(&mut entry, &mut out)?;
+                }
+
+                // 解压 assets/（如果存在）
+                for i in 0..archive.len() {
+                    let mut entry = archive
+                        .by_index(i)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let name = entry.name().to_string();
+                    if name == "manifest.json" || name == "session.sqlite" {
+                        continue;
+                    }
+                    // 只处理 assets/ 前缀的条目
+                    let Some(rel) = name.strip_prefix("assets/") else {
+                        continue;
+                    };
+                    if rel.is_empty() || rel.ends_with('/') {
+                        continue;
+                    }
+                    let out_path = dst_assets.join(rel);
+                    if entry.is_dir() {
+                        fs::create_dir_all(&out_path)?;
+                        continue;
+                    }
+                    if let Some(parent) = out_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let mut out = File::create(&out_path)?;
+                    std::io::copy(&mut entry, &mut out)?;
+                }
+
+                remap_context_checkpoint_paths_sqlite(&dst_sqlite, None, &dst_assets)?;
+                Ok(dst_id.to_string())
+            })();
+            if result.is_err() {
+                let _ = delete_history_artifacts(&dst_sqlite);
+                let _ = delete_assets_dir(&dst_assets);
+            }
+            result
+        })
+    }
+}
+
+fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -781,8 +872,33 @@ fn strip_filler_prefixes(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        generate_session_summary, is_low_quality_session_title, normalize_generated_session_title,
+        SessionStore, generate_session_summary, is_low_quality_session_title,
+        normalize_generated_session_title,
     };
+    use crate::ai::history::{Message, append_history_messages};
+    use serde_json::Value;
+    use std::{fs, path::PathBuf};
+
+    fn temp_history_file() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ai-session-test-{}-{}.sqlite",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn checkpoint_marker(path: &std::path::Path) -> Message {
+        Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(format!(
+                "[context_checkpoint path={}] durable state",
+                path.display()
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
 
     #[test]
     fn session_title_fallback_strips_compound_filler_prefixes() {
@@ -806,5 +922,89 @@ mod tests {
         );
 
         assert!(!is_low_quality_session_title("session title 问题排查"));
+    }
+
+    #[test]
+    fn fork_copies_checkpoint_assets_and_remaps_marker_paths() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let source_id = "source";
+        let target_id = "target";
+        let source_db = store.session_history_file(source_id);
+        let source_asset = store
+            .session_assets_dir(source_id)
+            .join("context-checkpoints")
+            .join("durable.md");
+        fs::create_dir_all(source_asset.parent().unwrap()).unwrap();
+        fs::write(&source_asset, "source checkpoint body").unwrap();
+        append_history_messages(&source_db, &[checkpoint_marker(&source_asset)]).unwrap();
+
+        store.fork_session(source_id, target_id).unwrap();
+
+        let target_asset = store
+            .session_assets_dir(target_id)
+            .join("context-checkpoints")
+            .join("durable.md");
+        let target_messages = store.read_all_messages(target_id).unwrap();
+        assert_eq!(target_messages.len(), 1);
+        assert!(
+            target_messages[0]
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .contains(target_asset.to_string_lossy().as_ref())
+        );
+        fs::remove_dir_all(store.session_assets_dir(source_id)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target_asset).unwrap(),
+            "source checkpoint body"
+        );
+
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn archive_import_remaps_checkpoint_marker_paths() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let source_id = "source";
+        let target_id = "imported";
+        let source_db = store.session_history_file(source_id);
+        let source_asset = store
+            .session_assets_dir(source_id)
+            .join("context-checkpoints")
+            .join("durable.md");
+        fs::create_dir_all(source_asset.parent().unwrap()).unwrap();
+        fs::write(&source_asset, "archived checkpoint body").unwrap();
+        append_history_messages(&source_db, &[checkpoint_marker(&source_asset)]).unwrap();
+
+        let archive = std::env::temp_dir().join(format!(
+            "ai-session-archive-test-{}.zip",
+            uuid::Uuid::new_v4()
+        ));
+        store.export_session_archive(source_id, &archive).unwrap();
+        store.import_session_archive(&archive, target_id).unwrap();
+
+        let target_asset = store
+            .session_assets_dir(target_id)
+            .join("context-checkpoints")
+            .join("durable.md");
+        let target_messages = store.read_all_messages(target_id).unwrap();
+        assert_eq!(target_messages.len(), 1);
+        assert!(
+            target_messages[0]
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .contains(target_asset.to_string_lossy().as_ref())
+        );
+        fs::remove_dir_all(store.session_assets_dir(source_id)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target_asset).unwrap(),
+            "archived checkpoint body"
+        );
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(store.sessions_root());
     }
 }

@@ -741,12 +741,15 @@ fn append_tool_call_arguments(
     }
 }
 
+/// 消费内部工具调用流事件。返回值表示本批事件里是否检出了模型幻觉的内部工具协议
+/// 标记（`HallucinatedProtocolMarker`）——调用方据此停流并降档重试。
 fn process_internal_tool_calls(
     app: &mut App,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
     internal_tool_call_events: Vec<InternalToolCallStreamEvent>,
-) {
+) -> bool {
+    let mut saw_hallucinated_marker = false;
     for event in internal_tool_call_events {
         match event {
             InternalToolCallStreamEvent::Begin(function_name) => {
@@ -791,8 +794,14 @@ fn process_internal_tool_calls(
                 }
                 state.content.internal_tool_call_idx += 1;
             }
+            InternalToolCallStreamEvent::HallucinatedProtocolMarker => {
+                // streamer 已把整块幻觉「工具结果」剥离不外显；这里只记录信号，
+                // 由调用方停流并走 degenerate_repetition 降档重试路径。
+                saw_hallucinated_marker = true;
+            }
         }
     }
+    saw_hallucinated_marker
 }
 
 fn commit_visible_content(
@@ -892,7 +901,9 @@ fn flush_inline_markup_normalizer(
     tool_events.extend(anthropic_events);
     tool_events.extend(bare_xml_events);
     if !tool_events.is_empty() {
-        process_internal_tool_calls(app, markers, state, tool_events);
+        // 冲刷阶段流已结束，无法再停流重试；此处即便检出幻觉标记，streamer 也已把
+        // 整块剥离，cleaned 不含协议标记，直接忽略返回值即可（不落盘幻觉正文）。
+        let _ = process_internal_tool_calls(app, markers, state, tool_events);
     }
     if !cleaned.is_empty() {
         let content = normalize_stream_text(cleaned);
@@ -1295,41 +1306,51 @@ fn process_stream_payload(
 
     state.content.empty_choice_chunks = 0;
 
-    // `.done` reasoning 事件会把整段推理摘要作为 SnapshotChunk 再发一次（见
-    // normalize::textual_event_chunk）。可见 assistant 文本靠 stream_text_event_to_content
-    // 的 unseen_suffix 去重，但 reasoning 文本在累积（下方 reasoning_text.push_str）与
-    // extract_chunk_events_streaming 里都按 Append 处理，snapshot 会导致 thinking 重复
-    // 输出。这里在两处消费前，把 snapshot 的 reasoning_content 收敛为未见后缀。
-    if matches!(merge_mode, StreamEventMergeMode::AppendMissingSuffix) {
-        if let Some(choice) = chunk.choices.first_mut() {
-            if !choice.delta.reasoning_content.is_empty() {
-                let suffix = unseen_suffix(
-                    &state.content.reasoning_text,
-                    &choice.delta.reasoning_content,
-                );
-                choice.delta.reasoning_content = suffix;
+    // reasoning_content 去重：Responses API 对同一段推理摘要会通过多条事件路径重复
+    // 下发（reasoning_summary_text.{delta,done} 与 content_part.{added,done} 的
+    // summary_text 携带相同内容）。此前仅对 SnapshotChunk（.done）做未见后缀去重，
+    // Append 模式（.delta/.added）的 reasoning_content 未去重，导致跨事件路径的
+    // thinking 重复输出。这里统一对两种模式计算未见后缀，渲染时只输出新增部分。
+    //
+    // 累积到 reasoning_text 时区分模式：Append 累积原文以保留模型复读循环的退化检测
+    // （has_degenerate_reasoning_repetition 依赖连续重复）；Snapshot 累积去重后缀
+    // （快照是已见文本的重发，原文已在 Append 阶段累积过）。
+    let original_reasoning = chunk
+        .choices
+        .first()
+        .map(|c| c.delta.reasoning_content.clone())
+        .unwrap_or_default();
+    let deduped_reasoning = if !original_reasoning.is_empty() {
+        unseen_suffix(&state.content.reasoning_text, &original_reasoning)
+    } else {
+        String::new()
+    };
+
+    if !original_reasoning.is_empty() {
+        state.content.saw_reasoning_output = true;
+        match merge_mode {
+            StreamEventMergeMode::Append => {
+                state.content.reasoning_text.push_str(&original_reasoning);
             }
+            StreamEventMergeMode::AppendMissingSuffix => {
+                state.content.reasoning_text.push_str(&deduped_reasoning);
+            }
+        }
+
+        // 某些长工具链上下文会诱发模型在 thinking 中逐字复读同一句话。继续读取只会
+        // 消耗输出预算并让终端看似卡死；升级为可重试截断，交给上层降低推理档位。
+        if has_degenerate_repetition(&state.content.reasoning_text) {
+            state.content.finish_reason_seen = true;
+            state.content.finish_reason_value =
+                Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
+            eprintln!("\n  ⚠ 检测到模型推理重复循环，停止当前响应并自动重试…");
+            return Ok(true);
         }
     }
 
-    if let Some(choice) = chunk.choices.first() {
-        if !choice.delta.reasoning_content.is_empty() {
-            state.content.saw_reasoning_output = true;
-            state
-                .content
-                .reasoning_text
-                .push_str(&choice.delta.reasoning_content);
-
-            // 某些长工具链上下文会诱发模型在 thinking 中逐字复读同一句话。继续读取只会
-            // 消耗输出预算并让终端看似卡死；升级为可重试截断，交给上层降低推理档位。
-            if has_degenerate_reasoning_repetition(&state.content.reasoning_text) {
-                state.content.finish_reason_seen = true;
-                state.content.finish_reason_value =
-                    Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
-                eprintln!("\n  ⚠ 检测到模型推理重复循环，停止当前响应并自动重试…");
-                return Ok(true);
-            }
-        }
+    // 渲染消费去重后的后缀，避免跨事件路径的 thinking 重复输出。
+    if let Some(choice) = chunk.choices.first_mut() {
+        choice.delta.reasoning_content = deduped_reasoning;
     }
 
     process_external_tool_calls_delta(app, markers, state, &chunk, merge_mode);
@@ -1346,7 +1367,19 @@ fn process_stream_payload(
         &mut state.content.bare_xml_tool_call_streamer,
         &mut state.content.inline_markup_normalizer,
     );
-    process_internal_tool_calls(app, markers, state, internal_tool_call_events);
+    let saw_hallucinated_marker =
+        process_internal_tool_calls(app, markers, state, internal_tool_call_events);
+    if saw_hallucinated_marker {
+        // 模型在可见正文里自编自演「工具调用→工具结果」，吐出系统从不生成的内部
+        // 协议标记（`<function_results>` 等）。streamer 已把整块剥离，这里停流并复用
+        // degenerate_repetition 降档重试路径，避免幻觉正文落盘毒化下一轮请求。这是
+        // 零误伤信号：合法重复代码/措辞永不含内部协议标记，无需任何文本统计阈值。
+        state.content.finish_reason_seen = true;
+        state.content.finish_reason_value =
+            Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
+        eprintln!("\n  ⚠ 检测到模型伪造工具结果标记（输出退化），停止当前响应并自动重试…");
+        return Ok(true);
+    }
 
     if events.is_empty() {
         return Ok(false);
@@ -1369,6 +1402,19 @@ fn process_stream_payload(
                     continue;
                 }
                 commit_visible_content(app, current_history, markers, state, content)?;
+
+                // 与 reasoning 路径对称：模型也会在**可见输出**里退化成逐字复读同一
+                // 短语（本次事故即 assistant content 复读「我再重新读一遍…」直到撑满
+                // 输出预算，产出 16 万字符垃圾并落盘，毒化下一轮请求触发 provider
+                // 400 InvalidParameter）。此前退化守卫只挂在 reasoning_content 上，
+                // 可见文本完全失守。命中即置 finish_reason 并停流，交给上层降档重试。
+                if has_degenerate_repetition(&state.content.assistant_text) {
+                    state.content.finish_reason_seen = true;
+                    state.content.finish_reason_value =
+                        Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
+                    eprintln!("\n  ⚠ 检测到模型输出重复循环，停止当前响应并自动重试…");
+                    return Ok(true);
+                }
             }
         }
     }
@@ -1379,11 +1425,13 @@ fn process_stream_payload(
     Ok(false)
 }
 
-/// 检测 reasoning 尾部是否出现三次连续、完全相同的长片段。
+/// 检测文本尾部是否出现三次连续、完全相同的长片段（退化复读循环）。
 ///
+/// 同时用于 reasoning_content 与可见 assistant 输出：模型在长工具链上下文下可能
+/// 在思考链或正文里逐字复读同一句话，继续读取只会耗尽输出预算并把垃圾落盘。
 /// 使用字符而非字节比较以正确处理中文；要求片段包含足够多的字母、数字或中文等实际
 /// 内容，避免把分隔线、空白或 Markdown 标点误判为退化循环。
-fn has_degenerate_reasoning_repetition(text: &str) -> bool {
+fn has_degenerate_repetition(text: &str) -> bool {
     // 每个流 chunk 都会调用该检测，因此只保留足以覆盖最大候选片段的尾部，避免长推理
     // 随上下文增长退化成反复扫描整段文本。
     let mut chars = text

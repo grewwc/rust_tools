@@ -19,6 +19,12 @@ const SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS: usize = 4_000;
 static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
 
+/// 标题任务必须从基础 history 文件推导 sessions 根目录；不能传入当前 session
+/// 数据库的父目录，否则会错误地拼接出嵌套的 `.sessions` 路径。
+fn session_title_store(history_file: &std::path::Path) -> crate::ai::history::SessionStore {
+    crate::ai::history::SessionStore::new(history_file)
+}
+
 fn ensure_final_assistant_recorded(
     final_assistant_text: &str,
     final_assistant_recorded: bool,
@@ -388,10 +394,7 @@ pub(super) async fn finalize_turn(
 
 /// 在 turn 结束后尝试用 LLM 生成 session 概括性标题。
 /// 条件：至少有 1 个 user turn，且没有已生成标题或现有标题质量过低。
-pub(in crate::ai::driver::turn_runtime) async fn maybe_generate_session_title(
-    app: &App,
-    run_in_background: bool,
-) {
+pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: bool) {
     if !mark_session_title_generation_started(&app.session_id) {
         return;
     }
@@ -411,16 +414,13 @@ pub(in crate::ai::driver::turn_runtime) async fn maybe_generate_session_title(
 }
 
 async fn generate_session_title_if_missing(app: &App) {
-    use crate::ai::history::{
-        SessionStore, is_low_quality_session_title, normalize_generated_session_title,
-    };
+    use crate::ai::history::{is_low_quality_session_title, normalize_generated_session_title};
     // eprintln!("[session-title] checking: session_id={} history_file={}", app.session_id, app.session_history_file.display());
 
-    let sessions_dir = app
-        .session_history_file
-        .parent()
-        .unwrap_or_else(|| app.session_history_file.as_path());
-    let store = SessionStore::new(sessions_dir);
+    // SessionStore 接收基础 history 文件，并据此推导 `<stem>.sessions/`。
+    // 传入当前 session sqlite 的父目录会额外拼出一层 `.sessions`，导致标题任务
+    // 读取不到当前会话的消息。
+    let store = session_title_store(&app.config.history_file);
 
     if let Some(existing_title) = store.read_session_title(&app.session_id).ok().flatten() {
         if !is_low_quality_session_title(&existing_title) {
@@ -600,5 +600,15 @@ mod tests {
         assert!(!should_generate_session_title_in_background(true, false));
         assert!(!should_generate_session_title_in_background(false, true));
         assert!(!should_generate_session_title_in_background(true, true));
+    }
+
+    #[test]
+    fn session_title_store_reads_active_session_from_base_history_file() {
+        let store = session_title_store(std::path::Path::new("/tmp/a.history.sqlite"));
+
+        assert_eq!(
+            store.session_history_file("current-session"),
+            std::path::Path::new("/tmp/a.history.sessions/current-session.sqlite")
+        );
     }
 }

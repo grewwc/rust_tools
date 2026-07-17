@@ -12,6 +12,7 @@ use crate::ai::tools::common::{
     ToolRegistration, ToolSpec,
 };
 use crate::ai::tools::search_tools::execute_find_path;
+use crate::ai::tools::storage::file_store::FileStore;
 use crate::ai::tools::text_grep_tools::{ContentSearchOptions, run_content_search};
 
 const CODE_EXTENSIONS: &[&str] = &[
@@ -181,14 +182,22 @@ fn nonempty_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+/// 模型经常为未使用的可选参数发送空字符串。路径参数不能把空值当作真实文件：
+/// 它既不指向文件，也会覆盖有效的 `path` 搜索根。统一按 FileStore 解析，以便
+/// `code_search` 与 read/write/patch 工具共享 `effective_cwd()` 和 `~` 语义。
+fn resolve_code_search_path(raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    let raw = if raw.is_empty() { "." } else { raw };
+    FileStore::new(PathBuf::from(raw)).path().to_path_buf()
+}
+
 /// 守卫一个 `path` 字符串参数：解析为绝对路径后调用
 /// [`text_grep_tools::validate_search_root`]，拒绝 `/` 与系统目录。
 /// 路径不存在时不在这里报错，留给下游函数按各自语义处理。
 fn guard_path_arg(raw: &str) -> Result<(), String> {
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
         .map_err(|e| format!("Failed to get cwd: {}", e))?;
-    let p = PathBuf::from(raw);
-    let abs = if p.is_absolute() { p } else { cwd.join(p) };
+    let abs = resolve_code_search_path(raw);
     super::text_grep_tools::validate_search_root(&abs, &cwd)
 }
 
@@ -338,7 +347,7 @@ fn execute_code_find_file(args: &Value) -> Result<String, String> {
         .as_str()
         .or_else(|| args["query"].as_str())
         .ok_or("find_file requires 'pattern' or 'query'")?;
-    let path = args["path"].as_str().unwrap_or(".");
+    let path = nonempty_str_arg(args, "path").unwrap_or(".");
     guard_path_arg(path)?;
     let forwarded = serde_json::json!({
         "pattern": pattern,
@@ -397,8 +406,8 @@ fn execute_code_text_search(args: &Value) -> Result<String, String> {
 }
 
 fn text_search_target(args: &Value) -> Result<PathBuf, String> {
-    if let Some(file_path) = args["file_path"].as_str() {
-        let path = PathBuf::from(file_path);
+    if let Some(file_path) = nonempty_str_arg(args, "file_path") {
+        let path = resolve_code_search_path(file_path);
         if !path.exists() {
             return Err(format!("File not found: {}", file_path));
         }
@@ -411,13 +420,10 @@ fn text_search_target(args: &Value) -> Result<PathBuf, String> {
         return Ok(path);
     }
 
-    let raw = args["path"].as_str().unwrap_or(".");
+    let raw = nonempty_str_arg(args, "path").unwrap_or(".");
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
         .map_err(|e| format!("Failed to get cwd: {}", e))?;
-    let path = {
-        let p = PathBuf::from(raw);
-        if p.is_absolute() { p } else { cwd.join(p) }
-    };
+    let path = resolve_code_search_path(raw);
     if !path.exists() {
         return Err(format!("Path not found: {}", path.display()));
     }
@@ -472,7 +478,7 @@ fn execute_code_workspace_symbol(args: &Value) -> Result<String, String> {
         "query": query,
     });
     let result = execute_lsp(&forwarded)?;
-    let fallback_path = args["path"].as_str().unwrap_or(".");
+    let fallback_path = nonempty_str_arg(args, "path").unwrap_or(".");
     render_workspace_symbol_with_fallback(args, query, result, fallback_path)
 }
 
@@ -490,19 +496,20 @@ fn execute_code_document_symbol(args: &Value) -> Result<String, String> {
 }
 
 fn execute_code_lsp_with_file(args: &Value, operation: &str) -> Result<String, String> {
-    let file_path = match args["file_path"].as_str() {
+    let file_path = match nonempty_str_arg(args, "file_path") {
         Some(fp) => {
-            if !Path::new(fp).exists() {
+            let path = resolve_code_search_path(fp);
+            if !path.exists() {
                 return Err(format!("File not found: {}", fp));
             }
-            fp.to_string()
+            path.to_string_lossy().to_string()
         }
         None => {
             if let Some(query) = args["query"].as_str() {
                 return fallback_lsp_to_workspace_symbol(args, operation, query);
             }
             return Err(format!(
-                "{} requires 'file_path' (with 'line'/'column') or 'query' to fall back to a workspace symbol search",
+                "{} requires a non-empty 'file_path' (with 'line'/'column') or 'query' to fall back to a workspace symbol search",
                 operation
             ));
         }
@@ -557,7 +564,7 @@ fn fallback_lsp_to_workspace_symbol(
         "query": query,
     });
     let result = execute_lsp(&forwarded)?;
-    let fallback_path = args["path"].as_str().unwrap_or(".");
+    let fallback_path = nonempty_str_arg(args, "path").unwrap_or(".");
     let rendered = render_workspace_symbol_with_fallback(args, query, result, fallback_path)?;
     Ok(format!(
         "{}\ncontext: original operation was '{}' and file_path was not provided.",
@@ -623,40 +630,41 @@ fn execute_code_structural(args: &Value) -> Result<String, String> {
     Ok(sections.join("\n\n"))
 }
 
-fn require_file_path<'a>(args: &'a Value, operation: &str) -> Result<&'a str, String> {
-    let file_path = args["file_path"]
-        .as_str()
-        .ok_or_else(|| format!("{} requires 'file_path'", operation))?;
-    if !Path::new(file_path).exists() {
+fn require_file_path(args: &Value, operation: &str) -> Result<String, String> {
+    let file_path = nonempty_str_arg(args, "file_path")
+        .ok_or_else(|| format!("{} requires a non-empty 'file_path'", operation))?;
+    let path = resolve_code_search_path(file_path);
+    if !path.exists() {
         return Err(format!("File not found: {}", file_path));
     }
-    Ok(file_path)
+    Ok(path.to_string_lossy().to_string())
 }
 
 fn structural_target(args: &Value) -> Result<String, String> {
-    if let Some(file_path) = args["file_path"].as_str() {
-        let p = PathBuf::from(file_path);
+    if let Some(file_path) = nonempty_str_arg(args, "file_path") {
+        let p = resolve_code_search_path(file_path);
         if p.is_dir() {
             guard_path_arg(file_path)?;
         }
-        return Ok(file_path.to_string());
+        return Ok(p.to_string_lossy().to_string());
     }
-    let path = args["path"].as_str().unwrap_or(".");
+    let path = nonempty_str_arg(args, "path").unwrap_or(".");
     guard_path_arg(path)?;
-    Ok(path.to_string())
+    Ok(resolve_code_search_path(path).to_string_lossy().to_string())
 }
 
 fn resolve_anchor_file(args: &Value) -> Result<String, String> {
-    if let Some(file_path) = args["file_path"].as_str() {
-        if Path::new(file_path).exists() {
-            return Ok(file_path.to_string());
+    if let Some(file_path) = nonempty_str_arg(args, "file_path") {
+        let path = resolve_code_search_path(file_path);
+        if path.exists() {
+            return Ok(path.to_string_lossy().to_string());
         }
         return Err(format!("File not found: {}", file_path));
     }
 
-    let raw_path = args["path"].as_str().unwrap_or(".");
+    let raw_path = nonempty_str_arg(args, "path").unwrap_or(".");
     guard_path_arg(raw_path)?;
-    let root = PathBuf::from(raw_path);
+    let root = resolve_code_search_path(raw_path);
     let anchor = find_code_anchor_file(&root).ok_or_else(|| {
         format!(
             "Could not find a source file under '{}' to use as an LSP workspace anchor.",
@@ -742,36 +750,38 @@ pub(crate) fn execute_lsp(args: &Value) -> Result<String, String> {
         .as_str()
         .ok_or("Missing 'operation' parameter")?;
 
-    let file_path = args["file_path"]
-        .as_str()
-        .ok_or("Missing 'file_path' parameter")?;
+    let raw_file_path =
+        nonempty_str_arg(args, "file_path").ok_or("Missing non-empty 'file_path' parameter")?;
+    let file_path = resolve_code_search_path(raw_file_path)
+        .to_string_lossy()
+        .to_string();
 
-    if !Path::new(file_path).exists() {
-        return Err(format!("File not found: {}", file_path));
+    if !Path::new(&file_path).exists() {
+        return Err(format!("File not found: {}", raw_file_path));
     }
 
     match operation {
         "go_to_definition" => {
-            let symbol = resolve_target_symbol(args, file_path)?;
-            lsp_go_to_definition(file_path, &symbol)
+            let symbol = resolve_target_symbol(args, &file_path)?;
+            lsp_go_to_definition(&file_path, &symbol)
         }
         "find_references" => {
-            let symbol = resolve_target_symbol(args, file_path)?;
-            lsp_find_references(file_path, &symbol)
+            let symbol = resolve_target_symbol(args, &file_path)?;
+            lsp_find_references(&file_path, &symbol)
         }
         "hover" => {
             let line = args["line"].as_u64().ok_or("Missing 'line' for hover")?;
             let column = args["column"].as_u64().unwrap_or(1);
-            lsp_hover(file_path, line as usize, column as usize)
+            lsp_hover(&file_path, line as usize, column as usize)
         }
-        "document_symbol" => lsp_document_symbols(file_path),
+        "document_symbol" => lsp_document_symbols(&file_path),
         "workspace_symbol" => {
             let query = args["query"]
                 .as_str()
                 .ok_or("Missing 'query' for workspace_symbol")?;
-            lsp_workspace_symbol(file_path, query)
+            lsp_workspace_symbol(&file_path, query)
         }
-        "diagnostics" => lsp_diagnostics(file_path),
+        "diagnostics" => lsp_diagnostics(&file_path),
         other => Err(format!("Unknown LSP operation: {}", other)),
     }
 }
@@ -1337,6 +1347,71 @@ mod tests {
         assert!(result.contains("fn beta() {}"));
         assert!(!result.contains("skip.txt"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_search_ignores_empty_optional_file_path() {
+        let dir = make_temp_dir("empty_file_path_text");
+        fs::write(dir.join("sample.rs"), "fn marker_function() {}\n").unwrap();
+
+        // 复现模型按 schema 填充所有字段时，把未使用的 file_path 传成 ""。
+        // 空 file_path 必须视为缺失，继续使用有效的目录 path 搜索。
+        let args = serde_json::json!({
+            "operation": "text_search",
+            "file_path": "",
+            "path": dir.to_string_lossy(),
+            "file_pattern": "**/*.rs",
+            "query": "marker_function",
+            "intent": "find_functions",
+            "name": "",
+            "contains_text": "",
+            "call_kind": "function_call",
+            "receiver": "",
+            "qualified_name": ""
+        });
+        let result = execute_code_search(&args).expect("empty file_path must not mask path");
+
+        assert!(result.contains("sample.rs"), "{result}");
+        assert!(result.contains("marker_function"), "{result}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn structural_search_ignores_empty_optional_file_path() {
+        let dir = make_temp_dir("empty_file_path_structural");
+        fs::write(dir.join("sample.rs"), "fn marker_function() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "operation": "structural",
+            "file_path": "",
+            "path": dir.to_string_lossy(),
+            "intent": "find_functions",
+            "name": "marker_function",
+            "query": ""
+        });
+        let result = execute_code_search(&args).expect("empty file_path must not mask path");
+
+        assert!(result.contains("marker_function"), "{result}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_symbol_ignores_empty_optional_file_path() {
+        let dir = make_temp_dir("empty_file_path_symbol");
+        fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/lib.rs"), "fn marker_function() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "operation": "workspace_symbol",
+            "file_path": "",
+            "path": dir.to_string_lossy(),
+            "query": "marker_function"
+        });
+        let result = execute_code_search(&args).expect("empty file_path must not mask path");
+
+        assert!(result.contains("marker_function"), "{result}");
         let _ = fs::remove_dir_all(&dir);
     }
 

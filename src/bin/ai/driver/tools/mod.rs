@@ -1,5 +1,3 @@
-use crate::ai::tools::os_tools::GLOBAL_OS;
-use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use aios_kernel::kernel::WaitPolicy;
 use chrono::{DateTime, Duration, Local, Utc};
 use rust_tools::commonw::FastSet;
@@ -16,12 +14,14 @@ use std::time::{Duration as StdDuration, Instant, UNIX_EPOCH};
 
 use crate::ai::{
     driver::print::{
-        echo_tool_args, echo_tool_output, format_tool_status_cached, format_tool_status_completed,
-        format_tool_status_deferred, format_tool_status_failed, format_tool_status_running,
-        format_tool_status_skipped,
+        echo_tool_args, echo_tool_output, format_file_tool_target, format_tool_status_cached,
+        format_tool_status_completed, format_tool_status_deferred, format_tool_status_failed,
+        format_tool_status_running, format_tool_status_skipped, format_tool_status_with_file_target,
     },
     mcp::{McpClient, SharedMcpClient},
     tools as builtin_tools,
+    tools::os_tools::GLOBAL_OS,
+    tools::storage::memory_store::{AgentMemoryEntry, MemoryStore},
     tools::task_tools::epoll_wait_many,
     types::{ToolCall, ToolResult},
 };
@@ -1134,15 +1134,32 @@ fn finalize_execution_result(
 
 fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
     let name = &tool_call.function.name;
+    let inline_file_target = matches!(name.as_str(), "read_file" | "write_file" | "apply_patch")
+        .then(|| format_file_tool_target(name, &tool_call.function.arguments))
+        .flatten();
+    let with_file_target = |status_line: String| {
+        if let Some(target) = inline_file_target.as_deref() {
+            format_tool_status_with_file_target(status_line, target)
+        } else {
+            status_line
+        }
+    };
+
     if run_result.cached {
-        println!("{}", format_tool_status_cached(name));
+        println!("{}", with_file_target(format_tool_status_cached(name)));
     } else if !run_result.executed {
-        println!("{}", format_tool_status_skipped(name));
+        println!("{}", with_file_target(format_tool_status_skipped(name)));
     } else if run_result.ok {
         // 已执行的工具：用 \r 回到行首覆盖 running 状态，保持同一行
-        print!("\r\x1b[2K{}\n", format_tool_status_completed(name));
+        print!(
+            "\r\x1b[2K{}\n",
+            with_file_target(format_tool_status_completed(name))
+        );
     } else {
-        print!("\r\x1b[2K{}\n", format_tool_status_failed(name));
+        print!(
+            "\r\x1b[2K{}\n",
+            with_file_target(format_tool_status_failed(name))
+        );
     }
 
     // 部分工具的输出对用户有较高可见性价值，额外把其内容回显到终端。
@@ -1153,6 +1170,16 @@ fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
     }
     if run_result.ok {
         echo_tool_output(name, &run_result.tool_result.content);
+    }
+
+    // delete_path 保持原有独立文件提示；读写/补丁工具已内联到状态行。
+    if matches!(name.as_str(), "delete_path") {
+        if let Some(target) = format_file_tool_target(name, &tool_call.function.arguments) {
+            println!(
+                "{}",
+                crate::ai::driver::print::format_tool_note_line("file", &target)
+            );
+        }
     }
 }
 

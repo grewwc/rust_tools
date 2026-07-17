@@ -233,27 +233,31 @@ fn recent_tool_message_protection_anchor(
 
 /// 从工具调用的 JSON `arguments` 里取 `file_path`（或兼容的 `path`）。
 /// `apply_patch` 还可能把目标写在 `patch` 正文 `*** Update File: <path>` /
-/// `*** Add File: <path>` 信封里，做兜底解析。
-fn extract_file_path_arg(arguments: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(arguments).ok()?;
+/// `*** Add File: <path>` / `*** Replace in line: <path>` 信封里，做兜底解析。
+fn extract_file_path_args(arguments: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<Value>(arguments) else {
+        return Vec::new();
+    };
     if let Some(p) = v.get("file_path").and_then(|x| x.as_str()) {
-        return Some(p.to_string());
+        return vec![p.to_string()];
     }
     if let Some(p) = v.get("path").and_then(|x| x.as_str()) {
-        return Some(p.to_string());
+        return vec![p.to_string()];
     }
     if let Some(patch) = v.get("patch").and_then(|x| x.as_str()) {
-        for line in patch.lines() {
-            let trimmed = line.trim_start();
-            if let Some(rest) = trimmed.strip_prefix("*** Update File:") {
-                return Some(rest.trim().to_string());
-            }
-            if let Some(rest) = trimmed.strip_prefix("*** Add File:") {
-                return Some(rest.trim().to_string());
-            }
-        }
+        return patch
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                trimmed
+                    .strip_prefix("*** Update File:")
+                    .or_else(|| trimmed.strip_prefix("*** Add File:"))
+                    .or_else(|| trimmed.strip_prefix("*** Replace in line:"))
+                    .map(|rest| rest.trim().to_string())
+            })
+            .collect();
     }
-    None
+    Vec::new()
 }
 
 /// 扫描整条消息流，找出"最近一次 `apply_patch` 失败、且之后同路径没有成功"
@@ -281,17 +285,22 @@ fn collect_pending_patch_paths(messages: &[Message]) -> FxHashSet<String> {
         if m.role != "assistant" {
             continue;
         }
-        let Some(tcs) = m.tool_calls.as_ref() else { continue; };
+        let Some(tcs) = m.tool_calls.as_ref() else {
+            continue;
+        };
         for tc in tcs {
             if tc.function.name != "apply_patch" {
                 continue;
             }
-            let Some(path) = extract_file_path_arg(&tc.function.arguments) else {
+            let paths = extract_file_path_args(&tc.function.arguments);
+            if paths.is_empty() {
                 continue;
-            };
+            }
             let result = result_by_id.get(&tc.id).map(String::as_str).unwrap_or("");
             let succeeded = result.trim_start().starts_with("Successfully patched");
-            last_state.insert(path, succeeded);
+            for path in paths {
+                last_state.insert(path, succeeded);
+            }
         }
     }
     last_state
@@ -301,7 +310,7 @@ fn collect_pending_patch_paths(messages: &[Message]) -> FxHashSet<String> {
         .collect()
 }
 
-/// 本工具组是否含 `read_file` 调用，且其 `file_path` 正是某个尚未成功的
+/// 本工具组是否含 `read_file` / `read_file_lines` 调用，且其 `file_path` 正是某个尚未成功的
 /// `apply_patch` 目标。若是，折叠器应跳过折叠以保留模型重试 patch 所需的
 /// 原始文件内容。
 fn group_reads_pending_patch_target(
@@ -316,9 +325,10 @@ fn group_reads_pending_patch_target(
         return false;
     };
     tcs.iter().any(|tc| {
-        tc.function.name == "read_file"
-            && extract_file_path_arg(&tc.function.arguments)
-                .is_some_and(|p| pending_paths.contains(&p))
+        matches!(tc.function.name.as_str(), "read_file" | "read_file_lines")
+            && extract_file_path_args(&tc.function.arguments)
+                .into_iter()
+                .any(|p| pending_paths.contains(&p))
     })
 }
 

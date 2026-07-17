@@ -421,7 +421,6 @@ fn agent_routing_source_hash(agent: &AgentManifest) -> String {
         "tools": agent.tools,
         "tool_groups": agent.tool_groups,
         "mcp_servers": agent.mcp_servers,
-        "routing_tags": agent.routing_tags,
     });
     let mut hasher = Sha256::new();
     hasher.update(payload.to_string().as_bytes());
@@ -467,9 +466,6 @@ fn choose_semantic_route(
 
 fn agent_document_text(agent: &AgentManifest) -> String {
     let mut parts = vec![agent.name.clone(), agent.description.clone()];
-    if !agent.routing_tags.is_empty() {
-        parts.push(agent.routing_tags.join(" "));
-    }
     if !agent.tools.is_empty() {
         parts.push(agent.tools.join(" "));
     }
@@ -530,7 +526,7 @@ fn extract_text_from_message(msg: &Message) -> Option<String> {
 mod tests {
     use super::*;
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
-    fn primary_agent(name: &str, description: &str, routing_tags: &[&str]) -> AgentManifest {
+    fn primary_agent(name: &str, description: &str) -> AgentManifest {
         AgentManifest {
             name: name.to_string(),
             description: description.to_string(),
@@ -544,7 +540,6 @@ mod tests {
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
             disable_mcp_tools: false,
-            routing_tags: routing_tags.iter().map(|tag| (*tag).to_string()).collect(),
             model_tier: Some(AgentModelTier::Heavy),
             disabled: false,
             hidden: false,
@@ -555,11 +550,7 @@ mod tests {
 
     #[test]
     fn semantic_router_selects_agent_based_on_semantic_match() {
-        let build = primary_agent(
-            "build",
-            "Default agent for development work",
-            &["fix", "debug"],
-        );
+        let build = primary_agent("build", "Default agent for development work");
         let agents = [build.clone(), build.clone()];
         let ranked =
             rank_agents_by_semantics(&agents, "先别改代码，帮我分析这次重构方案和风险", &[], None);
@@ -573,18 +564,8 @@ mod tests {
 
     #[test]
     fn history_alone_cannot_override_current_turn_semantics() {
-        let build = primary_agent(
-            "build",
-            "Default agent for development work",
-            &["fix", "debug"],
-        );
-        let build_analysis = primary_agent(
-            "build",
-            "Analysis-oriented build configuration",
-            &[
-                "plan", "planning", "review", "analyze", "analysis", "总结", "分析",
-            ],
-        );
+        let build = primary_agent("build", "Default agent for development work");
+        let build_analysis = primary_agent("build", "Analysis-oriented build configuration");
 
         let history = vec![
             Message {
@@ -617,14 +598,10 @@ mod tests {
 
     #[test]
     fn semantic_corpus_cache_refreshes_when_agent_content_changes() {
-        let first_agents = [primary_agent("helper", "Debug runtime failures", &[])];
+        let first_agents = [primary_agent("helper", "Debug runtime failures")];
         let first = rank_agents_by_semantics(&first_agents, "帮我做一份 ppt 幻灯片", &[], None);
 
-        let second_agents = [primary_agent(
-            "helper",
-            "生成幻灯片 PPT 演示文稿",
-            &["ppt", "slides", "presentation"],
-        )];
+        let second_agents = [primary_agent("helper", "生成幻灯片 PPT 演示文稿")];
         let second = rank_agents_by_semantics(&second_agents, "帮我做一份 ppt 幻灯片", &[], None);
 
         assert!(

@@ -565,7 +565,7 @@ pub fn try_handle_session_command(
         }
         "clear-history" | "clear_history" | "ch" => {
             let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(
-                "Clear current session history? (y/n): ",
+                "Clear current session history and checkpoints? (y/n): ",
             );
             if confirm != Some(true) {
                 println!("canceled by user.");
@@ -578,7 +578,7 @@ pub fn try_handle_session_command(
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
             clear_session_local_runtime_state(app);
             println!(
-                "Cleared history for session: {} (session preserved)",
+                "Cleared history and checkpoints for session: {} (session preserved)",
                 app.session_id
             );
         }

@@ -420,8 +420,11 @@ pub(super) fn supports_image_input(model: &str) -> bool {
 }
 
 const MODEL_RUNTIME_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+const MODEL_RUNTIME_VERIFIED_TTL: Duration = Duration::from_secs(30 * 60);
 
 static RUNTIME_DISABLED_MODELS: LazyLock<Mutex<FxHashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+static RUNTIME_VERIFIED_MODELS: LazyLock<Mutex<FxHashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 fn normalize_model_token(value: &str) -> String {
@@ -432,6 +435,9 @@ pub(super) fn mark_model_temporarily_unavailable(model: &str, reason: &str) {
     let trimmed = model.trim();
     if trimmed.is_empty() {
         return;
+    }
+    if let Ok(mut verified) = RUNTIME_VERIFIED_MODELS.lock() {
+        verified.remove(&normalize_model_token(trimmed));
     }
     let until = Instant::now() + MODEL_RUNTIME_COOLDOWN;
     if let Ok(mut disabled) = RUNTIME_DISABLED_MODELS.lock() {
@@ -453,6 +459,29 @@ pub(super) fn mark_model_temporarily_unavailable(model: &str, reason: &str) {
         "[model] temporarily disabled '{}' for auto-selection: {}",
         trimmed, reason
     );
+}
+
+pub(super) fn subagent_model_needs_probe(model: &str) -> bool {
+    let token = normalize_model_token(model);
+    if token.is_empty() {
+        return false;
+    }
+    let now = Instant::now();
+    let Ok(mut verified) = RUNTIME_VERIFIED_MODELS.lock() else {
+        return true;
+    };
+    verified.retain(|_, until| *until > now);
+    !verified.contains_key(&token)
+}
+
+pub(super) fn mark_subagent_model_verified(model: &str) {
+    let token = normalize_model_token(model);
+    if token.is_empty() {
+        return;
+    }
+    if let Ok(mut verified) = RUNTIME_VERIFIED_MODELS.lock() {
+        verified.insert(token, Instant::now() + MODEL_RUNTIME_VERIFIED_TTL);
+    }
 }
 
 fn runtime_model_disabled(model: &ModelDef) -> bool {
@@ -479,25 +508,14 @@ pub(super) fn auto_subagent_model_for_agent(
     auto_subagent_model_choice_for_agent(agent, description, prompt).model
 }
 
-/// 优先复用父 agent 当前模型作为子 agent 模型；只有缺少父模型时，才退回
-/// 到基于难度/分级的自动选择并启用自动 fallback。
+/// 未显式指定模型时，始终按任务难度和 agent 分级自动选择子 agent 模型。
+/// `parent_model` 仅保留用于兼容现有调用方；父模型不再覆盖难度路由结果。
 pub(super) fn choose_model_for_subagent(
-    parent_model: Option<&str>,
+    _parent_model: Option<&str>,
     agent: &AgentManifest,
     description: &str,
     prompt: &str,
 ) -> SubagentModelChoice {
-    if let Some(parent) = parent_model.map(str::trim).filter(|s| !s.is_empty()) {
-        let model = model_names::find_by_identifier(parent)
-            .map(model_handle)
-            .unwrap_or_else(|| parent.to_string());
-        return SubagentModelChoice {
-            model,
-            is_auto_selected: false,
-            fallback: None,
-        };
-    }
-
     let auto = auto_subagent_model_choice_for_agent(agent, description, prompt);
     SubagentModelChoice {
         model: auto.model,
@@ -873,7 +891,6 @@ mod tests {
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
             disable_mcp_tools: false,
-            routing_tags: Vec::new(),
             model_tier,
             disabled: false,
             hidden: false,

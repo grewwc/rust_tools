@@ -202,6 +202,9 @@ pub(crate) struct AsyncTaskEntry {
     pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,
     pub(crate) selection_explanation: String,
     pub(crate) inherit: InheritOptions,
+    /// 真实 Tokio 子任务的取消句柄。kernel process 终止时必须同步 abort，
+    /// 否则网络请求或工具 Future 仍会在后台继续运行。
+    pub(crate) abort_handle: Option<tokio::task::AbortHandle>,
     /// wall-clock 起始时间，用于 `prune_completed_tasks` LRU；不能由 kernel
     /// `created_at_tick` 替代。
     pub(crate) started_at: Instant,
@@ -849,6 +852,7 @@ pub(crate) fn spawn_subagent_kernel_task(
                 selection_explanation: prepared.selection_explanation.clone(),
                 inherit: prepared.inherit,
                 started_at: Instant::now(),
+                abort_handle: None,
             },
         );
         prune_completed_tasks(&mut registry);
@@ -867,6 +871,20 @@ pub(crate) fn spawn_subagent_kernel_task(
 pub(crate) fn with_task_entry<R>(task_id: &str, f: impl FnOnce(&AsyncTaskEntry) -> R) -> Option<R> {
     let registry = TASK_REGISTRY.lock().unwrap();
     registry.get_ref(&task_id.to_string()).map(f)
+}
+
+/// 关联实际执行子代理的 Tokio task，使取消和超时能够停止后台 Future，
+/// 而不只是终止 kernel 中的逻辑进程。
+pub(crate) fn set_task_abort_handle(
+    task_id: &str,
+    abort_handle: tokio::task::AbortHandle,
+) -> bool {
+    let mut registry = TASK_REGISTRY.lock().unwrap();
+    let Some(entry) = registry.get_mut(&task_id.to_string()) else {
+        return false;
+    };
+    entry.abort_handle = Some(abort_handle);
+    true
 }
 
 pub(crate) fn with_task_entry_by_pid<R>(
@@ -1259,7 +1277,8 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             }
         }
 
-        if !pending.is_empty() {
+        // `any` 在首次扫描已拿到结果时必须立即返回，不能再被其余 pending 任务挂起。
+        if !pending.is_empty() && !(wait_policy == WaitPolicy::Any && !ready.is_empty()) {
             let pending_ids = pending
                 .iter()
                 .map(|(tid, _)| tid.clone())
@@ -1320,7 +1339,10 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             // "BUDGET ELAPSED" 之类的终态措辞：suspend 是毫秒级同步返回的（不是
             // 真的等满 timeout_secs），否则模型会把"刚发起等待就超时"误判成
             // "子任务卡住"，从而提前放弃并转手动分析。
-            if !pending.is_empty() && wait.suspended {
+            if !pending.is_empty()
+                && wait.suspended
+                && !(wait_policy == WaitPolicy::Any && !ready.is_empty())
+            {
                 let mut parts = Vec::new();
                 if !ready.is_empty() {
                     parts.push(ready.join("\n\n---\n\n"));
@@ -1358,6 +1380,9 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     }
     if let Some(message) = wait_message {
         return Ok(message);
+    }
+    if wait_policy == WaitPolicy::Any && !ready.is_empty() {
+        return Ok(ready.join("\n\n---\n\n"));
     }
     if !pending.is_empty() {
         // Surface partial progress instead of dropping it on the floor.
@@ -1411,9 +1436,8 @@ fn write_terminal_subagent_result(
     status: &str,
     error: &str,
 ) {
-    // 先以主 agent 身份终止进程：kill_process 同步返回后进程已 terminated，其
-    // tokio future 不再被调度，不会再向 result channel 写入，避免与我们的终态
-    // 结果产生竞态。kill 需要 manage_children 权限（主 agent 持有）。
+    // 调用方必须先 abort 实际执行 subagent 的 Tokio task；kernel process 状态本身
+    // 不会停止宿主进程里的 Future。随后再终止 kernel 进程并发布终态结果。
     let _ = os.kill_process(pid, format!("{}: {}", status, error));
     // 再以 subagent 身份写终态结果并释放 producer 端（result channel 的 producer
     // 所有权校验要求 current == pid）。进程虽已 terminated，但 channel/futex 资源
@@ -1444,9 +1468,10 @@ fn write_terminal_subagent_result(
 /// 移除——这些留给收集方（task_wait 的 ready 路径）完成，避免重复释放。进程被 kill
 /// 后 `is_task_pending` 返回 false，后续 epoch 扫描到同一 entry 会跳过，不会重复 kill。
 ///
-/// 锁顺序：分两步以避免与 task_wait（registry -> kernel）形成锁环——
+/// 锁顺序：分三步以避免与 task_wait（registry -> kernel）形成锁环——
 /// 1. 仅锁 TASK_REGISTRY 收集候选，立即释放；
-/// 2. 仅锁 kernel（via with_os_kernel）执行 kill + 写结果。
+/// 2. 不持任何锁，abort 实际执行 subagent 的 Tokio task；
+/// 3. 仅锁 kernel（via with_os_kernel）执行 kill + 写结果。
 /// 两步绝不同时持有 registry 与 kernel（GLOBAL_OS 与 App.os 是同一把锁，参见
 /// os_tools.rs 的重入死锁警告）。
 pub(crate) fn reap_timed_out_subagents() {
@@ -1456,15 +1481,28 @@ pub(crate) fn reap_timed_out_subagents() {
         registry
             .iter()
             .filter(|(_, e)| e.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT)
-            .map(|(_, e)| (e.pid, e.result_channel_id, e.completion_futex_addr))
+            .map(|(_, e)| {
+                (
+                    e.pid,
+                    e.result_channel_id,
+                    e.completion_futex_addr,
+                    e.abort_handle.clone(),
+                )
+            })
             .collect::<Vec<_>>()
     };
     if candidates.is_empty() {
         return;
     }
-    // Step 2：仅持 kernel 锁，逐个检查是否仍在运行，是则 kill + 写 timeout 终态。
+    // Step 2：不持任何锁，先停止真实 Tokio Future，避免它与 timeout 终态并发写结果。
+    for (_, _, _, abort_handle) in &candidates {
+        if let Some(handle) = abort_handle {
+            handle.abort();
+        }
+    }
+    // Step 3：仅持 kernel 锁，逐个检查是否仍在运行，是则 kill + 写 timeout 终态。
     let _ = with_os_kernel(|os| {
-        for (pid, result_channel_id, completion_futex_addr) in candidates {
+        for (pid, result_channel_id, completion_futex_addr, _) in candidates {
             if !is_task_pending(os, pid)? {
                 // 进程已结束（正常完成 / 失败 / 被他人 kill），跳过；其结果与资源
                 // 清理交给收集方处理。
@@ -1566,20 +1604,40 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
         .unwrap_or_else(|| "cancelled by parent agent".to_string());
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
 
-    let registry = TASK_REGISTRY.lock().unwrap();
     let mut cancelled: Vec<String> = Vec::new();
     let mut already_finished: Vec<String> = Vec::new();
     let mut not_found: Vec<String> = Vec::new();
-    for tid in &task_ids {
-        let (pid, result_channel_id, completion_futex_addr) = match registry.get_ref(tid) {
-            Some(e) if e.session_id == current_session_id => {
-                (e.pid, e.result_channel_id, e.completion_futex_addr)
-            }
-            _ => {
-                not_found.push(tid.clone());
-                continue;
-            }
-        };
+    // 先只持 registry 锁复制取消所需信息，随后立即释放；Tokio task 的 abort 和
+    // kernel 终态写入都不能与 registry 锁重叠，避免与收集路径形成锁环。
+    let candidates = {
+        let registry = TASK_REGISTRY.lock().unwrap();
+        task_ids
+            .iter()
+            .filter_map(|tid| match registry.get_ref(tid) {
+                Some(entry) if entry.session_id == current_session_id => Some((
+                    tid.clone(),
+                    entry.pid,
+                    entry.result_channel_id,
+                    entry.completion_futex_addr,
+                    entry.abort_handle.clone(),
+                )),
+                _ => {
+                    not_found.push(tid.clone());
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // 必须先停止实际 Tokio Future，再进入 kernel 写 cancelled 终态；否则逻辑进程
+    // 已终止后，网络请求或工具调用仍可能在后台继续运行并与终态写入竞争。
+    for (_, _, _, _, abort_handle) in &candidates {
+        if let Some(handle) = abort_handle {
+            handle.abort();
+        }
+    }
+
+    for (tid, pid, result_channel_id, completion_futex_addr, _) in candidates {
         // 仅对仍在运行的 subagent 执行取消。已结束（正常完成 / 失败 / 进程终止）的
         // 任务不再 kill、也不再写终态结果——否则会向 channel 追加一条 "cancelled"
         // 消息并销毁 channel，遮蔽/丢弃 subagent 的真实结果，且让后续 task_wait 拿
@@ -1600,12 +1658,11 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
             Ok(true)
         })?;
         if was_pending {
-            cancelled.push(tid.clone());
+            cancelled.push(tid);
         } else {
-            already_finished.push(tid.clone());
+            already_finished.push(tid);
         }
     }
-    drop(registry);
 
     let mut msg = String::new();
     if !cancelled.is_empty() {
@@ -1712,11 +1769,27 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
                     selection_explanation: String::new(),
                     inherit: InheritOptions::default(),
                     started_at: *started_at,
+                    abort_handle: None,
                 };
                 completed_outputs.push(format_task_result(&entry, result));
                 let _ = os.channel_close(None, ChannelId(*result_channel_id));
                 let _ =
                     os.channel_release_named(ChannelId(*result_channel_id), "task_result.consumer");
+                let _ = os.channel_destroy(None, ChannelId(*result_channel_id));
+                let _ = os.futex_destroy(*completion_futex_addr);
+                finished_ids.push(tid.clone());
+            } else if !is_task_pending(os, *pid)? {
+                // 与 task_wait 保持一致：进程已终止但没有写回结果时，也必须把任务
+                // 收口并释放双方的 channel ownership，避免仅轮询 task_status 时泄漏。
+                completed_outputs.push(format!(
+                    "[Task: {} via {} @ {}] FAILED: process pid={} terminated without publishing any output.",
+                    description, agent_name, model, pid
+                ));
+                let _ = os.channel_close(None, ChannelId(*result_channel_id));
+                let _ =
+                    os.channel_release_named(ChannelId(*result_channel_id), "task_result.consumer");
+                let _ =
+                    os.channel_release_named(ChannelId(*result_channel_id), "task_result.producer");
                 let _ = os.channel_destroy(None, ChannelId(*result_channel_id));
                 let _ = os.futex_destroy(*completion_futex_addr);
                 finished_ids.push(tid.clone());
@@ -1971,9 +2044,6 @@ fn format_task_result(entry: &AsyncTaskEntry, result: StoredTaskResult) -> Strin
 
 fn subagent_document_text(agent: &AgentManifest) -> String {
     let mut parts = vec![agent.name.clone(), agent.description.clone()];
-    if !agent.routing_tags.is_empty() {
-        parts.push(agent.routing_tags.join(" "));
-    }
     if !agent.prompt.trim().is_empty() {
         parts.push(agent.prompt.chars().take(1500).collect());
     }
@@ -1994,17 +2064,7 @@ fn auto_subagent_score(
 struct SelectedSubagent<'a> {
     agent: &'a AgentManifest,
     auto_selected: bool,
-    matched_tags: Vec<String>,
     score: i32,
-}
-
-fn matched_routing_tags(agent: &AgentManifest, task_text: &str) -> Vec<String> {
-    let task = task_text.to_ascii_lowercase();
-    agent
-        .routing_tags_normalized()
-        .into_iter()
-        .filter(|tag| task.contains(tag.as_str()))
-        .collect()
 }
 
 fn select_subagent<'a>(
@@ -2030,7 +2090,6 @@ fn select_subagent<'a>(
             return Ok(SelectedSubagent {
                 agent,
                 auto_selected: false,
-                matched_tags: Vec::new(),
                 score: 0,
             });
         }
@@ -2073,7 +2132,6 @@ fn select_subagent<'a>(
             SelectedSubagent {
                 agent,
                 auto_selected: true,
-                matched_tags: matched_routing_tags(agent, &task_text),
                 score: (score * 100.0) as i32,
             }
         })
@@ -2104,15 +2162,10 @@ fn build_selection_explanation(
     inherited_parent_model: bool,
 ) -> String {
     let agent_reason = if selected.auto_selected {
-        if selected.matched_tags.is_empty() {
-            "agent_reason=auto-selected as the best available subagent".to_string()
-        } else {
-            format!(
-                "agent_reason=auto-selected by routing_tags [{}] (score={})",
-                selected.matched_tags.join(", "),
-                selected.score
-            )
-        }
+        format!(
+            "agent_reason=auto-selected as the best available subagent (score={})",
+            selected.score
+        )
     } else {
         "agent_reason=explicit agent override".to_string()
     };

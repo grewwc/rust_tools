@@ -186,8 +186,11 @@ fn try_build_context_history_sqlite_fastpath(
         return Ok(None);
     };
 
-    let mut messages = Vec::with_capacity(recent.messages.len() + 1);
+    let checkpoint_markers =
+        sqlite::read_context_checkpoint_markers_before_id_sqlite(history_file, start_message_id)?;
+    let mut messages = Vec::with_capacity(recent.messages.len() + checkpoint_markers.len() + 1);
     messages.push(summary);
+    messages.extend(checkpoint_markers);
     messages.extend(recent.messages);
     Ok(Some(compress_messages_for_context(
         messages,

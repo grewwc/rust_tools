@@ -75,21 +75,21 @@ pub(super) fn extract_chunk_events_with_tools(
         }
     }
 
-    // 处理 content（先关闭 thinking 标签）
-    if *thinking_open {
-        *thinking_open = false;
-        events.push(StreamTextEvent::CloseThinking);
-    }
+    // 只有真正产生可见正文时才结束 thinking。重复的 reasoning 快照在上游去重后
+    // 会变成空 chunk；若在此处关闭，会让后续 reasoning 反复重新打开折叠块。
     if !delta.content.is_empty() {
         let content = normalize_stream_text(delta.content.clone());
+        let mut content_events = Vec::new();
         push_text_with_hidden_meta(
-            &mut events,
+            &mut content_events,
             content,
             false,
             hidden_begin,
             hidden_end,
             hidden_meta_parse,
         );
+        close_thinking_before_visible_content(&mut events, thinking_open, &content_events);
+        events.extend(content_events);
     }
     (events, all_tool_calls)
 }
@@ -144,11 +144,8 @@ pub(super) fn extract_chunk_events_streaming(
         }
     }
 
-    // 处理 content（先关闭 thinking 标签）
-    if *thinking_open {
-        *thinking_open = false;
-        events.push(StreamTextEvent::CloseThinking);
-    }
+    // 只有真正产生可见正文时才结束 thinking。空 delta、被去重的 reasoning 快照、
+    // 以及被工具解析器完全消费的 XML 都不应让终端折叠块闪烁地关闭又重新打开。
     if !delta.content.is_empty() {
         let normalized = inline_markup_normalizer.push(&delta.content);
         if normalized.is_empty() {
@@ -164,19 +161,40 @@ pub(super) fn extract_chunk_events_streaming(
         hermes_events.extend(bare_xml_events);
         if !cleaned.is_empty() {
             let content = normalize_stream_text(cleaned);
+            let mut content_events = Vec::new();
             push_text_with_hidden_meta(
-                &mut events,
+                &mut content_events,
                 content,
                 false,
                 hidden_begin,
                 hidden_end,
                 hidden_meta_parse,
             );
+            close_thinking_before_visible_content(&mut events, thinking_open, &content_events);
+            events.extend(content_events);
         }
         all_tool_events.extend(hermes_events);
         return (events, all_tool_events);
     }
     (events, all_tool_events)
+}
+
+/// 在可见 assistant 正文首次落盘前才关闭 thinking，忽略不产生正文的协议噪声。
+fn close_thinking_before_visible_content(
+    events: &mut Vec<StreamTextEvent>,
+    thinking_open: &mut bool,
+    content_events: &[StreamTextEvent],
+) {
+    if !*thinking_open
+        || !content_events
+            .iter()
+            .any(|event| matches!(event, StreamTextEvent::AppendContent(_)))
+    {
+        return;
+    }
+
+    *thinking_open = false;
+    events.push(StreamTextEvent::CloseThinking);
 }
 
 pub(super) fn render_stream_text_events(
@@ -303,6 +321,76 @@ mod tests {
         );
         assert!(tool_calls.is_empty());
         assert!(thinking_open);
+    }
+
+    #[test]
+    fn streaming_extract_keeps_thinking_open_across_empty_reasoning_snapshot() {
+        // OpenAI Responses 的 summary delta 后可能紧跟一个已在 runtime 去重为空的
+        // snapshot chunk。它不是正文开始，不能结束折叠块；否则下一段 summary
+        // 又会重新打开 thinking，导致终端连续闪出多个折叠框。
+        let chunk = |content: &str, reasoning_content: &str| StreamChunk {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content: content.to_string(),
+                    reasoning_content: reasoning_content.to_string(),
+                    reasoning_details: String::new(),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let first_reasoning = chunk("", "first");
+        let duplicate_snapshot = chunk("", "");
+        let next_reasoning = chunk("", "second");
+        let answer = chunk("answer", "");
+
+        let mut thinking_open = false;
+        let mut hidden_meta_parse = HiddenMetaParseState::default();
+        let mut streamer = InternalToolCallStreamer::new();
+        let mut hermes_streamer = HermesXmlToolCallStreamer::new();
+        let mut anthropic_streamer = AnthropicXmlToolCallStreamer::new();
+        let mut bare_xml_streamer = BareXmlToolCallStreamer::new();
+        let mut inline_markup_normalizer =
+            super::super::inline_recovery::InlineMarkupNormalizer::new();
+        let mut extract = |stream_chunk: &StreamChunk| {
+            extract_chunk_events_streaming(
+                stream_chunk,
+                "<meta:self_note>",
+                "</meta:self_note>",
+                &mut thinking_open,
+                &mut hidden_meta_parse,
+                &mut streamer,
+                &mut hermes_streamer,
+                &mut anthropic_streamer,
+                &mut bare_xml_streamer,
+                &mut inline_markup_normalizer,
+            )
+            .0
+        };
+
+        assert_eq!(
+            extract(&first_reasoning),
+            vec![
+                StreamTextEvent::OpenThinking,
+                StreamTextEvent::AppendThinking("first".to_string()),
+            ]
+        );
+        assert!(extract(&duplicate_snapshot).is_empty());
+        assert_eq!(
+            extract(&next_reasoning),
+            vec![StreamTextEvent::AppendThinking("second".to_string())]
+        );
+        assert_eq!(
+            extract(&answer),
+            vec![
+                StreamTextEvent::CloseThinking,
+                StreamTextEvent::AppendContent("answer".to_string()),
+            ]
+        );
+        drop(extract);
+        assert!(!thinking_open);
     }
 
     #[test]

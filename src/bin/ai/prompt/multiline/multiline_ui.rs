@@ -39,33 +39,6 @@ const PANEL_CHROME_LINES: u16 = 2;
 /// 补全态允许比普通编辑态更高的 inline viewport，这样大终端里可以一次看到更多候选。
 const MAX_COMPLETION_VIEWPORT_HEIGHT: u16 = PANEL_CHROME_LINES + PANEL_COMPLETION_WINDOW + 2;
 
-/// `Terminal::clear()` 在 inline viewport 下会先把真实终端 cursor 挪到 viewport 顶部
-/// 再执行 `FromCursorDown`。如果 resize 突发期间又立刻来一轮 autoresize，ratatui 会
-/// 以这个被挪到顶部的 cursor 重新计算 viewport 锚点，导致输入框/光标跳到 terminal
-/// 顶部。这里清屏后把 cursor 放回清屏前的位置，只让它承担“清屏”职责，不污染下一轮
-/// viewport 定位基准。
-fn clear_inline_viewport_preserving_cursor<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-) {
-    let cursor_before_clear = terminal.get_cursor_position().ok();
-    let _ = terminal.clear();
-    if let Some(cursor_before_clear) = cursor_before_clear {
-        let _ = terminal.set_cursor_position(cursor_before_clear);
-    }
-}
-
-fn move_cursor_to_viewport_bottom<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    viewport_top_row: u16,
-    viewport_height: u16,
-) {
-    let mut bottom_row = viewport_top_row.saturating_add(viewport_height.saturating_sub(1));
-    if let Ok(size) = terminal.size() {
-        bottom_row = bottom_row.min(size.height.saturating_sub(1));
-    }
-    let _ = terminal.set_cursor_position((0, bottom_row));
-}
-
 fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
     let available_rows = terminal_rows.saturating_sub(2).max(1);
     // 空输入默认保持紧凑，避免把 cursor 放在一个很高的空白 textarea 左上角。
@@ -131,42 +104,6 @@ fn resize_inline_viewport(terminal: &mut MultilineTerminal, new_height: u16) -> 
     Ok(())
 }
 
-/// 处理 `Event::Resize` 连续触发的情况：终端窗口拖动时 Resize 事件会快速连发，
-/// 如果每次都重绘 inline viewport，会导致"画面撕裂"或闪烁。
-/// 本函数先 drain 掉后续堆积的 Resize 事件，再做一次 full redraw。
-fn handle_resize_burst<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    last_viewport_top_row: Option<u16>,
-    viewport_height: u16,
-) -> io::Result<()> {
-    // 1) drain 掉所有后续的 Resize 事件，避免重复触发重绘
-    while event::poll(Duration::ZERO).unwrap_or(false) {
-        match event::read() {
-            Ok(Event::Resize(_, _)) => continue,
-            // 其他 case：resize 突发期间夹杂的非 Resize 事件直接丢弃，
-            // 回到 UI 主循环重新处理
-            Ok(_) | Err(_) => break,
-        }
-    }
-
-    // 2) 先按 ratatui 记录的旧 inline viewport 擦掉上一帧，再通知 ratatui
-    //    终端尺寸已变化（宽度变化影响文本折行）。inline autoresize 会按
-    //    last_known_cursor_pos 相对旧 viewport 的行偏移重新锚定；编辑态真实光标
-    //    通常在 textarea 第一行，下面还有 model/help。如果直接 autoresize，ratatui
-    //    会 append_lines 保留“光标下方行数”，把上一帧的 model/help 推入
-    //    VSCode/Trae 终端 scrollback，形成重复渲染。清旧 viewport 后把 cursor
-    //    临时钉到上一帧 viewport 底部，让 autoresize 的“光标下方行数”为 0。
-    //    下一轮 draw 会重新把 cursor 放回 textarea 的真实编辑位置。
-    let _ = terminal.hide_cursor();
-    clear_inline_viewport_preserving_cursor(terminal);
-    if let Some(top_row) = last_viewport_top_row {
-        move_cursor_to_viewport_bottom(terminal, top_row, viewport_height.max(1));
-    }
-    let _ = terminal.autoresize();
-    clear_inline_viewport_preserving_cursor(terminal);
-    Ok(())
-}
-
 fn submitted_input_preview_lines(content: &str) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut lines = content.lines();
@@ -219,7 +156,6 @@ impl PromptEditor {
         // 退出时按“最后一次实际渲染到哪里”来清理 viewport；不能依赖创建 Terminal
         // 那一刻的 cursor 位置，因为补全面板/textarea 扩容会重建 inline viewport。
         let mut last_viewport_top_row: Option<u16> = None;
-        let mut last_viewport_height = base_viewport_height;
 
         let result: io::Result<Option<String>> = (|| {
             // 预填内容（编辑已有 memo 场景）：按行载入 textarea，读取后清空。
@@ -285,7 +221,6 @@ impl PromptEditor {
                     .draw(|f| {
                         let area = f.area();
                         last_viewport_top_row = Some(area.y);
-                        last_viewport_height = area.height;
                         render_multiline_popup(
                             f,
                             &mut textarea,
@@ -303,12 +238,11 @@ impl PromptEditor {
                     continue;
                 }
                 let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
-                if let Event::Resize(_, _) = &event {
-                    handle_resize_burst(
-                        &mut terminal,
-                        last_viewport_top_row,
-                        last_viewport_height,
-                    )?;
+                if matches!(event, Event::Resize(_, _)) {
+                    // `Terminal::draw` 会在下一轮调用 `autoresize`。不要在这里先清理并
+                    // 重定位 inline viewport：VS Code 终端完成横向 reflow 后，那样会把
+                    // 旧 viewport 的内容误推入 scrollback，表现为重复渲染。
+                    continue;
                 }
 
                 match handle_multiline_event(
@@ -364,49 +298,8 @@ impl PromptEditor {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_inline_viewport_preserving_cursor, multiline_viewport_height,
-        submitted_input_preview_lines, viewport_height_with_completion,
+        multiline_viewport_height, submitted_input_preview_lines, viewport_height_with_completion,
     };
-    use ratatui::{
-        Terminal, TerminalOptions, Viewport,
-        backend::TestBackend,
-        layout::{Position, Rect},
-        widgets::{Paragraph, Widget},
-    };
-
-    #[test]
-    fn clear_inline_viewport_preserves_existing_cursor_anchor() {
-        let backend = TestBackend::new(24, 8);
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(3),
-            },
-        )
-        .unwrap();
-
-        terminal
-            .insert_before(2, |buf| {
-                Paragraph::new(vec!["line 1".into(), "line 2".into()]).render(buf.area, buf);
-            })
-            .unwrap();
-
-        let mut viewport_area = Rect::ZERO;
-        terminal
-            .draw(|f| {
-                viewport_area = f.area();
-                f.render_widget(Paragraph::new("prompt"), f.area());
-                f.set_cursor_position((viewport_area.x + 4, viewport_area.y + 1));
-            })
-            .unwrap();
-
-        let expected = Position::new(viewport_area.x + 4, viewport_area.y + 1);
-        terminal.backend_mut().assert_cursor_position(expected);
-
-        clear_inline_viewport_preserving_cursor(&mut terminal);
-
-        terminal.backend_mut().assert_cursor_position(expected);
-    }
 
     #[test]
     fn multiline_viewport_height_scales_with_terminal() {
