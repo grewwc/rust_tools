@@ -43,7 +43,16 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
         return Some(ParsedStreamPayload::Done);
     }
     if event_type == "response.completed" {
-        return Some(ParsedStreamPayload::Ignore);
+        // Responses API 的最终用量嵌在 response.usage，而不是兼容流的顶层
+        // usage。将其包装成普通 chunk，复用既有的用量落账路径；仍不能把该
+        // 事件视为 [DONE]，因为连接关闭才是流结束信号。
+        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+        let usage = value.get("response")?.get("usage")?.clone();
+        let usage = serde_json::from_value(usage).ok()?;
+        return Some(ParsedStreamPayload::Chunk(StreamChunk {
+            usage: Some(usage),
+            ..Default::default()
+        }));
     }
     // OpenAI Responses API 错误/不完整事件——必须显式处理，否则会 fallthrough
     // 到 parse_provider_chunk 被当成空 chunk 静默丢弃。
@@ -754,15 +763,48 @@ mod tests {
     }
 
     #[test]
-    fn response_completed_event_is_not_treated_as_immediate_stop() {
-        let payload = r#"{"status":"completed"}"#;
+    fn response_completed_event_preserves_responses_api_usage() {
+        let payload = r#"{
+            "response": {
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 128,
+                    "output_tokens": 64,
+                    "total_tokens": 192,
+                    "input_tokens_details": {"cached_tokens": 32},
+                    "output_tokens_details": {"reasoning_tokens": 48}
+                }
+            }
+        }"#;
         match parse_stream_payload(
             provider::openai_adapter(),
             payload,
             Some("response.completed"),
         ) {
-            ParsedStreamPayload::Ignore => {}
-            _ => panic!("response.completed should not terminate stream before EOF"),
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert!(chunk.choices.is_empty());
+                let usage = chunk
+                    .usage
+                    .expect("response.completed should contain usage");
+                assert_eq!(usage.prompt_tokens, 128);
+                assert_eq!(usage.completion_tokens, 64);
+                assert_eq!(usage.total_tokens, 192);
+                assert_eq!(
+                    usage
+                        .prompt_tokens_details
+                        .expect("cached details")
+                        .cached_tokens,
+                    32
+                );
+                assert_eq!(
+                    usage
+                        .completion_tokens_details
+                        .expect("reasoning details")
+                        .reasoning_tokens,
+                    48
+                );
+            }
+            _ => panic!("response.completed should yield a usage chunk"),
         }
     }
 
