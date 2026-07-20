@@ -75,6 +75,27 @@ gate is `cargo build -p mcp_browser` + the smoke test above.
    profiles are reclaimed by `gc_stale_profiles()` at **startup**: it scans
    `mcp_browser-profile-<pid>` dirs and `remove_dir_all`s those whose pid is dead
    (`kill(pid, 0)`). Do not revert to the shared default dir.
+7. **Detect "must-do-by-user" pages, then block-and-wait on demand.** When
+   `navigate`, `get_text`, or `get_html` finds a page needing manual intervention
+   (captcha / slider / sms_otp / twofa / login_required / payment_verify /
+   identity_verify) it appends `[USER_ACTION_REQUIRED: <category>]` to the
+   returned text. Detection is one `evaluate_expression` call
+   (`detect_user_action_required`), best-effort and **conservative**: it prefers
+   DOM-structure signals and requires "keyword + input element" for text-only
+   cases to avoid false positives (e.g. an article explaining 2FA). JS errors /
+   no-match return `None` silently. The tag is appended **after** `cap_text`, so a
+   >24K body can never truncate it away. The single source for the tag string is
+   `user_action_tag()`.
+   To actually pause for the human, the model calls the **`wait_for_human`** tool.
+   It is a **real blocking wait** but **resumable in bounded segments**: each call
+   polls the page (every 2s) and returns `status=resolved` the instant the
+   blocking signal clears; if its per-call budget (default 60s, hard-clamped to
+   `op_timeout_ms - 15s`) expires first it returns `status=still_waiting` —
+   crucially as a **normal result, not an error** — so the model just calls again.
+   This keeps every single call safely under the host `request_timeout_ms`, so a
+   user can take minutes on a captcha without the host killing the subprocess
+   (invariant #2). Headless mode returns a warning because there is no visible
+   window for the user to act in.
 
 ## Environment variables
 

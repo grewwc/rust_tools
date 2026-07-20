@@ -1,6 +1,6 @@
 //! 工具 schema 声明 + `tools/call` 分发与各工具逻辑。
 //!
-//! 全部 12 个工具都通过 `content[0].text` 回传文本（宿主只读这一处）。
+//! 全部 13 个工具都通过 `content[0].text` 回传文本（宿主只读这一处）。
 //! 每个 CDP 操作都包在 `with_timeout` 里，超时返回不含 transport 触发词的干净错误。
 
 use std::path::PathBuf;
@@ -30,13 +30,13 @@ pub fn initialize_result() -> Value {
     })
 }
 
-/// tools/list 结果：12 个浏览器自动化工具的 schema。
+/// tools/list 结果：13 个浏览器自动化工具的 schema。
 pub fn tools_list_result() -> Value {
     json!({
         "tools": [
             {
                 "name": "navigate",
-                "description": "Launch/reuse a controlled Chrome and navigate to a URL, waiting for load. Keeps the session (cookies/login) alive across calls.",
+                "description": "Launch/reuse a controlled Chrome and navigate to a URL, waiting for load. Keeps the session (cookies/login) alive across calls. If the response contains [USER_ACTION_REQUIRED: <category>], the page needs manual user intervention (captcha/slider/sms_otp/twofa/login_required/payment_verify/identity_verify) - stop further browser automation, hand control back to the user, and resume only after they confirm.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -119,7 +119,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "get_text",
-                "description": "Extract visible text (innerText). Whole page (body) if no selector, else the matched element.",
+                "description": "Extract visible text (innerText). Whole page (body) if no selector, else the matched element. If the response contains [USER_ACTION_REQUIRED: <category>], the page needs manual user intervention - stop automation and hand control back to the user.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -129,7 +129,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "get_html",
-                "description": "Extract HTML. Full document if no selector, else the matched element's outerHTML.",
+                "description": "Extract HTML. Full document if no selector, else the matched element's outerHTML. If the response contains [USER_ACTION_REQUIRED: <category>], the page needs manual user intervention - stop automation and hand control back to the user.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -145,6 +145,18 @@ pub fn tools_list_result() -> Value {
                     "properties": {
                         "path": { "type": "string", "description": "Optional output path; defaults to MCP_BROWSER_SCREENSHOT_DIR / temp dir" },
                         "full_page": { "type": "boolean", "description": "Capture the full scrollable page (default false)", "default": false }
+                    }
+                }
+            },
+            {
+                "name": "wait_for_human",
+                "description": "BLOCK and wait for the user to manually complete an action in the visible (headed) browser window - captcha, slider, SMS/OTP code, 2FA, login, payment or identity verification. Call this when a page shows [USER_ACTION_REQUIRED] or otherwise needs a human. It polls the page and returns AS SOON AS the blocking signal is gone (status=resolved). Each call waits up to a bounded budget (default 60s, always kept safely under the host request timeout); if the user has not finished yet it returns status=still_waiting WITHOUT error - simply call it again to keep waiting. Requires headed mode (a visible window) so the user can act.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "expect": { "type": "string", "description": "Optional expected category being waited on (captcha/slider/sms_otp/twofa/login_required/payment_verify/identity_verify); used only for messaging" },
+                        "budget_ms": { "type": "integer", "description": "Max time to block on THIS call in ms (default 60000). Hard-clamped below the host timeout; on expiry returns still_waiting so you can call again." },
+                        "message": { "type": "string", "description": "Optional short instruction to relay to the user about what to do in the window" }
                     }
                 }
             },
@@ -188,6 +200,7 @@ pub async fn handle_tools_call(
         "evaluate_js" => tool_evaluate_js(session, &args).await,
         "get_text" => tool_get_text(session, &args).await,
         "get_html" => tool_get_html(session, &args).await,
+        "wait_for_human" => tool_wait_for_human(session, &args).await,
         "screenshot" => tool_screenshot(session, &args).await,
         "list_tabs" => tool_list_tabs(session).await,
         "close_browser" => tool_close_browser(session).await,
@@ -214,6 +227,52 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// 扫描页面是否出现需要用户手动完成的操作。
+///
+/// 覆盖 7 类：captcha、slider（滑块）、sms_otp、twofa、login_required、
+/// payment_verify、identity_verify。命中则返回分类标签，未命中返回 None。
+/// 检测失败（JS 执行异常等）静默返回 None，不影响正常流程。
+///
+/// 检测偏保守：DOM 结构信号（iframe/class/id、专用输入框）优先且最可信；
+/// 纯正文关键词匹配容易误报（如一篇讲 2FA/OTP 原理的文章），因此把纯文本类
+/// 归到结构信号之后，且尽量要求「关键词 + 结构特征」同时命中。
+async fn detect_user_action_required(page: &chromiumoxide::page::Page) -> Option<String> {
+    let result = page
+        .evaluate_expression(r#"(function(){
+          // body 可能为 null（极早期/纯 frameset 页），用 try 兜底避免整表达式 reject。
+          var t = "";
+          try { t = ((document.body && document.body.innerText) || "").toLowerCase(); } catch(e) { t = ""; }
+          function has(sel){ try { return !!document.querySelector(sel); } catch(e){ return false; } }
+          // 1) captcha：结构信号最强，直接判定。
+          if (has('iframe[src*="recaptcha"]') || has('iframe[src*="hcaptcha"]') || has('[class*="captcha"]') || has('[id*="captcha"]')) return 'captcha';
+          // 2) slider：需要滑块 DOM 结构，纯文案不足以判定。
+          if (has('.geetest_slider_button') || has('.geetest_slider') || has('[class*="slider_track"]') || has('[class*="slider-btn"]') || (has('[class*="slider"]') && /滑动|拖动|slide|滑块/.test(t))) return 'slider';
+          // 3) sms_otp：优先专用输入框；纯文本需同时存在可输入的验证码框，降低误报。
+          if (has('input[autocomplete="one-time-code"]')) return 'sms_otp';
+          if ((has('input[type="tel"]') || has('input[type="text"]') || has('input[type="number"]')) && /短信验证码|短信动态码|sms.{0,5}code|one-time.{0,5}code|verification code|动态验证码/.test(t)) return 'sms_otp';
+          // 4) twofa：要求「关键词 + 可输入框」同时命中，避免误伤科普文。
+          if ((has('input[type="tel"]') || has('input[type="text"]') || has('input[type="number"]')) && /two-factor|双因素|二次验证|authenticator/.test(t)) return 'twofa';
+          // 5) login_required：登录提示 + 页面存在密码/登录框。
+          if ((has('input[type="password"]') || has('input[name*="login"]') || has('input[id*="login"]')) && /请登录|请先登录|登录后查看|sign in to continue|please sign in|log in to continue/.test(t)) return 'login_required';
+          // 6) payment_verify：支付/银行验证，要求存在输入框。
+          if ((has('input[type="password"]') || has('input[type="tel"]')) && /支付密码|payment password|银行短信|bank verification/.test(t)) return 'payment_verify';
+          // 7) identity_verify：实名认证。
+          if (/实名认证|identity verification|verify your identity/.test(t) && (has('input') || has('form'))) return 'identity_verify';
+          return null;
+        })()"#)
+        .await
+        .ok()?;
+    let v = result.value().and_then(|v| v.as_str())?.to_string();
+    if v.is_empty() { None } else { Some(v) }
+}
+
+/// 生成追加到工具输出末尾的「需人工介入」提示标签（单一事实来源，避免多处重复）。
+fn user_action_tag(cat: &str) -> String {
+    format!(
+        "\n[USER_ACTION_REQUIRED: {cat}] 页面需要用户手动完成操作。可调用 wait_for_human 阻塞等待用户在可见浏览器窗口完成，或直接停止自动化并请用户完成后告知继续。"
+    )
 }
 
 // ---- 各工具实现 ----
@@ -252,7 +311,11 @@ async fn tool_navigate(
             .flatten()
             .unwrap_or_default();
         let final_url = s.page.url().await.ok().flatten().unwrap_or(url.clone());
-        Ok(format!("Navigated to {final_url}\nTitle: {title}"))
+        let mut summary = format!("Navigated to {final_url}\nTitle: {title}");
+        if let Some(cat) = detect_user_action_required(&s.page).await {
+            summary.push_str(&user_action_tag(&cat));
+        }
+        Ok(summary)
     })
     .await?;
 
@@ -478,11 +541,18 @@ async fn tool_get_text(
             .await
             .map_err(|e| format!("inner_text failed: {e}"))?
             .unwrap_or_default();
-        Ok(inner)
+        // 检测在正文之外单独返回，避免标签被 cap_text 截断吞掉（正文可能 ≥ 24K）。
+        let cat = detect_user_action_required(&s.page).await;
+        Ok((inner, cat))
     })
     .await?;
 
-    Ok(text_content(cap_text(&text)))
+    let (inner, cat) = text;
+    let mut out = cap_text(&inner);
+    if let Some(cat) = cat {
+        out.push_str(&user_action_tag(&cat));
+    }
+    Ok(text_content(out))
 }
 
 async fn tool_get_html(
@@ -496,7 +566,7 @@ async fn tool_get_html(
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
 
     let html = with_timeout(ms, async {
-        match &selector {
+        let content = match &selector {
             Some(sel) => {
                 let el = s
                     .page
@@ -514,11 +584,108 @@ async fn tool_get_html(
                 .content()
                 .await
                 .map_err(|e| format!("content failed: {e}")),
-        }
+        }?;
+        // 检测在正文之外单独返回，避免标签被 cap_text 截断吞掉（HTML 极易 ≥ 24K）。
+        let cat = detect_user_action_required(&s.page).await;
+        Ok((content, cat))
     })
     .await?;
 
-    Ok(text_content(cap_text(&html)))
+    let (content, cat) = html;
+    let mut out = cap_text(&content);
+    if let Some(cat) = cat {
+        out.push_str(&user_action_tag(&cat));
+    }
+    Ok(text_content(out))
+}
+
+/// 阻塞等待用户在可见窗口手动完成验证类操作（captcha / 滑块 / 短信码 / 2FA / 登录 …）。
+///
+/// # 为什么是「可续期分段阻塞」而非「一直等到底」
+/// 宿主对每个 MCP server 只有一个 `request_timeout_ms`（默认 120s），一旦某次
+/// tools/call 超过它，宿主会**kill 并 restart 子进程、销毁整个浏览器会话**
+/// （见 AGENTS.md 铁律 #2）。人工完成验证码常需数分钟，若本工具一直阻塞到底，
+/// 必然超时→窗口被杀→人做到一半前功尽弃。
+///
+/// 因此本工具**单次调用只阻塞一个有界预算**（默认 60s，且被硬夹紧到显著小于
+/// server op 上限），期间每 2s 轮询一次 `detect_user_action_required`：
+/// - 一旦检测不到阻塞信号 → 立即返回 `status=resolved`（人工已完成，可继续自动化）；
+/// - 预算耗尽仍未完成 → **正常返回**（非 error）`status=still_waiting`，提示模型
+///   「再次调用本工具即可继续等待」。绝不返回 -32001 超时错误，避免模型误判为失败。
+///
+/// 这样既是**真阻塞**（窗口内人一完成就马上被感知并返回），又永远不会触发宿主的
+/// kill+restart，人可以跨多次调用从容完成任意长的手工操作。
+async fn tool_wait_for_human(
+    session: &mut Option<BrowserSession>,
+    args: &Value,
+) -> Result<Value, JsonRpcErr> {
+    let expect = opt_str(args, "expect");
+    let relay = opt_str(args, "message");
+
+    // 单次调用的阻塞预算：默认 60s。硬夹紧到 [2s, op_timeout - 15s]，
+    // 给最后一次轮询 + 返回留足余量，确保绝不逼近宿主 request_timeout。
+    let op_cap = op_timeout_ms();
+    let ceiling = op_cap.saturating_sub(15_000).max(5_000);
+    let requested = args
+        .get("budget_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60_000);
+    let budget_ms = requested.clamp(2_000, ceiling);
+
+    let s = ensure_session(session)
+        .await
+        .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
+
+    // 无头模式下用户根本看不到窗口、无法手动操作——诚实拒绝而非假装等待。
+    let headless = std::env::var("MCP_BROWSER_HEADLESS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let poll_interval = std::time::Duration::from_millis(2_000);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+
+    // 段内轮询循环。注意：本循环自身即受 budget_ms 约束，不再套 with_timeout。
+    let mut last_seen: Option<String> = None;
+    loop {
+        match detect_user_action_required(&s.page).await {
+            Some(cat) => {
+                // 仍存在阻塞信号：记录分类，继续等。
+                last_seen = Some(cat);
+            }
+            None => {
+                // 阻塞信号消失 = 人工已完成（或本就没有）。立即返回成功。
+                let url = s.page.url().await.ok().flatten().unwrap_or_default();
+                let note = match &last_seen {
+                    Some(c) => format!("resolved: '{c}' cleared"),
+                    None => "resolved: no blocking signal detected".to_string(),
+                };
+                return Ok(text_content(format!(
+                    "status=resolved\n{note}\ncurrent_url: {url}\nYou may continue browser automation now."
+                )));
+            }
+        }
+
+        if std::time::Instant::now() + poll_interval >= deadline {
+            break;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // 预算耗尽仍未完成：正常返回 still_waiting（非 error），引导模型续等。
+    let cat = last_seen
+        .or(expect)
+        .unwrap_or_else(|| "unknown".to_string());
+    let hint = relay
+        .map(|m| format!("\nInstruction for the user: {m}"))
+        .unwrap_or_default();
+    let mode = if headless {
+        "\nWARNING: browser is HEADLESS — the user has no visible window to act in. Relaunch in headed mode (MCP_BROWSER_HEADLESS=0) so the user can complete the action."
+    } else {
+        ""
+    };
+    Ok(text_content(format!(
+        "status=still_waiting\nStill waiting for the user to complete '{cat}' in the visible browser window after {budget_ms} ms.{hint}{mode}\nCall wait_for_human again to keep waiting; it will return status=resolved as soon as the user finishes."
+    )))
 }
 
 async fn tool_screenshot(

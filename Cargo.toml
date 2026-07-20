@@ -9,6 +9,7 @@ members = [
     "crates/rust_tools_macros",
     "crates/aios_kernel",
     "crates/mcp_browser",
+    "crates/mcp_excel",
 ]
 
 [features]

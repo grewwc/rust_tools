@@ -777,6 +777,74 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn spaced_fullwidth_dsml_marker_is_recovered_not_leaked() {
+        // deepseek-v4-flash 有时把 DSML 命名空间分隔符输出成带空格的全角竖线，
+        // 如 `<｜｜DSML ｜ invoke ...>`。归一化应仍把它还原为普通 `<invoke ...>`。
+        let full = "<｜｜DSML ｜ tool_calls>\n<｜｜DSML ｜ invoke name=\"mcp_browser_get_text\">\n\n</｜｜DSML ｜ invoke>\n</｜｜DSML ｜ tool_calls>";
+
+        let mut thinking_open = false;
+        let mut hidden_meta_parse = HiddenMetaParseState::default();
+        let mut streamer = InternalToolCallStreamer::new();
+        let mut hermes_streamer = HermesXmlToolCallStreamer::new();
+        let mut anthropic_streamer = AnthropicXmlToolCallStreamer::new();
+        let mut bare_xml_streamer = BareXmlToolCallStreamer::new();
+        let mut inline_markup_normalizer =
+            super::super::inline_recovery::InlineMarkupNormalizer::new();
+
+        let mut visible = String::new();
+        let mut tool_events_total = Vec::new();
+        for piece in [
+            "<｜｜DSML ｜ tool",
+            "_calls>\n<｜｜DSML ｜ invoke name=\"mcp_browser_get_text\">\n\n",
+            "</｜｜DSML ｜ invoke>\n</｜｜DSML ｜ tool_calls>",
+        ] {
+            let chunk = StreamChunk {
+                choices: vec![StreamChoice {
+                    delta: StreamDelta {
+                        content: piece.to_string(),
+                        reasoning_content: String::new(),
+                        reasoning_details: String::new(),
+                        tool_calls: Vec::new(),
+                    },
+                    finish_reason: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let (events, tool_events) = extract_chunk_events_streaming(
+                &chunk,
+                "<meta:self_note>",
+                "</meta:self_note>",
+                &mut thinking_open,
+                &mut hidden_meta_parse,
+                &mut streamer,
+                &mut hermes_streamer,
+                &mut anthropic_streamer,
+                &mut bare_xml_streamer,
+                &mut inline_markup_normalizer,
+            );
+            for ev in &events {
+                if let StreamTextEvent::AppendContent(t) = ev {
+                    visible.push_str(t);
+                }
+            }
+            tool_events_total.extend(tool_events);
+        }
+        assert!(
+            !visible.contains("DSML") && !visible.contains("invoke"),
+            "DSML markup leaked to visible content: {visible:?}; source={full:?}"
+        );
+        assert_eq!(
+            tool_events_total,
+            vec![
+                InternalToolCallStreamEvent::Begin("mcp_browser_get_text".to_string()),
+                InternalToolCallStreamEvent::Args("{}".to_string()),
+                InternalToolCallStreamEvent::End,
+            ]
+        );
+    }
 }
 
 fn push_text_with_hidden_meta(

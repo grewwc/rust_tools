@@ -1,0 +1,13 @@
+[package]
+name = "mcp_excel"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mcp_excel"
+path = "src/main.rs"
+
+[dependencies]
+# osascript 子进程驱动，无重依赖：process 用于 tokio::process::Command 调 osascript。
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "process"] }
+serde_json = "1"

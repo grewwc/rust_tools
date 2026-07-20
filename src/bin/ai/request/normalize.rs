@@ -367,6 +367,17 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         sanitized
     }
 
+    fn has_valid_function_name(tool_call: &crate::ai::types::ToolCall) -> bool {
+        // `/v1/responses` 会严格校验 replay 的 function_call.name。历史记录可能来自
+        // 中断的流或旧版本，不能让路径等参数值误写为函数名后导致整个请求 400。
+        !tool_call.function.name.is_empty()
+            && tool_call
+                .function
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }
+
     fn sanitize_tool_message_sequence(messages: Vec<Message>) -> Vec<Message> {
         fn build_unpaired_tool_evidence_note(
             reason: &str,
@@ -406,8 +417,14 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             if lines.len() <= 2 {
                 return None;
             }
+            // 这条 note 在 normalize_messages_for_request 末尾的
+            // sanitize_tool_message_sequence 内部生成，此时所有 internal_note
+            // 都已被改写为 system。若这里再用 internal_note，它会绕过 role
+            // 归一化直接进入请求，触发 provider 400（'internal_note' 不是合法
+            // role）。直接用 system：本就是给模型的 context note，语义上属于
+            // system 提示，且 mid-stream system 消息是本项目已有合法模式。
             Some(Message {
-                role: "internal_note".to_string(),
+                role: ROLE_SYSTEM.to_string(),
                 content: Value::String(lines.join("\n")),
                 tool_calls: None,
                 tool_call_id: None,
@@ -437,6 +454,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
 
             let sanitized_tool_calls = tool_calls
                 .iter()
+                .filter(|tool_call| has_valid_function_name(tool_call))
                 .map(sanitize_tool_call_for_request)
                 .collect::<Vec<_>>();
             let mut scan = idx + 1;

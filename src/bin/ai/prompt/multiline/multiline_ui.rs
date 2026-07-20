@@ -7,7 +7,11 @@ use crossterm::{
     execute,
     terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal,
+    backend::{Backend, ClearType as BackendClearType, CrosstermBackend},
+    layout::Position,
+};
 use tui_textarea::TextArea;
 
 use super::{
@@ -104,6 +108,30 @@ fn resize_inline_viewport(terminal: &mut MultilineTerminal, new_height: u16) -> 
     Ok(())
 }
 
+/// 横向 resize 后终端会先对现有内容做 reflow，此时 ratatui 保存的 viewport 顶行
+/// 还是 resize 前的坐标。根据真实 cursor 和上一帧的相对行偏移重新找到顶行，先擦除
+/// 旧 viewport，避免它在下一次 `autoresize` 重锚时被推进 scrollback。
+fn clear_reflowed_inline_viewport<B: Backend>(
+    terminal: &mut Terminal<B>,
+    cursor_offset_row: u16,
+) -> Result<(), B::Error> {
+    let cursor_position = terminal.backend_mut().get_cursor_position()?;
+    let viewport_top = cursor_position.y.saturating_sub(cursor_offset_row);
+    terminal
+        .backend_mut()
+        .set_cursor_position(Position::new(0, viewport_top))?;
+    terminal
+        .backend_mut()
+        .clear_region(BackendClearType::CurrentLine)?;
+    terminal
+        .backend_mut()
+        .clear_region(BackendClearType::AfterCursor)?;
+    terminal
+        .backend_mut()
+        .set_cursor_position(cursor_position)?;
+    terminal.backend_mut().flush()
+}
+
 fn submitted_input_preview_lines(content: &str) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut lines = content.lines();
@@ -156,6 +184,9 @@ impl PromptEditor {
         // 退出时按“最后一次实际渲染到哪里”来清理 viewport；不能依赖创建 Terminal
         // 那一刻的 cursor 位置，因为补全面板/textarea 扩容会重建 inline viewport。
         let mut last_viewport_top_row: Option<u16> = None;
+        // resize reflow 后 viewport 的绝对坐标会变化，但 cursor 在 viewport 内的相对行
+        // 不变；记录该偏移用于在下一次 autoresize 前清掉旧帧。
+        let mut last_cursor_offset_row: Option<u16> = None;
 
         let result: io::Result<Option<String>> = (|| {
             // 预填内容（编辑已有 memo 场景）：按行载入 textarea，读取后清空。
@@ -221,7 +252,7 @@ impl PromptEditor {
                     .draw(|f| {
                         let area = f.area();
                         last_viewport_top_row = Some(area.y);
-                        render_multiline_popup(
+                        last_cursor_offset_row = render_multiline_popup(
                             f,
                             &mut textarea,
                             status_msg.as_deref(),
@@ -239,9 +270,12 @@ impl PromptEditor {
                 }
                 let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
                 if matches!(event, Event::Resize(_, _)) {
-                    // `Terminal::draw` 会在下一轮调用 `autoresize`。不要在这里先清理并
-                    // 重定位 inline viewport：VS Code 终端完成横向 reflow 后，那样会把
-                    // 旧 viewport 的内容误推入 scrollback，表现为重复渲染。
+                    // VS Code 已经完成横向 reflow；先按真实 cursor 重算并清理旧 viewport，
+                    // 再让下一轮 `Terminal::draw` 调用 `autoresize` 完成重锚和重绘。
+                    if let Some(cursor_offset_row) = last_cursor_offset_row {
+                        clear_reflowed_inline_viewport(&mut terminal, cursor_offset_row)
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                    }
                     continue;
                 }
 
@@ -297,9 +331,37 @@ impl PromptEditor {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        multiline_viewport_height, submitted_input_preview_lines, viewport_height_with_completion,
+    use ratatui::{
+        Terminal,
+        backend::{Backend, TestBackend},
+        layout::Position,
+        widgets::Paragraph,
     };
+
+    use super::{
+        clear_reflowed_inline_viewport, multiline_viewport_height, submitted_input_preview_lines,
+        viewport_height_with_completion,
+    };
+
+    #[test]
+    fn clear_reflowed_viewport_uses_cursor_relative_top_and_restores_cursor() {
+        let backend = TestBackend::new(8, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new("row0\nrow1\nrow2\nrow3\nrow4"), frame.area());
+            })
+            .unwrap();
+        let cursor = Position::new(3, 4);
+        terminal.backend_mut().set_cursor_position(cursor).unwrap();
+
+        clear_reflowed_inline_viewport(&mut terminal, 2).unwrap();
+
+        assert_eq!(terminal.backend_mut().get_cursor_position().unwrap(), cursor);
+        assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "r");
+        assert_eq!(terminal.backend().buffer()[(0, 2)].symbol(), " ");
+        assert_eq!(terminal.backend().buffer()[(0, 4)].symbol(), " ");
+    }
 
     #[test]
     fn multiline_viewport_height_scales_with_terminal() {

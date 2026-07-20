@@ -2206,3 +2206,47 @@ fn normalize_messages_downgrades_image_content_for_text_only_models() {
     assert!(content.contains("[image omitted]"));
     assert!(content.contains("please explain"));
 }
+
+#[test]
+fn normalize_messages_drops_path_like_historical_tool_call_names() {
+    let messages = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: "call_bad_name".to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "stream/splitter.rs".to_string(),
+                    arguments: r#"{"path":"stream/splitter.rs"}"#.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "tool".to_string(),
+            content: Value::String("source contents".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call_bad_name".to_string()),
+            reasoning_content: None,
+        },
+    ];
+
+    let normalized = normalize_messages_for_request(&messages);
+
+    assert!(normalized.iter().all(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| calls.iter().all(|call| call.function.name != "stream/splitter.rs"))
+    }));
+    assert!(normalized.iter().all(|message| message.role != "tool"));
+    assert!(normalized.iter().any(|message| {
+        message.role == "system"
+            && message
+                .content
+                .as_str()
+                .is_some_and(|content| content.contains("source contents"))
+    }));
+}

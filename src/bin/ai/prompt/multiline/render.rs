@@ -70,7 +70,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     completion_panel: Option<&CompletionPanel>,
     model_label: &str,
     session_topic: Option<&str>,
-) {
+) -> Option<u16> {
     let area = f.area();
     let current_lines = textarea.lines().to_vec();
     let current_content = current_lines.join("\n");
@@ -212,9 +212,11 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     textarea.set_cursor_style(Style::default());
 
     f.render_widget(&*textarea, textarea_area);
-    if let Some((cursor_x, cursor_y)) = textarea_terminal_cursor(textarea, textarea_area) {
-        f.set_cursor_position((cursor_x, cursor_y));
-    }
+    let cursor_offset_row =
+        textarea_terminal_cursor(textarea, textarea_area).map(|(cursor_x, cursor_y)| {
+            f.set_cursor_position((cursor_x, cursor_y));
+            cursor_y.saturating_sub(area.y)
+        });
 
     // 渲染 completion panel
     if let Some(panel) = completion_panel {
@@ -431,6 +433,8 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             f.render_widget(status_para, status_area);
         }
     }
+
+    cursor_offset_row
 }
 
 fn completion_item_line(display: &str, selected: bool) -> Line<'_> {

@@ -32,26 +32,40 @@ const INLINE_PARSERS: &[InlineToolCallParser] = &[
 /// 把模型输出里的命名空间前缀 XML 标签归一化为标准 XML 标签，例如
 /// `<|DSML|invoke name="x">` / `<｜｜DSML｜｜invoke name="x">` → `<invoke name="x">`，
 /// `</|DSML|invoke>` / `</｜｜DSML｜｜invoke>` → `</invoke>`。
+/// 也兼容部分模型会输出的带空格分隔形态：`<｜｜DSML ｜ invoke ...>`。
 /// 这样 Hermes / Anthropic 解析器无需为每个 `<|PREFIX|>` 协议单独适配。
 pub(super) fn normalize_inline_tool_call_markup(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains("<|") && !text.contains("<｜｜") && !text.contains("</｜｜") {
+    if !text.contains("<|")
+        && !text.contains("</|")
+        && !text.contains("<｜")
+        && !text.contains("</｜")
+    {
         return std::borrow::Cow::Borrowed(text);
     }
     static OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"<(?:\|([^>|]+)\|([^\s>]+)|｜｜([^＞>]+)｜｜([^\s>]+))"#)
+        Regex::new(
+            r#"<(?:\|\s*([^>|]+?)\s*\|\s*([^\s>|｜]+)([^＞>]*)|｜\s*｜?\s*([^｜＞>]+?)\s*｜\s*｜?\s*([^\s｜＞>]+)([^＞>]*))[＞>]"#,
+        )
             .expect("valid open-tag regex")
     });
     static CLOSE_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"</(?:\|([^>|]+)\|([^\s>]+)|｜｜([^＞>]+)｜｜([^\s>]+))>"#)
+        Regex::new(
+            r#"</(?:\|\s*([^>|]+?)\s*\|\s*([^\s>|｜]+)|｜\s*｜?\s*([^｜＞>]+?)\s*｜\s*｜?\s*([^\s｜＞>]+))\s*[＞>]"#,
+        )
             .expect("valid close-tag regex")
     });
     let s = OPEN_RE.replace_all(text, |caps: &regex::Captures<'_>| {
         let local = caps
             .get(2)
-            .or_else(|| caps.get(4))
+            .or_else(|| caps.get(5))
             .map(|m| m.as_str())
             .unwrap_or("");
-        format!("<{local}")
+        let tail = caps
+            .get(3)
+            .or_else(|| caps.get(6))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        format!("<{local}{tail}>")
     });
     std::borrow::Cow::Owned(
         CLOSE_RE

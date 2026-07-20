@@ -13,7 +13,7 @@ Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`,
 an LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill
 routing, tool registry, and MCP integration.
 
-- **Workspace members**: root crate, `crates/rust_tools_macros`, `crates/aios_kernel`, `crates/mcp_browser`
+- **Workspace members**: root crate, `crates/rust_tools_macros`, `crates/aios_kernel`, `crates/mcp_browser`, `crates/mcp_excel`
 - **Platform**: macOS-first (`objc2` deps); core library cross-platform
 
 ## Top-Level Layout
@@ -26,6 +26,7 @@ src/bin/ff/                 # file-finder module embedded by `a`
 crates/aios_kernel/         # scheduler / IPC / process state machine
 crates/rust_tools_macros/   # proc macros
 crates/mcp_browser/         # standalone MCP server: browser automation via chromiumoxide (CDP)
+crates/mcp_excel/           # standalone MCP server: real Microsoft Excel automation via AppleScript (osascript)
 tests/                      # integration tests
 models.json                 # model registry
 docs/agent-guides/          # long-form on-demand subsystem docs
@@ -34,6 +35,9 @@ docs/agent-guides/          # long-form on-demand subsystem docs
 > `crates/mcp_browser` pulls in the heavy `chromiumoxide` dep, but it is a
 > **standalone binary crate** — it only compiles under `cargo build -p mcp_browser`,
 > so `cargo check --bin a` (i.e. `-p rust_tools`) stays fast and unpolluted.
+> `crates/mcp_excel` is likewise a standalone binary crate (macOS-only; zero heavy
+> deps — just `tokio` + `serde_json`); it drives the installed Excel app and never
+> compiles into `a`.
 
 ## Build / Test
 

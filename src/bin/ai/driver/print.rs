@@ -274,7 +274,7 @@ pub(in crate::ai) fn format_file_tool_target(tool_name: &str, args_json: &str) -
         "apply_patch" => {
             // 优先从 file_path / path 参数取
             for key in &["file_path", "path"] {
-                if let Some(p) = args.get(*key).and_then(|v| v.as_str()) {
+                if let Some(p) = args.get(*key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                     return Some(short_path(p));
                 }
             }
