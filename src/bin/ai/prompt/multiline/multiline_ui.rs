@@ -169,9 +169,13 @@ impl PromptEditor {
         // Inline viewport 初始化会通过 append_lines() 真实撑开终端区域。空输入默认保持
         // 紧凑，避免每轮回答后和下一轮光标之间出现大段空白；编辑已有内容时再按预填行数
         // 放大，给 textarea 保留足够空间。
+        // fallback 必须与「空输入紧凑高度」一致：某些终端（如 VS Code 集成终端）在
+        // 特定时序下 ioctl(TIOCGWINSZ) 会短暂失败，此时若回落到一个更大的值，textarea
+        // 顶部会多撑出额外空行，表现为正文与 model/help 之间的大段空白。用
+        // EMPTY_VIEWPORT_HEIGHT 兜底可保证拿不到尺寸时仍是最紧凑的空框。
         let mut base_viewport_height = terminal_size()
             .map(|(_, h)| multiline_viewport_height(h, self.pending_prefill.as_deref()))
-            .unwrap_or(6);
+            .unwrap_or(EMPTY_VIEWPORT_HEIGHT);
 
         let mut terminal = match build_inline_terminal(base_viewport_height) {
             Ok(terminal) => terminal,
