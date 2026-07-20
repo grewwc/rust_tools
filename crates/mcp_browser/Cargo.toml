@@ -1,0 +1,18 @@
+[package]
+name = "mcp_browser"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mcp_browser"
+path = "src/main.rs"
+
+[dependencies]
+# tokio-only CDP driver; fetcher (downloads Chromium) is NOT a default feature, so it stays disabled.
+chromiumoxide = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "sync"] }
+serde_json = "1"
+futures-util = "0.3"
+# 仅用于 kill(pid, 0) 探测残留 profile 对应的进程是否已死（启动时 GC）。
+# 已由 chromiumoxide 传递引入，加此显式依赖零新增编译成本。
+libc = "0.2"
