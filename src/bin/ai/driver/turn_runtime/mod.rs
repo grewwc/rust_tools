@@ -38,6 +38,10 @@ pub(crate) use prepare::QuestionShape;
 use tool_result::{prepare_recent_tool_result, prepare_tool_result};
 pub(super) use types::TurnOutcome;
 
+pub(super) async fn maybe_generate_session_title(app: &super::App, run_in_background: bool) {
+    finalize::maybe_generate_session_title(app, run_in_background).await;
+}
+
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
 const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
 /// 首次 overflow stub 中的 head 预览字符数。

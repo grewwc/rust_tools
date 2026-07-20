@@ -488,6 +488,10 @@ pub(in crate::ai) async fn run_with_cli(
         eprintln!("[persona] failed to persist session binding: {}", err);
     }
 
+    // 旧 session 可能还没有生成式标题；恢复时立即在后台补齐，避免必须再完成一个
+    // 新 turn 才触发，同时不让标题模型请求阻塞输入界面启动。
+    turn_runtime::maybe_generate_session_title(&app, true).await;
+
     run_loop(
         &mut app,
         &mcp_client,

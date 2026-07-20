@@ -47,6 +47,11 @@ docs/agent-guides/          # long-form on-demand subsystem docs
 
 ## Build / Test
 
+> **Do not call `cargo check` / `cargo test` unless strictly required.** These
+> commands are very expensive in this project (heavy deps, unstable incremental
+> compilation). Only run them when the verification ladder explicitly demands it.
+> Prefer confirming correctness by reading code over running Cargo commands.
+
 ```bash
 cargo check --bin a                  # fast type-check for the main binary
 cargo check -p aios_kernel           # type-check one workspace crate
@@ -103,6 +108,12 @@ the user asks for broader verification.
     `if`/`else` fallbacks to work around a design problem. If a code path needs many
     layers of fallback to function correctly, the abstraction or data flow is wrong —
     refactor the design first so the happy path is clean and straightforward.
+12. **No unnecessary Cargo commands**: `cargo check` / `cargo test` are very
+    expensive in this project. Only run them when the verification ladder
+    explicitly demands it, and always use the narrowest possible scope.
+12. **非必要不调用 Cargo 命令**: `cargo check` / `cargo test` 在本项目中非常耗时。
+    能通过阅读代码确认正确性的，绝不调用 Cargo 命令。只有在验证阶梯
+    （Verification ladder）明确要求时才运行，且必须限定最小范围。
 
 ## High-Value Pitfalls
 
