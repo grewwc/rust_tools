@@ -319,7 +319,7 @@ fn params_knowledge_search() -> Value {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Search query."
+                "description": "Keywords to match. Use knowledge_semantic_search for paraphrases or related concepts."
             },
             "category": {
                 "type": "string",
@@ -400,7 +400,7 @@ fn knowledge_search_entry_visible(entry: &AgentMemoryEntry, category: Option<&st
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_search",
-        description: "Search knowledge base entries by keyword. Returns matching entries with their ids.",
+        description: "Search saved knowledge by keywords. For paraphrases or related concepts, use knowledge_semantic_search.",
         parameters: params_knowledge_search,
         execute: execute_knowledge_search,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,

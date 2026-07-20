@@ -590,46 +590,8 @@ mod tests {
     // activate_skill 系列测试共享同一个全局待激活槽位，串行化避免并发污染。
     static ACTIVATION_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     #[test]
-    fn discover_skills_returns_builtin_skill_metadata() {
-        let args = serde_json::json!({
-            "query": "debug",
-            "limit": 10
-        });
-        let out = execute_discover_skills(&args).unwrap();
-        assert!(out.contains("debugger"));
-        assert!(out.contains("metadata only"));
-        assert!(!out.contains("Skill enforcement"));
-    }
-
-    #[test]
-    fn discover_skills_can_include_capabilities() {
-        let args = serde_json::json!({
-            "query": "review",
-            "limit": 10,
-            "include_capabilities": true
-        });
-        let out = execute_discover_skills(&args).unwrap();
-        assert!(out.contains("code-review"));
-        assert!(out.contains("tools=") || out.contains("tool_groups="));
-    }
-
-    #[test]
     fn discover_query_extracts_meaningful_tokens_from_sentence() {
         assert!(query_tokens("帮我查一个 argos 日志").contains(&"argos".to_string()));
-    }
-
-    #[test]
-    fn discover_skills_matches_chinese_query_against_english_skill() {
-        // 中文 query 搜英文 builtin skill：纯子串匹配会失效，语义打分应能召回。
-        let args = serde_json::json!({
-            "query": "帮我审查一下这段代码",
-            "limit": 20
-        });
-        let out = execute_discover_skills(&args).unwrap();
-        assert!(
-            out.contains("code-review"),
-            "expected cross-lingual semantic match to surface code-review, got:\n{out}"
-        );
     }
 
     #[test]
@@ -732,14 +694,6 @@ mod tests {
         let err =
             execute_load_skill(&serde_json::json!({"name": "definitely-not-a-skill"})).unwrap_err();
         assert!(err.contains("No skill named"));
-    }
-
-    #[test]
-    fn load_skill_returns_prompt_body_for_builtin() {
-        // 取一个真实存在、prompt 非空的 skill（builtin debugger 一定在）。
-        let out = execute_load_skill(&serde_json::json!({"name": "debugger"})).unwrap();
-        assert!(out.contains("# Skill: debugger"));
-        assert!(out.contains("## prompt"));
     }
 
     #[test]

@@ -90,7 +90,8 @@ fn params_spawn_process() -> Value {
                     "env_write": { "type": "boolean" },
                     "manage_children": { "type": "boolean" },
                     "sleep": { "type": "boolean" },
-                    "reap": { "type": "boolean" }
+                    "reap": { "type": "boolean" },
+                    "signal": { "type": "boolean" }
                 }
             },
             "allowed_tools": {
@@ -1120,6 +1121,14 @@ mod tests {
             assert!(output.contains("general:mailbox"));
             assert!(output.contains("general"));
         });
+    }
+
+    #[test]
+    fn spawn_process_schema_exposes_signal_capability() {
+        assert_eq!(
+            params_spawn_process()["properties"]["capabilities"]["properties"]["signal"],
+            serde_json::json!({ "type": "boolean" })
+        );
     }
 
     #[test]

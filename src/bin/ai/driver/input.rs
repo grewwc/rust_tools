@@ -1876,12 +1876,9 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
         editor.set_session_id(app.session_id.clone());
         // 设置 session 主题：从当前 session 的首条用户消息生成概括性标题。
         // 若 session 尚无用户消息（新 session），显示 "new session"。
-        // SessionStore 需要 session 文件所在目录（而非 history 文件本身）。
-        let sessions_dir = app
-            .session_history_file
-            .parent()
-            .unwrap_or_else(|| app.session_history_file.as_path());
-        let store = crate::ai::history::SessionStore::new(sessions_dir);
+        // SessionStore 从基础 history 文件推导 `<stem>.sessions/`；传入当前
+        // session 文件的父目录会生成嵌套路径，导致读不到已生成的标题。
+        let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
         // 优先使用 LLM 生成的标题，fallback 到首条消息摘要
         let topic = match store.read_session_title(&app.session_id).ok().flatten() {
             Some(t) => {

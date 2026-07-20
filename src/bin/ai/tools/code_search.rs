@@ -161,7 +161,12 @@ pub(crate) fn execute_code_search(args: &Value) -> Result<String, String> {
         "hover" => execute_code_lsp_with_file(args, "hover"),
         "diagnostics" => execute_code_lsp_with_file(args, "diagnostics"),
         "structural" => execute_code_structural(args),
-        other => Err(format!("Unknown code_search operation: {}", other)),
+        other => Err(format!(
+            "Unknown code_search operation '{other}'. Use: find_file, text_search, \
+             workspace_symbol, document_symbol, go_to_definition, find_references, hover, \
+             diagnostics, or structural. For AST searches, use structural with intent \
+             find_functions, find_classes, find_methods, or find_calls."
+        )),
     }
 }
 
@@ -1281,6 +1286,18 @@ mod tests {
                 .unwrap()
                 .contains(&Value::String("operation".to_string()))
         );
+    }
+
+    #[test]
+    fn unknown_operation_lists_supported_operations() {
+        let error = execute_code_search(&serde_json::json!({
+            "operation": "invalid"
+        }))
+        .expect_err("invalid operation must fail");
+
+        assert!(error.contains("find_file"), "{error}");
+        assert!(error.contains("structural"), "{error}");
+        assert!(error.contains("find_functions"), "{error}");
     }
 
     #[test]

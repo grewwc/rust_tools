@@ -11,6 +11,9 @@ struct FileSnapshot {
     path: String,
     content: Option<String>,
     existed_before: bool,
+    /// `None` 表示旧调用方仅记录了写前快照；新调用方会同时记录写后状态以支持正确 redo。
+    existed_after: Option<bool>,
+    content_after: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +26,42 @@ struct ChangeSet {
 static UNDO_STACK: Mutex<VecDeque<ChangeSet>> = Mutex::new(VecDeque::new());
 static REDO_STACK: Mutex<VecDeque<ChangeSet>> = Mutex::new(VecDeque::new());
 const MAX_UNDO_HISTORY: usize = 50;
+
+/// 已成功完成的文件变更。由批量工具在全部落盘后一次性提交，避免失败操作污染 undo 栈。
+pub(crate) struct CompletedFileChange {
+    pub(crate) path: String,
+    pub(crate) before: Option<String>,
+    pub(crate) after: Option<String>,
+}
+
+pub(crate) fn record_completed_change_set(description: &str, changes: Vec<CompletedFileChange>) {
+    if changes.is_empty() {
+        return;
+    }
+
+    let files = changes
+        .into_iter()
+        .map(|change| FileSnapshot {
+            path: change.path,
+            existed_before: change.before.is_some(),
+            content: change.before,
+            existed_after: Some(change.after.is_some()),
+            content_after: change.after,
+        })
+        .collect();
+
+    let mut undo_stack = UNDO_STACK.lock().unwrap();
+    let mut redo_stack = REDO_STACK.lock().unwrap();
+    undo_stack.push_back(ChangeSet {
+        files,
+        description: description.to_string(),
+        timestamp: chrono::Local::now().timestamp(),
+    });
+    redo_stack.clear();
+    while undo_stack.len() > MAX_UNDO_HISTORY {
+        undo_stack.pop_front();
+    }
+}
 
 pub(crate) fn snapshot_file_before_write(path: &str) {
     let file_path = Path::new(path);
@@ -37,6 +76,8 @@ pub(crate) fn snapshot_file_before_write(path: &str) {
         path: path.to_string(),
         content,
         existed_before,
+        existed_after: None,
+        content_after: None,
     };
 
     let mut stack = UNDO_STACK.lock().unwrap();
@@ -223,7 +264,25 @@ pub(crate) fn execute_redo(args: &Value) -> Result<String, String> {
             for snapshot in &change_set.files {
                 let path = Path::new(&snapshot.path);
 
-                if !snapshot.existed_before {
+                if let Some(existed_after) = snapshot.existed_after {
+                    if existed_after {
+                        let content = snapshot.content_after.as_ref().ok_or_else(|| {
+                            format!(
+                                "Cannot redo {}: completed change is missing its after content",
+                                snapshot.path
+                            )
+                        })?;
+                        if let Some(parent) = path.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        fs::write(path, content)
+                            .map_err(|e| format!("Failed to reapply {}: {}", snapshot.path, e))?;
+                        reapplied_files.push(format!("  Reapplied changes to: {}", snapshot.path));
+                    } else {
+                        let _ = fs::remove_file(path);
+                        reapplied_files.push(format!("  Deleted: {}", snapshot.path));
+                    }
+                } else if !snapshot.existed_before {
                     if let Some(content) = &snapshot.content {
                         if let Some(parent) = path.parent() {
                             let _ = fs::create_dir_all(parent);

@@ -31,20 +31,7 @@ use rust_tools::cw::SkipMap;
 use crate::ai::config_schema::AiConfig;
 use crate::commonw::{configw, utils::expanduser};
 
-const BUILTIN_SKILLS: &[(&str, &str)] = &[
-    (
-        "debugger.skill",
-        include_str!("builtin_skills/debugger.skill"),
-    ),
-    (
-        "code-review.skill",
-        include_str!("builtin_skills/code-review.skill"),
-    ),
-    (
-        "refactor.skill",
-        include_str!("builtin_skills/refactor.skill"),
-    ),
-];
+const BUILTIN_SKILLS: &[(&str, &str)] = &[];
 
 fn default_skill_version() -> String {
     "1.0.0".to_string()
@@ -694,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn load_all_skills_includes_builtin_even_when_user_has_custom_skill() {
+    fn load_all_skills_loads_user_skill_without_builtins() {
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -721,38 +708,19 @@ custom"#,
         )
         .unwrap();
 
-        std::fs::write(
-            dir.join("code-review.skill"),
-            r#"---
-name: code-review
-description: override
-priority: 999
----
-
-override"#,
-        )
-        .unwrap();
-
         let skills = load_all_skills();
         let mut names = SkipSet::new(8);
         for s in &skills {
             names.insert(s.name.clone());
         }
+        let custom = "custom-skill".to_string();
         let debugger = "debugger".to_string();
         let code_review = "code-review".to_string();
         let refactor = "refactor".to_string();
-        let custom = "custom-skill".to_string();
-        assert!(names.contains(&debugger));
-        assert!(names.contains(&code_review));
-        assert!(names.contains(&refactor));
         assert!(names.contains(&custom));
-        let code_review = skills.iter().find(|s| s.name == "code-review").unwrap();
-        assert!(
-            code_review
-                .source_path
-                .as_deref()
-                .is_some_and(|p| p.starts_with("builtin:"))
-        );
+        assert!(!names.contains(&debugger));
+        assert!(!names.contains(&code_review));
+        assert!(!names.contains(&refactor));
 
         match old_home {
             Some(v) => unsafe {

@@ -11,6 +11,9 @@ use crate::ai::tools::common::{
 };
 use crate::commonw::utils::expanduser;
 
+const DEFAULT_FIND_PATH_MAX_RESULTS: usize = 100;
+const MAX_FIND_PATH_RESULTS: usize = 1_000;
+
 fn params_list_directory() -> Value {
     serde_json::json!({
         "type": "object",
@@ -30,11 +33,17 @@ fn params_find_path() -> Value {
         "properties": {
             "pattern": {
                 "type": "string",
-                "description": "Filename, path suffix, or glob pattern to match (e.g. \"Cargo.toml\", \"*.rs\", \"src/**\"). Exact filenames (no wildcards) use a fast BFS and return the first match."
+                "description": "Exact basename or glob to match (for example: \"Cargo.toml\", \"*.rs\", \"src/**\")."
             },
             "path": {
                 "type": "string",
                 "description": "Root directory to search in (default: \".\"). Returned paths are canonical absolute paths. Common build/cache/VCS dirs are skipped during recursion; pass such a dir explicitly as path to search inside it."
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum paths to return (default: 100; max: 1000).",
+                "minimum": 1,
+                "maximum": 1000
             }
         },
         "required": ["pattern"]
@@ -55,7 +64,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "find_path",
-        description: "Fast file-path finder under a root directory using filename, path-suffix, or glob match. This locates FILES by their path, not text inside files. For full-text matches, use an available content-search tool. Returns canonical absolute paths, one per line (empty output means no matches).",
+        description: "Find paths by exact basename or glob. Searches paths, not file contents; use content search for text. Returns absolute paths, one per line.",
         parameters: params_find_path,
         execute: execute_find_path,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
@@ -101,6 +110,15 @@ pub(crate) fn execute_list_directory(args: &Value) -> Result<String, String> {
 pub(crate) fn execute_find_path(args: &Value) -> Result<String, String> {
     let pattern = args["pattern"].as_str().ok_or("Missing pattern")?;
     let path = args["path"].as_str().unwrap_or(".");
+    let max_results = match args.get("max_results").and_then(Value::as_u64) {
+        Some(value) if value == 0 || value > MAX_FIND_PATH_RESULTS as u64 => {
+            return Err(format!(
+                "max_results must be between 1 and {MAX_FIND_PATH_RESULTS}"
+            ));
+        }
+        Some(value) => value as usize,
+        None => DEFAULT_FIND_PATH_MAX_RESULTS,
+    };
 
     let target = pattern.trim();
     if target.is_empty() {
@@ -127,19 +145,21 @@ pub(crate) fn execute_find_path(args: &Value) -> Result<String, String> {
         if p.is_absolute() { p } else { cwd.join(p) }
     };
 
-    // 快速路径：精确文件名（非 glob 模式）直接 BFS 命中即返回，
+    // 快速路径：精确文件名（非 glob 模式）直接 BFS 查找，
     // 避免每次都拉起 ff_embed 多线程 runtime 全量遍历
     if !glob_mode {
-        if let Some(found) = find_first_file_by_name(&base_dir, target) {
-            let abs = fs::canonicalize(&found).unwrap_or(found);
-            return Ok(abs.to_string_lossy().trim().to_string());
-        }
-        return Ok(String::new());
+        let output = find_paths_by_name(&base_dir, target, max_results)
+            .into_iter()
+            .map(|found| fs::canonicalize(&found).unwrap_or(found))
+            .map(|abs| abs.to_string_lossy().trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(output);
     }
 
     // glob 模式：优先尝试 ff_embed 多线程搜索（大仓库更快），
     // 失败时回退到 terminalw 单线程 glob
-    let result = run_glob_ff_embed(target, &root_pat, &base_dir);
+    let result = run_glob_ff_embed(target, &root_pat, &base_dir, max_results);
     match result {
         Ok(output) if !output.trim().is_empty() => {
             return Ok(truncate_chars(output.trim(), 16_000));
@@ -152,12 +172,17 @@ pub(crate) fn execute_find_path(args: &Value) -> Result<String, String> {
         }
     }
 
-    let fallback = run_glob_terminalw(target, path, &base_dir)?;
+    let fallback = run_glob_terminalw(target, path, &base_dir, max_results)?;
     Ok(truncate_chars(fallback.trim(), 16_000))
 }
 
 /// 使用 ff_embed 多线程搜索引擎进行 glob 匹配
-fn run_glob_ff_embed(target: &str, root_pat: &str, base_dir: &Path) -> Result<String, String> {
+fn run_glob_ff_embed(
+    target: &str,
+    root_pat: &str,
+    base_dir: &Path,
+    max_results: usize,
+) -> Result<String, String> {
     let wd = fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
 
     let opts = crate::ai::ff_embed::cli::Options {
@@ -167,7 +192,7 @@ fn run_glob_ff_embed(target: &str, root_pat: &str, base_dir: &Path) -> Result<St
         glob_mode: true,
         case_insensitive: false,
         relative: false,
-        num_print: i64::MAX,
+        num_print: max_results as i64,
         thread_count: rust_tools::commonw::half_parallelism(),
         wd,
         root_pat: root_pat.to_string(),
@@ -200,7 +225,12 @@ fn run_glob_ff_embed(target: &str, root_pat: &str, base_dir: &Path) -> Result<St
 }
 
 /// 使用 terminalw 单线程 glob 作为回退方案
-fn run_glob_terminalw(target: &str, path: &str, base_dir: &Path) -> Result<String, String> {
+fn run_glob_terminalw(
+    target: &str,
+    path: &str,
+    base_dir: &Path,
+    max_results: usize,
+) -> Result<String, String> {
     let matches =
         crate::terminalw::glob_paths(target, path).map_err(|e| format!("glob failed: {e}"))?;
     let out: Vec<String> = matches
@@ -212,23 +242,27 @@ fn run_glob_terminalw(target: &str, path: &str, base_dir: &Path) -> Result<Strin
             fs::canonicalize(&abs).unwrap_or(abs)
         })
         .filter(|abs| !rust_tools::commonw::path_contains_skip_dir(abs))
+        .take(max_results)
         .map(|abs| abs.to_string_lossy().to_string())
         .collect();
     Ok(out.join("\n"))
 }
 
-fn find_first_file_by_name(root: &Path, filename: &str) -> Option<PathBuf> {
+fn find_paths_by_name(root: &Path, filename: &str, max_results: usize) -> Vec<PathBuf> {
     if filename.trim().is_empty() {
-        return None;
+        return Vec::new();
     }
 
     if root.is_file() {
         let name = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        return (name == filename).then_some(root.to_path_buf());
+        return (name == filename)
+            .then_some(root.to_path_buf())
+            .into_iter()
+            .collect();
     }
 
     if !root.is_dir() {
-        return None;
+        return Vec::new();
     }
 
     let mut queue = VecDeque::new();
@@ -236,11 +270,12 @@ fn find_first_file_by_name(root: &Path, filename: &str) -> Option<PathBuf> {
 
     let mut scanned_dirs = 0usize;
     let max_dirs = 50_000usize;
+    let mut matches = Vec::new();
 
     while let Some(dir) = queue.pop_front() {
         scanned_dirs += 1;
         if scanned_dirs > max_dirs {
-            return None;
+            break;
         }
 
         let entries = match fs::read_dir(&dir) {
@@ -252,7 +287,10 @@ fn find_first_file_by_name(root: &Path, filename: &str) -> Option<PathBuf> {
             let file_name = file_name.to_string_lossy();
             let file_name = file_name.as_ref();
             if file_name == filename {
-                return Some(entry.path());
+                matches.push(entry.path());
+                if matches.len() >= max_results {
+                    return matches;
+                }
             }
 
             // 不能用 `?` —— 单个 entry 的 file_type() 失败（broken symlink / 权限不足）
@@ -266,7 +304,7 @@ fn find_first_file_by_name(root: &Path, filename: &str) -> Option<PathBuf> {
         }
     }
 
-    None
+    matches
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -319,6 +357,27 @@ mod tests {
             "should find target.txt by name, got: {}",
             output
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_path_honors_max_results_for_exact_names() {
+        let dir = make_temp_dir("findpath_limit");
+        fs::create_dir_all(dir.join("one")).unwrap();
+        fs::create_dir_all(dir.join("two")).unwrap();
+        fs::write(dir.join("one/target.txt"), "").unwrap();
+        fs::write(dir.join("two/target.txt"), "").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "target.txt",
+            "path": dir.to_string_lossy(),
+            "max_results": 2
+        });
+        let output = execute_find_path(&args).unwrap();
+
+        assert_eq!(output.lines().count(), 2, "expected both matching paths");
+        assert!(output.lines().all(|path| path.ends_with("target.txt")));
 
         let _ = fs::remove_dir_all(&dir);
     }

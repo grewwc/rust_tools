@@ -28,7 +28,7 @@ fn params_context_status() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "compact_context",
-        description: "Manually trigger context compaction to reduce token usage. Compresses older conversation turns into a concise summary while keeping recent turns intact. Use this when the conversation gets long and you want to optimize for token efficiency.",
+        description: "Explain the runtime's automatic context compaction behavior. This informational tool does not apply manual compaction or its parameters; the runtime independently summarizes older turns when its token budget is exceeded.",
         parameters: params_compact_context,
         execute: execute_compact_context,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -39,7 +39,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "context_status",
-        description: "Show current context usage including approximate token count and compression status.",
+        description: "Show the runtime's context-management policy. Live token usage, message counts, and compression metrics are not available through this tool.",
         parameters: params_context_status,
         execute: execute_context_status,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -61,22 +61,18 @@ pub(crate) fn execute_compact_context(args: &Value) -> Result<String, String> {
 
     Ok(format!(
         "Context compaction is handled automatically by the runtime when the token budget is exceeded. \
-        Manual compaction parameters (keep_recent_turns={}, summary_max_chars={}) are noted but \
-        not applied — the runtime uses its own mid-turn summarization strategy. \
-        To reduce context usage, try ending the session and starting a new one, or avoid repeating \
-        large file contents in your messages.",
+        This tool cannot apply keep_recent_turns={} or summary_max_chars={}; the runtime uses its \
+        own mid-turn summarization strategy. To reduce context usage, avoid repeating large file \
+        contents in messages.",
         keep_recent, summary_max
     ))
 }
 
 pub(crate) fn execute_context_status(_args: &Value) -> Result<String, String> {
-    let status = "Context compaction: enabled\n\
-                  Auto-compression: active\n\
-                  Strategy: Summarize older turns, keep recent turns intact\n\n\
-                  Tips:\n\
-                  - Use compact_context to manually trigger compression\n\
-                  - Context is automatically managed during long conversations\n\
-                  - Recent turns are always preserved for continuity";
+    let status = "Context-management policy:\n\
+                  - The runtime automatically summarizes older turns when its token budget is exceeded.\n\
+                  - Live token usage, message count, and compression metrics are unavailable.\n\
+                  - compact_context cannot manually trigger or configure compaction.";
 
     Ok(status.to_string())
 }

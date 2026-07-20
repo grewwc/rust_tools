@@ -21,7 +21,7 @@ fn params_semantic_search() -> Value {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Search query (semantic). The search understands meaning, not just keywords."
+                "description": "Meaning-based query; falls back to keyword search without embeddings."
             },
             "category": {
                 "type": "string",
@@ -167,7 +167,7 @@ fn execute_semantic_search(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_semantic_search",
-        description: "Search knowledge base using semantic (vector) similarity. Understands meaning beyond keywords. Use this when keyword search fails to find relevant results.",
+        description: "Search saved knowledge by meaning; falls back to keyword search without embeddings.",
         parameters: params_semantic_search,
         execute: execute_semantic_search,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,

@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashSet;
@@ -8,6 +9,7 @@ use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::common::ToolStreamWriter;
 use crate::ai::tools::common::ToolStreamingRegistration;
 use crate::ai::tools::storage::file_store::FileStore;
+use crate::ai::tools::undo_tools::{CompletedFileChange, record_completed_change_set};
 
 fn params_apply_patch() -> Value {
     serde_json::json!({
@@ -15,11 +17,15 @@ fn params_apply_patch() -> Value {
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "Preferred absolute path to the file to patch (some sensitive paths are blocked). Optional when the patch is wrapped in a `*** Begin Patch` envelope that already names its target path(s). The runtime also accepts `path` as a compatibility alias. For multi-file Begin Patch envelopes, do NOT also pass `file_path` / `path` — each section must declare its own target."
+                "description": "Absolute target path for a single-file unified diff. Optional for a Begin Patch envelope. Do not provide it for a multi-file envelope; each section declares its own path. `path` is accepted as a compatibility alias."
             },
             "patch": {
                 "type": "string",
-                "description": "Patch text. Accepted formats: raw unified-diff hunks starting with @@ (single target via `file_path` / `path`), or a `*** Begin Patch` envelope with one or more `*** Update File:` / `*** Add File:` / `*** Replace in line:` sections. In unified-diff hunks every content line MUST start with a prefix: ` ` (space) for context, `-` for removal, `+` for addition. Critical rules: (1) do NOT wrap the patch in a code fence; (2) do NOT copy line-number prefixes from read tools; (3) to avoid `ambiguous patch`, include function names or unique surrounding lines as anchor context so each hunk matches exactly one location; (4) to avoid `context mismatch` after a previous edit to the same file, ALWAYS re-read the file with read_file/read_file_lines first and rebuild the patch from the fresh content — patches based on stale content WILL fail; (5) if one Begin Patch envelope edits multiple files, each target path may appear only once in that envelope."
+                "description": "Patch content. Use either unified-diff hunks (`@@` header; content lines begin with space, `-`, or `+`) or a `*** Begin Patch` envelope. Envelope sections support `*** Update File:`, `*** Add File:`, `*** Delete File:`, and `*** Replace in line:`. Do not wrap it in a Markdown code fence. Include unique surrounding context and do not repeat a target path within one multi-file envelope."
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "When true, parse, sandbox-check, and match every patch section without writing any file. Defaults to false."
             }
         },
         "required": ["patch"]
@@ -29,7 +35,7 @@ fn params_apply_patch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply a localized patch. Supports raw unified-diff hunks for a single target file, or a `*** Begin Patch` envelope with one or more `*** Update File:`, `*** Add File:`, or `*** Replace in line:` sections. Prefer this over rewriting entire files. Multi-file Begin Patch envelopes are prepared first and written only after every section validates, so one failing section does not leave a half-applied batch. Creates missing parent directories; removals must match exactly, context is fuzzed only when removals uniquely anchor the hunk. Common pitfalls and how to avoid them: (1) `ambiguous patch` → add more unique surrounding context (function names, distinctive lines) so each hunk matches exactly one location; (2) `context mismatch` after a prior edit to the same file → you MUST re-read the file with read_file/read_file_lines first and rebuild the patch from fresh content; (3) in a multi-file Begin Patch envelope, do not also pass `file_path` / `path`, and do not mention the same target path twice.",
+        description: "Apply a localized patch; prefer it to rewriting a whole file. Supports a unified-diff hunk for one `file_path`, or a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, `*** Delete File:`, or `*** Replace in line:` sections. Multi-file envelopes are fully validated before writing, rechecked immediately before commit, and rolled back if a write fails. Use `dry_run` to validate without changing files. Re-read a file after any edit before retrying a patch.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -59,6 +65,7 @@ enum UnifiedLine {
 enum PatchEnvelopeOp {
     Update,
     Add,
+    Delete,
     /// 行内子串替换：用 `anchor:` 定位行，在该行内将 `old:` 精确替换为 `new:`。
     /// 不走 unified-diff 路径，由 `apply_inline_replace` 直接处理。
     ReplaceInLine,
@@ -74,7 +81,14 @@ struct PatchEnvelope {
 #[derive(Debug)]
 struct PreparedPatchWrite {
     path: PathBuf,
-    next: String,
+    before: Option<String>,
+    action: PreparedPatchAction,
+}
+
+#[derive(Debug)]
+enum PreparedPatchAction {
+    Write(String),
+    Delete,
 }
 
 fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
@@ -129,9 +143,7 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             // 残缺 envelope 误入 unified-diff 路径，目标文件由 file_path 决定、而非
             // envelope 声明--此时静默应用可能写到错误文件。故不 break，让该行落入
             // 下方 _ => 分支报"格式混用"错误，由模型重建，绝不静默错写。
-            if (next == "*** End Patch" || next == "*** End of File")
-                && !saw_envelope_marker
-            {
+            if (next == "*** End Patch" || next == "*** End of File") && !saw_envelope_marker {
                 break;
             }
             let l = iter.next().unwrap_or_default();
@@ -200,10 +212,13 @@ fn optional_file_path_arg(args: &Value) -> Option<&str> {
     args.get("file_path")
         .or_else(|| args.get("path"))
         .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
 }
 
 fn ensure_patch_target_matches(target_path: &Path, envelope_path: &str) -> Result<(), String> {
-    let resolved_target = FileStore::new(target_path.to_path_buf()).path().to_path_buf();
+    let resolved_target = FileStore::new(target_path.to_path_buf())
+        .path()
+        .to_path_buf();
     let resolved_envelope = FileStore::new(PathBuf::from(envelope_path))
         .path()
         .to_path_buf();
@@ -222,14 +237,14 @@ fn parse_patch_header(header: &str) -> Result<(PatchEnvelopeOp, &str), String> {
         Ok((PatchEnvelopeOp::Update, path.trim()))
     } else if let Some(path) = header.strip_prefix("*** Add File: ") {
         Ok((PatchEnvelopeOp::Add, path.trim()))
+    } else if let Some(path) = header.strip_prefix("*** Delete File: ") {
+        Ok((PatchEnvelopeOp::Delete, path.trim()))
     } else if let Some(path) = header.strip_prefix("*** Replace in line: ") {
         Ok((PatchEnvelopeOp::ReplaceInLine, path.trim()))
-    } else if header.starts_with("*** Delete File: ") {
-        Err("apply_patch does not support Delete File envelopes".to_string())
     } else {
         Err(
             "invalid patch envelope: expected `*** Update File:`, `*** Add File:`, \
-             or `*** Replace in line:`"
+             `*** Delete File:`, or `*** Replace in line:`"
                 .to_string(),
         )
     }
@@ -408,6 +423,12 @@ fn normalize_patch_envelope(path: &Path, envelope: &PatchEnvelope) -> Result<Str
                 normalized.push_str(&normalized_body.join("\n"));
             }
             normalized
+        }
+        PatchEnvelopeOp::Delete => {
+            return Err(
+                "internal error: Delete File envelopes should be handled by prepare_patch_write"
+                    .to_string(),
+            );
         }
     })
 }
@@ -1333,40 +1354,192 @@ fn format_patch_success(paths: &[PathBuf]) -> String {
     message
 }
 
+fn format_patch_dry_run(paths: &[PathBuf]) -> String {
+    if paths.len() == 1 {
+        return format!(
+            "Dry run succeeded; no files changed: {}",
+            paths[0].display()
+        );
+    }
+    let mut message = format!(
+        "Dry run succeeded for {} files; no files changed:",
+        paths.len()
+    );
+    for path in paths {
+        message.push_str(&format!("\n- {}", path.display()));
+    }
+    message
+}
+
+fn dry_run_arg(args: &Value) -> Result<bool, String> {
+    match args.get("dry_run") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(value) => Err(format!(
+            "[INVALID_ARGUMENT] `dry_run` must be a boolean, got {}",
+            value_type_name(value)
+        )),
+    }
+}
+
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 fn prepare_patch_write(
     path: &Path,
     store: &FileStore,
     envelope: &PatchEnvelope,
 ) -> Result<PreparedPatchWrite, String> {
+    if envelope.op == PatchEnvelopeOp::Delete {
+        if !envelope.body_lines.is_empty() {
+            return Err("Delete File sections must not contain patch content".to_string());
+        }
+        let metadata = fs::symlink_metadata(path).map_err(|err| {
+            format!(
+                "Delete File target does not exist or cannot be inspected: {} ({err})",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Delete File refuses symbolic links: {}. Delete the link explicitly outside apply_patch.",
+                path.display()
+            ));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "Delete File only supports regular files, not directories or special files: {}",
+                path.display()
+            ));
+        }
+        return Ok(PreparedPatchWrite {
+            path: path.to_path_buf(),
+            before: Some(store.read_to_string().map_err(|err| err.to_string())?),
+            action: PreparedPatchAction::Delete,
+        });
+    }
+
+    let before = if path.exists() {
+        Some(store.read_to_string().map_err(|err| err.to_string())?)
+    } else {
+        None
+    };
+    let original = before.as_deref().unwrap_or_default();
     let next = if envelope.op == PatchEnvelopeOp::ReplaceInLine {
-        let original = if path.exists() {
-            store.read_to_string().map_err(|err| err.to_string())?
-        } else {
+        if before.is_none() {
             return Err(format!(
                 "Replace in line: target file does not exist: {}",
                 path.display()
             ));
-        };
-        apply_inline_replace(&original, envelope)?
+        }
+        apply_inline_replace(original, envelope)?
     } else {
         let normalized_patch = normalize_patch_envelope(path, envelope)?;
-        let original = if path.exists() {
-            store.read_to_string().map_err(|err| err.to_string())?
-        } else {
-            String::new()
-        };
-        apply_unified_patch(&original, &normalized_patch)?
+        apply_unified_patch(original, &normalized_patch)?
     };
     Ok(PreparedPatchWrite {
         path: path.to_path_buf(),
-        next,
+        before,
+        action: PreparedPatchAction::Write(next),
     })
 }
 
-fn execute_apply_patch_impl(
-    args: &Value,
-    mut emit: impl FnMut(&str),
-) -> Result<String, String> {
+fn verify_patch_write_is_current(write: &PreparedPatchWrite) -> Result<(), String> {
+    let current = if write.path.exists() {
+        Some(
+            FileStore::new(write.path.clone())
+                .read_to_string()
+                .map_err(|err| err.to_string())?,
+        )
+    } else {
+        None
+    };
+    if current == write.before {
+        return Ok(());
+    }
+    Err(format!(
+        "[FILE_CHANGED] {} changed since this patch was prepared. Re-read it and rebuild the patch before retrying.",
+        write.path.display()
+    ))
+}
+
+fn apply_prepared_patch_write(write: &PreparedPatchWrite) -> Result<(), String> {
+    match &write.action {
+        PreparedPatchAction::Write(next) => FileStore::new(write.path.clone())
+            .write_all(next)
+            .map_err(|err| err.to_string()),
+        PreparedPatchAction::Delete => fs::remove_file(&write.path)
+            .map_err(|err| format!("Failed to delete {}: {err}", write.path.display())),
+    }
+}
+
+fn restore_prepared_patch_write(write: &PreparedPatchWrite) -> Result<(), String> {
+    match &write.before {
+        Some(content) => FileStore::new(write.path.clone())
+            .write_all(content)
+            .map_err(|err| format!("failed to restore {}: {err}", write.path.display())),
+        None => match fs::remove_file(&write.path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!(
+                "failed to remove {} during rollback: {err}",
+                write.path.display()
+            )),
+        },
+    }
+}
+
+fn commit_patch_writes(writes: &[PreparedPatchWrite]) -> Result<(), String> {
+    for write in writes {
+        verify_patch_write_is_current(write)?;
+    }
+
+    for (idx, write) in writes.iter().enumerate() {
+        if let Err(write_err) = apply_prepared_patch_write(write) {
+            let restoration_errors: Vec<_> = writes[..=idx]
+                .iter()
+                .rev()
+                .filter_map(|written| restore_prepared_patch_write(written).err())
+                .collect();
+            if restoration_errors.is_empty() {
+                return Err(format!(
+                    "failed to apply {}: {write_err}; all affected files were restored",
+                    write.path.display()
+                ));
+            }
+            return Err(format!(
+                "failed to apply {}: {write_err}; rollback was incomplete: {}",
+                write.path.display(),
+                restoration_errors.join("; ")
+            ));
+        }
+    }
+
+    let changes = writes
+        .iter()
+        .map(|write| CompletedFileChange {
+            path: write.path.to_string_lossy().into_owned(),
+            before: write.before.clone(),
+            after: match &write.action {
+                PreparedPatchAction::Write(next) => Some(next.clone()),
+                PreparedPatchAction::Delete => None,
+            },
+        })
+        .collect();
+    record_completed_change_set(&format!("apply_patch ({} file(s))", writes.len()), changes);
+    Ok(())
+}
+
+fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<String, String> {
+    let dry_run = dry_run_arg(args)?;
     let raw_patch = args["patch"].as_str().ok_or_else(|| {
         let actual = match args.get("patch") {
             None => "missing".to_string(),
@@ -1420,6 +1593,8 @@ fn execute_apply_patch_impl(
             }
             if envelope.op == PatchEnvelopeOp::ReplaceInLine {
                 emit("applying inline replacement");
+            } else if envelope.op == PatchEnvelopeOp::Delete {
+                emit("preparing file deletion");
             } else {
                 let hunk_count = envelope
                     .body_lines
@@ -1430,20 +1605,26 @@ fn execute_apply_patch_impl(
                 emit(&format!("applying {hunk_count} hunk(s)"));
             }
             let write = prepare_patch_write(&path, &store, envelope).map_err(|err| {
-                format!(
-                    "failed while preparing patch for {}: {err}",
-                    path.display()
-                )
+                format!("failed while preparing patch for {}: {err}", path.display())
             })?;
             paths.push(path);
             writes.push(write);
         }
-        for write in &writes {
-            emit(&format!("writing {} byte(s)", write.next.len()));
-            FileStore::new(write.path.clone())
-                .write_all(&write.next)
-                .map_err(|err| err.to_string())?;
+        if dry_run {
+            let success = format_patch_dry_run(&paths);
+            emit(&success);
+            return Ok(success);
         }
+        emit("rechecking files before commit");
+        for write in &writes {
+            match &write.action {
+                PreparedPatchAction::Write(next) => {
+                    emit(&format!("writing {} byte(s)", next.len()))
+                }
+                PreparedPatchAction::Delete => emit("deleting file"),
+            }
+        }
+        commit_patch_writes(&writes)?;
         let success = format_patch_success(&paths);
         emit(&success);
         return Ok(success);
@@ -1460,18 +1641,35 @@ fn execute_apply_patch_impl(
         .validate_write_access()
         .map_err(|err| err.to_string())?;
     let path = store.path().to_path_buf();
-    let hunk_count = patch.lines().filter(|line| line.starts_with("@@")).count().max(1);
+    let hunk_count = patch
+        .lines()
+        .filter(|line| line.starts_with("@@"))
+        .count()
+        .max(1);
     emit(&format!("applying {hunk_count} hunk(s)"));
-    let original = if path.exists() {
+    let before = if path.exists() {
         emit("reading current file");
-        store.read_to_string().map_err(|err| err.to_string())?
+        Some(store.read_to_string().map_err(|err| err.to_string())?)
     } else {
         emit("creating new file from patch");
-        String::new()
+        None
     };
-    let next = apply_unified_patch(&original, &patch)?;
-    emit(&format!("writing {} byte(s)", next.len()));
-    store.write_all(&next).map_err(|err| err.to_string())?;
+    let next = apply_unified_patch(before.as_deref().unwrap_or_default(), &patch)?;
+    let write = PreparedPatchWrite {
+        path: path.clone(),
+        before,
+        action: PreparedPatchAction::Write(next),
+    };
+    if dry_run {
+        let success = format_patch_dry_run(&[path]);
+        emit(&success);
+        return Ok(success);
+    }
+    if let PreparedPatchAction::Write(next) = &write.action {
+        emit("rechecking file before commit");
+        emit(&format!("writing {} byte(s)", next.len()));
+    }
+    commit_patch_writes(&[write])?;
     let success = format_patch_success(&[path]);
     emit(&success);
     Ok(success)
@@ -2678,6 +2876,8 @@ mod tests {
 
         crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
             let args = serde_json::json!({
+                // 部分模型会把未使用的可选字符串参数序列化为空串，应按未提供处理。
+                "file_path": "",
                 "patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-old_a\n+new_a\n*** Add File: b.txt\n+hello\n+world\n*** End Patch\n"
             });
             let result = execute_apply_patch(&args).expect("multi-file Begin Patch should succeed");
@@ -2706,9 +2906,86 @@ mod tests {
             execute_apply_patch(&args).expect_err("second file mismatch should abort whole batch")
         });
 
-        assert!(err.contains("failed while preparing patch for"), "err was: {err}");
+        assert!(
+            err.contains("failed while preparing patch for"),
+            "err was: {err}"
+        );
         assert_eq!(fs::read_to_string(&a).unwrap(), "old_a\n");
         assert_eq!(fs::read_to_string(&b).unwrap(), "current_b\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_dry_run_validates_without_writing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("dry_run");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "before\n").unwrap();
+
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            execute_apply_patch(&serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "patch": "@@\n-before\n+after\n",
+                "dry_run": true,
+            }))
+            .expect("dry run should validate a matching patch")
+        });
+
+        assert!(result.starts_with("Dry run succeeded; no files changed:"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_delete_file_can_be_undone_and_redone() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("delete_file");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "important\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            execute_apply_patch(&serde_json::json!({
+                "patch": format!(
+                    "*** Begin Patch\n*** Delete File: {}\n*** End Patch\n",
+                    path.display()
+                ),
+            }))
+            .expect("Delete File should succeed");
+        });
+        assert!(!path.exists());
+
+        crate::ai::tools::undo_tools::execute_undo(&serde_json::json!({ "count": 1 }))
+            .expect("delete should be undoable");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "important\n");
+
+        crate::ai::tools::undo_tools::execute_redo(&serde_json::json!({ "count": 1 }))
+            .expect("delete should be redoable");
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn prepared_patch_rejects_external_change_before_commit() {
+        let path = make_temp_path("stale_patch");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "before\n").unwrap();
+        let store = super::FileStore::new(path.clone());
+        let envelope = make_envelope(
+            PatchEnvelopeOp::Update,
+            &path.to_string_lossy(),
+            &["@@", "-before", "+after"],
+        );
+        let prepared = super::prepare_patch_write(&path, &store, &envelope)
+            .expect("matching patch should prepare");
+        fs::write(&path, "changed_elsewhere\n").unwrap();
+
+        let err = super::verify_patch_write_is_current(&prepared)
+            .expect_err("a changed target must not be overwritten");
+        assert!(err.contains("[FILE_CHANGED]"), "err: {err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "changed_elsewhere\n");
         let _ = fs::remove_dir_all(base);
     }
 }
