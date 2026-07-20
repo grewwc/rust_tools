@@ -509,13 +509,28 @@ pub(super) fn auto_subagent_model_for_agent(
 }
 
 /// 未显式指定模型时，始终按任务难度和 agent 分级自动选择子 agent 模型。
-/// `parent_model` 仅保留用于兼容现有调用方；父模型不再覆盖难度路由结果。
+/// 当配置 `ai.subagent.model_inherit = true` 时，跳过自动选择，直接继承
+/// 父 agent 当前使用的模型（此时 `parent_model` 必须存在）。
 pub(super) fn choose_model_for_subagent(
-    _parent_model: Option<&str>,
+    parent_model: Option<&str>,
     agent: &AgentManifest,
     description: &str,
     prompt: &str,
 ) -> SubagentModelChoice {
+    // 临时开关：ai.subagent.model_inherit — 当启用时，subagent 与主 agent 保持一致。
+    if let Some(model) = parent_model
+        && !model.trim().is_empty()
+    {
+        let cfg = crate::commonw::configw::get_all_config();
+        let inherit = cfg.get_opt(super::config_schema::AiConfig::SUBAGENT_MODEL_INHERIT);
+        if matches!(inherit.as_deref(), Some("true" | "1")) {
+            return SubagentModelChoice {
+                model: model.trim().to_string(),
+                is_auto_selected: false,
+                fallback: None,
+            };
+        }
+    }
     let auto = auto_subagent_model_choice_for_agent(agent, description, prompt);
     SubagentModelChoice {
         model: auto.model,

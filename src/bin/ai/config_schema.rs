@@ -14,6 +14,10 @@ pub struct AiConfig;
 impl AiConfig {
     // ── Model ──────────────────────────────────────────────
     pub const MODEL_ENDPOINT: &str = "ai.model.endpoint";
+    /// When set to "true" or "1", subagent model selection uses the same model
+    /// as the parent agent instead of the auto-selection logic (models.json
+    /// subagent_priority / task difficulty classification).
+    pub const SUBAGENT_MODEL_INHERIT: &str = "ai.subagent.model_inherit";
     pub const MODEL_API_KEY: &str = "api_key";
     pub const MODEL_OPENCODE_API_KEY: &str = "opencode.api_key";
     pub const MODEL_OPENROUTER_API_KEY: &str = "openrouter.api_key";
