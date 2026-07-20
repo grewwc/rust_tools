@@ -23,7 +23,8 @@ use tool_overflow::normalize_internal_notes_for_summary_model;
 use tool_overflow::{
     build_persisted_summary_text, build_persisted_summary_text_with_app,
     enforce_protected_precision_group_budget, is_non_compressible_tool,
-    prepare_tool_messages_structured, spill_oversized_preserved_messages, tool_line_signature,
+    normalize_preserved_message_stubs_for_model, prepare_tool_messages_structured,
+    spill_oversized_preserved_messages, tool_line_signature,
     try_spill_preserved_message_to_stub,
 };
 
@@ -201,12 +202,15 @@ fn build_overflow_placeholder(file_path: &str) -> String {
 }
 
 pub(in crate::ai) fn compress_messages_for_context(
-    messages: Vec<Message>,
+    mut messages: Vec<Message>,
     max_chars: usize,
     keep_last: usize,
     summary_max_chars: usize,
     overflow_dir: Option<PathBuf>,
 ) -> Vec<Message> {
+    // 历史库中可能仍有旧版 JSON stub。它是压缩器的内部协议，不能原样交给模型，
+    // 否则模型会把它当普通用户文本甚至直接复述到最终回复中。
+    normalize_preserved_message_stubs_for_model(&mut messages);
     if max_chars == 0 || messages.is_empty() {
         return messages;
     }

@@ -128,7 +128,8 @@ fn extract_round_tool_signatures(messages: &[crate::ai::history::Message]) -> Op
 /// 提取「粗粒度」签名：剥离 offset/limit/page 等易变翻页参数后再归一化。
 /// 用于抓字节精确检测漏掉的同文件翻页 / 仅微调分页参数的重复检索。
 /// 对 `execute_command` 额外折叠 shell 中的低收益变体（如 `| head -20/-30`、
-/// `2>/dev/null`、`ls -la/-lt` 的细微差异），让同目标资源的反复试探能命中。
+/// `2>/dev/null`、`ls -la/-lt` 的细微差异，以及 git log/show/diff 取证视角的
+/// 轻微切换），让同目标资源的反复试探能命中。
 fn extract_round_tool_signatures_coarse(
     messages: &[crate::ai::history::Message],
 ) -> Option<Vec<String>> {
@@ -339,6 +340,7 @@ fn coarse_shell_segment_signature(segment: &str) -> Option<String> {
         return None;
     }
     match program.as_str() {
+        "git" => Some(normalize_git_segment(&tokens)),
         "ls" => Some(normalize_ls_segment(&tokens)),
         "grep" | "rg" => Some(normalize_search_segment(&program, &tokens)),
         _ => Some(normalize_generic_shell_segment(&program, &tokens)),
@@ -407,6 +409,157 @@ fn normalize_search_segment(program: &str, tokens: &[String]) -> String {
         Some(pattern) => format!("{program}:{}#{pattern}", paths.join(",")),
         None => format!("{program}:{}", paths.join(",")),
     }
+}
+
+fn normalize_git_segment(tokens: &[String]) -> String {
+    let Some(subcommand_idx) = find_git_subcommand_index(tokens) else {
+        return "git".to_string();
+    };
+
+    let subcommand = tokens[subcommand_idx].to_ascii_lowercase();
+    // 对「为什么有两个 commit / 这两个 commit 差什么 / 当前分支状态如何」这类
+    // git 取证问题，模型常在 log/show/diff/status/reflog 之间来回切视角，命令
+    // 字面不同但语义上仍在围绕同一份证据打转。coarse 模式将其折叠成同一簇。
+    if matches!(
+        subcommand.as_str(),
+        "log" | "show" | "diff" | "diff-tree" | "reflog" | "status"
+    ) {
+        return "git:inspect".to_string();
+    }
+
+    let mut paths = Vec::new();
+    let mut revs = Vec::new();
+    let mut after_double_dash = false;
+    let mut skip_next = false;
+    for token in tokens.iter().skip(subcommand_idx + 1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if should_skip_shell_token(token) {
+            continue;
+        }
+        if token == "--" {
+            after_double_dash = true;
+            continue;
+        }
+        if !after_double_dash && token.starts_with('-') {
+            if git_option_takes_value(token) {
+                skip_next = true;
+            }
+            continue;
+        }
+        if looks_like_path_token(token) {
+            paths.push(normalize_path_like_token(token));
+            continue;
+        }
+        if looks_like_git_revision_token(token) {
+            revs.push(normalize_git_revision_token(token));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    revs.sort();
+    revs.dedup();
+    if !paths.is_empty() && !revs.is_empty() {
+        format!("git:{subcommand}:{}#{}", revs.join(","), paths.join(","))
+    } else if !paths.is_empty() {
+        format!("git:{subcommand}:{}", paths.join(","))
+    } else if !revs.is_empty() {
+        format!("git:{subcommand}:{}", revs.join(","))
+    } else {
+        format!("git:{subcommand}")
+    }
+}
+
+fn find_git_subcommand_index(tokens: &[String]) -> Option<usize> {
+    let mut idx = 1;
+    while idx < tokens.len() {
+        let token = &tokens[idx];
+        if !token.starts_with('-') {
+            return Some(idx);
+        }
+        if git_option_takes_value(token) {
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    None
+}
+
+fn git_option_takes_value(token: &str) -> bool {
+    matches!(
+        token,
+        "-C" | "-c"
+            | "--git-dir"
+            | "--work-tree"
+            | "--format"
+            | "--pretty"
+            | "--grep"
+            | "--author"
+            | "--committer"
+            | "--since"
+            | "--until"
+    )
+}
+
+fn looks_like_git_revision_token(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    if token.contains("..") || token.contains("...") || token.contains("@{") {
+        return true;
+    }
+    if matches!(
+        token,
+        "HEAD" | "FETCH_HEAD" | "ORIG_HEAD" | "MERGE_HEAD" | "CHERRY_PICK_HEAD"
+    ) {
+        return true;
+    }
+    let trimmed = token.trim_end_matches(['^', '~']);
+    let hexish = trimmed.len() >= 7
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() || matches!(ch, '^' | '~' | ':'));
+    if hexish {
+        return true;
+    }
+    trimmed.starts_with("refs/")
+}
+
+fn normalize_git_revision_token(token: &str) -> String {
+    let normalized = token.trim().trim_matches(',');
+    if normalized.contains("..") || normalized.contains("...") {
+        let sep = if normalized.contains("...") {
+            "..."
+        } else {
+            ".."
+        };
+        let mut parts: Vec<String> = normalized
+            .split(sep)
+            .filter(|part| !part.is_empty())
+            .map(normalize_git_revision_token)
+            .collect();
+        parts.sort();
+        parts.dedup();
+        return parts.join(sep);
+    }
+    if normalized.eq_ignore_ascii_case("head") {
+        return "HEAD".to_string();
+    }
+    if normalized.starts_with("HEAD@{") {
+        return "HEAD@{}".to_string();
+    }
+    let hex_prefix: String = normalized
+        .chars()
+        .take_while(|ch| ch.is_ascii_hexdigit())
+        .take(12)
+        .collect();
+    if hex_prefix.len() >= 7 {
+        return hex_prefix;
+    }
+    normalized.to_string()
 }
 
 fn normalize_generic_shell_segment(program: &str, tokens: &[String]) -> String {
@@ -1569,6 +1722,30 @@ mod tests {
     }
 
     #[test]
+    fn coarse_execute_command_signature_collapses_git_forensics_variants() {
+        let log_and_status = coarse_execute_command_signature(
+            "git log --oneline --decorate -5 && git status --short",
+        );
+        let show_pair = coarse_execute_command_signature(
+            "git show --stat --oneline 5dfc5676f && git show --stat --oneline 76530274f",
+        );
+        let diff_pair = coarse_execute_command_signature(
+            "git diff --stat 5dfc5676f^ 76530274f && git diff --stat 5dfc5676f 76530274f",
+        );
+        assert_eq!(log_and_status, "git:inspect");
+        assert_eq!(log_and_status, show_pair);
+        assert_eq!(show_pair, diff_pair);
+    }
+
+    #[test]
+    fn coarse_execute_command_signature_keeps_git_global_option_before_subcommand() {
+        let with_global = coarse_execute_command_signature("git -C /tmp/worktree status --short");
+        let plain = coarse_execute_command_signature("git status --short");
+        assert_eq!(with_global, "git:inspect");
+        assert_eq!(with_global, plain);
+    }
+
+    #[test]
     fn turn_supervisor_emits_coarse_signal_for_same_file_paging() {
         let mut supervisor = TurnSupervisor::default();
         let mut messages = Vec::new();
@@ -1655,6 +1832,100 @@ mod tests {
             }
         }
         assert!(supervisor.coarse_loop_note_injected);
+    }
+
+    #[test]
+    fn turn_supervisor_emits_coarse_signal_for_execute_command_git_forensics_variants() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let commands = [
+            "git log --oneline --decorate -5 && git status --short",
+            "git show --stat --oneline 5dfc5676f && git show --stat --oneline 76530274f",
+            "git diff --stat 5dfc5676f^ 76530274f && git diff --stat 5dfc5676f 76530274f",
+            "git show --format=fuller --name-status 5dfc5676f && git show --format=fuller --name-status 76530274f",
+            "git reflog -8 --date=iso --format='%h %gd %gs %cd' && git status --short --branch",
+        ];
+        for (i, command) in commands.iter().enumerate() {
+            messages.push(crate::ai::history::Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(String::new()),
+                tool_calls: Some(vec![crate::ai::types::ToolCall {
+                    id: format!("git-tc-{i}"),
+                    tool_type: "function".to_string(),
+                    function: crate::ai::types::FunctionCall {
+                        name: "execute_command".to_string(),
+                        arguments: serde_json::json!({ "command": command }).to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            let signal =
+                supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
+            if i < TOOL_LOOP_COARSE_WINDOW - 1 {
+                assert!(matches!(signal, ToolLoopSignal::None));
+            } else {
+                assert!(matches!(signal, ToolLoopSignal::Coarse));
+            }
+        }
+        assert!(supervisor.coarse_loop_note_injected);
+    }
+
+    #[test]
+    fn turn_supervisor_escalates_execute_command_git_forensics_to_hard_stop() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let commands = [
+            "git log --oneline --decorate -5 && git status --short",
+            "git show --stat --oneline 5dfc5676f && git show --stat --oneline 76530274f",
+            "git diff --stat 5dfc5676f^ 76530274f && git diff --stat 5dfc5676f 76530274f",
+            "git show --format=fuller --name-status 5dfc5676f && git show --format=fuller --name-status 76530274f",
+            "git reflog -8 --date=iso --format='%h %gd %gs %cd' && git status --short --branch",
+            "git diff-tree --no-commit-id --name-status -r 5dfc5676f && git diff-tree --no-commit-id --name-status -r 76530274f",
+            "git show --format=fuller --name-status 76530274f -- && git status --short",
+            "git log --graph --decorate --oneline -10 && git reflog -5 --date=iso",
+        ];
+        let mut signals = Vec::new();
+        for (i, command) in commands.iter().enumerate() {
+            messages.push(crate::ai::history::Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(String::new()),
+                tool_calls: Some(vec![crate::ai::types::ToolCall {
+                    id: format!("git-hard-{i}"),
+                    tool_type: "function".to_string(),
+                    function: crate::ai::types::FunctionCall {
+                        name: "execute_command".to_string(),
+                        arguments: serde_json::json!({ "command": command }).to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            signals.push(supervisor.record_tool_signatures(
+                &messages,
+                "",
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            ));
+        }
+        assert!(
+            signals[..TOOL_LOOP_COARSE_WINDOW - 1]
+                .iter()
+                .all(|s| matches!(s, ToolLoopSignal::None))
+        );
+        assert!(matches!(
+            signals[TOOL_LOOP_COARSE_WINDOW - 1],
+            ToolLoopSignal::Coarse
+        ));
+        assert!(
+            signals[TOOL_LOOP_COARSE_WINDOW..TOOL_LOOP_COARSE_HARD_WINDOW - 1]
+                .iter()
+                .all(|s| matches!(s, ToolLoopSignal::None))
+        );
+        assert!(matches!(
+            signals[TOOL_LOOP_COARSE_HARD_WINDOW - 1],
+            ToolLoopSignal::CoarseHard
+        ));
+        assert!(supervisor.hard_loop_stop_injected);
     }
 
     #[test]
@@ -1966,10 +2237,15 @@ mod tests {
         assert!(matches!(signals[1], ToolLoopSignal::None));
         assert!(matches!(signals[2], ToolLoopSignal::LowProgressSoft));
         assert!(matches!(signals[3], ToolLoopSignal::LowProgressLedger));
-        assert!(signals[4..signals.len() - 1]
-            .iter()
-            .all(|signal| matches!(signal, ToolLoopSignal::None)));
-        assert!(matches!(signals.last(), Some(ToolLoopSignal::LowProgressHard)));
+        assert!(
+            signals[4..signals.len() - 1]
+                .iter()
+                .all(|signal| matches!(signal, ToolLoopSignal::None))
+        );
+        assert!(matches!(
+            signals.last(),
+            Some(ToolLoopSignal::LowProgressHard)
+        ));
         assert!(supervisor.progress.hard_injected);
     }
 

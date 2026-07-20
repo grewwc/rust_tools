@@ -10,11 +10,16 @@ binary the Agent spawns as an MCP subprocess.
 ## Layout
 
 ```text
-src/main.rs      # #[tokio::main(multi_thread)]; stdin line loop; JSON-RPC dispatch; owns Option<BrowserSession>
-src/jsonrpc.rs   # JsonRpcErr, write_result/write_err (async), text_content(), cap_text(24K), with_timeout()
+src/main.rs      # #[tokio::main(multi_thread)]; BrowserServer { session } + impl mcp_stdio::McpServer; startup gc + mcp_stdio::run()
 src/browser.rs   # BrowserSession { browser, page, handler_task, temp_profile_dir }, launch(), ensure_session(), shutdown(), gc_stale_profiles()
-src/tools.rs     # initialize/tools_list schemas + handle_tools_call() dispatch + 12 tool impls
+src/tools.rs     # initialize/tools_list schemas + handle_tools_call() dispatch + 13 tool impls
 ```
+
+> The JSON-RPC transport (JsonRpcErr / write_result / write_err / text_content /
+> cap_text(24K) / with_timeout) and the stdin dispatch loop live in the shared
+> `crates/mcp_stdio` lib crate. This crate only implements the `McpServer` trait
+> (initialize / tools_list / tools_call + a `shutdown` override closing the CDP
+> session) and its tool logic + driver.
 
 ## Build / Test
 
@@ -48,7 +53,8 @@ gate is `cargo build -p mcp_browser` + the smoke test above.
    returned error contain `mcp response timeout`, `broken pipe`,
    `closed the stream`, `process exited`, `failed to read response`, or
    `failed waiting for mcp response` — those make the host kill the subprocess.
-   The timeout error uses "reached the N ms mcp_browser server cap" on purpose.
+   The shared timeout error (in `mcp_stdio::with_timeout`) uses "operation reached
+   the N ms server cap" on purpose — domain-neutral, none of the trigger words.
 3. **Only `content[0].text` reaches the model.** The host reads a single text
    field. Screenshots therefore **save to disk and return the path** — image
    bytes are never returned. Extracted text/HTML is capped to **24K chars**

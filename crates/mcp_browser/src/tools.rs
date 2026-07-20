@@ -10,7 +10,7 @@ use chromiumoxide::page::ScreenshotParams;
 use serde_json::{Value, json};
 
 use crate::browser::{BrowserSession, ensure_session};
-use crate::jsonrpc::{JsonRpcErr, cap_text, text_content, with_timeout};
+use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
 
 /// 每操作超时（毫秒）。默认 90s，短于宿主 request_timeout_ms（建议 120s），
 /// 使超时由 server 侧兜底、返回干净错误，而非被宿主 kill 掉整个会话。

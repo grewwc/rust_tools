@@ -400,17 +400,17 @@ pub(super) async fn run_project_knowledge_writeback_background(
     match upsert_project_writeback_entry(&store, &source, &payload.content, tags, payload.priority)
     {
         Ok(ProjectWritebackUpsert::Saved) => {
-            println!(
-                "[Memory] writeback saved project={} source={} category=project_memory priority={}",
-                project_name, source, payload.priority
-            );
+            // println!(
+                // "[Memory] writeback saved project={} source={} category=project_memory priority={}",
+                // project_name, source, payload.priority
+            // );
             store.maintain_after_append();
         }
         Ok(ProjectWritebackUpsert::Updated) => {
-            println!(
-                "[Memory] writeback updated project={} source={} category=project_memory priority={}",
-                project_name, source, payload.priority
-            );
+            // println!(
+                // "[Memory] writeback updated project={} source={} category=project_memory priority={}",
+                // project_name, source, payload.priority
+            // );
             store.maintain_after_append();
         }
         Ok(ProjectWritebackUpsert::Rejected) => {}

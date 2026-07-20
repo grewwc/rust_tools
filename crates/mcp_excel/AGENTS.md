@@ -11,11 +11,16 @@ binary the Agent spawns as an MCP subprocess. This is the Excel analogue of
 ## Layout
 
 ```text
-src/main.rs      # #[tokio::main(multi_thread)]; stdin line loop; JSON-RPC dispatch. NO session state.
-src/jsonrpc.rs   # JsonRpcErr, write_result/write_err (async), text_content(), cap_text(24K), with_timeout()
+src/main.rs      # #[tokio::main(multi_thread)]; ExcelServer (unit) + impl mcp_stdio::McpServer; mcp_stdio::run(). NO session state.
 src/osa.rs       # osascript wrapper + AppleScript templates. THE core — every Excel quirk is captured here.
 src/tools.rs     # initialize/tools_list schemas + handle_tools_call() dispatch + 9 tool impls + CSV helpers
 ```
+
+> The JSON-RPC transport (JsonRpcErr / write_result / write_err / text_content /
+> cap_text(24K) / with_timeout) and the stdin dispatch loop live in the shared
+> `crates/mcp_stdio` lib crate. This crate only implements the `McpServer` trait
+> (initialize / tools_list / tools_call; `shutdown` uses the no-op default since
+> there is no session) plus its tool logic + osascript driver.
 
 ## Build / Test
 
@@ -81,10 +86,10 @@ the templates back into the broken form.**
    Every osascript op is wrapped in `with_timeout(op_timeout_ms())` (default
    **90s**); configure the host larger (**120s** recommended).
 3. **Error messages must avoid the host's transport trigger words** (`mcp
-   response timeout`, `broken pipe`, `process exited`, ...). The timeout error
-   says "reached the N ms mcp_excel server cap" on purpose. Raw Excel error codes
-   (`-50`/`-10003`) are passed through verbatim — they are diagnostic, not
-   transport triggers.
+   response timeout`, `broken pipe`, `process exited`, ...). The shared timeout
+   error (in `mcp_stdio::with_timeout`) says "operation reached the N ms server
+   cap" on purpose. Raw Excel error codes (`-50`/`-10003`) are passed through
+   verbatim — they are diagnostic, not transport triggers.
 4. **Only `content[0].text` reaches the model**, capped to **24K chars**
    (`cap_text`). Large ranges must be exported to disk, not returned inline.
 5. **Persist via `export_csv`, not `save_workbook`.** Sandboxed Excel (present

@@ -413,14 +413,41 @@ pub(super) fn is_preserved_user_or_image_stub(text: &str) -> bool {
 }
 
 fn parse_preserved_message_stub(text: &str) -> Option<(String, String)> {
-    let payload = text.strip_prefix(PRESERVED_CONTENT_STUB_PREFIX)?;
-    let value = serde_json::from_str::<Value>(payload).ok()?;
-    let kind = value.get("kind")?.as_str()?.to_string();
-    let file_path = value.get("file_path")?.as_str()?.to_string();
-    if (kind == "user" || kind == "image") && !file_path.is_empty() {
-        Some((kind, file_path))
+    if let Some(payload) = text.strip_prefix(PRESERVED_CONTENT_STUB_PREFIX) {
+        let value = serde_json::from_str::<Value>(payload).ok()?;
+        let kind = value.get("kind")?.as_str()?.to_string();
+        let file_path = value.get("file_path")?.as_str()?.to_string();
+        return ((kind == "user" || kind == "image") && !file_path.is_empty())
+            .then_some((kind, file_path));
+    }
+
+    let kind = if text.starts_with("较早的用户图片内容已归档") {
+        "image"
+    } else if text.starts_with("较早的用户") {
+        "user"
     } else {
-        None
+        return None;
+    };
+    let file_path = text
+        .lines()
+        .find_map(|line| line.strip_prefix("归档文件: "))?
+        .trim();
+    (!file_path.is_empty()).then(|| (kind.to_string(), file_path.to_string()))
+}
+
+/// 将内部归档协议转换成模型可理解的上下文说明，同时兼容已经落盘的旧 JSON stub。
+pub(in crate::ai) fn normalize_preserved_message_stubs_for_model(messages: &mut [Message]) {
+    for message in messages {
+        let Value::String(text) = &message.content else {
+            continue;
+        };
+        let Some((kind, file_path)) = parse_preserved_message_stub(text) else {
+            continue;
+        };
+        message.content = Value::String(build_preserved_message_overflow_stub(
+            Path::new(&file_path),
+            &kind,
+        ));
     }
 }
 
@@ -511,14 +538,11 @@ fn write_preserved_message_overflow_file(
 }
 
 fn build_preserved_message_overflow_stub(path: &Path, kind: &str) -> String {
-    let payload = serde_json::json!({
-        "kind": kind,
-        "file_path": path.display().to_string(),
-        "encoding": "original",
-        "zero_compression": true,
-        "hint": "use read_file to inspect exact content before continuing"
-    });
-    format!("{PRESERVED_CONTENT_STUB_PREFIX}{payload}")
+    let content_kind = if kind == "image" { "图片" } else { "文本" };
+    format!(
+        "较早的用户{content_kind}内容已归档，原文未丢失。\n归档文件: {}\n这是一条上下文归档提示，不是用户的新请求。仅当当前任务确实依赖原文时，才使用 read_file 读取该文件。",
+        path.display()
+    )
 }
 
 pub(super) fn try_spill_preserved_message_to_stub(

@@ -843,10 +843,9 @@ fn compression_keeps_recent_non_compressible_tool_output_verbatim() {
 }
 
 fn extract_stub_file_path(stub: &str) -> Option<String> {
-    const PREFIX: &str = "[[PRESERVED_CONTENT_STUB_V1]]";
-    let payload = stub.strip_prefix(PREFIX)?;
-    let value = serde_json::from_str::<Value>(payload).ok()?;
-    value.get("file_path")?.as_str().map(str::to_string)
+    stub.lines()
+        .find_map(|line| line.strip_prefix("归档文件: "))
+        .map(str::to_string)
 }
 
 fn read_file_call_pair(id: &str, path: &str, content: &str) -> (Message, Message) {
@@ -1053,6 +1052,10 @@ fn compression_spills_old_user_message_to_session_temp_file() {
         std::path::Path::new(&file_path).exists(),
         "user overflow file path from stub should exist: {file_path}"
     );
+    assert!(
+        !stub.contains("[[PRESERVED_CONTENT_STUB_V1]]"),
+        "model-facing archive notice must not expose the internal stub protocol"
+    );
     let persisted = std::fs::read_to_string(&file_path).expect("should read persisted user file");
     assert!(
         persisted.contains(&old_user[..64]),
@@ -1158,6 +1161,10 @@ fn compression_spills_old_image_message_to_session_temp_file() {
     assert!(
         persisted.contains("data:image/png;base64,"),
         "persisted image file should contain original image payload"
+    );
+    assert!(
+        !stub.contains("[[PRESERVED_CONTENT_STUB_V1]]"),
+        "model-facing archive notice must not expose the internal stub protocol"
     );
 
     let _ = std::fs::remove_dir_all(&overflow_dir);

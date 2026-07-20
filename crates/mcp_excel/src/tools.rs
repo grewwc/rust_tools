@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use crate::jsonrpc::{JsonRpcErr, cap_text, text_content, with_timeout};
+use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
 use crate::osa;
 
 /// 每操作超时（毫秒）。默认 90s，短于宿主 request_timeout_ms（建议 120s）。

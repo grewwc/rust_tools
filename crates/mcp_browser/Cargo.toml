@@ -16,3 +16,5 @@ futures-util = "0.3"
 # 仅用于 kill(pid, 0) 探测残留 profile 对应的进程是否已死（启动时 GC）。
 # 已由 chromiumoxide 传递引入，加此显式依赖零新增编译成本。
 libc = "0.2"
+# 共享 MCP-over-stdio 协议骨架（JsonRpcErr / cap_text / with_timeout / run / McpServer）。
+mcp_stdio = { path = "../mcp_stdio" }

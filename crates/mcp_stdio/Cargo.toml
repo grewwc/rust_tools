@@ -1,0 +1,11 @@
+[package]
+name = "mcp_stdio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 共享 MCP-over-stdio 骨架，无重依赖。运行时（rt/macros）不在这里声明：
+# 由各消费 bin 的 #[tokio::main] 自行构建，本库只用 io-std/io-util/time 提供
+# stdin/stdout 异步读写与 tokio::time::timeout。
+tokio = { version = "1", features = ["io-std", "io-util", "time"] }
+serde_json = "1"
