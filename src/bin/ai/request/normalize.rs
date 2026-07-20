@@ -9,7 +9,9 @@
 
 use serde_json::Value;
 
-use crate::ai::history::{Message, ROLE_SYSTEM, is_internal_note_role, is_system_like_role};
+use crate::ai::history::{
+    Message, ROLE_SYSTEM, is_internal_note_role, is_summary_note_text, is_system_like_role,
+};
 use crate::ai::models;
 use crate::ai::types::App;
 
@@ -307,10 +309,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         if trimmed.starts_with("Context note: reused cached tool results") {
             return InternalNoteKind::CachedTools;
         }
-        if trimmed.starts_with("对话摘要（自动压缩")
-            || trimmed.starts_with("历史摘要（自动压缩")
-            || trimmed.starts_with("[mid-turn-summary]")
-        {
+        if is_summary_note_text(trimmed) {
             return InternalNoteKind::Summary;
         }
         if trimmed.starts_with("self_note:") {

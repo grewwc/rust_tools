@@ -695,7 +695,7 @@ fn truncate_summary(s: &str, max_len: usize) -> String {
 /// 清洗模型生成的 session 标题，避免把“帮我/请问”等请求壳写进标题。
 pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
     let first_line = title.lines().next().unwrap_or("").trim();
-    if is_preserved_content_title(first_line) {
+    if is_preserved_content_message(first_line) {
         return String::new();
     }
     let without_agent = strip_agent_prefix(first_line);
@@ -709,7 +709,7 @@ pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
     if trimmed.is_empty()
         || trimmed.contains('\n')
         || trimmed.contains('\r')
-        || is_preserved_content_title(trimmed)
+        || is_preserved_content_message(trimmed)
     {
         return true;
     }
@@ -719,11 +719,11 @@ pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
 }
 
 /// 归档协议是内部上下文，不应作为会话标题展示或被视为有效标题。
-fn is_preserved_content_title(title: &str) -> bool {
-    let title = title.trim_start();
-    title.starts_with("[[PRESERVED_CONTENT_STUB_V1]]")
-        || title.starts_with("较早的用户图片内容已归档")
-        || title.starts_with("较早的用户文本内容已归档")
+pub(super) fn is_preserved_content_message(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("[[PRESERVED_CONTENT_STUB_V1]]")
+        || text.starts_with("较早的用户图片内容已归档")
+        || text.starts_with("较早的用户文本内容已归档")
 }
 
 fn strip_request_filler_prefixes(mut text: &str) -> (&str, bool) {

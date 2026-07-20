@@ -28,6 +28,39 @@ use tool_overflow::{
     try_spill_preserved_message_to_stub,
 };
 
+/// 所有"自动压缩摘要" note 的前缀。写入端（生成摘要 note）与识别端
+/// （防重复 guard、sqlite 接续点、请求侧分组）**必须共用这一份清单**，否则
+/// 会出现"写入的前缀识别端不认"的断裂——历史上 `长期记忆摘要（压缩保留）`
+/// 就因未登记而绕过防重复 guard，导致每轮重复插入摘要 note、上下文预算被
+/// 持续推高、压缩管线每个 turn 空转。新增摘要前缀时只改这里。
+///
+/// 注意：条目应为"去除前导空白后"的裸前缀；判定统一走 [`is_summary_note_text`]，
+/// 它会先 `trim_start` 再逐一 `starts_with`，因此全角/半角冒号只需各列一次。
+pub(in crate::ai) const SUMMARY_NOTE_PREFIXES: &[&str] = &[
+    "对话摘要（自动压缩",
+    "历史摘要（自动压缩",
+    "长期记忆摘要（压缩保留）",
+    "[mid-turn-summary]",
+];
+
+/// 归档指针 note（overflow 原文回指）的前缀。与摘要 note 成对出现，
+/// P1 折叠逻辑据此识别并去重堆积的归档指针。
+pub(in crate::ai) const ARCHIVE_NOTE_PREFIX: &str = "长期记忆归档";
+
+/// 判断一段文本是否是"自动压缩摘要" note 正文（前缀匹配，容忍前导空白）。
+/// 这是摘要识别的**唯一真源**，供 guard / sqlite / 请求规范化统一调用。
+pub(in crate::ai) fn is_summary_note_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    SUMMARY_NOTE_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+/// 判断一段文本是否是 overflow 归档指针 note。
+fn is_archive_note_text(text: &str) -> bool {
+    text.trim_start().starts_with(ARCHIVE_NOTE_PREFIX)
+}
+
 const PERSISTED_HISTORY_KEEP_RECENT_TURNS: usize = 160;
 /// 压缩兜底（first_trim_candidate）时保护最近 user 起始尾窗的动态上下限。
 /// 小上下文优先保留 3 轮提升多阶段任务连续性；超大上下文回退到 2 轮控预算。
@@ -220,6 +253,10 @@ pub(in crate::ai) fn compress_messages_for_context(
     // 单调膨胀。MemoryStore 仍保留全部记录。
     let messages = trim_self_notes_to_recent(messages, MAX_SELF_NOTES_IN_MESSAGES);
 
+    // 收敛历史上因防重复 guard 断裂而堆积的重复摘要/归档 note。放在请求期入口，
+    // 让已经堆积了几十对 note 的旧 session 下一次请求就立刻恢复正常，无需等落盘。
+    let messages = coalesce_accumulated_summary_notes(messages);
+
     let keep_last = keep_last.min(messages.len());
     if keep_last == 0 {
         return shrink_messages_to_fit_with_summary(
@@ -295,10 +332,101 @@ pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -
 }
 
 fn sanitize_persisted_history_messages(messages: Vec<Message>) -> Vec<Message> {
+    let messages = coalesce_accumulated_summary_notes(messages);
     messages
         .into_iter()
         .map(|message| sanitize_message_for_persisted_history(&message))
         .collect()
+}
+
+/// 收敛历史上因防重复 guard 断裂而堆积的多条摘要 / 归档 note。
+///
+/// 背景：`长期记忆摘要（压缩保留）` 前缀曾未登记进 `is_summary_message`，导致
+/// 每轮压缩都在开头重复插入一对「摘要 + 归档」note，长 session 可堆积几十对，
+/// 既污染上下文预算又推高 `total_chars` 让压缩管线每 turn 空转。
+///
+/// 折叠策略（无损）：
+/// - **摘要 note**：把每条正文（去 header 后）按原顺序去重拼接成**一条**，放回
+///   第一条摘要原来的位置。不同轮次挤出窗口时各自记录的"初始目标"因此全部保留。
+/// - **归档指针 note**：内容完全相同的只保留一条（overflow 归档文件路径唯一，
+///   去重无损），紧跟合并后的摘要。
+/// - 其余消息一律原样保留、顺序不变（绝不触碰非摘要/归档消息）。
+///
+/// 仅当摘要 + 归档 note 合计 > 2 条时才折叠，避免对正常历史做无谓改写
+/// （返回值与入参逐条相等时，上层 `compacted == messages` 判定会跳过落盘）。
+fn coalesce_accumulated_summary_notes(messages: Vec<Message>) -> Vec<Message> {
+    let note_count = messages
+        .iter()
+        .filter(|m| is_summary_or_archive_note(m))
+        .count();
+    if note_count <= 2 {
+        return messages;
+    }
+
+    // 合并所有摘要正文（去重、保序）。
+    let mut merged_bodies: Vec<String> = Vec::new();
+    let mut first_summary_role: Option<String> = None;
+    let mut archive_note: Option<Message> = None;
+    for m in &messages {
+        if is_summary_message(m) {
+            if first_summary_role.is_none() {
+                first_summary_role = Some(m.role.clone());
+            }
+            let text = value_to_string(&m.content);
+            let body = automatic_summary_body(&text).unwrap_or_else(|| text.trim());
+            let body = body.trim();
+            if !body.is_empty() && !merged_bodies.iter().any(|b| b == body) {
+                merged_bodies.push(body.to_string());
+            }
+        } else if is_archive_note_message(m) && archive_note.is_none() {
+            archive_note = Some(m.clone());
+        }
+    }
+
+    let merged_summary = if merged_bodies.is_empty() {
+        None
+    } else {
+        Some(Message {
+            role: first_summary_role.unwrap_or_else(|| ROLE_INTERNAL_NOTE.to_string()),
+            content: Value::String(format!(
+                "长期记忆摘要（压缩保留）:\n{}",
+                merged_bodies.join("\n")
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        })
+    };
+
+    // 重建序列：在"第一条摘要/归档 note"的位置放入合并摘要 + 单一归档指针，
+    // 丢弃其余摘要/归档 note，其他消息原样保留。
+    let mut out = Vec::with_capacity(messages.len());
+    let mut inserted = false;
+    for m in messages {
+        if is_summary_or_archive_note(&m) {
+            if !inserted {
+                if let Some(summary) = merged_summary.clone() {
+                    out.push(summary);
+                }
+                if let Some(archive) = archive_note.clone() {
+                    out.push(archive);
+                }
+                inserted = true;
+            }
+            // 其余重复摘要/归档 note 丢弃。
+        } else {
+            out.push(m);
+        }
+    }
+    out
+}
+
+fn is_summary_or_archive_note(m: &Message) -> bool {
+    is_summary_message(m) || is_archive_note_message(m)
+}
+
+fn is_archive_note_message(m: &Message) -> bool {
+    is_system_like_role(&m.role) && is_archive_note_text(&value_to_string(&m.content))
 }
 
 pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Message> {
@@ -1109,10 +1237,7 @@ fn is_summary_message(message: &Message) -> bool {
     if !is_system_like_role(&message.role) {
         return false;
     }
-    let text = value_to_string(&message.content);
-    text.starts_with("对话摘要（自动压缩")
-        || text.starts_with("历史摘要（自动压缩")
-        || text.starts_with("[mid-turn-summary]")
+    is_summary_note_text(&value_to_string(&message.content))
 }
 
 /// 最近完整工具组的保护窗口。一个 assistant(tool_calls) 批次是不可拆分的证据
@@ -1479,3 +1604,5 @@ fn render_deduped_read_file_lines(lines: &[(usize, String)], removed: usize) -> 
 
 #[cfg(test)]
 mod fold_early_tool_groups_tests;
+#[cfg(test)]
+mod coalesce_summary_notes_tests;

@@ -586,37 +586,88 @@ enum ContextPolicy {
     Fuzz,
 }
 
-/// 剥离 read_file / grep 等工具输出的行号前缀。
+/// 剥离 read_file / grep 等工具输出的行号前缀（单参数兜底版）。
 /// 模型有时会不小心把行号前缀复制进 patch 的 context/remove 行中。
-/// 仅匹配 `digits + 分隔符` 模式，避免误剥真正的代码行。
 ///
-/// 覆盖三种真实来源格式（务必与实际渲染器保持一致）：
-/// - `read_file`：`{:>6}\t{}`，即右对齐行号 + 一个 TAB（最常见，此前遗漏，
-///   是 patch context 反复 mismatch 的根因）。
-/// - grep/文本搜索：`   42| `，行号 + `| `。
-/// - 其它冒号变体：`42: `，行号 + `: `。
+/// 该版本用于**没有"真实行"可锚定**的场景（如 IgnoreIndent 双侧各自归一）。
+/// 有真实行可比对时，优先用锚定式 [`strip_number_prefix_anchored`]，它分隔符
+/// 无关且几乎零误伤。此处为避免误剥真正以数字开头的代码行（如 `80:80`、`42px`、
+/// `3.14`），采取**保守**策略，只认两类确定性极高的行号栏形状：
+/// - `digits + \t`：read_file 的真实格式（`{:>6}\t{}`）。TAB 后直接是行内容
+///   （含其自身缩进），只吞这一个 TAB。
+/// - `digits + 单个非字母数字分隔符 + 空格`：grep 类（`42| `、`42: `）。要求分隔符
+///   后**必须跟空格**，因此 `80:80`（`:` 后是数字）、`3.14`（`.` 后是数字）不会被误剥。
 fn strip_line_number_prefix(s: &str) -> &str {
     let trimmed = s.trim_start();
     let digits_end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
     if digits_end == 0 {
         return s;
     }
-    // 分隔符必须紧跟在行号数字之后：
-    // - `\t`：read_file 的真实格式（`{:>6}\t{}`）。TAB 后直接是行内容（含其自身
-    //   缩进），只剥离这一个 TAB 即可完整保留代码原有缩进。
-    // - `| ` / `: `：grep 等工具格式；分隔符后带空格，所以 `80:80`（无空格）不会
-    //   被误剥，`80:80` 中的 `:` 不是有效行号分隔符。
     let after_digits = &trimmed[digits_end..];
-    if let Some(rest) = after_digits.strip_prefix('\t') {
-        return rest;
+    let mut chars = after_digits.chars();
+    let sep = match chars.next() {
+        Some(c) => c,
+        None => return s,
+    };
+    // TAB：read_file 真实分隔符，其后直接是内容（含缩进），只吞这一个 TAB。
+    if sep == '\t' {
+        return &after_digits['\t'.len_utf8()..];
     }
-    if let Some(rest) = after_digits.strip_prefix("| ") {
-        return rest;
+    // 其它分隔符：必须是"非字母数字、非空格"的单字符，且其后紧跟一个空格
+    // （`42| ` / `42: `）。要求尾随空格可避免把 `80:80`、`3.14` 误判成行号栏。
+    if sep.is_alphanumeric() || sep == ' ' {
+        return s;
     }
-    if let Some(rest) = after_digits.strip_prefix(": ") {
-        return rest;
+    let rest = &after_digits[sep.len_utf8()..];
+    match rest.strip_prefix(' ') {
+        Some(after_space) => after_space,
+        None => s,
     }
-    s
+}
+
+/// 锚定式行号前缀剥离：以 `actual`（原文件真实行，永不含行号栏）为 Ground Truth，
+/// 判断 `expected`（patch 行，可能被模型误抄了行号栏）去掉"数字栏"后是否**精确
+/// 等于** `actual`。是则返回去栏后的内容，否则返回 `expected` 原样。
+///
+/// 相比枚举分隔符，这里分隔符无关（`\t` `|` `:` 空格 `.` `)` 全兼容），且因为
+/// 要求"剩余部分精确等于真实行"，几乎不可能误伤真正以数字开头的代码行——即便
+/// 恰好撞上，也会被 lines_match 的多处匹配（ambiguity）检测拦截。
+fn strip_number_prefix_anchored<'a>(expected: &'a str, actual: &str) -> &'a str {
+    // expected 必须以「可选空白 + 数字」开头，否则不可能是"行号栏 + actual"。
+    let lead_ws_end = expected
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(expected.len());
+    let after_ws = &expected[lead_ws_end..];
+    let digits_end = after_ws
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after_ws.len());
+    if digits_end == 0 {
+        return expected; // 数字部分为空：不是行号栏。
+    }
+    let after_digits = &after_ws[digits_end..];
+    // 去掉 1 个分隔符（按 char 边界，避免多字节 UTF-8 切分 panic）后的剩余部分。
+    let after_one_sep = after_digits
+        .char_indices()
+        .nth(1)
+        .map(|(byte_idx, _)| &after_digits[byte_idx..])
+        .unwrap_or("");
+    // 逐一尝试：去掉 0 或 1 个分隔符（可再带 1 个空格）后是否等于真实行。
+    // 用"剩余部分精确等于真实行"作为唯一判据，因此无需知道分隔符具体是什么。
+    let candidates = [
+        after_digits,   // 数字后直接是内容（罕见）
+        after_one_sep,  // 吞 1 个分隔符
+    ];
+    for cand in candidates {
+        if cand == actual || cand.trim_end() == actual.trim_end() {
+            return cand;
+        }
+        if let Some(c2) = cand.strip_prefix(' ')
+            && (c2 == actual || c2.trim_end() == actual.trim_end())
+        {
+            return c2;
+        }
+    }
+    expected
 }
 
 /// 将常见的 Unicode "confusable" 字符归一化为 ASCII 等价形式。
@@ -649,20 +700,26 @@ fn lines_match_exact(actual: &str, expected: &str, mode: MatchMode) -> bool {
     }
     match mode {
         MatchMode::Strict => {
-            // 模型经常从 read_file 输出中复制行号前缀（真实格式为 `    42\t`，
-            // 即行号 + TAB），在严格匹配前先剥离行号前缀再比较，避免无谓的
-            // Strict→IgnoreIndent 降级。
-            let expected_stripped = strip_line_number_prefix(expected);
-            let actual_stripped = strip_line_number_prefix(actual);
-            if actual_stripped == expected_stripped
-                || actual_stripped.trim_end() == expected_stripped.trim_end()
-            {
+            // 模型经常从 read_file 输出中复制行号前缀（如 `    42\t<code>`）。
+            // 优先用锚定式：以 actual（真实文件行）为准，判断 expected 去掉数字栏后
+            // 是否精确等于 actual —— 分隔符无关且几乎零误伤。
+            let e = strip_number_prefix_anchored(expected, actual);
+            if e == actual || e.trim_end() == actual.trim_end() {
                 return true;
             }
-            false
+            // 兜底：无 actual 锚点信息时的通用数字栏剥离（双侧），
+            // 兼容 actual 侧也带栏之类的极端情况。
+            let expected_stripped = strip_line_number_prefix(expected);
+            let actual_stripped = strip_line_number_prefix(actual);
+            expected_stripped == actual_stripped
+                || expected_stripped.trim_end() == actual_stripped.trim_end()
         }
         MatchMode::IgnoreIndent => {
-            // 同样剥离行号前缀再 trim，覆盖缩进+行号双重差异的场景。
+            // 先试锚定式（以 actual.trim 为准），再回退到双侧通用剥离 + trim。
+            let e = strip_number_prefix_anchored(expected.trim_start(), actual.trim());
+            if e.trim() == actual.trim() {
+                return true;
+            }
             strip_line_number_prefix(actual).trim() == strip_line_number_prefix(expected).trim()
         }
     }
@@ -686,11 +743,19 @@ fn lines_match(actual: &str, expected: &str, mode: MatchMode) -> bool {
     }
     match mode {
         MatchMode::Strict => {
+            let e = strip_number_prefix_anchored(&expected_n, &actual_n);
+            if e == actual_n || e.trim_end() == actual_n.trim_end() {
+                return true;
+            }
             let a = strip_line_number_prefix(&actual_n);
             let e = strip_line_number_prefix(&expected_n);
             a == e || a.trim_end() == e.trim_end()
         }
         MatchMode::IgnoreIndent => {
+            let e = strip_number_prefix_anchored(expected_n.trim_start(), actual_n.trim());
+            if e.trim() == actual_n.trim() {
+                return true;
+            }
             strip_line_number_prefix(&actual_n).trim()
                 == strip_line_number_prefix(&expected_n).trim()
         }
@@ -2523,8 +2588,7 @@ mod tests {
 
     #[test]
     fn strip_line_number_prefix_does_not_strip_code_lines() {
-        // 以数字开头的代码行不应被误剥（如 `80:80` 是配置值），
-        // 但 read_file 的 `    42\t` 格式、grep 的 ` 42| `/`42: ` 格式应被剥离。
+        // 单参数兜底版：只认 `digits+\t` 与 `digits+分隔符+空格`，保守以防误剥。
         use super::strip_line_number_prefix;
         // read_file 真实格式：右对齐行号 + TAB（此前遗漏的根因场景）
         assert_eq!(strip_line_number_prefix("     3\tuse std::fs;"), "use std::fs;");
@@ -2533,17 +2597,39 @@ mod tests {
             strip_line_number_prefix("    42\t    let x = 1;"),
             "    let x = 1;"
         );
-        // grep 类格式应被剥离
+        // grep 类格式（分隔符 + 空格）应被剥离
         assert_eq!(strip_line_number_prefix("   42| hello"), "hello");
         assert_eq!(strip_line_number_prefix("42: hello"), "hello");
         // `80:80`（冒号后无空格）不是行号前缀，不应被剥离
         assert_eq!(strip_line_number_prefix("80:80"), "80:80");
+        // `3.14`（点后无空格）不应被剥离
+        assert_eq!(strip_line_number_prefix("3.14"), "3.14");
         // 纯数字行不应被剥离（没有分隔符）
         assert_eq!(strip_line_number_prefix("42"), "42");
-        // 数字紧跟非分隔符（无 TAB / `| ` / `: `）不应被剥离
+        // 数字紧跟字母不应被剥离（`42px`）
         assert_eq!(strip_line_number_prefix("42px"), "42px");
         // 不以数字开头的行不应被剥离
         assert_eq!(strip_line_number_prefix("hello"), "hello");
+    }
+
+    #[test]
+    fn strip_number_prefix_anchored_is_separator_agnostic() {
+        // 锚定式：以真实行为准，分隔符无关地剥离行号栏，几乎零误伤。
+        use super::strip_number_prefix_anchored;
+        let actual = "    let x = 1;";
+        // read_file TAB / grep `| ` / `: ` / 空格 / `.` / `)` 全部兼容
+        assert_eq!(strip_number_prefix_anchored("  42\t    let x = 1;", actual), actual);
+        assert_eq!(strip_number_prefix_anchored("42|     let x = 1;", actual), actual);
+        assert_eq!(strip_number_prefix_anchored("42:     let x = 1;", actual), actual);
+        assert_eq!(strip_number_prefix_anchored("42     let x = 1;", actual), actual);
+        assert_eq!(strip_number_prefix_anchored("42)     let x = 1;", actual), actual);
+        // 去栏后不等于真实行 → 原样返回（不误剥）
+        assert_eq!(
+            strip_number_prefix_anchored("42\tsomething else", actual),
+            "42\tsomething else"
+        );
+        // 不以数字开头 → 原样返回
+        assert_eq!(strip_number_prefix_anchored(actual, actual), actual);
     }
 
     // ── 大块替换：best-effort 部分匹配精确定位不一致行 ──

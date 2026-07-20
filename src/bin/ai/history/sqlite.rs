@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::ai::types::ToolCall;
 
 use super::{
-    compress::{compact_persisted_history, value_to_string},
+    compress::{compact_persisted_history, is_summary_note_text, value_to_string},
     types::{MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE},
 };
 
@@ -606,10 +606,10 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
         let Some(text) = message.content.as_str() else {
             continue;
         };
-        if text.starts_with("历史摘要（自动压缩")
-            || text.starts_with("对话摘要（自动压缩")
-            || text.starts_with("[mid-turn-summary]")
-        {
+        // 摘要前缀识别统一走 compress::is_summary_note_text（唯一真源）。
+        // 此前这里硬编码 3 种前缀、漏掉 `长期记忆摘要（压缩保留）`，导致 fastpath
+        // 找不到 overflow 路径产生的摘要接续点、每轮回退到全量慢路径重新压缩。
+        if is_summary_note_text(text) {
             return Ok(Some(message));
         }
     }
@@ -846,26 +846,33 @@ pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Op
         )
         .optional()
         .unwrap_or(None);
-    if meta.is_some() {
+    if meta
+        .as_deref()
+        .is_some_and(|prompt| !super::sessions::is_preserved_content_message(prompt))
+    {
         return Ok(meta);
     }
-    // 读取前 3 条用户消息，用于生成更完整的摘要
-    let fallback: Vec<String> = conn
-        .prepare("SELECT content FROM messages WHERE role='user' ORDER BY id ASC LIMIT 3")
-        .map_err(|e| io::Error::other(e.to_string()))?
+
+    // 缓存的首条消息可能是图片/文本归档协议。继续向后查找第一条真实用户请求，
+    // 避免过滤内部协议后把已有会话错误显示成 `new session`。
+    let mut stmt = conn
+        .prepare("SELECT content FROM messages WHERE role='user' ORDER BY id ASC")
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| io::Error::other(e.to_string()))?
-        .filter_map(|r| r.ok())
-        .collect();
-    if fallback.is_empty() {
-        return Ok(None);
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut prompts = Vec::with_capacity(3);
+    for raw in rows {
+        let raw = raw.map_err(|e| io::Error::other(e.to_string()))?;
+        let prompt = value_to_string(&decode_message_content(&raw));
+        if !super::sessions::is_preserved_content_message(&prompt) {
+            prompts.push(prompt);
+            if prompts.len() == 3 {
+                break;
+            }
+        }
     }
-    // 合并前几条消息的内容
-    let combined: Vec<String> = fallback
-        .iter()
-        .map(|content| value_to_string(&decode_message_content(content)))
-        .collect();
-    Ok(Some(combined.join("\n---\n")))
+    Ok((!prompts.is_empty()).then(|| prompts.join("\n---\n")))
 }
 
 /// 读取 LLM 生成的 session 标题（存储在 meta 表中，key='session_title'）。
@@ -1004,6 +1011,41 @@ mod tests {
         assert!(
             r6 > r5,
             "clear should bump even after wiping meta: {r5} -> {r6}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_user_prompt_skips_preserved_content_notices() {
+        let dir = std::env::temp_dir().join(format!(
+            "first_prompt_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+
+        append_history_sqlite(
+            &path,
+            vec![
+                msg("user", "较早的用户图片内容已归档，原文未丢失。"),
+                msg("user", r#"[[PRESERVED_CONTENT_STUB_V1]]{"kind":"image"}"#),
+                msg("user", "较早的用户图片内容已归档，归档文件: /tmp/2"),
+                msg("user", "较早的用户图片内容已归档，归档文件: /tmp/3"),
+                msg("user", "较早的用户图片内容已归档，归档文件: /tmp/4"),
+                msg("user", "这是实际用户请求"),
+                msg("user", "这是后续用户请求"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_first_user_prompt_sqlite(&path).unwrap().as_deref(),
+            Some("这是实际用户请求\n---\n这是后续用户请求")
         );
 
         let _ = std::fs::remove_dir_all(&dir);
