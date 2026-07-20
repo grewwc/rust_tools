@@ -1432,12 +1432,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                             stream_result.reasoning_text.len()
                         );
                         let r_snippet = if reasoning.len() > 600 {
-                            format!(
-                                "{}…[共 {} 字符]…{}",
-                                &reasoning[..300],
-                                reasoning.len(),
-                                &reasoning[reasoning.len() - 300..]
-                            )
+                            let rchar_count = reasoning.chars().count();
+                            let head: String = reasoning.chars().take(300).collect();
+                            let tail: String = reasoning.chars().skip(rchar_count - 300).collect();
+                            format!("{}…[共 {} 字符]…{}", head, rchar_count, tail)
                         } else {
                             reasoning.to_string()
                         };
@@ -1453,13 +1451,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                         );
                     }
                 } else if !partial.is_empty() {
-                    let snippet = if partial.len() > 600 {
-                        format!(
-                            "{}…[截断，共 {} 字符]…{}",
-                            &partial[..300],
-                            partial.len(),
-                            &partial[partial.len() - 300..]
-                        )
+                    let snippet = if partial.chars().count() > 600 {
+                        let char_count = partial.chars().count();
+                        let head: String = partial.chars().take(300).collect();
+                        let tail: String = partial.chars().skip(char_count - 300).collect();
+                        format!("{}…[截断，共 {} 字符]…{}", head, char_count, tail)
                     } else {
                         partial.to_string()
                     };

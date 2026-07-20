@@ -16,12 +16,13 @@ mod tool_overflow;
 use text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use tool_groups::{
     MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, first_tool_call_group, first_trim_candidate,
-    fold_early_tool_groups, fold_tool_call_group_to_stub,
+    fold_early_tool_groups, fold_tool_call_group_to_stub, recent_tool_group_message_indices,
 };
 #[cfg(test)]
 use tool_overflow::normalize_internal_notes_for_summary_model;
 use tool_overflow::{
-    build_persisted_summary_text, build_persisted_summary_text_with_app, is_non_compressible_tool,
+    build_persisted_summary_text, build_persisted_summary_text_with_app,
+    enforce_protected_precision_group_budget, is_non_compressible_tool,
     prepare_tool_messages_structured, spill_oversized_preserved_messages, tool_line_signature,
     try_spill_preserved_message_to_stub,
 };
@@ -433,7 +434,13 @@ fn shrink_messages_to_fit(
     // 而无法再折叠。先做内容级 dedup，把冗余全文折叠成回指 stub，再对真正需要保留
     // 的少数版本做 offload。
     dedup_repeated_tool_results(&mut messages);
-    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES, overflow_dir);
+    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_GROUPS, overflow_dir);
+    enforce_protected_precision_group_budget(
+        &mut messages,
+        KEEP_RECENT_TOOL_GROUPS,
+        max_chars / 2,
+        overflow_dir,
+    );
 
     if messages_total_chars(&messages) <= max_chars {
         return messages;
@@ -499,7 +506,13 @@ fn shrink_messages_to_fit_with_summary(
     // dedup 先于 offload：理由同 shrink_messages_to_fit——避免逐字节相同的重复
     // read_file 全文各自被 offload 成唯一临时路径 stub 而失去折叠机会。
     dedup_repeated_tool_results(&mut messages);
-    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES, overflow_dir);
+    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_GROUPS, overflow_dir);
+    enforce_protected_precision_group_budget(
+        &mut messages,
+        KEEP_RECENT_TOOL_GROUPS,
+        max_chars / 2,
+        overflow_dir,
+    );
 
     // 先无条件外溢体量过大的旧 user/图片消息（最新一轮保护尾窗除外）。
     // 图片在预算里只按名义成本计费，单张大图不再触发超预算循环，因此必须
@@ -768,7 +781,7 @@ pub(in crate::ai) fn mid_turn_compress(
     //    传入 overflow_dir 后，read_file/grep 等「不可压缩」工具的大输出会被
     //    零压缩外溢到会话文件并留 head+tail 预览 stub（与跨 turn 压缩一致），
     //    既释放上下文体积又不丢信息——模型可按 stub 里的 file_path 重新 read_file。
-    prepare_tool_messages_structured(&mut out, 480, KEEP_RECENT_TOOL_MESSAGES, overflow_dir);
+    prepare_tool_messages_structured(&mut out, 480, KEEP_RECENT_TOOL_GROUPS, overflow_dir);
     if messages_total_chars(&out) <= soft_threshold {
         let after = messages_total_chars(&out);
         return (out, before, after);
@@ -1098,7 +1111,9 @@ fn is_summary_message(message: &Message) -> bool {
         || text.starts_with("[mid-turn-summary]")
 }
 
-const KEEP_RECENT_TOOL_MESSAGES: usize = 6;
+/// 最近完整工具组的保护窗口。一个 assistant(tool_calls) 批次是不可拆分的证据
+/// 单元：绝不能按单条 tool 消息截断，否则并行读取会只留下半批结果。
+const KEEP_RECENT_TOOL_GROUPS: usize = 4;
 
 /// 带 tool_calls 的 assistant 消息中，保留完整 reasoning_content 的最近轮数。
 /// 更早的 tool-call reasoning 置 None（DeepSeek 由 echo 兜底补空字符串占位），
@@ -1230,7 +1245,7 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
 /// 跨轮 tool 结果去重：同一 (tool_name, normalized_args) 在历史中出现多次时，
 /// 把较早的 tool 结果替换为单行 stub（保留 tool_call_id 以维持 OpenAI tool-calls 协议正确性）。
 /// 仅压缩内容，不删除消息，避免 assistant tool_calls 与 tool 响应的配对断裂。
-/// 最近 KEEP_RECENT_TOOL_MESSAGES 条 tool 消息一律保留全文。
+/// 最近 KEEP_RECENT_TOOL_GROUPS 个完整工具组一律保留全文。
 fn dedup_repeated_tool_results(messages: &mut [Message]) {
     use rustc_hash::{FxHashMap, FxHasher};
     use std::hash::{Hash, Hasher};
@@ -1249,15 +1264,13 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
         }
     }
 
-    let tool_indices: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(i, m)| (m.role == "tool").then_some(i))
-        .collect();
-    if tool_indices.len() <= KEEP_RECENT_TOOL_MESSAGES {
-        return;
-    }
-    let protected_from = tool_indices.len().saturating_sub(KEEP_RECENT_TOOL_MESSAGES);
+    let tool_indices = tool_message_indices(messages);
+    let protected_indices = recent_tool_group_message_indices(messages, KEEP_RECENT_TOOL_GROUPS);
+
+    // `read_file` 的 offset/limit 不同不会命中调用签名去重，但它们可能包含同一
+    // 段文件。仅在两个结果都已离开近端保护窗口、同文件重叠行逐字一致时，才从较早
+    // 结果删除重叠行；任一行不同（文件曾被编辑、输出格式变化等）即保持原样。
+    dedup_overlapping_read_file_results(messages, &id_to_signature, &protected_indices);
 
     // (name, args) → 该签名下"首个保留全文"的 tool 消息序号，用于在折叠时回指。
     let mut seen: FxHashMap<(String, String), usize> = FxHashMap::default();
@@ -1267,7 +1280,7 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
     // 相同**的全文（实测占全部 tool 字节的 ~52%）。这些冗余副本可无损折叠，
     // 而内容确实变化的版本（如被编辑过的文件）因 hash 不同得以完整保留。
     let mut seen_content: FxHashMap<(String, String, u64), usize> = FxHashMap::default();
-    for (rank, &idx) in tool_indices.iter().enumerate() {
+    for &idx in &tool_indices {
         let signature = messages[idx]
             .tool_call_id
             .as_ref()
@@ -1279,9 +1292,9 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
                 // 孤儿 tool：找不到对应的 assistant.tool_calls（可能因为 assistant 消息
                 // 已被早期裁剪/丢弃，或写入历史时配对就已经断裂）。这些消息在
                 // normalize_messages_for_request 阶段会被丢掉，但在压缩阶段仍占用
-                // 字符预算。最近 KEEP_RECENT_TOOL_MESSAGES 条保留全文以防误伤；
+                // 字符预算。最近完整工具组的结果保留全文以防误伤；
                 // 较旧的孤儿一律折叠为短 stub，避免阻塞后续压缩判断。
-                if rank < protected_from {
+                if !protected_indices.contains(&idx) {
                     let tool_call_id = messages[idx].tool_call_id.clone().unwrap_or_default();
                     let stub = if tool_call_id.is_empty() {
                         "[orphan tool result: corresponding assistant.tool_calls missing; content dropped]".to_string()
@@ -1298,7 +1311,7 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
         };
         let count = seen.entry(signature.clone()).or_insert(0);
         *count += 1;
-        if rank >= protected_from {
+        if protected_indices.contains(&idx) {
             continue;
         }
         if is_non_compressible_tool(&signature.0) {
@@ -1334,6 +1347,130 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
             messages[idx].content = Value::String(stub);
         }
     }
+}
+
+#[derive(Clone)]
+struct NumberedReadFileResult {
+    message_idx: usize,
+    path: String,
+    lines: Vec<(usize, String)>,
+}
+
+fn dedup_overlapping_read_file_results(
+    messages: &mut [Message],
+    id_to_signature: &rustc_hash::FxHashMap<String, (String, String)>,
+    protected_indices: &rustc_hash::FxHashSet<usize>,
+) {
+    let tool_indices = tool_message_indices(messages);
+    let mut prior_results: Vec<NumberedReadFileResult> = Vec::new();
+
+    for idx in tool_indices {
+        let Some(tool_call_id) = messages[idx].tool_call_id.as_ref() else {
+            continue;
+        };
+        let Some((tool_name, args)) = id_to_signature.get(tool_call_id) else {
+            continue;
+        };
+        let Some(path) = read_file_path_from_args(tool_name, args) else {
+            continue;
+        };
+        let text = value_to_string(&messages[idx].content);
+        let Some(lines) = parse_numbered_read_file_lines(&text) else {
+            continue;
+        };
+
+        // 近端完整工具组必须逐字保留，避免下一轮模型看到被处理过的刚读取内容。
+        if protected_indices.contains(&idx) {
+            prior_results.push(NumberedReadFileResult {
+                message_idx: idx,
+                path,
+                lines,
+            });
+            continue;
+        }
+
+        for prior in &mut prior_results {
+            if protected_indices.contains(&prior.message_idx) || prior.path != path {
+                continue;
+            }
+
+            let overlapping = matching_line_numbers(&prior.lines, &lines);
+            if overlapping.is_empty() {
+                continue;
+            }
+            let removed = overlapping.len();
+            prior
+                .lines
+                .retain(|(line_no, _)| !overlapping.contains(line_no));
+            messages[prior.message_idx].content =
+                Value::String(render_deduped_read_file_lines(&prior.lines, removed));
+        }
+
+        prior_results.push(NumberedReadFileResult {
+            message_idx: idx,
+            path,
+            lines,
+        });
+    }
+}
+
+fn read_file_path_from_args(tool_name: &str, args: &str) -> Option<String> {
+    if tool_name != "read_file" {
+        return None;
+    }
+    serde_json::from_str::<Value>(args)
+        .ok()?
+        .get("file_path")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn parse_numbered_read_file_lines(text: &str) -> Option<Vec<(usize, String)>> {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let (number, content) = line.split_once('\t')?;
+        let number = number.trim().parse::<usize>().ok()?;
+        lines.push((number, content.to_string()));
+    }
+    (!lines.is_empty()).then_some(lines)
+}
+
+/// 返回双方所有共有行号，前提是每一个共有行的内容均完全相同。
+fn matching_line_numbers(
+    earlier: &[(usize, String)],
+    later: &[(usize, String)],
+) -> rustc_hash::FxHashSet<usize> {
+    let later_by_number: rustc_hash::FxHashMap<usize, &str> = later
+        .iter()
+        .map(|(number, content)| (*number, content.as_str()))
+        .collect();
+    let mut matching = rustc_hash::FxHashSet::default();
+    for (number, content) in earlier {
+        let Some(later_content) = later_by_number.get(number) else {
+            continue;
+        };
+        if *later_content != content {
+            return rustc_hash::FxHashSet::default();
+        }
+        matching.insert(*number);
+    }
+    matching
+}
+
+fn render_deduped_read_file_lines(lines: &[(usize, String)], removed: usize) -> String {
+    if lines.is_empty() {
+        return format!(
+            "[overlap dedup: all {removed} numbered lines are present verbatim in a later read_file result]"
+        );
+    }
+    let mut output = format!(
+        "[overlap dedup: {removed} numbered lines are present verbatim in a later read_file result]\n"
+    );
+    for (number, content) in lines {
+        output.push_str(&format!("{number:>6}\t{content}\n"));
+    }
+    output.pop();
+    output
 }
 
 #[cfg(test)]

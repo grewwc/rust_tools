@@ -124,6 +124,9 @@ pub(crate) enum ToolPrunePolicy {
 pub(crate) struct ToolHistoryPolicy {
     pub(crate) lossy_compress: ToolLossyCompressPolicy,
     pub(crate) prune: ToolPrunePolicy,
+    /// 最近工具组过大时，该工具是否占用高精度结果的 inline 预算。
+    /// 聚合型工具（如 task_wait）即使同样禁止有损压缩，也不占用此预算。
+    pub(crate) counts_toward_precision_inline_budget: bool,
 }
 
 impl ToolHistoryPolicy {
@@ -135,6 +138,10 @@ impl ToolHistoryPolicy {
     /// 是否允许该工具结果被 LLM 引导裁剪。
     pub(crate) fn allows_prune(&self) -> bool {
         matches!(self.prune, ToolPrunePolicy::Allow)
+    }
+
+    pub(crate) fn counts_toward_precision_inline_budget(&self) -> bool {
+        self.counts_toward_precision_inline_budget
     }
 }
 

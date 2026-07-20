@@ -178,6 +178,65 @@ pub(super) fn fold_tool_call_group_to_stub(
 /// 可摘要"时压缩器空转的问题。
 pub(super) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS: usize = 4;
 
+/// 返回最近 `keep_recent_groups` 个完整工具组中所有 tool 结果的消息下标。
+///
+/// 一个 assistant(tool_calls) 可能并行发起任意数量的调用。保护窗口必须按这个
+/// 原子组计算，不能按 tool 消息条数切开；否则一个批次会出现部分结果仍在上下文、
+/// 部分结果已被 offload/dedup 的状态，迫使模型重新读取缺失文件。
+pub(super) fn recent_tool_group_message_indices(
+    messages: &[Message],
+    keep_recent_groups: usize,
+) -> FxHashSet<usize> {
+    recent_tool_result_groups(messages, keep_recent_groups)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// 返回最近 `keep_recent_groups` 个完整工具组的 tool 结果下标，并保留组边界。
+pub(super) fn recent_tool_result_groups(
+    messages: &[Message],
+    keep_recent_groups: usize,
+) -> Vec<Vec<usize>> {
+    if keep_recent_groups == 0 {
+        return Vec::new();
+    }
+
+    let mut groups = Vec::<Vec<usize>>::new();
+    for (anchor, assistant) in messages.iter().enumerate() {
+        if assistant.role != "assistant" {
+            continue;
+        }
+        let Some(calls) = assistant
+            .tool_calls
+            .as_ref()
+            .filter(|calls| !calls.is_empty())
+        else {
+            continue;
+        };
+        let call_ids: FxHashSet<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+        let mut result_indices = Vec::new();
+        for (idx, message) in messages.iter().enumerate().skip(anchor + 1) {
+            if message.role == "assistant" && message.tool_calls.is_some() {
+                break;
+            }
+            if message.role == "tool"
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| call_ids.contains(id))
+            {
+                result_indices.push(idx);
+            }
+        }
+        if !result_indices.is_empty() {
+            groups.push(result_indices);
+        }
+    }
+
+    groups.into_iter().rev().take(keep_recent_groups).collect()
+}
+
 /// 为折叠 stub 生成"召回锚点"单行：优先提取已外溢 tool 结果里的 `file_path:`
 /// 指针（模型据此可重新 read_file），否则退回结果首个非空行。
 /// 保证折叠早期 precision 工具组时仍留下可召回的线索，避免失忆式重复检索。
@@ -195,40 +254,6 @@ fn tool_result_recall_one_liner(result_text: &str) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or("");
     truncate_to_chars(&normalize_whitespace(first_meaningful), 160)
-}
-
-/// 与 dedup/offload/prune 一致的「最近工具结果保护窗口」在折叠语境下的锚点。
-///
-/// 其它有损路径都按最近 `KEEP_RECENT_TOOL_MESSAGES` 条 `tool` 消息保护尾窗，而
-/// 折叠按「工具组」计窗口。返回「最早那条受保护 tool 消息所属工具组」的锚点
-/// 下标：折叠边界夹到该锚点之前，即可保证折叠永不越过统一的近端保护窗口。
-/// 若受保护的 tool 消息不足或找不到归属组，返回 `None`（不额外收紧）。
-fn recent_tool_message_protection_anchor(
-    messages: &[Message],
-    group_anchors: &[usize],
-) -> Option<usize> {
-    if group_anchors.is_empty() {
-        return None;
-    }
-    let tool_indices: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, m)| (m.role == "tool").then_some(idx))
-        .collect();
-    if tool_indices.len() <= super::KEEP_RECENT_TOOL_MESSAGES {
-        // 全部 tool 消息都在保护窗口内：折叠边界夹到最早的工具组锚点之前，
-        // 等价于「不折叠任何拥有 tool 结果的组」。
-        return group_anchors.first().copied();
-    }
-    let protect_from = tool_indices.len() - super::KEEP_RECENT_TOOL_MESSAGES;
-    let earliest_protected_tool_idx = tool_indices[protect_from];
-    // 最早受保护 tool 消息所属的工具组 = 不晚于它的最后一个 assistant(tool_calls) 锚点。
-    group_anchors
-        .iter()
-        .rev()
-        .find(|&&anchor| anchor <= earliest_protected_tool_idx)
-        .copied()
-        .or_else(|| group_anchors.first().copied())
 }
 
 /// 从工具调用的 JSON `arguments` 里取 `file_path`（或兼容的 `path`）。
@@ -365,22 +390,11 @@ pub(super) fn fold_early_tool_groups(
     // 最近 keep_recent_groups 个工具组逐字保留；更早的折叠。
     // keep_recent_groups=0 时折叠全部工具组（fold_before_anchor 取消息末尾），
     // 避免 group_anchors[len - 0] 越界 panic。
-    let mut fold_before_anchor = if keep_recent_groups == 0 {
+    let fold_before_anchor = if keep_recent_groups == 0 {
         messages.len()
     } else {
         group_anchors[group_anchors.len() - keep_recent_groups]
     };
-
-    // 与 dedup/offload/prune 统一的「最近工具结果保护窗口」下界：这些有损路径
-    // 都按最近 KEEP_RECENT_TOOL_MESSAGES 条 tool 消息保护尾窗，而折叠按「工具组」
-    // 数计窗口，二者单位不一致会让折叠把其它路径承诺保留的近端 tool 结果偷偷
-    // 折成 stub（近端结果被弱化 → 模型误以为要重跑同一工具）。这里把折叠边界
-    // 再夹到「拥有最早受保护 tool 消息的那个工具组锚点」之前，保证折叠永不越过
-    // 统一的近端保护窗口。
-    if let Some(protected_anchor) = recent_tool_message_protection_anchor(messages, &group_anchors)
-    {
-        fold_before_anchor = fold_before_anchor.min(protected_anchor);
-    }
 
     // 方向二：pending-patch 定向保留。扫描历史中"最近一次 apply_patch 失败、
     // 且之后同路径没有成功"的目标文件路径；折叠器遇到读这些路径的 read_file

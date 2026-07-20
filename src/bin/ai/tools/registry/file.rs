@@ -70,6 +70,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::Allow,
+        counts_toward_precision_inline_budget: true,
     },
 });
 

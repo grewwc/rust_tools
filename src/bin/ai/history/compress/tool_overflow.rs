@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 
-use crate::ai::{request, types::App};
+use crate::ai::{request, tools::tool_history_policy, types::App};
 
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
 use super::text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
+use super::tool_groups::{recent_tool_group_message_indices, recent_tool_result_groups};
 use super::{
-    IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_MESSAGES, PRESERVED_CONTENT_STUB_PREFIX,
+    IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_GROUPS, PRESERVED_CONTENT_STUB_PREFIX,
     PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR, PRESERVED_USER_OVERFLOW_DIR,
     USER_OVERFLOW_SPILL_MIN_CHARS, automatic_summary_body, dedup_adjacent,
     keep_recent_user_turns_when_trimming, message_contains_image, normalize_whitespace,
@@ -34,7 +35,7 @@ pub(super) async fn build_persisted_summary_text_with_app(
     max_chars: usize,
 ) -> String {
     let mut prepared = messages.to_vec();
-    prepare_tool_messages_structured(&mut prepared, 360, KEEP_RECENT_TOOL_MESSAGES, None);
+    prepare_tool_messages_structured(&mut prepared, 360, KEEP_RECENT_TOOL_GROUPS, None);
     redact_images_except_last(&mut prepared, 0);
     dedup_adjacent(&mut prepared);
     normalize_internal_notes_for_summary_model(&mut prepared);
@@ -85,13 +86,13 @@ pub(super) fn normalize_internal_notes_for_summary_model(messages: &mut Vec<Mess
 pub(super) fn prepare_tool_messages_structured(
     messages: &mut [Message],
     max_chars_per_msg: usize,
-    keep_recent: usize,
+    keep_recent_groups: usize,
     overflow_dir: Option<&Path>,
 ) {
     let id_to_tool_name = build_tool_call_name_index(messages);
     let indices = tool_message_indices(messages);
-    let protect_from = indices.len().saturating_sub(keep_recent);
-    for (rank, &idx) in indices.iter().enumerate() {
+    let protected_indices = recent_tool_group_message_indices(messages, keep_recent_groups);
+    for &idx in &indices {
         let message = &mut messages[idx];
         let text = value_to_string(&message.content);
         if text.trim().is_empty() {
@@ -112,11 +113,11 @@ pub(super) fn prepare_tool_messages_structured(
         if let Some(name) = tool_name
             && is_non_compressible_tool(name)
         {
-            // 最近 keep_recent 条不外溢：刚读到的文件/检索结果必须在下一轮请求里
+            // 最近完整工具组不外溢：刚读到的文件/检索结果必须在下一轮请求里
             // 完整可见，否则模型看到的是「已卸载，请重读」stub，会立刻再发一次
             // 同样的 read_file——在会话超软阈值、每轮都跑压缩时表现为无限重读。
             // 只有保护尾窗之外的旧 precision 结果才零压缩外溢到磁盘。
-            if rank < protect_from
+            if !protected_indices.contains(&idx)
                 && text.chars().count() > max_chars_per_msg
                 && let Some(path) = overflow_dir
                     .and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
@@ -127,14 +128,70 @@ pub(super) fn prepare_tool_messages_structured(
             continue;
         }
 
-        if rank >= protect_from {
-            // 最近 keep_recent 条普通工具结果仍保留全文，避免误伤近端上下文。
+        if protected_indices.contains(&idx) {
+            // 最近完整工具组的普通工具结果仍保留全文，避免误伤近端上下文。
             continue;
         }
 
         let summary = structured_tool_output_summary(&text, max_chars_per_msg);
         if !summary.is_empty() && summary != text {
             message.content = Value::String(summary);
+        }
+    }
+}
+
+/// 最新并行批次可能单独超过上下文窗口。此时仍按完整组判定，但对注册为高精度
+/// grounding 的结果设置 inline 上限：超过预算的结果零压缩外溢并保留可召回 stub。
+/// `task` / `task_wait` 等聚合结果没有注册该标志，不会挤占 read_file 等证据的预算。
+pub(super) fn enforce_protected_precision_group_budget(
+    messages: &mut [Message],
+    keep_recent_groups: usize,
+    inline_budget: usize,
+    overflow_dir: Option<&Path>,
+) {
+    let Some(overflow_dir) = overflow_dir else {
+        return;
+    };
+    let id_to_tool_name = build_tool_call_name_index(messages);
+
+    for group in recent_tool_result_groups(messages, keep_recent_groups) {
+        let mut precision_results: Vec<(usize, String)> = group
+            .into_iter()
+            .filter_map(|idx| {
+                let tool_name = messages[idx]
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| id_to_tool_name.get(id))?;
+                tool_history_policy(tool_name)
+                    .counts_toward_precision_inline_budget()
+                    .then(|| (idx, tool_name.clone()))
+            })
+            .collect();
+
+        let mut total_chars = precision_results
+            .iter()
+            .map(|(idx, _)| value_to_string(&messages[*idx].content).chars().count())
+            .sum::<usize>();
+        precision_results.sort_unstable_by_key(|(idx, _)| {
+            std::cmp::Reverse(value_to_string(&messages[*idx].content).chars().count())
+        });
+
+        // 优先外溢最大的结果，以最少的 stub 腾出足够空间；其余同组证据仍完整可见。
+        for (idx, tool_name) in precision_results {
+            if total_chars <= inline_budget {
+                break;
+            }
+            let text = value_to_string(&messages[idx].content);
+            if text.trim().is_empty() || is_preserved_tool_overflow_stub(&text) {
+                continue;
+            }
+            let text_len = text.chars().count();
+            if let Some(path) = write_preserved_tool_overflow_file(overflow_dir, &tool_name, &text)
+            {
+                messages[idx].content =
+                    Value::String(build_preserved_tool_overflow_stub(&path, &tool_name, &text));
+                total_chars = total_chars.saturating_sub(text_len);
+            }
         }
     }
 }
@@ -215,6 +272,36 @@ mod tests {
             - use read_file to inspect exact content.\n\
             Preview (for recall; not exhaustive):";
         assert!(is_preserved_tool_overflow_stub(legacy));
+    }
+
+    #[test]
+    fn protected_precision_budget_excludes_aggregated_task_results() {
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-precision-group-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut call = assistant_call("read", "read_file");
+        call.tool_calls.as_mut().unwrap().push(ToolCall {
+            id: "task".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "task_wait".to_string(),
+                arguments: "{}".to_string(),
+            },
+        });
+        let mut messages = vec![
+            call,
+            tool_result("read", &"r".repeat(1_000)),
+            tool_result("task", &"t".repeat(10_000)),
+        ];
+
+        enforce_protected_precision_group_budget(&mut messages, 1, 200, Some(&overflow_dir));
+
+        assert!(is_preserved_tool_overflow_stub(&value_to_string(
+            &messages[1].content
+        )));
+        assert_eq!(value_to_string(&messages[2].content).len(), 10_000);
+        let _ = std::fs::remove_dir_all(overflow_dir);
     }
 }
 

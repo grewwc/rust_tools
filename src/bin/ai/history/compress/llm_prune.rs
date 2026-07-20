@@ -149,7 +149,7 @@ pub(crate) fn update_prune_marks(
 /// 收集当前上下文中允许被 LLM 引导裁剪的 tool_call_id。
 ///
 /// 保护策略：
-/// - 最近 `KEEP_RECENT_TOOL_MESSAGES` 条 tool 结果保留全文。
+/// - 最近完整工具组的结果保留全文。
 /// - 工具注册策略声明 `prune: Never` 的结果（如 `plan`）永不裁剪。
 ///   注意 `read_file` / 检索类虽「不可有损压缩」但**允许**裁剪。
 pub(crate) fn active_prunable_tool_ids(messages: &[Message]) -> FxHashSet<String> {
@@ -168,21 +168,20 @@ pub(crate) fn active_prunable_tool_ids(messages: &[Message]) -> FxHashSet<String
 
 fn protected_tool_call_ids(messages: &[Message]) -> FxHashSet<String> {
     let id_to_tool_name = build_tool_call_name_index(messages);
-    let tool_indices = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, message)| (message.role == "tool").then_some(idx))
-        .collect::<Vec<_>>();
-    let protect_from = tool_indices
-        .len()
-        .saturating_sub(super::KEEP_RECENT_TOOL_MESSAGES);
+    let protected_indices = super::tool_groups::recent_tool_group_message_indices(
+        messages,
+        super::KEEP_RECENT_TOOL_GROUPS,
+    );
 
     let mut protected = FxHashSet::default();
-    for (rank, &idx) in tool_indices.iter().enumerate() {
-        let Some(tool_call_id) = messages[idx].tool_call_id.as_ref() else {
+    for (idx, message) in messages.iter().enumerate() {
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(tool_call_id) = message.tool_call_id.as_ref() else {
             continue;
         };
-        if rank >= protect_from {
+        if protected_indices.contains(&idx) {
             protected.insert(tool_call_id.clone());
             continue;
         }
@@ -211,8 +210,8 @@ pub(crate) struct PruneReport {
 ///
 /// 将计数 >= PRUNE_THRESHOLD 的 tool 消息内容替换为占位符。
 /// 不删除消息、不改变数组长度。
-/// 受 `protected_tool_call_ids` 保护的消息（最近 `KEEP_RECENT_TOOL_MESSAGES`
-/// 条 tool 结果、以及注册策略声明 `prune: Never` 的工具，如 `plan`）
+/// 受 `protected_tool_call_ids` 保护的消息（最近完整工具组、以及注册策略声明
+/// `prune: Never` 的工具，如 `plan`）
 /// 永不被裁剪，避免误裁剪当前轮所需结果或任务路线图锚点。
 ///
 /// 返回本次裁剪的统计报告（供调用方打印终端简讯）。
@@ -493,20 +492,22 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_pruning_protects_recent_tool_window() {
+    fn test_apply_pruning_protects_recent_tool_groups() {
         let mut marks = FxHashMap::default();
         marks.insert("call_last".to_string(), PRUNE_THRESHOLD);
 
         let mut messages = vec![
+            make_assistant_tool_call("call_prev", "execute_command"),
             make_tool_message("call_prev", "old result"),
+            make_assistant_tool_call("call_last", "execute_command"),
             make_tool_message("call_last", "most recent result"),
         ];
 
         let pruned = apply_pruning(&mut messages, &marks);
 
-        // call_last 是最后一条 tool，受保护，不被裁剪
+        // call_last 所在的最近完整工具组受保护，不被裁剪。
         assert_eq!(pruned.pruned_count, 0);
-        assert_eq!(messages[1].content.as_str().unwrap(), "most recent result");
+        assert_eq!(messages[3].content.as_str().unwrap(), "most recent result");
     }
 
     #[test]
@@ -528,13 +529,16 @@ mod tests {
         let mut messages = vec![
             make_user_message("important user question"),
             make_assistant_message("important assistant response"),
+            make_assistant_tool_call("call_1", "execute_command"),
             make_tool_message("call_1", "outdated tool result"),
+            make_assistant_tool_call("call_2", "execute_command"),
             make_tool_message("call_2", "current tool result"),
+            make_assistant_tool_call("call_3", "execute_command"),
             make_tool_message("call_3", "recent tool result 3"),
+            make_assistant_tool_call("call_4", "execute_command"),
             make_tool_message("call_4", "recent tool result 4"),
+            make_assistant_tool_call("call_5", "execute_command"),
             make_tool_message("call_5", "recent tool result 5"),
-            make_tool_message("call_6", "recent tool result 6"),
-            make_tool_message("call_7", "recent tool result 7"),
         ];
 
         let pruned = apply_pruning(&mut messages, &marks);
@@ -548,11 +552,11 @@ mod tests {
             messages[1].content.as_str().unwrap(),
             "important assistant response"
         );
-        assert!(messages[2].content.as_str().unwrap().contains("[pruned"));
+        assert!(messages[3].content.as_str().unwrap().contains("[pruned"));
     }
 
     #[test]
-    fn test_active_prunable_tool_ids_excludes_recent_window_and_non_compressible_tools() {
+    fn test_active_prunable_tool_ids_excludes_recent_groups_and_non_compressible_tools() {
         let messages = vec![
             make_assistant_tool_call("call_plan", "plan"),
             make_tool_message("call_plan", "task plan"),
@@ -566,10 +570,6 @@ mod tests {
             make_tool_message("call_recent_3", "recent 3"),
             make_assistant_tool_call("call_recent_4", "execute_command"),
             make_tool_message("call_recent_4", "recent 4"),
-            make_assistant_tool_call("call_recent_5", "execute_command"),
-            make_tool_message("call_recent_5", "recent 5"),
-            make_assistant_tool_call("call_recent_6", "execute_command"),
-            make_tool_message("call_recent_6", "recent 6"),
         ];
 
         let ids = active_prunable_tool_ids(&messages);

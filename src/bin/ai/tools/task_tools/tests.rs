@@ -1,13 +1,12 @@
 use super::{
     AsyncTaskEntry, InheritOptions, OsTaskGoal, OutstandingTaskSnapshot,
     SUBAGENT_PARENT_SUMMARY_REMINDER, SUBAGENT_WALL_CLOCK_TIMEOUT, SelectedSubagent,
-    StoredTaskResult, TASK_REGISTRY,
-    WaitManySource, append_current_process_cancel_source, build_selection_explanation,
-    encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels, execute_task_cancel,
-    execute_task_status, execute_task_wait, format_task_result, insert_task_entry_for_test,
-    is_encoded_task_goal, prepare_subagent_task, reap_timed_out_subagents, remove_task_entry,
-    render_outstanding_task_anchor, select_subagent, wait_sources_for_channel_and_futex,
-    with_task_entry_by_pid,
+    StoredTaskResult, TASK_REGISTRY, WaitManySource, append_current_process_cancel_source,
+    build_selection_explanation, encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels,
+    execute_task_cancel, execute_task_status, execute_task_wait, format_task_result,
+    insert_task_entry_for_test, is_encoded_task_goal, prepare_subagent_task,
+    reap_timed_out_subagents, remove_task_entry, render_outstanding_task_anchor, select_subagent,
+    wait_sources_for_channel_and_futex, with_task_entry_by_pid,
 };
 use super::{ToolRegistration, ToolSpec};
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
@@ -623,8 +622,7 @@ fn task_wait_any_returns_ready_result_without_waiting_for_pending_task() {
             .unwrap();
         let ready_channel = os.channel_create(Some(root_pid), 1, "ready-result".to_string());
         let ready_futex = os.futex_create(0, "ready-complete".to_string());
-        let pending_channel =
-            os.channel_create(Some(pending_pid), 1, "pending-result".to_string());
+        let pending_channel = os.channel_create(Some(pending_pid), 1, "pending-result".to_string());
         let pending_futex = os.futex_create(0, "pending-complete".to_string());
         os.channel_send(
             Some(root_pid),
@@ -844,11 +842,11 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
         },
     );
 
-    let cancel_output = crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
-        (app.session_id.clone(), 0usize),
-        || execute_task_cancel(&serde_json::json!({ "task_ids": [task_id.clone()] })),
-    )
-    .expect("task_cancel should succeed");
+    let cancel_output = crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .sync_scope((app.session_id.clone(), 0usize), || {
+            execute_task_cancel(&serde_json::json!({ "task_ids": [task_id.clone()] }))
+        })
+        .expect("task_cancel should succeed");
     assert!(
         worker
             .await
@@ -861,11 +859,11 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
         "cancelled task must stay collectable until task_wait/task_status consumes it"
     );
 
-    let wait_output = crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
-        (app.session_id.clone(), 0usize),
-        || execute_task_wait(&serde_json::json!({ "task_ids": [task_id.clone()] })),
-    )
-    .expect("task_wait should collect cancelled result");
+    let wait_output = crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .sync_scope((app.session_id.clone(), 0usize), || {
+            execute_task_wait(&serde_json::json!({ "task_ids": [task_id.clone()] }))
+        })
+        .expect("task_wait should collect cancelled result");
 
     assert!(wait_output.contains("CANCELLED"));
     assert!(wait_output.contains("Error: cancelled by parent agent"));
@@ -936,9 +934,7 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: Some(abort_handle),
-            started_at: Instant::now()
-                - SUBAGENT_WALL_CLOCK_TIMEOUT
-                - Duration::from_secs(1),
+            started_at: Instant::now() - SUBAGENT_WALL_CLOCK_TIMEOUT - Duration::from_secs(1),
         },
     );
 
@@ -950,11 +946,11 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
             .is_cancelled()
     );
 
-    let wait_output = crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
-        (app.session_id.clone(), 0usize),
-        || execute_task_wait(&serde_json::json!({ "task_ids": [task_id.clone()] })),
-    )
-    .expect("task_wait should collect timeout result");
+    let wait_output = crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .sync_scope((app.session_id.clone(), 0usize), || {
+            execute_task_wait(&serde_json::json!({ "task_ids": [task_id.clone()] }))
+        })
+        .expect("task_wait should collect timeout result");
     assert!(wait_output.contains("TIMEOUT"));
     assert!(wait_output.contains("exceeded wall-clock lifetime"));
     assert!(remove_task_entry(&task_id).is_none());

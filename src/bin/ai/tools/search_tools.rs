@@ -14,6 +14,20 @@ use crate::commonw::utils::expanduser;
 const DEFAULT_FIND_PATH_MAX_RESULTS: usize = 100;
 const MAX_FIND_PATH_RESULTS: usize = 1_000;
 
+/// 将 `fs::canonicalize` 产生的真实路径映射回用户可读的路径格式。
+///
+/// 在某些部署环境下，`/home/user` 是指向 `/data00/home/user` 的符号链接。
+/// `fs::canonicalize` 会解析该符号链接，导致 `find_path` 返回的路径与
+/// `effective_cwd()`（基于 `std::env::current_dir()`）格式不一致，使模型困惑。
+/// 此函数将 `real_cwd` 前缀替换回 `cwd` 前缀，保证路径格式一致。
+fn de_canonicalize(path: &Path, cwd: &Path, real_cwd: &Path) -> PathBuf {
+    if let Ok(stripped) = path.strip_prefix(real_cwd) {
+        cwd.join(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn params_list_directory() -> Value {
     serde_json::json!({
         "type": "object",
@@ -79,6 +93,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::Allow,
+        counts_toward_precision_inline_budget: true,
     }
 });
 
@@ -150,7 +165,8 @@ pub(crate) fn execute_find_path(args: &Value) -> Result<String, String> {
     if !glob_mode {
         let output = find_paths_by_name(&base_dir, target, max_results)
             .into_iter()
-            .map(|found| fs::canonicalize(&found).unwrap_or(found))
+            // 不做 canonicalize：它会解析符号链接（如 /home → /data00/home），
+            // 导致路径与 effective_cwd() 返回的格式不一致，引发模型困惑。
             .map(|abs| abs.to_string_lossy().trim().to_string())
             .collect::<Vec<_>>()
             .join("\n");
@@ -183,7 +199,13 @@ fn run_glob_ff_embed(
     base_dir: &Path,
     max_results: usize,
 ) -> Result<String, String> {
+    // ff_embed 内部（search.rs）会对匹配结果调用 canonicalize，导致路径格式与
+    // effective_cwd() 不一致。这里传入 canonicalized wd 以保持 ff 内部逻辑正常，
+    // 后续对输出做 de_canonicalize 映射回用户格式。
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+        .map_err(|e| format!("Failed to get cwd: {}", e))?;
     let wd = fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
+    let real_wd = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
 
     let opts = crate::ai::ff_embed::cli::Options {
         verbose: false,
@@ -216,7 +238,7 @@ fn run_glob_ff_embed(
         .map(|s| {
             let p = PathBuf::from(s.trim());
             let abs = if p.is_absolute() { p } else { base_dir.join(p) };
-            fs::canonicalize(&abs).unwrap_or(abs)
+            de_canonicalize(&abs, &cwd, &real_wd)
         })
         .filter(|abs| !rust_tools::commonw::path_contains_skip_dir(abs))
         .map(|abs| abs.to_string_lossy().to_string())
@@ -231,6 +253,9 @@ fn run_glob_terminalw(
     base_dir: &Path,
     max_results: usize,
 ) -> Result<String, String> {
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+        .map_err(|e| format!("Failed to get cwd: {}", e))?;
+    let real_cwd = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
     let matches =
         crate::terminalw::glob_paths(target, path).map_err(|e| format!("glob failed: {e}"))?;
     let out: Vec<String> = matches
@@ -239,7 +264,7 @@ fn run_glob_terminalw(
         .map(|s| {
             let p = PathBuf::from(s.trim());
             let abs = if p.is_absolute() { p } else { base_dir.join(p) };
-            fs::canonicalize(&abs).unwrap_or(abs)
+            de_canonicalize(&abs, &cwd, &real_cwd)
         })
         .filter(|abs| !rust_tools::commonw::path_contains_skip_dir(abs))
         .take(max_results)

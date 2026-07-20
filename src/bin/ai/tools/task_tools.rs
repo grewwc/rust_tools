@@ -631,6 +631,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::Never,
+        counts_toward_precision_inline_budget: false,
     },
 });
 
@@ -875,10 +876,7 @@ pub(crate) fn with_task_entry<R>(task_id: &str, f: impl FnOnce(&AsyncTaskEntry) 
 
 /// 关联实际执行子代理的 Tokio task，使取消和超时能够停止后台 Future，
 /// 而不只是终止 kernel 中的逻辑进程。
-pub(crate) fn set_task_abort_handle(
-    task_id: &str,
-    abort_handle: tokio::task::AbortHandle,
-) -> bool {
+pub(crate) fn set_task_abort_handle(task_id: &str, abort_handle: tokio::task::AbortHandle) -> bool {
     let mut registry = TASK_REGISTRY.lock().unwrap();
     let Some(entry) = registry.get_mut(&task_id.to_string()) else {
         return false;
@@ -1060,6 +1058,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::Never,
+        counts_toward_precision_inline_budget: false,
     },
 });
 
@@ -1547,6 +1546,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::Never,
+        counts_toward_precision_inline_budget: false,
     },
 });
 
@@ -1584,6 +1584,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::Never,
+        counts_toward_precision_inline_budget: false,
     },
 });
 

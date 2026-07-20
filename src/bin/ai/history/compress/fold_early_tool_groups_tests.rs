@@ -84,9 +84,8 @@ fn folds_early_groups_in_a_single_bloated_turn() {
     let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
 
     // 10 组各 1 条 tool 结果 → 10 条 tool 消息。虽然 keep_recent_groups=4，但
-    // 折叠必须尊重统一的「最近 KEEP_RECENT_TOOL_MESSAGES(6) 条 tool 结果」保护窗口，
-    // 因此实际只折叠最早 4 组，保留最近 6 组逐字。
-    assert_eq!(folded_groups, 4);
+    // 最近完整 4 组逐字保留，最早 6 组折叠。
+    assert_eq!(folded_groups, 6);
     let after = messages_total_chars(&folded);
     assert!(
         after < before,
@@ -112,14 +111,12 @@ fn keeps_recent_groups_verbatim() {
     let messages = single_turn_with_groups(8, 1_500);
     let (folded, _) = fold_early_tool_groups(&messages, 4);
 
-    // 8 组各 1 条 tool 结果。keep_recent_groups=4 会想折叠最早 4 组，但统一的
-    // 最近 6 条 tool 结果保护窗口把折叠边界夹到只允许折叠最早 2 组，故保留
-    // 最近 6 组的 tool 结果逐字。
+    // 8 组各 1 条 tool 结果。按完整组保护最近 4 组，最早 4 组折叠为 stub。
     let full_tool_results = folded
         .iter()
         .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(1_500))
         .count();
-    assert_eq!(full_tool_results, 6);
+    assert_eq!(full_tool_results, 4);
 }
 
 #[test]
@@ -131,11 +128,9 @@ fn no_op_when_group_count_within_keep_window() {
     assert_eq!(folded.len(), messages.len());
 }
 
-/// 统一保护窗口不变量：即使调用方要求最激进的 `keep_recent_groups=0`（折叠全部
-/// 工具组），折叠也必须尊重与 dedup/offload/prune 一致的「最近
-/// KEEP_RECENT_TOOL_MESSAGES 条 tool 结果」保护窗口，绝不把近端 tool 结果折成
-/// stub。否则近端结果被弱化，模型会误以为需要重跑同一工具（read_file /
-/// execute_command 重复调用的根因）。
+/// 组原子性不变量：即使调用方要求最激进的 `keep_recent_groups=0`，折叠也必须
+/// 保留最近完整工具组，而不是按扁平 tool 消息数从并行批次中间切开。否则模型会
+/// 看到同批调用的一半结果，误以为另一半需要重跑。
 #[test]
 fn fold_never_crosses_recent_tool_message_protection_window() {
     let messages = single_turn_with_groups(10, 1_200);
@@ -143,15 +138,15 @@ fn fold_never_crosses_recent_tool_message_protection_window() {
     // keep_recent_groups=0 表面上要折叠全部 10 组。
     let (folded, folded_groups) = fold_early_tool_groups(&messages, 0);
 
-    // 每组 1 条 tool 结果 → 只允许折叠最早 4 组，保留最近 6 组逐字。
-    assert_eq!(folded_groups, 4);
+    // 每组 1 条 tool 结果；调用方要求保留 0 组，因此 10 组都可折叠。
+    assert_eq!(folded_groups, 10);
     let full_tool_results = folded
         .iter()
         .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(1_200))
         .count();
     assert_eq!(
-        full_tool_results, KEEP_RECENT_TOOL_MESSAGES,
-        "最近 KEEP_RECENT_TOOL_MESSAGES 条 tool 结果必须逐字保留，不受激进折叠影响"
+        full_tool_results, 0,
+        "调用方要求保留 0 组时，不应留下任何原始 tool 结果"
     );
     assert_tool_pairs_consistent(&folded);
 }
@@ -443,7 +438,88 @@ fn preserves_read_file_for_each_pending_path_from_multi_file_patch() {
                     })
                     .unwrap_or(false)
         });
-        assert!(preserved, "pending multi-file patch path {target} should be preserved");
+        assert!(
+            preserved,
+            "pending multi-file patch path {target} should be preserved"
+        );
     }
     assert_tool_pairs_consistent(&folded);
+}
+
+#[test]
+fn removes_only_byte_identical_overlap_from_an_aged_read_file_result() {
+    let mut messages = vec![
+        assistant_call_args(
+            "older",
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":1,"limit":3}"#,
+        ),
+        tool_result("older", "     1\tone\n     2\ttwo\n     3\tthree"),
+        assistant_call_args(
+            "later",
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":2,"limit":3}"#,
+        ),
+        tool_result("later", "     2\ttwo\n     3\tthree\n     4\tfour"),
+    ];
+    let signatures = rustc_hash::FxHashMap::from_iter([
+        (
+            "older".to_string(),
+            (
+                "read_file".to_string(),
+                r#"{"file_path":"/a.rs","offset":1,"limit":3}"#.to_string(),
+            ),
+        ),
+        (
+            "later".to_string(),
+            (
+                "read_file".to_string(),
+                r#"{"file_path":"/a.rs","offset":2,"limit":3}"#.to_string(),
+            ),
+        ),
+    ]);
+
+    dedup_overlapping_read_file_results(&mut messages, &signatures, &FxHashSet::default());
+
+    let earlier = value_to_string(&messages[1].content);
+    assert!(earlier.contains("overlap dedup: 2"), "{earlier}");
+    assert!(earlier.contains("1\tone"), "{earlier}");
+    assert!(!earlier.contains("2\ttwo"), "{earlier}");
+    assert_eq!(
+        value_to_string(&messages[3].content),
+        "     2\ttwo\n     3\tthree\n     4\tfour"
+    );
+}
+
+#[test]
+fn retains_overlap_when_the_file_changed_between_reads() {
+    let mut messages = vec![
+        assistant_call_args("older", "read_file", r#"{"file_path":"/a.rs"}"#),
+        tool_result("older", "     1\tone\n     2\tbefore"),
+        assistant_call_args("later", "read_file", r#"{"file_path":"/a.rs"}"#),
+        tool_result("later", "     2\tafter\n     3\tthree"),
+    ];
+    let signatures = rustc_hash::FxHashMap::from_iter([
+        (
+            "older".to_string(),
+            (
+                "read_file".to_string(),
+                r#"{"file_path":"/a.rs"}"#.to_string(),
+            ),
+        ),
+        (
+            "later".to_string(),
+            (
+                "read_file".to_string(),
+                r#"{"file_path":"/a.rs"}"#.to_string(),
+            ),
+        ),
+    ]);
+
+    dedup_overlapping_read_file_results(&mut messages, &signatures, &FxHashSet::default());
+
+    assert_eq!(
+        value_to_string(&messages[1].content),
+        "     1\tone\n     2\tbefore"
+    );
 }
