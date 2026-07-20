@@ -67,8 +67,9 @@ pub(crate) fn validate_search_root(root: &Path, cwd: &Path) -> Result<(), String
 // 共享内容搜索引擎
 //
 // `run_content_search` 是 code_search.text_search operation 调用的内容搜索核心：
-// BFS 递归收集文件 → 逐行正则匹配 → 相关性重排 → 按文件聚合（每文件
-// top-N snippet + context + `>` 标记匹配行）。
+// BFS 递归收集文件 → 逐行匹配 → 相关性重排 → 按文件聚合（每文件 top-N
+// snippet + context + `>` 标记匹配行）。普通大小写敏感字面查询直接走
+// `str::find`，仅正则和大小写不敏感查询构造 Regex。
 //
 // 设计要点：
 // - 文件收集走 BFS（保留 `*.rs` 递归语义；`terminalw::glob_paths` 非递归，
@@ -117,8 +118,37 @@ struct FileHits {
     /// 注意 `scored` 仅保留 top-N snippet，但落到 context 窗口内的
     /// 其余命中行也应以 `>` 标注，否则会被误显示为普通 context 行。
     all_match_indices: Vec<usize>,
-    /// 文件全部行内容（渲染 context 用）。
-    lines: Vec<String>,
+    /// 原始文件内容。只为有命中的文件保留，渲染 context 时按行起点借用切片，
+    /// 避免为扫描过的每一行单独分配 String。
+    content: String,
+    /// 与 `str::lines()` 语义一致的行起始字节偏移。
+    line_starts: Vec<usize>,
+}
+
+enum SearchMatcher {
+    /// 默认路径：大小写敏感的字面子串搜索，不构造也不执行正则。
+    Literal,
+    /// 正则查询以及大小写不敏感的字面查询仍由 regex crate 处理，以保持语义。
+    Regex(Regex),
+}
+
+impl SearchMatcher {
+    fn new(options: &ContentSearchOptions<'_>) -> Result<Self, String> {
+        if !options.is_regex && options.case_sensitive {
+            Ok(Self::Literal)
+        } else {
+            build_regex(options.query, options.is_regex, options.case_sensitive).map(Self::Regex)
+        }
+    }
+
+    fn find(&self, line: &str, query: &str) -> Option<(usize, usize)> {
+        match self {
+            Self::Literal => line.find(query).map(|start| (start, start + query.len())),
+            Self::Regex(regex) => regex
+                .find(line)
+                .map(|matched| (matched.start(), matched.end())),
+        }
+    }
 }
 
 /// 运行共享内容搜索，返回已格式化好的结果字符串（含 truncate）。
@@ -131,7 +161,7 @@ pub(crate) fn run_content_search(
         return Err("pattern must not be empty".to_string());
     }
 
-    let regex = build_regex(options.query, options.is_regex, options.case_sensitive)?;
+    let matcher = SearchMatcher::new(options)?;
     let glob_matcher = options.file_pattern.map(build_glob_matcher);
     let files = collect_content_files(root, glob_matcher.as_ref(), options.extensions)?;
 
@@ -156,19 +186,18 @@ pub(crate) fn run_content_search(
             Err(_) => continue,
         };
 
-        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
         let display_path = display_path_for(file_path, options.display_root);
         let name_path_bonus = path_match_bonus(&display_path, options);
 
         let mut scored: Vec<ScoredLine> = Vec::new();
-        for (idx, line) in lines.iter().enumerate() {
+        for (idx, line) in content.lines().enumerate() {
             if total_matches >= options.max_results {
                 break;
             }
-            if !regex.is_match(line) {
+            let Some((match_start, match_end)) = matcher.find(line, options.query) else {
                 continue;
-            }
-            let score = score_line(line, options, &regex) + name_path_bonus;
+            };
+            let score = score_line(line, options, match_start, match_end) + name_path_bonus;
             scored.push(ScoredLine {
                 line_index: idx,
                 score,
@@ -198,7 +227,8 @@ pub(crate) fn run_content_search(
             file_score,
             scored,
             all_match_indices,
-            lines,
+            line_starts: collect_line_starts(&content),
+            content,
         });
     }
 
@@ -270,18 +300,19 @@ fn path_match_bonus(display_path: &str, options: &ContentSearchOptions<'_>) -> i
 
 /// 对单个匹配行打分：whole-word 命中 +4；字面大小写完全一致 +2；
 /// 匹配越靠近行首越优先（最多 +2）。
-fn score_line(line: &str, options: &ContentSearchOptions<'_>, regex: &Regex) -> i64 {
+fn score_line(
+    line: &str,
+    options: &ContentSearchOptions<'_>,
+    match_start: usize,
+    match_end: usize,
+) -> i64 {
     let mut score = 1; // 基础命中分
-    let Some(m) = regex.find(line) else {
-        return score;
-    };
-
-    let matched = &line[m.start()..m.end()];
+    let matched = &line[match_start..match_end];
 
     // 全词命中加权。
     let left_ok =
-        m.start() == 0 || !is_identifier_byte(line.as_bytes()[m.start().saturating_sub(1)]);
-    let right_ok = m.end() >= line.len() || !is_identifier_byte(line.as_bytes()[m.end()]);
+        match_start == 0 || !is_identifier_byte(line.as_bytes()[match_start.saturating_sub(1)]);
+    let right_ok = match_end >= line.len() || !is_identifier_byte(line.as_bytes()[match_end]);
     if left_ok && right_ok {
         score += 4;
     }
@@ -292,7 +323,7 @@ fn score_line(line: &str, options: &ContentSearchOptions<'_>, regex: &Regex) -> 
     }
 
     // 就近：匹配越靠前越好。
-    let lead = line[..m.start()]
+    let lead = line[..match_start]
         .chars()
         .filter(|c| !c.is_whitespace())
         .count();
@@ -307,6 +338,36 @@ fn score_line(line: &str, options: &ContentSearchOptions<'_>, regex: &Regex) -> 
 
 fn is_identifier_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// 收集与 `str::lines()` 一致的行起点。尾部换行不会产生额外空行。
+fn collect_line_starts(content: &str) -> Vec<usize> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+
+    let mut starts = Vec::new();
+    starts.push(0);
+    for (index, _) in content.match_indices('\n') {
+        let next = index + 1;
+        if next < content.len() {
+            starts.push(next);
+        }
+    }
+    starts
+}
+
+/// 根据行起点返回不含换行符的行切片，并与 `str::lines()` 一样去掉 CRLF 中的 CR。
+fn line_at<'a>(content: &'a str, starts: &[usize], index: usize) -> Option<&'a str> {
+    let start = *starts.get(index)?;
+    let mut end = starts
+        .get(index + 1)
+        .map_or(content.len(), |next| next.saturating_sub(1));
+    if index + 1 == starts.len() && content.as_bytes().last() == Some(&b'\n') {
+        end = end.saturating_sub(1);
+    }
+    let line = content.get(start..end)?;
+    Some(line.strip_suffix('\r').unwrap_or(line))
 }
 
 fn format_content_results(
@@ -336,7 +397,7 @@ fn format_content_results(
         let mut match_indices: Vec<usize> = hit.scored.iter().map(|s| s.line_index).collect();
         match_indices.sort_unstable();
 
-        let ranges = merge_context_ranges(&match_indices, context_lines, hit.lines.len());
+        let ranges = merge_context_ranges(&match_indices, context_lines, hit.line_starts.len());
         for range in &ranges {
             if range.start > 0 {
                 out.push_str("...\n");
@@ -347,8 +408,7 @@ fn format_content_results(
                 // 被误显示为普通 context 行。
                 let is_match = hit.all_match_indices.binary_search(&idx).is_ok();
                 let prefix = if is_match { ">" } else { " " };
-                let empty = String::new();
-                let line_content = hit.lines.get(idx).unwrap_or(&empty);
+                let line_content = line_at(&hit.content, &hit.line_starts, idx).unwrap_or("");
                 out.push_str(&format!("{}{:>5}| {}\n", prefix, line_num, line_content));
             }
         }
@@ -686,6 +746,33 @@ mod tests {
     }
 
     #[test]
+    fn test_text_grep_literal_metacharacters_are_not_regex() {
+        let dir = make_temp_dir("literal_metacharacters");
+        fs::write(
+            dir.join("literal.txt"),
+            "not a regex: a+b[0]\nregex-like alternative: aaab0\n",
+        )
+        .unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "a+b[0]",
+            "path": dir.to_string_lossy().to_string()
+        });
+        let output = execute_text_grep(&args).unwrap();
+        assert!(output.contains("not a regex: a+b[0]"), "{}", output);
+        assert!(output.contains("1 match(es)"), "{}", output);
+        assert!(
+            !output
+                .lines()
+                .any(|line| line.starts_with('>') && line.contains("regex-like alternative")),
+            "{}",
+            output
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_text_grep_regex_match() {
         let dir = make_temp_dir("regex");
         fs::write(
@@ -955,6 +1042,18 @@ mod tests {
         let out = truncate_output(&content, 32_000);
         assert_eq!(out, content, "should not truncate under char budget");
         assert!(!out.contains("output truncated"), "{}", out);
+    }
+
+    #[test]
+    fn test_line_offsets_match_str_lines_semantics() {
+        for content in ["", "one", "one\n", "one\n\n", "one\r\ntwo\r\n"] {
+            let starts = collect_line_starts(content);
+            let actual: Vec<&str> = (0..starts.len())
+                .map(|index| line_at(content, &starts, index).unwrap())
+                .collect();
+            let expected: Vec<&str> = content.lines().collect();
+            assert_eq!(actual, expected, "content={content:?}");
+        }
     }
 
     #[cfg(unix)]

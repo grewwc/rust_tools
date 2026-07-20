@@ -339,7 +339,7 @@ pub(super) async fn finalize_turn(
             should_generate_session_title_in_background(one_shot_mode, should_quit),
         )
         .await;
-        println!();
+        // println!();
         maybe_spawn_critic_revise_background(app, question, final_assistant_text);
 
         let mut first_observer_emitted = false;
