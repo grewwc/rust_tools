@@ -285,7 +285,7 @@ Tools remain available, but do not call '{tool_name}' again with the same argume
         ),
         ToolCallRejectionReason::PatchRetryNeedsFreshRead => format!(
             "Error: apply_patch retry blocked. The previous patch for this file failed with `context mismatch` or `ambiguous patch`, which means the file content you are working from is stale or the context is not unique. \
-Do NOT retry patches in this batch — doing so will only fail again. Required recovery steps: (1) call `read_file` (or `read_file_lines`) on the SAME target path to get the current truth state; (2) copy context lines DIRECTLY from that fresh output, including function names or distinctive surrounding lines to ensure each hunk matches exactly ONE location; (3) do NOT copy line-number prefixes (like `  42| `) into the patch; (4) call `apply_patch` only in a LATER tool round after you have successfully read the file."
+Do NOT retry patches in this batch — doing so will only fail again. Required recovery steps: (1) call `read_file` (or `read_file_lines`) on the SAME target path to get the current truth state; (2) copy context lines DIRECTLY from that fresh output, including function names or distinctive surrounding lines to ensure each hunk matches exactly ONE location; (3) do NOT copy the leading line-number + tab prefix that read_file prints (each line is rendered as a right-aligned line number followed by a TAB, e.g. `    42\\t<code>`) — copy only the code after the tab; (4) call `apply_patch` only in a LATER tool round after you have successfully read the file."
         ),
     }
 }

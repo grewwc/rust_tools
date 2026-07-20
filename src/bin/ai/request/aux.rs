@@ -200,6 +200,14 @@ fn session_title_text_content(content: &Value) -> String {
     }
 }
 
+/// 归档提示仅用于上下文恢复，不能成为会话标题的素材。
+fn is_preserved_content_message(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("[[PRESERVED_CONTENT_STUB_V1]]")
+        || text.starts_with("较早的用户图片内容已归档")
+        || text.starts_with("较早的用户文本内容已归档")
+}
+
 fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<String> {
     messages
         .iter()
@@ -207,6 +215,9 @@ fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<S
         .filter_map(|message| {
             let content = session_title_text_content(&message.content);
             if content.is_empty() {
+                return None;
+            }
+            if is_preserved_content_message(&content) {
                 return None;
             }
 
@@ -257,6 +268,22 @@ mod session_title_tests {
             "type": "image_url",
             "image_url": { "url": "data:image/png;base64,abc" }
         }]),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        assert!(session_title_dialog_lines(&messages).is_empty());
+    }
+
+    #[test]
+    fn title_transcript_skips_preserved_content_stubs() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String(
+                r#"[[PRESERVED_CONTENT_STUB_V1]]{"kind":"image","file_path":"/tmp/x"}"#
+                    .to_string(),
+            ),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,

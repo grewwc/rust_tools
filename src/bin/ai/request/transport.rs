@@ -453,12 +453,16 @@ pub(crate) fn print_info(app: &App, model: &str) {
         .read_session_title(&app.session_id)
         .ok()
         .flatten()
+        .map(|title| crate::ai::history::normalize_generated_session_title(&title))
+        .filter(|title| !title.is_empty())
         .or_else(|| {
             store
                 .first_user_prompt(&app.session_id)
                 .ok()
                 .flatten()
                 .map(|p| generate_session_summary(&p))
+                .map(|summary| crate::ai::history::normalize_generated_session_title(&summary))
+                .filter(|summary| !summary.is_empty())
         });
     let session_part = summary
         .filter(|s| !s.is_empty())

@@ -586,19 +586,30 @@ enum ContextPolicy {
     Fuzz,
 }
 
-/// 剥离 read_file/read_file_lines 输出的行号前缀（如 `   42| ` 或 `42: `）。
+/// 剥离 read_file / grep 等工具输出的行号前缀。
 /// 模型有时会不小心把行号前缀复制进 patch 的 context/remove 行中。
 /// 仅匹配 `digits + 分隔符` 模式，避免误剥真正的代码行。
+///
+/// 覆盖三种真实来源格式（务必与实际渲染器保持一致）：
+/// - `read_file`：`{:>6}\t{}`，即右对齐行号 + 一个 TAB（最常见，此前遗漏，
+///   是 patch context 反复 mismatch 的根因）。
+/// - grep/文本搜索：`   42| `，行号 + `| `。
+/// - 其它冒号变体：`42: `，行号 + `: `。
 fn strip_line_number_prefix(s: &str) -> &str {
     let trimmed = s.trim_start();
     let digits_end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
     if digits_end == 0 {
         return s;
     }
-    // read_file_lines 输出的行号格式为 `digits| ` 或 `digits: `。
-    // 分隔符后一定有空格，所以 `80:80`（`80` + `:` + `80`）不会被误匹配。
-    // 不匹配的无空格分隔符（如 `80:80` 中的 `:`）不是有效行号前缀。
+    // 分隔符必须紧跟在行号数字之后：
+    // - `\t`：read_file 的真实格式（`{:>6}\t{}`）。TAB 后直接是行内容（含其自身
+    //   缩进），只剥离这一个 TAB 即可完整保留代码原有缩进。
+    // - `| ` / `: `：grep 等工具格式；分隔符后带空格，所以 `80:80`（无空格）不会
+    //   被误剥，`80:80` 中的 `:` 不是有效行号分隔符。
     let after_digits = &trimmed[digits_end..];
+    if let Some(rest) = after_digits.strip_prefix('\t') {
+        return rest;
+    }
     if let Some(rest) = after_digits.strip_prefix("| ") {
         return rest;
     }
@@ -638,8 +649,9 @@ fn lines_match_exact(actual: &str, expected: &str, mode: MatchMode) -> bool {
     }
     match mode {
         MatchMode::Strict => {
-            // 模型经常从 read_file 输出中复制 `   42| ` 格式的行号前缀，
-            // 在严格匹配前先剥离行号前缀再比较，避免无谓的 Strict→IgnoreIndent 降级。
+            // 模型经常从 read_file 输出中复制行号前缀（真实格式为 `    42\t`，
+            // 即行号 + TAB），在严格匹配前先剥离行号前缀再比较，避免无谓的
+            // Strict→IgnoreIndent 降级。
             let expected_stripped = strip_line_number_prefix(expected);
             let actual_stripped = strip_line_number_prefix(actual);
             if actual_stripped == expected_stripped
@@ -1151,7 +1163,7 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
     }
 
     msg.push_str(
-        "Hint: re-read the file with read_file/read_file_lines to get exact current content, then rebuild the patch from the raw file text only. Do not copy the leading line numbers, any truncation notice, or the Symbol outline block into the patch.",
+        "Hint: re-read the file with read_file/read_file_lines to get exact current content, then rebuild the patch from the raw file text only. read_file prints each line as a right-aligned line number followed by a TAB (e.g. `    42\\t<code>`); copy only the code after the TAB. Do not copy the leading line number + tab, any truncation notice, or the Symbol outline block into the patch.",
     );
     msg
 }
@@ -2456,8 +2468,9 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_tolerates_line_number_prefix_in_context() {
-        // 模型从 read_file_lines 输出复制了带行号前缀的 context 行（如 `   42| `），
+        // 模型从 grep 类输出复制了带行号前缀的 context 行（如 `   42| `），
         // IgnoreIndent 兜底模式应剥离行号前缀后匹配成功。
+        // read_file 的真实 TAB 格式另有 apply_unified_patch_tolerates_read_file_tab_prefix 覆盖。
         let original = "line1\nline2\nline3\n";
         // context 行 " line1" 被模型误写为带行号前缀的 " 1| line1"
         let patch = "@@ -1,3 +1,3 @@\n 1| line1\n-line2\n+changed\n line3\n";
@@ -2478,6 +2491,27 @@ mod tests {
     }
 
     #[test]
+    fn apply_unified_patch_tolerates_read_file_tab_prefix() {
+        // 复现 history 中的真实失败场景：模型把 read_file 的输出逐行照抄进 patch 的
+        // context / remove 行。read_file 真实渲染格式是 `{:>6}\t{}`（右对齐行号 + TAB），
+        // 修复前 strip_line_number_prefix 不认 TAB，导致 context mismatch 反复失败。
+        let original = "fn foo() {\n    let x = 1;\n    x\n}\n";
+        // 用与 read_file 完全相同的渲染方式构造模型看到的行，避免手数空格出错。
+        let rf = |n: usize, s: &str| format!("{:>6}\t{}", n, s);
+        let patch = format!(
+            "@@ -1,4 +1,4 @@\n {}\n-{}\n+    let x = 2;\n {}\n {}\n",
+            rf(1, "fn foo() {"),
+            rf(2, "    let x = 1;"),
+            rf(3, "    x"),
+            rf(4, "}"),
+        );
+        let result = apply_unified_patch(original, &patch)
+            .expect("read_file TAB line-number prefix must be tolerated in context/remove lines");
+        // context 行保留原文件内容（含缩进），仅目标行被替换。
+        assert_eq!(result, "fn foo() {\n    let x = 2;\n    x\n}\n");
+    }
+
+    #[test]
     fn apply_unified_patch_line_number_prefix_still_detects_ambiguity() {
         // 行号前缀容忍不应牺牲安全性：忽略行号后若仍有多处匹配，应报歧义。
         let original = "dup\ndup\ndup\n";
@@ -2490,15 +2524,24 @@ mod tests {
     #[test]
     fn strip_line_number_prefix_does_not_strip_code_lines() {
         // 以数字开头的代码行不应被误剥（如 `80:80` 是配置值），
-        // 但 ` 42| foo` 或 `42: foo` 格式的行号前缀应被剥离。
+        // 但 read_file 的 `    42\t` 格式、grep 的 ` 42| `/`42: ` 格式应被剥离。
         use super::strip_line_number_prefix;
-        // 标准行号格式应被剥离
+        // read_file 真实格式：右对齐行号 + TAB（此前遗漏的根因场景）
+        assert_eq!(strip_line_number_prefix("     3\tuse std::fs;"), "use std::fs;");
+        // TAB 后保留代码原有缩进（只剥离一个 TAB，不动内容缩进）
+        assert_eq!(
+            strip_line_number_prefix("    42\t    let x = 1;"),
+            "    let x = 1;"
+        );
+        // grep 类格式应被剥离
         assert_eq!(strip_line_number_prefix("   42| hello"), "hello");
         assert_eq!(strip_line_number_prefix("42: hello"), "hello");
         // `80:80`（冒号后无空格）不是行号前缀，不应被剥离
         assert_eq!(strip_line_number_prefix("80:80"), "80:80");
         // 纯数字行不应被剥离（没有分隔符）
         assert_eq!(strip_line_number_prefix("42"), "42");
+        // 数字紧跟非分隔符（无 TAB / `| ` / `: `）不应被剥离
+        assert_eq!(strip_line_number_prefix("42px"), "42px");
         // 不以数字开头的行不应被剥离
         assert_eq!(strip_line_number_prefix("hello"), "hello");
     }

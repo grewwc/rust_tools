@@ -119,7 +119,13 @@ impl SessionStore {
                 .as_deref()
                 .map(normalize_generated_session_title)
                 .filter(|title| !title.is_empty())
-                .or_else(|| first_user_prompt.as_deref().map(generate_session_summary));
+                .or_else(|| {
+                    first_user_prompt
+                        .as_deref()
+                        .map(generate_session_summary)
+                        .map(|summary| normalize_generated_session_title(&summary))
+                        .filter(|summary| !summary.is_empty())
+                });
             let timestamp = modified_local
                 .map(|dt| dt.timestamp_millis() as u64)
                 .unwrap_or(0);
@@ -689,6 +695,9 @@ fn truncate_summary(s: &str, max_len: usize) -> String {
 /// 清洗模型生成的 session 标题，避免把“帮我/请问”等请求壳写进标题。
 pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
     let first_line = title.lines().next().unwrap_or("").trim();
+    if is_preserved_content_title(first_line) {
+        return String::new();
+    }
     let without_agent = strip_agent_prefix(first_line);
     let without_request = strip_request_filler_prefixes(without_agent).0;
     truncate_summary(without_request.trim(), 30)
@@ -697,12 +706,24 @@ pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
 /// 判断已有标题是否像原始用户请求片段；这类旧标题允许后续 turn 重新生成覆盖。
 pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
     let trimmed = title.trim();
-    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
+    if trimmed.is_empty()
+        || trimmed.contains('\n')
+        || trimmed.contains('\r')
+        || is_preserved_content_title(trimmed)
+    {
         return true;
     }
     let without_agent = strip_agent_prefix(trimmed);
     let (_, stripped_request_prefix) = strip_request_filler_prefixes(without_agent);
     stripped_request_prefix || trimmed.chars().count() > 40
+}
+
+/// 归档协议是内部上下文，不应作为会话标题展示或被视为有效标题。
+fn is_preserved_content_title(title: &str) -> bool {
+    let title = title.trim_start();
+    title.starts_with("[[PRESERVED_CONTENT_STUB_V1]]")
+        || title.starts_with("较早的用户图片内容已归档")
+        || title.starts_with("较早的用户文本内容已归档")
 }
 
 fn strip_request_filler_prefixes(mut text: &str) -> (&str, bool) {
@@ -922,6 +943,22 @@ mod tests {
         );
 
         assert!(!is_low_quality_session_title("session title 问题排查"));
+    }
+
+    #[test]
+    fn preserved_content_stub_is_not_a_session_title() {
+        let stub = r#"[[PRESERVED_CONTENT_STUB_V1]]{"kind":"image","file_path":"/tmp/x"}"#;
+
+        assert!(is_low_quality_session_title(stub));
+        assert!(normalize_generated_session_title(stub).is_empty());
+    }
+
+    #[test]
+    fn preserved_content_notice_is_not_a_fallback_session_title() {
+        let notice = "较早的用户图片内容已归档，原文未丢失。\n归档文件: /tmp/image.json";
+        let fallback = normalize_generated_session_title(&generate_session_summary(notice));
+
+        assert!(fallback.is_empty());
     }
 
     #[test]

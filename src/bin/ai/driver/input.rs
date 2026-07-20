@@ -1880,18 +1880,22 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
         // session 文件的父目录会生成嵌套路径，导致读不到已生成的标题。
         let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
         // 优先使用 LLM 生成的标题，fallback 到首条消息摘要
-        let topic = match store.read_session_title(&app.session_id).ok().flatten() {
-            Some(t) => {
-                let t = crate::ai::history::normalize_generated_session_title(&t);
-                (!t.is_empty()).then_some(t)
-            }
-            None => store
+        let topic = store
+            .read_session_title(&app.session_id)
+            .ok()
+            .flatten()
+            .map(|title| crate::ai::history::normalize_generated_session_title(&title))
+            .filter(|title| !title.is_empty())
+            .or_else(|| {
+                store
                 .first_user_prompt(&app.session_id)
                 .ok()
                 .flatten()
                 .as_deref()
-                .map(crate::ai::history::generate_session_summary),
-        };
+                .map(crate::ai::history::generate_session_summary)
+                .map(|summary| crate::ai::history::normalize_generated_session_title(&summary))
+                .filter(|summary| !summary.is_empty())
+            });
         editor.set_session_topic(topic);
         return editor.read_multi_line();
     }
