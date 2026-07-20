@@ -12,7 +12,10 @@ use crate::ai::{
         recall_rank, render_record,
     },
     driver::{print::print_ocr_summary, reflection, skill_runtime},
-    history::{Message, ROLE_INTERNAL_NOTE, build_context_history, compress::llm_prune},
+    history::{
+        Message, ROLE_INTERNAL_NOTE, build_context_history, compact_session_history_with_app,
+        compress::llm_prune,
+    },
     request,
     tools::storage::memory_store::{AgentMemoryEntry, MemoryStore},
     types::App,
@@ -292,6 +295,11 @@ pub(super) async fn prepare_turn(
         Some(store.session_assets_dir(&app.session_id))
     };
     crate::ai::driver::runtime_ctx::publish_subagent_phase("preparing context");
+    // 收尾阶段可能因中断、请求错误或旧版本进程而未执行。开始下一轮前再做一次
+    // 轻量检查，确保超出上下文预算的历史先被落盘压缩，避免每轮重复请求期摘要。
+    if let Err(err) = compact_session_history_with_app(app).await {
+        eprintln!("[Warning] Failed to compact persisted history before preparing context: {err}");
+    }
     let mut history = build_context_history(
         history_count,
         &app.session_history_file,

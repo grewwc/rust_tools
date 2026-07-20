@@ -187,6 +187,36 @@ pub(in crate::ai) fn count_user_turns_sqlite(path: &Path) -> io::Result<usize> {
     Ok(count.max(0) as usize)
 }
 
+/// 廉价统计持久化消息的有效载荷大小，用于在 user turn 数尚少、但工具输出已经
+/// 很大时仍能触发历史落盘压缩。不能以 sqlite 文件大小判断：WAL/空闲页不会在
+/// 替换消息后立刻回收，会导致每轮都误判为超限。
+pub(in crate::ai) fn total_message_chars_sqlite(path: &Path) -> io::Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let conn = open_history_db(path)?;
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(0);
+    }
+    let total: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(length(content) + COALESCE(length(tool_calls), 0) + COALESCE(length(reasoning_content), 0)), 0) FROM messages",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(total.max(0) as usize)
+}
+
 pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -> io::Result<()> {
     let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;

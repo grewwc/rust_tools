@@ -862,6 +862,23 @@ struct SymbolHit {
     name: String,
 }
 
+/// 读取并解析单个文件的符号表；跳过过大或不可解析的文件。
+/// `collect_workspace_symbols` 与 `scan_workspace_symbols` 共用此函数，避免重复 I/O 与 AST 解析。
+fn parse_file_symbols(file: &Path) -> Option<Vec<SymbolEntry>> {
+    let language = ast_symbols::language_for_path(&file.to_string_lossy())?;
+    let Ok(metadata) = fs::metadata(file) else {
+        return None;
+    };
+    if metadata.len() > MAX_LSP_FILE_SIZE {
+        return None;
+    }
+    let Ok(content) = fs::read_to_string(file) else {
+        return None;
+    };
+    ast_symbols::extract_document_symbols(language, &file.to_string_lossy(), &content)
+        .and_then(|r| r.ok())
+}
+
 /// 扫描项目内所有 AST 可解析的源文件，收集符号名与 `query` 匹配的定义。
 /// `exact` 为 true 时要求符号名完全相等，否则按子串匹配（大小写不敏感）。
 fn collect_workspace_symbols(root: &Path, query: &str, exact: bool) -> Vec<SymbolHit> {
@@ -873,21 +890,7 @@ fn collect_workspace_symbols(root: &Path, query: &str, exact: bool) -> Vec<Symbo
         if hits.len() >= MAX_SYMBOL_HITS {
             break;
         }
-        let Some(language) = ast_symbols::language_for_path(&file.to_string_lossy()) else {
-            continue;
-        };
-        let Ok(metadata) = fs::metadata(&file) else {
-            continue;
-        };
-        if metadata.len() > MAX_LSP_FILE_SIZE {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(&file) else {
-            continue;
-        };
-        let Some(Ok(symbols)) =
-            ast_symbols::extract_document_symbols(language, &file.to_string_lossy(), &content)
-        else {
+        let Some(symbols) = parse_file_symbols(&file) else {
             continue;
         };
         for symbol in symbols {
@@ -907,6 +910,55 @@ fn collect_workspace_symbols(root: &Path, query: &str, exact: bool) -> Vec<Symbo
 
     hits.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
     hits
+}
+
+/// 一次 AST 扫描同时收集精确与子串（非精确）匹配，各自独立计数上限。
+/// 精确命中达到上限即提前结束整个扫描——`go_to_definition` 优先用精确命中，
+/// 这样在精确命中充足时不必扫描全部文件，也不必为子串命中浪费 AST 解析；
+/// 而在无精确命中时一次扫描即可拿到子串结果，避免旧实现再走一遍全量解析。
+struct WorkspaceSymbolScan {
+    exact: Vec<SymbolHit>,
+    substring: Vec<SymbolHit>,
+}
+
+fn scan_workspace_symbols(files: &[PathBuf], query: &str) -> WorkspaceSymbolScan {
+    let needle = query.to_lowercase();
+    let mut exact = Vec::new();
+    let mut substring = Vec::new();
+
+    for file in files {
+        if exact.len() >= MAX_SYMBOL_HITS {
+            break;
+        }
+        let Some(symbols) = parse_file_symbols(file) else {
+            continue;
+        };
+        for symbol in symbols {
+            let name_lower = symbol.name.to_lowercase();
+            if name_lower == needle {
+                exact.push(SymbolHit {
+                    file: file.clone(),
+                    line: symbol.line,
+                    kind: symbol.kind,
+                    name: symbol.name.clone(),
+                });
+                if exact.len() >= MAX_SYMBOL_HITS {
+                    break;
+                }
+            } else if name_lower.contains(&needle) && substring.len() < MAX_SYMBOL_HITS {
+                substring.push(SymbolHit {
+                    file: file.clone(),
+                    line: symbol.line,
+                    kind: symbol.kind,
+                    name: symbol.name.clone(),
+                });
+            }
+        }
+    }
+
+    exact.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+    substring.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+    WorkspaceSymbolScan { exact, substring }
 }
 
 fn symbol_matches(symbol: &SymbolEntry, needle_lower: &str, exact: bool) -> bool {
@@ -943,12 +995,14 @@ fn lsp_workspace_symbol(file_path: &str, query: &str) -> Result<String, String> 
 
 fn lsp_go_to_definition(file_path: &str, symbol: &str) -> Result<String, String> {
     let root = find_project_root(file_path);
-    // 先精确匹配定义；没有再退回子串匹配，避免完全无结果。
-    let mut hits = collect_workspace_symbols(&root, symbol, true);
-    let exact = !hits.is_empty();
-    if hits.is_empty() {
-        hits = collect_workspace_symbols(&root, symbol, false);
-    }
+    let files = collect_source_files(&root);
+    // 一次扫描同时覆盖精确与子串语义，避免旧实现无精确命中时再走一遍全量 AST 解析。
+    let scan = scan_workspace_symbols(&files, symbol);
+    let (hits, exact) = if !scan.exact.is_empty() {
+        (scan.exact, true)
+    } else {
+        (scan.substring, false)
+    };
 
     if hits.is_empty() {
         return Ok(format!("Definition for '{}' not found in project.", symbol));
@@ -968,11 +1022,11 @@ fn lsp_go_to_definition(file_path: &str, symbol: &str) -> Result<String, String>
 fn lsp_find_references(file_path: &str, symbol: &str) -> Result<String, String> {
     let root = find_project_root(file_path);
 
-    // 定义位置（若能用 AST 定位）。
-    let definitions = collect_workspace_symbols(&root, symbol, true);
-
-    // 引用：跨项目按全词标识符扫描。
-    let references = scan_identifier_references(&root, symbol);
+    // 只遍历一次目录：定义（AST 精确匹配）与引用（全词扫描）共享同一份文件列表，
+    // 避免旧实现里 collect_workspace_symbols 与 scan_identifier_references 各走一遍 collect_source_files。
+    let files = collect_source_files(&root);
+    let definitions = scan_workspace_symbols(&files, symbol).exact;
+    let references = scan_identifier_references_from_files(&files, &root, symbol);
 
     if references.is_empty() && definitions.is_empty() {
         return Ok(format!("No references found for '{}'", symbol));
@@ -994,24 +1048,28 @@ fn lsp_find_references(file_path: &str, symbol: &str) -> Result<String, String> 
 }
 
 /// 跨项目对一个标识符做全词扫描，返回 `relpath:line: trimmed-content` 列表。
-fn scan_identifier_references(root: &Path, symbol: &str) -> Vec<String> {
-    let files = collect_source_files(root);
+/// 接受预收集的文件列表，以便与 `scan_workspace_symbols` 共享一次目录遍历。
+fn scan_identifier_references_from_files(
+    files: &[PathBuf],
+    root: &Path,
+    symbol: &str,
+) -> Vec<String> {
     let mut out = Vec::new();
 
     for file in files {
         if out.len() >= MAX_REFERENCE_HITS {
             break;
         }
-        let Ok(metadata) = fs::metadata(&file) else {
+        let Ok(metadata) = fs::metadata(file) else {
             continue;
         };
         if metadata.len() > MAX_LSP_FILE_SIZE {
             continue;
         }
-        let Ok(content) = fs::read_to_string(&file) else {
+        let Ok(content) = fs::read_to_string(file) else {
             continue;
         };
-        let rel = file.strip_prefix(root).unwrap_or(&file);
+        let rel = file.strip_prefix(root).unwrap_or(file);
         for (idx, line) in content.lines().enumerate() {
             if !line_contains_whole_word(line, symbol) {
                 continue;
@@ -1230,6 +1288,7 @@ fn is_identifier_char(b: u8) -> bool {
 }
 
 /// 判断一行里是否以"全词"形式出现 `word`（前后不是标识符字符）。
+/// 用 `str::find`（memchr/SIMD 加速）定位子串，替代旧的 `windows().position()` O(n*m) 扫描。
 fn line_contains_whole_word(line: &str, word: &str) -> bool {
     if word.is_empty() {
         return false;
@@ -1237,8 +1296,8 @@ fn line_contains_whole_word(line: &str, word: &str) -> bool {
     let bytes = line.as_bytes();
     let wb = word.as_bytes();
     let mut from = 0;
-    while let Some(pos) = find_subslice(&bytes[from..], wb) {
-        let start = from + pos;
+    while let Some(rel) = line[from..].find(word) {
+        let start = from + rel;
         let end = start + wb.len();
         let left_ok = start == 0 || !is_identifier_char(bytes[start - 1]);
         let right_ok = end >= bytes.len() || !is_identifier_char(bytes[end]);
@@ -1251,15 +1310,6 @@ fn line_contains_whole_word(line: &str, word: &str) -> bool {
         }
     }
     false
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 #[cfg(test)]

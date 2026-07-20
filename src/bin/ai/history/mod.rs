@@ -303,16 +303,20 @@ async fn compact_session_history_with_app_inner(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let history_file = &app.session_history_file;
     // === 增量游标式快路径 ===
-    // 99% 的 turn 收尾时，user_turns 远低于压缩阈值，根本不需要全量读。
-    // 这里先做廉价的 COUNT，未达阈值直接返回，避免反序列化几十 MB 的 tool 输出。
+    // 常规情况下 user_turns 远低于压缩阈值，根本不需要全量读。但不能只看
+    // turn 数：单个 read_file/命令输出就可能把短会话撑到数 MB，若不在这里落盘
+    // 压缩，下轮又会从原始历史重新做一次昂贵的请求期压缩。
     if blob::is_sqlite_path(history_file) {
         let user_turns = sqlite::count_user_turns_sqlite(history_file.as_path())?;
+        let exceeds_context_budget = app.config.history_max_chars > 0
+            && sqlite::total_message_chars_sqlite(history_file.as_path())?
+                > app.config.history_max_chars;
         let threshold = if at_boundary {
             crate::ai::history::compress::persisted_history_keep_recent_turns()
         } else {
             MAX_HISTORY_TURNS
         };
-        if user_turns <= threshold {
+        if user_turns <= threshold && !exceeds_context_budget {
             return Ok(());
         }
     }
@@ -328,7 +332,22 @@ async fn compact_session_history_with_app_inner(
         blob::parse_history_blob(&history)
     };
 
-    let compacted = if at_boundary {
+    let original_chars = messages_total_chars_pub(&messages);
+    let exceeds_context_budget =
+        app.config.history_max_chars > 0 && original_chars > app.config.history_max_chars;
+    let compacted = if exceeds_context_budget {
+        // 与下一轮 `build_context_history` 使用完全相同的压缩策略，并把结果写回
+        // history。原始的大块内容会进入 session assets，stub 保留可精确读回的
+        // 路径和预览；因此降低重复压缩成本不会损失可召回的信息。
+        let store = SessionStore::new(app.config.history_file.as_path());
+        compress::compress_messages_for_context(
+            messages.clone(),
+            app.config.history_max_chars,
+            app.config.history_keep_last,
+            app.config.history_summary_max_chars,
+            Some(store.session_assets_dir(&app.session_id)),
+        )
+    } else if at_boundary {
         compress::compact_persisted_history_at_boundary_with_app(app, messages.clone()).await
     } else {
         compress::compact_persisted_history_with_app(app, messages.clone()).await
@@ -345,5 +364,14 @@ async fn compact_session_history_with_app_inner(
             blob::serialize_history_messages_for_storage(&compacted),
         )?;
     }
+    let reason = if exceeds_context_budget {
+        "context-budget"
+    } else {
+        "turn-count"
+    };
+    eprintln!(
+        "[history] persisted {reason} compaction: {original_chars} -> {} chars",
+        messages_total_chars_pub(&compacted)
+    );
     Ok(())
 }
