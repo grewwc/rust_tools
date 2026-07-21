@@ -90,6 +90,7 @@ pub(super) fn prepare_tool_messages_structured(
     overflow_dir: Option<&Path>,
 ) {
     let id_to_tool_name = build_tool_call_name_index(messages);
+    let id_to_tool_args = build_tool_call_arguments_index(messages);
     let indices = tool_message_indices(messages);
     let protected_indices = recent_tool_group_message_indices(messages, keep_recent_groups);
     for &idx in &indices {
@@ -122,8 +123,18 @@ pub(super) fn prepare_tool_messages_structured(
                 && let Some(path) = overflow_dir
                     .and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
             {
-                message.content =
-                    Value::String(build_preserved_tool_overflow_stub(&path, name, &text));
+                let recall_lines = message
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| id_to_tool_args.get(id))
+                    .map(|args| build_tool_overflow_recall_lines(name, args))
+                    .unwrap_or_default();
+                message.content = Value::String(build_preserved_tool_overflow_stub(
+                    &path,
+                    name,
+                    &text,
+                    &recall_lines,
+                ));
             }
             continue;
         }
@@ -153,6 +164,7 @@ pub(super) fn enforce_protected_precision_group_budget(
         return;
     };
     let id_to_tool_name = build_tool_call_name_index(messages);
+    let id_to_tool_args = build_tool_call_arguments_index(messages);
 
     for group in recent_tool_result_groups(messages, keep_recent_groups) {
         let mut precision_results: Vec<(usize, String)> = group
@@ -188,8 +200,18 @@ pub(super) fn enforce_protected_precision_group_budget(
             let text_len = text.chars().count();
             if let Some(path) = write_preserved_tool_overflow_file(overflow_dir, &tool_name, &text)
             {
-                messages[idx].content =
-                    Value::String(build_preserved_tool_overflow_stub(&path, &tool_name, &text));
+                let recall_lines = messages[idx]
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| id_to_tool_args.get(id))
+                    .map(|args| build_tool_overflow_recall_lines(&tool_name, args))
+                    .unwrap_or_default();
+                messages[idx].content = Value::String(build_preserved_tool_overflow_stub(
+                    &path,
+                    &tool_name,
+                    &text,
+                    &recall_lines,
+                ));
                 total_chars = total_chars.saturating_sub(text_len);
             }
         }
@@ -209,12 +231,29 @@ pub(super) fn build_tool_call_name_index(messages: &[Message]) -> FxHashMap<Stri
     out
 }
 
+fn build_tool_call_arguments_index(messages: &[Message]) -> FxHashMap<String, String> {
+    let mut out = FxHashMap::default();
+    for message in messages {
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for tool_call in tool_calls {
+            out.insert(tool_call.id.clone(), tool_call.function.arguments.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ai::types::{FunctionCall, ToolCall};
 
     fn assistant_call(id: &str, name: &str) -> Message {
+        assistant_call_args(id, name, "{}")
+    }
+
+    fn assistant_call_args(id: &str, name: &str, arguments: &str) -> Message {
         Message {
             role: "assistant".to_string(),
             content: Value::String(String::new()),
@@ -223,7 +262,7 @@ mod tests {
                 tool_type: "function".to_string(),
                 function: FunctionCall {
                     name: name.to_string(),
-                    arguments: "{}".to_string(),
+                    arguments: arguments.to_string(),
                 },
             }]),
             tool_call_id: None,
@@ -261,6 +300,89 @@ mod tests {
         prepare_tool_messages_structured(&mut messages, 80, 1, Some(&overflow_dir));
         assert_eq!(value_to_string(&messages[1].content), first_stub);
         assert_eq!(std::fs::read_dir(&overflow_path).unwrap().count(), 1);
+
+        let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
+    fn preserved_read_file_overflow_stub_keeps_original_target_anchor() {
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-tool-overflow-read-anchor-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut messages = vec![
+            assistant_call_args(
+                "old",
+                "read_file",
+                r#"{"file_path":"src/lib.rs","offset":120,"limit":40}"#,
+            ),
+            tool_result("old", &"x".repeat(1_000)),
+            assistant_call("recent", "read_file"),
+            tool_result("recent", "recent result"),
+        ];
+
+        prepare_tool_messages_structured(&mut messages, 80, 1, Some(&overflow_dir));
+        let stub = value_to_string(&messages[1].content);
+        assert!(
+            stub.contains("- original_file_path: src/lib.rs"),
+            "stub: {stub}"
+        );
+        assert!(
+            stub.contains("- original_range: lines=120..159"),
+            "stub: {stub}"
+        );
+        assert!(
+            stub.contains("优先继续读取 `original_file_path` 指向的原始文件"),
+            "stub: {stub}"
+        );
+
+        let anchor = collapse_overflow_stub_to_anchor(&stub).expect("stub should collapse");
+        assert!(
+            anchor.contains("- original_file_path: src/lib.rs"),
+            "anchor: {anchor}"
+        );
+        assert!(
+            anchor.contains("优先读取 `original_file_path`"),
+            "anchor: {anchor}"
+        );
+
+        let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
+    fn preserved_execute_command_overflow_stub_keeps_original_command_anchor() {
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-tool-overflow-command-anchor-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut messages = vec![
+            assistant_call_args(
+                "old",
+                "execute_command",
+                r#"{"command":"git log --stat","cwd":"/repo"}"#,
+            ),
+            tool_result("old", &"x".repeat(1_000)),
+            assistant_call("recent", "read_file"),
+            tool_result("recent", "recent result"),
+        ];
+
+        prepare_tool_messages_structured(&mut messages, 80, 1, Some(&overflow_dir));
+        let stub = value_to_string(&messages[1].content);
+        assert!(
+            stub.contains("- original_command: git log --stat"),
+            "stub: {stub}"
+        );
+        assert!(stub.contains("- original_cwd: /repo"), "stub: {stub}");
+        assert!(
+            stub.contains("优先根据 `original_command` / `original_cwd` 继续判断"),
+            "stub: {stub}"
+        );
+
+        let anchor = collapse_overflow_stub_to_anchor(&stub).expect("stub should collapse");
+        assert!(
+            anchor.contains("- original_command: git log --stat"),
+            "anchor: {anchor}"
+        );
 
         let _ = std::fs::remove_dir_all(overflow_dir);
     }
@@ -320,7 +442,7 @@ mod tests {
             .map(|i| format!("line {i}: some content"))
             .collect::<Vec<_>>()
             .join("\n");
-        build_preserved_tool_overflow_stub(Path::new(file_path), tool_name, &full)
+        build_preserved_tool_overflow_stub(Path::new(file_path), tool_name, &full, &[])
     }
 
     #[test]
@@ -419,7 +541,10 @@ pub(super) fn preserve_noncompressible_tool_result_for_fold(
     let path =
         overflow_dir.and_then(|dir| write_preserved_tool_overflow_file(dir, tool_name, content))?;
     Some(build_preserved_tool_overflow_stub(
-        &path, tool_name, content,
+        &path,
+        tool_name,
+        content,
+        &[],
     ))
 }
 
@@ -451,24 +576,149 @@ fn write_preserved_tool_overflow_file(
     Some(path)
 }
 
-fn build_preserved_tool_overflow_stub(path: &Path, tool_name: &str, full_content: &str) -> String {
+fn build_preserved_tool_overflow_stub(
+    path: &Path,
+    tool_name: &str,
+    full_content: &str,
+    recall_lines: &[String],
+) -> String {
     // 仍把全文外溢到磁盘以控制上下文体积，但在 stub 内保留 head+tail 预览，
     // 让后续 turn 拥有"召回锚点"——模型据此判断是否真的需要重新 read_file，
     // 避免早期读到的代码被搬走后出现"失忆/反复重读"。
     // 提示文案保持中性：明确告知"仅在需要完整内容时才读取"，防止 LLM 看到
     // file_path 就无条件重读导致外溢→重读→再外溢的无限循环。
     let preview = build_overflow_content_preview(full_content);
-    let tool_hint = if tool_name == "read_file" || tool_name == "read_file_lines" {
-        "（这是之前读取文件的结果归档；除非你需要重新查看该文件的完整内容且预览不足，否则不要重新读取。）"
-    } else {
-        "（如需查看完整输出，可用 read_file 读取此文件；若预览已足够回答问题则忽略。）"
-    };
-    format!(
+    let tool_hint = preserved_tool_overflow_hint(tool_name, recall_lines);
+    let mut out = format!(
         "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
          Output preserved for tool `{tool_name}`. Full result saved to session asset:\n\
-         - file_path: {}\n{tool_hint}\n{preview}",
-        path.display()
-    )
+         - file_path: {}",
+        path.display(),
+    );
+    for line in recall_lines {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out.push('\n');
+    out.push_str(tool_hint);
+    out.push('\n');
+    out.push_str(&preview);
+    out
+}
+
+fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'static str {
+    let has_original_file_path = recall_lines
+        .iter()
+        .any(|line| line.starts_with("- original_file_path: "));
+    let has_original_command = recall_lines
+        .iter()
+        .any(|line| line.starts_with("- original_command: "));
+    let has_original_query = recall_lines
+        .iter()
+        .any(|line| line.starts_with("- original_query: "));
+
+    match tool_name {
+        "read_file" | "read_file_lines" if has_original_file_path => {
+            "（这是之前读取文件的结果归档；优先继续读取 `original_file_path` 指向的原始文件，而不是本归档文件。仅当你确实需要这次已外溢结果的完整原文时才读取 `file_path`。）"
+        }
+        "read_file" | "read_file_lines" => {
+            "（这是之前读取文件的结果归档；除非你需要重新查看该文件的完整内容且预览不足，否则不要重新读取。）"
+        }
+        "execute_command" if has_original_command => {
+            "（这是之前命令输出的归档；优先根据 `original_command` / `original_cwd` 继续判断，不要把 `file_path` 当作源码文件去读。仅在需要完整日志时才读取。）"
+        }
+        "code_search" if has_original_query => {
+            "（这是之前检索结果的归档；优先根据 `original_operation` / `original_query` / `original_path` 继续检索或缩小范围，而不是回读本归档文件。）"
+        }
+        _ => "（如需查看完整输出，可用 read_file 读取此文件；若预览已足够回答问题则忽略。）",
+    }
+}
+
+fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str) -> Vec<String> {
+    let Ok(args) = serde_json::from_str::<Value>(arguments) else {
+        return Vec::new();
+    };
+
+    match tool_name {
+        "read_file" | "read_file_lines" => {
+            let mut lines = Vec::with_capacity(2);
+            if let Some(path) = value_string_from_keys(&args, &["file_path", "path", "filePath"]) {
+                lines.push(format!(
+                    "- original_file_path: {}",
+                    truncate_to_chars(&normalize_whitespace(&path), 240)
+                ));
+            }
+
+            if let Some((label, range)) = read_file_range_summary(&args) {
+                lines.push(format!("- original_range: {label}={range}"));
+            }
+            lines
+        }
+        "execute_command" | "run_command" | "shell" | "bash" => {
+            let mut lines = Vec::with_capacity(2);
+            if let Some(command) = value_string_from_keys(&args, &["command"]) {
+                lines.push(format!(
+                    "- original_command: {}",
+                    truncate_to_chars(&normalize_whitespace(&command), 720)
+                ));
+            }
+            if let Some(cwd) = value_string_from_keys(&args, &["cwd"]) {
+                let cwd = normalize_whitespace(&cwd);
+                if !cwd.is_empty() {
+                    lines.push(format!("- original_cwd: {}", truncate_to_chars(&cwd, 240)));
+                }
+            }
+            lines
+        }
+        "code_search" => {
+            let mut lines = Vec::with_capacity(3);
+            if let Some(operation) = value_string_from_keys(&args, &["operation"]) {
+                lines.push(format!(
+                    "- original_operation: {}",
+                    truncate_to_chars(&normalize_whitespace(&operation), 80)
+                ));
+            }
+            if let Some(query) = value_string_from_keys(&args, &["query", "symbol", "pattern"]) {
+                lines.push(format!(
+                    "- original_query: {}",
+                    truncate_to_chars(&normalize_whitespace(&query), 240)
+                ));
+            }
+            if let Some(path) = value_string_from_keys(&args, &["path", "file_path"]) {
+                lines.push(format!(
+                    "- original_path: {}",
+                    truncate_to_chars(&normalize_whitespace(&path), 240)
+                ));
+            }
+            lines
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn value_string_from_keys(args: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_str))
+        .map(|value| value.to_string())
+}
+
+fn read_file_range_summary(args: &Value) -> Option<(&'static str, String)> {
+    let start_line = args.get("startLine").and_then(Value::as_u64);
+    let end_line = args.get("endLine").and_then(Value::as_u64);
+    if let (Some(start_line), Some(end_line)) = (start_line, end_line) {
+        return Some(("lines", format!("{start_line}..{end_line}")));
+    }
+
+    let offset = args.get("offset").and_then(Value::as_u64);
+    let limit = args.get("limit").and_then(Value::as_u64);
+    match (offset, limit) {
+        (Some(offset), Some(limit)) if limit > 0 => Some((
+            "lines",
+            format!("{offset}..{}", offset + limit.saturating_sub(1)),
+        )),
+        (Some(offset), _) => Some(("offset", offset.to_string())),
+        _ => None,
+    }
 }
 
 fn is_preserved_tool_overflow_stub(text: &str) -> bool {
@@ -522,16 +772,42 @@ fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
         .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
         .map(str::trim)
         .filter(|p| !p.is_empty())?;
+    let recall_lines = text
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("- original_"))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     let tool_hint = if tool_name == "read_file" || tool_name == "read_file_lines" {
-        "（这是之前读取文件的结果归档；通常无需重新读取。）"
+        if recall_lines
+            .iter()
+            .any(|line| line.starts_with("- original_file_path: "))
+        {
+            "（这是之前读取文件的结果归档；通常无需回读本归档。若必须追原文，优先读取 `original_file_path`。）"
+        } else {
+            "（这是之前读取文件的结果归档；通常无需重新读取。）"
+        }
+    } else if tool_name == "execute_command"
+        && recall_lines
+            .iter()
+            .any(|line| line.starts_with("- original_command: "))
+    {
+        "（这是之前命令输出的归档；通常无需回读本归档，优先依据 `original_command` / `original_cwd` 继续判断。）"
     } else {
         "（如需完整输出可用 read_file 读取。）"
     };
-    Some(format!(
+    let mut out = format!(
         "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
          Output preserved for tool `{tool_name}`. Full result saved to session asset:\n\
-         - file_path: {file_path}\n{tool_hint}"
-    ))
+         - file_path: {file_path}"
+    );
+    for line in &recall_lines {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out.push('\n');
+    out.push_str(tool_hint);
+    Some(out)
 }
 
 /// 将「保护尾窗之外」的 overflow stub 预览体老化折叠为单行锚点。仅作用于已外溢
