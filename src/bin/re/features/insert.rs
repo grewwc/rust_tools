@@ -25,11 +25,11 @@ pub fn insert_records(
             .map(|x| x.to_string())
             .collect::<Vec<_>>();
         if parts.len() == 1
-            && let Ok(globbed) = glob::glob(&parts[0])
+            && let Ok(globbed) = rust_tools::terminalw::glob_paths(&parts[0], ".")
         {
             parts = globbed
-                .filter_map(|x| x.ok())
-                .map(|x| x.to_string_lossy().to_string())
+                .into_iter()
+                .map(|x| x)
                 .collect();
         }
         for p in parts {

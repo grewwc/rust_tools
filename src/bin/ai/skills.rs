@@ -372,12 +372,13 @@ fn discover_external_skill_dirs() -> Vec<PathBuf> {
     let mut dirs = BTreeSet::new();
     for pattern in external_skill_glob_patterns() {
         let expanded = expanduser(pattern);
-        let Ok(paths) = glob::glob(expanded.as_ref()) else {
+        let Ok(paths) = rust_tools::terminalw::glob_paths(&expanded, ".") else {
             continue;
         };
-        for entry in paths.flatten() {
-            if entry.is_dir() {
-                dirs.insert(entry);
+        for entry in &paths {
+            let p = PathBuf::from(entry);
+            if p.is_dir() {
+                dirs.insert(p);
             }
         }
     }

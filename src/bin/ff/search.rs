@@ -80,9 +80,9 @@ fn collect_matches_in_dir(
 
 fn root_dirs_from_pattern(root_pat: &str) -> std::collections::VecDeque<PathBuf> {
     let mut root_dirs: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
-    if let Ok(paths) = glob::glob(root_pat) {
-        for entry in paths.flatten() {
-            root_dirs.push_back(entry);
+    if let Ok(paths) = terminalw::glob_paths(root_pat, ".") {
+        for s in paths {
+            root_dirs.push_back(PathBuf::from(s));
         }
     }
     if root_dirs.is_empty() {

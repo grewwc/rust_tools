@@ -37,7 +37,6 @@ chrono = "0.4"
 ctrlc = "3.4"
 crossterm = "0.28"
 futures-util = "0.3"
-glob = "0.3"
 inventory = "0.3"
 mongodb = "3.4"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm_0_28"] }
@@ -48,7 +47,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
 tui-textarea = { package = "tui-textarea-2", version = "0.10.2", default-features = false, features = ["crossterm_0_28"] }
 unicode-width = "0.2"
 lopdf = "0.40"
-pdf-extract = "0.10"
 rand = "0.10.0"
 dirs = "6"
 rust_tools_macros = { path = "crates/rust_tools_macros" }

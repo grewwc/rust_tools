@@ -122,12 +122,7 @@ pub fn parse_pdf(
         let extracted = match doc.extract_text(&page_numbers) {
             Ok(t) => t,
             Err(err) => {
-                if opts.pages.is_some() {
-                    return Err(PdfParseError::ExtractTextFailed(err.to_string()));
-                }
-                pdf_extract::extract_text(&canonical).map_err(|e| {
-                    PdfParseError::ExtractTextFailed(format!("{err}; fallback failed: {e}"))
-                })?
+                return Err(PdfParseError::ExtractTextFailed(err.to_string()));
             }
         };
         Some(extracted)

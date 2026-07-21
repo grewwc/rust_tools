@@ -47,10 +47,10 @@ docs/agent-guides/          # long-form on-demand subsystem docs
 
 ## Build / Test
 
-> **Do not call `cargo check` / `cargo test` unless strictly required.** These
-> commands are very expensive in this project (heavy deps, unstable incremental
-> compilation). Only run them when the verification ladder explicitly demands it.
-> Prefer confirming correctness by reading code over running Cargo commands.
+> **Do not call `cargo check` / `cargo test` speculatively.** These commands are
+> expensive in this project (heavy deps, unstable incremental compilation).
+> But when the verification ladder says you must run them, **do not skip them**.
+> Reading code cannot confirm compilation; only `cargo check` can.
 
 ```bash
 cargo check --bin a                  # fast type-check for the main binary
@@ -108,12 +108,10 @@ the user asks for broader verification.
     `if`/`else` fallbacks to work around a design problem. If a code path needs many
     layers of fallback to function correctly, the abstraction or data flow is wrong —
     refactor the design first so the happy path is clean and straightforward.
-12. **No unnecessary Cargo commands**: `cargo check` / `cargo test` are very
-    expensive in this project. Only run them when the verification ladder
-    explicitly demands it, and always use the narrowest possible scope.
-12. **非必要不调用 Cargo 命令**: `cargo check` / `cargo test` 在本项目中非常耗时。
-    能通过阅读代码确认正确性的，绝不调用 Cargo 命令。只有在验证阶梯
-    （Verification ladder）明确要求时才运行，且必须限定最小范围。
+12. **Follow the verification ladder, don't skip**: `cargo check` / `cargo test`
+    are expensive, do not run them speculatively. But when the ladder demands it
+    (compile-risk changes: dep edits, refactors, etc.), **run them** — reading
+    code cannot confirm compilation. Always scope to the narrowest target.
 
 ## High-Value Pitfalls
 
