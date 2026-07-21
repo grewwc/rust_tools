@@ -5,10 +5,14 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
+use std::path::Path;
 
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
 use super::text_utils::truncate_to_chars;
-use super::tool_overflow::{is_non_compressible_tool, is_preserved_user_or_image_stub};
+use super::tool_overflow::{
+    is_non_compressible_tool, is_preserved_user_or_image_stub,
+    preserve_noncompressible_tool_result_for_fold,
+};
 use super::{
     is_context_checkpoint_marker, keep_recent_user_turns_when_trimming, normalize_whitespace,
     value_to_string,
@@ -59,8 +63,8 @@ pub(super) fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> 
     Some(group)
 }
 
-pub(super) fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
-    let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages);
+pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Option<usize> {
+    let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages, budget);
     let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
 
     // 跳过头部所有 system-like（system / internal_note）消息：它们承载 agent
@@ -119,11 +123,12 @@ pub(super) fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
 }
 
 /// 渐进式卸载：把一个 (assistant tool_calls + 配套 tool 结果) 整组折叠成单条
-/// `internal_note`，保留"工具列表 + 每个工具结果首句"，便于后续轮次知道
-/// 之前发生过什么、避免重复劳动；同时大幅压缩 token 占用。
+/// `internal_note`。不可有损压缩的结果先写入会话 asset，再在 stub 中保留回读路径；
+/// 普通结果保留压缩后的关键结论，避免后续轮次重复劳动。
 pub(super) fn fold_tool_call_group_to_stub(
     messages: &[Message],
     group: &[usize],
+    overflow_dir: Option<&Path>,
 ) -> Option<Message> {
     if group.is_empty() {
         return None;
@@ -154,8 +159,8 @@ pub(super) fn fold_tool_call_group_to_stub(
                 }
             })
             .unwrap_or_default();
-        let one_liner = tool_result_recall_one_liner(&result_text);
-        lines.push(format!("- {} => {}", tc.function.name, one_liner));
+        let recall = tool_result_recall_text(&tc.function.name, &result_text, overflow_dir)?;
+        lines.push(format!("- {} => {}", tc.function.name, recall));
     }
     if tool_calls.len() > 8 {
         lines.push(format!(
@@ -171,6 +176,85 @@ pub(super) fn fold_tool_call_group_to_stub(
         tool_call_id: None,
         reasoning_content: None,
     })
+}
+
+/// 为工具组折叠生成结果召回文本。高精度结果在移除原始消息前必须先归档；若归档
+/// 失败则返回 `None`，调用方保留整组原文，不能将唯一证据降级为首句。
+fn tool_result_recall_text(
+    tool_name: &str,
+    result_text: &str,
+    overflow_dir: Option<&Path>,
+) -> Option<String> {
+    if !is_non_compressible_tool(tool_name) || result_text.trim().is_empty() {
+        return Some(tool_result_recall_one_liner(result_text));
+    }
+
+    let already_archived = result_text
+        .lines()
+        .map(str::trim)
+        .any(|line| line.starts_with("- file_path:") || line.starts_with("file_path:"));
+    let preserved =
+        preserve_noncompressible_tool_result_for_fold(overflow_dir, tool_name, result_text)?;
+    let path = preserved
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("- file_path:") || line.starts_with("file_path:"))?;
+
+    if tool_name == "execute_command" && !already_archived {
+        return Some(format!(
+            "{}\n  {path}\n  - use read_file to inspect exact diagnostics.",
+            command_result_recall(result_text),
+        ));
+    }
+
+    Some(truncate_to_chars(&normalize_whitespace(path), 240))
+}
+
+/// 命令输出被折叠时至少保留退出状态、关键诊断与尾部结论。完整日志仍由调用方
+/// 归档到 `file_path`，这里的职责只是让模型能在不重跑命令的情况下判断下一步。
+fn command_result_recall(result_text: &str) -> String {
+    const MAX_SIGNALS: usize = 5;
+    const MAX_CHARS: usize = 720;
+
+    let lines = result_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "command produced no output".to_string();
+    }
+
+    let mut signals = Vec::with_capacity(MAX_SIGNALS + 2);
+    push_command_signal(&mut signals, lines[0]);
+    for line in &lines {
+        let lower = line.to_ascii_lowercase();
+        let diagnostic = lower.contains("error")
+            || lower.contains("failed")
+            || lower.contains("panic")
+            || lower.contains("test result:")
+            || lower.contains("failures:")
+            || lower.contains("could not compile")
+            || lower.contains("aborting due to");
+        if diagnostic {
+            push_command_signal(&mut signals, line);
+            if signals.len() >= MAX_SIGNALS {
+                break;
+            }
+        }
+    }
+    if signals.len() < MAX_SIGNALS {
+        push_command_signal(&mut signals, lines[lines.len() - 1]);
+    }
+
+    truncate_to_chars(&signals.join(" | "), MAX_CHARS)
+}
+
+fn push_command_signal(signals: &mut Vec<String>, line: &str) {
+    let line = truncate_to_chars(&normalize_whitespace(line), 220);
+    if !line.is_empty() && !signals.iter().any(|existing| existing == &line) {
+        signals.push(line);
+    }
 }
 
 /// 单轮内折叠：LLM 摘要兜底时，尾窗（当前 user 轮）内部保留逐字的最近工具组数。
@@ -370,6 +454,7 @@ fn group_reads_pending_patch_target(
 pub(super) fn fold_early_tool_groups(
     messages: &[Message],
     keep_recent_groups: usize,
+    overflow_dir: Option<&Path>,
 ) -> (Vec<Message>, usize) {
     // 定位所有 assistant(tool_calls) 起始位置，作为工具组锚点。
     let group_anchors: Vec<usize> = messages
@@ -433,7 +518,7 @@ pub(super) fn fold_early_tool_groups(
                 }
                 cursor += 1;
             }
-            if let Some(stub) = fold_tool_call_group_to_stub(messages, &group) {
+            if let Some(stub) = fold_tool_call_group_to_stub(messages, &group, overflow_dir) {
                 // pending-patch 目标路径的 read_file 组跳过折叠，逐字保留。
                 if group_reads_pending_patch_target(messages, &group, &pending_patch_paths) {
                     for &gi in &group {

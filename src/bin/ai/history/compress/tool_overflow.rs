@@ -303,6 +303,89 @@ mod tests {
         assert_eq!(value_to_string(&messages[2].content).len(), 10_000);
         let _ = std::fs::remove_dir_all(overflow_dir);
     }
+
+    fn user_msg(text: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: Value::String(text.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// 构造一条「首次外溢」形态的 stub（含多行 Preview 正文），用于折叠测试。
+    fn overflow_stub_with_preview(file_path: &str, tool_name: &str) -> String {
+        let full = (0..40)
+            .map(|i| format!("line {i}: some content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        build_preserved_tool_overflow_stub(Path::new(file_path), tool_name, &full)
+    }
+
+    #[test]
+    fn collapse_overflow_stub_to_anchor_drops_preview_keeps_file_path() {
+        let stub = overflow_stub_with_preview("/tmp/session/read-abc.txt", "read_file");
+        // 前置条件：首次 stub 确实带 Preview 正文。
+        assert!(stub.contains("Preview ("));
+
+        let anchor = collapse_overflow_stub_to_anchor(&stub).expect("should collapse");
+        // 预览正文被丢弃。
+        assert!(!anchor.contains("Preview ("));
+        // file_path 与工具名召回锚点保留。
+        assert!(anchor.contains("- file_path: /tmp/session/read-abc.txt"));
+        assert!(anchor.contains("non-compressible tool `read_file`"));
+        assert!(anchor.contains("use read_file to inspect exact content."));
+        // 仍是合法 stub（前缀不变），后续压缩链继续按 stub 豁免识别。
+        assert!(is_preserved_tool_overflow_stub(&anchor));
+        // 体量骤降。
+        assert!(anchor.len() < stub.len());
+    }
+
+    #[test]
+    fn age_out_overflow_stub_previews_is_idempotent() {
+        let stub = overflow_stub_with_preview("/tmp/session/read-xyz.txt", "code_search");
+        // 两条 user 轮，让 stub 落在保护尾窗之外（retained_turn_start 之前）。
+        let mut messages = vec![
+            user_msg("q1"),
+            assistant_call("s", "code_search"),
+            tool_result("s", "placeholder"),
+            user_msg("q2"),
+            user_msg("q3"),
+        ];
+        messages[2].content = Value::String(stub);
+
+        age_out_overflow_stub_previews(&mut messages, 1);
+        let after_first = value_to_string(&messages[2].content);
+        assert!(!after_first.contains("Preview ("));
+
+        // 再跑一次：已是锚点形态，内容不得再变（防 stub->stub 抖动）。
+        age_out_overflow_stub_previews(&mut messages, 1);
+        assert_eq!(value_to_string(&messages[2].content), after_first);
+    }
+
+    #[test]
+    fn age_out_overflow_stub_previews_respects_protected_tail() {
+        // 早期 stub（尾窗外）与近端 stub（尾窗内）各一条。
+        let early = overflow_stub_with_preview("/tmp/session/early.txt", "read_file");
+        let recent = overflow_stub_with_preview("/tmp/session/recent.txt", "read_file");
+        let mut messages = vec![
+            user_msg("q1"),
+            assistant_call("early", "read_file"),
+            tool_result("early", "placeholder"),
+            user_msg("q2"),
+            assistant_call("recent", "read_file"),
+            tool_result("recent", "placeholder"),
+        ];
+        messages[2].content = Value::String(early);
+        messages[5].content = Value::String(recent.clone());
+
+        // 保护最近 1 个 user 轮（q2 起）：早期 stub 折叠，尾窗内 recent 保留完整预览。
+        age_out_overflow_stub_previews(&mut messages, 1);
+        assert!(!value_to_string(&messages[2].content).contains("Preview ("));
+        assert_eq!(value_to_string(&messages[5].content), recent);
+        assert!(value_to_string(&messages[5].content).contains("Preview ("));
+    }
 }
 
 /// 「读取/检索」类工具的输出零压缩（不行裁剪、不去重折叠、不整组删除），
@@ -312,10 +395,30 @@ mod tests {
 /// 现在改为查询工具自身声明的历史保留策略
 /// （`ToolHistoryPolicyRegistration`，见各工具注册文件），而非在此硬编码
 /// 工具名列表。默认未注册的工具允许有损压缩；只有显式声明
-/// `lossy_compress: Never` 的工具（`read_file` / 检索类 / `plan`）返回 true。
-/// 注意：这与「是否允许 LLM 裁剪」是正交维度——见 `llm_prune.rs`。
+/// `lossy_compress: Never` 的工具（`read_file` / 检索类 / `execute_command` / `plan`）
+/// 返回 true。注意：这与「是否允许 LLM 裁剪」是正交维度——见 `llm_prune.rs`。
 pub(super) fn is_non_compressible_tool(tool_name: &str) -> bool {
     !crate::ai::tools::registry::common::tool_history_policy(tool_name).allows_lossy_compress()
+}
+
+/// 将尚未外溢的高精度工具结果写入会话 asset，并返回带 `file_path` 的稳定 stub。
+///
+/// 工具组折叠会移除原始 `tool` 消息；对不可有损压缩的结果，必须先走这条路径，
+/// 否则折叠 note 只剩一行首句，完整诊断将没有任何可回读的真相来源。已有 stub
+/// 直接复用，避免同一结果在多轮压缩中反复写出副本。
+pub(super) fn preserve_noncompressible_tool_result_for_fold(
+    overflow_dir: Option<&Path>,
+    tool_name: &str,
+    content: &str,
+) -> Option<String> {
+    if is_preserved_tool_overflow_stub(content) {
+        return Some(content.to_string());
+    }
+    let path =
+        overflow_dir.and_then(|dir| write_preserved_tool_overflow_file(dir, tool_name, content))?;
+    Some(build_preserved_tool_overflow_stub(
+        &path, tool_name, content,
+    ))
 }
 
 fn write_preserved_tool_overflow_file(
@@ -365,6 +468,66 @@ fn is_preserved_tool_overflow_stub(text: &str) -> bool {
         || (text.starts_with(LEGACY_PRESERVED_TOOL_OVERFLOW_STUB_PREFIX)
             && text.contains("\n- file_path: ")
             && text.contains("\n- use read_file to inspect exact content."))
+}
+
+/// 把一条已外溢的 tool overflow stub 的 head+tail 预览体收敛为「单行召回锚点」
+/// （仅保留 `file_path:` 指针 + 回读提示，丢弃 `Preview (...)` 及其后所有行）。
+///
+/// 老 stub 的预览在长会话里单调累积（真实案例：800 条 × ~1KB ≈ 849KB），而
+/// `file_path` 才是模型精确回读的唯一必要信息——预览只是「首次召回锚点」，一旦
+/// 该 stub 已远离当前工作焦点，预览正文的边际价值趋近于 0。收敛后每条从 ~1KB
+/// 降到 ~200 字符，召回能力零损失（仍可 read_file 回读原文）。
+///
+/// 解析失败（无法定位 file_path 或工具名）返回 `None`，保持原文不动，绝不破坏。
+/// 对「已经是锚点形态」（不含 `Preview (` 段）的 stub 亦返回 `None`，保证幂等、
+/// 不产生 stub→stub 抖动。
+fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
+    if !is_preserved_tool_overflow_stub(text) {
+        return None;
+    }
+    // 已是锚点形态（无预览段）：幂等，返回 None 表示无需改写。
+    if !text.contains("Preview (") {
+        return None;
+    }
+    let tool_name = text
+        .split_once("non-compressible tool `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(name, _)| name.to_string())?;
+    let file_path = text
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())?;
+    Some(format!(
+        "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
+         Output preserved for non-compressible tool `{tool_name}`. Full result moved to session temp file:\n\
+         - file_path: {file_path}\n- use read_file to inspect exact content."
+    ))
+}
+
+/// 将「保护尾窗之外」的 overflow stub 预览体老化折叠为单行锚点。仅作用于已外溢
+/// 的 tool stub（`is_preserved_tool_overflow_stub`），不碰原始 tool 结果；尾窗内
+/// stub 保留完整 head+tail 预览（当前工作焦点仍需要它的召回上下文）。
+///
+/// 与预算驱动的组折叠互补：即便某条 stub 所在的组因近端保护未被
+/// `fold_early_tool_groups` 折叠，其预览正文也会随对话推进老化收敛，防止历史里
+/// 上百条早期 read_file 预览单调累积。
+pub(super) fn age_out_overflow_stub_previews(
+    messages: &mut [Message],
+    keep_recent_user_turns: usize,
+) {
+    let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
+    for message in messages.iter_mut().take(protected_tail_start) {
+        if message.role != "tool" {
+            continue;
+        }
+        let Value::String(text) = &message.content else {
+            continue;
+        };
+        if let Some(anchor) = collapse_overflow_stub_to_anchor(text) {
+            message.content = Value::String(anchor);
+        }
+    }
 }
 
 /// 为外溢内容生成 head+tail 预览。短内容直接全量保留；长内容保留前后各若干行，
@@ -451,8 +614,8 @@ pub(in crate::ai) fn normalize_preserved_message_stubs_for_model(messages: &mut 
     }
 }
 
-fn first_preserved_content_spill_candidate(messages: &[Message]) -> Option<usize> {
-    let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages);
+fn first_preserved_content_spill_candidate(messages: &[Message], budget: usize) -> Option<usize> {
+    let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages, budget);
     let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
     for (idx, message) in messages.iter().enumerate() {
         if idx >= protected_tail_start {
@@ -548,8 +711,9 @@ fn build_preserved_message_overflow_stub(path: &Path, kind: &str) -> String {
 pub(super) fn try_spill_preserved_message_to_stub(
     messages: &mut [Message],
     overflow_dir: &Path,
+    budget: usize,
 ) -> bool {
-    let Some(idx) = first_preserved_content_spill_candidate(messages) else {
+    let Some(idx) = first_preserved_content_spill_candidate(messages, budget) else {
         return false;
     };
     let kind = if message_contains_image(&messages[idx].content) {
@@ -573,8 +737,12 @@ pub(super) fn try_spill_preserved_message_to_stub(
 /// 循环内的 spill 永远不会被调用。这里改为「无论是否超预算，只要旧消息原始
 /// 体量超过阈值就外溢」，既保证大图/大段用户原文被零压缩归档，又避免它们污染
 /// 后续每一轮请求。最新一轮（保护尾窗内）的 user/图片永不外溢。
-pub(super) fn spill_oversized_preserved_messages(messages: &mut [Message], overflow_dir: &Path) {
-    while try_spill_preserved_message_to_stub(messages, overflow_dir) {}
+pub(super) fn spill_oversized_preserved_messages(
+    messages: &mut [Message],
+    overflow_dir: &Path,
+    budget: usize,
+) {
+    while try_spill_preserved_message_to_stub(messages, overflow_dir, budget) {}
 }
 
 fn structured_tool_output_summary(text: &str, max_chars: usize) -> String {

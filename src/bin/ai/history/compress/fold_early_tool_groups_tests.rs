@@ -81,7 +81,7 @@ fn folds_early_groups_in_a_single_bloated_turn() {
     let messages = single_turn_with_groups(10, 2_000);
     let before = messages_total_chars(&messages);
 
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None);
 
     // 10 组各 1 条 tool 结果 → 10 条 tool 消息。虽然 keep_recent_groups=4，但
     // 最近完整 4 组逐字保留，最早 6 组折叠。
@@ -97,7 +97,7 @@ fn folds_early_groups_in_a_single_bloated_turn() {
 #[test]
 fn preserves_user_message_verbatim() {
     let messages = single_turn_with_groups(8, 1_500);
-    let (folded, _) = fold_early_tool_groups(&messages, 4);
+    let (folded, _) = fold_early_tool_groups(&messages, 4, None);
 
     let user = folded
         .iter()
@@ -109,7 +109,7 @@ fn preserves_user_message_verbatim() {
 #[test]
 fn keeps_recent_groups_verbatim() {
     let messages = single_turn_with_groups(8, 1_500);
-    let (folded, _) = fold_early_tool_groups(&messages, 4);
+    let (folded, _) = fold_early_tool_groups(&messages, 4, None);
 
     // 8 组各 1 条 tool 结果。按完整组保护最近 4 组，最早 4 组折叠为 stub。
     let full_tool_results = folded
@@ -122,7 +122,7 @@ fn keeps_recent_groups_verbatim() {
 #[test]
 fn no_op_when_group_count_within_keep_window() {
     let messages = single_turn_with_groups(3, 1_000);
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None);
 
     assert_eq!(folded_groups, 0);
     assert_eq!(folded.len(), messages.len());
@@ -136,7 +136,7 @@ fn fold_never_crosses_recent_tool_message_protection_window() {
     let messages = single_turn_with_groups(10, 1_200);
 
     // keep_recent_groups=0 表面上要折叠全部 10 组。
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 0);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 0, None);
 
     // 每组 1 条 tool 结果；调用方要求保留 0 组，因此 10 组都可折叠。
     assert_eq!(folded_groups, 10);
@@ -167,7 +167,7 @@ fn stub_preserves_file_path_recall_anchor() {
         messages.push(tool_result(&id, "recent"));
     }
 
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None);
     assert!(folded_groups >= 1);
     let stub_text: String = folded
         .iter()
@@ -178,6 +178,53 @@ fn stub_preserves_file_path_recall_anchor() {
         stub_text.contains("/tmp/session/xyz.txt"),
         "folded stub must retain the file_path recall anchor, got: {stub_text}"
     );
+}
+
+/// 同一 user turn 内工具组过多时，`cargo test` 一类命令可能离开最近组保护窗。
+/// 折叠后仍必须能看到失败结论和关键报错，并通过 `file_path` 读取完整日志。
+#[test]
+fn folded_command_failure_keeps_diagnostics_and_full_output_pointer() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-command-fold-{}", uuid::Uuid::new_v4()));
+    let command_output = "Exit code: 101\n\
+        Checking rust_tools v0.1.0 (/repo)\n\
+        error[E0425]: cannot find value `missing` in this scope\n\
+        error: could not compile `rust_tools` (bin \"a\") due to 1 previous error\n\
+        test result: FAILED. 0 passed; 1 failed";
+    let mut messages = vec![msg("system", "s"), msg("user", "修复编译失败")];
+    messages.push(assistant_call("command", "execute_command"));
+    messages.push(tool_result("command", command_output));
+    // 将命令组推出最近 4 组保护窗，模拟一轮内大量 read/search 后触发 LLM 摘要。
+    for i in 0..4 {
+        let id = format!("later-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "later"));
+    }
+
+    let (folded, folded_groups) =
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()));
+    assert_eq!(folded_groups, 1);
+    let stub = folded
+        .iter()
+        .find(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && value_to_string(&message.content).contains("execute_command")
+        })
+        .map(|message| value_to_string(&message.content))
+        .expect("command group should be folded into a recall stub");
+    assert!(stub.contains("Exit code: 101"), "{stub}");
+    assert!(stub.contains("error[E0425]"), "{stub}");
+    assert!(stub.contains("could not compile"), "{stub}");
+    let path = stub
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("- file_path: "))
+        .expect("folded command must retain a full-output file path");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("archived command output should be readable"),
+        command_output
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
 fn assistant_call_with_reasoning(id: &str, name: &str, reasoning: &str) -> Message {
@@ -371,7 +418,7 @@ fn preserves_read_file_for_pending_patch_path() {
         messages.push(tool_result(&id, "recent"));
     }
 
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None);
     assert!(folded_groups >= 1, "应至少折叠 apply_patch/grep 组");
     // read_file 组必须逐字保留（不是 ROLE_INTERNAL_NOTE stub）。
     let rf = folded
@@ -425,7 +472,7 @@ fn preserves_read_file_for_each_pending_path_from_multi_file_patch() {
         messages.push(tool_result(&id, "recent"));
     }
 
-    let (folded, _) = fold_early_tool_groups(&messages, 4);
+    let (folded, _) = fold_early_tool_groups(&messages, 4, None);
     for target in ["/a.rs", "/b.rs"] {
         let preserved = folded.iter().any(|m| {
             m.role == "assistant"

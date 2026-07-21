@@ -21,10 +21,10 @@ use tool_groups::{
 #[cfg(test)]
 use tool_overflow::normalize_internal_notes_for_summary_model;
 use tool_overflow::{
-    build_persisted_summary_text, build_persisted_summary_text_with_app,
-    enforce_protected_precision_group_budget, is_non_compressible_tool,
-    normalize_preserved_message_stubs_for_model, prepare_tool_messages_structured,
-    spill_oversized_preserved_messages, tool_line_signature,
+    age_out_overflow_stub_previews, build_persisted_summary_text,
+    build_persisted_summary_text_with_app, enforce_protected_precision_group_budget,
+    is_non_compressible_tool, normalize_preserved_message_stubs_for_model,
+    prepare_tool_messages_structured, spill_oversized_preserved_messages, tool_line_signature,
     try_spill_preserved_message_to_stub,
 };
 
@@ -69,12 +69,35 @@ const KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX: usize = 3;
 /// 当上下文字符数不超过该阈值时，优先保留 3 轮 user。
 const KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS: usize = 48_000;
 
-fn keep_recent_user_turns_when_trimming(messages: &[Message]) -> usize {
-    if messages_total_chars(messages) <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
+/// 计算裁剪/外溢/折叠时应完整豁免的「最近 user 起始尾窗」轮数。
+///
+/// 基础判定（按总量二选一）不变：≤48K → 3 轮，否则 2 轮——正常会话零行为变化。
+///
+/// **字节上限逃逸阀**（`budget > 0` 时生效）：保护尾窗是「完整豁免区」，它自身
+/// 不应超过整个历史预算。tool-heavy agentic 会话（少 user 轮 × 每轮上百次工具
+/// 调用）会让尾窗撑到 MB 级且**结构上禁止收敛**——尾窗内即便有几百条工具组也
+/// 一律豁免。此时逐步收缩保护轮数，让「倒数第 2 轮及更早」的工具组暴露给
+/// fold/spill 路径恢复收敛。**保底不变式：永不低于 1 轮**——最新一轮 user 及其
+/// 工具组始终逐字保留（由 `KEEP_RECENT_TOOL_GROUPS` 组级保护继续兜底）。
+///
+/// `budget == 0` 表示调用方显式不设上限（保持旧行为），供无预算语境复用。
+fn keep_recent_user_turns_when_trimming(messages: &[Message], budget: usize) -> usize {
+    let mut keep = if messages_total_chars(messages) <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
         KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX
     } else {
         KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MIN
+    };
+    if budget == 0 {
+        return keep;
     }
+    while keep > 1 {
+        let tail_start = retained_turn_start(messages, keep);
+        if messages_total_chars(&messages[tail_start..]) <= budget {
+            break;
+        }
+        keep -= 1;
+    }
+    keep
 }
 
 /// 暴露给同 crate 的常量访问器，避免在 mod.rs 中复制阈值数字。
@@ -546,6 +569,43 @@ async fn compact_persisted_history_with_app_inner(
     out
 }
 
+/// 当 `first_tool_call_group` 折不动（剩余可折叠组都含 `read_file`/`code_search`
+/// 等 non-compressible 工具、被它按策略拒绝）但仍超预算时的下一档手段：用
+/// [`fold_early_tool_groups`] 递进折叠「保护尾窗之外」的这些组为单行
+/// `compressed_tool_round` note（内含 file_path 召回锚点，模型可 read_file 回读）。
+///
+/// 这与 `mid_turn_llm_summarize` 的 Path B+C 复用**同一个**久经测试的折叠函数，
+/// 只是把它前移到常规/落盘压缩路径——修复「tool-heavy 会话（少 user 轮 × 上百次
+/// read_file/code_search）在 `compress_messages_for_context` / `shrink_*` 里永远
+/// 压不掉工具组、整段历史无法收敛进预算」的总根因。
+///
+/// 返回是否发生了「有效折叠」（净字符数下降）。`keep_recent` 从
+/// [`KEEP_RECENT_TOOL_GROUPS`] 递进收紧到 0，保证最近的工具组尽量逐字保留、
+/// 只有仍超预算才逐步放宽折叠范围；每一步都要求净下降，避免无进展空转。
+fn fold_noncompressible_tool_groups_to_fit(
+    messages: &mut Vec<Message>,
+    max_chars: usize,
+    overflow_dir: Option<&Path>,
+) -> bool {
+    let mut made_progress = false;
+    for &keep_recent in &[KEEP_RECENT_TOOL_GROUPS, 2, 1, 0] {
+        if messages_total_chars(messages) <= max_chars {
+            break;
+        }
+        let (folded, folded_groups) = fold_early_tool_groups(messages, keep_recent, overflow_dir);
+        if folded_groups == 0 {
+            continue;
+        }
+        // 折叠必须带来净下降才采纳，否则丢弃本次结果继续收紧 keep_recent，
+        // 严防「组数变了但字符没降」导致的循环空转。
+        if messages_total_chars(&folded) < messages_total_chars(messages) {
+            *messages = folded;
+            made_progress = true;
+        }
+    }
+    made_progress
+}
+
 fn shrink_messages_to_fit(
     mut messages: Vec<Message>,
     max_chars: usize,
@@ -580,8 +640,15 @@ fn shrink_messages_to_fit(
     // `is_preserved_user_or_image_stub` 自动跳过它们——避免旧 user 被通用裁剪
     // 直接 `remove` 掉（那违反分类给 RecentUser 的 OffloadOnly 语义、静默丢原文）。
     if let Some(dir) = overflow_dir {
-        spill_oversized_preserved_messages(&mut messages, dir);
+        spill_oversized_preserved_messages(&mut messages, dir, max_chars);
     }
+
+    // 保护尾窗之外的 overflow stub 预览体老化折叠为单行锚点（file_path 召回不丢），
+    // 收敛「上百条早期 read_file 预览单调累积」的历史膨胀。放在预算判断之前，
+    // 让即便未超预算的会话也能持续收敛已外溢 stub。尾窗轮数受 max_chars 字节上限
+    // 约束：tool-heavy 会话尾窗过大时自动缩窗，把更早的 stub 暴露给老化折叠。
+    let keep_recent_turns = keep_recent_user_turns_when_trimming(&messages, max_chars);
+    age_out_overflow_stub_previews(&mut messages, keep_recent_turns);
 
     if messages_total_chars(&messages) <= max_chars {
         return messages;
@@ -592,7 +659,7 @@ fn shrink_messages_to_fit(
             // 渐进式卸载：先尝试折叠为单行 stub 而不是整组删除，
             // 让模型仍能"看见"早期发生过哪些工具调用、以什么结果收尾，
             // 避免后续轮次因为完全失忆而重复工作。
-            if let Some(stub) = fold_tool_call_group_to_stub(&messages, &group) {
+            if let Some(stub) = fold_tool_call_group_to_stub(&messages, &group, overflow_dir) {
                 let stub_idx = group[0];
                 for idx in group.iter().rev() {
                     messages.remove(*idx);
@@ -609,13 +676,19 @@ fn shrink_messages_to_fit(
             }
             continue;
         }
-        if let Some(idx) = first_trim_candidate(&messages) {
+        // first_tool_call_group 已折不动（剩余可折叠组都含 read_file/code_search
+        // 等 non-compressible 工具）但仍超预算：用 fold_early_tool_groups 递进折叠
+        // 保护尾窗之外的这些组。有效折叠则继续循环重新评估；否则落到通用裁剪。
+        if fold_noncompressible_tool_groups_to_fit(&mut messages, max_chars, overflow_dir) {
+            continue;
+        }
+        if let Some(idx) = first_trim_candidate(&messages, max_chars) {
             // 旧 user（含图片的多模态 user）绝不静默删除：这是分类给 RecentUser 的
             // OffloadOnly 语义。先尝试把原文零压缩搬到归档文件、替换成回指 stub；
             // 搬盘成功则继续裁剪循环。
             if messages[idx].role == "user" {
                 if let Some(dir) = overflow_dir
-                    && try_spill_preserved_message_to_stub(&mut messages, dir)
+                    && try_spill_preserved_message_to_stub(&mut messages, dir, max_chars)
                 {
                     continue;
                 }
@@ -676,8 +749,14 @@ fn shrink_messages_to_fit_with_summary(
     // 图片在预算里只按名义成本计费，单张大图不再触发超预算循环，因此必须
     // 在预算判断之前就把它们零压缩搬到文件，避免每轮请求都携带完整 base64。
     if let Some(dir) = overflow_dir {
-        spill_oversized_preserved_messages(&mut messages, dir);
+        spill_oversized_preserved_messages(&mut messages, dir, max_chars);
     }
+
+    // 保护尾窗之外的 overflow stub 预览体老化折叠为单行锚点（与 shrink_messages_to_fit
+    // 对称）。收敛早期 read_file 预览的单调累积，file_path 召回锚点保留不丢。
+    // 尾窗轮数同样受 max_chars 字节上限约束（见 keep_recent_user_turns_when_trimming）。
+    let keep_recent_turns = keep_recent_user_turns_when_trimming(&messages, max_chars);
+    age_out_overflow_stub_previews(&mut messages, keep_recent_turns);
 
     if messages_total_chars(&messages) <= max_chars {
         return messages;
@@ -691,7 +770,7 @@ fn shrink_messages_to_fit_with_summary(
             // 让模型仍能"看见"早期发生过哪些工具调用、以什么结果收尾，
             // 避免后续轮次完全失忆而重复工作。折叠仍超额或无法构造 stub
             // 时，才把整组移入 dropped 由 OverflowSink 归档。
-            if let Some(stub) = fold_tool_call_group_to_stub(&messages, &group) {
+            if let Some(stub) = fold_tool_call_group_to_stub(&messages, &group, overflow_dir) {
                 let stub_idx = group[0];
                 for idx in group.iter().rev() {
                     messages.remove(*idx);
@@ -710,12 +789,18 @@ fn shrink_messages_to_fit_with_summary(
             dropped.extend(removed_group);
             continue;
         }
-        if let Some(idx) = first_trim_candidate(&messages) {
+        // first_tool_call_group 已折不动（剩余可折叠组都含 read_file/code_search
+        // 等 non-compressible 工具）但仍超预算：用 fold_early_tool_groups 递进折叠
+        // 保护尾窗之外的这些组。有效折叠则继续循环重新评估；否则落到通用裁剪。
+        if fold_noncompressible_tool_groups_to_fit(&mut messages, max_chars, overflow_dir) {
+            continue;
+        }
+        if let Some(idx) = first_trim_candidate(&messages, max_chars) {
             dropped.push(messages.remove(idx));
             continue;
         }
         if let Some(dir) = overflow_dir
-            && try_spill_preserved_message_to_stub(&mut messages, dir)
+            && try_spill_preserved_message_to_stub(&mut messages, dir, max_chars)
         {
             continue;
         }
@@ -991,6 +1076,8 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     hard_target: usize,
 ) -> (Vec<Message>, usize, usize, bool) {
     let before = messages_total_chars(&messages);
+    let overflow_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
+        .session_assets_dir(&app.session_id);
     // best 追踪迄今为止体积最小的结果；None 表示仍使用原始 messages。
     let mut best: Option<Vec<Message>> = None;
     let mut best_after = before;
@@ -1032,6 +1119,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 let (tail, _) = fold_early_tool_groups(
                     &messages[split_at..],
                     MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS,
+                    Some(overflow_dir.as_path()),
                 );
                 out.extend(tail);
                 let after = messages_total_chars(&out);
@@ -1060,7 +1148,8 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
             break;
         }
         let current = best.as_ref().unwrap_or(&messages);
-        let (folded, folded_groups) = fold_early_tool_groups(current, keep_recent);
+        let (folded, folded_groups) =
+            fold_early_tool_groups(current, keep_recent, Some(overflow_dir.as_path()));
         if folded_groups == 0 {
             continue;
         }
@@ -1672,3 +1761,5 @@ fn render_deduped_read_file_lines(lines: &[(usize, String)], removed: usize) -> 
 mod fold_early_tool_groups_tests;
 #[cfg(test)]
 mod coalesce_summary_notes_tests;
+#[cfg(test)]
+mod tail_window_tests;

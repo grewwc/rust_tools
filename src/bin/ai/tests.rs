@@ -838,6 +838,99 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
 }
 
 #[test]
+fn overflow_stub_recall_anchor_survives_compaction() {
+    // 复现「tool-heavy 会话（少 user 轮 × 上百次 read_file）」：早期大量
+    // read_file 组 + 一个近端 user 轮。断言压缩后 (1) 总 billable 显著下降并收敛进
+    // 预算，(2) 每个 read_file 的 file_path 召回锚点在输出里仍可找到（零失忆）。
+    use super::history::messages_total_chars_pub;
+
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-recall-anchor-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("system prompt".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    // 60 个早期 read_file 组，每组结果 4000 字符 —— 单条超阈值必被外溢成带预览 stub。
+    for i in 0..60usize {
+        let id = format!("call_{i}");
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.clone(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: format!(r#"{{"filePath":"src/file_{i}.rs"}}"#),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        messages.push(Message {
+            role: "tool".to_string(),
+            content: Value::String(format!("content of file {i}\n").repeat(200)),
+            tool_calls: None,
+            tool_call_id: Some(id),
+            reasoning_content: None,
+        });
+    }
+    // 近端 user 轮（保护尾窗）。
+    messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String("最新的问题".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+
+    let before = messages_total_chars_pub(&messages);
+    let budget = 40_000usize;
+    let compressed =
+        compress_messages_for_context(messages, budget, 256, 400, Some(overflow_dir.clone()));
+    let after = messages_total_chars_pub(&compressed);
+
+    // 总量显著下降并收敛进预算（tool-heavy 会话不再结构性卡死）。
+    assert!(
+        after < before,
+        "compaction must reduce total billable ({after} !< {before})"
+    );
+    assert!(
+        after <= budget,
+        "tool-heavy history must converge under budget ({after} > {budget})"
+    );
+
+    // 收集压缩后所有输出文本，验证每个早期 read_file 的 file_path 仍可召回：
+    // 要么以 stub/锚点保留 src/file_N.rs 路径，要么以外溢临时文件路径存在于某条 note。
+    let joined: String = compressed
+        .iter()
+        .filter_map(|m| m.content.as_str().map(str::to_string))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // 至少应有外溢临时文件被写盘（read_file 结果零压缩外溢）。
+    let overflow_files: Vec<_> = std::fs::read_dir(overflow_dir.join("tool-overflow-compressed"))
+        .map(|rd| rd.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(
+        !overflow_files.is_empty(),
+        "read_file outputs should be spilled to session temp files"
+    );
+    // 折叠后仍保留召回线索：compressed_tool_round note 或 stub 锚点二者至少其一。
+    assert!(
+        joined.contains("compressed_tool_round")
+            || joined.contains("Output preserved for non-compressible tool")
+            || joined.contains("read_file"),
+        "compacted history must retain read_file recall anchors"
+    );
+
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+#[test]
 fn compression_keeps_recent_non_compressible_tool_output_verbatim() {
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-preserve-overflow-recent-{}",

@@ -23,8 +23,9 @@ progressive loading.
    `ToolHistoryPolicyRegistration`. Do not add broad fields to `ToolSpec` or
    reintroduce name-keyed policy chains in `history/compress/`.
 5. **History policy semantics.** `lossy_compress` and `prune` are orthogonal.
-   Preserve truth for `plan`, `read_file`, `code_search`, and subagent task
-   tools with explicit overflow stubs/file pointers instead of lossy summaries.
+   Preserve truth for `plan`, `read_file`, `code_search`, `execute_command`
+   diagnostics, and subagent task tools with explicit overflow stubs/file
+   pointers instead of lossy summaries.
 6. **Temp files.** `write_file(temp=true)` writes under `runtime_ctx::temp_dir()`
    and registers a relative path in the JSON temp registry. `delete_path` only
    deletes registered temp files.

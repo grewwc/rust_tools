@@ -96,7 +96,7 @@ pub(crate) fn tool_display_config(name: &str) -> ToolDisplayConfig {
 /// `Never` 表示 precision 结果，压缩路径只能零压缩外溢到磁盘并留指针 stub。
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) enum ToolLossyCompressPolicy {
-    /// 默认：允许有损压缩（普通工具结果，如 `execute_command`）。
+    /// 默认：允许有损压缩（普通概览型工具结果）。
     #[default]
     Allow,
     /// 禁止有损压缩：内容复现代价高（如 `read_file` / 检索类 / `plan`），
@@ -652,8 +652,16 @@ mod history_policy_tests {
     }
 
     #[test]
-    fn unregistered_tool_defaults_to_allow_both() {
+    fn execute_command_blocks_lossy_compression_but_allows_pruning() {
         let policy = tool_history_policy("execute_command");
+        assert!(!policy.allows_lossy_compress());
+        assert!(policy.allows_prune());
+        assert!(policy.counts_toward_precision_inline_budget());
+    }
+
+    #[test]
+    fn unregistered_tool_defaults_to_allow_both() {
+        let policy = tool_history_policy("unregistered_tool");
         assert!(policy.allows_lossy_compress());
         assert!(policy.allows_prune());
     }
