@@ -685,7 +685,7 @@ mod tests {
             })
             .and_then(|message| message.content.as_str())
             .expect("tool content");
-        assert!(tool_content.contains("Output preserved for non-compressible tool `find_path`"));
+        assert!(tool_content.contains("Output preserved for tool `find_path`"));
         assert!(tool_content.contains("- file_path:"));
         assert!(!tool_content.contains("tool_output_lines:"));
     }

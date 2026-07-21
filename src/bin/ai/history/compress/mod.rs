@@ -246,14 +246,11 @@ impl OverflowSink {
 
 fn build_overflow_placeholder(file_path: &str) -> String {
     let mut out = String::new();
-    out.push_str("长期记忆归档：更早的原始对话未丢失。\n");
-    out.push_str("原始归档文件: ");
+    out.push_str("长期记忆归档：更早的原始对话已移出上下文窗口，原文保存在会话归档文件中（零压缩）。\n");
+    out.push_str("归档文件: ");
     out.push_str(file_path);
     out.push('\n');
-    out.push_str("优先执行工具: read_file\n参数: file_path=\"");
-    out.push_str(file_path);
-    out.push_str("\", offset=1, limit=200)\n");
-    out.push_str("若当前问题依赖前文细节、最初目标、之前决定、旧报错或更早工具输出，请先分段读取该归档；只有在已经定位到相关位置后，再改用更精确的行范围读取。\n");
+    out.push_str("重要：不要主动读取此归档文件。仅当当前问题确实依赖已被移出的前文细节（如最初目标、之前的决定、旧报错、或更早的工具输出）而摘要中找不到答案时，才使用 read_file 分段读取（建议 offset=1, limit=200 起步）。若当前上下文足够回答问题，忽略此归档即可。\n");
     out
 }
 

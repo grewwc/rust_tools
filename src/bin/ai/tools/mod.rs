@@ -33,7 +33,6 @@ pub(crate) use registry::common::{
 };
 
 const BASELINE_TOOL_NAMES: &[&str] = &[
-    "discover_skills",
     "load_skill",
     "enable_tools",
     "read_file",

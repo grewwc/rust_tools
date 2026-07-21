@@ -58,6 +58,72 @@ pub(crate) fn render_line_excerpt(
     }
 }
 
+/// 检测内容是否带有 read_file 输出格式的行号前缀，若是则剥除所有嵌套层。
+///
+/// read_file 输出格式为 `{:>6}\t{content}`（6位右对齐行号 + tab + 内容）。
+/// 当这种输出被写入归档文件后再次被 read_file 读取时，会出现多层嵌套
+/// （如 `     1\t     1\t     1\t原始内容`）。此函数循环剥除所有外层行号前缀，
+/// 还原出原始内容。非 read_file 格式的内容原样返回。
+fn strip_nested_line_numbers(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return content.to_string();
+    }
+    // 快速判断：第一行必须以空格+数字+tab开头，否则不可能是 read_file 格式。
+    // 使用 split_once 避免对非匹配内容做全量解析。
+    if read_file_number_prefix_rest(lines[0]).is_none() {
+        return content.to_string();
+    }
+    // 逐行剥除行号前缀：只要行以"（空格）数字\t"开头就剥掉这一层，
+    // 直到不再匹配为止（处理多重嵌套）。
+    let stripped: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            let mut remaining = *line;
+            loop {
+                if let Some(rest) = read_file_number_prefix_rest(remaining) {
+                    remaining = rest;
+                } else {
+                    break;
+                }
+            }
+            remaining.to_string()
+        })
+        .collect();
+    stripped.join("\n")
+}
+
+fn read_file_number_prefix_rest(line: &str) -> Option<&str> {
+    let (num_part, rest) = line.split_once('\t')?;
+    // `render_line_excerpt` 使用 `{:>6}\t` 渲染行号；普通 TSV/日志里常见的
+    // `1\tfoo`/`12\tfoo` 不应被误判并剥离。
+    if num_part.chars().count() < 6 {
+        return None;
+    }
+    if !num_part.chars().all(|ch| ch == ' ' || ch.is_ascii_digit()) {
+        return None;
+    }
+    let trimmed = num_part.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(rest)
+}
+
+/// 仅对会话归档的 `overflow-history.md` 做嵌套行号剥离。
+///
+/// 普通用户文件里合法的 `123\t...`/TSV 内容不应被误判并篡改；而无限重读循环里
+/// 真正会出现 N 重行号嵌套的，正是归档历史文件中的旧 `read_file` 输出。
+fn should_strip_nested_line_numbers(file_path: &str) -> bool {
+    let path = std::path::Path::new(file_path);
+    path.file_name().and_then(|name| name.to_str()) == Some("overflow-history.md")
+        && path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".assets"))
+}
+
 fn truncate_chars_to_limit(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -122,7 +188,12 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
 
     let offset = args["offset"].as_u64().unwrap_or(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
-    let content = store.read_to_string().map_err(|e| e.to_string())?;
+    let raw_content = store.read_to_string().map_err(|e| e.to_string())?;
+    let content = if should_strip_nested_line_numbers(file_path) {
+        strip_nested_line_numbers(&raw_content)
+    } else {
+        raw_content
+    };
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     let start = offset.saturating_sub(1).min(total);
@@ -545,6 +616,36 @@ mod tests {
         assert!(!output.contains("line 11"));
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_strip_nested_line_numbers_preserves_plain_tabular_content() {
+        let content = "123\talpha\n124\tbeta";
+        assert_eq!(strip_nested_line_numbers(content), content);
+    }
+
+    #[test]
+    fn test_read_file_strips_nested_line_numbers_only_for_overflow_history() {
+        let session_assets = make_temp_path("overflow_history_assets").with_extension("assets");
+        fs::create_dir_all(&session_assets).unwrap();
+        let path = session_assets.join("overflow-history.md");
+        fs::write(&path, "     1\talpha\n     2\tbeta\n").unwrap();
+
+        let read_args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 100
+        });
+        let output = execute_read_file(&read_args).unwrap();
+        assert!(output.contains("     1\talpha"), "output: {output}");
+        assert!(output.contains("     2\tbeta"), "output: {output}");
+        assert!(
+            !output.contains("     1\t     1\talpha"),
+            "output should not contain nested line numbers: {output}"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&session_assets);
     }
 
     #[test]

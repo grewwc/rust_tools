@@ -2121,7 +2121,7 @@ make_llm_call_publisher | 一致 | 同一条 on_call complete callback
         let md = "\
 | | Skill 路由（已修复） | Agent 路由（你看到的问题） |
 | --- | --- | --- |
-| 代码机制 | skill_runtime.rs -> prepare_skill_for_turn TF-IDF 预激活 skill ✅ 已移除 ✅ 能，via discover_skills + activate_skill | agent_router.rs -> maybe_auto_route_agent TF-IDF + logistic regression 自动切换 agent ❌ 仍在 ❌ 不能，没有 activate_agent 工具 build prompt-skill 因为 \"Skill\" 命中了 prompt-skill agent 的 routing_tags |
+| 代码机制 | skill_runtime.rs -> prepare_skill_for_turn TF-IDF 预激活 skill ✅ 已移除 ✅ 能，仅保留显式 activate_skill | agent_router.rs -> maybe_auto_route_agent TF-IDF + logistic regression 自动切换 agent ❌ 仍在 ❌ 不能，没有 activate_agent 工具 build prompt-skill 因为 \"Skill\" 命中了 prompt-skill agent 的 routing_tags |
 ";
 
         let stream = render_full_stream(md, false);

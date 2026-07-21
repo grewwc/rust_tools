@@ -1065,27 +1065,7 @@ fn execute_tool_calls_with_suppressed_knowledge_search(
     })
 }
 
-const DISCOVER_SKILLS_FOLLOWUP_PREFIX: &str = "tool_followup:discover_skills\n";
 const PENDING_SUBAGENT_TASKS_FOLLOWUP_PREFIX: &str = "tool_followup:pending_subagent_tasks\n";
-
-fn build_discover_skills_followup_note(
-    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
-) -> String {
-    let mut note = String::from(DISCOVER_SKILLS_FOLLOWUP_PREFIX);
-    note.push_str("`discover_skills` only listed metadata and did not activate any skill.\n");
-    note.push_str("This is not a final answer. Continue the current turn:\n");
-    if allowed_tool_names.contains("activate_skill") {
-        note.push_str(
-            "- if one listed skill clearly matches the user's task, call `activate_skill` with its name to load its prompt and tools;\n",
-        );
-    }
-    if allowed_tool_names.contains("enable_tools") {
-        note.push_str("- otherwise enable the missing tools you need;\n");
-    }
-    note.push_str("- if no skill is actually needed, answer the user directly.\n");
-    note.push_str("Do not end the turn immediately after only listing skills.");
-    note
-}
 
 fn clear_pending_subagent_tasks_followup(messages: &mut Vec<Message>) {
     messages.retain(|message| {
@@ -1145,13 +1125,6 @@ fn reopen_turn_for_outstanding_subagent_tasks(
         reasoning_content: None,
     });
     true
-}
-
-fn requested_only_discover_skills(tool_calls: &[ToolCall]) -> bool {
-    !tool_calls.is_empty()
-        && tool_calls
-            .iter()
-            .all(|tool_call| tool_call.function.name == "discover_skills")
 }
 
 const TRUNCATION_RETRY_NOTE_PREFIX: &str = "tool_followup:output_truncated\n";
@@ -1245,33 +1218,6 @@ fn append_truncation_retry_note(
     messages.push(Message {
         role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    });
-}
-
-fn append_discover_skills_followup_note(
-    messages: &mut Vec<Message>,
-    _turn_messages: &mut Vec<Message>,
-    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
-) {
-    let note = build_discover_skills_followup_note(allowed_tool_names);
-    let already_present = messages.iter().any(|message| {
-        message.role == ROLE_INTERNAL_NOTE
-            && message
-                .content
-                .as_str()
-                .is_some_and(|content| content.starts_with(DISCOVER_SKILLS_FOLLOWUP_PREFIX))
-    });
-    if already_present {
-        return;
-    }
-    // 过程性提示：仅在本 turn 内下发给 LLM，引导模型在只 list 了 skills 后继续行动。
-    // 属于"仅当前回合有效"的纠偏提示，不写入 turn_messages 持久化轨道，避免跨 turn 重放。
-    messages.push(Message {
-        role: ROLE_INTERNAL_NOTE.to_string(),
-        content: serde_json::Value::String(note),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
@@ -1375,7 +1321,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     final_assistant_recorded: &mut bool,
     force_final_response: &mut bool,
     terminal_dedupe_candidate: &mut Option<String>,
-    no_active_skill: bool,
+    _no_active_skill: bool,
     iteration: usize,
     max_iterations: usize,
     consecutive_truncations: usize,
@@ -1565,8 +1511,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::ToolCall(tool_call_execution) => {
-            let discover_skills_only = no_active_skill
-                && requested_only_discover_skills(&tool_call_execution.stream_result.tool_calls);
             let repeated_read_only_call = !*force_final_response
                 && repeated_read_only_tool_request(
                     messages,
@@ -1615,13 +1559,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 &suppressed_knowledge_search_call_ids,
                 turn_had_tool_error,
             )?;
-            if discover_skills_only {
-                append_discover_skills_followup_note(
-                    messages,
-                    turn_messages,
-                    &tool_call_execution.allowed_tool_names,
-                );
-            }
             append_auto_image_followup_message(
                 app,
                 question,
@@ -2377,58 +2314,6 @@ mod tests {
 
         assert_eq!(exec_result.executed_tool_calls.len(), 1);
         assert_eq!(exec_result.tool_results.len(), 1);
-    }
-
-    #[test]
-    fn requested_only_discover_skills_detects_single_tool_round() {
-        let tool_calls = vec![ToolCall {
-            id: "call_1".to_string(),
-            tool_type: "function".to_string(),
-            function: FunctionCall {
-                name: "discover_skills".to_string(),
-                arguments: "{}".to_string(),
-            },
-        }];
-        assert!(requested_only_discover_skills(&tool_calls));
-    }
-
-    #[test]
-    fn requested_only_discover_skills_rejects_mixed_rounds() {
-        let tool_calls = vec![
-            ToolCall {
-                id: "call_1".to_string(),
-                tool_type: "function".to_string(),
-                function: FunctionCall {
-                    name: "discover_skills".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            },
-            ToolCall {
-                id: "call_2".to_string(),
-                tool_type: "function".to_string(),
-                function: FunctionCall {
-                    name: "enable_tools".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            },
-        ];
-        assert!(!requested_only_discover_skills(&tool_calls));
-    }
-
-    #[test]
-    fn discover_skills_followup_note_is_deduplicated() {
-        let mut messages = Vec::new();
-        let mut turn_messages = Vec::new();
-        let allowed: rust_tools::commonw::FastSet<String> =
-            ["enable_tools".to_string()].into_iter().collect();
-        append_discover_skills_followup_note(&mut messages, &mut turn_messages, &allowed);
-        append_discover_skills_followup_note(&mut messages, &mut turn_messages, &allowed);
-        let expected = build_discover_skills_followup_note(&allowed);
-        assert_eq!(messages.len(), 1);
-        // 过程性提示只进 messages（本 turn 内可见），不写入 turn_messages 持久化轨道。
-        assert!(turn_messages.is_empty());
-        assert_eq!(messages[0].role, ROLE_INTERNAL_NOTE);
-        assert_eq!(messages[0].content.as_str(), Some(expected.as_str()));
     }
 
     #[test]

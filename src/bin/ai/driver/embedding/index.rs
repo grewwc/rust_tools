@@ -12,7 +12,7 @@ use super::document::{SkillEmbeddingDocument, SkillEmbeddingDocumentSection};
 const SKILL_ROUTING_CATEGORY: &str = "skill-routing";
 const QUERY_EMBEDDING_CACHE_LIMIT: usize = 32;
 
-/// 短词条 query embedding 缓存：discover_skills / skill_match 每个 turn 都会查。
+/// 短词条 query embedding 缓存：skill_match / 本地 skill 排序会频繁复用。
 /// 用项目自带的 cw::LruCache（FxHashMap O(1) 查询 + 双向链表 O(1) 淘汰），
 /// 替代之前 Vec 线性扫描 + remove(0) 双 O(n) 实现。
 /// Value 用 Arc 避免命中时 clone 整个 f32 向量。

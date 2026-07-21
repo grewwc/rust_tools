@@ -686,12 +686,12 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
         .iter()
         .find_map(|m| {
             let text = m.content.as_str().unwrap_or_default();
-            text.contains("原始归档文件").then_some(text)
+            text.contains("归档文件:").then_some(text)
         })
         .expect("should include an explicit archive note");
     assert!(
         archive_text.contains("read_file"),
-        "archive note should give an explicit file-read action, got: {archive_text:?}"
+        "archive note should mention read_file as the mechanism to retrieve archive, got: {archive_text:?}"
     );
 
     let overflow_file = overflow_dir.join("overflow-history.md");
@@ -762,7 +762,7 @@ fn overflow_flush_failure_restores_dropped_messages_without_data_loss() {
         "flush 失败路径不得注入摘要 note"
     );
     assert!(
-        !joined.contains("原始归档文件"),
+        !joined.contains("长期记忆归档"),
         "flush 失败路径不得注入归档指针 note"
     );
 
@@ -817,7 +817,7 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
         .iter()
         .find_map(|m| {
             let text = m.content.as_str()?;
-            text.contains("Output preserved for non-compressible tool `read_file`")
+            text.contains("Output preserved for tool `read_file`")
                 .then_some(text.to_string())
         })
         .expect("expected preserved read_file overflow stub");
@@ -922,7 +922,7 @@ fn overflow_stub_recall_anchor_survives_compaction() {
     // 折叠后仍保留召回线索：compressed_tool_round note 或 stub 锚点二者至少其一。
     assert!(
         joined.contains("compressed_tool_round")
-            || joined.contains("Output preserved for non-compressible tool")
+            || joined.contains("Output preserved for tool")
             || joined.contains("read_file"),
         "compacted history must retain read_file recall anchors"
     );
@@ -975,7 +975,7 @@ fn compression_keeps_recent_non_compressible_tool_output_verbatim() {
         compressed.iter().all(|m| {
             m.content
                 .as_str()
-                .map(|s| !s.contains("Output preserved for non-compressible tool"))
+                .map(|s| !s.contains("Output preserved for tool"))
                 .unwrap_or(true)
         }),
         "recent non-compressible tool output must not be spilled to a stub"
@@ -1430,22 +1430,22 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         "mid-turn compression with overflow_dir must shrink payload \
          (before={reported_before}, after={reported_after})"
     );
-    // 应出现 read_file 外溢 stub，且其指向的文件真实存在（全文零压缩保存）。
-    let stub = compressed
-        .iter()
-        .find_map(|m| {
-            let text = m.content.as_str()?;
-            text.contains("Output preserved for non-compressible tool `read_file`")
-                .then_some(text.to_string())
-        })
-        .expect("expected preserved read_file overflow stub in mid-turn compression");
-    let file_path = stub
+    // 应出现 read_file 外溢召回锚点（可能是 Output preserved stub 或折叠后的
+    // compressed_tool_round note），且其指向的文件真实存在（全文零压缩保存）。
+    let all_contents: Vec<&str> = compressed.iter().filter_map(|m| m.content.as_str()).collect();
+    let joined = all_contents.join("\n");
+    let file_path = joined
         .lines()
-        .find_map(|line| line.trim().strip_prefix("- file_path: "))
-        .expect("stub should contain overflow file path");
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed.strip_prefix("- file_path: ").or_else(|| {
+                trimmed.split("file_path: ").nth(1).map(|p| p.trim())
+            })
+        })
+        .expect("compressed history should contain a file_path recall anchor for spilled read_file output");
     assert!(
         std::path::Path::new(file_path).exists(),
-        "overflow file from mid-turn stub should exist: {file_path}"
+        "overflow file from recall anchor should exist: {file_path}"
     );
 
     let _ = std::fs::remove_dir_all(&overflow_dir);

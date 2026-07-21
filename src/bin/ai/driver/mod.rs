@@ -82,7 +82,6 @@ pub use model::*;
 use process_context::*;
 use scheduler::*;
 use session::*;
-pub use skill_ranking::*;
 pub use text_similarity::*;
 
 tokio::task_local! {

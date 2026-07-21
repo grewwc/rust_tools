@@ -332,10 +332,12 @@ mod tests {
         let anchor = collapse_overflow_stub_to_anchor(&stub).expect("should collapse");
         // 预览正文被丢弃。
         assert!(!anchor.contains("Preview ("));
-        // file_path 与工具名召回锚点保留。
+        // file_path 保留。
         assert!(anchor.contains("- file_path: /tmp/session/read-abc.txt"));
-        assert!(anchor.contains("non-compressible tool `read_file`"));
-        assert!(anchor.contains("use read_file to inspect exact content."));
+        // 工具名保留（新格式用 "Output preserved for tool"）。
+        assert!(anchor.contains("Output preserved for tool `read_file`"));
+        // read_file 类型的归档有"通常无需重新读取"提示（而非旧的诱导式 "use read_file"）。
+        assert!(anchor.contains("之前读取文件的结果归档"));
         // 仍是合法 stub（前缀不变），后续压缩链继续按 stub 豁免识别。
         assert!(is_preserved_tool_overflow_stub(&anchor));
         // 体量骤降。
@@ -453,21 +455,37 @@ fn build_preserved_tool_overflow_stub(path: &Path, tool_name: &str, full_content
     // 仍把全文外溢到磁盘以控制上下文体积，但在 stub 内保留 head+tail 预览，
     // 让后续 turn 拥有"召回锚点"——模型据此判断是否真的需要重新 read_file，
     // 避免早期读到的代码被搬走后出现"失忆/反复重读"。
+    // 提示文案保持中性：明确告知"仅在需要完整内容时才读取"，防止 LLM 看到
+    // file_path 就无条件重读导致外溢→重读→再外溢的无限循环。
     let preview = build_overflow_content_preview(full_content);
+    let tool_hint = if tool_name == "read_file" || tool_name == "read_file_lines" {
+        "（这是之前读取文件的结果归档；除非你需要重新查看该文件的完整内容且预览不足，否则不要重新读取。）"
+    } else {
+        "（如需查看完整输出，可用 read_file 读取此文件；若预览已足够回答问题则忽略。）"
+    };
     format!(
         "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
-         Output preserved for non-compressible tool `{tool_name}`. Full result moved to session temp file:\n\
-         - file_path: {}\n- use read_file to inspect exact content.\n{preview}",
+         Output preserved for tool `{tool_name}`. Full result saved to session asset:\n\
+         - file_path: {}\n{tool_hint}\n{preview}",
         path.display()
     )
 }
 
 fn is_preserved_tool_overflow_stub(text: &str) -> bool {
     let text = text.trim_start();
-    text.starts_with(PRESERVED_TOOL_OVERFLOW_STUB_PREFIX)
-        || (text.starts_with(LEGACY_PRESERVED_TOOL_OVERFLOW_STUB_PREFIX)
-            && text.contains("\n- file_path: ")
-            && text.contains("\n- use read_file to inspect exact content."))
+    if text.starts_with(PRESERVED_TOOL_OVERFLOW_STUB_PREFIX) {
+        return text.contains("\n- file_path: ");
+    }
+    // Legacy formats (older sessions):
+    // - "Output preserved for non-compressible tool `..."  (pre-refactor)
+    // - "Output preserved for tool `..."                   (new format)
+    if (text.starts_with(LEGACY_PRESERVED_TOOL_OVERFLOW_STUB_PREFIX)
+        || text.starts_with("Output preserved for tool `"))
+        && text.contains("\n- file_path: ")
+    {
+        return true;
+    }
+    false
 }
 
 /// 把一条已外溢的 tool overflow stub 的 head+tail 预览体收敛为「单行召回锚点」
@@ -489,19 +507,30 @@ fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
     if !text.contains("Preview (") {
         return None;
     }
+    // 支持新旧两种格式解析 tool_name
     let tool_name = text
         .split_once("non-compressible tool `")
         .and_then(|(_, rest)| rest.split_once('`'))
-        .map(|(name, _)| name.to_string())?;
+        .map(|(name, _)| name.to_string())
+        .or_else(|| {
+            text.split_once("Output preserved for tool `")
+                .and_then(|(_, rest)| rest.split_once('`'))
+                .map(|(name, _)| name.to_string())
+        })?;
     let file_path = text
         .lines()
         .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
         .map(str::trim)
         .filter(|p| !p.is_empty())?;
+    let tool_hint = if tool_name == "read_file" || tool_name == "read_file_lines" {
+        "（这是之前读取文件的结果归档；通常无需重新读取。）"
+    } else {
+        "（如需完整输出可用 read_file 读取。）"
+    };
     Some(format!(
         "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
-         Output preserved for non-compressible tool `{tool_name}`. Full result moved to session temp file:\n\
-         - file_path: {file_path}\n- use read_file to inspect exact content."
+         Output preserved for tool `{tool_name}`. Full result saved to session asset:\n\
+         - file_path: {file_path}\n{tool_hint}"
     ))
 }
 

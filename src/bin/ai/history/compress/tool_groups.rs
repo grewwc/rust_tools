@@ -201,9 +201,23 @@ fn tool_result_recall_text(
         .find(|line| line.starts_with("- file_path:") || line.starts_with("file_path:"))?;
 
     if tool_name == "execute_command" && !already_archived {
+        let recall = command_result_recall(result_text);
+        let recall_lower = recall.to_ascii_lowercase();
+        let has_error_signal = recall_lower.contains("error")
+            || recall_lower.contains("failed")
+            || recall_lower.contains("panic")
+            || recall_lower.contains("blocked")
+            || recall_lower.contains("aborting")
+            || recall_lower.contains("could not compile");
+        if has_error_signal {
+            return Some(format!(
+                "{}\n  {path}\n  - 命令输出包含错误信号；如需完整诊断日志，可用 read_file 读取以上文件。",
+                recall,
+            ));
+        }
         return Some(format!(
-            "{}\n  {path}\n  - use read_file to inspect exact diagnostics.",
-            command_result_recall(result_text),
+            "{}\n  {path}",
+            recall,
         ));
     }
 

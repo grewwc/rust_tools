@@ -458,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known TF-IDF ranking false-positive; no longer affects skill selection since pre-routing was removed — TF-IDF now only sorts discover_skills results, LLM makes the final call"]
+    #[ignore = "known TF-IDF ranking false-positive; local ranking is no longer used to auto-select skills, so this remains a documentation/regression case only"]
     fn markdown_fix_query_does_not_route_to_feishu_export_skill() {
         let skills = vec![
             skill(

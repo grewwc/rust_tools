@@ -269,7 +269,7 @@ fn dedupe_tools_by_name(tools: Vec<ToolDef>) -> Vec<ToolDef> {
 }
 
 fn required_baseline_tool_names() -> Vec<String> {
-    // discovery / 自助能力 + 基础只读 / 检索能力 + 子 Agent 编排能力：
+    // 入口 / 自助能力 + 基础只读 / 检索能力 + 子 Agent 编排能力：
     // 这些都是白名单 skill 替换工具集时也必须常驻补回的 baseline。与进程级
     // allowed_tools whitelist 共享同一份清单，避免"schema 里可见，但执行时被
     // whitelist 拦掉"的分叉。
@@ -934,29 +934,17 @@ fn build_system_prompt(
         }
         let mut discovery_lines = Vec::new();
         if skill.is_none() {
-            if has_tool(available_tools, "discover_skills") {
+            discovery_lines.push(
+                "Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.".to_string(),
+            );
+            if has_tool(available_tools, "activate_skill") {
                 discovery_lines.push(
-                    "Not all tools are loaded. Use `discover_skills` for specialized workflows, or `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for specific tools.".to_string(),
-                );
-                discovery_lines.push(
-                    "If the user names a workflow, tool, product, or domain that likely maps to a local skill (for example an internal service, CLI, log system, or incident workflow), call `discover_skills` with the named keyword before inventing commands.".to_string(),
-                );
-                if has_tool(available_tools, "activate_skill") {
-                    discovery_lines.push(
-                        "After `discover_skills`, if one listed skill clearly matches the task, call `activate_skill(name=...)` to load its prompt and tools. Do not activate a skill that does not clearly match.".to_string(),
-                    );
-                }
-                discovery_lines.push(
-                    "No skill is active yet. Prefer `discover_skills` before a freeform response only when the task is specialized, tool-heavy, or likely covered by an installed skill.".to_string(),
-                );
-            } else {
-                discovery_lines.push(
-                    "Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.".to_string(),
-                );
-                discovery_lines.push(
-                    "No skill is active yet. Prefer enabling only the specific tools you need when the task is specialized or tool-heavy.".to_string(),
+                    "If the user explicitly names an installed skill and it clearly matches the task, call `activate_skill(name=...)` directly. Do not activate a skill speculatively.".to_string(),
                 );
             }
+            discovery_lines.push(
+                "No skill is active yet. Prefer enabling only the specific tools you need when the task is specialized or tool-heavy.".to_string(),
+            );
         } else {
             discovery_lines.push(
                 "Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.".to_string(),
@@ -1331,13 +1319,13 @@ pub(super) fn prepare_skill_for_turn(
         }
     }
 
-    // 不做任何自动 skill 激活：交给 LLM 在需要时通过 discover_skills /
-    // activate_skill 自主选择。cross-turn sticky 也已移除——浅层 Jaccard
+    // 不做任何自动 skill 激活：交给 LLM 在需要时通过 activate_skill 显式选择，
+    // 或直接使用现有工具完成任务。cross-turn sticky 也已移除——浅层 Jaccard
     // 匹配无法区分"追问同一 skill"与"恰好共享 token 的不同话题"。
     let skill: Option<&SkillManifest> = None;
 
     if debug {
-        eprintln!("[skills] no auto-activation; LLM may discover_skills if needed");
+        eprintln!("[skills] no auto-activation; explicit activate_skill only");
     }
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
     let skip_recall_by_skill = should_skip_recall_for_skill(skill);
@@ -1413,14 +1401,15 @@ mod tests {
     }
 
     #[test]
-    fn default_tools_start_with_core_discovery_and_editing() {
+    fn default_tools_start_with_core_skill_controls_and_editing() {
         let tools = builtin_tools_for_skill(None, None);
         let names = tools
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "enable_tools"));
-        assert!(names.iter().any(|name| name == "discover_skills"));
+        assert!(names.iter().any(|name| name == "activate_skill"));
+        assert!(names.iter().any(|name| name == "load_skill"));
         assert!(names.iter().any(|name| name == "code_search"));
         assert!(names.iter().any(|name| name == "read_file"));
         assert!(names.iter().any(|name| name == "knowledge_save"));
@@ -1633,7 +1622,6 @@ mod tests {
         available.insert("read_file".to_string());
         available.insert("apply_patch".to_string());
         available.insert("enable_tools".to_string());
-        available.insert("discover_skills".to_string());
 
         let prompt =
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
@@ -1813,41 +1801,39 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_reminds_model_to_check_skills_when_unsure() {
+    fn system_prompt_mentions_direct_skill_activation_when_available() {
         let mut available = SkipSet::new(16);
         available.insert("enable_tools".to_string());
-        available.insert("discover_skills".to_string());
+        available.insert("activate_skill".to_string());
         let prompt =
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
-        assert!(prompt.contains("discover_skills"));
+        assert!(prompt.contains("activate_skill"));
         assert!(prompt.contains("enable_tools"));
+        assert!(!prompt.contains("discover_skills"));
     }
 
     #[test]
-    fn system_prompt_prefers_discover_skills_before_freeform_when_no_skill_active() {
+    fn system_prompt_prefers_enable_tools_when_no_skill_active() {
         let mut available = SkipSet::new(16);
         available.insert("enable_tools".to_string());
-        available.insert("discover_skills".to_string());
         let prompt =
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
-        assert!(prompt.contains("discover_skills"));
         assert!(prompt.contains("No skill is active yet"));
-        assert!(prompt.contains("only when the task is specialized, tool-heavy"));
-        assert!(prompt.contains("call `discover_skills` with the named keyword"));
+        assert!(prompt.contains("enable_tools(operation=list)"));
+        assert!(prompt.contains("enabling only the specific tools you need"));
     }
 
     #[test]
-    fn system_prompt_omits_discover_skills_guidance_when_tool_is_unavailable() {
+    fn system_prompt_never_mentions_discover_skills() {
         let mut available = SkipSet::new(16);
         available.insert("enable_tools".to_string());
         let prompt =
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
         assert!(prompt.contains("enable_tools(operation=list)"));
-        assert!(!prompt.contains("call `discover_skills` with the named keyword"));
-        assert!(!prompt.contains("After `discover_skills`"));
+        assert!(!prompt.contains("discover_skills"));
     }
 
     #[test]
@@ -2330,7 +2316,6 @@ mod tests {
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"enable_tools".to_string()));
-        assert!(names.contains(&"discover_skills".to_string()));
         assert!(names.contains(&"code_search".to_string()));
         // 基础只读 / 检索能力应作为 baseline 常驻补回，避免窄白名单 skill 把
         // read_file 等最基本的阅读工具剔除，导致主 Agent 连用户点名的文件都读不了。
