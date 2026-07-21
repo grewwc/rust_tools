@@ -7,6 +7,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 use std::path::Path;
 
+use crate::ai::types::ToolCall;
+
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
 use super::text_utils::truncate_to_chars;
 use super::tool_overflow::{
@@ -160,7 +162,11 @@ pub(super) fn fold_tool_call_group_to_stub(
             })
             .unwrap_or_default();
         let recall = tool_result_recall_text(&tc.function.name, &result_text, overflow_dir)?;
-        lines.push(format!("- {} => {}", tc.function.name, recall));
+        let invocation = tool_call_invocation_recall(tc);
+        lines.push(format!(
+            "- {}{} => {}",
+            tc.function.name, invocation, recall
+        ));
     }
     if tool_calls.len() > 8 {
         lines.push(format!(
@@ -176,6 +182,48 @@ pub(super) fn fold_tool_call_group_to_stub(
         tool_call_id: None,
         reasoning_content: None,
     })
+}
+
+/// `execute_command` 的结果本身无法说明它回答的是哪个问题。工具组折叠会移除
+/// 原始 tool_call，因此必须把命令和 cwd 留在召回文本中；否则多个「成功但无输出」
+/// 的 git log 会退化成无法区分的记录，模型会把它当作尚未执行而重新开始排查。
+fn tool_call_invocation_recall(tool_call: &ToolCall) -> String {
+    if tool_call.function.name != "execute_command" {
+        return String::new();
+    }
+
+    let args = serde_json::from_str::<Value>(&tool_call.function.arguments).ok();
+    let command = args
+        .as_ref()
+        .and_then(|args| args.get("command"))
+        .and_then(Value::as_str)
+        .map(|command| truncate_to_chars(&normalize_whitespace(command), 720));
+    let cwd = args
+        .as_ref()
+        .and_then(|args| args.get("cwd"))
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(|cwd| truncate_to_chars(&normalize_whitespace(cwd), 240));
+
+    let mut fields = Vec::with_capacity(2);
+    if let Some(command) = command.filter(|command| !command.is_empty()) {
+        fields.push(format!("command: {command}"));
+    }
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
+        fields.push(format!("cwd: {cwd}"));
+    }
+    if fields.is_empty() {
+        let args = truncate_to_chars(&normalize_whitespace(&tool_call.function.arguments), 240);
+        if !args.is_empty() {
+            fields.push(format!("arguments: {args}"));
+        }
+    }
+
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", fields.join("; "))
+    }
 }
 
 /// 为工具组折叠生成结果召回文本。高精度结果在移除原始消息前必须先归档；若归档

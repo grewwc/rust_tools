@@ -1430,22 +1430,32 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         "mid-turn compression with overflow_dir must shrink payload \
          (before={reported_before}, after={reported_after})"
     );
-    // 应出现 read_file 外溢召回锚点（可能是 Output preserved stub 或折叠后的
-    // compressed_tool_round note），且其指向的文件真实存在（全文零压缩保存）。
-    let all_contents: Vec<&str> = compressed.iter().filter_map(|m| m.content.as_str()).collect();
-    let joined = all_contents.join("\n");
-    let file_path = joined
-        .lines()
-        .find_map(|line| {
-            let trimmed = line.trim();
-            trimmed.strip_prefix("- file_path: ").or_else(|| {
-                trimmed.split("file_path: ").nth(1).map(|p| p.trim())
-            })
+    // 契约：不可压缩的 read_file 结果被压缩后，必须留下可回读的 file_path 召回锚点，
+    // 且其指向的会话归档文件真实存在、全文零压缩保存。召回锚点有两种合法形态，取决于
+    // 命中的压缩路径（二者都携带指向归档文件的 `file_path:`，断言召回契约而非某条路径
+    // 的字面文案）：
+    //   - spill stub：`Output preserved for tool `read_file` ... - file_path: ...`
+    //   - fold note ：`compressed_tool_round: ... - read_file => - file_path: ...`
+    let recall = compressed
+        .iter()
+        .find_map(|m| {
+            let text = m.content.as_str()?;
+            (text.contains("read_file") && text.contains("file_path: "))
+                .then_some(text.to_string())
         })
-        .expect("compressed history should contain a file_path recall anchor for spilled read_file output");
+        .expect("expected read_file recall anchor (file_path) after mid-turn compression");
+    let file_path = recall
+        .split("file_path: ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("recall anchor should carry an overflow file path");
+    let archived = std::fs::read(file_path).unwrap_or_else(|e| {
+        panic!("overflow file referenced by recall anchor should exist: {file_path}: {e}")
+    });
     assert!(
-        std::path::Path::new(file_path).exists(),
-        "overflow file from recall anchor should exist: {file_path}"
+        archived.len() >= 8000,
+        "archived read_file output must preserve full content (zero-compression), got {} bytes",
+        archived.len()
     );
 
     let _ = std::fs::remove_dir_all(&overflow_dir);
