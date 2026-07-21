@@ -222,8 +222,18 @@ const MERGED_SINGLE_NOTE_MAX_CHARS: usize = 1_200;
 /// 本身随着长期会话无限增长。
 const REQUEST_CONTEXT_CHECKPOINT_LIMIT: usize = 8;
 
-fn is_context_checkpoint_marker(text: &str) -> bool {
-    text.trim_start().starts_with("[context_checkpoint ")
+/// checkpoint marker 是压缩后重新定位归档正文的短索引，写入端**始终**是
+/// `role=internal_note`（见 `history::compress::is_context_checkpoint_marker`）。
+/// 请求归一化会把 marker 收集后拼进一条独立 `system` 消息注入模型，因此这里
+/// **必须同时校验 role**：若仅按 content 前缀识别，任何 user/tool/assistant
+/// 正文只要以 `[context_checkpoint ` 开头就会被提权成 system 指令并注入——
+/// 一条跨信任边界的 prompt 注入通道。合法 marker（internal_note）行为不变。
+fn is_context_checkpoint_marker(message: &Message) -> bool {
+    is_internal_note_role(&message.role)
+        && message
+            .content
+            .as_str()
+            .is_some_and(|text| text.trim_start().starts_with("[context_checkpoint "))
 }
 
 pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
@@ -541,14 +551,8 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
 
     let checkpoint_markers = messages
         .iter()
-        .filter_map(|message| {
-            message
-                .content
-                .as_str()
-                .map(str::trim)
-                .filter(|text| is_context_checkpoint_marker(text))
-                .map(str::to_string)
-        })
+        .filter(|message| is_context_checkpoint_marker(message))
+        .filter_map(|message| message.content.as_str().map(|text| text.trim().to_string()))
         .collect::<Vec<_>>();
 
     let mut merged_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
@@ -559,7 +563,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
-        if is_context_checkpoint_marker(text) {
+        if is_context_checkpoint_marker(message) {
             continue;
         }
         if idx == first_system_idx {
@@ -578,11 +582,10 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     let mut merged_first = messages[first_system_idx].clone();
     merged_first.role = ROLE_SYSTEM.to_string();
     merged_first.content = normalize_system_like_content_for_request(&merged_first.content);
-    if merged_first
-        .content
-        .as_str()
-        .is_some_and(is_context_checkpoint_marker)
-    {
+    // 用**原始**消息（role 尚未被改写为 system）判定 checkpoint marker：merged_first
+    // 的 role 已被上一行改成 ROLE_SYSTEM，若拿它判定会因 role 校验失败而漏掉合法
+    // marker 的清空处理。
+    if is_context_checkpoint_marker(&messages[first_system_idx]) {
         merged_first.content = Value::String(String::new());
     }
     if let Some(base) = merged_first.content.as_str() {
@@ -632,11 +635,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         if idx == first_system_idx {
             continue;
         }
-        if message
-            .content
-            .as_str()
-            .is_some_and(is_context_checkpoint_marker)
-        {
+        if is_context_checkpoint_marker(message) {
             // 所有 checkpoint 都集中投影到请求前缀并限量，不能让历史尾部的 marker
             // 随会话增长；持久化 history 保留完整记录，后续请求只带最近若干条。
             continue;

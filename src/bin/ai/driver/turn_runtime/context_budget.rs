@@ -434,11 +434,10 @@ fn protected_messages_preserved(messages: &[Message], protected: &[ProtectedMess
 }
 
 fn message_chars(message: &Message) -> usize {
-    match &message.content {
-        Value::String(text) => text.chars().count(),
-        Value::Array(parts) => parts.iter().map(value_chars).sum(),
-        other => other.to_string().chars().count(),
-    }
+    // 统一走 history 层的权威计费口径（含 content + tool_calls + reasoning_content，
+    // 图片按名义成本），避免此处只算 content 导致带大 tool_calls/reasoning 的消息
+    // 在预算门控里被低估。
+    crate::ai::history::message_billable_chars(message)
 }
 
 fn content_text_is_empty(content: &Value) -> bool {
@@ -463,16 +462,6 @@ fn message_text(content: &Value) -> String {
             .join("\n"),
         other => other.to_string(),
     }
-}
-
-fn value_chars(value: &Value) -> usize {
-    if let Some(text) = value.get("text").and_then(Value::as_str) {
-        return text.chars().count();
-    }
-    if value.get("image_url").is_some() {
-        return 1024;
-    }
-    value.to_string().chars().count()
 }
 
 #[cfg(test)]

@@ -25,11 +25,14 @@ pub(in crate::ai) use compress::compress_messages_for_context;
 pub(in crate::ai) use compress::value_to_string;
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::{
-    is_summary_note_text, messages_total_chars_pub, mid_turn_compress, mid_turn_llm_summarize,
+    is_summary_note_text, message_billable_chars, messages_total_chars_pub, mid_turn_compress,
+    mid_turn_llm_summarize,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use markdown::messages_to_markdown;
 pub(in crate::ai) use sessions::generate_session_summary;
+#[allow(unused_imports)]
+pub(in crate::ai) use sessions::strip_think_tags;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
 #[allow(unused_imports)]
@@ -322,7 +325,11 @@ async fn compact_session_history_with_app_inner(
     }
 
     let messages = if blob::is_sqlite_path(history_file) {
-        sqlite::build_message_arr_sqlite(usize::MAX, history_file.as_path())?
+        // 用**原始** raw read，而非 build_message_arr_sqlite（后者会先跑启发式
+        // compact_persisted_history）。app-aware 压缩必须看到未经启发式压缩的原文，
+        // 语义与非-sqlite 分支的 parse_history_blob 对齐；随后压缩函数内部照常
+        // sanitize_persisted_history_messages。
+        sqlite::read_all_messages_sqlite(history_file.as_path())?
     } else {
         let history = match std::fs::read_to_string(history_file) {
             Ok(history) => history,

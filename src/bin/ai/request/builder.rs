@@ -64,11 +64,7 @@ const CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS: usize = 2_048;
 fn estimate_prompt_tokens(messages: &[Message]) -> usize {
     let chars: usize = messages
         .iter()
-        .map(|m| {
-            super::super::history::value_to_string(&m.content)
-                .chars()
-                .count()
-        })
+        .map(super::super::history::message_billable_chars)
         .sum();
     chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
 }

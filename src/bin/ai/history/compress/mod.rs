@@ -574,6 +574,15 @@ fn shrink_messages_to_fit(
         overflow_dir,
     );
 
+    // 先无条件外溢体量过大的旧 user/图片消息（保护尾窗除外），与
+    // `shrink_messages_to_fit_with_summary` 保持一致。图片在预算里只按名义成本
+    // 计费、大 user 原文零压缩搬盘为 stub 后，下面的裁剪循环因
+    // `is_preserved_user_or_image_stub` 自动跳过它们——避免旧 user 被通用裁剪
+    // 直接 `remove` 掉（那违反分类给 RecentUser 的 OffloadOnly 语义、静默丢原文）。
+    if let Some(dir) = overflow_dir {
+        spill_oversized_preserved_messages(&mut messages, dir);
+    }
+
     if messages_total_chars(&messages) <= max_chars {
         return messages;
     }
@@ -601,6 +610,23 @@ fn shrink_messages_to_fit(
             continue;
         }
         if let Some(idx) = first_trim_candidate(&messages) {
+            // 旧 user（含图片的多模态 user）绝不静默删除：这是分类给 RecentUser 的
+            // OffloadOnly 语义。先尝试把原文零压缩搬到归档文件、替换成回指 stub；
+            // 搬盘成功则继续裁剪循环。
+            if messages[idx].role == "user" {
+                if let Some(dir) = overflow_dir
+                    && try_spill_preserved_message_to_stub(&mut messages, dir)
+                {
+                    continue;
+                }
+                // 无法外溢（无 overflow_dir 或体量过小、上面的 proactive spill 已处理
+                // 掉所有超阈值 user）：直接跳出裁剪循环，绝不 `remove` 掉 user 原文。
+                // 残余的轻微超阈值交由上层硬阈值 `mid_turn_llm_summarize` 兜底，
+                // 避免同一小 user 被反复选中造成死循环。
+                break;
+            }
+            // 其余可裁候选（assistant 纯叙述等，first_trim_candidate 已排除 tool
+            // 与带 tool_calls 的 assistant）保持原样删除。
             messages.remove(idx);
             continue;
         }
@@ -790,6 +816,16 @@ fn shrink_messages_to_fit_with_summary(
                         },
                     );
                 }
+            } else {
+                // flush 失败：绝不删历史。把本轮已从 messages 移除、但尚未成功
+                // 落盘的 dropped 按原相对顺序放回头部（dropped 在循环中按时间升序
+                // 累积，且整组 tool_call/tool 作为连续块放入，故放回头部即恢复
+                // 原始时序、不破坏配对），随后立即返回——跳过摘要/归档 note 注入
+                //（防止产生没有对应归档文件的悬空指针 note）、truncate 与 reasoning
+                // 清理。返回值可能仍超预算，但那是可恢复的（下轮重试压缩 / 请求层
+                // clamp），而数据丢失不可逆——遵守“写入失败严禁删除历史”的既有教训。
+                messages.splice(0..0, dropped);
+                return messages;
             }
         } else if dropped_has_user_turn
             && !has_leading_summary_now
@@ -868,7 +904,7 @@ fn truncate_first_message_to_fit(messages: &mut [Message], max_chars: usize) {
 fn messages_total_chars(messages: &[Message]) -> usize {
     messages
         .iter()
-        .map(|m| value_len_chars(&m.content))
+        .map(message_billable_chars)
         .sum::<usize>()
 }
 
@@ -1139,6 +1175,36 @@ fn value_len_chars(v: &Value) -> usize {
         return arr.iter().map(content_part_budget_chars).sum();
     }
     v.to_string().chars().count()
+}
+
+/// 单条消息进入模型请求时的「计费字符数」——唯一权威口径。
+///
+/// 历史上多处预算只统计 `content`，把 `tool_calls[].function.arguments`
+/// （典型 `apply_patch` 会把整份大补丁放进 arguments、content 为空）与
+/// `reasoning_content`（thinking 模式的长思维链）完全漏算，导致大消息
+/// 绕过压缩门控、TPM preflight 与 max_tokens clamp 一起低估输入。
+///
+/// 这里把三者合并计量，与 SQL 端 `total_message_chars_sqlite`
+/// （`length(content)+length(tool_calls)+length(reasoning_content)`）对齐，
+/// 使「内存态预算」与「持久化预算」共用同一口径。图片仍按
+/// [`IMAGE_BUDGET_CHARS`] 名义计费（见 `value_len_chars`）。
+pub(in crate::ai) fn message_billable_chars(m: &Message) -> usize {
+    let content_chars = value_len_chars(&m.content);
+    let tool_call_chars = m
+        .tool_calls
+        .as_ref()
+        .map(|tc| {
+            serde_json::to_string(tc)
+                .map(|s| s.chars().count())
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let reasoning_chars = m
+        .reasoning_content
+        .as_deref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+    content_chars + tool_call_chars + reasoning_chars
 }
 
 pub(in crate::ai) fn value_to_string(v: &Value) -> String {

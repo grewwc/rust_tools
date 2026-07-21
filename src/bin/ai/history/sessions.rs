@@ -692,8 +692,99 @@ fn truncate_summary(s: &str, max_len: usize) -> String {
     out
 }
 
+/// 会话标题清洗共用的冗余前缀清单（请求壳 / 疑问词）。
+///
+/// 历史上 `strip_request_filler_prefixes` 与 `strip_filler_prefixes` 各维护一份
+/// 几乎相同的数组，且前者**缺** 如何/怎么/怎样，导致“如何实现 X”经 LLM 标题
+/// 路径与 fallback 摘要路径清洗结果不一致。这里合并为唯一真源，两处共用。
+///
+/// **顺序即匹配优先级**：strip 循环按数组顺序贪婪匹配，长复合前缀必须排在其
+/// 短子串之前（如 "你帮我看一下" 在 "帮我" 之前），否则会先剥掉短前缀、留下
+/// 半截壳。新增项请遵守“长前缀在前、短词垫后”。
+const SESSION_TITLE_FILLER_PREFIXES: &[&str] = &[
+    "你帮我看一下",
+    "你帮我给",
+    "请帮我给",
+    "麻烦帮我给",
+    "帮我看一下",
+    "帮我给",
+    "能不能帮我",
+    "可以帮我",
+    "麻烦帮我",
+    "请帮我",
+    "你帮我",
+    "帮我",
+    "请",
+    "麻烦",
+    "拜托",
+    "求",
+    "我想",
+    "我想要",
+    "我需要",
+    "希望",
+    "希望能",
+    "想问一下",
+    "问一下",
+    "请问",
+    "想知道",
+    "看一下",
+    "帮看看",
+    "看看",
+    "如何",
+    "怎么",
+    "怎样",
+];
+
+/// 移除模型输出里的 `<think>...</think>` 思维链，返回可作标题的纯净正文。
+///
+/// 背景：部分模型（thinking 模式）会把思维链包在 `<think>` 标签里连同答案一起
+/// 返回。若不剥离，`.lines().next()` 会截到 `<think>` 首行、且
+/// `is_low_quality_session_title("<think>")` 判为合格，导致思维链碎片被写成标题。
+///
+/// 规则：大小写不敏感匹配 `<think>` / `</think>`；成对出现的整段删除；出现未闭合
+/// 的 `<think>`（有起始无结束）时，截断到该 `<think>` 之前的内容（思维链往往后置，
+/// 其前的正文才是答案）。非 think 文本原样保留。
+pub(in crate::ai) fn strip_think_tags(text: &str) -> String {
+    // 直接在原串上按 ASCII 大小写不敏感定位标签字节，避免先 `to_lowercase()`
+    // 再按其索引回切 `text`——某些 Unicode 字符小写后字节长度会变，导致索引错位。
+    fn find_ci(haystack: &str, needle_lower: &str, from: usize) -> Option<usize> {
+        let bytes = haystack.as_bytes();
+        let nlen = needle_lower.len();
+        if nlen == 0 || from + nlen > bytes.len() {
+            return None;
+        }
+        (from..=bytes.len() - nlen).find(|&i| {
+            bytes[i..i + nlen]
+                .iter()
+                .zip(needle_lower.bytes())
+                .all(|(b, n)| b.to_ascii_lowercase() == n)
+        })
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(open) = find_ci(text, "<think>", cursor) {
+        out.push_str(&text[cursor..open]);
+        let after_open = open + "<think>".len();
+        match find_ci(text, "</think>", after_open) {
+            Some(close) => {
+                // 跳过整段 `<think>...</think>`，从闭合标签之后继续。
+                cursor = close + "</think>".len();
+            }
+            None => {
+                // 未闭合：丢弃 `<think>` 起始之后的全部内容。
+                return out.trim().to_string();
+            }
+        }
+    }
+    out.push_str(&text[cursor..]);
+    out.trim().to_string()
+}
+
 /// 清洗模型生成的 session 标题，避免把“帮我/请问”等请求壳写进标题。
 pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
+    // 先剥离思维链：防御纵深，覆盖 finalize 直接把 LLM 原文交进来的路径。
+    let title = strip_think_tags(title);
     let first_line = title.lines().next().unwrap_or("").trim();
     if is_preserved_content_message(first_line) {
         return String::new();
@@ -727,41 +818,12 @@ pub(super) fn is_preserved_content_message(text: &str) -> bool {
 }
 
 fn strip_request_filler_prefixes(mut text: &str) -> (&str, bool) {
-    let fillers = [
-        "你帮我看一下",
-        "你帮我给",
-        "请帮我给",
-        "麻烦帮我给",
-        "帮我看一下",
-        "帮我给",
-        "能不能帮我",
-        "可以帮我",
-        "麻烦帮我",
-        "请帮我",
-        "你帮我",
-        "帮我",
-        "请",
-        "麻烦",
-        "拜托",
-        "求",
-        "我想",
-        "我想要",
-        "我需要",
-        "希望",
-        "希望能",
-        "想问一下",
-        "问一下",
-        "请问",
-        "想知道",
-        "看一下",
-        "帮看看",
-        "看看",
-    ];
+    let fillers = SESSION_TITLE_FILLER_PREFIXES;
     let mut stripped_any = false;
     loop {
         let mut stripped = false;
         let trimmed = text.trim_start();
-        for filler in &fillers {
+        for filler in fillers {
             if let Some(rest) = trimmed.strip_prefix(filler) {
                 text = rest.trim_start();
                 stripped = true;
@@ -840,43 +902,11 @@ fn extract_first_sentence(text: &str) -> String {
 
 /// 去掉常见的冗余前缀，使标题更简洁概括。
 fn strip_filler_prefixes(text: &str) -> String {
-    let fillers = [
-        "你帮我看一下",
-        "你帮我给",
-        "请帮我给",
-        "麻烦帮我给",
-        "帮我看一下",
-        "帮我给",
-        "能不能帮我",
-        "可以帮我",
-        "麻烦帮我",
-        "请帮我",
-        "你帮我",
-        "帮我",
-        "请",
-        "麻烦",
-        "拜托",
-        "求",
-        "我想",
-        "我想要",
-        "我需要",
-        "希望",
-        "希望能",
-        "想问一下",
-        "问一下",
-        "请问",
-        "想知道",
-        "看一下",
-        "帮看看",
-        "看看",
-        "如何",
-        "怎么",
-        "怎样",
-    ];
+    let fillers = SESSION_TITLE_FILLER_PREFIXES;
     let mut t = text.trim();
     loop {
         let mut stripped = false;
-        for filler in &fillers {
+        for filler in fillers {
             if let Some(rest) = t.strip_prefix(filler) {
                 t = rest.trim_start();
                 stripped = true;
@@ -894,7 +924,7 @@ fn strip_filler_prefixes(text: &str) -> String {
 mod tests {
     use super::{
         SessionStore, generate_session_summary, is_low_quality_session_title,
-        normalize_generated_session_title,
+        normalize_generated_session_title, strip_think_tags,
     };
     use crate::ai::history::{Message, append_history_messages};
     use serde_json::Value;
@@ -951,6 +981,29 @@ mod tests {
 
         assert!(is_low_quality_session_title(stub));
         assert!(normalize_generated_session_title(stub).is_empty());
+    }
+
+    #[test]
+    fn strip_think_tags_removes_reasoning_and_keeps_real_title() {
+        // 成对标签：整段思维链被移除，仅保留其后的真标题。
+        assert_eq!(
+            strip_think_tags("<think>让我想想用户到底要什么</think>\n优化上下文压缩逻辑"),
+            "优化上下文压缩逻辑"
+        );
+        // 大小写不敏感。
+        assert_eq!(
+            strip_think_tags("<Think>reasoning</THINK>Session 标题修复"),
+            "Session 标题修复"
+        );
+        // 未闭合：截断到 `<think>` 之前，答案在前时仍能保留。
+        assert_eq!(
+            strip_think_tags("真正的标题<think>后面是没写完的思维链"),
+            "真正的标题"
+        );
+        // 无标签：原样返回（仅 trim）。
+        assert_eq!(strip_think_tags("普通标题"), "普通标题");
+        // 经 normalize 后，纯思维链输入不会被当成合格标题。
+        assert!(normalize_generated_session_title("<think>only reasoning</think>").is_empty());
     }
 
     #[test]

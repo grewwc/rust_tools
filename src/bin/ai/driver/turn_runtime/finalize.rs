@@ -414,7 +414,9 @@ pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: b
 }
 
 async fn generate_session_title_if_missing(app: &App) {
-    use crate::ai::history::{is_low_quality_session_title, normalize_generated_session_title};
+    use crate::ai::history::{
+        generate_session_summary, is_low_quality_session_title, normalize_generated_session_title,
+    };
     // eprintln!("[session-title] checking: session_id={} history_file={}", app.session_id, app.session_history_file.display());
 
     // SessionStore 接收基础 history 文件，并据此推导 `<stem>.sessions/`。
@@ -454,20 +456,37 @@ async fn generate_session_title_if_missing(app: &App) {
     let title = crate::ai::request::generate_session_title_via_model(app, &all_messages).await;
     // eprintln!("[session-title] LLM returned: {:?}", title.as_deref().unwrap_or("None"));
 
-    if let Some(t) = title {
-        let t = normalize_generated_session_title(&t);
-        if !t.is_empty() {
-            if let Some(existing_title) = store.read_session_title(&app.session_id).ok().flatten()
-                && !is_low_quality_session_title(&existing_title)
-            {
-                return;
-            }
-            if let Err(_) = store.write_session_title(&app.session_id, &t) {
-                // eprintln!("[session-title] failed to save title: {}", err);
-            } else {
-                // eprintln!("[session-title] generated: {}", t);
-            }
+    // LLM 生成 + 清洗；LLM 返回 None 或清洗后为空时，用首个 user 正文的
+    // `generate_session_summary`（同步、启发式）兜底固化。历史上 None 分支什么都不
+    // 写，导致标题永远缺失、每次展示都回退摘要且下轮仍反复发起昂贵 LLM 请求。
+    let mut resolved = title
+        .map(|t| normalize_generated_session_title(&t))
+        .unwrap_or_default();
+    if resolved.is_empty() {
+        if let Some(first_user) = all_messages
+            .iter()
+            .find(|m| m.role == "user")
+            .map(|m| value_to_string(&m.content))
+            .filter(|s| !s.trim().is_empty())
+        {
+            resolved = normalize_generated_session_title(&generate_session_summary(&first_user));
         }
+    }
+    if resolved.is_empty() {
+        // 仍无有效标题（无 user 正文可兜底）：不写，避免固化一个空标题。
+        return;
+    }
+
+    // 落盘前再查一次：已有非低质标题则不覆盖（并发/竞态下别人可能已写入更优标题）。
+    if let Some(existing_title) = store.read_session_title(&app.session_id).ok().flatten()
+        && !is_low_quality_session_title(&existing_title)
+    {
+        return;
+    }
+    if let Err(_) = store.write_session_title(&app.session_id, &resolved) {
+        // eprintln!("[session-title] failed to save title: {}", err);
+    } else {
+        // eprintln!("[session-title] generated: {}", resolved);
     }
 }
 

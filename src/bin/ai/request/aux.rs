@@ -428,6 +428,10 @@ pub(crate) async fn generate_session_title_via_model(
             return None;
         }
     };
+    // 先剥离 `<think>...</think>` 思维链，再做行拆分/清洗。thinking 模式模型会
+    // 把思维链连同答案一起返回，若不先剥离，下面的 `.lines().next()` 会截到
+    // `<think>` 首行，把思维链碎片当成合格标题写库。必须在 line 拆分之前完成。
+    let content = crate::ai::history::strip_think_tags(&content);
     let trimmed = content.trim().to_string();
 
     // 清理：去掉引号、去掉换行、截断到 30 字符

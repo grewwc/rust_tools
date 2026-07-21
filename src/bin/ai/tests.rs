@@ -716,6 +716,61 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
 }
 
 #[test]
+fn overflow_flush_failure_restores_dropped_messages_without_data_loss() {
+    // 缺陷1 回归：归档 flush 失败时必须把待删消息放回、绝不静默丢历史。
+    let path =
+        std::env::temp_dir().join(format!("ai-overflow-fail-{}.sqlite", uuid::Uuid::new_v4()));
+    // 关键：把 overflow_dir 指向一个**已存在的普通文件**。这样 OverflowSink::flush
+    // 里的 create_dir_all(parent=文件) 失败、随后 OpenOptions.open(文件/overflow-history.md)
+    // 因路径中间是文件而 ENOTDIR 失败 → flush() 必然返回 false，稳定触发失败回滚路径。
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-overflow-failfile-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&overflow_dir, b"not a directory").unwrap();
+
+    let long = "z".repeat(300);
+    let mut blob = String::new();
+    for i in 0..20usize {
+        blob.push_str(&format!("user{COLON}Q{i:02} {long}{NEWLINE}"));
+        blob.push_str(&format!("assistant{COLON}A{i:02} {long}{NEWLINE}"));
+    }
+    append_history(&path, &blob).unwrap();
+
+    let messages = build_message_arr(100, &path).unwrap();
+    let original_user_count = messages.iter().filter(|m| m.role == "user").count();
+    let compressed =
+        compress_messages_for_context(messages, 2000, 256, 400, Some(overflow_dir.clone()));
+
+    // flush 失败 → 绝不删历史：全部 user 原文必须仍在返回值中（旧代码会静默丢弃）。
+    let kept_user_count = compressed.iter().filter(|m| m.role == "user").count();
+    assert_eq!(
+        kept_user_count, original_user_count,
+        "flush 失败时不得丢任何 user 消息，期望 {original_user_count} 条，实得 {kept_user_count} 条"
+    );
+
+    let joined: String = compressed
+        .iter()
+        .filter_map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("Q00"),
+        "最早的用户问题 Q00 必须被放回，不能丢失"
+    );
+    // 失败路径绝不注入摘要/归档 note（避免产生没有对应归档文件的悬空指针）。
+    assert!(
+        !joined.contains("长期记忆摘要"),
+        "flush 失败路径不得注入摘要 note"
+    );
+    assert!(
+        !joined.contains("原始归档文件"),
+        "flush 失败路径不得注入归档指针 note"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&overflow_dir);
+}
+
+#[test]
 fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files() {
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-preserve-overflow-{}", uuid::Uuid::new_v4()));

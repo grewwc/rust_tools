@@ -441,15 +441,18 @@ pub(in crate::ai) fn build_message_arr_sqlite(
          FROM messages
          ORDER BY id ASC",
     )?;
-    let compacted = compact_persisted_history(messages.clone());
-    if compacted != messages {
-        replace_all_messages_sqlite(history_file, &compacted)?;
+    // 读路径**不落盘**：`compact_persisted_history` 仅用于内存返回值，保持
+    // `build_context_history` 现有的截断/归一行为不变。历史上这里会在 compacted
+    // 与原始不同时 `replace_all_messages_sqlite` 覆盖库并 bump revision——那让
+    // “读函数”产生写副作用：① 每次读都可能失效 `ContextHistoryCacheKey`（含
+    // history_revision）造成缓存抖动；② 在 app-aware 压缩之前就用启发式摘要
+    // 不可逆覆盖原文，使 >200 轮的会话被“双压”降保真。真正的落盘压缩由
+    // `compact_session_history_with_app_inner` 专责，读路径恢复只读。
+    let compacted = compact_persisted_history(messages);
+    if history_count >= compacted.len() {
+        return Ok(compacted);
     }
-    let messages = compacted;
-    if history_count >= messages.len() {
-        return Ok(messages);
-    }
-    Ok(messages[messages.len() - history_count..].to_vec())
+    Ok(compacted[compacted.len() - history_count..].to_vec())
 }
 
 pub(in crate::ai) fn read_recent_messages_sqlite(
