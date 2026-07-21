@@ -364,6 +364,50 @@ fn assistant_call_args(id: &str, name: &str, arguments: &str) -> Message {
     m
 }
 
+/// 压缩后的命令组必须保留调用参数。仅保留「成功但无输出」不足以说明已经查过
+/// 哪个 author/date/cwd 组合，模型会把它当成未执行过的调查而从同一条 git log 重启。
+#[test]
+fn folded_command_keeps_invocation_for_empty_success() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-command-invocation-{}", uuid::Uuid::new_v4()));
+    let command = r#"git log --all --author="wangwenchao.129" --since="2026-07-22 00:00" --until="2026-07-23 00:00""#;
+    let mut messages = vec![msg("system", "s"), msg("user", "审查今天的改动")];
+    messages.push(assistant_call_args(
+        "git-log",
+        "execute_command",
+        r#"{"command":"git log --all --author=\"wangwenchao.129\" --since=\"2026-07-22 00:00\" --until=\"2026-07-23 00:00\"","cwd":"/data01/AeolusLLM"}"#,
+    ));
+    messages.push(tool_result(
+        "git-log",
+        "(command succeeded with exit code 0 and produced no output)",
+    ));
+    for i in 0..4 {
+        let id = format!("later-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "later"));
+    }
+
+    let (folded, folded_groups) =
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()));
+    assert_eq!(folded_groups, 1);
+    let stub = folded
+        .iter()
+        .find(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && value_to_string(&message.content).contains("execute_command")
+        })
+        .map(|message| value_to_string(&message.content))
+        .expect("command group should be folded into a recall stub");
+    assert!(stub.contains(&format!("command: {command}")), "{stub}");
+    assert!(stub.contains("cwd: /data01/AeolusLLM"), "{stub}");
+    assert!(
+        stub.contains("command succeeded with exit code 0 and produced no output"),
+        "{stub}"
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
 fn assistant_call_args_multi(id: &str, calls: &[(&str, &str)]) -> Message {
     Message {
         role: "assistant".to_string(),
