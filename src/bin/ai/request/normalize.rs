@@ -240,7 +240,6 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum InternalNoteKind {
         WorkingMemory,
-        CodeDiscovery,
         CachedTools,
         Summary,
         SelfNote,
@@ -313,9 +312,6 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         if trimmed.starts_with("Current code-inspection working memory:") {
             return InternalNoteKind::WorkingMemory;
         }
-        if trimmed.starts_with("code_discovery:") {
-            return InternalNoteKind::CodeDiscovery;
-        }
         if trimmed.starts_with("Context note: reused cached tool results") {
             return InternalNoteKind::CachedTools;
         }
@@ -331,7 +327,6 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     fn note_heading(kind: InternalNoteKind) -> &'static str {
         match kind {
             InternalNoteKind::WorkingMemory => "Working Memory",
-            InternalNoteKind::CodeDiscovery => "Code Discoveries",
             InternalNoteKind::CachedTools => "Cached Tool Results",
             InternalNoteKind::Summary => "History Summary",
             InternalNoteKind::SelfNote => "Self Notes",
@@ -540,8 +535,8 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     // Only merge system-like notes that sit BEFORE the first conversational
     // (user/assistant/tool) message — those are produced by history
     // compression at the very top and stay stable across turns. Notes that
-    // arrive later (working memory / code discovery / self_note / cached
-    // tool results, etc.) are kept in their original positions with role
+    // arrive later (working memory / self_note / cached tool results, etc.)
+    // are kept in their original positions with role
     // rewritten to "system", so growing tail notes only invalidate the
     // suffix of the provider's prompt cache instead of the whole request.
     let first_body_idx = messages
@@ -652,9 +647,8 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             let mut promoted = message.clone();
             promoted.role = ROLE_SYSTEM.to_string();
             // Cap mid-stream notes to a reasonable budget to avoid bloating
-            // the request with stale long notes (working memory / code
-            // discoveries / self_note / cached-tool notes accumulated over
-            // many tool rounds).
+            // the request with stale long notes (working memory / self_note /
+            // cached-tool notes accumulated over many tool rounds).
             if let Value::String(text) = &promoted.content {
                 if text.chars().count() > MERGED_SINGLE_NOTE_MAX_CHARS {
                     promoted.content =

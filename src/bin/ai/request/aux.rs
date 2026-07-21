@@ -196,7 +196,9 @@ fn session_title_text_content(content: &Value) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         Value::String(text) => text.trim().to_string(),
-        other => crate::ai::history::value_to_string(other).trim().to_string(),
+        other => crate::ai::history::value_to_string(other)
+            .trim()
+            .to_string(),
     }
 }
 
@@ -265,9 +267,9 @@ mod session_title_tests {
         let messages = vec![Message {
             role: "user".to_string(),
             content: serde_json::json!([{
-            "type": "image_url",
-            "image_url": { "url": "data:image/png;base64,abc" }
-        }]),
+                "type": "image_url",
+                "image_url": { "url": "data:image/png;base64,abc" }
+            }]),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -281,8 +283,7 @@ mod session_title_tests {
         let messages = vec![Message {
             role: "user".to_string(),
             content: Value::String(
-                r#"[[PRESERVED_CONTENT_STUB_V1]]{"kind":"image","file_path":"/tmp/x"}"#
-                    .to_string(),
+                r#"[[PRESERVED_CONTENT_STUB_V1]]{"kind":"image","file_path":"/tmp/x"}"#.to_string(),
             ),
             tool_calls: None,
             tool_call_id: None,

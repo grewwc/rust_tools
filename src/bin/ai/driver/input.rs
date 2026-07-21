@@ -1888,13 +1888,13 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
             .filter(|title| !title.is_empty())
             .or_else(|| {
                 store
-                .first_user_prompt(&app.session_id)
-                .ok()
-                .flatten()
-                .as_deref()
-                .map(crate::ai::history::generate_session_summary)
-                .map(|summary| crate::ai::history::normalize_generated_session_title(&summary))
-                .filter(|summary| !summary.is_empty())
+                    .first_user_prompt(&app.session_id)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .map(crate::ai::history::generate_session_summary)
+                    .map(|summary| crate::ai::history::normalize_generated_session_title(&summary))
+                    .filter(|summary| !summary.is_empty())
             });
         editor.set_session_topic(topic);
         return editor.read_multi_line();

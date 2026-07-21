@@ -613,40 +613,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_recall_excludes_code_discovery_entries() {
-        let path = test_store_path("exclude_code_discovery");
-        let store = JsonlStore::new(path.clone());
-        append_entry(
-            &store,
-            "user_memory",
-            "rust_tools project structure: src/bin contains entrypoints and src/cw has shared utilities.",
-            "rust_tools",
-            180,
-        );
-        append_entry(
-            &store,
-            "code_discovery",
-            "read_file_lines(file=src/bin/ai/models.rs, lines=68..87) => endpoint_for_model",
-            "session:test",
-            220,
-        );
-
-        let recalled = build_auto_recalled_knowledge_with_project(
-            &store,
-            "What is the project structure of this project?",
-            1200,
-            Some("rust_tools"),
-            &KnowledgeConfig::default(),
-        )
-        .expect("recalled knowledge");
-
-        assert!(recalled.content.contains("project structure"));
-        assert!(!recalled.content.contains("read_file_lines"));
-        assert_eq!(recalled.categories, vec!["user_memory".to_string()]);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn auto_recall_excludes_project_writeback_with_local_skill_path_leak() {
         let path = test_store_path("exclude_local_skill_path");
         let store = JsonlStore::new(path.clone());

@@ -564,7 +564,10 @@ impl AnthropicXmlToolCallStreamer {
                     };
                     let tag = self.pending[..=gt_rel].to_string();
                     self.pending.drain(..=gt_rel);
-                    if matches!(classify_anthropic_tag(&tag), AnthropicTagClass::ResultBlockClose) {
+                    if matches!(
+                        classify_anthropic_tag(&tag),
+                        AnthropicTagClass::ResultBlockClose
+                    ) {
                         // 块结束，回到 Idle。闭标签本身也被吞除，不外显。
                         self.phase = AnthropicXmlPhase::Idle;
                     }
@@ -1251,8 +1254,7 @@ mod tests {
     fn anthropic_streamer_handles_namespaced_result_tag() {
         // 带命名空间前缀（如 `antml:`）的幻觉标记同样命中本地名。
         let mut s = super::AnthropicXmlToolCallStreamer::new();
-        let (cleaned, events) =
-            s.push("x<tool_result>garbage</tool_result>y");
+        let (cleaned, events) = s.push("x<tool_result>garbage</tool_result>y");
         assert_eq!(cleaned, "xy");
         assert!(events.contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker));
     }
@@ -1264,8 +1266,7 @@ mod tests {
         let (cleaned, events) = s.push("see <div>result</div> and <span>ok</span>");
         assert_eq!(cleaned, "see <div>result</div> and <span>ok</span>");
         assert!(
-            !events
-                .contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker),
+            !events.contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker),
             "普通 HTML 不得触发幻觉信号"
         );
         // 合法 invoke 工具调用仍正常解析，不受结果块逻辑影响。
@@ -1278,10 +1279,7 @@ mod tests {
             events2.first(),
             Some(&InternalToolCallStreamEvent::Begin("read_file".to_string()))
         );
-        assert!(
-            !events2
-                .contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker)
-        );
+        assert!(!events2.contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker));
     }
 
     #[test]

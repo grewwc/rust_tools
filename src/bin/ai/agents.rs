@@ -229,7 +229,6 @@ impl AgentManifest {
     pub(super) fn is_subagent(&self) -> bool {
         matches!(self.mode, AgentMode::Subagent | AgentMode::All)
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

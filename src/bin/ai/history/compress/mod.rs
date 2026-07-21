@@ -246,7 +246,9 @@ impl OverflowSink {
 
 fn build_overflow_placeholder(file_path: &str) -> String {
     let mut out = String::new();
-    out.push_str("长期记忆归档：更早的原始对话已移出上下文窗口，原文保存在会话归档文件中（零压缩）。\n");
+    out.push_str(
+        "长期记忆归档：更早的原始对话已移出上下文窗口，原文保存在会话归档文件中（零压缩）。\n",
+    );
     out.push_str("归档文件: ");
     out.push_str(file_path);
     out.push('\n');
@@ -984,10 +986,7 @@ fn truncate_first_message_to_fit(messages: &mut [Message], max_chars: usize) {
 }
 
 fn messages_total_chars(messages: &[Message]) -> usize {
-    messages
-        .iter()
-        .map(message_billable_chars)
-        .sum::<usize>()
+    messages.iter().map(message_billable_chars).sum::<usize>()
 }
 
 /// Public proxy of [`messages_total_chars`] for callers in other ai modules
@@ -1755,8 +1754,8 @@ fn render_deduped_read_file_lines(lines: &[(usize, String)], removed: usize) -> 
 }
 
 #[cfg(test)]
-mod fold_early_tool_groups_tests;
-#[cfg(test)]
 mod coalesce_summary_notes_tests;
+#[cfg(test)]
+mod fold_early_tool_groups_tests;
 #[cfg(test)]
 mod tail_window_tests;

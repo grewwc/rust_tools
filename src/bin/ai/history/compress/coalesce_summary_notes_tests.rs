@@ -68,10 +68,7 @@ fn coalesce_merges_accumulated_notes_losslessly() {
 
     let summaries: Vec<&Message> = out.iter().filter(|m| is_summary_message(m)).collect();
     assert_eq!(summaries.len(), 1, "多条摘要应被折叠为一条");
-    let archives: Vec<&Message> = out
-        .iter()
-        .filter(|m| is_archive_note_message(m))
-        .collect();
+    let archives: Vec<&Message> = out.iter().filter(|m| is_archive_note_message(m)).collect();
     assert_eq!(archives.len(), 1, "多条归档指针应去重为一条");
 
     // 三个不同目标全部保留（无损）。
@@ -82,7 +79,10 @@ fn coalesce_merges_accumulated_notes_losslessly() {
 
     // 非摘要/归档消息原样保留、顺序不变。
     assert_eq!(out.first().map(|m| m.role.as_str()), Some("system"));
-    assert!(out.iter().any(|m| m.role == "user" && value_to_string(&m.content) == "继续"));
+    assert!(
+        out.iter()
+            .any(|m| m.role == "user" && value_to_string(&m.content) == "继续")
+    );
     assert!(
         out.iter()
             .any(|m| m.role == "assistant" && value_to_string(&m.content) == "好的")
@@ -121,11 +121,17 @@ fn coalesced_summary_is_recognized_by_guard() {
         archive_note(),
     ];
     let out = coalesce_accumulated_summary_notes(input);
-    let summary = out.iter().find(|m| is_summary_message(m)).expect("应有合并摘要");
+    let summary = out
+        .iter()
+        .find(|m| is_summary_message(m))
+        .expect("应有合并摘要");
     // 幂等性：对已折叠结果再折叠一次，note 数不再变化。
     let again = coalesce_accumulated_summary_notes(out.clone());
     assert_eq!(
-        again.iter().filter(|m| is_summary_or_archive_note(m)).count(),
+        again
+            .iter()
+            .filter(|m| is_summary_or_archive_note(m))
+            .count(),
         out.iter().filter(|m| is_summary_or_archive_note(m)).count(),
         "折叠应幂等"
     );

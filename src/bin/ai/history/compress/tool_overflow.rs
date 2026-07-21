@@ -634,7 +634,7 @@ fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'s
     }
 }
 
-fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str) -> Vec<String> {
+pub(super) fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str) -> Vec<String> {
     let Ok(args) = serde_json::from_str::<Value>(arguments) else {
         return Vec::new();
     };

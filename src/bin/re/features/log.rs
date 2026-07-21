@@ -50,10 +50,7 @@ pub fn insert_records(
         if parts.len() == 1
             && let Ok(globbed) = rust_tools::terminalw::glob_paths(&parts[0], ".")
         {
-            parts = globbed
-                .into_iter()
-                .map(|x| x)
-                .collect();
+            parts = globbed.into_iter().map(|x| x).collect();
         }
         for p in parts {
             let base = std::path::Path::new(&p)

@@ -180,6 +180,86 @@ fn stub_preserves_file_path_recall_anchor() {
     );
 }
 
+/// 一级外溢 stub 已包含（或可由 tool call 重建）原始调用参数时，二级工具组折叠
+/// 也必须保留它们。否则 history 只剩不可辨识的内部归档路径，模型会把它当源码
+/// 回读，导致「压缩产物不存在 / 源码消失」的错误判断。
+#[test]
+fn folded_archived_precision_tools_keep_original_invocation_anchors() {
+    let mut messages = vec![msg("system", "s"), msg("user", "排查问题")];
+    let cases = [
+        (
+            "read",
+            "read_file",
+            r#"{"file_path":"src/bin/ai/driver/turn_runtime/orchestrator.rs","offset":120,"limit":40}"#,
+        ),
+        (
+            "command",
+            "execute_command",
+            r#"{"command":"git status --short","cwd":"/repo"}"#,
+        ),
+        (
+            "search",
+            "code_search",
+            r#"{"operation":"text_search","query":"task_wait","path":"src/bin/ai"}"#,
+        ),
+    ];
+    for (id, name, arguments) in cases {
+        messages.push(assistant_call_args(id, name, arguments));
+        messages.push(tool_result(
+            id,
+            &format!(
+                "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]\n\
+                 Output preserved for tool `{name}`. Full result saved to session asset:\n\
+                 - file_path: /tmp/session/{id}.txt"
+            ),
+        ));
+    }
+    for i in 0..4 {
+        let id = format!("later-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "recent"));
+    }
+
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None);
+    assert_eq!(folded_groups, 3);
+    let folded_text = folded
+        .iter()
+        .filter(|message| message.role == ROLE_INTERNAL_NOTE)
+        .map(|message| value_to_string(&message.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        folded_text
+            .contains("- original_file_path: src/bin/ai/driver/turn_runtime/orchestrator.rs"),
+        "{folded_text}"
+    );
+    assert!(
+        folded_text.contains("- original_range: lines=120..159"),
+        "{folded_text}"
+    );
+    assert!(
+        folded_text.contains("- original_command: git status --short"),
+        "{folded_text}"
+    );
+    assert!(
+        folded_text.contains("- original_cwd: /repo"),
+        "{folded_text}"
+    );
+    assert!(
+        folded_text.contains("- original_operation: text_search"),
+        "{folded_text}"
+    );
+    assert!(
+        folded_text.contains("- original_query: task_wait"),
+        "{folded_text}"
+    );
+    assert!(
+        folded_text.contains("- original_path: src/bin/ai"),
+        "{folded_text}"
+    );
+}
+
 /// 同一 user turn 内工具组过多时，`cargo test` 一类命令可能离开最近组保护窗。
 /// 折叠后仍必须能看到失败结论和关键报错，并通过 `file_path` 读取完整日志。
 #[test]

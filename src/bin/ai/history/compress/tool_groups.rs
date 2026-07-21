@@ -12,7 +12,7 @@ use crate::ai::types::ToolCall;
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
 use super::text_utils::truncate_to_chars;
 use super::tool_overflow::{
-    is_non_compressible_tool, is_preserved_user_or_image_stub,
+    build_tool_overflow_recall_lines, is_non_compressible_tool, is_preserved_user_or_image_stub,
     preserve_noncompressible_tool_result_for_fold,
 };
 use super::{
@@ -161,7 +161,7 @@ pub(super) fn fold_tool_call_group_to_stub(
                 }
             })
             .unwrap_or_default();
-        let recall = tool_result_recall_text(&tc.function.name, &result_text, overflow_dir)?;
+        let recall = tool_result_recall_text(tc, &result_text, overflow_dir)?;
         let invocation = tool_call_invocation_recall(tc);
         lines.push(format!(
             "- {}{} => {}",
@@ -229,10 +229,11 @@ fn tool_call_invocation_recall(tool_call: &ToolCall) -> String {
 /// 为工具组折叠生成结果召回文本。高精度结果在移除原始消息前必须先归档；若归档
 /// 失败则返回 `None`，调用方保留整组原文，不能将唯一证据降级为首句。
 fn tool_result_recall_text(
-    tool_name: &str,
+    tool_call: &ToolCall,
     result_text: &str,
     overflow_dir: Option<&Path>,
 ) -> Option<String> {
+    let tool_name = tool_call.function.name.as_str();
     if !is_non_compressible_tool(tool_name) || result_text.trim().is_empty() {
         return Some(tool_result_recall_one_liner(result_text));
     }
@@ -258,18 +259,53 @@ fn tool_result_recall_text(
             || recall_lower.contains("aborting")
             || recall_lower.contains("could not compile");
         if has_error_signal {
-            return Some(format!(
-                "{}\n  {path}\n  - 命令输出包含错误信号；如需完整诊断日志，可用 read_file 读取以上文件。",
-                recall,
+            return Some(append_original_recall_lines(
+                format!(
+                    "{}\n  {path}\n  - 命令输出包含错误信号；如需完整诊断日志，可用 read_file 读取以上文件。",
+                    recall,
+                ),
+                tool_call,
+                &preserved,
             ));
         }
-        return Some(format!(
-            "{}\n  {path}",
-            recall,
+        return Some(append_original_recall_lines(
+            format!("{}\n  {path}", recall),
+            tool_call,
+            &preserved,
         ));
     }
 
-    Some(truncate_to_chars(&normalize_whitespace(path), 240))
+    Some(append_original_recall_lines(
+        truncate_to_chars(&normalize_whitespace(path), 240),
+        tool_call,
+        &preserved,
+    ))
+}
+
+/// 工具组折叠是第二级压缩：不能把一级 stub 中的 `original_*` 调用锚点再次丢掉。
+///
+/// 优先从仍在场的 ToolCall 参数重建；旧格式或参数解析失败时，再保留已有 stub 中的
+/// 锚点。这样历史只剩内部归档路径时，模型仍知道原始文件、命令或检索是什么。
+fn append_original_recall_lines(
+    mut recall: String,
+    tool_call: &ToolCall,
+    preserved: &str,
+) -> String {
+    let mut seen = FxHashSet::default();
+    let from_call =
+        build_tool_overflow_recall_lines(&tool_call.function.name, &tool_call.function.arguments);
+    let from_preserved = preserved.lines().filter_map(|line| {
+        let line = line.trim();
+        line.starts_with("- original_").then_some(line)
+    });
+
+    for line in from_call.iter().map(String::as_str).chain(from_preserved) {
+        if seen.insert(line.to_string()) {
+            recall.push_str("\n  ");
+            recall.push_str(line);
+        }
+    }
+    recall
 }
 
 /// 命令输出被折叠时至少保留退出状态、关键诊断与尾部结论。完整日志仍由调用方

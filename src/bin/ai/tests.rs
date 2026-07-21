@@ -1440,8 +1440,7 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         .iter()
         .find_map(|m| {
             let text = m.content.as_str()?;
-            (text.contains("read_file") && text.contains("file_path: "))
-                .then_some(text.to_string())
+            (text.contains("read_file") && text.contains("file_path: ")).then_some(text.to_string())
         })
         .expect("expected read_file recall anchor (file_path) after mid-turn compression");
     let file_path = recall

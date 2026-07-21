@@ -654,8 +654,8 @@ fn strip_number_prefix_anchored<'a>(expected: &'a str, actual: &str) -> &'a str 
     // 逐一尝试：去掉 0 或 1 个分隔符（可再带 1 个空格）后是否等于真实行。
     // 用"剩余部分精确等于真实行"作为唯一判据，因此无需知道分隔符具体是什么。
     let candidates = [
-        after_digits,   // 数字后直接是内容（罕见）
-        after_one_sep,  // 吞 1 个分隔符
+        after_digits,  // 数字后直接是内容（罕见）
+        after_one_sep, // 吞 1 个分隔符
     ];
     for cand in candidates {
         if cand == actual || cand.trim_end() == actual.trim_end() {
@@ -2591,7 +2591,10 @@ mod tests {
         // 单参数兜底版：只认 `digits+\t` 与 `digits+分隔符+空格`，保守以防误剥。
         use super::strip_line_number_prefix;
         // read_file 真实格式：右对齐行号 + TAB（此前遗漏的根因场景）
-        assert_eq!(strip_line_number_prefix("     3\tuse std::fs;"), "use std::fs;");
+        assert_eq!(
+            strip_line_number_prefix("     3\tuse std::fs;"),
+            "use std::fs;"
+        );
         // TAB 后保留代码原有缩进（只剥离一个 TAB，不动内容缩进）
         assert_eq!(
             strip_line_number_prefix("    42\t    let x = 1;"),
@@ -2618,11 +2621,26 @@ mod tests {
         use super::strip_number_prefix_anchored;
         let actual = "    let x = 1;";
         // read_file TAB / grep `| ` / `: ` / 空格 / `.` / `)` 全部兼容
-        assert_eq!(strip_number_prefix_anchored("  42\t    let x = 1;", actual), actual);
-        assert_eq!(strip_number_prefix_anchored("42|     let x = 1;", actual), actual);
-        assert_eq!(strip_number_prefix_anchored("42:     let x = 1;", actual), actual);
-        assert_eq!(strip_number_prefix_anchored("42     let x = 1;", actual), actual);
-        assert_eq!(strip_number_prefix_anchored("42)     let x = 1;", actual), actual);
+        assert_eq!(
+            strip_number_prefix_anchored("  42\t    let x = 1;", actual),
+            actual
+        );
+        assert_eq!(
+            strip_number_prefix_anchored("42|     let x = 1;", actual),
+            actual
+        );
+        assert_eq!(
+            strip_number_prefix_anchored("42:     let x = 1;", actual),
+            actual
+        );
+        assert_eq!(
+            strip_number_prefix_anchored("42     let x = 1;", actual),
+            actual
+        );
+        assert_eq!(
+            strip_number_prefix_anchored("42)     let x = 1;", actual),
+            actual
+        );
         // 去栏后不等于真实行 → 原样返回（不误剥）
         assert_eq!(
             strip_number_prefix_anchored("42\tsomething else", actual),

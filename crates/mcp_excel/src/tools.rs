@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
 use crate::osa;
+use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
 
 /// 每操作超时（毫秒）。默认 90s，短于宿主 request_timeout_ms（建议 120s）。
 fn op_timeout_ms() -> u64 {
@@ -167,7 +167,10 @@ pub async fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcEr
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     match name.as_str() {
         "open_workbook" => tool_open_workbook(&args).await,
@@ -264,7 +267,10 @@ async fn tool_write_cell(args: &Value) -> Result<Value, JsonRpcErr> {
     let path = require_str(args, "path")?;
     let cell = require_str(args, "cell")?;
     let value = require_str(args, "value")?;
-    let as_number = args.get("as_number").and_then(|v| v.as_bool()).unwrap_or(false);
+    let as_number = args
+        .get("as_number")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let sheet = opt_str(args, "sheet");
     ensure_excel().await?;
     let _ = osa::open_workbook(&path).await;
@@ -295,7 +301,9 @@ async fn tool_write_range(args: &Value) -> Result<Value, JsonRpcErr> {
     let mut written = 0usize;
     let ms = op_timeout_ms();
     for (r, row) in rows.iter().enumerate() {
-        let Some(cells) = row.as_array() else { continue };
+        let Some(cells) = row.as_array() else {
+            continue;
+        };
         for (c, cell) in cells.iter().enumerate() {
             let addr = format!("{}{}", col_to_letters(start_col + c), start_row + r);
             let (val, is_num) = cell_value_literal(cell);
@@ -307,7 +315,9 @@ async fn tool_write_range(args: &Value) -> Result<Value, JsonRpcErr> {
             written += 1;
         }
     }
-    Ok(text_content(format!("Wrote {written} cells starting at {start}")))
+    Ok(text_content(format!(
+        "Wrote {written} cells starting at {start}"
+    )))
 }
 
 async fn tool_export_csv(args: &Value) -> Result<Value, JsonRpcErr> {
@@ -318,7 +328,11 @@ async fn tool_export_csv(args: &Value) -> Result<Value, JsonRpcErr> {
     let _ = osa::open_workbook(&path).await;
 
     // 走已验证可靠的 read_range(used range) → TSV，再 Rust 侧转 CSV 落盘（绕过 save -50）。
-    let tsv = with_timeout(op_timeout_ms(), osa::read_range(&path, sheet.as_deref(), None)).await?;
+    let tsv = with_timeout(
+        op_timeout_ms(),
+        osa::read_range(&path, sheet.as_deref(), None),
+    )
+    .await?;
     let csv = tsv_to_csv(&tsv);
 
     if let Some(parent) = PathBuf::from(&dest).parent() {
@@ -328,7 +342,9 @@ async fn tool_export_csv(args: &Value) -> Result<Value, JsonRpcErr> {
     std::fs::write(&dest, csv.as_bytes())
         .map_err(|e| JsonRpcErr::new(-32000, &format!("cannot write csv: {e}"), None))?;
     let bytes = csv.len();
-    Ok(text_content(format!("Exported used range to {dest} ({bytes} bytes)")))
+    Ok(text_content(format!(
+        "Exported used range to {dest} ({bytes} bytes)"
+    )))
 }
 
 async fn tool_save_workbook(args: &Value) -> Result<Value, JsonRpcErr> {

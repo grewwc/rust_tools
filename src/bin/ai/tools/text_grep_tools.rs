@@ -516,14 +516,39 @@ struct GlobMatcher {
 }
 
 impl GlobMatcher {
-    fn matches(&self, file_name: &str) -> bool {
+    fn matches(&self, relative_path: &Path) -> bool {
         if self.patterns.is_empty() {
             return true;
         }
-        self.patterns
-            .iter()
-            .any(|pat| glob_match_simple(pat, file_name))
+        let relative_path = relative_path.to_string_lossy().replace('\\', "/");
+        let file_name = relative_path.rsplit('/').next().unwrap_or(&relative_path);
+        self.patterns.iter().any(|pattern| {
+            if pattern.contains('/') {
+                glob_match_path(pattern, &relative_path)
+            } else {
+                glob_match_simple(pattern, file_name)
+            }
+        })
     }
+}
+
+/// 路径 glob 额外支持 `**/` 匹配零层目录，例如 `src/**/mod.rs` 也应匹配
+/// `src/mod.rs`。普通 `*` 的既有语义保持不变，仍由 `glob_match_simple` 处理。
+fn glob_match_path(pattern: &str, path: &str) -> bool {
+    if glob_match_simple(pattern, path) {
+        return true;
+    }
+
+    let mut offset = 0;
+    while let Some(found) = pattern[offset..].find("**/") {
+        let index = offset + found;
+        let without_globstar_dir = format!("{}{}", &pattern[..index], &pattern[index + 3..]);
+        if glob_match_path(&without_globstar_dir, path) {
+            return true;
+        }
+        offset = index + 3;
+    }
+    false
 }
 
 fn glob_match_simple(pattern: &str, name: &str) -> bool {
@@ -560,7 +585,7 @@ fn glob_match_simple(pattern: &str, name: &str) -> bool {
 }
 
 /// BFS 递归收集候选文件，跳过隐藏目录与依赖/构建目录。
-/// - `glob_matcher`：文件名 glob 过滤（None=不过滤）。
+/// - `glob_matcher`：文件名或相对路径 glob 过滤（None=不过滤）。
 /// - `extensions`：扩展名白名单（None=不按扩展名过滤）。
 fn collect_content_files(
     root: &Path,
@@ -626,7 +651,8 @@ fn collect_content_files(
                     }
                 }
                 if let Some(matcher) = glob_matcher {
-                    if !matcher.matches(&name_str) {
+                    let relative_path = path.strip_prefix(root).unwrap_or(&path);
+                    if !matcher.matches(relative_path) {
                         continue;
                     }
                 }
@@ -849,6 +875,35 @@ mod tests {
         let output = execute_text_grep(&args).unwrap();
         assert!(output.contains("inner.rs"), "should recurse: {}", output);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_text_grep_file_pattern_matches_relative_path() {
+        let dir = make_temp_dir("relative_pattern");
+        let matched = dir.join("src/bin/ai/history/compress/mod.rs");
+        let matched_without_intermediate_dir = dir.join("src/bin/ai/history/lib.rs");
+        let skipped = dir.join("src/bin/ai/driver/mod.rs");
+        fs::create_dir_all(matched.parent().unwrap()).unwrap();
+        fs::create_dir_all(skipped.parent().unwrap()).unwrap();
+        fs::write(&matched, "fn compress_marker() {}\n").unwrap();
+        fs::write(
+            &matched_without_intermediate_dir,
+            "fn compress_marker() {}\n",
+        )
+        .unwrap();
+        fs::write(&skipped, "fn compress_marker() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "compress_marker",
+            "path": dir.to_string_lossy(),
+            "file_pattern": "src/bin/ai/history/**/*.rs"
+        });
+        let output = execute_text_grep(&args).unwrap();
+
+        assert!(output.contains("history/compress/mod.rs"), "{output}");
+        assert!(output.contains("history/lib.rs"), "{output}");
+        assert!(!output.contains("driver/mod.rs"), "{output}");
         let _ = fs::remove_dir_all(&dir);
     }
 

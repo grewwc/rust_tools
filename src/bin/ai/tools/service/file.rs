@@ -425,6 +425,26 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_read_file_follows_file_symlink() {
+        let target = make_temp_path("symlink_target").with_extension("txt");
+        let alias = make_temp_path("symlink_alias").with_extension("txt");
+        fs::write(&target, "real file content\n").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        let args = serde_json::json!({
+            "file_path": alias.to_string_lossy(),
+            "offset": 1,
+            "limit": 10
+        });
+        let output = execute_read_file(&args).expect("read_file should follow file symlinks");
+
+        assert!(output.contains("real file content"), "output: {output}");
+        let _ = fs::remove_file(&alias);
+        let _ = fs::remove_file(&target);
+    }
+
     #[test]
     fn test_write_file_streaming_dispatch_emits_progress() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());

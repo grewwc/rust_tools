@@ -1419,6 +1419,29 @@ mod tests {
     }
 
     #[test]
+    fn text_search_file_pattern_matches_relative_directory_path() {
+        let dir = make_temp_dir("relative_file_pattern");
+        let matched = dir.join("src/bin/ai/history/compress/mod.rs");
+        let skipped = dir.join("src/bin/ai/driver/mod.rs");
+        fs::create_dir_all(matched.parent().unwrap()).unwrap();
+        fs::create_dir_all(skipped.parent().unwrap()).unwrap();
+        fs::write(&matched, "fn compress_marker() {}\n").unwrap();
+        fs::write(&skipped, "fn compress_marker() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "operation": "text_search",
+            "path": dir.to_string_lossy(),
+            "file_pattern": "src/bin/ai/history/**/*.rs",
+            "query": "compress_marker"
+        });
+        let result = execute_code_search(&args).unwrap();
+
+        assert!(result.contains("history/compress/mod.rs"), "{result}");
+        assert!(!result.contains("driver/mod.rs"), "{result}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn text_search_ignores_empty_optional_file_path() {
         let dir = make_temp_dir("empty_file_path_text");
         fs::write(dir.join("sample.rs"), "fn marker_function() {}\n").unwrap();

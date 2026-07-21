@@ -380,8 +380,8 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_skill_file_content, execute_activate_skill, execute_load_skill,
-        render_loaded_skill, take_pending_skill_activation,
+        build_skill_file_content, execute_activate_skill, execute_load_skill, render_loaded_skill,
+        take_pending_skill_activation,
     };
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};

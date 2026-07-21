@@ -43,7 +43,9 @@ fn glob_to_regex(pattern: &str) -> Result<Regex, String> {
                 re.push('[');
                 while let Some(cc) = it.next() {
                     re.push(cc);
-                    if cc == ']' { break; }
+                    if cc == ']' {
+                        break;
+                    }
                 }
             }
             '.' | '+' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '\\' => {
@@ -80,7 +82,10 @@ pub fn glob_paths(pattern: &str, root_path: &str) -> Result<Vec<String>, String>
     let pat = p.to_string_lossy().to_string();
     let re = glob_to_regex(&pat)?;
     // 找到通配符之前的目录前缀作为遍历起点
-    let root = match pat.char_indices().find(|(_, c)| matches!(c, '*' | '?' | '[')) {
+    let root = match pat
+        .char_indices()
+        .find(|(_, c)| matches!(c, '*' | '?' | '['))
+    {
         Some((i, _)) => match pat[..i].rfind('/') {
             Some(pos) => Path::new(&pat[..=pos]),
             None => Path::new("."),

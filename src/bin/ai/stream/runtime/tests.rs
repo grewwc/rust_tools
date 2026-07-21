@@ -866,8 +866,7 @@ fn content_part_summary_text_events_never_replay_streamed_reasoning() {
         .unwrap();
     }
     assert_eq!(
-        state.content.reasoning_text,
-        "Analyzing task cancellation",
+        state.content.reasoning_text, "Analyzing task cancellation",
         "content_part 的 summary_text 重发不应重复累积 reasoning_text"
     );
 
@@ -895,8 +894,7 @@ fn content_part_summary_text_events_never_replay_streamed_reasoning() {
         .unwrap();
     }
     assert_eq!(
-        state.content.reasoning_text,
-        "Analyzing task cancellationCollecting and inspecting tasks",
+        state.content.reasoning_text, "Analyzing task cancellationCollecting and inspecting tasks",
         "多段摘要的 content_part 重发仍不应重复累积"
     );
 }

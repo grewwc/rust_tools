@@ -2236,10 +2236,11 @@ fn normalize_messages_drops_path_like_historical_tool_call_names() {
     let normalized = normalize_messages_for_request(&messages);
 
     assert!(normalized.iter().all(|message| {
-        message
-            .tool_calls
-            .as_ref()
-            .is_none_or(|calls| calls.iter().all(|call| call.function.name != "stream/splitter.rs"))
+        message.tool_calls.as_ref().is_none_or(|calls| {
+            calls
+                .iter()
+                .all(|call| call.function.name != "stream/splitter.rs")
+        })
     }));
     assert!(normalized.iter().all(|message| message.role != "tool"));
     assert!(normalized.iter().any(|message| {

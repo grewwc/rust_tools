@@ -361,7 +361,10 @@ mod tests {
 
         clear_reflowed_inline_viewport(&mut terminal, 2).unwrap();
 
-        assert_eq!(terminal.backend_mut().get_cursor_position().unwrap(), cursor);
+        assert_eq!(
+            terminal.backend_mut().get_cursor_position().unwrap(),
+            cursor
+        );
         assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "r");
         assert_eq!(terminal.backend().buffer()[(0, 2)].symbol(), " ");
         assert_eq!(terminal.backend().buffer()[(0, 4)].symbol(), " ");

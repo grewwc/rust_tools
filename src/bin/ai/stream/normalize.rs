@@ -234,7 +234,9 @@ fn parse_content_part_event(
         // 摘要重发，而非模型增量。统一按 SnapshotChunk 处理，走未见后缀去重，
         // 避免 added 事件携带的完整文本按 Append 模式用原文重复累积 reasoning_text，
         // 污染退化检测并可能诱发 thinking 重复渲染（gpt-5.5/5.6 多发此路径）。
-        return Some(ParsedStreamPayload::SnapshotChunk(single_delta_chunk("", &text)));
+        return Some(ParsedStreamPayload::SnapshotChunk(single_delta_chunk(
+            "", &text,
+        )));
     }
     Some(textual_event_chunk(event_type, &text, ""))
 }

@@ -52,7 +52,11 @@ pub fn cap_text(s: &str) -> String {
 }
 
 /// 写出一条成功的 JSON-RPC 响应行并 flush。
-pub async fn write_result<W: AsyncWrite + Unpin>(stdout: &mut W, id: Option<&Value>, result: Value) {
+pub async fn write_result<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    id: Option<&Value>,
+    result: Value,
+) {
     let resp = json!({
         "jsonrpc": "2.0",
         "id": id,

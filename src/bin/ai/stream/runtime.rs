@@ -1375,8 +1375,7 @@ fn process_stream_payload(
         // degenerate_repetition 降档重试路径，避免幻觉正文落盘毒化下一轮请求。这是
         // 零误伤信号：合法重复代码/措辞永不含内部协议标记，无需任何文本统计阈值。
         state.content.finish_reason_seen = true;
-        state.content.finish_reason_value =
-            Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
+        state.content.finish_reason_value = Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
         eprintln!("\n  ⚠ 检测到模型伪造工具结果标记（输出退化），停止当前响应并自动重试…");
         return Ok(true);
     }

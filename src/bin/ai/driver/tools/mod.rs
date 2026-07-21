@@ -16,7 +16,8 @@ use crate::ai::{
     driver::print::{
         echo_tool_args, echo_tool_output, format_file_tool_target, format_tool_status_cached,
         format_tool_status_completed, format_tool_status_deferred, format_tool_status_failed,
-        format_tool_status_running, format_tool_status_skipped, format_tool_status_with_file_target,
+        format_tool_status_running, format_tool_status_skipped,
+        format_tool_status_with_file_target,
     },
     mcp::{McpClient, SharedMcpClient},
     tools as builtin_tools,

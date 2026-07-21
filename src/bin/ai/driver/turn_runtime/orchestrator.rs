@@ -15,7 +15,7 @@
 
 use std::io::Write;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ai::{mcp::SharedMcpClient, types::App};
 
@@ -655,7 +655,25 @@ fn detect_tool_loop(history: &[Vec<String>], window: usize) -> bool {
     if first.is_empty() {
         return false;
     }
-    tail.iter().all(|sigs| sigs == first)
+    if tail.iter().all(|sigs| sigs == first) {
+        return true;
+    }
+
+    // 除 A-A-A-A 外，模型还会以 A-B-A-B 或 A-B-C-A-B-C 的方式规避逐轮
+    // 去重。只识别恰好填满当前窗口的短周期，避免把正常的长任务误判成循环。
+    for period in 2..=3 {
+        if window % period != 0 {
+            continue;
+        }
+        let cycle = &tail[..period];
+        if cycle.iter().any(Vec::is_empty) {
+            continue;
+        }
+        if tail.chunks_exact(period).all(|chunk| chunk == cycle) {
+            return true;
+        }
+    }
+    false
 }
 
 fn signature_set_is_execute_command_only(sigs: &[String]) -> bool {
@@ -740,8 +758,9 @@ fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bool {
         .any(|tc| MUTATION_TOOL_NAMES.contains(&tc.function.name.as_str()))
 }
 
-/// 提取最近一轮 assistant 触碰的「目标资源」集合：文件路径 / 检索 pattern /
-/// 命令首 token。用于 ReadOnly 任务判定「是否碰了新目标」= 信息增益。
+/// 提取最近一轮成功触碰的「目标资源」集合：文件路径 / 检索 pattern / 命令首
+/// token。失败请求（尤其是拼错路径）不能被算作信息增益，否则模型可不断生成
+/// 新的无效参数来逃避收敛。
 fn extract_round_targets(messages: &[crate::ai::history::Message]) -> Vec<String> {
     use serde_json::Value;
     let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
@@ -750,8 +769,27 @@ fn extract_round_targets(messages: &[crate::ai::history::Message]) -> Vec<String
     let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
         return Vec::new();
     };
+    let results_by_call_id: FxHashMap<&str, bool> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| {
+            let call_id = message.tool_call_id.as_deref()?;
+            let text = message.content.as_str().unwrap_or_default().trim_start();
+            Some((
+                call_id,
+                !text.starts_with("Error:") && !text.starts_with("Exit code:"),
+            ))
+        })
+        .collect();
+
     let mut targets = Vec::new();
     for tc in tool_calls.iter() {
+        if results_by_call_id
+            .get(tc.id.as_str())
+            .is_some_and(|success| !success)
+        {
+            continue;
+        }
         let Ok(args) = serde_json::from_str::<Value>(tc.function.arguments.as_str()) else {
             continue;
         };
@@ -760,7 +798,12 @@ fn extract_round_targets(messages: &[crate::ai::history::Message]) -> Vec<String
         };
         for key in ["path", "file_path", "pattern", "query"] {
             if let Some(s) = map.get(key).and_then(|v| v.as_str()) {
-                targets.push(format!("{}:{}", tc.function.name, s.trim()));
+                let target = if matches!(key, "path" | "file_path") {
+                    normalize_path_like_token(s)
+                } else {
+                    s.trim().to_string()
+                };
+                targets.push(format!("{}:{key}:{target}", tc.function.name));
             }
         }
         if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
@@ -1427,6 +1470,22 @@ mod tests {
         let mut history = vec![sig.clone(); TOOL_LOOP_HARD_WINDOW];
         history[1] = vec!["read_file::{\"path\":\"b.rs\"}".to_string()];
         assert!(!detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
+    }
+
+    #[test]
+    fn detect_tool_loop_triggers_for_short_periodic_cycles() {
+        let a = vec!["find_path::{\"pattern\":\"**/a.rs\"}".to_string()];
+        let b = vec!["read_file::{\"path\":\"src/bin/a.rs\"}".to_string()];
+        let c = vec!["code_search::{\"query\":\"internal_note\"}".to_string()];
+
+        assert!(detect_tool_loop(
+            &[a.clone(), b.clone(), a.clone(), b.clone()],
+            TOOL_LOOP_SOFT_WINDOW
+        ));
+        assert!(detect_tool_loop(
+            &[a.clone(), b.clone(), c.clone(), a, b, c],
+            TOOL_LOOP_HARD_WINDOW
+        ));
     }
 
     #[test]
@@ -2134,6 +2193,38 @@ mod tests {
         }
         assert_eq!(breadth_warnings, 1);
         assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+    }
+
+    #[test]
+    fn progress_budget_ignores_failed_readonly_targets() {
+        let mut supervisor = TurnSupervisor::default();
+        supervisor.iteration = 30;
+        let mut messages = Vec::new();
+        let question = "分析这个 agent 的严重 bug";
+        let mut last = ToolLoopSignal::None;
+
+        for i in 0..5 {
+            let call_id = format!("failed-{i}");
+            messages.push(pb_read_msg(
+                &format!("src/missing-{i}.rs"),
+                call_id.as_str(),
+            ));
+            messages.push(crate::ai::history::Message {
+                role: "tool".to_string(),
+                content: serde_json::Value::String("Error: File not found".to_string()),
+                tool_calls: None,
+                tool_call_id: Some(call_id),
+                reasoning_content: None,
+            });
+            last = supervisor.record_tool_signatures(
+                &messages,
+                question,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+        }
+
+        assert!(matches!(last, ToolLoopSignal::LowProgressSoft));
+        assert!(supervisor.progress.seen_targets.is_empty());
     }
 
     #[test]

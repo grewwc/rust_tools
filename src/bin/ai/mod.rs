@@ -2,7 +2,6 @@
 mod agents;
 mod background;
 mod cli;
-mod code_discovery_policy;
 mod config;
 pub mod config_schema;
 mod driver;

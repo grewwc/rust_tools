@@ -7,7 +7,7 @@ use crate::ai::{
     types::{App, ToolCall},
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::Write,
     path::PathBuf,
 };
@@ -251,7 +251,6 @@ fn execute_tool_calls_for_round(
 #[derive(Clone, Copy)]
 enum ToolCallRejectionReason {
     NoToolHandoff,
-    RepeatedReadOnlyCall,
     PatchRetryNeedsFreshRead,
 }
 
@@ -279,10 +278,6 @@ fn rejected_tool_call_message(tool_name: &str, reason: ToolCallRejectionReason) 
             "Error: tool calls are disabled in no-tool handoff mode for this turn. \
 Do not call '{tool_name}' again; instead summarize confirmed facts, answer what you can, and explain the remaining work / blockers / next steps."
         ),
-        ToolCallRejectionReason::RepeatedReadOnlyCall => format!(
-            "Error: this exact repeated read-only tool call was suppressed. \
-Tools remain available, but do not call '{tool_name}' again with the same arguments. Reuse the previous result; if more evidence is necessary, call a different tool or change arguments so the next tool call can produce new information."
-        ),
         ToolCallRejectionReason::PatchRetryNeedsFreshRead => format!(
             "Error: apply_patch retry blocked. The previous patch for this file failed with `context mismatch` or `ambiguous patch`, which means the file content you are working from is stale or the context is not unique. \
 Do NOT retry patches in this batch — doing so will only fail again. Required recovery steps: (1) call `read_file` (or `read_file_lines`) on the SAME target path to get the current truth state; (2) copy context lines DIRECTLY from that fresh output, including function names or distinctive surrounding lines to ensure each hunk matches exactly ONE location; (3) do NOT copy the leading line-number + tab prefix that read_file prints (each line is rendered as a right-aligned line number followed by a TAB, e.g. `    42\\t<code>`) — copy only the code after the tab; (4) call `apply_patch` only in a LATER tool round after you have successfully read the file."
@@ -290,35 +285,43 @@ Do NOT retry patches in this batch — doing so will only fail again. Required r
     }
 }
 
-fn repeated_read_only_tool_request(messages: &[Message], tool_calls: &[ToolCall]) -> bool {
-    let Some(current) = read_only_tool_signature_set(tool_calls) else {
-        return false;
-    };
-    if current.is_empty() {
-        return false;
-    }
-
-    for message in messages.iter().rev() {
+fn duplicate_read_only_call_ids(messages: &[Message], tool_calls: &[ToolCall]) -> HashSet<String> {
+    let mut call_signatures = HashMap::new();
+    let mut completed = HashSet::new();
+    for message in messages {
         if message.role == "user" {
-            return false;
-        }
-        let Some(previous_tool_calls) = message.tool_calls.as_ref() else {
+            call_signatures.clear();
+            completed.clear();
             continue;
-        };
-        if let Some(previous) = read_only_tool_signature_set(previous_tool_calls) {
-            return previous == current;
+        }
+        if let Some(previous_calls) = &message.tool_calls {
+            for tool_call in previous_calls {
+                if let Some(signature) = read_only_tool_signature(tool_call) {
+                    call_signatures.insert(tool_call.id.as_str(), signature);
+                }
+            }
+        }
+        if message.role == "tool"
+            && let Some(call_id) = message.tool_call_id.as_deref()
+            && let Some(signature) = call_signatures.get(call_id)
+            && tool_result_completed_successfully(&message.content)
+        {
+            completed.insert(signature.clone());
         }
     }
 
-    false
+    tool_calls
+        .iter()
+        .filter_map(|tool_call| {
+            let signature = read_only_tool_signature(tool_call)?;
+            completed.contains(&signature).then(|| tool_call.id.clone())
+        })
+        .collect()
 }
 
-fn read_only_tool_signature_set(tool_calls: &[ToolCall]) -> Option<BTreeSet<String>> {
-    let mut signatures = BTreeSet::new();
-    for tool_call in tool_calls {
-        signatures.insert(read_only_tool_signature(tool_call)?);
-    }
-    Some(signatures)
+fn tool_result_completed_successfully(content: &serde_json::Value) -> bool {
+    let text = content.as_str().unwrap_or_default().trim_start();
+    !text.starts_with("Error:") && !text.starts_with("Exit code:")
 }
 
 fn read_only_tool_signature(tool_call: &ToolCall) -> Option<String> {
@@ -467,6 +470,16 @@ fn knowledge_store_mutated(tool_call: &ToolCall) -> bool {
 
 fn duplicate_knowledge_search_message() -> String {
     "Error: this knowledge_search was already completed with the same query in the current user turn. Reuse its result; search again only after knowledge changes or with a materially different query.".to_string()
+}
+
+fn duplicate_read_only_message(tool_name: &str) -> String {
+    if tool_name == "knowledge_search" {
+        return duplicate_knowledge_search_message();
+    }
+    format!(
+        "Error: this read-only call to '{tool_name}' already completed successfully in the current user turn. \
+Reuse its earlier result; only retry after the underlying data changes or with arguments that request different information."
+    )
 }
 
 fn extract_apply_patch_target_paths_from_patch(patch: &str) -> Vec<PathBuf> {
@@ -935,7 +948,7 @@ fn handle_tool_call_round(
     persisted_turn_messages: &mut usize,
     iteration: usize,
     rejection_reason: Option<ToolCallRejectionReason>,
-    suppressed_knowledge_search_call_ids: &HashSet<String>,
+    suppressed_read_only_call_ids: &HashSet<String>,
     turn_had_tool_error: &mut bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let remaining_meta = parse_prune_meta_and_update_marks(
@@ -948,7 +961,7 @@ fn handle_tool_call_round(
     } else {
         let mut observer = TerminalToolObserver::new(app);
         let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
-        execute_tool_calls_with_suppressed_knowledge_search(
+        execute_tool_calls_with_suppressed_read_only_calls(
             &app.session_id,
             mcp_client,
             shared_mcp_client,
@@ -956,7 +969,7 @@ fn handle_tool_call_round(
             &tool_call_execution.allowed_tool_names,
             Some(&mut observer),
             iteration,
-            suppressed_knowledge_search_call_ids,
+            suppressed_read_only_call_ids,
         )?
     };
     *turn_had_tool_error |= exec_result.had_error;
@@ -972,7 +985,6 @@ fn handle_tool_call_round(
     );
     record_hidden_self_note(app, turn_messages, &remaining_meta);
     record_tool_inspection_artifacts(
-        app,
         messages,
         turn_messages,
         &tool_call_execution.allowed_tool_names,
@@ -983,7 +995,7 @@ fn handle_tool_call_round(
     Ok(None)
 }
 
-fn execute_tool_calls_with_suppressed_knowledge_search(
+fn execute_tool_calls_with_suppressed_read_only_calls(
     session_id: &str,
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
@@ -1040,7 +1052,7 @@ fn execute_tool_calls_with_suppressed_knowledge_search(
         if suppressed_call_ids.contains(&tool_call.id) {
             tool_results.push(crate::ai::types::ToolResult {
                 tool_call_id: tool_call.id.clone(),
-                content: duplicate_knowledge_search_message(),
+                content: duplicate_read_only_message(&tool_call.function.name),
             });
             cached_hits.push(false);
             continue;
@@ -1511,11 +1523,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::ToolCall(tool_call_execution) => {
-            let repeated_read_only_call = !*force_final_response
-                && repeated_read_only_tool_request(
-                    messages,
-                    &tool_call_execution.stream_result.tool_calls,
-                );
             let patch_retry_needs_fresh_read = !*force_final_response
                 && patch_retry_requires_fresh_read(
                     messages,
@@ -1523,18 +1530,21 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 );
             let rejection_reason = if *force_final_response {
                 Some(ToolCallRejectionReason::NoToolHandoff)
-            } else if repeated_read_only_call {
-                Some(ToolCallRejectionReason::RepeatedReadOnlyCall)
             } else if patch_retry_needs_fresh_read {
                 Some(ToolCallRejectionReason::PatchRetryNeedsFreshRead)
             } else {
                 None
             };
-            let suppressed_knowledge_search_call_ids = if rejection_reason.is_none() {
-                duplicate_knowledge_search_call_ids(
+            let suppressed_read_only_call_ids = if rejection_reason.is_none() {
+                let mut call_ids = duplicate_read_only_call_ids(
                     messages,
                     &tool_call_execution.stream_result.tool_calls,
-                )
+                );
+                call_ids.extend(duplicate_knowledge_search_call_ids(
+                    messages,
+                    &tool_call_execution.stream_result.tool_calls,
+                ));
+                call_ids
             } else {
                 HashSet::new()
             };
@@ -1556,7 +1566,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 persisted_turn_messages,
                 iteration,
                 rejection_reason,
-                &suppressed_knowledge_search_call_ids,
+                &suppressed_read_only_call_ids,
                 turn_had_tool_error,
             )?;
             append_auto_image_followup_message(
@@ -1766,20 +1776,29 @@ mod tests {
     }
 
     #[test]
-    fn repeated_read_only_tool_request_ignores_call_id_but_matches_payload() {
+    fn duplicate_read_only_call_ids_span_intervening_tool_calls() {
         let args = serde_json::json!({ "file_path": "/tmp/demo.txt", "offset": 1 });
         let previous = test_tool_call("call_previous", "read_file", args.clone());
         let current = test_tool_call("call_current", "read_file", args);
         let messages = vec![
             assistant_tool_call_message(previous),
             tool_result_message("call_previous", "previous result"),
+            assistant_tool_call_message(test_tool_call(
+                "call_other",
+                "find_path",
+                serde_json::json!({ "pattern": "other.rs" }),
+            )),
+            tool_result_message("call_other", "/tmp/other.rs"),
         ];
 
-        assert!(repeated_read_only_tool_request(&messages, &[current]));
+        assert_eq!(
+            duplicate_read_only_call_ids(&messages, &[current]),
+            HashSet::from(["call_current".to_string()])
+        );
     }
 
     #[test]
-    fn repeated_read_only_tool_request_does_not_cross_user_boundary() {
+    fn duplicate_read_only_call_ids_do_not_cross_user_boundary() {
         let args = serde_json::json!({ "file_path": "/tmp/demo.txt" });
         let previous = test_tool_call("call_previous", "read_file", args.clone());
         let current = test_tool_call("call_current", "read_file", args);
@@ -1795,7 +1814,7 @@ mod tests {
             },
         ];
 
-        assert!(!repeated_read_only_tool_request(&messages, &[current]));
+        assert!(duplicate_read_only_call_ids(&messages, &[current]).is_empty());
     }
 
     #[test]
@@ -1808,7 +1827,20 @@ mod tests {
             tool_result_message("call_previous", "previous result"),
         ];
 
-        assert!(!repeated_read_only_tool_request(&messages, &[current]));
+        assert!(duplicate_read_only_call_ids(&messages, &[current]).is_empty());
+    }
+
+    #[test]
+    fn failed_read_only_call_is_not_suppressed() {
+        let args = serde_json::json!({ "file_path": "/tmp/demo.txt" });
+        let previous = test_tool_call("call_previous", "read_file", args.clone());
+        let current = test_tool_call("call_current", "read_file", args);
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_previous", "Error: file temporarily unavailable"),
+        ];
+
+        assert!(duplicate_read_only_call_ids(&messages, &[current]).is_empty());
     }
 
     #[test]
@@ -2055,7 +2087,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_read_only_tool_call_is_rejected_without_forcing_final_response() {
+    fn duplicate_read_only_tool_call_is_suppressed_without_forcing_final_response() {
         let mut app = test_app_with_tools(&["read_file"]);
         let shared_mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
         let current_call = test_tool_call(
@@ -2123,21 +2155,14 @@ mod tests {
                 .content
                 .as_str()
                 .unwrap_or_default()
-                .contains("exact repeated read-only tool call was suppressed")
+                .contains("already completed successfully in the current user turn")
         );
         assert!(
             rejected_tool_result
                 .content
                 .as_str()
                 .unwrap_or_default()
-                .contains("Tools remain available")
-        );
-        assert!(
-            rejected_tool_result
-                .content
-                .as_str()
-                .unwrap_or_default()
-                .contains("call a different tool or change arguments")
+                .contains("underlying data changes")
         );
     }
 

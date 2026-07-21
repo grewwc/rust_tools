@@ -4,10 +4,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use crate::ai::{
-    code_discovery_policy::{
-        CodeDiscoveryRecord, classify_finding, confidence_label, kind_label, persistence_limit,
-        priority_for_confidence, render_record, should_persist,
-    },
     driver::tools::ExecuteToolCallsResult,
     history::{Message, ROLE_INTERNAL_NOTE, SessionStore, is_system_like_role},
     types::App,
@@ -18,8 +14,6 @@ use super::super::types::PreparedToolResult;
 use super::execution::prepare_recent_tool_result;
 
 const CODE_INSPECTION_MEMORY_PREFIX: &str = "Current code-inspection working memory:";
-const CODE_DISCOVERY_PREFIX: &str = "code_discovery:";
-const CODE_DISCOVERY_CATEGORY: &str = "code_discovery";
 const CONTEXT_CHECKPOINT_OPEN: &str = "<context_checkpoint>";
 const CONTEXT_CHECKPOINT_CLOSE: &str = "</context_checkpoint>";
 const CONTEXT_CHECKPOINT_SUMMARY_MAX_CHARS: usize = 240;
@@ -398,20 +392,15 @@ pub(super) fn append_tool_result_messages(
     }
 }
 
-/// 在一次工具调用轮结束后，基于本轮累计的 `turn_messages` 生成两类记账：
-/// (1) code-inspection working memory（写进 `messages`，喂给模型）；
-/// (2) 持久化的 code discoveries（写进 `messages`/`turn_messages` 并落库）。
-/// 两者都依赖对 repo-inspection 工具输出的同一次扫描——这里只扫一次并复用，
-/// 避免在长 turn 里对全量 `turn_messages` 做 O(rounds²) 的重复扫描与 content 克隆。
+/// 在一次工具调用轮结束后，基于本轮累计的 `turn_messages` 生成
+/// code-inspection working memory，避免在长 turn 里重复扫描工具结果。
 pub(super) fn record_tool_inspection_artifacts(
-    app: &App,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
     allowed_tool_names: &rust_tools::commonw::FastSet<String>,
 ) {
     let findings = collect_repo_inspection_findings(turn_messages);
     append_code_inspection_working_memory(messages, turn_messages, &findings, allowed_tool_names);
-    record_persistent_code_discoveries(app, messages, turn_messages, &findings);
 }
 
 fn append_code_inspection_working_memory(
@@ -457,111 +446,6 @@ fn append_code_inspection_working_memory(
         tool_call_id: None,
         reasoning_content: None,
     });
-}
-
-fn record_persistent_code_discoveries(
-    app: &App,
-    messages: &mut Vec<Message>,
-    turn_messages: &mut Vec<Message>,
-    findings: &[RepoInspectionFinding],
-) {
-    let discoveries = build_persistent_code_discoveries(findings);
-    if discoveries.is_empty() {
-        return;
-    }
-
-    let body = discoveries
-        .iter()
-        .map(render_record)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // 渐进式合并：把新 discoveries 合并到已有的 code_discovery internal_note，
-    // 避免多轮 push 出 N 条 code_discovery 记录堆在 messages 里。
-    // 行级去重保留首次出现，新发现追加到尾部。
-    let merged_into_existing = merge_into_existing_code_discovery(messages, &body)
-        || merge_into_existing_code_discovery(turn_messages, &body);
-    if !merged_into_existing {
-        let record = Message {
-            role: ROLE_INTERNAL_NOTE.to_string(),
-            content: Value::String(format!("{CODE_DISCOVERY_PREFIX}\n{body}")),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        };
-        append_message_pair(messages, turn_messages, record);
-    }
-
-    let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
-    let session_source = format!("session:{}", app.session_id);
-    for discovery in &discoveries {
-        let entry = crate::ai::tools::storage::memory_store::AgentMemoryEntry {
-            id: None,
-            timestamp: chrono::Local::now().to_rfc3339(),
-            category: CODE_DISCOVERY_CATEGORY.to_string(),
-            note: discovery.finding.clone(),
-            tags: vec![
-                "code".to_string(),
-                "debug".to_string(),
-                "session".to_string(),
-                format!("kind:{}", kind_label(discovery.kind)),
-                format!("confidence:{}", confidence_label(discovery.confidence)),
-            ],
-            source: Some(session_source.clone()),
-            priority: Some(priority_for_confidence(discovery.confidence)),
-            owner_pid: None,
-            owner_pgid: None,
-            image_path: None,
-        };
-        let _ = store.append(&entry);
-    }
-    store.maintain_after_append();
-}
-
-/// 把 new_body 行级追加到已有 code_discovery internal_note 末尾（去重保留首次）。
-/// 命中已有 note 时 in-place 替换其内容并返回 true；否则返回 false（调用方走 push 路径）。
-fn merge_into_existing_code_discovery(messages: &mut [Message], new_body: &str) -> bool {
-    for message in messages.iter_mut().rev() {
-        if message.role != ROLE_INTERNAL_NOTE {
-            continue;
-        }
-        let Value::String(content) = &message.content else {
-            continue;
-        };
-        if !content.starts_with(CODE_DISCOVERY_PREFIX) {
-            continue;
-        }
-        let existing_body = content[CODE_DISCOVERY_PREFIX.len()..]
-            .trim_start()
-            .to_string();
-        let mut seen: FxHashSet<String> = existing_body
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-        let mut merged = existing_body.clone();
-        let mut appended_any = false;
-        for line in new_body.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if seen.insert(trimmed.to_string()) {
-                if !merged.is_empty() && !merged.ends_with('\n') {
-                    merged.push('\n');
-                }
-                merged.push_str(trimmed);
-                appended_any = true;
-            }
-        }
-        if !appended_any {
-            // 完全是已记录过的行：什么都不做，返回 true 表示无需新增 message
-            return true;
-        }
-        message.content = Value::String(format!("{CODE_DISCOVERY_PREFIX}\n{merged}"));
-        return true;
-    }
-    false
 }
 
 pub(super) fn record_final_stream_response(
@@ -704,20 +588,6 @@ fn normalized_tool_arguments(raw: &str) -> String {
         .unwrap_or_else(|_| raw.trim().to_string())
 }
 
-fn build_persistent_code_discoveries(
-    findings: &[RepoInspectionFinding],
-) -> Vec<CodeDiscoveryRecord> {
-    findings
-        .iter()
-        .filter_map(|finding| classify_code_discovery(finding))
-        .rev()
-        .take(persistence_limit())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
 fn collect_repo_inspection_findings(turn_messages: &[Message]) -> Vec<RepoInspectionFinding> {
     let tool_outputs = turn_messages
         .iter()
@@ -790,21 +660,6 @@ fn is_raw_repo_tool(tool_name: &str) -> bool {
 
 fn is_write_tool(tool_name: &str) -> bool {
     matches!(tool_name, "apply_patch" | "write_file")
-}
-
-fn persistent_code_discovery_already_present(messages: &[Message], body: &str) -> bool {
-    messages.iter().any(|message| match &message.content {
-        Value::String(content) => {
-            content.starts_with(CODE_DISCOVERY_PREFIX)
-                && content[CODE_DISCOVERY_PREFIX.len()..].trim_start() == body
-        }
-        _ => false,
-    })
-}
-
-fn classify_code_discovery(finding: &RepoInspectionFinding) -> Option<CodeDiscoveryRecord> {
-    let record = classify_finding(&finding.tool_name, &finding.highlight, &finding.rendered)?;
-    should_persist(record.confidence).then_some(record)
 }
 
 fn infer_apply_patch_targets(args: &Value) -> Vec<String> {
@@ -988,15 +843,12 @@ fn truncate_note(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         RepoInspectionFinding, build_code_inspection_working_memory,
-        build_persistent_code_discoveries, classify_code_discovery,
         collect_repo_inspection_findings, describe_tool_call, is_repo_inspection_tool,
-        persistent_code_discovery_already_present,
     };
     use super::{
         extract_context_checkpoints, save_context_checkpoint_in_dir, smart_truncate_to_sentence,
         truncate_checkpoint_summary,
     };
-    use crate::ai::code_discovery_policy::{CodeDiscoveryConfidence, CodeDiscoveryKind};
     use crate::ai::history::Message;
     use crate::ai::types::{FunctionCall, ToolCall};
     use serde_json::Value;
@@ -1240,109 +1092,6 @@ mod tests {
         .expect("note");
         assert!(!note.contains("Code-navigation correction"));
         assert!(!note.contains("`code_search`"));
-    }
-
-    #[test]
-    fn persistent_code_discoveries_keep_only_high_value_findings() {
-        let turn_messages = vec![
-            Message {
-                role: "assistant".to_string(),
-                content: Value::String(String::new()),
-                tool_calls: Some(vec![
-                    tool_call(
-                        "1",
-                        "read_file_lines",
-                        serde_json::json!({"file_path":"src/lib.rs","offset":10,"limit":20}),
-                    ),
-                    tool_call("2", "list_directory", serde_json::json!({"path":"src"})),
-                ]),
-                tool_call_id: None,
-                reasoning_content: None,
-            },
-            Message {
-                role: "tool".to_string(),
-                content: Value::String("    10\tfn load_config() {".to_string()),
-                tool_calls: None,
-                tool_call_id: Some("1".to_string()),
-                reasoning_content: None,
-            },
-            Message {
-                role: "tool".to_string(),
-                content: Value::String("main.rs\nlib.rs".to_string()),
-                tool_calls: None,
-                tool_call_id: Some("2".to_string()),
-                reasoning_content: None,
-            },
-        ];
-
-        let findings = collect_repo_inspection_findings(&turn_messages);
-        let discoveries = build_persistent_code_discoveries(&findings);
-        assert_eq!(discoveries.len(), 1);
-        assert!(discoveries[0].finding.contains("fn load_config()"));
-    }
-
-    #[test]
-    fn duplicate_persistent_discovery_is_detected() {
-        let messages = vec![Message {
-            role: "system".to_string(),
-            content: Value::String(
-                "code_discovery:\n- read_file_lines(file=src/lib.rs, lines=10..29) => fn load_config() {"
-                    .to_string(),
-            ),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        }];
-
-        assert!(persistent_code_discovery_already_present(
-            &messages,
-            "- read_file_lines(file=src/lib.rs, lines=10..29) => fn load_config() {"
-        ));
-    }
-
-    #[test]
-    fn classify_code_discovery_marks_root_cause() {
-        let finding = RepoInspectionFinding {
-            tool_name: "read_file_lines".to_string(),
-            rendered:
-                "- read_file_lines(file=src/main.rs, lines=40..50) => root cause: config cache is empty due to missing APP_ENV"
-                    .to_string(),
-            highlight: "root cause: config cache is empty due to missing APP_ENV".to_string(),
-        };
-
-        let record = classify_code_discovery(&finding).expect("record");
-        assert_eq!(record.kind, CodeDiscoveryKind::RootCause);
-        assert_eq!(record.confidence, CodeDiscoveryConfidence::High);
-    }
-
-    #[test]
-    fn classify_code_discovery_marks_entry_point() {
-        let finding = RepoInspectionFinding {
-            tool_name: "read_file_lines".to_string(),
-            rendered:
-                "- read_file_lines(file=src/main.rs, lines=1..20) => fn main() calls app::run() as the entry point"
-                    .to_string(),
-            highlight: "fn main() calls app::run() as the entry point".to_string(),
-        };
-
-        let record = classify_code_discovery(&finding).expect("record");
-        assert_eq!(record.kind, CodeDiscoveryKind::EntryPoint);
-        assert_eq!(record.confidence, CodeDiscoveryConfidence::High);
-    }
-
-    #[test]
-    fn classify_code_discovery_marks_call_chain() {
-        let finding = RepoInspectionFinding {
-            tool_name: "code_search".to_string(),
-            rendered:
-                "- code_search(operation=structural, intent=find_calls, query=load_config) => call chain: main -> bootstrap -> load_config"
-                    .to_string(),
-            highlight: "call chain: main -> bootstrap -> load_config".to_string(),
-        };
-
-        let record = classify_code_discovery(&finding).expect("record");
-        assert_eq!(record.kind, CodeDiscoveryKind::CallChain);
-        assert_eq!(record.confidence, CodeDiscoveryConfidence::Medium);
     }
 
     #[test]

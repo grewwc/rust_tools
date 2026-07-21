@@ -303,13 +303,7 @@ async fn tool_navigate(
                 .await
                 .map_err(|e| format!("wait_selector '{sel}' not found: {e}"))?;
         }
-        let title = s
-            .page
-            .get_title()
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let title = s.page.get_title().await.ok().flatten().unwrap_or_default();
         let final_url = s.page.url().await.ok().flatten().unwrap_or(url.clone());
         let mut summary = format!("Navigated to {final_url}\nTitle: {title}");
         if let Some(cat) = detect_user_action_required(&s.page).await {
@@ -322,7 +316,10 @@ async fn tool_navigate(
     Ok(text_content(summary))
 }
 
-async fn tool_click(session: &mut Option<BrowserSession>, args: &Value) -> Result<Value, JsonRpcErr> {
+async fn tool_click(
+    session: &mut Option<BrowserSession>,
+    args: &Value,
+) -> Result<Value, JsonRpcErr> {
     let selector = require_str(args, "selector")?;
     let ms = op_timeout_ms();
     let s = ensure_session(session)
@@ -338,9 +335,7 @@ async fn tool_click(session: &mut Option<BrowserSession>, args: &Value) -> Resul
         el.scroll_into_view()
             .await
             .map_err(|e| format!("scroll_into_view failed: {e}"))?;
-        el.click()
-            .await
-            .map_err(|e| format!("click failed: {e}"))?;
+        el.click().await.map_err(|e| format!("click failed: {e}"))?;
         Ok(())
     })
     .await?;
@@ -358,7 +353,10 @@ async fn tool_type_text(
         .and_then(|v| v.as_str())
         .ok_or_else(|| JsonRpcErr::new(-32602, "missing 'text'", None))?
         .to_string();
-    let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
+    let submit = args
+        .get("submit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let char_count = text.chars().count();
     let ms = op_timeout_ms();
     let s = ensure_session(session)
@@ -374,9 +372,7 @@ async fn tool_type_text(
         el.scroll_into_view()
             .await
             .map_err(|e| format!("scroll_into_view failed: {e}"))?;
-        el.focus()
-            .await
-            .map_err(|e| format!("focus failed: {e}"))?;
+        el.focus().await.map_err(|e| format!("focus failed: {e}"))?;
         el.type_str(&text)
             .await
             .map_err(|e| format!("type failed: {e}"))?;
@@ -414,9 +410,7 @@ async fn tool_press_key(
             .find_element(target.clone())
             .await
             .map_err(|e| format!("focus target '{target}' not found: {e}"))?;
-        el.focus()
-            .await
-            .map_err(|e| format!("focus failed: {e}"))?;
+        el.focus().await.map_err(|e| format!("focus failed: {e}"))?;
         el.press_key(&key)
             .await
             .map_err(|e| format!("press_key '{key}' failed: {e}"))?;
@@ -486,7 +480,9 @@ async fn tool_wait_for(
                 return Ok(format!("Found {selector} after {ms} ms"));
             }
             if start.elapsed().as_millis() as u64 >= timeout_ms {
-                return Err(format!("selector '{selector}' not found within {timeout_ms} ms"));
+                return Err(format!(
+                    "selector '{selector}' not found within {timeout_ms} ms"
+                ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -738,8 +734,9 @@ fn resolve_screenshot_path(explicit: Option<String>) -> Result<PathBuf, JsonRpcE
         dir.join(format!("screenshot-{ts}.png"))
     };
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| JsonRpcErr::new(-32000, &format!("cannot create screenshot dir: {e}"), None))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            JsonRpcErr::new(-32000, &format!("cannot create screenshot dir: {e}"), None)
+        })?;
     }
     Ok(std::path::absolute(&path).unwrap_or(path))
 }
