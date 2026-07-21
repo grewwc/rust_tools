@@ -125,9 +125,9 @@ pub(super) fn build_model_overflow_stub(
     let overflow_notice = if let Some(path) = path {
         format!(
             "Output too large; full result saved to a file. The COMPLETE output is NOT in context.\n\
-             To read it, call read_file on this path (read in chunks, e.g. offset=1, limit=200), \
-             then narrow to precise line ranges once located.\n\
-             The summary / tail_preview below are PARTIAL — do not rely on them if you need full detail.\n\
+             Do NOT read this overflow file by default. First use the summary / key_lines / head_preview / tail_preview below to decide whether you already have enough evidence.\n\
+             Only call read_file on `file_path` when the current question genuinely depends on omitted exact text that is not recoverable from the previews.\n\
+             Treat `file_path` as an overflow archive, not as the original source/document path.\n\
              - file_path: {}\n- summary: {}\n",
             path.display(),
             summary.summary
