@@ -149,9 +149,23 @@ pub(super) fn fold_tool_call_group_to_stub(
     ));
     lines.push(COMPRESSED_TOOL_EVIDENCE_MARKER.to_string());
 
-    let assistant_text = value_to_string(&assistant.content);
-    let assistant_text = normalize_whitespace(assistant_text.trim());
-    if assistant_text.is_empty() {
+    // checkpoint 优先取 assistant 正文；但 tool-call 轮的 content 往往为空
+    // （模型只发 tool_calls、无叙述）。此时回退到 reasoning_content——那是模型
+    // 发起这批调用前的思考，作为压缩后的决策锚点远比固定的 <empty> 有价值，
+    // 能避免模型在压缩后失忆、从同一轮重启取证。
+    let assistant_content = value_to_string(&assistant.content);
+    let assistant_text = normalize_whitespace(assistant_content.trim());
+    let checkpoint = if !assistant_text.is_empty() {
+        assistant_text
+    } else {
+        assistant
+            .reasoning_content
+            .as_deref()
+            .map(|reasoning| normalize_whitespace(reasoning.trim()))
+            .filter(|reasoning| !reasoning.is_empty())
+            .unwrap_or_default()
+    };
+    if checkpoint.is_empty() {
         lines.push(
             "assistant_checkpoint: <empty; no persisted decision before these tool calls>"
                 .to_string(),
@@ -159,7 +173,7 @@ pub(super) fn fold_tool_call_group_to_stub(
     } else {
         lines.push(format!(
             "assistant_checkpoint: {}",
-            truncate_to_chars(&assistant_text, 720)
+            truncate_to_chars(&checkpoint, 720)
         ));
     }
     lines.push("evidence:".to_string());
