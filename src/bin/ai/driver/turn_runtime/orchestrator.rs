@@ -29,6 +29,7 @@ use super::{
     iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
     mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
     persistence::persist_pending_turn_messages,
+    record_llm_summary_attempt_chars, should_try_llm_summary,
     prepare::prepare_turn,
     tool_result::handle_iteration_execution,
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
@@ -1365,9 +1366,15 @@ impl TurnSupervisor {
         free_explore_rounds: usize,
     ) -> ToolLoopSignal {
         // 本轮是否推进了任务：触碰新目标（信息增益）或调用变更类工具（实质动作）。
-        let mut made_progress = round_has_mutation(progress_messages);
+        // 两类信号要分开保留：ReadOnlyBreadth 只能由“继续扩展只读证据面”触发；
+        // 一旦本轮已有 apply_patch/write_file/delete_path 等 mutation，就不应再给模型
+        // 注入“先收敛证据”的 prompt。
+        let round_had_mutation = round_has_mutation(progress_messages);
+        let mut made_progress = round_had_mutation;
+        let mut added_new_target = false;
         for t in extract_round_targets(progress_messages) {
             if self.progress.seen_targets.insert(t) {
+                added_new_target = true;
                 made_progress = true;
             }
         }
@@ -1398,6 +1405,8 @@ impl TurnSupervisor {
             self.progress.consecutive_no_progress = 0;
             self.progress.last_reasoning_fp = reasoning_fp;
             if !self.progress.read_only_breadth_injected
+                && !round_had_mutation
+                && added_new_target
                 && self.iteration > free_explore_rounds
                 && self.progress.seen_targets.len() >= READ_ONLY_BREADTH_CHECK_TARGETS
             {
@@ -2574,6 +2583,43 @@ mod tests {
     }
 
     #[test]
+    fn progress_budget_does_not_inject_readonly_breadth_after_mutation() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+
+        // 先积累到 breadth 阈值前一格，模拟已经读过很多证据但还没触发
+        // ReadOnlyBreadth 的状态。
+        for i in 1..READ_ONLY_BREADTH_CHECK_TARGETS {
+            supervisor.next_iteration();
+            messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("tc-{i}")));
+            let signal = supervisor.record_tool_signatures(
+                &messages,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+            assert!(
+                matches!(signal, ToolLoopSignal::None),
+                "pre-threshold read-only exploration should stay silent: {signal:?}"
+            );
+        }
+
+        supervisor.next_iteration();
+        messages.push(pb_apply_patch_msg("patch-after-breadth"));
+        messages.push(pb_tool_result(
+            "patch-after-breadth",
+            "Patch applied successfully.",
+        ));
+        let signal =
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+
+        assert!(
+            matches!(signal, ToolLoopSignal::None),
+            "mutation progress must not inject read-only breadth convergence prompt: {signal:?}"
+        );
+        assert!(!supervisor.progress.read_only_breadth_injected);
+        assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+    }
+
+    #[test]
     fn progress_budget_ignores_failed_readonly_targets() {
         let mut supervisor = TurnSupervisor::default();
         supervisor.iteration = 30;
@@ -3581,7 +3627,9 @@ async fn run_turn_body(
             }
             // 硬阈值：无损 + 弱损管线之后仍超额，调用 LLM 摘要兜底，
             // 把早期对话压成单条 internal_note，并在终端打 status line。
-            if after > mid_turn_hard {
+            if after > mid_turn_hard
+                && should_try_llm_summary(&app.session_id, after, mid_turn_hard)
+            {
                 crate::ai::driver::print::print_tool_note_line(
                     "compress",
                     &format!(
@@ -3600,6 +3648,7 @@ async fn run_turn_body(
                     )
                     .await;
                 messages = after_msgs;
+                record_llm_summary_attempt_chars(&app.session_id, llm_after);
                 if did_summarize {
                     print_compress_status("mid-turn (llm)", llm_before, llm_after);
                 } else {

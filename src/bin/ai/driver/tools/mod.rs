@@ -1075,6 +1075,9 @@ fn finalize_execution_result(
 }
 
 fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
+    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        return;
+    }
     let name = &tool_call.function.name;
     let inline_file_target = matches!(name.as_str(), "read_file" | "write_file" | "apply_patch")
         .then(|| format_file_tool_target(name, &tool_call.function.arguments))
@@ -1241,9 +1244,11 @@ fn run_one(
         );
     }
 
-    // 不换行，以便完成状态用 \r 覆盖在同一行
-    print!("{}", format_tool_status_running(&tool_call.function.name));
-    let _ = std::io::stdout().flush();
+    if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        // 不换行，以便完成状态用 \r 覆盖在同一行
+        print!("{}", format_tool_status_running(&tool_call.function.name));
+        let _ = std::io::stdout().flush();
+    }
 
     if let Err(run_result) = reserve_current_process_tool_call_budget(tool_call) {
         return (prepared.route, run_result);
@@ -1323,8 +1328,10 @@ fn execute_tool_calls_inner(
     let mut idx = 0usize;
     while idx < tool_calls.len() {
         if crate::ai::tools::registry::common::is_tool_cancel_requested() {
-            for deferred in &tool_calls[idx..] {
-                println!("{}", format_tool_status_deferred(&deferred.function.name));
+            if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                for deferred in &tool_calls[idx..] {
+                    println!("{}", format_tool_status_deferred(&deferred.function.name));
+                }
             }
             break;
         }
@@ -1407,15 +1414,19 @@ fn execute_tool_calls_inner(
         had_error |= !run_result.ok;
 
         if should_barrier && !is_last {
-            for deferred in &tool_calls[idx + 1..] {
-                println!("{}", format_tool_status_deferred(&deferred.function.name));
+            if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                for deferred in &tool_calls[idx + 1..] {
+                    println!("{}", format_tool_status_deferred(&deferred.function.name));
+                }
             }
             break;
         }
 
         if crate::ai::tools::registry::common::is_tool_cancel_requested() {
-            for deferred in &tool_calls[idx + 1..] {
-                println!("{}", format_tool_status_deferred(&deferred.function.name));
+            if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                for deferred in &tool_calls[idx + 1..] {
+                    println!("{}", format_tool_status_deferred(&deferred.function.name));
+                }
             }
             break;
         }

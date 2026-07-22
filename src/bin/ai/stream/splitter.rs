@@ -331,6 +331,7 @@ enum AnthropicXmlPhase {
         name: String,
         params: serde_json::Map<String, serde_json::Value>,
         key: String,
+        force_string: bool,
         value: String,
     },
     /// 正在吞除一个模型幻觉的「工具结果」块，直到遇到匹配的闭标签或流结束。
@@ -350,7 +351,11 @@ enum AnthropicTagClass {
     Wrapper,
     InvokeOpen(String),
     InvokeClose,
-    ParamOpen(String),
+    ParamOpen {
+        key: String,
+        /// `string="true"` 属性：参数值应始终作为字符串，即使值形如 JSON 标量。
+        force_string: bool,
+    },
     ParamClose,
     /// 系统内部「工具结果」协议标记（`function_results` / `tool_result` 等）。
     /// 系统自身从不生成这类标记；出现即模型幻觉。开标签启动整块吞除，直到匹配的闭标签
@@ -472,7 +477,7 @@ impl AnthropicXmlToolCallStreamer {
                     let class = classify_anthropic_tag(&tag);
                     self.pending.drain(..=gt_rel);
                     match class {
-                        AnthropicTagClass::ParamOpen(key) => {
+                        AnthropicTagClass::ParamOpen { key, force_string } => {
                             if let AnthropicXmlPhase::InInvoke { name, params } =
                                 std::mem::take(&mut self.phase)
                             {
@@ -480,6 +485,7 @@ impl AnthropicXmlToolCallStreamer {
                                     name,
                                     params,
                                     key,
+                                    force_string,
                                     value: String::new(),
                                 };
                             }
@@ -522,13 +528,14 @@ impl AnthropicXmlToolCallStreamer {
                             name,
                             params,
                             key,
+                            force_string,
                             value,
                         } = std::mem::take(&mut self.phase)
                         {
                             let mut value = value;
                             value.push_str(&self.pending[..lt]);
                             let mut params = params;
-                            insert_anthropic_param(&mut params, key, &value);
+                            insert_anthropic_param(&mut params, key, &value, force_string);
                             self.phase = AnthropicXmlPhase::InInvoke { name, params };
                         }
                         self.pending.drain(..=gt_rel);
@@ -697,11 +704,16 @@ fn insert_anthropic_param(
     params: &mut serde_json::Map<String, serde_json::Value>,
     key: String,
     raw_value: &str,
+    force_string: bool,
 ) {
     if key.is_empty() {
         return;
     }
     let raw = raw_value.trim();
+    if force_string {
+        params.insert(key, serde_json::Value::String(raw.to_string()));
+        return;
+    }
     // 尝试把值解析成 JSON 标量/结构（数字、bool、对象、数组）；否则当字符串。
     let value = serde_json::from_str::<serde_json::Value>(raw)
         .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
@@ -754,7 +766,10 @@ fn classify_anthropic_tag(tag: &str) -> AnthropicTagClass {
             if is_close {
                 AnthropicTagClass::ParamClose
             } else {
-                AnthropicTagClass::ParamOpen(parse_anthropic_name_attr(attrs))
+                AnthropicTagClass::ParamOpen {
+                    key: parse_anthropic_name_attr(attrs),
+                    force_string: parse_anthropic_bool_attr(attrs, "string"),
+                }
             }
         }
         _ => AnthropicTagClass::Other,
@@ -763,22 +778,83 @@ fn classify_anthropic_tag(tag: &str) -> AnthropicTagClass {
 
 /// 从标签属性串里解析 `name="..."` 或 `name='...'` 的值。
 fn parse_anthropic_name_attr(attrs: &str) -> String {
-    let Some(pos) = attrs.find("name") else {
-        return String::new();
-    };
-    let after = attrs[pos + "name".len()..].trim_start();
-    let after = after.strip_prefix('=').unwrap_or(after).trim_start();
-    let (quote, rest) = if let Some(rest) = after.strip_prefix('"') {
-        ('"', rest)
-    } else if let Some(rest) = after.strip_prefix('\'') {
-        ('\'', rest)
-    } else {
-        return String::new();
-    };
-    match rest.find(quote) {
-        Some(end) => rest[..end].to_string(),
-        None => String::new(),
+    parse_xml_attr_value(attrs, "name")
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn parse_anthropic_bool_attr(attrs: &str, name: &str) -> bool {
+    parse_xml_attr_value(attrs, name).is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+/// 按 XML 属性边界扫描属性值，避免把目标名称误匹配到其他属性名或已引用的属性值中。
+pub(super) fn parse_xml_attr_value<'a>(input: &'a str, target: &str) -> Option<&'a str> {
+    let bytes = input.as_bytes();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_whitespace() || matches!(bytes[cursor], b'<' | b'>' | b'/'))
+        {
+            cursor += 1;
+        }
+        let name_start = cursor;
+        while cursor < bytes.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b'=' | b'>' | b'/')
+        {
+            cursor += 1;
+        }
+        if name_start == cursor {
+            cursor += 1;
+            continue;
+        }
+        let candidate = &input[name_start..cursor];
+
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+
+        let (value_start, value_end) = match bytes.get(cursor).copied() {
+            Some(quote @ (b'"' | b'\'')) => {
+                cursor += 1;
+                let start = cursor;
+                while cursor < bytes.len() && bytes[cursor] != quote {
+                    cursor += 1;
+                }
+                if cursor == bytes.len() {
+                    return None;
+                }
+                let end = cursor;
+                cursor += 1;
+                (start, end)
+            }
+            Some(_) => {
+                let start = cursor;
+                while cursor < bytes.len()
+                    && !bytes[cursor].is_ascii_whitespace()
+                    && !matches!(bytes[cursor], b'>' | b'/')
+                {
+                    cursor += 1;
+                }
+                (start, cursor)
+            }
+            None => return None,
+        };
+
+        if candidate == target {
+            return Some(&input[value_start..value_end]);
+        }
     }
+
+    None
 }
 
 fn sanitize_internal_tool_call_name(raw: &str) -> String {
@@ -1280,6 +1356,44 @@ mod tests {
             Some(&InternalToolCallStreamEvent::Begin("read_file".to_string()))
         );
         assert!(!events2.contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker));
+    }
+
+    #[test]
+    fn anthropic_streamer_respects_string_true_attr() {
+        // DSML `string="true"`：值看起来像 JSON 标量时仍保持为字符串。
+        let mut s = super::AnthropicXmlToolCallStreamer::new();
+        let (cleaned, events) = s.push(
+            r#"<tool_calls><invoke name="enable_tools"><parameter name="operation" string="true">enable</parameter><parameter name="tools" string="false">["read_file"]</parameter><parameter name="flag" string="true">true</parameter></invoke></tool_calls>"#,
+        );
+        assert_eq!(cleaned, "");
+        let mut it = events.into_iter();
+        assert_eq!(it.next(), Some(InternalToolCallStreamEvent::Begin("enable_tools".to_string())));
+        let InternalToolCallStreamEvent::Args(args) = it.next().expect("expected args event") else {
+            panic!("expected args event");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(parsed["operation"], "enable");
+        assert!(parsed["operation"].is_string());
+        assert_eq!(parsed["tools"], serde_json::json!(["read_file"]));
+        assert_eq!(parsed["flag"], "true");
+        assert!(parsed["flag"].is_string());
+        assert_eq!(it.next(), Some(InternalToolCallStreamEvent::End));
+    }
+
+    #[test]
+    fn anthropic_streamer_matches_bool_attributes_by_exact_name() {
+        let mut s = super::AnthropicXmlToolCallStreamer::new();
+        let (cleaned, events) = s.push(
+            r#"<invoke name="enable_tools"><parameter name="string" string="true">123</parameter><parameter name="count" notstring="true" string="false">456</parameter></invoke>"#,
+        );
+        assert_eq!(cleaned, "");
+
+        let InternalToolCallStreamEvent::Args(args) = &events[1] else {
+            panic!("expected args event");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(args).unwrap();
+        assert_eq!(parsed["string"], "123");
+        assert_eq!(parsed["count"], 456);
     }
 
     #[test]

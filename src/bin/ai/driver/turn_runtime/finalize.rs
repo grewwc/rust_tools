@@ -34,7 +34,9 @@ fn ensure_final_assistant_recorded(
         return;
     }
 
-    println!("\n{}", final_assistant_text.yellow());
+    if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        println!("\n{}", final_assistant_text.yellow());
+    }
     turn_messages.push(Message {
         role: "assistant".to_string(),
         content: Value::String(final_assistant_text.to_string()),
@@ -328,7 +330,9 @@ pub(super) async fn finalize_turn(
             } else {
                 compact_session_history_at_boundary_with_app(app).await
             };
-            if let Err(err) = compact_result {
+            if let Err(err) = compact_result
+                && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+            {
                 eprintln!("[Warning] Failed to compact persisted history: {}", err);
             }
         }
@@ -371,17 +375,23 @@ pub(super) async fn finalize_turn(
             if output.display_lines.is_empty() {
                 continue;
             }
-            if first_observer_emitted {
+            if first_observer_emitted
+                && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+            {
                 println!("---");
             }
             first_observer_emitted = true;
-            for line in &output.display_lines {
-                println!("{}", line);
+            if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                for line in &output.display_lines {
+                    println!("{}", line);
+                }
             }
         }
         let _ = poisoned;
     } else {
-        println!("{}", format_empty_state("no response"));
+        if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+            println!("{}", format_empty_state("no response"));
+        }
         app.last_turn_had_tool_calls = false;
     }
 

@@ -9,4 +9,4 @@ pub(in crate::ai) const ACCENT_MUTED: &str = "\x1b[38;2;148;163;184m";
 pub(in crate::ai) const ACCENT_SUCCESS: &str = "\x1b[38;2;134;194;166m";
 pub(in crate::ai) const ACCENT_WARN: &str = "\x1b[38;2;245;158;11m";
 pub(in crate::ai) const ACCENT_DANGER: &str = "\x1b[38;2;251;113;133m";
-pub(in crate::ai) const ACCENT_RULE: &str = "\x1b[38;2;51;65;85m";
+pub(in crate::ai) const ACCENT_RULE: &str = "\x1b[38;2;71;85;105m";

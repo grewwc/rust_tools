@@ -74,7 +74,7 @@ pub mod tools;
 pub mod turn_runtime;
 
 use agent_routing::*;
-use background_dispatch::dispatch_background_batch;
+use background_dispatch::{SubagentStatusLine, dispatch_background_batch};
 pub use commands::try_handle_interactive_command;
 pub use mcp_init::*;
 use mcp_lifecycle::*;
@@ -627,6 +627,7 @@ async fn run_loop(
     } else {
         None
     };
+    let mut subagent_status_line = SubagentStatusLine::new();
 
     let cleanup_one_shot = |app: &App| {
         // 会话结束：清理本会话遗留的后台进程组（如 `python app.py &` 派生的
@@ -670,11 +671,18 @@ async fn run_loop(
         // 调度器资源。函数内分两步取锁（先 registry 后 kernel），不与 task_wait 的
         // 锁顺序（registry -> kernel）形成环；且此处已释放 app.os 锁，无重入死锁。
         crate::ai::tools::task_tools::reap_timed_out_subagents();
+        // `task_wait.timeout_secs` 是真实 wall-clock 预算，不依赖 scheduler tick
+        // 频率。到期后主动唤醒等待中的 foreground 进程，让下一次 task_wait 返回
+        // BUDGET ELAPSED，而不是因 tick 漂移无限续等。
+        crate::ai::tools::task_tools::wake_expired_task_waits();
 
         if let Some(counter) = app.agent_reload_counter.as_mut() {
             *counter += 1;
             if manifests_loaded && *counter % 5 == 0 {
-                reload_agent_manifests(agent_manifests);
+                if let Some(message) = reload_agent_manifests(agent_manifests) {
+                    subagent_status_line.finish();
+                    println!("{message}");
+                }
             }
         } else {
             app.agent_reload_counter = Some(0);
@@ -705,12 +713,14 @@ async fn run_loop(
             &mut manifests_loaded,
             epoch,
         );
+        subagent_status_line.refresh(app);
 
         let fg_proc = {
             let mut os = app.os.lock().unwrap();
             os.pop_foreground_ready()
         };
         if let Some(proc) = fg_proc {
+            subagent_status_line.finish();
             run_foreground_resume(app, mcp_client, skill_manifests, agent_manifests, proc).await;
             continue;
         }
@@ -727,6 +737,8 @@ async fn run_loop(
             tokio::time::sleep(Duration::from_millis(20)).await;
             continue;
         }
+
+        subagent_status_line.finish();
 
         {
             // ── Goal 模式自动续推 ──

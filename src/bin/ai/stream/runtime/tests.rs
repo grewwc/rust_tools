@@ -19,8 +19,10 @@ fn prompt_cache_metrics_none_without_hit() {
 #[test]
 fn prompt_cache_metrics_reports_hit_rate() {
     let line = format_prompt_cache_metrics(1000, 750).unwrap();
-    assert!(line.contains("750/1000"));
-    assert!(line.contains("75% hit"));
+    assert_eq!(line, "↳ cache · 750/1.0k tokens · 75% hit");
+
+    let large = format_prompt_cache_metrics(59_798, 59_648).unwrap();
+    assert_eq!(large, "↳ cache · 59.6k/59.8k tokens · 100% hit");
 }
 
 #[test]
@@ -460,6 +462,31 @@ fn recover_inline_tool_calls_handles_anthropic_xml_parameter_tags() {
 }
 
 #[test]
+fn recover_inline_tool_calls_respects_anthropic_string_attr() {
+    // string="true" 必须把看起来像 JSON 标量的值（true/123/null）保持为字符串，
+    // 而不是自动解析成 bool/number。string="false" 则照常 JSON 解析。
+    let raw = r#"<function_calls><invoke name="enable_tools"><parameter name="operation" string="true">enable</parameter><parameter name="dry_run" string="true">true</parameter><parameter name="count" string="true">123</parameter><parameter name="tools" string="false">["a","b"]</parameter></invoke></function_calls>"#;
+    let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+    assert_eq!(calls.len(), 1);
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(args["operation"], "enable");
+    assert_eq!(args["dry_run"], "true", "string=\"true\" must keep 'true' as string");
+    assert_eq!(args["count"], "123", "string=\"true\" must keep '123' as string");
+    assert_eq!(args["tools"][0], "a");
+    assert_eq!(args["tools"][1], "b");
+}
+
+#[test]
+fn recover_inline_tool_calls_matches_anthropic_string_attr_by_exact_name() {
+    let raw = r#"<function_calls><invoke name="enable_tools"><parameter name="string_value" string="true">123</parameter><parameter name="count" notstring="true">456</parameter></invoke></function_calls>"#;
+    let calls = recover_inline_tool_calls(raw).expect("expected recovered tool call");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+
+    assert_eq!(args["string_value"], "123");
+    assert_eq!(args["count"], 456);
+}
+
+#[test]
 fn recover_inline_tool_calls_handles_anthropic_xml_namespaced_tags() {
     // 带命名空间前缀（antml:）且无外层包裹。
     let raw = r#"<invoke name="list_agents"></invoke>"#;
@@ -467,6 +494,22 @@ fn recover_inline_tool_calls_handles_anthropic_xml_namespaced_tags() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].function.name, "list_agents");
     assert_eq!(calls[0].function.arguments, "{}");
+}
+
+#[test]
+fn recover_inline_tool_calls_respects_anthropic_xml_string_attr() {
+    // DSML `string="true"`：即便值看起来像 JSON 标量，也必须保持为字符串。
+    // 覆盖用户报告的 deepseek 启用 MCP 工具的输出形态。
+    let raw = r#"<tool_calls><invoke name="enable_tools"><parameter name="operation" string="true">enable</parameter><parameter name="tools" string="false">["mcp_excel_open_workbook"]</parameter></invoke></tool_calls>"#;
+    let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "enable_tools");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    // string="true" -> "enable" 必须是字符串，不得被当成标识符。
+    assert_eq!(args["operation"], "enable");
+    assert!(args["operation"].is_string(), "string=\"true\" 必须保持字符串");
+    // string="false" -> 数组 JSON 正常解析。
+    assert_eq!(args["tools"][0], "mcp_excel_open_workbook");
 }
 
 #[test]
@@ -478,6 +521,23 @@ fn recover_inline_tool_calls_handles_anthropic_xml_parallel_calls() {
     let b: serde_json::Value = serde_json::from_str(&calls[1].function.arguments).unwrap();
     assert_eq!(a["path"], "/a");
     assert_eq!(b["path"], "/b");
+}
+
+#[test]
+fn recover_inline_tool_calls_handles_anthropic_xml_string_true_attr() {
+    // DSML `string="true"`：值看起来像 JSON 标量时仍保持为字符串。
+    let raw = r#"<tool_calls><invoke name="enable_tools"><parameter name="operation" string="true">enable</parameter><parameter name="tools" string="false">["read_file","write_file"]</parameter><parameter name="verbose" string="true">true</parameter><parameter name="count" string="true">123</parameter></invoke></tool_calls>"#;
+    let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "enable_tools");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(args["operation"], "enable", "string=true -> 字符串");
+    assert!(args["operation"].is_string());
+    assert_eq!(args["tools"], serde_json::json!(["read_file", "write_file"]), "string=false -> 原生 JSON 数组");
+    assert_eq!(args["verbose"], "true", "看起来像 bool 但 string=true -> 字符串 \"true\"");
+    assert!(args["verbose"].is_string());
+    assert_eq!(args["count"], "123", "看起来像数字但 string=true -> 字符串 \"123\"");
+    assert!(args["count"].is_string());
 }
 
 #[test]
@@ -552,7 +612,7 @@ fn response_completed_event_does_not_block_late_snapshot_text() {
     let mut app = test_app();
     let mut current_history = String::new();
 
-    let should_stop = process_stream_payload(
+    let outcome = process_stream_payload(
         &mut app,
         &mut current_history,
         &markers,
@@ -562,7 +622,8 @@ fn response_completed_event_does_not_block_late_snapshot_text() {
         r#"{"status":"completed"}"#,
     )
     .unwrap();
-    assert!(!should_stop);
+    assert!(!outcome.should_stop);
+    assert!(!outcome.meaningful_progress);
 
     process_stream_payload(
         &mut app,
@@ -577,6 +638,176 @@ fn response_completed_event_does_not_block_late_snapshot_text() {
 
     assert_eq!(current_history, "hello world");
     assert_eq!(state.content.assistant_text, "hello world");
+}
+
+#[test]
+fn stream_payload_meaningful_progress_includes_new_reasoning_chunks() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    let usage_only = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
+    )
+    .unwrap();
+    assert!(!usage_only.should_stop);
+    assert!(!usage_only.meaningful_progress);
+
+    let reasoning_only = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.reasoning_summary_text.delta"),
+        r#"{"delta":"thinking step"}"#,
+    )
+    .unwrap();
+    assert!(!reasoning_only.should_stop);
+    assert!(reasoning_only.meaningful_progress);
+    assert_eq!(state.content.reasoning_text, "thinking step");
+    assert!(current_history.is_empty());
+
+    let duplicate_reasoning_snapshot = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.reasoning_summary_text.done"),
+        r#"{"text":"thinking step"}"#,
+    )
+    .unwrap();
+    assert!(!duplicate_reasoning_snapshot.meaningful_progress);
+
+    let content = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"answer"}"#,
+    )
+    .unwrap();
+    assert!(content.meaningful_progress);
+    assert_eq!(current_history, "answer");
+
+    let duplicate_snapshot = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.done"),
+        r#"{"text":"answer"}"#,
+    )
+    .unwrap();
+    assert!(!duplicate_snapshot.meaningful_progress);
+
+    let tool_call = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"/tmp/x\"}"}}]}}]}"#,
+    )
+    .unwrap();
+    assert!(tool_call.meaningful_progress);
+
+    let finish_reason = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    )
+    .unwrap();
+    assert!(finish_reason.meaningful_progress);
+    assert_eq!(state.content.finish_reason_value.as_deref(), Some("stop"));
+}
+
+#[tokio::test]
+async fn process_chunk_result_marks_empty_sse_as_no_meaningful_progress() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    let empty_step = process_chunk_result(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Ok(Some(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}\n\n"
+                .as_slice(),
+        )),
+    )
+    .await
+    .unwrap();
+    match empty_step {
+        StreamChunkStep::Continue {
+            meaningful_progress,
+        } => assert!(!meaningful_progress),
+        _ => panic!("empty SSE should keep streaming without refreshing watchdog"),
+    }
+
+    let content_step = process_chunk_result(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Ok(Some(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n".as_slice(),
+        )),
+    )
+    .await
+    .unwrap();
+    match content_step {
+        StreamChunkStep::Continue {
+            meaningful_progress,
+        } => assert!(meaningful_progress),
+        _ => panic!("content SSE should keep streaming and refresh watchdog"),
+    }
+    assert_eq!(current_history, "hello");
+}
+
+#[test]
+fn suppressed_terminal_output_still_collects_subagent_response() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.sync_scope(true, || {
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            Some("response.output_text.done"),
+            r#"{"text":"subagent result"}"#,
+        )
+        .unwrap();
+    });
+
+    assert_eq!(current_history, "subagent result");
+    assert_eq!(state.content.assistant_text, "subagent result");
 }
 
 #[test]
@@ -711,7 +942,7 @@ fn process_stream_payload_halts_and_downshifts_on_hallucinated_result_marker() {
     let mut app = test_app();
     let mut current_history = String::new();
 
-    let should_stop = process_stream_payload(
+    let outcome = process_stream_payload(
         &mut app,
         &mut current_history,
         &markers,
@@ -722,7 +953,11 @@ fn process_stream_payload_halts_and_downshifts_on_hallucinated_result_marker() {
     )
     .unwrap();
 
-    assert!(should_stop, "检出幻觉标记必须停流");
+    assert!(outcome.should_stop, "检出幻觉标记必须停流");
+    assert!(
+        outcome.meaningful_progress,
+        "退化停流已设置 finish_reason，应视为语义进展"
+    );
     assert_eq!(
         state.content.finish_reason_value.as_deref(),
         Some("degenerate_repetition"),
@@ -943,7 +1178,7 @@ fn thinking_fold_window_counts_current_line_inside_visible_budget() {
     );
 
     let (window, _) = render_thinking_fold_window(fold);
-    assert_eq!(window.matches("lines folded").count(), 1);
+    assert_eq!(window.matches("earlier lines").count(), 1);
     assert!(!window.contains("line-1"));
     assert!(window.contains("line-2"));
     assert!(window.contains("line-3"));
@@ -1014,7 +1249,7 @@ fn thinking_fold_window_without_hidden_lines_has_no_fold_marker() {
     let (window, rows) = render_thinking_fold_window(fold);
 
     // 无隐藏行、无 active header：窗口物理行数 == 可见逻辑行数（3）。
-    assert!(!window.contains("lines folded"));
+    assert!(!window.contains("earlier lines"));
     assert!(window.contains("line-1"));
     assert!(window.contains("line-2"));
     assert!(window.contains("line-3"));
@@ -1049,7 +1284,7 @@ fn thinking_fold_window_body_excludes_anchored_header() {
 
     // 折叠标记(1) + 可见行(1) + current(1) = 3 物理行，header 不在此列。
     assert!(!window.contains("thinking"));
-    assert!(window.contains("lines folded"));
+    assert!(window.contains("earlier lines"));
     assert!(window.contains("line-1"));
     assert!(window.contains("line-2"));
     assert_eq!(rows, 3);
@@ -1068,8 +1303,8 @@ fn thinking_fold_erase_rows_follow_current_terminal_reflow_of_previous_body() {
     let fold = &mut state.render.thinking_fold;
     fold.window_rows = 2;
     fold.rendered_body_lines = vec![
-        "  ··· 103 lines folded ···".to_string(),
-        "Actually, looking more carefully:".to_string(),
+        "    … 103 earlier lines".to_string(),
+        "    Actually, looking more carefully:".to_string(),
     ];
 
     unsafe {
@@ -1127,7 +1362,7 @@ fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
 
 #[test]
 fn cancelled_stream_result_finalizes_active_thinking_fold() {
-    // 取消时若折叠窗口仍活跃，必须收口（finalize→reset），避免半截 `╭─ thinking`
+    // 取消时若折叠窗口仍活跃，必须收口（finalize→reset），避免半截 thinking
     // 残留、下一轮重试在其下叠新 header（重复 header + 大段空白的跨轮根因）。
     let mut state = StreamProcessingState::new();
     {

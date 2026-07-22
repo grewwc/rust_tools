@@ -27,9 +27,9 @@ history/compression in `turn_runtime/`, subagent flows in `turn_runtime/orchestr
 7. **Skill runtime isolation.** Skill/agent manifests determine visible tools,
    MCP allowlists, prompt overlays, and inheritance. Keep default visibility and
    explicit name pinning aligned with `tools/registry/`.
-8. **Subagent lifecycle.** Task registries are session-scoped. Surface completed
-   child results once, mark them observed, and keep outstanding-task reminders
-   limited to the current session.
+8. **Subagent lifecycle.** Task registries are scoped by session and owner
+   process pid. Surface completed child results once, mark them observed, and
+   keep outstanding-task reminders limited to the current owner process.
 9. **Depth guard.** Only the top-level agent may delegate to a child subagent;
    child subagents must work directly when orchestration tools are hidden.
 10. **Code-grounding reads stay serial.** `read_file` must not be encouraged or
@@ -47,3 +47,8 @@ history/compression in `turn_runtime/`, subagent flows in `turn_runtime/orchestr
 13. **Runtime environment is prompt context.** The base system prompt must include
     the current OS, architecture, and shell so generated commands target the
     actual execution platform instead of a model-default platform.
+14. **Foreground owns the terminal.** Background subagents must not write live
+    model, thinking, tool, or ANSI cursor output to stdout/stderr. They publish
+    results through task IPC for `task_wait` / `task_status` to aggregate. The
+    driver may expose lifecycle through one compact foreground-owned status line,
+    refreshed only at scheduler safe points and finalized before foreground output.

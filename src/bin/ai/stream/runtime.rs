@@ -10,7 +10,7 @@ use crate::ai::{
     models,
     provider::{self, ProviderAdapter},
     request::StreamChunk,
-    theme::{ACCENT_MUTED, ACCENT_RULE, DIM, RESET},
+    theme::{ACCENT_MUTED, DIM, RESET},
     types::{App, StreamOutcome, StreamResult, take_stream_cancelled},
 };
 use crate::commonw::configw;
@@ -40,13 +40,35 @@ const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
 /// 比 idle 超时更长，因为某些模型冷启动或排队需要时间。
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
 /// terminal 下 thinking 可见窗口的默认高度。只影响展示，不影响 reasoning 累积。
-const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 4;
+const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 2;
 /// 推理流连续重复的最短片段和判定次数。只检测 reasoning，避免把用户要求生成的重复
 /// 正文（表格、代码、测试数据等）误判为模型退化。
 const MIN_REASONING_REPEAT_CHARS: usize = 16;
 const MAX_REASONING_REPEAT_CHARS: usize = 512;
 const REASONING_REPEAT_COUNT: usize = 3;
 const DEGENERATE_REPETITION_FINISH_REASON: &str = "degenerate_repetition";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StreamPayloadOutcome {
+    should_stop: bool,
+    meaningful_progress: bool,
+}
+
+impl StreamPayloadOutcome {
+    fn stop() -> Self {
+        Self {
+            should_stop: true,
+            meaningful_progress: false,
+        }
+    }
+
+    fn stop_with_progress() -> Self {
+        Self {
+            should_stop: true,
+            meaningful_progress: true,
+        }
+    }
+}
 
 pub(super) async fn stream_response(
     app: &mut App,
@@ -67,11 +89,11 @@ pub(super) async fn stream_response(
         print_waiting_hint(&mut state)?;
     }
 
-    let mut last_chunk_at = Instant::now();
-    let has_content = |s: &StreamProcessingState| -> bool {
+    let mut last_meaningful_progress_at = Instant::now();
+    let has_meaningful_progress = |s: &StreamProcessingState| -> bool {
         !s.content.assistant_text.is_empty()
-            || !s.content.reasoning_text.is_empty()
             || !s.content.tool_calls_map.is_empty()
+            || s.content.finish_reason_seen
     };
 
     while !app.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -79,8 +101,9 @@ pub(super) async fn stream_response(
             return Ok(result);
         }
 
-        // 已有内容时用较短的 idle 超时，无内容时用较长的首 chunk 超时
-        let timeout_secs = if has_content(&state) {
+        // 已有可执行/可见进展时用较短的 idle 超时；空包、usage-only、heartbeat
+        // 不刷新该计时器，避免 provider 持续推无效包导致 stream 永不收口。
+        let timeout_secs = if has_meaningful_progress(&state) {
             STREAM_IDLE_TIMEOUT_SECS
         } else {
             STREAM_FIRST_CHUNK_TIMEOUT_SECS
@@ -94,8 +117,8 @@ pub(super) async fn stream_response(
                 _ = tokio::time::sleep(Duration::from_millis(FINISH_REASON_GRACE_MS)) => break,
             }
         } else {
-            let idle_remaining =
-                Duration::from_secs(timeout_secs).saturating_sub(last_chunk_at.elapsed());
+            let idle_remaining = Duration::from_secs(timeout_secs)
+                .saturating_sub(last_meaningful_progress_at.elapsed());
             tokio::select! {
                 chunk = response.chunk() => chunk,
                 _ = wait_for_interrupt(app) => {
@@ -117,8 +140,12 @@ pub(super) async fn stream_response(
         )
         .await?
         {
-            StreamChunkStep::Continue => {
-                last_chunk_at = Instant::now();
+            StreamChunkStep::Continue {
+                meaningful_progress,
+            } => {
+                if meaningful_progress {
+                    last_meaningful_progress_at = Instant::now();
+                }
             }
             StreamChunkStep::Stop => break,
             StreamChunkStep::Return(result) => return Ok(result),
@@ -138,7 +165,9 @@ pub(super) async fn stream_response(
 /// 对所有 TTY 会话生效。println! 保证提示立即可见，
 /// 收到首个可见 chunk 时用 \x1b[1A\r\x1b[2K 清掉，不残留额外行。
 fn should_show_waiting_hint(app: &App) -> bool {
-    io::stdout().is_terminal() && !app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
+    runtime_ctx::terminal_output_enabled()
+        && io::stdout().is_terminal()
+        && !app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
@@ -146,7 +175,7 @@ fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
         return Ok(());
     }
     // 独立行等待提示：println! 保证终端立即显示，首个 chunk 到达时用 \x1b[1A\r\x1b[2K 清掉
-    println!("⠋ waiting…");
+    println!("  {ACCENT_MUTED}⠋ waiting…{RESET}");
     io::stdout().flush()?;
     state.render.waiting_hint_active = true;
     Ok(())
@@ -208,7 +237,7 @@ fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::
     }
     // 光标上移+清行后重新 println!，保证 buffering 状态在独立行可见
     print!("\x1b[1A\r\x1b[2K");
-    println!("⠋ buffering…");
+    println!("  {ACCENT_MUTED}⠋ buffering…{RESET}");
     io::stdout().flush()?;
     state.render.waiting_hint_buffering = true;
     Ok(())
@@ -231,17 +260,19 @@ fn immediate_cancel_result(app: &App, state: &mut StreamProcessingState) -> Opti
 }
 
 /// 取消/中断时的 thinking 折叠收尾：折叠窗口若仍活跃，必须先擦掉当前窗口并落一个
-/// `╰─ done thinking` 收口，否则半截 `╭─ thinking` 窗口会被留在屏幕上，下一轮重试
+/// `done thinking` 收口，否则半截 thinking 窗口会被留在屏幕上，下一轮重试
 /// 的 fresh state 会在其下方再画一个新 header——累积成「重复 header + 大段空白」。
 fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
-    let _ = clear_waiting_hint(state);
-    if state.render.thinking_fold.active {
-        let _ = finalize_thinking_fold(state);
-    } else if state.render.subagent_fold.active {
-        let _ = finalize_subagent_preview_fold(state);
-    } else if state.content.thinking_open {
-        print!("\x1b[0m");
-        let _ = io::stdout().flush();
+    if runtime_ctx::terminal_output_enabled() {
+        let _ = clear_waiting_hint(state);
+        if state.render.thinking_fold.active {
+            let _ = finalize_thinking_fold(state);
+        } else if state.render.subagent_fold.active {
+            let _ = finalize_subagent_preview_fold(state);
+        } else if state.content.thinking_open {
+            print!("\x1b[0m");
+            let _ = io::stdout().flush();
+        }
     }
     StreamResult {
         outcome: StreamOutcome::Cancelled,
@@ -280,7 +311,9 @@ async fn process_chunk_result<T: AsRef<[u8]>>(
             if let Some(result) = handle_stream_decode_error(app, markers, state, err).await {
                 Ok(StreamChunkStep::Return(result))
             } else {
-                Ok(StreamChunkStep::Continue)
+                Ok(StreamChunkStep::Continue {
+                    meaningful_progress: false,
+                })
             }
         }
     }
@@ -297,8 +330,11 @@ async fn consume_pending_complete_lines(
     // remains available for mutation inside `process_stream_line()`.
     let lines = framing::take_complete_lines(&mut state.framing);
     let mut should_stop = false;
+    let mut meaningful_progress = false;
     for line in lines {
-        if process_stream_line(app, current_history, markers, state, adapter, &line)? {
+        let outcome = process_stream_line(app, current_history, markers, state, adapter, &line)?;
+        meaningful_progress |= outcome.meaningful_progress;
+        if outcome.should_stop {
             should_stop = true;
             break;
         }
@@ -306,7 +342,9 @@ async fn consume_pending_complete_lines(
     Ok(if should_stop {
         StreamChunkStep::Stop
     } else {
-        StreamChunkStep::Continue
+        StreamChunkStep::Continue {
+            meaningful_progress,
+        }
     })
 }
 
@@ -321,7 +359,7 @@ async fn process_pending_tail(
         // pending 为空时，仍需检查 sse_event_data 是否有未 flush 的最后一个事件。
         // 部分 provider 在关闭连接前不发送最终空行（\n\n），导致最后一个 SSE 事件被丢弃。
         if !state.framing.sse_event_data.trim().is_empty() {
-            if flush_sse_event(app, current_history, markers, state, adapter)? {
+            if flush_sse_event(app, current_history, markers, state, adapter)?.should_stop {
                 let final_state = std::mem::replace(state, StreamProcessingState::new());
                 return Ok(Some(finalize_stream_response(app, markers, final_state)?));
             }
@@ -335,7 +373,7 @@ async fn process_pending_tail(
     if !line.is_empty() {
         let _ = process_stream_line(app, current_history, markers, state, adapter, &line)?;
     }
-    if flush_sse_event(app, current_history, markers, state, adapter)? {
+    if flush_sse_event(app, current_history, markers, state, adapter)?.should_stop {
         let final_state = std::mem::replace(state, StreamProcessingState::new());
         return Ok(Some(finalize_stream_response(app, markers, final_state)?));
     }
@@ -347,9 +385,12 @@ fn finalize_stream_response(
     markers: &StreamMarkers,
     mut state: StreamProcessingState,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
-    clear_waiting_hint(&mut state)?;
+    let render_terminal = runtime_ctx::terminal_output_enabled();
+    if render_terminal {
+        clear_waiting_hint(&mut state)?;
+    }
 
-    if state.content.thinking_open {
+    if render_terminal && state.content.thinking_open {
         if state.render.thinking_fold.active {
             finalize_thinking_fold(&mut state)?;
         } else {
@@ -361,15 +402,16 @@ fn finalize_stream_response(
         }
     }
 
-    if state.render.subagent_fold.active {
+    if render_terminal && state.render.subagent_fold.active {
         finalize_subagent_preview_fold(&mut state)?;
     }
 
     flush_inline_markup_normalizer(app, markers, &mut state)?;
 
-    flush_terminal_splitter(&mut state, markers)?;
-
-    state.render.markdown.flush_pending()?;
+    if render_terminal {
+        flush_terminal_splitter(&mut state, markers)?;
+        state.render.markdown.flush_pending()?;
+    }
 
     if take_stream_cancelled(app) {
         return Ok(cancelled_stream_result(&mut state));
@@ -501,6 +543,9 @@ fn finalize_stream_response(
 /// 缓存时，打印一行缓存命中指标。OpenAI / DashScope 等是服务端自动缓存，
 /// 这里只是把它们已经上报的 `cached_tokens` 可视化出来。
 fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::StreamUsage) {
+    if !runtime_ctx::terminal_output_enabled() {
+        return;
+    }
     let show = crate::commonw::configw::get_all_config()
         .get(
             crate::ai::config_schema::AiConfig::PROMPT_CACHE_SHOW_METRICS,
@@ -517,8 +562,7 @@ fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::StreamUsage) {
         .map(|d| d.cached_tokens)
         .unwrap_or(0);
     if let Some(line) = format_prompt_cache_metrics(usage.prompt_tokens, cached) {
-        use colored::Colorize;
-        println!("{}", line.dimmed());
+        println!("  {ACCENT_MUTED}{line}{RESET}");
     }
 }
 
@@ -530,8 +574,20 @@ fn format_prompt_cache_metrics(prompt_tokens: u64, cached_tokens: u64) -> Option
     }
     let pct = (cached_tokens as f64 / prompt_tokens as f64 * 100.0).min(100.0);
     Some(format!(
-        "[prompt cache] {cached_tokens}/{prompt_tokens} prompt tokens cached ({pct:.0}% hit)"
+        "↳ cache · {}/{} tokens · {pct:.0}% hit",
+        format_compact_token_count(cached_tokens),
+        format_compact_token_count(prompt_tokens)
     ))
+}
+
+fn format_compact_token_count(tokens: u64) -> String {
+    if tokens < 1_000 {
+        tokens.to_string()
+    } else if tokens < 1_000_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    }
 }
 
 async fn wait_for_interrupt(app: &App) {
@@ -570,17 +626,21 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     err: E,
 ) -> Option<StreamResult> {
     state.framing.decode_error_count += 1;
-    eprintln!(
-        "[Warning] 读取响应流时出错：{} (错误次数：{}/{})",
-        err, state.framing.decode_error_count, MAX_DECODE_ERRORS
-    );
+    if runtime_ctx::terminal_output_enabled() {
+        eprintln!(
+            "[Warning] 读取响应流时出错：{} (错误次数：{}/{})",
+            err, state.framing.decode_error_count, MAX_DECODE_ERRORS
+        );
+    }
 
     if take_stream_cancelled(app) {
         return Some(cancelled_stream_result(state));
     }
 
     if state.framing.decode_error_count <= MAX_DECODE_ERRORS {
-        eprintln!("[Warning] 尝试继续读取...");
+        if runtime_ctx::terminal_output_enabled() {
+            eprintln!("[Warning] 尝试继续读取...");
+        }
         if wait_for_interrupt_or_timeout(
             app,
             Some(Duration::from_millis(DECODE_ERROR_RETRY_DELAY_MS)),
@@ -592,22 +652,25 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         return None;
     }
 
-    eprintln!("[Error] 响应流读取失败，返回已收集的内容");
-
-    if state.content.thinking_open {
-        let _ = write_stream_content(
-            &format!("\n{}\n", markers.end_thinking_tag),
-            &mut state.render.markdown,
-            false,
-        );
-        print!("\x1b[0m");
-        let _ = io::stdout().flush();
-    }
-    if state.render.subagent_fold.active {
-        let _ = finalize_subagent_preview_fold(state);
+    if runtime_ctx::terminal_output_enabled() {
+        eprintln!("[Error] 响应流读取失败，返回已收集的内容");
     }
 
-    let _ = state.render.markdown.flush_pending();
+    if runtime_ctx::terminal_output_enabled() {
+        if state.content.thinking_open {
+            let _ = write_stream_content(
+                &format!("\n{}\n", markers.end_thinking_tag),
+                &mut state.render.markdown,
+                false,
+            );
+            print!("\x1b[0m");
+            let _ = io::stdout().flush();
+        }
+        if state.render.subagent_fold.active {
+            let _ = finalize_subagent_preview_fold(state);
+        }
+        let _ = state.render.markdown.flush_pending();
+    }
 
     let (tool_calls, dropped_malformed) =
         collect_valid_tool_calls(&mut state.content.tool_calls_map);
@@ -684,17 +747,31 @@ fn process_external_tool_calls_delta(
     state: &mut StreamProcessingState,
     chunk: &StreamChunk,
     merge_mode: StreamEventMergeMode,
-) {
+) -> bool {
     let Some(choice) = chunk.choices.first() else {
-        return;
+        return false;
     };
 
+    let mut meaningful_progress = false;
     for stream_tool_call in &choice.delta.tool_calls {
+        if stream_tool_call.id.is_empty()
+            && stream_tool_call.tool_type.is_empty()
+            && stream_tool_call.function.name.is_empty()
+            && stream_tool_call.function.arguments.is_empty()
+        {
+            continue;
+        }
         let index = stream_tool_call.index;
         ensure_tool_calls_section_open(app, markers, state);
 
         let render_chunk = {
             let builder = state.content.tool_calls_map.entry(index).or_default();
+            let before = (
+                builder.id.len(),
+                builder.tool_type.len(),
+                builder.function_name.len(),
+                builder.arguments.len(),
+            );
             if !stream_tool_call.id.is_empty() {
                 builder.id.clone_from(&stream_tool_call.id);
             }
@@ -711,6 +788,13 @@ fn process_external_tool_calls_delta(
                 &stream_tool_call.function.arguments,
                 merge_mode,
             );
+            let after = (
+                builder.id.len(),
+                builder.tool_type.len(),
+                builder.function_name.len(),
+                builder.arguments.len(),
+            );
+            meaningful_progress |= after != before;
             take_tool_call_render_chunk(state.render.current_printing_index, index, builder)
         };
 
@@ -721,6 +805,7 @@ fn process_external_tool_calls_delta(
             let _ = write_tool_call_arguments_stream(&render_chunk.arguments);
         }
     }
+    meaningful_progress
 }
 
 fn append_tool_call_arguments(
@@ -748,14 +833,16 @@ fn process_internal_tool_calls(
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
     internal_tool_call_events: Vec<InternalToolCallStreamEvent>,
-) -> bool {
+) -> (bool, bool) {
     let mut saw_hallucinated_marker = false;
+    let mut meaningful_progress = false;
     for event in internal_tool_call_events {
         match event {
             InternalToolCallStreamEvent::Begin(function_name) => {
                 if function_name.trim().is_empty() {
                     continue;
                 }
+                meaningful_progress = true;
                 ensure_tool_calls_section_open(app, markers, state);
 
                 let index = state.content.internal_tool_call_idx;
@@ -770,6 +857,7 @@ fn process_internal_tool_calls(
                 if chunk.is_empty() {
                     continue;
                 }
+                meaningful_progress = true;
                 let index = state.content.internal_tool_call_idx;
                 let builder = state.content.tool_calls_map.entry(index).or_default();
                 if builder.function_name.is_empty() {
@@ -788,9 +876,13 @@ fn process_internal_tool_calls(
                     // write_tool_call_arguments_stream 均为 no-op），因此这里只需
                     // 复位颜色即可。绝不能用 println!——那会在「done thinking」与后续
                     // 输出之间凭空插入一行空行（外部 delta 工具路径本就不打这行）。
-                    print!("\x1b[0m");
+                    if runtime_ctx::terminal_output_enabled() {
+                        print!("\x1b[0m");
+                    }
                     state.render.current_printing_index = None;
-                    let _ = io::stdout().flush();
+                    if runtime_ctx::terminal_output_enabled() {
+                        let _ = io::stdout().flush();
+                    }
                 }
                 state.content.internal_tool_call_idx += 1;
             }
@@ -801,7 +893,7 @@ fn process_internal_tool_calls(
             }
         }
     }
-    saw_hallucinated_marker
+    (saw_hallucinated_marker, meaningful_progress)
 }
 
 fn commit_visible_content(
@@ -815,12 +907,15 @@ fn commit_visible_content(
         return Ok(());
     }
 
-    normalize_end_thinking_boundary(&mut content, markers, &state.render.markdown);
-
-    clear_waiting_hint(state)?;
+    let render_terminal = runtime_ctx::terminal_output_enabled();
+    if render_terminal {
+        normalize_end_thinking_boundary(&mut content, markers, &state.render.markdown);
+        clear_waiting_hint(state)?;
+    }
 
     // 当 thinking 折叠模式活跃且遇到 end_thinking_tag 时，做最终的折叠渲染
-    if !state.content.thinking_open
+    if render_terminal
+        && !state.content.thinking_open
         && state.render.thinking_fold.active
         && is_standalone_stream_marker(&content, &markers.end_thinking_tag)
     {
@@ -835,15 +930,17 @@ fn commit_visible_content(
         return Ok(());
     }
 
-    if markers.subagent_preview_enabled() {
-        write_subagent_content_folded(content.as_str(), state)?;
-    } else {
-        maybe_write_stream_content(
-            content.as_str(),
-            state,
-            markers,
-            state.content.thinking_open,
-        )?;
+    if render_terminal {
+        if markers.subagent_preview_enabled() {
+            write_subagent_content_folded(content.as_str(), state)?;
+        } else {
+            maybe_write_stream_content(
+                content.as_str(),
+                state,
+                markers,
+                state.content.thinking_open,
+            )?;
+        }
     }
     if state.content.thinking_open {
         return Ok(());
@@ -1042,7 +1139,7 @@ fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str
 
 /// 只覆盖 thinking 正文窗口（折叠摘要 + 最近可见行），header 不在此列。
 ///
-/// header（`╭─ thinking`）在折叠激活时打印一次并锚定在正文之上，之后每次重画都只
+/// header（`thinking`）在折叠激活时打印一次并锚定在正文之上，之后每次重画都只
 /// 擦除并重写正文。正文行数上限为 `max_visible_lines + 1`（折叠摘要），恒定落在可视
 /// 视口内，因此 `\x1b[{window_rows}A` 相对擦除永远够得着，不会随窗口滚入 scrollback
 /// 而失步——即便失步，也无法再生出第二个 header，从根上杜绝「孤儿 header 叠加」。
@@ -1078,7 +1175,7 @@ fn write_fold_header(
 ) -> io::Result<()> {
     write!(
         out,
-        "{ACCENT_RULE}╭─\x1b[0m {ACCENT_MUTED}{}\x1b[0m\n",
+        "  {ACCENT_MUTED}{}\x1b[0m\n",
         fold.header_label
     )
 }
@@ -1116,11 +1213,14 @@ fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     fold.window_rows = body_rows;
     fold.rendered_body_lines = body_lines;
 
-    // "done thinking" 结尾标记
+    // 结尾同时给出规模，避免用户还要从折叠提示反推本次 thinking 的长度。
+    let line_count = fold
+        .total_lines
+        .saturating_add(usize::from(!fold.current_line.is_empty()));
     write!(
         out,
-        "{ACCENT_RULE}╰─\x1b[0m {ACCENT_MUTED}{}\x1b[0m\n",
-        fold.footer_label
+        "  {ACCENT_MUTED}{} · {line_count} lines\x1b[0m\n",
+        fold.footer_label,
     )?;
     out.flush()?;
 
@@ -1170,11 +1270,11 @@ fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<St
     let marker_lines = usize::from(hidden_count > 0);
     if hidden_count > 0 {
         lines.push(clamp_line_to_terminal_row(&format!(
-            "  ··· {hidden_count} lines folded ···"
+            "    … {hidden_count} earlier lines"
         )));
     }
     for line in visible_lines {
-        lines.push(clamp_line_to_terminal_row(line));
+        lines.push(clamp_line_to_terminal_row(&format!("    {line}")));
     }
     (lines, marker_lines)
 }
@@ -1245,11 +1345,13 @@ fn process_stream_payload(
     adapter: &'static dyn ProviderAdapter,
     event_type: Option<&str>,
     payload: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<StreamPayloadOutcome, Box<dyn std::error::Error>> {
     let (mut chunk, merge_mode) =
         match normalize::parse_stream_payload(adapter, payload, event_type) {
-            super::state::ParsedStreamPayload::Ignore => return Ok(false),
-            super::state::ParsedStreamPayload::Done => return Ok(true),
+            super::state::ParsedStreamPayload::Ignore => {
+                return Ok(StreamPayloadOutcome::default());
+            }
+            super::state::ParsedStreamPayload::Done => return Ok(StreamPayloadOutcome::stop()),
             super::state::ParsedStreamPayload::Error(msg) => {
                 return Err(format!("provider stream error: {msg}").into());
             }
@@ -1257,7 +1359,7 @@ fn process_stream_payload(
                 // 捕获完整 reasoning item（含 encrypted_content）供同 turn 工具链回放。
                 // 不产生可见输出，也不进持久化历史。
                 state.content.reasoning_items.push(item);
-                return Ok(false);
+                return Ok(StreamPayloadOutcome::default());
             }
             super::state::ParsedStreamPayload::Chunk(chunk) => {
                 (chunk, StreamEventMergeMode::Append)
@@ -1274,12 +1376,13 @@ fn process_stream_payload(
         state.pending_llm_usage = Some((chunk.model.clone(), usage.clone().normalized()));
     }
 
-    if chunk.choices.iter().any(|choice| {
+    let saw_finish_reason = chunk.choices.iter().any(|choice| {
         choice
             .finish_reason
             .as_deref()
             .is_some_and(|reason| !reason.trim().is_empty())
-    }) {
+    });
+    if saw_finish_reason {
         state.content.finish_reason_seen = true;
     }
 
@@ -1300,7 +1403,10 @@ fn process_stream_payload(
         if should_show_waiting_hint(app) && state.content.empty_choice_chunks >= 3 {
             let _ = upgrade_waiting_hint_for_buffering(state);
         }
-        return Ok(false);
+        return Ok(StreamPayloadOutcome {
+            should_stop: false,
+            meaningful_progress: saw_finish_reason,
+        });
     }
 
     state.content.empty_choice_chunks = 0;
@@ -1324,6 +1430,7 @@ fn process_stream_payload(
     } else {
         String::new()
     };
+    let reasoning_progress = !deduped_reasoning.is_empty();
 
     if !original_reasoning.is_empty() {
         state.content.saw_reasoning_output = true;
@@ -1342,8 +1449,10 @@ fn process_stream_payload(
             state.content.finish_reason_seen = true;
             state.content.finish_reason_value =
                 Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
-            eprintln!("\n  ⚠ 检测到模型推理重复循环，停止当前响应并自动重试…");
-            return Ok(true);
+            if runtime_ctx::terminal_output_enabled() {
+                eprintln!("\n  ⚠ 检测到模型推理重复循环，停止当前响应并自动重试…");
+            }
+            return Ok(StreamPayloadOutcome::stop_with_progress());
         }
     }
 
@@ -1352,7 +1461,8 @@ fn process_stream_payload(
         choice.delta.reasoning_content = deduped_reasoning;
     }
 
-    process_external_tool_calls_delta(app, markers, state, &chunk, merge_mode);
+    let external_tool_progress =
+        process_external_tool_calls_delta(app, markers, state, &chunk, merge_mode);
 
     let (events, internal_tool_call_events) = extract_chunk_events_streaming(
         &chunk,
@@ -1366,8 +1476,10 @@ fn process_stream_payload(
         &mut state.content.bare_xml_tool_call_streamer,
         &mut state.content.inline_markup_normalizer,
     );
-    let saw_hallucinated_marker =
+    let (saw_hallucinated_marker, internal_tool_progress) =
         process_internal_tool_calls(app, markers, state, internal_tool_call_events);
+    let mut meaningful_progress =
+        reasoning_progress || saw_finish_reason || external_tool_progress || internal_tool_progress;
     if saw_hallucinated_marker {
         // 模型在可见正文里自编自演「工具调用→工具结果」，吐出系统从不生成的内部
         // 协议标记（`<function_results>` 等）。streamer 已把整块剥离，这里停流并复用
@@ -1375,12 +1487,17 @@ fn process_stream_payload(
         // 零误伤信号：合法重复代码/措辞永不含内部协议标记，无需任何文本统计阈值。
         state.content.finish_reason_seen = true;
         state.content.finish_reason_value = Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
-        eprintln!("\n  ⚠ 检测到模型伪造工具结果标记（输出退化），停止当前响应并自动重试…");
-        return Ok(true);
+        if runtime_ctx::terminal_output_enabled() {
+            eprintln!("\n  ⚠ 检测到模型伪造工具结果标记（输出退化），停止当前响应并自动重试…");
+        }
+        return Ok(StreamPayloadOutcome::stop_with_progress());
     }
 
     if events.is_empty() {
-        return Ok(false);
+        return Ok(StreamPayloadOutcome {
+            should_stop: false,
+            meaningful_progress,
+        });
     }
     for event in events {
         match event {
@@ -1399,7 +1516,9 @@ fn process_stream_payload(
                 if content.is_empty() {
                     continue;
                 }
+                let assistant_len_before = state.content.assistant_text.len();
                 commit_visible_content(app, current_history, markers, state, content)?;
+                meaningful_progress |= state.content.assistant_text.len() > assistant_len_before;
 
                 // 与 reasoning 路径对称：模型也会在**可见输出**里退化成逐字复读同一
                 // 短语（本次事故即 assistant content 复读「我再重新读一遍…」直到撑满
@@ -1410,8 +1529,10 @@ fn process_stream_payload(
                     state.content.finish_reason_seen = true;
                     state.content.finish_reason_value =
                         Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
-                    eprintln!("\n  ⚠ 检测到模型输出重复循环，停止当前响应并自动重试…");
-                    return Ok(true);
+                    if runtime_ctx::terminal_output_enabled() {
+                        eprintln!("\n  ⚠ 检测到模型输出重复循环，停止当前响应并自动重试…");
+                    }
+                    return Ok(StreamPayloadOutcome::stop_with_progress());
                 }
             }
         }
@@ -1420,7 +1541,10 @@ fn process_stream_payload(
     // Keep streaming until explicit stream end ([DONE]/EOF) or the outer loop's
     // short post-finish grace window expires. Some providers can set
     // finish_reason before all visible content chunks are delivered.
-    Ok(false)
+    Ok(StreamPayloadOutcome {
+        should_stop: false,
+        meaningful_progress,
+    })
 }
 
 /// 检测文本尾部是否出现三次连续、完全相同的长片段（退化复读循环）。
@@ -1618,9 +1742,9 @@ fn flush_sse_event(
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
     adapter: &'static dyn ProviderAdapter,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<StreamPayloadOutcome, Box<dyn std::error::Error>> {
     let Some(event) = framing::flush_sse_event(&mut state.framing) else {
-        return Ok(false);
+        return Ok(StreamPayloadOutcome::default());
     };
     process_stream_payload(
         app,
@@ -1640,7 +1764,7 @@ fn process_stream_line(
     state: &mut StreamProcessingState,
     adapter: &'static dyn ProviderAdapter,
     line: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<StreamPayloadOutcome, Box<dyn std::error::Error>> {
     if let Some(event) = framing::consume_sse_line(&mut state.framing, line) {
         return process_stream_payload(
             app,
@@ -1653,7 +1777,7 @@ fn process_stream_line(
         );
     }
 
-    Ok(false)
+    Ok(StreamPayloadOutcome::default())
 }
 
 pub(super) fn write_stream_content(
@@ -1661,6 +1785,9 @@ pub(super) fn write_stream_content(
     markdown: &mut MarkdownStreamRenderer,
     dimmed: bool,
 ) -> io::Result<()> {
+    if !runtime_ctx::terminal_output_enabled() {
+        return Ok(());
+    }
     write_stream_content_to_terminal(content, markdown, dimmed)
 }
 

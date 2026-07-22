@@ -18,52 +18,11 @@ use crate::ai::{
 
 use super::{
     MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
-    PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH, TurnOutcome, context_budget,
+    TurnOutcome, context_budget,
     persistence::persist_pending_turn_messages,
-    pre_request_llm_summary_threshold,
+    pre_request_llm_summary_threshold, record_llm_summary_attempt_chars, should_try_llm_summary,
     types::{IterationExecution, ToolCallExecution},
 };
-
-/// 记录每个 session 上次 pre-request LLM 摘要**尝试**后的 messages 总字符数。
-/// 用于增长量守卫：上次尝试后上下文需增长 [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`]
-/// 以上才会再次触发。**无论成功与否都写入该游标**——成功时记录压缩后大小，
-/// 失败/no-op（结构上无法压缩：Path A 无早期对话、Path B 折叠后仍 <
-/// MIN_EFFECTIVE、Path C 未触发）时也记录实际尝试后大小，避免 cursor 停在 0
-/// 导致 growth 始终 ≥ MIN_GROWTH、pre-request LLM summary 每轮空转重试。
-/// 按 `session_id` 分桶——多 session / sub-agent 并存时各自独立，避免进程级
-/// 全局游标造成的跨会话状态串扰（A 会话的大上下文抬高游标，B 会话据此误判为
-/// "增长不足"而跳过本该触发的摘要）。与 orchestrator 的 supervisor 冷却机制
-/// 互补（orchestrator 管理工具调用间的压缩，此处管理请求前的兜底）。
-static LAST_PRE_REQUEST_LLM_SUMMARY_CHARS: std::sync::LazyLock<
-    std::sync::Mutex<rust_tools::commonw::FastMap<String, usize>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(rust_tools::commonw::FastMap::default()));
-
-fn load_last_pre_request_summary_chars(session_id: &str) -> usize {
-    LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
-        .lock()
-        .ok()
-        .and_then(|map| map.get(session_id).copied())
-        .unwrap_or(0)
-}
-
-fn store_last_pre_request_summary_chars(session_id: &str, chars: usize) {
-    if let Ok(mut map) = LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.lock() {
-        map.insert(session_id.to_string(), chars);
-    }
-}
-
-fn should_try_pre_request_llm_summary(
-    session_id: &str,
-    after_chars: usize,
-    llm_threshold: usize,
-) -> bool {
-    if after_chars <= llm_threshold {
-        return false;
-    }
-    let last_summary_chars = load_last_pre_request_summary_chars(session_id);
-    let growth = after_chars.saturating_sub(last_summary_chars);
-    last_summary_chars == 0 || growth >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH
-}
 
 struct StreamingFlagGuard {
     flag: Arc<AtomicBool>,
@@ -386,11 +345,11 @@ async fn request_model_response(
     // 阈值取 history_max_chars * 2（默认 180K），比 orchestrator 的 hard
     // threshold（*3.5 = 315K）更积极——后者只在工具调用间隙触发，此处覆盖
     // 每次请求前的最后检查。
-    // 增长量守卫：自上次成功 LLM 摘要后需增长 ≥ MIN_GROWTH 才再次触发。
-    // 失败/no-op 不写游标，避免把后续真正需要的 LLM compact 静默挡掉。
+    // 增长量守卫：mid-turn 和 pre-request 共享同一个 LLM summary 尝试游标。
+    // 同一批上下文刚尝试过且无有效增量时，不再重复请求 summary。
     let llm_threshold = pre_request_llm_summary_threshold(next_model, app.config.history_max_chars);
     let session_id = app.session_id.clone();
-    if should_try_pre_request_llm_summary(&session_id, budget_report.after_chars, llm_threshold) {
+    if should_try_llm_summary(&session_id, budget_report.after_chars, llm_threshold) {
         crate::ai::driver::print::print_tool_note_line(
             "compress",
             &format!(
@@ -424,13 +383,12 @@ async fn request_model_response(
                  agent may hit context limit",
             );
         }
-        // 无论成功与否都写入游标（见 static 注释）。失败时也记录，避免
-        // 结构上无法压缩时每轮空转重试；MIN_GROWTH 保证真正增长后再次尝试。
-        store_last_pre_request_summary_chars(&session_id, llm_after);
+        record_llm_summary_attempt_chars(&session_id, llm_after);
     }
 
     let auto_model_fallback_spec = crate::ai::driver::runtime_ctx::auto_model_fallback_spec();
-    if auto_model_fallback_spec.is_some()
+    if crate::ai::driver::runtime_ctx::terminal_output_enabled()
+        && auto_model_fallback_spec.is_some()
         && crate::ai::models::subagent_model_needs_probe(next_model)
     {
         eprintln!(
@@ -454,10 +412,12 @@ async fn request_model_response(
         if let Some(fallback_model) =
             crate::ai::models::fallback_subagent_model_after_failure(next_model, fallback_spec)
         {
-            eprintln!(
-                "[model] auto-selected model '{}' failed; retrying subagent with '{}'",
-                next_model, fallback_model
-            );
+            if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                eprintln!(
+                    "[model] auto-selected model '{}' failed; retrying subagent with '{}'",
+                    next_model, fallback_model
+                );
+            }
             actual_model = fallback_model.clone();
             request_result = if force_final_response {
                 do_request_messages_without_tools(app, &fallback_model, messages, true).await
@@ -558,6 +518,19 @@ async fn finalize_stream_interaction(
             Ok(Ok(())) => {}
             Ok(Err(err)) => return Err(err),
             Err(_) => {
+                if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                    app.streaming
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(match stream_result.outcome {
+                        StreamOutcome::ToolCall => IterationExecution::ToolCall(ToolCallExecution {
+                            stream_result,
+                            allowed_tool_names: request_visible_tool_names(app),
+                        }),
+                        StreamOutcome::EmptyResponse => IterationExecution::EmptyResponse,
+                        StreamOutcome::Truncated => IterationExecution::Truncated(stream_result),
+                        _ => IterationExecution::FinalResponse(stream_result),
+                    });
+                }
                 eprintln!("[Warning] 响应流收尾 drain 超时，已跳过剩余字节读取以避免会话卡住。");
             }
         }
@@ -662,7 +635,9 @@ pub(super) async fn execute_turn_iteration(
     const MAX_STREAM_RETRIES: usize = 16;
     let mut stream_attempt = 0usize;
     loop {
-        request::print_info(app, &actual_model);
+        if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+            request::print_info(app, &actual_model);
+        }
         match stream_model_response(
             app,
             &mut response,
@@ -691,10 +666,12 @@ pub(super) async fn execute_turn_iteration(
                     && request::is_retryable_stream_error(&err_msg)
                 {
                     stream_attempt += 1;
-                    eprintln!(
-                        "\n[Info] 流式响应中断（{}），第 {}/{} 次重试...",
-                        err_msg, stream_attempt, MAX_STREAM_RETRIES
-                    );
+                    if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                        eprintln!(
+                            "\n[Info] 流式响应中断（{}），第 {}/{} 次重试...",
+                            err_msg, stream_attempt, MAX_STREAM_RETRIES
+                        );
+                    }
                     current_history.clear();
                     app.streaming
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -746,8 +723,10 @@ pub(super) async fn execute_turn_iteration(
                 }
 
                 // 不可重试或已用完重试次数——回退到旧行为，继续对话
-                eprintln!("\n[Error] 流式响应处理失败：{}", err_msg);
-                eprintln!("[Info] 尝试继续对话...");
+                if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                    eprintln!("\n[Error] 流式响应处理失败：{}", err_msg);
+                    eprintln!("[Info] 尝试继续对话...");
+                }
                 let stream_result = StreamResult {
                     outcome: StreamOutcome::Completed,
                     tool_calls: Vec::new(),
@@ -784,9 +763,9 @@ pub(super) async fn execute_turn_iteration(
 mod tests {
     use super::{
         StreamingFlagGuard, no_tool_handoff_note, refresh_outstanding_task_anchor,
-        request_interrupt_pending, should_try_pre_request_llm_summary,
-        store_last_pre_request_summary_chars,
+        request_interrupt_pending,
     };
+    use super::super::{record_llm_summary_attempt_chars, should_try_llm_summary};
     use crate::ai::history::{Message, ROLE_INTERNAL_NOTE};
     use serde_json::Value;
     use std::sync::atomic::AtomicBool;
@@ -846,48 +825,28 @@ mod tests {
     #[test]
     fn pre_request_llm_summary_cursor_backoff_after_attempt() {
         let sid = "test-session-cursor-backoff";
-        store_last_pre_request_summary_chars(sid, 0);
+        record_llm_summary_attempt_chars(sid, 0);
         let threshold = 240_000;
         let after_chars = 240_457;
 
-        assert!(should_try_pre_request_llm_summary(
-            sid,
-            after_chars,
-            threshold
-        ));
+        assert!(should_try_llm_summary(sid, after_chars, threshold));
 
         // 调用方在每次尝试后（无论成功与否）都写入游标。模拟失败/no-op 后
         // 写入实际尝试后大小，确保下一次同样大小的请求被 growth 守卫挡掉，
         // 避免结构上无法压缩时每轮空转重试。
-        store_last_pre_request_summary_chars(sid, after_chars);
-        assert!(!should_try_pre_request_llm_summary(
-            sid,
-            after_chars,
-            threshold
-        ));
+        record_llm_summary_attempt_chars(sid, after_chars);
+        assert!(!should_try_llm_summary(sid, after_chars, threshold));
         // 增长 ≥ MIN_GROWTH(20K) 后才再次触发
-        assert!(should_try_pre_request_llm_summary(
-            sid,
-            after_chars + 20_000,
-            threshold
-        ));
+        assert!(should_try_llm_summary(sid, after_chars + 20_000, threshold));
 
-        store_last_pre_request_summary_chars(sid, 230_000);
-        assert!(!should_try_pre_request_llm_summary(
-            sid,
-            after_chars,
-            threshold
-        ));
-        assert!(should_try_pre_request_llm_summary(sid, 251_000, threshold));
+        record_llm_summary_attempt_chars(sid, 230_000);
+        assert!(!should_try_llm_summary(sid, after_chars, threshold));
+        assert!(should_try_llm_summary(sid, 251_000, threshold));
 
         // 不同 session 之间互不串扰：另一个 session 游标仍为 0，应独立触发。
         let other = "test-session-cursor-isolation";
-        assert!(should_try_pre_request_llm_summary(
-            other,
-            after_chars,
-            threshold
-        ));
+        assert!(should_try_llm_summary(other, after_chars, threshold));
 
-        store_last_pre_request_summary_chars(sid, 0);
+        record_llm_summary_attempt_chars(sid, 0);
     }
 }

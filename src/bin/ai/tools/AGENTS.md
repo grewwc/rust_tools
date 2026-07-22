@@ -49,12 +49,14 @@ Module responsibilities: schema/metadata in `registry/`, execution in
     (`task`, `task_spawn`, `task_wait`, `task_status`, `task_cancel`) is
     top-level only: subagents must not see it, `enable_tools` must not
     reintroduce it, and execution paths must reject it when
-    `SUBAGENT_DEPTH > 0`. Results are session-scoped, and surfaced child
-    outputs must remind the parent to produce its own summary. Subagent
+    `SUBAGENT_DEPTH > 0`. Results are scoped by both session and owner process
+    pid; a process must not see, wait on, or cancel parent/sibling task ids.
+    Surfaced child outputs must remind the parent to produce its own summary. Subagent
     launches use a capped copy of the selected agent manifest
     (`SUBAGENT_MAX_ITERATIONS`) and wrap the prompt with leaf-task convergence
     constraints; do not lower the primary agent's manifest budget to tune
-    subagent behavior.
+    subagent behavior. Terminal lifecycle views must use read-only task snapshots;
+    never surface child thinking or streamed response bodies from the task registry.
 
 11. **Wall-clock safety net.** Stuck subagents are reaped after
     `SUBAGENT_WALL_CLOCK_TIMEOUT` (30 min) via two paths: `task_wait`'s per-call

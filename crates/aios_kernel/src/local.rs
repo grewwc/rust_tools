@@ -1613,6 +1613,30 @@ impl KernelInternal for LocalOS {
         }
     }
 
+    fn wake_process(&mut self, pid: u64, message: String) -> bool {
+        let should_enqueue = if let Some(proc) = self.processes.get_mut(&pid) {
+            if matches!(proc.state, ProcessState::Terminated) {
+                return false;
+            }
+            proc.mailbox.push_back(message);
+            if matches!(
+                proc.state,
+                ProcessState::Waiting { .. } | ProcessState::Sleeping { .. }
+            ) {
+                proc.state = ProcessState::Ready;
+                true
+            } else {
+                false
+            }
+        } else {
+            return false;
+        };
+        if should_enqueue {
+            self.enqueue_ready(pid);
+        }
+        should_enqueue
+    }
+
     fn process_pending_signals(&mut self) -> bool {
         let current = match self.current_pid {
             Some(pid) => pid,

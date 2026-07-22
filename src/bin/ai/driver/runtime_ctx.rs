@@ -117,6 +117,10 @@ tokio::task_local! {
     /// current execution phase here so the spawning `task` tool's heartbeat
     /// line can surface it. Absence means "no parent is showing a heartbeat".
     pub(crate) static SUBAGENT_PHASE: SubagentPhaseSlot;
+    /// 后台 subagent 不拥有 terminal。其完整响应仍照常解析、持久化并通过 result
+    /// slot 返回父 agent，但流式正文、thinking、工具状态等不得直接写 stdout/stderr，
+    /// 否则多个并发任务会互相覆盖光标并打乱前台输出。
+    pub(crate) static SUPPRESS_TERMINAL_OUTPUT: bool;
     /// 子代理嵌套深度。顶层 agent 未设置（等价于 0）；每 spawn 一层
     /// 子代理时递增。用于防止 `mode: all` 的 heavy agent 递归扇出
     /// 导致资源耗尽——`task_spawn` / `task` 在超过 `MAX_SUBAGENT_SPAWN_DEPTH`
@@ -169,6 +173,11 @@ pub(crate) async fn publish_subagent_result(text: &str) {
 
 pub(crate) fn has_subagent_result_slot() -> bool {
     SUBAGENT_RESULT_SLOT.try_with(|_| ()).is_ok()
+}
+
+/// 当前任务是否拥有 terminal 输出权。默认允许；后台 subagent 作用域显式关闭。
+pub(crate) fn terminal_output_enabled() -> bool {
+    !SUPPRESS_TERMINAL_OUTPUT.try_with(|value| *value).unwrap_or(false)
 }
 
 /// Publish the sub-agent's current execution phase into the active phase
@@ -293,6 +302,14 @@ mod tests {
     #[test]
     fn override_memory_path_is_none_outside_scope() {
         assert!(override_memory_path().is_none());
+    }
+
+    #[test]
+    fn terminal_output_is_disabled_only_inside_suppressed_scope() {
+        assert!(terminal_output_enabled());
+        let enabled = SUPPRESS_TERMINAL_OUTPUT.sync_scope(true, terminal_output_enabled);
+        assert!(!enabled);
+        assert!(terminal_output_enabled());
     }
 
     #[test]

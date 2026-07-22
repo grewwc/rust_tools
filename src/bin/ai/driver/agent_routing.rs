@@ -143,30 +143,33 @@ pub(super) fn maybe_auto_route_agent(
 }
 
 /// Loads all agents fresh from disk, enabling hot-reload of newly added/modified agents.
-/// Returns the updated manifests.
-pub(super) fn reload_agent_manifests(agent_manifests: &mut Arc<Vec<AgentManifest>>) {
+/// 发生变化时返回待展示消息，由前台 driver 在结束动态状态行后统一输出。
+pub(super) fn reload_agent_manifests(
+    agent_manifests: &mut Arc<Vec<AgentManifest>>,
+) -> Option<String> {
     let new_agents = agents::load_all_agents();
     let old_fingerprint = agent_manifests_fingerprint(agent_manifests.as_slice());
     let new_fingerprint = agent_manifests_fingerprint(new_agents.as_slice());
     if old_fingerprint == new_fingerprint {
-        return;
+        return None;
     }
     let added = new_agents.len() as i64 - agent_manifests.len() as i64;
-    if added > 0 {
-        println!("[Agent 发现] 新发现 {} 个 agent(s)，已自动加载", added);
+    let message = if added > 0 {
+        format!("[Agent 发现] 新发现 {} 个 agent(s)，已自动加载", added)
     } else if added < 0 {
-        println!(
+        format!(
             "[Agent 发现] 移除 {} 个 agent(s)，共 {} 个",
             -added,
             new_agents.len()
-        );
+        )
     } else {
-        println!(
+        format!(
             "[Agent 发现] 检测到 agent 内容变更，已重新加载，共 {} 个",
             new_agents.len()
-        );
-    }
+        )
+    };
     *agent_manifests = Arc::new(new_agents);
+    Some(message)
 }
 
 /// 基于 manifest 关键字段计算稳定指纹，用于检测增删改三类变更。

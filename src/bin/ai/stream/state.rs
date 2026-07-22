@@ -146,7 +146,7 @@ pub(super) struct ThinkingFoldState {
     pub(super) rendered_body_lines: Vec<String>,
     /// 是否处于活跃的 thinking 折叠模式
     pub(super) active: bool,
-    /// header（`╭─ thinking`）是否已落地。header 只打印一次并被锚定在重画区域之上，
+    /// header（`thinking`）是否已落地。header 只打印一次并被锚定在重画区域之上，
     /// 绝不随正文一起被 cursor-up 擦除重画——这样即便正文擦除失步也无法再生出第二个
     /// header，从根上杜绝「孤儿 header 叠加」的渲染 bug。
     pub(super) header_drawn: bool,
@@ -274,7 +274,7 @@ pub(super) struct HiddenMetaParseState {
 }
 
 pub(super) enum StreamChunkStep {
-    Continue,
+    Continue { meaningful_progress: bool },
     Stop,
     Return(StreamResult),
 }

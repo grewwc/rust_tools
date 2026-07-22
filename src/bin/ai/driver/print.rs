@@ -19,8 +19,11 @@ pub fn print_assistant_banner_with_app(app: Option<&App>) {
 }
 
 pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: Option<&str>) {
+    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        return;
+    }
     println!(
-        "\n{}",
+        "{}",
         format_assistant_banner(app.map(|a| a.current_agent.as_str()), skill_name)
     );
 }
@@ -30,18 +33,30 @@ pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: 
 pub fn print_tool_output_block(_content: &str) {}
 
 pub fn print_tool_output_line(line: &str) {
+    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        return;
+    }
     println!("{}", format_tool_output_line(line));
 }
 
 pub fn print_tool_note_line(label: &str, value: &str) {
+    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        return;
+    }
     println!("{}", format_tool_note_line(label, value));
 }
 
 pub fn print_tool_command_line(command: &str) {
+    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        return;
+    }
     println!("{}", format_tool_command_line(command));
 }
 
 pub fn print_ocr_summary(extraction: &OcrExtraction) {
+    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        return;
+    }
     for line in format_ocr_summary_block(extraction) {
         println!("{line}");
     }
@@ -49,10 +64,6 @@ pub fn print_ocr_summary(extraction: &OcrExtraction) {
 
 pub(in crate::ai) fn format_section_header(title: &str, detail: Option<&str>) -> String {
     let mut out = String::new();
-    out.push_str(ACCENT_RULE);
-    out.push_str("╭─");
-    out.push_str(RESET);
-    out.push(' ');
     out.push_str(BOLD);
     out.push_str(ACCENT_SUCCESS);
     out.push_str(title);
@@ -69,30 +80,21 @@ pub(in crate::ai) fn format_section_header(title: &str, detail: Option<&str>) ->
 }
 
 pub(in crate::ai) fn format_section_note(note: &str) -> String {
-    format!(
-        "  {}│{} {}{}{}",
-        ACCENT_RULE, RESET, ACCENT_MUTED, note, RESET
-    )
+    format!("  {}{}{}", ACCENT_MUTED, note, RESET)
 }
 
 pub(in crate::ai) fn format_section_item(label: &str, description: &str) -> String {
     if description.is_empty() {
-        return format!(
-            "  {}│{} {}{}{}",
-            ACCENT_RULE, RESET, ACCENT_PRIMARY, label, RESET
-        );
+        return format!("  {}{}{}", ACCENT_PRIMARY, label, RESET);
     }
     format!(
-        "  {}│{} {}{}{} {}· {}{}{}",
-        ACCENT_RULE, RESET, ACCENT_PRIMARY, label, RESET, ACCENT_MUTED, RESET, DIM, description
+        "  {}{}{} {}· {}{}{}",
+        ACCENT_PRIMARY, label, RESET, ACCENT_MUTED, RESET, DIM, description
     ) + RESET
 }
 
 pub(in crate::ai) fn format_empty_state(label: &str) -> String {
-    format!(
-        "{}╰─{} {}{}{}",
-        ACCENT_RULE, RESET, ACCENT_MUTED, label, RESET
-    )
+    format!("  {}{}{}", ACCENT_MUTED, label, RESET)
 }
 
 pub(in crate::ai) fn format_assistant_banner(
@@ -105,19 +107,23 @@ pub(in crate::ai) fn format_assistant_banner(
         (None, Some(skill)) => Some(format!("skill:{skill}")),
         (None, None) => None,
     };
-    format_section_header("assistant", detail.as_deref())
+    let mut out = format!("{BOLD}{ACCENT_SUCCESS}assistant{RESET}");
+    if let Some(detail) = detail.as_deref() {
+        out.push_str(&format!(" {ACCENT_MUTED}· {detail}{RESET}"));
+    }
+    out
 }
 
 pub(in crate::ai) fn format_tool_header(tool_name: &str) -> String {
     format!(
-        "{}├─{} {}{}tool{} {}{}{}",
-        ACCENT_RULE, RESET, BOLD, ACCENT_SUCCESS, RESET, ACCENT_PRIMARY, tool_name, RESET
+        "{}{}tool{} {}{}{}",
+        BOLD, ACCENT_SUCCESS, RESET, ACCENT_PRIMARY, tool_name, RESET
     )
 }
 
 pub(in crate::ai) fn format_tool_status(status: &str, tool_name: &str, accent: &str) -> String {
     format!(
-        "{}{}{} {}{}{}",
+        "  {}{}{} {}{}{}",
         accent, status, RESET, ACCENT_PRIMARY, tool_name, RESET
     )
 }
@@ -128,21 +134,21 @@ pub(in crate::ai) fn format_tool_status_with_file_target(
 ) -> String {
     let target = sanitize_for_terminal(target);
     format!(
-        "{}  {}file:{} {}{}{}",
+        "{}  {}·{} {}{}{}",
         status_line, ACCENT_MUTED, RESET, ACCENT_SECONDARY, target, RESET
     )
 }
 
 pub(in crate::ai) fn format_tool_status_running(tool_name: &str) -> String {
-    format_tool_status("→", tool_name, ACCENT_PRIMARY)
+    format_tool_status("●", tool_name, ACCENT_PRIMARY)
 }
 
 pub(in crate::ai) fn format_tool_status_cached(tool_name: &str) -> String {
-    format_tool_status("✓", tool_name, ACCENT_SECONDARY)
+    format_tool_status("◇", tool_name, ACCENT_SECONDARY)
 }
 
 pub(in crate::ai) fn format_tool_status_skipped(tool_name: &str) -> String {
-    format_tool_status("⊘", tool_name, ACCENT_WARN)
+    format_tool_status("–", tool_name, ACCENT_WARN)
 }
 
 pub(in crate::ai) fn format_tool_status_completed(tool_name: &str) -> String {
@@ -150,11 +156,11 @@ pub(in crate::ai) fn format_tool_status_completed(tool_name: &str) -> String {
 }
 
 pub(in crate::ai) fn format_tool_status_failed(tool_name: &str) -> String {
-    format_tool_status("✗", tool_name, ACCENT_DANGER)
+    format_tool_status("×", tool_name, ACCENT_DANGER)
 }
 
 pub(in crate::ai) fn format_tool_status_deferred(tool_name: &str) -> String {
-    format_tool_status("⏸", tool_name, ACCENT_WARN)
+    format_tool_status("◷", tool_name, ACCENT_WARN)
 }
 
 pub(in crate::ai) fn format_tool_output_prefix() -> String {
@@ -247,8 +253,8 @@ pub(in crate::ai) fn format_tool_note_line(label: &str, value: &str) -> String {
 
 pub(in crate::ai) fn format_tool_command_line(command: &str) -> String {
     format!(
-        "  {}│{} {}{}cmd:{} {}{}{}",
-        ACCENT_RULE, RESET, BOLD, ACCENT_MUTED, RESET, ACCENT_COMMAND, command, RESET
+        "  {}│{} {}${} {}{}{}",
+        ACCENT_RULE, RESET, ACCENT_MUTED, RESET, ACCENT_COMMAND, command, RESET
     )
 }
 
@@ -276,7 +282,12 @@ pub(in crate::ai) fn format_file_tool_target(tool_name: &str, args_json: &str) -
                     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1);
                     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
                     if limit > 0 {
-                        return format!("{}  lines {}..{}", short, offset, offset + limit.saturating_sub(1));
+                        return format!(
+                            "{}  lines {}..{}",
+                            short,
+                            offset,
+                            offset + limit.saturating_sub(1)
+                        );
                     }
                 }
                 short
@@ -340,6 +351,9 @@ fn short_path(p: &str) -> String {
 /// 若工具配置了 `print_args`，把调用入参回显到终端；否则为空操作。
 /// 是否回显由工具自身提交的 `ToolDisplayConfig` 决定，调用方无需感知具体工具名。
 pub(in crate::ai) fn echo_tool_args(tool_name: &str, args_json: &str) {
+    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        return;
+    }
     let config = crate::ai::tools::registry::common::tool_display_config(tool_name);
     if !config.print_args {
         return;
@@ -358,6 +372,9 @@ pub(in crate::ai) fn echo_tool_args(tool_name: &str, args_json: &str) {
 /// 若工具配置了 `print_result`，把输出内容回显到终端；否则为空操作。
 /// 是否回显由工具自身提交的 `ToolDisplayConfig` 决定，调用方无需感知具体工具名。
 pub(in crate::ai) fn echo_tool_output(tool_name: &str, content: &str) {
+    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        return;
+    }
     let config = crate::ai::tools::registry::common::tool_display_config(tool_name);
     if !config.print_result {
         return;
@@ -518,14 +535,14 @@ mod tests {
     #[test]
     fn assistant_banner_uses_modern_single_line_label() {
         let rendered = strip_ansi_for_test(&format_assistant_banner(Some("planner"), None));
-        assert_eq!(rendered, "╭─ assistant · planner");
+        assert_eq!(rendered, "assistant · planner");
     }
 
     #[test]
     fn assistant_banner_includes_active_skill_when_present() {
         let rendered =
             strip_ansi_for_test(&format_assistant_banner(Some("build"), Some("humanizer")));
-        assert_eq!(rendered, "╭─ assistant · build · skill:humanizer");
+        assert_eq!(rendered, "assistant · build · skill:humanizer");
     }
 
     #[test]
@@ -536,7 +553,7 @@ mod tests {
             .map(|line| strip_ansi_for_test(&line))
             .collect::<Vec<_>>();
 
-        assert_eq!(header, "├─ tool search_codebase");
+        assert_eq!(header, "tool search_codebase");
         assert_eq!(lines, vec!["  │ line 1", "  │", "  │ line 3"]);
     }
 
@@ -560,10 +577,10 @@ mod tests {
         ));
         let empty = strip_ansi_for_test(&format_empty_state("no response"));
 
-        assert_eq!(header, "╭─ mcp · 2 servers, 5 tools");
-        assert_eq!(note, "  │ config path: ~/.config/mcp.json");
-        assert_eq!(item, "  │ search_codebase · semantic code search");
-        assert_eq!(empty, "╰─ no response");
+        assert_eq!(header, "mcp · 2 servers, 5 tools");
+        assert_eq!(note, "  config path: ~/.config/mcp.json");
+        assert_eq!(item, "  search_codebase · semantic code search");
+        assert_eq!(empty, "  no response");
     }
 
     #[test]
@@ -592,10 +609,10 @@ mod tests {
 
         assert_eq!(
             visible[0],
-            "╭─ ocr · 2 images · 1 ok · 1 failed · mcp_ocr_extract_ocr_image"
+            "ocr · 2 images · 1 ok · 1 failed · mcp_ocr_extract_ocr_image"
         );
-        assert_eq!(visible[1], "  │ a.png · ok · 128 chars");
-        assert!(visible[2].starts_with("  │ b.png · failed · timeout talking to OCR service"));
+        assert_eq!(visible[1], "  a.png · ok · 128 chars");
+        assert!(visible[2].starts_with("  b.png · failed · timeout talking to OCR service"));
     }
 
     #[test]
@@ -614,7 +631,7 @@ mod tests {
     fn tool_command_line_keeps_text_stable_and_uses_distinct_accent() {
         let rendered = format_tool_command_line("cargo check --bin a");
         let visible = strip_ansi_for_test(&rendered);
-        assert_eq!(visible, "  │ cmd: cargo check --bin a");
+        assert_eq!(visible, "  │ $ cargo check --bin a");
         assert!(rendered.contains(ACCENT_COMMAND));
     }
 
@@ -626,7 +643,7 @@ mod tests {
         );
         let visible = strip_ansi_for_test(&rendered);
 
-        assert_eq!(visible, "✓ read_file  file: tool_result/execution.rs");
+        assert_eq!(visible, "  ✓ read_file  · tool_result/execution.rs");
         assert!(rendered.contains(&format!("{ACCENT_SECONDARY}tool_result/execution.rs")));
     }
 

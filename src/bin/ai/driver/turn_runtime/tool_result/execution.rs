@@ -2591,6 +2591,7 @@ mod tests {
             crate::ai::tools::task_tools::AsyncTaskEntry {
                 session_id: app.session_id.clone(),
                 result_observed: false,
+                owner_pid: pid,
                 pid,
                 result_channel_id,
                 completion_futex_addr: aios_kernel::primitives::FutexAddr(1),
@@ -2709,6 +2710,7 @@ mod tests {
             crate::ai::tools::task_tools::AsyncTaskEntry {
                 session_id: app.session_id.clone(),
                 result_observed: false,
+                owner_pid: pid,
                 pid,
                 result_channel_id,
                 completion_futex_addr: aios_kernel::primitives::FutexAddr(1),

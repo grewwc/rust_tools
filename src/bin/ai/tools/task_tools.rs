@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::ai::tools::os_tools::GLOBAL_OS;
 use crate::ai::{
@@ -190,6 +190,9 @@ impl InheritOptions {
 pub(crate) struct AsyncTaskEntry {
     pub(crate) session_id: String,
     pub(crate) result_observed: bool,
+    /// 直接拥有该 task 的父进程 pid。task_wait/status/cancel 只允许 owner
+    /// 进程观察自己 spawn 的子任务，避免同一 session 内父/兄弟任务互相污染。
+    pub(crate) owner_pid: u64,
     /// 与 kernel `Process.pid` 一致；agent 端额外保存便于通过 task_id 反查 pid。
     pub(crate) pid: u64,
     pub(crate) result_channel_id: u64,
@@ -222,6 +225,39 @@ pub(crate) struct AsyncTaskEntry {
 /// / `take_task_entry` 等 helper 函数来读写这里，避免直接持有 lock guard。
 static TASK_REGISTRY: LazyLock<Mutex<SkipMap<String, AsyncTaskEntry>>> =
     LazyLock::new(|| Mutex::new(SkipMap::default()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TaskWaitPolicyKey {
+    Any,
+    All,
+}
+
+impl From<&WaitPolicy> for TaskWaitPolicyKey {
+    fn from(value: &WaitPolicy) -> Self {
+        match value {
+            WaitPolicy::Any => Self::Any,
+            WaitPolicy::All => Self::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TaskWaitKey {
+    session_id: String,
+    owner_pid: u64,
+    wait_policy: TaskWaitPolicyKey,
+    task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TaskWaitState {
+    deadline: Instant,
+    timeout_secs: u64,
+    expired: bool,
+}
+
+static TASK_WAIT_STATES: LazyLock<Mutex<FxHashMap<TaskWaitKey, TaskWaitState>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 const OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX: &str = "[pending-subagent-tasks]";
 
@@ -348,6 +384,119 @@ fn with_os_kernel<T>(f: impl FnOnce(&mut dyn Kernel) -> Result<T, String>) -> Re
         .lock()
         .map_err(|e| format!("Failed to lock AIOS kernel: {e}"))?;
     f(kernel.as_mut())
+}
+
+fn current_task_owner_pid() -> Result<u64, String> {
+    with_os_kernel(|os| {
+        os.current_process_id()
+            .ok_or("task orchestration requires an active AIOS process context.".to_string())
+    })
+}
+
+fn current_task_owner_pid_opt() -> Option<u64> {
+    with_os_kernel(|os| Ok(os.current_process_id()))
+        .ok()
+        .flatten()
+}
+
+fn active_foreground_owner_pid(os: &mut dyn Kernel) -> Option<u64> {
+    if let Some(pid) = os.current_process_id()
+        && os.get_process(pid).is_some_and(|proc| proc.is_foreground)
+    {
+        return Some(pid);
+    }
+    os.list_processes()
+        .into_iter()
+        .find(|proc| proc.is_foreground && !matches!(proc.state, ProcessState::Terminated))
+        .map(|proc| proc.pid)
+}
+
+fn task_entry_owned_by(entry: &AsyncTaskEntry, session_id: &str, owner_pid: u64) -> bool {
+    entry.session_id == session_id && entry.owner_pid == owner_pid
+}
+
+fn task_wait_key(
+    session_id: &str,
+    owner_pid: u64,
+    wait_policy: &WaitPolicy,
+    task_ids: &[String],
+) -> TaskWaitKey {
+    let mut normalized = task_ids.to_vec();
+    normalized.sort();
+    normalized.dedup();
+    TaskWaitKey {
+        session_id: session_id.to_string(),
+        owner_pid,
+        wait_policy: wait_policy.into(),
+        task_ids: normalized,
+    }
+}
+
+fn load_or_create_task_wait_state(key: &TaskWaitKey, timeout_secs: u64) -> TaskWaitState {
+    let now = Instant::now();
+    let mut states = TASK_WAIT_STATES.lock().unwrap();
+    let state = states.entry(key.clone()).or_insert_with(|| TaskWaitState {
+        deadline: now + Duration::from_secs(timeout_secs),
+        timeout_secs,
+        expired: false,
+    });
+    if now >= state.deadline {
+        state.expired = true;
+    }
+    *state
+}
+
+fn clear_task_wait_state(key: &TaskWaitKey) {
+    let mut states = TASK_WAIT_STATES.lock().unwrap();
+    states.remove(key);
+}
+
+#[cfg(test)]
+pub(crate) fn expire_task_wait_states_for_test() {
+    let mut states = TASK_WAIT_STATES.lock().unwrap();
+    let expired_at = Instant::now() - Duration::from_secs(1);
+    for state in states.values_mut() {
+        state.deadline = expired_at;
+        state.expired = false;
+    }
+}
+
+pub(crate) fn wake_expired_task_waits() {
+    let expired = {
+        let now = Instant::now();
+        let mut states = TASK_WAIT_STATES.lock().unwrap();
+        states
+            .iter_mut()
+            .filter_map(|(key, state)| {
+                if state.expired || now < state.deadline {
+                    return None;
+                }
+                state.expired = true;
+                Some((key.clone(), *state))
+            })
+            .collect::<Vec<_>>()
+    };
+    if expired.is_empty() {
+        return;
+    }
+
+    let _ = with_os_kernel(|os| {
+        let mut woken: SkipSet<u64> = SkipSet::default();
+        for (key, state) in expired {
+            if !woken.insert(key.owner_pid) {
+                continue;
+            }
+            let task_ids = key.task_ids.join(", ");
+            let _ = os.wake_process(
+                key.owner_pid,
+                format!(
+                    "[TASK_WAIT_TIMEOUT]\nWall-clock task_wait budget elapsed after {}s. Re-call `task_wait` with the same task_ids to collect any ready results and receive the budget-elapsed status. task_ids=[{}]",
+                    state.timeout_secs, task_ids
+                ),
+            );
+        }
+        Ok(())
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -826,7 +975,7 @@ pub(crate) fn spawn_subagent_kernel_task(
         ));
     }
     let task_id = next_task_id();
-    let (pid, result_channel_id, completion_futex_addr) = with_os_kernel(|os| {
+    let (owner_pid, pid, result_channel_id, completion_futex_addr) = with_os_kernel(|os| {
         let parent_pid = os
             .current_process_id()
             .ok_or("subagent task requires an active AIOS process context.".to_string())?;
@@ -863,7 +1012,7 @@ pub(crate) fn spawn_subagent_kernel_task(
             None,
             None,
         )?;
-        Ok((pid, result_channel.raw(), completion_futex))
+        Ok((parent_pid, pid, result_channel.raw(), completion_futex))
     })?;
 
     {
@@ -873,6 +1022,7 @@ pub(crate) fn spawn_subagent_kernel_task(
             AsyncTaskEntry {
                 session_id: crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
                 result_observed: false,
+                owner_pid,
                 pid,
                 result_channel_id,
                 completion_futex_addr,
@@ -929,6 +1079,39 @@ pub(crate) fn with_task_entry_by_pid<R>(
     None
 }
 
+/// 前台状态栏使用的只读快照。只暴露展示所需字段；subagent 正文仍只通过
+/// `task_wait` / `task_status` 返回，避免后台任务争用 terminal。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubagentTerminalStatus {
+    pub(crate) description: String,
+    pub(crate) agent_name: String,
+    pub(crate) state: String,
+    pub(crate) elapsed_secs: u64,
+}
+
+pub(crate) fn subagent_terminal_statuses(
+    os: &mut dyn Kernel,
+    session_id: &str,
+) -> Vec<SubagentTerminalStatus> {
+    let Some(owner_pid) = active_foreground_owner_pid(os) else {
+        return Vec::new();
+    };
+    let registry = TASK_REGISTRY.lock().unwrap();
+    let mut statuses = registry
+        .iter()
+        .filter(|(_, entry)| task_entry_owned_by(entry, session_id, owner_pid))
+        .map(|(_, entry)| SubagentTerminalStatus {
+            description: entry.description.clone(),
+            agent_name: entry.agent_name.clone(),
+            state: task_state_string(os, entry.result_channel_id, entry.pid)
+                .unwrap_or_else(|_| "unknown".to_string()),
+            elapsed_secs: entry.started_at.elapsed().as_secs(),
+        })
+        .collect::<Vec<_>>();
+    statuses.sort_by(|a, b| a.description.cmp(&b.description));
+    statuses
+}
+
 /// Remove a task entry from the registry. Called by the synchronous `task`
 /// interception once it has consumed the result.
 pub(crate) fn remove_task_entry(task_id: &str) -> Option<AsyncTaskEntry> {
@@ -951,16 +1134,6 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_spawn")?;
     let prepared = prepare_subagent_task(args)?;
     let spawned = spawn_subagent_kernel_task(&prepared)?;
-
-    println!(
-        "\n[TaskSpawn] Launched AIOS task pid={} subagent '{}' with model '{}' inherit={} for: {} (task_id: {})",
-        spawned.pid,
-        prepared.agent_name,
-        prepared.model,
-        prepared.inherit.describe(),
-        prepared.description,
-        spawned.task_id,
-    );
 
     Ok(format!(
         "Task spawned: task_id={}, pid={}, agent={}, model={}, inherit={}\nUse task_wait to collect results when ready.",
@@ -1043,14 +1216,14 @@ fn ensure_top_level_task_orchestration(tool_name: &str) -> Result<(), String> {
 pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_wait")?;
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
-    let task_ids = args["task_ids"]
+    let requested_task_ids = args["task_ids"]
         .as_array()
         .ok_or("Missing 'task_ids' array parameter")?
         .iter()
         .filter_map(|v| v.as_str().map(String::from))
         .collect::<Vec<_>>();
 
-    if task_ids.is_empty() {
+    if requested_task_ids.is_empty() {
         return Err("task_ids array cannot be empty".to_string());
     }
 
@@ -1061,9 +1234,6 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TASK_WAIT_TIMEOUT_SECS)
         .clamp(1, MAX_TASK_WAIT_TIMEOUT_SECS);
-    // 启发式：driver 主循环 idle 路径每 ~10ms 调一次 advance_tick()，故 100
-    // ticks ≈ 1 秒。这里宁可早醒不晚醒，使用 100 ticks/sec。
-    let timeout_ticks = Some(timeout_secs.saturating_mul(100));
 
     // wait_policy: "any" | "all"，默认 "all"（与历史行为一致）。
     // - all  — 等到所有 pending 任务都完成才返回（适合需要汇总）；
@@ -1080,23 +1250,35 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         }
     };
 
+    let current_owner_pid = current_task_owner_pid()?;
     let mut registry = TASK_REGISTRY.lock().unwrap();
-    let mut foreign_task_ids = Vec::new();
+    let mut foreign_session_task_ids = Vec::new();
+    let mut foreign_owner_task_ids = Vec::new();
     let mut already_collected = 0usize;
     let mut task_ids_filtered = Vec::new();
-    for tid in task_ids {
+    for tid in &requested_task_ids {
         match registry.get_ref(&tid) {
-            Some(entry) if entry.session_id == current_session_id => {
-                task_ids_filtered.push(tid);
+            Some(entry) if task_entry_owned_by(entry, &current_session_id, current_owner_pid) => {
+                task_ids_filtered.push(tid.clone());
             }
-            Some(_) => foreign_task_ids.push(tid),
+            Some(entry) if entry.session_id == current_session_id => {
+                foreign_owner_task_ids.push(tid.clone());
+            }
+            Some(_) => foreign_session_task_ids.push(tid.clone()),
             None => already_collected += 1,
         }
     }
-    if !foreign_task_ids.is_empty() {
+    if !foreign_session_task_ids.is_empty() {
         return Err(format!(
             "Refusing to wait on task_id(s) owned by another session: {}",
-            foreign_task_ids.join(", ")
+            foreign_session_task_ids.join(", ")
+        ));
+    }
+    if !foreign_owner_task_ids.is_empty() {
+        return Err(format!(
+            "Refusing to wait on task_id(s) not owned by current process pid={}: {}",
+            current_owner_pid,
+            foreign_owner_task_ids.join(", ")
         ));
     }
     // task_id 不在 registry 中，说明它在 *上一次* task_wait 调用里已经被收集并清理
@@ -1115,6 +1297,14 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
              wait on; continue reasoning with the results you already collected."
         ));
     }
+    let wait_key = task_wait_key(
+        &current_session_id,
+        current_owner_pid,
+        &wait_policy,
+        &requested_task_ids,
+    );
+    let wait_state = load_or_create_task_wait_state(&wait_key, timeout_secs);
+    let wait_budget_elapsed = wait_state.expired;
 
     let mut ready = Vec::new();
     let mut pending = Vec::new();
@@ -1134,10 +1324,10 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             // 真实结果永久丢失，主 agent 自然会以为 "subagent 卡住"。
             //
             // 现在的做法：只看 channel 上有没有就绪 payload；如果还没有，统一
-            // 走 pending 分支，让 epoll_wait_many 在本次调用 budget 内挂起。
-            // 真正的"等待预算耗尽"只在 epoll_wait_many 的 wait.suspended /
-            // 返回空 ready 时体现，并且 **绝不销毁 channel/futex**，主 agent
-            // 可以继续调 task_wait 续等。
+            // 走 pending 分支。单次 task_wait 预算由 TASK_WAIT_STATES 的真实
+            // wall-clock deadline 控制；driver run_loop 到期后唤醒 owner 进程，
+            // 下一次 task_wait 才返回 BUDGET ELAPSED。预算耗尽也 **绝不销毁
+            // channel/futex**，主 agent 可以继续调 task_wait 续等。
             // wall-clock 总寿命检查：subagent 若超过 SUBAGENT_WALL_CLOCK_TIMEOUT
             // 仍无结果（典型如卡在单个永不返回的工具执行里），主动终止并写入
             // timeout 终态，使紧随其后的 read_task_result 立即读到结果，避免主
@@ -1196,7 +1386,10 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         }
 
         // `any` 在首次扫描已拿到结果时必须立即返回，不能再被其余 pending 任务挂起。
-        if !pending.is_empty() && !(wait_policy == WaitPolicy::Any && !ready.is_empty()) {
+        if !pending.is_empty()
+            && !wait_budget_elapsed
+            && !(wait_policy == WaitPolicy::Any && !ready.is_empty())
+        {
             let pending_ids = pending
                 .iter()
                 .map(|(tid, _)| tid.clone())
@@ -1212,7 +1405,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 &format!("task_wait:{}", pending_ids.join(",")),
                 &wait_sources,
                 WaitPolicy::Any,
-                timeout_ticks,
+                None,
             )?;
             // 无论 epoll_wait_many 是否 suspended，都先 re-scan 收集在等待期间
             // 变为就绪的结果。如果 suspended 且所有任务都已完成，直接返回结果
@@ -1300,6 +1493,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         return Ok(message);
     }
     if wait_policy == WaitPolicy::Any && !ready.is_empty() {
+        clear_task_wait_state(&wait_key);
         return Ok(ready.join("\n\n---\n\n"));
     }
     if !pending.is_empty() {
@@ -1331,12 +1525,14 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 registry.remove(tid);
             }
         }
+        clear_task_wait_state(&wait_key);
         return Ok(parts.join("\n\n---\n\n"));
     }
 
     for tid in &task_ids {
         registry.remove(tid);
     }
+    clear_task_wait_state(&wait_key);
     Ok(ready.join("\n\n---\n\n"))
 }
 
@@ -1524,6 +1720,7 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
         .map(String::from)
         .unwrap_or_else(|| "cancelled by parent agent".to_string());
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+    let current_owner_pid = current_task_owner_pid()?;
 
     let mut cancelled: Vec<String> = Vec::new();
     let mut already_finished: Vec<String> = Vec::new();
@@ -1535,13 +1732,15 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
         task_ids
             .iter()
             .filter_map(|tid| match registry.get_ref(tid) {
-                Some(entry) if entry.session_id == current_session_id => Some((
-                    tid.clone(),
-                    entry.pid,
-                    entry.result_channel_id,
-                    entry.completion_futex_addr,
-                    entry.abort_handle.clone(),
-                )),
+                Some(entry) if task_entry_owned_by(entry, &current_session_id, current_owner_pid) => {
+                    Some((
+                        tid.clone(),
+                        entry.pid,
+                        entry.result_channel_id,
+                        entry.completion_futex_addr,
+                        entry.abort_handle.clone(),
+                    ))
+                }
                 _ => {
                     not_found.push(tid.clone());
                     None
@@ -1612,7 +1811,7 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
             msg.push('\n');
         }
         msg.push_str(&format!(
-            "[task_cancel] {} task_id(s) not found or not owned by this session (already \
+            "[task_cancel] {} task_id(s) not found or not owned by this process/session (already \
              collected or never spawned): {}",
             not_found.len(),
             not_found.join(", ")
@@ -1624,14 +1823,18 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
 pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_status")?;
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+    let current_owner_pid = current_task_owner_pid()?;
     let tracked = {
         let registry = TASK_REGISTRY.lock().unwrap();
         registry
             .iter()
-            .filter(|(_, entry)| entry.session_id == current_session_id)
+            .filter(|(_, entry)| {
+                task_entry_owned_by(entry, &current_session_id, current_owner_pid)
+            })
             .map(|(tid, entry)| {
                 (
                     tid.clone(),
+                    entry.owner_pid,
                     entry.pid,
                     entry.result_channel_id,
                     entry.completion_futex_addr,
@@ -1661,6 +1864,7 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     with_os_kernel(|os| {
         for (
             tid,
+            owner_pid,
             pid,
             result_channel_id,
             completion_futex_addr,
@@ -1680,6 +1884,7 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
                 let entry = AsyncTaskEntry {
                     session_id: current_session_id.clone(),
                     result_observed: false,
+                    owner_pid: *owner_pid,
                     pid: *pid,
                     result_channel_id: *result_channel_id,
                     completion_futex_addr: *completion_futex_addr,
@@ -1740,11 +1945,14 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
 
 fn collect_outstanding_task_snapshots(
     session_id: &str,
+    owner_pid: u64,
 ) -> Result<Vec<OutstandingTaskSnapshot>, String> {
     let registry = TASK_REGISTRY.lock().unwrap();
     let tracked = registry
         .iter()
-        .filter(|(_, entry)| entry.session_id == session_id && !entry.result_observed)
+        .filter(|(_, entry)| {
+            task_entry_owned_by(entry, session_id, owner_pid) && !entry.result_observed
+        })
         .map(|(tid, entry)| {
             (
                 tid.clone(),
@@ -1811,7 +2019,10 @@ fn render_outstanding_task_anchor(snapshots: &[OutstandingTaskSnapshot]) -> Stri
 }
 
 pub(crate) fn build_outstanding_task_anchor(session_id: &str) -> Result<Option<String>, String> {
-    let snapshots = collect_outstanding_task_snapshots(session_id)?;
+    let Some(owner_pid) = current_task_owner_pid_opt() else {
+        return Ok(None);
+    };
+    let snapshots = collect_outstanding_task_snapshots(session_id, owner_pid)?;
     if snapshots.is_empty() {
         return Ok(None);
     }
@@ -1826,7 +2037,10 @@ pub(crate) fn build_abandoned_tasks_notice(
     session_id: &str,
     iteration_limit: usize,
 ) -> Result<Option<String>, String> {
-    let snapshots = collect_outstanding_task_snapshots(session_id)?;
+    let Some(owner_pid) = current_task_owner_pid_opt() else {
+        return Ok(None);
+    };
+    let snapshots = collect_outstanding_task_snapshots(session_id, owner_pid)?;
     if snapshots.is_empty() {
         return Ok(None);
     }

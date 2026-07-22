@@ -397,7 +397,9 @@ pub(super) async fn prepare_turn(
     // LLM 引导裁剪：在历史消息发送给模型前，静默替换已被连续标记为低价值的 tool 结果内容。
     // 不删除消息、不改变数组长度，仅替换 content 字段为占位符。
     let prune_report = llm_prune::apply_pruning(&mut history, &app.prune_marks);
-    if prune_report.pruned_count > 0 {
+    if prune_report.pruned_count > 0
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+    {
         let tools = if prune_report.tools.is_empty() {
             String::new()
         } else {

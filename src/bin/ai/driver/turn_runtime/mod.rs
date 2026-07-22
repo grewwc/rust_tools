@@ -164,6 +164,60 @@ pub(in crate::ai::driver::turn_runtime) fn token_window_char_ceiling(model: &str
 /// Pre-request LLM 摘要重触发最小增量：自上次 LLM 摘要后 messages 增量
 /// 小于此值则跳过，避免摘要失败时每轮重复调用 LLM。
 pub(in crate::ai::driver::turn_runtime) const PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH: usize = 20_000;
+
+/// 记录每个独立执行上下文上次 LLM 摘要尝试后的 messages 总字符数。
+///
+/// mid-turn 与 pre-request 共享该游标：若同一批上下文刚刚尝试过 LLM summary
+/// 且没有增长出新的压缩空间，就不要在另一个触发点马上重复请求。成功与 no-op
+/// 都写入尝试后大小；真正增长超过 [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`] 后再重试。
+/// key 同时包含 session 与当前调度进程 pid，避免父 agent 和并发 subagent 相互抑制。
+static LAST_LLM_SUMMARY_ATTEMPT_CHARS: std::sync::LazyLock<
+    std::sync::Mutex<rust_tools::commonw::FastMap<String, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(rust_tools::commonw::FastMap::default()));
+
+fn llm_summary_attempt_scope_key(session_id: &str, task_pid: Option<u64>) -> String {
+    match task_pid {
+        Some(pid) => format!("{session_id}:pid:{pid}"),
+        None => session_id.to_string(),
+    }
+}
+
+fn current_llm_summary_attempt_scope_key(session_id: &str) -> String {
+    llm_summary_attempt_scope_key(session_id, super::current_task_pid())
+}
+
+fn load_last_llm_summary_attempt_chars(session_id: &str) -> usize {
+    let scope_key = current_llm_summary_attempt_scope_key(session_id);
+    LAST_LLM_SUMMARY_ATTEMPT_CHARS
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&scope_key).copied())
+        .unwrap_or(0)
+}
+
+pub(in crate::ai::driver::turn_runtime) fn record_llm_summary_attempt_chars(
+    session_id: &str,
+    chars_after_attempt: usize,
+) {
+    let scope_key = current_llm_summary_attempt_scope_key(session_id);
+    if let Ok(mut map) = LAST_LLM_SUMMARY_ATTEMPT_CHARS.lock() {
+        map.insert(scope_key, chars_after_attempt);
+    }
+}
+
+pub(in crate::ai::driver::turn_runtime) fn should_try_llm_summary(
+    session_id: &str,
+    total_chars: usize,
+    threshold: usize,
+) -> bool {
+    if total_chars <= threshold {
+        return false;
+    }
+    let last_attempt_chars = load_last_llm_summary_attempt_chars(session_id);
+    let growth = total_chars.saturating_sub(last_attempt_chars);
+    last_attempt_chars == 0 || growth >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH
+}
+
 /// Mid-turn 压缩冷却：触发一次后至少间隔 N 轮才再次重判，避免在阈值附近徘徊
 /// 时每轮都跑一次（实际无变化）。
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_COOLDOWN_ITERATIONS: usize = 2;
@@ -186,6 +240,55 @@ mod tests {
         history::{Message, SessionStore, build_message_arr},
         types::{App, AppConfig},
     };
+
+    #[test]
+    fn llm_summary_attempt_gate_is_shared_across_mid_turn_and_pre_request() {
+        let sid = "test-shared-llm-summary-attempt-gate";
+        let mid_turn_hard = 315_000;
+        let pre_request_threshold = 180_000;
+        let attempted_chars = 426_331;
+
+        record_llm_summary_attempt_chars(sid, 0);
+        assert!(should_try_llm_summary(sid, attempted_chars, mid_turn_hard));
+
+        // mid-turn 已经对这批上下文尝试过 LLM summary 且无效后，
+        // pre-request 不应因为阈值更低就马上重复请求同一次 summary。
+        record_llm_summary_attempt_chars(sid, attempted_chars);
+        assert!(!should_try_llm_summary(
+            sid,
+            attempted_chars,
+            pre_request_threshold
+        ));
+        assert!(!should_try_llm_summary(
+            sid,
+            attempted_chars + PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH - 1,
+            pre_request_threshold
+        ));
+        assert!(should_try_llm_summary(
+            sid,
+            attempted_chars + PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH,
+            pre_request_threshold
+        ));
+
+        record_llm_summary_attempt_chars(sid, 0);
+    }
+
+    #[test]
+    fn llm_summary_attempt_scope_isolated_by_task_pid() {
+        let sid = "test-llm-summary-attempt-scope";
+        assert_ne!(
+            llm_summary_attempt_scope_key(sid, None),
+            llm_summary_attempt_scope_key(sid, Some(41))
+        );
+        assert_ne!(
+            llm_summary_attempt_scope_key(sid, Some(41)),
+            llm_summary_attempt_scope_key(sid, Some(42))
+        );
+        assert_ne!(
+            llm_summary_attempt_scope_key("session-a", Some(41)),
+            llm_summary_attempt_scope_key("session-b", Some(41))
+        );
+    }
 
     fn test_app(history_file: PathBuf) -> App {
         App {

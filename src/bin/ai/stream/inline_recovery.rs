@@ -381,6 +381,7 @@ fn parse_anthropic_invoke_body(body: &str) -> String {
         };
         let open_tag = &after_tag[..=open_gt];
         let key = parse_anthropic_xml_name_attr(open_tag);
+        let force_string = parse_anthropic_xml_bool_attr(open_tag, "string");
         let value_region = &after_tag[open_gt + 1..];
         let (raw_value, consumed_in_after) = match value_region.find("</parameter>") {
             Some(close_rel) => (
@@ -391,8 +392,12 @@ fn parse_anthropic_invoke_body(body: &str) -> String {
         };
         let raw_value = raw_value.trim();
         if !key.trim().is_empty() {
-            let value = serde_json::from_str::<serde_json::Value>(raw_value)
-                .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
+            let value = if force_string {
+                serde_json::Value::String(raw_value.to_string())
+            } else {
+                serde_json::from_str::<serde_json::Value>(raw_value)
+                    .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()))
+            };
             map.insert(key, value);
         }
         let advance = open_rel + consumed_in_after;
@@ -411,22 +416,16 @@ fn parse_anthropic_invoke_body(body: &str) -> String {
 /// 从 `<invoke name="x">` / `<parameter name="y">` 开标签里抽取 `name` 属性值，
 /// 支持双引号或单引号。
 fn parse_anthropic_xml_name_attr(open_tag: &str) -> String {
-    let Some(pos) = open_tag.find("name") else {
-        return String::new();
-    };
-    let after = open_tag[pos + "name".len()..].trim_start();
-    let after = after.strip_prefix('=').unwrap_or(after).trim_start();
-    let (quote, body) = if let Some(b) = after.strip_prefix('"') {
-        ('"', b)
-    } else if let Some(b) = after.strip_prefix('\'') {
-        ('\'', b)
-    } else {
-        return String::new();
-    };
-    match body.find(quote) {
-        Some(end) => body[..end].to_string(),
-        None => String::new(),
-    }
+    super::splitter::parse_xml_attr_value(open_tag, "name")
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 从开标签属性串里解析 `string="true"` 等 bool 属性（DSML 协议）。
+/// 值不区分大小写；缺省或非 "true" 值返回 false。
+fn parse_anthropic_xml_bool_attr(open_tag: &str, name: &str) -> bool {
+    super::splitter::parse_xml_attr_value(open_tag, name)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 /// 解析裸 XML 开标签，要求标签名本身是已注册工具名，且不带属性。
@@ -651,11 +650,13 @@ pub(super) fn collect_valid_tool_calls(
                 } else {
                     raw.to_string()
                 };
-                eprintln!(
-                    "[Warning] dropping malformed tool call '{}' due to incomplete JSON arguments\n\
-                     └─ 截断的 arguments 片段:\n{}",
-                    builder.function_name, snippet
-                );
+                if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                    eprintln!(
+                        "[Warning] dropping malformed tool call '{}' due to incomplete JSON arguments\n\
+                         └─ 截断的 arguments 片段:\n{}",
+                        builder.function_name, snippet
+                    );
+                }
                 return None;
             };
             builder.arguments = arguments;
@@ -671,6 +672,12 @@ pub(super) fn ensure_tool_calls_section_open(
     state: &mut StreamProcessingState,
 ) {
     if state.render.printed_tool_calls_header {
+        return;
+    }
+
+    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        state.content.thinking_open = false;
+        state.render.printed_tool_calls_header = true;
         return;
     }
 
