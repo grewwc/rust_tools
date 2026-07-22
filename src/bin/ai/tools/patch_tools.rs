@@ -21,7 +21,7 @@ fn params_apply_patch() -> Value {
             },
             "patch": {
                 "type": "string",
-                "description": "Patch content. Use either unified-diff hunks (`@@` header; content lines begin with space, `-`, or `+`) or a `*** Begin Patch` envelope. Envelope sections support `*** Update File:`, `*** Add File:`, `*** Delete File:`, and `*** Replace in line:`. Use `*** Delete File:` to remove existing project/source/config files, including git-tracked files. Do not wrap it in a Markdown code fence. Include unique surrounding context and do not repeat a target path within one multi-file envelope."
+                "description": "Patch content. Use either unified-diff hunks (`@@` header; content lines begin with space, `-`, or `+`) or a `*** Begin Patch` envelope. For several edits in the SAME file, prefer ONE `*** Update File:` section containing multiple `@@` hunks from one fresh read; do not split into serial apply_patch calls. For several files, use one Begin Patch envelope with one section per target. Envelope sections support `*** Update File:`, `*** Add File:`, `*** Delete File:`, and `*** Replace in line:`. Use `*** Delete File:` to remove existing project/source/config files, including git-tracked files. Do not wrap it in a Markdown code fence. Include unique surrounding context and do not repeat a target path within one multi-file envelope."
             },
             "dry_run": {
                 "type": "boolean",
@@ -35,7 +35,7 @@ fn params_apply_patch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply a localized patch; prefer it to rewriting a whole file. Supports a unified-diff hunk for one `file_path`, or a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, `*** Delete File:`, or `*** Replace in line:` sections. Use `*** Delete File:` to remove existing project/source/config files, including git-tracked files; `delete_path` is only for registered temp files. Multi-file envelopes are fully validated before writing, rechecked immediately before commit, and rolled back if a write fails. Use `dry_run` to validate without changing files. Re-read a file after any edit before retrying a patch.",
+        description: "Apply localized edits; prefer it to rewriting a whole file. Batch related edits: use one `*** Update File:` section with multiple `@@` hunks for several edits in the same file, and one Begin Patch envelope with one section per target for several files. Supports a unified-diff hunk for one `file_path`, or a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, `*** Delete File:`, or `*** Replace in line:` sections. Use `*** Delete File:` to remove existing project/source/config files, including git-tracked files; `delete_path` is only for registered temp files. Multi-file envelopes are fully validated before writing, rechecked immediately before commit, and rolled back if a write fails. Use `dry_run` to validate without changing files. After `context mismatch` or `ambiguous patch`, re-read the same target before retrying.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -1961,6 +1961,12 @@ mod tests {
         let patch = "@@ -2,1 +2,1 @@\n-not_present\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("context mismatch"), "err was: {err}");
+        assert!(
+            err.lines().next().unwrap_or_default().contains(
+                "required recovery: read_file the same target before retrying apply_patch"
+            ),
+            "first error line should include the recovery action: {err}"
+        );
         // 错误里应回显期望行与实际文件内容，便于模型自我修正。
         assert!(err.contains("not_present"), "err was: {err}");
         assert!(err.contains("beta"), "err was: {err}");

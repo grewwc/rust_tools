@@ -1187,6 +1187,9 @@ fn build_system_prompt(
                 lines.push(
                     "When modifying an existing project file, do NOT use `write_file` with `temp=true` — use `apply_patch` for localized edits, or `write_file` without `temp` only when a full rewrite is genuinely necessary.".to_string(),
                 );
+                lines.push(
+                    "When one file needs several localized edits, read the relevant span once and make ONE `apply_patch` call with multiple `@@` hunks in a single `*** Update File:` section. For several files, use one Begin Patch envelope with one section per target. Do not split related edits into serial read/patch cycles unless a previous patch failed or a later edit truly depends on the earlier edit's result.".to_string(),
+                );
             } else {
                 lines.push(
                     "When modifying an existing project file, do NOT use `write_file` with `temp=true`; use `write_file` without `temp` only when a full rewrite is genuinely necessary.".to_string(),
@@ -1708,6 +1711,8 @@ mod tests {
         assert!(prompt.contains("Temporary files:"));
         assert!(prompt.contains("git-tracked file"));
         assert!(prompt.contains("`apply_patch`"));
+        assert!(prompt.contains("ONE `apply_patch` call with multiple `@@` hunks"));
+        assert!(prompt.contains("Do not split related edits into serial read/patch cycles"));
         assert!(prompt.contains("`*** Delete File: <path>`"));
         assert!(prompt.contains("Do not use `delete_path` for project files"));
     }

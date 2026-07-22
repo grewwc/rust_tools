@@ -42,7 +42,10 @@ Module responsibilities: schema/metadata in `registry/`, execution in
    model-introduced variants still match without corrupting output (context
    lines emit the original file text). A `ReplaceInLine` envelope op
    (`anchor:`/`old:`/`new:`) does anchored inline substring replacement outside
-   the unified-diff path. `read_file` paginates by line and by character cap,
+   the unified-diff path. When one file needs multiple localized edits, guide
+   models toward one `apply_patch` call with multiple `@@` hunks in a single
+   `*** Update File:` section; use one envelope with one section per target for
+   multi-file edits. `read_file` paginates by line and by character cap,
    computing continuation offsets from rendered lines. Text search lives in the
    dedicated grep/search tools.
 10. **Subagent tools.** The `task` orchestration family

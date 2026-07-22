@@ -14,17 +14,17 @@ rules in the nearest child `AGENTS.md`.
 - `provider/`: provider adapters and wire-format differences
 - `tools/`: tool registry, service implementations, storage, and display/history
   policy metadata
-- `mcp/`: MCP server lifecycle, clients, routing snapshots, and OAuth/transport
-  behavior
+- `mcp/`: MCP server lifecycle, clients, routing snapshots, and transport behavior
 - `knowledge/`: durable knowledge indexing, retrieval, storage, and sync
-- `ui*` / `render*`: terminal/TUI rendering and user-visible output
+- `stream/`: streaming protocol, chunk extraction, state machine, and
+  terminal/TUI rendering (under `stream/render/`)
 
 ## Runtime-wide invariants
 
 1. **🏆 No `cargo test` without user approval.** Never run `cargo test`,
    `cargo build --release`, or `cargo build` on your own initiative.
    Full-application test compilation triggers heavy dependencies (mongodb,
-   rusqlite bundled, tree-sitter C parsers, ring, image, etc.) and takes
+   rusqlite bundled, image, etc.) and takes
    2–8 minutes cold. Only run `cargo test` when the user explicitly asks or
    when fixing a regression with a known focused test. For all other
    verification, `cargo check --bin a` is the default. Always scope with

@@ -2,10 +2,14 @@
 
 ## Scope
 
-Applies to `src/bin/ai/mcp/**` and nearby MCP execution glue.
-Key areas: server lifecycle in `lifecycle/`, client routing in `routing/`,
-transport errors in `transport/`, OAuth in `oauth/`, schema loading in
-`schema/`.
+Applies to `src/bin/ai/mcp/**`. The module is flat (no subdirectories):
+- `client.rs`: `McpClient` / `SharedMcpClient`, `send_request_to_conn` /
+  `send_notification_to_conn`, and `routing_snapshot()` for discovery metadata.
+- `connection.rs`: subprocess lifecycle + stdio JSON-RPC transport
+  (`Child`/stdin/stdout/stderr, reader thread).
+- `config.rs`: loads `McpServerConfig` from the mcp config file.
+- `io.rs`: fd nonblocking helper (Unix).
+- `jsonrpc.rs`: `JsonRpcRequest` / `JsonRpcResponse` wire types.
 
 ## Key invariants
 
@@ -20,7 +24,7 @@ transport errors in `transport/`, OAuth in `oauth/`, schema loading in
    missing or `null` ids; some servers emit spurious initialized acknowledgments
    that otherwise consume the next request's response slot.
 5. **Timeouts are behavior.** Request timeouts and restart logic can interrupt
-   long-running flows such as OAuth waits; treat changes as user-visible.
+   long-running flows; treat changes as user-visible.
 6. **Lazy MCP schemas.** Per-turn tool schemas include MCP tools only when a
    skill/agent declares an explicit `mcp_servers` allowlist. Otherwise expose the
    hidden MCP catalog and load tools on demand through `enable_tools`.
