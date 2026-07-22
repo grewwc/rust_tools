@@ -518,6 +518,60 @@ fn folded_tool_group_keeps_assistant_checkpoint_and_evidence_targets() {
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
+/// tool-call 轮的 assistant.content 常为空（模型只发 tool_calls、无叙述）。此时
+/// checkpoint 必须回退到 reasoning_content，把「发起这批调用前的思考」留作压缩后
+/// 的决策锚点，而不是塌成固定的 <empty>——否则模型压缩后失忆，从同一轮重启取证。
+#[test]
+fn folded_tool_group_falls_back_to_reasoning_when_content_empty() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-evidence-fold-reason-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("system", "s"), msg("user", "分析历史")];
+    let mut call = assistant_call_args(
+        "read-history",
+        "read_file",
+        r#"{"file_path":"0341-history.json","offset":1,"limit":120}"#,
+    );
+    // content 留空（tool-call 轮的典型形态），仅提供 reasoning。
+    call.content = Value::String(String::new());
+    call.reasoning_content =
+        Some("已确认该文件是 6393 行的会话历史；下一步只统计 role 分布，不再整文件回读。".to_string());
+    messages.push(call);
+    messages.push(tool_result(
+        "read-history",
+        "     1\t[\n     2\t{\"role\":\"user\"}\n... [truncated: showing lines 1-120 of 6393]",
+    ));
+    for i in 0..4 {
+        let id = format!("later-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "later"));
+    }
+
+    let (folded, folded_groups) =
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()));
+    assert_eq!(folded_groups, 1);
+    let stub = folded
+        .iter()
+        .find(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && value_to_string(&message.content).contains(COMPRESSED_TOOL_EVIDENCE_MARKER)
+        })
+        .map(|message| value_to_string(&message.content))
+        .expect("folded read group should become evidence note");
+
+    assert!(
+        stub.contains(
+            "assistant_checkpoint: 已确认该文件是 6393 行的会话历史；下一步只统计 role 分布，不再整文件回读。"
+        ),
+        "{stub}"
+    );
+    assert!(
+        !stub.contains("<empty; no persisted decision before these tool calls>"),
+        "reasoning fallback must replace the empty-checkpoint placeholder: {stub}"
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
 /// 压缩后的命令组必须保留调用参数。仅保留「成功但无输出」不足以说明已经查过
 /// 哪个 author/date/cwd 组合，模型会把它当成未执行过的调查而从同一条 git log 重启。
 #[test]
