@@ -244,7 +244,7 @@ fn tool_call_target_recall(tool_call: &ToolCall) -> String {
     };
     let mut fields = Vec::new();
     match tool_call.function.name.as_str() {
-        "read_file" | "read_file_lines" => {
+        "read_file" => {
             if let Some(path) = arg_string(&args, &["file_path", "path", "filePath"]) {
                 fields.push(format!(
                     "file: {}",
@@ -428,7 +428,7 @@ fn tool_result_recall_text(
         ));
     }
 
-    if matches!(tool_name, "read_file" | "read_file_lines" | "code_search") {
+    if matches!(tool_name, "read_file" | "code_search") {
         return Some(precision_grounding_tool_recall(
             tool_call,
             &preserved,
@@ -550,7 +550,7 @@ fn precision_grounding_tool_recall(
     }
 
     match tool_call.function.name.as_str() {
-        "read_file" | "read_file_lines" => lines.push(
+        "read_file" => lines.push(
             "优先依据 `original_file_path` / `original_range` 和 preview 继续判断；仅当这些锚点仍不足时再读取 `archive_file_path`。".to_string(),
         ),
         "code_search" => lines.push(
@@ -789,7 +789,7 @@ fn collect_pending_patch_paths(messages: &[Message]) -> FxHashSet<String> {
         .collect()
 }
 
-/// 本工具组是否含 `read_file` / `read_file_lines` 调用，且其 `file_path` 正是某个尚未成功的
+/// 本工具组是否含 `read_file` 调用，且其 `file_path` 正是某个尚未成功的
 /// `apply_patch` 目标。若是，折叠器应跳过折叠以保留模型重试 patch 所需的
 /// 原始文件内容。
 fn group_reads_pending_patch_target(
@@ -804,7 +804,7 @@ fn group_reads_pending_patch_target(
         return false;
     };
     tcs.iter().any(|tc| {
-        matches!(tc.function.name.as_str(), "read_file" | "read_file_lines")
+        tc.function.name == "read_file"
             && extract_file_path_args(&tc.function.arguments)
                 .into_iter()
                 .any(|p| pending_paths.contains(&p))

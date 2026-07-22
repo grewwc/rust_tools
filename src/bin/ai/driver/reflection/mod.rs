@@ -460,7 +460,7 @@ mod tests {
                     id: "call_1".to_string(),
                     tool_type: "function".to_string(),
                     function: FunctionCall {
-                        name: "read_file_lines".to_string(),
+                        name: "read_file".to_string(),
                         arguments: "{}".to_string(),
                     },
                 }]),

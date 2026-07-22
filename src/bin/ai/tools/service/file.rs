@@ -243,7 +243,7 @@ fn append_symbol_outline_if_useful(
     rendered
 }
 
-/// 单次 read_file / read_file_lines 结果的字符硬上限。
+/// 单次 read_file 结果的字符硬上限。
 ///
 /// 行分页（offset/limit）只约束"行数"，无法约束"字符量"：minified JS/JSON、
 /// 单行几十万字符的病理文件即使只读 1 行也能产出 MB 级结果，raw 进入 messages
@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_lines_reads_last_line_without_trailing_newline() {
+    fn test_read_file_reads_last_line_without_trailing_newline() {
         // 文件末尾无换行符时，旧实现按 '\n' 计数会漏掉最后一行。
         let path = make_temp_path("lastline");
         fs::write(&path, "first\nsecond\nthird").unwrap();
@@ -610,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_lines_respects_offset_limit() {
+    fn test_read_file_respects_offset_limit() {
         let path = make_temp_path("lines");
         let lines: Vec<String> = (1..=20).map(|i| format!("line {}", i)).collect();
         let content = lines.join("\n");
@@ -823,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_lines_skips_outline_for_later_chunks() {
+    fn test_read_file_skips_outline_for_later_chunks() {
         let path = make_temp_path("outline_late").with_extension("rs");
         let content = "fn alpha() {}\n\nstruct Beta {\n    x: i32,\n}\n\nfn gamma() {}\n";
         fs::create_dir_all(path.parent().unwrap()).unwrap();

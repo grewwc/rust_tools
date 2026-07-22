@@ -524,8 +524,9 @@ mod tests {
 /// 现在改为查询工具自身声明的历史保留策略
 /// （`ToolHistoryPolicyRegistration`，见各工具注册文件），而非在此硬编码
 /// 工具名列表。默认未注册的工具允许有损压缩；只有显式声明
-/// `lossy_compress: Never` 的工具（`read_file` / 检索类 / `execute_command` / `plan`）
-/// 返回 true。注意：这与「是否允许 LLM 裁剪」是正交维度——见 `llm_prune.rs`。
+/// `lossy_compress: Never` 的工具（`read_file` / 检索类 / `execute_command`）
+/// 返回 true。`plan` 不再禁止有损压缩：最新一版由最近工具组保护窗口完整保留，
+/// 旧版可摘要压缩以释放上下文。注意：这与「是否允许 LLM 裁剪」是正交维度——见 `llm_prune.rs`。
 pub(super) fn is_non_compressible_tool(tool_name: &str) -> bool {
     !crate::ai::tools::registry::common::tool_history_policy(tool_name).allows_lossy_compress()
 }
@@ -625,10 +626,10 @@ fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'s
         .any(|line| line.starts_with("- original_query: "));
 
     match tool_name {
-        "read_file" | "read_file_lines" if has_original_file_path => {
+        "read_file" if has_original_file_path => {
             "（这是之前读取文件的结果归档；优先继续读取 `original_file_path` 指向的原始文件，而不是本归档文件。仅当你确实需要这次已外溢结果的完整原文时才读取 `file_path`。）"
         }
-        "read_file" | "read_file_lines" => {
+        "read_file" => {
             "（这是之前读取文件的结果归档；除非你需要重新查看该文件的完整内容且预览不足，否则不要重新读取。）"
         }
         "execute_command" if has_original_command => {
@@ -647,7 +648,7 @@ pub(super) fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str)
     };
 
     match tool_name {
-        "read_file" | "read_file_lines" => {
+        "read_file" => {
             let mut lines = Vec::with_capacity(2);
             if let Some(path) = value_string_from_keys(&args, &["file_path", "path", "filePath"]) {
                 lines.push(format!(
@@ -785,7 +786,7 @@ fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
         .filter(|line| line.starts_with("- original_"))
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let tool_hint = if tool_name == "read_file" || tool_name == "read_file_lines" {
+    let tool_hint = if tool_name == "read_file" {
         if recall_lines
             .iter()
             .any(|line| line.starts_with("- original_file_path: "))

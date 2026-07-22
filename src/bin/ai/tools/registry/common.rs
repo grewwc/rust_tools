@@ -99,15 +99,16 @@ pub(crate) enum ToolLossyCompressPolicy {
     /// 默认：允许有损压缩（普通概览型工具结果）。
     #[default]
     Allow,
-    /// 禁止有损压缩：内容复现代价高（如 `read_file` / 检索类 / `plan`），
+    /// 禁止有损压缩：内容复现代价高（如 `read_file` / 检索类 / `execute_command`），
     /// 一旦被裁剪模型会反复重跑同一次操作，表现为失忆/原地打转。
     Never,
 }
 
 /// LLM 引导裁剪策略：控制该工具结果是否允许被模型标记后裁剪成占位符。
 /// 与有损压缩正交——「不可有损压缩」不等于「不可裁剪」：`read_file` 的旧
-/// 版本一旦被模型连续判定过时，就应允许裁剪以释放上下文，而 `plan` 作为
-/// 任务路线图锚点则永不裁剪。
+/// 版本一旦被模型连续判定过时，就应允许裁剪以释放上下文。`plan` 允许有损
+/// 压缩但禁止 LLM 裁剪：最新一版由最近工具组保护窗口完整保留，旧版可摘要
+/// 压缩以释放上下文，但模型不应单方"判废"既有规划。
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) enum ToolPrunePolicy {
     /// 默认：允许被 LLM 引导裁剪（仍受最近窗口保护与连续标记阈值约束）。
@@ -623,10 +624,14 @@ mod history_policy_tests {
     use super::*;
 
     #[test]
-    fn plan_is_never_compressed_and_never_pruned() {
+    fn plan_allows_lossy_compress_but_blocks_prune() {
+        // plan 最新一版由最近工具组保护窗口 (`KEEP_RECENT_TOOL_GROUPS`) 完整保留；
+        // 旧版 plan 触发上下文压力时允许有损压缩摘要。LLM 单方裁剪 prunes 始终禁止，
+        // 防止模型"判废"既有规划而原地打转。
         let policy = tool_history_policy("plan");
-        assert!(!policy.allows_lossy_compress());
+        assert!(policy.allows_lossy_compress());
         assert!(!policy.allows_prune());
+        assert!(!policy.counts_toward_precision_inline_budget());
     }
 
     #[test]

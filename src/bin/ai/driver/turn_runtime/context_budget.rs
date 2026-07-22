@@ -404,8 +404,6 @@ fn is_precision_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "read_file"
-            // 兼容旧会话历史里残留的 read_file_lines（已并入 read_file）。
-            | "read_file_lines"
             | "find_path"
             | "code_search"
             | "web_search"

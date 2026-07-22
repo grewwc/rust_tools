@@ -197,8 +197,10 @@ pub(crate) struct AsyncTaskEntry {
     /// 描述性文本；与 kernel `Process.goal` 不同——后者会带 TASK_GOAL_PREFIX
     /// 前缀和完整 prompt。
     pub(crate) description: String,
-    /// 子 agent 的逻辑名（"build" / "plan" 等）；与 kernel `Process.name` 同源
-    /// 但 kernel 端 name 仅作显示。
+    /// 子 agent 的逻辑名（用于查找注册的 AgentManifest，如 `"build"`）；与 kernel
+    /// `Process.name` 同源但 kernel 端 name 仅作显示。注意区分：`plan` 是工具名，
+    /// 不是 agent 名（仓库内未注册 `plan` subagent），不要将 `agent_name` 填为
+    /// `"plan"`——会把派名指向不存在的 manifest。
     pub(crate) agent_name: String,
     pub(crate) model: String,
     pub(crate) is_model_auto_selected: bool,

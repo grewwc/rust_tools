@@ -192,7 +192,6 @@ pub(super) fn turn_uses_repo_inspection_tools(messages: &Vec<Message>) -> bool {
     const REPO_INSPECTION_TOOLS: &[&str] = &[
         "code_search",
         "read_file",
-        "read_file_lines",
         "list_directory",
         "find_path",
         "execute_command",

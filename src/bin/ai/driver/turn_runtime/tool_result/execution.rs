@@ -280,7 +280,7 @@ Do not call '{tool_name}' again; instead summarize confirmed facts, answer what 
         ),
         ToolCallRejectionReason::PatchRetryNeedsFreshRead => format!(
             "Error: apply_patch retry blocked. The previous patch for this file failed with `context mismatch` or `ambiguous patch`, which means the file content you are working from is stale or the context is not unique. \
-Do NOT retry patches in this batch — doing so will only fail again. Required recovery steps: (1) call `read_file` (or `read_file_lines`) on the SAME target path to get the current truth state; (2) copy context lines DIRECTLY from that fresh output, including function names or distinctive surrounding lines to ensure each hunk matches exactly ONE location; (3) do NOT copy the leading line-number + tab prefix that read_file prints (each line is rendered as a right-aligned line number followed by a TAB, e.g. `    42\\t<code>`) — copy only the code after the tab; (4) call `apply_patch` only in a LATER tool round after you have successfully read the file."
+Do NOT retry patches in this batch — doing so will only fail again. Required recovery steps: (1) call `read_file` on the SAME target path to get the current truth state; (2) copy context lines DIRECTLY from that fresh output, including function names or distinctive surrounding lines to ensure each hunk matches exactly ONE location; (3) do NOT copy the leading line-number + tab prefix that read_file prints (each line is rendered as a right-aligned line number followed by a TAB, e.g. `    42\\t<code>`) — copy only the code after the tab; (4) call `apply_patch` only in a LATER tool round after you have successfully read the file."
         ),
     }
 }
@@ -543,7 +543,7 @@ fn patch_retry_requires_fresh_read(messages: &[Message], tool_calls: &[ToolCall]
                         stale_patch_targets.extend(paths);
                     }
                 }
-                "read_file" | "read_file_lines" => {
+                "read_file" => {
                     let Some(path) = file_tool_target_path(tool_call) else {
                         continue;
                     };
@@ -1241,7 +1241,7 @@ fn extract_image_paths_from_file_read_tool_calls(tool_calls: &[ToolCall]) -> Vec
     for tool_call in tool_calls {
         if !matches!(
             tool_call.function.name.as_str(),
-            "read_file" | "read_file_lines"
+            "read_file"
         ) {
             continue;
         }
@@ -2072,7 +2072,7 @@ mod tests {
             tool_result_message("call_read_a", "fn current_a() {}\n"),
             assistant_tool_call_message(test_tool_call(
                 "call_read_b",
-                "read_file_lines",
+                "read_file",
                 serde_json::json!({ "path": b }),
             )),
             tool_result_message("call_read_b", "1| fn current_b() {}\n"),
@@ -2356,7 +2356,7 @@ mod tests {
                 id: "call_2".to_string(),
                 tool_type: "function".to_string(),
                 function: FunctionCall {
-                    name: "read_file_lines".to_string(),
+                    name: "read_file".to_string(),
                     arguments: r#"{"file_path":"/tmp/notes.txt"}"#.to_string(),
                 },
             },

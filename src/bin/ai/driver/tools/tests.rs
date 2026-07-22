@@ -62,19 +62,11 @@ fn setup_async_tool_kernel() -> (AsyncToolTestGuard, aios_kernel::kernel::Shared
 }
 
 #[test]
-fn parallel_batch_groups_consecutive_readonly_builtin_tools() {
+fn read_file_is_forced_to_sequential_path() {
     let mcp = McpClient::new();
-    let calls = vec![
-        tool_call("read_file"),
-        tool_call("read_file"),
-        tool_call("read_file"),
-    ];
-    assert!(
-        calls
-            .iter()
-            .all(|call| is_parallel_safe_tool_call(&mcp, call))
-    );
-    assert_eq!(parallel_safe_batch_len(&mcp, &calls), 3);
+    assert!(is_cacheable_tool_name("read_file"));
+    assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("read_file")));
+    assert_eq!(parallel_safe_batch_len(&mcp, &[tool_call("read_file")]), 0);
 }
 
 #[test]
@@ -86,7 +78,7 @@ fn parallel_batch_stops_at_mutating_tool() {
         &mcp,
         &tool_call("execute_command")
     ));
-    let calls = vec![tool_call("read_file"), tool_call("write_file")];
+    let calls = vec![tool_call("code_search"), tool_call("write_file")];
     assert_eq!(parallel_safe_batch_len(&mcp, &calls), 1);
 }
 
@@ -106,7 +98,7 @@ fn parallel_batch_excludes_barriering_tools() {
 fn parallel_batch_caps_at_max_concurrency() {
     let mcp = McpClient::new();
     let calls: Vec<ToolCall> = (0..super::PARALLEL_READONLY_MAX_CONCURRENCY + 4)
-        .map(|_| tool_call("read_file"))
+        .map(|_| tool_call("code_search"))
         .collect();
     assert_eq!(
         parallel_safe_batch_len(&mcp, &calls),
@@ -117,7 +109,7 @@ fn parallel_batch_caps_at_max_concurrency() {
 #[test]
 fn parallel_batch_not_formed_for_single_readonly_call() {
     let mcp = McpClient::new();
-    let calls = vec![tool_call("read_file"), tool_call("write_file")];
+    let calls = vec![tool_call("code_search"), tool_call("write_file")];
     // 仅 1 个可并行调用，调用方应回退到顺序路径（batch_len == 1 < 2）。
     assert_eq!(parallel_safe_batch_len(&mcp, &calls), 1);
 }
@@ -328,7 +320,7 @@ fn should_retry_once_only_for_safe_builtin_read_only_tools() {
 
 #[test]
 fn remediation_hint_only_mentions_alternatives_available_in_current_turn() {
-    // read_file 现在唯一的等价备选是 code_search（read_file_lines 已并入 read_file）。
+    // read_file 现在唯一的等价备选是 code_search。
     let available: FastSet<String> = ["code_search".to_string()].into_iter().collect();
     let hint = remediation_hint("read_file", "not found", Some(&available)).expect("hint");
     assert!(hint.contains("`code_search`"));

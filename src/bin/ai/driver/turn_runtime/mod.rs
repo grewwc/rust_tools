@@ -398,7 +398,7 @@ mod tests {
         }
         assert!(content.chars().count() < MAX_TOOL_RESULT_INLINE_CHARS);
 
-        let prepared = prepare_tool_result(&app, "read_file_lines", &content);
+        let prepared = prepare_tool_result(&app, "read_file", &content);
 
         eprintln!("DEBUG: content chars = {}", content.chars().count());
         eprintln!("DEBUG: content lines = {}", content.lines().count());
@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn read_file_lines_uses_shorter_terminal_preview_policy() {
+    fn read_file_uses_shorter_terminal_preview_policy() {
         let history_file = std::env::temp_dir().join(format!(
             "ai-tool-preview-read-file-{}.sqlite",
             uuid::Uuid::new_v4()

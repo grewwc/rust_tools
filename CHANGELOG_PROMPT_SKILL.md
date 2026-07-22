@@ -115,7 +115,7 @@ routing_tags:
   - 生成
 tools:
   - save_skill      # 保存生成的 skill
-  - read_file_lines  # 读取现有文件
+  - read_file        # 读取现有文件
   - write_file       # 创建新文件
   - apply_patch      # 精确修改
   - code_search      # 代码搜索

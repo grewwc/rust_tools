@@ -514,7 +514,7 @@ mod tests {
                 content: Value::String(String::new()),
                 tool_calls: Some(vec![tool_call(
                     "call-1",
-                    "read_file_lines",
+                    "read_file",
                     serde_json::json!({"file_path":"src/lib.rs","offset":10,"limit":20}),
                 )]),
                 tool_call_id: None,
@@ -532,7 +532,7 @@ mod tests {
         let output = format_subagent_result_for_parent("done", &turn_messages);
         assert!(output.starts_with("[Subagent tool evidence]"));
         assert!(output.contains("[Subagent tool evidence]"));
-        assert!(output.contains("read_file_lines("));
+        assert!(output.contains("read_file("));
         assert!(output.contains("\"file_path\":\"src/lib.rs\""));
         assert!(output.contains("fn load_config()"));
         assert!(output.contains("[Subagent final answer]\ndone"));

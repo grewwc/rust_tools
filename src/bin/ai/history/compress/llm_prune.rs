@@ -8,12 +8,12 @@
 //! 响应中使用 `<meta:self_note>prune:tool_call_id1,tool_call_id2</meta:self_note>`
 //! 标记当前不再需要的低价值 tool 消息（通常是过期的普通工具结果）。
 //!
-//! - user / system / plan / assistant / internal_note 等角色即
+//! - user / system / assistant / internal_note 等角色即
 //!   使被标记也永远不会被裁剪（见 `is_protected_role`）。
 //! - 仅 `role == "tool"` 且拥有 `tool_call_id` 的消息才可能被裁剪。
 //! - 工具自身通过 `ToolHistoryPolicyRegistration` 声明 `prune: Never` 的结果
-//!   （如 `plan`）永远不会被裁剪；`read_file` / 检索类结果虽「不可有损压缩」，
-//!   但**允许**在过时后被 LLM 裁剪（两个维度正交）。
+//!   （如 `plan`）永远不会被裁剪；`read_file` / 检索类 / `execute_command` 结果
+//!   虽「不可有损压缩」，但**允许**在过时后被 LLM 裁剪（两个维度正交）。
 //! - 连续被标记 **PRUNE_THRESHOLD** 次后，消息内容被替换为简短占位符
 //!   （保留消息结构、不删除，避免破坏 tool_call ↔ tool_response 配对）。
 //! - 如果某条消息在某轮未被标记，其计数重置为 0（"连续"语义）。

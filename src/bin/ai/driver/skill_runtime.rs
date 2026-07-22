@@ -919,7 +919,7 @@ fn build_system_prompt(
              - Keep working until the task is complete, verification has passed, or you are blocked by a specific, named missing input. Do NOT keep exploring \"just in case\" — once the request is addressed, STOP.\n\
              - Start from the loaded core toolset and progressively enable extra tools only when they become necessary.\n\
              - After every tool result, decide the next concrete action immediately.\n\
-             - If a check fails, diagnose, fix, and re-run verification before finishing. Same 3-strike limit applies.",
+             - If a check fails, diagnose, fix, and re-run verification before finishing.",
         );
     }
 
@@ -974,7 +974,7 @@ fn build_system_prompt(
         if has_tool(available_tools, "plan") {
             lines.push("Simple tasks: act directly. Complex ones: call `plan` first.".to_string());
             if has_tool(available_tools, "task_spawn") {
-                lines.push("When planning, identify steps that are independent and can be delegated to subagents in parallel - mark them with `delegate: true` and `parallelizable: true` in the plan.".to_string());
+                lines.push("When planning, identify steps that are independent and can be delegated to subagents in parallel - mark them with `delegate: true` in the plan. `delegate: true` implies `parallelizable: true` (delegation is inherently async); set `parallelizable: true` explicitly only for parallel steps that you will execute yourself.".to_string());
             }
         }
         if has_tool(available_tools, "spawn_process") {

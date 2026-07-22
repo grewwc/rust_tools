@@ -12,7 +12,7 @@
 - **特性**:
   - 专注于 prompt 工程和 skill 设计
   - 支持中英文路由标签
-  - 配置了必要的工具权限（save_skill, read_file_lines, write_file, apply_patch 等）
+  - 配置了必要的工具权限（save_skill, read_file, write_file, apply_patch 等）
   - 使用 heavy model tier 以获得更好的推理能力
 
 ### 2. Agent 注册
@@ -86,7 +86,7 @@ routing_tags:
   - 生成
 tools:
   - save_skill
-  - read_file_lines
+  - read_file
   - write_file
   - apply_patch
   - code_search

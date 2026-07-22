@@ -194,7 +194,7 @@ fn blocked_overflow_read_reason(path: &Path) -> Option<String> {
         return None;
     }
     match overflow_artifact_tool_name(path)?.as_str() {
-        tool @ ("read_file" | "read_file_lines" | "code_search") => Some(format!(
+        tool @ ("read_file" | "code_search") => Some(format!(
             "Access blocked: this is an internal compression artifact (the archived render of a prior \
              `{tool}` result), not a source file. Re-reading it produces nested line numbers and \
              re-compression loops. Read the original target instead — for read_file use the stub's \

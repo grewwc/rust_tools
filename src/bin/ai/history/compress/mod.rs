@@ -15,8 +15,8 @@ mod tool_overflow;
 
 use text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use tool_groups::{
-    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, first_tool_call_group, first_trim_candidate,
-    fold_early_tool_groups, fold_tool_call_group_to_stub, recent_tool_group_message_indices,
+    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, first_trim_candidate, fold_early_tool_groups,
+    recent_tool_group_message_indices,
 };
 #[cfg(test)]
 use tool_overflow::normalize_internal_notes_for_summary_model;
@@ -337,6 +337,17 @@ pub(in crate::ai) fn compress_messages_for_context(
     shrink_messages_to_fit_with_summary(out, max_chars, summary_max_chars, overflow_dir.as_deref())
 }
 
+/// 持久化历史里"带 tool_calls 的 assistant narration"被截断到的字符数。
+///
+/// 折叠器 [`tool_groups::fold_tool_call_group_to_stub`] 把发起本轮工具调用前
+/// 的 narration 当作 `assistant_checkpoint` 的来源（重要于 reasoning_content，
+/// 因为 reasoning_content 体积过大且无条件丢弃）。要让这个 checkpoint 在
+/// 落盘压缩路径上仍能拾回，持久化层就必须保留足以承载"模型当前思路"的那一段
+/// narration；同时不能保留全文以免单个 user turn 膨胀成几百条低价值 assistant
+/// 噪音。720 字与折叠后 `truncate_to_chars(&checkpoint, 720)` 同量级——既把
+/// "发起这批调用前的核心叙述"留下，又把跨 turn 体积压回可接受量。
+const PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS: usize = 720;
+
 pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -> Message {
     let mut sanitized = message.clone();
     if sanitized.role != "assistant" {
@@ -344,18 +355,31 @@ pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -
     }
 
     // 持久化历史只保留跨 turn 真正需要的 assistant 事实：
-    // - `reasoning_content` 对后续请求没有必要保留原文，provider 需要字段形状时
-    //   由 request 层统一补空字符串；
-    // - 带 tool_calls 的 assistant narration 属于"本轮过程性话术"，真正的地面真相
-    //   是结构化 tool_calls + tool 结果，持久化该 narration 会让单个 user turn
-    //   膨胀成几十/几百条低价值 assistant 噪音。
+    // - `reasoning_content` 体积巨大且对后续决策无益，持久化层一律丢弃；
+    //   provider 需要字段形状时由 request 层统一补空字符串。
+    // - 带 tool_calls 的 assistant narration 历史上被清空成 `""`：理由是
+    //   "真正的地面真相是结构化 tool_calls + tool 结果，持久化长 narration
+    //   会让单个 user turn 膨胀"。但这让 [`tool_groups::fold_tool_call_group_to_stub`]
+    //   的 checkpoint 看不到任何文字，只能塌成
+    //   "assistant_checkpoint: <empty; no persisted decision before these tool calls>"，
+    //   压缩后模型失忆，从同一轮重启取证（详 e75fc2e5 session dump 中
+    //   50/50 assistant `content==""` + 22/22 fold `<empty>` checkpoint）。
+    //
+    // 修复：把 narration 截断到 [`PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS`]
+    // 字而不是清空——这一量级正好等于 fold 自己截到的 checkpoint 上限，
+    // 零额外体积代价就能把"发起这批调用前的核心叙述"留作压缩后的决策锚点。
     sanitized.reasoning_content = None;
     if sanitized
         .tool_calls
         .as_ref()
         .is_some_and(|tool_calls| !tool_calls.is_empty())
     {
-        sanitized.content = Value::String(String::new());
+        let narration = match sanitized.content {
+            Value::String(ref s) => s.clone(),
+            ref other => other.to_string(),
+        };
+        let capped = truncate_to_chars(&narration, PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS);
+        sanitized.content = Value::String(capped);
     }
     sanitized
 }
@@ -661,30 +685,16 @@ fn shrink_messages_to_fit(
     }
 
     while messages_total_chars(&messages) > max_chars {
-        if let Some(group) = first_tool_call_group(&messages) {
-            // 渐进式卸载：先尝试折叠为单行 stub 而不是整组删除，
-            // 让模型仍能"看见"早期发生过哪些工具调用、以什么结果收尾，
-            // 避免后续轮次因为完全失忆而重复工作。
-            if let Some(stub) = fold_tool_call_group_to_stub(&messages, &group, overflow_dir) {
-                let stub_idx = group[0];
-                for idx in group.iter().rev() {
-                    messages.remove(*idx);
-                }
-                messages.insert(stub_idx, stub);
-                if messages_total_chars(&messages) <= max_chars {
-                    break;
-                }
-                continue;
-            }
-            // 兜底：极端情况（无法构造 stub）才整组删除
-            for idx in group.into_iter().rev() {
-                messages.remove(idx);
-            }
-            continue;
-        }
-        // first_tool_call_group 已折不动（剩余可折叠组都含 read_file/code_search
-        // 等 non-compressible 工具）但仍超预算：用 fold_early_tool_groups 递进折叠
-        // 保护尾窗之外的这些组。有效折叠则继续循环重新评估；否则落到通用裁剪。
+        // 一次性批量折叠超出预算的所有非保护工具组（compressible + non-compressible
+        // 都通过 [`fold_early_tool_groups`] 处理）。
+        // 旧实现在 `first_tool_call_group` + 单组 fold 循环里一次只折一组，且只在
+        // 折无可折后才落到 `fold_noncompressible_tool_groups_to_fit` 的批 fold。Bug A
+        // 让单组 fold 的字符节省极小（assistant.content 已被 sanitize 置
+        // `""`/`null`，fold 出的 stub 几乎与原 group 同大）→ 外层 while 要迭代几十
+        // 轮才收敛，每轮再注入一条 `<empty>` empty-checkpoint note 污染上下文（详
+        // e75fc2e5 session dump 的 22 个连续 `compressed_tool_round` <empty> stub）。
+        // 改成每轮优先用一个 `fold_early_tool_groups` 批把所有可折叠组一次性收掉，
+        // 让收缩在数外层迭代内完成。
         if fold_noncompressible_tool_groups_to_fit(&mut messages, max_chars, overflow_dir) {
             continue;
         }
@@ -771,33 +781,10 @@ fn shrink_messages_to_fit_with_summary(
     let mut dropped: Vec<Message> = Vec::new();
 
     while messages_total_chars(&messages) > max_chars {
-        if let Some(group) = first_tool_call_group(&messages) {
-            // 与 shrink_messages_to_fit 保持一致：先尝试折叠成单条 stub，
-            // 让模型仍能"看见"早期发生过哪些工具调用、以什么结果收尾，
-            // 避免后续轮次完全失忆而重复工作。折叠仍超额或无法构造 stub
-            // 时，才把整组移入 dropped 由 OverflowSink 归档。
-            if let Some(stub) = fold_tool_call_group_to_stub(&messages, &group, overflow_dir) {
-                let stub_idx = group[0];
-                for idx in group.iter().rev() {
-                    messages.remove(*idx);
-                }
-                messages.insert(stub_idx, stub);
-                if messages_total_chars(&messages) <= max_chars {
-                    break;
-                }
-                continue;
-            }
-            let mut removed_group = Vec::with_capacity(group.len());
-            for idx in group.into_iter().rev() {
-                removed_group.push(messages.remove(idx));
-            }
-            removed_group.reverse();
-            dropped.extend(removed_group);
-            continue;
-        }
-        // first_tool_call_group 已折不动（剩余可折叠组都含 read_file/code_search
-        // 等 non-compressible 工具）但仍超预算：用 fold_early_tool_groups 递进折叠
-        // 保护尾窗之外的这些组。有效折叠则继续循环重新评估；否则落到通用裁剪。
+        // 一次性批量折叠超出预算的所有非保护工具组（compressible + non-compressible
+        // 都通过 [`fold_early_tool_groups`] 处理）——理由同
+        // [`shrink_messages_to_fit`]，避免单组 fold 循环迭代几十轮注入
+        // `<empty>` empty-checkpoint note（详 e75fc2e5 session dump）。
         if fold_noncompressible_tool_groups_to_fit(&mut messages, max_chars, overflow_dir) {
             continue;
         }
@@ -1561,12 +1548,19 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
 
     // (name, args) → 该签名下"首个保留全文"的 tool 消息序号，用于在折叠时回指。
     let mut seen: FxHashMap<(String, String), usize> = FxHashMap::default();
-    // (name, args, content_hash) → 首个出现该内容版本的 tool 消息序号。
+    // (tool_name, content_hash) → 首个出现该内容版本的 tool 消息序号。
     // 内容级去重是断开"重复整篇重读"失忆环的关键：对 read_file 等
-    // non-compressible 工具，同一 (文件, 参数) 被反复读取时往往返回**逐字节
+    // non-compressible 工具，同一 (文件) 被反复读取时往往返回**逐字节
     // 相同**的全文（实测占全部 tool 字节的 ~52%）。这些冗余副本可无损折叠，
     // 而内容确实变化的版本（如被编辑过的文件）因 hash 不同得以完整保留。
-    let mut seen_content: FxHashMap<(String, String, u64), usize> = FxHashMap::default();
+    //
+    // **关键**：key 不携带 `args_norm`——历史上把 args 也纳入键，导致显式的
+    // "同一查询的大小写/路径变体"（`readFileLines` vs `read_file_lines`、
+    // 大小写敏感差异等）即便返回**逐字节相同**的"无命中"体也 collapse 不掉，
+    // 在尾部反复堆积 6+ 份 15KB 的同内容（详 e75fc2e5 session dump）。
+    // 改用 `(tool_name, content_hash)`：只要返回体本身一致就折叠——args 不同
+    // 由调用签名去重的 `seen` 计数器单独管，不影响内容级折叠。
+    let mut seen_content: FxHashMap<(String, u64), usize> = FxHashMap::default();
     for &idx in &tool_indices {
         let signature = messages[idx]
             .tool_call_id
@@ -1598,9 +1592,14 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
         };
         let count = seen.entry(signature.clone()).or_insert(0);
         *count += 1;
-        if protected_indices.contains(&idx) {
-            continue;
-        }
+        // **不再豁免最近保护窗内的重复**。历史上这里 `if protected_indices.contains(&idx) continue;`
+        // 让最近 N 个工具组完全跳过去重，于是 agent 不断重发同一查询、最新副本一直
+        // 落到"最近窗"里 → 永不被折叠，尾部堆积 15KB × 29 份的逐字节相同结果。
+        // 现在让 dedup 一视同仁跑遍所有 tool 消息：首见登记为 canonical 全文，
+        // 其余副本（无论是否在保护窗内）一律折叠为回指 stub。模型仍能看到
+        // 第一个全文版本（在对话里、保护窗逻辑之外），后续重复是无损冗余。
+        // orphan 的保护逻辑（上面的 `!protected_indices.contains`）已经单独处理，
+        // 不受这里影响。
         if is_non_compressible_tool(&signature.0) {
             // read_file/检索类工具**内容不同的版本**必须零压缩保留（Invariant：
             // precision 结果不做 lossy 裁剪）。但**逐字节相同**的重复副本是纯冗余，
@@ -1610,7 +1609,7 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
             let text = value_to_string(&messages[idx].content);
             let mut hasher = FxHasher::default();
             text.hash(&mut hasher);
-            let content_key = (signature.0.clone(), signature.1.clone(), hasher.finish());
+            let content_key = (signature.0.clone(), hasher.finish());
             match seen_content.get(&content_key).copied() {
                 None => {
                     seen_content.insert(content_key, idx);
@@ -1662,7 +1661,7 @@ fn dedup_overlapping_read_file_results(
             continue;
         };
         let text = value_to_string(&messages[idx].content);
-        let Some(lines) = parse_numbered_read_file_lines(&text) else {
+        let Some(lines) = parse_numbered_read_file_output_lines(&text) else {
             continue;
         };
 
@@ -1690,7 +1689,7 @@ fn dedup_overlapping_read_file_results(
                 .lines
                 .retain(|(line_no, _)| !overlapping.contains(line_no));
             messages[prior.message_idx].content =
-                Value::String(render_deduped_read_file_lines(&prior.lines, removed));
+                Value::String(render_deduped_read_file_output_lines(&prior.lines, removed));
         }
 
         prior_results.push(NumberedReadFileResult {
@@ -1712,7 +1711,7 @@ fn read_file_path_from_args(tool_name: &str, args: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn parse_numbered_read_file_lines(text: &str) -> Option<Vec<(usize, String)>> {
+fn parse_numbered_read_file_output_lines(text: &str) -> Option<Vec<(usize, String)>> {
     let mut lines = Vec::new();
     for line in text.lines() {
         let (number, content) = line.split_once('\t')?;
@@ -1744,7 +1743,7 @@ fn matching_line_numbers(
     matching
 }
 
-fn render_deduped_read_file_lines(lines: &[(usize, String)], removed: usize) -> String {
+fn render_deduped_read_file_output_lines(lines: &[(usize, String)], removed: usize) -> String {
     if lines.is_empty() {
         return format!(
             "[overlap dedup: all {removed} numbered lines are present verbatim in a later read_file result]"

@@ -455,17 +455,10 @@ pub(super) async fn prepare_turn(
         }
     }
 
-    // C3: 复杂任务自动提示（不强制激活 Thinking 引擎，仅作为软引导）
-    // 仅依据多行、列表、长度和多 artifact 等形态信号判断，避免词面关键词误触发。
-    if detect_complex_task(question) {
-        skill_turn.push_section(
-            skill_runtime::ContextKind::Policy,
-            "Complex task hint:\n\
-             - This request looks multi-step (refactor / design / architecture / cross-module).\n\
-             - Before editing, briefly outline the plan: what to read, what to change, how to verify.\n\
-             - Prefer small reversible steps; surface assumptions explicitly.",
-        );
-    }
+    // C3 复杂任务自动提示已移除：build agent 的 Core Workflow Plan / Verify 步骤已覆盖
+    // 同样的"先列计划再动手"引导，重复注入会与 Autonomous Execution 段的
+    // "prefer acting over describing" 互相矛盾。`detect_complex_task` 保留
+    // 仅供测试观测形态信号。
 
     messages.push(Message {
         role: "system".to_string(),
@@ -501,6 +494,43 @@ pub(super) async fn prepare_turn(
             tool_call_id: None,
             reasoning_content: None,
         });
+    }
+    // 用户重定向提醒：若历史中最近一条 assistant 仍是 tool-call 批次（即上一轮
+    // agent 在工具循环里结束、未给出最终文本回复，可能是 stuck loop、被打断、
+    // 或限额触发），把用户当前输入的原文升级为一条头部 `ROLE_INTERNAL_NOTE`
+    // 提醒，放在 system 段之后、整段历史之前。否则漫长 tool-only 历史会冲淡
+    // 用户新指令的存在感，让模型反复重跑上一轮没成形的检索/读取（详 e75fc2e5
+    // session dump：用户喊"你卡住了啊"之后 agent 仍重发 8 次失败的 code_search）。
+    //
+    // 提醒是 system-like role，[`first_trim_candidate`] 与 fold 路径都豁免它，
+    // mid-turn compress 内不会被打掉；它紧贴 system 之后，模型早期读到，即以
+    // "重定向信号"的姿态启动本轮，而不是把整段 stale 工具历史当成起跳点。
+    let prev_assistant_in_tool_loop = history
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .is_some_and(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
+        });
+    if prev_assistant_in_tool_loop {
+        let nudge_text = question.trim();
+        if !nudge_text.is_empty() {
+            messages.push(Message {
+                role: ROLE_INTERNAL_NOTE.to_string(),
+                content: Value::String(format!(
+                    "User redirect reminder (上一轮未给出最终回复，仅工具循环):\n{nudge_text}\n\
+                     上一 turn 在 tool calls 中结束、并未给出最终文本回复。请直接以本重定向为最高优先级\
+                     行动，不要重复此前已跑过的检索/读取、不要从历史中重新取证；依据上方 system 指令与\
+                     本提醒推进当前任务。"
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+        }
     }
     messages.extend(history);
     // Per-turn context reminder (Current Date / Recalled Knowledge / Code
@@ -636,6 +666,7 @@ fn looks_like_code_or_repo_question(question: &str) -> bool {
 
 /// C3: 复杂任务检测——仅基于结构信号的轻量启发式。
 /// 命中后只会注入一段 Policy 提示鼓励 agent 自行拆解，不强制激活 Thinking 引擎。
+#[cfg(test)]
 fn detect_complex_task(question: &str) -> bool {
     QuestionShape::analyze(question).is_complex_task()
 }

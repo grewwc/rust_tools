@@ -122,7 +122,7 @@ routing_tags: 路由标签
 ```yaml
 tools:
   - read_file
-  - read_file_lines
+  - read_file
   - code_search
   - search_files
 ```

@@ -1228,7 +1228,7 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
     }
 
     msg.push_str(
-        "Hint: re-read the file with read_file/read_file_lines to get exact current content, then rebuild the patch from the raw file text only. read_file prints each line as a right-aligned line number followed by a TAB (e.g. `    42\\t<code>`); copy only the code after the TAB. Do not copy the leading line number + tab, any truncation notice, or the Symbol outline block into the patch.",
+        "Hint: re-read the file with read_file to get exact current content, then rebuild the patch from the raw file text only. read_file prints each line as a right-aligned line number followed by a TAB (e.g. `    42\\t<code>`); copy only the code after the TAB. Do not copy the leading line number + tab, any truncation notice, or the Symbol outline block into the patch.",
     );
     msg
 }

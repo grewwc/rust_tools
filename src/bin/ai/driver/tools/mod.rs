@@ -1493,6 +1493,11 @@ const PARALLEL_READONLY_MAX_CONCURRENCY: usize = 8;
 /// 工具都会被排除，因此并行批次与顺序执行在语义上完全等价，只是更快。
 fn is_parallel_safe_tool_call(mcp_client: &McpClient, tool_call: &ToolCall) -> bool {
     let name = &tool_call.function.name;
+    // read_file 的本地读取很快，但结果进入上下文的成本很高；并行读多个文件
+    // 往往只会把大量精确证据一次性塞进 history，收益远低于后续压缩/召回代价。
+    if name == "read_file" {
+        return false;
+    }
     if !is_cacheable_tool_name(name) {
         return false;
     }
@@ -1732,7 +1737,7 @@ fn collect_tool_cache_file_fingerprints(
     args: &Value,
 ) -> Vec<CachedFileFingerprint> {
     let path = match tool_name {
-        "read_file" | "read_file_lines" => args
+        "read_file" => args
             .get("file_path")
             .or_else(|| args.get("path"))
             .and_then(Value::as_str),
