@@ -112,7 +112,17 @@ impl PromptEditor {
         if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
             return self.read_multi_line_no_tty();
         }
-        self.read_multi_line_tui()
+        match self.read_multi_line_tui() {
+            Ok(input) => Ok(input),
+            Err(err) if Self::is_cursor_position_timeout(&err) => self.read_multi_line_no_tty(),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn is_cursor_position_timeout(err: &io::Error) -> bool {
+        let msg = err.to_string();
+        msg.contains("cursor position")
+            || msg.contains("The cursor position could not be read within a normal duration")
     }
 
     fn read_multi_line_no_tty(&mut self) -> io::Result<Option<String>> {

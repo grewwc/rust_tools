@@ -375,12 +375,15 @@ fn tool_result_recall_text(
         .lines()
         .map(str::trim)
         .any(|line| line.starts_with("- file_path:") || line.starts_with("file_path:"));
-    let preserved =
-        preserve_noncompressible_tool_result_for_fold(overflow_dir, tool_name, result_text)?;
-    let path = preserved
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("- file_path:") || line.starts_with("file_path:"))?;
+    let original_recall_lines =
+        build_tool_overflow_recall_lines(&tool_call.function.name, &tool_call.function.arguments);
+    let preserved = preserve_noncompressible_tool_result_for_fold(
+        overflow_dir,
+        tool_name,
+        result_text,
+        &original_recall_lines,
+    )?;
+    let archive_path_line = preserved_archive_file_path_line(&preserved);
 
     if tool_name == "execute_command" && !already_archived {
         let recall = command_result_recall(result_text);
@@ -391,25 +394,36 @@ fn tool_result_recall_text(
             || recall_lower.contains("blocked")
             || recall_lower.contains("aborting")
             || recall_lower.contains("could not compile");
+        let archive_hint = archive_path_line
+            .clone()
+            .unwrap_or_else(|| "完整日志已归档到会话 asset。".to_string());
         if has_error_signal {
             return Some(append_original_recall_lines(
                 format!(
-                    "{}\n  {path}\n  - 命令输出包含错误信号；如需完整诊断日志，可用 read_file 读取以上文件。",
-                    recall,
+                    "{}\n  {}\n  - 命令输出包含错误信号；仅当当前诊断确实需要完整日志时，再读取 `archive_file_path`。",
+                    recall, archive_hint
                 ),
                 tool_call,
                 &preserved,
             ));
         }
         return Some(append_original_recall_lines(
-            format!("{}\n  {path}", recall),
+            format!("{}\n  {}", recall, archive_hint),
             tool_call,
             &preserved,
         ));
     }
 
+    if matches!(tool_name, "read_file" | "read_file_lines" | "code_search") {
+        return Some(precision_grounding_tool_recall(
+            tool_call,
+            &preserved,
+            archive_path_line,
+        ));
+    }
+
     Some(append_original_recall_lines(
-        truncate_to_chars(&normalize_whitespace(path), 240),
+        archive_path_line.unwrap_or_else(|| "完整结果已归档到会话 asset。".to_string()),
         tool_call,
         &preserved,
     ))
@@ -424,7 +438,16 @@ fn append_original_recall_lines(
     tool_call: &ToolCall,
     preserved: &str,
 ) -> String {
+    for line in collect_original_recall_lines(tool_call, preserved) {
+        recall.push_str("\n  ");
+        recall.push_str(&line);
+    }
+    recall
+}
+
+fn collect_original_recall_lines(tool_call: &ToolCall, preserved: &str) -> Vec<String> {
     let mut seen = FxHashSet::default();
+    let mut out = Vec::new();
     let from_call =
         build_tool_overflow_recall_lines(&tool_call.function.name, &tool_call.function.arguments);
     let from_preserved = preserved.lines().filter_map(|line| {
@@ -434,11 +457,99 @@ fn append_original_recall_lines(
 
     for line in from_call.iter().map(String::as_str).chain(from_preserved) {
         if seen.insert(line.to_string()) {
-            recall.push_str("\n  ");
-            recall.push_str(line);
+            out.push(line.to_string());
         }
     }
-    recall
+    out
+}
+
+/// 折叠 tool group 时，不要把内部 overflow 归档路径伪装成普通 `file_path` 主线索；
+/// 对模型来说它只是二级审计产物，真正的继续调查目标应是 `original_*` 锚点。
+fn preserved_archive_file_path_line(preserved: &str) -> Option<String> {
+    preserved
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            line.strip_prefix("- file_path: ")
+                .or_else(|| line.strip_prefix("file_path:"))
+                .map(str::trim)
+        })
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            format!(
+                "- archive_file_path: {}",
+                truncate_to_chars(&normalize_whitespace(path), 240)
+            )
+        })
+}
+
+/// 一级 overflow stub 已经带有 head/tail 预览；二级 tool-group 折叠时继续保留几条
+/// preview，避免历史里只剩 `original_file_path`/`archive_file_path` 两个路径账单，
+/// 导致模型在压缩后失去“文件里看到了什么”的状态。
+fn preserved_preview_recall(preserved: &str, max_lines: usize) -> Option<String> {
+    let mut in_preview = false;
+    let mut lines = Vec::new();
+    for line in preserved.lines() {
+        let trimmed = line.trim();
+        if !in_preview {
+            if trimmed.starts_with("Preview (") {
+                in_preview = true;
+            }
+            continue;
+        }
+        if trimmed.is_empty()
+            || (trimmed.starts_with("... [") && trimmed.contains("omitted"))
+            || trimmed.starts_with("[[")
+        {
+            continue;
+        }
+        let normalized = truncate_to_chars(&normalize_whitespace(trimmed), 180);
+        if normalized.is_empty() {
+            continue;
+        }
+        lines.push(normalized);
+        if lines.len() >= max_lines {
+            break;
+        }
+    }
+
+    (!lines.is_empty()).then(|| format!("preview: {}", lines.join(" | ")))
+}
+
+fn precision_grounding_tool_recall(
+    tool_call: &ToolCall,
+    preserved: &str,
+    archive_path_line: Option<String>,
+) -> String {
+    let mut lines = Vec::new();
+    let preview_budget = if tool_call.function.name == "code_search" {
+        3
+    } else {
+        4
+    };
+    if let Some(preview) = preserved_preview_recall(preserved, preview_budget) {
+        lines.push(preview);
+    }
+    lines.extend(collect_original_recall_lines(tool_call, preserved));
+    if let Some(archive_path_line) = archive_path_line {
+        lines.push(archive_path_line);
+    }
+
+    match tool_call.function.name.as_str() {
+        "read_file" | "read_file_lines" => lines.push(
+            "优先依据 `original_file_path` / `original_range` 和 preview 继续判断；仅当这些锚点仍不足时再读取 `archive_file_path`。".to_string(),
+        ),
+        "code_search" => lines.push(
+            "优先依据 `original_operation` / `original_query` / `original_path` 和 preview 继续缩小范围；仅当这些锚点仍不足时再读取 `archive_file_path`。".to_string(),
+        ),
+        _ => {}
+    }
+
+    if lines.is_empty() {
+        "高精度结果已归档；仅在确需完整原文时再读取 `archive_file_path`。".to_string()
+    } else {
+        lines.join("\n  ")
+    }
 }
 
 /// 命令输出被折叠时至少保留退出状态、关键诊断与尾部结论。完整日志仍由调用方
@@ -556,6 +667,20 @@ pub(super) fn recent_tool_result_groups(
 /// 指针（模型据此可重新 read_file），否则退回结果首个非空行。
 /// 保证折叠早期 precision 工具组时仍留下可召回的线索，避免失忆式重复检索。
 fn tool_result_recall_one_liner(result_text: &str) -> String {
+    if let Some(original_line) = result_text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("- original_"))
+    {
+        return truncate_to_chars(&normalize_whitespace(original_line), 220);
+    }
+    if let Some(path_line) = result_text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("- archive_file_path:"))
+    {
+        return truncate_to_chars(&normalize_whitespace(path_line), 220);
+    }
     if let Some(path_line) = result_text
         .lines()
         .map(str::trim)

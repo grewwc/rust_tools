@@ -180,6 +180,70 @@ fn stub_preserves_file_path_recall_anchor() {
     );
 }
 
+#[test]
+fn folded_read_file_group_keeps_preview_and_original_target_anchor() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-read-preview-fold-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut messages = vec![msg("system", "s"), msg("user", "排查 prompt")];
+    messages.push(assistant_call_args(
+        "read-prompt",
+        "read_file",
+        r#"{"file_path":"src/bin/ai/prompt.rs","offset":1,"limit":220}"#,
+    ));
+    messages.push(tool_result(
+        "read-prompt",
+        "1\tuse std::{\n\
+         2\t    fs,\n\
+         3\t    io::{self, BufRead},\n\
+         4\t    path::{Path, PathBuf},\n\
+         5\t};\n\
+         110\tpub(super) fn read_multi_line(&mut self) -> io::Result<Option<String>> {\n\
+         111\t    use std::io::IsTerminal;\n\
+         112\t    if !io::stdout().is_terminal() || !io::stdin().is_terminal() {\n\
+         113\t        return self.read_multi_line_no_tty();\n\
+         114\t    }\n\
+         115\t    self.read_multi_line_tui()\n\
+         116\t}\n",
+    ));
+    for i in 0..4 {
+        let id = format!("later-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "later"));
+    }
+
+    let (folded, folded_groups) =
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()));
+    assert_eq!(folded_groups, 1);
+    let stub = folded
+        .iter()
+        .find(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && value_to_string(&message.content).contains(COMPRESSED_TOOL_EVIDENCE_MARKER)
+        })
+        .map(|message| value_to_string(&message.content))
+        .expect("folded read_file group should become evidence note");
+
+    assert!(stub.contains("preview:"), "{stub}");
+    assert!(
+        stub.contains("pub(super) fn read_multi_line(&mut self) -> io::Result<Option<String>>"),
+        "{stub}"
+    );
+    assert!(
+        stub.contains("- original_file_path: src/bin/ai/prompt.rs"),
+        "{stub}"
+    );
+    assert!(stub.contains("- original_range: lines=1..220"), "{stub}");
+    assert!(stub.contains("- archive_file_path:"), "{stub}");
+    assert!(
+        !stub.contains("=> - file_path: "),
+        "folded recall should not surface archive file as primary file_path anchor: {stub}"
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
 /// 一级外溢 stub 已包含（或可由 tool call 重建）原始调用参数时，二级工具组折叠
 /// 也必须保留它们。否则 history 只剩不可辨识的内部归档路径，模型会把它当源码
 /// 回读，导致「压缩产物不存在 / 源码消失」的错误判断。

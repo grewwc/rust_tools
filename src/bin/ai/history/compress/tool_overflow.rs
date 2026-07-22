@@ -534,11 +534,13 @@ pub(super) fn is_non_compressible_tool(tool_name: &str) -> bool {
 ///
 /// 工具组折叠会移除原始 `tool` 消息；对不可有损压缩的结果，必须先走这条路径，
 /// 否则折叠 note 只剩一行首句，完整诊断将没有任何可回读的真相来源。已有 stub
-/// 直接复用，避免同一结果在多轮压缩中反复写出副本。
+/// 直接复用，避免同一结果在多轮压缩中反复写出副本。调用方可额外传入
+/// `original_*` 锚点，让 stub 自身就明确区分「原始目标」与「内部归档文件」。
 pub(super) fn preserve_noncompressible_tool_result_for_fold(
     overflow_dir: Option<&Path>,
     tool_name: &str,
     content: &str,
+    recall_lines: &[String],
 ) -> Option<String> {
     if is_preserved_tool_overflow_stub(content) {
         return Some(content.to_string());
@@ -549,7 +551,7 @@ pub(super) fn preserve_noncompressible_tool_result_for_fold(
         &path,
         tool_name,
         content,
-        &[],
+        recall_lines,
     ))
 }
 
