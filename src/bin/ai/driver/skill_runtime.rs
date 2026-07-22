@@ -328,15 +328,15 @@ fn ensure_required_baseline_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
     dedupe_tools_by_name(tools)
 }
 
-const SUBAGENT_HIDDEN_TASK_TOOLS: &[&str] = &["task", "task_spawn", "task_wait", "task_status"];
-
 fn should_hide_task_tools_for_subagent() -> bool {
     super::runtime_ctx::current_subagent_depth() > 0
 }
 
 fn filter_subagent_hidden_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
     if should_hide_task_tools_for_subagent() {
-        tools.retain(|tool| !SUBAGENT_HIDDEN_TASK_TOOLS.contains(&tool.function.name.as_str()));
+        tools.retain(|tool| {
+            !super::super::tools::is_subagent_orchestration_tool_name(&tool.function.name)
+        });
     }
     tools
 }
@@ -912,7 +912,7 @@ fn build_system_prompt(
     }
 
     b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
-    b.push(ContextKind::Behavior, "Tool usage:\n- Stop reading once you have sufficient evidence. Do not read files speculatively \"just to understand the codebase\" — read only when a specific question demands it.\n- Only rely on tools available in this turn's tool schema.\n- Every tool call must have a specific information, verification, or change goal. Avoid open-ended exploration; before continuing a search, know what question the next tool result should answer.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- File reads: read each region exactly once and reuse prior output. Use `list_directory` or `tree` to locate before reading. Read in one broad chunk rather than paging through small slices. Do not re-read content already visible in conversation.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
+    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Every tool call must have a specific information, verification, or change goal. Avoid open-ended exploration; before continuing a search, know what question the next tool result should answer.\n- Stop exploratory loops once you have enough evidence - do not read files speculatively \"just to understand the codebase\"; read only when a specific question demands it.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- Keep code-grounding calls narrow and serial: for `read_file`, do one read at a time and avoid batching multiple file reads into the same message. Use `list_directory` or `tree` to locate before reading; read each region exactly once in one broad chunk rather than paging through small slices; do not re-read content already visible in conversation.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
     b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- Do not treat pressure to converge as permission to guess. If evidence is not yet sufficient, clearly state what you know and what remains uncertain.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain and what it would take to resolve it.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.");
     b.push(ContextKind::Behavior, "Git safety:\n- Never use `git reset`, `git checkout`, `git restore`, `git stash drop`, or any other git command to discard or roll back existing changes (including staged changes) solely for testing or verification.\n- For a clean test state, use a temporary branch, a worktree, or `git stash push` (then `pop` to restore).\n- If rolling back is genuinely necessary (e.g., the change itself is wrong), first explain the reason to the user and obtain confirmation.");
 
@@ -959,9 +959,19 @@ fn build_system_prompt(
     if has_tool(available_tools, "enable_tools") {
         // 未加载能力的详细目录与示例容易在每轮造成无关噪声；统一通过
         // enable_tools 按需发现，只有已经加载的工具才在下方注入具体规则。
-        let mut discovery_lines = vec![
-            "Additional capabilities are available via `enable_tools`; list and enable only what the current task needs.".to_string(),
-        ];
+        let mut discovery_lines = Vec::new();
+        if skill.is_none() {
+            discovery_lines.push(
+                "No skill is active yet. Additional capabilities are available via `enable_tools`; call `enable_tools(operation=list)` to see them, enabling only the specific tools you need.".to_string(),
+            );
+            discovery_lines.push(
+                "If a task needs an external system or MCP-backed capability, call `enable_tools(operation=list)` to see available tools, then discover and enable matching `mcp_*` tools first.".to_string(),
+            );
+        } else {
+            discovery_lines.push(
+                "Additional capabilities are available via `enable_tools`; list and enable only what the current task needs.".to_string(),
+            );
+        }
         if skill.is_none() && has_tool(available_tools, "activate_skill") {
             discovery_lines.push(
                 "If the user explicitly names an installed skill and it clearly matches the task, call `activate_skill(name=...)` directly; do not activate one speculatively.".to_string(),
@@ -1453,7 +1463,13 @@ mod tests {
                     .map(|tool| tool.function.name)
                     .collect::<Box<SkipSet<_>>>();
 
-                for hidden in ["task", "task_spawn", "task_wait", "task_status"] {
+                for hidden in [
+                    "task",
+                    "task_spawn",
+                    "task_wait",
+                    "task_status",
+                    "task_cancel",
+                ] {
                     assert!(!names.contains_str(hidden), "{hidden} should be hidden");
                 }
                 assert!(names.contains_str("read_file"));
@@ -2372,6 +2388,35 @@ mod tests {
 
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"knowledge_rebuild_index".to_string()));
+        set_explicit_enabled_tool_names(Vec::new());
+    }
+
+    #[test]
+    fn subagent_runtime_enabled_task_tools_stay_hidden() {
+        let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
+        set_explicit_enabled_tool_names(vec![
+            "task_wait".to_string(),
+            "task_cancel".to_string(),
+            "web_search".to_string(),
+        ]);
+
+        SUBAGENT_DEPTH.sync_scope(1, || {
+            let merged = merge_with_runtime_enabled_tools(
+                vec![tool("read_file"), tool("enable_tools")],
+                vec![],
+                &[tool("task_wait"), tool("task_cancel"), tool("web_search")],
+            );
+            let names = merged
+                .into_iter()
+                .map(|tool| tool.function.name)
+                .collect::<Vec<_>>();
+
+            assert!(names.contains(&"read_file".to_string()));
+            assert!(names.contains(&"web_search".to_string()));
+            assert!(!names.contains(&"task_wait".to_string()));
+            assert!(!names.contains(&"task_cancel".to_string()));
+        });
+
         set_explicit_enabled_tool_names(Vec::new());
     }
 

@@ -45,12 +45,16 @@ Module responsibilities: schema/metadata in `registry/`, execution in
    the unified-diff path. `read_file` paginates by line and by character cap,
    computing continuation offsets from rendered lines. Text search lives in the
    dedicated grep/search tools.
-10. **Subagent tools.** `task`/`task_spawn` enforce the depth cap, results are
-    session-scoped, and surfaced child outputs must remind the parent to produce
-    its own summary. Subagent launches use a capped copy of the selected agent
-    manifest (`SUBAGENT_MAX_ITERATIONS`) and wrap the prompt with leaf-task
-    convergence constraints; do not lower the primary agent's manifest budget to
-    tune subagent behavior.
+10. **Subagent tools.** The `task` orchestration family
+    (`task`, `task_spawn`, `task_wait`, `task_status`, `task_cancel`) is
+    top-level only: subagents must not see it, `enable_tools` must not
+    reintroduce it, and execution paths must reject it when
+    `SUBAGENT_DEPTH > 0`. Results are session-scoped, and surfaced child
+    outputs must remind the parent to produce its own summary. Subagent
+    launches use a capped copy of the selected agent manifest
+    (`SUBAGENT_MAX_ITERATIONS`) and wrap the prompt with leaf-task convergence
+    constraints; do not lower the primary agent's manifest budget to tune
+    subagent behavior.
 
 11. **Wall-clock safety net.** Stuck subagents are reaped after
     `SUBAGENT_WALL_CLOCK_TIMEOUT` (30 min) via two paths: `task_wait`'s per-call

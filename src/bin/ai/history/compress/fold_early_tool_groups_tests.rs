@@ -725,6 +725,62 @@ fn leading_compressed_tool_evidence_notes_are_not_immortal_prefix_context() {
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
+#[test]
+fn compressed_tool_evidence_has_independent_inline_budget() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-bounded-tool-evidence-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut messages = vec![msg("system", "system prompt"), msg("user", "分析长工具链")];
+    for index in 0..24 {
+        messages.push(msg(
+            ROLE_INTERNAL_NOTE,
+            &format!(
+                "compressed_tool_round: 1 tool calls (folded for context budget)\n{}\nassistant_checkpoint: checkpoint-{index:02}\nevidence:\n- read_file => {}",
+                COMPRESSED_TOOL_EVIDENCE_MARKER,
+                "x".repeat(900)
+            ),
+        ));
+    }
+    assert!(compressed_tool_evidence_exceeds_inline_budget(&messages));
+
+    // 整体远低于全局 100K 预算，仍应由工具证据自己的 12K 上限主动收敛。
+    let compressed = compress_messages_for_context(
+        messages,
+        100_000,
+        256,
+        8_000,
+        Some(overflow_dir.clone()),
+    );
+    let evidence = compressed
+        .iter()
+        .filter(|message| is_compressed_tool_evidence_note(message))
+        .map(|message| value_to_string(&message.content))
+        .collect::<Vec<_>>();
+    let inline_chars = compressed
+        .iter()
+        .filter(|message| is_compressed_tool_evidence_note(message))
+        .map(message_billable_chars)
+        .sum::<usize>();
+
+    assert!(inline_chars <= MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS);
+    assert!(evidence.iter().any(|text| text.contains("checkpoint-23")));
+    assert!(!evidence.iter().any(|text| text.contains("checkpoint-00")));
+    assert_eq!(
+        compressed
+            .iter()
+            .filter(|message| is_archive_note_message(message))
+            .count(),
+        1
+    );
+    let archived = std::fs::read_to_string(overflow_dir.join("overflow-history.md"))
+        .expect("older evidence should be archived before removal");
+    assert!(archived.contains("checkpoint-00"), "{archived}");
+    assert!(!archived.contains("checkpoint-23"), "{archived}");
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
 /// 压缩后的命令组必须保留调用参数。仅保留「成功但无输出」不足以说明已经查过
 /// 哪个 author/date/cwd 组合，模型会把它当成未执行过的调查而从同一条 git log 重启。
 #[test]

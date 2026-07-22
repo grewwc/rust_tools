@@ -20,6 +20,7 @@ const CODE_INSPECTION_MEMORY_PREFIX: &str = "Current code-inspection working mem
 const CONTEXT_CHECKPOINT_OPEN: &str = "<context_checkpoint>";
 const CONTEXT_CHECKPOINT_CLOSE: &str = "</context_checkpoint>";
 const CONTEXT_CHECKPOINT_SUMMARY_MAX_CHARS: usize = 240;
+const WORKING_CHECKPOINT_FILE_NAME: &str = "working-checkpoint.md";
 
 #[derive(Debug, Clone)]
 struct RepoInspectionFinding {
@@ -213,6 +214,193 @@ fn save_context_checkpoint_in_dir(
     }
     result?;
     Ok(path)
+}
+
+fn save_working_context_checkpoint(
+    app: &App,
+    summary: &str,
+    body: &str,
+) -> std::io::Result<PathBuf> {
+    let assets_dir = SessionStore::new(&app.session_history_file)
+        .session_assets_dir(&app.session_id)
+        .join("context-checkpoints");
+    fs::create_dir_all(&assets_dir)?;
+    let path = assets_dir.join(WORKING_CHECKPOINT_FILE_NAME);
+    let temporary_path = assets_dir.join(format!(
+        ".{WORKING_CHECKPOINT_FILE_NAME}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let contents = format!("# Working checkpoint\n\n摘要：{summary}\n\n---\n\n{body}\n");
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary_path, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result?;
+    Ok(path)
+}
+
+fn working_checkpoint_message_for_plan(
+    app: &App,
+    tool_call: &ToolCall,
+    result_content: &str,
+) -> Option<Message> {
+    if tool_call.function.name != "plan" || result_content.trim().is_empty() {
+        return None;
+    }
+    if !tool_result_success_for_observer("plan", result_content) {
+        return None;
+    }
+
+    let args = serde_json::from_str::<Value>(&tool_call.function.arguments).ok();
+    let summary = truncate_checkpoint_summary(&plan_checkpoint_summary(
+        args.as_ref(),
+        result_content,
+    ));
+    let body = build_plan_working_checkpoint_body(tool_call, args.as_ref(), result_content);
+    let marker = match save_working_context_checkpoint(app, &summary, &body) {
+        Ok(path) => format!("[context_checkpoint path={}] {}", path.display(), summary),
+        Err(error) => {
+            eprintln!("failed to save working context checkpoint: {error}");
+            format!(
+                "[context_checkpoint save_failed] working checkpoint: {}",
+                summary
+            )
+        }
+    };
+    Some(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(marker),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    })
+}
+
+fn plan_checkpoint_summary(args: Option<&Value>, result_content: &str) -> String {
+    if let Some(summary) = args
+        .and_then(|args| args.get("summary"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+    {
+        return format!("working_checkpoint: {summary}");
+    }
+
+    let first_line = result_content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("plan updated");
+    let summary = first_line.strip_prefix("Plan:").unwrap_or(first_line).trim();
+    format!("working_checkpoint: {summary}")
+}
+
+fn build_plan_working_checkpoint_body(
+    tool_call: &ToolCall,
+    args: Option<&Value>,
+    result_content: &str,
+) -> String {
+    let mut body = String::new();
+    body.push_str("kind: runtime_owned_working_checkpoint\n");
+    body.push_str("source_tool: plan\n");
+    body.push_str(&format!("tool_call_id: {}\n", tool_call.id));
+    body.push_str(&format!(
+        "updated_at: {}\n",
+        chrono::Local::now().to_rfc3339()
+    ));
+    body.push_str("\n## Facts\n");
+    body.push_str(
+        "- The current working plan below came from the latest successful `plan` tool call.\n",
+    );
+    body.push_str(
+        "- This file is overwritten by runtime when a newer working checkpoint is produced.\n",
+    );
+    body.push_str("\n## Decisions\n");
+    body.push_str(
+        "- Treat this checkpoint as the active task ledger until a newer working checkpoint replaces it.\n",
+    );
+    body.push_str("\n## Files Read\n");
+    body.push_str("- Not captured by `plan`.\n");
+    body.push_str("\n## Files Modified\n");
+    body.push_str("- Not captured by `plan`.\n");
+    body.push_str("\n## Next Steps\n");
+    if let Some(steps) = render_plan_steps(args) {
+        body.push_str(&steps);
+    } else {
+        body.push_str("- See raw plan output below.\n");
+    }
+    body.push_str("\n## Raw Plan Output\n\n");
+    body.push_str(result_content.trim());
+    body.push('\n');
+    body
+}
+
+fn render_plan_steps(args: Option<&Value>) -> Option<String> {
+    let steps = args?
+        .get("steps")
+        .and_then(Value::as_array)
+        .filter(|steps| !steps.is_empty())?;
+    let mut rendered = String::new();
+    for (idx, step) in steps.iter().enumerate() {
+        let number = step
+            .get("step")
+            .and_then(Value::as_u64)
+            .unwrap_or((idx + 1) as u64);
+        let action = step
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|action| !action.is_empty())
+            .unwrap_or("(missing action)");
+        let tool = step
+            .get("tool")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|tool| !tool.is_empty())
+            .unwrap_or("unspecified");
+        let delegate = step
+            .get("delegate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let parallelizable = step
+            .get("parallelizable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || delegate;
+        let mut tags = Vec::new();
+        if parallelizable {
+            tags.push("parallelizable");
+        }
+        if delegate {
+            tags.push("delegate");
+        }
+        let tags = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", tags.join(", "))
+        };
+        rendered.push_str(&format!(
+            "- [planned] Step {number} via `{tool}`{tags}: {action}\n"
+        ));
+        if let Some(reason) = step
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        {
+            rendered.push_str(&format!("  Reason: {reason}\n"));
+        }
+    }
+    Some(rendered)
 }
 
 pub(super) fn parse_prune_meta_and_update_marks(
@@ -689,6 +877,7 @@ pub(super) fn append_tool_result_messages(
     }
 
     let prepared_results = prepare_tool_results_for_history(app, exec_result);
+    let mut working_checkpoint_messages = Vec::new();
     for ((tool_call, result), prepared) in exec_result
         .executed_tool_calls
         .iter()
@@ -730,6 +919,14 @@ pub(super) fn append_tool_result_messages(
             reasoning_content: None,
         };
         append_message_pair(messages, turn_messages, tool_message);
+        if let Some(message) =
+            working_checkpoint_message_for_plan(app, tool_call, &result.content)
+        {
+            working_checkpoint_messages.push(message);
+        }
+    }
+    for message in working_checkpoint_messages {
+        append_message_pair(messages, turn_messages, message);
     }
 }
 
@@ -1136,13 +1333,15 @@ fn truncate_note(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_code_inspection_working_memory, prepare_tool_results_for_history,
+        append_tool_result_messages, build_code_inspection_working_memory,
         collect_repo_inspection_findings, describe_tool_call, is_repo_inspection_tool,
+        prepare_tool_results_for_history,
         RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS,
     };
     use super::{
         extract_context_checkpoints, save_context_checkpoint_in_dir, smart_truncate_to_sentence,
-        truncate_checkpoint_summary,
+        truncate_checkpoint_summary, working_checkpoint_message_for_plan,
+        WORKING_CHECKPOINT_FILE_NAME,
     };
     use std::sync::{Arc, atomic::AtomicBool};
 
@@ -1222,7 +1421,10 @@ mod tests {
         app
     }
 
-    fn exec_result_from_calls_and_contents(calls: &[ToolCall], contents: &[String]) -> ExecuteToolCallsResult {
+    fn exec_result_from_calls_and_contents(
+        calls: &[ToolCall],
+        contents: &[String],
+    ) -> ExecuteToolCallsResult {
         ExecuteToolCallsResult {
             executed_tool_calls: calls.to_vec(),
             tool_results: calls
@@ -1238,10 +1440,152 @@ mod tests {
         }
     }
 
+    fn checkpoint_path_from_marker(marker: &str) -> PathBuf {
+        marker
+            .strip_prefix("[context_checkpoint path=")
+            .and_then(|rest| rest.split(']').next())
+            .map(PathBuf::from)
+            .expect("marker should contain checkpoint path")
+    }
+
     #[test]
     fn repo_inspection_tools_include_read_and_path_tools() {
         assert!(is_repo_inspection_tool("read_file"));
         assert!(is_repo_inspection_tool("list_directory"));
+    }
+
+    #[test]
+    fn plan_result_updates_runtime_working_checkpoint_file() {
+        let session_root = std::env::temp_dir().join(format!(
+            "ai-plan-working-checkpoint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let history_file = session_root.join("history.sqlite");
+        let app = test_app(history_file);
+        let first_call = tool_call(
+            "call_plan_1",
+            "plan",
+            serde_json::json!({
+                "summary": "Inspect checkpoint flow",
+                "steps": [
+                    {
+                        "step": 1,
+                        "action": "Read driver checkpoint persistence",
+                        "reason": "Find the durable write path",
+                        "tool": "read_file"
+                    }
+                ]
+            }),
+        );
+        let first_message = working_checkpoint_message_for_plan(
+            &app,
+            &first_call,
+            "Plan: Inspect checkpoint flow\n\nStep 1. [read_file] Read driver checkpoint persistence",
+        )
+        .expect("plan result should create working checkpoint marker");
+        let first_marker = first_message.content.as_str().unwrap_or_default();
+        let first_path = checkpoint_path_from_marker(first_marker);
+
+        assert_eq!(
+            first_path.file_name().and_then(|name| name.to_str()),
+            Some(WORKING_CHECKPOINT_FILE_NAME)
+        );
+        let first_body = std::fs::read_to_string(&first_path).unwrap();
+        assert!(first_body.contains("kind: runtime_owned_working_checkpoint"));
+        assert!(first_body.contains("## Next Steps"));
+        assert!(first_body.contains("Step 1 via `read_file`"));
+        assert!(first_body.contains("## Files Modified"));
+
+        let second_call = tool_call(
+            "call_plan_2",
+            "plan",
+            serde_json::json!({
+                "summary": "Patch checkpoint flow",
+                "steps": [
+                    {
+                        "step": 1,
+                        "action": "Apply minimal runtime-owned checkpoint patch",
+                        "tool": "apply_patch"
+                    }
+                ]
+            }),
+        );
+        let second_message = working_checkpoint_message_for_plan(
+            &app,
+            &second_call,
+            "Plan: Patch checkpoint flow\n\nStep 1. [apply_patch] Apply minimal runtime-owned checkpoint patch",
+        )
+        .expect("new plan result should refresh working checkpoint marker");
+        let second_marker = second_message.content.as_str().unwrap_or_default();
+        let second_path = checkpoint_path_from_marker(second_marker);
+
+        assert_eq!(first_path, second_path);
+        let second_body = std::fs::read_to_string(&second_path).unwrap();
+        assert!(second_body.contains("Patch checkpoint flow"));
+        assert!(second_body.contains("Step 1 via `apply_patch`"));
+        assert!(!second_body.contains("Inspect checkpoint flow"));
+
+        let _ = std::fs::remove_dir_all(session_root);
+    }
+
+    #[test]
+    fn append_tool_result_messages_records_plan_working_checkpoint_marker() {
+        let session_root = std::env::temp_dir().join(format!(
+            "ai-plan-working-checkpoint-round-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let history_file = session_root.join("history.sqlite");
+        let mut app = test_app(history_file);
+        let call = tool_call(
+            "call_plan",
+            "plan",
+            serde_json::json!({
+                "summary": "Persist active plan",
+                "steps": [
+                    {
+                        "step": 1,
+                        "action": "Write checkpoint marker",
+                        "tool": "plan"
+                    }
+                ]
+            }),
+        );
+        let exec_result = exec_result_from_calls_and_contents(
+            std::slice::from_ref(&call),
+            &["Plan: Persist active plan\n\nStep 1. [plan] Write checkpoint marker".to_string()],
+        );
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+
+        append_tool_result_messages(
+            &mut app,
+            "",
+            "",
+            &[],
+            &exec_result,
+            &mut messages,
+            &mut turn_messages,
+        );
+
+        let marker = messages
+            .iter()
+            .find_map(|message| {
+                (message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
+                    .then(|| message.content.as_str())
+                    .flatten()
+                    .filter(|content| content.starts_with("[context_checkpoint path="))
+            })
+            .expect("plan result should append working checkpoint marker to live messages");
+        assert!(turn_messages.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|content| content == marker)
+        }));
+        let path = checkpoint_path_from_marker(marker);
+        assert!(path.is_file(), "working checkpoint asset should exist");
+
+        let _ = std::fs::remove_dir_all(session_root);
     }
 
     #[test]

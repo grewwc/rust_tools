@@ -3,10 +3,11 @@ use super::{
     SUBAGENT_PARENT_SUMMARY_REMINDER, SUBAGENT_WALL_CLOCK_TIMEOUT, SelectedSubagent,
     StoredTaskResult, TASK_REGISTRY, WaitManySource, append_current_process_cancel_source,
     build_selection_explanation, capped_subagent_manifest, encode_os_task_goal, epoll_wait_many,
-    epoll_wait_many_channels, execute_task_cancel, execute_task_status, execute_task_wait,
-    format_task_result, insert_task_entry_for_test, is_encoded_task_goal, prepare_subagent_task,
-    reap_timed_out_subagents, remove_task_entry, render_outstanding_task_anchor, select_subagent,
-    wait_sources_for_channel_and_futex, with_task_entry_by_pid,
+    epoll_wait_many_channels, execute_task_cancel, execute_task_spawn, execute_task_status,
+    execute_task_wait, format_task_result, insert_task_entry_for_test, is_encoded_task_goal,
+    prepare_subagent_task, reap_timed_out_subagents, remove_task_entry,
+    render_outstanding_task_anchor, select_subagent, wait_sources_for_channel_and_futex,
+    with_task_entry_by_pid,
 };
 use super::{ToolRegistration, ToolSpec};
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
@@ -515,6 +516,40 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
     assert!(output.contains("Error: request timed out waiting for response headers"));
     assert!(output.contains("(subagent did not produce any final assistant text)"));
     assert!(output.contains(SUBAGENT_PARENT_SUMMARY_REMINDER));
+}
+
+#[test]
+fn subagent_depth_rejects_task_orchestration_execution() {
+    crate::ai::driver::runtime_ctx::SUBAGENT_DEPTH.sync_scope(1, || {
+        for (tool_name, result) in [
+            (
+                "task_spawn",
+                execute_task_spawn(&serde_json::json!({
+                    "description": "nested",
+                    "prompt": "should not run"
+                })),
+            ),
+            (
+                "task_wait",
+                execute_task_wait(&serde_json::json!({ "task_ids": ["task_parent"] })),
+            ),
+            ("task_status", execute_task_status(&serde_json::json!({}))),
+            (
+                "task_cancel",
+                execute_task_cancel(&serde_json::json!({ "task_ids": ["task_parent"] })),
+            ),
+        ] {
+            let err = result.expect_err("subagent task orchestration should be rejected");
+            assert!(
+                err.contains(tool_name),
+                "error should name {tool_name}: {err}"
+            );
+            assert!(
+                err.contains("top-level agents") && err.contains("leaf task"),
+                "error should explain subagent leaf-task boundary: {err}"
+            );
+        }
+    });
 }
 
 #[test]

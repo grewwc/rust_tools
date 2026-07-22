@@ -854,11 +854,10 @@ fn commit_visible_content(
     } else {
         content
     };
-    let text = text.trim_matches('\n');
     current_history.reserve(text.len());
     state.content.assistant_text.reserve(text.len());
-    current_history.push_str(text);
-    state.content.assistant_text.push_str(text);
+    current_history.push_str(&text);
+    state.content.assistant_text.push_str(&text);
 
     Ok(())
 }
@@ -1554,10 +1553,9 @@ fn unseen_suffix_after_visible_overlap(existing: &str, incoming: &str) -> Option
 
 /// 空白容忍的后缀去重。
 ///
-/// `commit_visible_content` 会对每段内容做 `trim_matches('\n')`，纯空白 delta
-/// 也不会累积进 `assistant_text`，因此 `assistant_text` 相对 `response.output_text.done`
-/// 快照会丢失段间换行。此时精确的 `ends_with` 与 `unseen_suffix_after_visible_overlap`
-/// 都会失败，导致整段已流式输出的快照被当作新内容重复输出。
+/// 兼容旧历史/异常 provider 产生的空白差异：当 `assistant_text` 与最终
+/// `response.output_text.done` 快照仅在空白上不一致时，仍避免把已流式输出的整段
+/// 快照当作新内容重复追加。
 ///
 /// 这里按"空白可跳过"的方式逐字符对齐 existing 与 incoming，找出 incoming 中已被
 /// existing 覆盖的前缀，返回 incoming 剩余的（保留原始空白）尾部。若 incoming 的可见

@@ -18,7 +18,6 @@ const HISTORY_PREVIEW_DEFAULT_COUNT: usize = 6;
 const HISTORY_PREVIEW_FULL_COUNT: usize = 20;
 const HISTORY_PREVIEW_MAX_COUNT: usize = 20;
 const HISTORY_PREVIEW_MAX_CHARS: usize = 160;
-const HISTORY_PREVIEW_FULL_MAX_CHARS: usize = 320;
 const HISTORY_GREP_HIGHLIGHT_START: &str = "\x1b[1;93m";
 const HISTORY_GREP_HIGHLIGHT_END: &str = "\x1b[0m";
 
@@ -374,17 +373,13 @@ fn render_history_preview(
     options: HistoryPreviewOptions,
 ) -> Result<String, Box<dyn Error>> {
     let grep = options.grep.clone();
+    let full = options.full;
     let label = match options.role_filter {
         HistoryRoleFilter::All => "message(s)",
         HistoryRoleFilter::User => "user message(s)",
         HistoryRoleFilter::Assistant => "assistant message(s)",
         HistoryRoleFilter::Tool => "tool message(s)",
         HistoryRoleFilter::System => "system message(s)",
-    };
-    let max_chars = if options.full {
-        HISTORY_PREVIEW_FULL_MAX_CHARS
-    } else {
-        HISTORY_PREVIEW_MAX_CHARS
     };
     let grep_suffix = options
         .grep
@@ -402,7 +397,18 @@ fn render_history_preview(
         total, label, grep_suffix
     );
     for (idx, item) in shown.iter().enumerate() {
-        let content = summarize_history_content(&item.message.content, max_chars, grep.as_deref());
+        let content = if full {
+            highlight_history_keyword(
+                &searchable_history_content(&item.message.content),
+                grep.as_deref(),
+            )
+        } else {
+            summarize_history_content(
+                &item.message.content,
+                HISTORY_PREVIEW_MAX_CHARS,
+                grep.as_deref(),
+            )
+        };
         let marker = item
             .user_ordinal
             .map(|ordinal| format!(" (u{ordinal})"))
@@ -468,7 +474,7 @@ fn collect_history_messages(
     options: HistoryPreviewOptions,
 ) -> Result<Vec<HistoryPreviewItem>, Box<dyn Error>> {
     let history_file = active_history_path(app);
-    let messages = history::build_message_arr(usize::MAX, &history_file)?;
+    let messages = history::build_message_arr_for_history_view(&history_file)?;
     let mut user_ordinal = 0usize;
     let filtered = messages
         .into_iter()
@@ -1515,6 +1521,99 @@ mod tests {
         assert!(!rendered.contains("assistant reply"));
 
         let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn render_history_preview_full_preserves_complete_user_message() {
+        let history_path = std::env::temp_dir().join(format!(
+            "ai-history-full-user-message-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+        let content = format!("first line\n{}\nEND_OF_USER_INPUT", "x".repeat(400));
+        append_history_messages(&history_path, &[test_message("user", &content)]).unwrap();
+
+        let preview = render_history_preview(
+            &app,
+            HistoryPreviewOptions {
+                count: 6,
+                role_filter: HistoryRoleFilter::User,
+                full: false,
+                grep: None,
+            },
+        )
+        .unwrap();
+        assert!(!preview.contains("END_OF_USER_INPUT"));
+        assert!(preview.contains("..."));
+
+        let full = render_history_preview(
+            &app,
+            HistoryPreviewOptions {
+                count: 20,
+                role_filter: HistoryRoleFilter::User,
+                full: true,
+                grep: None,
+            },
+        )
+        .unwrap();
+        assert!(full.contains(&content));
+        assert!(full.contains("END_OF_USER_INPUT (u1)"));
+        assert!(!full.contains("..."));
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn render_history_preview_expands_archived_user_messages() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-history-archived-preview-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let history_path = root.join("history.sqlite");
+        let archive_path = root.join("overflow-history.md");
+        std::fs::write(
+            &archive_path,
+            "# 溢出对话历史\n\n---\n\n## 用户\n\nfirst archived user input\n\n## 助手\n\narchived answer\n\n## 用户\n\nsecond archived user input\n",
+        )
+        .unwrap();
+
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+        let archive_note = format!(
+            "长期记忆归档：更早的原始对话已移出上下文窗口。\n归档文件: {}",
+            archive_path.display()
+        );
+        append_history_messages(
+            &history_path,
+            &[
+                test_message("internal_note", &archive_note),
+                // 旧会话可能重复保存同一个回指，完整历史只能展开一次。
+                test_message("internal_note", &archive_note),
+                test_message("user", "current inline user input"),
+            ],
+        )
+        .unwrap();
+
+        let rendered = render_history_preview(
+            &app,
+            HistoryPreviewOptions {
+                count: 6,
+                role_filter: HistoryRoleFilter::User,
+                full: false,
+                grep: None,
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.contains("Showing 3 recent user message(s)"));
+        assert!(rendered.contains("first archived user input (u1)"));
+        assert!(rendered.contains("second archived user input (u2)"));
+        assert!(rendered.contains("current inline user input (u3)"));
+        assert_eq!(rendered.matches("first archived user input").count(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -43,3 +43,15 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
 pub(crate) fn baseline_tool_names() -> &'static [&'static str] {
     BASELINE_TOOL_NAMES
 }
+
+const SUBAGENT_ORCHESTRATION_TOOL_NAMES: &[&str] = &[
+    "task",
+    "task_spawn",
+    "task_wait",
+    "task_status",
+    "task_cancel",
+];
+
+pub(crate) fn is_subagent_orchestration_tool_name(name: &str) -> bool {
+    SUBAGENT_ORCHESTRATION_TOOL_NAMES.contains(&name)
+}

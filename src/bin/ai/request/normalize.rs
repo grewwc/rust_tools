@@ -7,6 +7,7 @@
 //! - `normalize_message_content_for_text_only_model`：纯文本模型降级
 //! - `normalize_messages_for_model`：模型特定的消息归一化
 
+use rustc_hash::FxHashSet;
 use serde_json::Value;
 
 use crate::ai::history::{
@@ -234,6 +235,29 @@ fn is_context_checkpoint_marker(message: &Message) -> bool {
             .content
             .as_str()
             .is_some_and(|text| text.trim_start().starts_with("[context_checkpoint "))
+}
+
+fn context_checkpoint_marker_key(marker: &str) -> String {
+    const PREFIX: &str = "[context_checkpoint path=";
+    let trimmed = marker.trim_start();
+    let path = trimmed
+        .strip_prefix(PREFIX)
+        .and_then(|rest| rest.split(']').next())
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    path.unwrap_or(trimmed).to_string()
+}
+
+fn dedupe_context_checkpoint_markers_by_path(markers: Vec<String>) -> Vec<String> {
+    let mut seen = FxHashSet::default();
+    let mut deduped_newest_first = Vec::with_capacity(markers.len());
+    for marker in markers.into_iter().rev() {
+        if seen.insert(context_checkpoint_marker_key(&marker)) {
+            deduped_newest_first.push(marker);
+        }
+    }
+    deduped_newest_first.reverse();
+    deduped_newest_first
 }
 
 pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
@@ -602,7 +626,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         merged_first.content = Value::String(content);
     }
 
-    let checkpoint_markers = checkpoint_markers
+    let checkpoint_markers = dedupe_context_checkpoint_markers_by_path(checkpoint_markers)
         .into_iter()
         .rev()
         .take(REQUEST_CONTEXT_CHECKPOINT_LIMIT)

@@ -616,15 +616,14 @@ fn output_text_done_snapshot_with_leading_whitespace_does_not_duplicate_answer()
 }
 
 #[test]
-fn output_text_done_snapshot_does_not_duplicate_when_inter_paragraph_newlines_dropped() {
+fn output_text_stream_preserves_inter_paragraph_newlines_without_snapshot_duplication() {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
     let mut current_history = String::new();
 
-    // responses 协议分段输出：正文 -> 纯换行 -> 下一段。纯换行 delta 会被丢弃，
-    // commit_visible_content 还会 trim 掉每段换行，使 assistant_text 相对最终 .done
-    // 快照缺少段间换行。此前会整段重复输出，修复后应只保留已流式渲染的内容。
+    // responses 协议分段输出：正文 -> 纯换行 -> 下一段。纯换行是正文格式的一部分，
+    // 必须原样进入 assistant_text；最终 .done 快照只用于去重，不能再次追加整段内容。
     process_stream_payload(
         &mut app,
         &mut current_history,
@@ -668,11 +667,11 @@ fn output_text_done_snapshot_does_not_duplicate_when_inter_paragraph_newlines_dr
 
     assert_eq!(
         current_history,
-        "有问题，而且问题不在 a.rs 本身。核心是 Agent 的收敛机制过于宽松。"
+        "有问题，而且问题不在 a.rs 本身。\n\n核心是 Agent 的收敛机制过于宽松。"
     );
     assert_eq!(
         state.content.assistant_text,
-        "有问题，而且问题不在 a.rs 本身。核心是 Agent 的收敛机制过于宽松。"
+        "有问题，而且问题不在 a.rs 本身。\n\n核心是 Agent 的收敛机制过于宽松。"
     );
 }
 

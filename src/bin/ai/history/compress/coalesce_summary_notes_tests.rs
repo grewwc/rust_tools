@@ -35,7 +35,7 @@ fn archive_note() -> Message {
     note("长期记忆归档: 见 overflow-history.md（原文已归档）")
 }
 
-/// note 合计 ≤ 2 条时不应改写（返回值须与入参逐条相等，避免无谓落盘）。
+/// 正常的一对摘要 + 归档 note 不应改写（返回值须与入参逐条相等，避免无谓落盘）。
 #[test]
 fn coalesce_leaves_small_histories_untouched() {
     let input = vec![
@@ -46,7 +46,51 @@ fn coalesce_leaves_small_histories_untouched() {
         msg("assistant", "ok"),
     ];
     let out = coalesce_accumulated_summary_notes(input.clone());
-    assert_eq!(out, input, "note 合计=2 不应触发折叠");
+    assert_eq!(out, input, "正常 note 对不应触发折叠");
+}
+
+/// 即使没有摘要，两条完全相同的归档指针也必须收敛，覆盖历史文件开头出现两条
+/// 相同 `internal_note` 的最小复现。
+#[test]
+fn coalesce_dedups_two_identical_archive_notes() {
+    let input = vec![archive_note(), archive_note(), msg("user", "继续")];
+    let out = coalesce_accumulated_summary_notes(input);
+
+    assert_eq!(
+        out.iter().filter(|m| is_archive_note_message(m)).count(),
+        1,
+        "相同归档指针应只保留一条"
+    );
+    assert!(out.iter().any(|m| m.role == "user"));
+}
+
+/// 不同归档路径可能来自会话导入/迁移，不能为了清理上下文而误删。
+#[test]
+fn coalesce_preserves_distinct_archive_notes() {
+    let first = archive_note();
+    let second = note("长期记忆归档: 见 imported-overflow-history.md（原文已归档）");
+    let input = vec![first, second, msg("user", "继续")];
+    let out = coalesce_accumulated_summary_notes(input.clone());
+
+    assert_eq!(out, input, "不同归档指针必须全部保留");
+}
+
+/// 写入端自身必须幂等，不能依赖下一轮请求入口再清理刚生成的重复 note。
+#[test]
+fn archive_note_insertion_is_idempotent() {
+    let archive_text = value_to_string(&archive_note().content);
+    let mut messages = vec![summary_note("目标 A"), archive_note(), msg("user", "继续")];
+
+    insert_archive_note_if_missing(&mut messages, archive_text);
+
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| is_archive_note_message(m))
+            .count(),
+        1,
+        "重复注入相同归档指针必须是 no-op"
+    );
 }
 
 /// 堆积多对「摘要 + 归档」note 应被折叠为单条合并摘要 + 单条归档指针，

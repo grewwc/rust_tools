@@ -1,3 +1,4 @@
+mod archive;
 mod blob;
 mod checkpoint;
 pub(crate) mod compress;
@@ -91,6 +92,15 @@ pub(in crate::ai) fn is_internal_note_role(role: &str) -> bool {
 
 pub(in crate::ai) fn is_system_like_role(role: &str) -> bool {
     types::is_system_like_role(role)
+}
+
+/// `/history` 人工查看入口需要展示完整会话，而不是只展示压缩后留在主历史库里的
+/// inline 消息。归档仅在查看时展开，不进入模型上下文，也不参与 rewind 写回。
+pub(in crate::ai) fn build_message_arr_for_history_view(
+    history_file: &Path,
+) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    let messages = build_message_arr(usize::MAX, history_file)?;
+    Ok(archive::expand_overflow_archives(messages))
 }
 
 pub(in crate::ai) fn build_context_history(
@@ -314,12 +324,18 @@ async fn compact_session_history_with_app_inner(
         let exceeds_context_budget = app.config.history_max_chars > 0
             && sqlite::total_message_chars_sqlite(history_file.as_path())?
                 > app.config.history_max_chars;
+        let exceeds_tool_evidence_budget = sqlite::compressed_tool_evidence_chars_sqlite(
+            history_file.as_path(),
+        )? > compress::compressed_tool_evidence_inline_chars_limit();
         let threshold = if at_boundary {
             crate::ai::history::compress::persisted_history_keep_recent_turns()
         } else {
             MAX_HISTORY_TURNS
         };
-        if user_turns <= threshold && !exceeds_context_budget {
+        if user_turns <= threshold
+            && !exceeds_context_budget
+            && !exceeds_tool_evidence_budget
+        {
             return Ok(());
         }
     }
@@ -342,7 +358,9 @@ async fn compact_session_history_with_app_inner(
     let original_chars = messages_total_chars_pub(&messages);
     let exceeds_context_budget =
         app.config.history_max_chars > 0 && original_chars > app.config.history_max_chars;
-    let compacted = if exceeds_context_budget {
+    let exceeds_tool_evidence_budget =
+        compress::compressed_tool_evidence_exceeds_inline_budget(&messages);
+    let compacted = if exceeds_context_budget || exceeds_tool_evidence_budget {
         // 与下一轮 `build_context_history` 使用完全相同的压缩策略，并把结果写回
         // history。原始的大块内容会进入 session assets，stub 保留可精确读回的
         // 路径和预览；因此降低重复压缩成本不会损失可召回的信息。
@@ -373,6 +391,8 @@ async fn compact_session_history_with_app_inner(
     }
     let reason = if exceeds_context_budget {
         "context-budget"
+    } else if exceeds_tool_evidence_budget {
+        "tool-evidence-budget"
     } else {
         "turn-count"
     };

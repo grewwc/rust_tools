@@ -948,6 +948,7 @@ pub(crate) fn format_finished_task(entry: &AsyncTaskEntry, result: StoredTaskRes
 }
 
 pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
+    ensure_top_level_task_orchestration("task_spawn")?;
     let prepared = prepare_subagent_task(args)?;
     let spawned = spawn_subagent_kernel_task(&prepared)?;
 
@@ -1030,7 +1031,17 @@ fn execute_tool_cancel_placeholder(_args: &Value) -> Result<String, String> {
     Err("tool_cancel is handled by the runtime".to_string())
 }
 
+fn ensure_top_level_task_orchestration(tool_name: &str) -> Result<(), String> {
+    if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "{tool_name} is only available to top-level agents. This subagent is a leaf task; complete the assigned work directly instead of waiting on, inspecting, or cancelling parent-owned subagent tasks."
+    ))
+}
+
 pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
+    ensure_top_level_task_orchestration("task_wait")?;
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let task_ids = args["task_ids"]
         .as_array()
@@ -1497,6 +1508,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
 });
 
 pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
+    ensure_top_level_task_orchestration("task_cancel")?;
     let task_ids = args["task_ids"]
         .as_array()
         .ok_or("Missing 'task_ids' array parameter")?
@@ -1610,6 +1622,7 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
 }
 
 pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
+    ensure_top_level_task_orchestration("task_status")?;
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let tracked = {
         let registry = TASK_REGISTRY.lock().unwrap();

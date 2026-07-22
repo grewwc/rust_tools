@@ -117,7 +117,14 @@ pub(in crate::ai) fn persisted_history_keep_recent_turns() -> usize {
 /// messages 里那条仅是同 turn 内被 LLM 看到的"冗余 inline 副本"。
 /// 长 session 累计上千 turn 时这些 inline 副本会单调膨胀，需要滑窗剪裁。
 const MAX_SELF_NOTES_IN_MESSAGES: usize = 8;
+/// 旧工具组的机械证据在模型上下文中逐字保留的总字符上限。
+/// 更早的证据会零压缩追加到 overflow-history.md，只在 messages 中保留统一回指。
+const MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS: usize = 12_000;
 const CONTEXT_CHECKPOINT_MARKER_PREFIX: &str = "[context_checkpoint";
+
+pub(in crate::ai) fn compressed_tool_evidence_inline_chars_limit() -> usize {
+    MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS
+}
 
 /// 仅保留最近 `keep_recent` 条 internal_note 中的 `self_note:` 条目。
 /// 其他 internal_note（如 cache 提示、loop-breaker、历史摘要）不在剪裁范围。
@@ -272,6 +279,79 @@ fn archive_trimmed_compressed_tool_evidence(message: &Message, overflow_dir: Opt
     let _ = sink.flush();
 }
 
+pub(in crate::ai) fn compressed_tool_evidence_exceeds_inline_budget(
+    messages: &[Message],
+) -> bool {
+    messages
+        .iter()
+        .filter(|message| is_compressed_tool_evidence_note(message))
+        .map(message_billable_chars)
+        .sum::<usize>()
+        > MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS
+}
+
+/// 工具组折叠 note 是旧证据的短期召回窗口，而不是永久逐条内联的账本。
+/// 保留能装入固定字符预算的最近连续窗口；更早 note 先零压缩归档，写入成功后
+/// 才从 messages 删除。这样长工具链不会用上百条约 1 KiB 的 note 挤占上下文。
+fn trim_compressed_tool_evidence_to_inline_budget(
+    mut messages: Vec<Message>,
+    overflow_dir: Option<&Path>,
+) -> Vec<Message> {
+    if !compressed_tool_evidence_exceeds_inline_budget(&messages) {
+        return messages;
+    }
+    let Some(overflow_dir) = overflow_dir else {
+        return messages;
+    };
+
+    let evidence_sizes: Vec<usize> = messages
+        .iter()
+        .filter(|message| is_compressed_tool_evidence_note(message))
+        .map(message_billable_chars)
+        .collect();
+    let mut keep_from = evidence_sizes.len();
+    let mut kept_chars = 0usize;
+    for (index, chars) in evidence_sizes.iter().enumerate().rev() {
+        if keep_from == evidence_sizes.len()
+            || kept_chars.saturating_add(*chars)
+                <= MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS
+        {
+            keep_from = index;
+            kept_chars = kept_chars.saturating_add(*chars);
+        } else {
+            break;
+        }
+    }
+    if keep_from == 0 {
+        return messages;
+    }
+
+    let dropped: Vec<Message> = messages
+        .iter()
+        .filter(|message| is_compressed_tool_evidence_note(message))
+        .take(keep_from)
+        .cloned()
+        .collect();
+    let mut sink = OverflowSink::new(overflow_dir);
+    sink.push_messages(&dropped);
+    if !sink.flush() {
+        return messages;
+    }
+
+    let mut evidence_ordinal = 0usize;
+    messages.retain(|message| {
+        if !is_compressed_tool_evidence_note(message) {
+            return true;
+        }
+        let keep = evidence_ordinal >= keep_from;
+        evidence_ordinal += 1;
+        keep
+    });
+    let archive_note = build_overflow_placeholder(&sink.file_path().to_string_lossy());
+    insert_archive_note_if_missing(&mut messages, archive_note);
+    messages
+}
+
 fn build_overflow_placeholder(file_path: &str) -> String {
     let mut out = String::new();
     out.push_str(
@@ -297,6 +377,10 @@ pub(in crate::ai) fn compress_messages_for_context(
     if max_chars == 0 || messages.is_empty() {
         return messages;
     }
+
+    // compressed_tool_round note 本身也是压缩产物；若不设独立上限，它们会在
+    // 全局 history 预算触发前逐条累积，形成另一种线性上下文膨胀。
+    messages = trim_compressed_tool_evidence_to_inline_budget(messages, overflow_dir.as_deref());
 
     // 在做大块压缩前先剪 self_note 滑动上限，避免上千轮 turn 累积的
     // self_note（已写入 MemoryStore，messages 里那条仅是冗余备份）
@@ -430,25 +514,29 @@ fn sanitize_persisted_history_messages(messages: Vec<Message>) -> Vec<Message> {
 /// 折叠策略（无损）：
 /// - **摘要 note**：把每条正文（去 header 后）按原顺序去重拼接成**一条**，放回
 ///   第一条摘要原来的位置。不同轮次挤出窗口时各自记录的"初始目标"因此全部保留。
-/// - **归档指针 note**：内容完全相同的只保留一条（overflow 归档文件路径唯一，
-///   去重无损），紧跟合并后的摘要。
+/// - **归档指针 note**：内容完全相同的只保留一条，内容不同的全部保留，紧跟
+///   合并后的摘要，避免导入/迁移会话时丢失指向其他归档文件的回指。
 /// - 其余消息一律原样保留、顺序不变（绝不触碰非摘要/归档消息）。
 ///
-/// 仅当摘要 + 归档 note 合计 > 2 条时才折叠，避免对正常历史做无谓改写
-/// （返回值与入参逐条相等时，上层 `compacted == messages` 判定会跳过落盘）。
+/// 仅当摘要超过一条或存在内容完全相同的归档指针时才折叠，避免对正常历史做
+/// 无谓改写（返回值与入参逐条相等时，上层 `compacted == messages` 判定会跳过落盘）。
 fn coalesce_accumulated_summary_notes(messages: Vec<Message>) -> Vec<Message> {
-    let note_count = messages
+    let summary_count = messages.iter().filter(|m| is_summary_message(m)).count();
+    let mut seen_archive_texts = rustc_hash::FxHashSet::default();
+    let has_duplicate_archive = messages
         .iter()
-        .filter(|m| is_summary_or_archive_note(m))
-        .count();
-    if note_count <= 2 {
+        .filter(|m| is_archive_note_message(m))
+        .map(|m| value_to_string(&m.content))
+        .any(|text| !seen_archive_texts.insert(text));
+    if summary_count <= 1 && !has_duplicate_archive {
         return messages;
     }
 
-    // 合并所有摘要正文（去重、保序）。
+    // 合并所有摘要正文，并对内容完全相同的归档指针去重；两者都保持原顺序。
     let mut merged_bodies: Vec<String> = Vec::new();
     let mut first_summary_role: Option<String> = None;
-    let mut archive_note: Option<Message> = None;
+    let mut archive_notes: Vec<Message> = Vec::new();
+    let mut seen_archive_texts = rustc_hash::FxHashSet::default();
     for m in &messages {
         if is_summary_message(m) {
             if first_summary_role.is_none() {
@@ -460,8 +548,11 @@ fn coalesce_accumulated_summary_notes(messages: Vec<Message>) -> Vec<Message> {
             if !body.is_empty() && !merged_bodies.iter().any(|b| b == body) {
                 merged_bodies.push(body.to_string());
             }
-        } else if is_archive_note_message(m) && archive_note.is_none() {
-            archive_note = Some(m.clone());
+        } else if is_archive_note_message(m) {
+            let text = value_to_string(&m.content);
+            if seen_archive_texts.insert(text) {
+                archive_notes.push(m.clone());
+            }
         }
     }
 
@@ -480,7 +571,7 @@ fn coalesce_accumulated_summary_notes(messages: Vec<Message>) -> Vec<Message> {
         })
     };
 
-    // 重建序列：在"第一条摘要/归档 note"的位置放入合并摘要 + 单一归档指针，
+    // 重建序列：在"第一条摘要/归档 note"的位置放入合并摘要 + 去重后的归档指针，
     // 丢弃其余摘要/归档 note，其他消息原样保留。
     let mut out = Vec::with_capacity(messages.len());
     let mut inserted = false;
@@ -490,12 +581,10 @@ fn coalesce_accumulated_summary_notes(messages: Vec<Message>) -> Vec<Message> {
                 if let Some(summary) = merged_summary.clone() {
                     out.push(summary);
                 }
-                if let Some(archive) = archive_note.clone() {
-                    out.push(archive);
-                }
+                out.extend(archive_notes.iter().cloned());
                 inserted = true;
             }
-            // 其余重复摘要/归档 note 丢弃。
+            // 其余摘要及已收集的归档 note 丢弃。
         } else {
             out.push(m);
         }
@@ -509,6 +598,29 @@ fn is_summary_or_archive_note(m: &Message) -> bool {
 
 fn is_archive_note_message(m: &Message) -> bool {
     is_system_like_role(&m.role) && is_archive_note_text(&value_to_string(&m.content))
+}
+
+/// 在 leading summary 后注入归档回指；相同回指已存在时保持幂等，避免每轮压缩
+/// 都在上下文头部追加一条完全相同的 `internal_note`。
+fn insert_archive_note_if_missing(messages: &mut Vec<Message>, archive_note: String) {
+    let already_present = messages.iter().any(|message| {
+        is_archive_note_message(message) && value_to_string(&message.content) == archive_note
+    });
+    if already_present {
+        return;
+    }
+
+    let archive_idx = messages.len().min(1);
+    messages.insert(
+        archive_idx,
+        Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(archive_note),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    );
 }
 
 pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Message> {
@@ -917,19 +1029,7 @@ fn shrink_messages_to_fit_with_summary(
                         "长期记忆摘要（压缩保留）:\n较早原始对话已移出当前窗口；如果当前问题依赖前文细节，请读取归档文件。".to_string()
                     });
 
-                if has_leading_summary_now {
-                    let archive_idx = messages.len().min(1);
-                    messages.insert(
-                        archive_idx,
-                        Message {
-                            role: ROLE_INTERNAL_NOTE.to_string(),
-                            content: Value::String(archive_note),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: None,
-                        },
-                    );
-                } else {
+                if !has_leading_summary_now {
                     messages.insert(
                         0,
                         Message {
@@ -940,18 +1040,8 @@ fn shrink_messages_to_fit_with_summary(
                             reasoning_content: None,
                         },
                     );
-                    let archive_idx = messages.len().min(1);
-                    messages.insert(
-                        archive_idx,
-                        Message {
-                            role: ROLE_INTERNAL_NOTE.to_string(),
-                            content: Value::String(archive_note),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: None,
-                        },
-                    );
                 }
+                insert_archive_note_if_missing(&mut messages, archive_note);
             } else {
                 // flush 失败：绝不删历史。把本轮已从 messages 移除、但尚未成功
                 // 落盘的 dropped 按原相对顺序放回头部（dropped 在循环中按时间升序
@@ -1099,8 +1189,10 @@ pub(in crate::ai) fn mid_turn_compress(
     overflow_dir: Option<&Path>,
 ) -> (Vec<Message>, usize, usize) {
     let before = messages_total_chars(&messages);
-    if before <= soft_threshold {
-        return (messages, before, before);
+    let messages = trim_compressed_tool_evidence_to_inline_budget(messages, overflow_dir);
+    let after_evidence_trim = messages_total_chars(&messages);
+    if after_evidence_trim <= soft_threshold {
+        return (messages, before, after_evidence_trim);
     }
     let mut out = messages;
     // 0. 清理过期 reasoning_content：单 turn 内 LLM 多次返回的 reasoning chain

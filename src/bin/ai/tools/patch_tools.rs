@@ -17,7 +17,7 @@ fn params_apply_patch() -> Value {
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "Absolute target path for a single-file unified diff. Optional for a Begin Patch envelope. Do not provide it for a multi-file envelope; each section declares its own path. `path` is accepted as a compatibility alias."
+                "description": "Absolute target path for a single-file unified diff. Not needed (and ignored) when using a Begin Patch envelope, since each section declares its own target path. `path` is accepted as a compatibility alias."
             },
             "patch": {
                 "type": "string",
@@ -953,11 +953,16 @@ fn locate_hunk_with_fuzzy_context(
     }
 
     let nominal = hunk.old_start.saturating_sub(1);
-    if hunk.old_start > 0
-        && best_score > 0
-        && let Some(candidate) = best.iter().find(|candidate| candidate.pos == nominal)
-    {
-        return Ok(Some(*candidate));
+    // 用 old_start 作为消歧信号：只要 nominal 候选的 context 分数接近最优
+    // （差值 ≤ 1），就信任模型标注的行号。best_score == 0 时（上下文行完全
+    // 无法区分候选位置）也接受——此时 old_start 是唯一可用的定位信号，
+    // 拒绝只会导致模型无限重试相同的 generic context。
+    if hunk.old_start > 0 && nominal < orig_lines.len() {
+        if let Some(nominal_candidate) = candidates.iter().find(|c| c.pos == nominal) {
+            if best_score == 0 || nominal_candidate.context_matches + 1 >= best_score {
+                return Ok(Some(*nominal_candidate));
+            }
+        }
     }
 
     let shown: Vec<String> = candidates
@@ -1306,22 +1311,12 @@ fn locate_hunk(
     }
 
     // 标称位置匹配不上时，先检查全文件范围内有多少处能匹配：
-    // 多处匹配说明 hunk 的 context 不足以唯一定位，强行用第一处会改错地方。
+    // 多处匹配时返回 None，让调用方的级联逻辑尝试更宽松的模式：
+    // IgnoreIndent → fuzzy context（后者有标称位置消歧 + 上下文评分）。
     let positions = all_hunk_match_positions(orig_lines, hunk, mode);
     let forward: Vec<usize> = positions.iter().copied().filter(|&p| p >= cursor).collect();
     if forward.len() > 1 {
-        let shown: Vec<String> = forward
-            .iter()
-            .take(5)
-            .map(|p| (p + 1).to_string())
-            .collect();
-        return Err(format!(
-            "ambiguous patch: hunk context matches {} locations (1-based lines: {}{}). \
-             Add more surrounding context lines to the hunk so it uniquely identifies the target.",
-            forward.len(),
-            shown.join(", "),
-            if forward.len() > 5 { ", ..." } else { "" }
-        ));
+        return Ok(None);
     }
     // forward 已经过滤了 p >= cursor，所以这里不会有 "hunks out of order"。
     // 之前回退到 find_hunk_offset（±50 窗口）会在唯一匹配超出窗口时误报
@@ -1358,9 +1353,9 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
                         hunk,
                         cursor,
                         MatchMode::Strict,
-                    )? {
-                        Some(candidate) => (candidate.pos, MatchMode::Strict, ContextPolicy::Fuzz),
-                        None => match locate_hunk_with_fuzzy_context(
+                    ) {
+                        Ok(Some(candidate)) => (candidate.pos, MatchMode::Strict, ContextPolicy::Fuzz),
+                        _ => match locate_hunk_with_fuzzy_context(
                             &orig_lines,
                             hunk,
                             cursor,
@@ -1694,18 +1689,17 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
     emit("parsing patch envelope");
     let initial_file_path = optional_file_path_arg(args);
     if let Some(envelopes) = parse_patch_envelopes(&patch)? {
-        if envelopes.len() > 1 && initial_file_path.is_some() {
-            return Err(
-                "multi-file Begin Patch envelopes must not also pass `file_path` / `path`. \
-                 Remove the top-level target arg and let each section declare its own file."
-                    .to_string(),
-            );
+        // 信封（无论单文件/多文件）内各 section 已声明各自目标路径，file_path 是
+        // 多余的。模型常在多文件信封时冗余传 file_path，与其硬报错浪费一轮，不如
+        // 静默忽略并用信封路径（信封路径才是权威来源）。
+        if initial_file_path.is_some() {
+            emit("note: ignoring redundant file_path arg; using paths from Begin Patch envelope");
         }
         emit(&format!("parsed {} patch section(s)", envelopes.len()));
         let mut seen_targets = FxHashSet::default();
         let mut writes = Vec::with_capacity(envelopes.len());
         for (idx, envelope) in envelopes.iter().enumerate() {
-            let target_arg = initial_file_path.unwrap_or(envelope.target_path.as_str());
+            let target_arg = envelope.target_path.as_str();
             let store = FileStore::new(PathBuf::from(target_arg));
             emit(&format!(
                 "target [{}/{}]: {}",
@@ -2129,9 +2123,34 @@ mod tests {
 -old target
 +new target
 ";
+        // old_start=1 (1-based) → nominal=0，remove "old target" 在 line 1 匹配。
+        // 即使 context 全部 miss，old_start 仍能消歧——应成功应用。
+        let result = apply_unified_patch(original, patch).expect("should apply via nominal");
+        assert_eq!(
+            result,
+            "alpha current\nnew target\nbeta current\nold target\n",
+            "should replace the FIRST 'old target' (line 1), not the second (line 3)"
+        );
+    }
+
+    #[test]
+    fn apply_unified_patch_fuzzy_context_rejects_when_nominal_not_in_candidates() {
+        // old_start 指向的位置不在候选列表中时，应仍然拒绝。
+        // original: line 0="old target", line 1="xxx", line 2="old target", line 3="yyy"
+        // patch: @@ -2,1 +2,1 @@ — old_start=2 → nominal=1
+        // hunk 只有 remove 行（无 context），remove "xxx" 出现在 line 1。
+        // 但换一种：多个 "old target" 作为 remove，old_start 指向没有匹配的位置。
+        // original: line 0="old target", line 1="aaa", line 2="old target", line 3="bbb"
+        // patch: @@ -3,1 +3,1 @@ — old_start=3 → nominal=2
+        // remove "old target" 匹配 line 0 (pos=0) 和 line 2 (pos=2)
+        // nominal=2 在候选列表中 → 会被接受（正确行为）。
+        // 改为: old_start 指向一个不在文件中的行号。
+        let original = "old target\naaa\nold target\nbbb\n";
+        let patch = "@@ -5,1 +5,1 @@\n-old target\n+changed\n";
+        // old_start=5 → nominal=4, 但文件只有4行 (index 0-3)。
+        // candidates: pos=0 和 pos=2 (old target 匹配)。nominal=4 不在 candidates 中。
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("ambiguous patch"), "err was: {err}");
-        assert!(err.contains("context-fuzz"), "err was: {err}");
     }
 
     #[test]
@@ -2343,7 +2362,8 @@ mod tests {
             execute_apply_patch(&args).expect_err("mismatched target must be rejected")
         });
 
-        assert!(err.contains("patch target mismatch"), "err was: {err}");
+        // file_path 被静默忽略，信封声明 b.txt 为权威目标；b.txt 不存在 → 报缺失文件。
+        assert!(err.contains("b.txt"), "err should mention the envelope target path: {err}");
         let _ = fs::remove_dir_all(base);
     }
 
@@ -2804,11 +2824,13 @@ mod tests {
     fn apply_unified_patch_bare_at_header_requires_unique_match() {
         // 裸 @@ header 没有标称行号，不能把 old_start=0 当成第 1 行的强锚点。
         // 如果上下文在文件中出现多次，应要求模型补充更多上下文，避免静默改错首个位置。
+        // locate_hunk 会返回 None 让级联继续，最终由 locate_hunk_with_fuzzy_context
+        // 报告歧义（因为没有标称位置可用来消歧）。
         let original = "alpha\nbeta\ngamma\nalpha\nbeta\ngamma\n";
         let patch = "@@\n alpha\n-beta\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("ambiguous patch"), "err was: {err}");
-        assert!(err.contains("1-based lines: 1, 4"), "err was: {err}");
+        assert!(err.contains("context-fuzz"), "err was: {err}");
     }
 
     #[test]
@@ -3083,6 +3105,32 @@ mod tests {
                 "patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-old_a\n+new_a\n*** Add File: b.txt\n+hello\n+world\n*** End Patch\n"
             });
             let result = execute_apply_patch(&args).expect("multi-file Begin Patch should succeed");
+            assert!(result.starts_with("Successfully patched 2 files:"), "result: {result}");
+        });
+
+        assert_eq!(fs::read_to_string(&a).unwrap(), "new_a\n");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "hello\nworld");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_multi_file_ignores_redundant_file_path() {
+        // 多文件信封 + 冗余 file_path：模型常在多文件信封时仍传 file_path
+        // （指向其中一个文件）。应静默忽略 file_path，用信封内各 section 自身路径。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("multi_file_redundant_path");
+        let a = base.join("a.txt");
+        let b = base.join("b.txt");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&a, "old_a\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                // 冗余 file_path 应被静默忽略
+                "file_path": a.to_string_lossy(),
+                "patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-old_a\n+new_a\n*** Add File: b.txt\n+hello\n+world\n*** End Patch\n"
+            });
+            let result = execute_apply_patch(&args).expect("multi-file Begin Patch with redundant file_path should succeed");
             assert!(result.starts_with("Successfully patched 2 files:"), "result: {result}");
         });
 

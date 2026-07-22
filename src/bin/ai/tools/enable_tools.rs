@@ -33,6 +33,11 @@ static STATE: LazyLock<RwLock<EnableState>> = LazyLock::new(|| RwLock::new(Enabl
 
 const EXPLICIT_TOOL_DEMOTE_AGE: u32 = 4;
 
+fn subagent_may_enable_tool(name: &str) -> bool {
+    crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
+        || !super::is_subagent_orchestration_tool_name(name)
+}
+
 pub(crate) fn set_active_tool_names(names: Vec<String>) {
     if let Ok(mut s) = STATE.write() {
         s.active_tool_names = names;
@@ -136,10 +141,11 @@ pub(crate) fn drain_pending_mcp_names() -> Vec<String> {
 }
 
 pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
-    let names: Vec<String> = match STATE.write() {
+    let mut names: Vec<String> = match STATE.write() {
         Ok(mut s) => s.pending_enable.drain(..).collect(),
         Err(_) => return Vec::new(),
     };
+    names.retain(|name| subagent_may_enable_tool(name));
     if names.is_empty() {
         return Vec::new();
     }
@@ -173,7 +179,7 @@ fn available_tools_not_active() -> Vec<(String, String)> {
         .unwrap_or_default();
     let mut result = Vec::new();
     for reg in inventory::iter::<ToolRegistration> {
-        if !active.iter().any(|a| a == reg.spec.name) {
+        if subagent_may_enable_tool(reg.spec.name) && !active.iter().any(|a| a == reg.spec.name) {
             result.push((reg.spec.name.to_string(), reg.spec.description.to_string()));
         }
     }
@@ -239,6 +245,11 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             if tool_names.is_empty() {
                 return Err("'tools' array is empty".to_string());
             }
+            let blocked_in_subagent: Vec<String> = tool_names
+                .iter()
+                .filter(|name| !subagent_may_enable_tool(name))
+                .cloned()
+                .collect();
             // 一次写锁内完成读 active/known_mcp + 写 pending_enable/pending_mcp_enable
             // + mark_explicitly_enabled，避免多次锁切换造成的状态拼接错位。
             let mut known_builtin: Vec<&str> = Vec::new();
@@ -263,7 +274,8 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             let unknown: Vec<String> = tool_names
                 .iter()
                 .filter(|n| {
-                    !known_builtin.iter().any(|k| k == n)
+                    !blocked_in_subagent.iter().any(|blocked| blocked == *n)
+                        && !known_builtin.iter().any(|k| k == n)
                         && !known_mcp.iter().any(|k| k == n.as_str())
                 })
                 .cloned()
@@ -271,11 +283,13 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             let explicitly_requested: Vec<String> = tool_names
                 .iter()
                 .filter(|n| !unknown.iter().any(|u| u == *n))
+                .filter(|n| !blocked_in_subagent.iter().any(|blocked| blocked == *n))
                 .cloned()
                 .collect();
             let to_enable: Vec<String> = tool_names
                 .into_iter()
                 .filter(|n| !active.iter().any(|a| a == n.as_str()))
+                .filter(|n| !blocked_in_subagent.iter().any(|blocked| blocked == n))
                 .collect();
             let (mcp_names, builtin_names): (Vec<String>, Vec<String>) = to_enable
                 .iter()
@@ -306,6 +320,12 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             }
             if !unknown.is_empty() {
                 msg.push(format!("Unknown tools (ignored): {}", unknown.join(", ")));
+            }
+            if !blocked_in_subagent.is_empty() {
+                msg.push(format!(
+                    "Unavailable in subagent context (ignored): {}",
+                    blocked_in_subagent.join(", ")
+                ));
             }
             Ok(msg.join("\n"))
         }
@@ -382,5 +402,61 @@ mod tests {
 
         assert!(output.contains("mcp_feishu_docs_get_text_by_url"));
         assert_eq!(pending, vec!["mcp_feishu_docs_get_text_by_url".to_string()]);
+    }
+
+    #[test]
+    fn subagent_list_hides_task_orchestration_tools() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_DEPTH.sync_scope(1, || {
+            let output = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+
+            for hidden in [
+                "task",
+                "task_spawn",
+                "task_wait",
+                "task_status",
+                "task_cancel",
+            ] {
+                assert!(
+                    !output.contains(&format!("  - {hidden}:")),
+                    "{hidden} should not be listed for subagents"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn subagent_enable_ignores_task_orchestration_tools() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_DEPTH.sync_scope(1, || {
+            let output = execute_enable_tools(
+                &json!({"operation": "enable", "tools": ["task_wait", "task_cancel"]}),
+            )
+            .unwrap();
+
+            assert!(output.contains("Unavailable in subagent context"));
+            assert!(output.contains("task_wait"));
+            assert!(output.contains("task_cancel"));
+            assert!(drain_pending_enable().is_empty());
+            assert!(explicit_enabled_tool_names().is_empty());
+
+            if let Ok(mut s) = STATE.write() {
+                s.pending_enable.push("task_wait".to_string());
+            }
+            assert!(
+                drain_pending_enable().is_empty(),
+                "subagent drain must drop task orchestration tools queued by stale state"
+            );
+        });
     }
 }

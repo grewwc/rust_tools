@@ -2035,6 +2035,82 @@ fn normalize_messages_projects_only_recent_context_checkpoints_without_truncatin
 }
 
 #[test]
+fn normalize_messages_dedupes_context_checkpoints_by_path_before_limit() {
+    let mut messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("base system".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("question".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(
+                "[context_checkpoint path=/tmp/checkpoint-0.md] checkpoint 0".to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(
+                "[context_checkpoint path=/tmp/context-checkpoints/working-checkpoint.md] old working plan"
+                    .to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+    for index in 1..=6 {
+        messages.push(Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(format!(
+                "[context_checkpoint path=/tmp/checkpoint-{index}.md] checkpoint {index}"
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
+    messages.push(Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(
+            "[context_checkpoint path=/tmp/context-checkpoints/working-checkpoint.md] new working plan"
+                .to_string(),
+        ),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+
+    let normalized = normalize_messages_for_request(&messages);
+    let checkpoint_context = normalized
+        .iter()
+        .filter_map(|message| message.content.as_str())
+        .find(|content| content.starts_with("[Persistent context checkpoints:"))
+        .expect("checkpoints should be projected into one system message");
+    let checkpoints = checkpoint_context
+        .lines()
+        .filter(|line| line.starts_with("[context_checkpoint "))
+        .collect::<Vec<_>>();
+
+    assert_eq!(checkpoints.len(), 8);
+    assert!(checkpoints[0].contains("checkpoint-0.md"));
+    assert!(checkpoint_context.contains("new working plan"));
+    assert!(!checkpoint_context.contains("old working plan"));
+}
+
+#[test]
 fn openai_image_content_uses_object_image_url_shape() {
     // 仅当 models.json 中存在一个 OpenAi-provider 且 is_vl=true 的模型时
     // 才能验证"以 {image_url:{url:...}} 对象形状下发图像"的协议契约。
