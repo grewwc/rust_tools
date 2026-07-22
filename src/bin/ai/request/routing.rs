@@ -62,24 +62,7 @@ fn parse_router_output(s: &str) -> (Option<String>, f64) {
 }
 
 pub(crate) fn extract_router_content(v: &Value) -> Option<String> {
-    let choices = v
-        .get("choices")
-        .or_else(|| v.get("output").and_then(|o| o.get("choices")))?;
-    let msg = choices.get(0)?.get("message")?;
-    let content = msg.get("content")?;
-    match content {
-        Value::String(s) => Some(s.to_string()),
-        Value::Array(parts) => {
-            let mut out = String::new();
-            for part in parts {
-                if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
-                    out.push_str(s);
-                }
-            }
-            Some(out)
-        }
-        _ => None,
-    }
+    super::protocol::extract_response_text(v)
 }
 
 #[derive(Debug, Clone)]
@@ -152,10 +135,12 @@ Skills:
 
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
+    let http_body =
+        super::protocol::build_http_body_for_request(&control_model, &endpoint, &request_body);
     // 辅助请求（skill 路由），15 秒超时兜底，理由同上。
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
-        .json(&request_body)
+        .json(&http_body)
         .send();
     let response = match tokio::time::timeout(Duration::from_secs(15), send_future).await {
         Ok(r) => r.ok()?,

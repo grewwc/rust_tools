@@ -310,7 +310,7 @@ impl CommandCompleter {
 
     /// `/model effort` 的第三个 token 候选：推理强度档位 + auto/off。
     fn model_effort_levels() -> &'static [&'static str] {
-        &["minimal", "low", "medium", "high", "auto", "off"]
+        &["minimal", "low", "medium", "high", "xhigh", "auto", "off"]
     }
 
     fn session_subcommands() -> &'static [&'static str] {
@@ -1277,7 +1277,7 @@ mod tests {
         let (start, candidates) = CommandCompleter::complete_for_line("/model effort ", 14);
         assert_eq!(start, 14);
         let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
-        for level in ["minimal", "low", "medium", "high", "auto", "off"] {
+        for level in ["minimal", "low", "medium", "high", "xhigh", "auto", "off"] {
             assert!(
                 labels.iter().any(|x| x == level),
                 "expected level `{}` in candidates: {:?}",

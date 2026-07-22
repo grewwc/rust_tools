@@ -268,8 +268,19 @@ pub(in crate::ai) fn format_file_tool_target(tool_name: &str, args_json: &str) -
     match tool_name {
         "read_file" | "write_file" => args
             .get("file_path")
+            .or_else(|| args.get("path"))
             .and_then(|v| v.as_str())
-            .map(short_path),
+            .map(|path| {
+                let short = short_path(path);
+                if tool_name == "read_file" {
+                    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1);
+                    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if limit > 0 {
+                        return format!("{}  lines {}..{}", short, offset, offset + limit.saturating_sub(1));
+                    }
+                }
+                short
+            }),
         "delete_path" => args.get("path").and_then(|v| v.as_str()).map(short_path),
         "apply_patch" => {
             // 优先从 file_path / path 参数取

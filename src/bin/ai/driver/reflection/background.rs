@@ -1145,24 +1145,7 @@ fn count_one_off_signals(note: &str, tokens: &[String]) -> usize {
 }
 
 pub(super) fn extract_content(v: &Value) -> Option<String> {
-    let choices = v
-        .get("choices")
-        .or_else(|| v.get("output").and_then(|o| o.get("choices")))?;
-    let msg = choices.get(0)?.get("message")?;
-    let content = msg.get("content")?;
-    match content {
-        Value::String(s) => Some(s.to_string()),
-        Value::Array(parts) => {
-            let mut out = String::new();
-            for part in parts {
-                if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
-                    out.push_str(s);
-                }
-            }
-            Some(out)
-        }
-        _ => None,
-    }
+    request::extract_response_text(v)
 }
 
 fn restore_tools(app: &mut App, saved_tools: Option<Vec<ToolDefinition>>) {
@@ -1195,13 +1178,8 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
     {
         return None;
     }
-    let request_model = crate::ai::models::request_model_name(model);
-    let mut body = json!({
-        "model": request_model,
-        "messages": messages,
-        "stream": false
-    });
-    request::apply_aux_thinking_fields(model, &mut body);
+    let body =
+        request::build_http_body_for_json_messages(model, &endpoint, messages, false, None, false);
     let req =
         request::apply_request_auth(BACKGROUND_HTTP_CLIENT.post(&endpoint), &endpoint, &api_key);
     // 后台反射请求：60 秒超时，避免永久阻塞 daemon 任务
@@ -1250,24 +1228,7 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
 }
 
 pub(super) fn extract_back_content(v: &Value) -> Option<String> {
-    let choices = v
-        .get("choices")
-        .or_else(|| v.get("output")?.get("choices"))?;
-    let msg = choices.get(0)?.get("message")?;
-    let content = msg.get("content")?;
-    match content {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(parts) => {
-            let mut out = String::new();
-            for p in parts {
-                if let Some(s) = p.get("text").and_then(|x| x.as_str()) {
-                    out.push_str(s);
-                }
-            }
-            Some(out)
-        }
-        _ => None,
-    }
+    request::extract_response_text(v)
 }
 
 async fn background_model_should_reflect(

@@ -33,6 +33,9 @@ pub(crate) use error::{
     should_temporarily_disable_auto_selected_model, should_temporarily_disable_model,
     should_try_model_fallback, sleep_with_cancel,
 };
+pub(crate) use protocol::{build_http_body_for_json_messages, extract_response_text};
+#[cfg(test)]
+pub(crate) use reasoning::apply_aux_thinking_fields;
 #[allow(unused_imports)]
 pub(crate) use routing::{extract_router_content, strip_json_fence};
 pub(crate) use thinking::strip_system_reminders;
@@ -45,8 +48,6 @@ pub(crate) use types::{
     RequestBody, StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall, StreamToolCall,
     StreamUsage, merge_reasoning_fragments,
 };
-// 外部 re-export（apply_aux_thinking_fields 被 driver/reflection 调用）
-pub(crate) use reasoning::apply_aux_thinking_fields;
 // 外部 re-export（build_content 被 driver 多处调用）
 #[allow(unused_imports)]
 pub(crate) use builder::{build_content, clamp_max_tokens_for_prompt};

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::Response;
 use rust_tools::commonw;
-use serde_json::json;
+use serde_json::Value;
 
 use super::super::{
     history::{Message, SessionStore, generate_session_summary},
@@ -32,9 +32,8 @@ use super::normalize::{
     strip_unavailable_tool_hints_from_messages,
 };
 use super::reasoning::{
-    apply_aux_thinking_fields, apply_prompt_cache_breakpoint,
-    ensure_reasoning_content_echo_for_thinking_model, prompt_cache_enabled_for_model,
-    resolve_reasoning_effort, resolve_reasoning_wire_controls,
+    apply_prompt_cache_breakpoint, ensure_reasoning_content_echo_for_thinking_model,
+    prompt_cache_enabled_for_model, resolve_reasoning_effort,
 };
 use super::thinking::resolve_thinking;
 use super::token_budget;
@@ -489,38 +488,23 @@ pub async fn do_request_json(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     clear_stale_request_interrupt_before_request(app);
 
-    let request_model = models::request_model_name(model);
-    let mut request_body = json!({
-        "model": request_model,
-        "messages": messages,
-        "stream": stream,
-    });
-
     let endpoint = endpoint_for_request_model(app, model);
+    let request_model = models::request_model_name(model);
     let resolved_reasoning_effort = (!skip_reasoning_effort)
         .then(|| resolve_reasoning_effort(app, model).map(|effort| effort.as_str()))
         .flatten();
-    let (thinking_fields, top_level_reasoning_effort, nested_reasoning) =
-        resolve_reasoning_wire_controls(model, &endpoint, false, resolved_reasoning_effort);
-
-    // 兼容（Qwen 等）provider 默认开启 thinking，会生成超长推理链。
-    // 非流式辅助请求（意图识别、知识整理等）必须等整段生成完才返回响应头，
-    // thinking 链一长就撑爆 60s 超时、重试也只是重复同样的慢生成。
-    // 因此这里显式关闭 thinking，与后台 background_call 保持一致。
-    if let Some(map) = request_body.as_object_mut() {
-        for (key, value) in thinking_fields {
-            map.insert(key, value);
-        }
-        if let Some(value) = top_level_reasoning_effort {
-            map.insert("reasoning_effort".to_string(), json!(value));
-        }
-        if let Some(value) = nested_reasoning {
-            map.insert("reasoning".to_string(), value);
-        }
-    }
+    // 辅助请求固定关闭 thinking，但仍按模型/endpoint 的协议方言生成最终
+    // HTTP body（chat-completions: messages；responses: input）。
+    let request_body = super::protocol::build_http_body_for_json_messages(
+        model,
+        &endpoint,
+        messages,
+        stream,
+        resolved_reasoning_effort,
+        stream,
+    );
 
     for attempt in 1..=REQUEST_MAX_ATTEMPTS {
-        let endpoint = endpoint_for_request_model(app, model);
         let api_key = api_key_for_request_model(app, model);
         let t0 = Instant::now();
         token_budget::wait_for_request_budget(
@@ -626,51 +610,133 @@ pub async fn do_request_json(
 /// `STREAM_RESPONSE_HEADER_TIMEOUT_SECS` 秒没有任何 chunk 才判定卡死。
 ///
 /// 适用于知识整理这类「只需要最终完整 JSON、不需要实时终端渲染」的辅助任务。
+pub(super) fn apply_aux_stream_payload(
+    payload: &str,
+    event_type: Option<&str>,
+    content: &mut String,
+    pending_usage: &mut Option<(String, StreamUsage)>,
+) {
+    let payload = payload.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(payload) {
+        let event_type = event_type
+            .or_else(|| value.get("type").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(event_type) = event_type
+            && apply_responses_stream_event(event_type, &value, content, pending_usage)
+        {
+            return;
+        }
+    }
+    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) {
+        // 捕获 usage：OpenAI 兼容流式把最终 usage 放在 choices 为空的尾包，
+        // 必须在取 choice 之前先 take 出来，否则会漏计。
+        if let Some(usage) = chunk.usage {
+            *pending_usage = Some((chunk.model.clone(), usage.normalized()));
+        }
+        if let Some(choice) = chunk.choices.into_iter().next() {
+            content.push_str(&choice.delta.content);
+        }
+    }
+}
+
+fn apply_responses_stream_event(
+    event_type: &str,
+    value: &Value,
+    content: &mut String,
+    pending_usage: &mut Option<(String, StreamUsage)>,
+) -> bool {
+    let event_type = event_type.to_ascii_lowercase();
+    if event_type == "response.completed" {
+        let response = value.get("response").unwrap_or(value);
+        if let Some(usage_val) = response.get("usage")
+            && let Ok(usage) = serde_json::from_value::<StreamUsage>(usage_val.clone())
+        {
+            let model = response
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            *pending_usage = Some((model, usage.normalized()));
+        }
+        if content.is_empty()
+            && let Some(text) = super::protocol::extract_response_text(response)
+                .or_else(|| super::protocol::extract_response_text(value))
+        {
+            content.push_str(&text);
+        }
+        return true;
+    }
+
+    if event_type.contains("output_text") || event_type.contains("content") {
+        if event_type.ends_with(".delta") {
+            if let Some(delta) = value
+                .get("delta")
+                .or_else(|| value.get("text"))
+                .or_else(|| value.get("content"))
+                .and_then(Value::as_str)
+            {
+                content.push_str(delta);
+            }
+            return true;
+        }
+        if event_type.ends_with(".done") {
+            if content.is_empty()
+                && let Some(text) = value
+                    .get("text")
+                    .or_else(|| value.get("content"))
+                    .and_then(Value::as_str)
+            {
+                content.push_str(text);
+            }
+            return true;
+        }
+    }
+
+    if event_type.contains("refusal") {
+        if event_type.ends_with(".delta") {
+            if let Some(delta) = value
+                .get("delta")
+                .or_else(|| value.get("refusal"))
+                .and_then(Value::as_str)
+            {
+                content.push_str(delta);
+            }
+            return true;
+        }
+        if event_type.ends_with(".done") {
+            if content.is_empty()
+                && let Some(text) = value
+                    .get("refusal")
+                    .or_else(|| value.get("text"))
+                    .and_then(Value::as_str)
+            {
+                content.push_str(text);
+            }
+            return true;
+        }
+    }
+
+    false
+}
+
 pub async fn do_request_text_streaming(
     app: &App,
     model: &str,
     messages: &[serde_json::Value],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    fn apply_stream_payload(
-        payload: &str,
-        content: &mut String,
-        pending_usage: &mut Option<(String, StreamUsage)>,
-    ) {
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            return;
-        }
-        if let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) {
-            // 捕获 usage：OpenAI 兼容流式把最终 usage 放在 choices 为空的尾包，
-            // 必须在取 choice 之前先 take 出来，否则会漏计。
-            if let Some(usage) = chunk.usage {
-                *pending_usage = Some((chunk.model.clone(), usage.normalized()));
-            }
-            if let Some(choice) = chunk.choices.into_iter().next() {
-                content.push_str(&choice.delta.content);
-            }
-        }
-    }
-
     clear_stale_request_interrupt_before_request(app);
 
+    let endpoint = endpoint_for_request_model(app, model);
     let request_model = models::request_model_name(model);
-    let mut request_body = json!({
-        "model": request_model,
-        "messages": messages,
-        "stream": true,
-        // 显式索取流式 usage：DashScope compatible-mode 流式默认不返回 usage，
-        // 不声明 include_usage 就无法统计 token、`/usage` 会漏计本次调用。
-        "stream_options": { "include_usage": true },
-    });
-
-    // 兼容（Qwen 等）provider 默认开启 thinking：流式下推理链以 reasoning_content
-    // 分片到达，而本函数只聚合 delta.content。思考阶段会让 content 长时间为空、
-    // spinner 一直转，表现为"卡死"。consolidate 是结构化 JSON 任务，关闭 thinking。
-    apply_aux_thinking_fields(model, &mut request_body);
+    let request_body = super::protocol::build_http_body_for_json_messages(
+        model, &endpoint, messages, true, None, true,
+    );
 
     for attempt in 1..=REQUEST_MAX_ATTEMPTS {
-        let endpoint = endpoint_for_request_model(app, model);
         let api_key = api_key_for_request_model(app, model);
         let retry_policy = request_retry_policy_for_current_context();
         let estimated_prompt_tokens = token_budget::estimate_json_request_tokens(&request_body);
@@ -751,6 +817,7 @@ pub async fn do_request_text_streaming(
         let mut content = String::new();
         let mut buffer: Vec<u8> = Vec::new();
         let mut sse_event_data = String::new();
+        let mut sse_event_type: Option<String> = None;
         let mut idle_timed_out = false;
         // final chunk 携带的 usage（OpenAI 兼容流式：通常在 choices 为空的尾包返回）。
         let mut pending_usage: Option<(String, StreamUsage)> = None;
@@ -777,11 +844,21 @@ pub async fn do_request_text_streaming(
                 let line = String::from_utf8_lossy(&line);
                 let trimmed = line.trim_end_matches(['\r', '\n']);
                 if trimmed.is_empty() {
-                    apply_stream_payload(&sse_event_data, &mut content, &mut pending_usage);
+                    apply_aux_stream_payload(
+                        &sse_event_data,
+                        sse_event_type.as_deref(),
+                        &mut content,
+                        &mut pending_usage,
+                    );
                     sse_event_data.clear();
+                    sse_event_type = None;
                     continue;
                 }
                 if trimmed.starts_with(':') {
+                    continue;
+                }
+                if let Some(event_type) = trimmed.strip_prefix("event:") {
+                    sse_event_type = Some(event_type.trim_start().to_string());
                     continue;
                 }
                 let Some(payload) = trimmed.strip_prefix("data:") else {
@@ -797,7 +874,9 @@ pub async fn do_request_text_streaming(
         if !buffer.is_empty() {
             let line = String::from_utf8_lossy(&buffer);
             let trimmed = line.trim_end_matches(['\r', '\n']);
-            if let Some(payload) = trimmed.strip_prefix("data:") {
+            if let Some(event_type) = trimmed.strip_prefix("event:") {
+                sse_event_type = Some(event_type.trim_start().to_string());
+            } else if let Some(payload) = trimmed.strip_prefix("data:") {
                 let payload = payload.strip_prefix(' ').unwrap_or(payload);
                 if !sse_event_data.is_empty() {
                     sse_event_data.push('\n');
@@ -805,7 +884,12 @@ pub async fn do_request_text_streaming(
                 sse_event_data.push_str(payload);
             }
         }
-        apply_stream_payload(&sse_event_data, &mut content, &mut pending_usage);
+        apply_aux_stream_payload(
+            &sse_event_data,
+            sse_event_type.as_deref(),
+            &mut content,
+            &mut pending_usage,
+        );
 
         // AIOS: 把本次流式辅助请求的 usage 落账到内核 `/dev/llm`，与主链路一致。
         if let Some((echoed_model, usage)) = pending_usage {

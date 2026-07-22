@@ -874,6 +874,94 @@ fn responses_protocol_dialect_infers_from_endpoint_when_unspecified() {
 }
 
 #[test]
+fn json_messages_aux_body_uses_responses_protocol_for_modelhub_models() {
+    let endpoint = models::endpoint_for_model("gpt-5.5", "");
+    let messages = vec![
+        json!({"role": "system", "content": "Return JSON only."}),
+        json!({"role": "user", "content": "classify this"}),
+    ];
+
+    let body =
+        build_http_body_for_json_messages("gpt-5.5", &endpoint, &messages, false, None, false);
+
+    assert_eq!(body["model"], models::request_model_name("gpt-5.5"));
+    assert!(body.get("messages").is_none());
+    assert_eq!(body["input"][0]["role"], "system");
+    assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    assert_eq!(body["input"][0]["content"][0]["text"], "Return JSON only.");
+    assert_eq!(body["input"][1]["role"], "user");
+    assert_eq!(body["input"][1]["content"][0]["text"], "classify this");
+}
+
+#[test]
+fn extract_response_text_reads_chat_and_responses_outputs() {
+    let chat = json!({
+        "choices": [{
+            "message": {
+                "content": [{"type": "text", "text": "chat text"}]
+            }
+        }]
+    });
+    assert_eq!(extract_response_text(&chat).as_deref(), Some("chat text"));
+
+    let responses_shortcut = json!({
+        "output_text": "shortcut text",
+        "output": []
+    });
+    assert_eq!(
+        extract_response_text(&responses_shortcut).as_deref(),
+        Some("shortcut text")
+    );
+
+    let responses_output = json!({
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "hello"},
+                {"type": "output_text", "text": " world"}
+            ]
+        }]
+    });
+    assert_eq!(
+        extract_response_text(&responses_output).as_deref(),
+        Some("hello world")
+    );
+}
+
+#[test]
+fn aux_stream_payload_reads_responses_text_and_usage_events() {
+    let mut content = String::new();
+    let mut usage = None;
+
+    super::transport::apply_aux_stream_payload(
+        r#"{"delta":"hello"}"#,
+        Some("response.output_text.delta"),
+        &mut content,
+        &mut usage,
+    );
+    super::transport::apply_aux_stream_payload(
+        r#"{"delta":" world"}"#,
+        Some("response.output_text.delta"),
+        &mut content,
+        &mut usage,
+    );
+    super::transport::apply_aux_stream_payload(
+        r#"{"response":{"model":"gpt-5.5","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}}"#,
+        Some("response.completed"),
+        &mut content,
+        &mut usage,
+    );
+
+    assert_eq!(content, "hello world");
+    let (model, usage) = usage.expect("response.completed should capture usage");
+    assert_eq!(model, "gpt-5.5");
+    assert_eq!(usage.prompt_tokens, 11);
+    assert_eq!(usage.completion_tokens, 7);
+    assert_eq!(usage.total_tokens, 18);
+}
+
+#[test]
 fn responses_request_body_omits_assistant_reasoning_from_message_content() {
     // Responses message content 只接受 output_text/refusal；reasoning_content 不得
     // 被回放成 summary_text（会 400），只保留可见回答文本。

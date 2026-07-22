@@ -8,7 +8,7 @@ fn print_model_help() {
     println!("  /model <selector>                   switch to a model");
     println!("                                      e.g. /model deepseek-v4-flash-opencode");
     println!("  /model effort                       show current reasoning effort");
-    println!("  /model effort <minimal|low|medium|high>");
+    println!("  /model effort <minimal|low|medium|high|xhigh>");
     println!("                                      override reasoning effort");
     println!("  /model effort off|none|auto         clear override (use model default)");
     println!();
@@ -73,6 +73,7 @@ fn print_model_list(app: &App) {
                 ReasoningEffort::Low => "effort:low",
                 ReasoningEffort::Medium => "effort:medium",
                 ReasoningEffort::High => "effort:high",
+                ReasoningEffort::XHigh => "effort:xhigh",
             }),
         ]
         .into_iter()
@@ -212,7 +213,7 @@ pub fn try_handle_model_command(
             }
             None => {
                 println!(
-                    "Unknown reasoning effort '{}'. Allowed: minimal, low, medium, high, off, auto.",
+                    "Unknown reasoning effort '{}'. Allowed: minimal, low, medium, high, xhigh, off, auto.",
                     arg
                 );
             }

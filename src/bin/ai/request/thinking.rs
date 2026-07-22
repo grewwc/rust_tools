@@ -244,11 +244,13 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
 
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
+    let http_body =
+        super::protocol::build_http_body_for_request(&control_model, &endpoint, &request_body);
     // 辅助请求（thinking gate），15 秒超时兜底：主 client 无整体 timeout，
     // 仅 connect_timeout 不覆盖“连上但服务端不回响应头”的永久阻塞。
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
-        .json(&request_body)
+        .json(&http_body)
         .send();
     let response = match tokio::time::timeout(Duration::from_secs(15), send_future).await {
         Ok(r) => r.ok()?,

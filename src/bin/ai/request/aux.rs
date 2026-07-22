@@ -152,13 +152,15 @@ pub(crate) async fn summarize_history_via_model(
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
+    let http_body =
+        super::protocol::build_http_body_for_request(&control_model, &endpoint, &request_body);
     // 历史摘要是 turn 收尾的后台辅助请求（任务边界压缩会在每次答案交付后触发）。
     // 主 client 只有 connect_timeout、没有整体 timeout，若摘要模型接受连接后迟迟
     // 不返回响应头，这里的裸 .send()/.text() 会永久阻塞、CPU 0，表现为"答案已输出
     // 但迟迟不回到提示符"的卡死。用显式超时兜底，超时即放弃摘要（保持原始历史）。
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
-        .json(&request_body)
+        .json(&http_body)
         .send();
     let response = match tokio::time::timeout(Duration::from_secs(60), send_future).await {
         Ok(r) => r.ok()?,
@@ -363,10 +365,12 @@ pub(crate) async fn generate_session_title_via_model(
     );
     let endpoint = endpoint_for_request_model(app, &title_model);
     let api_key = api_key_for_request_model(app, &title_model);
+    let http_body =
+        super::protocol::build_http_body_for_request(&title_model, &endpoint, &request_body);
 
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
-        .json(&request_body)
+        .json(&http_body)
         .send();
 
     let response = match tokio::time::timeout(

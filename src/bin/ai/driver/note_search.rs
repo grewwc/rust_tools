@@ -146,13 +146,8 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
 
         // 调用模型
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
-            Ok(response) => {
-                if let Some(content) = response.pointer("/choices/0/message/content") {
-                    content.as_str().unwrap_or("无法解析图片内容").to_string()
-                } else {
-                    "无法获取模型响应".to_string()
-                }
-            }
+            Ok(response) => crate::ai::request::extract_response_text(&response)
+                .unwrap_or_else(|| "无法获取模型响应".to_string()),
             Err(err) => {
                 eprintln!("[note] Failed to analyze image: {}", err);
                 let _ = fs::remove_file(image_path);
@@ -195,9 +190,7 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
             }),
         ];
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
-            Ok(response) => response
-                .pointer("/choices/0/message/content")
-                .and_then(|c| c.as_str())
+            Ok(response) => crate::ai::request::extract_response_text(&response)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or(raw),
@@ -481,10 +474,8 @@ async fn answer_memo_search(
     match crate::ai::request::do_request_json(app, &app.current_model, &messages, false, true).await
     {
         Ok(response) => {
-            let answer = response
-                .pointer("/choices/0/message/content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
+            let answer = crate::ai::request::extract_response_text(&response)
+                .unwrap_or_default()
                 .trim()
                 .to_string();
             if answer.is_empty() {
@@ -835,9 +826,7 @@ pub(super) async fn handle_note_delete(
 
     let chosen =
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
-            Ok(response) => response
-                .pointer("/choices/0/message/content")
-                .and_then(|c| c.as_str())
+            Ok(response) => crate::ai::request::extract_response_text(&response)
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
             Err(err) => {
@@ -1057,9 +1046,7 @@ pub(super) async fn handle_note_edit(
     let mut matched_err: Option<String> = None;
     let chosen =
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
-            Ok(response) => response
-                .pointer("/choices/0/message/content")
-                .and_then(|c| c.as_str())
+            Ok(response) => crate::ai::request::extract_response_text(&response)
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
             Err(err) => {
@@ -1194,9 +1181,7 @@ pub(super) async fn handle_note_edit(
             match crate::ai::request::do_request_json(app, &model, &tidy_messages, false, false)
                 .await
             {
-                Ok(response) => response
-                    .pointer("/choices/0/message/content")
-                    .and_then(|c| c.as_str())
+                Ok(response) => crate::ai::request::extract_response_text(&response)
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty()),
                 Err(err) => {

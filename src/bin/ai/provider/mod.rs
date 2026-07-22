@@ -58,6 +58,8 @@ pub(super) enum ReasoningEffort {
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh", alias = "x_high", alias = "extra_high")]
+    XHigh,
 }
 
 impl ReasoningEffort {
@@ -68,10 +70,11 @@ impl ReasoningEffort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
         }
     }
 
-    /// 解析 CLI / `/model effort` 命令传入的字符串。仅识别四个档位的字面量，
+    /// 解析 CLI / `/model effort` 命令传入的字符串。仅识别五个档位的字面量，
     /// 大小写不敏感；`off`/`none`/`auto` 等控制语义由调用方自行处理。
     pub(super) fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -79,6 +82,7 @@ impl ReasoningEffort {
             "low" => Some(Self::Low),
             "medium" | "mid" => Some(Self::Medium),
             "high" => Some(Self::High),
+            "xhigh" | "extra_high" | "extra-high" => Some(Self::XHigh),
             _ => None,
         }
     }
@@ -162,6 +166,14 @@ mod tests {
             Some(ReasoningEffort::Medium)
         );
         assert_eq!(ReasoningEffort::parse("HIGH"), Some(ReasoningEffort::High));
+        assert_eq!(
+            ReasoningEffort::parse("xhigh"),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            ReasoningEffort::parse("extra-high"),
+            Some(ReasoningEffort::XHigh)
+        );
         assert_eq!(ReasoningEffort::parse(""), None);
         assert_eq!(ReasoningEffort::parse("bogus"), None);
     }
@@ -173,6 +185,7 @@ mod tests {
             ReasoningEffort::Low,
             ReasoningEffort::Medium,
             ReasoningEffort::High,
+            ReasoningEffort::XHigh,
         ] {
             assert_eq!(ReasoningEffort::parse(level.as_str()), Some(level));
         }
@@ -202,6 +215,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(def2.reasoning_effort, Some(ReasoningEffort::High));
+
+        // xhigh 作为最高档位正确反序列化
+        let def_xhigh: ModelDef = serde_json::from_str(
+            r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"xhigh"}"#,
+        )
+        .unwrap();
+        assert_eq!(def_xhigh.reasoning_effort, Some(ReasoningEffort::XHigh));
 
         // "auto" 等同于未设置
         let def3: ModelDef = serde_json::from_str(

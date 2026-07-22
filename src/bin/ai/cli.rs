@@ -112,7 +112,7 @@ const NOTE_SEARCH_USAGE: &str =
     "search knowledge base (memo category) and answer using positional prompt";
 const GENERATE_COMPLETIONS_USAGE: &str =
     "generate shell completion script (bash/zsh/fish) and exit";
-const REASONING_EFFORT_USAGE: &str = "reasoning effort: minimal | low | medium | high | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)";
+const REASONING_EFFORT_USAGE: &str = "reasoning effort: minimal | low | medium | high | xhigh | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)";
 
 fn build_cli_parser() -> TermParser {
     let mut parser = TermParser::new();
@@ -460,7 +460,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
             cli.reasoning_effort_override = Some(Some(level));
         } else {
             eprintln!(
-                "[Warn] unknown --reasoning-effort value '{}'. Expected: minimal | low | medium | high | off",
+                "[Warn] unknown --reasoning-effort value '{}'. Expected: minimal | low | medium | high | xhigh | off",
                 trimmed
             );
         }
@@ -589,7 +589,7 @@ fn generate_bash(
         "  local model_selectors={}",
         shell_single_quote(&model_selector_words())
     );
-    println!("  local effort_levels='minimal low medium high auto off'");
+    println!("  local effort_levels='minimal low medium high xhigh auto off'");
     println!();
     // COMP_WORDS[0] 是命令名 a，内部命令位于 COMP_WORDS[1]。
     println!("  if [ \"$COMP_CWORD\" -ge 2 ]; then");
@@ -680,7 +680,7 @@ fn generate_zsh(
     );
     println!("  local -a _a_model_subcmds=(current list help effort)");
     println!("  local -a _a_model_selectors=({})", model_selector_words());
-    println!("  local -a _a_effort_levels=(minimal low medium high auto off)");
+    println!("  local -a _a_effort_levels=(minimal low medium high xhigh auto off)");
     println!("  local -a _a_model_entries");
     println!("  _a_model_entries=($_a_model_selectors $_a_model_subcmds)");
     println!();
@@ -772,7 +772,7 @@ fn generate_fish(
         "complete -c a -n '__fish_seen_subcommand_from /model :model' -a 'current list help effort' -d 'model command'"
     );
     println!(
-        "complete -c a -n '__fish_seen_subcommand_from effort' -a 'minimal low medium high auto off' -d 'reasoning effort'"
+        "complete -c a -n '__fish_seen_subcommand_from effort' -a 'minimal low medium high xhigh auto off' -d 'reasoning effort'"
     );
 }
 

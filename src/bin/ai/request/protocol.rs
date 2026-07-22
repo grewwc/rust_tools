@@ -6,9 +6,12 @@
 
 use serde_json::{Value, json};
 
+use super::reasoning::resolve_reasoning_wire_controls;
 use super::{RequestBody, types::extract_displayable_text};
 use crate::ai::history::Message;
+use crate::ai::models;
 use crate::ai::request_protocol::RequestProtocolDialect;
+use crate::ai::types::ToolCall;
 
 impl RequestProtocolDialect {
     pub(super) fn build_http_body(self, request: &RequestBody<'_>) -> Value {
@@ -18,6 +21,152 @@ impl RequestProtocolDialect {
             }
             Self::Responses => build_responses_request_body(request),
         }
+    }
+}
+
+pub(crate) fn build_http_body_for_request(
+    model: &str,
+    endpoint: &str,
+    request: &RequestBody<'_>,
+) -> Value {
+    models::request_protocol_dialect(model, endpoint).build_http_body(request)
+}
+
+pub(crate) fn json_messages_to_request_messages(messages: &[Value]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user")
+                .to_string();
+            let content = message
+                .get("content")
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new()));
+            let tool_calls = message
+                .get("tool_calls")
+                .and_then(|value| serde_json::from_value::<Vec<ToolCall>>(value.clone()).ok());
+            let tool_call_id = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let reasoning_content = message
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Message {
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn build_http_body_for_json_messages(
+    model: &str,
+    endpoint: &str,
+    messages: &[Value],
+    stream: bool,
+    reasoning_effort: Option<&str>,
+    include_stream_usage: bool,
+) -> Value {
+    let request_messages = json_messages_to_request_messages(messages);
+    let (thinking, reasoning_effort, reasoning) =
+        resolve_reasoning_wire_controls(model, endpoint, false, reasoning_effort);
+    let stream_options = (stream && include_stream_usage).then(|| json!({ "include_usage": true }));
+    let request = RequestBody {
+        model: models::request_model_name(model),
+        messages: &request_messages,
+        stream,
+        thinking,
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort,
+        reasoning,
+        stream_options,
+        max_tokens: None,
+        reasoning_items: None,
+        reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
+    };
+    build_http_body_for_request(model, endpoint, &request)
+}
+
+pub(crate) fn extract_response_text(v: &Value) -> Option<String> {
+    if let Some(content) = extract_chat_choices_text(v) {
+        return Some(content);
+    }
+    if let Some(text) = v.get("output_text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    if let Some(output) = v.get("output").and_then(Value::as_array) {
+        let mut out = String::new();
+        for item in output {
+            append_responses_output_item_text(&mut out, item);
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
+}
+
+fn extract_chat_choices_text(v: &Value) -> Option<String> {
+    let choices = v
+        .get("choices")
+        .or_else(|| v.get("output").and_then(|o| o.get("choices")))?;
+    let msg = choices.get(0)?.get("message")?;
+    let content = msg.get("content")?;
+    extract_content_text(content)
+}
+
+fn extract_content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.to_string()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                append_content_part_text(&mut out, part);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn append_responses_output_item_text(out: &mut String, item: &Value) {
+    if let Some(content) = item.get("content") {
+        match content {
+            Value::Array(parts) => {
+                for part in parts {
+                    append_content_part_text(out, part);
+                }
+            }
+            Value::String(text) => out.push_str(text),
+            _ => {}
+        }
+        return;
+    }
+
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    if matches!(item_type, "output_text" | "text" | "refusal") {
+        append_content_part_text(out, item);
+    }
+}
+
+fn append_content_part_text(out: &mut String, part: &Value) {
+    if let Some(text) = part
+        .get("text")
+        .or_else(|| part.get("output_text"))
+        .or_else(|| part.get("refusal"))
+        .and_then(Value::as_str)
+    {
+        out.push_str(text);
     }
 }
 
