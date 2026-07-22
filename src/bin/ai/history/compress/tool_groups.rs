@@ -16,8 +16,8 @@ use super::tool_overflow::{
     preserve_noncompressible_tool_result_for_fold,
 };
 use super::{
-    is_context_checkpoint_marker, keep_recent_user_turns_when_trimming, normalize_whitespace,
-    value_to_string,
+    COMPRESSED_TOOL_EVIDENCE_MARKER, is_context_checkpoint_marker,
+    keep_recent_user_turns_when_trimming, normalize_whitespace, value_to_string,
 };
 
 pub(super) fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
@@ -142,11 +142,27 @@ pub(super) fn fold_tool_call_group_to_stub(
         return None;
     }
 
-    let mut lines = Vec::with_capacity(tool_calls.len() + 1);
+    let mut lines = Vec::with_capacity(tool_calls.len() + 6);
     lines.push(format!(
         "compressed_tool_round: {} tool calls (folded for context budget)",
         tool_calls.len()
     ));
+    lines.push(COMPRESSED_TOOL_EVIDENCE_MARKER.to_string());
+
+    let assistant_text = value_to_string(&assistant.content);
+    let assistant_text = normalize_whitespace(assistant_text.trim());
+    if assistant_text.is_empty() {
+        lines.push(
+            "assistant_checkpoint: <empty; no persisted decision before these tool calls>"
+                .to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "assistant_checkpoint: {}",
+            truncate_to_chars(&assistant_text, 720)
+        ));
+    }
+    lines.push("evidence:".to_string());
 
     for tc in tool_calls.iter().take(8) {
         let result_text = group
@@ -163,9 +179,10 @@ pub(super) fn fold_tool_call_group_to_stub(
             .unwrap_or_default();
         let recall = tool_result_recall_text(tc, &result_text, overflow_dir)?;
         let invocation = tool_call_invocation_recall(tc);
+        let target = tool_call_target_recall(tc);
         lines.push(format!(
-            "- {}{} => {}",
-            tc.function.name, invocation, recall
+            "- {}{}{} => {}",
+            tc.function.name, target, invocation, recall
         ));
     }
     if tool_calls.len() > 8 {
@@ -173,6 +190,12 @@ pub(super) fn fold_tool_call_group_to_stub(
             "- ... ({} more tools omitted)",
             tool_calls.len() - 8
         ));
+    }
+    if tool_calls
+        .iter()
+        .any(|tool_call| is_non_compressible_tool(&tool_call.function.name))
+    {
+        lines.push("compression_decision: reuse the evidence above before repeating the same read/search/list/command action; only re-run or re-read if exact omitted text is required or the underlying target changed.".to_string());
     }
 
     Some(Message {
@@ -182,6 +205,116 @@ pub(super) fn fold_tool_call_group_to_stub(
         tool_call_id: None,
         reasoning_content: None,
     })
+}
+
+fn parsed_tool_args(tool_call: &ToolCall) -> Option<Value> {
+    serde_json::from_str::<Value>(&tool_call.function.arguments).ok()
+}
+
+fn arg_string(args: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn arg_u64(args: &Value, key: &str) -> Option<u64> {
+    args.get(key)
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn tool_call_target_recall(tool_call: &ToolCall) -> String {
+    let Some(args) = parsed_tool_args(tool_call) else {
+        return String::new();
+    };
+    let mut fields = Vec::new();
+    match tool_call.function.name.as_str() {
+        "read_file" | "read_file_lines" => {
+            if let Some(path) = arg_string(&args, &["file_path", "path", "filePath"]) {
+                fields.push(format!(
+                    "file: {}",
+                    truncate_to_chars(&normalize_whitespace(&path), 240)
+                ));
+            }
+            if let Some(offset) = arg_u64(&args, "offset") {
+                if let Some(limit) = arg_u64(&args, "limit") {
+                    fields.push(format!(
+                        "range: lines={}..{}",
+                        offset,
+                        offset.saturating_add(limit.saturating_sub(1))
+                    ));
+                } else {
+                    fields.push(format!("range: offset={offset}"));
+                }
+            } else if let Some(limit) = arg_u64(&args, "limit") {
+                fields.push(format!("range: first {limit} lines"));
+            }
+        }
+        "find_path" => {
+            if let Some(pattern) = arg_string(&args, &["pattern", "query"]) {
+                fields.push(format!(
+                    "pattern: {}",
+                    truncate_to_chars(&normalize_whitespace(&pattern), 240)
+                ));
+            }
+            if let Some(path) = arg_string(&args, &["path"]) {
+                fields.push(format!(
+                    "path: {}",
+                    truncate_to_chars(&normalize_whitespace(&path), 160)
+                ));
+            }
+        }
+        "code_search" => {
+            if let Some(operation) = arg_string(&args, &["operation"]) {
+                fields.push(format!(
+                    "operation: {}",
+                    truncate_to_chars(&normalize_whitespace(&operation), 80)
+                ));
+            }
+            if let Some(query) = arg_string(&args, &["query"]) {
+                fields.push(format!(
+                    "query: {}",
+                    truncate_to_chars(&normalize_whitespace(&query), 240)
+                ));
+            }
+            if let Some(path) = arg_string(&args, &["path"]) {
+                fields.push(format!(
+                    "path: {}",
+                    truncate_to_chars(&normalize_whitespace(&path), 160)
+                ));
+            }
+            if let Some(file_pattern) = arg_string(&args, &["file_pattern", "filePattern"]) {
+                fields.push(format!(
+                    "file_pattern: {}",
+                    truncate_to_chars(&normalize_whitespace(&file_pattern), 160)
+                ));
+            }
+        }
+        "list_directory" => {
+            if let Some(path) = arg_string(&args, &["path"]) {
+                fields.push(format!(
+                    "path: {}",
+                    truncate_to_chars(&normalize_whitespace(&path), 160)
+                ));
+            }
+        }
+        "write_file" | "create_file" | "edit_file" | "delete_path" => {
+            if let Some(path) = arg_string(&args, &["file_path", "path", "filePath"]) {
+                fields.push(format!(
+                    "file: {}",
+                    truncate_to_chars(&normalize_whitespace(&path), 240)
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", fields.join("; "))
+    }
 }
 
 /// `execute_command` 的结果本身无法说明它回答的是哪个问题。工具组折叠会移除

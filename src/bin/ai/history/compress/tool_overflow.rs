@@ -17,12 +17,12 @@ use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, reta
 use super::text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use super::tool_groups::{recent_tool_group_message_indices, recent_tool_result_groups};
 use super::{
-    IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_GROUPS, PRESERVED_CONTENT_STUB_PREFIX,
-    PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR, PRESERVED_USER_OVERFLOW_DIR,
-    USER_OVERFLOW_SPILL_MIN_CHARS, automatic_summary_body, dedup_adjacent,
-    keep_recent_user_turns_when_trimming, message_contains_image, normalize_whitespace,
-    redact_images_except_last, strip_nested_prior_summary_prefixes, tool_message_indices,
-    value_to_string,
+    COMPRESSED_TOOL_EVIDENCE_MARKER, IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_GROUPS,
+    PRESERVED_CONTENT_STUB_PREFIX, PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR,
+    PRESERVED_USER_OVERFLOW_DIR, USER_OVERFLOW_SPILL_MIN_CHARS, automatic_summary_body,
+    dedup_adjacent, keep_recent_user_turns_when_trimming, message_contains_image,
+    normalize_whitespace, redact_images_except_last, strip_nested_prior_summary_prefixes,
+    tool_message_indices, value_to_string,
 };
 
 const PRESERVED_TOOL_OVERFLOW_STUB_PREFIX: &str = "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]";
@@ -70,6 +70,11 @@ pub(super) fn normalize_internal_notes_for_summary_model(messages: &mut Vec<Mess
                     out.push(message);
                     seen_auto_summary = true;
                 }
+                continue;
+            }
+
+            if text.trim_start().contains(COMPRESSED_TOOL_EVIDENCE_MARKER) {
+                out.push(message);
                 continue;
             }
 
@@ -634,10 +639,7 @@ fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'s
     }
 }
 
-pub(super) fn build_tool_overflow_recall_lines(
-    tool_name: &str,
-    arguments: &str,
-) -> Vec<String> {
+pub(super) fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str) -> Vec<String> {
     let Ok(args) = serde_json::from_str::<Value>(arguments) else {
         return Vec::new();
     };

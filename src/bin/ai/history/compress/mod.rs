@@ -43,6 +43,13 @@ pub(in crate::ai) const SUMMARY_NOTE_PREFIXES: &[&str] = &[
     "[mid-turn-summary]",
 ];
 
+/// 工具组折叠时生成的确定性证据 note 标记。
+///
+/// 这不是 LLM 生成的摘要，而是压缩器从 tool_call 参数和 tool 结果中机械提取的
+/// evidence/checkpoint。它必须在二次摘要前保留，否则长工具链会退化成只有
+/// file_path / original_file_path 的工具账单，模型压缩后容易重新取证。
+pub(super) const COMPRESSED_TOOL_EVIDENCE_MARKER: &str = "[compressed-tool-evidence]";
+
 /// 归档指针 note（overflow 原文回指）的前缀。与摘要 note 成对出现，
 /// P1 折叠逻辑据此识别并去重堆积的归档指针。
 pub(in crate::ai) const ARCHIVE_NOTE_PREFIX: &str = "长期记忆归档";

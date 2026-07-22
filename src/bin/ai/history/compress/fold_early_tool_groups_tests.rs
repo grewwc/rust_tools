@@ -416,6 +416,13 @@ fn summary_model_input_drops_ephemeral_internal_notes() {
         msg(ROLE_INTERNAL_NOTE, "tool_followup:output_truncated"),
         msg(
             ROLE_INTERNAL_NOTE,
+            &format!(
+                "compressed_tool_round: 1 tool calls (folded for context budget)\n{}\nevidence:\n- read_file [file: src/lib.rs] => 已读过",
+                COMPRESSED_TOOL_EVIDENCE_MARKER
+            ),
+        ),
+        msg(
+            ROLE_INTERNAL_NOTE,
             "对话摘要（自动压缩，以下为早期对话要点）：\n初始目标: 保留",
         ),
         msg(
@@ -426,9 +433,15 @@ fn summary_model_input_drops_ephemeral_internal_notes() {
 
     normalize_internal_notes_for_summary_model(&mut messages);
 
-    assert_eq!(messages.len(), 2);
+    assert_eq!(messages.len(), 3);
     assert_eq!(messages[0].role, "user");
     let note = value_to_string(&messages[1].content);
+    assert!(
+        note.contains(COMPRESSED_TOOL_EVIDENCE_MARKER),
+        "compressed tool evidence should survive summary input normalization: {note}"
+    );
+    assert!(note.contains("src/lib.rs"), "{note}");
+    let note = value_to_string(&messages[2].content);
     assert!(note.contains("已有历史摘要"), "{note}");
     assert!(note.contains("初始目标: 保留"), "{note}");
     assert!(!note.contains("self_note"), "{note}");
@@ -442,6 +455,67 @@ fn assistant_call_args(id: &str, name: &str, arguments: &str) -> Message {
         calls[0].function.arguments = arguments.to_string();
     }
     m
+}
+
+fn assistant_call_args_with_content(
+    id: &str,
+    name: &str,
+    arguments: &str,
+    content: &str,
+) -> Message {
+    let mut m = assistant_call_args(id, name, arguments);
+    m.content = Value::String(content.to_string());
+    m
+}
+
+#[test]
+fn folded_tool_group_keeps_assistant_checkpoint_and_evidence_targets() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-evidence-fold-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("system", "s"), msg("user", "分析历史")];
+    messages.push(assistant_call_args_with_content(
+        "read-history",
+        "read_file",
+        r#"{"file_path":"0341-history.json","offset":1,"limit":120}"#,
+        "已确认文件存在，下一步只统计 role 分布。",
+    ));
+    messages.push(tool_result(
+        "read-history",
+        "     1\t[\n     2\t{\"role\":\"user\"}\n... [truncated: showing lines 1-120 of 6393]",
+    ));
+    for i in 0..4 {
+        let id = format!("later-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "later"));
+    }
+
+    let (folded, folded_groups) =
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()));
+    assert_eq!(folded_groups, 1);
+    let stub = folded
+        .iter()
+        .find(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && value_to_string(&message.content).contains(COMPRESSED_TOOL_EVIDENCE_MARKER)
+        })
+        .map(|message| value_to_string(&message.content))
+        .expect("folded read group should become evidence note");
+
+    assert!(
+        stub.contains("assistant_checkpoint: 已确认文件存在，下一步只统计 role 分布。"),
+        "{stub}"
+    );
+    assert!(stub.contains("evidence:"), "{stub}");
+    assert!(
+        stub.contains("read_file [file: 0341-history.json; range: lines=1..120]"),
+        "{stub}"
+    );
+    assert!(
+        stub.contains("compression_decision: reuse the evidence above"),
+        "{stub}"
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
 /// 压缩后的命令组必须保留调用参数。仅保留「成功但无输出」不足以说明已经查过
@@ -480,8 +554,13 @@ fn folded_command_keeps_invocation_for_empty_success() {
         .expect("command group should be folded into a recall stub");
     assert!(stub.contains(&format!("command: {command}")), "{stub}");
     assert!(stub.contains("cwd: /data01/AeolusLLM"), "{stub}");
+    assert!(stub.contains(COMPRESSED_TOOL_EVIDENCE_MARKER), "{stub}");
     assert!(
         stub.contains("command succeeded with exit code 0 and produced no output"),
+        "{stub}"
+    );
+    assert!(
+        stub.contains("compression_decision: reuse the evidence above before repeating the same read/search/list/command action"),
         "{stub}"
     );
 
