@@ -212,35 +212,7 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
         size_capped,
         excerpt.truncated_mid_line,
     );
-    Ok(append_symbol_outline_if_useful(
-        rendered, file_path, &content, start,
-    ))
-}
-
-/// 为受支持的语言在读取结果末尾附加一段紧凑的符号大纲，让模型每次读文件都能
-/// 获得结构化代码视图，而不必逐行 grep。不支持的语言或无符号时原样返回。
-fn append_symbol_outline_if_useful(
-    mut rendered: String,
-    file_path: &str,
-    content: &str,
-    start: usize,
-) -> String {
-    // 仅在首块读取时附大纲，避免分页读取同一文件时把同一份 outline 反复塞回上下文。
-    if start > 0 {
-        return rendered;
-    }
-    const MAX_OUTLINE_SYMBOLS: usize = 60;
-    if let Some(outline) = crate::ai::tools::ast_symbols::document_symbol_outline(
-        file_path,
-        content,
-        MAX_OUTLINE_SYMBOLS,
-    ) {
-        if !rendered.is_empty() {
-            rendered.push_str("\n\n");
-        }
-        rendered.push_str(&outline);
-    }
-    rendered
+    Ok(rendered)
 }
 
 /// 单次 read_file 结果的字符硬上限。

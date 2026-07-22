@@ -118,14 +118,11 @@ tools:
   - read_file        # 读取现有文件
   - write_file       # 创建新文件
   - apply_patch      # 精确修改
-  - code_search      # 代码搜索
   - search_files     # 文件搜索
 tool_groups:
   - builtin
 mcp_servers: []
 ```
-
-补充说明：`code_search` 做结构化搜索时应使用 `operation=structural`，并通过 `intent=find_functions|find_classes|find_methods|find_calls` 指定目标，不要把 `find_functions` 这类值直接写到 `operation` 中。
 
 ### 系统提示词结构
 

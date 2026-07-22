@@ -1,6 +1,3 @@
-mod ast_structural;
-pub(crate) mod ast_symbols;
-mod code_search;
 pub(crate) mod command_tools;
 mod common;
 mod context_tools;
@@ -37,8 +34,6 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "enable_tools",
     "read_file",
     "list_directory",
-    "find_path",
-    "code_search",
     "task",
     "task_spawn",
     "task_wait",

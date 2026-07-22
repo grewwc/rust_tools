@@ -3,9 +3,9 @@
 ## Scope
 
 Applies to `src/bin/ai/mcp/**` and nearby MCP execution glue.
-Read `docs/agent-guides/ai-mcp.md` before changing server initialization,
-client routing, transport error handling, OAuth flows, schema loading, or timeout
-semantics.
+Key areas: server lifecycle in `lifecycle/`, client routing in `routing/`,
+transport errors in `transport/`, OAuth in `oauth/`, schema loading in
+`schema/`.
 
 ## Key invariants
 
@@ -27,6 +27,3 @@ semantics.
 7. **Name consistency.** Prompt hints, hidden catalogs, and enablement behavior
    must stay consistent with the real configured MCP tool names.
 
-## Related detailed guide
-
-- `docs/agent-guides/ai-mcp.md`

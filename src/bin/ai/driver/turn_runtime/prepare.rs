@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::ai::mcp::SharedMcpClient;
 use crate::ai::{
-    driver::{print::print_ocr_summary, reflection, skill_runtime},
+    driver::{print::print_ocr_summary, skill_runtime},
     history::{
         Message, ROLE_INTERNAL_NOTE, build_context_history, compact_session_history_with_app,
         compress::llm_prune,
@@ -114,6 +114,7 @@ impl QuestionShape {
             || self.char_count >= 80
     }
 
+    #[cfg(test)]
     pub(crate) fn is_complex_task(self) -> bool {
         if self.char_count < 12 {
             return false;
@@ -122,17 +123,6 @@ impl QuestionShape {
             || self.has_list_marker
             || self.char_count >= 180
             || self.artifact_token_count >= 2
-    }
-
-    /// 极短、单行、无 code/repo artifact 的问句：保守近似"简单概念问答"。
-    ///
-    /// intent 移除后不再有"概念意图"信号，只能靠纯形态收紧近似；阈值取 48
-    /// 而非更宽的 120，以减少误跳过 recall（宁可多召回，不丢能力）。
-    pub(crate) fn is_lightweight_conceptual(self) -> bool {
-        self.char_count > 0
-            && self.char_count <= 48
-            && self.nonempty_line_count <= 1
-            && !self.has_code_or_repo_artifact()
     }
 
     /// 是否值得开启 deliberate thinking：具备 code/repo artifact、多行、
@@ -392,69 +382,6 @@ pub(super) async fn prepare_turn(
         skill_turn.push_section(skill_runtime::ContextKind::Behavior, &block);
     }
 
-    let skip_recall_for_skill_context = skill_turn.skip_recall_by_skill();
-    let matched_skill_name = skill_turn.matched_skill_name().map(|name| name.to_string());
-    let should_run_general_recall = should_run_general_recall(
-        question,
-        matched_skill_name.as_deref(),
-        skip_recall_for_skill_context,
-    );
-    if should_run_general_recall {
-        let recall_bundle = reflection::build_recall_bundle(question, 1200, 2000);
-        if let Some(guidelines) = recall_bundle.guidelines {
-            if !guidelines.trim().is_empty() {
-                skill_turn.push_labeled_section(
-                    skill_runtime::ContextKind::Fact,
-                    "Guidelines",
-                    &guidelines,
-                );
-            }
-        }
-        if let Some(recalled) = recall_bundle.recalled
-            && !recalled.content.trim().is_empty()
-        {
-            let project_part = recalled
-                .project_hint
-                .as_deref()
-                .map(|project| format!(" project={project}"))
-                .unwrap_or_default();
-            let category_part = if recalled.categories.is_empty() {
-                String::new()
-            } else {
-                format!(" categories={}", recalled.categories.join(","))
-            };
-            let confidence_part = if recalled.high_confidence_project_memory {
-                " high_confidence=true"
-            } else {
-                " high_confidence=false"
-            };
-            println!(
-                "{} count={}{}{}{}",
-                "[Memory] recalled".bright_blue().bold(),
-                recalled.entry_count,
-                project_part,
-                category_part,
-                confidence_part
-            );
-            skill_turn.push_labeled_section(
-                skill_runtime::ContextKind::Fact,
-                "Recalled Knowledge",
-                &recalled.content,
-            );
-            if recalled.high_confidence_project_memory {
-                skill_turn.push_section(
-                    skill_runtime::ContextKind::Policy,
-                    high_confidence_project_memory_policy(),
-                );
-            } else {
-                skill_turn.push_section(
-                    skill_runtime::ContextKind::Policy,
-                    recalled_knowledge_usage_policy(),
-                );
-            }
-        }
-    }
-
     // C3 复杂任务自动提示已移除：build agent 的 Core Workflow Plan / Verify 步骤已覆盖
     // 同样的"先列计划再动手"引导，重复注入会与 Autonomous Execution 段的
     // "prefer acting over describing" 互相矛盾。`detect_complex_task` 保留
@@ -500,7 +427,7 @@ pub(super) async fn prepare_turn(
     // 或限额触发），把用户当前输入的原文升级为一条头部 `ROLE_INTERNAL_NOTE`
     // 提醒，放在 system 段之后、整段历史之前。否则漫长 tool-only 历史会冲淡
     // 用户新指令的存在感，让模型反复重跑上一轮没成形的检索/读取（详 e75fc2e5
-    // session dump：用户喊"你卡住了啊"之后 agent 仍重发 8 次失败的 code_search）。
+    // session dump：用户喊"你卡住了啊"之后 agent 仍重发 8 次失败的查找调用）。
     //
     // 提醒是 system-like role，[`first_trim_candidate`] 与 fold 路径都豁免它，
     // mid-turn compress 内不会被打掉；它紧贴 system 之后，模型早期读到，即以
@@ -533,8 +460,8 @@ pub(super) async fn prepare_turn(
         }
     }
     messages.extend(history);
-    // Per-turn context reminder (Current Date / Recalled Knowledge / Code
-    // Discovery, …) used to be injected as a synthetic user+assistant pair
+    // Per-turn context reminder (Current Date / Code Discovery, …) used to be
+    // injected as a synthetic user+assistant pair
     // between `history` and the current user message. Because the reminder
     // text changes every turn, that pair sat right between two cache-stable
     // segments and caused providers to lose the prompt-cache hit on
@@ -625,45 +552,6 @@ pub(super) async fn prepare_turn(
     })
 }
 
-fn should_run_general_recall(
-    question: &str,
-    matched_skill_name: Option<&str>,
-    skip_recall_for_skill_context: bool,
-) -> bool {
-    if skip_recall_for_skill_context {
-        return false;
-    }
-
-    let question = question.trim();
-    if question.is_empty() {
-        return false;
-    }
-    if is_short_skill_follow_up(question, matched_skill_name) {
-        return false;
-    }
-
-    // 无 intent 后仅靠纯形态近似"简单概念问答"：极短 + 单行 + 无 artifact。
-    // 命中则跳过 general recall，否则倒向召回（保留能力）。
-    let simple_concept_turn = QuestionShape::analyze(question).is_lightweight_conceptual()
-        && !looks_like_code_or_repo_question(question);
-
-    !simple_concept_turn
-}
-
-fn is_short_skill_follow_up(question: &str, matched_skill_name: Option<&str>) -> bool {
-    if matched_skill_name.is_none() {
-        return false;
-    }
-    let shape = QuestionShape::analyze(question);
-    shape.char_count <= 48
-        && !shape.has_reflection_shape()
-        && !looks_like_code_or_repo_question(question)
-}
-
-fn looks_like_code_or_repo_question(question: &str) -> bool {
-    QuestionShape::analyze(question).has_code_or_repo_artifact()
-}
-
 /// C3: 复杂任务检测——仅基于结构信号的轻量启发式。
 /// 命中后只会注入一段 Policy 提示鼓励 agent 自行拆解，不强制激活 Thinking 引擎。
 #[cfg(test)]
@@ -671,21 +559,11 @@ fn detect_complex_task(question: &str) -> bool {
     QuestionShape::analyze(question).is_complex_task()
 }
 
-fn high_confidence_project_memory_policy() -> &'static str {
-    "Memory-first project answer policy:\n- High-confidence project memory is available. Answer from it first only when it already covers the ask and the answer does not depend on current repository state.\n- If the answer depends on current code, files, configs, command results, or any potentially changed runtime/project state, verify with file/search/inspection tools before concluding.\n- Only skip repo/tool verification when the recalled knowledge is sufficient and the request is not state-sensitive."
-}
-
-fn recalled_knowledge_usage_policy() -> &'static str {
-    "Knowledge usage policy:\n- Recalled knowledge is relevant for this turn; use it as context, not as a substitute for current-state verification.\n- If the answer depends on current code, files, configs, command results, or any potentially changed runtime/project state, verify with file/repo tools before concluding.\n- Use file/repo tools when key requested details are missing, ambiguous, or state-sensitive; avoid full re-scan when recall is already sufficient."
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         QuestionShape, detect_complex_task, filter_suggested_tool_calls_for_tool_names,
-        high_confidence_project_memory_policy, looks_like_code_or_repo_question,
-        persisted_user_turn_message, recalled_knowledge_usage_policy,
-        should_inject_integrated_reflection, should_run_general_recall,
+        persisted_user_turn_message, should_inject_integrated_reflection,
     };
     use crate::ai::driver::observer::SuggestedToolCall;
     use crate::ai::history::Message;
@@ -756,7 +634,7 @@ mod tests {
                     rationale: "visible".to_string(),
                 },
                 SuggestedToolCall {
-                    tool_name: "code_search".to_string(),
+                    tool_name: "list_directory".to_string(),
                     arguments: Value::Null,
                     rationale: "hidden".to_string(),
                 },
@@ -765,31 +643,6 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_name, "read_file");
-    }
-
-    #[test]
-    fn high_confidence_project_memory_policy_requires_state_verification() {
-        let policy = high_confidence_project_memory_policy();
-        assert!(policy.contains("does not depend on current repository state"));
-        assert!(policy.contains("verify with file/search/inspection tools before concluding"));
-        assert!(policy.contains("request is not state-sensitive"));
-    }
-
-    #[test]
-    fn recalled_knowledge_usage_policy_treats_memory_as_context_not_ground_truth() {
-        let policy = recalled_knowledge_usage_policy();
-        assert!(policy.contains("use it as context, not as a substitute"));
-        assert!(policy.contains("verify with file/repo tools before concluding"));
-        assert!(policy.contains("missing, ambiguous, or state-sensitive"));
-    }
-
-    #[test]
-    fn simple_concept_turn_skips_general_recall() {
-        assert!(!should_run_general_recall(
-            "Rust 的 trait 是什么？",
-            None,
-            false
-        ));
     }
 
     #[test]
@@ -816,14 +669,14 @@ mod tests {
 
     #[test]
     fn generic_file_extension_counts_as_code_or_repo_artifact() {
-        assert!(looks_like_code_or_repo_question(
-            "看一下 schema.proto 的生成逻辑"
-        ));
+        assert!(
+            QuestionShape::analyze("看一下 schema.proto 的生成逻辑").has_code_or_repo_artifact()
+        );
     }
 
     #[test]
     fn numeric_decimal_does_not_count_as_code_or_repo_artifact() {
-        assert!(!looks_like_code_or_repo_question("圆周率约等于 3.14"));
+        assert!(!QuestionShape::analyze("圆周率约等于 3.14").has_code_or_repo_artifact());
     }
 
     #[test]
@@ -833,46 +686,7 @@ mod tests {
             "src/bin/ai/driver/skill_runtime.rs\n".repeat(200)
         );
         assert!(!detect_complex_task(&polluted));
-        assert!(!looks_like_code_or_repo_question(&polluted));
-    }
-
-    #[test]
-    fn short_skill_follow_up_skips_general_recall() {
-        assert!(!should_run_general_recall(
-            "简短请求",
-            Some("debugger"),
-            false
-        ));
-    }
-
-    #[test]
-    fn structured_skill_turn_still_keeps_general_recall() {
-        assert!(should_run_general_recall(
-            "请帮我检查下面这个多步构建失败：\n1. cargo check 失败\n2. 错误出现在 src/main.rs",
-            Some("debugger"),
-            false
-        ));
-    }
-
-    #[test]
-    fn short_plain_question_is_lightweight_conceptual() {
-        assert!(QuestionShape::analyze("Rust 的 trait 是什么？").is_lightweight_conceptual());
-    }
-
-    #[test]
-    fn code_artifact_is_not_lightweight_conceptual() {
-        assert!(!QuestionShape::analyze("`Vec::push` 是什么？").is_lightweight_conceptual());
-    }
-
-    #[test]
-    fn long_question_is_not_lightweight_conceptual() {
-        let long = "这是一个".repeat(20);
-        assert!(!QuestionShape::analyze(&long).is_lightweight_conceptual());
-    }
-
-    #[test]
-    fn empty_question_is_not_lightweight_conceptual() {
-        assert!(!QuestionShape::analyze("").is_lightweight_conceptual());
+        assert!(!QuestionShape::analyze(&polluted).has_code_or_repo_artifact());
     }
 
     #[test]

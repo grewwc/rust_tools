@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use crate::ai::{request, tools::tool_history_policy, types::App};
@@ -35,7 +35,13 @@ pub(super) async fn build_persisted_summary_text_with_app(
     max_chars: usize,
 ) -> String {
     let mut prepared = messages.to_vec();
-    prepare_tool_messages_structured(&mut prepared, 360, KEEP_RECENT_TOOL_GROUPS, None);
+    prepare_tool_messages_structured(
+        &mut prepared,
+        360,
+        KEEP_RECENT_TOOL_GROUPS,
+        None,
+        &FxHashSet::default(),
+    );
     redact_images_except_last(&mut prepared, 0);
     dedup_adjacent(&mut prepared);
     normalize_internal_notes_for_summary_model(&mut prepared);
@@ -93,6 +99,7 @@ pub(super) fn prepare_tool_messages_structured(
     max_chars_per_msg: usize,
     keep_recent_groups: usize,
     overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &FxHashSet<String>,
 ) {
     let id_to_tool_name = build_tool_call_name_index(messages);
     let id_to_tool_args = build_tool_call_arguments_index(messages);
@@ -123,7 +130,12 @@ pub(super) fn prepare_tool_messages_structured(
             // 完整可见，否则模型看到的是「已卸载，请重读」stub，会立刻再发一次
             // 同样的 read_file——在会话超软阈值、每轮都跑压缩时表现为无限重读。
             // 只有保护尾窗之外的旧 precision 结果才零压缩外溢到磁盘。
-            if !protected_indices.contains(&idx)
+            let is_explicitly_protected = message
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| protected_tool_call_ids.contains(id));
+            if !is_explicitly_protected
+                && !protected_indices.contains(&idx)
                 && text.chars().count() > max_chars_per_msg
                 && let Some(path) = overflow_dir
                     .and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
@@ -164,6 +176,7 @@ pub(super) fn enforce_protected_precision_group_budget(
     keep_recent_groups: usize,
     inline_budget: usize,
     overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &FxHashSet<String>,
 ) {
     let Some(overflow_dir) = overflow_dir else {
         return;
@@ -200,6 +213,13 @@ pub(super) fn enforce_protected_precision_group_budget(
             }
             let text = value_to_string(&messages[idx].content);
             if text.trim().is_empty() || is_preserved_tool_overflow_stub(&text) {
+                continue;
+            }
+            if messages[idx]
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| protected_tool_call_ids.contains(id))
+            {
                 continue;
             }
             let text_len = text.chars().count();
@@ -296,13 +316,25 @@ mod tests {
             tool_result("recent", "recent result"),
         ];
 
-        prepare_tool_messages_structured(&mut messages, 80, 1, Some(&overflow_dir));
+        prepare_tool_messages_structured(
+            &mut messages,
+            80,
+            1,
+            Some(&overflow_dir),
+            &FxHashSet::default(),
+        );
         let first_stub = value_to_string(&messages[1].content);
         assert!(is_preserved_tool_overflow_stub(&first_stub));
         let overflow_path = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
         assert_eq!(std::fs::read_dir(&overflow_path).unwrap().count(), 1);
 
-        prepare_tool_messages_structured(&mut messages, 80, 1, Some(&overflow_dir));
+        prepare_tool_messages_structured(
+            &mut messages,
+            80,
+            1,
+            Some(&overflow_dir),
+            &FxHashSet::default(),
+        );
         assert_eq!(value_to_string(&messages[1].content), first_stub);
         assert_eq!(std::fs::read_dir(&overflow_path).unwrap().count(), 1);
 
@@ -326,7 +358,13 @@ mod tests {
             tool_result("recent", "recent result"),
         ];
 
-        prepare_tool_messages_structured(&mut messages, 80, 1, Some(&overflow_dir));
+        prepare_tool_messages_structured(
+            &mut messages,
+            80,
+            1,
+            Some(&overflow_dir),
+            &FxHashSet::default(),
+        );
         let stub = value_to_string(&messages[1].content);
         assert!(
             stub.contains("- original_file_path: src/lib.rs"),
@@ -371,7 +409,13 @@ mod tests {
             tool_result("recent", "recent result"),
         ];
 
-        prepare_tool_messages_structured(&mut messages, 80, 1, Some(&overflow_dir));
+        prepare_tool_messages_structured(
+            &mut messages,
+            80,
+            1,
+            Some(&overflow_dir),
+            &FxHashSet::default(),
+        );
         let stub = value_to_string(&messages[1].content);
         assert!(
             stub.contains("- original_command: git log --stat"),
@@ -422,7 +466,13 @@ mod tests {
             tool_result("task", &"t".repeat(10_000)),
         ];
 
-        enforce_protected_precision_group_budget(&mut messages, 1, 200, Some(&overflow_dir));
+        enforce_protected_precision_group_budget(
+            &mut messages,
+            1,
+            200,
+            Some(&overflow_dir),
+            &FxHashSet::default(),
+        );
 
         assert!(is_preserved_tool_overflow_stub(&value_to_string(
             &messages[1].content
@@ -473,11 +523,11 @@ mod tests {
 
     #[test]
     fn age_out_overflow_stub_previews_is_idempotent() {
-        let stub = overflow_stub_with_preview("/tmp/session/read-xyz.txt", "code_search");
+        let stub = overflow_stub_with_preview("/tmp/session/read-xyz.txt", "read_file");
         // 两条 user 轮，让 stub 落在保护尾窗之外（retained_turn_start 之前）。
         let mut messages = vec![
             user_msg("q1"),
-            assistant_call("s", "code_search"),
+            assistant_call("s", "read_file"),
             tool_result("s", "placeholder"),
             user_msg("q2"),
             user_msg("q3"),
@@ -621,10 +671,6 @@ fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'s
     let has_original_command = recall_lines
         .iter()
         .any(|line| line.starts_with("- original_command: "));
-    let has_original_query = recall_lines
-        .iter()
-        .any(|line| line.starts_with("- original_query: "));
-
     match tool_name {
         "read_file" if has_original_file_path => {
             "（这是之前读取文件的结果归档；优先继续读取 `original_file_path` 指向的原始文件，而不是本归档文件。仅当你确实需要这次已外溢结果的完整原文时才读取 `file_path`。）"
@@ -634,9 +680,6 @@ fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'s
         }
         "execute_command" if has_original_command => {
             "（这是之前命令输出的归档；优先根据 `original_command` / `original_cwd` 继续判断，不要把 `file_path` 当作源码文件去读。仅在需要完整日志时才读取。）"
-        }
-        "code_search" if has_original_query => {
-            "（这是之前检索结果的归档；优先根据 `original_operation` / `original_query` / `original_path` 继续检索或缩小范围，而不是回读本归档文件。）"
         }
         _ => "（如需查看完整输出，可用 read_file 读取此文件；若预览已足够回答问题则忽略。）",
     }
@@ -675,28 +718,6 @@ pub(super) fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str)
                 if !cwd.is_empty() {
                     lines.push(format!("- original_cwd: {}", truncate_to_chars(&cwd, 240)));
                 }
-            }
-            lines
-        }
-        "code_search" => {
-            let mut lines = Vec::with_capacity(3);
-            if let Some(operation) = value_string_from_keys(&args, &["operation"]) {
-                lines.push(format!(
-                    "- original_operation: {}",
-                    truncate_to_chars(&normalize_whitespace(&operation), 80)
-                ));
-            }
-            if let Some(query) = value_string_from_keys(&args, &["query", "symbol", "pattern"]) {
-                lines.push(format!(
-                    "- original_query: {}",
-                    truncate_to_chars(&normalize_whitespace(&query), 240)
-                ));
-            }
-            if let Some(path) = value_string_from_keys(&args, &["path", "file_path"]) {
-                lines.push(format!(
-                    "- original_path: {}",
-                    truncate_to_chars(&normalize_whitespace(&path), 240)
-                ));
             }
             lines
         }

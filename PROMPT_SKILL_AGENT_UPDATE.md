@@ -89,11 +89,8 @@ tools:
   - read_file
   - write_file
   - apply_patch
-  - code_search
   - search_files
 ```
-
-补充说明：当 `code_search` 用于结构化搜索时，应写成 `operation=structural` 并配合 `intent=find_functions|find_classes|find_methods|find_calls`，不要把 `find_functions`、`find_classes`、`find_methods`、`find_calls` 直接写到 `operation` 中。
 
 ### 核心能力
 

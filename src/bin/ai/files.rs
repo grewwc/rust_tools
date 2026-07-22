@@ -7,7 +7,6 @@ use super::types::FileParseResult;
 
 const ATTACHMENT_INLINE_MAX_CHARS: usize = 12_000;
 const ATTACHMENT_INLINE_MAX_LINES: usize = 240;
-const ATTACHMENT_OUTLINE_MAX_SYMBOLS: usize = 24;
 
 pub(super) fn parse_files(content: &str) -> FileParseResult {
     let files = split_by_str_keep_quotes(content, ",", "\"", false);
@@ -105,16 +104,6 @@ fn render_text_attachment_block(file: &str) -> io::Result<String> {
         if !preview.text.ends_with('\n') {
             out.push('\n');
         }
-    }
-
-    if let Some(outline) = crate::ai::tools::ast_symbols::document_symbol_outline(
-        file,
-        &content,
-        ATTACHMENT_OUTLINE_MAX_SYMBOLS,
-    ) {
-        out.push('\n');
-        out.push_str(&outline);
-        out.push('\n');
     }
 
     let next_offset = if preview.truncated_mid_line {

@@ -7,7 +7,7 @@ $(INSTALL_BINS): install ; @:
 
 RELEASE_DIR := target/release
 DEBUG_DIR := target/debug
-INSTALLW := $(DEBUG_DIR)/installw
+INSTALLW := $(RELEASE_DIR)/installw
 CargoLock := $(wildcard Cargo.lock)
 INSTALLW_DEPS := $(shell find src -type f -name '*.rs') Cargo.toml $(CargoLock)
 

@@ -28,8 +28,8 @@ fn is_web_url_token(token: &str) -> bool {
 fn path_candidates_from_token(token: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
-    while let Some(start) = find_path_start(token, cursor) {
-        let end = find_path_end(token, start);
+    while let Some(start) = local_path_start(token, cursor) {
+        let end = local_path_end(token, start);
         if end <= start {
             break;
         }
@@ -44,7 +44,7 @@ fn path_candidates_from_token(token: &str) -> Vec<&str> {
     out
 }
 
-fn find_path_start(token: &str, from: usize) -> Option<usize> {
+fn local_path_start(token: &str, from: usize) -> Option<usize> {
     let chars = token.char_indices().collect::<Vec<_>>();
     for (idx, ch) in chars {
         if idx < from {
@@ -67,7 +67,7 @@ fn find_path_start(token: &str, from: usize) -> Option<usize> {
     None
 }
 
-fn find_path_end(token: &str, start: usize) -> usize {
+fn local_path_end(token: &str, start: usize) -> usize {
     let tail = &token[start..];
     for (offset, ch) in tail.char_indices() {
         if is_path_terminator(ch) {

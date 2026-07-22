@@ -6,6 +6,7 @@ use crate::ai::{
 };
 use crate::commonw::configw;
 use rust_tools::cw::SkipSet;
+use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
 use super::{DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS};
@@ -121,6 +122,37 @@ impl SystemPromptBuilder {
 }
 
 const DEFAULT_TURN_TOOL_GROUPS: &[&str] = &["core"];
+
+fn runtime_environment_prompt() -> String {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let os_label = match os {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        "windows" => "Windows",
+        other => other,
+    };
+    let shell = std::env::var("SHELL")
+        .ok()
+        .and_then(|shell| {
+            let shell_name = Path::new(&shell)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(shell.as_str())
+                .trim()
+                .to_string();
+            (!shell_name.is_empty()).then_some(shell_name)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    format!(
+        "Execution environment:\n\
+         - Operating system: {os_label} (`{os}`); architecture: `{arch}`.\n\
+         - Shell: `{shell}`.\n\
+         - Write commands for this OS/shell. Do not use commands or package managers from another OS unless the user asks for cross-platform guidance or you first verify they exist here."
+    )
+}
+
 pub(super) struct SkillTurnGuard {
     restore_agent_context: Option<(Vec<ToolDef>, usize)>,
     builder: SystemPromptBuilder,
@@ -863,6 +895,7 @@ fn build_system_prompt(
         })
     };
     b.push(ContextKind::Identity, identity);
+    b.push(ContextKind::Behavior, runtime_environment_prompt());
 
     if let Some(resource_path) = skill
         .and_then(|skill| skill.resource_path.as_deref())
@@ -879,7 +912,7 @@ fn build_system_prompt(
     }
 
     b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
-    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Prefer tool-backed evidence over speculation: inspect the relevant sources, artifacts, or system state and use the available tools before concluding.\n- Every tool call must have a specific information, verification, or change goal. Avoid open-ended exploration; before continuing a search, know what question the next tool result should answer.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- Work in batches: when several independent read-only lookups are needed, issue them together in one message so they run in parallel instead of one-at-a-time round trips.\n- Read in large chunks: prefer one broad read (raise read_file's limit) or a single targeted search over paging through the same file in tiny slices. Do not re-read content you already have; reuse earlier tool output.\n- Locate before reading: use search/navigation tools to pinpoint the region, then read that region once — avoid repeated near-identical searches with only slightly tweaked queries.\n- Stop exploratory loops once you have enough evidence for a decision or answer; converge promptly instead of gathering redundant context.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
+    b.push(ContextKind::Behavior, "Tool usage:\n- Stop reading once you have sufficient evidence. Do not read files speculatively \"just to understand the codebase\" — read only when a specific question demands it.\n- Only rely on tools available in this turn's tool schema.\n- Every tool call must have a specific information, verification, or change goal. Avoid open-ended exploration; before continuing a search, know what question the next tool result should answer.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- File reads: read each region exactly once and reuse prior output. Use `list_directory` or `tree` to locate before reading. Read in one broad chunk rather than paging through small slices. Do not re-read content already visible in conversation.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
     b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- Do not treat pressure to converge as permission to guess. If evidence is not yet sufficient, clearly state what you know and what remains uncertain.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain and what it would take to resolve it.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.");
     b.push(ContextKind::Behavior, "Git safety:\n- Never use `git reset`, `git checkout`, `git restore`, `git stash drop`, or any other git command to discard or roll back existing changes (including staged changes) solely for testing or verification.\n- For a clean test state, use a temporary branch, a worktree, or `git stash push` (then `pop` to restore).\n- If rolling back is genuinely necessary (e.g., the change itself is wrong), first explain the reason to the user and obtain confirmation.");
 
@@ -1020,7 +1053,7 @@ fn build_system_prompt(
     {
         let mut lines = Vec::new();
         if has_tool(available_tools, "tool_spawn") {
-            lines.push("Use `tool_spawn` for parallel independent tool calls.".to_string());
+            lines.push("Use `tool_spawn` for parallel independent tool calls, but do not use it to parallelize `read_file`; keep code-grounding reads serial.".to_string());
         }
         let async_tool_controls = available_tool_names_in_order(
             available_tools,
@@ -1140,14 +1173,27 @@ fn build_system_prompt(
             lines.push(
                 "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` cannot be deleted by `delete_path` and will accumulate. `execute_command` cannot run `rm` either (blocked by sandbox).".to_string(),
             );
-            lines.push(
-                "When modifying an existing project file, do NOT use `write_file` with `temp=true` — use `apply_patch` for localized edits, or `write_file` without `temp` only when a full rewrite is genuinely necessary.".to_string(),
-            );
+            if has_tool(available_tools, "apply_patch") {
+                lines.push(
+                    "When modifying an existing project file, do NOT use `write_file` with `temp=true` — use `apply_patch` for localized edits, or `write_file` without `temp` only when a full rewrite is genuinely necessary.".to_string(),
+                );
+            } else {
+                lines.push(
+                    "When modifying an existing project file, do NOT use `write_file` with `temp=true`; use `write_file` without `temp` only when a full rewrite is genuinely necessary.".to_string(),
+                );
+            }
         }
         if has_tool(available_tools, "delete_path") {
             lines.push(
                 "Use `delete_path` to clean up temp files when done. It only deletes files created via `write_file(temp=true)` — source code, configs, and other project files are always refused.".to_string(),
             );
+        }
+        if has_tool(available_tools, "apply_patch") {
+            let mut line = "To remove an existing project/source/config file, including a git-tracked file, use `apply_patch` with a Begin Patch envelope and a `*** Delete File: <path>` section.".to_string();
+            if has_tool(available_tools, "delete_path") {
+                line.push_str(" Do not use `delete_path` for project files.");
+            }
+            lines.push(line);
         }
         push_tool_guidance_section(&mut b, ContextKind::Behavior, "Temporary files:", lines);
     }
@@ -1391,7 +1437,6 @@ mod tests {
         assert!(names.iter().any(|name| name == "enable_tools"));
         assert!(names.iter().any(|name| name == "activate_skill"));
         assert!(names.iter().any(|name| name == "load_skill"));
-        assert!(names.iter().any(|name| name == "code_search"));
         assert!(names.iter().any(|name| name == "read_file"));
         assert!(names.iter().any(|name| name == "knowledge_save"));
         assert!(names.iter().any(|name| name == "knowledge_search"));
@@ -1412,7 +1457,6 @@ mod tests {
                     assert!(!names.contains_str(hidden), "{hidden} should be hidden");
                 }
                 assert!(names.contains_str("read_file"));
-                assert!(names.contains_str("code_search"));
             })
             .await;
     }
@@ -1441,7 +1485,6 @@ mod tests {
         assert!(names.iter().any(|n| n == "apply_patch"));
         assert!(names.iter().any(|n| n == "write_file"));
         assert!(names.iter().any(|n| n == "read_file"));
-        assert!(names.iter().any(|n| n == "code_search"));
         // 常驻：baseline 自助/编排能力
         assert!(names.iter().any(|n| n == "enable_tools"));
         assert!(names.iter().any(|n| n == "task_spawn"));
@@ -1532,7 +1575,7 @@ mod tests {
         let mut plan_agent = agent("plan", Vec::new());
         plan_agent.mode = AgentMode::All;
         plan_agent.tool_groups = Vec::new();
-        plan_agent.tools = vec!["read_file".to_string(), "code_search".to_string()];
+        plan_agent.tools = vec!["read_file".to_string()];
         assert!(!declares_executor_group(None, Some(&plan_agent)));
 
         assert!(!declares_executor_group(None, None));
@@ -1599,7 +1642,6 @@ mod tests {
     #[test]
     fn system_prompt_only_mentions_tools_available_this_turn() {
         let mut available = SkipSet::new(16);
-        available.insert("code_search".to_string());
         available.insert("read_file".to_string());
         available.insert("apply_patch".to_string());
         available.insert("enable_tools".to_string());
@@ -1619,6 +1661,39 @@ mod tests {
         assert!(!prompt.contains("cargo_test"));
         assert!(!prompt.contains("execute_command"));
         assert!(!prompt.contains("apply_patch"));
+    }
+
+    #[test]
+    fn system_prompt_includes_runtime_environment() {
+        let available = SkipSet::new(16);
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+
+        assert!(prompt.contains("Execution environment:"));
+        assert!(prompt.contains("Operating system:"));
+        assert!(prompt.contains(std::env::consts::OS));
+        assert!(prompt.contains(std::env::consts::ARCH));
+        assert!(prompt.contains("Shell:"));
+        assert!(prompt.contains("Write commands for this OS/shell"));
+    }
+
+    #[test]
+    fn system_prompt_routes_project_file_deletes_to_apply_patch() {
+        let mut available = SkipSet::new(16);
+        available.insert("write_file".to_string());
+        available.insert("delete_path".to_string());
+        available.insert("apply_patch".to_string());
+
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+
+        assert!(prompt.contains("Temporary files:"));
+        assert!(prompt.contains("git-tracked file"));
+        assert!(prompt.contains("`apply_patch`"));
+        assert!(prompt.contains("`*** Delete File: <path>`"));
+        assert!(prompt.contains("Do not use `delete_path` for project files"));
     }
 
     #[test]
@@ -1681,6 +1756,21 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_keeps_code_grounding_calls_serial() {
+        let available = SkipSet::new(16);
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+        assert!(prompt.contains("Keep code-grounding calls narrow and serial"));
+        assert!(prompt.contains("for `read_file`, do one read at a time"));
+        assert!(prompt.contains("avoid batching multiple file reads into the same message"));
+        assert!(
+            !prompt
+                .contains("Work in batches: when several independent read-only lookups are needed")
+        );
+    }
+
+    #[test]
     fn generic_system_prompt_does_not_hardcode_repo_specific_tool_names() {
         let available = SkipSet::new(16);
         let prompt =
@@ -1702,6 +1792,20 @@ mod tests {
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
         assert!(prompt.contains("discover and enable matching `mcp_*` tools first"));
+    }
+
+    #[test]
+    fn system_prompt_does_not_encourage_tool_spawn_for_code_grounding_parallelism() {
+        let mut available = SkipSet::new(16);
+        available.insert("tool_spawn".to_string());
+        available.insert("tool_wait".to_string());
+        available.insert("tool_status".to_string());
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+        assert!(prompt.contains("do not use it to parallelize `read_file`"));
+        assert!(prompt.contains("keep code-grounding reads serial"));
+        assert!(!prompt.contains("Use `tool_spawn` for parallel independent tool calls."));
     }
 
     #[test]
@@ -2241,19 +2345,15 @@ mod tests {
         let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
         set_explicit_enabled_tool_names(vec!["enable_tools".to_string(), "web_search".to_string()]);
         let merged = merge_with_runtime_enabled_tools(
-            vec![tool("code_search"), tool("read_file"), tool("enable_tools")],
+            vec![tool("read_file"), tool("enable_tools")],
             vec![],
-            &[
-                tool("code_search"),
-                tool("enable_tools"),
-                tool("web_search"),
-            ],
+            &[tool("read_file"), tool("enable_tools"), tool("web_search")],
         );
         let names = merged
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
-        assert!(names.contains(&"code_search".to_string()));
+        assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"enable_tools".to_string()));
         assert!(names.contains(&"web_search".to_string()));
         set_explicit_enabled_tool_names(Vec::new());
@@ -2264,13 +2364,13 @@ mod tests {
         let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
         set_explicit_enabled_tool_names(vec!["knowledge_rebuild_index".to_string()]);
 
-        let merged = merge_with_runtime_enabled_tools(vec![tool("code_search")], vec![], &[]);
+        let merged = merge_with_runtime_enabled_tools(vec![tool("read_file")], vec![], &[]);
         let names = merged
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
 
-        assert!(names.contains(&"code_search".to_string()));
+        assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"knowledge_rebuild_index".to_string()));
         set_explicit_enabled_tool_names(Vec::new());
     }
@@ -2280,15 +2380,15 @@ mod tests {
         let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
         set_explicit_enabled_tool_names(vec!["web_search".to_string()]);
         let merged = merge_with_runtime_enabled_tools(
-            vec![tool("code_search")],
+            vec![tool("read_file")],
             vec![],
-            &[tool("code_search"), tool("apply_patch"), tool("web_search")],
+            &[tool("read_file"), tool("apply_patch"), tool("web_search")],
         );
         let names = merged
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
-        assert!(names.contains(&"code_search".to_string()));
+        assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"web_search".to_string()));
         assert!(!names.contains(&"apply_patch".to_string()));
         set_explicit_enabled_tool_names(Vec::new());
@@ -2296,18 +2396,16 @@ mod tests {
 
     #[test]
     fn explicit_tool_lists_keep_baseline_entries_available() {
-        let merged = ensure_required_baseline_tools(vec![tool("code_search")]);
+        let merged = ensure_required_baseline_tools(vec![tool("read_file")]);
         let names = merged
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"enable_tools".to_string()));
-        assert!(names.contains(&"code_search".to_string()));
         // 基础只读 / 检索能力应作为 baseline 常驻补回，避免窄白名单 skill 把
         // read_file 等最基本的阅读工具剔除，导致主 Agent 连用户点名的文件都读不了。
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"list_directory".to_string()));
-        assert!(names.contains(&"find_path".to_string()));
         // 子 Agent 编排能力应作为 baseline 常驻补回，避免 skill 白名单把 task_*
         // 全部剔除导致主 Agent 失去委派子 Agent 的能力。
         assert!(names.contains(&"task".to_string()));

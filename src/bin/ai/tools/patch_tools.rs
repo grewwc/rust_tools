@@ -21,7 +21,7 @@ fn params_apply_patch() -> Value {
             },
             "patch": {
                 "type": "string",
-                "description": "Patch content. Use either unified-diff hunks (`@@` header; content lines begin with space, `-`, or `+`) or a `*** Begin Patch` envelope. Envelope sections support `*** Update File:`, `*** Add File:`, `*** Delete File:`, and `*** Replace in line:`. Do not wrap it in a Markdown code fence. Include unique surrounding context and do not repeat a target path within one multi-file envelope."
+                "description": "Patch content. Use either unified-diff hunks (`@@` header; content lines begin with space, `-`, or `+`) or a `*** Begin Patch` envelope. Envelope sections support `*** Update File:`, `*** Add File:`, `*** Delete File:`, and `*** Replace in line:`. Use `*** Delete File:` to remove existing project/source/config files, including git-tracked files. Do not wrap it in a Markdown code fence. Include unique surrounding context and do not repeat a target path within one multi-file envelope."
             },
             "dry_run": {
                 "type": "boolean",
@@ -35,7 +35,7 @@ fn params_apply_patch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply a localized patch; prefer it to rewriting a whole file. Supports a unified-diff hunk for one `file_path`, or a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, `*** Delete File:`, or `*** Replace in line:` sections. Multi-file envelopes are fully validated before writing, rechecked immediately before commit, and rolled back if a write fails. Use `dry_run` to validate without changing files. Re-read a file after any edit before retrying a patch.",
+        description: "Apply a localized patch; prefer it to rewriting a whole file. Supports a unified-diff hunk for one `file_path`, or a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, `*** Delete File:`, or `*** Replace in line:` sections. Use `*** Delete File:` to remove existing project/source/config files, including git-tracked files; `delete_path` is only for registered temp files. Multi-file envelopes are fully validated before writing, rechecked immediately before commit, and rolled back if a write fails. Use `dry_run` to validate without changing files. Re-read a file after any edit before retrying a patch.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -78,14 +78,14 @@ struct PatchEnvelope {
     body_lines: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PreparedPatchWrite {
     path: PathBuf,
     before: Option<String>,
     action: PreparedPatchAction,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PreparedPatchAction {
     Write(String),
     Delete,
@@ -203,7 +203,11 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
         if saw_content_before_header {
             return Err("no hunk header found: patch contains content lines but no hunk header. Prepend a hunk header before the content lines, or use a Begin Patch envelope.".to_string());
         }
-        return Err("no hunks found".to_string());
+        return Err(
+            "no hunks found: the patch is empty or contains no valid unified-diff hunks (no `@@` headers). \
+             Check that the patch content is not wrapped in Markdown code fences and contains hunk headers like `@@ -1,3 +1,3 @@`."
+                .to_string(),
+        );
     }
     Ok(hunks)
 }
@@ -1228,7 +1232,7 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
     }
 
     msg.push_str(
-        "Hint: re-read the file with read_file to get exact current content, then rebuild the patch from the raw file text only. read_file prints each line as a right-aligned line number followed by a TAB (e.g. `    42\\t<code>`); copy only the code after the TAB. Do not copy the leading line number + tab, any truncation notice, or the Symbol outline block into the patch.",
+	        "Hint: re-read the file with read_file to get exact current content, then rebuild the patch from the raw file text only. read_file prints each line as a right-aligned line number followed by a TAB (e.g. `    42\\t<code>`); copy only the code after the TAB. Do not copy the leading line number + tab or any truncation notice into the patch.",
     );
     msg
 }
@@ -1420,30 +1424,84 @@ fn strip_code_fence(patch: &str) -> String {
     lines[1..last_nonempty].join("\n").trim().to_string()
 }
 
-fn format_patch_success(paths: &[PathBuf]) -> String {
-    if paths.len() == 1 {
-        return format!("Successfully patched {}", paths[0].display());
+fn diff_stats_for_write(write: &PreparedPatchWrite) -> (usize, usize, usize) {
+    // (added, removed, total_lines_after)
+    match &write.action {
+        PreparedPatchAction::Write(next) => {
+            let after_lines = next.lines().count();
+            match &write.before {
+                Some(before) => {
+                    // 逐行对比统计新增/删除
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut before_set: Vec<u64> = before
+                        .lines()
+                        .map(|l| {
+                            let mut h = DefaultHasher::new();
+                            l.hash(&mut h);
+                            h.finish()
+                        })
+                        .collect();
+                    let mut added = 0usize;
+                    for l in next.lines() {
+                        let mut h = DefaultHasher::new();
+                        l.hash(&mut h);
+                        let hash = h.finish();
+                        if let Some(pos) = before_set.iter().position(|&x| x == hash) {
+                            before_set.remove(pos);
+                        } else {
+                            added += 1;
+                        }
+                    }
+                    let removed = before_set.len();
+                    (added, removed, after_lines)
+                }
+                None => (after_lines, 0, after_lines),
+            }
+        }
+        PreparedPatchAction::Delete => {
+            (0, write.before.as_ref().map_or(0, |b| b.lines().count()), 0)
+        }
     }
-    let mut message = format!("Successfully patched {} files:", paths.len());
-    for path in paths {
-        message.push_str(&format!("\n- {}", path.display()));
+}
+
+fn format_patch_success(writes: &[PreparedPatchWrite]) -> String {
+    if writes.len() == 1 {
+        let (added, removed, total) = diff_stats_for_write(&writes[0]);
+        return format!(
+            "Successfully patched {}; +{added} -{removed} ({total} lines)",
+            writes[0].path.display()
+        );
+    }
+    let mut message = format!("Successfully patched {} files:", writes.len());
+    for write in writes {
+        let (added, removed, total) = diff_stats_for_write(write);
+        message.push_str(&format!(
+            "\n- {}; +{added} -{removed} ({total} lines)",
+            write.path.display()
+        ));
     }
     message
 }
 
-fn format_patch_dry_run(paths: &[PathBuf]) -> String {
-    if paths.len() == 1 {
+fn format_patch_dry_run(writes: &[PreparedPatchWrite]) -> String {
+    if writes.len() == 1 {
+        let (added, removed, total) = diff_stats_for_write(&writes[0]);
         return format!(
-            "Dry run succeeded; no files changed: {}",
-            paths[0].display()
+            "Dry run succeeded; no files changed: {}; +{added} -{removed} ({total} lines after)",
+            writes[0].path.display()
         );
     }
     let mut message = format!(
         "Dry run succeeded for {} files; no files changed:",
-        paths.len()
+        writes.len()
     );
-    for path in paths {
-        message.push_str(&format!("\n- {}", path.display()));
+    for write in writes {
+        let (added, removed, total) = diff_stats_for_write(write);
+        message.push_str(&format!(
+            "\n- {}; +{added} -{removed} ({total} lines after)",
+            write.path.display()
+        ));
     }
     message
 }
@@ -1646,7 +1704,6 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         emit(&format!("parsed {} patch section(s)", envelopes.len()));
         let mut seen_targets = FxHashSet::default();
         let mut writes = Vec::with_capacity(envelopes.len());
-        let mut paths = Vec::with_capacity(envelopes.len());
         for (idx, envelope) in envelopes.iter().enumerate() {
             let target_arg = initial_file_path.unwrap_or(envelope.target_path.as_str());
             let store = FileStore::new(PathBuf::from(target_arg));
@@ -1682,17 +1739,15 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
                 emit(&format!("applying {hunk_count} hunk(s)"));
             }
             let write = prepare_patch_write(&path, &store, envelope).map_err(|err| {
-                format!("failed while preparing patch for {}: {err}", path.display())
+                format!("[section {}/{}] failed while preparing patch for {}: {err}", idx + 1, envelopes.len(), path.display())
             })?;
-            paths.push(path);
             writes.push(write);
         }
         if dry_run {
-            let success = format_patch_dry_run(&paths);
+            let success = format_patch_dry_run(&writes);
             emit(&success);
             return Ok(success);
         }
-        emit("rechecking files before commit");
         for write in &writes {
             match &write.action {
                 PreparedPatchAction::Write(next) => {
@@ -1702,7 +1757,7 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
             }
         }
         commit_patch_writes(&writes)?;
-        let success = format_patch_success(&paths);
+        let success = format_patch_success(&writes);
         emit(&success);
         return Ok(success);
     }
@@ -1738,16 +1793,15 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         action: PreparedPatchAction::Write(next),
     };
     if dry_run {
-        let success = format_patch_dry_run(&[path]);
+        let success = format_patch_dry_run(&[write]);
         emit(&success);
         return Ok(success);
     }
     if let PreparedPatchAction::Write(next) = &write.action {
-        emit("rechecking file before commit");
         emit(&format!("writing {} byte(s)", next.len()));
     }
+    let success = format_patch_success(std::slice::from_ref(&write));
     commit_patch_writes(&[write])?;
-    let success = format_patch_success(&[path]);
     emit(&success);
     Ok(success)
 }
@@ -2259,12 +2313,13 @@ mod tests {
             );
             assert!(streamed.contains("writing "), "streamed: {streamed}");
             assert!(
-                streamed.contains(&format!("Successfully patched {}", path.display())),
+                streamed.contains(&format!("Successfully patched {};", path.display())),
                 "streamed: {streamed}"
             );
-            assert_eq!(
-                result.content,
-                format!("Successfully patched {}", path.display())
+            assert!(
+                result.content.starts_with(&format!("Successfully patched {};", path.display())),
+                "result.content: {}",
+                result.content
             );
         });
 

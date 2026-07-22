@@ -49,7 +49,7 @@ const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
 const TOOL_OVERFLOW_HEAD_CHARS: usize = 800;
 /// 中等大输出阈值：超过此值但未到 overflow 阈值的工具结果，仅对非精确概览类
 /// 工具走"头 + 关键命中 + 尾"的按行裁剪，避免完整 32KB 全部进上下文。
-/// grep/code_search/find_path/read_file(_lines) 等精确证据工具不走该有损路径。
+/// grep/read_file(_lines) 等精确证据工具不走该有损路径。
 const MAX_TOOL_RESULT_LINE_TRIM_CHARS: usize = 8_000;
 
 /// 单条工具结果 inline（不 offload 到文件）的字符上限，按模型 context window 动态计算。
@@ -468,11 +468,9 @@ mod tests {
         assert!(content.chars().count() > MAX_TOOL_RESULT_LINE_TRIM_CHARS);
         assert!(content.chars().count() < MAX_TOOL_RESULT_INLINE_CHARS);
 
-        for tool_name in ["find_path", "code_search"] {
-            let prepared = prepare_tool_result(&app, tool_name, &content);
-            assert_eq!(prepared.content_for_model, content);
-            assert!(!prepared.content_for_model.contains("middle trimmed"));
-        }
+        let prepared = prepare_tool_result(&app, "read_file", &content);
+        assert_eq!(prepared.content_for_model, content);
+        assert!(!prepared.content_for_model.contains("middle trimmed"));
     }
 
     #[test]
@@ -497,7 +495,7 @@ mod tests {
             .collect::<String>();
         assert!(content.chars().count() > MAX_TOOL_RESULT_INLINE_CHARS);
 
-        let prepared = prepare_tool_result(&app, "find_path", &content);
+        let prepared = prepare_tool_result(&app, "read_file", &content);
 
         assert!(
             prepared

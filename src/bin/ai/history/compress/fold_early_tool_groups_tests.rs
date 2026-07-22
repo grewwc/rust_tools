@@ -81,7 +81,7 @@ fn folds_early_groups_in_a_single_bloated_turn() {
     let messages = single_turn_with_groups(10, 2_000);
     let before = messages_total_chars(&messages);
 
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
 
     // 10 组各 1 条 tool 结果 → 10 条 tool 消息。虽然 keep_recent_groups=4，但
     // 最近完整 4 组逐字保留，最早 6 组折叠。
@@ -97,7 +97,7 @@ fn folds_early_groups_in_a_single_bloated_turn() {
 #[test]
 fn preserves_user_message_verbatim() {
     let messages = single_turn_with_groups(8, 1_500);
-    let (folded, _) = fold_early_tool_groups(&messages, 4, None);
+    let (folded, _) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
 
     let user = folded
         .iter()
@@ -109,7 +109,7 @@ fn preserves_user_message_verbatim() {
 #[test]
 fn keeps_recent_groups_verbatim() {
     let messages = single_turn_with_groups(8, 1_500);
-    let (folded, _) = fold_early_tool_groups(&messages, 4, None);
+    let (folded, _) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
 
     // 8 组各 1 条 tool 结果。按完整组保护最近 4 组，最早 4 组折叠为 stub。
     let full_tool_results = folded
@@ -122,7 +122,7 @@ fn keeps_recent_groups_verbatim() {
 #[test]
 fn no_op_when_group_count_within_keep_window() {
     let messages = single_turn_with_groups(3, 1_000);
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
 
     assert_eq!(folded_groups, 0);
     assert_eq!(folded.len(), messages.len());
@@ -136,7 +136,7 @@ fn fold_never_crosses_recent_tool_message_protection_window() {
     let messages = single_turn_with_groups(10, 1_200);
 
     // keep_recent_groups=0 表面上要折叠全部 10 组。
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 0, None);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 0, None, &FxHashSet::default());
 
     // 每组 1 条 tool 结果；调用方要求保留 0 组，因此 10 组都可折叠。
     assert_eq!(folded_groups, 10);
@@ -167,7 +167,7 @@ fn stub_preserves_file_path_recall_anchor() {
         messages.push(tool_result(&id, "recent"));
     }
 
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
     assert!(folded_groups >= 1);
     let stub_text: String = folded
         .iter()
@@ -214,7 +214,7 @@ fn folded_read_file_group_keeps_preview_and_original_target_anchor() {
     }
 
     let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()));
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -261,11 +261,6 @@ fn folded_archived_precision_tools_keep_original_invocation_anchors() {
             "execute_command",
             r#"{"command":"git status --short","cwd":"/repo"}"#,
         ),
-        (
-            "search",
-            "code_search",
-            r#"{"operation":"text_search","query":"task_wait","path":"src/bin/ai"}"#,
-        ),
     ];
     for (id, name, arguments) in cases {
         messages.push(assistant_call_args(id, name, arguments));
@@ -284,7 +279,7 @@ fn folded_archived_precision_tools_keep_original_invocation_anchors() {
         messages.push(tool_result(&id, "recent"));
     }
 
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
     assert_eq!(folded_groups, 3);
     let folded_text = folded
         .iter()
@@ -308,14 +303,6 @@ fn folded_archived_precision_tools_keep_original_invocation_anchors() {
     );
     assert!(
         folded_text.contains("- original_cwd: /repo"),
-        "{folded_text}"
-    );
-    assert!(
-        folded_text.contains("- original_operation: text_search"),
-        "{folded_text}"
-    );
-    assert!(
-        folded_text.contains("- original_query: task_wait"),
         "{folded_text}"
     );
     assert!(
@@ -346,7 +333,7 @@ fn folded_command_failure_keeps_diagnostics_and_full_output_pointer() {
     }
 
     let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()));
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -554,7 +541,7 @@ fn folded_tool_group_keeps_assistant_checkpoint_and_evidence_targets() {
     }
 
     let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()));
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -611,7 +598,7 @@ fn folded_tool_group_falls_back_to_reasoning_when_content_empty() {
     }
 
     let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()));
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -632,6 +619,108 @@ fn folded_tool_group_falls_back_to_reasoning_when_content_empty() {
         !stub.contains("<empty; no persisted decision before these tool calls>"),
         "reasoning fallback must replace the empty-checkpoint placeholder: {stub}"
     );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn current_turn_precision_results_stay_raw_during_mid_turn_compress() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-current-turn-precision-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let content = (1..=120)
+        .map(|line| format!("{line:>6}\tlet value_{line} = {line};\n"))
+        .collect::<String>();
+    let mut messages = vec![
+        msg("system", "system prompt"),
+        msg("user", "当前轮读取后应直接修复"),
+    ];
+    messages.push(assistant_call_args(
+        "read-1",
+        "read_file",
+        r#"{"file_path":"src/lib.rs","offset":1,"limit":120}"#,
+    ));
+    messages.push(tool_result("read-1", &content));
+    messages.push(assistant_call_args(
+        "read-2",
+        "read_file",
+        r#"{"file_path":"src/lib.rs","offset":1,"limit":120}"#,
+    ));
+    messages.push(tool_result("read-2", &content));
+
+    let (compressed, _, _) = mid_turn_compress(messages, 2_000, Some(&overflow_dir));
+    let results = compressed
+        .iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| value_to_string(&message.content))
+        .collect::<Vec<_>>();
+
+    assert_eq!(results, vec![content.clone(), content]);
+    assert!(
+        results.iter().all(|text| {
+            !text.contains("[deduped:") && !text.contains("Output preserved for tool")
+        }),
+        "current-turn precision outputs must stay raw: {results:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn leading_compressed_tool_evidence_notes_are_not_immortal_prefix_context() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-leading-tool-evidence-{}", uuid::Uuid::new_v4()));
+    let compressed_note = format!(
+        "compressed_tool_round: 1 tool calls (folded for context budget)\n{}\nassistant_checkpoint: <empty; no persisted decision before these tool calls>\nevidence:\n- read_file [file: src/lib.rs] => {}",
+        COMPRESSED_TOOL_EVIDENCE_MARKER,
+        "x".repeat(1_200)
+    );
+    let mut messages = vec![
+        msg("system", "system prompt"),
+        msg(
+            ROLE_INTERNAL_NOTE,
+            "历史摘要（自动压缩，以下为更早对话的简短语义）：\n初始目标: 修复上下文压缩",
+        ),
+    ];
+    for _ in 0..8 {
+        messages.push(msg(ROLE_INTERNAL_NOTE, &compressed_note));
+    }
+    for i in 0..4 {
+        messages.push(msg("user", &format!("旧问题 {i}")));
+        messages.push(msg("assistant", "旧回答"));
+    }
+    messages.push(msg("user", "当前问题必须保留"));
+
+    let trim_idx = first_trim_candidate(&messages, 2_000)
+        .expect("leading compressed evidence should be eligible for trimming");
+    assert_eq!(
+        value_to_string(&messages[trim_idx].content),
+        compressed_note,
+        "summary/system prefix should stay protected, but compressed tool evidence should not"
+    );
+
+    let (compressed, before, after) = mid_turn_compress(messages, 2_000, Some(&overflow_dir));
+    assert!(after < before, "compression should make progress");
+    assert!(
+        compressed
+            .iter()
+            .any(|message| message.role == "user"
+                && message.content.as_str() == Some("当前问题必须保留")),
+        "latest user message must remain protected"
+    );
+    let remaining_evidence = compressed
+        .iter()
+        .filter(|message| is_compressed_tool_evidence_note(message))
+        .count();
+    assert!(
+        remaining_evidence < 8,
+        "stale compressed evidence notes should not remain an immortal prefix"
+    );
+    let archived = std::fs::read_to_string(overflow_dir.join("overflow-history.md"))
+        .expect("trimmed compressed evidence should be archived before removal");
+    assert!(archived.contains("compressed_tool_round"), "{archived}");
+    assert!(archived.contains(COMPRESSED_TOOL_EVIDENCE_MARKER), "{archived}");
 
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
@@ -660,7 +749,7 @@ fn folded_command_keeps_invocation_for_empty_success() {
     }
 
     let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()));
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -739,7 +828,7 @@ fn preserves_read_file_for_pending_patch_path() {
         messages.push(tool_result(&id, "recent"));
     }
 
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None);
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
     assert!(folded_groups >= 1, "应至少折叠 apply_patch/grep 组");
     // read_file 组必须逐字保留（不是 ROLE_INTERNAL_NOTE stub）。
     let rf = folded
@@ -793,7 +882,7 @@ fn preserves_read_file_for_each_pending_path_from_multi_file_patch() {
         messages.push(tool_result(&id, "recent"));
     }
 
-    let (folded, _) = fold_early_tool_groups(&messages, 4, None);
+    let (folded, _) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
     for target in ["/a.rs", "/b.rs"] {
         let preserved = folded.iter().any(|m| {
             m.role == "assistant"
@@ -847,7 +936,12 @@ fn removes_only_byte_identical_overlap_from_an_aged_read_file_result() {
         ),
     ]);
 
-    dedup_overlapping_read_file_results(&mut messages, &signatures, &FxHashSet::default());
+    dedup_overlapping_read_file_results(
+        &mut messages,
+        &signatures,
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+    );
 
     let earlier = value_to_string(&messages[1].content);
     assert!(earlier.contains("overlap dedup: 2"), "{earlier}");
@@ -884,7 +978,12 @@ fn retains_overlap_when_the_file_changed_between_reads() {
         ),
     ]);
 
-    dedup_overlapping_read_file_results(&mut messages, &signatures, &FxHashSet::default());
+    dedup_overlapping_read_file_results(
+        &mut messages,
+        &signatures,
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+    );
 
     assert_eq!(
         value_to_string(&messages[1].content),

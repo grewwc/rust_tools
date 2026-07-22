@@ -183,7 +183,7 @@ impl VerificationWorkflow {
              Context: {}\n\n\
              A good hypothesis should be:\n\
              1. Specific and falsifiable\n\
-             2. Testable with available tools (file read, command execution, code search)\n\
+             2. Testable with available tools (file read, path lookup, command execution)\n\
              3. Focused on a single claim\n\n\
              Output STRICT JSON: {{\"hypothesis\":\"...\",\"confidence\":0.8}}",
             question,

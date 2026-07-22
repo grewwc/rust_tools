@@ -3,7 +3,6 @@
 ## Scope
 
 Applies to `src/bin/ai/knowledge/**`.
-Keep this file brief; inspect the touched module directly before broad refactors.
 
 ## Key invariants
 

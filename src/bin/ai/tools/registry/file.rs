@@ -57,7 +57,7 @@ inventory::submit!(ToolRegistration {
         description: "Read a line-numbered excerpt from a local file (regular files only; directories are not supported; absolute paths only). Use offset/limit to page: a large limit for a broad overview during discovery, a small limit for a precise line-range read once you know the region you need.",
         parameters: params_read_file,
         execute: execute_read_file,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["executor", "builtin", "core"],
     }
 });
@@ -77,7 +77,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "write_file",
-        description: "Write a file. For scratch/intermediate files (scripts, data dumps, test fixtures that are not part of the project), pass temp=true with a relative filename to write under the per-session temp directory; the file is registered so it can be cleaned up later via delete_path. Without temp=true, this creates a new file or intentionally replaces an entire file at an absolute path — for modifying an existing project file, prefer apply_patch or a minimal localized edit instead of a full rewrite.",
+        description: "Write a file. For scratch/intermediate files (scripts, data dumps, test fixtures that are not part of the project), pass temp=true with a relative filename to write under the per-session temp directory; the file is registered so it can be cleaned up later via delete_path. Without temp=true, this creates a new file or intentionally replaces an entire file at an absolute path — for modifying an existing project file, prefer apply_patch or a minimal localized edit instead of a full rewrite. For deleting project/source/config files, including git-tracked files, use apply_patch with a `*** Delete File:` envelope section.",
         parameters: params_write_file,
         execute: execute_write_file,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -110,7 +110,7 @@ fn params_delete_path() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "delete_path",
-        description: "Delete a temporary file or directory that was created via write_file(temp=true). Only files registered in the persistent temp-file registry can be deleted — source code, configs, and other project files are always refused. Use this to clean up scratch/intermediate files when done. Files created with write_file(temp=true) are tracked in a JSON registry that survives session restarts. Single-file deletes are undoable; recursive directory deletes are not.",
+        description: "Delete a temporary file or directory that was created via write_file(temp=true). Only files registered in the persistent temp-file registry can be deleted — source code, configs, and other project files are always refused. Use apply_patch with a `*** Delete File:` envelope section to remove existing project/source/config files, including git-tracked files. Use this tool only to clean up scratch/intermediate temp files when done. Files created with write_file(temp=true) are tracked in a JSON registry that survives session restarts. Single-file deletes are undoable; recursive directory deletes are not.",
         parameters: params_delete_path,
         execute: execute_delete_path,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

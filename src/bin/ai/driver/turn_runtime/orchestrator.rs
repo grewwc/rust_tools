@@ -81,7 +81,7 @@ const LONG_LOOP_COMPRESS_ITERATION_THRESHOLD: usize = 12;
 /// 这是叠加在 exact / coarse 循环检测之上的第三层，用于治理「参数每轮都变、
 /// 但整体不推进任务」的发散型 loop——前两层按「签名重复」判定，结构上抓不到
 /// 每轮都在搜新符号 / 读新文件却始终零收敛的膨胀（真实案例：一个「删除方法」
-/// 的变更请求连续 60+ 轮只 read_file/code_search、零 apply_patch）。
+/// 的变更请求连续 60+ 轮只读取/检索、零 apply_patch）。
 ///
 /// 核心理念：不按「动作次数」计费，按「信息增益」这一**行为信号**计费——本轮
 /// 触碰到新目标资源（成功读取 / 检索到新目标），或调用了变更类工具，即算推进；
@@ -178,9 +178,15 @@ fn strip_volatile_args(value: &mut serde_json::Value) {
 }
 
 fn normalize_coarse_tool_args(tool_name: &str, value: &mut serde_json::Value) {
-    if tool_name != "execute_command" {
-        return;
+    match tool_name {
+        "execute_command" => normalize_coarse_execute_command_args(value),
+        "task_wait" => normalize_coarse_task_wait_args(value),
+        "task_status" => normalize_coarse_task_status_args(value),
+        _ => {}
     }
+}
+
+fn normalize_coarse_execute_command_args(value: &mut serde_json::Value) {
     let Some(map) = value.as_object_mut() else {
         return;
     };
@@ -199,6 +205,44 @@ fn normalize_coarse_tool_args(tool_name: &str, value: &mut serde_json::Value) {
     map.insert("command".to_string(), serde_json::Value::String(command));
     if let Some(cwd) = cwd {
         map.insert("cwd".to_string(), serde_json::Value::String(cwd));
+    }
+}
+
+fn normalize_coarse_task_wait_args(value: &mut serde_json::Value) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    let task_ids = map
+        .get("task_ids")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            let mut ids = values
+                .iter()
+                .filter_map(|v| v.as_str().map(str::trim))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids.dedup();
+            ids
+        });
+    map.clear();
+    if let Some(ids) = task_ids {
+        map.insert(
+            "task_ids".to_string(),
+            serde_json::Value::Array(
+                ids.into_iter()
+                    .map(serde_json::Value::String)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+}
+
+fn normalize_coarse_task_status_args(value: &mut serde_json::Value) {
+    if let Some(map) = value.as_object_mut() {
+        // task_status 忽略参数；不同空壳参数不应逃过 coarse 循环检测。
+        map.clear();
     }
 }
 
@@ -721,6 +765,9 @@ fn detect_target_repeat_loop(history: &[Vec<String>], window: usize) -> bool {
 /// 世界，却曾被无差别计为 Mutation 进展，导致模型反复刷同一批 git 检查就能不断
 /// 刷新 no-progress 预算、永不收敛。因此对 execute_command 额外判定：只有**非只读**
 /// 命令才算 Mutation 动作。
+///
+/// `task_wait` / `task_status` 也是双关工具：只有真正交付了子任务结果时才算推进。
+/// 空轮询、PARKED、BUDGET-ELAPSED、already-collected 提示和无任务状态都不算实质动作。
 fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bool {
     let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
         return false;
@@ -728,24 +775,72 @@ fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bool {
     let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
         return false;
     };
+    let tool_results_by_call_id: FxHashMap<&str, &str> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| {
+            let call_id = message.tool_call_id.as_deref()?;
+            let text = message.content.as_str().unwrap_or_default();
+            Some((call_id, text))
+        })
+        .collect();
     tool_calls.iter().any(|tc| {
-        if !MUTATION_TOOL_NAMES.contains(&tc.function.name.as_str()) {
+        let name = tc.function.name.as_str();
+        if !MUTATION_TOOL_NAMES.contains(&name) {
             return false;
         }
-        if tc.function.name != "execute_command" {
-            return true;
+        match name {
+            "execute_command" => {
+                // 只读取证命令不算变更进展；解析失败或非只读命令保守计为 Mutation
+                // （安全方向：避免把真实改动误判为无进展而过早收口）。
+                serde_json::from_str::<serde_json::Value>(tc.function.arguments.as_str())
+                    .ok()
+                    .and_then(|args| {
+                        args.get("command")
+                            .and_then(|v| v.as_str())
+                            .map(|cmd| !execute_command_is_read_only(cmd))
+                    })
+                    .unwrap_or(true)
+            }
+            "task_wait" | "task_status" => tool_results_by_call_id
+                .get(tc.id.as_str())
+                .is_some_and(|text| task_tool_result_delivered_task_output(text)),
+            _ => true,
         }
-        // 只读取证命令不算变更进展；解析失败或非只读命令保守计为 Mutation（安全方向：
-        // 避免把真实改动误判为无进展而过早收口）。
-        serde_json::from_str::<serde_json::Value>(tc.function.arguments.as_str())
-            .ok()
-            .and_then(|args| {
-                args.get("command")
-                    .and_then(|v| v.as_str())
-                    .map(|cmd| !execute_command_is_read_only(cmd))
-            })
-            .unwrap_or(true)
     })
+}
+
+fn task_tool_result_delivered_task_output(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.trim_start().starts_with("[Task: "))
+}
+
+fn current_tool_round_messages(
+    messages: &[crate::ai::history::Message],
+) -> Vec<crate::ai::history::Message> {
+    let Some(assistant_idx) = messages.iter().rposition(|message| {
+        message.role == "assistant"
+            && message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tool_calls| !tool_calls.is_empty())
+    }) else {
+        return Vec::new();
+    };
+    let Some(tool_calls) = messages[assistant_idx].tool_calls.as_ref() else {
+        return Vec::new();
+    };
+    let tool_call_ids: FxHashSet<&str> = tool_calls.iter().map(|tc| tc.id.as_str()).collect();
+    let mut out = vec![messages[assistant_idx].clone()];
+    let mut idx = assistant_idx + 1;
+    while idx < messages.len() && messages[idx].role == "tool" {
+        match messages[idx].tool_call_id.as_deref() {
+            Some(id) if tool_call_ids.contains(id) => out.push(messages[idx].clone()),
+            _ => break,
+        }
+        idx += 1;
+    }
+    out
 }
 
 /// 判断一条 shell 命令是否为纯只读取证（不改变世界）。解析不确定时返回 false
@@ -818,9 +913,59 @@ const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
     "annotate",
 ];
 
-/// 提取最近一轮成功触碰的「目标资源」集合：文件路径 / 检索 pattern / 命令首
-/// token。失败请求（尤其是拼错路径）不能被算作信息增益，否则模型可不断生成
-/// 新的无效参数来逃避收敛。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ToolResultProgressStatus {
+    Success,
+    Failure,
+    DedupOnly,
+    BlockedOutsideWorkspace(String),
+}
+
+fn classify_tool_result_progress(text: &str) -> ToolResultProgressStatus {
+    let text = text.trim_start();
+    if let Some(path) = blocked_outside_workspace_path(text) {
+        return ToolResultProgressStatus::BlockedOutsideWorkspace(path);
+    }
+    if is_dedup_only_tool_result(text) {
+        return ToolResultProgressStatus::DedupOnly;
+    }
+    if text.starts_with("Error:") || text.starts_with("Exit code:") {
+        return ToolResultProgressStatus::Failure;
+    }
+    ToolResultProgressStatus::Success
+}
+
+fn is_dedup_only_tool_result(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("[deduped:") || text.starts_with("[overlap dedup:")
+}
+
+fn blocked_outside_workspace_path(text: &str) -> Option<String> {
+    let marker = "Command blocked: command references path ";
+    let rest = text.split_once(marker)?.1;
+    if let Some((_, after_resolves)) = rest.split_once(" (resolves to ") {
+        let resolved = after_resolves
+            .split_once(") which is outside")
+            .map(|(path, _)| path)
+            .or_else(|| after_resolves.split_once(')').map(|(path, _)| path))?
+            .trim();
+        if !resolved.is_empty() {
+            return Some(normalize_path_like_token(resolved));
+        }
+    }
+
+    let original = rest
+        .split_once(" which is outside")
+        .map(|(path, _)| path)
+        .unwrap_or(rest)
+        .trim();
+    (!original.is_empty()).then(|| normalize_path_like_token(original))
+}
+
+/// 提取最近一轮触碰的「目标资源」集合：文件路径 / 检索 pattern / 命令 coarse
+/// target。普通失败请求（尤其是拼错路径）不能被算作信息增益，否则模型可不断生成
+/// 新的无效参数来逃避收敛；但沙箱外路径拒绝会归一成稳定目标，专门用于识别
+/// 反复读取同一个禁止路径的循环。
 fn extract_round_targets(messages: &[crate::ai::history::Message]) -> Vec<String> {
     use serde_json::Value;
     let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
@@ -829,26 +974,33 @@ fn extract_round_targets(messages: &[crate::ai::history::Message]) -> Vec<String
     let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
         return Vec::new();
     };
-    let results_by_call_id: FxHashMap<&str, bool> = messages
+    let results_by_call_id: FxHashMap<&str, ToolResultProgressStatus> = messages
         .iter()
         .filter(|message| message.role == "tool")
         .filter_map(|message| {
             let call_id = message.tool_call_id.as_deref()?;
-            let text = message.content.as_str().unwrap_or_default().trim_start();
-            Some((
-                call_id,
-                !text.starts_with("Error:") && !text.starts_with("Exit code:"),
-            ))
+            let text = message.content.as_str().unwrap_or_default();
+            Some((call_id, classify_tool_result_progress(text)))
         })
         .collect();
 
     let mut targets = Vec::new();
     for tc in tool_calls.iter() {
-        if results_by_call_id
-            .get(tc.id.as_str())
-            .is_some_and(|success| !success)
-        {
-            continue;
+        match results_by_call_id.get(tc.id.as_str()) {
+            Some(ToolResultProgressStatus::Success) | None => {}
+            Some(ToolResultProgressStatus::BlockedOutsideWorkspace(path))
+                if tc.function.name == "execute_command" =>
+            {
+                targets.push(format!(
+                    "execute_command:blocked-outside-workspace:{path}"
+                ));
+                continue;
+            }
+            Some(
+                ToolResultProgressStatus::BlockedOutsideWorkspace(_)
+                | ToolResultProgressStatus::Failure
+                | ToolResultProgressStatus::DedupOnly,
+            ) => continue,
         }
         let Ok(args) = serde_json::from_str::<Value>(tc.function.arguments.as_str()) else {
             continue;
@@ -960,8 +1112,8 @@ struct TurnSupervisor {
     last_compress_after_chars: usize,
     tool_signature_history: Vec<Vec<String>>,
     tool_signature_history_coarse: Vec<Vec<String>>,
-    /// 每轮触碰的「coarse 目标资源」集合历史（同 read_file 文件 / 同 code_search
-    /// query / 同 execute_command coarse 命令，忽略翻页参数）。用于抓「整轮签名不
+    /// 每轮触碰的「coarse 目标资源」集合历史（同 read_file 文件 /
+    /// 同 execute_command coarse 命令，忽略翻页参数）。用于抓「整轮签名不
     /// 相等、但同一目标被混在不同工具批次里反复取证」的循环——纯整轮签名比较对
     /// 这类混合批次无能为力（每轮多一个陪衬工具即逃逸）。
     tool_target_history: Vec<Vec<String>>,
@@ -975,7 +1127,7 @@ enum ToolLoopSignal {
     /// 近似低收益重复：同一工具反复命中同一目标资源（忽略翻页参数）。温和提示一次。
     Coarse,
     /// 混合工具轮里同一目标资源被反复取证：整轮签名各不相等（每轮穿插不同陪衬
-    /// 工具）逃过了 exact/coarse 整轮比较，但某个 read_file 文件 / code_search query
+    /// 工具）逃过了 exact/coarse 整轮比较，但某个 read_file 文件
     /// 在窗口每一轮都出现。温和提示一次。
     TargetRepeat,
     /// `execute_command` 在同一 coarse 目标上长时间空转，直接强制收敛。
@@ -1103,6 +1255,20 @@ impl TurnSupervisor {
         messages: &[crate::ai::history::Message],
         free_explore_rounds: usize,
     ) -> ToolLoopSignal {
+        self.record_tool_signatures_for_progress(messages, messages, free_explore_rounds)
+    }
+
+    fn record_tool_signatures_for_progress(
+        &mut self,
+        messages: &[crate::ai::history::Message],
+        progress_messages: &[crate::ai::history::Message],
+        free_explore_rounds: usize,
+    ) -> ToolLoopSignal {
+        let signature_messages = if progress_messages.is_empty() {
+            messages
+        } else {
+            progress_messages
+        };
         // 截断重试跳过：清空历史后不记录本轮签名，避免截断重试
         // 被误判为工具循环。`skip_tool_signature_rounds` 由
         // `mark_truncation_skip()` 递增，每跳过一次递减。
@@ -1110,7 +1276,7 @@ impl TurnSupervisor {
             self.skip_tool_signature_rounds -= 1;
             return ToolLoopSignal::None;
         }
-        let Some(sigs) = extract_round_tool_signatures(messages) else {
+        let Some(sigs) = extract_round_tool_signatures(signature_messages) else {
             return ToolLoopSignal::None;
         };
         self.tool_signature_history.push(sigs);
@@ -1118,7 +1284,7 @@ impl TurnSupervisor {
             let drop = self.tool_signature_history.len() - TOOL_SIGNATURE_HISTORY_LIMIT;
             self.tool_signature_history.drain(0..drop);
         }
-        if let Some(coarse) = extract_round_tool_signatures_coarse(messages) {
+        if let Some(coarse) = extract_round_tool_signatures_coarse(signature_messages) {
             self.tool_signature_history_coarse.push(coarse);
             if self.tool_signature_history_coarse.len() > TOOL_SIGNATURE_HISTORY_LIMIT {
                 let drop = self.tool_signature_history_coarse.len() - TOOL_SIGNATURE_HISTORY_LIMIT;
@@ -1127,7 +1293,8 @@ impl TurnSupervisor {
         }
         // 目标级历史：与 coarse 签名平行维护，供混合工具轮的目标交集检测使用。
         // 与 exact/coarse 一样受 TOOL_SIGNATURE_HISTORY_LIMIT 约束。
-        self.tool_target_history.push(extract_round_targets(messages));
+        self.tool_target_history
+            .push(extract_round_targets(signature_messages));
         if self.tool_target_history.len() > TOOL_SIGNATURE_HISTORY_LIMIT {
             let drop = self.tool_target_history.len() - TOOL_SIGNATURE_HISTORY_LIMIT;
             self.tool_target_history.drain(0..drop);
@@ -1179,7 +1346,7 @@ impl TurnSupervisor {
         }
         // exact/coarse 均未命中「签名重复」型循环时，交给 Progress Budget 补位：
         // 抓「参数每轮都变、但整体不推进任务」的发散型 loop。
-        self.assess_progress(messages, free_explore_rounds)
+        self.assess_progress(messages, progress_messages, free_explore_rounds)
     }
 
     /// Progress Budget 判定：按「信息增益」而非动作次数计费。只在 exact/coarse
@@ -1194,17 +1361,19 @@ impl TurnSupervisor {
     fn assess_progress(
         &mut self,
         messages: &[crate::ai::history::Message],
+        progress_messages: &[crate::ai::history::Message],
         free_explore_rounds: usize,
     ) -> ToolLoopSignal {
         // 本轮是否推进了任务：触碰新目标（信息增益）或调用变更类工具（实质动作）。
-        let mut made_progress = round_has_mutation(messages);
-        for t in extract_round_targets(messages) {
+        let mut made_progress = round_has_mutation(progress_messages);
+        for t in extract_round_targets(progress_messages) {
             if self.progress.seen_targets.insert(t) {
                 made_progress = true;
             }
         }
 
-        let reasoning_fp = extract_round_reasoning_fingerprint(messages);
+        let reasoning_fp = extract_round_reasoning_fingerprint(progress_messages)
+            .or_else(|| extract_round_reasoning_fingerprint(messages));
         if made_progress {
             // 实质进展：清零无进展计数，并重置已注入的升级阶梯标志（soft / grace /
             // hard / grace_until），让模型在「被提醒收敛 -> 真正推进」后获得完整的新
@@ -1573,9 +1742,9 @@ mod tests {
 
     #[test]
     fn detect_tool_loop_triggers_for_short_periodic_cycles() {
-        let a = vec!["find_path::{\"pattern\":\"**/a.rs\"}".to_string()];
+        let a = vec!["list_directory::{\"path\":\"src\"}".to_string()];
         let b = vec!["read_file::{\"path\":\"src/bin/a.rs\"}".to_string()];
-        let c = vec!["code_search::{\"query\":\"internal_note\"}".to_string()];
+        let c = vec!["list_directory::{\"path\":\"src/bin\"}".to_string()];
 
         assert!(detect_tool_loop(
             &[a.clone(), b.clone(), a.clone(), b.clone()],
@@ -2226,6 +2395,65 @@ mod tests {
         }
     }
 
+    fn pb_execute_command_msg(command: &str, id: &str) -> crate::ai::history::Message {
+        crate::ai::history::Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "execute_command".to_string(),
+                    arguments: serde_json::json!({ "command": command }).to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn pb_task_tool_msg(
+        tool_name: &str,
+        args: serde_json::Value,
+        id: &str,
+    ) -> crate::ai::history::Message {
+        crate::ai::history::Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: tool_name.to_string(),
+                    arguments: args.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn pb_tool_result(id: &str, text: &str) -> crate::ai::history::Message {
+        crate::ai::history::Message {
+            role: "tool".to_string(),
+            content: serde_json::Value::String(text.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+        }
+    }
+
+    fn pb_task_round(
+        messages: &mut Vec<crate::ai::history::Message>,
+        tool_name: &str,
+        args: serde_json::Value,
+        id: &str,
+        result: &str,
+    ) {
+        messages.push(pb_task_tool_msg(tool_name, args, id));
+        messages.push(pb_tool_result(id, result));
+    }
+
     /// 失败的只读调用轮：assistant 发起 read_file，紧跟一条 tool 结果表示读取失败。
     /// 失败调用不进入 `extract_round_targets`（无目标 → 无信息增益 → 无进展），
     /// 且因每轮 path 不同而绕过 exact/coarse 签名循环检测，是进展预算升级阶梯
@@ -2252,6 +2480,40 @@ mod tests {
         messages.push(crate::ai::history::Message {
             role: "tool".to_string(),
             content: serde_json::Value::String("Error: File not found".to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+        });
+    }
+
+    fn pb_dedup_read_round(
+        messages: &mut Vec<crate::ai::history::Message>,
+        path: &str,
+        id: &str,
+    ) {
+        messages.push(pb_read_msg(path, id));
+        messages.push(crate::ai::history::Message {
+            role: "tool".to_string(),
+            content: serde_json::Value::String(
+                "[deduped: byte-identical `read_file` result already present verbatim earlier in this conversation; content unchanged since then.]\n- original_tool_call_id: later\n- canonical_tool_call_id: earlier\n- preview: fn main() {}".to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+        });
+    }
+
+    fn pb_blocked_outside_workspace_round(
+        messages: &mut Vec<crate::ai::history::Message>,
+        command: &str,
+        id: &str,
+    ) {
+        messages.push(pb_execute_command_msg(command, id));
+        messages.push(crate::ai::history::Message {
+            role: "tool".to_string(),
+            content: serde_json::Value::String(
+                "Error: execute_command failed: Command blocked: command references path ~/.config/mcp.json (resolves to /Users/bytedance/.config/mcp.json) which is outside the current workspace\nSuggestion: inspect files inside the current project instead.".to_string(),
+            ),
             tool_calls: None,
             tool_call_id: Some(id.to_string()),
             reasoning_content: None,
@@ -2330,8 +2592,77 @@ mod tests {
         assert!(supervisor.progress.seen_targets.is_empty());
     }
 
+    #[test]
+    fn progress_budget_ignores_dedup_only_read_targets() {
+        let mut supervisor = TurnSupervisor::default();
+        supervisor.iteration = 30;
+        let mut messages = Vec::new();
+        let mut last = ToolLoopSignal::None;
+
+        for i in 0..5 {
+            pb_dedup_read_round(&mut messages, &format!("src/repeated-{i}.rs"), &format!("dedup-{i}"));
+            last = supervisor.record_tool_signatures(
+                &messages,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+        }
+
+        assert!(matches!(last, ToolLoopSignal::LowProgressSoft));
+        assert!(
+            supervisor.progress.seen_targets.is_empty(),
+            "dedup-only stubs should not count as fresh evidence targets"
+        );
+    }
+
+    #[test]
+    fn blocked_outside_workspace_command_normalizes_to_stable_target() {
+        let mut messages = Vec::new();
+        pb_blocked_outside_workspace_round(&mut messages, "cat ~/.config/mcp.json", "blocked-1");
+
+        assert_eq!(
+            extract_round_targets(&messages),
+            vec![
+                "execute_command:blocked-outside-workspace:/Users/bytedance/.config/mcp.json"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn target_repeat_catches_repeated_blocked_outside_workspace_commands() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let commands = [
+            "cat ~/.config/mcp.json",
+            "grep api ~/.config/mcp.json",
+            "head -20 ~/.config/mcp.json",
+            "tail -20 ~/.config/mcp.json",
+            "wc -l ~/.config/mcp.json",
+        ];
+        let mut signals = Vec::new();
+        for (i, command) in commands.iter().enumerate() {
+            pb_blocked_outside_workspace_round(&mut messages, command, &format!("blocked-{i}"));
+            signals.push(supervisor.record_tool_signatures(
+                &messages,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            ));
+        }
+
+        assert!(
+            signals[..TOOL_LOOP_COARSE_WINDOW - 1]
+                .iter()
+                .all(|signal| matches!(signal, ToolLoopSignal::None)),
+            "blocked command variants should not trigger earlier exact/coarse loops: {signals:?}"
+        );
+        assert!(matches!(
+            signals[TOOL_LOOP_COARSE_WINDOW - 1],
+            ToolLoopSignal::TargetRepeat
+        ));
+        assert!(supervisor.target_repeat_note_injected);
+    }
+
     /// 混合工具轮里同一目标反复取证：每轮都读同一个文件 A，但穿插一个每轮都不同的
-    /// code_search，使整轮 exact/coarse 签名各不相等而逃过 detect_tool_loop；此时
+    /// list_directory，使整轮 exact/coarse 签名各不相等而逃过 detect_tool_loop；此时
     /// 目标交集检测应抓到「A 每轮都在」并发出一次 TargetRepeat。
     #[test]
     fn turn_supervisor_emits_target_repeat_for_mixed_tool_rounds_on_same_file() {
@@ -2349,13 +2680,13 @@ mod tests {
                             arguments: "{\"path\":\"src/bin/ai/mod.rs\"}".to_string(),
                         },
                     },
-                    // 每轮不同的陪衬检索：让整轮签名各不相等，逃过整轮判等。
+                    // 每轮不同的陪衬目录读取：让整轮签名各不相等，逃过整轮判等。
                     crate::ai::types::ToolCall {
                         id: format!("search-{i}"),
                         tool_type: "function".to_string(),
                         function: crate::ai::types::FunctionCall {
-                            name: "code_search".to_string(),
-                            arguments: format!("{{\"query\":\"probe_{i}\"}}"),
+                            name: "list_directory".to_string(),
+                            arguments: format!("{{\"path\":\"src/probe_{i}\"}}"),
                         },
                     },
                 ]),
@@ -2444,6 +2775,206 @@ mod tests {
             supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         assert!(matches!(signal, ToolLoopSignal::None));
         assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+    }
+
+    #[test]
+    fn progress_budget_uses_pre_compress_current_round_for_apply_patch_progress() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut compressed_messages = Vec::new();
+        // 固定在计费区，并预置 4 轮无进展；下一轮若仍按压缩后视图判定，
+        // 会触发 LowProgressSoft。真实当前轮是 apply_patch，必须按原始工具轮清零。
+        supervisor.iteration = 30;
+        supervisor.progress.consecutive_no_progress = 4;
+
+        pb_failed_read_round(&mut compressed_messages, "src/missing.rs", "read-after-compress");
+
+        let mut current_round = Vec::new();
+        current_round.push(pb_apply_patch_msg("patch-current"));
+        current_round.push(pb_tool_result("patch-current", "Patch applied successfully."));
+
+        let signal = supervisor.record_tool_signatures_for_progress(
+            &compressed_messages,
+            &current_round,
+            PROGRESS_FREE_EXPLORE_ROUNDS,
+        );
+
+        assert!(
+            matches!(signal, ToolLoopSignal::None),
+            "apply_patch in the raw current round must not be hidden by compressed messages"
+        );
+        assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+    }
+
+    #[test]
+    fn task_wait_status_idle_results_do_not_count_as_mutation_progress() {
+        let idle_results = [
+            (
+                "task_wait",
+                serde_json::json!({ "task_ids": ["task-1"], "timeout_secs": 1 }),
+                "[task_wait] All 1 referenced task(s) already completed and their results were delivered by an earlier task_wait call. No tasks remain to wait on; continue reasoning with the results you already collected.",
+            ),
+            (
+                "task_wait",
+                serde_json::json!({ "task_ids": ["task-1"], "wait_policy": "all" }),
+                "[task_wait PARKED] Yielded CPU so 1 pending subagent task(s) can run. This is normal cooperative scheduling, NOT a timeout and NOT a stall.",
+            ),
+            (
+                "task_wait",
+                serde_json::json!({ "task_ids": ["task-1"], "timeout_secs": 1 }),
+                "[task_wait BUDGET ELAPSED] 1 pending subagent task(s) still running in the background. wait_policy=all, timeout_secs=1.",
+            ),
+            (
+                "task_status",
+                serde_json::json!({}),
+                "No async tasks currently tracked.",
+            ),
+        ];
+
+        for (idx, (tool_name, args, result)) in idle_results.into_iter().enumerate() {
+            let mut messages = Vec::new();
+            pb_task_round(
+                &mut messages,
+                tool_name,
+                args,
+                &format!("task-idle-{idx}"),
+                result,
+            );
+            assert!(
+                !round_has_mutation(&messages),
+                "{tool_name} idle result must not reset progress budget: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_wait_status_delivered_task_output_counts_as_mutation_progress() {
+        let delivered = "[Task: inspect driver via explorer @ sonnet] SUCCESS after 0.1s\nConfirmed result.";
+        let status_delivered = format!(
+            "TaskID              PID      Agent          Model          State       Description\n\
+             task-1              42       explorer       sonnet         completed   inspect\n\n\
+             Completed task results below (already collected — no need to wait for these):\n{delivered}"
+        );
+        let cases = [
+            (
+                "task_wait",
+                serde_json::json!({ "task_ids": ["task-1"] }),
+                delivered,
+            ),
+            ("task_status", serde_json::json!({}), status_delivered.as_str()),
+        ];
+
+        for (idx, (tool_name, args, result)) in cases.into_iter().enumerate() {
+            let mut messages = Vec::new();
+            pb_task_round(
+                &mut messages,
+                tool_name,
+                args,
+                &format!("task-result-{idx}"),
+                result,
+            );
+            assert!(
+                round_has_mutation(&messages),
+                "{tool_name} with collected subagent output must count as progress"
+            );
+        }
+    }
+
+    #[test]
+    fn task_wait_status_idle_polling_does_not_reset_progress_budget() {
+        let mut supervisor = TurnSupervisor::default();
+        supervisor.iteration = 30;
+        let mut messages = Vec::new();
+
+        for i in 0..4 {
+            pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
+            let signal =
+                supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            assert!(matches!(signal, ToolLoopSignal::None));
+        }
+        assert_eq!(supervisor.progress.consecutive_no_progress, 4);
+
+        pb_task_round(
+            &mut messages,
+            "task_wait",
+            serde_json::json!({ "task_ids": ["task-1"], "timeout_secs": 1 }),
+            "task-wait-idle",
+            "[task_wait BUDGET ELAPSED] 1 pending subagent task(s) still running in the background. wait_policy=all, timeout_secs=1.",
+        );
+        let signal =
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(matches!(signal, ToolLoopSignal::LowProgressSoft));
+        assert_eq!(supervisor.progress.consecutive_no_progress, 5);
+    }
+
+    #[test]
+    fn task_wait_status_delivered_result_resets_progress_budget() {
+        let mut supervisor = TurnSupervisor::default();
+        supervisor.iteration = 30;
+        let mut messages = Vec::new();
+
+        for i in 0..4 {
+            pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
+            let signal =
+                supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            assert!(matches!(signal, ToolLoopSignal::None));
+        }
+        assert_eq!(supervisor.progress.consecutive_no_progress, 4);
+
+        pb_task_round(
+            &mut messages,
+            "task_status",
+            serde_json::json!({}),
+            "task-status-result",
+            "TaskID              PID      Agent          Model          State       Description\n\
+             task-1              42       explorer       sonnet         completed   inspect\n\n\
+             Completed task results below (already collected — no need to wait for these):\n\
+             [Task: inspect driver via explorer @ sonnet] SUCCESS after 0.1s\nConfirmed result.",
+        );
+        let signal =
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(matches!(signal, ToolLoopSignal::None));
+        assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+    }
+
+    #[test]
+    fn task_wait_status_coarse_signatures_ignore_polling_noise() {
+        let wait_a = pb_task_tool_msg(
+            "task_wait",
+            serde_json::json!({
+                "task_ids": ["task-b", "task-a", "task-a"],
+                "timeout_secs": 1,
+                "wait_policy": "any"
+            }),
+            "wait-a",
+        );
+        let wait_b = pb_task_tool_msg(
+            "task_wait",
+            serde_json::json!({
+                "task_ids": ["task-a", "task-b"],
+                "timeout_secs": 600,
+                "wait_policy": "all"
+            }),
+            "wait-b",
+        );
+        assert_eq!(
+            extract_round_tool_signatures_coarse(&[wait_a]).unwrap(),
+            extract_round_tool_signatures_coarse(&[wait_b]).unwrap()
+        );
+
+        let status_a = pb_task_tool_msg(
+            "task_status",
+            serde_json::json!({ "noise": "a" }),
+            "status-a",
+        );
+        let status_b = pb_task_tool_msg(
+            "task_status",
+            serde_json::json!({ "noise": "b", "limit": 10 }),
+            "status-b",
+        );
+        assert_eq!(
+            extract_round_tool_signatures_coarse(&[status_a]).unwrap(),
+            extract_round_tool_signatures_coarse(&[status_b]).unwrap()
+        );
     }
 
     #[test]
@@ -2759,6 +3290,7 @@ async fn run_turn_body(
             Ok(e) => e,
             Err(err) => break 'turn Err(err),
         };
+        let had_tool_call_execution = matches!(&execution, IterationExecution::ToolCall(_));
         {
             let mc = mcp_client.lock().unwrap().routing_snapshot();
             // 用服务端返回的实际 prompt_tokens 校正后续请求的 max_tokens clamp。
@@ -3007,6 +3539,11 @@ async fn run_turn_body(
             }
         }
         // ↓↓↓ Continue 分支的后续处理（已离开 mc 锁，可以安全 await）↓↓↓
+        let progress_messages = if had_tool_call_execution {
+            current_tool_round_messages(&messages)
+        } else {
+            Vec::new()
+        };
 
         // === Mid-turn 渐进式压缩 ===
         // 每轮 tool 执行完毕后检查 messages 总字符；超过软阈值时
@@ -3076,7 +3613,15 @@ async fn run_turn_body(
         }
 
         // === 工具循环检测 ===
-        match supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS)
+        match supervisor.record_tool_signatures_for_progress(
+            &messages,
+            if progress_messages.is_empty() {
+                &messages
+            } else {
+                &progress_messages
+            },
+            PROGRESS_FREE_EXPLORE_ROUNDS,
+        )
         {
             ToolLoopSignal::None => {}
             ToolLoopSignal::Coarse => {

@@ -1021,6 +1021,31 @@ fn read_file_call_pair(id: &str, path: &str, content: &str) -> (Message, Message
     (assistant, tool)
 }
 
+fn tool_call_pair(id: &str, tool_name: &str, arguments: &str, content: &str) -> (Message, Message) {
+    let assistant = Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: tool_name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let tool = Message {
+        role: "tool".to_string(),
+        content: Value::String(content.to_string()),
+        tool_calls: None,
+        tool_call_id: Some(id.to_string()),
+        reasoning_content: None,
+    };
+    (assistant, tool)
+}
+
 #[test]
 fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_versions() {
     // 回归测试：断开"重复整篇重读"失忆环。
@@ -1082,19 +1107,29 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
         "byte-identical repeated read_file must collapse to exactly one full copy"
     );
 
-    let dedup_stubs = compressed
+    let dedup_stubs: Vec<&str> = compressed
         .iter()
-        .filter(|m| {
-            m.content
-                .as_str()
-                .map(|s| s.contains("byte-identical") && s.contains("No need to re-read"))
-                .unwrap_or(false)
-        })
-        .count();
+        .filter_map(|m| m.content.as_str())
+        .filter(|s| s.contains("byte-identical") && s.contains("No need to re-read"))
+        .collect();
     assert_eq!(
-        dedup_stubs, 5,
+        dedup_stubs.len(),
+        5,
         "the other five identical reads must become re-read-suppressing dedup stubs"
     );
+    for (i, stub) in dedup_stubs.iter().enumerate() {
+        let call_id = format!("call_same_{}", i + 1);
+        assert!(stub.contains("- original_tool_call_id: "), "{stub}");
+        assert!(stub.contains("- canonical_tool_call_id: call_same_0"), "{stub}");
+        assert!(stub.contains(&format!("- original_tool_call_id: {call_id}")), "{stub}");
+        assert!(stub.contains("- first_occurrence_message_index: "), "{stub}");
+        assert!(stub.contains(r#""filePath":"/repo/agent_adapter.py""#), "{stub}");
+        assert!(
+            stub.contains("- original_target: file=/repo/agent_adapter.py"),
+            "{stub}"
+        );
+        assert!(stub.contains("- preview: // agent_adapter.py"), "{stub}");
+    }
 
     // 两个内容不同的版本都必须完整保留，绝不因签名相同而被折叠。
     assert!(
@@ -1109,6 +1144,41 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
             .any(|m| m.content.as_str() == Some(changed_v2.as_str())),
         "changed file version 2 must be preserved verbatim"
     );
+}
+
+#[test]
+fn compression_dedup_stub_preserves_identical_list_directory_call_context() {
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("system prompt".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    for id in ["list-1", "list-2"] {
+        let (assistant, tool) = tool_call_pair(
+            id,
+            "list_directory",
+            r#"{"path":"/repo/src/bin/ai"}"#,
+            "driver/\nhistory/\ntools/",
+        );
+        messages.push(assistant);
+        messages.push(tool);
+    }
+
+    let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None);
+    let stub = compressed
+        .iter()
+        .filter_map(|m| m.content.as_str())
+        .find(|s| s.contains("byte-identical `list_directory`"))
+        .expect("duplicate list_directory result should collapse to a self-describing stub");
+
+    assert!(stub.contains("- original_tool_call_id: list-2"), "{stub}");
+    assert!(stub.contains("- canonical_tool_call_id: list-1"), "{stub}");
+    assert!(stub.contains("- original_args: {\"path\":\"/repo/src/bin/ai\"}"), "{stub}");
+    assert!(stub.contains("- original_target: path=/repo/src/bin/ai"), "{stub}");
+    assert!(stub.contains("- preview: driver/ history/ tools/"), "{stub}");
 }
 
 #[test]
@@ -1492,7 +1562,7 @@ fn large_image_does_not_evict_tool_history_from_budget() {
         Message {
             role: "tool".to_string(),
             content: Value::String(
-                "code_search 结果：found memo.rs at src/bin/re/memo".to_string(),
+                "read_file 结果：found memo.rs at src/bin/re/memo".to_string(),
             ),
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
@@ -1521,7 +1591,7 @@ fn large_image_does_not_evict_tool_history_from_budget() {
 
     let kept_tool_result = compressed.iter().any(|m| {
         m.role == "tool"
-            && m.content.as_str() == Some("code_search 结果：found memo.rs at src/bin/re/memo")
+            && m.content.as_str() == Some("read_file 结果：found memo.rs at src/bin/re/memo")
     });
     assert!(
         kept_tool_result,
@@ -2194,8 +2264,8 @@ fn context_history_summary_keeps_tool_names_and_results() {
                         id: format!("call_{i}"),
                         tool_type: "function".to_string(),
                         function: FunctionCall {
-                            name: "find_path".to_string(),
-                            arguments: format!(r#"{{"query":"issue-{i}"}}"#),
+                            name: "list_directory".to_string(),
+                            arguments: format!(r#"{{"path":"issue-{i}"}}"#),
                         },
                     }]),
                     tool_call_id: None,
@@ -2230,7 +2300,7 @@ fn context_history_summary_keeps_tool_names_and_results() {
         .unwrap_or_default()
         .to_string();
     assert!(summary.contains("已知工具结论"));
-    assert!(summary.contains("find_path"));
+    assert!(summary.contains("list_directory"));
     assert!(summary.contains("issue-0"));
     assert!(summary.contains("ERROR") || summary.contains("repeated failure"));
 

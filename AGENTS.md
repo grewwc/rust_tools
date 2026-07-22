@@ -3,9 +3,8 @@
 ## Scope
 
 Root-level overview and repo-wide invariants only. Subsystem details belong in
-scoped `AGENTS.md` files (under important subdirectories) or
-`docs/agent-guides/*.md` (long-form, loaded on demand). Only `AGENTS.md` /
-`Agent.md` / `CLAUDE.md` are auto-discovered; `docs/agent-guides/` are **not**.
+scoped `AGENTS.md` files (under important subdirectories). Only `AGENTS.md` /
+`Agent.md` / `CLAUDE.md` are auto-discovered.
 
 ## Overview
 
@@ -30,7 +29,6 @@ crates/mcp_browser/         # standalone MCP server: browser automation via chro
 crates/mcp_excel/           # standalone MCP server: real Microsoft Excel automation via AppleScript (osascript)
 tests/                      # integration tests
 models.json                 # model registry
-docs/agent-guides/          # long-form on-demand subsystem docs
 ```
 
 > `crates/mcp_browser` pulls in the heavy `chromiumoxide` dep, but it is a

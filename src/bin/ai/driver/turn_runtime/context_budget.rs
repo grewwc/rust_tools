@@ -401,14 +401,7 @@ fn precision_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String
 }
 
 fn is_precision_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "read_file"
-            | "find_path"
-            | "code_search"
-            | "web_search"
-            | "web_fetch"
-    )
+    matches!(tool_name, "read_file" | "web_search" | "web_fetch")
 }
 
 fn collect_protected_messages(messages: &[Message]) -> Vec<ProtectedMessage> {
@@ -625,7 +618,7 @@ mod tests {
     fn context_budget_classifies_precision_tools_as_offload_only() {
         let messages = vec![
             msg("system", "s"),
-            assistant_tool_call("call-1", "find_path"),
+            assistant_tool_call("call-1", "read_file"),
             tool_result("call-1", "src/main.rs:1: fn main()"),
             msg("user", "current"),
         ];
@@ -658,11 +651,11 @@ mod tests {
                 )
             })
             .collect::<String>();
-        // 大体量 find_path 结果必须位于「最近 6 条工具结果」保护窗之外才会被外溢，
+        // 大体量 read_file 结果必须位于「最近 6 条工具结果」保护窗之外才会被外溢，
         // 否则近端窗口会逐字保留（防止刚检索到的内容被卸载导致模型重复检索）。
         let mut messages = vec![
             msg("system", "system prompt must stay exact"),
-            assistant_tool_call("call-1", "find_path"),
+            assistant_tool_call("call-1", "read_file"),
             tool_result("call-1", exact_output.clone()),
         ];
         for i in 0..6usize {
@@ -683,7 +676,7 @@ mod tests {
             })
             .and_then(|message| message.content.as_str())
             .expect("tool content");
-        assert!(tool_content.contains("Output preserved for tool `find_path`"));
+        assert!(tool_content.contains("Output preserved for tool `read_file`"));
         assert!(tool_content.contains("- file_path:"));
         assert!(!tool_content.contains("tool_output_lines:"));
     }

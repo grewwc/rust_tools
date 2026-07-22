@@ -35,7 +35,7 @@ use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
 /// 适合"中段按行裁剪"的非精确概览工具。
 ///
-/// find_path / code_search / read_file(_lines) 的每一行都可能是
+/// read_file(_lines) 的每一行都可能是
 /// agent 后续判断需要引用的精确证据，不能做有损中段抽样；这些工具只允许在
 /// 超过 inline 上限后 offload 到 session 文件，并在模型上下文里保留 path + stub。
 fn supports_line_trim(tool_name: &str) -> bool {
@@ -984,11 +984,7 @@ fn handle_tool_call_round(
         turn_messages,
     );
     record_hidden_self_note(app, turn_messages, &remaining_meta);
-    record_tool_inspection_artifacts(
-        messages,
-        turn_messages,
-        &tool_call_execution.allowed_tool_names,
-    );
+    record_tool_inspection_artifacts(messages, turn_messages);
 
     persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
 
@@ -1785,10 +1781,10 @@ mod tests {
             tool_result_message("call_previous", "previous result"),
             assistant_tool_call_message(test_tool_call(
                 "call_other",
-                "find_path",
-                serde_json::json!({ "pattern": "other.rs" }),
+                "list_directory",
+                serde_json::json!({ "path": "/tmp" }),
             )),
-            tool_result_message("call_other", "/tmp/other.rs"),
+            tool_result_message("call_other", "other.rs"),
         ];
 
         assert_eq!(

@@ -3,8 +3,7 @@
 ## Scope
 
 Applies to `src/bin/ai/**`. Keep this file runtime-wide; put subsystem-specific
-rules in the nearest child `AGENTS.md` and long explanations in
-`docs/agent-guides/*.md`.
+rules in the nearest child `AGENTS.md`.
 
 ## Runtime layout
 
@@ -53,7 +52,7 @@ rules in the nearest child `AGENTS.md` and long explanations in
 
 ## Scoped guides
 
-Read the nearest guide before changing these areas:
+Reference the nearest child `AGENTS.md` for area-specific invariants:
 
 - `src/bin/ai/driver/`
 - `src/bin/ai/tools/`

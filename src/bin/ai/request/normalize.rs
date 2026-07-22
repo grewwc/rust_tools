@@ -132,7 +132,7 @@ pub(super) fn line_can_contain_unavailable_tool_hint(message: &Message, line: &s
     }
 
     if message.role == ROLE_SYSTEM || is_internal_note_role(&message.role) {
-        return trimmed.starts_with("- ") || trimmed.starts_with("Code-navigation correction:");
+        return trimmed.starts_with("- ");
     }
 
     if message.role == "tool" {
@@ -148,7 +148,7 @@ pub(super) fn message_may_need_unavailable_tool_hint_filter(message: &Message, t
     }
 
     if message.role == ROLE_SYSTEM || is_internal_note_role(&message.role) {
-        return text.contains("- ") || text.contains("Code-navigation correction:");
+        return text.contains("- ");
     }
 
     if message.role == "tool" {
@@ -173,7 +173,7 @@ pub(super) fn should_drop_unavailable_tool_hint_line(
 
     let trimmed = line.trim_start();
     if message.role == ROLE_SYSTEM || is_internal_note_role(&message.role) {
-        return trimmed.starts_with("- ") || trimmed.starts_with("Code-navigation correction:");
+        return trimmed.starts_with("- ");
     }
     if message.role == "tool" {
         return trimmed.starts_with("Suggestion:");

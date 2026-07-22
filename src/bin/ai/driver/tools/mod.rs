@@ -186,53 +186,11 @@ fn confirm_tool_execution(tool_call: &ToolCall, args: &Value) -> Result<(), RunO
     })
 }
 
-#[derive(Clone, Copy)]
-struct ToolAlternative {
-    name: &'static str,
-    description: &'static str,
-}
-
 fn tool_visible_in_current_turn(
     available_tool_names: Option<&FastSet<String>>,
     tool_name: &str,
 ) -> bool {
     available_tool_names.is_some_and(|names| names.contains(tool_name))
-}
-
-fn format_tool_alternatives(alternatives: &[ToolAlternative]) -> String {
-    alternatives
-        .iter()
-        .map(|tool| format!("`{}` ({})", tool.name, tool.description))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn equivalent_tools(
-    tool_name: &str,
-    available_tool_names: Option<&FastSet<String>>,
-) -> Option<String> {
-    let candidates: &[ToolAlternative] = match tool_name {
-        "read_file" => &[ToolAlternative {
-            name: "code_search",
-            description: "locate the relevant region first",
-        }],
-        "code_search" => &[ToolAlternative {
-            name: "find_path",
-            description: "filename or glob match",
-        }],
-        "find_path" => &[ToolAlternative {
-            name: "code_search",
-            description: "semantic or structural search",
-        }],
-        _ => &[],
-    };
-
-    let visible = candidates
-        .iter()
-        .copied()
-        .filter(|tool| tool_visible_in_current_turn(available_tool_names, tool.name))
-        .collect::<Vec<_>>();
-    (!visible.is_empty()).then(|| format_tool_alternatives(&visible))
 }
 
 fn remediation_hint(
@@ -285,14 +243,6 @@ fn remediation_hint(
     }
 
     if err_lower.contains("no such file") || err_lower.contains("not found") {
-        // 文件类工具在 "not found" 时优先建议先用搜索类工具确认目标
-        if let Some(fallback) = equivalent_tools(tool_name, available_tool_names) {
-            return Some(format!(
-                "Suggestion: verify the path or identifier first. Equivalent tools you can try \
-                 instead of retrying with the same args: {}.",
-                fallback
-            ));
-        }
         return Some(
             "Suggestion: verify the path or identifier first, or use a search/list tool to discover the correct target before retrying.".to_string(),
         );
@@ -304,7 +254,6 @@ fn remediation_hint(
         );
     }
 
-    // 通用 fallback：如果工具名在等价表里，提示可改用的备选工具
     if tool_name == "execute_command" {
         let mut fallback = Vec::new();
         if tool_visible_in_current_turn(available_tool_names, "read_file") {
@@ -319,14 +268,6 @@ fn remediation_hint(
                 fallback.join(", ")
             ));
         }
-    }
-
-    if let Some(fallback) = equivalent_tools(tool_name, available_tool_names) {
-        return Some(format!(
-            "Suggestion: if this failure is intrinsic (not a transient I/O error), \
-             try an equivalent tool instead of repeating: {}.",
-            fallback
-        ));
     }
 
     None
@@ -1389,8 +1330,13 @@ fn execute_tool_calls_inner(
         }
 
         // 当模型在一轮里批量发出多个只读、无副作用、且永不触发 barrier 的工具
-        // 调用（如同时 read_file 多个文件）时，把这些连续调用并行执行以降低延迟。
-        // 任何带副作用 / 需要 barrier / 流式输出的工具都走原有的顺序路径。
+        // 调用时，把这些连续调用并行执行以降低延迟。
+        //
+        // 例外：`read_file` 这类源码 grounding 工具必须强制
+        // 串行。它的本地执行本身很快，但返回体积大、进入上下文的成本高；若同轮
+        // 批量并行，极易放大证据面、冲击 history 预算，并诱导模型继续“读更多”
+        // 而不是基于已有证据收敛。任何带副作用 / 需要 barrier / 流式输出的工具
+        // 也继续走原有顺序路径。
         let batch_len = parallel_safe_batch_len(mcp_client, &tool_calls[idx..]);
         if batch_len >= 2 {
             let batch = &tool_calls[idx..idx + batch_len];
@@ -1489,13 +1435,19 @@ const PARALLEL_READONLY_MAX_CONCURRENCY: usize = 8;
 
 /// 判断一个工具调用是否可安全并行执行：必须是 builtin 路由、只读（命中
 /// `is_cacheable_tool_name` 的复用白名单且不在 mutating 列表）、且永不触发
-/// barrier。MCP 工具（始终 barrier）、写类工具、命令执行、子 agent / 异步任务
-/// 工具都会被排除，因此并行批次与顺序执行在语义上完全等价，只是更快。
+/// barrier。
+///
+/// `read_file` 属于高精度 grounding 入口：虽然技术上无副作
+/// 用，但它返回的大块证据进入上下文的成本远高于执行成本，必须串行以压缩证据面，
+/// 帮助模型沿“定位 -> 阅读 -> 判断 -> 修改”的收敛路径推进。
+///
+/// MCP 工具（始终 barrier）、写类工具、命令执行、子 agent / 异步任务工具都会
+/// 被排除，因此并行批次与顺序执行在语义上完全等价，只是更快。
 fn is_parallel_safe_tool_call(mcp_client: &McpClient, tool_call: &ToolCall) -> bool {
     let name = &tool_call.function.name;
-    // read_file 的本地读取很快，但结果进入上下文的成本很高；并行读多个文件
-    // 往往只会把大量精确证据一次性塞进 history，收益远低于后续压缩/召回代价。
-    if name == "read_file" {
+    // 源码阅读工具必须强制串行：执行本身便宜，但并行批量返回会迅速把
+    // 大量精确证据塞进上下文，放大 evidence flooding 风险并干扰后续收敛。
+    if matches!(name.as_str(), "read_file" | "read_file_lines") {
         return false;
     }
     if !is_cacheable_tool_name(name) {

@@ -44,7 +44,9 @@ pub(crate) fn execute_delete_path(args: &Value) -> Result<String, String> {
         return Err(format!(
             "Refused: '{abs_path_str}' is not a registered temp file. \
              delete_path only removes files created via write_file(temp=true). \
-             Source code, configs, and other project files cannot be deleted."
+             Source code, configs, and other project files cannot be deleted with delete_path; \
+             if the target is an existing project/source/config file, use apply_patch with a \
+             `*** Delete File:` envelope section."
         ));
     };
 
@@ -150,6 +152,8 @@ mod tests {
             let args = serde_json::json!({ "path": "main.rs" });
             let err = execute_delete_path(&args).unwrap_err();
             assert!(err.contains("not a registered temp file"), "got: {err}");
+            assert!(err.contains("apply_patch"), "got: {err}");
+            assert!(err.contains("*** Delete File:"), "got: {err}");
         });
         assert!(src.exists(), "source file should not be deleted");
         let _ = fs::remove_dir_all(&base);

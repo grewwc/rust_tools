@@ -283,7 +283,7 @@ pub(super) async fn finalize_turn(
         subagent_result_payload_for_parent(final_assistant_text, turn_messages)
     {
         // 尽早发布给父 agent：即便本轮没有最终 assistant 正文，只要留下了可复用的
-        // subagent 证据（如 read_file / code_search 结果），父 agent 也必须感知。
+        // subagent 证据（如 read_file 结果），父 agent 也必须感知。
         // 这样同步 `task` 与异步 `task_wait` 都能拿到同一份父侧 payload。
         crate::ai::driver::runtime_ctx::publish_subagent_result(&subagent_output_for_parent).await;
     }

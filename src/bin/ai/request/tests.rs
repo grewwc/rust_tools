@@ -1645,7 +1645,8 @@ fn normalize_messages_prioritizes_working_memory_before_summary_and_self_note() 
         Message {
             role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
             content: Value::String(
-                "Current code-inspection working memory:\n- use code_search first".to_string(),
+                "Current code-inspection working memory:\n- use execute_command for shell checks"
+                    .to_string(),
             ),
             tool_calls: None,
             tool_call_id: None,
@@ -1663,13 +1664,13 @@ fn normalize_messages_prioritizes_working_memory_before_summary_and_self_note() 
 }
 
 #[test]
-fn strip_unavailable_tool_hints_removes_code_search_correction_from_working_memory() {
+fn strip_unavailable_tool_hints_removes_internal_note_tool_hint() {
     let mut messages = vec![Message {
             role: "system".to_string(),
             content: Value::String(
                 "Current code-inspection working memory:\n\
                  - read_file(file=src/main.rs)\n\
-                 Code-navigation correction: you have started raw inspection without `code_search`. Before another raw read, use `code_search` first to locate the relevant file/symbol/definition, then read only the specific region you need.\n\
+                 - use `execute_command` only when a shell check is needed.\n\
                  Treat these findings as already-known context."
                     .to_string(),
             ),
@@ -1678,7 +1679,7 @@ fn strip_unavailable_tool_hints_removes_code_search_correction_from_working_memo
             reasoning_content: None,
         }];
 
-    let available = ["read_file", "find_path"]
+    let available = ["read_file", "list_directory"]
         .into_iter()
         .map(|name| name.to_string())
         .collect();
@@ -1687,8 +1688,7 @@ fn strip_unavailable_tool_hints_removes_code_search_correction_from_working_memo
     let text = messages[0].content.as_str().unwrap();
     assert!(text.contains("Current code-inspection working memory:"));
     assert!(text.contains("Treat these findings as already-known context."));
-    assert!(!text.contains("Code-navigation correction:"));
-    assert!(!text.contains("`code_search`"));
+    assert!(!text.contains("`execute_command`"));
 }
 
 #[test]
@@ -1696,7 +1696,7 @@ fn strip_unavailable_tool_hints_removes_tool_suggestion_lines() {
     let mut messages = vec![Message {
         role: "tool".to_string(),
         content: Value::String(
-            "Suggestion: use `code_search` to narrow the target before another raw read.\n\
+            "Suggestion: use `execute_command` only when a shell check is needed.\n\
                  Result: fallback kept."
                 .to_string(),
         ),
@@ -1721,7 +1721,7 @@ fn strip_unavailable_tool_hints_keeps_regular_assistant_text() {
     let mut messages = vec![Message {
         role: "assistant".to_string(),
         content: Value::String(
-            "你可以之后再试 `code_search`，但这不是一条内部纠偏提示。".to_string(),
+            "你可以之后再试 `execute_command`，但这不是一条内部纠偏提示。".to_string(),
         ),
         tool_calls: None,
         tool_call_id: None,
@@ -1736,7 +1736,7 @@ fn strip_unavailable_tool_hints_keeps_regular_assistant_text() {
 
     assert_eq!(
         messages[0].content.as_str(),
-        Some("你可以之后再试 `code_search`，但这不是一条内部纠偏提示。")
+        Some("你可以之后再试 `execute_command`，但这不是一条内部纠偏提示。")
     );
 }
 

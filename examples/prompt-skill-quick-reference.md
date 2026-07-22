@@ -122,8 +122,6 @@ routing_tags: 路由标签
 ```yaml
 tools:
   - read_file
-  - read_file
-  - code_search
   - search_files
 ```
 
@@ -133,7 +131,6 @@ tools:
   - read_file
   - write_file
   - apply_patch
-  - code_search
 ```
 
 ### 完整权限
@@ -143,15 +140,8 @@ tools:
   - write_file
   - apply_patch
   - execute_command
-  - code_search
   - search_files
 ```
-
-### `code_search` 参数提示
-- 做结构化代码搜索时，固定使用 `operation=structural`
-- 具体意图写在 `intent`：`find_functions`、`find_classes`、`find_methods`、`find_calls`
-- 不要把 `find_functions`、`find_classes`、`find_methods`、`find_calls` 直接放进 `operation`
-- 正确示例：`code_search(operation=structural, intent=find_functions, path=/repo, name=run)`
 
 ## 🎨 路由标签建议
 
@@ -198,7 +188,6 @@ tools:
   - read_file
   - write_file
   - apply_patch
-  - code_search
 tool_groups:
   - builtin
 priority: 70

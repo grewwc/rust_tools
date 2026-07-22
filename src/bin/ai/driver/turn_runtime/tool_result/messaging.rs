@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fs, io::Write, path::Path};
+use std::{borrow::Cow, fs, io::Write, path::Path, path::PathBuf};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
@@ -6,13 +6,15 @@ use serde_json::Value;
 use crate::ai::{
     driver::tools::ExecuteToolCallsResult,
     history::{Message, ROLE_INTERNAL_NOTE, SessionStore, is_system_like_role},
-    tools::tool_history_policy,
     types::App,
     types::ToolCall,
 };
 
 use super::super::types::PreparedToolResult;
-use super::execution::{prepare_recent_tool_result, prepare_tool_result};
+use super::execution::prepare_recent_tool_result;
+
+const RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS: usize = 64_000;
+const TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES: usize = 64_000;
 
 const CODE_INSPECTION_MEMORY_PREFIX: &str = "Current code-inspection working memory:";
 const CONTEXT_CHECKPOINT_OPEN: &str = "<context_checkpoint>";
@@ -297,60 +299,347 @@ fn prepare_tool_results_for_history(
     app: &App,
     exec_result: &ExecuteToolCallsResult,
 ) -> Vec<PreparedToolResult> {
-    let mut prepared = exec_result
+    exec_result
         .executed_tool_calls
         .iter()
         .zip(exec_result.tool_results.iter())
         .map(|(tool_call, result)| {
-            prepare_recent_tool_result(app, &tool_call.function.name, &result.content)
+            prepare_tool_result_for_current_turn(app, tool_call, &result.content)
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    let inline_budget = super::super::max_tool_result_inline_chars(&app.current_model) / 2;
-    let mut precision_indices = exec_result
-        .executed_tool_calls
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, tool_call)| {
-            tool_history_policy(&tool_call.function.name)
-                .counts_toward_precision_inline_budget()
-                .then_some(idx)
-        })
-        .collect::<Vec<_>>();
-
-    let mut total_chars = precision_indices
-        .iter()
-        .map(|idx| prepared[*idx].content_for_model.chars().count())
-        .sum::<usize>();
-
-    if total_chars <= inline_budget {
-        return prepared;
+fn prepare_tool_result_for_current_turn(
+    app: &App,
+    tool_call: &ToolCall,
+    content: &str,
+) -> PreparedToolResult {
+    if !exceeds_chars(content, RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS) {
+        return prepare_recent_tool_result(app, &tool_call.function.name, content);
     }
 
-    precision_indices.sort_unstable_by_key(|idx| {
-        std::cmp::Reverse(prepared[*idx].content_for_model.chars().count())
-    });
+    let content_for_terminal =
+        build_large_current_turn_terminal_preview(&tool_call.function.name, content);
+    let path = write_current_turn_tool_overflow_file(app, &tool_call.function.name, content).ok();
+    let mut content_for_model =
+        build_current_turn_tool_overflow_stub(path.as_ref(), &tool_call.function.name, content);
+    let anchors = current_tool_result_recall_anchors(tool_call);
+    if !anchors.is_empty() {
+        content_for_model.push_str("- original_call:\n");
+        for anchor in anchors {
+            content_for_model.push_str("  ");
+            content_for_model.push_str(&anchor);
+            content_for_model.push('\n');
+        }
+    }
+    content_for_model.push_str(
+        "- context_policy: result exceeded the current-turn raw hard cap; use the previews and original_call anchors first. Read the overflow archive only when exact omitted text is required.\n",
+    );
+    PreparedToolResult {
+        content_for_model,
+        content_for_terminal,
+    }
+}
 
-    for idx in precision_indices {
-        if total_chars <= inline_budget {
+fn exceeds_chars(content: &str, max_chars: usize) -> bool {
+    content.chars().nth(max_chars).is_some()
+}
+
+fn build_large_current_turn_terminal_preview(tool_name: &str, content: &str) -> String {
+    let head = take_chars(content, 1_200);
+    let tail = tail_chars(content, 1_200);
+    format!(
+        "{head}\n... (current-turn `{tool_name}` result exceeded raw context hard cap; full output saved to overflow archive when possible)\n{tail}"
+    )
+}
+
+fn write_current_turn_tool_overflow_file(
+    app: &App,
+    tool_name: &str,
+    content: &str,
+) -> std::io::Result<PathBuf> {
+    let store = SessionStore::new(app.config.history_file.as_path());
+    store.ensure_root_dir()?;
+    let dir = store
+        .session_assets_dir(&app.session_id)
+        .join("tool-overflow");
+    fs::create_dir_all(&dir)?;
+    let sanitized_name = tool_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let path = dir.join(format!(
+        "{}-{}-{}.txt",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        sanitized_name,
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::write(&path, content)?;
+    Ok(path.canonicalize().unwrap_or(path))
+}
+
+fn build_current_turn_tool_overflow_stub(
+    path: Option<&PathBuf>,
+    tool_name: &str,
+    content: &str,
+) -> String {
+    let mut out = if let Some(path) = path {
+        format!(
+            "Output too large for current-turn raw context; full `{tool_name}` result saved to overflow archive.\n\
+             The COMPLETE output is NOT in context.\n\
+             Do NOT read this overflow file by default; first use summary / key_lines / previews below.\n\
+             - file_path: {}\n",
+            path.display()
+        )
+    } else {
+        format!(
+            "Output too large for current-turn raw context; full `{tool_name}` result omitted because overflow archival failed.\n\
+             The COMPLETE output is NOT in context.\n"
+        )
+    };
+    out.push_str(&format!(
+        "- output_size: >{} chars, {} bytes\n",
+        RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS,
+        content.len()
+    ));
+    if let Some(summary) = first_relevant_line(content) {
+        out.push_str(&format!(
+            "- summary: {}\n",
+            truncate_inline(&normalize_anchor_text(&summary), 240)
+        ));
+    }
+    let key_lines = extract_tool_result_key_lines(content, 20);
+    if !key_lines.is_empty() {
+        out.push_str(&format!("- key_lines ({}):\n", key_lines.len()));
+        for line in key_lines {
+            out.push_str("  ");
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out.push_str(&format!(
+        "- head_preview: {}\n",
+        take_chars(content, 800)
+    ));
+    out.push_str(&format!(
+        "- tail_preview: {}\n",
+        tail_chars(content, 800)
+    ));
+    out
+}
+
+fn first_relevant_line(content: &str) -> Option<String> {
+    let mut first_nonempty = None;
+    let mut scanned_bytes = 0usize;
+    for line in content.lines() {
+        scanned_bytes = scanned_bytes.saturating_add(line.len()).saturating_add(1);
+        let sample = line_sample(line, 512);
+        if !sample.is_empty() {
+            let lower = sample.to_ascii_lowercase();
+            if lower.contains("error")
+                || lower.contains("failed")
+                || lower.contains("panic")
+                || lower.contains("exception")
+                || lower.contains("timeout")
+            {
+                return Some(sample);
+            }
+            if first_nonempty.is_none() {
+                first_nonempty = Some(sample);
+            }
+        }
+        if scanned_bytes >= TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES {
             break;
         }
-        let content = &exec_result.tool_results[idx].content;
-        let offloaded = prepare_tool_result(
-            app,
-            &exec_result.executed_tool_calls[idx].function.name,
-            content,
-        );
-        if offloaded.content_for_model == content.as_str() {
+    }
+    first_nonempty
+}
+
+fn extract_tool_result_key_lines(content: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(max);
+    let mut scanned_bytes = 0usize;
+    for (idx, line) in content.lines().enumerate() {
+        if out.len() >= max {
+            break;
+        }
+        scanned_bytes = scanned_bytes.saturating_add(line.len()).saturating_add(1);
+        let trimmed = line_sample(line, 512);
+        if trimmed.is_empty() {
+            if scanned_bytes >= TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES {
+                break;
+            }
             continue;
         }
-        let previous_len = prepared[idx].content_for_model.chars().count();
-        prepared[idx] = offloaded;
-        total_chars = total_chars.saturating_sub(previous_len);
-        total_chars = total_chars.saturating_add(prepared[idx].content_for_model.chars().count());
+        let lower = trimmed.to_ascii_lowercase();
+        let is_key = lower.starts_with("fn ")
+            || lower.starts_with("pub fn ")
+            || lower.starts_with("impl ")
+            || lower.starts_with("struct ")
+            || lower.starts_with("pub struct ")
+            || lower.starts_with("trait ")
+            || lower.starts_with("enum ")
+            || lower.starts_with("pub enum ")
+            || lower.starts_with("mod ")
+            || lower.starts_with("#[")
+            || lower.starts_with("//!")
+            || lower.starts_with("///")
+            || lower.starts_with("class ")
+            || lower.starts_with("def ")
+            || lower.starts_with("func ")
+            || lower.contains("error")
+            || lower.contains("failed")
+            || lower.contains("panic")
+            || lower.contains("exception")
+            || lower.contains("timeout")
+            || lower.contains("warning")
+            || lower.contains("todo")
+            || lower.contains("fixme");
+        if is_key {
+            out.push(format!(
+                "L{}: {}",
+                idx + 1,
+                truncate_inline(&normalize_anchor_text(&trimmed), 200)
+            ));
+        }
+        if scanned_bytes >= TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES {
+            break;
+        }
     }
+    out
+}
 
-    prepared
+fn line_sample(line: &str, max_chars: usize) -> String {
+    take_chars(line.trim_start(), max_chars).trim().to_string()
+}
+
+fn take_chars(content: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut iter = content.chars();
+    for _ in 0..max_chars {
+        let Some(ch) = iter.next() else {
+            return out;
+        };
+        out.push(ch);
+    }
+    if iter.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+fn tail_chars(content: &str, max_chars: usize) -> String {
+    let mut start = 0usize;
+    let mut seen = 0usize;
+    for (idx, _) in content.char_indices().rev() {
+        start = idx;
+        seen += 1;
+        if seen == max_chars {
+            break;
+        }
+    }
+    if seen < max_chars {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(max_chars + 4);
+    out.push('…');
+    out.push_str(&content[start..]);
+    out
+}
+
+fn current_tool_result_recall_anchors(tool_call: &ToolCall) -> Vec<String> {
+    let Ok(args) = serde_json::from_str::<Value>(&tool_call.function.arguments) else {
+        return Vec::new();
+    };
+    match tool_call.function.name.as_str() {
+        "read_file" => read_file_recall_anchors(&args),
+        "execute_command" | "run_command" | "shell" | "bash" => command_recall_anchors(&args),
+        _ => generic_tool_recall_anchors(&args),
+    }
+}
+
+fn read_file_recall_anchors(args: &Value) -> Vec<String> {
+    let mut anchors = Vec::new();
+    if let Some(path) = value_string_from_keys(args, &["file_path", "path", "filePath"]) {
+        anchors.push(format!(
+            "original_file_path: {}",
+            truncate_inline(&normalize_anchor_text(&path), 240)
+        ));
+    }
+    if let Some(range) = read_file_range_anchor(args) {
+        anchors.push(format!("original_range: {range}"));
+    }
+    anchors
+}
+
+fn command_recall_anchors(args: &Value) -> Vec<String> {
+    let mut anchors = Vec::new();
+    if let Some(command) = value_string_from_keys(args, &["command"]) {
+        anchors.push(format!(
+            "original_command: {}",
+            truncate_inline(&normalize_anchor_text(&command), 720)
+        ));
+    }
+    if let Some(cwd) = value_string_from_keys(args, &["cwd"]) {
+        let cwd = normalize_anchor_text(&cwd);
+        if !cwd.is_empty() {
+            anchors.push(format!("original_cwd: {}", truncate_inline(&cwd, 240)));
+        }
+    }
+    anchors
+}
+
+fn generic_tool_recall_anchors(args: &Value) -> Vec<String> {
+    ["file_path", "path", "filePath", "query", "pattern", "command"]
+        .iter()
+        .filter_map(|key| {
+            args.get(*key)
+                .and_then(Value::as_str)
+                .map(|value| format!("{key}: {}", truncate_inline(&normalize_anchor_text(value), 240)))
+        })
+        .collect()
+}
+
+fn value_string_from_keys(args: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn read_file_range_anchor(args: &Value) -> Option<String> {
+    let offset = args.get("offset").and_then(Value::as_u64);
+    let limit = args.get("limit").and_then(Value::as_u64);
+    if let (Some(offset), Some(limit)) = (offset, limit) {
+        return Some(format!("offset={offset}, limit={limit}"));
+    }
+    let start_line = args.get("startLine").and_then(Value::as_u64);
+    let end_line = args.get("endLine").and_then(Value::as_u64);
+    if let (Some(start_line), Some(end_line)) = (start_line, end_line) {
+        return Some(format!("lines={start_line}..{end_line}"));
+    }
+    None
+}
+
+fn normalize_anchor_text(value: &str) -> String {
+    let mut out = String::new();
+    let mut in_ws = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(ch);
+            in_ws = false;
+        }
+    }
+    out.trim().to_string()
 }
 
 pub(super) fn append_tool_result_messages(
@@ -406,29 +695,19 @@ pub(super) fn append_tool_result_messages(
         .zip(exec_result.tool_results.iter())
         .zip(prepared_results.into_iter())
     {
+        let observer_result_content = prepared.content_for_model.as_str();
+        let observer_success = tool_result_success_for_observer(
+            &tool_call.function.name,
+            observer_result_content,
+        );
         for obs in app.observers.iter_mut() {
             if obs.is_poisoned() {
                 continue;
             }
             let ctx = crate::ai::driver::observer::ToolResultContext {
                 tool_name: tool_call.function.name.clone(),
-                result_content: result.content.as_str(),
-                success: {
-                    let content_lower = result.content.to_lowercase();
-                    let is_execution_tool = tool_call.function.name == "execute_command"
-                        || tool_call.function.name == "run_command"
-                        || tool_call.function.name == "shell"
-                        || tool_call.function.name == "bash";
-                    if is_execution_tool {
-                        !content_lower.contains("error:")
-                            && !content_lower.contains("exit code")
-                            && !content_lower.contains("command not found")
-                            && !content_lower.contains("permission denied")
-                    } else {
-                        !content_lower.starts_with("error:")
-                            && !content_lower.starts_with("failed:")
-                    }
-                },
+                result_content: observer_result_content,
+                success: observer_success,
             };
             let obs_name = obs.name().to_string();
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -454,26 +733,37 @@ pub(super) fn append_tool_result_messages(
     }
 }
 
+fn tool_result_success_for_observer(tool_name: &str, content: &str) -> bool {
+    let is_execution_tool =
+        matches!(tool_name, "execute_command" | "run_command" | "shell" | "bash");
+    if is_execution_tool {
+        let sample = take_chars(content, TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES);
+        let lower = sample.to_ascii_lowercase();
+        return !lower.contains("error:")
+            && !lower.contains("exit code")
+            && !lower.contains("command not found")
+            && !lower.contains("permission denied");
+    }
+    let prefix = take_chars(content.trim_start(), 128).to_ascii_lowercase();
+    !prefix.starts_with("error:") && !prefix.starts_with("failed:")
+}
+
 /// 在一次工具调用轮结束后，基于本轮累计的 `turn_messages` 生成
 /// code-inspection working memory，避免在长 turn 里重复扫描工具结果。
 pub(super) fn record_tool_inspection_artifacts(
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
-    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
 ) {
     let findings = collect_repo_inspection_findings(turn_messages);
-    append_code_inspection_working_memory(messages, turn_messages, &findings, allowed_tool_names);
+    append_code_inspection_working_memory(messages, turn_messages, &findings);
 }
 
 fn append_code_inspection_working_memory(
     messages: &mut Vec<Message>,
     turn_messages: &[Message],
     findings: &[RepoInspectionFinding],
-    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
 ) {
-    let Some(note) =
-        build_code_inspection_working_memory(turn_messages, findings, allowed_tool_names)
-    else {
+    let Some(note) = build_code_inspection_working_memory(turn_messages, findings) else {
         return;
     };
 
@@ -541,12 +831,10 @@ pub(super) fn record_final_stream_response(
 fn build_code_inspection_working_memory(
     turn_messages: &[Message],
     findings: &[RepoInspectionFinding],
-    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
 ) -> Option<String> {
     let exact_calls = collect_completed_repo_inspection_calls(turn_messages);
 
     let mut raw_repo_tool_count = 0usize;
-    let mut code_search_count = 0usize;
     let mut write_tool_count = 0usize;
     for message in turn_messages {
         let Some(tool_calls) = &message.tool_calls else {
@@ -562,9 +850,6 @@ fn build_code_inspection_working_memory(
             }
             if is_write_tool(tool_name) {
                 write_tool_count += 1;
-            }
-            if tool_name == "code_search" {
-                code_search_count += 1;
             }
         }
     }
@@ -594,16 +879,6 @@ fn build_code_inspection_working_memory(
     note.push_str(
         "Treat these findings as already-known context. Avoid re-running the same reads unless you need verification.\n",
     );
-    let can_use_code_search = allowed_tool_names.contains("code_search");
-    if can_use_code_search && raw_repo_tool_count >= 1 && code_search_count == 0 {
-        note.push_str(
-            "Code-navigation correction: you have started raw inspection without `code_search`. Before another raw read, use `code_search` first to locate the relevant file/symbol/definition, then read only the specific region you need.\n",
-        );
-    } else if can_use_code_search && raw_repo_tool_count >= 2 && code_search_count <= 1 {
-        note.push_str(
-            "Code-navigation correction: too many raw reads/searches. Prefer one `code_search` hop plus one targeted local read instead of another `read_file` or `find_path`.\n",
-        );
-    }
     Some(truncate_note(&note, 1800))
 }
 
@@ -702,17 +977,12 @@ fn collect_repo_inspection_findings(turn_messages: &[Message]) -> Vec<RepoInspec
 fn is_repo_inspection_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "code_search"
-            | "read_file"
-            | "find_path"
-            | "list_directory"
-            | "apply_patch"
-            | "write_file"
+        "read_file" | "list_directory" | "apply_patch" | "write_file"
     )
 }
 
 fn is_raw_repo_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "read_file" | "find_path" | "list_directory")
+    matches!(tool_name, "read_file" | "list_directory")
 }
 
 fn is_write_tool(tool_name: &str) -> bool {
@@ -755,21 +1025,6 @@ fn describe_tool_call(tool_call: &ToolCall) -> String {
         return String::new();
     };
     match tool_call.function.name.as_str() {
-        "code_search" => {
-            let operation = args
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .unwrap_or("search");
-            let mut parts = vec![format!("operation={operation}")];
-            for key in ["query", "symbol", "file_path", "path", "intent"] {
-                if let Some(value) = args.get(key).and_then(|v| v.as_str())
-                    && !value.is_empty()
-                {
-                    parts.push(format!("{key}={}", truncate_inline(value, 48)));
-                }
-            }
-            format!("({})", parts.join(", "))
-        }
         "read_file" => {
             let path = args
                 .get("file_path")
@@ -789,15 +1044,6 @@ fn describe_tool_call(tool_call: &ToolCall) -> String {
             } else {
                 format!("(file={path})")
             }
-        }
-        "find_path" => {
-            let query = args
-                .get("query")
-                .or_else(|| args.get("pattern"))
-                .and_then(|v| v.as_str())
-                .map(|v| truncate_inline(v, 48))
-                .unwrap_or_else(|| "?".to_string());
-            format!("(query={query})")
         }
         "list_directory" => args
             .get("path")
@@ -838,11 +1084,10 @@ fn summarize_tool_result(tool_name: &str, content: &str) -> String {
         return truncate_inline(first_line, 120);
     }
 
-    let mut lines = content
+    let lines = content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .filter(|line| !line.starts_with("code_search route="))
         .filter(|line| !line.starts_with("- tail_preview:"))
         .collect::<Vec<_>>();
     if let Some(summary_line) = lines
@@ -860,14 +1105,6 @@ fn summarize_tool_result(tool_name: &str, content: &str) -> String {
             || lower.contains("missing")
     }) {
         return truncate_inline(error_like, 160);
-    }
-
-    if tool_name == "code_search" {
-        lines.retain(|line| {
-            !line.starts_with("No exact symbol")
-                && !line.starts_with("No exact matches")
-                && !line.starts_with("No files matched")
-        });
     }
 
     lines
@@ -899,8 +1136,9 @@ fn truncate_note(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        prepare_tool_results_for_history, RepoInspectionFinding, build_code_inspection_working_memory,
+        build_code_inspection_working_memory, prepare_tool_results_for_history,
         collect_repo_inspection_findings, describe_tool_call, is_repo_inspection_tool,
+        RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS,
     };
     use super::{
         extract_context_checkpoints, save_context_checkpoint_in_dir, smart_truncate_to_sentence,
@@ -926,10 +1164,6 @@ mod tests {
                 arguments: arguments.to_string(),
             },
         }
-    }
-
-    fn available_tool_names(names: &[&str]) -> rust_tools::commonw::FastSet<String> {
-        names.iter().map(|name| (*name).to_string()).collect()
     }
 
     fn test_app(history_file: PathBuf) -> App {
@@ -1005,8 +1239,9 @@ mod tests {
     }
 
     #[test]
-    fn repo_inspection_tools_include_code_search() {
-        assert!(is_repo_inspection_tool("code_search"));
+    fn repo_inspection_tools_include_read_and_path_tools() {
+        assert!(is_repo_inspection_tool("read_file"));
+        assert!(is_repo_inspection_tool("list_directory"));
     }
 
     #[test]
@@ -1073,9 +1308,9 @@ mod tests {
     }
 
     #[test]
-    fn prepare_tool_results_for_history_spills_oversized_precision_batch() {
+    fn prepare_tool_results_for_history_keeps_precision_batch_under_hard_cap_raw() {
         let history_file = std::env::temp_dir().join(format!(
-            "ai-batch-precision-spill-{}.sqlite",
+            "ai-batch-precision-oversized-raw-{}.sqlite",
             uuid::Uuid::new_v4()
         ));
         let app = test_app(history_file.clone());
@@ -1097,11 +1332,61 @@ mod tests {
         let exec_result = exec_result_from_calls_and_contents(&calls, &contents);
 
         let prepared = prepare_tool_results_for_history(&app, &exec_result);
-        let spilled = prepared
-            .iter()
-            .filter(|result| result.content_for_model.contains("Output too large; full result saved"))
-            .count();
-        assert!(spilled >= 2, "expected oversized precision batch to spill, got: {spilled}");
+        assert!(prepared.iter().all(|result| {
+            !result
+                .content_for_model
+                .contains("Output too large; full result saved")
+        }));
+        for (prepared, content) in prepared.iter().zip(contents.iter()) {
+            assert_eq!(prepared.content_for_model, *content);
+        }
+
+        let store = crate::ai::history::SessionStore::new(history_file.as_path());
+        let _ = store.delete_session(&app.session_id);
+    }
+
+    #[test]
+    fn prepare_tool_results_for_history_spills_single_result_over_hard_cap() {
+        let history_file = std::env::temp_dir().join(format!(
+            "ai-current-tool-overflow-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(history_file.clone());
+        let calls = vec![tool_call(
+            "cmd-big",
+            "execute_command",
+            serde_json::json!({
+                "command": "yes huge | head -n 100000",
+                "cwd": "/tmp/work"
+            }),
+        )];
+        let content = format!(
+            "first line\nerror: important failure\n{}\nlast line",
+            "x".repeat(RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS + 10_000)
+        );
+        let exec_result = exec_result_from_calls_and_contents(&calls, std::slice::from_ref(&content));
+
+        let prepared = prepare_tool_results_for_history(&app, &exec_result);
+        let model = &prepared[0].content_for_model;
+
+        assert!(model.contains("Output too large for current-turn raw context"));
+        assert!(model.contains("The COMPLETE output is NOT in context"));
+        assert!(model.contains("original_command: yes huge | head -n 100000"));
+        assert!(model.contains("original_cwd: /tmp/work"));
+        assert!(model.contains("error: important failure"));
+        assert!(
+            model.len() < 8_000,
+            "overflow stub must stay bounded, got {} bytes",
+            model.len()
+        );
+        assert_ne!(model, &content);
+        let path = model
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("- file_path: "))
+            .map(PathBuf::from)
+            .expect("overflow stub should include archive path");
+        assert!(path.exists(), "archive should exist: {}", path.display());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
 
         let store = crate::ai::history::SessionStore::new(history_file.as_path());
         let _ = store.delete_session(&app.session_id);
@@ -1155,8 +1440,8 @@ mod tests {
                     ),
                     tool_call(
                         "2",
-                        "find_path",
-                        serde_json::json!({"pattern":"panic!","path":"src"}),
+                        "list_directory",
+                        serde_json::json!({"path":"src"}),
                     ),
                     tool_call(
                         "3",
@@ -1176,7 +1461,7 @@ mod tests {
             },
             Message {
                 role: "tool".to_string(),
-                content: Value::String("src/main.rs:42: panic!(\"boom\")".to_string()),
+                content: Value::String("main.rs\nlib.rs".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("2".to_string()),
                 reasoning_content: None,
@@ -1191,12 +1476,7 @@ mod tests {
         ];
 
         let findings = collect_repo_inspection_findings(&turn_messages);
-        let note = build_code_inspection_working_memory(
-            &turn_messages,
-            &findings,
-            &available_tool_names(&["code_search", "read_file", "find_path"]),
-        )
-        .expect("note");
+        let note = build_code_inspection_working_memory(&turn_messages, &findings).expect("note");
         assert!(note.contains("Current code-inspection working memory"));
         assert!(note.contains("Completed exact tool calls in this turn"));
         assert!(note.contains("read_file("));
@@ -1205,54 +1485,11 @@ mod tests {
         assert!(note.contains("read_file("));
         assert!(note.contains("\"file_path\":\"src/main.rs\""));
         assert!(note.contains("read_file(file=src/lib.rs, lines=10..29)"));
-        assert!(note.contains("find_path(query=panic!)"));
-        assert!(note.contains("Code-navigation correction"));
-        assert!(
-            note.contains("use `code_search` first")
-                || note.contains("Before another raw read, use `code_search` first")
-        );
+        assert!(note.contains("list_directory(path=src)"));
     }
 
     #[test]
-    fn working_memory_note_uses_code_search_without_correction_when_present() {
-        let turn_messages = vec![
-            Message {
-                role: "assistant".to_string(),
-                content: Value::String(String::new()),
-                tool_calls: Some(vec![tool_call(
-                    "1",
-                    "code_search",
-                    serde_json::json!({"operation":"text_search","query":"load_config"}),
-                )]),
-                tool_call_id: None,
-                reasoning_content: None,
-            },
-            Message {
-                role: "tool".to_string(),
-                content: Value::String(
-                    "code_search route=content operation=text_search\nsrc/lib.rs:10: fn load_config() {"
-                        .to_string(),
-                ),
-                tool_calls: None,
-                tool_call_id: Some("1".to_string()),
-                reasoning_content: None,
-            },
-        ];
-
-        let findings = collect_repo_inspection_findings(&turn_messages);
-        let note = build_code_inspection_working_memory(
-            &turn_messages,
-            &findings,
-            &available_tool_names(&["code_search", "read_file", "find_path"]),
-        )
-        .expect("note");
-        assert!(note.contains("code_search(operation=text_search, query=load_config)"));
-        assert!(note.contains("fn load_config()"));
-        assert!(!note.contains("Code-navigation correction"));
-    }
-
-    #[test]
-    fn working_memory_note_hides_code_search_when_unavailable() {
+    fn working_memory_note_does_not_emit_navigation_correction() {
         let turn_messages = vec![
             Message {
                 role: "assistant".to_string(),
@@ -1265,8 +1502,8 @@ mod tests {
                     ),
                     tool_call(
                         "2",
-                        "find_path",
-                        serde_json::json!({"pattern":"panic!","path":"src"}),
+                        "list_directory",
+                        serde_json::json!({"path":"src"}),
                     ),
                 ]),
                 tool_call_id: None,
@@ -1281,7 +1518,7 @@ mod tests {
             },
             Message {
                 role: "tool".to_string(),
-                content: Value::String("src/main.rs:42: panic!(\"boom\")".to_string()),
+                content: Value::String("main.rs\nlib.rs".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("2".to_string()),
                 reasoning_content: None,
@@ -1289,14 +1526,8 @@ mod tests {
         ];
 
         let findings = collect_repo_inspection_findings(&turn_messages);
-        let note = build_code_inspection_working_memory(
-            &turn_messages,
-            &findings,
-            &available_tool_names(&["read_file", "find_path"]),
-        )
-        .expect("note");
-        assert!(!note.contains("Code-navigation correction"));
-        assert!(!note.contains("`code_search`"));
+        let note = build_code_inspection_working_memory(&turn_messages, &findings).expect("note");
+        assert!(note.contains("list_directory(path=src)"));
     }
 
     #[test]

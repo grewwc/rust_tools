@@ -50,7 +50,6 @@ fn attachment_block_truncates_large_files_and_points_to_read_file() {
         "rendered: {rendered}"
     );
     assert!(rendered.contains("read_file("), "rendered: {rendered}");
-    assert!(rendered.contains("Symbol outline"), "rendered: {rendered}");
 
     let _ = fs::remove_file(path);
 }

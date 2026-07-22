@@ -9,14 +9,15 @@ use std::path::Path;
 
 use crate::ai::types::ToolCall;
 
-use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
+use super::super::types::{Message, ROLE_INTERNAL_NOTE, ROLE_SYSTEM, retained_turn_start};
 use super::text_utils::truncate_to_chars;
 use super::tool_overflow::{
     build_tool_overflow_recall_lines, is_non_compressible_tool, is_preserved_user_or_image_stub,
     preserve_noncompressible_tool_result_for_fold,
 };
 use super::{
-    COMPRESSED_TOOL_EVIDENCE_MARKER, is_context_checkpoint_marker,
+    COMPRESSED_TOOL_EVIDENCE_MARKER, is_archive_note_message,
+    is_compressed_tool_evidence_note, is_context_checkpoint_marker, is_summary_message,
     keep_recent_user_turns_when_trimming, normalize_whitespace, value_to_string,
 };
 
@@ -69,14 +70,16 @@ pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Optio
     let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages, budget);
     let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
 
-    // 跳过头部所有 system-like（system / internal_note）消息：它们承载 agent
-    // 指令、工具列表、历史摘要等关键上下文，不能被裁掉。
+    // 跳过头部受保护的 system-like 消息：真正的 system prompt、历史摘要、
+    // 归档指针和 checkpoint。不能把所有 internal_note 都整体保护起来：
+    // compressed_tool_round 也是 internal_note，若位于持久化历史头部，会变成
+    // 不可裁剪噪音并持续挤占上下文。
     // 旧实现只跳过以"对话摘要/历史摘要"前缀开头的条目，会把普通 system prompt
     // 当成可裁削目标，触发"上下文压缩后回复戛然而止"。
     // 同时把最近 N 轮 user 起始的整段尾部窗口都设为保护区，避免把多阶段任务
     // 的上一个子目标与当前子目标切开。
     let mut index = 0usize;
-    while index < messages.len() && is_system_like_role(&messages[index].role) {
+    while index < messages.len() && is_protected_leading_system_like_message(&messages[index]) {
         index += 1;
     }
 
@@ -122,6 +125,21 @@ pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Optio
     }
 
     None
+}
+
+fn is_protected_leading_system_like_message(message: &Message) -> bool {
+    if message.role == ROLE_SYSTEM {
+        return true;
+    }
+    if message.role != ROLE_INTERNAL_NOTE {
+        return false;
+    }
+    if is_compressed_tool_evidence_note(message) {
+        return false;
+    }
+    is_summary_message(message)
+        || is_archive_note_message(message)
+        || is_context_checkpoint_marker(message)
 }
 
 /// 渐进式卸载：把一个 (assistant tool_calls + 配套 tool 结果) 整组折叠成单条
@@ -265,46 +283,6 @@ fn tool_call_target_recall(tool_call: &ToolCall) -> String {
                 fields.push(format!("range: first {limit} lines"));
             }
         }
-        "find_path" => {
-            if let Some(pattern) = arg_string(&args, &["pattern", "query"]) {
-                fields.push(format!(
-                    "pattern: {}",
-                    truncate_to_chars(&normalize_whitespace(&pattern), 240)
-                ));
-            }
-            if let Some(path) = arg_string(&args, &["path"]) {
-                fields.push(format!(
-                    "path: {}",
-                    truncate_to_chars(&normalize_whitespace(&path), 160)
-                ));
-            }
-        }
-        "code_search" => {
-            if let Some(operation) = arg_string(&args, &["operation"]) {
-                fields.push(format!(
-                    "operation: {}",
-                    truncate_to_chars(&normalize_whitespace(&operation), 80)
-                ));
-            }
-            if let Some(query) = arg_string(&args, &["query"]) {
-                fields.push(format!(
-                    "query: {}",
-                    truncate_to_chars(&normalize_whitespace(&query), 240)
-                ));
-            }
-            if let Some(path) = arg_string(&args, &["path"]) {
-                fields.push(format!(
-                    "path: {}",
-                    truncate_to_chars(&normalize_whitespace(&path), 160)
-                ));
-            }
-            if let Some(file_pattern) = arg_string(&args, &["file_pattern", "filePattern"]) {
-                fields.push(format!(
-                    "file_pattern: {}",
-                    truncate_to_chars(&normalize_whitespace(&file_pattern), 160)
-                ));
-            }
-        }
         "list_directory" => {
             if let Some(path) = arg_string(&args, &["path"]) {
                 fields.push(format!(
@@ -428,7 +406,7 @@ fn tool_result_recall_text(
         ));
     }
 
-    if matches!(tool_name, "read_file" | "code_search") {
+    if tool_name == "read_file" {
         return Some(precision_grounding_tool_recall(
             tool_call,
             &preserved,
@@ -536,12 +514,7 @@ fn precision_grounding_tool_recall(
     archive_path_line: Option<String>,
 ) -> String {
     let mut lines = Vec::new();
-    let preview_budget = if tool_call.function.name == "code_search" {
-        3
-    } else {
-        4
-    };
-    if let Some(preview) = preserved_preview_recall(preserved, preview_budget) {
+    if let Some(preview) = preserved_preview_recall(preserved, 4) {
         lines.push(preview);
     }
     lines.extend(collect_original_recall_lines(tool_call, preserved));
@@ -552,9 +525,6 @@ fn precision_grounding_tool_recall(
     match tool_call.function.name.as_str() {
         "read_file" => lines.push(
             "优先依据 `original_file_path` / `original_range` 和 preview 继续判断；仅当这些锚点仍不足时再读取 `archive_file_path`。".to_string(),
-        ),
-        "code_search" => lines.push(
-            "优先依据 `original_operation` / `original_query` / `original_path` 和 preview 继续缩小范围；仅当这些锚点仍不足时再读取 `archive_file_path`。".to_string(),
         ),
         _ => {}
     }
@@ -825,6 +795,7 @@ pub(super) fn fold_early_tool_groups(
     messages: &[Message],
     keep_recent_groups: usize,
     overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &FxHashSet<String>,
 ) -> (Vec<Message>, usize) {
     // 定位所有 assistant(tool_calls) 起始位置，作为工具组锚点。
     let group_anchors: Vec<usize> = messages
@@ -878,6 +849,14 @@ pub(super) fn fold_early_tool_groups(
                 .iter()
                 .map(|tc| tc.id.as_str())
                 .collect();
+            if tool_call_ids
+                .iter()
+                .any(|id| protected_tool_call_ids.contains(*id))
+            {
+                out.push(message.clone());
+                idx += 1;
+                continue;
+            }
             // 收集紧随其后、属于本 assistant 的连续 tool 响应，构成完整组。
             let mut group = vec![idx];
             let mut cursor = idx + 1;

@@ -3,9 +3,8 @@
 ## Scope
 
 Applies to `src/bin/ai/tools/**`.
-Read `docs/agent-guides/ai-tools.md` before changing tool registration,
-execution policy, sandboxing, path resolution, history/display policy, or
-progressive loading.
+Module responsibilities: schema/metadata in `registry/`, execution in
+`service/`, shared helpers/state in `storage/`.
 
 ## Key invariants
 
@@ -23,12 +22,14 @@ progressive loading.
    `ToolHistoryPolicyRegistration`. Do not add broad fields to `ToolSpec` or
    reintroduce name-keyed policy chains in `history/compress/`.
 5. **History policy semantics.** `lossy_compress` and `prune` are orthogonal.
-   Preserve truth for `plan`, `read_file`, `code_search`, `execute_command`
-   diagnostics, and subagent task tools with explicit overflow stubs/file
-   pointers instead of lossy summaries.
+   Preserve truth for `plan`, `read_file`, `execute_command` diagnostics, and
+   subagent task tools with explicit overflow stubs/file pointers instead of
+   lossy summaries.
 6. **Temp files.** `write_file(temp=true)` writes under `runtime_ctx::temp_dir()`
    and registers a relative path in the JSON temp registry. `delete_path` only
-   deletes registered temp files.
+   deletes registered temp files. Delete existing project/source/config files
+   through `apply_patch` with a `*** Delete File:` envelope section, including
+   git-tracked files.
 7. **Process groups.** `execute_command` runs in its own process group. Keep
    background pgids in the in-memory session registry and kill by process group
    at teardown; do not persist pgids across restarts.
@@ -42,8 +43,8 @@ progressive loading.
    lines emit the original file text). A `ReplaceInLine` envelope op
    (`anchor:`/`old:`/`new:`) does anchored inline substring replacement outside
    the unified-diff path. `read_file` paginates by line and by character cap,
-   computing continuation offsets from rendered lines. `code_search` is the
-   single entry point for LSP, file, text, and structural navigation.
+   computing continuation offsets from rendered lines. Text search lives in the
+   dedicated grep/search tools.
 10. **Subagent tools.** `task`/`task_spawn` enforce the depth cap, results are
     session-scoped, and surfaced child outputs must remind the parent to produce
     its own summary. Subagent launches use a capped copy of the selected agent
@@ -62,7 +63,3 @@ progressive loading.
     avoid a lock cycle with `task_wait` (which holds registry -> kernel).
     `task_cancel` skips already-finished tasks (via `is_task_pending`) so it
     never overwrites/discards a real result.
-
-## Related detailed guide
-
-- `docs/agent-guides/ai-tools.md`

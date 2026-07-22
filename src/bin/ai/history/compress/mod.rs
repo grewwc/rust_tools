@@ -157,6 +157,14 @@ pub(super) fn is_context_checkpoint_marker(m: &Message) -> bool {
             .trim_start()
             .starts_with(CONTEXT_CHECKPOINT_MARKER_PREFIX)
 }
+
+pub(super) fn is_compressed_tool_evidence_note(m: &Message) -> bool {
+    m.role == ROLE_INTERNAL_NOTE
+        && value_to_string(&m.content)
+            .trim_start()
+            .contains(COMPRESSED_TOOL_EVIDENCE_MARKER)
+}
+
 const PERSISTED_HISTORY_SUMMARY_MAX_CHARS: usize = 8_000;
 const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
 const PRESERVED_TOOL_OVERFLOW_DIR: &str = "tool-overflow-compressed";
@@ -251,6 +259,19 @@ impl OverflowSink {
     }
 }
 
+fn archive_trimmed_compressed_tool_evidence(message: &Message, overflow_dir: Option<&Path>) {
+    if !is_compressed_tool_evidence_note(message) {
+        return;
+    }
+    let Some(dir) = overflow_dir else {
+        return;
+    };
+
+    let mut sink = OverflowSink::new(dir);
+    sink.push_messages(std::slice::from_ref(message));
+    let _ = sink.flush();
+}
+
 fn build_overflow_placeholder(file_path: &str) -> String {
     let mut out = String::new();
     out.push_str(
@@ -293,6 +314,7 @@ pub(in crate::ai) fn compress_messages_for_context(
             max_chars,
             summary_max_chars,
             overflow_dir.as_deref(),
+            &rustc_hash::FxHashSet::default(),
         );
     }
 
@@ -304,6 +326,7 @@ pub(in crate::ai) fn compress_messages_for_context(
             max_chars,
             summary_max_chars,
             overflow_dir.as_deref(),
+            &rustc_hash::FxHashSet::default(),
         );
     }
 
@@ -334,7 +357,13 @@ pub(in crate::ai) fn compress_messages_for_context(
             .cloned(),
     );
     out.extend_from_slice(recent);
-    shrink_messages_to_fit_with_summary(out, max_chars, summary_max_chars, overflow_dir.as_deref())
+    shrink_messages_to_fit_with_summary(
+        out,
+        max_chars,
+        summary_max_chars,
+        overflow_dir.as_deref(),
+        &rustc_hash::FxHashSet::default(),
+    )
 }
 
 /// 持久化历史里"带 tool_calls 的 assistant narration"被截断到的字符数。
@@ -599,14 +628,14 @@ async fn compact_persisted_history_with_app_inner(
     out
 }
 
-/// 当 `first_tool_call_group` 折不动（剩余可折叠组都含 `read_file`/`code_search`
+/// 当 `first_tool_call_group` 折不动（剩余可折叠组都含 `read_file`
 /// 等 non-compressible 工具、被它按策略拒绝）但仍超预算时的下一档手段：用
 /// [`fold_early_tool_groups`] 递进折叠「保护尾窗之外」的这些组为单行
 /// `compressed_tool_round` note（内含 file_path 召回锚点，模型可 read_file 回读）。
 ///
 /// 这与 `mid_turn_llm_summarize` 的 Path B+C 复用**同一个**久经测试的折叠函数，
 /// 只是把它前移到常规/落盘压缩路径——修复「tool-heavy 会话（少 user 轮 × 上百次
-/// read_file/code_search）在 `compress_messages_for_context` / `shrink_*` 里永远
+/// read_file）在 `compress_messages_for_context` / `shrink_*` 里永远
 /// 压不掉工具组、整段历史无法收敛进预算」的总根因。
 ///
 /// 返回是否发生了「有效折叠」（净字符数下降）。`keep_recent` 从
@@ -616,13 +645,15 @@ fn fold_noncompressible_tool_groups_to_fit(
     messages: &mut Vec<Message>,
     max_chars: usize,
     overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
     let mut made_progress = false;
     for &keep_recent in &[KEEP_RECENT_TOOL_GROUPS, 2, 1, 0] {
         if messages_total_chars(messages) <= max_chars {
             break;
         }
-        let (folded, folded_groups) = fold_early_tool_groups(messages, keep_recent, overflow_dir);
+        let (folded, folded_groups) =
+            fold_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids);
         if folded_groups == 0 {
             continue;
         }
@@ -640,6 +671,7 @@ fn shrink_messages_to_fit(
     mut messages: Vec<Message>,
     max_chars: usize,
     overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> Vec<Message> {
     if max_chars == 0 {
         return messages;
@@ -655,13 +687,20 @@ fn shrink_messages_to_fit(
     // 替换成带**唯一临时路径**的 stub，一旦如此，逐字节相同的重复副本就因路径不同
     // 而无法再折叠。先做内容级 dedup，把冗余全文折叠成回指 stub，再对真正需要保留
     // 的少数版本做 offload。
-    dedup_repeated_tool_results(&mut messages);
-    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_GROUPS, overflow_dir);
+    dedup_repeated_tool_results(&mut messages, protected_tool_call_ids);
+    prepare_tool_messages_structured(
+        &mut messages,
+        480,
+        KEEP_RECENT_TOOL_GROUPS,
+        overflow_dir,
+        protected_tool_call_ids,
+    );
     enforce_protected_precision_group_budget(
         &mut messages,
         KEEP_RECENT_TOOL_GROUPS,
         max_chars / 2,
         overflow_dir,
+        protected_tool_call_ids,
     );
 
     // 先无条件外溢体量过大的旧 user/图片消息（保护尾窗除外），与
@@ -695,7 +734,12 @@ fn shrink_messages_to_fit(
         // e75fc2e5 session dump 的 22 个连续 `compressed_tool_round` <empty> stub）。
         // 改成每轮优先用一个 `fold_early_tool_groups` 批把所有可折叠组一次性收掉，
         // 让收缩在数外层迭代内完成。
-        if fold_noncompressible_tool_groups_to_fit(&mut messages, max_chars, overflow_dir) {
+        if fold_noncompressible_tool_groups_to_fit(
+            &mut messages,
+            max_chars,
+            overflow_dir,
+            protected_tool_call_ids,
+        ) {
             continue;
         }
         if let Some(idx) = first_trim_candidate(&messages, max_chars) {
@@ -716,14 +760,15 @@ fn shrink_messages_to_fit(
             }
             // 其余可裁候选（assistant 纯叙述等，first_trim_candidate 已排除 tool
             // 与带 tool_calls 的 assistant）保持原样删除。
-            messages.remove(idx);
+            let removed = messages.remove(idx);
+            archive_trimmed_compressed_tool_evidence(&removed, overflow_dir);
             continue;
         }
         break;
     }
 
     if messages_total_chars(&messages) > max_chars {
-        truncate_first_message_to_fit(&mut messages, max_chars);
+        truncate_first_message_to_fit(&mut messages, max_chars, protected_tool_call_ids);
     }
 
     keep_only_recent_reasoning_content(&mut messages);
@@ -740,6 +785,7 @@ fn shrink_messages_to_fit_with_summary(
     max_chars: usize,
     summary_max_chars: usize,
     overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> Vec<Message> {
     if max_chars == 0 {
         return messages;
@@ -752,13 +798,20 @@ fn shrink_messages_to_fit_with_summary(
     dedup_adjacent(&mut messages);
     // dedup 先于 offload：理由同 shrink_messages_to_fit——避免逐字节相同的重复
     // read_file 全文各自被 offload 成唯一临时路径 stub 而失去折叠机会。
-    dedup_repeated_tool_results(&mut messages);
-    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_GROUPS, overflow_dir);
+    dedup_repeated_tool_results(&mut messages, protected_tool_call_ids);
+    prepare_tool_messages_structured(
+        &mut messages,
+        480,
+        KEEP_RECENT_TOOL_GROUPS,
+        overflow_dir,
+        protected_tool_call_ids,
+    );
     enforce_protected_precision_group_budget(
         &mut messages,
         KEEP_RECENT_TOOL_GROUPS,
         max_chars / 2,
         overflow_dir,
+        protected_tool_call_ids,
     );
 
     // 先无条件外溢体量过大的旧 user/图片消息（最新一轮保护尾窗除外）。
@@ -785,7 +838,12 @@ fn shrink_messages_to_fit_with_summary(
         // 都通过 [`fold_early_tool_groups`] 处理）——理由同
         // [`shrink_messages_to_fit`]，避免单组 fold 循环迭代几十轮注入
         // `<empty>` empty-checkpoint note（详 e75fc2e5 session dump）。
-        if fold_noncompressible_tool_groups_to_fit(&mut messages, max_chars, overflow_dir) {
+        if fold_noncompressible_tool_groups_to_fit(
+            &mut messages,
+            max_chars,
+            overflow_dir,
+            protected_tool_call_ids,
+        ) {
             continue;
         }
         if let Some(idx) = first_trim_candidate(&messages, max_chars) {
@@ -932,7 +990,7 @@ fn shrink_messages_to_fit_with_summary(
     }
 
     if messages_total_chars(&messages) > max_chars {
-        truncate_first_message_to_fit(&mut messages, max_chars);
+        truncate_first_message_to_fit(&mut messages, max_chars, protected_tool_call_ids);
     }
 
     keep_only_recent_reasoning_content(&mut messages);
@@ -949,7 +1007,11 @@ fn take_leading_summary(messages: &mut Vec<Message>) -> Option<Message> {
     }
 }
 
-fn truncate_first_message_to_fit(messages: &mut [Message], max_chars: usize) {
+fn truncate_first_message_to_fit(
+    messages: &mut [Message],
+    max_chars: usize,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+) {
     if messages.is_empty() {
         return;
     }
@@ -959,7 +1021,10 @@ fn truncate_first_message_to_fit(messages: &mut [Message], max_chars: usize) {
     // - 跳过 user（用户原文零压缩）；
     // - 跳过图片消息（图片引用零压缩）。
     let target_idx = messages.iter().position(|m| {
-        m.role != "system" && m.role != "user" && !message_contains_image(&m.content)
+        m.role != "system"
+            && m.role != "user"
+            && !protected_tool_result_message(m, protected_tool_call_ids)
+            && !message_contains_image(&m.content)
     });
     let Some(target_idx) = target_idx else {
         return; // 全是 system，没有可截断的目标
@@ -981,6 +1046,38 @@ fn truncate_first_message_to_fit(messages: &mut [Message], max_chars: usize) {
 
 fn messages_total_chars(messages: &[Message]) -> usize {
     messages.iter().map(message_billable_chars).sum::<usize>()
+}
+
+fn current_turn_precision_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String> {
+    let mut out = rustc_hash::FxHashSet::default();
+    let Some(current_turn_start) = messages.iter().rposition(|message| message.role == "user") else {
+        return out;
+    };
+    for message in messages.iter().skip(current_turn_start) {
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for tool_call in tool_calls {
+            if is_non_compressible_tool(&tool_call.function.name)
+                && crate::ai::tools::tool_history_policy(&tool_call.function.name)
+                    .counts_toward_precision_inline_budget()
+            {
+                out.insert(tool_call.id.clone());
+            }
+        }
+    }
+    out
+}
+
+fn protected_tool_result_message(
+    message: &Message,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+) -> bool {
+    message.role == "tool"
+        && message
+            .tool_call_id
+            .as_ref()
+            .is_some_and(|id| protected_tool_call_ids.contains(id))
 }
 
 /// Public proxy of [`messages_total_chars`] for callers in other ai modules
@@ -1015,7 +1112,8 @@ pub(in crate::ai) fn mid_turn_compress(
         return (out, before, after);
     }
     // 1. 同 signature 工具结果去重
-    dedup_repeated_tool_results(&mut out);
+    let protected_tool_call_ids = current_turn_precision_tool_call_ids(&out);
+    dedup_repeated_tool_results(&mut out, &protected_tool_call_ids);
     if messages_total_chars(&out) <= soft_threshold {
         let after = messages_total_chars(&out);
         return (out, before, after);
@@ -1024,13 +1122,19 @@ pub(in crate::ai) fn mid_turn_compress(
     //    传入 overflow_dir 后，read_file/grep 等「不可压缩」工具的大输出会被
     //    零压缩外溢到会话文件并留 head+tail 预览 stub（与跨 turn 压缩一致），
     //    既释放上下文体积又不丢信息——模型可按 stub 里的 file_path 重新 read_file。
-    prepare_tool_messages_structured(&mut out, 480, KEEP_RECENT_TOOL_GROUPS, overflow_dir);
+    prepare_tool_messages_structured(
+        &mut out,
+        480,
+        KEEP_RECENT_TOOL_GROUPS,
+        overflow_dir,
+        &protected_tool_call_ids,
+    );
     if messages_total_chars(&out) <= soft_threshold {
         let after = messages_total_chars(&out);
         return (out, before, after);
     }
     // 3. 仍超额：用 shrink_messages_to_fit 走"折叠 tool group + 整体兜底"
-    out = shrink_messages_to_fit(out, soft_threshold, overflow_dir);
+    out = shrink_messages_to_fit(out, soft_threshold, overflow_dir, &protected_tool_call_ids);
     let after = messages_total_chars(&out);
     (out, before, after)
 }
@@ -1068,6 +1172,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     let before = messages_total_chars(&messages);
     let overflow_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
         .session_assets_dir(&app.session_id);
+    let protected_tool_call_ids = current_turn_precision_tool_call_ids(&messages);
     // best 追踪迄今为止体积最小的结果；None 表示仍使用原始 messages。
     let mut best: Option<Vec<Message>> = None;
     let mut best_after = before;
@@ -1110,6 +1215,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                     &messages[split_at..],
                     MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS,
                     Some(overflow_dir.as_path()),
+                    &protected_tool_call_ids,
                 );
                 out.extend(tail);
                 let after = messages_total_chars(&out);
@@ -1138,8 +1244,12 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
             break;
         }
         let current = best.as_ref().unwrap_or(&messages);
-        let (folded, folded_groups) =
-            fold_early_tool_groups(current, keep_recent, Some(overflow_dir.as_path()));
+        let (folded, folded_groups) = fold_early_tool_groups(
+            current,
+            keep_recent,
+            Some(overflow_dir.as_path()),
+            &protected_tool_call_ids,
+        );
         if folded_groups == 0 {
             continue;
         }
@@ -1165,7 +1275,11 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // 这是绝对最后手段——宁可截断也不能让模型 4xx。
     if best_after > hard_target {
         let current = best.unwrap_or(messages);
-        let capped = cap_oversized_non_system_messages(current, PATH_C_PER_MSG_CAP);
+        let capped = cap_oversized_non_system_messages(
+            current,
+            PATH_C_PER_MSG_CAP,
+            &protected_tool_call_ids,
+        );
         let after = messages_total_chars(&capped);
         let savings = before.saturating_sub(after);
         return (
@@ -1188,9 +1302,13 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
 fn cap_oversized_non_system_messages(
     mut messages: Vec<Message>,
     per_msg_cap: usize,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> Vec<Message> {
     for message in &mut messages {
-        if is_system_like_role(&message.role) || message.role == "user" {
+        if is_system_like_role(&message.role)
+            || message.role == "user"
+            || protected_tool_result_message(message, protected_tool_call_ids)
+        {
             continue;
         }
         let chars = value_len_chars(&message.content);
@@ -1520,13 +1638,17 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
 /// 把较早的 tool 结果替换为单行 stub（保留 tool_call_id 以维持 OpenAI tool-calls 协议正确性）。
 /// 仅压缩内容，不删除消息，避免 assistant tool_calls 与 tool 响应的配对断裂。
 /// 最近 KEEP_RECENT_TOOL_GROUPS 个完整工具组一律保留全文。
-fn dedup_repeated_tool_results(messages: &mut [Message]) {
+fn dedup_repeated_tool_results(
+    messages: &mut [Message],
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+) {
     use rustc_hash::{FxHashMap, FxHasher};
     use std::hash::{Hash, Hasher};
 
     // 收集 (tool_name, args_signature) → 出现次数与索引
     // 通过 assistant.tool_calls 关联 tool_call_id → (name, args)
     let mut id_to_signature: FxHashMap<String, (String, String)> = FxHashMap::default();
+    let mut id_to_args_raw: FxHashMap<String, String> = FxHashMap::default();
     for message in messages.iter() {
         if let Some(tool_calls) = &message.tool_calls {
             for tc in tool_calls {
@@ -1534,6 +1656,7 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
                     .map(|v| v.to_string())
                     .unwrap_or_else(|_| tc.function.arguments.clone());
                 id_to_signature.insert(tc.id.clone(), (tc.function.name.clone(), args_norm));
+                id_to_args_raw.insert(tc.id.clone(), tc.function.arguments.clone());
             }
         }
     }
@@ -1544,11 +1667,16 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
     // `read_file` 的 offset/limit 不同不会命中调用签名去重，但它们可能包含同一
     // 段文件。仅在两个结果都已离开近端保护窗口、同文件重叠行逐字一致时，才从较早
     // 结果删除重叠行；任一行不同（文件曾被编辑、输出格式变化等）即保持原样。
-    dedup_overlapping_read_file_results(messages, &id_to_signature, &protected_indices);
+    dedup_overlapping_read_file_results(
+        messages,
+        &id_to_signature,
+        &protected_indices,
+        protected_tool_call_ids,
+    );
 
-    // (name, args) → 该签名下"首个保留全文"的 tool 消息序号，用于在折叠时回指。
-    let mut seen: FxHashMap<(String, String), usize> = FxHashMap::default();
-    // (tool_name, content_hash) → 首个出现该内容版本的 tool 消息序号。
+    // (name, args) → 该签名下"首个保留全文"的 tool 调用，用于在折叠时回指。
+    let mut seen: FxHashMap<(String, String), DedupToolOccurrence> = FxHashMap::default();
+    // (tool_name, content_hash) → 首个出现该内容版本的 tool 调用。
     // 内容级去重是断开"重复整篇重读"失忆环的关键：对 read_file 等
     // non-compressible 工具，同一 (文件) 被反复读取时往往返回**逐字节
     // 相同**的全文（实测占全部 tool 字节的 ~52%）。这些冗余副本可无损折叠，
@@ -1560,15 +1688,12 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
     // 在尾部反复堆积 6+ 份 15KB 的同内容（详 e75fc2e5 session dump）。
     // 改用 `(tool_name, content_hash)`：只要返回体本身一致就折叠——args 不同
     // 由调用签名去重的 `seen` 计数器单独管，不影响内容级折叠。
-    let mut seen_content: FxHashMap<(String, u64), usize> = FxHashMap::default();
+    let mut seen_content: FxHashMap<(String, u64), DedupToolOccurrence> = FxHashMap::default();
     for &idx in &tool_indices {
-        let signature = messages[idx]
-            .tool_call_id
-            .as_ref()
-            .and_then(|id| id_to_signature.get(id))
-            .cloned();
-        let signature = match signature {
-            Some(sig) => sig,
+        let occurrence =
+            dedup_tool_occurrence(messages, idx, &id_to_signature, &id_to_args_raw);
+        let occurrence = match occurrence {
+            Some(occurrence) => occurrence,
             None => {
                 // 孤儿 tool：找不到对应的 assistant.tool_calls（可能因为 assistant 消息
                 // 已被早期裁剪/丢弃，或写入历史时配对就已经断裂）。这些消息在
@@ -1590,8 +1715,14 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
                 continue;
             }
         };
-        let count = seen.entry(signature.clone()).or_insert(0);
-        *count += 1;
+        if protected_tool_call_ids.contains(&occurrence.tool_call_id) {
+            continue;
+        }
+        let signature_key = (occurrence.tool_name.clone(), occurrence.args_norm.clone());
+        let signature_canonical = seen.get(&signature_key).cloned();
+        if signature_canonical.is_none() {
+            seen.insert(signature_key, occurrence.clone());
+        }
         // **不再豁免最近保护窗内的重复**。历史上这里 `if protected_indices.contains(&idx) continue;`
         // 让最近 N 个工具组完全跳过去重，于是 agent 不断重发同一查询、最新副本一直
         // 落到"最近窗"里 → 永不被折叠，尾部堆积 15KB × 29 份的逐字节相同结果。
@@ -1600,8 +1731,8 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
         // 第一个全文版本（在对话里、保护窗逻辑之外），后续重复是无损冗余。
         // orphan 的保护逻辑（上面的 `!protected_indices.contains`）已经单独处理，
         // 不受这里影响。
-        if is_non_compressible_tool(&signature.0) {
-            // read_file/检索类工具**内容不同的版本**必须零压缩保留（Invariant：
+        if tool_uses_content_identity_dedup(&occurrence.tool_name) {
+            // read_file/list_directory/检索类工具**内容不同的版本**必须零压缩保留（Invariant：
             // precision 结果不做 lossy 裁剪）。但**逐字节相同**的重复副本是纯冗余，
             // 折叠它们不丢失任何信息，且能直接消除"旧全文堆积 + 近端 offload 触发
             // 重读"的失忆环。用内容 hash 区分二者：hash 首见 → 保留全文并登记；
@@ -1609,15 +1740,17 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
             let text = value_to_string(&messages[idx].content);
             let mut hasher = FxHasher::default();
             text.hash(&mut hasher);
-            let content_key = (signature.0.clone(), hasher.finish());
-            match seen_content.get(&content_key).copied() {
+            let content_key = (occurrence.tool_name.clone(), hasher.finish());
+            match seen_content.get(&content_key).cloned() {
                 None => {
-                    seen_content.insert(content_key, idx);
+                    seen_content.insert(content_key, occurrence);
                 }
-                Some(_) => {
-                    let stub = format!(
-                        "[deduped: byte-identical `{}` result already present verbatim earlier in this conversation; content unchanged since then. No need to re-read — reuse the earlier full result.]",
-                        signature.0
+                Some(canonical) => {
+                    let stub = render_dedup_tool_stub(
+                        DedupToolStubKind::ByteIdentical,
+                        &occurrence,
+                        &canonical,
+                        &text,
                     );
                     messages[idx].content = Value::String(stub);
                 }
@@ -1625,19 +1758,210 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
             continue;
         }
         // 保留首次出现，把后续重复的旧 tool 结果折叠为 stub
-        if *count > 1 {
-            let stub = format!(
-                "[deduped: identical {} call earlier in this conversation; full result preserved at first occurrence]",
-                signature.0
+        if let Some(canonical) = signature_canonical {
+            let text = value_to_string(&messages[idx].content);
+            let stub = render_dedup_tool_stub(
+                DedupToolStubKind::IdenticalCall,
+                &occurrence,
+                &canonical,
+                &text,
             );
             messages[idx].content = Value::String(stub);
         }
     }
 }
 
+#[derive(Clone, Copy)]
+enum DedupToolStubKind {
+    ByteIdentical,
+    IdenticalCall,
+}
+
+#[derive(Clone)]
+struct DedupToolOccurrence {
+    message_idx: usize,
+    tool_name: String,
+    tool_call_id: String,
+    args_norm: String,
+    args_raw: String,
+    target: Option<String>,
+}
+
+fn dedup_tool_occurrence(
+    messages: &[Message],
+    idx: usize,
+    id_to_signature: &rustc_hash::FxHashMap<String, (String, String)>,
+    id_to_args_raw: &rustc_hash::FxHashMap<String, String>,
+) -> Option<DedupToolOccurrence> {
+    let tool_call_id = messages[idx].tool_call_id.as_deref()?;
+    let (tool_name, args_norm) = id_to_signature.get(tool_call_id)?;
+    let args_raw = id_to_args_raw
+        .get(tool_call_id)
+        .map(String::as_str)
+        .unwrap_or(args_norm.as_str());
+    Some(DedupToolOccurrence {
+        message_idx: idx,
+        tool_name: tool_name.clone(),
+        tool_call_id: tool_call_id.to_string(),
+        args_norm: args_norm.clone(),
+        args_raw: args_raw.to_string(),
+        target: dedup_tool_target_summary(tool_name, args_raw),
+    })
+}
+
+fn tool_uses_content_identity_dedup(tool_name: &str) -> bool {
+    is_non_compressible_tool(tool_name) || tool_name == "list_directory"
+}
+
+fn render_dedup_tool_stub(
+    kind: DedupToolStubKind,
+    original: &DedupToolOccurrence,
+    canonical: &DedupToolOccurrence,
+    removed_content: &str,
+) -> String {
+    let mut out = match kind {
+        DedupToolStubKind::ByteIdentical => format!(
+            "[deduped: byte-identical `{}` result already present verbatim earlier in this conversation; content unchanged since then. No need to re-read - reuse the canonical full result.]\n",
+            original.tool_name
+        ),
+        DedupToolStubKind::IdenticalCall => format!(
+            "[deduped: identical `{}` call earlier in this conversation; full result preserved at first occurrence.]\n",
+            original.tool_name
+        ),
+    };
+    out.push_str(&format!(
+        "- original_tool_call_id: {}\n- canonical_tool_call_id: {}\n- first_occurrence_message_index: {}\n",
+        original.tool_call_id, canonical.tool_call_id, canonical.message_idx
+    ));
+    out.push_str(&format!(
+        "- original_args: {}\n",
+        render_dedup_args(&original.args_raw)
+    ));
+    if let Some(target) = original.target.as_deref() {
+        out.push_str(&format!("- original_target: {target}\n"));
+    }
+    if original.args_norm != canonical.args_norm {
+        out.push_str(&format!(
+            "- canonical_args: {}\n",
+            render_dedup_args(&canonical.args_raw)
+        ));
+    }
+    if original.target != canonical.target
+        && let Some(target) = canonical.target.as_deref()
+    {
+        out.push_str(&format!("- canonical_target: {target}\n"));
+    }
+    out.push_str(&format!(
+        "- preview: {}",
+        render_dedup_preview(removed_content)
+    ));
+    out
+}
+
+fn render_dedup_args(args: &str) -> String {
+    let rendered = serde_json::from_str::<Value>(args)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| normalize_whitespace(args));
+    truncate_to_chars(&rendered, 720)
+}
+
+fn render_dedup_preview(content: &str) -> String {
+    let content = content.trim();
+    if content.is_empty() {
+        return "<empty>".to_string();
+    }
+    let preview = summarize_text(content, 520);
+    truncate_to_chars(&normalize_whitespace(&preview), 520)
+}
+
+fn dedup_tool_target_summary(tool_name: &str, args: &str) -> Option<String> {
+    let args = serde_json::from_str::<Value>(args).ok()?;
+    let mut fields = Vec::new();
+    match tool_name {
+        "read_file" => {
+            if let Some(path) = dedup_arg_string(&args, &["file_path", "path", "filePath"]) {
+                fields.push(format!(
+                    "file={}",
+                    truncate_to_chars(&normalize_whitespace(&path), 240)
+                ));
+            }
+            if let Some(range) = dedup_read_file_range_summary(&args) {
+                fields.push(range);
+            }
+        }
+        "list_directory" => {
+            if let Some(path) = dedup_arg_string(&args, &["path"]) {
+                fields.push(format!(
+                    "path={}",
+                    truncate_to_chars(&normalize_whitespace(&path), 240)
+                ));
+            }
+        }
+        "execute_command" | "run_command" | "shell" | "bash" => {
+            if let Some(command) = dedup_arg_string(&args, &["command"]) {
+                fields.push(format!(
+                    "command={}",
+                    truncate_to_chars(&normalize_whitespace(&command), 360)
+                ));
+            }
+            if let Some(cwd) = dedup_arg_string(&args, &["cwd"]) {
+                let cwd = normalize_whitespace(&cwd);
+                if !cwd.is_empty() {
+                    fields.push(format!("cwd={}", truncate_to_chars(&cwd, 240)));
+                }
+            }
+        }
+        _ => {
+            for key in ["file_path", "path", "filePath", "pattern", "query", "command"] {
+                if let Some(value) = args.get(key).and_then(Value::as_str) {
+                    fields.push(format!(
+                        "{key}={}",
+                        truncate_to_chars(&normalize_whitespace(value), 240)
+                    ));
+                }
+            }
+        }
+    }
+
+    (!fields.is_empty()).then(|| fields.join("; "))
+}
+
+fn dedup_arg_string(args: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn dedup_arg_u64(args: &Value, key: &str) -> Option<u64> {
+    args.get(key)
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn dedup_read_file_range_summary(args: &Value) -> Option<String> {
+    let start_line = dedup_arg_u64(args, "startLine");
+    let end_line = dedup_arg_u64(args, "endLine");
+    if let (Some(start_line), Some(end_line)) = (start_line, end_line) {
+        return Some(format!("range=lines:{start_line}..{end_line}"));
+    }
+
+    let offset = dedup_arg_u64(args, "offset");
+    let limit = dedup_arg_u64(args, "limit");
+    match (offset, limit) {
+        (Some(offset), Some(limit)) if limit > 0 => Some(format!(
+            "range=lines:{}..{}",
+            offset,
+            offset.saturating_add(limit.saturating_sub(1))
+        )),
+        (Some(offset), _) => Some(format!("range=offset:{offset}")),
+        (None, Some(limit)) => Some(format!("range=first:{limit}")),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 struct NumberedReadFileResult {
     message_idx: usize,
+    tool_call_id: String,
     path: String,
     lines: Vec<(usize, String)>,
 }
@@ -1646,6 +1970,7 @@ fn dedup_overlapping_read_file_results(
     messages: &mut [Message],
     id_to_signature: &rustc_hash::FxHashMap<String, (String, String)>,
     protected_indices: &rustc_hash::FxHashSet<usize>,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) {
     let tool_indices = tool_message_indices(messages);
     let mut prior_results: Vec<NumberedReadFileResult> = Vec::new();
@@ -1666,9 +1991,10 @@ fn dedup_overlapping_read_file_results(
         };
 
         // 近端完整工具组必须逐字保留，避免下一轮模型看到被处理过的刚读取内容。
-        if protected_indices.contains(&idx) {
+        if protected_indices.contains(&idx) || protected_tool_call_ids.contains(tool_call_id) {
             prior_results.push(NumberedReadFileResult {
                 message_idx: idx,
+                tool_call_id: tool_call_id.clone(),
                 path,
                 lines,
             });
@@ -1676,7 +2002,10 @@ fn dedup_overlapping_read_file_results(
         }
 
         for prior in &mut prior_results {
-            if protected_indices.contains(&prior.message_idx) || prior.path != path {
+            if protected_indices.contains(&prior.message_idx)
+                || protected_tool_call_ids.contains(&prior.tool_call_id)
+                || prior.path != path
+            {
                 continue;
             }
 
@@ -1694,6 +2023,7 @@ fn dedup_overlapping_read_file_results(
 
         prior_results.push(NumberedReadFileResult {
             message_idx: idx,
+            tool_call_id: tool_call_id.clone(),
             path,
             lines,
         });

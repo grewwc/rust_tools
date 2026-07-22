@@ -51,16 +51,6 @@ rand = "0.10.0"
 dirs = "6"
 rust_tools_macros = { path = "crates/rust_tools_macros" }
 aios_kernel = { path = "crates/aios_kernel" }
-tree-sitter = "0.24"
-tree-sitter-rust = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-java = "0.23"
-tree-sitter-cpp = "0.23"
-tree-sitter-go = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-typescript = "0.23"
-tree-sitter-c = "0.23"
-streaming-iterator = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -68,5 +58,5 @@ objc2-foundation = "0.3"
 objc2-vision = { version = "0.3", features = ["VNRequest", "VNObservation"] }
 
 [profile.release]
-strip = false
+strip = true
 panic = "abort"

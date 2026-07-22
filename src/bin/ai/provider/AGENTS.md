@@ -3,8 +3,8 @@
 ## Scope
 
 Applies to `src/bin/ai/provider/**`.
-Read `docs/agent-guides/ai-provider.md` before changing provider-specific
-request fields, endpoint selection, reasoning flags, or stream normalization.
+Key areas: request fields and endpoint selection in adapter hooks, reasoning
+flags in platform config, stream normalization in `normalize/`.
 
 ## Key invariants
 
@@ -18,6 +18,3 @@ request fields, endpoint selection, reasoning flags, or stream normalization.
 4. **Wire-format tests.** Request-body or stream-format changes need focused
    tests, especially when formats differ across providers.
 
-## Related detailed guide
-
-- `docs/agent-guides/ai-provider.md`

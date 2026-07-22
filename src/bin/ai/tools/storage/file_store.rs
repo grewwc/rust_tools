@@ -20,7 +20,7 @@ impl FileStore {
     }
 
     pub(crate) fn validate_read_access(&self) -> Result<(), AiError> {
-        // 封锁对压缩器内部 read_file / code_search 外溢产物的回读：这些文件是工具
+        // 封锁对压缩器内部 read_file 外溢产物的回读：这些文件是工具
         // 渲染结果的转储，模型读回只会拿到旧行号内容并触发无限重读循环。带原始锚点
         // 的 execute_command 日志、user/image 归档与 overflow-history.md 不在此列。
         if let Some(reason) = blocked_overflow_read_reason(&self.path) {
@@ -180,10 +180,10 @@ fn session_overflow_dir_component(path: &Path) -> Option<&'static str> {
 
 /// 判断读取该路径是否应被拒绝，若拒绝则给出可执行的替代指引。
 ///
-/// 仅拦截 `tool-overflow-compressed/` 下 read_file / code_search 的外溢产物：这些
+/// 仅拦截 `tool-overflow-compressed/` 下 read_file 的外溢产物：这些
 /// 文件是"工具渲染结果"的内部转储，模型回读只会拿到带行号的旧输出，触发
 /// "压缩→留 file_path→回读→再压缩→再留 file_path→再回读" 的无限重读循环；而它们
-/// 都能通过 stub 里的 `original_file_path` / `original_query` 指回真正的原始来源。
+/// 都能通过 stub 里的 `original_file_path` 指回真正的原始来源。
 ///
 /// 明确放行（这些文件对模型有独立价值，不能封锁）：
 /// - `execute_command` 外溢日志——命令输出没有可替代的"原始源"，归档本身即证据；
@@ -194,13 +194,13 @@ fn blocked_overflow_read_reason(path: &Path) -> Option<String> {
         return None;
     }
     match overflow_artifact_tool_name(path)?.as_str() {
-        tool @ ("read_file" | "code_search") => Some(format!(
+        "read_file" => Some(
             "Access blocked: this is an internal compression artifact (the archived render of a prior \
-             `{tool}` result), not a source file. Re-reading it produces nested line numbers and \
-             re-compression loops. Read the original target instead — for read_file use the stub's \
-             `original_file_path` (+ `original_range`); for code_search re-run with the stub's \
-             `original_query` / `original_path`."
-        )),
+             `read_file` result), not a source file. Re-reading it produces nested line numbers and \
+             re-compression loops. Read the original target instead using the stub's \
+             `original_file_path` (+ `original_range`)."
+                .to_string(),
+        ),
         // execute_command / plan / 其它高精度工具的归档保持可读：它们没有更好的原始锚点。
         _ => None,
     }
@@ -415,20 +415,13 @@ mod tests {
     }
 
     #[test]
-    fn read_file_and_code_search_artifacts_are_blocked_with_redirect() {
+    fn read_file_artifacts_are_blocked_with_redirect() {
         let read_artifact = Path::new(
             "/proj.assets/tool-overflow-compressed/20260722T101112Z-read_file-abc123.txt",
         );
         let reason = blocked_overflow_read_reason(read_artifact)
             .expect("read_file overflow artifact must be blocked");
         assert!(reason.contains("original_file_path"), "{reason}");
-
-        let search_artifact = Path::new(
-            "/proj.assets/tool-overflow-compressed/20260722T101112Z-code_search-abc123.txt",
-        );
-        let reason = blocked_overflow_read_reason(search_artifact)
-            .expect("code_search overflow artifact must be blocked");
-        assert!(reason.contains("original_query"), "{reason}");
 
         // 通过 FileStore 端到端确认拒绝（read_file 工具会走 validate_read_access）。
         assert!(FileStore::new(read_artifact.to_path_buf())

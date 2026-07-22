@@ -893,7 +893,7 @@ mod tests {
     fn process_tool_result_scores_tree() {
         let mut orch = ThinkingOrchestrator::new();
         orch.apply_meta_tags("<meta:begin_tree_of_thoughts>root</meta:begin_tree_of_thoughts>");
-        orch.process_tool_result("code_search", "found relevant code", true);
+        orch.process_tool_result("read_file", "found relevant code", true);
     }
 
     #[test]

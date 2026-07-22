@@ -1257,7 +1257,6 @@ mod tests {
 
         assert!(ctx.attachments_text.contains("Attachment preview only"));
         assert!(ctx.attachments_text.contains("read_file("));
-        assert!(ctx.attachments_text.contains("Symbol outline"));
         assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
     }
 

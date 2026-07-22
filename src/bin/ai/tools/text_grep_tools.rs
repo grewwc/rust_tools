@@ -66,7 +66,7 @@ pub(crate) fn validate_search_root(root: &Path, cwd: &Path) -> Result<(), String
 // ============================================================================
 // 共享内容搜索引擎
 //
-// `run_content_search` 是 code_search.text_search operation 调用的内容搜索核心：
+// `run_content_search` 是文本搜索工具的内容搜索核心：
 // BFS 递归收集文件 → 逐行匹配 → 相关性重排 → 按文件聚合（每文件 top-N
 // snippet + context + `>` 标记匹配行）。普通大小写敏感字面查询直接走
 // `str::find`，仅正则和大小写不敏感查询构造 Regex。

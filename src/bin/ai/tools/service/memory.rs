@@ -1529,7 +1529,7 @@ mod tests {
         }
 
         let save_args = serde_json::json!({
-            "content": "Prefer code_search before repeated raw reads"
+            "content": "Prefer targeted reads over repeated raw reads"
         });
         execute_memory_save(&save_args).unwrap();
 

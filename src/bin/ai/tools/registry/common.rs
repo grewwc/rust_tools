@@ -444,12 +444,9 @@ pub(crate) fn is_registered_tool_name(name: &str) -> bool {
 
 /// 把已废弃/合并的历史工具名规整到当前规范名，用于旧会话回放兼容。
 /// `read_file_lines` 已并入 `read_file`（两者都接受 offset/limit）。
-/// `lsp` 已并入 `code_search`（后者是超集：同样的 operation/file_path 语义，
-/// 6 个 LSP 操作内部委托给 `execute_lsp`）。
 fn canonical_tool_name(name: &str) -> &str {
     match name {
         "read_file_lines" => "read_file",
-        "lsp" => "code_search",
         other => other,
     }
 }
@@ -490,9 +487,8 @@ fn execute_tool_call_with_args_impl(
     args: &Value,
     on_chunk: Option<&mut ToolStreamWriter<'_>>,
 ) -> Result<ToolResult, String> {
-    // 旧会话回放兼容：read_file_lines 已并入 read_file（同样支持 offset/limit），
-    // lsp 已并入 code_search（同样的 operation/file_path 语义）。老历史里残留的
-    // 调用名映射到规范名，避免回放时命中 "Unknown tool"。
+    // 旧会话回放兼容：read_file_lines 已并入 read_file（同样支持 offset/limit）。
+    // 老历史里残留的调用名映射到规范名，避免回放时命中 "Unknown tool"。
     let name = canonical_tool_name(name);
     let Some(spec) = TOOL_INDEX.get_ref(&name.to_string()).copied() else {
         record_tool_stat(name, false);
@@ -639,21 +635,16 @@ mod history_policy_tests {
         // 旧会话历史里残留的 read_file_lines 调用名必须映射到 read_file，
         // 回放时不能命中 "Unknown tool"。
         assert_eq!(canonical_tool_name("read_file_lines"), "read_file");
-        assert_eq!(canonical_tool_name("lsp"), "code_search");
+        assert_eq!(canonical_tool_name("lsp"), "lsp");
         assert_eq!(canonical_tool_name("read_file"), "read_file");
         assert_eq!(canonical_tool_name("execute_command"), "execute_command");
     }
 
     #[test]
-    fn read_and_search_tools_block_lossy_but_allow_prune() {
-        for name in ["read_file", "find_path", "code_search"] {
-            let policy = tool_history_policy(name);
-            assert!(
-                !policy.allows_lossy_compress(),
-                "{name} should block lossy compression"
-            );
-            assert!(policy.allows_prune(), "{name} should allow LLM pruning");
-        }
+    fn read_file_blocks_lossy_but_allows_prune() {
+        let policy = tool_history_policy("read_file");
+        assert!(!policy.allows_lossy_compress());
+        assert!(policy.allows_prune());
     }
 
     #[test]

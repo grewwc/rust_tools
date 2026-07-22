@@ -5,7 +5,6 @@ use super::ToolRoute;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BarrierRule {
     Always,
-    OnSuccessNonEmptyOutput,
     Never,
 }
 
@@ -23,11 +22,6 @@ struct BarrierSpec {
 }
 
 const BARRIER_SPECS: &[BarrierSpec] = &[
-    BarrierSpec {
-        route: ToolRouteKind::Builtin,
-        tool_name: "find_path",
-        rule: BarrierRule::OnSuccessNonEmptyOutput,
-    },
     BarrierSpec {
         route: ToolRouteKind::Builtin,
         tool_name: "list_directory",
@@ -63,12 +57,11 @@ fn barrier_rule(route: &ToolRoute, tool_name: &str) -> BarrierRule {
 pub(super) fn should_barrier_after(
     route: &ToolRoute,
     tool_call: &ToolCall,
-    ok: bool,
-    content: &str,
+    _ok: bool,
+    _content: &str,
 ) -> bool {
     match barrier_rule(route, &tool_call.function.name) {
         BarrierRule::Always => true,
-        BarrierRule::OnSuccessNonEmptyOutput => ok && !content.trim().is_empty(),
         BarrierRule::Never => false,
     }
 }
@@ -94,24 +87,6 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
-    }
-
-    #[test]
-    fn barrier_builtin_find_path_requires_non_empty_success_output() {
-        let tc = tool_call("find_path");
-        assert!(!should_barrier_after(&ToolRoute::Builtin, &tc, true, "   "));
-        assert!(!should_barrier_after(
-            &ToolRoute::Builtin,
-            &tc,
-            false,
-            "/tmp/a.rs"
-        ));
-        assert!(should_barrier_after(
-            &ToolRoute::Builtin,
-            &tc,
-            true,
-            "/tmp/a.rs"
-        ));
     }
 
     #[test]

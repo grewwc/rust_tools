@@ -7,7 +7,7 @@ use super::{
     delete_async_tool_snapshot, execute_tool_calls, execute_with_safe_retry,
     is_cacheable_tool_name, is_parallel_safe_tool_call, is_tool_cache_entry_fresh,
     load_async_tool_snapshot, lookup_wait_sources, parallel_safe_batch_len,
-    persist_async_tool_snapshot, remediation_hint, send_async_tool_pipe_message, should_retry_once,
+    persist_async_tool_snapshot, send_async_tool_pipe_message, should_retry_once,
     stream_preview_from_aggregate, tool_cache_validation_matches,
 };
 use crate::ai::mcp::McpClient;
@@ -70,6 +70,13 @@ fn read_file_is_forced_to_sequential_path() {
 }
 
 #[test]
+fn parallel_batch_stops_at_serial_grounding_tool() {
+    let mcp = McpClient::new();
+    let calls = vec![tool_call("read_file"), tool_call("knowledge_search")];
+    assert_eq!(parallel_safe_batch_len(&mcp, &calls), 0);
+}
+
+#[test]
 fn parallel_batch_stops_at_mutating_tool() {
     let mcp = McpClient::new();
     // write_file / execute_command 带副作用，不可并行，应在其处截断。
@@ -78,15 +85,14 @@ fn parallel_batch_stops_at_mutating_tool() {
         &mcp,
         &tool_call("execute_command")
     ));
-    let calls = vec![tool_call("code_search"), tool_call("write_file")];
+    let calls = vec![tool_call("knowledge_search"), tool_call("write_file")];
     assert_eq!(parallel_safe_batch_len(&mcp, &calls), 1);
 }
 
 #[test]
 fn parallel_batch_excludes_barriering_tools() {
     let mcp = McpClient::new();
-    // find_path / list_directory / web_search 会触发 barrier，必须顺序执行。
-    assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("find_path")));
+    // list_directory / web_search 会触发 barrier，必须顺序执行。
     assert!(!is_parallel_safe_tool_call(
         &mcp,
         &tool_call("list_directory")
@@ -98,7 +104,7 @@ fn parallel_batch_excludes_barriering_tools() {
 fn parallel_batch_caps_at_max_concurrency() {
     let mcp = McpClient::new();
     let calls: Vec<ToolCall> = (0..super::PARALLEL_READONLY_MAX_CONCURRENCY + 4)
-        .map(|_| tool_call("code_search"))
+        .map(|_| tool_call("knowledge_search"))
         .collect();
     assert_eq!(
         parallel_safe_batch_len(&mcp, &calls),
@@ -109,7 +115,7 @@ fn parallel_batch_caps_at_max_concurrency() {
 #[test]
 fn parallel_batch_not_formed_for_single_readonly_call() {
     let mcp = McpClient::new();
-    let calls = vec![tool_call("code_search"), tool_call("write_file")];
+    let calls = vec![tool_call("knowledge_search"), tool_call("write_file")];
     // 仅 1 个可并行调用，调用方应回退到顺序路径（batch_len == 1 < 2）。
     assert_eq!(parallel_safe_batch_len(&mcp, &calls), 1);
 }
@@ -268,7 +274,6 @@ fn sample_completed_entry(result_channel_id: Option<u64>) -> AsyncToolEntry {
 #[test]
 fn cacheable_tool_name_prefers_read_only_tools() {
     assert!(is_cacheable_tool_name("read_file"));
-    assert!(is_cacheable_tool_name("find_path"));
     assert!(!is_cacheable_tool_name("create_file"));
     assert!(!is_cacheable_tool_name("execute_command"));
 }
@@ -316,15 +321,6 @@ fn should_retry_once_only_for_safe_builtin_read_only_tools() {
         "read_file",
         "timeout while reading"
     ));
-}
-
-#[test]
-fn remediation_hint_only_mentions_alternatives_available_in_current_turn() {
-    // read_file 现在唯一的等价备选是 code_search。
-    let available: FastSet<String> = ["code_search".to_string()].into_iter().collect();
-    let hint = remediation_hint("read_file", "not found", Some(&available)).expect("hint");
-    assert!(hint.contains("`code_search`"));
-    assert!(!hint.contains("search_files"));
 }
 
 #[test]
