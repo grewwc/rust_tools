@@ -924,35 +924,16 @@ fn build_system_prompt(
     }
 
     if has_tool(available_tools, "enable_tools") {
-        // Capability catalog（如有）按 trigger→tool 给出事实性精确映射；
-        // discovery 段是 actionable 政策。两者 ContextKind 不同，挂在一起
-        // 重叠较小且各自承担不同职责（catalog 让模型知道有什么，policy
-        // 告诉模型何时去发现/启用）。保持双挂以避免回归测试用例期望的
-        // mcp 提示与 "No skill is active yet" 提示丢失。
-        if let Some(catalog) = build_capability_catalog(available_tools) {
-            b.push(ContextKind::Fact, catalog);
-        }
-        let mut discovery_lines = Vec::new();
-        if skill.is_none() {
+        // 未加载能力的详细目录与示例容易在每轮造成无关噪声；统一通过
+        // enable_tools 按需发现，只有已经加载的工具才在下方注入具体规则。
+        let mut discovery_lines = vec![
+            "Additional capabilities are available via `enable_tools`; list and enable only what the current task needs.".to_string(),
+        ];
+        if skill.is_none() && has_tool(available_tools, "activate_skill") {
             discovery_lines.push(
-                "Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.".to_string(),
-            );
-            if has_tool(available_tools, "activate_skill") {
-                discovery_lines.push(
-                    "If the user explicitly names an installed skill and it clearly matches the task, call `activate_skill(name=...)` directly. Do not activate a skill speculatively.".to_string(),
-                );
-            }
-            discovery_lines.push(
-                "No skill is active yet. Prefer enabling only the specific tools you need when the task is specialized or tool-heavy.".to_string(),
-            );
-        } else {
-            discovery_lines.push(
-                "Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.".to_string(),
+                "If the user explicitly names an installed skill and it clearly matches the task, call `activate_skill(name=...)` directly; do not activate one speculatively.".to_string(),
             );
         }
-        discovery_lines.push(
-            "For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.".to_string(),
-        );
         push_tool_guidance_section(
             &mut b,
             ContextKind::Policy,
@@ -1628,6 +1609,11 @@ mod tests {
                 .render_system_prompt();
         assert!(prompt.contains("Tool usage:"));
         assert!(prompt.contains("Tool discovery:"));
+        assert!(prompt.contains("Additional capabilities are available via `enable_tools`"));
+        assert!(!prompt.contains("Capability catalog (not yet loaded"));
+        assert!(!prompt.contains("Configured MCP tools are available"));
+        assert!(!prompt.contains("Process / IPC / shared-memory primitives are available"));
+        assert!(!prompt.contains("Feishu/Lark"));
         assert!(!prompt.contains("Web search:"));
         assert!(!prompt.contains("Knowledge retrieval:"));
         assert!(!prompt.contains("cargo_test"));

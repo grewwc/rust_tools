@@ -44,9 +44,10 @@ use super::super::runtime_ctx::DriverContext;
 
 /// Hard upper bound on how long a synchronous `task` tool call may block
 /// the parent agent. Keeps a runaway sub-agent from wedging the foreground
-/// turn forever. 10 minutes is generous for a single subagent invocation
-/// while still being shorter than typical interactive patience.
-const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(600);
+/// turn forever. Subagents are leaf tasks with a separate iteration cap; five
+/// minutes is enough to return useful partial evidence without wedging the
+/// parent turn for an interactive session.
+const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 子代理"运行中"心跳的刷新间隔。仅在 subagent 尚未产出任何流式输出
 /// 的等待窗口里使用（首个 token 到达前），用于消除"看似卡死"的死寂感。
@@ -100,7 +101,8 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
                 prepared.agent_name
             ));
         }
-        super::super::activate_primary_agent(&mut task_app, agent);
+        let capped_agent = task_tools::capped_subagent_manifest(agent);
+        super::super::activate_primary_agent(&mut task_app, &capped_agent);
     }
 
     let task_skill_manifests = if prepared.inherit.skills {
@@ -548,19 +550,23 @@ mod tests {
 
     #[test]
     fn sync_task_formats_timeout_as_parent_visible_output() {
+        let timeout_error = format!(
+            "subagent task exceeded hard timeout of {}s",
+            SYNC_TASK_HARD_TIMEOUT.as_secs()
+        );
         let output = format_subagent_output(
-            subagent_wait_error_status("subagent task exceeded hard timeout of 600s"),
+            subagent_wait_error_status(&timeout_error),
             "verify behavior",
             "build",
             "qwen3.7-max",
-            600.0,
+            SYNC_TASK_HARD_TIMEOUT.as_secs_f64(),
             "model_reason=auto-selected",
             "",
-            Some("subagent task exceeded hard timeout of 600s"),
+            Some(&timeout_error),
         );
 
         assert!(output.contains("TIMED_OUT"));
-        assert!(output.contains("Error: subagent task exceeded hard timeout of 600s"));
+        assert!(output.contains(&format!("Error: {timeout_error}")));
         assert!(output.contains("(subagent did not produce any final assistant text)"));
         assert!(output.contains(task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER));
     }

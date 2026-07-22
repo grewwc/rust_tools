@@ -2,9 +2,9 @@ use super::{
     AsyncTaskEntry, InheritOptions, OsTaskGoal, OutstandingTaskSnapshot,
     SUBAGENT_PARENT_SUMMARY_REMINDER, SUBAGENT_WALL_CLOCK_TIMEOUT, SelectedSubagent,
     StoredTaskResult, TASK_REGISTRY, WaitManySource, append_current_process_cancel_source,
-    build_selection_explanation, encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels,
-    execute_task_cancel, execute_task_status, execute_task_wait, format_task_result,
-    insert_task_entry_for_test, is_encoded_task_goal, prepare_subagent_task,
+    build_selection_explanation, capped_subagent_manifest, encode_os_task_goal, epoll_wait_many,
+    epoll_wait_many_channels, execute_task_cancel, execute_task_status, execute_task_wait,
+    format_task_result, insert_task_entry_for_test, is_encoded_task_goal, prepare_subagent_task,
     reap_timed_out_subagents, remove_task_entry, render_outstanding_task_anchor, select_subagent,
     wait_sources_for_channel_and_futex, with_task_entry_by_pid,
 };
@@ -123,11 +123,23 @@ fn auto_select_prefers_navigator_for_codebase_investigation() {
 
 #[test]
 fn prepare_subagent_task_auto_selects_model_and_fallback() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let cfg_path = std::env::temp_dir().join(format!(
+        "rt_subagent_model_{}.configw",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&cfg_path, "").unwrap();
+    let old_cfg = std::env::var_os("CONFIGW_PATH");
+    unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
+    crate::commonw::configw::refresh();
+
     let current_model = crate::ai::model_names::all()
         .first()
         .map(|model| crate::ai::model_names::model_handle(model))
         .expect("models.json must contain at least one model");
-    let mut navigator = manifest(
+    let navigator = manifest(
         "navigator",
         "Read-only codebase navigation agent",
         AgentMode::Subagent,
@@ -144,9 +156,16 @@ fn prepare_subagent_task_auto_selects_model_and_fallback() {
         "agent": "navigator"
     });
 
-    let prepared = DRIVER_CTX
-        .sync_scope(ctx, || prepare_subagent_task(&args))
-        .unwrap();
+    let prepared = DRIVER_CTX.sync_scope(ctx, || prepare_subagent_task(&args));
+
+    match old_cfg {
+        Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+        None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+    }
+    crate::commonw::configw::refresh();
+    let _ = std::fs::remove_file(&cfg_path);
+
+    let prepared = prepared.unwrap();
 
     assert!(prepared.is_model_auto_selected);
     assert!(prepared.auto_model_fallback.is_some());
@@ -155,6 +174,38 @@ fn prepare_subagent_task_auto_selects_model_and_fallback() {
             .selection_explanation
             .contains("model_reason=auto-selected for agent_tier=")
     );
+    assert!(prepared.prompt.contains("Runtime constraints:"));
+    assert!(
+        prepared
+            .prompt
+            .contains("Do not repeat an equivalent read/search/list/command")
+    );
+    assert!(
+        prepared
+            .prompt
+            .contains("Parent task prompt:\nFind where task spawning is implemented.")
+    );
+}
+
+#[test]
+fn capped_subagent_manifest_limits_large_iteration_budget() {
+    let mut agent = manifest("build", "Main build agent", AgentMode::Subagent);
+    agent.max_steps = Some(128);
+
+    let capped = capped_subagent_manifest(&agent);
+
+    assert_eq!(capped.max_steps, Some(super::SUBAGENT_MAX_ITERATIONS));
+    assert_eq!(agent.max_steps, Some(128));
+}
+
+#[test]
+fn capped_subagent_manifest_preserves_stricter_iteration_budget() {
+    let mut agent = manifest("small", "Small subagent", AgentMode::Subagent);
+    agent.max_steps = Some(12);
+
+    let capped = capped_subagent_manifest(&agent);
+
+    assert_eq!(capped.max_steps, Some(12));
 }
 
 #[test]

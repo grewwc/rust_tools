@@ -9,8 +9,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::ai::{
-    agents::AgentManifest, mcp::SharedMcpClient, skills::SkillManifest,
-    tools::task_tools::with_task_entry_by_pid, types::App,
+    agents::AgentManifest,
+    mcp::SharedMcpClient,
+    skills::SkillManifest,
+    tools::task_tools::{capped_subagent_manifest, with_task_entry_by_pid},
+    types::App,
 };
 
 use super::agent_routing::{activate_primary_agent, ensure_runtime_manifests_loaded};
@@ -182,7 +185,8 @@ pub(super) fn dispatch_background_batch(
             }
         };
         if let Some(agent) = task_agent {
-            activate_primary_agent(&mut task_app, agent);
+            let capped_agent = capped_subagent_manifest(agent);
+            activate_primary_agent(&mut task_app, &capped_agent);
         }
         let next_model = model_override.unwrap_or_else(|| app.current_model.clone());
 

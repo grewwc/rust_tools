@@ -36,6 +36,9 @@ const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
 /// 子代理最大嵌套深度。depth=1 是顶层 agent 直接 spawn 的子代理。
 /// 子代理不允许继续 spawn 孙代理，避免递归扇出与结果无人收集。
 pub(crate) const MAX_SUBAGENT_SPAWN_DEPTH: usize = 1;
+/// Subagent 是父 agent 的叶子取证/执行单元，不应继承主 agent 的完整长循环预算。
+/// 主 agent 仍保留自身 max_steps；这里只有 `task` / `task_spawn` 启动路径会钳制。
+pub(crate) const SUBAGENT_MAX_ITERATIONS: usize = 32;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 /// 子代理结果只是主 agent 的证据输入，不是最终对用户的直接回答。
 /// 主 agent 拿到 payload 后仍需自行汇总结论、风险与下一步，再面向用户输出。
@@ -692,6 +695,32 @@ pub(crate) struct PreparedSubagentTask {
     pub(crate) inherit: InheritOptions,
 }
 
+pub(in crate::ai) fn capped_subagent_manifest(agent: &AgentManifest) -> AgentManifest {
+    let mut capped = agent.clone();
+    let max_steps = agent
+        .max_steps
+        .unwrap_or(SUBAGENT_MAX_ITERATIONS)
+        .min(SUBAGENT_MAX_ITERATIONS)
+        .max(1);
+    capped.max_steps = Some(max_steps);
+    capped
+}
+
+fn wrap_subagent_prompt(description: &str, prompt: &str) -> String {
+    format!(
+        "Subagent task: {}\n\n\
+         Runtime constraints:\n\
+         - Treat this as a bounded leaf task for the parent agent. Do not expand scope beyond the task.\n\
+         - Reuse already observed evidence before every tool call. Do not repeat an equivalent read/search/list/command with only paging, sorting, limit, or formatting changes unless exact omitted text is required.\n\
+         - Prefer one targeted broad read/search/command over many small variants.\n\
+         - If tools fail, evidence is sufficient, or the remaining gap would require broad exploration, stop and return a partial evidence ledger: confirmed facts, excluded paths, remaining gap, and next suggested step.\n\
+         - Return a concise final answer to the parent agent. Do not wait for perfect certainty.\n\n\
+         Parent task prompt:\n{}",
+        description.trim(),
+        prompt.trim()
+    )
+}
+
 /// Parse and validate a `task` / `task_spawn` tool call payload, run subagent
 /// auto-selection, and resolve the model. Used both by the async `task_spawn`
 /// path and by the synchronous `task` interception in the driver.
@@ -760,7 +789,7 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
 
     Ok(PreparedSubagentTask {
         description: description.to_string(),
-        prompt: prompt.to_string(),
+        prompt: wrap_subagent_prompt(description, prompt),
         agent_name: selected.agent.name.clone(),
         model: selected_model,
         is_model_auto_selected,
