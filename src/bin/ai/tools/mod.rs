@@ -1,6 +1,5 @@
 pub(crate) mod command_tools;
 mod common;
-mod context_tools;
 pub(crate) mod enable_tools;
 mod knowledge_tools;
 pub mod os_tools;
@@ -16,7 +15,6 @@ pub(crate) mod storage;
 pub(crate) mod task_tools;
 mod text_grep_tools;
 mod tree_tools;
-mod undo_tools;
 
 #[cfg(test)]
 pub use command_tools::validate_execute_command;
