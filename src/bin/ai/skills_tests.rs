@@ -234,6 +234,50 @@ fn load_all_skills_discovers_external_installed_skill_packages() {
 }
 
 #[test]
+fn skill_watch_roots_only_include_existing_skill_containers() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let home = std::env::temp_dir().join(format!("rust-tools-home-{}", uuid::Uuid::new_v4()));
+    let old_home = std::env::var("HOME").ok();
+    unsafe {
+        std::env::set_var("HOME", &home);
+    }
+
+    let trae_builtin = home.join(".trae-cn/builtin_skills");
+    let trae_user = home.join(".trae-cn/skills");
+    let trae_nested = home.join(".trae-cn/builtin/global/skills");
+    let trae_extension = home.join(".trae-cn/extensions/pylance/skills");
+    let unrelated = home.join(".trae-cn/workspaces/project/cache");
+    for dir in [
+        &trae_builtin,
+        &trae_user,
+        &trae_nested,
+        &trae_extension,
+        &unrelated,
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    let roots = skill_watch_roots().into_iter().collect::<BTreeSet<_>>();
+    for expected in [skills_dir(), trae_builtin, trae_user, trae_nested, trae_extension] {
+        assert!(roots.contains(&expected), "missing root {}", expected.display());
+    }
+    assert!(!roots.contains(&home.join(".trae-cn")));
+    assert!(!roots.contains(&unrelated));
+
+    match old_home {
+        Some(value) => unsafe {
+            std::env::set_var("HOME", value);
+        },
+        None => unsafe {
+            std::env::remove_var("HOME");
+        },
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn load_skills_from_dir_supports_collection_directory() {
     // feishu 式集合：collection/skills/<pkg>/SKILL.md，无根 manifest。
     let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));

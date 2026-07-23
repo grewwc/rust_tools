@@ -562,11 +562,13 @@ pub(crate) fn search_memo_candidates_scored(
     }
     let limit = limit.clamp(1, 50);
     let store = MemoryStore::from_env_or_config();
-    // 只加载 memo 类别条目即可：memo 是用户手工记录的类别，量很小。
-    // category 写入恒为小写 "memo"。
+    // `a -n` 保存的用户笔记固定为 memo；-ns / -nd / -ne 都只处理这类条目。
     let results = store.entries_by_category("memo", 100_000, true)?;
     let viewer = ViewerContext::current();
     let qlc = query.to_lowercase();
+    let query_tokens = crate::ai::knowledge::indexing::similarity::expand_tokens(
+        &crate::ai::knowledge::indexing::similarity::tokenize(&qlc),
+    );
 
     let visible: Vec<AgentMemoryEntry> =
         results.into_iter().filter(|e| viewer.can_see(e)).collect();
@@ -580,6 +582,29 @@ pub(crate) fn search_memo_candidates_scored(
         }
         if e.tags.iter().any(|t| t.to_lowercase().contains(&qlc)) {
             score += 1.2;
+        }
+
+        // 未配置 embedding 时不能只依赖整个 query 的连续子串：用户往往会在
+        // 检索词中加入项目名或描述性词，而旧笔记只覆盖其中一部分。按 token 覆盖率
+        // 加分，仍让完整短语命中保持最高优先级。
+        if !query_tokens.is_empty() {
+            let mut searchable = e.note.to_lowercase();
+            if !e.tags.is_empty() {
+                searchable.push(' ');
+                searchable.push_str(&e.tags.join(" ").to_lowercase());
+            }
+            if let Some(source) = &e.source {
+                searchable.push(' ');
+                searchable.push_str(&source.to_lowercase());
+            }
+            let entry_tokens = crate::ai::knowledge::indexing::similarity::expand_tokens(
+                &crate::ai::knowledge::indexing::similarity::tokenize(&searchable),
+            );
+            let overlap = query_tokens
+                .iter()
+                .filter(|token| entry_tokens.contains(*token))
+                .count();
+            score += 2.5 * overlap as f64 / query_tokens.len() as f64;
         }
         score
     };
@@ -1349,10 +1374,11 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
 mod tests {
     use super::{
         execute_memory_delete, execute_memory_list_json, execute_memory_save,
-        execute_memory_update, is_memory_visible_to, update_memo_entry,
+        execute_memory_update, is_memory_visible_to, search_memo_candidates_scored,
+        update_memo_entry,
     };
     use crate::ai::test_support::ENV_LOCK;
-    use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
+    use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
     use chrono::Local;
     use std::path::Path;
     use std::sync::MutexGuard;
@@ -1511,6 +1537,84 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn memo_search_finds_archived_memo_and_excludes_non_memo_entries() {
+        let _guard = env_lock_guard();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_notebook_search_{ts}.jsonl"));
+        let archive = path.with_extension("jsonl.20260101000000");
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let non_memo_decoy = AgentMemoryEntry {
+            id: Some("non-memo-decoy".to_string()),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            category: "project_memory".to_string(),
+            note: "AeolusLLM Copilot 二次分析问题排查：项目自动写回记录。".to_string(),
+            tags: vec!["aeolusllm".to_string(), "copilot".to_string()],
+            source: Some("auto_project_writeback:aeolus".to_string()),
+            priority: Some(180),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+        let archived_memo = AgentMemoryEntry {
+            id: Some("archived-memo".to_string()),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            category: "memo".to_string(),
+            note: "AeolusLLM Copilot 二次分析：通过 trace_id 在数据库检索原始问题。"
+                .to_string(),
+            tags: vec!["aeolusllm".to_string(), "copilot".to_string()],
+            source: Some("cli_note".to_string()),
+            priority: Some(150),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+        let decoy_line = serde_json::to_string(&non_memo_decoy).unwrap();
+        let archived_line = serde_json::to_string(&archived_memo).unwrap();
+        std::fs::write(&archive, format!("{decoy_line}\n{archived_line}\n")).unwrap();
+
+        let store = MemoryStore::from_env_or_config();
+        store
+            .append(&AgentMemoryEntry {
+                id: Some("current-memo".to_string()),
+                timestamp: "2026-01-02T00:00:00Z".to_string(),
+                category: "memo".to_string(),
+                note: "无关的手工笔记".to_string(),
+                tags: vec![],
+                source: Some("cli_note".to_string()),
+                priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
+                image_path: None,
+            })
+            .unwrap();
+
+        let memo_only =
+            search_memo_candidates_scored("aeolusllm copilot 二次分析问题排查", 10).unwrap();
+        assert_eq!(
+            memo_only[0].entry.id.as_deref(),
+            Some("archived-memo")
+        );
+        assert!(memo_only
+            .iter()
+            .all(|candidate| candidate.entry.category == "memo"));
+        assert!(memo_only
+            .iter()
+            .all(|candidate| candidate.entry.id.as_deref() != Some("non-memo-decoy")));
+
+        cleanup_memory_artifacts(&path);
+        let _ = std::fs::remove_file(&archive);
         unsafe {
             std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
         }

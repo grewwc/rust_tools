@@ -36,6 +36,16 @@ impl McpServerConnection {
         &mut self.stdin
     }
 
+    /// 终止并回收 MCP 子进程。`Child` 自身的 Drop 不会执行这两步。
+    pub(in crate::ai) fn shutdown_and_reap(&mut self) {
+        match self.process.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) | Err(_) => {}
+        }
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+
     pub(super) fn read_response_line(&mut self) -> Result<String, String> {
         self.read_response_line_with_timeout(self.request_timeout_ms)
     }
@@ -81,6 +91,12 @@ impl McpServerConnection {
     }
 }
 
+impl Drop for McpServerConnection {
+    fn drop(&mut self) {
+        self.shutdown_and_reap();
+    }
+}
+
 fn drain_stderr_into_tail(mut stderr: ChildStderr, sink: Arc<Mutex<String>>) {
     let mut buf = [0u8; 1024];
     loop {
@@ -110,4 +126,51 @@ fn append_stderr_tail(sink: &Arc<Mutex<String>>, chunk: &[u8]) {
         .map(|(idx, _)| idx)
         .unwrap_or(0);
     tail.drain(..keep_start);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_tools::cw::SkipMap;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn dropping_mcp_connection_kills_and_reaps_child() {
+        let mut process = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = process.id() as libc::pid_t;
+        let stdin = process.stdin.take().unwrap();
+        let stdout = process.stdout.take().unwrap();
+        let stderr = process.stderr.take().unwrap();
+        let connection = McpServerConnection {
+            config: crate::ai::types::McpServerConfig {
+                command: "/bin/sleep".to_string(),
+                args: vec!["30".to_string()],
+                env: SkipMap::default(),
+                request_timeout_ms: 100,
+                disabled: false,
+            },
+            process,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr_tail: spawn_stderr_drain(stderr),
+            request_timeout_ms: 100,
+            tools: Vec::new(),
+            resources: Vec::new(),
+            prompts: Vec::new(),
+        };
+
+        drop(connection);
+
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
 }

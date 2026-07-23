@@ -275,7 +275,7 @@ impl McpClient {
     fn restart_connection(&self, conn: &mut McpServerConnection) -> Result<(), String> {
         let cfg = conn.config.clone();
 
-        let _ = conn.process.kill();
+        conn.shutdown_and_reap();
 
         let mut cmd = Command::new(&cfg.command);
         cmd.args(&cfg.args)
@@ -687,9 +687,7 @@ impl McpClient {
 
     pub(in crate::ai) fn disconnect_all(&mut self) {
         for (_, conn) in self.servers.drain() {
-            let conn = conn.into_inner().unwrap_or_else(|e| e.into_inner());
-            let mut process = conn.process;
-            let _ = process.kill();
+            drop(conn);
         }
         self.cached_tool_definitions.clear();
         self.cached_resources.clear();

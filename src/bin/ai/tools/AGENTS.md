@@ -44,8 +44,10 @@ Module responsibilities: schema/metadata in `registry/`, execution in
    (`anchor:`/`old:`/`new:`) does anchored inline substring replacement outside
    the unified-diff path. When one file needs multiple localized edits, guide
    models toward one `apply_patch` call with multiple `@@` hunks in a single
-   `*** Update File:` section; use one envelope with one section per target for
-   multi-file edits. `read_file` paginates by line and by character cap,
+   `*** Update File:` section. Repeated sections for the same target are valid
+   when edits are clearer or sequentially dependent; they apply in order to an
+   in-memory result and commit once. Use one envelope for multi-file edits.
+   `read_file` paginates by line and by character cap,
    computing continuation offsets from rendered lines. Text search lives in the
    dedicated grep/search tools.
 10. **Subagent tools.** The `task` orchestration family

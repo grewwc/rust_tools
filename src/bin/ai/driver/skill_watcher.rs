@@ -196,4 +196,36 @@ mod tests {
             &skills_dir.join(".cache"),
         ));
     }
+
+    #[test]
+    fn ignores_trae_events_outside_skill_watch_roots() {
+        let roots = vec![
+            PathBuf::from("/tmp/.trae-cn/skills"),
+            PathBuf::from("/tmp/.trae-cn/extensions/pylance/skills"),
+        ];
+        let event = Event::new(EventKind::Any)
+            .add_path(PathBuf::from("/tmp/.trae-cn/workspaces/project/index"));
+
+        assert!(!is_relevant_skill_event(
+            &event,
+            &roots,
+            &PathBuf::from("/tmp/user-skills/.cache"),
+        ));
+    }
+
+    #[test]
+    fn accepts_external_skill_manifest_event() {
+        let roots = vec![PathBuf::from(
+            "/tmp/.trae-cn/extensions/pylance/skills",
+        )];
+        let event = Event::new(EventKind::Any).add_path(
+            PathBuf::from("/tmp/.trae-cn/extensions/pylance/skills/refactor/SKILL.md"),
+        );
+
+        assert!(is_relevant_skill_event(
+            &event,
+            &roots,
+            &PathBuf::from("/tmp/user-skills/.cache"),
+        ));
+    }
 }

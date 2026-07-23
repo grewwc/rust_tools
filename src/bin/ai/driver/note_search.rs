@@ -429,7 +429,7 @@ async fn answer_memo_search(
         question.clone()
     };
 
-    // 检索相关 memo 条目作为上下文。
+    // `a -n` 保存的用户笔记固定为 memo；notebook 检索不混入其他内部知识类别。
     let candidates = match crate::ai::tools::service::memory::search_memo_candidates_scored(
         &retrieval_query,
         20,

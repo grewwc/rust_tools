@@ -177,16 +177,13 @@ pub(super) fn skills_dir() -> PathBuf {
     PathBuf::from(expanduser(&path).as_ref())
 }
 
-/// 返回需要监听的根目录。用户技能目录始终监听；Trae 外部技能都位于同一根目录下，
-/// 监听该根目录可以发现运行期间新增的外部包。
+/// 返回需要监听的根目录。用户技能目录始终监听；外部技能只监听实际的技能容器，
+/// 避免递归监听整个 Trae 数据目录产生大量无关事件。
 pub(super) fn skill_watch_roots() -> Vec<PathBuf> {
-    let user_skills_dir = skills_dir();
-    let external_root = PathBuf::from(expanduser("~/.trae-cn").as_ref());
-    if external_root.is_dir() && external_root != user_skills_dir {
-        vec![user_skills_dir, external_root]
-    } else {
-        vec![user_skills_dir]
-    }
+    let mut roots = BTreeSet::new();
+    roots.insert(skills_dir());
+    roots.extend(discover_external_skill_roots());
+    roots.into_iter().collect()
 }
 
 fn looks_like_front_matter_skill(content: &str) -> bool {
@@ -381,9 +378,28 @@ fn load_external_skills() -> Vec<SkillManifest> {
 }
 
 fn discover_external_skill_dirs() -> Vec<PathBuf> {
+    discover_matching_dirs(external_skill_glob_patterns().iter().copied())
+}
+
+fn discover_external_skill_roots() -> Vec<PathBuf> {
+    discover_matching_dirs(
+        external_skill_glob_patterns()
+            .iter()
+            .filter_map(|pattern| pattern.strip_suffix("/*")),
+    )
+}
+
+fn discover_matching_dirs<'a>(patterns: impl IntoIterator<Item = &'a str>) -> Vec<PathBuf> {
     let mut dirs = BTreeSet::new();
-    for pattern in external_skill_glob_patterns() {
+    for pattern in patterns {
         let expanded = expanduser(pattern);
+        if !expanded.chars().any(|ch| matches!(ch, '*' | '?' | '[')) {
+            let path = PathBuf::from(expanded.as_ref());
+            if path.is_dir() {
+                dirs.insert(path);
+            }
+            continue;
+        }
         let Ok(paths) = rust_tools::terminalw::glob_paths(&expanded, ".") else {
             continue;
         };
