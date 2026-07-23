@@ -26,6 +26,50 @@ use std::fs;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[test]
+fn execution_signature_canonicalizes_arguments_and_tracks_environment() {
+    let first = ToolCall {
+        id: "first".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "read_file".to_string(),
+            arguments: r#"{"b":2,"a":{"y":1,"x":0}}"#.to_string(),
+        },
+    };
+    let second = ToolCall {
+        id: "second".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "read_file".to_string(),
+            arguments: r#"{"a":{"x":0,"y":1},"b":2}"#.to_string(),
+        },
+    };
+
+    let first = super::tool_execution_outcome("session", "/repo", &ToolRoute::Builtin, &first, false);
+    let second = super::tool_execution_outcome("session", "/repo", &ToolRoute::Builtin, &second, true);
+    assert_eq!(first.execution_signature, second.execution_signature);
+
+    let different_cwd = super::tool_execution_outcome(
+        "session",
+        "/other",
+        &ToolRoute::Builtin,
+        &ToolCall { id: "third".to_string(), ..first_tool_call() },
+        true,
+    );
+    assert_ne!(first.execution_signature, different_cwd.execution_signature);
+}
+
+fn first_tool_call() -> ToolCall {
+    ToolCall {
+        id: "template".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "read_file".to_string(),
+            arguments: r#"{"b":2,"a":{"y":1,"x":0}}"#.to_string(),
+        },
+    }
+}
+
 static ASYNC_TOOL_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 struct AsyncToolTestGuard {

@@ -28,8 +28,8 @@ use super::error::{
     should_retry_status, should_rotate_key, sleep_with_cancel,
 };
 use super::normalize::{
-    agent_tools_for_request, normalize_messages_for_model, request_tool_names_for_model,
-    strip_unavailable_tool_hints_from_messages,
+    agent_tools_for_request, fold_resolved_tool_failures, normalize_messages_for_model,
+    request_tool_names_for_model, strip_unavailable_tool_hints_from_messages,
 };
 use super::reasoning::{
     apply_prompt_cache_breakpoint, ensure_reasoning_content_echo_for_thinking_model,
@@ -288,6 +288,11 @@ async fn do_request_messages_with_tool_mode(
     clear_stale_request_interrupt_before_request(app);
 
     let mut normalized_messages = normalize_messages_for_model(model, messages);
+    if let Ok(outcomes) =
+        crate::ai::history::read_tool_execution_outcomes_sqlite(&app.session_history_file)
+    {
+        fold_resolved_tool_failures(&mut normalized_messages, &outcomes);
+    }
     let request_tool_names = tools_enabled
         .then(|| request_tool_names_for_model(app, model))
         .unwrap_or_default();

@@ -19,6 +19,7 @@ use crate::ai::{
         format_tool_status_running, format_tool_status_skipped,
         format_tool_status_with_file_target,
     },
+    history::ToolExecutionOutcome,
     mcp::{McpClient, SharedMcpClient},
     tools as builtin_tools,
     tools::os_tools::GLOBAL_OS,
@@ -67,6 +68,8 @@ pub(super) struct ExecuteToolCallsResult {
     pub(super) executed_tool_calls: Vec<ToolCall>,
     pub(super) tool_results: Vec<ToolResult>,
     pub(super) cached_hits: Vec<bool>,
+    /// 每个真实执行调用的结构化状态与环境签名；与展示正文解耦并单独持久化。
+    pub(super) execution_outcomes: Vec<Option<ToolExecutionOutcome>>,
     /// 本轮是否有任何工具执行失败（`RunOneResult.ok == false`）。
     /// 结构化信号，供下游 reflection/evolution 判定 turn 质量时使用，
     /// 替代旧版扫描 assistant 答案文本找 "error"/"failed" 的脆弱做法。
@@ -1323,7 +1326,11 @@ fn execute_tool_calls_inner(
     let mut executed_tool_calls = Vec::with_capacity(tool_calls.len());
     let mut tool_results = Vec::with_capacity(tool_calls.len());
     let mut cached_hits = Vec::with_capacity(tool_calls.len());
+    let mut execution_outcomes = Vec::with_capacity(tool_calls.len());
     let mut had_error = false;
+    let execution_cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
     let mut idx = 0usize;
     while idx < tool_calls.len() {
@@ -1362,9 +1369,16 @@ fn execute_tool_calls_inner(
                 allowed_tool_names,
                 &mut observer,
             );
-            for (tool_call, (_route, run_result)) in batch.iter().zip(batch_results.into_iter()) {
+            for (tool_call, (route, run_result)) in batch.iter().zip(batch_results.into_iter()) {
                 executed_tool_calls.push(tool_call.clone());
                 cached_hits.push(run_result.cached);
+                execution_outcomes.push(Some(tool_execution_outcome(
+                    session_id,
+                    &execution_cwd,
+                    &route,
+                    tool_call,
+                    run_result.ok,
+                )));
                 notify_tool_finished(&mut observer, tool_call, &run_result);
                 print_run_status(tool_call, &run_result);
                 crate::ai::driver::hooks::run_lifecycle_hook(
@@ -1403,6 +1417,13 @@ fn execute_tool_calls_inner(
 
         executed_tool_calls.push(tool_call.clone());
         cached_hits.push(run_result.cached);
+        execution_outcomes.push(Some(tool_execution_outcome(
+            session_id,
+            &execution_cwd,
+            &route,
+            tool_call,
+            run_result.ok,
+        )));
         notify_tool_finished(&mut observer, tool_call, &run_result);
         print_run_status(tool_call, &run_result);
         crate::ai::driver::hooks::run_lifecycle_hook(
@@ -1437,8 +1458,67 @@ fn execute_tool_calls_inner(
         executed_tool_calls,
         tool_results,
         cached_hits,
+        execution_outcomes,
         had_error,
     })
+}
+
+fn tool_execution_outcome(
+    session_id: &str,
+    cwd: &str,
+    route: &ToolRoute,
+    tool_call: &ToolCall,
+    succeeded: bool,
+) -> ToolExecutionOutcome {
+    fn canonicalize_json(value: Value) -> Value {
+        match value {
+            Value::Array(values) => {
+                Value::Array(values.into_iter().map(canonicalize_json).collect())
+            }
+            Value::Object(values) => {
+                let mut entries = values.into_iter().collect::<Vec<_>>();
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, canonicalize_json(value)))
+                        .collect(),
+                )
+            }
+            scalar => scalar,
+        }
+    }
+
+    let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
+        .map(canonicalize_json)
+        .map(|value| json!({ "json": value }))
+        .unwrap_or_else(|_| json!({ "raw": tool_call.function.arguments }));
+    let route = match route {
+        ToolRoute::Builtin => json!({ "kind": "builtin" }),
+        ToolRoute::Mcp {
+            server_name,
+            tool_name,
+        } => json!({
+            "kind": "mcp",
+            "server": server_name,
+            "tool": tool_name,
+        }),
+    };
+    let execution_signature = json!({
+        "version": 1,
+        "session": session_id,
+        "cwd": cwd,
+        "route": route,
+        "tool": tool_call.function.name,
+        "arguments": arguments,
+    })
+    .to_string();
+
+    ToolExecutionOutcome {
+        tool_call_id: tool_call.id.clone(),
+        execution_signature,
+        succeeded,
+    }
 }
 
 /// 上限：单批并行只读工具的并发度，避免模型一次发起几十个调用时打满线程。

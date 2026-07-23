@@ -1436,6 +1436,7 @@ mod tests {
                 })
                 .collect(),
             cached_hits: vec![false; calls.len()],
+            execution_outcomes: Vec::new(),
             had_error: false,
         }
     }

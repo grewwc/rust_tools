@@ -820,6 +820,29 @@ fn describe_ambiguous_hunk(positions: &[usize]) -> String {
     )
 }
 
+const DECLARED_LINE_DISAMBIGUATION_MAX_DRIFT: usize = 12;
+
+fn disambiguate_by_declared_line(positions: &[usize], hunk: &UnifiedHunk) -> Option<usize> {
+    if hunk.old_start == 0 || positions.len() < 2 {
+        return None;
+    }
+    let nominal = hunk.old_start.saturating_sub(1);
+    let mut scored: Vec<(usize, usize)> = positions
+        .iter()
+        .map(|&pos| (pos.abs_diff(nominal), pos))
+        .collect();
+    scored.sort_unstable();
+    let (best_dist, best_pos) = scored[0];
+    let (second_dist, _) = scored[1];
+    if best_dist <= DECLARED_LINE_DISAMBIGUATION_MAX_DRIFT
+        && best_dist.saturating_mul(2) < second_dist
+    {
+        Some(best_pos)
+    } else {
+        None
+    }
+}
+
 fn hunk_old_line_count(hunk: &UnifiedHunk) -> usize {
     hunk.lines
         .iter()
@@ -1175,7 +1198,9 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
     let expected = hunk_expected_lines(hunk);
     let nominal = hunk.old_start.saturating_sub(1);
 
-    let mut msg = String::from("context mismatch: patch hunk could not be located.\n");
+    let mut msg = String::from(
+        "context mismatch: required recovery: read_file the same target before retrying apply_patch. patch hunk could not be located.\n",
+    );
     msg.push_str(&format!(
         "Hunk header declared @@ -{} (1-based line {}).\n",
         hunk.old_start, hunk.old_start
@@ -1333,6 +1358,9 @@ fn locate_hunk(
     let positions = all_hunk_match_positions(orig_lines, hunk, mode);
     let forward: Vec<usize> = positions.iter().copied().filter(|&p| p >= cursor).collect();
     if forward.len() > 1 {
+        if let Some(pos) = disambiguate_by_declared_line(&forward, hunk) {
+            return Ok(Some(pos));
+        }
         return Err(describe_ambiguous_hunk(&forward));
     }
     // forward 已经过滤了 p >= cursor，所以这里不会有 "hunks out of order"。
@@ -2089,6 +2117,25 @@ mod tests {
         // 同样的行在文件里出现多次，且标称位置匹配不上，应报歧义错误。
         let original = "dup\nmid\ndup\ntail\n";
         let patch = "@@ -9,1 +9,1 @@\n-dup\n+changed\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("ambiguous patch"), "err was: {err}");
+    }
+
+    #[test]
+    fn apply_unified_patch_disambiguates_ambiguous_match_by_nearby_declared_line() {
+        let original = "dup\nhead\nfiller1\nfiller2\nfiller3\ndup\ntail\n";
+        // `dup` 出现两次，但 hunk 头标称第 5 行，明显靠近第二个候选（第 6 行）。
+        let patch = "@@ -5,1 +5,1 @@\n-dup\n+changed\n";
+        let result = apply_unified_patch(original, patch)
+            .expect("nearby declared line should disambiguate repeated context");
+        assert_eq!(result, "dup\nhead\nfiller1\nfiller2\nfiller3\nchanged\ntail\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_rejects_declared_line_when_not_clear_nearest() {
+        let original = "dup\nleft\nmid\ndup\nright\n";
+        // 标称第 3 行夹在两个 `dup` 中间，候选距离相同，不能猜。
+        let patch = "@@ -3,1 +3,1 @@\n-dup\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("ambiguous patch"), "err was: {err}");
     }
@@ -2915,13 +2962,12 @@ mod tests {
     fn apply_unified_patch_bare_at_header_requires_unique_match() {
         // 裸 @@ header 没有标称行号，不能把 old_start=0 当成第 1 行的强锚点。
         // 如果上下文在文件中出现多次，应要求模型补充更多上下文，避免静默改错首个位置。
-        // locate_hunk 会返回 None 让级联继续，最终由 locate_hunk_with_fuzzy_context
-        // 报告歧义（因为没有标称位置可用来消歧）。
+        // exact 定位阶段已经足够确认歧义；不应继续猜测或静默选第一个位置。
         let original = "alpha\nbeta\ngamma\nalpha\nbeta\ngamma\n";
         let patch = "@@\n alpha\n-beta\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("ambiguous patch"), "err was: {err}");
-        assert!(err.contains("context-fuzz"), "err was: {err}");
+        assert!(err.contains("1, 4"), "err was: {err}");
     }
 
     #[test]

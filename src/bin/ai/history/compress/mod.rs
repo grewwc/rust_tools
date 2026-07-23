@@ -1739,11 +1739,24 @@ fn dedup_repeated_tool_results(
 
     // 收集 (tool_name, args_signature) → 出现次数与索引
     // 通过 assistant.tool_calls 关联 tool_call_id → (name, args)
+    let mut id_occurrences: FxHashMap<String, usize> = FxHashMap::default();
+    for message in messages.iter() {
+        for tool_call in message.tool_calls.iter().flatten() {
+            *id_occurrences.entry(tool_call.id.clone()).or_default() += 1;
+        }
+    }
+    let ambiguous_ids = id_occurrences
+        .into_iter()
+        .filter_map(|(id, count)| (count > 1).then_some(id))
+        .collect::<rustc_hash::FxHashSet<_>>();
     let mut id_to_signature: FxHashMap<String, (String, String)> = FxHashMap::default();
     let mut id_to_args_raw: FxHashMap<String, String> = FxHashMap::default();
     for message in messages.iter() {
         if let Some(tool_calls) = &message.tool_calls {
             for tc in tool_calls {
+                if ambiguous_ids.contains(&tc.id) {
+                    continue;
+                }
                 let args_norm = serde_json::from_str::<Value>(&tc.function.arguments)
                     .map(|v| v.to_string())
                     .unwrap_or_else(|_| tc.function.arguments.clone());
@@ -1766,9 +1779,9 @@ fn dedup_repeated_tool_results(
         protected_tool_call_ids,
     );
 
-    // (name, args) → 该签名下"首个保留全文"的 tool 调用，用于在折叠时回指。
+    // (name, args) → 该签名下"最新保留全文"的 tool 调用，用于在折叠时回指。
     let mut seen: FxHashMap<(String, String), DedupToolOccurrence> = FxHashMap::default();
-    // (tool_name, content_hash) → 首个出现该内容版本的 tool 调用。
+    // (tool_name, content_hash) → 最新出现该内容版本的 tool 调用。
     // 内容级去重是断开"重复整篇重读"失忆环的关键：对 read_file 等
     // non-compressible 工具，同一 (文件) 被反复读取时往往返回**逐字节
     // 相同**的全文（实测占全部 tool 字节的 ~52%）。这些冗余副本可无损折叠，
@@ -1781,7 +1794,17 @@ fn dedup_repeated_tool_results(
     // 改用 `(tool_name, content_hash)`：只要返回体本身一致就折叠——args 不同
     // 由调用签名去重的 `seen` 计数器单独管，不影响内容级折叠。
     let mut seen_content: FxHashMap<(String, u64), DedupToolOccurrence> = FxHashMap::default();
-    for &idx in &tool_indices {
+    // 从新到旧扫描，确保最新一次调用保留全文，较早的重复结果才被折叠。
+    // 这对失败后重试尤其关键：成功重试不能被旧失败占据 canonical 位置后压成 stub。
+    for &idx in tool_indices.iter().rev() {
+        if messages[idx]
+            .tool_call_id
+            .as_ref()
+            .is_some_and(|id| ambiguous_ids.contains(id))
+        {
+            // 旧历史里复用的 ID 无法可靠关联到具体 assistant occurrence；保留原文。
+            continue;
+        }
         let occurrence =
             dedup_tool_occurrence(messages, idx, &id_to_signature, &id_to_args_raw);
         let occurrence = match occurrence {
@@ -1818,9 +1841,9 @@ fn dedup_repeated_tool_results(
         // **不再豁免最近保护窗内的重复**。历史上这里 `if protected_indices.contains(&idx) continue;`
         // 让最近 N 个工具组完全跳过去重，于是 agent 不断重发同一查询、最新副本一直
         // 落到"最近窗"里 → 永不被折叠，尾部堆积 15KB × 29 份的逐字节相同结果。
-        // 现在让 dedup 一视同仁跑遍所有 tool 消息：首见登记为 canonical 全文，
-        // 其余副本（无论是否在保护窗内）一律折叠为回指 stub。模型仍能看到
-        // 第一个全文版本（在对话里、保护窗逻辑之外），后续重复是无损冗余。
+        // 现在让 dedup 一视同仁跑遍所有 tool 消息：逆序首见（即最新一次）登记为
+        // canonical 全文，其余较早副本一律折叠为回指 stub。模型仍能看到最新全文，
+        // 同时避免旧失败覆盖后续成功重试的有效结果。
         // orphan 的保护逻辑（上面的 `!protected_indices.contains`）已经单独处理，
         // 不受这里影响。
         if tool_uses_content_identity_dedup(&occurrence.tool_name) {
@@ -1828,7 +1851,7 @@ fn dedup_repeated_tool_results(
             // precision 结果不做 lossy 裁剪）。但**逐字节相同**的重复副本是纯冗余，
             // 折叠它们不丢失任何信息，且能直接消除"旧全文堆积 + 近端 offload 触发
             // 重读"的失忆环。用内容 hash 区分二者：hash 首见 → 保留全文并登记；
-            // hash 重现 → 折叠为回指首个全文的 stub（保留 tool_call_id 以维持协议）。
+            // hash 重现 → 折叠为回指最新全文的 stub（保留 tool_call_id 以维持协议）。
             let text = value_to_string(&messages[idx].content);
             let mut hasher = FxHasher::default();
             text.hash(&mut hasher);
@@ -1849,7 +1872,7 @@ fn dedup_repeated_tool_results(
             }
             continue;
         }
-        // 保留首次出现，把后续重复的旧 tool 结果折叠为 stub
+        // 逆序首见即最新调用；把更早的同签名结果折叠为 stub。
         if let Some(canonical) = signature_canonical {
             let text = value_to_string(&messages[idx].content);
             let stub = render_dedup_tool_stub(
@@ -1913,16 +1936,16 @@ fn render_dedup_tool_stub(
 ) -> String {
     let mut out = match kind {
         DedupToolStubKind::ByteIdentical => format!(
-            "[deduped: byte-identical `{}` result already present verbatim earlier in this conversation; content unchanged since then. No need to re-read - reuse the canonical full result.]\n",
+            "[deduped: byte-identical `{}` result is preserved verbatim at a newer occurrence; content unchanged. No need to re-read - reuse the canonical full result.]\n",
             original.tool_name
         ),
         DedupToolStubKind::IdenticalCall => format!(
-            "[deduped: identical `{}` call earlier in this conversation; full result preserved at first occurrence.]\n",
+            "[deduped: identical `{}` call repeated later in this conversation; full result preserved at the newest occurrence.]\n",
             original.tool_name
         ),
     };
     out.push_str(&format!(
-        "- original_tool_call_id: {}\n- canonical_tool_call_id: {}\n- first_occurrence_message_index: {}\n",
+        "- original_tool_call_id: {}\n- canonical_tool_call_id: {}\n- canonical_message_index: {}\n",
         original.tool_call_id, canonical.tool_call_id, canonical.message_idx
     ));
     out.push_str(&format!(

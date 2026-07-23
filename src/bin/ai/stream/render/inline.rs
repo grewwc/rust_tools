@@ -91,7 +91,54 @@ fn is_ambiguous_emoji_block_char(ch: char) -> bool {
     )
 }
 
+/// 把紧贴文件名/链接的中文标点（`：` `，` `。`）转成英文版（`:` `,` `.`）。
+///
+/// Agent 常把中文标点和文件名/行号或链接连在一起输出，如 `src/foo.rs：42`、
+/// `https://x.com，详见`。全角标点会让终端无法识别 file:line / URL 边界，导致
+/// 无法点击跳转。仅当标点的「前一个字符」是路径/链接常见字符（字母数字、
+/// `/ _ . - ~ + @ : # ? = & %` 及反引号）时才转换，避免误伤纯中文语境
+/// （如 `时间：12点`，前一个字符是中文，不转换）。
+fn normalize_cjk_punct_around_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev: Option<char> = None;
+    let mut i = 0;
+    while i < s.len() {
+        // code / math span 是 Markdown 字面量，不能为了终端跳转而改写其内容。
+        if let Some((span, next)) = take_atomic_markdown_span(s, i)
+            && (span.starts_with('`') || span.starts_with('$'))
+        {
+            out.push_str(&span);
+            prev = span.chars().last();
+            i = next;
+            continue;
+        }
+
+        let ch = s[i..].chars().next().expect("character boundary");
+        let replaced = match ch {
+            '：' if prev.is_some_and(is_path_neighbor) => ':',
+            '，' if prev.is_some_and(is_path_neighbor) => ',',
+            '。' if prev.is_some_and(is_path_neighbor) => '.',
+            _ => ch,
+        };
+        out.push(replaced);
+        // 用原始字符判断前文，避免连续全角标点连锁转换（如 `：：` 只转第一个）。
+        prev = Some(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn is_path_neighbor(ch: char) -> bool {
+    matches!(
+        ch,
+        'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '_' | '.' | '-' | '~' | '+' | '@'
+            | ':' | '#' | '?' | '=' | '&' | '%' | '`'
+    )
+}
+
 pub(super) fn render_inline_md(s: &str, base: &str) -> String {
+    let normalized = normalize_cjk_punct_around_path(s);
+    let s = normalized.as_str();
     let bytes = s.as_bytes();
     let mut out = String::new();
     let mut i = 0usize;
@@ -814,5 +861,12 @@ mod tests {
         let rendered = render_inline_md("price: $5 USD", "");
         assert!(!rendered.contains("\x1b[95m"));
         assert!(rendered.contains("$5 USD"));
+    }
+
+    #[test]
+    fn code_and_math_spans_keep_cjk_punctuation_literal() {
+        let rendered = render_inline_md("`src/main.rs：42` 和 $https://x.com，a$", "");
+        assert!(rendered.contains("src/main.rs：42"));
+        assert!(rendered.contains("https://x.com，a"));
     }
 }

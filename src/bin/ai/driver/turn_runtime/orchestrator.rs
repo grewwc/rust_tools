@@ -760,6 +760,10 @@ fn detect_target_repeat_loop(history: &[Vec<String>], window: usize) -> bool {
     !intersection.is_empty()
 }
 
+fn is_direct_file_mutation_tool(name: &str) -> bool {
+    matches!(name, "apply_patch" | "write_file" | "delete_path")
+}
+
 /// 判断最近一轮 assistant 是否调用了变更类工具（apply_patch/write_file/delete_path）。
 ///
 /// `execute_command` 是双关工具：`git status`/`git log`/`ls` 等只读取证命令不改变
@@ -968,6 +972,17 @@ fn blocked_outside_workspace_path(text: &str) -> Option<String> {
 /// 新的无效参数来逃避收敛；但沙箱外路径拒绝会归一成稳定目标，专门用于识别
 /// 反复读取同一个禁止路径的循环。
 fn extract_round_targets(messages: &[crate::ai::history::Message]) -> Vec<String> {
+    extract_round_targets_inner(messages, true)
+}
+
+fn extract_round_probe_targets(messages: &[crate::ai::history::Message]) -> Vec<String> {
+    extract_round_targets_inner(messages, false)
+}
+
+fn extract_round_targets_inner(
+    messages: &[crate::ai::history::Message],
+    include_direct_file_mutations: bool,
+) -> Vec<String> {
     use serde_json::Value;
     let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
         return Vec::new();
@@ -987,6 +1002,9 @@ fn extract_round_targets(messages: &[crate::ai::history::Message]) -> Vec<String
 
     let mut targets = Vec::new();
     for tc in tool_calls.iter() {
+        if !include_direct_file_mutations && is_direct_file_mutation_tool(&tc.function.name) {
+            continue;
+        }
         match results_by_call_id.get(tc.id.as_str()) {
             Some(ToolResultProgressStatus::Success) | None => {}
             Some(ToolResultProgressStatus::BlockedOutsideWorkspace(path))
@@ -1295,7 +1313,7 @@ impl TurnSupervisor {
         // 目标级历史：与 coarse 签名平行维护，供混合工具轮的目标交集检测使用。
         // 与 exact/coarse 一样受 TOOL_SIGNATURE_HISTORY_LIMIT 约束。
         self.tool_target_history
-            .push(extract_round_targets(signature_messages));
+            .push(extract_round_probe_targets(signature_messages));
         if self.tool_target_history.len() > TOOL_SIGNATURE_HISTORY_LIMIT {
             let drop = self.tool_target_history.len() - TOOL_SIGNATURE_HISTORY_LIMIT;
             self.tool_target_history.drain(0..drop);
@@ -1399,6 +1417,7 @@ impl TurnSupervisor {
             if self.hard_loop_stop_injected
                 || self.loop_breaker_injected
                 || self.coarse_loop_note_injected
+                || self.target_repeat_note_injected
             {
                 self.reset_tool_loop_escalation();
             }
@@ -2404,6 +2423,35 @@ mod tests {
         }
     }
 
+    fn pb_write_file_msg_with_content(
+        path: &str,
+        id: &str,
+        content: &str,
+    ) -> crate::ai::history::Message {
+        crate::ai::history::Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({
+                        "file_path": path,
+                        "content": content,
+                    })
+                    .to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn pb_write_file_msg(path: &str, id: &str) -> crate::ai::history::Message {
+        pb_write_file_msg_with_content(path, id, &format!("updated {id}\n"))
+    }
+
     fn pb_execute_command_msg(command: &str, id: &str) -> crate::ai::history::Message {
         crate::ai::history::Message {
             role: "assistant".to_string(),
@@ -2788,6 +2836,63 @@ mod tests {
             "distinct targets each round must not trigger TargetRepeat: {signals:?}"
         );
         assert!(!supervisor.target_repeat_note_injected);
+    }
+
+    #[test]
+    fn target_repeat_does_not_fire_on_write_file_progress() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let target = "main-test/zi_ping.txt";
+
+        for i in 0..TOOL_LOOP_COARSE_WINDOW {
+            let id = format!("write-{i}");
+            messages.push(pb_write_file_msg(target, &id));
+            messages.push(pb_tool_result(&id, "Successfully wrote file."));
+            let signal = supervisor.record_tool_signatures(
+                &messages,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+            assert!(
+                matches!(signal, ToolLoopSignal::None),
+                "successful write_file progress must not trigger TargetRepeat: {signal:?}"
+            );
+        }
+
+        assert!(!supervisor.target_repeat_note_injected);
+        assert!(supervisor.tool_target_history.iter().all(Vec::is_empty));
+        assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+    }
+
+    #[test]
+    fn repeated_identical_write_file_still_hits_exact_tool_loop() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let mut signals = Vec::new();
+
+        for i in 0..TOOL_LOOP_SOFT_WINDOW {
+            let id = format!("write-same-{i}");
+            messages.push(pb_write_file_msg_with_content(
+                "main-test/zi_ping.txt",
+                &id,
+                "same content\n",
+            ));
+            messages.push(pb_tool_result(&id, "Successfully wrote file."));
+            signals.push(supervisor.record_tool_signatures(
+                &messages,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            ));
+        }
+
+        assert!(
+            signals[..TOOL_LOOP_SOFT_WINDOW - 1]
+                .iter()
+                .all(|signal| matches!(signal, ToolLoopSignal::None)),
+            "identical write_file calls should stay quiet before soft window fills: {signals:?}"
+        );
+        assert!(
+            matches!(signals[TOOL_LOOP_SOFT_WINDOW - 1], ToolLoopSignal::Soft),
+            "identical write_file calls should still be caught by exact loop detection: {signals:?}"
+        );
     }
 
     #[test]

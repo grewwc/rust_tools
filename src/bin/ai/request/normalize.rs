@@ -705,3 +705,130 @@ pub(super) fn normalize_messages_for_model(model: &str, messages: &[Message]) ->
     }
     normalized
 }
+
+/// 仅修改即将发送给模型的消息投影：如果一个失败调用之后出现了执行签名完全一致
+/// 的成功调用，则用短标记替换旧失败正文。签名在执行时构造，包含 session、有效
+/// cwd、路由、精确工具名和 canonical JSON 参数；这里不扫描自然语言猜测成败。
+pub(crate) fn fold_resolved_tool_failures(
+    messages: &mut [Message],
+    outcomes: &[crate::ai::history::ToolExecutionOutcome],
+) {
+    use rustc_hash::FxHashMap;
+
+    // 老历史可能包含 provider/fallback 跨轮复用的 ID，而旧版旁路表只保留了
+    // 最后一条 outcome。对任何歧义 ID 安全退化为保留全文，绝不猜测 occurrence。
+    let mut message_occurrences: FxHashMap<&str, usize> = FxHashMap::default();
+    for message in messages.iter() {
+        if message.role == "tool"
+            && let Some(tool_call_id) = message.tool_call_id.as_deref()
+        {
+            *message_occurrences.entry(tool_call_id).or_default() += 1;
+        }
+    }
+    let outcome_by_id = outcomes
+        .iter()
+        .filter(|outcome| message_occurrences.get(outcome.tool_call_id.as_str()) == Some(&1))
+        .map(|outcome| (outcome.tool_call_id.as_str(), outcome))
+        .collect::<FxHashMap<_, _>>();
+    let mut later_success_by_signature: FxHashMap<&str, &str> = FxHashMap::default();
+
+    for message in messages.iter_mut().rev() {
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some(outcome) = outcome_by_id.get(tool_call_id).copied() else {
+            // 老历史没有结构化状态时保留全文；绝不回退到字符串启发式。
+            continue;
+        };
+        if outcome.succeeded {
+            later_success_by_signature
+                .entry(outcome.execution_signature.as_str())
+                .or_insert(tool_call_id);
+            continue;
+        }
+        let Some(successful_tool_call_id) = later_success_by_signature
+            .get(outcome.execution_signature.as_str())
+            .copied()
+        else {
+            continue;
+        };
+        message.content = Value::String(format!(
+            "[resolved tool failure: a later invocation with the identical tool, arguments, and execution environment succeeded; failed_tool_call_id={tool_call_id}; successful_tool_call_id={successful_tool_call_id}; original diagnostics omitted]"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod resolved_tool_failure_tests {
+    use super::*;
+    use crate::ai::history::ToolExecutionOutcome;
+
+    fn tool_message(id: &str, content: &str) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+        }
+    }
+
+    fn outcome(id: &str, signature: &str, succeeded: bool) -> ToolExecutionOutcome {
+        ToolExecutionOutcome {
+            tool_call_id: id.to_string(),
+            execution_signature: signature.to_string(),
+            succeeded,
+        }
+    }
+
+    #[test]
+    fn resolved_tool_failures_fold_only_before_identical_success() {
+        let original = vec![
+            tool_message("fail-1", "Error: first diagnostic"),
+            tool_message("fail-2", "Error: second diagnostic"),
+            tool_message("success", "complete result"),
+            tool_message("new-fail", "Error: current failure"),
+            tool_message("other-fail", "Error: different environment"),
+        ];
+        let mut projected = original.clone();
+        let outcomes = vec![
+            outcome("fail-1", "same-signature", false),
+            outcome("fail-2", "same-signature", false),
+            outcome("success", "same-signature", true),
+            outcome("new-fail", "same-signature", false),
+            outcome("other-fail", "different-signature", false),
+        ];
+
+        fold_resolved_tool_failures(&mut projected, &outcomes);
+
+        assert!(projected[0].content.as_str().unwrap().starts_with("[resolved tool failure:"));
+        assert!(projected[1].content.as_str().unwrap().starts_with("[resolved tool failure:"));
+        assert_eq!(projected[2].content, original[2].content);
+        assert_eq!(projected[3].content, original[3].content);
+        assert_eq!(projected[4].content, original[4].content);
+        assert_eq!(original[0].content, Value::String("Error: first diagnostic".to_string()));
+        assert_eq!(projected[0].role, "tool");
+        assert_eq!(projected[0].tool_call_id.as_deref(), Some("fail-1"));
+    }
+
+    #[test]
+    fn reused_legacy_tool_call_id_is_never_folded_ambiguously() {
+        let original = vec![
+            tool_message("reused", "successful result from an older occurrence"),
+            tool_message("reused", "Error: newer occurrence failed"),
+            tool_message("success", "later success"),
+        ];
+        let mut projected = original.clone();
+        let outcomes = vec![
+            outcome("reused", "same-signature", false),
+            outcome("success", "same-signature", true),
+        ];
+
+        fold_resolved_tool_failures(&mut projected, &outcomes);
+
+        assert_eq!(projected, original);
+    }
+}

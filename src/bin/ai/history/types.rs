@@ -9,6 +9,15 @@ pub(in crate::ai) const NEWLINE: char = '\x01';
 pub(crate) const ROLE_SYSTEM: &str = "system";
 pub(crate) const ROLE_INTERNAL_NOTE: &str = "internal_note";
 
+/// 工具执行的结构化结果旁路。正文仍原样保存在 `messages`，该记录只用于构造
+/// 模型请求时判断旧失败是否已被同执行签名的后续成功解决。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ai) struct ToolExecutionOutcome {
+    pub(in crate::ai) tool_call_id: String,
+    pub(in crate::ai) execution_signature: String,
+    pub(in crate::ai) succeeded: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(in crate::ai) struct Message {
     pub(in crate::ai) role: String,

@@ -269,6 +269,7 @@ fn reject_tool_calls(
             })
             .collect(),
         cached_hits: vec![false; tool_calls.len()],
+        execution_outcomes: Vec::new(),
         had_error: true,
     }
 }
@@ -630,6 +631,7 @@ struct TerminalToolObserver<'a> {
     app: &'a App,
     active_stream_tool_call_id: Option<String>,
     pending_utf8: Vec<u8>,
+    render_full_pty_stream: bool,
     visual_output_probe: String,
     visual_output_line: String,
     visual_output_detected: bool,
@@ -644,7 +646,7 @@ struct TerminalToolObserver<'a> {
 // 典型终端二维码约 30–50 行；保留 64 行能完整展示扫码登录等一次性视觉输出，
 // 同时仍为构建日志等无界流式输出提供确定上限。
 const TOOL_OUTPUT_FOLD_MAX_VISIBLE: usize = 64;
-// 常规命令日志不应出现在终端；只有连续的 block-glyph 网格才按视觉输出展示。
+// 常规命令日志不应出现在终端；非 PTY 的流式输出只有连续的 block-glyph 网格才展示。
 // 这个上限既覆盖常见终端二维码，又避免长时间普通日志无限占用探测缓冲区。
 const VISUAL_OUTPUT_PROBE_MAX_BYTES: usize = 16 * 1024;
 const VISUAL_OUTPUT_MIN_CONSECUTIVE_GRID_ROWS: usize = 3;
@@ -816,6 +818,7 @@ impl<'a> TerminalToolObserver<'a> {
             app,
             active_stream_tool_call_id: None,
             pending_utf8: Vec::new(),
+            render_full_pty_stream: false,
             visual_output_probe: String::new(),
             visual_output_line: String::new(),
             visual_output_detected: false,
@@ -832,6 +835,7 @@ impl<'a> TerminalToolObserver<'a> {
     fn reset_stream_state(&mut self) {
         self.active_stream_tool_call_id = None;
         self.pending_utf8.clear();
+        self.render_full_pty_stream = false;
         self.visual_output_probe.clear();
         self.visual_output_line.clear();
         self.visual_output_detected = false;
@@ -847,6 +851,9 @@ impl<'a> TerminalToolObserver<'a> {
         }
         self.reset_stream_state();
         self.active_stream_tool_call_id = Some(tool_call.id.clone());
+        // `pty: true` 是调用方对交互式终端能力的显式请求。完整转发这一路的输出，
+        // 让菜单、确认提示和登录引导可见；普通管道命令仍保持静默，避免日志淹没终端。
+        self.render_full_pty_stream = execute_command_uses_pseudo_terminal(tool_call);
         let label = if tool_call.function.name == "execute_command" {
             "streaming command output"
         } else {
@@ -869,6 +876,11 @@ impl<'a> TerminalToolObserver<'a> {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         let sanitized = sanitize_for_terminal(&normalized);
         if sanitized.is_empty() {
+            return;
+        }
+
+        if self.render_full_pty_stream {
+            self.render_visible_stream_text(&sanitized);
             return;
         }
 
@@ -895,7 +907,7 @@ impl<'a> TerminalToolObserver<'a> {
             let line = self.visual_output_line[..=newline_at].to_string();
             self.visual_output_line.drain(..=newline_at);
             if is_terminal_visual_grid_line(&line) {
-                self.render_visual_output_text(&line);
+                self.render_visible_stream_text(&line);
             }
         }
 
@@ -913,11 +925,12 @@ impl<'a> TerminalToolObserver<'a> {
         let line = std::mem::take(&mut self.visual_output_line);
         if is_terminal_visual_grid_line(&line) {
             // 补齐换行，避免紧随其后的完成状态与最后一行视觉输出粘连。
-            self.render_visual_output_text(&format!("{line}\n"));
+            self.render_visible_stream_text(&format!("{line}\n"));
         }
     }
 
-    fn render_visual_output_text(&mut self, text: &str) {
+    /// 渲染已获准展示的流式文本：显式 PTY 输出，或已识别的视觉网格。
+    fn render_visible_stream_text(&mut self, text: &str) {
         if self.allow_inline_fold_updates {
             let _ = self.tty_fold.push_text(text);
             let _ = std::io::stdout().flush();
@@ -971,7 +984,7 @@ impl<'a> TerminalToolObserver<'a> {
         if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
             return;
         }
-        if !self.visual_output_detected {
+        if !self.visual_output_detected && !self.render_full_pty_stream {
             return;
         }
         if self.allow_inline_fold_updates {
@@ -1004,6 +1017,17 @@ impl<'a> TerminalToolObserver<'a> {
         // 终端不再打印工具输出内容，只保留状态行。
         let _ = prepared;
     }
+}
+
+/// 只有 `execute_command` 显式请求 PTY 时才完整展示流式输出。PTY 是交互式 CLI
+/// （菜单、确认、扫码登录等）的 opt-in 信号；常规命令继续走视觉网格检测，避免把
+/// 所有构建/搜索日志写到终端。
+fn execute_command_uses_pseudo_terminal(tool_call: &ToolCall) -> bool {
+    tool_call.function.name == "execute_command"
+        && serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+            .ok()
+            .and_then(|args| args.get("pty").and_then(serde_json::Value::as_bool))
+            == Some(true)
 }
 
 /// 把 `execute_command` 等命令类工具的 arguments 渲染成单行可读的命令文本，
@@ -1079,11 +1103,7 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
             == Some(tool_call.id.as_str())
             && self.streamed_any_output;
         if streamed_output {
-            let is_failure = if tool_call.function.name == "execute_command" {
-                run_result.tool_result.content.starts_with("Exit code:")
-            } else {
-                !run_result.ok
-            };
+            let is_failure = streamed_tool_result_is_failure(tool_call, run_result);
             self.finish_stream_output(is_failure);
 
             if is_failure {
@@ -1109,6 +1129,12 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
     }
 }
 
+fn streamed_tool_result_is_failure(tool_call: &ToolCall, run_result: &tools::RunOneResult) -> bool {
+    !run_result.ok
+        || (tool_call.function.name == "execute_command"
+            && run_result.tool_result.content.starts_with("Exit code:"))
+}
+
 fn handle_tool_call_round(
     app: &mut App,
     mcp_client: &McpClient,
@@ -1128,7 +1154,7 @@ fn handle_tool_call_round(
         messages,
         &tool_call_execution.stream_result.hidden_meta,
     );
-    let exec_result = if let Some(reason) = rejection_reason {
+    let mut exec_result = if let Some(reason) = rejection_reason {
         reject_tool_calls(&tool_call_execution.stream_result.tool_calls, reason)
     } else {
         let mut observer = TerminalToolObserver::new(app);
@@ -1144,6 +1170,10 @@ fn handle_tool_call_round(
             suppressed_read_only_call_ids,
         )?
     };
+    let persisted_tool_call_ids =
+        crate::ai::history::read_tool_message_ids_sqlite(&app.session_history_file)
+            .unwrap_or_default();
+    uniquify_tool_call_occurrences(messages, &persisted_tool_call_ids, &mut exec_result);
     *turn_had_tool_error |= exec_result.had_error;
     append_cached_tool_results_note(&exec_result, messages, turn_messages);
     append_tool_result_messages(
@@ -1158,7 +1188,23 @@ fn handle_tool_call_round(
     record_hidden_self_note(app, turn_messages, &remaining_meta);
     record_tool_inspection_artifacts(messages, turn_messages);
 
-    persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
+    let history_ready =
+        persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
+    if history_ready {
+        let outcomes = exec_result
+            .execution_outcomes
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(error) = crate::ai::history::append_tool_execution_outcomes_sqlite(
+            &app.session_history_file,
+            &outcomes,
+        ) {
+            // 旁路状态写入失败时必须安全退化为“不折叠”，不能影响原始工具结果。
+            eprintln!("[Warning] failed to persist structured tool outcomes: {error}");
+        }
+    }
 
     Ok(None)
 }
@@ -1195,6 +1241,7 @@ fn execute_tool_calls_with_suppressed_read_only_calls(
             executed_tool_calls: Vec::new(),
             tool_results: Vec::new(),
             cached_hits: Vec::new(),
+            execution_outcomes: Vec::new(),
             had_error: false,
         }
     } else {
@@ -1209,13 +1256,17 @@ fn execute_tool_calls_with_suppressed_read_only_calls(
         )?
     };
 
-    let mut result_by_id = HashMap::new();
-    for (index, result) in executed.tool_results.into_iter().enumerate() {
-        let cached = executed.cached_hits.get(index).copied().unwrap_or(false);
-        result_by_id.insert(result.tool_call_id.clone(), (result, cached));
-    }
+    let executed_had_error = executed.had_error;
+    let mut executed = executed
+        .executed_tool_calls
+        .into_iter()
+        .zip(executed.tool_results)
+        .zip(executed.cached_hits)
+        .zip(executed.execution_outcomes)
+        .map(|(((call, result), cached), outcome)| (call, result, cached, outcome));
     let mut tool_results = Vec::with_capacity(tool_calls.len());
     let mut cached_hits = Vec::with_capacity(tool_calls.len());
+    let mut execution_outcomes = Vec::with_capacity(tool_calls.len());
     for tool_call in tool_calls {
         if suppressed_call_ids.contains(&tool_call.id) {
             tool_results.push(crate::ai::types::ToolResult {
@@ -1223,26 +1274,75 @@ fn execute_tool_calls_with_suppressed_read_only_calls(
                 content: duplicate_read_only_message(&tool_call.function.name),
             });
             cached_hits.push(false);
+            execution_outcomes.push(None);
             continue;
         }
-        let Some((result, cached)) = result_by_id.remove(&tool_call.id) else {
+        let Some((executed_call, result, cached, outcome)) = executed.next() else {
             tool_results.push(crate::ai::types::ToolResult {
                 tool_call_id: tool_call.id.clone(),
                 content: "Error: tool execution returned no result for this call.".to_string(),
             });
             cached_hits.push(false);
+            execution_outcomes.push(None);
             continue;
         };
+        debug_assert_eq!(executed_call.id, tool_call.id);
         tool_results.push(result);
         cached_hits.push(cached);
+        execution_outcomes.push(outcome);
     }
 
     Ok(ExecuteToolCallsResult {
         executed_tool_calls: tool_calls.to_vec(),
         tool_results,
         cached_hits,
-        had_error: executed.had_error || !suppressed_call_ids.is_empty(),
+        execution_outcomes,
+        had_error: executed_had_error || !suppressed_call_ids.is_empty(),
     })
+}
+
+/// `tool_call_id` 只保证单次模型响应内关联；部分 provider/fallback 会跨轮复用。
+/// 写入历史前将碰撞的 assistant/tool/outcome 三方一起改成新的 occurrence ID，
+/// 从而让后续压缩和结构化 outcome 永远按一次真实调用关联。
+fn uniquify_tool_call_occurrences(
+    messages: &[Message],
+    persisted_tool_call_ids: &[String],
+    result: &mut ExecuteToolCallsResult,
+) {
+    let mut used = messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().flatten())
+        .map(|call| call.id.clone())
+        .collect::<HashSet<_>>();
+    used.extend(
+        messages
+            .iter()
+            .filter_map(|message| message.tool_call_id.clone()),
+    );
+    // context budget 可能已从 live messages 裁掉较早调用，完整持久化历史也必须
+    // 参与碰撞检测，避免新 occurrence 与已不在 live context 的旧消息重名。
+    used.extend(persisted_tool_call_ids.iter().cloned());
+
+    for index in 0..result.executed_tool_calls.len() {
+        let original = result.executed_tool_calls[index].id.clone();
+        let occurrence_id = if used.insert(original.clone()) {
+            original
+        } else {
+            loop {
+                let candidate = format!("call_{}", uuid::Uuid::new_v4().simple());
+                if used.insert(candidate.clone()) {
+                    break candidate;
+                }
+            }
+        };
+        result.executed_tool_calls[index].id = occurrence_id.clone();
+        if let Some(tool_result) = result.tool_results.get_mut(index) {
+            tool_result.tool_call_id = occurrence_id.clone();
+        }
+        if let Some(Some(outcome)) = result.execution_outcomes.get_mut(index) {
+            outcome.tool_call_id = occurrence_id;
+        }
+    }
 }
 
 const PENDING_SUBAGENT_TASKS_FOLLOWUP_PREFIX: &str = "tool_followup:pending_subagent_tasks\n";
@@ -2502,6 +2602,7 @@ mod tests {
                 content: "1\n2\n3\n".to_string(),
             }],
             cached_hits: vec![false],
+            execution_outcomes: Vec::new(),
             had_error: false,
         };
 
@@ -2630,6 +2731,94 @@ mod tests {
         let piped = format_command_input(r#"{"command":"git diff","pty":false}"#)
             .expect("valid command arguments");
         assert_eq!(piped, "git diff");
+    }
+
+    #[test]
+    fn full_streaming_is_limited_to_explicit_pty_execute_command() {
+        let interactive = test_tool_call(
+            "call_interactive",
+            "execute_command",
+            serde_json::json!({ "command": "lark-cli auth login", "pty": true }),
+        );
+        assert!(execute_command_uses_pseudo_terminal(&interactive));
+
+        let ordinary = test_tool_call(
+            "call_ordinary",
+            "execute_command",
+            serde_json::json!({ "command": "cargo check", "pty": false }),
+        );
+        assert!(!execute_command_uses_pseudo_terminal(&ordinary));
+
+        let unrelated = test_tool_call(
+            "call_unrelated",
+            "read_file",
+            serde_json::json!({ "file_path": "Cargo.toml", "pty": true }),
+        );
+        assert!(!execute_command_uses_pseudo_terminal(&unrelated));
+    }
+
+    #[test]
+    fn reused_tool_call_id_is_rewritten_for_the_whole_occurrence() {
+        let existing_call = test_tool_call(
+            "reused",
+            "execute_command",
+            serde_json::json!({ "command": "false", "pty": false }),
+        );
+        let messages = vec![Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_calls: Some(vec![existing_call]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let mut result = ExecuteToolCallsResult {
+            executed_tool_calls: vec![test_tool_call(
+                "reused",
+                "execute_command",
+                serde_json::json!({ "command": "true", "pty": false }),
+            )],
+            tool_results: vec![crate::ai::types::ToolResult {
+                tool_call_id: "reused".to_string(),
+                content: "done".to_string(),
+            }],
+            cached_hits: vec![false],
+            execution_outcomes: vec![Some(crate::ai::history::ToolExecutionOutcome {
+                tool_call_id: "reused".to_string(),
+                execution_signature: "signature".to_string(),
+                succeeded: true,
+            })],
+            had_error: false,
+        };
+
+        uniquify_tool_call_occurrences(&messages, &[], &mut result);
+
+        let occurrence_id = &result.executed_tool_calls[0].id;
+        assert_ne!(occurrence_id, "reused");
+        assert_eq!(&result.tool_results[0].tool_call_id, occurrence_id);
+        assert_eq!(
+            &result.execution_outcomes[0].as_ref().unwrap().tool_call_id,
+            occurrence_id
+        );
+    }
+
+    #[test]
+    fn partial_stream_with_structured_failure_never_renders_success() {
+        let call = test_tool_call(
+            "call_timeout",
+            "execute_command",
+            serde_json::json!({ "command": "sleep 30", "pty": true }),
+        );
+        let result = tools::RunOneResult {
+            tool_result: crate::ai::types::ToolResult {
+                tool_call_id: call.id.clone(),
+                content: "partial output before timeout".to_string(),
+            },
+            ok: false,
+            executed: true,
+            cached: false,
+        };
+
+        assert!(streamed_tool_result_is_failure(&call, &result));
     }
 
     #[test]

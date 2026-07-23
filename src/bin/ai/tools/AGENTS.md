@@ -40,7 +40,9 @@ Module responsibilities: schema/metadata in `registry/`, execution in
    tolerates stale context only when the removal is unique; line matching
    normalizes confusable typographic characters (smart quotes, dashes, NBSP) so
    model-introduced variants still match without corrupting output (context
-   lines emit the original file text). A `ReplaceInLine` envelope op
+   lines emit the original file text). Ambiguous exact hunk matches may only use
+   the declared `@@ -N` line number as a tiebreaker when one candidate is nearby
+   and clearly closest; otherwise ambiguity remains a hard error. A `ReplaceInLine` envelope op
    (`anchor:`/`old:`/`new:`) does anchored inline substring replacement outside
    the unified-diff path. When one file needs multiple localized edits, guide
    models toward one `apply_patch` call with multiple `@@` hunks in a single

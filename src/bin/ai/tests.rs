@@ -1118,11 +1118,11 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
         "the other five identical reads must become re-read-suppressing dedup stubs"
     );
     for (i, stub) in dedup_stubs.iter().enumerate() {
-        let call_id = format!("call_same_{}", i + 1);
+        let call_id = format!("call_same_{i}");
         assert!(stub.contains("- original_tool_call_id: "), "{stub}");
-        assert!(stub.contains("- canonical_tool_call_id: call_same_0"), "{stub}");
+        assert!(stub.contains("- canonical_tool_call_id: call_same_5"), "{stub}");
         assert!(stub.contains(&format!("- original_tool_call_id: {call_id}")), "{stub}");
-        assert!(stub.contains("- first_occurrence_message_index: "), "{stub}");
+        assert!(stub.contains("- canonical_message_index: "), "{stub}");
         assert!(stub.contains(r#""filePath":"/repo/agent_adapter.py""#), "{stub}");
         assert!(
             stub.contains("- original_target: file=/repo/agent_adapter.py"),
@@ -1174,8 +1174,8 @@ fn compression_dedup_stub_preserves_identical_list_directory_call_context() {
         .find(|s| s.contains("byte-identical `list_directory`"))
         .expect("duplicate list_directory result should collapse to a self-describing stub");
 
-    assert!(stub.contains("- original_tool_call_id: list-2"), "{stub}");
-    assert!(stub.contains("- canonical_tool_call_id: list-1"), "{stub}");
+    assert!(stub.contains("- original_tool_call_id: list-1"), "{stub}");
+    assert!(stub.contains("- canonical_tool_call_id: list-2"), "{stub}");
     assert!(stub.contains("- original_args: {\"path\":\"/repo/src/bin/ai\"}"), "{stub}");
     assert!(stub.contains("- original_target: path=/repo/src/bin/ai"), "{stub}");
     assert!(stub.contains("- preview: driver/ history/ tools/"), "{stub}");

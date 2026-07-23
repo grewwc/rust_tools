@@ -14,7 +14,7 @@ use super::{
         COMPRESSED_TOOL_EVIDENCE_MARKER, compact_persisted_history, is_summary_note_text,
         value_to_string,
     },
-    types::{MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE},
+    types::{MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, ToolExecutionOutcome},
 };
 
 pub(in crate::ai) struct RecentTurnWindow {
@@ -50,6 +50,12 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        CREATE TABLE IF NOT EXISTS tool_execution_outcomes (
+            tool_call_id TEXT PRIMARY KEY,
+            execution_signature TEXT NOT NULL,
+            succeeded INTEGER NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );",
     )
@@ -251,6 +257,137 @@ pub(in crate::ai) fn compressed_tool_evidence_chars_sqlite(path: &Path) -> io::R
     Ok(total.max(0) as usize)
 }
 
+/// 持久化每个真实工具调用的结构化成败与执行签名。工具结果正文仍只保存在
+/// `messages`，因此请求投影可折叠已解决错误，而人工历史仍保留原始诊断。
+pub(in crate::ai) fn append_tool_execution_outcomes_sqlite(
+    path: &Path,
+    outcomes: &[ToolExecutionOutcome],
+) -> io::Result<()> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    let mut conn = open_history_db(path)?;
+    init_history_schema(&conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    {
+        let mut statement = tx
+            .prepare(
+                "INSERT INTO tool_execution_outcomes
+                    (tool_call_id, execution_signature, succeeded)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(tool_call_id) DO NOTHING",
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        for outcome in outcomes {
+            statement
+                .execute(params![
+                    outcome.tool_call_id,
+                    outcome.execution_signature,
+                    outcome.succeeded
+                ])
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+    }
+    bump_history_revision(&tx)?;
+    tx.commit()
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// 读取请求投影所需的结构化工具结果。老会话没有旁路表时安全退化为空集合，
+/// 不对历史正文做任何基于自然语言的成败猜测。
+pub(in crate::ai) fn read_tool_execution_outcomes_sqlite(
+    path: &Path,
+) -> io::Result<Vec<ToolExecutionOutcome>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = open_history_db(path)?;
+    let table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type='table' AND name='tool_execution_outcomes'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT tool_call_id, execution_signature, succeeded
+             FROM tool_execution_outcomes ORDER BY created_at ASC, rowid ASC",
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ToolExecutionOutcome {
+                tool_call_id: row.get(0)?,
+                execution_signature: row.get(1)?,
+                succeeded: row.get::<_, i64>(2)? != 0,
+            })
+        })
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// 读取持久化 tool 消息使用过的关联 ID。live context 可能已裁掉较早消息，
+/// 生成新 occurrence ID 时仍须避开完整历史中的这些 ID。
+pub(in crate::ai) fn read_tool_message_ids_sqlite(path: &Path) -> io::Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = open_history_db(path)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT DISTINCT tool_call_id FROM messages
+             WHERE role = 'tool' AND tool_call_id IS NOT NULL",
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let rows = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// outcome 只属于同一 `tool_call_id` 的 tool 消息。历史替换、压缩或分支截断后
+/// 立即清掉失去消息所有者的旁路记录，避免已删除 occurrence 的状态污染保留历史。
+fn prune_orphan_tool_execution_outcomes(conn: &Connection) -> io::Result<()> {
+    conn.execute(
+        "DELETE FROM tool_execution_outcomes
+         WHERE tool_call_id NOT IN (
+             SELECT DISTINCT tool_call_id FROM messages
+             WHERE role = 'tool' AND tool_call_id IS NOT NULL
+         )",
+        [],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
+}
+
+/// 旧历史可能在 occurrence ID 修复前复用过 `tool_call_id`。一旦后续替换或
+/// 截断只保留其中一条，仅按当前消息计数就无法知道 outcome 原本属于哪一次，
+/// 因此必须在改变消息集合前永久丢弃这些歧义旁路状态。
+fn drop_ambiguous_tool_execution_outcomes(conn: &Connection) -> io::Result<()> {
+    conn.execute(
+        "DELETE FROM tool_execution_outcomes
+         WHERE tool_call_id IN (
+             SELECT tool_call_id FROM messages
+             WHERE role = 'tool' AND tool_call_id IS NOT NULL
+             GROUP BY tool_call_id HAVING COUNT(1) > 1
+         )",
+        [],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
+}
+
 pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -> io::Result<()> {
     let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;
@@ -312,9 +449,11 @@ pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -
     .map_err(|e| io::Error::other(e.to_string()))?;
     let compacted = compact_persisted_history(messages.clone());
     if compacted != messages {
+        drop_ambiguous_tool_execution_outcomes(&tx)?;
         tx.execute("DELETE FROM messages", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
         insert_messages(&tx, compacted)?;
+        prune_orphan_tool_execution_outcomes(&tx)?;
     }
     bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
@@ -377,11 +516,13 @@ pub(in crate::ai) fn replace_all_messages_sqlite(
     let tx = conn
         .transaction()
         .map_err(|e| io::Error::other(e.to_string()))?;
+    drop_ambiguous_tool_execution_outcomes(&tx)?;
     tx.execute("DELETE FROM messages", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
     tx.execute("DELETE FROM meta WHERE key='first_user_prompt'", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
     insert_messages(&tx, messages.to_vec())?;
+    prune_orphan_tool_execution_outcomes(&tx)?;
     refresh_first_user_prompt_meta(&tx, messages)?;
     bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
@@ -827,6 +968,8 @@ pub(in crate::ai) fn clear_session_history_sqlite(path: &Path) -> io::Result<()>
         .map_err(|e| io::Error::other(e.to_string()))?;
     tx.execute("DELETE FROM messages", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute("DELETE FROM tool_execution_outcomes", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
     // 保留 history_revision 行：它是缓存失效计数器，须跨 clear **单调递增**。
     // 若连同它一起删掉，bump 会从 1 重新开始，版本号回退后可能与早期缓存
     // 条目的 revision 撞车，反而让已失效的旧历史被误命中。
@@ -850,8 +993,11 @@ pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::R
     let tx = conn
         .transaction()
         .map_err(|e| io::Error::other(e.to_string()))?;
+    drop_ambiguous_tool_execution_outcomes(&tx)?;
     if keep == 0 {
         tx.execute("DELETE FROM messages", [])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        tx.execute("DELETE FROM tool_execution_outcomes", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
         bump_history_revision(&tx)?;
         return tx.commit().map_err(|e| io::Error::other(e.to_string()));
@@ -869,6 +1015,7 @@ pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::R
         tx.execute("DELETE FROM messages WHERE id > ?1", params![cutoff_id])
             .map_err(|e| io::Error::other(e.to_string()))?;
     }
+    prune_orphan_tool_execution_outcomes(&tx)?;
     bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
@@ -894,6 +1041,7 @@ pub(in crate::ai) fn truncate_messages_to_user_turns_sqlite(
     let tx = conn
         .transaction()
         .map_err(|error| io::Error::other(error.to_string()))?;
+    drop_ambiguous_tool_execution_outcomes(&tx)?;
     let next_turn_start: Option<i64> = tx
         .query_row(
             "SELECT id FROM messages WHERE role = 'user' ORDER BY id ASC LIMIT 1 OFFSET ?1",
@@ -909,6 +1057,7 @@ pub(in crate::ai) fn truncate_messages_to_user_turns_sqlite(
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
     }
+    prune_orphan_tool_execution_outcomes(&tx)?;
     bump_history_revision(&tx)?;
     tx.commit()
         .map_err(|error| io::Error::other(error.to_string()))
@@ -1046,6 +1195,20 @@ mod tests {
         }
     }
 
+    fn tool_msg(id: &str, text: &str) -> Message {
+        let mut message = msg("tool", text);
+        message.tool_call_id = Some(id.to_string());
+        message
+    }
+
+    fn outcome(id: &str) -> ToolExecutionOutcome {
+        ToolExecutionOutcome {
+            tool_call_id: id.to_string(),
+            execution_signature: format!("signature-{id}"),
+            succeeded: true,
+        }
+    }
+
     /// P1 回归：`read_history_revision` 必须**跨连接**观察到写入递增。
     /// 每次写路径都开新连接读版本号，模拟 build_context_history 的缓存失效判定。
     /// 旧实现用连接局部的 `PRAGMA data_version`，新连接恒返回固定值，无法失效缓存。
@@ -1126,6 +1289,91 @@ mod tests {
             Some("这是实际用户请求\n---\n这是后续用户请求")
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn structured_tool_outcomes_follow_message_lifecycle() {
+        let dir = std::env::temp_dir().join(format!(
+            "tool_outcome_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        let original_messages = vec![tool_msg("call-1", "first"), tool_msg("call-2", "second")];
+        append_history_sqlite(&path, original_messages.clone()).unwrap();
+        let expected = vec![outcome("call-1"), outcome("call-2")];
+        append_tool_execution_outcomes_sqlite(&path, &expected).unwrap();
+
+        assert_eq!(read_tool_execution_outcomes_sqlite(&path).unwrap(), expected);
+        assert_eq!(read_all_messages_sqlite(&path).unwrap(), original_messages);
+
+        replace_all_messages_sqlite(&path, &[tool_msg("call-2", "second")]).unwrap();
+        assert_eq!(
+            read_tool_execution_outcomes_sqlite(&path).unwrap(),
+            vec![outcome("call-2")]
+        );
+
+        append_history_sqlite(&path, vec![tool_msg("call-3", "third")]).unwrap();
+        append_tool_execution_outcomes_sqlite(&path, &[outcome("call-3")]).unwrap();
+        truncate_messages_sqlite(&path, 1).unwrap();
+        assert_eq!(
+            read_tool_execution_outcomes_sqlite(&path).unwrap(),
+            vec![outcome("call-2")]
+        );
+
+        clear_session_history_sqlite(&path).unwrap();
+        assert!(read_tool_execution_outcomes_sqlite(&path).unwrap().is_empty());
+
+        // 旧历史可能已经复用过同一 ID；改变消息集合前必须永久丢弃其歧义 outcome，
+        // 否则删除较新的 occurrence 后会把它的状态错误绑定到保留的旧消息。
+        append_history_sqlite(
+            &path,
+            vec![tool_msg("legacy-reused", "older"), tool_msg("legacy-reused", "newer")],
+        )
+        .unwrap();
+        append_tool_execution_outcomes_sqlite(&path, &[outcome("legacy-reused")]).unwrap();
+        replace_all_messages_sqlite(&path, &[tool_msg("legacy-reused", "older")]).unwrap();
+        assert!(read_tool_execution_outcomes_sqlite(&path).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncating_by_user_turn_prunes_removed_tool_outcomes() {
+        let dir = std::env::temp_dir().join(format!(
+            "tool_outcome_turn_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        append_history_sqlite(
+            &path,
+            vec![
+                msg("user", "first turn"),
+                tool_msg("call-1", "first result"),
+                msg("user", "second turn"),
+                tool_msg("call-2", "second result"),
+            ],
+        )
+        .unwrap();
+        append_tool_execution_outcomes_sqlite(&path, &[outcome("call-1"), outcome("call-2")])
+            .unwrap();
+
+        truncate_messages_to_user_turns_sqlite(&path, 1).unwrap();
+
+        assert_eq!(
+            read_tool_execution_outcomes_sqlite(&path).unwrap(),
+            vec![outcome("call-1")]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

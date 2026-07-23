@@ -37,7 +37,10 @@ pub(in crate::ai) use sessions::strip_think_tags;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
 #[allow(unused_imports)]
-pub(in crate::ai) use sqlite::read_recent_messages_sqlite;
+pub(in crate::ai) use sqlite::{
+    append_tool_execution_outcomes_sqlite, read_recent_messages_sqlite,
+    read_tool_execution_outcomes_sqlite, read_tool_message_ids_sqlite,
+};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
 #[allow(unused_imports)]
@@ -45,7 +48,9 @@ pub(in crate::ai) use suspended::{
     SuspendedSessionEntry, SuspendedSessionStore, format_suspended_timestamp_label,
 };
 #[allow(unused_imports)]
-pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE};
+pub(in crate::ai) use types::{
+    COLON, MAX_HISTORY_TURNS, Message, NEWLINE, ToolExecutionOutcome,
+};
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
 pub(in crate::ai) const ROLE_INTERNAL_NOTE: &str = types::ROLE_INTERNAL_NOTE;
