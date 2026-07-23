@@ -177,6 +177,18 @@ pub(super) fn skills_dir() -> PathBuf {
     PathBuf::from(expanduser(&path).as_ref())
 }
 
+/// 返回需要监听的根目录。用户技能目录始终监听；Trae 外部技能都位于同一根目录下，
+/// 监听该根目录可以发现运行期间新增的外部包。
+pub(super) fn skill_watch_roots() -> Vec<PathBuf> {
+    let user_skills_dir = skills_dir();
+    let external_root = PathBuf::from(expanduser("~/.trae-cn").as_ref());
+    if external_root.is_dir() && external_root != user_skills_dir {
+        vec![user_skills_dir, external_root]
+    } else {
+        vec![user_skills_dir]
+    }
+}
+
 fn looks_like_front_matter_skill(content: &str) -> bool {
     content.lines().next().is_some_and(|l| l.trim() == "---")
 }

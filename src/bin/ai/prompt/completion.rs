@@ -19,6 +19,10 @@ use crate::{commonw::utils::expanduser, cw::Trie};
 pub(super) type LineEditor = Editor<CommandCompleter, DefaultHistory>;
 
 static CURRENT_MODEL_HINT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new(String::new()));
+/// 由 driver 在加载 manifest 后写入。补全位于热路径，不能在每次 Tab 时重新扫描磁盘。
+/// `None` 表示尚未初始化，保留给单元测试和非交互调用的兼容回退。
+static SKILL_NAME_CANDIDATES: LazyLock<RwLock<Option<Vec<CompletionCandidate>>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 /// Trie 存储所有 "/" 和 ":" 开头的顶层命令，替换原先的线性 starts_with 过滤。
 static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
@@ -133,6 +137,15 @@ impl CommandCompleter {
             .ok()
             .map(|guard| guard.trim().to_string())
             .filter(|model| !model.is_empty())
+    }
+
+    /// 用运行时 manifest 快照更新技能补全缓存。
+    pub(in crate::ai) fn set_skill_manifests(
+        manifests: &[crate::ai::skills::SkillManifest],
+    ) {
+        if let Ok(mut guard) = SKILL_NAME_CANDIDATES.write() {
+            *guard = Some(Self::skill_candidates_from_manifests(manifests));
+        }
     }
 
     fn top_level_commands() -> &'static [&'static str] {
@@ -379,23 +392,35 @@ impl CommandCompleter {
         &["list", "current", "use", "help"]
     }
 
-    /// 所有已加载 skill 的名称候选（带 display）。
-    fn skill_name_candidates() -> Vec<CompletionCandidate> {
-        let skills = crate::ai::skills::load_all_skills();
-        skills
-            .into_iter()
-            .map(|s| {
-                let display = if s.description.trim().is_empty() {
-                    s.name.clone()
+    fn skill_candidates_from_manifests(
+        manifests: &[crate::ai::skills::SkillManifest],
+    ) -> Vec<CompletionCandidate> {
+        manifests
+            .iter()
+            .map(|skill| {
+                let display = if skill.description.trim().is_empty() {
+                    skill.name.clone()
                 } else {
-                    format!("{} · {}", s.name, s.description.trim())
+                    format!("{} · {}", skill.name, skill.description.trim())
                 };
                 CompletionCandidate {
                     display,
-                    replacement: s.name,
+                    replacement: skill.name.clone(),
                 }
             })
             .collect()
+    }
+
+    /// 所有已加载 skill 的名称候选（带 display）。
+    fn skill_name_candidates() -> Vec<CompletionCandidate> {
+        if let Ok(guard) = SKILL_NAME_CANDIDATES.read()
+            && let Some(candidates) = guard.as_ref()
+        {
+            return candidates.clone();
+        }
+
+        // 非交互调用与尚未设置运行时快照的单元测试保持原有行为。
+        Self::skill_candidates_from_manifests(&crate::ai::skills::load_all_skills())
     }
 
     pub(super) fn complete_for_line(line: &str, pos: usize) -> (usize, Vec<CompletionCandidate>) {
@@ -545,7 +570,7 @@ fn complete_skill_reference(before: &str) -> Option<(usize, Vec<CompletionCandid
     let rest = token.strip_prefix('@')?;
     let filters = skill_token_filters(rest)?;
 
-    let skills = crate::ai::skills::load_all_skills();
+    let skills = CommandCompleter::skill_name_candidates();
 
     // 任一切分得到空过滤词 ⇒ 仍在输入关键字（如 `@skill`/`@skills`），列出全部。
     let list_all = filters.iter().any(|f| f.is_empty());
@@ -556,7 +581,7 @@ fn complete_skill_reference(before: &str) -> Option<(usize, Vec<CompletionCandid
     } else {
         let mut trie = rust_tools::cw::Trie::new();
         for skill in &skills {
-            trie.insert(&skill.name.to_ascii_lowercase());
+            trie.insert(&skill.replacement.to_ascii_lowercase());
         }
         let mut set = rust_tools::commonw::FastSet::default();
         for filter in &filters {
@@ -570,18 +595,13 @@ fn complete_skill_reference(before: &str) -> Option<(usize, Vec<CompletionCandid
     let mut candidates = Vec::new();
     for skill in &skills {
         if let Some(set) = &matched {
-            if !set.contains(&skill.name.to_ascii_lowercase()) {
+            if !set.contains(&skill.replacement.to_ascii_lowercase()) {
                 continue;
             }
         }
-        let display = if skill.description.trim().is_empty() {
-            skill.name.clone()
-        } else {
-            format!("{} · {}", skill.name, skill.description.trim())
-        };
         candidates.push(CompletionCandidate {
-            display,
-            replacement: format!("@skills:{}", skill.name),
+            display: skill.display.clone(),
+            replacement: format!("@skills:{}", skill.replacement),
         });
     }
     Some((token_start, candidates))

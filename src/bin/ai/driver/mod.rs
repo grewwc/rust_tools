@@ -68,6 +68,7 @@ pub mod signal;
 pub mod skill_match_model;
 pub mod skill_ranking;
 pub mod skill_runtime;
+mod skill_watcher;
 pub mod text_similarity;
 pub mod thinking;
 pub mod tools;
@@ -622,6 +623,8 @@ async fn run_loop(
     let mut mcp_initialized = false;
     let mut mcp_loading_announced = false;
     let mut manifests_loaded = false;
+    let mut skill_watcher = None;
+    let mut skill_watcher_started = false;
     let mut mcp_preload_task = if should_preload_mcp(one_shot_mode, &mcp_probe) {
         Some(spawn_mcp_preload_task(mcp_probe.config_path.clone()))
     } else {
@@ -740,6 +743,25 @@ async fn run_loop(
 
         subagent_status_line.finish();
 
+        // 输入框的 Tab 补全依赖技能 manifest；必须在打开交互输入前准备快照，避免
+        // `/skills <TAB>` 同步扫描所有目录、包和 zip 文件而阻塞终端。
+        ensure_runtime_manifests_loaded(
+            app,
+            skill_manifests,
+            agent_manifests,
+            &mut manifests_loaded,
+        );
+
+        // 监听线程只在 manifest 已完成首次加载后启动：补全始终从内存快照读取，
+        // 文件变更才由后台线程重新扫描并替换该快照。
+        if !skill_watcher_started && !one_shot_mode {
+            skill_watcher_started = true;
+            match skill_watcher::start_skill_manifest_watcher(app.cli.no_skills) {
+                Ok(watcher) => skill_watcher = watcher,
+                Err(err) => eprintln!("[Warning] 技能热加载监听未启动：{err}"),
+            }
+        }
+
         {
             // ── Goal 模式自动续推 ──
             // 当 goal 已设定且上一轮调用了工具时，跳过用户输入，直接注入
@@ -787,16 +809,17 @@ async fn run_loop(
             }
         }
 
+        // 监听线程已同步刷新补全缓存；在输入提交后切换 driver 的运行时快照，
+        // 使紧接着的 /skills 命令和下一轮路由也能使用同一份新 manifest。
+        if let Some(watcher) = skill_watcher.as_mut()
+            && let Some(updated) = watcher.take_latest()
+        {
+            *skill_manifests = updated;
+        }
+
         if !one_shot_mode {
             announce_mcp_loading_if_needed(&mcp_probe, mcp_initialized, &mut mcp_loading_announced);
         }
-
-        ensure_runtime_manifests_loaded(
-            app,
-            skill_manifests,
-            agent_manifests,
-            &mut manifests_loaded,
-        );
 
         if try_handle_interactive_command(
             app,
