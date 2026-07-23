@@ -235,7 +235,7 @@ fn parse_local_command(input: &str) -> Result<Option<LocalCommand>, Box<dyn Erro
 }
 
 fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Box<dyn Error>> {
-    if args.first().copied() == Some("rewind") || args.first().copied() == Some("undo") {
+    if args.first().copied() == Some("rewind") {
         return parse_history_rewind_command(&args[1..])
             .map(|target| Some(LocalCommand::RewindHistory(target)));
     }
@@ -1370,6 +1370,7 @@ mod tests {
                 "wrong turn".to_string()
             )))
         );
+        assert!(parse_local_command("/history undo u3").is_err());
         assert_eq!(parse_local_command("hello").unwrap(), None);
     }
 

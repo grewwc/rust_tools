@@ -542,6 +542,8 @@ fn generate_bash(
     _is_bool: fn(&str) -> bool,
     _has_value: fn(&str) -> bool,
 ) {
+    let session_subcommands =
+        crate::ai::driver::commands::session::CANONICAL_SESSION_SUBCOMMANDS.join(" ");
     println!("_a_completions() {{");
     println!("  local cur prev words cword");
     println!("  _get_comp_words_by_ref -n = cur prev words cword 2>/dev/null || true");
@@ -575,13 +577,14 @@ fn generate_bash(
     println!("  local usage_sub='today 7d 30d all daily trend days models help'");
     println!("  local checkpoint_sub='save list rollback delete help'");
     println!(
-        "  local history_sub='full user assistant tool system grep rewind undo export copy last replay help 3 6 10 20'"
+        "  local history_sub='full user assistant tool system grep rewind export copy last replay help 3 6 10 20'"
     );
     println!(
         "  local persona_sub='help list ls current cur create new use select switch delete del rm'"
     );
     println!(
-        "  local session_sub='help list current new use suspend bound delete clear-bound clear-history clear-all dump-history dump export export-current export-last fork branch'"
+        "  local session_sub={}",
+        shell_single_quote(&session_subcommands)
     );
     println!("  local agent_sub='help list current use auto'");
     println!("  local model_sub='current list help effort'");
@@ -632,6 +635,8 @@ fn generate_zsh(
     is_bool: fn(&str) -> bool,
     _has_value: fn(&str) -> bool,
 ) {
+    let session_subcommands =
+        crate::ai::driver::commands::session::CANONICAL_SESSION_SUBCOMMANDS.join(" ");
     println!("#compdef a");
     println!();
     println!("_a() {{");
@@ -669,11 +674,9 @@ fn generate_zsh(
     println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days models help)");
     println!("  local -a _a_checkpoint_subcmds=(save list rollback delete help)");
     println!(
-        "  local -a _a_history_subcmds=(full user assistant tool system grep rewind undo export copy last replay help 3 6 10 20)"
+        "  local -a _a_history_subcmds=(full user assistant tool system grep rewind export copy last replay help 3 6 10 20)"
     );
-    println!(
-        "  local -a _a_session_subcmds=(help list current new use suspend bound delete clear-bound clear-history clear-all dump-history dump export export-current export-last fork branch)"
-    );
+    println!("  local -a _a_session_subcmds=({session_subcommands})");
     println!("  local -a _a_agent_subcmds=(help list current use auto)");
     println!(
         "  local -a _a_persona_subcmds=(help list ls current cur create new use select switch delete del rm)"

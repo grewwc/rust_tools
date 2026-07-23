@@ -48,30 +48,26 @@ pub fn print_interactive_help() {
     println!("    /skills <name>            select & activate a skill");
     println!();
     println!("  Session management:");
-    println!("    /sessions                 list all sessions");
-    println!("    /sessions list            list all sessions");
+    println!("    /sessions [list]          list all sessions");
     println!("    /sessions current         show current session info");
     println!("    /sessions new             create and switch to new session");
     println!("    /sessions use <id>        switch to specified session");
-    println!(
-        "    /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)"
-    );
+    println!("    /sessions suspend         suspend current session and return to shell");
     println!("    /sessions bound           list suspended sessions bound to current terminal");
     println!("    /sessions delete <id> [more...]     delete one or more sessions");
-    println!("    /sessions clear-bound     clear suspended sessions bound to current terminal");
+    println!(
+        "    /sessions unbind          remove this terminal's suspended-session bindings (sessions are kept)"
+    );
     println!("    /sessions clear-history   clear current session history (keeps session alive)");
     println!("    /sessions clear-all       delete all sessions");
-    println!("    /sessions export <id> [output.md]       export session to Markdown");
-    println!("    /sessions export-current [output.md]    export current session to Markdown");
-    println!("    /sessions export-last [output.md]       export latest session to Markdown");
+    println!("    /sessions dump-history <id>              dump session history to JSON");
+    println!("    /sessions export <id|current|last> [output.md]   export session to Markdown");
     println!(
-        "    /sessions export-archive <id> [output.zip]       full session archive for migration"
+        "    /sessions archive <id|current|last> [output.zip] full session archive for migration"
     );
-    println!("    /sessions export-archive-current [output.zip]    archive current session");
-    println!("    /sessions export-archive-last [output.zip]       archive latest session");
     println!("    /sessions import <file.zip> [as=<id>]           import session from archive");
     println!("    /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
-    println!("    /sessions branch <keep_messages> [src=<id>] [as=<id>]");
+    println!("    /sessions branch <keep_turns> [src=<id>] [as=<id>] retain complete user turns");
     println!();
     println!("  Notes:");
     println!("    - Commands support both / and : prefix (e.g., /help or :help)");

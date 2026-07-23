@@ -222,6 +222,10 @@ where
     if cli.new_session && cli.clear {
         return Err("`--new-session` 不能和 `--clear` 同时使用".into());
     }
+    if let Some(session_id) = cli.session.as_deref() {
+        SessionStore::validate_session_id(session_id.trim())
+            .map_err(|error| format!("invalid --session id: {error}"))?;
+    }
 
     let mut choice = StartupSessionChoice {
         history_file: crate::ai::persona::history_file_for_persona(

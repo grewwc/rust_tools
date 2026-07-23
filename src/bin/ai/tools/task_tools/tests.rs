@@ -106,7 +106,7 @@ fn auto_select_prefers_navigator_for_codebase_investigation() {
         AgentMode::Subagent,
     );
     navigator.model_tier = Some(AgentModelTier::Light);
-    let mut review = manifest("review", "Read-only review agent", AgentMode::Subagent);
+    let review = manifest("review", "Read-only review agent", AgentMode::Subagent);
 
     let all_agents = vec![build, navigator, review];
 
@@ -211,8 +211,8 @@ fn capped_subagent_manifest_preserves_stricter_iteration_budget() {
 
 #[test]
 fn explicit_primary_agent_is_rejected_for_task_tool() {
-    let mut build = manifest("build", "Main build agent", AgentMode::Primary);
-    let mut navigator = manifest(
+    let build = manifest("build", "Main build agent", AgentMode::Primary);
+    let navigator = manifest(
         "navigator",
         "Read-only codebase navigation agent",
         AgentMode::Subagent,
@@ -234,7 +234,7 @@ fn tfidf_auto_selection_matches_task_to_subagent_description() {
     );
     explore.model_tier = Some(AgentModelTier::Light);
 
-    let mut review = manifest("critic", "Code review agent", AgentMode::Subagent);
+    let review = manifest("critic", "Code review agent", AgentMode::Subagent);
     let all_agents = vec![explore, review];
 
     let selected = select_subagent(

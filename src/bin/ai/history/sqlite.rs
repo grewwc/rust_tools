@@ -873,6 +873,47 @@ pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::R
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
+/// 把 messages 表保留到前 `keep_turns` 个完整用户 turn。
+///
+/// 用户 turn 从 `role='user'` 开始，到下一条用户消息前结束；按下一条用户消息
+/// 截断可让 assistant tool call 与随后的 tool result 留在同一侧。
+pub(in crate::ai) fn truncate_messages_to_user_turns_sqlite(
+    path: &Path,
+    keep_turns: usize,
+) -> io::Result<()> {
+    if keep_turns == 0 {
+        return truncate_messages_sqlite(path, 0);
+    }
+
+    let mut conn = match open_history_db(path) {
+        Ok(connection) => connection,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    init_history_schema(&conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let next_turn_start: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM messages WHERE role = 'user' ORDER BY id ASC LIMIT 1 OFFSET ?1",
+            params![keep_turns as i64],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if let Some(next_turn_start) = next_turn_start {
+        tx.execute(
+            "DELETE FROM messages WHERE id >= ?1",
+            params![next_turn_start],
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    }
+    bump_history_revision(&tx)?;
+    tx.commit()
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
     let meta: Option<String> = conn

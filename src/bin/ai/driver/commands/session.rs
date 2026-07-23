@@ -9,6 +9,27 @@ use crate::ai::{
     types::App,
 };
 
+/// 公开给帮助与补全的规范二级命令；旧别名仅为兼容保留，不再主动展示。
+pub(in crate::ai) const CANONICAL_SESSION_SUBCOMMANDS: &[&str] = &[
+    "help",
+    "list",
+    "current",
+    "new",
+    "use",
+    "suspend",
+    "bound",
+    "unbind",
+    "delete",
+    "clear-history",
+    "clear-all",
+    "dump-history",
+    "export",
+    "archive",
+    "import",
+    "fork",
+    "branch",
+];
+
 pub(in crate::ai) fn cancel_current_process_reflection_daemons(app: &App) -> usize {
     let Ok(mut os) = app.os.lock() else {
         return 0;
@@ -115,6 +136,35 @@ pub fn try_handle_clear_command(input: &str) -> bool {
     true
 }
 
+/// 解析 export/archive 使用的规范目标选择器，并确保普通 ID 指向现有会话。
+fn resolve_existing_session_selector(
+    store: &SessionStore,
+    current_session_id: &str,
+    selector: &str,
+) -> std::io::Result<String> {
+    let session_id = match selector {
+        "current" => current_session_id.to_string(),
+        "last" => store
+            .list_sessions()?
+            .first()
+            .map(|session| session.id.clone())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no sessions found")
+            })?,
+        id => {
+            SessionStore::validate_session_id(id)?;
+            id.to_string()
+        }
+    };
+    if !store.session_exists(&session_id)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("session '{session_id}' not found"),
+        ));
+    }
+    Ok(session_id)
+}
+
 pub fn try_handle_session_command(
     app: &mut App,
     input: &str,
@@ -158,14 +208,11 @@ pub fn try_handle_session_command(
         "help" | "h" => {
             println!("Session management commands:");
             println!();
-            println!("  /sessions                 list all sessions");
-            println!("  /sessions list            list all sessions");
+            println!("  /sessions [list]          list all sessions");
             println!("  /sessions current         show current session info");
             println!("  /sessions new             create and switch to new session");
             println!("  /sessions use <id>        switch to specified session");
-            println!(
-                "  /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)"
-            );
+            println!("  /sessions suspend         suspend current session and return to shell");
             println!(
                 "  /close                    close and delete current session, then exit (or :close)"
             );
@@ -174,32 +221,28 @@ pub fn try_handle_session_command(
             );
             println!("  /sessions delete <id> [more...]     delete one or more sessions");
             println!(
-                "  /sessions clear-bound     clear suspended sessions bound to current terminal"
+                "  /sessions unbind          remove suspended-session bindings for this terminal (sessions are kept)"
             );
             println!(
                 "  /sessions clear-history   clear current session history (keeps session alive)"
             );
             println!("  /sessions clear-all       delete all sessions");
-            println!("  /sessions export <id> [output.md]       export session to Markdown");
             println!(
-                "  /sessions dump-history <id>                dump session history to JSON (<id>-history.json)"
+                "  /sessions dump-history <id>              dump session history to JSON (<id>-history.json)"
             );
             println!(
-                "  /sessions export-current [output.md]    export current session to Markdown"
+                "  /sessions export <id|current|last> [output.md]   export session to Markdown"
             );
-            println!("  /sessions export-last [output.md]       export latest session to Markdown");
             println!(
-                "  /sessions export-archive <id> [output.zip]       full session archive for migration"
+                "  /sessions archive <id|current|last> [output.zip] full session archive for migration"
             );
-            println!("  /sessions export-archive-current [output.zip]    archive current session");
-            println!("  /sessions export-archive-last [output.zip]       archive latest session");
             println!(
                 "  /sessions import <file.zip> [as=<id>]           import session from archive"
             );
             println!("  /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
-            println!("  /sessions branch <keep_messages> [src=<id>] [as=<id>]");
+            println!("  /sessions branch <keep_turns> [src=<id>] [as=<id>]");
             println!(
-                "                                          fork then truncate to first N messages"
+                "                                          fork then retain the first N complete user turns"
             );
             println!();
         }
@@ -264,6 +307,14 @@ pub fn try_handle_session_command(
                 println!("missing session id. try: /sessions use <id>");
                 return Ok(true);
             };
+            if let Err(error) = SessionStore::validate_session_id(id) {
+                println!("invalid session id: {error}");
+                return Ok(true);
+            }
+            if !store.session_exists(id)? {
+                println!("Session not found: {id}");
+                return Ok(true);
+            }
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
             clear_session_local_runtime_state(app);
             app.session_id = id.to_string();
@@ -328,6 +379,13 @@ pub fn try_handle_session_command(
                 println!("missing session id(s). try: /sessions delete <id1> [<id2> ...]");
                 return Ok(true);
             };
+            if let Some(error) = ids
+                .iter()
+                .find_map(|id| SessionStore::validate_session_id(id).err())
+            {
+                println!("invalid session id: {error}");
+                return Ok(true);
+            }
             let mut deleted_count = 0;
             let mut not_found_count = 0;
             let mut deleted_current = false;
@@ -358,7 +416,7 @@ pub fn try_handle_session_command(
                 println!("Switched to new session: {}", new_id);
             }
         }
-        "clear-bound" | "clear_bound" | "clear-suspended" | "clear_suspended" => {
+        "unbind" | "clear-bound" | "clear_bound" | "clear-suspended" | "clear_suspended" => {
             let suspended_store = SuspendedSessionStore::new();
             let entries = match suspended_store.list_current_terminal() {
                 Ok(entries) => entries,
@@ -373,7 +431,7 @@ pub fn try_handle_session_command(
             }
 
             let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(
-                "Clear ALL suspended sessions bound to the current terminal? (y/n): ",
+                "Remove ALL suspended-session bindings for the current terminal? Sessions will be kept. (y/n): ",
             );
             if confirm != Some(true) {
                 println!("canceled by user.");
@@ -383,7 +441,7 @@ pub fn try_handle_session_command(
             match suspended_store.clear_current_terminal() {
                 Ok(cleared) => {
                     println!(
-                        "Cleared {cleared} suspended session(s) bound to the current terminal."
+                        "Removed {cleared} suspended-session binding(s) for the current terminal; sessions were kept."
                     );
                 }
                 Err(err) => {
@@ -391,21 +449,33 @@ pub fn try_handle_session_command(
                 }
             }
         }
-        "export" => {
-            let Some(id) = parts.next() else {
-                println!("missing session id. try: /sessions export <id> [output.md]");
-                return Ok(true);
+        "export" | "export-current" | "export-cur" | "export-last" | "export-latest" => {
+            let (selector, output) = match action {
+                "export" => {
+                    let Some(selector) = parts.next() else {
+                        println!(
+                            "missing session selector. try: /sessions export <id|current|last> [output.md]"
+                        );
+                        return Ok(true);
+                    };
+                    (selector, parts.next())
+                }
+                "export-current" | "export-cur" => ("current", parts.next()),
+                "export-last" | "export-latest" => ("last", parts.next()),
+                _ => unreachable!("matched export action"),
             };
-            let output_path = parts.next().unwrap_or("session_export.md");
-            let output_path = std::path::Path::new(output_path);
+            let id = match resolve_existing_session_selector(&store, &app.session_id, selector) {
+                Ok(id) => id,
+                Err(error) => {
+                    eprintln!("Failed to export session: {error}");
+                    return Ok(true);
+                }
+            };
+            let output_path = std::path::Path::new(output.unwrap_or("session_export.md"));
 
-            match store.export_session_to_markdown(id, output_path) {
-                Ok(()) => {
-                    println!("Exported session '{}' to '{}'", id, output_path.display());
-                }
-                Err(err) => {
-                    eprintln!("Failed to export session: {}", err);
-                }
+            match store.export_session_to_markdown(&id, output_path) {
+                Ok(()) => println!("Exported session '{id}' to '{}'", output_path.display()),
+                Err(error) => eprintln!("Failed to export session: {error}"),
             }
         }
         "dump-history" | "dump" => {
@@ -413,10 +483,17 @@ pub fn try_handle_session_command(
                 println!("missing session id. try: /sessions dump-history <id>");
                 return Ok(true);
             };
+            let id = match resolve_existing_session_selector(&store, &app.session_id, id) {
+                Ok(id) => id,
+                Err(error) => {
+                    eprintln!("Failed to dump history: {error}");
+                    return Ok(true);
+                }
+            };
             let output_path = format!("{}-history.json", id);
             let output_path = std::path::Path::new(&output_path);
 
-            match store.read_all_messages(id) {
+            match store.read_all_messages(&id) {
                 Ok(messages) => {
                     let json = serde_json::to_string_pretty(&messages)?;
                     if let Some(parent) = output_path.parent() {
@@ -434,99 +511,49 @@ pub fn try_handle_session_command(
                 }
             }
         }
-        "export-current" | "export-cur" => {
-            let output_path = parts.next().unwrap_or("session_export.md");
-            let output_path = std::path::Path::new(output_path);
-
-            match store.export_session_to_markdown(&app.session_id, output_path) {
-                Ok(()) => {
-                    println!(
-                        "Exported current session '{}' to '{}'",
-                        app.session_id,
-                        output_path.display()
-                    );
+        "archive"
+        | "export-archive"
+        | "export-bundle"
+        | "pack"
+        | "export-archive-current"
+        | "export-bundle-current"
+        | "pack-current"
+        | "pack-cur"
+        | "export-archive-last"
+        | "export-bundle-last"
+        | "pack-last"
+        | "pack-latest" => {
+            let (selector, output) = match action {
+                "archive" | "export-archive" | "export-bundle" | "pack" => {
+                    let Some(selector) = parts.next() else {
+                        println!(
+                            "missing session selector. try: /sessions archive <id|current|last> [output.zip]"
+                        );
+                        return Ok(true);
+                    };
+                    (selector, parts.next())
                 }
-                Err(err) => {
-                    eprintln!("Failed to export session: {}", err);
+                "export-archive-current"
+                | "export-bundle-current"
+                | "pack-current"
+                | "pack-cur" => ("current", parts.next()),
+                "export-archive-last" | "export-bundle-last" | "pack-last" | "pack-latest" => {
+                    ("last", parts.next())
                 }
-            }
-        }
-        "export-last" | "export-latest" => {
-            let sessions = store.list_sessions()?;
-            let Some(last) = sessions.first() else {
-                println!("No sessions found to export.");
-                return Ok(true);
+                _ => unreachable!("matched archive action"),
             };
-            let output_path = parts.next().unwrap_or("session_export.md");
-            let output_path = std::path::Path::new(output_path);
-
-            match store.export_session_to_markdown(&last.id, output_path) {
-                Ok(()) => {
-                    println!(
-                        "Exported latest session '{}' to '{}'",
-                        last.id,
-                        output_path.display()
-                    );
+            let id = match resolve_existing_session_selector(&store, &app.session_id, selector) {
+                Ok(id) => id,
+                Err(error) => {
+                    eprintln!("Failed to archive session: {error}");
+                    return Ok(true);
                 }
-                Err(err) => {
-                    eprintln!("Failed to export session: {}", err);
-                }
-            }
-        }
-        "export-archive" | "export-bundle" | "pack" => {
-            let Some(id) = parts.next() else {
-                println!("missing session id. try: /sessions export-archive <id> [output.zip]");
-                return Ok(true);
             };
-            let output_path = parts.next().unwrap_or("session_archive.zip");
-            let output_path = std::path::Path::new(output_path);
+            let output_path = std::path::Path::new(output.unwrap_or("session_archive.zip"));
 
-            match store.export_session_archive(id, output_path) {
-                Ok(()) => {
-                    println!("Archived session '{}' to '{}'", id, output_path.display());
-                }
-                Err(err) => {
-                    eprintln!("Failed to export archive: {}", err);
-                }
-            }
-        }
-        "export-archive-current" | "export-bundle-current" | "pack-current" | "pack-cur" => {
-            let output_path = parts.next().unwrap_or("session_archive.zip");
-            let output_path = std::path::Path::new(output_path);
-
-            match store.export_session_archive(&app.session_id, output_path) {
-                Ok(()) => {
-                    println!(
-                        "Archived current session '{}' to '{}'",
-                        app.session_id,
-                        output_path.display()
-                    );
-                }
-                Err(err) => {
-                    eprintln!("Failed to export archive: {}", err);
-                }
-            }
-        }
-        "export-archive-last" | "export-bundle-last" | "pack-last" | "pack-latest" => {
-            let sessions = store.list_sessions()?;
-            let Some(last) = sessions.first() else {
-                println!("No sessions found to archive.");
-                return Ok(true);
-            };
-            let output_path = parts.next().unwrap_or("session_archive.zip");
-            let output_path = std::path::Path::new(output_path);
-
-            match store.export_session_archive(&last.id, output_path) {
-                Ok(()) => {
-                    println!(
-                        "Archived latest session '{}' to '{}'",
-                        last.id,
-                        output_path.display()
-                    );
-                }
-                Err(err) => {
-                    eprintln!("Failed to export archive: {}", err);
-                }
+            match store.export_session_archive(&id, output_path) {
+                Ok(()) => println!("Archived session '{id}' to '{}'", output_path.display()),
+                Err(error) => eprintln!("Failed to archive session: {error}"),
             }
         }
         "import" | "import-archive" | "unpack" => {
@@ -582,7 +609,7 @@ pub fn try_handle_session_command(
                 app.session_id
             );
         }
-        "clear-all" | "clear_all" | "clear" | "wipe" => {
+        "clear-all" | "clear_all" | "wipe" => {
             let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(
                 "Delete ALL sessions? (y/n): ",
             );
@@ -633,10 +660,10 @@ pub fn try_handle_session_command(
             }
         }
         "branch" => {
-            // 用法: /sessions branch <keep_messages> [src=<id>] [as=<id>]
+            // 用法: /sessions branch <keep_turns> [src=<id>] [as=<id>]
             let Some(keep_str) = parts.next() else {
                 println!(
-                    "missing keep count. try: /sessions branch <keep_messages> [src=<id>] [as=<id>]"
+                    "missing keep count. try: /sessions branch <keep_turns> [src=<id>] [as=<id>]"
                 );
                 return Ok(true);
             };
@@ -665,7 +692,7 @@ pub fn try_handle_session_command(
                     app.session_history_file = store.session_history_file(&dst_id);
                     app.sync_persona_session_binding();
                     println!(
-                        "Branched '{}' -> '{}' (kept first {} message(s)), switched to new branch.",
+                        "Branched '{}' -> '{}' (kept first {} complete user turn(s)), switched to new branch.",
                         src_id, dst_id, keep
                     );
                 }
@@ -1015,6 +1042,47 @@ mod tests {
             imported_messages[1].content,
             Value::String("hi there".to_string())
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sessions_branch_retains_complete_user_turns() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let source = store.session_history_file(&app.session_id);
+        let message = |role: &str, content: &str| Message {
+            role: role.to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        append_history_messages(
+            &source,
+            &[
+                message("user", "first request"),
+                message("assistant", "tool call"),
+                message("tool", "tool result"),
+                message("assistant", "first answer"),
+                message("user", "second request"),
+                message("assistant", "second answer"),
+            ],
+        )
+        .unwrap();
+
+        try_handle_session_command(&mut app, "/sessions branch 1 as=turn-one").unwrap();
+
+        let branched = store.read_all_messages("turn-one").unwrap();
+        assert_eq!(branched.len(), 4);
+        assert_eq!(branched[0].role, "user");
+        assert_eq!(branched[1].role, "assistant");
+        assert_eq!(branched[2].role, "tool");
+        assert_eq!(branched[3].role, "assistant");
 
         let _ = fs::remove_dir_all(root);
     }

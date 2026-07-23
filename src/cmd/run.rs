@@ -7,7 +7,7 @@ use crate::{commonw::utils::expanduser, strw::split::split_space_keep_symbol};
 use std::{
     ffi::OsString,
     io::{self, Read},
-    process::{Child, Command, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread,
     time::{Duration, Instant},
@@ -433,6 +433,37 @@ fn accumulate_chunk<F>(
     on_chunk(chunk);
 }
 
+/// 命令执行结果：携带 stdout/stderr，并用标志位区分「被超时/取消杀掉」的情形。
+///
+/// 超时或取消时仍保留已捕获的部分输出（`status` 可能为 `None`），让上层能把
+/// 「被杀前已经产生的输出」交给调用方，而不是只给一句无信息的 timeout/cancelled。
+#[derive(Debug)]
+pub struct CommandRunResult {
+    pub status: Option<ExitStatus>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub timed_out: bool,
+    pub cancelled: bool,
+}
+
+/// 把带超时/取消标记的结果转回旧的 `io::Result<Output>` 语义：
+/// 超时 -> `Err(TimedOut)`、取消 -> `Err(Interrupted)`、正常 -> `Ok(Output)`。
+/// 旧路径（hooks、非流式 `run_cmd_output_with_timeout`）不需要部分输出，只看成功/失败，
+/// 因此维持原签名，由本函数丢弃被杀情形下的部分输出。
+fn result_to_output(r: CommandRunResult) -> io::Result<Output> {
+    if r.timed_out {
+        Err(io::Error::new(io::ErrorKind::TimedOut, "timeout"))
+    } else if r.cancelled {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+    } else {
+        Ok(Output {
+            status: r.status.expect("non-killed result must carry a status"),
+            stdout: r.stdout,
+            stderr: r.stderr,
+        })
+    }
+}
+
 pub fn run_cmd_output_streaming_with_timeout<F, C>(
     command: &str,
     opts: RunCmdOptions<'_>,
@@ -444,14 +475,15 @@ where
     F: FnMut(&[u8]),
     C: Fn() -> bool,
 {
-    run_cmd_output_streaming_with_timeout_tracked(
+    let r = run_cmd_output_streaming_with_timeout_tracked(
         command,
         opts,
         timeout,
         on_chunk,
         should_cancel,
         |_| {},
-    )
+    )?;
+    result_to_output(r)
 }
 
 /// 与 [`run_cmd_output_streaming_with_timeout`] 相同，但额外接收
@@ -469,7 +501,7 @@ pub fn run_cmd_output_streaming_with_timeout_tracked<F, C, G>(
     mut on_chunk: F,
     should_cancel: C,
     mut on_background_group: G,
-) -> io::Result<Output>
+) -> io::Result<CommandRunResult>
 where
     F: FnMut(&[u8]),
     C: Fn() -> bool,
@@ -518,7 +550,7 @@ where
                 if should_cancel() {
                     // 取消：杀掉整个进程组（含后台派生进程），管道随之关闭，读取线程退出。
                     terminate_child(&mut child);
-                    let _ = child.wait();
+                    let killed_status = child.wait().ok();
                     drain_channel(
                         &rx,
                         &mut stdout_buf,
@@ -526,12 +558,20 @@ where
                         &mut on_chunk,
                         DRAIN_GRACE,
                     );
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                    // 取消时仍返回已捕获的部分输出（status 可能因 wait 失败而为 None），
+                    // 让上层能把「被取消前已经产生的输出」交给模型，而不是只给一句 cancelled。
+                    return Ok(CommandRunResult {
+                        status: killed_status,
+                        stdout: stdout_buf,
+                        stderr: stderr_buf,
+                        timed_out: false,
+                        cancelled: true,
+                    });
                 }
                 if Instant::now() >= deadline {
                     // 超时：同样杀掉整个进程组，避免后台进程继续持有管道。
                     terminate_child(&mut child);
-                    let _ = child.wait();
+                    let killed_status = child.wait().ok();
                     drain_channel(
                         &rx,
                         &mut stdout_buf,
@@ -539,7 +579,15 @@ where
                         &mut on_chunk,
                         DRAIN_GRACE,
                     );
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout"));
+                    // 超时仍返回已捕获的部分输出（典型：长构建/测试被杀前已打印的进度与
+                    // 错误），让模型能据此判断下一步，而不是只看到一个无信息的 "timeout"。
+                    return Ok(CommandRunResult {
+                        status: killed_status,
+                        stdout: stdout_buf,
+                        stderr: stderr_buf,
+                        timed_out: true,
+                        cancelled: false,
+                    });
                 }
                 match rx.recv_timeout(Duration::from_millis(20)) {
                     Ok((kind, chunk)) => accumulate_chunk(
@@ -572,10 +620,12 @@ where
         on_background_group(pgid);
     }
 
-    Ok(Output {
-        status,
+    Ok(CommandRunResult {
+        status: Some(status),
         stdout: stdout_buf,
         stderr: stderr_buf,
+        timed_out: false,
+        cancelled: false,
     })
 }
 
@@ -623,7 +673,7 @@ pub fn run_cmd(command: &str) -> io::Result<String> {
 mod tests {
     use super::{
         RunCmdOptions, run_cmd, run_cmd_output, run_cmd_output_streaming_with_timeout,
-        should_use_shell,
+        run_cmd_output_streaming_with_timeout_tracked, should_use_shell,
     };
     use std::time::{Duration, Instant};
 
@@ -725,6 +775,26 @@ mod tests {
     }
 
     #[test]
+    fn test_tracked_timeout_preserves_partial_output() {
+        #[cfg(unix)]
+        {
+            let result = run_cmd_output_streaming_with_timeout_tracked(
+                "printf 'before-timeout\\n'; sleep 5",
+                RunCmdOptions::default(),
+                Duration::from_millis(200),
+                |_| {},
+                || false,
+                |_| {},
+            )
+            .expect("tracked timeout should return its partial result");
+
+            assert!(result.timed_out);
+            assert!(!result.cancelled);
+            assert!(String::from_utf8_lossy(&result.stdout).contains("before-timeout"));
+        }
+    }
+
+    #[test]
     fn test_returns_promptly_when_command_backgrounds_a_long_lived_process() {
         // 回归：前台命令结束、但后台派生进程继承了 stdout/stderr 管道。
         // 旧实现会 join 永不退出的读取线程而死锁；新实现应在宽限期后返回。
@@ -770,7 +840,7 @@ mod tests {
             )
             .expect("should return without hanging");
 
-            assert!(output.status.success());
+            assert!(output.status.unwrap().success());
             assert_eq!(reported.len(), 1, "expected exactly one surviving group");
             let pgid = reported[0];
             assert!(pgid > 0);
@@ -799,7 +869,7 @@ mod tests {
             )
             .expect("should succeed");
 
-            assert!(output.status.success());
+            assert!(output.status.unwrap().success());
             assert!(
                 reported.is_empty(),
                 "clean foreground command should not report a surviving group, got {reported:?}"

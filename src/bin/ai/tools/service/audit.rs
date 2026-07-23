@@ -989,6 +989,71 @@ fn paren_follows_escaped_dollar(bytes: &[u8], i: usize) -> bool {
     backslashes % 2 == 1
 }
 
+/// 查找 shell 结构中与 `open_idx` 处左括号配对的右括号。
+/// 引号内和反斜杠转义后的括号按字面量处理。
+fn find_matching_shell_paren(command: &str, open_idx: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    if bytes.get(open_idx) != Some(&b'(') {
+        return None;
+    }
+
+    let mut depth = 1_u32;
+    let mut i = open_idx + 1;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && !in_single {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if b == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_backtick {
+            if b == b'`' {
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'`' => in_backtick = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// 检查命令字符串中是否存在不安全的 shell 注入面。
 ///
 /// 本函数是 **shell-specific** 的安全检查，只应对经 shell 解释执行的命令
@@ -996,9 +1061,8 @@ fn paren_follows_escaped_dollar(bytes: &[u8], i: usize) -> bool {
 /// `apply_patch` 等纯字符串操作），不应应用本检查——它们是直接写入文件系统
 /// 或做文本替换，不会把参数喂给 shell 解释，`<<` / `$()` 只是普通文本。
 ///
-/// 拦截那些不被分段化策略覆盖的注入面：命令替换
-///（`$(...)` / `` `...` ``）、进程替换。它们在正当 dev 工作流里几乎不出现，但可以一举绕过任何
-/// program/参数级黑名单（典型样例：`$(echo rm) -rf /tmp/foo`）。
+/// 命令替换（`$(...)` / `` `...` ``）可能在运行时生成 program 名，继续禁止。
+/// 进程替换 `<(...)` / `>(...)` 则递归校验内部命令后放行，避免误伤 diff/sort 等常见用法。
 fn validate_no_injection_surface(command: &str) -> Result<(), String> {
     let bytes = command.as_bytes();
     let mut i = 0;
@@ -1089,9 +1153,17 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
                     .to_string(),
             );
         }
-        // 进程替换 `<(...)` / `>(...)` 只在引号外有 shell 语义。
+        // 进程替换 `<(...)` / `>(...)` 只在引号外有 shell 语义。递归校验其中的完整
+        // 命令，而不是无差别禁止；这样安全命令可用，`<(rm ...)` 等仍会被原有规则拦截。
         if !in_double && (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
-            return Err("process substitution `<(...)` / `>(...)` is not allowed".to_string());
+            let close = find_matching_shell_paren(command, i + 1).ok_or_else(|| {
+                "unterminated process substitution `<(...)` / `>(...)`".to_string()
+            })?;
+            let inner = command[i + 2..close].trim();
+            validate_execute_command(inner)
+                .map_err(|reason| format!("unsafe process substitution: {reason}"))?;
+            i = close + 1;
+            continue;
         }
         // 未引用的 `(` / `)` / `{` / `}` 开启子 shell 或命令分组（如 `(rm -rf /tmp)`、
         // `{ rm -rf /tmp; }`），会绕过分段黑名单验证。
@@ -1142,31 +1214,47 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
 // 分段级校验入口
 // ---------------------------------------------------------------------------
 
-/// 将单个路径参数中的 `~` 展开为 `$HOME`，`$HOME` 展开为实际路径。
-/// 返回展开后的路径；若展开后的绝对路径不在 base_dir 内，返回 Err。
-fn expand_tilde_and_home(arg: &str, base_dir: &std::path::Path) -> Result<String, String> {
-    let expanded = if let Some(rest) = arg.strip_prefix("~/").or_else(|| arg.strip_prefix('~')) {
-        let home = std::env::var("HOME")
-            .map_err(|_| "cannot expand ~: HOME environment variable not set".to_string())?;
-        if rest.is_empty() {
-            home
-        } else {
-            format!("{home}/{rest}")
+fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
         }
-    } else if let Some(rest) = arg.strip_prefix("$HOME/") {
-        let home = std::env::var("HOME")
-            .map_err(|_| "cannot expand $HOME: HOME environment variable not set".to_string())?;
-        format!("{home}/{rest}")
+    }
+    normalized
+}
+
+/// 展开参数开头的 `~` / `$HOME`。home 本身及其子路径属于正常开发访问；仅拒绝
+/// 通过 `..` 从 home 目录向外逃逸。`~other` 不在 shell 的当前用户 home 语义内，
+/// 留给 shell 自身处理。
+fn expand_tilde_and_home(arg: &str) -> Result<String, String> {
+    let home = if arg == "~" || arg.starts_with("~/") {
+        std::env::var("HOME")
+            .map_err(|_| "cannot expand ~: HOME environment variable not set".to_string())?
+    } else if arg == "$HOME" || arg.starts_with("$HOME/") {
+        std::env::var("HOME")
+            .map_err(|_| "cannot expand $HOME: HOME environment variable not set".to_string())?
     } else {
         return Ok(arg.to_string());
     };
-
-    let resolved = std::path::PathBuf::from(&expanded);
-    if resolved.starts_with(base_dir) {
+    let rest = arg
+        .strip_prefix("~/")
+        .or_else(|| arg.strip_prefix("$HOME/"));
+    let expanded = rest.map_or_else(|| home.clone(), |rest| format!("{home}/{rest}"));
+    let home = normalize_path(std::path::Path::new(&home));
+    let resolved = normalize_path(std::path::Path::new(&expanded));
+    if resolved.starts_with(&home) {
         Ok(expanded)
     } else {
         Err(format!(
-            "command references path {arg} (resolves to {expanded}) which is outside the current workspace"
+            "command references path {arg} (resolves to {}) which escapes the home directory",
+            resolved.display()
         ))
     }
 }
@@ -1202,33 +1290,14 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
     // 后续所有比较统一使用 basename，确保 `/bin/rm` 与 `rm` 被同等对待。
     let program = program_basename;
     let extra_blocked = config_blocked_commands();
-    let normalize_path = |path: &std::path::Path| {
-        let mut normalized = std::path::PathBuf::new();
-        for component in path.components() {
-            match component {
-                std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-                std::path::Component::RootDir => normalized.push(component.as_os_str()),
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
-                    normalized.pop();
-                }
-                std::path::Component::Normal(part) => normalized.push(part),
-            }
-        }
-        normalized
-    };
-
     // ---- tilde / $HOME 逃逸检测 ----
-    // 在所有程序级检查之前，解析参数中的 `~` 和 `$HOME`，拒绝逃逸出工作目录的路径。
+    // home 与其子路径可正常访问；仅拒绝 `~/..` / `$HOME/..` 向外逃逸。
     {
-        let base_dir = crate::ai::driver::runtime_ctx::effective_cwd()
-            .map_err(|err| format!("failed to resolve current directory: {err}"))?;
-        let base_dir = normalize_path(&base_dir);
         for token in raw_command_tokens.iter().skip(1) {
             if token.starts_with('-') {
                 continue;
             }
-            expand_tilde_and_home(token, &base_dir)?;
+            expand_tilde_and_home(token)?;
         }
     }
 
@@ -1575,8 +1644,15 @@ mod tests {
     }
 
     #[test]
-    fn injection_blocks_process_substitution() {
-        assert!(validate_no_injection_surface("diff <(echo a) <(echo b)").is_err());
+    fn injection_allows_validated_process_substitution() {
+        assert!(validate_no_injection_surface("diff <(echo a) <(echo b)").is_ok());
+        assert!(validate_no_injection_surface("cat <(printf '%s' ok)").is_ok());
+    }
+
+    #[test]
+    fn injection_blocks_unsafe_or_unterminated_process_substitution() {
+        assert!(validate_no_injection_surface("cat <(rm -rf target)").is_err());
+        assert!(validate_no_injection_surface("cat <(echo missing").is_err());
     }
 
     #[test]
@@ -1827,6 +1903,13 @@ mod tests {
     }
 
     // ---- tilde / $HOME 逃逸检测 ----
+
+    #[test]
+    fn home_paths_are_allowed() {
+        assert!(validate("ls ~").is_ok());
+        assert!(validate("cat ~/.gitconfig").is_ok());
+        assert!(validate("cat $HOME/.cargo/config.toml").is_ok());
+    }
 
     #[test]
     fn tilde_escape_to_parent_dir_blocked() {

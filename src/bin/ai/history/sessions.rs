@@ -20,6 +20,8 @@ use super::{
     types::Message,
 };
 
+const MAX_SESSION_ID_BYTES: usize = 128;
+
 /// 递归复制目录树 `src` -> `dst`（`dst` 不应已存在）。
 /// fork_session 时用于完整复制 assets 目录：checkpoint 正文位于嵌套目录中，
 /// 浅复制会让 fork 后的 marker 指向缺失文件。
@@ -67,6 +69,27 @@ impl SessionStore {
         &self.root
     }
 
+    /// 会话 ID 会成为持久化路径的一部分，调用方必须先拒绝非法输入，不能静默改写。
+    pub(in crate::ai) fn validate_session_id(session_id: &str) -> io::Result<()> {
+        if session_id.is_empty()
+            || session_id.len() > MAX_SESSION_ID_BYTES
+            || !session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session id must contain 1-128 ASCII letters, digits, '-' or '_'",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(in crate::ai) fn session_exists(&self, session_id: &str) -> io::Result<bool> {
+        Self::validate_session_id(session_id)?;
+        Ok(self.session_history_file(session_id).is_file())
+    }
+
     pub(in crate::ai) fn session_history_file(&self, session_id: &str) -> PathBuf {
         let id = sanitize_session_id(session_id);
         self.root.join(format!("{id}.sqlite"))
@@ -106,13 +129,17 @@ impl SessionStore {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
+            let id = stem.to_string();
+            // 忽略旧版本或外部写入留下的不合法文件名，避免它们重新进入可选 session 集合。
+            if Self::validate_session_id(&id).is_err() {
+                continue;
+            }
             let metadata = match entry.metadata() {
                 Ok(v) => v,
                 Err(_) => continue,
             };
             let modified_local = metadata.modified().ok().map(DateTime::<Local>::from);
             let first_user_prompt = read_first_user_prompt_sqlite(&path).unwrap_or(None);
-            let id = stem.to_string();
             // 优先使用 LLM 生成的标题（存储在 meta 表中），fallback 到首条消息摘要
             let generated_title = read_session_title_sqlite(&path).unwrap_or(None);
             let summary = generated_title
@@ -129,12 +156,13 @@ impl SessionStore {
             let timestamp = modified_local
                 .map(|dt| dt.timestamp_millis() as u64)
                 .unwrap_or(0);
+            let size_bytes = self.session_size_bytes(&path, &id)?;
             sessions.insert(
                 (timestamp, id.clone()),
                 SessionInfo {
                     id,
                     modified_local,
-                    size_bytes: metadata.len(),
+                    size_bytes,
                     first_user_prompt,
                     summary,
                 },
@@ -143,7 +171,22 @@ impl SessionStore {
         Ok(sessions.into_iter().map(|(_, v)| v).collect())
     }
 
+    fn session_size_bytes(&self, sqlite_path: &Path, session_id: &str) -> io::Result<u64> {
+        let mut total = file_size_if_exists(sqlite_path)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            total = total.saturating_add(file_size_if_exists(&PathBuf::from(format!(
+                "{}{}",
+                sqlite_path.display(),
+                suffix
+            )))?);
+        }
+        total = total.saturating_add(directory_size(&self.session_assets_dir(session_id))?);
+        total = total.saturating_add(directory_size(&self.checkpoints_dir(session_id))?);
+        Ok(total)
+    }
+
     pub(in crate::ai) fn delete_session(&self, session_id: &str) -> io::Result<bool> {
+        Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
         let assets = self.session_assets_dir(session_id);
         let checkpoints = self.checkpoints_dir(session_id);
@@ -157,6 +200,7 @@ impl SessionStore {
     }
 
     pub(in crate::ai) fn clear_session(&self, session_id: &str) -> io::Result<()> {
+        Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
         let assets = self.session_assets_dir(session_id);
         let checkpoints = self.checkpoints_dir(session_id);
@@ -169,6 +213,7 @@ impl SessionStore {
     }
 
     pub(in crate::ai) fn clear_session_history(&self, session_id: &str) -> io::Result<()> {
+        Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
         let assets = self.session_assets_dir(session_id);
         let checkpoints = self.checkpoints_dir(session_id);
@@ -184,6 +229,7 @@ impl SessionStore {
 
     /// 在读取 live session 前恢复被中断的 checkpoint rollback 事务。
     pub(in crate::ai) fn recover_checkpoint_state(&self, session_id: &str) -> io::Result<()> {
+        Self::validate_session_id(session_id)?;
         super::checkpoint::CheckpointStore::from_session_paths(
             self.session_history_file(session_id),
             self.session_assets_dir(session_id),
@@ -219,6 +265,7 @@ impl SessionStore {
     }
 
     pub(in crate::ai) fn first_user_prompt(&self, session_id: &str) -> io::Result<Option<String>> {
+        Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
         if !path.exists() {
             return Ok(None);
@@ -230,6 +277,7 @@ impl SessionStore {
     /// 用于交互模式下用户直接 Ctrl+C 退出时清理空 session。
     /// 文件不存在或 messages 表中没有 role='user' 的记录均视为空。
     pub(in crate::ai) fn is_empty_session(&self, session_id: &str) -> io::Result<bool> {
+        Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
         if !path.exists() {
             return Ok(true);
@@ -240,6 +288,7 @@ impl SessionStore {
 
     /// 读取 LLM 生成的 session 标题。
     pub(in crate::ai) fn read_session_title(&self, session_id: &str) -> io::Result<Option<String>> {
+        Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
         if !path.exists() {
             return Ok(None);
@@ -253,6 +302,7 @@ impl SessionStore {
         session_id: &str,
         title: &str,
     ) -> io::Result<()> {
+        Self::validate_session_id(session_id)?;
         write_session_title_sqlite(&self.session_history_file(session_id), title)
     }
 
@@ -262,6 +312,7 @@ impl SessionStore {
     }
 
     pub(in crate::ai) fn read_all_messages(&self, session_id: &str) -> io::Result<Vec<Message>> {
+        Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
         if !path.exists() {
             return Ok(Vec::new());
@@ -277,6 +328,8 @@ impl SessionStore {
         dst: &str,
         after_fork: impl FnOnce(&Path) -> io::Result<T>,
     ) -> io::Result<T> {
+        Self::validate_session_id(src)?;
+        Self::validate_session_id(dst)?;
         let src_path = self.session_history_file(src);
         let dst_path = self.session_history_file(dst);
         let src_assets = self.session_assets_dir(src);
@@ -330,16 +383,16 @@ impl SessionStore {
         self.fork_session_with(src, dst, |_| Ok(()))
     }
 
-    /// 在 `src` 之上分支，并把分支保留到第 `keep_messages` 条消息（按 id 升序）。
+    /// 在 `src` 之上分支，并保留前 `keep_turns` 个完整用户 turn。
     /// 适合"我想从某轮回滚后换个方向继续"的场景。
     pub(in crate::ai) fn branch_session(
         &self,
         src: &str,
         dst: &str,
-        keep_messages: usize,
+        keep_turns: usize,
     ) -> io::Result<()> {
         self.fork_session_with(src, dst, |dst_path| {
-            super::sqlite::truncate_messages_sqlite(dst_path, keep_messages)
+            super::sqlite::truncate_messages_to_user_turns_sqlite(dst_path, keep_turns)
         })
     }
 
@@ -348,6 +401,7 @@ impl SessionStore {
         session_id: &str,
         output_path: &Path,
     ) -> io::Result<()> {
+        Self::validate_session_id(session_id)?;
         let messages = self.read_all_messages(session_id)?;
         if messages.is_empty() {
             return Err(io::Error::new(
@@ -379,6 +433,7 @@ impl SessionStore {
         session_id: &str,
         output_path: &Path,
     ) -> io::Result<()> {
+        Self::validate_session_id(session_id)?;
         let sqlite_path = self.session_history_file(session_id);
         let checkpoints = self.checkpoints_dir(session_id);
         super::checkpoint::with_checkpoint_lock(&checkpoints, || {
@@ -442,9 +497,12 @@ impl SessionStore {
         archive_path: &Path,
         dst_id: &str,
     ) -> io::Result<String> {
+        Self::validate_session_id(dst_id)?;
         let file = File::open(archive_path)?;
         let mut archive =
             zip::ZipArchive::new(file).map_err(|e| io::Error::other(e.to_string()))?;
+
+        validate_archive_entries(&mut archive)?;
 
         // 读取 manifest（可选，仅用于校验）
         let manifest = {
@@ -490,11 +548,19 @@ impl SessionStore {
                     if name == "manifest.json" || name == "session.sqlite" {
                         continue;
                     }
-                    // 只处理 assets/ 前缀的条目
-                    let Some(rel) = name.strip_prefix("assets/") else {
-                        continue;
-                    };
-                    if rel.is_empty() || rel.ends_with('/') {
+                    let rel = entry.enclosed_name().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsafe archive entry: {name}"),
+                        )
+                    })?;
+                    let rel = rel.strip_prefix("assets").map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected archive entry: {name}"),
+                        )
+                    })?;
+                    if rel.as_os_str().is_empty() {
                         continue;
                     }
                     let out_path = dst_assets.join(rel);
@@ -519,6 +585,99 @@ impl SessionStore {
             result
         })
     }
+}
+
+/// 校验归档布局，且在创建目标文件前拒绝 Zip Slip、重复 SQLite 和未知条目。
+fn validate_archive_entries(archive: &mut zip::ZipArchive<File>) -> io::Result<()> {
+    let mut session_sqlite_count = 0usize;
+    let mut manifest_count = 0usize;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let name = entry.name().to_string();
+        match name.as_str() {
+            "session.sqlite" => {
+                if entry.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "session.sqlite must be a file",
+                    ));
+                }
+                session_sqlite_count += 1;
+            }
+            "manifest.json" => {
+                if entry.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "manifest.json must be a file",
+                    ));
+                }
+                manifest_count += 1;
+            }
+            _ => {
+                let enclosed_name = entry.enclosed_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsafe archive entry: {name}"),
+                    )
+                })?;
+                let relative = enclosed_name.strip_prefix("assets").map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected archive entry: {name}"),
+                    )
+                })?;
+                if relative.as_os_str().is_empty() && !entry.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "assets entry must be a directory",
+                    ));
+                }
+            }
+        }
+    }
+    if session_sqlite_count != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive must contain exactly one session.sqlite",
+        ));
+    }
+    if manifest_count > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive must not contain duplicate manifest.json entries",
+        ));
+    }
+    Ok(())
+}
+
+fn file_size_if_exists(path: &Path) -> io::Result<u64> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
+    }
+}
+
+/// 统计目录内常规文件的字节数；符号链接不跟随，避免显示尺寸时产生循环或越界读取。
+fn directory_size(path: &Path) -> io::Result<u64> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut total = 0u64;
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            total = total.saturating_add(directory_size(&entry.path())?);
+        } else if file_type.is_file() {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
 }
 
 fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
@@ -1095,6 +1254,82 @@ mod tests {
         );
 
         let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn session_ids_reject_path_separators_and_silent_normalization() {
+        for session_id in ["", "../other", "has space", "name/slash", "名字"] {
+            assert!(SessionStore::validate_session_id(session_id).is_err());
+        }
+        assert!(SessionStore::validate_session_id("safe_session-123").is_ok());
+    }
+
+    #[test]
+    fn archive_import_rejects_zip_slip_before_creating_session_files() {
+        use std::io::Write;
+
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let archive_path = std::env::temp_dir().join(format!(
+            "ai-session-malicious-archive-{}.zip",
+            uuid::Uuid::new_v4()
+        ));
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("session.sqlite", options).unwrap();
+        zip.write_all(b"not reached: archive validation must fail first")
+            .unwrap();
+        zip.start_file("assets/../../escaped.txt", options).unwrap();
+        zip.write_all(b"malicious").unwrap();
+        zip.finish().unwrap();
+
+        let error = store
+            .import_session_archive(&archive_path, "imported")
+            .expect_err("Zip Slip archive must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!store.session_history_file("imported").exists());
+        assert!(!store.session_assets_dir("imported").exists());
+
+        let _ = fs::remove_file(archive_path);
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn listed_session_size_includes_assets_and_checkpoints() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let session_id = "sized";
+        let sqlite_path = store.session_history_file(session_id);
+        append_history_messages(
+            &sqlite_path,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("size me".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        let assets_dir = store.session_assets_dir(session_id);
+        let checkpoints_dir = store.checkpoints_dir(session_id);
+        fs::create_dir_all(&assets_dir).unwrap();
+        fs::create_dir_all(&checkpoints_dir).unwrap();
+        fs::write(assets_dir.join("asset.bin"), b"assets").unwrap();
+        fs::write(checkpoints_dir.join("checkpoint.bin"), b"checkpoints").unwrap();
+
+        let listed = store.list_sessions().unwrap();
+        let session = listed
+            .iter()
+            .find(|session| session.id == session_id)
+            .unwrap();
+        let expected_minimum = fs::metadata(&sqlite_path).unwrap().len()
+            + b"assets".len() as u64
+            + b"checkpoints".len() as u64;
+        assert!(session.size_bytes >= expected_minimum);
+
         let _ = fs::remove_dir_all(store.sessions_root());
     }
 }

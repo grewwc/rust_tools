@@ -19,7 +19,7 @@ pub(crate) fn run_command_streaming<F>(
     cwd: Option<&str>,
     timeout_secs: u64,
     on_chunk: F,
-) -> Result<Output, String>
+) -> Result<crate::cmd::run::CommandRunResult, String>
 where
     F: FnMut(&[u8]),
 {

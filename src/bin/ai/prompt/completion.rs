@@ -314,26 +314,7 @@ impl CommandCompleter {
     }
 
     fn session_subcommands() -> &'static [&'static str] {
-        &[
-            "help",
-            "list",
-            "current",
-            "new",
-            "use",
-            "suspend",
-            "bound",
-            "delete",
-            "clear-bound",
-            "clear-history",
-            "clear-all",
-            "dump-history",
-            "dump",
-            "export",
-            "export-current",
-            "export-last",
-            "fork",
-            "branch",
-        ]
+        crate::ai::driver::commands::session::CANONICAL_SESSION_SUBCOMMANDS
     }
 
     fn persona_subcommands() -> &'static [&'static str] {
@@ -361,7 +342,6 @@ impl CommandCompleter {
             "system",
             "grep",
             "rewind",
-            "undo",
             "export",
             "copy",
             "last",
@@ -1002,7 +982,7 @@ mod tests {
             .unwrap();
 
         assert!(pairs.iter().any(|pair| pair.replacement == "rewind"));
-        assert!(pairs.iter().any(|pair| pair.replacement == "undo"));
+        assert!(!pairs.iter().any(|pair| pair.replacement == "undo"));
         assert!(pairs.iter().any(|pair| pair.replacement == "last"));
     }
 
