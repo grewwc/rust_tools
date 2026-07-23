@@ -237,6 +237,9 @@ pub(super) fn ensure_runtime_manifests_loaded(
     }
 
     *skill_manifests = Arc::new(load_skill_manifests(app.cli.no_skills));
+    crate::ai::prompt::completion::CommandCompleter::set_skill_manifests(
+        skill_manifests.as_slice(),
+    );
     *agent_manifests = Arc::new(agents::load_all_agents());
 
     if !skill_manifests.is_empty() {
