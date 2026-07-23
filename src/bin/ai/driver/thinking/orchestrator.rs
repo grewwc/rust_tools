@@ -392,8 +392,8 @@ impl ThinkingOrchestrator {
     // ── P3: 上下文预算感知的委派提醒 ──────────────────────────────
     //
     // 当对话已经很长（turn_index 超过阈值）且 agent 拥有 task_spawn 工具时，
-    // 注入一条提醒，鼓励把剩余独立子任务委派给 subagent，避免主 agent 上下文
-    // 继续膨胀导致注意力分散和 token 浪费。
+    // 注入一条提醒：仅把边界清晰且有净收益的独立分支委派给 subagent，避免主 agent
+    // 上下文继续膨胀导致注意力分散和 token 浪费，也避免为并发而无效扇出。
     const CONTEXT_BUDGET_TURN_THRESHOLD: usize = 12;
 
     fn build_context_budget_nudge(
@@ -410,9 +410,10 @@ impl ThinkingOrchestrator {
         Some(format!(
             "[Context Budget] This conversation has been going for {}+ turns. \
              Your context is growing large, which can disperse attention and waste tokens. \
-             If the remaining work has independent sub-parts, delegate them to subagents \
-             via task_spawn so each sub-task gets its own focused context. \
-             Reserve your context for orchestration and synthesis.",
+             If the remaining work contains focused, independent, bounded sub-parts whose expected \
+             latency or context benefit outweighs handoff and synthesis overhead, delegate only those \
+             via task_spawn so each sub-task gets its own focused context. Do not delegate merely \
+             because the conversation is long. Reserve your context for orchestration and synthesis.",
             turn_index,
         ))
     }
@@ -1030,8 +1031,10 @@ mod tests {
         let tools = vec!["task_spawn".to_string()];
         // 低于阈值 → 不注入
         assert!(orch.build_context_budget_nudge(5, &tools).is_none());
-        // 达到阈值且拥有 task_spawn → 注入
-        assert!(orch.build_context_budget_nudge(15, &tools).is_some());
+        // 达到阈值且拥有 task_spawn → 注入，但仍保留有净收益的委派门槛。
+        let nudge = orch.build_context_budget_nudge(15, &tools).unwrap();
+        assert!(nudge.contains("context benefit outweighs handoff and synthesis overhead"));
+        assert!(nudge.contains("Do not delegate merely because the conversation is long"));
         // 达到阈值但没有 task_spawn → 不注入
         assert!(orch.build_context_budget_nudge(15, &[]).is_none());
     }

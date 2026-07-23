@@ -1020,7 +1020,7 @@ fn build_system_prompt(
         if has_tool(available_tools, "plan") {
             lines.push("Simple tasks: act directly. Complex ones: call `plan` first.".to_string());
             if has_tool(available_tools, "task_spawn") {
-                lines.push("When planning, identify steps that are independent and can be delegated to subagents in parallel - mark them with `delegate: true` in the plan. `delegate: true` implies `parallelizable: true` (delegation is inherently async); set `parallelizable: true` explicitly only for parallel steps that you will execute yourself.".to_string());
+                lines.push("When planning, mark `delegate: true` only for independent steps whose expected benefit outweighs handoff and synthesis overhead. `delegate: true` implies `parallelizable: true` (delegation is inherently async); set `parallelizable: true` explicitly only for parallel steps that you will execute yourself.".to_string());
             }
         }
         if has_tool(available_tools, "spawn_process") {
@@ -1097,11 +1097,11 @@ fn build_system_prompt(
     {
         let mut lines = Vec::new();
         if has_tool(available_tools, "task_spawn") {
-            lines.push("Use `task_spawn` to launch a subagent task and fan out parallel independent subtasks.".to_string());
-            lines.push("If N subtasks have no data dependency, spawn ALL of them in the same response (multiple task_spawn calls in one turn), then a single task_wait. Do NOT spawn-wait-spawn-wait serially.".to_string());
-            lines.push("Delegate when there are multiple independent, non-trivial work streams and parallel execution is likely to reduce latency or main-agent context pressure. A subtask does not need to be complex on its own when several branches can be investigated concurrently.".to_string());
-            lines.push("Do not delegate simple tasks, single-file localized changes, strongly sequential work, or work you can finish directly with a few tool calls.".to_string());
-            lines.push("Delegation test: ask whether the work can run independently and whether delegation is likely to reduce latency or context pressure. When both are plausible, delegate; certainty is not required.".to_string());
+            lines.push("Use `task_spawn` only for focused, independent work where delegation has a clear net benefit; for multiple qualifying subtasks, fan them out in parallel.".to_string());
+            lines.push("Qualify a subtask only when it has a distinct, bounded goal, can proceed without another branch's result, and is substantial enough that its expected latency or context benefit outweighs handoff and synthesis overhead.".to_string());
+            lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in the same response (multiple `task_spawn` calls in one turn), then use a single `task_wait`. Do NOT spawn-wait-spawn-wait serially.".to_string());
+            lines.push("Do not delegate merely to create parallelism. Keep simple tasks, single-file localized changes, tightly coupled or overlapping work, strongly sequential work, and work you can finish directly with a few tool calls in the parent.".to_string());
+            lines.push("Delegation check: delegate only if the subtask is independent, bounded, and has a clear net benefit. If any condition is weak or unclear, keep it in the parent; do not create speculative or duplicate subagents.".to_string());
         }
         if has_tool(available_tools, "task_wait") {
             lines.push("Use `task_wait` to collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.".to_string());
@@ -1751,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_encourages_bounded_parallel_delegation() {
+    fn system_prompt_uses_criterion_based_parallel_delegation() {
         let mut available = SkipSet::new(16);
         available.insert("task_spawn".to_string());
         available.insert("task_wait".to_string());
@@ -1761,14 +1761,18 @@ mod tests {
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
 
-        // 多个独立、非琐碎分支应允许积极并行，但仍禁止琐碎任务滥用子 agent。
-        assert!(prompt.contains("multiple independent, non-trivial work streams"));
-        assert!(prompt.contains("does not need to be complex on its own"));
-        assert!(prompt.contains("latency or main-agent context pressure"));
-        assert!(prompt.contains("Do not delegate simple tasks"));
-        assert!(prompt.contains("certainty is not required"));
-        assert!(!prompt.contains("genuinely complex"));
-        assert!(!prompt.contains("both answers are yes"));
+        // 并行仅适用于有净收益、边界清晰且互不依赖的工作，不能为并发而委派。
+        assert!(
+            prompt.contains("focused, independent work where delegation has a clear net benefit")
+        );
+        assert!(prompt.contains("distinct, bounded goal"));
+        assert!(
+            prompt.contains("latency or context benefit outweighs handoff and synthesis overhead")
+        );
+        assert!(prompt.contains("Do not delegate merely to create parallelism"));
+        assert!(prompt.contains("tightly coupled or overlapping work"));
+        assert!(prompt.contains("If any condition is weak or unclear, keep it in the parent"));
+        assert!(!prompt.contains("certainty is not required"));
     }
 
     #[test]

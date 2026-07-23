@@ -10,6 +10,7 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::{Backend, ClearType as BackendClearType, CrosstermBackend},
+    buffer::CellDiffOption,
     layout::Position,
 };
 use tui_textarea::TextArea;
@@ -160,6 +161,30 @@ fn clear_reflowed_inline_viewport<B: Backend>(
     terminal.backend_mut().flush()
 }
 
+/// 强制当前帧的所有单元格写回终端。
+///
+/// 某些 inline viewport 场景下，终端画面可能残留一个已删除字符，但 ratatui 的上一帧
+/// buffer 已经认为该位置是空白，常规 diff 因而不会再次输出空格。仅在输入内容缩短后的
+/// 下一帧使用 `AlwaysUpdate`，既能擦掉这种残影，也避免每帧全量重绘。
+fn force_frame_repaint(frame: &mut ratatui::Frame<'_>) {
+    let area = frame.area();
+    let buffer = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            buffer[(x, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+    }
+}
+
+fn textarea_logical_char_count(textarea: &TextArea<'_>) -> usize {
+    textarea
+        .lines()
+        .iter()
+        .map(|line| line.chars().count())
+        .sum::<usize>()
+        .saturating_add(textarea.lines().len().saturating_sub(1))
+}
+
 fn submitted_input_preview_lines(content: &str) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut lines = content.lines();
@@ -237,6 +262,8 @@ impl PromptEditor {
             // 面板出现/消失/候选数变化时，据此重建 viewport 让面板获得足够高度，
             // 而输入框行数保持不变。
             let mut fitted_completion_items: Option<usize> = None;
+            // 输入缩短时强制写回一帧，清除 ratatui buffer 与真实终端失同步留下的字符。
+            let mut force_repaint_next_frame = false;
 
             loop {
                 // 首轮 user message 落盘后，session 标题会在后台生成。输入框已经打开时
@@ -290,6 +317,7 @@ impl PromptEditor {
                     }
                 }
 
+                let force_repaint = force_repaint_next_frame;
                 terminal
                     .draw(|f| {
                         let area = f.area();
@@ -302,8 +330,12 @@ impl PromptEditor {
                             &self.current_model_label,
                             self.session_topic.as_deref(),
                         );
+                        if force_repaint {
+                            force_frame_repaint(f);
+                        }
                     })
                     .map_err(|e| io::Error::other(e.to_string()))?;
+                force_repaint_next_frame = false;
 
                 if !event::poll(Duration::from_millis(250))
                     .map_err(|e| io::Error::other(e.to_string()))?
@@ -321,6 +353,7 @@ impl PromptEditor {
                     continue;
                 }
 
+                let previous_input_len = textarea_logical_char_count(&textarea);
                 match handle_multiline_event(
                     event,
                     &mut textarea,
@@ -331,7 +364,10 @@ impl PromptEditor {
                     &mut recent_text_input,
                     &self.session_image_dir,
                 )? {
-                    EventLoopAction::Continue => {}
+                    EventLoopAction::Continue => {
+                        force_repaint_next_frame =
+                            textarea_logical_char_count(&textarea) < previous_input_len;
+                    }
                     EventLoopAction::Submit(result) => break Ok(result),
                 }
             }
@@ -376,14 +412,32 @@ mod tests {
     use ratatui::{
         Terminal,
         backend::{Backend, TestBackend},
+        buffer::Cell,
         layout::Position,
         widgets::Paragraph,
     };
 
     use super::{
-        clear_and_reanchor_inline_viewport, clear_reflowed_inline_viewport,
+        clear_and_reanchor_inline_viewport, clear_reflowed_inline_viewport, force_frame_repaint,
         multiline_viewport_height, submitted_input_preview_lines, viewport_height_with_completion,
     };
+
+    #[test]
+    fn forced_repaint_clears_character_missing_from_ratatui_back_buffer() {
+        let backend = TestBackend::new(4, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|_| {}).unwrap();
+
+        // 模拟真实终端仍显示字符、而 ratatui 上一帧 buffer 已认为该位置为空白。
+        let slash = Cell::new("/");
+        terminal
+            .backend_mut()
+            .draw(std::iter::once((0, 0, &slash)))
+            .unwrap();
+        terminal.draw(|frame| force_frame_repaint(frame)).unwrap();
+
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+    }
 
     #[test]
     fn clear_reflowed_viewport_uses_cursor_relative_top_and_restores_cursor() {
