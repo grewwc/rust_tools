@@ -9,7 +9,6 @@ use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::common::ToolStreamWriter;
 use crate::ai::tools::common::ToolStreamingRegistration;
 use crate::ai::tools::storage::file_store::FileStore;
-use crate::ai::tools::undo_tools::{CompletedFileChange, record_completed_change_set};
 
 fn params_apply_patch() -> Value {
     serde_json::json!({
@@ -1653,18 +1652,6 @@ fn commit_patch_writes(writes: &[PreparedPatchWrite]) -> Result<(), String> {
         }
     }
 
-    let changes = writes
-        .iter()
-        .map(|write| CompletedFileChange {
-            path: write.path.to_string_lossy().into_owned(),
-            before: write.before.clone(),
-            after: match &write.action {
-                PreparedPatchAction::Write(next) => Some(next.clone()),
-                PreparedPatchAction::Delete => None,
-            },
-        })
-        .collect();
-    record_completed_change_set(&format!("apply_patch ({} file(s))", writes.len()), changes);
     Ok(())
 }
 
@@ -3190,35 +3177,6 @@ mod tests {
 
         assert!(result.starts_with("Dry run succeeded; no files changed:"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn execute_apply_patch_delete_file_can_be_undone_and_redone() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let path = make_temp_path("delete_file");
-        let base = path.parent().unwrap().to_path_buf();
-        fs::create_dir_all(&base).unwrap();
-        fs::write(&path, "important\n").unwrap();
-
-        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
-            execute_apply_patch(&serde_json::json!({
-                "patch": format!(
-                    "*** Begin Patch\n*** Delete File: {}\n*** End Patch\n",
-                    path.display()
-                ),
-            }))
-            .expect("Delete File should succeed");
-        });
-        assert!(!path.exists());
-
-        crate::ai::tools::undo_tools::execute_undo(&serde_json::json!({ "count": 1 }))
-            .expect("delete should be undoable");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "important\n");
-
-        crate::ai::tools::undo_tools::execute_redo(&serde_json::json!({ "count": 1 }))
-            .expect("delete should be redoable");
-        assert!(!path.exists());
         let _ = fs::remove_dir_all(base);
     }
 

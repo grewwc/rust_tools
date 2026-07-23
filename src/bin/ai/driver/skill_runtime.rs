@@ -641,11 +641,6 @@ const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
         hint: "For Feishu/Lark docs or sheets, enable the relevant MCP tools before proceeding.",
     },
     CapabilityEntry {
-        use_case: "Undo or redo prior editor changes.",
-        tools: &["undo", "redo"],
-        hint: "",
-    },
-    CapabilityEntry {
         use_case: "Inspect directory contents or enumerate files in a folder.",
         tools: &["list_directory"],
         hint: "",

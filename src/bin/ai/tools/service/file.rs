@@ -287,8 +287,6 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
         PathBuf::from(file_path)
     };
 
-    super::super::undo_tools::snapshot_file_before_write(&resolved_path.to_string_lossy());
-
     let store = FileStore::new(resolved_path);
     // temp 文件落在 runtime 控制的临时目录（session assets 或系统 temp），不属于
     // 用户项目空间，跳过沙箱写权限检查（与 tool-overflow 行为一致）。
@@ -302,8 +300,6 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
         let abs_path = store.path().display().to_string();
         super::super::storage::temp_registry::register(&abs_path)?;
     }
-
-    super::super::undo_tools::commit_change_set(&format!("write_file: {}", store.path().display()));
 
     Ok(format!("Successfully wrote to {}", store.path().display()))
 }
@@ -327,9 +323,6 @@ pub(crate) fn execute_write_file_streaming(
     let target = store.path().display().to_string();
 
     emit_stream_line(on_chunk, &format!("target: {target}"));
-    emit_stream_line(on_chunk, "snapshotting previous file state");
-    super::super::undo_tools::snapshot_file_before_write(&target);
-
     // temp 文件落在 runtime 控制的临时目录，不属于用户项目空间，跳过沙箱写权限检查。
     if !is_temp {
         emit_stream_line(on_chunk, "validating write access");
@@ -344,8 +337,6 @@ pub(crate) fn execute_write_file_streaming(
         let abs_path = store.path().display().to_string();
         super::super::storage::temp_registry::register(&abs_path)?;
     }
-
-    super::super::undo_tools::commit_change_set(&format!("write_file: {}", file_path));
 
     let result = format!("Successfully wrote to {}", store.path().display());
     emit_stream_line(on_chunk, &result);

@@ -76,10 +76,7 @@ pub(crate) fn execute_delete_path(args: &Value) -> Result<String, String> {
         return Ok(format!("Removed directory (recursive): {abs_path_str}"));
     }
 
-    // 删除普通文件 / 符号链接：先做 undo 快照，再删除。
-    super::super::undo_tools::snapshot_file_before_write(&registered_path);
     std::fs::remove_file(&resolved).map_err(|e| format!("Failed to remove file: {e}"))?;
-    super::super::undo_tools::commit_change_set(&format!("delete_path: {abs_path_str}"));
     temp_registry::unregister(&registered_path)?;
 
     Ok(format!("Removed file: {abs_path_str}"))
