@@ -96,14 +96,42 @@ fn build_inline_terminal(height: u16) -> io::Result<MultilineTerminal> {
     .map_err(|err| io::Error::other(err.to_string()))
 }
 
+/// 清除 inline viewport 后，将光标重新锚定到旧 viewport 顶部。
+///
+/// `Terminal::clear()` 会恢复调用前的 cursor；而新的 `Viewport::Inline` 会以创建时
+/// backend cursor 所在行作为顶边。若直接重建，输入框内的 cursor 行会被当作新顶边，
+/// 导致原 viewport 顶部的内容留在 scrollback。优先根据 cursor 相对 viewport 的偏移
+/// 计算顶行；缺少上一帧的相对偏移时则回退到上一帧记录的顶行。
+fn clear_and_reanchor_inline_viewport<B: Backend>(
+    terminal: &mut Terminal<B>,
+    last_viewport_top_row: Option<u16>,
+    last_cursor_offset_row: Option<u16>,
+) -> Result<(), B::Error> {
+    let cursor_position = terminal.backend_mut().get_cursor_position()?;
+    let viewport_top_row = last_cursor_offset_row
+        .map(|offset| cursor_position.y.saturating_sub(offset))
+        .or(last_viewport_top_row)
+        .unwrap_or(cursor_position.y);
+
+    terminal.clear()?;
+    terminal
+        .backend_mut()
+        .set_cursor_position(Position::new(0, viewport_top_row))
+}
+
 /// 补全面板开/关时，inline viewport 需要的高度会变化，而 ratatui 的 inline viewport
-/// 高度在创建时固定、无法原地修改。这里通过“清屏归位光标 -> 用新高度重建 Terminal”
-/// 完成切换：`clear()` 会把光标移回 viewport 顶部并擦除其下内容，重建时 ratatui 以同一
-/// 顶部锚点向下 `append_lines` 展开，因此放大/收回都不会污染 scrollback。
-/// 输入框（textarea）的行数不受影响——多出/收回的高度只作用于补全面板区域。
-fn resize_inline_viewport(terminal: &mut MultilineTerminal, new_height: u16) -> io::Result<()> {
+/// 高度在创建时固定、无法原地修改。清屏后先把 cursor 放回旧 viewport 顶部，再用新高度
+/// 重建 Terminal；这样 ratatui 会以同一顶部锚点向下 `append_lines` 展开，放大/收回都
+/// 不会把旧帧残留在 scrollback。输入框（textarea）的行数不受影响——多出/收回的高度
+/// 只作用于补全面板区域。
+fn resize_inline_viewport(
+    terminal: &mut MultilineTerminal,
+    new_height: u16,
+    last_viewport_top_row: Option<u16>,
+    last_cursor_offset_row: Option<u16>,
+) -> io::Result<()> {
     let _ = terminal.hide_cursor();
-    let _ = terminal.clear();
+    clear_and_reanchor_inline_viewport(terminal, last_viewport_top_row, last_cursor_offset_row)?;
     *terminal = build_inline_terminal(new_height)?;
     Ok(())
 }
@@ -232,7 +260,12 @@ impl PromptEditor {
                         base_viewport_height,
                         current_items,
                     );
-                    resize_inline_viewport(&mut terminal, new_height)?;
+                    resize_inline_viewport(
+                        &mut terminal,
+                        new_height,
+                        last_viewport_top_row,
+                        last_cursor_offset_row,
+                    )?;
                     fitted_completion_items = current_items;
                 }
 
@@ -247,7 +280,12 @@ impl PromptEditor {
                         .min(MAX_VIEWPORT_HEIGHT)
                         .min(available);
                     if new_height > base_viewport_height {
-                        resize_inline_viewport(&mut terminal, new_height)?;
+                        resize_inline_viewport(
+                            &mut terminal,
+                            new_height,
+                            last_viewport_top_row,
+                            last_cursor_offset_row,
+                        )?;
                         base_viewport_height = new_height;
                     }
                 }
@@ -343,8 +381,8 @@ mod tests {
     };
 
     use super::{
-        clear_reflowed_inline_viewport, multiline_viewport_height, submitted_input_preview_lines,
-        viewport_height_with_completion,
+        clear_and_reanchor_inline_viewport, clear_reflowed_inline_viewport,
+        multiline_viewport_height, submitted_input_preview_lines, viewport_height_with_completion,
     };
 
     #[test]
@@ -368,6 +406,23 @@ mod tests {
         assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "r");
         assert_eq!(terminal.backend().buffer()[(0, 2)].symbol(), " ");
         assert_eq!(terminal.backend().buffer()[(0, 4)].symbol(), " ");
+    }
+
+    #[test]
+    fn clearing_and_reanchoring_inline_viewport_uses_previous_cursor_offset() {
+        let backend = TestBackend::new(8, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .backend_mut()
+            .set_cursor_position(Position::new(3, 4))
+            .unwrap();
+
+        clear_and_reanchor_inline_viewport(&mut terminal, Some(1), Some(2)).unwrap();
+
+        assert_eq!(
+            terminal.backend_mut().get_cursor_position().unwrap(),
+            Position::new(0, 2)
+        );
     }
 
     #[test]

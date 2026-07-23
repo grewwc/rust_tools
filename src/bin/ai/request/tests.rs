@@ -13,6 +13,18 @@ fn session_title_generation_timeouts_are_relaxed_for_background_work() {
 }
 
 #[test]
+fn request_diagnostics_follow_terminal_suppression_scope() {
+    assert!(request_diagnostics_enabled());
+
+    let emitted = crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.sync_scope(true, || {
+        emit_request_diagnostic(format_args!("hidden request diagnostic"))
+    });
+
+    assert!(!emitted);
+    assert!(request_diagnostics_enabled());
+}
+
+#[test]
 fn model_fallback_and_disable_statuses_are_separate() {
     let network = RequestError::cancelled("network timeout");
     assert!(should_try_model_fallback(&network));

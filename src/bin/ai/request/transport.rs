@@ -91,10 +91,10 @@ async fn send_with_budgeted_hedged_backup(
             }
             _ = tokio::time::sleep(hedge) => {
                 if round < max_sends {
-                    eprintln!(
+                    super::emit_request_diagnostic(format_args!(
                         "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup request",
                         backup_after_secs
-                    );
+                    ));
                 }
             }
         }
@@ -158,14 +158,14 @@ async fn request_messages_with_key(
             Err(_) => {
                 if attempt < retry_policy.max_attempts {
                     let delay = retry_delay(attempt);
-                    eprintln!(
+                    super::emit_request_diagnostic(format_args!(
                         "[Warning] {}等待响应头超时 ({}s) - sleep {} 秒后重试 (attempt {}/{})",
                         retry_scope_tag(),
                         retry_policy.header_timeout_secs,
                         delay.as_secs_f32(),
                         attempt,
                         retry_policy.max_attempts
-                    );
+                    ));
                     if sleep_with_cancel(app, delay).await {
                         return Err(RequestError::cancelled(
                             "request canceled by user during retry wait",
@@ -210,14 +210,14 @@ async fn request_messages_with_key(
                     && attempt < retry_policy.max_attempts
                 {
                     let delay = retry_delay(attempt);
-                    eprintln!(
+                    super::emit_request_diagnostic(format_args!(
                         "[Warning] {}{} - sleep {} 秒后重试 (attempt {}/{})",
                         retry_scope_tag(),
                         status,
                         delay.as_secs_f32(),
                         attempt,
                         retry_policy.max_attempts
-                    );
+                    ));
                     if sleep_with_cancel(app, delay).await {
                         return Err(RequestError::cancelled(
                             "request canceled by user during retry wait",
@@ -234,13 +234,13 @@ async fn request_messages_with_key(
                 };
                 if retryable && attempt < retry_policy.max_attempts {
                     let delay = retry_delay(attempt);
-                    eprintln!(
+                    super::emit_request_diagnostic(format_args!(
                         "[Warning] {}网络错误 - sleep {} 秒后重试 (attempt {}/{})",
                         retry_scope_tag(),
                         delay.as_secs_f32(),
                         attempt,
                         retry_policy.max_attempts
-                    );
+                    ));
                     if sleep_with_cancel(app, delay).await {
                         return Err(RequestError::cancelled(
                             "request canceled by user during retry wait",
@@ -319,10 +319,10 @@ async fn do_request_messages_with_tool_mode(
         },
     );
     if force_thinking_requested && !enable_thinking {
-        eprintln!(
+        super::emit_request_diagnostic(format_args!(
             "[Info] thinking 已请求，但当前模型 `{}` 不支持 thinking；本轮将继续以普通模式输出。",
             model
-        );
+        ));
     }
     // DeepSeek/OpenCode 等协议要求：只要该模型 wire 需要 tool-call assistant
     // 历史回传 `reasoning_content` 字段，就必须在发请求前补齐字段形状。
@@ -377,13 +377,13 @@ async fn do_request_messages_with_tool_mode(
         let mut round_retry_after: Option<Duration> = None;
         for (key_idx, api_key) in keys_to_try.iter().enumerate() {
             if key_idx > 0 {
-                eprintln!(
+                super::emit_request_diagnostic(format_args!(
                     "[{}] key #{} failed, trying next key #{} ({} remaining)",
                     adapter.label(),
                     key_idx - 1,
                     key_idx,
                     total_keys - key_idx
-                );
+                ));
             }
             match request_messages_with_key(
                 app,
@@ -413,14 +413,14 @@ async fn do_request_messages_with_tool_mode(
             break;
         }
         let delay = round_retry_after.unwrap_or_else(|| retry_delay_429(attempt));
-        eprintln!(
+        super::emit_request_diagnostic(format_args!(
             "[Warning] {}429 Too Many Requests - {} 个 key 均配额超限，sleep {} 秒后重试 (attempt {}/{})",
             retry_scope_tag(),
             total_keys,
             delay.as_secs_f32(),
             attempt,
             retry_policy.max_attempts_429
-        );
+        ));
         if sleep_with_cancel(app, delay).await {
             return Err(RequestError::cancelled(
                 "request canceled by user during retry wait",
@@ -540,12 +540,12 @@ pub async fn do_request_json(
             Ok(result) => result,
             Err(_) => {
                 if attempt < REQUEST_MAX_ATTEMPTS {
-                    eprintln!(
+                    super::emit_request_diagnostic(format_args!(
                         "[Warning] {}do_request_json timeout (60s), retrying (attempt {}/{})",
                         retry_scope_tag(),
                         attempt,
                         REQUEST_MAX_ATTEMPTS
-                    );
+                    ));
                     continue;
                 }
                 return Err("do_request_json: all attempts timed out".into());
@@ -805,13 +805,13 @@ pub async fn do_request_text_streaming(
             }
             Err(_) => {
                 if attempt < REQUEST_MAX_ATTEMPTS {
-                    eprintln!(
+                    super::emit_request_diagnostic(format_args!(
                         "[Warning] {}do_request_text_streaming 等待响应头超时 ({}s), retrying (attempt {}/{})",
                         retry_scope_tag(),
                         retry_policy.header_timeout_secs,
                         attempt,
                         REQUEST_MAX_ATTEMPTS
-                    );
+                    ));
                     continue;
                 }
                 return Err("do_request_text_streaming: all attempts timed out".into());
@@ -908,13 +908,13 @@ pub async fn do_request_text_streaming(
         }
 
         if idle_timed_out && content.is_empty() && attempt < REQUEST_MAX_ATTEMPTS {
-            eprintln!(
+            super::emit_request_diagnostic(format_args!(
                 "[Warning] {}do_request_text_streaming chunk 空闲超时 ({}s) 且无内容, retrying (attempt {}/{})",
                 retry_scope_tag(),
                 STREAM_RESPONSE_HEADER_TIMEOUT_SECS,
                 attempt,
                 REQUEST_MAX_ATTEMPTS
-            );
+            ));
             continue;
         }
         return Ok(content);

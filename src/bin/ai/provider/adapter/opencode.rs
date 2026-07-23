@@ -54,11 +54,11 @@ impl ProviderAdapter for OpenCodeAdapter {
         match try_parse_stream_chunk_loose(trimmed) {
             Some(chunk) => ParsedStreamPayload::Chunk(chunk),
             None => {
-                eprintln!(
+                crate::ai::request::emit_request_diagnostic(format_args!(
                     "[opencode] ignored payload, length: {}, starts_with: {:.30}",
                     trimmed.len(),
                     trimmed
-                );
+                ));
                 ParsedStreamPayload::Ignore
             }
         }

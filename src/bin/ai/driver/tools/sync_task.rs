@@ -49,9 +49,15 @@ use super::super::runtime_ctx::DriverContext;
 /// parent turn for an interactive session.
 const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// 子代理"运行中"心跳的刷新间隔。仅在 subagent 尚未产出任何流式输出
-/// 的等待窗口里使用（首个 token 到达前），用于消除"看似卡死"的死寂感。
+/// 子代理"运行中"心跳的刷新间隔。同步子 agent 自身不直接拥有 terminal；
+/// 前台等待循环用这条单行 heartbeat 展示进度，直到任务完成/取消/超时。
 const SUBAGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+type BoxedSubagentFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubagentFuture {
+    Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped))
+}
 
 pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
     // 递归深度守卫：防止 mode:all 的 heavy agent 通过同步 `task`
@@ -150,11 +156,6 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     // 等待循环、把子 agent 取消掉，父 agent 不受影响。
     let wait_shutdown = subagent_shutdown.clone();
     let wait_cancel = subagent_cancel.clone();
-    // 子 agent 的 `run_turn` 一旦开始流式响应就把 `subagent_streaming` 置 true
-    // （见 iteration.rs 的 `StreamingFlagGuard`）。父 agent 此刻阻塞在工具执行里、
-    // 自身不流式，所以这个标志可精确当作"subagent 首个输出已到达"的信号，用来在
-    // 恰当时机关闭等待心跳，避免心跳与 subagent 正文交错。
-    let wait_streaming = subagent_streaming.clone();
     // Slot used by the sub-agent's `finalize_turn` to publish its final
     // assistant text. Created here, scoped via `SUBAGENT_RESULT_SLOT` over
     // the spawned future, and read once the sub-agent returns.
@@ -192,7 +193,6 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
         let _ = tx.send(result);
     };
 
-    type BoxedSubagentFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
     let mut wrapped: BoxedSubagentFuture = Box::pin(inner_fut);
     let persona_memory_path = spawn_driver_ctx.app_proto.current_persona_memory_file();
 
@@ -231,6 +231,8 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
         }
     }
 
+    wrapped = suppress_subagent_terminal_output(wrapped);
+
     let subagent_handle = tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, wrapped));
 
     // 把子 agent 的私有 cancel 标志登记到前台子 agent 注册表：Ctrl+C 时
@@ -251,7 +253,6 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
             rx,
             wait_shutdown,
             wait_cancel,
-            wait_streaming,
             phase_slot,
             started,
             SYNC_TASK_HARD_TIMEOUT,
@@ -294,7 +295,6 @@ async fn wait_for_sync_task_completion(
     mut rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
     parent_shutdown: Arc<AtomicBool>,
     parent_cancel: Arc<AtomicBool>,
-    streaming_flag: Arc<AtomicBool>,
     phase_slot: runtime_ctx::SubagentPhaseSlot,
     started: Instant,
     hard_timeout: Duration,
@@ -310,9 +310,6 @@ async fn wait_for_sync_task_completion(
         // 避免 subagent 很快就出首包时还闪一下心跳。
         heartbeat.tick().await;
         let mut heartbeat_visible = false;
-        // 一旦 subagent 开始流式输出就永久停止心跳：之后它会持续打印正文/工具
-        // 调用，用户能直接看到活动，心跳只会和正文交错添乱。
-        let mut subagent_started = false;
         loop {
             if parent_shutdown.load(Ordering::Relaxed) {
                 clear_heartbeat_line(show_heartbeat, &mut heartbeat_visible);
@@ -344,13 +341,7 @@ async fn wait_for_sync_task_completion(
                 _ = notified => {
                     continue;
                 }
-                _ = heartbeat.tick(), if show_heartbeat && !subagent_started => {
-                    if streaming_flag.load(Ordering::Relaxed) {
-                        // subagent 已开始产出：清掉心跳行并永久停用心跳。
-                        subagent_started = true;
-                        clear_heartbeat_line(show_heartbeat, &mut heartbeat_visible);
-                        continue;
-                    }
+                _ = heartbeat.tick(), if show_heartbeat => {
                     let phase = phase_slot
                         .lock()
                         .ok()
@@ -468,9 +459,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_task_subagent_future_suppresses_terminal_output() {
+        assert!(runtime_ctx::terminal_output_enabled());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let fut: BoxedSubagentFuture = Box::pin(async move {
+            let _ = tx.send(runtime_ctx::terminal_output_enabled());
+        });
+
+        suppress_subagent_terminal_output(fut).await;
+
+        assert!(!rx.await.expect("subagent future should report terminal state"));
+        assert!(runtime_ctx::terminal_output_enabled());
+    }
+
+    #[tokio::test]
     async fn sync_task_wait_returns_subagent_result() {
         let (shutdown, cancel) = flags();
-        let streaming = Arc::new(AtomicBool::new(false));
         let (tx, rx) = tokio::sync::oneshot::channel();
         tx.send(Ok(())).unwrap();
 
@@ -478,7 +482,6 @@ mod tests {
             rx,
             shutdown,
             cancel,
-            streaming,
             phase(),
             Instant::now(),
             Duration::from_secs(1),
@@ -495,7 +498,6 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
         crate::ai::driver::signal::clear_request_interrupt();
         let (shutdown, cancel) = flags();
-        let streaming = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let cancel_for_trigger = cancel.clone();
 
@@ -503,7 +505,6 @@ mod tests {
             rx,
             shutdown,
             cancel,
-            streaming,
             phase(),
             Instant::now(),
             Duration::from_secs(5),
@@ -526,14 +527,12 @@ mod tests {
     #[tokio::test]
     async fn sync_task_wait_respects_hard_timeout() {
         let (shutdown, cancel) = flags();
-        let streaming = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = tokio::sync::oneshot::channel();
 
         let result = wait_for_sync_task_completion(
             rx,
             shutdown,
             cancel,
-            streaming,
             phase(),
             Instant::now(),
             Duration::from_millis(10),

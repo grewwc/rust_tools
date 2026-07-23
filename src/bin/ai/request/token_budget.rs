@@ -198,12 +198,12 @@ pub(super) async fn wait_for_request_budget(
         match decision {
             BudgetDecision::Reserved => return Ok(()),
             BudgetDecision::Wait(delay) => {
-                eprintln!(
+                super::emit_request_diagnostic(format_args!(
                     "[Info] request TPM budget reached for `{request_model_label}`; waiting {:.1}s before next send (reserved {} / model limit {} tokens, key-scoped 60s window)",
                     delay.as_secs_f32(),
                     tokens,
                     limit
-                );
+                ));
                 if sleep_with_cancel(app, delay).await {
                     return Err(RequestError::cancelled(
                         "request canceled by user during TPM budget wait",

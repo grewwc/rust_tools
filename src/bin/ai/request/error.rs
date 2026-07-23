@@ -269,10 +269,10 @@ pub(crate) async fn send_with_hedged_backup(
                 // hedge 窗口内无任何响应头到达：若还有配额则追加一个并发请求，
                 // 否则落到循环后的最终竞速（由外层 header_timeout 兜底）。
                 if round < max_sends {
-                    eprintln!(
+                    super::emit_request_diagnostic(format_args!(
                         "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup request",
                         backup_after_secs
-                    );
+                    ));
                 }
             }
         }

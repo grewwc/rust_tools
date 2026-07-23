@@ -104,10 +104,13 @@ pub(in crate::ai) trait ProviderAdapter: Sync {
                     .err()
                     .map(|e| e.to_string())
                     .unwrap_or_else(|| "unable to parse stream payload".to_string());
-                eprintln!("handleResponse error [{}] {err}", self.label());
-                eprintln!("======> response: ");
-                eprintln!("{payload}");
-                eprintln!("<======");
+                crate::ai::request::emit_request_diagnostic(format_args!(
+                    "handleResponse error [{}] {err}",
+                    self.label()
+                ));
+                crate::ai::request::emit_request_diagnostic(format_args!("======> response: "));
+                crate::ai::request::emit_request_diagnostic(format_args!("{payload}"));
+                crate::ai::request::emit_request_diagnostic(format_args!("<======"));
                 ParsedStreamPayload::Ignore
             }
         }

@@ -4,6 +4,7 @@ use reqwest::StatusCode;
 mod aux;
 mod builder;
 mod error;
+mod logging;
 mod normalize;
 mod protocol;
 mod reasoning;
@@ -19,6 +20,9 @@ pub(crate) use aux::{
     charge_llm_usage_to_kernel, charge_llm_usage_via_kernel, generate_session_title_via_model,
     summarize_history_via_model,
 };
+#[cfg(test)]
+pub(in crate::ai) use logging::request_diagnostics_enabled;
+pub(in crate::ai) use logging::emit_request_diagnostic;
 #[allow(unused_imports)]
 pub(crate) use error::{
     AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS, AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,

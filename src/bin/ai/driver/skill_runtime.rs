@@ -971,10 +971,10 @@ fn build_system_prompt(
             && has_tool(available_tools, "activate_skill")
         {
             discovery_lines.push(
-                "Skills are optional. When a task may need specialized domain context, an established workflow, bundled resources, or dedicated tools, proactively call `list_skills` to inspect installed skills before deciding whether to use one.".to_string(),
+                "Skills are optional. If the user asks about available skills, call `list_skills`. Otherwise, first assess the task: when you identify a concrete, genuinely specialized need for domain context, an established workflow, bundled resources, or dedicated tools and do not know which skill is available, proactively call `list_skills`. Do not browse skills as a routine opening step; a routine source-code, repository, file, or terminal investigation—or technical keywords alone—is not evidence that a skill is needed.".to_string(),
             );
             discovery_lines.push(
-                "After inspecting the catalog, call `activate_skill(name=...)` only when one listed skill clearly and materially improves the task. Do not list or activate skills for generic Q&A, simple work already handled by current tools, loose keyword overlap, or just in case.".to_string(),
+                "Call `activate_skill(name=...)` only when one listed skill clearly and materially improves the task. Do not activate for generic work, loose keyword overlap, or just in case.".to_string(),
             );
             discovery_lines.push(
                 "Skill activation is limited to the current user turn and unloads automatically after it ends; rediscover and reactivate only when a later turn clearly needs it.".to_string(),
@@ -1943,6 +1943,9 @@ mod tests {
         assert!(prompt.contains("activate_skill"));
         assert!(prompt.contains("list_skills"));
         assert!(prompt.contains("Skills are optional"));
+        assert!(prompt.contains("proactively call `list_skills`"));
+        assert!(prompt.contains("technical keywords alone"));
+        assert!(prompt.contains("routine source-code, repository, file, or terminal investigation"));
         assert!(prompt.contains("unloads automatically"));
         assert!(prompt.contains("enable_tools"));
     }

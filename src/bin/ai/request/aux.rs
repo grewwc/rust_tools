@@ -165,7 +165,9 @@ pub(crate) async fn summarize_history_via_model(
     let response = match tokio::time::timeout(Duration::from_secs(60), send_future).await {
         Ok(r) => r.ok()?,
         Err(_) => {
-            eprintln!("[summary] timeout (60s) waiting for response headers, skipping");
+            super::emit_request_diagnostic(format_args!(
+                "[summary] timeout (60s) waiting for response headers, skipping"
+            ));
             return None;
         }
     };
@@ -175,7 +177,9 @@ pub(crate) async fn summarize_history_via_model(
     let text = match tokio::time::timeout(Duration::from_secs(30), response.text()).await {
         Ok(r) => r.ok()?,
         Err(_) => {
-            eprintln!("[summary] timeout (30s) reading response body, skipping");
+            super::emit_request_diagnostic(format_args!(
+                "[summary] timeout (30s) reading response body, skipping"
+            ));
             return None;
         }
     };

@@ -78,7 +78,7 @@ inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "activate_skill",
         description: "Activate a specific skill by name so its full prompt and tool set load into the current turn. \
-                      When specialized domain context, workflow, bundled resources, or dedicated tools may help, inspect `list_skills` first. \
+                      If the appropriate skill is not known, proactively use `list_skills` after identifying a concrete specialized need or when the user asks about available skills; do not infer such a need from technical keywords or a routine source-code, repository, file, or terminal investigation alone. \
                       Activate only when one listed skill clearly and materially improves the user's task; do not activate for generic work, loose keyword overlap, or just in case. \
                       Activation is scoped to the current user turn and unloads automatically at turn end.",
         parameters: params_activate_skill,
@@ -174,8 +174,8 @@ inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "list_skills",
         description: "Browse installed skill names and descriptions without activating anything. \
-                      Use this proactively when a task may need specialized domain background, an established workflow, bundled resources, or dedicated tools. \
-                      Do not list skills for generic Q&A or simple work already handled by the current tools.",
+                      Use this proactively when the user asks about available skills, or after identifying a concrete, genuinely specialized need for domain context, an established workflow, bundled resources, or dedicated tools and you need to identify the right skill. \
+                      Do not browse merely because a task contains technical keywords or involves a routine source-code, repository, file, or terminal investigation.",
         parameters: params_list_skills,
         execute: execute_list_skills,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -519,6 +519,24 @@ mod tests {
         );
         // take 应清空槽位。
         assert!(take_pending_skill_activation().is_none());
+    }
+
+    #[test]
+    fn skill_discovery_descriptions_preserve_proactive_boundary() {
+        let list_skills = crate::ai::tools::registry::common::get_tool_spec("list_skills")
+            .expect("list_skills should be registered");
+        assert!(list_skills.description.contains("Use this proactively"));
+        assert!(list_skills.description.contains("technical keywords"));
+        assert!(list_skills
+            .description
+            .contains("routine source-code, repository, file, or terminal investigation"));
+
+        let activate_skill = crate::ai::tools::registry::common::get_tool_spec("activate_skill")
+            .expect("activate_skill should be registered");
+        assert!(activate_skill
+            .description
+            .contains("proactively use `list_skills`"));
+        assert!(activate_skill.description.contains("technical keywords"));
     }
 
     #[test]
