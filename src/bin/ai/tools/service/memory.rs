@@ -544,8 +544,9 @@ pub(crate) struct ScoredMemo {
 pub(crate) fn search_memo_candidates(
     query: &str,
     limit: usize,
+    include_archives: bool,
 ) -> Result<Vec<AgentMemoryEntry>, String> {
-    Ok(search_memo_candidates_scored(query, limit)?
+    Ok(search_memo_candidates_scored(query, limit, include_archives)?
         .into_iter()
         .map(|s| s.entry)
         .collect())
@@ -555,6 +556,7 @@ pub(crate) fn search_memo_candidates(
 pub(crate) fn search_memo_candidates_scored(
     query: &str,
     limit: usize,
+    include_archives: bool,
 ) -> Result<Vec<ScoredMemo>, String> {
     let query = query.trim();
     if query.is_empty() {
@@ -563,7 +565,17 @@ pub(crate) fn search_memo_candidates_scored(
     let limit = limit.clamp(1, 50);
     let store = MemoryStore::from_env_or_config();
     // `a -n` 保存的用户笔记固定为 memo；-ns / -nd / -ne 都只处理这类条目。
-    let results = store.entries_by_category("memo", 100_000, true)?;
+    // include_archives=false 时只读当前 memory 文件：删除/编辑只能改写当前文件，
+    // 即便全局开启了 ai.memory.search_archives.enable 也不纳入归档候选，
+    // 否则用户选中归档条目后删除/更新会得到 "matching memo entry not found"。
+    let results: Vec<AgentMemoryEntry> = if include_archives {
+        store.entries_by_category("memo", 100_000, true)?
+    } else {
+        load_memory_entries(store.path())?
+            .into_iter()
+            .filter(|e| e.category == "memo")
+            .collect()
+    };
     let viewer = ViewerContext::current();
     let qlc = query.to_lowercase();
     let query_tokens = crate::ai::knowledge::indexing::similarity::expand_tokens(
@@ -1374,8 +1386,8 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
 mod tests {
     use super::{
         execute_memory_delete, execute_memory_list_json, execute_memory_save,
-        execute_memory_update, is_memory_visible_to, search_memo_candidates_scored,
-        update_memo_entry,
+        execute_memory_update, is_memory_visible_to, delete_memo_entry,
+        search_memo_candidates, search_memo_candidates_scored, update_memo_entry,
     };
     use crate::ai::test_support::ENV_LOCK;
     use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
@@ -1601,7 +1613,7 @@ mod tests {
             .unwrap();
 
         let memo_only =
-            search_memo_candidates_scored("aeolusllm copilot 二次分析问题排查", 10).unwrap();
+            search_memo_candidates_scored("aeolusllm copilot 二次分析问题排查", 10, true).unwrap();
         assert_eq!(
             memo_only[0].entry.id.as_deref(),
             Some("archived-memo")
@@ -1612,6 +1624,74 @@ mod tests {
         assert!(memo_only
             .iter()
             .all(|candidate| candidate.entry.id.as_deref() != Some("non-memo-decoy")));
+
+        cleanup_memory_artifacts(&path);
+        let _ = std::fs::remove_file(&archive);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    /// 回归：-nd/-ne 的候选函数在 include_archives=false 时只读当前 memory 文件，
+    /// 不纳入归档条目（删除/更新只能改写当前文件，否则会落到 "matching memo entry not found"）。
+    #[test]
+    fn memo_delete_candidates_exclude_archives_and_delete_fails_on_archived() {
+        let _guard = env_lock_guard();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_notebook_delete_{ts}.jsonl"));
+        let archive = path.with_extension("jsonl.20260101000000");
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let archived_memo = AgentMemoryEntry {
+            id: Some("archived-del-memo".to_string()),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            category: "memo".to_string(),
+            note: "归档中的待删笔记 二次分析问题排查".to_string(),
+            tags: vec!["aeolusllm".to_string()],
+            source: Some("cli_note".to_string()),
+            priority: Some(150),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+        std::fs::write(&archive, format!("{}\n", serde_json::to_string(&archived_memo).unwrap()))
+            .unwrap();
+
+        let store = MemoryStore::from_env_or_config();
+        store
+            .append(&AgentMemoryEntry {
+                id: Some("current-del-memo".to_string()),
+                timestamp: "2026-01-02T00:00:00Z".to_string(),
+                category: "memo".to_string(),
+                note: "当前文件中的笔记 二次分析问题排查".to_string(),
+                tags: vec!["aeolusllm".to_string()],
+                source: Some("cli_note".to_string()),
+                priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
+                image_path: None,
+            })
+            .unwrap();
+
+        // include_archives=false：候选不应包含归档条目，
+        // 只剩当前文件里的 "current-del-memo"。
+        let candidates = search_memo_candidates("二次分析问题排查", 10, false).unwrap();
+        assert!(candidates
+            .iter()
+            .all(|c| c.id.as_deref() != Some("archived-del-memo")));
+        assert!(candidates
+            .iter()
+            .any(|c| c.id.as_deref() == Some("current-del-memo")));
+
+        // 即便外部传入归档条目，delete_memo_entry 也只能在当前文件找不到它而失败，
+        // 而不是静默误删或落到成功路径。
+        let err = delete_memo_entry(&archived_memo).unwrap_err();
+        assert_eq!(err, "matching memo entry not found");
 
         cleanup_memory_artifacts(&path);
         let _ = std::fs::remove_file(&archive);

@@ -433,6 +433,7 @@ async fn answer_memo_search(
     let candidates = match crate::ai::tools::service::memory::search_memo_candidates_scored(
         &retrieval_query,
         20,
+        true,
     ) {
         Ok(c) => c,
         Err(err) => {
@@ -787,7 +788,11 @@ pub(super) async fn handle_note_delete(
     };
 
     // 检索候选条目。
-    let candidates = match crate::ai::tools::service::memory::search_memo_candidates(&query, 10) {
+    let candidates = match crate::ai::tools::service::memory::search_memo_candidates(
+        &query,
+        10,
+        false,
+    ) {
         Ok(c) => c,
         Err(err) => {
             eprintln!("[note-delete] 检索失败: {}", err);
@@ -1007,7 +1012,11 @@ pub(super) async fn handle_note_edit(
     let spinner = SearchSpinner::start("匹配知识库条目");
 
     // 检索候选条目。
-    let candidates = match crate::ai::tools::service::memory::search_memo_candidates(&query, 10) {
+    let candidates = match crate::ai::tools::service::memory::search_memo_candidates(
+        &query,
+        10,
+        false,
+    ) {
         Ok(c) => c,
         Err(err) => {
             spinner.stop();
