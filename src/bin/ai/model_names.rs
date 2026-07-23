@@ -81,7 +81,7 @@ pub struct ModelDef {
     /// 在 `models.json` 中可填以下值（大小写不敏感）：
     /// - `"auto"` / `"none"` / `"off"` 或字段省略：等同 `None`，请求中不带
     ///   `reasoning_effort` 字段（与历史行为兼容）；
-    /// - `"minimal"` / `"low"` / `"medium"` / `"high"` / `"xhigh"`：对应档位。
+    /// - `"minimal"` / `"low"` / `"medium"` / `"high"` / `"xhigh"` / `"max"`：对应档位。
     #[serde(
         default,
         alias = "reasoning_effort",
@@ -122,7 +122,7 @@ where
         _ => match ReasoningEffort::parse(trimmed) {
             Some(level) => Ok(Some(level)),
             None => Err(serde::de::Error::custom(format!(
-                "unknown default_reasoning_effort '{}': expected auto/minimal/low/medium/high/xhigh/off",
+                "unknown default_reasoning_effort '{}': expected auto/minimal/low/medium/high/xhigh/max/off",
                 trimmed
             ))),
         },

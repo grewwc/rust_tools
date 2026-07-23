@@ -60,6 +60,8 @@ pub(super) enum ReasoningEffort {
     High,
     #[serde(rename = "xhigh", alias = "x_high", alias = "extra_high")]
     XHigh,
+    #[serde(alias = "maximum")]
+    Max,
 }
 
 impl ReasoningEffort {
@@ -71,6 +73,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 
@@ -83,6 +86,7 @@ impl ReasoningEffort {
             "medium" | "mid" => Some(Self::Medium),
             "high" => Some(Self::High),
             "xhigh" | "extra_high" | "extra-high" => Some(Self::XHigh),
+            "max" | "maximum" => Some(Self::Max),
             _ => None,
         }
     }
@@ -174,6 +178,14 @@ mod tests {
             ReasoningEffort::parse("extra-high"),
             Some(ReasoningEffort::XHigh)
         );
+        assert_eq!(
+            ReasoningEffort::parse("max"),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(
+            ReasoningEffort::parse("MAXIMUM"),
+            Some(ReasoningEffort::Max)
+        );
         assert_eq!(ReasoningEffort::parse(""), None);
         assert_eq!(ReasoningEffort::parse("bogus"), None);
     }
@@ -186,6 +198,7 @@ mod tests {
             ReasoningEffort::Medium,
             ReasoningEffort::High,
             ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
         ] {
             assert_eq!(ReasoningEffort::parse(level.as_str()), Some(level));
         }
@@ -216,12 +229,19 @@ mod tests {
         .unwrap();
         assert_eq!(def2.reasoning_effort, Some(ReasoningEffort::High));
 
-        // xhigh 作为最高档位正确反序列化
+        // xhigh 档位正确反序列化
         let def_xhigh: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"xhigh"}"#,
         )
         .unwrap();
         assert_eq!(def_xhigh.reasoning_effort, Some(ReasoningEffort::XHigh));
+
+        // max 作为最高档位正确反序列化
+        let def_max: ModelDef = serde_json::from_str(
+            r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"max"}"#,
+        )
+        .unwrap();
+        assert_eq!(def_max.reasoning_effort, Some(ReasoningEffort::Max));
 
         // "auto" 等同于未设置
         let def3: ModelDef = serde_json::from_str(

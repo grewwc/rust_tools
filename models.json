@@ -218,7 +218,7 @@
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
-    "default_reasoning_effort": "high",
+    "default_reasoning_effort": "xhigh",
     "subagent_priority": 50,
     "max_output_tokens": 128000
   },
@@ -303,7 +303,7 @@
     "tools_default_enabled": true,
     "enable_thinking": true,
     "request_protocol": "responses",
-    "default_reasoning_effort": "xhigh",
+    "default_reasoning_effort": "max",
     "reasoning_effort_conflicts_with_tools": false,
     "reasoning_encrypted_replay": true,
     "subagent_priority": 50,
