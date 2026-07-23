@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::ai::types::ToolCall;
 
 use super::{
+    blob,
     compress::{
         COMPRESSED_TOOL_EVIDENCE_MARKER, compact_persisted_history, is_summary_note_text,
         value_to_string,
@@ -263,7 +264,7 @@ pub(in crate::ai) fn append_tool_execution_outcomes_sqlite(
     path: &Path,
     outcomes: &[ToolExecutionOutcome],
 ) -> io::Result<()> {
-    if outcomes.is_empty() {
+    if outcomes.is_empty() || !blob::is_sqlite_path(path) {
         return Ok(());
     }
     let mut conn = open_history_db(path)?;
@@ -300,7 +301,7 @@ pub(in crate::ai) fn append_tool_execution_outcomes_sqlite(
 pub(in crate::ai) fn read_tool_execution_outcomes_sqlite(
     path: &Path,
 ) -> io::Result<Vec<ToolExecutionOutcome>> {
-    if !path.exists() {
+    if !blob::is_sqlite_path(path) || !path.exists() {
         return Ok(Vec::new());
     }
     let conn = open_history_db(path)?;
@@ -339,7 +340,7 @@ pub(in crate::ai) fn read_tool_execution_outcomes_sqlite(
 /// 读取持久化 tool 消息使用过的关联 ID。live context 可能已裁掉较早消息，
 /// 生成新 occurrence ID 时仍须避开完整历史中的这些 ID。
 pub(in crate::ai) fn read_tool_message_ids_sqlite(path: &Path) -> io::Result<Vec<String>> {
-    if !path.exists() {
+    if !blob::is_sqlite_path(path) || !path.exists() {
         return Ok(Vec::new());
     }
     let conn = open_history_db(path)?;
@@ -1339,6 +1340,32 @@ mod tests {
         append_tool_execution_outcomes_sqlite(&path, &[outcome("legacy-reused")]).unwrap();
         replace_all_messages_sqlite(&path, &[tool_msg("legacy-reused", "older")]).unwrap();
         assert!(read_tool_execution_outcomes_sqlite(&path).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn structured_tool_outcomes_ignore_non_sqlite_history_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "tool_outcome_text_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.txt");
+        std::fs::write(&path, "plain text history\n").unwrap();
+
+        append_tool_execution_outcomes_sqlite(&path, &[outcome("call-1")]).unwrap();
+
+        assert!(read_tool_execution_outcomes_sqlite(&path).unwrap().is_empty());
+        assert!(read_tool_message_ids_sqlite(&path).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "plain text history\n"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

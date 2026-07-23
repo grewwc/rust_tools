@@ -2461,6 +2461,11 @@ fn session_delete_removes_sqlite_sidecars() {
     std::fs::write(PathBuf::from(format!("{}-wal", db.display())), b"test").unwrap();
     std::fs::write(PathBuf::from(format!("{}-shm", db.display())), b"test").unwrap();
     std::fs::write(PathBuf::from(format!("{}-journal", db.display())), b"test").unwrap();
+    let derived = store.sessions_root().join("abc.proc-42.sqlite");
+    std::fs::write(&derived, b"derived").unwrap();
+    std::fs::write(PathBuf::from(format!("{}-wal", derived.display())), b"derived").unwrap();
+    let legacy_derived = store.sessions_root().join("abc.sqlite.subagent-legacy");
+    std::fs::write(&legacy_derived, b"legacy").unwrap();
     let assets = store.session_assets_dir("abc");
     let checkpoints = store.checkpoints_dir("abc");
     std::fs::create_dir_all(&assets).unwrap();
@@ -2472,6 +2477,9 @@ fn session_delete_removes_sqlite_sidecars() {
     assert!(PathBuf::from(format!("{}-wal", db.display())).exists());
     assert!(PathBuf::from(format!("{}-shm", db.display())).exists());
     assert!(PathBuf::from(format!("{}-journal", db.display())).exists());
+    assert!(derived.exists());
+    assert!(PathBuf::from(format!("{}-wal", derived.display())).exists());
+    assert!(legacy_derived.exists());
     assert!(assets.exists());
     assert!(checkpoints.exists());
 
@@ -2481,6 +2489,9 @@ fn session_delete_removes_sqlite_sidecars() {
     assert!(!PathBuf::from(format!("{}-wal", db.display())).exists());
     assert!(!PathBuf::from(format!("{}-shm", db.display())).exists());
     assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
+    assert!(!derived.exists());
+    assert!(!PathBuf::from(format!("{}-wal", derived.display())).exists());
+    assert!(!legacy_derived.exists());
     assert!(!assets.exists());
     assert!(!checkpoints.exists());
 }
@@ -2531,6 +2542,9 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
         std::fs::write(PathBuf::from(format!("{}-wal", db.display())), b"test").unwrap();
         std::fs::write(PathBuf::from(format!("{}-shm", db.display())), b"test").unwrap();
         std::fs::write(PathBuf::from(format!("{}-journal", db.display())), b"test").unwrap();
+        let derived = store.sessions_root().join(format!("{id}.subagent-child.sqlite"));
+        std::fs::write(&derived, b"derived").unwrap();
+        std::fs::write(PathBuf::from(format!("{}-shm", derived.display())), b"derived").unwrap();
         let assets = store.session_assets_dir(id);
         std::fs::create_dir_all(&assets).unwrap();
         std::fs::write(assets.join("paste.png"), b"test").unwrap();
@@ -2541,6 +2555,8 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
     let orphan_checkpoints = store.checkpoints_dir("orphan");
     std::fs::create_dir_all(&orphan_checkpoints).unwrap();
     std::fs::write(orphan_checkpoints.join("saved.sqlite"), b"test").unwrap();
+    let orphan_derived = store.sessions_root().join("orphan.proc-1.sqlite");
+    std::fs::write(&orphan_derived, b"orphan").unwrap();
 
     let deleted = store.clear_all_sessions().unwrap();
     assert_eq!(deleted, 3);
@@ -2551,11 +2567,15 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
         assert!(!PathBuf::from(format!("{}-wal", db.display())).exists());
         assert!(!PathBuf::from(format!("{}-shm", db.display())).exists());
         assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
+        let derived = store.sessions_root().join(format!("{id}.subagent-child.sqlite"));
+        assert!(!derived.exists());
+        assert!(!PathBuf::from(format!("{}-shm", derived.display())).exists());
         let assets = store.session_assets_dir(id);
         assert!(!assets.exists());
         assert!(!store.checkpoints_dir(id).exists());
     }
     assert!(!orphan_checkpoints.exists());
+    assert!(!orphan_derived.exists());
 }
 
 #[test]

@@ -10,15 +10,31 @@ use aios_kernel::primitives::{ResourceUsageDelta, RlimitVerdict};
 
 use crate::ai::skills::SkillManifest;
 
-/// Generate history file path for a background process.
-/// appends .proc-{pid} to the session history filename.
-pub(super) fn process_history_path(base: &Path, pid: u64) -> PathBuf {
-    let file_name = base
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| format!("{name}.proc-{pid}"))
-        .unwrap_or_else(|| format!("session.proc-{pid}"));
+pub(in crate::ai::driver) fn history_path_with_suffix(base: &Path, suffix: &str) -> PathBuf {
+    let file_name = match base.file_stem() {
+        Some(stem) => {
+            let mut name = stem.to_os_string();
+            name.push(suffix);
+            if let Some(extension) = base.extension() {
+                name.push(".");
+                name.push(extension);
+            }
+            name
+        }
+        None => {
+            let mut name = std::ffi::OsString::from("session");
+            name.push(suffix);
+            name
+        }
+    };
     base.with_file_name(file_name)
+}
+
+/// Generate history file path for a background process.
+/// Inserts `.proc-{pid}` before the final extension so SQLite history files
+/// stay recognizable as SQLite by extension-based dispatch.
+pub(super) fn process_history_path(base: &Path, pid: u64) -> PathBuf {
+    history_path_with_suffix(base, &format!(".proc-{pid}"))
 }
 
 pub(super) fn resolve_background_subagent_context(
@@ -110,4 +126,23 @@ pub(super) fn finalize_turn_quota(
         termination_result = "Completed".to_string();
     }
     (should_terminate, termination_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_history_path_preserves_sqlite_extension() {
+        let got = process_history_path(Path::new("/tmp/session.sqlite"), 42);
+
+        assert_eq!(got, PathBuf::from("/tmp/session.proc-42.sqlite"));
+    }
+
+    #[test]
+    fn history_path_with_suffix_preserves_db_extension() {
+        let got = history_path_with_suffix(Path::new("/tmp/session.db"), ".proc-7");
+
+        assert_eq!(got, PathBuf::from("/tmp/session.proc-7.db"));
+    }
 }

@@ -6,6 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, Local};
+use rust_tools::commonw::FastMap;
 use rust_tools::cw::SkipMap;
 use serde_json::json;
 
@@ -120,6 +121,7 @@ impl SessionStore {
                     std::cmp::Ordering::Greater => -1,
                 }
             });
+        let derived_history_sizes = self.derived_session_history_artifact_sizes()?;
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -156,7 +158,11 @@ impl SessionStore {
             let timestamp = modified_local
                 .map(|dt| dt.timestamp_millis() as u64)
                 .unwrap_or(0);
-            let size_bytes = self.session_size_bytes(&path, &id)?;
+            let size_bytes = self.session_size_bytes(
+                &path,
+                &id,
+                *derived_history_sizes.get(&id).unwrap_or(&0),
+            )?;
             sessions.insert(
                 (timestamp, id.clone()),
                 SessionInfo {
@@ -171,7 +177,12 @@ impl SessionStore {
         Ok(sessions.into_iter().map(|(_, v)| v).collect())
     }
 
-    fn session_size_bytes(&self, sqlite_path: &Path, session_id: &str) -> io::Result<u64> {
+    fn session_size_bytes(
+        &self,
+        sqlite_path: &Path,
+        session_id: &str,
+        derived_history_size: u64,
+    ) -> io::Result<u64> {
         let mut total = file_size_if_exists(sqlite_path)?;
         for suffix in ["-wal", "-shm", "-journal"] {
             total = total.saturating_add(file_size_if_exists(&PathBuf::from(format!(
@@ -180,9 +191,92 @@ impl SessionStore {
                 suffix
             )))?);
         }
+        total = total.saturating_add(derived_history_size);
         total = total.saturating_add(directory_size(&self.session_assets_dir(session_id))?);
         total = total.saturating_add(directory_size(&self.checkpoints_dir(session_id))?);
         Ok(total)
+    }
+
+    fn derived_session_history_artifact_sizes(&self) -> io::Result<FastMap<String, u64>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(FastMap::default());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut sizes: FastMap<String, u64> = FastMap::default();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(session_id) = derived_session_history_artifact_session_id(file_name) else {
+                continue;
+            };
+            let size = entry.metadata()?.len();
+            let total = sizes.entry(session_id).or_insert(0);
+            *total = total.saturating_add(size);
+        }
+        Ok(sizes)
+    }
+
+    fn derived_session_history_artifact_paths(&self, session_id: &str) -> io::Result<Vec<PathBuf>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if derived_session_history_artifact_name_matches(file_name, session_id) {
+                paths.push(entry.path());
+            }
+        }
+        Ok(paths)
+    }
+
+    fn delete_derived_session_history_artifacts(&self, session_id: &str) -> io::Result<bool> {
+        let paths = self.derived_session_history_artifact_paths(session_id)?;
+        let existed = !paths.is_empty();
+        for path in paths {
+            remove_file_if_exists(&path)?;
+        }
+        Ok(existed)
+    }
+
+    fn delete_all_derived_session_history_artifacts(&self) -> io::Result<()> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if is_any_derived_session_history_artifact_name(file_name) {
+                remove_file_if_exists(&entry.path())?;
+            }
+        }
+        Ok(())
     }
 
     pub(in crate::ai) fn delete_session(&self, session_id: &str) -> io::Result<bool> {
@@ -193,9 +287,10 @@ impl SessionStore {
         super::checkpoint::with_checkpoint_lock(&checkpoints, || {
             let existed = path.exists();
             delete_history_artifacts(&path)?;
+            let derived_existed = self.delete_derived_session_history_artifacts(session_id)?;
             delete_assets_dir(&assets)?;
             remove_dir_if_exists(&checkpoints)?;
-            Ok(existed)
+            Ok(existed || derived_existed)
         })
     }
 
@@ -206,6 +301,7 @@ impl SessionStore {
         let checkpoints = self.checkpoints_dir(session_id);
         super::checkpoint::with_checkpoint_lock(&checkpoints, || {
             delete_history_artifacts(&path)?;
+            self.delete_derived_session_history_artifacts(session_id)?;
             delete_assets_dir(&assets)?;
             remove_dir_if_exists(&checkpoints)?;
             Ok(())
@@ -221,6 +317,7 @@ impl SessionStore {
             if path.exists() {
                 super::sqlite::clear_session_history_sqlite(&path)?;
             }
+            self.delete_derived_session_history_artifacts(session_id)?;
             delete_assets_dir(&assets)?;
             remove_dir_if_exists(&checkpoints)?;
             Ok(())
@@ -257,6 +354,7 @@ impl SessionStore {
                     deleted += 1;
                 }
             }
+            self.delete_all_derived_session_history_artifacts()?;
             // 兼容旧版本留下的孤立 checkpoint 目录：它们没有对应的 `.sqlite`，不会被
             // `list_sessions` 枚举，但 clear-all 的语义仍应清空全部会话数据。
             remove_dir_if_exists(&checkpoints_root)?;
@@ -658,6 +756,57 @@ fn file_size_if_exists(path: &Path) -> io::Result<u64> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
         Err(error) => Err(error),
     }
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn derived_session_history_artifact_name_matches(file_name: &str, session_id: &str) -> bool {
+    let current_proc_prefix = format!("{session_id}.proc-");
+    let current_subagent_prefix = format!("{session_id}.subagent-");
+    let legacy_proc_prefix = format!("{session_id}.sqlite.proc-");
+    let legacy_subagent_prefix = format!("{session_id}.sqlite.subagent-");
+
+    ((file_name.starts_with(&current_proc_prefix)
+        || file_name.starts_with(&current_subagent_prefix))
+        && is_sqlite_history_artifact_name(file_name))
+        || file_name.starts_with(&legacy_proc_prefix)
+        || file_name.starts_with(&legacy_subagent_prefix)
+}
+
+fn derived_session_history_artifact_session_id(file_name: &str) -> Option<String> {
+    let (raw_session_id, _) = file_name
+        .split_once(".proc-")
+        .or_else(|| file_name.split_once(".subagent-"))?;
+    if !raw_session_id.ends_with(".sqlite") && !is_sqlite_history_artifact_name(file_name) {
+        return None;
+    }
+    let session_id = raw_session_id
+        .strip_suffix(".sqlite")
+        .unwrap_or(raw_session_id);
+    if SessionStore::validate_session_id(session_id).is_err() {
+        return None;
+    }
+    Some(session_id.to_string())
+}
+
+fn is_any_derived_session_history_artifact_name(file_name: &str) -> bool {
+    ((file_name.contains(".proc-") || file_name.contains(".subagent-"))
+        && is_sqlite_history_artifact_name(file_name))
+        || file_name.contains(".sqlite.proc-")
+        || file_name.contains(".sqlite.subagent-")
+}
+
+fn is_sqlite_history_artifact_name(file_name: &str) -> bool {
+    file_name.ends_with(".sqlite")
+        || file_name.ends_with(".sqlite-wal")
+        || file_name.ends_with(".sqlite-shm")
+        || file_name.ends_with(".sqlite-journal")
 }
 
 /// 统计目录内常规文件的字节数；符号链接不跟随，避免显示尺寸时产生循环或越界读取。
@@ -1319,15 +1468,22 @@ mod tests {
         fs::create_dir_all(&checkpoints_dir).unwrap();
         fs::write(assets_dir.join("asset.bin"), b"assets").unwrap();
         fs::write(checkpoints_dir.join("checkpoint.bin"), b"checkpoints").unwrap();
+        fs::write(
+            store.sessions_root().join("sized.proc-42.sqlite"),
+            b"derived",
+        )
+        .unwrap();
 
         let listed = store.list_sessions().unwrap();
+        assert!(!listed.iter().any(|session| session.id == "sized.proc-42"));
         let session = listed
             .iter()
             .find(|session| session.id == session_id)
             .unwrap();
         let expected_minimum = fs::metadata(&sqlite_path).unwrap().len()
             + b"assets".len() as u64
-            + b"checkpoints".len() as u64;
+            + b"checkpoints".len() as u64
+            + b"derived".len() as u64;
         assert!(session.size_bytes >= expected_minimum);
 
         let _ = fs::remove_dir_all(store.sessions_root());

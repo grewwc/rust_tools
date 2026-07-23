@@ -890,7 +890,7 @@ fn sample_skill(name: &str) -> SkillManifest {
 #[test]
 fn background_task_inherit_history_uses_parent_history_file() {
     let original = PathBuf::from("/tmp/session.sqlite");
-    let process = PathBuf::from("/tmp/session.sqlite.proc-42");
+    let process = PathBuf::from("/tmp/session.proc-42.sqlite");
     let skills = Arc::new(vec![sample_skill("s1")]);
 
     let (effective_history, effective_skills) = super::resolve_background_subagent_context(
@@ -913,7 +913,7 @@ fn background_task_inherit_history_uses_parent_history_file() {
 #[test]
 fn background_task_disable_skills_uses_empty_skill_set() {
     let original = PathBuf::from("/tmp/session.sqlite");
-    let process = PathBuf::from("/tmp/session.sqlite.proc-43");
+    let process = PathBuf::from("/tmp/session.proc-43.sqlite");
     let skills = Arc::new(vec![sample_skill("s1")]);
 
     let (effective_history, effective_skills) = super::resolve_background_subagent_context(
@@ -936,7 +936,7 @@ fn background_task_disable_skills_uses_empty_skill_set() {
 #[test]
 fn non_task_background_process_keeps_process_history_and_skills() {
     let original = PathBuf::from("/tmp/session.sqlite");
-    let process = PathBuf::from("/tmp/session.sqlite.proc-99");
+    let process = PathBuf::from("/tmp/session.proc-99.sqlite");
     let skills = Arc::new(vec![sample_skill("s1")]);
 
     let (effective_history, effective_skills) = super::resolve_background_subagent_context(

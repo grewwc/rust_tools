@@ -446,12 +446,10 @@ fn subagent_wait_error_status(err: &str) -> &'static str {
 }
 
 fn subagent_history_path(base: &std::path::Path, task_id: &str) -> PathBuf {
-    let file_name = base
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| format!("{name}.subagent-{task_id}"))
-        .unwrap_or_else(|| format!("session.subagent-{task_id}"));
-    base.with_file_name(file_name)
+    crate::ai::driver::process_context::history_path_with_suffix(
+        base,
+        &format!(".subagent-{task_id}"),
+    )
 }
 
 #[cfg(test)]
@@ -569,5 +567,15 @@ mod tests {
         assert!(output.contains(&format!("Error: {timeout_error}")));
         assert!(output.contains("(subagent did not produce any final assistant text)"));
         assert!(output.contains(task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER));
+    }
+
+    #[test]
+    fn subagent_history_path_preserves_sqlite_extension() {
+        let got = subagent_history_path(
+            std::path::Path::new("/tmp/session.sqlite"),
+            "abc123",
+        );
+
+        assert_eq!(got, std::path::PathBuf::from("/tmp/session.subagent-abc123.sqlite"));
     }
 }
