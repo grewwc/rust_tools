@@ -22,9 +22,13 @@ fn params_execute_command() -> Value {
             "timeout": {
                 "type": "integer",
                 "description": "Timeout in seconds (1-300; default: 30)."
+            },
+            "pty": {
+                "type": "boolean",
+                "description": "Required execution-mode decision. Set true when an interactive terminal-dependent CLI must render a QR code, prompt, or full-screen interface; set false for ordinary commands so their output keeps normal pipe semantics. The tool cannot forward keyboard input."
             }
         },
-        "required": ["command"]
+        "required": ["command", "pty"]
     })
 }
 
@@ -38,7 +42,7 @@ fn execute_command_streaming_registered(
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "execute_command",
-        description: "Run a shell command with an optional working directory and timeout. Destructive/network/escalation commands are blocked. Output is truncated past a char cap; when truncated the result states how much was shown vs. total and warns that unseen matches may be in the cut-off tail (narrow/page instead of re-running variants). Failures include the exit code.",
+        description: "Run a shell command with an optional working directory and timeout. Every call must explicitly choose `pty`: use true for terminal-dependent QR codes/prompts/full-screen CLIs and false for ordinary commands. Destructive/network/escalation commands are blocked. Output is truncated past a char cap; when truncated the result states how much was shown vs. total and warns that unseen matches may be in the cut-off tail (narrow/page instead of re-running variants). Failures include the exit code.",
         parameters: params_execute_command,
         execute: execute_command,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

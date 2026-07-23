@@ -19,7 +19,7 @@ use super::{
     MarkdownStreamRenderer,
     extract::{StreamTextEvent, extract_chunk_events_streaming, normalize_stream_text},
     framing, normalize,
-    render::markdown::{clamp_line_to_terminal_row, live_preview_cursor_rows},
+    render::markdown::{live_preview_cursor_rows, wrap_line_to_terminal_rows_with_reserve},
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{StreamChunkStep, StreamMarkers, StreamProcessingState, ToolCallBuilder},
 };
@@ -41,6 +41,9 @@ const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
 /// terminal 下 thinking 可见窗口的默认高度。只影响展示，不影响 reasoning 累积。
 const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 2;
+/// thinking / subagent 折叠正文缩进：header/footer 用 2 空格，正文再内缩一层。
+const THINKING_FOLD_BODY_INDENT: &str = "    ";
+const THINKING_FOLD_BODY_INDENT_WIDTH: usize = 4;
 /// 推理流连续重复的最短片段和判定次数。只检测 reasoning，避免把用户要求生成的重复
 /// 正文（表格、代码、测试数据等）误判为模型退化。
 const MIN_REASONING_REPEAT_CHARS: usize = 16;
@@ -1158,13 +1161,14 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
     }
 
     let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
-    let (body, body_rows) = render_thinking_fold_window_lines(&body_lines, marker_lines);
+    let (body, body_rows, rendered_body_lines) =
+        render_thinking_fold_window_lines(&body_lines, marker_lines);
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
     }
     out.flush()?;
     fold.window_rows = body_rows;
-    fold.rendered_body_lines = body_lines;
+    fold.rendered_body_lines = rendered_body_lines;
     Ok(())
 }
 
@@ -1206,12 +1210,13 @@ fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     }
 
     let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
-    let (body, body_rows) = render_thinking_fold_window_lines(&body_lines, marker_lines);
+    let (body, body_rows, rendered_body_lines) =
+        render_thinking_fold_window_lines(&body_lines, marker_lines);
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
     }
     fold.window_rows = body_rows;
-    fold.rendered_body_lines = body_lines;
+    fold.rendered_body_lines = rendered_body_lines;
 
     // 结尾同时给出规模，避免用户还要从折叠提示反推本次 thinking 的长度。
     let line_count = fold
@@ -1269,47 +1274,56 @@ fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<St
     let mut lines = Vec::with_capacity(visible_lines.len() + usize::from(hidden_count > 0));
     let marker_lines = usize::from(hidden_count > 0);
     if hidden_count > 0 {
-        lines.push(clamp_line_to_terminal_row(&format!(
-            "    … {hidden_count} earlier lines"
-        )));
+        lines.push(format!("… {hidden_count} earlier lines"));
     }
     for line in visible_lines {
-        lines.push(clamp_line_to_terminal_row(&format!("    {line}")));
+        lines.push(line.to_string());
     }
     (lines, marker_lines)
 }
 
 /// 渲染折叠窗口的**正文**（折叠摘要 + 最近可见行），不含 header。
 /// header 由 `write_thinking_fold_header` 单独锚定打印。返回的行数即正文物理行数，
-/// 供 `\x1b[{n}A` 精确擦除；正文行数上限为 `max_visible_lines + 1`，恒在视口内。
+/// 供 `\x1b[{n}A` 精确擦除；逻辑行数上限为 `max_visible_lines + 1`，超长行会手动换行。
 fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
     let (lines, marker_lines) = thinking_fold_window_lines(fold);
-    render_thinking_fold_window_lines(&lines, marker_lines)
+    let (window, rows, _) = render_thinking_fold_window_lines(&lines, marker_lines);
+    (window, rows)
 }
 
-fn render_thinking_fold_window_lines(lines: &[String], marker_lines: usize) -> (String, usize) {
+fn render_thinking_fold_window_lines(
+    lines: &[String],
+    marker_lines: usize,
+) -> (String, usize, Vec<String>) {
     if lines.is_empty() {
-        return (String::new(), 0);
+        return (String::new(), 0, Vec::new());
     }
     let mut out = String::new();
-    // 每条可见行都被 clamp 成「最多占一个物理行」，因此窗口物理行数恒等于逻辑行数。
-    // cursor-up 擦除据此精确，不再依赖对自动折行的预测（tab/CJK/超长行/resize 免疫）。
-    let rows = lines.len();
+    let mut rendered_lines = Vec::with_capacity(lines.len());
+    // 折叠正文固定内缩；超长 thinking 手动换成多条同缩进视觉行，避免终端自动折行
+    // 顶到左边界，同时保留完整内容。
+    let mut rows = 0usize;
 
     for (idx, line) in lines.iter().enumerate() {
-        if idx < marker_lines {
-            out.push_str(ACCENT_MUTED);
-            out.push_str(line);
-            out.push_str("\x1b[0m\n");
-        } else {
-            out.push_str(DIM);
-            out.push_str(line);
-            out.push_str(RESET);
-            out.push('\n');
+        let wrapped = wrap_line_to_terminal_rows_with_reserve(line, THINKING_FOLD_BODY_INDENT_WIDTH);
+        for body in wrapped {
+            let rendered_line = format!("{THINKING_FOLD_BODY_INDENT}{body}");
+            rows += live_preview_cursor_rows(&rendered_line);
+            if idx < marker_lines {
+                out.push_str(ACCENT_MUTED);
+                out.push_str(&rendered_line);
+                out.push_str("\x1b[0m\n");
+            } else {
+                out.push_str(DIM);
+                out.push_str(&rendered_line);
+                out.push_str(RESET);
+                out.push('\n');
+            }
+            rendered_lines.push(rendered_line);
         }
     }
 
-    (out, rows)
+    (out, rows, rendered_lines)
 }
 
 fn maybe_write_stream_content(

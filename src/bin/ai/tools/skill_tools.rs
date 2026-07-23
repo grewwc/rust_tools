@@ -69,7 +69,7 @@ pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
     set_pending_skill_activation(skill.name.clone());
     Ok(format!(
         "Skill '{}' will be activated on the next step: its prompt and tool set load into the current turn. \
-         Only continue if this skill clearly matches the user's task; otherwise proceed without it.",
+         It is scoped to this user turn and unloads automatically when the turn ends.",
         skill.name
     ))
 }
@@ -78,10 +78,106 @@ inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "activate_skill",
         description: "Activate a specific skill by name so its full prompt and tool set load into the current turn. \
-                      Only use this when one specific skill clearly matches the user's task. \
-                      Do not activate a skill speculatively or for tasks that need no skill.",
+                      When specialized domain context, workflow, bundled resources, or dedicated tools may help, inspect `list_skills` first. \
+                      Activate only when one listed skill clearly and materially improves the user's task; do not activate for generic work, loose keyword overlap, or just in case. \
+                      Activation is scoped to the current user turn and unloads automatically at turn end.",
         parameters: params_activate_skill,
         execute: execute_activate_skill,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
+const DEFAULT_SKILL_LIST_LIMIT: usize = 50;
+const MAX_SKILL_LIST_LIMIT: usize = 100;
+
+fn params_list_skills() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Optional concise keyword or phrase to filter skill names and descriptions. Omit to browse the installed catalog."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of matching skills to return (default 50, maximum 100)."
+            }
+        }
+    })
+}
+
+fn skill_list_limit(args: &Value) -> usize {
+    args["limit"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(DEFAULT_SKILL_LIST_LIMIT)
+        .clamp(1, MAX_SKILL_LIST_LIMIT)
+}
+
+fn render_skill_catalog(skills: &[SkillManifest], query: &str, limit: usize) -> String {
+    let query = query.trim().to_lowercase();
+    let mut matches = skills
+        .iter()
+        .filter(|skill| {
+            query.is_empty()
+                || skill.name.to_lowercase().contains(&query)
+                || skill.description.to_lowercase().contains(&query)
+        })
+        .collect::<Vec<_>>();
+    // catalog 是发现入口而非排序候选，固定按名字列出以免把 priority 误解为推荐分数。
+    matches.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if matches.is_empty() {
+        return if query.is_empty() {
+            "No installed skills are available. Continue with the current tools.".to_string()
+        } else {
+            format!(
+                "No installed skills matched '{query}'. Refine the query or continue with the current tools."
+            )
+        };
+    }
+
+    let total = matches.len();
+    let shown = total.min(limit);
+    let mut out = format!("Installed skills ({shown} shown of {total}):\n");
+    for skill in matches.into_iter().take(shown) {
+        let description = skill
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if description.is_empty() {
+            out.push_str(&format!("- `{}`\n", skill.name));
+        } else {
+            out.push_str(&format!("- `{}` — {description}\n", skill.name));
+        }
+    }
+    if total > shown {
+        out.push_str(
+            "Results are sorted by name and truncated; refine `query` to browse further.\n",
+        );
+    }
+    out.push_str(
+        "This catalog is metadata only and does not activate a skill. Call `activate_skill(name=...)` only when one listed skill clearly and materially helps the current task.",
+    );
+    out
+}
+
+pub(crate) fn execute_list_skills(args: &Value) -> Result<String, String> {
+    let query = args["query"].as_str().unwrap_or("");
+    let skills = crate::ai::skills::load_all_skills();
+    Ok(render_skill_catalog(&skills, query, skill_list_limit(args)))
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "list_skills",
+        description: "Browse installed skill names and descriptions without activating anything. \
+                      Use this proactively when a task may need specialized domain background, an established workflow, bundled resources, or dedicated tools. \
+                      Do not list skills for generic Q&A or simple work already handled by the current tools.",
+        parameters: params_list_skills,
+        execute: execute_list_skills,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
@@ -381,7 +477,7 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
 mod tests {
     use super::{
         build_skill_file_content, execute_activate_skill, execute_load_skill, render_loaded_skill,
-        take_pending_skill_activation,
+        render_skill_catalog, take_pending_skill_activation,
     };
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};
@@ -451,6 +547,31 @@ mod tests {
         let err =
             execute_load_skill(&serde_json::json!({"name": "definitely-not-a-skill"})).unwrap_err();
         assert!(err.contains("No skill named"));
+    }
+
+    #[test]
+    fn skill_catalog_is_alphabetical_and_exposes_only_metadata() {
+        let mut excel = test_skill("excel-analysis", "Analyze local workbooks");
+        excel.resource_path = Some("/private/excel/resources".to_string());
+        let general = test_skill("general-review", "Review a document");
+        let catalog = render_skill_catalog(&[general, excel], "", 50);
+
+        let excel_pos = catalog.find("`excel-analysis`").unwrap();
+        let general_pos = catalog.find("`general-review`").unwrap();
+        assert!(excel_pos < general_pos);
+        assert!(catalog.contains("Analyze local workbooks"));
+        assert!(!catalog.contains("/private/excel/resources"));
+        assert!(!catalog.contains("## prompt"));
+    }
+
+    #[test]
+    fn skill_catalog_filters_by_name_or_description() {
+        let excel = test_skill("excel-analysis", "Analyze local workbooks");
+        let general = test_skill("general-review", "Review a document");
+        let catalog = render_skill_catalog(&[general, excel], "workbook", 50);
+
+        assert!(catalog.contains("`excel-analysis`"));
+        assert!(!catalog.contains("`general-review`"));
     }
 
     #[test]

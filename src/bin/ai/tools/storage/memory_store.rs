@@ -2022,7 +2022,7 @@ mod retention_tests {
             write_lines(&ap, &[entry("memo", note, "2026-07-01T00:00:00Z", 100)]);
             // 设置递增 mtime，确保排序确定（最旧 -> 最新）
             let times = std::fs::FileTimes::new();
-            times.set_modified(
+            let _ = times.set_modified(
                 UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + i as u64),
             );
             std::fs::File::open(&ap).unwrap().set_times(times).unwrap();

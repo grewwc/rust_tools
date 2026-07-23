@@ -6,6 +6,7 @@ use crate::{commonw::utils::expanduser, strw::split::split_space_keep_symbol};
 
 use std::{
     ffi::OsString,
+    fs::File,
     io::{self, Read},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
@@ -14,7 +15,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{
+    io::FromRawFd,
+    process::CommandExt,
+};
 
 /// 命令执行选项
 ///
@@ -243,6 +247,45 @@ fn configure_child_process_group(cmd: &mut Command) {
 
 #[cfg(not(unix))]
 fn configure_child_process_group(_cmd: &mut Command) {}
+
+/// 让子进程将 slave PTY 作为控制终端。仅把 stdout 接到 PTY 不足以满足一些
+/// CLI 的 TTY 检测；它们还会检查 stdin/stderr 或是否拥有 controlling terminal。
+#[cfg(unix)]
+fn configure_child_process_group_with_controlling_terminal(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY.into(), 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// 打开一对 PTY。master 仅由父进程读取，slave 会成为子进程的 stdin/stdout/stderr。
+#[cfg(unix)]
+fn open_pseudo_terminal() -> io::Result<(File, File)> {
+    let mut master = -1;
+    let mut slave = -1;
+    let result = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // openpty 成功时两个 fd 的所有权都已转移给 File，离开作用域自动关闭。
+    Ok(unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) })
+}
 
 #[cfg(unix)]
 fn terminate_child(child: &mut Child) {
@@ -498,9 +541,61 @@ pub fn run_cmd_output_streaming_with_timeout_tracked<F, C, G>(
     command: &str,
     opts: RunCmdOptions<'_>,
     timeout: Duration,
+    on_chunk: F,
+    should_cancel: C,
+    on_background_group: G,
+) -> io::Result<CommandRunResult>
+where
+    F: FnMut(&[u8]),
+    C: Fn() -> bool,
+    G: FnMut(u32),
+{
+    run_cmd_output_streaming_with_timeout_tracked_inner(
+        command,
+        opts,
+        timeout,
+        on_chunk,
+        should_cancel,
+        on_background_group,
+        false,
+    )
+}
+
+/// 与 [`run_cmd_output_streaming_with_timeout_tracked`] 相同，但让子进程运行在 PTY
+/// 中。仅限需要终端能力（例如扫码登录、全屏交互 CLI）的显式调用；常规命令仍应
+/// 使用管道，以保留 stdout/stderr 分离和普通日志的非交互语义。
+pub fn run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal<F, C, G>(
+    command: &str,
+    opts: RunCmdOptions<'_>,
+    timeout: Duration,
+    on_chunk: F,
+    should_cancel: C,
+    on_background_group: G,
+) -> io::Result<CommandRunResult>
+where
+    F: FnMut(&[u8]),
+    C: Fn() -> bool,
+    G: FnMut(u32),
+{
+    run_cmd_output_streaming_with_timeout_tracked_inner(
+        command,
+        opts,
+        timeout,
+        on_chunk,
+        should_cancel,
+        on_background_group,
+        true,
+    )
+}
+
+fn run_cmd_output_streaming_with_timeout_tracked_inner<F, C, G>(
+    command: &str,
+    opts: RunCmdOptions<'_>,
+    timeout: Duration,
     mut on_chunk: F,
     should_cancel: C,
     mut on_background_group: G,
+    pseudo_terminal: bool,
 ) -> io::Result<CommandRunResult>
 where
     F: FnMut(&[u8]),
@@ -509,25 +604,50 @@ where
 {
     let mut cmd = build_command(command, opts)?;
 
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    configure_child_process_group(&mut cmd);
+    let (mut child, rx) = if pseudo_terminal {
+        #[cfg(unix)]
+        {
+            let (master, slave) = open_pseudo_terminal()?;
+            cmd.stdin(Stdio::from(slave.try_clone()?));
+            cmd.stdout(Stdio::from(slave.try_clone()?));
+            cmd.stderr(Stdio::from(slave));
+            configure_child_process_group_with_controlling_terminal(&mut cmd);
 
-    let mut child = cmd.spawn()?;
+            let child = cmd.spawn()?;
+            let (tx, rx) = mpsc::channel::<(StreamKind, Vec<u8>)>();
+            // PTY 将 stdout/stderr 合并到同一个 master；用 stdout 槽保存，保持上层
+            // "合并输出" 的既有结果语义。
+            spawn_pipe_reader(master, StreamKind::Stdout, tx);
+            (child, rx)
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "pseudo terminal is only supported on Unix",
+            ));
+        }
+    } else {
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        configure_child_process_group(&mut cmd);
+
+        let mut child = cmd.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("missing stdout pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
+        let (tx, rx) = mpsc::channel::<(StreamKind, Vec<u8>)>();
+        spawn_pipe_reader(stdout, StreamKind::Stdout, tx.clone());
+        spawn_pipe_reader(stderr, StreamKind::Stderr, tx);
+        (child, rx)
+    };
     let pgid = child.id();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("missing stdout pipe"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
-    let (tx, rx) = mpsc::channel::<(StreamKind, Vec<u8>)>();
-    spawn_pipe_reader(stdout, StreamKind::Stdout, tx.clone());
-    spawn_pipe_reader(stderr, StreamKind::Stderr, tx.clone());
-    drop(tx);
 
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
@@ -747,6 +867,30 @@ mod tests {
             .unwrap();
             assert!(output.status.success());
             assert_eq!(String::from_utf8_lossy(&streamed), "hello\nworld");
+        }
+    }
+
+    #[test]
+    fn test_pseudo_terminal_makes_standard_streams_tty() {
+        #[cfg(unix)]
+        {
+            let result = super::run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal(
+                "test -t 0 && test -t 1 && test -t 2 && printf pty-ready",
+                RunCmdOptions::default(),
+                Duration::from_secs(2),
+                |_| {},
+                || false,
+                |_| {},
+            )
+            .expect("pseudo-terminal command should run");
+
+            assert!(result.status.is_some_and(|status| status.success()));
+            assert!(
+                String::from_utf8_lossy(&result.stdout).contains("pty-ready"),
+                "expected PTY output, got: {:?}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            assert!(result.stderr.is_empty());
         }
     }
 

@@ -1201,28 +1201,66 @@ fn thinking_fold_window_rows_follow_wrapped_terminal_height() {
     let mut state = StreamProcessingState::new();
     let fold = &mut state.render.thinking_fold;
     fold.max_visible_lines = 2;
-    fold.total_lines = 2;
+    fold.total_lines = 1;
     fold.recent_lines
         .push_back("12345678901234567890".to_string());
-    fold.recent_lines.push_back("abcdef".to_string());
-    fold.current_line = "ghijklmnopqrst".to_string();
+    fold.current_line = "abcdef".to_string();
 
     let (window, rows) = render_thinking_fold_window(fold);
 
-    // 每条可见行被 clamp 成单物理行，窗口物理行数恒等于逻辑行数：
-    // 1 折叠标记 + 2 可见行 = 3。
-    assert_eq!(rows, 3);
-    // 每条渲染行都不超过终端列宽（12），确保 cursor-up 擦除精确。
-    for line in window.lines() {
-        let visible = crate::ai::stream::extract::strip_ansi_codes(line);
+    let plain_lines = window
+        .lines()
+        .map(crate::ai::stream::extract::strip_ansi_codes)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        plain_lines,
+        vec!["    12345678", "    90123456", "    7890", "    abcdef"]
+    );
+    assert_eq!(rows, 4);
+    // 每条手动换行后的视觉行都不超过终端列宽（12），且仍缩进在 thinking 块内。
+    for visible in &plain_lines {
+        assert!(
+            visible.starts_with(THINKING_FOLD_BODY_INDENT),
+            "thinking body should stay nested under header: {visible:?}"
+        );
         assert!(
             unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 12,
             "line exceeds terminal width: {visible:?}"
         );
     }
-    // 未溢出的短行原样保留；溢出的超长行被截断为省略号结尾。
-    assert!(window.contains("abcdef"));
-    assert!(window.contains('…'));
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
+fn thinking_fold_window_indents_body_under_header() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("COLUMNS", "200");
+    }
+
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.max_visible_lines = 2;
+    fold.total_lines = 2;
+    fold.recent_lines.push_back("line-1".to_string());
+    fold.current_line = "line-2".to_string();
+
+    let (window, rows) = render_thinking_fold_window(fold);
+    let plain_lines = window
+        .lines()
+        .map(crate::ai::stream::extract::strip_ansi_codes)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        plain_lines,
+        vec!["    … 1 earlier lines", "    line-1", "    line-2"]
+    );
+    assert_eq!(rows, 3);
 
     unsafe {
         std::env::remove_var("COLUMNS");

@@ -5,7 +5,7 @@ use crate::ai::{
     skills::SkillManifest,
     theme::{
         ACCENT_COMMAND, ACCENT_DANGER, ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY,
-        ACCENT_SUCCESS, ACCENT_WARN, BOLD, DIM, RESET,
+        ACCENT_SUCCESS, ACCENT_TOOL_NAME, ACCENT_WARN, BOLD, DIM, RESET,
     },
     types::App,
 };
@@ -117,14 +117,14 @@ pub(in crate::ai) fn format_assistant_banner(
 pub(in crate::ai) fn format_tool_header(tool_name: &str) -> String {
     format!(
         "{}{}tool{} {}{}{}",
-        BOLD, ACCENT_SUCCESS, RESET, ACCENT_PRIMARY, tool_name, RESET
+        BOLD, ACCENT_SUCCESS, RESET, ACCENT_TOOL_NAME, tool_name, RESET
     )
 }
 
 pub(in crate::ai) fn format_tool_status(status: &str, tool_name: &str, accent: &str) -> String {
     format!(
         "  {}{}{} {}{}{}",
-        accent, status, RESET, ACCENT_PRIMARY, tool_name, RESET
+        accent, status, RESET, ACCENT_TOOL_NAME, tool_name, RESET
     )
 }
 
@@ -133,10 +133,21 @@ pub(in crate::ai) fn format_tool_status_with_file_target(
     target: &str,
 ) -> String {
     let target = sanitize_for_terminal(target);
-    format!(
-        "{}  {}·{} {}{}{}",
-        status_line, ACCENT_MUTED, RESET, ACCENT_SECONDARY, target, RESET
-    )
+    // 当 target 包含行号信息（read_file 的 "path  lines X..Y"）时，
+    // 把路径和行号分开着色，避免同一行两种信息颜色重复。
+    if let Some((path_part, line_part)) = target.split_once("  lines ") {
+        format!(
+            "{}  {}·{} {}{}{} {}{}{}",
+            status_line,
+            ACCENT_MUTED, RESET, ACCENT_SECONDARY, path_part, RESET,
+            ACCENT_COMMAND, line_part, RESET,
+        )
+    } else {
+        format!(
+            "{}  {}·{} {}{}{}",
+            status_line, ACCENT_MUTED, RESET, ACCENT_SECONDARY, target, RESET
+        )
+    }
 }
 
 pub(in crate::ai) fn format_tool_status_running(tool_name: &str) -> String {
@@ -247,7 +258,7 @@ pub(in crate::ai) fn sanitize_for_terminal(text: &str) -> String {
 pub(in crate::ai) fn format_tool_note_line(label: &str, value: &str) -> String {
     format!(
         "  {}│{} {}{}:{} {}{}{}",
-        ACCENT_RULE, RESET, BOLD, label, RESET, ACCENT_PRIMARY, value, RESET
+        ACCENT_RULE, RESET, BOLD, label, RESET, ACCENT_MUTED, value, RESET
     )
 }
 

@@ -946,25 +946,38 @@ fn build_system_prompt(
         );
     }
 
-    if has_tool(available_tools, "enable_tools") {
+    if has_tool(available_tools, "enable_tools")
+        || (skill.is_none()
+            && has_tool(available_tools, "list_skills")
+            && has_tool(available_tools, "activate_skill"))
+    {
         // 未加载能力的详细目录与示例容易在每轮造成无关噪声；统一通过
         // enable_tools 按需发现，只有已经加载的工具才在下方注入具体规则。
         let mut discovery_lines = Vec::new();
-        if skill.is_none() {
+        if skill.is_none() && has_tool(available_tools, "enable_tools") {
             discovery_lines.push(
                 "No skill is active yet. Additional capabilities are available via `enable_tools`; call `enable_tools(operation=list)` to see them, enabling only the specific tools you need.".to_string(),
             );
             discovery_lines.push(
                 "If a task needs an external system or MCP-backed capability, call `enable_tools(operation=list)` to see available tools, then discover and enable matching `mcp_*` tools first.".to_string(),
             );
-        } else {
+        } else if has_tool(available_tools, "enable_tools") {
             discovery_lines.push(
                 "Additional capabilities are available via `enable_tools`; list and enable only what the current task needs.".to_string(),
             );
         }
-        if skill.is_none() && has_tool(available_tools, "activate_skill") {
+        if skill.is_none()
+            && has_tool(available_tools, "list_skills")
+            && has_tool(available_tools, "activate_skill")
+        {
             discovery_lines.push(
-                "If the user explicitly names an installed skill and it clearly matches the task, call `activate_skill(name=...)` directly; do not activate one speculatively.".to_string(),
+                "Skills are optional. When a task may need specialized domain context, an established workflow, bundled resources, or dedicated tools, proactively call `list_skills` to inspect installed skills before deciding whether to use one.".to_string(),
+            );
+            discovery_lines.push(
+                "After inspecting the catalog, call `activate_skill(name=...)` only when one listed skill clearly and materially improves the task. Do not list or activate skills for generic Q&A, simple work already handled by current tools, loose keyword overlap, or just in case.".to_string(),
+            );
+            discovery_lines.push(
+                "Skill activation is limited to the current user turn and unloads automatically after it ends; rediscover and reactivate only when a later turn clearly needs it.".to_string(),
             );
         }
         push_tool_guidance_section(
@@ -1439,6 +1452,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "enable_tools"));
         assert!(names.iter().any(|name| name == "activate_skill"));
+        assert!(names.iter().any(|name| name == "list_skills"));
         assert!(names.iter().any(|name| name == "load_skill"));
         assert!(names.iter().any(|name| name == "read_file"));
         assert!(names.iter().any(|name| name == "knowledge_save"));
@@ -1918,16 +1932,19 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_mentions_direct_skill_activation_when_available() {
+    fn system_prompt_guides_optional_skill_discovery_when_available() {
         let mut available = SkipSet::new(16);
         available.insert("enable_tools".to_string());
         available.insert("activate_skill".to_string());
+        available.insert("list_skills".to_string());
         let prompt =
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
         assert!(prompt.contains("activate_skill"));
+        assert!(prompt.contains("list_skills"));
+        assert!(prompt.contains("Skills are optional"));
+        assert!(prompt.contains("unloads automatically"));
         assert!(prompt.contains("enable_tools"));
-        assert!(!prompt.contains("discover_skills"));
     }
 
     #[test]

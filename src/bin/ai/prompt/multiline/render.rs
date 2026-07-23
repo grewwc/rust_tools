@@ -42,7 +42,7 @@ fn popup_layout_config(
     let top_rule_lines: u16 = 0;
     // 补全面板激活时，把底部帮助压缩为 1 行并隐藏 model/session 信息，
     // 优先把高度让给候选列表；小终端里这能显著减少"只能看到 1 个候选"的情况。
-    let help_lines: u16 = if has_completion_panel { 1 } else { 2 };
+    let help_lines: u16 = 1;
     let model_header_lines = if has_completion_panel || !has_model_label {
         0
     } else {
@@ -337,9 +337,9 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             ),
         ])]
     } else {
-        vec![
-            Line::from(vec![
-                Span::styled("换行：", Style::default().fg(Color::DarkGray)),
+        vec![Line::from({
+            let spans: Vec<Span> = vec![
+                Span::styled("换行:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "↵",
                     Style::default()
@@ -347,7 +347,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled("发送：", Style::default().fg(Color::DarkGray)),
+                Span::styled("发送:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Alt+↵/F2",
                     Style::default()
@@ -355,15 +355,14 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled("取消：", Style::default().fg(Color::DarkGray)),
+                Span::styled("取消:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Ctrl+C",
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(status_info, Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
-                Span::styled("历史：", Style::default().fg(Color::DarkGray)),
+                Span::raw("  "),
+                Span::styled("历史:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "↑↓/Ctrl+P/N",
                     Style::default()
@@ -371,7 +370,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled("删行：", Style::default().fg(Color::DarkGray)),
+                Span::styled("删行:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "⌘/Ctrl+U",
                     Style::default()
@@ -379,7 +378,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled("粘贴：", Style::default().fg(Color::DarkGray)),
+                Span::styled("粘贴:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Ctrl+V",
                     Style::default()
@@ -387,7 +386,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled("清空：", Style::default().fg(Color::DarkGray)),
+                Span::styled("清空:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "F8",
                     Style::default()
@@ -395,7 +394,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled("复制回答：", Style::default().fg(Color::DarkGray)),
+                Span::styled("复制回答:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "F9",
                     Style::default()
@@ -403,21 +402,22 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled("复制全部：", Style::default().fg(Color::DarkGray)),
+                Span::styled("复制全部:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "F10",
                     Style::default()
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::BOLD),
                 ),
-            ]),
-        ]
+            ];
+            spans
+        })]
     };
     f.render_widget(Paragraph::new(help_lines), chunks[4]);
 
     if let Some(msg) = status_msg {
         let c2 = chunks[4];
-        if c2.height >= 2 && c2.width > 2 {
+        if c2.height >= 1 && c2.width > 2 {
             let status_width = (c2.width - 2) as usize;
             let status_text = truncate_with_ellipsis(msg, status_width);
             let status_para = Paragraph::new(Line::from(Span::styled(
@@ -428,7 +428,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             )))
             .alignment(Alignment::Center);
 
-            let status_area = Rect::new(c2.x + 1, c2.y + 1, c2.width - 2, 1);
+            let status_area = Rect::new(c2.x + 1, c2.y, c2.width - 2, 1);
             f.render_widget(Clear, status_area);
             f.render_widget(status_para, status_area);
         }
@@ -646,7 +646,7 @@ mod tests {
         // 紧凑空输入：不再放任何装饰性 divider，避免 resize 后横线残影。
         assert_eq!(layout.top_margin, 0);
         assert_eq!(layout.top_rule_lines, 0);
-        assert_eq!(layout.help_lines, 2);
+        assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
@@ -657,7 +657,7 @@ mod tests {
         // 普通编辑态也不再画 divider，避免 resize/re-anchor 后装饰线堆入 scrollback。
         assert_eq!(layout.top_margin, 0);
         assert_eq!(layout.top_rule_lines, 0);
-        assert_eq!(layout.help_lines, 2);
+        assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }

@@ -1029,6 +1029,35 @@ pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
     out
 }
 
+/// 按当前终端宽度把单个逻辑行拆成多条可见行，并为行首装饰预留列宽。
+///
+/// 与 [`clamp_line_to_terminal_row_with_reserve`] 不同，这里不截断内容；调用方通常会
+/// 给每个返回片段重新加上相同前缀/缩进，让手动换行后的视觉行仍留在同一个块里。
+pub(in crate::ai) fn wrap_line_to_terminal_rows_with_reserve(
+    line: &str,
+    reserve_cols: usize,
+) -> Vec<String> {
+    let cols = raw_terminal_cols().saturating_sub(reserve_cols).max(1);
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut col = 0usize;
+    for ch in line.chars() {
+        let w = terminal_cell_width(ch);
+        if col > 0 && col + w > cols {
+            rows.push(std::mem::take(&mut current));
+            col = 0;
+        }
+        current.push(ch);
+        col += w;
+    }
+    rows.push(current);
+    rows
+}
+
 pub(in crate::ai) fn live_preview_cursor_rows(line: &str) -> usize {
     // 预览行是逐字符原样写入终端、由终端按 **真实** 列宽自动折行的，所以这里必须用
     // raw_terminal_cols（而非保留右边距的 preview_terminal_width）来数物理行数。

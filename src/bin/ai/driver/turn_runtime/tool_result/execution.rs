@@ -29,7 +29,8 @@ use super::{
     preview::{build_terminal_preview, tail_chars},
 };
 use crate::ai::driver::print::{
-    format_tool_output_line, print_tool_command_line, print_tool_note_line,
+    format_tool_output_line, format_tool_output_prefix, print_tool_command_line,
+    print_tool_note_line, sanitize_for_terminal,
 };
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
@@ -629,6 +630,9 @@ struct TerminalToolObserver<'a> {
     app: &'a App,
     active_stream_tool_call_id: Option<String>,
     pending_utf8: Vec<u8>,
+    visual_output_probe: String,
+    visual_output_line: String,
+    visual_output_detected: bool,
     at_line_start: bool,
     streamed_any_output: bool,
     // 流式输出折叠状态
@@ -637,7 +641,57 @@ struct TerminalToolObserver<'a> {
     tty_fold: TtyToolOutputFoldState,
 }
 
-const TOOL_OUTPUT_FOLD_MAX_VISIBLE: usize = 4;
+// 典型终端二维码约 30–50 行；保留 64 行能完整展示扫码登录等一次性视觉输出，
+// 同时仍为构建日志等无界流式输出提供确定上限。
+const TOOL_OUTPUT_FOLD_MAX_VISIBLE: usize = 64;
+// 常规命令日志不应出现在终端；只有连续的 block-glyph 网格才按视觉输出展示。
+// 这个上限既覆盖常见终端二维码，又避免长时间普通日志无限占用探测缓冲区。
+const VISUAL_OUTPUT_PROBE_MAX_BYTES: usize = 16 * 1024;
+const VISUAL_OUTPUT_MIN_CONSECUTIVE_GRID_ROWS: usize = 3;
+const VISUAL_OUTPUT_MIN_BLOCK_GLYPHS_PER_ROW: usize = 8;
+
+/// 判断一行是否像由 Unicode block glyph 绘制的终端视觉输出（例如二维码）。
+/// 不根据命令名做白名单，避免把某个 CLI 的行为硬编码进通用执行器。
+fn is_terminal_visual_grid_line(line: &str) -> bool {
+    line.chars()
+        .filter(|ch| {
+            matches!(
+                ch,
+                '█' | '▀' | '▄' | '▌' | '▐' | '▖' | '▗' | '▘' | '▝' | '▚' | '▞' | '■'
+            )
+        })
+        .count()
+        >= VISUAL_OUTPUT_MIN_BLOCK_GLYPHS_PER_ROW
+}
+
+/// 至少连续三行 block-glyph 网格才视作视觉输出，防止进度条或普通文本误触发。
+fn contains_terminal_visual_grid(text: &str) -> bool {
+    let mut consecutive_rows = 0;
+    for line in text.lines() {
+        if is_terminal_visual_grid_line(line) {
+            consecutive_rows += 1;
+            if consecutive_rows >= VISUAL_OUTPUT_MIN_CONSECUTIVE_GRID_ROWS {
+                return true;
+            }
+        } else {
+            consecutive_rows = 0;
+        }
+    }
+    false
+}
+
+fn trim_visual_output_probe(probe: &mut String) {
+    if probe.len() <= VISUAL_OUTPUT_PROBE_MAX_BYTES {
+        return;
+    }
+
+    let excess = probe.len() - VISUAL_OUTPUT_PROBE_MAX_BYTES;
+    let trim_at = probe
+        .char_indices()
+        .find_map(|(offset, _)| (offset >= excess).then_some(offset))
+        .unwrap_or(probe.len());
+    probe.drain(..trim_at);
+}
 
 #[derive(Debug, Default)]
 struct TtyToolOutputFoldState {
@@ -762,6 +816,9 @@ impl<'a> TerminalToolObserver<'a> {
             app,
             active_stream_tool_call_id: None,
             pending_utf8: Vec::new(),
+            visual_output_probe: String::new(),
+            visual_output_line: String::new(),
+            visual_output_detected: false,
             at_line_start: true,
             streamed_any_output: false,
             fold_total_lines: 0,
@@ -775,6 +832,9 @@ impl<'a> TerminalToolObserver<'a> {
     fn reset_stream_state(&mut self) {
         self.active_stream_tool_call_id = None;
         self.pending_utf8.clear();
+        self.visual_output_probe.clear();
+        self.visual_output_line.clear();
+        self.visual_output_detected = false;
         self.at_line_start = true;
         self.streamed_any_output = false;
         self.fold_total_lines = 0;
@@ -796,11 +856,96 @@ impl<'a> TerminalToolObserver<'a> {
     }
 
     fn push_stream_text(&mut self, text: &str) {
-        // 终端不再打印流式工具输出内容，只保留状态行。
-        // 仍需标记 streamed_any_output 以便 on_tool_finished 输出完成状态。
-        if !text.is_empty() {
-            self.streamed_any_output = true;
+        if text.is_empty() {
+            return;
         }
+        self.streamed_any_output = true;
+        // 工具输出被禁用时仍记录已收到流，避免完成时误报“无输出”，但不可绕过
+        // runtime_ctx 的终端输出开关直接写 stdout。
+        if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+            return;
+        }
+
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let sanitized = sanitize_for_terminal(&normalized);
+        if sanitized.is_empty() {
+            return;
+        }
+
+        if !self.visual_output_detected {
+            self.visual_output_probe.push_str(&sanitized);
+            if !contains_terminal_visual_grid(&self.visual_output_probe) {
+                trim_visual_output_probe(&mut self.visual_output_probe);
+                return;
+            }
+
+            self.visual_output_detected = true;
+            let visual_output = std::mem::take(&mut self.visual_output_probe);
+            self.push_visual_output_text(&visual_output);
+            return;
+        }
+
+        self.push_visual_output_text(&sanitized);
+    }
+
+    /// 已确认存在视觉网格后，仍只展示构成网格的行；后续普通日志保持隐藏。
+    fn push_visual_output_text(&mut self, text: &str) {
+        self.visual_output_line.push_str(text);
+        while let Some(newline_at) = self.visual_output_line.find('\n') {
+            let line = self.visual_output_line[..=newline_at].to_string();
+            self.visual_output_line.drain(..=newline_at);
+            if is_terminal_visual_grid_line(&line) {
+                self.render_visual_output_text(&line);
+            }
+        }
+
+        // 非换行的普通日志不能无限堆积；二维码行会在换行到达后再做判定。
+        if self.visual_output_line.len() > VISUAL_OUTPUT_PROBE_MAX_BYTES {
+            self.visual_output_line.clear();
+        }
+    }
+
+    fn flush_visual_output_line(&mut self) {
+        if self.visual_output_line.is_empty() {
+            return;
+        }
+
+        let line = std::mem::take(&mut self.visual_output_line);
+        if is_terminal_visual_grid_line(&line) {
+            // 补齐换行，避免紧随其后的完成状态与最后一行视觉输出粘连。
+            self.render_visual_output_text(&format!("{line}\n"));
+        }
+    }
+
+    fn render_visual_output_text(&mut self, text: &str) {
+        if self.allow_inline_fold_updates {
+            let _ = self.tty_fold.push_text(text);
+            let _ = std::io::stdout().flush();
+            return;
+        }
+
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.fold_total_lines += 1;
+                if self.fold_total_lines <= TOOL_OUTPUT_FOLD_MAX_VISIBLE {
+                    print!("{RESET}\n");
+                    self.at_line_start = true;
+                } else if self.fold_total_lines == TOOL_OUTPUT_FOLD_MAX_VISIBLE + 1 {
+                    print!("{RESET}\n");
+                    self.at_line_start = true;
+                    println!(
+                        "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· streaming output folded until completion ···{RESET}"
+                    );
+                }
+            } else if self.fold_total_lines < TOOL_OUTPUT_FOLD_MAX_VISIBLE {
+                if self.at_line_start {
+                    print!("{}", format_tool_output_prefix());
+                    self.at_line_start = false;
+                }
+                print!("{ch}");
+            }
+        }
+        let _ = std::io::stdout().flush();
     }
 
     fn push_stream_text_for_tool(&mut self, tool_call: &ToolCall, text: &str) {
@@ -821,9 +966,33 @@ impl<'a> TerminalToolObserver<'a> {
     }
 
     fn finish_stream_output(&mut self, newline: bool) {
-        // 终端不再打印流式工具输出内容，finish 也无需输出可见内容。
-        let _ = newline;
-        self.pending_utf8.clear();
+        self.flush_pending_utf8();
+        self.flush_visual_output_line();
+        if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+            return;
+        }
+        if !self.visual_output_detected {
+            return;
+        }
+        if self.allow_inline_fold_updates {
+            let _ = self.tty_fold.finish();
+            return;
+        }
+        if self.fold_total_lines > TOOL_OUTPUT_FOLD_MAX_VISIBLE {
+            let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
+            println!(
+                "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded ···{RESET}"
+            );
+            self.at_line_start = true;
+        } else if !self.at_line_start {
+            if newline {
+                print!("{RESET}\n");
+                self.at_line_start = true;
+            } else {
+                print!("{RESET}");
+            }
+            let _ = std::io::stdout().flush();
+        }
     }
 
     fn print_prepared_tool_result(&mut self, prepared: &PreparedToolResult) {
@@ -854,6 +1023,9 @@ fn format_command_input(arguments: &str) -> Option<String> {
         if !cwd.is_empty() {
             line.push_str(&format!("  (cwd: {cwd})"));
         }
+    }
+    if args.get("pty").and_then(serde_json::Value::as_bool) == Some(true) {
+        line.push_str("  (PTY)");
     }
     Some(line)
 }
@@ -2402,6 +2574,62 @@ mod tests {
         unsafe {
             std::env::remove_var("COLUMNS");
         }
+    }
+
+    #[test]
+    fn tty_tool_output_fold_window_preserves_mock_qr_output() {
+        // 模拟扫码登录命令输出：二维码通常为 30–50 行，不能被通用日志折叠策略截断。
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe {
+            std::env::set_var("COLUMNS", "200");
+        }
+
+        let mock_qr = (0..41)
+            .map(|row| format!("mock-qr-{row:02} ██  ██  ██  ██"))
+            .collect::<Vec<_>>();
+        let mut fold = TtyToolOutputFoldState::default();
+        fold.total_lines = mock_qr.len();
+        fold.recent_lines.extend(mock_qr.iter().cloned());
+
+        let (window, rows) = render_tty_tool_output_fold_window(&fold);
+        assert_eq!(tty_tool_output_hidden_count(&fold), 0);
+        assert_eq!(rows, mock_qr.len());
+        assert!(!window.contains("lines folded"));
+        for row in &mock_qr {
+            assert!(window.contains(row), "missing QR row: {row}");
+        }
+
+        unsafe {
+            std::env::remove_var("COLUMNS");
+        }
+    }
+
+    #[test]
+    fn terminal_visual_grid_detection_requires_a_block_glyph_grid() {
+        // 普通命令输出（如 git diff）即使有很多行，也不能被渲染到终端。
+        let git_diff = "diff --git a/file.rs b/file.rs\n@@ -1,3 +1,4 @@\n-old line\n+new line\n";
+        assert!(!contains_terminal_visual_grid(git_diff));
+
+        let mock_qr = (0..VISUAL_OUTPUT_MIN_CONSECUTIVE_GRID_ROWS)
+            .map(|row| format!("mock-qr-{row:02} ██  ██  ██  ██"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(contains_terminal_visual_grid(&mock_qr));
+    }
+
+    #[test]
+    fn command_input_marks_pseudo_terminal_mode() {
+        let pty = format_command_input(
+            r#"{"command":"login --qr","pty":true,"cwd":"/tmp"}"#,
+        )
+        .expect("valid command arguments");
+        assert_eq!(pty, "login --qr  (cwd: /tmp)  (PTY)");
+
+        let piped = format_command_input(r#"{"command":"git diff","pty":false}"#)
+            .expect("valid command arguments");
+        assert_eq!(piped, "git diff");
     }
 
     #[test]

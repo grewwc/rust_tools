@@ -141,8 +141,8 @@ pub(super) struct ThinkingFoldState {
     pub(super) total_lines: usize,
     /// 当前折叠窗口（仅正文，不含 header）占用的 terminal 物理行数
     pub(super) window_rows: usize,
-    /// 上次真正写到 terminal 的正文纯文本行（不含 ANSI / header），用于在 terminal
-    /// resize 后按**当前**列宽重算旧窗口会占多少物理行，避免 cursor-up 擦不干净。
+    /// 上次真正写到 terminal 的正文纯文本行（含缩进/截断，不含 ANSI / header），用于在
+    /// terminal resize 后按**当前**列宽重算旧窗口会占多少物理行，避免 cursor-up 擦不干净。
     pub(super) rendered_body_lines: Vec<String>,
     /// 是否处于活跃的 thinking 折叠模式
     pub(super) active: bool,
