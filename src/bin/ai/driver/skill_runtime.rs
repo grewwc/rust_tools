@@ -646,11 +646,6 @@ const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
         hint: "",
     },
     CapabilityEntry {
-        use_case: "Compact or trim conversation context to recover token budget.",
-        tools: &["compact_context"],
-        hint: "",
-    },
-    CapabilityEntry {
         use_case: "Inspect directory contents or enumerate files in a folder.",
         tools: &["list_directory"],
         hint: "",
@@ -1583,6 +1578,22 @@ mod tests {
             available.insert(name);
         }
         assert!(build_hidden_execution_primitive_catalog(&Box::new(available)).is_none());
+    }
+
+    #[test]
+    fn capability_catalog_only_references_registered_tools() {
+        // 能力目录会提示模型按需启用工具；若引用已删除的 builtin，会造成无效调用。
+        // web_* 与 mcp_* 是运行时/外部工具名，不在 Rust builtin registry 中。
+        for entry in super::CAPABILITY_CATALOG {
+            for tool_name in entry.tools {
+                assert!(
+                    crate::ai::tools::registry::common::is_registered_tool_name(tool_name)
+                        || matches!(*tool_name, "web_search" | "web_fetch")
+                        || tool_name.starts_with("mcp_"),
+                    "capability catalog references unregistered tool: {tool_name}"
+                );
+            }
+        }
     }
 
     #[test]
