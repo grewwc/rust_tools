@@ -1,8 +1,9 @@
 use crate::ai::{
     driver::{print::format_empty_state, reflection},
     history::{
-        Message, compact_session_history_at_boundary_with_app, compact_session_history_with_app,
-        value_to_string,
+        Message, SessionTitle, SessionTitleOrigin, compact_session_history_at_boundary_with_app,
+        compact_session_history_with_app, generate_session_summary,
+        is_low_quality_session_title, normalize_generated_session_title, value_to_string,
     },
     types::App,
 };
@@ -269,6 +270,67 @@ fn mark_session_title_generation_finished(session_id: &str) {
     in_flight.remove(session_id);
 }
 
+/// 只在已经拿到可展示的最终回复后生成标题，避免用未完成的首条请求固化标题。
+fn has_completed_assistant_response(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        message.role == "assistant"
+            && message
+                .tool_calls
+                .as_ref()
+                .is_none_or(|tool_calls| tool_calls.is_empty())
+            && !value_to_string(&message.content).trim().is_empty()
+    })
+}
+
+/// fallback 与旧版无来源标题的匹配依据必须保持和落盘时一致。
+fn fallback_session_title(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .map(|message| value_to_string(&message.content))
+        .map(|text| normalize_generated_session_title(&generate_session_summary(&text)))
+        .find(|title| !title.is_empty())
+        .unwrap_or_default()
+}
+
+fn should_generate_model_session_title(
+    existing: Option<&SessionTitle>,
+    fallback_title: &str,
+) -> bool {
+    let Some(existing) = existing else {
+        return true;
+    };
+    if is_low_quality_session_title(&existing.text) {
+        return true;
+    }
+
+    match existing.origin {
+        SessionTitleOrigin::Fallback => true,
+        // 没有来源标记的旧标题只有在与旧 fallback 完全一致时才升级，避免误覆盖
+        // 已经由模型生成的历史好标题。
+        SessionTitleOrigin::Legacy => {
+            !fallback_title.is_empty()
+                && normalize_generated_session_title(&existing.text) == fallback_title
+        }
+        SessionTitleOrigin::Model => false,
+    }
+}
+
+fn should_write_fallback_session_title(
+    existing: Option<&SessionTitle>,
+    fallback_title: &str,
+) -> bool {
+    match existing {
+        None => true,
+        Some(existing) if is_low_quality_session_title(&existing.text) => true,
+        // 迁移旧 fallback 时补上来源标记；之后可以可靠地继续尝试模型升级。
+        Some(existing) => {
+            existing.origin == SessionTitleOrigin::Legacy
+                && normalize_generated_session_title(&existing.text) == fallback_title
+        }
+    }
+}
+
 pub(super) async fn finalize_turn(
     app: &mut App,
     next_model: &str,
@@ -424,79 +486,59 @@ pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: b
 }
 
 async fn generate_session_title_if_missing(app: &App) {
-    use crate::ai::history::{
-        generate_session_summary, is_low_quality_session_title, normalize_generated_session_title,
-    };
-    // eprintln!("[session-title] checking: session_id={} history_file={}", app.session_id, app.session_history_file.display());
-
     // SessionStore 接收基础 history 文件，并据此推导 `<stem>.sessions/`。
     // 传入当前 session sqlite 的父目录会额外拼出一层 `.sessions`，导致标题任务
     // 读取不到当前会话的消息。
     let store = session_title_store(&app.config.history_file);
 
-    if let Some(existing_title) = store.read_session_title(&app.session_id).ok().flatten() {
-        if !is_low_quality_session_title(&existing_title) {
-            return;
-        }
-    }
-
     let all_messages = match store.read_all_messages(&app.session_id) {
-        Ok(m) if !m.is_empty() => {
-            // eprintln!("[session-title] read {} messages", m.len());
-            m
-        }
-        Ok(_) => {
-            // eprintln!("[session-title] no messages found for session {}", app.session_id);
-            return;
-        }
-        Err(_) => {
-            // eprintln!("[session-title] failed to read messages: {e}");
-            return;
-        }
+        Ok(messages) if !messages.is_empty() => messages,
+        Ok(_) | Err(_) => return,
     };
 
-    // 至少需要 1 个 user turn 即可生成标题（首条消息通常已包含核心意图）
-    let user_turns = all_messages.iter().filter(|m| m.role == "user").count();
-    // eprintln!("[session-title] user_turns={user_turns}");
-    if user_turns < 1 {
+    if !has_completed_assistant_response(&all_messages) {
         return;
     }
 
-    // 调用 LLM 生成标题
-    let title = crate::ai::request::generate_session_title_via_model(app, &all_messages).await;
-    // eprintln!("[session-title] LLM returned: {:?}", title.as_deref().unwrap_or("None"));
+    let fallback_title = fallback_session_title(&all_messages);
+    let existing = store
+        .read_session_title_with_origin(&app.session_id)
+        .ok()
+        .flatten();
+    if !should_generate_model_session_title(existing.as_ref(), &fallback_title) {
+        return;
+    }
 
-    // LLM 生成 + 清洗；LLM 返回 None 或清洗后为空时，用首个 user 正文的
-    // `generate_session_summary`（同步、启发式）兜底固化。历史上 None 分支什么都不
-    // 写，导致标题永远缺失、每次展示都回退摘要且下轮仍反复发起昂贵 LLM 请求。
-    let mut resolved = title
-        .map(|t| normalize_generated_session_title(&t))
-        .unwrap_or_default();
-    if resolved.is_empty() {
-        if let Some(first_user) = all_messages
-            .iter()
-            .find(|m| m.role == "user")
-            .map(|m| value_to_string(&m.content))
-            .filter(|s| !s.trim().is_empty())
-        {
-            resolved = normalize_generated_session_title(&generate_session_summary(&first_user));
+    let generated_title = crate::ai::request::generate_session_title_via_model(app, &all_messages)
+        .await
+        .map(|title| normalize_generated_session_title(&title))
+        .filter(|title| !title.is_empty() && !is_low_quality_session_title(title));
+
+    // 网络请求期间，另一个进程可能已写入标题；重新读取后只在仍可升级时覆盖。
+    let current = store
+        .read_session_title_with_origin(&app.session_id)
+        .ok()
+        .flatten();
+    if let Some(title) = generated_title {
+        if should_generate_model_session_title(current.as_ref(), &fallback_title) {
+            let _ = store.write_session_title_with_origin(
+                &app.session_id,
+                &title,
+                SessionTitleOrigin::Model,
+            );
         }
-    }
-    if resolved.is_empty() {
-        // 仍无有效标题（无 user 正文可兜底）：不写，避免固化一个空标题。
         return;
     }
 
-    // 落盘前再查一次：已有非低质标题则不覆盖（并发/竞态下别人可能已写入更优标题）。
-    if let Some(existing_title) = store.read_session_title(&app.session_id).ok().flatten()
-        && !is_low_quality_session_title(&existing_title)
+    // 失败时只补写 fallback，绝不覆盖已有的合格标题；下一次完成回合仍会重试模型。
+    if !fallback_title.is_empty()
+        && should_write_fallback_session_title(current.as_ref(), &fallback_title)
     {
-        return;
-    }
-    if let Err(_) = store.write_session_title(&app.session_id, &resolved) {
-        // eprintln!("[session-title] failed to save title: {}", err);
-    } else {
-        // eprintln!("[session-title] generated: {}", resolved);
+        let _ = store.write_session_title_with_origin(
+            &app.session_id,
+            &fallback_title,
+            SessionTitleOrigin::Fallback,
+        );
     }
 }
 
@@ -621,6 +663,60 @@ mod tests {
         assert!(output.contains("pub mod ai;"));
         assert!(output.contains("[Subagent final answer]\n"));
         assert!(output.ends_with(&long_final));
+    }
+
+    #[test]
+    fn session_title_fallback_and_legacy_titles_remain_eligible_for_model_upgrade() {
+        let fallback = "修复 session title";
+        let fallback_title = SessionTitle {
+            text: fallback.to_string(),
+            origin: SessionTitleOrigin::Fallback,
+        };
+        let legacy_fallback_title = SessionTitle {
+            text: fallback.to_string(),
+            origin: SessionTitleOrigin::Legacy,
+        };
+        let model_title = SessionTitle {
+            text: "完成标题生成修复".to_string(),
+            origin: SessionTitleOrigin::Model,
+        };
+
+        assert!(should_generate_model_session_title(
+            Some(&fallback_title),
+            fallback
+        ));
+        assert!(should_generate_model_session_title(
+            Some(&legacy_fallback_title),
+            fallback
+        ));
+        assert!(!should_generate_model_session_title(
+            Some(&model_title),
+            fallback
+        ));
+    }
+
+    #[test]
+    fn session_title_generation_waits_for_final_assistant_response() {
+        let pending_messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("修复标题".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let completed_messages = vec![
+            pending_messages[0].clone(),
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("已完成修复".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        assert!(!has_completed_assistant_response(&pending_messages));
+        assert!(has_completed_assistant_response(&completed_messages));
     }
 
     #[test]

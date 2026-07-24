@@ -93,6 +93,8 @@ const INTERNAL_COMMANDS: &[&str] = &[
     ":cp",
     "/memo",
     ":memo",
+    "/export",
+    ":export",
     "/model",
     ":model",
     "/agents",

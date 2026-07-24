@@ -35,7 +35,7 @@ use crate::ai::{
     cli::{self},
     config,
     config_schema::AiConfig,
-    history::SessionStore,
+    history::{SessionStore, SuspendedSessionStore},
     mcp::{McpClient, SharedMcpClient},
     models,
     prompt::PromptEditor,
@@ -192,6 +192,32 @@ const EXECUTOR_MAX_ITERATIONS: usize = 64 * 16;
 
 fn one_shot_cli_mode(cli: &cli::ParsedCli) -> bool {
     !cli.args.is_empty() && !cli.interactive
+}
+
+/// Ctrl+C 在 signal handler 中只设置标志；在 driver 事件循环里再安全地落盘当前会话。
+fn should_suspend_session_on_sigint(app: &App) -> bool {
+    if app.cli.session.is_some() {
+        return true;
+    }
+
+    let store = SessionStore::new(app.config.history_file.as_path());
+    !store.is_empty_session(&app.session_id).unwrap_or(false)
+}
+
+fn suspend_session_on_sigint(app: &App) {
+    // 新建但尚未产生用户消息的会话会在退出清理阶段删除，不能留下指向它的挂起条目。
+    if !should_suspend_session_on_sigint(app) {
+        return;
+    }
+
+    if let Err(err) = SuspendedSessionStore::new().suspend_current_terminal(
+        &app.session_id,
+        app.config.history_file.as_path(),
+        &app.active_persona.id,
+        &app.current_model,
+    ) {
+        eprintln!("[suspend] Ctrl+C 退出时保存当前模型失败：{err}");
+    }
 }
 
 fn decision_log_persist_enabled() -> bool {
@@ -707,6 +733,9 @@ async fn run_loop(
         }
 
         if app.shutdown.load(Ordering::Relaxed) {
+            if signal::take_sigint_shutdown_request() {
+                suspend_session_on_sigint(app);
+            }
             cleanup_one_shot(app);
             return Ok(());
         }

@@ -39,6 +39,33 @@ pub(crate) use prepare::QuestionShape;
 use tool_result::{prepare_recent_tool_result, prepare_tool_result};
 pub(super) use types::TurnOutcome;
 
+/// 将相邻压缩阶段合并为一条 status line，避免每个阶段各占一行。
+#[derive(Default)]
+pub(super) struct CompressionReport {
+    entries: Vec<String>,
+}
+
+impl CompressionReport {
+    pub(super) fn record(&mut self, label: impl Into<String>, before: usize, after: usize) {
+        self.entries
+            .push(format!("{}: {before} → {after} chars", label.into()));
+    }
+
+    pub(super) fn note(&mut self, note: impl Into<String>) {
+        self.entries.push(note.into());
+    }
+
+    pub(super) fn render(&self) -> Option<String> {
+        (!self.entries.is_empty()).then(|| self.entries.join(" | "))
+    }
+
+    pub(super) fn emit(self) {
+        if let Some(line) = self.render() {
+            crate::ai::driver::print::print_tool_note_line("compress", &line);
+        }
+    }
+}
+
 pub(super) async fn maybe_generate_session_title(app: &super::App, run_in_background: bool) {
     finalize::maybe_generate_session_title(app, run_in_background).await;
 }
@@ -78,7 +105,7 @@ pub(in crate::ai::driver::turn_runtime) fn max_tool_result_inline_chars(model: &
 /// 导致 mid-turn 压缩在单条 tool 结果就被触发，反而不停 no-op）。
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_SOFT_FLOOR: usize = 36_000;
 /// Mid-turn LLM 摘要硬阈值 floor：经过无损/弱损压缩后仍超过该值，触发 LLM summary
-/// 兜底（会调用一次模型，并显示 "🗜️ compressing context..." 状态行）。
+/// 兜底（会调用一次模型，并在完成后输出一条合并的压缩状态行）。
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_FLOOR: usize = 80_000;
 
 /// 软阈值：min 36K，否则取 history_max_chars * 1.5。
@@ -241,6 +268,21 @@ mod tests {
         history::{Message, SessionStore, build_message_arr},
         types::{App, AppConfig},
     };
+
+    #[test]
+    fn compression_report_merges_adjacent_stages_into_one_line() {
+        let mut report = CompressionReport::default();
+        report.record("mid-turn", 182_743, 182_259);
+        report.record("pre-request LLM (limit 180000)", 182_259, 89_984);
+
+        assert_eq!(
+            report.render().as_deref(),
+            Some(
+                "mid-turn: 182743 → 182259 chars | \
+                 pre-request LLM (limit 180000): 182259 → 89984 chars"
+            )
+        );
+    }
 
     #[test]
     fn llm_summary_attempt_gate_is_shared_across_mid_turn_and_pre_request() {

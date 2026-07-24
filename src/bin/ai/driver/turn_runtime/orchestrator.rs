@@ -20,17 +20,15 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::ai::{mcp::SharedMcpClient, types::App};
 
 use super::{
-    MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
+    CompressionReport, MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
     MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
     MID_TURN_LLM_SUMMARY_MAX_CHARS,
-    finalize::{
-        finalize_turn, maybe_generate_session_title, should_generate_session_title_in_background,
-    },
+    finalize::finalize_turn,
     iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
     mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
     persistence::persist_pending_turn_messages,
-    record_llm_summary_attempt_chars, should_try_llm_summary,
     prepare::prepare_turn,
+    record_llm_summary_attempt_chars, should_try_llm_summary,
     tool_result::handle_iteration_execution,
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
 };
@@ -1129,6 +1127,8 @@ struct TurnSupervisor {
     task_anchor_injected: bool,
     last_compress_iteration: usize,
     last_compress_after_chars: usize,
+    /// 等待与下次 pre-request LLM 压缩结果合并输出的 mid-turn 状态。
+    pending_compression_report: CompressionReport,
     tool_signature_history: Vec<Vec<String>>,
     tool_signature_history_coarse: Vec<Vec<String>>,
     /// 每轮触碰的「coarse 目标资源」集合历史（同 read_file 文件 /
@@ -1523,14 +1523,6 @@ impl TurnSupervisor {
         self.task_anchor_injected = true;
         inject_task_anchor_note(messages, question, self.iteration, reason);
     }
-}
-
-/// 把 mid-turn 压缩状态以 status line 形式输出到终端。
-fn print_compress_status(stage: &str, before: usize, after: usize) {
-    crate::ai::driver::print::print_tool_note_line(
-        "compress",
-        &format!("{stage}: {} → {} chars", before, after),
-    );
 }
 
 /// 工具循环检测命中后，向 messages 注入一条 internal_note 让 agent 自我反思
@@ -3366,18 +3358,12 @@ async fn run_turn_body(
         Err(err) => return Err(err),
     };
 
-    // 第一条用户消息一落盘就启动标题生成，不再等到完整回答结束。
-    // PromptEditor 会在输入框 TUI 中轮询 session title 文件；后台任务完成后，
-    // 下一次 500ms 刷新即可把新标题展示给终端前端。
     persist_pending_turn_messages(
         app,
         one_shot_mode,
         &turn_messages,
         &mut persisted_turn_messages,
     );
-    if should_generate_session_title_in_background(one_shot_mode, should_quit) {
-        maybe_generate_session_title(app, true).await;
-    }
 
     let mut supervisor = TurnSupervisor::default();
     let mut force_final_response = false;
@@ -3423,6 +3409,7 @@ async fn run_turn_body(
             );
         }
         let active_skill_name = skill_turn.matched_skill_name().map(str::to_string);
+        let compression_report = std::mem::take(&mut supervisor.pending_compression_report);
         let execution = match execute_turn_iteration(
             app,
             &next_model,
@@ -3435,6 +3422,7 @@ async fn run_turn_body(
             terminal_dedupe_candidate.as_deref(),
             active_skill_name.as_deref(),
             iteration,
+            compression_report,
         )
         .await
         {
@@ -3727,21 +3715,15 @@ async fn run_turn_body(
             );
             messages = compressed;
             supervisor.mark_compress(after);
+            let mut compression_report = CompressionReport::default();
             if after < before {
-                print_compress_status("mid-turn", before, after);
+                compression_report.record("mid-turn", before, after);
             }
             // 硬阈值：无损 + 弱损管线之后仍超额，调用 LLM 摘要兜底，
-            // 把早期对话压成单条 internal_note，并在终端打 status line。
+            // 把早期对话压成单条 internal_note，并将各压缩阶段合并为一条 status line。
             if after > mid_turn_hard
                 && should_try_llm_summary(&app.session_id, after, mid_turn_hard)
             {
-                crate::ai::driver::print::print_tool_note_line(
-                    "compress",
-                    &format!(
-                        "hard threshold exceeded ({after} > {mid_turn_hard}), \
-                         requesting LLM summary…"
-                    ),
-                );
                 let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
                 let (after_msgs, llm_before, llm_after, did_summarize) =
                     crate::ai::history::mid_turn_llm_summarize(
@@ -3755,14 +3737,20 @@ async fn run_turn_body(
                 messages = after_msgs;
                 record_llm_summary_attempt_chars(&app.session_id, llm_after);
                 if did_summarize {
-                    print_compress_status("mid-turn (llm)", llm_before, llm_after);
+                    compression_report.record(
+                        format!("mid-turn LLM (limit {mid_turn_hard})"),
+                        llm_before,
+                        llm_after,
+                    );
                 } else {
-                    crate::ai::driver::print::print_tool_note_line(
-                        "compress",
+                    compression_report.note(
                         "llm summary skipped (no early dialog or call failed); \
                          agent may hit context limit",
                     );
                 }
+                compression_report.emit();
+            } else {
+                supervisor.pending_compression_report = compression_report;
             }
         }
 

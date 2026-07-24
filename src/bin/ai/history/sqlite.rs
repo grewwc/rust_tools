@@ -1174,7 +1174,7 @@ pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Op
     Ok((!prompts.is_empty()).then(|| prompts.join("\n---\n")))
 }
 
-/// 读取 LLM 生成的 session 标题（存储在 meta 表中，key='session_title'）。
+/// 读取 session 标题（存储在 meta 表中，key='session_title'）。
 pub(in crate::ai) fn read_session_title_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
     let title: Option<String> = conn
@@ -1188,16 +1188,40 @@ pub(in crate::ai) fn read_session_title_sqlite(path: &Path) -> io::Result<Option
     Ok(title.filter(|s| !s.trim().is_empty()))
 }
 
-/// 写入 LLM 生成的 session 标题到 meta 表。
-pub(in crate::ai) fn write_session_title_sqlite(path: &Path, title: &str) -> io::Result<()> {
+/// 读取 session 标题来源（`model` / `fallback`）；缺失时调用方按旧数据处理。
+pub(in crate::ai) fn read_session_title_origin_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
+    let origin: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='session_title_origin' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    Ok(origin.filter(|value| !value.trim().is_empty()))
+}
+
+/// 原子写入 session 标题及其来源，避免 fallback 被误认为模型标题而永久跳过升级。
+pub(in crate::ai) fn write_session_title_sqlite(
+    path: &Path,
+    title: &str,
+    origin: &str,
+) -> io::Result<()> {
+    let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;
-    conn.execute(
+    let tx = conn.transaction().map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute(
         "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES ('session_title', ?1, unixepoch())",
         rusqlite::params![title],
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
-    Ok(())
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES ('session_title_origin', ?1, unixepoch())",
+        rusqlite::params![origin],
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
 fn decode_message_content(content: &str) -> Value {

@@ -6,7 +6,7 @@ use super::{
     has_pending_foreground_process, maybe_auto_route_agent, one_shot_cli_mode,
     reset_scheduler_test_state, resolve_background_subagent_override,
     resolve_startup_session_choice, resolve_startup_session_choice_with_selector,
-    should_preload_mcp, should_publish_subagent_task_result,
+    should_preload_mcp, should_publish_subagent_task_result, should_suspend_session_on_sigint,
     should_resume_suspended_terminal_session, update_dispatch_meta,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
@@ -338,6 +338,44 @@ fn interactive_flag_disables_one_shot_cli_mode() {
 }
 
 #[test]
+fn sigint_does_not_suspend_new_empty_session() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = std::env::temp_dir().join(format!(
+        "rt_sigint_empty_session_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    unsafe {
+        std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", root.join("suspended"));
+        std::env::set_var("TERM_SESSION_ID", "term-empty");
+    }
+
+    let mut app = test_app("build");
+    app.config.history_file = root.join("history.sqlite");
+    app.session_id = "empty-session".to_string();
+
+    assert!(!should_suspend_session_on_sigint(&app));
+    super::suspend_session_on_sigint(&app);
+    assert!(
+        SuspendedSessionStore::new()
+            .peek_entries_for_terminal_key("terminal:term-empty")
+            .unwrap()
+            .is_empty()
+    );
+
+    // 显式恢复的会话即使暂时没有用户消息，也应保留原有挂起语义。
+    app.cli.session = Some(app.session_id.clone());
+    assert!(should_suspend_session_on_sigint(&app));
+
+    unsafe {
+        std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+        std::env::remove_var("TERM_SESSION_ID");
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn resume_predicate_requires_clean_interactive_start() {
     let cli = ParsedCli::default();
     assert!(should_resume_suspended_terminal_session(&cli));
@@ -399,6 +437,7 @@ fn startup_choice_auto_resumes_terminal_bound_session() {
     assert_eq!(choice.session_id, "sess-123");
     assert_eq!(choice.history_file, suspended_history);
     assert_eq!(choice.active_persona.id, reviewer.id);
+    assert_eq!(choice.model.as_deref(), Some("test-model"));
     assert!(choice.startup_notice.is_some());
     assert!(
         SuspendedSessionStore::new()

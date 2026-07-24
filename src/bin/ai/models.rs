@@ -408,6 +408,15 @@ pub(super) fn determine_vl_model(model: &str) -> String {
         return model_handle(def);
     }
 
+    // 用户指定了一个已知模型但不是 VL → 回退默认 VL，不要在 VL 池里强行模糊匹配
+    if let Some(def) = model_names::find_by_identifier(&model) && !def.is_vl {
+        eprintln!(
+            "[note] 模型 `{}` 不支持图片输入，自动使用默认视觉模型",
+            raw
+        );
+        return default_vl_model();
+    }
+
     best_match_model_handle(
         &model,
         vl_model_search_candidates().into_iter(),

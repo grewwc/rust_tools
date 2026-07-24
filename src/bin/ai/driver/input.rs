@@ -93,7 +93,7 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
                     continue;
                 }
                 println!("Exit.");
-                crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
+                crate::ai::driver::signal::request_sigint_shutdown(app.shutdown.as_ref());
                 return Ok(None);
             }
             Err(_) if app.shutdown.load(Ordering::Relaxed) => {
@@ -424,7 +424,7 @@ fn render_history_preview(
     Ok(out.trim_end().to_string())
 }
 
-fn last_assistant_conclusion_text(app: &App) -> Result<Option<String>, Box<dyn Error>> {
+pub(crate) fn last_assistant_conclusion_text(app: &App) -> Result<Option<String>, Box<dyn Error>> {
     let history_file = active_history_path(app);
     let messages = history::build_message_arr(usize::MAX, &history_file)?;
     Ok(messages.iter().rev().find_map(|message| {

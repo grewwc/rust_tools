@@ -220,7 +220,7 @@
     "enable_thinking": true,
     "default_reasoning_effort": "xhigh",
     "subagent_priority": 50,
-    "max_output_tokens": 256000
+    "max_output_tokens": 128000
   },
   {
     "key": "doubao-seed-2.1-turbo",

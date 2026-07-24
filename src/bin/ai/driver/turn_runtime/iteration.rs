@@ -17,7 +17,7 @@ use crate::ai::{
 };
 
 use super::{
-    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
+    CompressionReport, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
     TurnOutcome, context_budget,
     persistence::persist_pending_turn_messages,
     pre_request_llm_summary_threshold, record_llm_summary_attempt_chars, should_try_llm_summary,
@@ -301,6 +301,7 @@ async fn request_model_response(
     messages: &mut Vec<Message>,
     force_final_response: bool,
     _iteration: usize,
+    mut compression_report: CompressionReport,
 ) -> Result<(reqwest::Response, String), request::RequestError> {
     if force_final_response {
         clear_outstanding_task_anchor(messages);
@@ -343,13 +344,6 @@ async fn request_model_response(
     let llm_threshold = pre_request_llm_summary_threshold(next_model, app.config.history_max_chars);
     let session_id = app.session_id.clone();
     if should_try_llm_summary(&session_id, budget_report.after_chars, llm_threshold) {
-        crate::ai::driver::print::print_tool_note_line(
-            "compress",
-            &format!(
-                "pre-request LLM summary: {} > {} chars, requesting summary…",
-                budget_report.after_chars, llm_threshold
-            ),
-        );
         // 取消安全：传入 messages 的 **clone** 而非 `mem::take`。若本次摘要 await
         // 期间被 Ctrl+C 中断，请求 future 被 drop，`messages` 仍保有原始完整内容，
         // 不会退化成空 Vec 导致后续请求发出空上下文 / 丢失消息状态。
@@ -364,13 +358,13 @@ async fn request_model_response(
             .await;
         *messages = after_msgs;
         if did_summarize {
-            crate::ai::driver::print::print_tool_note_line(
-                "compress",
-                &format!("pre-request (llm): {} → {} chars", llm_before, llm_after),
+            compression_report.record(
+                format!("pre-request LLM (limit {llm_threshold})"),
+                llm_before,
+                llm_after,
             );
         } else {
-            crate::ai::driver::print::print_tool_note_line(
-                "compress",
+            compression_report.note(
                 "pre-request LLM summary skipped \
                  (no early dialog to summarize or call failed); \
                  agent may hit context limit",
@@ -378,6 +372,7 @@ async fn request_model_response(
         }
         record_llm_summary_attempt_chars(&session_id, llm_after);
     }
+    compression_report.emit();
 
     let auto_model_fallback_spec = crate::ai::driver::runtime_ctx::auto_model_fallback_spec();
     if crate::ai::driver::runtime_ctx::terminal_output_enabled()
@@ -566,6 +561,7 @@ pub(super) async fn execute_turn_iteration(
     terminal_dedupe_candidate: Option<&str>,
     active_skill_name: Option<&str>,
     iteration: usize,
+    compression_report: CompressionReport,
 ) -> Result<IterationExecution, Box<dyn std::error::Error>> {
     let mut current_history = String::new();
     request::clear_stale_request_interrupt_before_request(app);
@@ -581,6 +577,7 @@ pub(super) async fn execute_turn_iteration(
             messages,
             force_final_response,
             iteration,
+            compression_report,
         ) => response,
         _ = wait_for_request_interrupt(shutdown.clone(), cancel_stream.clone()) => {
             return Ok(interrupted_iteration_execution(

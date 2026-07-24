@@ -35,7 +35,9 @@ pub(in crate::ai) use sessions::generate_session_summary;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::strip_think_tags;
 #[allow(unused_imports)]
-pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
+pub(in crate::ai) use sessions::{
+    SessionInfo, SessionStore, SessionTitle, SessionTitleOrigin,
+};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::{
     append_tool_execution_outcomes_sqlite, read_recent_messages_sqlite,

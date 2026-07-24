@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod checkpoint;
+pub mod export;
 pub mod feishu;
 pub mod goal;
 pub mod help;
@@ -10,6 +11,7 @@ pub mod proc;
 pub mod session;
 pub mod share;
 pub mod skills;
+pub mod status_line;
 pub mod usage;
 
 use std::sync::Arc;
@@ -18,6 +20,7 @@ use crate::ai::{agents::AgentManifest, mcp::SharedMcpClient, skills::SkillManife
 
 pub use agent::try_handle_agent_command;
 pub use checkpoint::try_handle_checkpoint_command;
+pub use export::try_handle_export_command;
 pub use feishu::try_handle_feishu_auth_command;
 pub use goal::try_handle_goal_command;
 pub use help::try_handle_help_command;
@@ -74,6 +77,9 @@ pub fn try_handle_interactive_command(
         return Ok(true);
     }
     if try_handle_share_command(app, input)? {
+        return Ok(true);
+    }
+    if try_handle_export_command(app, input)? {
         return Ok(true);
     }
     Ok(false)

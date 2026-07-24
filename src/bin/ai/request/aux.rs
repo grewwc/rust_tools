@@ -219,7 +219,15 @@ fn is_preserved_content_message(text: &str) -> bool {
 fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<String> {
     messages
         .iter()
-        .filter(|message| !crate::ai::history::is_system_like_role(&message.role))
+        // 工具结果常常很长、且不等于用户想解决的问题。只给标题模型用户意图和
+        // 最终回答，避免工具输出抢占有限的标题上下文窗口。
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .filter(|message| {
+            !message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
+        })
         .filter_map(|message| {
             let content = session_title_text_content(&message.content);
             if content.is_empty() {
@@ -232,12 +240,31 @@ fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<S
             let role = match message.role.as_str() {
                 "user" => "用户",
                 "assistant" => "助手",
-                "tool" => "工具",
-                _ => message.role.as_str(),
+                _ => return None,
             };
             Some(format!("{role}: {content}"))
         })
         .collect()
+}
+
+const SESSION_TITLE_TRANSCRIPT_MAX_CHARS: usize = 8_000;
+const SESSION_TITLE_TRANSCRIPT_HEAD_CHARS: usize = 2_400;
+
+/// 长对话保留开头的用户意图和结尾的最新结论，而不是只截取开头。
+fn compact_session_title_transcript(dialog: &[String]) -> String {
+    let transcript = dialog.join("\n");
+    if transcript.chars().count() <= SESSION_TITLE_TRANSCRIPT_MAX_CHARS {
+        return transcript;
+    }
+
+    let head: String = transcript
+        .chars()
+        .take(SESSION_TITLE_TRANSCRIPT_HEAD_CHARS)
+        .collect();
+    let tail_len = SESSION_TITLE_TRANSCRIPT_MAX_CHARS - SESSION_TITLE_TRANSCRIPT_HEAD_CHARS - 3;
+    let mut tail: Vec<char> = transcript.chars().rev().take(tail_len).collect();
+    tail.reverse();
+    format!("{head}\n…\n{}", tail.into_iter().collect::<String>())
 }
 
 #[cfg(test)]
@@ -298,6 +325,58 @@ mod session_title_tests {
 
         assert!(session_title_dialog_lines(&messages).is_empty());
     }
+
+    #[test]
+    fn title_transcript_ignores_tool_output_and_keeps_final_answer() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Value::String("修复 session title".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("无关且很长的工具输出".repeat(100)),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("已改为在完整回复后生成标题".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        let dialog = session_title_dialog_lines(&messages);
+
+        assert_eq!(
+            dialog,
+            vec![
+                "用户: 修复 session title",
+                "助手: 已改为在完整回复后生成标题"
+            ]
+        );
+    }
+
+    #[test]
+    fn long_title_transcript_keeps_initial_intent_and_final_conclusion() {
+        let dialog = vec![
+            format!("用户: 任务意图{}", "a".repeat(3_000)),
+            format!("助手: 最终结论{}", "b".repeat(6_000)),
+        ];
+
+        let transcript = compact_session_title_transcript(&dialog);
+
+        assert!(transcript.starts_with("用户: 任务意图"));
+        assert!(transcript.ends_with('b'));
+        assert!(transcript.contains("\n…\n"));
+        assert!(transcript.chars().count() <= SESSION_TITLE_TRANSCRIPT_MAX_CHARS);
+    }
 }
 
 /// 用 LLM 为当前对话生成一个简短的概括性标题（不超过 20 字）。
@@ -310,18 +389,15 @@ pub(crate) async fn generate_session_title_via_model(
         return None;
     }
 
-    // 只取最近的文本对话内容用于生成标题（最多 8000 字符）。图片内容不参与标题生成，
-    // 避免模型被截图里的无关 UI 文案干扰；图片请求依赖用户同时输入的文字来概括主题。
+    // 只取用户意图和助手最终回答用于生成标题。图片内容不参与标题生成，避免模型被截图
+    // 里的无关 UI 文案干扰；图片请求依赖用户同时输入的文字来概括主题。
     let dialog = session_title_dialog_lines(messages);
 
     if dialog.is_empty() {
         return None;
     }
 
-    let mut transcript = dialog.join("\n");
-    if transcript.chars().count() > 8000 {
-        transcript = transcript.chars().take(8000).collect();
-    }
+    let transcript = compact_session_title_transcript(&dialog);
 
     let system_prompt = "你是一个对话标题生成器。根据下面的对话内容，生成一个不超过20个字的简短标题，概括对话的核心主题。\n\
 要求：\n\

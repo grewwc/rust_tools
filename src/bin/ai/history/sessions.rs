@@ -15,7 +15,8 @@ use super::{
     markdown::messages_to_markdown,
     sqlite::{
         backup_sqlite, read_all_messages_sqlite, read_first_user_prompt_sqlite,
-        read_session_title_sqlite, remap_context_checkpoint_paths_sqlite,
+        read_session_title_origin_sqlite, read_session_title_sqlite,
+        remap_context_checkpoint_paths_sqlite,
         write_session_title_sqlite,
     },
     types::Message,
@@ -53,6 +54,39 @@ pub(in crate::ai) struct SessionInfo {
     pub(in crate::ai) size_bytes: u64,
     pub(in crate::ai) first_user_prompt: Option<String>,
     pub(in crate::ai) summary: Option<String>,
+}
+
+/// 标题的持久化来源。旧数据库没有来源标记，必须保守处理，避免误覆盖已有好标题。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ai) enum SessionTitleOrigin {
+    Model,
+    Fallback,
+    Legacy,
+}
+
+impl SessionTitleOrigin {
+    fn from_persisted(value: Option<&str>) -> Self {
+        match value {
+            Some("model") => Self::Model,
+            Some("fallback") => Self::Fallback,
+            _ => Self::Legacy,
+        }
+    }
+
+    fn persisted_value(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Fallback => "fallback",
+            // Legacy 只用于读取旧数据，新的写入必须显式标记真实来源。
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ai) struct SessionTitle {
+    pub(in crate::ai) text: String,
+    pub(in crate::ai) origin: SessionTitleOrigin,
 }
 
 impl SessionStore {
@@ -384,29 +418,62 @@ impl SessionStore {
         Ok(count == 0)
     }
 
-    /// 读取 LLM 生成的 session 标题。
+    /// 读取 session 标题。
     pub(in crate::ai) fn read_session_title(&self, session_id: &str) -> io::Result<Option<String>> {
+        Ok(self
+            .read_session_title_with_origin(session_id)?
+            .map(|title| title.text))
+    }
+
+    /// 读取 session 标题及其来源。没有来源标记的旧数据会标为 `Legacy`。
+    pub(in crate::ai) fn read_session_title_with_origin(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<SessionTitle>> {
         Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
         if !path.exists() {
             return Ok(None);
         }
-        read_session_title_sqlite(&path)
+        let Some(text) = read_session_title_sqlite(&path)? else {
+            return Ok(None);
+        };
+        let origin = SessionTitleOrigin::from_persisted(
+            read_session_title_origin_sqlite(&path)?.as_deref(),
+        );
+        Ok(Some(SessionTitle { text, origin }))
     }
 
-    /// 写入 LLM 生成的 session 标题。
+    /// 写入模型生成的 session 标题。
     pub(in crate::ai) fn write_session_title(
         &self,
         session_id: &str,
         title: &str,
     ) -> io::Result<()> {
+        self.write_session_title_with_origin(session_id, title, SessionTitleOrigin::Model)
+    }
+
+    /// 写入 session 标题及其来源。
+    pub(in crate::ai) fn write_session_title_with_origin(
+        &self,
+        session_id: &str,
+        title: &str,
+        origin: SessionTitleOrigin,
+    ) -> io::Result<()> {
         Self::validate_session_id(session_id)?;
-        write_session_title_sqlite(&self.session_history_file(session_id), title)
+        write_session_title_sqlite(
+            &self.session_history_file(session_id),
+            title,
+            origin.persisted_value(),
+        )
     }
 
     /// 检查是否已有 LLM 生成的标题。
     pub(in crate::ai) fn has_generated_title(&self, session_id: &str) -> bool {
-        self.read_session_title(session_id).ok().flatten().is_some()
+        self.read_session_title_with_origin(session_id)
+            .ok()
+            .flatten()
+            .is_some_and(|title| title.origin == SessionTitleOrigin::Model)
     }
 
     pub(in crate::ai) fn read_all_messages(&self, session_id: &str) -> io::Result<Vec<Message>> {
@@ -1231,7 +1298,7 @@ fn strip_filler_prefixes(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionStore, generate_session_summary, is_low_quality_session_title,
+        SessionStore, SessionTitleOrigin, generate_session_summary, is_low_quality_session_title,
         normalize_generated_session_title, strip_think_tags,
     };
     use crate::ai::history::{Message, append_history_messages};
@@ -1320,6 +1387,40 @@ mod tests {
         let fallback = normalize_generated_session_title(&generate_session_summary(notice));
 
         assert!(fallback.is_empty());
+    }
+
+    #[test]
+    fn session_title_origin_persists_with_the_title() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let session_id = "current";
+        store.ensure_root_dir().unwrap();
+
+        store
+            .write_session_title_with_origin(
+                session_id,
+                "修复 session title",
+                SessionTitleOrigin::Fallback,
+            )
+            .unwrap();
+        assert_eq!(
+            store.read_session_title_with_origin(session_id).unwrap(),
+            Some(super::SessionTitle {
+                text: "修复 session title".to_string(),
+                origin: SessionTitleOrigin::Fallback,
+            })
+        );
+
+        store.write_session_title(session_id, "会话标题生成修复").unwrap();
+        assert_eq!(
+            store.read_session_title_with_origin(session_id).unwrap(),
+            Some(super::SessionTitle {
+                text: "会话标题生成修复".to_string(),
+                origin: SessionTitleOrigin::Model,
+            })
+        );
+
+        let _ = fs::remove_dir_all(store.sessions_root());
     }
 
     #[test]

@@ -130,7 +130,7 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
         // 有图片，调用视觉模型理解内容
         println!("[note] Detected image in clipboard, analyzing...");
 
-        let model = crate::ai::models::default_vl_model();
+        let model = crate::ai::models::determine_vl_model(&app.current_model);
 
         // 构建包含图片的消息
         let content = crate::ai::request::build_content(

@@ -11,6 +11,8 @@ static REQUEST_INTERRUPT_FUTEX: LazyLock<Mutex<Option<(usize, FutexAddr)>>> =
     LazyLock::new(|| Mutex::new(None));
 static REQUEST_INTERRUPT_FLAG: AtomicBool = AtomicBool::new(false);
 static REQUEST_INTERRUPT_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+// 仅记录由 Ctrl+C 触发的会话退出；`/sessions close` 等主动退出不能被误判为挂起。
+static SIGINT_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// 当前正在前台同步执行（阻塞父 turn）的子 agent 注册表。
 ///
@@ -151,7 +153,7 @@ pub(in crate::ai) fn handle_sigint(
         }
         SigintAction::Shutdown => {
             crate::ai::tools::registry::common::request_tool_cancel();
-            request_shutdown(shutdown);
+            request_sigint_shutdown(shutdown);
             #[cfg(unix)]
             unsafe {
                 let _ = libc::close(libc::STDIN_FILENO);
@@ -179,6 +181,17 @@ pub(in crate::ai) fn handle_sigint(
 pub(in crate::ai) fn request_shutdown(shutdown: &AtomicBool) {
     shutdown.store(true, Ordering::Relaxed);
     signal_request_interrupt();
+}
+
+/// 标记本次 shutdown 来自 Ctrl+C，供 driver 在安全的事件循环上下文中持久化会话。
+pub(in crate::ai) fn request_sigint_shutdown(shutdown: &AtomicBool) {
+    SIGINT_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+    request_shutdown(shutdown);
+}
+
+/// 读取并清除 Ctrl+C 退出标记，避免后续非信号退出重复挂起会话。
+pub(in crate::ai) fn take_sigint_shutdown_request() -> bool {
+    SIGINT_SHUTDOWN_REQUESTED.swap(false, Ordering::AcqRel)
 }
 
 fn current_global_os() -> Option<aios_kernel::kernel::SharedKernel> {
@@ -347,7 +360,8 @@ pub(in crate::ai) fn sigint_action(
 mod tests {
     use super::{
         ForegroundSubagentGuard, ForegroundTurnGuard, SigintAction, foreground_turn_active,
-        sigint_action, try_cancel_foreground_subagent,
+        request_shutdown, request_sigint_shutdown, sigint_action, take_sigint_shutdown_request,
+        try_cancel_foreground_subagent,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -372,6 +386,25 @@ mod tests {
             sigint_action(&shutdown, &streaming, &cancel_stream, false),
             SigintAction::Shutdown
         );
+    }
+
+    #[test]
+    fn sigint_shutdown_is_marked_separately_from_regular_shutdown() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let shutdown = AtomicBool::new(false);
+        let _ = take_sigint_shutdown_request();
+
+        request_shutdown(&shutdown);
+        assert!(shutdown.load(Ordering::Relaxed));
+        assert!(!take_sigint_shutdown_request());
+
+        shutdown.store(false, Ordering::Relaxed);
+        request_sigint_shutdown(&shutdown);
+        assert!(shutdown.load(Ordering::Relaxed));
+        assert!(take_sigint_shutdown_request());
+        assert!(!take_sigint_shutdown_request());
     }
 
     #[test]
