@@ -1,24 +1,21 @@
-//! 嵌入向量提供方（fastembed 已移除）
+//! 嵌入向量提供方（远程 OpenAI 兼容接口）
 //!
 //! 历史上这里挂的是 `fastembed::TextEmbedding` (MultilingualE5Small)，需要静态
 //! 链接 ONNX Runtime + XNNPACK，占整个 binary ~25MB / 23.6%——属于体积膨胀
 //! 的最大单一原因。
 //!
-//! 现在统一降级为"嵌入不可用"：
-//! - `embed_text` / `embed_texts` 返回 `None`
-//! - 所有调用方（`keyword_search.rs`、`memory_store.rs::search` 的 vector 重排、
-//!   `memory.rs::execute_memory_dedup` 的 cosine 去重等）都已经处理过 `None`
-//!   场景，会自动回退到 BM25 + lexical similarity（dice / jaccard / char_overlap）。
-//! - 语义重排不再生效，但召回仍然是可用的。
-//!
-//! 如果将来想再启用嵌入，建议挂一个外部 embedding HTTP 服务（OpenAI / 自部署
-//! BGE 等）通过 `set_provider` 注入；这里保留 trait + GLOBAL_PROVIDER 的形状
-//! 就是为了未来切换不动调用方。
+//! 当前由 `warm_up` 根据配置安装远程 provider，默认使用火山方舟 Coding Plan 的
+//! `doubao-embedding-vision`。未配置或请求失败时，所有调用方都会自动回退到
+//! BM25 + lexical similarity，检索功能不会中断。
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use dirs::cache_dir;
+
+const DEFAULT_EMBEDDING_ENDPOINT: &str =
+    "https://ark.cn-beijing.volces.com/api/coding/v3/embeddings";
+const DEFAULT_EMBEDDING_MODEL: &str = "doubao-embedding-vision";
 
 pub trait EmbeddingProvider: Sync + Send {
     fn embed(&self, text: &str) -> Option<Vec<f32>>;
@@ -81,15 +78,20 @@ pub fn is_ready() -> bool {
     global_provider().is_ready()
 }
 
-/// 启动时从配置安装远程 embedding provider（阿里云百炼 / 任意 OpenAI 兼容端点）。
+/// 启动时从配置安装远程 embedding provider（默认火山方舟 / 任意 OpenAI 兼容端点）。
 /// 任意一步缺失都保持 NullEmbeddingProvider（即当前 BM25/lexical 行为），不报错。
 pub fn warm_up() {
     use crate::ai::config_schema::AiConfig;
     use crate::commonw::configw;
 
     let cfg = configw::get_all_config();
+    let get_nonempty = |key: &str| {
+        cfg.get_opt(key)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
 
-    // 默认开启：只要配了 api_key（专用 key 或通用 aliyun key）就启用语义检索；
+    // 默认开启：只要配了 api_key（专用 key 或当前端点对应的通用 key）就启用语义检索；
     // 显式设为 false 可关闭。没配 key 时下面会自然回退，不安装 provider。
     let enabled = cfg
         .get_opt(AiConfig::EMBEDDING_ENABLE)
@@ -102,31 +104,29 @@ pub fn warm_up() {
         return;
     }
 
-    // endpoint：默认阿里云百炼 OpenAI 兼容 embeddings 端点。
-    let endpoint = cfg
-        .get_opt(AiConfig::EMBEDDING_ENDPOINT)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings".to_string()
-        });
+    // endpoint：默认使用 Coding Plan 专用的 /api/coding/v3；/api/v3 会产生额外费用。
+    let endpoint = get_nonempty(AiConfig::EMBEDDING_ENDPOINT)
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_ENDPOINT.to_string());
 
-    // api_key：优先专用 key，回退到通用 aliyun key。
-    let api_key = cfg
-        .get_opt(AiConfig::EMBEDDING_API_KEY)
-        .or_else(|| cfg.get_opt(AiConfig::MODEL_ALIYUN_API_KEY))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // api_key：专用 key 优先；无专用 key 时按端点回退到对应平台的通用 key。
+    // 其他 OpenAI 兼容端点必须显式配置 ai.embedding.api_key，避免误用无关平台的 key。
+    let endpoint_lc = endpoint.to_ascii_lowercase();
+    let api_key = get_nonempty(AiConfig::EMBEDDING_API_KEY).or_else(|| {
+        if endpoint_lc.contains("volces.com") {
+            get_nonempty(AiConfig::MODEL_VOLCANO_API_KEY)
+        } else if endpoint_lc.contains("aliyuncs.com") {
+            get_nonempty(AiConfig::MODEL_ALIYUN_API_KEY)
+        } else {
+            None
+        }
+    });
     let Some(api_key) = api_key else {
         // 没配 key：保持降级，不安装。
         return;
     };
 
-    let model = cfg
-        .get_opt(AiConfig::EMBEDDING_MODEL)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "text-embedding-v4".to_string());
+    let model = get_nonempty(AiConfig::EMBEDDING_MODEL)
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
 
     let timeout_ms = cfg
         .get_opt(AiConfig::EMBEDDING_TIMEOUT_MS)
@@ -141,7 +141,7 @@ pub fn warm_up() {
     }));
 }
 
-/// 远程 embedding provider：走 OpenAI 兼容 `/embeddings` 接口（阿里云百炼默认）。
+/// 远程 embedding provider：走 OpenAI 兼容 `/embeddings` 接口。
 ///
 /// 关键约定：**任何失败（网络 / 鉴权 / 解析）都返回 `None`**，让所有调用方
 /// （memory_store::search 的向量重排、rag_tools、dedup 等）自动回退到

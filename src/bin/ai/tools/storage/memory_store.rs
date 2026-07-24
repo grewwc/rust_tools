@@ -460,11 +460,27 @@ impl MemoryStore {
                     .and_then(OsStr::to_str)
                     .unwrap_or("")
                     .to_string();
+                let legacy_base = self
+                    .path
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("")
+                    .to_string();
+                let archive_prefix = format!("{base}.");
+                let legacy_migration_prefix = format!("{legacy_base}.legacy-migrate-");
                 let mut archives = Vec::new();
                 for entry in fs::read_dir(parent).map_err(|e| format!("{}", e))? {
                     let entry = entry.map_err(|e| format!("{}", e))?;
                     let file_name = entry.file_name().to_str().unwrap_or("").to_string();
-                    if !file_name.starts_with(&(base.clone() + ".")) {
+                    let is_rotation_archive = file_name.starts_with(&archive_prefix);
+                    // 旧版迁移曾将原始 JSONL 留为
+                    // `agent_memory.legacy-migrate-<timestamp>.jsonl.bak`。它不符合
+                    // 当前 rotation 的 `<base>.{timestamp}` 命名；仅在 -ns 等显式
+                    // 要求查归档时纳入，避免普通自动召回读取过期迁移快照。
+                    let is_legacy_migration_backup = include_archives
+                        && file_name.starts_with(&legacy_migration_prefix)
+                        && file_name.ends_with(".jsonl.bak");
+                    if !is_rotation_archive && !is_legacy_migration_backup {
                         continue;
                     }
                     let meta = entry.metadata().map_err(|e| format!("{}", e))?;
@@ -1988,8 +2004,8 @@ mod retention_tests {
     }
 
     /// P0 回归：-ns memo 检索（include_archives=true）必须扫描全部归档，
-    /// 不受 keep_last_archives 截断。否则被 rotation 移入旧归档的历史 memo
-    /// 会永久不可检索（用户报告"二次分析问题排查"搜不到的根因）。
+    /// 不受 keep_last_archives 截断；也必须兼容旧迁移留下的 `.jsonl.bak`。
+    /// 否则被 rotation 或迁移移出的历史 memo 会永久不可检索。
     #[test]
     fn entries_by_category_include_archives_scans_all_archives() {
         let path = unique_path("memo_arch_scan");
@@ -2000,6 +2016,7 @@ mod retention_tests {
             .and_then(|n| n.to_str())
             .unwrap()
             .to_string();
+        let legacy_base = path.file_stem().and_then(|n| n.to_str()).unwrap().to_string();
 
         // 主文件：1 条 memo
         write_lines(
@@ -2029,18 +2046,32 @@ mod retention_tests {
             archive_paths.push(ap);
         }
 
+        // 旧版本曾把迁移前的数据留在此命名格式；它不是普通 rotation 归档。
+        let legacy_path = parent.join(format!(
+            "{legacy_base}.legacy-migrate-20260701180745.jsonl.bak"
+        ));
+        write_lines(
+            &legacy_path,
+            &[entry(
+                "memo",
+                "legacy: 二次分析问题排查 mysql",
+                "2026-06-30T00:00:00Z",
+                100,
+            )],
+        );
+
         let store = MemoryStore::for_tests_with_path(path.clone());
         let memos = store.entries_by_category("memo", 100_000, true).unwrap();
 
-        // 主文件 1 + 归档 5 = 6 条，包括最旧归档中的 "二次分析"
+        // 主文件 1 + 普通归档 5 + 旧迁移备份 1 = 7 条。
         assert_eq!(
             memos.len(),
-            6,
-            "include_archives=true 必须扫描全部归档，不应被 keep_last 截断"
+            7,
+            "include_archives=true 必须扫描全部归档及旧迁移备份，不应被 keep_last 截断"
         );
         assert!(
             memos.iter().any(|m| m.note.contains("二次分析")),
-            "最旧归档中的 memo 必须可检索"
+            "最旧归档和旧迁移备份中的 memo 都必须可检索"
         );
 
         // 清理
@@ -2048,5 +2079,6 @@ mod retention_tests {
         for p in archive_paths {
             let _ = std::fs::remove_file(p);
         }
+        let _ = std::fs::remove_file(legacy_path);
     }
 }
