@@ -234,7 +234,7 @@ fn load_all_skills_discovers_external_installed_skill_packages() {
 }
 
 #[test]
-fn skill_watch_roots_only_include_existing_skill_containers() {
+fn skill_watch_roots_exclude_builtin_skills_and_include_existing_skill_containers() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -260,9 +260,10 @@ fn skill_watch_roots_only_include_existing_skill_containers() {
     }
 
     let roots = skill_watch_roots().into_iter().collect::<BTreeSet<_>>();
-    for expected in [skills_dir(), trae_builtin, trae_user, trae_nested, trae_extension] {
+    for expected in [skills_dir(), trae_user, trae_nested, trae_extension] {
         assert!(roots.contains(&expected), "missing root {}", expected.display());
     }
+    assert!(!roots.contains(&trae_builtin));
     assert!(!roots.contains(&home.join(".trae-cn")));
     assert!(!roots.contains(&unrelated));
 

@@ -383,7 +383,7 @@ fn discover_external_skill_dirs() -> Vec<PathBuf> {
 
 fn discover_external_skill_roots() -> Vec<PathBuf> {
     discover_matching_dirs(
-        external_skill_glob_patterns()
+        external_skill_watch_glob_patterns()
             .iter()
             .filter_map(|pattern| pattern.strip_suffix("/*")),
     )
@@ -416,6 +416,16 @@ fn discover_matching_dirs<'a>(patterns: impl IntoIterator<Item = &'a str>) -> Ve
 fn external_skill_glob_patterns() -> &'static [&'static str] {
     &[
         "~/.trae-cn/builtin_skills/*",
+        "~/.trae-cn/skills/*",
+        "~/.trae-cn/builtin/**/skills/*",
+        "~/.trae-cn/extensions/*/skills/*",
+    ]
+}
+
+fn external_skill_watch_glob_patterns() -> &'static [&'static str] {
+    &[
+        // builtin_skills 仍参与加载，但不监听。Linux notify 会把本进程扫描目录产生的
+        // Access/Open 事件回报给 watcher，递归监听该大目录会导致热加载自激循环。
         "~/.trae-cn/skills/*",
         "~/.trae-cn/builtin/**/skills/*",
         "~/.trae-cn/extensions/*/skills/*",
