@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::ai::mcp::SharedMcpClient;
 use crate::ai::{
-    driver::{print::print_ocr_summary, skill_runtime},
+    driver::{print::print_ocr_summary, reflection, skill_runtime},
     history::{
         Message, ROLE_INTERNAL_NOTE, build_context_history, compact_session_history_with_app,
         compress::llm_prune,
@@ -14,6 +14,31 @@ use crate::ai::{
 };
 
 use super::types::TurnPreparation;
+
+const PERSISTENT_GUIDELINES_MAX_CHARS: usize = 4096;
+const AUTO_RECALL_MAX_CHARS: usize = 4096;
+
+fn inject_recalled_knowledge(skill_turn: &mut skill_runtime::SkillTurnGuard, question: &str) {
+    if skill_turn.skip_recall_by_skill() {
+        return;
+    }
+
+    let bundle = reflection::build_recall_bundle(
+        question,
+        PERSISTENT_GUIDELINES_MAX_CHARS,
+        AUTO_RECALL_MAX_CHARS,
+    );
+    if let Some(guidelines) = bundle.guidelines.as_deref() {
+        skill_turn.push_section(skill_runtime::ContextKind::Behavior, guidelines);
+    }
+    if let Some(recalled) = bundle.recalled.as_ref() {
+        skill_turn.push_labeled_section(
+            skill_runtime::ContextKind::Fact,
+            "Auto-Recalled Knowledge",
+            &recalled.content,
+        );
+    }
+}
 
 fn current_request_tool_names(app: &App) -> rust_tools::commonw::FastSet<String> {
     app.agent_context
@@ -244,6 +269,7 @@ pub(super) async fn prepare_turn(
     mcp_client: &SharedMcpClient,
     skill_manifests: &[crate::ai::skills::SkillManifest],
     history_count: usize,
+    turn_index: usize,
     question: &str,
     attachments_text: &str,
     next_model: &str,
@@ -282,6 +308,8 @@ pub(super) async fn prepare_turn(
             &format!("Today's date is {}.", date_str),
         );
     }
+
+    inject_recalled_knowledge(&mut skill_turn, question);
 
     let mut messages = Vec::with_capacity(history.len() + 2);
 
@@ -326,7 +354,7 @@ pub(super) async fn prepare_turn(
             }
             let ctx = crate::ai::driver::observer::PrepareContext {
                 question: question.to_string(),
-                turn_index: history_count,
+                turn_index,
                 available_tool_names: available_tool_names.clone(),
             };
             let obs_name = obs.name().to_string();

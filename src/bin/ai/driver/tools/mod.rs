@@ -110,6 +110,7 @@ struct CachedFileFingerprint {
 const TOOL_CACHE_RECENT_LIMIT: usize = 400;
 const TOOL_CACHE_MAX_RESULT_CHARS: usize = 12_000;
 const TOOL_CACHE_TTL_MINUTES: i64 = 30;
+const TOOL_CACHE_READ_FILE_TOOL: &str = "read_file";
 
 fn route_tool_call(mcp_client: &McpClient, tool_name: &str) -> ToolRoute {
     if let Some((server_name, tool_name)) = mcp_client.parse_tool_name_for_known_server(tool_name) {
@@ -1641,7 +1642,7 @@ fn load_cached_tool_result(
     tool_call: &ToolCall,
     args: &Value,
 ) -> Option<ToolResult> {
-    if !is_cacheable_tool_name(&tool_call.function.name) {
+    if !should_store_or_load_tool_cache(&tool_call.function.name, args) {
         return None;
     }
     let source = format!("session:{session_id}");
@@ -1693,7 +1694,7 @@ fn store_tool_cache_result(
     args: &Value,
     tool_result: &ToolResult,
 ) {
-    if !is_cacheable_tool_name(&tool_call.function.name) {
+    if !should_store_or_load_tool_cache(&tool_call.function.name, args) {
         return;
     }
     if tool_result.content.trim().is_empty() || tool_result.content.starts_with("Error:") {
@@ -1759,6 +1760,16 @@ fn is_cacheable_tool_name(name: &str) -> bool {
     reusable.iter().any(|needle| lower.contains(needle))
 }
 
+fn should_store_or_load_tool_cache(tool_name: &str, args: &Value) -> bool {
+    if !is_cacheable_tool_name(tool_name) {
+        return false;
+    }
+    // 目前只有 read_file 缓存具备可校验的环境指纹。搜索/目录/MCP 读取类工具虽然是
+    // 只读，但其结果会随外部状态变化；没有对应 fingerprint 时不落盘/不命中缓存，
+    // 避免把陈旧检索结果直接回放给模型。
+    tool_name == TOOL_CACHE_READ_FILE_TOOL && !collect_tool_cache_file_fingerprints(tool_name, args).is_empty()
+}
+
 fn build_tool_cache_key(name: &str, args: &Value) -> String {
     use sha2::{Digest, Sha256};
     let args_json = serde_json::to_string(args).unwrap_or_else(|_| args.to_string());
@@ -1780,7 +1791,7 @@ fn collect_tool_cache_file_fingerprints(
     args: &Value,
 ) -> Vec<CachedFileFingerprint> {
     let path = match tool_name {
-        "read_file" => args
+        TOOL_CACHE_READ_FILE_TOOL => args
             .get("file_path")
             .or_else(|| args.get("path"))
             .and_then(Value::as_str),

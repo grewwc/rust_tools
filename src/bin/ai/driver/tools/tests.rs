@@ -8,7 +8,7 @@ use super::{
     is_cacheable_tool_name, is_parallel_safe_tool_call, is_tool_cache_entry_fresh,
     load_async_tool_snapshot, lookup_wait_sources, parallel_safe_batch_len,
     persist_async_tool_snapshot, send_async_tool_pipe_message, should_retry_once,
-    stream_preview_from_aggregate, tool_cache_validation_matches,
+    should_store_or_load_tool_cache, stream_preview_from_aggregate, tool_cache_validation_matches,
 };
 use crate::ai::mcp::McpClient;
 use crate::ai::tools::registry::common::current_process_tool_cancel_futex;
@@ -425,6 +425,34 @@ fn tool_cache_entry_obeys_ttl() {
     };
     assert!(is_tool_cache_entry_fresh(&fresh));
     assert!(!is_tool_cache_entry_fresh(&stale));
+}
+
+#[test]
+fn tool_cache_requires_file_fingerprints() {
+    let path = temp_file_path("tool_cache_requires_fingerprint");
+    fs::write(&path, "hello").unwrap();
+
+    let read_args = json!({
+        "file_path": path.to_string_lossy(),
+        "offset": 1,
+        "limit": 10
+    });
+    assert!(should_store_or_load_tool_cache("read_file", &read_args));
+
+    assert!(!should_store_or_load_tool_cache(
+        "read_file",
+        &json!({"file_path":"/path/that/does/not/exist"})
+    ));
+    assert!(!should_store_or_load_tool_cache(
+        "knowledge_search",
+        &json!({"query":"durable preference"})
+    ));
+    assert!(!should_store_or_load_tool_cache(
+        "list_directory",
+        &json!({"path": path.parent().unwrap().to_string_lossy()})
+    ));
+
+    let _ = fs::remove_file(path);
 }
 
 fn temp_file_path(name: &str) -> std::path::PathBuf {

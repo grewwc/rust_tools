@@ -13,11 +13,14 @@
 //   4. Return TurnOutcome (Quit, Success, or Error)
 // =============================================================================
 
-use std::io::Write;
+use std::{
+    io::Write,
+    sync::{LazyLock, Mutex},
+};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::ai::{mcp::SharedMcpClient, types::App};
+use crate::ai::{history, mcp::SharedMcpClient, types::App};
 
 use super::{
     CompressionReport, MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
@@ -61,6 +64,12 @@ const TOOL_ITERATION_SOFT_LIMIT: usize = 24;
 /// 连续「流读取中断型」截断（stream_error）的重试上限。超过即放弃本 turn，
 /// 避免服务端持续断流时无限重试（尤其后台任务的 max_iterations = usize::MAX）。
 const MAX_STREAM_ERROR_RETRIES: usize = 16;
+/// 连续「模型输出过长 / 工具调用 JSON 半截」截断的重试上限。
+/// stream_error 使用独立上限，不参与该计数。
+const MAX_MODEL_TRUNCATION_RETRIES: usize = 3;
+
+static SESSION_TURN_INDEXES: LazyLock<Mutex<FxHashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 /// === 长循环感知的中段压缩 ===
 /// 中段压缩的软阈值按模型 token 窗口换算（flagship 256K → ~135K 字符）。对
@@ -117,6 +126,26 @@ const MUTATION_TOOL_NAMES: &[&str] = &[
 /// 早于硬上限触发；对默认 2048 这类超大 ceiling，也要在明显失控前提醒收敛。
 fn tool_iteration_soft_limit(max_iterations: usize) -> usize {
     (max_iterations / 2).max(1).min(TOOL_ITERATION_SOFT_LIMIT)
+}
+
+fn persisted_user_turn_count(app: &App) -> usize {
+    history::build_message_arr(usize::MAX, &app.session_history_file)
+        .map(|messages| messages.iter().filter(|message| message.role == "user").count())
+        .unwrap_or(0)
+}
+
+fn next_turn_index(app: &App) -> usize {
+    let persisted_count = persisted_user_turn_count(app);
+    let Ok(mut indexes) = SESSION_TURN_INDEXES.lock() else {
+        return persisted_count;
+    };
+    let entry = indexes.entry(app.session_id.clone()).or_insert(persisted_count);
+    if *entry < persisted_count {
+        *entry = persisted_count;
+    }
+    let turn_index = *entry;
+    *entry = entry.saturating_add(1);
+    turn_index
 }
 
 /// 提取最近一轮 assistant 消息中的 (tool_name, args_json) 签名集合。
@@ -3289,10 +3318,11 @@ pub(in crate::ai::driver) async fn run_turn(
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
     // 把 (session_id, turn_id) 注入 task_local，让下游工具调用与反馈
-    // 写入路径能拿到正确身份。turn_id 复用 history_count（每个 turn 在
-    // 进入时的 history 长度，全 session 内单调递增）。
+    // 写入路径能拿到正确身份。turn_id 使用按 session 递增的 turn 序号，而非
+    // history_count（它只是上下文裁剪参数，常规路径会是 0）。
     let session_id = app.session_id.clone();
-    let turn_id = history_count;
+    let turn_index = next_turn_index(app);
+    let turn_id = turn_index;
     // 仅前台主 turn 抬起「turn 活动」标志：子 agent（sync / background）持有私有
     // 信号标志，且都通过 SUBAGENT_RESULT_SLOT 作用域执行，据此排除。该标志让
     // prepare / 思考 / 阶段切换 / mid-turn 压缩等 streaming=false 的空窗里的
@@ -3307,6 +3337,7 @@ pub(in crate::ai::driver) async fn run_turn(
                 mcp_client,
                 skill_manifests,
                 history_count,
+                turn_index,
                 question,
                 attachments_text,
                 next_model,
@@ -3324,6 +3355,7 @@ async fn run_turn_body(
     mcp_client: &SharedMcpClient,
     skill_manifests: &[crate::ai::skills::SkillManifest],
     history_count: usize,
+    turn_index: usize,
     question: String,
     attachments_text: String,
     next_model: String,
@@ -3347,6 +3379,7 @@ async fn run_turn_body(
         mcp_client,
         skill_manifests,
         history_count,
+        turn_index,
         &question,
         &attachments_text,
         &next_model,
@@ -3562,7 +3595,7 @@ async fn run_turn_body(
                         });
                         // effort 阶梯走到第 3 档仍截断，说明仅靠降 effort 已不足以收敛，
                         // 叠加强制关闭 thinking 作为兜底，把整个输出预算让给可见内容。
-                        if consecutive_truncations >= 3 {
+                        if consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES {
                             app.cli.thinking_disabled_override = true;
                         }
                     } else {
@@ -3579,7 +3612,9 @@ async fn run_turn_body(
                 // 预算）。继续重试通常无帮助——模型会反复产出同样长度的内容。
                 // 给一次降档重试机会后即接受部分文本作为最终回答。
                 // 但 stream_error 场景不计入 consecutive_truncations，不会触发此分支。
-                if has_visible_text && consecutive_truncations >= 16 && !stream_result.stream_error
+                if has_visible_text
+                    && consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
+                    && !stream_result.stream_error
                 {
                     let _ = writeln!(
                         std::io::stderr(),
@@ -3591,7 +3626,9 @@ async fn run_turn_body(
                 }
 
                 // stream_error 已在上面重置 consecutive_truncations=0，不会进入此分支。
-                if consecutive_truncations >= 16 && !stream_result.stream_error {
+                if consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
+                    && !stream_result.stream_error
+                {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ✗ 连续 {} 次响应被截断，停止重试",
