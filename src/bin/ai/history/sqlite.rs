@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use rustc_hash::FxHashSet;
 use serde_json::Value;
 
@@ -13,10 +13,10 @@ use crate::ai::types::ToolCall;
 use super::{
     blob,
     compress::{
-        COMPRESSED_TOOL_EVIDENCE_MARKER, compact_persisted_history, is_summary_note_text,
-        value_to_string,
+        compact_persisted_history, is_summary_note_text, value_to_string,
+        COMPRESSED_TOOL_EVIDENCE_MARKER,
     },
-    types::{MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, ToolExecutionOutcome},
+    types::{Message, ToolExecutionOutcome, MAX_HISTORY_TURNS, ROLE_INTERNAL_NOTE},
 };
 
 const STALE_PATCH_TARGETS_META_KEY: &str = "stale_patch_targets_v1";
@@ -118,6 +118,47 @@ fn bump_history_revision(conn: &Connection) -> io::Result<()> {
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(())
+}
+
+/// 原子预留一个 session 全局 turn 序号。
+///
+/// 序号写入 SQLite 元数据而不是保存在进程内存中，因此重启和多个进程并发恢复
+/// 同一 session 时也不会重复。旧 session 首次分配时从已持久化的 user turn 数
+/// 继续编号，兼容此前 `turn_index` 的语义。
+pub(in crate::ai) fn reserve_turn_index_sqlite(path: &Path) -> io::Result<usize> {
+    let mut conn = open_history_db(path)?;
+    init_history_schema(&conn)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let current = tx
+        .query_row("SELECT value FROM meta WHERE key = 'turn_seq'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_else(|| {
+            tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE role = 'user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+        })
+        .max(0);
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("turn sequence overflow"))?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES('turn_seq', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![next.to_string()],
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
+    usize::try_from(current).map_err(io::Error::other)
 }
 
 /// 用 SQLite Online Backup API 创建一致快照，并以原子替换的方式写入目标。
@@ -415,8 +456,8 @@ pub(in crate::ai) fn write_stale_patch_targets_sqlite(
     }
     let mut paths = targets.iter().cloned().collect::<Vec<_>>();
     paths.sort();
-    let encoded = serde_json::to_string(&paths)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let encoded =
+        serde_json::to_string(&paths).map_err(|error| io::Error::other(error.to_string()))?;
     let conn = open_history_db(path)?;
     init_history_schema(&conn)?;
     conn.execute(
@@ -1043,10 +1084,14 @@ pub(in crate::ai) fn clear_session_history_sqlite(path: &Path) -> io::Result<()>
     tx.execute("DELETE FROM tool_execution_outcomes", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
     // 保留 history_revision 行：它是缓存失效计数器，须跨 clear **单调递增**。
+    // turn_seq 同样是 session 级身份，清空上下文不能让旧序号被复用。
     // 若连同它一起删掉，bump 会从 1 重新开始，版本号回退后可能与早期缓存
     // 条目的 revision 撞车，反而让已失效的旧历史被误命中。
-    tx.execute("DELETE FROM meta WHERE key != 'history_revision'", [])
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute(
+        "DELETE FROM meta WHERE key NOT IN ('history_revision', 'turn_seq')",
+        [],
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
     bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
@@ -1210,7 +1255,9 @@ pub(in crate::ai) fn write_session_title_sqlite(
 ) -> io::Result<()> {
     let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;
-    let tx = conn.transaction().map_err(|e| io::Error::other(e.to_string()))?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| io::Error::other(e.to_string()))?;
     tx.execute(
         "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES ('session_title', ?1, unixepoch())",
         rusqlite::params![title],
@@ -1305,6 +1352,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn turn_sequence_is_atomic_and_survives_history_clear() {
+        let dir = std::env::temp_dir().join(format!(
+            "turn_sequence_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        append_history_sqlite(&path, vec![msg("user", "first"), msg("user", "second")]).unwrap();
+
+        // 旧 session 第一次升级时从已落盘的 user turn 数继续编号。
+        assert_eq!(reserve_turn_index_sqlite(&path).unwrap(), 2);
+        assert_eq!(reserve_turn_index_sqlite(&path).unwrap(), 3);
+
+        clear_session_history_sqlite(&path).unwrap();
+        assert_eq!(reserve_turn_index_sqlite(&path).unwrap(), 4);
+
+        // 每个线程都建立独立连接，覆盖多 runtime / 多进程相同的事务竞争路径。
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || reserve_turn_index_sqlite(&path).unwrap())
+            })
+            .collect();
+        let mut indexes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        indexes.sort_unstable();
+        assert_eq!(indexes, (5..13).collect::<Vec<_>>());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// P1 回归：`read_history_revision` 必须**跨连接**观察到写入递增。
     /// 每次写路径都开新连接读版本号，模拟 build_context_history 的缓存失效判定。
     /// 旧实现用连接局部的 `PRAGMA data_version`，新连接恒返回固定值，无法失效缓存。
@@ -1364,16 +1449,20 @@ mod tests {
         let path = dir.join("history.sqlite");
         append_history_sqlite(&path, vec![msg("user", "before compression")]).unwrap();
 
-        let targets = FxHashSet::from_iter([
-            PathBuf::from("/tmp/a.rs"),
-            PathBuf::from("/tmp/b.rs"),
-        ]);
+        let targets =
+            FxHashSet::from_iter([PathBuf::from("/tmp/a.rs"), PathBuf::from("/tmp/b.rs")]);
         write_stale_patch_targets_sqlite(&path, &targets).unwrap();
-        assert_eq!(read_stale_patch_targets_sqlite(&path).unwrap(), Some(targets.clone()));
+        assert_eq!(
+            read_stale_patch_targets_sqlite(&path).unwrap(),
+            Some(targets.clone())
+        );
 
         // replace_all_messages 是持久化 history 压缩/改写路径；账本不能随消息形态丢失。
         replace_all_messages_sqlite(&path, &[msg("user", "after compression")]).unwrap();
-        assert_eq!(read_stale_patch_targets_sqlite(&path).unwrap(), Some(targets));
+        assert_eq!(
+            read_stale_patch_targets_sqlite(&path).unwrap(),
+            Some(targets)
+        );
 
         // 显式空集合也要与“旧库尚无 meta”区分，防止恢复时误走 legacy 回放。
         write_stale_patch_targets_sqlite(&path, &FxHashSet::default()).unwrap();
@@ -1439,7 +1528,10 @@ mod tests {
         let expected = vec![outcome("call-1"), outcome("call-2")];
         append_tool_execution_outcomes_sqlite(&path, &expected).unwrap();
 
-        assert_eq!(read_tool_execution_outcomes_sqlite(&path).unwrap(), expected);
+        assert_eq!(
+            read_tool_execution_outcomes_sqlite(&path).unwrap(),
+            expected
+        );
         assert_eq!(read_all_messages_sqlite(&path).unwrap(), original_messages);
 
         replace_all_messages_sqlite(&path, &[tool_msg("call-2", "second")]).unwrap();
@@ -1457,18 +1549,25 @@ mod tests {
         );
 
         clear_session_history_sqlite(&path).unwrap();
-        assert!(read_tool_execution_outcomes_sqlite(&path).unwrap().is_empty());
+        assert!(read_tool_execution_outcomes_sqlite(&path)
+            .unwrap()
+            .is_empty());
 
         // 旧历史可能已经复用过同一 ID；改变消息集合前必须永久丢弃其歧义 outcome，
         // 否则删除较新的 occurrence 后会把它的状态错误绑定到保留的旧消息。
         append_history_sqlite(
             &path,
-            vec![tool_msg("legacy-reused", "older"), tool_msg("legacy-reused", "newer")],
+            vec![
+                tool_msg("legacy-reused", "older"),
+                tool_msg("legacy-reused", "newer"),
+            ],
         )
         .unwrap();
         append_tool_execution_outcomes_sqlite(&path, &[outcome("legacy-reused")]).unwrap();
         replace_all_messages_sqlite(&path, &[tool_msg("legacy-reused", "older")]).unwrap();
-        assert!(read_tool_execution_outcomes_sqlite(&path).unwrap().is_empty());
+        assert!(read_tool_execution_outcomes_sqlite(&path)
+            .unwrap()
+            .is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1489,7 +1588,9 @@ mod tests {
 
         append_tool_execution_outcomes_sqlite(&path, &[outcome("call-1")]).unwrap();
 
-        assert!(read_tool_execution_outcomes_sqlite(&path).unwrap().is_empty());
+        assert!(read_tool_execution_outcomes_sqlite(&path)
+            .unwrap()
+            .is_empty());
         assert!(read_tool_message_ids_sqlite(&path).unwrap().is_empty());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),

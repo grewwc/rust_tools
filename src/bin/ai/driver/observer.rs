@@ -2,10 +2,10 @@ use serde_json::Value;
 
 pub struct PrepareContext {
     pub question: String,
-    /// 当前 turn 在 session 内的序号（单调递增），
-    /// 用 history_count 填充，作为上下文膨胀程度的代理指标。
+    /// 当前 turn 在 session 内持久化的全局序号（单调递增），
+    /// 普通、resume 和 internal turn 都会占用独立序号。
     /// observer 可据此决定是否注入"上下文预算"提醒。
-    /// 默认 0 表示首次调用（无历史消息）。
+    /// 0 表示该 session 首次调用。
     pub turn_index: usize,
     /// 当前 agent 可用的工具名列表，observer 可据此决定是否注入委派提示。
     pub available_tool_names: Vec<String>,

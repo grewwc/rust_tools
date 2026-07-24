@@ -14,6 +14,15 @@ pub struct AutoRecalledKnowledge {
     pub entry_count: usize,
     pub project_hint: Option<String>,
     pub categories: Vec<String>,
+    pub min_relevance_score: f64,
+    pub max_relevance_score: f64,
+    pub project_match_count: usize,
+}
+
+#[derive(Clone)]
+struct ScoredRecallEntry {
+    entry: KnowledgeEntry,
+    relevance_score: f64,
 }
 
 /// Build persistent guidelines for the system prompt.
@@ -238,8 +247,8 @@ pub fn build_auto_recalled_knowledge_with_project(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    let mut entries: Vec<KnowledgeEntry> = Vec::new();
-    let mut seen = rust_tools::cw::SkipSet::new(32);
+    let mut entries: Vec<ScoredRecallEntry> = Vec::new();
+    let mut entry_indexes = rustc_hash::FxHashMap::default();
 
     let mut query_variants = Vec::new();
     query_variants.push(q.to_string());
@@ -257,8 +266,15 @@ pub fn build_auto_recalled_knowledge_with_project(
                     continue;
                 }
                 let key = entry.dedup_key();
-                if seen.insert(key) {
-                    entries.push(entry);
+                if let Some(&index) = entry_indexes.get(&key) {
+                    let existing: &mut ScoredRecallEntry = &mut entries[index];
+                    existing.relevance_score = existing.relevance_score.max(score);
+                } else {
+                    entry_indexes.insert(key, entries.len());
+                    entries.push(ScoredRecallEntry {
+                        entry,
+                        relevance_score: score,
+                    });
                 }
             }
         }
@@ -268,26 +284,27 @@ pub fn build_auto_recalled_knowledge_with_project(
         return None;
     }
 
-    deduplicate_entries(&mut entries, config.thresholds.dedup_similarity_knowledge);
+    deduplicate_scored_entries(&mut entries, config.thresholds.dedup_similarity_knowledge);
 
     let project_hint_lc = project_hint.as_deref().map(|s| s.to_lowercase());
     entries.sort_by(|a, b| {
         let a_project = project_hint_lc
             .as_deref()
-            .map(|hint| a.mentions_project(hint))
+            .map(|hint| a.entry.mentions_project(hint))
             .unwrap_or(false);
         let b_project = project_hint_lc
             .as_deref()
-            .map(|hint| b.mentions_project(hint))
+            .map(|hint| b.entry.mentions_project(hint))
             .unwrap_or(false);
         b_project
             .cmp(&a_project)
-            .then_with(|| b.priority_value().cmp(&a.priority_value()))
+            .then_with(|| b.relevance_score.total_cmp(&a.relevance_score))
+            .then_with(|| b.entry.priority_value().cmp(&a.entry.priority_value()))
             .then_with(|| {
-                let b_ts = parse_ts_utc(&b.timestamp)
+                let b_ts = parse_ts_utc(&b.entry.timestamp)
                     .map(|dt| dt.timestamp())
                     .unwrap_or(0);
-                let a_ts = parse_ts_utc(&a.timestamp)
+                let a_ts = parse_ts_utc(&a.entry.timestamp)
                     .map(|dt| dt.timestamp())
                     .unwrap_or(0);
                 b_ts.cmp(&a_ts)
@@ -307,8 +324,11 @@ pub fn build_auto_recalled_knowledge_with_project(
     let mut first_entry_project_match = false;
     let mut strongest_project_priority = 0u8;
     let mut categories = Vec::new();
+    let mut min_relevance_score = f64::INFINITY;
+    let mut max_relevance_score = f64::NEG_INFINITY;
 
-    for (idx, entry) in entries.into_iter().take(max_entries).enumerate() {
+    for (idx, scored) in entries.into_iter().take(max_entries).enumerate() {
+        let entry = scored.entry;
         let is_project_match = project_hint_lc
             .as_deref()
             .map(|hint| entry.mentions_project(hint))
@@ -321,6 +341,8 @@ pub fn build_auto_recalled_knowledge_with_project(
                 if !categories.iter().any(|cat| cat == &entry.category) {
                     categories.push(entry.category.clone());
                 }
+                min_relevance_score = min_relevance_score.min(scored.relevance_score);
+                max_relevance_score = max_relevance_score.max(scored.relevance_score);
                 if is_project_match {
                     appended_project_matches += 1;
                     strongest_project_priority =
@@ -337,6 +359,8 @@ pub fn build_auto_recalled_knowledge_with_project(
         if !categories.iter().any(|cat| cat == &entry.category) {
             categories.push(entry.category.clone());
         }
+        min_relevance_score = min_relevance_score.min(scored.relevance_score);
+        max_relevance_score = max_relevance_score.max(scored.relevance_score);
         if is_project_match {
             appended_project_matches += 1;
             strongest_project_priority = strongest_project_priority.max(entry.priority_value());
@@ -365,6 +389,9 @@ pub fn build_auto_recalled_knowledge_with_project(
         entry_count: appended,
         project_hint,
         categories,
+        min_relevance_score,
+        max_relevance_score,
+        project_match_count: appended_project_matches,
     })
 }
 
@@ -458,6 +485,45 @@ fn deduplicate_entries(entries: &mut Vec<KnowledgeEntry>, similarity_threshold: 
         }
     }
     *entries = filtered;
+}
+
+fn deduplicate_scored_entries(entries: &mut Vec<ScoredRecallEntry>, similarity_threshold: f64) {
+    if entries.len() <= 1 {
+        return;
+    }
+    let mut keep = vec![true; entries.len()];
+    for i in 0..entries.len() {
+        if !keep[i] {
+            continue;
+        }
+        for j in (i + 1)..entries.len() {
+            if !keep[j] {
+                continue;
+            }
+            let sim = similarity::note_similarity(&entries[i].entry.note, &entries[j].entry.note);
+            if sim < similarity_threshold {
+                continue;
+            }
+            let max_score = entries[i].relevance_score.max(entries[j].relevance_score);
+            let pri_i = entries[i].entry.priority_value();
+            let pri_j = entries[j].entry.priority_value();
+            if pri_j > pri_i
+                || (pri_j == pri_i && entries[j].relevance_score > entries[i].relevance_score)
+            {
+                entries[j].relevance_score = max_score;
+                keep[i] = false;
+                break;
+            }
+            entries[i].relevance_score = max_score;
+            keep[j] = false;
+        }
+    }
+    let mut index = 0usize;
+    entries.retain(|_| {
+        let should_keep = keep[index];
+        index += 1;
+        should_keep
+    });
 }
 
 fn push_entry_lines(
@@ -588,6 +654,49 @@ mod tests {
                 image_path: None,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn auto_recall_ranks_relevance_before_priority_and_exposes_evidence() {
+        let path = test_store_path("relevance_rank");
+        let store = JsonlStore::new(path.clone());
+        append_entry(
+            &store,
+            "user_memory",
+            "rust lifetime checker operations policy for release deployment",
+            "rust_tools",
+            255,
+        );
+        append_entry(
+            &store,
+            "user_memory",
+            "rust lifetime borrow checker ownership diagnostics",
+            "rust_tools",
+            10,
+        );
+
+        let recalled = build_auto_recalled_knowledge_with_project(
+            &store,
+            "rust lifetime borrow checker",
+            1200,
+            Some("rust_tools"),
+            &KnowledgeConfig::default(),
+        )
+        .expect("query should recall both matching entries");
+
+        let specific = recalled
+            .content
+            .find("rust lifetime borrow checker ownership diagnostics")
+            .unwrap();
+        let generic = recalled
+            .content
+            .find("rust lifetime checker operations policy for release deployment")
+            .unwrap();
+        assert!(specific < generic, "relevance must outrank raw priority");
+        assert!(recalled.max_relevance_score > recalled.min_relevance_score);
+        assert_eq!(recalled.project_match_count, 2);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

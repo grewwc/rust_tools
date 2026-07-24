@@ -19,6 +19,9 @@ pub(crate) struct AutoRecalledKnowledge {
     pub(crate) entry_count: usize,
     pub(crate) project_hint: Option<String>,
     pub(crate) categories: Vec<String>,
+    pub(crate) strongest_relevance_score: f64,
+    pub(crate) weakest_relevance_score: f64,
+    pub(crate) project_match_count: usize,
 }
 
 #[derive(Clone)]
@@ -168,6 +171,9 @@ fn map_auto_recalled_knowledge(
         entry_count: r.entry_count,
         project_hint: r.project_hint,
         categories: r.categories,
+        strongest_relevance_score: r.max_relevance_score,
+        weakest_relevance_score: r.min_relevance_score,
+        project_match_count: r.project_match_count,
     }
 }
 

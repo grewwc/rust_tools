@@ -8,6 +8,7 @@ mod sqlite;
 mod suspended;
 mod types;
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
@@ -35,9 +36,9 @@ pub(in crate::ai) use sessions::generate_session_summary;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::strip_think_tags;
 #[allow(unused_imports)]
-pub(in crate::ai) use sessions::{
-    SessionInfo, SessionStore, SessionTitle, SessionTitleOrigin,
-};
+pub(in crate::ai) use sessions::{SessionInfo, SessionStore, SessionTitle, SessionTitleOrigin};
+#[allow(unused_imports)]
+pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::{
     append_tool_execution_outcomes_sqlite, read_recent_messages_sqlite,
@@ -45,15 +46,11 @@ pub(in crate::ai) use sqlite::{
     read_tool_message_ids_sqlite, write_stale_patch_targets_sqlite,
 };
 #[allow(unused_imports)]
-pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
-#[allow(unused_imports)]
 pub(in crate::ai) use suspended::{
-    SuspendedSessionEntry, SuspendedSessionStore, format_suspended_timestamp_label,
+    format_suspended_timestamp_label, SuspendedSessionEntry, SuspendedSessionStore,
 };
 #[allow(unused_imports)]
-pub(in crate::ai) use types::{
-    COLON, MAX_HISTORY_TURNS, Message, NEWLINE, ToolExecutionOutcome,
-};
+pub(in crate::ai) use types::{Message, ToolExecutionOutcome, COLON, MAX_HISTORY_TURNS, NEWLINE};
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
 pub(in crate::ai) const ROLE_INTERNAL_NOTE: &str = types::ROLE_INTERNAL_NOTE;
@@ -304,6 +301,20 @@ pub(in crate::ai) fn clear_context_history_cache() {
     }
 }
 
+/// 原子预留 session 的下一个全局 turn 序号。
+///
+/// 当前 session store 统一使用 SQLite；拒绝旧文本路径，避免悄悄退回会在
+/// 重启或多进程场景重复编号的进程内计数。
+pub(in crate::ai) fn reserve_turn_index(history_file: &Path) -> io::Result<usize> {
+    if !blob::is_sqlite_path(history_file) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "persistent turn sequence requires a SQLite session",
+        ));
+    }
+    sqlite::reserve_turn_index_sqlite(history_file)
+}
+
 pub(in crate::ai) async fn compact_session_history_with_app(
     app: &App,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -332,18 +343,15 @@ async fn compact_session_history_with_app_inner(
         let exceeds_context_budget = app.config.history_max_chars > 0
             && sqlite::total_message_chars_sqlite(history_file.as_path())?
                 > app.config.history_max_chars;
-        let exceeds_tool_evidence_budget = sqlite::compressed_tool_evidence_chars_sqlite(
-            history_file.as_path(),
-        )? > compress::compressed_tool_evidence_inline_chars_limit();
+        let exceeds_tool_evidence_budget =
+            sqlite::compressed_tool_evidence_chars_sqlite(history_file.as_path())?
+                > compress::compressed_tool_evidence_inline_chars_limit();
         let threshold = if at_boundary {
             crate::ai::history::compress::persisted_history_keep_recent_turns()
         } else {
             MAX_HISTORY_TURNS
         };
-        if user_turns <= threshold
-            && !exceeds_context_budget
-            && !exceeds_tool_evidence_budget
-        {
+        if user_turns <= threshold && !exceeds_context_budget && !exceeds_tool_evidence_budget {
             return Ok(());
         }
     }

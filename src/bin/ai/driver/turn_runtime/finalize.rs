@@ -1,9 +1,9 @@
 use crate::ai::{
     driver::{print::format_empty_state, reflection},
     history::{
-        Message, SessionTitle, SessionTitleOrigin, compact_session_history_at_boundary_with_app,
-        compact_session_history_with_app, generate_session_summary,
-        is_low_quality_session_title, normalize_generated_session_title, value_to_string,
+        compact_session_history_at_boundary_with_app, compact_session_history_with_app,
+        generate_session_summary, is_low_quality_session_title, normalize_generated_session_title,
+        value_to_string, Message, SessionTitle, SessionTitleOrigin,
     },
     types::App,
 };
@@ -12,7 +12,7 @@ use rust_tools::commonw::FastSet;
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
 
-use super::{TurnOutcome, persistence::persist_pending_turn_messages};
+use super::{persistence::persist_pending_turn_messages, TurnOutcome};
 
 const SUBAGENT_TOOL_EVIDENCE_MAX_CALLS: usize = 8;
 const SUBAGENT_TOOL_EVIDENCE_MAX_CHARS_PER_RESULT: usize = 700;
@@ -425,10 +425,12 @@ pub(super) async fn finalize_turn(
             })) {
                 Ok(o) => o,
                 Err(_) => {
-                    eprintln!(
-                        "[Warning] observer '{}' panicked in on_finalize; disabling for rest of conversation.",
-                        obs_name
-                    );
+                    if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                        eprintln!(
+                            "[Warning] observer '{}' panicked in on_finalize; disabling for rest of conversation.",
+                            obs_name
+                        );
+                    }
                     obs.mark_poisoned();
                     poisoned.push(obs_name);
                     continue;
@@ -437,9 +439,7 @@ pub(super) async fn finalize_turn(
             if output.display_lines.is_empty() {
                 continue;
             }
-            if first_observer_emitted
-                && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-            {
+            if first_observer_emitted && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                 println!("---");
             }
             first_observer_emitted = true;

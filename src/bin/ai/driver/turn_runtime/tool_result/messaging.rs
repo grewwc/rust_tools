@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::ai::{
     driver::tools::ExecuteToolCallsResult,
-    history::{Message, ROLE_INTERNAL_NOTE, SessionStore, is_system_like_role},
+    history::{is_system_like_role, Message, SessionStore, ROLE_INTERNAL_NOTE},
     types::App,
     types::ToolCall,
 };
@@ -54,7 +54,9 @@ pub(super) fn record_hidden_self_note(
         let marker = match save_context_checkpoint(app, index, &summary, &checkpoint.body) {
             Ok(path) => format!("[context_checkpoint path={}] {}", path.display(), summary),
             Err(error) => {
-                eprintln!("failed to save context checkpoint: {error}");
+                if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                    eprintln!("failed to save context checkpoint: {error}");
+                }
                 turn_messages.push(Message {
                     role: ROLE_INTERNAL_NOTE.to_string(),
                     content: Value::String(format!(
@@ -262,15 +264,15 @@ fn working_checkpoint_message_for_plan(
     }
 
     let args = serde_json::from_str::<Value>(&tool_call.function.arguments).ok();
-    let summary = truncate_checkpoint_summary(&plan_checkpoint_summary(
-        args.as_ref(),
-        result_content,
-    ));
+    let summary =
+        truncate_checkpoint_summary(&plan_checkpoint_summary(args.as_ref(), result_content));
     let body = build_plan_working_checkpoint_body(tool_call, args.as_ref(), result_content);
     let marker = match save_working_context_checkpoint(app, &summary, &body) {
         Ok(path) => format!("[context_checkpoint path={}] {}", path.display(), summary),
         Err(error) => {
-            eprintln!("failed to save working context checkpoint: {error}");
+            if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                eprintln!("failed to save working context checkpoint: {error}");
+            }
             format!(
                 "[context_checkpoint save_failed] working checkpoint: {}",
                 summary
@@ -301,7 +303,10 @@ fn plan_checkpoint_summary(args: Option<&Value>, result_content: &str) -> String
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("plan updated");
-    let summary = first_line.strip_prefix("Plan:").unwrap_or(first_line).trim();
+    let summary = first_line
+        .strip_prefix("Plan:")
+        .unwrap_or(first_line)
+        .trim();
     format!("working_checkpoint: {summary}")
 }
 
@@ -612,14 +617,8 @@ fn build_current_turn_tool_overflow_stub(
             out.push('\n');
         }
     }
-    out.push_str(&format!(
-        "- head_preview: {}\n",
-        take_chars(content, 800)
-    ));
-    out.push_str(&format!(
-        "- tail_preview: {}\n",
-        tail_chars(content, 800)
-    ));
+    out.push_str(&format!("- head_preview: {}\n", take_chars(content, 800)));
+    out.push_str(&format!("- tail_preview: {}\n", tail_chars(content, 800)));
     out
 }
 
@@ -784,14 +783,24 @@ fn command_recall_anchors(args: &Value) -> Vec<String> {
 }
 
 fn generic_tool_recall_anchors(args: &Value) -> Vec<String> {
-    ["file_path", "path", "filePath", "query", "pattern", "command"]
-        .iter()
-        .filter_map(|key| {
-            args.get(*key)
-                .and_then(Value::as_str)
-                .map(|value| format!("{key}: {}", truncate_inline(&normalize_anchor_text(value), 240)))
+    [
+        "file_path",
+        "path",
+        "filePath",
+        "query",
+        "pattern",
+        "command",
+    ]
+    .iter()
+    .filter_map(|key| {
+        args.get(*key).and_then(Value::as_str).map(|value| {
+            format!(
+                "{key}: {}",
+                truncate_inline(&normalize_anchor_text(value), 240)
+            )
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn value_string_from_keys(args: &Value, keys: &[&str]) -> Option<String> {
@@ -886,10 +895,8 @@ pub(super) fn append_tool_result_messages(
         .zip(prepared_results.into_iter())
     {
         let observer_result_content = prepared.content_for_model.as_str();
-        let observer_success = tool_result_success_for_observer(
-            &tool_call.function.name,
-            observer_result_content,
-        );
+        let observer_success =
+            tool_result_success_for_observer(&tool_call.function.name, observer_result_content);
         for obs in app.observers.iter_mut() {
             if obs.is_poisoned() {
                 continue;
@@ -905,10 +912,12 @@ pub(super) fn append_tool_result_messages(
             }))
             .is_err()
             {
-                eprintln!(
-                    "[Warning] observer '{}' panicked in on_tool_result; disabling for rest of conversation.",
-                    obs_name
-                );
+                if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                    eprintln!(
+                        "[Warning] observer '{}' panicked in on_tool_result; disabling for rest of conversation.",
+                        obs_name
+                    );
+                }
                 obs.mark_poisoned();
             }
         }
@@ -920,8 +929,7 @@ pub(super) fn append_tool_result_messages(
             reasoning_content: None,
         };
         append_message_pair(messages, turn_messages, tool_message);
-        if let Some(message) =
-            working_checkpoint_message_for_plan(app, tool_call, &result.content)
+        if let Some(message) = working_checkpoint_message_for_plan(app, tool_call, &result.content)
         {
             working_checkpoint_messages.push(message);
         }
@@ -932,8 +940,10 @@ pub(super) fn append_tool_result_messages(
 }
 
 fn tool_result_success_for_observer(tool_name: &str, content: &str) -> bool {
-    let is_execution_tool =
-        matches!(tool_name, "execute_command" | "run_command" | "shell" | "bash");
+    let is_execution_tool = matches!(
+        tool_name,
+        "execute_command" | "run_command" | "shell" | "bash"
+    );
     if is_execution_tool {
         let sample = take_chars(content, TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES);
         let lower = sample.to_ascii_lowercase();
@@ -1336,15 +1346,14 @@ mod tests {
     use super::{
         append_tool_result_messages, build_code_inspection_working_memory,
         collect_repo_inspection_findings, describe_tool_call, is_repo_inspection_tool,
-        prepare_tool_results_for_history,
-        RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS,
+        prepare_tool_results_for_history, RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS,
     };
     use super::{
         extract_context_checkpoints, save_context_checkpoint_in_dir, smart_truncate_to_sentence,
         truncate_checkpoint_summary, working_checkpoint_message_for_plan,
         WORKING_CHECKPOINT_FILE_NAME,
     };
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::{atomic::AtomicBool, Arc};
 
     use crate::ai::driver::tools::ExecuteToolCallsResult;
     use crate::ai::{
@@ -1711,7 +1720,8 @@ mod tests {
             "first line\nerror: important failure\n{}\nlast line",
             "x".repeat(RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS + 10_000)
         );
-        let exec_result = exec_result_from_calls_and_contents(&calls, std::slice::from_ref(&content));
+        let exec_result =
+            exec_result_from_calls_and_contents(&calls, std::slice::from_ref(&content));
 
         let prepared = prepare_tool_results_for_history(&app, &exec_result);
         let model = &prepared[0].content_for_model;
@@ -1763,9 +1773,11 @@ mod tests {
         let exec_result = exec_result_from_calls_and_contents(&calls, &contents);
 
         let prepared = prepare_tool_results_for_history(&app, &exec_result);
-        assert!(prepared
-            .iter()
-            .all(|result| !result.content_for_model.contains("Output too large; full result saved")));
+        assert!(prepared.iter().all(|result| {
+            !result
+                .content_for_model
+                .contains("Output too large; full result saved")
+        }));
         assert_eq!(prepared[0].content_for_model, contents[0]);
         assert_eq!(prepared[1].content_for_model, contents[1]);
 
@@ -1785,11 +1797,7 @@ mod tests {
                         "read_file",
                         serde_json::json!({"file_path":"src/lib.rs","offset":10,"limit":20}),
                     ),
-                    tool_call(
-                        "2",
-                        "list_directory",
-                        serde_json::json!({"path":"src"}),
-                    ),
+                    tool_call("2", "list_directory", serde_json::json!({"path":"src"})),
                     tool_call(
                         "3",
                         "read_file",
@@ -1847,11 +1855,7 @@ mod tests {
                         "read_file",
                         serde_json::json!({"file_path":"src/lib.rs","offset":10,"limit":20}),
                     ),
-                    tool_call(
-                        "2",
-                        "list_directory",
-                        serde_json::json!({"path":"src"}),
-                    ),
+                    tool_call("2", "list_directory", serde_json::json!({"path":"src"})),
                 ]),
                 tool_call_id: None,
                 reasoning_content: None,
@@ -1933,11 +1937,9 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("checkpoint directory entries should be readable");
         assert_eq!(entries.len(), 2);
-        assert!(
-            entries
-                .iter()
-                .all(|entry| { !entry.file_name().to_string_lossy().contains(".tmp") })
-        );
+        assert!(entries
+            .iter()
+            .all(|entry| { !entry.file_name().to_string_lossy().contains(".tmp") }));
 
         std::fs::remove_dir_all(&directory)
             .expect("temporary checkpoint directory should clean up");

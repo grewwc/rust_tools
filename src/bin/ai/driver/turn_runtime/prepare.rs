@@ -6,8 +6,8 @@ use crate::ai::mcp::SharedMcpClient;
 use crate::ai::{
     driver::{print::print_ocr_summary, reflection, skill_runtime},
     history::{
-        Message, ROLE_INTERNAL_NOTE, build_context_history, compact_session_history_with_app,
-        compress::llm_prune,
+        build_context_history, compact_session_history_with_app, compress::llm_prune, Message,
+        ROLE_INTERNAL_NOTE,
     },
     request,
     types::App,
@@ -32,9 +32,22 @@ fn inject_recalled_knowledge(skill_turn: &mut skill_runtime::SkillTurnGuard, que
         skill_turn.push_section(skill_runtime::ContextKind::Behavior, guidelines);
     }
     if let Some(recalled) = bundle.recalled.as_ref() {
+        let project = recalled.project_hint.as_deref().unwrap_or("none");
+        let categories = if recalled.categories.is_empty() {
+            "none".to_string()
+        } else {
+            recalled.categories.join(",")
+        };
+        let label = format!(
+            "Auto-Recalled Knowledge; entries={}; relevance={:.3}..{:.3}; project={project}; project_matches={}; categories={categories}",
+            recalled.entry_count,
+            recalled.weakest_relevance_score,
+            recalled.strongest_relevance_score,
+            recalled.project_match_count,
+        );
         skill_turn.push_labeled_section(
             skill_runtime::ContextKind::Fact,
-            "Auto-Recalled Knowledge",
+            &label,
             &recalled.content,
         );
     }
@@ -283,7 +296,9 @@ pub(super) async fn prepare_turn(
     crate::ai::driver::runtime_ctx::publish_subagent_phase("preparing context");
     // 收尾阶段可能因中断、请求错误或旧版本进程而未执行。开始下一轮前再做一次
     // 轻量检查，确保超出上下文预算的历史先被落盘压缩，避免每轮重复请求期摘要。
-    if let Err(err) = compact_session_history_with_app(app).await {
+    if let Err(err) = compact_session_history_with_app(app).await
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+    {
         eprintln!("[Warning] Failed to compact persisted history before preparing context: {err}");
     }
     let mut history = build_context_history(
@@ -363,7 +378,9 @@ pub(super) async fn prepare_turn(
             })) {
                 Ok(out) => Some(out),
                 Err(_) => {
-                    eprintln!("[Warning] observer '{}' panicked in on_prepare; disabling for rest of conversation.", obs_name);
+                    if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                        eprintln!("[Warning] observer '{}' panicked in on_prepare; disabling for rest of conversation.", obs_name);
+                    }
                     obs.mark_poisoned();
                     None
                 }
@@ -425,9 +442,7 @@ pub(super) async fn prepare_turn(
     // LLM 引导裁剪：在历史消息发送给模型前，静默替换已被连续标记为低价值的 tool 结果内容。
     // 不删除消息、不改变数组长度，仅替换 content 字段为占位符。
     let prune_report = llm_prune::apply_pruning(&mut history, &app.prune_marks);
-    if prune_report.pruned_count > 0
-        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-    {
+    if prune_report.pruned_count > 0 && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         let tools = if prune_report.tools.is_empty() {
             String::new()
         } else {
@@ -592,8 +607,8 @@ fn detect_complex_task(question: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        QuestionShape, detect_complex_task, filter_suggested_tool_calls_for_tool_names,
-        persisted_user_turn_message, should_inject_integrated_reflection,
+        detect_complex_task, filter_suggested_tool_calls_for_tool_names,
+        persisted_user_turn_message, should_inject_integrated_reflection, QuestionShape,
     };
     use crate::ai::driver::observer::SuggestedToolCall;
     use crate::ai::history::Message;

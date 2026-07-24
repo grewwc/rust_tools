@@ -13,19 +13,13 @@
 //   4. Return TurnOutcome (Quit, Success, or Error)
 // =============================================================================
 
-use std::{
-    io::Write,
-    sync::{LazyLock, Mutex},
-};
+use std::io::Write;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ai::{history, mcp::SharedMcpClient, types::App};
 
 use super::{
-    CompressionReport, MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
-    MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-    MID_TURN_LLM_SUMMARY_MAX_CHARS,
     finalize::finalize_turn,
     iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
     mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
@@ -34,6 +28,9 @@ use super::{
     record_llm_summary_attempt_chars, should_try_llm_summary,
     tool_result::handle_iteration_execution,
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
+    CompressionReport, MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
+    MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+    MID_TURN_LLM_SUMMARY_MAX_CHARS,
 };
 
 /// 工具调用循环检测窗口：
@@ -67,9 +64,6 @@ const MAX_STREAM_ERROR_RETRIES: usize = 16;
 /// 连续「模型输出过长 / 工具调用 JSON 半截」截断的重试上限。
 /// stream_error 使用独立上限，不参与该计数。
 const MAX_MODEL_TRUNCATION_RETRIES: usize = 3;
-
-static SESSION_TURN_INDEXES: LazyLock<Mutex<FxHashMap<String, usize>>> =
-    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 /// === 长循环感知的中段压缩 ===
 /// 中段压缩的软阈值按模型 token 窗口换算（flagship 256K → ~135K 字符）。对
@@ -126,26 +120,6 @@ const MUTATION_TOOL_NAMES: &[&str] = &[
 /// 早于硬上限触发；对默认 2048 这类超大 ceiling，也要在明显失控前提醒收敛。
 fn tool_iteration_soft_limit(max_iterations: usize) -> usize {
     (max_iterations / 2).max(1).min(TOOL_ITERATION_SOFT_LIMIT)
-}
-
-fn persisted_user_turn_count(app: &App) -> usize {
-    history::build_message_arr(usize::MAX, &app.session_history_file)
-        .map(|messages| messages.iter().filter(|message| message.role == "user").count())
-        .unwrap_or(0)
-}
-
-fn next_turn_index(app: &App) -> usize {
-    let persisted_count = persisted_user_turn_count(app);
-    let Ok(mut indexes) = SESSION_TURN_INDEXES.lock() else {
-        return persisted_count;
-    };
-    let entry = indexes.entry(app.session_id.clone()).or_insert(persisted_count);
-    if *entry < persisted_count {
-        *entry = persisted_count;
-    }
-    let turn_index = *entry;
-    *entry = entry.saturating_add(1);
-    turn_index
 }
 
 /// 提取最近一轮 assistant 消息中的 (tool_name, args_json) 签名集合。
@@ -1037,9 +1011,7 @@ fn extract_round_targets_inner(
             Some(ToolResultProgressStatus::BlockedOutsideWorkspace(path))
                 if tc.function.name == "execute_command" =>
             {
-                targets.push(format!(
-                    "execute_command:blocked-outside-workspace:{path}"
-                ));
+                targets.push(format!("execute_command:blocked-outside-workspace:{path}"));
                 continue;
             }
             Some(
@@ -1710,7 +1682,8 @@ fn inject_progress_ledger_note(messages: &mut Vec<crate::ai::history::Message>) 
 fn inject_low_progress_hard_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[low-progress-hard-stop] 经软提示与记账后你仍未取得任何可见进展，判定为无效循环。\n\
+    let note =
+        "[low-progress-hard-stop] 经软提示与记账后你仍未取得任何可见进展，判定为无效循环。\n\
         从现在起进入无工具收口模式：不要再发起任何工具调用；\n\
         请基于已收集到的信息给出阶段结论：已确认了什么、还差什么、\n\
         以及若要完成任务建议的下一步（若是变更类任务，直接说明应改哪些文件、怎么改）。";
@@ -1854,10 +1827,8 @@ mod tests {
         let mut signals = Vec::new();
         for i in 0..(TOOL_LOOP_SOFT_WINDOW + TOOL_LOOP_HARD_WINDOW) {
             messages.push(assistant_with_same_read(&format!("tc-{i}")));
-            signals.push(supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            ));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
         assert!(
             signals[..TOOL_LOOP_SOFT_WINDOW - 1]
@@ -1883,10 +1854,7 @@ mod tests {
         // 同一只读调用重复到 soft 阈值。
         for i in 0..TOOL_LOOP_SOFT_WINDOW {
             messages.push(pb_read_msg("src/main.rs", &format!("read-{i}")));
-            let signal = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            );
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             if i == TOOL_LOOP_SOFT_WINDOW - 1 {
                 assert!(matches!(signal, ToolLoopSignal::Soft));
             }
@@ -1905,10 +1873,7 @@ mod tests {
         // 新的一轮重复必须重新先得到 soft，而不是沿用旧状态直接 hard-stop。
         for i in 0..TOOL_LOOP_SOFT_WINDOW {
             messages.push(pb_read_msg("src/other.rs", &format!("retry-{i}")));
-            let signal = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            );
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             if i == TOOL_LOOP_SOFT_WINDOW - 1 {
                 assert!(matches!(signal, ToolLoopSignal::Soft));
             } else {
@@ -1965,8 +1930,7 @@ mod tests {
         // 第二轮：恢复后重新积累，验证 soft 能再次触发。
         for i in 0..TOOL_LOOP_SOFT_WINDOW {
             messages.push(assistant_with_read(&format!("tc2-{i}")));
-            let signal =
-                supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             if i == TOOL_LOOP_SOFT_WINDOW - 1 {
                 // 第 4 次应触发 soft。
                 assert!(matches!(signal, ToolLoopSignal::Soft));
@@ -1979,8 +1943,7 @@ mod tests {
         // soft 后需重新积累完整 hard window，验证完整升级阶梯恢复。
         for i in 0..TOOL_LOOP_HARD_WINDOW {
             messages.push(assistant_with_read(&format!("tc3-{i}")));
-            let signal =
-                supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             if i == TOOL_LOOP_HARD_WINDOW - 1 {
                 // 收到 soft 后又重复 6 次，才应触发 hard。
                 assert!(matches!(signal, ToolLoopSignal::Hard));
@@ -2027,9 +1990,7 @@ mod tests {
         s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD - 1;
         assert_eq!(s.effective_mid_turn_soft_threshold(base), base);
         // 此时 ~120K 历史（< 135K 基准）不触发压缩——正是旧行为的空窗。
-        assert!(
-            !s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base))
-        );
+        assert!(!s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base)));
 
         // 长循环（达阈值）：有效阈值降到 FLOOR，同样 ~120K 历史立即触发压缩。
         s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD;
@@ -2143,10 +2104,8 @@ mod tests {
         let mut signals = Vec::new();
         for i in 0..TOOL_LOOP_COARSE_WINDOW {
             messages.push(assistant_paging_read(&format!("tc-{i}"), i * 80));
-            signals.push(supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            ));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
         assert!(
             signals[..TOOL_LOOP_COARSE_WINDOW - 1]
@@ -2194,8 +2153,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
             });
-            let signal =
-                supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             if i < TOOL_LOOP_COARSE_WINDOW - 1 {
                 assert!(matches!(signal, ToolLoopSignal::None));
             } else {
@@ -2231,8 +2189,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
             });
-            let signal =
-                supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             if i < TOOL_LOOP_COARSE_WINDOW - 1 {
                 assert!(matches!(signal, ToolLoopSignal::None));
             } else {
@@ -2272,16 +2229,12 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
             });
-            signals.push(supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            ));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
-        assert!(
-            signals[..TOOL_LOOP_COARSE_WINDOW - 1]
-                .iter()
-                .all(|s| matches!(s, ToolLoopSignal::None))
-        );
+        assert!(signals[..TOOL_LOOP_COARSE_WINDOW - 1]
+            .iter()
+            .all(|s| matches!(s, ToolLoopSignal::None)));
         assert!(matches!(
             signals[TOOL_LOOP_COARSE_WINDOW - 1],
             ToolLoopSignal::Coarse
@@ -2328,16 +2281,12 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
             });
-            signals.push(supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            ));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
-        assert!(
-            signals[..TOOL_LOOP_COARSE_WINDOW - 1]
-                .iter()
-                .all(|s| matches!(s, ToolLoopSignal::None))
-        );
+        assert!(signals[..TOOL_LOOP_COARSE_WINDOW - 1]
+            .iter()
+            .all(|s| matches!(s, ToolLoopSignal::None)));
         assert!(matches!(
             signals[TOOL_LOOP_COARSE_WINDOW - 1],
             ToolLoopSignal::Coarse
@@ -2383,7 +2332,7 @@ mod tests {
         let mut supervisor = TurnSupervisor::default();
         let mut messages = Vec::new();
         let max_iterations = 10; // soft_limit = 5
-        // 未到软阈值不注入
+                                 // 未到软阈值不注入
         supervisor.iteration = 4;
         assert!(!supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
         assert!(messages.is_empty());
@@ -2391,13 +2340,11 @@ mod tests {
         supervisor.iteration = 5;
         assert!(supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
         assert_eq!(messages.len(), 1);
-        assert!(
-            messages[0]
-                .content
-                .as_str()
-                .unwrap_or_default()
-                .contains("[iteration-soft-limit]")
-        );
+        assert!(messages[0]
+            .content
+            .as_str()
+            .unwrap_or_default()
+            .contains("[iteration-soft-limit]"));
         // 再次调用不重复注入
         supervisor.iteration = 8;
         assert!(!supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
@@ -2536,11 +2483,7 @@ mod tests {
     /// 失败调用不进入 `extract_round_targets`（无目标 → 无信息增益 → 无进展），
     /// 且因每轮 path 不同而绕过 exact/coarse 签名循环检测，是进展预算升级阶梯
     /// 在「统一为行为信号」后唯一的无进展驱动方式（成功的新目标读取都算进展）。
-    fn pb_failed_read_round(
-        messages: &mut Vec<crate::ai::history::Message>,
-        path: &str,
-        id: &str,
-    ) {
+    fn pb_failed_read_round(messages: &mut Vec<crate::ai::history::Message>, path: &str, id: &str) {
         pb_failed_read_round_reasoning(messages, path, id, None);
     }
 
@@ -2564,11 +2507,7 @@ mod tests {
         });
     }
 
-    fn pb_dedup_read_round(
-        messages: &mut Vec<crate::ai::history::Message>,
-        path: &str,
-        id: &str,
-    ) {
+    fn pb_dedup_read_round(messages: &mut Vec<crate::ai::history::Message>, path: &str, id: &str) {
         messages.push(pb_read_msg(path, id));
         messages.push(crate::ai::history::Message {
             role: "tool".to_string(),
@@ -2609,10 +2548,8 @@ mod tests {
         for i in 1..=25 {
             supervisor.next_iteration();
             pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("tc-{i}"));
-            signals.push(supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            ));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
         assert!(
             signals[..24]
@@ -2633,10 +2570,7 @@ mod tests {
         for i in 1..=rounds {
             supervisor.next_iteration();
             messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("tc-{i}")));
-            let signal = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            );
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             match signal {
                 ToolLoopSignal::ReadOnlyBreadth => {
                     breadth_warnings += 1;
@@ -2661,10 +2595,7 @@ mod tests {
         for i in 1..READ_ONLY_BREADTH_CHECK_TARGETS {
             supervisor.next_iteration();
             messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("tc-{i}")));
-            let signal = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            );
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             assert!(
                 matches!(signal, ToolLoopSignal::None),
                 "pre-threshold read-only exploration should stay silent: {signal:?}"
@@ -2677,8 +2608,7 @@ mod tests {
             "patch-after-breadth",
             "Patch applied successfully.",
         ));
-        let signal =
-            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
 
         assert!(
             matches!(signal, ToolLoopSignal::None),
@@ -2696,11 +2626,12 @@ mod tests {
         let mut last = ToolLoopSignal::None;
 
         for i in 0..5 {
-            pb_failed_read_round(&mut messages, &format!("src/missing-{i}.rs"), &format!("failed-{i}"));
-            last = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
+            pb_failed_read_round(
+                &mut messages,
+                &format!("src/missing-{i}.rs"),
+                &format!("failed-{i}"),
             );
+            last = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         }
 
         assert!(matches!(last, ToolLoopSignal::LowProgressSoft));
@@ -2715,11 +2646,12 @@ mod tests {
         let mut last = ToolLoopSignal::None;
 
         for i in 0..5 {
-            pb_dedup_read_round(&mut messages, &format!("src/repeated-{i}.rs"), &format!("dedup-{i}"));
-            last = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
+            pb_dedup_read_round(
+                &mut messages,
+                &format!("src/repeated-{i}.rs"),
+                &format!("dedup-{i}"),
             );
+            last = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         }
 
         assert!(matches!(last, ToolLoopSignal::LowProgressSoft));
@@ -2757,10 +2689,8 @@ mod tests {
         let mut signals = Vec::new();
         for (i, command) in commands.iter().enumerate() {
             pb_blocked_outside_workspace_round(&mut messages, command, &format!("blocked-{i}"));
-            signals.push(supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            ));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
 
         assert!(
@@ -2815,10 +2745,8 @@ mod tests {
         let mut signals = Vec::new();
         for i in 0..TOOL_LOOP_COARSE_WINDOW {
             messages.push(mixed_round(i));
-            signals.push(supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            ));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
 
         // 整轮签名每轮都不同：exact / coarse 整轮判等一律不命中。
@@ -2830,7 +2758,10 @@ mod tests {
         );
         // 填满 coarse 窗口时，目标交集（文件 A）命中，发出一次 TargetRepeat。
         assert!(
-            matches!(signals[TOOL_LOOP_COARSE_WINDOW - 1], ToolLoopSignal::TargetRepeat),
+            matches!(
+                signals[TOOL_LOOP_COARSE_WINDOW - 1],
+                ToolLoopSignal::TargetRepeat
+            ),
             "same-file across mixed rounds must trigger TargetRepeat: {signals:?}"
         );
         assert!(supervisor.target_repeat_note_injected);
@@ -2845,10 +2776,8 @@ mod tests {
         let mut signals = Vec::new();
         for i in 0..TOOL_LOOP_COARSE_WINDOW {
             messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("tc-{i}")));
-            signals.push(supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            ));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
         assert!(
             signals
@@ -2869,10 +2798,7 @@ mod tests {
             let id = format!("write-{i}");
             messages.push(pb_write_file_msg(target, &id));
             messages.push(pb_tool_result(&id, "Successfully wrote file."));
-            let signal = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            );
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             assert!(
                 matches!(signal, ToolLoopSignal::None),
                 "successful write_file progress must not trigger TargetRepeat: {signal:?}"
@@ -2898,10 +2824,8 @@ mod tests {
                 "same content\n",
             ));
             messages.push(pb_tool_result(&id, "Successfully wrote file."));
-            signals.push(supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            ));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
 
         assert!(
@@ -2934,17 +2858,13 @@ mod tests {
         supervisor.iteration = 30;
         for i in 0..4 {
             pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
-            let signal = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            );
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             assert!(matches!(signal, ToolLoopSignal::None));
         }
         assert_eq!(supervisor.progress.consecutive_no_progress, 4);
         // 一次真正的变更动作：无进展计数清零。
         messages.push(pb_apply_patch_msg("patch-1"));
-        let signal =
-            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         assert!(matches!(signal, ToolLoopSignal::None));
         assert_eq!(supervisor.progress.consecutive_no_progress, 0);
     }
@@ -2958,11 +2878,18 @@ mod tests {
         supervisor.iteration = 30;
         supervisor.progress.consecutive_no_progress = 4;
 
-        pb_failed_read_round(&mut compressed_messages, "src/missing.rs", "read-after-compress");
+        pb_failed_read_round(
+            &mut compressed_messages,
+            "src/missing.rs",
+            "read-after-compress",
+        );
 
         let mut current_round = Vec::new();
         current_round.push(pb_apply_patch_msg("patch-current"));
-        current_round.push(pb_tool_result("patch-current", "Patch applied successfully."));
+        current_round.push(pb_tool_result(
+            "patch-current",
+            "Patch applied successfully.",
+        ));
 
         let signal = supervisor.record_tool_signatures_for_progress(
             &compressed_messages,
@@ -3020,7 +2947,8 @@ mod tests {
 
     #[test]
     fn task_wait_status_delivered_task_output_counts_as_mutation_progress() {
-        let delivered = "[Task: inspect driver via explorer @ sonnet] SUCCESS after 0.1s\nConfirmed result.";
+        let delivered =
+            "[Task: inspect driver via explorer @ sonnet] SUCCESS after 0.1s\nConfirmed result.";
         let status_delivered = format!(
             "TaskID              PID      Agent          Model          State       Description\n\
              task-1              42       explorer       sonnet         completed   inspect\n\n\
@@ -3032,7 +2960,11 @@ mod tests {
                 serde_json::json!({ "task_ids": ["task-1"] }),
                 delivered,
             ),
-            ("task_status", serde_json::json!({}), status_delivered.as_str()),
+            (
+                "task_status",
+                serde_json::json!({}),
+                status_delivered.as_str(),
+            ),
         ];
 
         for (idx, (tool_name, args, result)) in cases.into_iter().enumerate() {
@@ -3059,8 +2991,7 @@ mod tests {
 
         for i in 0..4 {
             pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
-            let signal =
-                supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             assert!(matches!(signal, ToolLoopSignal::None));
         }
         assert_eq!(supervisor.progress.consecutive_no_progress, 4);
@@ -3072,8 +3003,7 @@ mod tests {
             "task-wait-idle",
             "[task_wait BUDGET ELAPSED] 1 pending subagent task(s) still running in the background. wait_policy=all, timeout_secs=1.",
         );
-        let signal =
-            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         assert!(matches!(signal, ToolLoopSignal::LowProgressSoft));
         assert_eq!(supervisor.progress.consecutive_no_progress, 5);
     }
@@ -3086,8 +3016,7 @@ mod tests {
 
         for i in 0..4 {
             pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
-            let signal =
-                supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             assert!(matches!(signal, ToolLoopSignal::None));
         }
         assert_eq!(supervisor.progress.consecutive_no_progress, 4);
@@ -3102,8 +3031,7 @@ mod tests {
              Completed task results below (already collected — no need to wait for these):\n\
              [Task: inspect driver via explorer @ sonnet] SUCCESS after 0.1s\nConfirmed result.",
         );
-        let signal =
-            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         assert!(matches!(signal, ToolLoopSignal::None));
         assert_eq!(supervisor.progress.consecutive_no_progress, 0);
     }
@@ -3164,18 +3092,14 @@ mod tests {
         let mut last = ToolLoopSignal::None;
         for i in 0..5 {
             pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
-            last = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            );
+            last = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         }
         assert!(matches!(last, ToolLoopSignal::LowProgressSoft));
         assert!(supervisor.progress.soft_injected);
 
         // 阶段二：一次真正的变更动作（apply_patch）-> 实质进展，重置整个升级阶梯。
         messages.push(pb_apply_patch_msg("patch-1"));
-        let signal =
-            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         assert!(matches!(signal, ToolLoopSignal::None));
         assert!(!supervisor.progress.soft_injected);
         assert!(!supervisor.progress.ledger_injected);
@@ -3186,10 +3110,7 @@ mod tests {
         // 若 soft_injected 未被重置，第 5 轮会因 soft_injected 仍为 true 直接走 ledger。
         for i in 0..5 {
             pb_failed_read_round(&mut messages, &format!("src/g{i}.rs"), &format!("r2-{i}"));
-            last = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            );
+            last = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         }
         assert!(
             matches!(last, ToolLoopSignal::LowProgressSoft),
@@ -3209,10 +3130,8 @@ mod tests {
         let mut signals = Vec::new();
         for i in 0..(3 + PROGRESS_NO_PROGRESS_HARD_MARGIN) {
             pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
-            signals.push(supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            ));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
         // consecutive 递增：达到 soft_threshold 时依次触发 Soft 与 Ledger，
         // 到达 soft_threshold + margin 时才触发 Hard。
@@ -3220,11 +3139,9 @@ mod tests {
         assert!(matches!(signals[1], ToolLoopSignal::None));
         assert!(matches!(signals[2], ToolLoopSignal::LowProgressSoft));
         assert!(matches!(signals[3], ToolLoopSignal::LowProgressLedger));
-        assert!(
-            signals[4..signals.len() - 1]
-                .iter()
-                .all(|signal| matches!(signal, ToolLoopSignal::None))
-        );
+        assert!(signals[4..signals.len() - 1]
+            .iter()
+            .all(|signal| matches!(signal, ToolLoopSignal::None)));
         assert!(matches!(
             signals.last(),
             Some(ToolLoopSignal::LowProgressHard)
@@ -3241,10 +3158,7 @@ mod tests {
         let mut last = ToolLoopSignal::None;
         for i in 0..5 {
             pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
-            last = supervisor.record_tool_signatures(
-                &messages,
-                PROGRESS_FREE_EXPLORE_ROUNDS,
-            );
+            last = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         }
         assert!(matches!(last, ToolLoopSignal::LowProgressSoft));
         assert!(supervisor.progress.soft_injected);
@@ -3257,8 +3171,7 @@ mod tests {
             "r-grace",
             Some("换一个思路：先看调用方再决定删除策略"),
         );
-        let signal =
-            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         assert!(
             matches!(signal, ToolLoopSignal::None),
             "new reasoning should buy a grace window instead of immediate ledger"
@@ -3276,8 +3189,7 @@ mod tests {
             "r-after-grace",
             Some("再换一个思路：检查配置加载顺序"),
         );
-        let signal =
-            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         assert!(matches!(signal, ToolLoopSignal::LowProgressLedger));
         assert_eq!(supervisor.progress.grace_until_iteration, grace_until);
     }
@@ -3318,10 +3230,10 @@ pub(in crate::ai::driver) async fn run_turn(
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
     // 把 (session_id, turn_id) 注入 task_local，让下游工具调用与反馈
-    // 写入路径能拿到正确身份。turn_id 使用按 session 递增的 turn 序号，而非
-    // history_count（它只是上下文裁剪参数，常规路径会是 0）。
+    // 写入路径能拿到正确身份。turn_id 由 session SQLite 原子分配，包含普通、
+    // resume 和 internal turn，跨重启/多进程也不会重复。
     let session_id = app.session_id.clone();
-    let turn_index = next_turn_index(app);
+    let turn_index = history::reserve_turn_index(&app.session_history_file)?;
     let turn_id = turn_index;
     // 仅前台主 turn 抬起「turn 活动」标志：子 agent（sync / background）持有私有
     // 信号标志，且都通过 SUBAGENT_RESULT_SLOT 作用域执行，据此排除。该标志让
@@ -3800,8 +3712,7 @@ async fn run_turn_body(
                 &progress_messages
             },
             PROGRESS_FREE_EXPLORE_ROUNDS,
-        )
-        {
+        ) {
             ToolLoopSignal::None => {}
             ToolLoopSignal::Coarse => {
                 crate::ai::driver::print::print_tool_note_line(
