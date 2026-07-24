@@ -3,6 +3,7 @@ pub mod checkpoint;
 pub mod feishu;
 pub mod goal;
 pub mod help;
+pub mod memo;
 pub mod model;
 pub mod persona;
 pub mod proc;

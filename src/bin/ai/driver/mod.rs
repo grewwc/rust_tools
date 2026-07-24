@@ -883,6 +883,12 @@ async fn run_loop(
             }
         }
 
+        // /memo 命令需要异步调用模型做内容整理，单独在这里处理。
+        if commands::memo::try_handle_memo_command(app, &question).await? {
+            should_quit = false;
+            continue;
+        }
+
         // ── Goal 模式等待状态 ──
         // 用户输入 `/goal` 后，下一条非 slash 消息作为目标内容。
         // 将目标包装成 goal prompt 发送给 LLM，同时更新 goal_mode。

@@ -12,6 +12,7 @@ use std::time::Duration;
 use rustc_hash::FxHashSet;
 
 use crate::ai::cli::ParsedCli;
+use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::types::{App, clear_stream_cancel};
 
 use super::signal::ForegroundTurnGuard;
@@ -45,7 +46,6 @@ pub(super) fn note_search_interactive_mode(cli: &ParsedCli) -> bool {
 /// 如果剪贴板有图片，使用视觉模型理解内容；
 /// 否则使用 `-n` 后面提供的文本；若也没有文本，则进入多行输入框让用户输入。
 pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
     use arboard::Clipboard;
     use image::buffer::ConvertBuffer;
     use image::{ImageBuffer, Rgb, Rgba};
@@ -552,10 +552,76 @@ pub(super) async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ConsolidationScope {
+    Memo,
+    OtherKnowledge,
+}
+
+impl ConsolidationScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Memo => "memo 笔记",
+            Self::OtherKnowledge => "非 memo 知识",
+        }
+    }
+
+    fn matches(self, entry: &AgentMemoryEntry) -> bool {
+        match self {
+            // 带图片的 memo 保留原条目，避免合并后丢失图片附件的关联。
+            Self::Memo => entry.category == "memo" && entry.image_path.is_none(),
+            Self::OtherKnowledge => entry.category != "memo",
+        }
+    }
+
+    fn merged_category(self) -> &'static str {
+        match self {
+            Self::Memo => "memo",
+            // 保持原有 consolidate 的非 memo 合并落点。
+            Self::OtherKnowledge => "user_memory",
+        }
+    }
+
+    fn merged_source(self) -> Option<&'static str> {
+        match self {
+            Self::Memo => Some("cli_note"),
+            Self::OtherKnowledge => None,
+        }
+    }
+
+    fn curator_rule(self) -> &'static str {
+        match self {
+            Self::Memo => {
+                "Retain every concrete fact, troubleshooting step, command, identifier, and database detail when merging memos."
+            }
+            Self::OtherKnowledge => "Keep useful knowledge and its intent intact when merging.",
+        }
+    }
+}
+
+fn consolidation_candidates(
+    all_entries: &[AgentMemoryEntry],
+    scope: ConsolidationScope,
+) -> Vec<&AgentMemoryEntry> {
+    let mut candidates: Vec<&AgentMemoryEntry> = all_entries
+        .iter()
+        .filter(|entry| entry.priority.unwrap_or(100) < 200)
+        // 无 ID 的历史条目无法被 apply_batch_update 精确替换，不让模型对其做计划。
+        .filter(|entry| entry.id.as_deref().is_some_and(|id| !id.trim().is_empty()))
+        .filter(|entry| scope.matches(entry))
+        .collect();
+    candidates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    candidates.truncate(15);
+    candidates
+}
+
 // 处理 consolidate 计划里的 merge 项：只为有效 merge（ids 非空且 merged_content 非空）
 // 生成新条目，并把对应源 IDs 自动并入删除集合，避免"旧条目 + 合并条目"并存。
 fn build_consolidation_merge_entries(
+    category: &str,
+    source: Option<&str>,
     merge_plan: &[&serde_json::Value],
+    eligible_ids: &FxHashSet<&str>,
 ) -> (
     FxHashSet<String>,
     usize,
@@ -568,10 +634,14 @@ fn build_consolidation_merge_entries(
     for item in merge_plan {
         let ids: Vec<&str> = item["ids"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| eligible_ids.contains(id) && !merge_delete_ids.contains(*id))
+            .collect();
         let content = item["merged_content"].as_str().unwrap_or("").trim();
-        if ids.is_empty() || content.is_empty() {
+        // 单条改写不属于 merge；至少两条可操作条目才能替换为一个合并条目。
+        if ids.len() < 2 || content.is_empty() {
             continue;
         }
 
@@ -580,10 +650,10 @@ fn build_consolidation_merge_entries(
         new_entries.push(crate::ai::tools::storage::memory_store::AgentMemoryEntry {
             id: Some(crate::ai::tools::service::memory::next_memory_id()),
             timestamp: chrono::Local::now().to_rfc3339(),
-            category: "user_memory".into(),
+            category: category.into(),
             note: content.to_string(),
             tags: vec!["consolidated".into()],
-            source: None,
+            source: source.map(str::to_string),
             priority: Some(150),
             owner_pid: None,
             owner_pgid: None,
@@ -594,44 +664,16 @@ fn build_consolidation_merge_entries(
     (merge_delete_ids, merged_count, new_entries)
 }
 
-/// 处理 --consolidate-knowledge：读取全部知识条目 → 模型分析 → 执行整理。
-///
-/// **优化策略**（避免 60s 超时）：
-/// 1. 只分析优先级 < 200 的条目（≥200 受保护）
-/// 2. 按时间倒序取**最近 15 条**（之前 30 条还是太多）
-/// 3. 每条内容截断到**40 字**（之前 80 字）
-/// 4. 用 JSON 数组格式（比文本格式更省 token）
-/// 5. 英文 system prompt（模型响应更快）
-pub(super) async fn handle_consolidate_knowledge(
+async fn consolidate_scope(
     app: &App,
+    store: &MemoryStore,
+    scope: ConsolidationScope,
+    candidates: &[&AgentMemoryEntry],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
     use serde_json::Value;
 
-    let store = MemoryStore::from_env_or_config();
-    let all_entries = store.all().map_err(|e| format!("读取失败：{}", e))?;
-
-    if all_entries.is_empty() {
-        println!("📭 知识库为空，无需整理。");
-        return Ok(());
-    }
-
-    // 过滤：优先级 < 200 的才分析；排除 memo（用户记事本，不应被自动删除/合并）；按时间倒序；取最近 15 条
-    let mut candidates: Vec<&AgentMemoryEntry> = all_entries
-        .iter()
-        .filter(|e| e.priority.unwrap_or(100) < 200 && e.category != "memo")
-        .collect();
-    candidates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    candidates.truncate(15);
-
-    if candidates.is_empty() {
-        println!("📭 没有可整理的条目（全部优先级 ≥ 200，已保护）。");
-        return Ok(());
-    }
-
-    // 构建紧凑的 JSON 数组（比文本格式更省 token）
     let mut entries_json = Vec::new();
-    for entry in &candidates {
+    for entry in candidates {
         let id = entry.id.as_deref().unwrap_or("unknown");
         let prio = entry.priority.unwrap_or(100);
         let ts_short: String = entry.timestamp.chars().take(10).collect();
@@ -651,14 +693,19 @@ pub(super) async fn handle_consolidate_knowledge(
         }));
     }
 
-    let sys = "You are a knowledge curator. Analyze entries and suggest deletions/merges.\n\
-        Return ONLY valid JSON:\n\
-        {\"reasoning\":\"1-sentence summary\",\"delete_ids\":[\"id1\",\"id2\"],\"merge_plan\":[{\"ids\":[\"id1\",\"id2\"],\"merged_content\":\"...\"}]}\n\
-        Rules: delete duplicates/obsolete; merge related; keep useful. Priority>=200 already filtered out.";
-
+    let sys = format!(
+        "You are a knowledge curator. Analyze only the current scope: {}. \
+         Every listed entry belongs to this scope; never combine it with another scope.\n\
+         Return ONLY valid JSON:\n\
+         {{\"reasoning\":\"1-sentence summary\",\"delete_ids\":[\"id1\",\"id2\"],\"merge_plan\":[{{\"ids\":[\"id1\",\"id2\"],\"merged_content\":\"...\"}}]}}\n\
+         Rules: use only listed IDs; delete only exact duplicates or obsolete entries; merge only related entries; keep useful entries. {} Priority>=200 entries are already excluded.",
+        scope.label(),
+        scope.curator_rule(),
+    );
     let prompt = format!(
-        "Analyze these {} entries:\n{}",
+        "Analyze these {} {} entries:\n{}",
         candidates.len(),
+        scope.label(),
         serde_json::to_string(&entries_json).unwrap()
     );
     let messages = vec![
@@ -666,10 +713,8 @@ pub(super) async fn handle_consolidate_knowledge(
         serde_json::json!({"role": "user", "content": prompt}),
     ];
 
-    // 知识整理用主模型（用户的默认对话模型）。走流式链路：响应头立即返回、
-    // 数据按 chunk 增量到达，避免非流式"等整段 body 生成完"被 60s 超时撑爆。
     let model = crate::ai::models::initial_model(&app.cli);
-    let spinner = SearchSpinner::start("整理知识库");
+    let spinner = SearchSpinner::start(&format!("整理{}", scope.label()));
     let raw = match crate::ai::request::do_request_text_streaming(app, &model, &messages).await {
         Ok(text) => {
             spinner.stop();
@@ -677,7 +722,7 @@ pub(super) async fn handle_consolidate_knowledge(
         }
         Err(err) => {
             spinner.stop();
-            eprintln!("[consolidate] Request failed: {}", err);
+            eprintln!("[consolidate:{}] Request failed: {}", scope.label(), err);
             return Err(err);
         }
     };
@@ -688,45 +733,56 @@ pub(super) async fn handle_consolidate_knowledge(
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-
     if cleaned.is_empty() || raw.is_empty() {
-        println!("⚠  Empty response. No changes.");
+        println!("⚠ [{}] Empty response. No changes.", scope.label());
         return Ok(());
     }
 
     let plan: Value = match serde_json::from_str(cleaned) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[consolidate] JSON parse error: {}", e);
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("[consolidate:{}] JSON parse error: {}", scope.label(), err);
             eprintln!(
-                "[consolidate] Raw: {}",
+                "[consolidate:{}] Raw: {}",
+                scope.label(),
                 raw.chars().take(200).collect::<String>()
             );
             return Ok(());
         }
     };
-
     if let Some(reasoning) = plan["reasoning"].as_str() {
-        println!("\n🔍 {}\n", reasoning);
+        println!("\n🔍 [{}] {}\n", scope.label(), reasoning);
     }
 
-    let delete_ids: Vec<&str> = plan["delete_ids"]
+    let eligible_ids: FxHashSet<&str> = candidates
+        .iter()
+        .filter_map(|entry| entry.id.as_deref())
+        .collect();
+    let requested_delete_ids: Vec<&str> = plan["delete_ids"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .map(|entries| entries.iter().filter_map(|value| value.as_str()).collect())
         .unwrap_or_default();
     let merge_plan: Vec<&Value> = plan["merge_plan"]
         .as_array()
-        .map(|a| a.iter().collect())
+        .map(|entries| entries.iter().collect())
         .unwrap_or_default();
-    let (merge_delete_ids, merged_count, new_entries) =
-        build_consolidation_merge_entries(&merge_plan);
+    let (merge_delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(
+        scope.merged_category(),
+        scope.merged_source(),
+        &merge_plan,
+        &eligible_ids,
+    );
 
-    let mut delete_id_set: FxHashSet<String> =
-        delete_ids.iter().map(|id| (*id).to_string()).collect();
+    // 模型输出只能影响当前批次的候选 ID，保证 memo 与其它类别不会互相删除或合并。
+    let mut delete_id_set: FxHashSet<String> = requested_delete_ids
+        .into_iter()
+        .filter(|id| eligible_ids.contains(id))
+        .map(str::to_string)
+        .collect();
     delete_id_set.extend(merge_delete_ids);
 
     if delete_id_set.is_empty() && new_entries.is_empty() {
-        println!("✅ Already well-organized. Nothing to change.");
+        println!("✅ [{}] Already well-organized. Nothing to change.", scope.label());
         return Ok(());
     }
 
@@ -734,18 +790,57 @@ pub(super) async fn handle_consolidate_knowledge(
     match store.apply_batch_update(&delete_refs, &new_entries) {
         Ok(report) => {
             if !delete_refs.is_empty() {
-                println!("🗑  Deleted {} entries", report.deleted);
+                println!("🗑  [{}] Deleted {} entries", scope.label(), report.deleted);
             }
             if !new_entries.is_empty() {
                 println!(
-                    "💾 Merged {} entries into {} new",
-                    merged_count, report.appended
+                    "💾 [{}] Merged {} entries into {} new",
+                    scope.label(),
+                    merged_count,
+                    report.appended
                 );
             }
         }
-        Err(e) => {
-            eprintln!("  Consolidation error: {}", e);
+        Err(err) => eprintln!("[consolidate:{}] Error: {}", scope.label(), err),
+    }
+
+    Ok(())
+}
+
+/// 处理 --consolidate-knowledge：读取全部知识条目 → 模型分析 → 执行整理。
+///
+/// **优化策略**（避免 60s 超时）：
+/// 1. 只分析优先级 < 200 的条目（≥200 受保护）
+/// 2. memo 与其它类别分别按时间倒序取**最近 15 条**，绝不混合整理
+/// 3. 每条内容截断到**40 字**（之前 80 字）
+/// 4. 用 JSON 数组格式（比文本格式更省 token）
+/// 5. 英文 system prompt（模型响应更快）
+pub(super) async fn handle_consolidate_knowledge(
+    app: &App,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = MemoryStore::from_env_or_config();
+    let all_entries = store.all().map_err(|e| format!("读取失败：{}", e))?;
+
+    if all_entries.is_empty() {
+        println!("📭 知识库为空，无需整理。");
+        return Ok(());
+    }
+
+    let mut scopes_with_candidates = 0usize;
+    // memo 优先执行；即使后续非 memo 整理的模型请求失败，用户笔记也已独立处理。
+    for scope in [ConsolidationScope::Memo, ConsolidationScope::OtherKnowledge] {
+        let candidates = consolidation_candidates(&all_entries, scope);
+        if candidates.is_empty() {
+            continue;
         }
+        scopes_with_candidates += 1;
+        println!("📚 整理 {}（{} 条）", scope.label(), candidates.len());
+        consolidate_scope(app, &store, scope, &candidates).await?;
+    }
+
+    if scopes_with_candidates == 0 {
+        println!("📭 没有可整理的条目（仅处理有 ID、优先级 < 200 的文本记录）。");
+        return Ok(());
     }
 
     println!("\n✨ Done.");
@@ -1281,8 +1376,9 @@ mod tests {
         ];
         let merge_plan_refs: Vec<&serde_json::Value> = merge_plan.iter().collect();
 
+        let eligible_ids = FxHashSet::from_iter(["id_a", "id_b", "ignored"].into_iter());
         let (delete_ids, merged_count, new_entries) =
-            build_consolidation_merge_entries(&merge_plan_refs);
+            build_consolidation_merge_entries("memo", Some("test"), &merge_plan_refs, &eligible_ids);
 
         assert_eq!(merged_count, 2);
         assert_eq!(delete_ids.len(), 2);
@@ -1298,5 +1394,56 @@ mod tests {
         );
         assert_eq!(new_entries[0].note, "合并后的内容");
         assert_eq!(new_entries[0].tags, vec!["consolidated".to_string()]);
+    }
+
+    #[test]
+    fn memo_consolidation_isolated_from_other_categories() {
+        let entry = |id: &str, category: &str, image_path: Option<&str>| AgentMemoryEntry {
+            id: Some(id.to_string()),
+            timestamp: "2026-07-24T00:00:00Z".to_string(),
+            category: category.to_string(),
+            note: format!("{id} 内容"),
+            tags: Vec::new(),
+            source: Some("cli_note".to_string()),
+            priority: Some(150),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: image_path.map(str::to_string),
+        };
+        let entries = vec![
+            entry("memo_a", "memo", None),
+            entry("memo_b", "memo", None),
+            entry("memo_image", "memo", Some("/tmp/note.png")),
+            entry("knowledge_a", "user_memory", None),
+        ];
+
+        let candidates = consolidation_candidates(&entries, ConsolidationScope::Memo);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|entry| entry.category == "memo"));
+        assert!(candidates.iter().all(|entry| entry.image_path.is_none()));
+
+        let eligible_ids: FxHashSet<&str> = candidates
+            .iter()
+            .filter_map(|entry| entry.id.as_deref())
+            .collect();
+        let merge_plan = [serde_json::json!({
+            "ids": ["memo_a", "memo_b", "knowledge_a"],
+            "merged_content": "合并后的 memo"
+        })];
+        let merge_plan_refs: Vec<&serde_json::Value> = merge_plan.iter().collect();
+        let (delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(
+            "memo",
+            Some("cli_note"),
+            &merge_plan_refs,
+            &eligible_ids,
+        );
+
+        assert_eq!(merged_count, 2);
+        assert!(delete_ids.contains("memo_a"));
+        assert!(delete_ids.contains("memo_b"));
+        assert!(!delete_ids.contains("knowledge_a"));
+        assert_eq!(new_entries.len(), 1);
+        assert_eq!(new_entries[0].category, "memo");
+        assert_eq!(new_entries[0].source.as_deref(), Some("cli_note"));
     }
 }

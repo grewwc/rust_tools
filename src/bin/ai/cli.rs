@@ -91,6 +91,8 @@ const INTERNAL_COMMANDS: &[&str] = &[
     ":checkpoint",
     "/cp",
     ":cp",
+    "/memo",
+    ":memo",
     "/model",
     ":model",
     "/agents",

@@ -24,6 +24,7 @@ pub fn print_interactive_help() {
     println!("    /share [output.md]        export current session as shareable markdown");
     println!("    /close                    close and delete current session, then exit");
     println!("    /proc                     show running sessions (interactive + background)");
+    println!("    /memo [text]              save last assistant conclusion (or given text) as memo to knowledge base");
     println!(
         "    /goal [target]            enter goal mode: agent persists until the goal is done"
     );
