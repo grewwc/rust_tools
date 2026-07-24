@@ -682,7 +682,8 @@ fn tool_result_recall_one_liner(result_text: &str) -> String {
 
 /// 从工具调用的 JSON `arguments` 里取 `file_path`（或兼容的 `path`）。
 /// `apply_patch` 还可能把目标写在 `patch` 正文 `*** Update File: <path>` /
-/// `*** Add File: <path>` / `*** Replace in line: <path>` 信封里，做兜底解析。
+/// `*** Add File: <path>` / `*** Delete File: <path>` /
+/// `*** Replace in line: <path>` 信封里，做兜底解析。
 fn extract_file_path_args(arguments: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<Value>(arguments) else {
         return Vec::new();
@@ -701,6 +702,7 @@ fn extract_file_path_args(arguments: &str) -> Vec<String> {
                 trimmed
                     .strip_prefix("*** Update File:")
                     .or_else(|| trimmed.strip_prefix("*** Add File:"))
+                    .or_else(|| trimmed.strip_prefix("*** Delete File:"))
                     .or_else(|| trimmed.strip_prefix("*** Replace in line:"))
                     .map(|rest| rest.trim().to_string())
             })

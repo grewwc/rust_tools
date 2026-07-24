@@ -8,7 +8,7 @@ use std::{
 
 use reqwest::Client;
 use rust_tools::cw::SkipMap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -69,6 +69,7 @@ impl Clone for App {
             last_turn_interrupted: self.last_turn_interrupted,
             prune_marks: self.prune_marks.clone(),
             turn_reasoning_items: self.turn_reasoning_items.clone(),
+            stale_patch_targets: self.stale_patch_targets.clone(),
         }
     }
 }
@@ -139,6 +140,22 @@ pub(super) struct App {
     /// `#[serde(skip)]` 才能挡住落盘。用 turn 级旁路 map（同 `prune_marks` 模式）
     /// 天然按轮对齐、纯内存态、物理上不可能落盘。
     pub(super) turn_reasoning_items: FxHashMap<String, Vec<Value>>,
+
+    /// `apply_patch` 的 stale-target 运行时账本：值为「上一次 patch 因
+    /// `context mismatch` / `ambiguous patch` 失败、且之后同路径尚未成功
+    /// `read_file` / `write_file` / `apply_patch`」的目标文件路径集合。
+    ///
+    /// 语义：patch 失败说明模型持有的文件事实已过期，在对同一路径重新取真相
+    /// （成功 read/write/patch）之前再次 patch 只会重复失败，guard
+    /// [`patch_retry_requires_fresh_read`] 据此拒绝。
+    ///
+    /// 为什么用专用账本而非扫描 `messages`：历史压缩会把失败的 apply_patch 组
+    /// 折叠成 `internal_note` stub（丢失 `role=tool` 结果与
+    /// `assistant.tool_calls`），使基于消息扫描的 guard 丢失 stale 状态、
+    /// 无法拦截重试。账本由工具执行结果直接维护，并同步到当前 session 的 SQLite
+    /// meta；切换/恢复 session 时重新加载，因此既不受消息压缩影响，也不会跨 session
+    /// 污染。旧数据库首次加载时才从仍可见的结构化消息回放并迁移。
+    pub(super) stale_patch_targets: FxHashSet<PathBuf>,
 }
 
 impl App {

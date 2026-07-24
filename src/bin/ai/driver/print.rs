@@ -18,14 +18,10 @@ pub fn print_assistant_banner_with_app(app: Option<&App>) {
     print_assistant_banner_with_app_and_skill(app, None);
 }
 
-pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: Option<&str>) {
-    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-        return;
-    }
-    println!(
-        "{}",
-        format_assistant_banner(app.map(|a| a.current_agent.as_str()), skill_name)
-    );
+/// 终端不再打印 assistant 角色标记行（如 "assistant · build"），信息冗余。
+/// 角色信息仍通过 messages 传递给模型，不影响 agent 效果。
+pub fn print_assistant_banner_with_app_and_skill(_app: Option<&App>, _skill_name: Option<&str>) {
+    // no-op
 }
 
 /// 终端不再打印工具输出内容，只保留工具调用状态行。

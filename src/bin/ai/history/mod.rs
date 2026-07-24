@@ -39,7 +39,8 @@ pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::{
     append_tool_execution_outcomes_sqlite, read_recent_messages_sqlite,
-    read_tool_execution_outcomes_sqlite, read_tool_message_ids_sqlite,
+    read_stale_patch_targets_sqlite, read_tool_execution_outcomes_sqlite,
+    read_tool_message_ids_sqlite, write_stale_patch_targets_sqlite,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;

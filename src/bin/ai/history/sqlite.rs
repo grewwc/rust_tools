@@ -5,6 +5,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
+use rustc_hash::FxHashSet;
 use serde_json::Value;
 
 use crate::ai::types::ToolCall;
@@ -17,6 +18,8 @@ use super::{
     },
     types::{MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, ToolExecutionOutcome},
 };
+
+const STALE_PATCH_TARGETS_META_KEY: &str = "stale_patch_targets_v1";
 
 pub(in crate::ai) struct RecentTurnWindow {
     pub(in crate::ai) messages: Vec<Message>,
@@ -355,6 +358,74 @@ pub(in crate::ai) fn read_tool_message_ids_sqlite(path: &Path) -> io::Result<Vec
         .map_err(|error| io::Error::other(error.to_string()))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// 读取当前 session 的 stale-patch 账本。`None` 表示旧数据库尚未写入过该状态，
+/// 调用方应从仍可见的结构化消息回放一次并写回；`Some(empty)` 则表示已知为空，
+/// 不能再次扫描可能含旧失败记录的历史。
+pub(in crate::ai) fn read_stale_patch_targets_sqlite(
+    path: &Path,
+) -> io::Result<Option<FxHashSet<PathBuf>>> {
+    if !blob::is_sqlite_path(path) || !path.exists() {
+        return Ok(None);
+    }
+    let conn = open_history_db(path)?;
+    let table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(None);
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1 LIMIT 1",
+            params![STALE_PATCH_TARGETS_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    raw.map(|raw| {
+        serde_json::from_str::<Vec<PathBuf>>(&raw)
+            .map(|paths| paths.into_iter().collect())
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid stale patch target metadata: {error}"),
+                )
+            })
+    })
+    .transpose()
+}
+
+/// 原子替换当前 session 的 stale-patch 账本。空集合也显式写成 `[]`，用于区分
+/// “已知为空”与“旧数据库尚未初始化”；该运行时元数据不改变模型历史，故不递增
+/// `history_revision`。
+pub(in crate::ai) fn write_stale_patch_targets_sqlite(
+    path: &Path,
+    targets: &FxHashSet<PathBuf>,
+) -> io::Result<()> {
+    if !blob::is_sqlite_path(path) {
+        return Ok(());
+    }
+    let mut paths = targets.iter().cloned().collect::<Vec<_>>();
+    paths.sort();
+    let encoded = serde_json::to_string(&paths)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let conn = open_history_db(path)?;
+    init_history_schema(&conn)?;
+    conn.execute(
+        "INSERT INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, created_at=excluded.created_at",
+        params![STALE_PATCH_TARGETS_META_KEY, encoded],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
 }
 
 /// outcome 只属于同一 `tool_call_id` 的 tool 消息。历史替换、压缩或分支截断后
@@ -1256,6 +1327,40 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_patch_targets_survive_history_replacement_and_clear_with_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "stale_patch_meta_test_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.sqlite");
+        append_history_sqlite(&path, vec![msg("user", "before compression")]).unwrap();
+
+        let targets = FxHashSet::from_iter([
+            PathBuf::from("/tmp/a.rs"),
+            PathBuf::from("/tmp/b.rs"),
+        ]);
+        write_stale_patch_targets_sqlite(&path, &targets).unwrap();
+        assert_eq!(read_stale_patch_targets_sqlite(&path).unwrap(), Some(targets.clone()));
+
+        // replace_all_messages 是持久化 history 压缩/改写路径；账本不能随消息形态丢失。
+        replace_all_messages_sqlite(&path, &[msg("user", "after compression")]).unwrap();
+        assert_eq!(read_stale_patch_targets_sqlite(&path).unwrap(), Some(targets));
+
+        // 显式空集合也要与“旧库尚无 meta”区分，防止恢复时误走 legacy 回放。
+        write_stale_patch_targets_sqlite(&path, &FxHashSet::default()).unwrap();
+        assert_eq!(
+            read_stale_patch_targets_sqlite(&path).unwrap(),
+            Some(FxHashSet::default())
+        );
+
+        clear_session_history_sqlite(&path).unwrap();
+        assert_eq!(read_stale_patch_targets_sqlite(&path).unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

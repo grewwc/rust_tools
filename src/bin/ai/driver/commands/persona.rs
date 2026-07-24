@@ -183,13 +183,7 @@ fn handle_deleted_persona(app: &mut App, result: PersonaDeleteResult) {
 
 fn switch_to_persona(app: &mut App, persona: PersonaProfile) {
     crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
-    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
-    if let Some(ctx) = app.agent_context.as_mut() {
-        ctx.tools.clear();
-    }
-    app.attached_image_files.clear();
-    app.forced_skill = None;
-    app.last_skill_bias = None;
+    super::session::clear_session_local_runtime_state(app);
     app.active_persona = persona.clone();
     app.config.history_file =
         persona::history_file_for_persona(app.config.base_history_file.as_path(), &persona.id);
@@ -202,6 +196,9 @@ fn switch_to_persona(app: &mut App, persona: PersonaProfile) {
     let session_store = SessionStore::new(app.config.history_file.as_path());
     app.session_id = session_id.clone();
     app.session_history_file = session_store.session_history_file(&session_id);
+    if let Err(error) = super::session::restore_session_local_runtime_state(app) {
+        eprintln!("[persona] failed to restore session-local state: {error}");
+    }
     app.sync_persona_session_binding();
 }
 

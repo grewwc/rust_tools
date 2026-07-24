@@ -324,16 +324,9 @@ async fn request_model_response(
         crate::ai::driver::print::print_tool_note_line(
             "context-budget",
             &format!(
-                "compressed {} -> {} chars (target={}, lossless_removed={} messages/{} chars, critical={}, offload_only={}, lossy_candidates={} segments/{} chars)",
+                "compressed {} -> {} chars",
                 budget_report.before_chars,
                 budget_report.after_chars,
-                budget_report.target_chars,
-                budget_report.lossless_removed_messages,
-                budget_report.lossless_saved_chars,
-                budget_report.critical_segments,
-                budget_report.offload_only_segments,
-                budget_report.lossy_candidate_segments,
-                budget_report.lossy_candidate_chars
             ),
         );
     }

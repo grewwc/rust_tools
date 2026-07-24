@@ -65,6 +65,63 @@ pub(in crate::ai) fn clear_session_local_runtime_state(app: &mut App) {
     app.forced_skill = None;
     app.forced_question = None;
     app.last_skill_bias = None;
+    app.stale_patch_targets.clear();
+}
+
+fn load_stale_patch_targets(
+    store: &SessionStore,
+    session_id: &str,
+    history_file: &std::path::Path,
+) -> std::io::Result<rustc_hash::FxHashSet<std::path::PathBuf>> {
+    if let Some(targets) = crate::ai::history::read_stale_patch_targets_sqlite(history_file)? {
+        return Ok(targets);
+    }
+
+    // 兼容升级前没有专用 meta 的 session：只在首次加载时从尚存的结构化消息
+    // 回放一次，随后写回 meta。以后即使历史被压缩，账本也不再依赖消息形态。
+    let messages = store.read_all_messages(session_id)?;
+    let targets = crate::ai::driver::turn_runtime::stale_patch_targets_from_messages(&messages);
+    if history_file.exists() {
+        crate::ai::history::write_stale_patch_targets_sqlite(history_file, &targets)?;
+    }
+    Ok(targets)
+}
+
+/// 恢复当前 App 对应 session 的持久化运行时状态。启动恢复、persona 切换与
+/// `/sessions use` 必须统一走这里，避免 stale-patch 状态跨 session 污染或丢失。
+pub(in crate::ai) fn restore_session_local_runtime_state(app: &mut App) -> std::io::Result<()> {
+    let store = SessionStore::new(app.config.history_file.as_path());
+    app.stale_patch_targets =
+        load_stale_patch_targets(&store, &app.session_id, &app.session_history_file)?;
+    Ok(())
+}
+
+fn switch_app_to_session(
+    app: &mut App,
+    store: &SessionStore,
+    session_id: &str,
+) -> std::io::Result<()> {
+    let history_file = store.session_history_file(session_id);
+    // 先加载目标状态，失败时保持当前 App 不变；成功后再清理旧 session 状态并切换。
+    let stale_patch_targets = load_stale_patch_targets(store, &session_id, &history_file)?;
+    clear_session_local_runtime_state(app);
+    app.session_id = session_id.to_string();
+    app.session_history_file = history_file;
+    app.stale_patch_targets = stale_patch_targets;
+    app.sync_persona_session_binding();
+    Ok(())
+}
+
+/// 历史 rewind 会原地替换当前 session 的消息，必须同步重建并持久化账本，不能沿用
+/// rewind 之前的 meta，也不能简单清空后让下一次 patch 绕过 fresh-read 门控。
+pub(in crate::ai) fn reset_stale_patch_targets_from_messages(
+    app: &mut App,
+    messages: &[crate::ai::history::Message],
+) -> std::io::Result<()> {
+    let targets = crate::ai::driver::turn_runtime::stale_patch_targets_from_messages(messages);
+    crate::ai::history::write_stale_patch_targets_sqlite(&app.session_history_file, &targets)?;
+    app.stale_patch_targets = targets;
+    Ok(())
 }
 
 fn suspended_session_summary(entry: &SuspendedSessionEntry) -> Option<String> {
@@ -296,10 +353,7 @@ pub fn try_handle_session_command(
             // 切换前清掉旧 session 的 history cache 与 explicit-enabled tools，
             // 防止下个 turn 携带跨 session 脏状态。
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
-            clear_session_local_runtime_state(app);
-            app.session_id = new_id.clone();
-            app.session_history_file = store.session_history_file(&new_id);
-            app.sync_persona_session_binding();
+            switch_app_to_session(app, &store, &new_id)?;
             println!("Switched to new session: {}", new_id);
         }
         "use" | "select" => {
@@ -316,10 +370,7 @@ pub fn try_handle_session_command(
                 return Ok(true);
             }
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
-            clear_session_local_runtime_state(app);
-            app.session_id = id.to_string();
-            app.session_history_file = store.session_history_file(id);
-            app.sync_persona_session_binding();
+            switch_app_to_session(app, &store, id)?;
             println!("Switched session: {}", id);
             // 显示 session 摘要
             let sessions = store.list_sessions().unwrap_or_default();
@@ -408,11 +459,8 @@ pub fn try_handle_session_command(
                 println!("Summary: {deleted_count} deleted, {not_found_count} not found.");
             }
             if deleted_current {
-                clear_session_local_runtime_state(app);
                 let new_id = Uuid::new_v4().to_string();
-                app.session_id = new_id.clone();
-                app.session_history_file = store.session_history_file(&new_id);
-                app.sync_persona_session_binding();
+                switch_app_to_session(app, &store, &new_id)?;
                 println!("Switched to new session: {}", new_id);
             }
         }
@@ -576,10 +624,7 @@ pub fn try_handle_session_command(
                     crate::ai::history::invalidate_context_history_cache_for(
                         &app.session_history_file,
                     );
-                    clear_session_local_runtime_state(app);
-                    app.session_id = id.clone();
-                    app.session_history_file = store.session_history_file(&id);
-                    app.sync_persona_session_binding();
+                    switch_app_to_session(app, &store, &id)?;
                     println!(
                         "Imported session from '{}' -> '{}', switched to it.",
                         file, id
@@ -620,11 +665,8 @@ pub fn try_handle_session_command(
 
             let deleted = store.clear_all_sessions()?;
             crate::ai::history::clear_context_history_cache();
-            clear_session_local_runtime_state(app);
             let new_id = Uuid::new_v4().to_string();
-            app.session_id = new_id.clone();
-            app.session_history_file = store.session_history_file(&new_id);
-            app.sync_persona_session_binding();
+            switch_app_to_session(app, &store, &new_id)?;
             println!("Deleted {deleted} session(s). Switched to new session: {new_id}");
         }
         "fork" => {
@@ -645,10 +687,7 @@ pub fn try_handle_session_command(
                     crate::ai::history::invalidate_context_history_cache_for(
                         &app.session_history_file,
                     );
-                    clear_session_local_runtime_state(app);
-                    app.session_id = dst_id.clone();
-                    app.session_history_file = store.session_history_file(&dst_id);
-                    app.sync_persona_session_binding();
+                    switch_app_to_session(app, &store, &dst_id)?;
                     println!(
                         "Forked '{}' -> '{}', switched to new branch.",
                         src_id, dst_id
@@ -687,10 +726,7 @@ pub fn try_handle_session_command(
                     crate::ai::history::invalidate_context_history_cache_for(
                         &app.session_history_file,
                     );
-                    clear_session_local_runtime_state(app);
-                    app.session_id = dst_id.clone();
-                    app.session_history_file = store.session_history_file(&dst_id);
-                    app.sync_persona_session_binding();
+                    switch_app_to_session(app, &store, &dst_id)?;
                     println!(
                         "Branched '{}' -> '{}' (kept first {} complete user turn(s)), switched to new branch.",
                         src_id, dst_id, keep
@@ -750,8 +786,11 @@ mod tests {
     use super::*;
     use crate::ai::{
         cli::ParsedCli,
-        history::{Message, SuspendedSessionStore, append_history_messages},
-        types::{AgentContext, AppConfig, SkillBiasMemory},
+        history::{
+            Message, SuspendedSessionStore, append_history_messages,
+            read_stale_patch_targets_sqlite, write_stale_patch_targets_sqlite,
+        },
+        types::{AgentContext, AppConfig, FunctionCall, SkillBiasMemory, ToolCall},
     };
     use serde_json::Value;
     use std::{
@@ -827,6 +866,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
+            stale_patch_targets: Default::default(),
         }
     }
 
@@ -863,6 +903,109 @@ mod tests {
                 .is_some_and(|ctx| ctx.tools.is_empty())
         );
         assert!(crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sessions_use_restores_stale_patch_targets_without_cross_session_leakage() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let target_id = "sess-target";
+        let target_path = store.session_history_file(target_id);
+        append_history_messages(
+            &target_path,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("target session".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        let target = PathBuf::from("/tmp/target-session.rs");
+        write_stale_patch_targets_sqlite(
+            &target_path,
+            &rustc_hash::FxHashSet::from_iter([target.clone()]),
+        )
+        .unwrap();
+        app.stale_patch_targets
+            .insert(PathBuf::from("/tmp/source-session.rs"));
+
+        try_handle_session_command(&mut app, "/sessions use sess-target").unwrap();
+
+        assert_eq!(
+            app.stale_patch_targets,
+            rustc_hash::FxHashSet::from_iter([target])
+        );
+
+        try_handle_session_command(&mut app, "/sessions new").unwrap();
+        assert!(
+            app.stale_patch_targets.is_empty(),
+            "a brand-new session must not inherit the previous session ledger"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sessions_use_migrates_legacy_stale_patch_state_from_messages() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let target_id = "legacy-stale";
+        let target_path = store.session_history_file(target_id);
+        let patch_path = PathBuf::from("/tmp/legacy-stale.rs");
+        append_history_messages(
+            &target_path,
+            &[
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::String(String::new()),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "legacy-patch".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "apply_patch".to_string(),
+                            arguments: serde_json::json!({
+                                "file_path": patch_path,
+                                "patch": "@@\n-old\n+new",
+                            })
+                            .to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "tool".to_string(),
+                    content: Value::String(
+                        "Error: apply_patch failed: context mismatch".to_string(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: Some("legacy-patch".to_string()),
+                    reasoning_content: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(read_stale_patch_targets_sqlite(&target_path).unwrap(), None);
+
+        try_handle_session_command(&mut app, "/sessions use legacy-stale").unwrap();
+
+        assert!(app.stale_patch_targets.contains(&patch_path));
+        assert!(
+            read_stale_patch_targets_sqlite(&target_path)
+                .unwrap()
+                .is_some_and(|targets| targets.contains(&patch_path)),
+            "legacy replay must be persisted so later compression cannot erase it"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
