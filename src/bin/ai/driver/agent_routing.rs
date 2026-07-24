@@ -236,7 +236,29 @@ pub(super) fn ensure_runtime_manifests_loaded(
         return;
     }
 
-    *skill_manifests = Arc::new(load_skill_manifests(app.cli.no_skills));
+    let loaded_skill_manifests = Arc::new(load_skill_manifests(app.cli.no_skills));
+    install_runtime_manifests(
+        app,
+        skill_manifests,
+        agent_manifests,
+        manifests_loaded,
+        loaded_skill_manifests,
+    );
+}
+
+/// 安装已在后台发现的技能快照，避免交互式首屏等待磁盘扫描完成。
+pub(super) fn install_runtime_manifests(
+    app: &mut App,
+    skill_manifests: &mut Arc<Vec<SkillManifest>>,
+    agent_manifests: &mut Arc<Vec<AgentManifest>>,
+    manifests_loaded: &mut bool,
+    loaded_skill_manifests: Arc<Vec<SkillManifest>>,
+) {
+    if *manifests_loaded {
+        return;
+    }
+
+    *skill_manifests = loaded_skill_manifests;
     crate::ai::prompt::completion::CommandCompleter::set_skill_manifests(
         skill_manifests.as_slice(),
     );

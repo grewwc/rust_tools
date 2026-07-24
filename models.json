@@ -220,11 +220,11 @@
     "enable_thinking": true,
     "default_reasoning_effort": "xhigh",
     "subagent_priority": 50,
-    "max_output_tokens": 128000
+    "max_output_tokens": 256000
   },
   {
-    "key": "doubao-seed-2.0-pro",
-    "name": "doubao-seed-2.0-pro",
+    "key": "doubao-seed-2.1-turbo",
+    "name": "doubao-seed-2.1-turbo",
     "endpoint": "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
     "api_key_config_key": "volcano.api_key",
     "quality_tier": "strong",
@@ -236,7 +236,7 @@
     "enable_thinking": true,
     "default_reasoning_effort": "high",
     "subagent_priority": 50,
-    "max_output_tokens": 128000
+    "max_output_tokens": 256000
   },
   {
     "key": "doubao-seed-2.1-pro",

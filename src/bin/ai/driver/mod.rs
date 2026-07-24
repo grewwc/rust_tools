@@ -627,6 +627,19 @@ async fn run_loop(
     let mut manifests_loaded = false;
     let mut skill_watcher = None;
     let mut skill_watcher_started = false;
+    // 外部技能目录（尤其是 Trae 的递归目录）可能很大。交互模式下等输入框首帧
+    // 绘制完成后再在后台扫描；用户提交首条输入前仍会接管完整快照。
+    let mut initial_skill_manifests = if !one_shot_mode && !app.cli.no_skills {
+        match skill_watcher::spawn_initial_skill_manifest_load() {
+            Ok(loader) => Some(loader),
+            Err(err) => {
+                eprintln!("[Warning] 技能预加载线程未启动，将在首条输入后同步加载：{err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut mcp_preload_task = if should_preload_mcp(one_shot_mode, &mcp_probe) {
         Some(spawn_mcp_preload_task(mcp_probe.config_path.clone()))
     } else {
@@ -745,25 +758,6 @@ async fn run_loop(
 
         subagent_status_line.finish();
 
-        // 输入框的 Tab 补全依赖技能 manifest；必须在打开交互输入前准备快照，避免
-        // `/skills <TAB>` 同步扫描所有目录、包和 zip 文件而阻塞终端。
-        ensure_runtime_manifests_loaded(
-            app,
-            skill_manifests,
-            agent_manifests,
-            &mut manifests_loaded,
-        );
-
-        // 监听线程只在 manifest 已完成首次加载后启动：补全始终从内存快照读取，
-        // 文件变更才由后台线程重新扫描并替换该快照。
-        if !skill_watcher_started && !one_shot_mode {
-            skill_watcher_started = true;
-            match skill_watcher::start_skill_manifest_watcher(app.cli.no_skills) {
-                Ok(watcher) => skill_watcher = watcher,
-                Err(err) => eprintln!("[Warning] 技能热加载监听未启动：{err}"),
-            }
-        }
-
         {
             // ── Goal 模式自动续推 ──
             // 当 goal 已设定且上一轮调用了工具时，跳过用户输入，直接注入
@@ -797,6 +791,21 @@ async fn run_loop(
                     app.goal_mode = None;
                 }
 
+                if let Some(notifier) = initial_skill_manifests
+                    .as_mut()
+                    .and_then(|loader| loader.take_prompt_ready_notifier())
+                {
+                    // `-i <prompt>` 会直接消费 CLI 参数而不进入输入框，必须立即
+                    // 放行预加载线程，否则后续接管 manifest 时会永久等待通知。
+                    if !app.cli.args.is_empty() {
+                        let _ = notifier.send(());
+                    } else if let Some(editor) = app.prompt_editor.as_mut() {
+                        editor.set_first_render_notifier(notifier);
+                    } else {
+                        let _ = notifier.send(());
+                    }
+                }
+
                 let Some(ctx) = input::next_question(app)? else {
                     cleanup_one_shot(app);
                     return Ok(());
@@ -808,6 +817,41 @@ async fn run_loop(
                 question = ctx.question;
                 attachments_text = ctx.attachments_text;
                 history_count = ctx.history_count;
+            }
+        }
+
+        // one-shot 模式直接取得 CLI 输入，交互模式则在用户提交首条输入前接管
+        // 已在首屏后扫描的 manifest。若预加载线程异常退出，则退回原有同步路径，
+        // 保证本轮的技能和 agent 语义完整。
+        if !manifests_loaded {
+            if let Some(loaded_skill_manifests) = initial_skill_manifests
+                .take()
+                .and_then(|loader| loader.recv().ok())
+            {
+                install_runtime_manifests(
+                    app,
+                    skill_manifests,
+                    agent_manifests,
+                    &mut manifests_loaded,
+                    loaded_skill_manifests,
+                );
+            } else {
+                ensure_runtime_manifests_loaded(
+                    app,
+                    skill_manifests,
+                    agent_manifests,
+                    &mut manifests_loaded,
+                );
+            }
+        }
+
+        // 监听线程只在首次快照就绪后启动：补全始终从内存快照读取，文件变更才
+        // 由后台线程重新扫描并替换该快照。
+        if !skill_watcher_started && !one_shot_mode {
+            skill_watcher_started = true;
+            match skill_watcher::start_skill_manifest_watcher(app.cli.no_skills) {
+                Ok(watcher) => skill_watcher = watcher,
+                Err(err) => eprintln!("[Warning] 技能热加载监听未启动：{err}"),
             }
         }
 

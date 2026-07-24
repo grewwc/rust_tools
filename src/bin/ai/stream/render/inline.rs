@@ -94,10 +94,10 @@ fn is_ambiguous_emoji_block_char(ch: char) -> bool {
 /// 把紧贴文件名/链接的中文标点（`：` `，` `。`）转成英文版（`:` `,` `.`）。
 ///
 /// Agent 常把中文标点和文件名/行号或链接连在一起输出，如 `src/foo.rs：42`、
-/// `https://x.com，详见`。全角标点会让终端无法识别 file:line / URL 边界，导致
-/// 无法点击跳转。仅当标点的「前一个字符」是路径/链接常见字符（字母数字、
-/// `/ _ . - ~ + @ : # ? = & %` 及反引号）时才转换，避免误伤纯中文语境
-/// （如 `时间：12点`，前一个字符是中文，不转换）。
+/// `调用时机： app.py:334`、`https://x.com，详见`。全角标点会让终端无法识别
+/// file:line / URL 边界，导致无法点击跳转。标点前是路径/链接常见字符时直接转换；
+/// 标点前是普通中文时，仅在其后（允许空格及行内代码标记）确实跟着可点击目标时转换，
+/// 避免误伤 `时间：12点` 这类纯中文语境。
 fn normalize_cjk_punct_around_path(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev: Option<char> = None;
@@ -114,10 +114,11 @@ fn normalize_cjk_punct_around_path(s: &str) -> String {
         }
 
         let ch = s[i..].chars().next().expect("character boundary");
+        let next_is_clickable_target = starts_clickable_terminal_target(s, i + ch.len_utf8());
         let replaced = match ch {
-            '：' if prev.is_some_and(is_path_neighbor) => ':',
-            '，' if prev.is_some_and(is_path_neighbor) => ',',
-            '。' if prev.is_some_and(is_path_neighbor) => '.',
+            '：' if prev.is_some_and(is_path_neighbor) || next_is_clickable_target => ':',
+            '，' if prev.is_some_and(is_path_neighbor) || next_is_clickable_target => ',',
+            '。' if prev.is_some_and(is_path_neighbor) || next_is_clickable_target => '.',
             _ => ch,
         };
         out.push(replaced);
@@ -134,6 +135,64 @@ fn is_path_neighbor(ch: char) -> bool {
         'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '_' | '.' | '-' | '~' | '+' | '@'
             | ':' | '#' | '?' | '=' | '&' | '%' | '`'
     )
+}
+
+/// 判断全角标点右侧是否紧跟终端通常可点击的路径 / URL。
+///
+/// Markdown 行内代码里的 `app.py:334` 仍是终端链接目标，因此识别其内容；数学 span
+/// 则保持字面量，不参与判断。这里只接受带路径分隔符、文件扩展名或 URL scheme 的目标，
+/// 不能把 `时间：12点` 之类普通中文后的数字误判为文件。
+fn starts_clickable_terminal_target(s: &str, mut start: usize) -> bool {
+    while let Some(ch) = s.get(start..).and_then(|rest| rest.chars().next()) {
+        if !matches!(ch, ' ' | '\t') {
+            break;
+        }
+        start += ch.len_utf8();
+    }
+
+    if start >= s.len() {
+        return false;
+    }
+
+    if let Some((span, _)) = take_atomic_markdown_span(s, start) {
+        if span.starts_with('`') {
+            return is_clickable_terminal_target(&span[1..span.len() - 1]);
+        }
+        if span.starts_with('$') {
+            return false;
+        }
+    }
+
+    let end = s[start..]
+        .char_indices()
+        .find_map(|(offset, ch)| (!ch.is_ascii() || ch.is_ascii_whitespace()).then_some(start + offset))
+        .unwrap_or(s.len());
+    is_clickable_terminal_target(&s[start..end])
+}
+
+fn is_clickable_terminal_target(token: &str) -> bool {
+    let token = token.trim_end_matches(['.', ',', ';', ':', ')', ']']);
+    if token.starts_with("https://") || token.starts_with("http://") || token.starts_with("file://") {
+        return true;
+    }
+
+    if token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+        || token.contains('/')
+    {
+        return true;
+    }
+
+    let Some((stem, extension)) = token.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && stem
+            .chars()
+            .any(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '-'))
+        && extension.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
 pub(super) fn render_inline_md(s: &str, base: &str) -> String {
@@ -868,5 +927,21 @@ mod tests {
         let rendered = render_inline_md("`src/main.rs：42` 和 $https://x.com，a$", "");
         assert!(rendered.contains("src/main.rs：42"));
         assert!(rendered.contains("https://x.com，a"));
+    }
+
+    #[test]
+    fn cjk_punctuation_before_clickable_target_is_normalized() {
+        assert_eq!(
+            normalize_cjk_punct_around_path(
+                "调用时机： `app.py:334`，文档：https://example.com/guide。"
+            ),
+            "调用时机: `app.py:334`,文档:https://example.com/guide."
+        );
+    }
+
+    #[test]
+    fn cjk_punctuation_without_clickable_target_stays_literal() {
+        let text = "时间：12点，普通说明。公式：$https://x.com$。";
+        assert_eq!(normalize_cjk_punct_around_path(text), text);
     }
 }

@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{self, BufRead},
     path::{Path, PathBuf},
+    sync::mpsc::Sender,
 };
 
 use rustyline::{CompletionType, Config, Editor, history::DefaultHistory};
@@ -33,6 +34,8 @@ pub(super) struct PromptEditor {
     current_model_label: String,
     /// 当前 session 主题，用于在输入框顶部与模型提示同行展示。
     session_topic: Option<String>,
+    /// 首帧绘制完成后的单次通知。启动期的后台初始化可据此避开终端首屏渲染。
+    first_render_notifier: Option<Sender<()>>,
 }
 
 impl PromptEditor {
@@ -62,6 +65,7 @@ impl PromptEditor {
             pending_status_msg: None,
             current_model_label: String::new(),
             session_topic: None,
+            first_render_notifier: None,
         }
     }
 
@@ -89,6 +93,18 @@ impl PromptEditor {
     /// 设置当前 session 主题，下一次 `read_multi_line` 会在模型提示同行展示。
     pub(super) fn set_session_topic(&mut self, topic: Option<String>) {
         self.session_topic = topic;
+    }
+
+    /// 设置下一次输入框首帧完成后的通知。
+    pub(in crate::ai) fn set_first_render_notifier(&mut self, notifier: Sender<()>) {
+        self.first_render_notifier = Some(notifier);
+    }
+
+    /// 通知一次即可；发送端被消费后，后续重绘不会产生额外事件。
+    pub(in crate::ai::prompt) fn notify_first_render(&mut self) {
+        if let Some(notifier) = self.first_render_notifier.take() {
+            let _ = notifier.send(());
+        }
     }
 
     /// 轮询后台生成的 LLM 标题；返回 `Some(changed)` 表示已读到生成标题。
@@ -126,6 +142,7 @@ impl PromptEditor {
     }
 
     fn read_multi_line_no_tty(&mut self) -> io::Result<Option<String>> {
+        self.notify_first_render();
         // 非 TTY 无法交互编辑：有预填且无管道输入时，直接返回预填原文。
         let prefill = self.pending_prefill.take();
         let _ = self.pending_status_msg.take();
