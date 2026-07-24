@@ -854,12 +854,7 @@ impl<'a> TerminalToolObserver<'a> {
         // `pty: true` 是调用方对交互式终端能力的显式请求。完整转发这一路的输出，
         // 让菜单、确认提示和登录引导可见；普通管道命令仍保持静默，避免日志淹没终端。
         self.render_full_pty_stream = execute_command_uses_pseudo_terminal(tool_call);
-        let label = if tool_call.function.name == "execute_command" {
-            "streaming command output"
-        } else {
-            "streaming tool output"
-        };
-        print_tool_note_line("output", label);
+        // 流式输出内容本身已在实时渲染，无需额外标签。
     }
 
     fn push_stream_text(&mut self, text: &str) {
@@ -1110,10 +1105,6 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
                 if let Some(exit_line) = run_result.tool_result.content.lines().next() {
                     print_tool_note_line("error", exit_line);
                 }
-            } else if tool_call.function.name == "execute_command" {
-                print_tool_note_line("result", "command completed");
-            } else {
-                print_tool_note_line("result", "tool completed");
             }
 
             self.reset_stream_state();
