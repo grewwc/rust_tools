@@ -335,6 +335,7 @@ impl PromptEditor {
                         }
                     })
                     .map_err(|e| io::Error::other(e.to_string()))?;
+                self.notify_first_render();
                 force_repaint_next_frame = false;
 
                 if !event::poll(Duration::from_millis(250))

@@ -42,6 +42,48 @@ impl Drop for SkillManifestWatcher {
     }
 }
 
+/// 首次技能发现任务。工作线程会等到输入框首帧完成才开始扫描大目录。
+pub(super) struct InitialSkillManifestLoader {
+    prompt_ready_tx: Option<mpsc::Sender<()>>,
+    updates: Receiver<Arc<Vec<skills::SkillManifest>>>,
+}
+
+impl InitialSkillManifestLoader {
+    pub(super) fn take_prompt_ready_notifier(&mut self) -> Option<mpsc::Sender<()>> {
+        self.prompt_ready_tx.take()
+    }
+
+    pub(super) fn recv(self) -> Result<Arc<Vec<skills::SkillManifest>>, mpsc::RecvError> {
+        self.updates.recv()
+    }
+}
+
+/// 在独立线程中完成首次技能发现。
+///
+/// 外部技能目录可能很大；工作线程等到交互式首屏已经绘制后才扫描。完整快照会在
+/// 用户提交第一条输入前由 driver 接管；线程完成后立即更新补全缓存，因此用户思考
+/// 期间的 Tab 补全会自然变为完整结果。
+pub(super) fn spawn_initial_skill_manifest_load() -> Result<InitialSkillManifestLoader, String> {
+    let (prompt_ready_tx, prompt_ready_rx) = mpsc::channel();
+    let (updates_tx, updates) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("initial-skill-manifest-loader".to_string())
+        .spawn(move || {
+            // 先让主线程完成首屏终端渲染，避免大目录扫描与启动期 I/O 竞争。
+            if prompt_ready_rx.recv().is_err() {
+                return;
+            }
+            let manifests = Arc::new(load_skill_manifests(false));
+            CommandCompleter::set_skill_manifests(manifests.as_slice());
+            let _ = updates_tx.send(manifests);
+        })
+        .map_err(|err| format!("启动初始技能加载线程失败：{err}"))?;
+    Ok(InitialSkillManifestLoader {
+        prompt_ready_tx: Some(prompt_ready_tx),
+        updates,
+    })
+}
+
 /// 启动技能目录监听。`--no-skills` 模式不创建 watcher。
 pub(super) fn start_skill_manifest_watcher(
     no_skills: bool,
