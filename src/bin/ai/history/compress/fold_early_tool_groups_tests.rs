@@ -1046,3 +1046,33 @@ fn retains_overlap_when_the_file_changed_between_reads() {
         "     1\tone\n     2\tbefore"
     );
 }
+
+/// 渐进折叠窗口序列从最大保护窗口起、递进收紧但**绝不到 0**：最近一次工具交互
+/// 始终至少保留 1 组逐字，避免最近的结构化工具上下文也被折叠成 stub。
+#[test]
+fn progressive_fold_windows_never_reach_zero() {
+    let windows = progressive_fold_windows();
+    assert_eq!(
+        *windows.first().unwrap(),
+        KEEP_RECENT_TOOL_GROUPS,
+        "sequence must start at the max protection window"
+    );
+    assert_eq!(
+        *windows.last().unwrap(),
+        MIN_KEEP_RECENT_TOOL_GROUPS,
+        "sequence must end at the minimum protection window, not 0"
+    );
+    assert!(
+        windows.iter().all(|&w| w >= MIN_KEEP_RECENT_TOOL_GROUPS),
+        "no window may drop below the minimum (was {windows:?})"
+    );
+    assert!(
+        !windows.contains(&0),
+        "window 0 folds the most recent tool interaction into a stub (was {windows:?})"
+    );
+    // 严格递减，保证每一步真正放宽折叠范围、不空转。
+    assert!(
+        windows.windows(2).all(|pair| pair[0] > pair[1]),
+        "windows must be strictly decreasing (was {windows:?})"
+    );
+}

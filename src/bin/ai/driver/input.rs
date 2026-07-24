@@ -546,6 +546,10 @@ fn apply_history_rewind(app: &mut App, plan: HistoryRewindPlan) -> Result<String
     history::replace_history_messages(&history_file, &plan.keep_messages)?;
     history::invalidate_context_history_cache_for(&history_file);
     crate::ai::driver::commands::session::clear_session_local_runtime_state(app);
+    crate::ai::driver::commands::session::reset_stale_patch_targets_from_messages(
+        app,
+        &plan.keep_messages,
+    )?;
     Ok(format!(
         "[history] Rewound from u{}: {} · removed {} message(s); kept {} message(s).",
         plan.user_ordinal,
@@ -1190,6 +1194,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
+            stale_patch_targets: Default::default(),
         }
     }
 

@@ -31,6 +31,7 @@ mod tool_result;
 mod types;
 
 pub(super) use orchestrator::run_turn;
+pub(in crate::ai::driver) use tool_result::stale_patch_targets_from_messages;
 #[cfg(test)]
 use persistence::persist_pending_turn_messages;
 pub(crate) use prepare::QuestionShape;
@@ -338,6 +339,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
+            stale_patch_targets: Default::default(),
         }
     }
 

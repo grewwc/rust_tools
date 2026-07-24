@@ -9,7 +9,8 @@ use super::{
     history::{
         COLON, MAX_HISTORY_TURNS, Message, NEWLINE, SessionStore, append_history,
         append_history_messages, build_context_history, build_message_arr,
-        compress_messages_for_context, mid_turn_compress,
+        compress_messages_for_context, messages_total_chars_pub, mid_turn_compress,
+        mid_turn_llm_summarize,
     },
     models,
     prompt::MultilineHistoryState,
@@ -97,6 +98,7 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
         last_turn_interrupted: false,
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
+        stale_patch_targets: Default::default(),
     }
 }
 
@@ -185,6 +187,7 @@ fn resolve_model_is_unicode_safe() {
         last_turn_interrupted: false,
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
+        stale_patch_targets: Default::default(),
     };
 
     let mut question = "a 什么是rust的一个crate？".to_string();
@@ -1440,6 +1443,92 @@ fn mid_turn_compress_preserves_latest_user_message() {
         has_latest_user,
         "mid-turn compression must preserve the latest user message"
     );
+}
+
+/// 回归：旧工具组已节省超过 4K 时，不能在仍高于 hard_target 的情况下提前返回。
+/// 最新完整工具组（尤其并行结果和大 arguments）必须保留配对结构并按总预算收敛。
+#[tokio::test]
+async fn mid_turn_llm_summary_reaches_hard_target_after_effective_early_folding() {
+    let root = std::env::temp_dir().join(format!(
+        "ai-mid-turn-hard-target-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
+    app.config.history_file = root.join("history.sqlite");
+    app.session_id = "hard-target-regression".to_string();
+
+    let mut messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("继续完成当前任务".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+    for index in 0..4 {
+        let id = format!("hard-target-call-{index}");
+        let result_chars = if index == 3 { 20_000 } else { 3_000 };
+        let arguments = if index == 3 {
+            serde_json::json!({ "query": "q".repeat(12_000) }).to_string()
+        } else {
+            serde_json::json!({ "query": format!("old-{index}") }).to_string()
+        };
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.clone(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "text_grep".to_string(),
+                    arguments,
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        messages.push(Message {
+            role: "tool".to_string(),
+            content: Value::String("x".repeat(result_chars)),
+            tool_calls: None,
+            tool_call_id: Some(id),
+            reasoning_content: None,
+        });
+    }
+
+    let hard_target = 5_000;
+    let (compressed, before, after, did_summarize) =
+        mid_turn_llm_summarize(&app, messages, 4, 2_000, hard_target).await;
+
+    assert!(before > hard_target + 20_000);
+    assert!(did_summarize);
+    assert!(after <= hard_target, "after={after}, payload={compressed:?}");
+    assert_eq!(after, messages_total_chars_pub(&compressed));
+    let latest_call = compressed
+        .iter()
+        .find_map(|message| {
+            message
+                .tool_calls
+                .as_ref()?
+                .iter()
+                .find(|call| call.id == "hard-target-call-3")
+        })
+        .expect("latest assistant tool call must remain structurally present");
+    assert!(serde_json::from_str::<Value>(&latest_call.function.arguments).is_ok());
+    assert!(compressed.iter().any(|message| {
+        message.role == "tool"
+            && message.tool_call_id.as_deref() == Some("hard-target-call-3")
+    }));
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

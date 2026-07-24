@@ -492,6 +492,7 @@ fn extract_apply_patch_target_paths_from_patch(patch: &str) -> Vec<PathBuf> {
             [
                 "*** Update File: ",
                 "*** Add File: ",
+                "*** Delete File: ",
                 "*** Replace in line: ",
             ]
             .iter()
@@ -506,72 +507,114 @@ fn extract_apply_patch_target_paths_from_patch(patch: &str) -> Vec<PathBuf> {
 }
 
 /// `apply_patch` 的 context mismatch / ambiguity 说明模型当前持有的文件事实已过期，
-/// 继续微调旧 patch 只会重复失败。这里以实际工具消息为准：目标文件在失败后必须有
-/// 一次成功的 `read_file`，才允许再次 patch。路径统一经 FileStore 归一化，避免
-/// 相对路径、`~` 和绝对路径写法不同而绕过门控。
-fn patch_retry_requires_fresh_read(messages: &[Message], tool_calls: &[ToolCall]) -> bool {
-    let mut result_by_id: HashMap<&str, &str> = HashMap::new();
-    for message in messages {
-        if message.role != "tool" {
-            continue;
-        }
-        if let (Some(id), Some(content)) =
-            (message.tool_call_id.as_deref(), message.content.as_str())
-        {
-            result_by_id.insert(id, content);
-        }
+/// 继续微调旧 patch 只会重复失败。这里查询 [`App::stale_patch_targets`] 运行时账本
+/// （由 [`update_stale_patch_targets`] 在每轮工具结果落定后维护）：目标文件在失败后
+/// 必须有一次成功的 `read_file` / `write_file` / `apply_patch`，才会从账本移除、允许
+/// 再次 patch。
+///
+/// 为什么不再扫描 `messages`：历史压缩会把失败的 apply_patch 组折叠成
+/// `internal_note` stub（丢失 `role=tool` 结果与 `assistant.tool_calls`），使基于
+/// 消息扫描的旧实现丢失 stale 状态、无法拦截重试。账本是不受压缩影响的真相源。
+fn patch_retry_requires_fresh_read(
+    stale_patch_targets: &rustc_hash::FxHashSet<PathBuf>,
+    tool_calls: &[ToolCall],
+) -> bool {
+    if stale_patch_targets.is_empty() {
+        return false;
     }
-
-    let mut stale_patch_targets = HashSet::new();
-    for message in messages {
-        let Some(previous_calls) = message.tool_calls.as_ref() else {
-            continue;
-        };
-        for tool_call in previous_calls {
-            let Some(result) = result_by_id.get(tool_call.id.as_str()).copied() else {
-                continue;
-            };
-            match tool_call.function.name.as_str() {
-                "apply_patch" => {
-                    let paths = patch_target_paths(tool_call);
-                    if paths.is_empty() {
-                        continue;
-                    }
-                    if result.trim_start().starts_with("Successfully patched") {
-                        for path in paths {
-                            stale_patch_targets.remove(&path);
-                        }
-                    } else if patch_failure_requires_fresh_read(result) {
-                        stale_patch_targets.extend(paths);
-                    }
-                }
-                "read_file" => {
-                    let Some(path) = file_tool_target_path(tool_call) else {
-                        continue;
-                    };
-                    if !result.trim_start().starts_with("Error:") {
-                        stale_patch_targets.remove(&path);
-                    }
-                }
-                "write_file" => {
-                    let Some(path) = file_tool_target_path(tool_call) else {
-                        continue;
-                    };
-                    if result.trim_start().starts_with("Successfully wrote to") {
-                        stale_patch_targets.remove(&path);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
     tool_calls.iter().any(|tool_call| {
         tool_call.function.name == "apply_patch"
             && patch_target_paths(tool_call)
                 .into_iter()
                 .any(|path| stale_patch_targets.contains(&path))
     })
+}
+
+/// 依据本轮真实执行的工具调用及其结果，增量维护 [`App::stale_patch_targets`] 账本。
+///
+/// 规则（与旧的消息扫描等价，但状态存活于内存账本、不受历史压缩影响）：
+/// - `apply_patch` 成功（`Successfully patched`）→ 目标路径移出账本；
+/// - `apply_patch` 因 `context mismatch` / `ambiguous patch` 失败 → 目标路径记入账本；
+/// - `read_file` 非 `Error:` → 目标路径移出账本（已重新取真相）；
+/// - `write_file` 成功（`Successfully wrote to`）→ 目标路径移出账本。
+///
+/// 只处理「有对应结果」的调用，路径统一经 [`patch_target_paths`] / [`file_tool_target_path`]
+/// 归一化，避免相对路径 / `~` / 绝对路径写法差异绕过门控。
+fn update_stale_patch_targets(
+    stale_patch_targets: &mut rustc_hash::FxHashSet<PathBuf>,
+    executed_tool_calls: &[ToolCall],
+    tool_results: &[crate::ai::types::ToolResult],
+) {
+    let result_by_id: HashMap<&str, &str> = tool_results
+        .iter()
+        .map(|result| (result.tool_call_id.as_str(), result.content.as_str()))
+        .collect();
+    for tool_call in executed_tool_calls {
+        let Some(result) = result_by_id.get(tool_call.id.as_str()).copied() else {
+            continue;
+        };
+        match tool_call.function.name.as_str() {
+            "apply_patch" => {
+                let paths = patch_target_paths(tool_call);
+                if paths.is_empty() {
+                    continue;
+                }
+                if result.trim_start().starts_with("Successfully patched") {
+                    for path in paths {
+                        stale_patch_targets.remove(&path);
+                    }
+                } else if patch_failure_requires_fresh_read(result) {
+                    stale_patch_targets.extend(paths);
+                }
+            }
+            "read_file" => {
+                let Some(path) = file_tool_target_path(tool_call) else {
+                    continue;
+                };
+                if !result.trim_start().starts_with("Error:") {
+                    stale_patch_targets.remove(&path);
+                }
+            }
+            "write_file" => {
+                let Some(path) = file_tool_target_path(tool_call) else {
+                    continue;
+                };
+                if result.trim_start().starts_with("Successfully wrote to") {
+                    stale_patch_targets.remove(&path);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 从旧 session 仍保留的结构化工具消息重建 stale-patch 账本。
+///
+/// 新 session 直接从 SQLite meta 恢复；这里只服务于升级前尚无 meta 的旧库，
+/// 并在首次加载后立刻写回，避免后续历史压缩丢掉重建所需的 tool-call 配对。
+pub(in crate::ai::driver) fn stale_patch_targets_from_messages(
+    messages: &[Message],
+) -> rustc_hash::FxHashSet<PathBuf> {
+    let mut tool_calls = Vec::new();
+    let mut tool_results = Vec::new();
+    for message in messages {
+        if let Some(calls) = &message.tool_calls {
+            tool_calls.extend(calls.iter().cloned());
+        }
+        if message.role == "tool"
+            && let (Some(tool_call_id), Some(content)) =
+                (message.tool_call_id.as_deref(), message.content.as_str())
+        {
+            tool_results.push(crate::ai::types::ToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                content: content.to_string(),
+            });
+        }
+    }
+
+    let mut stale_patch_targets = rustc_hash::FxHashSet::default();
+    update_stale_patch_targets(&mut stale_patch_targets, &tool_calls, &tool_results);
+    stale_patch_targets
 }
 
 fn patch_failure_requires_fresh_read(result: &str) -> bool {
@@ -1166,6 +1209,27 @@ fn handle_tool_call_round(
             .unwrap_or_default();
     uniquify_tool_call_occurrences(messages, &persisted_tool_call_ids, &mut exec_result);
     *turn_had_tool_error |= exec_result.had_error;
+    // apply_patch stale-target 账本必须在结果落定后、下一轮 guard 检查前更新。
+    // messages 不是可靠真相源：历史压缩会把失败组折叠成 internal_note；因此 live
+    // 状态放在 App，并同步写入当前 session 的 SQLite meta。被 guard 拒绝时产生的
+    // `apply_patch retry blocked` 文本既非成功也非 mismatch，对账本无副作用。
+    update_stale_patch_targets(
+        &mut app.stale_patch_targets,
+        &exec_result.executed_tool_calls,
+        &exec_result.tool_results,
+    );
+    // 先于消息落盘写账本：若进程恰在两次写入之间崩溃，留下一个偏保守的 fresh-read
+    // 要求是安全的；反过来丢掉 mismatch 状态会在恢复 session 后放行陈旧 patch。
+    // 普通一次性临时 session 会在退出时删除，不为它单独创建 SQLite。
+    let ephemeral_one_shot = one_shot_mode && app.cli.session.is_none();
+    if !ephemeral_one_shot
+        && let Err(error) = crate::ai::history::write_stale_patch_targets_sqlite(
+            &app.session_history_file,
+            &app.stale_patch_targets,
+        )
+    {
+        eprintln!("[Warning] failed to persist stale patch targets: {error}");
+    }
     append_cached_tool_results_note(&exec_result, messages, turn_messages);
     append_tool_result_messages(
         app,
@@ -1784,7 +1848,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
         IterationExecution::ToolCall(tool_call_execution) => {
             let patch_retry_needs_fresh_read = !*force_final_response
                 && patch_retry_requires_fresh_read(
-                    messages,
+                    &app.stale_patch_targets,
                     &tool_call_execution.stream_result.tool_calls,
                 );
             let rejection_reason = if *force_final_response {
@@ -2000,6 +2064,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
+            stale_patch_targets: Default::default(),
         }
     }
 
@@ -2032,6 +2097,30 @@ mod tests {
             tool_call_id: Some(id.to_string()),
             reasoning_content: None,
         }
+    }
+
+    /// 把一段 `assistant(tool_calls)` + `tool` 的消息序列按时间顺序回放进
+    /// stale-target 账本，等价于运行时逐轮调用 [`update_stale_patch_targets`]
+    /// 的累积效果。让 guard 测试仍用直观的「历史消息」表达场景，再据账本派生的
+    /// 门控行为断言——即覆盖修复后的完整链路（messages → 账本 → guard）。
+    fn ledger_from_messages(messages: &[Message]) -> rustc_hash::FxHashSet<PathBuf> {
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut tool_results: Vec<crate::ai::types::ToolResult> = Vec::new();
+        for message in messages {
+            if let Some(calls) = &message.tool_calls {
+                tool_calls.extend(calls.iter().cloned());
+            }
+            if message.role == "tool" {
+                if let (Some(id), Some(content)) =
+                    (message.tool_call_id.as_deref(), message.content.as_str())
+                {
+                    tool_results.push(tool_result(id, content));
+                }
+            }
+        }
+        let mut ledger = rustc_hash::FxHashSet::default();
+        update_stale_patch_targets(&mut ledger, &tool_calls, &tool_results);
+        ledger
     }
 
     #[test]
@@ -2202,7 +2291,8 @@ mod tests {
             serde_json::json!({ "path": path, "patch": "@@\n-old\n+newer" }),
         );
 
-        assert!(patch_retry_requires_fresh_read(&messages, &[retry]));
+        let ledger = ledger_from_messages(&messages);
+        assert!(patch_retry_requires_fresh_read(&ledger, &[retry]));
     }
 
     #[test]
@@ -2231,7 +2321,8 @@ mod tests {
             serde_json::json!({ "file_path": path, "patch": "@@\n-old\n+newer" }),
         );
 
-        assert!(!patch_retry_requires_fresh_read(&messages, &[retry]));
+        let ledger = ledger_from_messages(&messages);
+        assert!(!patch_retry_requires_fresh_read(&ledger, &[retry]));
     }
 
     #[test]
@@ -2264,7 +2355,8 @@ mod tests {
             serde_json::json!({ "file_path": patch_path, "patch": "@@\n-old\n+newer" }),
         );
 
-        assert!(patch_retry_requires_fresh_read(&messages, &[retry]));
+        let ledger = ledger_from_messages(&messages);
+        assert!(patch_retry_requires_fresh_read(&ledger, &[retry]));
     }
 
     #[test]
@@ -2300,7 +2392,8 @@ mod tests {
             serde_json::json!({ "file_path": b, "patch": "@@\n-old_b\n+newer_b" }),
         );
 
-        assert!(patch_retry_requires_fresh_read(&messages, &[retry]));
+        let ledger = ledger_from_messages(&messages);
+        assert!(patch_retry_requires_fresh_read(&ledger, &[retry]));
     }
 
     #[test]
@@ -2342,7 +2435,8 @@ mod tests {
             serde_json::json!({ "file_path": b, "patch": "@@\n-old_b\n+newer_b" }),
         );
 
-        assert!(!patch_retry_requires_fresh_read(&messages, &[retry]));
+        let ledger = ledger_from_messages(&messages);
+        assert!(!patch_retry_requires_fresh_read(&ledger, &[retry]));
     }
 
     #[test]
@@ -2446,6 +2540,10 @@ mod tests {
                 "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
             ),
         ];
+        // 账本才是 guard 的真相源：等价于上一轮 handle_tool_call_round 结束时
+        // update_stale_patch_targets 依据这段失败历史落定的状态。历史消息此后
+        // 即使被压缩折叠，账本仍独立存活。
+        app.stale_patch_targets = ledger_from_messages(&messages);
         let mut turn_messages = Vec::new();
         let mut final_assistant_text = String::new();
         let mut final_assistant_recorded = false;
@@ -3680,5 +3778,122 @@ mod tests {
             !shutdown.load(std::sync::atomic::Ordering::Relaxed),
             "Ctrl+C during foreground tool round should not request shutdown"
         );
+    }
+
+    fn tool_result(id: &str, content: &str) -> crate::ai::types::ToolResult {
+        crate::ai::types::ToolResult {
+            tool_call_id: id.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    /// 核心回归：apply_patch 因 context mismatch 失败后，账本记住 stale 目标；
+    /// 即便随后失败轮从 `messages` 里被历史压缩完全抹除（模拟折叠成
+    /// internal_note stub），guard 仍据账本拦截对同一路径的重试。这正是旧的
+    /// 消息扫描实现失效的场景。
+    #[test]
+    fn stale_patch_guard_survives_history_compression_via_ledger() {
+        let mut ledger: rustc_hash::FxHashSet<PathBuf> = Default::default();
+
+        // 第一轮：apply_patch 对 table.rs 失败（context mismatch）。
+        let failed_patch = test_tool_call(
+            "call_patch_1",
+            "apply_patch",
+            serde_json::json!({ "file_path": "/tmp/proj/table.rs", "patch": "*** Update File: /tmp/proj/table.rs\n@@\n-old\n+new\n" }),
+        );
+        update_stale_patch_targets(
+            &mut ledger,
+            std::slice::from_ref(&failed_patch),
+            &[tool_result(
+                "call_patch_1",
+                "Error: apply_patch failed: context mismatch: required recovery: read_file the same target before retrying apply_patch.",
+            )],
+        );
+        let normalized = FileStore::new(PathBuf::from("/tmp/proj/table.rs"))
+            .path()
+            .to_path_buf();
+        assert!(
+            ledger.contains(&normalized),
+            "failed patch target must be recorded in the ledger"
+        );
+
+        // 模拟历史压缩：失败轮的结构化消息被折叠、从 messages 中彻底消失。
+        // 旧实现从 messages 反推 stale 状态，此刻会漏判；账本不受影响。
+        let retry_patch = test_tool_call(
+            "call_patch_2",
+            "apply_patch",
+            serde_json::json!({ "file_path": "/tmp/proj/table.rs", "patch": "*** Update File: /tmp/proj/table.rs\n@@\n-old2\n+new2\n" }),
+        );
+        assert!(
+            patch_retry_requires_fresh_read(&ledger, std::slice::from_ref(&retry_patch)),
+            "guard must block stale retry using the ledger even after the failed round was compressed out of messages"
+        );
+    }
+
+    /// 成功的 read_file 对同一路径重新取真相后，账本释放该目标，guard 放行后续
+    /// patch。验证恢复链路能正常收敛（不会永久拦死）。
+    #[test]
+    fn stale_patch_guard_clears_after_fresh_read() {
+        let mut ledger: rustc_hash::FxHashSet<PathBuf> = Default::default();
+        let normalized = FileStore::new(PathBuf::from("/tmp/proj/table.rs"))
+            .path()
+            .to_path_buf();
+        ledger.insert(normalized.clone());
+
+        // 成功 read_file 同一目标 → 账本释放。
+        let fresh_read = test_tool_call(
+            "call_read_1",
+            "read_file",
+            serde_json::json!({ "file_path": "/tmp/proj/table.rs" }),
+        );
+        update_stale_patch_targets(
+            &mut ledger,
+            std::slice::from_ref(&fresh_read),
+            &[tool_result("call_read_1", "   1\tfn table() {}\n")],
+        );
+        assert!(
+            !ledger.contains(&normalized),
+            "successful read_file must clear the stale target"
+        );
+
+        let retry_patch = test_tool_call(
+            "call_patch_2",
+            "apply_patch",
+            serde_json::json!({ "file_path": "/tmp/proj/table.rs", "patch": "*** Update File: /tmp/proj/table.rs\n@@\n-a\n+b\n" }),
+        );
+        assert!(
+            !patch_retry_requires_fresh_read(&ledger, std::slice::from_ref(&retry_patch)),
+            "guard must allow the retry once the target has been freshly read"
+        );
+    }
+
+    #[test]
+    fn stale_patch_ledger_tracks_delete_file_envelope_targets() {
+        let mut ledger: rustc_hash::FxHashSet<PathBuf> = Default::default();
+        let failed_delete = test_tool_call(
+            "call_delete",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Delete File: /tmp/proj/obsolete.rs\n*** End Patch",
+            }),
+        );
+
+        update_stale_patch_targets(
+            &mut ledger,
+            std::slice::from_ref(&failed_delete),
+            &[tool_result(
+                "call_delete",
+                "Error: apply_patch failed: context mismatch",
+            )],
+        );
+
+        let normalized = FileStore::new(PathBuf::from("/tmp/proj/obsolete.rs"))
+            .path()
+            .to_path_buf();
+        assert!(ledger.contains(&normalized));
+        assert!(patch_retry_requires_fresh_read(
+            &ledger,
+            std::slice::from_ref(&failed_delete)
+        ));
     }
 }

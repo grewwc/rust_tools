@@ -394,7 +394,9 @@ pub(in crate::ai) async fn run_with_cli(
         last_turn_interrupted: false,
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
+        stale_patch_targets: Default::default(),
     };
+    commands::session::restore_session_local_runtime_state(&mut app)?;
     if let Some(notice) = startup_notice {
         println!("{notice}");
     }

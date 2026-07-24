@@ -751,8 +751,11 @@ async fn compact_persisted_history_with_app_inner(
 /// 压不掉工具组、整段历史无法收敛进预算」的总根因。
 ///
 /// 返回是否发生了「有效折叠」（净字符数下降）。`keep_recent` 从
-/// [`KEEP_RECENT_TOOL_GROUPS`] 递进收紧到 0，保证最近的工具组尽量逐字保留、
-/// 只有仍超预算才逐步放宽折叠范围；每一步都要求净下降，避免无进展空转。
+/// [`KEEP_RECENT_TOOL_GROUPS`] 递进收紧到 [`MIN_KEEP_RECENT_TOOL_GROUPS`]（=1），
+/// 保证最近的工具组尽量逐字保留、只有仍超预算才逐步放宽折叠范围；每一步都要求
+/// 净下降，避免无进展空转。**不再收紧到 0**：窗口降到 0 会把最近一次工具交互也
+/// 折叠成 stub，模型因此完全失去最近的结构化工具上下文；剩余超额交由 while 循环
+/// 后续的 `first_trim_candidate` / `truncate_mutable_messages_to_fit` 兜底。
 fn fold_noncompressible_tool_groups_to_fit(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -760,7 +763,7 @@ fn fold_noncompressible_tool_groups_to_fit(
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
     let mut made_progress = false;
-    for &keep_recent in &[KEEP_RECENT_TOOL_GROUPS, 2, 1, 0] {
+    for &keep_recent in progressive_fold_windows().iter() {
         if messages_total_chars(messages) <= max_chars {
             break;
         }
@@ -880,7 +883,7 @@ fn shrink_messages_to_fit(
     }
 
     if messages_total_chars(&messages) > max_chars {
-        truncate_first_message_to_fit(&mut messages, max_chars, protected_tool_call_ids);
+        truncate_unprotected_messages_to_fit(&mut messages, max_chars, protected_tool_call_ids);
     }
 
     keep_only_recent_reasoning_content(&mut messages);
@@ -1080,7 +1083,7 @@ fn shrink_messages_to_fit_with_summary(
     }
 
     if messages_total_chars(&messages) > max_chars {
-        truncate_first_message_to_fit(&mut messages, max_chars, protected_tool_call_ids);
+        truncate_mutable_messages_to_fit(&mut messages, max_chars, protected_tool_call_ids);
     }
 
     keep_only_recent_reasoning_content(&mut messages);
@@ -1097,41 +1100,220 @@ fn take_leading_summary(messages: &mut Vec<Message>) -> Option<Message> {
     }
 }
 
-fn truncate_first_message_to_fit(
+/// 最后一层硬预算逃逸阀：保持 system/user 与工具调用配对结构不变，只缩短可重建的
+/// assistant/tool 正文、reasoning 及超大 tool arguments。先保护当前高精度结果；若
+/// 仍无法达标，再允许截断这些结果。若不可裁的 system/user 自身已经超限，返回 false。
+fn truncate_mutable_messages_to_fit(
     messages: &mut [Message],
     max_chars: usize,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
-) {
-    if messages.is_empty() {
-        return;
+) -> bool {
+    truncate_mutable_messages_to_fit_with_policy(
+        messages,
+        max_chars,
+        protected_tool_call_ids,
+        true,
+    )
+}
+
+fn truncate_mutable_messages_to_fit_with_policy(
+    messages: &mut [Message],
+    max_chars: usize,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+    allow_protected_fallback: bool,
+) -> bool {
+    if max_chars == 0 || messages_total_chars(messages) <= max_chars {
+        return true;
     }
 
-    // 找到第一个可被截断的消息：
-    // - 跳过 system（agent 指令不能被截断）；
-    // - 跳过 user（用户原文零压缩）；
-    // - 跳过图片消息（图片引用零压缩）。
-    let target_idx = messages.iter().position(|m| {
-        m.role != "system"
-            && m.role != "user"
-            && !protected_tool_result_message(m, protected_tool_call_ids)
-            && !message_contains_image(&m.content)
-    });
-    let Some(target_idx) = target_idx else {
-        return; // 全是 system，没有可截断的目标
-    };
+    for include_protected in [false, true] {
+        if include_protected && !allow_protected_fallback {
+            break;
+        }
+        while messages_total_chars(messages) > max_chars {
+            let excess = messages_total_chars(messages).saturating_sub(max_chars);
+            let mut best: Option<(usize, MutableMessageField, usize)> = None;
+            for (index, message) in messages.iter().enumerate() {
+                if is_system_like_role(&message.role) || message.role == "user" {
+                    continue;
+                }
+                let is_protected = protected_tool_context_message(message, protected_tool_call_ids);
+                if is_protected && !include_protected {
+                    continue;
+                }
+                let content_chars = value_len_chars(&message.content);
+                if !message_contains_image(&message.content) && content_chars > 160 {
+                    choose_larger_mutable_field(
+                        &mut best,
+                        (index, MutableMessageField::Content, content_chars - 160),
+                    );
+                }
+                if let Some(reasoning) = message.reasoning_content.as_deref()
+                    && reasoning.chars().count() > 160
+                {
+                    choose_larger_mutable_field(
+                        &mut best,
+                        (
+                            index,
+                            MutableMessageField::Reasoning,
+                            reasoning.chars().count() - 160,
+                        ),
+                    );
+                }
+                if let Some(tool_calls) = &message.tool_calls {
+                    for (call_index, call) in tool_calls.iter().enumerate() {
+                        let argument_chars = call.function.arguments.chars().count();
+                        if argument_chars > 160 {
+                            choose_larger_mutable_field(
+                                &mut best,
+                                (
+                                    index,
+                                    MutableMessageField::ToolArguments(call_index),
+                                    argument_chars - 160,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
 
-    let others_chars: usize = messages
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != target_idx)
-        .map(|(_, m)| value_len_chars(&m.content))
-        .sum();
-    let remaining_chars = max_chars.saturating_sub(others_chars).max(50);
+            let Some((message_index, field, reducible)) = best else {
+                break;
+            };
+            let reduce_by = excess.min(reducible).max(1);
+            truncate_mutable_field(&mut messages[message_index], field, reduce_by);
+        }
+    }
 
-    let target = &mut messages[target_idx];
-    let text = value_to_string(&target.content);
-    let truncated = truncate_to_chars(&text, remaining_chars);
-    target.content = Value::String(truncated);
+    messages_total_chars(messages) <= max_chars
+}
+
+/// 软压缩只裁未受保护字段；当前轮高精度 tool 结果必须留给真正的 hard-target
+/// 兜底处理，不能因为 soft threshold 较小就损失刚读到的精确上下文。
+fn truncate_unprotected_messages_to_fit(
+    messages: &mut [Message],
+    max_chars: usize,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+) -> bool {
+    truncate_mutable_messages_to_fit_with_policy(
+        messages,
+        max_chars,
+        protected_tool_call_ids,
+        false,
+    )
+}
+
+/// Path C 先给每个可裁字段设置单项上限，防止一个最新结果独占整个窗口；再按总预算
+/// 继续收紧。两步都不删除消息或工具调用，因此 assistant↔tool 配对保持完整。
+fn emergency_cap_messages_to_fit(
+    messages: &mut [Message],
+    max_chars: usize,
+    per_field_cap: usize,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+) -> bool {
+    for message in messages.iter_mut() {
+        if is_system_like_role(&message.role) || message.role == "user" {
+            continue;
+        }
+        let content_chars = value_len_chars(&message.content);
+        if !message_contains_image(&message.content) && content_chars > per_field_cap {
+            truncate_mutable_field(
+                message,
+                MutableMessageField::Content,
+                content_chars - per_field_cap,
+            );
+        }
+        if let Some(reasoning_chars) = message
+            .reasoning_content
+            .as_deref()
+            .map(|reasoning| reasoning.chars().count())
+            && reasoning_chars > per_field_cap
+        {
+            truncate_mutable_field(
+                message,
+                MutableMessageField::Reasoning,
+                reasoning_chars - per_field_cap,
+            );
+        }
+        let tool_call_count = message.tool_calls.as_ref().map(Vec::len).unwrap_or(0);
+        for call_index in 0..tool_call_count {
+            let argument_chars = message
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.get(call_index))
+                .map(|call| call.function.arguments.chars().count())
+                .unwrap_or(0);
+            if argument_chars > per_field_cap {
+                truncate_mutable_field(
+                    message,
+                    MutableMessageField::ToolArguments(call_index),
+                    argument_chars - per_field_cap,
+                );
+            }
+        }
+    }
+    truncate_mutable_messages_to_fit(messages, max_chars, protected_tool_call_ids)
+}
+
+#[derive(Clone, Copy)]
+enum MutableMessageField {
+    Content,
+    Reasoning,
+    ToolArguments(usize),
+}
+
+fn choose_larger_mutable_field(
+    best: &mut Option<(usize, MutableMessageField, usize)>,
+    candidate: (usize, MutableMessageField, usize),
+) {
+    if best
+        .as_ref()
+        .is_none_or(|(_, _, best_reducible)| candidate.2 > *best_reducible)
+    {
+        *best = Some(candidate);
+    }
+}
+
+fn truncate_mutable_field(message: &mut Message, field: MutableMessageField, reduce_by: usize) {
+    match field {
+        MutableMessageField::Content => {
+            let text = value_to_string(&message.content);
+            let target = text.chars().count().saturating_sub(reduce_by).max(160);
+            message.content = Value::String(format!(
+                "[context-overflow-truncated] head+tail preview:\n{}",
+                keep_ends_by_chars(&text, target.saturating_sub(64))
+            ));
+        }
+        MutableMessageField::Reasoning => {
+            let Some(reasoning) = message.reasoning_content.as_deref() else {
+                return;
+            };
+            let target = reasoning.chars().count().saturating_sub(reduce_by).max(160);
+            message.reasoning_content = Some(format!(
+                "[context-overflow-truncated] {}",
+                keep_ends_by_chars(reasoning, target.saturating_sub(32))
+            ));
+        }
+        MutableMessageField::ToolArguments(call_index) => {
+            let Some(call) = message
+                .tool_calls
+                .as_mut()
+                .and_then(|calls| calls.get_mut(call_index))
+            else {
+                return;
+            };
+            let original_chars = call.function.arguments.chars().count();
+            let target = original_chars.saturating_sub(reduce_by).max(160);
+            let preview = keep_ends_by_chars(&call.function.arguments, target.saturating_sub(96));
+            // arguments 必须继续是合法 JSON；直接截字符串会让 provider 拒绝整次请求。
+            call.function.arguments = serde_json::json!({
+                "_context_overflow_truncated": true,
+                "original_chars": original_chars,
+                "preview": preview,
+            })
+            .to_string();
+        }
+    }
 }
 
 fn messages_total_chars(messages: &[Message]) -> usize {
@@ -1168,6 +1350,18 @@ fn protected_tool_result_message(
             .tool_call_id
             .as_ref()
             .is_some_and(|id| protected_tool_call_ids.contains(id))
+}
+
+fn protected_tool_context_message(
+    message: &Message,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+) -> bool {
+    protected_tool_result_message(message, protected_tool_call_ids)
+        || message.tool_calls.as_ref().is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|call| protected_tool_call_ids.contains(&call.id))
+        })
 }
 
 /// Public proxy of [`messages_total_chars`] for callers in other ai modules
@@ -1246,7 +1440,7 @@ const PATH_C_PER_MSG_CAP: usize = 8_000;
 ///     调 LLM 摘要器把那段压成单条 `internal_note` 注入到尾窗前；同时对尾窗
 ///     内部较早的工具组做折叠，避免"臃肿全在最近一轮"时压不动。
 ///   - Path B+C（渐进式折叠）：从 `keep_recent=4` 开始（等价于原 Path B），
-///     逐步缩小保护窗口到 2→1→0，直到有效压缩或降至 `hard_target` 以下。
+///     逐步缩小保护窗口到 2→1，直到有效压缩或降至 `hard_target` 以下。
 ///     解决"臃肿全在保护尾窗内、早期历史已压无可压"时压缩器空转的问题。
 ///   - Path C 兜底（per-message 截断）：渐进式折叠后仍超 `hard_target` 时，
 ///     对尾窗内单个超大非 system 消息做 head+tail 截断。这是绝对最后手段。
@@ -1326,12 +1520,14 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     }
 
     // === Path B+C：渐进式工具组折叠 ===
-    // 从 keep_recent=4（等价于原 Path B）开始，逐步缩小保护窗口到 2→1→0，
+    // 从 keep_recent=4（等价于原 Path B）开始，逐步缩小保护窗口到 2→1（绝不到 0），
     // 直到有效压缩或降至 hard_target 以下。解决"臃肿全在保护尾窗内"时空转。
     // 在 best（Path A 结果或原始 messages）上链式折叠：已折叠的组变成 stub
     //（internal_note），不会被 fold_early_tool_groups 再次匹配，因此每次迭代
-    // 只会折叠上一轮保留的组，逐步释放保护尾窗。
-    for &keep_recent in &[MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, 2, 1, 0] {
+    // 只会折叠上一轮保留的组，逐步释放保护尾窗。窗口不降到 0（见
+    // [`MIN_KEEP_RECENT_TOOL_GROUPS`]）：保留最近 1 组逐字，剩余超额由下方 Path C
+    // per-message 截断兜底，避免把最近一次工具交互也 stub 化。
+    for &keep_recent in progressive_fold_windows().iter() {
         if best_after <= hard_target {
             break;
         }
@@ -1352,68 +1548,39 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         }
     }
 
-    // 有效压缩 → 返回（无论是否达标 hard_target，只要净下降够大就算成功）
-    if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS {
-        return (best.unwrap_or(messages), before, best_after, true);
-    }
-
-    // === Path C 兜底：per-message 截断 ===
-    // 渐进式折叠后仍超 hard_target 且未达有效压缩：对尾窗内单个超大非 system
-    // 消息做 head+tail 截断。典型场景：最近一轮对话本身就很大（巨型 user 消息
-    // 或大量近期工具结果），早期历史已压无可压，臃肿全在保护尾窗内。user 消息
-    // 承载任务指令，head+tail 截断会让 agent 丢失任务目标，因此永不截断——
-    // 宁可让该轮带超大 user 超限发请求（由 normalize_messages_for_request 兜底
-    // 或 provider 4xx 后重试），也不能把任务指令截成预览碎片。
-    // 这是绝对最后手段——宁可截断也不能让模型 4xx。
-    if best_after > hard_target {
-        let current = best.unwrap_or(messages);
-        let capped = cap_oversized_non_system_messages(
-            current,
-            PATH_C_PER_MSG_CAP,
-            &protected_tool_call_ids,
-        );
-        let after = messages_total_chars(&capped);
-        let savings = before.saturating_sub(after);
+    // 只有真正达到 hard_target 才能提前返回。旧逻辑只要净下降超过 4K 就返回，
+    // 会跳过下面的硬兜底，让「旧组已省很多、最新一组仍单独超窗」继续发出超限请求。
+    if best_after <= hard_target {
+        let did_summarize =
+            before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS;
         return (
-            capped,
+            best.unwrap_or(messages),
             before,
-            after,
-            savings >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS,
+            best_after,
+            did_summarize,
         );
     }
 
-    // 所有路径均未达到有效压缩：返回最佳结果，did_summarize=false
-    let result = best.unwrap_or(messages);
-    (result, before, best_after, false)
-}
-
-/// Path C 兜底：对序列中单个超大非 system 消息做 head+tail 截断。
-/// 仅在渐进式折叠后仍超 `hard_target` 时由 [`mid_turn_llm_summarize`] 调用。
-/// system / agent 指令 / user 消息永不截断；图片按名义计费（≤ PATH_C_PER_MSG_CAP）天然跳过。
-/// user 消息承载任务指令，截断成 head+tail 预览会导致 agent 丢失任务目标。
-fn cap_oversized_non_system_messages(
-    mut messages: Vec<Message>,
-    per_msg_cap: usize,
-    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
-) -> Vec<Message> {
-    for message in &mut messages {
-        if is_system_like_role(&message.role)
-            || message.role == "user"
-            || protected_tool_result_message(message, protected_tool_call_ids)
-        {
-            continue;
-        }
-        let chars = value_len_chars(&message.content);
-        if chars <= per_msg_cap {
-            continue;
-        }
-        let text = value_to_string(&message.content);
-        let capped = keep_ends_by_chars(&text, per_msg_cap);
-        message.content = Value::String(format!(
-            "[context-overflow-truncated] 原文 {chars} 字符已截断为 head+tail 预览：\n{capped}"
-        ));
-    }
-    messages
+    // === Path C 兜底：预算感知的结构保留截断 ===
+    // 保留 system/user 与最近工具组的 assistant↔tool 配对；仅压缩可再取回的结果正文、
+    // reasoning 和超大 tool arguments。与旧的「每条最多 8K」不同，这里继续按总预算
+    // 收紧，因此并行工具结果很多时也能收敛。若不可裁的 system/user 本身已超预算，
+    // 返回可达到的最小结果，而不是破坏用户任务原文。
+    let mut result = best.unwrap_or(messages);
+    emergency_cap_messages_to_fit(
+        &mut result,
+        hard_target,
+        PATH_C_PER_MSG_CAP,
+        &protected_tool_call_ids,
+    );
+    let after = messages_total_chars(&result);
+    let savings = before.saturating_sub(after);
+    (
+        result,
+        before,
+        after,
+        savings >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS,
+    )
 }
 
 /// 单张图片在「字符预算」里的名义计费。
@@ -1598,6 +1765,31 @@ fn is_summary_message(message: &Message) -> bool {
 /// 最近完整工具组的保护窗口。一个 assistant(tool_calls) 批次是不可拆分的证据
 /// 单元：绝不能按单条 tool 消息截断，否则并行读取会只留下半批结果。
 const KEEP_RECENT_TOOL_GROUPS: usize = 4;
+
+/// 渐进式工具组折叠的**最小**保护窗口。窗口收紧到该值即停，绝不降到 0。
+///
+/// 窗口降到 0 会把最近一次工具交互也折叠成 `compressed_tool_round` stub：
+/// 模型因此完全失去最近的结构化工具上下文（`assistant.tool_calls` + `role=tool`
+/// 结果），既伤害多步任务连续性，也让依赖结构化消息的运行时守卫失去最新证据。
+/// 保留最近 1 组逐字；剩余超额由下游 per-message 截断 / first_trim 兜底。
+const MIN_KEEP_RECENT_TOOL_GROUPS: usize = 1;
+
+/// 渐进式折叠的保护窗口序列：从 [`KEEP_RECENT_TOOL_GROUPS`] 递进收紧到
+/// [`MIN_KEEP_RECENT_TOOL_GROUPS`]，逐步放宽折叠范围但绝不到 0。两条渐进折叠
+/// 路径（[`fold_noncompressible_tool_groups_to_fit`] 与 `mid_turn_llm_summarize`
+/// 的 Path B+C）共用同一序列，保证「最小保护窗口」这一策略只有一处真源。
+fn progressive_fold_windows() -> Vec<usize> {
+    let mut windows = Vec::new();
+    let mut keep = KEEP_RECENT_TOOL_GROUPS;
+    loop {
+        windows.push(keep);
+        if keep <= MIN_KEEP_RECENT_TOOL_GROUPS {
+            break;
+        }
+        keep = (keep / 2).max(MIN_KEEP_RECENT_TOOL_GROUPS);
+    }
+    windows
+}
 
 /// 带 tool_calls 的 assistant 消息中，保留完整 reasoning_content 的最近轮数。
 /// 更早的 tool-call reasoning 置 None（DeepSeek 由 echo 兜底补空字符串占位），
