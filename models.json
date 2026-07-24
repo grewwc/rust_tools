@@ -234,7 +234,7 @@
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
-    "default_reasoning_effort": "hight",
+    "default_reasoning_effort": "high",
     "subagent_priority": 50,
     "max_output_tokens": 256000
   },
