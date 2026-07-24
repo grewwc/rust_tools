@@ -1,5 +1,5 @@
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossterm::{
     cursor,
@@ -256,8 +256,6 @@ impl PromptEditor {
             let mut pending_tab_completion: Option<PendingTabCompletion> = None;
             let mut completion_panel: Option<CompletionPanel> = None;
             let mut recent_text_input: Option<RecentTextInput> = None;
-            let mut generated_title_seen = false;
-            let mut next_title_refresh = Instant::now();
             // 记录当前 viewport 已适配的补全候选数：None 表示无面板（base 高度）。
             // 面板出现/消失/候选数变化时，据此重建 viewport 让面板获得足够高度，
             // 而输入框行数保持不变。
@@ -266,17 +264,8 @@ impl PromptEditor {
             let mut force_repaint_next_frame = false;
 
             loop {
-                // 首轮 user message 落盘后，session 标题会在后台生成。输入框已经打开时
-                // 不能只依赖下一轮 prompt 初始化，否则底部会一直停留在首条消息摘要。
-                if !generated_title_seen {
-                    let now = Instant::now();
-                    if now >= next_title_refresh {
-                        if let Ok(Some(_)) = self.refresh_generated_session_topic() {
-                            generated_title_seen = true;
-                        }
-                        next_title_refresh = now + Duration::from_millis(500);
-                    }
-                }
+                // 后台只发布标题更新；终端仍由前台输入循环在本次安全绘制点重绘。
+                self.apply_pending_session_title_updates();
 
                 // 面板状态变化时，重建 inline viewport 以匹配面板所需高度。
                 let current_items = completion_panel.as_ref().map(|p| p.items.len());

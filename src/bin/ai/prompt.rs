@@ -2,7 +2,11 @@ use std::{
     fs,
     io::{self, BufRead},
     path::{Path, PathBuf},
-    sync::mpsc::Sender,
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
 };
 
 use rustyline::{CompletionType, Config, Editor, history::DefaultHistory};
@@ -20,6 +24,39 @@ pub(super) use multiline::MultilineHistoryState;
 const LINE_REPL_HISTORY_FILE: &str = "~/.liner_history";
 const MAX_INPUT_CHARS: usize = 4000;
 
+/// 后台任务只发布标题变更；终端重绘仍由前台输入循环独占。
+#[derive(Clone)]
+struct SessionTitleUpdate {
+    session_id: String,
+    title: String,
+}
+
+static SESSION_TITLE_UPDATE_SUBSCRIBERS: LazyLock<Mutex<Vec<(u64, Sender<SessionTitleUpdate>)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static NEXT_SESSION_TITLE_UPDATE_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn subscribe_session_title_updates() -> (u64, Receiver<SessionTitleUpdate>) {
+    let (sender, receiver) = mpsc::channel();
+    let subscriber_id = NEXT_SESSION_TITLE_UPDATE_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed);
+    SESSION_TITLE_UPDATE_SUBSCRIBERS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push((subscriber_id, sender));
+    (subscriber_id, receiver)
+}
+
+/// 将已持久化的标题变更转交给当前前台编辑器。
+pub(in crate::ai) fn notify_session_title_updated(session_id: &str, title: &str) {
+    let update = SessionTitleUpdate {
+        session_id: session_id.to_string(),
+        title: title.to_string(),
+    };
+    SESSION_TITLE_UPDATE_SUBSCRIBERS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .retain(|(_, sender)| sender.send(update.clone()).is_ok());
+}
+
 pub(super) struct PromptEditor {
     editor: Option<LineEditor>,
     pub(super) history_path: PathBuf,
@@ -34,8 +71,20 @@ pub(super) struct PromptEditor {
     current_model_label: String,
     /// 当前 session 主题，用于在输入框顶部与模型提示同行展示。
     session_topic: Option<String>,
+    /// 当前前台编辑器的后台标题变更订阅。
+    session_title_update_subscription: u64,
+    session_title_updates: Mutex<Receiver<SessionTitleUpdate>>,
     /// 首帧绘制完成后的单次通知。启动期的后台初始化可据此避开终端首屏渲染。
     first_render_notifier: Option<Sender<()>>,
+}
+
+impl Drop for PromptEditor {
+    fn drop(&mut self) {
+        SESSION_TITLE_UPDATE_SUBSCRIBERS
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .retain(|(subscriber_id, _)| *subscriber_id != self.session_title_update_subscription);
+    }
 }
 
 impl PromptEditor {
@@ -55,6 +104,8 @@ impl PromptEditor {
         }
         let session_store = SessionStore::new(history_file);
         let session_image_dir = session_store.session_assets_dir(session_id);
+        let (session_title_update_subscription, session_title_updates) =
+            subscribe_session_title_updates();
         Self {
             editor,
             history_path,
@@ -65,6 +116,8 @@ impl PromptEditor {
             pending_status_msg: None,
             current_model_label: String::new(),
             session_topic: None,
+            session_title_update_subscription,
+            session_title_updates: Mutex::new(session_title_updates),
             first_render_notifier: None,
         }
     }
@@ -107,20 +160,28 @@ impl PromptEditor {
         }
     }
 
-    /// 轮询后台生成的 LLM 标题；返回 `Some(changed)` 表示已读到生成标题。
-    fn refresh_generated_session_topic(&mut self) -> io::Result<Option<bool>> {
-        let Some(title) = self.session_store.read_session_title(&self.session_id)? else {
-            return Ok(None);
+    /// 在前台安全点应用后台标题更新，避免后台任务直接操作终端。
+    fn apply_pending_session_title_updates(&mut self) -> bool {
+        let updates = {
+            let receiver = self
+                .session_title_updates
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            receiver.try_iter().collect::<Vec<_>>()
         };
-        let title = crate::ai::history::normalize_generated_session_title(&title);
-        if title.trim().is_empty() {
-            return Ok(None);
-        }
-        let changed = self.session_topic.as_deref() != Some(title.as_str());
-        if changed {
+        let mut changed = false;
+        for update in updates {
+            if update.session_id != self.session_id {
+                continue;
+            }
+            let title = crate::ai::history::normalize_generated_session_title(&update.title);
+            if title.trim().is_empty() || self.session_topic.as_deref() == Some(title.as_str()) {
+                continue;
+            }
             self.session_topic = Some(title);
+            changed = true;
         }
-        Ok(Some(changed))
+        changed
     }
 
     pub(super) fn read_multi_line(&mut self) -> io::Result<Option<String>> {

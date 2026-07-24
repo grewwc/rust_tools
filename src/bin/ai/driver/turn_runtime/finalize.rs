@@ -521,11 +521,12 @@ async fn generate_session_title_if_missing(app: &App) {
         .flatten();
     if let Some(title) = generated_title {
         if should_generate_model_session_title(current.as_ref(), &fallback_title) {
-            let _ = store.write_session_title_with_origin(
-                &app.session_id,
-                &title,
-                SessionTitleOrigin::Model,
-            );
+            if store
+                .write_session_title_with_origin(&app.session_id, &title, SessionTitleOrigin::Model)
+                .is_ok()
+            {
+                crate::ai::prompt::notify_session_title_updated(&app.session_id, &title);
+            }
         }
         return;
     }
@@ -534,11 +535,16 @@ async fn generate_session_title_if_missing(app: &App) {
     if !fallback_title.is_empty()
         && should_write_fallback_session_title(current.as_ref(), &fallback_title)
     {
-        let _ = store.write_session_title_with_origin(
-            &app.session_id,
-            &fallback_title,
-            SessionTitleOrigin::Fallback,
-        );
+        if store
+            .write_session_title_with_origin(
+                &app.session_id,
+                &fallback_title,
+                SessionTitleOrigin::Fallback,
+            )
+            .is_ok()
+        {
+            crate::ai::prompt::notify_session_title_updated(&app.session_id, &fallback_title);
+        }
     }
 }
 
