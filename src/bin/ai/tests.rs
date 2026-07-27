@@ -481,7 +481,7 @@ fn history_file_parsing_sqlite_round_trips_structured_messages() {
 }
 
 #[test]
-fn history_file_loading_keeps_visible_narration_without_promoting_reasoning() {
+fn canonical_history_keeps_reasoning_without_promoting_it_to_visible_content() {
     for ext in ["txt", "sqlite"] {
         let path =
             std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
@@ -552,19 +552,23 @@ fn history_file_loading_keeps_visible_narration_without_promoting_reasoning() {
             loaded[1].content,
             Value::String("我先看一下这个文件。".to_string())
         );
-        assert_eq!(loaded[1].reasoning_content, None);
+        assert_eq!(loaded[1].reasoning_content.as_deref(), Some("step by step"));
         assert_eq!(
             loaded[1].tool_calls.as_ref().map(|calls| calls.len()),
             Some(1)
         );
         assert_eq!(loaded[2].content, Value::String("fn main() {}".to_string()));
-        assert_eq!(loaded[3].content, Value::String(String::new()));
-        assert_eq!(loaded[3].reasoning_content, None);
+        assert_eq!(loaded[3].content, Value::Null);
+        assert_eq!(
+            loaded[3].reasoning_content.as_deref(),
+            Some("需要查看 Cargo.toml 里的 crate 配置。")
+        );
         assert!(
-            loaded.iter().all(|message| message
-                .content
-                .as_str()
-                .is_none_or(|content| !content.contains("需要查看 Cargo.toml 里的 crate 配置。"))),
+            loaded
+                .iter()
+                .all(|message| message.content.as_str().is_none_or(
+                    |content| !content.contains("需要查看 Cargo.toml 里的 crate 配置。")
+                )),
             "hidden reasoning must not become visible history content"
         );
         assert_eq!(
@@ -576,10 +580,57 @@ fn history_file_loading_keeps_visible_narration_without_promoting_reasoning() {
             Value::String("[package]\nname = \"rust_tools\"".to_string())
         );
         assert_eq!(loaded[5].content, Value::String("done".to_string()));
-        assert_eq!(loaded[5].reasoning_content, None);
+        assert_eq!(
+            loaded[5].reasoning_content.as_deref(),
+            Some("final hidden reasoning")
+        );
 
         let _ = std::fs::remove_file(path);
     }
+}
+
+#[test]
+fn declared_model_keeps_raw_reasoning_and_builds_tagged_context_projection() {
+    let path = std::env::temp_dir().join(format!(
+        "ai-history-glm-reasoning-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let assistant = Message {
+        role: "assistant".to_string(),
+        content: Value::String("准备调用工具".to_string()),
+        tool_calls: Some(vec![ToolCall {
+            id: "call_glm_history".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: Some("GLM continuation state".to_string()),
+    };
+    crate::ai::history::append_history_messages_for_model(
+        &path,
+        std::slice::from_ref(&assistant),
+        "glm-5.2-opencode",
+    )
+    .unwrap();
+
+    let loaded = build_message_arr(10, &path).unwrap();
+    assert_eq!(loaded, vec![assistant]);
+    let context =
+        crate::ai::history::read_context_history_sqlite(&path, "reasoning-projection-test")
+            .unwrap();
+    assert!(
+        context.messages[0]
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|reasoning| reasoning
+                .starts_with(crate::ai::history::compress::PERSISTED_REASONING_REPLAY_PREFIX)),
+        "模型 continuation state 应只在可重建上下文投影里携带来源标记"
+    );
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -1166,10 +1217,19 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
     for (i, stub) in dedup_stubs.iter().enumerate() {
         let call_id = format!("call_same_{i}");
         assert!(stub.contains("- original_tool_call_id: "), "{stub}");
-        assert!(stub.contains("- canonical_tool_call_id: call_same_5"), "{stub}");
-        assert!(stub.contains(&format!("- original_tool_call_id: {call_id}")), "{stub}");
+        assert!(
+            stub.contains("- canonical_tool_call_id: call_same_5"),
+            "{stub}"
+        );
+        assert!(
+            stub.contains(&format!("- original_tool_call_id: {call_id}")),
+            "{stub}"
+        );
         assert!(stub.contains("- canonical_message_index: "), "{stub}");
-        assert!(stub.contains(r#""filePath":"/repo/agent_adapter.py""#), "{stub}");
+        assert!(
+            stub.contains(r#""filePath":"/repo/agent_adapter.py""#),
+            "{stub}"
+        );
         assert!(
             stub.contains("- original_target: file=/repo/agent_adapter.py"),
             "{stub}"
@@ -1222,9 +1282,18 @@ fn compression_dedup_stub_preserves_identical_list_directory_call_context() {
 
     assert!(stub.contains("- original_tool_call_id: list-1"), "{stub}");
     assert!(stub.contains("- canonical_tool_call_id: list-2"), "{stub}");
-    assert!(stub.contains("- original_args: {\"path\":\"/repo/src/bin/ai\"}"), "{stub}");
-    assert!(stub.contains("- original_target: path=/repo/src/bin/ai"), "{stub}");
-    assert!(stub.contains("- preview: driver/ history/ tools/"), "{stub}");
+    assert!(
+        stub.contains("- original_args: {\"path\":\"/repo/src/bin/ai\"}"),
+        "{stub}"
+    );
+    assert!(
+        stub.contains("- original_target: path=/repo/src/bin/ai"),
+        "{stub}"
+    );
+    assert!(
+        stub.contains("- preview: driver/ history/ tools/"),
+        "{stub}"
+    );
 }
 
 #[test]
@@ -1492,10 +1561,8 @@ fn mid_turn_compress_preserves_latest_user_message() {
 /// 最新完整工具组（尤其并行结果和大 arguments）必须保留配对结构并按总预算收敛。
 #[tokio::test]
 async fn mid_turn_llm_summary_reaches_hard_target_after_effective_early_folding() {
-    let root = std::env::temp_dir().join(format!(
-        "ai-mid-turn-hard-target-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("ai-mid-turn-hard-target-{}", uuid::Uuid::new_v4()));
     let mut app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
     app.config.history_file = root.join("history.sqlite");
     app.session_id = "hard-target-regression".to_string();
@@ -1553,7 +1620,10 @@ async fn mid_turn_llm_summary_reaches_hard_target_after_effective_early_folding(
 
     assert!(before > hard_target + 20_000);
     assert!(did_summarize);
-    assert!(after <= hard_target, "after={after}, payload={compressed:?}");
+    assert!(
+        after <= hard_target,
+        "after={after}, payload={compressed:?}"
+    );
     assert_eq!(after, messages_total_chars_pub(&compressed));
     let latest_call = compressed
         .iter()
@@ -1567,8 +1637,7 @@ async fn mid_turn_llm_summary_reaches_hard_target_after_effective_early_folding(
         .expect("latest assistant tool call must remain structurally present");
     assert!(serde_json::from_str::<Value>(&latest_call.function.arguments).is_ok());
     assert!(compressed.iter().any(|message| {
-        message.role == "tool"
-            && message.tool_call_id.as_deref() == Some("hard-target-call-3")
+        message.role == "tool" && message.tool_call_id.as_deref() == Some("hard-target-call-3")
     }));
 
     let _ = std::fs::remove_dir_all(root);
@@ -1693,9 +1762,7 @@ fn large_image_does_not_evict_tool_history_from_budget() {
         },
         Message {
             role: "tool".to_string(),
-            content: Value::String(
-                "read_file 结果：found memo.rs at src/bin/re/memo".to_string(),
-            ),
+            content: Value::String("read_file 结果：found memo.rs at src/bin/re/memo".to_string()),
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
             reasoning_content: None,
@@ -2188,7 +2255,7 @@ fn history_retains_turns_under_cap() {
 }
 
 #[test]
-fn history_compacts_old_turns_into_summary() {
+fn canonical_history_never_compacts_old_turns() {
     let turns = MAX_HISTORY_TURNS + 50;
     for ext in ["txt", "sqlite"] {
         let path =
@@ -2230,22 +2297,11 @@ fn history_compacts_old_turns_into_summary() {
             .unwrap();
         }
         let loaded = build_message_arr(10_000, &path).unwrap();
-        assert_eq!(
-            loaded.first().unwrap().role,
-            crate::ai::history::ROLE_INTERNAL_NOTE
-        );
-        assert!(
-            loaded
-                .first()
-                .and_then(|m| m.content.as_str())
-                .unwrap_or_default()
-                .contains("历史摘要")
-        );
+        assert_eq!(loaded.len(), turns * 4);
         let first_user = loaded.iter().find(|m| m.role == "user").unwrap();
-        assert_ne!(first_user.content, Value::String("u0".to_string()));
+        assert_eq!(first_user.content, Value::String("u0".to_string()));
         let user_count = loaded.iter().filter(|m| m.role == "user").count();
-        assert!(user_count <= MAX_HISTORY_TURNS);
-        assert!(user_count < turns);
+        assert_eq!(user_count, turns);
         assert_eq!(
             loaded.last().unwrap().content,
             Value::String(format!("a{}_final", turns - 1))
@@ -2470,6 +2526,74 @@ fn context_history_cache_invalidates_after_history_changes() {
 }
 
 #[test]
+fn context_history_caps_oversized_canonical_tail_without_mutating_canonical_data() {
+    let id = uuid::Uuid::new_v4();
+    let path = std::env::temp_dir().join(format!("ai-history-hard-cap-{id}.sqlite"));
+    let overflow_dir = std::env::temp_dir().join(format!("ai-history-hard-cap-assets-{id}"));
+    let raw_tool_result = "precise-tool-output\n".repeat(4_000);
+    assert!(raw_tool_result.chars().count() > 64_000);
+
+    append_history_messages(
+        &path,
+        &[
+            Message {
+                role: "user".to_string(),
+                content: Value::String("inspect the output".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_oversized".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "inspect_output".to_string(),
+                        arguments: r#"{"path":"large.log"}"#.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String(raw_tool_result.clone()),
+                tool_calls: None,
+                tool_call_id: Some("call_oversized".to_string()),
+                reasoning_content: None,
+            },
+        ],
+    )
+    .unwrap();
+
+    // 即使关闭常规 history 压缩，绝对安全上限仍应投影超大 canonical tail。
+    let context = build_context_history(8, &path, 0, 8, 2_000, Some(overflow_dir.clone())).unwrap();
+    let projected = context
+        .iter()
+        .find(|message| message.role == "tool")
+        .and_then(|message| message.content.as_str())
+        .unwrap();
+    assert_ne!(projected, raw_tool_result);
+    assert!(projected.starts_with("[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]"));
+    assert!(projected.contains("file_path"));
+    assert!(projected.chars().count() < 64_000);
+
+    let canonical = build_message_arr(8, &path).unwrap();
+    assert_eq!(
+        canonical
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(|message| message.content.as_str()),
+        Some(raw_tool_result.as_str())
+    );
+
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
 fn sqlite_recent_turn_window_reads_only_recent_user_turns() {
     let path =
         std::env::temp_dir().join(format!("ai-history-window-{}.sqlite", uuid::Uuid::new_v4()));
@@ -2595,7 +2719,11 @@ fn session_delete_removes_sqlite_sidecars() {
     std::fs::write(PathBuf::from(format!("{}-journal", db.display())), b"test").unwrap();
     let derived = store.sessions_root().join("abc.proc-42.sqlite");
     std::fs::write(&derived, b"derived").unwrap();
-    std::fs::write(PathBuf::from(format!("{}-wal", derived.display())), b"derived").unwrap();
+    std::fs::write(
+        PathBuf::from(format!("{}-wal", derived.display())),
+        b"derived",
+    )
+    .unwrap();
     let legacy_derived = store.sessions_root().join("abc.sqlite.subagent-legacy");
     std::fs::write(&legacy_derived, b"legacy").unwrap();
     let assets = store.session_assets_dir("abc");
@@ -2674,9 +2802,15 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
         std::fs::write(PathBuf::from(format!("{}-wal", db.display())), b"test").unwrap();
         std::fs::write(PathBuf::from(format!("{}-shm", db.display())), b"test").unwrap();
         std::fs::write(PathBuf::from(format!("{}-journal", db.display())), b"test").unwrap();
-        let derived = store.sessions_root().join(format!("{id}.subagent-child.sqlite"));
+        let derived = store
+            .sessions_root()
+            .join(format!("{id}.subagent-child.sqlite"));
         std::fs::write(&derived, b"derived").unwrap();
-        std::fs::write(PathBuf::from(format!("{}-shm", derived.display())), b"derived").unwrap();
+        std::fs::write(
+            PathBuf::from(format!("{}-shm", derived.display())),
+            b"derived",
+        )
+        .unwrap();
         let assets = store.session_assets_dir(id);
         std::fs::create_dir_all(&assets).unwrap();
         std::fs::write(assets.join("paste.png"), b"test").unwrap();
@@ -2699,7 +2833,9 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
         assert!(!PathBuf::from(format!("{}-wal", db.display())).exists());
         assert!(!PathBuf::from(format!("{}-shm", db.display())).exists());
         assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
-        let derived = store.sessions_root().join(format!("{id}.subagent-child.sqlite"));
+        let derived = store
+            .sessions_root()
+            .join(format!("{id}.subagent-child.sqlite"));
         assert!(!derived.exists());
         assert!(!PathBuf::from(format!("{}-shm", derived.display())).exists());
         let assets = store.session_assets_dir(id);

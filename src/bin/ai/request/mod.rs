@@ -111,7 +111,7 @@ use thinking::resolve_thinking;
 #[cfg(test)]
 #[allow(unused_imports)]
 use reasoning::{
-    apply_prompt_cache_breakpoint, ensure_reasoning_content_echo_for_thinking_model,
+    apply_prompt_cache_breakpoint, normalize_reasoning_content_replay_for_model,
     prompt_cache_enabled_for_model, resolve_reasoning_wire_controls,
 };
 

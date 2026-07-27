@@ -17,7 +17,8 @@ history/compression in `turn_runtime/`, subagent flows in `turn_runtime/orchestr
    is hidden/lazy, keep the reminder text consistent with the registry behavior.
 4. **History is evidence.** Compression and pruning must preserve tool outputs,
    subagent results, and truncation state through explicit stubs or file pointers;
-   never silently summarize away the only source of truth.
+   never silently summarize away the only source of truth. Persist the raw turn
+   separately from the bounded request-context projection.
 5. **Retry behavior is intentional.** Retry only on well-classified transport,
    provider, or context-window failures. Treat retry/backoff changes as user
    visible behavior changes.
@@ -36,10 +37,11 @@ history/compression in `turn_runtime/`, subagent flows in `turn_runtime/orchestr
     executed as a parallel batch in the driver path or system prompt guidance;
     use each result to refine the next lookup so evidence stays narrow and the
     model converges instead of flooding context.
-11. **Current-turn tool results have a hard cap.** Keep normal recent precision
+11. **Model-visible tool results have a hard cap.** Keep normal recent precision
     results raw for recall, but never put physically huge tool output directly
     into `messages`; write it to a session overflow file and keep a bounded,
-    self-describing stub with original-call anchors.
+    self-describing stub with original-call anchors. Rebuilt canonical-history
+    tails must apply the same absolute cap without mutating canonical rows.
 12. **Progress truth comes from the raw current tool round.** Tool-loop and
     Progress Budget checks may run after mid-turn compression, but current-round
     mutation/progress must be sampled from the pre-compression tool-call snapshot,
@@ -56,3 +58,6 @@ history/compression in `turn_runtime/`, subagent flows in `turn_runtime/orchestr
     skill across turns only after its `request_user_input` control tool succeeds;
     consume that continuation on the next normal turn, let an explicit skill pin
     override it, and never infer it from response wording or question marks.
+16. **Persist the actual response model.** Automatic request fallback does not
+    rewrite `app.current_model`; model-dependent projection and canonical-history
+    provenance must use the model that actually produced each response.

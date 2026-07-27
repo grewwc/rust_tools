@@ -7,7 +7,7 @@ use std::{
 use crate::commonw::utils::open_file_for_append;
 
 use super::{
-    compress, sqlite,
+    sqlite,
     types::{COLON, Message, NEWLINE},
 };
 
@@ -36,16 +36,10 @@ pub(in crate::ai) fn build_message_arr(
         }
     }
 
-    let compacted = compress::compact_persisted_history(parsed_messages.clone());
-    if compacted != parsed_messages {
-        fs::write(history_file, serialize_history_messages(&compacted))?;
+    if history_count >= parsed_messages.len() {
+        return Ok(parsed_messages);
     }
-    let messages = compacted;
-
-    if history_count >= messages.len() {
-        return Ok(messages);
-    }
-    Ok(messages[messages.len() - history_count..].to_vec())
+    Ok(parsed_messages[parsed_messages.len() - history_count..].to_vec())
 }
 
 pub(in crate::ai) fn append_history(path: &Path, content: &str) -> io::Result<()> {
@@ -74,26 +68,24 @@ pub(in crate::ai) fn append_history_messages(path: &Path, messages: &[Message]) 
     append_history(path, &blob)
 }
 
-pub(in crate::ai) fn append_history_messages_uncompacted(
+/// 把本轮原始消息连同生成它们的模型写入 canonical history。
+/// `source_model` 只作为 reasoning 请求投影的来源证明，不会改写消息正文。
+pub(in crate::ai) fn append_history_messages_for_model(
     path: &Path,
     messages: &[Message],
+    source_model: &str,
 ) -> io::Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
-
-    let newline = NEWLINE.to_string();
-    let mut records = Vec::with_capacity(messages.len());
-    for message in messages {
-        let record = serde_json::to_string(message).map_err(|e| io::Error::other(e.to_string()))?;
-        records.push(record);
-    }
-    let blob = format!("{}{}", records.join(&newline), newline);
-
     if is_sqlite_path(path) {
-        return sqlite::append_history_sqlite_uncompacted(path, messages.to_vec());
+        return sqlite::append_history_sqlite_for_model(
+            path,
+            messages.to_vec(),
+            Some(source_model),
+        );
     }
-    append_history_blob(path, &blob)
+    append_history_messages(path, messages)
 }
 
 pub(in crate::ai) fn replace_history_messages(path: &Path, messages: &[Message]) -> io::Result<()> {
@@ -104,6 +96,19 @@ pub(in crate::ai) fn replace_history_messages(path: &Path, messages: &[Message])
         fs::create_dir_all(parent)?;
     }
     fs::write(path, serialize_history_messages(messages))
+}
+
+pub(in crate::ai) fn truncate_history_messages(path: &Path, keep: usize) -> io::Result<()> {
+    if is_sqlite_path(path) {
+        return sqlite::truncate_messages_sqlite(path, keep);
+    }
+    let mut messages = match fs::read_to_string(path) {
+        Ok(content) => parse_history_blob(&content),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    messages.truncate(keep);
+    replace_history_messages(path, &messages)
 }
 
 fn append_history_blob(path: &Path, content: &str) -> io::Result<()> {

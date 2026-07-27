@@ -168,6 +168,62 @@ pub(super) fn prepare_tool_messages_structured(
     }
 }
 
+/// 对请求上下文中的工具结果施加不可绕过的物理上限。
+///
+/// canonical history 始终保留原文；这里仅修改请求侧副本。普通近端结果继续保持
+/// raw，只有超过绝对上限时才外溢，避免 SQLite snapshot 水位之后的 canonical
+/// tail 绕过 current-turn 投影，再次把超大输出送进模型。
+pub(super) fn cap_oversized_tool_results_for_context(
+    messages: &mut [Message],
+    hard_cap_chars: usize,
+    overflow_dir: Option<&Path>,
+) -> usize {
+    if hard_cap_chars == 0 {
+        return 0;
+    }
+
+    let id_to_tool_name = build_tool_call_name_index(messages);
+    let id_to_tool_args = build_tool_call_arguments_index(messages);
+    let mut capped = 0;
+    for idx in tool_message_indices(messages) {
+        let text = value_to_string(&messages[idx].content);
+        if is_preserved_tool_overflow_stub(&text) || text.chars().nth(hard_cap_chars).is_none() {
+            continue;
+        }
+
+        let tool_call_id = messages[idx].tool_call_id.as_deref();
+        let tool_name = tool_call_id
+            .and_then(|id| id_to_tool_name.get(id))
+            .map(String::as_str)
+            .unwrap_or("unknown_tool");
+        let recall_lines = tool_call_id
+            .and_then(|id| id_to_tool_args.get(id))
+            .map(|args| build_tool_overflow_recall_lines(tool_name, args))
+            .unwrap_or_default();
+        let replacement = overflow_dir
+            .and_then(|dir| write_preserved_tool_overflow_file(dir, tool_name, &text))
+            .map(|path| {
+                build_preserved_tool_overflow_stub(&path, tool_name, &text, &recall_lines)
+            })
+            .unwrap_or_else(|| {
+                let mut stub = format!(
+                    "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
+                     Output for tool `{tool_name}` exceeded the absolute request-context cap, but the session asset could not be written. Canonical history still retains the raw result."
+                );
+                for line in &recall_lines {
+                    stub.push('\n');
+                    stub.push_str(line);
+                }
+                stub.push('\n');
+                stub.push_str(&build_overflow_content_preview(&text));
+                stub
+            });
+        messages[idx].content = Value::String(replacement);
+        capped += 1;
+    }
+    capped
+}
+
 /// 最新并行批次可能单独超过上下文窗口。此时仍按完整组判定，但对注册为高精度
 /// grounding 的结果设置 inline 上限：超过预算的结果零压缩外溢并保留可召回 stub。
 /// `task` / `task_wait` 等聚合结果没有注册该标志，不会挤占 read_file 等证据的预算。

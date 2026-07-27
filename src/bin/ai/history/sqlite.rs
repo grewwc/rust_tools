@@ -12,14 +12,21 @@ use crate::ai::types::ToolCall;
 
 use super::{
     blob,
-    compress::{
-        compact_persisted_history, is_summary_note_text, value_to_string,
-        COMPRESSED_TOOL_EVIDENCE_MARKER,
-    },
-    types::{Message, ToolExecutionOutcome, MAX_HISTORY_TURNS, ROLE_INTERNAL_NOTE},
+    compress::{self, is_summary_note_text, value_to_string, COMPRESSED_TOOL_EVIDENCE_MARKER},
+    types::{Message, ToolExecutionOutcome, ROLE_INTERNAL_NOTE},
 };
 
 const STALE_PATCH_TARGETS_META_KEY: &str = "stale_patch_targets_v1";
+
+/// 模型实际请求所消费的可重建上下文。`messages` 永远是唯一的原始会话记录；
+/// 这里的消息只是一次压缩快照，加上 `source_message_id` 之后的新原始消息即可
+/// 重建当前上下文。`canonical_generation` 用于拒绝并发 rewind/clear 后的陈旧快照。
+pub(in crate::ai) struct ContextHistory {
+    pub(in crate::ai) messages: Vec<Message>,
+    pub(in crate::ai) source_message_id: i64,
+    pub(in crate::ai) canonical_generation: i64,
+    pub(in crate::ai) snapshot_is_current: bool,
+}
 
 pub(in crate::ai) struct RecentTurnWindow {
     pub(in crate::ai) messages: Vec<Message>,
@@ -48,9 +55,24 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             tool_calls TEXT,
             tool_call_id TEXT,
             reasoning_content TEXT,
+            source_model TEXT,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
         CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+        CREATE TABLE IF NOT EXISTS context_messages (
+            position INTEGER PRIMARY KEY,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tool_calls TEXT,
+            tool_call_id TEXT,
+            reasoning_content TEXT
+        );
+        CREATE TABLE IF NOT EXISTS context_snapshot (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            source_message_id INTEGER NOT NULL,
+            source_generation INTEGER NOT NULL,
+            projection_fingerprint TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -67,6 +89,14 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
     add_column_if_missing(conn, "messages", "tool_calls", "TEXT")?;
     add_column_if_missing(conn, "messages", "tool_call_id", "TEXT")?;
     add_column_if_missing(conn, "messages", "reasoning_content", "TEXT")?;
+    add_column_if_missing(conn, "messages", "source_model", "TEXT")?;
+    // 旧快照无法证明符合当前投影策略，空 fingerprint 会让读取路径安全地忽略它。
+    add_column_if_missing(
+        conn,
+        "context_snapshot",
+        "projection_fingerprint",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     Ok(())
 }
 
@@ -117,6 +147,33 @@ fn bump_history_revision(conn: &Connection) -> io::Result<()> {
         [],
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(())
+}
+
+fn history_generation(conn: &Connection) -> io::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(
+            (SELECT CAST(value AS INTEGER) FROM meta WHERE key='history_generation'),
+            0
+         )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// 任何会重写 canonical messages 的操作都必须使派生快照失效。
+fn invalidate_context_snapshot(conn: &Connection) -> io::Result<()> {
+    conn.execute("DELETE FROM context_messages", [])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    conn.execute("DELETE FROM context_snapshot", [])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('history_generation', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())
 }
 
@@ -502,79 +559,15 @@ fn drop_ambiguous_tool_execution_outcomes(conn: &Connection) -> io::Result<()> {
 }
 
 pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -> io::Result<()> {
-    let mut conn = open_history_db(path)?;
-    init_history_schema(&conn)?;
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let first_user_in_blob = entries
-        .iter()
-        .find(|message| message.role == "user")
-        .map(|message| value_to_string(&message.content));
-    let tx = conn
-        .transaction()
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    {
-        let existing_first: Option<String> = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key='first_user_prompt' LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .unwrap_or(None);
-        if existing_first.is_none() {
-            let first_existing_user: Option<String> = tx
-                .query_row(
-                    "SELECT content FROM messages WHERE role='user' ORDER BY id ASC LIMIT 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .unwrap_or(None);
-            let first_user_prompt = first_existing_user.or(first_user_in_blob.clone());
-            if let Some(v) = first_user_prompt.as_deref() {
-                let _ = tx.execute(
-                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('first_user_prompt', ?1)",
-                    params![v],
-                );
-            }
-        }
-        insert_messages(&tx, entries)?;
-    }
-    let user_turns: i64 = tx
-        .query_row(
-            "SELECT COUNT(1) FROM messages WHERE role = 'user'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    if user_turns.max(0) as usize <= MAX_HISTORY_TURNS {
-        bump_history_revision(&tx)?;
-        return tx.commit().map_err(|e| io::Error::other(e.to_string()));
-    }
-    let messages = read_messages_with_sql(
-        &tx,
-        "SELECT role, content, tool_calls, tool_call_id, reasoning_content
-         FROM messages
-         ORDER BY id ASC",
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
-    let compacted = compact_persisted_history(messages.clone());
-    if compacted != messages {
-        drop_ambiguous_tool_execution_outcomes(&tx)?;
-        tx.execute("DELETE FROM messages", [])
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        insert_messages(&tx, compacted)?;
-        prune_orphan_tool_execution_outcomes(&tx)?;
-    }
-    bump_history_revision(&tx)?;
-    tx.commit().map_err(|e| io::Error::other(e.to_string()))
+    append_history_sqlite_for_model(path, entries, None)
 }
 
-pub(in crate::ai) fn append_history_sqlite_uncompacted(
+/// 只向 canonical history 追加原始消息。模型来源作为旁路元数据保存，绝不改写
+/// `Message` 本身；后续仅在构造可重建 context view 时生成协议专属投影。
+pub(in crate::ai) fn append_history_sqlite_for_model(
     path: &Path,
     entries: Vec<Message>,
+    source_model: Option<&str>,
 ) -> io::Result<()> {
     let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;
@@ -614,7 +607,7 @@ pub(in crate::ai) fn append_history_sqlite_uncompacted(
                 );
             }
         }
-        insert_messages(&tx, entries)?;
+        insert_messages(&tx, entries, source_model)?;
     }
     bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
@@ -632,20 +625,26 @@ pub(in crate::ai) fn replace_all_messages_sqlite(
     drop_ambiguous_tool_execution_outcomes(&tx)?;
     tx.execute("DELETE FROM messages", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
+    invalidate_context_snapshot(&tx)?;
     tx.execute("DELETE FROM meta WHERE key='first_user_prompt'", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
-    insert_messages(&tx, messages.to_vec())?;
+    insert_messages(&tx, messages.to_vec(), None)?;
     prune_orphan_tool_execution_outcomes(&tx)?;
     refresh_first_user_prompt_meta(&tx, messages)?;
     bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
-fn insert_messages(conn: &Connection, messages: Vec<Message>) -> io::Result<()> {
+fn insert_messages(
+    conn: &Connection,
+    messages: Vec<Message>,
+    source_model: Option<&str>,
+) -> io::Result<()> {
     let mut stmt = conn
         .prepare(
-            "INSERT INTO messages (role, content, tool_calls, tool_call_id, reasoning_content)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO messages
+                (role, content, tool_calls, tool_call_id, reasoning_content, source_model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
     for message in messages {
@@ -662,7 +661,8 @@ fn insert_messages(conn: &Connection, messages: Vec<Message>) -> io::Result<()> 
             content,
             tool_calls,
             message.tool_call_id,
-            message.reasoning_content
+            message.reasoning_content,
+            source_model,
         ])
         .map_err(|e| io::Error::other(e.to_string()))?;
     }
@@ -712,6 +712,185 @@ fn read_messages_with_sql(
     Ok(messages)
 }
 
+fn read_projected_canonical_messages_after_id(
+    conn: &Connection,
+    after_id: i64,
+) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT role, content, tool_calls, tool_call_id, reasoning_content, source_model
+         FROM messages
+         WHERE id > ?1
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![after_id], |row| {
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let tool_calls: Option<String> = row.get(2)?;
+        let tool_call_id: Option<String> = row.get(3)?;
+        let reasoning_content: Option<String> = row.get(4)?;
+        let source_model: Option<String> = row.get(5)?;
+        Ok((
+            Message {
+                role,
+                content: decode_message_content(&content),
+                tool_calls: decode_tool_calls(tool_calls.as_deref()),
+                tool_call_id,
+                reasoning_content,
+            },
+            source_model,
+        ))
+    })?;
+
+    let mut messages = Vec::new();
+    for row in rows {
+        let (message, source_model) = row?;
+        messages.push(match source_model.as_deref() {
+            Some(model) => compress::sanitize_message_for_persisted_history_for_model(
+                model, &message,
+            ),
+            None => compress::sanitize_message_for_persisted_history(&message),
+        });
+    }
+    Ok(messages)
+}
+
+/// 返回模型上下文层：最近一次可替换压缩快照，加上快照水位之后的原始消息投影。
+/// 读取在同一个 SQLite 快照事务中完成，因此 `source_message_id` 精确描述返回值已经
+/// 消费到的 canonical 水位；并发追加会自然成为下一次读取的 tail，不会被快照吞掉。
+pub(in crate::ai) fn read_context_history_sqlite(
+    path: &Path,
+    projection_fingerprint: &str,
+) -> io::Result<ContextHistory> {
+    let mut conn = open_history_db(path)?;
+    init_history_schema(&conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let canonical_generation = history_generation(&tx)?;
+    let latest_message_id = tx
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let snapshot = tx
+        .query_row(
+            "SELECT source_message_id, source_generation, projection_fingerprint
+             FROM context_snapshot WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .filter(|(_, generation, fingerprint)| {
+            *generation == canonical_generation && fingerprint == projection_fingerprint
+        });
+
+    let (mut messages, after_id, has_snapshot) =
+        if let Some((source_message_id, _, _)) = snapshot {
+            let messages = read_messages_with_sql(
+                &tx,
+                "SELECT role, content, tool_calls, tool_call_id, reasoning_content
+                 FROM context_messages ORDER BY position ASC",
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+            (messages, source_message_id, true)
+        } else {
+            (Vec::new(), 0, false)
+        };
+    messages.extend(
+        read_projected_canonical_messages_after_id(&tx, after_id)
+            .map_err(|error| io::Error::other(error.to_string()))?,
+    );
+    tx.commit()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+
+    Ok(ContextHistory {
+        messages,
+        source_message_id: latest_message_id,
+        canonical_generation,
+        snapshot_is_current: has_snapshot && after_id == latest_message_id,
+    })
+}
+
+/// 原子替换可重建的上下文快照。若读取快照后发生 rewind/clear 等 canonical 改写，
+/// generation 会变化，此时拒绝陈旧结果；普通并发 append 不改变 generation，且其
+/// message id 大于传入水位，后续读取会把它作为 tail 合并回来。
+pub(in crate::ai) fn write_context_snapshot_sqlite(
+    path: &Path,
+    messages: &[Message],
+    source_message_id: i64,
+    canonical_generation: i64,
+    projection_fingerprint: &str,
+) -> io::Result<bool> {
+    let mut conn = open_history_db(path)?;
+    init_history_schema(&conn)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if history_generation(&tx)? != canonical_generation {
+        return Ok(false);
+    }
+
+    tx.execute("DELETE FROM context_messages", [])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    insert_context_messages(&tx, messages)?;
+    tx.execute(
+        "INSERT INTO context_snapshot
+            (singleton, source_message_id, source_generation, projection_fingerprint)
+         VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT(singleton) DO UPDATE SET
+            source_message_id = excluded.source_message_id,
+            source_generation = excluded.source_generation,
+            projection_fingerprint = excluded.projection_fingerprint",
+        params![
+            source_message_id,
+            canonical_generation,
+            projection_fingerprint
+        ],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    bump_history_revision(&tx)?;
+    tx.commit()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(true)
+}
+
+fn insert_context_messages(conn: &Connection, messages: &[Message]) -> io::Result<()> {
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO context_messages
+                (position, role, content, tool_calls, tool_call_id, reasoning_content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    for (position, message) in messages.iter().enumerate() {
+        let content = serde_json::to_string(&message.content)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let tool_calls = message
+            .tool_calls
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        stmt.execute(params![
+            position as i64,
+            message.role,
+            content,
+            tool_calls,
+            message.tool_call_id,
+            message.reasoning_content,
+        ])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    }
+    Ok(())
+}
+
 pub(in crate::ai) fn build_message_arr_sqlite(
     history_count: usize,
     history_file: &Path,
@@ -729,18 +908,10 @@ pub(in crate::ai) fn build_message_arr_sqlite(
          FROM messages
          ORDER BY id ASC",
     )?;
-    // 读路径**不落盘**：`compact_persisted_history` 仅用于内存返回值，保持
-    // `build_context_history` 现有的截断/归一行为不变。历史上这里会在 compacted
-    // 与原始不同时 `replace_all_messages_sqlite` 覆盖库并 bump revision——那让
-    // “读函数”产生写副作用：① 每次读都可能失效 `ContextHistoryCacheKey`（含
-    // history_revision）造成缓存抖动；② 在 app-aware 压缩之前就用启发式摘要
-    // 不可逆覆盖原文，使 >200 轮的会话被“双压”降保真。真正的落盘压缩由
-    // `compact_session_history_with_app_inner` 专责，读路径恢复只读。
-    let compacted = compact_persisted_history(messages);
-    if history_count >= compacted.len() {
-        return Ok(compacted);
+    if history_count >= messages.len() {
+        return Ok(messages);
     }
-    Ok(compacted[compacted.len() - history_count..].to_vec())
+    Ok(messages[messages.len() - history_count..].to_vec())
 }
 
 pub(in crate::ai) fn read_recent_messages_sqlite(
@@ -1012,6 +1183,7 @@ pub(in crate::ai) fn remap_context_checkpoint_paths_sqlite(
         remapped += 1;
     }
     if remapped > 0 {
+        invalidate_context_snapshot(&tx)?;
         bump_history_revision(&tx)?;
     }
     tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
@@ -1081,14 +1253,17 @@ pub(in crate::ai) fn clear_session_history_sqlite(path: &Path) -> io::Result<()>
         .map_err(|e| io::Error::other(e.to_string()))?;
     tx.execute("DELETE FROM messages", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
+    invalidate_context_snapshot(&tx)?;
     tx.execute("DELETE FROM tool_execution_outcomes", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
     // 保留 history_revision 行：它是缓存失效计数器，须跨 clear **单调递增**。
+    // history_generation 是快照并发写的 fencing token，clear 后也必须单调递增；
     // turn_seq 同样是 session 级身份，清空上下文不能让旧序号被复用。
     // 若连同它一起删掉，bump 会从 1 重新开始，版本号回退后可能与早期缓存
     // 条目的 revision 撞车，反而让已失效的旧历史被误命中。
     tx.execute(
-        "DELETE FROM meta WHERE key NOT IN ('history_revision', 'turn_seq')",
+        "DELETE FROM meta
+         WHERE key NOT IN ('history_revision', 'history_generation', 'turn_seq')",
         [],
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
@@ -1114,6 +1289,7 @@ pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::R
     if keep == 0 {
         tx.execute("DELETE FROM messages", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
+        invalidate_context_snapshot(&tx)?;
         tx.execute("DELETE FROM tool_execution_outcomes", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
         bump_history_revision(&tx)?;
@@ -1131,6 +1307,7 @@ pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::R
     if let Some(cutoff_id) = cutoff {
         tx.execute("DELETE FROM messages WHERE id > ?1", params![cutoff_id])
             .map_err(|e| io::Error::other(e.to_string()))?;
+        invalidate_context_snapshot(&tx)?;
     }
     prune_orphan_tool_execution_outcomes(&tx)?;
     bump_history_revision(&tx)?;
@@ -1173,6 +1350,7 @@ pub(in crate::ai) fn truncate_messages_to_user_turns_sqlite(
             params![next_turn_start],
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
+        invalidate_context_snapshot(&tx)?;
     }
     prune_orphan_tool_execution_outcomes(&tx)?;
     bump_history_revision(&tx)?;
@@ -1630,6 +1808,175 @@ mod tests {
         assert_eq!(
             read_tool_execution_outcomes_sqlite(&path).unwrap(),
             vec![outcome("call-1")]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canonical_messages_are_unchanged_by_context_snapshots() {
+        const PROJECTION: &str = "test-policy-a";
+        let dir = std::env::temp_dir().join(format!(
+            "context_snapshot_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        let assistant = Message {
+            role: "assistant".to_string(),
+            content: Value::String("准备读取文件".to_string()),
+            tool_calls: Some(vec![ToolCall {
+                id: "call-1".to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: Some("provider 原始 continuation state".to_string()),
+        };
+        let original = vec![msg("user", "读取文件"), assistant.clone()];
+        append_history_sqlite_for_model(&path, original.clone(), Some("glm-5.2-opencode"))
+            .unwrap();
+
+        let source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+        assert_eq!(read_all_messages_sqlite(&path).unwrap(), original);
+        assert_ne!(source.messages[1].reasoning_content, assistant.reasoning_content);
+
+        let snapshot = vec![msg(ROLE_INTERNAL_NOTE, "[History summary]\n已读取文件")];
+        write_context_snapshot_sqlite(
+            &path,
+            &snapshot,
+            source.source_message_id,
+            source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap();
+        assert_eq!(read_all_messages_sqlite(&path).unwrap(), original);
+
+        let tail = msg("user", "继续分析");
+        append_history_sqlite_for_model(&path, vec![tail.clone()], Some("gpt-5.5")).unwrap();
+        let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+        assert_eq!(projected.messages, vec![snapshot[0].clone(), tail.clone()]);
+        assert!(!projected.snapshot_is_current);
+
+        let mut expected_canonical = original;
+        expected_canonical.push(tail);
+        assert_eq!(read_all_messages_sqlite(&path).unwrap(), expected_canonical);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_context_snapshot_cannot_resurrect_truncated_history() {
+        const PROJECTION: &str = "test-policy-a";
+        let dir = std::env::temp_dir().join(format!(
+            "stale_context_snapshot_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        append_history_sqlite(
+            &path,
+            vec![msg("user", "保留"), msg("assistant", "删除")],
+        )
+        .unwrap();
+        let stale_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+
+        truncate_messages_sqlite(&path, 1).unwrap();
+        let written = write_context_snapshot_sqlite(
+            &path,
+            &[msg(ROLE_INTERNAL_NOTE, "包含已删除内容的旧快照")],
+            stale_source.source_message_id,
+            stale_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap();
+        assert!(!written);
+        assert_eq!(
+            read_context_history_sqlite(&path, PROJECTION)
+                .unwrap()
+                .messages,
+            vec![msg("user", "保留")]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_snapshot_is_ignored_when_projection_policy_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "context_snapshot_policy_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        let canonical = vec![msg("user", "必须从 canonical 重建")];
+        append_history_sqlite(&path, canonical.clone()).unwrap();
+
+        let source = read_context_history_sqlite(&path, "policy-a").unwrap();
+        write_context_snapshot_sqlite(
+            &path,
+            &[msg(ROLE_INTERNAL_NOTE, "旧策略摘要")],
+            source.source_message_id,
+            source.canonical_generation,
+            "policy-a",
+        )
+        .unwrap();
+        assert!(read_context_history_sqlite(&path, "policy-a")
+            .unwrap()
+            .snapshot_is_current);
+
+        let rebuilt = read_context_history_sqlite(&path, "policy-b").unwrap();
+        assert_eq!(rebuilt.messages, canonical);
+        assert!(!rebuilt.snapshot_is_current);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_context_snapshot_cannot_resurrect_cleared_history() {
+        const PROJECTION: &str = "test-policy-a";
+        let dir = std::env::temp_dir().join(format!(
+            "stale_context_snapshot_clear_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        append_history_sqlite(&path, vec![msg("user", "已经清除")]).unwrap();
+        let stale_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+
+        clear_session_history_sqlite(&path).unwrap();
+        let current = msg("user", "清除后的新会话");
+        append_history_sqlite(&path, vec![current.clone()]).unwrap();
+        let written = write_context_snapshot_sqlite(
+            &path,
+            &[msg(ROLE_INTERNAL_NOTE, "包含已清除内容的旧快照")],
+            stale_source.source_message_id,
+            stale_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap();
+
+        assert!(!written);
+        assert_eq!(
+            read_context_history_sqlite(&path, PROJECTION)
+                .unwrap()
+                .messages,
+            vec![current]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

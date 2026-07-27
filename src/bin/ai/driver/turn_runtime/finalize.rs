@@ -1,9 +1,9 @@
 use crate::ai::{
     driver::{print::format_empty_state, reflection},
     history::{
-        compact_session_history_at_boundary_with_app, compact_session_history_with_app,
-        generate_session_summary, is_low_quality_session_title, normalize_generated_session_title,
-        value_to_string, Message, SessionTitle, SessionTitleOrigin,
+        Message, SessionTitle, SessionTitleOrigin, compact_session_history_at_boundary_with_app,
+        compact_session_history_with_app, generate_session_summary, is_low_quality_session_title,
+        normalize_generated_session_title, value_to_string,
     },
     types::App,
 };
@@ -12,7 +12,7 @@ use rust_tools::commonw::FastSet;
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
 
-use super::{persistence::persist_pending_turn_messages, TurnOutcome};
+use super::{TurnOutcome, persistence::persist_pending_turn_messages_for_model};
 
 const SUBAGENT_TOOL_EVIDENCE_MAX_CALLS: usize = 8;
 const SUBAGENT_TOOL_EVIDENCE_MAX_CHARS_PER_RESULT: usize = 700;
@@ -334,6 +334,7 @@ fn should_write_fallback_session_title(
 pub(super) async fn finalize_turn(
     app: &mut App,
     next_model: &str,
+    response_source_model: &str,
     question: &str,
     final_assistant_text: &str,
     final_assistant_recorded: bool,
@@ -375,7 +376,13 @@ pub(super) async fn finalize_turn(
             turn_messages,
         )
         .await;
-        persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
+        persist_pending_turn_messages_for_model(
+            app,
+            response_source_model,
+            one_shot_mode,
+            turn_messages,
+            persisted_turn_messages,
+        );
         // 任务边界判定：当前 turn 没有再调工具，意味着 agent 已经把答案交付，
         // 这是一个自然的"任务完成"切点；用更激进的阈值（160 turns）触发摘要，
         // 避免对话一直堆到硬上限（200 turns）才被动压缩。

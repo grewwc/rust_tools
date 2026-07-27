@@ -107,6 +107,13 @@ pub(super) fn reasoning_encrypted_replay_enabled(model: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 该 Chat Completions 模型是否要求工具调用链原样回放 `reasoning_content`。
+pub(super) fn reasoning_content_replay_enabled(model: &str) -> bool {
+    model_def(model)
+        .map(|m| m.reasoning_content_replay)
+        .unwrap_or(false)
+}
+
 pub(super) fn model_adapter(model: &str) -> ApiProvider {
     model_def(model).map(|m| m.adapter).unwrap_or_default()
 }

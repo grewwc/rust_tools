@@ -521,10 +521,9 @@ fn persist_note_search_turn(app: &App, question: &str, answer: &str) {
             reasoning_content: None,
         },
     ];
-    if let Err(err) = crate::ai::history::append_history_messages_uncompacted(
-        &app.session_history_file,
-        &messages,
-    ) {
+    if let Err(err) =
+        crate::ai::history::append_history_messages(&app.session_history_file, &messages)
+    {
         eprintln!("[Warning] Failed to save notebook search history: {}", err);
     }
 }

@@ -5,7 +5,10 @@ use serde_json::Value;
 
 use crate::ai::{
     driver::tools::ExecuteToolCallsResult,
-    history::{is_system_like_role, Message, SessionStore, ROLE_INTERNAL_NOTE},
+    history::{
+        Message, ROLE_INTERNAL_NOTE, SessionStore, compress::TOOL_RESULT_RAW_HARD_CAP_CHARS,
+        is_system_like_role,
+    },
     types::App,
     types::ToolCall,
 };
@@ -13,7 +16,6 @@ use crate::ai::{
 use super::super::types::PreparedToolResult;
 use super::execution::prepare_recent_tool_result;
 
-const RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS: usize = 64_000;
 const TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES: usize = 64_000;
 
 const CODE_INSPECTION_MEMORY_PREFIX: &str = "Current code-inspection working memory:";
@@ -508,7 +510,7 @@ fn prepare_tool_result_for_current_turn(
     tool_call: &ToolCall,
     content: &str,
 ) -> PreparedToolResult {
-    if !exceeds_chars(content, RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS) {
+    if !exceeds_chars(content, TOOL_RESULT_RAW_HARD_CAP_CHARS) {
         return prepare_recent_tool_result(app, &tool_call.function.name, content);
     }
 
@@ -599,7 +601,7 @@ fn build_current_turn_tool_overflow_stub(
     };
     out.push_str(&format!(
         "- output_size: >{} chars, {} bytes\n",
-        RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS,
+        TOOL_RESULT_RAW_HARD_CAP_CHARS,
         content.len()
     ));
     if let Some(summary) = first_relevant_line(content) {
@@ -849,6 +851,29 @@ pub(super) fn append_tool_result_messages(
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
 ) {
+    let source_model = app.current_model.clone();
+    append_tool_result_messages_for_model(
+        app,
+        &source_model,
+        stream_assistant_text,
+        stream_reasoning_text,
+        stream_reasoning_items,
+        exec_result,
+        messages,
+        turn_messages,
+    );
+}
+
+pub(super) fn append_tool_result_messages_for_model(
+    app: &mut App,
+    source_model: &str,
+    stream_assistant_text: &str,
+    stream_reasoning_text: &str,
+    stream_reasoning_items: &[serde_json::Value],
+    exec_result: &ExecuteToolCallsResult,
+    messages: &mut Vec<Message>,
+    turn_messages: &mut Vec<Message>,
+) {
     // 截断 tool-call 前的 assistant narration：纯叙述对后续轮次价值有限，
     // 多轮叠加后会大幅膨胀上下文，对最终回答几乎没有帮助。
     // 智能截断：优先回退到最近一处句子边界（。！？.!?\n），保证不腰斩半句话；
@@ -860,17 +885,30 @@ pub(super) fn append_tool_result_messages(
     } else {
         stream_assistant_text.to_string()
     };
-    let assistant_msg = Message {
+    let raw_assistant = Message {
         role: "assistant".to_string(),
-        content: Value::String(narration),
+        content: Value::String(stream_assistant_text.to_string()),
         tool_calls: Some(exec_result.executed_tool_calls.clone()),
         tool_call_id: None,
         reasoning_content: (!stream_reasoning_text.is_empty())
             .then(|| stream_reasoning_text.to_string()),
     };
-    messages.push(assistant_msg.clone());
-    turn_messages
-        .push(crate::ai::history::compress::sanitize_message_for_persisted_history(&assistant_msg));
+    let mut assistant_msg = raw_assistant.clone();
+    assistant_msg.content = Value::String(narration);
+    let projected_assistant =
+        crate::ai::history::compress::sanitize_message_for_persisted_history_for_model(
+            source_model,
+            &assistant_msg,
+        );
+    if crate::ai::models::reasoning_content_replay_enabled(source_model) {
+        // exact-replay 模型的内存历史也携带内部标记，避免 mid-turn 压缩把较早工具轮的
+        // continuation state 当作普通 reasoning 裁掉；发送请求时会在投影副本中解码。
+        messages.push(projected_assistant);
+    } else {
+        messages.push(assistant_msg.clone());
+    }
+    // canonical history 永远保存 provider 原始消息；模型专属状态只存在于请求投影。
+    turn_messages.push(raw_assistant);
 
     // 侧信道：把本轮捕获的 reasoning items 挂到「首个 tool_call id」上，供
     // Responses 协议回放时在对应 function_call 前原样 splice。仅内存态、不落盘。
@@ -921,14 +959,22 @@ pub(super) fn append_tool_result_messages(
                 obs.mark_poisoned();
             }
         }
-        let tool_message = Message {
+        let projected_tool_message = Message {
             role: "tool".to_string(),
             content: Value::String(prepared.content_for_model),
             tool_calls: None,
             tool_call_id: Some(result.tool_call_id.clone()),
             reasoning_content: None,
         };
-        append_message_pair(messages, turn_messages, tool_message);
+        let raw_tool_message = Message {
+            role: "tool".to_string(),
+            content: Value::String(result.content.clone()),
+            tool_calls: None,
+            tool_call_id: Some(result.tool_call_id.clone()),
+            reasoning_content: None,
+        };
+        messages.push(projected_tool_message);
+        turn_messages.push(raw_tool_message);
         if let Some(message) = working_checkpoint_message_for_plan(app, tool_call, &result.content)
         {
             working_checkpoint_messages.push(message);
@@ -1029,8 +1075,7 @@ pub(super) fn record_final_stream_response(
             .then(|| stream_result.reasoning_text.clone()),
     };
     messages.push(assistant_msg.clone());
-    turn_messages
-        .push(crate::ai::history::compress::sanitize_message_for_persisted_history(&assistant_msg));
+    turn_messages.push(assistant_msg);
     *final_assistant_text = stream_result.assistant_text;
     *final_assistant_recorded = true;
     record_hidden_self_note(app, turn_messages, &remaining_meta);
@@ -1344,16 +1389,17 @@ fn truncate_note(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_tool_result_messages, build_code_inspection_working_memory,
+        TOOL_RESULT_RAW_HARD_CAP_CHARS, append_tool_result_messages,
+        append_tool_result_messages_for_model, build_code_inspection_working_memory,
         collect_repo_inspection_findings, describe_tool_call, is_repo_inspection_tool,
-        prepare_tool_results_for_history, RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS,
+        prepare_tool_results_for_history,
     };
     use super::{
-        extract_context_checkpoints, save_context_checkpoint_in_dir, smart_truncate_to_sentence,
-        truncate_checkpoint_summary, working_checkpoint_message_for_plan,
-        WORKING_CHECKPOINT_FILE_NAME,
+        WORKING_CHECKPOINT_FILE_NAME, extract_context_checkpoints, save_context_checkpoint_in_dir,
+        smart_truncate_to_sentence, truncate_checkpoint_summary,
+        working_checkpoint_message_for_plan,
     };
-    use std::sync::{atomic::AtomicBool, Arc};
+    use std::sync::{Arc, atomic::AtomicBool};
 
     use crate::ai::driver::tools::ExecuteToolCallsResult;
     use crate::ai::{
@@ -1602,6 +1648,57 @@ mod tests {
     }
 
     #[test]
+    fn append_tool_result_messages_uses_actual_response_model_for_reasoning_replay() {
+        let history_file = std::env::temp_dir().join(format!(
+            "ai-tool-result-source-model-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut app = test_app(history_file);
+        assert!(app.current_model.is_empty());
+        let call = tool_call("call_fallback", "demo_tool", serde_json::json!({}));
+        let exec_result = exec_result_from_calls_and_contents(
+            std::slice::from_ref(&call),
+            &["fallback tool output".to_string()],
+        );
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+
+        append_tool_result_messages_for_model(
+            &mut app,
+            "glm-5.2-opencode",
+            "",
+            "fallback reasoning state",
+            &[],
+            &exec_result,
+            &mut messages,
+            &mut turn_messages,
+        );
+
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("tool round should contain an assistant request");
+        assert!(
+            assistant
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|reasoning| {
+                    reasoning.starts_with(
+                        crate::ai::history::compress::PERSISTED_REASONING_REPLAY_PREFIX,
+                    )
+                })
+        );
+        let canonical_assistant = turn_messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("canonical tool round should contain an assistant request");
+        assert_eq!(
+            canonical_assistant.reasoning_content.as_deref(),
+            Some("fallback reasoning state")
+        );
+    }
+
+    #[test]
     fn describe_tool_call_infers_apply_patch_target_from_envelope() {
         let call = tool_call(
             "1",
@@ -1719,7 +1816,7 @@ mod tests {
         )];
         let content = format!(
             "first line\nerror: important failure\n{}\nlast line",
-            "x".repeat(RECENT_TOOL_RESULT_RAW_HARD_CAP_CHARS + 10_000)
+            "x".repeat(TOOL_RESULT_RAW_HARD_CAP_CHARS + 10_000)
         );
         let exec_result =
             exec_result_from_calls_and_contents(&calls, std::slice::from_ref(&content));
@@ -1938,9 +2035,11 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("checkpoint directory entries should be readable");
         assert_eq!(entries.len(), 2);
-        assert!(entries
-            .iter()
-            .all(|entry| { !entry.file_name().to_string_lossy().contains(".tmp") }));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| { !entry.file_name().to_string_lossy().contains(".tmp") })
+        );
 
         std::fs::remove_dir_all(&directory)
             .expect("temporary checkpoint directory should clean up");

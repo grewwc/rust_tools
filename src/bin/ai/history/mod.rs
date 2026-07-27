@@ -16,8 +16,8 @@ use std::time::SystemTime;
 use crate::ai::types::App;
 #[allow(unused_imports)]
 pub(in crate::ai) use blob::{
-    append_history, append_history_messages, append_history_messages_uncompacted,
-    build_message_arr, delete_history_artifacts, replace_history_messages,
+    append_history, append_history_messages, append_history_messages_for_model, build_message_arr,
+    delete_history_artifacts, replace_history_messages, truncate_history_messages,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use checkpoint::{CheckpointInfo, CheckpointStore};
@@ -37,6 +37,8 @@ pub(in crate::ai) use sessions::generate_session_summary;
 pub(in crate::ai) use sessions::strip_think_tags;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore, SessionTitle, SessionTitleOrigin};
+#[cfg(test)]
+pub(in crate::ai) use sqlite::read_context_history_sqlite;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
 #[allow(unused_imports)]
@@ -47,10 +49,10 @@ pub(in crate::ai) use sqlite::{
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use suspended::{
-    format_suspended_timestamp_label, SuspendedSessionEntry, SuspendedSessionStore,
+    SuspendedSessionEntry, SuspendedSessionStore, format_suspended_timestamp_label,
 };
 #[allow(unused_imports)]
-pub(in crate::ai) use types::{Message, ToolExecutionOutcome, COLON, MAX_HISTORY_TURNS, NEWLINE};
+pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE, ToolExecutionOutcome};
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
 pub(in crate::ai) const ROLE_INTERNAL_NOTE: &str = types::ROLE_INTERNAL_NOTE;
@@ -116,6 +118,12 @@ pub(in crate::ai) fn build_context_history(
     history_summary_max_chars: usize,
     overflow_dir: Option<PathBuf>,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    let projection_fingerprint = context_projection_fingerprint(
+        history_max_chars,
+        history_keep_last,
+        history_summary_max_chars,
+        overflow_dir.as_deref(),
+    );
     let cache_key = context_history_cache_key(
         history_file,
         history_count,
@@ -128,22 +136,16 @@ pub(in crate::ai) fn build_context_history(
         return Ok(cached);
     }
 
-    if history_max_chars > 0
-        && blob::is_sqlite_path(history_file)
-        && let Some(fast) = try_build_context_history_sqlite_fastpath(
-            history_file,
-            history_count,
-            history_max_chars,
-            history_keep_last,
-            history_summary_max_chars,
-            overflow_dir.as_deref(),
-        )?
-    {
-        store_cached_context_history(cache_key, fast.clone());
-        return Ok(fast);
-    }
-
-    let history = build_message_arr(usize::MAX, history_file)?;
+    // SQLite 会话把 canonical history 与可替换的 context snapshot 分层保存。
+    // 请求只读取 snapshot + watermark 之后的原始增量；人工历史始终读取 canonical 表。
+    let mut history = if blob::is_sqlite_path(history_file) {
+        sqlite::read_context_history_sqlite(history_file, &projection_fingerprint)?.messages
+    } else {
+        build_message_arr(usize::MAX, history_file)?
+    };
+    // canonical 层刻意保留 raw 工具结果；请求层必须重新执行同一物理上限，
+    // 防止 snapshot 水位之后的 SQLite tail 绕过 current-turn 投影。
+    compress::cap_raw_tool_results_for_context(&mut history, overflow_dir.as_deref());
     let out = if history_max_chars == 0 {
         if history_count >= history.len() {
             history
@@ -168,55 +170,21 @@ pub(in crate::ai) fn build_context_history(
     Ok(out)
 }
 
-fn try_build_context_history_sqlite_fastpath(
-    history_file: &Path,
-    history_count: usize,
+/// 快照只对生成它的投影策略有效。策略配置变化时回退到 canonical messages
+/// 重建，避免继续沿用旧预算或旧压缩算法产生的有损上下文。
+fn context_projection_fingerprint(
     history_max_chars: usize,
     history_keep_last: usize,
     history_summary_max_chars: usize,
-    overflow_dir: Option<&std::path::Path>,
-) -> Result<Option<Vec<Message>>, Box<dyn std::error::Error>> {
-    let keep_last = if history_count == 0 {
-        history_keep_last
-    } else {
-        history_count
-    };
-    let recent = sqlite::read_recent_turn_window_sqlite(history_file, keep_last)?;
-    if recent.messages.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-    if !recent.has_older_messages {
-        return Ok(Some(compress_messages_for_context(
-            recent.messages,
-            history_max_chars,
-            keep_last,
-            history_summary_max_chars,
-            overflow_dir.map(|p| p.to_path_buf()),
-        )));
-    }
-
-    let Some(start_message_id) = recent.start_message_id else {
-        return Ok(None);
-    };
-    let Some(summary) =
-        sqlite::read_latest_history_summary_before_id_sqlite(history_file, start_message_id)?
-    else {
-        return Ok(None);
-    };
-
-    let checkpoint_markers =
-        sqlite::read_context_checkpoint_markers_before_id_sqlite(history_file, start_message_id)?;
-    let mut messages = Vec::with_capacity(recent.messages.len() + checkpoint_markers.len() + 1);
-    messages.push(summary);
-    messages.extend(checkpoint_markers);
-    messages.extend(recent.messages);
-    Ok(Some(compress_messages_for_context(
-        messages,
-        history_max_chars,
-        keep_last,
-        history_summary_max_chars,
-        overflow_dir.map(|p| p.to_path_buf()),
-    )))
+    overflow_dir: Option<&Path>,
+) -> String {
+    const PROJECTION_VERSION: u8 = 1;
+    let overflow_dir = overflow_dir
+        .map(|path| path.to_string_lossy())
+        .unwrap_or_default();
+    format!(
+        "v{PROJECTION_VERSION}|max={history_max_chars}|keep={history_keep_last}|summary={history_summary_max_chars}|assets={overflow_dir}"
+    )
 }
 
 fn context_history_cache_key(
@@ -334,76 +302,83 @@ async fn compact_session_history_with_app_inner(
     at_boundary: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let history_file = &app.session_history_file;
-    // === 增量游标式快路径 ===
-    // 常规情况下 user_turns 远低于压缩阈值，根本不需要全量读。但不能只看
-    // turn 数：单个 read_file/命令输出就可能把短会话撑到数 MB，若不在这里落盘
-    // 压缩，下轮又会从原始历史重新做一次昂贵的请求期压缩。
-    if blob::is_sqlite_path(history_file) {
-        let user_turns = sqlite::count_user_turns_sqlite(history_file.as_path())?;
-        let exceeds_context_budget = app.config.history_max_chars > 0
-            && sqlite::total_message_chars_sqlite(history_file.as_path())?
-                > app.config.history_max_chars;
-        let exceeds_tool_evidence_budget =
-            sqlite::compressed_tool_evidence_chars_sqlite(history_file.as_path())?
-                > compress::compressed_tool_evidence_inline_chars_limit();
-        let threshold = if at_boundary {
-            crate::ai::history::compress::persisted_history_keep_recent_turns()
-        } else {
-            MAX_HISTORY_TURNS
-        };
-        if user_turns <= threshold && !exceeds_context_budget && !exceeds_tool_evidence_budget {
+    let store = SessionStore::new(app.config.history_file.as_path());
+    let overflow_dir = store.session_assets_dir(&app.session_id);
+    let projection_fingerprint = context_projection_fingerprint(
+        app.config.history_max_chars,
+        app.config.history_keep_last,
+        app.config.history_summary_max_chars,
+        Some(&overflow_dir),
+    );
+    let (messages, sqlite_source) = if blob::is_sqlite_path(history_file) {
+        let context =
+            sqlite::read_context_history_sqlite(history_file.as_path(), &projection_fingerprint)?;
+        if context.snapshot_is_current {
             return Ok(());
         }
-    }
-
-    let messages = if blob::is_sqlite_path(history_file) {
-        // 用**原始** raw read，而非 build_message_arr_sqlite（后者会先跑启发式
-        // compact_persisted_history）。app-aware 压缩必须看到未经启发式压缩的原文，
-        // 语义与非-sqlite 分支的 parse_history_blob 对齐；随后压缩函数内部照常
-        // sanitize_persisted_history_messages。
-        sqlite::read_all_messages_sqlite(history_file.as_path())?
+        let source = Some((context.source_message_id, context.canonical_generation));
+        (context.messages, source)
     } else {
         let history = match std::fs::read_to_string(history_file) {
             Ok(history) => history,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(err.into()),
         };
-        blob::parse_history_blob(&history)
+        (blob::parse_history_blob(&history), None)
     };
+    if messages.is_empty() {
+        return Ok(());
+    }
 
     let original_chars = messages_total_chars_pub(&messages);
+    let user_turns = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .count();
     let exceeds_context_budget =
         app.config.history_max_chars > 0 && original_chars > app.config.history_max_chars;
     let exceeds_tool_evidence_budget =
         compress::compressed_tool_evidence_exceeds_inline_budget(&messages);
+    let threshold = if at_boundary {
+        compress::persisted_history_keep_recent_turns()
+    } else {
+        MAX_HISTORY_TURNS
+    };
+    if user_turns <= threshold && !exceeds_context_budget && !exceeds_tool_evidence_budget {
+        return Ok(());
+    }
+
     let compacted = if exceeds_context_budget || exceeds_tool_evidence_budget {
         // 与下一轮 `build_context_history` 使用完全相同的压缩策略，并把结果写回
-        // history。原始的大块内容会进入 session assets，stub 保留可精确读回的
-        // 路径和预览；因此降低重复压缩成本不会损失可召回的信息。
-        let store = SessionStore::new(app.config.history_file.as_path());
+        // context snapshot。原始消息只存在 canonical 层，不会被压缩覆盖。
         compress::compress_messages_for_context(
             messages.clone(),
             app.config.history_max_chars,
             app.config.history_keep_last,
             app.config.history_summary_max_chars,
-            Some(store.session_assets_dir(&app.session_id)),
+            Some(overflow_dir),
         )
     } else if at_boundary {
         compress::compact_persisted_history_at_boundary_with_app(app, messages.clone()).await
     } else {
         compress::compact_persisted_history_with_app(app, messages.clone()).await
     };
-    if compacted == messages {
-        return Ok(());
-    }
 
-    if blob::is_sqlite_path(history_file) {
-        sqlite::replace_all_messages_sqlite(history_file.as_path(), &compacted)?;
-    } else {
+    if let Some((source_message_id, history_generation)) = sqlite_source {
+        sqlite::write_context_snapshot_sqlite(
+            history_file.as_path(),
+            &compacted,
+            source_message_id,
+            history_generation,
+            &projection_fingerprint,
+        )?;
+    } else if compacted != messages {
         std::fs::write(
             history_file,
             blob::serialize_history_messages_for_storage(&compacted),
         )?;
+    } else {
+        return Ok(());
     }
     let reason = if exceeds_context_budget {
         "context-budget"

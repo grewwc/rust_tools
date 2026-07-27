@@ -22,11 +22,21 @@ use tool_groups::{
 use tool_overflow::normalize_internal_notes_for_summary_model;
 use tool_overflow::{
     age_out_overflow_stub_previews, build_persisted_summary_text,
-    build_persisted_summary_text_with_app, enforce_protected_precision_group_budget,
-    is_non_compressible_tool, normalize_preserved_message_stubs_for_model,
-    prepare_tool_messages_structured, spill_oversized_preserved_messages, tool_line_signature,
-    try_spill_preserved_message_to_stub,
+    build_persisted_summary_text_with_app, cap_oversized_tool_results_for_context,
+    enforce_protected_precision_group_budget, is_non_compressible_tool,
+    normalize_preserved_message_stubs_for_model, prepare_tool_messages_structured,
+    spill_oversized_preserved_messages, tool_line_signature, try_spill_preserved_message_to_stub,
 };
+
+/// 请求上下文中单条 raw tool result 的物理上限。canonical history 不受影响。
+pub(in crate::ai) const TOOL_RESULT_RAW_HARD_CAP_CHARS: usize = 64_000;
+
+pub(in crate::ai) fn cap_raw_tool_results_for_context(
+    messages: &mut [Message],
+    overflow_dir: Option<&Path>,
+) -> usize {
+    cap_oversized_tool_results_for_context(messages, TOOL_RESULT_RAW_HARD_CAP_CHARS, overflow_dir)
+}
 
 /// 所有"自动压缩摘要" note 的前缀。写入端（生成摘要 note）与识别端
 /// （防重复 guard、sqlite 接续点、请求侧分组）**必须共用这一份清单**，否则
@@ -279,9 +289,7 @@ fn archive_trimmed_compressed_tool_evidence(message: &Message, overflow_dir: Opt
     let _ = sink.flush();
 }
 
-pub(in crate::ai) fn compressed_tool_evidence_exceeds_inline_budget(
-    messages: &[Message],
-) -> bool {
+pub(in crate::ai) fn compressed_tool_evidence_exceeds_inline_budget(messages: &[Message]) -> bool {
     messages
         .iter()
         .filter(|message| is_compressed_tool_evidence_note(message))
@@ -313,8 +321,7 @@ fn trim_compressed_tool_evidence_to_inline_budget(
     let mut kept_chars = 0usize;
     for (index, chars) in evidence_sizes.iter().enumerate().rev() {
         if keep_from == evidence_sizes.len()
-            || kept_chars.saturating_add(*chars)
-                <= MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS
+            || kept_chars.saturating_add(*chars) <= MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS
         {
             keep_from = index;
             kept_chars = kept_chars.saturating_add(*chars);
@@ -453,12 +460,37 @@ pub(in crate::ai) fn compress_messages_for_context(
 /// 持久化历史里"带 tool_calls 的 assistant narration"被截断到的字符数。
 ///
 /// 折叠器 [`tool_groups::fold_tool_call_group_to_stub`] 把发起本轮工具调用前
-/// 的可见 narration 当作 `assistant_checkpoint` 的来源。完整 reasoning_content
-/// 不落盘，也绝不能提升为 assistant 正文；tool-call-only 消息由折叠器根据结构化
-/// tool_calls 重建安全的操作摘要。720 字与折叠后的 checkpoint 上限同量级。
+/// 的可见 narration 当作 `assistant_checkpoint` 的来源。除模型协议明确要求回放的
+/// continuation state 外，完整 reasoning_content 不落盘，也绝不能提升为 assistant
+/// 正文；tool-call-only 消息由折叠器根据结构化 tool_calls 重建安全的操作摘要。
+/// 720 字与折叠后的 checkpoint 上限同量级。
 const PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS: usize = 720;
+pub(in crate::ai) const PERSISTED_REASONING_REPLAY_PREFIX: &str =
+    "\u{1e}aios:reasoning-content-replay:v1\u{1f}";
 
-pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -> Message {
+/// exact-replay continuation state 只存在于可重建的上下文投影中。payload 带来源模型，
+/// 因此切换模型时不会把另一个 provider 的隐藏状态误当成当前模型的续传状态。
+pub(in crate::ai) fn encode_reasoning_replay_state(model: &str, reasoning: &str) -> String {
+    format!(
+        "{PERSISTED_REASONING_REPLAY_PREFIX}{}",
+        serde_json::json!({ "model": model, "reasoning": reasoning })
+    )
+}
+
+pub(in crate::ai) fn decode_reasoning_replay_for_model(
+    model: &str,
+    encoded: &str,
+) -> Option<String> {
+    let payload = encoded.strip_prefix(PERSISTED_REASONING_REPLAY_PREFIX)?;
+    let payload: Value = serde_json::from_str(payload).ok()?;
+    (payload.get("model")?.as_str()? == model)
+        .then(|| payload.get("reasoning")?.as_str().map(str::to_owned))?
+}
+
+fn sanitize_message_for_persisted_history_inner(
+    message: &Message,
+    replay_source_model: Option<&str>,
+) -> Message {
     let mut sanitized = message.clone();
     if sanitized.role != "assistant" {
         return sanitized;
@@ -488,15 +520,57 @@ pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -
         );
         sanitized.content = Value::String(capped);
     }
-    sanitized.reasoning_content = None;
+    let has_tool_calls = sanitized
+        .tool_calls
+        .as_ref()
+        .is_some_and(|tool_calls| !tool_calls.is_empty());
+    if has_tool_calls {
+        if let Some(reasoning) = sanitized.reasoning_content.as_mut() {
+            if reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX) {
+                // 已经是 context snapshot 中的 model-neutral 标记，保持幂等。
+            } else if let Some(model) = replay_source_model {
+                *reasoning = encode_reasoning_replay_state(model, reasoning);
+            } else {
+                sanitized.reasoning_content = None;
+            }
+        }
+    } else {
+        sanitized.reasoning_content = None;
+    }
     sanitized
+}
+
+pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -> Message {
+    sanitize_message_for_persisted_history_inner(message, None)
+}
+
+/// 按模型协议生成持久化投影。只有显式声明需要原样回放的模型，才会为
+/// tool-call assistant 保留隐藏推理；最终回答等其他消息仍一律删除。
+pub(in crate::ai) fn sanitize_message_for_persisted_history_for_model(
+    model: &str,
+    message: &Message,
+) -> Message {
+    let replay_source_model =
+        crate::ai::models::reasoning_content_replay_enabled(model).then_some(model);
+    sanitize_message_for_persisted_history_inner(message, replay_source_model)
 }
 
 fn sanitize_persisted_history_messages(messages: Vec<Message>) -> Vec<Message> {
     let messages = coalesce_accumulated_summary_notes(messages);
     messages
         .into_iter()
-        .map(|message| sanitize_message_for_persisted_history(&message))
+        // 只有带内部标记的 reasoning 才是运行时按模型能力显式保留的连续性状态；
+        // 旧历史、导入文件和其他模型的裸 reasoning 仍按原策略删除。
+        .map(|message| {
+            let preserve = message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|reasoning| reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX));
+            sanitize_message_for_persisted_history_inner(
+                &message,
+                preserve.then_some("already-tagged"),
+            )
+        })
         .collect()
 }
 
@@ -1103,12 +1177,7 @@ fn truncate_mutable_messages_to_fit(
     max_chars: usize,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
-    truncate_mutable_messages_to_fit_with_policy(
-        messages,
-        max_chars,
-        protected_tool_call_ids,
-        true,
-    )
+    truncate_mutable_messages_to_fit_with_policy(messages, max_chars, protected_tool_call_ids, true)
 }
 
 fn truncate_mutable_messages_to_fit_with_policy(
@@ -1144,6 +1213,7 @@ fn truncate_mutable_messages_to_fit_with_policy(
                     );
                 }
                 if let Some(reasoning) = message.reasoning_content.as_deref()
+                    && !reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX)
                     && reasoning.chars().count() > 160
                 {
                     choose_larger_mutable_field(
@@ -1199,7 +1269,8 @@ fn truncate_unprotected_messages_to_fit(
 }
 
 /// Path C 先给每个可裁字段设置单项上限，防止一个最新结果独占整个窗口；再按总预算
-/// 继续收紧。两步都不删除消息或工具调用，因此 assistant↔tool 配对保持完整。
+/// 继续收紧。两步都不删除消息或工具调用，也不改写 exact-replay 协议状态，因此
+/// assistant↔tool 配对及 reasoning continuation state 保持完整。
 fn emergency_cap_messages_to_fit(
     messages: &mut [Message],
     max_chars: usize,
@@ -1221,6 +1292,7 @@ fn emergency_cap_messages_to_fit(
         if let Some(reasoning_chars) = message
             .reasoning_content
             .as_deref()
+            .filter(|reasoning| !reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX))
             .map(|reasoning| reasoning.chars().count())
             && reasoning_chars > per_field_cap
         {
@@ -1283,6 +1355,11 @@ fn truncate_mutable_field(message: &mut Message, field: MutableMessageField, red
             let Some(reasoning) = message.reasoning_content.as_deref() else {
                 return;
             };
+            // exact replay payload 必须逐字回放；保留 marker 却截断 payload 会令请求层
+            // 解码失败。调用方应改裁其它字段，或在无法达标时保留该协议状态。
+            if reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX) {
+                return;
+            }
             let target = reasoning.chars().count().saturating_sub(reduce_by).max(160);
             message.reasoning_content = Some(format!(
                 "[context-overflow-truncated] {}",
@@ -1317,7 +1394,8 @@ fn messages_total_chars(messages: &[Message]) -> usize {
 
 fn current_turn_precision_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String> {
     let mut out = rustc_hash::FxHashSet::default();
-    let Some(current_turn_start) = messages.iter().rposition(|message| message.role == "user") else {
+    let Some(current_turn_start) = messages.iter().rposition(|message| message.role == "user")
+    else {
         return out;
     };
     for message in messages.iter().skip(current_turn_start) {
@@ -1546,14 +1624,8 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // 只有真正达到 hard_target 才能提前返回。旧逻辑只要净下降超过 4K 就返回，
     // 会跳过下面的硬兜底，让「旧组已省很多、最新一组仍单独超窗」继续发出超限请求。
     if best_after <= hard_target {
-        let did_summarize =
-            before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS;
-        return (
-            best.unwrap_or(messages),
-            before,
-            best_after,
-            did_summarize,
-        );
+        let did_summarize = before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS;
+        return (best.unwrap_or(messages), before, best_after, did_summarize);
     }
 
     // === Path C 兜底：预算感知的结构保留截断 ===
@@ -1858,14 +1930,13 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
 /// 裁剪历史中的 reasoning_content，只保留确有必要回传给厂商的那些。
 ///
 /// 较老的 reasoning chain 对后续 turn 决策几乎没有帮助，去掉可节省上下文预算。
-/// 但 DeepSeek thinking-mode 有一个硬约束：**凡是触发过 tool_calls 的那一回合，
-/// 其 assistant 消息的 reasoning_content 必须在后续所有请求中原样回传**，否则
-/// 会返回 `400 invalid_request_error: The reasoning_content in the thinking mode
-/// must be passed back to the API`。因此这里的策略是：
-/// - 带 `tool_calls` 的 assistant 消息：只保留最近 `KEEP_RECENT_TOOL_CALL_REASONING`
-///   轮的完整 reasoning_content，更早的置 None——DeepSeek 所需的字段形状由
-///   `ensure_reasoning_content_echo_for_thinking_model` 用空字符串占位补齐，既满足
-///   协议校验又避免历史 reasoning 文本在长 session 里单调累积、拖慢并"变蠢"；
+/// 部分模型对 tool-call reasoning 有回传约束，因此这里的策略是：
+/// - 模型显式声明 exact replay 的 continuation state 带内部标记，只要所属
+///   assistant/tool 协议组仍在上下文中就始终保留；整组被摘要替代后无需再回放；
+/// - 其他带 `tool_calls` 的 assistant 消息只保留最近
+///   `KEEP_RECENT_TOOL_CALL_REASONING` 轮的完整 reasoning_content，更早的置 None；
+///   DeepSeek 所需的缺失字段由 request 层用空字符串占位补齐，避免历史 reasoning
+///   文本在长 session 里单调累积、拖慢并"变蠢"；
 /// - 不带 tool_calls 的纯回答 assistant 消息：只保留最近一条的 reasoning_content，
 ///   其余置 None（OpenAI 等仅要求与最近一次 tool_call 同回合的 reasoning 配对，
 ///   旧的纯回答 reasoning 可安全丢弃）。
@@ -1880,12 +1951,15 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
         })
         .map(|(idx, _)| idx);
 
-    // 带 tool_calls 的 assistant reasoning 跨轮滑窗：只保留最近 N 条的完整文本，
-    // 更早的置 None（DeepSeek 会由 echo 兜底补空字符串占位）。
+    // 未标记的 tool-call assistant reasoning 跨轮滑窗：只保留最近 N 条完整文本。
     let tool_call_reasoning_count = messages
         .iter()
         .filter(|m| {
-            m.role == "assistant" && m.reasoning_content.is_some() && m.tool_calls.is_some()
+            m.role == "assistant"
+                && m.reasoning_content.as_deref().is_some_and(|reasoning| {
+                    !reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX)
+                })
+                && m.tool_calls.is_some()
         })
         .count();
     let drop_tool_call_reasoning_before =
@@ -1894,6 +1968,13 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
 
     for (idx, m) in messages.iter_mut().enumerate() {
         if m.role != "assistant" || m.reasoning_content.is_none() {
+            continue;
+        }
+        // exact replay 是所属 tool-call 消息的协议状态；消息仍在时不能单独裁掉。
+        if m.reasoning_content
+            .as_deref()
+            .is_some_and(|reasoning| reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX))
+        {
             continue;
         }
         // 带 tool_calls 的回合：仅保留最近 N 条完整 reasoning，其余置 None。
@@ -1992,8 +2073,7 @@ fn dedup_repeated_tool_results(
             // 旧历史里复用的 ID 无法可靠关联到具体 assistant occurrence；保留原文。
             continue;
         }
-        let occurrence =
-            dedup_tool_occurrence(messages, idx, &id_to_signature, &id_to_args_raw);
+        let occurrence = dedup_tool_occurrence(messages, idx, &id_to_signature, &id_to_args_raw);
         let occurrence = match occurrence {
             Some(occurrence) => occurrence,
             None => {
@@ -2214,7 +2294,14 @@ fn dedup_tool_target_summary(tool_name: &str, args: &str) -> Option<String> {
             }
         }
         _ => {
-            for key in ["file_path", "path", "filePath", "pattern", "query", "command"] {
+            for key in [
+                "file_path",
+                "path",
+                "filePath",
+                "pattern",
+                "query",
+                "command",
+            ] {
                 if let Some(value) = args.get(key).and_then(Value::as_str) {
                     fields.push(format!(
                         "{key}={}",

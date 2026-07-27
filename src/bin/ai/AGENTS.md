@@ -44,9 +44,10 @@ rules in the nearest child `AGENTS.md`.
    `enable_tools` behavior must reflect the real configured registry names.
 7. **Path/session authority.** Use `runtime_ctx::effective_cwd()` for user paths
    and runtime context helpers for session/temp state.
-8. **History truthfulness.** Compression, pruning, and truncation must preserve
-   evidence with explicit overflow/file pointers. Do not replace tool or subagent
-   results with lossy summaries when the parent still needs them.
+8. **History truthfulness.** Canonical session messages and rebuildable model
+   context are separate layers. Compression may replace only the context snapshot,
+   never canonical messages; only explicit user lifecycle operations may truncate
+   canonical history. Preserve pruned evidence with explicit overflow/file pointers.
 9. **Subagent ownership.** Child task results are evidence for the parent turn;
    the parent must summarize confirmed conclusions in its own final response.
 

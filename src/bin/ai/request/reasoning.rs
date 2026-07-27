@@ -54,34 +54,58 @@ pub(super) fn resolve_reasoning_wire_controls<'a>(
     (thinking, top_level_reasoning_effort, nested_reasoning)
 }
 
-/// 对需要 reasoning_content echo 的 thinking 模型（如 DeepSeek-R1），
-/// 为所有带 tool_calls 的 assistant 消息补上空字符串 reasoning_content。
-///
-/// DeepSeek 协议要求带 tool_calls 的 assistant 消息必须回传 reasoning_content 字段，
-/// 否则服务端会报 400。此处统一用空字符串占位，既满足协议校验又避免历史 reasoning
-/// 文本在长 session 里单调累积、拖慢并"变蠢"。
-pub(super) fn ensure_reasoning_content_echo_for_thinking_model(
-    model: &str,
-    messages: &mut [Message],
-) {
+/// 按模型能力归一化 tool-call assistant 的 `reasoning_content` 回放策略：
+/// - GLM 等声明 exact replay 的模型保留服务端原文，维持跨工具调用连续性；
+/// - DeepSeek 等要求字段回传的模型保留现有原文，缺失时补空字符串；
+/// - 其余模型彻底移除隐藏 reasoning，避免跨 turn 泄漏和上下文膨胀。
+pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages: &mut [Message]) {
+    let exact_replay = models::reasoning_content_replay_enabled(model);
     let adapter_kind = models::model_adapter(model);
     let endpoint = models::endpoint_for_model(model, "");
     let request_model = models::request_model_name(model);
     let dialect = thinking_dialect_for(adapter_kind, &request_model, &endpoint);
-    if !dialect.requires_reasoning_content_echo() {
-        return;
-    }
+    let shape_only_replay = dialect.requires_reasoning_content_echo();
 
     for message in messages.iter_mut() {
-        if message.role != "assistant" || message.reasoning_content.is_some() {
+        if message.role != "assistant" {
             continue;
         }
-        if message
+        let has_tool_calls = message
             .tool_calls
             .as_ref()
-            .is_some_and(|tool_calls| !tool_calls.is_empty())
-        {
-            message.reasoning_content = Some(String::new());
+            .is_some_and(|tool_calls| !tool_calls.is_empty());
+        if !has_tool_calls {
+            message.reasoning_content = None;
+            continue;
+        }
+        if exact_replay {
+            // exact continuation state 只能由同一模型生成。未标记内容（例如切换前
+            // GPT 的 reasoning）和其他 exact 模型的状态都不能跨模型回放。
+            message.reasoning_content = message.reasoning_content.as_deref().and_then(
+                |reasoning| {
+                    crate::ai::history::compress::decode_reasoning_replay_for_model(
+                        model, reasoning,
+                    )
+                },
+            );
+            continue;
+        }
+        if shape_only_replay {
+            let carries_exact_replay_marker = message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|reasoning| {
+                    reasoning.starts_with(
+                        crate::ai::history::compress::PERSISTED_REASONING_REPLAY_PREFIX,
+                    )
+                });
+            if carries_exact_replay_marker {
+                message.reasoning_content = Some(String::new());
+            } else {
+                message.reasoning_content.get_or_insert_default();
+            }
+        } else {
+            message.reasoning_content = None;
         }
     }
 }

@@ -68,6 +68,11 @@ pub struct ModelDef {
     /// 模型行为不变，网关不透传 `encrypted_content` 时回放自动退化为不回传。
     #[serde(default)]
     pub reasoning_encrypted_replay: bool,
+    /// 可选：Chat Completions 模型是否要求后续工具调用请求原样回放
+    /// assistant 的 `reasoning_content`。这与仅要求字段存在（可为空字符串）
+    /// 的协议不同；缺省关闭，避免无关模型累积或泄露隐藏推理文本。
+    #[serde(default)]
+    pub reasoning_content_replay: bool,
     /// 子 agent 模型选择优先级（越大越优先）。同 tier 内按此值降序排列。
     /// 缺省为 0，用户可在 ~/.config/rust_tools/models.json 中覆盖以调整偏好，
     /// 无需重新编译。

@@ -32,7 +32,7 @@ use super::normalize::{
     request_tool_names_for_model, strip_unavailable_tool_hints_from_messages,
 };
 use super::reasoning::{
-    apply_prompt_cache_breakpoint, ensure_reasoning_content_echo_for_thinking_model,
+    apply_prompt_cache_breakpoint, normalize_reasoning_content_replay_for_model,
     prompt_cache_enabled_for_model, resolve_reasoning_effort,
 };
 use super::thinking::resolve_thinking;
@@ -358,12 +358,10 @@ async fn do_request_messages_with_tool_mode(
             model
         ));
     }
-    // DeepSeek/OpenCode 等协议要求：只要该模型 wire 需要 tool-call assistant
-    // 历史回传 `reasoning_content` 字段，就必须在发请求前补齐字段形状。
-    // 这与本轮 `enable_thinking` 判定不是同一回事：mid-turn 压缩会把较老
-    // 的 reasoning 文本裁成 None，而该模型即使本轮 local gate 关掉 thinking，
-    // 也可能仍因默认 `reasoning_effort` / 历史续写约束要求回传空字符串占位。
-    ensure_reasoning_content_echo_for_thinking_model(model, &mut normalized_messages);
+    // 最终 wire 投影按模型能力决定 reasoning_content 的回放语义：GLM 保留
+    // tool-call assistant 的原文，DeepSeek 仅补空字段形状，其余模型一律剥离。
+    // 这与本轮 enable_thinking gate 不同，必须在每次请求前统一收口。
+    normalize_reasoning_content_replay_for_model(model, &mut normalized_messages);
     let reasoning_effort = resolve_reasoning_effort(app, model).map(|e| e.as_str());
     // 部分网关（如 bytedance modelhub）在 /v1/chat/completions 上拒绝
     // `tools` + `reasoning_effort` 同时出现（返回 400）。当模型声明了

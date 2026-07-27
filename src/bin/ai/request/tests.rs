@@ -1358,7 +1358,7 @@ fn deepseek_tool_call_messages_echo_empty_reasoning_content() {
         reasoning_content: None,
     }];
 
-    ensure_reasoning_content_echo_for_thinking_model("deepseek-v4-flash-free", &mut messages);
+    normalize_reasoning_content_replay_for_model("deepseek-v4-flash-free", &mut messages);
     assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
 
     let value = serde_json::to_value(&messages[0]).unwrap();
@@ -1388,7 +1388,7 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
     // 回归：OpenCode DeepSeek 默认会下发顶层 reasoning_effort，
     // 此时请求体不会再带 `thinking` 对象；但历史 tool-call assistant
     // 仍必须补齐空 reasoning_content，否则压缩后续写会稳定 400。
-    ensure_reasoning_content_echo_for_thinking_model(
+    normalize_reasoning_content_replay_for_model(
         "deepseek-v4-flash-free-opencode",
         &mut messages,
     );
@@ -1420,6 +1420,73 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
         .and_then(|msg| msg.get("reasoning_content"))
         .and_then(|v| v.as_str());
     assert_eq!(echoed, Some(""));
+}
+
+#[test]
+fn reasoning_content_replay_is_exact_only_for_declared_models() {
+    let assistant = Message {
+        role: "assistant".to_string(),
+        content: json!("准备调用工具"),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_glm_replay".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: Some("必须原样回放的 GLM 推理".to_string()),
+    };
+
+    let projected = crate::ai::history::compress::sanitize_message_for_persisted_history_for_model(
+        "glm-5.2-opencode",
+        &assistant,
+    );
+    assert_ne!(
+        projected.reasoning_content, assistant.reasoning_content,
+        "请求上下文投影应携带来源模型标记"
+    );
+    let mut glm_messages = vec![projected.clone()];
+    normalize_reasoning_content_replay_for_model("glm-5.2-opencode", &mut glm_messages);
+    assert_eq!(
+        glm_messages[0].reasoning_content.as_deref(),
+        Some("必须原样回放的 GLM 推理")
+    );
+
+    let mut volcano_glm_messages = vec![projected.clone()];
+    normalize_reasoning_content_replay_for_model("glm-5.2-volcano", &mut volcano_glm_messages);
+    assert_eq!(volcano_glm_messages[0].reasoning_content, None);
+
+    let mut untagged_glm_messages = vec![assistant.clone()];
+    normalize_reasoning_content_replay_for_model(
+        "glm-5.2-opencode",
+        &mut untagged_glm_messages,
+    );
+    assert_eq!(untagged_glm_messages[0].reasoning_content, None);
+
+    let mut deepseek_messages = vec![assistant];
+    normalize_reasoning_content_replay_for_model("deepseek-v4-flash-free", &mut deepseek_messages);
+    assert_eq!(
+        deepseek_messages[0].reasoning_content.as_deref(),
+        Some("必须原样回放的 GLM 推理"),
+        "DeepSeek 的已有 reasoning 不能退化为空字符串"
+    );
+
+    let mut switched_to_deepseek = vec![projected.clone()];
+    normalize_reasoning_content_replay_for_model(
+        "deepseek-v4-flash-free",
+        &mut switched_to_deepseek,
+    );
+    assert_eq!(
+        switched_to_deepseek[0].reasoning_content.as_deref(),
+        Some(""),
+        "从 GLM 切到 DeepSeek 时不能把内部持久化标记发给 provider"
+    );
+
+    let mut gpt_messages = vec![projected];
+    normalize_reasoning_content_replay_for_model("gpt-5.5", &mut gpt_messages);
+    assert_eq!(gpt_messages[0].reasoning_content, None);
 }
 
 /// 核心回归：DashScope compatible-mode 端点的 Alibaba-provider 模型必须按

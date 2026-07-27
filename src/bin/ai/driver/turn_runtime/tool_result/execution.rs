@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-use super::super::persistence::persist_pending_turn_messages;
+use super::super::persistence::persist_pending_turn_messages_for_model;
 use super::super::{
     MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
     iteration::no_tool_handoff_note,
@@ -21,9 +21,9 @@ use super::super::{
 };
 use super::{
     messaging::{
-        append_cached_tool_results_note, append_message_pair, append_tool_result_messages,
-        parse_prune_meta_and_update_marks, record_final_stream_response, record_hidden_self_note,
-        record_tool_inspection_artifacts,
+        append_cached_tool_results_note, append_message_pair,
+        append_tool_result_messages_for_model, parse_prune_meta_and_update_marks,
+        record_final_stream_response, record_hidden_self_note, record_tool_inspection_artifacts,
     },
     overflow::{build_model_overflow_stub, summarize_large_tool_output, write_tool_overflow_file},
     preview::{build_terminal_preview, tail_chars},
@@ -1031,9 +1031,7 @@ impl<'a> TerminalToolObserver<'a> {
         }
         if self.fold_total_lines > TOOL_OUTPUT_FOLD_MAX_VISIBLE {
             let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
-            println!(
-                "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded ···{RESET}"
-            );
+            println!("  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded ···{RESET}");
             self.at_line_start = true;
         } else if !self.at_line_start {
             if newline {
@@ -1171,6 +1169,7 @@ fn streamed_tool_result_is_failure(tool_call: &ToolCall, run_result: &tools::Run
 
 fn handle_tool_call_round(
     app: &mut App,
+    source_model: &str,
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
     tool_call_execution: &ToolCallExecution,
@@ -1231,8 +1230,9 @@ fn handle_tool_call_round(
         eprintln!("[Warning] failed to persist stale patch targets: {error}");
     }
     append_cached_tool_results_note(&exec_result, messages, turn_messages);
-    append_tool_result_messages(
+    append_tool_result_messages_for_model(
         app,
+        source_model,
         &tool_call_execution.stream_result.assistant_text,
         &tool_call_execution.stream_result.reasoning_text,
         &tool_call_execution.stream_result.reasoning_items,
@@ -1243,8 +1243,13 @@ fn handle_tool_call_round(
     record_hidden_self_note(app, turn_messages, &remaining_meta);
     record_tool_inspection_artifacts(messages, turn_messages);
 
-    let history_ready =
-        persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
+    let history_ready = persist_pending_turn_messages_for_model(
+        app,
+        source_model,
+        one_shot_mode,
+        turn_messages,
+        persisted_turn_messages,
+    );
     if history_ready {
         let outcomes = exec_result
             .execution_outcomes
@@ -1562,10 +1567,7 @@ fn append_truncation_retry_note(
 fn extract_image_paths_from_file_read_tool_calls(tool_calls: &[ToolCall]) -> Vec<String> {
     let mut out = Vec::new();
     for tool_call in tool_calls {
-        if !matches!(
-            tool_call.function.name.as_str(),
-            "read_file"
-        ) {
+        if !matches!(tool_call.function.name.as_str(), "read_file") {
             continue;
         }
         let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
@@ -1644,6 +1646,52 @@ fn append_auto_image_followup_message(
 
 pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     app: &mut App,
+    question: &str,
+    mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
+    execution: IterationExecution,
+    messages: &mut Vec<Message>,
+    turn_messages: &mut Vec<Message>,
+    one_shot_mode: bool,
+    persisted_turn_messages: &mut usize,
+    final_assistant_text: &mut String,
+    final_assistant_recorded: &mut bool,
+    force_final_response: &mut bool,
+    terminal_dedupe_candidate: &mut Option<String>,
+    _no_active_skill: bool,
+    iteration: usize,
+    max_iterations: usize,
+    consecutive_truncations: usize,
+    turn_had_tool_error: &mut bool,
+) -> Result<TurnLoopStep, Box<dyn std::error::Error>> {
+    let source_model = app.current_model.clone();
+    handle_iteration_execution_for_model(
+        app,
+        &source_model,
+        question,
+        mcp_client,
+        shared_mcp_client,
+        execution,
+        messages,
+        turn_messages,
+        one_shot_mode,
+        persisted_turn_messages,
+        final_assistant_text,
+        final_assistant_recorded,
+        force_final_response,
+        terminal_dedupe_candidate,
+        _no_active_skill,
+        iteration,
+        max_iterations,
+        consecutive_truncations,
+        turn_had_tool_error,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
+    app: &mut App,
+    source_model: &str,
     question: &str,
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
@@ -1880,6 +1928,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             };
             *terminal_dedupe_candidate = handle_tool_call_round(
                 app,
+                source_model,
                 mcp_client,
                 shared_mcp_client,
                 &tool_call_execution,
@@ -2812,10 +2861,8 @@ mod tests {
 
     #[test]
     fn command_input_marks_pseudo_terminal_mode() {
-        let pty = format_command_input(
-            r#"{"command":"login --qr","pty":true,"cwd":"/tmp"}"#,
-        )
-        .expect("valid command arguments");
+        let pty = format_command_input(r#"{"command":"login --qr","pty":true,"cwd":"/tmp"}"#)
+            .expect("valid command arguments");
         assert_eq!(pty, "login --qr  (cwd: /tmp)  (PTY)");
 
         let piped = format_command_input(r#"{"command":"git diff","pty":false}"#)
@@ -3696,6 +3743,7 @@ mod tests {
             let start = Instant::now();
             let result = handle_tool_call_round(
                 &mut app,
+                "",
                 &mcp,
                 &shared_mcp,
                 &ToolCallExecution {

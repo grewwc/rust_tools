@@ -182,10 +182,8 @@ fn stub_preserves_file_path_recall_anchor() {
 
 #[test]
 fn folded_read_file_group_keeps_preview_and_original_target_anchor() {
-    let overflow_dir = std::env::temp_dir().join(format!(
-        "ai-read-preview-fold-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-read-preview-fold-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![msg("system", "s"), msg("user", "排查 prompt")];
     messages.push(assistant_call_args(
         "read-prompt",
@@ -336,8 +334,12 @@ fn folded_command_failure_keeps_diagnostics_and_full_output_pointer() {
         messages.push(tool_result(&id, "later"));
     }
 
-    let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -444,6 +446,94 @@ fn keeps_only_recent_tool_call_reasoning_across_turns() {
 }
 
 #[test]
+fn exact_replay_reasoning_survives_recent_reasoning_window() {
+    let mut messages = Vec::new();
+    for i in 0..5 {
+        let original = assistant_call_with_reasoning(
+            &format!("glm-call-{i}"),
+            "read_file",
+            &format!("glm-reasoning-{i}"),
+        );
+        messages.push(sanitize_message_for_persisted_history_for_model(
+            "glm-5.2-opencode",
+            &original,
+        ));
+    }
+
+    keep_only_recent_reasoning_content(&mut messages);
+
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.reasoning_content.is_some()),
+        "exact replay 模型的跨工具 continuation state 不能被通用三轮窗口裁掉"
+    );
+}
+
+#[test]
+fn path_c_preserves_exact_replay_reasoning_verbatim() {
+    let model = "glm-5.2-opencode";
+    let raw_reasoning = "reasoning-state-".repeat(64);
+    let assistant = sanitize_message_for_persisted_history_for_model(
+        model,
+        &assistant_call_with_reasoning("glm-call", "read_file", &raw_reasoning),
+    );
+    let encoded = assistant
+        .reasoning_content
+        .clone()
+        .expect("exact-replay reasoning should be encoded");
+    assert!(encoded.starts_with(PERSISTED_REASONING_REPLAY_PREFIX));
+
+    // Path C 的单字段上限不能把 marker+payload 当普通 reasoning 截断。
+    let mut per_field_capped = vec![assistant.clone(), tool_result("glm-call", "ok")];
+    assert!(emergency_cap_messages_to_fit(
+        &mut per_field_capped,
+        usize::MAX,
+        160,
+        &FxHashSet::default(),
+    ));
+    assert_eq!(
+        per_field_capped[0].reasoning_content.as_deref(),
+        Some(encoded.as_str())
+    );
+
+    let mut directly_capped = assistant.clone();
+    truncate_mutable_field(
+        &mut directly_capped,
+        MutableMessageField::Reasoning,
+        encoded.chars().count(),
+    );
+    assert_eq!(
+        directly_capped.reasoning_content.as_deref(),
+        Some(encoded.as_str())
+    );
+
+    // 若 exact replay 本身已超过总预算，宁可报告未达标，也不能制造不可解码的伪状态。
+    let mut aggregate_capped = vec![assistant, tool_result("glm-call", "ok")];
+    assert!(!emergency_cap_messages_to_fit(
+        &mut aggregate_capped,
+        160,
+        usize::MAX,
+        &FxHashSet::default(),
+    ));
+    assert_eq!(
+        aggregate_capped[0].reasoning_content.as_deref(),
+        Some(encoded.as_str())
+    );
+    assert_eq!(
+        decode_reasoning_replay_for_model(
+            model,
+            aggregate_capped[0]
+                .reasoning_content
+                .as_deref()
+                .expect("replay marker should remain present"),
+        )
+        .as_deref(),
+        Some(raw_reasoning.as_str())
+    );
+}
+
+#[test]
 fn persisted_summary_absorbs_prior_summary_without_nested_prefix() {
     let messages = vec![
         msg(
@@ -544,8 +634,12 @@ fn folded_tool_group_keeps_assistant_checkpoint_and_evidence_targets() {
         messages.push(tool_result(&id, "later"));
     }
 
-    let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -587,8 +681,9 @@ fn folded_tool_group_ignores_reasoning_when_content_empty() {
     );
     // content 留空（tool-call 轮的典型形态），仅提供 reasoning。
     call.content = Value::String(String::new());
-    call.reasoning_content =
-        Some("已确认该文件是 6393 行的会话历史；下一步只统计 role 分布，不再整文件回读。".to_string());
+    call.reasoning_content = Some(
+        "已确认该文件是 6393 行的会话历史；下一步只统计 role 分布，不再整文件回读。".to_string(),
+    );
     messages.push(call);
     messages.push(tool_result(
         "read-history",
@@ -600,8 +695,12 @@ fn folded_tool_group_ignores_reasoning_when_content_empty() {
         messages.push(tool_result(&id, "later"));
     }
 
-    let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -658,8 +757,12 @@ fn folded_tool_group_reconstructs_checkpoint_when_tool_call_has_no_text() {
         messages.push(tool_result(&id, "later"));
     }
 
-    let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -762,10 +865,8 @@ fn leading_compressed_tool_evidence_notes_are_not_immortal_prefix_context() {
     let (compressed, before, after) = mid_turn_compress(messages, 2_000, Some(&overflow_dir));
     assert!(after < before, "compression should make progress");
     assert!(
-        compressed
-            .iter()
-            .any(|message| message.role == "user"
-                && message.content.as_str() == Some("当前问题必须保留")),
+        compressed.iter().any(|message| message.role == "user"
+            && message.content.as_str() == Some("当前问题必须保留")),
         "latest user message must remain protected"
     );
     let remaining_evidence = compressed
@@ -779,17 +880,18 @@ fn leading_compressed_tool_evidence_notes_are_not_immortal_prefix_context() {
     let archived = std::fs::read_to_string(overflow_dir.join("overflow-history.md"))
         .expect("trimmed compressed evidence should be archived before removal");
     assert!(archived.contains("compressed_tool_round"), "{archived}");
-    assert!(archived.contains(COMPRESSED_TOOL_EVIDENCE_MARKER), "{archived}");
+    assert!(
+        archived.contains(COMPRESSED_TOOL_EVIDENCE_MARKER),
+        "{archived}"
+    );
 
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
 #[test]
 fn compressed_tool_evidence_has_independent_inline_budget() {
-    let overflow_dir = std::env::temp_dir().join(format!(
-        "ai-bounded-tool-evidence-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-bounded-tool-evidence-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![msg("system", "system prompt"), msg("user", "分析长工具链")];
     for index in 0..24 {
         messages.push(msg(
@@ -804,13 +906,8 @@ fn compressed_tool_evidence_has_independent_inline_budget() {
     assert!(compressed_tool_evidence_exceeds_inline_budget(&messages));
 
     // 整体远低于全局 100K 预算，仍应由工具证据自己的 12K 上限主动收敛。
-    let compressed = compress_messages_for_context(
-        messages,
-        100_000,
-        256,
-        8_000,
-        Some(overflow_dir.clone()),
-    );
+    let compressed =
+        compress_messages_for_context(messages, 100_000, 256, 8_000, Some(overflow_dir.clone()));
     let evidence = compressed
         .iter()
         .filter(|message| is_compressed_tool_evidence_note(message))
@@ -863,8 +960,12 @@ fn folded_command_keeps_invocation_for_empty_success() {
         messages.push(tool_result(&id, "later"));
     }
 
-    let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()

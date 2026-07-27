@@ -543,7 +543,7 @@ fn plan_history_rewind(
 
 fn apply_history_rewind(app: &mut App, plan: HistoryRewindPlan) -> Result<String, Box<dyn Error>> {
     let history_file = active_history_path(app);
-    history::replace_history_messages(&history_file, &plan.keep_messages)?;
+    history::truncate_history_messages(&history_file, plan.keep_messages.len())?;
     history::invalidate_context_history_cache_for(&history_file);
     crate::ai::driver::commands::session::clear_session_local_runtime_state(app);
     crate::ai::driver::commands::session::reset_stale_patch_targets_from_messages(

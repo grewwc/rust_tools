@@ -326,8 +326,7 @@ async fn request_model_response(
             "context-budget",
             &format!(
                 "compressed {} -> {} chars",
-                budget_report.before_chars,
-                budget_report.after_chars,
+                budget_report.before_chars, budget_report.after_chars,
             ),
         );
     }
@@ -510,10 +509,12 @@ async fn finalize_stream_interaction(
                     app.streaming
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     return Ok(match stream_result.outcome {
-                        StreamOutcome::ToolCall => IterationExecution::ToolCall(ToolCallExecution {
-                            stream_result,
-                            allowed_tool_names: request_visible_tool_names(app),
-                        }),
+                        StreamOutcome::ToolCall => {
+                            IterationExecution::ToolCall(ToolCallExecution {
+                                stream_result,
+                                allowed_tool_names: request_visible_tool_names(app),
+                            })
+                        }
                         StreamOutcome::EmptyResponse => IterationExecution::EmptyResponse,
                         StreamOutcome::Truncated => IterationExecution::Truncated(stream_result),
                         _ => IterationExecution::FinalResponse(stream_result),
@@ -552,6 +553,7 @@ async fn finalize_stream_interaction(
 pub(super) async fn execute_turn_iteration(
     app: &mut App,
     next_model: &str,
+    response_model: &mut Option<String>,
     messages: &mut Vec<Message>,
     turn_messages: &[Message],
     one_shot_mode: bool,
@@ -606,6 +608,9 @@ pub(super) async fn execute_turn_iteration(
             )));
         }
     };
+    // 自动 fallback 后仍需把真正完成本次响应的模型传到消息投影与 canonical
+    // 持久化层，不能继续使用路由前的 next_model / app.current_model。
+    *response_model = Some(actual_model.clone());
 
     if app
         .cancel_stream
@@ -751,11 +756,11 @@ pub(super) async fn execute_turn_iteration(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{record_llm_summary_attempt_chars, should_try_llm_summary};
     use super::{
         StreamingFlagGuard, no_tool_handoff_note, refresh_outstanding_task_anchor,
         request_interrupt_pending,
     };
-    use super::super::{record_llm_summary_attempt_chars, should_try_llm_summary};
     use crate::ai::history::{Message, ROLE_INTERNAL_NOTE};
     use serde_json::Value;
     use std::sync::atomic::AtomicBool;

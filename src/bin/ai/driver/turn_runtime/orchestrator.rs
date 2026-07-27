@@ -20,17 +20,17 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::ai::{history, mcp::SharedMcpClient, types::App};
 
 use super::{
+    CompressionReport, MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
+    MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+    MID_TURN_LLM_SUMMARY_MAX_CHARS,
     finalize::finalize_turn,
     iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
     mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
     persistence::persist_pending_turn_messages,
     prepare::prepare_turn,
     record_llm_summary_attempt_chars, should_try_llm_summary,
-    tool_result::handle_iteration_execution,
+    tool_result::handle_iteration_execution_for_model,
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
-    CompressionReport, MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
-    MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-    MID_TURN_LLM_SUMMARY_MAX_CHARS,
 };
 
 /// 工具调用循环检测窗口：
@@ -1682,8 +1682,7 @@ fn inject_progress_ledger_note(messages: &mut Vec<crate::ai::history::Message>) 
 fn inject_low_progress_hard_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note =
-        "[low-progress-hard-stop] 经软提示与记账后你仍未取得任何可见进展，判定为无效循环。\n\
+    let note = "[low-progress-hard-stop] 经软提示与记账后你仍未取得任何可见进展，判定为无效循环。\n\
         从现在起进入无工具收口模式：不要再发起任何工具调用；\n\
         请基于已收集到的信息给出阶段结论：已确认了什么、还差什么、\n\
         以及若要完成任务建议的下一步（若是变更类任务，直接说明应改哪些文件、怎么改）。";
@@ -1990,7 +1989,9 @@ mod tests {
         s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD - 1;
         assert_eq!(s.effective_mid_turn_soft_threshold(base), base);
         // 此时 ~120K 历史（< 135K 基准）不触发压缩——正是旧行为的空窗。
-        assert!(!s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base)));
+        assert!(
+            !s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base))
+        );
 
         // 长循环（达阈值）：有效阈值降到 FLOOR，同样 ~120K 历史立即触发压缩。
         s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD;
@@ -2232,9 +2233,11 @@ mod tests {
             signals
                 .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
-        assert!(signals[..TOOL_LOOP_COARSE_WINDOW - 1]
-            .iter()
-            .all(|s| matches!(s, ToolLoopSignal::None)));
+        assert!(
+            signals[..TOOL_LOOP_COARSE_WINDOW - 1]
+                .iter()
+                .all(|s| matches!(s, ToolLoopSignal::None))
+        );
         assert!(matches!(
             signals[TOOL_LOOP_COARSE_WINDOW - 1],
             ToolLoopSignal::Coarse
@@ -2284,9 +2287,11 @@ mod tests {
             signals
                 .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
         }
-        assert!(signals[..TOOL_LOOP_COARSE_WINDOW - 1]
-            .iter()
-            .all(|s| matches!(s, ToolLoopSignal::None)));
+        assert!(
+            signals[..TOOL_LOOP_COARSE_WINDOW - 1]
+                .iter()
+                .all(|s| matches!(s, ToolLoopSignal::None))
+        );
         assert!(matches!(
             signals[TOOL_LOOP_COARSE_WINDOW - 1],
             ToolLoopSignal::Coarse
@@ -2332,7 +2337,7 @@ mod tests {
         let mut supervisor = TurnSupervisor::default();
         let mut messages = Vec::new();
         let max_iterations = 10; // soft_limit = 5
-                                 // 未到软阈值不注入
+        // 未到软阈值不注入
         supervisor.iteration = 4;
         assert!(!supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
         assert!(messages.is_empty());
@@ -2340,11 +2345,13 @@ mod tests {
         supervisor.iteration = 5;
         assert!(supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
         assert_eq!(messages.len(), 1);
-        assert!(messages[0]
-            .content
-            .as_str()
-            .unwrap_or_default()
-            .contains("[iteration-soft-limit]"));
+        assert!(
+            messages[0]
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .contains("[iteration-soft-limit]")
+        );
         // 再次调用不重复注入
         supervisor.iteration = 8;
         assert!(!supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
@@ -3139,9 +3146,11 @@ mod tests {
         assert!(matches!(signals[1], ToolLoopSignal::None));
         assert!(matches!(signals[2], ToolLoopSignal::LowProgressSoft));
         assert!(matches!(signals[3], ToolLoopSignal::LowProgressLedger));
-        assert!(signals[4..signals.len() - 1]
-            .iter()
-            .all(|signal| matches!(signal, ToolLoopSignal::None)));
+        assert!(
+            signals[4..signals.len() - 1]
+                .iter()
+                .all(|signal| matches!(signal, ToolLoopSignal::None))
+        );
         assert!(matches!(
             signals.last(),
             Some(ToolLoopSignal::LowProgressHard)
@@ -3317,6 +3326,7 @@ async fn run_turn_body(
     let mut force_final_response = false;
     let mut final_assistant_text = String::new();
     let mut final_assistant_recorded = false;
+    let mut final_response_model = None::<String>;
     let mut terminal_dedupe_candidate = None;
     // 收集本 turn 实际调用过的 explicit-enabled tool 名字，turn 末用于老化未用项。
     let mut tools_used_this_turn: rust_tools::cw::SkipSet<String> =
@@ -3358,9 +3368,11 @@ async fn run_turn_body(
         }
         let active_skill_name = skill_turn.matched_skill_name().map(str::to_string);
         let compression_report = std::mem::take(&mut supervisor.pending_compression_report);
+        let mut response_model = None;
         let execution = match execute_turn_iteration(
             app,
             &next_model,
+            &mut response_model,
             &mut messages,
             &turn_messages,
             one_shot_mode,
@@ -3377,6 +3389,7 @@ async fn run_turn_body(
             Ok(e) => e,
             Err(err) => break 'turn Err(err),
         };
+        let was_final_response = matches!(&execution, IterationExecution::FinalResponse(_));
         let had_tool_call_execution = matches!(&execution, IterationExecution::ToolCall(_));
         {
             let mc = mcp_client.lock().unwrap().routing_snapshot();
@@ -3566,8 +3579,9 @@ async fn run_turn_body(
                     mt_downgraded = false;
                 }
             }
-            let step = match handle_iteration_execution(
+            let step = match handle_iteration_execution_for_model(
                 app,
+                response_model.as_deref().unwrap_or(&next_model),
                 &question,
                 &mc,
                 mcp_client,
@@ -3625,7 +3639,12 @@ async fn run_turn_body(
                         }
                     }
                 }
-                TurnLoopStep::Break => break 'turn Ok(None),
+                TurnLoopStep::Break => {
+                    if was_final_response {
+                        final_response_model.clone_from(&response_model);
+                    }
+                    break 'turn Ok(None);
+                }
                 TurnLoopStep::Return(outcome) => break 'turn Ok(Some(outcome)),
             }
         }
@@ -3851,9 +3870,8 @@ async fn run_turn_body(
     let requested_user_input = crate::ai::tools::skill_tools::take_pending_user_input_request();
     if requested_user_input && loop_result.is_ok() && !app.last_turn_interrupted {
         if let Some(skill_name) = skill_turn.matched_skill_name().map(str::to_owned) {
-            app.pending_skill_continuation = Some(
-                crate::ai::types::PendingSkillContinuation { skill_name },
-            );
+            app.pending_skill_continuation =
+                Some(crate::ai::types::PendingSkillContinuation { skill_name });
         }
     }
 
@@ -3868,6 +3886,7 @@ async fn run_turn_body(
             finalize_turn(
                 app,
                 &next_model,
+                final_response_model.as_deref().unwrap_or(&next_model),
                 &question,
                 &final_assistant_text,
                 final_assistant_recorded,
