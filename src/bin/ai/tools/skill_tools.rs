@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
 
+use rust_tools::commonw::FastSet;
 use serde_json::Value;
 
 use crate::ai::config_schema::AiConfig;
@@ -18,6 +19,17 @@ use crate::ai::tools::common::ToolSpec;
 static PENDING_SKILL_ACTIVATION: LazyLock<RwLock<Option<String>>> =
     LazyLock::new(|| RwLock::new(None));
 
+/// `request_user_input` 在本轮内记录的明确交互边界。按 `(session_id, turn_id)` 隔离，
+/// 避免并行 subagent 或其他 session 的请求污染当前 foreground turn。
+static PENDING_USER_INPUT_REQUESTS: LazyLock<RwLock<FastSet<(String, usize)>>> =
+    LazyLock::new(|| RwLock::new(FastSet::default()));
+
+fn current_turn_identity() -> (String, usize) {
+    crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .try_with(Clone::clone)
+        .unwrap_or_default()
+}
+
 fn set_pending_skill_activation(name: String) {
     if let Ok(mut slot) = PENDING_SKILL_ACTIVATION.write() {
         *slot = Some(name);
@@ -30,6 +42,20 @@ pub(crate) fn take_pending_skill_activation() -> Option<String> {
         .write()
         .ok()
         .and_then(|mut slot| slot.take())
+}
+
+pub(crate) fn clear_pending_user_input_request() {
+    if let Ok(mut requests) = PENDING_USER_INPUT_REQUESTS.write() {
+        requests.remove(&current_turn_identity());
+    }
+}
+
+/// driver 侧调用：查询并清空本轮的显式用户输入请求。
+pub(crate) fn take_pending_user_input_request() -> bool {
+    PENDING_USER_INPUT_REQUESTS
+        .write()
+        .map(|mut requests| requests.remove(&current_turn_identity()))
+        .unwrap_or(false)
 }
 
 fn params_activate_skill() -> Value {
@@ -74,6 +100,37 @@ pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
     ))
 }
 
+fn params_request_user_input() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The concise information, decision, or confirmation needed from the user."
+            }
+        },
+        "required": ["question"]
+    })
+}
+
+/// 标记当前 skill 正在等待用户输入。工具结果仅供模型接续生成面向用户的问题；
+/// 真正的跨轮状态由 driver 在本 turn 结束时保存，避免工具层直接修改会话状态。
+pub(crate) fn execute_request_user_input(args: &Value) -> Result<String, String> {
+    let question = args["question"].as_str().unwrap_or("").trim();
+    if question.is_empty() {
+        return Err("request_user_input requires a non-empty 'question'.".to_string());
+    }
+
+    if let Ok(mut requests) = PENDING_USER_INPUT_REQUESTS.write() {
+        requests.insert(current_turn_identity());
+    }
+
+    Ok(format!(
+        "User input has been requested: {question}\n\
+         Ask the user this question in your final response, then stop. The active skill will be restored only for the user's immediately following normal message."
+    ))
+}
+
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "activate_skill",
@@ -85,6 +142,18 @@ inventory::submit!(ToolRegistration {
         execute: execute_activate_skill,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "request_user_input",
+        description: "When an active skill needs information, a decision, or confirmation from the user before it can continue, use this tool instead of merely ending with a question. The driver restores that skill only for the user's immediately following normal message.",
+        parameters: params_request_user_input,
+        execute: execute_request_user_input,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        // 这是 driver 直接按名称注入的控制工具，不能通过 manifest 的 tool_groups 暴露。
+        groups: &[],
     }
 });
 
@@ -476,9 +545,11 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_skill_file_content, execute_activate_skill, execute_load_skill, render_loaded_skill,
-        render_skill_catalog, take_pending_skill_activation,
+        build_skill_file_content, clear_pending_user_input_request, execute_activate_skill,
+        execute_load_skill, execute_request_user_input, render_loaded_skill,
+        render_skill_catalog, take_pending_skill_activation, take_pending_user_input_request,
     };
+    use crate::ai::driver::runtime_ctx::TURN_IDENTITY;
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};
 
@@ -519,6 +590,32 @@ mod tests {
         );
         // take 应清空槽位。
         assert!(take_pending_skill_activation().is_none());
+    }
+
+    #[test]
+    fn request_user_input_is_turn_scoped_and_one_shot() {
+        let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
+        let identity_a = ("session-a".to_string(), 11);
+        let identity_b = ("session-b".to_string(), 12);
+
+        TURN_IDENTITY.sync_scope(identity_a.clone(), || {
+            clear_pending_user_input_request();
+            let out = execute_request_user_input(&serde_json::json!({
+                "question": "Which region should I query?"
+            }))
+            .unwrap();
+            assert!(out.contains("Which region should I query?"));
+        });
+
+        TURN_IDENTITY.sync_scope(identity_b, || {
+            clear_pending_user_input_request();
+            assert!(!take_pending_user_input_request());
+        });
+
+        TURN_IDENTITY.sync_scope(identity_a, || {
+            assert!(take_pending_user_input_request());
+            assert!(!take_pending_user_input_request());
+        });
     }
 
     #[test]

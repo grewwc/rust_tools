@@ -885,6 +885,15 @@ fn build_system_prompt(
         })
     };
     b.push(ContextKind::Identity, identity);
+    if skill.is_some() && has_tool(available_tools, "request_user_input") {
+        b.push(
+            ContextKind::Behavior,
+            "Interactive skill handoff:\n\
+             - When the active skill needs information, a choice, or confirmation from the user before it can proceed, call `request_user_input` with the concise question instead of merely ending the response with a question.\n\
+             - Use it only for input required to continue the active workflow, not for optional follow-up questions after completing the task.\n\
+             - After the call, present that question to the user and wait. The runtime restores this skill for only the user's immediately following normal message; an explicit skill selection overrides it.",
+        );
+    }
     b.push(ContextKind::Behavior, runtime_environment_prompt());
 
     if let Some(resource_path) = skill
@@ -1234,7 +1243,14 @@ fn build_skill_turn_guard(
     let executor_active = skill.as_ref().is_some_and(|s| is_executor_skill(s))
         || active_agent.as_ref().is_some_and(is_executor_agent);
 
-    let builtin_tools = builtin_tools_for_skill(skill, active_agent.as_ref());
+    let mut builtin_tools = builtin_tools_for_skill(skill, active_agent.as_ref());
+    // 外部下载的 skill 无法预先声明本运行时的续接协议；仅在 skill 已激活时
+    // 注入这个 driver-owned 工具，普通 turn 不增加 schema 噪声或行为分支。
+    if skill.is_some() {
+        builtin_tools.extend(crate::ai::tools::get_tool_definitions_by_names(&[
+            "request_user_input".to_string(),
+        ]));
+    }
     let mcp_tools = select_mcp_tools(all_mcp_tools.clone(), skill, active_agent.as_ref());
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
     let ctx = PromptContext {
@@ -1335,6 +1351,10 @@ pub(super) fn prepare_skill_for_turn(
 
     // 用户通过 `@skills:<name>` 在输入框中显式选择的强制 skill 最高优先。
     // 这是 per-turn 语义：消费后立即清空，下一轮不再强制注入。
+    // 它也是用户显式离开等待中 skill 的信号，不能让旧续接抢回本轮。
+    if app.forced_skill.is_some() {
+        app.pending_skill_continuation = None;
+    }
     if let Some(forced) = app.forced_skill.take() {
         if let Some(skill) = skill_manifests
             .iter()
@@ -1358,6 +1378,29 @@ pub(super) fn prepare_skill_for_turn(
             eprintln!(
                 "[skills] forced @skills:{} not found, no auto-activation",
                 forced
+            );
+        }
+    }
+
+    // 只消费一次由 `request_user_input` 建立的显式续接。这里按名字重新解析
+    // manifest，既避免把已删除/改名的外部 skill 当作有效状态，也不会退回到
+    // 旧版基于文本相似度的 cross-turn sticky 路由。
+    if let Some(continuation) = app.pending_skill_continuation.take() {
+        let requested_name = continuation.skill_name;
+        if let Some(skill) = skill_manifests.iter().find(|s| s.name == requested_name) {
+            let name = skill.name.clone();
+            if let Some(guard) =
+                force_activate_named_skill(app, mcp_client, skill_manifests, question, &name)
+            {
+                if debug {
+                    eprintln!("[skills] continuing requested skill: {name}");
+                }
+                return guard;
+            }
+        } else if debug {
+            eprintln!(
+                "[skills] pending continuation skill '{}' not found; continuing without it",
+                requested_name
             );
         }
     }
@@ -1390,9 +1433,10 @@ mod tests {
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
+    use crate::ai::mcp::McpClient;
     use crate::ai::skills::SkillManifest;
     use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
-    use crate::ai::types::{FunctionDefinition, ToolDefinition};
+    use crate::ai::types::{FunctionDefinition, PendingSkillContinuation, ToolDefinition};
     use rust_tools::cw::SkipSet;
     use std::fs;
     use std::path::PathBuf;
@@ -1458,6 +1502,74 @@ mod tests {
         assert!(names.iter().any(|name| name == "knowledge_save"));
         assert!(names.iter().any(|name| name == "knowledge_search"));
         assert!(!names.iter().any(|name| name == "web_search"));
+    }
+
+    #[test]
+    fn active_skill_prompt_uses_explicit_user_input_handoff_only_for_skills() {
+        let active_skill = skill("external-skill", "external workflow");
+        let available = {
+            let mut available = SkipSet::new(16);
+            available.insert("request_user_input".to_string());
+            Box::new(available)
+        };
+
+        let active_prompt = build_system_prompt(
+            None,
+            Some(&active_skill),
+            &available,
+            &PromptContext::default(),
+        )
+        .render_system_prompt();
+        assert!(active_prompt.contains("Interactive skill handoff:"));
+        assert!(active_prompt.contains("`request_user_input`"));
+
+        let ordinary_prompt =
+            build_system_prompt(None, None, &available, &PromptContext::default())
+                .render_system_prompt();
+        assert!(!ordinary_prompt.contains("Interactive skill handoff:"));
+    }
+
+    #[test]
+    fn explicit_user_input_continuation_restores_only_the_next_turn() {
+        let external = skill("external-skill", "external workflow");
+        let replacement = skill("replacement", "replacement workflow");
+        let mcp_client = McpClient::new();
+        let mut app = super::super::tests::test_app("build");
+
+        app.pending_skill_continuation = Some(PendingSkillContinuation {
+            skill_name: external.name.clone(),
+        });
+        let guard = super::prepare_skill_for_turn(
+            &mut app,
+            &mcp_client,
+            std::slice::from_ref(&external),
+            "the requested answer",
+        );
+        assert_eq!(guard.matched_skill_name(), Some(external.name.as_str()));
+        assert!(app.pending_skill_continuation.is_none());
+        drop(guard);
+
+        let next_guard = super::prepare_skill_for_turn(
+            &mut app,
+            &mcp_client,
+            std::slice::from_ref(&external),
+            "an unrelated new request",
+        );
+        assert_eq!(next_guard.matched_skill_name(), None);
+        drop(next_guard);
+
+        app.pending_skill_continuation = Some(PendingSkillContinuation {
+            skill_name: external.name.clone(),
+        });
+        app.forced_skill = Some(replacement.name.clone());
+        let forced_guard = super::prepare_skill_for_turn(
+            &mut app,
+            &mcp_client,
+            &[external, replacement],
+            "use the explicitly selected skill",
+        );
+        assert_eq!(forced_guard.matched_skill_name(), Some("replacement"));
+        assert!(app.pending_skill_continuation.is_none());
     }
 
     #[tokio::test]
@@ -2288,6 +2400,21 @@ mod tests {
             color: None,
             source_path: None,
         }
+    }
+
+    #[test]
+    fn manifest_skill_group_does_not_expose_request_user_input_without_active_skill() {
+        let mut active_agent = agent("ordinary", vec![]);
+        active_agent.tool_groups.push("skill".to_string());
+
+        let tools = super::builtin_tools_for_skill(None, Some(&active_agent));
+
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool.function.name == "request_user_input"),
+            "manifest tool_groups must not expose the skill-only handoff control tool"
+        );
     }
 
     #[test]

@@ -74,6 +74,7 @@ fn test_app_with_model(current_model: String) -> App {
         current_agent_manifest: None,
         pending_files: None,
         forced_skill: None,
+        pending_skill_continuation: None,
         forced_question: None,
         attached_image_files: Vec::new(),
         shutdown: Arc::new(AtomicBool::new(false)),

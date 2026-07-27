@@ -38,6 +38,12 @@ fn subagent_may_enable_tool(name: &str) -> bool {
         || !super::is_subagent_orchestration_tool_name(name)
 }
 
+/// 按需启用只暴露通用 builtin 工具。skill 专属的 driver control tool 只能在
+/// active skill turn 由 driver 注入，不能通过普通 turn 的 `enable_tools` 获得。
+fn registration_may_be_dynamically_enabled(reg: &ToolRegistration) -> bool {
+    reg.spec.groups.contains(&"builtin")
+}
+
 pub(crate) fn set_active_tool_names(names: Vec<String>) {
     if let Ok(mut s) = STATE.write() {
         s.active_tool_names = names;
@@ -151,7 +157,9 @@ pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
     }
     let mut defs = Vec::new();
     for reg in inventory::iter::<ToolRegistration> {
-        if names.iter().any(|n| n == reg.spec.name) {
+        if registration_may_be_dynamically_enabled(reg)
+            && names.iter().any(|n| n == reg.spec.name)
+        {
             defs.push(ToolDefinition {
                 tool_type: "function".to_string(),
                 function: crate::ai::types::FunctionDefinition {
@@ -179,7 +187,10 @@ fn available_tools_not_active() -> Vec<(String, String)> {
         .unwrap_or_default();
     let mut result = Vec::new();
     for reg in inventory::iter::<ToolRegistration> {
-        if subagent_may_enable_tool(reg.spec.name) && !active.iter().any(|a| a == reg.spec.name) {
+        if registration_may_be_dynamically_enabled(reg)
+            && subagent_may_enable_tool(reg.spec.name)
+            && !active.iter().any(|a| a == reg.spec.name)
+        {
             result.push((reg.spec.name.to_string(), reg.spec.description.to_string()));
         }
     }
@@ -254,7 +265,9 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             // + mark_explicitly_enabled，避免多次锁切换造成的状态拼接错位。
             let mut known_builtin: Vec<&str> = Vec::new();
             for reg in inventory::iter::<ToolRegistration> {
-                known_builtin.push(reg.spec.name);
+                if registration_may_be_dynamically_enabled(reg) {
+                    known_builtin.push(reg.spec.name);
+                }
             }
             let mut s = match STATE.write() {
                 Ok(g) => g,
@@ -290,6 +303,10 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 .into_iter()
                 .filter(|n| !active.iter().any(|a| a == n.as_str()))
                 .filter(|n| !blocked_in_subagent.iter().any(|blocked| blocked == n))
+                .filter(|n| {
+                    known_builtin.iter().any(|k| k == n)
+                        || known_mcp.iter().any(|k| k == n.as_str())
+                })
                 .collect();
             let (mcp_names, builtin_names): (Vec<String>, Vec<String>) = to_enable
                 .iter()
@@ -402,6 +419,29 @@ mod tests {
 
         assert!(output.contains("mcp_feishu_docs_get_text_by_url"));
         assert_eq!(pending, vec!["mcp_feishu_docs_get_text_by_url".to_string()]);
+    }
+
+    #[test]
+    fn skill_control_tools_cannot_be_dynamically_enabled() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+
+        let listed = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+        assert!(
+            !listed.contains("  - request_user_input:"),
+            "skill-only control tools must not appear in the normal enable catalog"
+        );
+
+        let output = execute_enable_tools(
+            &json!({"operation": "enable", "tools": ["request_user_input"]}),
+        )
+        .unwrap();
+        assert!(output.contains("Unknown tools (ignored): request_user_input"));
+        assert!(drain_pending_enable().is_empty());
+        assert!(explicit_enabled_tool_names().is_empty());
     }
 
     #[test]

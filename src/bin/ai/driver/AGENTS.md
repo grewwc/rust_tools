@@ -52,3 +52,7 @@ history/compression in `turn_runtime/`, subagent flows in `turn_runtime/orchestr
     results through task IPC for `task_wait` / `task_status` to aggregate. The
     driver may expose lifecycle through one compact foreground-owned status line,
     refreshed only at scheduler safe points and finalized before foreground output.
+15. **Interactive skill handoffs are explicit and one-shot.** Preserve an active
+    skill across turns only after its `request_user_input` control tool succeeds;
+    consume that continuation on the next normal turn, let an explicit skill pin
+    override it, and never infer it from response wording or question marks.

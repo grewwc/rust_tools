@@ -3277,6 +3277,9 @@ async fn run_turn_body(
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
     // 每轮开始清除上一轮的打断标记，确保它只反映「本轮」是否被 Ctrl+C 打断。
     app.last_turn_interrupted = false;
+    // 请求用户输入是工具层到 driver 的 turn 级侧信道；先清除遗留状态，避免异常退出
+    // 的上一轮把续接误带入当前 turn。
+    crate::ai::tools::skill_tools::clear_pending_user_input_request();
     // reasoning items 侧信道是 turn 级内存态：每轮开始清空，避免上一轮的
     // encrypted reasoning 泄漏到本轮请求（call_id 也不会再匹配）。
     app.turn_reasoning_items.clear();
@@ -3841,9 +3844,20 @@ async fn run_turn_body(
     // 连续 N 个 turn 闲置就 demote，避免"启用一次永久焊接"。
     crate::ai::tools::enable_tools::age_unused_explicit_tools(tools_used_this_turn.iter());
 
-    skill_turn.restore_agent_context(app);
-
     let loop_result = loop_result.map_err(|e: Box<dyn std::error::Error>| e.to_string());
+
+    // 只有 active skill 明确通过工具请求用户输入、且本轮正常结束时才建立一次性续接。
+    // 这避免了按自然语言问号/关键词猜测，外部 skill 也无需修改自身 manifest。
+    let requested_user_input = crate::ai::tools::skill_tools::take_pending_user_input_request();
+    if requested_user_input && loop_result.is_ok() && !app.last_turn_interrupted {
+        if let Some(skill_name) = skill_turn.matched_skill_name().map(str::to_owned) {
+            app.pending_skill_continuation = Some(
+                crate::ai::types::PendingSkillContinuation { skill_name },
+            );
+        }
+    }
+
+    skill_turn.restore_agent_context(app);
 
     match loop_result {
         Ok(Some(outcome)) => {

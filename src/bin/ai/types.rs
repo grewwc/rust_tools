@@ -50,6 +50,9 @@ impl Clone for App {
             current_agent_manifest: self.current_agent_manifest.clone(),
             pending_files: self.pending_files.clone(),
             forced_skill: self.forced_skill.clone(),
+            // 该状态只属于 foreground 的下一条用户消息；`App` clone 还会用于
+            // DriverContext、subagent 与后台任务，不能让它们继承这次续接。
+            pending_skill_continuation: None,
             forced_question: self.forced_question.clone(),
             attached_image_files: self.attached_image_files.clone(),
             shutdown: self.shutdown.clone(),
@@ -95,6 +98,9 @@ pub(super) struct App {
     /// 用户通过 `@skills:<name>` 在输入框中显式选择、仅对**本轮**生效的强制 skill。
     /// turn 准备阶段读取后强制注入该 skill，并在该 turn 结束后清空，下一轮不再强制。
     pub(super) forced_skill: Option<String>,
+    /// 当前 skill 通过 `request_user_input` 明确请求用户输入后保存的一次性续接。
+    /// 下一条普通用户消息消费它；显式 skill 选择或会话切换会覆盖/清除它。
+    pub(super) pending_skill_continuation: Option<PendingSkillContinuation>,
     /// 当 /skills <name> <rest> 时，<rest> 作为本轮问题使用。
     pub(super) forced_question: Option<String>,
     pub(super) attached_image_files: Vec<String>,
@@ -207,6 +213,13 @@ impl App {
 pub(super) struct SkillBiasMemory {
     pub(super) skill_name: String,
     pub(super) question: String,
+}
+
+/// 一个已明确请求用户输入的 skill。它只允许续接下一条普通用户消息，不能作为
+/// 模糊的跨轮 skill 偏好使用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PendingSkillContinuation {
+    pub(super) skill_name: String,
 }
 
 /// Schema definition for a tool that can be offered to the AI model,

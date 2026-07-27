@@ -76,3 +76,6 @@ Module responsibilities: schema/metadata in `registry/`, execution in
     avoid a lock cycle with `task_wait` (which holds registry -> kernel).
     `task_cancel` skips already-finished tasks (via `is_task_pending`) so it
     never overwrites/discards a real result.
+12. **Interactive skill handoff.** `request_user_input` is a driver-owned
+    control tool, visible only during an active skill turn. Scope its signal by
+    `TURN_IDENTITY`; never infer a cross-turn continuation from response text.
