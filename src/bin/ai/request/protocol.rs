@@ -13,6 +13,13 @@ use crate::ai::models;
 use crate::ai::request_protocol::RequestProtocolDialect;
 use crate::ai::types::ToolCall;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ai::request) struct ResponsesReasoningReplayStats {
+    pub(in crate::ai::request) tool_call_groups: usize,
+    pub(in crate::ai::request) replayed_groups: usize,
+    pub(in crate::ai::request) missing_groups: usize,
+}
+
 impl RequestProtocolDialect {
     pub(super) fn build_http_body(self, request: &RequestBody<'_>) -> Value {
         match self {
@@ -280,6 +287,33 @@ fn responses_message_input(message: &Message) -> Value {
         "role": message.role,
         "content": responses_message_content(message),
     })
+}
+
+pub(in crate::ai::request) fn responses_reasoning_replay_stats(
+    messages: &[Message],
+    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+) -> ResponsesReasoningReplayStats {
+    let mut stats = ResponsesReasoningReplayStats::default();
+    for message in messages {
+        let Some(first_tool_call) = message
+            .tool_calls
+            .as_ref()
+            .filter(|calls| !calls.is_empty())
+            .and_then(|calls| calls.first())
+        else {
+            continue;
+        };
+        stats.tool_call_groups += 1;
+        let replayed = reasoning_items
+            .and_then(|items| items.get(&first_tool_call.id))
+            .is_some_and(|items| !items.is_empty());
+        if replayed {
+            stats.replayed_groups += 1;
+        } else {
+            stats.missing_groups += 1;
+        }
+    }
+    stats
 }
 
 fn responses_input(

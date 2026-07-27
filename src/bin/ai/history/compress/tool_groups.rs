@@ -167,33 +167,23 @@ pub(super) fn fold_tool_call_group_to_stub(
     ));
     lines.push(COMPRESSED_TOOL_EVIDENCE_MARKER.to_string());
 
-    // checkpoint 优先取 assistant 正文；但 tool-call 轮的 content 往往为空
-    // （模型只发 tool_calls、无叙述）。此时回退到 reasoning_content——那是模型
-    // 发起这批调用前的思考，作为压缩后的决策锚点远比固定的 <empty> 有价值，
-    // 能避免模型在压缩后失忆、从同一轮重启取证。
-    let assistant_content = value_to_string(&assistant.content);
+    // checkpoint 只使用对用户可见的 assistant 正文。隐藏 reasoning_content 可能是
+    // 未验证的中间推断，不能在压缩时提升为持久化事实；正文为空时从结构化工具调用
+    // 重建「已完成的工具活动」，避免模型误以为这些调用尚未执行。
+    let assistant_content = match &assistant.content {
+        Value::Null => String::new(),
+        content => value_to_string(content),
+    };
     let assistant_text = normalize_whitespace(assistant_content.trim());
     let checkpoint = if !assistant_text.is_empty() {
         assistant_text
     } else {
-        assistant
-            .reasoning_content
-            .as_deref()
-            .map(|reasoning| normalize_whitespace(reasoning.trim()))
-            .filter(|reasoning| !reasoning.is_empty())
-            .unwrap_or_default()
+        reconstructed_tool_call_checkpoint(tool_calls)
     };
-    if checkpoint.is_empty() {
-        lines.push(
-            "assistant_checkpoint: <empty; no persisted decision before these tool calls>"
-                .to_string(),
-        );
-    } else {
-        lines.push(format!(
-            "assistant_checkpoint: {}",
-            truncate_to_chars(&checkpoint, 720)
-        ));
-    }
+    lines.push(format!(
+        "assistant_checkpoint: {}",
+        truncate_to_chars(&checkpoint, 720)
+    ));
     lines.push("evidence:".to_string());
 
     for tc in tool_calls.iter().take(8) {
@@ -241,6 +231,23 @@ pub(super) fn fold_tool_call_group_to_stub(
 
 fn parsed_tool_args(tool_call: &ToolCall) -> Option<Value> {
     serde_json::from_str::<Value>(&tool_call.function.arguments).ok()
+}
+
+fn reconstructed_tool_call_checkpoint(tool_calls: &[ToolCall]) -> String {
+    let mut calls = Vec::new();
+    for tool_call in tool_calls.iter().take(4) {
+        let target = tool_call_target_recall(tool_call);
+        let invocation = tool_call_invocation_recall(tool_call);
+        let detail = format!("{target}{invocation}");
+        calls.push(format!("{}{}", tool_call.function.name, detail));
+    }
+    if tool_calls.len() > 4 {
+        calls.push(format!("... {} more tool calls", tool_calls.len() - 4));
+    }
+    format!(
+        "no assistant narration was persisted; reconstructed completed tool activity: {}",
+        calls.join("; ")
+    )
 }
 
 fn arg_string(args: &Value, keys: &[&str]) -> Option<String> {
@@ -337,13 +344,6 @@ fn tool_call_invocation_recall(tool_call: &ToolCall) -> String {
     if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
         fields.push(format!("cwd: {cwd}"));
     }
-    if fields.is_empty() {
-        let args = truncate_to_chars(&normalize_whitespace(&tool_call.function.arguments), 240);
-        if !args.is_empty() {
-            fields.push(format!("arguments: {args}"));
-        }
-    }
-
     if fields.is_empty() {
         String::new()
     } else {

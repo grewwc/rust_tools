@@ -453,12 +453,9 @@ pub(in crate::ai) fn compress_messages_for_context(
 /// 持久化历史里"带 tool_calls 的 assistant narration"被截断到的字符数。
 ///
 /// 折叠器 [`tool_groups::fold_tool_call_group_to_stub`] 把发起本轮工具调用前
-/// 的 narration 当作 `assistant_checkpoint` 的来源（重要于 reasoning_content，
-/// 因为 reasoning_content 体积过大且无条件丢弃）。要让这个 checkpoint 在
-/// 落盘压缩路径上仍能拾回，持久化层就必须保留足以承载"模型当前思路"的那一段
-/// narration；同时不能保留全文以免单个 user turn 膨胀成几百条低价值 assistant
-/// 噪音。720 字与折叠后 `truncate_to_chars(&checkpoint, 720)` 同量级——既把
-/// "发起这批调用前的核心叙述"留下，又把跨 turn 体积压回可接受量。
+/// 的可见 narration 当作 `assistant_checkpoint` 的来源。完整 reasoning_content
+/// 不落盘，也绝不能提升为 assistant 正文；tool-call-only 消息由折叠器根据结构化
+/// tool_calls 重建安全的操作摘要。720 字与折叠后的 checkpoint 上限同量级。
 const PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS: usize = 720;
 
 pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -> Message {
@@ -468,32 +465,30 @@ pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -
     }
 
     // 持久化历史只保留跨 turn 真正需要的 assistant 事实：
-    // - `reasoning_content` 体积巨大且对后续决策无益，持久化层一律丢弃；
+    // - `reasoning_content` 是隐藏推理，持久化层一律丢弃，绝不复制到可见正文；
     //   provider 需要字段形状时由 request 层统一补空字符串。
-    // - 带 tool_calls 的 assistant narration 历史上被清空成 `""`：理由是
-    //   "真正的地面真相是结构化 tool_calls + tool 结果，持久化长 narration
-    //   会让单个 user turn 膨胀"。但这让 [`tool_groups::fold_tool_call_group_to_stub`]
-    //   的 checkpoint 看不到任何文字，只能塌成
+    // - 带 tool_calls 的 assistant narration 不能清空：否则
+    //   [`tool_groups::fold_tool_call_group_to_stub`] 的 checkpoint 看不到任何文字，只能塌成
     //   "assistant_checkpoint: <empty; no persisted decision before these tool calls>"，
-    //   压缩后模型失忆，从同一轮重启取证（详 e75fc2e5 session dump 中
-    //   50/50 assistant `content==""` + 22/22 fold `<empty>` checkpoint）。
+    //   压缩后模型失忆，从同一轮重启取证。
     //
-    // 修复：把 narration 截断到 [`PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS`]
-    // 字而不是清空——这一量级正好等于 fold 自己截到的 checkpoint 上限，
-    // 零额外体积代价就能把"发起这批调用前的核心叙述"留作压缩后的决策锚点。
-    sanitized.reasoning_content = None;
     if sanitized
         .tool_calls
         .as_ref()
         .is_some_and(|tool_calls| !tool_calls.is_empty())
     {
-        let narration = match sanitized.content {
-            Value::String(ref s) => s.clone(),
-            ref other => other.to_string(),
+        let narration = match &sanitized.content {
+            Value::Null => String::new(),
+            Value::String(text) => text.clone(),
+            other => value_to_string(other),
         };
-        let capped = truncate_to_chars(&narration, PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS);
+        let capped = truncate_to_chars(
+            &narration,
+            PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS,
+        );
         sanitized.content = Value::String(capped);
     }
+    sanitized.reasoning_content = None;
     sanitized
 }
 

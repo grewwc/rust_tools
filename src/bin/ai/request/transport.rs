@@ -49,6 +49,40 @@ fn retry_scope_tag() -> String {
     }
 }
 
+fn maybe_emit_responses_reasoning_replay_diagnostic(
+    model: &str,
+    endpoint: &str,
+    messages: &[Message],
+    reasoning_items: &rustc_hash::FxHashMap<String, Vec<Value>>,
+) {
+    if !models::reasoning_encrypted_replay_enabled(model)
+        || models::request_protocol_dialect(model, endpoint)
+            != crate::ai::request_protocol::RequestProtocolDialect::Responses
+    {
+        return;
+    }
+    // 加密 reasoning item 只在当前 turn 的工具链中通过内存侧信道回放；历史 turn
+    // 已经无法忠实回放，且由 history checkpoint/工具证据承担语义保真。诊断只统计
+    // 最新 user 之后的当前 turn，避免每次请求都对旧历史发噪音。
+    let current_turn_start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(0);
+    let stats = super::protocol::responses_reasoning_replay_stats(
+        &messages[current_turn_start..],
+        Some(reasoning_items),
+    );
+    if stats.tool_call_groups == 0 || stats.missing_groups == 0 {
+        return;
+    }
+    // super::emit_request_diagnostic(format_args!(
+    //     "[Info] responses reasoning replay: replayed {}/{} assistant tool-call groups; {} group(s) missing encrypted reasoning items, falling back to function_call replay.",
+    //     stats.replayed_groups,
+    //     stats.tool_call_groups,
+    //     stats.missing_groups
+    // ));
+}
+
 /// 带 TPM 预检的 hedged send。
 ///
 /// 预算必须按 actual physical send 计，而不是按 logical request 计：hedged backup
@@ -343,9 +377,16 @@ async fn do_request_messages_with_tool_mode(
     } else {
         reasoning_effort
     };
+    let endpoint = endpoint_for_request_model(app, model);
     // 把 reasoning items 侧信道快照到局部，避免 `request_body` 长期持有对 `app`
     // 的不可变借用（后续 key 轮换循环需要 `&mut app`）。
     let turn_reasoning_items = app.turn_reasoning_items.clone();
+    maybe_emit_responses_reasoning_replay_diagnostic(
+        model,
+        &endpoint,
+        &normalized_messages,
+        &turn_reasoning_items,
+    );
     let request_body = build_request_body(
         model,
         &normalized_messages,
@@ -365,7 +406,6 @@ async fn do_request_messages_with_tool_mode(
     // 每一轮先轮换尝试所有 key；只有当全部 key 都因 429（配额/限流）失败时，
     // 才整轮退避重试（最多 max_attempts_429 轮）。其它可轮换错误（401/403）
     // 轮换 key 后仍失败则直接返回，重试无意义。
-    let endpoint = endpoint_for_request_model(app, model);
     let primary_key = api_key_for_request_model(app, model);
     let adapter = adapter_for(models::model_adapter(model), &endpoint);
     let keys_to_try = adapter.collect_api_keys(&primary_key);

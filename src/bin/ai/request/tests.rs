@@ -1212,6 +1212,11 @@ fn responses_request_body_replays_reasoning_items_before_function_call() {
     assert_eq!(input[0]["encrypted_content"], "ENC");
     assert_eq!(input[1]["type"], "function_call");
     assert_eq!(input[1]["call_id"], "call_1");
+
+    let stats = responses_reasoning_replay_stats(&messages, Some(&items));
+    assert_eq!(stats.tool_call_groups, 1);
+    assert_eq!(stats.replayed_groups, 1);
+    assert_eq!(stats.missing_groups, 0);
 }
 
 #[test]
@@ -1253,6 +1258,11 @@ fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items
     assert_eq!(input.len(), 1);
     assert_eq!(input[0]["type"], "function_call");
     assert_eq!(input[0]["call_id"], "call_1");
+
+    let stats = responses_reasoning_replay_stats(&messages, Some(&empty));
+    assert_eq!(stats.tool_call_groups, 1);
+    assert_eq!(stats.replayed_groups, 0);
+    assert_eq!(stats.missing_groups, 1);
 }
 
 #[test]

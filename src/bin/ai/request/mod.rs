@@ -39,6 +39,8 @@ pub(crate) use error::{
 };
 pub(crate) use protocol::{build_http_body_for_json_messages, extract_response_text};
 #[cfg(test)]
+use protocol::responses_reasoning_replay_stats;
+#[cfg(test)]
 pub(crate) use reasoning::apply_aux_thinking_fields;
 #[allow(unused_imports)]
 pub(crate) use routing::{extract_router_content, strip_json_fence};

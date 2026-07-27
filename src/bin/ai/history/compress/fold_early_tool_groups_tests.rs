@@ -213,8 +213,12 @@ fn folded_read_file_group_keeps_preview_and_original_target_anchor() {
         messages.push(tool_result(&id, "later"));
     }
 
-    let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -569,11 +573,10 @@ fn folded_tool_group_keeps_assistant_checkpoint_and_evidence_targets() {
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
-/// tool-call 轮的 assistant.content 常为空（模型只发 tool_calls、无叙述）。此时
-/// checkpoint 必须回退到 reasoning_content，把「发起这批调用前的思考」留作压缩后
-/// 的决策锚点，而不是塌成固定的 <empty>——否则模型压缩后失忆，从同一轮重启取证。
+/// tool-call 轮的 assistant.content 常为空（模型只发 tool_calls、无叙述）。此时只能
+/// 从结构化 tool_calls 重建活动摘要，不能把隐藏 reasoning 提升为后续模型可见的事实。
 #[test]
-fn folded_tool_group_falls_back_to_reasoning_when_content_empty() {
+fn folded_tool_group_ignores_reasoning_when_content_empty() {
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-evidence-fold-reason-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![msg("system", "s"), msg("user", "分析历史")];
@@ -609,15 +612,71 @@ fn folded_tool_group_falls_back_to_reasoning_when_content_empty() {
         .map(|message| value_to_string(&message.content))
         .expect("folded read group should become evidence note");
 
+    assert!(stub.contains("assistant_checkpoint: no assistant narration was persisted; reconstructed completed tool activity: read_file [file: 0341-history.json; range: lines=1..120]"), "{stub}");
     assert!(
-        stub.contains(
-            "assistant_checkpoint: 已确认该文件是 6393 行的会话历史；下一步只统计 role 分布，不再整文件回读。"
-        ),
+        !stub.contains("已确认该文件是 6393 行的会话历史"),
+        "hidden reasoning must not be promoted into compressed context: {stub}"
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn folded_tool_group_reconstructs_checkpoint_when_tool_call_has_no_text() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-evidence-fold-reconstructed-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut messages = vec![msg("system", "s"), msg("user", "分析历史")];
+    let mut call = assistant_call_args(
+        "read-history",
+        "read_file",
+        r#"{"file_path":"0341-history.json","offset":1,"limit":120}"#,
+    );
+    call.content = Value::Null;
+    call.reasoning_content = None;
+    call.tool_calls
+        .as_mut()
+        .expect("assistant call should contain tool calls")
+        .push(ToolCall {
+            id: "opaque-call".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "opaque_tool".to_string(),
+                arguments: r#"{"payload":"DO_NOT_SURFACE_RAW_ARGUMENTS"}"#.to_string(),
+            },
+        });
+    messages.push(call);
+    messages.push(tool_result(
+        "read-history",
+        "     1\t[\n     2\t{\"role\":\"user\"}\n... [truncated: showing lines 1-120 of 6393]",
+    ));
+    messages.push(tool_result("opaque-call", "opaque result"));
+    for i in 0..4 {
+        let id = format!("later-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "later"));
+    }
+
+    let (folded, folded_groups) =
+        fold_early_tool_groups(&messages, 4, Some(overflow_dir.as_path()), &FxHashSet::default());
+    assert_eq!(folded_groups, 1);
+    let stub = folded
+        .iter()
+        .find(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && value_to_string(&message.content).contains(COMPRESSED_TOOL_EVIDENCE_MARKER)
+        })
+        .map(|message| value_to_string(&message.content))
+        .expect("folded read group should become evidence note");
+
+    assert!(
+        stub.contains("assistant_checkpoint: no assistant narration was persisted; reconstructed completed tool activity: read_file [file: 0341-history.json; range: lines=1..120]; opaque_tool"),
         "{stub}"
     );
     assert!(
-        !stub.contains("<empty; no persisted decision before these tool calls>"),
-        "reasoning fallback must replace the empty-checkpoint placeholder: {stub}"
+        !stub.contains("DO_NOT_SURFACE_RAW_ARGUMENTS"),
+        "generic tool arguments must not be copied into the checkpoint: {stub}"
     );
 
     let _ = std::fs::remove_dir_all(overflow_dir);

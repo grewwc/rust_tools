@@ -481,7 +481,7 @@ fn history_file_parsing_sqlite_round_trips_structured_messages() {
 }
 
 #[test]
-fn history_file_loading_sanitizes_persisted_assistant_reasoning_and_tool_call_narration() {
+fn history_file_loading_keeps_visible_narration_without_promoting_reasoning() {
     for ext in ["txt", "sqlite"] {
         let path =
             std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
@@ -516,6 +516,27 @@ fn history_file_loading_sanitizes_persisted_assistant_reasoning_and_tool_call_na
             },
             Message {
                 role: "assistant".to_string(),
+                content: Value::Null,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_2".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: Some("需要查看 Cargo.toml 里的 crate 配置。".to_string()),
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("[package]\nname = \"rust_tools\"".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_2".to_string()),
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".to_string(),
                 content: Value::String("done".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
@@ -526,16 +547,36 @@ fn history_file_loading_sanitizes_persisted_assistant_reasoning_and_tool_call_na
         append_history_messages(&path, &messages).unwrap();
 
         let loaded = build_message_arr(10, &path).unwrap();
-        assert_eq!(loaded.len(), 4);
-        assert_eq!(loaded[1].content, Value::String(String::new()));
+        assert_eq!(loaded.len(), 6);
+        assert_eq!(
+            loaded[1].content,
+            Value::String("我先看一下这个文件。".to_string())
+        );
         assert_eq!(loaded[1].reasoning_content, None);
         assert_eq!(
             loaded[1].tool_calls.as_ref().map(|calls| calls.len()),
             Some(1)
         );
         assert_eq!(loaded[2].content, Value::String("fn main() {}".to_string()));
-        assert_eq!(loaded[3].content, Value::String("done".to_string()));
+        assert_eq!(loaded[3].content, Value::String(String::new()));
         assert_eq!(loaded[3].reasoning_content, None);
+        assert!(
+            loaded.iter().all(|message| message
+                .content
+                .as_str()
+                .is_none_or(|content| !content.contains("需要查看 Cargo.toml 里的 crate 配置。"))),
+            "hidden reasoning must not become visible history content"
+        );
+        assert_eq!(
+            loaded[3].tool_calls.as_ref().map(|calls| calls.len()),
+            Some(1)
+        );
+        assert_eq!(
+            loaded[4].content,
+            Value::String("[package]\nname = \"rust_tools\"".to_string())
+        );
+        assert_eq!(loaded[5].content, Value::String("done".to_string()));
+        assert_eq!(loaded[5].reasoning_content, None);
 
         let _ = std::fs::remove_file(path);
     }
