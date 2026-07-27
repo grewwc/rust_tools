@@ -77,6 +77,7 @@ pub mod turn_runtime;
 use agent_routing::*;
 use background_dispatch::{SubagentStatusLine, dispatch_background_batch};
 pub use commands::try_handle_interactive_command;
+pub use commands::try_handle_local_command;
 pub use mcp_init::*;
 use mcp_lifecycle::*;
 pub use model::*;
@@ -847,6 +848,22 @@ async fn run_loop(
                 question = ctx.question;
                 attachments_text = ctx.attachments_text;
                 history_count = ctx.history_count;
+            }
+        }
+
+        // ── 纯本地命令快速路径 ──
+        // /usage、/help、/model 等不依赖 skill/agent manifest 的命令先行分发。
+        // 命中且未注入 forced_question（无需继续 LLM 流程）时直接跳过昂贵的
+        // manifest 扫描——把 `a /usage` 等只读命令从 ~1s 降到 ~0.1s。
+        // /goal 等会注入 forced_question 继续对话，仍需加载 manifest。
+        if try_handle_local_command(app, mcp_client, &question)? {
+            if let Some(rest) = app.forced_question.take() {
+                question = rest;
+            } else {
+                if handle_post_command(app, &mut should_quit) {
+                    return Ok(());
+                }
+                continue;
             }
         }
 

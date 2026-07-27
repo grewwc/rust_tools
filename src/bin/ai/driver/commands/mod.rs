@@ -33,12 +33,15 @@ pub use share::try_handle_share_command;
 pub use skills::try_handle_skills_command;
 pub use usage::try_handle_usage_command;
 
-pub fn try_handle_interactive_command(
+/// 处理不依赖 skill/agent manifest 的本地斜杠命令。
+///
+/// 这些命令（/usage、/help、/model、/goal 等）可在 manifest 加载之前先行分发，
+/// 命中且未注入 `forced_question` 时即可跳过昂贵的 manifest 扫描，显著降低
+/// one-shot 模式下纯只读命令（如 `a /usage`）的延迟。
+pub fn try_handle_local_command(
     app: &mut App,
     mcp_client: &SharedMcpClient,
     input: &str,
-    agent_manifests: &mut Arc<Vec<AgentManifest>>,
-    skill_manifests: &mut Arc<Vec<SkillManifest>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if try_handle_help_command(input) {
         return Ok(true);
@@ -67,12 +70,6 @@ pub fn try_handle_interactive_command(
     if try_handle_checkpoint_command(app, input)? {
         return Ok(true);
     }
-    if try_handle_agent_command(app, input, agent_manifests)? {
-        return Ok(true);
-    }
-    if try_handle_skills_command(app, input, skill_manifests)? {
-        return Ok(true);
-    }
     if try_handle_feishu_auth_command(mcp_client, input)? {
         return Ok(true);
     }
@@ -80,6 +77,25 @@ pub fn try_handle_interactive_command(
         return Ok(true);
     }
     if try_handle_export_command(app, input)? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub fn try_handle_interactive_command(
+    app: &mut App,
+    mcp_client: &SharedMcpClient,
+    input: &str,
+    agent_manifests: &mut Arc<Vec<AgentManifest>>,
+    skill_manifests: &mut Arc<Vec<SkillManifest>>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if try_handle_local_command(app, mcp_client, input)? {
+        return Ok(true);
+    }
+    if try_handle_agent_command(app, input, agent_manifests)? {
+        return Ok(true);
+    }
+    if try_handle_skills_command(app, input, skill_manifests)? {
         return Ok(true);
     }
     Ok(false)
