@@ -1236,3 +1236,25 @@ fn progressive_fold_windows_never_reach_zero() {
         "windows must be strictly decreasing (was {windows:?})"
     );
 }
+
+#[test]
+fn context_compaction_state_is_model_visible_and_idempotent() {
+    let mut messages = vec![
+        msg("system", "system"),
+        msg("user", "finish the investigation"),
+    ];
+
+    upsert_context_compaction_state(&mut messages);
+    upsert_context_compaction_state(&mut messages);
+
+    let notes = messages
+        .iter()
+        .filter(|message| is_context_compaction_state(message))
+        .collect::<Vec<_>>();
+    assert_eq!(notes.len(), 1, "repeated compaction must update one state note");
+
+    let content = value_to_string(&notes[0].content);
+    assert!(content.contains("passed the runtime budget guard"));
+    assert!(content.contains("does not mean the model context is full"));
+    assert!(content.contains("original_file_path"));
+}

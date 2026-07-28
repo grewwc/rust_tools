@@ -43,6 +43,24 @@ pub(super) fn delete_session_state_lock(path: &Path) -> io::Result<()> {
     }
 }
 
+/// 回收 [`SESSION_STATE_LOCKS`] 中某路径的 per-path 锁条目。
+///
+/// 子代理历史文件按 pid / task_id 唯一，若只删磁盘 `.state.lock` 文件而不回收
+/// 进程内 map 条目，长跑主会话派生大量子代理后 map 会无界增长直到进程退出。
+/// 这里在子代理生命周期结束（`delete_subagent_history`）时清理条目；仅当
+/// `Arc::strong_count == 1`（无其他线程正持有该锁的克隆）时移除，避免摘除一把
+/// 正在被 `with_session_state_lock` 使用的锁，从而破坏该路径的互斥语义。
+pub(super) fn remove_session_state_lock_entry(path: &Path) {
+    let mut locks = SESSION_STATE_LOCKS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(existing) = locks.get(path)
+        && Arc::strong_count(existing) == 1
+    {
+        locks.remove(path);
+    }
+}
+
 /// 将会替换整个 live SQLite 文件的 rollback 与常规 canonical writer 串行化。
 /// 进程内 mutex 避免同进程线程间 `flock` 语义差异，文件锁负责跨进程互斥。
 fn with_session_state_lock<T>(

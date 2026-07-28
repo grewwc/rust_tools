@@ -111,10 +111,14 @@ fn publish_text_subagent_history(
 }
 
 /// 同步子代理的 history 仅在任务执行期间存在。任务已停止后清除主文件、SQLite
-/// sidecar 与跨进程 state lock；文本后端复用同一清理入口也不会产生额外副作用。
+/// sidecar、跨进程 state lock 文件与进程内 state-lock map 条目；文本后端复用同一
+/// 清理入口也不会产生额外副作用。
 pub(in crate::ai) fn delete_subagent_history(path: &Path) -> io::Result<()> {
     let history_result = blob::delete_history_artifacts(path);
     let lock_result = sqlite::delete_session_state_lock(path);
+    // 回收进程内 per-path 锁条目，避免子代理路径（按 pid/task_id 唯一）累积后
+    // 令 SESSION_STATE_LOCKS map 无界增长。放在磁盘清理之后、不影响其错误传播。
+    sqlite::remove_session_state_lock_entry(path);
     history_result.and(lock_result)
 }
 

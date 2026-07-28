@@ -966,18 +966,22 @@ fn shrink_messages_to_fit(
         );
     }
 
-    if messages_total_chars(&messages) > max_chars {
-        truncate_unprotected_messages_to_fit(&mut messages, max_chars, protected_tool_call_ids);
-    }
-
     // 裁剪 compressed_tool_evidence 时，正文会零压缩追加到统一历史归档；必须把
-    // 统一回指重新放回请求，否则磁盘上虽有证据，模型却不知道归档路径。
+    // 统一回指重新放回请求，否则磁盘上虽有证据，模型却不知道归档路径。归档 note
+    // 是 internal_note（受 is_system_like_role 保护、不会被下方截断裁掉），因此必须
+    // 在 `truncate_unprotected_messages_to_fit` **之前**注入，才能让最后一次截断把它
+    // 占用的预算从其他可裁消息中腾出，避免返回轻微超 max_chars 的 payload。这与
+    // `shrink_messages_to_fit_with_summary` 先插 summary note 再 truncate 的顺序一致。
     if let Some(dir) = overflow_dir {
         let archive_path = dir.join(OVERFLOW_HISTORY_FILENAME);
         if archive_path.is_file() {
             let archive_note = build_overflow_placeholder(&archive_path.to_string_lossy());
             insert_archive_note_if_missing(&mut messages, archive_note);
         }
+    }
+
+    if messages_total_chars(&messages) > max_chars {
+        truncate_unprotected_messages_to_fit(&mut messages, max_chars, protected_tool_call_ids);
     }
 
     keep_only_recent_reasoning_content(&mut messages);
@@ -1487,6 +1491,40 @@ pub(in crate::ai) fn messages_total_chars_pub(messages: &[Message]) -> usize {
     messages_total_chars(messages)
 }
 
+const CONTEXT_COMPACTION_STATE_PREFIX: &str = "[runtime context state]";
+const CONTEXT_COMPACTION_STATE: &str = "[runtime context state]\n\
+- This request uses a compacted context projection and has passed the runtime budget guard.\n\
+- Folded or truncated tool output is recoverable evidence; it does not mean the model context is full.\n\
+- Prefer the stub's original_file_path/original_range. Read archive_file_path only when the original source is unavailable.\n\
+- Report context exhaustion only when the provider returns an explicit context-length error.\n\
+- Continue from the latest working checkpoint and verify uncertain details from the cited source.";
+
+pub(in crate::ai) fn is_context_compaction_state(message: &Message) -> bool {
+    message.role == ROLE_INTERNAL_NOTE
+        && message
+            .content
+            .as_str()
+            .is_some_and(|content| content.starts_with(CONTEXT_COMPACTION_STATE_PREFIX))
+}
+
+fn upsert_context_compaction_state(messages: &mut Vec<Message>) {
+    messages.retain(|message| !is_context_compaction_state(message));
+    let insert_at = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .map_or(messages.len(), |index| index + 1);
+    messages.insert(
+        insert_at,
+        Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(CONTEXT_COMPACTION_STATE.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    );
+}
+
 /// Mid-turn 渐进式压缩：在 iteration loop 中复用跨 turn 压缩管线的前几档。
 /// 只做"无损/弱损"操作，不动 system / 不删除最近 keep_recent 条工具消息：
 ///   1. dedup_repeated_tool_results — 同 (tool, args) 旧结果折叠为 stub
@@ -1505,6 +1543,9 @@ pub(in crate::ai) fn mid_turn_compress(
         return (messages, before, after_evidence_trim);
     }
     let mut out = messages;
+    // 把压缩状态显式交给模型，避免它把可恢复的 evidence stub 误判为上下文已满。
+    // 在任何裁剪之前插入，后续预算计算会把这条固定开销一并纳入。
+    upsert_context_compaction_state(&mut out);
     // 0. 清理过期 reasoning_content：单 turn 内 LLM 多次返回的 reasoning chain
     //    对后续决策无益，但部分厂商要求历史 reasoning 与 tool_calls 配对。
     //    只保留最后一条 assistant 的 reasoning_content，其余置 None。
