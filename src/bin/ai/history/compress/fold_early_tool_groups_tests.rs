@@ -263,6 +263,7 @@ fn folded_archived_precision_tools_keep_original_invocation_anchors() {
             "execute_command",
             r#"{"command":"git status --short","cwd":"/repo"}"#,
         ),
+        ("list", "list_directory", r#"{"path":"src/bin/ai"}"#),
     ];
     for (id, name, arguments) in cases {
         messages.push(assistant_call_args(id, name, arguments));
@@ -830,6 +831,28 @@ fn current_turn_precision_results_stay_raw_during_mid_turn_compress() {
 }
 
 #[test]
+fn current_turn_task_wait_is_protected_from_path_c_lossy_truncation() {
+    let messages = vec![
+        msg("system", "system prompt"),
+        msg("user", "等待并采用子任务结论"),
+        assistant_call("wait-1", "task_wait"),
+        tool_result("wait-1", &"aggregated conclusion\n".repeat(600)),
+    ];
+
+    let precision_ids = current_turn_precision_tool_call_ids(&messages);
+    let lossless_ids = current_turn_lossless_tool_call_ids(&messages);
+
+    assert!(
+        !precision_ids.contains("wait-1"),
+        "task_wait must not consume the precision inline budget"
+    );
+    assert!(
+        lossless_ids.contains("wait-1"),
+        "Path C must preserve task_wait instead of truncating its conclusion"
+    );
+}
+
+#[test]
 fn leading_compressed_tool_evidence_notes_are_not_immortal_prefix_context() {
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-leading-tool-evidence-{}", uuid::Uuid::new_v4()));
@@ -1251,7 +1274,23 @@ fn context_compaction_state_is_model_visible_and_idempotent() {
         .iter()
         .filter(|message| is_context_compaction_state(message))
         .collect::<Vec<_>>();
-    assert_eq!(notes.len(), 1, "repeated compaction must update one state note");
+    assert_eq!(
+        notes.len(),
+        1,
+        "repeated compaction must update one state note"
+    );
+    let user_index = messages
+        .iter()
+        .position(|message| message.role == "user")
+        .expect("test setup has user message");
+    let note_index = messages
+        .iter()
+        .position(is_context_compaction_state)
+        .expect("compaction state note should be inserted");
+    assert!(
+        note_index > user_index,
+        "compaction state note must stay after the latest user message"
+    );
 
     let content = value_to_string(&notes[0].content);
     assert!(content.contains("passed the runtime budget guard"));

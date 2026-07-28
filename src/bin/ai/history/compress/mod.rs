@@ -881,15 +881,6 @@ fn shrink_messages_to_fit(
         overflow_dir,
         protected_tool_call_ids,
     );
-    enforce_protected_precision_group_budget(
-        &mut messages,
-        KEEP_RECENT_TOOL_GROUPS,
-        max_chars / 2,
-        overflow_dir,
-        protected_tool_call_ids,
-        false,
-    );
-
     // 先无条件外溢体量过大的旧 user/图片消息（保护尾窗除外），与
     // `shrink_messages_to_fit_with_summary` 保持一致。图片在预算里只按名义成本
     // 计费、大 user 原文零压缩搬盘为 stub 后，下面的裁剪循环因
@@ -952,18 +943,6 @@ fn shrink_messages_to_fit(
             continue;
         }
         break;
-    }
-
-    // 当前 turn 的精确工具证据在常规裁剪阶段受保护；若它们本身令请求仍然超限，
-    // 必须先零压缩外溢并留下可回读 file_path，而不是返回超预算 payload，或让后续
-    // 通用截断静默破坏证据。这里也覆盖不经过 LLM Path C 的普通 mid-turn 压缩。
-    if messages_total_chars(&messages) > max_chars {
-        spill_protected_precision_to_fit(
-            &mut messages,
-            max_chars,
-            overflow_dir,
-            protected_tool_call_ids,
-        );
     }
 
     // 裁剪 compressed_tool_evidence 时，正文会零压缩追加到统一历史归档；必须把
@@ -1319,7 +1298,10 @@ fn emergency_cap_messages_to_fit(
 ) -> bool {
     minimize_overflow_stubs_for_hard_budget(messages);
     for message in messages.iter_mut() {
-        if is_system_like_role(&message.role) || message.role == "user" {
+        if is_system_like_role(&message.role)
+            || message.role == "user"
+            || protected_tool_context_message(message, protected_tool_call_ids)
+        {
             continue;
         }
         let content_chars = value_len_chars(&message.content);
@@ -1461,6 +1443,29 @@ fn current_turn_precision_tool_call_ids(messages: &[Message]) -> rustc_hash::FxH
     out
 }
 
+/// 收集当前 turn 内所有禁止有损压缩的工具调用。它比 precision inline 集合更宽：
+/// `task_wait` 等聚合结果不参与 precision 配额，但其正文同样不能被 Path C 截断。
+fn current_turn_lossless_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String> {
+    let mut out = rustc_hash::FxHashSet::default();
+    let Some(current_turn_start) = messages.iter().rposition(|message| message.role == "user")
+    else {
+        return out;
+    };
+    for message in messages.iter().skip(current_turn_start) {
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for tool_call in tool_calls {
+            if !crate::ai::tools::tool_history_policy(&tool_call.function.name)
+                .allows_lossy_compress()
+            {
+                out.insert(tool_call.id.clone());
+            }
+        }
+    }
+    out
+}
+
 fn protected_tool_result_message(
     message: &Message,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
@@ -1582,8 +1587,8 @@ pub(in crate::ai) fn mid_turn_compress(
     (out, before, after)
 }
 
-/// LLM 摘要"有效压缩"的最小净下降量（字符）。低于此值视为 no-op，
-/// `did_summarize` 返回 false，避免调用方误存游标抑制后续重试。
+/// LLM 摘要"有效压缩"的最小净下降量（字符）。低于此值视为低效，
+/// `was_effective` 返回 false；硬预算兜底仍可能返回一个略小的上下文结果。
 /// 取 `summary_max_chars` 同量级：若净下降还不如注入的摘要文本大，
 /// 说明压缩器空转（典型症状："295K 压到 294K 就停了"）。
 const MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS: usize = 4_000;
@@ -1602,9 +1607,9 @@ const PATH_C_PER_MSG_CAP: usize = 8_000;
 ///   - Path C 兜底（per-message 截断）：渐进式折叠后仍超 `hard_target` 时，
 ///     对尾窗内单个超大非 system 消息做 head+tail 截断。这是绝对最后手段。
 /// 头部所有 system / internal_note（agent 指令、工具列表、全局指引）始终原样保留。
-/// 返回 `(messages_after, before, after, did_summarize)`；`did_summarize` 仅在
-/// 净下降 ≥ [`MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS`] 时为 true，避免调用方误存
-/// 游标抑制后续重试。
+/// 返回 `(messages_after, before, after, was_effective)`；`was_effective` 仅在
+/// 净下降 ≥ [`MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS`] 时为 true。false 不代表返回的
+/// messages 未变化；硬预算兜底可能产生低于有效阈值的部分下降。
 pub(in crate::ai) async fn mid_turn_llm_summarize(
     app: &App,
     messages: Vec<Message>,
@@ -1616,6 +1621,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     let overflow_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
         .session_assets_dir(&app.session_id);
     let protected_tool_call_ids = current_turn_precision_tool_call_ids(&messages);
+    let lossless_tool_call_ids = current_turn_lossless_tool_call_ids(&messages);
     // best 追踪迄今为止体积最小的结果；None 表示仍使用原始 messages。
     let mut best: Option<Vec<Message>> = None;
     let mut best_after = before;
@@ -1724,8 +1730,8 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // 只有真正达到 hard_target 才能提前返回。旧逻辑只要净下降超过 4K 就返回，
     // 会跳过下面的硬兜底，让「旧组已省很多、最新一组仍单独超窗」继续发出超限请求。
     if best_after <= hard_target {
-        let did_summarize = before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS;
-        return (best.unwrap_or(messages), before, best_after, did_summarize);
+        let was_effective = before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS;
+        return (best.unwrap_or(messages), before, best_after, was_effective);
     }
 
     // === Path C 兜底：预算感知的结构保留截断 ===
@@ -1734,20 +1740,20 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // 收紧，因此并行工具结果很多时也能收敛。若不可裁的 system/user 本身已超预算，
     // 返回可达到的最小结果，而不是破坏用户任务原文。
     let mut result = best.unwrap_or(messages);
-    // Path C 兜底前先对当前 turn 的 protected precision 结果做零压缩外溢：
+    // Path C 兜底前先对当前 turn 的所有禁止有损压缩结果做零压缩外溢：
     // 原文落盘为可回读 asset 并替换为 stub，避免紧接着的 `emergency_cap_messages_to_fit`
     // 把这些 grounding 证据有损截断到 8K / ~160 字符后原文不可恢复。
     spill_protected_precision_to_fit(
         &mut result,
         hard_target,
         Some(overflow_dir.as_path()),
-        &protected_tool_call_ids,
+        &lossless_tool_call_ids,
     );
     emergency_cap_messages_to_fit(
         &mut result,
         hard_target,
         PATH_C_PER_MSG_CAP,
-        &protected_tool_call_ids,
+        &lossless_tool_call_ids,
     );
     let after = messages_total_chars(&result);
     let savings = before.saturating_sub(after);

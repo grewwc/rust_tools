@@ -51,6 +51,32 @@ impl CompressionReport {
             .push(format!("{}: {before} → {after} chars", label.into()));
     }
 
+    /// `effective` 只表示净节省是否达到摘要有效阈值；false 时硬预算兜底仍可能
+    /// 已经缩小并替换请求上下文，不能误报为 skipped。
+    pub(super) fn record_llm_summary_attempt(
+        &mut self,
+        label: impl Into<String>,
+        before: usize,
+        after: usize,
+        effective: bool,
+    ) {
+        let label = label.into();
+        if effective {
+            self.record(label, before, after);
+        } else if after < before {
+            self.record(
+                format!("{label} partial (below effective-savings threshold)"),
+                before,
+                after,
+            );
+        } else {
+            self.note(format!(
+                "{label} skipped (no reducible context or summary call failed); \
+                 agent may hit context limit"
+            ));
+        }
+    }
+
     pub(super) fn note(&mut self, note: impl Into<String>) {
         self.entries.push(note.into());
     }
@@ -280,6 +306,25 @@ mod tests {
             Some(
                 "mid-turn: 182743 → 182259 chars | \
                  pre-request LLM (limit 180000): 182259 → 89984 chars"
+            )
+        );
+    }
+
+    #[test]
+    fn llm_summary_partial_reduction_is_not_reported_as_skipped() {
+        let mut report = CompressionReport::default();
+        report.record_llm_summary_attempt(
+            "pre-request LLM (limit 180000)",
+            182_259,
+            181_000,
+            false,
+        );
+
+        assert_eq!(
+            report.render().as_deref(),
+            Some(
+                "pre-request LLM (limit 180000) partial \
+                 (below effective-savings threshold): 182259 → 181000 chars"
             )
         );
     }

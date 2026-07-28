@@ -3703,7 +3703,7 @@ async fn run_turn_body(
                 && should_try_llm_summary(&app.session_id, after, mid_turn_hard)
             {
                 let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
-                let (after_msgs, llm_before, llm_after, did_summarize) =
+                let (after_msgs, llm_before, llm_after, was_effective) =
                     crate::ai::history::mid_turn_llm_summarize(
                         app,
                         drained,
@@ -3714,18 +3714,12 @@ async fn run_turn_body(
                     .await;
                 messages = after_msgs;
                 record_llm_summary_attempt_chars(&app.session_id, llm_after);
-                if did_summarize {
-                    compression_report.record(
-                        format!("mid-turn LLM (limit {mid_turn_hard})"),
-                        llm_before,
-                        llm_after,
-                    );
-                } else {
-                    compression_report.note(
-                        "llm summary skipped (no early dialog or call failed); \
-                         agent may hit context limit",
-                    );
-                }
+                compression_report.record_llm_summary_attempt(
+                    format!("mid-turn LLM (limit {mid_turn_hard})"),
+                    llm_before,
+                    llm_after,
+                    was_effective,
+                );
                 compression_report.emit();
             } else {
                 supervisor.pending_compression_report = compression_report;

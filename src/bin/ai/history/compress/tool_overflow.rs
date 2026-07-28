@@ -303,8 +303,10 @@ pub(super) fn enforce_protected_precision_group_budget(
     }
 }
 
-/// Path C 的全局兜底：跨工具组收集所有受保护的高精度结果，并优先外溢最大的
-/// 原文，直到整个请求回到 hard target 或没有可外溢候选。
+/// Path C 的全局兜底：跨工具组收集所有受保护且禁止有损压缩的结果，并优先外溢
+/// 最大的原文，直到整个请求回到 hard target 或没有可外溢候选。候选放宽到
+/// `!allows_lossy_compress()`（而非仅高精度 inline 预算工具），使 `task_wait` 等
+/// 聚合但禁压缩的大结果也走无损外溢+file 指针，避免落到后续有损截断被静默丢真相。
 pub(super) fn spill_protected_precision_to_fit(
     messages: &mut [Message],
     hard_target_chars: usize,
@@ -328,7 +330,7 @@ pub(super) fn spill_protected_precision_to_fit(
             let text = value_to_string(&message.content);
             (!text.trim().is_empty()
                 && !is_preserved_tool_overflow_stub(&text)
-                && tool_history_policy(tool_name).counts_toward_precision_inline_budget())
+                && !tool_history_policy(tool_name).allows_lossy_compress())
             .then(|| (idx, tool_name.clone(), text.chars().count()))
         })
         .collect::<Vec<_>>();
@@ -653,6 +655,38 @@ mod tests {
     }
 
     #[test]
+    fn path_c_spills_aggregated_task_wait_result_losslessly() {
+        // task_wait 禁止有损压缩但不占 inline 预算；Path C 全局兜底必须把它无损外溢
+        // 并留下 file 指针，而不是排除在候选之外、任由后续有损截断丢失聚合真相。
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-global-precision-taskwait-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut protected = FxHashSet::default();
+        protected.insert("wait".to_string());
+        let mut messages = vec![
+            assistant_call("wait", "task_wait"),
+            tool_result("wait", &"aggregated subagent conclusion\n".repeat(600)),
+        ];
+
+        let spilled =
+            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), &protected);
+
+        assert_eq!(spilled, 1, "task_wait 大结果应被 Path C 无损外溢");
+        let stub = value_to_string(&messages[1].content);
+        assert!(
+            is_preserved_tool_overflow_stub(&stub),
+            "外溢后应替换为 overflow stub"
+        );
+        let file_path = stub
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
+            .expect("overflow stub 必须保留可召回的 file_path 指针");
+        assert!(Path::new(file_path.trim()).is_file(), "外溢原文必须落盘");
+        let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
     fn path_c_does_not_expand_short_protected_results_into_stubs() {
         let overflow_dir = std::env::temp_dir().join(format!(
             "ai-global-precision-short-{}",
@@ -899,6 +933,14 @@ pub(super) fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str)
             }
             lines
         }
+        "list_directory" | "tree" => value_string_from_keys(&args, &["path"])
+            .map(|path| {
+                vec![format!(
+                    "- original_path: {}",
+                    truncate_to_chars(&normalize_whitespace(&path), 240)
+                )]
+            })
+            .unwrap_or_default(),
         "execute_command" | "run_command" | "shell" | "bash" => {
             let mut lines = Vec::with_capacity(2);
             if let Some(command) = value_string_from_keys(&args, &["command"]) {

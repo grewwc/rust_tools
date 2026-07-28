@@ -16,9 +16,9 @@ use super::tool_overflow::{
     preserve_noncompressible_tool_result_for_fold,
 };
 use super::{
-    COMPRESSED_TOOL_EVIDENCE_MARKER, is_archive_note_message,
-    is_compressed_tool_evidence_note, is_context_checkpoint_marker, is_summary_message,
-    keep_recent_user_turns_when_trimming, normalize_whitespace, value_to_string,
+    COMPRESSED_TOOL_EVIDENCE_MARKER, is_archive_note_message, is_compressed_tool_evidence_note,
+    is_context_checkpoint_marker, is_summary_message, keep_recent_user_turns_when_trimming,
+    normalize_whitespace, value_to_string,
 };
 
 pub(super) fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
@@ -359,14 +359,19 @@ fn tool_result_recall_text(
     overflow_dir: Option<&Path>,
 ) -> Option<String> {
     let tool_name = tool_call.function.name.as_str();
-    if !is_non_compressible_tool(tool_name) || result_text.trim().is_empty() {
-        return Some(tool_result_recall_one_liner(result_text));
-    }
-
     let already_archived = result_text
         .lines()
         .map(str::trim)
         .any(|line| line.starts_with("- file_path:") || line.starts_with("file_path:"));
+    if !is_non_compressible_tool(tool_name) || result_text.trim().is_empty() {
+        let recall = tool_result_recall_one_liner(result_text);
+        return Some(if already_archived {
+            append_original_recall_lines(recall, tool_call, result_text)
+        } else {
+            recall
+        });
+    }
+
     let original_recall_lines =
         build_tool_overflow_recall_lines(&tool_call.function.name, &tool_call.function.arguments);
     let preserved = preserve_noncompressible_tool_result_for_fold(
@@ -375,9 +380,22 @@ fn tool_result_recall_text(
         result_text,
         &original_recall_lines,
     )?;
+    let file_path_line = preserved_file_path_line(&preserved);
     let archive_path_line = preserved_archive_file_path_line(&preserved);
 
-    if tool_name == "execute_command" && !already_archived {
+    if tool_name == "execute_command" {
+        let full_output_hint = file_path_line
+            .clone()
+            .or_else(|| archive_path_line.clone())
+            .unwrap_or_else(|| "完整日志已归档到会话 asset。".to_string());
+        if already_archived {
+            return Some(append_original_recall_lines(
+                full_output_hint,
+                tool_call,
+                &preserved,
+            ));
+        }
+
         let recall = command_result_recall(result_text);
         let recall_lower = recall.to_ascii_lowercase();
         let has_error_signal = recall_lower.contains("error")
@@ -386,21 +404,18 @@ fn tool_result_recall_text(
             || recall_lower.contains("blocked")
             || recall_lower.contains("aborting")
             || recall_lower.contains("could not compile");
-        let archive_hint = archive_path_line
-            .clone()
-            .unwrap_or_else(|| "完整日志已归档到会话 asset。".to_string());
         if has_error_signal {
             return Some(append_original_recall_lines(
                 format!(
-                    "{}\n  {}\n  - 命令输出包含错误信号；仅当当前诊断确实需要完整日志时，再读取 `archive_file_path`。",
-                    recall, archive_hint
+                    "{}\n  {}\n  - 命令输出包含错误信号；仅当当前诊断确实需要完整日志时，再读取 `file_path`。",
+                    recall, full_output_hint
                 ),
                 tool_call,
                 &preserved,
             ));
         }
         return Some(append_original_recall_lines(
-            format!("{}\n  {}", recall, archive_hint),
+            format!("{}\n  {}", recall, full_output_hint),
             tool_call,
             &preserved,
         ));
@@ -455,9 +470,7 @@ fn collect_original_recall_lines(tool_call: &ToolCall, preserved: &str) -> Vec<S
     out
 }
 
-/// 折叠 tool group 时，不要把内部 overflow 归档路径伪装成普通 `file_path` 主线索；
-/// 对模型来说它只是二级审计产物，真正的继续调查目标应是 `original_*` 锚点。
-fn preserved_archive_file_path_line(preserved: &str) -> Option<String> {
+fn preserved_file_path_value(preserved: &str) -> Option<String> {
     preserved
         .lines()
         .map(str::trim)
@@ -467,12 +480,17 @@ fn preserved_archive_file_path_line(preserved: &str) -> Option<String> {
                 .map(str::trim)
         })
         .filter(|path| !path.is_empty())
-        .map(|path| {
-            format!(
-                "- archive_file_path: {}",
-                truncate_to_chars(&normalize_whitespace(path), 240)
-            )
-        })
+        .map(|path| truncate_to_chars(&normalize_whitespace(path), 240))
+}
+
+fn preserved_file_path_line(preserved: &str) -> Option<String> {
+    preserved_file_path_value(preserved).map(|path| format!("- file_path: {path}"))
+}
+
+/// 折叠 read_file 结果时，不要把内部 overflow 归档路径伪装成普通 `file_path`
+/// 主线索；真正的继续调查目标应是 `original_file_path` / `original_range`。
+fn preserved_archive_file_path_line(preserved: &str) -> Option<String> {
+    preserved_file_path_value(preserved).map(|path| format!("- archive_file_path: {path}"))
 }
 
 /// 一级 overflow stub 已经带有 head/tail 预览；二级 tool-group 折叠时继续保留几条
@@ -514,7 +532,7 @@ fn precision_grounding_tool_recall(
     archive_path_line: Option<String>,
 ) -> String {
     let mut lines = Vec::new();
-    if let Some(preview) = preserved_preview_recall(preserved, 4) {
+    if let Some(preview) = preserved_preview_recall(preserved, 12) {
         lines.push(preview);
     }
     lines.extend(collect_original_recall_lines(tool_call, preserved));
