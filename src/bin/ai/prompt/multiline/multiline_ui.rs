@@ -101,18 +101,23 @@ fn build_inline_terminal(height: u16) -> io::Result<MultilineTerminal> {
 ///
 /// `Terminal::clear()` 会恢复调用前的 cursor；而新的 `Viewport::Inline` 会以创建时
 /// backend cursor 所在行作为顶边。若直接重建，输入框内的 cursor 行会被当作新顶边，
-/// 导致原 viewport 顶部的内容留在 scrollback。优先根据 cursor 相对 viewport 的偏移
-/// 计算顶行；缺少上一帧的相对偏移时则回退到上一帧记录的顶行。
+/// 导致原 viewport 顶部的内容留在 scrollback。高度变更发生在两帧之间时，以上一帧
+/// 记录的 viewport 顶行为准；部分终端在输入后读取到的 live cursor 会暂时漂到左上角。
+/// 尚未完成首帧绘制时才根据 cursor 相对 viewport 的偏移回退计算顶行。
 fn clear_and_reanchor_inline_viewport<B: Backend>(
     terminal: &mut Terminal<B>,
     last_viewport_top_row: Option<u16>,
     last_cursor_offset_row: Option<u16>,
 ) -> Result<(), B::Error> {
-    let cursor_position = terminal.backend_mut().get_cursor_position()?;
-    let viewport_top_row = last_cursor_offset_row
-        .map(|offset| cursor_position.y.saturating_sub(offset))
-        .or(last_viewport_top_row)
-        .unwrap_or(cursor_position.y);
+    let viewport_top_row = match last_viewport_top_row {
+        Some(top_row) => top_row,
+        None => {
+            let cursor_position = terminal.backend_mut().get_cursor_position()?;
+            last_cursor_offset_row
+                .map(|offset| cursor_position.y.saturating_sub(offset))
+                .unwrap_or(cursor_position.y)
+        }
+    };
 
     terminal.clear()?;
     terminal
@@ -453,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_and_reanchoring_inline_viewport_uses_previous_cursor_offset() {
+    fn clearing_and_reanchoring_inline_viewport_uses_previous_viewport_top() {
         let backend = TestBackend::new(8, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -465,7 +470,7 @@ mod tests {
 
         assert_eq!(
             terminal.backend_mut().get_cursor_position().unwrap(),
-            Position::new(0, 2)
+            Position::new(0, 1)
         );
     }
 
