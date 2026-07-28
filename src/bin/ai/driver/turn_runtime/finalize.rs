@@ -1,5 +1,5 @@
 use crate::ai::{
-    driver::{print::format_empty_state, reflection},
+    driver::print::format_empty_state,
     history::{
         Message, SessionTitle, SessionTitleOrigin, compact_session_history_at_boundary_with_app,
         compact_session_history_with_app, generate_session_summary, is_low_quality_session_title,
@@ -147,109 +147,6 @@ fn subagent_result_payload_for_parent(
     (!output.trim().is_empty()).then_some(output)
 }
 
-async fn maybe_append_post_turn_reflection(
-    app: &mut App,
-    next_model: &str,
-    question: &str,
-    final_assistant_text: &str,
-    turn_messages: &mut Vec<Message>,
-    had_tool_error: bool,
-) {
-    let integrated_reflect = crate::commonw::configw::get_all_config()
-        .get_opt("ai.reflection.integrated")
-        .unwrap_or_else(|| "true".to_string())
-        .trim()
-        .ne("false");
-    if !integrated_reflect {
-        reflection::maybe_append_self_reflection(
-            app,
-            next_model,
-            question,
-            final_assistant_text,
-            turn_messages,
-            had_tool_error,
-        )
-        .await;
-    }
-}
-
-async fn write_post_turn_project_knowledge(
-    app: &mut App,
-    next_model: &str,
-    question: &str,
-    final_assistant_text: &str,
-    turn_messages: &mut Vec<Message>,
-) {
-    reflection::maybe_write_back_project_knowledge(
-        app,
-        next_model,
-        question,
-        final_assistant_text,
-        turn_messages,
-    )
-    .await;
-}
-
-fn maybe_spawn_critic_revise_background(app: &App, question: &str, final_assistant_text: &str) {
-    let integrated = crate::commonw::configw::get_all_config()
-        .get_opt("ai.critic_revise.integrated")
-        .unwrap_or_else(|| "true".to_string())
-        .trim()
-        .ne("false");
-    if integrated {
-        return;
-    }
-
-    let path = app.session_history_file.clone();
-    let model_bg = crate::commonw::configw::get_all_config()
-        .get_opt("ai.critic_revise.model")
-        .unwrap_or_else(|| "qwen3.5-flash".to_string());
-    let q_bg = question.to_string();
-    let a_bg = final_assistant_text.to_string();
-
-    // 登记 daemon：critic/revise 是典型的后台反思类。
-    use aios_kernel::primitives::DaemonKind;
-    let kernel = app.os.clone();
-    let (handle, cancel_token) = {
-        let mut os = match kernel.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let parent_pid = os.current_process_id();
-        os.daemon_register(
-            "critic_revise_background".to_string(),
-            DaemonKind::Reflection,
-            parent_pid,
-        )
-    };
-    // 必须在释放 kernel 锁之后再调用：alloc_interrupt_futex 内部会再次锁同一把
-    // Arc<Mutex<Kernel>>（GLOBAL_OS 与 app.os 共享），在持锁时调用会自死锁。
-    let interrupt_futex =
-        crate::ai::driver::signal::alloc_interrupt_futex("critic_revise_interrupt");
-
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = crate::ai::driver::signal::wait_for_interrupt_sources(
-                Some(cancel_token.clone()),
-                interrupt_futex,
-               None,
-            ) => {}
-            _ = super::super::reflection::run_critic_revise_background(path, model_bg, q_bg, a_bg) => {}
-        }
-        let mut os = match kernel.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        os.daemon_exit(handle, None);
-        // 必须先释放 kernel 锁再 destroy：destroy_interrupt_futex 内部会再次锁同一把
-        // Arc<Mutex<Kernel>>（GLOBAL_OS 与 app.os 共享），在持锁时调用会自死锁。
-        drop(os);
-        if let Some(addr) = interrupt_futex {
-            crate::ai::driver::signal::destroy_interrupt_futex(addr);
-        }
-    });
-}
-
 pub(in crate::ai::driver::turn_runtime) fn should_generate_session_title_in_background(
     one_shot_mode: bool,
     should_quit: bool,
@@ -334,7 +231,7 @@ fn should_write_fallback_session_title(
 
 pub(super) async fn finalize_turn(
     app: &mut App,
-    next_model: &str,
+    _next_model: &str,
     response_source_model: &str,
     question: &str,
     final_assistant_text: &str,
@@ -343,7 +240,7 @@ pub(super) async fn finalize_turn(
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     should_quit: bool,
-    had_tool_error: bool,
+    _had_tool_error: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
     if let Some(subagent_output_for_parent) =
         subagent_result_payload_for_parent(final_assistant_text, turn_messages)
@@ -360,23 +257,6 @@ pub(super) async fn finalize_turn(
             final_assistant_recorded,
             turn_messages,
         );
-        maybe_append_post_turn_reflection(
-            app,
-            next_model,
-            question,
-            final_assistant_text,
-            turn_messages,
-            had_tool_error,
-        )
-        .await;
-        write_post_turn_project_knowledge(
-            app,
-            next_model,
-            question,
-            final_assistant_text,
-            turn_messages,
-        )
-        .await;
         persist_pending_turn_messages_for_model(
             app,
             response_source_model,
@@ -414,7 +294,6 @@ pub(super) async fn finalize_turn(
         )
         .await;
         // println!();
-        maybe_spawn_critic_revise_background(app, question, final_assistant_text);
 
         let mut first_observer_emitted = false;
         let mut poisoned: Vec<String> = Vec::new();

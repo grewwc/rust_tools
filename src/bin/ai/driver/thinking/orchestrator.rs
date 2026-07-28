@@ -6,7 +6,6 @@ use crate::ai::driver::observer::{
 
 use crate::ai::driver::thinking::{
     engine::ThoughtTree,
-    generalization::ExperienceGeneralizer,
     goals::GoalManager,
     verification::{VerificationOutcome, VerificationStep, VerificationWorkflow},
 };
@@ -29,7 +28,6 @@ pub struct ThinkingDecision {
 pub struct ThinkingOrchestrator {
     pub thought_tree: Option<ThoughtTree>,
     pub verification: Option<VerificationWorkflow>,
-    pub generalizer: ExperienceGeneralizer,
     pub goal_manager: GoalManager,
     pub active_modes: SkipSet<ThinkingMode>,
     pub enabled: bool,
@@ -58,7 +56,6 @@ impl ThinkingOrchestrator {
         Self {
             thought_tree: None,
             verification: None,
-            generalizer: ExperienceGeneralizer::new(),
             goal_manager,
             active_modes: SkipSet::default(),
             enabled: true,
@@ -81,7 +78,7 @@ impl ThinkingOrchestrator {
         // substring-based pseudo-understanding. Instead:
         //
         //   * If the LLM explicitly requested a mode via a <meta:begin_*>
-        //     self-note in a previous turn, that mode is already established
+        //     meta-tag in a previous turn, that mode is already established
         //     and its state (thought_tree / verification / goal_manager) is
         //     present.
         //   * on_prepare activates whatever state currently exists; we do not
@@ -147,52 +144,7 @@ impl ThinkingOrchestrator {
             }
         }
 
-        // 注意：这里**不再**把工具失败自动 ingest 成经验。
-        //
-        // 之前的做法是把失败结果截 200 字、拼成 `Avoid: <tool> led to failure - <原始报错>`
-        // 喂给 generalizer。但这类输入本质是"实例特定"的噪音——退出码、具体用例名、路径、
-        // 行号都只属于那一次运行，对未来零复用价值；而 synthesize_principle 又只做字符串
-        // 拼接、不做抽象，于是这些噪音会原样流进"泛化原则"并在后续 turn 注入，反而误导模型。
-        //
-        // 真正可泛化的经验只应来自模型**有意识总结**的 self-note（process_self_note 里以
-        // `Do:`/`Avoid:` 开头的结构化记录）。工具失败的运行时信号交给 TreeOfThoughts 打分
-        // 与 VerificationLoop 记录即可，不进入长期记忆。
-    }
-
-    pub fn process_self_note(&mut self, note: &str) {
-        // Explicit structured prefix — not substring guessing. The LLM is
-        // expected to literally start its note with "Do:" or "Avoid:" to
-        // categorize it.
-        let trimmed = note.trim_start().to_lowercase();
-        let category = if trimmed.starts_with("do:") {
-            "self_note_do"
-        } else if trimmed.starts_with("avoid:") {
-            "self_note_avoid"
-        } else {
-            "self_note"
-        };
-        self.generalizer.ingest_experience(
-            category,
-            note,
-            &["agent".to_string(), "policy".to_string()],
-            Some("thinking_orchestrator"),
-        );
-    }
-
-    pub fn try_generalize(&mut self) -> Option<GeneralizeResult> {
-        let principle = self.generalizer.try_generalize()?;
-        self.generalizer.persist_principle(&principle);
-        // 取出本次参与泛化的原始经验，供调用方异步发起 LLM 二次提炼。
-        let source_notes = self.generalizer.take_last_generalization_inputs();
-        Some(GeneralizeResult {
-            principle_text: principle.principle.clone(),
-            principle_id: principle.id.clone(),
-            source_notes,
-        })
-    }
-
-    pub fn try_cross_domain_link(&mut self) -> Option<(String, String)> {
-        self.generalizer.try_cross_domain_link()
+        // 工具结果只更新当前 turn 的 thinking 状态，不写入长期经验或自动泛化。
     }
 
     pub fn complete_verification_cycle(&mut self, outcome: VerificationOutcome) {
@@ -263,8 +215,7 @@ impl ThinkingOrchestrator {
                  <meta:begin_tree_of_thoughts>Q</meta:begin_tree_of_thoughts> \
                  | <meta:begin_verification>H</meta:begin_verification> \
                  | <meta:begin_goal>G</meta:begin_goal> \
-                 | <meta:reset_thinking/> \
-                 | <meta:self_note>Do:/Avoid: ...</meta:self_note>."
+                 | <meta:reset_thinking/>."
                     .to_string(),
             );
         }
@@ -419,85 +370,11 @@ impl ThinkingOrchestrator {
     }
 }
 
-pub struct GeneralizeResult {
-    pub principle_text: String,
-    /// 本次泛化产出/强化的 principle id（用于 LLM 二次提炼时按 id 覆写）。
-    pub principle_id: String,
-    /// 本次参与泛化的原始经验 `(category, note)`，作为 LLM 二次提炼的上下文。
-    pub source_notes: Vec<(String, String)>,
-}
-
-/// 读取配置并在后台 spawn LLM 二次提炼任务。
-///
-/// 仅在存在 tokio 运行时（即真实 agent 运行环境）且配置开启时生效；单测等无运行时的
-/// 同步上下文会直接跳过，不影响同步拼接的 principle。
-fn maybe_spawn_llm_refine(result: &GeneralizeResult) {
-    use crate::ai::config_schema::AiConfig;
-
-    if result.source_notes.is_empty() {
-        return;
-    }
-    let cfg = crate::commonw::configw::get_all_config();
-    // 默认开启；显式设为 false 时关闭。
-    let enabled = cfg
-        .get_opt(AiConfig::GENERALIZE_LLM_REFINE_ENABLE)
-        .map(|v| !v.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
-    if !enabled {
-        return;
-    }
-    // 只有在 tokio 运行时内才能 spawn；无运行时（单测）直接跳过。
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let model = cfg
-        .get_opt(AiConfig::GENERALIZE_LLM_REFINE_MODEL)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "qwen3.5-flash".to_string());
-    let timeout_ms = cfg
-        .get_opt(AiConfig::GENERALIZE_LLM_REFINE_TIMEOUT_MS)
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(8000);
-
-    let principle_id = result.principle_id.clone();
-    let source_notes = result.source_notes.clone();
-    handle.spawn(async move {
-        crate::ai::driver::thinking::generalization::ExperienceGeneralizer::run_llm_refine_background(
-            principle_id,
-            source_notes,
-            model,
-            timeout_ms,
-        )
-        .await;
-    });
-}
-
 #[derive(Debug, Clone)]
 pub struct ThinkingOutcome {
     pub tree_summary: Option<String>,
     pub verification_summary: Option<String>,
     pub goal_status: Option<String>,
-}
-
-fn extract_all_self_notes_from_text(text: &str) -> Vec<String> {
-    let mut notes = Vec::new();
-    let open = "<meta:self_note>";
-    let close = "</meta:self_note>";
-    let mut search_from = 0;
-    while let Some(start) = text[search_from..].find(open) {
-        let abs_start = search_from + start;
-        let content_start = abs_start + open.len();
-        if let Some(end) = text[content_start..].find(close) {
-            let content = text[content_start..content_start + end].trim();
-            if !content.is_empty() {
-                notes.push(content.to_string());
-            }
-            search_from = content_start + end + close.len();
-        } else {
-            break;
-        }
-    }
-    notes
 }
 
 fn extract_tag(text: &str, tag: &str) -> Option<String> {
@@ -700,41 +577,6 @@ impl TurnObserver for ThinkingOrchestrator {
             self.stagnation_turns = 0;
         }
 
-        // 自我学习（吸收 self-note → 泛化 → 展示 [Thinking] 行）只应发生在"确实做了
-        // 事"的 turn 上：本轮调用过工具，或当前有激活的思考模式（目标/验证/思维树）。
-        // 纯常识 / 概念问答既不调用工具也没有激活模式，不应触发自我学习——否则会把此前
-        // 编码 turn 积累的经验泛化后，原样打印在一个毫不相关的简单问题之后。
-        let is_work_turn = ctx.had_tool_calls || !self.active_modes.is_empty();
-        if !is_work_turn {
-            self.active_modes.clear();
-            self.current_tree_node_id = None;
-            return ObserverOutput { display_lines };
-        }
-
-        // Extract ALL self-notes (LLM may emit multiple in one reply).
-        for note in extract_all_self_notes_from_text(&ctx.final_text) {
-            self.process_self_note(&note);
-        }
-
-        let generalized = self.try_generalize();
-        if let Some(result) = &generalized {
-            // 不向用户暴露原始拼接的 principle 文本——它是内部学习产物，直接展示会
-            // 产生"奇怪的自我总结"。principle 已持久化到 MemoryStore，后续通过
-            // auto-recall / evolution 系统参与行为。此处只给一条简短确认。
-            display_lines.push(format!(
-                "[Thinking] Self-learning: synthesized a principle from {} experiences.",
-                result.source_notes.len()
-            ));
-            // 同步拼接出的 principle 缺乏真正抽象。若开启 LLM 二次提炼，则在后台用 LLM 把
-            // 参与本次泛化的原始经验提炼成更高层、可复用的原则，并按同 id 覆写持久化。
-            // 后台失败时安静降级，已落库的同步 principle 仍有效。
-            maybe_spawn_llm_refine(result);
-        }
-
-        if generalized.is_some() && self.try_cross_domain_link().is_some() {
-            display_lines.push("[Thinking] Cross-domain link discovered".to_string());
-        }
-
         let outcome = self.get_outcome();
         if outcome.tree_summary.is_some() || outcome.verification_summary.is_some() {
             display_lines.push("[Thinking] Turn outcome:".to_string());
@@ -773,7 +615,6 @@ impl TurnObserver for ThinkingOrchestrator {
             self.verification = None;
             self.active_modes.clear();
             self.current_tree_node_id = None;
-            self.generalizer = ExperienceGeneralizer::new();
             self.goal_manager =
                 GoalManager::new().with_persistence_dir_opt(default_goal_persistence_dir());
         }
@@ -794,42 +635,6 @@ impl TurnObserver for ThinkingOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::test_support::ENV_LOCK;
-    use std::path::PathBuf;
-    use std::sync::MutexGuard;
-
-    struct ScopedMemoryFile {
-        path: PathBuf,
-        _guard: MutexGuard<'static, ()>,
-    }
-
-    impl ScopedMemoryFile {
-        fn new(prefix: &str) -> Self {
-            let guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-            let path = std::env::temp_dir().join(format!(
-                "{}_{}_{}.jsonl",
-                prefix,
-                std::process::id(),
-                uuid::Uuid::new_v4().simple()
-            ));
-            unsafe {
-                std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
-            }
-            Self {
-                path,
-                _guard: guard,
-            }
-        }
-    }
-
-    impl Drop for ScopedMemoryFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-            unsafe {
-                std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
-            }
-        }
-    }
 
     #[test]
     fn explicit_meta_tag_activates_verification() {
@@ -898,18 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn process_self_note_feeds_generalizer() {
-        let mut orch = ThinkingOrchestrator::new();
-        orch.process_self_note("Do: always validate inputs in async handlers");
-        orch.process_self_note("Do: check for None before unwrap in async code");
-        orch.process_self_note("Do: verify async results before use");
-        orch.process_self_note("Avoid: unwrap on async results without checking");
-        orch.process_self_note("Avoid: skip validation in concurrent code");
-        let result = orch.try_generalize();
-        assert!(result.is_some() || orch.generalizer.experience_buffer.len() >= 3);
-    }
-
-    #[test]
     fn on_finalize_returns_output_no_io() {
         let mut orch = ThinkingOrchestrator::new();
         let output = orch.on_finalize(&FinalizeContext {
@@ -917,101 +710,7 @@ mod tests {
             final_text: "some response".to_string(),
             had_tool_calls: false,
         });
-        let _ = output.display_lines;
-    }
-
-    #[test]
-    fn on_finalize_skips_self_learning_on_no_work_turn() {
-        let mut orch = ThinkingOrchestrator::new();
-        // 预置足以触发泛化的结构化自我经验（模拟此前编码 turn 的积累）。
-        orch.process_self_note("Avoid: apply_patch failed with empty hunk line");
-        orch.process_self_note("Avoid: apply_patch failed with context mismatch");
-        orch.process_self_note("Avoid: apply_patch failed when hunk not located");
-        orch.process_self_note("Avoid: apply_patch failed on stale line numbers");
-        // 一个纯常识问答 turn：没有工具调用，也没有激活任何思考模式。
-        let output = orch.on_finalize(&FinalizeContext {
-            question: "rust 是什么？".to_string(),
-            final_text: "Rust 是一门系统编程语言。".to_string(),
-            had_tool_calls: false,
-        });
-        assert!(
-            output.display_lines.is_empty(),
-            "no-work turn must not emit any [Thinking] line, got: {:?}",
-            output.display_lines
-        );
-    }
-
-    #[test]
-    fn on_finalize_runs_self_learning_when_tools_were_called() {
-        let _memory_file = ScopedMemoryFile::new("rt_orch_finalize_work");
-        let mut orch = ThinkingOrchestrator::new();
-        orch.generalizer.experience_buffer.clear();
-        orch.generalizer.inject_principles_for_test(Vec::new());
-        orch.process_self_note("Do: always validate inputs in async handlers");
-        orch.process_self_note("Do: check for None before unwrap in async code");
-        orch.process_self_note("Do: verify async results before use");
-        orch.process_self_note("Avoid: unwrap on async results without checking");
-        let output = orch.on_finalize(&FinalizeContext {
-            question: "fix the async handler".to_string(),
-            final_text: "<meta:self_note>Do: write a regression test first</meta:self_note>"
-                .to_string(),
-            had_tool_calls: true,
-        });
-        let retained_experience = !orch.generalizer.experience_buffer.is_empty();
-        let generalized = output
-            .display_lines
-            .iter()
-            .any(|line| line.starts_with("[Thinking] Self-learning:"));
-        // 工作 turn 不会被提前 return 跳过：final_text 中的 self-note 要么留在 buffer，
-        // 要么被本轮 generalization 正常消费并产出 [Thinking] Self-learning 行。
-        assert!(
-            retained_experience || generalized,
-            "self-learning turn should either retain buffered experience or generalize it; lines={:?}",
-            output.display_lines,
-        );
-    }
-
-    #[test]
-    fn on_finalize_does_not_emit_cross_domain_link_without_new_generalization() {
-        let mut orch = ThinkingOrchestrator::new();
-        let ts = chrono::Local::now().to_rfc3339();
-        orch.generalizer.inject_principles_for_test(vec![
-            crate::ai::driver::thinking::generalization::GeneralizedPrinciple {
-                id: "p1".to_string(),
-                principle: "Always validate inputs before processing in API handlers".to_string(),
-                source_experiences: vec![],
-                domain: "api_design".to_string(),
-                abstraction_level: 1,
-                confidence: 0.7,
-                created_at: ts.clone(),
-                last_reinforced: ts.clone(),
-                reinforcement_count: 1,
-                cross_domain_links: vec![],
-            },
-            crate::ai::driver::thinking::generalization::GeneralizedPrinciple {
-                id: "p2".to_string(),
-                principle: "Always validate inputs before processing in async handlers".to_string(),
-                source_experiences: vec![],
-                domain: "async_patterns".to_string(),
-                abstraction_level: 1,
-                confidence: 0.7,
-                created_at: ts.clone(),
-                last_reinforced: ts,
-                reinforcement_count: 1,
-                cross_domain_links: vec![],
-            },
-        ]);
-        let output = orch.on_finalize(&FinalizeContext {
-            question: "hello".to_string(),
-            final_text: "hello".to_string(),
-            had_tool_calls: false,
-        });
-        assert!(
-            !output
-                .display_lines
-                .iter()
-                .any(|line| line.contains("Cross-domain link discovered"))
-        );
+        assert!(output.display_lines.is_empty());
     }
 
     #[test]

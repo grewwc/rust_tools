@@ -67,53 +67,12 @@ impl AiConfig {
     pub const MEMORY_ARCHIVES_KEEP_LAST: &str = "ai.memory.archives.keep_last";
     pub const MEMORY_ARCHIVES_MAX_BYTES: &str = "ai.memory.archives.max_bytes";
 
-    // ── Knowledge ──────────────────────────────────────────
-    pub const KNOWLEDGE_MIN_SCORE_GUIDELINE: &str = "ai.knowledge.thresholds.min_score_guideline";
-    pub const KNOWLEDGE_MIN_SCORE_KNOWLEDGE: &str = "ai.knowledge.thresholds.min_score_knowledge";
-    pub const KNOWLEDGE_GUIDELINES_MAX_CHARS: &str =
-        "ai.knowledge.maintenance.guidelines_max_chars";
-    pub const KNOWLEDGE_SEARCH_DEFAULT_LIMIT: &str = "ai.knowledge.search.default_limit";
-
     // ── Embedding (remote provider) ────────────────────────
     pub const EMBEDDING_ENABLE: &str = "ai.embedding.enable";
     pub const EMBEDDING_ENDPOINT: &str = "ai.embedding.endpoint";
     pub const EMBEDDING_API_KEY: &str = "ai.embedding.api_key";
     pub const EMBEDDING_MODEL: &str = "ai.embedding.model";
     pub const EMBEDDING_TIMEOUT_MS: &str = "ai.embedding.timeout_ms";
-
-    // ── Reflection ─────────────────────────────────────────
-    pub const REFLECTION_ENABLE: &str = "ai.reflection.enable";
-    pub const REFLECTION_INTEGRATED: &str = "ai.reflection.integrated";
-    pub const REFLECTION_TIMEOUT_MS: &str = "ai.reflection.timeout_ms";
-    pub const REFLECTION_MODEL_GATE_ENABLE: &str = "ai.reflection.model_gate.enable";
-    pub const REFLECTION_MODEL_GATE_TIMEOUT_MS: &str = "ai.reflection.model_gate.timeout_ms";
-    pub const REFLECTION_FILTER_ENABLE: &str = "ai.reflection.filter.enable";
-    pub const REFLECTION_FILTER_MIN_QUESTION_CHARS: &str =
-        "ai.reflection.filter.min_question_chars";
-    pub const REFLECTION_FILTER_MIN_ANSWER_CHARS: &str = "ai.reflection.filter.min_answer_chars";
-    pub const REFLECTION_FILTER_REQUIRE_TOOL_OR_LONG: &str =
-        "ai.reflection.filter.require_tool_or_long";
-
-    // ── Critic & Revise ────────────────────────────────────
-    pub const CRITIC_REVISE_ENABLE: &str = "ai.critic_revise.enable";
-    pub const CRITIC_REVISE_INTEGRATED: &str = "ai.critic_revise.integrated";
-    pub const CRITIC_REVISE_TIMEOUT_MS: &str = "ai.critic_revise.timeout_ms";
-    pub const CRITIC_REVISE_ONLY_FOR_CODE: &str = "ai.critic_revise.only_for_code";
-    pub const CRITIC_REVISE_MODEL: &str = "ai.critic_revise.model";
-    pub const CRITIC_REVISE_FILTER_MIN_QUESTION_CHARS: &str =
-        "ai.critic_revise.filter.min_question_chars";
-    pub const CRITIC_REVISE_FILTER_MIN_ANSWER_CHARS: &str =
-        "ai.critic_revise.filter.min_answer_chars";
-
-    // ── Experience Generalization (LLM 二次提炼) ────────────
-    pub const GENERALIZE_LLM_REFINE_ENABLE: &str = "ai.generalize.llm_refine.enable";
-    pub const GENERALIZE_LLM_REFINE_MODEL: &str = "ai.generalize.llm_refine.model";
-    pub const GENERALIZE_LLM_REFINE_TIMEOUT_MS: &str = "ai.generalize.llm_refine.timeout_ms";
-
-    // ── Project Writeback ──────────────────────────────────
-    pub const PROJECT_WRITEBACK_ENABLE: &str = "ai.project_writeback.enable";
-    pub const PROJECT_WRITEBACK_MODEL: &str = "ai.project_writeback.model";
-    pub const PROJECT_WRITEBACK_TIMEOUT_MS: &str = "ai.project_writeback.timeout_ms";
 
     // ── Sandbox ────────────────────────────────────────────
     /// Comma-separated extra program names to block in `execute_command`

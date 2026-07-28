@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 
 use super::types::Category;
 
-/// 环境本地路径属于一次性实现细节，不应作为可跨 session 自动召回的长期知识。
+/// 环境本地路径属于一次性实现细节，不应保存为长期知识。
 /// 这里不再靠零散 substring 黑名单，而是：
 /// 1. 从 note 中抽取疑似文件系统路径；
 /// 2. 判断它是否是 home-relative / absolute / windows absolute 路径。

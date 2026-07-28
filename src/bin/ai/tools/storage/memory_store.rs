@@ -9,19 +9,19 @@ use rustc_hash::{FxHashMap, FxHashSet};
 ///    - 存储项目知识、决策记录、用户偏好等事实性知识
 ///    - 类别: `user_memory`, `project_info`, `architecture`, `decision_log`
 ///
-/// 2. **Memory (记忆)** - Agent 内部自动学习
+/// 2. **Memory (记忆)** - 显式保存的长期规则和会话期内部记录
 ///    - 通过 `memory.rs` 服务层管理
 ///    - 存储安全规则、编码规范、自我反思等行为指导
 ///    - 类别: `safety_rules`, `coding_guideline`, `self_note`, `common_sense`
 ///
 /// ## 类别区分
-/// - **Guideline 类别** (用于 `build_persistent_guidelines`):
+/// - **Guidance 类别**:
 ///   `safety_rules`, `user_preference`, `preference`, `coding_guideline`,
 ///   `best_practice`, `common_sense`, `self_note`
 ///
-/// - **Knowledge 类别** (用于 `build_auto_recalled_knowledge`):
+/// - **Knowledge 类别**:
 ///   `user_memory`, `project_info`, `architecture`, `decision_log`
-///   以及其他非 guideline 类别
+///   以及其他非 guidance 类别
 ///
 /// ## 搜索机制
 /// - BM25 关键词搜索 + 向量语义搜索 (通过 RAG store)
@@ -476,7 +476,7 @@ impl MemoryStore {
                     // 旧版迁移曾将原始 JSONL 留为
                     // `agent_memory.legacy-migrate-<timestamp>.jsonl.bak`。它不符合
                     // 当前 rotation 的 `<base>.{timestamp}` 命名；仅在 -ns 等显式
-                    // 要求查归档时纳入，避免普通自动召回读取过期迁移快照。
+                    // 要求查归档时纳入，避免普通当前文件检索读取过期迁移快照。
                     let is_legacy_migration_backup = include_archives
                         && file_name.starts_with(&legacy_migration_prefix)
                         && file_name.ends_with(".jsonl.bak");

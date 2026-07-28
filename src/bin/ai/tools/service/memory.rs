@@ -264,13 +264,13 @@ fn maybe_downgrade_long_term_save(
 ///     best_practice/common_sense）
 ///   - `project_memory`：项目级事实，writeback 路径会主动 upsert，不应被时间淘汰
 ///
-/// 注意 self_note 是会话期反思，已从 `guideline_categories()` 中移除，
-/// 不再被全局召回，也不在此处豁免 GC（自然落入正常时间淘汰）。
+/// 注意 self_note 是会话期反思，不属于长期资产白名单，
+/// 也不在此处豁免 GC（自然落入正常时间淘汰）。
 pub(crate) fn is_permanent_memory(entry: &AgentMemoryEntry) -> bool {
     if entry.priority.unwrap_or(100) == 255 {
         return true;
     }
-    if crate::ai::knowledge::retrieval::recall::is_guideline_category(&entry.category) {
+    if crate::ai::knowledge::types::Category::from_str(&entry.category).is_guideline() {
         return true;
     }
     matches!(entry.category.as_str(), "project_memory")
@@ -1573,7 +1573,7 @@ mod tests {
             category: "project_memory".to_string(),
             note: "AeolusLLM Copilot 二次分析问题排查：项目自动写回记录。".to_string(),
             tags: vec!["aeolusllm".to_string(), "copilot".to_string()],
-            source: Some("auto_project_writeback:aeolus".to_string()),
+            source: Some("project_writeback:aeolus".to_string()),
             priority: Some(180),
             owner_pid: None,
             owner_pgid: None,

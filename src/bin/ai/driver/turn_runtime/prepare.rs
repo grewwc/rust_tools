@@ -4,54 +4,16 @@ use std::path::Path;
 
 use crate::ai::mcp::SharedMcpClient;
 use crate::ai::{
-    driver::{print::print_ocr_summary, reflection, skill_runtime},
+    driver::{print::print_ocr_summary, skill_runtime},
     history::{
-        build_context_history, compact_session_history_with_app, compress::llm_prune, Message,
-        ROLE_INTERNAL_NOTE,
+        Message, ROLE_INTERNAL_NOTE, build_context_history, compact_session_history_with_app,
+        compress::llm_prune,
     },
     request,
     types::App,
 };
 
 use super::types::TurnPreparation;
-
-const PERSISTENT_GUIDELINES_MAX_CHARS: usize = 4096;
-const AUTO_RECALL_MAX_CHARS: usize = 4096;
-
-fn inject_recalled_knowledge(skill_turn: &mut skill_runtime::SkillTurnGuard, question: &str) {
-    if skill_turn.skip_recall_by_skill() {
-        return;
-    }
-
-    let bundle = reflection::build_recall_bundle(
-        question,
-        PERSISTENT_GUIDELINES_MAX_CHARS,
-        AUTO_RECALL_MAX_CHARS,
-    );
-    if let Some(guidelines) = bundle.guidelines.as_deref() {
-        skill_turn.push_section(skill_runtime::ContextKind::Behavior, guidelines);
-    }
-    if let Some(recalled) = bundle.recalled.as_ref() {
-        let project = recalled.project_hint.as_deref().unwrap_or("none");
-        let categories = if recalled.categories.is_empty() {
-            "none".to_string()
-        } else {
-            recalled.categories.join(",")
-        };
-        let label = format!(
-            "Auto-Recalled Knowledge; entries={}; relevance={:.3}..{:.3}; project={project}; project_matches={}; categories={categories}",
-            recalled.entry_count,
-            recalled.weakest_relevance_score,
-            recalled.strongest_relevance_score,
-            recalled.project_match_count,
-        );
-        skill_turn.push_labeled_section(
-            skill_runtime::ContextKind::Fact,
-            &label,
-            &recalled.content,
-        );
-    }
-}
 
 fn current_request_tool_names(app: &App) -> rust_tools::commonw::FastSet<String> {
     app.agent_context
@@ -145,13 +107,6 @@ impl QuestionShape {
             || self.artifact_token_count > 0
     }
 
-    pub(crate) fn has_reflection_shape(self) -> bool {
-        self.has_code_or_repo_artifact()
-            || self.nonempty_line_count >= 2
-            || self.has_list_marker
-            || self.char_count >= 80
-    }
-
     #[cfg(test)]
     pub(crate) fn is_complex_task(self) -> bool {
         if self.char_count < 12 {
@@ -242,10 +197,6 @@ fn is_probable_file_extension(extension: &str) -> bool {
         && extension.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
-fn should_inject_integrated_reflection(question: &str) -> bool {
-    QuestionShape::analyze(question).has_reflection_shape()
-}
-
 fn sync_prepare_observers_enabled() -> bool {
     crate::commonw::configw::get_all_config()
         .get_opt("ai.prepare.sync_observers")
@@ -324,35 +275,7 @@ pub(super) async fn prepare_turn(
         );
     }
 
-    inject_recalled_knowledge(&mut skill_turn, question);
-
     let mut messages = Vec::with_capacity(history.len() + 2);
-
-    {
-        let integrated = crate::commonw::configw::get_all_config()
-            .get_opt("ai.critic_revise.integrated")
-            .unwrap_or_else(|| "true".to_string())
-            .trim()
-            .ne("false");
-        let reflect_integrated = crate::commonw::configw::get_all_config()
-            .get_opt("ai.reflection.integrated")
-            .unwrap_or_else(|| "true".to_string())
-            .trim()
-            .ne("false");
-        let intent_needs_reflection = should_inject_integrated_reflection(question);
-        if (integrated || reflect_integrated) && intent_needs_reflection {
-            let mut sys = String::new();
-            if integrated {
-                sys.push_str("Before replying, internally perform a brief CRITIC→REVISE pass to ensure correctness, missing steps, and clear structure. Do not output the critic. Output only the final improved answer.\n");
-            }
-            if reflect_integrated {
-                sys.push_str("At the very end of your message, include a compact self experience note enclosed within <meta:self_note> and </meta:self_note>. The note should be 2-6 short bullets grouped under 'Do:' and 'Avoid:'. Do not mention these tags in the visible content.\n");
-            }
-            if !sys.is_empty() {
-                skill_turn.push_section(skill_runtime::ContextKind::Behavior, &sys);
-            }
-        }
-    }
 
     // 提前收集可用工具名，供 observer 做上下文预算/委派决策。
     let available_tool_names: Vec<String> = app
@@ -607,8 +530,8 @@ fn detect_complex_task(question: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_complex_task, filter_suggested_tool_calls_for_tool_names,
-        persisted_user_turn_message, should_inject_integrated_reflection, QuestionShape,
+        QuestionShape, detect_complex_task, filter_suggested_tool_calls_for_tool_names,
+        persisted_user_turn_message,
     };
     use crate::ai::driver::observer::SuggestedToolCall;
     use crate::ai::history::Message;
@@ -688,28 +611,6 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_name, "read_file");
-    }
-
-    #[test]
-    fn simple_common_sense_turn_skips_integrated_reflection_even_if_misclassified() {
-        assert!(!should_inject_integrated_reflection("为什么天是蓝的？"));
-    }
-
-    #[test]
-    fn simple_technical_concept_turn_skips_integrated_reflection_even_if_misclassified() {
-        assert!(!should_inject_integrated_reflection("Rust 的函数是什么？"));
-    }
-
-    #[test]
-    fn coding_task_keeps_integrated_reflection() {
-        assert!(should_inject_integrated_reflection(
-            "帮我处理 `build check` 的 failure"
-        ));
-    }
-
-    #[test]
-    fn plain_action_words_do_not_trigger_reflection_without_structure() {
-        assert!(!should_inject_integrated_reflection("帮我处理这个问题"));
     }
 
     #[test]

@@ -52,21 +52,19 @@ impl Category {
             "tool_cache" => Self::ToolCache,
             "project_writeback" => Self::ProjectWriteback,
             "memo" => Self::Memo,
-            // 历史/兼容：reflection/writeback 模块写入的 category 字符串是 "project_memory"，
-            // 与 ProjectWriteback 在语义上同源，统一映射避免落到 Other 而被 auto-recall 漏掉。
+            // 历史/兼容：reflection/writeback 模块写入的 category 字符串是
+            // "project_memory"，与 ProjectWriteback 在语义上同源。
             "project_memory" => Self::ProjectWriteback,
             _ => Self::Other,
         }
     }
 
-    /// Whether this is a guideline category (used for persistent guidelines)
+    /// Whether this is a durable guidance category.
     ///
     /// 注意：`SelfNote` 故意不在此白名单中。
     /// self_note 是 LLM 会话内自我反思（reflection background / hidden_meta 等
-    /// 路径写入），带有 `source="session:{id}"` 的会话血缘。如果把它当作全局
-    /// guideline 召回，旧 session 的反思会污染新 session 的 system prompt，
-    /// 表现为模型在新窗口"自言自语"接续旧话题。条目仍持久化到 jsonl，可通过
-    /// `knowledge_search` 等工具按需查询，但不再自动注入。
+    /// 路径写入），带有会话血缘。条目仍持久化到 jsonl，可通过
+    /// `knowledge_search` 等工具按需查询。
     pub fn is_guideline(&self) -> bool {
         matches!(
             self,
@@ -77,11 +75,6 @@ impl Category {
                 | Self::BestPractice
                 | Self::CommonSense
         )
-    }
-
-    /// Whether this is a knowledge category (used for auto-recall)
-    pub fn is_knowledge(&self) -> bool {
-        !self.is_guideline() && !matches!(self, Self::ToolCache | Self::Memo)
     }
 
     /// Default priority for this category
@@ -180,33 +173,5 @@ impl KnowledgeType {
     /// Whether this type needs validation
     pub fn needs_validation(&self) -> bool {
         matches!(self, Self::FileBased | Self::TimeSensitive)
-    }
-}
-
-/// Guidelines group for ranking in persistent guidelines
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuidelineGroup {
-    Safety = 0,
-    Preferences = 1,
-    SelfNotes = 2,
-    Other = 3,
-}
-
-impl GuidelineGroup {
-    pub fn from_category(cat: &Category) -> Self {
-        match cat {
-            Category::SafetyRules => Self::Safety,
-            Category::UserPreference
-            | Category::Preference
-            | Category::CodingGuideline
-            | Category::BestPractice
-            | Category::CommonSense => Self::Preferences,
-            Category::SelfNote => Self::SelfNotes,
-            _ => Self::Other,
-        }
-    }
-
-    pub fn as_u8(self) -> u8 {
-        self as u8
     }
 }

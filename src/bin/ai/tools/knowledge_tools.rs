@@ -51,7 +51,7 @@
 ///
 use serde_json::Value;
 
-use crate::ai::knowledge::retrieval::recall::is_guideline_category;
+use crate::ai::knowledge::types::Category;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::service::memory::{
@@ -158,18 +158,17 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
     result.push_str(&format!("  Priority: {}\n", entry.priority.unwrap_or(100)));
     if downgraded && entry.category == "self_note" {
         result.push_str(&format!(
-            "  Note: requested category '{}' was downgraded to 'self_note' because the content is too generic for durable principle recall.\n",
+            "  Note: requested category '{}' was downgraded to 'self_note' because the content is too generic for durable knowledge.\n",
             requested_category
         ));
         result.push_str(
-              "  Saved as short-term self_note; it will not enter persistent guideline recall until the note is more specific and actionable.\n",
+            "  Saved as short-term self_note; retrieve it explicitly with knowledge_search if needed.\n",
         );
-    } else if is_guideline_category(&entry.category) {
-        result.push_str("  This principle will participate in persistent guideline recall.\n");
+    } else if Category::from_str(&entry.category).is_guideline() {
+        result.push_str("  Saved as durable guidance; retrieve it explicitly with knowledge_search when needed.\n");
     } else {
-        result.push_str(
-            "  The agent will automatically check this knowledge in future conversations.\n",
-        );
+        result
+            .push_str("  Saved as searchable knowledge; it will not be injected automatically.\n");
     }
 
     if let Some(warning) = rag_warning {
@@ -224,7 +223,7 @@ fn sync_entry_to_rag(entry: &AgentMemoryEntry) -> Option<String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_save",
-        description: "Save user-directed content to the global knowledge base with optional category and tags. Use guideline categories like `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` for durable principles/constraints so they participate in persistent recall.",
+        description: "Save user-directed content to the global knowledge base with optional category and tags. Use guideline categories like `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` for durable principles/constraints that can be retrieved explicitly.",
         parameters: params_knowledge_save,
         execute: execute_knowledge_save,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -1070,7 +1069,7 @@ mod tests {
             "category": "common_sense"
         }))
         .unwrap();
-        assert!(save_msg.contains("persistent guideline recall"));
+        assert!(save_msg.contains("Saved as durable guidance"));
 
         let entries = read_entries(&path);
         assert_eq!(entries.len(), 1);

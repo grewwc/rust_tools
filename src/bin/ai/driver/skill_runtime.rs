@@ -1000,7 +1000,7 @@ fn build_system_prompt(
     if has_tool(available_tools, "knowledge_save") {
         let mut lines = vec![
             "If the user asks to remember or states a durable preference/constraint, call `knowledge_save`.".to_string(),
-            "When saving a durable principle, preference, safety rule, or coding rule, choose a guideline category such as `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` so it participates in persistent recall.".to_string(),
+            "When saving a durable principle, preference, safety rule, or coding rule, choose a guideline category such as `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules`.".to_string(),
             "Use `user_memory` / `project_info` / `architecture` / `decision_log` for factual knowledge.".to_string(),
             "Save each distinct durable fact at most once per turn. Do not save temporary work notes, raw tool output, or speculative conclusions as global knowledge.".to_string(),
         ];
@@ -1155,7 +1155,7 @@ fn build_system_prompt(
         );
         if !search_tools.is_empty() {
             lines.push(format!(
-                "Before answering from memory, search with {}.",
+                "Only when the user explicitly asks about remembered or saved knowledge, search with {}.",
                 format_tool_names(&search_tools)
             ));
             lines.push(
@@ -2176,7 +2176,7 @@ mod tests {
         assert!(prompt.contains("`common_sense`, `coding_guideline`"));
         assert!(prompt.contains("Save each distinct durable fact at most once per turn"));
         assert!(prompt.contains("Knowledge retrieval:"));
-        assert!(prompt.contains("search with `knowledge_search`"));
+        assert!(prompt.contains("Only when the user explicitly asks"));
         assert!(prompt.contains("Reuse a successful knowledge search"));
         assert!(prompt.contains("Use `knowledge_list` when asked what is remembered"));
         assert!(!prompt.contains("call `memory_save`"));

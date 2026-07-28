@@ -4,11 +4,6 @@
 ///
 /// ```text
 /// ┌─────────────────────────────────────────────────────────────┐
-/// │                        DRIVER LAYER                          │
-/// │  driver/reflection.rs → knowledge::retrieval::recall        │
-/// └──────────────────────────┬──────────────────────────────────┘
-///                            │
-/// ┌──────────────────────────▼──────────────────────────────────┐
 /// │                      TOOL LAYER                              │
 /// │  knowledge_tools.rs → knowledge::retrieval                  │
 /// │  rag_tools.rs       → knowledge::retrieval                  │
@@ -16,13 +11,13 @@
 ///                            │
 /// ┌──────────────────────────▼──────────────────────────────────┐
 /// │                       KNOWLEDGE MODULE                       │
-/// │  ├── config.rs         — All thresholds, weights, TTLs      │
+/// │  ├── config.rs         — Search weights and defaults        │
 /// │  ├── types.rs          — Category enum, KnowledgeType       │
 /// │  ├── entry.rs          — KnowledgeEntry (unified)           │
 /// │  ├── indexing/         — BM25, embeddings, similarity       │
 /// │  ├── storage/          — JSONL store, vector store          │
 /// │  ├── sync/             — ID generation, store coordination  │
-/// │  └── retrieval/        — keyword, semantic, hybrid, recall  │
+/// │  └── retrieval/        — keyword, semantic, hybrid          │
 /// └─────────────────────────────────────────────────────────────┘
 /// ```
 ///
@@ -37,7 +32,7 @@
 /// ## Knowledge vs Memory
 ///
 /// - **Knowledge**: User-facing, explicitly saved facts (project info, decisions, preferences)
-/// - **Memory**: Agent-internal, auto-learned behavior rules (safety, guidelines, self-notes)
+/// - **Memory**: Saved behavior rules and session-scoped internal notes
 ///
 /// Both share the same storage backend but are distinguished by category.
 pub mod config;
