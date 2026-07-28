@@ -105,6 +105,10 @@ async fn send_with_budgeted_hedged_backup(
     let hedge = Duration::from_secs(backup_after_secs);
     let mut in_flight = FuturesUnordered::new();
 
+    // 记录最近一次可重试 HTTP 响应 / 网络失败：单个失败不应短路其它在途请求，
+    // 只有不可重试响应到达，或所有请求均结束时才返回。
+    let mut last_retryable_response: Option<Response> = None;
+    let mut last_err: Option<RequestError> = None;
     for round in 1..=max_sends {
         token_budget::wait_for_request_budget(
             app,
@@ -117,31 +121,47 @@ async fn send_with_budgeted_hedged_backup(
         )
         .await?;
         in_flight.push(build_request().send());
+        if round == max_sends {
+            break;
+        }
         tokio::select! {
             result = in_flight.next() => {
-                return result
-                    .expect("in_flight 非空")
-                    .map_err(RequestError::network);
+                match result.expect("in_flight 非空") {
+                    Ok(resp) if should_retry_status(resp.status()) => {
+                        last_retryable_response = Some(resp);
+                    }
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => last_err = Some(RequestError::network(e)),
+                }
             }
             _ = tokio::time::sleep(hedge) => {
-                if round < max_sends {
-                    super::emit_request_diagnostic(format_args!(
-                        "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup request",
-                        backup_after_secs
-                    ));
-                }
+                super::emit_request_diagnostic(format_args!(
+                    "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup request",
+                    backup_after_secs
+                ));
             }
         }
     }
 
-    match in_flight.next().await {
-        Some(result) => result.map_err(RequestError::network),
-        None => Err(RequestError {
-            kind: RequestErrorKind::Network,
-            message: "hedged request set unexpectedly empty".to_string(),
-            retry_after: None,
-        }),
+    // 所有 hedged 请求已发起；继续等待在途请求。可重试 HTTP 状态（429/5xx 等）
+    // 和网络错误都只作为候选失败保留，避免它们抢赢仍可能成功的请求。
+    while let Some(result) = in_flight.next().await {
+        match result {
+            Ok(resp) if should_retry_status(resp.status()) => {
+                last_retryable_response = Some(resp);
+            }
+            Ok(resp) => return Ok(resp),
+            Err(e) => last_err = Some(RequestError::network(e)),
+        }
     }
+    if let Some(resp) = last_retryable_response {
+        return Ok(resp);
+    }
+    Err(last_err.unwrap_or_else(|| RequestError {
+        kind: RequestErrorKind::Network,
+        message: "hedged request set unexpectedly empty".to_string(),
+        retry_after: None,
+    }))
 }
 
 /// Try a single API key for `do_request_messages`, with retry logic for

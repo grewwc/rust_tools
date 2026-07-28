@@ -57,7 +57,7 @@ pub(in crate::ai) fn cancel_current_process_reflection_daemons(app: &App) -> usi
 
 pub(in crate::ai) fn clear_session_local_runtime_state(app: &mut App) {
     cancel_current_process_reflection_daemons(app);
-    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
+    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools(&app.session_id);
     if let Some(ctx) = app.agent_context.as_mut() {
         ctx.tools.clear();
     }

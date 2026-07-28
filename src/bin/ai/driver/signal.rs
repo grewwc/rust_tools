@@ -119,7 +119,11 @@ fn try_cancel_foreground_subagent() -> bool {
     };
     cancel_flag.store(true, Ordering::Relaxed);
     crate::ai::tools::registry::common::request_tool_cancel();
-    signal_request_interrupt();
+    // 定向取消只翻目标子 agent 的私有 cancel flag 并唤醒其等待者；不设置进程级
+    // REQUEST_INTERRUPT_FLAG/futex，避免并发后台 turn 读到全局 flag 被误判为
+    // "本 turn 被取消"。目标子 agent 的等待路径通过 wait_for_interrupt_sources
+    // 的 cancel_flag 形参在被唤醒后重新检查其私有 cancel_stream。
+    notify_request_interrupt_waiters();
     true
 }
 
@@ -233,6 +237,18 @@ pub(in crate::ai) fn signal_request_interrupt() {
     let _ = os.futex_store(addr, 1);
 }
 
+/// 只唤醒等待 `REQUEST_INTERRUPT_NOTIFY` 的协程，**不**设置进程级中断 flag/futex。
+///
+/// 用于定向取消单个前台子 agent：取消条件由目标子 agent 私有的 `cancel_stream`
+/// 承载（其等待路径以 `Some(&cancel_stream)` 调用 `wait_for_interrupt_sources`，
+/// 被唤醒后重新检查该 flag 即可返回）。若改用 `signal_request_interrupt` 会写入
+/// 进程级 flag/futex，并发后台 turn 的 `should_abort_retry_wait` /
+/// `stream_interrupt_requested` 会读到该全局 flag 被误判为"本 turn 被取消"，
+/// 且任一请求进入时调用的 `clear_request_interrupt` 还可能让目标子 agent 错过取消。
+pub(in crate::ai) fn notify_request_interrupt_waiters() {
+    REQUEST_INTERRUPT_NOTIFY.notify_waiters();
+}
+
 pub(in crate::ai) fn clear_request_interrupt() {
     REQUEST_INTERRUPT_FLAG.store(false, Ordering::Release);
     let Some(addr) = request_interrupt_futex() else {
@@ -315,9 +331,17 @@ pub(in crate::ai) fn interrupt_sources_ready(local_interrupt_futex: Option<Futex
 pub(in crate::ai) async fn wait_for_interrupt_sources(
     cancel_token: Option<DaemonCancelToken>,
     local_interrupt_futex: Option<FutexAddr>,
+    cancel_flag: Option<&AtomicBool>,
 ) {
     loop {
         if interrupt_sources_ready(local_interrupt_futex) {
+            return;
+        }
+        // 定向取消（前台子 agent）只翻其私有 cancel_stream，不设全局 flag；
+        // 这里在被 Notify 唤醒后重新检查该 flag，使其等待能及时返回。
+        if let Some(flag) = cancel_flag
+            && flag.load(Ordering::Relaxed)
+        {
             return;
         }
         if let Some(token) = cancel_token.as_ref()

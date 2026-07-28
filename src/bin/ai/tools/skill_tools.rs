@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
 
-use rust_tools::commonw::FastSet;
+use rust_tools::commonw::{FastMap, FastSet};
 use serde_json::Value;
 
 use crate::ai::config_schema::AiConfig;
@@ -16,8 +16,8 @@ use crate::ai::tools::common::ToolSpec;
 /// 工具是纯函数 `fn(&Value) -> Result<String, String>`，拿不到 `App`，因此沿用
 /// `enable_tools.rs` 的"工具写全局状态 → driver 读取"桥接模式。这里只需要一个
 /// 极小的待激活槽位，故用单个 `RwLock<Option<String>>` 而非完整状态结构。
-static PENDING_SKILL_ACTIVATION: LazyLock<RwLock<Option<String>>> =
-    LazyLock::new(|| RwLock::new(None));
+pub(crate) static PENDING_SKILL_ACTIVATION: LazyLock<RwLock<FastMap<(String, usize), String>>> =
+    LazyLock::new(|| RwLock::new(FastMap::default()));
 
 /// `request_user_input` 在本轮内记录的明确交互边界。按 `(session_id, turn_id)` 隔离，
 /// 避免并行 subagent 或其他 session 的请求污染当前 foreground turn。
@@ -32,7 +32,7 @@ fn current_turn_identity() -> (String, usize) {
 
 fn set_pending_skill_activation(name: String) {
     if let Ok(mut slot) = PENDING_SKILL_ACTIVATION.write() {
-        *slot = Some(name);
+        slot.insert(current_turn_identity(), name);
     }
 }
 
@@ -41,7 +41,7 @@ pub(crate) fn take_pending_skill_activation() -> Option<String> {
     PENDING_SKILL_ACTIVATION
         .write()
         .ok()
-        .and_then(|mut slot| slot.take())
+        .and_then(|mut slot| slot.remove(&current_turn_identity()))
 }
 
 pub(crate) fn clear_pending_user_input_request() {
@@ -546,8 +546,8 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
 mod tests {
     use super::{
         build_skill_file_content, clear_pending_user_input_request, execute_activate_skill,
-        execute_load_skill, execute_request_user_input, render_loaded_skill,
-        render_skill_catalog, take_pending_skill_activation, take_pending_user_input_request,
+        execute_load_skill, execute_request_user_input, render_loaded_skill, render_skill_catalog,
+        take_pending_skill_activation, take_pending_user_input_request,
     };
     use crate::ai::driver::runtime_ctx::TURN_IDENTITY;
     use crate::ai::skills::SkillManifest;
@@ -624,15 +624,19 @@ mod tests {
             .expect("list_skills should be registered");
         assert!(list_skills.description.contains("Use this proactively"));
         assert!(list_skills.description.contains("technical keywords"));
-        assert!(list_skills
-            .description
-            .contains("routine source-code, repository, file, or terminal investigation"));
+        assert!(
+            list_skills
+                .description
+                .contains("routine source-code, repository, file, or terminal investigation")
+        );
 
         let activate_skill = crate::ai::tools::registry::common::get_tool_spec("activate_skill")
             .expect("activate_skill should be registered");
-        assert!(activate_skill
-            .description
-            .contains("proactively use `list_skills`"));
+        assert!(
+            activate_skill
+                .description
+                .contains("proactively use `list_skills`")
+        );
         assert!(activate_skill.description.contains("technical keywords"));
     }
 

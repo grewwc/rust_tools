@@ -1,37 +1,72 @@
 use std::sync::{LazyLock, RwLock};
 
-use rust_tools::cw::{SkipMap, SkipSet};
+use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipSet;
 use serde_json::Value;
 
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 use crate::ai::types::ToolDefinition;
 
-/// 把以前 6 把独立的 Mutex（pending_enable/pending_mcp_enable/active_tool_names/
-/// explicit_enabled_tool_names/explicit_tool_age/available_mcp_tools）合并到单个
-/// `RwLock<EnableState>`：
-///   - 减少锁加解次数与潜在的锁顺序隐患；
-///   - 读多写少的场景（available_tools_not_active 等）允许并发读；
-///   - execute_enable_tools 是 SyncOnly，所有持锁路径都不跨 await，使用
-///     std::sync::RwLock 安全。
+type TurnIdentity = (String, usize);
+type EnableOwner = (String, Option<usize>);
+
+#[derive(Default)]
+struct TurnEnableState {
+    pending_enable: Vec<String>,
+    pending_mcp_enable: Vec<String>,
+    active_tool_names: Vec<String>,
+    available_mcp_tools: Vec<ToolDefinition>,
+}
+
+#[derive(Default)]
+struct ExplicitEnableState {
+    tool_names: Vec<String>,
+    tool_age: FastMap<String, u32>,
+}
+
+/// active/catalog/pending 都是 turn 级状态，避免并发 Agent 覆盖或偷取消费。
+/// 前台显式启用的工具按 session 保留以维持跨 turn 语义；子 Agent 则绑定其
+/// 独立 turn，并在 turn 结束时清理。
 #[derive(Default)]
 struct EnableState {
-    /// 等待激活的内置 tool 名称
-    pending_enable: Vec<String>,
-    /// 等待激活的 MCP tool 名称
-    pending_mcp_enable: Vec<String>,
-    /// 已经激活、出现在请求 tools 数组里的 tool 名称
-    active_tool_names: Vec<String>,
-    /// 通过 enable_tools 显式启用、应该跨 turn 保留的 tool 名称
-    explicit_enabled_tool_names: Vec<String>,
-    /// 每个 explicit-enabled tool 的"未使用计数"
-    explicit_tool_age: SkipMap<String, u32>,
-    /// MCP server 暴露但当前未必已启用的全部 tool 列表
-    available_mcp_tools: Vec<ToolDefinition>,
+    turns: FastMap<TurnIdentity, TurnEnableState>,
+    explicit: FastMap<EnableOwner, ExplicitEnableState>,
 }
 
 static STATE: LazyLock<RwLock<EnableState>> = LazyLock::new(|| RwLock::new(EnableState::default()));
 
 const EXPLICIT_TOOL_DEMOTE_AGE: u32 = 4;
+
+fn clear_turn_state(s: &mut EnableState, turn: &TurnIdentity, owner: &EnableOwner) {
+    s.turns.remove(turn);
+    if owner.1.is_some() {
+        s.explicit.remove(owner);
+    }
+}
+
+/// 把 enable_tools 的 turn 级状态绑定到 driver turn future 的生命周期。
+/// 即使 turn 提前报错、被 abort 或发生 unwind，Drop 也会清理对应条目。
+#[must_use = "guard 必须持有到 turn future 结束"]
+pub(crate) struct EnableTurnStateGuard {
+    turn: TurnIdentity,
+    owner: EnableOwner,
+}
+
+impl EnableTurnStateGuard {
+    pub(crate) fn enter() -> Self {
+        let turn = current_turn_identity();
+        let owner = current_enable_owner(&turn);
+        Self { turn, owner }
+    }
+}
+
+impl Drop for EnableTurnStateGuard {
+    fn drop(&mut self) {
+        if let Ok(mut s) = STATE.write() {
+            clear_turn_state(&mut s, &self.turn, &self.owner);
+        }
+    }
+}
 
 fn subagent_may_enable_tool(name: &str) -> bool {
     crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
@@ -44,22 +79,39 @@ fn registration_may_be_dynamically_enabled(reg: &ToolRegistration) -> bool {
     reg.spec.groups.contains(&"builtin")
 }
 
+fn current_turn_identity() -> TurnIdentity {
+    crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .try_with(Clone::clone)
+        .unwrap_or_default()
+}
+
+fn current_enable_owner(turn: &TurnIdentity) -> EnableOwner {
+    let is_subagent = crate::ai::driver::runtime_ctx::current_subagent_depth() > 0
+        || crate::ai::driver::runtime_ctx::has_subagent_result_slot();
+    (turn.0.clone(), is_subagent.then_some(turn.1))
+}
+
 pub(crate) fn set_active_tool_names(names: Vec<String>) {
+    let turn = current_turn_identity();
     if let Ok(mut s) = STATE.write() {
-        s.active_tool_names = names;
+        s.turns.entry(turn).or_default().active_tool_names = names;
     }
 }
 
 pub(crate) fn set_available_mcp_tools(tools: Vec<ToolDefinition>) {
+    let turn = current_turn_identity();
     if let Ok(mut s) = STATE.write() {
-        s.available_mcp_tools = tools;
+        s.turns.entry(turn).or_default().available_mcp_tools = tools;
     }
 }
 
 pub(crate) fn explicit_enabled_tool_names() -> Vec<String> {
+    let turn = current_turn_identity();
+    let owner = current_enable_owner(&turn);
     STATE
         .read()
-        .map(|s| s.explicit_enabled_tool_names.clone())
+        .ok()
+        .and_then(|s| s.explicit.get(&owner).map(|state| state.tool_names.clone()))
         .unwrap_or_default()
 }
 
@@ -67,10 +119,9 @@ pub(crate) fn explicit_enabled_tool_names() -> Vec<String> {
 /// 由 session 切换 / clear-history 等流程调用，避免上一 session 启用过的 tool
 /// 永久焊接到后续所有 session 的请求 tools 数组（每个 schema 几百~上千 token，
 /// 还会让 prompt cache 失效）。
-pub(crate) fn clear_explicitly_enabled_tools() {
+pub(crate) fn clear_explicitly_enabled_tools(session_id: &str) {
     if let Ok(mut s) = STATE.write() {
-        s.explicit_enabled_tool_names.clear();
-        s.explicit_tool_age.clear();
+        s.explicit.remove(&(session_id.to_string(), None));
     }
 }
 
@@ -89,66 +140,76 @@ where
         .into_iter()
         .map(|s| s.as_ref().to_string())
         .collect();
+    let turn = current_turn_identity();
+    let owner = current_enable_owner(&turn);
     let Ok(mut s) = STATE.write() else {
         return;
     };
-    // 1. 老化或清零
-    let mut to_remove: Vec<String> = Vec::new();
-    // 这里需要同时可变借用 s.explicit_enabled_tool_names 和 s.explicit_tool_age，
-    // 通过 split borrow 拆出来避免借用冲突。
-    let EnableState {
-        explicit_enabled_tool_names,
-        explicit_tool_age,
-        ..
-    } = &mut *s;
-    for name in explicit_enabled_tool_names.iter() {
-        if used.contains(name) {
-            explicit_tool_age.insert(name.clone(), 0);
-        } else {
-            let entry = explicit_tool_age.entry(name.clone()).or_insert(0);
-            *entry = entry.saturating_add(1);
-            if *entry >= EXPLICIT_TOOL_DEMOTE_AGE {
-                to_remove.push(name.clone());
+    if let Some(explicit) = s.explicit.get_mut(&owner) {
+        let mut to_remove: Vec<String> = Vec::new();
+        for name in &explicit.tool_names {
+            if used.contains(name) {
+                explicit.tool_age.insert(name.clone(), 0);
+            } else {
+                let entry = explicit.tool_age.entry(name.clone()).or_insert(0);
+                *entry = entry.saturating_add(1);
+                if *entry >= EXPLICIT_TOOL_DEMOTE_AGE {
+                    to_remove.push(name.clone());
+                }
+            }
+        }
+        if !to_remove.is_empty() {
+            explicit.tool_names.retain(|n| !to_remove.contains(n));
+            for name in &to_remove {
+                explicit.tool_age.remove(name);
             }
         }
     }
-    // 2. demote
-    if !to_remove.is_empty() {
-        explicit_enabled_tool_names.retain(|n| !to_remove.contains(n));
-        for n in &to_remove {
-            explicit_tool_age.remove(n);
-        }
-    }
+    clear_turn_state(&mut s, &turn, &owner);
 }
 
-fn mark_explicitly_enabled_tools(s: &mut EnableState, names: &[String]) {
+fn mark_explicitly_enabled_tools(s: &mut EnableState, owner: EnableOwner, names: &[String]) {
     if names.is_empty() {
         return;
     }
+    let explicit = s.explicit.entry(owner).or_default();
     for name in names {
-        if !s.explicit_enabled_tool_names.contains(name) {
-            s.explicit_enabled_tool_names.push(name.clone());
+        if !explicit.tool_names.contains(name) {
+            explicit.tool_names.push(name.clone());
         }
     }
 }
 
 #[cfg(test)]
 pub(crate) fn set_explicit_enabled_tool_names(names: Vec<String>) {
+    let turn = current_turn_identity();
+    let owner = current_enable_owner(&turn);
     if let Ok(mut s) = STATE.write() {
-        s.explicit_enabled_tool_names = names;
+        s.explicit.entry(owner).or_default().tool_names = names;
     }
 }
 
 pub(crate) fn drain_pending_mcp_names() -> Vec<String> {
+    let turn = current_turn_identity();
     STATE
         .write()
-        .map(|mut s| s.pending_mcp_enable.drain(..).collect())
+        .ok()
+        .and_then(|mut s| {
+            s.turns
+                .get_mut(&turn)
+                .map(|state| std::mem::take(&mut state.pending_mcp_enable))
+        })
         .unwrap_or_default()
 }
 
 pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
+    let turn = current_turn_identity();
     let mut names: Vec<String> = match STATE.write() {
-        Ok(mut s) => s.pending_enable.drain(..).collect(),
+        Ok(mut s) => s
+            .turns
+            .get_mut(&turn)
+            .map(|state| std::mem::take(&mut state.pending_enable))
+            .unwrap_or_default(),
         Err(_) => return Vec::new(),
     };
     names.retain(|name| subagent_may_enable_tool(name));
@@ -157,8 +218,7 @@ pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
     }
     let mut defs = Vec::new();
     for reg in inventory::iter::<ToolRegistration> {
-        if registration_may_be_dynamically_enabled(reg)
-            && names.iter().any(|n| n == reg.spec.name)
+        if registration_may_be_dynamically_enabled(reg) && names.iter().any(|n| n == reg.spec.name)
         {
             defs.push(ToolDefinition {
                 tool_type: "function".to_string(),
@@ -171,9 +231,10 @@ pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
         }
     }
     if let Ok(mut s) = STATE.write() {
+        let state = s.turns.entry(turn).or_default();
         for d in &defs {
-            if !s.active_tool_names.contains(&d.function.name) {
-                s.active_tool_names.push(d.function.name.clone());
+            if !state.active_tool_names.contains(&d.function.name) {
+                state.active_tool_names.push(d.function.name.clone());
             }
         }
     }
@@ -181,9 +242,18 @@ pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
 }
 
 fn available_tools_not_active() -> Vec<(String, String)> {
+    let turn = current_turn_identity();
     let (active, mcp_tools) = STATE
         .read()
-        .map(|s| (s.active_tool_names.clone(), s.available_mcp_tools.clone()))
+        .ok()
+        .and_then(|s| {
+            s.turns.get(&turn).map(|state| {
+                (
+                    state.active_tool_names.clone(),
+                    state.available_mcp_tools.clone(),
+                )
+            })
+        })
         .unwrap_or_default();
     let mut result = Vec::new();
     for reg in inventory::iter::<ToolRegistration> {
@@ -273,8 +343,11 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 Ok(g) => g,
                 Err(_) => return Err("enable_tools state poisoned".to_string()),
             };
-            let active = s.active_tool_names.clone();
-            let known_mcp: Vec<String> = s
+            let turn = current_turn_identity();
+            let owner = current_enable_owner(&turn);
+            let state = s.turns.entry(turn.clone()).or_default();
+            let active = state.active_tool_names.clone();
+            let known_mcp: Vec<String> = state
                 .available_mcp_tools
                 .iter()
                 .map(|t| t.function.name.clone())
@@ -313,16 +386,16 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 .cloned()
                 .partition(|n| n.starts_with("mcp_"));
             for name in &builtin_names {
-                if !s.pending_enable.contains(name) {
-                    s.pending_enable.push(name.clone());
+                if !state.pending_enable.contains(name) {
+                    state.pending_enable.push(name.clone());
                 }
             }
             for name in &mcp_names {
-                if !s.pending_mcp_enable.contains(name) {
-                    s.pending_mcp_enable.push(name.clone());
+                if !state.pending_mcp_enable.contains(name) {
+                    state.pending_mcp_enable.push(name.clone());
                 }
             }
-            mark_explicitly_enabled_tools(&mut s, &explicitly_requested);
+            mark_explicitly_enabled_tools(&mut s, owner, &explicitly_requested);
             drop(s);
             let mut msg = Vec::new();
             if !to_enable.is_empty() {
@@ -435,10 +508,9 @@ mod tests {
             "skill-only control tools must not appear in the normal enable catalog"
         );
 
-        let output = execute_enable_tools(
-            &json!({"operation": "enable", "tools": ["request_user_input"]}),
-        )
-        .unwrap();
+        let output =
+            execute_enable_tools(&json!({"operation": "enable", "tools": ["request_user_input"]}))
+                .unwrap();
         assert!(output.contains("Unknown tools (ignored): request_user_input"));
         assert!(drain_pending_enable().is_empty());
         assert!(explicit_enabled_tool_names().is_empty());
@@ -491,12 +563,82 @@ mod tests {
             assert!(explicit_enabled_tool_names().is_empty());
 
             if let Ok(mut s) = STATE.write() {
-                s.pending_enable.push("task_wait".to_string());
+                s.turns
+                    .entry(current_turn_identity())
+                    .or_default()
+                    .pending_enable
+                    .push("task_wait".to_string());
             }
             assert!(
                 drain_pending_enable().is_empty(),
                 "subagent drain must drop task orchestration tools queued by stale state"
             );
         });
+    }
+
+    #[test]
+    fn concurrent_subagent_turns_keep_enable_state_isolated() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        let turn_a = ("shared-session".to_string(), 11);
+        let turn_b = ("shared-session".to_string(), 12);
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_DEPTH.sync_scope(1, || {
+            crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(turn_a.clone(), || {
+                set_active_tool_names(vec!["enable_tools".to_string()]);
+                set_available_mcp_tools(vec![tool("mcp_agent_a")]);
+                execute_enable_tools(&json!({"operation": "enable", "tools": ["mcp_agent_a"]}))
+                    .unwrap();
+            });
+
+            crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(turn_b, || {
+                set_active_tool_names(vec!["enable_tools".to_string()]);
+                set_available_mcp_tools(vec![tool("mcp_agent_b")]);
+                let listed = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+                assert!(listed.contains("mcp_agent_b"));
+                assert!(!listed.contains("mcp_agent_a"));
+                assert!(drain_pending_mcp_names().is_empty());
+                assert!(explicit_enabled_tool_names().is_empty());
+            });
+
+            crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(turn_a, || {
+                assert_eq!(drain_pending_mcp_names(), vec!["mcp_agent_a".to_string()]);
+                assert_eq!(
+                    explicit_enabled_tool_names(),
+                    vec!["mcp_agent_a".to_string()]
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn enable_turn_state_guard_cleans_subagent_state_on_drop() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        let turn = ("guard-cleanup-session".to_string(), 21);
+        let owner = (turn.0.clone(), Some(turn.1));
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_DEPTH.sync_scope(1, || {
+            crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(turn.clone(), || {
+                let turn_guard = EnableTurnStateGuard::enter();
+                set_active_tool_names(vec!["enable_tools".to_string()]);
+                set_explicit_enabled_tool_names(vec!["read_file".to_string()]);
+
+                let s = STATE.read().unwrap_or_else(|poison| poison.into_inner());
+                assert!(s.turns.contains_key(&turn));
+                assert!(s.explicit.contains_key(&owner));
+                drop(s);
+
+                drop(turn_guard);
+            });
+        });
+
+        let s = STATE.read().unwrap_or_else(|poison| poison.into_inner());
+        assert!(!s.turns.contains_key(&turn));
+        assert!(!s.explicit.contains_key(&owner));
     }
 }

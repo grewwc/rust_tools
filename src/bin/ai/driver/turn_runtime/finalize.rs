@@ -232,6 +232,7 @@ fn maybe_spawn_critic_revise_background(app: &App, question: &str, final_assista
             _ = crate::ai::driver::signal::wait_for_interrupt_sources(
                 Some(cancel_token.clone()),
                 interrupt_futex,
+               None,
             ) => {}
             _ = super::super::reflection::run_critic_revise_background(path, model_bg, q_bg, a_bg) => {}
         }

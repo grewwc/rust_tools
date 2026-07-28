@@ -1683,6 +1683,22 @@ fn prepare_patch_write(
     })
 }
 
+/// 拒绝最终内容与原文件完全相同的写入，避免工具报告成功却没有产生实际改动。
+fn ensure_patch_writes_change(writes: &[PreparedPatchWrite]) -> Result<(), String> {
+    for write in writes {
+        let PreparedPatchAction::Write(next) = &write.action else {
+            continue;
+        };
+        if write.before.as_deref() == Some(next.as_str()) {
+            return Err(format!(
+                "[NO_CHANGES] patch would leave {} unchanged. Remove the no-op hunk or re-read the file and rebuild the patch.",
+                write.path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_patch_write_is_current(write: &PreparedPatchWrite) -> Result<(), String> {
     let current = if write.path.exists() {
         Some(
@@ -1846,6 +1862,7 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
                 writes.push(write);
             }
         }
+        ensure_patch_writes_change(&writes)?;
         if dry_run {
             let success = format_patch_dry_run(&writes);
             emit(&success);
@@ -1895,6 +1912,7 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         before,
         action: PreparedPatchAction::Write(next),
     };
+    ensure_patch_writes_change(std::slice::from_ref(&write))?;
     if dry_run {
         let success = format_patch_dry_run(&[write]);
         emit(&success);
@@ -2128,7 +2146,10 @@ mod tests {
         let patch = "@@ -5,1 +5,1 @@\n-dup\n+changed\n";
         let result = apply_unified_patch(original, patch)
             .expect("nearby declared line should disambiguate repeated context");
-        assert_eq!(result, "dup\nhead\nfiller1\nfiller2\nfiller3\nchanged\ntail\n");
+        assert_eq!(
+            result,
+            "dup\nhead\nfiller1\nfiller2\nfiller3\nchanged\ntail\n"
+        );
     }
 
     #[test]
@@ -3367,6 +3388,27 @@ mod tests {
         });
 
         assert!(result.starts_with("Dry run succeeded; no files changed:"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_rejects_unified_noop() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("unified_noop");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "before\n").unwrap();
+
+        let err = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            execute_apply_patch(&serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "patch": "@@ -1,1 +1,1 @@\n before\n",
+            }))
+            .expect_err("a context-only unified diff must not report success")
+        });
+
+        assert!(err.contains("[NO_CHANGES]"), "err was: {err}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
         let _ = fs::remove_dir_all(base);
     }

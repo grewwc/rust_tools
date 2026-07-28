@@ -3,14 +3,14 @@
 //! 包含：
 //! - `RequestError` / `RequestErrorKind`：统一的请求错误类型
 //! - `RequestRetryPolicy`：重试次数/超时/对冲策略
-//! - 重试辅助：`send_with_hedged_backup` / `sleep_with_cancel` / `retry_delay`
+//! - 重试辅助：`sleep_with_cancel` / `retry_delay`
 //! - 模型错误分类：`is_transient_error` / `should_temporarily_disable_model` / `should_try_model_fallback`
 //! - 请求配置辅助：`endpoint_for_request_model` / `api_key_for_request_model` / `apply_request_auth`
 
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::{Response, StatusCode};
+use reqwest::StatusCode;
 
 use crate::ai::config_schema::AiConfig;
 use crate::ai::models;
@@ -231,59 +231,6 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
     None
 }
 
-/// 对冲请求（hedged backup request）。
-///
-/// 先发起 primary 请求；若在 `backup_after_secs` 内未收到响应头，则【不丢弃 primary】，
-/// 并发发起一个完全相同的 backup 请求，让二者竞速——谁先返回响应头谁赢，落败者被
-/// drop（仅取消客户端等待，服务端可能仍在处理）。若 `max_sends > 2`，则继续按
-/// `backup_after_secs` 间隔逐步追加并发请求（最多 `max_sends` 个同时在飞），任一返回
-/// 即作为结果，其余被 drop。所有请求发完仍无返回时，等待首个完成（由外层
-/// `header_timeout_secs` 兜底）。
-///
-/// 典型场景：服务端接受了 TCP 连接但因内部排队迟迟不返回响应头，primary 请求
-/// 会卡在 `.send().await` 上等满 90s 才超时。hedged backup 在 ~10s 就并发发起
-/// 新连接，新请求通常能立即被处理（命中不同的后端实例或脱离原队列），
-/// 从而把尾延迟从 90s+ 降到 10s+。与"先 drop 再顺序重发"不同，真正的并发对冲
-/// 不会浪费"只差一点就能返回"的 primary——它仍有机会赢得竞速。
-///
-/// 注意：竞速中落败的请求会被 drop，只取消客户端的等待，服务端可能仍在处理。
-/// 但 LLM chat completions 是幂等的读操作，重复请求不会产生副作用。代价是长尾
-/// 场景下最多会有 `max_sends` 个并发连接（原"顺序 drop"实现为 1 个）。
-pub(crate) async fn send_with_hedged_backup(
-    build_request: impl Fn() -> reqwest::RequestBuilder,
-    backup_after_secs: u64,
-    max_sends: usize,
-) -> Result<Response, reqwest::Error> {
-    use futures_util::stream::{FuturesUnordered, StreamExt};
-    let max_sends = max_sends.max(1);
-    let hedge = Duration::from_secs(backup_after_secs);
-    // 所有在飞的请求；任一返回响应头即作为结果，其余被 drop（取消等待）。
-    let mut in_flight = FuturesUnordered::new();
-    for round in 1..=max_sends {
-        in_flight.push(build_request().send());
-        // 竞速：集合中首个响应头返回 vs hedge 计时器
-        tokio::select! {
-            // 集合中首个 future 完成（返回即移出集合），其余继续在飞
-            result = in_flight.next() => return result.expect("in_flight 非空"),
-            _ = tokio::time::sleep(hedge) => {
-                // hedge 窗口内无任何响应头到达：若还有配额则追加一个并发请求，
-                // 否则落到循环后的最终竞速（由外层 header_timeout 兜底）。
-                if round < max_sends {
-                    super::emit_request_diagnostic(format_args!(
-                        "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup request",
-                        backup_after_secs
-                    ));
-                }
-            }
-        }
-    }
-    // 已发起全部 max_sends 个请求且仍在飞行中：等待首个完成（由外层 header_timeout 兜底）
-    in_flight
-        .next()
-        .await
-        .expect("in_flight 必非空：至少发起过一次请求")
-}
-
 pub(crate) fn should_abort_retry_wait(app: &App) -> bool {
     app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
         || app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
@@ -297,7 +244,7 @@ pub(crate) async fn sleep_with_cancel(app: &App, delay: Duration) -> bool {
 
     tokio::select! {
         _ = tokio::time::sleep(delay) => should_abort_retry_wait(app),
-        _ = crate::ai::driver::signal::wait_for_interrupt_sources(None, None) => true,
+        _ = crate::ai::driver::signal::wait_for_interrupt_sources(None, None, Some(app.cancel_stream.as_ref())) => true,
     }
 }
 

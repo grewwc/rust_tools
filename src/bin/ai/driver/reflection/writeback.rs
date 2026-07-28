@@ -144,6 +144,7 @@ pub(super) async fn maybe_write_back_project_knowledge(
             _ = crate::ai::driver::signal::wait_for_interrupt_sources(
                 Some(cancel_token.clone()),
                 interrupt_futex,
+               None,
             ) => {}
             _ = run_project_knowledge_writeback_background(project_name, model_s, q_s, a_s) => {}
         }

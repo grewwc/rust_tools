@@ -258,7 +258,7 @@ async fn wait_for_interrupt_sources_returns_after_shutdown_request() {
 
     let shutdown = app.shutdown.clone();
     let waiter = tokio::spawn(async move {
-        crate::ai::driver::signal::wait_for_interrupt_sources(None, None).await;
+        crate::ai::driver::signal::wait_for_interrupt_sources(None, None, None).await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     crate::ai::driver::signal::request_shutdown(shutdown.as_ref());
@@ -294,6 +294,7 @@ async fn wait_for_interrupt_sources_returns_after_daemon_cancel() {
         crate::ai::driver::signal::wait_for_interrupt_sources(
             Some(cancel_token),
             Some(local_interrupt),
+            None,
         )
         .await;
     });

@@ -32,10 +32,9 @@ pub(crate) use error::{
     config_bool_is_true, config_forces_thinking, control_model_for_aux_tasks,
     endpoint_for_request_model, is_retryable_reqwest_error, is_retryable_status_with_body,
     is_retryable_stream_error, is_transient_error, parse_retry_after, request_retry_policy,
-    request_retry_policy_for_current_context, retry_delay, send_with_hedged_backup,
-    should_abort_retry_wait, should_retry_status, should_rotate_key,
-    should_temporarily_disable_auto_selected_model, should_temporarily_disable_model,
-    should_try_model_fallback, sleep_with_cancel,
+    request_retry_policy_for_current_context, retry_delay, should_abort_retry_wait,
+    should_retry_status, should_rotate_key, should_temporarily_disable_auto_selected_model,
+    should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel,
 };
 pub(crate) use protocol::{build_http_body_for_json_messages, extract_response_text};
 #[cfg(test)]

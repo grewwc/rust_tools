@@ -8,6 +8,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::ai::{
     agents::AgentManifest,
@@ -344,6 +345,15 @@ pub(super) fn dispatch_background_batch(
     ) in task_specs
     {
         let mut task_app = app.clone();
+        // 后台任务必须拥有独立的 streaming/cancel_stream 标志：`App::clone` 默认与
+        // 父 App 共享同一组 Arc，多个并发后台 run_turn 会互相覆写 streaming、互相
+        // 清除 cancel（clear_stream_cancel 会重置共享 cancel_stream）。后台任务的
+        // 取消由 task_cancel 通过 abort_handle + kernel kill 完成，不依赖这两个 Arc，
+        // 故为每个任务新建私有标志是安全的。shutdown 仍与父 App 共享：会话级退出需
+        // 传播到后台任务让其优雅收尾，这与 streaming/cancel_stream 的"每流私有"语义
+        // 不同，故单独保留共享。
+        task_app.streaming = Arc::new(AtomicBool::new(false));
+        task_app.cancel_stream = Arc::new(AtomicBool::new(false));
         crate::ai::types::clear_stream_cancel(&task_app);
         let task_mcp = mcp_client.clone();
         let task_os = app.os.clone();

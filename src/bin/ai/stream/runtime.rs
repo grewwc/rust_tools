@@ -612,11 +612,16 @@ async fn wait_for_interrupt_or_timeout(app: &App, delay: Option<Duration>) -> bo
         Some(delay) => {
             tokio::select! {
                 _ = tokio::time::sleep(delay) => false,
-                _ = crate::ai::driver::signal::wait_for_interrupt_sources(None, None) => true,
+                _ = crate::ai::driver::signal::wait_for_interrupt_sources(None, None, Some(app.cancel_stream.as_ref())) => true,
             }
         }
         None => {
-            crate::ai::driver::signal::wait_for_interrupt_sources(None, None).await;
+            crate::ai::driver::signal::wait_for_interrupt_sources(
+                None,
+                None,
+                Some(app.cancel_stream.as_ref()),
+            )
+            .await;
             true
         }
     }
@@ -1177,11 +1182,7 @@ fn write_fold_header(
     out: &mut impl Write,
     fold: &super::state::ThinkingFoldState,
 ) -> io::Result<()> {
-    write!(
-        out,
-        "  {ACCENT_MUTED}{}\x1b[0m\n",
-        fold.header_label
-    )
+    write!(out, "  {ACCENT_MUTED}{}\x1b[0m\n", fold.header_label)
 }
 
 /// Thinking 结束时的最终渲染：覆盖正文窗口，输出最终折叠摘要 + "done thinking"。
@@ -1305,7 +1306,8 @@ fn render_thinking_fold_window_lines(
     let mut rows = 0usize;
 
     for (idx, line) in lines.iter().enumerate() {
-        let wrapped = wrap_line_to_terminal_rows_with_reserve(line, THINKING_FOLD_BODY_INDENT_WIDTH);
+        let wrapped =
+            wrap_line_to_terminal_rows_with_reserve(line, THINKING_FOLD_BODY_INDENT_WIDTH);
         for body in wrapped {
             let rendered_line = format!("{THINKING_FOLD_BODY_INDENT}{body}");
             rows += live_preview_cursor_rows(&rendered_line);

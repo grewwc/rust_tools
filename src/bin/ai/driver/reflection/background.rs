@@ -63,6 +63,7 @@ pub(crate) async fn maybe_append_self_reflection(
             _ = crate::ai::driver::signal::wait_for_interrupt_sources(
                 Some(cancel_token.clone()),
                 interrupt_futex,
+               None,
             ) => {}
             _ = run_self_reflection_background(history_path, session_id, model_s, q_s, a_s, had_tool, had_tool_error) => {}
         }

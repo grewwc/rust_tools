@@ -3253,19 +3253,26 @@ pub(in crate::ai::driver) async fn run_turn(
     crate::ai::driver::runtime_ctx::TURN_IDENTITY
         .scope(
             (session_id, turn_id),
-            run_turn_body(
-                app,
-                mcp_client,
-                skill_manifests,
-                history_count,
-                turn_index,
-                question,
-                attachments_text,
-                next_model,
-                precomputed_ocr,
-                one_shot_mode,
-                should_quit,
-            ),
+            async {
+                // enable_tools 的 per-turn 状态必须跟随整个 future，而不能只依赖
+                // run_turn_body 的 happy-path 尾部清理；abort / early return 也会 Drop。
+                let _enable_turn_guard =
+                    crate::ai::tools::enable_tools::EnableTurnStateGuard::enter();
+                run_turn_body(
+                    app,
+                    mcp_client,
+                    skill_manifests,
+                    history_count,
+                    turn_index,
+                    question,
+                    attachments_text,
+                    next_model,
+                    precomputed_ocr,
+                    one_shot_mode,
+                    should_quit,
+                )
+                .await
+            },
         )
         .await
 }
