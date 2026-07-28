@@ -118,12 +118,12 @@ fn try_cancel_foreground_subagent() -> bool {
         top.cancel.clone()
     };
     cancel_flag.store(true, Ordering::Relaxed);
-    crate::ai::tools::registry::common::request_tool_cancel();
     // 定向取消只翻目标子 agent 的私有 cancel flag 并唤醒其等待者；不设置进程级
     // REQUEST_INTERRUPT_FLAG/futex，避免并发后台 turn 读到全局 flag 被误判为
     // "本 turn 被取消"。目标子 agent 的等待路径通过 wait_for_interrupt_sources
     // 的 cancel_flag 形参在被唤醒后重新检查其私有 cancel_stream。
     notify_request_interrupt_waiters();
+    let _ = crate::ai::tools::registry::common::try_request_tool_cancel();
     true
 }
 
@@ -151,17 +151,19 @@ pub(in crate::ai) fn handle_sigint(
     }
     match sigint_action(shutdown, streaming, cancel_stream, foreground_turn_active()) {
         SigintAction::CancelStream => {
-            crate::ai::tools::registry::common::request_tool_cancel();
+            // 先唤醒 request/stream 等待者，再通知工具层 cancel。后者会拿 kernel
+            // 锁；若锁竞争发生在断网/卡住路径上，不能阻塞真正的 Ctrl+C 取消信号。
             cancel_stream.store(true, Ordering::Relaxed);
             signal_request_interrupt();
+            let _ = crate::ai::tools::registry::common::try_request_tool_cancel();
         }
         SigintAction::Shutdown => {
-            crate::ai::tools::registry::common::request_tool_cancel();
             request_sigint_shutdown(shutdown);
             #[cfg(unix)]
             unsafe {
                 let _ = libc::close(libc::STDIN_FILENO);
             }
+            let _ = crate::ai::tools::registry::common::try_request_tool_cancel();
         }
         SigintAction::Exit => {
             // 用户已二次 Ctrl+C，明确要求退出：必须无条件、优先退出。

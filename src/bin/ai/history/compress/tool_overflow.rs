@@ -631,7 +631,13 @@ mod tests {
         // 覆盖 Path C 的后半段：spill 后仍超预算时会进入 emergency cap。所有
         // preserved stub 必须先缩成不可截断的最小指针，不能再被通用 head/tail 截断。
         assert!(super::super::messages_total_chars(&messages) > 4_000);
-        super::super::emergency_cap_messages_to_fit(&mut messages, 4_000, 160, &protected);
+        super::super::emergency_cap_messages_to_fit(
+            &mut messages,
+            4_000,
+            160,
+            Some(&overflow_dir),
+            &protected,
+        );
 
         assert_eq!(spilled, 8);
         let stubs = messages

@@ -219,6 +219,18 @@ pub(crate) fn request_tool_cancel() {
     });
 }
 
+/// SIGINT handler 路径不能阻塞在 kernel mutex 上。stream/request cancel flag 是
+/// 主取消信号；这里仅作为正在轮询 SigCancel 的工具的 best-effort 侧信道。
+pub(crate) fn try_request_tool_cancel() -> bool {
+    try_with_current_process_kernel(|os, pid| {
+        let addr = ensure_process_tool_cancel_futex(os, pid)?;
+        let _ = os.futex_store(addr, 1);
+        os.signal_process(pid, Signal::SigCancel)?;
+        Ok(())
+    })
+    .is_some()
+}
+
 pub(crate) fn clear_tool_cancel() {
     with_current_process_kernel(|os, pid| {
         let addr = ensure_process_tool_cancel_futex(os, pid)?;
@@ -256,6 +268,17 @@ fn with_current_process_kernel<T>(
     let guard = GLOBAL_OS.lock().ok()?;
     let os = guard.as_ref()?.clone();
     let mut os = os.lock().ok()?;
+    let pid = os.current_process_id()?;
+    f(os.as_mut(), pid).ok()
+}
+
+fn try_with_current_process_kernel<T>(
+    f: impl FnOnce(&mut dyn Kernel, u64) -> Result<T, String>,
+) -> Option<T> {
+    let guard = GLOBAL_OS.try_lock().ok()?;
+    let os = guard.as_ref()?.clone();
+    drop(guard);
+    let mut os = os.try_lock().ok()?;
     let pid = os.current_process_id()?;
     f(os.as_mut(), pid).ok()
 }

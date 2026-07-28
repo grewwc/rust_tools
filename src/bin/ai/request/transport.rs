@@ -49,6 +49,37 @@ fn retry_scope_tag() -> String {
     }
 }
 
+async fn wait_for_app_request_interrupt(app: &App) {
+    crate::ai::driver::signal::wait_for_interrupt_sources(
+        None,
+        None,
+        Some(app.cancel_stream.as_ref()),
+    )
+    .await
+}
+
+pub(super) async fn response_text_with_cancel(
+    app: &App,
+    response: Response,
+    cancel_reason: &'static str,
+) -> Result<String, RequestError> {
+    tokio::select! {
+        body = response.text() => Ok(body.unwrap_or_default()),
+        _ = wait_for_app_request_interrupt(app) => Err(RequestError::cancelled(cancel_reason)),
+    }
+}
+
+async fn response_json_with_cancel(
+    app: &App,
+    response: Response,
+    cancel_reason: &'static str,
+) -> Result<Value, RequestError> {
+    tokio::select! {
+        body = response.json::<Value>() => body.map_err(RequestError::network),
+        _ = wait_for_app_request_interrupt(app) => Err(RequestError::cancelled(cancel_reason)),
+    }
+}
+
 fn maybe_emit_responses_reasoning_replay_diagnostic(
     model: &str,
     endpoint: &str,
@@ -140,12 +171,38 @@ async fn send_with_budgeted_hedged_backup(
                     backup_after_secs
                 ));
             }
+            _ = crate::ai::driver::signal::wait_for_interrupt_sources(
+                None,
+                None,
+                Some(app.cancel_stream.as_ref()),
+            ) => {
+                return Err(RequestError::cancelled(
+                    "request canceled by user while waiting for response headers",
+                ));
+            }
         }
     }
 
     // 所有 hedged 请求已发起；继续等待在途请求。可重试 HTTP 状态（429/5xx 等）
     // 和网络错误都只作为候选失败保留，避免它们抢赢仍可能成功的请求。
-    while let Some(result) = in_flight.next().await {
+    while !in_flight.is_empty() {
+        let result = tokio::select! {
+            result = in_flight.next() => {
+                let Some(result) = result else {
+                    break;
+                };
+                result
+            }
+            _ = crate::ai::driver::signal::wait_for_interrupt_sources(
+                None,
+                None,
+                Some(app.cancel_stream.as_ref()),
+            ) => {
+                return Err(RequestError::cancelled(
+                    "request canceled by user while waiting for response headers",
+                ));
+            }
+        };
         match result {
             Ok(resp) if should_retry_status(resp.status()) => {
                 last_retryable_response = Some(resp);
@@ -250,7 +307,12 @@ async fn request_messages_with_key(
                 } else {
                     None
                 };
-                let body = (response.text().await).unwrap_or_default();
+                let body = response_text_with_cancel(
+                    app,
+                    response,
+                    "request canceled by user while reading error response body",
+                )
+                .await?;
                 let mut err = RequestError::status(status, body);
 
                 // 429（配额/限流）不在单 key 内退避：携带钳制后的 retry_after 立即返回，
@@ -594,9 +656,23 @@ pub async fn do_request_json(
                 .await?;
             Ok::<_, reqwest::Error>(resp)
         };
-        let response = match tokio::time::timeout(Duration::from_secs(60), send_future).await {
-            Ok(result) => result,
-            Err(_) => {
+        enum AuxSendWait<T> {
+            Ready(T),
+            TimedOut,
+            Cancelled,
+        }
+        let response = match tokio::select! {
+            result = send_future => AuxSendWait::Ready(result),
+            _ = wait_for_app_request_interrupt(app) => AuxSendWait::Cancelled,
+            _ = tokio::time::sleep(Duration::from_secs(60)) => AuxSendWait::TimedOut,
+        } {
+            AuxSendWait::Ready(result) => result,
+            AuxSendWait::Cancelled => {
+                return Err(Box::new(RequestError::cancelled(
+                    "request canceled by user while waiting for auxiliary response headers",
+                )));
+            }
+            AuxSendWait::TimedOut => {
                 if attempt < REQUEST_MAX_ATTEMPTS {
                     super::emit_request_diagnostic(format_args!(
                         "[Warning] {}do_request_json timeout (60s), retrying (attempt {}/{})",
@@ -613,7 +689,16 @@ pub async fn do_request_json(
         match response {
             Ok(response) => {
                 if response.status().is_success() {
-                    let json: serde_json::Value = response.json().await?;
+                    let json = match response_json_with_cancel(
+                        app,
+                        response,
+                        "request canceled by user while reading auxiliary response body",
+                    )
+                    .await
+                    {
+                        Ok(json) => json,
+                        Err(err) => return Err(Box::new(err)),
+                    };
                     // AIOS: bridge non-stream usage to kernel `/dev/llm`.
                     if let Some(usage_val) = json.get("usage") {
                         if let Ok(usage) = serde_json::from_value::<StreamUsage>(usage_val.clone())
@@ -633,7 +718,16 @@ pub async fn do_request_json(
                 } else {
                     None
                 };
-                let body = (response.text().await).unwrap_or_default();
+                let body = match response_text_with_cancel(
+                    app,
+                    response,
+                    "request canceled by user while reading auxiliary error response body",
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(err) => return Err(Box::new(err)),
+                };
                 let err = RequestError::status(status, body);
                 if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
                     let delay = retry_after_delay.unwrap_or_else(|| retry_delay(attempt));
@@ -834,7 +928,16 @@ pub async fn do_request_text_streaming(
                     resp
                 } else {
                     let status = resp.status();
-                    let body = (resp.text().await).unwrap_or_default();
+                    let body = match response_text_with_cancel(
+                        app,
+                        resp,
+                        "request canceled by user while reading streaming error response body",
+                    )
+                    .await
+                    {
+                        Ok(body) => body,
+                        Err(err) => return Err(Box::new(err)),
+                    };
                     let err = RequestError::status(status, body);
                     if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
                         let delay = retry_delay(attempt);
@@ -886,18 +989,29 @@ pub async fn do_request_text_streaming(
         let mut pending_usage: Option<(String, StreamUsage)> = None;
         let t0 = std::time::Instant::now();
         loop {
-            let chunk = match tokio::time::timeout(
-                Duration::from_secs(STREAM_RESPONSE_HEADER_TIMEOUT_SECS),
-                response.chunk(),
-            )
-            .await
-            {
-                Ok(Ok(Some(bytes))) => bytes,
-                Ok(Ok(None)) => break, // 流正常结束
-                Ok(Err(_)) => break,   // 读取错误：用已聚合内容
-                Err(_) => {
+            enum AuxChunkWait<T> {
+                Ready(T),
+                TimedOut,
+                Cancelled,
+            }
+            let chunk = match tokio::select! {
+                result = response.chunk() => AuxChunkWait::Ready(result),
+                _ = wait_for_app_request_interrupt(app) => AuxChunkWait::Cancelled,
+                _ = tokio::time::sleep(Duration::from_secs(STREAM_RESPONSE_HEADER_TIMEOUT_SECS)) => {
+                    AuxChunkWait::TimedOut
+                }
+            } {
+                AuxChunkWait::Ready(Ok(Some(bytes))) => bytes,
+                AuxChunkWait::Ready(Ok(None)) => break, // 流正常结束
+                AuxChunkWait::Ready(Err(_)) => break,   // 读取错误：用已聚合内容
+                AuxChunkWait::TimedOut => {
                     idle_timed_out = true;
                     break;
+                }
+                AuxChunkWait::Cancelled => {
+                    return Err(Box::new(RequestError::cancelled(
+                        "request canceled by user while reading auxiliary streaming response body",
+                    )));
                 }
             };
             buffer.extend_from_slice(&chunk);

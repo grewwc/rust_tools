@@ -16,9 +16,9 @@ use super::tool_overflow::{
     preserve_noncompressible_tool_result_for_fold,
 };
 use super::{
-    COMPRESSED_TOOL_EVIDENCE_MARKER, is_archive_note_message, is_compressed_tool_evidence_note,
-    is_context_checkpoint_marker, is_summary_message, keep_recent_user_turns_when_trimming,
-    normalize_whitespace, value_to_string,
+    COMPRESSED_TOOL_EVIDENCE_MARKER, archive_messages_to_overflow, is_archive_note_message,
+    is_compressed_tool_evidence_note, is_context_checkpoint_marker, is_summary_message,
+    keep_recent_user_turns_when_trimming, normalize_whitespace, value_to_string,
 };
 
 pub(super) fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
@@ -160,12 +160,26 @@ pub(super) fn fold_tool_call_group_to_stub(
         return None;
     }
 
-    let mut lines = Vec::with_capacity(tool_calls.len() + 6);
+    let archive_file_path = if let Some(dir) = overflow_dir {
+        let group_messages = group
+            .iter()
+            .filter_map(|idx| messages.get(*idx).cloned())
+            .collect::<Vec<_>>();
+        Some(archive_messages_to_overflow(&group_messages, Some(dir))?)
+    } else {
+        None
+    };
+
+    let mut lines = Vec::with_capacity(tool_calls.len() + 8);
     lines.push(format!(
         "compressed_tool_round: {} tool calls (folded for context budget)",
         tool_calls.len()
     ));
     lines.push(COMPRESSED_TOOL_EVIDENCE_MARKER.to_string());
+    if let Some(path) = archive_file_path {
+        lines.push(format!("- archive_file_path: {path}"));
+        lines.push("- archive_scope: folded_tool_group_raw_messages".to_string());
+    }
 
     // checkpoint 只使用对用户可见的 assistant 正文。隐藏 reasoning_content 可能是
     // 未验证的中间推断，不能在压缩时提升为持久化事实；正文为空时从结构化工具调用
@@ -887,15 +901,17 @@ pub(super) fn fold_early_tool_groups(
                 }
                 cursor += 1;
             }
-            if let Some(stub) = fold_tool_call_group_to_stub(messages, &group, overflow_dir) {
-                // pending-patch 目标路径的 read_file 组跳过折叠，逐字保留。
-                if group_reads_pending_patch_target(messages, &group, &pending_patch_paths) {
-                    for &gi in &group {
-                        out.push(messages[gi].clone());
-                    }
-                    idx = cursor;
-                    continue;
+            // pending-patch 目标路径的 read_file 组跳过折叠，逐字保留。必须在构造
+            // stub 之前判断，因为构造过程会归档原始组；否则每次压缩尝试都会把同一
+            // 个受保护组重复追加到 overflow-history.md。
+            if group_reads_pending_patch_target(messages, &group, &pending_patch_paths) {
+                for &gi in &group {
+                    out.push(messages[gi].clone());
                 }
+                idx = cursor;
+                continue;
+            }
+            if let Some(stub) = fold_tool_call_group_to_stub(messages, &group, overflow_dir) {
                 out.push(stub);
                 folded_groups += 1;
                 idx = cursor;

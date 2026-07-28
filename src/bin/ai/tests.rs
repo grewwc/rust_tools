@@ -1644,6 +1644,81 @@ async fn mid_turn_llm_summary_reaches_hard_target_after_effective_early_folding(
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn mid_turn_llm_summary_path_a_preserves_raw_archive_pointer() {
+    let mut app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
+    let root = std::env::temp_dir().join(format!("ai-mid-turn-path-a-{}", uuid::Uuid::new_v4()));
+    app.config.history_file = root.join("history.sqlite");
+    app.session_id = "path-a-archive-regression".to_string();
+
+    let old_user = format!("早期目标: 修复无损压缩回指 {}", "u".repeat(4_000));
+    let old_assistant = format!("早期结论: 需要归档 earlier 原文 {}", "a".repeat(4_000));
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(old_user.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(old_assistant.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("继续当前任务".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let (compressed, before, after, _) =
+        mid_turn_llm_summarize(&app, messages, 1, 1_000, 20_000).await;
+
+    assert!(after < before, "Path A should reduce earlier history");
+    assert!(compressed.iter().any(|message| {
+        message
+            .content
+            .as_str()
+            .is_some_and(|text| text.starts_with("[mid-turn-summary]"))
+    }));
+    assert!(compressed.iter().any(|message| {
+        message
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains("归档文件:"))
+    }));
+
+    let archive_file = SessionStore::new(app.config.history_file.as_path())
+        .session_assets_dir(&app.session_id)
+        .join("overflow-history.md");
+    let archived =
+        std::fs::read_to_string(&archive_file).expect("Path A raw archive should be readable");
+    assert!(
+        archived.contains("早期目标: 修复无损压缩回指"),
+        "{archived}"
+    );
+    assert!(
+        archived.contains("早期结论: 需要归档 earlier 原文"),
+        "{archived}"
+    );
+    assert!(archived.contains("raw_message_json"), "{archived}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present() {
     // 回归测试：mid-turn 压缩传入 overflow_dir 后，read_file 等「不可压缩」

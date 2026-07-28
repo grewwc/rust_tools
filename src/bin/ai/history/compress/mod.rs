@@ -193,13 +193,13 @@ const PRESERVED_CONTENT_STUB_PREFIX: &str = "[[PRESERVED_CONTENT_STUB_V1]]";
 const USER_OVERFLOW_SPILL_MIN_CHARS: usize = 1_024;
 const IMAGE_OVERFLOW_SPILL_MIN_CHARS: usize = 512;
 
-struct OverflowSink {
+pub(super) struct OverflowSink {
     path: PathBuf,
     buffer: String,
 }
 
 impl OverflowSink {
-    fn new(overflow_dir: &Path) -> Self {
+    pub(super) fn new(overflow_dir: &Path) -> Self {
         let path = overflow_dir.join(OVERFLOW_HISTORY_FILENAME);
         Self {
             path,
@@ -207,10 +207,7 @@ impl OverflowSink {
         }
     }
 
-    fn push_messages(&mut self, messages: &[Message]) {
-        if messages.is_empty() {
-            return;
-        }
+    fn start_batch(&mut self, title: &str) {
         if self.buffer.is_empty() {
             // 仅在归档文件尚未存在时写入头部说明；后续调用走 append 模式追加新批次。
             // 每个新批次再加一个分隔行，方便人工/工具分块读取。
@@ -222,6 +219,18 @@ impl OverflowSink {
                 self.buffer.push_str("\n---\n\n");
             }
         }
+        if !title.trim().is_empty() {
+            self.buffer.push_str("## ");
+            self.buffer.push_str(title.trim());
+            self.buffer.push_str("\n\n");
+        }
+    }
+
+    pub(super) fn push_messages(&mut self, messages: &[Message]) {
+        if messages.is_empty() {
+            return;
+        }
+        self.start_batch("移出消息原文");
         for msg in messages {
             let text = value_to_string(&msg.content);
             match msg.role.as_str() {
@@ -248,10 +257,44 @@ impl OverflowSink {
                     self.buffer.push_str("\n\n");
                 }
             }
+            self.push_raw_message_json(msg);
         }
     }
 
-    fn flush(&mut self) -> bool {
+    fn push_raw_message_json(&mut self, msg: &Message) {
+        let Ok(json) = serde_json::to_string_pretty(msg) else {
+            return;
+        };
+        self.buffer.push_str("raw_message_json:\n```json\n");
+        self.buffer.push_str(&json);
+        self.buffer.push_str("\n```\n\n");
+    }
+
+    fn push_truncated_field(&mut self, message: &Message, field: MutableMessageField) -> bool {
+        let Some(original) = field.original_text(message) else {
+            return false;
+        };
+        self.start_batch("截断字段原文");
+        self.buffer.push_str("### 字段原文\n\n");
+        self.buffer.push_str("- role: ");
+        self.buffer.push_str(&message.role);
+        self.buffer.push('\n');
+        if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+            self.buffer.push_str("- tool_call_id: ");
+            self.buffer.push_str(tool_call_id);
+            self.buffer.push('\n');
+        }
+        self.buffer.push_str("- field: ");
+        self.buffer.push_str(&field.archive_label());
+        self.buffer.push_str("\n\n");
+        self.buffer.push_str("原文开始\n");
+        self.buffer.push_str(&original);
+        self.buffer.push_str("\n原文结束\n\n");
+        self.push_raw_message_json(message);
+        true
+    }
+
+    pub(super) fn flush(&mut self) -> bool {
         if self.buffer.is_empty() {
             return false;
         }
@@ -273,22 +316,48 @@ impl OverflowSink {
             .is_ok()
     }
 
-    fn file_path(&self) -> &Path {
+    pub(super) fn file_path(&self) -> &Path {
         &self.path
     }
 }
 
-fn archive_trimmed_compressed_tool_evidence(message: &Message, overflow_dir: Option<&Path>) {
-    if !is_compressed_tool_evidence_note(message) {
-        return;
+pub(super) fn archive_messages_to_overflow(
+    messages: &[Message],
+    overflow_dir: Option<&Path>,
+) -> Option<String> {
+    let dir = overflow_dir?;
+    let mut sink = OverflowSink::new(dir);
+    sink.push_messages(messages);
+    sink.flush()
+        .then(|| sink.file_path().to_string_lossy().to_string())
+}
+
+fn archive_truncated_field_to_overflow(
+    message: &Message,
+    field: MutableMessageField,
+    overflow_dir: Option<&Path>,
+) -> Option<String> {
+    let dir = overflow_dir?;
+    let mut sink = OverflowSink::new(dir);
+    if !sink.push_truncated_field(message, field) {
+        return None;
     }
+    sink.flush()
+        .then(|| sink.file_path().to_string_lossy().to_string())
+}
+
+fn insert_overflow_archive_note_if_exists(
+    messages: &mut Vec<Message>,
+    overflow_dir: Option<&Path>,
+) {
     let Some(dir) = overflow_dir else {
         return;
     };
-
-    let mut sink = OverflowSink::new(dir);
-    sink.push_messages(std::slice::from_ref(message));
-    let _ = sink.flush();
+    let archive_path = dir.join(OVERFLOW_HISTORY_FILENAME);
+    if archive_path.is_file() {
+        let archive_note = build_overflow_placeholder(&archive_path.to_string_lossy());
+        insert_archive_note_if_missing(messages, archive_note);
+    }
 }
 
 pub(in crate::ai) fn compressed_tool_evidence_exceeds_inline_budget(messages: &[Message]) -> bool {
@@ -936,10 +1005,17 @@ fn shrink_messages_to_fit(
                 // 避免同一小 user 被反复选中造成死循环。
                 break;
             }
-            // 其余可裁候选（assistant 纯叙述等，first_trim_candidate 已排除 tool
-            // 与带 tool_calls 的 assistant）保持原样删除。
-            let removed = messages.remove(idx);
-            archive_trimmed_compressed_tool_evidence(&removed, overflow_dir);
+            // 其余可裁候选（assistant 纯叙述、compressed_tool_round 等，first_trim_candidate
+            // 已排除 tool 与带 tool_calls 的 assistant）删除前先零压缩归档。若有
+            // overflow_dir 但写入失败，保留原文并退出裁剪循环，避免制造不可恢复丢失。
+            if let Some(dir) = overflow_dir {
+                let removed = messages[idx].clone();
+                if archive_messages_to_overflow(std::slice::from_ref(&removed), Some(dir)).is_none()
+                {
+                    break;
+                }
+            }
+            messages.remove(idx);
             continue;
         }
         break;
@@ -951,16 +1027,15 @@ fn shrink_messages_to_fit(
     // 在 `truncate_unprotected_messages_to_fit` **之前**注入，才能让最后一次截断把它
     // 占用的预算从其他可裁消息中腾出，避免返回轻微超 max_chars 的 payload。这与
     // `shrink_messages_to_fit_with_summary` 先插 summary note 再 truncate 的顺序一致。
-    if let Some(dir) = overflow_dir {
-        let archive_path = dir.join(OVERFLOW_HISTORY_FILENAME);
-        if archive_path.is_file() {
-            let archive_note = build_overflow_placeholder(&archive_path.to_string_lossy());
-            insert_archive_note_if_missing(&mut messages, archive_note);
-        }
-    }
+    insert_overflow_archive_note_if_exists(&mut messages, overflow_dir);
 
     if messages_total_chars(&messages) > max_chars {
-        truncate_unprotected_messages_to_fit(&mut messages, max_chars, protected_tool_call_ids);
+        truncate_unprotected_messages_to_fit(
+            &mut messages,
+            max_chars,
+            overflow_dir,
+            protected_tool_call_ids,
+        );
     }
 
     keep_only_recent_reasoning_content(&mut messages);
@@ -1024,6 +1099,9 @@ fn shrink_messages_to_fit_with_summary(
         return messages;
     }
     let had_leading_summary = messages.first().map(is_summary_message).unwrap_or(false);
+    // 归档失败时必须恢复首次删除前的完整顺序；直接把 dropped 插到头部会把它们
+    // 放到原本保留的 system prompt 之前，破坏 provider 要求的消息顺序。
+    let mut messages_before_first_drop: Option<Vec<Message>> = None;
     let mut dropped: Vec<Message> = Vec::new();
 
     while messages_total_chars(&messages) > max_chars {
@@ -1040,6 +1118,9 @@ fn shrink_messages_to_fit_with_summary(
             continue;
         }
         if let Some(idx) = first_trim_candidate(&messages, max_chars) {
+            if messages_before_first_drop.is_none() {
+                messages_before_first_drop = Some(messages.clone());
+            }
             dropped.push(messages.remove(idx));
             continue;
         }
@@ -1124,15 +1205,12 @@ fn shrink_messages_to_fit_with_summary(
                 }
                 insert_archive_note_if_missing(&mut messages, archive_note);
             } else {
-                // flush 失败：绝不删历史。把本轮已从 messages 移除、但尚未成功
-                // 落盘的 dropped 按原相对顺序放回头部（dropped 在循环中按时间升序
-                // 累积，且整组 tool_call/tool 作为连续块放入，故放回头部即恢复
-                // 原始时序、不破坏配对），随后立即返回——跳过摘要/归档 note 注入
+                // flush 失败：绝不删历史。恢复首次删除前的完整消息快照，随后立即
+                // 返回——跳过摘要/归档 note 注入
                 //（防止产生没有对应归档文件的悬空指针 note）、truncate 与 reasoning
                 // 清理。返回值可能仍超预算，但那是可恢复的（下轮重试压缩 / 请求层
                 // clamp），而数据丢失不可逆——遵守“写入失败严禁删除历史”的既有教训。
-                messages.splice(0..0, dropped);
-                return messages;
+                return messages_before_first_drop.unwrap_or(messages);
             }
         } else if dropped_has_user_turn
             && !has_leading_summary_now
@@ -1161,7 +1239,12 @@ fn shrink_messages_to_fit_with_summary(
     }
 
     if messages_total_chars(&messages) > max_chars {
-        truncate_mutable_messages_to_fit(&mut messages, max_chars, protected_tool_call_ids);
+        truncate_mutable_messages_to_fit(
+            &mut messages,
+            max_chars,
+            overflow_dir,
+            protected_tool_call_ids,
+        );
     }
 
     keep_only_recent_reasoning_content(&mut messages);
@@ -1182,16 +1265,24 @@ fn take_leading_summary(messages: &mut Vec<Message>) -> Option<Message> {
 /// assistant/tool 正文、reasoning 及超大 tool arguments。先保护当前高精度结果；若
 /// 仍无法达标，再允许截断这些结果。若不可裁的 system/user 自身已经超限，返回 false。
 fn truncate_mutable_messages_to_fit(
-    messages: &mut [Message],
+    messages: &mut Vec<Message>,
     max_chars: usize,
+    overflow_dir: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
-    truncate_mutable_messages_to_fit_with_policy(messages, max_chars, protected_tool_call_ids, true)
+    truncate_mutable_messages_to_fit_with_policy(
+        messages,
+        max_chars,
+        overflow_dir,
+        protected_tool_call_ids,
+        true,
+    )
 }
 
 fn truncate_mutable_messages_to_fit_with_policy(
-    messages: &mut [Message],
+    messages: &mut Vec<Message>,
     max_chars: usize,
+    overflow_dir: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
     allow_protected_fallback: bool,
 ) -> bool {
@@ -1206,6 +1297,7 @@ fn truncate_mutable_messages_to_fit_with_policy(
         return true;
     }
 
+    let mut blocked_fields = rustc_hash::FxHashSet::default();
     for include_protected in [false, true] {
         if include_protected && !allow_protected_fallback {
             break;
@@ -1225,6 +1317,7 @@ fn truncate_mutable_messages_to_fit_with_policy(
                 if !message_contains_image(&message.content)
                     && !is_preserved_tool_overflow_content(&message.content)
                     && content_chars > 160
+                    && !blocked_fields.contains(&(index, MutableMessageField::Content))
                 {
                     choose_larger_mutable_field(
                         &mut best,
@@ -1234,6 +1327,7 @@ fn truncate_mutable_messages_to_fit_with_policy(
                 if let Some(reasoning) = message.reasoning_content.as_deref()
                     && !reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX)
                     && reasoning.chars().count() > 160
+                    && !blocked_fields.contains(&(index, MutableMessageField::Reasoning))
                 {
                     choose_larger_mutable_field(
                         &mut best,
@@ -1247,14 +1341,13 @@ fn truncate_mutable_messages_to_fit_with_policy(
                 if let Some(tool_calls) = &message.tool_calls {
                     for (call_index, call) in tool_calls.iter().enumerate() {
                         let argument_chars = call.function.arguments.chars().count();
-                        if argument_chars > 160 {
+                        let field = MutableMessageField::ToolArguments(call_index);
+                        if argument_chars > 160
+                            && !blocked_fields.contains(&(index, field))
+                        {
                             choose_larger_mutable_field(
                                 &mut best,
-                                (
-                                    index,
-                                    MutableMessageField::ToolArguments(call_index),
-                                    argument_chars - 160,
-                                ),
+                                (index, field, argument_chars - 160),
                             );
                         }
                     }
@@ -1265,7 +1358,16 @@ fn truncate_mutable_messages_to_fit_with_policy(
                 break;
             };
             let reduce_by = excess.min(reducible).max(1);
-            truncate_mutable_field(&mut messages[message_index], field, reduce_by);
+            if !truncate_mutable_field(&mut messages[message_index], field, reduce_by, overflow_dir)
+            {
+                // 固定 marker / 归档路径可能已经是字段能达到的最小形态。
+                // 跳过无进展字段继续尝试其它候选，避免反复选择同一字段。
+                blocked_fields.insert((message_index, field));
+                continue;
+            }
+            insert_overflow_archive_note_if_exists(messages, overflow_dir);
+            // 首次插入 archive note 可能改变消息下标；成功缩短后重新评估候选。
+            blocked_fields.clear();
         }
     }
 
@@ -1275,13 +1377,15 @@ fn truncate_mutable_messages_to_fit_with_policy(
 /// 软压缩只裁未受保护字段；当前轮高精度 tool 结果必须留给真正的 hard-target
 /// 兜底处理，不能因为 soft threshold 较小就损失刚读到的精确上下文。
 fn truncate_unprotected_messages_to_fit(
-    messages: &mut [Message],
+    messages: &mut Vec<Message>,
     max_chars: usize,
+    overflow_dir: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
     truncate_mutable_messages_to_fit_with_policy(
         messages,
         max_chars,
+        overflow_dir,
         protected_tool_call_ids,
         false,
     )
@@ -1291,12 +1395,14 @@ fn truncate_unprotected_messages_to_fit(
 /// 继续收紧。两步都不删除消息或工具调用，也不改写 exact-replay 协议状态，因此
 /// assistant↔tool 配对及 reasoning continuation state 保持完整。
 fn emergency_cap_messages_to_fit(
-    messages: &mut [Message],
+    messages: &mut Vec<Message>,
     max_chars: usize,
     per_field_cap: usize,
+    overflow_dir: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
     minimize_overflow_stubs_for_hard_budget(messages);
+    let mut truncated_any = false;
     for message in messages.iter_mut() {
         if is_system_like_role(&message.role)
             || message.role == "user"
@@ -1309,10 +1415,11 @@ fn emergency_cap_messages_to_fit(
             && !is_preserved_tool_overflow_content(&message.content)
             && content_chars > per_field_cap
         {
-            truncate_mutable_field(
+            truncated_any |= truncate_mutable_field(
                 message,
                 MutableMessageField::Content,
                 content_chars - per_field_cap,
+                overflow_dir,
             );
         }
         if let Some(reasoning_chars) = message
@@ -1322,10 +1429,11 @@ fn emergency_cap_messages_to_fit(
             .map(|reasoning| reasoning.chars().count())
             && reasoning_chars > per_field_cap
         {
-            truncate_mutable_field(
+            truncated_any |= truncate_mutable_field(
                 message,
                 MutableMessageField::Reasoning,
                 reasoning_chars - per_field_cap,
+                overflow_dir,
             );
         }
         let tool_call_count = message.tool_calls.as_ref().map(Vec::len).unwrap_or(0);
@@ -1337,22 +1445,50 @@ fn emergency_cap_messages_to_fit(
                 .map(|call| call.function.arguments.chars().count())
                 .unwrap_or(0);
             if argument_chars > per_field_cap {
-                truncate_mutable_field(
+                truncated_any |= truncate_mutable_field(
                     message,
                     MutableMessageField::ToolArguments(call_index),
                     argument_chars - per_field_cap,
+                    overflow_dir,
                 );
             }
         }
     }
-    truncate_mutable_messages_to_fit(messages, max_chars, protected_tool_call_ids)
+    if truncated_any {
+        insert_overflow_archive_note_if_exists(messages, overflow_dir);
+    }
+    truncate_mutable_messages_to_fit(messages, max_chars, overflow_dir, protected_tool_call_ids)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum MutableMessageField {
     Content,
     Reasoning,
     ToolArguments(usize),
+}
+
+impl MutableMessageField {
+    fn archive_label(self) -> String {
+        match self {
+            MutableMessageField::Content => "content".to_string(),
+            MutableMessageField::Reasoning => "reasoning_content".to_string(),
+            MutableMessageField::ToolArguments(index) => {
+                format!("tool_calls[{index}].function.arguments")
+            }
+        }
+    }
+
+    fn original_text(self, message: &Message) -> Option<String> {
+        match self {
+            MutableMessageField::Content => Some(value_to_string(&message.content)),
+            MutableMessageField::Reasoning => message.reasoning_content.clone(),
+            MutableMessageField::ToolArguments(index) => message
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.get(index))
+                .map(|call| call.function.arguments.clone()),
+        }
+    }
 }
 
 fn choose_larger_mutable_field(
@@ -1367,52 +1503,115 @@ fn choose_larger_mutable_field(
     }
 }
 
-fn truncate_mutable_field(message: &mut Message, field: MutableMessageField, reduce_by: usize) {
+fn truncate_mutable_field(
+    message: &mut Message,
+    field: MutableMessageField,
+    reduce_by: usize,
+    overflow_dir: Option<&Path>,
+) -> bool {
     match field {
         MutableMessageField::Content => {
             if is_preserved_tool_overflow_content(&message.content) {
-                return;
+                return false;
             }
             let text = value_to_string(&message.content);
-            let target = text.chars().count().saturating_sub(reduce_by).max(160);
-            message.content = Value::String(format!(
-                "[context-overflow-truncated] head+tail preview:\n{}",
-                keep_ends_by_chars(&text, target.saturating_sub(64))
-            ));
+            let original_chars = text.chars().count();
+            let archive_file_path =
+                archive_truncated_field_to_overflow(message, field, overflow_dir);
+            let target = original_chars.saturating_sub(reduce_by).max(160);
+            let prefix = archive_file_path
+                .as_deref()
+                .map(|path| {
+                    format!(
+                        "[context-overflow-truncated] full original archived at: {path}\nhead+tail preview:\n"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "[context-overflow-truncated] head+tail preview:\n".to_string()
+                });
+            let preview_budget = target.saturating_sub(prefix.chars().count());
+            let truncated = format!("{prefix}{}", keep_ends_by_chars(&text, preview_budget));
+            // 固定协议文本可能比目标预算还长；只有严格变短才提交。
+            if truncated.chars().count() >= original_chars {
+                return false;
+            }
+            message.content = Value::String(truncated);
+            true
         }
         MutableMessageField::Reasoning => {
             let Some(reasoning) = message.reasoning_content.as_deref() else {
-                return;
+                return false;
             };
             // exact replay payload 必须逐字回放；保留 marker 却截断 payload 会令请求层
             // 解码失败。调用方应改裁其它字段，或在无法达标时保留该协议状态。
             if reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX) {
-                return;
+                return false;
             }
-            let target = reasoning.chars().count().saturating_sub(reduce_by).max(160);
-            message.reasoning_content = Some(format!(
-                "[context-overflow-truncated] {}",
-                keep_ends_by_chars(reasoning, target.saturating_sub(32))
-            ));
+            let original_chars = reasoning.chars().count();
+            let archive_file_path =
+                archive_truncated_field_to_overflow(message, field, overflow_dir);
+            let target = original_chars.saturating_sub(reduce_by).max(160);
+            let prefix = archive_file_path
+                .as_deref()
+                .map(|path| {
+                    format!("[context-overflow-truncated] full original archived at: {path}; ")
+                })
+                .unwrap_or_else(|| "[context-overflow-truncated] ".to_string());
+            let preview_budget = target.saturating_sub(prefix.chars().count());
+            let truncated = format!(
+                "{prefix}{}",
+                keep_ends_by_chars(reasoning, preview_budget)
+            );
+            if truncated.chars().count() >= original_chars {
+                return false;
+            }
+            message.reasoning_content = Some(truncated);
+            true
         }
         MutableMessageField::ToolArguments(call_index) => {
+            let Some(arguments) = message
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.get(call_index))
+                .map(|call| call.function.arguments.clone())
+            else {
+                return false;
+            };
+            let archive_file_path =
+                archive_truncated_field_to_overflow(message, field, overflow_dir);
+            let original_chars = arguments.chars().count();
+            let target = original_chars.saturating_sub(reduce_by).max(160);
+            let build_truncated = |preview: String| {
+                serde_json::json!({
+                    "_context_overflow_truncated": true,
+                    "original_chars": original_chars,
+                    "archive_file_path": archive_file_path.as_deref(),
+                    "preview": preview,
+                })
+                .to_string()
+            };
+            let fixed_chars = build_truncated(String::new()).chars().count();
+            let mut preview_budget = target.saturating_sub(fixed_chars);
+            let mut truncated = build_truncated(keep_ends_by_chars(&arguments, preview_budget));
+            // JSON escaping 可能让一个预览字符占用多个序列化字符，按实际超额收紧。
+            while truncated.chars().count() > target && preview_budget > 0 {
+                let excess = truncated.chars().count() - target;
+                preview_budget = preview_budget.saturating_sub(excess.max(1));
+                truncated = build_truncated(keep_ends_by_chars(&arguments, preview_budget));
+            }
+            if truncated.chars().count() >= original_chars {
+                return false;
+            }
             let Some(call) = message
                 .tool_calls
                 .as_mut()
                 .and_then(|calls| calls.get_mut(call_index))
             else {
-                return;
+                return false;
             };
-            let original_chars = call.function.arguments.chars().count();
-            let target = original_chars.saturating_sub(reduce_by).max(160);
-            let preview = keep_ends_by_chars(&call.function.arguments, target.saturating_sub(96));
             // arguments 必须继续是合法 JSON；直接截字符串会让 provider 拒绝整次请求。
-            call.function.arguments = serde_json::json!({
-                "_context_overflow_truncated": true,
-                "original_chars": original_chars,
-                "preview": preview,
-            })
-            .to_string();
+            call.function.arguments = truncated;
+            true
         }
     }
 }
@@ -1658,41 +1857,51 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 build_persisted_summary_text_with_app(app, &summary_source, summary_max_chars)
                     .await;
             if !summary.trim().is_empty() {
-                let mut out =
-                    Vec::with_capacity(preserved_system_end + 1 + (messages.len() - split_at));
-                // 1. 头部 system / internal_note（agent 指令等）原样保留
-                out.extend_from_slice(&messages[..preserved_system_end]);
-                // 2. 摘要作为 internal_note 注入（normalize_messages_for_request 会把
-                //    它归类成 Summary heading 并合并进 system 消息）
-                out.push(Message {
-                    role: ROLE_INTERNAL_NOTE.to_string(),
-                    content: Value::String(format!(
-                        "[mid-turn-summary] 早期工具调用与对话已被 LLM 摘要：\n{summary}"
-                    )),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                });
-                // 2b. 回填被抽出的 context checkpoint 标记，保留其可回读索引
-                out.extend(checkpoint_markers.iter().cloned());
-                // 3. 尾窗：保留 user 逐字 + 最近若干工具组逐字，更早工具组折叠成 stub
-                let (tail, _) = fold_early_tool_groups(
-                    &messages[split_at..],
-                    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS,
-                    Some(overflow_dir.as_path()),
-                    &protected_tool_call_ids,
-                );
-                out.extend(tail);
-                let after = messages_total_chars(&out);
-                if after < best_after {
-                    best = Some(out);
-                    best_after = after;
-                }
-                // 有效压缩且达标 → 直接返回
-                if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS
-                    && best_after <= hard_target
+                // Path A 会用摘要替换 earlier 原文；若归档失败，跳过该路径并保留
+                // 原始 messages 进入后续折叠/硬预算兜底，避免摘要成为唯一证据。
+                if let Some(archive_file_path) =
+                    archive_messages_to_overflow(earlier, Some(overflow_dir.as_path()))
                 {
-                    return (best.unwrap(), before, best_after, true);
+                    let mut out =
+                        Vec::with_capacity(preserved_system_end + 2 + (messages.len() - split_at));
+                    // 1. 头部 system / internal_note（agent 指令等）原样保留
+                    out.extend_from_slice(&messages[..preserved_system_end]);
+                    // 2. 摘要作为 internal_note 注入（normalize_messages_for_request 会把
+                    //    它归类成 Summary heading 并合并进 system 消息）
+                    out.push(Message {
+                        role: ROLE_INTERNAL_NOTE.to_string(),
+                        content: Value::String(format!(
+                            "[mid-turn-summary] 早期工具调用与对话已被 LLM 摘要：\n{summary}"
+                        )),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                    insert_archive_note_if_missing(
+                        &mut out,
+                        build_overflow_placeholder(&archive_file_path),
+                    );
+                    // 2b. 回填被抽出的 context checkpoint 标记，保留其可回读索引
+                    out.extend(checkpoint_markers.iter().cloned());
+                    // 3. 尾窗：保留 user 逐字 + 最近若干工具组逐字，更早工具组折叠成 stub
+                    let (tail, _) = fold_early_tool_groups(
+                        &messages[split_at..],
+                        MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS,
+                        Some(overflow_dir.as_path()),
+                        &protected_tool_call_ids,
+                    );
+                    out.extend(tail);
+                    let after = messages_total_chars(&out);
+                    if after < best_after {
+                        best = Some(out);
+                        best_after = after;
+                    }
+                    // 有效压缩且达标 → 直接返回
+                    if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS
+                        && best_after <= hard_target
+                    {
+                        return (best.unwrap(), before, best_after, true);
+                    }
                 }
             }
         }
@@ -1753,6 +1962,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         &mut result,
         hard_target,
         PATH_C_PER_MSG_CAP,
+        Some(overflow_dir.as_path()),
         &lossless_tool_call_ids,
     );
     let after = messages_total_chars(&result);

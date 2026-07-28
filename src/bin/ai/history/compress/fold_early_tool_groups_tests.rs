@@ -76,6 +76,15 @@ fn assert_tool_pairs_consistent(messages: &[Message]) {
     );
 }
 
+fn archive_file_path_from_text(text: &str) -> String {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("- archive_file_path: "))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .expect("text should contain archive_file_path")
+        .to_string()
+}
+
 #[test]
 fn folds_early_groups_in_a_single_bloated_turn() {
     let messages = single_turn_with_groups(10, 2_000);
@@ -491,6 +500,7 @@ fn path_c_preserves_exact_replay_reasoning_verbatim() {
         &mut per_field_capped,
         usize::MAX,
         160,
+        None,
         &FxHashSet::default(),
     ));
     assert_eq!(
@@ -499,11 +509,12 @@ fn path_c_preserves_exact_replay_reasoning_verbatim() {
     );
 
     let mut directly_capped = assistant.clone();
-    truncate_mutable_field(
+    assert!(!truncate_mutable_field(
         &mut directly_capped,
         MutableMessageField::Reasoning,
         encoded.chars().count(),
-    );
+        None,
+    ));
     assert_eq!(
         directly_capped.reasoning_content.as_deref(),
         Some(encoded.as_str())
@@ -515,6 +526,7 @@ fn path_c_preserves_exact_replay_reasoning_verbatim() {
         &mut aggregate_capped,
         160,
         usize::MAX,
+        None,
         &FxHashSet::default(),
     ));
     assert_eq!(
@@ -532,6 +544,106 @@ fn path_c_preserves_exact_replay_reasoning_verbatim() {
         .as_deref(),
         Some(raw_reasoning.as_str())
     );
+}
+
+#[test]
+fn truncating_mutable_content_archives_original_field() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-truncate-field-{}", uuid::Uuid::new_v4()));
+    let original = format!("prefix-{}-suffix", "x".repeat(2_000));
+    let mut message = msg("assistant", &original);
+
+    assert!(truncate_mutable_field(
+        &mut message,
+        MutableMessageField::Content,
+        1_600,
+        Some(overflow_dir.as_path()),
+    ));
+
+    let truncated = value_to_string(&message.content);
+    assert!(
+        truncated.contains("[context-overflow-truncated] full original archived at:"),
+        "{truncated}"
+    );
+    assert!(truncated.contains("head+tail preview"), "{truncated}");
+
+    let archived = std::fs::read_to_string(overflow_dir.join("overflow-history.md"))
+        .expect("truncated original field should be archived");
+    assert!(archived.contains("- field: content"), "{archived}");
+    assert!(archived.contains(&original), "{archived}");
+    assert!(archived.contains("raw_message_json"), "{archived}");
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn hard_budget_truncation_converges_with_archive_pointer_overhead() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-truncate-converges-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("assistant", &"x".repeat(4_000))];
+
+    assert!(truncate_mutable_messages_to_fit(
+        &mut messages,
+        700,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    ));
+    assert!(messages_total_chars(&messages) <= 700);
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn hard_budget_truncation_falls_back_when_archive_write_fails() {
+    let blocked_dir =
+        std::env::temp_dir().join(format!("ai-truncate-blocked-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&blocked_dir, "not a directory").expect("create blocking file");
+    let overflow_dir = blocked_dir.join("session-assets");
+    let mut messages = vec![msg("assistant", &"x".repeat(4_000))];
+
+    assert!(truncate_mutable_messages_to_fit(
+        &mut messages,
+        600,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    ));
+    assert!(messages_total_chars(&messages) <= 600);
+    assert!(
+        !value_to_string(&messages[0].content).contains("full original archived at:"),
+        "failed archive must not leave a dangling pointer"
+    );
+
+    let _ = std::fs::remove_file(blocked_dir);
+}
+
+#[test]
+fn summary_shrink_preserves_system_order_when_archive_write_fails() {
+    let blocked_dir =
+        std::env::temp_dir().join(format!("ai-summary-blocked-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&blocked_dir, "not a directory").expect("create blocking file");
+    let overflow_dir = blocked_dir.join("session-assets");
+    let messages = vec![
+        msg("system", "system prompt"),
+        msg("assistant", &"old answer ".repeat(600)),
+        msg("user", "recent request"),
+    ];
+
+    let shrunk = shrink_messages_to_fit_with_summary(
+        messages,
+        500,
+        200,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
+
+    assert_eq!(shrunk.len(), 3);
+    assert_eq!(shrunk[0].role, "system");
+    assert_eq!(shrunk[1].role, "assistant");
+    assert_eq!(shrunk[2].role, "user");
+    assert_eq!(value_to_string(&shrunk[0].content), "system prompt");
+    assert_eq!(value_to_string(&shrunk[2].content), "recent request");
+
+    let _ = std::fs::remove_file(blocked_dir);
 }
 
 #[test]
@@ -664,6 +776,63 @@ fn folded_tool_group_keeps_assistant_checkpoint_and_evidence_targets() {
         stub.contains("compression_decision: reuse the evidence above"),
         "{stub}"
     );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn folded_tool_group_points_to_raw_group_archive() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-raw-group-archive-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("system", "s"), msg("user", "查找 needle")];
+    messages.push(assistant_call_args_with_content(
+        "grep-raw",
+        "text_grep",
+        r#"{"pattern":"needle","path":"src/bin/ai"}"#,
+        "准备按 needle 搜索目标模块。",
+    ));
+    messages.push(tool_result(
+        "grep-raw",
+        "src/bin/ai/example.rs:42: unique raw grep result",
+    ));
+    for i in 0..4 {
+        let id = format!("later-raw-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "later"));
+    }
+
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
+    assert_eq!(folded_groups, 1);
+    let stub = folded
+        .iter()
+        .find(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && value_to_string(&message.content)
+                    .contains("- archive_scope: folded_tool_group_raw_messages")
+        })
+        .map(|message| value_to_string(&message.content))
+        .expect("folded group should expose an archive pointer");
+
+    assert!(
+        stub.contains("- archive_scope: folded_tool_group_raw_messages"),
+        "{stub}"
+    );
+    let archive_path = archive_file_path_from_text(&stub);
+    let archived = std::fs::read_to_string(&archive_path)
+        .expect("folded group raw archive should be readable");
+    assert!(archived.contains("grep-raw"), "{archived}");
+    assert!(archived.contains("text_grep"), "{archived}");
+    assert!(
+        archived.contains("准备按 needle 搜索目标模块。"),
+        "{archived}"
+    );
+    assert!(archived.contains("unique raw grep result"), "{archived}");
+    assert!(archived.contains("raw_message_json"), "{archived}");
 
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
@@ -1039,6 +1208,10 @@ fn assistant_call_args_multi(id: &str, calls: &[(&str, &str)]) -> Message {
 /// 会因拿不到精确 context 再次 patch 失败、陷入"重读→再失败"循环。
 #[test]
 fn preserves_read_file_for_pending_patch_path() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-pending-patch-fold-{}",
+        uuid::Uuid::new_v4()
+    ));
     let mut messages = vec![msg("system", "s"), msg("user", "改代码")];
     // 早期：read_file 读 /a.rs（将被 apply_patch 引用）。
     messages.push(assistant_call_args(
@@ -1048,7 +1221,7 @@ fn preserves_read_file_for_pending_patch_path() {
     ));
     messages.push(tool_result(
         "call-rf",
-        "Output preserved for non-compressible tool `read_file`.\n- file_path: /a.rs\n- use read_file to inspect exact content.",
+        "PENDING_READ_SENTINEL\nOutput preserved for non-compressible tool `read_file`.\n- file_path: /a.rs\n- use read_file to inspect exact content.",
     ));
     // apply_patch 针对 /a.rs 失败（pending）。
     messages.push(assistant_call_args(
@@ -1067,7 +1240,12 @@ fn preserves_read_file_for_pending_patch_path() {
         messages.push(tool_result(&id, "recent"));
     }
 
-    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
     assert!(folded_groups >= 1, "应至少折叠 apply_patch/grep 组");
     // read_file 组必须逐字保留（不是 ROLE_INTERNAL_NOTE stub）。
     let rf = folded
@@ -1083,6 +1261,13 @@ fn preserves_read_file_for_pending_patch_path() {
         .expect("pending-patch 路径的 read_file 组不应被折叠");
     let _ = rf; // 仅断言其存在且 role 仍为 assistant
     assert_tool_pairs_consistent(&folded);
+    let archive = std::fs::read_to_string(overflow_dir.join(OVERFLOW_HISTORY_FILENAME))
+        .expect("other folded groups should create overflow archive");
+    assert!(
+        !archive.contains("PENDING_READ_SENTINEL"),
+        "pending-patch read group must not be archived while it remains inline"
+    );
+    let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
 #[test]
