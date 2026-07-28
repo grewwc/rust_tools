@@ -413,7 +413,7 @@ fn maybe_promote_stable_self_note(
         return;
     }
 
-    let recent_self_notes = match store.entries_by_category("self_note", 200, false) {
+    let recent_self_notes = match store.entries_by_category_current_file("self_note", 200) {
         Ok(entries) => entries,
         Err(_) => return,
     };
@@ -745,7 +745,7 @@ fn previous_evolution_guideline_from(
 
 fn reflection_evolution_guidelines(store: &MemoryStore) -> Vec<AgentMemoryEntry> {
     store
-        .entries_by_category("coding_guideline", 500, false)
+        .entries_by_category_current_file("coding_guideline", 500)
         .ok()
         .unwrap_or_default()
         .into_iter()
@@ -838,7 +838,7 @@ fn demote_contradicting_self_notes(store: &MemoryStore, new_note: &str) {
     let Some((new_do, new_avoid)) = split_do_avoid(new_note) else {
         return;
     };
-    let recent = match store.entries_by_category("self_note", 100, false) {
+    let recent = match store.entries_by_category_current_file("self_note", 100) {
         Ok(e) => e,
         Err(_) => return,
     };

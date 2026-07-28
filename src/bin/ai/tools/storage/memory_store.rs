@@ -517,12 +517,34 @@ impl MemoryStore {
         limit: usize,
         include_archives: bool,
     ) -> Result<Vec<AgentMemoryEntry>, String> {
+        self.entries_by_category_from_paths(category, limit, || {
+            self.memory_files_to_scan(include_archives)
+        })
+    }
+
+    pub(crate) fn entries_by_category_current_file(
+        &self,
+        category: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentMemoryEntry>, String> {
+        self.entries_by_category_from_paths(category, limit, || Ok(vec![self.path.clone()]))
+    }
+
+    fn entries_by_category_from_paths<F>(
+        &self,
+        category: &str,
+        limit: usize,
+        files: F,
+    ) -> Result<Vec<AgentMemoryEntry>, String>
+    where
+        F: FnOnce() -> Result<Vec<PathBuf>, String>,
+    {
         if limit == 0 {
             return Ok(Vec::new());
         }
 
         let mut window: VecDeque<AgentMemoryEntry> = VecDeque::new();
-        for path in self.memory_files_to_scan(include_archives)? {
+        for path in files()? {
             if !path.exists() {
                 continue;
             }
@@ -2016,7 +2038,11 @@ mod retention_tests {
             .and_then(|n| n.to_str())
             .unwrap()
             .to_string();
-        let legacy_base = path.file_stem().and_then(|n| n.to_str()).unwrap().to_string();
+        let legacy_base = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
 
         // 主文件：1 条 memo
         write_lines(
@@ -2080,5 +2106,55 @@ mod retention_tests {
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_file(legacy_path);
+    }
+
+    #[test]
+    fn entries_by_category_current_file_ignores_global_archive_search() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let cfg_path = unique_path("current_only_config");
+        std::fs::write(
+            &cfg_path,
+            "ai.memory.search_archives.enable = true\nai.memory.search_archives.keep_last = 10\n",
+        )
+        .unwrap();
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
+        crate::commonw::configw::refresh();
+
+        let path = unique_path("current_only");
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let base = path.file_name().and_then(|n| n.to_str()).unwrap();
+        let archive_path = parent.join(format!("{base}.20260729120000"));
+
+        write_lines(
+            &path,
+            &[entry("memo", "main memo", "2026-07-29T00:00:00Z", 100)],
+        );
+        write_lines(
+            &archive_path,
+            &[entry("memo", "archive memo", "2026-07-28T00:00:00Z", 100)],
+        );
+
+        let store = MemoryStore::for_tests_with_path(path.clone());
+        let configured_scan = store.entries_by_category("memo", 10, false).unwrap();
+        let current_only = store.entries_by_category_current_file("memo", 10).unwrap();
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+
+        let _ = std::fs::remove_file(cfg_path);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(archive_path);
+
+        assert_eq!(configured_scan.len(), 2);
+        assert_eq!(current_only.len(), 1);
+        assert_eq!(current_only[0].note, "main memo");
     }
 }
