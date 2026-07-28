@@ -35,6 +35,30 @@ use super::{BgSubagentGuard, TASK_PID, terminate_and_cleanup};
 
 const MAX_SUBAGENT_STATUS_DETAILS: usize = 3;
 
+/// 后台 subagent 的历史只在进程仍可继续调度时保留。正常终止、失败、panic 或
+/// `task_cancel` 导致 future 被 abort 时都会通过 Drop 清理。
+struct BackgroundSubagentHistoryGuard {
+    path: Option<PathBuf>,
+}
+
+impl BackgroundSubagentHistoryGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn preserve(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for BackgroundSubagentHistoryGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = crate::ai::history::delete_subagent_history(&path);
+        }
+    }
+}
+
 /// 前台唯一的 subagent 状态展示。后台任务保持静默，只在调度循环的安全点刷新
 /// 一条紧凑状态行，避免并发正文或多行 ANSI 重绘打乱 terminal。
 pub(super) struct SubagentStatusLine {
@@ -173,7 +197,10 @@ impl Drop for SubagentStatusLine {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_subagent_elapsed, render_subagent_status_line, sanitize_status_field};
+    use super::{
+        BackgroundSubagentHistoryGuard, format_subagent_elapsed, render_subagent_status_line,
+        sanitize_status_field,
+    };
     use crate::ai::tools::task_tools::SubagentTerminalStatus;
 
     #[test]
@@ -220,6 +247,31 @@ mod tests {
         assert_eq!(format_subagent_elapsed(59), "59s");
         assert_eq!(format_subagent_elapsed(60), "1m0s");
     }
+
+    #[test]
+    fn background_subagent_history_guard_cleans_or_preserves_history() {
+        let root = std::env::temp_dir().join(format!(
+            "background-subagent-history-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let cleaned = root.join("session.proc-1.sqlite");
+        std::fs::write(&cleaned, b"db").unwrap();
+        std::fs::write(format!("{}-wal", cleaned.display()), b"wal").unwrap();
+        drop(BackgroundSubagentHistoryGuard::new(cleaned.clone()));
+        assert!(!cleaned.exists());
+        assert!(!std::path::Path::new(&format!("{}-wal", cleaned.display())).exists());
+
+        let preserved = root.join("session.proc-2.sqlite");
+        std::fs::write(&preserved, b"db").unwrap();
+        let mut guard = BackgroundSubagentHistoryGuard::new(preserved.clone());
+        guard.preserve();
+        drop(guard);
+        assert!(preserved.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// Dispatch a batch of background processes: select ready processes, decode
@@ -258,6 +310,7 @@ pub(super) fn dispatch_background_batch(
         Option<String>,
         Option<crate::ai::models::AutoModelFallbackSpec>,
         usize,
+        bool,
         bool,
     )> = Vec::new();
     for proc in &background_procs {
@@ -301,16 +354,19 @@ pub(super) fn dispatch_background_batch(
             &mailbox_messages,
         );
 
-        {
+        let initialize_history = {
             let mut os = app.os.lock().unwrap();
             os.set_current_pid(Some(pid));
+            let mut initialize_history = false;
             if let Some(p) = os.get_process_mut(pid) {
-                if p.history_file.is_none() {
+                initialize_history = p.history_file.is_none();
+                if initialize_history {
                     p.history_file = Some(process_history_path(&original_history_file, pid));
                 }
                 let _ = os.process_pending_signals();
             }
-        }
+            initialize_history
+        };
 
         let history_path = process_history_path(&original_history_file, pid);
         task_specs.push((
@@ -327,6 +383,7 @@ pub(super) fn dispatch_background_batch(
             task_goal.as_ref().and_then(|goal| goal.auto_model_fallback),
             task_goal.as_ref().map(|goal| goal.spawn_depth).unwrap_or(0),
             is_resume_wakeup,
+            initialize_history,
         ));
     }
 
@@ -342,6 +399,7 @@ pub(super) fn dispatch_background_batch(
         auto_model_fallback,
         spawn_depth,
         is_resume_wakeup,
+        initialize_history,
     ) in task_specs
     {
         let mut task_app = app.clone();
@@ -384,13 +442,27 @@ pub(super) fn dispatch_background_batch(
             .as_deref()
             .and_then(|tid| crate::ai::tools::task_tools::with_task_entry(tid, |e| e.inherit))
             .unwrap_or_default();
-        let (effective_history, task_skills) = resolve_background_subagent_context(
+        let (effective_history, task_skills) = match resolve_background_subagent_context(
             history_path,
             original_history_file.as_path(),
             skill_manifests,
             task_id.as_deref(),
             inherit,
-        );
+            initialize_history,
+        ) {
+            Ok(context) => context,
+            Err(err) => {
+                let mut os = app.os.lock().unwrap();
+                publish_background_task_failure(
+                    os.as_mut(),
+                    pid,
+                    result_channel_id,
+                    completion_futex_addr,
+                    &err,
+                );
+                continue;
+            }
+        };
         task_app.session_history_file = effective_history;
         let task_driver_ctx = runtime_ctx::DriverContext::new(
             task_app.clone(),
@@ -411,6 +483,8 @@ pub(super) fn dispatch_background_batch(
         let result_slot_for_scope = result_slot_for_payload.clone();
 
         let inner_fut = TASK_PID.scope(Some(pid), async move {
+            let mut history_guard =
+                BackgroundSubagentHistoryGuard::new(task_app.session_history_file.clone());
             crate::ai::tools::registry::common::clear_tool_cancel();
             let run = runtime_ctx::IS_RESUME_TURN.scope(
                 is_resume_wakeup,
@@ -473,7 +547,7 @@ pub(super) fn dispatch_background_batch(
             if publish_task_result && let Some(addr) = completion_futex_addr {
                 let _ = os.futex_store(addr, 1);
             }
-            match result {
+            let preserve_history = match result {
                 Ok(_outcome) => {
                     let outcome = classify_process_outcome(&**os, pid);
                     record_scheduler_outcome(os.as_mut(), pid, outcome);
@@ -482,15 +556,24 @@ pub(super) fn dispatch_background_batch(
                         finalize_turn_quota(os.as_mut(), pid);
                     if should_terminate {
                         terminate_and_cleanup(os.as_mut(), pid, termination_result, true);
+                        false
                     } else if os.is_round_robin() {
                         os.set_current_pid(Some(pid));
                         os.requeue_current();
+                        true
+                    } else {
+                        true
                     }
                 }
                 Err(err) => {
                     record_scheduler_outcome(os.as_mut(), pid, DispatchOutcomeTag::Failed);
                     terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), true);
+                    false
                 }
+            };
+            drop(os);
+            if preserve_history {
+                history_guard.preserve();
             }
         });
 

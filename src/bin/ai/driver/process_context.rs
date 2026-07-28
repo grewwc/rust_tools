@@ -43,19 +43,25 @@ pub(super) fn resolve_background_subagent_context(
     skill_manifests: &Arc<Vec<SkillManifest>>,
     task_id: Option<&str>,
     inherit: crate::ai::tools::task_tools::InheritOptions,
-) -> (PathBuf, Arc<Vec<SkillManifest>>) {
+    initialize_history: bool,
+) -> Result<(PathBuf, Arc<Vec<SkillManifest>>), String> {
     let is_task_subagent = task_id.is_some();
-    let effective_history = if is_task_subagent && inherit.history {
-        original_history_file.to_path_buf()
-    } else {
-        history_path
-    };
+    // 是否首次派发由 Process.history_file 决定，不能由 mailbox 推断：SIGCONT 唤醒
+    // 不会写 mailbox，但仍必须复用 child 库，避免覆盖此前的执行历史。
+    crate::ai::history::prepare_subagent_history(
+        original_history_file,
+        &history_path,
+        is_task_subagent && inherit.history,
+        initialize_history,
+    )
+    .map_err(|err| format!("准备子代理历史失败：{err}"))?;
+    let effective_history = history_path;
     let effective_skills = if is_task_subagent && !inherit.skills {
         Arc::new(Vec::new())
     } else {
         skill_manifests.clone()
     };
-    (effective_history, effective_skills)
+    Ok((effective_history, effective_skills))
 }
 
 pub(super) fn build_background_process_question(

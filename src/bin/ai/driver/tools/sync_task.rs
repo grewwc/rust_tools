@@ -36,6 +36,7 @@ use serde_json::Value;
 use crate::ai::{
     agents,
     driver::{runtime_ctx, turn_runtime},
+    history,
     tools::task_tools,
     types::ToolResult,
 };
@@ -48,6 +49,27 @@ use super::super::runtime_ctx::DriverContext;
 /// minutes is enough to return useful partial evidence without wedging the
 /// parent turn for an interactive session.
 const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(300);
+
+struct SyncSubagentHistoryGuard {
+    path: PathBuf,
+}
+
+impl SyncSubagentHistoryGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for SyncSubagentHistoryGuard {
+    fn drop(&mut self) {
+        if let Err(error) = history::delete_subagent_history(&self.path) {
+            eprintln!(
+                "[Warning] failed to clean up sync subagent history {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
 
 /// 子代理"运行中"心跳的刷新间隔。同步子 agent 自身不直接拥有 terminal；
 /// 前台等待循环用这条单行 heartbeat 展示进度，直到任务完成/取消/超时。
@@ -93,10 +115,18 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     let parent_history_path = ctx.app_proto.session_history_file.clone();
     let task_id = uuid::Uuid::new_v4().simple().to_string();
 
-    if !prepared.inherit.history {
-        task_app.session_history_file =
-            subagent_history_path(&task_app.session_history_file, &task_id);
-    }
+    let parent_history = task_app.session_history_file.clone();
+    let child_history = subagent_history_path(&parent_history, &task_id);
+    crate::ai::history::prepare_subagent_history(
+        &parent_history,
+        &child_history,
+        prepared.inherit.history,
+        true,
+    )
+    .map_err(|err| format!("准备同步子代理历史失败：{err}"))?;
+    let _history_cleanup = SyncSubagentHistoryGuard::new(child_history.clone());
+    // 无论是否继承，子代理都只写自己的历史文件，绝不能写回父 canonical history。
+    task_app.session_history_file = child_history;
 
     if let Some(agent) =
         agents::find_agent_by_name(ctx.agent_manifests.as_ref(), &prepared.agent_name)
@@ -261,6 +291,9 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     if join_result.is_err() {
         subagent_handle.abort();
     }
+    // `abort` 只发出取消请求；必须等任务真正退出后才能删除仍可能被它写入的 DB。
+    let _ =
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(subagent_handle));
 
     let duration = started.elapsed();
     let elapsed_secs = duration.as_secs_f64();
@@ -468,7 +501,10 @@ mod tests {
 
         suppress_subagent_terminal_output(fut).await;
 
-        assert!(!rx.await.expect("subagent future should report terminal state"));
+        assert!(
+            !rx.await
+                .expect("subagent future should report terminal state")
+        );
         assert!(runtime_ctx::terminal_output_enabled());
     }
 
@@ -570,11 +606,114 @@ mod tests {
 
     #[test]
     fn subagent_history_path_preserves_sqlite_extension() {
-        let got = subagent_history_path(
-            std::path::Path::new("/tmp/session.sqlite"),
-            "abc123",
-        );
+        let got = subagent_history_path(std::path::Path::new("/tmp/session.sqlite"), "abc123");
 
-        assert_eq!(got, std::path::PathBuf::from("/tmp/session.subagent-abc123.sqlite"));
+        assert_eq!(
+            got,
+            std::path::PathBuf::from("/tmp/session.subagent-abc123.sqlite")
+        );
+    }
+
+    #[test]
+    fn subagent_history_path_preserves_text_extension() {
+        let got = subagent_history_path(std::path::Path::new("/tmp/session.txt"), "abc123");
+
+        assert_eq!(
+            got,
+            std::path::PathBuf::from("/tmp/session.subagent-abc123.txt")
+        );
+    }
+
+    #[test]
+    fn inherited_sync_subagent_history_is_forked_from_parent() {
+        let root =
+            std::env::temp_dir().join(format!("ai-sync-history-fork-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let parent_path = root.join("session.sqlite");
+        let child_path = subagent_history_path(&parent_path, "abc123");
+        let parent = rusqlite::Connection::open(&parent_path).unwrap();
+        parent
+            .execute("CREATE TABLE evidence(value TEXT)", [])
+            .unwrap();
+        parent
+            .execute("INSERT INTO evidence VALUES ('parent')", [])
+            .unwrap();
+        drop(parent);
+
+        crate::ai::history::prepare_subagent_history(&parent_path, &child_path, true, true)
+            .unwrap();
+
+        let child = rusqlite::Connection::open(&child_path).unwrap();
+        assert_eq!(
+            child
+                .query_row("SELECT value FROM evidence", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "parent"
+        );
+        drop(child);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_subagent_text_history_uses_text_backend() {
+        let root =
+            std::env::temp_dir().join(format!("ai-sync-text-history-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let parent_path = root.join("session.txt");
+        let inherited_path = subagent_history_path(&parent_path, "inherited");
+        let empty_path = subagent_history_path(&parent_path, "empty");
+        std::fs::write(&parent_path, "user:parent evidence\n").unwrap();
+
+        crate::ai::history::prepare_subagent_history(&parent_path, &inherited_path, true, true)
+            .unwrap();
+        crate::ai::history::prepare_subagent_history(&parent_path, &empty_path, false, true)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&inherited_path).unwrap(),
+            "user:parent evidence\n"
+        );
+        assert_eq!(std::fs::read_to_string(&empty_path).unwrap(), "");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_subagent_history_guard_removes_database_sidecars_and_lock() {
+        let root =
+            std::env::temp_dir().join(format!("ai-sync-history-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let child_path = root.join("session.subagent-child.sqlite");
+        std::fs::write(&child_path, b"db").unwrap();
+        std::fs::write(format!("{}-wal", child_path.display()), b"wal").unwrap();
+        std::fs::write(format!("{}-shm", child_path.display()), b"shm").unwrap();
+        let lock_path = child_path.with_file_name(format!(
+            ".{}.state.lock",
+            child_path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&lock_path, b"").unwrap();
+
+        drop(SyncSubagentHistoryGuard::new(child_path.clone()));
+
+        assert!(!child_path.exists());
+        assert!(!std::path::Path::new(&format!("{}-wal", child_path.display())).exists());
+        assert!(!std::path::Path::new(&format!("{}-shm", child_path.display())).exists());
+        assert!(!lock_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inherited_sync_subagent_history_fork_failure_is_returned() {
+        let root =
+            std::env::temp_dir().join(format!("sync-task-fork-error-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let child = root.join("child.sqlite");
+
+        let error =
+            crate::ai::history::prepare_subagent_history(&root, &child, true, true).unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+        assert!(!child.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -3,11 +3,12 @@ use super::{
     SUBAGENT_PARENT_SUMMARY_REMINDER, SUBAGENT_WALL_CLOCK_TIMEOUT, SelectedSubagent,
     StoredTaskResult, TASK_REGISTRY, WaitManySource, append_current_process_cancel_source,
     build_outstanding_task_anchor, build_selection_explanation, capped_subagent_manifest,
-    encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels, execute_task_cancel,
-    execute_task_spawn, execute_task_status, execute_task_wait, expire_task_wait_states_for_test,
-    format_task_result, insert_task_entry_for_test, is_encoded_task_goal, prepare_subagent_task,
-    reap_timed_out_subagents, remove_task_entry, render_outstanding_task_anchor, select_subagent,
-    wait_sources_for_channel_and_futex, wake_expired_task_waits, with_task_entry_by_pid,
+    discard_tasks_for_session, encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels,
+    execute_task_cancel, execute_task_spawn, execute_task_status, execute_task_wait,
+    expire_task_wait_states_for_test, format_task_result, insert_task_entry_for_test,
+    is_encoded_task_goal, prepare_subagent_task, reap_timed_out_subagents, remove_task_entry,
+    render_outstanding_task_anchor, select_subagent, wait_sources_for_channel_and_futex,
+    wake_expired_task_waits, with_task_entry_by_pid,
 };
 use super::{ToolRegistration, ToolSpec};
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
@@ -1276,6 +1277,85 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
     let os = app.os.lock().unwrap();
     assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
     assert!(os.futex_event_id(completion_futex_addr).is_none());
+
+    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        *guard = None;
+    }
+}
+
+#[tokio::test]
+async fn discarding_session_tasks_aborts_workers_and_releases_results() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (root, pid, result_channel_id, completion_futex_addr) = {
+        let mut os = app.os.lock().unwrap();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        let pid = os
+            .spawn(
+                Some(root),
+                "child".to_string(),
+                "goal".to_string(),
+                20,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        let channel = os.channel_create_tagged_with_holders(
+            Some(root),
+            1,
+            "task-result".to_string(),
+            aios_kernel::primitives::ChannelOwnerTag::TaskResult,
+            vec![
+                "task_result.producer".to_string(),
+                "task_result.consumer".to_string(),
+            ],
+        );
+        let completion_futex = os.futex_create(0, "task-complete".to_string());
+        (root, pid, channel.raw(), completion_futex)
+    };
+
+    let worker = tokio::spawn(std::future::pending::<()>());
+    insert_task_entry_for_test(
+        task_id.clone(),
+        AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            result_observed: false,
+            owner_pid: root,
+            pid,
+            result_channel_id,
+            completion_futex_addr,
+            description: "deleted session branch".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            abort_handle: Some(worker.abort_handle()),
+            started_at: Instant::now(),
+        },
+    );
+
+    discard_tasks_for_session(&app.session_id);
+
+    assert!(
+        worker
+            .await
+            .expect_err("session deletion must stop its Tokio worker")
+            .is_cancelled()
+    );
+    assert!(remove_task_entry(&task_id).is_none());
+    let os = app.os.lock().unwrap();
+    assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
+    assert!(os.futex_event_id(completion_futex_addr).is_none());
+    drop(os);
 
     if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         *guard = None;

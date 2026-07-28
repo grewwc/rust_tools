@@ -443,6 +443,9 @@ pub fn try_handle_session_command(
             let mut deleted_current = false;
             for id in &ids {
                 let deleted_path = store.session_history_file(id);
+                // 必须先终止该 session 尚在执行的 subagent；否则删除 SQLite 后，
+                // 活跃 Future 仍可能再次写入并重建派生历史。
+                crate::ai::tools::task_tools::discard_tasks_for_session(id);
                 let deleted = store.delete_session(id)?;
                 if deleted {
                     crate::ai::history::invalidate_context_history_cache_for(&deleted_path);

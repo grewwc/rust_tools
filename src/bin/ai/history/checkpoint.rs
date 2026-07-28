@@ -22,8 +22,10 @@ use rust_tools::commonw::FastMap;
 
 use crate::ai::history::SessionStore;
 
-use super::{sessions::copy_dir_recursively, sqlite::backup_sqlite};
-
+use super::{
+    sessions::copy_dir_recursively,
+    sqlite::{backup_sqlite, restore_sqlite_after_rollback},
+};
 const MAX_CHECKPOINTS_PER_SESSION: usize = 20;
 const MAX_CHECKPOINT_STORAGE_BYTES: u64 = 512 * 1024 * 1024;
 const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
@@ -167,7 +169,7 @@ impl CheckpointStore {
                     if let Some(parent) = store.session_file.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    backup_sqlite(&sqlite, &store.session_file)
+                    restore_sqlite_after_rollback(&sqlite, &store.session_file)
                 }
                 CheckpointSource::Generation { sqlite, assets } => {
                     let transaction = store.stage_live_rollback(&sqlite, &assets)?;
@@ -386,8 +388,8 @@ impl CheckpointStore {
         if let Some(parent) = self.session_file.parent() {
             fs::create_dir_all(parent)?;
         }
-        backup_sqlite(&sqlite, &self.session_file)?;
-        replace_live_assets_from_transaction(transaction, &assets, &self.session_assets)?;
+        restore_sqlite_after_rollback(&sqlite, &self.session_file)?;
+        restore_checkpoint_assets(&assets, &self.session_assets)?;
         fs::remove_dir_all(transaction)?;
         Ok(())
     }
@@ -779,27 +781,13 @@ fn copy_directory_snapshot(source: &Path, destination: &Path) -> io::Result<()> 
     Ok(())
 }
 
-/// 从事务内不可变快照替换 live assets。旧目录与发布副本都在事务目录中，
-/// 因此异常退出时恢复器仍可依据 `new/` 完成同一个 rollback。
-fn replace_live_assets_from_transaction(
-    transaction: &Path,
-    source: &Path,
-    destination: &Path,
-) -> io::Result<()> {
-    let staged = transaction.join("assets-publish");
-    let previous = transaction.join("assets-previous");
-    copy_directory_snapshot(source, &staged)?;
-    if previous.exists() {
-        fs::remove_dir_all(&previous)?;
-    }
-    if destination.exists() {
-        fs::rename(destination, &previous)?;
-    }
-    if let Err(error) = fs::rename(&staged, destination) {
-        if previous.exists() && !destination.exists() {
-            let _ = fs::rename(&previous, destination);
-        }
-        return Err(error);
+/// overflow assets 以 UUID 命名且写入后不可变。rollback 只补回 checkpoint 引用的
+/// 文件，不能整体替换 live 目录：并发 writer 可能已经创建新 asset 并在 rollback 后
+/// 向 canonical DB 提交其 stub，删除该文件会留下无法回读的 `file_path`。
+fn restore_checkpoint_assets(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+    if source.is_dir() {
+        copy_dir_recursively(source, destination)?;
     }
     Ok(())
 }
@@ -1164,5 +1152,32 @@ mod tests {
         if let Some(root) = history_file.parent() {
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn restoring_checkpoint_assets_preserves_concurrent_unique_files() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-assets-restore-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let checkpoint_assets = root.join("checkpoint");
+        let live_assets = root.join("live");
+        fs::create_dir_all(&checkpoint_assets).unwrap();
+        fs::create_dir_all(&live_assets).unwrap();
+        fs::write(checkpoint_assets.join("existing.md"), "checkpoint").unwrap();
+        fs::write(live_assets.join("existing.md"), "newer").unwrap();
+        fs::write(live_assets.join("concurrent.md"), "concurrent output").unwrap();
+
+        restore_checkpoint_assets(&checkpoint_assets, &live_assets).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(live_assets.join("existing.md")).unwrap(),
+            "checkpoint"
+        );
+        assert_eq!(
+            fs::read_to_string(live_assets.join("concurrent.md")).unwrap(),
+            "concurrent output"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

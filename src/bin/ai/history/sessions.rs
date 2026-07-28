@@ -834,6 +834,7 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
 }
 
 fn derived_session_history_artifact_name_matches(file_name: &str, session_id: &str) -> bool {
+    let file_name = history_artifact_name_from_state_lock(file_name).unwrap_or(file_name);
     let current_proc_prefix = format!("{session_id}.proc-");
     let current_subagent_prefix = format!("{session_id}.subagent-");
     let legacy_proc_prefix = format!("{session_id}.sqlite.proc-");
@@ -847,6 +848,7 @@ fn derived_session_history_artifact_name_matches(file_name: &str, session_id: &s
 }
 
 fn derived_session_history_artifact_session_id(file_name: &str) -> Option<String> {
+    let file_name = history_artifact_name_from_state_lock(file_name).unwrap_or(file_name);
     let (raw_session_id, _) = file_name
         .split_once(".proc-")
         .or_else(|| file_name.split_once(".subagent-"))?;
@@ -863,10 +865,17 @@ fn derived_session_history_artifact_session_id(file_name: &str) -> Option<String
 }
 
 fn is_any_derived_session_history_artifact_name(file_name: &str) -> bool {
+    let file_name = history_artifact_name_from_state_lock(file_name).unwrap_or(file_name);
     ((file_name.contains(".proc-") || file_name.contains(".subagent-"))
         && is_sqlite_history_artifact_name(file_name))
         || file_name.contains(".sqlite.proc-")
         || file_name.contains(".sqlite.subagent-")
+}
+
+fn history_artifact_name_from_state_lock(file_name: &str) -> Option<&str> {
+    file_name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".state.lock"))
 }
 
 fn is_sqlite_history_artifact_name(file_name: &str) -> bool {

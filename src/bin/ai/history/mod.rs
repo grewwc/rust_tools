@@ -37,6 +37,87 @@ pub(in crate::ai) use sessions::generate_session_summary;
 pub(in crate::ai) use sessions::strip_think_tags;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore, SessionTitle, SessionTitleOrigin};
+#[allow(unused_imports)]
+pub(in crate::ai) use sqlite::fork_history_for_subagent;
+
+/// 为子代理准备独立的历史文件。首次派发按需 fork 父历史；resume 只复用既有
+/// child 文件，绝不能再次用父快照覆盖子代理已经产生的证据。
+pub(in crate::ai) fn prepare_subagent_history(
+    parent: &Path,
+    child: &Path,
+    inherit_history: bool,
+    initialize: bool,
+) -> io::Result<()> {
+    if initialize {
+        let parent_is_sqlite = blob::is_sqlite_path(parent);
+        let child_is_sqlite = blob::is_sqlite_path(child);
+        if parent_is_sqlite != child_is_sqlite {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "父子代理历史后端不一致：{} -> {}",
+                    parent.display(),
+                    child.display()
+                ),
+            ));
+        }
+        return match (parent_is_sqlite, inherit_history) {
+            (true, true) => fork_history_for_subagent(parent, child),
+            (true, false) => sqlite::reset_history_for_subagent(child),
+            (false, _) => publish_text_subagent_history(parent, child, inherit_history),
+        };
+    }
+    if child.is_file() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("子代理历史文件不存在，无法 resume：{}", child.display()),
+        ))
+    }
+}
+
+/// 文本历史后端不能交给 SQLite Online Backup。先写同目录临时文件再 rename，
+/// 避免子代理观察到半份父历史；父文件尚未创建时继承语义等同于空历史。
+fn publish_text_subagent_history(
+    parent: &Path,
+    child: &Path,
+    inherit_history: bool,
+) -> io::Result<()> {
+    if let Some(dir) = child.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file_name = child
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("history.txt");
+    let temporary = child.with_file_name(format!(
+        ".{file_name}.prepare-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        if inherit_history && parent.is_file() {
+            std::fs::copy(parent, &temporary)?;
+        } else {
+            std::fs::write(&temporary, b"")?;
+        }
+        std::fs::rename(&temporary, child)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// 同步子代理的 history 仅在任务执行期间存在。任务已停止后清除主文件、SQLite
+/// sidecar 与跨进程 state lock；文本后端复用同一清理入口也不会产生额外副作用。
+pub(in crate::ai) fn delete_subagent_history(path: &Path) -> io::Result<()> {
+    let history_result = blob::delete_history_artifacts(path);
+    let lock_result = sqlite::delete_session_state_lock(path);
+    history_result.and(lock_result)
+}
+
 #[cfg(test)]
 pub(in crate::ai) use sqlite::read_context_history_sqlite;
 #[allow(unused_imports)]

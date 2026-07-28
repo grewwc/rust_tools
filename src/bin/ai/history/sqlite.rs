@@ -1,22 +1,87 @@
 use std::{
-    fs, io,
+    fs,
+    fs::OpenOptions,
+    io,
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use rustc_hash::FxHashSet;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use crate::ai::types::ToolCall;
 
 use super::{
     blob,
-    compress::{self, is_summary_note_text, value_to_string, COMPRESSED_TOOL_EVIDENCE_MARKER},
-    types::{Message, ToolExecutionOutcome, ROLE_INTERNAL_NOTE},
+    compress::{self, COMPRESSED_TOOL_EVIDENCE_MARKER, is_summary_note_text, value_to_string},
+    types::{Message, ROLE_INTERNAL_NOTE, ToolExecutionOutcome},
 };
 
 const STALE_PATCH_TARGETS_META_KEY: &str = "stale_patch_targets_v1";
+
+static SESSION_STATE_LOCKS: LazyLock<Mutex<FxHashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+fn session_state_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("history.sqlite");
+    path.with_file_name(format!(".{file_name}.state.lock"))
+}
+
+pub(super) fn delete_session_state_lock(path: &Path) -> io::Result<()> {
+    match fs::remove_file(session_state_lock_path(path)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// 将会替换整个 live SQLite 文件的 rollback 与常规 canonical writer 串行化。
+/// 进程内 mutex 避免同进程线程间 `flock` 语义差异，文件锁负责跨进程互斥。
+fn with_session_state_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let lock = {
+        let mut locks = SESSION_STATE_LOCKS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        locks
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+
+    let lock_path = session_state_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    #[cfg(unix)]
+    unsafe {
+        if libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let result = operation();
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
+    }
+    result
+}
 
 /// 模型实际请求所消费的可重建上下文。`messages` 永远是唯一的原始会话记录；
 /// 这里的消息只是一次压缩快照，加上 `source_message_id` 之后的新原始消息即可
@@ -183,6 +248,10 @@ fn invalidate_context_snapshot(conn: &Connection) -> io::Result<()> {
 /// 同一 session 时也不会重复。旧 session 首次分配时从已持久化的 user turn 数
 /// 继续编号，兼容此前 `turn_index` 的语义。
 pub(in crate::ai) fn reserve_turn_index_sqlite(path: &Path) -> io::Result<usize> {
+    with_session_state_lock(path, || reserve_turn_index_sqlite_unlocked(path))
+}
+
+fn reserve_turn_index_sqlite_unlocked(path: &Path) -> io::Result<usize> {
     let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;
     let tx = conn
@@ -216,6 +285,157 @@ pub(in crate::ai) fn reserve_turn_index_sqlite(path: &Path) -> io::Result<usize>
     .map_err(|e| io::Error::other(e.to_string()))?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
     usize::try_from(current).map_err(io::Error::other)
+}
+
+/// 读取回滚前 live 库的三个单调计数器：`history_generation`、
+/// `history_revision`、`turn_seq`。回滚会用 `backup_sqlite` 把 checkpoint 库
+/// 整库覆盖到 live 路径，这会把这三个计数器一起还原成 checkpoint 时刻的旧值，
+/// 破坏"跨回滚单调递增"不变量。本函数在覆盖前读取 live 值，供
+/// `rebase_metadata_after_rollback` 在覆盖后把它们抬高到 live 之上。
+/// 库不存在或 meta 行缺失时对应返回 0，与"从未修改"基准一致。
+pub(in crate::ai) struct LiveRollbackMetadata {
+    pub(in crate::ai) generation: i64,
+    pub(in crate::ai) revision: i64,
+    pub(in crate::ai) turn_seq: i64,
+}
+
+impl LiveRollbackMetadata {
+    fn zero() -> Self {
+        Self {
+            generation: 0,
+            revision: 0,
+            turn_seq: 0,
+        }
+    }
+}
+
+pub(in crate::ai) fn read_live_rollback_metadata(path: &Path) -> io::Result<LiveRollbackMetadata> {
+    // `Connection::open` 会创建文件，这里只需读取已存在 live 库，缺失时按 0 基准返回。
+    if !path.exists() {
+        return Ok(LiveRollbackMetadata::zero());
+    }
+    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let meta_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .is_some();
+    if !meta_exists {
+        return Ok(LiveRollbackMetadata::zero());
+    }
+    let read = |key: &str| -> io::Result<i64> {
+        let value = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1 LIMIT 1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        value.map_or(Ok(0), |value| {
+            value.parse::<i64>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid SQLite meta value for {key}: {error}"),
+                )
+            })
+        })
+    };
+    Ok(LiveRollbackMetadata {
+        generation: read("history_generation")?,
+        revision: read("history_revision")?,
+        turn_seq: read("turn_seq")?,
+    })
+}
+
+/// 在 `backup_sqlite` 用 checkpoint 覆盖 live 库之后调用：清空派生快照
+/// （canonical 已回退到 checkpoint，旧快照不再匹配），并把三个单调计数器抬高到
+/// 回滚前 live 值之上，保证：
+/// - `history_generation` 严格大于 live 值 -> 任何仍持有旧 generation 的
+///   stale 快照写入会被 fencing 拒绝（`write_context_snapshot_sqlite` 的
+///   generation 比对返回 false）。
+/// - `turn_seq` 不低于 live 值 -> 回滚后新分配的 turn 序号不会复用已用过的序号。
+/// - `history_revision` 严格大于 live 值 -> 跨连接文件缓存能观测到变化并重载。
+/// 全程在一个 Immediate 事务内提交，避免覆盖后留下"已回滚但计数器未抬升"的
+/// 不一致窗口。
+pub(in crate::ai) fn rebase_metadata_after_rollback(
+    path: &Path,
+    live_generation: i64,
+    live_revision: i64,
+    live_turn_seq: i64,
+) -> io::Result<()> {
+    let mut conn = open_history_db(path)?;
+    init_history_schema(&conn)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // canonical 已回退，旧派生快照（可能由 checkpoint 时刻的 generation 标记）
+    // 不再匹配，清空以强制下次读取从 canonical 重算。
+    tx.execute("DELETE FROM context_messages", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute("DELETE FROM context_snapshot", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // 各计数器取 MAX(checkpoint 值, live 值) 再 +1（generation/revision 需严格
+    // 递增；turn_seq 取 live 值即可，因为 live 值是"下一个待分配序号"）。
+    let bump_gen = live_generation.saturating_add(1).max(0);
+    let bump_rev = live_revision.saturating_add(1).max(0);
+    let bump_turn = live_turn_seq.max(0);
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('history_generation', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?1 AS INTEGER))",
+        params![bump_gen.to_string()],
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('turn_seq', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?1 AS INTEGER))",
+        params![bump_turn.to_string()],
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('history_revision', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?1 AS INTEGER))",
+        params![bump_rev.to_string()],
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.commit().map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// 在 session 状态锁内准备一个已 rebase 的临时库，再通过 Online Backup 的原子
+/// rename 发布到 live 路径。崩溃发生在最终发布前时 live 库保持不变；发布后则元数据
+/// 已完整抬升，不存在“库已回滚但计数器仍是旧值”的中间状态。
+pub(in crate::ai) fn restore_sqlite_after_rollback(
+    checkpoint: &Path,
+    live_path: &Path,
+) -> io::Result<()> {
+    with_session_state_lock(live_path, || {
+        let live = read_live_rollback_metadata(live_path)?;
+        let parent = live_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let working = parent.join(format!(".rollback-rebased-{}.sqlite", uuid::Uuid::new_v4()));
+
+        let result = (|| {
+            backup_sqlite(checkpoint, &working)?;
+            rebase_metadata_after_rollback(
+                &working,
+                live.generation,
+                live.revision,
+                live.turn_seq,
+            )?;
+            // 第二次 backup 会把 working 的 WAL 一并物化到最终临时主库，随后以
+            // 单次 rename 发布，避免只移动主文件而遗漏 rebase 事务。
+            backup_sqlite(&working, live_path)
+        })();
+        let _ = fs::remove_file(&working);
+        let _ = remove_sqlite_sidecars(&working);
+        result
+    })
 }
 
 /// 用 SQLite Online Backup API 创建一致快照，并以原子替换的方式写入目标。
@@ -252,6 +472,56 @@ pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<(
         let _ = fs::remove_file(&temporary);
         let _ = remove_sqlite_sidecars(&temporary);
     }
+    result
+}
+
+/// 为子 agent 复制父会话的历史库到独立的 per-process 文件。
+///
+/// `inherit.history` 语义应为「子 agent 可读父会话上下文，但写入不回灌父库」。
+/// 直接复用父库的 canonical 文件会让子 agent 的内部 prompt/tool trace 污染父会话，
+/// 并在多个并发子 agent 间交错写入同一 session。这里用 SQLite Online Backup 做一次
+/// 一致性快照拷贝，子 agent 后续只读写自己的 fork 文件，父库保持隔离。
+///
+/// 父会话尚无历史文件（首次会话）时发布一个全新的空库，不能复用残留 child 库。
+pub(in crate::ai) fn fork_history_for_subagent(parent: &Path, child: &Path) -> io::Result<()> {
+    with_session_state_lock(child, || match fs::metadata(parent) {
+        Ok(_metadata) => {
+            // 确保子文件父目录存在，否则 backup_sqlite 的临时文件会创建失败。
+            if let Some(dir) = child.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            backup_sqlite(parent, child)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // 父会话尚无历史文件，子 agent 从空白历史开始。
+            reset_history_for_subagent_unlocked(child)
+        }
+        Err(error) => Err(error),
+    })
+}
+
+/// 首次派发无历史继承的子代理时，发布一个全新的空库，不能复用同 pid 的残留库。
+pub(in crate::ai) fn reset_history_for_subagent(child: &Path) -> io::Result<()> {
+    with_session_state_lock(child, || reset_history_for_subagent_unlocked(child))
+}
+
+fn reset_history_for_subagent_unlocked(child: &Path) -> io::Result<()> {
+    let temporary = child.with_extension(format!(
+        "sqlite.empty-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Some(parent) = temporary.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let result = (|| {
+        let conn = open_history_db(&temporary)?;
+        init_history_schema(&conn)?;
+        drop(conn);
+        backup_sqlite(&temporary, child)
+    })();
+    let _ = fs::remove_file(&temporary);
+    let _ = remove_sqlite_sidecars(&temporary);
     result
 }
 
@@ -368,33 +638,35 @@ pub(in crate::ai) fn append_tool_execution_outcomes_sqlite(
     if outcomes.is_empty() || !blob::is_sqlite_path(path) {
         return Ok(());
     }
-    let mut conn = open_history_db(path)?;
-    init_history_schema(&conn)?;
-    let tx = conn
-        .transaction()
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    {
-        let mut statement = tx
-            .prepare(
-                "INSERT INTO tool_execution_outcomes
-                    (tool_call_id, execution_signature, succeeded)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(tool_call_id) DO NOTHING",
-            )
+    with_session_state_lock(path, || {
+        let mut conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        let tx = conn
+            .transaction()
             .map_err(|error| io::Error::other(error.to_string()))?;
-        for outcome in outcomes {
-            statement
-                .execute(params![
-                    outcome.tool_call_id,
-                    outcome.execution_signature,
-                    outcome.succeeded
-                ])
+        {
+            let mut statement = tx
+                .prepare(
+                    "INSERT INTO tool_execution_outcomes
+                        (tool_call_id, execution_signature, succeeded)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(tool_call_id) DO NOTHING",
+                )
                 .map_err(|error| io::Error::other(error.to_string()))?;
+            for outcome in outcomes {
+                statement
+                    .execute(params![
+                        outcome.tool_call_id,
+                        outcome.execution_signature,
+                        outcome.succeeded
+                    ])
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            }
         }
-    }
-    bump_history_revision(&tx)?;
-    tx.commit()
-        .map_err(|error| io::Error::other(error.to_string()))
+        bump_history_revision(&tx)?;
+        tx.commit()
+            .map_err(|error| io::Error::other(error.to_string()))
+    })
 }
 
 /// 读取请求投影所需的结构化工具结果。老会话没有旁路表时安全退化为空集合，
@@ -515,15 +787,17 @@ pub(in crate::ai) fn write_stale_patch_targets_sqlite(
     paths.sort();
     let encoded =
         serde_json::to_string(&paths).map_err(|error| io::Error::other(error.to_string()))?;
-    let conn = open_history_db(path)?;
-    init_history_schema(&conn)?;
-    conn.execute(
-        "INSERT INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value, created_at=excluded.created_at",
-        params![STALE_PATCH_TARGETS_META_KEY, encoded],
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(())
+    with_session_state_lock(path, || {
+        let conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        conn.execute(
+            "INSERT INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, created_at=excluded.created_at",
+            params![STALE_PATCH_TARGETS_META_KEY, encoded],
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(())
+    })
 }
 
 /// outcome 只属于同一 `tool_call_id` 的 tool 消息。历史替换、压缩或分支截断后
@@ -565,6 +839,16 @@ pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -
 /// 只向 canonical history 追加原始消息。模型来源作为旁路元数据保存，绝不改写
 /// `Message` 本身；后续仅在构造可重建 context view 时生成协议专属投影。
 pub(in crate::ai) fn append_history_sqlite_for_model(
+    path: &Path,
+    entries: Vec<Message>,
+    source_model: Option<&str>,
+) -> io::Result<()> {
+    with_session_state_lock(path, || {
+        append_history_sqlite_for_model_unlocked(path, entries, source_model)
+    })
+}
+
+fn append_history_sqlite_for_model_unlocked(
     path: &Path,
     entries: Vec<Message>,
     source_model: Option<&str>,
@@ -617,6 +901,12 @@ pub(in crate::ai) fn replace_all_messages_sqlite(
     path: &Path,
     messages: &[Message],
 ) -> io::Result<()> {
+    with_session_state_lock(path, || {
+        replace_all_messages_sqlite_unlocked(path, messages)
+    })
+}
+
+fn replace_all_messages_sqlite_unlocked(path: &Path, messages: &[Message]) -> io::Result<()> {
     let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;
     let tx = conn
@@ -745,9 +1035,9 @@ fn read_projected_canonical_messages_after_id(
     for row in rows {
         let (message, source_model) = row?;
         messages.push(match source_model.as_deref() {
-            Some(model) => compress::sanitize_message_for_persisted_history_for_model(
-                model, &message,
-            ),
+            Some(model) => {
+                compress::sanitize_message_for_persisted_history_for_model(model, &message)
+            }
             None => compress::sanitize_message_for_persisted_history(&message),
         });
     }
@@ -791,18 +1081,17 @@ pub(in crate::ai) fn read_context_history_sqlite(
             *generation == canonical_generation && fingerprint == projection_fingerprint
         });
 
-    let (mut messages, after_id, has_snapshot) =
-        if let Some((source_message_id, _, _)) = snapshot {
-            let messages = read_messages_with_sql(
-                &tx,
-                "SELECT role, content, tool_calls, tool_call_id, reasoning_content
+    let (mut messages, after_id, has_snapshot) = if let Some((source_message_id, _, _)) = snapshot {
+        let messages = read_messages_with_sql(
+            &tx,
+            "SELECT role, content, tool_calls, tool_call_id, reasoning_content
                  FROM context_messages ORDER BY position ASC",
-            )
-            .map_err(|error| io::Error::other(error.to_string()))?;
-            (messages, source_message_id, true)
-        } else {
-            (Vec::new(), 0, false)
-        };
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        (messages, source_message_id, true)
+    } else {
+        (Vec::new(), 0, false)
+    };
     messages.extend(
         read_projected_canonical_messages_after_id(&tx, after_id)
             .map_err(|error| io::Error::other(error.to_string()))?,
@@ -828,37 +1117,39 @@ pub(in crate::ai) fn write_context_snapshot_sqlite(
     canonical_generation: i64,
     projection_fingerprint: &str,
 ) -> io::Result<bool> {
-    let mut conn = open_history_db(path)?;
-    init_history_schema(&conn)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    if history_generation(&tx)? != canonical_generation {
-        return Ok(false);
-    }
+    with_session_state_lock(path, || {
+        let mut conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if history_generation(&tx)? != canonical_generation {
+            return Ok(false);
+        }
 
-    tx.execute("DELETE FROM context_messages", [])
+        tx.execute("DELETE FROM context_messages", [])
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        insert_context_messages(&tx, messages)?;
+        tx.execute(
+            "INSERT INTO context_snapshot
+                (singleton, source_message_id, source_generation, projection_fingerprint)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(singleton) DO UPDATE SET
+                source_message_id = excluded.source_message_id,
+                source_generation = excluded.source_generation,
+                projection_fingerprint = excluded.projection_fingerprint",
+            params![
+                source_message_id,
+                canonical_generation,
+                projection_fingerprint
+            ],
+        )
         .map_err(|error| io::Error::other(error.to_string()))?;
-    insert_context_messages(&tx, messages)?;
-    tx.execute(
-        "INSERT INTO context_snapshot
-            (singleton, source_message_id, source_generation, projection_fingerprint)
-         VALUES (1, ?1, ?2, ?3)
-         ON CONFLICT(singleton) DO UPDATE SET
-            source_message_id = excluded.source_message_id,
-            source_generation = excluded.source_generation,
-            projection_fingerprint = excluded.projection_fingerprint",
-        params![
-            source_message_id,
-            canonical_generation,
-            projection_fingerprint
-        ],
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
-    bump_history_revision(&tx)?;
-    tx.commit()
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(true)
+        bump_history_revision(&tx)?;
+        tx.commit()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(true)
+    })
 }
 
 fn insert_context_messages(conn: &Connection, messages: &[Message]) -> io::Result<()> {
@@ -1139,6 +1430,16 @@ pub(in crate::ai) fn remap_context_checkpoint_paths_sqlite(
     source_assets: Option<&Path>,
     target_assets: &Path,
 ) -> io::Result<usize> {
+    with_session_state_lock(history_file, || {
+        remap_context_checkpoint_paths_sqlite_unlocked(history_file, source_assets, target_assets)
+    })
+}
+
+fn remap_context_checkpoint_paths_sqlite_unlocked(
+    history_file: &Path,
+    source_assets: Option<&Path>,
+    target_assets: &Path,
+) -> io::Result<usize> {
     let mut conn = open_history_db(history_file)?;
     init_history_schema(&conn)?;
     let tx = conn
@@ -1239,6 +1540,10 @@ fn checked_context_checkpoint_relative(path: &Path) -> Option<PathBuf> {
 }
 
 pub(in crate::ai) fn clear_session_history_sqlite(path: &Path) -> io::Result<()> {
+    with_session_state_lock(path, || clear_session_history_sqlite_unlocked(path))
+}
+
+fn clear_session_history_sqlite_unlocked(path: &Path) -> io::Result<()> {
     let mut conn = match open_history_db(path) {
         Ok(c) => c,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1274,6 +1579,10 @@ pub(in crate::ai) fn clear_session_history_sqlite(path: &Path) -> io::Result<()>
 /// 把 messages 表保留到前 `keep` 条（按 id 升序）。用于 session branch：
 /// 复制完整 sqlite 后再回滚到指定消息数。`keep == 0` 等价于 clear。
 pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::Result<()> {
+    with_session_state_lock(path, || truncate_messages_sqlite_unlocked(path, keep))
+}
+
+fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()> {
     let mut conn = match open_history_db(path) {
         Ok(c) => c,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1326,6 +1635,15 @@ pub(in crate::ai) fn truncate_messages_to_user_turns_sqlite(
         return truncate_messages_sqlite(path, 0);
     }
 
+    with_session_state_lock(path, || {
+        truncate_messages_to_user_turns_sqlite_unlocked(path, keep_turns)
+    })
+}
+
+fn truncate_messages_to_user_turns_sqlite_unlocked(
+    path: &Path,
+    keep_turns: usize,
+) -> io::Result<()> {
     let mut conn = match open_history_db(path) {
         Ok(connection) => connection,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1431,22 +1749,24 @@ pub(in crate::ai) fn write_session_title_sqlite(
     title: &str,
     origin: &str,
 ) -> io::Result<()> {
-    let mut conn = open_history_db(path)?;
-    init_history_schema(&conn)?;
-    let tx = conn
-        .transaction()
+    with_session_state_lock(path, || {
+        let mut conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES ('session_title', ?1, unixepoch())",
+            rusqlite::params![title],
+        )
         .map_err(|e| io::Error::other(e.to_string()))?;
-    tx.execute(
-        "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES ('session_title', ?1, unixepoch())",
-        rusqlite::params![title],
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
-    tx.execute(
-        "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES ('session_title_origin', ?1, unixepoch())",
-        rusqlite::params![origin],
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
-    tx.commit().map_err(|e| io::Error::other(e.to_string()))
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES ('session_title_origin', ?1, unixepoch())",
+            rusqlite::params![origin],
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+        tx.commit().map_err(|e| io::Error::other(e.to_string()))
+    })
 }
 
 fn decode_message_content(content: &str) -> Value {
@@ -1564,6 +1884,36 @@ mod tests {
             .collect();
         indexes.sort_unstable();
         assert_eq!(indexes, (5..13).collect::<Vec<_>>());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_metadata_read_error_does_not_replace_live_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "rollback_metadata_error_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.sqlite");
+        let checkpoint = dir.join("checkpoint.sqlite");
+        append_history_sqlite(&live, vec![msg("user", "live message")]).unwrap();
+        append_history_sqlite(&checkpoint, vec![msg("user", "checkpoint message")]).unwrap();
+        let conn = Connection::open(&live).unwrap();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('turn_seq', 'invalid')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = restore_sqlite_after_rollback(&checkpoint, &live).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let messages = read_all_messages_sqlite(&live).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(value_to_string(&messages[0].content), "live message");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1727,9 +2077,11 @@ mod tests {
         );
 
         clear_session_history_sqlite(&path).unwrap();
-        assert!(read_tool_execution_outcomes_sqlite(&path)
-            .unwrap()
-            .is_empty());
+        assert!(
+            read_tool_execution_outcomes_sqlite(&path)
+                .unwrap()
+                .is_empty()
+        );
 
         // 旧历史可能已经复用过同一 ID；改变消息集合前必须永久丢弃其歧义 outcome，
         // 否则删除较新的 occurrence 后会把它的状态错误绑定到保留的旧消息。
@@ -1743,9 +2095,11 @@ mod tests {
         .unwrap();
         append_tool_execution_outcomes_sqlite(&path, &[outcome("legacy-reused")]).unwrap();
         replace_all_messages_sqlite(&path, &[tool_msg("legacy-reused", "older")]).unwrap();
-        assert!(read_tool_execution_outcomes_sqlite(&path)
-            .unwrap()
-            .is_empty());
+        assert!(
+            read_tool_execution_outcomes_sqlite(&path)
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1766,9 +2120,11 @@ mod tests {
 
         append_tool_execution_outcomes_sqlite(&path, &[outcome("call-1")]).unwrap();
 
-        assert!(read_tool_execution_outcomes_sqlite(&path)
-            .unwrap()
-            .is_empty());
+        assert!(
+            read_tool_execution_outcomes_sqlite(&path)
+                .unwrap()
+                .is_empty()
+        );
         assert!(read_tool_message_ids_sqlite(&path).unwrap().is_empty());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1840,12 +2196,14 @@ mod tests {
             reasoning_content: Some("provider 原始 continuation state".to_string()),
         };
         let original = vec![msg("user", "读取文件"), assistant.clone()];
-        append_history_sqlite_for_model(&path, original.clone(), Some("glm-5.2-opencode"))
-            .unwrap();
+        append_history_sqlite_for_model(&path, original.clone(), Some("glm-5.2-opencode")).unwrap();
 
         let source = read_context_history_sqlite(&path, PROJECTION).unwrap();
         assert_eq!(read_all_messages_sqlite(&path).unwrap(), original);
-        assert_ne!(source.messages[1].reasoning_content, assistant.reasoning_content);
+        assert_ne!(
+            source.messages[1].reasoning_content,
+            assistant.reasoning_content
+        );
 
         let snapshot = vec![msg(ROLE_INTERNAL_NOTE, "[History summary]\n已读取文件")];
         write_context_snapshot_sqlite(
@@ -1883,11 +2241,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("history.db");
-        append_history_sqlite(
-            &path,
-            vec![msg("user", "保留"), msg("assistant", "删除")],
-        )
-        .unwrap();
+        append_history_sqlite(&path, vec![msg("user", "保留"), msg("assistant", "删除")]).unwrap();
         let stale_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
 
         truncate_messages_sqlite(&path, 1).unwrap();
@@ -1933,9 +2287,11 @@ mod tests {
             "policy-a",
         )
         .unwrap();
-        assert!(read_context_history_sqlite(&path, "policy-a")
-            .unwrap()
-            .snapshot_is_current);
+        assert!(
+            read_context_history_sqlite(&path, "policy-a")
+                .unwrap()
+                .snapshot_is_current
+        );
 
         let rebuilt = read_context_history_sqlite(&path, "policy-b").unwrap();
         assert_eq!(rebuilt.messages, canonical);
@@ -1978,6 +2334,86 @@ mod tests {
                 .messages,
             vec![current]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_state_lock_serializes_every_public_side_state_writer() {
+        let dir = std::env::temp_dir().join(format!(
+            "history_side_writer_lock_test_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        append_history_sqlite(&path, vec![msg("user", "seed")]).unwrap();
+
+        type Writer = Box<dyn FnOnce(&Path) -> io::Result<()> + Send>;
+        let writers: Vec<(&str, Writer)> = vec![
+            (
+                "tool outcomes",
+                Box::new(|path| append_tool_execution_outcomes_sqlite(path, &[outcome("call-1")])),
+            ),
+            (
+                "stale patch targets",
+                Box::new(|path| {
+                    let mut targets = FxHashSet::default();
+                    targets.insert(PathBuf::from("src/main.rs"));
+                    write_stale_patch_targets_sqlite(path, &targets)
+                }),
+            ),
+            (
+                "context snapshot",
+                Box::new(|path| {
+                    let source = read_context_history_sqlite(path, "lock-test")?;
+                    write_context_snapshot_sqlite(
+                        path,
+                        &[msg(ROLE_INTERNAL_NOTE, "snapshot")],
+                        source.source_message_id,
+                        source.canonical_generation,
+                        "lock-test",
+                    )
+                    .map(|_| ())
+                }),
+            ),
+            (
+                "session title",
+                Box::new(|path| write_session_title_sqlite(path, "title", "test")),
+            ),
+        ];
+
+        for (name, writer) in writers {
+            let (lock_held_tx, lock_held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let lock_path = path.clone();
+            let lock_thread = std::thread::spawn(move || {
+                with_session_state_lock(&lock_path, || {
+                    lock_held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+            });
+            lock_held_rx.recv().unwrap();
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let writer_path = path.clone();
+            let writer_thread = std::thread::spawn(move || {
+                let result = writer(&writer_path);
+                done_tx.send(()).unwrap();
+                result
+            });
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err(),
+                "{name} bypassed the rollback state lock"
+            );
+
+            release_tx.send(()).unwrap();
+            lock_thread.join().unwrap().unwrap();
+            writer_thread.join().unwrap().unwrap();
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

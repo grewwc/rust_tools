@@ -1714,7 +1714,9 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
             let text = m.content.as_str()?;
             (text.contains("read_file") && text.contains("file_path: ")).then_some(text.to_string())
         })
-        .expect("expected read_file recall anchor (file_path) after mid-turn compression");
+        .unwrap_or_else(|| {
+            panic!("expected read_file recall anchor after mid-turn compression: {compressed:#?}")
+        });
     let file_path = recall
         .split("file_path: ")
         .nth(1)
@@ -2725,6 +2727,8 @@ fn session_delete_removes_sqlite_sidecars() {
         b"derived",
     )
     .unwrap();
+    let derived_state_lock = store.sessions_root().join(".abc.proc-42.sqlite.state.lock");
+    std::fs::write(&derived_state_lock, b"lock").unwrap();
     let legacy_derived = store.sessions_root().join("abc.sqlite.subagent-legacy");
     std::fs::write(&legacy_derived, b"legacy").unwrap();
     let assets = store.session_assets_dir("abc");
@@ -2740,6 +2744,7 @@ fn session_delete_removes_sqlite_sidecars() {
     assert!(PathBuf::from(format!("{}-journal", db.display())).exists());
     assert!(derived.exists());
     assert!(PathBuf::from(format!("{}-wal", derived.display())).exists());
+    assert!(derived_state_lock.exists());
     assert!(legacy_derived.exists());
     assert!(assets.exists());
     assert!(checkpoints.exists());
@@ -2752,6 +2757,7 @@ fn session_delete_removes_sqlite_sidecars() {
     assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
     assert!(!derived.exists());
     assert!(!PathBuf::from(format!("{}-wal", derived.display())).exists());
+    assert!(!derived_state_lock.exists());
     assert!(!legacy_derived.exists());
     assert!(!assets.exists());
     assert!(!checkpoints.exists());

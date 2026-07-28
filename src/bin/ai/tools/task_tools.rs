@@ -1703,6 +1703,66 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
+/// 销毁一个 session 时终止并移除其全部异步 subagent。
+///
+/// 这条路径不保留可收集结果：父 session 已被用户显式删除，继续保留 registry、IPC
+/// 或后台 Future 只会让已删除的派生历史被重新创建。
+pub(crate) fn discard_tasks_for_session(session_id: &str) {
+    let candidates = {
+        let registry = TASK_REGISTRY.lock().unwrap();
+        registry
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(task_id, entry)| {
+                (
+                    task_id.clone(),
+                    entry.pid,
+                    entry.result_channel_id,
+                    entry.completion_futex_addr,
+                    entry.abort_handle.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+
+    for (_, _, _, _, abort_handle) in &candidates {
+        if let Some(handle) = abort_handle {
+            handle.abort();
+        }
+    }
+
+    let _ = with_os_kernel(|os| {
+        for (_, pid, result_channel_id, completion_futex_addr, _) in &candidates {
+            let _ = os.kill_process(*pid, "parent session deleted".to_string());
+            let channel_id = ChannelId(*result_channel_id);
+            let _ = os.channel_close(None, channel_id);
+            let _ = os.channel_release_named(channel_id, "task_result.consumer");
+            let _ = os.channel_release_named(channel_id, "task_result.producer");
+            let _ = os.channel_destroy(None, channel_id);
+            let _ = os.futex_destroy(*completion_futex_addr);
+        }
+        Ok::<(), String>(())
+    });
+
+    let task_ids = candidates
+        .into_iter()
+        .map(|(task_id, _, _, _, _)| task_id)
+        .collect::<Vec<_>>();
+    {
+        let mut registry = TASK_REGISTRY.lock().unwrap();
+        for task_id in &task_ids {
+            registry.remove(task_id);
+        }
+    }
+    TASK_WAIT_STATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .retain(|key, _| key.session_id != session_id);
+}
+
 pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_cancel")?;
     let task_ids = args["task_ids"]

@@ -17,8 +17,8 @@ use crate::ai::{
 };
 
 use super::{
-    CompressionReport, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
-    TurnOutcome, context_budget,
+    CompressionReport, MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+    MID_TURN_LLM_SUMMARY_MAX_CHARS, TurnOutcome, context_budget,
     persistence::persist_pending_turn_messages,
     pre_request_llm_summary_threshold, record_llm_summary_attempt_chars, should_try_llm_summary,
     types::{IterationExecution, ToolCallExecution},
@@ -278,6 +278,35 @@ fn refresh_outstanding_task_anchor(messages: &mut Vec<Message>, session_id: &str
     });
 }
 
+/// Reactive 上下文收缩：仅在 provider 因上下文超限拒绝请求后调用。
+///
+/// 主动压缩（`apply_pre_request_context_budget` + LLM 摘要）已在请求前尽力把
+/// 上下文压到软阈值附近，但字符估算不是 token 的权威裁判——一次英文占比高、
+/// 或图片/工具 schema 额外开销大的请求，仍可能被 provider 的 tokenizer 判超限。
+/// 与其在本地用字符阈值主动 413（会误杀合法请求），不如把请求发出去，只在真正
+/// 被拒后再收缩重试。
+///
+/// 每次调用把目标预算在上次基础上再砍 25%（floor 兜底防止砍到 0），复用跨 turn
+/// 压缩管线 [`mid_turn_compress`](crate::ai::history::mid_turn_compress)（含
+/// Path C emergency 截断）强制收敛。返回压缩后的字符数；若无法再压缩（已触及
+/// system/current-user 不可裁下限），返回的字符数不会下降，调用方据此终止重试。
+fn reactive_shrink_context_after_overflow(
+    app: &App,
+    messages: &mut Vec<Message>,
+    target_chars: usize,
+) -> usize {
+    let overflow_dir = {
+        use crate::ai::history::SessionStore;
+        let store = SessionStore::new(app.config.history_file.as_path());
+        store.session_assets_dir(&app.session_id)
+    };
+    let drained = std::mem::take(messages);
+    let (compressed, _before, after) =
+        crate::ai::history::mid_turn_compress(drained, target_chars, Some(overflow_dir.as_path()));
+    *messages = compressed;
+    after
+}
+
 #[crate::ai::agent_hang_span(
     "pre-fix",
     "B",
@@ -383,51 +412,89 @@ async fn request_model_response(
             next_model
         );
     }
-    let mut actual_model = next_model.to_string();
-    let mut request_result = if force_final_response {
-        do_request_messages_without_tools(app, next_model, messages, true).await
-    } else {
-        do_request_messages(app, next_model, messages, true).await
-    };
-    if let Err(err) = &request_result
-        && let Some(fallback_spec) = auto_model_fallback_spec
-        && request::should_try_model_fallback(err)
-    {
-        if request::should_temporarily_disable_auto_selected_model(err) {
-            crate::ai::models::mark_model_temporarily_unavailable(next_model, &err.to_string());
-        }
-        if let Some(fallback_model) =
-            crate::ai::models::fallback_subagent_model_after_failure(next_model, fallback_spec)
-        {
-            if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-                eprintln!(
-                    "[model] auto-selected model '{}' failed; retrying subagent with '{}'",
-                    next_model, fallback_model
-                );
-            }
-            actual_model = fallback_model.clone();
-            request_result = if force_final_response {
-                do_request_messages_without_tools(app, &fallback_model, messages, true).await
-            } else {
-                do_request_messages(app, &fallback_model, messages, true).await
-            };
-            if let Err(fallback_err) = &request_result
-                && request::should_temporarily_disable_auto_selected_model(fallback_err)
-            {
-                crate::ai::models::mark_model_temporarily_unavailable(
-                    &fallback_model,
-                    &fallback_err.to_string(),
-                );
-            }
-        }
-    }
 
-    request_result.map(|response| {
-        if auto_model_fallback_spec.is_some() {
-            crate::ai::models::mark_subagent_model_verified(&actual_model);
+    // Reactive 上下文超限重试：主动压缩已尽力把上下文压到软阈值附近，但字符估算
+    // 不是 provider tokenizer 的权威裁判。若请求仍被判上下文超限，就地收缩后重试，
+    // 而不是本地主动 413 误杀合法请求，也不是把超限包硬塞给 provider 后直接放弃。
+    // 超限错误不触发模型 fallback（`should_try_model_fallback` 已排除 400/413），
+    // 二者互斥。
+    const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 4;
+    let mut overflow_retries = 0usize;
+    loop {
+        let mut actual_model = next_model.to_string();
+        let mut request_result = if force_final_response {
+            do_request_messages_without_tools(app, next_model, messages, true).await
+        } else {
+            do_request_messages(app, next_model, messages, true).await
+        };
+        if let Err(err) = &request_result
+            && let Some(fallback_spec) = auto_model_fallback_spec
+            && request::should_try_model_fallback(err)
+        {
+            if request::should_temporarily_disable_auto_selected_model(err) {
+                crate::ai::models::mark_model_temporarily_unavailable(next_model, &err.to_string());
+            }
+            if let Some(fallback_model) =
+                crate::ai::models::fallback_subagent_model_after_failure(next_model, fallback_spec)
+            {
+                if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                    eprintln!(
+                        "[model] auto-selected model '{}' failed; retrying subagent with '{}'",
+                        next_model, fallback_model
+                    );
+                }
+                actual_model = fallback_model.clone();
+                request_result = if force_final_response {
+                    do_request_messages_without_tools(app, &fallback_model, messages, true).await
+                } else {
+                    do_request_messages(app, &fallback_model, messages, true).await
+                };
+                if let Err(fallback_err) = &request_result
+                    && request::should_temporarily_disable_auto_selected_model(fallback_err)
+                {
+                    crate::ai::models::mark_model_temporarily_unavailable(
+                        &fallback_model,
+                        &fallback_err.to_string(),
+                    );
+                }
+            }
         }
-        (response, actual_model)
-    })
+
+        if let Err(err) = &request_result
+            && request::is_context_overflow_error(err)
+            && overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES
+        {
+            let before = crate::ai::history::messages_total_chars_pub(messages);
+            // 目标在当前实际大小基础上再砍 25%，floor 兜底防止砍到 0 触发 no-op。
+            let target = before
+                .saturating_mul(3)
+                .saturating_div(4)
+                .max(MID_TURN_COMPRESS_SOFT_FLOOR);
+            let after = reactive_shrink_context_after_overflow(app, messages, target);
+            overflow_retries += 1;
+            if after < before {
+                crate::ai::driver::print::print_tool_note_line(
+                    "context-overflow",
+                    &format!(
+                        "provider rejected oversized context; compressed {before} → {after} chars, retrying"
+                    ),
+                );
+                continue;
+            }
+            // 压不动了（system / current-user 已是不可裁下限）：再重试只会被同样拒绝。
+            crate::ai::driver::print::print_tool_note_line(
+                "context-overflow",
+                "provider rejected context but it cannot be compressed further",
+            );
+        }
+
+        return request_result.map(|response| {
+            if auto_model_fallback_spec.is_some() {
+                crate::ai::models::mark_subagent_model_verified(&actual_model);
+            }
+            (response, actual_model)
+        });
+    }
 }
 
 #[crate::ai::agent_hang_span(

@@ -233,6 +233,7 @@ pub(super) fn enforce_protected_precision_group_budget(
     inline_budget: usize,
     overflow_dir: Option<&Path>,
     protected_tool_call_ids: &FxHashSet<String>,
+    allow_overflow_protected: bool,
 ) {
     let Some(overflow_dir) = overflow_dir else {
         return;
@@ -271,10 +272,13 @@ pub(super) fn enforce_protected_precision_group_budget(
             if text.trim().is_empty() || is_preserved_tool_overflow_stub(&text) {
                 continue;
             }
-            if messages[idx]
-                .tool_call_id
-                .as_ref()
-                .is_some_and(|id| protected_tool_call_ids.contains(id))
+            // protected（当前 turn）结果默认保持原样以留在上下文内；仅在 Path C 兜底时
+            // 允许零压缩外溢到 asset，避免后续被有损截断后原文不可恢复。
+            if !allow_overflow_protected
+                && messages[idx]
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| protected_tool_call_ids.contains(id))
             {
                 continue;
             }
@@ -297,6 +301,72 @@ pub(super) fn enforce_protected_precision_group_budget(
             }
         }
     }
+}
+
+/// Path C 的全局兜底：跨工具组收集所有受保护的高精度结果，并优先外溢最大的
+/// 原文，直到整个请求回到 hard target 或没有可外溢候选。
+pub(super) fn spill_protected_precision_to_fit(
+    messages: &mut [Message],
+    hard_target_chars: usize,
+    overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &FxHashSet<String>,
+) -> usize {
+    let Some(overflow_dir) = overflow_dir else {
+        return 0;
+    };
+    let id_to_tool_name = build_tool_call_name_index(messages);
+    let id_to_tool_args = build_tool_call_arguments_index(messages);
+    let mut candidates = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, message)| {
+            let id = message.tool_call_id.as_ref()?;
+            if !protected_tool_call_ids.contains(id) {
+                return None;
+            }
+            let tool_name = id_to_tool_name.get(id)?;
+            let text = value_to_string(&message.content);
+            (!text.trim().is_empty()
+                && !is_preserved_tool_overflow_stub(&text)
+                && tool_history_policy(tool_name).counts_toward_precision_inline_budget())
+            .then(|| (idx, tool_name.clone(), text.chars().count()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(_, _, chars)| std::cmp::Reverse(*chars));
+
+    let mut spilled = 0usize;
+    for (idx, tool_name, _) in candidates {
+        if super::messages_total_chars(messages) <= hard_target_chars {
+            break;
+        }
+        let text = value_to_string(&messages[idx].content);
+        let Some(path) = write_preserved_tool_overflow_file(overflow_dir, &tool_name, &text) else {
+            continue;
+        };
+        let recall_lines = messages[idx]
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| id_to_tool_args.get(id))
+            .map(|args| build_tool_overflow_recall_lines(&tool_name, args))
+            .unwrap_or_default();
+        let full_stub = build_preserved_tool_overflow_stub(&path, &tool_name, &text, &recall_lines);
+        let replacement = if full_stub.chars().count() < text.chars().count() {
+            full_stub
+        } else if let Some(pointer_stub) = minimize_overflow_stub_to_pointer(&full_stub) {
+            if pointer_stub.chars().count() < text.chars().count() {
+                pointer_stub
+            } else {
+                let _ = std::fs::remove_file(path);
+                continue;
+            }
+        } else {
+            let _ = std::fs::remove_file(path);
+            continue;
+        };
+        messages[idx].content = Value::String(replacement);
+        spilled += 1;
+    }
+    spilled
 }
 
 pub(super) fn build_tool_call_name_index(messages: &[Message]) -> FxHashMap<String, String> {
@@ -528,12 +598,80 @@ mod tests {
             200,
             Some(&overflow_dir),
             &FxHashSet::default(),
+            false,
         );
 
         assert!(is_preserved_tool_overflow_stub(&value_to_string(
             &messages[1].content
         )));
         assert_eq!(value_to_string(&messages[2].content).len(), 10_000);
+        let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
+    fn path_c_spills_all_protected_precision_groups_without_recent_group_cap() {
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-global-precision-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut messages = Vec::new();
+        let mut protected = FxHashSet::default();
+        for index in 0..8 {
+            let id = format!("read-{index}");
+            protected.insert(id.clone());
+            messages.push(assistant_call(&id, "read_file"));
+            messages.push(tool_result(&id, &"line of exact evidence\n".repeat(600)));
+        }
+
+        let spilled =
+            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), &protected);
+
+        // 覆盖 Path C 的后半段：spill 后仍超预算时会进入 emergency cap。所有
+        // preserved stub 必须先缩成不可截断的最小指针，不能再被通用 head/tail 截断。
+        assert!(super::super::messages_total_chars(&messages) > 4_000);
+        super::super::emergency_cap_messages_to_fit(&mut messages, 4_000, 160, &protected);
+
+        assert_eq!(spilled, 8);
+        let stubs = messages
+            .iter()
+            .filter_map(|message| {
+                let content = value_to_string(&message.content);
+                is_preserved_tool_overflow_stub(&content).then_some(content)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stubs.len(), 8);
+        for stub in stubs {
+            let file_path = stub
+                .lines()
+                .find_map(|line| line.strip_prefix("- file_path: "))
+                .expect("minimal overflow stub must retain file_path");
+            assert!(Path::new(file_path).is_file());
+            assert!(!stub.contains("Preview ("));
+        }
+        assert!(super::super::messages_total_chars(&messages) <= 4_000);
+        let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
+    fn path_c_does_not_expand_short_protected_results_into_stubs() {
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-global-precision-short-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut protected = FxHashSet::default();
+        protected.insert("read-short".to_string());
+        let mut messages = vec![
+            assistant_call("read-short", "read_file"),
+            tool_result("read-short", "ok"),
+        ];
+        let before = super::super::messages_total_chars(&messages);
+
+        let spilled =
+            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), &protected);
+
+        assert_eq!(spilled, 0);
+        assert_eq!(value_to_string(&messages[1].content), "ok");
+        assert_eq!(super::super::messages_total_chars(&messages), before);
         let _ = std::fs::remove_dir_all(overflow_dir);
     }
 
@@ -893,6 +1031,55 @@ fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
     out.push('\n');
     out.push_str(tool_hint);
     Some(out)
+}
+
+/// Path C 的最终硬预算阶段只允许去掉 overflow stub 的预览与召回附注，不能把
+/// 唯一的 asset 指针交给通用 head+tail 截断。返回的最小 stub 仍保留协议 marker、
+/// 工具名和 `file_path`，因此后续可以精确回读原始证据。
+fn minimize_overflow_stub_to_pointer(text: &str) -> Option<String> {
+    if !is_preserved_tool_overflow_stub(text) {
+        return None;
+    }
+    let tool_name = text
+        .split_once("non-compressible tool `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(name, _)| name)
+        .or_else(|| {
+            text.split_once("Output preserved for tool `")
+                .and_then(|(_, rest)| rest.split_once('`'))
+                .map(|(name, _)| name)
+        })?;
+    let file_path = text
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    Some(format!(
+        "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
+         Output preserved for tool `{tool_name}`.\n\
+         - file_path: {file_path}"
+    ))
+}
+
+pub(super) fn minimize_overflow_stubs_for_hard_budget(messages: &mut [Message]) {
+    for message in messages {
+        if message.role != "tool" {
+            continue;
+        }
+        let Value::String(text) = &message.content else {
+            continue;
+        };
+        let Some(minimal) = minimize_overflow_stub_to_pointer(text) else {
+            continue;
+        };
+        message.content = Value::String(minimal);
+    }
+}
+
+pub(super) fn is_preserved_tool_overflow_content(content: &Value) -> bool {
+    content
+        .as_str()
+        .is_some_and(is_preserved_tool_overflow_stub)
 }
 
 /// 将「保护尾窗之外」的 overflow stub 预览体老化折叠为单行锚点。仅作用于已外溢

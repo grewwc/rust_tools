@@ -24,8 +24,10 @@ use tool_overflow::{
     age_out_overflow_stub_previews, build_persisted_summary_text,
     build_persisted_summary_text_with_app, cap_oversized_tool_results_for_context,
     enforce_protected_precision_group_budget, is_non_compressible_tool,
+    is_preserved_tool_overflow_content, minimize_overflow_stubs_for_hard_budget,
     normalize_preserved_message_stubs_for_model, prepare_tool_messages_structured,
-    spill_oversized_preserved_messages, tool_line_signature, try_spill_preserved_message_to_stub,
+    spill_oversized_preserved_messages, spill_protected_precision_to_fit, tool_line_signature,
+    try_spill_preserved_message_to_stub,
 };
 
 /// 请求上下文中单条 raw tool result 的物理上限。canonical history 不受影响。
@@ -885,6 +887,7 @@ fn shrink_messages_to_fit(
         max_chars / 2,
         overflow_dir,
         protected_tool_call_ids,
+        false,
     );
 
     // 先无条件外溢体量过大的旧 user/图片消息（保护尾窗除外），与
@@ -951,8 +954,30 @@ fn shrink_messages_to_fit(
         break;
     }
 
+    // 当前 turn 的精确工具证据在常规裁剪阶段受保护；若它们本身令请求仍然超限，
+    // 必须先零压缩外溢并留下可回读 file_path，而不是返回超预算 payload，或让后续
+    // 通用截断静默破坏证据。这里也覆盖不经过 LLM Path C 的普通 mid-turn 压缩。
+    if messages_total_chars(&messages) > max_chars {
+        spill_protected_precision_to_fit(
+            &mut messages,
+            max_chars,
+            overflow_dir,
+            protected_tool_call_ids,
+        );
+    }
+
     if messages_total_chars(&messages) > max_chars {
         truncate_unprotected_messages_to_fit(&mut messages, max_chars, protected_tool_call_ids);
+    }
+
+    // 裁剪 compressed_tool_evidence 时，正文会零压缩追加到统一历史归档；必须把
+    // 统一回指重新放回请求，否则磁盘上虽有证据，模型却不知道归档路径。
+    if let Some(dir) = overflow_dir {
+        let archive_path = dir.join(OVERFLOW_HISTORY_FILENAME);
+        if archive_path.is_file() {
+            let archive_note = build_overflow_placeholder(&archive_path.to_string_lossy());
+            insert_archive_note_if_missing(&mut messages, archive_note);
+        }
     }
 
     keep_only_recent_reasoning_content(&mut messages);
@@ -996,6 +1021,7 @@ fn shrink_messages_to_fit_with_summary(
         max_chars / 2,
         overflow_dir,
         protected_tool_call_ids,
+        false,
     );
 
     // 先无条件外溢体量过大的旧 user/图片消息（最新一轮保护尾窗除外）。
@@ -1190,6 +1216,13 @@ fn truncate_mutable_messages_to_fit_with_policy(
         return true;
     }
 
+    // overflow asset 是受保护证据的唯一真源。预算不足时先丢弃可选预览，只保留
+    // 可解析的 file_path 指针；后续通用 head+tail 截断绝不能再碰该最小协议。
+    minimize_overflow_stubs_for_hard_budget(messages);
+    if messages_total_chars(messages) <= max_chars {
+        return true;
+    }
+
     for include_protected in [false, true] {
         if include_protected && !allow_protected_fallback {
             break;
@@ -1206,7 +1239,10 @@ fn truncate_mutable_messages_to_fit_with_policy(
                     continue;
                 }
                 let content_chars = value_len_chars(&message.content);
-                if !message_contains_image(&message.content) && content_chars > 160 {
+                if !message_contains_image(&message.content)
+                    && !is_preserved_tool_overflow_content(&message.content)
+                    && content_chars > 160
+                {
                     choose_larger_mutable_field(
                         &mut best,
                         (index, MutableMessageField::Content, content_chars - 160),
@@ -1277,12 +1313,16 @@ fn emergency_cap_messages_to_fit(
     per_field_cap: usize,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
+    minimize_overflow_stubs_for_hard_budget(messages);
     for message in messages.iter_mut() {
         if is_system_like_role(&message.role) || message.role == "user" {
             continue;
         }
         let content_chars = value_len_chars(&message.content);
-        if !message_contains_image(&message.content) && content_chars > per_field_cap {
+        if !message_contains_image(&message.content)
+            && !is_preserved_tool_overflow_content(&message.content)
+            && content_chars > per_field_cap
+        {
             truncate_mutable_field(
                 message,
                 MutableMessageField::Content,
@@ -1344,6 +1384,9 @@ fn choose_larger_mutable_field(
 fn truncate_mutable_field(message: &mut Message, field: MutableMessageField, reduce_by: usize) {
     match field {
         MutableMessageField::Content => {
+            if is_preserved_tool_overflow_content(&message.content) {
+                return;
+            }
             let text = value_to_string(&message.content);
             let target = text.chars().count().saturating_sub(reduce_by).max(160);
             message.content = Value::String(format!(
@@ -1547,12 +1590,26 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
             .position(|m| !is_system_like_role(&m.role))
             .unwrap_or(split_at);
         let earlier = &messages[preserved_system_end..split_at];
+        // 从待摘要区段中抽出 context checkpoint 标记：它是定位已保存检查点正文的
+        // 唯一索引，绝不能被摘要吞掉。常规落盘压缩路径已做同样处理，这里补齐。
+        let checkpoint_markers: Vec<Message> = earlier
+            .iter()
+            .filter(|m| is_context_checkpoint_marker(m))
+            .cloned()
+            .collect();
+        let summary_source: Vec<Message> = earlier
+            .iter()
+            .filter(|m| !is_context_checkpoint_marker(m))
+            .cloned()
+            .collect();
         let has_dialog = earlier
             .iter()
-            .any(|m| m.role == "user" || m.role == "assistant");
+            .any(|m| m.role == "user" || m.role == "assistant")
+            || !checkpoint_markers.is_empty();
         if has_dialog {
             let summary =
-                build_persisted_summary_text_with_app(app, earlier, summary_max_chars).await;
+                build_persisted_summary_text_with_app(app, &summary_source, summary_max_chars)
+                    .await;
             if !summary.trim().is_empty() {
                 let mut out =
                     Vec::with_capacity(preserved_system_end + 1 + (messages.len() - split_at));
@@ -1569,6 +1626,8 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                     tool_call_id: None,
                     reasoning_content: None,
                 });
+                // 2b. 回填被抽出的 context checkpoint 标记，保留其可回读索引
+                out.extend(checkpoint_markers.iter().cloned());
                 // 3. 尾窗：保留 user 逐字 + 最近若干工具组逐字，更早工具组折叠成 stub
                 let (tail, _) = fold_early_tool_groups(
                     &messages[split_at..],
@@ -1634,6 +1693,15 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // 收紧，因此并行工具结果很多时也能收敛。若不可裁的 system/user 本身已超预算，
     // 返回可达到的最小结果，而不是破坏用户任务原文。
     let mut result = best.unwrap_or(messages);
+    // Path C 兜底前先对当前 turn 的 protected precision 结果做零压缩外溢：
+    // 原文落盘为可回读 asset 并替换为 stub，避免紧接着的 `emergency_cap_messages_to_fit`
+    // 把这些 grounding 证据有损截断到 8K / ~160 字符后原文不可恢复。
+    spill_protected_precision_to_fit(
+        &mut result,
+        hard_target,
+        Some(overflow_dir.as_path()),
+        &protected_tool_call_ids,
+    );
     emergency_cap_messages_to_fit(
         &mut result,
         hard_target,
@@ -1899,10 +1967,19 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
     let mut prev_role = String::new();
     let mut prev_content = String::new();
     let mut prev_signature = String::new();
+    let mut prev_tool_call_id: Option<String> = None;
+    // 上一条 tool 消息的 tool_call_id：只有同 tool_call_id 才视为同一次调用的重复结果。
     for m in messages.drain(..) {
         let text = value_to_string(&m.content);
         // 完全相等去重仅对 tool 启用：用户/助手/system 原文不做去重。
-        if m.role == "tool" && m.role == prev_role && text == prev_content {
+        // 必须同 tool_call_id：并行工具调用返回相同文本属于不同调用，不能丢弃，
+        // 否则会破坏 assistant tool_call <-> tool result 的配对。
+        if m.role == "tool"
+            && m.role == prev_role
+            && text == prev_content
+            && m.tool_call_id.is_some()
+            && m.tool_call_id == prev_tool_call_id
+        {
             continue;
         }
         // 模糊去重：仅对 tool 角色启用，避免误伤 assistant/user 中观感相近但实质不同的回复。
@@ -1916,12 +1993,15 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
             && !signature.is_empty()
             && m.role == prev_role
             && signature == prev_signature
+            && m.tool_call_id.is_some()
+            && m.tool_call_id == prev_tool_call_id
         {
             continue;
         }
         prev_role = m.role.clone();
         prev_content = text;
         prev_signature = signature;
+        prev_tool_call_id = m.tool_call_id.clone();
         out.push(m);
     }
     *messages = out;
@@ -2480,6 +2560,8 @@ fn render_deduped_read_file_output_lines(lines: &[(usize, String)], removed: usi
 
 #[cfg(test)]
 mod coalesce_summary_notes_tests;
+#[cfg(test)]
+mod dedup_adjacent_tests;
 #[cfg(test)]
 mod fold_early_tool_groups_tests;
 #[cfg(test)]

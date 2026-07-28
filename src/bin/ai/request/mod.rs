@@ -20,9 +20,6 @@ pub(crate) use aux::{
     charge_llm_usage_to_kernel, charge_llm_usage_via_kernel, generate_session_title_via_model,
     summarize_history_via_model,
 };
-#[cfg(test)]
-pub(in crate::ai) use logging::request_diagnostics_enabled;
-pub(in crate::ai) use logging::emit_request_diagnostic;
 #[allow(unused_imports)]
 pub(crate) use error::{
     AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS, AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
@@ -30,15 +27,19 @@ pub(crate) use error::{
     RequestErrorKind, RequestRetryPolicy, STREAM_RESPONSE_HEADER_TIMEOUT_SECS,
     api_key_for_request_model, apply_request_auth, clear_stale_request_interrupt_before_request,
     config_bool_is_true, config_forces_thinking, control_model_for_aux_tasks,
-    endpoint_for_request_model, is_retryable_reqwest_error, is_retryable_status_with_body,
-    is_retryable_stream_error, is_transient_error, parse_retry_after, request_retry_policy,
-    request_retry_policy_for_current_context, retry_delay, should_abort_retry_wait,
-    should_retry_status, should_rotate_key, should_temporarily_disable_auto_selected_model,
-    should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel,
+    endpoint_for_request_model, is_context_overflow_error, is_retryable_reqwest_error,
+    is_retryable_status_with_body, is_retryable_stream_error, is_transient_error,
+    parse_retry_after, request_retry_policy, request_retry_policy_for_current_context, retry_delay,
+    should_abort_retry_wait, should_retry_status, should_rotate_key,
+    should_temporarily_disable_auto_selected_model, should_temporarily_disable_model,
+    should_try_model_fallback, sleep_with_cancel,
 };
-pub(crate) use protocol::{build_http_body_for_json_messages, extract_response_text};
+pub(in crate::ai) use logging::emit_request_diagnostic;
+#[cfg(test)]
+pub(in crate::ai) use logging::request_diagnostics_enabled;
 #[cfg(test)]
 use protocol::responses_reasoning_replay_stats;
+pub(crate) use protocol::{build_http_body_for_json_messages, extract_response_text};
 #[cfg(test)]
 pub(crate) use reasoning::apply_aux_thinking_fields;
 #[allow(unused_imports)]

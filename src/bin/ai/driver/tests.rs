@@ -6,8 +6,9 @@ use super::{
     has_pending_foreground_process, maybe_auto_route_agent, one_shot_cli_mode,
     reset_scheduler_test_state, resolve_background_subagent_override,
     resolve_startup_session_choice, resolve_startup_session_choice_with_selector,
-    should_preload_mcp, should_publish_subagent_task_result, should_suspend_session_on_sigint,
-    should_resume_suspended_terminal_session, update_dispatch_meta,
+    should_preload_mcp, should_publish_subagent_task_result,
+    should_resume_suspended_terminal_session, should_suspend_session_on_sigint,
+    update_dispatch_meta,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 use crate::ai::cli::ParsedCli;
@@ -929,13 +930,26 @@ fn sample_skill(name: &str) -> SkillManifest {
 }
 
 #[test]
-fn background_task_inherit_history_uses_parent_history_file() {
-    let original = PathBuf::from("/tmp/session.sqlite");
-    let process = PathBuf::from("/tmp/session.proc-42.sqlite");
+fn background_task_signal_only_resume_preserves_child_history() {
+    let root = std::env::temp_dir().join(format!(
+        "ai-background-history-fork-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let original = root.join("session.sqlite");
+    let process = root.join("session.proc-42.sqlite");
+    let parent = rusqlite::Connection::open(&original).unwrap();
+    parent
+        .execute("CREATE TABLE parent_evidence(value TEXT)", [])
+        .unwrap();
+    parent
+        .execute("INSERT INTO parent_evidence VALUES ('parent')", [])
+        .unwrap();
+    drop(parent);
     let skills = Arc::new(vec![sample_skill("s1")]);
 
     let (effective_history, effective_skills) = super::resolve_background_subagent_context(
-        process,
+        process.clone(),
         original.as_path(),
         &skills,
         Some("task_1"),
@@ -945,16 +959,68 @@ fn background_task_inherit_history_uses_parent_history_file() {
             cwd: true,
             skills: true,
         },
-    );
+        true,
+    )
+    .unwrap();
 
-    assert_eq!(effective_history, original);
+    assert_eq!(effective_history, process);
     assert_eq!(effective_skills.len(), 1);
+    let child = rusqlite::Connection::open(&process).unwrap();
+    assert_eq!(
+        child
+            .query_row("SELECT value FROM parent_evidence", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "parent"
+    );
+    child
+        .execute("CREATE TABLE child_evidence(value TEXT)", [])
+        .unwrap();
+    child
+        .execute("INSERT INTO child_evidence VALUES ('child')", [])
+        .unwrap();
+    drop(child);
+
+    super::resolve_background_subagent_context(
+        process.clone(),
+        original.as_path(),
+        &skills,
+        Some("task_1"),
+        InheritOptions {
+            history: true,
+            memory: false,
+            cwd: true,
+            skills: true,
+        },
+        false,
+    )
+    .unwrap();
+    let resumed = rusqlite::Connection::open(&process).unwrap();
+    assert_eq!(
+        resumed
+            .query_row("SELECT value FROM child_evidence", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "child"
+    );
+    drop(resumed);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn background_task_disable_skills_uses_empty_skill_set() {
-    let original = PathBuf::from("/tmp/session.sqlite");
-    let process = PathBuf::from("/tmp/session.proc-43.sqlite");
+    let root = std::env::temp_dir().join(format!(
+        "ai-background-fresh-history-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let original = root.join("session.sqlite");
+    let process = root.join("session.proc-43.sqlite");
+    let stale = rusqlite::Connection::open(&process).unwrap();
+    stale
+        .execute("CREATE TABLE stale_child_evidence(value TEXT)", [])
+        .unwrap();
+    drop(stale);
     let skills = Arc::new(vec![sample_skill("s1")]);
 
     let (effective_history, effective_skills) = super::resolve_background_subagent_context(
@@ -968,10 +1034,86 @@ fn background_task_disable_skills_uses_empty_skill_set() {
             cwd: true,
             skills: false,
         },
-    );
+        true,
+    )
+    .unwrap();
 
     assert_eq!(effective_history, process);
     assert!(effective_skills.is_empty());
+    let child = rusqlite::Connection::open(&process).unwrap();
+    assert_eq!(
+        child
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='stale_child_evidence'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "首次派发且不继承历史时必须清掉复用 pid 留下的 child 库"
+    );
+    assert_eq!(
+        child
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='messages'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "首次派发必须发布一个可打开的全新 child history"
+    );
+    drop(child);
+
+    std::fs::remove_file(&process).unwrap();
+    let error = super::resolve_background_subagent_context(
+        process.clone(),
+        original.as_path(),
+        &skills,
+        Some("task_2"),
+        InheritOptions {
+            history: false,
+            memory: false,
+            cwd: true,
+            skills: false,
+        },
+        false,
+    )
+    .expect_err("resume 丢失 child history 时必须失败，不能让 SQLite 静默新建空库");
+    assert!(error.contains("不存在"), "unexpected resume error: {error}");
+
+    // 请求继承历史但父会话尚未创建时，首次派发仍要覆盖复用 pid 遗留的 child 库。
+    let stale = rusqlite::Connection::open(&process).unwrap();
+    stale
+        .execute("CREATE TABLE stale_parentless_evidence(value TEXT)", [])
+        .unwrap();
+    drop(stale);
+    super::resolve_background_subagent_context(
+        process.clone(),
+        original.as_path(),
+        &skills,
+        Some("task_2"),
+        InheritOptions {
+            history: true,
+            memory: false,
+            cwd: true,
+            skills: false,
+        },
+        true,
+    )
+    .unwrap();
+    let fresh = rusqlite::Connection::open(&process).unwrap();
+    let stale_table_count: i64 = fresh
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='stale_parentless_evidence'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_table_count, 0);
+    drop(fresh);
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -986,7 +1128,9 @@ fn non_task_background_process_keeps_process_history_and_skills() {
         &skills,
         None,
         InheritOptions::default(),
-    );
+        true,
+    )
+    .unwrap();
 
     assert_eq!(effective_history, process);
     assert_eq!(effective_skills.len(), 1);

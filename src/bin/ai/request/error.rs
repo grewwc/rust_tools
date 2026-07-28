@@ -304,6 +304,39 @@ pub(crate) fn should_try_model_fallback(err: &RequestError) -> bool {
     }
 }
 
+/// 判断错误是否是「上下文/输入超出模型窗口」类的拒绝。
+///
+/// 这类错误不是瞬态的（重发同样的包只会再次被拒），也不该触发 key 轮换或换模型
+/// ——唯一有意义的补救是**收缩上下文后重试**。因此它独立于 [`is_transient_error`]
+/// / [`should_try_model_fallback`] 分类，供 driver 的 reactive 压缩重试路径专用。
+///
+/// provider 对「上下文过长」的表述五花八门，且状态码不统一（OpenAI 用
+/// 400 `context_length_exceeded`，部分兼容层用 413 Payload Too Large，也有网关
+/// 直接回 400 + "maximum context length" / "too many tokens" 文案）。这里同时按
+/// 状态码与 body 文案做保守匹配：413 视为上下文超限；400 需 body 命中已知文案。
+/// 429/5xx 不在此列（它们由既有瞬态/轮换/退避路径处理）。
+pub(crate) fn is_context_overflow_error(err: &RequestError) -> bool {
+    let RequestErrorKind::Status(status) = err.kind else {
+        return false;
+    };
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        return true;
+    }
+    if status.as_u16() != 400 {
+        return false;
+    }
+    let lower = err.message.to_ascii_lowercase();
+    lower.contains("context_length_exceeded")
+        || lower.contains("context length")
+        || lower.contains("context window")
+        || lower.contains("maximum context")
+        || lower.contains("too many tokens")
+        || lower.contains("reduce the length")
+        || lower.contains("input is too long")
+        || lower.contains("prompt is too long")
+        || lower.contains("string too long")
+}
+
 /// Returns `true` if the error indicates an auth or quota issue with the API key
 /// (401 Unauthorized, 403 Forbidden, 429 Too Many Requests),
 /// which should trigger key rotation when alternative keys are available.
@@ -355,4 +388,50 @@ pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
         || lower.contains("503")
         || lower.contains("504")
         || lower.contains("risk_control")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_overflow_matches_413_regardless_of_body() {
+        let err = RequestError::status(StatusCode::PAYLOAD_TOO_LARGE, String::new());
+        assert!(is_context_overflow_error(&err));
+    }
+
+    #[test]
+    fn context_overflow_matches_400_with_known_phrasing() {
+        for body in [
+            "{\"error\":{\"code\":\"context_length_exceeded\"}}",
+            "This model's maximum context length is 262144 tokens",
+            "please reduce the length of the messages",
+            "input is too long for requested model",
+        ] {
+            let err = RequestError::status(StatusCode::BAD_REQUEST, body.to_string());
+            assert!(
+                is_context_overflow_error(&err),
+                "expected overflow classification for body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_overflow_ignores_unrelated_400_and_transient_errors() {
+        let unrelated_400 = RequestError::status(
+            StatusCode::BAD_REQUEST,
+            "invalid tool arguments".to_string(),
+        );
+        assert!(!is_context_overflow_error(&unrelated_400));
+
+        let rate_limited = RequestError::status(StatusCode::TOO_MANY_REQUESTS, String::new());
+        assert!(!is_context_overflow_error(&rate_limited));
+
+        let server_error =
+            RequestError::status(StatusCode::INTERNAL_SERVER_ERROR, "upstream".to_string());
+        assert!(!is_context_overflow_error(&server_error));
+
+        let network = RequestError::cancelled("canceled");
+        assert!(!is_context_overflow_error(&network));
+    }
 }
