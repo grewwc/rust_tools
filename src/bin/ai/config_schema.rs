@@ -67,6 +67,11 @@ impl AiConfig {
     pub const MEMORY_ARCHIVES_KEEP_LAST: &str = "ai.memory.archives.keep_last";
     pub const MEMORY_ARCHIVES_MAX_BYTES: &str = "ai.memory.archives.max_bytes";
 
+    // ── Response critic ───────────────────────────────────────
+    // 仅对当前回答做内联自检，不读取或召回知识库。
+    pub const CRITIC_REVISE_ENABLE: &str = "ai.critic_revise.enable";
+    pub const CRITIC_REVISE_INTEGRATED_ENABLE: &str = "ai.critic_revise.integrated.enable";
+
     // ── Embedding (remote provider) ────────────────────────
     pub const EMBEDDING_ENABLE: &str = "ai.embedding.enable";
     pub const EMBEDDING_ENDPOINT: &str = "ai.embedding.endpoint";

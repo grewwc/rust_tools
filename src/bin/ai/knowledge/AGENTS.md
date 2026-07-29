@@ -15,6 +15,10 @@ Applies to `src/bin/ai/knowledge/**`.
    failing.
 4. **Separated responsibilities.** Keep retrieval, indexing, storage, and sync
    responsibilities separated unless a change genuinely crosses those boundaries.
+5. **No automatic recall.** Knowledge is read only through explicit
+   `knowledge_*` / `memory_*` tool calls. Do not scan or inject the knowledge
+   store automatically while preparing a turn. Notebook remains an independent
+   tool-backed context source and must not be coupled to knowledge retrieval.
 
 ## Related code areas
 

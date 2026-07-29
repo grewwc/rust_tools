@@ -159,7 +159,6 @@ pub(super) struct SkillTurnGuard {
     cached_system_prompt: Option<String>,
     cached_context_reminder: Option<Option<String>>,
     matched_skill_name: Option<String>,
-    skip_recall_by_skill: bool,
 }
 
 impl SkillTurnGuard {
@@ -195,10 +194,6 @@ impl SkillTurnGuard {
 
     pub(super) fn matched_skill_name(&self) -> Option<&str> {
         self.matched_skill_name.as_deref()
-    }
-
-    pub(super) fn skip_recall_by_skill(&self) -> bool {
-        self.skip_recall_by_skill
     }
 
     pub(super) fn take_restore_agent_context(&mut self) -> Option<(Vec<ToolDef>, usize)> {
@@ -1226,10 +1221,6 @@ fn build_system_prompt(
     b
 }
 
-fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
-    skill.is_some_and(|skill| skill.skip_recall || is_executor_skill(skill))
-}
-
 fn build_skill_turn_guard(
     app: &mut App,
     mcp_client: &McpClient,
@@ -1238,7 +1229,6 @@ fn build_skill_turn_guard(
     let all_mcp_tools = mcp_client.get_all_tools();
     super::super::tools::enable_tools::set_available_mcp_tools(all_mcp_tools.clone());
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
-    let skip_recall_by_skill = should_skip_recall_for_skill(skill);
     let active_agent = app.current_agent_manifest.clone();
     let executor_active = skill.as_ref().is_some_and(|s| is_executor_skill(s))
         || active_agent.as_ref().is_some_and(is_executor_agent);
@@ -1298,7 +1288,6 @@ fn build_skill_turn_guard(
         cached_system_prompt: None,
         cached_context_reminder: None,
         matched_skill_name,
-        skip_recall_by_skill,
     }
 }
 
@@ -1332,7 +1321,6 @@ pub(super) fn force_activate_named_skill(
     let skill = skill_manifests.iter().find(|s| s.name == requested_name)?;
     let mut guard = build_skill_turn_guard(app, mcp_client, Some(skill));
     guard.matched_skill_name = Some(skill.name.clone());
-    guard.skip_recall_by_skill = should_skip_recall_for_skill(Some(skill));
     Some(guard)
 }
 
@@ -1414,10 +1402,8 @@ pub(super) fn prepare_skill_for_turn(
         eprintln!("[skills] no auto-activation; explicit activate_skill only");
     }
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
-    let skip_recall_by_skill = should_skip_recall_for_skill(skill);
     let mut guard = build_skill_turn_guard(app, mcp_client, skill);
     guard.matched_skill_name = matched_skill_name;
-    guard.skip_recall_by_skill = skip_recall_by_skill;
     guard
 }
 
@@ -2362,7 +2348,6 @@ mod tests {
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
-            skip_recall: false,
             disable_builtin_tools: false,
             disable_mcp_tools: false,
             prompt: String::new(),

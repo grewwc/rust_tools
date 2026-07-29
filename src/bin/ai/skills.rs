@@ -61,8 +61,6 @@ pub(super) struct SkillManifest {
     #[serde(default)]
     pub(super) mcp_servers: Vec<String>,
     #[serde(default)]
-    pub(super) skip_recall: bool,
-    #[serde(default)]
     pub(super) disable_builtin_tools: bool,
     #[serde(default)]
     pub(super) disable_mcp_tools: bool,
@@ -106,7 +104,6 @@ impl SkillManifest {
             "tools": self.tools,
             "tool_groups": self.tool_groups,
             "mcp_servers": self.mcp_servers,
-            "skip_recall": self.skip_recall,
             "disable_builtin_tools": self.disable_builtin_tools,
             "disable_mcp_tools": self.disable_mcp_tools,
             "prompt": self.prompt,
@@ -235,7 +232,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
     let mut tool_groups: Vec<String> = Vec::new();
     let mut mcp_servers: Vec<String> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();
-    let mut skip_recall = false;
     let mut disable_builtin_tools = false;
     let mut disable_mcp_tools = false;
     let mut system_prompt: Option<String> = None;
@@ -295,7 +291,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
                 "version" => version = Some(unquoted.to_string()),
                 "description" => description = Some(unquoted.to_string()),
                 "author" => author = Some(unquoted.to_string()),
-                "skip_recall" => skip_recall = parse_bool_value(unquoted).unwrap_or(false),
                 "disable_builtin_tools" => {
                     disable_builtin_tools = parse_bool_value(unquoted).unwrap_or(false)
                 }
@@ -334,7 +329,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
         tools,
         tool_groups,
         mcp_servers,
-        skip_recall,
         disable_builtin_tools,
         disable_mcp_tools,
         prompt: body.trim().to_string(),

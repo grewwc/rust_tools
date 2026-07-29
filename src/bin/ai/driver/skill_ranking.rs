@@ -353,7 +353,6 @@ mod tests {
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
-            skip_recall: false,
             disable_builtin_tools: false,
             disable_mcp_tools: false,
             prompt: String::new(),

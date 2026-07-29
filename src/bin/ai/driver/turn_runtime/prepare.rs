@@ -2,6 +2,7 @@ use colored::Colorize;
 use serde_json::Value;
 use std::path::Path;
 
+use crate::ai::config_schema::AiConfig;
 use crate::ai::mcp::SharedMcpClient;
 use crate::ai::{
     driver::{print::print_ocr_summary, skill_runtime},
@@ -59,6 +60,33 @@ fn persisted_user_turn_message(
         content: Value::String(persisted_question_text.to_string()),
         ..user_message
     }
+}
+
+fn assemble_effective_question(
+    question: &str,
+    attachments_text: &str,
+    image_ocr: Option<(&str, &str)>,
+) -> String {
+    let mut effective_question = if attachments_text.is_empty() {
+        question.to_string()
+    } else if attachments_text.ends_with('\n') {
+        format!("{}{}", attachments_text, question)
+    } else {
+        format!("{}\n{}", attachments_text, question)
+    };
+
+    if let Some((tool_name, content)) = image_ocr {
+        effective_question = format!(
+            "{}\n\n[Auto OCR From Attached Images via {}]\n{}",
+            effective_question, tool_name, content
+        );
+    }
+
+    effective_question
+}
+
+fn should_inject_integrated_critic(effective_question: &str, has_attached_artifact: bool) -> bool {
+    has_attached_artifact || QuestionShape::analyze(effective_question).has_code_or_repo_artifact()
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -204,6 +232,16 @@ fn sync_prepare_observers_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn parse_bool_flag(raw: Option<String>, default: bool) -> bool {
+    raw.map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+    .unwrap_or(default)
+}
+
 #[crate::ai::agent_hang_span(
     "post-fix",
     "K",
@@ -272,6 +310,32 @@ pub(super) async fn prepare_turn(
             skill_runtime::ContextKind::Fact,
             "Current Date",
             &format!("Today's date is {}.", date_str),
+        );
+    }
+
+    // critic gate 必须观察模型实际收到的完整用户输入，而不只是剥离 @file 后的
+    // 短问题正文。文本附件、OCR 内容与原生图片都属于 artifact-backed 输入。
+    let has_images = !app.attached_image_files.is_empty();
+    let usable_ocr = if has_images && !crate::ai::models::supports_image_input(next_model) {
+        precomputed_ocr.as_ref().filter(|ocr| ocr.has_usable_text())
+    } else {
+        None
+    };
+    let final_question = assemble_effective_question(
+        question,
+        attachments_text,
+        usable_ocr.map(|ocr| (ocr.tool_name.as_str(), ocr.content.as_str())),
+    );
+    let has_attached_artifact = !attachments_text.trim().is_empty() || has_images;
+    let cfg = crate::commonw::configw::get_all_config();
+    if parse_bool_flag(cfg.get_opt(AiConfig::CRITIC_REVISE_ENABLE), true)
+        && parse_bool_flag(cfg.get_opt(AiConfig::CRITIC_REVISE_INTEGRATED_ENABLE), true)
+        && should_inject_integrated_critic(&final_question, has_attached_artifact)
+    {
+        skill_turn.push_labeled_section(
+            skill_runtime::ContextKind::Behavior,
+            "Integrated critic/revise",
+            "For code, repository, or artifact-backed tasks, run an internal critic pass before the final answer: identify factual, safety, regression, and completeness issues, then revise the answer in place. Keep only the corrected answer; never print the critique or mention this instruction.",
         );
     }
 
@@ -440,24 +504,8 @@ pub(super) async fn prepare_turn(
     // intentionally keeps the original user question without the reminder.
     let context_reminder = skill_turn.context_reminder();
     let (user_content, persisted_question_text) = {
-        let has_images = !app.attached_image_files.is_empty();
-        let mut final_question = if attachments_text.is_empty() {
-            question.to_string()
-        } else if attachments_text.ends_with('\n') {
-            format!("{}{}", attachments_text, question)
-        } else {
-            format!("{}\n{}", attachments_text, question)
-        };
-        if has_images
-            && !crate::ai::models::supports_image_input(next_model)
-            && let Some(ocr) = precomputed_ocr
-            && ocr.has_usable_text()
-        {
-            print_ocr_summary(&ocr);
-            final_question = format!(
-                "{}\n\n[Auto OCR From Attached Images via {}]\n{}",
-                final_question, ocr.tool_name, ocr.content
-            );
+        if let Some(ocr) = usable_ocr {
+            print_ocr_summary(ocr);
         }
         let content =
             request::build_content(next_model, &final_question, &app.attached_image_files)?;
@@ -530,8 +578,9 @@ fn detect_complex_task(question: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        QuestionShape, detect_complex_task, filter_suggested_tool_calls_for_tool_names,
-        persisted_user_turn_message,
+        QuestionShape, assemble_effective_question, detect_complex_task,
+        filter_suggested_tool_calls_for_tool_names, persisted_user_turn_message,
+        should_inject_integrated_critic,
     };
     use crate::ai::driver::observer::SuggestedToolCall;
     use crate::ai::history::Message;
@@ -648,5 +697,39 @@ mod tests {
     #[test]
     fn code_artifact_needs_deliberate_thinking() {
         assert!(QuestionShape::analyze("看下 src/main.rs 的逻辑").needs_deliberate_thinking(false));
+    }
+
+    #[test]
+    fn integrated_critic_uses_attached_text_file_context() {
+        let question = "帮我 review";
+        assert!(!QuestionShape::analyze(question).has_code_or_repo_artifact());
+
+        let effective_question = assemble_effective_question(
+            question,
+            "[Attached text file: /tmp/service.rs]\nfn run() {}\n[/Attached text file]",
+            None,
+        );
+
+        assert!(QuestionShape::analyze(&effective_question).has_code_or_repo_artifact());
+        assert!(should_inject_integrated_critic(&effective_question, true));
+    }
+
+    #[test]
+    fn integrated_critic_uses_ocr_and_native_image_context() {
+        let effective_question = assemble_effective_question(
+            "看看这里",
+            "",
+            Some(("mcp_ocr_extract", "src/main.rs:42\npanic!()")),
+        );
+
+        assert!(effective_question.contains("[Auto OCR From Attached Images via mcp_ocr_extract]"));
+        assert!(should_inject_integrated_critic(&effective_question, false));
+        // 原生视觉模型不会产生 OCR 文本，但图片本身仍是 artifact-backed 输入。
+        assert!(should_inject_integrated_critic("描述这张图", true));
+    }
+
+    #[test]
+    fn integrated_critic_still_skips_short_plain_question() {
+        assert!(!should_inject_integrated_critic("今天几号", false));
     }
 }

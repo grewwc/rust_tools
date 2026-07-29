@@ -70,9 +70,6 @@ fn build_capability_text(skill: &SkillManifest) -> String {
     if !skill.mcp_servers.is_empty() {
         lines.push(skill.mcp_servers.join("\n"));
     }
-    if skill.skip_recall {
-        lines.push("skip recall".to_string());
-    }
     if skill.disable_builtin_tools {
         lines.push("disable builtin tools".to_string());
     }
