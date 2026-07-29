@@ -360,23 +360,25 @@ fn responses_input(
     input
 }
 
-fn responses_tools(tools: &Value) -> Value {
-    Value::Array(
-        tools
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|tool| {
-                let function = tool.get("function").unwrap_or(tool);
-                json!({
-                    "type": "function",
-                    "name": function.get("name").cloned().unwrap_or(Value::Null),
-                    "description": function.get("description").cloned().unwrap_or(Value::Null),
-                    "parameters": function.get("parameters").cloned().unwrap_or(Value::Null),
-                })
+fn responses_tools(tools: Option<&Value>, enable_search: bool) -> Option<Value> {
+    let mut converted = tools
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|tool| {
+            let function = tool.get("function").unwrap_or(tool);
+            json!({
+                "type": "function",
+                "name": function.get("name").cloned().unwrap_or(Value::Null),
+                "description": function.get("description").cloned().unwrap_or(Value::Null),
+                "parameters": function.get("parameters").cloned().unwrap_or(Value::Null),
             })
-            .collect(),
-    )
+        })
+        .collect::<Vec<_>>();
+    if enable_search {
+        converted.push(json!({"type": "web_search"}));
+    }
+    (!converted.is_empty()).then_some(Value::Array(converted))
 }
 
 pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
@@ -395,8 +397,11 @@ pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
             json!(["reasoning.encrypted_content"]),
         );
     }
-    if let Some(tools) = &request.tools {
-        object.insert("tools".to_string(), responses_tools(tools));
+    if let Some(tools) = responses_tools(
+        request.tools.as_ref(),
+        request.enable_search == Some(true),
+    ) {
+        object.insert("tools".to_string(), tools);
     }
     if let Some(tool_choice) = &request.tool_choice {
         object.insert("tool_choice".to_string(), tool_choice.clone());

@@ -909,6 +909,63 @@ fn responses_request_body_uses_function_tools_and_nested_reasoning() {
 }
 
 #[test]
+fn responses_search_uses_builtin_web_search_tool() {
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("搜索今天的新闻".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "读取文件",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    }]);
+    let request = build_request_body(
+        "gpt-5.5",
+        &messages,
+        false,
+        false,
+        Some(true),
+        Some(tools),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let body = super::build_responses_request_body(&request);
+
+    assert!(body.get("enable_search").is_none());
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][1], json!({"type": "web_search"}));
+
+    let request_without_function_tools = build_request_body(
+        "gpt-5.5",
+        &messages,
+        false,
+        false,
+        Some(true),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let body_without_function_tools =
+        super::build_responses_request_body(&request_without_function_tools);
+    assert_eq!(
+        body_without_function_tools["tools"],
+        json!([{"type": "web_search"}])
+    );
+}
+
+#[test]
 fn no_tool_request_bodies_omit_tools_and_tool_choice() {
     let messages = vec![Message {
         role: "user".to_string(),

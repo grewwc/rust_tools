@@ -33,6 +33,9 @@ pub struct ModelDef {
     #[serde(default)]
     pub quality_tier: ModelQualityTier,
     pub is_vl: bool,
+    /// provider 原生联网搜索能力。仅当请求协议有明确 wire 映射时开启：
+    /// DashScope Chat Completions 使用 `enable_search`，OpenAI Responses 使用
+    /// 内置 `web_search` tool；客户端工具不属于此字段。
     pub search_enabled: bool,
     pub tools_default_enabled: bool,
     /// 是否支持在 message content block 上注入

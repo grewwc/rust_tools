@@ -17,6 +17,7 @@ use crate::ai::{
     history::Message,
     models,
     provider::{adapter_for, compatible_wire_shapes},
+    request_protocol::RequestProtocolDialect,
 };
 
 /// 构建消息 content：纯文本模型或无图片时返回字符串；多模态模型返回
@@ -146,9 +147,12 @@ pub(super) fn build_request_body<'a>(
     let request_model = models::request_model_name(model);
     let (thinking, reasoning_effort, reasoning) =
         resolve_reasoning_wire_controls(model, &endpoint, enable_thinking, reasoning_effort);
-    // compatible 端点里非 DashScope 的纯 OpenAI 兼容网关不认识 enable_search，
-    // 由 compatible_wire_shapes 判定是否下发；其他 adapter 走默认 hook。
-    let enable_search = if adapter_kind == crate::ai::provider::ApiProvider::Compatible {
+    // Responses 将搜索能力映射成内置 web_search tool；Chat Completions 的
+    // 搜索开关则继续交给 provider 方言决定是否保留 `enable_search`。
+    let request_protocol = models::request_protocol_dialect(model, &endpoint);
+    let enable_search = if request_protocol == RequestProtocolDialect::Responses {
+        enable_search
+    } else if adapter_kind == crate::ai::provider::ApiProvider::Compatible {
         let (es, _, _) = compatible_wire_shapes(&endpoint, enable_search, None);
         es
     } else {
