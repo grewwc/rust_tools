@@ -1,6 +1,7 @@
 use colored::Colorize;
 use rust_tools::commonw::FastSet;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
@@ -55,6 +56,87 @@ fn request_visible_tool_names(app: &App) -> FastSet<String> {
         .unwrap_or_default()
 }
 
+fn push_project_target(targets: &mut Vec<PathBuf>, seen: &mut FastSet<String>, raw_path: &str) {
+    let path = raw_path.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    if path.is_empty() || !seen.insert(path.to_string()) {
+        return;
+    }
+    targets.push(PathBuf::from(path));
+}
+
+fn push_patch_envelope_targets(
+    targets: &mut Vec<PathBuf>,
+    seen: &mut FastSet<String>,
+    patch: &str,
+) {
+    const PREFIXES: &[&str] = &[
+        "*** Update File:",
+        "*** Add File:",
+        "*** Delete File:",
+        "*** Replace in line:",
+    ];
+    for line in patch.lines() {
+        let trimmed = line.trim();
+        if let Some(path) = PREFIXES
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix))
+        {
+            push_project_target(targets, seen, path);
+        }
+    }
+}
+
+pub(super) fn project_instruction_target_paths_from_tool_calls(
+    tool_calls: &[crate::ai::types::ToolCall],
+    include_read_only: bool,
+) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    let mut seen = FastSet::default();
+    for tool_call in tool_calls {
+        let supported = matches!(
+            tool_call.function.name.as_str(),
+            "write_file" | "apply_patch"
+        ) || (include_read_only && tool_call.function.name == "read_file");
+        if !supported {
+            continue;
+        }
+        let Ok(args) = serde_json::from_str::<Value>(&tool_call.function.arguments) else {
+            continue;
+        };
+        if let Some(path) = args
+            .get("file_path")
+            .or_else(|| args.get("path"))
+            .and_then(Value::as_str)
+        {
+            push_project_target(&mut targets, &mut seen, path);
+        }
+        if tool_call.function.name == "apply_patch"
+            && let Some(patch) = args.get("patch").and_then(Value::as_str)
+        {
+            push_patch_envelope_targets(&mut targets, &mut seen, patch);
+        }
+    }
+    targets
+}
+
+fn project_instruction_target_paths(messages: &[Message]) -> Vec<PathBuf> {
+    let current_turn_start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(0);
+    let mut targets = Vec::new();
+    let mut seen = FastSet::default();
+    for message in messages.iter().skip(current_turn_start) {
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for target in project_instruction_target_paths_from_tool_calls(tool_calls, true) {
+            push_project_target(&mut targets, &mut seen, &target.to_string_lossy());
+        }
+    }
+    targets
+}
+
 pub(super) fn refresh_skill_turn_for_iteration(
     app: &mut App,
     mcp_client: &McpClient,
@@ -95,6 +177,8 @@ pub(super) fn refresh_skill_turn_for_iteration(
                 prev_skill.as_deref(),
             )
         });
+    let project_targets = project_instruction_target_paths(messages);
+    new_skill_turn.push_scoped_project_instructions(&project_targets);
     if inherited_restore.is_some() {
         new_skill_turn.set_restore_agent_context(inherited_restore);
     }
@@ -821,10 +905,11 @@ pub(super) async fn execute_turn_iteration(
 mod tests {
     use super::super::{record_llm_summary_attempt_chars, should_try_llm_summary};
     use super::{
-        StreamingFlagGuard, no_tool_handoff_note, refresh_outstanding_task_anchor,
-        request_interrupt_pending,
+        StreamingFlagGuard, no_tool_handoff_note, project_instruction_target_paths,
+        refresh_outstanding_task_anchor, request_interrupt_pending,
     };
     use crate::ai::history::{Message, ROLE_INTERNAL_NOTE};
+    use crate::ai::types::{FunctionCall, ToolCall};
     use serde_json::Value;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, atomic::Ordering};
@@ -879,6 +964,76 @@ mod tests {
         refresh_outstanding_task_anchor(&mut messages, "session-without-tasks");
 
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn project_instruction_targets_follow_current_turn_file_tools() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Value::String("old turn".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "old".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: r#"{"file_path":"old.rs"}"#.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("current turn".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "read".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_file".to_string(),
+                            arguments: r#"{"file_path":"src/bin/ai/driver/mod.rs"}"#.to_string(),
+                        },
+                    },
+                    ToolCall {
+                        id: "patch".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "apply_patch".to_string(),
+                            arguments: serde_json::json!({
+                                "patch": "*** Begin Patch\n*** Update File: src/bin/ai/agents.rs\n@@\n-old\n+new\n*** Add File: src/bin/ai/new.rs\n+new\n*** End Patch"
+                            })
+                            .to_string(),
+                        },
+                    },
+                ]),
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        assert_eq!(
+            project_instruction_target_paths(&messages),
+            vec![
+                std::path::PathBuf::from("src/bin/ai/driver/mod.rs"),
+                std::path::PathBuf::from("src/bin/ai/agents.rs"),
+                std::path::PathBuf::from("src/bin/ai/new.rs"),
+            ]
+        );
     }
 
     #[test]

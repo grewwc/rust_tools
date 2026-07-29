@@ -1761,7 +1761,7 @@ fn alibaba_request_body_keeps_extension_flags() {
 }
 
 #[test]
-fn normalize_messages_merges_non_leading_system_messages() {
+fn normalize_messages_keeps_model_derived_notes_out_of_system_role() {
     // Internal notes that appear AFTER the first conversational message
     // must remain in their original positions (with role normalized to
     // "system") so that older prompt-cache prefixes stay valid when new
@@ -1777,7 +1777,9 @@ fn normalize_messages_merges_non_leading_system_messages() {
         },
         Message {
             role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
-            content: Value::String("history summary".to_string()),
+            content: Value::String(
+                "对话摘要（自动压缩，以下为早期对话要点）：\nhistory summary".to_string(),
+            ),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -1810,13 +1812,26 @@ fn normalize_messages_merges_non_leading_system_messages() {
     assert_eq!(normalized[0].role, "system");
     let head_text = normalized[0].content.as_str().unwrap();
     assert!(head_text.contains("base system"));
-    assert!(head_text.contains("history summary"));
+    assert!(!head_text.contains("history summary"));
     assert!(!head_text.contains("working memory"));
 
-    assert_eq!(normalized[1].role, "user");
-    assert_eq!(normalized[2].role, "assistant");
-    assert_eq!(normalized[3].role, "system");
-    assert_eq!(normalized[3].content.as_str(), Some("working memory"));
+    assert_eq!(
+        normalized.iter().map(|message| message.role.as_str()).collect::<Vec<_>>(),
+        vec!["system", "user", "assistant", "user", "assistant", "system"]
+    );
+    assert!(
+        normalized[1]
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains("Runtime context handoff"))
+    );
+    assert!(normalized[2].content.as_str().is_some_and(|text| {
+        text.contains("Compressed history summary")
+            && text.contains("Do not rerun tools solely")
+            && text.contains("history summary")
+            && !text.contains("not authoritative evidence")
+    }));
+    assert_eq!(normalized[5].content.as_str(), Some("working memory"));
 }
 
 #[test]
@@ -1858,12 +1873,92 @@ fn normalize_messages_prioritizes_working_memory_before_summary_and_self_note() 
     ];
 
     let normalized = normalize_messages_for_request(&messages);
-    let text = normalized[0].content.as_str().unwrap();
-    let wm = text.find("## Working Memory").unwrap();
-    let summary = text.find("## History Summary").unwrap();
-    let self_note = text.find("## Self Notes").unwrap();
-    assert!(wm < summary);
+    let system_text = normalized[0].content.as_str().unwrap();
+    assert!(system_text.contains("## Working Memory"));
+    assert!(!system_text.contains("## History Summary"));
+    assert!(!system_text.contains("## Self Notes"));
+    assert_eq!(
+        normalized.iter().map(|message| message.role.as_str()).collect::<Vec<_>>(),
+        vec!["system", "user", "assistant"]
+    );
+    assert!(
+        normalized[1]
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains("Runtime context handoff"))
+    );
+    let derived_text = normalized[2].content.as_str().unwrap();
+    let summary = derived_text.find("## History Summary").unwrap();
+    let self_note = derived_text.find("## Self Notes").unwrap();
     assert!(summary < self_note);
+    assert!(derived_text.contains("Compressed history summary"));
+    assert!(derived_text.contains("Do not rerun tools solely"));
+    assert!(derived_text.contains("not authoritative evidence"));
+}
+
+#[test]
+fn normalize_messages_wraps_midstream_self_note_in_user_assistant_handoff() {
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("base system".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("question".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("answer".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String("self_note:\npossible explanation".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("later answer".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let normalized = normalize_messages_for_request(&messages);
+    assert_eq!(
+        normalized.iter().map(|message| message.role.as_str()).collect::<Vec<_>>(),
+        vec!["system", "user", "assistant", "user", "assistant", "user", "assistant"]
+    );
+    assert!(
+        normalized[3]
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains("Runtime context handoff"))
+    );
+    assert!(
+        normalized[4]
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains("not authoritative evidence"))
+    );
+    assert!(
+        normalized[5]
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains("handoff complete"))
+    );
 }
 
 #[test]
@@ -2207,9 +2302,15 @@ fn normalize_messages_projects_only_recent_context_checkpoints_without_truncatin
     let normalized = normalize_messages_for_request(&messages);
     let checkpoint_context = normalized
         .iter()
-        .filter_map(|message| message.content.as_str())
-        .find(|content| content.starts_with("[Persistent context checkpoints:"))
-        .expect("recent checkpoints should be projected into one system message");
+        .find(|message| {
+            message.role == "assistant"
+                && message
+                    .content
+                    .as_str()
+                    .is_some_and(|content| content.contains("## Context Checkpoints"))
+        })
+        .and_then(|message| message.content.as_str())
+        .expect("recent checkpoints should be projected into one assistant message");
     let checkpoints = checkpoint_context
         .lines()
         .filter(|line| line.starts_with("[context_checkpoint "))
@@ -2229,6 +2330,7 @@ fn normalize_messages_projects_only_recent_context_checkpoints_without_truncatin
         checkpoint_context.contains("read_file"),
         "checkpoint projection must tell the model how to fetch the full body"
     );
+    assert!(checkpoint_context.contains("not verified facts"));
     assert!(normalized.iter().any(|message| {
         message
             .content
@@ -2299,9 +2401,15 @@ fn normalize_messages_dedupes_context_checkpoints_by_path_before_limit() {
     let normalized = normalize_messages_for_request(&messages);
     let checkpoint_context = normalized
         .iter()
-        .filter_map(|message| message.content.as_str())
-        .find(|content| content.starts_with("[Persistent context checkpoints:"))
-        .expect("checkpoints should be projected into one system message");
+        .find(|message| {
+            message.role == "assistant"
+                && message
+                    .content
+                    .as_str()
+                    .is_some_and(|content| content.contains("## Context Checkpoints"))
+        })
+        .and_then(|message| message.content.as_str())
+        .expect("checkpoints should be projected into one assistant message");
     let checkpoints = checkpoint_context
         .lines()
         .filter(|line| line.starts_with("[context_checkpoint "))

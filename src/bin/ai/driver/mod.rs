@@ -412,9 +412,10 @@ pub(in crate::ai) async fn run_with_cli(
         last_skill_bias: None,
         os: os_arc,
         agent_reload_counter: None,
-        observers: vec![Box::new(
-            crate::ai::driver::thinking::ThinkingOrchestrator::new(),
-        )],
+        // ThinkingOrchestrator 的 JSON 控制协议尚未与主回答解耦，也不会消费
+        // 自己要求模型生成的状态 JSON。生产请求不注册它，避免可选 observer
+        // 把用户回答劫持成 STRICT JSON；待改为独立控制调用后再显式接回。
+        observers: Vec::new(),
         last_known_prompt_tokens: None,
         last_known_cached_prompt_tokens: None,
         goal_mode: None,

@@ -21,15 +21,9 @@ rules in the nearest child `AGENTS.md`.
 
 ## Runtime-wide invariants
 
-1. **🏆 No `cargo test` without user approval.** Never run `cargo test`,
-   `cargo build --release`, or `cargo build` on your own initiative.
-   Full-application test compilation triggers heavy dependencies (mongodb,
-   rusqlite bundled, image, etc.) and takes
-   2–8 minutes cold. Only run `cargo test` when the user explicitly asks or
-   when fixing a regression with a known focused test. For all other
-   verification, `cargo check --bin a` is the default. Always scope with
-   `--bin`, `--lib`, or `-p`.
-
+1. **No `cargo test` without user approval** - see root `AGENTS.md` Build/Test.
+   Full-app test compilation triggers heavy deps (mongodb, rusqlite, image) and
+   takes 2–8 min cold. Default to `cargo check --bin a`, always scoped.
 2. **Driver-owned turn lifecycle.** Prompt assembly, model calls, tool loops,
    history updates, and final response handling flow through the driver. Do not
    bypass it with ad-hoc side effects.
@@ -50,6 +44,12 @@ rules in the nearest child `AGENTS.md`.
    canonical history. Preserve pruned evidence with explicit overflow/file pointers.
 9. **Subagent ownership.** Child task results are evidence for the parent turn;
    the parent must summarize confirmed conclusions in its own final response.
+10. **Derived-context provenance.** Runtime-owned policy/control notes may map
+    to `system`; model-authored self-notes, checkpoints, and automatic summaries
+    remain assistant-derived and marked unverified. Project assistant-derived
+    context through request-only user/assistant handoff pairs (conventional role
+    order). Never promote prior assistant wording into a system-level fact or
+    verified conclusion.
 
 ## Scoped guides
 

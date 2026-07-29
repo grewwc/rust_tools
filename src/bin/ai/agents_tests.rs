@@ -1,5 +1,6 @@
 use super::{
-    AgentModelTier, BUILTIN_AGENTS, load_project_instruction_docs_from, parse_agent_front_matter,
+    AgentModelTier, BUILTIN_AGENTS, load_project_instruction_docs_from,
+    load_scoped_project_instruction_docs_for_targets_from, parse_agent_front_matter,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -155,4 +156,92 @@ fn project_instruction_docs_cache_invalidates_on_content_change() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn target_scoped_instruction_docs_add_only_nested_rules() {
+    let root = temp_dir("target_scoped_docs");
+    let target = root.join("src/bin/ai/driver/iteration.rs");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(root.join("AGENTS.md"), "root rules\n").unwrap();
+    fs::write(root.join("src/bin/ai/AGENTS.md"), "ai rules\n").unwrap();
+    fs::write(root.join("src/bin/ai/driver/AGENTS.md"), "driver rules\n").unwrap();
+    fs::write(&target, "// source\n").unwrap();
+
+    let docs =
+        load_scoped_project_instruction_docs_for_targets_from(&root, std::slice::from_ref(&target));
+
+    assert_eq!(docs.len(), 2);
+    assert!(docs[0].path.ends_with("src/bin/ai/AGENTS.md"));
+    assert!(docs[0].content.contains("ai rules"));
+    assert!(docs[1].path.ends_with("src/bin/ai/driver/AGENTS.md"));
+    assert!(docs[1].content.contains("driver rules"));
+    assert!(docs.iter().all(|doc| !doc.content.contains("root rules")));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn target_scoped_instruction_budget_preserves_deepest_rules_first() {
+    let root = temp_dir("target_scoped_budget");
+    let target = root.join("src/bin/ai/driver/deep/iteration.rs");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(root.join("AGENTS.md"), "root rules\n").unwrap();
+    fs::write(
+        root.join("src/bin/ai/AGENTS.md"),
+        format!("ai-start\n{}\nai-tail\n", "a".repeat(7_900)),
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/ai/driver/AGENTS.md"),
+        format!("driver-start\n{}\ndriver-tail\n", "d".repeat(7_900)),
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/ai/driver/deep/AGENTS.md"),
+        format!("deep-start\n{}\ndeep-tail\n", "z".repeat(7_900)),
+    )
+    .unwrap();
+    fs::write(&target, "// source\n").unwrap();
+
+    let docs =
+        load_scoped_project_instruction_docs_for_targets_from(&root, std::slice::from_ref(&target));
+
+    assert_eq!(docs.len(), 3);
+    assert!(docs[0].path.ends_with("src/bin/ai/AGENTS.md"));
+    assert!(docs[0].content.contains("ai-start"));
+    assert!(!docs[0].content.contains("ai-tail"));
+    assert!(docs[1].path.ends_with("src/bin/ai/driver/AGENTS.md"));
+    assert!(docs[1].content.contains("driver-tail"));
+    assert!(docs[2].path.ends_with("src/bin/ai/driver/deep/AGENTS.md"));
+    assert!(docs[2].content.contains("deep-tail"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn target_scoped_instruction_docs_ignore_paths_outside_project() {
+    let root = temp_dir("target_scoped_outside");
+    let outside = temp_dir("target_scoped_external").join("file.rs");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("AGENTS.md"), "root rules\n").unwrap();
+    fs::create_dir_all(outside.parent().unwrap()).unwrap();
+    fs::write(
+        outside.parent().unwrap().join("AGENTS.md"),
+        "outside rules\n",
+    )
+    .unwrap();
+    fs::write(&outside, "// source\n").unwrap();
+
+    let docs = load_scoped_project_instruction_docs_for_targets_from(
+        &root,
+        std::slice::from_ref(&outside),
+    );
+
+    assert!(docs.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside.parent().unwrap());
 }

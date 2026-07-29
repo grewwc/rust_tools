@@ -46,6 +46,7 @@ const PROJECT_ROOT_MARKERS: &[&str] = &[
 ];
 const PROJECT_INSTRUCTION_MAX_DOC_CHARS: usize = 8_000;
 const PROJECT_INSTRUCTION_MAX_TOTAL_CHARS: usize = 16_000;
+const TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS: usize = 16_000;
 
 /// 已识别的项目语言/构建体系类型，用来在 system prompt 里给 agent 一些
 /// 默认约定（构建/测试命令、惯用工具等），减少"摸索式"工具调用。
@@ -352,6 +353,94 @@ pub(super) fn load_project_instruction_docs() -> Vec<ProjectInstructionDoc> {
     load_project_instruction_docs_from(&cwd)
 }
 
+/// 加载已经被本轮工具调用触达的目标文件所适用、但 cwd 基础范围尚未包含的 scoped
+/// 指令。这样从仓库根启动时，读取 `src/bin/ai/driver/foo.rs` 后，下一次模型请求能
+/// 同时看到 `src/bin/ai/AGENTS.md` 与 `src/bin/ai/driver/AGENTS.md`。
+pub(super) fn load_scoped_project_instruction_docs_for_targets(
+    targets: &[PathBuf],
+) -> Vec<ProjectInstructionDoc> {
+    let Ok(cwd) = crate::ai::driver::runtime_ctx::effective_cwd() else {
+        return Vec::new();
+    };
+    load_scoped_project_instruction_docs_for_targets_from(&cwd, targets)
+}
+
+fn load_scoped_project_instruction_docs_for_targets_from(
+    cwd: &Path,
+    targets: &[PathBuf],
+) -> Vec<ProjectInstructionDoc> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let base_docs = load_project_instruction_docs_from(cwd);
+    let base_paths = base_docs
+        .iter()
+        .map(|doc| doc.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let scope = project_instruction_search_scope(cwd);
+    let project_root = scope.first().map(PathBuf::as_path).unwrap_or(cwd);
+    let canonical_root = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.into());
+
+    let mut seen_paths = std::collections::BTreeSet::new();
+    let mut candidates = Vec::new();
+    for target in targets {
+        let absolute = if target.is_absolute() {
+            target.clone()
+        } else {
+            cwd.join(target)
+        };
+        let Some(parent) = absolute.parent() else {
+            continue;
+        };
+        let Ok(target_dir) = fs::canonicalize(parent) else {
+            continue;
+        };
+        if !target_dir.starts_with(&canonical_root) {
+            continue;
+        }
+        for doc in load_project_instruction_candidates_from(&target_dir) {
+            if base_paths.contains(doc.path.as_str()) || !seen_paths.insert(doc.path.clone()) {
+                continue;
+            }
+            candidates.push(doc);
+        }
+    }
+    // 预算先分配给最深目录，保证最具体的规则不会被上层长文档挤掉；渲染前再
+    // 恢复 root -> deep 顺序，让后出现的具体规则自然覆盖通用规则。
+    candidates.sort_by(|a, b| {
+        instruction_doc_depth(b)
+            .cmp(&instruction_doc_depth(a))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let mut selected = Vec::new();
+    let mut used = 0usize;
+    for doc in candidates {
+        if used >= TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS {
+            break;
+        }
+        let remaining = TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS - used;
+        let content = truncate_instruction_doc(&doc.content, remaining);
+        if content.is_empty() {
+            continue;
+        }
+        used += content.chars().count();
+        selected.push(ProjectInstructionDoc {
+            path: doc.path,
+            content,
+        });
+    }
+    selected.sort_by(|a, b| {
+        instruction_doc_depth(a)
+            .cmp(&instruction_doc_depth(b))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    selected
+}
+
+fn instruction_doc_depth(doc: &ProjectInstructionDoc) -> usize {
+    Path::new(&doc.path).components().count()
+}
+
 /// 用 (path, len, mtime) 指纹缓存项目指令文档，避免每个 turn 都重新做磁盘
 /// I/O + truncate。实测中 AGENTS.md / CLAUDE.md 在一个会话里几乎不会变化，
 /// 但 build_system_prompt 每个 turn / 每个 iteration 都要拿一次它们，单
@@ -364,6 +453,7 @@ type ProjectInstructionFingerprint = Vec<(PathBuf, u64, Option<SystemTime>)>;
 
 struct ProjectInstructionCacheEntry {
     fingerprint: ProjectInstructionFingerprint,
+    candidates: Vec<ProjectInstructionDoc>,
     docs: Vec<ProjectInstructionDoc>,
 }
 
@@ -404,11 +494,16 @@ fn load_project_instruction_docs_from(cwd: &Path) -> Vec<ProjectInstructionDoc> 
                 return entry.docs.clone();
             }
         }
-        let docs = load_project_instruction_docs_uncached(cwd);
+        let candidates = discover_project_instruction_docs(cwd);
+        let docs = limit_project_instruction_docs(
+            candidates.clone(),
+            PROJECT_INSTRUCTION_MAX_TOTAL_CHARS,
+        );
         cache.insert(
             key,
             ProjectInstructionCacheEntry {
                 fingerprint,
+                candidates,
                 docs: docs.clone(),
             },
         );
@@ -420,10 +515,64 @@ fn load_project_instruction_docs_from(cwd: &Path) -> Vec<ProjectInstructionDoc> 
 }
 
 fn load_project_instruction_docs_uncached(cwd: &Path) -> Vec<ProjectInstructionDoc> {
+    let candidates = discover_project_instruction_docs(cwd);
+    limit_project_instruction_docs(candidates, PROJECT_INSTRUCTION_MAX_TOTAL_CHARS)
+}
+
+fn load_project_instruction_candidates_from(cwd: &Path) -> Vec<ProjectInstructionDoc> {
+    let fingerprint = fingerprint_project_instruction_files(cwd);
+    if let Ok(mut cache) = project_instruction_cache().lock() {
+        let key = cwd.to_path_buf();
+        if let Some(entry) = cache.get_ref(&key)
+            && entry.fingerprint == fingerprint
+        {
+            return entry.candidates.clone();
+        }
+        let candidates = discover_project_instruction_docs(cwd);
+        let docs = limit_project_instruction_docs(
+            candidates.clone(),
+            PROJECT_INSTRUCTION_MAX_TOTAL_CHARS,
+        );
+        cache.insert(
+            key,
+            ProjectInstructionCacheEntry {
+                fingerprint,
+                candidates: candidates.clone(),
+                docs,
+            },
+        );
+        return candidates;
+    }
+    discover_project_instruction_docs(cwd)
+}
+
+fn limit_project_instruction_docs(
+    candidates: Vec<ProjectInstructionDoc>,
+    max_chars: usize,
+) -> Vec<ProjectInstructionDoc> {
     let mut docs = Vec::new();
     let mut used = 0usize;
-    let mut seen_paths = std::collections::BTreeSet::new();
+    for doc in candidates {
+        if used >= max_chars {
+            break;
+        }
+        let budget = max_chars - used;
+        let content = truncate_instruction_doc(&doc.content, budget);
+        if content.is_empty() {
+            continue;
+        }
+        used += content.chars().count();
+        docs.push(ProjectInstructionDoc {
+            path: doc.path,
+            content,
+        });
+    }
+    docs
+}
 
+fn discover_project_instruction_docs(cwd: &Path) -> Vec<ProjectInstructionDoc> {
+    let mut docs = Vec::new();
+    let mut seen_paths = std::collections::BTreeSet::new();
     for dir in project_instruction_search_scope(cwd) {
         for name in PROJECT_INSTRUCTION_FILENAMES {
             let path = dir.join(name);
@@ -442,23 +591,15 @@ fn load_project_instruction_docs_uncached(cwd: &Path) -> Vec<ProjectInstructionD
             if trimmed.is_empty() {
                 continue;
             }
-            if used >= PROJECT_INSTRUCTION_MAX_TOTAL_CHARS {
-                return docs;
+            let content = truncate_instruction_doc(trimmed, PROJECT_INSTRUCTION_MAX_DOC_CHARS);
+            if !content.is_empty() {
+                docs.push(ProjectInstructionDoc {
+                    path: canonical_key,
+                    content,
+                });
             }
-            let budget = PROJECT_INSTRUCTION_MAX_TOTAL_CHARS.saturating_sub(used);
-            let limited =
-                truncate_instruction_doc(trimmed, PROJECT_INSTRUCTION_MAX_DOC_CHARS.min(budget));
-            if limited.is_empty() {
-                continue;
-            }
-            used += limited.chars().count();
-            docs.push(ProjectInstructionDoc {
-                path: canonical_key,
-                content: limited,
-            });
         }
     }
-
     docs
 }
 

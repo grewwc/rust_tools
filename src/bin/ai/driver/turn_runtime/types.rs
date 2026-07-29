@@ -42,6 +42,9 @@ pub(super) enum IterationExecution {
 
 pub(super) enum TurnLoopStep {
     Continue,
+    /// 本轮只执行了 target-scoped instruction preflight，没有产生文件副作用。
+    /// Orchestrator 可为它授予一次不占正常工具迭代预算的重试机会。
+    ScopedPreflightContinue,
     Break,
     Return(TurnOutcome),
 }

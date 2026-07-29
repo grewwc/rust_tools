@@ -2,14 +2,8 @@
 
 ## Scope
 
-Applies to `src/bin/ai/mcp/**`. The module is flat (no subdirectories):
-- `client.rs`: `McpClient` / `SharedMcpClient`, `send_request_to_conn` /
-  `send_notification_to_conn`, and `routing_snapshot()` for discovery metadata.
-- `connection.rs`: subprocess lifecycle + stdio JSON-RPC transport
-  (`Child`/stdin/stdout/stderr, reader thread).
-- `config.rs`: loads `McpServerConfig` from the mcp config file.
-- `io.rs`: fd nonblocking helper (Unix).
-- `jsonrpc.rs`: `JsonRpcRequest` / `JsonRpcResponse` wire types.
+Applies to `src/bin/ai/mcp/**` (flat module: `client.rs`, `connection.rs`,
+`config.rs`, `io.rs`, `jsonrpc.rs`).
 
 ## Key invariants
 
@@ -30,4 +24,3 @@ Applies to `src/bin/ai/mcp/**`. The module is flat (no subdirectories):
    hidden MCP catalog and load tools on demand through `enable_tools`.
 7. **Name consistency.** Prompt hints, hidden catalogs, and enablement behavior
    must stay consistent with the real configured MCP tool names.
-

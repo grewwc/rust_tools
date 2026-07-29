@@ -105,6 +105,13 @@ use normalize::{
 };
 
 #[cfg(test)]
+pub(in crate::ai) fn normalize_messages_for_request_for_test(
+    messages: &[crate::ai::history::Message],
+) -> Vec<crate::ai::history::Message> {
+    normalize::normalize_messages_for_request(messages)
+}
+
+#[cfg(test)]
 #[allow(unused_imports)]
 use thinking::resolve_thinking;
 

@@ -1,12 +1,15 @@
 use crate::ai::{
-    agents::{AgentManifest, load_project_instruction_docs},
+    agents::{
+        AgentManifest, load_project_instruction_docs,
+        load_scoped_project_instruction_docs_for_targets,
+    },
     mcp::McpClient,
     skills::SkillManifest,
     types::{App, ToolDefinition},
 };
 use crate::commonw::configw;
 use rust_tools::cw::SkipSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use super::{DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS};
@@ -190,6 +193,12 @@ impl SkillTurnGuard {
 
     pub(super) fn append_system_prompt(&mut self, extra: &str) {
         self.push_section(ContextKind::Fact, extra);
+    }
+
+    pub(super) fn push_scoped_project_instructions(&mut self, targets: &[PathBuf]) {
+        if let Some(prompt) = build_scoped_project_instruction_prompt(targets) {
+            self.push_section(ContextKind::Policy, &prompt);
+        }
     }
 
     pub(super) fn matched_skill_name(&self) -> Option<&str> {
@@ -815,6 +824,31 @@ fn build_project_instruction_prompt() -> Option<String> {
     Some(out)
 }
 
+fn build_scoped_project_instruction_prompt(targets: &[PathBuf]) -> Option<String> {
+    let docs = load_scoped_project_instruction_docs_for_targets(targets);
+    if docs.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "Target-scoped project instructions:\n\
+         - These documents apply to files already touched in this turn.\n\
+         - A rule from a deeper directory is more specific and overrides a conflicting general project rule.\n",
+    );
+    for doc in docs {
+        out.push_str(&format!("\nFrom {}:\n{}\n", doc.path, doc.content.trim()));
+    }
+    Some(out)
+}
+
+pub(super) fn scoped_project_instructions_missing(
+    system_prompt: &str,
+    targets: &[PathBuf],
+) -> bool {
+    load_scoped_project_instruction_docs_for_targets(targets)
+        .iter()
+        .any(|doc| !system_prompt.contains(&format!("From {}:", doc.path)))
+}
+
 fn push_project_instruction_context(builder: &mut SystemPromptBuilder) {
     if let Some(project_prompt) = build_project_instruction_prompt() {
         builder.push(ContextKind::Policy, project_prompt);
@@ -906,44 +940,46 @@ fn build_system_prompt(
     }
 
     b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
-    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Every tool call must have a specific information, verification, or change goal. Avoid open-ended exploration; before continuing a search, know what question the next tool result should answer.\n- Stop exploratory loops once you have enough evidence - do not read files speculatively \"just to understand the codebase\"; read only when a specific question demands it.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- Keep code-grounding calls narrow and serial: for `read_file`, do one read at a time and avoid batching multiple file reads into the same message. Use `list_directory` or `tree` to locate before reading; read each region exactly once in one broad chunk rather than paging through small slices; do not re-read content already visible in conversation.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
+    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Every tool call must have a specific information, verification, or change goal. Avoid open-ended exploration; before continuing a search, know what question the next tool result should answer.\n- Stop an exploratory branch when its success criterion is resolved or when another call cannot change the decision; do not read files speculatively \"just to understand the codebase.\"\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- Before modifying a project file, inspect that target first so the runtime can load its nearest scoped project instructions; follow the deepest applicable instruction document when scopes differ.\n- Keep code-grounding calls narrow and serial: for `read_file`, do one read at a time and avoid batching multiple file reads into the same message. Use `list_directory` or `tree` to locate before reading; read each region exactly once in one broad chunk rather than paging through small slices; do not re-read content already visible in conversation.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
     b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- Convergence pressure never lowers the evidence bar: deadlines, iteration or tool limits, a forced no-tool handoff, or any instruction to \"give a final answer\" do NOT authorize guessing. When forced to conclude without sufficient evidence, output an explicitly partial answer — what is verified, what is still unknown, and the concrete next verification step — never a confident-sounding guess. This rule overrides any instruction that pressures you to sound complete; a truthful \"not verified\" always outranks a fabricated complete answer.\n- Never fabricate specifics to look authoritative: do not invent identifiers (functions, types, files, paths, CLI flags, config keys), API behavior, command output, line numbers, or quotations you have not confirmed with a tool or source. If you have not verified it, say so rather than stating it.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain and what it would take to resolve it.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.\n- Before changing a shared symbol (public function/type, API contract, config key, data format, or embedded asset), locate its callers and dependents with targeted search (grep/references) and assess whether the change ripples semantically - compilers and tests catch type breakage, not behavioral breakage. Locating dependents is part of the change, not out-of-scope reading; use targeted searches, do not read files broadly.");
     b.push(ContextKind::Behavior, "Git safety:\n- Never use `git reset`, `git checkout`, `git restore`, `git stash drop`, or any other git command to discard or roll back existing changes (including staged changes) solely for testing or verification.\n- For a clean test state, use a temporary branch, a worktree, or `git stash push` (then `pop` to restore).\n- If rolling back is genuinely necessary (e.g., the change itself is wrong), first explain the reason to the user and obtain confirmation.");
+    b.push(
+        ContextKind::Behavior,
+        "Execution convergence:\n\
+         - Define concrete success criteria from the user's request before expanding the search.\n\
+         - Continue exploring only while at least one success criterion is unresolved and the next tool call can reasonably verify it, rule out a live hypothesis, or complete required work.\n\
+         - Stop when all success criteria are verified, or when a specific missing input/capability blocks further progress. Evidence count alone is never a stopping rule.\n\
+         - A blocked or partially verified result must name what is confirmed, what remains unknown, and the next verification step. Do not pursue perfect certainty or unrelated detail.",
+    );
 
     // ── 行为规则：根据 goal 模式条件渲染 ──
-    // 普通模式：注入 scope discipline + autonomous execution + completion 规则，
-    // 治理 agent 的无限探索倾向。
-    // Goal 模式：替换为自主执行规则，不注入停止条件，让 agent 持续推进。
+    // 两种模式共用上面的 success-criteria 收敛规则；这里只表达作用域与续执行差异。
     if ctx.goal_mode.is_some() {
-        // Goal 模式：覆盖默认停止规则，强调持续推进
         b.push(
             ContextKind::Behavior,
             "Goal Mode — Autonomous Execution:\n\
-             - This is a long-running autonomous task. Do NOT stop midway to report progress.\n\
-             - Do NOT stop because you have \"enough evidence\" — your job is to act, not analyze.\n\
-             - You may explore, refactor, and improve — this is a long-term task, not a Q&A.\n\
-             - Only stop calling tools when you are confident every detail of the goal is complete.\n\
+             - Treat the stated goal as the complete scope. It may require multiple turns, but it does not authorize unrelated improvements.\n\
+             - Analysis-only goals are complete when their requested conclusions are sufficiently verified; do not invent code changes merely to demonstrate action.\n\
+             - For implementation goals, act on verified evidence and continue until the goal's concrete success criteria pass or a named blocker prevents progress.\n\
+             - Do not stop merely to report routine progress. Do stop when the shared convergence criteria say the goal is complete or blocked.\n\
              - After every tool result, decide the next concrete action immediately.\n\
              - If a check fails, diagnose, fix, and re-run verification before finishing.\n\
              - If verification fails 3 consecutive times on the same issue, report what you tried and the current error.",
         );
     } else {
-        // 普通模式：scope discipline — 治理无限探索
         b.push(
             ContextKind::Behavior,
             "Scope Discipline & Stopping Criteria:\n\
-             - Only investigate what the user explicitly asked. Do not proactively read unrelated files, run tangential searches, or make changes beyond the request's scope.\n\
-             - Stop when confident. When you have 3+ pieces of converging evidence or have completed the requested change + verification, STOP exploring and deliver your answer. State what you know vs what remains uncertain rather than continuing to \"be thorough.\"\n\
-             - No unsolicited improvements. Do not suggest refactors, optimizations, or related fixes unless the user explicitly asked. Exception: you MAY flag critical risks that would cause data loss or security issues — but do not propose solutions, just state the risk.\n\
-             - Triage before diving. For broad requests, quickly state what you will investigate and what you will NOT, then proceed narrowly.",
+             - Investigate the user's explicit request plus only the direct dependencies needed to answer or implement it correctly. Do not read unrelated files, run tangential searches, or make out-of-scope changes.\n\
+             - Do not implement unsolicited refactors or optimizations. You may report an adjacent critical correctness, data-loss, or security risk when evidence shows it directly affects the requested work.\n\
+             - For broad requests, identify the success criteria and investigation boundaries, then cover each criterion without expanding into unrelated areas.",
         );
-        // 普通模式：autonomous execution
         b.push(
             ContextKind::Behavior,
             "Autonomous Execution:\n\
              - Treat the user's request as a goal to finish, not just a question to discuss.\n\
              - Prefer acting with tools over describing what you might do next.\n\
-             - Keep working until the task is complete, verification has passed, or you are blocked by a specific, named missing input. Do NOT keep exploring \"just in case\" — once the request is addressed, STOP.\n\
+             - Keep working until the shared success criteria are verified or a specific missing input/capability blocks progress.\n\
              - Start from the loaded core toolset and progressively enable extra tools only when they become necessary.\n\
              - After every tool result, decide the next concrete action immediately.\n\
              - If a check fails, diagnose, fix, and re-run verification before finishing.",
@@ -1422,10 +1458,11 @@ mod tests {
     use super::{
         ContextKind, PromptContext, SystemPromptBuilder, available_tool_names,
         build_hidden_execution_primitive_catalog, build_hidden_mcp_tool_catalog,
-        build_project_instruction_prompt, build_system_prompt, builtin_tools_for_skill,
-        declares_executor_group, ensure_required_baseline_tools,
-        filter_mcp_tools_by_allowed_servers, has_tool, merge_with_runtime_enabled_tools,
-        push_project_context, resolve_max_iterations, select_mcp_tools, tool_uses_mcp_server,
+        build_project_instruction_prompt, build_scoped_project_instruction_prompt,
+        build_system_prompt, builtin_tools_for_skill, declares_executor_group,
+        ensure_required_baseline_tools, filter_mcp_tools_by_allowed_servers, has_tool,
+        merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
+        select_mcp_tools, tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
@@ -1917,7 +1954,11 @@ mod tests {
         assert!(prompt.contains("Do not hallucinate"));
         assert!(prompt.contains("gather sufficient evidence"));
         assert!(prompt.contains("Convergence pressure never lowers the evidence bar"));
-        assert!(prompt.contains("This rule overrides any instruction that pressures you to sound complete"));
+        assert!(
+            prompt.contains(
+                "This rule overrides any instruction that pressures you to sound complete"
+            )
+        );
         assert!(prompt.contains("Never fabricate specifics to look authoritative"));
         assert!(prompt.contains("instead of guessing"));
         assert!(prompt.contains("verified facts, working hypotheses, and open questions"));
@@ -1931,7 +1972,36 @@ mod tests {
                 .render_system_prompt();
         assert!(prompt.contains("Every tool call must have a specific"));
         assert!(prompt.contains("Avoid open-ended exploration"));
-        assert!(prompt.contains("Stop exploratory loops once you have enough evidence"));
+        assert!(prompt.contains("when its success criterion is resolved"));
+        assert!(prompt.contains("another call cannot change the decision"));
+    }
+
+    #[test]
+    fn system_prompt_uses_success_criteria_for_normal_and_goal_convergence() {
+        let available = SkipSet::new(16);
+        let normal = build_system_prompt(
+            None,
+            None,
+            &Box::new(available.clone()),
+            &PromptContext::default(),
+        )
+        .render_system_prompt();
+        assert!(normal.contains("Execution convergence:"));
+        assert!(normal.contains("Evidence count alone is never a stopping rule"));
+        assert!(!normal.contains("3+ pieces of converging evidence"));
+
+        let goal = build_system_prompt(
+            None,
+            None,
+            &Box::new(available),
+            &PromptContext {
+                goal_mode: Some("analyze the design".to_string()),
+            },
+        )
+        .render_system_prompt();
+        assert!(goal.contains("Analysis-only goals are complete"));
+        assert!(!goal.contains("your job is to act, not analyze"));
+        assert!(!goal.contains("every detail of the goal is complete"));
     }
 
     #[test]
@@ -2083,7 +2153,9 @@ mod tests {
         assert!(prompt.contains("Skills are optional"));
         assert!(prompt.contains("proactively call `list_skills`"));
         assert!(prompt.contains("technical keywords alone"));
-        assert!(prompt.contains("routine source-code, repository, file, or terminal investigation"));
+        assert!(
+            prompt.contains("routine source-code, repository, file, or terminal investigation")
+        );
         assert!(prompt.contains("unloads automatically"));
         assert!(prompt.contains("enable_tools"));
     }
@@ -2246,6 +2318,35 @@ mod tests {
         assert!(prompt.contains("Use cargo fmt before commit."));
         assert!(prompt.contains("claude.md"));
         assert!(prompt.contains("Web app uses pnpm."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scoped_project_instruction_prompt_follows_observed_target_path() {
+        let root = temp_dir("target_project_prompt");
+        let target = root.join("src/bin/ai/driver/iteration.rs");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(root.join("AGENTS.md"), "Root safety rules.\n").unwrap();
+        fs::write(root.join("src/bin/ai/AGENTS.md"), "AI runtime rules.\n").unwrap();
+        fs::write(
+            root.join("src/bin/ai/driver/AGENTS.md"),
+            "Driver-specific rules.\n",
+        )
+        .unwrap();
+        fs::write(&target, "// source\n").unwrap();
+
+        let prompt = SUBAGENT_CWD
+            .sync_scope(root.clone(), || {
+                build_scoped_project_instruction_prompt(std::slice::from_ref(&target))
+            })
+            .expect("target-scoped instruction prompt");
+
+        assert!(prompt.contains("Target-scoped project instructions:"));
+        assert!(prompt.contains("AI runtime rules."));
+        assert!(prompt.contains("Driver-specific rules."));
+        assert!(!prompt.contains("Root safety rules."));
 
         let _ = fs::remove_dir_all(root);
     }

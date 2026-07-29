@@ -17,6 +17,19 @@ use crate::ai::models;
 use crate::ai::types::App;
 
 const IMAGE_PLACEHOLDER: &str = "[image omitted]";
+const HISTORY_SUMMARY_CONTEXT_HEADER: &str = "[Compressed history summary for task continuity. Use it to continue earlier work without rediscovering context. \
+Do not rerun tools solely because information is summarized; verify a factual claim only when the current decision needs exact evidence and no cited source already establishes it.]";
+const MODEL_SELF_NOTE_CONTEXT_HEADER: &str =
+    "[Model-authored note from an earlier turn; this is not authoritative evidence. \
+Treat every claim as unverified unless it is backed by tool output or a cited source, \
+and re-check it before using it as a conclusion.]";
+const DERIVED_CONTEXT_HANDOFF: &str =
+    "[Runtime context handoff, not a new end-user request. The next assistant message contains \
+derived context from earlier turns. Use it only as described there, then continue to the latest \
+actual user request later in this conversation.]";
+const DERIVED_CONTEXT_RETURN: &str =
+    "[Runtime context handoff complete, not a new end-user request. Continue with the next recorded \
+conversation message and ultimately follow the latest actual user request.]";
 
 fn flatten_multimodal_content_to_text(content: &Value) -> Option<String> {
     match content {
@@ -358,6 +371,39 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         }
     }
 
+    fn is_model_derived_note(kind: InternalNoteKind) -> bool {
+        matches!(kind, InternalNoteKind::Summary | InternalNoteKind::SelfNote)
+    }
+
+    fn model_derived_content(kind: InternalNoteKind, text: &str) -> Value {
+        let header = match kind {
+            InternalNoteKind::Summary => HISTORY_SUMMARY_CONTEXT_HEADER,
+            InternalNoteKind::SelfNote => MODEL_SELF_NOTE_CONTEXT_HEADER,
+            _ => MODEL_SELF_NOTE_CONTEXT_HEADER,
+        };
+        Value::String(format!("{header}\n{text}"))
+    }
+
+    fn derived_context_handoff_message() -> Message {
+        Message {
+            role: "user".to_string(),
+            content: Value::String(DERIVED_CONTEXT_HANDOFF.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn derived_context_return_message() -> Message {
+        Message {
+            role: "user".to_string(),
+            content: Value::String(DERIVED_CONTEXT_RETURN.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
     fn content_is_effectively_empty(content: &Value) -> bool {
         match content {
             Value::Null => true,
@@ -549,20 +595,51 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         out
     }
 
-    let first_system_idx = messages
-        .iter()
-        .position(|m| m.role == ROLE_SYSTEM || is_internal_note_role(&m.role));
+    let first_system_idx = messages.iter().position(|m| m.role == ROLE_SYSTEM);
     let Some(first_system_idx) = first_system_idx else {
-        return sanitize_tool_message_sequence(messages.to_vec());
+        let mut projected = Vec::with_capacity(messages.len() + 1);
+        for (idx, message) in messages.iter().enumerate() {
+            if !is_internal_note_role(&message.role) {
+                projected.push(message.clone());
+                continue;
+            }
+            let mut note = message.clone();
+            note.content = normalize_system_like_content_for_request(&note.content);
+            let text = note.content.as_str().unwrap_or_default();
+            let kind = detect_note_kind(text);
+            let checkpoint = is_context_checkpoint_marker(message);
+            let model_derived = checkpoint || is_model_derived_note(kind);
+            note.role = if model_derived {
+                "assistant".to_string()
+            } else {
+                ROLE_SYSTEM.to_string()
+            };
+            if model_derived {
+                projected.push(derived_context_handoff_message());
+                note.content = if checkpoint {
+                    Value::String(format!(
+                        "{MODEL_SELF_NOTE_CONTEXT_HEADER}\n## Context Checkpoint\n{text}"
+                    ))
+                } else {
+                    model_derived_content(kind, text)
+                };
+            }
+            projected.push(note);
+            if model_derived
+                && messages[idx + 1..]
+                    .iter()
+                    .find(|next| !is_context_checkpoint_marker(next))
+                    .is_some_and(|next| next.role == "assistant")
+            {
+                projected.push(derived_context_return_message());
+            }
+        }
+        return sanitize_tool_message_sequence(projected);
     };
 
-    // Only merge system-like notes that sit BEFORE the first conversational
-    // (user/assistant/tool) message — those are produced by history
-    // compression at the very top and stay stable across turns. Notes that
-    // arrive later (working memory / self_note / cached tool results, etc.)
-    // are kept in their original positions with role
-    // rewritten to "system", so growing tail notes only invalidate the
-    // suffix of the provider's prompt cache instead of the whole request.
+    // 只把 runtime-owned system-like note 合入首条 system。模型自产的
+    // self_note / 自动摘要单独投影为 assistant 来源，避免派生判断被提权。
+    // 首个对话消息之后的 note 保持原位，避免新增尾部 note 破坏缓存前缀。
     let first_body_idx = messages
         .iter()
         .position(|m| !is_system_like_role(&m.role))
@@ -575,9 +652,10 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         .collect::<Vec<_>>();
 
     let mut merged_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
+    let mut model_derived_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
     for (idx, message) in messages.iter().enumerate().take(first_body_idx) {
-        let text = message
-            .content
+        let normalized_content = normalize_system_like_content_for_request(&message.content);
+        let text = normalized_content
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -589,14 +667,21 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             continue;
         }
         if !text.is_empty() {
-            merged_notes.push((
+            let kind = detect_note_kind(text);
+            let note = (
                 idx,
-                detect_note_kind(text),
+                kind,
                 truncate_note_text(text, MERGED_SINGLE_NOTE_MAX_CHARS),
-            ));
+            );
+            if is_internal_note_role(&message.role) && is_model_derived_note(kind) {
+                model_derived_notes.push(note);
+            } else {
+                merged_notes.push(note);
+            }
         }
     }
     merged_notes.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    model_derived_notes.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut merged_first = messages[first_system_idx].clone();
     merged_first.role = ROLE_SYSTEM.to_string();
@@ -632,19 +717,41 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         .take(REQUEST_CONTEXT_CHECKPOINT_LIMIT)
         .collect::<Vec<_>>();
 
-    let mut out = Vec::with_capacity(messages.len() + usize::from(!checkpoint_markers.is_empty()));
+    let mut out = Vec::with_capacity(messages.len() + 1);
     out.push(merged_first);
+    let mut derived_sections = Vec::new();
+    let mut current_kind: Option<InternalNoteKind> = None;
+    for (_, kind, text) in model_derived_notes {
+        if current_kind != Some(kind) {
+            let header = match kind {
+                InternalNoteKind::Summary => HISTORY_SUMMARY_CONTEXT_HEADER,
+                InternalNoteKind::SelfNote => MODEL_SELF_NOTE_CONTEXT_HEADER,
+                _ => MODEL_SELF_NOTE_CONTEXT_HEADER,
+            };
+            derived_sections.push(header.to_string());
+            derived_sections.push(format!("## {}", note_heading(kind)));
+            current_kind = Some(kind);
+        }
+        derived_sections.push(text);
+    }
     if !checkpoint_markers.is_empty() {
         let mut checkpoint_context = String::from(
-            "[Persistent context checkpoints: durable intermediate results you saved earlier so they survive compression. Each entry is a one-line summary followed by the file path holding the full details; read_file that path when you need the complete conclusion or evidence instead of rediscovering it.]\n",
+            "## Context Checkpoints\n\
+These are model-authored navigation notes, not verified facts. Each entry has a summary and \
+the file path holding its full details; use `read_file` on that path and verify claims against source/tool \
+evidence before relying on them.\n",
         );
         for marker in checkpoint_markers.iter().rev() {
             checkpoint_context.push_str(marker);
             checkpoint_context.push('\n');
         }
+        derived_sections.push(checkpoint_context);
+    }
+    if !derived_sections.is_empty() {
+        out.push(derived_context_handoff_message());
         out.push(Message {
-            role: ROLE_SYSTEM.to_string(),
-            content: Value::String(checkpoint_context),
+            role: "assistant".to_string(),
+            content: Value::String(derived_sections.join("\n\n")),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -660,16 +767,23 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             continue;
         }
         if idx < first_body_idx {
-            // 普通 note 已折叠进 merged_first；checkpoint 已作为独立、无截断的
-            // system 消息投影，避免被普通 note 的字符预算截断。
+            // runtime note 已折叠进 merged_first；model-derived note / checkpoint
+            // 已作为独立 assistant 上下文投影。
             continue;
         }
         if is_system_like_role(&message.role) {
-            // Keep the note in-place but normalize the role so the API
-            // accepts it. Stable position preserves prompt-cache prefix:
-            // older notes don't move when newer ones get appended.
             let mut promoted = message.clone();
-            promoted.role = ROLE_SYSTEM.to_string();
+            promoted.content = normalize_system_like_content_for_request(&promoted.content);
+            let text = promoted.content.as_str().unwrap_or_default();
+            let kind = detect_note_kind(text);
+            let model_derived = is_internal_note_role(&message.role) && is_model_derived_note(kind);
+            // 模型自产的 self_note / 历史摘要只能作为 assistant 来源的导航信息，
+            // 不能与运行时拥有的 policy/control note 一起提权为 system。
+            promoted.role = if model_derived {
+                "assistant".to_string()
+            } else {
+                ROLE_SYSTEM.to_string()
+            };
             // Cap mid-stream notes to a reasonable budget to avoid bloating
             // the request with stale long notes (working memory / self_note /
             // cached-tool notes accumulated over many tool rounds).
@@ -679,8 +793,21 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
                         Value::String(truncate_note_text(text, MERGED_SINGLE_NOTE_MAX_CHARS));
                 }
             }
-            promoted.content = normalize_system_like_content_for_request(&promoted.content);
+            if model_derived && let Some(text) = promoted.content.as_str() {
+                promoted.content = model_derived_content(kind, text);
+            }
+            if model_derived {
+                out.push(derived_context_handoff_message());
+            }
             out.push(promoted);
+            if model_derived
+                && messages[idx + 1..]
+                    .iter()
+                    .find(|next| !is_context_checkpoint_marker(next))
+                    .is_some_and(|next| next.role == "assistant")
+            {
+                out.push(derived_context_return_message());
+            }
             continue;
         }
         out.push(message.clone());

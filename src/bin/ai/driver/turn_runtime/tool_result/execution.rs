@@ -253,6 +253,23 @@ fn execute_tool_calls_for_round(
 enum ToolCallRejectionReason {
     NoToolHandoff,
     PatchRetryNeedsFreshRead,
+    ScopedInstructionsNeedReload,
+}
+
+fn mutation_needs_scoped_instruction_preflight(
+    messages: &[Message],
+    tool_calls: &[ToolCall],
+) -> bool {
+    let targets =
+        super::super::iteration::project_instruction_target_paths_from_tool_calls(tool_calls, false);
+    if targets.is_empty() {
+        return false;
+    }
+    let system_prompt = messages
+        .first()
+        .and_then(|message| message.content.as_str())
+        .unwrap_or_default();
+    crate::ai::driver::skill_runtime::scoped_project_instructions_missing(system_prompt, &targets)
 }
 
 fn reject_tool_calls(
@@ -283,6 +300,10 @@ Do not call '{tool_name}' again; instead summarize confirmed facts, answer what 
         ToolCallRejectionReason::PatchRetryNeedsFreshRead => format!(
             "Error: apply_patch retry blocked. The previous patch for this file failed with `context mismatch` or `ambiguous patch`, which means the file content you are working from is stale or the context is not unique. \
 Do NOT retry patches in this batch — doing so will only fail again. Required recovery steps: (1) call `read_file` on the SAME target path to get the current truth state; (2) copy context lines DIRECTLY from that fresh output, including function names or distinctive surrounding lines to ensure each hunk matches exactly ONE location; (3) do NOT copy the leading line-number + tab prefix that read_file prints (each line is rendered as a right-aligned line number followed by a TAB, e.g. `    42\\t<code>`) — copy only the code after the tab; (4) call `apply_patch` only in a LATER tool round after you have successfully read the file."
+        ),
+        ToolCallRejectionReason::ScopedInstructionsNeedReload => format!(
+            "Error: '{tool_name}' was paused before execution because target-scoped project instructions were not loaded yet. \
+No file was changed. The runtime will add the applicable instruction documents on the next model step. Review those rules, then retry the mutation in a later tool round; do not repeat it in this batch."
         ),
     }
 }
@@ -1899,10 +1920,18 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     &app.stale_patch_targets,
                     &tool_call_execution.stream_result.tool_calls,
                 );
+            let scoped_preflight_needed = !*force_final_response
+                && !patch_retry_needs_fresh_read
+                && mutation_needs_scoped_instruction_preflight(
+                    messages,
+                    &tool_call_execution.stream_result.tool_calls,
+                );
             let rejection_reason = if *force_final_response {
                 Some(ToolCallRejectionReason::NoToolHandoff)
             } else if patch_retry_needs_fresh_read {
                 Some(ToolCallRejectionReason::PatchRetryNeedsFreshRead)
+            } else if scoped_preflight_needed {
+                Some(ToolCallRejectionReason::ScopedInstructionsNeedReload)
             } else {
                 None
             };
@@ -1951,6 +1980,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             )?;
 
             crate::ai::driver::input::clear_stdin_buffer();
+
+            if scoped_preflight_needed {
+                return Ok(TurnLoopStep::ScopedPreflightContinue);
+            }
 
             {
                 let mut os = app.os.lock().unwrap();
@@ -2040,7 +2073,7 @@ mod tests {
     use super::*;
     use crate::ai::{
         cli::ParsedCli,
-        driver::signal,
+        driver::{runtime_ctx::SUBAGENT_CWD, signal},
         types::{
             AgentContext, App, AppConfig, FunctionCall, FunctionDefinition, ToolDefinition,
             ToolResult,
@@ -2049,6 +2082,7 @@ mod tests {
     use aios_kernel::primitives::ResourceLimit;
     use rust_tools::cw::SkipMap;
     use serde_json::Value;
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{Duration, Instant};
@@ -2127,6 +2161,104 @@ mod tests {
                 arguments: arguments.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn scoped_instruction_preflight_blocks_first_mutation_until_rules_are_loaded() {
+        let root = std::env::temp_dir().join(format!(
+            "scoped-preflight-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let target = root.join("src/feature/mod.rs");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(root.join("AGENTS.md"), "root rules\n").unwrap();
+        fs::write(root.join("src/feature/AGENTS.md"), "feature rules\n").unwrap();
+        fs::write(&target, "// source\n").unwrap();
+        let mutation = test_tool_call(
+            "write",
+            "write_file",
+            serde_json::json!({"file_path": target, "content": "// changed\n"}),
+        );
+        let mut messages = vec![Message {
+            role: "system".to_string(),
+            content: Value::String("base system".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        SUBAGENT_CWD.sync_scope(root.clone(), || {
+            assert!(mutation_needs_scoped_instruction_preflight(
+                &messages,
+                std::slice::from_ref(&mutation)
+            ));
+            let mut app = test_app_with_tools(&["write_file"]);
+            let shared_mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
+            let mut turn_messages = Vec::new();
+            let mut persisted_turn_messages = 0;
+            let mut final_assistant_text = String::new();
+            let mut final_assistant_recorded = false;
+            let mut force_final_response = false;
+            let mut terminal_dedupe_candidate = None;
+            let mut turn_had_tool_error = false;
+            let step = handle_iteration_execution(
+                &mut app,
+                "change the file",
+                &shared_mcp_client.lock().unwrap(),
+                &shared_mcp_client,
+                IterationExecution::ToolCall(ToolCallExecution {
+                    stream_result: crate::ai::types::StreamResult {
+                        tool_calls: vec![mutation.clone()],
+                        ..Default::default()
+                    },
+                    allowed_tool_names: ["write_file".to_string()].into_iter().collect(),
+                }),
+                &mut messages,
+                &mut turn_messages,
+                true,
+                &mut persisted_turn_messages,
+                &mut final_assistant_text,
+                &mut final_assistant_recorded,
+                &mut force_final_response,
+                &mut terminal_dedupe_candidate,
+                false,
+                1,
+                1,
+                0,
+                &mut turn_had_tool_error,
+            )
+            .unwrap();
+            assert!(matches!(step, TurnLoopStep::ScopedPreflightContinue));
+            assert!(!force_final_response);
+            assert_eq!(fs::read_to_string(&target).unwrap(), "// source\n");
+
+            let targets =
+                super::super::super::iteration::project_instruction_target_paths_from_tool_calls(
+                    std::slice::from_ref(&mutation),
+                    false,
+                );
+            let docs = crate::ai::agents::load_scoped_project_instruction_docs_for_targets(&targets);
+            let loaded = docs
+                .iter()
+                .map(|doc| format!("From {}:\n{}", doc.path, doc.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            messages[0].content = Value::String(format!("base system\n{loaded}"));
+            assert!(!mutation_needs_scoped_instruction_preflight(
+                &messages,
+                std::slice::from_ref(&mutation)
+            ));
+        });
+        assert!(
+            rejected_tool_call_message(
+                "write_file",
+                ToolCallRejectionReason::ScopedInstructionsNeedReload
+            )
+            .contains("No file was changed")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn assistant_tool_call_message(tool_call: ToolCall) -> Message {

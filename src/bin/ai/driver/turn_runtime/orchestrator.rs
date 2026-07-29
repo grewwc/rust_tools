@@ -103,6 +103,9 @@ const READ_ONLY_BREADTH_CHECK_TARGETS: usize = 32;
 const PROGRESS_GRACE_WINDOW: usize = 6;
 /// 从「软提示 / 记账」升级到「硬停收口」额外需要的连续无进展轮数。
 const PROGRESS_NO_PROGRESS_HARD_MARGIN: usize = 16;
+/// scoped instruction preflight 使用独立预算，不消耗正常工具迭代；上限防止模型
+/// 通过不断切换新目录无限延长单 turn。
+const MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS: usize = 8;
 /// 变更类工具：调用这些动作（或产出 final text）即视为本轮有实质动作、算进展。
 const MUTATION_TOOL_NAMES: &[&str] = &[
     "apply_patch",
@@ -1125,6 +1128,7 @@ struct TurnSupervisor {
     coarse_loop_note_injected: bool,
     iteration_soft_limit_note_injected: bool,
     iteration_limit_note_injected: bool,
+    scoped_preflight_grace_rounds: usize,
     task_anchor_injected: bool,
     last_compress_iteration: usize,
     last_compress_after_chars: usize,
@@ -1211,6 +1215,18 @@ impl TurnSupervisor {
     fn next_iteration(&mut self) -> usize {
         self.iteration = self.iteration.saturating_add(1);
         self.iteration
+    }
+
+    fn grant_scoped_preflight_grace(&mut self) -> bool {
+        if self.scoped_preflight_grace_rounds >= MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS {
+            return false;
+        }
+        self.scoped_preflight_grace_rounds += 1;
+        true
+    }
+
+    fn effective_max_iterations(&self, max_iterations: usize) -> usize {
+        max_iterations.saturating_add(self.scoped_preflight_grace_rounds)
     }
 
     fn should_try_mid_turn_compress(&self, total_chars: usize, soft_threshold: usize) -> bool {
@@ -1759,6 +1775,24 @@ mod tests {
         let mut history = vec![sig.clone(); TOOL_LOOP_HARD_WINDOW];
         history[1] = vec!["read_file::{\"path\":\"b.rs\"}".to_string()];
         assert!(!detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
+    }
+
+    #[test]
+    fn scoped_preflight_grace_has_separate_bounded_budget() {
+        let mut supervisor = TurnSupervisor::default();
+        assert_eq!(supervisor.effective_max_iterations(1), 1);
+        for expected_rounds in 1..=MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS {
+            assert!(supervisor.grant_scoped_preflight_grace());
+            assert_eq!(
+                supervisor.effective_max_iterations(1),
+                1 + expected_rounds
+            );
+        }
+        assert!(!supervisor.grant_scoped_preflight_grace());
+        assert_eq!(
+            supervisor.effective_max_iterations(1),
+            1 + MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS
+        );
     }
 
     #[test]
@@ -3361,6 +3395,7 @@ async fn run_turn_body(
     let mut mt_downgraded = false;
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
+        let effective_max_iterations = supervisor.effective_max_iterations(max_iterations);
         {
             let mc = mcp_client.lock().unwrap();
             refresh_skill_turn_for_iteration(
@@ -3603,7 +3638,7 @@ async fn run_turn_body(
                 &mut terminal_dedupe_candidate,
                 skill_turn.matched_skill_name().is_none(),
                 iteration,
-                max_iterations,
+                effective_max_iterations,
                 consecutive_truncations,
                 &mut turn_had_tool_error,
             ) {
@@ -3611,6 +3646,16 @@ async fn run_turn_body(
                 Err(err) => break 'turn Err(err),
             };
             match step {
+                TurnLoopStep::ScopedPreflightContinue => {
+                    if supervisor.grant_scoped_preflight_grace() {
+                        // 该轮没有执行 mutation，也不应计入 progress/loop 统计。
+                        continue 'turn;
+                    }
+                    // 独立 preflight 预算耗尽后保持安全拒绝并收口，避免通过不断
+                    // 切换目录无限扩张迭代预算。
+                    force_final_response = true;
+                    continue 'turn;
+                }
                 TurnLoopStep::Continue => {
                     let mut new_tools = crate::ai::tools::enable_tools::drain_pending_enable();
                     let pending_mcp = crate::ai::tools::enable_tools::drain_pending_mcp_names();
@@ -3830,7 +3875,10 @@ async fn run_turn_body(
         // === 中段迭代断路器 ===
         // 远早于 max_iterations 硬上限：单轮迭代到达软阈值时注入一次收敛提示，
         // 治理「合法但低效」的工具刷屏（翻页、碎片检索），不强制收敛。
-        if supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations) {
+        let effective_max_iterations = supervisor.effective_max_iterations(max_iterations);
+        if supervisor
+            .maybe_inject_iteration_soft_limit_note(&mut messages, effective_max_iterations)
+        {
             crate::ai::driver::print::print_tool_note_line(
                 "agent-health",
                 "tool-iteration soft limit reached: injecting converge prompt",
@@ -3845,7 +3893,7 @@ async fn run_turn_body(
         // （只注入一次，避免重复刷屏）。
         supervisor.maybe_inject_iteration_limit_note(
             &mut messages,
-            max_iterations,
+            effective_max_iterations,
             force_final_response,
         );
         if force_final_response {

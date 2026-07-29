@@ -1,10 +1,10 @@
-# AGENTS.md — rust_tools Project Guide
+# AGENTS.md - rust_tools Project Guide
 
 ## Scope
 
 Root-level overview and repo-wide invariants only. Subsystem details belong in
-scoped `AGENTS.md` files (under important subdirectories). Only `AGENTS.md` /
-`Agent.md` / `CLAUDE.md` are auto-discovered.
+scoped `AGENTS.md` files. Only `AGENTS.md` / `Agent.md` / `CLAUDE.md` are
+auto-discovered.
 
 ## Overview
 
@@ -31,24 +31,16 @@ tests/                      # integration tests
 models.json                 # model registry
 ```
 
-> `crates/mcp_browser` pulls in the heavy `chromiumoxide` dep, but it is a
-> **standalone binary crate** — it only compiles under `cargo build -p mcp_browser`,
-> so `cargo check --bin a` (i.e. `-p rust_tools`) stays fast and unpolluted.
-> `crates/mcp_excel` is likewise a standalone binary crate (macOS-only; zero heavy
-> deps — just `tokio` + `serde_json`); it drives the installed Excel app and never
-> compiles into `a`. Both depend on `crates/mcp_stdio`, a tiny **lib crate**
-> (`tokio` + `serde_json` only) holding the shared MCP-over-stdio transport +
-> `run<S: McpServer>` dispatch loop; it is **not** a dependency of `a`, so the
-> main binary is unaffected. New "drive an OS-native app" MCP servers
-> (word / photoshop / pdf preview ...) should reuse it and only implement their
-> own tool set + driver.
+> `mcp_browser` / `mcp_excel` are **standalone binary crates** (not deps of `a`);
+> `cargo check --bin a` stays fast and unpolluted. Both reuse the tiny `mcp_stdio`
+> lib crate for transport + `run<S: McpServer>` dispatch. New "drive an OS-native
+> app" MCP servers should follow the same pattern.
 
 ## Build / Test
 
-> **Do not call `cargo check` / `cargo test` speculatively.** These commands are
-> expensive in this project (heavy deps, unstable incremental compilation).
-> But when the verification ladder says you must run them, **do not skip them**.
-> Reading code cannot confirm compilation; only `cargo check` can.
+`cargo check` / `cargo test` are expensive here (heavy deps, slow incremental).
+Don't run speculatively, but **do** run them when the ladder below demands it -
+reading code cannot confirm compilation. Always scope to the narrowest target.
 
 ```bash
 cargo check --bin a                  # fast type-check for the main binary
@@ -58,31 +50,17 @@ cargo test -p aios_kernel test_name  # run one targeted test in a crate
 cargo test --lib --bin a test_name   # only when one named test spans lib + bin
 ```
 
-**Scope every verification.** Always use `--bin`, `--lib`, `-p`, or a specific
-test name. Never run bare `cargo test`, bare `cargo build --release`, or broad
-workspace-wide commands for routine verification.
+Never run bare `cargo test` / `cargo build --release` / workspace-wide commands
+for routine verification, and never repeat a `cargo test` without a code change
+in between. Prefer locating an existing focused test before choosing a command.
 
 **Verification ladder:**
 
-1. **No code change / docs-only / comments-only**: no Cargo command required.
-   Say that verification was not run because no executable code changed.
-2. **Type-level, compile-risk, or mechanical refactor**: run the narrowest
-   relevant `cargo check` command.
-3. **Runtime behavior changed**: run the narrowest relevant existing test
-   (`cargo test ... test_name`) if one clearly covers the changed path.
-4. **Runtime behavior changed but no focused test exists**: run the narrowest
-   relevant `cargo check`, then explicitly say no targeted test was found. Do
-   not run broad tests just to satisfy this rule.
-5. **Bug fix with a known regression test or newly added test**: run that named
-   test. If it fails, fix the code and re-run the same test after the code
-   change.
-
-**Do not run tests speculatively.** Prefer reading the affected code and locating
-an existing focused test before choosing a Cargo command.
-
-**Avoid repeated test loops.** Never run the same `cargo test` command repeatedly
-without a code change in between. After one successful focused test, stop unless
-the user asks for broader verification.
+1. **No code change / docs-only**: no Cargo command required.
+2. **Type-level / compile-risk / mechanical refactor**: run the narrowest `cargo check`.
+3. **Runtime behavior changed, focused test exists**: run that named test.
+4. **Runtime behavior changed, no focused test**: run the narrowest `cargo check`; say no targeted test was found. Do not run broad tests just to satisfy this.
+5. **Bug fix with regression/new test**: run that named test; on failure, fix and re-run.
 
 ## Global Engineering Rules
 
@@ -91,25 +69,12 @@ the user asks for broader verification.
 3. **Collections**: prefer `rustc-hash` FxHashMap/FxHashSet via existing re-exports.
 4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
 5. **AI tools**: schema/registration in `tools/registry/`, logic in `tools/service/`.
-6. **Focused changes**: do not modify unrelated code. Avoid opportunistic refactors
-   or formatting churn — if truly necessary, explain first and get confirmation.
+6. **Focused changes**: do not modify unrelated code; avoid opportunistic refactors or formatting churn - if truly necessary, explain first and get confirmation.
 7. **Tests**: keep close to the changed module; serial tests use `test_support::ENV_LOCK`.
-8. **Extensibility**: prefer data-driven/registration-based design over hardcoded
-   `if`/`else` chains. Additive, optional registration over modifying shared structs.
-9. **AGENTS.md maintenance**: after every code change, check whether the nearest
-   scoped `AGENTS.md` (or this root file for repo-wide invariants) needs updating.
-   **Delete or revise** stale content — do not merely append. Outdated rules that
-   contradict current behavior are worse than missing rules.
-10. **Git safety**: never `git stash` / `git stash drop` someone else's uncommitted
-    changes. Use a temporary branch, worktree, or stash only your own (and pop back).
-11. **Architecture-first, no excessive fallback logic**: Do not pile on defensive
-    `if`/`else` fallbacks to work around a design problem. If a code path needs many
-    layers of fallback to function correctly, the abstraction or data flow is wrong —
-    refactor the design first so the happy path is clean and straightforward.
-12. **Follow the verification ladder, don't skip**: `cargo check` / `cargo test`
-    are expensive, do not run them speculatively. But when the ladder demands it
-    (compile-risk changes: dep edits, refactors, etc.), **run them** — reading
-    code cannot confirm compilation. Always scope to the narrowest target.
+8. **Extensibility**: prefer data-driven/registration-based design over hardcoded `if`/`else` chains. Additive, optional registration over modifying shared structs.
+9. **AGENTS.md maintenance**: after every code change, check whether the nearest scoped `AGENTS.md` (or this root file) needs updating. **Delete or revise** stale content - do not merely append. Outdated rules that contradict current behavior are worse than missing rules.
+10. **Git safety**: never `git stash` / `git stash drop` someone else's uncommitted changes. Use a temporary branch, worktree, or stash only your own (and pop back).
+11. **Architecture-first, no excessive fallback logic**: if a path needs many layers of fallback, the abstraction/data flow is wrong - refactor so the happy path is clean instead of piling on defensive `if`/`else`.
 
 ## High-Value Pitfalls
 

@@ -1850,7 +1850,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
             if !line.is_empty() {
                 line.push_str(" | ");
             }
-            line.push_str("结论: ");
+            line.push_str("助手先前回答（未独立验证）: ");
             line.push_str(&turn.assistant_final);
         }
         if !turn.tool_names.is_empty() {
@@ -1881,14 +1881,9 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
             line.push_str(" @ ");
             line.push_str(&turn.topic_label);
         }
-        let conclusion = if !turn.tool_highlights.is_empty() {
-            turn.tool_highlights.join("；")
-        } else {
-            turn.assistant_final.clone()
-        };
-        if !conclusion.is_empty() {
+        if !turn.tool_highlights.is_empty() {
             line.push_str(" => ");
-            line.push_str(&conclusion);
+            line.push_str(&turn.tool_highlights.join("；"));
         }
         Some(line)
     }
@@ -2030,7 +2025,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
     let reserved_tool_chars = if known_tool_lines.is_empty() {
         0
     } else {
-        let tool_blob = format!("已知工具结论:\n{}", known_tool_lines.join("\n"));
+        let tool_blob = format!("工具证据摘要:\n{}", known_tool_lines.join("\n"));
         tool_blob.chars().count().min(max_chars / 3)
     };
     let body_budget = max_chars
@@ -2054,7 +2049,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
     }
 
     if !known_tool_lines.is_empty() {
-        let _ = push_line_with_budget(&mut lines, "已知工具结论:".to_string(), max_chars);
+        let _ = push_line_with_budget(&mut lines, "工具证据摘要:".to_string(), max_chars);
         for line in known_tool_lines {
             if !push_line_with_budget(&mut lines, line, max_chars) {
                 break;
@@ -2074,7 +2069,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
                 parts.push(format!("用户: {}", t.user));
             }
             if !t.assistant_final.is_empty() {
-                parts.push(format!("助手: {}", t.assistant_final));
+                parts.push(format!("助手先前回答（未独立验证）: {}", t.assistant_final));
             }
             if !t.tool_names.is_empty() {
                 parts.push(format!("工具: {}", t.tool_names.join(", ")));
