@@ -168,15 +168,29 @@ fn mark_session_title_generation_finished(session_id: &str) {
     in_flight.remove(session_id);
 }
 
-/// 只在已经拿到可展示的最终回复后生成标题，避免用未完成的首条请求固化标题。
-fn has_completed_assistant_response(messages: &[Message]) -> bool {
+/// 标题任务可以在当前 user message 尚未落盘时启动；把这条已提交输入补进快照，
+/// 让辅助模型无需等待主请求或首轮 assistant response。
+fn session_title_messages(
+    mut persisted_messages: Vec<Message>,
+    pending_user_input: Option<&str>,
+) -> Vec<Message> {
+    let Some(user_input) = pending_user_input.map(str::trim).filter(|input| !input.is_empty()) else {
+        return persisted_messages;
+    };
+
+    persisted_messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String(user_input.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    persisted_messages
+}
+
+fn has_session_title_source(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
-        message.role == "assistant"
-            && message
-                .tool_calls
-                .as_ref()
-                .is_none_or(|tool_calls| tool_calls.is_empty())
-            && !value_to_string(&message.content).trim().is_empty()
+        message.role == "user" && !value_to_string(&message.content).trim().is_empty()
     })
 }
 
@@ -354,6 +368,15 @@ pub(super) async fn finalize_turn(
 /// 在 turn 结束后尝试用 LLM 生成 session 概括性标题。
 /// 条件：至少有 1 个 user turn，且没有已生成标题或现有标题质量过低。
 pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: bool) {
+    let store = session_title_store(&app.config.history_file);
+    if !store
+        .read_all_messages(&app.session_id)
+        .is_ok_and(|messages| has_session_title_source(&messages))
+    {
+        // 新 session 启动时没有历史，不要占住 in-flight 标记；否则用户立即提交
+        // 首条输入时，真正需要的标题任务可能被这个空任务挡掉。
+        return;
+    }
     if !mark_session_title_generation_started(&app.session_id) {
         return;
     }
@@ -362,28 +385,46 @@ pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: b
         let task_app = app.clone();
         let session_id = task_app.session_id.clone();
         tokio::spawn(async move {
-            generate_session_title_if_missing(&task_app).await;
+            generate_session_title_if_missing(&task_app, None).await;
             mark_session_title_generation_finished(&session_id);
         });
         return;
     }
 
-    generate_session_title_if_missing(app).await;
+    generate_session_title_if_missing(app, None).await;
     mark_session_title_generation_finished(&app.session_id);
 }
 
-async fn generate_session_title_if_missing(app: &App) {
+/// 用户提交输入后立即派发标题生成，不等待该 turn 的历史落盘或模型响应。
+pub(super) async fn maybe_generate_session_title_for_input(app: &App, user_input: &str) {
+    if user_input.trim().is_empty() || !mark_session_title_generation_started(&app.session_id) {
+        return;
+    }
+
+    let task_app = app.clone();
+    let session_id = task_app.session_id.clone();
+    let user_input = user_input.to_string();
+    tokio::spawn(async move {
+        generate_session_title_if_missing(&task_app, Some(&user_input)).await;
+        mark_session_title_generation_finished(&session_id);
+    });
+}
+
+async fn generate_session_title_if_missing(app: &App, pending_user_input: Option<&str>) {
     // SessionStore 接收基础 history 文件，并据此推导 `<stem>.sessions/`。
     // 传入当前 session sqlite 的父目录会额外拼出一层 `.sessions`，导致标题任务
     // 读取不到当前会话的消息。
     let store = session_title_store(&app.config.history_file);
 
-    let all_messages = match store.read_all_messages(&app.session_id) {
-        Ok(messages) if !messages.is_empty() => messages,
-        Ok(_) | Err(_) => return,
+    let persisted_messages = match store.read_all_messages(&app.session_id) {
+        Ok(messages) => messages,
+        // 首条输入触发时 session sqlite 可能还没由主 turn 创建；pending input 本身
+        // 已足够生成标题，因此把“尚无历史文件”视为空历史，而不是错过整个首轮。
+        Err(_) if pending_user_input.is_some() => Vec::new(),
+        Err(_) => return,
     };
-
-    if !has_completed_assistant_response(&all_messages) {
+    let all_messages = session_title_messages(persisted_messages, pending_user_input);
+    if !has_session_title_source(&all_messages) {
         return;
     }
 
@@ -589,27 +630,15 @@ mod tests {
     }
 
     #[test]
-    fn session_title_generation_waits_for_final_assistant_response() {
-        let pending_messages = vec![Message {
-            role: "user".to_string(),
-            content: Value::String("修复标题".to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        }];
-        let completed_messages = vec![
-            pending_messages[0].clone(),
-            Message {
-                role: "assistant".to_string(),
-                content: Value::String("已完成修复".to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            },
-        ];
+    fn session_title_generation_uses_submitted_user_input_before_persistence() {
+        let messages = session_title_messages(Vec::new(), Some("  修复标题显示延迟  "));
 
-        assert!(!has_completed_assistant_response(&pending_messages));
-        assert!(has_completed_assistant_response(&completed_messages));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(value_to_string(&messages[0].content), "修复标题显示延迟");
+        assert_eq!(fallback_session_title(&messages), "修复标题显示延迟");
+        assert!(has_session_title_source(&messages));
+        assert!(!has_session_title_source(&[]));
     }
 
     #[test]

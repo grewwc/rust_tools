@@ -1237,6 +1237,51 @@ fn thinking_fold_window_rows_follow_wrapped_terminal_height() {
 }
 
 #[test]
+fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
+    assert_eq!(fold_rewrite_right_margin_cols(Some("vscode")), 1);
+    assert_eq!(fold_rewrite_right_margin_cols(Some("Trae")), 1);
+    assert_eq!(fold_rewrite_right_margin_cols(Some("iTerm.app")), 0);
+
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("COLUMNS", "12");
+    }
+
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.max_visible_lines = 2;
+    fold.rewrite_right_margin_cols = fold_rewrite_right_margin_cols(Some("vscode"));
+    fold.total_lines = 1;
+    fold.recent_lines
+        .push_back("12345678901234567890".to_string());
+    fold.current_line = "abcdef".to_string();
+
+    let (window, rows) = render_thinking_fold_window(fold);
+    let plain_lines = window
+        .lines()
+        .map(crate::ai::stream::extract::strip_ansi_codes)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        plain_lines,
+        vec!["    1234567", "    8901234", "    567890", "    abcdef"]
+    );
+    assert_eq!(rows, 4);
+    for visible in &plain_lines {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 11,
+            "xterm.js rewrite line reaches delayed-wrap column: {visible:?}"
+        );
+    }
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
 fn thinking_fold_window_indents_body_under_header() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()

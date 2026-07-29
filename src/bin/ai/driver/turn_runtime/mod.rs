@@ -96,6 +96,13 @@ pub(super) async fn maybe_generate_session_title(app: &super::App, run_in_backgr
     finalize::maybe_generate_session_title(app, run_in_background).await;
 }
 
+pub(super) async fn maybe_generate_session_title_for_input(
+    app: &super::App,
+    user_input: &str,
+) {
+    finalize::maybe_generate_session_title_for_input(app, user_input).await;
+}
+
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
 const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
 /// 首次 overflow stub 中的 head 预览字符数。

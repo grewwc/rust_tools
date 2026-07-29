@@ -144,6 +144,9 @@ pub(super) struct ThinkingFoldState {
     /// 上次真正写到 terminal 的正文纯文本行（含缩进/截断，不含 ANSI / header），用于在
     /// terminal resize 后按**当前**列宽重算旧窗口会占多少物理行，避免 cursor-up 擦不干净。
     pub(super) rendered_body_lines: Vec<String>,
+    /// 重画正文时额外保留的右侧列数。xterm.js 在最后一列使用 delayed-wrap，若正文恰好
+    /// 写满整行，下一次换行可能多占一个未计入 cursor-up 的物理行并把旧帧推入 scrollback。
+    pub(super) rewrite_right_margin_cols: usize,
     /// 是否处于活跃的 thinking 折叠模式
     pub(super) active: bool,
     /// header（`thinking`）是否已落地。header 只打印一次并被锚定在重画区域之上，
@@ -175,6 +178,7 @@ impl ThinkingFoldState {
             total_lines: 0,
             window_rows: 0,
             rendered_body_lines: Vec::new(),
+            rewrite_right_margin_cols: 0,
             active: false,
             header_drawn: false,
             header_label: header_label.into(),
