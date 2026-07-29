@@ -938,6 +938,13 @@ async fn run_loop(
             continue;
         }
 
+        if !one_shot_mode {
+            // 标题只依赖用户已经提交的输入，不应等待首轮模型响应完成。这里在 MCP 初始化、
+            // 图片预处理和主请求之前立即派发后台生成任务；结果写库后会通过 prompt update
+            // 通道通知前端，后续 request header 也会直接读到最新标题。
+            turn_runtime::maybe_generate_session_title_for_input(app, &question).await;
+        }
+
         // ── Goal 模式等待状态 ──
         // 用户输入 `/goal` 后，下一条非 slash 消息作为目标内容。
         // 将目标包装成 goal prompt 发送给 LLM，同时更新 goal_mode。

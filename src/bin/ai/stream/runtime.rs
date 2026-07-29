@@ -44,6 +44,9 @@ const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 2;
 /// thinking / subagent 折叠正文缩进：header/footer 用 2 空格，正文再内缩一层。
 const THINKING_FOLD_BODY_INDENT: &str = "    ";
 const THINKING_FOLD_BODY_INDENT_WIDTH: usize = 4;
+/// xterm.js 在最后一列使用 delayed-wrap；折叠重画若写满该列，下一次换行可能产生一条
+/// 未计入 cursor-up 的物理行，导致旧窗口逐帧泄漏进 scrollback。
+const XTERMJS_FOLD_RIGHT_MARGIN_COLS: usize = 1;
 /// 推理流连续重复的最短片段和判定次数。只检测 reasoning，避免把用户要求生成的重复
 /// 正文（表格、代码、测试数据等）误判为模型退化。
 const MIN_REASONING_REPEAT_CHARS: usize = 16;
@@ -191,6 +194,8 @@ fn configure_thinking_fold(state: &mut StreamProcessingState) {
             .get_opt(AiConfig::OUTPUT_THINKING_MAX_VISIBLE_LINES)
             .as_deref(),
     );
+    state.render.thinking_fold.rewrite_right_margin_cols =
+        fold_rewrite_right_margin_cols(std::env::var("TERM_PROGRAM").ok().as_deref());
 }
 
 fn configure_subagent_preview_fold(
@@ -198,6 +203,8 @@ fn configure_subagent_preview_fold(
     state: &mut StreamProcessingState,
     markers: &mut StreamMarkers,
 ) {
+    state.render.subagent_fold.rewrite_right_margin_cols =
+        fold_rewrite_right_margin_cols(std::env::var("TERM_PROGRAM").ok().as_deref());
     if !io::stdout().is_terminal() || runtime_ctx::current_subagent_depth() == 0 {
         state.render.subagent_fold.max_visible_lines = usize::MAX;
         return;
@@ -215,6 +222,18 @@ fn configure_subagent_preview_fold(
         markers.subagent_fold_footer.as_deref(),
     ) {
         state.render.subagent_fold.set_labels(header, footer);
+    }
+}
+
+fn fold_rewrite_right_margin_cols(term_program: Option<&str>) -> usize {
+    let Some(term_program) = term_program else {
+        return 0;
+    };
+    let term_program = term_program.to_ascii_lowercase();
+    if term_program.contains("vscode") || term_program.contains("trae") {
+        XTERMJS_FOLD_RIGHT_MARGIN_COLS
+    } else {
+        0
     }
 }
 
@@ -1167,7 +1186,11 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
 
     let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
     let (body, body_rows, rendered_body_lines) =
-        render_thinking_fold_window_lines(&body_lines, marker_lines);
+        render_thinking_fold_window_lines(
+            &body_lines,
+            marker_lines,
+            fold.rewrite_right_margin_cols,
+        );
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
     }
@@ -1212,7 +1235,11 @@ fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
 
     let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
     let (body, body_rows, rendered_body_lines) =
-        render_thinking_fold_window_lines(&body_lines, marker_lines);
+        render_thinking_fold_window_lines(
+            &body_lines,
+            marker_lines,
+            fold.rewrite_right_margin_cols,
+        );
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
     }
@@ -1288,26 +1315,33 @@ fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<St
 /// 供 `\x1b[{n}A` 精确擦除；逻辑行数上限为 `max_visible_lines + 1`，超长行会手动换行。
 fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
     let (lines, marker_lines) = thinking_fold_window_lines(fold);
-    let (window, rows, _) = render_thinking_fold_window_lines(&lines, marker_lines);
+    let (window, rows, _) = render_thinking_fold_window_lines(
+        &lines,
+        marker_lines,
+        fold.rewrite_right_margin_cols,
+    );
     (window, rows)
 }
 
 fn render_thinking_fold_window_lines(
     lines: &[String],
     marker_lines: usize,
+    rewrite_right_margin_cols: usize,
 ) -> (String, usize, Vec<String>) {
     if lines.is_empty() {
         return (String::new(), 0, Vec::new());
     }
     let mut out = String::new();
     let mut rendered_lines = Vec::with_capacity(lines.len());
-    // 折叠正文固定内缩；超长 thinking 手动换成多条同缩进视觉行，避免终端自动折行
-    // 顶到左边界，同时保留完整内容。
+    // 折叠正文固定内缩；超长 thinking 手动换成多条同缩进视觉行。xterm.js 集成终端
+    // 额外留出最后一列，避免 delayed-wrap 产生未计入 cursor-up 的物理行。
     let mut rows = 0usize;
 
     for (idx, line) in lines.iter().enumerate() {
-        let wrapped =
-            wrap_line_to_terminal_rows_with_reserve(line, THINKING_FOLD_BODY_INDENT_WIDTH);
+        let wrapped = wrap_line_to_terminal_rows_with_reserve(
+            line,
+            THINKING_FOLD_BODY_INDENT_WIDTH + rewrite_right_margin_cols,
+        );
         for body in wrapped {
             let rendered_line = format!("{THINKING_FOLD_BODY_INDENT}{body}");
             rows += live_preview_cursor_rows(&rendered_line);
