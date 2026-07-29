@@ -10,7 +10,7 @@ use std::{
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
@@ -117,6 +117,12 @@ pub(in crate::ai) struct RecentTurnWindow {
     pub(in crate::ai) has_older_messages: bool,
 }
 
+/// `/ss` 列表展示所需的轻量元数据。
+pub(in crate::ai) struct SessionListMetadata {
+    pub(in crate::ai) first_user_prompt: Option<String>,
+    pub(in crate::ai) session_title: Option<String>,
+}
+
 fn open_history_db(path: &Path) -> Result<Connection, io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -126,6 +132,15 @@ fn open_history_db(path: &Path) -> Result<Connection, io::Error> {
         .map_err(|e| io::Error::other(e.to_string()))?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(conn)
+}
+
+/// 会话列表只读元数据，不能因枚举而创建目录、初始化数据库或切换 journal mode。
+fn open_history_db_read_only(path: &Path) -> Result<Connection, io::Error> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(conn)
 }
 
@@ -1696,6 +1711,10 @@ fn truncate_messages_to_user_turns_sqlite_unlocked(
 
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
+    read_first_user_prompt_from_conn(&conn)
+}
+
+fn read_first_user_prompt_from_conn(conn: &Connection) -> io::Result<Option<String>> {
     let meta: Option<String> = conn
         .query_row(
             "SELECT value FROM meta WHERE key='first_user_prompt' LIMIT 1",
@@ -1736,6 +1755,10 @@ pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Op
 /// 读取 session 标题（存储在 meta 表中，key='session_title'）。
 pub(in crate::ai) fn read_session_title_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
+    Ok(read_session_title_from_conn(&conn))
+}
+
+fn read_session_title_from_conn(conn: &Connection) -> Option<String> {
     let title: Option<String> = conn
         .query_row(
             "SELECT value FROM meta WHERE key='session_title' LIMIT 1",
@@ -1744,7 +1767,21 @@ pub(in crate::ai) fn read_session_title_sqlite(path: &Path) -> io::Result<Option
         )
         .optional()
         .unwrap_or(None);
-    Ok(title.filter(|s| !s.trim().is_empty()))
+    title.filter(|title| !title.trim().is_empty())
+}
+
+/// 单次只读连接读取 `/ss` 列表的标题与首条用户请求。
+///
+/// 两项元数据沿用列表层原本的容错语义：单项查询失败不影响另一项，也不会让
+/// 一个损坏或旧格式的 session 阻断整个列表。
+pub(in crate::ai) fn read_session_list_metadata_sqlite(
+    path: &Path,
+) -> io::Result<SessionListMetadata> {
+    let conn = open_history_db_read_only(path)?;
+    Ok(SessionListMetadata {
+        first_user_prompt: read_first_user_prompt_from_conn(&conn).unwrap_or(None),
+        session_title: read_session_title_from_conn(&conn),
+    })
 }
 
 /// 读取 session 标题来源（`model` / `fallback`）；缺失时调用方按旧数据处理。
@@ -2053,6 +2090,30 @@ mod tests {
             read_first_user_prompt_sqlite(&path).unwrap().as_deref(),
             Some("这是实际用户请求\n---\n这是后续用户请求")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_list_metadata_reads_both_fields_without_creating_missing_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "session_list_metadata_test_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let missing_path = dir.join("missing.db");
+        assert!(read_session_list_metadata_sqlite(&missing_path).is_err());
+        assert!(!missing_path.exists());
+
+        let path = dir.join("history.db");
+        append_history_sqlite(&path, vec![msg("user", "first prompt")]).unwrap();
+        write_session_title_sqlite(&path, "generated title", "model").unwrap();
+
+        let metadata = read_session_list_metadata_sqlite(&path).unwrap();
+        assert_eq!(metadata.first_user_prompt.as_deref(), Some("first prompt"));
+        assert_eq!(metadata.session_title.as_deref(), Some("generated title"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

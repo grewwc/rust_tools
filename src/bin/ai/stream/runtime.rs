@@ -44,9 +44,9 @@ const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 2;
 /// thinking / subagent 折叠正文缩进：header/footer 用 2 空格，正文再内缩一层。
 const THINKING_FOLD_BODY_INDENT: &str = "    ";
 const THINKING_FOLD_BODY_INDENT_WIDTH: usize = 4;
-/// xterm.js 在最后一列使用 delayed-wrap；折叠重画若写满该列，下一次换行可能产生一条
-/// 未计入 cursor-up 的物理行，导致旧窗口逐帧泄漏进 scrollback。
-const XTERMJS_FOLD_RIGHT_MARGIN_COLS: usize = 1;
+/// xterm.js 在右边界使用 delayed-wrap；折叠重画额外留两列，避免终端宽度或字符宽度
+/// 存在一列偏差时仍触发隐式换行，把旧窗口逐帧泄漏进 scrollback。
+const XTERMJS_FOLD_RIGHT_MARGIN_COLS: usize = 2;
 /// 推理流连续重复的最短片段和判定次数。只检测 reasoning，避免把用户要求生成的重复
 /// 正文（表格、代码、测试数据等）误判为模型退化。
 const MIN_REASONING_REPEAT_CHARS: usize = 16;
@@ -1168,7 +1168,7 @@ fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str
 ///
 /// header（`thinking`）在折叠激活时打印一次并锚定在正文之上，之后每次重画都只
 /// 擦除并重写正文。正文行数上限为 `max_visible_lines + 1`（折叠摘要），恒定落在可视
-/// 视口内，因此 `\x1b[{window_rows}A` 相对擦除永远够得着，不会随窗口滚入 scrollback
+/// 视口内，因此相对擦除永远够得着，不会随窗口滚入 scrollback
 /// 而失步——即便失步，也无法再生出第二个 header，从根上杜绝「孤儿 header 叠加」。
 fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     let mut out = io::stdout();
@@ -1176,21 +1176,18 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
     // 注意：terminal 缩窄后，旧正文会被终端按当前宽度自动 reflow 成更多物理行；
     // 这里不能只信缓存的 window_rows，而要按"上次正文在当前宽度下会占几行"重算。
     let erase_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
-    if erase_rows > 0 {
-        write!(out, "\x1b[{}A\r\x1b[0J", erase_rows)?;
-    }
+    erase_fold_body(&mut out, erase_rows)?;
     if fold.active && !fold.header_drawn {
         write_fold_header(&mut out, fold)?;
         fold.header_drawn = true;
     }
 
     let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
-    let (body, body_rows, rendered_body_lines) =
-        render_thinking_fold_window_lines(
-            &body_lines,
-            marker_lines,
-            fold.rewrite_right_margin_cols,
-        );
+    let (body, body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
+        &body_lines,
+        marker_lines,
+        fold.rewrite_right_margin_cols,
+    );
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
     }
@@ -1205,7 +1202,20 @@ fn write_fold_header(
     out: &mut impl Write,
     fold: &super::state::ThinkingFoldState,
 ) -> io::Result<()> {
-    write!(out, "  {ACCENT_MUTED}{}\x1b[0m\n", fold.header_label)
+    write!(out, "  {ACCENT_MUTED}{}\x1b[0m\r\n", fold.header_label)
+}
+
+/// 正文渲染后光标停在最后一条物理行，而不是额外的空白行。重画时因此只需上移
+/// `rows - 1`；先回到行首再擦到屏幕底部，可覆盖窗口变窄后产生的 reflow 行。
+fn erase_fold_body(out: &mut impl Write, rows: usize) -> io::Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+    write!(out, "\r")?;
+    if rows > 1 {
+        write!(out, "\x1b[{}A", rows - 1)?;
+    }
+    write!(out, "\x1b[0J")
 }
 
 /// Thinking 结束时的最终渲染：覆盖正文窗口，输出最终折叠摘要 + "done thinking"。
@@ -1224,9 +1234,7 @@ fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
 
     let mut out = io::stdout();
     let erase_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
-    if erase_rows > 0 {
-        write!(out, "\x1b[{}A\r\x1b[0J", erase_rows)?;
-    }
+    erase_fold_body(&mut out, erase_rows)?;
     // 若正文从未渲染过（header 尚未落地），补一个 header 以保证块结构完整。
     if !fold.header_drawn {
         write_fold_header(&mut out, fold)?;
@@ -1234,12 +1242,11 @@ fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     }
 
     let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
-    let (body, body_rows, rendered_body_lines) =
-        render_thinking_fold_window_lines(
-            &body_lines,
-            marker_lines,
-            fold.rewrite_right_margin_cols,
-        );
+    let (body, body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
+        &body_lines,
+        marker_lines,
+        fold.rewrite_right_margin_cols,
+    );
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
     }
@@ -1250,9 +1257,12 @@ fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     let line_count = fold
         .total_lines
         .saturating_add(usize::from(!fold.current_line.is_empty()));
+    if body_rows > 0 {
+        out.write_all(b"\r\n")?;
+    }
     write!(
         out,
-        "  {ACCENT_MUTED}{} · {line_count} lines\x1b[0m\n",
+        "  {ACCENT_MUTED}{} · {line_count} lines\x1b[0m\r\n",
         fold.footer_label,
     )?;
     out.flush()?;
@@ -1311,15 +1321,12 @@ fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<St
 }
 
 /// 渲染折叠窗口的**正文**（折叠摘要 + 最近可见行），不含 header。
-/// header 由 `write_thinking_fold_header` 单独锚定打印。返回的行数即正文物理行数，
-/// 供 `\x1b[{n}A` 精确擦除；逻辑行数上限为 `max_visible_lines + 1`，超长行会手动换行。
+/// header 由 `write_fold_header` 单独锚定打印。返回的行数即正文物理行数；正文末尾不
+/// 输出换行，光标始终停在最后一行，避免 xterm.js 把末尾 LF 解释成额外滚屏。
 fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
     let (lines, marker_lines) = thinking_fold_window_lines(fold);
-    let (window, rows, _) = render_thinking_fold_window_lines(
-        &lines,
-        marker_lines,
-        fold.rewrite_right_margin_cols,
-    );
+    let (window, rows, _) =
+        render_thinking_fold_window_lines(&lines, marker_lines, fold.rewrite_right_margin_cols);
     (window, rows)
 }
 
@@ -1334,8 +1341,9 @@ fn render_thinking_fold_window_lines(
     let mut out = String::new();
     let mut rendered_lines = Vec::with_capacity(lines.len());
     // 折叠正文固定内缩；超长 thinking 手动换成多条同缩进视觉行。xterm.js 集成终端
-    // 额外留出最后一列，避免 delayed-wrap 产生未计入 cursor-up 的物理行。
+    // 额外留出右边距，避免 delayed-wrap 产生未计入 cursor-up 的物理行。
     let mut rows = 0usize;
+    let mut first_rendered_row = true;
 
     for (idx, line) in lines.iter().enumerate() {
         let wrapped = wrap_line_to_terminal_rows_with_reserve(
@@ -1343,17 +1351,20 @@ fn render_thinking_fold_window_lines(
             THINKING_FOLD_BODY_INDENT_WIDTH + rewrite_right_margin_cols,
         );
         for body in wrapped {
+            if !first_rendered_row {
+                out.push_str("\r\n");
+            }
+            first_rendered_row = false;
             let rendered_line = format!("{THINKING_FOLD_BODY_INDENT}{body}");
             rows += live_preview_cursor_rows(&rendered_line);
             if idx < marker_lines {
                 out.push_str(ACCENT_MUTED);
                 out.push_str(&rendered_line);
-                out.push_str("\x1b[0m\n");
+                out.push_str("\x1b[0m");
             } else {
                 out.push_str(DIM);
                 out.push_str(&rendered_line);
                 out.push_str(RESET);
-                out.push('\n');
             }
             rendered_lines.push(rendered_line);
         }

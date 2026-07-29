@@ -1029,7 +1029,12 @@ fn extract_round_targets_inner(
         let Some(map) = args.as_object() else {
             continue;
         };
-        for key in ["path", "file_path", "pattern", "query"] {
+        // url/selector：浏览器工具（navigate/get_text/click/type_text 等）读写的是
+        // 「当前页面」这一外部状态。它们不在 MUTATION_TOOL_NAMES 里，参数也不带
+        // path/query，若不纳入目标提取，则 navigate 新 URL、读取新 selector 这类真实
+        // 推进会被 assess_progress 一律判成「无进展」，导致正常的多步浏览 turn 在
+        // ~41 轮被 LowProgressHard 误停。把 url/selector 视作新目标即可正确记进展。
+        for key in ["path", "file_path", "pattern", "query", "url", "selector"] {
             if let Some(s) = map.get(key).and_then(|v| v.as_str()) {
                 let target = if matches!(key, "path" | "file_path") {
                     normalize_path_like_token(s)
@@ -2713,6 +2718,38 @@ mod tests {
                 "execute_command:blocked-outside-workspace:/Users/bytedance/.config/mcp.json"
                     .to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn browser_navigation_and_read_count_as_progress_targets() {
+        // 浏览器工具不在 MUTATION_TOOL_NAMES、参数也不带 path/query；若不提取
+        // url/selector，navigate 新页面与读取新 selector 会被误判为无进展，正常的
+        // 多步浏览 turn 会在进展预算阶梯下被 LowProgressHard 误停。
+        let mut messages = Vec::new();
+        pb_task_round(
+            &mut messages,
+            "mcp_browser_navigate",
+            serde_json::json!({ "url": "https://example.com/page" }),
+            "nav-1",
+            "ok",
+        );
+        assert_eq!(
+            extract_round_targets(&messages),
+            vec!["mcp_browser_navigate:url:https://example.com/page".to_string()]
+        );
+
+        let mut read_messages = Vec::new();
+        pb_task_round(
+            &mut read_messages,
+            "mcp_browser_get_text",
+            serde_json::json!({ "selector": "#main" }),
+            "read-1",
+            "hello",
+        );
+        assert_eq!(
+            extract_round_targets(&read_messages),
+            vec!["mcp_browser_get_text:selector:#main".to_string()]
         );
     }
 

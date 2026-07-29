@@ -72,6 +72,12 @@ pub(super) fn summarize_text(text: &str, target_chars: usize) -> String {
 }
 
 pub(super) fn keep_ends_by_chars(text: &str, target_chars: usize) -> String {
+    // 与 truncate_to_chars / summarize_text 一致：预算为 0 时无处放 head/tail，直接返回空串，
+    // 否则下方 `target_chars - head_budget - 1` 会在 target_chars==0 时下溢（debug 崩溃、
+    // release 回绕成 usize::MAX 导致 take/skip 反而放大文本）。
+    if target_chars == 0 {
+        return String::new();
+    }
     let char_count = text.chars().count();
     if char_count <= target_chars {
         return text.to_string();
@@ -84,4 +90,29 @@ pub(super) fn keep_ends_by_chars(text: &str, target_chars: usize) -> String {
         .skip(char_count.saturating_sub(tail_budget))
         .collect();
     format!("{}\u{2026}{}", head, tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keep_ends_by_chars_zero_budget_returns_empty_without_overflow() {
+        // 回归：prefix 撑爆 target 时预算会算成 0，旧实现在 `target - head - 1` 处下溢
+        // （debug 崩溃 / release 回绕成 usize::MAX 反而放大文本）。0 预算必须安全返回空串。
+        assert_eq!(keep_ends_by_chars("non-empty text", 0), "");
+        assert_eq!(keep_ends_by_chars("", 0), "");
+    }
+
+    #[test]
+    fn keep_ends_by_chars_small_budget_stays_within_target() {
+        // 预算 >=1 时不得下溢，且结果字符数不超过 target。
+        for target in 1..=8 {
+            let out = keep_ends_by_chars("abcdefghijklmnopqrstuvwxyz", target);
+            assert!(
+                out.chars().count() <= target,
+                "target={target} produced {out:?}"
+            );
+        }
+    }
 }

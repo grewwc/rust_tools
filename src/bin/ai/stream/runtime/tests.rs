@@ -1238,8 +1238,8 @@ fn thinking_fold_window_rows_follow_wrapped_terminal_height() {
 
 #[test]
 fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
-    assert_eq!(fold_rewrite_right_margin_cols(Some("vscode")), 1);
-    assert_eq!(fold_rewrite_right_margin_cols(Some("Trae")), 1);
+    assert_eq!(fold_rewrite_right_margin_cols(Some("vscode")), 2);
+    assert_eq!(fold_rewrite_right_margin_cols(Some("Trae")), 2);
     assert_eq!(fold_rewrite_right_margin_cols(Some("iTerm.app")), 0);
 
     let _guard = crate::ai::test_support::ENV_LOCK
@@ -1266,12 +1266,22 @@ fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
 
     assert_eq!(
         plain_lines,
-        vec!["    1234567", "    8901234", "    567890", "    abcdef"]
+        vec![
+            "    123456",
+            "    789012",
+            "    345678",
+            "    90",
+            "    abcdef"
+        ]
     );
-    assert_eq!(rows, 4);
+    assert_eq!(rows, 5);
+    assert!(
+        !window.ends_with('\n'),
+        "live fold body must keep the cursor on its last row"
+    );
     for visible in &plain_lines {
         assert!(
-            unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 11,
+            unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 10,
             "xterm.js rewrite line reaches delayed-wrap column: {visible:?}"
         );
     }
@@ -1279,6 +1289,17 @@ fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
     unsafe {
         std::env::remove_var("COLUMNS");
     }
+}
+
+#[test]
+fn fold_body_erase_starts_from_the_last_rendered_row() {
+    let mut one_row = Vec::new();
+    erase_fold_body(&mut one_row, 1).expect("erase one-row fold body");
+    assert_eq!(one_row, b"\r\x1b[0J");
+
+    let mut four_rows = Vec::new();
+    erase_fold_body(&mut four_rows, 4).expect("erase four-row fold body");
+    assert_eq!(four_rows, b"\r\x1b[3A\x1b[0J");
 }
 
 #[test]

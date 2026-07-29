@@ -15,8 +15,8 @@ use super::{
     markdown::messages_to_markdown,
     sqlite::{
         backup_sqlite, read_all_messages_sqlite, read_first_user_prompt_sqlite,
-        read_session_title_origin_sqlite, read_session_title_sqlite,
-        remap_context_checkpoint_paths_sqlite,
+        read_session_list_metadata_sqlite, read_session_title_origin_sqlite,
+        read_session_title_sqlite, remap_context_checkpoint_paths_sqlite,
         write_session_title_sqlite,
     },
     types::Message,
@@ -175,9 +175,12 @@ impl SessionStore {
                 Err(_) => continue,
             };
             let modified_local = metadata.modified().ok().map(DateTime::<Local>::from);
-            let first_user_prompt = read_first_user_prompt_sqlite(&path).unwrap_or(None);
-            // 优先使用 LLM 生成的标题（存储在 meta 表中），fallback 到首条消息摘要
-            let generated_title = read_session_title_sqlite(&path).unwrap_or(None);
+            let (first_user_prompt, generated_title) =
+                match read_session_list_metadata_sqlite(&path) {
+                    Ok(metadata) => (metadata.first_user_prompt, metadata.session_title),
+                    Err(_) => (None, None),
+                };
+            // 优先使用 LLM 生成的标题（存储在 meta 表中），fallback 到首条消息摘要。
             let summary = generated_title
                 .as_deref()
                 .map(normalize_generated_session_title)

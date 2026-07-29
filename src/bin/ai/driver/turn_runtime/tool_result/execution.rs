@@ -386,6 +386,14 @@ fn repeat_guarded_read_only_tool_name(name: &str) -> bool {
         return false;
     }
 
+    // 浏览器类工具读取的是"当前页面"这一可变外部状态：同一个 turn 内 navigate/click/
+    // type_text/scroll 等中途操作会改变页面，因此同名同参的 get_text/get_html/list_tabs
+    // 并非重复调用。它们不是参数的纯函数，不能纳入通用只读去重——否则导航到新页面后重新
+    // 读取会被误判为重复而抑制，逼模型改用 evaluate_js 之类兜底。
+    if lower.contains("browser") {
+        return false;
+    }
+
     let reusable = [
         "search", "find", "read", "get", "list", "view", "fetch", "export",
     ];
@@ -2348,6 +2356,27 @@ mod tests {
     }
 
     #[test]
+    fn browser_read_after_navigation_is_not_suppressed_as_duplicate() {
+        // 浏览器读取的是「当前页面」这一可变外部状态：navigate 到新页面后，同名同参的
+        // get_text 是对新页面的全新读取，不能因签名相同而被误判为重复抑制。
+        let read_args = serde_json::json!({ "selector": "body" });
+        let previous = test_tool_call("call_previous", "mcp_browser_get_text", read_args.clone());
+        let current = test_tool_call("call_current", "mcp_browser_get_text", read_args);
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_previous", "old page text"),
+            assistant_tool_call_message(test_tool_call(
+                "call_nav",
+                "mcp_browser_navigate",
+                serde_json::json!({ "url": "https://example.com/next" }),
+            )),
+            tool_result_message("call_nav", "navigated"),
+        ];
+
+        assert!(duplicate_read_only_call_ids(&messages, &[current]).is_empty());
+    }
+
+    #[test]
     fn repeated_mutating_tool_request_is_not_suppressed() {
         let args = serde_json::json!({ "command": "cargo check" });
         let previous = test_tool_call("call_previous", "execute_command", args.clone());
@@ -2939,9 +2968,16 @@ mod tests {
 
         let (window, _) = render_tty_tool_output_fold_window(&fold);
         assert_eq!(window.matches("lines folded").count(), 1);
-        assert!(!window.contains("line-1"));
-        assert!(window.contains("line-2"));
-        assert!(window.contains(&format!("line-{}", TOOL_OUTPUT_FOLD_MAX_VISIBLE + 1)));
+        // 逐行去掉 ANSI 与 `  │ ` 前缀后按**精确**正文序列比较，而非 `contains("line-1")`：
+        // line-10..line-19 等可见行都把 "line-1" 当子串包含，子串断言会假失败（MAX_VISIBLE
+        // 从 8 提到 64 后暴露的测试脆弱性）。精确序列已同时证明 line-1 被折叠、其余按序保留。
+        let body_tokens = window
+            .lines()
+            .map(|line| crate::ai::driver::print::sanitize_for_terminal(line))
+            .filter_map(|line| line.rsplit("│ ").next().map(str::to_string))
+            .filter(|body| !body.contains("lines folded"))
+            .collect::<Vec<_>>();
+        assert_eq!(body_tokens, expected_owned);
 
         unsafe {
             std::env::remove_var("COLUMNS");

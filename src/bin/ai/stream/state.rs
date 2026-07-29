@@ -139,7 +139,8 @@ pub(super) struct ThinkingFoldState {
     pub(super) current_line: String,
     /// 总完成行数（含已被折叠的）
     pub(super) total_lines: usize,
-    /// 当前折叠窗口（仅正文，不含 header）占用的 terminal 物理行数
+    /// 当前折叠窗口（仅正文，不含 header）占用的 terminal 物理行数。光标停在正文
+    /// 最后一行，而不是窗口下方的空白行；重画时只需向上移动 `window_rows - 1`。
     pub(super) window_rows: usize,
     /// 上次真正写到 terminal 的正文纯文本行（含缩进/截断，不含 ANSI / header），用于在
     /// terminal resize 后按**当前**列宽重算旧窗口会占多少物理行，避免 cursor-up 擦不干净。

@@ -17,7 +17,7 @@ mod types;
 #[cfg(test)]
 use aux::{SESSION_TITLE_BODY_TIMEOUT_SECS, SESSION_TITLE_REQUEST_TIMEOUT_SECS};
 pub(crate) use aux::{
-    charge_llm_usage_to_kernel, charge_llm_usage_via_kernel, generate_session_title_via_model,
+    charge_llm_usage_to_kernel, generate_session_title_via_model,
     summarize_history_via_model,
 };
 #[allow(unused_imports)]
@@ -39,7 +39,7 @@ pub(in crate::ai) use logging::emit_request_diagnostic;
 pub(in crate::ai) use logging::request_diagnostics_enabled;
 #[cfg(test)]
 use protocol::responses_reasoning_replay_stats;
-pub(crate) use protocol::{build_http_body_for_json_messages, extract_response_text};
+pub(crate) use protocol::extract_response_text;
 #[cfg(test)]
 pub(crate) use reasoning::apply_aux_thinking_fields;
 #[allow(unused_imports)]
