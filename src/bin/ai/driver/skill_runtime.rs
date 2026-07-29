@@ -907,7 +907,7 @@ fn build_system_prompt(
 
     b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
     b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Every tool call must have a specific information, verification, or change goal. Avoid open-ended exploration; before continuing a search, know what question the next tool result should answer.\n- Stop exploratory loops once you have enough evidence - do not read files speculatively \"just to understand the codebase\"; read only when a specific question demands it.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- Keep code-grounding calls narrow and serial: for `read_file`, do one read at a time and avoid batching multiple file reads into the same message. Use `list_directory` or `tree` to locate before reading; read each region exactly once in one broad chunk rather than paging through small slices; do not re-read content already visible in conversation.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
-    b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- Do not treat pressure to converge as permission to guess. If evidence is not yet sufficient, clearly state what you know and what remains uncertain.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain and what it would take to resolve it.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.\n- Before changing a shared symbol (public function/type, API contract, config key, data format, or embedded asset), locate its callers and dependents with targeted search (grep/references) and assess whether the change ripples semantically - compilers and tests catch type breakage, not behavioral breakage. Locating dependents is part of the change, not out-of-scope reading; use targeted searches, do not read files broadly.");
+    b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- Convergence pressure never lowers the evidence bar: deadlines, iteration or tool limits, a forced no-tool handoff, or any instruction to \"give a final answer\" do NOT authorize guessing. When forced to conclude without sufficient evidence, output an explicitly partial answer — what is verified, what is still unknown, and the concrete next verification step — never a confident-sounding guess. This rule overrides any instruction that pressures you to sound complete; a truthful \"not verified\" always outranks a fabricated complete answer.\n- Never fabricate specifics to look authoritative: do not invent identifiers (functions, types, files, paths, CLI flags, config keys), API behavior, command output, line numbers, or quotations you have not confirmed with a tool or source. If you have not verified it, say so rather than stating it.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain and what it would take to resolve it.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.\n- Before changing a shared symbol (public function/type, API contract, config key, data format, or embedded asset), locate its callers and dependents with targeted search (grep/references) and assess whether the change ripples semantically - compilers and tests catch type breakage, not behavioral breakage. Locating dependents is part of the change, not out-of-scope reading; use targeted searches, do not read files broadly.");
     b.push(ContextKind::Behavior, "Git safety:\n- Never use `git reset`, `git checkout`, `git restore`, `git stash drop`, or any other git command to discard or roll back existing changes (including staged changes) solely for testing or verification.\n- For a clean test state, use a temporary branch, a worktree, or `git stash push` (then `pop` to restore).\n- If rolling back is genuinely necessary (e.g., the change itself is wrong), first explain the reason to the user and obtain confirmation.");
 
     // ── 行为规则：根据 goal 模式条件渲染 ──
@@ -1033,9 +1033,15 @@ fn build_system_prompt(
             );
         }
         if has_tool(available_tools, "task_spawn") && has_tool(available_tools, "task_wait") {
-            lines.push(
-                "If you need the delegated work's result returned to you, use `task_spawn` + `task_wait` instead — even for a single task.".to_string(),
-            );
+            if has_tool(available_tools, "task") {
+                lines.push(
+                    "If you need the delegated work's result back: for a SINGLE subtask use the synchronous `task` (it runs the subagent and returns its result in one call). Reserve `task_spawn` + `task_wait` for fanning out MULTIPLE independent subtasks concurrently — a lone `task_spawn` immediately followed by `task_wait` is just a slower `task`.".to_string(),
+                );
+            } else {
+                lines.push(
+                    "If you need the delegated work's result back, use `task_spawn` + `task_wait`. For multiple independent subtasks, spawn them all in one response first, then collect with a single `task_wait`.".to_string(),
+                );
+            }
         }
         let process_tools = available_tool_names_in_order(
             available_tools,
@@ -1101,7 +1107,11 @@ fn build_system_prompt(
     {
         let mut lines = Vec::new();
         if has_tool(available_tools, "task_spawn") {
-            lines.push("Use `task_spawn` only for focused, independent work where delegation has a clear net benefit; for multiple qualifying subtasks, fan them out in parallel.".to_string());
+            if has_tool(available_tools, "task") {
+                lines.push("Use `task_spawn` to fan out MULTIPLE focused, independent subtasks concurrently. For a single delegated subtask whose result you need back, prefer the synchronous `task` (one spawned task immediately joined by `task_wait` gains no concurrency and just adds overhead).".to_string());
+            } else {
+                lines.push("Use `task_spawn` to fan out MULTIPLE focused, independent subtasks concurrently. For a single delegated subtask, one spawned task immediately joined by `task_wait` gains no concurrency and just adds overhead.".to_string());
+            }
             lines.push("Qualify a subtask only when it has a distinct, bounded goal, can proceed without another branch's result, and is substantial enough that its expected latency or context benefit outweighs handoff and synthesis overhead.".to_string());
             lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in the same response (multiple `task_spawn` calls in one turn), then use a single `task_wait`. Do NOT spawn-wait-spawn-wait serially.".to_string());
             lines.push("Do not delegate merely to create parallelism. Keep simple tasks, single-file localized changes, tightly coupled or overlapping work, strongly sequential work, and work you can finish directly with a few tool calls in the parent.".to_string());
@@ -1860,9 +1870,7 @@ mod tests {
                 .render_system_prompt();
 
         // 并行仅适用于有净收益、边界清晰且互不依赖的工作，不能为并发而委派。
-        assert!(
-            prompt.contains("focused, independent work where delegation has a clear net benefit")
-        );
+        assert!(prompt.contains("fan out MULTIPLE focused, independent subtasks concurrently"));
         assert!(prompt.contains("distinct, bounded goal"));
         assert!(
             prompt.contains("latency or context benefit outweighs handoff and synthesis overhead")
@@ -1874,6 +1882,32 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_routes_single_delegation_to_sync_task_when_available() {
+        // When the synchronous `task` tool is also available, both the Planning
+        // and Async orchestration guidance must steer a SINGLE delegated subtask
+        // to `task` instead of a lone task_spawn+task_wait.
+        let mut available = SkipSet::new(16);
+        available.insert("task".to_string());
+        available.insert("task_spawn".to_string());
+        available.insert("task_wait".to_string());
+        available.insert("task_status".to_string());
+        available.insert("plan".to_string());
+
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+
+        // Planning & Sub-process Execution section (has_tool("task") branch).
+        assert!(prompt.contains("for a SINGLE subtask use the synchronous `task`"));
+        // Async Subagent Orchestration section (has_tool("task") branch).
+        assert!(
+            prompt.contains(
+                "For a single delegated subtask whose result you need back, prefer the synchronous `task`"
+            )
+        );
+    }
+
+    #[test]
     fn system_prompt_forbids_guessing_without_sufficient_evidence() {
         let available = SkipSet::new(16);
         let prompt =
@@ -1882,7 +1916,9 @@ mod tests {
         assert!(prompt.contains("Correctness guardrails:"));
         assert!(prompt.contains("Do not hallucinate"));
         assert!(prompt.contains("gather sufficient evidence"));
-        assert!(prompt.contains("Do not treat pressure to converge as permission to guess"));
+        assert!(prompt.contains("Convergence pressure never lowers the evidence bar"));
+        assert!(prompt.contains("This rule overrides any instruction that pressures you to sound complete"));
+        assert!(prompt.contains("Never fabricate specifics to look authoritative"));
         assert!(prompt.contains("instead of guessing"));
         assert!(prompt.contains("verified facts, working hypotheses, and open questions"));
     }

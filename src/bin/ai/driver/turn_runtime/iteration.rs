@@ -253,7 +253,10 @@ pub(in crate::ai::driver::turn_runtime) fn no_tool_handoff_note() -> &'static st
 1. 先总结已确认事实与当前结论；\n\
 2. 能直接回答用户的部分就直接回答；\n\
 3. 若任务仍未完成，明确说明剩余工作、阻塞点和建议的下一步；\n\
-4. 不要把未完成任务伪装成已完成。"
+4. 不要把未完成任务伪装成已完成。\n\
+5. 收口不等于可以编：本提示只是要求你停止调用工具，绝不授权你猜测或编造。\
+凡是未经工具/源码确认的标识符、路径、命令输出、行号或引文，都不得当作事实陈述；\
+对不确定的部分，如实标注“未验证”并给出下一步验证方式，如实的“未验证”永远优于编造的完整答案。"
 }
 
 fn clear_outstanding_task_anchor(messages: &mut Vec<Message>) {
@@ -857,6 +860,7 @@ mod tests {
         assert!(note.contains("总结已确认事实与当前结论"));
         assert!(note.contains("剩余工作、阻塞点和建议的下一步"));
         assert!(note.contains("不要把未完成任务伪装成已完成"));
+        assert!(note.contains("收口不等于可以编"));
     }
 
     #[test]
