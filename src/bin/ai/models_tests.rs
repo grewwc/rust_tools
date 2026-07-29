@@ -3,8 +3,8 @@ use super::{
     auto_subagent_model_for_agent, classify_subagent_task_difficulty, default_model,
     determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
     endpoint_supports_anonymous_auth, initial_model, merge_agent_tier_with_difficulty,
-    model_adapter, model_platform_label, model_quality_tier, parse_disabled_model_tokens,
-    request_model_name, request_protocol_dialect,
+    context_window_tokens, max_output_tokens, model_adapter, model_platform_label,
+    model_quality_tier, parse_disabled_model_tokens, request_model_name, request_protocol_dialect,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 use crate::ai::cli::ParsedCli;
@@ -312,6 +312,10 @@ fn platform_changes_model_handle_but_legacy_adapter_handle_still_resolves() {
     assert_eq!(super::model_names::model_handle(def), volcano);
     assert_eq!(determine_model("glm-5.2-compatible"), volcano);
     assert_eq!(model_platform_label(volcano), "volcano");
+    // 火山 Coding Plan 官方 OpenCode 配置声明 1,024K context / 64K output。
+    // 这里必须显式配置，不能回退到 flagship 的保守 256K 默认窗口。
+    assert_eq!(context_window_tokens(volcano), 1_024_000);
+    assert_eq!(max_output_tokens(volcano), Some(65_536));
 }
 
 #[test]

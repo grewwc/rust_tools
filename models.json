@@ -223,7 +223,8 @@
     "reasoning_content_replay": true,
     "default_reasoning_effort": "xhigh",
     "subagent_priority": 50,
-    "max_output_tokens": 128000
+    "context_window_tokens": 1024000,
+    "max_output_tokens": 65536
   },
   {
     "key": "doubao-seed-2.1-turbo",
