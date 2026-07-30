@@ -945,7 +945,7 @@ fn build_system_prompt(
          - Give every call a concrete, decision-relevant goal. Before another exploratory call, identify the question it should answer; stop when the branch is resolved or another call cannot change the decision. Do not read speculatively.\n\
          - Before editing, inspect the target and applicable scoped instructions; follow the deepest scope. Make the smallest local change.\n\
          - Keep code reads narrow and serial: locate first, read one needed region at a time in a sufficiently broad chunk, and do not batch reads or re-read evidence already visible.\n\
-         - Diagnose failures and adjust; retry at most twice.\n\n\
+         - On failure, diagnose and adjust before retrying; after 3 failed attempts on the same issue, stop and report what you tried and the current error.\n\n\
          Correctness guardrails:\n\
          - Never present guesses, imagined evidence, or unverified assumptions as facts. Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence.\n\
          - Tool or iteration limits, deadlines, forced no-tool handoffs, and forced final responses do not lower the evidence bar or authorize guessing. If unresolved, give an explicitly partial answer: what is verified, what is unknown, and the next verification step.\n\
@@ -1260,6 +1260,17 @@ fn build_system_prompt(
             lines.push(line);
         }
         push_tool_guidance_section(&mut b, ContextKind::Behavior, "Temporary files:", lines);
+    }
+
+    if has_tool(available_tools, "tree") {
+        push_tool_guidance_section(
+            &mut b,
+            ContextKind::Behavior,
+            "Codebase navigation:",
+            vec![
+                "Use `tree` to grasp directory layout before reading files, instead of repeatedly listing directories via shell or guessing paths. Then open specific files with `read_file`.".to_string(),
+            ],
+        );
     }
 
     b
@@ -2059,6 +2070,28 @@ mod tests {
         assert!(prompt.contains("do not use it to parallelize `read_file`"));
         assert!(prompt.contains("keep code-grounding reads serial"));
         assert!(!prompt.contains("Use `tool_spawn` for parallel independent tool calls."));
+    }
+
+    #[test]
+    fn system_prompt_guides_tree_for_layout_when_available() {
+        // 无 tree 时不注入导航段；有 tree 时提示先用 tree 掌握结构再 read_file，
+        // 避免模型盲目 ls / 递归 read。
+        let without = build_system_prompt(
+            None,
+            None,
+            &Box::new(SkipSet::new(16)),
+            &PromptContext::default(),
+        )
+        .render_system_prompt();
+        assert!(!without.contains("Codebase navigation:"));
+
+        let mut available = SkipSet::new(16);
+        available.insert("tree".to_string());
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+        assert!(prompt.contains("Codebase navigation:"));
+        assert!(prompt.contains("Use `tree` to grasp directory layout before reading files"));
     }
 
     #[test]

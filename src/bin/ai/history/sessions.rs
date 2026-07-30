@@ -262,6 +262,46 @@ impl SessionStore {
         Ok(sessions.into_iter().map(|(_, v)| v).collect())
     }
 
+    /// 只读取一个 session 的恢复预览信息，避免启动恢复时扫描并统计全部 session。
+    pub(in crate::ai) fn read_session_preview(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<(Option<String>, Option<DateTime<Local>>)>> {
+        Self::validate_session_id(session_id)?;
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let file_modified = path.metadata().ok().and_then(|metadata| metadata.modified().ok());
+        let (first_user_prompt, generated_title, last_activity_unix_ms) =
+            match read_session_list_metadata_sqlite(&path) {
+                Ok(metadata) => (
+                    metadata.first_user_prompt,
+                    metadata.session_title,
+                    metadata.last_activity_unix_ms,
+                ),
+                Err(_) => (None, None, None),
+            };
+        let modified_local = last_activity_unix_ms
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+            .map(|time| time.with_timezone(&Local))
+            .or_else(|| file_modified.map(DateTime::<Local>::from));
+        let summary = generated_title
+            .as_deref()
+            .map(normalize_generated_session_title)
+            .filter(|title| !title.is_empty())
+            .or_else(|| {
+                first_user_prompt
+                    .as_deref()
+                    .map(generate_session_summary)
+                    .map(|summary| normalize_generated_session_title(&summary))
+                    .filter(|summary| !summary.is_empty())
+            });
+
+        Ok(Some((summary, modified_local)))
+    }
+
     fn session_size_bytes(
         &self,
         sqlite_path: &Path,

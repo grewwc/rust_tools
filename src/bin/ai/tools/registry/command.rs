@@ -13,19 +13,19 @@ fn params_execute_command() -> Value {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Shell command to execute. Destructive/network/escalation commands are blocked. To start a long-running server (e.g. `flask`/`python app.py`/`npm run dev`), background it and redirect its output to a log file, otherwise it will block until timeout: `python app.py > /tmp/app.log 2>&1 & sleep 2 && curl -s localhost:5566/...`. Never run a foreground server directly."
+                "description": "Shell command to run. For long-running servers, background and redirect output: `cmd > /tmp/app.log 2>&1 & sleep 2 && curl -s localhost:PORT/...`. Never run a foreground server directly."
             },
             "cwd": {
                 "type": "string",
-                "description": "Optional working directory for the command (default: current directory)."
+                "description": "Working directory (default: current directory)."
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in seconds (1-300; default: 30)."
+                "description": "Timeout in seconds, 1-300 (default: 30)."
             },
             "pty": {
                 "type": "boolean",
-                "description": "Required execution-mode decision. Set true when an interactive terminal-dependent CLI must render a QR code, prompt, or full-screen interface; set false for ordinary commands so their output keeps normal pipe semantics. The tool cannot forward keyboard input."
+                "description": "Required. Use true for interactive CLIs (QR codes, prompts, full-screen); false otherwise. No keyboard input forwarding."
             }
         },
         "required": ["command", "pty"]
@@ -42,7 +42,7 @@ fn execute_command_streaming_registered(
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "execute_command",
-        description: "Run a shell command with an optional working directory and timeout. Every call must explicitly choose `pty`: use true for terminal-dependent QR codes/prompts/full-screen CLIs and false for ordinary commands. Destructive/network/escalation commands are blocked. Output is truncated past a char cap; when truncated the result states how much was shown vs. total and warns that unseen matches may be in the cut-off tail (narrow/page instead of re-running variants). Failures include the exit code.",
+        description: "Run a shell command. Destructive/network/escalation commands are blocked. Output is truncated past a char cap with shown-vs-total counts; narrow or page instead of re-running with different variants. Failures include exit code.",
         parameters: params_execute_command,
         execute: execute_command,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

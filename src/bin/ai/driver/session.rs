@@ -6,7 +6,6 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
 use crate::ai::{
@@ -40,7 +39,6 @@ pub(super) fn build_suspended_session_previews(
     persona_store: &crate::ai::persona::PersonaStore,
 ) -> Vec<SuspendedSessionPreview> {
     let personas = persona_store.list_personas().unwrap_or_default();
-    let mut sessions_by_history: FxHashMap<PathBuf, Vec<_>> = FxHashMap::default();
 
     entries
         .into_iter()
@@ -50,24 +48,21 @@ pub(super) fn build_suspended_session_previews(
                 .find(|persona| persona.id == entry.persona_id)
                 .map(|persona| persona.name.clone())
                 .unwrap_or_else(|| entry.persona_id.clone());
-            let session_info = sessions_by_history
-                .entry(entry.history_file.clone())
-                .or_insert_with(|| {
-                    SessionStore::new(entry.history_file.as_path())
-                        .list_sessions()
-                        .unwrap_or_default()
+            let (summary, modified_label) = SessionStore::new(entry.history_file.as_path())
+                .read_session_preview(&entry.session_id)
+                .ok()
+                .flatten()
+                .map(|(summary, modified_local)| {
+                    (
+                        summary,
+                        modified_local.map(|dt| dt.format("%Y-%m-%d %H:%M").to_string()),
+                    )
                 })
-                .iter()
-                .find(|session| session.id == entry.session_id);
+                .unwrap_or_default();
             SuspendedSessionPreview {
                 persona_label,
-                summary: session_info.and_then(|session| session.summary.clone()),
-                modified_label: session_info.and_then(|session| {
-                    session
-                        .modified_local
-                        .as_ref()
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                }),
+                summary,
+                modified_label,
                 suspended_label: format_suspended_timestamp_label(&entry.suspended_at),
                 entry,
             }

@@ -1,9 +1,0 @@
----
-name: explore
-description: "DEPRECATED: removed, kept as disabled stub for file-system compatibility"
-mode: subagent
-disabled: true
-hidden: true
----
-
-This agent has been removed. Use the build agent instead.

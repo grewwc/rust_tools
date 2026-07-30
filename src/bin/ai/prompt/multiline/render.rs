@@ -205,6 +205,8 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     // 设置对齐方式
     textarea.set_alignment(Alignment::Left);
+    // 设置输入文字颜色：柔和的灰白色，在深色背景上清晰可读且与整体主题协调
+    textarea.set_style(Style::default().fg(Color::Rgb(220, 225, 235)));
     // tui-textarea 默认用 REVERSED 空格把 cursor 画进 buffer；在 ratatui inline
     // viewport 下，resize 重锚会把这块"画出来的 cursor"推进 scrollback，表现为
     // 每次侧栏展开/收回都多一个白色 cursor 残影。这里禁用 buffer cursor，改用

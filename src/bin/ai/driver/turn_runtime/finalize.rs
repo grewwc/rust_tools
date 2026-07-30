@@ -438,6 +438,10 @@ pub(super) async fn finalize_turn(
 /// 条件：至少有 1 个 user turn，且没有已生成标题或现有标题质量过低。
 pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: bool) {
     let store = session_title_store(&app.config.history_file);
+    // 已有模型标题的恢复 session 不需要为标题检查解码整段 canonical history。
+    if store.has_generated_title(&app.session_id) {
+        return;
+    }
     if !store
         .read_all_messages(&app.session_id)
         .is_ok_and(|messages| has_session_title_source(&messages))
