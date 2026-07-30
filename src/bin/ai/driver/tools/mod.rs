@@ -263,9 +263,6 @@ fn remediation_hint(
         if tool_visible_in_current_turn(available_tool_names, "read_file") {
             fallback.push("read files (whole or precise line ranges) with `read_file`");
         }
-        if tool_visible_in_current_turn(available_tool_names, "list_directory") {
-            fallback.push("inspect directories with `list_directory`");
-        }
         if !fallback.is_empty() {
             return Some(format!(
                 "Suggestion: if this failure is intrinsic (not a transient I/O error), break the command into smaller pieces or {} instead of running shell just to inspect state.",

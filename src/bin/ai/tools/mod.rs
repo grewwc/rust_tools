@@ -8,7 +8,6 @@ mod permissions;
 mod plan_tools;
 mod rag_tools;
 pub(crate) mod registry;
-mod search_tools;
 pub(crate) mod service;
 pub(crate) mod skill_tools;
 pub(crate) mod storage;
@@ -32,7 +31,6 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "load_skill",
     "enable_tools",
     "read_file",
-    "list_directory",
     "task",
     "task_spawn",
     "task_wait",

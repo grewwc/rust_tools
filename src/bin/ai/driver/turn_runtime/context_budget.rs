@@ -589,7 +589,7 @@ mod tests {
         let system = msg("system", "system prompt must stay exact");
         let current_user = msg("user", "latest user input must stay exact");
         let duplicate_note = msg(crate::ai::history::ROLE_INTERNAL_NOTE, "same reminder");
-        let tool_call = assistant_tool_call("call-1", "list_directory");
+        let tool_call = assistant_tool_call("call-1", "read_file");
         let mut messages = vec![
             system.clone(),
             duplicate_note.clone(),
@@ -662,7 +662,7 @@ mod tests {
         ];
         for i in 0..6usize {
             let id = format!("recent-{i}");
-            messages.push(assistant_tool_call(&id, "list_directory"));
+            messages.push(assistant_tool_call(&id, "execute_command"));
             messages.push(tool_result(&id, format!("recent tool output {i}")));
         }
         messages.push(current_user.clone());

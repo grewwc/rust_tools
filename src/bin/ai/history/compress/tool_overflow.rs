@@ -939,7 +939,7 @@ pub(super) fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str)
             }
             lines
         }
-        "list_directory" | "tree" => value_string_from_keys(&args, &["path"])
+        "tree" => value_string_from_keys(&args, &["path"])
             .map(|path| {
                 vec![format!(
                     "- original_path: {}",

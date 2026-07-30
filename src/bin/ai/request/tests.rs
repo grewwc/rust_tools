@@ -1978,7 +1978,7 @@ fn strip_unavailable_tool_hints_removes_internal_note_tool_hint() {
             reasoning_content: None,
         }];
 
-    let available = ["read_file", "list_directory"]
+    let available = ["read_file", "tree"]
         .into_iter()
         .map(|name| name.to_string())
         .collect();

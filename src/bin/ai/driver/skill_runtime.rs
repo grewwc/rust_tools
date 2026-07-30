@@ -644,11 +644,6 @@ const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
         ],
         hint: "For Feishu/Lark docs or sheets, enable the relevant MCP tools before proceeding.",
     },
-    CapabilityEntry {
-        use_case: "Inspect directory contents or enumerate files in a folder.",
-        tools: &["list_directory"],
-        hint: "",
-    },
 ];
 
 fn build_capability_catalog(available_tools: &Box<SkipSet<String>>) -> Option<String> {
@@ -2743,7 +2738,6 @@ mod tests {
         // 基础只读 / 检索能力应作为 baseline 常驻补回，避免窄白名单 skill 把
         // read_file 等最基本的阅读工具剔除，导致主 Agent 连用户点名的文件都读不了。
         assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"list_directory".to_string()));
         // 子 Agent 编排能力应作为 baseline 常驻补回，避免 skill 白名单把 task_*
         // 全部剔除导致主 Agent 失去委派子 Agent 的能力。
         assert!(names.contains(&"task".to_string()));

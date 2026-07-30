@@ -1801,9 +1801,9 @@ mod tests {
 
     #[test]
     fn detect_tool_loop_triggers_for_short_periodic_cycles() {
-        let a = vec!["list_directory::{\"path\":\"src\"}".to_string()];
+        let a = vec!["tree::{\"path\":\"src\"}".to_string()];
         let b = vec!["read_file::{\"path\":\"src/bin/a.rs\"}".to_string()];
-        let c = vec!["list_directory::{\"path\":\"src/bin\"}".to_string()];
+        let c = vec!["tree::{\"path\":\"src/bin\"}".to_string()];
 
         assert!(detect_tool_loop(
             &[a.clone(), b.clone(), a.clone(), b.clone()],
@@ -2784,7 +2784,7 @@ mod tests {
     }
 
     /// 混合工具轮里同一目标反复取证：每轮都读同一个文件 A，但穿插一个每轮都不同的
-    /// list_directory，使整轮 exact/coarse 签名各不相等而逃过 detect_tool_loop；此时
+    /// tree，使整轮 exact/coarse 签名各不相等而逃过 detect_tool_loop；此时
     /// 目标交集检测应抓到「A 每轮都在」并发出一次 TargetRepeat。
     #[test]
     fn turn_supervisor_emits_target_repeat_for_mixed_tool_rounds_on_same_file() {
@@ -2807,7 +2807,7 @@ mod tests {
                         id: format!("search-{i}"),
                         tool_type: "function".to_string(),
                         function: crate::ai::types::FunctionCall {
-                            name: "list_directory".to_string(),
+                            name: "tree".to_string(),
                             arguments: format!("{{\"path\":\"src/probe_{i}\"}}"),
                         },
                     },

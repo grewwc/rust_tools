@@ -272,7 +272,7 @@ fn folded_archived_precision_tools_keep_original_invocation_anchors() {
             "execute_command",
             r#"{"command":"git status --short","cwd":"/repo"}"#,
         ),
-        ("list", "list_directory", r#"{"path":"src/bin/ai"}"#),
+        ("list", "tree", r#"{"path":"src/bin/ai"}"#),
     ];
     for (id, name, arguments) in cases {
         messages.push(assistant_call_args(id, name, arguments));

@@ -703,7 +703,7 @@ mod tests {
                     rationale: "visible".to_string(),
                 },
                 SuggestedToolCall {
-                    tool_name: "list_directory".to_string(),
+                    tool_name: "tree".to_string(),
                     arguments: Value::Null,
                     rationale: "hidden".to_string(),
                 },

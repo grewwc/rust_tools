@@ -1230,12 +1230,12 @@ fn collect_repo_inspection_findings(turn_messages: &[Message]) -> Vec<RepoInspec
 fn is_repo_inspection_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "read_file" | "list_directory" | "apply_patch" | "write_file"
+        "read_file" | "tree" | "apply_patch" | "write_file"
     )
 }
 
 fn is_raw_repo_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "read_file" | "list_directory")
+    matches!(tool_name, "read_file" | "tree")
 }
 
 fn is_write_tool(tool_name: &str) -> bool {
@@ -1298,7 +1298,7 @@ fn describe_tool_call(tool_call: &ToolCall) -> String {
                 format!("(file={path})")
             }
         }
-        "list_directory" => args
+        "tree" => args
             .get("path")
             .and_then(|v| v.as_str())
             .map(|path| format!("(path={})", truncate_inline(path, 64)))
@@ -1510,7 +1510,7 @@ mod tests {
     #[test]
     fn repo_inspection_tools_include_read_and_path_tools() {
         assert!(is_repo_inspection_tool("read_file"));
-        assert!(is_repo_inspection_tool("list_directory"));
+        assert!(is_repo_inspection_tool("tree"));
     }
 
     #[test]
@@ -1895,7 +1895,7 @@ mod tests {
                         "read_file",
                         serde_json::json!({"file_path":"src/lib.rs","offset":10,"limit":20}),
                     ),
-                    tool_call("2", "list_directory", serde_json::json!({"path":"src"})),
+                    tool_call("2", "tree", serde_json::json!({"path":"src"})),
                     tool_call(
                         "3",
                         "read_file",
@@ -1938,7 +1938,7 @@ mod tests {
         assert!(note.contains("read_file("));
         assert!(note.contains("\"file_path\":\"src/main.rs\""));
         assert!(note.contains("read_file(file=src/lib.rs, lines=10..29)"));
-        assert!(note.contains("list_directory(path=src)"));
+        assert!(note.contains("tree(path=src)"));
     }
 
     #[test]
@@ -1953,7 +1953,7 @@ mod tests {
                         "read_file",
                         serde_json::json!({"file_path":"src/lib.rs","offset":10,"limit":20}),
                     ),
-                    tool_call("2", "list_directory", serde_json::json!({"path":"src"})),
+                    tool_call("2", "tree", serde_json::json!({"path":"src"})),
                 ]),
                 tool_call_id: None,
                 reasoning_content: None,
@@ -1976,7 +1976,7 @@ mod tests {
 
         let findings = collect_repo_inspection_findings(&turn_messages);
         let note = build_code_inspection_working_memory(&turn_messages, &findings).expect("note");
-        assert!(note.contains("list_directory(path=src)"));
+        assert!(note.contains("tree(path=src)"));
     }
 
     #[test]

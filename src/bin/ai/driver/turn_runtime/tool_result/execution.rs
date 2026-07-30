@@ -545,6 +545,35 @@ fn patch_retry_requires_fresh_read(
     })
 }
 
+/// patch-retry 门控（[`patch_retry_requires_fresh_read`]）要求对失败目标重新
+/// `read_file` 才会把它移出 stale 账本、放行后续 patch；但只读去重
+/// （[`duplicate_read_only_call_ids`]）会把"同一 user turn 内同参数的重复 read_file"
+/// 判为重复而抑制。两个守卫叠加会互锁成活锁：门控逼模型重读 → 重读被去重抑制 →
+/// 账本无法清除 → patch 持续被拦（复现于 `search_tools.rs` 删除会话 idx 207–232：
+/// 连续 apply_patch retry blocked 与 read_file "already completed" 相互打死）。
+///
+/// 这里挑出"针对 stale-patch 目标的 read_file"调用 id，交由调用点将其移出抑制集合，
+/// 确保门控所要求的那次重读一定能真正执行——读成功后 [`update_stale_patch_targets`]
+/// 会把目标移出账本，下一轮 patch 即可放行。读成功后目标离开账本，同文件的后续
+/// read_file 又回到常规去重保护之下，不会引入新的重复读循环。
+fn stale_patch_target_reads(
+    stale_patch_targets: &rustc_hash::FxHashSet<PathBuf>,
+    tool_calls: &[ToolCall],
+) -> HashSet<String> {
+    if stale_patch_targets.is_empty() {
+        return HashSet::new();
+    }
+    tool_calls
+        .iter()
+        .filter(|tool_call| tool_call.function.name == "read_file")
+        .filter(|tool_call| {
+            file_tool_target_path(tool_call)
+                .is_some_and(|path| stale_patch_targets.contains(&path))
+        })
+        .map(|tool_call| tool_call.id.clone())
+        .collect()
+}
+
 /// 依据本轮真实执行的工具调用及其结果，增量维护 [`App::stale_patch_targets`] 账本。
 ///
 /// 规则（与旧的消息扫描等价，但状态存活于内存账本、不受历史压缩影响）：
@@ -1938,6 +1967,14 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     messages,
                     &tool_call_execution.stream_result.tool_calls,
                 ));
+                // patch-retry 门控要求重读 stale 目标才能放行后续 patch；这次重读绝不能
+                // 被只读去重抑制，否则门控与去重互锁成活锁。放行门控指定的重读。
+                for call_id in stale_patch_target_reads(
+                    &app.stale_patch_targets,
+                    &tool_call_execution.stream_result.tool_calls,
+                ) {
+                    call_ids.remove(&call_id);
+                }
                 call_ids
             } else {
                 HashSet::new()
@@ -2310,7 +2347,7 @@ mod tests {
             tool_result_message("call_previous", "previous result"),
             assistant_tool_call_message(test_tool_call(
                 "call_other",
-                "list_directory",
+                "tree",
                 serde_json::json!({ "path": "/tmp" }),
             )),
             tool_result_message("call_other", "other.rs"),
@@ -2521,6 +2558,82 @@ mod tests {
 
         let ledger = ledger_from_messages(&messages);
         assert!(!patch_retry_requires_fresh_read(&ledger, &[retry]));
+    }
+
+    #[test]
+    fn stale_patch_target_read_is_exempt_from_duplicate_suppression() {
+        // 复现 search_tools.rs 删除会话的活锁：同一 user turn 内先读过该文件，
+        // 随后 apply_patch context mismatch 把它记入 stale 账本。此时门控要求重读，
+        // 但去重会把「同参数的重复 read_file」判为重复而抑制——两者互锁。
+        // stale_patch_target_reads 必须把这次门控要求的重读移出抑制集合。
+        let path = "/tmp/patch-target.rs";
+        let read_args = serde_json::json!({ "file_path": path });
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_first_read",
+                "read_file",
+                read_args.clone(),
+            )),
+            tool_result_message("call_first_read", "fn current() {}\n"),
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_patch",
+                "apply_patch",
+                serde_json::json!({ "file_path": path, "patch": "@@\n-old\n+new" }),
+            )),
+            tool_result_message(
+                "call_failed_patch",
+                "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+            ),
+        ];
+        let fresh_read = test_tool_call("call_fresh_read", "read_file", read_args);
+
+        // 去重本身仍会把这次重读判为重复（同 turn 同参数）。
+        assert_eq!(
+            duplicate_read_only_call_ids(&messages, std::slice::from_ref(&fresh_read)),
+            HashSet::from(["call_fresh_read".to_string()])
+        );
+
+        // 但门控要求重读 stale 目标，因此它必须被豁免。
+        let ledger = ledger_from_messages(&messages);
+        assert_eq!(
+            stale_patch_target_reads(&ledger, std::slice::from_ref(&fresh_read)),
+            HashSet::from(["call_fresh_read".to_string()])
+        );
+    }
+
+    #[test]
+    fn stale_patch_target_reads_ignores_unrelated_reads() {
+        // 账本为空、或读取的是非 stale 目标时，不得豁免任何读取——避免削弱常规去重。
+        let stale_path = "/tmp/stale.rs";
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_patch",
+                "apply_patch",
+                serde_json::json!({ "file_path": stale_path, "patch": "@@\n-old\n+new" }),
+            )),
+            tool_result_message(
+                "call_failed_patch",
+                "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+            ),
+        ];
+        let ledger = ledger_from_messages(&messages);
+
+        let unrelated_read = test_tool_call(
+            "call_other",
+            "read_file",
+            serde_json::json!({ "file_path": "/tmp/other.rs" }),
+        );
+        assert!(stale_patch_target_reads(&ledger, std::slice::from_ref(&unrelated_read)).is_empty());
+
+        let empty_ledger = rustc_hash::FxHashSet::default();
+        let stale_read = test_tool_call(
+            "call_stale",
+            "read_file",
+            serde_json::json!({ "file_path": stale_path }),
+        );
+        assert!(
+            stale_patch_target_reads(&empty_ledger, std::slice::from_ref(&stale_read)).is_empty()
+        );
     }
 
     #[test]

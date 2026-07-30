@@ -24,11 +24,6 @@ struct BarrierSpec {
 const BARRIER_SPECS: &[BarrierSpec] = &[
     BarrierSpec {
         route: ToolRouteKind::Builtin,
-        tool_name: "list_directory",
-        rule: BarrierRule::Always,
-    },
-    BarrierSpec {
-        route: ToolRouteKind::Builtin,
         tool_name: "web_search",
         rule: BarrierRule::Always,
     },
@@ -91,12 +86,6 @@ mod tests {
 
     #[test]
     fn barrier_builtin_and_mcp_rules_match_existing_behavior() {
-        assert!(should_barrier_after(
-            &ToolRoute::Builtin,
-            &tool_call("list_directory"),
-            true,
-            ""
-        ));
         assert!(!should_barrier_after(
             &ToolRoute::Builtin,
             &tool_call("read_file"),

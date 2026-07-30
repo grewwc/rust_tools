@@ -2451,7 +2451,7 @@ fn dedup_repeated_tool_results(
         // orphan 的保护逻辑（上面的 `!protected_indices.contains`）已经单独处理，
         // 不受这里影响。
         if tool_uses_content_identity_dedup(&occurrence.tool_name) {
-            // read_file/list_directory/检索类工具**内容不同的版本**必须零压缩保留（Invariant：
+            // read_file/检索类工具**内容不同的版本**必须零压缩保留（Invariant：
             // precision 结果不做 lossy 裁剪）。但**逐字节相同**的重复副本是纯冗余，
             // 折叠它们不丢失任何信息，且能直接消除"旧全文堆积 + 近端 offload 触发
             // 重读"的失忆环。用内容 hash 区分二者：hash 首见 → 保留全文并登记；
@@ -2529,7 +2529,7 @@ fn dedup_tool_occurrence(
 }
 
 fn tool_uses_content_identity_dedup(tool_name: &str) -> bool {
-    is_non_compressible_tool(tool_name) || tool_name == "list_directory"
+    is_non_compressible_tool(tool_name) || tool_name == "tree"
 }
 
 fn render_dedup_tool_stub(
@@ -2606,14 +2606,6 @@ fn dedup_tool_target_summary(tool_name: &str, args: &str) -> Option<String> {
             }
             if let Some(range) = dedup_read_file_range_summary(&args) {
                 fields.push(range);
-            }
-        }
-        "list_directory" => {
-            if let Some(path) = dedup_arg_string(&args, &["path"]) {
-                fields.push(format!(
-                    "path={}",
-                    truncate_to_chars(&normalize_whitespace(&path), 240)
-                ));
             }
         }
         "execute_command" | "run_command" | "shell" | "bash" => {

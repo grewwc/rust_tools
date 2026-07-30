@@ -304,7 +304,7 @@ fn tool_call_target_recall(tool_call: &ToolCall) -> String {
                 fields.push(format!("range: first {limit} lines"));
             }
         }
-        "list_directory" => {
+        "tree" => {
             if let Some(path) = arg_string(&args, &["path"]) {
                 fields.push(format!(
                     "path: {}",

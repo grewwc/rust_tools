@@ -136,11 +136,8 @@ fn parallel_batch_stops_at_mutating_tool() {
 #[test]
 fn parallel_batch_excludes_barriering_tools() {
     let mcp = McpClient::new();
-    // list_directory / web_search 会触发 barrier，必须顺序执行。
-    assert!(!is_parallel_safe_tool_call(
-        &mcp,
-        &tool_call("list_directory")
-    ));
+    // tree 不可缓存、web_search 会触发 barrier，均必须顺序执行。
+    assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("tree")));
     assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("web_search")));
 }
 
@@ -448,7 +445,7 @@ fn tool_cache_requires_file_fingerprints() {
         &json!({"query":"durable preference"})
     ));
     assert!(!should_store_or_load_tool_cache(
-        "list_directory",
+        "tree",
         &json!({"path": path.parent().unwrap().to_string_lossy()})
     ));
 

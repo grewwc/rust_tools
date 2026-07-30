@@ -1253,49 +1253,6 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
     );
 }
 
-#[test]
-fn compression_dedup_stub_preserves_identical_list_directory_call_context() {
-    let mut messages = vec![Message {
-        role: "system".to_string(),
-        content: Value::String("system prompt".to_string()),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    }];
-
-    for id in ["list-1", "list-2"] {
-        let (assistant, tool) = tool_call_pair(
-            id,
-            "list_directory",
-            r#"{"path":"/repo/src/bin/ai"}"#,
-            "driver/\nhistory/\ntools/",
-        );
-        messages.push(assistant);
-        messages.push(tool);
-    }
-
-    let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None);
-    let stub = compressed
-        .iter()
-        .filter_map(|m| m.content.as_str())
-        .find(|s| s.contains("byte-identical `list_directory`"))
-        .expect("duplicate list_directory result should collapse to a self-describing stub");
-
-    assert!(stub.contains("- original_tool_call_id: list-1"), "{stub}");
-    assert!(stub.contains("- canonical_tool_call_id: list-2"), "{stub}");
-    assert!(
-        stub.contains("- original_args: {\"path\":\"/repo/src/bin/ai\"}"),
-        "{stub}"
-    );
-    assert!(
-        stub.contains("- original_target: path=/repo/src/bin/ai"),
-        "{stub}"
-    );
-    assert!(
-        stub.contains("- preview: driver/ history/ tools/"),
-        "{stub}"
-    );
-}
 
 #[test]
 fn compression_spills_old_user_message_to_session_temp_file() {
@@ -2530,7 +2487,7 @@ fn context_history_summary_keeps_tool_names_and_results() {
                         id: format!("call_{i}"),
                         tool_type: "function".to_string(),
                         function: FunctionCall {
-                            name: "list_directory".to_string(),
+                            name: "tree".to_string(),
                             arguments: format!(r#"{{"path":"issue-{i}"}}"#),
                         },
                     }]),
@@ -2567,7 +2524,7 @@ fn context_history_summary_keeps_tool_names_and_results() {
         .to_string();
     assert!(summary.contains("工具证据摘要"));
     assert!(summary.contains("助手先前回答（未独立验证）"));
-    assert!(summary.contains("list_directory"));
+    assert!(summary.contains("tree"));
     assert!(summary.contains("issue-0"));
     assert!(summary.contains("ERROR") || summary.contains("repeated failure"));
 
