@@ -128,7 +128,10 @@ fn execute_plan(args: &Value) -> Result<String, String> {
         .iter()
         .filter_map(|s| {
             let d = s.get("delegate").and_then(|v| v.as_bool()).unwrap_or(false);
-            let p = s.get("parallelizable").and_then(|v| v.as_bool()).unwrap_or(false);
+            let p = s
+                .get("parallelizable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             Some(d || p)
         })
         .filter(|&b| b)

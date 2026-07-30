@@ -1,5 +1,5 @@
 //! Session PID 注册：每个 `a` 进程启动时在 sessions 目录下写入
-//! `<session_id>.pid` 文件，退出时自动删除。
+//! `<session_id>.<pid>.pid` 文件，退出时自动删除。
 //!
 //! `/proc` 命令通过扫描这些文件来发现所有正在运行的 session
 //! （前台 + `a -bg` 后台），而不是仅依赖 cwd 下的 `*.pid`（只有 `-bg` 才写）。
@@ -14,28 +14,19 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-/// 写入并管理 sessions 目录下的 `<session_id>.pid` 文件。
+/// 写入并管理 sessions 目录下的 `<session_id>.<pid>.pid` 文件。
 /// 创建时写入 PID，Drop 时删除文件。
 pub(in crate::ai) struct SessionPidGuard {
     path: Option<PathBuf>,
 }
 
 impl SessionPidGuard {
-    /// 在 `sessions_root` 目录下写入 `<session_id>.pid`，内容为当前进程 PID。
+    /// 在 `sessions_root` 目录下写入 `<session_id>.<pid>.pid`，内容为当前进程 PID。
     /// 如果写入失败只打印警告，不阻断启动。
     pub(in crate::ai) fn register(sessions_root: &std::path::Path, session_id: &str) -> Self {
-        let safe_id: String = session_id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        if safe_id.is_empty() {
-            return Self { path: None };
-        }
-        let path = sessions_root.join(format!("{safe_id}.pid"));
-        let pid = std::process::id();
-        match fs::write(&path, pid.to_string()) {
-            Ok(()) => Self { path: Some(path) },
-            Err(err) => {
+        match mark_session_pid(sessions_root, session_id, false) {
+            Ok(path) => Self { path: Some(path) },
+            Err((path, err)) => {
                 eprintln!(
                     "[Warning] 无法写入 session PID 文件 ({}): {err}",
                     path.display()
@@ -44,6 +35,41 @@ impl SessionPidGuard {
             }
         }
     }
+}
+
+/// 为当前进程额外登记一个活跃 session。
+///
+/// session 切换后保留旧标记是安全的：进程退出后扫描器会清理失效 PID；
+/// 更重要的是，prune 不会误删当前已经切换到的新 session。
+pub(in crate::ai) fn mark_session_pid(
+    sessions_root: &std::path::Path,
+    session_id: &str,
+    require_existing: bool,
+) -> Result<PathBuf, (PathBuf, io::Error)> {
+    let pid = std::process::id();
+    let safe_id: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let path = sessions_root.join(format!("{safe_id}.{pid}.pid"));
+    if safe_id.is_empty() {
+        return Err((
+            path,
+            io::Error::new(io::ErrorKind::InvalidInput, "session id 为空"),
+        ));
+    }
+    crate::ai::history::with_sessions_lifecycle_lock(sessions_root, || {
+        let history_path = sessions_root.join(format!("{safe_id}.sqlite"));
+        if require_existing && !history_path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("session '{}' no longer exists", session_id),
+            ));
+        }
+        fs::write(&path, pid.to_string())
+    })
+    .map(|()| path.clone())
+    .map_err(|err| (path, err))
 }
 
 impl Drop for SessionPidGuard {
@@ -97,7 +123,8 @@ fn dir_has_sqlite_files(dir: &std::path::Path) -> bool {
 }
 
 /// 扫描 sessions 目录下的所有 `*.pid` 文件，返回 (session_id, pid, alive) 列表。
-/// 会自动清理 PID 已死的残留文件。
+/// 同时兼容旧版 `<session_id>.pid` 和新版 `<session_id>.<pid>.pid`；会自动清理
+/// PID 已死的残留文件。
 pub(in crate::ai) fn scan_session_pids(
     sessions_root: &std::path::Path,
 ) -> io::Result<Vec<(String, i32, bool)>> {
@@ -132,7 +159,11 @@ pub(in crate::ai) fn scan_session_pids(
             // 清理残留的 PID 文件
             let _ = fs::remove_file(&path);
         }
-        found.push((stem.to_string(), pid, alive));
+        let session_id = stem
+            .rsplit_once('.')
+            .filter(|(_, marker_pid)| marker_pid.parse::<i32>().ok() == Some(pid))
+            .map_or(stem, |(session_id, _)| session_id);
+        found.push((session_id.to_string(), pid, alive));
     }
     // 按 session_id 排序保证输出稳定
     found.sort_by(|a, b| a.0.cmp(&b.0));
@@ -164,9 +195,10 @@ pub(in crate::ai) fn scan_all_session_pids(
         }
     }
 
-    // 去重：同一个 session_id 可能在多个目录出现，保留 alive 的
-    all.sort_by(|a, b| a.0.cmp(&b.0));
-    all.dedup_by(|a, b| a.0 == b.0);
+    // 去重：同一个 session_id / PID 可能在多个目录出现，保留一份即可；
+    // 同一 session 的不同进程必须全部保留。
+    all.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    all.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     Ok(all)
 }
 
@@ -304,7 +336,7 @@ mod tests {
 
         {
             let _guard = SessionPidGuard::register(&dir, sid);
-            let pid_path = dir.join(format!("{sid}.pid"));
+            let pid_path = dir.join(format!("{sid}.{}.pid", std::process::id()));
             assert!(
                 pid_path.exists(),
                 "PID file should exist while guard is alive"
@@ -315,7 +347,7 @@ mod tests {
         }
 
         // Drop 后文件应被删除
-        let pid_path = dir.join(format!("{sid}.pid"));
+        let pid_path = dir.join(format!("{sid}.{}.pid", std::process::id()));
         assert!(!pid_path.exists(), "PID file should be removed after drop");
 
         let _ = fs::remove_dir_all(&dir);
@@ -341,6 +373,64 @@ mod tests {
             assert!(*alive, "own PID should be alive");
             assert_eq!(*pid as u32, std::process::id());
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_process_markers_do_not_overwrite_each_other() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-tools-pid-multi-process-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let sid = "shared-session";
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let child_pid = i32::try_from(child.id()).unwrap();
+        let child_path = dir.join(format!("{sid}.{child_pid}.pid"));
+        fs::write(&child_path, child_pid.to_string()).unwrap();
+
+        {
+            let _guard = SessionPidGuard::register(&dir, sid);
+            let results = scan_session_pids(&dir).unwrap();
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|(session_id, _, alive)| session_id == sid && *alive)
+                    .count(),
+                2,
+                "同一 session 的两个活动进程都必须被发现"
+            );
+        }
+
+        assert!(
+            child_path.exists(),
+            "一个进程退出时不能删除另一个进程的 PID 标记"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_accepts_legacy_session_pid_file() {
+        let dir =
+            std::env::temp_dir().join(format!("rust-tools-pid-legacy-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let sid = "legacy-session";
+        fs::write(
+            dir.join(format!("{sid}.pid")),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+
+        let results = scan_session_pids(&dir).unwrap();
+        assert!(results.iter().any(|(session_id, pid, alive)| {
+            session_id == sid && *pid as u32 == std::process::id() && *alive
+        }));
 
         let _ = fs::remove_dir_all(&dir);
     }

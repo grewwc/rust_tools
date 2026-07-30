@@ -1,5 +1,6 @@
 use super::builder::MIN_OUTPUT_TOKENS_FLOOR;
 use super::*;
+use super::protocol::build_http_body_for_json_messages;
 use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
 use crate::ai::{cli::ParsedCli, types::AppConfig};
 use serde_json::Value;

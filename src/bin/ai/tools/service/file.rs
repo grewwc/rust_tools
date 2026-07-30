@@ -295,7 +295,7 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
     }
     store.write_all(content).map_err(|e| e.to_string())?;
 
-    // temp 文件写入成功后注册到持久化注册表，使其可被 delete_path 清理。
+    // temp 文件写入成功后注册到持久化注册表，供审计跟踪。
     if is_temp {
         let abs_path = store.path().display().to_string();
         super::super::storage::temp_registry::register(&abs_path)?;
@@ -332,7 +332,7 @@ pub(crate) fn execute_write_file_streaming(
     emit_stream_line(on_chunk, &format!("writing {} byte(s)", content.len()));
     store.write_all(content).map_err(|e| e.to_string())?;
 
-    // temp 文件写入成功后注册到持久化注册表，使其可被 delete_path 清理。
+    // temp 文件写入成功后注册到持久化注册表，供审计跟踪。
     if is_temp {
         let abs_path = store.path().display().to_string();
         super::super::storage::temp_registry::register(&abs_path)?;

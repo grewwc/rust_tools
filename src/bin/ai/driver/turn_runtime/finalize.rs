@@ -19,6 +19,10 @@ const SUBAGENT_TOOL_EVIDENCE_MAX_CHARS_PER_RESULT: usize = 700;
 const SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS: usize = 4_000;
 static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
+/// 与标题任务同构的 in-flight 去重：避免同一 session 同时跑多次持久化压缩
+///（前台收尾派发的后台压缩与下一轮 prepare 的防御性压缩可能重叠）。
+static SESSION_COMPACTION_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
+    LazyLock::new(|| Mutex::new(FastSet::default()));
 
 /// 标题任务必须从基础 history 文件推导 sessions 根目录；不能传入当前 session
 /// 数据库的父目录，否则会错误地拼接出嵌套的 `.sessions` 路径。
@@ -168,6 +172,74 @@ fn mark_session_title_generation_finished(session_id: &str) {
     in_flight.remove(session_id);
 }
 
+/// 返回 true 表示成功抢到压缩 in-flight 槽位；false 表示该 session 已有
+/// 压缩任务在跑，调用方应直接跳过，避免重复压缩同一批历史。
+pub(in crate::ai::driver::turn_runtime) fn mark_session_compaction_started(
+    session_id: &str,
+) -> bool {
+    let mut in_flight = SESSION_COMPACTION_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    in_flight.insert(session_id.to_string())
+}
+
+pub(in crate::ai::driver::turn_runtime) fn mark_session_compaction_finished(session_id: &str) {
+    let mut in_flight = SESSION_COMPACTION_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    in_flight.remove(session_id);
+}
+
+/// 交互式收尾把持久化压缩派发到后台：压缩结果只是 context snapshot 的写回缓存，
+/// 下一轮 `build_context_history` 始终从 canonical 层重新压缩，故延迟落盘不影响
+/// 正确性。前台 turn 因此不必在答案交付后再干等一次 CPU 压缩 + SQLite 写事务。
+///
+/// `at_boundary` 对应本轮是否再调用过工具（无工具调用 = "答案已交付"，用更激进
+/// 阈值）。返回后 in-flight 槽位由 spawned task 负责清理。
+fn spawn_background_compaction(app: &App, at_boundary: bool) {
+    if !mark_session_compaction_started(&app.session_id) {
+        // 已有压缩在跑（例如上一轮的后台任务尚未完成）；本轮跳过即可，
+        // 待其完成后下一轮 prepare 会基于最新 canonical 再判定。
+        return;
+    }
+    let task_app = app.clone();
+    let session_id = task_app.session_id.clone();
+    // 后台任务不拥有前台终端：压缩的告警/日志不得抢占前台输出光标。
+    tokio::spawn(crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(
+        true,
+        async move {
+            let compact_result = if at_boundary {
+                compact_session_history_at_boundary_with_app(&task_app).await
+            } else {
+                compact_session_history_with_app(&task_app).await
+            };
+            if let Err(err) = compact_result {
+                eprintln!("[Warning] Failed to compact persisted history: {}", err);
+            }
+            mark_session_compaction_finished(&session_id);
+        },
+    ));
+}
+
+/// 收尾阶段的持久化压缩派发。交互式 turn 走后台（不阻塞前台回到 prompt）；
+/// one-shot / 即将退出的进程走前台 `.await`，确保进程结束前 snapshot 已落盘。
+async fn dispatch_finalize_compaction(app: &App, at_boundary: bool, run_in_background: bool) {
+    if run_in_background {
+        spawn_background_compaction(app, at_boundary);
+        return;
+    }
+    let compact_result = if at_boundary {
+        compact_session_history_at_boundary_with_app(app).await
+    } else {
+        compact_session_history_with_app(app).await
+    };
+    if let Err(err) = compact_result
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+    {
+        eprintln!("[Warning] Failed to compact persisted history: {}", err);
+    }
+}
+
 /// 标题任务可以在当前 user message 尚未落盘时启动；把这条已提交输入补进快照，
 /// 让辅助模型无需等待主请求或首轮 assistant response。
 fn session_title_messages(
@@ -287,19 +359,16 @@ pub(super) async fn finalize_turn(
         // goal 模式下，run_loop 通过此标志判定目标是否完成：
         // 一轮结束时没有调用任何工具 = agent 已交付最终结果。
         app.last_turn_had_tool_calls = had_tool_calls;
-        {
-            // 用块限制 compact_result 的生命周期，避免它跨越 await 导致 Send 问题
-            let compact_result = if had_tool_calls {
-                compact_session_history_with_app(app).await
-            } else {
-                compact_session_history_at_boundary_with_app(app).await
-            };
-            if let Err(err) = compact_result
-                && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-            {
-                eprintln!("[Warning] Failed to compact persisted history: {}", err);
-            }
-        }
+        // 持久化压缩：交互式 turn 派发到后台，避免答案交付后前台再干等一次
+        // CPU 压缩 + SQLite 写事务（快照只是写回缓存，下一轮从 canonical 重算）。
+        // one-shot / 即将退出时走前台 await，确保进程结束前 snapshot 已落盘。
+        // `at_boundary` = 本轮没有再调工具（答案已交付），用更激进的阈值。
+        dispatch_finalize_compaction(
+            app,
+            !had_tool_calls,
+            should_generate_session_title_in_background(one_shot_mode, should_quit),
+        )
+        .await;
         // 尝试为当前对话生成 LLM 概括性标题（如果尚未生成且已有足够上下文）。
         // 交互式前台 turn 不应在这里等待一个后台质量任务。
         maybe_generate_session_title(

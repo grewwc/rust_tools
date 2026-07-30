@@ -19,6 +19,7 @@ mod tree_tools;
 #[cfg(test)]
 pub use command_tools::validate_execute_command;
 
+pub(crate) use patch_tools::apply_patch_target_paths_from_patch;
 #[cfg(test)]
 pub(crate) use registry::common::execute_tool_call;
 pub(crate) use registry::common::execute_tool_call_with_args_streaming;
@@ -26,7 +27,6 @@ pub(crate) use registry::common::{
     deferred_eager_load_tool_summaries, get_tool_definitions_by_names, tool_defers_eager_load,
     tool_definitions_for_groups, tool_history_policy, tool_summaries_for_groups,
 };
-
 const BASELINE_TOOL_NAMES: &[&str] = &[
     "list_skills",
     "load_skill",

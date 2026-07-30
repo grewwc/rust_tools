@@ -21,6 +21,12 @@ pub fn prompt_yes_or_no(prompt: &str) -> bool {
     }
 }
 
+/// 高危操作确认：提示文字以红色显示，用户输入后颜色立即还原。
+pub fn prompt_yes_or_no_danger(prompt: &str) -> Option<bool> {
+    // \x1b[31m 红色，\x1b[0m 还原；prompt 内打印完颜色即归位，不影响后续输出。
+    prompt_yes_or_no_interruptible(&format!("\x1b[31m{prompt}\x1b[0m"))
+}
+
 pub fn prompt_yes_or_no_interruptible(prompt: &str) -> Option<bool> {
     if !std::io::stdin().is_terminal() {
         return Some(prompt_yes_or_no(prompt));
@@ -52,7 +58,9 @@ pub fn prompt_yes_or_no_interruptible(prompt: &str) -> Option<bool> {
         let evt = match event::read() {
             Ok(e) => e,
             Err(_) => {
-                println!();
+                // raw mode 下 \n 不回车，必须 \r\n 才能正确换行
+                let _ = write!(std::io::stdout(), "\r\n");
+                let _ = std::io::stdout().flush();
                 return None;
             }
         };
@@ -66,20 +74,24 @@ pub fn prompt_yes_or_no_interruptible(prompt: &str) -> Option<bool> {
 
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                println!();
+                let _ = write!(std::io::stdout(), "\r\n");
+                let _ = std::io::stdout().flush();
                 return None;
             }
             (KeyCode::Esc, _) => {
-                println!();
+                let _ = write!(std::io::stdout(), "\r\n");
+                let _ = std::io::stdout().flush();
                 return None;
             }
             (KeyCode::Char(ch), _) => match ch.to_ascii_lowercase() {
                 'y' => {
-                    println!("y");
+                    let _ = write!(std::io::stdout(), "y\r\n");
+                    let _ = std::io::stdout().flush();
                     return Some(true);
                 }
                 'n' => {
-                    println!("n");
+                    let _ = write!(std::io::stdout(), "n\r\n");
+                    let _ = std::io::stdout().flush();
                     return Some(false);
                 }
                 _ => {}

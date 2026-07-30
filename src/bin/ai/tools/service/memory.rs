@@ -546,10 +546,12 @@ pub(crate) fn search_memo_candidates(
     limit: usize,
     include_archives: bool,
 ) -> Result<Vec<AgentMemoryEntry>, String> {
-    Ok(search_memo_candidates_scored(query, limit, include_archives)?
-        .into_iter()
-        .map(|s| s.entry)
-        .collect())
+    Ok(
+        search_memo_candidates_scored(query, limit, include_archives)?
+            .into_iter()
+            .map(|s| s.entry)
+            .collect(),
+    )
 }
 
 /// 与 `search_memo_candidates` 同源，但保留分数与"是否用了语义"标记。
@@ -1385,9 +1387,9 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_memory_delete, execute_memory_list_json, execute_memory_save,
-        execute_memory_update, is_memory_visible_to, delete_memo_entry,
-        search_memo_candidates, search_memo_candidates_scored, update_memo_entry,
+        delete_memo_entry, execute_memory_delete, execute_memory_list_json, execute_memory_save,
+        execute_memory_update, is_memory_visible_to, search_memo_candidates,
+        search_memo_candidates_scored, update_memo_entry,
     };
     use crate::ai::test_support::ENV_LOCK;
     use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
@@ -1583,8 +1585,7 @@ mod tests {
             id: Some("archived-memo".to_string()),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             category: "memo".to_string(),
-            note: "AeolusLLM Copilot 二次分析：通过 trace_id 在数据库检索原始问题。"
-                .to_string(),
+            note: "AeolusLLM Copilot 二次分析：通过 trace_id 在数据库检索原始问题。".to_string(),
             tags: vec!["aeolusllm".to_string(), "copilot".to_string()],
             source: Some("cli_note".to_string()),
             priority: Some(150),
@@ -1614,16 +1615,17 @@ mod tests {
 
         let memo_only =
             search_memo_candidates_scored("aeolusllm copilot 二次分析问题排查", 10, true).unwrap();
-        assert_eq!(
-            memo_only[0].entry.id.as_deref(),
-            Some("archived-memo")
+        assert_eq!(memo_only[0].entry.id.as_deref(), Some("archived-memo"));
+        assert!(
+            memo_only
+                .iter()
+                .all(|candidate| candidate.entry.category == "memo")
         );
-        assert!(memo_only
-            .iter()
-            .all(|candidate| candidate.entry.category == "memo"));
-        assert!(memo_only
-            .iter()
-            .all(|candidate| candidate.entry.id.as_deref() != Some("non-memo-decoy")));
+        assert!(
+            memo_only
+                .iter()
+                .all(|candidate| candidate.entry.id.as_deref() != Some("non-memo-decoy"))
+        );
 
         cleanup_memory_artifacts(&path);
         let _ = std::fs::remove_file(&archive);
@@ -1659,8 +1661,11 @@ mod tests {
             owner_pgid: None,
             image_path: None,
         };
-        std::fs::write(&archive, format!("{}\n", serde_json::to_string(&archived_memo).unwrap()))
-            .unwrap();
+        std::fs::write(
+            &archive,
+            format!("{}\n", serde_json::to_string(&archived_memo).unwrap()),
+        )
+        .unwrap();
 
         let store = MemoryStore::from_env_or_config();
         store
@@ -1681,12 +1686,16 @@ mod tests {
         // include_archives=false：候选不应包含归档条目，
         // 只剩当前文件里的 "current-del-memo"。
         let candidates = search_memo_candidates("二次分析问题排查", 10, false).unwrap();
-        assert!(candidates
-            .iter()
-            .all(|c| c.id.as_deref() != Some("archived-del-memo")));
-        assert!(candidates
-            .iter()
-            .any(|c| c.id.as_deref() == Some("current-del-memo")));
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.id.as_deref() != Some("archived-del-memo"))
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.id.as_deref() == Some("current-del-memo"))
+        );
 
         // 即便外部传入归档条目，delete_memo_entry 也只能在当前文件找不到它而失败，
         // 而不是静默误删或落到成功路径。

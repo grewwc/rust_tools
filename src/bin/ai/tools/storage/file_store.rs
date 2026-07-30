@@ -424,34 +424,46 @@ mod tests {
         assert!(reason.contains("original_file_path"), "{reason}");
 
         // 通过 FileStore 端到端确认拒绝（read_file 工具会走 validate_read_access）。
-        assert!(FileStore::new(read_artifact.to_path_buf())
-            .validate_read_access()
-            .is_err());
+        assert!(
+            FileStore::new(read_artifact.to_path_buf())
+                .validate_read_access()
+                .is_err()
+        );
     }
 
     #[test]
     fn execute_command_and_recall_archives_remain_readable() {
         // execute_command 日志没有可替代的原始来源，必须放行。
-        assert!(blocked_overflow_read_reason(Path::new(
-            "/proj.assets/tool-overflow-compressed/20260722T101112Z-execute_command-abc123.txt"
-        ))
-        .is_none());
+        assert!(
+            blocked_overflow_read_reason(Path::new(
+                "/proj.assets/tool-overflow-compressed/20260722T101112Z-execute_command-abc123.txt"
+            ))
+            .is_none()
+        );
         // user / image 归档 stub 主动引导模型按需回读，放行。
-        assert!(blocked_overflow_read_reason(Path::new(
-            "/proj.assets/user-overflow-preserved/20260722T101112Z-user-abc123.json"
-        ))
-        .is_none());
-        assert!(blocked_overflow_read_reason(Path::new(
-            "/proj.assets/image-overflow-preserved/20260722T101112Z-image-abc123.json"
-        ))
-        .is_none());
+        assert!(
+            blocked_overflow_read_reason(Path::new(
+                "/proj.assets/user-overflow-preserved/20260722T101112Z-user-abc123.json"
+            ))
+            .is_none()
+        );
+        assert!(
+            blocked_overflow_read_reason(Path::new(
+                "/proj.assets/image-overflow-preserved/20260722T101112Z-image-abc123.json"
+            ))
+            .is_none()
+        );
         // overflow-history.md 位于 assets 根目录，不在封锁子目录内。
-        assert!(blocked_overflow_read_reason(Path::new("/proj.assets/overflow-history.md")).is_none());
+        assert!(
+            blocked_overflow_read_reason(Path::new("/proj.assets/overflow-history.md")).is_none()
+        );
         // 用户项目里恰好同名的目录不受影响（未锚定到 .assets / 会话目录）。
-        assert!(blocked_overflow_read_reason(Path::new(
-            "/proj/tool-overflow-compressed/20260722T101112Z-read_file-abc123.txt"
-        ))
-        .is_none());
+        assert!(
+            blocked_overflow_read_reason(Path::new(
+                "/proj/tool-overflow-compressed/20260722T101112Z-read_file-abc123.txt"
+            ))
+            .is_none()
+        );
     }
 
     #[test]

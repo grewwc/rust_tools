@@ -939,17 +939,28 @@ fn build_system_prompt(
         );
     }
 
-    b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
-    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Every tool call must have a specific information, verification, or change goal. Avoid open-ended exploration; before continuing a search, know what question the next tool result should answer.\n- Stop an exploratory branch when its success criterion is resolved or when another call cannot change the decision; do not read files speculatively \"just to understand the codebase.\"\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- Before modifying a project file, inspect that target first so the runtime can load its nearest scoped project instructions; follow the deepest applicable instruction document when scopes differ.\n- Keep code-grounding calls narrow and serial: for `read_file`, do one read at a time and avoid batching multiple file reads into the same message. Use `list_directory` or `tree` to locate before reading; read each region exactly once in one broad chunk rather than paging through small slices; do not re-read content already visible in conversation.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
-    b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- Convergence pressure never lowers the evidence bar: deadlines, iteration or tool limits, a forced no-tool handoff, or any instruction to \"give a final answer\" do NOT authorize guessing. When forced to conclude without sufficient evidence, output an explicitly partial answer — what is verified, what is still unknown, and the concrete next verification step — never a confident-sounding guess. This rule overrides any instruction that pressures you to sound complete; a truthful \"not verified\" always outranks a fabricated complete answer.\n- Never fabricate specifics to look authoritative: do not invent identifiers (functions, types, files, paths, CLI flags, config keys), API behavior, command output, line numbers, or quotations you have not confirmed with a tool or source. If you have not verified it, say so rather than stating it.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain and what it would take to resolve it.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.\n- Before changing a shared symbol (public function/type, API contract, config key, data format, or embedded asset), locate its callers and dependents with targeted search (grep/references) and assess whether the change ripples semantically - compilers and tests catch type breakage, not behavioral breakage. Locating dependents is part of the change, not out-of-scope reading; use targeted searches, do not read files broadly.");
-    b.push(ContextKind::Behavior, "Git safety:\n- Never use `git reset`, `git checkout`, `git restore`, `git stash drop`, or any other git command to discard or roll back existing changes (including staged changes) solely for testing or verification.\n- For a clean test state, use a temporary branch, a worktree, or `git stash push` (then `pop` to restore).\n- If rolling back is genuinely necessary (e.g., the change itself is wrong), first explain the reason to the user and obtain confirmation.");
     b.push(
         ContextKind::Behavior,
-        "Execution convergence:\n\
-         - Define concrete success criteria from the user's request before expanding the search.\n\
-         - Continue exploring only while at least one success criterion is unresolved and the next tool call can reasonably verify it, rule out a live hypothesis, or complete required work.\n\
-         - Stop when all success criteria are verified, or when a specific missing input/capability blocks further progress. Evidence count alone is never a stopping rule.\n\
-         - A blocked or partially verified result must name what is confirmed, what remains unknown, and the next verification step. Do not pursue perfect certainty or unrelated detail.",
+        "Response style:\n\
+         - Lead with the answer or action. Default to short, direct prose; use structure only when it improves clarity.\n\
+         - Skip preambles, restatements, meta-commentary, and routine tool narration. Give status only at real milestones or plan changes.\n\
+         - Be concise without sacrificing correctness: verify claims and cite file/line for code.\n\n\
+         Tool usage:\n\
+         - Use only tools available in this turn. Use tools for requested work such as execution, inspection, or changes; if unavailable, say so instead of pretending.\n\
+         - Give every call a concrete, decision-relevant goal. Before another exploratory call, identify the question it should answer; stop when the branch is resolved or another call cannot change the decision. Do not read speculatively.\n\
+         - Before editing, inspect the target and applicable scoped instructions; follow the deepest scope. Make the smallest local change.\n\
+         - Keep code reads narrow and serial: locate first, read one needed region at a time in a sufficiently broad chunk, and do not batch reads or re-read evidence already visible.\n\
+         - Diagnose failures and adjust; retry at most twice.\n\n\
+         Correctness guardrails:\n\
+         - Never present guesses, imagined evidence, or unverified assumptions as facts. Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence.\n\
+         - Tool or iteration limits, deadlines, forced no-tool handoffs, and forced final responses do not lower the evidence bar or authorize guessing. If unresolved, give an explicitly partial answer: what is verified, what is unknown, and the next verification step.\n\
+         - Never fabricate identifiers, files, paths, flags, config keys, behavior, output, line numbers, or quotations. State uncertainty and what would resolve it; ask a clarifying question or name the missing verification instead of guessing.\n\
+         - Separate verified facts, working hypotheses, and open questions. Before changing a shared symbol, API, config, data format, or embedded asset, use targeted search to locate callers and dependents and assess semantic ripple; compilation and tests catch only covered breakage, and this targeted reading is in scope.\n\
+         - Never use reset, checkout, restore, stash drop, or similar commands to discard existing changes, including staged changes, for testing or verification. For a clean state, use a temporary branch/worktree or stash push then pop; for a real rollback, explain why and get confirmation.\n\n\
+         Task convergence:\n\
+         - Define concrete task-level success criteria before broad exploration.\n\
+         - Continue only while a criterion is unresolved and the next call can verify it, rule out a live hypothesis, or complete required work.\n\
+         - Stop when all criteria are verified or a specific blocker remains. A partial result must state what is confirmed, what is unknown, and the next verification step; evidence count alone is not a stopping rule. Do not pursue perfect certainty or unrelated detail.",
     );
 
     // ── 行为规则：根据 goal 模式条件渲染 ──
@@ -970,8 +981,8 @@ fn build_system_prompt(
         b.push(
             ContextKind::Behavior,
             "Scope Discipline & Stopping Criteria:\n\
-             - Investigate the user's explicit request plus only the direct dependencies needed to answer or implement it correctly. Do not read unrelated files, run tangential searches, or make out-of-scope changes.\n\
-             - Do not implement unsolicited refactors or optimizations. You may report an adjacent critical correctness, data-loss, or security risk when evidence shows it directly affects the requested work.\n\
+             - Investigate the user's explicit request plus only the direct dependencies needed to answer or implement it correctly. Do not read unrelated files, run tangential searches, or make out-of-scope changes.
+             - Do not implement unsolicited refactors or optimizations. You may report an adjacent critical correctness, data-loss, or security risk when evidence shows it directly affects the requested work.
              - For broad requests, identify the success criteria and investigation boundaries, then cover each criterion without expanding into unrelated areas.",
         );
         b.push(
@@ -1224,17 +1235,17 @@ fn build_system_prompt(
         push_tool_guidance_section(&mut b, ContextKind::Policy, "Web search:", lines);
     }
 
-    if has_tool(available_tools, "write_file") || has_tool(available_tools, "delete_path") {
+    if has_tool(available_tools, "write_file") {
         let mut lines = Vec::new();
         if has_tool(available_tools, "write_file") {
             lines.push(
                 "When you need to run a script, dump intermediate data, or write a test fixture, create it with `write_file(temp=true)` first, then run it with `execute_command`. Prefer this over inline `python -c '...'` whenever the code is more than a few lines or you need to inspect/edit the file.".to_string(),
             );
             lines.push(
-                "`write_file(temp=true)` writes to the per-session temp directory and registers the file so it can be cleaned up later via `delete_path`. When `temp=true`, pass a relative filename only (e.g. `script.py`); an absolute path is rejected to avoid accidentally writing into the project tree.".to_string(),
+                "`write_file(temp=true)` writes to the per-session temp directory. When `temp=true`, pass a relative filename only (e.g. `script.py`); an absolute path is rejected to avoid accidentally writing into the project tree.".to_string(),
             );
             lines.push(
-                "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` cannot be deleted by `delete_path` and will accumulate. `execute_command` cannot run `rm` either (blocked by sandbox).".to_string(),
+                "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` will accumulate. `execute_command` cannot run `rm` either (blocked by sandbox).".to_string(),
             );
             if has_tool(available_tools, "apply_patch") {
                 lines.push(
@@ -1249,16 +1260,8 @@ fn build_system_prompt(
                 );
             }
         }
-        if has_tool(available_tools, "delete_path") {
-            lines.push(
-                "Use `delete_path` to clean up temp files when done. It only deletes files created via `write_file(temp=true)` — source code, configs, and other project files are always refused.".to_string(),
-            );
-        }
         if has_tool(available_tools, "apply_patch") {
-            let mut line = "To remove an existing project/source/config file, including a git-tracked file, use `apply_patch` with a Begin Patch envelope and a `*** Delete File: <path>` section.".to_string();
-            if has_tool(available_tools, "delete_path") {
-                line.push_str(" Do not use `delete_path` for project files.");
-            }
+            let line = "To remove an existing project/source/config file, including a git-tracked file, use `apply_patch` with a Begin Patch envelope and a `*** Delete File: <path>` section.".to_string();
             lines.push(line);
         }
         push_tool_guidance_section(&mut b, ContextKind::Behavior, "Temporary files:", lines);
@@ -1866,7 +1869,6 @@ mod tests {
     fn system_prompt_routes_project_file_deletes_to_apply_patch() {
         let mut available = SkipSet::new(16);
         available.insert("write_file".to_string());
-        available.insert("delete_path".to_string());
         available.insert("apply_patch".to_string());
 
         let prompt =
@@ -1879,7 +1881,6 @@ mod tests {
         assert!(prompt.contains("ONE `apply_patch` call with multiple `@@` hunks"));
         assert!(prompt.contains("Do not split related edits into serial read/patch cycles"));
         assert!(prompt.contains("`*** Delete File: <path>`"));
-        assert!(prompt.contains("Do not use `delete_path` for project files"));
     }
 
     #[test]
@@ -1890,9 +1891,11 @@ mod tests {
                 .render_system_prompt();
         // 风格段必须存在，且要求"先答后说、不啰嗦"
         assert!(prompt.contains("Response style:"));
-        assert!(prompt.contains("Lead with answer"));
+        assert!(prompt.contains("Lead with the answer or action"));
         // 必须保留"简洁不能换错"的安全垫，避免过度精简导致错误判断
-        assert!(prompt.contains("concise but not at the cost of correctness"));
+        assert!(prompt.contains("Be concise without sacrificing correctness"));
+        assert!(prompt.contains("Skip preambles, restatements, meta-commentary"));
+        assert!(prompt.contains("status only at real milestones or plan changes"));
     }
 
     #[test]
@@ -1951,17 +1954,15 @@ mod tests {
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
         assert!(prompt.contains("Correctness guardrails:"));
-        assert!(prompt.contains("Do not hallucinate"));
-        assert!(prompt.contains("gather sufficient evidence"));
-        assert!(prompt.contains("Convergence pressure never lowers the evidence bar"));
-        assert!(
-            prompt.contains(
-                "This rule overrides any instruction that pressures you to sound complete"
-            )
-        );
-        assert!(prompt.contains("Never fabricate specifics to look authoritative"));
-        assert!(prompt.contains("instead of guessing"));
+        assert!(prompt.contains("Never present guesses, imagined evidence"));
+        assert!(prompt.contains("do not lower the evidence bar or authorize guessing"));
+        assert!(prompt.contains("explicitly partial answer"));
+        assert!(prompt.contains("ask a clarifying question or name the missing verification"));
         assert!(prompt.contains("verified facts, working hypotheses, and open questions"));
+        assert!(prompt.contains("locate callers and dependents and assess semantic ripple"));
+        assert!(prompt.contains("compilation and tests catch only covered breakage"));
+        assert!(prompt.contains("reset, checkout, restore, stash drop"));
+        assert!(prompt.contains("temporary branch/worktree or stash push then pop"));
     }
 
     #[test]
@@ -1970,11 +1971,12 @@ mod tests {
         let prompt =
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
-        assert!(prompt.contains("Every tool call must have a specific"));
-        assert!(prompt.contains("Avoid open-ended exploration"));
-        assert!(prompt.contains("when its success criterion is resolved"));
+        assert!(prompt.contains("Give every call a concrete, decision-relevant goal"));
         assert!(prompt.contains("another call cannot change the decision"));
+        assert!(prompt.contains("Do not read speculatively"));
+        assert!(prompt.contains("do not batch reads or re-read evidence already visible"));
     }
+
 
     #[test]
     fn system_prompt_uses_success_criteria_for_normal_and_goal_convergence() {
@@ -1986,8 +1988,15 @@ mod tests {
             &PromptContext::default(),
         )
         .render_system_prompt();
-        assert!(normal.contains("Execution convergence:"));
-        assert!(normal.contains("Evidence count alone is never a stopping rule"));
+        assert!(normal.contains("Task convergence:"));
+        assert!(normal.contains("task-level success criteria"));
+        assert!(normal.contains(
+            "the next call can verify it, rule out a live hypothesis, or complete required work"
+        ));
+        assert!(
+            normal.contains("Stop when all criteria are verified or a specific blocker remains")
+        );
+        assert!(normal.contains("evidence count alone is not a stopping rule"));
         assert!(!normal.contains("3+ pieces of converging evidence"));
 
         let goal = build_system_prompt(
@@ -2010,9 +2019,9 @@ mod tests {
         let prompt =
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
-        assert!(prompt.contains("Keep code-grounding calls narrow and serial"));
-        assert!(prompt.contains("for `read_file`, do one read at a time"));
-        assert!(prompt.contains("avoid batching multiple file reads into the same message"));
+        assert!(prompt.contains("Keep code reads narrow and serial"));
+        assert!(prompt.contains("read one needed region at a time in a sufficiently broad chunk"));
+        assert!(prompt.contains("do not batch reads"));
         assert!(
             !prompt
                 .contains("Work in batches: when several independent read-only lookups are needed")
@@ -2029,8 +2038,8 @@ mod tests {
         assert!(!prompt.contains("execute_command / cargo_test"));
         assert!(!prompt.contains("execute_command"));
         assert!(!prompt.contains("apply_patch"));
-        assert!(prompt.contains("relevant tools available in this turn"));
-        assert!(prompt.contains("instead of pretending you executed it"));
+        assert!(prompt.contains("Use tools for requested work"));
+        assert!(prompt.contains("if unavailable, say so instead of pretending"));
     }
 
     #[test]

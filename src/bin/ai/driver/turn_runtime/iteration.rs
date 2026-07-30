@@ -64,28 +64,6 @@ fn push_project_target(targets: &mut Vec<PathBuf>, seen: &mut FastSet<String>, r
     targets.push(PathBuf::from(path));
 }
 
-fn push_patch_envelope_targets(
-    targets: &mut Vec<PathBuf>,
-    seen: &mut FastSet<String>,
-    patch: &str,
-) {
-    const PREFIXES: &[&str] = &[
-        "*** Update File:",
-        "*** Add File:",
-        "*** Delete File:",
-        "*** Replace in line:",
-    ];
-    for line in patch.lines() {
-        let trimmed = line.trim();
-        if let Some(path) = PREFIXES
-            .iter()
-            .find_map(|prefix| trimmed.strip_prefix(prefix))
-        {
-            push_project_target(targets, seen, path);
-        }
-    }
-}
-
 pub(super) fn project_instruction_target_paths_from_tool_calls(
     tool_calls: &[crate::ai::types::ToolCall],
     include_read_only: bool,
@@ -113,7 +91,9 @@ pub(super) fn project_instruction_target_paths_from_tool_calls(
         if tool_call.function.name == "apply_patch"
             && let Some(patch) = args.get("patch").and_then(Value::as_str)
         {
-            push_patch_envelope_targets(&mut targets, &mut seen, patch);
+            for path in crate::ai::tools::apply_patch_target_paths_from_patch(patch) {
+                push_project_target(&mut targets, &mut seen, &path.to_string_lossy());
+            }
         }
     }
     targets
@@ -1020,6 +1000,17 @@ mod tests {
                             .to_string(),
                         },
                     },
+                    ToolCall {
+                        id: "git-header-patch".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "apply_patch".to_string(),
+                            arguments: serde_json::json!({
+                                "patch": "diff --git a/src/bin/ai/quoted-old.rs b/src/bin/ai/quoted-new.rs\n@@ -1 +1 @@\n-old\n+new\n"
+                            })
+                            .to_string(),
+                        },
+                    },
                 ]),
                 tool_call_id: None,
                 reasoning_content: None,
@@ -1032,6 +1023,7 @@ mod tests {
                 std::path::PathBuf::from("src/bin/ai/driver/mod.rs"),
                 std::path::PathBuf::from("src/bin/ai/agents.rs"),
                 std::path::PathBuf::from("src/bin/ai/new.rs"),
+                std::path::PathBuf::from("src/bin/ai/quoted-new.rs"),
             ]
         );
     }

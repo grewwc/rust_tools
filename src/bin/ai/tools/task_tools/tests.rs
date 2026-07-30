@@ -680,8 +680,7 @@ fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() 
                 None,
             )
             .unwrap();
-        let sibling_channel =
-            os.channel_create(Some(sibling_pid), 1, "sibling-result".to_string());
+        let sibling_channel = os.channel_create(Some(sibling_pid), 1, "sibling-result".to_string());
         let sibling_futex = os.futex_create(0, "sibling-complete".to_string());
         os.set_current_pid(Some(owner_pid));
         (
@@ -741,7 +740,9 @@ fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() 
         || {
             (
                 execute_task_status(&serde_json::json!({})).unwrap(),
-                build_outstanding_task_anchor(&app.session_id).unwrap().unwrap(),
+                build_outstanding_task_anchor(&app.session_id)
+                    .unwrap()
+                    .unwrap(),
             )
         },
     );
@@ -787,7 +788,13 @@ fn task_cancel_refuses_same_session_foreign_owner_task() {
         let channel = os.channel_create(Some(child_pid), 1, "sibling-result".to_string());
         let futex = os.futex_create(0, "sibling-complete".to_string());
         os.set_current_pid(Some(owner_pid));
-        (owner_pid, sibling_owner_pid, child_pid, channel.raw(), futex)
+        (
+            owner_pid,
+            sibling_owner_pid,
+            child_pid,
+            channel.raw(),
+            futex,
+        )
     };
     insert_task_entry_for_test(
         task_id.clone(),
@@ -896,13 +903,18 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
         let proc = os
             .get_process(owner_pid)
             .expect("owner process should still exist");
-        assert!(matches!(proc.state, aios_kernel::kernel::ProcessState::Ready));
+        assert!(matches!(
+            proc.state,
+            aios_kernel::kernel::ProcessState::Ready
+        ));
         assert!(
             proc.mailbox
                 .iter()
                 .any(|message| message.contains("[TASK_WAIT_TIMEOUT]"))
         );
-        let resumed = os.pop_foreground_ready().expect("expired wait should wake owner");
+        let resumed = os
+            .pop_foreground_ready()
+            .expect("expired wait should wake owner");
         assert_eq!(resumed.pid, owner_pid);
     }
 

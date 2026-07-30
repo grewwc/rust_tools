@@ -2,8 +2,7 @@
 // Persistent temp-file registry
 // =============================================================================
 // agent 通过 `write_file(temp=true)` 创建的临时文件会在此注册表留下记录。
-// `delete_path` 只允许删除注册表中存在的路径——未经 agent 创建的文件一律
-// 拒绝删除，从根上杜绝误删源码 / 配置 / 用户数据。
+// 注册表用于审计跟踪；临时文件在会话结束时由运行时统一清理。
 //
 // 注册表以 JSON 文件持久化在 `<temp_dir>/temp_registry.json`
 // （`temp_dir` 优先为 `~/.history_file.sessions/<session>.assets/tmp/`，

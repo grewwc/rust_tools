@@ -3,8 +3,8 @@ use uuid::Uuid;
 
 use crate::ai::{
     history::{
-        SessionStore, SuspendedSessionEntry, SuspendedSessionStore,
-        format_suspended_timestamp_label,
+        PruneSessionDeleteResult, SessionInfo, SessionStore, SuspendedSessionEntry,
+        SuspendedSessionStore, format_suspended_timestamp_label,
     },
     types::App,
 };
@@ -20,6 +20,7 @@ pub(in crate::ai) const CANONICAL_SESSION_SUBCOMMANDS: &[&str] = &[
     "bound",
     "unbind",
     "delete",
+    "prune",
     "clear-history",
     "clear-all",
     "dump-history",
@@ -101,9 +102,23 @@ fn switch_app_to_session(
     app: &mut App,
     store: &SessionStore,
     session_id: &str,
+    require_existing: bool,
 ) -> std::io::Result<()> {
     let history_file = store.session_history_file(session_id);
-    // 先加载目标状态，失败时保持当前 App 不变；成功后再清理旧 session 状态并切换。
+    if let Err((path, err)) = crate::ai::driver::session_pid::mark_session_pid(
+        store.sessions_root(),
+        session_id,
+        require_existing,
+    ) {
+        if require_existing {
+            return Err(err);
+        }
+        eprintln!(
+            "[Warning] 无法写入 session PID 文件 ({}): {err}",
+            path.display()
+        );
+    }
+    // 先登记活跃标记，再加载目标状态，避免 prune 在切换窗口内删除目标 session。
     let stale_patch_targets = load_stale_patch_targets(store, &session_id, &history_file)?;
     clear_session_local_runtime_state(app);
     app.session_id = session_id.to_string();
@@ -223,6 +238,26 @@ fn resolve_existing_session_selector(
     Ok(session_id)
 }
 
+/// `/sessions prune <days>` 允许的最大天数（~10k 年）。远小于 `chrono` 的
+/// `Duration::days` 与 `DateTime` 运算溢出阈值，用来把非法的超大输入挡在 panic 之前。
+/// 有效区间为 `1..=MAX_PRUNE_DAYS`：`0` 会退化成"删除所有非当前 session"，被显式拒绝。
+pub(crate) const MAX_PRUNE_DAYS: i64 = 3_650_000;
+
+/// 选出 N 天未活动的 session：`modified_local` 早于 `cutoff` 的视为过期。
+/// 当前 session 永不删除；缺少时间戳的 session 无法判定新旧，保守跳过。
+pub(crate) fn select_stale_sessions<'a>(
+    sessions: &'a [SessionInfo],
+    current_session_id: &str,
+    cutoff: chrono::DateTime<chrono::Local>,
+) -> Vec<&'a SessionInfo> {
+    sessions
+        .iter()
+        .filter(|s| {
+            s.id != current_session_id && s.modified_local.map(|t| t < cutoff).unwrap_or(false)
+        })
+        .collect()
+}
+
 pub fn try_handle_session_command(
     app: &mut App,
     input: &str,
@@ -285,6 +320,9 @@ pub fn try_handle_session_command(
                 "  /sessions clear-history   clear current session history (keeps session alive)"
             );
             println!("  /sessions clear-all       delete all sessions");
+            println!(
+                "  /sessions prune <days>    delete sessions inactive for N days (current session kept)"
+            );
             println!(
                 "  /sessions dump-history <id>              dump session history to JSON (<id>-history.json)"
             );
@@ -354,7 +392,7 @@ pub fn try_handle_session_command(
             // 切换前清掉旧 session 的 history cache 与 explicit-enabled tools，
             // 防止下个 turn 携带跨 session 脏状态。
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
-            switch_app_to_session(app, &store, &new_id)?;
+            switch_app_to_session(app, &store, &new_id, false)?;
             println!("Switched to new session: {}", new_id);
         }
         "use" | "select" => {
@@ -371,7 +409,7 @@ pub fn try_handle_session_command(
                 return Ok(true);
             }
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
-            switch_app_to_session(app, &store, id)?;
+            switch_app_to_session(app, &store, id, true)?;
             println!("Switched session: {}", id);
             // 显示 session 摘要
             let sessions = store.list_sessions().unwrap_or_default();
@@ -464,7 +502,7 @@ pub fn try_handle_session_command(
             }
             if deleted_current {
                 let new_id = Uuid::new_v4().to_string();
-                switch_app_to_session(app, &store, &new_id)?;
+                switch_app_to_session(app, &store, &new_id, false)?;
                 println!("Switched to new session: {}", new_id);
             }
         }
@@ -628,7 +666,7 @@ pub fn try_handle_session_command(
                     crate::ai::history::invalidate_context_history_cache_for(
                         &app.session_history_file,
                     );
-                    switch_app_to_session(app, &store, &id)?;
+                    switch_app_to_session(app, &store, &id, true)?;
                     println!(
                         "Imported session from '{}' -> '{}', switched to it.",
                         file, id
@@ -659,7 +697,7 @@ pub fn try_handle_session_command(
             );
         }
         "clear-all" | "clear_all" | "wipe" => {
-            let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(
+            let confirm = crate::commonw::prompt::prompt_yes_or_no_danger(
                 "Delete ALL sessions? (y/n): ",
             );
             if confirm != Some(true) {
@@ -670,8 +708,116 @@ pub fn try_handle_session_command(
             let deleted = store.clear_all_sessions()?;
             crate::ai::history::clear_context_history_cache();
             let new_id = Uuid::new_v4().to_string();
-            switch_app_to_session(app, &store, &new_id)?;
+            switch_app_to_session(app, &store, &new_id, false)?;
             println!("Deleted {deleted} session(s). Switched to new session: {new_id}");
+        }
+        "prune" | "delete-old" | "delete_old" | "purge" | "gc" | "stale" => {
+            // /sessions prune <days>：删除 N 天未活动的 session（当前 session 永不删除）。
+            let Some(days_str) = parts.next() else {
+                println!("missing days. try: /sessions prune <days>");
+                return Ok(true);
+            };
+            let Ok(days) = days_str.parse::<i64>() else {
+                println!("invalid days: '{}'", days_str);
+                return Ok(true);
+            };
+            // 下界为 1：`prune 0` 的 cutoff 落在 now，等于删除所有非当前 session，
+            // 与"清理 N 天未活动"的语义相悖，属于误伤级 footgun，直接拒绝。上界防止
+            // `Duration::days` / `DateTime` 运算溢出 panic；~10k 年足够任何清理场景。
+            if !(1..=MAX_PRUNE_DAYS).contains(&days) {
+                println!(
+                    "days must be between 1 and {MAX_PRUNE_DAYS}. try: /sessions prune <days>"
+                );
+                return Ok(true);
+            }
+            let cutoff = chrono::Local::now() - chrono::Duration::days(days);
+            let sessions = store.list_sessions()?;
+            let stale = select_stale_sessions(&sessions, &app.session_id, cutoff);
+            if stale.is_empty() {
+                println!("No sessions inactive for {} day(s).", days);
+                return Ok(true);
+            }
+            println!(
+                "Found {} session(s) inactive for {} day(s) (current session kept):",
+                stale.len(),
+                days
+            );
+            let max_id_len = stale.iter().map(|s| s.id.len()).max().unwrap_or(36);
+            for s in &stale {
+                let time = s
+                    .modified_local
+                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let summary = s
+                    .summary
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("-");
+                println!(
+                    "  {:<width$}  {}  {}",
+                    s.id,
+                    time,
+                    summary,
+                    width = max_id_len
+                );
+            }
+            let confirm = crate::commonw::prompt::prompt_yes_or_no_danger(&format!(
+                "Delete these {} session(s)? (y/n): ",
+                stale.len()
+            ));
+            if confirm != Some(true) {
+                println!("canceled by user.");
+                return Ok(true);
+            }
+            let mut deleted_count = 0;
+            let mut skipped_count = 0;
+            let mut failed_count = 0;
+            for s in &stale {
+                let deleted_path = store.session_history_file(&s.id);
+                let session_id = s.id.clone();
+                match store.delete_session_if_unchanged(s, cutoff, || {
+                    let active =
+                        crate::ai::driver::session_pid::scan_session_pids(store.sessions_root())?
+                            .into_iter()
+                            .any(|(id, _, alive)| alive && id == session_id);
+                    if !active {
+                        // 最终校验后再终止该 session 的子代理，避免删除后 Future 写回。
+                        crate::ai::tools::task_tools::discard_tasks_for_session(&session_id);
+                    }
+                    Ok(active)
+                }) {
+                    Ok(PruneSessionDeleteResult::Deleted) => {
+                        crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
+                        deleted_count += 1;
+                    }
+                    Ok(PruneSessionDeleteResult::Missing) => {
+                        skipped_count += 1;
+                        println!("[prune] skipped {}: session no longer exists", s.id);
+                    }
+                    Ok(PruneSessionDeleteResult::Changed) => {
+                        skipped_count += 1;
+                        println!(
+                            "[prune] skipped {}: session changed after confirmation",
+                            s.id
+                        );
+                    }
+                    Ok(PruneSessionDeleteResult::NotExpired) => {
+                        skipped_count += 1;
+                        println!("[prune] skipped {}: session is no longer expired", s.id);
+                    }
+                    Ok(PruneSessionDeleteResult::Active) => {
+                        skipped_count += 1;
+                        println!("[prune] skipped {}: session is active", s.id);
+                    }
+                    Err(err) => {
+                        failed_count += 1;
+                        eprintln!("[prune] failed to delete session {}: {}", s.id, err);
+                    }
+                }
+            }
+            println!(
+                "Prune complete: deleted {deleted_count}, skipped {skipped_count}, failed {failed_count} (inactive for {days} day(s))."
+            );
         }
         "fork" => {
             // 解析 src=<id> / as=<id>，未指定 src 时默认基于当前 session。
@@ -691,7 +837,7 @@ pub fn try_handle_session_command(
                     crate::ai::history::invalidate_context_history_cache_for(
                         &app.session_history_file,
                     );
-                    switch_app_to_session(app, &store, &dst_id)?;
+                    switch_app_to_session(app, &store, &dst_id, true)?;
                     println!(
                         "Forked '{}' -> '{}', switched to new branch.",
                         src_id, dst_id
@@ -730,7 +876,7 @@ pub fn try_handle_session_command(
                     crate::ai::history::invalidate_context_history_cache_for(
                         &app.session_history_file,
                     );
-                    switch_app_to_session(app, &store, &dst_id)?;
+                    switch_app_to_session(app, &store, &dst_id, true)?;
                     println!(
                         "Branched '{}' -> '{}' (kept first {} complete user turn(s)), switched to new branch.",
                         src_id, dst_id, keep
@@ -791,11 +937,12 @@ mod tests {
     use crate::ai::{
         cli::ParsedCli,
         history::{
-            Message, SuspendedSessionStore, append_history_messages,
+            Message, SessionInfo, SuspendedSessionStore, append_history_messages,
             read_stale_patch_targets_sqlite, write_stale_patch_targets_sqlite,
         },
         types::{AgentContext, AppConfig, FunctionCall, SkillBiasMemory, ToolCall},
     };
+    use chrono::{Duration, Local};
     use serde_json::Value;
     use std::{
         fs,
@@ -1231,6 +1378,220 @@ mod tests {
         assert_eq!(branched[1].role, "assistant");
         assert_eq!(branched[2].role, "tool");
         assert_eq!(branched[3].role, "assistant");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn make_session_info(id: &str, days_ago: Option<i64>) -> SessionInfo {
+        SessionInfo {
+            id: id.to_string(),
+            modified_local: days_ago.map(|d| Local::now() - Duration::days(d)),
+            history_revision: 0,
+            size_bytes: 0,
+            first_user_prompt: None,
+            summary: None,
+        }
+    }
+
+    #[test]
+    fn select_stale_sessions_filters_by_age_and_keeps_current() {
+        let sessions = vec![
+            make_session_info("old", Some(40)),
+            make_session_info("recent", Some(5)),
+            make_session_info("current", Some(40)),
+            make_session_info("unknown", None),
+        ];
+        let cutoff = Local::now() - Duration::days(30);
+        let stale = select_stale_sessions(&sessions, "current", cutoff);
+        let stale_ids: Vec<&str> = stale.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(stale_ids, vec!["old"]);
+    }
+
+    /// 把目标 session 文件的 mtime 回拨到 N 天前，用于模拟“N 天未读”。
+    fn set_session_activity_days_ago(path: &std::path::Path, days: i64) {
+        let activity_unix_ms = (Local::now() - Duration::days(days)).timestamp_millis();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(
+                "INSERT INTO meta(key, value) VALUES('last_activity_unix_ms', ?1) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![activity_unix_ms.to_string()],
+            )
+            .unwrap();
+        use std::time::Duration as StdDuration;
+        let time = std::time::SystemTime::now() - StdDuration::from_secs((days as u64) * 86400);
+        let times = std::fs::FileTimes::new().set_modified(time);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+    }
+
+    #[test]
+    fn prune_selects_and_deletes_only_old_disk_sessions() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+
+        // 三个 session：两个旧（>30 天）、一个新（刚刚写入）。
+        for id in ["sess-old-a", "sess-old-b", "sess-fresh"] {
+            let path = store.session_history_file(id);
+            append_history_messages(
+                &path,
+                &[Message {
+                    role: "user".to_string(),
+                    content: Value::String(format!("hi {id}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        }
+        set_session_activity_days_ago(&store.session_history_file("sess-old-a"), 40);
+        set_session_activity_days_ago(&store.session_history_file("sess-old-b"), 35);
+
+        let cutoff = Local::now() - Duration::days(30);
+        let sessions = store.list_sessions().unwrap();
+        let stale = select_stale_sessions(&sessions, &app.session_id, cutoff);
+        let mut stale_ids: Vec<String> = stale.iter().map(|s| s.id.clone()).collect();
+        stale_ids.sort();
+        assert_eq!(
+            stale_ids,
+            vec!["sess-old-a".to_string(), "sess-old-b".to_string()]
+        );
+
+        // 走与 handler 相同的最终重检 + 加锁删除路径，仅省略交互确认与 PID 扫描。
+        for s in &stale {
+            assert_eq!(
+                store
+                    .delete_session_if_unchanged(s, cutoff, || Ok(false))
+                    .unwrap(),
+                PruneSessionDeleteResult::Deleted
+            );
+        }
+        let mut remaining: Vec<String> = store
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining, vec!["sess-fresh".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_rechecks_activity_and_session_state_before_deleting() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let session_id = "sess-racy";
+        let path = store.session_history_file(session_id);
+        let message = |content: &str| Message {
+            role: "user".to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        append_history_messages(&path, &[message("old")]).unwrap();
+        set_session_activity_days_ago(&path, 40);
+
+        let cutoff = Local::now() - Duration::days(30);
+        let sessions = store.list_sessions().unwrap();
+        let candidate = sessions.iter().find(|s| s.id == session_id).unwrap();
+        assert_eq!(
+            store
+                .delete_session_if_unchanged(candidate, cutoff, || Ok(true))
+                .unwrap(),
+            PruneSessionDeleteResult::Active
+        );
+        assert!(path.exists(), "active session must not be deleted");
+
+        append_history_messages(&path, &[message("new activity")]).unwrap();
+        assert_eq!(
+            store
+                .delete_session_if_unchanged(candidate, cutoff, || Ok(false))
+                .unwrap(),
+            PruneSessionDeleteResult::NotExpired
+        );
+        assert!(
+            path.exists(),
+            "session changed after confirmation must be kept"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_rejects_out_of_range_days_without_panic() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+
+        // 落盘两个旧 session，用于验证越界输入被拒后不会误删任何数据。
+        for id in ["sess-stale-a", "sess-stale-b"] {
+            let path = store.session_history_file(id);
+            append_history_messages(
+                &path,
+                &[Message {
+                    role: "user".to_string(),
+                    content: Value::String(format!("hi {id}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        }
+        set_session_activity_days_ago(&store.session_history_file("sess-stale-a"), 40);
+        set_session_activity_days_ago(&store.session_history_file("sess-stale-b"), 35);
+
+        // `0`（退化成删除所有非当前 session）、负数、恰好越过上界、以及会让 chrono
+        // 日期运算溢出 panic 的超大值，都应被优雅拒绝。
+        // `1e8` 天回拨会越过 `DateTime` 下界——若无上界守卫，这一行本身就会 panic。
+        let over_bound = (MAX_PRUNE_DAYS + 1).to_string();
+        let max_i64 = i64::MAX.to_string();
+        for bad in [
+            "0",
+            "-1",
+            "100000000",
+            over_bound.as_str(),
+            max_i64.as_str(),
+        ] {
+            let handled = try_handle_session_command(&mut app, &format!("/sessions prune {bad}"))
+                .expect("prune handler must not error on out-of-range days");
+            assert!(
+                handled,
+                "prune should consume the command for input '{bad}'"
+            );
+        }
+
+        // 两个旧 session 仍然存在：越界输入在进入删除逻辑之前就返回了。
+        let mut remaining: Vec<String> = store
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["sess-stale-a".to_string(), "sess-stale-b".to_string()]
+        );
 
         let _ = fs::remove_dir_all(root);
     }

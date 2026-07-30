@@ -260,8 +260,9 @@ fn mutation_needs_scoped_instruction_preflight(
     messages: &[Message],
     tool_calls: &[ToolCall],
 ) -> bool {
-    let targets =
-        super::super::iteration::project_instruction_target_paths_from_tool_calls(tool_calls, false);
+    let targets = super::super::iteration::project_instruction_target_paths_from_tool_calls(
+        tool_calls, false,
+    );
     if targets.is_empty() {
         return false;
     }
@@ -514,24 +515,9 @@ Reuse its earlier result; only retry after the underlying data changes or with a
 }
 
 fn extract_apply_patch_target_paths_from_patch(patch: &str) -> Vec<PathBuf> {
-    patch
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_start();
-            [
-                "*** Update File: ",
-                "*** Add File: ",
-                "*** Delete File: ",
-                "*** Replace in line: ",
-            ]
-            .iter()
-            .find_map(|prefix| line.strip_prefix(prefix))
-            .map(|path| {
-                FileStore::new(PathBuf::from(path.trim()))
-                    .path()
-                    .to_path_buf()
-            })
-        })
+    crate::ai::tools::apply_patch_target_paths_from_patch(patch)
+        .into_iter()
+        .map(|path| FileStore::new(path).path().to_path_buf())
         .collect()
 }
 
@@ -2246,7 +2232,8 @@ mod tests {
                     std::slice::from_ref(&mutation),
                     false,
                 );
-            let docs = crate::ai::agents::load_scoped_project_instruction_docs_for_targets(&targets);
+            let docs =
+                crate::ai::agents::load_scoped_project_instruction_docs_for_targets(&targets);
             let loaded = docs
                 .iter()
                 .map(|doc| format!("From {}:\n{}", doc.path, doc.content))

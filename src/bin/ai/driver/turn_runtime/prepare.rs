@@ -302,12 +302,20 @@ pub(super) async fn prepare_turn(
         Some(store.session_assets_dir(&app.session_id))
     };
     crate::ai::driver::runtime_ctx::publish_subagent_phase("preparing context");
-    // 收尾阶段可能因中断、请求错误或旧版本进程而未执行。开始下一轮前再做一次
-    // 轻量检查，确保超出上下文预算的历史先被落盘压缩，避免每轮重复请求期摘要。
-    if let Err(err) = compact_session_history_with_app(app).await
-        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-    {
-        eprintln!("[Warning] Failed to compact persisted history before preparing context: {err}");
+    // 收尾阶段可能因中断、请求错误或旧版本进程而未执行；其派发的后台压缩也可能
+    // 仍在进行。开始下一轮前再做一次轻量检查：若已有压缩在跑则跳过（快照只是
+    // 写回缓存，build_context_history 始终从 canonical 重算），否则前台补一次压缩
+    // 落盘，避免每轮重复请求期摘要。
+    if super::finalize::mark_session_compaction_started(&app.session_id) {
+        let compact_result = compact_session_history_with_app(app).await;
+        super::finalize::mark_session_compaction_finished(&app.session_id);
+        if let Err(err) = compact_result
+            && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+        {
+            eprintln!(
+                "[Warning] Failed to compact persisted history before preparing context: {err}"
+            );
+        }
     }
     let mut history = build_context_history(
         history_count,

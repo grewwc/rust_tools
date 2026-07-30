@@ -299,7 +299,6 @@ pub(in crate::ai) fn format_file_tool_target(tool_name: &str, args_json: &str) -
                 }
                 short
             }),
-        "delete_path" => args.get("path").and_then(|v| v.as_str()).map(short_path),
         "apply_patch" => {
             // 优先从 file_path / path 参数取
             for key in &["file_path", "path"] {

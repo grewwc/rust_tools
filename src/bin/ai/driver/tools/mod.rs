@@ -1121,15 +1121,6 @@ fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
         echo_tool_output(name, &run_result.tool_result.content);
     }
 
-    // delete_path 保持原有独立文件提示；读写/补丁工具已内联到状态行。
-    if matches!(name.as_str(), "delete_path") {
-        if let Some(target) = format_file_tool_target(name, &tool_call.function.arguments) {
-            println!(
-                "{}",
-                crate::ai::driver::print::format_tool_note_line("file", &target)
-            );
-        }
-    }
 }
 
 fn reserve_current_process_tool_call_budget(tool_call: &ToolCall) -> Result<(), RunOneResult> {

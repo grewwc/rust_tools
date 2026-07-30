@@ -147,13 +147,8 @@ where
     super::audit::validate_execute_command(command)
         .map_err(|reason| format!("Command blocked: {reason}"))?;
 
-    let output = command_runner::run_command_streaming(
-        command,
-        cwd,
-        timeout,
-        pseudo_terminal,
-        on_chunk,
-    )?;
+    let output =
+        command_runner::run_command_streaming(command, cwd, timeout, pseudo_terminal, on_chunk)?;
     let interrupted = output.timed_out || output.cancelled;
     let formatted = format_command_result(output, timeout);
     if interrupted {

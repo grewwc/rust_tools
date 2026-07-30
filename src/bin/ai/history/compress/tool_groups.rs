@@ -312,7 +312,7 @@ fn tool_call_target_recall(tool_call: &ToolCall) -> String {
                 ));
             }
         }
-        "write_file" | "create_file" | "edit_file" | "delete_path" => {
+        "write_file" | "create_file" | "edit_file" => {
             if let Some(path) = arg_string(&args, &["file_path", "path", "filePath"]) {
                 fields.push(format!(
                     "file: {}",

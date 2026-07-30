@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
     fs::File,
     fs::{self},
@@ -5,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use rust_tools::commonw::FastMap;
 use rust_tools::cw::SkipMap;
 use serde_json::json;
@@ -16,13 +18,39 @@ use super::{
     sqlite::{
         backup_sqlite, read_all_messages_sqlite, read_first_user_prompt_sqlite,
         read_session_list_metadata_sqlite, read_session_title_origin_sqlite,
-        read_session_title_sqlite, remap_context_checkpoint_paths_sqlite,
+        read_session_title_sqlite, remap_context_checkpoint_paths_sqlite, with_session_state_lock,
         write_session_title_sqlite,
     },
     types::Message,
 };
 
 const MAX_SESSION_ID_BYTES: usize = 128;
+const SESSIONS_LIFECYCLE_LOCK: &str = ".sessions-lifecycle.lock";
+
+pub(in crate::ai) fn with_sessions_lifecycle_lock<T>(
+    sessions_root: &Path,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    fs::create_dir_all(sessions_root)?;
+    let lock_path = sessions_root.join(SESSIONS_LIFECYCLE_LOCK);
+    let lock_file = File::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    #[cfg(unix)]
+    unsafe {
+        if libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let result = operation();
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
+    }
+    result
+}
 
 /// 递归复制目录树 `src` -> `dst`（`dst` 不应已存在）。
 /// fork_session 时用于完整复制 assets 目录：checkpoint 正文位于嵌套目录中，
@@ -51,9 +79,19 @@ pub(in crate::ai) struct SessionStore {
 pub(in crate::ai) struct SessionInfo {
     pub(in crate::ai) id: String,
     pub(in crate::ai) modified_local: Option<DateTime<Local>>,
+    pub(in crate::ai) history_revision: i64,
     pub(in crate::ai) size_bytes: u64,
     pub(in crate::ai) first_user_prompt: Option<String>,
     pub(in crate::ai) summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ai) enum PruneSessionDeleteResult {
+    Deleted,
+    Missing,
+    Changed,
+    NotExpired,
+    Active,
 }
 
 /// 标题的持久化来源。旧数据库没有来源标记，必须保守处理，避免误覆盖已有好标题。
@@ -174,12 +212,24 @@ impl SessionStore {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let modified_local = metadata.modified().ok().map(DateTime::<Local>::from);
-            let (first_user_prompt, generated_title) =
+            let file_modified = metadata.modified().ok();
+            let (first_user_prompt, generated_title, last_activity_unix_ms, history_revision) =
                 match read_session_list_metadata_sqlite(&path) {
-                    Ok(metadata) => (metadata.first_user_prompt, metadata.session_title),
-                    Err(_) => (None, None),
+                    Ok(metadata) => (
+                        metadata.first_user_prompt,
+                        metadata.session_title,
+                        metadata.last_activity_unix_ms,
+                        metadata.history_revision,
+                    ),
+                    Err(_) => (None, None, None, 0),
                 };
+            // 新库使用事务内维护的逻辑活动时间；旧库由元数据读取层回退到最后一条
+            // canonical message 的 created_at。只有无法读取逻辑时间时才使用主库 mtime。
+            // 不能使用 -shm/-wal mtime：只读连接和 SQLite 内部维护也可能刷新它们。
+            let modified_local = last_activity_unix_ms
+                .and_then(DateTime::<Utc>::from_timestamp_millis)
+                .map(|time| time.with_timezone(&Local))
+                .or_else(|| file_modified.map(DateTime::<Local>::from));
             // 优先使用 LLM 生成的标题（存储在 meta 表中），fallback 到首条消息摘要。
             let summary = generated_title
                 .as_deref()
@@ -195,16 +245,14 @@ impl SessionStore {
             let timestamp = modified_local
                 .map(|dt| dt.timestamp_millis() as u64)
                 .unwrap_or(0);
-            let size_bytes = self.session_size_bytes(
-                &path,
-                &id,
-                *derived_history_sizes.get(&id).unwrap_or(&0),
-            )?;
+            let size_bytes =
+                self.session_size_bytes(&path, &id, *derived_history_sizes.get(&id).unwrap_or(&0))?;
             sessions.insert(
                 (timestamp, id.clone()),
                 SessionInfo {
                     id,
                     modified_local,
+                    history_revision,
                     size_bytes,
                     first_user_prompt,
                     summary,
@@ -321,14 +369,83 @@ impl SessionStore {
         let path = self.session_history_file(session_id);
         let assets = self.session_assets_dir(session_id);
         let checkpoints = self.checkpoints_dir(session_id);
-        super::checkpoint::with_checkpoint_lock(&checkpoints, || {
-            let existed = path.exists();
-            delete_history_artifacts(&path)?;
-            let derived_existed = self.delete_derived_session_history_artifacts(session_id)?;
-            delete_assets_dir(&assets)?;
-            remove_dir_if_exists(&checkpoints)?;
-            Ok(existed || derived_existed)
+        with_sessions_lifecycle_lock(&self.root, || {
+            super::checkpoint::with_checkpoint_lock(&checkpoints, || {
+                // 与 canonical writer / rollback 共用同一把跨进程锁；锁文件本身必须保留，
+                // 否则删除期间或紧随其后的 writer 可能在不同 inode 上各自取得 flock。
+                with_session_state_lock(&path, || {
+                    self.delete_session_artifacts_unlocked(session_id, &path, &assets, &checkpoints)
+                })
+            })
         })
+    }
+
+    /// prune 的最终校验与删除必须共同持有 lifecycle + checkpoint + session state 锁。
+    /// `is_active` 在所有元数据校验通过后、真正 unlink 前执行，供调用方做最后一次
+    /// PID 活跃检查；state lock 文件本身不属于删除集合，会跨本次临界区保留。
+    pub(in crate::ai) fn delete_session_if_unchanged(
+        &self,
+        candidate: &SessionInfo,
+        cutoff: DateTime<Local>,
+        is_active: impl FnOnce() -> io::Result<bool>,
+    ) -> io::Result<PruneSessionDeleteResult> {
+        Self::validate_session_id(&candidate.id)?;
+        let path = self.session_history_file(&candidate.id);
+        let assets = self.session_assets_dir(&candidate.id);
+        let checkpoints = self.checkpoints_dir(&candidate.id);
+        with_sessions_lifecycle_lock(&self.root, || {
+            super::checkpoint::with_checkpoint_lock(&checkpoints, || {
+                with_session_state_lock(&path, || {
+                    let current = self
+                        .list_sessions()?
+                        .into_iter()
+                        .find(|session| session.id == candidate.id);
+                    let Some(current) = current else {
+                        return if path.exists() {
+                            Err(io::Error::other(format!(
+                                "failed to re-read session '{}' before prune",
+                                candidate.id
+                            )))
+                        } else {
+                            Ok(PruneSessionDeleteResult::Missing)
+                        };
+                    };
+                    if !current.modified_local.is_some_and(|time| time < cutoff) {
+                        return Ok(PruneSessionDeleteResult::NotExpired);
+                    }
+                    if current.modified_local != candidate.modified_local
+                        || current.history_revision != candidate.history_revision
+                    {
+                        return Ok(PruneSessionDeleteResult::Changed);
+                    }
+                    if is_active()? {
+                        return Ok(PruneSessionDeleteResult::Active);
+                    }
+                    self.delete_session_artifacts_unlocked(
+                        &candidate.id,
+                        &path,
+                        &assets,
+                        &checkpoints,
+                    )?;
+                    Ok(PruneSessionDeleteResult::Deleted)
+                })
+            })
+        })
+    }
+
+    fn delete_session_artifacts_unlocked(
+        &self,
+        session_id: &str,
+        path: &Path,
+        assets: &Path,
+        checkpoints: &Path,
+    ) -> io::Result<bool> {
+        let existed = path.exists();
+        delete_history_artifacts(path)?;
+        let derived_existed = self.delete_derived_session_history_artifacts(session_id)?;
+        delete_assets_dir(assets)?;
+        remove_dir_if_exists(checkpoints)?;
+        Ok(existed || derived_existed)
     }
 
     pub(in crate::ai) fn clear_session(&self, session_id: &str) -> io::Result<()> {
@@ -441,9 +558,8 @@ impl SessionStore {
         let Some(text) = read_session_title_sqlite(&path)? else {
             return Ok(None);
         };
-        let origin = SessionTitleOrigin::from_persisted(
-            read_session_title_origin_sqlite(&path)?.as_deref(),
-        );
+        let origin =
+            SessionTitleOrigin::from_persisted(read_session_title_origin_sqlite(&path)?.as_deref());
         Ok(Some(SessionTitle { text, origin }))
     }
 
@@ -1423,7 +1539,9 @@ mod tests {
             })
         );
 
-        store.write_session_title(session_id, "会话标题生成修复").unwrap();
+        store
+            .write_session_title(session_id, "会话标题生成修复")
+            .unwrap();
         assert_eq!(
             store.read_session_title_with_origin(session_id).unwrap(),
             Some(super::SessionTitle {

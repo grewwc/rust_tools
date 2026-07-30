@@ -110,7 +110,6 @@ const MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS: usize = 8;
 const MUTATION_TOOL_NAMES: &[&str] = &[
     "apply_patch",
     "write_file",
-    "delete_path",
     "plan",
     "task_spawn",
     "task_wait",
@@ -765,10 +764,10 @@ fn detect_target_repeat_loop(history: &[Vec<String>], window: usize) -> bool {
 }
 
 fn is_direct_file_mutation_tool(name: &str) -> bool {
-    matches!(name, "apply_patch" | "write_file" | "delete_path")
+    matches!(name, "apply_patch" | "write_file")
 }
 
-/// 判断最近一轮 assistant 是否调用了变更类工具（apply_patch/write_file/delete_path）。
+/// 判断最近一轮 assistant 是否调用了变更类工具（apply_patch/write_file）。
 ///
 /// `execute_command` 是双关工具：`git status`/`git log`/`ls` 等只读取证命令不改变
 /// 世界，却曾被无差别计为 Mutation 进展，导致模型反复刷同一批 git 检查就能不断
@@ -1407,7 +1406,7 @@ impl TurnSupervisor {
     ) -> ToolLoopSignal {
         // 本轮是否推进了任务：触碰新目标（信息增益）或调用变更类工具（实质动作）。
         // 两类信号要分开保留：ReadOnlyBreadth 只能由“继续扩展只读证据面”触发；
-        // 一旦本轮已有 apply_patch/write_file/delete_path 等 mutation，就不应再给模型
+        // 一旦本轮已有 apply_patch/write_file 等 mutation，就不应再给模型
         // 注入“先收敛证据”的 prompt。
         let round_had_mutation = round_has_mutation(progress_messages);
         let mut made_progress = round_had_mutation;
@@ -1643,7 +1642,7 @@ fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::history::Message>
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = "[low-progress] 你已连续多轮调用工具，但任务没有可见的推进：\n\
-        - 若这是「修改/删除/新增代码」类任务，你一直在读取/检索却还没提交任何 apply_patch/write_file/delete_path；\n\
+        - 若这是「修改/删除/新增代码」类任务，你一直在读取/检索却还没提交任何 apply_patch/write_file；\n\
         - 若是探索类任务，最近几轮没有触及新的目标资源，也没有排除掉候选分支。\n\
         请先停下来回答自己：上一步得到了什么『新信息』？如果说不出，就不要再沿同一方向重复。\n\
         然后二选一：(a) 若信息已足够，立即执行下一步实质动作（提交修改 / 给出结论）；\n\

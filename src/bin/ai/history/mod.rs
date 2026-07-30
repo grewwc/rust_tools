@@ -36,7 +36,10 @@ pub(in crate::ai) use sessions::generate_session_summary;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::strip_think_tags;
 #[allow(unused_imports)]
-pub(in crate::ai) use sessions::{SessionInfo, SessionStore, SessionTitle, SessionTitleOrigin};
+pub(in crate::ai) use sessions::{
+    PruneSessionDeleteResult, SessionInfo, SessionStore, SessionTitle, SessionTitleOrigin,
+    with_sessions_lifecycle_lock,
+};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::fork_history_for_subagent;
 

@@ -1792,7 +1792,9 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
         task_ids
             .iter()
             .filter_map(|tid| match registry.get_ref(tid) {
-                Some(entry) if task_entry_owned_by(entry, &current_session_id, current_owner_pid) => {
+                Some(entry)
+                    if task_entry_owned_by(entry, &current_session_id, current_owner_pid) =>
+                {
                     Some((
                         tid.clone(),
                         entry.pid,
@@ -1888,9 +1890,7 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
         let registry = TASK_REGISTRY.lock().unwrap();
         registry
             .iter()
-            .filter(|(_, entry)| {
-                task_entry_owned_by(entry, &current_session_id, current_owner_pid)
-            })
+            .filter(|(_, entry)| task_entry_owned_by(entry, &current_session_id, current_owner_pid))
             .map(|(tid, entry)| {
                 (
                     tid.clone(),

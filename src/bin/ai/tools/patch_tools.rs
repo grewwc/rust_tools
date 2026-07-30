@@ -16,11 +16,11 @@ fn params_apply_patch() -> Value {
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "Absolute target path for a single-file unified diff. Not needed (and ignored) when using a Begin Patch envelope, since each section declares its own target path. `path` is accepted as a compatibility alias."
+                "description": "Absolute target path for a single-file unified diff. Optional when the patch carries a git-style header (`--- a/<path>` / `+++ b/<path>` / `diff --git`), since the path is read from the header. Not needed (and ignored) when using a Begin Patch envelope, since each section declares its own target path. `path` is accepted as a compatibility alias."
             },
             "patch": {
                 "type": "string",
-                "description": "Patch content. Use either unified-diff hunks (`@@` header; content lines begin with space, `-`, or `+`) or a `*** Begin Patch` envelope. For several edits in the SAME file, prefer ONE `*** Update File:` section containing multiple `@@` hunks from one fresh read. If separate same-file sections are clearer or sequentially dependent (for example `Add File` then `Update File`), repeat the same `*** ... File:` target; sections for the same file apply in order to the in-memory result and are committed once. For several files, use one Begin Patch envelope with one or more sections per target. Envelope sections support `*** Update File:`, `*** Add File:`, `*** Delete File:`, and `*** Replace in line:`. Use `*** Delete File:` to remove existing project/source/config files, including git-tracked files. Do not wrap it in a Markdown code fence. Include unique surrounding context (both before and after pure additions when possible); avoid zero-change hunks."
+                "description": "Patch text in exactly one format. (1) One-file unified diff: `@@` hunks whose lines start with space (context), `-` (remove), or `+` (add). Pass `file_path`, or include one consistent git header (`--- a/<path>` plus `+++ b/<path>`, optionally `diff --git`). Unified diffs must target one file and cannot delete it. (2) `*** Begin Patch` envelope: use `*** Update File:`, `*** Add File:`, `*** Delete File:`, or `*** Replace in line:` sections; use this format for multiple files and file deletion. For several edits to one file, prefer one section with multiple hunks made from the same fresh read; repeat the same target only when sections intentionally depend on earlier sections. Copy exact file text without read/search line-number prefixes, include enough unchanged context to identify one location, and include context on both sides of pure additions when possible. Do not mix formats, wrap the patch in Markdown fences, or send a zero-change patch."
             },
             "dry_run": {
                 "type": "boolean",
@@ -34,7 +34,7 @@ fn params_apply_patch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply localized edits; prefer it to rewriting a whole file. Batch related edits: use one `*** Update File:` section with multiple `@@` hunks for several edits in the same file; repeated sections for the same file are also supported and apply sequentially to an in-memory result before one final commit. Supports a unified-diff hunk for one `file_path`, or a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, `*** Delete File:`, or `*** Replace in line:` sections. Use `*** Delete File:` to remove existing project/source/config files, including git-tracked files; `delete_path` is only for registered temp files. Multi-section envelopes are fully validated before writing, rechecked immediately before commit, and rolled back if a write fails. Use `dry_run` to validate without changing files. After `context mismatch` or `ambiguous patch`, re-read the same target before retrying with unique context.",
+        description: "Apply precise localized edits without rewriting whole files. Use a one-file unified diff with `file_path` (or one consistent git header), or a `*** Begin Patch` envelope for multi-file edits, adds, and deletes. Batch related same-file edits into one section with multiple hunks. All sections are validated before writing and rechecked before commit; failures are rolled back when possible. Use `dry_run` for validation. After a context mismatch or ambiguous match, re-read the target and rebuild the patch from current exact text instead of retrying stale context.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -216,6 +216,193 @@ fn optional_file_path_arg(args: &Value) -> Option<&str> {
         .or_else(|| args.get("path"))
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UnifiedDiffHeaderTarget {
+    paths: Vec<String>,
+    deletes_file: bool,
+}
+
+/// 解析 git 的双引号路径 token。除常见 C 转义外也兼容 git quotePath 使用的三位八进制
+/// 字节，避免带空格或转义字符的合法路径被按空白切碎后写错目标。
+fn parse_git_path_token(input: &str) -> Option<(String, &str)> {
+    let input = input.trim_start();
+    if !input.starts_with('"') {
+        let end = input.find(char::is_whitespace).unwrap_or(input.len());
+        return Some((input[..end].to_string(), &input[end..]));
+    }
+
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::new();
+    let mut idx = 1;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'"' => {
+                let path = String::from_utf8(decoded).ok()?;
+                return Some((path, &input[idx + 1..]));
+            }
+            b'\\' => {
+                idx += 1;
+                let escaped = *bytes.get(idx)?;
+                match escaped {
+                    b'a' => decoded.push(0x07),
+                    b'b' => decoded.push(0x08),
+                    b'f' => decoded.push(0x0c),
+                    b'n' => decoded.push(b'\n'),
+                    b'r' => decoded.push(b'\r'),
+                    b't' => decoded.push(b'\t'),
+                    b'v' => decoded.push(0x0b),
+                    b'0'..=b'7' => {
+                        let mut value = escaped - b'0';
+                        for _ in 0..2 {
+                            let Some(next @ b'0'..=b'7') = bytes.get(idx + 1).copied() else {
+                                break;
+                            };
+                            idx += 1;
+                            value = value.saturating_mul(8).saturating_add(next - b'0');
+                        }
+                        decoded.push(value);
+                    }
+                    other => decoded.push(other),
+                }
+            }
+            byte => decoded.push(byte),
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn normalized_diff_path(path: &str) -> Option<String> {
+    if path.is_empty() || path == "/dev/null" {
+        return None;
+    }
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn diff_marker_path(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.starts_with('"') {
+        return parse_git_path_token(raw).map(|(path, _)| path);
+    }
+    // `---`/`+++` 路径允许空格；仅 TAB 明确分隔可选时间戳。
+    Some(raw.split('\t').next().unwrap_or(raw).trim().to_string())
+}
+
+fn record_diff_target(paths: &mut Vec<String>, path: Option<String>) {
+    if let Some(path) = path
+        && !paths.contains(&path)
+    {
+        paths.push(path);
+    }
+}
+
+/// 收集完整 unified diff 中的所有文件目标。`diff --git` 与相邻的 `---`/`+++` 文件头
+/// 会交叉校验并去重；因此标准多文件 diff、带空格的引号路径，以及首个 hunk 后的后续
+/// 文件头都不会被静默误当成单文件 patch。
+fn parse_unified_diff_header_target(patch: &str) -> UnifiedDiffHeaderTarget {
+    let lines: Vec<&str> = patch.lines().collect();
+    let mut parsed = UnifiedDiffHeaderTarget::default();
+
+    for line in &lines {
+        let Some(rest) = line.strip_prefix("diff --git ") else {
+            continue;
+        };
+        let Some((_, rest)) = parse_git_path_token(rest) else {
+            continue;
+        };
+        let Some((new_path, trailing)) = parse_git_path_token(rest) else {
+            continue;
+        };
+        if trailing.trim().is_empty() {
+            record_diff_target(&mut parsed.paths, normalized_diff_path(&new_path));
+        }
+    }
+
+    for (index, pair) in lines.windows(2).enumerate() {
+        let (Some(old_raw), Some(new_raw)) =
+            (pair[0].strip_prefix("--- "), pair[1].strip_prefix("+++ "))
+        else {
+            continue;
+        };
+        // 文件头后必须紧跟（可跨空行）hunk header。否则正文中恰好相邻的
+        // `--- ...` / `+++ ...` 增删行会被误判为第二个文件目标。
+        let followed_by_hunk = lines[index + 2..]
+            .iter()
+            .find(|line| !line.is_empty())
+            .is_some_and(|line| line.starts_with("@@"));
+        if !followed_by_hunk {
+            continue;
+        }
+        let old_path = diff_marker_path(old_raw);
+        let new_path = diff_marker_path(new_raw);
+        parsed.deletes_file |= new_path.as_deref() == Some("/dev/null");
+        let target = new_path
+            .as_deref()
+            .and_then(normalized_diff_path)
+            .or_else(|| old_path.as_deref().and_then(normalized_diff_path));
+        record_diff_target(&mut parsed.paths, target);
+    }
+
+    // 容忍只有一个 `+++` 或 `---` 文件头的模型输出，但只在没有更完整来源时回退，
+    // 且仅扫描首个 hunk 之前，避免把正文中形似文件头的增删行当作目标。
+    if parsed.paths.is_empty() {
+        for line in lines.iter().take_while(|line| !line.starts_with("@@")) {
+            let raw = line
+                .strip_prefix("+++ ")
+                .or_else(|| line.strip_prefix("--- "));
+            let path = raw
+                .and_then(diff_marker_path)
+                .as_deref()
+                .and_then(normalized_diff_path);
+            record_diff_target(&mut parsed.paths, path);
+        }
+    }
+    parsed
+}
+
+fn file_path_from_unified_diff_header(patch: &str) -> Option<String> {
+    let parsed = parse_unified_diff_header_target(patch);
+    (parsed.paths.len() == 1).then(|| parsed.paths[0].clone())
+}
+
+/// 为 driver 的 scoped-instruction preflight 与 stale-patch 账本提供统一目标提取语义。
+/// 即使 envelope 最终因结构错误而执行失败，也尽量暴露已声明的目标，确保首次潜在写入
+/// 前仍会加载对应目录的项目规则。
+pub(crate) fn apply_patch_target_paths_from_patch(raw_patch: &str) -> Vec<PathBuf> {
+    let patch = strip_code_fence(raw_patch);
+    let mut targets = Vec::new();
+    for line in patch.lines() {
+        let path = [
+            "*** Update File:",
+            "*** Add File:",
+            "*** Delete File:",
+            "*** Replace in line:",
+        ]
+        .iter()
+        .find_map(|prefix| line.trim_start().strip_prefix(prefix))
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+        if let Some(path) = path {
+            let path = PathBuf::from(path);
+            if !targets.contains(&path) {
+                targets.push(path);
+            }
+        }
+    }
+    if !targets.is_empty() {
+        return targets;
+    }
+    parse_unified_diff_header_target(&patch)
+        .paths
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn ensure_patch_target_matches(target_path: &Path, envelope_path: &str) -> Result<(), String> {
@@ -1882,11 +2069,44 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         return Ok(success);
     }
 
-    let file_path = initial_file_path.ok_or(
-        "missing file_path: provide `file_path` (or `path`) arg, \
-         or wrap the patch in a `*** Begin Patch` / `*** Update File: <path>` envelope.",
-    )?;
-    let store = FileStore::new(PathBuf::from(file_path));
+    let header_target = parse_unified_diff_header_target(&patch);
+    if header_target.paths.len() > 1 {
+        return Err(format!(
+            "single-file unified diff declares multiple file targets ({}); use one `*** Begin Patch` envelope with a section for each file",
+            header_target.paths.join(", ")
+        ));
+    }
+    if header_target.deletes_file {
+        return Err(
+            "unified diff deletion (`+++ /dev/null`) is not supported because unified mode writes file content; use a `*** Begin Patch` envelope with `*** Delete File: <path>` so deletion is explicit"
+                .to_string(),
+        );
+    }
+    let inferred_file_path = header_target.paths.first().cloned();
+    let file_path = match initial_file_path {
+        Some(path) => path.to_string(),
+        // file_path 缺失时，回退解析 git 风格 diff 头（`--- a/`/`+++ b/`/`diff --git`）
+        // 里自带的路径：模型写出的合法 unified diff 不该被判成 "missing file_path"。
+        None => inferred_file_path.clone().ok_or(
+            "missing file_path: provide `file_path` (or `path`) arg, wrap the patch in a \
+             `*** Begin Patch` / `*** Update File: <path>` envelope, or include a git-style \
+             diff header (`--- a/<path>` and `+++ b/<path>`) so the target path can be read \
+             from the patch itself.",
+        )?,
+    };
+    let store = FileStore::new(PathBuf::from(&file_path));
+    if initial_file_path.is_some()
+        && let Some(header_path) = inferred_file_path
+    {
+        let header_store = FileStore::new(PathBuf::from(&header_path));
+        if header_store.path() != store.path() {
+            return Err(format!(
+                "file_path '{}' conflicts with unified diff header target '{}'; use one consistent target",
+                store.path().display(),
+                header_store.path().display()
+            ));
+        }
+    }
     emit(&format!("target: {}", store.path().display()));
     emit("validating write access");
     store
@@ -1941,8 +2161,10 @@ pub(crate) fn execute_apply_patch_streaming(
 #[cfg(test)]
 mod tests {
     use super::{
-        PatchEnvelopeOp, apply_inline_replace, apply_unified_patch, execute_apply_patch,
-        parse_patch_envelope, parse_patch_envelopes, parse_unified_hunks, strip_code_fence,
+        PatchEnvelopeOp, apply_inline_replace, apply_patch_target_paths_from_patch,
+        apply_unified_patch, execute_apply_patch, file_path_from_unified_diff_header,
+        parse_patch_envelope, parse_patch_envelopes, parse_unified_diff_header_target,
+        parse_unified_hunks, strip_code_fence,
     };
     use crate::ai::test_support::ENV_LOCK;
     use std::{fs, path::PathBuf};
@@ -2628,6 +2850,197 @@ mod tests {
             "line1\nchanged\nline3\n"
         );
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn file_path_from_unified_diff_header_reads_git_style_paths() {
+        // `+++ b/` 侧优先，剥离 `b/` 前缀。
+        assert_eq!(
+            file_path_from_unified_diff_header(
+                "--- a/src/old.rs\n+++ b/src/new.rs\n@@ -1 +1 @@\n-x\n+y\n"
+            )
+            .as_deref(),
+            Some("src/new.rs")
+        );
+        // 删除场景：`+++ /dev/null` 跳过，回退到 `--- a/` 侧。
+        assert_eq!(
+            file_path_from_unified_diff_header(
+                "--- a/src/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
+            )
+            .as_deref(),
+            Some("src/gone.rs")
+        );
+        // `diff --git a/… b/…` 取 b 侧；行尾 TAB+时间戳被剥离。
+        assert_eq!(
+            file_path_from_unified_diff_header(
+                "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\t2026-07-30\n+++ b/foo.rs\t2026-07-30\n@@ -1 +1 @@\n-a\n+b\n"
+            )
+            .as_deref(),
+            Some("foo.rs")
+        );
+        // 绝对路径无 a/ b/ 前缀时原样保留。
+        assert_eq!(
+            file_path_from_unified_diff_header("+++ /abs/path.rs\n@@ -1 +1 @@\n-a\n+b\n")
+                .as_deref(),
+            Some("/abs/path.rs")
+        );
+        // 没有 diff 头则返回 None（裸 `@@` hunk 仍需显式 file_path）。
+        assert_eq!(
+            file_path_from_unified_diff_header("@@ -1 +1 @@\n-a\n+b\n"),
+            None
+        );
+        // `---`/`+++` header 解析必须在首个 hunk 前停止，不能把正文 context 误当成路径。
+        assert_eq!(
+            file_path_from_unified_diff_header("@@ -1 +1 @@\n +++ b/not-a-header.rs\n"),
+            None
+        );
+        // Git 会把带空格的路径写成 JSON/C 风格引号；应先解码再剥离 b/。
+        assert_eq!(
+            file_path_from_unified_diff_header(
+                "--- \"a/src/old name.rs\"\n+++ \"b/src/new name.rs\"\n@@ -1 +1 @@\n-a\n+b\n"
+            )
+            .as_deref(),
+            Some("src/new name.rs")
+        );
+        // 单文件调用不能静默接受不带 `diff --git` 的标准多文件 unified diff；
+        // 每个文件头都必须由自己的 hunk 跟随，冲突时不推断任一目标。
+        assert_eq!(
+            file_path_from_unified_diff_header(
+                "--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\n--- a/two.rs\n+++ b/two.rs\n@@ -1 +1 @@\n-c\n+d\n"
+            ),
+            None
+        );
+        // 标准多文件 Git diff 的第二个 `diff --git` 位于首个 hunk 后；仍必须识别冲突，
+        // 不能把整个 patch 静默应用到第一个文件。
+        assert_eq!(
+            file_path_from_unified_diff_header(
+                "diff --git a/one.rs b/one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/two.rs b/two.rs\n--- a/two.rs\n+++ b/two.rs\n@@ -1 +1 @@\n-c\n+d\n"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_unified_diff_header_target(
+                "diff --git a/one.rs b/one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/two.rs b/two.rs\n--- a/two.rs\n+++ b/two.rs\n@@ -1 +1 @@\n-c\n+d\n"
+            )
+            .paths,
+            vec!["one.rs", "two.rs"]
+        );
+        // 带空格路径必须按 git 的引号/转义规则读取，不能按空白切成半截 token。
+        assert_eq!(
+            file_path_from_unified_diff_header(
+                "diff --git \"a/foo bar.rs\" \"b/foo bar.rs\"\n--- \"a/foo bar.rs\"\n+++ \"b/foo bar.rs\"\n@@ -1 +1 @@\n-a\n+b\n"
+            )
+            .as_deref(),
+            Some("foo bar.rs")
+        );
+        // 即使没有 `+++`/`---` 兜底，引号路径也应从 `diff --git` 正确解析。
+        assert_eq!(
+            file_path_from_unified_diff_header(
+                "diff --git \"a/foo bar.rs\" \"b/foo bar.rs\"\n@@ -1 +1 @@\n-a\n+b\n"
+            )
+            .as_deref(),
+            Some("foo bar.rs")
+        );
+        // `diff --git` 与 `+++` 指向同一文件（无引号）时不算多文件冲突，正常解析。
+        assert_eq!(
+            file_path_from_unified_diff_header(
+                "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n@@ -1 +1 @@\n-a\n+b\n"
+            )
+            .as_deref(),
+            Some("foo.rs")
+        );
+    }
+
+    #[test]
+    fn execute_apply_patch_reads_path_from_git_diff_header_without_file_path_arg() {
+        // 复现历史 loop 的第一张多米诺骨牌：模型写出教科书级 git unified diff
+        // （自带 `--- a/` `+++ b/` 头），但未传 file_path。此前工具报 missing
+        // file_path，逼模型反复换格式试错。修复后应直接从 diff 头读出路径并成功。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("git_diff_header").with_extension("txt");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            // patch 头用相对文件名（相对 cwd 解析），且不传 file_path/path 参数。
+            let patch = format!(
+                "--- a/{file_name}\n+++ b/{file_name}\n@@ -1,3 +1,3 @@\n line1\n-line2\n+changed\n line3\n"
+            );
+            let args = serde_json::json!({ "patch": patch });
+            execute_apply_patch(&args)
+                .expect("apply_patch should read target path from git-style diff header");
+        });
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "line1\nchanged\nline3\n"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_missing_path_error_mentions_diff_header_option() {
+        // 既无 file_path、又无 diff 头、又非信封时，报错文案应提示三条出路之一
+        // 是 git 风格 diff 头，帮模型接地到正确的下一步。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let err = execute_apply_patch(&serde_json::json!({
+            "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
+        }))
+        .expect_err("bare hunk without file_path must error");
+        assert!(err.contains("missing file_path"), "err was: {err}");
+        assert!(
+            err.contains("git-style") && err.contains("+++ b/"),
+            "error should mention the git-style diff-header option; err was: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_apply_patch_rejects_multi_file_diff_even_with_explicit_path() {
+        let patch = "diff --git a/one.rs b/one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/two.rs b/two.rs\n--- a/two.rs\n+++ b/two.rs\n@@ -1 +1 @@\n-c\n+d\n";
+        let err = execute_apply_patch(&serde_json::json!({
+            "file_path": "one.rs",
+            "patch": patch,
+        }))
+        .expect_err("single-file mode must reject a multi-file diff");
+        assert!(err.contains("multiple file targets"), "err was: {err}");
+    }
+
+    #[test]
+    fn unified_header_parser_ignores_header_shaped_hunk_body_lines() {
+        let patch =
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n--- old marker\n+++ new marker\n";
+        assert_eq!(
+            file_path_from_unified_diff_header(patch).as_deref(),
+            Some("notes.txt")
+        );
+    }
+
+    #[test]
+    fn execute_apply_patch_rejects_dev_null_deletion_with_actionable_guidance() {
+        let patch =
+            "diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n";
+        let err = execute_apply_patch(&serde_json::json!({ "patch": patch }))
+            .expect_err("unified mode must not silently turn deletion into an empty file");
+        assert!(err.contains("+++ /dev/null"), "err was: {err}");
+        assert!(err.contains("*** Delete File:"), "err was: {err}");
+    }
+
+    #[test]
+    fn shared_target_extractor_covers_envelope_and_quoted_git_header() {
+        assert_eq!(
+            apply_patch_target_paths_from_patch(
+                "*** Begin Patch\n*** Update File: src/a.rs\n*** Add File: src/b.rs\n*** End Patch"
+            ),
+            vec![PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")]
+        );
+        assert_eq!(
+            apply_patch_target_paths_from_patch(
+                "diff --git \"a/src/old name.rs\" \"b/src/new name.rs\"\n@@ -1 +1 @@\n-old\n+new\n"
+            ),
+            vec![PathBuf::from("src/new name.rs")]
+        );
     }
 
     #[test]

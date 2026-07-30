@@ -24,8 +24,9 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
    subagent task tools with explicit overflow stubs/file pointers, not lossy
    summaries.
 6. **Temp files.** `write_file(temp=true)` writes under `runtime_ctx::temp_dir()`
-   and registers a relative path in the JSON temp registry. `delete_path` only
-   deletes registered temp files. Delete project/source/config files (incl.
+   and registers a relative path in the JSON temp registry for audit tracking.
+   Temp files are cleaned up automatically when the session ends. Delete
+   project/source/config files (incl.
    git-tracked) via `apply_patch` with a `*** Delete File:` section.
 7. **Process groups.** `execute_command` runs in its own process group. Keep
    background pgids in the in-memory session registry and kill by process group at
@@ -36,10 +37,17 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
 9. **Patch/read/search contracts.** `apply_patch` anchors on remove lines,
    normalizes confusable typographic chars (smart quotes, dashes, NBSP) so
    model-introduced variants match without corrupting output, and treats
-   ambiguous hunk matches as a hard error. Prefer one `apply_patch` call with
-   multiple `@@` hunks per file (one `*** Update File:` section); one envelope for
-   multi-file edits. `read_file` paginates by line and by character cap. Text
-   search lives in the dedicated grep/search tools, not here.
+   ambiguous hunk matches as a hard error. A single-file unified diff may carry a
+   git-style header (`--- a/<path>` / `+++ b/<path>` / `diff --git`), including
+   quoted paths; when present the target path is read from the header, so
+   `file_path` is optional. Reject multi-file unified diffs and `/dev/null`
+   deletion rather than guessing; use an envelope with explicit `*** Delete File:`
+   for deletion. Driver preflight and stale-patch tracking must reuse the tool's
+   target extractor so inferred git-header paths receive the same safeguards as
+   envelope paths. Prefer one call with multiple `@@` hunks per file (one
+   `*** Update File:` section); one envelope for multi-file edits. `read_file`
+   paginates by line and by character cap. Text search lives in dedicated grep/search
+   tools, not here.
 10. **Subagent tools are top-level only.** The `task` family
     (`task`/`task_spawn`/`task_wait`/`task_status`/`task_cancel`) must be hidden
     from subagents, not reintroduced by `enable_tools`, and rejected when

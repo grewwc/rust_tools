@@ -4,7 +4,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -23,6 +23,7 @@ use super::{
 };
 
 const STALE_PATCH_TARGETS_META_KEY: &str = "stale_patch_targets_v1";
+const LAST_ACTIVITY_META_KEY: &str = "last_activity_unix_ms";
 
 static SESSION_STATE_LOCKS: LazyLock<Mutex<FxHashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
@@ -63,7 +64,7 @@ pub(super) fn remove_session_state_lock_entry(path: &Path) {
 
 /// 将会替换整个 live SQLite 文件的 rollback 与常规 canonical writer 串行化。
 /// 进程内 mutex 避免同进程线程间 `flock` 语义差异，文件锁负责跨进程互斥。
-fn with_session_state_lock<T>(
+pub(super) fn with_session_state_lock<T>(
     path: &Path,
     operation: impl FnOnce() -> io::Result<T>,
 ) -> io::Result<T> {
@@ -121,6 +122,8 @@ pub(in crate::ai) struct RecentTurnWindow {
 pub(in crate::ai) struct SessionListMetadata {
     pub(in crate::ai) first_user_prompt: Option<String>,
     pub(in crate::ai) session_title: Option<String>,
+    pub(in crate::ai) last_activity_unix_ms: Option<i64>,
+    pub(in crate::ai) history_revision: i64,
 }
 
 fn open_history_db(path: &Path) -> Result<Connection, io::Error> {
@@ -235,9 +238,25 @@ pub(in crate::ai) fn read_history_revision(path: &Path) -> Option<i64> {
     Some(value.unwrap_or(0))
 }
 
-/// 在写事务内递增 `meta.history_revision`。所有会改变 messages 内容的写路径
-/// （append / replace / clear / truncate）都必须调用它，使 `read_history_revision`
-/// 能被跨连接观察到变化。
+/// 记录最近一次消息写入时间；同一毫秒内连续写入也保持单调递增。
+fn touch_session_activity(conn: &Connection) -> io::Result<()> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let previous = read_i64_meta_from_conn(conn, LAST_ACTIVITY_META_KEY).unwrap_or(0);
+    let next = now_ms.max(previous.saturating_add(1));
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value, created_at)
+         VALUES (?1, ?2, unixepoch())",
+        params![LAST_ACTIVITY_META_KEY, next.to_string()],
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(())
+}
+
+/// 在写事务内递增历史版本，并同步刷新逻辑活动时间。
 fn bump_history_revision(conn: &Connection) -> io::Result<()> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('history_revision', '1')
@@ -245,7 +264,7 @@ fn bump_history_revision(conn: &Connection) -> io::Result<()> {
         [],
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
-    Ok(())
+    touch_session_activity(conn)
 }
 
 fn history_generation(conn: &Connection) -> io::Result<i64> {
@@ -316,6 +335,7 @@ fn reserve_turn_index_sqlite_unlocked(path: &Path) -> io::Result<usize> {
         params![next.to_string()],
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
+    touch_session_activity(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
     usize::try_from(current).map_err(io::Error::other)
 }
@@ -437,6 +457,7 @@ pub(in crate::ai) fn rebase_metadata_after_rollback(
         params![bump_rev.to_string()],
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
+    touch_session_activity(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
@@ -1770,7 +1791,30 @@ fn read_session_title_from_conn(conn: &Connection) -> Option<String> {
     title.filter(|title| !title.trim().is_empty())
 }
 
-/// 单次只读连接读取 `/ss` 列表的标题与首条用户请求。
+fn read_i64_meta_from_conn(conn: &Connection, key: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key=?1 LIMIT 1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|value| value.parse::<i64>().ok())
+}
+
+/// 旧 session 尚未写入显式活动时间时，以最后一条 canonical message 的创建时间
+/// 作为活动时间。`messages.created_at` 使用 Unix 秒，列表接口统一返回毫秒。
+fn read_latest_message_activity_unix_ms(conn: &Connection) -> Option<i64> {
+    conn.query_row("SELECT MAX(created_at) FROM messages", [], |row| {
+        row.get::<_, Option<i64>>(0)
+    })
+    .ok()
+    .flatten()
+    .and_then(|seconds| seconds.checked_mul(1_000))
+}
+
+/// 单次只读连接读取 `/ss` 列表的标题、首条用户请求与活动时间。
 ///
 /// 两项元数据沿用列表层原本的容错语义：单项查询失败不影响另一项，也不会让
 /// 一个损坏或旧格式的 session 阻断整个列表。
@@ -1781,6 +1825,9 @@ pub(in crate::ai) fn read_session_list_metadata_sqlite(
     Ok(SessionListMetadata {
         first_user_prompt: read_first_user_prompt_from_conn(&conn).unwrap_or(None),
         session_title: read_session_title_from_conn(&conn),
+        last_activity_unix_ms: read_i64_meta_from_conn(&conn, LAST_ACTIVITY_META_KEY)
+            .or_else(|| read_latest_message_activity_unix_ms(&conn)),
+        history_revision: read_i64_meta_from_conn(&conn, "history_revision").unwrap_or(0),
     })
 }
 
@@ -1820,6 +1867,7 @@ pub(in crate::ai) fn write_session_title_sqlite(
             rusqlite::params![origin],
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
+        touch_session_activity(&tx)?;
         tx.commit().map_err(|e| io::Error::other(e.to_string()))
     })
 }
@@ -2095,7 +2143,7 @@ mod tests {
     }
 
     #[test]
-    fn session_list_metadata_reads_both_fields_without_creating_missing_database() {
+    fn session_list_metadata_reads_fields_and_legacy_activity_without_creating_database() {
         let dir = std::env::temp_dir().join(format!(
             "session_list_metadata_test_{}_{}",
             std::process::id(),
@@ -2111,9 +2159,25 @@ mod tests {
         append_history_sqlite(&path, vec![msg("user", "first prompt")]).unwrap();
         write_session_title_sqlite(&path, "generated title", "model").unwrap();
 
+        // 模拟尚未写入 last_activity_unix_ms 的旧 session。列表必须使用消息时间，
+        // 不能依赖会被只读连接创建/刷新的 SQLite -shm 文件时间。
+        let conn = open_history_db(&path).unwrap();
+        conn.execute(
+            "UPDATE messages SET created_at = ?1",
+            [1_700_000_000_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM meta WHERE key = 'last_activity_unix_ms'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
         let metadata = read_session_list_metadata_sqlite(&path).unwrap();
         assert_eq!(metadata.first_user_prompt.as_deref(), Some("first prompt"));
         assert_eq!(metadata.session_title.as_deref(), Some("generated title"));
+        assert_eq!(metadata.last_activity_unix_ms, Some(1_700_000_000_000));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

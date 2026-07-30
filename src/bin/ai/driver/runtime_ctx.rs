@@ -242,8 +242,7 @@ pub(crate) fn effective_cwd() -> std::io::Result<PathBuf> {
 // `<std::env::temp_dir()/.agent_tmp/<session>/`（系统临时目录，不污染项目）。
 //
 // 通过 `write_file(temp=true)` 写入此目录的文件会被记录在持久化注册表
-// （`storage::temp_registry`）中，只有注册表中的文件才能被 `delete_path`
-// 删除——未经 agent 创建的文件一律拒绝，杜绝误删源码/配置。
+// （`storage::temp_registry`）中，供审计跟踪。临时文件在会话结束时由运行时统一清理。
 // 注册表以 JSON 文件持久化，会话终止后重启仍可读取。
 // =============================================================================
 

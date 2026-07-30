@@ -184,9 +184,9 @@ fn parse_output_item_event(
         .trim()
         .to_ascii_lowercase();
 
-    // 完整的 reasoning output item 只在 `.done` 落地（`.added` 时 encrypted_content
-    // 尚未填充）。只捕获真正带 `encrypted_content` 的 item：没有加密载荷就无法
-    // 忠实回放，交回上层退化为不回传，避免送半截 item 触发 400。
+    // 只捕获 `.done` 上的 reasoning item：`.added` 虽然也带 `encrypted_content` 字段，
+    // 但那是固定长度的占位 stub（实测恒为同一短串），完整可回放的加密载荷只在 `.done`
+    // 落地。没有加密载荷就无法忠实回放，交回上层退化为不回传，避免送半截 item 触发 400。
     if item_type == "reasoning" {
         if event_type == "response.output_item.done"
             && item
