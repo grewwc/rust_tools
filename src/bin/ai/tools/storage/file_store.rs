@@ -5,12 +5,17 @@ use crate::ai::errors::AiError;
 use aios_kernel::primitives::VfsError;
 
 pub(crate) struct FileStore {
+    /// 调用方传入的原始路径（未经 resolve），用于错误提示中展示，避免模型
+    /// 看到解析后的绝对路径时无法对应自己的输入。
+    original: PathBuf,
     path: PathBuf,
 }
 
 impl FileStore {
     pub(crate) fn new(path: PathBuf) -> Self {
+        let original = path.clone();
         Self {
+            original,
             path: resolve_effective_path(path),
         }
     }
@@ -32,9 +37,21 @@ impl FileStore {
     pub(crate) fn validate_write_access(&self) -> Result<(), AiError> {
         self.validate_read_access()?;
         if !path_within_allowed_roots(&self.path) {
+            let resolved = self.path.display();
+            let hint = if self.original.to_string_lossy().contains("tmp/") {
+                "\nHint: for temporary/scratch files, use temp=true with a relative \
+                 filename (e.g. file_path='script.py', temp=true) — the temp directory \
+                 is write-accessible without sandbox restrictions."
+            } else {
+                "\nHint: for temporary/scratch files, use temp=true with a relative \
+                 filename to write under the session temp directory."
+            };
             return Err(AiError::file(
-                self.path.display().to_string(),
-                "Access blocked: path is outside the sandbox write roots (defaults to effective_cwd when ai.sandbox.allowed_roots is unset)",
+                self.original.display().to_string(),
+                format!(
+                    "Write blocked: path '{resolved}' is outside the allowed write \
+                     directory (effective_cwd).{hint}"
+                ),
             ));
         }
         Ok(())
@@ -288,6 +305,14 @@ fn path_within_allowed_roots(path: &Path) -> bool {
         .collect();
     if roots.is_empty() {
         roots.push(normalize_lexical(&base));
+    }
+    // session 临时目录始终可写：模型可能从之前工具输出中发现 temp 路径后
+    // 用绝对路径写入（不带 temp=true），不应被沙箱拦截。
+    if let Ok(temp) = crate::ai::driver::runtime_ctx::temp_dir() {
+        let temp = normalize_lexical(&temp);
+        if !roots.iter().any(|r| temp.starts_with(r)) {
+            roots.push(temp);
+        }
     }
     path_within_roots(path, &base, &roots)
 }
@@ -551,5 +576,19 @@ mod tests {
 
         assert_eq!(resolved, temp_root.join("nested/file.txt"));
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn session_temp_dir_is_always_writable() {
+        // session 临时目录（由 runtime_ctx::temp_dir() 返回）即使不在
+        // effective_cwd 之下也应被允许写入：模型可能从先前工具输出中
+        // 发现 temp 路径后用绝对路径写入（不带 temp=true）。
+        let temp = crate::ai::driver::runtime_ctx::temp_dir().unwrap();
+        let target = temp.join(format!("sandbox-test-{}.txt", uuid::Uuid::new_v4()));
+        assert!(
+            path_within_allowed_roots(&target),
+            "session temp dir path must be within allowed write roots: {}",
+            target.display()
+        );
     }
 }

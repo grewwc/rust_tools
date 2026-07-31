@@ -34,6 +34,15 @@ mod barrier;
 mod oauth;
 mod sync_task;
 
+/// 供 driver 内部的显式命令复用同步 `task` 路径，保持子代理隔离、取消和证据持久化语义。
+pub(in crate::ai::driver) fn execute_direct_subagent_task(
+    tool_call_id: &str,
+    args: &Value,
+    hard_timeout: StdDuration,
+) -> Result<ToolResult, String> {
+    sync_task::execute_sync_task_with_hard_timeout(tool_call_id, args, hard_timeout)
+}
+
 #[allow(unused_imports)]
 use async_pipe::*;
 

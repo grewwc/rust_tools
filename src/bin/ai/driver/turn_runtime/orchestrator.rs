@@ -3309,6 +3309,14 @@ pub(in crate::ai::driver) async fn run_turn(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+    // `/audit` 是用户直接请求的同步子代理调用。必须在父 DRIVER_CTX 已建立、
+    // 子 agent 尚未进入递归 turn 前处理，才能复用 task 的隔离与证据生命周期。
+    if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
+        if let Some(command) = crate::ai::driver::commands::audit::parse_audit_command(&question)
+        {
+            return Ok(execute_audit_command(command, should_quit));
+        }
+    }
     // 把 (session_id, turn_id) 注入 task_local，让下游工具调用与反馈
     // 写入路径能拿到正确身份。turn_id 由 session SQLite 原子分配，包含普通、
     // resume 和 internal turn，跨重启/多进程也不会重复。
@@ -3346,6 +3354,43 @@ pub(in crate::ai::driver) async fn run_turn(
             },
         )
         .await
+}
+
+fn execute_audit_command(
+    command: crate::ai::driver::commands::audit::AuditCommand,
+    should_quit: bool,
+) -> TurnOutcome {
+    match command {
+        crate::ai::driver::commands::audit::AuditCommand::Usage => {
+            println!("Usage: /audit <instruction>");
+        }
+        crate::ai::driver::commands::audit::AuditCommand::Run(instruction) => {
+            // 默认只继承 cwd/skills，避免把无关的父对话和 memory 带入审计任务。
+            let description = format!("/audit {instruction}");
+            let args = serde_json::json!({
+                "description": description,
+                "prompt": instruction,
+                "agent": "audit",
+            });
+            match crate::ai::driver::tools::execute_direct_subagent_task(
+                "slash-audit",
+                &args,
+                crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
+            ) {
+                Ok(result) => println!(
+                    "\n{}",
+                    crate::ai::driver::commands::audit::terminal_audit_result(&result.content)
+                ),
+                Err(error) => println!("\n[audit] Unable to start audit subagent: {error}"),
+            }
+        }
+    }
+
+    if should_quit {
+        TurnOutcome::Quit
+    } else {
+        TurnOutcome::Continue
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

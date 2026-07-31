@@ -17,10 +17,12 @@
 //! - 累计被标记 **PRUNE_THRESHOLD** 次后，消息内容被卸载到会话 asset 磁盘，
 //!   inline 替换为**可召回 stub**（保留 `file_path` + 召回锚点 + head/tail 预览，
 //!   保留消息结构、不删除，避免破坏 tool_call ↔ tool_response 配对）。
-//! - 计数语义为「容忍静默 + 衰减」而非「必须连续」：本轮模型未产出任何 prune
-//!   指令时计数完全不动（连续调工具的中间轮不会误清零）；本轮产出了 prune
-//!   指令、但某个此前被标记的 id 未再出现，则其计数 -1（衰减，可回退），而非
-//!   直接归零。详见 [`update_prune_marks`]。
+//! - 计数语义为「容忍静默 + 单调累计」而非「必须连续」：本轮模型未产出任何 prune
+//!   指令时计数完全不动（连续调工具的中间轮不会误清零）；被标记的 id 计数只增
+//!   （+1），未被标记的既有条目**保持不变、不衰减**，直到该 id 真正离开上下文或
+//!   被保护策略排除时才清除。之所以不衰减：模型每轮通常标记的是"这一轮新变陈旧
+//!   的结果"（每轮标不同 id），衰减会在计数到阈值前将其清零，使机制在最典型用法
+//!   下几乎永不触发。详见 [`update_prune_marks`]。
 //!
 //! ## 安全保证（不丢真实信息）
 //!
@@ -56,7 +58,7 @@ fn is_prune_protected_tool(tool_name: &str) -> bool {
 
 /// 累计被标记多少次后才卸载裁剪。
 ///
-/// 采用「容忍静默 + 衰减」累计语义（见 [`update_prune_marks`]），因此这里的阈值
+/// 采用「容忍静默 + 单调累计」语义（见 [`update_prune_marks`]），因此这里的阈值
 /// 表示**累计**而非**连续**次数。裁剪本身无损可召回（全文落盘 + stub），因此可用
 /// 较低阈值：2 次即卸载，兼顾激进回收与「单个 stray token 不误触发」的迟滞。
 pub(crate) const PRUNE_THRESHOLD: u8 = 2;
@@ -130,7 +132,7 @@ pub(crate) fn parse_prune_from_hidden_meta(hidden_meta: &str) -> (Vec<String>, S
     (prune_ids, remaining)
 }
 
-/// 更新裁剪计数（「容忍静默 + 衰减」语义）。
+/// 更新裁剪计数（「容忍静默 + 单调累计」语义）。
 ///
 /// - `current_marks`: 当前会话的裁剪计数表（tool_call_id → 累计计数）
 /// - `prune_ids`: 本轮模型标记的 tool_call_id 列表
@@ -138,12 +140,14 @@ pub(crate) fn parse_prune_from_hidden_meta(hidden_meta: &str) -> (Vec<String>, S
 ///
 /// 逻辑：
 /// 1. **静默轮不动计数**：本轮模型未产出任何有效 prune 指令时（`prune_ids` 里没有
-///    命中 active 的 id），整表保持不变直接返回。这样"连续调工具、中间轮没写
-///    self_note"不会把此前攒下的计数误清零——这是旧「连续」语义导致机制几乎从不
-///    触发的根因。
-/// 2. 本轮确有有效标记时：被标记的 id 计数 +1；此前存在于表中、但本轮**未**被
-///    标记且仍 active 的 id 计数 -1（衰减，可回退到 0 被清理），而非直接归零。
-/// 3. 清理计数 <=0、已不在当前上下文、或已被保护策略排除的条目。
+///    命中 active 的 id），整表保持不变（仅清理已离开上下文/被保护的陈旧条目）。
+///    这样"连续调工具、中间轮没写 self_note"不会误清此前攒下的计数。
+/// 2. 本轮被标记的 id 计数 +1（单调累计）。**未被标记的既有条目保持不变、不衰减**：
+///    模型每轮通常标记的是"这一轮刚用完、新变陈旧的结果"（每轮标不同 id），若对
+///    未标记项做衰减，会在计数到达阈值前把它清零，使机制在最典型用法下几乎永不
+///    触发——这正是早前 decay 版本的隐性失效。累计只增不减，直到该 id 真正离开
+///    上下文或被保护策略排除时才清除。
+/// 3. 清理已不在当前上下文、或已被保护策略排除的条目。
 pub(crate) fn update_prune_marks(
     current_marks: &mut FxHashMap<String, u8>,
     prune_ids: &[String],
@@ -155,23 +159,7 @@ pub(crate) fn update_prune_marks(
         .cloned()
         .collect::<FxHashSet<_>>();
 
-    // 静默轮（本轮无任何命中 active 的有效标记）：不触碰计数，避免中间工具轮误清零。
-    if marked_ids.is_empty() {
-        // 仍需清理已离开上下文 / 被保护的陈旧条目，避免计数表无界增长。
-        current_marks.retain(|id, v| *v > 0 && active_prunable_tool_ids.contains(id));
-        return;
-    }
-
-    // 对本轮未被标记、但仍 active 的既有条目做衰减（-1），保留"模型改主意可回退"语义。
-    for id in active_prunable_tool_ids {
-        if !marked_ids.contains(id)
-            && let Some(count) = current_marks.get_mut(id)
-        {
-            *count = count.saturating_sub(1);
-        }
-    }
-
-    // 增加被标记的 tool 的计数。
+    // 增加被标记的 tool 的计数（单调累计；静默轮 marked_ids 为空即无操作）。
     for id in marked_ids {
         let count = current_marks.entry(id).or_insert(0);
         *count = count.saturating_add(1);
@@ -481,16 +469,39 @@ mod tests {
         assert_eq!(marks.get("call_1"), Some(&2));
         assert_eq!(marks.get("call_2"), Some(&2));
 
-        // 第三轮只标记 call_1：call_2 未被标记但本轮有有效标记 → 衰减 -1（2→1），
-        // 不再像旧「连续」语义那样直接清零。
+        // 第三轮只标记 call_1：单调累计——call_2 未被标记但**保持不变**（不衰减），
+        // call_1 继续 +1。
         update_prune_marks(&mut marks, &["call_1".to_string()], &active);
         assert_eq!(marks.get("call_1"), Some(&3));
-        assert_eq!(marks.get("call_2"), Some(&1));
+        assert_eq!(marks.get("call_2"), Some(&2));
+    }
 
-        // 再来一轮只标记 call_1：call_2 衰减到 0 被清理。
-        update_prune_marks(&mut marks, &["call_1".to_string()], &active);
-        assert_eq!(marks.get("call_1"), Some(&4));
-        assert!(!marks.contains_key("call_2"));
+    /// 真实分布验证：模型每轮标记"这一轮刚用完、新变陈旧"的**不同** id，从不重复
+    /// 标记同一个旧 id。单调累计下，各 id 的计数只增不减，多轮后能真正到达阈值
+    /// 并触发裁剪；若沿用旧的衰减语义，这里会在到阈值前被清零、永不触发。
+    #[test]
+    fn test_update_prune_marks_distinct_ids_accumulate_monotonically() {
+        let mut marks = FxHashMap::default();
+        let active: FxHashSet<String> = ["A", "B", "C"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // 每轮标不同 id（真实模型行为）。
+        update_prune_marks(&mut marks, &["A".to_string()], &active);
+        update_prune_marks(&mut marks, &["B".to_string()], &active);
+        update_prune_marks(&mut marks, &["C".to_string()], &active);
+        // 三个 id 各累计 1，均未被衰减清零。
+        assert_eq!(marks.get("A"), Some(&1));
+        assert_eq!(marks.get("B"), Some(&1));
+        assert_eq!(marks.get("C"), Some(&1));
+
+        // 再各标一轮 → 到达阈值 2，可被裁剪。
+        update_prune_marks(&mut marks, &["A".to_string()], &active);
+        update_prune_marks(&mut marks, &["B".to_string()], &active);
+        assert_eq!(marks.get("A"), Some(&2));
+        assert_eq!(marks.get("B"), Some(&2));
+        assert!(marks.values().any(|v| *v >= PRUNE_THRESHOLD));
     }
 
     /// 静默轮（本轮无任何有效 prune 标记）不得清零既有计数——这是新语义相对旧

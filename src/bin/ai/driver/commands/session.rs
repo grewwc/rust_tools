@@ -3,8 +3,9 @@ use uuid::Uuid;
 
 use crate::ai::{
     history::{
-        PruneSessionDeleteResult, SessionInfo, SessionStore, SuspendedSessionEntry,
-        SuspendedSessionStore, format_suspended_timestamp_label,
+        PruneSessionDeleteResult, SessionInfo, SessionStore, SessionTitleOrigin,
+        SuspendedSessionEntry, SuspendedSessionStore, format_suspended_timestamp_label,
+        generate_session_summary,
     },
     types::App,
 };
@@ -279,11 +280,13 @@ pub fn try_handle_session_command(
     };
     let top_level_suspend = matches!(cmd, "suspend" | "bg" | "detach" | "susp");
     let top_level_close = cmd == "close";
+    let top_level_fork = cmd == "fork";
     if cmd != "sessions"
         && cmd != "session"
         && cmd != "ss"
         && !top_level_suspend
         && !top_level_close
+        && !top_level_fork
     {
         return Ok(false);
     }
@@ -291,6 +294,8 @@ pub fn try_handle_session_command(
         "suspend"
     } else if top_level_close {
         "close"
+    } else if top_level_fork {
+        "fork"
     } else {
         parts.next().unwrap_or("list")
     };
@@ -308,6 +313,9 @@ pub fn try_handle_session_command(
             println!("  /sessions suspend         suspend current session and return to shell");
             println!(
                 "  /close                    close and delete current session, then exit (or :close)"
+            );
+            println!(
+                "  /fork                     fork current session into a new branch (keeps original) and switch"
             );
             println!(
                 "  /sessions bound           list suspended sessions bound to current terminal"
@@ -343,7 +351,9 @@ pub fn try_handle_session_command(
             println!();
         }
         "list" | "ls" | "" => {
-            let sessions = store.list_sessions()?;
+            let mut sessions = store.list_sessions()?;
+            // 大小按需并行统计：list_sessions 只读元数据，assets 递归统计放到这里多核并行。
+            store.attach_session_sizes(&mut sessions)?;
             if sessions.is_empty() {
                 println!("No sessions.");
             } else {
@@ -376,13 +386,16 @@ pub fn try_handle_session_command(
             println!("session: {}", app.session_id);
             println!("history: {}", app.session_history_file.display());
             // 显示 session 摘要
-            let sessions = store.list_sessions().unwrap_or_default();
-            if let Some(current) = sessions.iter().find(|s| s.id == app.session_id) {
-                if let Some(summary) = &current.summary {
+            // 只读当前 session 的预览，避免扫描并统计全部 session。
+            if let Ok(Some((summary, modified_local))) =
+                store.read_session_preview(&app.session_id)
+            {
+                if let Some(summary) = &summary {
                     println!("summary: {}", summary);
                 }
-                println!("size: {}", format_size(current.size_bytes));
-                if let Some(t) = current.modified_local {
+                let size = store.session_total_size(&app.session_id).unwrap_or(0);
+                println!("size: {}", format_size(size));
+                if let Some(t) = modified_local {
                     println!("modified: {}", t.format("%Y-%m-%d %H:%M:%S"));
                 }
             }
@@ -412,9 +425,9 @@ pub fn try_handle_session_command(
             switch_app_to_session(app, &store, id, true)?;
             println!("Switched session: {}", id);
             // 显示 session 摘要
-            let sessions = store.list_sessions().unwrap_or_default();
-            if let Some(session) = sessions.iter().find(|s| s.id == id) {
-                if let Some(summary) = &session.summary {
+            // 只读目标 session 预览，避免扫描全部 session。
+            if let Ok(Some((summary, _))) = store.read_session_preview(id) {
+                if let Some(summary) = &summary {
                     println!("summary: {}", summary);
                 }
             }
@@ -697,9 +710,8 @@ pub fn try_handle_session_command(
             );
         }
         "clear-all" | "clear_all" | "wipe" => {
-            let confirm = crate::commonw::prompt::prompt_yes_or_no_danger(
-                "Delete ALL sessions? (y/n): ",
-            );
+            let confirm =
+                crate::commonw::prompt::prompt_yes_or_no_danger("Delete ALL sessions? (y/n): ");
             if confirm != Some(true) {
                 println!("canceled by user.");
                 return Ok(true);
@@ -834,6 +846,10 @@ pub fn try_handle_session_command(
             let dst_id = dst.unwrap_or_else(|| Uuid::new_v4().to_string());
             match store.fork_session(&src_id, &dst_id) {
                 Ok(()) => {
+                    // 为 fork 出的新 session 写入带深度的 fork 标记标题（支持 fork 的 fork）。
+                    if let Err(err) = apply_fork_title(&store, &src_id, &dst_id) {
+                        eprintln!("[fork] 无法写入 fork 标记标题: {err}");
+                    }
                     crate::ai::history::invalidate_context_history_cache_for(
                         &app.session_history_file,
                     );
@@ -892,6 +908,89 @@ pub fn try_handle_session_command(
         }
     }
     Ok(true)
+}
+
+/// 解析标题开头的 fork 标记，返回 (已 fork 深度, 去除标记后的内层标题)。
+/// 无标记或格式不符时返回 (0, 原标题)。`[fork]` 视为深度 1，`[fork N]` 视为深度 N。
+fn parse_fork_marker(title: &str) -> (usize, &str) {
+    let trimmed = title.trim_start();
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return (0, title);
+    };
+    let Some(close) = rest.find(']') else {
+        return (0, title);
+    };
+    let tag = &rest[..close];
+    let after = rest[close + 1..].trim_start();
+    let Some(suffix) = tag.strip_prefix("fork") else {
+        return (0, title);
+    };
+    let suffix = suffix.trim();
+    let depth = if suffix.is_empty() {
+        1
+    } else {
+        match suffix.parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => return (0, title),
+        }
+    };
+    (depth, after)
+}
+
+/// 构造带 fork 深度标记的标题。深度 1 显示为 `[fork]`，N≥2 显示为 `[fork N]`。
+/// 总长度限制在 40 字符内，避免被判定为低质量标题而在后续被模型重新生成覆盖。
+fn format_fork_title(depth: usize, inner: &str) -> String {
+    let marker = if depth <= 1 {
+        "[fork]".to_string()
+    } else {
+        format!("[fork {}]", depth)
+    };
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return marker;
+    }
+    const MAX_TITLE_CHARS: usize = 40;
+    let budget = MAX_TITLE_CHARS.saturating_sub(marker.chars().count() + 1);
+    let inner = if budget == 0 {
+        String::new()
+    } else if inner.chars().count() <= budget {
+        inner.to_string()
+    } else {
+        let mut out: String = inner.chars().take(budget - 1).collect();
+        out.push('…');
+        out
+    };
+    if inner.is_empty() {
+        marker
+    } else {
+        format!("{} {}", marker, inner)
+    }
+}
+
+/// 读取源 session 的有效标题作为 fork 标记的基底：优先持久化标题，
+/// 否则从首条用户消息生成回退标题。
+fn session_title_base(store: &SessionStore, session_id: &str) -> String {
+    if let Ok(Some(title)) = store.read_session_title(session_id) {
+        let title = title.trim();
+        if !title.is_empty() {
+            return title.to_string();
+        }
+    }
+    if let Ok(Some(prompt)) = store.first_user_prompt(session_id) {
+        let summary = generate_session_summary(&prompt);
+        if !summary.is_empty() {
+            return summary;
+        }
+    }
+    String::new()
+}
+
+/// 把 dst session 的标题改成带 fork 标记的版本，深度基于源 session 标题递增。
+fn apply_fork_title(store: &SessionStore, src_id: &str, dst_id: &str) -> std::io::Result<()> {
+    let base = session_title_base(store, src_id);
+    let (depth, inner) = parse_fork_marker(&base);
+    let new_title = format_fork_title(depth + 1, inner);
+    store.write_session_title_with_origin(dst_id, &new_title, SessionTitleOrigin::Model)
 }
 
 fn sanitize_session_prompt(s: &str) -> String {
@@ -1138,7 +1237,7 @@ mod tests {
                 Message {
                     role: "tool".to_string(),
                     content: Value::String(
-                        "Error: apply_patch failed: context mismatch".to_string(),
+                        "Error: apply_patch failed: ambiguous patch".to_string(),
                     ),
                     tool_calls: None,
                     tool_call_id: Some("legacy-patch".to_string()),
@@ -1592,6 +1691,74 @@ mod tests {
             remaining,
             vec!["sess-stale-a".to_string(), "sess-stale-b".to_string()]
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fork_command_marks_title_and_keeps_original() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let src_path = store.session_history_file(&app.session_id);
+        append_history_messages(
+            &src_path,
+            &[
+                Message {
+                    role: "user".to_string(),
+                    content: Value::String("帮我实现 /fork 功能".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::String("好的，开始实现。".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+            ],
+        )
+        .unwrap();
+        // 给源 session 写一个模型标题，作为 fork 标记的基底。
+        store
+            .write_session_title_with_origin(
+                &app.session_id,
+                "实现fork功能",
+                SessionTitleOrigin::Model,
+            )
+            .unwrap();
+
+        // 第一次 fork：标题加上 [fork] 标记，并切到新 session。
+        try_handle_session_command(&mut app, "/fork").unwrap();
+        let first_fork_id = app.session_id.clone();
+        assert_ne!(first_fork_id, "sess-old");
+        assert_eq!(
+            store.read_session_title(&first_fork_id).unwrap().unwrap(),
+            "[fork] 实现fork功能"
+        );
+
+        // 原 session 保留未删除，标题不变。
+        assert!(store.session_history_file("sess-old").exists());
+        assert_eq!(
+            store.read_session_title("sess-old").unwrap().unwrap(),
+            "实现fork功能"
+        );
+
+        // 在 fork 出来的 session 上再 fork：标记深度递增为 [fork 2]。
+        try_handle_session_command(&mut app, "/fork").unwrap();
+        assert_ne!(app.session_id, first_fork_id);
+        assert_eq!(
+            store.read_session_title(&app.session_id).unwrap().unwrap(),
+            "[fork 2] 实现fork功能"
+        );
+        // 两个 fork 分支都保留未删除。
+        assert!(store.session_history_file(&first_fork_id).exists());
+        assert!(store.session_history_file("sess-old").exists());
 
         let _ = fs::remove_dir_all(root);
     }

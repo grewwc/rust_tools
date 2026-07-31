@@ -193,7 +193,6 @@ impl SessionStore {
                     std::cmp::Ordering::Greater => -1,
                 }
             });
-        let derived_history_sizes = self.derived_session_history_artifact_sizes()?;
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -245,15 +244,15 @@ impl SessionStore {
             let timestamp = modified_local
                 .map(|dt| dt.timestamp_millis() as u64)
                 .unwrap_or(0);
-            let size_bytes =
-                self.session_size_bytes(&path, &id, *derived_history_sizes.get(&id).unwrap_or(&0))?;
             sessions.insert(
                 (timestamp, id.clone()),
                 SessionInfo {
                     id,
                     modified_local,
                     history_revision,
-                    size_bytes,
+                    // 大小按需由 `attach_session_sizes` / `session_total_size` 计算；
+                    // list_sessions 不再递归统计每个 session 的 assets 目录。
+                    size_bytes: 0,
                     first_user_prompt,
                     summary,
                 },
@@ -323,6 +322,74 @@ impl SessionStore {
         total = total.saturating_add(directory_size(&self.session_assets_dir(session_id))?);
         total = total.saturating_add(directory_size(&self.checkpoints_dir(session_id))?);
         Ok(total)
+    }
+
+    /// 计算单个 session 的总占用字节，供 `/ss current` 等只展示单个 session 大小的命令使用，
+    /// 避免为了一个 session 扫描并统计全部 session。
+    pub(in crate::ai) fn session_total_size(&self, session_id: &str) -> io::Result<u64> {
+        let derived_history_size = *self
+            .derived_session_history_artifact_sizes()?
+            .get(session_id)
+            .unwrap_or(&0);
+        self.session_size_bytes(
+            &self.session_history_file(session_id),
+            session_id,
+            derived_history_size,
+        )
+    }
+
+    /// 并行地为已列出的 session 填充 `size_bytes`。
+    ///
+    /// `list_sessions` 出于性能不再计算大小：逐个 session 递归统计 assets 是主要瓶颈
+    /// （本机约 2.6s）。只有 `/ss list` 等需要展示大小的命令才调用本方法，把每个 session 的
+    /// 统计任务分发到独立线程，用多核把墙钟时间压到几百毫秒。
+    pub(in crate::ai) fn attach_session_sizes(
+        &self,
+        sessions: &mut [SessionInfo],
+    ) -> io::Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let derived_history_sizes = self.derived_session_history_artifact_sizes()?;
+        // 预收集 (下标, session_id, 派生大小)；线程只借用 self，不借用 sessions。
+        let jobs: Vec<(usize, String, u64)> = sessions
+            .iter()
+            .enumerate()
+            .map(|(idx, session)| {
+                (
+                    idx,
+                    session.id.clone(),
+                    *derived_history_sizes.get(&session.id).unwrap_or(&0),
+                )
+            })
+            .collect();
+        let sizes: Vec<(usize, u64)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = jobs
+                .into_iter()
+                .map(|(idx, id, derived_history_size)| {
+                    scope.spawn(move || {
+                        let size = self
+                            .session_size_bytes(
+                                &self.session_history_file(&id),
+                                &id,
+                                derived_history_size,
+                            )
+                            .unwrap_or(0);
+                        (idx, size)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .collect()
+        });
+        for (idx, size) in sizes {
+            if let Some(session) = sessions.get_mut(idx) {
+                session.size_bytes = size;
+            }
+        }
+        Ok(())
     }
 
     fn derived_session_history_artifact_sizes(&self) -> io::Result<FastMap<String, u64>> {
@@ -1748,7 +1815,8 @@ mod tests {
         )
         .unwrap();
 
-        let listed = store.list_sessions().unwrap();
+        let mut listed = store.list_sessions().unwrap();
+        store.attach_session_sizes(&mut listed).unwrap();
         assert!(!listed.iter().any(|session| session.id == "sized.proc-42"));
         let session = listed
             .iter()

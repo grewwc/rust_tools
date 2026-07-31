@@ -13,6 +13,7 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use rustc_hash::FxHashMap;
 
 /// 写入并管理 sessions 目录下的 `<session_id>.<pid>.pid` 文件。
 /// 创建时写入 PID，Drop 时删除文件。
@@ -202,24 +203,30 @@ pub(in crate::ai) fn scan_all_session_pids(
     Ok(all)
 }
 
-/// 通过 `lsof` 扫描 sessions 目录，发现正在使用 `.sqlite` 文件的进程。
+/// 通过 `lsof` 发现给定进程正在使用的 `.sqlite` 文件，作为 PID 文件机制的兜底。
 ///
-/// 这是 PID 文件机制的**兜底**：旧版本 `a` 启动的 session 不会写 PID 文件，
-/// 但如果该 session 正在读写 history（SQLite 连接打开中），`lsof` 能抓到。
-/// 对于空闲等待输入的旧版本 session，此方法可能漏报。
+/// 旧版本 `a` 启动的 session 不会写 PID 文件，但如果该 session 正在读写
+/// history（SQLite 连接打开中），`lsof` 能抓到。对于空闲等待输入的旧版本
+/// session 可能漏报。
 ///
-/// 返回 (session_id, pid) 列表，已按 session_id 去重。
-pub(in crate::ai) fn discover_lsof_sessions(sessions_root: &std::path::Path) -> Vec<(String, i32)> {
-    // 扫描基目录（覆盖所有 persona / config 的 sessions 目录）
-    let base = resolve_sessions_base(sessions_root);
-    discover_lsof_in_dir(&base)
-}
-
-/// 对单个目录运行 `lsof +D`，解析输出。
-fn discover_lsof_in_dir(dir: &std::path::Path) -> Vec<(String, i32)> {
+/// 与旧实现的关键区别：不再用 `lsof +D <sessions_root>` 递归扫描整个 sessions
+/// 目录树（条目多时极慢），而是直接查询给定 PID 的文件描述符表
+/// （`lsof -p pids -Fpcn`），只看这些进程打开了哪些 `.sqlite`。
+///
+/// `pids` 应为"未通过 PID 文件登记的 `a` 进程"列表。返回 (session_id, pid)，
+/// 已按 session_id 去重。
+pub(in crate::ai) fn discover_lsof_sessions(
+    _sessions_root: &std::path::Path,
+    pids: &[i32],
+) -> Vec<(String, i32)> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    // lsof -p 接受逗号分隔的 PID 列表
+    let joined = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
     let output = match std::process::Command::new("lsof")
-        .arg("+D")
-        .arg(dir)
+        .arg("-p")
+        .arg(&joined)
         .arg("-Fpcn")
         .output()
     {
@@ -261,25 +268,43 @@ fn discover_lsof_in_dir(dir: &std::path::Path) -> Vec<(String, i32)> {
 
 /// 检测进程是否有控制终端（tty）。
 /// 前台交互式 session 有 tty（如 ttys001），`a -bg` daemon 没有（显示为 `??`）。
-pub(in crate::ai) fn process_has_tty(pid: i32) -> bool {
+///
+/// 一次性批量查询多个进程，把 N 次 `ps` 的 fork/exec 降为单次。这是 `/proc`
+/// 输出循环里的主要性能瓶颈点：旧实现对每个活跃 session 各跑一次 `ps`。
+pub(in crate::ai) fn tty_map_for_pids(pids: &[i32]) -> FxHashMap<i32, bool> {
+    let mut map = FxHashMap::default();
+    if pids.is_empty() {
+        return map;
+    }
+    // macOS `ps -p` 接受逗号分隔的 PID 列表，一次返回所有进程的 tty。
+    let joined = pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let output = std::process::Command::new("ps")
         .arg("-o")
-        .arg("tt=")
+        .arg("pid=,tt=")
         .arg("-p")
-        .arg(pid.to_string())
+        .arg(&joined)
         .output();
-    match output {
-        Ok(o) => {
-            let tt = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            !tt.is_empty() && tt != "??"
-        }
-        Err(_) => false,
+    let Ok(o) = output else {
+        return map;
+    };
+    let text = String::from_utf8_lossy(&o.stdout);
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let Some(pid) = it.next().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let tt = it.next().unwrap_or("");
+        map.insert(pid, !tt.is_empty() && tt != "??");
     }
+    map
 }
 
-/// 统计当前正在运行的 `a` 进程数量（通过 `pgrep -x a`）。
-/// 用于在 `/proc` 输出中提示"有 N 个 a 进程在跑，但只识别出 M 个 session"。
-pub(in crate::ai) fn count_a_processes() -> usize {
+/// 列出所有正在运行的 `a` 进程的 PID（通过 `pgrep -x a`，回退 `ps`）。
+pub(in crate::ai) fn list_a_pids() -> Vec<i32> {
     // pgrep -x a：精确匹配进程名为 "a" 的进程
     let output = std::process::Command::new("pgrep")
         .arg("-x")
@@ -288,20 +313,29 @@ pub(in crate::ai) fn count_a_processes() -> usize {
     match output {
         Ok(o) => {
             let text = String::from_utf8_lossy(&o.stdout);
-            text.lines().filter(|l| !l.trim().is_empty()).count()
+            text.lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
         }
         Err(_) => {
-            // pgrep 不可用时，回退到 ps
+            // pgrep 不可用时，回退到 ps：输出 pid + comm，过滤 comm=="a"
             let alt = std::process::Command::new("ps")
                 .arg("-eo")
-                .arg("comm=")
+                .arg("pid=,comm=")
                 .output();
             match alt {
                 Ok(o) => {
                     let text = String::from_utf8_lossy(&o.stdout);
-                    text.lines().map(|l| l.trim()).filter(|l| *l == "a").count()
+                    text.lines()
+                        .filter_map(|l| {
+                            let mut it = l.split_whitespace();
+                            let pid: i32 = it.next()?.parse().ok()?;
+                            let comm = it.next()?;
+                            (comm == "a").then_some(pid)
+                        })
+                        .collect()
                 }
-                Err(_) => 0,
+                Err(_) => Vec::new(),
             }
         }
     }
@@ -476,5 +510,21 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tty_map_batches_multiple_pids_in_one_call() {
+        // 空输入直接返回空映射，不应启动 ps。
+        assert!(tty_map_for_pids(&[]).is_empty());
+
+        // 当前进程自身一定存活：ps 应返回它。是否拥有 tty 取决于运行环境
+        // （cargo test 下通常无控制终端 -> false），故只断言键存在，不断言值。
+        let own = std::process::id() as i32;
+        let map = tty_map_for_pids(&[own]);
+        assert!(map.contains_key(&own), "ps 应当返回当前进程自身的 pid");
+
+        // 逗号分隔的多 PID 仍只发一次 ps，全部存活 PID 都应出现。
+        let map = tty_map_for_pids(&[own, own]);
+        assert!(map.contains_key(&own));
     }
 }

@@ -118,7 +118,20 @@ fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubag
     Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped))
 }
 
+/// 执行模型通过 `task` 工具发起的同步子代理。普通工具调用始终保留五分钟上限；
+/// 只有显式命令入口才可以通过下面的内部函数使用各自的等待预算。
 pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
+    execute_sync_task_with_hard_timeout(tool_call_id, args, SYNC_TASK_HARD_TIMEOUT)
+}
+
+/// 执行 driver 自己发起的同步子代理，并采用调用方明确选择的硬超时。
+///
+/// 该入口保持 crate 私有，避免模型工具参数把前台等待时间放大为无界值。
+pub(super) fn execute_sync_task_with_hard_timeout(
+    tool_call_id: &str,
+    args: &Value,
+    hard_timeout: Duration,
+) -> Result<ToolResult, String> {
     // 递归深度守卫：防止 mode:all 的 heavy agent 通过同步 `task`
     // 无限嵌套委派。与 `spawn_subagent_kernel_task` 中的检查保持一致。
     let parent_depth = runtime_ctx::current_subagent_depth();
@@ -339,7 +352,7 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
             wait_cancel,
             phase_slot,
             started,
-            SYNC_TASK_HARD_TIMEOUT,
+            hard_timeout,
         ))
     });
     if join_result.is_err() {
@@ -677,6 +690,11 @@ mod tests {
         assert!(output.contains(&format!("Error: {timeout_error}")));
         assert!(output.contains("(subagent did not produce any final assistant text)"));
         assert!(output.contains(task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER));
+    }
+
+    #[test]
+    fn ordinary_sync_task_hard_timeout_remains_five_minutes() {
+        assert_eq!(SYNC_TASK_HARD_TIMEOUT, Duration::from_secs(5 * 60));
     }
 
     #[test]

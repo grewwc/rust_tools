@@ -945,7 +945,7 @@ fn build_system_prompt(
          - Give every call a concrete, decision-relevant goal. Before another exploratory call, identify the question it should answer; stop when the branch is resolved or another call cannot change the decision. Do not read speculatively.\n\
          - Before editing, inspect the target and applicable scoped instructions; follow the deepest scope. Make the smallest local change.\n\
          - Keep code reads narrow and serial: locate first, read one needed region at a time in a sufficiently broad chunk, and do not batch reads or re-read evidence already visible.\n\
-         - On failure, diagnose and adjust before retrying; after 3 failed attempts on the same issue, stop and report what you tried and the current error.\n\n\
+         - On failure, diagnose and adjust before retrying. After 3 failed attempts with the same approach, stop repeating that approach, not the whole task. Continue with a materially different safe recovery when one remains; end only when the task is complete or a specific blocker remains, then report what you tried and the current error.\n\n\
          Correctness guardrails:\n\
          - Ground factual claims in observed evidence; never invent identifiers, paths, behavior, output, line numbers, or quotations. If evidence is insufficient—even under tool or iteration limits—state what is verified, what is unknown, and the next verification step.\n\
          - Before changing a shared symbol, API, config, data format, or embedded asset, locate relevant callers and dependents and assess semantic ripple; compilation and tests prove only covered behavior.\n\
@@ -2023,6 +2023,20 @@ mod tests {
         assert!(goal.contains("Analysis-only goals are complete"));
         assert!(!goal.contains("your job is to act, not analyze"));
         assert!(!goal.contains("every detail of the goal is complete"));
+    }
+
+    #[test]
+    fn system_prompt_stops_repeating_failed_approach_without_ending_task() {
+        let available = SkipSet::new(16);
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+
+        assert!(prompt.contains("stop repeating that approach, not the whole task"));
+        assert!(prompt.contains("Continue with a materially different safe recovery"));
+        assert!(!prompt.contains(
+            "after 3 failed attempts on the same issue, stop and report"
+        ));
     }
 
     #[test]

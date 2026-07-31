@@ -97,6 +97,8 @@ const INTERNAL_COMMANDS: &[&str] = &[
     ":export",
     "/model",
     ":model",
+    "/audit",
+    ":audit",
     "/agent",
     ":agent",
     "/personas",

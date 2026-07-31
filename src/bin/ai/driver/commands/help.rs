@@ -7,6 +7,7 @@ pub fn print_interactive_help() {
     println!("  General:");
     println!("    /help, /h                 show this help message");
     println!("    /model [name]             list or switch models");
+    println!("    /audit <instruction>      run the audit subagent synchronously (up to 15 min)");
     println!("    /clear                    clear the terminal screen");
     println!("    /usage [models|today|7d|30d|all|daily]   show LLM token usage statistics");
     println!("    /history [full|user|assistant|tool|system] [N]     show recent session messages");
@@ -53,6 +54,7 @@ pub fn print_interactive_help() {
     println!("    /sessions current         show current session info");
     println!("    /sessions new             create and switch to new session");
     println!("    /sessions use <id>        switch to specified session");
+    println!("    /fork                     fork current session into a new branch (keeps original) and switch");
     println!("    /sessions suspend         suspend current session and return to shell");
     println!("    /sessions bound           list suspended sessions bound to current terminal");
     println!("    /sessions delete <id> [more...]     delete one or more sessions");

@@ -254,7 +254,6 @@ enum ToolCallRejectionReason {
     NoToolHandoff,
     PatchRetryNeedsFreshRead,
     ScopedInstructionsNeedReload,
-    CommandProjectPathsRequired,
 }
 
 fn mutation_needs_scoped_instruction_preflight(
@@ -300,16 +299,12 @@ fn rejected_tool_call_message(tool_name: &str, reason: ToolCallRejectionReason) 
 Do not call '{tool_name}' again; instead summarize confirmed facts, answer what you can, and explain the remaining work / blockers / next steps."
         ),
         ToolCallRejectionReason::PatchRetryNeedsFreshRead => format!(
-            "Error: apply_patch retry blocked. The previous patch for this file failed with `context mismatch` or `ambiguous patch`, which means the file content you are working from is stale or the context is not unique. \
+            "Error: apply_patch retry blocked. The previous patch for this file failed with `ambiguous patch`, so the matched text was not unique. \
 Do NOT retry patches in this batch — doing so will only fail again. Required recovery steps: (1) call `read_file` on the SAME target path to get the current truth state; (2) copy context lines DIRECTLY from that fresh output, including function names or distinctive surrounding lines to ensure each hunk matches exactly ONE location; (3) do NOT copy the leading line-number + tab prefix that read_file prints (each line is rendered as a right-aligned line number followed by a TAB, e.g. `    42\\t<code>`) — copy only the code after the tab; (4) call `apply_patch` only in a LATER tool round after you have successfully read the file."
         ),
         ToolCallRejectionReason::ScopedInstructionsNeedReload => format!(
             "Error: '{tool_name}' was paused before execution because target-scoped project instructions were not loaded yet. \
 No file was changed. The runtime will add the applicable instruction documents on the next model step. Review those rules, then retry the mutation in a later tool round; do not repeat it in this batch."
-        ),
-        ToolCallRejectionReason::CommandProjectPathsRequired => format!(
-            "Error: '{tool_name}' may modify files, but its `project_paths` declaration is missing. \
-No command was executed. Retry in a later tool round with every project file or directory that may be created, modified, or deleted listed in `project_paths`, so target-scoped instructions can be loaded first. Prefer apply_patch/write_file for direct file edits."
         ),
     }
 }
@@ -458,7 +453,7 @@ fn tool_call_is_successful_mutation_candidate(tool_call: &ToolCall) -> bool {
                 .and_then(|args| {
                     args.get("command")
                         .and_then(serde_json::Value::as_str)
-                        .map(super::super::iteration::execute_command_requires_project_paths)
+                        .map(super::super::iteration::execute_command_may_mutate)
                 })
                 .unwrap_or(false)
         }
@@ -750,7 +745,7 @@ fn extract_apply_patch_target_paths_from_patch(patch: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `apply_patch` 的 context mismatch / ambiguity 说明模型当前持有的文件事实已过期，
+/// `apply_patch` 的 ambiguity 说明 patch 匹配不唯一，模型需要重新读取目标文件，
 /// 继续微调旧 patch 只会重复失败。这里查询 [`App::stale_patch_targets`] 运行时账本
 /// （由 [`update_stale_patch_targets`] 在每轮工具结果落定后维护）：目标文件在失败后
 /// 必须有一次成功的 `read_file` / `write_file` / `apply_patch`，才会从账本移除、允许
@@ -806,7 +801,7 @@ fn stale_patch_target_reads(
 ///
 /// 规则（与旧的消息扫描等价，但状态存活于内存账本、不受历史压缩影响）：
 /// - `apply_patch` 成功（`Successfully patched`）→ 目标路径移出账本；
-/// - `apply_patch` 因 `context mismatch` / `ambiguous patch` 失败 → 目标路径记入账本；
+/// - `apply_patch` 因 `ambiguous patch` 失败 → 仅将实际失败的目标路径记入账本；
 /// - `read_file` 非 `Error:` → 目标路径移出账本（已重新取真相）；
 /// - `write_file` 成功（`Successfully wrote to`）→ 目标路径移出账本。
 ///
@@ -835,8 +830,9 @@ fn update_stale_patch_targets(
                     for path in paths {
                         stale_patch_targets.remove(&path);
                     }
-                } else if patch_failure_requires_fresh_read(result) {
-                    stale_patch_targets.extend(paths);
+                } else {
+                    stale_patch_targets
+                        .extend(patch_failure_stale_targets(tool_call, result, &paths));
                 }
             }
             "read_file" => {
@@ -889,9 +885,43 @@ pub(in crate::ai::driver) fn stale_patch_targets_from_messages(
     stale_patch_targets
 }
 
-fn patch_failure_requires_fresh_read(result: &str) -> bool {
-    let result = result.to_ascii_lowercase();
-    result.contains("context mismatch") || result.contains("ambiguous patch")
+fn patch_failure_diagnostic(result: &str) -> &str {
+    result
+        .split_once(crate::ai::tools::PATCH_TEXT_BLOCK_START)
+        .map_or(result, |(before, _)| before)
+}
+
+fn direct_patch_failure_is_ambiguous(diagnostic: &str) -> bool {
+    diagnostic
+        .trim_start()
+        .strip_prefix("Error: apply_patch failed: ")
+        .unwrap_or(diagnostic.trim_start())
+        .starts_with("ambiguous patch:")
+}
+
+fn patch_failure_stale_targets(
+    tool_call: &ToolCall,
+    result: &str,
+    targets: &[PathBuf],
+) -> Vec<PathBuf> {
+    let diagnostic = patch_failure_diagnostic(result);
+    let failed_targets: Vec<PathBuf> = targets
+        .iter()
+        .filter(|path| {
+            diagnostic.contains(&format!(
+                "failed while preparing patch for {}: ambiguous patch:",
+                path.display()
+            ))
+        })
+        .cloned()
+        .collect();
+    if !failed_targets.is_empty() {
+        failed_targets
+    } else if direct_patch_failure_is_ambiguous(diagnostic) {
+        patch_target_paths(tool_call)
+    } else {
+        Vec::new()
+    }
 }
 
 fn patch_target_paths(tool_call: &ToolCall) -> Vec<PathBuf> {
@@ -2240,12 +2270,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::ToolCall(tool_call_execution) => {
-            let command_project_paths_missing = !*force_final_response
-                && super::super::iteration::execute_command_missing_project_paths(
-                    &tool_call_execution.stream_result.tool_calls,
-                );
             let patch_retry_needs_fresh_read = !*force_final_response
-                && !command_project_paths_missing
                 && patch_retry_requires_fresh_read(
                     &app.stale_patch_targets,
                     &tool_call_execution.stream_result.tool_calls,
@@ -2258,8 +2283,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 );
             let rejection_reason = if *force_final_response {
                 Some(ToolCallRejectionReason::NoToolHandoff)
-            } else if command_project_paths_missing {
-                Some(ToolCallRejectionReason::CommandProjectPathsRequired)
             } else if patch_retry_needs_fresh_read {
                 Some(ToolCallRejectionReason::PatchRetryNeedsFreshRead)
             } else if scoped_preflight_needed {
@@ -2543,9 +2566,12 @@ mod tests {
         fs::write(root.join("src/feature/AGENTS.md"), "feature rules\n").unwrap();
         fs::write(&target, "// source\n").unwrap();
         let mutation = test_tool_call(
-            "write",
-            "write_file",
-            serde_json::json!({"file_path": target, "content": "// changed\n"}),
+            "command",
+            "execute_command",
+            serde_json::json!({
+                "command": format!("printf changed > {}", target.display()),
+                "pty": false
+            }),
         );
         let mut messages = vec![Message {
             role: "system".to_string(),
@@ -2560,7 +2586,7 @@ mod tests {
                 &messages,
                 std::slice::from_ref(&mutation)
             ));
-            let mut app = test_app_with_tools(&["write_file"]);
+            let mut app = test_app_with_tools(&["execute_command"]);
             let shared_mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
             let mut turn_messages = Vec::new();
             let mut persisted_turn_messages = 0;
@@ -2579,7 +2605,7 @@ mod tests {
                         tool_calls: vec![mutation.clone()],
                         ..Default::default()
                     },
-                    allowed_tool_names: ["write_file".to_string()].into_iter().collect(),
+                    allowed_tool_names: ["execute_command".to_string()].into_iter().collect(),
                 }),
                 &mut messages,
                 &mut turn_messages,
@@ -2620,7 +2646,7 @@ mod tests {
         });
         assert!(
             rejected_tool_call_message(
-                "write_file",
+                "execute_command",
                 ToolCallRejectionReason::ScopedInstructionsNeedReload
             )
             .contains("No file was changed")
@@ -2843,7 +2869,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_retry_requires_fresh_read_after_context_mismatch() {
+    fn context_mismatch_does_not_require_fresh_read() {
         let path = "/tmp/patch-target.rs";
         let messages = vec![
             assistant_tool_call_message(test_tool_call(
@@ -2853,7 +2879,7 @@ mod tests {
             )),
             tool_result_message(
                 "call_failed_patch",
-                "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+                "Error: apply_patch failed: context mismatch: patch hunk could not be located.\nMismatched lines (showing 1 of 1):\n  line 12: expected \"ambiguous patch: stale source text\", found \"current source text\"\nCurrent file text at this location (copy verbatim, no line-number prefix):\n<<<PATCH_TEXT\ncurrent source text\nPATCH_TEXT>>>",
             ),
         ];
         let retry = test_tool_call(
@@ -2863,7 +2889,8 @@ mod tests {
         );
 
         let ledger = ledger_from_messages(&messages);
-        assert!(patch_retry_requires_fresh_read(&ledger, &[retry]));
+        assert!(ledger.is_empty());
+        assert!(!patch_retry_requires_fresh_read(&ledger, &[retry]));
     }
 
     #[test]
@@ -2918,7 +2945,7 @@ mod tests {
             )),
             tool_result_message(
                 "call_failed_patch",
-                "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+                "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.",
             ),
         ];
         let fresh_read = test_tool_call("call_fresh_read", "read_file", read_args);
@@ -2949,7 +2976,7 @@ mod tests {
             )),
             tool_result_message(
                 "call_failed_patch",
-                "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+                "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.",
             ),
         ];
         let ledger = ledger_from_messages(&messages);
@@ -2989,7 +3016,7 @@ mod tests {
             )),
             tool_result_message(
                 "call_failed_patch",
-                "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+                "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.",
             ),
             assistant_tool_call_message(test_tool_call(
                 "call_other_read",
@@ -3009,7 +3036,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_retry_multi_file_failure_blocks_all_targets_until_each_is_re_read() {
+    fn patch_retry_multi_file_failure_blocks_only_failed_target() {
         let a = "/tmp/patch-a.rs";
         let b = "/tmp/patch-b.rs";
         let messages = vec![
@@ -3025,28 +3052,88 @@ mod tests {
             tool_result_message(
                 "call_failed_patch",
                 &format!(
-                    "Error: apply_patch failed: failed while preparing patch for {b}: context mismatch: patch hunk could not be located."
+                    "Error: apply_patch failed: failed while preparing patch for {b}: ambiguous patch: hunk context matches 2 locations."
                 ),
             ),
-            assistant_tool_call_message(test_tool_call(
-                "call_read_a",
-                "read_file",
-                serde_json::json!({ "file_path": a }),
-            )),
-            tool_result_message("call_read_a", "fn current_a() {}\n"),
         ];
-        let retry = test_tool_call(
+        let retry_a = test_tool_call(
+            "call_retry_a",
+            "apply_patch",
+            serde_json::json!({ "file_path": a, "patch": "@@\n-old_a\n+newer_a" }),
+        );
+        let retry_b = test_tool_call(
             "call_retry_b",
             "apply_patch",
             serde_json::json!({ "file_path": b, "patch": "@@\n-old_b\n+newer_b" }),
         );
 
         let ledger = ledger_from_messages(&messages);
-        assert!(patch_retry_requires_fresh_read(&ledger, &[retry]));
+        assert!(!patch_retry_requires_fresh_read(&ledger, &[retry_a]));
+        assert!(patch_retry_requires_fresh_read(&ledger, &[retry_b]));
     }
 
     #[test]
-    fn patch_retry_multi_file_failure_is_released_after_all_targets_are_re_read() {
+    fn patch_retry_multi_file_relative_targets_match_normalized_error_path() {
+        let a = "audit-relative/patch-a.rs";
+        let b = "audit-relative/patch-b.rs";
+        let normalized_b = FileStore::new(PathBuf::from(b)).path().to_path_buf();
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_patch",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": format!(
+                        "*** Begin Patch\n*** Update File: {a}\n@@\n-old_a\n+new_a\n*** Update File: {b}\n@@\n-old_b\n+new_b\n*** End Patch"
+                    )
+                }),
+            )),
+            tool_result_message(
+                "call_failed_patch",
+                &format!(
+                    "Error: apply_patch failed: failed while preparing patch for {}: ambiguous patch: hunk context matches 2 locations.",
+                    normalized_b.display()
+                ),
+            ),
+        ];
+
+        let ledger = ledger_from_messages(&messages);
+        assert_eq!(ledger, rustc_hash::FxHashSet::from_iter([normalized_b]));
+    }
+
+    #[test]
+    fn patch_retry_target_path_may_contain_patch_text_marker() {
+        let a = "/tmp/patch-a.rs";
+        let b = "/tmp/patch<<<PATCH_TEXT.rs";
+        let messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_patch",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": format!(
+                        "*** Begin Patch\n*** Update File: {a}\n@@\n-old_a\n+new_a\n*** Update File: {b}\n@@\n-old_b\n+new_b\n*** End Patch"
+                    )
+                }),
+            )),
+            tool_result_message(
+                "call_failed_patch",
+                &format!(
+                    "Error: apply_patch failed: failed while preparing patch for {b}: ambiguous patch: hunk context matches 2 locations.\n{}current text\nPATCH_TEXT>>>",
+                    crate::ai::tools::PATCH_TEXT_BLOCK_START
+                ),
+            ),
+        ];
+
+        let ledger = ledger_from_messages(&messages);
+        assert_eq!(
+            ledger,
+            rustc_hash::FxHashSet::from_iter([FileStore::new(PathBuf::from(b))
+                .path()
+                .to_path_buf()])
+        );
+    }
+
+    #[test]
+    fn patch_retry_multi_file_failure_is_released_after_failed_target_is_re_read() {
         let a = "/tmp/patch-a.rs";
         let b = "/tmp/patch-b.rs";
         let messages = vec![
@@ -3186,7 +3273,7 @@ mod tests {
             )),
             tool_result_message(
                 "call_failed_patch",
-                "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
+                "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.",
             ),
         ];
         // 账本才是 guard 的真相源：等价于上一轮 handle_tool_call_round 结束时
@@ -3913,8 +4000,7 @@ mod tests {
             "call_command",
             "execute_command",
             serde_json::json!({
-                "command": "printf x > src/generated.txt && cargo check --bin a",
-                "project_paths": ["src/generated.txt"]
+                "command": "printf x > src/generated.txt && cargo check --bin a"
             }),
         );
         let turn_messages = vec![
@@ -3942,8 +4028,7 @@ mod tests {
             "call_command",
             "execute_command",
             serde_json::json!({
-                "command": "sed -i '' -e 's/old/new/' missing.rs; cargo check --bin a",
-                "project_paths": ["missing.rs"]
+                "command": "sed -i '' -e 's/old/new/' missing.rs; cargo check --bin a"
             }),
         );
         let turn_messages = vec![
@@ -4803,7 +4888,7 @@ mod tests {
         }
     }
 
-    /// 核心回归：apply_patch 因 context mismatch 失败后，账本记住 stale 目标；
+    /// 核心回归：apply_patch 因 ambiguous patch 失败后，账本记住 stale 目标；
     /// 即便随后失败轮从 `messages` 里被历史压缩完全抹除（模拟折叠成
     /// internal_note stub），guard 仍据账本拦截对同一路径的重试。这正是旧的
     /// 消息扫描实现失效的场景。
@@ -4811,7 +4896,7 @@ mod tests {
     fn stale_patch_guard_survives_history_compression_via_ledger() {
         let mut ledger: rustc_hash::FxHashSet<PathBuf> = Default::default();
 
-        // 第一轮：apply_patch 对 table.rs 失败（context mismatch）。
+        // 第一轮：apply_patch 对 table.rs 失败（ambiguous patch）。
         let failed_patch = test_tool_call(
             "call_patch_1",
             "apply_patch",
@@ -4822,7 +4907,7 @@ mod tests {
             std::slice::from_ref(&failed_patch),
             &[tool_result(
                 "call_patch_1",
-                "Error: apply_patch failed: context mismatch: required recovery: read_file the same target before retrying apply_patch.",
+                "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.",
             )],
         );
         let normalized = FileStore::new(PathBuf::from("/tmp/proj/table.rs"))
@@ -4899,7 +4984,7 @@ mod tests {
             std::slice::from_ref(&failed_delete),
             &[tool_result(
                 "call_delete",
-                "Error: apply_patch failed: context mismatch",
+                "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.",
             )],
         );
 

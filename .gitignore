@@ -11,3 +11,9 @@ Cargo.lock
 # 内含完整会话转录，属敏感/临时文件，严禁提交。
 *.log
 *.pid
+# 测试/子进程在 cwd 下产生的历史 session 工件（见 sessions_root_from_history_file）
+# 默认 history_file=~/.history_file.sqlite 不会在工作区下产生此目录，
+# 仅当显式/测试把 history_file 指向工作区内路径时才出现。
+history.sessions/
+history.sqlite
+history.sqlite-*

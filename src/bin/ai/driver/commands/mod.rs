@@ -1,3 +1,4 @@
+pub(crate) mod audit;
 pub mod agent;
 pub mod checkpoint;
 pub mod export;
@@ -91,6 +92,11 @@ pub fn try_handle_interactive_command(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if try_handle_local_command(app, mcp_client, input)? {
         return Ok(true);
+    }
+    // `/audit` 必须保留到已有 DRIVER_CTX 的 turn 中执行，避免在本地命令阶段
+    // 丢失 session/task 身份；同时优先于同名 skill 的显式激活。
+    if audit::parse_audit_command(input).is_some() {
+        return Ok(false);
     }
     if try_handle_agent_command(app, input, agent_manifests)? {
         return Ok(true);

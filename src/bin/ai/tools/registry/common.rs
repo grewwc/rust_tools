@@ -679,6 +679,18 @@ mod history_policy_tests {
     }
 
     #[test]
+    fn apply_patch_blocks_lossy_compression_and_counts_toward_precision() {
+        // apply_patch 结果是当前轮「我刚改了什么」的唯一精确证据；失败诊断还会回显
+        // 整份文件文本供重建补丁。漏注册会让它退回默认 (Allow/Allow, precision=false)，
+        // 于是当前轮补丁结果既不进保护集合又可被有损截断，模型看不到补丁是否落地而
+        // 原地重试。这条断言把该契约钉死，防止再次回退到默认策略。
+        let policy = tool_history_policy("apply_patch");
+        assert!(!policy.allows_lossy_compress());
+        assert!(policy.allows_prune());
+        assert!(policy.counts_toward_precision_inline_budget());
+    }
+
+    #[test]
     fn unregistered_tool_defaults_to_allow_both() {
         let policy = tool_history_policy("unregistered_tool");
         assert!(policy.allows_lossy_compress());

@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 
+use crate::ai::tools::common::ToolHistoryPolicy;
+use crate::ai::tools::common::ToolHistoryPolicyRegistration;
+use crate::ai::tools::common::ToolLossyCompressPolicy;
+use crate::ai::tools::common::ToolPrunePolicy;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::common::ToolStreamWriter;
@@ -20,7 +24,7 @@ fn params_apply_patch() -> Value {
             },
             "patch": {
                 "type": "string",
-                "description": "The edit to apply. Prefer the smallest format that fits:\n\n(A) RECOMMENDED for a small in-line change — replace a substring on one uniquely identifiable line. Lowest failure rate: no line numbers, no indentation to reproduce.\n```\n*** Begin Patch\n*** Replace in line: <absolute/path>\nanchor: <substring that uniquely identifies the target line>\nold: <exact substring on that line to replace>\nnew: <replacement substring>\n*** End Patch\n```\n\n(B) For adding/removing whole lines or larger edits — a `*** Begin Patch` envelope with `@@` hunks. This is also the ONLY format for multiple files, new files, and deletions:\n```\n*** Begin Patch\n*** Update File: <absolute/path>\n@@\n <unchanged context line>\n-<line to remove>\n+<line to add>\n <unchanged context line>\n*** End Patch\n```\nUse `*** Add File: <path>` (body is `+`-prefixed new lines) and `*** Delete File: <path>` (no body) for creation/deletion. Repeat section headers for multiple files.\n\n(C) A plain one-file unified diff is also accepted: pass `file_path`, or include a git header (`--- a/<path>` / `+++ b/<path>`). Cannot delete files.\n\nCopying rules (avoid the most common errors): copy file text EXACTLY, but WITHOUT read_file's `<number>\\t` line-number prefix — copy only the code after the TAB. Context/removed lines must match the current file character-for-character (indentation included). Do not wrap the patch in Markdown fences, mix formats, or send a zero-change patch. On a context-mismatch or ambiguous-match error, use the current file text echoed back in the error to rebuild the patch — you usually do not need to re-read the whole file."
+                "description": "The edit to apply. Prefer the smallest format that fits:\n\n(A) One substring on one uniquely identifiable line:\n```\n*** Begin Patch\n*** Replace in line: <absolute/path>\nanchor: <substring that uniquely identifies the target line>\nold: <exact substring on that line to replace>\nnew: <replacement substring>\n*** End Patch\n```\n\n(B) Larger edits, multiple files, additions, or deletions:\n```\n*** Begin Patch\n*** Update File: <absolute/path>\n@@\n <unchanged context line>\n-<line to remove>\n+<line to add>\n <unchanged context line>\n*** End Patch\n```\nUse `*** Add File: <path>` with `+`-prefixed content and `*** Delete File: <path>` with no body. Repeat sections for multiple files.\n\n(C) Plain one-file unified diff: pass `file_path`, or include `---` / `+++` headers. It cannot delete files.\n\nCopy file text exactly, but omit `read_file`'s `<number>\\t` prefix. Context and removed lines must match the current file, including indentation. Do not use Markdown fences, mix formats, or send a zero-change patch."
             },
             "dry_run": {
                 "type": "boolean",
@@ -34,7 +38,7 @@ fn params_apply_patch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply precise localized edits without rewriting whole files. For a small in-line change, prefer a `*** Replace in line:` section (anchor + old/new substring) — it needs no line numbers or indentation and rarely fails. For adding/removing lines or larger/multi-file edits, adds, and deletes, use a `*** Begin Patch` envelope with `@@` hunks; a plain one-file unified diff (with `file_path` or a git header) is also accepted. All sections are validated before writing and rechecked before commit; failures are rolled back when possible. Use `dry_run` for validation. On a context-mismatch or ambiguous-match error, rebuild the patch from the current file text echoed back in the error message.",
+        description: "Apply localized file edits. For one substring on one line, use `*** Replace in line:`. For larger or multi-file changes, use a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, or `*** Delete File:` sections. A plain unified diff is accepted only for one file and then needs `file_path` or a diff header. Copy source text exactly, without `read_file` line-number prefixes. Use `dry_run` to validate without writing; on failure, rebuild from the current text echoed in the error.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -45,6 +49,20 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolStreamingRegistration {
     name: "apply_patch",
     execute_streaming: execute_apply_patch_streaming,
+});
+
+// apply_patch 结果是当前轮「我刚改了哪个文件」的唯一精确证据，且失败诊断会回显
+// 整份当前文件文本（供模型无需重读即可重建补丁）。一旦被有损压缩/截断，模型就
+// 看不到补丁是否落地，会反复怀疑工具未被调用、原地重试——因此禁止有损压缩，并
+// 占用高精度 inline 预算以进入当前轮保护集合。与 execute_command 语义一致：旧的
+// 补丁结果仍可由模型主动标记过时后裁剪，不会让上下文单调增长。
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "apply_patch",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Allow,
+        counts_toward_precision_inline_budget: true,
+    },
 });
 
 #[derive(Debug, Clone)]
@@ -991,20 +1009,29 @@ fn all_hunk_match_positions(
     positions
 }
 
-fn describe_ambiguous_hunk(positions: &[usize]) -> String {
+fn describe_ambiguous_hunk(orig_lines: &[String], positions: &[usize]) -> String {
     let shown: Vec<String> = positions
         .iter()
         .take(8)
         .map(|pos| (pos + 1).to_string())
         .collect();
-    format!(
+    let mut msg = format!(
         "ambiguous patch: hunk context matched {} locations (1-based lines: {}{}). \
          Add more unique surrounding context, preferably both before and after the edit, \
-         or split the edit around a uniquely matching removed line.",
+         or split the edit around a uniquely matching removed line.\n",
         positions.len(),
         shown.join(", "),
         if positions.len() > 8 { ", ..." } else { "" }
-    )
+    );
+    // 回显每个候选位置的当前首行，帮助模型选出正确锚点、加更独特的上下文，
+    // 无需再单独 read_file。
+    msg.push_str("Candidate locations (current first line at each):\n");
+    for &pos in positions.iter().take(8) {
+        if let Some(line) = orig_lines.get(pos) {
+            msg.push_str(&format!("  line {}: {:?}\n", pos + 1, line));
+        }
+    }
+    msg
 }
 
 const DECLARED_LINE_DISAMBIGUATION_MAX_DRIFT: usize = 12;
@@ -1206,7 +1233,7 @@ fn locate_hunk_with_fuzzy_context(
         .collect();
     Err(format!(
         "ambiguous patch: remove lines match {} locations under context-fuzz mode (1-based lines: {}{}). \
-         Re-read the file and include more exact surrounding context, or split the hunk around a more unique removed line.",
+         Include more exact surrounding context (both before and after the edit), or split the hunk around a more unique removed line. A `*** Replace in line:` section with a unique anchor also avoids this.",
         candidates.len(),
         shown.join(", "),
         if candidates.len() > 5 { ", ..." } else { "" }
@@ -1379,6 +1406,9 @@ fn describe_aligned_block_first_mismatch(
     None
 }
 
+pub(crate) const PATCH_TEXT_BLOCK_START: &str =
+    "Current file text at this location (copy verbatim, no line-number prefix):\n<<<PATCH_TEXT\n";
+
 /// 渲染一段「可直接粘贴」的当前文件文本块（0-based `start`，含 `count` 行）。
 ///
 /// 与错误信息里其它诊断（带 `<行号>:` 前缀、便于人眼定位）不同，这个块**不带任何
@@ -1390,15 +1420,63 @@ fn render_pasteable_current_block(orig_lines: &[String], start: usize, count: us
     if start >= end {
         return String::new();
     }
-    let mut out = String::from(
-        "Current file text at this location (copy verbatim, no line-number prefix):\n<<<PATCH_TEXT\n",
-    );
+    let mut out = String::from(PATCH_TEXT_BLOCK_START);
     for line in &orig_lines[start..end] {
         out.push_str(line);
         out.push('\n');
     }
     out.push_str("PATCH_TEXT>>>\n");
     out
+}
+
+/// 构造带诊断的 "hunks out of order" 错误。
+///
+/// 之前该错误只返回裸字符串 `"hunks out of order"`——没有行号、没有是哪个 hunk、
+/// 没有当前文本、没有修复建议，模型只能盲猜（真实会话里因此连败 4 轮）。
+///
+/// unified diff 要求各 hunk 按文件行号**升序**排列；`apply_unified_patch` 用一个
+/// 单调递增的 `cursor` 逐个定位 hunk。当某个 hunk 唯一匹配到的位置落在 `cursor`
+/// （上一个 hunk 结束行）之前，就说明模型把 hunk 写成了乱序（或存在重叠）。这里
+/// 说清楚原因、给出该 hunk 匹配到的位置 vs 允许的最早位置、附可粘贴当前文本，并
+/// 明确建议按行号重排或改用独立的 `*** Replace in line:` 段落。
+///
+/// `matched_pos` 为该 hunk 实际匹配到的 0-based 行（若已知）；`cursor` 为当前允许
+/// 的最早 0-based 起点。
+fn describe_hunks_out_of_order(
+    orig_lines: &[String],
+    hunk: &UnifiedHunk,
+    matched_pos: Option<usize>,
+    cursor: usize,
+) -> String {
+    let mut msg = String::from(
+        "hunks out of order: this hunk matches a location earlier in the file than a previous hunk in the same section. Unified-diff hunks must be ordered by ascending file line number. Reorder the hunks by their position in the file (top to bottom), or split unrelated edits into separate `*** Replace in line:` sections.\n",
+    );
+    if hunk.old_start > 0 {
+        msg.push_str(&format!(
+            "This hunk declared @@ -{} (1-based line {}).\n",
+            hunk.old_start, hunk.old_start
+        ));
+    }
+    match matched_pos {
+        Some(pos) => msg.push_str(&format!(
+            "It matches at 1-based line {}, but the previous hunk already consumed through 1-based line {}; a following hunk must start at 1-based line {} or later.\n",
+            pos + 1,
+            cursor,
+            cursor + 1
+        )),
+        None => msg.push_str(&format!(
+            "The earliest position a following hunk may target is 1-based line {} (where the previous hunk ended).\n",
+            cursor + 1
+        )),
+    }
+    // 附该 hunk 期望块处的可粘贴当前文本，帮助模型据此重排/重建。
+    let anchor = matched_pos.unwrap_or_else(|| hunk.old_start.saturating_sub(1));
+    let expected_len = hunk_expected_lines(hunk).len().max(1);
+    let block = render_pasteable_current_block(orig_lines, anchor, expected_len);
+    if !block.is_empty() {
+        msg.push_str(&block);
+    }
+    msg
 }
 
 /// 构造带上下文的 "context mismatch" 错误：列出 patch 期望匹配的行，以及原文件
@@ -1455,11 +1533,8 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
         }
         // 可直接粘贴的当前文本块：覆盖 best 匹配区间（含少量前后余量），
         // 让模型无需重读整文件即可就地重建 patch。
-        let block = render_pasteable_current_block(
-            orig_lines,
-            best.pos,
-            best.total.max(expected.len()),
-        );
+        let block =
+            render_pasteable_current_block(orig_lines, best.pos, best.total.max(expected.len()));
         if !block.is_empty() {
             msg.push_str(&block);
         }
@@ -1558,7 +1633,12 @@ fn locate_hunk(
         }
         let nominal = hunk.old_start.saturating_sub(1);
         if nominal < cursor {
-            return Err("hunks out of order".to_string());
+            return Err(describe_hunks_out_of_order(
+                orig_lines,
+                hunk,
+                Some(nominal),
+                cursor,
+            ));
         }
         return if nominal <= orig_lines.len() {
             Ok(Some(nominal))
@@ -1585,16 +1665,22 @@ fn locate_hunk(
         if let Some(pos) = disambiguate_by_declared_line(&forward, hunk) {
             return Ok(Some(pos));
         }
-        return Err(describe_ambiguous_hunk(&forward));
+        return Err(describe_ambiguous_hunk(orig_lines, &forward));
     }
     // forward 已经过滤了 p >= cursor，所以这里不会有 "hunks out of order"。
     // 之前回退到 find_hunk_offset（±50 窗口）会在唯一匹配超出窗口时误报
     // context mismatch；直接使用 forward 的唯一结果即可。
     if let Some(&offset) = forward.first() {
         Ok(Some(offset))
-    } else if !positions.is_empty() {
-        // 所有匹配都在 cursor 之前——hunk 顺序错误
-        Err("hunks out of order".to_string())
+    } else if let Some(&earliest) = positions.first() {
+        // 所有匹配都在 cursor 之前——hunk 顺序错误。positions 已按升序排列，
+        // 取最靠前的匹配位置作为诊断锚点。
+        Err(describe_hunks_out_of_order(
+            orig_lines,
+            hunk,
+            Some(earliest),
+            cursor,
+        ))
     } else {
         Ok(None)
     }
@@ -1603,12 +1689,23 @@ fn locate_hunk(
 fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
     let had_trailing_newline = original.ends_with('\n');
     let hunks = parse_unified_hunks(patch)?;
+    if !hunks.iter().any(|hunk| {
+        hunk.lines
+            .iter()
+            .any(|line| matches!(line, UnifiedLine::Remove(_) | UnifiedLine::Add(_)))
+    }) {
+        return Err("[NO_CHANGES] patch contains no additions or removals".to_string());
+    }
     let orig_lines: Vec<String> = original.lines().map(|s| s.to_string()).collect();
 
     let mut out: Vec<String> = Vec::new();
     let mut cursor = 0usize;
 
-    for hunk in &hunks {
+    for hunk in hunks.iter().filter(|hunk| {
+        hunk.lines
+            .iter()
+            .any(|line| matches!(line, UnifiedLine::Remove(_) | UnifiedLine::Add(_)))
+    }) {
         // 先做严格匹配（仅容忍行尾空白）。严格匹配全文件都定位不到时，再用忽略
         // 前导缩进的宽松模式兜底一次——对齐 `git apply --ignore-whitespace`，
         // 解决模型对 markdown/嵌套列表/代码块缩进复刻不准导致的 context mismatch。
@@ -2216,6 +2313,68 @@ mod tests {
         path
     }
 
+    /// 离线回放：用真实会话（history.json）里模型实际发出的 apply_patch 输入，
+    /// 对照重建出的"当时文件真相"，用**当前代码**跑一遍，打印每个 patch 的真实
+    /// 成/败。这不是常规断言测试——它验证的是"真实调用成功率"，而非我写的断言。
+    ///
+    /// 默认忽略；需要时用：
+    ///   AI_PATCH_REPLAY_DIR=/tmp/patch_review cargo test --bin a replay_apply_patch -- --ignored --nocapture
+    /// 目录下需有 replay_manifest.json + rebuild/proc.rs + rebuild/session_pid.rs。
+    #[test]
+    #[ignore]
+    fn replay_apply_patch_from_session() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let Ok(dir) = std::env::var("AI_PATCH_REPLAY_DIR") else {
+            eprintln!("AI_PATCH_REPLAY_DIR not set; skipping replay");
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("replay_manifest.json")).unwrap())
+                .unwrap();
+
+        // 会话里的绝对路径前缀，替换为临时工作区。
+        const OLD_PREFIX: &str = "/Users/bytedance/rust_tools/src/bin/ai/driver";
+        let records = manifest.as_array().unwrap();
+        let mut ok = 0usize;
+        let total = records.len();
+        for rec in records {
+            let msg = rec["msg"].as_i64().unwrap();
+            let session = rec["session"].as_str().unwrap();
+            let patch = rec["patch"].as_str().unwrap();
+            let dry_run = rec["dry_run"].as_bool().unwrap_or(false);
+
+            // 每个 patch 用全新的重建文件（互不污染）。
+            let work = make_temp_path(&format!("replay_{msg}"));
+            let commands = work.join("commands");
+            fs::create_dir_all(&commands).unwrap();
+            fs::copy(dir.join("rebuild/proc.rs"), commands.join("proc.rs")).unwrap();
+            fs::copy(
+                dir.join("rebuild/session_pid.rs"),
+                work.join("session_pid.rs"),
+            )
+            .unwrap();
+
+            let new_prefix = work.to_string_lossy().to_string();
+            let patch_rewritten = patch.replace(OLD_PREFIX, &new_prefix);
+
+            let args = serde_json::json!({ "patch": patch_rewritten, "dry_run": dry_run });
+            let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+                .sync_scope(work.clone(), || execute_apply_patch(&args));
+            let now = if result.is_ok() { "OK" } else { "FAIL" };
+            if result.is_ok() {
+                ok += 1;
+            }
+            let detail = match &result {
+                Ok(s) => s.lines().next().unwrap_or("").to_string(),
+                Err(e) => e.lines().next().unwrap_or("").to_string(),
+            };
+            eprintln!("msg{msg}: session={session} current_code={now} | {detail}");
+            let _ = fs::remove_dir_all(&work);
+        }
+        eprintln!("=== replay success: {ok}/{total} ===");
+    }
+
     #[test]
     fn parse_unified_hunks_treats_empty_hunk_line_as_context() {
         // 模型常把空 context 行写成完全没有前导空格的空行，应当作空 context 行处理，
@@ -2348,14 +2507,18 @@ mod tests {
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("context mismatch"), "err was: {err}");
         assert!(
-            err.lines().next().unwrap_or_default().contains(
-                "required recovery: read_file the same target before retrying apply_patch"
-            ),
+            err.lines()
+                .next()
+                .unwrap_or_default()
+                .contains("Rebuild the patch from the current file text"),
             "first error line should include the recovery action: {err}"
         );
         // 错误里应回显期望行与实际文件内容，便于模型自我修正。
         assert!(err.contains("not_present"), "err was: {err}");
         assert!(err.contains("beta"), "err was: {err}");
+        // 应包含无行号前缀、可直接粘贴的当前文本块。
+        assert!(err.contains("<<<PATCH_TEXT"), "err was: {err}");
+        assert!(err.contains("PATCH_TEXT>>>"), "err was: {err}");
     }
 
     #[test]
@@ -2396,6 +2559,67 @@ mod tests {
         let patch = "@@ -9,1 +9,1 @@\n-dup\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("ambiguous patch"), "err was: {err}");
+        // 歧义错误应回显各候选位置的当前行文本，便于模型选唯一锚点，无需重读。
+        assert!(
+            err.contains("Candidate locations"),
+            "ambiguous error should echo candidate current lines: {err}"
+        );
+        assert!(err.contains("line 1"), "err was: {err}");
+        assert!(err.contains("line 3"), "err was: {err}");
+    }
+
+    /// context mismatch 且文件里完全找不到部分匹配时（no-partial-match 分支），
+    /// 也应附带无行号前缀、可直接粘贴的当前文本块。
+    #[test]
+    fn apply_unified_patch_context_mismatch_emits_pasteable_block_without_partial_match() {
+        let original = "alpha\nbeta\ngamma\n";
+        // 期望块与文件内容毫无重叠，触发 no-partial-match 分支。
+        let patch = "@@ -1,2 +1,2 @@\n-zzz1\n-zzz2\n+repl\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("context mismatch"), "err was: {err}");
+        assert!(err.contains("<<<PATCH_TEXT"), "err was: {err}");
+        assert!(err.contains("PATCH_TEXT>>>"), "err was: {err}");
+        // 可粘贴块内是原文件真实行，且不带 `<行号>:` 前缀。
+        let block = err
+            .split("<<<PATCH_TEXT\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\nPATCH_TEXT>>>").next())
+            .unwrap_or_default();
+        assert!(block.contains("alpha"), "block was: {block:?}");
+        assert!(
+            !block.contains(':'),
+            "pasteable block must not carry line-number prefixes: {block:?}"
+        );
+    }
+
+    /// "hunks out of order" 不再是裸字符串：应说明原因、给出可粘贴当前文本、并
+    /// 提示按行号重排或改用 Replace in line。真实会话里模型曾因裸报错连败 4 轮。
+    #[test]
+    fn apply_unified_patch_out_of_order_error_is_actionable() {
+        // 文件：first 在前、last 在后。patch 把 hunk 顺序写反：先改 last（第 4 行），
+        // 再改 first（第 1 行）——第二个 hunk 匹配位置落在游标之前，触发 out of order。
+        let original = "first\naaa\nbbb\nlast\n";
+        let patch = concat!("@@\n-last\n+LAST\n", "@@\n-first\n+FIRST\n",);
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("hunks out of order"), "err was: {err}");
+        // 应包含可操作的重排/Replace in line 建议与可粘贴文本块。
+        assert!(
+            err.contains("ascending file line number"),
+            "err should explain ordering rule: {err}"
+        );
+        assert!(
+            err.contains("<<<PATCH_TEXT"),
+            "err should echo current text: {err}"
+        );
+        assert!(err.contains("PATCH_TEXT>>>"), "err was: {err}");
+        assert!(
+            err.contains("consumed through 1-based line 4"),
+            "err should report the previous hunk's inclusive end line: {err}"
+        );
+        assert!(
+            err.contains("must start at 1-based line 5 or later"),
+            "err should report the next hunk's earliest start line: {err}"
+        );
     }
 
     #[test]
@@ -3840,6 +4064,17 @@ mod tests {
         assert!(result.starts_with("Dry run succeeded; no files changed:"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn apply_unified_patch_ignores_context_only_hunks_when_ordering_changes() {
+        let original = "first\nmiddle\nlast\n";
+        let patch = "@@ -3,1 +3,1 @@\n last\n@@ -1,1 +1,1 @@\n-first\n+FIRST\n";
+
+        let actual = apply_unified_patch(original, patch)
+            .expect("context-only hunks must not advance the changed-hunk cursor");
+
+        assert_eq!(actual, "FIRST\nmiddle\nlast\n");
     }
 
     #[test]

@@ -379,7 +379,7 @@ pub(super) fn execute_command_segment_effects(command: &str) -> Vec<ExecuteComma
     analyze_execute_command(command, Path::new(".")).effects
 }
 
-pub(super) fn execute_command_requires_project_paths(command: &str) -> bool {
+pub(super) fn execute_command_may_mutate(command: &str) -> bool {
     execute_command_segment_effects(command)
         .iter()
         .any(|effect| effect.mutation)
@@ -412,61 +412,6 @@ fn path_is_in_project(path: &Path, project_root: &Path) -> bool {
     path.starts_with(project_root)
 }
 
-fn declared_project_paths(args: &Value, base: &Path) -> Vec<PathBuf> {
-    args.get("project_paths")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|path| !path.trim().is_empty())
-        .filter_map(|path| resolve_command_path(base, path))
-        .collect()
-}
-
-fn declared_path_covers(declared: &[PathBuf], target: &Path) -> bool {
-    declared.iter().any(|path| target.starts_with(path))
-}
-
-pub(super) fn execute_command_missing_project_paths(
-    tool_calls: &[crate::ai::types::ToolCall],
-) -> bool {
-    tool_calls.iter().any(|tool_call| {
-        if tool_call.function.name != "execute_command" {
-            return false;
-        }
-        let Ok(args) = serde_json::from_str::<Value>(&tool_call.function.arguments) else {
-            return false;
-        };
-        let Some(command) = args.get("command").and_then(Value::as_str) else {
-            return false;
-        };
-        let base = command_base_dir(&args);
-        let analysis = analyze_execute_command(command, &base);
-        let project_root = project_root_dir();
-        let project_targets = analysis
-            .mutation_targets
-            .iter()
-            .filter(|target| path_is_in_project(target, &project_root))
-            .collect::<Vec<_>>();
-        let unknown_project_bases = analysis
-            .unknown_mutation_bases
-            .iter()
-            .filter(|base| path_is_in_project(base, &project_root))
-            .collect::<Vec<_>>();
-        if project_targets.is_empty() && unknown_project_bases.is_empty() {
-            return false;
-        }
-        let declared = declared_project_paths(&args, &base);
-        declared.is_empty()
-            || project_targets
-                .iter()
-                .any(|target| !declared_path_covers(&declared, target))
-            || unknown_project_bases
-                .iter()
-                .any(|unknown_base| !declared_path_covers(&declared, unknown_base))
-    })
-}
-
 pub(super) fn project_instruction_target_paths_from_tool_calls(
     tool_calls: &[crate::ai::types::ToolCall],
     include_read_only: bool,
@@ -495,12 +440,6 @@ pub(super) fn project_instruction_target_paths_from_tool_calls(
         if tool_call.function.name == "execute_command" {
             let base = command_base_dir(&args);
             let project_root = project_root_dir();
-            for path in declared_project_paths(&args, &base)
-                .into_iter()
-                .filter(|path| path_is_in_project(path, &project_root))
-            {
-                push_project_target(&mut targets, &mut seen, &path.to_string_lossy());
-            }
             if let Some(command) = args.get("command").and_then(Value::as_str) {
                 let analysis = analyze_execute_command(command, &base);
                 for path in analysis
@@ -1454,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_command_mutations_require_declared_project_paths() {
+    fn execute_command_mutations_infer_project_instruction_targets() {
         let mut call = ToolCall {
             id: "command".to_string(),
             tool_type: "function".to_string(),
@@ -1463,30 +1402,6 @@ mod tests {
                 arguments: r#"{"command":"python scripts/update.py","pty":false}"#.to_string(),
             },
         };
-
-        assert!(super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
-
-        call.function.arguments = serde_json::json!({
-            "command": "python scripts/update.py",
-            "project_paths": ["src/bin/ai/driver"],
-            "pty": false
-        })
-        .to_string();
-        assert!(super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
-
-        call.function.arguments = serde_json::json!({
-            "command": "python scripts/update.py",
-            "project_paths": ["."],
-            "pty": false
-        })
-        .to_string();
-        assert!(!super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
         let project_root = crate::ai::driver::runtime_ctx::effective_cwd().unwrap();
         assert_eq!(
             super::project_instruction_target_paths_from_tool_calls(
@@ -1498,53 +1413,49 @@ mod tests {
 
         call.function.arguments = serde_json::json!({
             "command": "touch src/bin/ai/driver/new.rs",
-            "project_paths": ["src/bin/ai/tools"],
             "pty": false
         })
         .to_string();
-        assert!(super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
+        assert_eq!(
+            super::project_instruction_target_paths_from_tool_calls(
+                std::slice::from_ref(&call),
+                false
+            ),
+            vec![project_root.join("src/bin/ai/driver/new.rs")]
+        );
 
         call.function.arguments = serde_json::json!({
             "command": "cd src/bin/ai && python update.py",
-            "project_paths": ["src/bin/ai/driver"],
             "pty": false
         })
         .to_string();
-        assert!(super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
-        call.function.arguments = serde_json::json!({
-            "command": "cd src/bin/ai && python update.py",
-            "project_paths": ["src/bin/ai"],
-            "pty": false
-        })
-        .to_string();
-        assert!(!super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
+        assert_eq!(
+            super::project_instruction_target_paths_from_tool_calls(
+                std::slice::from_ref(&call),
+                false
+            ),
+            vec![project_root.join("src/bin/ai")]
+        );
 
         call.function.arguments = serde_json::json!({
             "command": "sed -i '' -e 's/old/new/' src/bin/ai/driver/mod.rs",
-            "project_paths": ["src/bin/ai/driver/mod.rs"],
             "pty": false
         })
         .to_string();
-        assert!(!super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
+        assert_eq!(
+            super::project_instruction_target_paths_from_tool_calls(
+                std::slice::from_ref(&call),
+                false
+            ),
+            vec![project_root.join("src/bin/ai/driver/mod.rs")]
+        );
 
         call.function.arguments = serde_json::json!({
             "command": "python update.py",
             "cwd": "src/bin/ai/driver",
-            "project_paths": ["."],
             "pty": false
         })
         .to_string();
-        assert!(!super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
         assert_eq!(
             super::project_instruction_target_paths_from_tool_calls(
                 std::slice::from_ref(&call),
@@ -1555,9 +1466,13 @@ mod tests {
 
         call.function.arguments =
             r#"{"command":"printf ready > /tmp/agent-ready.log","pty":false}"#.to_string();
-        assert!(!super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
+        assert!(
+            super::project_instruction_target_paths_from_tool_calls(
+                std::slice::from_ref(&call),
+                false
+            )
+            .is_empty()
+        );
 
         for command in [
             "git -C /tmp/repo status",
@@ -1566,29 +1481,28 @@ mod tests {
             call.function.arguments =
                 serde_json::json!({"command": command, "pty": false}).to_string();
             assert!(
-                !super::execute_command_missing_project_paths(std::slice::from_ref(&call)),
-                "read-only command must not require project_paths: {command}"
+                super::project_instruction_target_paths_from_tool_calls(
+                    std::slice::from_ref(&call),
+                    false
+                )
+                .is_empty(),
+                "read-only command must not infer mutation targets: {command}"
             );
         }
 
         call.function.arguments =
             serde_json::json!({"command": "npm install", "pty": false}).to_string();
-        assert!(super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
-        call.function.arguments = serde_json::json!({
-            "command": "npm install",
-            "project_paths": ["."],
-            "pty": false
-        })
-        .to_string();
-        assert!(!super::execute_command_missing_project_paths(
-            std::slice::from_ref(&call)
-        ));
+        assert_eq!(
+            super::project_instruction_target_paths_from_tool_calls(
+                std::slice::from_ref(&call),
+                false
+            ),
+            vec![project_root]
+        );
 
         call.function.arguments =
             r#"{"command":"git -c core.pager=cat --no-pager diff -- src","pty":false}"#.to_string();
-        assert!(!super::execute_command_missing_project_paths(&[call]));
+        assert!(super::project_instruction_target_paths_from_tool_calls(&[call], false).is_empty());
     }
 
     #[test]

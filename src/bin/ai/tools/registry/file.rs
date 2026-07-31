@@ -76,7 +76,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "write_file",
-        description: "Write a file. For scratch/intermediate files (scripts, data dumps, test fixtures that are not part of the project), pass temp=true with a relative filename to write under the per-session temp directory. Temp files are automatically cleaned up when the session ends. Without temp=true, this creates a new file or intentionally replaces an entire file at an absolute path — for modifying an existing project file, prefer apply_patch or a minimal localized edit instead of a full rewrite. For deleting project/source/config files, including git-tracked files, use apply_patch with a `*** Delete File:` envelope section.",
+        description: "Write content to a file, replacing its entire contents (no append, no merge). Returns the absolute path on success.\n- temp=false (default): write to an absolute path; parent directories are created if missing. For modifying an existing file, prefer apply_patch instead of a full rewrite.\n- temp=true: pass a relative filename (e.g. `script.py`); it is written under the per-session temp directory and cleaned up when the session ends. Absolute paths are rejected.",
         parameters: params_write_file,
         execute: execute_write_file,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

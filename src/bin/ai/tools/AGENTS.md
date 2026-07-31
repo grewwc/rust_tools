@@ -35,9 +35,18 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
 9. **Patch/read/search contracts.** `apply_patch` anchors on removed text,
    normalizes supported typographic confusables, and rejects ambiguous matches.
    Unified diffs are single-file; multi-file edits and deletion use an explicit
-   envelope. Driver preflight and stale-patch tracking must reuse the patch target
-   extractor. `read_file` paginates by line and character cap; text search stays
-   in dedicated search tools.
+   envelope; a `*** Replace in line:` section is the low-friction path for a
+   single-line substring edit. Context-mismatch / ambiguous errors echo the
+   current file text as a prefix-free, paste-ready block (delimited by
+   `<<<PATCH_TEXT` / `PATCH_TEXT>>>`) so the model can rebuild without a full
+   re-read — keep that block prefix-free. Context-mismatch, ambiguous-match, and
+   hunks-out-of-order errors all carry actionable diagnostics. Only an ambiguous
+   match trips the stale-patch guard; context mismatch can be repaired directly
+   from the echoed current text, while out-of-order is a hunk-ordering problem.
+   Classify only the diagnostic before `<<<PATCH_TEXT` so source text cannot mimic
+   an error, and for multi-file patches block only the target that actually
+   failed. `read_file` paginates by line and character cap; text search stays in
+   dedicated search tools.
 10. **Subagent tools are top-level only.** Hide and reject the `task` family when
     `SUBAGENT_DEPTH > 0`; `enable_tools` must not restore it. Scope tasks by
     session + owner pid, persist results before IPC cleanup, and require
@@ -52,5 +61,5 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
     `TURN_IDENTITY`; never infer a cross-turn continuation from response text.
 13. **Command execution defaults to non-interactive.** Non-PTY runners disable
     blocking pagers, editors, prompts, and color; explicit PTY runs preserve
-    interactive terminal behavior. Mutating commands declare all affected
-    `project_paths` so scoped instructions load before execution.
+    interactive terminal behavior. Analyze mutating commands before execution
+    and automatically load scoped instructions for inferred project targets.
