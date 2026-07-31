@@ -980,9 +980,14 @@ pub(crate) fn merge_subagent_whitelist(
         let mut e = entry;
         e.owner_pid = None;
         e.owner_pgid = None;
-        if main_store.append(&e).is_ok() {
-            merged += 1;
-        }
+        main_store.append(&e).map_err(|error| {
+            format!(
+                "failed to merge subagent memory entry {} into {}: {error}",
+                e.id.as_deref().unwrap_or("<without-id>"),
+                main_path.display()
+            )
+        })?;
+        merged += 1;
     }
     crate::ai::tools::storage::memory_store::trace_memory_event(
         "memory.subagent_merge",

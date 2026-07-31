@@ -35,6 +35,7 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "task_spawn",
     "task_wait",
     "task_status",
+    "task_integrate",
 ];
 
 pub(crate) fn baseline_tool_names() -> &'static [&'static str] {
@@ -46,6 +47,7 @@ const SUBAGENT_ORCHESTRATION_TOOL_NAMES: &[&str] = &[
     "task_spawn",
     "task_wait",
     "task_status",
+    "task_integrate",
     "task_cancel",
 ];
 

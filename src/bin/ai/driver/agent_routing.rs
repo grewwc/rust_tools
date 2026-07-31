@@ -168,6 +168,7 @@ pub(super) fn reload_agent_manifests(
             new_agents.len()
         )
     };
+    crate::ai::prompt::completion::CommandCompleter::set_agent_manifests(&new_agents);
     *agent_manifests = Arc::new(new_agents);
     Some(message)
 }
@@ -263,6 +264,9 @@ pub(super) fn install_runtime_manifests(
         skill_manifests.as_slice(),
     );
     *agent_manifests = Arc::new(agents::load_all_agents());
+    crate::ai::prompt::completion::CommandCompleter::set_agent_manifests(
+        agent_manifests.as_slice(),
+    );
 
     if !skill_manifests.is_empty() {
         crate::ai::knowledge::indexing::embedder::warm_up();

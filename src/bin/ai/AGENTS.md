@@ -8,7 +8,8 @@ rules in the nearest child `AGENTS.md`.
 ## Runtime layout
 
 - `config*`: config loading, schema, model registry access
-- `driver/`: turn orchestration, prompt/tool loop, skill runtime, history glue
+- `driver/`: turn orchestration, prompt/tool loop, and skill runtime
+- `history/`: canonical persistence, context projection/compression, and task evidence
 - `request/`: LLM request execution, retry, error handling, routing,
   normalization, and thinking/reasoning support
 - `provider/`: provider adapters and wire-format differences
@@ -21,9 +22,8 @@ rules in the nearest child `AGENTS.md`.
 
 ## Runtime-wide invariants
 
-1. **No `cargo test` without user approval** - see root `AGENTS.md` Build/Test.
-   Full-app test compilation triggers heavy deps (mongodb, rusqlite, image) and
-   takes 2–8 min cold. Default to `cargo check --bin a`, always scoped.
+1. **Verification.** Follow the root verification ladder and keep Cargo commands
+   scoped; do not run bare workspace-wide checks or tests for routine changes.
 2. **Driver-owned turn lifecycle.** Prompt assembly, model calls, tool loops,
    history updates, and final response handling flow through the driver. Do not
    bypass it with ad-hoc side effects.
@@ -42,8 +42,9 @@ rules in the nearest child `AGENTS.md`.
    context are separate layers. Compression may replace only the context snapshot,
    never canonical messages; only explicit user lifecycle operations may truncate
    canonical history. Preserve pruned evidence with explicit overflow/file pointers.
-9. **Subagent ownership.** Child task results are evidence for the parent turn;
-   the parent must summarize confirmed conclusions in its own final response.
+9. **Subagent evidence lifecycle.** Persist delivered child results, restore
+   unintegrated evidence after context rebuild, and require explicit parent
+   integration before normal completion.
 10. **Derived-context provenance.** Runtime-owned policy/control notes may map
     to `system`; model-authored self-notes, checkpoints, and automatic summaries
     remain assistant-derived and marked unverified. Project assistant-derived

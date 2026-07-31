@@ -947,10 +947,9 @@ fn build_system_prompt(
          - Keep code reads narrow and serial: locate first, read one needed region at a time in a sufficiently broad chunk, and do not batch reads or re-read evidence already visible.\n\
          - On failure, diagnose and adjust before retrying; after 3 failed attempts on the same issue, stop and report what you tried and the current error.\n\n\
          Correctness guardrails:\n\
-         - Never present guesses, imagined evidence, or unverified assumptions as facts. Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence.\n\
-         - Tool or iteration limits, deadlines, forced no-tool handoffs, and forced final responses do not lower the evidence bar or authorize guessing. If unresolved, give an explicitly partial answer: what is verified, what is unknown, and the next verification step.\n\
-         - Never fabricate identifiers, files, paths, flags, config keys, behavior, output, line numbers, or quotations. State uncertainty and what would resolve it; ask a clarifying question or name the missing verification instead of guessing.\n\
-         - Separate verified facts, working hypotheses, and open questions. Before changing a shared symbol, API, config, data format, or embedded asset, use targeted search to locate callers and dependents and assess semantic ripple; compilation and tests catch only covered breakage, and this targeted reading is in scope.\n\
+         - Ground factual claims in observed evidence; never invent identifiers, paths, behavior, output, line numbers, or quotations. If evidence is insufficient—even under tool or iteration limits—state what is verified, what is unknown, and the next verification step.\n\
+         - Before changing a shared symbol, API, config, data format, or embedded asset, locate relevant callers and dependents and assess semantic ripple; compilation and tests prove only covered behavior.\n\
+         - In review or diagnosis work, report only consequences supported by traced evidence; keep unresolved hypotheses separate and distinguish introduced behavior from pre-existing behavior.\n\
          - Never use reset, checkout, restore, stash drop, or similar commands to discard existing changes, including staged changes, for testing or verification. For a clean state, use a temporary branch/worktree or stash push then pop; for a real rollback, explain why and get confirmation.\n\n\
          Task convergence:\n\
          - Define concrete task-level success criteria before broad exploration.\n\
@@ -1146,6 +1145,7 @@ fn build_system_prompt(
     if has_tool(available_tools, "task_spawn")
         || has_tool(available_tools, "task_wait")
         || has_tool(available_tools, "task_status")
+        || has_tool(available_tools, "task_integrate")
     {
         let mut lines = Vec::new();
         if has_tool(available_tools, "task_spawn") {
@@ -1155,16 +1155,19 @@ fn build_system_prompt(
                 lines.push("Use `task_spawn` to fan out MULTIPLE focused, independent subtasks concurrently. For a single delegated subtask, one spawned task immediately joined by `task_wait` gains no concurrency and just adds overhead.".to_string());
             }
             lines.push("Qualify a subtask only when it has a distinct, bounded goal, can proceed without another branch's result, and is substantial enough that its expected latency or context benefit outweighs handoff and synthesis overhead.".to_string());
-            lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in the same response (multiple `task_spawn` calls in one turn), then use a single `task_wait`. Do NOT spawn-wait-spawn-wait serially.".to_string());
+            lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in the same response (multiple `task_spawn` calls in one turn). Then continue every independent parent-side step while they run. Do NOT call `task_wait` merely because tasks are running, and do not spawn-wait-spawn-wait serially.".to_string());
             lines.push("Do not delegate merely to create parallelism. Keep simple tasks, single-file localized changes, tightly coupled or overlapping work, strongly sequential work, and work you can finish directly with a few tool calls in the parent.".to_string());
-            lines.push("Delegation check: delegate only if the subtask is independent, bounded, and has a clear net benefit. If any condition is weak or unclear, keep it in the parent; do not create speculative or duplicate subagents.".to_string());
+            lines.push("Context pressure, iteration limits, tool failures, and recovery steps are not delegation benefits. Do not hand off the parent's current unresolved branch; delegate only work that is independently bounded and worthwhile without those pressures.".to_string());
         }
         if has_tool(available_tools, "task_wait") {
-            lines.push("Use `task_wait` to collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.".to_string());
+            lines.push("Call `task_wait` only when the parent is blocked on subagent results or has no productive independent work left. Keep its per-call timeout short (normally 30-60 seconds) and prefer `wait_policy=\"any\"` so the parent resumes on the first useful result.".to_string());
         }
         if has_tool(available_tools, "task_status") {
-            lines.push("Use `task_status` for a non-blocking peek.".to_string());
-            lines.push("Before finishing your answer, call `task_status` to confirm no spawned subagent is still running. For every task_id you spawned, you MUST have collected its result (via task_wait or seen completed in task_status) and handled its output — including errors. Never silently drop a spawned task.".to_string());
+            lines.push("Use `task_status` for a non-blocking peek while continuing parent-side work.".to_string());
+            lines.push("Before finishing your answer, call `task_status` to confirm no spawned subagent is still running. Never silently drop a spawned task.".to_string());
+        }
+        if has_tool(available_tools, "task_integrate") {
+            lines.push("After `task`, `task_wait`, or `task_status` delivers a result, call `task_integrate` with that task_id, a disposition, and the parent conclusion. Delivery alone is not integration, and normal final answers are blocked while delivered results remain unintegrated.".to_string());
         }
         if has_tool(available_tools, "task_cancel") {
             lines.push("Use `task_cancel` to abandon a stuck or no-longer-needed background subagent instead of repeatedly calling `task_wait` - it terminates the subagent process and writes a cancelled terminal result, but you still must collect that result later with `task_wait` or `task_status`.".to_string());
@@ -1629,6 +1632,7 @@ mod tests {
                     "task_spawn",
                     "task_wait",
                     "task_status",
+                    "task_integrate",
                     "task_cancel",
                 ] {
                     assert!(!names.contains_str(hidden), "{hidden} should be hidden");
@@ -1923,7 +1927,9 @@ mod tests {
         );
         assert!(prompt.contains("Do not delegate merely to create parallelism"));
         assert!(prompt.contains("tightly coupled or overlapping work"));
-        assert!(prompt.contains("If any condition is weak or unclear, keep it in the parent"));
+        assert!(prompt.contains("continue every independent parent-side step while they run"));
+        assert!(prompt.contains("only when the parent is blocked on subagent results"));
+        assert!(prompt.contains("Use `task_status` for a non-blocking peek while continuing"));
         assert!(!prompt.contains("certainty is not required"));
     }
 
@@ -1960,13 +1966,13 @@ mod tests {
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
         assert!(prompt.contains("Correctness guardrails:"));
-        assert!(prompt.contains("Never present guesses, imagined evidence"));
-        assert!(prompt.contains("do not lower the evidence bar or authorize guessing"));
-        assert!(prompt.contains("explicitly partial answer"));
-        assert!(prompt.contains("ask a clarifying question or name the missing verification"));
-        assert!(prompt.contains("verified facts, working hypotheses, and open questions"));
-        assert!(prompt.contains("locate callers and dependents and assess semantic ripple"));
-        assert!(prompt.contains("compilation and tests catch only covered breakage"));
+        assert!(prompt.contains("Ground factual claims in observed evidence"));
+        assert!(prompt.contains("state what is verified, what is unknown"));
+        assert!(prompt.contains("locate relevant callers and dependents"));
+        assert!(prompt.contains("compilation and tests prove only covered behavior"));
+        assert!(prompt.contains("consequences supported by traced evidence"));
+        assert!(prompt.contains("keep unresolved hypotheses separate"));
+        assert!(prompt.contains("distinguish introduced behavior from pre-existing behavior"));
         assert!(prompt.contains("reset, checkout, restore, stash drop"));
         assert!(prompt.contains("temporary branch/worktree or stash push then pop"));
     }

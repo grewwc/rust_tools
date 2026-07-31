@@ -340,6 +340,10 @@ fn build_plan_working_checkpoint_body(
     body.push_str("- Not captured by `plan`.\n");
     body.push_str("\n## Files Modified\n");
     body.push_str("- Not captured by `plan`.\n");
+    body.push_str("\n## Task Evidence\n");
+    body.push_str(
+        "- Durable subagent delivery/integration state is maintained in the sibling `task-evidence.md` checkpoint and injected automatically into parent turns.\n",
+    );
     body.push_str("\n## Next Steps\n");
     if let Some(steps) = render_plan_steps(args) {
         body.push_str(&steps);

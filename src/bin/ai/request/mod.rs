@@ -4,6 +4,7 @@ use reqwest::StatusCode;
 mod aux;
 mod builder;
 mod error;
+mod image_digest;
 mod logging;
 mod normalize;
 mod protocol;
@@ -19,6 +20,10 @@ use aux::{SESSION_TITLE_BODY_TIMEOUT_SECS, SESSION_TITLE_REQUEST_TIMEOUT_SECS};
 pub(crate) use aux::{
     charge_llm_usage_to_kernel, generate_session_title_via_model,
     summarize_history_via_model,
+};
+pub(crate) use image_digest::{
+    content_has_image, describe_image_for_digest, digest_instruction, parse_digest,
+    swap_images_with_digest,
 };
 #[allow(unused_imports)]
 pub(crate) use error::{
@@ -37,6 +42,7 @@ pub(crate) use error::{
 pub(in crate::ai) use logging::emit_request_diagnostic;
 #[cfg(test)]
 pub(in crate::ai) use logging::request_diagnostics_enabled;
+pub(in crate::ai) use logging::TransientStatusLine;
 #[cfg(test)]
 use protocol::responses_reasoning_replay_stats;
 pub(crate) use protocol::extract_response_text;

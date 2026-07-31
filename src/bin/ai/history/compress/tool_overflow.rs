@@ -384,7 +384,7 @@ pub(super) fn build_tool_call_name_index(messages: &[Message]) -> FxHashMap<Stri
     out
 }
 
-fn build_tool_call_arguments_index(messages: &[Message]) -> FxHashMap<String, String> {
+pub(super) fn build_tool_call_arguments_index(messages: &[Message]) -> FxHashMap<String, String> {
     let mut out = FxHashMap::default();
     for message in messages {
         let Some(tool_calls) = &message.tool_calls else {
@@ -840,15 +840,58 @@ pub(super) fn preserve_noncompressible_tool_result_for_fold(
     ))
 }
 
-fn write_preserved_tool_overflow_file(
+/// 同 [`preserve_noncompressible_tool_result_for_fold`]，但归档文件名由
+/// `tool_call_id` 确定性派生（而非随机 uuid + 时间戳）。
+///
+/// LLM 引导裁剪（`llm_prune::apply_pruning`）作用于每轮 `prepare` 内**重新构建**、
+/// 从不落盘的临时 `history` 副本上：同一条被裁剪的 tool 消息会在后续每一轮被再次
+/// 裁剪。若沿用随机文件名，则每轮都会写出新副本、生成不同 stub 文本 → prompt
+/// cache 从该点断裂 + 磁盘副本单调膨胀。用确定性文件名后，同一 `tool_call_id`
+/// 的归档幂等：文件已存在则跳过写入，stub 文本逐轮稳定。
+pub(super) fn preserve_pruned_tool_result_stable(
+    overflow_dir: Option<&Path>,
+    tool_call_id: &str,
+    tool_name: &str,
+    content: &str,
+    recall_lines: &[String],
+) -> Option<String> {
+    if is_preserved_tool_overflow_stub(content) {
+        return Some(content.to_string());
+    }
+    let path = overflow_dir.and_then(|dir| {
+        write_preserved_tool_overflow_file_stable(dir, tool_call_id, tool_name, content)
+    })?;
+    Some(build_preserved_tool_overflow_stub(
+        &path,
+        tool_name,
+        content,
+        recall_lines,
+    ))
+}
+
+/// 以 `tool_call_id` 派生确定性文件名写出归档；文件已存在则直接复用，不重复写。
+fn write_preserved_tool_overflow_file_stable(
     overflow_dir: &Path,
+    tool_call_id: &str,
     tool_name: &str,
     content: &str,
 ) -> Option<PathBuf> {
     let dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
     std::fs::create_dir_all(&dir).ok()?;
-    let safe_tool = tool_name
-        .chars()
+    let safe_tool = sanitize_overflow_name_component(tool_name);
+    let safe_id = sanitize_overflow_name_component(tool_call_id);
+    let file_name = format!("pruned-{safe_tool}-{safe_id}.txt");
+    let path = dir.join(file_name);
+    // 幂等：内容不随轮次变化，已存在则不重复写盘（也保住 prompt cache 稳定）。
+    if !path.exists() {
+        std::fs::write(&path, content).ok()?;
+    }
+    Some(path)
+}
+
+/// 把工具名 / id 归一成仅含字母数字与 `-`/`_` 的安全文件名片段。
+fn sanitize_overflow_name_component(raw: &str) -> String {
+    raw.chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
                 ch
@@ -856,7 +899,17 @@ fn write_preserved_tool_overflow_file(
                 '_'
             }
         })
-        .collect::<String>();
+        .collect::<String>()
+}
+
+fn write_preserved_tool_overflow_file(
+    overflow_dir: &Path,
+    tool_name: &str,
+    content: &str,
+) -> Option<PathBuf> {
+    let dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+    std::fs::create_dir_all(&dir).ok()?;
+    let safe_tool = sanitize_overflow_name_component(tool_name);
     let file_name = format!(
         "{}-{}-{}.txt",
         chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),

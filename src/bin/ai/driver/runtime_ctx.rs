@@ -278,12 +278,20 @@ pub(crate) fn temp_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Deterministic scratch-workspace path for a sub-agent that opted out of
+/// `inherit.cwd`. Single source of truth for the path rule so that the
+/// creation site ([`make_subagent_cwd`]) and the cleanup site (the history
+/// guard) can never drift out of sync.
+pub(crate) fn subagent_cwd_path(base: &Path, task_id: &str) -> PathBuf {
+    base.join(format!("subagent-cwd-{task_id}"))
+}
+
 /// Build a default scratch workspace path for a sub-agent that opted out
 /// of `inherit.cwd`. The directory is created on demand. Returns `None`
 /// if the directory cannot be created (caller should fall back to
 /// inheriting cwd in that case).
 pub(crate) fn make_subagent_cwd(base: &Path, task_id: &str) -> Option<PathBuf> {
-    let dir = base.join(format!("subagent-cwd-{task_id}"));
+    let dir = subagent_cwd_path(base, task_id);
     std::fs::create_dir_all(&dir).ok().map(|_| dir)
 }
 

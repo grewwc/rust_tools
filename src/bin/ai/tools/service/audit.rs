@@ -23,18 +23,39 @@ fn config_blocked_commands() -> Vec<String> {
 // Shell 分段（按 `&&` / `||` / `;` / `|` / `\n` 拆分链式命令）
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellJoin {
+    Start,
+    And,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShellSegment {
+    pub(crate) command: String,
+    pub(crate) join: ShellJoin,
+}
+
 /// 以 unquoted 的 `&&` / `||` / `;` / `|` / `\n` 为分隔符，把整条命令拆成
 /// 独立段。单/双引号内的分隔符不会触发拆分；单引号 heredoc body 内的换行也会
 /// 被跳过（heredoc body 内容是字面量，不应被拆分逻辑消费）。
-pub(super) fn split_unquoted_segments(command: &str) -> Vec<String> {
+pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment> {
     let bytes = command.as_bytes();
-    let mut segments: Vec<String> = Vec::new();
+    let mut segments = Vec::new();
     let mut current = String::new();
+    let mut current_join = ShellJoin::Start;
     let mut i = 0usize;
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
     let mut pending_heredocs: Vec<HereDocSpec> = Vec::new();
+
+    let push_current = |segments: &mut Vec<ShellSegment>, current: &mut String, join: ShellJoin| {
+        let command = std::mem::take(current).trim().to_string();
+        if !command.is_empty() {
+            segments.push(ShellSegment { command, join });
+        }
+    };
 
     while i < bytes.len() {
         let b = bytes[i];
@@ -95,20 +116,24 @@ pub(super) fn split_unquoted_segments(command: &str) -> Vec<String> {
             }
             // 双字符操作符 `&&` / `||`
             b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
-                segments.push(std::mem::take(&mut current));
+                push_current(&mut segments, &mut current, current_join);
+                current_join = ShellJoin::And;
                 i += 2;
             }
             b'|' if i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
-                segments.push(std::mem::take(&mut current));
+                push_current(&mut segments, &mut current, current_join);
+                current_join = ShellJoin::Other;
                 i += 2;
             }
             // 单字符分隔符
             b';' | b'|' | b'&' => {
-                segments.push(std::mem::take(&mut current));
+                push_current(&mut segments, &mut current, current_join);
+                current_join = ShellJoin::Other;
                 i += 1;
             }
             b'\n' => {
-                segments.push(std::mem::take(&mut current));
+                push_current(&mut segments, &mut current, current_join);
+                current_join = ShellJoin::Other;
                 i += 1;
                 if !pending_heredocs.is_empty() {
                     i = skip_heredoc_bodies(command, i, &pending_heredocs);
@@ -121,11 +146,22 @@ pub(super) fn split_unquoted_segments(command: &str) -> Vec<String> {
             }
         }
     }
-    segments.push(current);
+    let trailing_non_success_join = current.trim().is_empty() && current_join == ShellJoin::Other;
+    push_current(&mut segments, &mut current, current_join);
+    if trailing_non_success_join && !segments.is_empty() {
+        segments.push(ShellSegment {
+            command: String::new(),
+            join: ShellJoin::Other,
+        });
+    }
     segments
+}
+
+pub(crate) fn split_unquoted_segments(command: &str) -> Vec<String> {
+    split_unquoted_command_segments(command)
         .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(|segment| segment.command)
+        .filter(|command| !command.is_empty())
         .collect()
 }
 
@@ -348,7 +384,7 @@ fn validate_and_skip_heredoc_bodies(
 // Shell 词法分析（用于单段校验）
 // ---------------------------------------------------------------------------
 
-pub(super) fn tokenize_shell_words(command: &str) -> Vec<String> {
+pub(crate) fn tokenize_shell_words(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
@@ -696,6 +732,33 @@ fn indirect_command_index(
     }
 }
 
+pub(crate) fn effective_command_tokens(segment: &str) -> Vec<String> {
+    let tokens = tokenize_shell_words(segment);
+    let Some(start) = command_word_index(&tokens, true) else {
+        return Vec::new();
+    };
+    let mut current = tokens[start..].to_vec();
+    for _ in 0..4 {
+        let Some(program) = current.first().and_then(|token| {
+            std::path::Path::new(token)
+                .file_name()
+                .and_then(|name| name.to_str())
+        }) else {
+            break;
+        };
+        let lower = current
+            .iter()
+            .map(|token| token.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let Some(index) = indirect_command_index(&program.to_ascii_lowercase(), &lower, &current)
+        else {
+            break;
+        };
+        current = current[index..].to_vec();
+    }
+    current
+}
+
 fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
     let is_shell = matches!(program, "bash" | "sh" | "zsh" | "ksh" | "dash");
     // 脚本解释器同样支持 `-c` / `-e` 直接传入并执行代码字符串，会绕过分段黑名单验证。
@@ -806,6 +869,58 @@ fn git_subcommand_index(command_tokens: &[String]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn cargo_subcommand_index(command_tokens: &[String]) -> Option<usize> {
+    const VALUE_CONSUMING: &[&str] = &[
+        "--color",
+        "--config",
+        "--manifest-path",
+        "--target-dir",
+        "-C",
+        "-Z",
+    ];
+    let mut index = 1usize;
+    while index < command_tokens.len() {
+        let token = command_tokens[index].as_str();
+        if token == "--" {
+            return command_tokens.get(index + 1).map(|_| index + 1);
+        }
+        if !token.starts_with('-') || token == "-" {
+            return Some(index);
+        }
+        if token.contains('=')
+            || (token.starts_with("-C") && token.len() > 2)
+            || (token.starts_with("-Z") && token.len() > 2)
+        {
+            index += 1;
+            continue;
+        }
+        index += if VALUE_CONSUMING.contains(&token) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
+pub(crate) fn command_subcommand_index(command_tokens: &[String]) -> Option<usize> {
+    let program = command_tokens.first().and_then(|token| {
+        std::path::Path::new(token)
+            .file_name()
+            .and_then(|name| name.to_str())
+    })?;
+    match program {
+        "git" => git_subcommand_index(command_tokens),
+        "cargo" => cargo_subcommand_index(command_tokens),
+        _ => command_tokens
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, token)| !token.starts_with('-') && !token.contains('='))
+            .map(|(index, _)| index),
+    }
 }
 
 /// 被安全策略硬拦的 `git` 子命令及其拒绝原因。
@@ -1549,7 +1664,11 @@ pub(crate) fn validate_execute_command(command: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_unquoted_segments, tokenize_shell_words, validate_no_injection_surface};
+    use super::{
+        ShellJoin, command_subcommand_index, effective_command_tokens,
+        split_unquoted_command_segments, split_unquoted_segments, tokenize_shell_words,
+        validate_no_injection_surface,
+    };
 
     // ---- split_unquoted_segments ----
 
@@ -1573,6 +1692,18 @@ mod tests {
                 "c".to_string(),
                 "d".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn split_preserves_success_chain_semantics() {
+        let segments = split_unquoted_command_segments("a && b; c");
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.join)
+                .collect::<Vec<_>>(),
+            vec![ShellJoin::Start, ShellJoin::And, ShellJoin::Other]
         );
     }
 
@@ -1611,6 +1742,17 @@ mod tests {
                 "\\$(literal)".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn command_analysis_handles_wrappers_and_value_options() {
+        let git = effective_command_tokens("env -C /tmp FOO=1 git -C /repo status");
+        let git_index = command_subcommand_index(&git).unwrap();
+        assert_eq!(git[git_index], "status");
+
+        let cargo = effective_command_tokens("cargo --manifest-path Cargo.toml check");
+        let cargo_index = command_subcommand_index(&cargo).unwrap();
+        assert_eq!(cargo[cargo_index], "check");
     }
 
     // ---- injection surface ----

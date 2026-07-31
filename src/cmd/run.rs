@@ -15,10 +15,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::{
-    io::FromRawFd,
-    process::CommandExt,
-};
+use std::os::unix::{io::FromRawFd, process::CommandExt};
 
 /// 命令执行选项
 ///
@@ -391,6 +388,22 @@ pub fn run_cmd_output_with_timeout(
     run_cmd_output_streaming_with_timeout(command, opts, timeout, |_| {}, || false)
 }
 
+pub fn run_cmd_output_with_timeout_non_interactive(
+    command: &str,
+    opts: RunCmdOptions<'_>,
+    timeout: Duration,
+) -> io::Result<Output> {
+    let result = run_cmd_output_streaming_with_timeout_tracked_non_interactive(
+        command,
+        opts,
+        timeout,
+        |_| {},
+        || false,
+        |_| {},
+    )?;
+    result_to_output(result)
+}
+
 #[derive(Clone, Copy)]
 enum StreamKind {
     Stdout,
@@ -489,6 +502,49 @@ pub struct CommandRunResult {
     pub cancelled: bool,
 }
 
+#[derive(Clone, Copy)]
+struct CommandEnvPolicy {
+    suppress_pagers: bool,
+    suppress_interaction: bool,
+}
+
+const INHERITED_ENV_POLICY: CommandEnvPolicy = CommandEnvPolicy {
+    suppress_pagers: false,
+    suppress_interaction: false,
+};
+const NON_INTERACTIVE_ENV_POLICY: CommandEnvPolicy = CommandEnvPolicy {
+    suppress_pagers: true,
+    suppress_interaction: true,
+};
+// PTY 输出仍由父进程捕获，因此关闭 pager；但保留提示、编辑器、终端和颜色环境，
+// 让显式交互命令继续按真实终端模式运行。
+const PSEUDO_TERMINAL_ENV_POLICY: CommandEnvPolicy = CommandEnvPolicy {
+    suppress_pagers: true,
+    suppress_interaction: false,
+};
+
+fn apply_pager_suppression_env(cmd: &mut Command) {
+    cmd.env("PAGER", "cat").env("GIT_PAGER", "cat");
+}
+
+fn apply_interaction_suppression_env(cmd: &mut Command) {
+    cmd.env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0");
+}
+
+fn apply_command_env_policy(cmd: &mut Command, policy: CommandEnvPolicy) {
+    if policy.suppress_pagers {
+        apply_pager_suppression_env(cmd);
+    }
+    if policy.suppress_interaction {
+        apply_interaction_suppression_env(cmd);
+    }
+}
+
 /// 把带超时/取消标记的结果转回旧的 `io::Result<Output>` 语义：
 /// 超时 -> `Err(TimedOut)`、取消 -> `Err(Interrupted)`、正常 -> `Ok(Output)`。
 /// 旧路径（hooks、非流式 `run_cmd_output_with_timeout`）不需要部分输出，只看成功/失败，
@@ -558,11 +614,38 @@ where
         should_cancel,
         on_background_group,
         false,
+        INHERITED_ENV_POLICY,
+    )
+}
+
+pub fn run_cmd_output_streaming_with_timeout_tracked_non_interactive<F, C, G>(
+    command: &str,
+    opts: RunCmdOptions<'_>,
+    timeout: Duration,
+    on_chunk: F,
+    should_cancel: C,
+    on_background_group: G,
+) -> io::Result<CommandRunResult>
+where
+    F: FnMut(&[u8]),
+    C: Fn() -> bool,
+    G: FnMut(u32),
+{
+    run_cmd_output_streaming_with_timeout_tracked_inner(
+        command,
+        opts,
+        timeout,
+        on_chunk,
+        should_cancel,
+        on_background_group,
+        false,
+        NON_INTERACTIVE_ENV_POLICY,
     )
 }
 
 /// 与 [`run_cmd_output_streaming_with_timeout_tracked`] 相同，但让子进程运行在 PTY
-/// 中。仅限需要终端能力（例如扫码登录、全屏交互 CLI）的显式调用；常规命令仍应
+/// 中。仅限需要终端能力（例如扫码登录、全屏交互 CLI）的显式调用；该路径只关闭
+/// 可能阻塞捕获输出的 pager，不关闭提示、编辑器、终端能力或颜色。常规命令仍应
 /// 使用管道，以保留 stdout/stderr 分离和普通日志的非交互语义。
 pub fn run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal<F, C, G>(
     command: &str,
@@ -585,6 +668,7 @@ where
         should_cancel,
         on_background_group,
         true,
+        PSEUDO_TERMINAL_ENV_POLICY,
     )
 }
 
@@ -596,6 +680,7 @@ fn run_cmd_output_streaming_with_timeout_tracked_inner<F, C, G>(
     should_cancel: C,
     mut on_background_group: G,
     pseudo_terminal: bool,
+    env_policy: CommandEnvPolicy,
 ) -> io::Result<CommandRunResult>
 where
     F: FnMut(&[u8]),
@@ -603,6 +688,7 @@ where
     G: FnMut(u32),
 {
     let mut cmd = build_command(command, opts)?;
+    apply_command_env_policy(&mut cmd, env_policy);
 
     let (mut child, rx) = if pseudo_terminal {
         #[cfg(unix)]
@@ -1017,6 +1103,69 @@ mod tests {
             assert!(
                 reported.is_empty(),
                 "clean foreground command should not report a surviving group, got {reported:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pseudo_terminal_env_only_disables_pagers() {
+        fn configured_env<'a>(
+            cmd: &'a std::process::Command,
+            key: &str,
+        ) -> Option<Option<&'a std::ffi::OsStr>> {
+            cmd.get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .map(|(_, value)| value)
+        }
+
+        let mut cmd = std::process::Command::new("env");
+        super::apply_command_env_policy(&mut cmd, super::PSEUDO_TERMINAL_ENV_POLICY);
+
+        for key in ["PAGER", "GIT_PAGER"] {
+            assert_eq!(
+                configured_env(&cmd, key),
+                Some(Some(std::ffi::OsStr::new("cat"))),
+                "PTY should disable captured-output pager {key}"
+            );
+        }
+        for key in [
+            "GIT_EDITOR",
+            "GIT_SEQUENCE_EDITOR",
+            "GIT_TERMINAL_PROMPT",
+            "TERM",
+            "NO_COLOR",
+            "CLICOLOR",
+        ] {
+            assert_eq!(
+                configured_env(&cmd, key),
+                None,
+                "PTY should preserve inherited interactive environment {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_interactive_runner_disables_pagers_and_prompts() {
+        let output = super::run_cmd_output_with_timeout_non_interactive(
+            "env",
+            RunCmdOptions::default(),
+            Duration::from_secs(5),
+        )
+        .expect("non-interactive command should succeed");
+        let env = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            "PAGER=cat",
+            "GIT_PAGER=cat",
+            "GIT_EDITOR=true",
+            "GIT_SEQUENCE_EDITOR=true",
+            "GIT_TERMINAL_PROMPT=0",
+            "TERM=dumb",
+            "NO_COLOR=1",
+            "CLICOLOR=0",
+        ] {
+            assert!(
+                env.lines().any(|line| line == expected),
+                "missing {expected}"
             );
         }
     }

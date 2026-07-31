@@ -1,6 +1,7 @@
 use ratatui::{
     layout::Alignment,
     layout::Rect,
+    layout::Position,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -205,8 +206,10 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     // 设置对齐方式
     textarea.set_alignment(Alignment::Left);
-    // 设置输入文字颜色：柔和的灰白色，在深色背景上清晰可读且与整体主题协调
-    textarea.set_style(Style::default().fg(Color::Rgb(220, 225, 235)));
+    // 用户输入使用低饱和暖灰；它不会与蓝/青状态信息或黄色告警争夺注意力，
+    // 在深色终端中也比高饱和颜色更适合长时间阅读。
+    let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
+    textarea.set_style(Style::default().fg(Color::Rgb(red, green, blue)));
     // tui-textarea 默认用 REVERSED 空格把 cursor 画进 buffer；在 ratatui inline
     // viewport 下，resize 重锚会把这块"画出来的 cursor"推进 scrollback，表现为
     // 每次侧栏展开/收回都多一个白色 cursor 残影。这里禁用 buffer cursor，改用
@@ -214,11 +217,16 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     textarea.set_cursor_style(Style::default());
 
     f.render_widget(&*textarea, textarea_area);
-    let cursor_offset_row =
-        textarea_terminal_cursor(textarea, textarea_area).map(|(cursor_x, cursor_y)| {
-            f.set_cursor_position((cursor_x, cursor_y));
-            cursor_y.saturating_sub(area.y)
-        });
+    // 直接使用 tui-textarea 渲染后计算好的真实终端光标位置。
+    // 之前这里自己重算了一套屏幕坐标，用了 `UnicodeWidthChar::width_cjk`，而
+    // tui-textarea 内部（screen_map.rs）使用非 CJK 版本的 `c.width()`，两者对
+    // CJK/ambiguous-width 字符返回的宽度不同，在中文输入下会导致真实终端光标
+    // 跟编辑器 buffer 光标位置偏离 1 列以上（越靠前的 CJK 字符越明显）。
+    // 直接复用库内部在 render_plan 阶段算好的位置，保证两者永远一致。
+    let cursor_offset_row = textarea.rendered_cursor_position().map(|pos: Position| {
+        f.set_cursor_position((pos.x, pos.y));
+        pos.y.saturating_sub(area.y)
+    });
 
     // 渲染 completion panel
     if let Some(panel) = completion_panel {
@@ -537,41 +545,6 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
     out
 }
 
-fn textarea_terminal_cursor(textarea: &TextArea<'_>, area: Rect) -> Option<(u16, u16)> {
-    if area.width == 0 || area.height == 0 {
-        return None;
-    }
-
-    let (cursor_row, cursor_col) = textarea.cursor();
-    let rows = textarea.lines().len();
-    if rows == 0 {
-        return Some((area.x, area.y));
-    }
-
-    let visible_rows = area.height as usize;
-    let top_row = cursor_row.saturating_sub(visible_rows.saturating_sub(1));
-    let y = area.y + cursor_row.saturating_sub(top_row).min(visible_rows - 1) as u16;
-
-    let line = textarea
-        .lines()
-        .get(cursor_row)
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    let cursor_col_width = line
-        .chars()
-        .take(cursor_col)
-        .map(|ch| unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0))
-        .sum::<usize>();
-    let visible_cols = area.width as usize;
-    let left_col = cursor_col_width.saturating_sub(visible_cols.saturating_sub(1));
-    let x = area.x
-        + cursor_col_width
-            .saturating_sub(left_col)
-            .min(visible_cols - 1) as u16;
-
-    Some((x, y))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -583,7 +556,7 @@ mod tests {
         backend::TestBackend,
         layout::{Position, Rect},
     };
-    use tui_textarea::TextArea;
+    use tui_textarea::{TextArea, CursorMove};
     use unicode_width::UnicodeWidthStr;
 
     fn display_width(s: &str) -> usize {
@@ -740,5 +713,44 @@ mod tests {
                 "viewport row {y} still contains a decorative divider: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn cjk_cursor_position_matches_popup_inner_left_plus_width() {
+        // 中文输入时，光标应落在 textarea 首行 popup 内左边 + 文字显示宽度处。
+        // 之前手算用 width_cjk，与 tui-textarea 内部的 width 不一致，
+        // 导致光标向右偏移（CJK 字符每字符偏移 1 列）。
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        // "你好世界" 4 个 CJK 字符，每个宽度 2，合计显示宽度 8
+        let content = "你好世界";
+        let mut textarea = TextArea::from(vec![content.to_string()]);
+        // 把光标移到文字末尾（"你好世界" → col 4）
+        textarea.move_cursor(CursorMove::End);
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup(f, &mut textarea, None, None, "glm-5.2-super-relay", None);
+            })
+            .unwrap();
+
+        let popup_width = viewport_area
+            .width
+            .saturating_sub(2)
+            .clamp(40, 180)
+            .min(viewport_area.width);
+        let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
+        // 光标在 "你好世界" 末尾 → popup 内左边(1) + "你好世界" 显示宽度(8)
+        let expected_x = popup_x + 1 + 8;
+        let expected = Position::new(expected_x, viewport_area.y);
+        terminal.backend_mut().assert_cursor_position(expected);
     }
 }

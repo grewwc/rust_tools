@@ -273,7 +273,10 @@ impl SessionStore {
             return Ok(None);
         }
 
-        let file_modified = path.metadata().ok().and_then(|metadata| metadata.modified().ok());
+        let file_modified = path
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
         let (first_user_prompt, generated_title, last_activity_unix_ms) =
             match read_session_list_metadata_sqlite(&path) {
                 Ok(metadata) => (

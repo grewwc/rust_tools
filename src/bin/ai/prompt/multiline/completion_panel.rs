@@ -216,36 +216,18 @@ mod tests {
     use tui_textarea::CursorMove;
 
     #[test]
-    fn multiline_completion_first_tab_is_silent_for_ambiguous_matches() {
+    fn multiline_completion_completes_canonical_agent_command() {
         let mut textarea = TextArea::new(vec!["/agen".to_string()]);
         textarea.move_cursor(CursorMove::End);
         let mut pending = None;
         let mut panel = None;
 
-        let status = apply_multiline_completion(&mut textarea, &mut pending, &mut panel);
-
-        assert_eq!(textarea.lines(), vec!["/agen"]);
-        assert!(pending.is_some());
-        assert!(panel.is_none());
-        assert!(status.is_none());
-    }
-
-    #[test]
-    fn multiline_completion_second_tab_lists_candidates() {
-        let mut textarea = TextArea::new(vec!["/agen".to_string()]);
-        textarea.move_cursor(CursorMove::End);
-        let mut pending = None;
-        let mut panel = None;
-
-        let _ = apply_multiline_completion(&mut textarea, &mut pending, &mut panel);
         let status = apply_multiline_completion(&mut textarea, &mut pending, &mut panel).unwrap();
 
-        assert_eq!(textarea.lines(), vec!["/agen"]);
-        assert!(pending.is_some());
-        assert!(status.contains("发现 2 个候选"));
-        let items = panel.as_ref().map(|panel| panel.items.clone()).unwrap();
-        assert!(items.iter().any(|item| item.replacement == "/agent"));
-        assert!(items.iter().any(|item| item.replacement == "/agents"));
+        assert_eq!(textarea.lines(), vec!["/agent"]);
+        assert!(pending.is_none());
+        assert!(panel.is_none());
+        assert_eq!(status, "已补全为 /agent");
     }
 
     #[test]
@@ -273,7 +255,7 @@ mod tests {
 
     #[test]
     fn multiline_completion_lists_candidates_for_subcommands() {
-        let mut textarea = TextArea::new(vec!["/agents ".to_string()]);
+        let mut textarea = TextArea::new(vec!["/agent ".to_string()]);
         textarea.move_cursor(CursorMove::End);
         let mut pending = None;
         let mut panel = None;
@@ -322,7 +304,7 @@ mod tests {
 
     #[test]
     fn completion_panel_enter_confirms_selected_candidate() {
-        let mut textarea = TextArea::new(vec!["/agen".to_string()]);
+        let mut textarea = TextArea::new(vec!["/usage ".to_string()]);
         textarea.move_cursor(CursorMove::End);
         let mut pending = None;
         let mut panel = None;
@@ -332,11 +314,11 @@ mod tests {
 
         let result = confirm_completion_selection(&mut textarea, &mut pending, &mut panel);
 
-        assert_eq!(textarea.lines(), vec!["/agent"]); // 第一个候选 /agent（字典序 < /agents）
+        assert_eq!(textarea.lines(), vec!["/usage today"]);
         assert!(pending.is_none());
         assert!(panel.is_none());
         assert_eq!(result.submit, None);
-        assert_eq!(result.status.as_deref(), Some("已选择 /agent"));
+        assert_eq!(result.status.as_deref(), Some("已选择 today"));
     }
 
     #[test]
@@ -361,7 +343,7 @@ mod tests {
 
     #[test]
     fn dismiss_completion_panel_clears_panel_without_changing_input() {
-        let mut textarea = TextArea::new(vec!["/agen".to_string()]);
+        let mut textarea = TextArea::new(vec!["/model".to_string()]);
         textarea.move_cursor(CursorMove::End);
         let mut pending = None;
         let mut panel = None;
@@ -371,7 +353,7 @@ mod tests {
 
         dismiss_completion_panel(&mut pending, &mut panel);
 
-        assert_eq!(textarea.lines(), vec!["/agen"]);
+        assert_eq!(textarea.lines(), vec!["/model"]);
         assert!(pending.is_none());
         assert!(panel.is_none());
     }

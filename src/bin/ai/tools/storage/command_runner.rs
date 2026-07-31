@@ -1,4 +1,5 @@
 use std::process::Output;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 pub(crate) fn run_command(
@@ -6,7 +7,7 @@ pub(crate) fn run_command(
     cwd: Option<&str>,
     timeout_secs: u64,
 ) -> Result<Output, String> {
-    crate::cmd::run::run_cmd_output_with_timeout(
+    crate::cmd::run::run_cmd_output_with_timeout_non_interactive(
         command,
         crate::cmd::run::RunCmdOptions { cwd },
         Duration::from_secs(timeout_secs),
@@ -36,20 +37,26 @@ where
             opts,
             Duration::from_secs(timeout_secs),
             on_chunk,
-            crate::ai::tools::registry::common::is_tool_cancel_requested,
+            is_command_cancel_requested,
             on_background_group,
         )
     } else {
-        crate::cmd::run::run_cmd_output_streaming_with_timeout_tracked(
+        crate::cmd::run::run_cmd_output_streaming_with_timeout_tracked_non_interactive(
             command,
             opts,
             Duration::from_secs(timeout_secs),
             on_chunk,
-            crate::ai::tools::registry::common::is_tool_cancel_requested,
+            is_command_cancel_requested,
             on_background_group,
         )
     };
     result.map_err(map_command_error)
+}
+
+fn is_command_cancel_requested() -> bool {
+    crate::ai::tools::registry::common::is_tool_cancel_requested()
+        || crate::ai::driver::runtime_ctx::try_current()
+            .is_some_and(|context| context.app_proto.cancel_stream.load(Ordering::Acquire))
 }
 
 fn map_command_error(err: std::io::Error) -> String {

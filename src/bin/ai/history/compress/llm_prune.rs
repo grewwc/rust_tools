@@ -1,4 +1,4 @@
-//! LLM 引导的上下文裁剪（模型标记 → 延迟裁剪）。
+//! LLM 引导的上下文裁剪（模型标记 → 延迟卸载）。
 //!
 //! 这是现有压缩逻辑的**补充**模块，不修改任何已有的压缩代码。
 //!
@@ -14,23 +14,37 @@
 //! - 工具自身通过 `ToolHistoryPolicyRegistration` 声明 `prune: Never` 的结果
 //!   （如 `plan`）永远不会被裁剪；`read_file` / 检索类 / `execute_command` 结果
 //!   虽「不可有损压缩」，但**允许**在过时后被 LLM 裁剪（两个维度正交）。
-//! - 连续被标记 **PRUNE_THRESHOLD** 次后，消息内容被替换为简短占位符
-//!   （保留消息结构、不删除，避免破坏 tool_call ↔ tool_response 配对）。
-//! - 如果某条消息在某轮未被标记，其计数重置为 0（"连续"语义）。
+//! - 累计被标记 **PRUNE_THRESHOLD** 次后，消息内容被卸载到会话 asset 磁盘，
+//!   inline 替换为**可召回 stub**（保留 `file_path` + 召回锚点 + head/tail 预览，
+//!   保留消息结构、不删除，避免破坏 tool_call ↔ tool_response 配对）。
+//! - 计数语义为「容忍静默 + 衰减」而非「必须连续」：本轮模型未产出任何 prune
+//!   指令时计数完全不动（连续调工具的中间轮不会误清零）；本轮产出了 prune
+//!   指令、但某个此前被标记的 id 未再出现，则其计数 -1（衰减，可回退），而非
+//!   直接归零。详见 [`update_prune_marks`]。
 //!
-//! ## 安全保证
+//! ## 安全保证（不丢真实信息）
 //!
 //! 1. 不删除任何消息，不改变 messages 数组长度或顺序。
 //! 2. 不修改现有的 `compress/mod.rs` / `context_budget.rs` 逻辑。
-//! 3. 只替换 tool 消息的 content 字段为一个短占位符。
-//! 4. 最近 `KEEP_RECENT_TOOL_MESSAGES` 条 tool 结果始终保护，避免误裁剪当前轮所需结果。
+//! 3. 裁剪是**无损可召回**的：被裁剪的 tool 结果全文先写入会话 asset，inline
+//!    只替换为带 `file_path` 的召回 stub，模型可随时 `read_file` 取回完整原文。
+//! 4. **无归档目录（`overflow_dir=None`）时绝不裁剪**：宁可不压缩，也不做
+//!    不可逆的内容丢弃。
+//! 5. `apply_pruning` 只作用于 `prepare` 内每轮重建、从不落盘的临时 `history`
+//!    副本，不污染持久化存储。
+//! 6. 最近 `KEEP_RECENT_TOOL_GROUPS` 组工具结果始终保护，避免误裁剪当前轮所需结果。
+
+use std::path::Path;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use crate::ai::history::types::Message;
 
-use super::tool_overflow::build_tool_call_name_index;
+use super::tool_overflow::{
+    build_tool_call_arguments_index, build_tool_call_name_index, build_tool_overflow_recall_lines,
+    preserve_pruned_tool_result_stable,
+};
 
 /// 判断某工具结果是否被其注册策略标记为「永不 LLM 裁剪」。
 /// 查询工具自身声明的 [`ToolHistoryPolicy`]（见各工具注册文件），
@@ -40,8 +54,12 @@ fn is_prune_protected_tool(tool_name: &str) -> bool {
     !crate::ai::tools::registry::common::tool_history_policy(tool_name).allows_prune()
 }
 
-/// 连续被标记多少次后才裁剪。
-pub(crate) const PRUNE_THRESHOLD: u8 = 3;
+/// 累计被标记多少次后才卸载裁剪。
+///
+/// 采用「容忍静默 + 衰减」累计语义（见 [`update_prune_marks`]），因此这里的阈值
+/// 表示**累计**而非**连续**次数。裁剪本身无损可召回（全文落盘 + stub），因此可用
+/// 较低阈值：2 次即卸载，兼顾激进回收与「单个 stray token 不误触发」的迟滞。
+pub(crate) const PRUNE_THRESHOLD: u8 = 2;
 
 /// 历史消息少于该值时不注入裁剪提示（太短无需裁剪）。
 pub(crate) const PRUNE_PROMPT_MIN_MESSAGES: usize = 20;
@@ -50,14 +68,18 @@ pub(crate) const PRUNE_PROMPT_MIN_MESSAGES: usize = 20;
 /// 保持简短，避免占用过多 token。
 pub(crate) const PRUNE_PROTOCOL_PROMPT: &str = "\n## Context Management Protocol\n\
 When your context holds outdated tool results, actively reclaim space by marking them.\n\
-Include a hidden self-note listing the tool_call_ids to prune:\n\
+Each tool result in the history has a stable id (the `call_id` / `tool_call_id` shown on\n\
+that tool output). Include a hidden self-note listing the ids to prune:\n\
 `<meta:self_note>prune:call_abc,call_xyz</meta:self_note>`\n\
 Mark any tool result that is now superseded or no longer needed — including old file\n\
 reads and code/search results whose content you have already used, that you have since\n\
 re-read, or that describe code you have already edited.\n\
 Rules:\n\
 - Never mark user messages, system instructions, assistant messages, plans, or the most recent tool results.\n\
-- Marking is advisory and reversible: the system keeps a result until you mark it on several consecutive turns, and always protects recent results and plans.\n\
+- Marking is safe and reversible: pruning is loss-free — the full result is archived to a\n\
+  session file and the kept stub shows its `file_path`, so you can re-read it anytime if you\n\
+  turn out to still need it. The system only prunes after you mark an id on a couple of turns\n\
+  and always protects recent results and plans.\n\
 - Put the `prune:` directive on its own line; if you also write a normal self_note, keep it in the same hidden note.";
 
 /// 判断该角色的消息是否受保护（永不被裁剪）。
@@ -108,16 +130,20 @@ pub(crate) fn parse_prune_from_hidden_meta(hidden_meta: &str) -> (Vec<String>, S
     (prune_ids, remaining)
 }
 
-/// 更新裁剪计数。
+/// 更新裁剪计数（「容忍静默 + 衰减」语义）。
 ///
-/// - `current_marks`: 当前会话的裁剪计数表（tool_call_id → 连续计数）
+/// - `current_marks`: 当前会话的裁剪计数表（tool_call_id → 累计计数）
 /// - `prune_ids`: 本轮模型标记的 tool_call_id 列表
-/// - `active_tool_ids`: 本轮 messages 中实际存在的 tool_call_id 集合
+/// - `active_prunable_tool_ids`: 本轮 messages 中实际存在、且允许裁剪的 tool_call_id 集合
 ///
 /// 逻辑：
-/// 1. 对每个被标记的 id，计数 +1
-/// 2. 对未被标记但存在于 active_tool_ids 中的 id，计数重置为 0
-/// 3. 移除计数为 0 的条目
+/// 1. **静默轮不动计数**：本轮模型未产出任何有效 prune 指令时（`prune_ids` 里没有
+///    命中 active 的 id），整表保持不变直接返回。这样"连续调工具、中间轮没写
+///    self_note"不会把此前攒下的计数误清零——这是旧「连续」语义导致机制几乎从不
+///    触发的根因。
+/// 2. 本轮确有有效标记时：被标记的 id 计数 +1；此前存在于表中、但本轮**未**被
+///    标记且仍 active 的 id 计数 -1（衰减，可回退到 0 被清理），而非直接归零。
+/// 3. 清理计数 <=0、已不在当前上下文、或已被保护策略排除的条目。
 pub(crate) fn update_prune_marks(
     current_marks: &mut FxHashMap<String, u8>,
     prune_ids: &[String],
@@ -129,14 +155,23 @@ pub(crate) fn update_prune_marks(
         .cloned()
         .collect::<FxHashSet<_>>();
 
-    // 重置未被标记的 tool 的计数
+    // 静默轮（本轮无任何命中 active 的有效标记）：不触碰计数，避免中间工具轮误清零。
+    if marked_ids.is_empty() {
+        // 仍需清理已离开上下文 / 被保护的陈旧条目，避免计数表无界增长。
+        current_marks.retain(|id, v| *v > 0 && active_prunable_tool_ids.contains(id));
+        return;
+    }
+
+    // 对本轮未被标记、但仍 active 的既有条目做衰减（-1），保留"模型改主意可回退"语义。
     for id in active_prunable_tool_ids {
-        if !marked_ids.contains(id) {
-            current_marks.remove(id);
+        if !marked_ids.contains(id)
+            && let Some(count) = current_marks.get_mut(id)
+        {
+            *count = count.saturating_sub(1);
         }
     }
 
-    // 增加被标记的 tool 的计数
+    // 增加被标记的 tool 的计数。
     for id in marked_ids {
         let count = current_marks.entry(id).or_insert(0);
         *count = count.saturating_add(1);
@@ -198,33 +233,44 @@ fn protected_tool_call_ids(messages: &[Message]) -> FxHashSet<String> {
 /// 单次 `apply_pruning` 的裁剪统计，供调用方打印终端简讯。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PruneReport {
-    /// 本次被替换为占位符的 tool 结果条数。
+    /// 本次被卸载到磁盘、inline 替换为召回 stub 的 tool 结果条数。
     pub(crate) pruned_count: usize,
-    /// 净释放的字符数（原内容长度减去占位符长度之和）。
+    /// 净释放的字符数（原内容长度减去 stub 长度之和）。
     pub(crate) freed_chars: usize,
     /// 涉及的工具名（去重、按首次出现顺序）。
     pub(crate) tools: Vec<String>,
 }
 
-/// 对 messages 数组应用裁剪。
+/// 对 messages 数组应用裁剪（无损可召回卸载）。
 ///
-/// 将计数 >= PRUNE_THRESHOLD 的 tool 消息内容替换为占位符。
-/// 不删除消息、不改变数组长度。
+/// 将计数 >= PRUNE_THRESHOLD 的 tool 消息全文卸载到会话 asset 磁盘，inline 替换为
+/// 带 `file_path` + 召回锚点 + head/tail 预览的 stub；不删除消息、不改变数组长度，
+/// 模型可随时 `read_file` 取回完整原文。
+///
+/// **安全底线**：`overflow_dir=None`（无归档目录，如临时/one-shot session）时**绝不
+/// 裁剪**——宁可不压缩也不做不可逆丢弃。归档写盘失败的单条也保留原文跳过。
+///
 /// 受 `protected_tool_call_ids` 保护的消息（最近完整工具组、以及注册策略声明
-/// `prune: Never` 的工具，如 `plan`）
-/// 永不被裁剪，避免误裁剪当前轮所需结果或任务路线图锚点。
+/// `prune: Never` 的工具，如 `plan`）永不被裁剪，避免误裁剪当前轮所需结果或任务
+/// 路线图锚点。
 ///
 /// 返回本次裁剪的统计报告（供调用方打印终端简讯）。
 pub(crate) fn apply_pruning(
     messages: &mut [Message],
     prune_marks: &FxHashMap<String, u8>,
+    overflow_dir: Option<&Path>,
 ) -> PruneReport {
     let mut report = PruneReport::default();
     if prune_marks.is_empty() {
         return report;
     }
+    // 安全底线：没有归档目录就无法无损召回，直接不裁剪。
+    if overflow_dir.is_none() {
+        return report;
+    }
 
     let id_to_tool_name = build_tool_call_name_index(messages);
+    let id_to_tool_args = build_tool_call_arguments_index(messages);
     let protected_ids = protected_tool_call_ids(messages);
 
     for msg in messages.iter_mut() {
@@ -232,30 +278,52 @@ pub(crate) fn apply_pruning(
             continue;
         }
 
-        let Some(ref tool_call_id) = msg.tool_call_id else {
+        let Some(tool_call_id) = msg.tool_call_id.clone() else {
             continue;
         };
 
-        if protected_ids.contains(tool_call_id) {
+        if protected_ids.contains(&tool_call_id) {
             continue;
         }
 
-        if let Some(&count) = prune_marks.get(tool_call_id) {
-            if count >= PRUNE_THRESHOLD {
-                let freed = msg.content.as_str().map(|s| s.chars().count()).unwrap_or(0);
-                if let Some(name) = id_to_tool_name.get(tool_call_id) {
-                    if !report.tools.contains(name) {
-                        report.tools.push(name.clone());
-                    }
-                }
-                // 替换内容为占位符，保留消息结构
-                let placeholder =
-                    format!("[pruned: tool result marked as outdated {} times]", count);
-                report.freed_chars += freed.saturating_sub(placeholder.chars().count());
-                msg.content = Value::String(placeholder);
-                report.pruned_count += 1;
-            }
+        let Some(&count) = prune_marks.get(&tool_call_id) else {
+            continue;
+        };
+        if count < PRUNE_THRESHOLD {
+            continue;
         }
+
+        let Some(content) = msg.content.as_str() else {
+            continue;
+        };
+        let freed = content.chars().count();
+        let tool_name = id_to_tool_name
+            .get(&tool_call_id)
+            .map(String::as_str)
+            .unwrap_or("tool");
+        let recall_lines = id_to_tool_args
+            .get(&tool_call_id)
+            .map(|args| build_tool_overflow_recall_lines(tool_name, args))
+            .unwrap_or_default();
+
+        // 无损卸载：全文落盘 + 生成召回 stub。归档失败（含 overflow_dir=None，
+        // 上方已提前返回）则保留原文、跳过本条，绝不做不可逆丢弃。
+        let Some(stub) = preserve_pruned_tool_result_stable(
+            overflow_dir,
+            &tool_call_id,
+            tool_name,
+            content,
+            &recall_lines,
+        ) else {
+            continue;
+        };
+
+        if !report.tools.iter().any(|name| name == tool_name) {
+            report.tools.push(tool_name.to_string());
+        }
+        report.freed_chars += freed.saturating_sub(stub.chars().count());
+        msg.content = Value::String(stub);
+        report.pruned_count += 1;
     }
 
     report
@@ -413,14 +481,39 @@ mod tests {
         assert_eq!(marks.get("call_1"), Some(&2));
         assert_eq!(marks.get("call_2"), Some(&2));
 
-        // 第三轮只标记 call_1，call_2 计数重置
+        // 第三轮只标记 call_1：call_2 未被标记但本轮有有效标记 → 衰减 -1（2→1），
+        // 不再像旧「连续」语义那样直接清零。
         update_prune_marks(&mut marks, &["call_1".to_string()], &active);
         assert_eq!(marks.get("call_1"), Some(&3));
-        assert!(!marks.contains_key("call_2")); // 重置后被清理
+        assert_eq!(marks.get("call_2"), Some(&1));
+
+        // 再来一轮只标记 call_1：call_2 衰减到 0 被清理。
+        update_prune_marks(&mut marks, &["call_1".to_string()], &active);
+        assert_eq!(marks.get("call_1"), Some(&4));
+        assert!(!marks.contains_key("call_2"));
     }
 
+    /// 静默轮（本轮无任何有效 prune 标记）不得清零既有计数——这是新语义相对旧
+    /// 「连续」语义的核心修复：连续调工具的中间轮不再误清此前攒下的计数。
     #[test]
-    fn test_update_prune_marks_empty_round_resets_active_marks() {
+    fn test_update_prune_marks_silent_round_preserves_counts() {
+        let mut marks = FxHashMap::default();
+        marks.insert("call_1".to_string(), 1);
+        let active: FxHashSet<String> =
+            ["call_1", "call_2"].iter().map(|s| s.to_string()).collect();
+
+        // 静默轮：模型没写任何 prune 指令。
+        update_prune_marks(&mut marks, &[], &active);
+        assert_eq!(marks.get("call_1"), Some(&1)); // 计数保持，不清零
+
+        // 之后再标记一次即可达到阈值 2。
+        update_prune_marks(&mut marks, &["call_1".to_string()], &active);
+        assert_eq!(marks.get("call_1"), Some(&2));
+    }
+
+    /// 静默轮仍需清理已离开上下文 / 被保护的陈旧条目，避免计数表无界增长。
+    #[test]
+    fn test_update_prune_marks_silent_round_drops_stale_ids() {
         let mut marks = FxHashMap::default();
         marks.insert("call_1".to_string(), 2);
         marks.insert("stale".to_string(), 2);
@@ -429,7 +522,9 @@ mod tests {
 
         update_prune_marks(&mut marks, &[], &active);
 
-        assert!(marks.is_empty());
+        // call_1 仍 active → 保留；stale 已离开上下文 → 清理。
+        assert_eq!(marks.get("call_1"), Some(&2));
+        assert!(!marks.contains_key("stale"));
     }
 
     #[test]
@@ -451,48 +546,138 @@ mod tests {
         assert!(!marks.contains_key("missing"));
     }
 
+    /// 供 apply_pruning 测试使用的临时归档目录。
+    fn make_overflow_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-llm-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn test_apply_pruning_replaces_content() {
+        let overflow_dir = make_overflow_dir();
         let mut marks = FxHashMap::default();
         marks.insert("call_old".to_string(), PRUNE_THRESHOLD);
         marks.insert("call_keep".to_string(), 1);
 
         let mut messages = vec![
+            make_assistant_tool_call("call_old", "execute_command"),
             make_tool_message(
                 "call_old",
                 "very long outdated result that should be pruned",
             ),
+            make_assistant_tool_call("call_keep", "execute_command"),
             make_tool_message("call_keep", "still relevant result"),
+            make_assistant_tool_call("call_recent_1", "execute_command"),
             make_tool_message("call_recent_1", "current turn result 1"),
+            make_assistant_tool_call("call_recent_2", "execute_command"),
             make_tool_message("call_recent_2", "current turn result 2"),
+            make_assistant_tool_call("call_recent_3", "execute_command"),
             make_tool_message("call_recent_3", "current turn result 3"),
+            make_assistant_tool_call("call_recent_4", "execute_command"),
             make_tool_message("call_recent_4", "current turn result 4"),
-            make_tool_message("call_recent_5", "current turn result 5"),
-            make_tool_message("call_recent_6", "current turn result 6"),
             make_user_message("what about this?"),
         ];
 
-        let pruned = apply_pruning(&mut messages, &marks);
+        let pruned = apply_pruning(&mut messages, &marks, Some(overflow_dir.as_path()));
 
         assert_eq!(pruned.pruned_count, 1);
-        // call_old 内容被替换
-        assert!(messages[0].content.as_str().unwrap().contains("[pruned"));
+        // call_old 内容被卸载为可召回 stub，且含全文归档 file_path。
+        let stub = messages[1].content.as_str().unwrap();
+        assert!(stub.contains("file_path:"));
+        // 全文确实落盘可召回（stub 本身可能含 head/tail 预览，故不断言"不含原文"）。
+        let path_line = stub
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("- file_path: "))
+            .expect("stub must carry an archived file_path");
+        let archived = std::fs::read_to_string(path_line.trim()).unwrap();
+        assert!(archived.contains("very long outdated result that should be pruned"));
         // call_keep 内容不变（计数 < threshold）
         assert_eq!(
-            messages[1].content.as_str().unwrap(),
+            messages[3].content.as_str().unwrap(),
             "still relevant result"
         );
         // 最近 tool 窗口内容不变
         assert_eq!(
-            messages[2].content.as_str().unwrap(),
+            messages[5].content.as_str().unwrap(),
             "current turn result 1"
         );
         // user 消息不变
-        assert_eq!(messages[8].content.as_str().unwrap(), "what about this?");
+        assert_eq!(messages[12].content.as_str().unwrap(), "what about this?");
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
+    }
+
+    /// 安全底线：无归档目录（overflow_dir=None）时绝不裁剪，保留全文原样。
+    #[test]
+    fn test_apply_pruning_skips_without_overflow_dir() {
+        let mut marks = FxHashMap::default();
+        marks.insert("call_old".to_string(), PRUNE_THRESHOLD);
+
+        let mut messages = vec![
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", "irrecoverable if dropped"),
+            make_assistant_tool_call("call_r1", "execute_command"),
+            make_tool_message("call_r1", "recent 1"),
+            make_assistant_tool_call("call_r2", "execute_command"),
+            make_tool_message("call_r2", "recent 2"),
+            make_assistant_tool_call("call_r3", "execute_command"),
+            make_tool_message("call_r3", "recent 3"),
+            make_assistant_tool_call("call_r4", "execute_command"),
+            make_tool_message("call_r4", "recent 4"),
+            make_assistant_tool_call("call_r5", "execute_command"),
+            make_tool_message("call_r5", "recent 5"),
+        ];
+
+        let pruned = apply_pruning(&mut messages, &marks, None);
+
+        assert_eq!(pruned.pruned_count, 0);
+        assert_eq!(
+            messages[1].content.as_str().unwrap(),
+            "irrecoverable if dropped"
+        );
+    }
+
+    /// 幂等性：同一条被裁剪的消息重复裁剪，stub 文本逐轮稳定（保 prompt cache）。
+    #[test]
+    fn test_apply_pruning_is_idempotent_across_turns() {
+        let overflow_dir = make_overflow_dir();
+        let mut marks = FxHashMap::default();
+        marks.insert("call_old".to_string(), PRUNE_THRESHOLD);
+
+        let build = || {
+            vec![
+                make_assistant_tool_call("call_old", "read_file"),
+                make_tool_message("call_old", "stable archived body"),
+                make_assistant_tool_call("call_r1", "execute_command"),
+                make_tool_message("call_r1", "recent 1"),
+                make_assistant_tool_call("call_r2", "execute_command"),
+                make_tool_message("call_r2", "recent 2"),
+                make_assistant_tool_call("call_r3", "execute_command"),
+                make_tool_message("call_r3", "recent 3"),
+                make_assistant_tool_call("call_r4", "execute_command"),
+                make_tool_message("call_r4", "recent 4"),
+                make_assistant_tool_call("call_r5", "execute_command"),
+                make_tool_message("call_r5", "recent 5"),
+            ]
+        };
+
+        let mut m1 = build();
+        apply_pruning(&mut m1, &marks, Some(overflow_dir.as_path()));
+        let stub1 = m1[1].content.as_str().unwrap().to_string();
+
+        let mut m2 = build();
+        apply_pruning(&mut m2, &marks, Some(overflow_dir.as_path()));
+        let stub2 = m2[1].content.as_str().unwrap().to_string();
+
+        assert_eq!(stub1, stub2, "stub must be stable across turns");
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
     #[test]
     fn test_apply_pruning_protects_recent_tool_groups() {
+        let overflow_dir = make_overflow_dir();
         let mut marks = FxHashMap::default();
         marks.insert("call_last".to_string(), PRUNE_THRESHOLD);
 
@@ -503,24 +688,32 @@ mod tests {
             make_tool_message("call_last", "most recent result"),
         ];
 
-        let pruned = apply_pruning(&mut messages, &marks);
+        let pruned = apply_pruning(&mut messages, &marks, Some(overflow_dir.as_path()));
 
         // call_last 所在的最近完整工具组受保护，不被裁剪。
         assert_eq!(pruned.pruned_count, 0);
         assert_eq!(messages[3].content.as_str().unwrap(), "most recent result");
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
     #[test]
     fn test_apply_pruning_empty_marks() {
+        let overflow_dir = make_overflow_dir();
         let mut messages = vec![make_tool_message("call_1", "result")];
 
-        let pruned = apply_pruning(&mut messages, &FxHashMap::default());
+        let pruned = apply_pruning(
+            &mut messages,
+            &FxHashMap::default(),
+            Some(overflow_dir.as_path()),
+        );
         assert_eq!(pruned.pruned_count, 0);
         assert_eq!(messages[0].content.as_str().unwrap(), "result");
     }
 
     #[test]
     fn test_apply_pruning_never_touches_user_or_assistant() {
+        let overflow_dir = make_overflow_dir();
         let mut marks = FxHashMap::default();
         // 即使 user/assistant 有对应的 "tool_call_id"，也不会被裁剪
         marks.insert("call_1".to_string(), PRUNE_THRESHOLD);
@@ -541,7 +734,7 @@ mod tests {
             make_tool_message("call_5", "recent tool result 5"),
         ];
 
-        let pruned = apply_pruning(&mut messages, &marks);
+        let pruned = apply_pruning(&mut messages, &marks, Some(overflow_dir.as_path()));
 
         assert_eq!(pruned.pruned_count, 1);
         assert_eq!(
@@ -552,7 +745,9 @@ mod tests {
             messages[1].content.as_str().unwrap(),
             "important assistant response"
         );
-        assert!(messages[3].content.as_str().unwrap().contains("[pruned"));
+        assert!(messages[3].content.as_str().unwrap().contains("file_path:"));
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
     #[test]
@@ -614,6 +809,7 @@ mod tests {
 
     #[test]
     fn test_apply_pruning_protects_non_compressible_tools() {
+        let overflow_dir = make_overflow_dir();
         let mut marks = FxHashMap::default();
         marks.insert("call_plan".to_string(), PRUNE_THRESHOLD);
         marks.insert("call_old".to_string(), PRUNE_THRESHOLD);
@@ -637,11 +833,13 @@ mod tests {
             make_tool_message("call_recent_6", "recent 6"),
         ];
 
-        let pruned = apply_pruning(&mut messages, &marks);
+        let pruned = apply_pruning(&mut messages, &marks, Some(overflow_dir.as_path()));
 
         assert_eq!(pruned.pruned_count, 1);
         assert_eq!(messages[1].content.as_str().unwrap(), "task plan");
-        assert!(messages[3].content.as_str().unwrap().contains("[pruned"));
+        assert!(messages[3].content.as_str().unwrap().contains("file_path:"));
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
     #[test]
@@ -654,36 +852,49 @@ mod tests {
 
     #[test]
     fn test_prune_threshold_is_reasonable() {
-        // 确保阈值不是 0 或 1（太激进），也不超过 10（太保守）
-        assert!(PRUNE_THRESHOLD >= 2);
+        // 确保阈值不是 0（每轮都触发），也不超过 10（太保守）
+        assert!(PRUNE_THRESHOLD >= 1);
         assert!(PRUNE_THRESHOLD <= 10);
     }
 
     #[test]
     fn test_message_count_after_pruning_unchanged() {
+        let overflow_dir = make_overflow_dir();
         let mut marks = FxHashMap::default();
         marks.insert("call_1".to_string(), PRUNE_THRESHOLD);
         marks.insert("call_2".to_string(), PRUNE_THRESHOLD);
         marks.insert("call_3".to_string(), PRUNE_THRESHOLD);
 
         let mut messages = vec![
+            make_assistant_tool_call("call_1", "execute_command"),
             make_tool_message("call_1", "result 1"),
+            make_assistant_tool_call("call_2", "execute_command"),
             make_tool_message("call_2", "result 2"),
+            make_assistant_tool_call("call_3", "execute_command"),
             make_tool_message("call_3", "result 3"),
+            make_assistant_tool_call("call_4", "execute_command"),
             make_tool_message("call_4", "old unmarked result"),
+            make_assistant_tool_call("call_5", "execute_command"),
             make_tool_message("call_5", "recent result 5"),
+            make_assistant_tool_call("call_6", "execute_command"),
             make_tool_message("call_6", "recent result 6"),
+            make_assistant_tool_call("call_7", "execute_command"),
             make_tool_message("call_7", "recent result 7"),
+            make_assistant_tool_call("call_8", "execute_command"),
             make_tool_message("call_8", "recent result 8"),
+            make_assistant_tool_call("call_9", "execute_command"),
             make_tool_message("call_9", "recent result 9"),
+            make_assistant_tool_call("call_10", "execute_command"),
             make_tool_message("call_10", "recent result 10"),
         ];
 
         let len_before = messages.len();
-        let pruned = apply_pruning(&mut messages, &marks);
+        let pruned = apply_pruning(&mut messages, &marks, Some(overflow_dir.as_path()));
         let len_after = messages.len();
 
         assert_eq!(len_before, len_after);
-        assert_eq!(pruned.pruned_count, 3); // 最近 6 条 tool 受保护
+        assert_eq!(pruned.pruned_count, 3); // 最近 4 组工具受保护
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
     }
 }

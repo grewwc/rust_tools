@@ -1,7 +1,7 @@
 use colored::Colorize;
 use rust_tools::commonw::FastSet;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
@@ -64,6 +64,409 @@ fn push_project_target(targets: &mut Vec<PathBuf>, seen: &mut FastSet<String>, r
     targets.push(PathBuf::from(path));
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ExecuteCommandSegmentEffect {
+    pub(super) mutation: bool,
+    pub(super) scope_review: bool,
+    pub(super) behavior_check: bool,
+    pub(super) success_guaranteed: bool,
+}
+
+#[derive(Default)]
+struct ExecuteCommandAnalysis {
+    effects: Vec<ExecuteCommandSegmentEffect>,
+    mutation_targets: Vec<PathBuf>,
+    unknown_mutation_bases: Vec<PathBuf>,
+}
+
+fn shell_command_tokens(segment: &str) -> Vec<String> {
+    crate::ai::tools::service::audit::effective_command_tokens(segment)
+}
+
+fn command_subcommand(tokens: &[String]) -> Option<&str> {
+    crate::ai::tools::service::audit::command_subcommand_index(tokens)
+        .and_then(|index| tokens.get(index))
+        .map(String::as_str)
+}
+
+fn command_program(tokens: &[String]) -> Option<&str> {
+    tokens
+        .first()
+        .and_then(|token| Path::new(token).file_name().and_then(|name| name.to_str()))
+}
+
+fn segment_verification_effect(tokens: &[String]) -> (bool, bool) {
+    let Some(program) = command_program(tokens) else {
+        return (false, false);
+    };
+    let subcommand = command_subcommand(tokens).unwrap_or_default();
+    let scope_review = program == "git" && matches!(subcommand, "diff" | "status");
+    let behavior_check = match program {
+        "cargo" => matches!(subcommand, "check" | "test" | "clippy" | "build"),
+        "pytest" => true,
+        "go" => subcommand == "test",
+        "npm" | "pnpm" | "yarn" => matches!(subcommand, "test" | "check"),
+        "make" => matches!(subcommand, "test" | "check"),
+        _ => false,
+    };
+    (scope_review, behavior_check)
+}
+
+fn is_read_only_segment(tokens: &[String]) -> bool {
+    let Some(program) = command_program(tokens) else {
+        return true;
+    };
+    let subcommand = command_subcommand(tokens).unwrap_or_default();
+    match program {
+        "cd" | "pwd" | "ls" | "cat" | "rg" | "grep" | "head" | "tail" | "wc" | "stat" | "file"
+        | "which" | "type" | "echo" | "printf" | "sleep" | "true" | "false" | "test" | "sort"
+        | "uniq" | "cut" | "find" => true,
+        "git" => matches!(
+            subcommand,
+            "diff"
+                | "status"
+                | "log"
+                | "show"
+                | "reflog"
+                | "branch"
+                | "rev-parse"
+                | "ls-files"
+                | "grep"
+                | "blame"
+        ),
+        "cargo" => matches!(
+            subcommand,
+            "check" | "test" | "clippy" | "build" | "metadata"
+        ),
+        "go" => subcommand == "test",
+        "npm" | "pnpm" | "yarn" => matches!(subcommand, "test" | "check"),
+        "make" => matches!(subcommand, "test" | "check"),
+        "pytest" => true,
+        _ => false,
+    }
+}
+
+fn positional_tokens(tokens: &[String], skip: usize) -> Vec<String> {
+    tokens
+        .iter()
+        .skip(skip)
+        .filter(|token| {
+            !token.is_empty()
+                && !token.starts_with('-')
+                && !matches!(token.as_str(), ">" | ">>" | "<" | "<<")
+                && !token.contains('=')
+        })
+        .cloned()
+        .collect()
+}
+
+fn redirection_targets(segment: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let chars: Vec<char> = segment.chars().collect();
+    let mut index = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if ch != '>' || in_single || in_double {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if index < chars.len() && chars[index] == '>' {
+            index += 1;
+        }
+        while index < chars.len() && chars[index].is_whitespace() {
+            index += 1;
+        }
+        let start = index;
+        while index < chars.len()
+            && !chars[index].is_whitespace()
+            && !matches!(chars[index], ';' | '|' | '&')
+        {
+            index += 1;
+        }
+        if start < index {
+            targets.push(chars[start..index].iter().collect());
+        }
+    }
+    targets
+}
+
+fn mutation_target_tokens(tokens: &[String]) -> (Vec<String>, bool) {
+    let Some(program) = command_program(tokens) else {
+        return (Vec::new(), false);
+    };
+    let subcommand_index =
+        crate::ai::tools::service::audit::command_subcommand_index(tokens).unwrap_or(1);
+    let mut targets = match program {
+        "touch" | "mkdir" | "rm" | "rmdir" | "truncate" | "tee" | "ln" => {
+            positional_tokens(tokens, 1)
+        }
+        "cp" | "mv" | "install" => positional_tokens(tokens, 1),
+        "chmod" | "chown" | "chgrp" => positional_tokens(tokens, 2),
+        "sed"
+            if tokens
+                .iter()
+                .any(|token| token == "-i" || token.starts_with("-i")) =>
+        {
+            positional_tokens(tokens, 1).into_iter().skip(1).collect()
+        }
+        "perl"
+            if tokens
+                .iter()
+                .any(|token| token.starts_with("-pi") || token.starts_with("-ip")) =>
+        {
+            positional_tokens(tokens, 1)
+        }
+        "git"
+            if matches!(
+                command_subcommand(tokens),
+                Some("add" | "checkout" | "restore" | "rm" | "mv")
+            ) =>
+        {
+            positional_tokens(tokens, subcommand_index + 1)
+        }
+        _ => Vec::new(),
+    };
+    targets.retain(|target| !target.chars().all(|ch| ch.is_ascii_digit()));
+    let known_mutator = matches!(
+        program,
+        "touch"
+            | "mkdir"
+            | "rm"
+            | "rmdir"
+            | "truncate"
+            | "tee"
+            | "ln"
+            | "cp"
+            | "mv"
+            | "install"
+            | "chmod"
+            | "chown"
+            | "chgrp"
+            | "sed"
+            | "perl"
+            | "git"
+            | "cargo"
+            | "npm"
+            | "pnpm"
+            | "yarn"
+            | "make"
+    );
+    (targets, known_mutator)
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn resolve_command_path(base: &Path, raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim().trim_matches(|ch| matches!(ch, '\'' | '"'));
+    if raw.is_empty() || raw.starts_with('$') || raw.contains(['*', '?', '[', ']']) {
+        return None;
+    }
+    let path = Path::new(raw);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    Some(normalize_lexical(&resolved))
+}
+
+fn analyze_execute_command(command: &str, initial_cwd: &Path) -> ExecuteCommandAnalysis {
+    let mut analysis = ExecuteCommandAnalysis::default();
+    let mut cwd = normalize_lexical(initial_cwd);
+    let mut seen = FastSet::default();
+    let segments = crate::ai::tools::service::audit::split_unquoted_command_segments(command);
+    let success_guaranteed = segments.iter().all(|segment| {
+        matches!(
+            segment.join,
+            crate::ai::tools::service::audit::ShellJoin::Start
+                | crate::ai::tools::service::audit::ShellJoin::And
+        )
+    });
+    for segment in segments {
+        let tokens = shell_command_tokens(&segment.command);
+        if tokens.is_empty() {
+            continue;
+        }
+        if command_program(&tokens) == Some("cd") {
+            if let Some(path) = tokens
+                .get(1)
+                .and_then(|path| resolve_command_path(&cwd, path))
+            {
+                cwd = path;
+            }
+            analysis.effects.push(ExecuteCommandSegmentEffect {
+                success_guaranteed,
+                ..Default::default()
+            });
+            continue;
+        }
+        let (scope_review, behavior_check) = segment_verification_effect(&tokens);
+        let mut raw_targets = redirection_targets(&segment.command);
+        let has_redirection = !raw_targets.is_empty();
+        let read_only = is_read_only_segment(&tokens);
+        let (mut command_targets, known_mutator) = mutation_target_tokens(&tokens);
+        raw_targets.append(&mut command_targets);
+        let mutation = has_redirection || !read_only;
+        analysis.effects.push(ExecuteCommandSegmentEffect {
+            mutation,
+            scope_review,
+            behavior_check,
+            success_guaranteed,
+        });
+        if !mutation {
+            continue;
+        }
+        let mut resolved_any = false;
+        for raw_target in raw_targets {
+            if let Some(target) = resolve_command_path(&cwd, &raw_target) {
+                let key = target.to_string_lossy().into_owned();
+                if seen.insert(key) {
+                    analysis.mutation_targets.push(target);
+                }
+                resolved_any = true;
+            } else {
+                if !analysis.unknown_mutation_bases.contains(&cwd) {
+                    analysis.unknown_mutation_bases.push(cwd.clone());
+                }
+            }
+        }
+        if !read_only && (!known_mutator || !resolved_any) {
+            if !analysis.unknown_mutation_bases.contains(&cwd) {
+                analysis.unknown_mutation_bases.push(cwd.clone());
+            }
+        }
+    }
+    analysis
+}
+
+pub(super) fn execute_command_segment_effects(command: &str) -> Vec<ExecuteCommandSegmentEffect> {
+    analyze_execute_command(command, Path::new(".")).effects
+}
+
+pub(super) fn execute_command_requires_project_paths(command: &str) -> bool {
+    execute_command_segment_effects(command)
+        .iter()
+        .any(|effect| effect.mutation)
+}
+
+fn command_base_dir(args: &Value) -> PathBuf {
+    let effective_cwd = project_root_dir();
+    args.get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(Path::new)
+        .map(|cwd| {
+            let resolved = if cwd.is_absolute() {
+                cwd.to_path_buf()
+            } else {
+                effective_cwd.join(cwd)
+            };
+            normalize_lexical(&resolved)
+        })
+        .unwrap_or_else(|| normalize_lexical(&effective_cwd))
+}
+
+fn project_root_dir() -> PathBuf {
+    normalize_lexical(
+        &crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from(".")),
+    )
+}
+
+fn path_is_in_project(path: &Path, project_root: &Path) -> bool {
+    path.starts_with(project_root)
+}
+
+fn declared_project_paths(args: &Value, base: &Path) -> Vec<PathBuf> {
+    args.get("project_paths")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .filter_map(|path| resolve_command_path(base, path))
+        .collect()
+}
+
+fn declared_path_covers(declared: &[PathBuf], target: &Path) -> bool {
+    declared.iter().any(|path| target.starts_with(path))
+}
+
+pub(super) fn execute_command_missing_project_paths(
+    tool_calls: &[crate::ai::types::ToolCall],
+) -> bool {
+    tool_calls.iter().any(|tool_call| {
+        if tool_call.function.name != "execute_command" {
+            return false;
+        }
+        let Ok(args) = serde_json::from_str::<Value>(&tool_call.function.arguments) else {
+            return false;
+        };
+        let Some(command) = args.get("command").and_then(Value::as_str) else {
+            return false;
+        };
+        let base = command_base_dir(&args);
+        let analysis = analyze_execute_command(command, &base);
+        let project_root = project_root_dir();
+        let project_targets = analysis
+            .mutation_targets
+            .iter()
+            .filter(|target| path_is_in_project(target, &project_root))
+            .collect::<Vec<_>>();
+        let unknown_project_bases = analysis
+            .unknown_mutation_bases
+            .iter()
+            .filter(|base| path_is_in_project(base, &project_root))
+            .collect::<Vec<_>>();
+        if project_targets.is_empty() && unknown_project_bases.is_empty() {
+            return false;
+        }
+        let declared = declared_project_paths(&args, &base);
+        declared.is_empty()
+            || project_targets
+                .iter()
+                .any(|target| !declared_path_covers(&declared, target))
+            || unknown_project_bases
+                .iter()
+                .any(|unknown_base| !declared_path_covers(&declared, unknown_base))
+    })
+}
+
 pub(super) fn project_instruction_target_paths_from_tool_calls(
     tool_calls: &[crate::ai::types::ToolCall],
     include_read_only: bool,
@@ -74,7 +477,8 @@ pub(super) fn project_instruction_target_paths_from_tool_calls(
         let supported = matches!(
             tool_call.function.name.as_str(),
             "write_file" | "apply_patch"
-        ) || (include_read_only && tool_call.function.name == "read_file");
+        ) || tool_call.function.name == "execute_command"
+            || (include_read_only && tool_call.function.name == "read_file");
         if !supported {
             continue;
         }
@@ -87,6 +491,27 @@ pub(super) fn project_instruction_target_paths_from_tool_calls(
             .and_then(Value::as_str)
         {
             push_project_target(&mut targets, &mut seen, path);
+        }
+        if tool_call.function.name == "execute_command" {
+            let base = command_base_dir(&args);
+            let project_root = project_root_dir();
+            for path in declared_project_paths(&args, &base)
+                .into_iter()
+                .filter(|path| path_is_in_project(path, &project_root))
+            {
+                push_project_target(&mut targets, &mut seen, &path.to_string_lossy());
+            }
+            if let Some(command) = args.get("command").and_then(Value::as_str) {
+                let analysis = analyze_execute_command(command, &base);
+                for path in analysis
+                    .mutation_targets
+                    .into_iter()
+                    .chain(analysis.unknown_mutation_bases)
+                    .filter(|path| path_is_in_project(path, &project_root))
+                {
+                    push_project_target(&mut targets, &mut seen, &path.to_string_lossy());
+                }
+            }
         }
         if tool_call.function.name == "apply_patch"
             && let Some(patch) = args.get("patch").and_then(Value::as_str)
@@ -1026,6 +1451,144 @@ mod tests {
                 std::path::PathBuf::from("src/bin/ai/quoted-new.rs"),
             ]
         );
+    }
+
+    #[test]
+    fn execute_command_mutations_require_declared_project_paths() {
+        let mut call = ToolCall {
+            id: "command".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "execute_command".to_string(),
+                arguments: r#"{"command":"python scripts/update.py","pty":false}"#.to_string(),
+            },
+        };
+
+        assert!(super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+
+        call.function.arguments = serde_json::json!({
+            "command": "python scripts/update.py",
+            "project_paths": ["src/bin/ai/driver"],
+            "pty": false
+        })
+        .to_string();
+        assert!(super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+
+        call.function.arguments = serde_json::json!({
+            "command": "python scripts/update.py",
+            "project_paths": ["."],
+            "pty": false
+        })
+        .to_string();
+        assert!(!super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+        let project_root = crate::ai::driver::runtime_ctx::effective_cwd().unwrap();
+        assert_eq!(
+            super::project_instruction_target_paths_from_tool_calls(
+                std::slice::from_ref(&call),
+                false
+            ),
+            vec![project_root.clone()]
+        );
+
+        call.function.arguments = serde_json::json!({
+            "command": "touch src/bin/ai/driver/new.rs",
+            "project_paths": ["src/bin/ai/tools"],
+            "pty": false
+        })
+        .to_string();
+        assert!(super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+
+        call.function.arguments = serde_json::json!({
+            "command": "cd src/bin/ai && python update.py",
+            "project_paths": ["src/bin/ai/driver"],
+            "pty": false
+        })
+        .to_string();
+        assert!(super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+        call.function.arguments = serde_json::json!({
+            "command": "cd src/bin/ai && python update.py",
+            "project_paths": ["src/bin/ai"],
+            "pty": false
+        })
+        .to_string();
+        assert!(!super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+
+        call.function.arguments = serde_json::json!({
+            "command": "sed -i '' -e 's/old/new/' src/bin/ai/driver/mod.rs",
+            "project_paths": ["src/bin/ai/driver/mod.rs"],
+            "pty": false
+        })
+        .to_string();
+        assert!(!super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+
+        call.function.arguments = serde_json::json!({
+            "command": "python update.py",
+            "cwd": "src/bin/ai/driver",
+            "project_paths": ["."],
+            "pty": false
+        })
+        .to_string();
+        assert!(!super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+        assert_eq!(
+            super::project_instruction_target_paths_from_tool_calls(
+                std::slice::from_ref(&call),
+                false
+            ),
+            vec![project_root.join("src/bin/ai/driver")]
+        );
+
+        call.function.arguments =
+            r#"{"command":"printf ready > /tmp/agent-ready.log","pty":false}"#.to_string();
+        assert!(!super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+
+        for command in [
+            "git -C /tmp/repo status",
+            "cargo --manifest-path Cargo.toml check",
+        ] {
+            call.function.arguments =
+                serde_json::json!({"command": command, "pty": false}).to_string();
+            assert!(
+                !super::execute_command_missing_project_paths(std::slice::from_ref(&call)),
+                "read-only command must not require project_paths: {command}"
+            );
+        }
+
+        call.function.arguments =
+            serde_json::json!({"command": "npm install", "pty": false}).to_string();
+        assert!(super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+        call.function.arguments = serde_json::json!({
+            "command": "npm install",
+            "project_paths": ["."],
+            "pty": false
+        })
+        .to_string();
+        assert!(!super::execute_command_missing_project_paths(
+            std::slice::from_ref(&call)
+        ));
+
+        call.function.arguments =
+            r#"{"command":"git -c core.pager=cat --no-pager diff -- src","pty":false}"#.to_string();
+        assert!(!super::execute_command_missing_project_paths(&[call]));
     }
 
     #[test]

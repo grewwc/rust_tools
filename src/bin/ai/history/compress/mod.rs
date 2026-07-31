@@ -1342,9 +1342,7 @@ fn truncate_mutable_messages_to_fit_with_policy(
                     for (call_index, call) in tool_calls.iter().enumerate() {
                         let argument_chars = call.function.arguments.chars().count();
                         let field = MutableMessageField::ToolArguments(call_index);
-                        if argument_chars > 160
-                            && !blocked_fields.contains(&(index, field))
-                        {
+                        if argument_chars > 160 && !blocked_fields.contains(&(index, field)) {
                             choose_larger_mutable_field(
                                 &mut best,
                                 (index, field, argument_chars - 160),
@@ -1558,10 +1556,7 @@ fn truncate_mutable_field(
                 })
                 .unwrap_or_else(|| "[context-overflow-truncated] ".to_string());
             let preview_budget = target.saturating_sub(prefix.chars().count());
-            let truncated = format!(
-                "{prefix}{}",
-                keep_ends_by_chars(reasoning, preview_budget)
-            );
+            let truncated = format!("{prefix}{}", keep_ends_by_chars(reasoning, preview_budget));
             if truncated.chars().count() >= original_chars {
                 return false;
             }

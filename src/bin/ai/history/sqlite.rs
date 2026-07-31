@@ -4,13 +4,16 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, Error as RusqliteError, ErrorCode, OpenFlags, OptionalExtension,
+    TransactionBehavior, params,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
@@ -102,6 +105,91 @@ pub(super) fn with_session_state_lock<T>(
     result
 }
 
+fn session_state_lock_timeout(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("timed out acquiring history state lock: {}", path.display()),
+    )
+}
+
+fn wait_for_session_state_lock(path: &Path, deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(session_state_lock_timeout(path));
+    }
+    std::thread::sleep(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(10)),
+    );
+    Ok(())
+}
+
+/// 与 [`with_session_state_lock`] 相同，但把进程内 mutex 与跨进程 flock
+/// 一并限制在调用方给定的截止时间内，供短超时重试路径使用。
+fn with_session_state_lock_until<T>(
+    path: &Path,
+    deadline: Instant,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let lock = loop {
+        match SESSION_STATE_LOCKS.try_lock() {
+            Ok(mut locks) => {
+                break locks
+                    .entry(path.to_path_buf())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone();
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut locks = poisoned.into_inner();
+                break locks
+                    .entry(path.to_path_buf())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                wait_for_session_state_lock(path, deadline)?;
+            }
+        }
+    };
+    let _guard = loop {
+        match lock.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                wait_for_session_state_lock(path, deadline)?;
+            }
+        }
+    };
+
+    let lock_path = session_state_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    #[cfg(unix)]
+    loop {
+        // SAFETY: `lock_file` 在整个临界区内保持打开，drop 时内核自动释放 flock。
+        let status = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if status == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+        ) {
+            return Err(error);
+        }
+        wait_for_session_state_lock(path, deadline)?;
+    }
+
+    operation()
+}
+
 /// 模型实际请求所消费的可重建上下文。`messages` 永远是唯一的原始会话记录；
 /// 这里的消息只是一次压缩快照，加上 `source_message_id` 之后的新原始消息即可
 /// 重建当前上下文。`canonical_generation` 用于拒绝并发 rewind/clear 后的陈旧快照。
@@ -127,15 +215,66 @@ pub(in crate::ai) struct SessionListMetadata {
 }
 
 fn open_history_db(path: &Path) -> Result<Connection, io::Error> {
+    open_history_db_with_busy_timeout(path, Duration::from_secs(5))
+}
+
+fn open_history_db_with_busy_timeout(
+    path: &Path,
+    busy_timeout: Duration,
+) -> Result<Connection, io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    // 本函数是同步的，且会被 async 调用者（compaction 的读/写路径）经 `?` 复用。
+    // 因此这里绝不做同步 sleep 重试 —— 那会阻塞 tokio worker。瞬时 I/O 失败
+    // （如并发首开 WAL 时的 SQLITE_IOERR_FSTAT）统一以 `WouldBlock` 返回，交给
+    // async 调用点的非阻塞重试循环（`tokio::time::sleep`）处理；纯同步调用点则
+    // 依赖 SQLite 自身的 busy_timeout。非瞬时错误按原语义直接上抛。
+    try_open_history_db(path, busy_timeout)
+}
+
+fn try_open_history_db(path: &Path, busy_timeout: Duration) -> Result<Connection, io::Error> {
+    let conn = Connection::open(path).map_err(|error| sqlite_error(path, "open", error))?;
+    conn.busy_timeout(busy_timeout)
+        .map_err(|error| sqlite_error(path, "set busy_timeout", error))?;
     conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|e| io::Error::other(e.to_string()))?;
+        .map_err(|error| sqlite_error(path, "set journal_mode=WAL", error))?;
     Ok(conn)
+}
+
+fn sqlite_error_kind(error: &RusqliteError) -> io::ErrorKind {
+    match error {
+        RusqliteError::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked | ErrorCode::SystemIoFailure
+            ) =>
+        {
+            io::ErrorKind::WouldBlock
+        }
+        _ => io::ErrorKind::Other,
+    }
+}
+
+fn sqlite_error(path: &Path, operation: &str, error: RusqliteError) -> io::Error {
+    let kind = sqlite_error_kind(&error);
+    let detail = match &error {
+        RusqliteError::SqliteFailure(inner, message) => {
+            let message = message
+                .as_deref()
+                .map(|message| format!("; message={message}"))
+                .unwrap_or_default();
+            format!(
+                "SQLite {operation} failed for {}: {error}; code={:?}; extended_code={}{}",
+                path.display(),
+                inner.code,
+                inner.extended_code,
+                message
+            )
+        }
+        _ => format!("SQLite {operation} failed for {}: {error}", path.display()),
+    };
+    io::Error::new(kind, detail)
 }
 
 /// 会话列表只读元数据，不能因枚举而创建目录、初始化数据库或切换 journal mode。
@@ -186,7 +325,7 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );",
     )
-    .map_err(|e| io::Error::other(e.to_string()))?;
+    .map_err(|error| io::Error::new(sqlite_error_kind(&error), error.to_string()))?;
     add_column_if_missing(conn, "messages", "tool_calls", "TEXT")?;
     add_column_if_missing(conn, "messages", "tool_call_id", "TEXT")?;
     add_column_if_missing(conn, "messages", "reasoning_content", "TEXT")?;
@@ -211,7 +350,7 @@ fn add_column_if_missing(
     match conn.execute(&sql, []) {
         Ok(_) => Ok(()),
         Err(err) if err.to_string().contains("duplicate column name") => Ok(()),
-        Err(err) => Err(io::Error::other(err.to_string())),
+        Err(error) => Err(io::Error::new(sqlite_error_kind(&error), error.to_string())),
     }
 }
 
@@ -1171,19 +1310,41 @@ pub(in crate::ai) fn write_context_snapshot_sqlite(
     canonical_generation: i64,
     projection_fingerprint: &str,
 ) -> io::Result<bool> {
-    with_session_state_lock(path, || {
-        let mut conn = open_history_db(path)?;
+    write_context_snapshot_sqlite_with_busy_timeout(
+        path,
+        messages,
+        source_message_id,
+        canonical_generation,
+        projection_fingerprint,
+        Duration::from_secs(5),
+    )
+}
+
+pub(in crate::ai) fn write_context_snapshot_sqlite_with_busy_timeout(
+    path: &Path,
+    messages: &[Message],
+    source_message_id: i64,
+    canonical_generation: i64,
+    projection_fingerprint: &str,
+    busy_timeout: Duration,
+) -> io::Result<bool> {
+    let deadline = Instant::now() + busy_timeout;
+    with_session_state_lock_until(path, deadline, || {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        let mut conn = open_history_db_with_busy_timeout(path, remaining)?;
         init_history_schema(&conn)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+            .map_err(|error| sqlite_error(path, "begin context snapshot transaction", error))?;
         if history_generation(&tx)? != canonical_generation {
             return Ok(false);
         }
 
         tx.execute("DELETE FROM context_messages", [])
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        insert_context_messages(&tx, messages)?;
+            .map_err(|error| sqlite_error(path, "clear context_messages", error))?;
+        insert_context_messages(&tx, path, messages)?;
         tx.execute(
             "INSERT INTO context_snapshot
                 (singleton, source_message_id, source_generation, projection_fingerprint)
@@ -1198,22 +1359,22 @@ pub(in crate::ai) fn write_context_snapshot_sqlite(
                 projection_fingerprint
             ],
         )
-        .map_err(|error| io::Error::other(error.to_string()))?;
+        .map_err(|error| sqlite_error(path, "upsert context_snapshot", error))?;
         bump_history_revision(&tx)?;
         tx.commit()
-            .map_err(|error| io::Error::other(error.to_string()))?;
+            .map_err(|error| sqlite_error(path, "commit context snapshot transaction", error))?;
         Ok(true)
     })
 }
 
-fn insert_context_messages(conn: &Connection, messages: &[Message]) -> io::Result<()> {
+fn insert_context_messages(conn: &Connection, path: &Path, messages: &[Message]) -> io::Result<()> {
     let mut stmt = conn
         .prepare(
             "INSERT INTO context_messages
                 (position, role, content, tool_calls, tool_call_id, reasoning_content)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
-        .map_err(|error| io::Error::other(error.to_string()))?;
+        .map_err(|error| sqlite_error(path, "prepare context_messages insert", error))?;
     for (position, message) in messages.iter().enumerate() {
         let content = serde_json::to_string(&message.content)
             .map_err(|error| io::Error::other(error.to_string()))?;
@@ -1231,7 +1392,13 @@ fn insert_context_messages(conn: &Connection, messages: &[Message]) -> io::Resul
             message.tool_call_id,
             message.reasoning_content,
         ])
-        .map_err(|error| io::Error::other(error.to_string()))?;
+        .map_err(|error| {
+            sqlite_error(
+                path,
+                &format!("insert context_messages row {position}"),
+                error,
+            )
+        })?;
     }
     Ok(())
 }
@@ -1929,6 +2096,77 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    #[test]
+    fn sqlite_error_classifies_transient_failures_as_retryable() {
+        // BUSY/LOCKED 与 SQLITE_IOERR 系统 I/O 失败（如并发首开 WAL 时的
+        // FSTAT/SHMOPEN）都属瞬时，必须归为 WouldBlock 供上层短退避重试。
+        for result_code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_IOERR_FSTAT,
+        ] {
+            let error =
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(result_code), None);
+            assert_eq!(
+                sqlite_error_kind(&error),
+                io::ErrorKind::WouldBlock,
+                "schema and transaction paths must share retry classification"
+            );
+            let io_error = sqlite_error(Path::new("history.db"), "test operation", error);
+            assert_eq!(io_error.kind(), io::ErrorKind::WouldBlock);
+        }
+
+        // 非瞬时失败（只读文件系统）不得重试。
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
+            None,
+        );
+        let io_error = sqlite_error(Path::new("history.db"), "test operation", error);
+        assert_eq!(io_error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn context_snapshot_busy_timeout_includes_session_state_lock_wait() {
+        let dir = std::env::temp_dir().join(format!(
+            "snapshot_state_lock_timeout_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        let holder_path = path.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            with_session_state_lock(&holder_path, || {
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(250));
+                Ok(())
+            })
+            .unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let started = Instant::now();
+        let error = write_context_snapshot_sqlite_with_busy_timeout(
+            &path,
+            &[],
+            0,
+            0,
+            "fingerprint",
+            Duration::from_millis(30),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        holder.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn msg(role: &str, text: &str) -> Message {
         Message {
             role: role.to_string(),
@@ -2162,16 +2400,10 @@ mod tests {
         // 模拟尚未写入 last_activity_unix_ms 的旧 session。列表必须使用消息时间，
         // 不能依赖会被只读连接创建/刷新的 SQLite -shm 文件时间。
         let conn = open_history_db(&path).unwrap();
-        conn.execute(
-            "UPDATE messages SET created_at = ?1",
-            [1_700_000_000_i64],
-        )
-        .unwrap();
-        conn.execute(
-            "DELETE FROM meta WHERE key = 'last_activity_unix_ms'",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE messages SET created_at = ?1", [1_700_000_000_i64])
+            .unwrap();
+        conn.execute("DELETE FROM meta WHERE key = 'last_activity_unix_ms'", [])
+            .unwrap();
         drop(conn);
 
         let metadata = read_session_list_metadata_sqlite(&path).unwrap();

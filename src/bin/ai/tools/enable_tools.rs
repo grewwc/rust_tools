@@ -532,6 +532,7 @@ mod tests {
                 "task_spawn",
                 "task_wait",
                 "task_status",
+                "task_integrate",
                 "task_cancel",
             ] {
                 assert!(

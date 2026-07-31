@@ -1208,10 +1208,8 @@ fn assistant_call_args_multi(id: &str, calls: &[(&str, &str)]) -> Message {
 /// 会因拿不到精确 context 再次 patch 失败、陷入"重读→再失败"循环。
 #[test]
 fn preserves_read_file_for_pending_patch_path() {
-    let overflow_dir = std::env::temp_dir().join(format!(
-        "ai-pending-patch-fold-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-pending-patch-fold-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![msg("system", "s"), msg("user", "改代码")];
     // 早期：read_file 读 /a.rs（将被 apply_patch 引用）。
     messages.push(assistant_call_args(

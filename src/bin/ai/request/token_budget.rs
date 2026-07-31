@@ -186,6 +186,7 @@ pub(super) async fn wait_for_request_budget(
     let tokens = reservation_tokens(estimated_prompt_tokens, physical_sends);
     let key = budget_key(endpoint, request_model_label, api_key);
 
+    let mut status_line = super::TransientStatusLine::new();
     loop {
         let decision = {
             let Ok(mut state) = STATE.lock() else {
@@ -198,13 +199,20 @@ pub(super) async fn wait_for_request_budget(
         match decision {
             BudgetDecision::Reserved => return Ok(()),
             BudgetDecision::Wait(delay) => {
-                super::emit_request_diagnostic(format_args!(
-                    "[Info] request TPM budget reached for `{request_model_label}`; waiting {:.1}s before next send (reserved {} / model limit {} tokens, key-scoped 60s window)",
+                let msg = format!(
+                    "⌛ TPM 限流 · `{request_model_label}` · 等待 {:.1}s (预占 {} / 限额 {} tokens, 60s 窗口)",
                     delay.as_secs_f32(),
                     tokens,
                     limit
-                ));
+                );
+                if let Some(line) = status_line.as_mut() {
+                    line.update(&msg);
+                } else {
+                    super::emit_request_diagnostic(format_args!("{msg}"));
+                }
                 if sleep_with_cancel(app, delay).await {
+                    // 取消时顺手清掉瞬态行，避免残留
+                    drop(status_line.take());
                     return Err(RequestError::cancelled(
                         "request canceled by user during TPM budget wait",
                     ));

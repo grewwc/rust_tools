@@ -34,12 +34,11 @@ pub fn try_handle_agent_command(
         "help" | "h" => {
             println!("Agent management commands:");
             println!();
-            println!("  /agents                   list available agents");
-            println!("  /agents list              list available agents");
-            println!("  /agents current           show current agent");
-            println!("  /agents use <name>        switch to an agent");
-            println!("  /agents auto              restore automatic agent routing");
-            println!("  /agents reload            reload agents from disk (hot-discovery)");
+            println!("  /agent                    list available agents");
+            println!("  /agent <name>             switch to an agent");
+            println!("  /agent current            show current agent");
+            println!("  /agent auto               restore automatic agent routing");
+            println!("  /agent reload             reload agents from disk (hot-discovery)");
             println!();
         }
         "list" | "ls" | "" => {
@@ -111,6 +110,9 @@ pub fn try_handle_agent_command(
         "reload" => {
             let old_count = agent_manifests.len();
             *agent_manifests = Arc::new(agents::load_all_agents());
+            crate::ai::prompt::completion::CommandCompleter::set_agent_manifests(
+                agent_manifests.as_slice(),
+            );
             let new_count = agent_manifests.len();
             let delta = new_count as i64 - old_count as i64;
             if delta > 0 {
@@ -132,7 +134,7 @@ pub fn try_handle_agent_command(
         }
         "use" | "select" | "switch" => {
             let Some(name) = parts.next() else {
-                println!("missing agent name. try: /agents use <name>");
+                println!("missing agent name. try: /agent <name>");
                 println!("\nAvailable primary agents:");
                 for agent in agents::get_primary_agents(agent_manifests) {
                     println!("  {} - {}", agent.name, agent.description);
@@ -140,43 +142,45 @@ pub fn try_handle_agent_command(
                 return Ok(true);
             };
 
-            if let Some(agent) = agents::find_agent_by_name(agent_manifests, name) {
-                if !agent.is_primary() {
-                    println!(
-                        "Agent '{}' is not a primary agent. Use @mention to invoke subagents.",
-                        name
-                    );
-                    return Ok(true);
-                }
-                if agent.disabled {
-                    println!("Agent '{}' is disabled.", name);
-                    return Ok(true);
-                }
-
-                let old_agent = app.current_agent.clone();
-                app.current_agent = agent.name.clone();
-                app.current_agent_manifest = Some(agent.clone());
-                app.cli.agent = Some(agent.name.clone());
-
-                if let Some(model) = &agent.model {
-                    app.current_model = model.clone();
-                }
-
-                println!("Switched agent: {} -> {}", old_agent, agent.name);
-                if let Some(model) = &agent.model {
-                    println!("Model: {}", model);
-                }
-            } else {
-                println!("Agent not found: {}", name);
-                println!("\nAvailable primary agents:");
-                for agent in agents::get_primary_agents(agent_manifests) {
-                    println!("  {} - {}", agent.name, agent.description);
-                }
-            }
+            switch_agent(app, name, agent_manifests);
         }
-        _ => {
-            println!("unknown action: '{}'. try: /agents help", action);
-        }
+        name => switch_agent(app, name, agent_manifests),
     }
     Ok(true)
+}
+
+fn switch_agent(app: &mut App, name: &str, agent_manifests: &[AgentManifest]) {
+    if let Some(agent) = agents::find_agent_by_name(agent_manifests, name) {
+        if !agent.is_primary() {
+            println!(
+                "Agent '{}' is not a primary agent. Use @mention to invoke subagents.",
+                name
+            );
+            return;
+        }
+        if agent.disabled {
+            println!("Agent '{}' is disabled.", name);
+            return;
+        }
+
+        let old_agent = app.current_agent.clone();
+        app.current_agent = agent.name.clone();
+        app.current_agent_manifest = Some(agent.clone());
+        app.cli.agent = Some(agent.name.clone());
+
+        if let Some(model) = &agent.model {
+            app.current_model = model.clone();
+        }
+
+        println!("Switched agent: {} -> {}", old_agent, agent.name);
+        if let Some(model) = &agent.model {
+            println!("Model: {}", model);
+        }
+    } else {
+        println!("Agent not found: {}", name);
+        println!("\nAvailable primary agents:");
+        for agent in agents::get_primary_agents(agent_manifests) {
+            println!("  {} - {}", agent.name, agent.description);
+        }
+    }
 }

@@ -19,6 +19,11 @@ fn params_execute_command() -> Value {
                 "type": "string",
                 "description": "Working directory (default: current directory)."
             },
+            "project_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Required for commands that may create, modify, or delete project files. List every affected project file or directory so scoped project instructions can be loaded before execution. Relative paths resolve against the command's cwd."
+            },
             "timeout": {
                 "type": "integer",
                 "description": "Timeout in seconds, 1-300 (default: 30)."

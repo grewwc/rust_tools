@@ -6,12 +6,13 @@ mod markdown;
 mod sessions;
 mod sqlite;
 mod suspended;
+mod task_evidence;
 mod types;
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::ai::types::App;
 #[allow(unused_imports)]
@@ -125,6 +126,21 @@ pub(in crate::ai) fn delete_subagent_history(path: &Path) -> io::Result<()> {
     history_result.and(lock_result)
 }
 
+/// 清理 sub-agent 私有 memory 文件：jsonl 本体 + 派生的 `.db` 索引（连同其
+/// WAL/SHM sidecar）。与 [`delete_subagent_history`] 同生命周期，仅在任务真正
+/// 结束（非 resume 保留）时调用。
+pub(in crate::ai) fn delete_subagent_memory(memory_path: &Path) -> io::Result<()> {
+    let jsonl_result = blob::delete_history_artifacts(memory_path);
+    let db_result = match memory_path.file_stem().and_then(|stem| stem.to_str()) {
+        Some(stem) => {
+            let db_path = memory_path.with_file_name(format!("{stem}.db"));
+            blob::delete_history_artifacts(&db_path)
+        }
+        None => Ok(()),
+    };
+    jsonl_result.and(db_result)
+}
+
 #[cfg(test)]
 pub(in crate::ai) use sqlite::read_context_history_sqlite;
 #[allow(unused_imports)]
@@ -139,11 +155,82 @@ pub(in crate::ai) use sqlite::{
 pub(in crate::ai) use suspended::{
     SuspendedSessionEntry, SuspendedSessionStore, format_suspended_timestamp_label,
 };
+#[cfg(test)]
+pub(in crate::ai) use task_evidence::render_unintegrated_task_evidence;
+pub(in crate::ai) use task_evidence::{
+    DeliveredTaskEvidence, integrate_task_evidence, record_delivered_task_evidence,
+    render_unintegrated_task_evidence_resilient, task_evidence_exists,
+};
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE, ToolExecutionOutcome};
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
 pub(in crate::ai) const ROLE_INTERNAL_NOTE: &str = types::ROLE_INTERNAL_NOTE;
+
+const CONTEXT_SNAPSHOT_WRITE_DEADLINE: Duration = Duration::from_secs(1);
+const CONTEXT_SNAPSHOT_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+const CONTEXT_SNAPSHOT_MAX_RETRIES: usize = 4;
+const CONTEXT_SNAPSHOT_RETRY_BASE_DELAY: Duration = Duration::from_millis(25);
+
+fn context_snapshot_busy_timeout(remaining: Duration) -> Option<Duration> {
+    (!remaining.is_zero()).then(|| remaining.min(CONTEXT_SNAPSHOT_BUSY_TIMEOUT))
+}
+
+fn context_snapshot_retry_delay(retry_index: usize) -> Duration {
+    CONTEXT_SNAPSHOT_RETRY_BASE_DELAY.saturating_mul(1_u32 << retry_index.min(31))
+}
+
+async fn write_context_snapshot_with_retry(
+    mut write_snapshot: impl FnMut(Duration) -> io::Result<bool>,
+) -> io::Result<bool> {
+    let started = Instant::now();
+    let mut retries = 0;
+    let mut first_error = None::<String>;
+
+    loop {
+        let remaining = CONTEXT_SNAPSHOT_WRITE_DEADLINE.saturating_sub(started.elapsed());
+        let Some(busy_timeout) = context_snapshot_busy_timeout(remaining) else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "context snapshot write deadline exceeded; first_error={}",
+                    first_error
+                        .as_deref()
+                        .unwrap_or("unknown SQLite busy error")
+                ),
+            ));
+        };
+
+        match write_snapshot(busy_timeout) {
+            Ok(written) => return Ok(written),
+            Err(error) if error.kind() != io::ErrorKind::WouldBlock => return Err(error),
+            Err(error) => {
+                let first_error = first_error.get_or_insert_with(|| error.to_string());
+                if retries >= CONTEXT_SNAPSHOT_MAX_RETRIES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "context snapshot write retries exhausted; first_error={first_error}; retry_error={error}"
+                        ),
+                    ));
+                }
+
+                let remaining = CONTEXT_SNAPSHOT_WRITE_DEADLINE.saturating_sub(started.elapsed());
+                let delay = context_snapshot_retry_delay(retries);
+                if remaining <= delay {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "context snapshot write deadline exceeded; first_error={first_error}; retry_error={error}"
+                        ),
+                    ));
+                }
+                tokio::time::sleep(delay).await;
+                retries += 1;
+            }
+        }
+    }
+}
 
 pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
     sessions::normalize_generated_session_title(title)
@@ -151,6 +238,31 @@ pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
 
 pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
     sessions::is_low_quality_session_title(title)
+}
+
+/// Read the derived context snapshot, retrying transient SQLite I/O failures
+/// (e.g. `SQLITE_IOERR_FSTAT` while a sibling sub-agent DB is first opening
+/// WAL) on the async caller's timeline. The underlying `open_history_db` is
+/// synchronous and never sleeps, so the non-blocking wait lives here via
+/// `tokio::time::sleep` — mirroring `write_context_snapshot_with_retry`.
+async fn read_context_history_sqlite_with_retry(
+    path: &Path,
+    projection_fingerprint: &str,
+) -> io::Result<sqlite::ContextHistory> {
+    let mut retries = 0;
+    loop {
+        match sqlite::read_context_history_sqlite(path, projection_fingerprint) {
+            Ok(context) => return Ok(context),
+            Err(error) if error.kind() != io::ErrorKind::WouldBlock => return Err(error),
+            Err(error) => {
+                if retries >= CONTEXT_SNAPSHOT_MAX_RETRIES {
+                    return Err(error);
+                }
+                tokio::time::sleep(context_snapshot_retry_delay(retries)).await;
+                retries += 1;
+            }
+        }
+    }
 }
 
 const CONTEXT_HISTORY_CACHE_LIMIT: usize = 8;
@@ -400,7 +512,8 @@ async fn compact_session_history_with_app_inner(
     );
     let (messages, sqlite_source) = if blob::is_sqlite_path(history_file) {
         let context =
-            sqlite::read_context_history_sqlite(history_file.as_path(), &projection_fingerprint)?;
+            read_context_history_sqlite_with_retry(history_file.as_path(), &projection_fingerprint)
+                .await?;
         if context.snapshot_is_current {
             return Ok(());
         }
@@ -453,13 +566,20 @@ async fn compact_session_history_with_app_inner(
     };
 
     if let Some((source_message_id, history_generation)) = sqlite_source {
-        sqlite::write_context_snapshot_sqlite(
-            history_file.as_path(),
-            &compacted,
-            source_message_id,
-            history_generation,
-            &projection_fingerprint,
-        )?;
+        let written = write_context_snapshot_with_retry(|busy_timeout| {
+            sqlite::write_context_snapshot_sqlite_with_busy_timeout(
+                history_file.as_path(),
+                &compacted,
+                source_message_id,
+                history_generation,
+                &projection_fingerprint,
+                busy_timeout,
+            )
+        })
+        .await?;
+        if !written {
+            return Ok(());
+        }
     } else if compacted != messages {
         std::fs::write(
             history_file,
@@ -480,4 +600,30 @@ async fn compact_session_history_with_app_inner(
         messages_total_chars_pub(&compacted)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_snapshot_retry_backoff_and_busy_timeout_are_bounded() {
+        assert_eq!(context_snapshot_retry_delay(0), Duration::from_millis(25));
+        assert_eq!(context_snapshot_retry_delay(3), Duration::from_millis(200));
+        assert_eq!(context_snapshot_busy_timeout(Duration::ZERO), None);
+        assert_eq!(
+            context_snapshot_busy_timeout(Duration::from_millis(40)),
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            context_snapshot_busy_timeout(Duration::from_secs(5)),
+            Some(CONTEXT_SNAPSHOT_BUSY_TIMEOUT)
+        );
+        assert!(
+            (0..CONTEXT_SNAPSHOT_MAX_RETRIES)
+                .map(context_snapshot_retry_delay)
+                .sum::<Duration>()
+                < CONTEXT_SNAPSHOT_WRITE_DEADLINE
+        );
+    }
 }

@@ -39,11 +39,10 @@ pub fn print_interactive_help() {
     println!("    /personas help            show persona command help");
     println!();
     println!("  Agent management:");
-    println!("    /agents                   list available agents");
-    println!("    /agents list              list available agents");
-    println!("    /agents current           show current agent");
-    println!("    /agents use <name>        switch to an agent");
-    println!("    /agents auto              restore automatic agent routing");
+    println!("    /agent                    list available agents");
+    println!("    /agent <name>             switch to an agent");
+    println!("    /agent current            show current agent");
+    println!("    /agent auto               restore automatic agent routing");
     println!();
     println!("  Skill management:");
     println!("    /skills                   list available skills");
@@ -107,7 +106,7 @@ pub fn print_agents_list(agent_manifests: &[AgentManifest]) {
     println!("Available agents:\n");
 
     if !primary_agents.is_empty() {
-        println!("Primary agents (use --agent <name> or /agents use <name>):");
+        println!("Primary agents (use --agent <name> or /agent <name>):");
         for agent in &primary_agents {
             let color_info = agent.color.as_deref().unwrap_or("default");
             let model_info = agent

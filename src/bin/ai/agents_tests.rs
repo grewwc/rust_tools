@@ -80,6 +80,24 @@ fn builtin_agents_do_not_mount_mcp_tools_by_default() {
 }
 
 #[test]
+fn builtin_audit_agent_enforces_evidence_driven_review() {
+    let (_, content) = BUILTIN_AGENTS
+        .iter()
+        .find(|(filename, _)| *filename == "audit.agent")
+        .expect("audit agent should be registered");
+    let agent = parse_agent_front_matter(content).unwrap();
+
+    assert_eq!(agent.name, "audit");
+    assert!(agent.is_primary());
+    assert!(agent.is_subagent());
+    assert_eq!(agent.model_tier, Some(AgentModelTier::Heavy));
+    assert!(agent.disable_mcp_tools);
+    assert!(agent.prompt.contains("Falsify candidate findings"));
+    assert!(agent.prompt.contains("An unresolved hypothesis is not a finding"));
+    assert!(agent.prompt.contains("newly introduced behavior from pre-existing behavior"));
+}
+
+#[test]
 fn project_instruction_docs_include_root_and_nested_scope() {
     let root = temp_dir("project_docs");
     let nested = root.join("packages/app/src");

@@ -70,9 +70,10 @@ mod tests {
                 );
             }
             Err(err) => {
+                let normalized = err.to_ascii_lowercase();
                 assert!(
-                    err.contains("timeout"),
-                    "error should mention timeout, got: {}",
+                    normalized.contains("timeout") || normalized.contains("timed out"),
+                    "error should state that the command timed out, got: {}",
                     err
                 );
             }

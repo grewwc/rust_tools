@@ -89,23 +89,28 @@ fn overflow_heading_role(line: &str) -> Option<&'static str> {
     }
 }
 
-fn finish_message(
-    messages: &mut Vec<Message>,
-    role: Option<&str>,
-    content_lines: &mut Vec<&str>,
-) {
+fn finish_message(messages: &mut Vec<Message>, role: Option<&str>, content_lines: &mut Vec<&str>) {
     let Some(role) = role else {
         content_lines.clear();
         return;
     };
 
-    while content_lines.last().is_some_and(|line| line.trim().is_empty()) {
+    while content_lines
+        .last()
+        .is_some_and(|line| line.trim().is_empty())
+    {
         content_lines.pop();
     }
     // OverflowSink 在不同 append 批次之间写入 `---`；它不是消息正文。
-    if content_lines.last().is_some_and(|line| line.trim() == "---") {
+    if content_lines
+        .last()
+        .is_some_and(|line| line.trim() == "---")
+    {
         content_lines.pop();
-        while content_lines.last().is_some_and(|line| line.trim().is_empty()) {
+        while content_lines
+            .last()
+            .is_some_and(|line| line.trim().is_empty())
+        {
             content_lines.pop();
         }
     }

@@ -23,6 +23,8 @@ static CURRENT_MODEL_HINT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::n
 /// `None` 表示尚未初始化，保留给单元测试和非交互调用的兼容回退。
 static SKILL_NAME_CANDIDATES: LazyLock<RwLock<Option<Vec<CompletionCandidate>>>> =
     LazyLock::new(|| RwLock::new(None));
+static AGENT_NAME_CANDIDATES: LazyLock<RwLock<Vec<CompletionCandidate>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Trie 存储所有 "/" 和 ":" 开头的顶层命令，替换原先的线性 starts_with 过滤。
 static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
@@ -50,8 +52,6 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         "/export",
         ":export",
         ":model",
-        "/agents",
-        ":agents",
         "/agent",
         ":agent",
         "/personas",
@@ -152,6 +152,19 @@ impl CommandCompleter {
         }
     }
 
+    /// 用运行时 manifest 快照更新可切换 agent 的补全缓存。
+    pub(in crate::ai) fn set_agent_manifests(manifests: &[crate::ai::agents::AgentManifest]) {
+        if let Ok(mut guard) = AGENT_NAME_CANDIDATES.write() {
+            *guard = crate::ai::agents::get_primary_agents(manifests)
+                .into_iter()
+                .map(|agent| CompletionCandidate {
+                    display: format!("{} · {}", agent.name, agent.description),
+                    replacement: agent.name.clone(),
+                })
+                .collect();
+        }
+    }
+
     fn top_level_commands() -> &'static [&'static str] {
         &[
             "/help",
@@ -176,8 +189,6 @@ impl CommandCompleter {
             "/export",
             ":export",
             ":model",
-            "/agents",
-            ":agents",
             "/agent",
             ":agent",
             "/personas",
@@ -319,7 +330,20 @@ impl CommandCompleter {
     }
 
     fn agent_subcommands() -> &'static [&'static str] {
-        &["help", "list", "current", "use", "auto"]
+        &["help", "list", "current", "use", "auto", "reload"]
+    }
+
+    fn agent_name_candidates(token: &str) -> Vec<CompletionCandidate> {
+        AGENT_NAME_CANDIDATES
+            .read()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|candidate| candidate.replacement.starts_with(token))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// `/model` 的二级子命令字面量。注意：这些子命令与"模型名"互斥地占据
@@ -493,38 +517,50 @@ impl CommandCompleter {
                     }
                     _ => Vec::new(),
                 }
-            } else {
-                let candidates = match first {
-                    "/skills" | ":skills" | "/skill" | ":skill" => Self::skill_name_candidates()
-                        .into_iter()
-                        .filter(|c| c.replacement.starts_with(token))
-                        .collect(),
-                    _ => {
-                        let sources: &[&str] = match first {
-                            "/agents" | ":agents" | "/agent" | ":agent" => {
-                                Self::agent_subcommands()
-                            }
-                            "/sessions" | ":sessions" | "/ss" | ":ss" => {
-                                Self::session_subcommands()
-                            }
-                            "/history" | ":history" => Self::history_subcommands(),
-                            "/personas" | ":personas" => Self::persona_subcommands(),
-                            "/usage" | ":usage" => Self::usage_subcommands(),
-                            "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => {
-                                Self::checkpoint_subcommands()
-                            }
-                            "/model" | ":model" => Self::model_subcommands(),
-                            _ => &[],
-                        };
-                        Self::plain_candidates(
-                            sources
+            } else if matches!(first, "/agent" | ":agent") {
+                match words.next() {
+                    None => {
+                        let mut candidates = Self::agent_name_candidates(token);
+                        candidates.extend(Self::plain_candidates(
+                            Self::agent_subcommands()
                                 .iter()
                                 .filter(|c| c.starts_with(token))
                                 .map(|c| c.to_string()),
-                        )
+                        ));
+                        candidates
                     }
+                    Some("use") if words.next().is_none() => Self::agent_name_candidates(token),
+                    _ => Vec::new(),
+                }
+            } else {
+                let sources: &[&str] = match first {
+                    "/skills" | ":skills" | "/skill" | ":skill" => {
+                        return (
+                            token_start,
+                            Self::skill_name_candidates()
+                                .into_iter()
+                                .filter(|c| c.replacement.starts_with(token))
+                                .collect(),
+                        );
+                    }
+                    "/sessions" | ":sessions" | "/ss" | ":ss" => {
+                        Self::session_subcommands()
+                    }
+                    "/history" | ":history" => Self::history_subcommands(),
+                    "/personas" | ":personas" => Self::persona_subcommands(),
+                    "/usage" | ":usage" => Self::usage_subcommands(),
+                    "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => {
+                        Self::checkpoint_subcommands()
+                    }
+                    "/model" | ":model" => Self::model_subcommands(),
+                    _ => &[],
                 };
-                candidates
+                Self::plain_candidates(
+                    sources
+                        .iter()
+                        .filter(|c| c.starts_with(token))
+                        .map(|c| c.to_string()),
+                )
             }
         };
 
@@ -916,8 +952,30 @@ mod tests {
         let (_, pairs) = completer
             .complete("/agen", 5, &Context::new(&history))
             .unwrap();
-        assert!(pairs.iter().any(|pair| pair.replacement == "/agents"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "/agent"));
+        assert!(!pairs.iter().any(|pair| pair.replacement == "/agents"));
     }
+
+    #[test]
+    fn command_completion_suggests_agent_names_for_direct_switch() {
+        let manifests = crate::ai::agents::load_all_agents();
+        CommandCompleter::set_agent_manifests(&manifests);
+
+        let (_, direct) = CommandCompleter::complete_for_line("/agent au", 9);
+        assert!(
+            direct
+                .iter()
+                .any(|candidate| candidate.replacement == "audit")
+        );
+
+        let (_, legacy) = CommandCompleter::complete_for_line("/agent use au", 13);
+        assert!(
+            legacy
+                .iter()
+                .any(|candidate| candidate.replacement == "audit")
+        );
+    }
+
     #[test]
     fn command_completion_expands_top_level_close_command() {
         let completer = CommandCompleter;
@@ -938,9 +996,9 @@ mod tests {
         let completer = CommandCompleter;
         let history = DefaultHistory::new();
         let (start, pairs) = completer
-            .complete("/agents a", 9, &Context::new(&history))
+            .complete("/agent a", 8, &Context::new(&history))
             .unwrap();
-        assert_eq!(start, 8);
+        assert_eq!(start, 7);
         assert!(pairs.iter().any(|pair| pair.replacement == "auto"));
     }
 

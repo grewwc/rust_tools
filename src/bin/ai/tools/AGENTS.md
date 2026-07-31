@@ -23,47 +23,34 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
    Preserve truth for `plan`, `read_file`, `execute_command` diagnostics, and
    subagent task tools with explicit overflow stubs/file pointers, not lossy
    summaries.
-6. **Temp files.** `write_file(temp=true)` writes under `runtime_ctx::temp_dir()`
-   and registers a relative path in the JSON temp registry for audit tracking.
-   Temp files are cleaned up automatically when the session ends. Delete
-   project/source/config files (incl.
-   git-tracked) via `apply_patch` with a `*** Delete File:` section.
+6. **Temp files.** `write_file(temp=true)` uses `runtime_ctx::temp_dir()` and the
+   session temp registry. Delete project/source/config files via `apply_patch`
+   with an explicit `*** Delete File:` section.
 7. **Process groups.** `execute_command` runs in its own process group. Keep
    background pgids in the in-memory session registry and kill by process group at
    teardown; do not persist pgids across restarts.
 8. **Self-describing truncation.** Truncating tools must distinguish complete,
    failed, and incomplete output. Include shown-vs-total counts and a concrete
    narrow/page hint when output is cut.
-9. **Patch/read/search contracts.** `apply_patch` anchors on remove lines,
-   normalizes confusable typographic chars (smart quotes, dashes, NBSP) so
-   model-introduced variants match without corrupting output, and treats
-   ambiguous hunk matches as a hard error. A single-file unified diff may carry a
-   git-style header (`--- a/<path>` / `+++ b/<path>` / `diff --git`), including
-   quoted paths; when present the target path is read from the header, so
-   `file_path` is optional. Reject multi-file unified diffs and `/dev/null`
-   deletion rather than guessing; use an envelope with explicit `*** Delete File:`
-   for deletion. Driver preflight and stale-patch tracking must reuse the tool's
-   target extractor so inferred git-header paths receive the same safeguards as
-   envelope paths. Prefer one call with multiple `@@` hunks per file (one
-   `*** Update File:` section); one envelope for multi-file edits. `read_file`
-   paginates by line and by character cap. Text search lives in dedicated grep/search
-   tools, not here.
-10. **Subagent tools are top-level only.** The `task` family
-    (`task`/`task_spawn`/`task_wait`/`task_status`/`task_cancel`) must be hidden
-    from subagents, not reintroduced by `enable_tools`, and rejected when
-    `SUBAGENT_DEPTH > 0`. Results are scoped by session + owner pid; a process
-    must not see/wait/cancel parent/sibling task ids. Surfaced child outputs must
-    remind the parent to produce its own summary. Subagent launches use a capped
-    copy of the agent manifest (`SUBAGENT_MAX_ITERATIONS`) with leaf-task
-    convergence constraints; do not lower the primary agent's budget to tune
-    subagent behavior. Never surface child thinking or streamed response bodies.
-11. **Wall-clock safety net.** Stuck subagents are reaped after
-    `SUBAGENT_WALL_CLOCK_TIMEOUT` (30 min) by both `task_wait` (per-call) and the
-    driver `run_loop` (per-epoch `reap_timed_out_subagents()`), so they are killed
-    even if the parent never calls `task_wait`. The reaper writes a terminal
-    `timeout`/`cancelled` result but leaves registry cleanup to the collecting
-    `task_wait`; `task_cancel` skips already-finished tasks so it never discards a
-    real result.
+9. **Patch/read/search contracts.** `apply_patch` anchors on removed text,
+   normalizes supported typographic confusables, and rejects ambiguous matches.
+   Unified diffs are single-file; multi-file edits and deletion use an explicit
+   envelope. Driver preflight and stale-patch tracking must reuse the patch target
+   extractor. `read_file` paginates by line and character cap; text search stays
+   in dedicated search tools.
+10. **Subagent tools are top-level only.** Hide and reject the `task` family when
+    `SUBAGENT_DEPTH > 0`; `enable_tools` must not restore it. Scope tasks by
+    session + owner pid, persist results before IPC cleanup, and require
+    `task_integrate` after delivery. Cap only the child manifest and never expose
+    child thinking or streamed response bodies.
+11. **Wall-clock safety net.** Both `task_wait` and the driver loop reap tasks past
+    `SUBAGENT_WALL_CLOCK_TIMEOUT`. Write a terminal result before collection,
+    preserve already-finished results, and signal `cancel_stream` before aborting
+    the Tokio task so synchronous child commands can stop their process group.
 12. **Interactive skill handoff.** `request_user_input` is a driver-owned control
     tool, visible only during an active skill turn. Scope its signal by
     `TURN_IDENTITY`; never infer a cross-turn continuation from response text.
+13. **Command execution defaults to non-interactive.** Non-PTY runners disable
+    blocking pagers, editors, prompts, and color; explicit PTY runs preserve
+    interactive terminal behavior. Mutating commands declare all affected
+    `project_paths` so scoped instructions load before execution.

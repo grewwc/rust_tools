@@ -8,7 +8,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ai::{
     agents::AgentManifest,
@@ -36,18 +36,43 @@ use super::{BgSubagentGuard, TASK_PID, terminate_and_cleanup};
 const MAX_SUBAGENT_STATUS_DETAILS: usize = 3;
 
 /// 后台 subagent 的历史只在进程仍可继续调度时保留。正常终止、失败、panic 或
-/// `task_cancel` 导致 future 被 abort 时都会通过 Drop 清理。
+/// `task_cancel` 导致 future 被 abort 时都会通过 Drop 清理。私有 memory 文件与
+/// 独占 cwd scratch 目录与 history 同生命周期，一并在此回收，避免长跑堆积。
 struct BackgroundSubagentHistoryGuard {
     path: Option<PathBuf>,
+    memory_path: Option<PathBuf>,
+    cwd_dir: Option<PathBuf>,
 }
 
 impl BackgroundSubagentHistoryGuard {
     fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+        Self {
+            path: Some(path),
+            memory_path: None,
+            cwd_dir: None,
+        }
+    }
+
+    /// 登记随任务派生、需与 history 同生命周期回收的私有 memory 文件与独占 cwd
+    /// scratch 目录。路径是确定性拼接，可在构造点一次算好传入。
+    fn with_scoped_artifacts(
+        mut self,
+        memory_path: Option<PathBuf>,
+        cwd_dir: Option<PathBuf>,
+    ) -> Self {
+        self.memory_path = memory_path;
+        self.cwd_dir = cwd_dir;
+        self
     }
 
     fn preserve(&mut self) {
         self.path = None;
+        self.memory_path = None;
+        self.cwd_dir = None;
+    }
+
+    fn preserve_memory(&mut self) {
+        self.memory_path = None;
     }
 }
 
@@ -55,6 +80,12 @@ impl Drop for BackgroundSubagentHistoryGuard {
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
             let _ = crate::ai::history::delete_subagent_history(&path);
+        }
+        if let Some(memory_path) = self.memory_path.take() {
+            let _ = crate::ai::history::delete_subagent_memory(&memory_path);
+        }
+        if let Some(cwd_dir) = self.cwd_dir.take() {
+            let _ = std::fs::remove_dir_all(&cwd_dir);
         }
     }
 }
@@ -272,6 +303,108 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn background_subagent_guard_cleans_scoped_memory_and_cwd_on_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "background-subagent-scoped-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let history = root.join("session.subagent-task_x.sqlite");
+        std::fs::write(&history, b"db").unwrap();
+        // 私有 memory：jsonl 本体 + 派生 .db 及其 WAL sidecar。
+        let memory = root.join("agent_memory.subagent-task_x.jsonl");
+        std::fs::write(&memory, b"[]").unwrap();
+        let memory_db = root.join("agent_memory.subagent-task_x.db");
+        std::fs::write(&memory_db, b"db").unwrap();
+        std::fs::write(format!("{}-wal", memory_db.display()), b"wal").unwrap();
+        // 独占 cwd scratch 目录（含内容，需递归删除）。
+        let cwd = root.join("subagent-cwd-task_x");
+        std::fs::create_dir_all(cwd.join("nested")).unwrap();
+        std::fs::write(cwd.join("scratch.txt"), b"tmp").unwrap();
+
+        drop(
+            BackgroundSubagentHistoryGuard::new(history.clone())
+                .with_scoped_artifacts(Some(memory.clone()), Some(cwd.clone())),
+        );
+
+        assert!(!history.exists(), "history db must be cleaned");
+        assert!(!memory.exists(), "memory jsonl must be cleaned");
+        assert!(!memory_db.exists(), "derived memory .db must be cleaned");
+        assert!(
+            !std::path::Path::new(&format!("{}-wal", memory_db.display())).exists(),
+            "memory .db WAL sidecar must be cleaned"
+        );
+        assert!(!cwd.exists(), "cwd scratch dir must be recursively cleaned");
+
+        // preserve() 必须让 memory/cwd 也一并保留（正常结束 / resume 场景）。
+        let history2 = root.join("session.subagent-task_y.sqlite");
+        let memory2 = root.join("agent_memory.subagent-task_y.jsonl");
+        let cwd2 = root.join("subagent-cwd-task_y");
+        std::fs::write(&history2, b"db").unwrap();
+        std::fs::write(&memory2, b"[]").unwrap();
+        std::fs::create_dir_all(&cwd2).unwrap();
+        let mut guard = BackgroundSubagentHistoryGuard::new(history2.clone())
+            .with_scoped_artifacts(Some(memory2.clone()), Some(cwd2.clone()));
+        guard.preserve();
+        drop(guard);
+        assert!(history2.exists() && memory2.exists() && cwd2.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn background_subagent_memory_is_merged_before_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "background-subagent-merge-order-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let history = root.join("session.subagent-task_merge.sqlite");
+        let private_memory = root.join("agent_memory.subagent-task_merge.jsonl");
+        let main_memory = root.join("agent_memory.jsonl");
+        std::fs::write(&history, b"db").unwrap();
+        std::fs::write(
+            &private_memory,
+            serde_json::json!({
+                "id": "mem-merge",
+                "timestamp": "2026-07-31T00:00:00Z",
+                "category": "project_memory",
+                "note": "durable subagent conclusion",
+                "tags": [],
+                "source": "test",
+                "priority": 180,
+                "owner_pid": 42,
+                "owner_pgid": 42,
+                "image_path": null
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let guard = BackgroundSubagentHistoryGuard::new(history.clone())
+            .with_scoped_artifacts(Some(private_memory.clone()), None);
+
+        assert_eq!(
+            crate::ai::tools::service::memory::merge_subagent_whitelist(
+                &private_memory,
+                &main_memory
+            )
+            .unwrap(),
+            1
+        );
+        drop(guard);
+
+        assert!(!private_memory.exists());
+        assert!(
+            std::fs::read_to_string(&main_memory)
+                .unwrap()
+                .contains("durable subagent conclusion")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// Dispatch a batch of background processes: select ready processes, decode
@@ -406,12 +539,18 @@ pub(super) fn dispatch_background_batch(
         // 后台任务必须拥有独立的 streaming/cancel_stream 标志：`App::clone` 默认与
         // 父 App 共享同一组 Arc，多个并发后台 run_turn 会互相覆写 streaming、互相
         // 清除 cancel（clear_stream_cancel 会重置共享 cancel_stream）。后台任务的
-        // 取消由 task_cancel 通过 abort_handle + kernel kill 完成，不依赖这两个 Arc，
-        // 故为每个任务新建私有标志是安全的。shutdown 仍与父 App 共享：会话级退出需
-        // 传播到后台任务让其优雅收尾，这与 streaming/cancel_stream 的"每流私有"语义
-        // 不同，故单独保留共享。
+        // cancel_stream 必须与 registry 条目共享：同步命令会轮询它并在 timeout/cancel
+        // 时杀掉实际 OS 进程组，单靠 Tokio abort 无法打断正在执行的同步 poll。
+        // shutdown 仍与父 App 共享：会话级退出需传播到后台任务让其优雅收尾。
         task_app.streaming = Arc::new(AtomicBool::new(false));
-        task_app.cancel_stream = Arc::new(AtomicBool::new(false));
+        task_app.cancel_stream = task_id
+            .as_deref()
+            .and_then(|task_id| {
+                crate::ai::tools::task_tools::with_task_entry(task_id, |entry| {
+                    entry.cancel_stream.clone()
+                })
+            })
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         crate::ai::types::clear_stream_cancel(&task_app);
         let task_mcp = mcp_client.clone();
         let task_os = app.os.clone();
@@ -473,6 +612,32 @@ pub(super) fn dispatch_background_batch(
         let scope_task_id = task_id.clone().unwrap_or_else(|| format!("pid-{pid}"));
         let parent_history_for_scopes = original_history_file.clone();
 
+        // 私有 memory 文件与独占 cwd scratch 目录都随任务派生，需与 history
+        // 同生命周期回收（正常结束由 preserve 保留，异常/abort/panic 由 Drop 清理）。
+        // 两者路径都必须复用建立时的同源逻辑，避免第二份定义漂移导致漏删/误删。
+        let scoped_memory_path = (!inherit.memory).then(|| {
+            runtime_ctx::make_subagent_memory_path(&parent_history_for_scopes, &scope_task_id)
+        });
+        let scratch_base_for_cwd = parent_history_for_scopes
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let scoped_cwd_dir = if inherit.cwd {
+            None
+        } else {
+            runtime_ctx::make_subagent_cwd(&scratch_base_for_cwd, &scope_task_id)
+        };
+        let history_guard =
+            BackgroundSubagentHistoryGuard::new(task_app.session_history_file.clone())
+                .with_scoped_artifacts(scoped_memory_path.clone(), scoped_cwd_dir.clone());
+        let preserve_scoped_artifacts = Arc::new(AtomicBool::new(false));
+        let preserve_scoped_artifacts_for_inner = preserve_scoped_artifacts.clone();
+        let memory_merge_failed = Arc::new(AtomicBool::new(false));
+        let memory_merge_failed_for_inner = memory_merge_failed.clone();
+        let private_memory_for_merge = scoped_memory_path.clone();
+        let persona_memory_path = app.current_persona_memory_file();
+        let main_memory_for_merge = persona_memory_path.clone();
+
         // Slot used by the sub-agent's `finalize_turn` to publish
         // its final assistant text. Cloned into the result-channel
         // payload below so `task_wait` can surface what the
@@ -483,8 +648,6 @@ pub(super) fn dispatch_background_batch(
         let result_slot_for_scope = result_slot_for_payload.clone();
 
         let inner_fut = TASK_PID.scope(Some(pid), async move {
-            let mut history_guard =
-                BackgroundSubagentHistoryGuard::new(task_app.session_history_file.clone());
             crate::ai::tools::registry::common::clear_tool_cancel();
             let run = runtime_ctx::IS_RESUME_TURN.scope(
                 is_resume_wakeup,
@@ -516,18 +679,29 @@ pub(super) fn dispatch_background_batch(
             } else {
                 String::new()
             };
+            let memory_merge_error = private_memory_for_merge.and_then(|private_memory| {
+                crate::ai::tools::service::memory::merge_subagent_whitelist(
+                    &private_memory,
+                    &main_memory_for_merge,
+                )
+                .err()
+            });
+            if memory_merge_error.is_some() {
+                memory_merge_failed_for_inner.store(true, Ordering::Release);
+            }
             let mut os = task_os.lock().unwrap();
             os.set_current_pid(Some(pid));
+            let task_succeeded = result.is_ok() && memory_merge_error.is_none();
             let publish_task_result = should_publish_subagent_task_result(
-                result.is_ok(),
+                task_succeeded,
                 &captured_output,
                 os.get_process(pid).map(|proc| &proc.state),
             );
             if publish_task_result && let Some(result_channel_id) = result_channel_id {
                 let payload = serde_json::json!({
-                    "status": if result.is_ok() { "completed" } else { "failed" },
+                    "status": if task_succeeded { "completed" } else { "failed" },
                     "output": captured_output,
-                    "error": result.as_ref().err().cloned(),
+                    "error": result.as_ref().err().cloned().or(memory_merge_error),
                 })
                 .to_string();
                 let _ = os.channel_send(
@@ -572,48 +746,23 @@ pub(super) fn dispatch_background_batch(
                 }
             };
             drop(os);
-            if preserve_history {
-                history_guard.preserve();
-            }
+            preserve_scoped_artifacts_for_inner.store(preserve_history, Ordering::Release);
         });
 
         type BoxedTaskFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
         let mut wrapped: BoxedTaskFuture = Box::pin(inner_fut);
-        let persona_memory_path = app.current_persona_memory_file();
         wrapped =
             Box::pin(runtime_ctx::PERSONA_MEMORY_PATH.scope(persona_memory_path.clone(), wrapped));
         wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
-        if !inherit.memory {
-            let mem_path =
-                runtime_ctx::make_subagent_memory_path(&parent_history_for_scopes, &scope_task_id);
+        if let Some(mem_path) = scoped_memory_path {
             // sub-agent 默认私有 memory：finalize 后把白名单条目
             // (is_permanent_memory) 合并回主 memory 文件，让 long-term
             // assets 能跨 task 共享，但普通 task_event 留在私有文件，
             // 不污染主记忆。
-            let main_path = persona_memory_path;
-            let private_for_merge = mem_path.clone();
             wrapped = Box::pin(runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped));
-            // 这里包一层 outer future：sub-agent run 完成后 merge。
-            // merge_subagent_whitelist 内部用 for_tests_with_path
-            // 直接绑定 main_path，绕过 SUBAGENT_MEMORY_PATH override，
-            // 避免白名单条目又被写回私有文件（=死循环）。
-            let inner = wrapped;
-            wrapped = Box::pin(async move {
-                inner.await;
-                let _ = crate::ai::tools::service::memory::merge_subagent_whitelist(
-                    &private_for_merge,
-                    &main_path,
-                );
-            });
         }
-        if !inherit.cwd {
-            let scratch_base = parent_history_for_scopes
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."));
-            if let Some(scratch) = runtime_ctx::make_subagent_cwd(&scratch_base, &scope_task_id) {
-                wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
-            }
+        if let Some(scratch) = scoped_cwd_dir {
+            wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
         }
         // 设置子代理嵌套深度，供 `task_spawn` / `task` 在子代理内部
         // 检测递归扇出时使用。
@@ -626,8 +775,15 @@ pub(super) fn dispatch_background_batch(
         // 任务结束（正常 / 错误 / panic）时 Drop 自动 dec，避免输入框被永久门控。
         let inflight_guard = BgSubagentGuard::new();
         let guarded_fut = async move {
-            let _guard = inflight_guard;
-            wrapped.await
+            let _inflight_guard = inflight_guard;
+            let mut history_guard = history_guard;
+            wrapped.await;
+            if memory_merge_failed.load(Ordering::Acquire) {
+                history_guard.preserve_memory();
+            }
+            if preserve_scoped_artifacts.load(Ordering::Acquire) {
+                history_guard.preserve();
+            }
         };
         let handle = tokio::spawn(runtime_ctx::DRIVER_CTX.scope(task_driver_ctx, guarded_fut));
         crate::ai::tools::task_tools::set_task_abort_handle(&scope_task_id, handle.abort_handle());

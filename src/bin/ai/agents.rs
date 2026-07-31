@@ -14,6 +14,7 @@
 //
 // Builtin agents:
 //   - build: Default unified development agent (planning, code-writing, execution, prompt engineering, exploration)
+//   - audit: Evidence-driven code, configuration, prompt, and behavior reviewer
 // =============================================================================
 
 use rust_tools::cw::SkipMap;
@@ -25,8 +26,10 @@ use std::time::SystemTime;
 
 use crate::commonw::{configw, utils::expanduser};
 
-const BUILTIN_AGENTS: &[(&str, &str)] =
-    &[("build.agent", include_str!("builtin_agents/build.agent"))];
+const BUILTIN_AGENTS: &[(&str, &str)] = &[
+    ("build.agent", include_str!("builtin_agents/build.agent")),
+    ("audit.agent", include_str!("builtin_agents/audit.agent")),
+];
 const PROJECT_INSTRUCTION_FILENAMES: &[&str] = &[
     "AGENTS.md",
     "Agent.md",

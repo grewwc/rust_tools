@@ -52,11 +52,31 @@ const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct SyncSubagentHistoryGuard {
     path: PathBuf,
+    memory_path: Option<PathBuf>,
+    cwd_dir: Option<PathBuf>,
 }
 
 impl SyncSubagentHistoryGuard {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            memory_path: None,
+            cwd_dir: None,
+        }
+    }
+
+    fn with_scoped_artifacts(
+        mut self,
+        memory_path: Option<PathBuf>,
+        cwd_dir: Option<PathBuf>,
+    ) -> Self {
+        self.memory_path = memory_path;
+        self.cwd_dir = cwd_dir;
+        self
+    }
+
+    fn preserve_memory(&mut self) {
+        self.memory_path = None;
     }
 }
 
@@ -66,6 +86,23 @@ impl Drop for SyncSubagentHistoryGuard {
             eprintln!(
                 "[Warning] failed to clean up sync subagent history {}: {error}",
                 self.path.display()
+            );
+        }
+        if let Some(memory_path) = self.memory_path.take()
+            && let Err(error) = history::delete_subagent_memory(&memory_path)
+        {
+            eprintln!(
+                "[Warning] failed to clean up sync subagent memory {}: {error}",
+                memory_path.display()
+            );
+        }
+        if let Some(cwd_dir) = self.cwd_dir.take()
+            && let Err(error) = std::fs::remove_dir_all(&cwd_dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "[Warning] failed to clean up sync subagent cwd {}: {error}",
+                cwd_dir.display()
             );
         }
     }
@@ -114,6 +151,12 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
 
     let parent_history_path = ctx.app_proto.session_history_file.clone();
     let task_id = uuid::Uuid::new_v4().simple().to_string();
+    let private_memory_path = (!prepared.inherit.memory)
+        .then(|| runtime_ctx::make_subagent_memory_path(&parent_history_path, &task_id));
+    let scratch_base = parent_history_path
+        .parent()
+        .map(|path| path.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let parent_history = task_app.session_history_file.clone();
     let child_history = subagent_history_path(&parent_history, &task_id);
@@ -124,7 +167,13 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
         true,
     )
     .map_err(|err| format!("准备同步子代理历史失败：{err}"))?;
-    let _history_cleanup = SyncSubagentHistoryGuard::new(child_history.clone());
+    let private_cwd_dir = if prepared.inherit.cwd {
+        None
+    } else {
+        runtime_ctx::make_subagent_cwd(&scratch_base, &task_id)
+    };
+    let history_cleanup = SyncSubagentHistoryGuard::new(child_history.clone())
+        .with_scoped_artifacts(private_memory_path.clone(), private_cwd_dir.clone());
     // 无论是否继承，子代理都只写自己的历史文件，绝不能写回父 canonical history。
     task_app.session_history_file = child_history;
 
@@ -196,8 +245,6 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     let phase_slot: runtime_ctx::SubagentPhaseSlot = Arc::new(std::sync::Mutex::new(String::new()));
     let phase_slot_for_scope = phase_slot.clone();
 
-    let inherit = prepared.inherit;
-
     let inner_fut = async move {
         let mut subagent_app = subagent_app;
         crate::ai::tools::registry::common::clear_tool_cancel();
@@ -235,35 +282,42 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
     wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(child_depth, wrapped));
 
-    if !inherit.memory {
-        let mem_path = runtime_ctx::make_subagent_memory_path(&parent_history_path, &task_id);
+    let mut memory_merge = None;
+    if let Some(mem_path) = private_memory_path {
         // sub-agent 默认私有 memory：merge 白名单条目回主文件
         let main_path = persona_memory_path;
         let private_for_merge = mem_path.clone();
         wrapped = Box::pin(runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped));
-        let inner = wrapped;
-        wrapped = Box::pin(async move {
-            inner.await;
-            let _ = crate::ai::tools::service::memory::merge_subagent_whitelist(
-                &private_for_merge,
-                &main_path,
-            );
-        });
+        memory_merge = Some((private_for_merge, main_path));
     }
 
-    if !inherit.cwd {
-        let scratch_base = parent_history_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        if let Some(scratch) = runtime_ctx::make_subagent_cwd(&scratch_base, &task_id) {
-            wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
-        }
+    if let Some(scratch) = private_cwd_dir {
+        wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
     }
 
     wrapped = suppress_subagent_terminal_output(wrapped);
 
-    let subagent_handle = tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, wrapped));
+    let memory_merge_error = Arc::new(std::sync::Mutex::new(None));
+    let memory_merge_error_for_task = memory_merge_error.clone();
+    let guarded = async move {
+        let mut history_cleanup = history_cleanup;
+        wrapped.await;
+        if let Some((private_memory, main_memory)) = memory_merge {
+            match crate::ai::tools::service::memory::merge_subagent_whitelist(
+                &private_memory,
+                &main_memory,
+            ) {
+                Ok(_) => {}
+                Err(error) => {
+                    history_cleanup.preserve_memory();
+                    *memory_merge_error_for_task
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = Some(error);
+                }
+            }
+        }
+    };
+    let subagent_handle = tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, guarded));
 
     // 把子 agent 的私有 cancel 标志登记到前台子 agent 注册表：Ctrl+C 时
     // SIGINT 处理器会优先定向取消栈顶子 agent（翻这个标志），而不是关掉主 agent。
@@ -289,6 +343,7 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
         ))
     });
     if join_result.is_err() {
+        subagent_cancel.store(true, Ordering::Release);
         subagent_handle.abort();
     }
     // `abort` 只发出取消请求；必须等任务真正退出后才能删除仍可能被它写入的 DB。
@@ -303,24 +358,44 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
         .ok()
         .and_then(|guard| guard.clone())
         .unwrap_or_default();
+    let memory_merge_error = memory_merge_error
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
 
-    let (status, error) = match join_result {
-        Ok(Ok(())) => ("COMPLETED", None),
-        Ok(Err(err)) => ("FAILED", Some(err)),
-        Err(err) => (subagent_wait_error_status(&err), Some(err)),
+    let (status, error) = match (join_result, memory_merge_error) {
+        (Ok(Ok(())), Some(error)) => ("FAILED", Some(error)),
+        (Ok(Ok(())), None) => ("COMPLETED", None),
+        (Ok(Err(err)), _) => ("FAILED", Some(err)),
+        (Err(err), _) => (subagent_wait_error_status(&err), Some(err)),
     };
+    let rendered = format_subagent_output(
+        status,
+        &log_description,
+        &log_agent_name,
+        &log_model,
+        elapsed_secs,
+        &log_selection_explanation,
+        &captured_output,
+        error.as_deref(),
+    );
+    let content = format!("[task_id={task_id}]\n{rendered}");
+    history::record_delivered_task_evidence(
+        ctx.app_proto.config.history_file.as_path(),
+        &ctx.app_proto.session_id,
+        history::DeliveredTaskEvidence {
+            task_id: &task_id,
+            description: &log_description,
+            agent_name: &log_agent_name,
+            model: &log_model,
+            status: &status.to_ascii_lowercase(),
+            payload: &content,
+        },
+    )
+    .map_err(|error| format!("failed to persist synchronous task evidence: {error}"))?;
     Ok(ToolResult {
         tool_call_id: tool_call_id.to_string(),
-        content: format_subagent_output(
-            status,
-            &log_description,
-            &log_agent_name,
-            &log_model,
-            elapsed_secs,
-            &log_selection_explanation,
-            &captured_output,
-            error.as_deref(),
-        ),
+        content,
     })
 }
 
@@ -692,13 +767,79 @@ mod tests {
             child_path.file_name().unwrap().to_string_lossy()
         ));
         std::fs::write(&lock_path, b"").unwrap();
+        let memory_path = root.join("agent_memory.subagent-child.jsonl");
+        let memory_db_path = root.join("agent_memory.subagent-child.db");
+        std::fs::write(&memory_path, b"[]").unwrap();
+        std::fs::write(&memory_db_path, b"db").unwrap();
+        std::fs::write(format!("{}-wal", memory_db_path.display()), b"wal").unwrap();
+        let cwd_path = root.join("subagent-cwd-child");
+        std::fs::create_dir_all(cwd_path.join("nested")).unwrap();
+        std::fs::write(cwd_path.join("scratch.txt"), b"scratch").unwrap();
 
-        drop(SyncSubagentHistoryGuard::new(child_path.clone()));
+        drop(
+            SyncSubagentHistoryGuard::new(child_path.clone())
+                .with_scoped_artifacts(Some(memory_path.clone()), Some(cwd_path.clone())),
+        );
 
         assert!(!child_path.exists());
         assert!(!std::path::Path::new(&format!("{}-wal", child_path.display())).exists());
         assert!(!std::path::Path::new(&format!("{}-shm", child_path.display())).exists());
         assert!(!lock_path.exists());
+        assert!(!memory_path.exists());
+        assert!(!memory_db_path.exists());
+        assert!(!std::path::Path::new(&format!("{}-wal", memory_db_path.display())).exists());
+        assert!(!cwd_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_subagent_memory_is_merged_before_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-sync-memory-merge-order-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let child_path = root.join("session.subagent-child.sqlite");
+        let private_memory = root.join("agent_memory.subagent-child.jsonl");
+        let main_memory = root.join("agent_memory.jsonl");
+        std::fs::write(&child_path, b"db").unwrap();
+        std::fs::write(
+            &private_memory,
+            serde_json::json!({
+                "id": "mem-sync-merge",
+                "timestamp": "2026-07-31T00:00:00Z",
+                "category": "project_memory",
+                "note": "durable synchronous conclusion",
+                "tags": [],
+                "source": "test",
+                "priority": 180,
+                "owner_pid": 42,
+                "owner_pgid": 42,
+                "image_path": null
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let guard = SyncSubagentHistoryGuard::new(child_path)
+            .with_scoped_artifacts(Some(private_memory.clone()), None);
+
+        assert_eq!(
+            crate::ai::tools::service::memory::merge_subagent_whitelist(
+                &private_memory,
+                &main_memory
+            )
+            .unwrap(),
+            1
+        );
+        drop(guard);
+
+        assert!(!private_memory.exists());
+        assert!(
+            std::fs::read_to_string(&main_memory)
+                .unwrap()
+                .contains("durable synchronous conclusion")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

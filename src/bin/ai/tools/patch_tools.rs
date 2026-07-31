@@ -16,11 +16,11 @@ fn params_apply_patch() -> Value {
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "Absolute target path for a single-file unified diff. Optional when the patch carries a git-style header (`--- a/<path>` / `+++ b/<path>` / `diff --git`), since the path is read from the header. Not needed (and ignored) when using a Begin Patch envelope, since each section declares its own target path. `path` is accepted as a compatibility alias."
+                "description": "Absolute target path for a single-file unified diff. Optional when the patch carries a git-style header or a `*** Update File:` envelope (the path is read from the patch). Ignored for `*** Begin Patch` envelopes, since each section declares its own path. `path` is accepted as an alias."
             },
             "patch": {
                 "type": "string",
-                "description": "Patch text in exactly one format. (1) One-file unified diff: `@@` hunks whose lines start with space (context), `-` (remove), or `+` (add). Pass `file_path`, or include one consistent git header (`--- a/<path>` plus `+++ b/<path>`, optionally `diff --git`). Unified diffs must target one file and cannot delete it. (2) `*** Begin Patch` envelope: use `*** Update File:`, `*** Add File:`, `*** Delete File:`, or `*** Replace in line:` sections; use this format for multiple files and file deletion. For several edits to one file, prefer one section with multiple hunks made from the same fresh read; repeat the same target only when sections intentionally depend on earlier sections. Copy exact file text without read/search line-number prefixes, include enough unchanged context to identify one location, and include context on both sides of pure additions when possible. Do not mix formats, wrap the patch in Markdown fences, or send a zero-change patch."
+                "description": "The edit to apply. Prefer the smallest format that fits:\n\n(A) RECOMMENDED for a small in-line change — replace a substring on one uniquely identifiable line. Lowest failure rate: no line numbers, no indentation to reproduce.\n```\n*** Begin Patch\n*** Replace in line: <absolute/path>\nanchor: <substring that uniquely identifies the target line>\nold: <exact substring on that line to replace>\nnew: <replacement substring>\n*** End Patch\n```\n\n(B) For adding/removing whole lines or larger edits — a `*** Begin Patch` envelope with `@@` hunks. This is also the ONLY format for multiple files, new files, and deletions:\n```\n*** Begin Patch\n*** Update File: <absolute/path>\n@@\n <unchanged context line>\n-<line to remove>\n+<line to add>\n <unchanged context line>\n*** End Patch\n```\nUse `*** Add File: <path>` (body is `+`-prefixed new lines) and `*** Delete File: <path>` (no body) for creation/deletion. Repeat section headers for multiple files.\n\n(C) A plain one-file unified diff is also accepted: pass `file_path`, or include a git header (`--- a/<path>` / `+++ b/<path>`). Cannot delete files.\n\nCopying rules (avoid the most common errors): copy file text EXACTLY, but WITHOUT read_file's `<number>\\t` line-number prefix — copy only the code after the TAB. Context/removed lines must match the current file character-for-character (indentation included). Do not wrap the patch in Markdown fences, mix formats, or send a zero-change patch. On a context-mismatch or ambiguous-match error, use the current file text echoed back in the error to rebuild the patch — you usually do not need to re-read the whole file."
             },
             "dry_run": {
                 "type": "boolean",
@@ -34,7 +34,7 @@ fn params_apply_patch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply precise localized edits without rewriting whole files. Use a one-file unified diff with `file_path` (or one consistent git header), or a `*** Begin Patch` envelope for multi-file edits, adds, and deletes. Batch related same-file edits into one section with multiple hunks. All sections are validated before writing and rechecked before commit; failures are rolled back when possible. Use `dry_run` for validation. After a context mismatch or ambiguous match, re-read the target and rebuild the patch from current exact text instead of retrying stale context.",
+        description: "Apply precise localized edits without rewriting whole files. For a small in-line change, prefer a `*** Replace in line:` section (anchor + old/new substring) — it needs no line numbers or indentation and rarely fails. For adding/removing lines or larger/multi-file edits, adds, and deletes, use a `*** Begin Patch` envelope with `@@` hunks; a plain one-file unified diff (with `file_path` or a git header) is also accepted. All sections are validated before writing and rechecked before commit; failures are rolled back when possible. Use `dry_run` for validation. On a context-mismatch or ambiguous-match error, rebuild the patch from the current file text echoed back in the error message.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -1379,6 +1379,28 @@ fn describe_aligned_block_first_mismatch(
     None
 }
 
+/// 渲染一段「可直接粘贴」的当前文件文本块（0-based `start`，含 `count` 行）。
+///
+/// 与错误信息里其它诊断（带 `<行号>:` 前缀、便于人眼定位）不同，这个块**不带任何
+/// 行号前缀**，专门给模型照抄进新 patch 的 context/removed 行——从根源上消除「把
+/// read_file 的 `<number>\t` 行号栏一起抄进 patch」这一高频错误。用 `<<<PATCH_TEXT`
+/// / `PATCH_TEXT>>>` 明确圈定可复制边界。
+fn render_pasteable_current_block(orig_lines: &[String], start: usize, count: usize) -> String {
+    let end = start.saturating_add(count).min(orig_lines.len());
+    if start >= end {
+        return String::new();
+    }
+    let mut out = String::from(
+        "Current file text at this location (copy verbatim, no line-number prefix):\n<<<PATCH_TEXT\n",
+    );
+    for line in &orig_lines[start..end] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("PATCH_TEXT>>>\n");
+    out
+}
+
 /// 构造带上下文的 "context mismatch" 错误：列出 patch 期望匹配的行，以及原文件
 /// 在标称位置附近的实际行，帮助模型快速自我修正，而不是只看到一句 "context mismatch"。
 fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> String {
@@ -1386,7 +1408,7 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
     let nominal = hunk.old_start.saturating_sub(1);
 
     let mut msg = String::from(
-        "context mismatch: required recovery: read_file the same target before retrying apply_patch. patch hunk could not be located.\n",
+        "context mismatch: patch hunk could not be located. Rebuild the patch from the current file text shown below (re-read the file only if the shown context is not enough).\n",
     );
     msg.push_str(&format!(
         "Hunk header declared @@ -{} (1-based line {}).\n",
@@ -1431,6 +1453,16 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
                 ));
             }
         }
+        // 可直接粘贴的当前文本块：覆盖 best 匹配区间（含少量前后余量），
+        // 让模型无需重读整文件即可就地重建 patch。
+        let block = render_pasteable_current_block(
+            orig_lines,
+            best.pos,
+            best.total.max(expected.len()),
+        );
+        if !block.is_empty() {
+            msg.push_str(&block);
+        }
     } else {
         // 文件中找不到任何部分匹配——块完全不存在。回显期望行和标称位置附近实际内容。
         msg.push_str("Patch expected these lines (context/removed):\n");
@@ -1453,6 +1485,11 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
             for (offset, line) in orig_lines[win_start..win_end].iter().enumerate() {
                 msg.push_str(&format!("  {:>6}: {}\n", win_start + offset + 1, line));
             }
+            // 同样附一份无行号前缀、可直接粘贴的块。
+            let block = render_pasteable_current_block(orig_lines, win_start, win_end - win_start);
+            if !block.is_empty() {
+                msg.push_str(&block);
+            }
         } else {
             msg.push_str(&format!(
                 "File has {} line(s); declared position is out of range.\n",
@@ -1466,7 +1503,7 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
     }
 
     msg.push_str(
-	        "Hint: re-read the file with read_file to get exact current content, then rebuild the patch from the raw file text only. read_file prints each line as a right-aligned line number followed by a TAB (e.g. `    42\\t<code>`); copy only the code after the TAB. Do not copy the leading line number + tab or any truncation notice into the patch.",
+        "Hint: rebuild the patch from the copy-verbatim block above (the text between <<<PATCH_TEXT and PATCH_TEXT>>>), which is the exact current file content with NO line-number prefix. For a small change, a `*** Replace in line:` section (anchor/old/new) is the most reliable. If the shown context is insufficient, re-read the file with read_file and copy only the code after each `<number>\\t` prefix.",
     );
     msg
 }

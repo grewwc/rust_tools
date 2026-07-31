@@ -6,3 +6,8 @@ Cargo.lock
 .DS_Store
 .cargo
 .trae
+*-history.json
+# 后台模式 (-bg) daemonize 产物：{session_id}.log / {session_id}.pid（见 background.rs），
+# 内含完整会话转录，属敏感/临时文件，严禁提交。
+*.log
+*.pid

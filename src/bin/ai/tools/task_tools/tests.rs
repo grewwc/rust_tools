@@ -4,11 +4,12 @@ use super::{
     StoredTaskResult, TASK_REGISTRY, WaitManySource, append_current_process_cancel_source,
     build_outstanding_task_anchor, build_selection_explanation, capped_subagent_manifest,
     discard_tasks_for_session, encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels,
-    execute_task_cancel, execute_task_spawn, execute_task_status, execute_task_wait,
-    expire_task_wait_states_for_test, format_task_result, insert_task_entry_for_test,
-    is_encoded_task_goal, prepare_subagent_task, reap_timed_out_subagents, remove_task_entry,
+    execute_task_cancel, execute_task_integrate, execute_task_spawn, execute_task_status,
+    execute_task_wait, expire_task_wait_states_for_test, format_task_result,
+    insert_task_entry_for_test, is_encoded_task_goal, parse_task_wait_options,
+    prepare_subagent_task, reap_timed_out_subagents, remove_task_entry,
     render_outstanding_task_anchor, select_subagent, wait_sources_for_channel_and_futex,
-    wake_expired_task_waits, with_task_entry_by_pid,
+    wake_expired_task_waits, with_task_entry_by_pid, wrap_subagent_prompt,
 };
 use super::{ToolRegistration, ToolSpec};
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
@@ -46,6 +47,30 @@ fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
         color: None,
         source_path: None,
     }
+}
+
+#[test]
+fn task_wait_defaults_are_short_and_resume_on_first_result() {
+    let (timeout_secs, wait_policy) = parse_task_wait_options(&serde_json::json!({})).unwrap();
+    let (clamped_timeout_secs, _) =
+        parse_task_wait_options(&serde_json::json!({ "timeout_secs": 900 })).unwrap();
+
+    assert_eq!(timeout_secs, 30);
+    assert_eq!(wait_policy, WaitPolicy::Any);
+    assert_eq!(clamped_timeout_secs, 60);
+}
+
+#[test]
+fn subagent_prompt_preserves_the_evidence_bar() {
+    let prompt = wrap_subagent_prompt("review change", "inspect the diff");
+
+    assert!(prompt.contains("Reuse observed evidence"));
+    assert!(prompt.contains("prefer one targeted broad call"));
+    assert!(prompt.contains("Ground factual claims in observed evidence"));
+    assert!(prompt.contains("check likely counter-evidence"));
+    assert!(prompt.contains("return a concise partial result"));
+    assert!(prompt.contains("unresolved hypotheses, missing evidence"));
+    assert!(!prompt.contains("Do not wait for perfect certainty"));
 }
 
 fn test_app_with_model(current_model: String) -> App {
@@ -189,6 +214,57 @@ fn prepare_subagent_task_auto_selects_model_and_fallback() {
             .prompt
             .contains("Parent task prompt:\nFind where task spawning is implemented.")
     );
+}
+
+#[test]
+fn task_integrate_closes_durable_evidence() {
+    let root =
+        std::env::temp_dir().join(format!("task-integrate-{}", uuid::Uuid::new_v4().simple()));
+    let history_file = root.join("history.sqlite");
+    let session_id = format!("task-integrate-{}", uuid::Uuid::new_v4().simple());
+    crate::ai::history::record_delivered_task_evidence(
+        &history_file,
+        &session_id,
+        crate::ai::history::DeliveredTaskEvidence {
+            task_id: "task-1",
+            description: "review parser",
+            agent_name: "build",
+            model: "test-model",
+            status: "completed",
+            payload: "[Subagent final answer]\nconfirmed",
+        },
+    )
+    .unwrap();
+    let mut app = test_app_with_model(String::new());
+    app.config.history_file = history_file.clone();
+    app.session_id = session_id.clone();
+    let context = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    let result = DRIVER_CTX.sync_scope(context, || {
+        execute_task_integrate(&serde_json::json!({
+            "tasks": [{
+                "task_id": "task-1",
+                "disposition": "accepted",
+                "summary": "used confirmed conclusion"
+            }]
+        }))
+    });
+    assert!(result.unwrap().contains("task-1"));
+    assert!(
+        crate::ai::history::render_unintegrated_task_evidence(&history_file, &session_id)
+            .unwrap()
+            .is_none()
+    );
+
+    let sessions_root = crate::ai::history::SessionStore::new(&history_file)
+        .sessions_root()
+        .to_path_buf();
+    let _ = std::fs::remove_dir_all(sessions_root);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -506,6 +582,7 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
         selection_explanation: "model_reason=auto-selected".to_string(),
         inherit: InheritOptions::default(),
         abort_handle: None,
+        cancel_stream: Arc::new(AtomicBool::new(false)),
         started_at: Instant::now(),
     };
     let result = StoredTaskResult {
@@ -538,6 +615,16 @@ fn subagent_depth_rejects_task_orchestration_execution() {
                 execute_task_wait(&serde_json::json!({ "task_ids": ["task_parent"] })),
             ),
             ("task_status", execute_task_status(&serde_json::json!({}))),
+            (
+                "task_integrate",
+                execute_task_integrate(&serde_json::json!({
+                    "tasks": [{
+                        "task_id": "task_parent",
+                        "disposition": "accepted",
+                        "summary": "nested"
+                    }]
+                })),
+            ),
             (
                 "task_cancel",
                 execute_task_cancel(&serde_json::json!({ "task_ids": ["task_parent"] })),
@@ -589,6 +676,7 @@ fn task_wait_rejects_foreign_session_task_ids() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
     );
@@ -609,6 +697,7 @@ fn task_wait_rejects_foreign_session_task_ids() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
     );
@@ -629,6 +718,77 @@ fn task_wait_rejects_foreign_session_task_ids() {
     if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         *guard = None;
     }
+}
+
+#[test]
+fn task_wait_distinguishes_delivered_and_unknown_registry_misses() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = std::env::temp_dir().join(format!(
+        "task-wait-tombstone-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    app.config.history_file = root.join("history.sqlite");
+    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    {
+        let mut os = app.os.lock().unwrap();
+        os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+    }
+    let delivered_task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let unknown_task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    crate::ai::history::record_delivered_task_evidence(
+        app.config.history_file.as_path(),
+        &app.session_id,
+        crate::ai::history::DeliveredTaskEvidence {
+            task_id: &delivered_task_id,
+            description: "already delivered",
+            agent_name: "explore",
+            model: "qwen3.7-max",
+            status: "completed",
+            payload: "delivered result",
+        },
+    )
+    .unwrap();
+    let context = DriverContext::new(
+        app.clone(),
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+
+    let (delivered, unknown) = crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+        (app.session_id.clone(), 0usize),
+        || {
+            DRIVER_CTX.sync_scope(context, || {
+                (
+                    execute_task_wait(
+                        &serde_json::json!({ "task_ids": [delivered_task_id.clone()] }),
+                    ),
+                    execute_task_wait(
+                        &serde_json::json!({ "task_ids": [unknown_task_id.clone()] }),
+                    ),
+                )
+            })
+        },
+    );
+
+    assert!(delivered.unwrap().contains("results were delivered"));
+    let unknown = unknown.expect_err("unknown task id must not be reported as delivered");
+    assert!(unknown.contains("Unknown task_id"));
+    assert!(unknown.contains(&unknown_task_id));
+    assert!(!unknown.contains("results were delivered"));
+
+    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        *guard = None;
+    }
+    let sessions_root = crate::ai::history::SessionStore::new(&app.config.history_file)
+        .sessions_root()
+        .to_path_buf();
+    let _ = std::fs::remove_dir_all(sessions_root);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -730,6 +890,7 @@ fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() 
                 selection_explanation: "explicit override".to_string(),
                 inherit: InheritOptions::default(),
                 abort_handle: None,
+                cancel_stream: Arc::new(AtomicBool::new(false)),
                 started_at: Instant::now(),
             },
         );
@@ -813,6 +974,7 @@ fn task_cancel_refuses_same_session_foreign_owner_task() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
     );
@@ -882,6 +1044,7 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
     );
@@ -946,6 +1109,11 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    let root = std::env::temp_dir().join(format!(
+        "task-status-ledger-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    app.config.history_file = root.join("history.sqlite");
     crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
@@ -985,13 +1153,20 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
     );
 
+    let context = DriverContext::new(
+        app.clone(),
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
     let output = crate::ai::driver::runtime_ctx::TURN_IDENTITY
         .sync_scope((app.session_id.clone(), 0usize), || {
-            execute_task_status(&serde_json::json!({}))
+            DRIVER_CTX.sync_scope(context, || execute_task_status(&serde_json::json!({})))
         })
         .expect("task_status should succeed");
 
@@ -1003,10 +1178,24 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
     let os = app.os.lock().unwrap();
     assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
     assert!(os.futex_event_id(completion_futex_addr).is_none());
+    drop(os);
+    let ledger = crate::ai::history::render_unintegrated_task_evidence(
+        app.config.history_file.as_path(),
+        &app.session_id,
+    )
+    .unwrap()
+    .expect("collected task result must survive channel cleanup");
+    assert!(ledger.contains(&task_id));
+    assert!(ledger.contains("subagent final answer"));
 
     if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         *guard = None;
     }
+    let sessions_root = crate::ai::history::SessionStore::new(&app.config.history_file)
+        .sessions_root()
+        .to_path_buf();
+    let _ = std::fs::remove_dir_all(sessions_root);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1092,6 +1281,7 @@ fn task_wait_any_returns_ready_result_without_waiting_for_pending_task() {
                 selection_explanation: "explicit override".to_string(),
                 inherit: InheritOptions::default(),
                 abort_handle: None,
+                cancel_stream: Arc::new(AtomicBool::new(false)),
                 started_at: Instant::now(),
             },
         );
@@ -1176,6 +1366,7 @@ fn task_status_cleans_up_terminated_task_without_result() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
     );
@@ -1191,6 +1382,7 @@ fn task_status_cleans_up_terminated_task_without_result() {
     let os = app.os.lock().unwrap();
     assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
     assert!(os.futex_event_id(completion_futex_addr).is_none());
+    assert!(os.get_process(pid).is_none());
     drop(os);
 
     if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
@@ -1238,6 +1430,7 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
 
     let worker = tokio::spawn(std::future::pending::<()>());
     let abort_handle = worker.abort_handle();
+    let cancel_stream = Arc::new(AtomicBool::new(false));
     insert_task_entry_for_test(
         task_id.clone(),
         AsyncTaskEntry {
@@ -1255,6 +1448,7 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: Some(abort_handle),
+            cancel_stream: cancel_stream.clone(),
             started_at: Instant::now(),
         },
     );
@@ -1270,6 +1464,7 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
             .expect_err("task_cancel must stop the Tokio worker")
             .is_cancelled()
     );
+    assert!(cancel_stream.load(std::sync::atomic::Ordering::Acquire));
     assert!(cancel_output.contains("Required next step: collect these terminal results"));
     assert!(
         crate::ai::tools::task_tools::with_task_entry(&task_id, |_| ()).is_some(),
@@ -1289,6 +1484,7 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
     let os = app.os.lock().unwrap();
     assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
     assert!(os.futex_event_id(completion_futex_addr).is_none());
+    assert!(os.get_process(pid).is_none());
 
     if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         *guard = None;
@@ -1351,6 +1547,7 @@ async fn discarding_session_tasks_aborts_workers_and_releases_results() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: Some(worker.abort_handle()),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
     );
@@ -1367,6 +1564,7 @@ async fn discarding_session_tasks_aborts_workers_and_releases_results() {
     let os = app.os.lock().unwrap();
     assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
     assert!(os.futex_event_id(completion_futex_addr).is_none());
+    assert!(os.get_process(pid).is_none());
     drop(os);
 
     if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
@@ -1431,6 +1629,7 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: Some(abort_handle),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now() - SUBAGENT_WALL_CLOCK_TIMEOUT - Duration::from_secs(1),
         },
     );
@@ -1455,7 +1654,95 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
     let os = app.os.lock().unwrap();
     assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
     assert!(os.futex_event_id(completion_futex_addr).is_none());
+    assert!(os.get_process(pid).is_none());
 
+    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        *guard = None;
+    }
+}
+
+#[tokio::test]
+async fn task_wait_wall_clock_timeout_aborts_worker_before_publishing_result() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (root, pid, result_channel_id, completion_futex_addr) = {
+        let mut os = app.os.lock().unwrap();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        let pid = os
+            .spawn(
+                Some(root),
+                "child".to_string(),
+                "goal".to_string(),
+                20,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        let channel = os.channel_create_tagged_with_holders(
+            Some(root),
+            1,
+            "task-result".to_string(),
+            aios_kernel::primitives::ChannelOwnerTag::TaskResult,
+            vec![
+                "task_result.producer".to_string(),
+                "task_result.consumer".to_string(),
+            ],
+        );
+        let completion_futex = os.futex_create(0, "task-complete".to_string());
+        (root, pid, channel.raw(), completion_futex)
+    };
+
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let cancel_stream = Arc::new(AtomicBool::new(false));
+    insert_task_entry_for_test(
+        task_id.clone(),
+        AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            result_observed: false,
+            owner_pid: root,
+            pid,
+            result_channel_id,
+            completion_futex_addr,
+            description: "timeout in task_wait".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            abort_handle: Some(worker.abort_handle()),
+            cancel_stream: cancel_stream.clone(),
+            started_at: Instant::now() - SUBAGENT_WALL_CLOCK_TIMEOUT - Duration::from_secs(1),
+        },
+    );
+
+    let wait_output = crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .sync_scope((app.session_id.clone(), 0usize), || {
+            execute_task_wait(&serde_json::json!({ "task_ids": [task_id.clone()] }))
+        })
+        .expect("task_wait should collect its timeout result");
+
+    assert!(
+        worker
+            .await
+            .expect_err("task_wait wall-clock timeout must stop the Tokio worker")
+            .is_cancelled()
+    );
+    assert!(cancel_stream.load(std::sync::atomic::Ordering::Acquire));
+    assert!(wait_output.contains("TIMEOUT"));
+    assert!(remove_task_entry(&task_id).is_none());
+
+    let os = app.os.lock().unwrap();
+    assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
+    assert!(os.futex_event_id(completion_futex_addr).is_none());
+    drop(os);
     if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         *guard = None;
     }
@@ -1463,7 +1750,7 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
 
 #[test]
 fn subagent_result_tools_are_never_lossy_or_pruned() {
-    for name in ["task", "task_wait", "task_status"] {
+    for name in ["task", "task_wait", "task_status", "task_integrate"] {
         let policy = tool_history_policy(name);
         assert!(
             !policy.allows_lossy_compress(),
@@ -1519,6 +1806,7 @@ fn task_entry_can_be_looked_up_by_pid() {
                 selection_explanation: "explicit override".to_string(),
                 inherit: InheritOptions::default(),
                 abort_handle: None,
+                cancel_stream: Arc::new(AtomicBool::new(false)),
                 started_at: Instant::now(),
             },
         );

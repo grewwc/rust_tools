@@ -1726,7 +1726,8 @@ fn inject_iteration_soft_limit_note(
         "[iteration-soft-limit] 你已经在本轮内迭代 {iteration} 次工具调用，明显偏多。\n\
         请先停下来复盘：(a) 总结目前已确认的事实与还差什么；(b) 明确下一步唯一动作；\n\
         (c) 优先用批量/大范围读取与精准检索收敛，避免继续碎片化地翻页或反复搜索；\n\
-        (d) 若已经足够回答，就直接给出结论。"
+        (d) soft limit 不改变委派标准：不要因上下文或迭代压力转交当前分支，只委派原本就独立、有界且值得委派的子任务；\n\
+        (e) 若已经足够回答，就直接给出结论。"
     );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -3429,9 +3430,57 @@ async fn run_turn_body(
     let saved_max_tokens_override = app.cli.max_tokens_override;
     // 当前是否处于零输出降级状态。
     let mut mt_downgraded = false;
+    // VL 图片摘要（429 TPM 缓解）状态：pending_digest_source 保存上一轮 tool-call
+    // 响应的未截断原文（含 reasoning），作为“搭车”解析摘要的来源；
+    // image_digest_resolved 一旦置位，表示图片已被摘要替换、或两条路径都拿不到
+    // 摘要而按用户决定保留原图——两种情况都不再每轮重试，避免反复发兜底请求。
+    let mut pending_digest_source: Option<String> = None;
+    let mut image_digest_resolved = false;
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         let effective_max_iterations = supervisor.effective_max_iterations(max_iterations);
+        // 从第二轮起，把请求投影里用户消息内联的图片换成上一轮产出的文字摘要，
+        // 避免在工具循环里反复重放 base64 触发 Doubao/Ark 侧 429 TPM 限流。
+        // 优先搭车解析上一轮响应；拿不到再发一次禁用工具的一次性 VL 请求兜底；
+        // 两者都失败则保留原图。只改请求投影 messages，canonical turn_messages 不动。
+        // 放在 mcp 锁块之前：兜底请求含 .await，绝不能跨 std::Mutex 持锁。
+        if !image_digest_resolved && iteration >= 2 {
+            // 只处理「当前 turn」的用户图片：用 rposition 取最后一条含图 user 消息。
+            // messages 头部可能载入历史里更早 turn 的图片（若未被压缩外溢），但我们
+            // 采集/生成的摘要只描述当前 turn 的图片（指令注入在当前 user 消息、兜底用
+            // app.attached_image_files=当前 turn），拿它去替换旧图会张冠李戴。旧 turn
+            // 图片本就由压缩的 spill 外溢到文件，当前 turn 图片才是被 spill 豁免、每轮
+            // 重放的那张，正是要换掉的目标。
+            if let Some(idx) = messages.iter().rposition(|m| {
+                m.role == "user" && crate::ai::request::content_has_image(&m.content)
+            }) {
+                let image_paths = app.attached_image_files.clone();
+                let digest = match pending_digest_source
+                    .as_deref()
+                    .and_then(crate::ai::request::parse_digest)
+                {
+                    Some(d) => Some(d),
+                    None => {
+                        crate::ai::request::describe_image_for_digest(
+                            app,
+                            &next_model,
+                            &image_paths,
+                        )
+                        .await
+                    }
+                };
+                if let Some(digest) = digest {
+                    crate::ai::request::swap_images_with_digest(
+                        &mut messages[idx].content,
+                        &digest,
+                        &image_paths,
+                    );
+                }
+                image_digest_resolved = true;
+            } else {
+                image_digest_resolved = true;
+            }
+        }
         {
             let mc = mcp_client.lock().unwrap();
             refresh_skill_turn_for_iteration(
@@ -3469,6 +3518,14 @@ async fn run_turn_body(
         };
         let was_final_response = matches!(&execution, IterationExecution::FinalResponse(_));
         let had_tool_call_execution = matches!(&execution, IterationExecution::ToolCall(_));
+        // 搭车采集：图片摘要尚未解决时，缓存本轮 tool-call 响应的未截断原文
+        // （assistant_text + reasoning_text）。下一轮循环开头据此尝试 parse 出摘要，
+        // 命中即可省掉一次兜底请求。必须用 stream_result 原文——写回 messages 的
+        // assistant narration 会被截断到 800 字符，可能截掉摘要尾部哨兵。
+        if !image_digest_resolved && let IterationExecution::ToolCall(tce) = &execution {
+            let sr = &tce.stream_result;
+            pending_digest_source = Some(format!("{}\n{}", sr.assistant_text, sr.reasoning_text));
+        }
         {
             let mc = mcp_client.lock().unwrap().routing_snapshot();
             // 用服务端返回的实际 prompt_tokens 校正后续请求的 max_tokens clamp。

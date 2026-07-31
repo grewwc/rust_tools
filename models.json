@@ -256,7 +256,7 @@
     "default_reasoning_effort": "high",
     "subagent_priority": 50,
     "max_output_tokens": 400000,
-    "request_tpm_limit": 300000
+    "request_tpm_limit": 500000
   },
   {
     "key": "gpt-5.5",
