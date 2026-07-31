@@ -2,6 +2,8 @@ use std::time::Duration;
 
 /// `/audit` 是用户显式发起的深度审计；允许比普通同步 `task` 更长的前台等待时间。
 pub(crate) const AUDIT_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// 给审计子代理预留收口时间，避免到硬超时时丢失已经收集到的结论。
+pub(crate) const AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(2 * 60);
 
 const SUBAGENT_FINAL_ANSWER_MARKER: &str = "[Subagent final answer]\n";
 
@@ -66,12 +68,21 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AUDIT_SUBAGENT_HARD_TIMEOUT, AuditCommand, parse_audit_command, terminal_audit_result,
+        AUDIT_SUBAGENT_HARD_TIMEOUT, AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME, AuditCommand,
+        parse_audit_command, terminal_audit_result,
     };
 
     #[test]
     fn audit_subagent_hard_timeout_is_fifteen_minutes() {
         assert_eq!(AUDIT_SUBAGENT_HARD_TIMEOUT, Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn audit_subagent_reserves_two_minutes_for_wrap_up() {
+        assert_eq!(
+            AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
+            Duration::from_secs(2 * 60)
+        );
     }
 
     #[test]

@@ -38,7 +38,10 @@
 // =============================================================================
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::ai::{
     agents::AgentManifest, mcp::SharedMcpClient, models::AutoModelFallbackSpec,
@@ -62,6 +65,10 @@ pub(crate) type SubagentResultSlot = Arc<Mutex<Option<String>>>;
 /// across the lock. The parent installs a fresh slot via
 /// `SUBAGENT_PHASE.scope(...)` before invoking `run_turn`.
 pub(crate) type SubagentPhaseSlot = Arc<std::sync::Mutex<String>>;
+
+/// 一次性收口信号：父等待循环在预留的收口时间到达时置位，子代理在下一轮
+/// 请求模型前消费它并切换到无工具的最终回答模式。
+pub(crate) type SubagentWrapUpSignal = Arc<AtomicBool>;
 
 /// Snapshot of the live runtime that a sub-agent dispatch needs.
 ///
@@ -117,6 +124,8 @@ tokio::task_local! {
     /// current execution phase here so the spawning `task` tool's heartbeat
     /// line can surface it. Absence means "no parent is showing a heartbeat".
     pub(crate) static SUBAGENT_PHASE: SubagentPhaseSlot;
+    /// 父同步等待即将到达硬超时时置位；子代理只消费一次，用于请求其立即收口。
+    pub(crate) static SUBAGENT_WRAP_UP_SIGNAL: SubagentWrapUpSignal;
     /// 后台 subagent 不拥有 terminal。其完整响应仍照常解析、持久化并通过 result
     /// slot 返回父 agent，但流式正文、thinking、工具状态等不得直接写 stdout/stderr，
     /// 否则多个并发任务会互相覆盖光标并打乱前台输出。
@@ -192,6 +201,14 @@ pub(crate) fn publish_subagent_phase(phase: &str) {
             *guard = phase.to_string();
         }
     }
+}
+
+/// 消费一次父代理发来的收口请求。未安装该 task-local 时说明当前 turn 没有
+/// 预超时收口策略，保持普通执行路径。
+pub(crate) fn take_subagent_wrap_up_request() -> bool {
+    SUBAGENT_WRAP_UP_SIGNAL
+        .try_with(|signal| signal.swap(false, Ordering::AcqRel))
+        .unwrap_or(false)
 }
 
 /// Try to read the current `DRIVER_CTX`. Returns `None` when called from a
@@ -305,6 +322,20 @@ pub(crate) fn make_subagent_memory_path(base_history: &Path, task_id: &str) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_wrap_up_request_is_consumed_once() {
+        let signal = Arc::new(AtomicBool::new(true));
+        let (first, second) = SUBAGENT_WRAP_UP_SIGNAL.sync_scope(signal, || {
+            (
+                take_subagent_wrap_up_request(),
+                take_subagent_wrap_up_request(),
+            )
+        });
+
+        assert!(first);
+        assert!(!second);
+    }
 
     #[test]
     fn override_memory_path_is_none_outside_scope() {

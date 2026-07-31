@@ -39,8 +39,14 @@ pub(in crate::ai::driver) fn execute_direct_subagent_task(
     tool_call_id: &str,
     args: &Value,
     hard_timeout: StdDuration,
+    wrap_up_lead_time: Option<StdDuration>,
 ) -> Result<ToolResult, String> {
-    sync_task::execute_sync_task_with_hard_timeout(tool_call_id, args, hard_timeout)
+    sync_task::execute_sync_task_with_pre_timeout_wrap_up(
+        tool_call_id,
+        args,
+        hard_timeout,
+        wrap_up_lead_time,
+    )
 }
 
 #[allow(unused_imports)]

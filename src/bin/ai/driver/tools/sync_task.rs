@@ -132,6 +132,17 @@ pub(super) fn execute_sync_task_with_hard_timeout(
     args: &Value,
     hard_timeout: Duration,
 ) -> Result<ToolResult, String> {
+    execute_sync_task_with_pre_timeout_wrap_up(tool_call_id, args, hard_timeout, None)
+}
+
+/// 与普通同步 `task` 相同，但允许显式命令在硬超时前预留一段时间，请子代理
+/// 停止扩展调查并基于现有证据收口。该参数不暴露给模型工具调用。
+pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
+    tool_call_id: &str,
+    args: &Value,
+    hard_timeout: Duration,
+    wrap_up_lead_time: Option<Duration>,
+) -> Result<ToolResult, String> {
     // 递归深度守卫：防止 mode:all 的 heavy agent 通过同步 `task`
     // 无限嵌套委派。与 `spawn_subagent_kernel_task` 中的检查保持一致。
     let parent_depth = runtime_ctx::current_subagent_depth();
@@ -257,6 +268,8 @@ pub(super) fn execute_sync_task_with_hard_timeout(
     // loop reads it to annotate the heartbeat line ("… · calling model").
     let phase_slot: runtime_ctx::SubagentPhaseSlot = Arc::new(std::sync::Mutex::new(String::new()));
     let phase_slot_for_scope = phase_slot.clone();
+    let wrap_up_signal = wrap_up_lead_time.map(|_| Arc::new(AtomicBool::new(false)));
+    let wrap_up_signal_for_scope = wrap_up_signal.clone();
 
     let inner_fut = async move {
         let mut subagent_app = subagent_app;
@@ -292,6 +305,9 @@ pub(super) fn execute_sync_task_with_hard_timeout(
     wrapped =
         Box::pin(runtime_ctx::PERSONA_MEMORY_PATH.scope(persona_memory_path.clone(), wrapped));
     wrapped = Box::pin(runtime_ctx::SUBAGENT_PHASE.scope(phase_slot_for_scope, wrapped));
+    if let Some(wrap_up_signal) = wrap_up_signal_for_scope {
+        wrapped = Box::pin(runtime_ctx::SUBAGENT_WRAP_UP_SIGNAL.scope(wrap_up_signal, wrapped));
+    }
     wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
     wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(child_depth, wrapped));
 
@@ -346,13 +362,15 @@ pub(super) fn execute_sync_task_with_hard_timeout(
     // atomic flag 只作为条件判断，不作为唤醒机制；正常写入 cancel/shutdown 的入口
     // 必须调用 signal_request_interrupt()/request_shutdown() 发送 Notify。
     let join_result: Result<Result<(), String>, String> = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(wait_for_sync_task_completion(
+        tokio::runtime::Handle::current().block_on(wait_for_sync_task_completion_with_wrap_up(
             rx,
             wait_shutdown,
             wait_cancel,
             phase_slot,
             started,
             hard_timeout,
+            wrap_up_lead_time,
+            wrap_up_signal,
         ))
     });
     if join_result.is_err() {
@@ -413,17 +431,46 @@ pub(super) fn execute_sync_task_with_hard_timeout(
 }
 
 async fn wait_for_sync_task_completion(
-    mut rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
     parent_shutdown: Arc<AtomicBool>,
     parent_cancel: Arc<AtomicBool>,
     phase_slot: runtime_ctx::SubagentPhaseSlot,
     started: Instant,
     hard_timeout: Duration,
 ) -> Result<Result<(), String>, String> {
+    wait_for_sync_task_completion_with_wrap_up(
+        rx,
+        parent_shutdown,
+        parent_cancel,
+        phase_slot,
+        started,
+        hard_timeout,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn wait_for_sync_task_completion_with_wrap_up(
+    mut rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    parent_shutdown: Arc<AtomicBool>,
+    parent_cancel: Arc<AtomicBool>,
+    phase_slot: runtime_ctx::SubagentPhaseSlot,
+    started: Instant,
+    hard_timeout: Duration,
+    wrap_up_lead_time: Option<Duration>,
+    wrap_up_signal: Option<runtime_ctx::SubagentWrapUpSignal>,
+) -> Result<Result<(), String>, String> {
     // 心跳只在交互式 TTY 下显示：它用 `\r` + 清行做单行原地刷新，管道/重定向
     // 场景下这些控制序列会污染输出，所以非 TTY 直接关闭。
     let show_heartbeat = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let wait_for_result = async {
+        let mut wrap_up_deadline = wrap_up_lead_time.zip(wrap_up_signal).map(|(lead, signal)| {
+            (
+                Box::pin(tokio::time::sleep(hard_timeout.saturating_sub(lead))),
+                signal,
+            )
+        });
         let interrupt_notify = crate::ai::driver::signal::request_interrupt_notify();
         let mut heartbeat = tokio::time::interval(SUBAGENT_HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -458,6 +505,17 @@ async fn wait_for_sync_task_completion(
                             "subagent task channel closed before result: {e}"
                         )),
                     };
+                }
+                _ = async {
+                    match wrap_up_deadline.as_mut() {
+                        Some((deadline, _)) => deadline.as_mut().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let (_, signal) = wrap_up_deadline
+                        .take()
+                        .expect("wrap-up deadline must exist when it fires");
+                    signal.store(true, Ordering::Release);
                 }
                 _ = notified => {
                     continue;
@@ -567,6 +625,36 @@ fn subagent_history_path(base: &std::path::Path, task_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sync_task_wait_signals_wrap_up_before_hard_timeout() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let signal: runtime_ctx::SubagentWrapUpSignal = Arc::new(AtomicBool::new(false));
+        let signal_for_wait = signal.clone();
+        let phase_slot: runtime_ctx::SubagentPhaseSlot =
+            Arc::new(std::sync::Mutex::new(String::new()));
+        let waiter = tokio::spawn(wait_for_sync_task_completion_with_wrap_up(
+            rx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            phase_slot,
+            Instant::now(),
+            Duration::from_millis(800),
+            Some(Duration::from_millis(600)),
+            Some(signal_for_wait),
+        ));
+
+        tokio::time::timeout(Duration::from_millis(600), async {
+            while !signal.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("wrap-up signal should arrive before the hard timeout");
+        tx.send(Ok(()))
+            .expect("waiting child should still accept its completion");
+        assert_eq!(waiter.await.expect("waiter should not panic"), Ok(Ok(())));
+    }
 
     fn flags() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
         (

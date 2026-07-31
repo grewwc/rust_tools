@@ -1759,9 +1759,40 @@ fn inject_iteration_limit_reflect_note(
     });
 }
 
+/// `/audit` 的同步等待快到硬超时时，请子代理停止扩展新分支，优先交付可验证结论。
+fn inject_subagent_pre_timeout_wrap_up_note(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+
+    let note = "[subagent-pre-timeout-wrap-up] 当前 `/audit` 的前台等待时间即将耗尽。\n\
+        现在进入无工具收口模式：不要再发起新的工具调用或扩展新的审计分支。\n\
+        请立即基于已收集的证据输出最终审计结论：先列出已验证的 findings；\n\
+        将尚未验证的风险单独标注，绝不可猜测。";
+    messages.push(Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_pre_timeout_wrap_up_note_requires_immediate_final_answer() {
+        let mut messages = Vec::new();
+        inject_subagent_pre_timeout_wrap_up_note(&mut messages);
+
+        let note = messages
+            .last()
+            .and_then(|message| message.content.as_str())
+            .expect("wrap-up note should be textual");
+        assert!(note.contains("无工具收口模式"));
+        assert!(note.contains("最终审计结论"));
+    }
 
     #[test]
     fn detect_tool_loop_triggers_after_window_of_identical_signatures() {
@@ -3376,6 +3407,7 @@ fn execute_audit_command(
                 "slash-audit",
                 &args,
                 crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
+                Some(crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME),
             ) {
                 Ok(result) => println!(
                     "\n{}",
@@ -3447,6 +3479,7 @@ async fn run_turn_body(
 
     let mut supervisor = TurnSupervisor::default();
     let mut force_final_response = false;
+    let mut pre_timeout_wrap_up_requested = false;
     let mut final_assistant_text = String::new();
     let mut final_assistant_recorded = false;
     let mut final_response_model = None::<String>;
@@ -3537,6 +3570,11 @@ async fn run_turn_body(
                 &mut skill_turn,
                 &mut messages,
             );
+        }
+        if crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request() {
+            pre_timeout_wrap_up_requested = true;
+            force_final_response = true;
+            inject_subagent_pre_timeout_wrap_up_note(&mut messages);
         }
         let active_skill_name = skill_turn.matched_skill_name().map(str::to_string);
         let compression_report = std::mem::take(&mut supervisor.pending_compression_report);
@@ -4032,9 +4070,9 @@ async fn run_turn_body(
         supervisor.maybe_inject_iteration_limit_note(
             &mut messages,
             effective_max_iterations,
-            force_final_response,
+            force_final_response && !pre_timeout_wrap_up_requested,
         );
-        if force_final_response {
+        if force_final_response && !pre_timeout_wrap_up_requested {
             supervisor.maybe_inject_task_anchor(&mut messages, &question, "iteration-limit");
         }
     };
