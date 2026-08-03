@@ -207,7 +207,7 @@ fn prepare_subagent_task_auto_selects_model_and_fallback() {
     assert!(
         prepared
             .prompt
-            .contains("Do not repeat an equivalent read/search/list/command")
+            .contains("avoid equivalent read/search/list/command variants")
     );
     assert!(
         prepared
@@ -268,13 +268,13 @@ fn task_integrate_closes_durable_evidence() {
 }
 
 #[test]
-fn capped_subagent_manifest_limits_large_iteration_budget() {
+fn capped_subagent_manifest_preserves_explicit_iteration_budget_within_hard_cap() {
     let mut agent = manifest("build", "Main build agent", AgentMode::Subagent);
     agent.max_steps = Some(128);
 
     let capped = capped_subagent_manifest(&agent);
 
-    assert_eq!(capped.max_steps, Some(super::SUBAGENT_MAX_ITERATIONS));
+    assert_eq!(capped.max_steps, Some(128));
     assert_eq!(agent.max_steps, Some(128));
 }
 
@@ -286,6 +286,20 @@ fn capped_subagent_manifest_preserves_stricter_iteration_budget() {
     let capped = capped_subagent_manifest(&agent);
 
     assert_eq!(capped.max_steps, Some(12));
+}
+
+#[test]
+fn capped_subagent_manifest_limits_large_iteration_budget_to_hard_cap() {
+    let mut agent = manifest("build", "Main build agent", AgentMode::Subagent);
+    agent.max_steps = Some(9999);
+
+    let capped = capped_subagent_manifest(&agent);
+
+    assert_eq!(
+        capped.max_steps,
+        Some(super::SUBAGENT_MAX_ITERATIONS_HARD_CAP)
+    );
+    assert_eq!(agent.max_steps, Some(9999));
 }
 
 #[test]

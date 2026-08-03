@@ -8,6 +8,9 @@ rules in the nearest child `AGENTS.md`.
 ## Runtime layout
 
 - `config*`: config loading, schema, model registry access
+- `prompt/`: prompt assembly and multiline extraction
+- `skills.rs` / `agents.rs`: skill + agent manifests; `builtin_agents/` holds
+  `.agent` files compiled in via `include_str!`
 - `driver/`: turn orchestration, prompt/tool loop, and skill runtime
 - `history/`: canonical persistence, context projection/compression, and task evidence
 - `request/`: LLM request execution, retry, error handling, routing,
@@ -19,38 +22,39 @@ rules in the nearest child `AGENTS.md`.
 - `knowledge/`: durable knowledge indexing, retrieval, storage, and sync
 - `stream/`: streaming protocol, chunk extraction, state machine, and
   terminal/TUI rendering (under `stream/render/`)
+- `cli.rs` / `theme.rs` / `background.rs`: CLI entry, theming, background tasks
 
 ## Runtime-wide invariants
 
-1. **Verification.** Follow the root verification ladder and keep Cargo commands
-   scoped; do not run bare workspace-wide checks or tests for routine changes.
+1. **Verification.** Follow the root verification ladder; keep Cargo commands
+   scoped, never bare workspace-wide checks.
 2. **Driver-owned turn lifecycle.** Prompt assembly, model calls, tool loops,
-   history updates, and final response handling flow through the driver. Do not
-   bypass it with ad-hoc side effects.
-3. **Clear provider/request boundary.** Request routing and normalization belong
-   in `request/`; provider-specific wire behavior belongs in `provider/` adapter
-   hooks, not scattered conditionals.
-4. **Model metadata.** Treat `ApiProvider` as the request adapter axis. Platform
+   history updates, and final response all flow through the driver; no ad-hoc
+   side effects.
+3. **Provider/request boundary.** Request routing/normalization in `request/`;
+   provider wire behavior in `provider/` adapter hooks, not scattered
+   conditionals.
+4. **Model metadata.** `ApiProvider` is the request adapter axis; platform
    naming and model metadata live in `models.json`.
-5. **Tool contracts.** Tool names, schemas, display policy, and history policy
-   are registry-driven. Execution logic stays out of registry metadata.
+5. **Tool contracts.** Tool names, schemas, display/history policy are
+   registry-driven; execution logic stays out of registry metadata.
 6. **Lazy capability loading.** Hidden tool/MCP catalogs, prompt hints, and
-   `enable_tools` behavior must reflect the real configured registry names.
+   `enable_tools` must reflect the real configured registry names.
 7. **Path/session authority.** Use `runtime_ctx::effective_cwd()` for user paths
    and runtime context helpers for session/temp state.
-8. **History truthfulness.** Canonical session messages and rebuildable model
-   context are separate layers. Compression may replace only the context snapshot,
-   never canonical messages; only explicit user lifecycle operations may truncate
-   canonical history. Preserve pruned evidence with explicit overflow/file pointers.
+8. **History truthfulness.** Canonical messages and rebuildable model context
+   are separate layers: compression may replace only the context snapshot, never
+   canonical messages; only explicit user lifecycle ops truncate history.
+   Preserve pruned evidence via explicit overflow/file pointers.
 9. **Subagent evidence lifecycle.** Persist delivered child results, restore
    unintegrated evidence after context rebuild, and require explicit parent
    integration before normal completion.
 10. **Derived-context provenance.** Runtime-owned policy/control notes may map
     to `system`; model-authored self-notes, checkpoints, and automatic summaries
-    remain assistant-derived and marked unverified. Project assistant-derived
-    context through request-only user/assistant handoff pairs (conventional role
-    order). Never promote prior assistant wording into a system-level fact or
-    verified conclusion.
+    stay assistant-derived and unverified. Project assistant-derived context
+    through request-only user/assistant handoff pairs (conventional role order);
+    never promote prior assistant wording into a system-level fact or verified
+    conclusion.
 
 ## Scoped guides
 

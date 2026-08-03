@@ -73,6 +73,30 @@ pub(crate) struct ToolDisplayRegistration {
 
 inventory::collect!(ToolDisplayRegistration);
 
+/// 可选的同参结果复用注册。只有结果在当前 user turn 内可视为稳定快照、且重复执行
+/// 没有消费副作用的工具才可登记；未登记工具默认必须真实执行。
+pub(crate) struct ToolReplayRegistration {
+    pub(crate) name: &'static str,
+}
+
+inventory::collect!(ToolReplayRegistration);
+
+static TOOL_REPLAY_INDEX: LazyLock<SkipMap<String, ()>> = LazyLock::new(|| {
+    let mut index: SkipMap<String, ()> = SkipMap::default();
+    for reg in inventory::iter::<ToolReplayRegistration> {
+        let name = reg.name.to_string();
+        if !index.contains_key(&name) {
+            index.insert(name, ());
+        }
+    }
+    index
+});
+
+/// 同名同参的成功结果是否允许在当前 user turn 内直接复用。
+pub(crate) fn tool_allows_same_turn_replay(name: &str) -> bool {
+    TOOL_REPLAY_INDEX.contains_key(&name.to_string())
+}
+
 static TOOL_DISPLAY_INDEX: LazyLock<SkipMap<String, ToolDisplayConfig>> = LazyLock::new(|| {
     let mut index: SkipMap<String, ToolDisplayConfig> = SkipMap::default();
     for reg in inventory::iter::<ToolDisplayRegistration> {

@@ -720,6 +720,7 @@ pub(super) fn dispatch_background_batch(
             }
             if publish_task_result && let Some(addr) = completion_futex_addr {
                 let _ = os.futex_store(addr, 1);
+                super::notify_scheduler();
             }
             let preserve_history = match result {
                 Ok(_outcome) => {

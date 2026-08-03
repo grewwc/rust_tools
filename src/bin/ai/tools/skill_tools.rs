@@ -7,8 +7,7 @@ use serde_json::Value;
 
 use crate::ai::config_schema::AiConfig;
 use crate::ai::skills::SkillManifest;
-use crate::ai::tools::common::ToolRegistration;
-use crate::ai::tools::common::ToolSpec;
+use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 
 /// 模型通过 `activate_skill` 工具显式请求激活的 skill 名称（待 driver 在下一个
 /// iteration 读取并应用）。
@@ -141,7 +140,10 @@ inventory::submit!(ToolRegistration {
         parameters: params_activate_skill,
         execute: execute_activate_skill,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core"],
+        // skill 发现/激活是低频能力：默认不随每轮 core 展开常驻，模型按需经
+        // `enable_tools` 启用，压缩每轮 tools schema token。仍保留 builtin 组，
+        // 保证可被动态启用。
+        groups: &["builtin"],
     }
 });
 
@@ -248,7 +250,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_list_skills,
         execute: execute_list_skills,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core"],
+        groups: &["builtin"],
     }
 });
 
@@ -332,7 +334,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_load_skill,
         execute: execute_load_skill,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core"],
+        groups: &["builtin"],
     }
 });
 
@@ -403,7 +405,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_save_skill,
         execute: execute_save_skill,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core"],
+        groups: &["builtin"],
     }
 });
 

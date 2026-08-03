@@ -19,13 +19,19 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
 4. **Registry-driven metadata.** Display via `ToolDisplayRegistration`; history
    retention via `ToolHistoryPolicyRegistration`. Do not add broad fields to
    `ToolSpec` or reintroduce name-keyed policy chains in `history/compress/`.
+   Same-turn same-argument result reuse is opt-in via `ToolReplayRegistration`;
+   never infer replay safety from read-like tool names.
 5. **History policy semantics.** `lossy_compress` and `prune` are orthogonal.
    Preserve truth for `plan`, `read_file`, `execute_command` diagnostics, and
    subagent task tools with explicit overflow stubs/file pointers, not lossy
    summaries.
 6. **Temp files.** `write_file(temp=true)` uses `runtime_ctx::temp_dir()` and the
    session temp registry. Delete project/source/config files via `apply_patch`
-   with an explicit `*** Delete File:` section.
+   with an explicit `*** Delete File:` section. Paths already registered in the
+   session temp registry (e.g. a temp file created by a subagent in an isolated
+   temp dir) are writable by `write_file`/`apply_patch` even when they fall
+   outside `effective_cwd`/allowed roots — the registry is the authoritative
+   same-session temp allowlist.
 7. **Process groups.** `execute_command` runs in its own process group. Keep
    background pgids in the in-memory session registry and kill by process group at
    teardown; do not persist pgids across restarts.
@@ -36,17 +42,14 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
    normalizes supported typographic confusables, and rejects ambiguous matches.
    Unified diffs are single-file; multi-file edits and deletion use an explicit
    envelope; a `*** Replace in line:` section is the low-friction path for a
-   single-line substring edit. Context-mismatch / ambiguous errors echo the
-   current file text as a prefix-free, paste-ready block (delimited by
-   `<<<PATCH_TEXT` / `PATCH_TEXT>>>`) so the model can rebuild without a full
-   re-read — keep that block prefix-free. Context-mismatch, ambiguous-match, and
-   hunks-out-of-order errors all carry actionable diagnostics. Only an ambiguous
-   match trips the stale-patch guard; context mismatch can be repaired directly
-   from the echoed current text, while out-of-order is a hunk-ordering problem.
-   Classify only the diagnostic before `<<<PATCH_TEXT` so source text cannot mimic
-   an error, and for multi-file patches block only the target that actually
-   failed. `read_file` paginates by line and character cap; text search stays in
-   dedicated search tools.
+   single-line substring edit. Context-mismatch / ambiguous / out-of-order errors
+   each echo the current text as a prefix-free, paste-ready block (`<<<PATCH_TEXT`
+   ... `PATCH_TEXT>>>`) so the model can rebuild without re-reading. Only an
+   ambiguous match trips the stale-patch guard (context mismatch repairable
+   directly, out-of-order is a hunk-ordering problem); classify the diagnostic
+   before the block so source text cannot mimic an error, and for multi-file
+   patches block only the failed target. `read_file` paginates by line and
+   character cap; text search stays in dedicated search tools.
 10. **Subagent tools are top-level only.** Hide and reject the `task` family when
     `SUBAGENT_DEPTH > 0`; `enable_tools` must not restore it. Scope tasks by
     session + owner pid, persist results before IPC cleanup, and require

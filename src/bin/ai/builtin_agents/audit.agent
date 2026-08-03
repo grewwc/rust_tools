@@ -4,6 +4,7 @@ description: Evidence-driven reviewer for code changes, regressions, security, r
 mode: all
 color: warning
 model_tier: heavy
+max_steps: 256
 tool_groups:
   - core
   - executor

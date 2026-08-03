@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::ai::errors::AiError;
+use crate::ai::tools::storage::temp_registry;
 use aios_kernel::primitives::VfsError;
 
 pub(crate) struct FileStore {
@@ -25,9 +26,10 @@ impl FileStore {
     }
 
     pub(crate) fn validate_read_access(&self) -> Result<(), AiError> {
-        // 封锁对压缩器内部 read_file 外溢产物的回读：这些文件是工具
-        // 渲染结果的转储，模型读回只会拿到旧行号内容并触发无限重读循环。带原始锚点
-        // 的 execute_command 日志、user/image 归档与 overflow-history.md 不在此列。
+        // 外溢归档是请求侧压缩后的唯一完整快照，必须可读；否则对模型而言等价于
+        // 丢弃。read_file 归档中的历史行号由 service::file 在渲染前剥离，避免
+        // 回读时产生嵌套行号。这里仍需把快照限制在当前会话，避免绝对路径把
+        // 相邻会话的历史内容带入当前上下文。
         if let Some(reason) = blocked_overflow_read_reason(&self.path) {
             return Err(AiError::file(self.path.display().to_string(), reason));
         }
@@ -36,25 +38,42 @@ impl FileStore {
 
     pub(crate) fn validate_write_access(&self) -> Result<(), AiError> {
         self.validate_read_access()?;
-        if !path_within_allowed_roots(&self.path) {
-            let resolved = self.path.display();
-            let hint = if self.original.to_string_lossy().contains("tmp/") {
-                "\nHint: for temporary/scratch files, use temp=true with a relative \
-                 filename (e.g. file_path='script.py', temp=true) — the temp directory \
-                 is write-accessible without sandbox restrictions."
-            } else {
-                "\nHint: for temporary/scratch files, use temp=true with a relative \
-                 filename to write under the session temp directory."
-            };
-            return Err(AiError::file(
-                self.original.display().to_string(),
-                format!(
-                    "Write blocked: path '{resolved}' is outside the allowed write \
-                     directory (effective_cwd).{hint}"
-                ),
-            ));
+        if path_within_allowed_roots(&self.path) {
+            return Ok(());
         }
-        Ok(())
+        // 同 session 的临时文件：write_file(temp=true) 已把解析后的绝对路径注册进
+        // temp registry。即使该路径不在 effective_cwd / allowed_roots / 当前 temp_dir
+        // 之下（例如子代理在隔离临时目录里创建的文件），write_file / apply_patch 也应
+        // 允许继续操作，而不是被沙箱拦截。这是对「同 session 临时文件」的最权威判定。
+        if temp_registry::is_registered(&self.path.display().to_string()) {
+            return Ok(());
+        }
+        let resolved = self.path.display();
+        // 明确告知模型「能写哪里」，而不仅是「这里不能写」。此前消息只提示
+        // temp=true（scratch 语义），当模型的真实目标是把正式产物写到某个指定
+        // 目录时无从下手，于是对同一越界路径反复重试。这里给出可写根目录 +
+        // 两条具体可选路径（写进根目录内 / 用 temp=true），让模型一次纠偏。
+        let roots = writable_roots_for_hint();
+        let root_hint = match roots.first() {
+            Some(root) => format!(
+                "\nWritable root: '{}'. To fix, either (a) write to a path under \
+                 that root, or (b) for scratch/intermediate files pass a relative \
+                 filename with temp=true (e.g. file_path='script.py', temp=true). \
+                 Do NOT retry the same absolute path — it will keep failing.",
+                root.display()
+            ),
+            None => "\nHint: for temporary/scratch files, use temp=true with a \
+                 relative filename to write under the session temp directory. \
+                 Do NOT retry the same absolute path — it will keep failing."
+                .to_string(),
+        };
+        Err(AiError::file(
+            self.original.display().to_string(),
+            format!(
+                "Write blocked: path '{resolved}' is outside the allowed write \
+                 directory (effective_cwd).{root_hint}"
+            ),
+        ))
     }
 
     pub(crate) fn ensure_exists(&self) -> Result<(), AiError> {
@@ -195,32 +214,14 @@ fn session_overflow_dir_component(path: &Path) -> Option<&'static str> {
     })
 }
 
-/// 判断读取该路径是否应被拒绝，若拒绝则给出可执行的替代指引。
+/// 是否为会话压缩器保存的 `read_file` 结果快照。
 ///
-/// 仅拦截 `tool-overflow-compressed/` 下 read_file 的外溢产物：这些
-/// 文件是"工具渲染结果"的内部转储，模型回读只会拿到带行号的旧输出，触发
-/// "压缩→留 file_path→回读→再压缩→再留 file_path→再回读" 的无限重读循环；而它们
-/// 都能通过 stub 里的 `original_file_path` 指回真正的原始来源。
-///
-/// 明确放行（这些文件对模型有独立价值，不能封锁）：
-/// - `execute_command` 外溢日志——命令输出没有可替代的"原始源"，归档本身即证据；
-/// - `user-overflow-preserved` / `image-overflow-preserved`——stub 主动引导模型按需回读；
-/// - `overflow-history.md`——位于 assets 根目录，本就不在这些子目录内。
-fn blocked_overflow_read_reason(path: &Path) -> Option<String> {
-    if session_overflow_dir_component(path)? != "tool-overflow-compressed" {
-        return None;
-    }
-    match overflow_artifact_tool_name(path)?.as_str() {
-        "read_file" => Some(
-            "Access blocked: this is an internal compression artifact (the archived render of a prior \
-             `read_file` result), not a source file. Re-reading it produces nested line numbers and \
-             re-compression loops. Read the original target instead using the stub's \
-             `original_file_path` (+ `original_range`)."
-                .to_string(),
-        ),
-        // execute_command / plan / 其它高精度工具的归档保持可读：它们没有更好的原始锚点。
-        _ => None,
-    }
+/// 这类文件需要正常回读，但 service 层必须在重新渲染前剥离旧的行号前缀，防止
+/// `read_file` 的展示格式在多次召回时不断嵌套。不能只依赖 `original_file_path`：
+/// 原始文件可能已经变更、删除，或无法复现当时的截断结果。
+pub(crate) fn is_read_file_overflow_artifact(path: &Path) -> bool {
+    session_overflow_dir_component(path) == Some("tool-overflow-compressed")
+        && overflow_artifact_tool_name(path).as_deref() == Some("read_file")
 }
 
 /// 从外溢产物文件名 `{timestamp}-{tool}-{uuid}.txt` 中提取工具名。
@@ -236,6 +237,53 @@ fn overflow_artifact_tool_name(path: &Path) -> Option<String> {
     }
     let tool = &stem[first + 1..last];
     (!tool.is_empty()).then(|| tool.to_string())
+}
+
+/// 当前 turn 对应的会话 asset 根目录。无活动 driver context 时保守返回 None，
+/// 不能把测试/one-shot 环境误当成拥有任意历史会话的读取权限。
+fn current_session_assets_dir() -> Option<PathBuf> {
+    let ctx = crate::ai::driver::runtime_ctx::try_current()?;
+    let turn_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+    let session_id = if turn_session_id.is_empty() {
+        ctx.app_proto.session_id.as_str()
+    } else {
+        turn_session_id.as_str()
+    };
+    if session_id.is_empty() {
+        return None;
+    }
+    Some(
+        crate::ai::history::SessionStore::new(ctx.app_proto.config.history_file.as_path())
+            .session_assets_dir(session_id),
+    )
+}
+
+fn blocked_overflow_read_reason(path: &Path) -> Option<String> {
+    blocked_overflow_read_reason_for_assets(path, current_session_assets_dir().as_deref())
+}
+
+fn blocked_overflow_read_reason_for_assets(
+    path: &Path,
+    current_session_assets: Option<&Path>,
+) -> Option<String> {
+    if !is_read_file_overflow_artifact(path) {
+        return None;
+    }
+
+    let is_current_session_artifact = current_session_assets.is_some_and(|assets_dir| {
+        let expected_dir = normalize_lexical(assets_dir).join("tool-overflow-compressed");
+        normalize_lexical(path).parent() == Some(expected_dir.as_path())
+    });
+    if is_current_session_artifact {
+        return None;
+    }
+
+    Some(
+        "Access blocked: this read_file overflow artifact does not belong to the current session. \
+         Use the stub's `original_file_path` (+ `original_range`) when available; only the current \
+         session's exact `file_path` snapshot may be read when the original source changed or was removed."
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -287,16 +335,14 @@ fn config_extra_sensitive_substrings() -> Vec<String> {
         .collect()
 }
 
-/// 当 `ai.sandbox.allowed_roots` 非空时，文件路径必须位于其中某个根之下。
-/// 为空（默认）时，退回到 `effective_cwd()` 作为单一沙箱根目录。
-fn path_within_allowed_roots(path: &Path) -> bool {
+/// 计算当前生效的可写根目录集合：`ai.sandbox.allowed_roots` 非空时用其配置，
+/// 为空（默认）时退回 `effective_cwd()`；session 临时目录始终追加为可写根。
+/// 返回值同时用于写权限校验与「写被拒」错误提示中的可写路径建议，避免两处漂移。
+fn configured_write_roots(base: &Path) -> Vec<PathBuf> {
     let raw = crate::commonw::configw::get_all_config().get(
         crate::ai::config_schema::AiConfig::SANDBOX_ALLOWED_ROOTS,
         "",
     );
-    // 相对路径基于 effective_cwd 解析为绝对路径后再归一化。
-    let base =
-        crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
     let mut roots: Vec<PathBuf> = raw
         .split(',')
         .map(|s| s.trim())
@@ -304,7 +350,7 @@ fn path_within_allowed_roots(path: &Path) -> bool {
         .map(|s| normalize_lexical(Path::new(s)))
         .collect();
     if roots.is_empty() {
-        roots.push(normalize_lexical(&base));
+        roots.push(normalize_lexical(base));
     }
     // session 临时目录始终可写：模型可能从之前工具输出中发现 temp 路径后
     // 用绝对路径写入（不带 temp=true），不应被沙箱拦截。
@@ -314,6 +360,24 @@ fn path_within_allowed_roots(path: &Path) -> bool {
             roots.push(temp);
         }
     }
+    roots
+}
+
+/// 供「写被拒」错误提示使用的可写根目录：优先展示 effective_cwd 类的项目根，
+/// 排在最前，便于模型据此纠偏（session 临时目录不适合承载正式产物，不作首选）。
+fn writable_roots_for_hint() -> Vec<PathBuf> {
+    let base =
+        crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
+    configured_write_roots(&base)
+}
+
+/// 当 `ai.sandbox.allowed_roots` 非空时，文件路径必须位于其中某个根之下。
+/// 为空（默认）时，退回到 `effective_cwd()` 作为单一沙箱根目录。
+fn path_within_allowed_roots(path: &Path) -> bool {
+    // 相对路径基于 effective_cwd 解析为绝对路径后再归一化。
+    let base =
+        crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
+    let roots = configured_write_roots(&base);
     path_within_roots(path, &base, &roots)
 }
 
@@ -333,9 +397,9 @@ fn path_within_roots(path: &Path, base: &Path, roots: &[PathBuf]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileStore, blocked_overflow_read_reason, is_sensitive_fs_path,
-        is_session_overflow_asset_path, normalize_lexical, overflow_artifact_tool_name,
-        path_within_allowed_roots, path_within_roots,
+        FileStore, blocked_overflow_read_reason_for_assets, is_read_file_overflow_artifact,
+        is_sensitive_fs_path, is_session_overflow_asset_path, normalize_lexical,
+        overflow_artifact_tool_name, path_within_allowed_roots, path_within_roots, temp_registry,
     };
     use crate::ai::test_support::ENV_LOCK;
     use std::path::{Path, PathBuf};
@@ -440,54 +504,51 @@ mod tests {
     }
 
     #[test]
-    fn read_file_artifacts_are_blocked_with_redirect() {
-        let read_artifact = Path::new(
-            "/proj.assets/tool-overflow-compressed/20260722T101112Z-read_file-abc123.txt",
+    fn read_file_overflow_artifact_access_is_session_scoped() {
+        let current_assets = Path::new("/sessions/current.assets");
+        let current_artifact = Path::new(
+            "/sessions/current.assets/tool-overflow-compressed/20260722T101112Z-read_file-abc123.txt",
         );
-        let reason = blocked_overflow_read_reason(read_artifact)
-            .expect("read_file overflow artifact must be blocked");
-        assert!(reason.contains("original_file_path"), "{reason}");
+        let other_artifact = Path::new(
+            "/sessions/other.assets/tool-overflow-compressed/20260722T101112Z-read_file-def456.txt",
+        );
 
-        // 通过 FileStore 端到端确认拒绝（read_file 工具会走 validate_read_access）。
+        assert!(is_read_file_overflow_artifact(current_artifact));
         assert!(
-            FileStore::new(read_artifact.to_path_buf())
+            blocked_overflow_read_reason_for_assets(current_artifact, Some(current_assets))
+                .is_none()
+        );
+        assert!(
+            blocked_overflow_read_reason_for_assets(other_artifact, Some(current_assets)).is_some()
+        );
+        assert!(blocked_overflow_read_reason_for_assets(current_artifact, None).is_some());
+        assert!(!is_read_file_overflow_artifact(Path::new(
+            "/proj/tool-overflow-compressed/20260722T101112Z-read_file-abc123.txt"
+        )));
+
+        // 无活动 driver context 时，FileStore 端到端必须拒绝历史快照。
+        assert!(
+            FileStore::new(current_artifact.to_path_buf())
                 .validate_read_access()
                 .is_err()
         );
     }
 
     #[test]
-    fn execute_command_and_recall_archives_remain_readable() {
-        // execute_command 日志没有可替代的原始来源，必须放行。
-        assert!(
-            blocked_overflow_read_reason(Path::new(
-                "/proj.assets/tool-overflow-compressed/20260722T101112Z-execute_command-abc123.txt"
-            ))
-            .is_none()
+    fn read_file_overflow_artifact_cannot_escape_current_assets() {
+        let current_assets = Path::new("/sessions/current.assets");
+        let escaped = Path::new(
+            "/sessions/current.assets/../other.assets/tool-overflow-compressed/20260722T101112Z-read_file-def456.txt",
         );
-        // user / image 归档 stub 主动引导模型按需回读，放行。
-        assert!(
-            blocked_overflow_read_reason(Path::new(
-                "/proj.assets/user-overflow-preserved/20260722T101112Z-user-abc123.json"
-            ))
-            .is_none()
+        assert!(blocked_overflow_read_reason_for_assets(escaped, Some(current_assets)).is_some());
+
+        // 其它工具归档保持既有可读行为，不劣化其精确证据召回能力。
+        let command_artifact = Path::new(
+            "/sessions/other.assets/tool-overflow-compressed/20260722T101112Z-execute_command-def456.txt",
         );
         assert!(
-            blocked_overflow_read_reason(Path::new(
-                "/proj.assets/image-overflow-preserved/20260722T101112Z-image-abc123.json"
-            ))
-            .is_none()
-        );
-        // overflow-history.md 位于 assets 根目录，不在封锁子目录内。
-        assert!(
-            blocked_overflow_read_reason(Path::new("/proj.assets/overflow-history.md")).is_none()
-        );
-        // 用户项目里恰好同名的目录不受影响（未锚定到 .assets / 会话目录）。
-        assert!(
-            blocked_overflow_read_reason(Path::new(
-                "/proj/tool-overflow-compressed/20260722T101112Z-read_file-abc123.txt"
-            ))
-            .is_none()
+            blocked_overflow_read_reason_for_assets(command_artifact, Some(current_assets))
+                .is_none()
         );
     }
 
@@ -524,6 +585,51 @@ mod tests {
 
         assert!(result.0);
         assert!(!result.1);
+    }
+
+    #[test]
+    fn blocked_write_error_names_writable_root_and_warns_against_retry() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let temp_root =
+            std::env::temp_dir().join(format!("file-store-hint-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let outside = temp_root
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join(format!("outside-{}.json", uuid::Uuid::new_v4()));
+
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", temp_root.join("empty.configw")) };
+        crate::commonw::configw::refresh();
+
+        let err = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .sync_scope(temp_root.clone(), || {
+                FileStore::new(outside.clone()).validate_write_access()
+            })
+            .expect_err("write outside effective_cwd must be blocked");
+        let msg = err.to_string();
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+        let _ = std::fs::remove_file(temp_root.join("empty.configw"));
+        let _ = std::fs::remove_dir_all(&temp_root);
+
+        // 保留稳定的分类前缀（供 orchestrator 的 write_blocked_outside_root_path 解析）。
+        assert!(msg.contains("Write blocked: path '"), "msg: {msg}");
+        // 必须明确告知可写根目录，而不仅是「这里不能写」。
+        assert!(msg.contains("Writable root:"), "msg: {msg}");
+        assert!(
+            msg.contains(&temp_root.display().to_string()),
+            "hint must name the effective_cwd root: {msg}"
+        );
+        // 必须劝阻对同一绝对路径的重试。
+        assert!(
+            msg.contains("Do NOT retry the same absolute path"),
+            "msg: {msg}"
+        );
     }
 
     #[test]
@@ -590,5 +696,50 @@ mod tests {
             "session temp dir path must be within allowed write roots: {}",
             target.display()
         );
+    }
+
+    #[test]
+    fn temp_registry_registered_path_outside_roots_is_writable() {
+        // 同 session 的临时文件（如子代理在隔离临时目录里创建、已注册进 temp
+        // registry 的路径）即使不在 effective_cwd / allowed_roots 之下，也应被
+        // write_file / apply_patch 允许继续操作，而不是被沙箱拦截。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let temp_root =
+            std::env::temp_dir().join(format!("file-store-registry-{}", uuid::Uuid::new_v4()));
+        // 一个在 effective_cwd 之外、也被 allowed_roots 排除的路径。
+        let outside = temp_root
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join(format!("outside-registered-{}.txt", uuid::Uuid::new_v4()));
+
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", temp_root.join("empty.configw")) };
+        crate::commonw::configw::refresh();
+
+        // 未注册时，越界路径必须被拦截。
+        let blocked = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .sync_scope(temp_root.clone(), || {
+                FileStore::new(outside.clone()).validate_write_access()
+            })
+            .expect_err("unregistered outside path must be blocked");
+        assert!(blocked.to_string().contains("Write blocked"));
+
+        // 注册后（模拟 write_file(temp=true) 已注册该解析绝对路径），应放行。
+        let abs = outside.display().to_string();
+        temp_registry::register(&abs).unwrap();
+        let allowed = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .sync_scope(temp_root.clone(), || {
+                FileStore::new(outside.clone()).validate_write_access()
+            });
+        assert!(allowed.is_ok(), "registered temp path must be writable");
+        let _ = temp_registry::unregister(&abs);
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+        let _ = std::fs::remove_file(temp_root.join("empty.configw"));
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

@@ -17,6 +17,7 @@ use super::super::{
     MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
     iteration::no_tool_handoff_note,
     max_tool_result_inline_chars,
+    orchestrator::record_force_final_reason,
     types::{IterationExecution, PreparedToolResult, ToolCallExecution, TurnLoopStep},
 };
 use super::{
@@ -309,12 +310,26 @@ No file was changed. The runtime will add the applicable instruction documents o
     }
 }
 
-fn duplicate_read_only_call_ids(messages: &[Message], tool_calls: &[ToolCall]) -> HashSet<String> {
+fn duplicate_read_only_suppressions(
+    messages: &[Message],
+    turn_messages: &[Message],
+    tool_calls: &[ToolCall],
+) -> HashMap<String, String> {
+    // 当前批次只要包含无法证明为只读的调用，就无法保证读取与状态变化的执行顺序；
+    // 此时必须真实读取，不能复用旧结果。
+    if tool_calls.iter().any(read_only_replay_invalidating_call) {
+        return HashMap::new();
+    }
+
     let mut call_signatures = HashMap::new();
-    let mut completed = HashSet::new();
-    for message in messages {
+    let mut invalidating_call_ids = HashSet::new();
+    let mut completed = HashMap::new();
+    // 从当前 turn 的规范原文建立锚点，再要求同一原文仍逐字存在于 request context。
+    // 这样 compression/dedup/overflow stub 以及 suppression 自身都不会成为新锚点。
+    for message in turn_messages {
         if message.role == "user" {
             call_signatures.clear();
+            invalidating_call_ids.clear();
             completed.clear();
             continue;
         }
@@ -322,15 +337,27 @@ fn duplicate_read_only_call_ids(messages: &[Message], tool_calls: &[ToolCall]) -
             for tool_call in previous_calls {
                 if let Some(signature) = read_only_tool_signature(tool_call) {
                     call_signatures.insert(tool_call.id.as_str(), signature);
+                } else if read_only_replay_invalidating_call(tool_call) {
+                    invalidating_call_ids.insert(tool_call.id.as_str());
                 }
             }
         }
         if message.role == "tool"
             && let Some(call_id) = message.tool_call_id.as_deref()
-            && let Some(signature) = call_signatures.get(call_id)
-            && tool_result_completed_successfully(&message.content)
         {
-            completed.insert(signature.clone());
+            // 失败不代表没有副作用：shell 命令可能先写文件再非零退出。
+            // 任何未注册调用一旦返回，都保守失效旧快照。
+            if invalidating_call_ids.contains(call_id) {
+                completed.clear();
+                continue;
+            }
+            if let Some(signature) = call_signatures.get(call_id)
+                && tool_result_completed_successfully(&message.content)
+                && tool_result_is_available_verbatim(messages, call_id, &message.content)
+            {
+                // 只保留原调用锚点，不复制旧正文；原结果已经在当前 request context 中。
+                completed.insert(signature.clone(), call_id.to_string());
+            }
         }
     }
 
@@ -338,14 +365,66 @@ fn duplicate_read_only_call_ids(messages: &[Message], tool_calls: &[ToolCall]) -
         .iter()
         .filter_map(|tool_call| {
             let signature = read_only_tool_signature(tool_call)?;
-            completed.contains(&signature).then(|| tool_call.id.clone())
+            completed.get(&signature).map(|previous_call_id| {
+                (
+                    tool_call.id.clone(),
+                    duplicate_read_only_suppression_message(
+                        &tool_call.function.name,
+                        previous_call_id,
+                    ),
+                )
+            })
         })
         .collect()
 }
 
+fn read_only_replay_invalidating_call(tool_call: &ToolCall) -> bool {
+    read_only_tool_signature(tool_call).is_none()
+}
+
+const DUPLICATE_READ_ONLY_SUPPRESSION_PREFIX: &str = "Duplicate read-only call to '";
+
+fn duplicate_read_only_suppression_message(tool_name: &str, previous_call_id: &str) -> String {
+    format!(
+        "Duplicate read-only call to '{tool_name}' suppressed: identical successful call '{previous_call_id}' is already present in the current request context. Reuse that earlier result; execute again only after relevant state changes or with different arguments."
+    )
+}
+
+#[cfg(test)]
+fn duplicate_read_only_call_ids(messages: &[Message], tool_calls: &[ToolCall]) -> HashSet<String> {
+    duplicate_read_only_suppressions(messages, messages, tool_calls)
+        .into_keys()
+        .collect()
+}
+
+#[cfg(test)]
+fn duplicate_read_only_call_ids_with_context(
+    messages: &[Message],
+    turn_messages: &[Message],
+    tool_calls: &[ToolCall],
+) -> HashSet<String> {
+    duplicate_read_only_suppressions(messages, turn_messages, tool_calls)
+        .into_keys()
+        .collect()
+}
+
+fn tool_result_is_available_verbatim(
+    messages: &[Message],
+    call_id: &str,
+    canonical_content: &serde_json::Value,
+) -> bool {
+    messages.iter().any(|message| {
+        message.role == "tool"
+            && message.tool_call_id.as_deref() == Some(call_id)
+            && message.content == *canonical_content
+    })
+}
+
 fn tool_result_completed_successfully(content: &serde_json::Value) -> bool {
     let text = content.as_str().unwrap_or_default().trim_start();
-    !text.starts_with("Error:") && !text.starts_with("Exit code:")
+    !text.starts_with("Error:")
+        && !text.starts_with("Exit code:")
+        && !text.starts_with(DUPLICATE_READ_ONLY_SUPPRESSION_PREFIX)
 }
 
 const COMPLETION_EVIDENCE_REQUIRED_MARKER: &str = "self_note:completion_evidence_required";
@@ -359,9 +438,9 @@ enum CompletionEvidenceGateAction {
 }
 
 #[derive(Default)]
-struct CompletionEvidenceState {
-    successful_mutation: bool,
-    successful_post_mutation_verification: bool,
+pub(in crate::ai::driver::turn_runtime) struct CompletionEvidenceState {
+    pub(in crate::ai::driver::turn_runtime) successful_mutation: bool,
+    pub(in crate::ai::driver::turn_runtime) successful_post_mutation_verification: bool,
     successful_post_mutation_scope_review: bool,
     successful_post_mutation_behavior_check: bool,
 }
@@ -369,7 +448,9 @@ struct CompletionEvidenceState {
 /// 只扫描当前 user turn 的规范消息，并按 `tool_call_id` 将调用与结果配对。
 /// 每次成功 mutation 都会使之前的验证失效；同一复合命令中只有纯 `&&`
 /// 成功链里的后续检查才能覆盖最新改动。
-fn completion_evidence_state(turn_messages: &[Message]) -> CompletionEvidenceState {
+pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
+    turn_messages: &[Message],
+) -> CompletionEvidenceState {
     let mut state = CompletionEvidenceState::default();
     let mut calls_by_id: HashMap<String, ToolCall> = HashMap::new();
 
@@ -424,12 +505,16 @@ fn completion_evidence_state(turn_messages: &[Message]) -> CompletionEvidenceSta
     state
 }
 
-fn completion_tool_result_succeeded(content: &serde_json::Value) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn completion_tool_result_succeeded(
+    content: &serde_json::Value,
+) -> bool {
     let text = content.as_str().unwrap_or_default().trim_start();
     !text.starts_with("Error") && !text.starts_with("Exit code:")
 }
 
-fn tool_call_is_successful_mutation_candidate(tool_call: &ToolCall) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn tool_call_is_successful_mutation_candidate(
+    tool_call: &ToolCall,
+) -> bool {
     match tool_call.function.name.as_str() {
         "apply_patch" => serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
             .ok()
@@ -484,6 +569,276 @@ enum FinalClaimKind {
     None,
     Completion,
     NoImpact,
+}
+
+const DANGLING_FINAL_RECOVERY_MARKER: &str = "[dangling-final-recovery]";
+const DANGLING_FINAL_WARNING: &str = "[Runtime warning] The model still described a future inspection step after a one-time no-tool wrap-up retry, so this turn ended without a complete conclusion.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DanglingFinalRecoveryAction {
+    Allow,
+    RetryWithoutTools,
+    Warn,
+}
+
+fn text_range_is_quoted(text: &str, start: usize, end: usize) -> bool {
+    for (open, close) in [
+        ("\"", "\""),
+        ("'", "'"),
+        ("“", "”"),
+        ("‘", "’"),
+        ("「", "」"),
+        ("『", "』"),
+        ("《", "》"),
+    ] {
+        let before = &text[..start];
+        let after = &text[end..];
+        if open == close {
+            if before.matches(open).count() % 2 == 1 && after.contains(close) {
+                return true;
+            }
+        } else if before.rfind(open).is_some_and(|open_index| {
+            before
+                .rfind(close)
+                .is_none_or(|close_index| open_index > close_index)
+                && after.contains(close)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn plan_request_phrase_is_negated(text: &str, start: usize) -> bool {
+    let clause = text[..start]
+        .rsplit(|ch: char| matches!(ch, '.' | ';' | '!' | '?' | '。' | '；' | '！' | '？' | '\n'))
+        .next()
+        .unwrap_or_default();
+    let english_negated = clause
+        .split(|ch: char| !ch.is_ascii_alphabetic() && ch != '\'')
+        .filter(|token| !token.is_empty())
+        .rev()
+        .take(8)
+        .any(|token| {
+            matches!(
+                token,
+                "not" | "never" | "without" | "don't" | "dont" | "avoid"
+            ) || token.ends_with("n't")
+        });
+    if english_negated {
+        return true;
+    }
+
+    let chinese_tail = clause
+        .chars()
+        .rev()
+        .take(12)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    ["不要", "不用", "无需", "别", "不需要", "不必"]
+        .iter()
+        .any(|marker| chinese_tail.contains(marker))
+}
+
+fn contains_active_plan_request_phrase(question: &str, phrase: &str) -> bool {
+    question.match_indices(phrase).any(|(start, _)| {
+        let end = start + phrase.len();
+        let bytes = question.as_bytes();
+        let bounded_before = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let bounded_after = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        bounded_before
+            && bounded_after
+            && !text_range_is_quoted(question, start, end)
+            && !plan_request_phrase_is_negated(question, start)
+    })
+}
+
+fn question_requests_plan(question: &str) -> bool {
+    let question = question.to_ascii_lowercase();
+    let exact = question.trim_matches(|ch: char| ch.is_whitespace() || ch.is_ascii_punctuation());
+    if matches!(exact, "next steps" | "实施步骤") {
+        return true;
+    }
+
+    [
+        "give me a plan",
+        "provide a plan",
+        "create a plan",
+        "make a plan",
+        "draft a plan",
+        "outline a plan",
+        "give me next steps",
+        "provide next steps",
+        "outline next steps",
+        "list the next steps",
+        "what are the next steps",
+        "next steps for",
+        "what should i do next",
+        "给我一个计划",
+        "给出一个计划",
+        "制定计划",
+        "制定一个计划",
+        "列出下一步",
+        "给出下一步",
+        "下一步怎么做",
+        "给出实施步骤",
+        "列出实施步骤",
+    ]
+    .iter()
+    .any(|marker| contains_active_plan_request_phrase(&question, marker))
+}
+
+/// 识别「口头承诺继续读/查，但既没有 tool call、也没有交付结论」的悬空最终响应。
+///
+/// 保持保守：只检查已有工具证据的非计划型任务、较短且无结构化结论的文本。
+/// 这不是通用语义分类器，而是修复模型在长工具链末尾把下一步旁白误当 final 的
+/// 已知失败模式。
+fn looks_like_dangling_action_final(
+    question: &str,
+    turn_messages: &[Message],
+    final_text: &str,
+) -> bool {
+    if question_requests_plan(question)
+        || !turn_messages.iter().any(|message| {
+            message.role == "tool"
+                || message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+        })
+    {
+        return false;
+    }
+
+    // 运行时可能已附加其它告警；分类时只看模型原始可见文本。
+    let candidate = final_text
+        .find("[Runtime warning]")
+        .map(|index| &final_text[..index])
+        .unwrap_or(final_text)
+        .trim();
+    if candidate.is_empty() || candidate.chars().count() > 900 || candidate.contains("```") {
+        return false;
+    }
+
+    let structured_lines = candidate
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| {
+            line.starts_with("- ")
+                || line.starts_with("* ")
+                || line.starts_with("# ")
+                || line
+                    .split_once('.')
+                    .is_some_and(|(prefix, _)| prefix.chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .count();
+    let sentence_ends = candidate
+        .chars()
+        .filter(|ch| matches!(ch, '.' | '!' | '?' | '。' | '！' | '？'))
+        .count();
+    if structured_lines >= 2 || sentence_ends > 4 {
+        return false;
+    }
+
+    let lower = candidate.to_ascii_lowercase();
+    let has_future_inspection = [
+        "let me read",
+        "let me inspect",
+        "let me check",
+        "let me examine",
+        "let me look at",
+        "let me review",
+        "let me trace",
+        "let me verify",
+        "let me investigate",
+        "let me search",
+        "let me open",
+        "i'll read",
+        "i'll inspect",
+        "i'll check",
+        "i'll examine",
+        "i will read",
+        "i will inspect",
+        "i will check",
+        "i will examine",
+        "我再读",
+        "我再看",
+        "我再检查",
+        "让我再读",
+        "让我再看",
+        "让我检查",
+        "接下来我会读",
+        "接下来我会看",
+        "接下来我会检查",
+        "接下来让我",
+        "下一步我会读",
+        "下一步我会检查",
+        "现在我来读",
+        "现在我来检查",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if !has_future_inspection {
+        return false;
+    }
+
+    ![
+        "conclusion:",
+        "findings:",
+        "root cause",
+        "the issue is",
+        "the bug is",
+        "verified finding",
+        "no verified finding",
+        "结论：",
+        "结论:",
+        "根因：",
+        "根因:",
+        "问题是：",
+        "问题是:",
+        "已验证",
+        "未发现问题",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn dangling_final_recovery_action(
+    question: &str,
+    messages: &mut Vec<Message>,
+    turn_messages: &[Message],
+    final_text: &str,
+) -> DanglingFinalRecoveryAction {
+    if !looks_like_dangling_action_final(question, turn_messages, final_text) {
+        return DanglingFinalRecoveryAction::Allow;
+    }
+
+    let already_retried = messages.iter().any(|message| {
+        message.role == ROLE_INTERNAL_NOTE
+            && message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(DANGLING_FINAL_RECOVERY_MARKER))
+    });
+    if already_retried {
+        return DanglingFinalRecoveryAction::Warn;
+    }
+
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(format!(
+            "{DANGLING_FINAL_RECOVERY_MARKER}\n\
+             Your previous response ended with a promise to read, inspect, or verify more, but it did not deliver findings or a conclusion.\n\
+             This is a one-time synthesis recovery, not a new investigation round. Do not call tools.\n\
+             Based only on evidence already present in the context, give the final answer now. If evidence is insufficient, state the exact unresolved gap and why it could not be verified; do not narrate future actions."
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    DanglingFinalRecoveryAction::RetryWithoutTools
 }
 
 fn final_text_claim_kind(text: &str) -> FinalClaimKind {
@@ -573,7 +928,7 @@ fn completion_evidence_gate_action(
 }
 
 fn read_only_tool_signature(tool_call: &ToolCall) -> Option<String> {
-    if !repeat_guarded_read_only_tool_name(&tool_call.function.name) {
+    if !crate::ai::tools::tool_allows_same_turn_replay(&tool_call.function.name) {
         return None;
     }
 
@@ -581,48 +936,6 @@ fn read_only_tool_signature(tool_call: &ToolCall) -> Option<String> {
         .unwrap_or_else(|_| serde_json::Value::String(tool_call.function.arguments.clone()));
     let args_json = serde_json::to_string(&args).unwrap_or_else(|_| args.to_string());
     Some(format!("{}\n{}", tool_call.function.name, args_json))
-}
-
-fn repeat_guarded_read_only_tool_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    let mutating = [
-        "create",
-        "delete",
-        "remove",
-        "update",
-        "write",
-        "save",
-        "append",
-        "insert",
-        "rename",
-        "move",
-        "install",
-        "run",
-        "execute",
-        "oauth",
-        "open_browser",
-        "report_event",
-        "memory",
-        "kill_terminal",
-        "edit",
-        "apply_patch",
-    ];
-    if mutating.iter().any(|needle| lower.contains(needle)) {
-        return false;
-    }
-
-    // 浏览器类工具读取的是"当前页面"这一可变外部状态：同一个 turn 内 navigate/click/
-    // type_text/scroll 等中途操作会改变页面，因此同名同参的 get_text/get_html/list_tabs
-    // 并非重复调用。它们不是参数的纯函数，不能纳入通用只读去重——否则导航到新页面后重新
-    // 读取会被误判为重复而抑制，逼模型改用 evaluate_js 之类兜底。
-    if lower.contains("browser") {
-        return false;
-    }
-
-    let reusable = [
-        "search", "find", "read", "get", "list", "view", "fetch", "export",
-    ];
-    reusable.iter().any(|needle| lower.contains(needle))
 }
 
 /// `knowledge_search` 在一个 user turn 内是可复用的只读事实。通用重复保护只会
@@ -728,16 +1041,6 @@ fn duplicate_knowledge_search_message() -> String {
     "Error: this knowledge_search was already completed with the same query in the current user turn. Reuse its result; search again only after knowledge changes or with a materially different query.".to_string()
 }
 
-fn duplicate_read_only_message(tool_name: &str) -> String {
-    if tool_name == "knowledge_search" {
-        return duplicate_knowledge_search_message();
-    }
-    format!(
-        "Error: this read-only call to '{tool_name}' already completed successfully in the current user turn. \
-Reuse its earlier result; only retry after the underlying data changes or with arguments that request different information."
-    )
-}
-
 fn extract_apply_patch_target_paths_from_patch(patch: &str) -> Vec<PathBuf> {
     crate::ai::tools::apply_patch_target_paths_from_patch(patch)
         .into_iter()
@@ -767,34 +1070,6 @@ fn patch_retry_requires_fresh_read(
                 .into_iter()
                 .any(|path| stale_patch_targets.contains(&path))
     })
-}
-
-/// patch-retry 门控（[`patch_retry_requires_fresh_read`]）要求对失败目标重新
-/// `read_file` 才会把它移出 stale 账本、放行后续 patch；但只读去重
-/// （[`duplicate_read_only_call_ids`]）会把"同一 user turn 内同参数的重复 read_file"
-/// 判为重复而抑制。两个守卫叠加会互锁成活锁：门控逼模型重读 → 重读被去重抑制 →
-/// 账本无法清除 → patch 持续被拦（复现于 `search_tools.rs` 删除会话 idx 207–232：
-/// 连续 apply_patch retry blocked 与 read_file "already completed" 相互打死）。
-///
-/// 这里挑出"针对 stale-patch 目标的 read_file"调用 id，交由调用点将其移出抑制集合，
-/// 确保门控所要求的那次重读一定能真正执行——读成功后 [`update_stale_patch_targets`]
-/// 会把目标移出账本，下一轮 patch 即可放行。读成功后目标离开账本，同文件的后续
-/// read_file 又回到常规去重保护之下，不会引入新的重复读循环。
-fn stale_patch_target_reads(
-    stale_patch_targets: &rustc_hash::FxHashSet<PathBuf>,
-    tool_calls: &[ToolCall],
-) -> HashSet<String> {
-    if stale_patch_targets.is_empty() {
-        return HashSet::new();
-    }
-    tool_calls
-        .iter()
-        .filter(|tool_call| tool_call.function.name == "read_file")
-        .filter(|tool_call| {
-            file_tool_target_path(tool_call).is_some_and(|path| stale_patch_targets.contains(&path))
-        })
-        .map(|tool_call| tool_call.id.clone())
-        .collect()
 }
 
 /// 依据本轮真实执行的工具调用及其结果，增量维护 [`App::stale_patch_targets`] 账本。
@@ -1481,7 +1756,7 @@ fn handle_tool_call_round(
     persisted_turn_messages: &mut usize,
     iteration: usize,
     rejection_reason: Option<ToolCallRejectionReason>,
-    suppressed_read_only_call_ids: &HashSet<String>,
+    suppressed_read_only_results: &HashMap<String, String>,
     turn_had_tool_error: &mut bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let remaining_meta = parse_prune_meta_and_update_marks(
@@ -1502,7 +1777,7 @@ fn handle_tool_call_round(
             &tool_call_execution.allowed_tool_names,
             Some(&mut observer),
             iteration,
-            suppressed_read_only_call_ids,
+            suppressed_read_only_results,
         )?
     };
     let persisted_tool_call_ids =
@@ -1579,9 +1854,9 @@ fn execute_tool_calls_with_suppressed_read_only_calls(
     allowed_tool_names: &rust_tools::commonw::FastSet<String>,
     observer: Option<&mut dyn tools::ToolExecutionObserver>,
     iteration: usize,
-    suppressed_call_ids: &HashSet<String>,
+    suppressed_results: &HashMap<String, String>,
 ) -> Result<ExecuteToolCallsResult, Box<dyn std::error::Error>> {
-    if suppressed_call_ids.is_empty() {
+    if suppressed_results.is_empty() {
         return execute_tool_calls_for_round(
             session_id,
             mcp_client,
@@ -1595,7 +1870,7 @@ fn execute_tool_calls_with_suppressed_read_only_calls(
 
     let executable = tool_calls
         .iter()
-        .filter(|tool_call| !suppressed_call_ids.contains(&tool_call.id))
+        .filter(|tool_call| !suppressed_results.contains_key(&tool_call.id))
         .cloned()
         .collect::<Vec<_>>();
     let executed = if executable.is_empty() {
@@ -1630,11 +1905,12 @@ fn execute_tool_calls_with_suppressed_read_only_calls(
     let mut cached_hits = Vec::with_capacity(tool_calls.len());
     let mut execution_outcomes = Vec::with_capacity(tool_calls.len());
     for tool_call in tool_calls {
-        if suppressed_call_ids.contains(&tool_call.id) {
+        if let Some(content) = suppressed_results.get(&tool_call.id) {
             tool_results.push(crate::ai::types::ToolResult {
                 tool_call_id: tool_call.id.clone(),
-                content: duplicate_read_only_message(&tool_call.function.name),
+                content: content.clone(),
             });
+            // 去重结果只是指向当前上下文中原调用的短锚点，并非真实缓存正文。
             cached_hits.push(false);
             execution_outcomes.push(None);
             continue;
@@ -1659,7 +1935,10 @@ fn execute_tool_calls_with_suppressed_read_only_calls(
         tool_results,
         cached_hits,
         execution_outcomes,
-        had_error: executed_had_error || !suppressed_call_ids.is_empty(),
+        had_error: executed_had_error
+            || suppressed_results
+                .values()
+                .any(|content| content.trim_start().starts_with("Error:")),
     })
 }
 
@@ -2210,6 +2489,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                         "[模型只返回了思考内容，没有给出最终回答，请重试或切换模型]".to_string();
                     return Ok(TurnLoopStep::Break);
                 }
+                record_force_final_reason(messages, "reasoning_only_completion", iteration);
                 *force_final_response = true;
                 return Ok(TurnLoopStep::Continue);
             }
@@ -2225,6 +2505,29 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 CompletionEvidenceGateAction::Reopen => return Ok(TurnLoopStep::Continue),
                 CompletionEvidenceGateAction::Warn => true,
             };
+            match dangling_final_recovery_action(
+                question,
+                messages,
+                turn_messages,
+                &stream_result.assistant_text,
+            ) {
+                DanglingFinalRecoveryAction::Allow => {}
+                DanglingFinalRecoveryAction::RetryWithoutTools => {
+                    crate::ai::driver::print::print_tool_note_line(
+                        "agent-health",
+                        "final response only promised more inspection: retrying once in no-tool synthesis mode",
+                    );
+                    record_force_final_reason(messages, "dangling_action_final", iteration);
+                    *force_final_response = true;
+                    return Ok(TurnLoopStep::Continue);
+                }
+                DanglingFinalRecoveryAction::Warn => {
+                    stream_result.assistant_text.push_str("\n\n");
+                    stream_result
+                        .assistant_text
+                        .push_str(DANGLING_FINAL_WARNING);
+                }
+            }
             if warn_unverified_completion {
                 stream_result.assistant_text.push_str("\n\n");
                 stream_result
@@ -2290,26 +2593,23 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             } else {
                 None
             };
-            let suppressed_read_only_call_ids = if rejection_reason.is_none() {
-                let mut call_ids = duplicate_read_only_call_ids(
+            let suppressed_read_only_results = if rejection_reason.is_none() {
+                let mut results = duplicate_read_only_suppressions(
                     messages,
+                    turn_messages,
                     &tool_call_execution.stream_result.tool_calls,
                 );
-                call_ids.extend(duplicate_knowledge_search_call_ids(
+                for call_id in duplicate_knowledge_search_call_ids(
                     messages,
                     &tool_call_execution.stream_result.tool_calls,
-                ));
-                // patch-retry 门控要求重读 stale 目标才能放行后续 patch；这次重读绝不能
-                // 被只读去重抑制，否则门控与去重互锁成活锁。放行门控指定的重读。
-                for call_id in stale_patch_target_reads(
-                    &app.stale_patch_targets,
-                    &tool_call_execution.stream_result.tool_calls,
                 ) {
-                    call_ids.remove(&call_id);
+                    results
+                        .entry(call_id)
+                        .or_insert_with(duplicate_knowledge_search_message);
                 }
-                call_ids
+                results
             } else {
-                HashSet::new()
+                HashMap::new()
             };
             let image_read_paths = if rejection_reason.is_none() {
                 extract_image_paths_from_file_read_tool_calls(
@@ -2330,7 +2630,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 persisted_turn_messages,
                 iteration,
                 rejection_reason,
-                &suppressed_read_only_call_ids,
+                &suppressed_read_only_results,
                 turn_had_tool_error,
             )?;
             append_auto_image_followup_message(
@@ -2374,6 +2674,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     *final_assistant_text = text;
                     return Ok(TurnLoopStep::Break);
                 }
+                record_force_final_reason(messages, "iteration_limit", iteration);
                 *force_final_response = true;
             } else {
                 // AIOS: kernel is the authoritative source for tool-call quota.
@@ -2406,9 +2707,19 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                                     );
                                     return Ok(TurnLoopStep::Break);
                                 }
+                                record_force_final_reason(
+                                    messages,
+                                    "kernel_turn_rlimit",
+                                    iteration,
+                                );
                                 *force_final_response = true;
                             }
                             RlimitDim::ToolCalls => {
+                                record_force_final_reason(
+                                    messages,
+                                    "kernel_tool_call_rlimit",
+                                    iteration,
+                                );
                                 *force_final_response = true;
                             }
                             _ => {}
@@ -2421,6 +2732,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                             ..
                         }
                     ) {
+                        record_force_final_reason(messages, "kernel_tool_call_rlimit", iteration);
                         *force_final_response = true;
                     }
                 }
@@ -2449,6 +2761,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{Duration, Instant};
+
+    const TEST_REPLAY_TOOL: &str = "test_stable_read";
+
+    inventory::submit!(crate::ai::tools::ToolReplayRegistration {
+        name: TEST_REPLAY_TOOL,
+    });
 
     fn test_app_with_tools(tool_names: &[&str]) -> App {
         App {
@@ -2702,15 +3020,15 @@ mod tests {
     #[test]
     fn duplicate_read_only_call_ids_span_intervening_tool_calls() {
         let args = serde_json::json!({ "file_path": "/tmp/demo.txt", "offset": 1 });
-        let previous = test_tool_call("call_previous", "read_file", args.clone());
-        let current = test_tool_call("call_current", "read_file", args);
+        let previous = test_tool_call("call_previous", TEST_REPLAY_TOOL, args.clone());
+        let current = test_tool_call("call_current", TEST_REPLAY_TOOL, args);
         let messages = vec![
             assistant_tool_call_message(previous),
             tool_result_message("call_previous", "previous result"),
             assistant_tool_call_message(test_tool_call(
                 "call_other",
-                "tree",
-                serde_json::json!({ "path": "/tmp" }),
+                TEST_REPLAY_TOOL,
+                serde_json::json!({ "file_path": "/tmp/other.txt" }),
             )),
             tool_result_message("call_other", "other.rs"),
         ];
@@ -2722,10 +3040,145 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_read_only_suppression_references_previous_successful_result() {
+        let args = serde_json::json!({ "file_path": "/tmp/demo.txt", "offset": 1 });
+        let previous = test_tool_call("call_previous", TEST_REPLAY_TOOL, args.clone());
+        let current = test_tool_call("call_current", TEST_REPLAY_TOOL, args);
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_previous", "previous result"),
+        ];
+
+        let suppressed = duplicate_read_only_suppressions(&messages, &messages, &[current]);
+        let content = suppressed
+            .get("call_current")
+            .expect("duplicate suppressed");
+        assert!(content.contains("call_previous"));
+        assert!(!content.contains("previous result"));
+    }
+
+    #[test]
+    fn compressed_read_result_is_not_used_as_duplicate_anchor() {
+        let args = serde_json::json!({ "file_path": "/tmp/demo.txt" });
+        let previous = test_tool_call("call_previous", TEST_REPLAY_TOOL, args.clone());
+        let current = test_tool_call("call_current", TEST_REPLAY_TOOL, args);
+        let turn_messages = vec![
+            assistant_tool_call_message(previous.clone()),
+            tool_result_message("call_previous", "canonical file contents"),
+        ];
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message(
+                "call_previous",
+                "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]\nOutput preserved in file_path: /tmp/result.txt",
+            ),
+        ];
+
+        assert!(
+            duplicate_read_only_call_ids_with_context(&messages, &turn_messages, &[current])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn suppression_result_does_not_form_an_indirect_anchor_chain() {
+        let args = serde_json::json!({ "file_path": "/tmp/demo.txt" });
+        let previous = test_tool_call("call_previous", TEST_REPLAY_TOOL, args.clone());
+        let suppressed = test_tool_call("call_suppressed", TEST_REPLAY_TOOL, args.clone());
+        let current = test_tool_call("call_current", TEST_REPLAY_TOOL, args);
+        let turn_messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_previous", "canonical file contents"),
+            assistant_tool_call_message(suppressed.clone()),
+            tool_result_message(
+                "call_suppressed",
+                &duplicate_read_only_suppression_message(TEST_REPLAY_TOOL, "call_previous"),
+            ),
+        ];
+        let messages = vec![
+            assistant_tool_call_message(suppressed),
+            tool_result_message(
+                "call_suppressed",
+                &duplicate_read_only_suppression_message(TEST_REPLAY_TOOL, "call_previous"),
+            ),
+        ];
+
+        assert!(
+            duplicate_read_only_call_ids_with_context(&messages, &turn_messages, &[current])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn successful_mutation_invalidates_previous_read_only_result() {
+        let args = serde_json::json!({ "file_path": "/tmp/demo.txt", "offset": 1 });
+        let previous = test_tool_call("call_previous", TEST_REPLAY_TOOL, args.clone());
+        let current = test_tool_call("call_current", TEST_REPLAY_TOOL, args);
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_previous", "old file contents"),
+            assistant_tool_call_message(test_tool_call(
+                "call_patch",
+                "apply_patch",
+                serde_json::json!({ "patch": "*** Begin Patch\n*** End Patch" }),
+            )),
+            tool_result_message("call_patch", "Done!"),
+        ];
+
+        assert!(duplicate_read_only_call_ids(&messages, &[current]).is_empty());
+    }
+
+    #[test]
+    fn state_writes_invalidate_generic_read_replay() {
+        let cases = ["shm_write", "send_ipc_message", "save_skill", "write_file"];
+
+        for write_name in cases {
+            let args = serde_json::json!({ "resource": "demo" });
+            let previous = test_tool_call("call_previous", TEST_REPLAY_TOOL, args.clone());
+            let current = test_tool_call("call_current", TEST_REPLAY_TOOL, args);
+            let write_args = if write_name == "write_file" {
+                serde_json::json!({ "file_path": "demo.txt", "content": "new", "temp": true })
+            } else {
+                serde_json::json!({ "value": "new" })
+            };
+            let messages = vec![
+                assistant_tool_call_message(previous),
+                tool_result_message("call_previous", "old state"),
+                assistant_tool_call_message(test_tool_call("call_write", write_name, write_args)),
+                tool_result_message("call_write", "Done!"),
+            ];
+
+            assert!(
+                duplicate_read_only_call_ids(&messages, &[current]).is_empty(),
+                "{write_name} must invalidate cached output"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_mutation_also_invalidates_generic_read_replay() {
+        let args = serde_json::json!({ "resource": "demo" });
+        let previous = test_tool_call("call_previous", TEST_REPLAY_TOOL, args.clone());
+        let current = test_tool_call("call_current", TEST_REPLAY_TOOL, args);
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_previous", "old state"),
+            assistant_tool_call_message(test_tool_call(
+                "call_failed_write",
+                "execute_command",
+                serde_json::json!({ "command": "printf new > demo.txt; false" }),
+            )),
+            tool_result_message("call_failed_write", "Exit code: 1"),
+        ];
+
+        assert!(duplicate_read_only_call_ids(&messages, &[current]).is_empty());
+    }
+
+    #[test]
     fn duplicate_read_only_call_ids_do_not_cross_user_boundary() {
         let args = serde_json::json!({ "file_path": "/tmp/demo.txt" });
-        let previous = test_tool_call("call_previous", "read_file", args.clone());
-        let current = test_tool_call("call_current", "read_file", args);
+        let previous = test_tool_call("call_previous", TEST_REPLAY_TOOL, args.clone());
+        let current = test_tool_call("call_current", TEST_REPLAY_TOOL, args);
         let messages = vec![
             assistant_tool_call_message(previous),
             tool_result_message("call_previous", "previous result"),
@@ -2778,8 +3231,8 @@ mod tests {
     #[test]
     fn failed_read_only_call_is_not_suppressed() {
         let args = serde_json::json!({ "file_path": "/tmp/demo.txt" });
-        let previous = test_tool_call("call_previous", "read_file", args.clone());
-        let current = test_tool_call("call_current", "read_file", args);
+        let previous = test_tool_call("call_previous", TEST_REPLAY_TOOL, args.clone());
+        let current = test_tool_call("call_current", TEST_REPLAY_TOOL, args);
         let messages = vec![
             assistant_tool_call_message(previous),
             tool_result_message("call_previous", "Error: file temporarily unavailable"),
@@ -2924,11 +3377,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_patch_target_read_is_exempt_from_duplicate_suppression() {
-        // 复现 search_tools.rs 删除会话的活锁：同一 user turn 内先读过该文件，
-        // 随后 apply_patch context mismatch 把它记入 stale 账本。此时门控要求重读，
-        // 但去重会把「同参数的重复 read_file」判为重复而抑制——两者互锁。
-        // stale_patch_target_reads 必须把这次门控要求的重读移出抑制集合。
+    fn stale_patch_target_read_is_never_replay_suppressed() {
         let path = "/tmp/patch-target.rs";
         let read_args = serde_json::json!({ "file_path": path });
         let messages = vec![
@@ -2950,54 +3399,9 @@ mod tests {
         ];
         let fresh_read = test_tool_call("call_fresh_read", "read_file", read_args);
 
-        // 去重本身仍会把这次重读判为重复（同 turn 同参数）。
-        assert_eq!(
-            duplicate_read_only_call_ids(&messages, std::slice::from_ref(&fresh_read)),
-            HashSet::from(["call_fresh_read".to_string()])
-        );
-
-        // 但门控要求重读 stale 目标，因此它必须被豁免。
-        let ledger = ledger_from_messages(&messages);
-        assert_eq!(
-            stale_patch_target_reads(&ledger, std::slice::from_ref(&fresh_read)),
-            HashSet::from(["call_fresh_read".to_string()])
-        );
-    }
-
-    #[test]
-    fn stale_patch_target_reads_ignores_unrelated_reads() {
-        // 账本为空、或读取的是非 stale 目标时，不得豁免任何读取——避免削弱常规去重。
-        let stale_path = "/tmp/stale.rs";
-        let messages = vec![
-            assistant_tool_call_message(test_tool_call(
-                "call_failed_patch",
-                "apply_patch",
-                serde_json::json!({ "file_path": stale_path, "patch": "@@\n-old\n+new" }),
-            )),
-            tool_result_message(
-                "call_failed_patch",
-                "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.",
-            ),
-        ];
-        let ledger = ledger_from_messages(&messages);
-
-        let unrelated_read = test_tool_call(
-            "call_other",
-            "read_file",
-            serde_json::json!({ "file_path": "/tmp/other.rs" }),
-        );
         assert!(
-            stale_patch_target_reads(&ledger, std::slice::from_ref(&unrelated_read)).is_empty()
-        );
-
-        let empty_ledger = rustc_hash::FxHashSet::default();
-        let stale_read = test_tool_call(
-            "call_stale",
-            "read_file",
-            serde_json::json!({ "file_path": stale_path }),
-        );
-        assert!(
-            stale_patch_target_reads(&empty_ledger, std::slice::from_ref(&stale_read)).is_empty()
+            duplicate_read_only_call_ids(&messages, std::slice::from_ref(&fresh_read)).is_empty(),
+            "read_file is externally mutable and must always execute"
         );
     }
 
@@ -3176,23 +3580,42 @@ mod tests {
     }
 
     #[test]
+    fn mutable_disk_and_ipc_tools_are_not_replay_registered() {
+        for name in [
+            "read_mailbox",
+            "shm_read",
+            "read_file",
+            "list_skills",
+            "load_skill",
+        ] {
+            let call = test_tool_call("call", name, serde_json::json!({}));
+            assert!(
+                read_only_tool_signature(&call).is_none(),
+                "{name} must execute against current external state"
+            );
+        }
+        let stable = test_tool_call("stable", TEST_REPLAY_TOOL, serde_json::json!({}));
+        assert!(read_only_tool_signature(&stable).is_some());
+    }
+
+    #[test]
     fn duplicate_read_only_tool_call_is_suppressed_without_forcing_final_response() {
-        let mut app = test_app_with_tools(&["read_file"]);
+        let mut app = test_app_with_tools(&[TEST_REPLAY_TOOL]);
         let shared_mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
         let current_call = test_tool_call(
             "call_current",
-            "read_file",
+            TEST_REPLAY_TOOL,
             serde_json::json!({ "file_path": "/tmp/demo.txt" }),
         );
         let mut messages = vec![
             assistant_tool_call_message(test_tool_call(
                 "call_previous",
-                "read_file",
+                TEST_REPLAY_TOOL,
                 serde_json::json!({ "file_path": "/tmp/demo.txt" }),
             )),
             tool_result_message("call_previous", "previous result"),
         ];
-        let mut turn_messages = Vec::new();
+        let mut turn_messages = messages.clone();
         let mut final_assistant_text = String::new();
         let mut final_assistant_recorded = false;
         let mut terminal_dedupe_candidate = None;
@@ -3212,7 +3635,7 @@ mod tests {
                     ..Default::default()
                 },
                 allowed_tool_names: rust_tools::commonw::FastSet::from_iter([
-                    "read_file".to_string()
+                    TEST_REPLAY_TOOL.to_string()
                 ]),
             }),
             &mut messages,
@@ -3233,7 +3656,7 @@ mod tests {
 
         assert!(matches!(step, TurnLoopStep::Continue));
         assert!(!force_final_response);
-        assert!(turn_had_tool_error);
+        assert!(!turn_had_tool_error);
         let rejected_tool_result = messages
             .iter()
             .rev()
@@ -3244,14 +3667,14 @@ mod tests {
                 .content
                 .as_str()
                 .unwrap_or_default()
-                .contains("already completed successfully in the current user turn")
+                .contains("Duplicate read-only call")
         );
         assert!(
             rejected_tool_result
                 .content
                 .as_str()
                 .unwrap_or_default()
-                .contains("underlying data changes")
+                .contains("call_previous")
         );
     }
 
@@ -3802,6 +4225,77 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn completion_evidence_gate_precedes_dangling_final_recovery() {
+        let mutation = test_tool_call(
+            "call_patch",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: /tmp/project/lib.rs\n@@\n-old\n+new\n*** End Patch"
+            }),
+        );
+        let evidence_messages = vec![
+            assistant_tool_call_message(mutation),
+            tool_result_message("call_patch", "Successfully patched 1 file."),
+        ];
+        let mut app = test_app_with_tools(&["apply_patch", "execute_command"]);
+        let shared_mcp =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let mut messages = evidence_messages.clone();
+        let mut turn_messages = evidence_messages;
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = false;
+        let mut terminal_dedupe_candidate = None;
+        let mut turn_had_tool_error = false;
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "fix the bug",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Completed,
+                assistant_text: "Let me inspect the diff and run the targeted test.".to_string(),
+                skip_response_drain: true,
+                ..Default::default()
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            2,
+            16,
+            0,
+            &mut turn_had_tool_error,
+        )
+        .unwrap();
+
+        assert!(matches!(step, TurnLoopStep::Continue));
+        assert!(
+            !force_final_response,
+            "verification must keep tools enabled"
+        );
+        assert!(messages.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER))
+        }));
+        assert!(!messages.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(DANGLING_FINAL_RECOVERY_MARKER))
+        }));
     }
 
     #[test]
@@ -4760,6 +5254,97 @@ mod tests {
     }
 
     #[test]
+    fn dangling_action_final_gets_exactly_one_no_tool_recovery() {
+        let turn_messages = vec![Message {
+            role: "tool".to_string(),
+            content: Value::String("existing scheduler evidence".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call-1".to_string()),
+            reasoning_content: None,
+        }];
+        let mut messages = turn_messages.clone();
+        let final_text = "Now I understand the SchedulerClock::wait mechanism. Let me read the full run loop body to see how it uses next_wakeup_tick and advance_ticks";
+
+        assert_eq!(
+            dangling_final_recovery_action(
+                "Audit the scheduler changes",
+                &mut messages,
+                &turn_messages,
+                final_text,
+            ),
+            DanglingFinalRecoveryAction::RetryWithoutTools
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .content
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(DANGLING_FINAL_RECOVERY_MARKER))
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            dangling_final_recovery_action(
+                "Audit the scheduler changes",
+                &mut messages,
+                &turn_messages,
+                final_text,
+            ),
+            DanglingFinalRecoveryAction::Warn
+        );
+    }
+
+    #[test]
+    fn dangling_action_detection_preserves_normal_finals_and_plan_answers() {
+        let turn_messages = vec![Message {
+            role: "tool".to_string(),
+            content: Value::String("evidence".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call-1".to_string()),
+            reasoning_content: None,
+        }];
+
+        assert!(!looks_like_dangling_action_final(
+            "Audit the scheduler changes",
+            &turn_messages,
+            "Conclusion: the scheduler wake path is covered. Let me explain the remaining risk.",
+        ));
+        assert!(!looks_like_dangling_action_final(
+            "Give me a plan for auditing the scheduler",
+            &turn_messages,
+            "Next steps: let me inspect the run loop, then check the kernel wake path.",
+        ));
+        assert!(!looks_like_dangling_action_final(
+            "Audit the scheduler changes",
+            &[],
+            "Let me inspect the run loop first.",
+        ));
+        assert!(looks_like_dangling_action_final(
+            "Audit the scheduler changes",
+            &turn_messages,
+            "Now I understand the flow. Let me inspect the final dispatch branch.\n\n[Runtime warning] Completion claim is unverified.",
+        ));
+        assert!(looks_like_dangling_action_final(
+            "Don't give me next steps; audit the scheduler changes",
+            &turn_messages,
+            "Let me inspect the final dispatch branch.",
+        ));
+        assert!(looks_like_dangling_action_final(
+            "Execute the existing next steps and report findings",
+            &turn_messages,
+            "Let me inspect the final dispatch branch.",
+        ));
+        assert!(looks_like_dangling_action_final(
+            "The phrase \"give me a plan\" is an example; audit the scheduler changes",
+            &turn_messages,
+            "Let me inspect the final dispatch branch.",
+        ));
+    }
+
+    #[test]
     fn ctrl_c_during_foreground_tool_round_cancels_without_shutdown() {
         let _env_guard = crate::ai::test_support::ENV_LOCK
             .lock()
@@ -4833,7 +5418,7 @@ mod tests {
                 &mut persisted_turn_messages,
                 1,
                 None,
-                &HashSet::new(),
+                &HashMap::new(),
                 &mut turn_had_tool_error,
             );
             (

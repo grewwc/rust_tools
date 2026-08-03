@@ -39,6 +39,9 @@ pub(crate) const MAX_SUBAGENT_SPAWN_DEPTH: usize = 1;
 /// Subagent 是父 agent 的叶子取证/执行单元，不应继承主 agent 的完整长循环预算。
 /// 主 agent 仍保留自身 max_steps；这里只有 `task` / `task_spawn` 启动路径会钳制。
 pub(crate) const SUBAGENT_MAX_ITERATIONS: usize = 32;
+/// 显式声明 `max_steps` 的 agent（如深度审计 `/audit`）可以突破默认 32 轮，
+/// 但任何子代理都不能超过这个绝对硬帽，防止失控子代理无限迭代。
+pub(crate) const SUBAGENT_MAX_ITERATIONS_HARD_CAP: usize = 256;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 /// 子代理结果只是主 agent 的证据输入，不是最终对用户的直接回答。
 /// 主 agent 拿到 payload 后仍需自行汇总结论、风险与下一步，再面向用户输出。
@@ -386,15 +389,24 @@ fn task_wait_key(
 fn load_or_create_task_wait_state(key: &TaskWaitKey, timeout_secs: u64) -> TaskWaitState {
     let now = Instant::now();
     let mut states = TASK_WAIT_STATES.lock().unwrap();
-    let state = states.entry(key.clone()).or_insert_with(|| TaskWaitState {
-        deadline: now + Duration::from_secs(timeout_secs),
-        timeout_secs,
-        expired: false,
+    let mut inserted = false;
+    let state = states.entry(key.clone()).or_insert_with(|| {
+        inserted = true;
+        TaskWaitState {
+            deadline: now + Duration::from_secs(timeout_secs),
+            timeout_secs,
+            expired: false,
+        }
     });
     if now >= state.deadline {
         state.expired = true;
     }
-    *state
+    let state = *state;
+    drop(states);
+    if inserted {
+        crate::ai::driver::notify_scheduler_after(Duration::from_secs(timeout_secs));
+    }
+    state
 }
 
 fn clear_task_wait_state(key: &TaskWaitKey) {
@@ -802,7 +814,7 @@ pub(in crate::ai) fn capped_subagent_manifest(agent: &AgentManifest) -> AgentMan
     let max_steps = agent
         .max_steps
         .unwrap_or(SUBAGENT_MAX_ITERATIONS)
-        .min(SUBAGENT_MAX_ITERATIONS)
+        .min(SUBAGENT_MAX_ITERATIONS_HARD_CAP)
         .max(1);
     capped.max_steps = Some(max_steps);
     capped
@@ -998,6 +1010,7 @@ pub(crate) fn spawn_subagent_kernel_task(
             },
         );
     }
+    crate::ai::driver::notify_scheduler_after(SUBAGENT_WALL_CLOCK_TIMEOUT);
 
     Ok(SpawnedSubagentTask {
         task_id,

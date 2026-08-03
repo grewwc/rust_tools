@@ -122,5 +122,5 @@ where the format enum is at
 ## Host registration
 
 Add to `~/.config/mcp.json` under `mcpServers` (tools appear as
-`mcp_browser_navigate`, etc.). **Keep `request_timeout_ms` (120000) > server cap
-(90000).**
+`mcp_browser_navigate`, etc.). Keep `request_timeout_ms` (120000) > server cap
+(90000) - see invariant #1.

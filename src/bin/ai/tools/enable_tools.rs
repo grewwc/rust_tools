@@ -476,6 +476,31 @@ mod tests {
     }
 
     #[test]
+    fn skill_discovery_tools_remain_dynamically_enabled() {
+        // skill 发现/激活工具已从 core 组降级为 builtin-only：默认不随每轮
+        // 常驻，但仍必须在 enable_tools 目录中可见、可按需启用，不能"隐形"。
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+
+        let output = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+        for name in ["activate_skill", "list_skills", "load_skill", "save_skill"] {
+            assert!(
+                output.contains(&format!("  - {name}:")),
+                "{name} must remain discoverable via enable_tools"
+            );
+        }
+
+        let enabled = execute_enable_tools(
+            &json!({"operation": "enable", "tools": ["activate_skill", "list_skills"]}),
+        )
+        .unwrap();
+        assert!(enabled.contains("Enabled 2 tool(s): activate_skill, list_skills"));
+    }
+
+    #[test]
     fn enable_known_mcp_tool_queues_mcp_activation() {
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()

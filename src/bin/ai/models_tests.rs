@@ -344,23 +344,37 @@ fn known_model_entries_carry_adapter_and_quality_tier() {
 
 #[test]
 fn endpoint_for_known_model_prefers_model_config_over_global_fallback() {
-    // 任意一个在 models.json 中显式声明 endpoint 的条目都应该优先使用自身配置，
-    // 忽略 global_fallback。这里挑第一个声明 endpoint 的条目即可。
+    // 任意一个在 models.json 中显式声明 endpoint 的条目都应该优先使用自身配置。
     let (name, expected) = super::model_names::all()
         .iter()
-        .find_map(|m| {
-            m.endpoint
+        .filter_map(|m| {
+            let endpoint = m
+                .endpoint
                 .as_deref()
                 .map(str::trim)
-                .filter(|e| !e.is_empty())
-                .map(|e| (m.name.clone(), e.to_string()))
+                .filter(|e| !e.is_empty())?;
+            let resolved = super::model_names::find_by_identifier(&m.name)?;
+            std::ptr::eq(resolved, *m).then(|| (m.name.clone(), endpoint.to_string()))
         })
-        .expect("models.json must contain at least one entry with explicit endpoint");
+        .next()
+        .expect("models.json must contain a selectable entry with an explicit endpoint");
     let endpoint = endpoint_for_model(
         &name,
         "https://example.com/should-not-be-used/v1/chat/completions",
     );
     assert_eq!(endpoint, expected);
+}
+
+#[test]
+fn deepseek_v4_flash_selector_keeps_opencode_compatibility() {
+    assert_eq!(
+        determine_model("deepseek-v4-flash"),
+        "deepseek-v4-flash-opencode"
+    );
+    assert_eq!(
+        determine_model("deepseek-v4-flash-0731-alibaba"),
+        "deepseek-v4-flash-0731-alibaba"
+    );
 }
 
 #[test]

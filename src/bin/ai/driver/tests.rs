@@ -1,8 +1,8 @@
 use super::note_search::read_recent_history;
 use super::{
     DispatchOutcomeTag, ProcessDispatchMeta, SCHED_COOLDOWN_EPOCHS_DEFAULT,
-    SCHEDULER_DISPATCH_META, background_execute_limit, background_pop_limit,
-    build_background_process_question, decode_background_process_task_goal,
+    SCHEDULER_DISPATCH_META, SCHEDULER_TICK_DURATION, SchedulerClock, background_execute_limit,
+    background_pop_limit, build_background_process_question, decode_background_process_task_goal,
     has_pending_foreground_process, maybe_auto_route_agent, one_shot_cli_mode,
     reset_scheduler_test_state, resolve_background_subagent_override,
     resolve_startup_session_choice, resolve_startup_session_choice_with_selector,
@@ -19,7 +19,16 @@ use crate::ai::types::{AgentContext, App, AppConfig};
 use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy, WaitReason};
 use aios_kernel::primitives::ResourceLimit;
 use std::sync::{Arc, atomic::AtomicBool};
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
+
+#[test]
+fn scheduler_clock_preserves_partial_ticks_across_notifications() {
+    let mut clock = SchedulerClock::default();
+    assert_eq!(clock.consume_elapsed(Duration::from_millis(9)), 0);
+    assert_eq!(clock.duration_until_ticks(1), Duration::from_millis(1));
+    assert_eq!(clock.consume_elapsed(Duration::from_millis(1)), 1);
+    assert_eq!(clock.duration_until_ticks(2), SCHEDULER_TICK_DURATION * 2);
+}
 
 #[test]
 fn background_dispatch_limits_scale_with_backlog() {

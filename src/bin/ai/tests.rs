@@ -1255,6 +1255,80 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
 
 
 #[test]
+fn dedup_skips_byte_identical_overflow_archived_stubs() {
+    // 回归测试（真实案例 session c0ad15e6，msg 471/472）：
+    // 当一条 tool 结果内容**本身已是 overflow 归档 stub**（`[context-overflow-truncated]`
+    // 或 `[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]`）时，它并非"完整结果"，只是指向磁盘
+    // 原文的召回指针。byte-identical dedup 逆序首见登记 canonical，副本与 canonical
+    // 逐字节相同 ⇒ canonical 同样是截断 stub。若仍折叠成 "reuse the canonical full
+    // result" 就是谎报，把模型导向"下一跳仍是 stub"的回指链、永远拿不到原文。
+    // 正确行为：跳过折叠，各条 stub 各自保留其 file_path 召回指针。
+    let archived_stub = format!(
+        "[context-overflow-truncated] full original archived at: \
+         /sess.assets/tool-overflow-compressed/20260803T041154Z-read_file-abc.txt\n\
+         head+tail preview:\n{}",
+        "X".repeat(4_000)
+    );
+
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("system prompt".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    // 5 次读取同一文件，结果内容都已是**同一条截断 stub**（模拟溢出后被反复重放）。
+    for i in 0..5 {
+        let (a, t) = read_file_call_pair(
+            &format!("call_stub_{i}"),
+            "/repo/task_tools.rs",
+            &archived_stub,
+        );
+        messages.push(a);
+        messages.push(t);
+    }
+
+    // 末尾追加唯一内容的近端 tool 消息，把上面的读取推出 KEEP_RECENT 保护窗，
+    // 确保 dedup 真正作用到它们身上。
+    for i in 0..8 {
+        let (a, t) = read_file_call_pair(
+            &format!("call_pad_{i}"),
+            &format!("/repo/pad_{i}.py"),
+            &format!("padding-{i}"),
+        );
+        messages.push(a);
+        messages.push(t);
+    }
+
+    let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None);
+
+    // 关键断言：绝不能产生任何 "reuse the canonical full result" 的 byte-identical
+    // dedup stub——那会把已截断的 stub 谎报成可复用全文。
+    let lying_dedup_stubs = compressed
+        .iter()
+        .filter_map(|m| m.content.as_str())
+        .filter(|s| s.contains("byte-identical") && s.contains("No need to re-read"))
+        .count();
+    assert_eq!(
+        lying_dedup_stubs, 0,
+        "overflow-archived stubs must not be dedup-collapsed into a 'reuse canonical full result' claim"
+    );
+
+    // 5 条截断 stub 必须原样保留（各自带 file_path 召回指针），一条都不少。
+    let preserved_archive_stubs = compressed
+        .iter()
+        .filter_map(|m| m.content.as_str())
+        .filter(|s| s.trim_start().starts_with("[context-overflow-truncated]"))
+        .count();
+    assert_eq!(
+        preserved_archive_stubs, 5,
+        "all five overflow-archived stubs must be preserved so each keeps its own recall pointer"
+    );
+}
+
+
+#[test]
 fn compression_spills_old_user_message_to_session_temp_file() {
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-preserve-user-overflow-{}",

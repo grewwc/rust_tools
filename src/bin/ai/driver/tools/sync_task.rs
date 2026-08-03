@@ -118,8 +118,8 @@ fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubag
     Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped))
 }
 
-/// 执行模型通过 `task` 工具发起的同步子代理。普通工具调用始终保留五分钟上限；
-/// 只有显式命令入口才可以通过下面的内部函数使用各自的等待预算。
+/// 执行模型通过 `task` 工具发起的同步子代理。普通工具调用可使用完整五分钟预算；
+/// 仅 driver 的显式命令可选择在硬超时前请求子代理收口。
 pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
     execute_sync_task_with_hard_timeout(tool_call_id, args, SYNC_TASK_HARD_TIMEOUT)
 }

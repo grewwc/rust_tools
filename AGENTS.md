@@ -1,21 +1,17 @@
 # AGENTS.md - rust_tools Project Guide
 
-## Scope
-
-Root-level overview and repo-wide invariants only. Subsystem details belong in
+Root-level overview and repo-wide invariants only; subsystem details live in
 scoped `AGENTS.md` files. Only `AGENTS.md` / `Agent.md` / `CLAUDE.md` are
 auto-discovered.
 
-## Overview
+Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`, an
+LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill routing,
+tool registry, and MCP integration. Workspace members: root crate,
+`crates/rust_tools_macros`, `crates/aios_kernel`, `crates/mcp_stdio`,
+`crates/mcp_browser`, `crates/mcp_excel`. macOS-first (`objc2` deps); core
+library cross-platform.
 
-Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`,
-an LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill
-routing, tool registry, and MCP integration.
-
-- **Workspace members**: root crate, `crates/rust_tools_macros`, `crates/aios_kernel`, `crates/mcp_stdio`, `crates/mcp_browser`, `crates/mcp_excel`
-- **Platform**: macOS-first (`objc2` deps); core library cross-platform
-
-## Top-Level Layout
+## Layout
 
 ```text
 src/lib.rs                  # utility library
@@ -31,10 +27,10 @@ tests/                      # integration tests
 models.json                 # model registry
 ```
 
-> `mcp_browser` / `mcp_excel` are **standalone binary crates** (not deps of `a`);
-> `cargo check --bin a` stays fast and unpolluted. Both reuse the tiny `mcp_stdio`
-> lib crate for transport + `run<S: McpServer>` dispatch. New "drive an OS-native
-> app" MCP servers should follow the same pattern.
+> `mcp_browser` / `mcp_excel` are standalone binary crates (not deps of `a`),
+> so `cargo check --bin a` stays fast. Both reuse the `mcp_stdio` lib crate for
+> transport + `run<S: McpServer>` dispatch; new "drive an OS-native app" MCP
+> servers should follow the same pattern.
 
 ## Build / Test
 
@@ -52,14 +48,14 @@ cargo test --lib --bin a test_name   # only when one named test spans lib + bin
 
 Never run bare `cargo test` / `cargo build --release` / workspace-wide commands
 for routine verification, and never repeat a `cargo test` without a code change
-in between. Prefer locating an existing focused test before choosing a command.
+in between. Prefer an existing focused test before running one.
 
 **Verification ladder:**
 
 1. **No code change / docs-only**: no Cargo command required.
 2. **Type-level / compile-risk / mechanical refactor**: run the narrowest `cargo check`.
 3. **Runtime behavior changed, focused test exists**: run that named test.
-4. **Runtime behavior changed, no focused test**: run the narrowest `cargo check`; say no targeted test was found. Do not run broad tests just to satisfy this.
+4. **Runtime behavior changed, no focused test**: run the narrowest `cargo check`; say no targeted test was found.
 5. **Bug fix with regression/new test**: run that named test; on failure, fix and re-run.
 
 ## Global Engineering Rules
@@ -74,13 +70,11 @@ in between. Prefer locating an existing focused test before choosing a command.
 8. **Extensibility**: prefer data-driven/registration-based design over hardcoded `if`/`else` chains. Additive, optional registration over modifying shared structs.
 9. **AGENTS.md maintenance**: after every code change, check whether the nearest scoped `AGENTS.md` (or this root file) needs updating. **Delete or revise** stale content - do not merely append. Outdated rules that contradict current behavior are worse than missing rules.
 10. **Git safety**: never `git stash` / `git stash drop` someone else's uncommitted changes. Use a temporary branch, worktree, or stash only your own (and pop back).
-11. **Architecture-first, no excessive fallback logic**: if a path needs many layers of fallback, the abstraction/data flow is wrong - refactor so the happy path is clean instead of piling on defensive `if`/`else`.
+11. **Architecture-first**: if a path needs many layers of fallback, the data flow is wrong - refactor so the happy path is clean instead of piling on defensive `if`/`else`.
 
 ## High-Value Pitfalls
 
-1. `.agent` files are compiled into `a` via `include_str!`; editing them recompiles the binary. `.skill` files load at runtime from the skills dir (no recompile).
+1. `.agent` files are compiled into `a` via `include_str!` (editing recompiles); `.skill` files load at runtime from the skills dir (no recompile).
 2. `src/bin/ff/` is embedded into `a` via `include!`; changes there affect the agent binary.
 3. `runtime_ctx::effective_cwd()` is the working-directory authority for tools and sub-agents.
 4. `objc2*` dependencies are macOS-only.
-
-> Subsystem-specific pitfalls live in their scoped `AGENTS.md`.

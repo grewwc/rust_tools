@@ -355,6 +355,7 @@ pub(super) fn publish_background_task_failure(
     }
     if let Some(addr) = completion_futex_addr {
         let _ = os.futex_store(addr, 1);
+        super::notify_scheduler();
     }
     record_scheduler_outcome(os, pid, DispatchOutcomeTag::Failed);
     super::terminate_and_cleanup(os, pid, format!("Failed: {}", error), true);

@@ -2452,6 +2452,16 @@ fn dedup_repeated_tool_results(
             // 重读"的失忆环。用内容 hash 区分二者：hash 首见 → 保留全文并登记；
             // hash 重现 → 折叠为回指最新全文的 stub（保留 tool_call_id 以维持协议）。
             let text = value_to_string(&messages[idx].content);
+            // 若内容本身已是 overflow/truncation 归档 stub，它并非"完整结果"：
+            // canonical（逆序首见）与本副本 byte-identical，因此 canonical 同样是
+            // 截断 stub。此时折叠成"reuse the canonical full result"是谎报——真实
+            // 案例：task_wait 结果先被 overflow 截断成 [context-overflow-truncated]，
+            // dedup 再谎称可复用 canonical 全文，模型反复追 canonical 却永远拿不到
+            // 原文（下一跳仍是 stub 的回指链）。跳过折叠：每条 stub 自带 file_path
+            // 召回指针，保留它们即可让模型直接回读归档原文。
+            if is_content_overflow_archived_stub(&messages[idx].content) {
+                continue;
+            }
             let mut hasher = FxHasher::default();
             text.hash(&mut hasher);
             let content_key = (occurrence.tool_name.clone(), hasher.finish());
@@ -2525,6 +2535,20 @@ fn dedup_tool_occurrence(
 
 fn tool_uses_content_identity_dedup(tool_name: &str) -> bool {
     is_non_compressible_tool(tool_name) || tool_name == "tree"
+}
+
+/// 内容是否为「已外溢/截断的归档 stub」——即本身就不是完整结果，只是一个指向
+/// 磁盘原文的召回指针（`[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]` 或
+/// `[context-overflow-truncated]`）。byte-identical dedup 遇到这类内容时必须
+/// 跳过折叠：canonical 与副本逐字节相同 ⇒ canonical 同样是截断 stub，谎称
+/// "reuse the canonical full result" 会把模型导向拿不到原文的回指链。
+fn is_content_overflow_archived_stub(content: &Value) -> bool {
+    if is_preserved_tool_overflow_content(content) {
+        return true;
+    }
+    content
+        .as_str()
+        .is_some_and(|text| text.trim_start().starts_with("[context-overflow-truncated]"))
 }
 
 fn render_dedup_tool_stub(

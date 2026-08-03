@@ -88,5 +88,3 @@ inventory::submit!(ToolStreamingRegistration {
     name: "write_file",
     execute_streaming: execute_write_file_streaming,
 });
-
-

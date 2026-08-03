@@ -1027,7 +1027,7 @@ async fn finalize_stream_interaction(
             stream_result.tool_calls.clear();
             if stream_result.assistant_text.trim().is_empty() {
                 stream_result.assistant_text =
-                    "工具调用已停止；基于已获得的信息，无法继续验证。".to_string();
+                    "运行时已停止继续执行工具调用。请基于已获得的信息收尾结论；若证据不足，请明确列出缺失项与下一步建议。".to_string();
             }
             IterationExecution::FinalResponse(stream_result)
         }

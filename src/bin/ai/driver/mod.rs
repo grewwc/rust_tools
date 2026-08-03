@@ -29,6 +29,7 @@ use std::{
 };
 
 use aios_kernel::primitives::{RlimitDim, RlimitVerdict};
+use tokio::sync::Notify;
 
 use crate::ai::{
     agents::{self, AgentManifest},
@@ -104,6 +105,69 @@ fn current_task_pid() -> Option<u64> {
 /// raw mode 输入框，让调度循环继续 tick、子 agent 在 cooked 模式下正常输出，避免
 /// 并发写终端造成的显示混乱（同时不丢失任何子 agent 输出）。
 static BG_SUBAGENT_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static SCHEDULER_NOTIFY: Notify = Notify::const_new();
+const SCHEDULER_TICK_DURATION: Duration = Duration::from_millis(10);
+
+pub(crate) fn notify_scheduler() {
+    SCHEDULER_NOTIFY.notify_one();
+}
+
+pub(crate) fn notify_scheduler_after(delay: Duration) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        tokio::time::sleep(delay).await;
+        notify_scheduler();
+    });
+}
+
+#[derive(Default)]
+struct SchedulerClock {
+    partial_tick: Duration,
+}
+
+impl SchedulerClock {
+    fn duration_until_ticks(&self, ticks: u64) -> Duration {
+        let ticks = u32::try_from(ticks).unwrap_or(u32::MAX);
+        SCHEDULER_TICK_DURATION
+            .saturating_mul(ticks)
+            .saturating_sub(self.partial_tick)
+    }
+
+    fn consume_elapsed(&mut self, elapsed: Duration) -> u64 {
+        let total = self.partial_tick.saturating_add(elapsed);
+        let tick_nanos = SCHEDULER_TICK_DURATION.as_nanos();
+        let ticks = (total.as_nanos() / tick_nanos).min(u64::MAX as u128) as u64;
+        self.partial_tick = Duration::from_nanos((total.as_nanos() % tick_nanos) as u64);
+        ticks
+    }
+
+    async fn wait(&mut self, app: &App) {
+        let wake_after = {
+            let os = app.os.lock().unwrap_or_else(|err| err.into_inner());
+            os.next_wakeup_tick().map(|wake_tick| {
+                self.duration_until_ticks(wake_tick.saturating_sub(os.current_tick()).max(1))
+            })
+        };
+        let started_at = tokio::time::Instant::now();
+        if let Some(delay) = wake_after {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(delay) => {}
+                _ = SCHEDULER_NOTIFY.notified() => {}
+            }
+        } else {
+            SCHEDULER_NOTIFY.notified().await;
+        }
+
+        let elapsed_ticks = self.consume_elapsed(started_at.elapsed());
+        if elapsed_ticks > 0 {
+            let mut os = app.os.lock().unwrap_or_else(|err| err.into_inner());
+            os.advance_ticks(elapsed_ticks);
+        }
+    }
+}
 
 fn bg_subagents_inflight() -> bool {
     BG_SUBAGENT_INFLIGHT.load(Ordering::Acquire) > 0
@@ -116,6 +180,7 @@ pub(super) struct BgSubagentGuard;
 impl BgSubagentGuard {
     fn new() -> Self {
         BG_SUBAGENT_INFLIGHT.fetch_add(1, Ordering::AcqRel);
+        notify_scheduler();
         BgSubagentGuard
     }
 }
@@ -123,6 +188,7 @@ impl BgSubagentGuard {
 impl Drop for BgSubagentGuard {
     fn drop(&mut self) {
         BG_SUBAGENT_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+        notify_scheduler();
     }
 }
 
@@ -706,15 +772,12 @@ async fn run_loop(
         }
     };
 
+    let mut scheduler_clock = SchedulerClock::default();
     loop {
         let epoch = next_scheduler_epoch();
-        {
-            let mut os = app.os.lock().unwrap_or_else(|err| err.into_inner());
-            os.advance_tick();
-        }
 
         // 主动回收超过 wall-clock 总寿命的卡死 subagent 进程。task_wait 内的同名检查
-        // 只在主 agent 主动调用时触发；此处每 epoch 扫描，确保主 agent 去做别的事、
+        // 只在主 agent 主动调用时触发；此处在调度事件发生后扫描，确保主 agent 去做别的事、
         // 长期不调 task_wait 时，卡死的后台 subagent 也能被及时终止，避免永久占用
         // 调度器资源。函数内分两步取锁（先 registry 后 kernel），不与 task_wait 的
         // 锁顺序（registry -> kernel）形成环；且此处已释放 app.os 锁，无重入死锁。
@@ -777,15 +840,15 @@ async fn run_loop(
         }
 
         if has_pending_foreground_process(app) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            scheduler_clock.wait(app).await;
             continue;
         }
 
         // 仍有后台子 agent 在途时，不打开交互式输入框（它会进入 raw mode，导致子 agent
-        // 的流式输出 `\n` 缺 `\r` 而逐行右移）。继续 tick 调度循环，等子 agent 在 cooked
+        // 的流式输出 `\n` 缺 `\r` 而逐行右移）。等待后台状态通知，等子 agent 在 cooked
         // 模式下把输出写完、计数归零后再接收新输入。one-shot 模式没有交互输入框，不受影响。
         if !one_shot_mode && bg_subagents_inflight() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            scheduler_clock.wait(app).await;
             continue;
         }
 

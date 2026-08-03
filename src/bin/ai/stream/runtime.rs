@@ -1,5 +1,6 @@
 use super::inline_recovery::{
-    collect_valid_tool_calls, ensure_tool_calls_section_open, recover_inline_tool_calls,
+    collect_valid_tool_calls, ensure_tool_calls_section_open, normalize_inline_tool_call_markup,
+    recover_inline_tool_calls,
 };
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
@@ -469,24 +470,14 @@ fn finalize_stream_response(
         collect_valid_tool_calls(&mut state.content.tool_calls_map);
     state.content.dropped_malformed_tool_call = dropped_malformed;
 
-    // Fallback：部分 provider（已知 qwen3.7-max thinking 模式）会把 function call
-    // 以纯 content JSON 的形式输出而不走 delta.tool_calls[]，导致 turn 在打印完
-    // 那段 JSON 后被判定为 Completed 直接结束。这里做一次保守的反向识别：仅当
-    // assistant_text 整体（去掉代码围栏 / <tool_call> 标签后）就是一个含 name 和
-    // arguments 的 JSON 对象/数组时，才升级为 tool_call。
+    // Fallback：部分 provider 会把 function call 作为普通 content 返回，而不走
+    // delta.tool_calls[]。流式解析未命中时，对完整 assistant_text 再做一次保守恢复。
     if tool_calls.is_empty() {
         if let Some(recovered) = recover_inline_tool_calls(&state.content.assistant_text) {
             tool_calls = recovered;
-            // 把误打成 content 的那段 JSON 从可见输出里挪走，避免被持久化为
-            // 真正的 assistant 文本——否则下一轮请求模型会看到"自己上一轮回答
-            // 了一段 JSON"，进一步混乱。
-            let stripped = std::mem::take(&mut state.content.assistant_text);
-            if state.content.hidden_meta.is_empty() {
-                state.content.hidden_meta = stripped;
-            } else {
-                state.content.hidden_meta.push('\n');
-                state.content.hidden_meta.push_str(&stripped);
-            }
+            // 协议载荷既不是 assistant 正文，也不是模型 self_note。恢复成功后直接
+            // 丢弃，避免 no-tool handoff 把 DSML/JSON 持久化为 internal_note。
+            state.content.assistant_text.clear();
         }
     }
 
@@ -1517,6 +1508,9 @@ fn process_stream_payload(
         }
     }
 
+    let recovered_inline_events =
+        recover_protocol_only_inline_tool_call_snapshot(&mut chunk, merge_mode, state);
+
     // 渲染消费去重后的后缀，避免跨事件路径的 thinking 重复输出。
     if let Some(choice) = chunk.choices.first_mut() {
         choice.delta.reasoning_content = deduped_reasoning;
@@ -1525,7 +1519,7 @@ fn process_stream_payload(
     let external_tool_progress =
         process_external_tool_calls_delta(app, markers, state, &chunk, merge_mode);
 
-    let (events, internal_tool_call_events) = extract_chunk_events_streaming(
+    let (events, mut internal_tool_call_events) = extract_chunk_events_streaming(
         &chunk,
         markers.hidden_begin,
         markers.hidden_end,
@@ -1537,6 +1531,7 @@ fn process_stream_payload(
         &mut state.content.bare_xml_tool_call_streamer,
         &mut state.content.inline_markup_normalizer,
     );
+    internal_tool_call_events.extend(recovered_inline_events);
     let (saw_hallucinated_marker, internal_tool_progress) =
         process_internal_tool_calls(app, markers, state, internal_tool_call_events);
     let mut meaningful_progress =
@@ -1606,6 +1601,69 @@ fn process_stream_payload(
         should_stop: false,
         meaningful_progress,
     })
+}
+
+/// OpenCode 等兼容网关偶尔会把完整 DSML 工具协议作为单个 content 快照返回。
+/// 在正文提交和终端渲染前识别这种完整包裹，避免只能在流末 fallback 恢复。
+fn recover_protocol_only_inline_tool_call_snapshot(
+    chunk: &mut StreamChunk,
+    merge_mode: StreamEventMergeMode,
+    state: &StreamProcessingState,
+) -> Vec<InternalToolCallStreamEvent> {
+    let Some(choice) = chunk.choices.first_mut() else {
+        return Vec::new();
+    };
+    if !choice.delta.tool_calls.is_empty() || choice.delta.content.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let normalized = normalize_inline_tool_call_markup(&choice.delta.content);
+    let normalized = normalized.trim();
+    if !normalized.starts_with("<tool_calls>") || !normalized.ends_with("</tool_calls>") {
+        return Vec::new();
+    }
+    let Some(mut tool_calls) = recover_inline_tool_calls(normalized) else {
+        return Vec::new();
+    };
+
+    choice.delta.content.clear();
+    if matches!(merge_mode, StreamEventMergeMode::AppendMissingSuffix) {
+        // `.done` 快照会重发此前 delta 已解析的完整协议；只过滤语义相同的调用，
+        // 不能因已有其他工具调用就误吞真正新增的并行调用。
+        tool_calls.retain(|tool_call| {
+            !state
+                .content
+                .tool_calls_map
+                .iter()
+                .any(|(_, builder)| collected_tool_call_matches(builder, tool_call))
+        });
+    }
+
+    let mut events = Vec::with_capacity(tool_calls.len().saturating_mul(3));
+    for tool_call in tool_calls {
+        events.push(InternalToolCallStreamEvent::Begin(tool_call.function.name));
+        events.push(InternalToolCallStreamEvent::Args(
+            tool_call.function.arguments,
+        ));
+        events.push(InternalToolCallStreamEvent::End);
+    }
+    events
+}
+
+fn collected_tool_call_matches(
+    builder: &ToolCallBuilder,
+    tool_call: &crate::ai::types::ToolCall,
+) -> bool {
+    if builder.function_name != tool_call.function.name {
+        return false;
+    }
+    match (
+        serde_json::from_str::<serde_json::Value>(&builder.arguments),
+        serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments),
+    ) {
+        (Ok(existing), Ok(incoming)) => existing == incoming,
+        _ => builder.arguments.trim() == tool_call.function.arguments.trim(),
+    }
 }
 
 /// 检测文本尾部是否出现三次连续、完全相同的长片段（退化复读循环）。

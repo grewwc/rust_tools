@@ -91,6 +91,7 @@ fn builtin_audit_agent_enforces_evidence_driven_review() {
     assert!(agent.is_primary());
     assert!(agent.is_subagent());
     assert_eq!(agent.model_tier, Some(AgentModelTier::Heavy));
+    assert_eq!(agent.max_steps, Some(256));
     assert!(agent.disable_mcp_tools);
     assert!(agent.prompt.contains("Falsify candidate findings"));
     assert!(agent.prompt.contains("An unresolved hypothesis is not a finding"));

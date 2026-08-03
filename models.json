@@ -17,18 +17,19 @@
     "endpoint": "https://opencode.ai/zen/go/v1/chat/completions"
   },
   {
-    "key": "grok",
-    "name": "grok-4.5",
-    "adapter": "opencode",
+    "key": "deepseek-v4-flash-0731-alibaba",
+    "name": "deepseek-v4-flash-0731",
+    "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
-    "is_vl": true,
+    "adapter": "alibaba",
+    "is_vl": false,
     "search_enabled": true,
+    "default_reasoning_effort": "xhigh",
     "tools_default_enabled": true,
+    "explicit_prompt_cache": true,
     "enable_thinking": true,
-    "subagent_priority": 85,
-    "default_reasoning_effort": "high",
-    "max_output_tokens": 393216,
-    "endpoint": "https://opencode.ai/zen/go/v1/chat/completions"
+    "subagent_priority": 80,
+    "max_output_tokens": 65536
   },
   {
     "key": "glm-5.2-opencode",

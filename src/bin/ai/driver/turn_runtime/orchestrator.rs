@@ -29,7 +29,10 @@ use super::{
     persistence::persist_pending_turn_messages,
     prepare::prepare_turn,
     record_llm_summary_attempt_chars, should_try_llm_summary,
-    tool_result::handle_iteration_execution_for_model,
+    tool_result::{
+        completion_evidence_state, completion_tool_result_succeeded,
+        handle_iteration_execution_for_model, tool_call_is_successful_mutation_candidate,
+    },
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
 };
 
@@ -52,11 +55,10 @@ const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
 /// 分页、同一检索的不同结果上限会折叠成同一 coarse 签名。
 const VOLATILE_ARG_KEYS: &[&str] = &["offset", "limit", "page", "cursor", "max_results"];
 
-/// 中段断路器绝对上限：单轮工具迭代达到该值即注入一次收敛提示，远早于
-/// max_iterations 硬上限，用于治理「合法但低效」的工具刷屏。
-/// 默认 turn 预算是 1024；软提示应足够早，给模型留出整理证据并主动收口的空间，
-/// 但它只提醒、不禁用工具，不压缩复杂任务的硬预算。
-const TOOL_ITERATION_SOFT_LIMIT: usize = 24;
+/// 工具轮次检查点的首个固定阈值。默认 turn 硬预算是 4096；24 / 48 / 96
+/// 三档检查点只调度收敛、不禁用工具，累计轮次也不会因 mutation 清零。
+const TOOL_ROUND_CHECKPOINT: usize = 24;
+const TOOL_ROUND_CHECKPOINT_MULTIPLIERS: [usize; 3] = [1, 2, 4];
 
 /// 连续「流读取中断型」截断（stream_error）的重试上限。超过即放弃本 turn，
 /// 避免服务端持续断流时无限重试（尤其后台任务的 max_iterations = usize::MAX）。
@@ -118,10 +120,18 @@ const MUTATION_TOOL_NAMES: &[&str] = &[
     "execute_command",
 ];
 
-/// 单轮工具迭代软阈值：取 max_iterations 的一半与绝对上限的较小值，保证一定
-/// 早于硬上限触发；对默认 2048 这类超大 ceiling，也要在明显失控前提醒收敛。
-fn tool_iteration_soft_limit(max_iterations: usize) -> usize {
-    (max_iterations / 2).max(1).min(TOOL_ITERATION_SOFT_LIMIT)
+/// 首档检查点对小预算仍按一半缩放；大预算明确固定在 24 轮，后续档位为 48 / 96。
+fn initial_tool_round_checkpoint(max_iterations: usize) -> usize {
+    (max_iterations / 2).max(1).min(TOOL_ROUND_CHECKPOINT)
+}
+
+fn tool_round_checkpoint_threshold(max_iterations: usize, level: usize) -> Option<usize> {
+    let multiplier = *TOOL_ROUND_CHECKPOINT_MULTIPLIERS.get(level)?;
+    let threshold = initial_tool_round_checkpoint(max_iterations).checked_mul(multiplier)?;
+    if level > 0 && threshold >= max_iterations {
+        return None;
+    }
+    Some(threshold)
 }
 
 /// 提取最近一轮 assistant 消息中的 (tool_name, args_json) 签名集合。
@@ -813,6 +823,21 @@ fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bool {
             "task_wait" | "task_status" => tool_results_by_call_id
                 .get(tc.id.as_str())
                 .is_some_and(|text| task_tool_result_delivered_task_output(text)),
+            "write_file" | "apply_patch" => {
+                // 直接文件变更工具只有**写入成功**才算推进。失败（沙箱越界、
+                // 上下文不匹配、路径错误等）不改变世界，却曾无差别计为 Mutation，
+                // 每次重试都会清零 no-progress 预算，使进展预算 loop guard 永远
+                // 攒不满窗口——模型可对同一个被拒路径反复 write_file / apply_patch
+                // 而不被收口（见 write blocked 循环）。结果缺失（None）保守计为
+                // 推进，避免把真实改动误判为无进展而过早停。
+                match tool_results_by_call_id.get(tc.id.as_str()) {
+                    Some(text) => matches!(
+                        classify_tool_result_progress(text),
+                        ToolResultProgressStatus::Success
+                    ),
+                    None => true,
+                }
+            }
             _ => true,
         }
     })
@@ -849,6 +874,162 @@ fn current_tool_round_messages(
         idx += 1;
     }
     out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolRoundCheckpointPhase {
+    Explore,
+    ImplementedNeedsVerification,
+    VerifiedNeedsFinalization,
+    RecoveringFromError,
+}
+
+impl ToolRoundCheckpointPhase {
+    fn recent_progress(self) -> &'static str {
+        match self {
+            Self::Explore => "read-only",
+            Self::ImplementedNeedsVerification => "mutation",
+            Self::VerifiedNeedsFinalization => "verification-success",
+            Self::RecoveringFromError => "verification-failure",
+        }
+    }
+
+    fn action(self) -> &'static str {
+        match self {
+            Self::Explore => "choose-one-next-step",
+            Self::ImplementedNeedsVerification => "verify-and-wrap-up",
+            Self::VerifiedNeedsFinalization => "finalize",
+            Self::RecoveringFromError => "fix-current-failure",
+        }
+    }
+
+    fn guidance(self) -> &'static str {
+        match self {
+            Self::Explore => {
+                "当前仍处于只读取证阶段：总结已确认事实与唯一缺口，只选择一个最有信息增益的下一步；优先精准检索或一次足够大的读取，停止扩展无关证据面。"
+            }
+            Self::ImplementedNeedsVerification => {
+                "最近已成功修改状态：不要重新扩展探索或继续无关修改；运行最窄且能覆盖该变更的检查/测试，必要时查看 diff/status，然后立即收尾。"
+            }
+            Self::VerifiedNeedsFinalization => {
+                "已观察到成功验证：除非存在一个明确且会改变结论的缺口，否则不要继续调用工具；直接总结改动、验证结果与剩余风险并完成答复。"
+            }
+            Self::RecoveringFromError => {
+                "最近的修改或验证失败：只诊断当前失败并进行一次针对性修复/重试，不要扩展到无关问题；若仍受阻，明确报告阻塞点并收尾。"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolRoundCheckpointLevel {
+    Review,
+    Restrict,
+    Finalize,
+}
+
+impl ToolRoundCheckpointLevel {
+    fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Review,
+            1 => Self::Restrict,
+            _ => Self::Finalize,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::Restrict => "restrict",
+            Self::Finalize => "finalize",
+        }
+    }
+
+    fn guidance(self) -> &'static str {
+        match self {
+            Self::Review => "这是非错误、非工具失败的一次性阶段检查点。",
+            Self::Restrict => {
+                "这是第二级检查点：先列出剩余必要工作，只允许完成关键修复与最小验证，不再扩大任务范围。"
+            }
+            Self::Finalize => {
+                "这是第三级检查点：基于现有证据收尾；除非当前验证失败且一次针对性修复可直接解决，否则不要继续调用工具。"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolRoundCheckpoint {
+    level: ToolRoundCheckpointLevel,
+    phase: ToolRoundCheckpointPhase,
+    threshold: usize,
+}
+
+fn checkpoint_tool_call_effects(tool_call: &crate::ai::types::ToolCall) -> (bool, bool) {
+    if tool_call.function.name != "execute_command" {
+        return (
+            tool_call_is_successful_mutation_candidate(tool_call),
+            false,
+        );
+    }
+    let effects =
+        serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+            .ok()
+            .and_then(|args| args.get("command")?.as_str().map(str::to_owned))
+            .map(|command| super::iteration::execute_command_segment_effects(&command))
+            .unwrap_or_default();
+    (
+        effects.iter().any(|effect| effect.mutation),
+        effects
+            .iter()
+            .any(|effect| effect.scope_review || effect.behavior_check),
+    )
+}
+
+fn tool_round_checkpoint_phase(
+    current_round: &[crate::ai::history::Message],
+    turn_messages: &[crate::ai::history::Message],
+) -> ToolRoundCheckpointPhase {
+    let evidence = completion_evidence_state(turn_messages);
+    let results: FxHashMap<&str, bool> = current_round
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| {
+            Some((
+                message.tool_call_id.as_deref()?,
+                completion_tool_result_succeeded(&message.content),
+            ))
+        })
+        .collect();
+    let mut relevant_failure = false;
+
+    for tool_call in current_round
+        .iter()
+        .find(|message| message.role == "assistant")
+        .and_then(|message| message.tool_calls.as_ref())
+        .into_iter()
+        .flatten()
+    {
+        let (mutation, verification) = checkpoint_tool_call_effects(tool_call);
+        let Some(succeeded) = results.get(tool_call.id.as_str()).copied() else {
+            continue;
+        };
+        if mutation || verification {
+            // checkpoint 只关心最后一个相关动作的状态；早期失败若已被后续
+            // mutation + verification 修复，不应继续强制进入 Recovering。
+            relevant_failure = !succeeded;
+        }
+    }
+
+    if relevant_failure {
+        ToolRoundCheckpointPhase::RecoveringFromError
+    } else if evidence.successful_mutation && evidence.successful_post_mutation_verification {
+        ToolRoundCheckpointPhase::VerifiedNeedsFinalization
+    } else if evidence.successful_mutation {
+        ToolRoundCheckpointPhase::ImplementedNeedsVerification
+    } else {
+        ToolRoundCheckpointPhase::Explore
+    }
 }
 
 /// 判断一条 shell 命令是否为纯只读取证（不改变世界）。解析不确定时返回 false
@@ -934,6 +1115,9 @@ fn classify_tool_result_progress(text: &str) -> ToolResultProgressStatus {
     if let Some(path) = blocked_outside_workspace_path(text) {
         return ToolResultProgressStatus::BlockedOutsideWorkspace(path);
     }
+    if let Some(path) = write_blocked_outside_root_path(text) {
+        return ToolResultProgressStatus::BlockedOutsideWorkspace(path);
+    }
     if is_dedup_only_tool_result(text) {
         return ToolResultProgressStatus::DedupOnly;
     }
@@ -946,6 +1130,19 @@ fn classify_tool_result_progress(text: &str) -> ToolResultProgressStatus {
 fn is_dedup_only_tool_result(text: &str) -> bool {
     let text = text.trim_start();
     text.starts_with("[deduped:") || text.starts_with("[overlap dedup:")
+}
+
+/// 从 `write_file` / `apply_patch` 的沙箱越界拒绝消息中解析被拒的目标路径。
+///
+/// 消息形如 `... Write blocked: path '/abs/path' is outside the allowed write
+/// directory ...`。与 `blocked_outside_workspace_path`（execute_command 的命令级
+/// 拒绝）平行：把「反复写同一个被拒路径」归一成稳定目标，让 target-repeat loop
+/// guard 能在少数几轮内抓到，而不是任由模型对同一路径反复重试。
+fn write_blocked_outside_root_path(text: &str) -> Option<String> {
+    let marker = "Write blocked: path '";
+    let rest = text.split_once(marker)?.1;
+    let path = rest.split_once('\'').map(|(path, _)| path)?.trim();
+    (!path.is_empty()).then(|| normalize_path_like_token(path))
 }
 
 fn blocked_outside_workspace_path(text: &str) -> Option<String> {
@@ -1005,6 +1202,21 @@ fn extract_round_targets_inner(
 
     let mut targets = Vec::new();
     for tc in tool_calls.iter() {
+        // 写被拒（沙箱越界）的直接文件变更工具：即使在排除变更工具的 probe 通道里，
+        // 也要放行成一个稳定目标。否则「反复写同一个被拒路径」既不算进展、又不进入
+        // target 历史，任何 loop guard 都抓不到（见 write blocked 循环）。归一路径让
+        // 同一被拒目标跨轮稳定命中；成功写入仍按下方正常目标提取处理。
+        if is_direct_file_mutation_tool(&tc.function.name) {
+            if let Some(ToolResultProgressStatus::BlockedOutsideWorkspace(path)) =
+                results_by_call_id.get(tc.id.as_str())
+            {
+                targets.push(format!(
+                    "{}:blocked-outside-root:{path}",
+                    tc.function.name
+                ));
+                continue;
+            }
+        }
         if !include_direct_file_mutations && is_direct_file_mutation_tool(&tc.function.name) {
             continue;
         }
@@ -1130,7 +1342,7 @@ struct TurnSupervisor {
     loop_breaker_injected: bool,
     hard_loop_stop_injected: bool,
     coarse_loop_note_injected: bool,
-    iteration_soft_limit_note_injected: bool,
+    next_tool_round_checkpoint_level: usize,
     iteration_limit_note_injected: bool,
     scoped_preflight_grace_rounds: usize,
     task_anchor_injected: bool,
@@ -1501,23 +1713,27 @@ impl TurnSupervisor {
         ToolLoopSignal::None
     }
 
-    /// 中段断路器：单轮迭代到达软阈值时注入一次收敛提示（远早于 max_iterations
-    /// 硬上限），治理「合法但低效」的工具刷屏。仅注入一次。
-    fn maybe_inject_iteration_soft_limit_note(
+    /// 分级工具轮次检查点：保留累计轮次，在 24 / 48 / 96（小预算按首档缩放）
+    /// 根据当前工作阶段注入不同调度提示。
+    fn maybe_inject_tool_round_checkpoint(
         &mut self,
         messages: &mut Vec<crate::ai::history::Message>,
         max_iterations: usize,
-    ) -> bool {
-        if self.iteration_soft_limit_note_injected {
-            return false;
+        phase: ToolRoundCheckpointPhase,
+    ) -> Option<ToolRoundCheckpoint> {
+        let level_index = self.next_tool_round_checkpoint_level;
+        let threshold = tool_round_checkpoint_threshold(max_iterations, level_index)?;
+        if self.iteration < threshold {
+            return None;
         }
-        let soft_limit = tool_iteration_soft_limit(max_iterations);
-        if self.iteration < soft_limit {
-            return false;
-        }
-        self.iteration_soft_limit_note_injected = true;
-        inject_iteration_soft_limit_note(messages, self.iteration);
-        true
+        self.next_tool_round_checkpoint_level += 1;
+        let checkpoint = ToolRoundCheckpoint {
+            level: ToolRoundCheckpointLevel::from_index(level_index),
+            phase,
+            threshold,
+        };
+        inject_tool_round_checkpoint_note(messages, self.iteration, checkpoint);
+        Some(checkpoint)
     }
 
     fn maybe_inject_iteration_limit_note(
@@ -1580,6 +1796,41 @@ fn inject_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     });
 }
 
+const TOOL_STOP_REASON_PREFIX: &str = "[runtime-tool-stop]";
+
+/// 将进入无工具收口模式的首个根因仅写入当前 request context。
+pub(super) fn record_force_final_reason(
+    messages: &mut Vec<crate::ai::history::Message>,
+    reason: &str,
+    iteration: usize,
+) {
+    use crate::ai::history::{Message, ROLE_INTERNAL_NOTE};
+    use serde_json::Value;
+
+    if messages.iter().any(|message| {
+        message.role == ROLE_INTERNAL_NOTE
+            && message
+                .content
+                .as_str()
+                .is_some_and(|content| content.starts_with(TOOL_STOP_REASON_PREFIX))
+    }) {
+        return;
+    }
+
+    let event = Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(format!(
+            "{TOOL_STOP_REASON_PREFIX} reason={reason}, iteration={iteration}, action=no_tool_handoff"
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    // 运行时停止原因只属于本次请求投影；若写入 canonical turn_messages，下一轮会把
+    // 过期的 no-tool-handoff 控制状态重新提升为 system 并永久重放。
+    messages.push(event);
+}
+
 /// 近似低收益重复命中：同一工具反复命中同一目标资源（仅翻页/检索参数在变）。
 /// 提醒 agent 判断这些调用是否真的在推进问题；若只是碎片化翻页则收敛，
 /// 若各轮服务于不同且明确的子问题则允许继续。软提示，不强制收敛。
@@ -1637,20 +1888,34 @@ fn inject_coarse_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Mess
 }
 
 /// Progress Budget 第一级（软反思）：连续多轮无信息增益（无新目标也无实质动作）。
+/// 收敛类提示在“工具仍可继续”的阶段（soft / breadth / ledger）要求模型写下的
+/// 账本 / 归纳属于**内部自省**，必须落在隐藏的 `<meta:self_note>…</meta:self_note>`
+/// 通道里：流层 [`push_text_with_hidden_meta`](crate::ai::stream) 会把它从可见输出
+/// 剥离、持久化成 internal_note，下一轮模型仍能读到。若不约束落点，模型会把这段
+/// 中途反思写进面向用户的正文，被立即流式呈现成「预结论」，并与真正的最终答复
+/// 重复（本次事故的直接成因）。硬停 / 迭代上限等 force-final 提示不套用本约束——
+/// 那时正文就是最终答复。
+const SELF_NOTE_REFLECTION_CHANNEL_HINT: &str = "\n\
+    重要（落点约束）：上面要求你写下的账本 / 归纳属于内部自省，必须整段写在 \
+    `<meta:self_note>` 与 `</meta:self_note>` 之间；这段内容不会展示给用户、但会保留在你的后续上下文里。\n\
+    面向用户的正文本轮应保持为空或仅承载「继续执行的下一步」，只有在你确实可以收尾时才写真正的最终结论。";
+
 /// 反思式提示，不阻断工具——给模型解释「为什么还要继续同方向」和继续探索的权利。
 fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[low-progress] 你已连续多轮调用工具，但任务没有可见的推进：\n\
+    let note = format!(
+        "[low-progress] 你已连续多轮调用工具，但任务没有可见的推进：\n\
         - 若这是「修改/删除/新增代码」类任务，你一直在读取/检索却还没提交任何 apply_patch/write_file；\n\
         - 若是探索类任务，最近几轮没有触及新的目标资源，也没有排除掉候选分支。\n\
         请先停下来回答自己：上一步得到了什么『新信息』？如果说不出，就不要再沿同一方向重复。\n\
         然后二选一：(a) 若信息已足够，立即执行下一步实质动作（提交修改 / 给出结论）；\n\
         (b) 若确需继续探索，请显式写下你正在权衡的 A/B 候选分支及当前倾向——这不是惩罚，\n\
-        而是帮你把『无意识的打转』变成『有方向的探索』。";
+        而是帮你把『无意识的打转』变成『有方向的探索』。{SELF_NOTE_REFLECTION_CHANNEL_HINT}"
+    );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
-        content: Value::String(note.to_string()),
+        content: Value::String(note),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
@@ -1662,15 +1927,17 @@ fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::history::Message>
 fn inject_read_only_breadth_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[read-only-breadth-check] 你已在只读分析中覆盖了大量不同目标资源，\n\
+    let note = format!(
+        "[read-only-breadth-check] 你已在只读分析中覆盖了大量不同目标资源，\n\
         这可能是必要的广泛排查，也可能已经从『补关键证据』滑向『不断扩分支』。\n\
         工具仍然可用；但在继续前，请先用不超过 6 行写下：\n\
         1) 已确认事实（最多 3 条）；2) 当前结论或最可能解释；\n\
         3) 仍缺的唯一关键证据；4) 下一步唯一工具动作。\n\
-        如果已经足够回答，请直接给出结论，不要为了再次确认而继续扩展搜索面。";
+        如果已经足够回答，请直接给出结论，不要为了再次确认而继续扩展搜索面。{SELF_NOTE_REFLECTION_CHANNEL_HINT}"
+    );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
-        content: Value::String(note.to_string()),
+        content: Value::String(note),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
@@ -1682,16 +1949,18 @@ fn inject_read_only_breadth_note(messages: &mut Vec<crate::ai::history::Message>
 fn inject_progress_ledger_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[low-progress-ledger] 软提示后你仍在原地打转。现在请在继续任何工具调用之前，\n\
+    let note = format!(
+        "[low-progress-ledger] 软提示后你仍在原地打转。现在请在继续任何工具调用之前，\n\
         先用不超过 6 行写出一份决策账本，强制自己收敛：\n\
         1) 已确认事实（bullet，最多 3 条）\n\
         2) 仍待解决的唯一关键问题\n\
         3) 候选分支 A / B 及你现在选哪个、为什么\n\
         4) 基于所选分支的下一步唯一动作\n\
-        写完后，直接执行该动作；不要再做与该动作无关的探索性读取/检索。";
+        写完后，直接执行该动作；不要再做与该动作无关的探索性读取/检索。{SELF_NOTE_REFLECTION_CHANNEL_HINT}"
+    );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
-        content: Value::String(note.to_string()),
+        content: Value::String(note),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
@@ -1715,19 +1984,24 @@ fn inject_low_progress_hard_stop_note(messages: &mut Vec<crate::ai::history::Mes
     });
 }
 
-/// 中段断路器：单轮迭代到达软阈值（远早于 max_iterations）时的一次性收敛提示。
-fn inject_iteration_soft_limit_note(
+/// 分级、阶段感知的工具轮次检查点；它调度下一步，但不把刚完成的工具标成失败。
+fn inject_tool_round_checkpoint_note(
     messages: &mut Vec<crate::ai::history::Message>,
     iteration: usize,
+    checkpoint: ToolRoundCheckpoint,
 ) {
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-        "[iteration-soft-limit] 你已经在本轮内迭代 {iteration} 次工具调用，明显偏多。\n\
-        请先停下来复盘：(a) 总结目前已确认的事实与还差什么；(b) 明确下一步唯一动作；\n\
-        (c) 优先用批量/大范围读取与精准检索收敛，避免继续碎片化地翻页或反复搜索；\n\
-        (d) soft limit 不改变委派标准：不要因上下文或迭代压力转交当前分支，只委派原本就独立、有界且值得委派的子任务；\n\
-        (e) 若已经足够回答，就直接给出结论。"
+        "[tool-round-checkpoint] level={} phase={} round={iteration} threshold={}。\n\
+        {}\n\
+        {}\n\
+        checkpoint 不改变委派标准：不要因上下文或迭代压力转交当前分支，只委派原本就独立、有界且值得委派的子任务。",
+        checkpoint.level.label(),
+        checkpoint.phase.recent_progress(),
+        checkpoint.threshold,
+        checkpoint.level.guidance(),
+        checkpoint.phase.guidance(),
     );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -1759,14 +2033,14 @@ fn inject_iteration_limit_reflect_note(
     });
 }
 
-/// `/audit` 的同步等待快到硬超时时，请子代理停止扩展新分支，优先交付可验证结论。
+/// 同步等待快到硬超时时，请子代理停止扩展新分支，优先交付可验证结论。
 fn inject_subagent_pre_timeout_wrap_up_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
 
-    let note = "[subagent-pre-timeout-wrap-up] 当前 `/audit` 的前台等待时间即将耗尽。\n\
+    let note = "[subagent-pre-timeout-wrap-up] 当前同步子任务的前台等待时间即将耗尽。\n\
         现在进入无工具收口模式：不要再发起新的工具调用或扩展新的审计分支。\n\
-        请立即基于已收集的证据输出最终审计结论：先列出已验证的 findings；\n\
+        请立即基于已收集的证据输出最终答复：先列出已验证的结论；\n\
         将尚未验证的风险单独标注，绝不可猜测。";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -1791,7 +2065,24 @@ mod tests {
             .and_then(|message| message.content.as_str())
             .expect("wrap-up note should be textual");
         assert!(note.contains("无工具收口模式"));
-        assert!(note.contains("最终审计结论"));
+        assert!(note.contains("最终答复"));
+        assert!(!note.contains("`/audit`"));
+    }
+
+    #[test]
+    fn force_final_reason_is_request_only_and_deduplicated() {
+        let mut messages = Vec::new();
+
+        record_force_final_reason(&mut messages, "iteration_limit", 24);
+        record_force_final_reason(&mut messages, "tool_loop_exact", 25);
+
+        assert_eq!(messages.len(), 1);
+        let note = messages[0]
+            .content
+            .as_str()
+            .expect("stop reason should be textual");
+        assert!(note.contains("reason=iteration_limit"));
+        assert!(note.contains("iteration=24"));
     }
 
     #[test]
@@ -2389,43 +2680,206 @@ mod tests {
     }
 
     #[test]
-    fn tool_iteration_soft_limit_clamps_to_absolute_ceiling() {
-        assert_eq!(TOOL_ITERATION_SOFT_LIMIT, 24);
-        assert_eq!(tool_iteration_soft_limit(0), 1);
-        assert_eq!(tool_iteration_soft_limit(1), 1);
-        assert_eq!(tool_iteration_soft_limit(10), 5);
-        assert_eq!(tool_iteration_soft_limit(256), TOOL_ITERATION_SOFT_LIMIT);
-        assert_eq!(tool_iteration_soft_limit(2048), TOOL_ITERATION_SOFT_LIMIT);
-        assert_eq!(
-            tool_iteration_soft_limit(100_000),
-            TOOL_ITERATION_SOFT_LIMIT
-        );
+    fn tool_round_checkpoints_scale_and_stop_before_hard_limit() {
+        assert_eq!(TOOL_ROUND_CHECKPOINT, 24);
+        assert_eq!(initial_tool_round_checkpoint(0), 1);
+        assert_eq!(initial_tool_round_checkpoint(1), 1);
+        assert_eq!(initial_tool_round_checkpoint(10), 5);
+        assert_eq!(initial_tool_round_checkpoint(4096), TOOL_ROUND_CHECKPOINT);
+        assert_eq!(tool_round_checkpoint_threshold(4096, 0), Some(24));
+        assert_eq!(tool_round_checkpoint_threshold(4096, 1), Some(48));
+        assert_eq!(tool_round_checkpoint_threshold(4096, 2), Some(96));
+        assert_eq!(tool_round_checkpoint_threshold(10, 0), Some(5));
+        assert_eq!(tool_round_checkpoint_threshold(10, 1), None);
     }
 
     #[test]
-    fn iteration_soft_limit_note_injected_once() {
+    fn tool_round_checkpoints_are_staged() {
         let mut supervisor = TurnSupervisor::default();
         let mut messages = Vec::new();
-        let max_iterations = 10; // soft_limit = 5
-        // 未到软阈值不注入
-        supervisor.iteration = 4;
-        assert!(!supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
-        assert!(messages.is_empty());
-        // 到达软阈值注入一次
-        supervisor.iteration = 5;
-        assert!(supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
-        assert_eq!(messages.len(), 1);
+        supervisor.iteration = 23;
         assert!(
-            messages[0]
-                .content
-                .as_str()
-                .unwrap_or_default()
-                .contains("[iteration-soft-limit]")
+            supervisor
+                .maybe_inject_tool_round_checkpoint(
+                    &mut messages,
+                    4096,
+                    ToolRoundCheckpointPhase::Explore,
+                )
+                .is_none()
         );
-        // 再次调用不重复注入
-        supervisor.iteration = 8;
-        assert!(!supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
-        assert_eq!(messages.len(), 1);
+        for (iteration, expected_level) in [(24, "review"), (48, "restrict"), (96, "finalize")] {
+            supervisor.iteration = iteration;
+            let checkpoint = supervisor
+                .maybe_inject_tool_round_checkpoint(
+                    &mut messages,
+                    4096,
+                    ToolRoundCheckpointPhase::Explore,
+                )
+                .expect("checkpoint should fire");
+            assert_eq!(checkpoint.threshold, iteration);
+            assert!(
+                messages
+                    .last()
+                    .and_then(|message| message.content.as_str())
+                    .is_some_and(|text| text.contains(&format!("level={expected_level}")))
+            );
+        }
+        supervisor.iteration = 97;
+        assert!(
+            supervisor
+                .maybe_inject_tool_round_checkpoint(
+                    &mut messages,
+                    4096,
+                    ToolRoundCheckpointPhase::Explore,
+                )
+                .is_none()
+        );
+        assert_eq!(messages.len(), 3);
+    }
+
+    fn checkpoint_tool_round(
+        call_id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+        result: &str,
+    ) -> Vec<crate::ai::history::Message> {
+        vec![
+            crate::ai::history::Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(String::new()),
+                tool_calls: Some(vec![crate::ai::types::ToolCall {
+                    id: call_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: crate::ai::types::FunctionCall {
+                        name: name.to_string(),
+                        arguments: arguments.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            crate::ai::history::Message {
+                role: "tool".to_string(),
+                content: serde_json::Value::String(result.to_string()),
+                tool_calls: None,
+                tool_call_id: Some(call_id.to_string()),
+                reasoning_content: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn tool_round_checkpoint_phase_tracks_mutation_verification_and_failure() {
+        let read_round = checkpoint_tool_round(
+            "read",
+            "read_file",
+            serde_json::json!({"file_path": "/tmp/demo"}),
+            "contents",
+        );
+        assert_eq!(
+            tool_round_checkpoint_phase(&read_round, &read_round),
+            ToolRoundCheckpointPhase::Explore
+        );
+
+        let mutation_round = checkpoint_tool_round(
+            "patch",
+            "apply_patch",
+            serde_json::json!({"patch": "demo", "dry_run": false}),
+            "Done!",
+        );
+        assert_eq!(
+            tool_round_checkpoint_phase(&mutation_round, &mutation_round),
+            ToolRoundCheckpointPhase::ImplementedNeedsVerification
+        );
+
+        let verification_round = checkpoint_tool_round(
+            "check",
+            "execute_command",
+            serde_json::json!({"command": "cargo check --bin a"}),
+            "Finished dev profile",
+        );
+        assert_eq!(
+            tool_round_checkpoint_phase(&verification_round, &verification_round),
+            ToolRoundCheckpointPhase::Explore
+        );
+        let mut verified_turn = mutation_round.clone();
+        verified_turn.extend(verification_round.clone());
+        assert_eq!(
+            tool_round_checkpoint_phase(&verification_round, &verified_turn),
+            ToolRoundCheckpointPhase::VerifiedNeedsFinalization
+        );
+
+        let failed_round = checkpoint_tool_round(
+            "test",
+            "execute_command",
+            serde_json::json!({"command": "cargo test --bin a focused_test"}),
+            "Exit code: 101\nfailed",
+        );
+        let mut failed_turn = mutation_round;
+        failed_turn.extend(failed_round.clone());
+        assert_eq!(
+            tool_round_checkpoint_phase(&failed_round, &failed_turn),
+            ToolRoundCheckpointPhase::RecoveringFromError
+        );
+
+        let mut verification_before_mutation = checkpoint_tool_round(
+            "check-first",
+            "execute_command",
+            serde_json::json!({"command": "cargo check --bin a"}),
+            "Finished dev profile",
+        );
+        verification_before_mutation.extend(checkpoint_tool_round(
+            "patch-last",
+            "apply_patch",
+            serde_json::json!({"patch": "demo", "dry_run": false}),
+            "Done!",
+        ));
+        assert_eq!(
+            tool_round_checkpoint_phase(
+                &verification_before_mutation,
+                &verification_before_mutation,
+            ),
+            ToolRoundCheckpointPhase::ImplementedNeedsVerification
+        );
+
+        let failed_check = checkpoint_tool_round(
+            "failed-check",
+            "execute_command",
+            serde_json::json!({"command": "cargo test --bin a focused_test"}),
+            "Exit code: 101\nfailed",
+        );
+        let repair = checkpoint_tool_round(
+            "repair",
+            "apply_patch",
+            serde_json::json!({"patch": "demo", "dry_run": false}),
+            "Done!",
+        );
+        let passing_check = checkpoint_tool_round(
+            "passing-check",
+            "execute_command",
+            serde_json::json!({"command": "cargo test --bin a focused_test"}),
+            "test result: ok",
+        );
+        let mut repaired_after_failure = vec![failed_check[0].clone()];
+        repaired_after_failure[0]
+            .tool_calls
+            .as_mut()
+            .expect("assistant batch")
+            .extend(repair[0].tool_calls.clone().expect("repair call"));
+        repaired_after_failure[0]
+            .tool_calls
+            .as_mut()
+            .expect("assistant batch")
+            .extend(passing_check[0].tool_calls.clone().expect("passing call"));
+        repaired_after_failure.extend([
+            failed_check[1].clone(),
+            repair[1].clone(),
+            passing_check[1].clone(),
+        ]);
+        assert_eq!(
+            tool_round_checkpoint_phase(&repaired_after_failure, &repaired_after_failure),
+            ToolRoundCheckpointPhase::VerifiedNeedsFinalization
+        );
     }
 
     // ===== Progress Budget（行为信号进展预算）测试 =====
@@ -2947,6 +3401,93 @@ mod tests {
             matches!(signals[TOOL_LOOP_SOFT_WINDOW - 1], ToolLoopSignal::Soft),
             "identical write_file calls should still be caught by exact loop detection: {signals:?}"
         );
+    }
+
+    /// 回归：反复写同一个「沙箱越界被拒」的路径（content 每轮不同、file_path 相同），
+    /// 曾因失败被误计为 mutation-progress、且不进入 target 历史而逃过所有 loop guard。
+    /// 修复后：blocked 写不再算进展，且归一成稳定目标，target-repeat guard 在少数轮内命中。
+    #[test]
+    fn repeated_blocked_write_to_same_path_triggers_target_repeat() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let mut signals = Vec::new();
+        let blocked = "Error: write_file failed: File error (/out/picks.json): Write blocked: \
+             path '/out/picks.json' is outside the allowed write directory (effective_cwd).\n\
+             Writable root: '/work'. Do NOT retry the same absolute path.";
+
+        for i in 0..TOOL_LOOP_COARSE_WINDOW {
+            let id = format!("blocked-write-{i}");
+            // content 每轮不同：exact/coarse 整轮签名各不相等，逃过 detect_tool_loop。
+            messages.push(pb_write_file_msg_with_content(
+                "/out/picks.json",
+                &id,
+                &format!("attempt {i} content\n"),
+            ));
+            messages.push(pb_tool_result(&id, blocked));
+            signals
+                .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        }
+
+        assert!(
+            signals[..TOOL_LOOP_COARSE_WINDOW - 1]
+                .iter()
+                .all(|s| matches!(s, ToolLoopSignal::None)),
+            "varying-content blocked writes must not fire exact/coarse loops early: {signals:?}"
+        );
+        assert!(
+            matches!(
+                signals[TOOL_LOOP_COARSE_WINDOW - 1],
+                ToolLoopSignal::TargetRepeat
+            ),
+            "repeated blocked write to same path must trigger TargetRepeat: {signals:?}"
+        );
+        assert!(supervisor.target_repeat_note_injected);
+    }
+
+    /// 回归：blocked write 不得清零无进展预算。此前 `_ => true` 把失败写也计为
+    /// mutation，每次重试都重置 consecutive_no_progress，使 progress-budget 永不升级。
+    #[test]
+    fn blocked_write_does_not_count_as_mutation_progress() {
+        let blocked = "Error: write_file failed: File error (/out/x.json): Write blocked: \
+             path '/out/x.json' is outside the allowed write directory (effective_cwd).";
+        let mut messages = Vec::new();
+        messages.push(pb_write_file_msg_with_content("/out/x.json", "w1", "data\n"));
+        messages.push(pb_tool_result("w1", blocked));
+        assert!(
+            !round_has_mutation(&messages),
+            "a blocked write must not be counted as mutation progress"
+        );
+
+        // 对照：成功写入仍算 mutation。
+        let mut ok = Vec::new();
+        ok.push(pb_write_file_msg_with_content("in-root.json", "w2", "data\n"));
+        ok.push(pb_tool_result("w2", "Successfully wrote to /work/in-root.json"));
+        assert!(
+            round_has_mutation(&ok),
+            "a successful write must still count as mutation progress"
+        );
+    }
+
+    #[test]
+    fn write_blocked_outside_root_path_parses_and_classifies() {
+        let text = "Error: write_file failed: File error (/out/p.json): Write blocked: \
+             path '/out/p.json' is outside the allowed write directory (effective_cwd).\n\
+             Writable root: '/work'.";
+        assert_eq!(
+            write_blocked_outside_root_path(text).as_deref(),
+            Some("/out/p.json")
+        );
+        assert_eq!(
+            classify_tool_result_progress(text),
+            ToolResultProgressStatus::BlockedOutsideWorkspace("/out/p.json".to_string())
+        );
+        // 普通失败（非 write-blocked）仍归类为 Failure。
+        assert_eq!(
+            classify_tool_result_progress("Error: read_file failed: File not found"),
+            ToolResultProgressStatus::Failure
+        );
+        // 无 marker 文本不误匹配。
+        assert!(write_blocked_outside_root_path("Successfully wrote to /x").is_none());
     }
 
     #[test]
@@ -3573,6 +4114,11 @@ async fn run_turn_body(
         }
         if crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request() {
             pre_timeout_wrap_up_requested = true;
+            record_force_final_reason(
+                &mut messages,
+                "subagent_pre_timeout_wrap_up",
+                iteration,
+            );
             force_final_response = true;
             inject_subagent_pre_timeout_wrap_up_note(&mut messages);
         }
@@ -3829,6 +4375,11 @@ async fn run_turn_body(
                     }
                     // 独立 preflight 预算耗尽后保持安全拒绝并收口，避免通过不断
                     // 切换目录无限扩张迭代预算。
+                    record_force_final_reason(
+                        &mut messages,
+                        "scoped_preflight_budget_exhausted",
+                        iteration,
+                    );
                     force_final_response = true;
                     continue 'turn;
                 }
@@ -3983,6 +4534,11 @@ async fn run_turn_body(
                     &question,
                     "low-yield-hard-stop",
                 );
+                record_force_final_reason(
+                    &mut messages,
+                    "low_yield_repetition",
+                    iteration,
+                );
                 force_final_response = true;
             }
             ToolLoopSignal::Soft => {
@@ -4004,6 +4560,11 @@ async fn run_turn_body(
                     &mut messages,
                     &question,
                     "tool-loop-hard-stop",
+                );
+                record_force_final_reason(
+                    &mut messages,
+                    "tool_loop",
+                    iteration,
                 );
                 force_final_response = true;
             }
@@ -4044,22 +4605,37 @@ async fn run_turn_body(
                     &question,
                     "low-progress-hard-stop",
                 );
+                record_force_final_reason(
+                    &mut messages,
+                    "progress_no_progress",
+                    iteration,
+                );
                 force_final_response = true;
             }
         }
 
-        // === 中段迭代断路器 ===
-        // 远早于 max_iterations 硬上限：单轮迭代到达软阈值时注入一次收敛提示，
-        // 治理「合法但低效」的工具刷屏（翻页、碎片检索），不强制收敛。
+        // === 分级、阶段感知的工具轮次检查点 ===
+        // 使用 pre-compression 的当前工具轮判断阶段，累计轮次保持不变；检查点只调度
+        // 下一步，不把刚完成的 mutation 误报为失败。
         let effective_max_iterations = supervisor.effective_max_iterations(max_iterations);
-        if supervisor
-            .maybe_inject_iteration_soft_limit_note(&mut messages, effective_max_iterations)
-        {
+        let checkpoint_phase = tool_round_checkpoint_phase(&progress_messages, &turn_messages);
+        if let Some(checkpoint) = supervisor.maybe_inject_tool_round_checkpoint(
+            &mut messages,
+            effective_max_iterations,
+            checkpoint_phase,
+        ) {
             crate::ai::driver::print::print_tool_note_line(
                 "agent-health",
-                "tool-iteration soft limit reached: injecting converge prompt",
+                &format!(
+                    "tool-round checkpoint reached: round={} threshold={} level={} recent_progress={} action={}",
+                    supervisor.iteration,
+                    checkpoint.threshold,
+                    checkpoint.level.label(),
+                    checkpoint.phase.recent_progress(),
+                    checkpoint.phase.action(),
+                ),
             );
-            supervisor.maybe_inject_task_anchor(&mut messages, &question, "iteration-soft-limit");
+            supervisor.maybe_inject_task_anchor(&mut messages, &question, "tool-round-checkpoint");
         }
 
         // === Iteration limit 自反思 ===

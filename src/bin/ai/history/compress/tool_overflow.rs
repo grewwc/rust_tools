@@ -502,20 +502,14 @@ mod tests {
             stub.contains("- original_range: lines=120..159"),
             "stub: {stub}"
         );
-        assert!(
-            stub.contains("优先继续读取 `original_file_path` 指向的原始文件"),
-            "stub: {stub}"
-        );
+        assert!(stub.contains("完整结果快照"), "stub: {stub}");
 
         let anchor = collapse_overflow_stub_to_anchor(&stub).expect("stub should collapse");
         assert!(
             anchor.contains("- original_file_path: src/lib.rs"),
             "anchor: {anchor}"
         );
-        assert!(
-            anchor.contains("优先读取 `original_file_path`"),
-            "anchor: {anchor}"
-        );
+        assert!(anchor.contains("完整结果快照"), "anchor: {anchor}");
 
         let _ = std::fs::remove_dir_all(overflow_dir);
     }
@@ -960,10 +954,10 @@ fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'s
         .any(|line| line.starts_with("- original_command: "));
     match tool_name {
         "read_file" if has_original_file_path => {
-            "（这是之前读取文件的结果归档；优先继续读取 `original_file_path` 指向的原始文件，而不是本归档文件。仅当你确实需要这次已外溢结果的完整原文时才读取 `file_path`。）"
+            "（这是之前读取文件的完整结果快照。若只需当前文件内容，优先读取 `original_file_path`；若原文件已变更、删除，或需要当时的精确输出，可用 `read_file` 分页读取 `file_path`。）"
         }
         "read_file" => {
-            "（这是之前读取文件的结果归档；除非你需要重新查看该文件的完整内容且预览不足，否则不要重新读取。）"
+            "（这是之前读取文件的完整结果快照。仅在预览不足且需要当时的精确输出时，用 `read_file` 分页读取 `file_path`。）"
         }
         "execute_command" if has_original_command => {
             "（这是之前命令输出的归档；优先根据 `original_command` / `original_cwd` 继续判断，不要把 `file_path` 当作源码文件去读。仅在需要完整日志时才读取。）"
@@ -1107,9 +1101,9 @@ fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
             .iter()
             .any(|line| line.starts_with("- original_file_path: "))
         {
-            "（这是之前读取文件的结果归档；通常无需回读本归档。若必须追原文，优先读取 `original_file_path`。）"
+            "（这是之前读取文件的完整结果快照。若只需当前文件内容，优先读取 `original_file_path`；若需要当时的精确输出，可用 `read_file` 分页读取 `file_path`。）"
         } else {
-            "（这是之前读取文件的结果归档；通常无需重新读取。）"
+            "（这是之前读取文件的完整结果快照；若需要当时的精确输出，可用 `read_file` 分页读取 `file_path`。）"
         }
     } else if tool_name == "execute_command"
         && recall_lines

@@ -1522,7 +1522,14 @@ impl KernelInternal for LocalOS {
     }
 
     fn advance_tick(&mut self) {
-        self.tick = self.tick.saturating_add(1);
+        self.advance_ticks(1);
+    }
+
+    fn advance_ticks(&mut self, ticks: u64) {
+        if ticks == 0 {
+            return;
+        }
+        self.tick = self.tick.saturating_add(ticks);
         let mut wake_sleeping_pids = Vec::new();
         let mut wake_async_timeout_pids = Vec::new();
         for (pid, proc) in self.processes.iter() {
@@ -1562,6 +1569,27 @@ impl KernelInternal for LocalOS {
             }
             self.enqueue_ready(pid);
         }
+    }
+
+    fn current_tick(&self) -> u64 {
+        self.tick
+    }
+
+    fn next_wakeup_tick(&self) -> Option<u64> {
+        self.processes
+            .values()
+            .filter_map(|process| match &process.state {
+                ProcessState::Sleeping { until_tick } => Some(*until_tick),
+                ProcessState::Waiting {
+                    reason:
+                        WaitReason::Events {
+                            timeout_tick: Some(timeout_tick),
+                            ..
+                        },
+                } => Some(*timeout_tick),
+                _ => None,
+            })
+            .min()
     }
 
     fn has_ready(&self) -> bool {
@@ -4206,17 +4234,19 @@ mod tests {
         );
         let wake_tick = os.sleep_current(2).unwrap();
         assert_eq!(wake_tick, 2);
+        assert_eq!(os.current_tick(), 0);
+        assert_eq!(os.next_wakeup_tick(), Some(2));
         assert!(os.consume_yield_requested());
         assert!(matches!(
             os.get_process(root).map(|p| &p.state),
             Some(ProcessState::Sleeping { until_tick }) if *until_tick == 2
         ));
 
-        os.advance_tick();
-        assert!(os.pop_ready().is_none());
-        os.advance_tick();
+        os.advance_ticks(2);
         let resumed = os.pop_ready().unwrap();
         assert_eq!(resumed.pid, root);
+        assert_eq!(os.current_tick(), 2);
+        assert_eq!(os.next_wakeup_tick(), None);
     }
 
     #[test]

@@ -335,6 +335,16 @@ pub trait KernelInternal {
     fn drop_terminated(&mut self, target_pid: u64) -> bool;
     /// 推进调度器 tick，唤醒到期睡眠进程
     fn advance_tick(&mut self);
+    /// 批量推进调度器 tick，唤醒所有到期进程。
+    fn advance_ticks(&mut self, ticks: u64) {
+        for _ in 0..ticks {
+            self.advance_tick();
+        }
+    }
+    /// 当前调度器 tick。
+    fn current_tick(&self) -> u64;
+    /// 下一个需要由计时器唤醒的 tick。
+    fn next_wakeup_tick(&self) -> Option<u64>;
     /// 检查是否有就绪进程（用于调度决策）
     fn has_ready(&self) -> bool;
     /// 返回就绪队列中的进程数量

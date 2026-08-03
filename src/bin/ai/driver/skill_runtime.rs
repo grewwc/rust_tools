@@ -305,11 +305,10 @@ fn dedupe_tools_by_name(tools: Vec<ToolDef>) -> Vec<ToolDef> {
 }
 
 fn required_baseline_tool_names() -> Vec<String> {
-    // 入口 / 自助能力 + 基础只读 / 检索能力 + 子 Agent 编排能力：
-    // 这些都是白名单 skill 替换工具集时也必须常驻补回的 baseline。与进程级
-    // allowed_tools whitelist 共享同一份清单，避免"schema 里可见，但执行时被
-    // whitelist 拦掉"的分叉。
-    crate::ai::tools::baseline_tool_names()
+    // 只补回每轮必须常驻的执行 baseline。低频 skill 发现工具仍保留在进程级
+    // allowlist 中，但由 `enable_tools` 按需加入 schema，避免 manifest 路径绕过
+    // lazy-loading 策略。
+    crate::ai::tools::eager_baseline_tool_names()
         .iter()
         .map(|name| (*name).to_string())
         .collect()
@@ -1473,8 +1472,8 @@ mod tests {
         build_project_instruction_prompt, build_scoped_project_instruction_prompt,
         build_system_prompt, builtin_tools_for_skill, declares_executor_group,
         ensure_required_baseline_tools, filter_mcp_tools_by_allowed_servers, has_tool,
-        merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
-        select_mcp_tools, tool_uses_mcp_server,
+        manifest_tool_definitions, merge_with_runtime_enabled_tools, push_project_context,
+        resolve_max_iterations, select_mcp_tools, tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
@@ -1533,20 +1532,40 @@ mod tests {
     }
 
     #[test]
-    fn default_tools_start_with_core_skill_controls_and_editing() {
+    fn default_core_tools_exclude_lazy_skill_discovery_tools() {
         let tools = builtin_tools_for_skill(None, None);
         let names = tools
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "enable_tools"));
-        assert!(names.iter().any(|name| name == "activate_skill"));
-        assert!(names.iter().any(|name| name == "list_skills"));
-        assert!(names.iter().any(|name| name == "load_skill"));
         assert!(names.iter().any(|name| name == "read_file"));
         assert!(names.iter().any(|name| name == "knowledge_save"));
         assert!(names.iter().any(|name| name == "knowledge_search"));
+        // skill 发现/激活是低频能力：默认不随每轮 core 展开常驻，改由
+        // `enable_tools` 按需启用（仍保留 builtin 组、可被动态启用）。
+        assert!(!names.iter().any(|name| name == "activate_skill"));
+        assert!(!names.iter().any(|name| name == "list_skills"));
+        assert!(!names.iter().any(|name| name == "load_skill"));
+        assert!(!names.iter().any(|name| name == "save_skill"));
         assert!(!names.iter().any(|name| name == "web_search"));
+    }
+
+    #[test]
+    fn manifest_tools_keep_skill_discovery_lazy() {
+        let groups = vec!["core".to_string(), "executor".to_string()];
+        let tools = manifest_tool_definitions(&groups, &[])
+            .expect("non-empty manifest groups should resolve tool definitions");
+        let names = tools
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "enable_tools"));
+        assert!(names.iter().any(|name| name == "read_file"));
+        assert!(!names.iter().any(|name| name == "activate_skill"));
+        assert!(!names.iter().any(|name| name == "list_skills"));
+        assert!(!names.iter().any(|name| name == "load_skill"));
     }
 
     #[test]

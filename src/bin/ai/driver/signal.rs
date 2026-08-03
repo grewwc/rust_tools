@@ -186,6 +186,7 @@ pub(in crate::ai) fn handle_sigint(
 
 pub(in crate::ai) fn request_shutdown(shutdown: &AtomicBool) {
     shutdown.store(true, Ordering::Relaxed);
+    super::notify_scheduler();
     signal_request_interrupt();
 }
 

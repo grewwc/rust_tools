@@ -10,6 +10,14 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
+const REPORTED_FULLWIDTH_DSML_TOOL_CALL: &str = r#"<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="read_file">
+<｜｜DSML｜｜parameter name="file_path" string="true">/Users/bytedance/rust_tools/src/bin/ai/driver/turn_runtime/iteration.rs</｜｜DSML｜｜parameter>
+<｜｜DSML｜｜parameter name="limit" string="false">80</｜｜DSML｜｜parameter>
+<｜｜DSML｜｜parameter name="offset" string="false">110</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>"#;
+
 #[test]
 fn prompt_cache_metrics_none_without_hit() {
     assert_eq!(format_prompt_cache_metrics(1000, 0), None);
@@ -931,6 +939,97 @@ fn process_stream_payload_suppresses_bare_registered_xml_tool_markup() {
     let builder = state.content.tool_calls_map.get_ref(&0).unwrap();
     assert_eq!(builder.function_name, "execute_command");
     assert_eq!(builder.arguments, r#"{"command":"pwd"}"#);
+}
+
+#[test]
+fn opencode_message_snapshot_recovers_reported_fullwidth_dsml_before_rendering() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+    let payload = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": REPORTED_FULLWIDTH_DSML_TOOL_CALL
+            }
+        }]
+    })
+    .to_string();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::opencode_adapter(),
+        None,
+        &payload,
+    )
+    .unwrap();
+
+    assert!(current_history.is_empty());
+    assert!(state.content.assistant_text.is_empty());
+    assert!(state.content.hidden_meta.is_empty());
+    assert_eq!(state.content.tool_calls_map.len(), 1);
+    let builder = state.content.tool_calls_map.get_ref(&0).unwrap();
+    assert_eq!(builder.function_name, "read_file");
+    let args: serde_json::Value = serde_json::from_str(&builder.arguments).unwrap();
+    assert_eq!(
+        args["file_path"],
+        "/Users/bytedance/rust_tools/src/bin/ai/driver/turn_runtime/iteration.rs"
+    );
+    assert_eq!(args["limit"], 80);
+    assert_eq!(args["offset"], 110);
+}
+
+#[test]
+fn fullwidth_dsml_done_snapshot_does_not_duplicate_delta_tool_call() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    for event_type in ["response.output_text.delta", "response.output_text.done"] {
+        let payload = if event_type.ends_with(".delta") {
+            serde_json::json!({ "delta": REPORTED_FULLWIDTH_DSML_TOOL_CALL }).to_string()
+        } else {
+            serde_json::json!({ "text": REPORTED_FULLWIDTH_DSML_TOOL_CALL }).to_string()
+        };
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            Some(event_type),
+            &payload,
+        )
+        .unwrap();
+    }
+
+    assert!(current_history.is_empty());
+    assert!(state.content.assistant_text.is_empty());
+    assert_eq!(state.content.tool_calls_map.len(), 1);
+    assert_eq!(state.content.internal_tool_call_idx, 1);
+}
+
+#[test]
+fn inline_tool_call_fallback_does_not_persist_protocol_as_hidden_meta() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.content.assistant_text = REPORTED_FULLWIDTH_DSML_TOOL_CALL.to_string();
+    let mut app = test_app();
+
+    let result = finalize_stream_response(&mut app, &markers, state).unwrap();
+
+    assert_eq!(result.outcome, StreamOutcome::ToolCall);
+    assert_eq!(result.tool_calls.len(), 1);
+    assert_eq!(result.tool_calls[0].function.name, "read_file");
+    assert!(result.assistant_text.is_empty());
+    assert!(
+        result.hidden_meta.is_empty(),
+        "工具协议不是 self_note，不得进入 hidden_meta"
+    );
 }
 
 #[test]

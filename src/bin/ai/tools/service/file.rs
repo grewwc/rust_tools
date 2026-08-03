@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::ai::tools::common::ToolStreamWriter;
-use crate::ai::tools::storage::file_store::FileStore;
+use crate::ai::tools::storage::file_store::{FileStore, is_read_file_overflow_artifact};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenderedLineExcerpt {
@@ -58,13 +58,13 @@ pub(crate) fn render_line_excerpt(
     }
 }
 
-/// 检测内容是否带有 read_file 输出格式的行号前缀，若是则剥除所有嵌套层。
+/// 检测内容是否带有 read_file 输出格式的最外层行号前缀，若是则只剥除这一层。
 ///
 /// read_file 输出格式为 `{:>6}\t{content}`（6位右对齐行号 + tab + 内容）。
 /// 当这种输出被写入归档文件后再次被 read_file 读取时，会出现多层嵌套
-/// （如 `     1\t     1\t     1\t原始内容`）。此函数循环剥除所有外层行号前缀，
-/// 还原出原始内容。非 read_file 格式的内容原样返回。
-fn strip_nested_line_numbers(content: &str) -> String {
+/// （如 `     1\t     1\t原始内容`）。每次回读只需去掉当前工具产生的最外层，
+/// 不能继续猜测内层：原始文件内容本身也可能合法地以同一格式开头。
+fn strip_rendered_line_number_layer(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
         return content.to_string();
@@ -74,20 +74,14 @@ fn strip_nested_line_numbers(content: &str) -> String {
     if read_file_number_prefix_rest(lines[0]).is_none() {
         return content.to_string();
     }
-    // 逐行剥除行号前缀：只要行以"（空格）数字\t"开头就剥掉这一层，
-    // 直到不再匹配为止（处理多重嵌套）。
+    // 每行至多剥除一次，恰好移除保存快照时由 read_file 渲染的展示层。
+    // 不循环剥离，避免将原始文件中合法的 `     7\tvalue` 当作展示层丢掉。
     let stripped: Vec<String> = lines
         .iter()
         .map(|line| {
-            let mut remaining = *line;
-            loop {
-                if let Some(rest) = read_file_number_prefix_rest(remaining) {
-                    remaining = rest;
-                } else {
-                    break;
-                }
-            }
-            remaining.to_string()
+            read_file_number_prefix_rest(line)
+                .unwrap_or(line)
+                .to_string()
         })
         .collect();
     stripped.join("\n")
@@ -110,18 +104,18 @@ fn read_file_number_prefix_rest(line: &str) -> Option<&str> {
     Some(rest)
 }
 
-/// 仅对会话归档的 `overflow-history.md` 做嵌套行号剥离。
+/// 仅对会话归档的 `overflow-history.md` 与 `read_file` 外溢快照剥离一层展示行号。
 ///
 /// 普通用户文件里合法的 `123\t...`/TSV 内容不应被误判并篡改；而无限重读循环里
-/// 真正会出现 N 重行号嵌套的，正是归档历史文件中的旧 `read_file` 输出。
-fn should_strip_nested_line_numbers(file_path: &str) -> bool {
-    let path = std::path::Path::new(file_path);
-    path.file_name().and_then(|name| name.to_str()) == Some("overflow-history.md")
-        && path
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".assets"))
+/// 真正会出现 N 重行号嵌套的，是归档历史文件和保存的旧 `read_file` 输出。
+fn should_strip_rendered_line_number_layer(path: &std::path::Path) -> bool {
+    is_read_file_overflow_artifact(path)
+        || (path.file_name().and_then(|name| name.to_str()) == Some("overflow-history.md")
+            && path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".assets")))
 }
 
 fn truncate_chars_to_limit(text: &str, max_chars: usize) -> String {
@@ -189,8 +183,8 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     let offset = args["offset"].as_u64().unwrap_or(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
     let raw_content = store.read_to_string().map_err(|e| e.to_string())?;
-    let content = if should_strip_nested_line_numbers(file_path) {
-        strip_nested_line_numbers(&raw_content)
+    let content = if should_strip_rendered_line_number_layer(store.path()) {
+        strip_rendered_line_number_layer(&raw_content)
     } else {
         raw_content
     };
@@ -602,20 +596,30 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_nested_line_numbers_preserves_plain_tabular_content() {
+    fn test_strip_rendered_line_number_layer_preserves_plain_tabular_content() {
         let content = "123\talpha\n124\tbeta";
-        assert_eq!(strip_nested_line_numbers(content), content);
+        assert_eq!(strip_rendered_line_number_layer(content), content);
     }
 
     #[test]
-    fn test_read_file_strips_nested_line_numbers_only_for_overflow_history() {
+    fn test_strip_rendered_line_number_layer_preserves_source_prefix() {
+        // 外层 `1` 是保存 read_file 输出时产生的展示行号；内层 `7` 是源文件内容。
+        let snapshot = "     1\t     7\tvalue";
+        assert_eq!(strip_rendered_line_number_layer(snapshot), "     7\tvalue");
+    }
+
+    #[test]
+    fn test_read_file_strips_rendered_line_number_layer_for_session_archives() {
         let session_assets = make_temp_path("overflow_history_assets").with_extension("assets");
         fs::create_dir_all(&session_assets).unwrap();
-        let path = session_assets.join("overflow-history.md");
-        fs::write(&path, "     1\talpha\n     2\tbeta\n").unwrap();
+        let overflow_history = session_assets.join("overflow-history.md");
+        let tool_overflow_dir = session_assets.join("tool-overflow-compressed");
+        fs::create_dir_all(&tool_overflow_dir).unwrap();
+        let read_file_snapshot = tool_overflow_dir.join("20260722T101112Z-read_file-abc123.txt");
 
+        fs::write(&overflow_history, "     1\talpha\n     2\tbeta\n").unwrap();
         let read_args = serde_json::json!({
-            "file_path": path.to_string_lossy(),
+            "file_path": overflow_history.to_string_lossy(),
             "offset": 1,
             "limit": 100
         });
@@ -627,7 +631,14 @@ mod tests {
             "output should not contain nested line numbers: {output}"
         );
 
-        let _ = fs::remove_file(&path);
+        // read_file 快照需要当前 driver 会话授权；无上下文的 service 单测只验证
+        // 会话归档的渲染规则，正反授权边界由 storage::file_store 的回归测试覆盖。
+        fs::write(&read_file_snapshot, "     1\talpha\n     2\tbeta\n").unwrap();
+        assert_eq!(
+            strip_rendered_line_number_layer(&fs::read_to_string(&read_file_snapshot).unwrap()),
+            "alpha\nbeta"
+        );
+
         let _ = fs::remove_dir_all(&session_assets);
     }
 
