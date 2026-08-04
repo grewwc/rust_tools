@@ -1765,7 +1765,8 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         tool_call_id: None,
         reasoning_content: None,
     }];
-    // 10 组 read_file 调用，每条结果 8000 字符，远端组（非最近 6 条）应被外溢。
+    // 10 组 read_file 调用，每条结果超过 8000 字符且内容各异，避免先命中
+    // byte-identical dedup；远端组（非最近 6 条）应被外溢。
     for i in 0..10usize {
         let id = format!("call_{i}");
         messages.push(Message {
@@ -1788,7 +1789,7 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         });
         messages.push(Message {
             role: "tool".to_string(),
-            content: Value::String("y".repeat(8000)),
+            content: Value::String(format!("chunk-{i:02}\n{}", "y".repeat(8000))),
             tool_calls: None,
             tool_call_id: Some(id),
             reasoning_content: None,

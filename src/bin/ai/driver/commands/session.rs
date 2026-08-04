@@ -1137,8 +1137,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sessions_new_clears_session_local_runtime_state() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_new_clears_session_local_runtime_state() {
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1154,9 +1154,14 @@ mod tests {
                 },
             });
         }
-        crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(vec![
-            "mcp_feishu_doc_create_from_markdown".to_string(),
-        ]);
+        let source_session_id = app.session_id.clone();
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY
+            .scope((source_session_id.clone(), 0), async {
+                crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(vec![
+                    "mcp_feishu_doc_create_from_markdown".to_string(),
+                ]);
+            })
+            .await;
 
         try_handle_session_command(&mut app, "/sessions new").unwrap();
 
@@ -1169,7 +1174,13 @@ mod tests {
                 .as_ref()
                 .is_some_and(|ctx| ctx.tools.is_empty())
         );
-        assert!(crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty());
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY
+            .scope((source_session_id, 1), async {
+                assert!(
+                    crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty()
+                );
+            })
+            .await;
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1253,7 +1264,8 @@ mod tests {
                 Message {
                     role: "tool".to_string(),
                     content: Value::String(
-                        "Error: apply_patch failed: ambiguous patch".to_string(),
+                        "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations."
+                            .to_string(),
                     ),
                     tool_calls: None,
                     tool_call_id: Some("legacy-patch".to_string()),
@@ -1276,8 +1288,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn sessions_branch_also_clears_stale_skill_bias_and_explicit_tools() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_branch_also_clears_stale_skill_bias_and_explicit_tools() {
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1305,16 +1317,27 @@ mod tests {
             ],
         )
         .unwrap();
-        crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(vec![
-            "mcp_feishu_doc_create_from_markdown".to_string(),
-        ]);
+        let source_session_id = app.session_id.clone();
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY
+            .scope((source_session_id.clone(), 0), async {
+                crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(vec![
+                    "mcp_feishu_doc_create_from_markdown".to_string(),
+                ]);
+            })
+            .await;
 
         try_handle_session_command(&mut app, "/sessions branch 1").unwrap();
 
         assert!(app.last_skill_bias.is_none());
         assert!(app.forced_skill.is_none());
         assert!(app.forced_question.is_none());
-        assert!(crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty());
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY
+            .scope((source_session_id, 1), async {
+                assert!(
+                    crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty()
+                );
+            })
+            .await;
         let _ = fs::remove_dir_all(root);
     }
 
