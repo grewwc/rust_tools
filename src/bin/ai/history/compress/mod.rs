@@ -16,7 +16,7 @@ mod tool_overflow;
 use text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use tool_groups::{
     MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, first_trim_candidate, fold_early_tool_groups,
-    recent_tool_group_message_indices,
+    recent_tool_group_message_indices, recent_tool_result_groups,
 };
 #[cfg(test)]
 use tool_overflow::normalize_internal_notes_for_summary_model;
@@ -966,6 +966,12 @@ fn shrink_messages_to_fit(
     let keep_recent_turns = keep_recent_user_turns_when_trimming(&messages, max_chars);
     age_out_overflow_stub_previews(&mut messages, keep_recent_turns);
 
+    // 主动精简「已成功写入」的 write_file/apply_patch 巨型 arguments：文件落盘、
+    // 结果确认成功后全文不再有语义价值，无需等预算压力即可先替换为归档 stub。
+    // 保护窗口内（含当前轮刚写完、模型可能立即引用正文构造后续编辑的组）与失败
+    // 结果一律保留，保证 agent 效果不劣化。
+    shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids);
+
     if messages_total_chars(&messages) <= max_chars {
         return messages;
     }
@@ -1094,6 +1100,10 @@ fn shrink_messages_to_fit_with_summary(
     // 尾窗轮数同样受 max_chars 字节上限约束（见 keep_recent_user_turns_when_trimming）。
     let keep_recent_turns = keep_recent_user_turns_when_trimming(&messages, max_chars);
     age_out_overflow_stub_previews(&mut messages, keep_recent_turns);
+
+    // 与 shrink_messages_to_fit 对称：成功写入的 write_file/apply_patch 巨型
+    // arguments 主动替换为归档 stub（保护窗口与失败结果保留）。
+    shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids);
 
     if messages_total_chars(&messages) <= max_chars {
         return messages;
@@ -1507,6 +1517,11 @@ fn truncate_mutable_field(
     reduce_by: usize,
     overflow_dir: Option<&Path>,
 ) -> bool {
+    // 归档路径可由 overflow_dir 直接推导（与 OverflowSink::new 同源），因此先以该
+    // 路径完成尺寸判定、真正归档放最后：若 stub 不会严格短于原文，直接放弃，避免
+    // 「先归档后判定失败」导致同一字段每轮压缩重复归档、溢出文件无界增长。
+    let archive_path_hint: Option<String> = overflow_dir
+        .map(|dir| dir.join(OVERFLOW_HISTORY_FILENAME).to_string_lossy().into_owned());
     match field {
         MutableMessageField::Content => {
             if is_preserved_tool_overflow_content(&message.content) {
@@ -1514,25 +1529,29 @@ fn truncate_mutable_field(
             }
             let text = value_to_string(&message.content);
             let original_chars = text.chars().count();
-            let archive_file_path =
-                archive_truncated_field_to_overflow(message, field, overflow_dir);
             let target = original_chars.saturating_sub(reduce_by).max(160);
-            let prefix = archive_file_path
-                .as_deref()
-                .map(|path| {
-                    format!(
-                        "[context-overflow-truncated] full original archived at: {path}\nhead+tail preview:\n"
-                    )
-                })
-                .unwrap_or_else(|| {
-                    "[context-overflow-truncated] head+tail preview:\n".to_string()
-                });
-            let preview_budget = target.saturating_sub(prefix.chars().count());
-            let truncated = format!("{prefix}{}", keep_ends_by_chars(&text, preview_budget));
+            let build_truncated = |path: Option<&str>| {
+                let prefix = path
+                    .map(|p| {
+                        format!(
+                            "[context-overflow-truncated] full original archived at: {p}\nhead+tail preview:\n"
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "[context-overflow-truncated] head+tail preview:\n".to_string()
+                    });
+                let preview_budget = target.saturating_sub(prefix.chars().count());
+                format!("{prefix}{}", keep_ends_by_chars(&text, preview_budget))
+            };
+            let truncated = build_truncated(archive_path_hint.as_deref());
             // 固定协议文本可能比目标预算还长；只有严格变短才提交。
             if truncated.chars().count() >= original_chars {
                 return false;
             }
+            // 判定通过才落盘归档；用真实返回路径重建（正常与 hint 完全一致）。
+            let archive_file_path =
+                archive_truncated_field_to_overflow(message, field, overflow_dir);
+            let truncated = build_truncated(archive_file_path.as_deref());
             message.content = Value::String(truncated);
             true
         }
@@ -1546,20 +1565,24 @@ fn truncate_mutable_field(
                 return false;
             }
             let original_chars = reasoning.chars().count();
-            let archive_file_path =
-                archive_truncated_field_to_overflow(message, field, overflow_dir);
             let target = original_chars.saturating_sub(reduce_by).max(160);
-            let prefix = archive_file_path
-                .as_deref()
-                .map(|path| {
-                    format!("[context-overflow-truncated] full original archived at: {path}; ")
-                })
-                .unwrap_or_else(|| "[context-overflow-truncated] ".to_string());
-            let preview_budget = target.saturating_sub(prefix.chars().count());
-            let truncated = format!("{prefix}{}", keep_ends_by_chars(reasoning, preview_budget));
+            let build_truncated = |path: Option<&str>| {
+                let prefix = path
+                    .map(|p| {
+                        format!("[context-overflow-truncated] full original archived at: {p}; ")
+                    })
+                    .unwrap_or_else(|| "[context-overflow-truncated] ".to_string());
+                let preview_budget = target.saturating_sub(prefix.chars().count());
+                format!("{prefix}{}", keep_ends_by_chars(reasoning, preview_budget))
+            };
+            let truncated = build_truncated(archive_path_hint.as_deref());
             if truncated.chars().count() >= original_chars {
                 return false;
             }
+            // 判定通过才落盘归档；用真实返回路径重建（正常与 hint 完全一致）。
+            let archive_file_path =
+                archive_truncated_field_to_overflow(message, field, overflow_dir);
+            let truncated = build_truncated(archive_file_path.as_deref());
             message.reasoning_content = Some(truncated);
             true
         }
@@ -1572,31 +1595,38 @@ fn truncate_mutable_field(
             else {
                 return false;
             };
-            let archive_file_path =
-                archive_truncated_field_to_overflow(message, field, overflow_dir);
             let original_chars = arguments.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
-            let build_truncated = |preview: String| {
+            let build_truncated = |path: Option<&str>, preview: String| {
                 serde_json::json!({
                     "_context_overflow_truncated": true,
                     "original_chars": original_chars,
-                    "archive_file_path": archive_file_path.as_deref(),
+                    "archive_file_path": path,
                     "preview": preview,
                 })
                 .to_string()
             };
-            let fixed_chars = build_truncated(String::new()).chars().count();
+            let fixed_chars = build_truncated(archive_path_hint.as_deref(), String::new())
+                .chars()
+                .count();
             let mut preview_budget = target.saturating_sub(fixed_chars);
-            let mut truncated = build_truncated(keep_ends_by_chars(&arguments, preview_budget));
+            let mut preview_text = keep_ends_by_chars(&arguments, preview_budget);
+            let mut truncated =
+                build_truncated(archive_path_hint.as_deref(), preview_text.clone());
             // JSON escaping 可能让一个预览字符占用多个序列化字符，按实际超额收紧。
             while truncated.chars().count() > target && preview_budget > 0 {
                 let excess = truncated.chars().count() - target;
                 preview_budget = preview_budget.saturating_sub(excess.max(1));
-                truncated = build_truncated(keep_ends_by_chars(&arguments, preview_budget));
+                preview_text = keep_ends_by_chars(&arguments, preview_budget);
+                truncated =
+                    build_truncated(archive_path_hint.as_deref(), preview_text.clone());
             }
             if truncated.chars().count() >= original_chars {
-                return false;
+                return false; // stub 不会更短：不归档、不改消息。
             }
+            // 判定通过才落盘归档；用真实返回路径重建（正常与 hint 完全一致）。
+            let archive_file_path =
+                archive_truncated_field_to_overflow(message, field, overflow_dir);
             let Some(call) = message
                 .tool_calls
                 .as_mut()
@@ -1605,9 +1635,111 @@ fn truncate_mutable_field(
                 return false;
             };
             // arguments 必须继续是合法 JSON；直接截字符串会让 provider 拒绝整次请求。
-            call.function.arguments = truncated;
+            call.function.arguments = build_truncated(archive_file_path.as_deref(), preview_text);
             true
         }
+    }
+}
+
+/// 主动精简「已成功写入」的 write_file / apply_patch 巨型 arguments。
+///
+/// 文件已落盘（结果消息确认成功）之后，完整 content/patch 正文对后续轮次没有
+/// 语义价值——模型引用的是文件路径而非正文——保留只会持续占用上下文。与预算
+/// 压力无关：只要该组已滑出最近保护窗口（模型不再可能引用刚写入的正文来构造
+/// 后续编辑），立即将其替换为 `_context_overflow_truncated` 指针 stub 并零压缩
+/// 归档原文；失败结果、窗口内结果、当前轮保护 id 一律不动，保证 agent 效果
+/// 不劣化（模型需要时仍可按 stub 的 archive_file_path 回读原文，或按 preview
+/// 识别文件内容轮廓）。
+fn shrink_successful_write_arguments(
+    messages: &mut Vec<Message>,
+    overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    // 保护窗口：最近 KEEP_RECENT_TOOL_GROUPS 个已有结果的工具组（含当前轮刚写完、
+    // 模型可能立即引用正文构造后续编辑的组），其调用一律保留完整 arguments。
+    let protected_recent_call_ids: rustc_hash::FxHashSet<String> =
+        recent_tool_result_groups(messages, KEEP_RECENT_TOOL_GROUPS)
+            .into_iter()
+            .flatten()
+            .filter_map(|idx| messages[idx].tool_call_id.clone())
+            .collect();
+    // tool_call_id → 结果文本（判定成功/失败）。
+    let result_by_call_id: rustc_hash::FxHashMap<String, String> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| {
+            message
+                .tool_call_id
+                .as_deref()
+                .map(|id| (id.to_string(), value_to_string(&message.content)))
+        })
+        .collect();
+
+    let mut changed = false;
+    for message in messages.iter_mut() {
+        if message.role != "assistant" {
+            continue;
+        }
+        let Some(tool_calls) = message.tool_calls.as_mut() else {
+            continue;
+        };
+        // 先收集候选，避免与 truncate_mutable_field 的独占借用冲突。
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        for (call_index, call) in tool_calls.iter().enumerate() {
+            let name = call.function.name.as_str();
+            if name != "write_file" && name != "apply_patch" {
+                continue;
+            }
+            if protected_recent_call_ids.contains(&call.id) || protected_tool_call_ids.contains(&call.id)
+            {
+                continue;
+            }
+            let arguments = &call.function.arguments;
+            if arguments.contains("\"_context_overflow_truncated\"") {
+                continue; // 已替换，幂等（避免重复归档/重复写文件）
+            }
+            let original_chars = arguments.chars().count();
+            if original_chars <= 160 {
+                continue;
+            }
+            let Some(result_text) = result_by_call_id.get(&call.id) else {
+                continue;
+            };
+            if !is_successful_write_result(name, result_text) {
+                continue;
+            }
+            candidates.push((call_index, original_chars));
+        }
+        for (call_index, original_chars) in candidates {
+            if truncate_mutable_field(
+                message,
+                MutableMessageField::ToolArguments(call_index),
+                original_chars.saturating_sub(240),
+                overflow_dir,
+            ) {
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        insert_overflow_archive_note_if_exists(messages, overflow_dir);
+    }
+}
+
+/// 判定 write_file / apply_patch 的结果是否成功。失败结果必须保留完整 arguments
+/// 供模型依据原文修复；成功结果才是可安全精简的对象。
+fn is_successful_write_result(tool_name: &str, result_text: &str) -> bool {
+    let trimmed = result_text.trim_start();
+    if trimmed.starts_with("Error:") || trimmed.starts_with("Exit code:") {
+        return false;
+    }
+    match tool_name {
+        "write_file" => trimmed.starts_with("Successfully wrote to"),
+        "apply_patch" => trimmed.starts_with("Successfully patched"),
+        _ => false,
     }
 }
 
@@ -2832,5 +2964,7 @@ mod coalesce_summary_notes_tests;
 mod dedup_adjacent_tests;
 #[cfg(test)]
 mod fold_early_tool_groups_tests;
+#[cfg(test)]
+mod shrink_successful_write_arguments_tests;
 #[cfg(test)]
 mod tail_window_tests;

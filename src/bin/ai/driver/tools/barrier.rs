@@ -21,13 +21,9 @@ struct BarrierSpec {
     rule: BarrierRule,
 }
 
-const BARRIER_SPECS: &[BarrierSpec] = &[
-    BarrierSpec {
-        route: ToolRouteKind::Builtin,
-        tool_name: "web_search",
-        rule: BarrierRule::Always,
-    },
-];
+// 当前没有需要 barrier 的内置工具；MCP 工具始终 barrier（见 barrier_rule）。
+// 未来若内置工具需要 barrier，在此登记 BarrierSpec 即可。
+const BARRIER_SPECS: &[BarrierSpec] = &[];
 
 fn route_kind(route: &ToolRoute) -> ToolRouteKind {
     match route {

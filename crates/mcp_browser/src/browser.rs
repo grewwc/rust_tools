@@ -84,6 +84,10 @@ pub struct BrowserSession {
     handler_task: JoinHandle<()>,
     /// 自动生成的临时 profile 目录，shutdown 时清理；用户显式指定或 attach 模式为 None。
     temp_profile_dir: Option<PathBuf>,
+    /// 待人工操作标记：检测到人机校验后置位（分类），wait_for_human 确认解决、
+    /// 检测为空或 navigate 到新页面后清除。置位期间改动类工具（click/type/press_key）
+    /// 会在输出前加 [HUMAN_ACTION_PENDING] 提醒，让模型停下来把操作交给用户。
+    pub pending_human: Option<String>,
 }
 
 impl BrowserSession {
@@ -154,6 +158,7 @@ impl BrowserSession {
             page,
             handler_task,
             temp_profile_dir,
+            pending_human: None,
         })
     }
 

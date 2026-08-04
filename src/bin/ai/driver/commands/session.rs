@@ -14,6 +14,7 @@ use crate::ai::{
 pub(in crate::ai) const CANONICAL_SESSION_SUBCOMMANDS: &[&str] = &[
     "help",
     "list",
+    "verbose",
     "current",
     "new",
     "use",
@@ -306,7 +307,8 @@ pub fn try_handle_session_command(
         "help" | "h" => {
             println!("Session management commands:");
             println!();
-            println!("  /sessions [list]          list all sessions");
+            println!("  /sessions [list]          list all sessions (default, no sizes)");
+            println!("  /sessions verbose         list all sessions with per-session sizes");
             println!("  /sessions current         show current session info");
             println!("  /sessions new             create and switch to new session");
             println!("  /sessions use <id>        switch to specified session");
@@ -350,10 +352,16 @@ pub fn try_handle_session_command(
             );
             println!();
         }
-        "list" | "ls" | "" => {
+        "list" | "ls" | "" | "verbose" => {
+            // 默认不递归统计每个 session 的大小（assets 递归是 `/ss` 的唯一重活）；
+            // 只有显式 `verbose`（`/ss verbose` 或 `/ss list verbose`）才并行统计。
+            let verbose = action == "verbose"
+                || parts.next().map(|t| t == "verbose").unwrap_or(false);
             let mut sessions = store.list_sessions()?;
-            // 大小按需并行统计：list_sessions 只读元数据，assets 递归统计放到这里多核并行。
-            store.attach_session_sizes(&mut sessions)?;
+            if verbose {
+                // 大小按需并行统计：list_sessions 只读元数据，assets 递归统计放到这里多核并行。
+                store.attach_session_sizes(&mut sessions)?;
+            }
             if sessions.is_empty() {
                 println!("No sessions.");
             } else {
@@ -370,15 +378,23 @@ pub fn try_handle_session_command(
                         .as_deref()
                         .filter(|v| !v.is_empty())
                         .unwrap_or("-");
+                    let size = if verbose {
+                        format_size(s.size_bytes)
+                    } else {
+                        "-".to_string()
+                    };
                     println!(
                         "{} {:<width$}  {}  {:>8}  {}",
                         mark,
                         s.id,
                         time,
-                        format_size(s.size_bytes),
+                        size,
                         summary,
                         width = max_id_len
                     );
+                }
+                if !verbose {
+                    println!("(run `/ss verbose` to include per-session sizes)");
                 }
             }
         }

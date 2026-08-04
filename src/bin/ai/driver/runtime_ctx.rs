@@ -49,22 +49,47 @@ use crate::ai::{
 };
 use tokio::sync::Mutex;
 
-/// Slot used by a sub-agent's `finalize_turn` to publish its final
-/// assistant text back to the caller. The parent task installs a fresh
-/// async `Mutex<Option<String>>` via `SUBAGENT_RESULT_SLOT.scope(...)` before
-/// invoking `run_turn`, then reads the slot once `run_turn` returns. This
-/// lets `task` / `task_spawn` actually surface the sub-agent's answer
-/// instead of just an "OK / FAILED" status line.
-pub(crate) type SubagentResultSlot = Arc<Mutex<Option<String>>>;
+/// 子代理发布给父代理的结果。`parent_payload` 可包含工具证据，供父代理复用；
+/// `final_assistant_text` 保留模型原始最终正文，供 `response_schema` 校验。
+/// 两者必须分开，避免证据包装破坏结构化 JSON 输出。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SubagentResult {
+    pub(crate) parent_payload: String,
+    pub(crate) final_assistant_text: String,
+}
 
-/// Slot used by a sub-agent to publish its **current phase** (e.g.
-/// "preparing context" / "calling model") so the spawning `task` tool can
-/// show it on the waiting heartbeat line. Unlike `SubagentResultSlot` this
-/// is a plain `std::sync::Mutex` because it is written from the sub-agent
-/// task and read from the parent's blocking wait loop with no `.await`
-/// across the lock. The parent installs a fresh slot via
-/// `SUBAGENT_PHASE.scope(...)` before invoking `run_turn`.
-pub(crate) type SubagentPhaseSlot = Arc<std::sync::Mutex<String>>;
+/// Slot used by a sub-agent's `finalize_turn` to publish its result back to
+/// the caller. The parent installs a fresh slot before invoking `run_turn`,
+/// then reads it once the child returns.
+pub(crate) type SubagentResultSlot = Arc<Mutex<SubagentResult>>;
+
+/// 子代理的实时进度。`phase` 随模型请求和工具调用变化，最近一次持久化的
+/// 工作计划则跨 phase 保留，供父代理的单行状态渲染器组合展示。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SubagentProgress {
+    phase: String,
+    checkpoint_summary: Option<String>,
+}
+
+impl SubagentProgress {
+    fn new(phase: &str) -> Self {
+        Self {
+            phase: compact_progress_text(phase, 80),
+            checkpoint_summary: None,
+        }
+    }
+
+    pub(crate) fn display(&self) -> String {
+        match self.checkpoint_summary.as_deref() {
+            Some(summary) if !summary.is_empty() => format!("{} · plan: {summary}", self.phase),
+            _ => self.phase.clone(),
+        }
+    }
+}
+
+/// 与 `SubagentResultSlot` 不同，这里使用同步锁：子代理写入时不跨 `.await`，
+/// 父代理的前台等待/刷新循环也只做一次短快照。
+pub(crate) type SubagentPhaseSlot = Arc<std::sync::Mutex<SubagentProgress>>;
 
 /// 一次性收口信号：父等待循环在预留的收口时间到达时置位，子代理在下一轮
 /// 请求模型前消费它并切换到无工具的最终回答模式。
@@ -165,11 +190,13 @@ pub(crate) fn is_resume_turn() -> bool {
     IS_RESUME_TURN.try_with(|v| *v).unwrap_or(false)
 }
 
-/// Publish the sub-agent's final assistant text into the active result
-/// slot if one was installed by the spawning tool. Silent no-op when no
-/// slot is set (e.g. top-level foreground turn).
-pub(crate) async fn publish_subagent_result(text: &str) {
-    if text.trim().is_empty() {
+/// 把父侧 payload 与原始最终正文一起发布到 active result slot。顶层前台
+/// turn 没有安装 slot 时静默跳过。
+pub(crate) async fn publish_subagent_result(
+    parent_payload: &str,
+    final_assistant_text: &str,
+) {
+    if parent_payload.trim().is_empty() {
         return;
     }
     let slot = match SUBAGENT_RESULT_SLOT.try_with(|slot| slot.clone()) {
@@ -177,7 +204,10 @@ pub(crate) async fn publish_subagent_result(text: &str) {
         Err(_) => return,
     };
     let mut guard = slot.lock().await;
-    *guard = Some(text.to_string());
+    *guard = SubagentResult {
+        parent_payload: parent_payload.to_string(),
+        final_assistant_text: final_assistant_text.to_string(),
+    };
 }
 
 pub(crate) fn has_subagent_result_slot() -> bool {
@@ -197,9 +227,50 @@ pub(crate) fn publish_subagent_phase(phase: &str) {
         return;
     };
     if let Ok(mut guard) = slot.lock() {
-        if *guard != phase {
-            *guard = phase.to_string();
+        let phase = compact_progress_text(phase, 80);
+        if guard.phase != phase {
+            guard.phase = phase;
         }
+    }
+}
+
+/// 记录最近一次已成功落盘的工作计划。阶段变化只更新 `phase`，不会丢失这条
+/// 可供父代理展示的任务级进展。
+pub(crate) fn publish_subagent_checkpoint_summary(summary: &str) {
+    let Ok(slot) = SUBAGENT_PHASE.try_with(|slot| slot.clone()) else {
+        return;
+    };
+    if let Ok(mut guard) = slot.lock() {
+        let summary = summary
+            .strip_prefix("working_checkpoint:")
+            .unwrap_or(summary)
+            .trim();
+        guard.checkpoint_summary = Some(compact_progress_text(summary, 120));
+    }
+}
+
+pub(crate) fn new_subagent_progress_slot() -> SubagentPhaseSlot {
+    Arc::new(std::sync::Mutex::new(SubagentProgress::new("starting")))
+}
+
+pub(crate) fn subagent_progress_snapshot(slot: &SubagentPhaseSlot) -> Option<String> {
+    slot.lock().ok().map(|progress| progress.display())
+}
+
+fn compact_progress_text(value: &str, max_chars: usize) -> String {
+    // 进度最终会进入父进程 TTY；先在共享槽写入边界移除 ESC、BEL、回车等
+    // 终端控制字符，避免任一前台渲染路径误把模型提供的工具参数当作控制序列。
+    let sanitized: String = value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
     }
 }
 
@@ -348,6 +419,36 @@ mod tests {
         let enabled = SUPPRESS_TERMINAL_OUTPUT.sync_scope(true, terminal_output_enabled);
         assert!(!enabled);
         assert!(terminal_output_enabled());
+    }
+
+    #[test]
+    fn subagent_progress_keeps_saved_plan_while_phase_changes() {
+        let slot = new_subagent_progress_slot();
+        let rendered = SUBAGENT_PHASE.sync_scope(slot.clone(), || {
+            publish_subagent_checkpoint_summary("working_checkpoint: inspect the task path");
+            publish_subagent_phase("calling model");
+            subagent_progress_snapshot(&slot)
+        });
+
+        assert_eq!(rendered.as_deref(), Some("calling model · plan: inspect the task path"));
+    }
+
+    #[tokio::test]
+    async fn published_subagent_result_keeps_parent_payload_and_raw_final_separate() {
+        let slot: SubagentResultSlot = Arc::new(Mutex::new(SubagentResult::default()));
+        SUBAGENT_RESULT_SLOT
+            .scope(slot.clone(), async {
+                publish_subagent_result(
+                    "[Subagent tool evidence]\nread_file(...)\n\n[Subagent final answer]\n{\"ok\":true}",
+                    "{\"ok\":true}",
+                )
+                .await;
+            })
+            .await;
+
+        let result = slot.lock().await.clone();
+        assert!(result.parent_payload.starts_with("[Subagent tool evidence]"));
+        assert_eq!(result.final_assistant_text, "{\"ok\":true}");
     }
 
     #[test]

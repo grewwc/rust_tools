@@ -1,10 +1,10 @@
 use super::{
     ModelStrengthTier, SubagentTaskDifficulty, agent_model_tier, api_key_for_model,
-    auto_subagent_model_for_agent, classify_subagent_task_difficulty, default_model,
-    determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
-    endpoint_supports_anonymous_auth, initial_model, merge_agent_tier_with_difficulty,
-    context_window_tokens, max_output_tokens, model_adapter, model_platform_label,
-    model_quality_tier, parse_disabled_model_tokens, request_model_name, request_protocol_dialect,
+    auto_subagent_model_for_agent, classify_subagent_task_difficulty, context_window_tokens,
+    default_model, determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
+    endpoint_supports_anonymous_auth, initial_model, max_output_tokens,
+    merge_agent_tier_with_difficulty, model_adapter, model_platform_label, model_quality_tier,
+    parse_disabled_model_tokens, request_model_name, request_protocol_dialect,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 use crate::ai::cli::ParsedCli;

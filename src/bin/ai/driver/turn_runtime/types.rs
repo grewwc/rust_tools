@@ -1,5 +1,6 @@
 use crate::ai::history::Message;
 use rust_tools::commonw::FastSet;
+use std::path::PathBuf;
 
 pub(super) struct PreparedToolResult {
     pub(super) content_for_model: String,
@@ -44,7 +45,7 @@ pub(super) enum TurnLoopStep {
     Continue,
     /// 本轮只执行了 target-scoped instruction preflight，没有产生文件副作用。
     /// Orchestrator 可为它授予一次不占正常工具迭代预算的重试机会。
-    ScopedPreflightContinue,
+    ScopedPreflightContinue(Vec<PathBuf>),
     Break,
     Return(TurnOutcome),
 }

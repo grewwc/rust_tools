@@ -100,6 +100,23 @@ impl FileStore {
     }
 
     pub(crate) fn write_all(&self, content: &str) -> Result<(), AiError> {
+        // 改动前快照（best-effort）：供 mutation log 的 before 字段使用。
+        // 新文件 / 二进制 / 读取失败均为 None，不影响写盘。
+        let before = self.read_to_string().ok();
+        let result = self.write_all_inner(content);
+        if result.is_ok() {
+            // 记录到会话级 mutation log（best-effort，绝不影响写盘结果）。
+            crate::ai::tools::storage::mutation_log::record(
+                &self.path,
+                "write",
+                before.as_deref(),
+                Some(content),
+            );
+        }
+        result
+    }
+
+    fn write_all_inner(&self, content: &str) -> Result<(), AiError> {
         if let Some(result) = try_vfs_write(&self.path, content) {
             return result.map_err(|e| vfs_to_ai_err(&self.path, e));
         }
@@ -241,7 +258,7 @@ fn overflow_artifact_tool_name(path: &Path) -> Option<String> {
 
 /// 当前 turn 对应的会话 asset 根目录。无活动 driver context 时保守返回 None，
 /// 不能把测试/one-shot 环境误当成拥有任意历史会话的读取权限。
-fn current_session_assets_dir() -> Option<PathBuf> {
+pub(crate) fn current_session_assets_dir() -> Option<PathBuf> {
     let ctx = crate::ai::driver::runtime_ctx::try_current()?;
     let turn_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let session_id = if turn_session_id.is_empty() {

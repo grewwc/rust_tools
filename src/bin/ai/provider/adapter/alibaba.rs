@@ -1,10 +1,9 @@
 //! 阿里云百炼（DashScope）compatible-mode 适配器。
 //!
 //! 端点：`https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`。
-//! 推理强度走嵌套 `reasoning: { effort }`，并接受 `enable_search` 扩展字段。
+//! 默认不发送推理强度字段，并接受 `enable_search` 扩展字段。DeepSeek / GLM
+//! 等模型的推理强度 wire 由 models.json 的模型级能力声明覆盖。
 //! 思考开关由 `thinking` 方言模块统一处理，不在此实现。
-
-use serde_json::{Value, json};
 
 use crate::ai::config_schema::AiConfig;
 
@@ -23,10 +22,6 @@ impl ProviderAdapter for AlibabaAdapter {
 
     fn reasoning_top_level<'a>(&self, _effort: Option<&'a str>) -> Option<&'a str> {
         None
-    }
-
-    fn reasoning_nested(&self, effort: Option<&str>) -> Option<Value> {
-        effort.map(|effort| json!({ "effort": effort }))
     }
 
     fn default_endpoint(&self) -> &'static str {

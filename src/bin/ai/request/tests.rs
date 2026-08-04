@@ -298,10 +298,16 @@ fn prompt_cache_breakpoint_noop_without_system_message() {
 }
 
 #[test]
-fn prompt_cache_model_support_uses_models_json_flag() {
-    assert!(models::explicit_prompt_cache_enabled("qwen3.7-max"));
-    assert!(models::explicit_prompt_cache_enabled("qwen3.7-plus"));
-    assert!(models::explicit_prompt_cache_enabled("glm-5.2"));
+fn dashscope_builtin_models_do_not_enable_anthropic_prompt_cache() {
+    for model in [
+        "deepseek-v4-flash-0731-alibaba",
+        "qwen3.7-plus-alibaba",
+        "qwen3.7-max-alibaba",
+        "qwen3.6-flash-alibaba",
+        "glm-5.2-alibaba",
+    ] {
+        assert!(!models::explicit_prompt_cache_enabled(model), "{model}");
+    }
 }
 
 #[test]
@@ -392,8 +398,35 @@ fn thinking_disabled_override_forces_thinking_off() {
         .unwrap();
     let mut app = test_app();
     app.cli.thinking_disabled_override = true;
-    let enabled = rt.block_on(super::resolve_thinking(&app, "glm-5.2", &[]));
+    let enabled = rt.block_on(super::resolve_thinking(
+        &app,
+        "deepseek-v4-flash-0731-alibaba",
+        &[],
+    ));
     assert!(!enabled, "override 置位时 thinking 必须关闭");
+}
+
+#[test]
+fn dashscope_deepseek_defaults_to_thinking_for_simple_requests() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let app = test_app();
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("你好".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    let enabled = rt.block_on(super::resolve_thinking(
+        &app,
+        "deepseek-v4-flash-0731-alibaba",
+        &messages,
+    ));
+    assert!(enabled);
 }
 
 #[test]
@@ -648,7 +681,7 @@ fn first_model_key_for_adapter(adapter: crate::ai::provider::ApiProvider) -> Opt
 /// 作为 adapter 重构「不破坏对外 wire 行为」的可执行回归网。
 /// 字段顺序由 [`RequestBody`] 声明顺序决定，serde 输出稳定可断言整串。
 #[test]
-fn build_request_body_wire_format_is_byte_stable_per_adapter() {
+fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
     use crate::ai::provider::ApiProvider;
 
     let messages = vec![Message {
@@ -659,10 +692,15 @@ fn build_request_body_wire_format_is_byte_stable_per_adapter() {
         reasoning_content: None,
     }];
 
-    // Alibaba：嵌套 reasoning.effort + enable_thinking/enable_search，无 stream_options（非流式）。
+    // Alibaba 默认：enable_thinking/enable_search，无未经模型声明的 effort 字段。
     // 用唯一 key 定位模型（生产链路一致），避免共享 name 命中歧义条目。
-    let alibaba_model = first_model_key_for_adapter(ApiProvider::Alibaba)
-        .expect("models.json must contain an Alibaba model");
+    let alibaba_model = crate::ai::model_names::all()
+        .iter()
+        .find(|model| {
+            model.adapter == ApiProvider::Alibaba && model.reasoning_effort_wire.is_none()
+        })
+        .map(|model| model.key.clone())
+        .expect("models.json must contain an Alibaba model using the adapter-default effort wire");
     let alibaba = build_request_body(
         &alibaba_model,
         &messages,
@@ -685,7 +723,7 @@ fn build_request_body_wire_format_is_byte_stable_per_adapter() {
     assert_eq!(
         serde_json::to_string(&alibaba).unwrap(),
         format!(
-            r#"{{"model":"{alibaba_wire_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true,"reasoning":{{"effort":"high"}}{alibaba_max_tokens_field}}}"#
+            r#"{{"model":"{alibaba_wire_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true{alibaba_max_tokens_field}}}"#
         )
     );
 
@@ -837,6 +875,132 @@ fn opencode_deepseek_reasoning_effort_suppresses_thinking_object() {
         );
         assert!(json.get("thinking").is_none(), "{model}");
     }
+}
+
+#[test]
+fn dashscope_deepseek_uses_model_specific_reasoning_contract() {
+    const MODEL: &str = "deepseek-v4-flash-0731-alibaba";
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    let body = build_request_body(
+        MODEL,
+        &messages,
+        false,
+        true,
+        Some(true),
+        None,
+        None,
+        Some("max"),
+        None,
+        None,
+        None,
+    );
+    let json = serde_json::to_value(&body).unwrap();
+    assert_eq!(
+        json.get("model").and_then(|value| value.as_str()),
+        Some("deepseek-v4-flash-0731")
+    );
+    assert_eq!(
+        json.get("enable_thinking")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        json.get("reasoning_effort")
+            .and_then(|value| value.as_str()),
+        Some("max")
+    );
+    assert!(json.get("reasoning").is_none());
+    assert_eq!(
+        models::default_reasoning_effort(MODEL),
+        Some(crate::ai::provider::ReasoningEffort::Max)
+    );
+    assert!(models::reasoning_effort_reduces_thinking(MODEL));
+    assert!(models::reasoning_content_replay_enabled(MODEL));
+    assert!(!models::explicit_prompt_cache_enabled(MODEL));
+
+    let assistant = Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_dashscope_deepseek".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: Some("需要先读取目标文件。".to_string()),
+    };
+    let projected = crate::ai::history::compress::sanitize_message_for_persisted_history_for_model(
+        MODEL, &assistant,
+    );
+    let mut projected_messages = vec![projected];
+    normalize_reasoning_content_replay_for_model(MODEL, &mut projected_messages);
+    assert_eq!(
+        projected_messages[0].reasoning_content,
+        assistant.reasoning_content
+    );
+}
+
+#[test]
+fn dashscope_glm_uses_top_level_effort_and_exact_reasoning_replay() {
+    const MODEL: &str = "glm-5.2-alibaba";
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    let body = build_request_body(
+        MODEL,
+        &messages,
+        false,
+        true,
+        None,
+        None,
+        None,
+        Some("high"),
+        None,
+        None,
+        None,
+    );
+    let json = serde_json::to_value(&body).unwrap();
+    assert_eq!(
+        json.get("enable_thinking")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        json.get("reasoning_effort")
+            .and_then(|value| value.as_str()),
+        Some("high")
+    );
+    assert!(json.get("reasoning").is_none());
+    assert!(models::reasoning_effort_reduces_thinking(MODEL));
+    assert!(models::reasoning_content_replay_enabled(MODEL));
+}
+
+#[test]
+fn dashscope_qwen_metadata_matches_documented_thinking_controls() {
+    assert_eq!(
+        models::default_reasoning_effort("qwen3.7-plus-alibaba"),
+        None
+    );
+    assert_eq!(
+        models::default_reasoning_effort("qwen3.7-max-alibaba"),
+        None
+    );
+    assert!(models::enable_thinking("qwen3.6-flash-alibaba"));
 }
 
 #[test]
@@ -1752,13 +1916,7 @@ fn alibaba_request_body_keeps_extension_flags() {
         Some(true)
     );
     assert!(value.get("reasoning_effort").is_none());
-    assert_eq!(
-        value
-            .get("reasoning")
-            .and_then(|v| v.get("effort"))
-            .and_then(|v| v.as_str()),
-        Some("high")
-    );
+    assert!(value.get("reasoning").is_none());
 }
 
 #[test]

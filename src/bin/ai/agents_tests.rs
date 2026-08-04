@@ -1,5 +1,6 @@
 use super::{
     AgentModelTier, BUILTIN_AGENTS, load_project_instruction_docs_from,
+    load_scoped_project_instruction_docs_for_target_priority_from,
     load_scoped_project_instruction_docs_for_targets_from, parse_agent_front_matter,
 };
 use std::fs;
@@ -77,6 +78,20 @@ fn builtin_agents_do_not_mount_mcp_tools_by_default() {
             "{filename} should use progressive MCP loading instead of mounting every MCP tool"
         );
     }
+}
+
+#[test]
+fn builtin_build_agent_prompt_preserves_end_to_end_behavior_tracing() {
+    let (_, content) = BUILTIN_AGENTS
+        .iter()
+        .find(|(filename, _)| *filename == "build.agent")
+        .expect("build agent should be registered");
+    let agent = parse_agent_front_matter(content).unwrap();
+
+    assert!(agent.prompt.contains("Trace behavior before editing"));
+    assert!(agent.prompt.contains("transformations, branches, retries, and consumers"));
+    assert!(agent.prompt.contains("do not infer a value's meaning or completeness"));
+    assert!(agent.prompt.contains("Prove behavior, not just compilation"));
 }
 
 #[test]
@@ -236,6 +251,44 @@ fn target_scoped_instruction_budget_preserves_deepest_rules_first() {
     assert!(docs[1].content.contains("driver-tail"));
     assert!(docs[2].path.ends_with("src/bin/ai/driver/deep/AGENTS.md"));
     assert!(docs[2].content.contains("deep-tail"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn target_scoped_instruction_budget_prioritizes_pending_mutation() {
+    let root = temp_dir("target_scoped_priority");
+    let required_target = root.join("required/file.rs");
+    let observed_target = root.join("observed/deep/file.rs");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(required_target.parent().unwrap()).unwrap();
+    fs::create_dir_all(observed_target.parent().unwrap()).unwrap();
+    fs::write(root.join("AGENTS.md"), "root rules\n").unwrap();
+    fs::write(root.join("required/AGENTS.md"), "required mutation rule\n").unwrap();
+    fs::write(
+        root.join("observed/AGENTS.md"),
+        format!("observed-parent\n{}", "p".repeat(8_000)),
+    )
+    .unwrap();
+    fs::write(
+        root.join("observed/deep/AGENTS.md"),
+        format!("observed-deep\n{}", "d".repeat(8_000)),
+    )
+    .unwrap();
+    fs::write(&required_target, "// required\n").unwrap();
+    fs::write(&observed_target, "// observed\n").unwrap();
+
+    let docs = load_scoped_project_instruction_docs_for_target_priority_from(
+        &root,
+        std::slice::from_ref(&required_target),
+        std::slice::from_ref(&observed_target),
+    );
+
+    let required = docs
+        .iter()
+        .find(|doc| doc.path.ends_with("required/AGENTS.md"))
+        .expect("pending mutation rules must not be starved by observed targets");
+    assert_eq!(required.content, "required mutation rule");
 
     let _ = fs::remove_dir_all(root);
 }

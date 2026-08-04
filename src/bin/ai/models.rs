@@ -63,6 +63,23 @@ pub(super) fn default_reasoning_effort(model: &str) -> Option<ReasoningEffort> {
     model_def(model).and_then(|m| m.reasoning_effort)
 }
 
+pub(super) fn reasoning_effort_wire(model: &str) -> Option<model_names::ReasoningEffortWire> {
+    model_def(model).and_then(|m| m.reasoning_effort_wire)
+}
+
+/// 降低该模型的 reasoning effort 是否能实际缩短思考链。
+///
+/// 模型显式声明 wire 形状时，说明该字段是模型协议的一部分；否则回退到 provider
+/// thinking dialect 的默认能力判断。
+pub(super) fn reasoning_effort_reduces_thinking(model: &str) -> bool {
+    if reasoning_effort_wire(model).is_some() {
+        return true;
+    }
+    let endpoint = endpoint_for_model(model, "");
+    let request_model = request_model_name(model);
+    provider::reasoning_effort_reduces_thinking_for(model_adapter(model), &request_model, &endpoint)
+}
+
 /// 返回该模型是否声明了 `reasoning_effort` 与 `tools` 不兼容。
 /// 若为 true，请求层在携带 tools 时会自动省略 `reasoning_effort` 字段，
 /// 避免部分网关（如 bytedance modelhub）返回 400。

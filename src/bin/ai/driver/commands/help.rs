@@ -50,7 +50,8 @@ pub fn print_interactive_help() {
     println!("    /skills <name>            select & activate a skill");
     println!();
     println!("  Session management:");
-    println!("    /sessions [list]          list all sessions");
+    println!("    /sessions [list]          list all sessions (default, no sizes)");
+    println!("    /sessions verbose         list all sessions with per-session sizes");
     println!("    /sessions current         show current session info");
     println!("    /sessions new             create and switch to new session");
     println!("    /sessions use <id>        switch to specified session");

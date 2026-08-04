@@ -709,28 +709,4 @@ mod tests {
         let _ = store.delete_session(&app.session_id);
     }
 
-    #[test]
-    fn web_search_uses_summary_first_terminal_preview() {
-        let history_file = std::env::temp_dir().join(format!(
-            "ai-tool-preview-web-search-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ));
-        let app = test_app(history_file);
-
-        let mut content = String::new();
-        for i in 0..40usize {
-            content.push_str(&format!("result {}: title {}\n", i, "x".repeat(60)));
-        }
-
-        let prepared = prepare_tool_result(&app, "web_search", &content);
-
-        assert_eq!(prepared.content_for_model, content);
-        assert!(
-            prepared
-                .content_for_terminal
-                .contains("summary-first terminal preview")
-        );
-        assert!(prepared.content_for_terminal.contains("result 0"));
-        assert!(!prepared.content_for_terminal.contains("result 39"));
-    }
 }

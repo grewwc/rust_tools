@@ -1,5 +1,5 @@
 use crate::ai::{
-    driver::print::format_empty_state,
+    driver::print::{format_empty_state, print_assistant_banner_with_app_and_skill},
     history::{
         Message, SessionTitle, SessionTitleOrigin, compact_session_history_at_boundary_with_app,
         compact_session_history_with_app, generate_session_summary, is_low_quality_session_title,
@@ -7,7 +7,6 @@ use crate::ai::{
     },
     types::App,
 };
-use colored::Colorize;
 use rust_tools::commonw::FastSet;
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
@@ -39,9 +38,6 @@ fn ensure_final_assistant_recorded(
         return;
     }
 
-    if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-        println!("\n{}", final_assistant_text.yellow());
-    }
     turn_messages.push(Message {
         role: "assistant".to_string(),
         content: Value::String(final_assistant_text.to_string()),
@@ -322,6 +318,7 @@ pub(super) async fn finalize_turn(
     question: &str,
     final_assistant_text: &str,
     final_assistant_recorded: bool,
+    active_skill_name: Option<&str>,
     turn_messages: &mut Vec<Message>,
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
@@ -334,7 +331,11 @@ pub(super) async fn finalize_turn(
         // 尽早发布给父 agent：即便本轮没有最终 assistant 正文，只要留下了可复用的
         // subagent 证据（如 read_file 结果），父 agent 也必须感知。
         // 这样同步 `task` 与异步 `task_wait` 都能拿到同一份父侧 payload。
-        crate::ai::driver::runtime_ctx::publish_subagent_result(&subagent_output_for_parent).await;
+        crate::ai::driver::runtime_ctx::publish_subagent_result(
+            &subagent_output_for_parent,
+            final_assistant_text,
+        )
+        .await;
     }
 
     if !final_assistant_text.trim().is_empty() {
@@ -343,6 +344,10 @@ pub(super) async fn finalize_turn(
             final_assistant_recorded,
             turn_messages,
         );
+        if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+            print_assistant_banner_with_app_and_skill(Some(app), active_skill_name);
+            crate::ai::stream::render_markdown_block(final_assistant_text)?;
+        }
         persist_pending_turn_messages_for_model(
             app,
             response_source_model,

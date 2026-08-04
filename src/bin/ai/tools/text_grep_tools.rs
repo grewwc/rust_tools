@@ -98,6 +98,9 @@ pub(crate) struct ContentSearchOptions<'a> {
     pub(crate) extensions: Option<&'a [&'a str]>,
     /// 展示路径时用于裁掉前缀（一般是 cwd），让输出用相对路径。
     pub(crate) display_root: Option<&'a Path>,
+    /// 单文件大小上限（字节），超过即跳过该文件。普通搜索用 2 MiB；
+    /// 会话归档搜索会调大，因为 overflow 文件可能远超普通源文件。
+    pub(crate) max_file_size: u64,
 }
 
 /// 一行匹配，连同它在文件内的相关性分数。
@@ -177,7 +180,7 @@ pub(crate) fn run_content_search(
             Ok(m) => m,
             Err(_) => continue,
         };
-        if metadata.len() > MAX_FILE_SIZE {
+        if metadata.len() > options.max_file_size {
             continue;
         }
 
@@ -724,6 +727,7 @@ fn execute_text_grep(args: &Value) -> Result<String, String> {
         // text_grep 不按扩展名过滤——只受可选的 file_pattern 约束。
         extensions: None,
         display_root: Some(&cwd),
+        max_file_size: MAX_FILE_SIZE,
     };
 
     run_content_search(&root, &options)

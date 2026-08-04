@@ -45,10 +45,10 @@ use super::super::runtime_ctx::DriverContext;
 
 /// Hard upper bound on how long a synchronous `task` tool call may block
 /// the parent agent. Keeps a runaway sub-agent from wedging the foreground
-/// turn forever. Subagents are leaf tasks with a separate iteration cap; five
+/// turn forever. Subagents are leaf tasks with a separate iteration cap; ten
 /// minutes is enough to return useful partial evidence without wedging the
 /// parent turn for an interactive session.
-const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(300);
+const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(600);
 
 struct SyncSubagentHistoryGuard {
     path: PathBuf,
@@ -244,6 +244,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let task_mcp_for_spawn = task_mcp.clone();
     let task_agent_manifests_for_spawn = task_agent_manifests.clone();
     let prompt = prepared.prompt.clone();
+    let response_schema = prepared.response_schema.clone();
     let model = prepared.model.clone();
     let auto_model_fallback = prepared.auto_model_fallback;
 
@@ -262,11 +263,12 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     // Slot used by the sub-agent's `finalize_turn` to publish its final
     // assistant text. Created here, scoped via `SUBAGENT_RESULT_SLOT` over
     // the spawned future, and read once the sub-agent returns.
-    let result_slot: runtime_ctx::SubagentResultSlot = Arc::new(tokio::sync::Mutex::new(None));
+    let result_slot: runtime_ctx::SubagentResultSlot =
+        Arc::new(tokio::sync::Mutex::new(runtime_ctx::SubagentResult::default()));
     let result_slot_for_scope = result_slot.clone();
     // Slot the sub-agent writes its current execution phase into; the wait
     // loop reads it to annotate the heartbeat line ("… · calling model").
-    let phase_slot: runtime_ctx::SubagentPhaseSlot = Arc::new(std::sync::Mutex::new(String::new()));
+    let phase_slot = runtime_ctx::new_subagent_progress_slot();
     let phase_slot_for_scope = phase_slot.clone();
     let wrap_up_signal = wrap_up_lead_time.map(|_| Arc::new(AtomicBool::new(false)));
     let wrap_up_signal_for_scope = wrap_up_signal.clone();
@@ -384,22 +386,33 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let duration = started.elapsed();
     let elapsed_secs = duration.as_secs_f64();
 
-    let captured_output = result_slot
+    let captured_result = result_slot
         .try_lock()
         .ok()
-        .and_then(|guard| guard.clone())
+        .map(|guard| guard.clone())
         .unwrap_or_default();
+    let captured_output = captured_result.parent_payload;
+    let response_for_validation = captured_result.final_assistant_text;
     let memory_merge_error = memory_merge_error
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .take();
 
-    let (status, error) = match (join_result, memory_merge_error) {
+    let (mut status, mut error) = match (join_result, memory_merge_error) {
         (Ok(Ok(())), Some(error)) => ("FAILED", Some(error)),
         (Ok(Ok(())), None) => ("COMPLETED", None),
         (Ok(Err(err)), _) => ("FAILED", Some(err)),
         (Err(err), _) => (subagent_wait_error_status(&err), Some(err)),
     };
+    if status == "COMPLETED"
+        && let Err(validation_error) = task_tools::validate_subagent_response(
+            response_schema.as_ref(),
+            &response_for_validation,
+        )
+    {
+        status = "FAILED";
+        error = Some(validation_error);
+    }
     let rendered = format_subagent_output(
         status,
         &log_description,
@@ -521,10 +534,7 @@ async fn wait_for_sync_task_completion_with_wrap_up(
                     continue;
                 }
                 _ = heartbeat.tick(), if show_heartbeat => {
-                    let phase = phase_slot
-                        .lock()
-                        .ok()
-                        .map(|guard| guard.clone())
+                    let phase = runtime_ctx::subagent_progress_snapshot(&phase_slot)
                         .unwrap_or_default();
                     print_heartbeat_line(started.elapsed(), &phase);
                     heartbeat_visible = true;
@@ -542,18 +552,25 @@ async fn wait_for_sync_task_completion_with_wrap_up(
     }
 }
 
-/// 原地刷新一行 subagent 运行心跳（不换行）。用 `\r` 回到行首 + `\x1b[2K`
-/// 清整行，保证多次心跳只占同一行；暗色显示以免喧宾夺主。`phase` 非空时
-/// 追加当前执行阶段（如 "calling model"），让用户看到子 agent 正在做什么。
-fn print_heartbeat_line(elapsed: Duration, phase: &str) {
-    use std::io::Write;
+/// 构造最多占一个终端物理行的 subagent 心跳。长路径、计划等阶段详情必须按当前
+/// 终端宽度截断，否则终端自动折行后，下一次 `\r` 只能覆盖最后一行，旧状态会逐次累积。
+fn render_heartbeat_line(elapsed: Duration, phase: &str) -> String {
     let secs = elapsed.as_secs();
     let phase = phase.trim();
-    if phase.is_empty() {
-        print!("\r\x1b[2K\x1b[2m⏳ subagent running… {secs}s (Ctrl+C to cancel)\x1b[0m");
+    let line = if phase.is_empty() {
+        format!("⏳ subagent running… {secs}s (Ctrl+C to cancel)")
     } else {
-        print!("\r\x1b[2K\x1b[2m⏳ subagent running… {secs}s · {phase} (Ctrl+C to cancel)\x1b[0m");
-    }
+        format!("⏳ subagent running… {secs}s · {phase} (Ctrl+C to cancel)")
+    };
+    crate::ai::stream::clamp_line_to_terminal_row_with_reserve(&line, 0)
+}
+
+/// 原地刷新一行 subagent 运行心跳（不换行）。用 `\r` 回到行首 + `\x1b[2K`
+/// 清整行，保证多次心跳只占同一行；暗色显示以免喧宾夺主。
+fn print_heartbeat_line(elapsed: Duration, phase: &str) {
+    use std::io::Write;
+    let line = render_heartbeat_line(elapsed, phase);
+    print!("\r\x1b[2K\x1b[2m{line}\x1b[0m");
     let _ = std::io::stdout().flush();
 }
 
@@ -631,8 +648,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let signal: runtime_ctx::SubagentWrapUpSignal = Arc::new(AtomicBool::new(false));
         let signal_for_wait = signal.clone();
-        let phase_slot: runtime_ctx::SubagentPhaseSlot =
-            Arc::new(std::sync::Mutex::new(String::new()));
+        let phase_slot = runtime_ctx::new_subagent_progress_slot();
         let waiter = tokio::spawn(wait_for_sync_task_completion_with_wrap_up(
             rx,
             Arc::new(AtomicBool::new(false)),
@@ -664,7 +680,30 @@ mod tests {
     }
 
     fn phase() -> runtime_ctx::SubagentPhaseSlot {
-        Arc::new(std::sync::Mutex::new(String::new()))
+        runtime_ctx::new_subagent_progress_slot()
+    }
+
+    #[test]
+    fn sync_task_heartbeat_is_safe_and_clamped_to_one_terminal_row() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe { std::env::set_var("COLUMNS", "48") };
+
+        let slot = runtime_ctx::new_subagent_progress_slot();
+        let phase = runtime_ctx::SUBAGENT_PHASE.sync_scope(slot.clone(), || {
+            runtime_ctx::publish_subagent_phase(
+                "using read_file · \x1b[2J/Users/example/a/very/long/path.rs\x07",
+            );
+            runtime_ctx::subagent_progress_snapshot(&slot).expect("progress should be published")
+        });
+        let line = render_heartbeat_line(Duration::from_secs(66), &phase);
+
+        assert!(!phase.chars().any(char::is_control));
+        assert!(!line.chars().any(char::is_control));
+        assert!(line.ends_with('…'), "long heartbeat should be truncated: {line}");
+        assert!(unicode_width::UnicodeWidthStr::width(line.as_str()) <= 48);
+        unsafe { std::env::remove_var("COLUMNS") };
     }
 
     #[tokio::test]
@@ -781,8 +820,8 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_sync_task_hard_timeout_remains_five_minutes() {
-        assert_eq!(SYNC_TASK_HARD_TIMEOUT, Duration::from_secs(5 * 60));
+    fn ordinary_sync_task_hard_timeout_remains_ten_minutes() {
+        assert_eq!(SYNC_TASK_HARD_TIMEOUT, Duration::from_secs(10 * 60));
     }
 
     #[test]

@@ -48,7 +48,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "click",
-                "description": "Click the first element matching a CSS selector (scrolled into view first).",
+                "description": "Click the first element matching a CSS selector (scrolled into view first). If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending on the page - stop and call wait_for_human (or return control to the user) before continuing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -59,7 +59,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "type_text",
-                "description": "Focus an input matching the selector and type text. Optionally press Enter to submit.",
+                "description": "Focus an input matching the selector and type text. Optionally press Enter to submit. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending - stop and call wait_for_human (or return control to the user) before continuing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -72,7 +72,7 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "press_key",
-                "description": "Press a keyboard key (e.g. Enter, Tab, Escape, ArrowDown). Optionally focus a selector first.",
+                "description": "Press a keyboard key (e.g. Enter, Tab, Escape, ArrowDown). Optionally focus a selector first. If the response starts with [HUMAN_ACTION_PENDING: <category>], a human verification is still pending - stop and call wait_for_human (or return control to the user) before continuing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -150,12 +150,11 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "wait_for_human",
-                "description": "BLOCK and wait for the user to manually complete an action in the visible (headed) browser window - captcha, slider, SMS/OTP code, 2FA, login, payment or identity verification. Call this when a page shows [USER_ACTION_REQUIRED] or otherwise needs a human. It polls the page and returns AS SOON AS the blocking signal is gone (status=resolved). Each call waits up to a bounded budget (default 60s, always kept safely under the host request timeout); if the user has not finished yet it returns status=still_waiting WITHOUT error - simply call it again to keep waiting. Requires headed mode (a visible window) so the user can act.",
+                "description": "BLOCK and wait for the user to manually complete an action in the visible (headed) browser window - captcha, slider, SMS/OTP code, 2FA, login, payment or identity verification. Call this when a page shows [USER_ACTION_REQUIRED] or otherwise needs a human. It polls the page and returns AS SOON AS the blocking signal is gone (status=resolved). Each call waits at most 60s (always kept safely under the host request timeout); if the user has not finished yet it returns status=still_waiting WITHOUT error - END YOUR TURN and ask the user to complete the action in the browser window; when they reply, call wait_for_human again to verify and continue. In headless mode it returns status=unavailable immediately (no visible window, so the user cannot act).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "expect": { "type": "string", "description": "Optional expected category being waited on (captcha/slider/sms_otp/twofa/login_required/payment_verify/identity_verify); used only for messaging" },
-                        "budget_ms": { "type": "integer", "description": "Max time to block on THIS call in ms (default 60000). Hard-clamped below the host timeout; on expiry returns still_waiting so you can call again." },
                         "message": { "type": "string", "description": "Optional short instruction to relay to the user about what to do in the window" }
                     }
                 }
@@ -245,8 +244,30 @@ async fn detect_user_action_required(page: &chromiumoxide::page::Page) -> Option
           var t = "";
           try { t = ((document.body && document.body.innerText) || "").toLowerCase(); } catch(e) { t = ""; }
           function has(sel){ try { return !!document.querySelector(sel); } catch(e){ return false; } }
-          // 1) captcha：结构信号最强，直接判定。
-          if (has('iframe[src*="recaptcha"]') || has('iframe[src*="hcaptcha"]') || has('[class*="captcha"]') || has('[id*="captcha"]')) return 'captcha';
+          function anyVisible(sel){
+            try {
+              var els = document.querySelectorAll(sel);
+              for (var i = 0; i < els.length; i++) {
+                var r = els[i].getBoundingClientRect();
+                var st = getComputedStyle(els[i]);
+                if (r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none') return true;
+              }
+            } catch(e){}
+            return false;
+          }
+          // reCAPTCHA / hCaptcha 已解决：隐藏的 response textarea 被填入 token。
+          // 注意：验证码 iframe 在解决后仍常驻 DOM（打勾/徽标），所以「存在」≠「阻塞」，
+          // 必须用「存在 && 未解决」判定，否则 wait_for_human 将永远等不到 resolved。
+          function recaptchaSolved(){
+            var ta = document.querySelector('textarea[name="g-recaptcha-response"], textarea[name="h-captcha-response"]');
+            return !!(ta && ta.value && ta.value.length > 0);
+          }
+          // 1) captcha：验证码 iframe（reCAPTCHA / hCaptcha / 腾讯等）或可见的 captcha
+          //    类元素，且「未解决」。隐藏的页脚徽标/已关闭的弹层不算阻塞。
+          if (has('iframe[src*="recaptcha/api2/anchor"]') && !recaptchaSolved()) return 'captcha';
+          if (has('iframe[src*="hcaptcha"]') && !has('iframe[src*="badge"]') && !recaptchaSolved()) return 'captcha';
+          if (has('iframe[src*="captcha"]') && !has('iframe[src*="recaptcha/api2/bframe"]') && !has('iframe[src*="badge"]') && !recaptchaSolved()) return 'captcha';
+          if ((has('[class*="captcha"]') || has('[id*="captcha"]')) && anyVisible('[class*="captcha"], [id*="captcha"]') && !recaptchaSolved()) return 'captcha';
           // 2) slider：需要滑块 DOM 结构，纯文案不足以判定。
           if (has('.geetest_slider_button') || has('.geetest_slider') || has('[class*="slider_track"]') || has('[class*="slider-btn"]') || (has('[class*="slider"]') && /滑动|拖动|slide|滑块/.test(t))) return 'slider';
           // 3) sms_otp：优先专用输入框；纯文本需同时存在可输入的验证码框，降低误报。
@@ -273,6 +294,30 @@ fn user_action_tag(cat: &str) -> String {
     format!(
         "\n[USER_ACTION_REQUIRED: {cat}] 页面需要用户手动完成操作。可调用 wait_for_human 阻塞等待用户在可见浏览器窗口完成，或直接停止自动化并请用户完成后告知继续。"
     )
+}
+
+/// 检测人机校验并把结果记入会话（`pending_human` 标记）：
+/// 命中 → 写入分类并返回待追加的标签；未命中 → 清空标记并返回空串。
+/// 供 navigate / get_text / get_html / click / type_text / press_key 复用，
+/// 保证会话标记与页面实际状态一致。
+async fn detect_and_mark(s: &mut BrowserSession) -> String {
+    if let Some(cat) = detect_user_action_required(&s.page).await {
+        s.pending_human = Some(cat.clone());
+        user_action_tag(&cat)
+    } else {
+        s.pending_human = None;
+        String::new()
+    }
+}
+
+/// 会话仍有人工操作待完成时，给改动类工具输出前加的提醒前缀。
+fn pending_warning(s: &BrowserSession) -> String {
+    match &s.pending_human {
+        Some(cat) => format!(
+            "[HUMAN_ACTION_PENDING: {cat}] 页面仍需要用户手动完成验证：请先调用 wait_for_human 等待用户在浏览器中完成，或结束本轮把操作交给用户；在用户完成前继续自动化通常无效。\n"
+        ),
+        None => String::new(),
+    }
 }
 
 // ---- 各工具实现 ----
@@ -305,10 +350,10 @@ async fn tool_navigate(
         }
         let title = s.page.get_title().await.ok().flatten().unwrap_or_default();
         let final_url = s.page.url().await.ok().flatten().unwrap_or(url.clone());
+        // 新页面 = 新状态：清掉旧的人工待办标记，随后按新页面重新检测。
+        s.pending_human = None;
         let mut summary = format!("Navigated to {final_url}\nTitle: {title}");
-        if let Some(cat) = detect_user_action_required(&s.page).await {
-            summary.push_str(&user_action_tag(&cat));
-        }
+        summary.push_str(&detect_and_mark(s).await);
         Ok(summary)
     })
     .await?;
@@ -326,7 +371,9 @@ async fn tool_click(
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
 
-    with_timeout(ms, async {
+    // 会话仍有人工操作待完成时，先提示模型停下来（见 pending_warning）。
+    let pending = pending_warning(s);
+    let tag = with_timeout(ms, async {
         let el = s
             .page
             .find_element(selector.clone())
@@ -336,11 +383,12 @@ async fn tool_click(
             .await
             .map_err(|e| format!("scroll_into_view failed: {e}"))?;
         el.click().await.map_err(|e| format!("click failed: {e}"))?;
-        Ok(())
+        // 点击常触发验证码/登录墙：动作后立即检测并标记，让模型第一时间知道。
+        Ok(detect_and_mark(s).await)
     })
     .await?;
 
-    Ok(text_content(format!("Clicked {selector}")))
+    Ok(text_content(format!("{pending}Clicked {selector}{tag}")))
 }
 
 async fn tool_type_text(
@@ -363,7 +411,9 @@ async fn tool_type_text(
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
 
-    with_timeout(ms, async {
+    // 会话仍有人工操作待完成时，先提示模型停下来（见 pending_warning）。
+    let pending = pending_warning(s);
+    let tag = with_timeout(ms, async {
         let el = s
             .page
             .find_element(selector.clone())
@@ -381,13 +431,14 @@ async fn tool_type_text(
                 .await
                 .map_err(|e| format!("submit (Enter) failed: {e}"))?;
         }
-        Ok(())
+        // 提交常触发验证码/登录墙：动作后立即检测并标记，让模型第一时间知道。
+        Ok(detect_and_mark(s).await)
     })
     .await?;
 
     let suffix = if submit { " and pressed Enter" } else { "" };
     Ok(text_content(format!(
-        "Typed {char_count} chars into {selector}{suffix}"
+        "{pending}Typed {char_count} chars into {selector}{suffix}{tag}"
     )))
 }
 
@@ -402,7 +453,9 @@ async fn tool_press_key(
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
 
-    with_timeout(ms, async {
+    // 会话仍有人工操作待完成时，先提示模型停下来（见 pending_warning）。
+    let pending = pending_warning(s);
+    let tag = with_timeout(ms, async {
         // 键盘动作走元素句柄：给定 selector 则用它，否则退到 body。
         let target = selector.clone().unwrap_or_else(|| "body".to_string());
         let el = s
@@ -414,11 +467,12 @@ async fn tool_press_key(
         el.press_key(&key)
             .await
             .map_err(|e| format!("press_key '{key}' failed: {e}"))?;
-        Ok(())
+        // Enter 提交常触发验证码/登录墙：动作后立即检测并标记，让模型第一时间知道。
+        Ok(detect_and_mark(s).await)
     })
     .await?;
 
-    Ok(text_content(format!("Pressed {key}")))
+    Ok(text_content(format!("{pending}Pressed {key}{tag}")))
 }
 
 async fn tool_scroll(
@@ -538,16 +592,14 @@ async fn tool_get_text(
             .map_err(|e| format!("inner_text failed: {e}"))?
             .unwrap_or_default();
         // 检测在正文之外单独返回，避免标签被 cap_text 截断吞掉（正文可能 ≥ 24K）。
-        let cat = detect_user_action_required(&s.page).await;
-        Ok((inner, cat))
+        let tag = detect_and_mark(s).await;
+        Ok((inner, tag))
     })
     .await?;
 
-    let (inner, cat) = text;
+    let (inner, tag) = text;
     let mut out = cap_text(&inner);
-    if let Some(cat) = cat {
-        out.push_str(&user_action_tag(&cat));
-    }
+    out.push_str(&tag);
     Ok(text_content(out))
 }
 
@@ -582,16 +634,14 @@ async fn tool_get_html(
                 .map_err(|e| format!("content failed: {e}")),
         }?;
         // 检测在正文之外单独返回，避免标签被 cap_text 截断吞掉（HTML 极易 ≥ 24K）。
-        let cat = detect_user_action_required(&s.page).await;
-        Ok((content, cat))
+        let tag = detect_and_mark(s).await;
+        Ok((content, tag))
     })
     .await?;
 
-    let (content, cat) = html;
+    let (content, tag) = html;
     let mut out = cap_text(&content);
-    if let Some(cat) = cat {
-        out.push_str(&user_action_tag(&cat));
-    }
+    out.push_str(&tag);
     Ok(text_content(out))
 }
 
@@ -603,11 +653,14 @@ async fn tool_get_html(
 /// （见 AGENTS.md 铁律 #2）。人工完成验证码常需数分钟，若本工具一直阻塞到底，
 /// 必然超时→窗口被杀→人做到一半前功尽弃。
 ///
-/// 因此本工具**单次调用只阻塞一个有界预算**（默认 60s，且被硬夹紧到显著小于
+/// 因此本工具**单次调用只阻塞一个有界预算**（固定最长 60s，且被硬夹紧到显著小于
 /// server op 上限），期间每 2s 轮询一次 `detect_user_action_required`：
-/// - 一旦检测不到阻塞信号 → 立即返回 `status=resolved`（人工已完成，可继续自动化）；
+/// - 连续 2 次检测不到阻塞信号 → 返回 `status=resolved`（人工已完成，可继续自动化）；
+///   连续判定可避免页面重渲染/检测瞬时抖动造成的误报「已解决」。
+/// - 每次检测自带 5s 超时：单次检测卡死按「仍在阻塞」处理，绝不误判 resolved。
 /// - 预算耗尽仍未完成 → **正常返回**（非 error）`status=still_waiting`，提示模型
-///   「再次调用本工具即可继续等待」。绝不返回 -32001 超时错误，避免模型误判为失败。
+///   **结束本轮、把操作交给用户**，用户回复后再调本工具验证。绝不返回 -32001
+///   超时错误，避免模型误判为失败；无头模式（用户看不到窗口）立即返回 unavailable。
 ///
 /// 这样既是**真阻塞**（窗口内人一完成就马上被感知并返回），又永远不会触发宿主的
 /// kill+restart，人可以跨多次调用从容完成任意长的手工操作。
@@ -618,46 +671,58 @@ async fn tool_wait_for_human(
     let expect = opt_str(args, "expect");
     let relay = opt_str(args, "message");
 
-    // 单次调用的阻塞预算：默认 60s。硬夹紧到 [2s, op_timeout - 15s]，
-    // 给最后一次轮询 + 返回留足余量，确保绝不逼近宿主 request_timeout。
+    // 单次调用的阻塞预算：固定最长 60s（人完成校验立刻返回，否则最多等 1 分钟）。
+    // 仍硬夹紧到 [2s, op_timeout - 15s]，给最后一次轮询 + 返回留足余量，
+    // 确保绝不逼近宿主 request_timeout。
     let op_cap = op_timeout_ms();
     let ceiling = op_cap.saturating_sub(15_000).max(5_000);
-    let requested = args
-        .get("budget_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(60_000);
-    let budget_ms = requested.clamp(2_000, ceiling);
+    let budget_ms = 60_000u64.min(ceiling);
+
+    // 无头模式下用户根本看不到窗口、无法手动操作——立即返回，不空等（也避免启动浏览器）。
+    let headless = std::env::var("MCP_BROWSER_HEADLESS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if headless {
+        return Ok(text_content(
+            "status=unavailable\nBrowser is HEADLESS - the user has no visible window to act in. Relaunch with MCP_BROWSER_HEADLESS=0 (headed) so the user can complete the action, then call wait_for_human again.",
+        ));
+    }
 
     let s = ensure_session(session)
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
 
-    // 无头模式下用户根本看不到窗口、无法手动操作——诚实拒绝而非假装等待。
-    let headless = std::env::var("MCP_BROWSER_HEADLESS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
     let poll_interval = std::time::Duration::from_millis(2_000);
+    let poll_timeout = std::time::Duration::from_secs(5);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
 
     // 段内轮询循环。注意：本循环自身即受 budget_ms 约束，不再套 with_timeout。
     let mut last_seen: Option<String> = None;
+    let mut clean_polls = 0u32;
     loop {
-        match detect_user_action_required(&s.page).await {
-            Some(cat) => {
+        match tokio::time::timeout(poll_timeout, detect_user_action_required(&s.page)).await {
+            Ok(Some(cat)) => {
                 // 仍存在阻塞信号：记录分类，继续等。
                 last_seen = Some(cat);
+                clean_polls = 0;
             }
-            None => {
-                // 阻塞信号消失 = 人工已完成（或本就没有）。立即返回成功。
-                let url = s.page.url().await.ok().flatten().unwrap_or_default();
-                let note = match &last_seen {
-                    Some(c) => format!("resolved: '{c}' cleared"),
-                    None => "resolved: no blocking signal detected".to_string(),
-                };
-                return Ok(text_content(format!(
-                    "status=resolved\n{note}\ncurrent_url: {url}\nYou may continue browser automation now."
-                )));
+            Ok(None) => {
+                // 阻塞信号消失：连续 2 次干净轮询才确认人工已完成（防重渲染抖动）。
+                clean_polls += 1;
+                if clean_polls >= 2 {
+                    let url = s.page.url().await.ok().flatten().unwrap_or_default();
+                    let note = match &last_seen {
+                        Some(c) => format!("resolved: '{c}' cleared"),
+                        None => "resolved: no blocking signal detected".to_string(),
+                    };
+                    s.pending_human = None;
+                    return Ok(text_content(format!(
+                        "status=resolved\n{note}\ncurrent_url: {url}\nYou may continue browser automation now."
+                    )));
+                }
+            }
+            Err(_) => {
+                // 单次检测超时（CDP 卡死）：按「仍在阻塞」继续等，不累计 clean_polls。
             }
         }
 
@@ -667,20 +732,16 @@ async fn tool_wait_for_human(
         tokio::time::sleep(poll_interval).await;
     }
 
-    // 预算耗尽仍未完成：正常返回 still_waiting（非 error），引导模型续等。
+    // 预算耗尽仍未完成：正常返回 still_waiting（非 error），引导模型把控制权交还用户。
     let cat = last_seen
         .or(expect)
         .unwrap_or_else(|| "unknown".to_string());
+    s.pending_human = Some(cat.clone());
     let hint = relay
         .map(|m| format!("\nInstruction for the user: {m}"))
         .unwrap_or_default();
-    let mode = if headless {
-        "\nWARNING: browser is HEADLESS — the user has no visible window to act in. Relaunch in headed mode (MCP_BROWSER_HEADLESS=0) so the user can complete the action."
-    } else {
-        ""
-    };
     Ok(text_content(format!(
-        "status=still_waiting\nStill waiting for the user to complete '{cat}' in the visible browser window after {budget_ms} ms.{hint}{mode}\nCall wait_for_human again to keep waiting; it will return status=resolved as soon as the user finishes."
+        "status=still_waiting\nStill waiting for the user to complete '{cat}' in the visible browser window after {budget_ms} ms.{hint}\nEnd your turn now and ask the user to complete it in the browser window; when they reply, call wait_for_human again to verify and continue."
     )))
 }
 

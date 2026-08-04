@@ -105,6 +105,7 @@ fn encoded_background_task_goal_rejects_corrupt_payload() {
         auto_model_fallback: None,
         selection_explanation: "explicit override".to_string(),
         spawn_depth: 0,
+        response_schema: None,
     })
     .unwrap();
     assert!(
@@ -148,6 +149,7 @@ fn background_task_wakeup_prompt_prefers_mailbox_and_decoded_goal() {
         auto_model_fallback: None,
         selection_explanation: "explicit override".to_string(),
         spawn_depth: 0,
+        response_schema: None,
     })
     .unwrap();
     let mailbox = vec![

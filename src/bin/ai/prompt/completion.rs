@@ -23,8 +23,10 @@ static CURRENT_MODEL_HINT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::n
 /// `None` 表示尚未初始化，保留给单元测试和非交互调用的兼容回退。
 static SKILL_NAME_CANDIDATES: LazyLock<RwLock<Option<Vec<CompletionCandidate>>>> =
     LazyLock::new(|| RwLock::new(None));
-static AGENT_NAME_CANDIDATES: LazyLock<RwLock<Vec<CompletionCandidate>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
+/// 与 SKILL_NAME_CANDIDATES 相同的语义：`None` 表示尚未被 driver 填充，
+/// agent 名补全在此时同步回退到磁盘扫描（否则新会话首条输入前的 Tab 无候选）。
+static AGENT_NAME_CANDIDATES: LazyLock<RwLock<Option<Vec<CompletionCandidate>>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 /// Trie 存储所有 "/" 和 ":" 开头的顶层命令，替换原先的线性 starts_with 过滤。
 static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
@@ -159,13 +161,7 @@ impl CommandCompleter {
     /// 用运行时 manifest 快照更新可切换 agent 的补全缓存。
     pub(in crate::ai) fn set_agent_manifests(manifests: &[crate::ai::agents::AgentManifest]) {
         if let Ok(mut guard) = AGENT_NAME_CANDIDATES.write() {
-            *guard = crate::ai::agents::get_primary_agents(manifests)
-                .into_iter()
-                .map(|agent| CompletionCandidate {
-                    display: format!("{} · {}", agent.name, agent.description),
-                    replacement: agent.name.clone(),
-                })
-                .collect();
+            *guard = Some(Self::agent_candidates_from_manifests(manifests));
         }
     }
 
@@ -341,17 +337,33 @@ impl CommandCompleter {
         &["help", "list", "current", "use", "auto", "reload"]
     }
 
-    fn agent_name_candidates(token: &str) -> Vec<CompletionCandidate> {
-        AGENT_NAME_CANDIDATES
-            .read()
-            .map(|guard| {
-                guard
-                    .iter()
-                    .filter(|candidate| candidate.replacement.starts_with(token))
-                    .cloned()
-                    .collect()
+    fn agent_candidates_from_manifests(
+        manifests: &[crate::ai::agents::AgentManifest],
+    ) -> Vec<CompletionCandidate> {
+        crate::ai::agents::get_primary_agents(manifests)
+            .into_iter()
+            .map(|agent| CompletionCandidate {
+                display: format!("{} · {}", agent.name, agent.description),
+                replacement: agent.name.clone(),
             })
-            .unwrap_or_default()
+            .collect()
+    }
+
+    /// 所有已加载 agent 的名称候选（带 display）。
+    fn agent_name_candidates(token: &str) -> Vec<CompletionCandidate> {
+        let candidates = if let Ok(guard) = AGENT_NAME_CANDIDATES.read()
+            && let Some(candidates) = guard.as_ref()
+        {
+            candidates.clone()
+        } else {
+            // 缓存尚未填充（首条输入提交前 / 非交互调用 / 单元测试）时，
+            // 同步回退到磁盘扫描，与技能补全 SKILL_NAME_CANDIDATES=None 的回退一致。
+            Self::agent_candidates_from_manifests(&crate::ai::agents::load_all_agents())
+        };
+        candidates
+            .into_iter()
+            .filter(|candidate| candidate.replacement.starts_with(token))
+            .collect()
     }
 
     /// `/model` 的二级子命令字面量。注意：这些子命令与"模型名"互斥地占据
@@ -525,7 +537,7 @@ impl CommandCompleter {
                     }
                     _ => Vec::new(),
                 }
-            } else if matches!(first, "/agent" | ":agent") {
+            } else if matches!(first, "/agent" | ":agent" | "/agents" | ":agents") {
                 match words.next() {
                     None => {
                         let mut candidates = Self::agent_name_candidates(token);
@@ -979,6 +991,41 @@ mod tests {
         let (_, legacy) = CommandCompleter::complete_for_line("/agent use au", 13);
         assert!(
             legacy
+                .iter()
+                .any(|candidate| candidate.replacement == "audit")
+        );
+    }
+
+    #[test]
+    fn command_completion_suggests_agent_names_for_plural_alias() {
+        let manifests = crate::ai::agents::load_all_agents();
+        CommandCompleter::set_agent_manifests(&manifests);
+
+        // `/agents <name>` 与运行时别名一致：第二 token 也应按 agent 名补全。
+        let (_, direct) = CommandCompleter::complete_for_line("/agents au", 10);
+        assert!(
+            direct
+                .iter()
+                .any(|candidate| candidate.replacement == "audit")
+        );
+
+        let (_, legacy) = CommandCompleter::complete_for_line("/agents use au", 14);
+        assert!(
+            legacy
+                .iter()
+                .any(|candidate| candidate.replacement == "audit")
+        );
+    }
+
+    #[test]
+    fn agent_candidates_fall_back_to_disk_scan_before_cache_is_filled() {
+        // 全新启动、driver 尚未调用 set_agent_manifests（缓存为 None）时，
+        // agent 名补全必须能同步扫描出候选，否则新会话首条输入前的
+        // `/agent <prefix><Tab>` / `/agents <prefix><Tab>` 会无响应。
+        let manifests = crate::ai::agents::load_all_agents();
+        let candidates = CommandCompleter::agent_candidates_from_manifests(&manifests);
+        assert!(
+            candidates
                 .iter()
                 .any(|candidate| candidate.replacement == "audit")
         );

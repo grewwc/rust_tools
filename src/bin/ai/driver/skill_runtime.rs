@@ -1,6 +1,7 @@
 use crate::ai::{
     agents::{
         AgentManifest, load_project_instruction_docs,
+        load_scoped_project_instruction_docs_for_target_priority,
         load_scoped_project_instruction_docs_for_targets,
     },
     mcp::McpClient,
@@ -195,8 +196,14 @@ impl SkillTurnGuard {
         self.push_section(ContextKind::Fact, extra);
     }
 
-    pub(super) fn push_scoped_project_instructions(&mut self, targets: &[PathBuf]) {
-        if let Some(prompt) = build_scoped_project_instruction_prompt(targets) {
+    pub(super) fn push_scoped_project_instructions(
+        &mut self,
+        required_targets: &[PathBuf],
+        observed_targets: &[PathBuf],
+    ) {
+        if let Some(prompt) =
+            build_scoped_project_instruction_prompt_with_priority(required_targets, observed_targets)
+        {
             self.push_section(ContextKind::Policy, &prompt);
         }
     }
@@ -631,11 +638,6 @@ const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
         hint: "",
     },
     CapabilityEntry {
-        use_case: "Handle live web information, current events, or URL-based research.",
-        tools: &["web_search", "web_fetch"],
-        hint: "",
-    },
-    CapabilityEntry {
         use_case: "Work with Feishu/Lark documents, wikis, sheets, or doc exports.",
         tools: &[
             "mcp_feishu_docs_get_text_by_url",
@@ -819,7 +821,17 @@ fn build_project_instruction_prompt() -> Option<String> {
 }
 
 fn build_scoped_project_instruction_prompt(targets: &[PathBuf]) -> Option<String> {
-    let docs = load_scoped_project_instruction_docs_for_targets(targets);
+    build_scoped_project_instruction_prompt_with_priority(targets, &[])
+}
+
+fn build_scoped_project_instruction_prompt_with_priority(
+    required_targets: &[PathBuf],
+    observed_targets: &[PathBuf],
+) -> Option<String> {
+    let docs = load_scoped_project_instruction_docs_for_target_priority(
+        required_targets,
+        observed_targets,
+    );
     if docs.is_empty() {
         return None;
     }
@@ -947,11 +959,12 @@ fn build_system_prompt(
          - On failure, diagnose and adjust before retrying. After 3 failed attempts with the same approach, stop repeating that approach, not the whole task. Continue with a materially different safe recovery when one remains; end only when the task is complete or a specific blocker remains, then report what you tried and the current error.\n\n\
          Correctness guardrails:\n\
          - Ground factual claims in observed evidence; never invent identifiers, paths, behavior, output, line numbers, or quotations. If evidence is insufficient—even under tool or iteration limits—state what is verified, what is unknown, and the next verification step.\n\
+         - Treat the current plan and interpretation as hypotheses, not commitments. When a user correction, failed check, or new evidence invalidates an assumption, identify and re-evaluate the conclusions and actions that depended on it. Do not patch only the literal symptom or treat approval of one property as approval of adjacent behavior.\n\
          - Before changing a shared symbol, API, config, data format, or embedded asset, locate relevant callers and dependents and assess semantic ripple; compilation and tests prove only covered behavior.\n\
          - In review or diagnosis work, report only consequences supported by traced evidence; keep unresolved hypotheses separate and distinguish introduced behavior from pre-existing behavior.\n\
          - Never use reset, checkout, restore, stash drop, or similar commands to discard existing changes, including staged changes, for testing or verification. For a clean state, use a temporary branch/worktree or stash push then pop; for a real rollback, explain why and get confirmation.\n\n\
          Task convergence:\n\
-         - Define concrete task-level success criteria before broad exploration.\n\
+         - Define concrete task-level success criteria before broad exploration in terms of observable outcomes and preserved invariants: what must change, what must stay unchanged, and how each will be verified. Do not use implementation shape or disappearance of the original symptom as the sole criterion.\n\
          - Continue only while a criterion is unresolved and the next call can verify it, rule out a live hypothesis, or complete required work.\n\
          - Stop when all criteria are verified or a specific blocker remains. A partial result must state what is confirmed, what is unknown, and the next verification step; evidence count alone is not a stopping rule. Do not pursue perfect certainty or unrelated detail.",
     );
@@ -1074,13 +1087,23 @@ fn build_system_prompt(
         }
         if has_tool(available_tools, "task_spawn") && has_tool(available_tools, "task_wait") {
             if has_tool(available_tools, "task") {
-                lines.push(
-                    "If you need the delegated work's result back: for a SINGLE subtask use the synchronous `task` (it runs the subagent and returns its result in one call). Reserve `task_spawn` + `task_wait` for fanning out MULTIPLE independent subtasks concurrently — a lone `task_spawn` immediately followed by `task_wait` is just a slower `task`.".to_string(),
-                );
+                let batch_guidance = if has_tool(available_tools, "task_spawn_batch") {
+                    "Reserve `task_spawn_batch` + `task_wait` for fanning out MULTIPLE independent subtasks concurrently"
+                } else {
+                    "Reserve multiple `task_spawn` calls + `task_wait` for fanning out MULTIPLE independent subtasks concurrently"
+                };
+                lines.push(format!(
+                    "If you need the delegated work's result back: for a SINGLE subtask use the synchronous `task` (it runs the subagent and returns its result in one call). {batch_guidance} — a lone `task_spawn` immediately followed by `task_wait` is just a slower `task`."
+                ));
             } else {
-                lines.push(
-                    "If you need the delegated work's result back, use `task_spawn` + `task_wait`. For multiple independent subtasks, spawn them all in one response first, then collect with a single `task_wait`.".to_string(),
-                );
+                let fan_out_guidance = if has_tool(available_tools, "task_spawn_batch") {
+                    "For multiple independent subtasks, prefer one ordered `task_spawn_batch` call, then collect with a single `task_wait`."
+                } else {
+                    "For multiple independent subtasks, spawn them all in one response first, then collect with a single `task_wait`."
+                };
+                lines.push(format!(
+                    "If you need the delegated work's result back, use `task_spawn` + `task_wait`. {fan_out_guidance}"
+                ));
             }
         }
         let process_tools = available_tool_names_in_order(
@@ -1154,7 +1177,11 @@ fn build_system_prompt(
                 lines.push("Use `task_spawn` to fan out MULTIPLE focused, independent subtasks concurrently. For a single delegated subtask, one spawned task immediately joined by `task_wait` gains no concurrency and just adds overhead.".to_string());
             }
             lines.push("Qualify a subtask only when it has a distinct, bounded goal, can proceed without another branch's result, and is substantial enough that its expected latency or context benefit outweighs handoff and synthesis overhead.".to_string());
-            lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in the same response (multiple `task_spawn` calls in one turn). Then continue every independent parent-side step while they run. Do NOT call `task_wait` merely because tasks are running, and do not spawn-wait-spawn-wait serially.".to_string());
+            if has_tool(available_tools, "task_spawn_batch") {
+                lines.push("Once you identify multiple qualifying subtasks with no data dependency, prefer one `task_spawn_batch` call so dispatch and returned task ids preserve input order. Then continue every independent parent-side step while they run. Do NOT call `task_wait` merely because tasks are running, and do not spawn-wait-spawn-wait serially.".to_string());
+            } else {
+                lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in the same response (multiple `task_spawn` calls in one turn). Then continue every independent parent-side step while they run. Do NOT call `task_wait` merely because tasks are running, and do not spawn-wait-spawn-wait serially.".to_string());
+            }
             lines.push("Do not delegate merely to create parallelism. Keep simple tasks, single-file localized changes, tightly coupled or overlapping work, strongly sequential work, and work you can finish directly with a few tool calls in the parent.".to_string());
             lines.push("Context pressure, iteration limits, tool failures, and recovery steps are not delegation benefits. Do not hand off the parent's current unresolved branch; delegate only work that is independently bounded and worthwhile without those pressures.".to_string());
         }
@@ -1218,20 +1245,6 @@ fn build_system_prompt(
         push_tool_guidance_section(&mut b, ContextKind::Policy, "Knowledge retrieval:", lines);
     }
 
-    if has_tool(available_tools, "web_search") || has_tool(available_tools, "web_fetch") {
-        let mut lines = Vec::new();
-        if has_tool(available_tools, "web_search") {
-            lines.push(
-                "For real-time or time-sensitive topics, use `web_search` first (not memory)."
-                    .to_string(),
-            );
-        }
-        if has_tool(available_tools, "web_fetch") {
-            lines.push("Use `web_fetch` for detailed content from selected URLs.".to_string());
-        }
-        push_tool_guidance_section(&mut b, ContextKind::Policy, "Web search:", lines);
-    }
-
     if has_tool(available_tools, "write_file") {
         let mut lines = Vec::new();
         if has_tool(available_tools, "write_file") {
@@ -1249,7 +1262,7 @@ fn build_system_prompt(
                     "When modifying an existing project file, do NOT use `write_file` with `temp=true` — use `apply_patch` for localized edits, or `write_file` without `temp` only when a full rewrite is genuinely necessary.".to_string(),
                 );
                 lines.push(
-                    "When one file needs several localized edits, read the relevant span once and make ONE `apply_patch` call with multiple `@@` hunks in a single `*** Update File:` section. For several files, use one Begin Patch envelope with one section per target. Do not split related edits into serial read/patch cycles unless a previous patch failed or a later edit truly depends on the earlier edit's result.".to_string(),
+                    "When one file needs several localized edits, read the relevant span once and make ONE `apply_patch` call with multiple `@@` hunks in a single `*** Update File:` section — but only when every hunk has a unique anchor (distinct surrounding context). For several files, use one Begin Patch envelope with one section per target. Do not split related edits into serial read/patch cycles unless a previous patch failed or a later edit truly depends on the earlier edit's result. For structurally similar blocks (e.g. repeated closures with identical bodies), apply one at a time and give each hunk a distinctive anchor line (function name or comment). Keep each patch under ~4KB: split large edits into multiple apply_patch calls, or write the patch to a temp file and pass `patch_file`.".to_string(),
                 );
             } else {
                 lines.push(
@@ -1548,7 +1561,6 @@ mod tests {
         assert!(!names.iter().any(|name| name == "list_skills"));
         assert!(!names.iter().any(|name| name == "load_skill"));
         assert!(!names.iter().any(|name| name == "save_skill"));
-        assert!(!names.iter().any(|name| name == "web_search"));
     }
 
     #[test]
@@ -1769,12 +1781,11 @@ mod tests {
     #[test]
     fn capability_catalog_only_references_registered_tools() {
         // 能力目录会提示模型按需启用工具；若引用已删除的 builtin，会造成无效调用。
-        // web_* 与 mcp_* 是运行时/外部工具名，不在 Rust builtin registry 中。
+        // mcp_* 是运行时/外部工具名，不在 Rust builtin registry 中。
         for entry in super::CAPABILITY_CATALOG {
             for tool_name in entry.tools {
                 assert!(
                     crate::ai::tools::registry::common::is_registered_tool_name(tool_name)
-                        || matches!(*tool_name, "web_search" | "web_fetch")
                         || tool_name.starts_with("mcp_"),
                     "capability catalog references unregistered tool: {tool_name}"
                 );
@@ -1908,6 +1919,8 @@ mod tests {
         assert!(prompt.contains("git-tracked file"));
         assert!(prompt.contains("`apply_patch`"));
         assert!(prompt.contains("ONE `apply_patch` call with multiple `@@` hunks"));
+        assert!(prompt.contains("unique anchor"));
+        assert!(prompt.contains("structurally similar blocks"));
         assert!(prompt.contains("Do not split related edits into serial read/patch cycles"));
         assert!(prompt.contains("`*** Delete File: <path>`"));
     }
@@ -1994,6 +2007,23 @@ mod tests {
         assert!(prompt.contains("distinguish introduced behavior from pre-existing behavior"));
         assert!(prompt.contains("reset, checkout, restore, stash drop"));
         assert!(prompt.contains("temporary branch/worktree or stash push then pop"));
+    }
+
+    #[test]
+    fn system_prompt_defines_an_end_to_end_behavior_contract() {
+        let available = SkipSet::new(16);
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+
+        assert!(prompt.contains("current plan and interpretation as hypotheses"));
+        assert!(prompt.contains("user correction, failed check, or new evidence"));
+        assert!(prompt.contains("conclusions and actions that depended on it"));
+        assert!(prompt.contains("Do not patch only the literal symptom"));
+        assert!(prompt.contains("approval of adjacent behavior"));
+        assert!(prompt.contains("observable outcomes and preserved invariants"));
+        assert!(prompt.contains("what must change, what must stay unchanged"));
+        assert!(prompt.contains("disappearance of the original symptom"));
     }
 
     #[test]
@@ -2719,11 +2749,18 @@ mod tests {
     #[test]
     fn runtime_enabled_tools_are_preserved_when_refreshing_context() {
         let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
-        set_explicit_enabled_tool_names(vec!["enable_tools".to_string(), "web_search".to_string()]);
+        set_explicit_enabled_tool_names(vec![
+            "enable_tools".to_string(),
+            "knowledge_search".to_string(),
+        ]);
         let merged = merge_with_runtime_enabled_tools(
             vec![tool("read_file"), tool("enable_tools")],
             vec![],
-            &[tool("read_file"), tool("enable_tools"), tool("web_search")],
+            &[
+                tool("read_file"),
+                tool("enable_tools"),
+                tool("knowledge_search"),
+            ],
         );
         let names = merged
             .into_iter()
@@ -2731,7 +2768,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"enable_tools".to_string()));
-        assert!(names.contains(&"web_search".to_string()));
+        assert!(names.contains(&"knowledge_search".to_string()));
         set_explicit_enabled_tool_names(Vec::new());
     }
 
@@ -2754,17 +2791,22 @@ mod tests {
     #[test]
     fn subagent_runtime_enabled_task_tools_stay_hidden() {
         let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
-        set_explicit_enabled_tool_names(vec![
-            "task_wait".to_string(),
-            "task_cancel".to_string(),
-            "web_search".to_string(),
-        ]);
-
         SUBAGENT_DEPTH.sync_scope(1, || {
+            // 显式启用列表按 owner（含是否处于子代理上下文）隔离，必须在
+            // sync_scope 内写入，读取才使用同一 owner。
+            set_explicit_enabled_tool_names(vec![
+                "task_wait".to_string(),
+                "task_cancel".to_string(),
+                "knowledge_search".to_string(),
+            ]);
             let merged = merge_with_runtime_enabled_tools(
                 vec![tool("read_file"), tool("enable_tools")],
                 vec![],
-                &[tool("task_wait"), tool("task_cancel"), tool("web_search")],
+                &[
+                    tool("task_wait"),
+                    tool("task_cancel"),
+                    tool("knowledge_search"),
+                ],
             );
             let names = merged
                 .into_iter()
@@ -2772,29 +2814,32 @@ mod tests {
                 .collect::<Vec<_>>();
 
             assert!(names.contains(&"read_file".to_string()));
-            assert!(names.contains(&"web_search".to_string()));
+            assert!(names.contains(&"knowledge_search".to_string()));
             assert!(!names.contains(&"task_wait".to_string()));
             assert!(!names.contains(&"task_cancel".to_string()));
+            set_explicit_enabled_tool_names(Vec::new());
         });
-
-        set_explicit_enabled_tool_names(Vec::new());
     }
 
     #[test]
     fn non_explicit_skill_tools_do_not_leak_into_next_context() {
         let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
-        set_explicit_enabled_tool_names(vec!["web_search".to_string()]);
+        set_explicit_enabled_tool_names(vec!["knowledge_search".to_string()]);
         let merged = merge_with_runtime_enabled_tools(
             vec![tool("read_file")],
             vec![],
-            &[tool("read_file"), tool("apply_patch"), tool("web_search")],
+            &[
+                tool("read_file"),
+                tool("apply_patch"),
+                tool("knowledge_search"),
+            ],
         );
         let names = merged
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"web_search".to_string()));
+        assert!(names.contains(&"knowledge_search".to_string()));
         assert!(!names.contains(&"apply_patch".to_string()));
         set_explicit_enabled_tool_names(Vec::new());
     }

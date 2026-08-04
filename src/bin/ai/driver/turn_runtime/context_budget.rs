@@ -401,7 +401,7 @@ fn precision_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String
 }
 
 fn is_precision_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "read_file" | "web_search" | "web_fetch")
+    matches!(tool_name, "read_file")
 }
 
 fn collect_protected_messages(messages: &[Message]) -> Vec<ProtectedMessage> {

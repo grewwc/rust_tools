@@ -1,15 +1,18 @@
 use super::{
-    AsyncTaskEntry, InheritOptions, OsTaskGoal, OutstandingTaskSnapshot,
+    AsyncTaskEntry, InheritOptions, OsTaskGoal, OutstandingTaskSnapshot, PreparedSubagentTask,
     SUBAGENT_PARENT_SUMMARY_REMINDER, SUBAGENT_WALL_CLOCK_TIMEOUT, SelectedSubagent,
-    StoredTaskResult, TASK_REGISTRY, WaitManySource, append_current_process_cancel_source,
-    build_outstanding_task_anchor, build_selection_explanation, capped_subagent_manifest,
-    discard_tasks_for_session, encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels,
-    execute_task_cancel, execute_task_integrate, execute_task_spawn, execute_task_status,
-    execute_task_wait, expire_task_wait_states_for_test, format_task_result,
-    insert_task_entry_for_test, is_encoded_task_goal, parse_task_wait_options,
-    prepare_subagent_task, reap_timed_out_subagents, remove_task_entry,
-    render_outstanding_task_anchor, select_subagent, wait_sources_for_channel_and_futex,
-    wake_expired_task_waits, with_task_entry_by_pid, wrap_subagent_prompt,
+    StoredTaskResult, TASK_REGISTRY, TASK_RETRY_REGISTRY, WaitManySource,
+    append_current_process_cancel_source, build_outstanding_task_anchor,
+    build_selection_explanation, capped_subagent_manifest, discard_tasks_for_session,
+    encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels, execute_task_cancel,
+    execute_task_integrate, execute_task_retry, execute_task_spawn, execute_task_spawn_batch,
+    execute_task_status, execute_task_wait, expire_task_wait_states_for_test,
+    format_task_result_with_id,
+    insert_task_entry_for_test, is_encoded_task_goal, is_retryable_task_status,
+    parse_task_wait_options, prepare_subagent_task, reap_timed_out_subagents, register_retry_spec,
+    remove_task_entry, render_outstanding_task_anchor, select_subagent,
+    validate_subagent_response, wait_sources_for_channel_and_futex, wake_expired_task_waits,
+    with_task_entry_by_pid, wrap_subagent_prompt,
 };
 use super::{ToolRegistration, ToolSpec};
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
@@ -49,6 +52,20 @@ fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
     }
 }
 
+fn prepared_retry_task() -> PreparedSubagentTask {
+    PreparedSubagentTask {
+        description: "retry test".to_string(),
+        prompt: "retry the same task".to_string(),
+        response_schema: None,
+        agent_name: "build".to_string(),
+        model: "qwen3.7-max".to_string(),
+        is_model_auto_selected: false,
+        auto_model_fallback: None,
+        selection_explanation: "test fixture".to_string(),
+        inherit: InheritOptions::default(),
+    }
+}
+
 #[test]
 fn task_wait_defaults_are_short_and_resume_on_first_result() {
     let (timeout_secs, wait_policy) = parse_task_wait_options(&serde_json::json!({})).unwrap();
@@ -62,7 +79,7 @@ fn task_wait_defaults_are_short_and_resume_on_first_result() {
 
 #[test]
 fn subagent_prompt_preserves_the_evidence_bar() {
-    let prompt = wrap_subagent_prompt("review change", "inspect the diff");
+    let prompt = wrap_subagent_prompt("review change", "inspect the diff", None);
 
     assert!(prompt.contains("Reuse observed evidence"));
     assert!(prompt.contains("prefer one targeted broad call"));
@@ -71,6 +88,47 @@ fn subagent_prompt_preserves_the_evidence_bar() {
     assert!(prompt.contains("return a concise partial result"));
     assert!(prompt.contains("unresolved hypotheses, missing evidence"));
     assert!(!prompt.contains("Do not wait for perfect certainty"));
+}
+
+#[test]
+fn subagent_response_schema_is_prompted_and_validated() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string" }
+        },
+        "required": ["summary"],
+        "additionalProperties": false
+    });
+    let prompt = wrap_subagent_prompt("summarize", "inspect the evidence", Some(&schema));
+
+    assert!(prompt.contains("Return exactly one JSON value"));
+    assert!(prompt.contains("<response_schema>"));
+    assert!(validate_subagent_response(Some(&schema), r#"{"summary":"done"}"#).is_ok());
+    assert!(
+        validate_subagent_response(Some(&schema), r#"{"other":"done"}"#)
+            .unwrap_err()
+            .contains("did not match response_schema")
+    );
+    assert!(
+        validate_subagent_response(Some(&schema), "not json")
+            .unwrap_err()
+            .contains("not valid JSON")
+    );
+}
+
+#[test]
+fn task_spawn_batch_rejects_unbounded_fan_out() {
+    let tasks = vec![serde_json::json!({}); super::MAX_SUBAGENT_SPAWN_BATCH_SIZE + 1];
+    let error = execute_task_spawn_batch(&serde_json::json!({ "tasks": tasks })).unwrap_err();
+
+    assert_eq!(
+        error,
+        format!(
+            "task_spawn_batch accepts at most {} tasks per call",
+            super::MAX_SUBAGENT_SPAWN_BATCH_SIZE
+        )
+    );
 }
 
 fn test_app_with_model(current_model: String) -> App {
@@ -603,14 +661,27 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
         status: "failed".to_string(),
         output: String::new(),
         error: Some("request timed out waiting for response headers".to_string()),
+        progress: Some("calling model".to_string()),
     };
 
-    let output = format_task_result(&entry, result);
+    let output = format_task_result_with_id("task-failed", &entry, result);
 
     assert!(output.contains("FAILED"));
-    assert!(output.contains("Error: request timed out waiting for response headers"));
+    assert!(output.contains("Failure reason: request timed out waiting for response headers"));
+    assert!(output.contains("Last known progress: calling model"));
     assert!(output.contains("(subagent did not produce any final assistant text)"));
+    assert!(output.contains("task_retry"));
+    assert!(output.contains("task-failed"));
     assert!(output.contains(SUBAGENT_PARENT_SUMMARY_REMINDER));
+}
+
+#[test]
+fn task_retry_status_matches_the_runtime_timeout_value() {
+    assert!(is_retryable_task_status("failed"));
+    assert!(is_retryable_task_status("timeout"));
+    assert!(is_retryable_task_status("cancelled"));
+    assert!(!is_retryable_task_status("timed_out"));
+    assert!(!is_retryable_task_status("completed"));
 }
 
 #[test]
@@ -627,6 +698,10 @@ fn subagent_depth_rejects_task_orchestration_execution() {
             (
                 "task_wait",
                 execute_task_wait(&serde_json::json!({ "task_ids": ["task_parent"] })),
+            ),
+            (
+                "task_retry",
+                execute_task_retry(&serde_json::json!({ "task_id": "task_parent" })),
             ),
             ("task_status", execute_task_status(&serde_json::json!({}))),
             (
@@ -1392,6 +1467,8 @@ fn task_status_cleans_up_terminated_task_without_result() {
         .expect("task_status should collect terminated task");
 
     assert!(output.contains("terminated without publishing any output"));
+    assert!(output.contains("task_retry"));
+    assert!(output.contains(&task_id));
     assert!(remove_task_entry(&task_id).is_none());
     let os = app.os.lock().unwrap();
     assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
@@ -1402,6 +1479,73 @@ fn task_status_cleans_up_terminated_task_without_result() {
     if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         *guard = None;
     }
+}
+
+#[test]
+fn task_retry_rejects_a_different_parent_process() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+    let owner_pid = {
+        let mut os = app.os.lock().unwrap();
+        let owner_pid = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        os.set_current_pid(Some(owner_pid));
+        owner_pid
+    };
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    register_retry_spec(
+        &task_id,
+        app.session_id.clone(),
+        owner_pid.saturating_add(1),
+        prepared_retry_task(),
+        task_id.clone(),
+    );
+
+    let error = crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .sync_scope((app.session_id.clone(), 0usize), || {
+            execute_task_retry(&serde_json::json!({ "task_id": task_id }))
+        })
+        .expect_err("a sibling process must not retry another parent's task");
+    assert!(error.contains("different parent process"));
+
+    discard_tasks_for_session(&app.session_id);
+    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        *guard = None;
+    }
+}
+
+#[test]
+fn discard_session_removes_retry_specs_after_active_tasks_are_gone() {
+    let session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    register_retry_spec(
+        &task_id,
+        session_id.clone(),
+        1,
+        prepared_retry_task(),
+        task_id.clone(),
+    );
+    assert!(
+        TASK_RETRY_REGISTRY
+            .lock()
+            .unwrap()
+            .get_ref(&task_id)
+            .is_some()
+    );
+
+    discard_tasks_for_session(&session_id);
+
+    assert!(
+        TASK_RETRY_REGISTRY
+            .lock()
+            .unwrap()
+            .get_ref(&task_id)
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1492,7 +1636,7 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
         .expect("task_wait should collect cancelled result");
 
     assert!(wait_output.contains("CANCELLED"));
-    assert!(wait_output.contains("Error: cancelled by parent agent"));
+    assert!(wait_output.contains("Failure reason: cancelled by parent agent"));
     assert!(remove_task_entry(&task_id).is_none());
 
     let os = app.os.lock().unwrap();
@@ -1791,6 +1935,7 @@ fn encoded_task_goal_prefix_is_detectable_without_decoding() {
         auto_model_fallback: None,
         selection_explanation: "explicit agent/model override".to_string(),
         spawn_depth: 0,
+        response_schema: None,
     })
     .unwrap();
 

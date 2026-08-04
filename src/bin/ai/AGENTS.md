@@ -7,7 +7,8 @@ rules in the nearest child `AGENTS.md`.
 
 ## Runtime layout
 
-- `config*`: config loading, schema, model registry access
+- `config*` / `config/`: config loading and schema
+- `models.rs` / `models.json`: model registry access, platform naming, metadata
 - `prompt/`: prompt assembly and multiline extraction
 - `skills.rs` / `agents.rs`: skill + agent manifests; `builtin_agents/` holds
   `.agent` files compiled in via `include_str!`
@@ -51,10 +52,9 @@ rules in the nearest child `AGENTS.md`.
    integration before normal completion.
 10. **Derived-context provenance.** Runtime-owned policy/control notes may map
     to `system`; model-authored self-notes, checkpoints, and automatic summaries
-    stay assistant-derived and unverified. Project assistant-derived context
-    through request-only user/assistant handoff pairs (conventional role order);
-    never promote prior assistant wording into a system-level fact or verified
-    conclusion.
+    stay assistant-derived and unverified. Never promote prior assistant wording
+    into a system-level fact; project assistant-derived context via
+    user/assistant handoff pairs only.
 
 ## Scoped guides
 

@@ -270,7 +270,10 @@ fn working_checkpoint_message_for_plan(
         truncate_checkpoint_summary(&plan_checkpoint_summary(args.as_ref(), result_content));
     let body = build_plan_working_checkpoint_body(tool_call, args.as_ref(), result_content);
     let marker = match save_working_context_checkpoint(app, &summary, &body) {
-        Ok(path) => format!("[context_checkpoint path={}] {}", path.display(), summary),
+        Ok(path) => {
+            crate::ai::driver::runtime_ctx::publish_subagent_checkpoint_summary(&summary);
+            format!("[context_checkpoint path={}] {}", path.display(), summary)
+        }
         Err(error) => {
             if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                 eprintln!("failed to save working context checkpoint: {error}");

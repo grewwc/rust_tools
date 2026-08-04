@@ -31,7 +31,7 @@ fn params_plan() -> Value {
                         },
                         "tool": {
                             "type": "string",
-                            "description": "The primary tool you plan to use for this step (e.g., 'read_file', 'execute_command', 'apply_patch', 'web_search'). Use 'none' if no tool is needed."
+                            "description": "The primary tool you plan to use for this step (e.g., 'read_file', 'execute_command', 'apply_patch', 'knowledge_search'). Use 'none' if no tool is needed."
                         },
                         "parallelizable": {
                             "type": "boolean",

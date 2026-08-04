@@ -2,6 +2,7 @@ pub(crate) mod command_tools;
 mod common;
 pub(crate) mod enable_tools;
 mod knowledge_tools;
+mod overflow_search;
 pub mod os_tools;
 mod patch_tools;
 mod permissions;
@@ -36,6 +37,8 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "read_file",
     "task",
     "task_spawn",
+    "task_spawn_batch",
+    "task_retry",
     "task_wait",
     "task_status",
     "task_integrate",
@@ -48,6 +51,8 @@ const EAGER_BASELINE_TOOL_NAMES: &[&str] = &[
     "read_file",
     "task",
     "task_spawn",
+    "task_spawn_batch",
+    "task_retry",
     "task_wait",
     "task_status",
     "task_integrate",
@@ -64,6 +69,8 @@ pub(crate) fn eager_baseline_tool_names() -> &'static [&'static str] {
 const SUBAGENT_ORCHESTRATION_TOOL_NAMES: &[&str] = &[
     "task",
     "task_spawn",
+    "task_spawn_batch",
+    "task_retry",
     "task_wait",
     "task_status",
     "task_integrate",

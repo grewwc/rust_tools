@@ -61,6 +61,10 @@ pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message
         return false;
     }
 
+    if models::default_reasoning_effort(model).is_some() {
+        return true;
+    }
+
     let raw_question = latest_user_message_text(messages).unwrap_or_default();
     // 注入的 `<system-reminder>...</system-reminder>` 上下文会被拼到当前
     // user message 最前面（见 prepare.rs / skill_runtime.rs）。它会把一句

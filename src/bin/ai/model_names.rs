@@ -8,6 +8,13 @@ use rust_tools::cw::SkipSet;
 use super::provider::{ApiProvider, ModelQualityTier, ReasoningEffort};
 use super::request_protocol::RequestProtocolDialect;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffortWire {
+    TopLevel,
+    Nested,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelDef {
     pub key: String,
@@ -82,9 +89,14 @@ pub struct ModelDef {
     #[serde(default)]
     pub subagent_priority: i32,
 
-    /// 可选：默认推理强度档位。OpenAI/OpenCode 兼容协议使用顶层
-    /// `reasoning_effort`，DashScope compatible provider 使用嵌套
-    /// `reasoning.effort`。CLI / `/model effort` 命令的覆盖优先级高于这里。
+    /// 可选：覆盖 adapter 的推理强度 wire 形状。相同网关下的不同模型族可能使用
+    /// 不同字段（例如 DashScope DeepSeek / GLM 使用顶层 `reasoning_effort`；
+    /// 未声明的 Alibaba 模型不发送未经确认的推理强度字段）。
+    #[serde(default)]
+    pub reasoning_effort_wire: Option<ReasoningEffortWire>,
+
+    /// 可选：默认推理强度档位。具体 wire 形状优先使用上面的模型级覆盖，否则由
+    /// provider adapter 决定。CLI / `/model effort` 命令的覆盖优先级高于这里。
     ///
     /// 在 `models.json` 中可填以下值（大小写不敏感）：
     /// - `"auto"` / `"none"` / `"off"` 或字段省略：等同 `None`，请求中不带

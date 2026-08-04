@@ -144,12 +144,11 @@ impl SubagentStatusLine {
             return;
         }
 
-        if self.is_tty {
-            print!("\r\x1b[2K{line}");
-            let _ = std::io::stdout().flush();
-        } else {
-            println!("{line}");
+        if !self.is_tty {
+            return;
         }
+        print!("\r\x1b[2K{line}");
+        let _ = std::io::stdout().flush();
         self.last_line = Some(line);
     }
 
@@ -184,13 +183,18 @@ fn render_subagent_status_line(
             .iter()
             .take(MAX_SUBAGENT_STATUS_DETAILS)
             .map(|status| {
-                format!(
+                let mut detail = format!(
                     "{} {} {} ({})",
                     sanitize_status_field(&status.description),
                     format_subagent_elapsed(status.elapsed_secs),
                     sanitize_status_field(&status.state),
                     sanitize_status_field(&status.agent_name)
-                )
+                );
+                if let Some(progress) = status.progress.as_deref() {
+                    detail.push_str(": ");
+                    detail.push_str(&sanitize_status_field(progress));
+                }
+                detail
             }),
     );
 
@@ -250,30 +254,34 @@ mod tests {
                 agent_name: "explorer".to_string(),
                 state: "running".to_string(),
                 elapsed_secs: 38,
+                progress: Some("using read_file · src/bin/ai/driver.rs".to_string()),
             },
             SubagentTerminalStatus {
                 description: "review driver".to_string(),
                 agent_name: "explorer".to_string(),
                 state: "waiting".to_string(),
                 elapsed_secs: 61,
+                progress: None,
             },
             SubagentTerminalStatus {
                 description: "compile check".to_string(),
                 agent_name: "executor".to_string(),
                 state: "completed".to_string(),
                 elapsed_secs: 3661,
+                progress: None,
             },
             SubagentTerminalStatus {
                 description: "extra task".to_string(),
                 agent_name: "executor".to_string(),
                 state: "running".to_string(),
                 elapsed_secs: 5,
+                progress: None,
             },
         ];
 
         assert_eq!(
             render_subagent_status_line(&statuses),
-            "subagents · 3/4 active · review stream 38s running (explorer) · review driver 1m1s waiting (explorer) · compile check 1h1m completed (executor) · +1 more"
+            "subagents · 3/4 active · review stream 38s running (explorer): using read_file · src/bin/ai/driver.rs · review driver 1m1s waiting (explorer) · compile check 1h1m completed (executor) · +1 more"
         );
         assert_eq!(format_subagent_elapsed(59), "59s");
         assert_eq!(format_subagent_elapsed(60), "1m0s");
@@ -441,6 +449,7 @@ pub(super) fn dispatch_background_batch(
         Option<u64>,
         Option<aios_kernel::primitives::FutexAddr>,
         Option<String>,
+        Option<serde_json::Value>,
         Option<crate::ai::models::AutoModelFallbackSpec>,
         usize,
         bool,
@@ -513,6 +522,9 @@ pub(super) fn dispatch_background_batch(
                 .as_ref()
                 .map(|goal| aios_kernel::primitives::FutexAddr(goal.completion_futex_addr)),
             task_goal.as_ref().map(|goal| goal.task_id.clone()),
+            task_goal
+                .as_ref()
+                .and_then(|goal| goal.response_schema.clone()),
             task_goal.as_ref().and_then(|goal| goal.auto_model_fallback),
             task_goal.as_ref().map(|goal| goal.spawn_depth).unwrap_or(0),
             is_resume_wakeup,
@@ -529,6 +541,7 @@ pub(super) fn dispatch_background_batch(
         result_channel_id,
         completion_futex_addr,
         task_id,
+        response_schema,
         auto_model_fallback,
         spawn_depth,
         is_resume_wakeup,
@@ -610,6 +623,9 @@ pub(super) fn dispatch_background_batch(
             agent_manifests.clone(),
         );
         let scope_task_id = task_id.clone().unwrap_or_else(|| format!("pid-{pid}"));
+        let phase_slot = crate::ai::tools::task_tools::task_progress_slot(&scope_task_id)
+            .unwrap_or_else(runtime_ctx::new_subagent_progress_slot);
+        let phase_slot_for_payload = phase_slot.clone();
         let parent_history_for_scopes = original_history_file.clone();
 
         // 私有 memory 文件与独占 cwd scratch 目录都随任务派生，需与 history
@@ -644,7 +660,9 @@ pub(super) fn dispatch_background_batch(
         // sub-agent actually produced (instead of just "completed
         // with empty output").
         let result_slot_for_payload: runtime_ctx::SubagentResultSlot =
-            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                runtime_ctx::SubagentResult::default(),
+            ));
         let result_slot_for_scope = result_slot_for_payload.clone();
 
         let inner_fut = TASK_PID.scope(Some(pid), async move {
@@ -670,15 +688,18 @@ pub(super) fn dispatch_background_batch(
                 run.await
             }
             .map_err(|e| format!("{}", e));
-            let captured_output = if result_channel_id.is_some() {
+            let captured_result = if result_channel_id.is_some() {
                 result_slot_for_payload
                     .lock()
                     .await
                     .clone()
-                    .unwrap_or_default()
             } else {
-                String::new()
+                runtime_ctx::SubagentResult::default()
             };
+            let captured_output = captured_result.parent_payload;
+            let response_for_validation = captured_result.final_assistant_text;
+            let progress = runtime_ctx::subagent_progress_snapshot(&phase_slot_for_payload)
+                .unwrap_or_else(|| "working".to_string());
             let memory_merge_error = private_memory_for_merge.and_then(|private_memory| {
                 crate::ai::tools::service::memory::merge_subagent_whitelist(
                     &private_memory,
@@ -689,9 +710,20 @@ pub(super) fn dispatch_background_batch(
             if memory_merge_error.is_some() {
                 memory_merge_failed_for_inner.store(true, Ordering::Release);
             }
+            let response_validation_error = if result.is_ok() && memory_merge_error.is_none() {
+                crate::ai::tools::task_tools::validate_subagent_response(
+                    response_schema.as_ref(),
+                    &response_for_validation,
+                )
+                .err()
+            } else {
+                None
+            };
             let mut os = task_os.lock().unwrap();
             os.set_current_pid(Some(pid));
-            let task_succeeded = result.is_ok() && memory_merge_error.is_none();
+            let task_succeeded = result.is_ok()
+                && memory_merge_error.is_none()
+                && response_validation_error.is_none();
             let publish_task_result = should_publish_subagent_task_result(
                 task_succeeded,
                 &captured_output,
@@ -701,7 +733,13 @@ pub(super) fn dispatch_background_batch(
                 let payload = serde_json::json!({
                     "status": if task_succeeded { "completed" } else { "failed" },
                     "output": captured_output,
-                    "error": result.as_ref().err().cloned().or(memory_merge_error),
+                    "error": result
+                        .as_ref()
+                        .err()
+                        .cloned()
+                        .or(memory_merge_error)
+                        .or(response_validation_error),
+                    "progress": progress,
                 })
                 .to_string();
                 let _ = os.channel_send(
@@ -755,6 +793,7 @@ pub(super) fn dispatch_background_batch(
         wrapped =
             Box::pin(runtime_ctx::PERSONA_MEMORY_PATH.scope(persona_memory_path.clone(), wrapped));
         wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
+        wrapped = Box::pin(runtime_ctx::SUBAGENT_PHASE.scope(phase_slot, wrapped));
         if let Some(mem_path) = scoped_memory_path {
             // sub-agent 默认私有 memory：finalize 后把白名单条目
             // (is_permanent_memory) 合并回主 memory 文件，让 long-term

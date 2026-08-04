@@ -742,7 +742,7 @@ mod tests {
         // 工具名保留（新格式用 "Output preserved for tool"）。
         assert!(anchor.contains("Output preserved for tool `read_file`"));
         // read_file 类型的归档有"通常无需重新读取"提示（而非旧的诱导式 "use read_file"）。
-        assert!(anchor.contains("之前读取文件的结果归档"));
+        assert!(anchor.contains("完整结果快照"));
         // 仍是合法 stub（前缀不变），后续压缩链继续按 stub 豁免识别。
         assert!(is_preserved_tool_overflow_stub(&anchor));
         // 体量骤降。
@@ -837,9 +837,9 @@ pub(super) fn preserve_noncompressible_tool_result_for_fold(
 /// 同 [`preserve_noncompressible_tool_result_for_fold`]，但归档文件名由
 /// `tool_call_id` 确定性派生（而非随机 uuid + 时间戳）。
 ///
-/// LLM 引导裁剪（`llm_prune::apply_pruning`）作用于每轮 `prepare` 内**重新构建**、
-/// 从不落盘的临时 `history` 副本上：同一条被裁剪的 tool 消息会在后续每一轮被再次
-/// 裁剪。若沿用随机文件名，则每轮都会写出新副本、生成不同 stub 文本 → prompt
+/// LLM 引导裁剪（`llm_prune::apply_pruning`）作用于每次模型请求前的临时 `messages`
+/// 投影：同一条 canonical tool 消息在后续 turn 重建投影时会被再次裁剪。若沿用随机
+/// 文件名，则每轮都会写出新副本、生成不同 stub 文本 → prompt
 /// cache 从该点断裂 + 磁盘副本单调膨胀。用确定性文件名后，同一 `tool_call_id`
 /// 的归档幂等：文件已存在则跳过写入，stub 文本逐轮稳定。
 pub(super) fn preserve_pruned_tool_result_stable(
@@ -1039,7 +1039,7 @@ fn read_file_range_summary(args: &Value) -> Option<(&'static str, String)> {
     }
 }
 
-fn is_preserved_tool_overflow_stub(text: &str) -> bool {
+pub(super) fn is_preserved_tool_overflow_stub(text: &str) -> bool {
     let text = text.trim_start();
     if text.starts_with(PRESERVED_TOOL_OVERFLOW_STUB_PREFIX) {
         return text.contains("\n- file_path: ");

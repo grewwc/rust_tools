@@ -7,7 +7,6 @@ use crate::ai::{
     driver::{print::print_ocr_summary, skill_runtime},
     history::{
         Message, ROLE_INTERNAL_NOTE, build_context_history, compact_session_history_with_app,
-        compress::llm_prune,
     },
     request,
     types::App,
@@ -341,7 +340,7 @@ pub(super) async fn prepare_turn(
             );
         }
     }
-    let mut history = build_context_history(
+    let history = build_context_history(
         history_count,
         &app.session_history_file,
         app.config.history_max_chars,
@@ -488,35 +487,6 @@ pub(super) async fn prepare_turn(
         tool_call_id: None,
         reasoning_content: None,
     });
-    // LLM 引导裁剪：在历史消息发送给模型前，把已被累计标记为低价值的 tool 结果
-    // 无损卸载到会话 asset 磁盘，inline 替换为可召回 stub（含 file_path）。
-    // 不删除消息、不改变数组长度；overflow_dir=None 时不裁剪（见 apply_pruning）。
-    let prune_report =
-        llm_prune::apply_pruning(&mut history, &app.prune_marks, overflow_dir.as_deref());
-    if prune_report.pruned_count > 0 {
-        let tools = if prune_report.tools.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", prune_report.tools.join(", "))
-        };
-        crate::ai::driver::print::print_tool_note_line(
-            "context-pruned",
-            &format!(
-                "{} tool result(s){}, ~{} chars freed",
-                prune_report.pruned_count, tools, prune_report.freed_chars
-            ),
-        );
-    }
-    // 当历史足够长时，在系统 prompt 后追加裁剪协议提示（不影响用户可见 prompt）。
-    if llm_prune::should_inject_prune_prompt(history.len()) {
-        messages.push(Message {
-            role: "system".to_string(),
-            content: Value::String(llm_prune::PRUNE_PROTOCOL_PROMPT.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
-    }
     // 用户重定向提醒：若历史中最近一条 assistant 仍是 tool-call 批次（即上一轮
     // agent 在工具循环里结束、未给出最终文本回复，可能是 stuck loop、被打断、
     // 或限额触发），注入一条纯 runtime-owned 的头部提醒，指向请求末尾真实的

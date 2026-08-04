@@ -6,10 +6,8 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 use crate::ai::{
-    driver::{
-        drain_response, input, print::print_assistant_banner_with_app_and_skill, skill_runtime,
-    },
-    history::{Message, ROLE_INTERNAL_NOTE},
+    driver::{drain_response, input, skill_runtime},
+    history::{Message, ROLE_INTERNAL_NOTE, compress::llm_prune},
     mcp::McpClient,
     request::{self, do_request_messages, do_request_messages_without_tools},
     stream,
@@ -488,6 +486,7 @@ pub(super) fn refresh_skill_turn_for_iteration(
     question: &str,
     iteration: usize,
     skill_turn: &mut super::super::skill_runtime::SkillTurnGuard,
+    required_project_targets: &[PathBuf],
     messages: &mut [Message],
 ) {
     if iteration <= 1 {
@@ -522,7 +521,8 @@ pub(super) fn refresh_skill_turn_for_iteration(
             )
         });
     let project_targets = project_instruction_target_paths(messages);
-    new_skill_turn.push_scoped_project_instructions(&project_targets);
+    new_skill_turn
+        .push_scoped_project_instructions(required_project_targets, &project_targets);
     if inherited_restore.is_some() {
         new_skill_turn.set_restore_agent_context(inherited_restore);
     }
@@ -738,6 +738,36 @@ fn reactive_shrink_context_after_overflow(
     after
 }
 
+/// 在每个模型请求边界更新临时上下文投影，不触碰 canonical `turn_messages`。
+fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Message>) {
+    let overflow_dir = {
+        use crate::ai::history::SessionStore;
+        let store = SessionStore::new(app.config.history_file.as_path());
+        store.session_assets_dir(&app.session_id)
+    };
+    let report = llm_prune::prepare_request_projection(
+        messages,
+        &app.prune_marks,
+        Some(overflow_dir.as_path()),
+    );
+    if report.pruned_count == 0 {
+        return;
+    }
+
+    let tools = if report.tools.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", report.tools.join(", "))
+    };
+    crate::ai::driver::print::print_tool_note_line(
+        "context-pruned",
+        &format!(
+            "{} tool result(s){}, ~{} chars freed",
+            report.pruned_count, tools, report.freed_chars
+        ),
+    );
+}
+
 #[crate::ai::agent_hang_span(
     "pre-fix",
     "B",
@@ -777,6 +807,10 @@ async fn request_model_response(
             reasoning_content: None,
         });
     }
+
+    // 每次请求前都处理，而不是只在 turn 初始化时处理。这样同一 turn 内后续工具轮
+    // 也能消费刚累计到阈值的 prune 标记，并在上下文压缩前先做无损卸载。
+    apply_model_guided_pruning_before_request(app, messages);
 
     let budget_report = context_budget::apply_pre_request_context_budget(app, next_model, messages);
     if let Some(reason) = budget_report.rollback_reason {
@@ -824,6 +858,8 @@ async fn request_model_response(
         );
         record_llm_summary_attempt_chars(&session_id, llm_after);
     }
+    // 摘要管线原则上保留 system 消息；这里仍做一次幂等兜底，确保请求边界协议存在。
+    llm_prune::ensure_prune_protocol_prompt(messages);
     compression_report.emit();
 
     let auto_model_fallback_spec = crate::ai::driver::runtime_ctx::auto_model_fallback_spec();
@@ -945,10 +981,9 @@ async fn stream_model_response(
     response: &mut reqwest::Response,
     current_history: &mut String,
     terminal_dedupe_candidate: Option<&str>,
-    active_skill_name: Option<&str>,
+    _active_skill_name: Option<&str>,
     _iteration: usize,
 ) -> Result<StreamResult, String> {
-    print_assistant_banner_with_app_and_skill(Some(app), active_skill_name);
     match stream::stream_response(app, response, current_history, terminal_dedupe_candidate).await {
         Ok(result) => Ok(result),
         Err(err) => {
@@ -967,7 +1002,7 @@ async fn finalize_stream_interaction(
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     should_quit: bool,
-    force_final_response: bool,
+    _force_final_response: bool,
 ) -> Result<IterationExecution, Box<dyn std::error::Error>> {
     input::clear_stdin_buffer();
 
@@ -1019,18 +1054,6 @@ async fn finalize_stream_interaction(
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
     Ok(match stream_result.outcome {
-        StreamOutcome::ToolCall if force_final_response => {
-            // 即使上游错误地在没有 tools 的请求中返回 tool call，也不能再把它送入
-            // 工具执行路径，否则 no-tool handoff 会退化成一次无意义的报错循环。
-            let mut stream_result = stream_result;
-            stream_result.outcome = StreamOutcome::Completed;
-            stream_result.tool_calls.clear();
-            if stream_result.assistant_text.trim().is_empty() {
-                stream_result.assistant_text =
-                    "运行时已停止继续执行工具调用。请基于已获得的信息收尾结论；若证据不足，请明确列出缺失项与下一步建议。".to_string();
-            }
-            IterationExecution::FinalResponse(stream_result)
-        }
         StreamOutcome::ToolCall => IterationExecution::ToolCall(ToolCallExecution {
             stream_result,
             allowed_tool_names: request_visible_tool_names(app),

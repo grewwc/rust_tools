@@ -11,7 +11,7 @@ binary the Agent spawns as an MCP subprocess.
 
 ```text
 src/main.rs      # #[tokio::main(multi_thread)]; BrowserServer { session } + impl mcp_stdio::McpServer; startup gc + mcp_stdio::run()
-src/browser.rs   # BrowserSession { browser, page, handler_task, temp_profile_dir }, launch(), ensure_session(), shutdown(), gc_stale_profiles()
+src/browser.rs   # BrowserSession { browser, page, handler_task, temp_profile_dir, pending_human }, launch(), ensure_session(), shutdown(), gc_stale_profiles()
 src/tools.rs     # initialize/tools_list schemas + handle_tools_call() dispatch + 13 tool impls
 ```
 
@@ -82,21 +82,38 @@ For a full Chrome round-trip add a `tools/call` with `navigate`. Set
    `navigate`, `get_text`, or `get_html` finds a page needing manual intervention
    (captcha / slider / sms_otp / twofa / login_required / payment_verify /
    identity_verify) it appends `[USER_ACTION_REQUIRED: <category>]` to the
-   returned text. Detection is one `evaluate_expression` call, best-effort and
-   **conservative**: it prefers DOM-structure signals and requires "keyword +
-   input element" for text-only cases to avoid false positives. JS errors /
-   no-match return `None` silently. The tag is appended **after** `cap_text`, so
-   a >24K body can never truncate it away. Single source for the tag string:
-   `user_action_tag()`.
+   returned text; `click` / `type_text` / `press_key` also re-detect **after** the
+   action, so a captcha triggered by a submit lands in the next tool output.
+   Detection is one `evaluate_expression` call, best-effort and **conservative**:
+   it prefers DOM-structure signals and requires "keyword + input element" for
+   text-only cases to avoid false positives. JS errors / no-match return `None`
+   silently. The tag is appended **after** `cap_text`, so a >24K body can never
+   truncate it away. Single source for the tag string: `user_action_tag()`.
+   **captcha is a "present AND unsolved" check, not a presence check**: the
+   reCAPTCHA/hCaptcha iframe **stays in the DOM after solving** (only the hidden
+   `g-recaptcha-response` / `h-captcha-response` textarea gets filled), so a
+   presence-only check would make `wait_for_human` never resolve; generic
+   `[class*="captcha"]` / `[id*="captcha"]` elements must also be *visible* to
+   count (hidden footer badges / closed overlays do not block).
    To pause for the human, the model calls **`wait_for_human`**: a **real
    blocking wait, resumable in bounded segments**. Each call polls the page
-   (every 2s) and returns `status=resolved` the instant the signal clears; if its
-   per-call budget (default 60s, hard-clamped to `op_timeout_ms - 15s`) expires
-   first it returns `status=still_waiting` - as a **normal result, not an error**
-   - so the model just calls again. This keeps every call safely under the host
-   `request_timeout_ms`, so a user can take minutes on a captcha without the host
-   killing the subprocess (invariant #1). Headless mode returns a warning (no
-   visible window to act in).
+   (every 2s, each poll with its own 5s timeout - a hung poll counts as
+   still-blocked, never as resolved) and returns `status=resolved` only after 2
+   **consecutive** clean polls (guards against transient re-render false
+   "resolved"); if its fixed 60s budget (hard-clamped to `op_timeout_ms - 15s`
+   for safety) expires first it returns `status=still_waiting` - as a
+   **normal result, not an error** - telling the model to **end its turn and ask
+   the user**, then call `wait_for_human` again when the user replies. This keeps
+   every call safely under the host `request_timeout_ms`, so a user can take
+   minutes on a captcha without the host killing the subprocess (invariant #1).
+   Headless mode fails fast with `status=unavailable` (no visible window to act
+   in) instead of waiting pointlessly.
+
+   The session tracks `pending_human: Option<String>`: set by any detection hit,
+   cleared by `wait_for_human`'s resolution, an empty detection, or a fresh
+   `navigate`. While set, mutating tools (`click` / `type_text` / `press_key`)
+   prepend `[HUMAN_ACTION_PENDING: <category>]` to their output so the model is
+   reminded to stop and hand control to the user instead of blindly continuing.
 
 ## Environment variables
 

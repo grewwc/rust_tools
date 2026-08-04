@@ -1184,6 +1184,18 @@ fn reserve_current_process_tool_call_budget(tool_call: &ToolCall) -> Result<(), 
     }
 }
 
+fn subagent_tool_phase(tool_name: &str, args: &Value) -> String {
+    let target = args
+        .get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    match target {
+        Some(target) => format!("using {tool_name} · {target}"),
+        None => format!("using {tool_name}"),
+    }
+}
+
 fn run_one(
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
@@ -1253,6 +1265,9 @@ fn run_one(
             },
         );
     }
+
+    let progress = subagent_tool_phase(&tool_call.function.name, &prepared.args);
+    crate::ai::driver::runtime_ctx::publish_subagent_phase(&progress);
 
     if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         // 不换行，以便完成状态用 \r 覆盖在同一行

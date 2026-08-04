@@ -257,21 +257,36 @@ enum ToolCallRejectionReason {
     ScopedInstructionsNeedReload,
 }
 
+#[cfg(test)]
 fn mutation_needs_scoped_instruction_preflight(
     messages: &[Message],
     tool_calls: &[ToolCall],
 ) -> bool {
+    !mutation_scoped_instruction_preflight_targets(messages, tool_calls).is_empty()
+}
+
+fn mutation_scoped_instruction_preflight_targets(
+    messages: &[Message],
+    tool_calls: &[ToolCall],
+) -> Vec<PathBuf> {
     let targets = super::super::iteration::project_instruction_target_paths_from_tool_calls(
         tool_calls, false,
     );
     if targets.is_empty() {
-        return false;
+        return Vec::new();
     }
     let system_prompt = messages
         .first()
         .and_then(|message| message.content.as_str())
         .unwrap_or_default();
-    crate::ai::driver::skill_runtime::scoped_project_instructions_missing(system_prompt, &targets)
+    if crate::ai::driver::skill_runtime::scoped_project_instructions_missing(
+        system_prompt,
+        &targets,
+    ) {
+        targets
+    } else {
+        Vec::new()
+    }
 }
 
 fn reject_tool_calls(
@@ -573,6 +588,11 @@ enum FinalClaimKind {
 
 const DANGLING_FINAL_RECOVERY_MARKER: &str = "[dangling-final-recovery]";
 const DANGLING_FINAL_WARNING: &str = "[Runtime warning] The model still described a future inspection step after a one-time no-tool wrap-up retry, so this turn ended without a complete conclusion.";
+const NO_TOOL_SYNTHESIS_RETRY_MARKER: &str = "[no-tool-synthesis-retry]";
+const NO_TOOL_SYNTHESIS_RETRY_NOTE: &str = "The previous no-tool synthesis response incorrectly returned a tool call. Do not call any tool. Produce the final answer now from the evidence already present in the conversation, and explicitly mark anything unverified as incomplete.";
+const NO_TOOL_SYNTHESIS_WARNING: &str = "模型连续两次在无工具收尾阶段返回工具调用；运行时已停止重试。请仅依据此前已获得的证据判断任务状态，未验证的部分应视为未完成。";
+const REASONING_ONLY_RETRY_MARKER: &str = "[reasoning-only-retry]";
+const REASONING_ONLY_RETRY_NOTE: &str = "The previous response contained hidden reasoning but no visible assistant answer. This is the one automatic recovery attempt. Retry the step normally with the same capabilities, including tools and internal reasoning when needed, and ensure the response eventually includes visible assistant content.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DanglingFinalRecoveryAction {
@@ -2484,13 +2504,27 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 && !stream_result.reasoning_text.trim().is_empty()
                 && stream_result.tool_calls.is_empty();
             if reasoning_only_completion {
-                if *force_final_response {
+                let already_retried = messages.iter().any(|message| {
+                    message.role == ROLE_INTERNAL_NOTE
+                        && message
+                            .content
+                            .as_str()
+                            .is_some_and(|text| text.starts_with(REASONING_ONLY_RETRY_MARKER))
+                });
+                if already_retried {
                     *final_assistant_text =
                         "[模型只返回了思考内容，没有给出最终回答，请重试或切换模型]".to_string();
                     return Ok(TurnLoopStep::Break);
                 }
-                record_force_final_reason(messages, "reasoning_only_completion", iteration);
-                *force_final_response = true;
+                messages.push(Message {
+                    role: ROLE_INTERNAL_NOTE.to_string(),
+                    content: serde_json::Value::String(format!(
+                        "{REASONING_ONLY_RETRY_MARKER}\n{REASONING_ONLY_RETRY_NOTE}"
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
                 return Ok(TurnLoopStep::Continue);
             }
             let warn_unverified_completion = match completion_evidence_gate_action(
@@ -2578,12 +2612,17 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     &app.stale_patch_targets,
                     &tool_call_execution.stream_result.tool_calls,
                 );
-            let scoped_preflight_needed = !*force_final_response
+            let scoped_preflight_targets = if !*force_final_response
                 && !patch_retry_needs_fresh_read
-                && mutation_needs_scoped_instruction_preflight(
+            {
+                mutation_scoped_instruction_preflight_targets(
                     messages,
                     &tool_call_execution.stream_result.tool_calls,
-                );
+                )
+            } else {
+                Vec::new()
+            };
+            let scoped_preflight_needed = !scoped_preflight_targets.is_empty();
             let rejection_reason = if *force_final_response {
                 Some(ToolCallRejectionReason::NoToolHandoff)
             } else if patch_retry_needs_fresh_read {
@@ -2645,7 +2684,51 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             crate::ai::driver::input::clear_stdin_buffer();
 
             if scoped_preflight_needed {
-                return Ok(TurnLoopStep::ScopedPreflightContinue);
+                return Ok(TurnLoopStep::ScopedPreflightContinue(
+                    scoped_preflight_targets,
+                ));
+            }
+
+            if *force_final_response {
+                let already_retried = messages.iter().any(|message| {
+                    message.role == ROLE_INTERNAL_NOTE
+                        && message
+                            .content
+                            .as_str()
+                            .is_some_and(|text| text.starts_with(NO_TOOL_SYNTHESIS_RETRY_MARKER))
+                });
+                if !already_retried {
+                    let retry_note = Message {
+                        role: ROLE_INTERNAL_NOTE.to_string(),
+                        content: serde_json::Value::String(format!(
+                            "{NO_TOOL_SYNTHESIS_RETRY_MARKER}\n{NO_TOOL_SYNTHESIS_RETRY_NOTE}"
+                        )),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    };
+                    messages.push(retry_note.clone());
+                    turn_messages.push(retry_note);
+                    crate::ai::driver::print::print_tool_note_line(
+                        "agent-health",
+                        "无工具收尾响应仍包含工具调用；正在进行一次最终综合重试。",
+                    );
+                    return Ok(TurnLoopStep::Continue);
+                }
+
+                // 第二次违规后停止，避免模型在已禁用工具的收尾阶段无限重试。
+                let partial = tool_call_execution.stream_result.assistant_text.trim();
+                *final_assistant_text = if partial.is_empty() {
+                    NO_TOOL_SYNTHESIS_WARNING.to_string()
+                } else {
+                    format!("{partial}\n\n{NO_TOOL_SYNTHESIS_WARNING}")
+                };
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    NO_TOOL_SYNTHESIS_WARNING,
+                );
+                *terminal_dedupe_candidate = None;
+                return Ok(TurnLoopStep::Break);
             }
 
             {
@@ -2940,7 +3023,7 @@ mod tests {
                 &mut turn_had_tool_error,
             )
             .unwrap();
-            assert!(matches!(step, TurnLoopStep::ScopedPreflightContinue));
+            assert!(matches!(step, TurnLoopStep::ScopedPreflightContinue(_)));
             assert!(!force_final_response);
             assert_eq!(fs::read_to_string(&target).unwrap(), "// source\n");
 
@@ -4545,7 +4628,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_only_final_response_retries_once_with_forced_final() {
+    fn reasoning_only_final_response_retries_once_with_full_capabilities() {
         let mut app = test_app_with_tools(&["read_file"]);
         let mcp = crate::ai::mcp::McpClient::new();
         let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
@@ -4595,19 +4678,34 @@ mod tests {
         .unwrap();
 
         assert!(matches!(step, TurnLoopStep::Continue));
-        assert!(force_final_response);
+        assert!(!force_final_response);
+        assert!(!app.cli.thinking_disabled_override);
         assert!(final_assistant_text.is_empty());
         assert!(!final_assistant_recorded);
-        assert!(messages.is_empty());
+        assert!(messages.iter().any(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(REASONING_ONLY_RETRY_MARKER))
+        }));
         assert!(turn_messages.is_empty());
     }
 
     #[test]
-    fn reasoning_only_final_response_stops_after_forced_retry() {
+    fn reasoning_only_final_response_stops_after_dedicated_retry() {
         let mut app = test_app_with_tools(&["read_file"]);
         let mcp = crate::ai::mcp::McpClient::new();
         let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
-        let mut messages = Vec::new();
+        let mut messages = vec![Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: serde_json::Value::String(format!(
+                "{REASONING_ONLY_RETRY_MARKER}\n{REASONING_ONLY_RETRY_NOTE}"
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
         let mut turn_messages = Vec::new();
         let mut persisted_turn_messages = 0usize;
         let mut final_assistant_text = String::new();
@@ -4658,7 +4756,7 @@ mod tests {
             "[模型只返回了思考内容，没有给出最终回答，请重试或切换模型]"
         );
         assert!(!final_assistant_recorded);
-        assert!(messages.is_empty());
+        assert_eq!(messages.len(), 1);
         assert!(turn_messages.is_empty());
     }
 
@@ -5213,6 +5311,62 @@ mod tests {
             .join("\n");
         assert!(joined.contains("disabled in no-tool handoff mode"));
         assert!(!joined.contains("exceeded kernel rlimit"));
+        assert!(joined.contains(NO_TOOL_SYNTHESIS_RETRY_MARKER));
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "summarize findings",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            IterationExecution::ToolCall(ToolCallExecution {
+                stream_result: crate::ai::types::StreamResult {
+                    outcome: crate::ai::types::StreamOutcome::ToolCall,
+                    tool_calls: vec![ToolCall {
+                        id: "call_2".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_file".to_string(),
+                            arguments: format!(r#"{{"file_path":"{}"}}"#, path.to_string_lossy()),
+                        },
+                    }],
+                    assistant_text: "I still need one more read.".to_string(),
+                    hidden_meta: String::new(),
+                    reasoning_text: String::new(),
+                    reasoning_items: Vec::new(),
+                    skip_response_drain: true,
+                    truncated_by_length: false,
+                    stream_error: false,
+                    finish_reason_value: None,
+                    usage_prompt_tokens: 0,
+                    usage_cached_prompt_tokens: 0,
+                    usage_completion_tokens: 0,
+                    usage_reasoning_tokens: 0,
+                },
+                allowed_tool_names: ["read_file".to_string()].into_iter().collect(),
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            4,
+            16,
+            0,
+            &mut false,
+        )
+        .unwrap();
+
+        assert!(matches!(step, TurnLoopStep::Break));
+        assert!(final_assistant_text.contains("I still need one more read."));
+        assert!(final_assistant_text.contains(NO_TOOL_SYNTHESIS_WARNING));
+        {
+            let os = app.os.lock().unwrap();
+            assert_eq!(os.rusage_get(pid).unwrap().tool_calls, 0);
+        }
 
         let _ = std::fs::remove_file(&path);
         if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {

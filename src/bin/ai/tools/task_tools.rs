@@ -42,6 +42,9 @@ pub(crate) const SUBAGENT_MAX_ITERATIONS: usize = 32;
 /// 显式声明 `max_steps` 的 agent（如深度审计 `/audit`）可以突破默认 32 轮，
 /// 但任何子代理都不能超过这个绝对硬帽，防止失控子代理无限迭代。
 pub(crate) const SUBAGENT_MAX_ITERATIONS_HARD_CAP: usize = 256;
+/// 单次批量委派的硬上限，与后台调度默认最大批次保持一致。
+/// schema 与执行入口都校验，避免绕过父级单次 tool-call 配额造成无界扇出。
+const MAX_SUBAGENT_SPAWN_BATCH_SIZE: usize = 8;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 /// 子代理结果只是主 agent 的证据输入，不是最终对用户的直接回答。
 /// 主 agent 拿到 payload 后仍需自行汇总结论、风险与下一步，再面向用户输出。
@@ -62,8 +65,8 @@ const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 60;
 /// 30s、上限 60s）不同，这是进程级硬上限：subagent 存活超过此值（典型如卡在单个永不
 /// 返回的工具执行里、单 turn 内无 wall-clock 超时），task_wait 入口会主动
 /// 终止它并写入 timeout 终态结果，避免主 agent 陷入"超时->续等->再超时"空转
-/// 或后台进程永久占用资源。30 分钟远大于正常完成时长，仅在真正卡死时兜底。
-const SUBAGENT_WALL_CLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// 或后台进程永久占用资源。1 小时远大于正常完成时长，仅在真正卡死时兜底。
+const SUBAGENT_WALL_CLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Granular control over which slices of the parent agent's execution
 /// context are inherited by a spawned sub-agent. Defaults are cwd+skills=true
@@ -230,6 +233,82 @@ pub(crate) struct AsyncTaskEntry {
 /// / `take_task_entry` 等 helper 函数来读写这里，避免直接持有 lock guard。
 static TASK_REGISTRY: LazyLock<Mutex<SkipMap<String, AsyncTaskEntry>>> =
     LazyLock::new(|| Mutex::new(SkipMap::default()));
+static TASK_PROGRESS_REGISTRY: LazyLock<
+    Mutex<SkipMap<String, crate::ai::driver::runtime_ctx::SubagentPhaseSlot>>,
+> = LazyLock::new(|| Mutex::new(SkipMap::default()));
+static TASK_RETRY_REGISTRY: LazyLock<Mutex<SkipMap<String, RetryableTaskSpec>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
+
+#[derive(Clone)]
+struct RetryableTaskSpec {
+    session_id: String,
+    owner_pid: u64,
+    prepared: PreparedSubagentTask,
+    retry_root: String,
+    terminal_status: Option<String>,
+    recorded_at: Instant,
+}
+
+pub(crate) fn task_progress_slot(
+    task_id: &str,
+) -> Option<crate::ai::driver::runtime_ctx::SubagentPhaseSlot> {
+    TASK_PROGRESS_REGISTRY
+        .lock()
+        .ok()?
+        .get_ref(&task_id.to_string())
+        .cloned()
+}
+
+fn current_task_progress(task_id: &str) -> Option<String> {
+    let slot = task_progress_slot(task_id)?;
+    let value = crate::ai::driver::runtime_ctx::subagent_progress_snapshot(&slot)?;
+    (!value.is_empty()).then_some(value)
+}
+
+fn register_retry_spec(
+    task_id: &str,
+    session_id: String,
+    owner_pid: u64,
+    prepared: PreparedSubagentTask,
+    retry_root: String,
+) {
+    let mut registry = TASK_RETRY_REGISTRY.lock().unwrap();
+    while registry.len() >= MAX_TASK_REGISTRY_SIZE {
+        let Some(oldest) = registry
+            .iter()
+            .min_by_key(|(_, spec)| spec.recorded_at)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        registry.remove(&oldest);
+    }
+    registry.insert(
+        task_id.to_string(),
+        RetryableTaskSpec {
+            session_id,
+            owner_pid,
+            prepared,
+            retry_root,
+            terminal_status: None,
+            recorded_at: Instant::now(),
+        },
+    );
+}
+
+fn mark_task_retry_status(task_id: &str, status: &str) {
+    if let Some(spec) = TASK_RETRY_REGISTRY
+        .lock()
+        .unwrap()
+        .get_mut(&task_id.to_string())
+    {
+        spec.terminal_status = Some(status.to_string());
+    }
+}
+
+fn is_retryable_task_status(status: &str) -> bool {
+    matches!(status, "failed" | "timeout" | "cancelled")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TaskWaitPolicyKey {
@@ -292,6 +371,9 @@ pub(crate) struct OsTaskGoal {
     /// 子代理嵌套深度：顶层 spawn 为 1，逐层递增。用于防止递归扇出。
     #[serde(default)]
     pub(crate) spawn_depth: usize,
+    /// 可选的子代理最终响应 JSON Schema；旧任务载荷缺失时保持兼容。
+    #[serde(default)]
+    pub(crate) response_schema: Option<Value>,
 }
 
 fn next_task_id() -> String {
@@ -722,6 +804,10 @@ fn params_task() -> Value {
             "inherit": {
                 "type": "string",
                 "description": task_inherit_schema_description()
+            },
+            "response_schema": {
+                "type": "object",
+                "description": "Optional JSON Schema for the subagent's final output. When provided, the child must return exactly one JSON value matching this schema."
             }
         },
         "required": ["description", "prompt"]
@@ -779,9 +865,29 @@ fn params_task_spawn() -> Value {
             "inherit": {
                 "type": "string",
                 "description": task_inherit_schema_description()
+            },
+            "response_schema": {
+                "type": "object",
+                "description": "Optional JSON Schema for the subagent's final output. When provided, the child must return exactly one JSON value matching this schema."
             }
         },
         "required": ["description", "prompt"]
+    })
+}
+
+fn params_task_spawn_batch() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_SUBAGENT_SPAWN_BATCH_SIZE,
+                "description": "Independent subagent tasks to preflight and spawn in input order.",
+                "items": params_task_spawn()
+            }
+        },
+        "required": ["tasks"]
     })
 }
 
@@ -796,11 +902,24 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "task_spawn_batch",
+        description: "Spawn multiple independent subagent tasks in one deterministic batch. Every item is preflight-validated before any child starts, then spawn attempts run in input order and the returned task entries preserve that order. Runtime spawn failures are reported per item without hiding already-started tasks.",
+        parameters: params_task_spawn_batch,
+        execute: execute_task_spawn_batch,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
 /// Pre-flight subagent task spec produced from a `task` / `task_spawn` tool
 /// call before the kernel actually spawns the new process.
+#[derive(Clone)]
 pub(crate) struct PreparedSubagentTask {
     pub(crate) description: String,
     pub(crate) prompt: String,
+    pub(crate) response_schema: Option<Value>,
     pub(crate) agent_name: String,
     pub(crate) model: String,
     pub(crate) is_model_auto_selected: bool,
@@ -820,7 +939,23 @@ pub(in crate::ai) fn capped_subagent_manifest(agent: &AgentManifest) -> AgentMan
     capped
 }
 
-fn wrap_subagent_prompt(description: &str, prompt: &str) -> String {
+fn wrap_subagent_prompt(
+    description: &str,
+    prompt: &str,
+    response_schema: Option<&Value>,
+) -> String {
+    let response_contract = response_schema
+        .map(|schema| {
+            let schema = serde_json::to_string_pretty(schema)
+                .unwrap_or_else(|_| schema.to_string());
+            format!(
+                "Required response contract:\n\
+                 - Return exactly one JSON value matching the schema below.\n\
+                 - Do not wrap the JSON in Markdown fences or add prose before or after it.\n\
+                 <response_schema>\n{schema}\n</response_schema>\n\n"
+            )
+        })
+        .unwrap_or_default();
     format!(
         "Subagent task: {}\n\n\
          Runtime constraints:\n\
@@ -828,10 +963,45 @@ fn wrap_subagent_prompt(description: &str, prompt: &str) -> String {
          - Reuse observed evidence and avoid equivalent read/search/list/command variants unless omitted text is needed; prefer one targeted broad call over many small ones.\n\
          - Ground factual claims in observed evidence. For review or diagnosis, trace the relevant path and check likely counter-evidence before reporting a finding.\n\
          - If evidence is incomplete, return a concise partial result separating confirmed conclusions, unresolved hypotheses, missing evidence, and the next verification step.\n\n\
-         Parent task prompt:\n{}",
+         {}Parent task prompt:\n{}",
         description.trim(),
+        response_contract,
         prompt.trim()
     )
+}
+
+fn parse_response_schema(args: &Value) -> Result<Option<Value>, String> {
+    let Some(schema) = args.get("response_schema") else {
+        return Ok(None);
+    };
+    if schema.is_null() {
+        return Ok(None);
+    }
+    if !schema.is_object() {
+        return Err("'response_schema' must be a JSON Schema object".to_string());
+    }
+    jsonschema::validator_for(schema)
+        .map_err(|error| format!("Invalid 'response_schema': {error}"))?;
+    Ok(Some(schema.clone()))
+}
+
+pub(crate) fn validate_subagent_response(
+    response_schema: Option<&Value>,
+    output: &str,
+) -> Result<(), String> {
+    let Some(schema) = response_schema else {
+        return Ok(());
+    };
+    let instance: Value = serde_json::from_str(output.trim()).map_err(|error| {
+        format!(
+            "Subagent response is not valid JSON required by response_schema: {error}"
+        )
+    })?;
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|error| format!("Invalid response_schema: {error}"))?;
+    validator.validate(&instance).map_err(|error| {
+        format!("Subagent response did not match response_schema: {error}")
+    })
 }
 
 /// Parse and validate a `task` / `task_spawn` tool call payload, run subagent
@@ -861,6 +1031,7 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
     }
 
     let inherit = InheritOptions::from_value(&args["inherit"])?;
+    let response_schema = parse_response_schema(args)?;
 
     // 优先从 DRIVER_CTX 中拿已缓存的 agent_manifests，避免每次 task_spawn 都重读磁盘。
     // 当不在 DRIVER_CTX scope 中（极少见，例如单测），回退到 load_all_agents()。
@@ -902,7 +1073,8 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
 
     Ok(PreparedSubagentTask {
         description: description.to_string(),
-        prompt: wrap_subagent_prompt(description, prompt),
+        prompt: wrap_subagent_prompt(description, prompt, response_schema.as_ref()),
+        response_schema,
         agent_name: selected.agent.name.clone(),
         model: selected_model,
         is_model_auto_selected,
@@ -925,6 +1097,13 @@ pub(crate) struct SpawnedSubagentTask {
 /// interception path.
 pub(crate) fn spawn_subagent_kernel_task(
     prepared: &PreparedSubagentTask,
+) -> Result<SpawnedSubagentTask, String> {
+    spawn_subagent_kernel_task_attempt(prepared, None)
+}
+
+fn spawn_subagent_kernel_task_attempt(
+    prepared: &PreparedSubagentTask,
+    retry_of: Option<&str>,
 ) -> Result<SpawnedSubagentTask, String> {
     let parent_depth = crate::ai::driver::runtime_ctx::current_subagent_depth();
     let child_depth = parent_depth + 1;
@@ -973,6 +1152,7 @@ pub(crate) fn spawn_subagent_kernel_task(
             auto_model_fallback: prepared.auto_model_fallback,
             selection_explanation: prepared.selection_explanation.clone(),
             spawn_depth: child_depth,
+            response_schema: prepared.response_schema.clone(),
         })?;
         let pid = os.spawn(
             Some(parent_pid),
@@ -1010,6 +1190,20 @@ pub(crate) fn spawn_subagent_kernel_task(
             },
         );
     }
+    TASK_PROGRESS_REGISTRY
+        .lock()
+        .unwrap()
+        .insert(
+            task_id.clone(),
+            crate::ai::driver::runtime_ctx::new_subagent_progress_slot(),
+        );
+    register_retry_spec(
+        &task_id,
+        crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+        owner_pid,
+        prepared.clone(),
+        retry_of.unwrap_or(&task_id).to_string(),
+    );
     crate::ai::driver::notify_scheduler_after(SUBAGENT_WALL_CLOCK_TIMEOUT);
 
     Ok(SpawnedSubagentTask {
@@ -1059,6 +1253,7 @@ pub(crate) struct SubagentTerminalStatus {
     pub(crate) agent_name: String,
     pub(crate) state: String,
     pub(crate) elapsed_secs: u64,
+    pub(crate) progress: Option<String>,
 }
 
 pub(crate) fn subagent_terminal_statuses(
@@ -1072,12 +1267,13 @@ pub(crate) fn subagent_terminal_statuses(
     let mut statuses = registry
         .iter()
         .filter(|(_, entry)| task_entry_owned_by(entry, session_id, owner_pid))
-        .map(|(_, entry)| SubagentTerminalStatus {
+        .map(|(task_id, entry)| SubagentTerminalStatus {
             description: entry.description.clone(),
             agent_name: entry.agent_name.clone(),
             state: task_state_string(os, entry.result_channel_id, entry.pid)
                 .unwrap_or_else(|_| "unknown".to_string()),
             elapsed_secs: entry.started_at.elapsed().as_secs(),
+            progress: current_task_progress(task_id),
         })
         .collect::<Vec<_>>();
     statuses.sort_by(|a, b| a.description.cmp(&b.description));
@@ -1114,6 +1310,142 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
         prepared.agent_name,
         prepared.model,
         prepared.inherit.describe()
+    ))
+}
+
+pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
+    ensure_top_level_task_orchestration("task_spawn_batch")?;
+    let tasks = args
+        .get("tasks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "task_spawn_batch requires a 'tasks' array".to_string())?;
+    if tasks.is_empty() {
+        return Err("task_spawn_batch requires at least one task".to_string());
+    }
+    if tasks.len() > MAX_SUBAGENT_SPAWN_BATCH_SIZE {
+        return Err(format!(
+            "task_spawn_batch accepts at most {MAX_SUBAGENT_SPAWN_BATCH_SIZE} tasks per call"
+        ));
+    }
+
+    // 先完成整批 preflight，避免后续条目参数无效时前面的 child 已经启动。
+    let prepared = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            prepare_subagent_task(task)
+                .map_err(|error| format!("task_spawn_batch tasks[{index}]: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut spawned_count = 0usize;
+    let mut entries = Vec::with_capacity(prepared.len());
+    for (index, task) in prepared.iter().enumerate() {
+        match spawn_subagent_kernel_task(task) {
+            Ok(spawned) => {
+                spawned_count += 1;
+                entries.push(serde_json::json!({
+                    "index": index,
+                    "status": "spawned",
+                    "task_id": spawned.task_id,
+                    "pid": spawned.pid,
+                    "agent": task.agent_name,
+                    "model": task.model,
+                    "inherit": task.inherit.describe(),
+                }));
+            }
+            Err(error) => entries.push(serde_json::json!({
+                "index": index,
+                "status": "failed",
+                "error": error,
+                "agent": task.agent_name,
+                "model": task.model,
+                "inherit": task.inherit.describe(),
+            })),
+        }
+    }
+
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "spawned": spawned_count,
+        "failed": entries.len() - spawned_count,
+        "tasks": entries,
+        "next": "Continue independent parent-side work; use task_status for snapshots and task_wait only when blocked on results."
+    }))
+    .expect("serializing task_spawn_batch result cannot fail"))
+}
+
+fn params_task_retry() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Terminal failed, timed-out, or cancelled task_id to retry with the same agent, prompt, model, inheritance, tools, and MCP configuration."
+            }
+        },
+        "required": ["task_id"]
+    })
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "task_retry",
+        description: "Retry a terminal failed, timed-out, or cancelled subagent as a new linked attempt using the original task configuration. Returns a new task_id; collect and integrate the old and new attempts separately.",
+        parameters: params_task_retry,
+        execute: execute_task_retry,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
+fn execute_task_retry(args: &Value) -> Result<String, String> {
+    ensure_top_level_task_orchestration("task_retry")?;
+    let task_id = args
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "task_retry requires non-empty 'task_id'".to_string())?;
+    let record = TASK_RETRY_REGISTRY
+        .lock()
+        .unwrap()
+        .get_ref(&task_id.to_string())
+        .cloned()
+        .ok_or_else(|| format!("task_retry: unknown task_id '{task_id}'"))?;
+    if record.session_id != crate::ai::driver::runtime_ctx::current_session_id_or_empty() {
+        return Err(format!(
+            "task_retry: task_id '{task_id}' belongs to another session"
+        ));
+    }
+
+    let current_owner_pid = current_task_owner_pid()?;
+    if record.owner_pid != current_owner_pid {
+        return Err(format!(
+            "task_retry: task_id '{task_id}' belongs to a different parent process"
+        ));
+    }
+    match record.terminal_status.as_deref() {
+        Some(status) if is_retryable_task_status(status) => {}
+        Some(status) => {
+            return Err(format!(
+                "task_retry: task_id '{task_id}' ended with status '{status}' and is not retryable"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "task_retry: task_id '{task_id}' has no collected terminal failure yet; collect it with task_wait or task_status first"
+            ));
+        }
+    }
+    let spawned = spawn_subagent_kernel_task_attempt(&record.prepared, Some(&record.retry_root))?;
+    Ok(format!(
+        "Task retried: retry_of={}, new_task_id={}, pid={}, agent={}, model={}, inherit={}\nThis is a distinct attempt. Collect and integrate both task ids separately.",
+        record.retry_root,
+        spawned.task_id,
+        spawned.pid,
+        record.prepared.agent_name,
+        record.prepared.model,
+        record.prepared.inherit.describe()
     ))
 }
 
@@ -1349,6 +1681,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             if entry.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT {
                 write_terminal_subagent_result(
                     os,
+                    tid,
                     entry.pid,
                     entry.result_channel_id,
                     entry.completion_futex_addr,
@@ -1372,13 +1705,9 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 // 子 agent 进程终止但未发布结果时，它不会运行自己的清理代码
                 // 来释放 producer holder，因此这里必须同时释放 consumer 和 producer，
                 // 否则 channel_destroy 因 ref_count != 0 失败，channel + futex 永久泄漏。
-                let rendered = format!(
-                    "[Task: {} via {} @ {}] FAILED: process pid={} terminated without publishing any output.",
-                    entry.description, entry.agent_name, entry.model, entry.pid
-                );
-                persist_rendered_task_evidence(tid, entry, "failed", &rendered)?;
+                let rendered = collect_missing_task_result(tid, entry)?;
                 cleanup_collected_task(os, entry, "subagent terminated without output");
-                ready.push(format!("[task_id={tid}]\n{rendered}"));
+                ready.push(rendered);
                 finished.push(tid.clone());
             }
         }
@@ -1419,17 +1748,13 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 } else if is_task_pending(os, entry.pid)? {
                     pending.push((tid.clone(), entry.pid));
                 } else {
-                    let rendered = format!(
-                        "[Task: {} via {} @ {}] FAILED: process pid={} terminated without publishing any output.",
-                        entry.description, entry.agent_name, entry.model, entry.pid
-                    );
-                    persist_rendered_task_evidence(tid, entry, "failed", &rendered)?;
+                    let rendered = collect_missing_task_result(tid, entry)?;
                     cleanup_collected_task(
                         os,
                         entry,
                         "subagent terminated without output after wait",
                     );
-                    ready.push(format!("[task_id={tid}]\n{rendered}"));
+                    ready.push(rendered);
                     finished.push(tid.clone());
                 }
             }
@@ -1532,6 +1857,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
 /// 的 ready 路径或 task_cancel 自身）完成，避免重复释放。
 fn write_terminal_subagent_result(
     os: &mut dyn aios_kernel::kernel::Kernel,
+    task_id: &str,
     pid: u64,
     result_channel_id: u64,
     completion_futex_addr: aios_kernel::primitives::FutexAddr,
@@ -1550,6 +1876,7 @@ fn write_terminal_subagent_result(
         "status": status,
         "output": "",
         "error": error,
+        "progress": current_task_progress(task_id),
     })
     .to_string();
     let _ = os.channel_send(Some(pid), ChannelId(result_channel_id), payload);
@@ -1583,8 +1910,9 @@ pub(crate) fn reap_timed_out_subagents() {
         registry
             .iter()
             .filter(|(_, e)| e.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT)
-            .map(|(_, e)| {
+            .map(|(task_id, e)| {
                 (
+                    task_id.clone(),
                     e.pid,
                     e.result_channel_id,
                     e.completion_futex_addr,
@@ -1598,7 +1926,7 @@ pub(crate) fn reap_timed_out_subagents() {
         return;
     }
     // Step 2：不持任何锁，先停止真实 Tokio Future，避免它与 timeout 终态并发写结果。
-    for (_, _, _, abort_handle, cancel_stream) in &candidates {
+    for (_, _, _, _, abort_handle, cancel_stream) in &candidates {
         cancel_stream.store(true, Ordering::Release);
         if let Some(handle) = abort_handle {
             handle.abort();
@@ -1606,7 +1934,7 @@ pub(crate) fn reap_timed_out_subagents() {
     }
     // Step 3：仅持 kernel 锁，逐个检查是否仍在运行，是则 kill + 写 timeout 终态。
     let _ = with_os_kernel(|os| {
-        for (pid, result_channel_id, completion_futex_addr, _, _) in candidates {
+        for (task_id, pid, result_channel_id, completion_futex_addr, _, _) in candidates {
             if !is_task_pending(os, pid)? {
                 // 进程已结束（正常完成 / 失败 / 被他人 kill），跳过；其结果与资源
                 // 清理交给收集方处理。
@@ -1614,6 +1942,7 @@ pub(crate) fn reap_timed_out_subagents() {
             }
             write_terminal_subagent_result(
                 os,
+                &task_id,
                 pid,
                 result_channel_id,
                 completion_futex_addr,
@@ -1823,10 +2152,6 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
             })
             .collect::<Vec<_>>()
     };
-    if candidates.is_empty() {
-        return;
-    }
-
     for (_, _, _, _, abort_handle, cancel_stream) in &candidates {
         cancel_stream.store(true, Ordering::Release);
         if let Some(handle) = abort_handle {
@@ -1834,20 +2159,22 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
         }
     }
 
-    let _ = with_os_kernel(|os| {
-        for (_, pid, result_channel_id, completion_futex_addr, _, _) in &candidates {
-            let _ = os.cleanup_process_resources(*pid);
-            let _ = os.kill_process(*pid, "parent session deleted".to_string());
-            let _ = os.drop_terminated(*pid);
-            let channel_id = ChannelId(*result_channel_id);
-            let _ = os.channel_close(None, channel_id);
-            let _ = os.channel_release_named(channel_id, "task_result.consumer");
-            let _ = os.channel_release_named(channel_id, "task_result.producer");
-            let _ = os.channel_destroy(None, channel_id);
-            let _ = os.futex_destroy(*completion_futex_addr);
-        }
-        Ok::<(), String>(())
-    });
+    if !candidates.is_empty() {
+        let _ = with_os_kernel(|os| {
+            for (_, pid, result_channel_id, completion_futex_addr, _, _) in &candidates {
+                let _ = os.cleanup_process_resources(*pid);
+                let _ = os.kill_process(*pid, "parent session deleted".to_string());
+                let _ = os.drop_terminated(*pid);
+                let channel_id = ChannelId(*result_channel_id);
+                let _ = os.channel_close(None, channel_id);
+                let _ = os.channel_release_named(channel_id, "task_result.consumer");
+                let _ = os.channel_release_named(channel_id, "task_result.producer");
+                let _ = os.channel_destroy(None, channel_id);
+                let _ = os.futex_destroy(*completion_futex_addr);
+            }
+            Ok::<(), String>(())
+        });
+    }
 
     let task_ids = candidates
         .into_iter()
@@ -1857,6 +2184,23 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
         let mut registry = TASK_REGISTRY.lock().unwrap();
         for task_id in &task_ids {
             registry.remove(task_id);
+        }
+    }
+    {
+        let mut progress_registry = TASK_PROGRESS_REGISTRY.lock().unwrap();
+        for task_id in &task_ids {
+            progress_registry.remove(task_id);
+        }
+    }
+    {
+        let mut retry_registry = TASK_RETRY_REGISTRY.lock().unwrap();
+        let retry_task_ids = retry_registry
+            .iter()
+            .filter(|(_, spec)| spec.session_id == session_id)
+            .map(|(task_id, _)| task_id.clone())
+            .collect::<Vec<_>>();
+        for task_id in retry_task_ids {
+            retry_registry.remove(&task_id);
         }
     }
     TASK_WAIT_STATES
@@ -1935,6 +2279,7 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
             }
             write_terminal_subagent_result(
                 os,
+                &tid,
                 pid,
                 result_channel_id,
                 completion_futex_addr,
@@ -2069,12 +2414,8 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
             } else if !is_task_pending(os, *pid)? {
                 // 与 task_wait 保持一致：进程已终止但没有写回结果时，也必须把任务
                 // 收口并释放双方的 channel ownership，避免仅轮询 task_status 时泄漏。
-                let rendered = format!(
-                    "[Task: {} via {} @ {}] FAILED: process pid={} terminated without publishing any output.",
-                    description, agent_name, model, pid
-                );
-                persist_rendered_task_evidence(tid, &entry, "failed", &rendered)?;
-                completed_outputs.push(format!("[task_id={tid}]\n{rendered}"));
+                let rendered = collect_missing_task_result(tid, &entry)?;
+                completed_outputs.push(rendered);
                 cleanup_collected_task(
                     os,
                     &entry,
@@ -2236,6 +2577,8 @@ pub(crate) struct StoredTaskResult {
     pub(crate) status: String,
     pub(crate) output: String,
     pub(crate) error: Option<String>,
+    #[serde(default)]
+    pub(crate) progress: Option<String>,
 }
 
 fn read_task_result(
@@ -2328,10 +2671,19 @@ fn format_task_result(entry: &AsyncTaskEntry, result: StoredTaskResult) -> Strin
     if let Some(error) = result.error
         && !error.trim().is_empty()
     {
-        parts.push(format!("Error: {}", error));
+        parts.push(format!("Failure reason: {}", error));
+    }
+    if let Some(progress) = result.progress
+        && !progress.trim().is_empty()
+    {
+        parts.push(format!("Last known progress: {}", progress));
     }
     if !result.output.trim().is_empty() {
-        parts.push(result.output.trim().to_string());
+        if result.status == "completed" {
+            parts.push(result.output.trim().to_string());
+        } else {
+            parts.push(format!("Partial output:\n{}", result.output.trim()));
+        }
     } else {
         parts.push("(subagent did not produce any final assistant text)".to_string());
     }
@@ -2344,7 +2696,14 @@ fn format_task_result_with_id(
     entry: &AsyncTaskEntry,
     result: StoredTaskResult,
 ) -> String {
-    format!("[task_id={task_id}]\n{}", format_task_result(entry, result))
+    let retryable = is_retryable_task_status(&result.status);
+    let mut rendered = format!("[task_id={task_id}]\n{}", format_task_result(entry, result));
+    if retryable {
+        rendered.push_str(&format!(
+            "\nRetry available: call `task_retry` with `task_id=\"{task_id}\"` to rerun the same subagent configuration as a new linked attempt."
+        ));
+    }
+    rendered
 }
 
 fn persist_rendered_task_evidence(
@@ -2371,6 +2730,26 @@ fn persist_rendered_task_evidence(
     .map_err(|error| format!("failed to persist task evidence for {task_id}: {error}"))
 }
 
+fn collect_missing_task_result(task_id: &str, entry: &AsyncTaskEntry) -> Result<String, String> {
+    let result = StoredTaskResult {
+        status: "failed".to_string(),
+        output: String::new(),
+        error: Some(format!(
+            "Subagent process pid={} terminated without publishing any output.",
+            entry.pid
+        )),
+        progress: current_task_progress(task_id),
+    };
+    let rendered = format_task_result_with_id(task_id, entry, result.clone());
+    persist_rendered_task_evidence(task_id, entry, &result.status, &rendered)?;
+    mark_task_retry_status(task_id, &result.status);
+    TASK_PROGRESS_REGISTRY
+        .lock()
+        .unwrap()
+        .take(&task_id.to_string());
+    Ok(rendered)
+}
+
 fn collect_ready_task_result(
     os: &mut dyn Kernel,
     task_id: &str,
@@ -2387,6 +2766,11 @@ fn collect_ready_task_result(
             "task result for {task_id} disappeared after durable persistence"
         ));
     }
+    mark_task_retry_status(task_id, &result.status);
+    TASK_PROGRESS_REGISTRY
+        .lock()
+        .unwrap()
+        .take(&task_id.to_string());
     Ok(Some(rendered))
 }
 

@@ -27,49 +27,56 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
 7. **Skill runtime isolation.** Skill/agent manifests determine visible tools,
    MCP allowlists, prompt overlays, and inheritance. Keep default visibility and
    explicit name pinning aligned with `tools/registry/`.
-8. **Subagent lifecycle.** Scope tasks by session and owner pid. Persist delivered
-   results before IPC cleanup, keep delivery distinct from integration, and restore
-   unintegrated evidence after context rebuild. Preserve isolated-memory artifacts
-   when permanent-memory merge fails.
-9. **Depth guard.** Only the top-level agent may delegate to a child subagent;
-   child subagents must work directly when orchestration tools are hidden.
-10. **Code-grounding reads stay serial.** Do not batch `read_file` calls in the
+8. **Subagent lifecycle.** Scope tasks by session and owner pid. Persist
+   delivered results before IPC cleanup, keep delivery distinct from
+   integration, restore unintegrated evidence after context rebuild, and
+   preserve isolated-memory artifacts when permanent-memory merge fails.
+   **Depth guard:** only the top-level agent may delegate to a child; child
+   subagents must work directly when orchestration tools are hidden.
+9. **Code-grounding reads stay serial.** Do not batch `read_file` calls in the
     driver path / system prompt; use each result to refine the next lookup.
-11. **Model-visible tool results have a hard cap.** Store oversized output in a
+10. **Model-visible tool results have a hard cap.** Store oversized output in a
     session overflow file with a bounded, self-describing stub; apply the same cap
     when rebuilding context without mutating history.
-12. **Progress truth comes from the raw current tool round.** Sample current-round
+11. **Progress truth comes from the raw current tool round.** Sample current-round
     mutation/progress from the pre-compression tool-call snapshot, not only from
     compressed `messages`.
-13. **Runtime environment is prompt context.** The base system prompt must include
+12. **Runtime environment is prompt context.** The base system prompt must include
     the current OS, architecture, and shell so generated commands target the actual
     execution platform.
-14. **Foreground owns the terminal.** Background subagents must not write live
+13. **Foreground owns the terminal.** Background subagents must not write live
     model/thinking/tool/ANSI output to stdout/stderr; they publish results through
-    task IPC for `task_wait` / `task_status` to aggregate. The driver may expose
-    one compact foreground-owned status line, refreshed only at scheduler safe
-    points.
-15. **Interactive skill handoffs are explicit and one-shot.** Preserve an active
+    task IPC for `task_wait` / `task_status`. The driver may expose one compact
+    foreground-owned status line, refreshed only at scheduler safe points.
+14. **Interactive skill handoffs are explicit and one-shot.** Preserve an active
     skill across turns only after its `request_user_input` control tool succeeds;
     consume that continuation on the next normal turn, let an explicit skill pin
     override it, and never infer it from response wording or question marks.
-16. **Persist the actual response model.** Automatic request fallback does not
+15. **Persist the actual response model.** Automatic request fallback does not
     rewrite `app.current_model`; model-dependent projection and canonical-history
     provenance use the model that actually produced each response.
-17. **Target-scoped instructions precede mutation.** Load applicable rules
-    root-to-deep before the first write, reject paths outside the project root,
-    and keep preflight grace separate from normal tool and kernel quotas.
-18. **Reasoning control is separate from the answer.** A reasoning controller must
+16. **Target-scoped instructions precede mutation.** Load applicable rules
+    root-to-deep before the first write, prioritize a paused mutation over
+    previously observed targets, reject paths outside the project root, and keep
+    preflight grace separate from normal tool and kernel quotas.
+17. **Reasoning control is separate from the answer.** A reasoning controller must
     use a parsed control channel before it can influence the user-facing prompt.
-19. **Redirect notes never quote user content.** Keep redirect text fixed and
+18. **Redirect notes never quote user content.** Keep redirect text fixed and
     runtime-owned; retain the exact input only in its user-role message.
-20. **Completion claims require evidence.** Recheck unsupported post-mutation
+19. **Completion claims require evidence.** Recheck unsupported post-mutation
     completion claims once; otherwise persist and display an explicit warning.
-21. **Scheduler blocking is event-driven.** Foreground waits, background-task
+20. **Scheduler blocking is event-driven.** Foreground waits, background-task
     completion, shutdown, and wall-clock deadlines wake the driver through the
     scheduler notifier; never restore fixed-interval polling sleeps in the main loop.
-22. **Dangling finals get one synthesis grace.** After post-mutation evidence
-    requirements are handled, a tool-backed final that only promises another
-    read/check is not completion: retry once with tools disabled, without resetting
-    iteration or tool accounting. Never replace a required verification round with
-    no-tool synthesis; if the retry still does not conclude, warn and stop.
+21. **Incomplete finals get one synthesis grace.** A tool-backed final that only
+    promises another read/check is not completion: retry once with tools disabled
+    (no reset of iteration/tool accounting). If a no-tool synthesis still emits a
+    tool call, reject and retry synthesis once before warning and stopping. Never
+    replace a required verification round with no-tool synthesis.
+22. **Tool-round narration stays internal.** Assistant text emitted alongside
+    tool calls or rejected candidate finals remains model/history context but is
+    not rendered in the terminal; render only the turn-final assistant response.
+23. **Model-guided offloading is request-boundary work.** Before every logical
+    model request, apply eligible prune marks to the transient `messages`
+    projection before normal context budgeting, archive full tool output before
+    replacing it with a recall stub, and never mutate canonical `turn_messages`.

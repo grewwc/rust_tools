@@ -28,10 +28,9 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
 6. **Temp files.** `write_file(temp=true)` uses `runtime_ctx::temp_dir()` and the
    session temp registry. Delete project/source/config files via `apply_patch`
    with an explicit `*** Delete File:` section. Paths already registered in the
-   session temp registry (e.g. a temp file created by a subagent in an isolated
-   temp dir) are writable by `write_file`/`apply_patch` even when they fall
-   outside `effective_cwd`/allowed roots — the registry is the authoritative
-   same-session temp allowlist.
+   session temp registry (e.g. a subagent's isolated temp dir) are writable by
+   `write_file`/`apply_patch` even outside `effective_cwd`/allowed roots — the
+   registry is the authoritative same-session temp allowlist.
 7. **Process groups.** `execute_command` runs in its own process group. Keep
    background pgids in the in-memory session registry and kill by process group at
    teardown; do not persist pgids across restarts.
@@ -41,15 +40,25 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
 9. **Patch/read/search contracts.** `apply_patch` anchors on removed text,
    normalizes supported typographic confusables, and rejects ambiguous matches.
    Unified diffs are single-file; multi-file edits and deletion use an explicit
-   envelope; a `*** Replace in line:` section is the low-friction path for a
-   single-line substring edit. Context-mismatch / ambiguous / out-of-order errors
-   each echo the current text as a prefix-free, paste-ready block (`<<<PATCH_TEXT`
-   ... `PATCH_TEXT>>>`) so the model can rebuild without re-reading. Only an
-   ambiguous match trips the stale-patch guard (context mismatch repairable
-   directly, out-of-order is a hunk-ordering problem); classify the diagnostic
-   before the block so source text cannot mimic an error, and for multi-file
-   patches block only the failed target. `read_file` paginates by line and
-   character cap; text search stays in dedicated search tools.
+   envelope; `*** Replace in line:` is the low-friction single-line substring
+   edit. Context-mismatch / ambiguous / out-of-order errors echo current text as
+   a prefix-free, paste-ready block (`<<<PATCH_TEXT` ... `PATCH_TEXT>>>`) so the
+   model can rebuild without re-reading; classify the diagnostic before the
+   block (so source text cannot mimic an error), and for multi-file patches
+   block only the failed target. Only an ambiguous match trips the stale-patch
+   guard (context mismatch repairable directly; out-of-order is a hunk-ordering
+   problem). `patch` and `patch_file` are optional, mutually exclusive sources:
+   missing, `null`, or empty-string values mean absent; exactly one non-empty
+   string must remain after normalization, while non-string values are rejected.
+   Validation is intrinsic to normal execution; do not expose a model-facing
+   `dry_run` switch. The executor may honor legacy `dry_run: true` calls only to
+   prevent historical no-write requests from silently becoming real writes.
+   `read_file` paginates by line/char cap; text search stays in dedicated search
+   tools. Large patches: inline `patch` hard-capped at 8K chars
+   (split into multiple calls, or pass `patch_file` = a session temp file via
+   `write_file(temp=true)` or a file under `effective_cwd`; `patch_file` has its
+   own 64K safety cap, so it is the path for large patches); `@@ -0` normalizes
+   to insert-at-start (line 1).
 10. **Subagent tools are top-level only.** Hide and reject the `task` family when
     `SUBAGENT_DEPTH > 0`; `enable_tools` must not restore it. Scope tasks by
     session + owner pid, persist results before IPC cleanup, and require
@@ -66,3 +75,14 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
     blocking pagers, editors, prompts, and color; explicit PTY runs preserve
     interactive terminal behavior. Analyze mutating commands before execution
     and automatically load scoped instructions for inferred project targets.
+14. **Mutation log is best-effort and session-scoped.** `FileStore::write_all`
+    and `apply_patch` delete/rollback paths append a JSONL entry to
+    `<session_assets>/mutation_log.jsonl` (before/after capped, op, seq); it
+    never affects the real write (failures silently dropped). Skip every path
+    under the sessions root (assets, subagent scratch `subagent-cwd-*` siblings,
+    checkpoints) - session runtime artifacts, not project changes; skipping the
+    whole root keeps parallel subagent writes out of view. Appends are
+    serialized by a process-global lock (main agent + parallel subagents share
+    one log). `/audit` reads this log (via `current_session_assets_dir()`, needs
+    `DRIVER_CTX`) to show the main agent's own changes without concurrent work
+    contaminating the view; falls back to `git diff` only when the log is empty.

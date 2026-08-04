@@ -13,6 +13,7 @@ use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::common::ToolStreamWriter;
 use crate::ai::tools::common::ToolStreamingRegistration;
 use crate::ai::tools::storage::file_store::FileStore;
+use crate::ai::tools::storage::temp_registry;
 
 fn params_apply_patch() -> Value {
     serde_json::json!({
@@ -24,21 +25,20 @@ fn params_apply_patch() -> Value {
             },
             "patch": {
                 "type": "string",
-                "description": "The edit to apply. Prefer the smallest format that fits:\n\n(A) One substring on one uniquely identifiable line:\n```\n*** Begin Patch\n*** Replace in line: <absolute/path>\nanchor: <substring that uniquely identifies the target line>\nold: <exact substring on that line to replace>\nnew: <replacement substring>\n*** End Patch\n```\n\n(B) Larger edits, multiple files, additions, or deletions:\n```\n*** Begin Patch\n*** Update File: <absolute/path>\n@@\n <unchanged context line>\n-<line to remove>\n+<line to add>\n <unchanged context line>\n*** End Patch\n```\nUse `*** Add File: <path>` with `+`-prefixed content and `*** Delete File: <path>` with no body. Repeat sections for multiple files.\n\n(C) Plain one-file unified diff: pass `file_path`, or include `---` / `+++` headers. It cannot delete files.\n\nCopy file text exactly, but omit `read_file`'s `<number>\\t` prefix. Context and removed lines must match the current file, including indentation. Do not use Markdown fences, mix formats, or send a zero-change patch."
+                "description": "The edit to apply. Prefer the smallest format that fits:\n\n(A) One substring on one uniquely identifiable line:\n```\n*** Begin Patch\n*** Replace in line: <absolute/path>\nanchor: <substring that uniquely identifies the target line>\nold: <exact substring on that line to replace>\nnew: <replacement substring>\n*** End Patch\n```\n\n(B) Larger edits, multiple files, additions, or deletions:\n```\n*** Begin Patch\n*** Update File: <absolute/path>\n@@\n <unchanged context line>\n-<line to remove>\n+<line to add>\n <unchanged context line>\n*** End Patch\n```\nUse `*** Add File: <path>` with `+`-prefixed content and `*** Delete File: <path>` with no body. Repeat sections for multiple files.\n\n(C) Plain one-file unified diff: pass `file_path`, or include `---` / `+++` headers. It cannot delete files.\n\nCopy file text exactly, but omit `read_file`'s `<number>\\t` prefix. Context and removed lines must match the current file, including indentation. Do not use Markdown fences, mix formats, or send a zero-change patch.\n\nSize guidance: patches larger than ~4KB are likely to be truncated by the context manager before reaching this tool; split them into multiple apply_patch calls (each with a few hunks) or write the patch to a temp file and pass `patch_file`. Batch multiple hunks in one call only when each hunk has uniquely identifiable context; for structurally similar blocks (e.g. repeated closures), apply one patch per block."
             },
-            "dry_run": {
-                "type": "boolean",
-                "description": "When true, parse, sandbox-check, and match every patch section without writing any file. Defaults to false."
+            "patch_file": {
+                "type": "string",
+                "description": "Optional absolute path to a file containing the patch text (alternative to `patch`). Use for large patches: write the patch to a temp file with write_file(temp=true) (which registers it in the session temp registry), then pass its path here so the tool-call payload stays small. The file must be a session temp file or inside the current working directory. Pass either `patch` or `patch_file`, not both."
             }
-        },
-        "required": ["patch"]
+        }
     })
 }
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply localized file edits. For one substring on one line, use `*** Replace in line:`. For larger or multi-file changes, use a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, or `*** Delete File:` sections. A plain unified diff is accepted only for one file and then needs `file_path` or a diff header. Copy source text exactly, without `read_file` line-number prefixes. Use `dry_run` to validate without writing; on failure, rebuild from the current text echoed in the error.",
+        description: "Apply localized file edits. For one substring on one line, use `*** Replace in line:`. For larger or multi-file changes, use a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, or `*** Delete File:` sections. A plain unified diff is accepted only for one file and then needs `file_path` or a diff header. Copy source text exactly, without `read_file` line-number prefixes. On failure, rebuild from the current text echoed in the error. For large patches, write the patch to a temp file (write_file(temp=true)) and pass its path as `patch_file` instead of the inline `patch` text.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -137,13 +137,16 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
         // `@@ <上下文标题> @@` 作为 hunk 分隔符，不带 `-N,M +N,M` 行号。仅当
         // header 形如 `-N` 时解析标称行号；否则 old_start=0，交给 locate_hunk
         // 的全文件搜索唯一定位，避免对规范信封格式报 "invalid hunk header"。
+        // 模型常把"插入到文件开头"错写成 `@@ -0,0 +1,3 @@`：git 语义中 -0 即
+        // "第 1 行之前插入"，因此归一化为 old_start=1，而不是当作无标称行号走
+        // 全文件搜索，导致后续报出误导性的 "declared line 0"。
         let old_start = match rest.strip_prefix('-') {
             Some(after) => after
                 .split_whitespace()
                 .next()
                 .and_then(|part| part.split(',').next())
                 .and_then(|num| num.parse::<isize>().ok())
-                .map(|n| if n <= 0 { 0 } else { n as usize })
+                .map(|n| if n <= 0 { 1 } else { n as usize })
                 .unwrap_or(0),
             None => 0,
         };
@@ -1031,6 +1034,13 @@ fn describe_ambiguous_hunk(orig_lines: &[String], positions: &[usize]) -> String
             msg.push_str(&format!("  line {}: {:?}\n", pos + 1, line));
         }
     }
+    msg.push_str(
+        "Hint: the first line at each candidate is shown above; add more unique surrounding \
+         context (e.g. the preceding function signature or comment) around the intended \
+         location. For a single-line change, `*** Replace in line:` (anchor/old/new) is the \
+         most reliable. If the candidates are structurally similar blocks (e.g. repeated \
+         closures), apply one patch per block instead of one multi-hunk patch.\n",
+    );
     msg
 }
 
@@ -1488,10 +1498,17 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
     let mut msg = String::from(
         "context mismatch: patch hunk could not be located. Rebuild the patch from the current file text shown below (re-read the file only if the shown context is not enough).\n",
     );
-    msg.push_str(&format!(
-        "Hunk header declared @@ -{} (1-based line {}).\n",
-        hunk.old_start, hunk.old_start
-    ));
+    if hunk.old_start == 0 {
+        msg.push_str(
+            "Hunk header declared no line number (bare `@@`); the hunk is located by full-file \
+             context search.\n",
+        );
+    } else {
+        msg.push_str(&format!(
+            "Hunk header declared @@ -{} (1-based line {}).\n",
+            hunk.old_start, hunk.old_start
+        ));
+    }
 
     // 先尝试 best-effort 部分匹配，精确定位不一致的行。大块替换中最常见的失败是
     // 整块只有个别行复刻不准，部分匹配能告诉模型"第 X 行期望 A 但实际是 B"。
@@ -1847,7 +1864,7 @@ fn format_patch_success(writes: &[PreparedPatchWrite]) -> String {
     message
 }
 
-fn format_patch_dry_run(writes: &[PreparedPatchWrite]) -> String {
+fn format_legacy_patch_dry_run(writes: &[PreparedPatchWrite]) -> String {
     if writes.len() == 1 {
         let (added, removed, total) = diff_stats_for_write(&writes[0]);
         return format!(
@@ -1869,7 +1886,9 @@ fn format_patch_dry_run(writes: &[PreparedPatchWrite]) -> String {
     message
 }
 
-fn dry_run_arg(args: &Value) -> Result<bool, String> {
+/// 仅兼容旧会话/历史回放。`dry_run` 不再暴露给模型，但不能直接忽略旧参数，
+/// 否则旧的 `dry_run: true` 调用会从“只校验”静默变成真实写入。
+fn legacy_dry_run_arg(args: &Value) -> Result<bool, String> {
     match args.get("dry_run") {
         None | Some(Value::Null) => Ok(false),
         Some(Value::Bool(value)) => Ok(*value),
@@ -2044,8 +2063,17 @@ fn apply_prepared_patch_write(write: &PreparedPatchWrite) -> Result<(), String> 
         PreparedPatchAction::Write(next) => FileStore::new(write.path.clone())
             .write_all(next)
             .map_err(|err| err.to_string()),
-        PreparedPatchAction::Delete => fs::remove_file(&write.path)
-            .map_err(|err| format!("Failed to delete {}: {err}", write.path.display())),
+        PreparedPatchAction::Delete => {
+            fs::remove_file(&write.path)
+                .map_err(|err| format!("Failed to delete {}: {err}", write.path.display()))?;
+            let _ = crate::ai::tools::storage::mutation_log::record(
+                &write.path,
+                "delete",
+                write.before.as_deref(),
+                None,
+            );
+            Ok(())
+        }
     }
 }
 
@@ -2055,7 +2083,20 @@ fn restore_prepared_patch_write(write: &PreparedPatchWrite) -> Result<(), String
             .write_all(content)
             .map_err(|err| format!("failed to restore {}: {err}", write.path.display())),
         None => match fs::remove_file(&write.path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // 回滚删除（文件是本批次新建的）：记录被删内容，使审计轨迹完整。
+                let deleted = match &write.action {
+                    PreparedPatchAction::Write(c) => Some(c.as_str()),
+                    PreparedPatchAction::Delete => None,
+                };
+                let _ = crate::ai::tools::storage::mutation_log::record(
+                    &write.path,
+                    "delete",
+                    deleted,
+                    None,
+                );
+                Ok(())
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(format!(
                 "failed to remove {} during rollback: {err}",
@@ -2094,24 +2135,102 @@ fn commit_patch_writes(writes: &[PreparedPatchWrite]) -> Result<(), String> {
     Ok(())
 }
 
+fn optional_patch_source_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        // 部分 provider / tool bridge 会把 schema 中的可选字段物化为 null 或空串。
+        // 对互斥来源参数而言它们都表示“未提供”，不能在另一个来源有效时误报错误。
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(format!(
+            "{key} parameter has wrong type ({}): expected a string{}.",
+            value_type_name(other),
+            if key == "patch_file" {
+                " path to a file containing the patch text"
+            } else {
+                " containing the patch text"
+            }
+        )),
+    }
+}
+
 fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<String, String> {
-    let dry_run = dry_run_arg(args)?;
-    let raw_patch = args["patch"].as_str().ok_or_else(|| {
-        let actual = match args.get("patch") {
-            None => "missing".to_string(),
-            Some(Value::String(_)) => "string (should not happen)".to_string(),
-            Some(Value::Object(_)) => "object".to_string(),
-            Some(Value::Array(_)) => "array".to_string(),
-            Some(Value::Number(_)) => "number".to_string(),
-            Some(Value::Bool(_)) => "boolean".to_string(),
-            Some(Value::Null) => "null".to_string(),
-        };
-        format!(
-            "patch parameter has wrong type ({actual}): expected a string. \
-             Pass the patch text as a string value, not a JSON object or array."
-        )
-    })?;
-    let patch = strip_code_fence(raw_patch);
+    let legacy_dry_run = legacy_dry_run_arg(args)?;
+    let inline_patch = optional_patch_source_arg(args, "patch")?;
+    let patch_file = optional_patch_source_arg(args, "patch_file")?;
+    let (raw_patch, from_file) = match (inline_patch, patch_file) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "pass either `patch` (inline edit text) or `patch_file` (path to a file with the \
+                 patch text), not both"
+                    .to_string(),
+            );
+        }
+        (Some(p), None) => (p, false),
+        (None, Some(pf)) => {
+            let store = FileStore::new(PathBuf::from(&pf));
+            let resolved = store.path();
+            // patch_file 的合同：必须是会话临时文件（write_file(temp=true) 写入并登记
+            // 在 temp registry）或 effective_cwd 下的文件；两者之外明确拒绝，避免模型
+            // 指向任意系统文件造成困惑。
+            let in_cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+                .map(|cwd| resolved.starts_with(&cwd))
+                .unwrap_or(false);
+            if !temp_registry::is_registered(&resolved.to_string_lossy()) && !in_cwd {
+                return Err(format!(
+                    "patch_file '{}' is not an allowed patch source: write the patch to a temp \
+                     file with write_file(temp=true) and pass its path here, or use a file under \
+                     the current working directory.",
+                    resolved.display()
+                ));
+            }
+            emit(&format!("reading patch from {}", resolved.display()));
+            let content = store.read_to_string().map_err(|err| {
+                format!("patch_file '{}' could not be read: {err}", resolved.display())
+            })?;
+            (content, true)
+        }
+        (None, None) => {
+            return Err(
+                "patch parameter is missing or empty: provide `patch` (inline edit text) or \
+                 `patch_file` (path to a temp file containing the patch text, written with \
+                 write_file(temp=true)). If you sent a large patch, it may have been truncated \
+                 by the context manager before reaching this tool - retry with a smaller patch \
+                 (split into multiple apply_patch calls), or write the patch to a temp file and \
+                 pass `patch_file` instead. For a small change, `*** Replace in line:` is the \
+                 most reliable format."
+                    .to_string(),
+            );
+        }
+    };
+    let patch = strip_code_fence(&raw_patch);
+    if from_file {
+        // patch_file 的目的就是承载大补丁（内联 patch 会被上下文管理器截断），因此不受
+        // 8K 内联限制；只设一个宽松的安全上限，防止模型误读超大文件。
+        const MAX_PATCH_FILE_CHARS: usize = 64_000;
+        if patch.chars().count() > MAX_PATCH_FILE_CHARS {
+            return Err(format!(
+                "patch_file too large ({} chars; limit 64000). Split the patch into multiple \
+                 smaller patch files and apply them sequentially, or use write_file for a \
+                 full-file rewrite.",
+                patch.chars().count()
+            ));
+        }
+    } else {
+        // 内联 patch 过大时大概率在上下文管理器处被截断（表现为 patch 缺失/残缺，或
+        // 误导性的 context mismatch）。直接报错并给出拆分路径，胜过把残缺文本喂给解析器。
+        const MAX_INLINE_PATCH_CHARS: usize = 8_000;
+        if patch.chars().count() > MAX_INLINE_PATCH_CHARS {
+            return Err(format!(
+                "patch too large ({} chars; limit 8000). Large patches are likely to be truncated \
+                 by the context manager mid-flight. Split the edit into multiple smaller \
+                 apply_patch calls (a few hunks each), write the patch to a temp file with \
+                 write_file(temp=true) and pass its path as `patch_file`, or use write_file for a \
+                 full-file rewrite.",
+                patch.chars().count()
+            ));
+        }
+    }
     emit("parsing patch envelope");
     let initial_file_path = optional_file_path_arg(args);
     if let Some(envelopes) = parse_patch_envelopes(&patch)? {
@@ -2184,8 +2303,8 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
             }
         }
         ensure_patch_writes_change(&writes)?;
-        if dry_run {
-            let success = format_patch_dry_run(&writes);
+        if legacy_dry_run {
+            let success = format_legacy_patch_dry_run(&writes);
             emit(&success);
             return Ok(success);
         }
@@ -2267,8 +2386,8 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         action: PreparedPatchAction::Write(next),
     };
     ensure_patch_writes_change(std::slice::from_ref(&write))?;
-    if dry_run {
-        let success = format_patch_dry_run(&[write]);
+    if legacy_dry_run {
+        let success = format_legacy_patch_dry_run(&[write]);
         emit(&success);
         return Ok(success);
     }
@@ -2297,8 +2416,8 @@ mod tests {
     use super::{
         PatchEnvelopeOp, apply_inline_replace, apply_patch_target_paths_from_patch,
         apply_unified_patch, execute_apply_patch, file_path_from_unified_diff_header,
-        parse_patch_envelope, parse_patch_envelopes, parse_unified_diff_header_target,
-        parse_unified_hunks, strip_code_fence,
+        params_apply_patch, parse_patch_envelope, parse_patch_envelopes,
+        parse_unified_diff_header_target, parse_unified_hunks, strip_code_fence,
     };
     use crate::ai::test_support::ENV_LOCK;
     use std::{fs, path::PathBuf};
@@ -2311,6 +2430,12 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         path
+    }
+
+    #[test]
+    fn apply_patch_schema_does_not_expose_legacy_dry_run() {
+        let schema = params_apply_patch();
+        assert!(schema["properties"].get("dry_run").is_none());
     }
 
     /// 离线回放：用真实会话（history.json）里模型实际发出的 apply_patch 输入，
@@ -2566,6 +2691,153 @@ mod tests {
         );
         assert!(err.contains("line 1"), "err was: {err}");
         assert!(err.contains("line 3"), "err was: {err}");
+    }
+
+    /// 模型错写 `@@ -0,0 +1,3 @@`（插入到文件开头）时应归一化为 old_start=1，
+    /// 而不是当作"无标称行号"（old_start=0）导致 context mismatch 报 "declared line 0"。
+    #[test]
+    fn parse_unified_hunks_normalizes_zero_declared_line_to_one() {
+        let patch = "@@ -0,0 +1,3 @@\n+aaa\n+bbb\n+ccc\n";
+        let hunks = parse_unified_hunks(patch).expect("@@ -0 should parse");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_start, 1);
+        // 且能直接应用到空文件顶部。
+        let result = apply_unified_patch("", patch).expect("insert at top should apply");
+        assert_eq!(result, "aaa\nbbb\nccc");
+    }
+
+    /// `@@ -0` 插入到已有文件顶部时也应正常。
+    #[test]
+    fn apply_unified_patch_inserts_at_top_with_zero_declared_line() {
+        let original = "first\nsecond\n";
+        let patch = "@@ -0,0 +1,2 @@\n+head\n+top\n";
+        let result =
+            apply_unified_patch(original, patch).expect("@@ -0 insert at top should apply");
+        assert_eq!(result, "head\ntop\nfirst\nsecond\n");
+    }
+
+    /// patch 缺失时给出截断提示和 patch_file 替代路径。
+    #[test]
+    fn apply_patch_missing_patch_error_hints_truncation_and_patch_file() {
+        let args = serde_json::json!({});
+        let err = execute_apply_patch(&args).unwrap_err();
+        assert!(err.contains("patch parameter is missing"), "err was: {err}");
+        assert!(err.contains("patch_file"), "err was: {err}");
+        assert!(err.contains("truncated"), "err was: {err}");
+    }
+
+    /// 超大内联 patch 直接报错并引导拆分，而不是带病解析。
+    #[test]
+    fn apply_patch_rejects_oversized_inline_patch() {
+        let huge = format!("@@ -1,1 +1,1 @@\n-a\n+{}", "x".repeat(9_000));
+        let args = serde_json::json!({ "patch": huge });
+        let err = execute_apply_patch(&args).unwrap_err();
+        assert!(err.contains("patch too large"), "err was: {err}");
+        assert!(err.contains("patch_file"), "err was: {err}");
+    }
+
+    /// patch_file 承载大补丁（>8K 内联上限）时应成功：内联限制只针对内联 patch，
+    /// 否则审计指出的"推荐降级路径实际不可用"自相矛盾无法消除。
+    #[test]
+    fn apply_patch_large_patch_file_above_inline_limit_applies() {
+        let temp = make_temp_path("patch_file_large");
+        std::fs::create_dir_all(&temp).unwrap();
+        let patch_path = temp.join("large.patch");
+        let huge = format!("@@ -1,1 +1,1 @@\n-a\n+{}", "y".repeat(9_000));
+        std::fs::write(&patch_path, &huge).unwrap();
+        let target = temp.join("target.txt");
+        std::fs::write(&target, "a\n").unwrap();
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(temp.clone(), || {
+            let args = serde_json::json!({
+                "patch_file": patch_path.to_string_lossy(),
+                "file_path": target.to_string_lossy(),
+            });
+            execute_apply_patch(&args)
+        });
+        let out = result.expect("large patch_file should apply");
+        assert!(out.contains("+1 -1"), "out was: {out}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            format!("{}\n", "y".repeat(9_000))
+        );
+    }
+
+    /// tool bridge 物化出的空 patch_file 是“未提供”，不能阻断有效的内联补丁。
+    #[test]
+    fn apply_patch_inline_accepts_empty_patch_file_placeholder() {
+        let temp = make_temp_path("empty_patch_file_placeholder");
+        std::fs::create_dir_all(&temp).unwrap();
+        let target = temp.join("target.txt");
+        std::fs::write(&target, "old\n").unwrap();
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(temp.clone(), || {
+            let args = serde_json::json!({
+                "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
+                "patch_file": "",
+                "file_path": target.to_string_lossy(),
+            });
+            execute_apply_patch(&args)
+        });
+        result.expect("empty patch_file placeholder should be absent");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    }
+
+    /// 两个来源都为空时仍应明确报缺少补丁，而不是尝试执行空内容。
+    #[test]
+    fn apply_patch_empty_source_placeholders_report_missing_patch() {
+        let args = serde_json::json!({ "patch": "", "patch_file": null });
+        let err = execute_apply_patch(&args).unwrap_err();
+        assert!(err.contains("missing or empty"), "err was: {err}");
+    }
+
+    /// patch_file 超过宽松安全上限（64K）时明确拒绝并引导拆分。
+    #[test]
+    fn apply_patch_rejects_oversized_patch_file() {
+        let temp = make_temp_path("patch_file_huge");
+        std::fs::create_dir_all(&temp).unwrap();
+        let patch_path = temp.join("huge.patch");
+        let huge = format!("@@ -1,1 +1,1 @@\n-a\n+{}", "z".repeat(70_000));
+        std::fs::write(&patch_path, &huge).unwrap();
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(temp.clone(), || {
+            let args = serde_json::json!({ "patch_file": patch_path.to_string_lossy() });
+            execute_apply_patch(&args)
+        });
+        let err = result.unwrap_err();
+        assert!(err.contains("patch_file too large"), "err was: {err}");
+    }
+
+    /// patch_file 从 effective_cwd（sync_scope）下的文件读取补丁并应用。
+    #[test]
+    fn apply_patch_reads_patch_from_patch_file_under_cwd() {
+        let temp = make_temp_path("patch_file_cwd");
+        std::fs::create_dir_all(&temp).unwrap();
+        let patch_path = temp.join("edit.patch");
+        std::fs::write(&patch_path, "@@ -1,1 +1,1 @@\n-foo\n+bar\n").unwrap();
+        let target = temp.join("target.txt");
+        std::fs::write(&target, "foo\n").unwrap();
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(temp.clone(), || {
+            let args = serde_json::json!({
+                "patch": "",
+                "patch_file": patch_path.to_string_lossy(),
+                "file_path": target.to_string_lossy(),
+            });
+            execute_apply_patch(&args)
+        });
+        let out = result.expect("patch_file should apply");
+        assert!(out.contains("+1 -1"), "out was: {out}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "bar\n");
+    }
+
+    /// patch_file 指向 cwd 之外且未登记在 temp registry 的路径必须被明确拒绝。
+    #[test]
+    fn apply_patch_rejects_patch_file_outside_cwd_and_registry() {
+        let outside = std::env::temp_dir().join(format!(
+            "ai_patch_outside_{}.patch",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&outside, "@@ -1,1 +1,1 @@\n-foo\n+bar\n").unwrap();
+        let args = serde_json::json!({ "patch_file": outside.to_string_lossy() });
+        let err = execute_apply_patch(&args).unwrap_err();
+        assert!(err.contains("not an allowed patch source"), "err was: {err}");
     }
 
     /// context mismatch 且文件里完全找不到部分匹配时（no-partial-match 分支），
@@ -4045,7 +4317,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_apply_patch_dry_run_validates_without_writing() {
+    fn execute_apply_patch_legacy_dry_run_remains_non_mutating() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let path = make_temp_path("dry_run");
         let base = path.parent().unwrap().to_path_buf();
@@ -4058,7 +4330,7 @@ mod tests {
                 "patch": "@@\n-before\n+after\n",
                 "dry_run": true,
             }))
-            .expect("dry run should validate a matching patch")
+            .expect("legacy dry run should remain safe for old calls")
         });
 
         assert!(result.starts_with("Dry run succeeded; no files changed:"));

@@ -37,19 +37,29 @@ pub(super) fn resolve_reasoning_wire_controls<'a>(
     let thinking_dialect = thinking_dialect_for(adapter_kind, &request_model, &endpoint);
     // `enable_search` 的用户请求在 builder 里传入；此处仅关心 reasoning/thinking 三元组，
     // 所以传入 `None` 占位——我们并不依赖这里返回的 enable_search。
-    let (_, top_level_reasoning_effort, nested_reasoning) =
-        if adapter_kind == ApiProvider::Compatible {
-            // compatible provider 按 endpoint 分流：DashScope 走 DashScope 形状，
-            // 其他纯 OpenAI 兼容端点（如内部 modelhub）走 OpenAI 形状。
-            // 不能直接用 adapter.reasoning_*() 默认值，因为 trait 单例看不到 endpoint。
-            compatible_wire_shapes(endpoint, None, reasoning_effort)
-        } else {
-            (
+    let (_, top_level_reasoning_effort, nested_reasoning) = if let Some(wire) =
+        models::reasoning_effort_wire(model)
+    {
+        match wire {
+            crate::ai::model_names::ReasoningEffortWire::TopLevel => (None, reasoning_effort, None),
+            crate::ai::model_names::ReasoningEffortWire::Nested => (
                 None,
-                adapter.reasoning_top_level(reasoning_effort),
-                adapter.reasoning_nested(reasoning_effort),
-            )
-        };
+                None,
+                reasoning_effort.map(|effort| json!({ "effort": effort })),
+            ),
+        }
+    } else if adapter_kind == ApiProvider::Compatible {
+        // compatible provider 按 endpoint 分流：DashScope 走 DashScope 形状，
+        // 其他纯 OpenAI 兼容端点（如内部 modelhub）走 OpenAI 形状。
+        // 不能直接用 adapter.reasoning_*() 默认值，因为 trait 单例看不到 endpoint。
+        compatible_wire_shapes(endpoint, None, reasoning_effort)
+    } else {
+        (
+            None,
+            adapter.reasoning_top_level(reasoning_effort),
+            adapter.reasoning_nested(reasoning_effort),
+        )
+    };
     let thinking = thinking_dialect.fields(enable_thinking, top_level_reasoning_effort);
     (thinking, top_level_reasoning_effort, nested_reasoning)
 }
@@ -140,7 +150,7 @@ fn prompt_cache_config_enabled() -> bool {
     configw::get_all_config()
         .get(
             crate::ai::config_schema::AiConfig::PROMPT_CACHE_ENABLE,
-            "true",
+            "false",
         )
         .trim()
         .eq_ignore_ascii_case("true")

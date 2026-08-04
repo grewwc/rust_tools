@@ -116,7 +116,7 @@ const NOTE_SEARCH_USAGE: &str =
     "search knowledge base (memo category) and answer using positional prompt";
 const GENERATE_COMPLETIONS_USAGE: &str =
     "generate shell completion script (bash/zsh/fish) and exit";
-const REASONING_EFFORT_USAGE: &str = "reasoning effort: minimal | low | medium | high | xhigh | max | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)";
+const REASONING_EFFORT_USAGE: &str = "reasoning effort: minimal | low | medium | high | xhigh | max | off (clears default; support depends on the selected model)";
 
 fn build_cli_parser() -> TermParser {
     let mut parser = TermParser::new();

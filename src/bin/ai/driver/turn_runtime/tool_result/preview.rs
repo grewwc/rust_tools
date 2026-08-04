@@ -6,15 +6,12 @@ const READ_FILE_TERMINAL_PREVIEW_MAX_CHARS: usize = 2_200;
 const READ_FILE_TERMINAL_PREVIEW_MAX_LINES: usize = 40;
 const READ_FILE_TERMINAL_PREVIEW_HEAD_LINES: usize = 24;
 const READ_FILE_TERMINAL_PREVIEW_TAIL_LINES: usize = 8;
-const WEB_SEARCH_TERMINAL_PREVIEW_MAX_CHARS: usize = 1_800;
-const WEB_SEARCH_TERMINAL_PREVIEW_MAX_LINES: usize = 18;
 
 struct ToolTerminalPreviewPolicy {
     max_chars: usize,
     max_lines: usize,
     head_lines: usize,
     tail_lines: usize,
-    summary_first: bool,
 }
 
 fn terminal_preview_policy(tool_name: &str) -> ToolTerminalPreviewPolicy {
@@ -24,21 +21,12 @@ fn terminal_preview_policy(tool_name: &str) -> ToolTerminalPreviewPolicy {
             max_lines: READ_FILE_TERMINAL_PREVIEW_MAX_LINES,
             head_lines: READ_FILE_TERMINAL_PREVIEW_HEAD_LINES,
             tail_lines: READ_FILE_TERMINAL_PREVIEW_TAIL_LINES,
-            summary_first: false,
-        },
-        "web_search" => ToolTerminalPreviewPolicy {
-            max_chars: WEB_SEARCH_TERMINAL_PREVIEW_MAX_CHARS,
-            max_lines: WEB_SEARCH_TERMINAL_PREVIEW_MAX_LINES,
-            head_lines: 12,
-            tail_lines: 0,
-            summary_first: true,
         },
         _ => ToolTerminalPreviewPolicy {
             max_chars: TOOL_TERMINAL_PREVIEW_MAX_CHARS,
             max_lines: TOOL_TERMINAL_PREVIEW_MAX_LINES,
             head_lines: TOOL_TERMINAL_PREVIEW_HEAD_LINES,
             tail_lines: TOOL_TERMINAL_PREVIEW_TAIL_LINES,
-            summary_first: false,
         },
     }
 }
@@ -78,32 +66,6 @@ pub(super) fn build_terminal_preview(tool_name: &str, content: &str) -> String {
     let char_count = content.chars().count();
     if line_count <= policy.max_lines && char_count <= policy.max_chars {
         return content.to_string();
-    }
-
-    if policy.summary_first {
-        let mut preview = String::new();
-        let mut kept = 0usize;
-        for line in content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
-            preview.push_str(line);
-            preview.push('\n');
-            kept += 1;
-            if kept >= policy.head_lines || preview.chars().count() >= policy.max_chars {
-                break;
-            }
-        }
-        if preview.is_empty() {
-            preview = truncate_chars(content, policy.max_chars);
-        }
-        return format!(
-            "{}\n... (summary-first terminal preview; {} lines, {} chars total)",
-            preview.trim_end(),
-            line_count,
-            char_count
-        );
     }
 
     if line_count <= 1 {

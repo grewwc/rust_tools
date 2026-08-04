@@ -365,14 +365,39 @@ pub(super) fn load_scoped_project_instruction_docs_for_targets(
     let Ok(cwd) = crate::ai::driver::runtime_ctx::effective_cwd() else {
         return Vec::new();
     };
-    load_scoped_project_instruction_docs_for_targets_from(&cwd, targets)
+    load_scoped_project_instruction_docs_for_target_priority_from(&cwd, targets, &[])
+}
+
+/// 加载 scoped 指令时，先为当前必须解锁的 mutation 目标分配预算，再用本轮其它已
+/// 观察目标填充剩余预算。安全 preflight 不能与普通历史读取竞争同一个无优先级池，
+/// 否则长 turn 中旧目标会让新 mutation 永远拿不到规则、反复暂停。
+pub(super) fn load_scoped_project_instruction_docs_for_target_priority(
+    required_targets: &[PathBuf],
+    observed_targets: &[PathBuf],
+) -> Vec<ProjectInstructionDoc> {
+    let Ok(cwd) = crate::ai::driver::runtime_ctx::effective_cwd() else {
+        return Vec::new();
+    };
+    load_scoped_project_instruction_docs_for_target_priority_from(
+        &cwd,
+        required_targets,
+        observed_targets,
+    )
 }
 
 fn load_scoped_project_instruction_docs_for_targets_from(
     cwd: &Path,
     targets: &[PathBuf],
 ) -> Vec<ProjectInstructionDoc> {
-    if targets.is_empty() {
+    load_scoped_project_instruction_docs_for_target_priority_from(cwd, targets, &[])
+}
+
+fn load_scoped_project_instruction_docs_for_target_priority_from(
+    cwd: &Path,
+    required_targets: &[PathBuf],
+    observed_targets: &[PathBuf],
+) -> Vec<ProjectInstructionDoc> {
+    if required_targets.is_empty() && observed_targets.is_empty() {
         return Vec::new();
     }
     let base_docs = load_project_instruction_docs_from(cwd);
@@ -385,39 +410,49 @@ fn load_scoped_project_instruction_docs_for_targets_from(
     let canonical_root = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.into());
 
     let mut seen_paths = std::collections::BTreeSet::new();
-    let mut candidates = Vec::new();
-    for target in targets {
-        let absolute = if target.is_absolute() {
-            target.clone()
-        } else {
-            cwd.join(target)
-        };
-        let Some(parent) = absolute.parent() else {
-            continue;
-        };
-        let Ok(target_dir) = fs::canonicalize(parent) else {
-            continue;
-        };
-        if !target_dir.starts_with(&canonical_root) {
-            continue;
-        }
-        for doc in load_project_instruction_candidates_from(&target_dir) {
-            if base_paths.contains(doc.path.as_str()) || !seen_paths.insert(doc.path.clone()) {
+    let mut required_candidates = Vec::new();
+    let mut observed_candidates = Vec::new();
+    for (targets, candidates) in [
+        (required_targets, &mut required_candidates),
+        (observed_targets, &mut observed_candidates),
+    ] {
+        for target in targets {
+            let absolute = if target.is_absolute() {
+                target.clone()
+            } else {
+                cwd.join(target)
+            };
+            let Some(parent) = absolute.parent() else {
+                continue;
+            };
+            let Ok(target_dir) = fs::canonicalize(parent) else {
+                continue;
+            };
+            if !target_dir.starts_with(&canonical_root) {
                 continue;
             }
-            candidates.push(doc);
+            for doc in load_project_instruction_candidates_from(&target_dir) {
+                if base_paths.contains(doc.path.as_str()) || !seen_paths.insert(doc.path.clone()) {
+                    continue;
+                }
+                candidates.push(doc);
+            }
         }
     }
-    // 预算先分配给最深目录，保证最具体的规则不会被上层长文档挤掉；渲染前再
-    // 恢复 root -> deep 顺序，让后出现的具体规则自然覆盖通用规则。
-    candidates.sort_by(|a, b| {
-        instruction_doc_depth(b)
-            .cmp(&instruction_doc_depth(a))
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    // 每个优先级内部先选最具体规则；required 整组始终排在 observed 之前。
+    for candidates in [&mut required_candidates, &mut observed_candidates] {
+        candidates.sort_by(|a, b| {
+            instruction_doc_depth(b)
+                .cmp(&instruction_doc_depth(a))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+    }
     let mut selected = Vec::new();
     let mut used = 0usize;
-    for doc in candidates {
+    for doc in required_candidates
+        .into_iter()
+        .chain(observed_candidates.into_iter())
+    {
         if used >= TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS {
             break;
         }

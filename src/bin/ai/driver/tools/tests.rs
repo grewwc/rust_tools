@@ -27,6 +27,16 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn subagent_tool_phase_includes_file_target_without_rendering() {
+    let args = json!({"file_path": "/repo/src/main.rs"});
+    assert_eq!(
+        super::subagent_tool_phase("read_file", &args),
+        "using read_file · /repo/src/main.rs"
+    );
+    assert_eq!(super::subagent_tool_phase("task_status", &json!({})), "using task_status");
+}
+
+#[test]
 fn execution_signature_canonicalizes_arguments_and_tracks_environment() {
     let first = ToolCall {
         id: "first".to_string(),
@@ -134,11 +144,10 @@ fn parallel_batch_stops_at_mutating_tool() {
 }
 
 #[test]
-fn parallel_batch_excludes_barriering_tools() {
+fn parallel_batch_excludes_non_cacheable_tools() {
     let mcp = McpClient::new();
-    // tree 不可缓存、web_search 会触发 barrier，均必须顺序执行。
+    // tree 不在只读可复用白名单内，必须顺序执行。
     assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("tree")));
-    assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("web_search")));
 }
 
 #[test]

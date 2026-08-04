@@ -5,6 +5,7 @@ use std::{
     fs::{self},
     io::{self, Write},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use chrono::{DateTime, Local, Utc};
@@ -19,13 +20,14 @@ use super::{
         backup_sqlite, read_all_messages_sqlite, read_first_user_prompt_sqlite,
         read_session_list_metadata_sqlite, read_session_title_origin_sqlite,
         read_session_title_sqlite, remap_context_checkpoint_paths_sqlite, with_session_state_lock,
-        write_session_title_sqlite,
+        write_session_title_sqlite, SessionListMetadata,
     },
     types::Message,
 };
 
 const MAX_SESSION_ID_BYTES: usize = 128;
 const SESSIONS_LIFECYCLE_LOCK: &str = ".sessions-lifecycle.lock";
+const SESSION_SIZE_CACHE_FILE: &str = ".sizes-cache.json";
 
 pub(in crate::ai) fn with_sessions_lifecycle_lock<T>(
     sessions_root: &Path,
@@ -185,14 +187,9 @@ impl SessionStore {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
-        let mut sessions: Box<SkipMap<(u64, String), SessionInfo>> =
-            SkipMap::new(16, |a: &(u64, String), b: &(u64, String)| {
-                match b.0.cmp(&a.0) {
-                    std::cmp::Ordering::Equal => a.1.cmp(&b.1) as i32 * -1,
-                    std::cmp::Ordering::Less => 1,
-                    std::cmp::Ordering::Greater => -1,
-                }
-            });
+        // 先在本线程筛选出合法 session（文件名校验 + stat），再把每个库的元数据读取
+        // 分发到并行线程：逐个串行打开几十上百个 sqlite 是 `/ss` 的主要耗时之一。
+        let mut jobs: Vec<(String, PathBuf, Option<SystemTime>)> = Vec::new();
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -207,20 +204,33 @@ impl SessionStore {
             if Self::validate_session_id(&id).is_err() {
                 continue;
             }
-            let metadata = match entry.metadata() {
-                Ok(v) => v,
+            let file_modified = match entry.metadata() {
+                Ok(v) => v.modified().ok(),
                 Err(_) => continue,
             };
-            let file_modified = metadata.modified().ok();
+            jobs.push((id, path, file_modified));
+        }
+        // 并行读取结果按下标汇总回主线程，按原顺序插入 SkipMap，排序与串行版本一致。
+        let mut metadata_results = Self::read_session_list_metadata_parallel(&jobs);
+
+        let mut sessions: Box<SkipMap<(u64, String), SessionInfo>> =
+            SkipMap::new(16, |a: &(u64, String), b: &(u64, String)| {
+                match b.0.cmp(&a.0) {
+                    std::cmp::Ordering::Equal => a.1.cmp(&b.1) as i32 * -1,
+                    std::cmp::Ordering::Less => 1,
+                    std::cmp::Ordering::Greater => -1,
+                }
+            });
+        for (idx, (id, _path, file_modified)) in jobs.into_iter().enumerate() {
             let (first_user_prompt, generated_title, last_activity_unix_ms, history_revision) =
-                match read_session_list_metadata_sqlite(&path) {
-                    Ok(metadata) => (
+                match metadata_results[idx].take() {
+                    Some(metadata) => (
                         metadata.first_user_prompt,
                         metadata.session_title,
                         metadata.last_activity_unix_ms,
                         metadata.history_revision,
                     ),
-                    Err(_) => (None, None, None, 0),
+                    None => (None, None, None, 0),
                 };
             // 新库使用事务内维护的逻辑活动时间；旧库由元数据读取层回退到最后一条
             // canonical message 的 created_at。只有无法读取逻辑时间时才使用主库 mtime。
@@ -259,6 +269,46 @@ impl SessionStore {
             );
         }
         Ok(sessions.into_iter().map(|(_, v)| v).collect())
+    }
+
+    /// 并行读取多个 session 库的列表元数据（标题、首条请求、活动时间）。
+    ///
+    /// 与 `list_sessions` 原有容错语义一致：单个库读取失败返回 `None`，由调用方回退到
+    /// 文件 mtime；不会让一个损坏或旧格式的 session 阻断整个列表。静态分片避免原子
+    /// 计数争用，`std::thread::scope` 保证线程只借用 `jobs` 而不拷贝。
+    fn read_session_list_metadata_parallel(
+        jobs: &[(String, PathBuf, Option<SystemTime>)],
+    ) -> Vec<Option<SessionListMetadata>> {
+        let count = jobs.len();
+        let mut results: Vec<Option<SessionListMetadata>> = Vec::new();
+        results.resize_with(count, || None);
+        if count == 0 {
+            return results;
+        }
+        const MAX_WORKERS: usize = 16;
+        let workers = count.min(MAX_WORKERS);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        let mut chunk: Vec<(usize, Option<SessionListMetadata>)> = Vec::new();
+                        let mut idx = worker;
+                        while idx < count {
+                            let (_, path, _) = &jobs[idx];
+                            chunk.push((idx, read_session_list_metadata_sqlite(path).ok()));
+                            idx += workers;
+                        }
+                        chunk
+                    })
+                })
+                .collect();
+            for handle in handles {
+                for (idx, metadata) in handle.join().unwrap_or_default() {
+                    results[idx] = metadata;
+                }
+            }
+        });
+        results
     }
 
     /// 只读取一个 session 的恢复预览信息，避免启动恢复时扫描并统计全部 session。
@@ -343,6 +393,9 @@ impl SessionStore {
     /// `list_sessions` 出于性能不再计算大小：逐个 session 递归统计 assets 是主要瓶颈
     /// （本机约 2.6s）。只有 `/ss list` 等需要展示大小的命令才调用本方法，把每个 session 的
     /// 统计任务分发到独立线程，用多核把墙钟时间压到几百毫秒。
+    /// 递归统计结果按目录顶层指纹缓存在 `<root>/.sizes-cache.json`：指纹只读取 assets /
+    /// checkpoints 的直接子项（名称、类型、长度、mtime），新增/删除/改写文件都会反映到
+    /// 指纹上；指纹未变时直接复用缓存，后续 `/ss` 不再重复遍历几百 MB 的 overflow 目录。
     pub(in crate::ai) fn attach_session_sizes(
         &self,
         sessions: &mut [SessionInfo],
@@ -351,6 +404,8 @@ impl SessionStore {
             return Ok(());
         }
         let derived_history_sizes = self.derived_session_history_artifact_sizes()?;
+        let cache_path = self.root.join(SESSION_SIZE_CACHE_FILE);
+        let mut cache = Self::load_session_size_cache(&cache_path);
         // 预收集 (下标, session_id, 派生大小)；线程只借用 self，不借用 sessions。
         let jobs: Vec<(usize, String, u64)> = sessions
             .iter()
@@ -363,33 +418,228 @@ impl SessionStore {
                 )
             })
             .collect();
-        let sizes: Vec<(usize, u64)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = jobs
-                .into_iter()
-                .map(|(idx, id, derived_history_size)| {
-                    scope.spawn(move || {
-                        let size = self
-                            .session_size_bytes(
-                                &self.session_history_file(&id),
-                                &id,
-                                derived_history_size,
-                            )
-                            .unwrap_or(0);
-                        (idx, size)
+        let (sizes, recomputed): (Vec<(usize, u64)>, Vec<(String, String, u64, u64)>) =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = jobs
+                    .iter()
+                    .map(|(idx, id, derived_history_size)| {
+                        let (idx, id, derived_history_size) =
+                            (*idx, id.clone(), *derived_history_size);
+                        let cache = &cache;
+                        scope.spawn(move || {
+                            let assets_dir = self.session_assets_dir(&id);
+                            let checkpoints_dir = self.checkpoints_dir(&id);
+                            // 顶层指纹命中缓存时跳过递归遍历；遍历失败按旧语义记 0 且不写缓存。
+                            let (assets_size, checkpoints_size, recompute) =
+                                match (
+                                    Self::dir_two_level_fingerprint(&assets_dir),
+                                    Self::dir_two_level_fingerprint(&checkpoints_dir),
+                                ) {
+                                    (Ok(assets_fp), Ok(checkpoints_fp)) => {
+                                        let fingerprint =
+                                            format!("{assets_fp}\u{1f}{checkpoints_fp}");
+                                        match cache.get(&id) {
+                                            Some((cached_fp, cached_assets, cached_checkpoints))
+                                                if *cached_fp == fingerprint =>
+                                            {
+                                                (*cached_assets, *cached_checkpoints, None)
+                                            }
+                                            _ => {
+                                                match directory_size(&assets_dir).and_then(
+                                                    |assets| {
+                                                        directory_size(&checkpoints_dir).map(
+                                                            |checkpoints| (assets, checkpoints),
+                                                        )
+                                                    },
+                                                ) {
+                                                    Ok((assets, checkpoints)) => (
+                                                        assets,
+                                                        checkpoints,
+                                                        Some((
+                                                            id.clone(),
+                                                            fingerprint,
+                                                            assets,
+                                                            checkpoints,
+                                                        )),
+                                                    ),
+                                                    Err(_) => (0, 0, None),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => (0, 0, None),
+                                };
+                            let sqlite_path = self.session_history_file(&id);
+                            let mut total = file_size_if_exists(&sqlite_path)
+                                .unwrap_or(0)
+                                .saturating_add(derived_history_size);
+                            for suffix in ["-wal", "-shm", "-journal"] {
+                                total = total.saturating_add(
+                                    file_size_if_exists(&PathBuf::from(format!(
+                                        "{}{}",
+                                        sqlite_path.display(),
+                                        suffix
+                                    )))
+                                    .unwrap_or(0),
+                                );
+                            }
+                            total = total
+                                .saturating_add(assets_size)
+                                .saturating_add(checkpoints_size);
+                            ((idx, total), recompute)
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .filter_map(|handle| handle.join().ok())
-                .collect()
-        });
+                    .collect();
+                let mut sizes = Vec::with_capacity(jobs.len());
+                let mut recomputed = Vec::new();
+                for handle in handles {
+                    if let Ok((size, recompute)) = handle.join() {
+                        sizes.push(size);
+                        if let Some(entry) = recompute {
+                            recomputed.push(entry);
+                        }
+                    }
+                }
+                (sizes, recomputed)
+            });
         for (idx, size) in sizes {
             if let Some(session) = sessions.get_mut(idx) {
                 session.size_bytes = size;
             }
         }
+        if !recomputed.is_empty() {
+            for (id, fingerprint, assets_size, checkpoints_size) in recomputed {
+                cache.insert(id, (fingerprint, assets_size, checkpoints_size));
+            }
+            // 顺带清掉已删除 session 的残留缓存项，避免缓存文件无限增长。
+            let current_ids: std::collections::HashSet<&str> =
+                sessions.iter().map(|session| session.id.as_str()).collect();
+            cache.retain(|id, _| current_ids.contains(id.as_str()));
+            Self::save_session_size_cache(&cache_path, &cache)?;
+        }
         Ok(())
+    }
+
+    /// 目录两级指纹：读取直接子项（名称、类型、长度、mtime），并对每个直接子目录再读取
+    /// 其直接子项，用于判断目录树是否变化。新增/删除/改写都会改变文件自身的 size/mtime
+    /// 或所在目录的 mtime，从而改变指纹；不存在的目录返回 `Ok("-")`。相比递归遍历，
+    /// 指纹读取量与"顶层条目数 + 直接子目录条目数"成正比。
+    /// 已知边界：深度 ≥3 的文件内容改写不改任何祖先目录的 mtime，两层指纹感知不到；
+    /// 本仓库实际结构（assets 两层、checkpoints 目录以 rename 原子发布）不受影响，
+    /// 且任何新增/删除仍会经目录 mtime 信号使缓存失效自愈。
+    fn dir_two_level_fingerprint(path: &Path) -> io::Result<String> {
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok("-".to_string()),
+            Err(error) => return Err(error),
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let (kind, size, mtime_ns) = if file_type.is_dir() {
+                // 子目录本身不参与字节统计，但它的 mtime 会随内容增删变化，用作变更信号。
+                let mtime = fs::metadata(&entry.path())
+                    .ok()
+                    .and_then(|m| Self::metadata_mtime_nanos(&m))
+                    .unwrap_or(0);
+                ("d", 0u64, mtime)
+            } else if file_type.is_file() {
+                let metadata = entry.metadata()?;
+                ("f", metadata.len(), Self::metadata_mtime_nanos(&metadata).unwrap_or(0))
+            } else {
+                // 符号链接等既不递归也不计入大小，与 directory_size 的语义一致。
+                ("o", 0u64, 0)
+            };
+            parts.push(format!("{kind}|{name}|{size}|{mtime_ns}"));
+            // 第二级：直接子目录内的文件改写（size/mtime 变化）与新增/删除同样可感知。
+            // 条目带父目录名前缀，避免不同目录下的同名子项混淆；第二级读取失败不阻断整体。
+            if file_type.is_dir() {
+                let Ok(sub_entries) = fs::read_dir(entry.path()) else {
+                    continue;
+                };
+                for sub in sub_entries {
+                    let Ok(sub) = sub else { continue };
+                    let Ok(sub_type) = sub.file_type() else { continue };
+                    let sub_name = sub.file_name().to_string_lossy().into_owned();
+                    let (sub_kind, sub_size, sub_mtime) = if sub_type.is_dir() {
+                        let mtime = fs::metadata(sub.path())
+                            .ok()
+                            .and_then(|m| Self::metadata_mtime_nanos(&m))
+                            .unwrap_or(0);
+                        ("d", 0u64, mtime)
+                    } else if sub_type.is_file() {
+                        let Ok(metadata) = sub.metadata() else { continue };
+                        ("f", metadata.len(), Self::metadata_mtime_nanos(&metadata).unwrap_or(0))
+                    } else {
+                        ("o", 0u64, 0)
+                    };
+                    parts.push(format!("{name}/{sub_kind}|{sub_name}|{sub_size}|{sub_mtime}"));
+                }
+            }
+        }
+        parts.sort();
+        Ok(parts.join(";"))
+    }
+
+    fn metadata_mtime_nanos(metadata: &fs::Metadata) -> Option<u128> {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+    }
+
+    /// 会话大小缓存的持久化格式：`Vec<(session_id, fingerprint, assets_size, checkpoints_size)>`。
+    /// 直接序列化元组序列，避免为缓存结构引入 serde derive；文件缺失或损坏时整体失效重算。
+    fn load_session_size_cache(path: &Path) -> FastMap<String, (String, u64, u64)> {
+        let Ok(bytes) = fs::read(path) else {
+            return FastMap::default();
+        };
+        let Ok(entries) = serde_json::from_slice::<Vec<(String, String, u64, u64)>>(&bytes) else {
+            return FastMap::default();
+        };
+        entries
+            .into_iter()
+            .map(|(id, fingerprint, assets_size, checkpoints_size)| {
+                (id, (fingerprint, assets_size, checkpoints_size))
+            })
+            .collect()
+    }
+
+    fn save_session_size_cache(
+        path: &Path,
+        cache: &FastMap<String, (String, u64, u64)>,
+    ) -> io::Result<()> {
+        let entries: Vec<(String, String, u64, u64)> = cache
+            .iter()
+            .map(|(id, (fingerprint, assets_size, checkpoints_size))| {
+                (id.clone(), fingerprint.clone(), *assets_size, *checkpoints_size)
+            })
+            .collect();
+        let payload =
+            serde_json::to_vec(&entries).map_err(|error| io::Error::other(error.to_string()))?;
+        // 临时文件 + rename 原子发布，与 sqlite 备份的发布方式一致；并发 /ss 各写各的临时文件。
+        let temporary = path.with_file_name(format!(
+            ".{}.tmp-{}",
+            SESSION_SIZE_CACHE_FILE,
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&temporary, &payload)?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    }
+
+    /// 删除 session 后主动移除其大小缓存条目，避免残留条目悬挂到下一次有重算的 /ss。
+    /// 写失败不阻塞删除流程：attach_session_sizes 的 retain 清理会自愈兜底。
+    fn remove_session_size_cache_entry(&self, session_id: &str) -> io::Result<()> {
+        let cache_path = self.root.join(SESSION_SIZE_CACHE_FILE);
+        let mut cache = Self::load_session_size_cache(&cache_path);
+        if cache.remove(session_id).is_none() {
+            return Ok(());
+        }
+        Self::save_session_size_cache(&cache_path, &cache)
     }
 
     fn derived_session_history_artifact_sizes(&self) -> io::Result<FastMap<String, u64>> {
@@ -479,7 +729,7 @@ impl SessionStore {
         let path = self.session_history_file(session_id);
         let assets = self.session_assets_dir(session_id);
         let checkpoints = self.checkpoints_dir(session_id);
-        with_sessions_lifecycle_lock(&self.root, || {
+        let deleted = with_sessions_lifecycle_lock(&self.root, || {
             super::checkpoint::with_checkpoint_lock(&checkpoints, || {
                 // 与 canonical writer / rollback 共用同一把跨进程锁；锁文件本身必须保留，
                 // 否则删除期间或紧随其后的 writer 可能在不同 inode 上各自取得 flock。
@@ -487,7 +737,13 @@ impl SessionStore {
                     self.delete_session_artifacts_unlocked(session_id, &path, &assets, &checkpoints)
                 })
             })
-        })
+        })?;
+        if deleted {
+            // 删除成功后主动清理缓存条目；清理失败不影响删除结果，残留条目由
+            // attach_session_sizes 的 retain 自愈兜底。
+            let _ = self.remove_session_size_cache_entry(session_id);
+        }
+        Ok(deleted)
     }
 
     /// prune 的最终校验与删除必须共同持有 lifecycle + checkpoint + session state 锁。
@@ -537,6 +793,8 @@ impl SessionStore {
                         &assets,
                         &checkpoints,
                     )?;
+                    // 删除成功后主动清理缓存条目；失败不阻断 prune 结果，缓存自愈兜底。
+                    let _ = self.remove_session_size_cache_entry(&candidate.id);
                     Ok(PruneSessionDeleteResult::Deleted)
                 })
             })
@@ -568,6 +826,7 @@ impl SessionStore {
             self.delete_derived_session_history_artifacts(session_id)?;
             delete_assets_dir(&assets)?;
             remove_dir_if_exists(&checkpoints)?;
+            let _ = self.remove_session_size_cache_entry(session_id);
             Ok(())
         })
     }
@@ -584,6 +843,7 @@ impl SessionStore {
             self.delete_derived_session_history_artifacts(session_id)?;
             delete_assets_dir(&assets)?;
             remove_dir_if_exists(&checkpoints)?;
+            let _ = self.remove_session_size_cache_entry(session_id);
             Ok(())
         })
     }
@@ -622,6 +882,8 @@ impl SessionStore {
             // 兼容旧版本留下的孤立 checkpoint 目录：它们没有对应的 `.sqlite`，不会被
             // `list_sessions` 枚举，但 clear-all 的语义仍应清空全部会话数据。
             remove_dir_if_exists(&checkpoints_root)?;
+            // 全部会话已清空，缓存整体失效，直接移除缓存文件。
+            remove_file_if_exists(&self.root.join(SESSION_SIZE_CACHE_FILE))?;
             Ok(deleted)
         })
     }
@@ -1536,8 +1798,8 @@ fn strip_filler_prefixes(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionStore, SessionTitleOrigin, generate_session_summary, is_low_quality_session_title,
-        normalize_generated_session_title, strip_think_tags,
+        SESSION_SIZE_CACHE_FILE, SessionStore, SessionTitleOrigin, generate_session_summary,
+        is_low_quality_session_title, normalize_generated_session_title, strip_think_tags,
     };
     use crate::ai::history::{Message, append_history_messages};
     use serde_json::Value;
@@ -1625,6 +1887,94 @@ mod tests {
         let fallback = normalize_generated_session_title(&generate_session_summary(notice));
 
         assert!(fallback.is_empty());
+    }
+
+    #[test]
+    fn session_size_cache_reuses_top_level_fingerprint_hits() {
+        // 临时 sessions 根目录：SessionStore 的根目录从 history 文件路径推导。
+        let session_id = format!("size-cache-{}", uuid::Uuid::new_v4());
+        let root = std::env::temp_dir().join(format!(
+            "ai-session-size-cache-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = SessionStore::new(&root.join("unused.sqlite"));
+        store.ensure_root_dir().unwrap();
+
+        // 造一个 session：sqlite 主库 + assets 目录内两层文件。
+        let sqlite_path = store.session_history_file(&session_id);
+        fs::write(&sqlite_path, vec![0u8; 100]).unwrap();
+        let assets_dir = store.session_assets_dir(&session_id);
+        fs::create_dir_all(assets_dir.join("sub")).unwrap();
+        fs::write(assets_dir.join("a.txt"), vec![0u8; 30]).unwrap();
+        fs::write(assets_dir.join("sub").join("b.txt"), vec![0u8; 40]).unwrap();
+
+        let mut sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        // 期望：主库 100 + assets 70 + 顶层指纹中不存在的 checkpoints 0。
+        store.attach_session_sizes(&mut sessions).unwrap();
+        assert_eq!(sessions[0].size_bytes, 170);
+
+        // 第二次调用走缓存命中，大小保持不变。
+        store.attach_session_sizes(&mut sessions).unwrap();
+        assert_eq!(sessions[0].size_bytes, 170);
+        // 缓存文件已持久化。
+        assert!(store.root.join(SESSION_SIZE_CACHE_FILE).is_file());
+
+        // 顶层新增文件会改变指纹，缓存失效并重算。
+        fs::write(assets_dir.join("c.txt"), vec![0u8; 20]).unwrap();
+        store.attach_session_sizes(&mut sessions).unwrap();
+        assert_eq!(sessions[0].size_bytes, 190);
+
+        // 深层新增文件：sub 目录 mtime 变化，指纹失效并重算。
+        fs::write(assets_dir.join("sub").join("c2.txt"), vec![0u8; 15]).unwrap();
+        store.attach_session_sizes(&mut sessions).unwrap();
+        assert_eq!(sessions[0].size_bytes, 205);
+
+        // 深层文件覆写：两级指纹感知子目录内文件的 size/mtime 变化，缓存失效并重算。
+        fs::write(assets_dir.join("sub").join("b.txt"), vec![0u8; 10]).unwrap();
+        store.attach_session_sizes(&mut sessions).unwrap();
+        assert_eq!(sessions[0].size_bytes, 175);
+
+        // 自愈：顶层新增文件后重算，深层覆写也一并反映出来。
+        fs::write(assets_dir.join("d.txt"), vec![0u8; 5]).unwrap();
+        store.attach_session_sizes(&mut sessions).unwrap();
+        assert_eq!(sessions[0].size_bytes, 180);
+
+        // 清理临时目录。
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_session_removes_size_cache_entry() {
+        let session_id = format!("del-cache-{}", uuid::Uuid::new_v4());
+        let root = std::env::temp_dir().join(format!(
+            "ai-session-del-cache-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = SessionStore::new(&root.join("unused.sqlite"));
+        store.ensure_root_dir().unwrap();
+
+        // 造一个 session 并触发缓存写入。
+        let sqlite_path = store.session_history_file(&session_id);
+        fs::write(&sqlite_path, vec![0u8; 100]).unwrap();
+        let assets_dir = store.session_assets_dir(&session_id);
+        fs::create_dir_all(assets_dir.join("sub")).unwrap();
+        fs::write(assets_dir.join("a.txt"), vec![0u8; 30]).unwrap();
+        fs::write(assets_dir.join("sub").join("b.txt"), vec![0u8; 40]).unwrap();
+
+        let mut sessions = store.list_sessions().unwrap();
+        store.attach_session_sizes(&mut sessions).unwrap();
+        assert!(store.root.join(SESSION_SIZE_CACHE_FILE).is_file());
+
+        // 删除 session 后，缓存条目应被同步移除（不依赖下一次 attach 的 retain 自愈）。
+        assert!(store.delete_session(&session_id).unwrap());
+        let cache = SessionStore::load_session_size_cache(&store.root.join(SESSION_SIZE_CACHE_FILE));
+        assert!(!cache.contains_key(&session_id));
+
+        // 清理临时目录。
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

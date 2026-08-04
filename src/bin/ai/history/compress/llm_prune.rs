@@ -32,8 +32,8 @@
 //!    只替换为带 `file_path` 的召回 stub，模型可随时 `read_file` 取回完整原文。
 //! 4. **无归档目录（`overflow_dir=None`）时绝不裁剪**：宁可不压缩，也不做
 //!    不可逆的内容丢弃。
-//! 5. `apply_pruning` 只作用于 `prepare` 内每轮重建、从不落盘的临时 `history`
-//!    副本，不污染持久化存储。
+//! 5. `apply_pruning` 只作用于每次模型请求使用的临时 `messages` 投影；持久化使用独立
+//!    的 canonical `turn_messages`，因此卸载不会污染真实历史。
 //! 6. 最近 `KEEP_RECENT_TOOL_GROUPS` 组工具结果始终保护，避免误裁剪当前轮所需结果。
 
 use std::path::Path;
@@ -45,7 +45,7 @@ use crate::ai::history::types::Message;
 
 use super::tool_overflow::{
     build_tool_call_arguments_index, build_tool_call_name_index, build_tool_overflow_recall_lines,
-    preserve_pruned_tool_result_stable,
+    is_preserved_tool_overflow_stub, preserve_pruned_tool_result_stable,
 };
 
 /// 判断某工具结果是否被其注册策略标记为「永不 LLM 裁剪」。
@@ -284,6 +284,10 @@ pub(crate) fn apply_pruning(
         let Some(content) = msg.content.as_str() else {
             continue;
         };
+        // 请求投影会跨多个模型轮次复用；已卸载的 stub 不应重复计入裁剪报告。
+        if is_preserved_tool_overflow_stub(content) {
+            continue;
+        }
         let freed = content.chars().count();
         let tool_name = id_to_tool_name
             .get(&tool_call_id)
@@ -320,6 +324,46 @@ pub(crate) fn apply_pruning(
 /// 判断当前历史长度是否值得注入裁剪提示。
 pub(crate) fn should_inject_prune_prompt(message_count: usize) -> bool {
     message_count >= PRUNE_PROMPT_MIN_MESSAGES
+}
+
+/// 在模型请求投影中按需注入裁剪协议，且保证重复调用不产生重复提示。
+pub(crate) fn ensure_prune_protocol_prompt(messages: &mut Vec<Message>) -> bool {
+    if messages.iter().any(|message| {
+        message.role == "system"
+            && matches!(&message.content, Value::String(text) if text == PRUNE_PROTOCOL_PROMPT)
+    }) || !should_inject_prune_prompt(messages.len())
+    {
+        return false;
+    }
+
+    let insert_at = messages
+        .iter()
+        .position(|message| message.role != "system")
+        .unwrap_or(messages.len());
+    messages.insert(
+        insert_at,
+        Message {
+            role: "system".to_string(),
+            content: Value::String(PRUNE_PROTOCOL_PROMPT.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    );
+    true
+}
+
+/// 在每次模型请求前更新临时投影：先无损卸载达到阈值的旧工具结果，再按需注入协议。
+///
+/// 调用方必须传入与 canonical `turn_messages` 分离的请求投影。
+pub(crate) fn prepare_request_projection(
+    messages: &mut Vec<Message>,
+    prune_marks: &FxHashMap<String, u8>,
+    overflow_dir: Option<&Path>,
+) -> PruneReport {
+    let report = apply_pruning(messages.as_mut_slice(), prune_marks, overflow_dir);
+    ensure_prune_protocol_prompt(messages);
+    report
 }
 
 #[cfg(test)]
@@ -859,6 +903,74 @@ mod tests {
         assert!(!should_inject_prune_prompt(PRUNE_PROMPT_MIN_MESSAGES - 1));
         assert!(should_inject_prune_prompt(PRUNE_PROMPT_MIN_MESSAGES));
         assert!(should_inject_prune_prompt(100));
+    }
+
+    #[test]
+    fn test_prune_protocol_activates_at_same_turn_request_boundary_once() {
+        let mut messages = (0..PRUNE_PROMPT_MIN_MESSAGES - 1)
+            .map(|index| make_user_message(&format!("message {index}")))
+            .collect::<Vec<_>>();
+
+        assert!(!ensure_prune_protocol_prompt(&mut messages));
+        messages.push(make_assistant_message("same-turn growth"));
+        assert!(ensure_prune_protocol_prompt(&mut messages));
+        assert!(!ensure_prune_protocol_prompt(&mut messages));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content.as_str() == Some(PRUNE_PROTOCOL_PROMPT))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_prepare_request_projection_prunes_without_mutating_canonical_copy() {
+        let overflow_dir = make_overflow_dir();
+        let mut request_messages = vec![make_user_message("system-sized request")];
+        request_messages.extend([
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", "old result that reached the prune threshold"),
+        ]);
+        for index in 0..4 {
+            let id = format!("call_recent_{index}");
+            request_messages.push(make_assistant_tool_call(&id, "execute_command"));
+            request_messages.push(make_tool_message(&id, "recent result"));
+        }
+        while request_messages.len() < PRUNE_PROMPT_MIN_MESSAGES {
+            request_messages.push(make_user_message("padding"));
+        }
+        let canonical_messages = request_messages.clone();
+        let marks = [("call_old".to_string(), PRUNE_THRESHOLD)]
+            .into_iter()
+            .collect();
+
+        let first =
+            prepare_request_projection(&mut request_messages, &marks, Some(overflow_dir.as_path()));
+        let second =
+            prepare_request_projection(&mut request_messages, &marks, Some(overflow_dir.as_path()));
+
+        assert_eq!(first.pruned_count, 1);
+        assert_eq!(second.pruned_count, 0);
+        assert_eq!(
+            canonical_messages[2].content.as_str(),
+            Some("old result that reached the prune threshold")
+        );
+        let pruned_content = request_messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_old"))
+            .and_then(|message| message.content.as_str())
+            .expect("pruned tool response should remain in the request projection");
+        assert!(pruned_content.contains("file_path:"));
+        assert_eq!(
+            request_messages
+                .iter()
+                .filter(|message| message.content.as_str() == Some(PRUNE_PROTOCOL_PROMPT))
+                .count(),
+            1
+        );
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
     #[test]
