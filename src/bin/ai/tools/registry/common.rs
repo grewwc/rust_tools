@@ -13,21 +13,12 @@ use aios_kernel::{
 };
 use chrono::Local;
 
-/// Static specification for a builtin tool, including its name,
-/// description, parameter schema, execution function, and group memberships.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolAsyncPolicy {
-    SyncOnly,
-    Spawnable,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct ToolSpec {
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
     pub(crate) parameters: fn() -> Value,
     pub(crate) execute: fn(&Value) -> Result<String, String>,
-    pub(crate) async_policy: ToolAsyncPolicy,
     pub(crate) groups: &'static [&'static str],
 }
 

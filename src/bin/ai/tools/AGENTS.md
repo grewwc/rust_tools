@@ -39,9 +39,11 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
    narrow/page hint when output is cut.
 9. **Patch/read/search contracts.** `apply_patch` anchors on removed text,
    normalizes supported typographic confusables, and rejects ambiguous matches.
-   Unified diffs are single-file; multi-file edits and deletion use an explicit
-   envelope; `*** Replace in line:` is the low-friction single-line substring
-   edit. Context-mismatch / ambiguous / out-of-order errors echo current text as
+   Multi-file unified diffs (git-style `diff --git` headers or `---`/`+++` pairs)
+   are auto-split and applied per file (atomic, same-path sections stack);
+   deletions still require an explicit envelope; `*** Replace in line:` is the
+   low-friction single-line substring edit. Context-mismatch / ambiguous /
+   out-of-order errors echo current text as
    a prefix-free, paste-ready block (`<<<PATCH_TEXT` ... `PATCH_TEXT>>>`) so the
    model can rebuild without re-reading; classify the diagnostic before the
    block (so source text cannot mimic an error), and for multi-file patches
@@ -63,7 +65,10 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
     `SUBAGENT_DEPTH > 0`; `enable_tools` must not restore it. Scope tasks by
     session + owner pid, persist results before IPC cleanup, and require
     `task_integrate` after delivery. Cap only the child manifest and never expose
-    child thinking or streamed response bodies.
+    child thinking or streamed response bodies. `task_wait` emits a one-shot
+    `[tool_followup:lone_spawn]` hint (never a rejection) when it collects the
+    only task of the most recent single-task spawn — the parent should have used
+    the synchronous `task` tool instead; the hint is consumed once per spawn.
 11. **Wall-clock safety net.** Both `task_wait` and the driver loop reap tasks past
     `SUBAGENT_WALL_CLOCK_TIMEOUT`. Write a terminal result before collection,
     preserve already-finished results, and signal `cancel_stream` before aborting

@@ -1530,7 +1530,12 @@ fn truncate_mutable_field(
             let text = value_to_string(&message.content);
             let original_chars = text.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
-            let build_truncated = |path: Option<&str>| {
+            // 预览预算不足时 stub 只剩长路径、不含任何实际内容（假截断）：
+            // 小结果（如 task_status 轮询结果）被换成空预览 stub 后模型无法判断
+            // 真实状态，会陷入「状态确认不了 → 无限轮询」死循环。宁可保留原文
+            // 交给硬预算兜底，也不产出无信息 stub。
+            const MIN_CONTENT_PREVIEW_CHARS: usize = 32;
+            let build_truncated = |path: Option<&str>| -> Option<String> {
                 let prefix = path
                     .map(|p| {
                         format!(
@@ -1541,9 +1546,14 @@ fn truncate_mutable_field(
                         "[context-overflow-truncated] head+tail preview:\n".to_string()
                     });
                 let preview_budget = target.saturating_sub(prefix.chars().count());
-                format!("{prefix}{}", keep_ends_by_chars(&text, preview_budget))
+                if preview_budget < MIN_CONTENT_PREVIEW_CHARS {
+                    return None;
+                }
+                Some(format!("{prefix}{}", keep_ends_by_chars(&text, preview_budget)))
             };
-            let truncated = build_truncated(archive_path_hint.as_deref());
+            let Some(truncated) = build_truncated(archive_path_hint.as_deref()) else {
+                return false;
+            };
             // 固定协议文本可能比目标预算还长；只有严格变短才提交。
             if truncated.chars().count() >= original_chars {
                 return false;
@@ -1551,7 +1561,8 @@ fn truncate_mutable_field(
             // 判定通过才落盘归档；用真实返回路径重建（正常与 hint 完全一致）。
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
-            let truncated = build_truncated(archive_file_path.as_deref());
+            let truncated =
+                build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
             message.content = Value::String(truncated);
             true
         }
@@ -1566,23 +1577,35 @@ fn truncate_mutable_field(
             }
             let original_chars = reasoning.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
-            let build_truncated = |path: Option<&str>| {
+            // 与 Content 分支对称：预览预算被长归档路径吃光时 stub 不含任何实际内容
+            // （假截断），模型无法据此判断推理状态，应拒绝截断保留原文交给硬预算兜底。
+            const MIN_REASONING_PREVIEW_CHARS: usize = 32;
+            let build_truncated = |path: Option<&str>| -> Option<String> {
                 let prefix = path
                     .map(|p| {
                         format!("[context-overflow-truncated] full original archived at: {p}; ")
                     })
                     .unwrap_or_else(|| "[context-overflow-truncated] ".to_string());
                 let preview_budget = target.saturating_sub(prefix.chars().count());
-                format!("{prefix}{}", keep_ends_by_chars(reasoning, preview_budget))
+                if preview_budget < MIN_REASONING_PREVIEW_CHARS {
+                    return None;
+                }
+                Some(format!(
+                    "{prefix}{}",
+                    keep_ends_by_chars(reasoning, preview_budget)
+                ))
             };
-            let truncated = build_truncated(archive_path_hint.as_deref());
+            let Some(truncated) = build_truncated(archive_path_hint.as_deref()) else {
+                return false;
+            };
             if truncated.chars().count() >= original_chars {
                 return false;
             }
             // 判定通过才落盘归档；用真实返回路径重建（正常与 hint 完全一致）。
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
-            let truncated = build_truncated(archive_file_path.as_deref());
+            let truncated =
+                build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
             message.reasoning_content = Some(truncated);
             true
         }
@@ -1597,6 +1620,15 @@ fn truncate_mutable_field(
             };
             let original_chars = arguments.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
+            // 固定 JSON 前缀 + 长归档路径可能吃光全部 target 预算（fixed_chars >=
+            // target 时 preview_budget 直接为 0），产出 preview 为空（或仅剩 1~2 个
+            // 字符）的 stub。这类 stub 不含任何实际参数信息，模型会把
+            // `_context_overflow_truncated` / `archive_file_path` / `preview` 这些
+            // 协议 key 误当成真实参数名回发，形成「stub 参数 → 工具返回指针 → 再发
+            // stub 参数」的死循环。此处只拦空/近乎空的 preview；对巨大 arguments，
+            // 即便长路径吃掉大半预算，剩下几十上百字符的 preview 仍能锚定 file_path
+            // 等关键信息，属于有效截断，不应拒绝。
+            const MIN_TOOL_ARGS_PREVIEW_CHARS: usize = 8;
             let build_truncated = |path: Option<&str>, preview: String| {
                 serde_json::json!({
                     "_context_overflow_truncated": true,
@@ -1620,6 +1652,11 @@ fn truncate_mutable_field(
                 preview_text = keep_ends_by_chars(&arguments, preview_budget);
                 truncated =
                     build_truncated(archive_path_hint.as_deref(), preview_text.clone());
+            }
+            // 循环收敛后再判定（初始预算够，但 JSON escaping 把它收紧到阈值以下的情况
+            // 也要拦住）：预览不足以承载真实参数信息时放弃截断。
+            if preview_text.chars().count() < MIN_TOOL_ARGS_PREVIEW_CHARS {
+                return false;
             }
             if truncated.chars().count() >= original_chars {
                 return false; // stub 不会更短：不归档、不改消息。

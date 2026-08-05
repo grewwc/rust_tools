@@ -43,7 +43,6 @@ inventory::submit!(ToolRegistration {
         description: "Manage knowledge cache: view stats, clear volatile cache, or force refresh.",
         parameters: params_knowledge_cache_manage,
         execute: execute_knowledge_cache_manage,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });

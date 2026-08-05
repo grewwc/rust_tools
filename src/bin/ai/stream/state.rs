@@ -104,6 +104,7 @@ pub(super) struct StreamRenderState {
     pub(super) markdown: MarkdownStreamRenderer,
     pub(super) waiting_hint_active: bool,
     pub(super) waiting_hint_buffering: bool,
+    pub(super) waiting_hint_tool_call: bool,
     pub(super) printed_tool_calls_header: bool,
     pub(super) current_printing_index: Option<usize>,
     pub(super) terminal_dedupe: Option<TerminalDedupeState>,
@@ -118,6 +119,7 @@ impl StreamRenderState {
             markdown: MarkdownStreamRenderer::new(),
             waiting_hint_active: false,
             waiting_hint_buffering: false,
+            waiting_hint_tool_call: false,
             printed_tool_calls_header: false,
             current_printing_index: None,
             terminal_dedupe: None,
@@ -217,6 +219,9 @@ pub(super) struct StreamContentState {
     pub(super) thinking_open: bool,
     pub(super) empty_choice_chunks: usize,
     pub(super) finish_reason_seen: bool,
+    /// 未收到 finish_reason 前，响应流连续无有效进展并触发 idle timeout。
+    /// 这属于传输中断，不能把未确认完整的工具调用交给执行层。
+    pub(super) stream_idle_timed_out: bool,
     /// 最近一个非空 `finish_reason` 的具体值（如 `stop` / `length` / `tool_calls`）。
     /// `length` 表示服务端因输出上限截断，是比"工具 JSON 解析失败"更早、更准的
     /// 截断信号，用于把本轮 outcome 升级为可重试的 `Truncated`。
@@ -252,6 +257,7 @@ impl StreamContentState {
             thinking_open: false,
             empty_choice_chunks: 0,
             finish_reason_seen: false,
+            stream_idle_timed_out: false,
             finish_reason_value: None,
             dropped_malformed_tool_call: false,
             saw_reasoning_output: false,

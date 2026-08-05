@@ -18,8 +18,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::ai::tools::common::{
-    ToolAsyncPolicy, ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy,
-    ToolPrunePolicy, ToolRegistration, ToolSpec,
+    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
+    ToolRegistration, ToolSpec,
 };
 use crate::ai::tools::storage::file_store::current_session_assets_dir;
 use crate::ai::tools::text_grep_tools::{run_content_search, ContentSearchOptions};
@@ -182,7 +182,6 @@ inventory::submit!(ToolRegistration {
         description: "Search session content moved out of context. Returns verbatim excerpts with file paths and line numbers; use read_file only when more context is needed.",
         parameters: params_search_overflow,
         execute: execute_search_overflow,
-        async_policy: ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });

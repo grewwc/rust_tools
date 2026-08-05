@@ -139,7 +139,6 @@ inventory::submit!(ToolRegistration {
                       Activation is scoped to the current user turn and unloads automatically at turn end.",
         parameters: params_activate_skill,
         execute: execute_activate_skill,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         // skill 发现/激活是低频能力：默认不随每轮 core 展开常驻，模型按需经
         // `enable_tools` 启用，压缩每轮 tools schema token。仍保留 builtin 组，
         // 保证可被动态启用。
@@ -153,7 +152,6 @@ inventory::submit!(ToolRegistration {
         description: "When an active skill needs information, a decision, or confirmation from the user before it can continue, use this tool instead of merely ending with a question. The driver restores that skill only for the user's immediately following normal message.",
         parameters: params_request_user_input,
         execute: execute_request_user_input,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         // 这是 driver 直接按名称注入的控制工具，不能通过 manifest 的 tool_groups 暴露。
         groups: &[],
     }
@@ -249,7 +247,6 @@ inventory::submit!(ToolRegistration {
                       Do not browse merely because a task contains technical keywords or involves a routine source-code, repository, file, or terminal investigation.",
         parameters: params_list_skills,
         execute: execute_list_skills,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -333,7 +330,6 @@ inventory::submit!(ToolRegistration {
                       Reading a skill does not change the current turn or tool set.",
         parameters: params_load_skill,
         execute: execute_load_skill,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -404,7 +400,6 @@ inventory::submit!(ToolRegistration {
         description: "Render and save a .skill file (YAML front matter + prompt body) into the configured skills directory.",
         parameters: params_save_skill,
         execute: execute_save_skill,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });

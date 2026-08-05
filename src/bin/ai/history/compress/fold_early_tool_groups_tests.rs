@@ -577,6 +577,51 @@ fn truncating_mutable_content_archives_original_field() {
 }
 
 #[test]
+fn truncating_content_refuses_empty_preview_stub_for_long_archive_paths() {
+    // 长归档路径会吃掉整个预览预算：stub 只剩路径、不含任何实际内容（假截断）。
+    // 小结果（如 task_status 轮询结果）被换成空预览 stub 后模型无法判断真实状态，
+    // 会陷入「状态确认不了 → 无限轮询」死循环。必须拒绝截断并保留原文。
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-truncate-empty-preview-{}-{}",
+        "d".repeat(120),
+        uuid::Uuid::new_v4()
+    ));
+    let original = format!("prefix-{}-suffix", "x".repeat(300));
+    let mut message = msg("assistant", &original);
+
+    assert!(!truncate_mutable_field(
+        &mut message,
+        MutableMessageField::Content,
+        100,
+        Some(overflow_dir.as_path()),
+    ));
+    assert_eq!(value_to_string(&message.content), original);
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn truncating_reasoning_refuses_empty_preview_stub_for_long_archive_paths() {
+    // 与 Content 分支对称：长归档路径吃光预览预算时，reasoning stub 只剩路径、
+    // 不含任何实际内容（假截断）。必须拒绝截断并保留原文，交给硬预算兜底。
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-truncate-reasoning-empty-preview-{}-{}",
+        "d".repeat(120),
+        uuid::Uuid::new_v4()
+    ));
+    let reasoning = format!("reasoning-prefix-{}-suffix", "r".repeat(300));
+    let mut message = assistant_plain_with_reasoning(&reasoning);
+
+    assert!(!truncate_mutable_field(
+        &mut message,
+        MutableMessageField::Reasoning,
+        100,
+        Some(overflow_dir.as_path()),
+    ));
+    assert_eq!(message.reasoning_content.as_deref(), Some(reasoning.as_str()));
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
 fn hard_budget_truncation_converges_with_archive_pointer_overhead() {
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-truncate-converges-{}", uuid::Uuid::new_v4()));

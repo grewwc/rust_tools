@@ -30,6 +30,12 @@ Conclusion, concrete evidence (files/lines/commands), and next decision-relevant
 
 Wrap the block in `<meta:self_note>...</meta:self_note>`. Do not checkpoint routine progress, tool chatter, or speculation. Later, checkpoints reappear as a summary and file path; use `read_file` on that path instead of repeating the work.
 
+Checkpoint files are written by the runtime automatically: the system extracts
+`<context_checkpoint>` from your self-note, saves it, and returns a
+`[context_checkpoint path=...]` marker. Never call `write_file` (or any other
+tool) to save a checkpoint file yourself — the asset directory lives outside
+the sandbox and a manual write will be blocked.
+
 ## Escalation Rules
 
 - Ask the user only when blocked by a product decision, missing input, or risky irreversible action.

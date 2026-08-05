@@ -45,7 +45,6 @@ inventory::submit!(ToolRegistration {
         description: "Run a shell command. Destructive/network/escalation commands are blocked. Output is truncated past a char cap with shown-vs-total counts; narrow or page instead of re-running with different variants. Failures include exit code.",
         parameters: params_execute_command,
         execute: execute_command,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });

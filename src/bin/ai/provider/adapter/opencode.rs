@@ -11,6 +11,38 @@ use super::{OPENCODE_DEFAULT_ENDPOINT, ProviderAdapter};
 
 pub(super) struct OpenCodeAdapter;
 
+fn collect_api_keys_from_config(
+    cfg: &crate::commonw::configw::ConfigW,
+    primary_key: &str,
+) -> Vec<String> {
+    let mut provider_keys = Vec::new();
+    for (key, _) in cfg.entries() {
+        if key.starts_with("opencode.api_key")
+            && key != "opencode.api_key"
+            && let Some(value) = cfg
+                .get_opt(key)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            && value != primary_key
+            && !provider_keys.contains(&value)
+        {
+            provider_keys.push(value);
+        }
+    }
+
+    // `opencode.api_key` 未配置时，通用 `api_key` 只是兜底；专属轮换 key 应优先。
+    if cfg.get_opt(AiConfig::MODEL_API_KEY).as_deref() == Some(primary_key)
+        && !provider_keys.is_empty()
+    {
+        provider_keys.push(primary_key.to_string());
+        provider_keys
+    } else {
+        let mut keys = vec![primary_key.to_string()];
+        keys.extend(provider_keys);
+        keys
+    }
+}
+
 impl ProviderAdapter for OpenCodeAdapter {
     fn label(&self) -> &'static str {
         "opencode"
@@ -25,17 +57,7 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 
     fn collect_api_keys(&self, primary_key: &str) -> Vec<String> {
-        let mut keys = vec![primary_key.to_string()];
-        for (k, v) in crate::commonw::configw::get_all_config().entries() {
-            if k.starts_with("opencode.api_key") && k != "opencode.api_key" && !v.trim().is_empty()
-            {
-                let trimmed = v.trim().to_string();
-                if trimmed != primary_key && !keys.contains(&trimmed) {
-                    keys.push(trimmed);
-                }
-            }
-        }
-        keys
+        collect_api_keys_from_config(&crate::commonw::configw::get_all_config(), primary_key)
     }
 
     fn keys_exhausted_message(&self) -> &'static str {
@@ -62,5 +84,25 @@ impl ProviderAdapter for OpenCodeAdapter {
                 ParsedStreamPayload::Ignore
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commented_keys_are_ignored_and_active_named_key_is_normalized() {
+        let cfg = crate::commonw::configw::ConfigW::parse(
+            "opencode.api_key_active = \"active-key\" # account\n\
+             api_key = \"global-fallback\"\n\
+             # opencode.api_key = \"disabled-key\" # disabled\n\
+             # opencode.api_key_old = \"old-key\" # disabled",
+        );
+
+        assert_eq!(
+            collect_api_keys_from_config(&cfg, "global-fallback"),
+            vec!["active-key", "global-fallback"]
+        );
     }
 }

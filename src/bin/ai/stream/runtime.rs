@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::ai::{
     config_schema::AiConfig,
-    driver::runtime_ctx,
+    driver::{print::sanitize_for_terminal, runtime_ctx},
     models,
     provider::{self, ProviderAdapter},
     request::StreamChunk,
@@ -102,6 +102,7 @@ pub(super) async fn stream_response(
             || !s.content.tool_calls_map.is_empty()
             || s.content.finish_reason_seen
     };
+    let mut idle_timeout_secs = None;
 
     while !app.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some(result) = immediate_cancel_result(app, &mut state) {
@@ -132,6 +133,7 @@ pub(super) async fn stream_response(
                     return Ok(cancelled_stream_result(&mut state));
                 }
                 _ = tokio::time::sleep(idle_remaining) => {
+                    idle_timeout_secs = Some(timeout_secs);
                     break;
                 }
             }
@@ -165,11 +167,19 @@ pub(super) async fn stream_response(
         return Ok(result);
     }
 
+    if let Some(timeout_secs) = idle_timeout_secs.filter(|_| !state.content.finish_reason_seen) {
+        state.content.stream_idle_timed_out = true;
+        if runtime_ctx::terminal_output_enabled() {
+            clear_waiting_hint(&mut state)?;
+            eprintln!("  ⚠ 响应流连续 {timeout_secs} 秒无有效进展，按流中断处理…");
+        }
+    }
+
     finalize_stream_response(app, &markers, state)
 }
 
 /// 是否在终端显示「等待模型输出」的紧凑状态提示。
-/// 对所有 TTY 会话生效。println! 保证提示立即可见，
+/// 对所有 TTY 会话生效。独立行写入并 flush，保证提示立即可见，
 /// 收到首个可见 chunk 时用 \x1b[1A\r\x1b[2K 清掉，不残留额外行。
 fn should_show_waiting_hint(app: &App) -> bool {
     runtime_ctx::terminal_output_enabled()
@@ -181,10 +191,41 @@ fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     if state.render.waiting_hint_active {
         return Ok(());
     }
-    // 独立行等待提示：println! 保证终端立即显示，首个 chunk 到达时用 \x1b[1A\r\x1b[2K 清掉
-    println!("  {ACCENT_MUTED}⠋ waiting…{RESET}");
-    io::stdout().flush()?;
+    // 独立行等待提示：首个 chunk 到达时用 \x1b[1A\r\x1b[2K 清掉。
+    write_waiting_hint_line("waiting…")?;
     state.render.waiting_hint_active = true;
+    state.render.waiting_hint_tool_call = false;
+    Ok(())
+}
+
+fn write_waiting_hint_line(label: &str) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "  {ACCENT_MUTED}⠋ {label}{RESET}")?;
+    out.flush()
+}
+
+fn sanitize_waiting_hint_tool_name(function_name: &str) -> String {
+    let sanitized = sanitize_for_terminal(function_name);
+    let single_line = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        "tool".to_string()
+    } else {
+        single_line
+    }
+}
+
+fn print_tool_call_waiting_hint(
+    state: &mut StreamProcessingState,
+    function_name: &str,
+) -> io::Result<()> {
+    if state.render.waiting_hint_active {
+        clear_waiting_hint(state)?;
+    }
+    let function_name = sanitize_waiting_hint_tool_name(function_name);
+    write_waiting_hint_line(&format!("receiving `{function_name}` arguments…"))?;
+    state.render.waiting_hint_active = true;
+    state.render.waiting_hint_tool_call = true;
     Ok(())
 }
 
@@ -255,13 +296,18 @@ fn resolve_thinking_fold_max_visible_lines(is_tty: bool, raw: Option<&str>) -> u
 }
 
 fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::Result<()> {
-    if !state.render.waiting_hint_active || state.render.waiting_hint_buffering {
+    if !state.render.waiting_hint_active
+        || state.render.waiting_hint_buffering
+        || state.render.waiting_hint_tool_call
+    {
         return Ok(());
     }
-    // 光标上移+清行后重新 println!，保证 buffering 状态在独立行可见
-    print!("\x1b[1A\r\x1b[2K");
-    println!("  {ACCENT_MUTED}⠋ buffering…{RESET}");
-    io::stdout().flush()?;
+    // 光标上移、清行后重写独立行，保持 buffering 状态可见。
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    write!(out, "\x1b[1A\r\x1b[2K")?;
+    writeln!(out, "  {ACCENT_MUTED}⠋ buffering…{RESET}")?;
+    out.flush()?;
     state.render.waiting_hint_buffering = true;
     Ok(())
 }
@@ -270,11 +316,14 @@ pub(super) fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Resul
     if !state.render.waiting_hint_active {
         return Ok(());
     }
-    // 光标上移一行 + \r + 清行：擦掉 println! 输出的独立提示行，让内容在原位输出
-    print!("\x1b[1A\r\x1b[2K");
-    io::stdout().flush()?;
+    // 光标上移一行 + \r + 清行：擦掉独立提示行，让内容在原位输出。
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    write!(out, "\x1b[1A\r\x1b[2K")?;
+    out.flush()?;
     state.render.waiting_hint_active = false;
     state.render.waiting_hint_buffering = false;
+    state.render.waiting_hint_tool_call = false;
     Ok(())
 }
 
@@ -466,13 +515,19 @@ fn finalize_stream_response(
         maybe_print_prompt_cache_metrics(&usage);
     }
 
+    let stream_error = state.content.stream_idle_timed_out;
     let (mut tool_calls, dropped_malformed) =
         collect_valid_tool_calls(&mut state.content.tool_calls_map);
     state.content.dropped_malformed_tool_call = dropped_malformed;
+    if stream_error {
+        // 未收到 finish_reason 就 idle timeout，无法证明工具调用已经完整；即使当前
+        // arguments 恰好是合法 JSON，也不能提前执行可能仍在生成中的操作。
+        tool_calls.clear();
+    }
 
     // Fallback：部分 provider 会把 function call 作为普通 content 返回，而不走
     // delta.tool_calls[]。流式解析未命中时，对完整 assistant_text 再做一次保守恢复。
-    if tool_calls.is_empty() {
+    if !stream_error && tool_calls.is_empty() {
         if let Some(recovered) = recover_inline_tool_calls(&state.content.assistant_text) {
             tool_calls = recovered;
             // 协议载荷既不是 assistant 正文，也不是模型 self_note。恢复成功后直接
@@ -492,7 +547,9 @@ fn finalize_stream_response(
         .as_deref()
         .is_some_and(|reason| reason == DEGENERATE_REPETITION_FINISH_REASON);
 
-    let outcome = if !tool_calls.is_empty() {
+    let outcome = if stream_error {
+        StreamOutcome::Truncated
+    } else if !tool_calls.is_empty() {
         StreamOutcome::ToolCall
     } else {
         let has_text = !state.content.assistant_text.trim().is_empty();
@@ -543,7 +600,7 @@ fn finalize_stream_response(
         reasoning_items: std::mem::take(&mut state.content.reasoning_items),
         skip_response_drain: true,
         truncated_by_length,
-        stream_error: false,
+        stream_error,
         finish_reason_value: state.content.finish_reason_value.clone(),
         usage_prompt_tokens: usage_snapshot.map(|(p, _, _, _)| p).unwrap_or(0),
         usage_cached_prompt_tokens: usage_snapshot.map(|(_, cp, _, _)| cp).unwrap_or(0),
@@ -645,6 +702,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 ) -> Option<StreamResult> {
     state.framing.decode_error_count += 1;
     if runtime_ctx::terminal_output_enabled() {
+        let _ = clear_waiting_hint(state);
         eprintln!(
             "[Warning] 读取响应流时出错：{} (错误次数：{}/{})",
             err, state.framing.decode_error_count, MAX_DECODE_ERRORS
@@ -748,13 +806,17 @@ fn take_tool_call_render_chunk(
 fn open_tool_call_line(
     state: &mut StreamProcessingState,
     index: usize,
-    _function_name: &str,
+    function_name: &str,
 ) -> io::Result<()> {
     state.render.current_printing_index = Some(index);
+    if runtime_ctx::terminal_output_enabled() && io::stdout().is_terminal() {
+        print_tool_call_waiting_hint(state, function_name)?;
+    }
     Ok(())
 }
 
-/// 终端不再打印工具调用参数，只保留工具名称。
+/// 终端不打印工具调用参数；流式接收阶段只显示可擦除的工具名状态提示，
+/// 实际执行行仍由工具执行层统一输出。
 fn write_tool_call_arguments_stream(_arguments: &str) -> io::Result<()> {
     Ok(())
 }

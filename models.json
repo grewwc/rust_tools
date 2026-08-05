@@ -236,7 +236,7 @@
     "tools_default_enabled": true,
     "enable_thinking": true,
     "reasoning_content_replay": true,
-    "default_reasoning_effort": "max",
+    "default_reasoning_effort": "high",
     "subagent_priority": 80,
     "context_window_tokens": 1024000,
     "max_output_tokens": 65536

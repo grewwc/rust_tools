@@ -725,15 +725,24 @@ fn detect_tool_loop(history: &[Vec<String>], window: usize) -> bool {
     // 除 A-A-A-A 外，模型还会以 A-B-A-B 或 A-B-C-A-B-C 的方式规避逐轮
     // 去重。只识别恰好填满当前窗口的短周期，避免把正常的长任务误判成循环。
     for period in 2..=3 {
-        if window % period != 0 {
-            continue;
-        }
         let cycle = &tail[..period];
         if cycle.iter().any(Vec::is_empty) {
             continue;
         }
-        if tail.chunks_exact(period).all(|chunk| chunk == cycle) {
-            return true;
+        if window % period == 0 {
+            // 窗口恰好被周期整除：要求窗口内是完整周期的重复。
+            if tail.chunks_exact(period).all(|chunk| chunk == cycle) {
+                return true;
+            }
+        } else {
+            // 窗口不能整除周期（如 soft 窗口 4 vs 周期 3）：退化为
+            // 「若干完整周期 + 一个周期前缀」也判为循环。这补上了 3 周期在
+            // soft 检查里永远不触发（4 % 3 != 0 被跳过）、导致第 6 轮被无预警
+            // 直接 hard-stop 的洞：A-B-C-A-B-C 会在第 4 轮（A-B-C-A 匹配
+            // 周期 [A,B,C] 的前缀）先拿到 Soft 预警，维持 soft→hard 升级不变量。
+            if tail.iter().zip(cycle.iter().cycle()).all(|(a, b)| a == b) {
+                return true;
+            }
         }
     }
     false
@@ -1038,17 +1047,15 @@ fn tool_round_checkpoint_phase(
 
 /// 判断一条 shell 命令是否为纯只读取证（不改变世界）。解析不确定时返回 false
 /// （保守：宁可把只读误判为可能变更，也不把真实变更误判为只读）。
-fn execute_command_is_read_only(command: &str) -> bool {
-    let Some(first_segment) = split_shell_segments_for_coarse(command).into_iter().next() else {
-        return false;
-    };
-    let mut tokens = first_segment.split_whitespace();
+/// 判定单个 shell 段是否只读。程序取段首 token 的 basename，`git` 再取真正的
+/// 子命令（跳过 `-C <path>` / `-c k=v` 等全局选项）。
+fn shell_segment_is_read_only(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
     let Some(program) = tokens.next() else {
         return false;
     };
     let program = program.rsplit('/').next().unwrap_or(program);
     if program == "git" {
-        // 跳过 `-C <path>` / `-c k=v` 等全局选项，取真正的子命令。
         let mut skip_next = false;
         for token in tokens {
             if skip_next {
@@ -1067,6 +1074,32 @@ fn execute_command_is_read_only(command: &str) -> bool {
         return false;
     }
     READ_ONLY_COMMAND_PROGRAMS.contains(&program)
+}
+
+/// `cd` / `export` 只改变工作目录或环境，不写文件系统，本身无副作用。作为前导段
+/// 跳过，避免 `cd X && git status` 这类「游走 + 检查」命令被误判为变更。
+fn shell_segment_is_nav_or_env(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let Some(program) = tokens.next() else {
+        return false;
+    };
+    matches!(program.rsplit('/').next().unwrap_or(program), "cd" | "export")
+}
+
+fn execute_command_is_read_only(command: &str) -> bool {
+    // 跳过前导 `cd`/`export` 段后，要求**所有**实质段都只读才算只读；任一实质段
+    // 可能变更即视为变更（安全方向：避免把真实改动误判为无进展而过早收口）。
+    let mut saw_substantive = false;
+    for segment in split_shell_segments_for_coarse(command) {
+        if shell_segment_is_nav_or_env(&segment) {
+            continue;
+        }
+        saw_substantive = true;
+        if !shell_segment_is_read_only(&segment) {
+            return false;
+        }
+    }
+    saw_substantive
 }
 
 /// 明确只读的独立程序。刻意排除 `sed`/`awk`（可 `-i` 原地改写）与任何可能带副作用
@@ -1641,6 +1674,16 @@ impl TurnSupervisor {
             // 让模型有完整的 hard window 来响应提示，而不是只再重复两轮就被强制
             // 收口（旧逻辑中 soft=4、hard=6，实际恢复窗口只有两轮）。
             self.tool_signature_history.clear();
+            // 设计洞补位：soft 只清了 exact 样本，但 coarse/target 历史未清，且它们
+            // 的一次性门（coarse_loop_note_injected / target_repeat_note_injected）
+            // 被下方 `!loop_breaker_injected` 永久挡死——模型 soft 后换一批参数继续
+            // 翻同一目标时，coarse/target 再也无法触发，直到迭代上限才被收口。这里把
+            // 两个门重新武装并清空对应历史，让「soft 后换姿势」的翻页 / 混合轮循环仍
+            // 能被后续 coarse/target 捕获（提示仍是一次性、soft 优先级，不额外加压）。
+            self.coarse_loop_note_injected = false;
+            self.target_repeat_note_injected = false;
+            self.tool_signature_history_coarse.clear();
+            self.tool_target_history.clear();
             return ToolLoopSignal::Soft;
         }
         if !self.hard_loop_stop_injected
@@ -1655,7 +1698,6 @@ impl TurnSupervisor {
         // 字节精确的 soft/hard 均未命中时，再看粗粒度：同一目标资源反复翻页/微调
         // 检索参数的膨胀会在这里被抓到。仅提示一次，且让位于精确检测。
         if !self.coarse_loop_note_injected
-            && !self.loop_breaker_injected
             && detect_tool_loop(&self.tool_signature_history_coarse, TOOL_LOOP_COARSE_WINDOW)
         {
             self.coarse_loop_note_injected = true;
@@ -1666,7 +1708,6 @@ impl TurnSupervisor {
         // 目标即命中。让位于上面所有整轮检测，且与 coarse 一样只提示一次。
         if !self.target_repeat_note_injected
             && !self.coarse_loop_note_injected
-            && !self.loop_breaker_injected
             && detect_target_repeat_loop(&self.tool_target_history, TOOL_LOOP_COARSE_WINDOW)
         {
             self.target_repeat_note_injected = true;
@@ -2257,6 +2298,48 @@ mod tests {
     }
 
     #[test]
+    fn detect_tool_loop_matches_cycle_prefix_when_window_not_divisible_by_period() {
+        // 回归：soft 窗口 4 无法被周期 3 整除，旧实现 `window % period != 0` 直接
+        // continue，导致 A-B-C-A-B-C 在第 6 轮被无预警 hard-stop（hard 先查、soft
+        // 后查，soft 永不可能先触发，升级不变量被破坏）。修复后退化为「若干完整
+        // 周期 + 一个周期前缀」也判为循环，使 3 周期在第 4 轮（A-B-C-A）先拿到 Soft。
+        let a = vec!["tree::{\"path\":\"src\"}".to_string()];
+        let b = vec!["read_file::{\"path\":\"src/bin/a.rs\"}".to_string()];
+        let c = vec!["tree::{\"path\":\"src/bin\"}".to_string()];
+
+        // 不足窗口不误报。
+        assert!(!detect_tool_loop(&[a.clone(), b.clone(), c.clone()], TOOL_LOOP_SOFT_WINDOW));
+        // 3 周期 + 1 前缀正好填满 soft 窗口 4：应触发 Soft。
+        assert!(detect_tool_loop(
+            &[a.clone(), b.clone(), c.clone(), a.clone()],
+            TOOL_LOOP_SOFT_WINDOW
+        ));
+        // 完整 hard 窗口（6 轮整周期）仍触发，且整除路径不受影响。
+        assert!(detect_tool_loop(
+            &[a.clone(), b.clone(), c.clone(), a.clone(), b.clone(), c.clone()],
+            TOOL_LOOP_HARD_WINDOW
+        ));
+        // 前缀不匹配（第 4 轮与周期无关）不得误报。
+        assert!(!detect_tool_loop(
+            &[a.clone(), b.clone(), c.clone(), b.clone()],
+            TOOL_LOOP_SOFT_WINDOW
+        ));
+    }
+
+    #[test]
+    fn execute_command_is_read_only_skips_nav_segments_and_requires_all_substantive_read_only() {
+        // 前导 cd/export 无副作用，应跳过：`cd X && git status` 是只读。
+        assert!(execute_command_is_read_only("cd /tmp && git status --short"));
+        assert!(execute_command_is_read_only("cd /tmp && export FOO=1 && ls -la"));
+        // 任一实质段可能变更 → 非只读（堵住旧实现「只看首段」的盲区）。
+        assert!(!execute_command_is_read_only("ls /tmp && rm -rf build"));
+        assert!(!execute_command_is_read_only("cd /tmp && git checkout master"));
+        // 纯只读命令仍成立。
+        assert!(execute_command_is_read_only("git log --oneline -5"));
+        assert!(execute_command_is_read_only("ls -la /tmp"));
+    }
+
+    #[test]
     fn turn_supervisor_emits_soft_then_hard_loop_signal() {
         let mut supervisor = TurnSupervisor::default();
         let mut messages = Vec::new();
@@ -2333,6 +2416,55 @@ mod tests {
                 assert!(matches!(signal, ToolLoopSignal::None));
             }
         }
+    }
+
+    #[test]
+    fn soft_rearms_coarse_and_target_gates_so_post_soft_page_cycling_is_still_caught() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+
+        // 阶段一：同一只读调用重复到 soft 触发。
+        for i in 0..TOOL_LOOP_SOFT_WINDOW {
+            messages.push(pb_read_msg("src/main.rs", &format!("read-{i}")));
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            if i == TOOL_LOOP_SOFT_WINDOW - 1 {
+                assert!(matches!(signal, ToolLoopSignal::Soft));
+            }
+        }
+        assert!(supervisor.loop_breaker_injected);
+        // soft 处理器清空了 coarse/target 历史并重武装了它们的门。
+        assert!(supervisor.tool_signature_history_coarse.is_empty());
+        assert!(supervisor.tool_target_history.is_empty());
+        assert!(!supervisor.coarse_loop_note_injected);
+        assert!(!supervisor.target_repeat_note_injected);
+
+        // 阶段二：soft 后模型换一批 `ls` 变体继续翻同一日志目录。exact 签名各不相同，
+        // 不会重触发精确 soft/hard；但 coarse 签名都是 `ls:/data01/logs`，应在填满
+        // COARSE_WINDOW 后触发 Coarse（旧实现中该门被 loop_breaker_injected 永久挡死，
+        // 会一直漏到迭代上限）。
+        // 注意：第一个 `ls` 轮因 `/data01/logs` 是全新目标，会走 assess_progress 的
+        // 新目标 + 已注入过 loop 分支，触发 reset_tool_loop_escalation（清空 coarse
+        // 历史并重武装门）。因此需要在其后再积累 COARSE_WINDOW 轮同 coarse 样本。
+        let ls_variants = [
+            "ls -lt /data01/logs | head -20",
+            "ls -la /data01/logs | head -30",
+            "ls /data01/logs 2>/dev/null",
+            "ls -l /data01/logs | tail -5",
+            "ls -lt /data01/logs | head -10",
+            "ls -la /data01/logs | head -50",
+        ];
+        for (i, cmd) in ls_variants.iter().enumerate() {
+            messages.push(pb_execute_command_msg(cmd, &format!("ls-{i}")));
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            // 第 5 轮（ls-5，索引 5）是 reset 后填满 COARSE_WINDOW 的首轮。
+            if i == TOOL_LOOP_COARSE_WINDOW {
+                assert!(
+                    matches!(signal, ToolLoopSignal::Coarse),
+                    "post-soft coarse page cycling should be caught at window size"
+                );
+            }
+        }
+        assert!(supervisor.coarse_loop_note_injected);
     }
 
     #[test]
@@ -4428,7 +4560,7 @@ async fn run_turn_body(
                     }
                     let _ = writeln!(
                         std::io::stderr(),
-                        "  ⚠ 响应流读取中断（疑似服务端不稳定），自动重试…"
+                        "  ⚠ 响应流读取中断（连续第 {consecutive_stream_errors} 次）；正在自动重试，连续超过 {MAX_STREAM_ERROR_RETRIES} 次时停止…"
                     );
                 } else {
                     // 真截断：模型撞输出上限或工具 JSON 半截。

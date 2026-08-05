@@ -14,7 +14,6 @@ use super::{
     validate_subagent_response, wait_sources_for_channel_and_futex, wake_expired_task_waits,
     with_task_entry_by_pid, wrap_subagent_prompt,
 };
-use super::{ToolRegistration, ToolSpec};
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 use crate::ai::cli::ParsedCli;
 use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
@@ -26,7 +25,6 @@ use aios_kernel::{
     local::LocalOS,
     primitives::{ChannelId, FutexAddr, FutexOps, IpcOps},
 };
-use serde_json::Value;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
@@ -129,6 +127,57 @@ fn task_spawn_batch_rejects_unbounded_fan_out() {
             super::MAX_SUBAGENT_SPAWN_BATCH_SIZE
         )
     );
+}
+
+#[test]
+fn task_wait_hints_lone_spawn_and_consumes_hint_once() {
+    super::reset_last_spawn_batch_for_test();
+    super::record_last_spawn_batch(vec!["t-1".to_string()]);
+
+    let hint = super::lone_spawn_hint_note(&["t-1".to_string()])
+        .expect("lone spawn+wait should hint");
+    assert!(hint.contains("lone_spawn"));
+    assert!(hint.contains("synchronous `task`"));
+
+    // 只提示一次：hinted 置位后，同一会话内不再重复提示。
+    assert!(super::lone_spawn_hint_note(&["t-1".to_string()]).is_none());
+    super::reset_last_spawn_batch_for_test();
+}
+
+#[test]
+fn task_wait_no_hint_for_multi_task_spawn() {
+    super::reset_last_spawn_batch_for_test();
+    super::record_last_spawn_batch(vec!["t-1".to_string(), "t-2".to_string()]);
+    assert!(
+        super::lone_spawn_hint_note(&["t-1".to_string()]).is_none(),
+        "batch spawn 是真正的 fan-out，不应提示改用同步 task"
+    );
+    super::reset_last_spawn_batch_for_test();
+}
+
+#[test]
+fn task_wait_no_hint_when_waiting_unrelated_task() {
+    super::reset_last_spawn_batch_for_test();
+    super::record_last_spawn_batch(vec!["t-1".to_string()]);
+    assert!(
+        super::lone_spawn_hint_note(&["t-other".to_string()]).is_none(),
+        "wait 的不是最近 spawn 的任务，不提示"
+    );
+    // 未命中不消耗 hint：之后 wait 自己的任务仍可提示。
+    assert!(super::lone_spawn_hint_note(&["t-1".to_string()]).is_some());
+    super::reset_last_spawn_batch_for_test();
+}
+
+#[test]
+fn task_wait_no_hint_after_newer_spawn() {
+    super::reset_last_spawn_batch_for_test();
+    super::record_last_spawn_batch(vec!["t-1".to_string()]);
+    super::record_last_spawn_batch(vec!["t-2".to_string()]);
+    assert!(
+        super::lone_spawn_hint_note(&["t-1".to_string()]).is_none(),
+        "t-2 是更近的 spawn，wait 旧的 t-1 不提示"
+    );
+    super::reset_last_spawn_batch_for_test();
 }
 
 fn test_app_with_model(current_model: String) -> App {
@@ -2011,133 +2060,4 @@ fn outstanding_task_anchor_lists_ids_and_required_follow_up() {
     assert!(note.contains("task_id=task_alpha status=running"));
     assert!(note.contains("task_id=task_beta status=completed"));
     assert!(note.contains("use `task_wait` with the same task_ids"));
-}
-
-fn params_question() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "question": {
-                "type": "string",
-                "description": "The question to ask the user."
-            },
-            "header": {
-                "type": "string",
-                "description": "Very short label (max 30 chars) for context."
-            },
-            "options": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "label": {
-                            "type": "string",
-                            "description": "Display text for this option (1-5 words)."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Brief explanation of what this option means."
-                        }
-                    },
-                    "required": ["label", "description"]
-                },
-                "description": "Available choices for the user."
-            },
-            "multiple": {
-                "type": "boolean",
-                "description": "Allow selecting multiple choices (default: false)."
-            }
-        },
-        "required": ["question", "header", "options"]
-    })
-}
-
-inventory::submit!(ToolRegistration {
-    spec: ToolSpec {
-        name: "question",
-        description: "Ask the user questions during execution. Use this to gather preferences, clarify ambiguous instructions, get decisions on implementation choices, or offer choices about direction. Returns the user's selected answer(s).",
-        parameters: params_question,
-        execute: execute_question,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core"],
-    }
-});
-
-pub(crate) fn execute_question(args: &Value) -> Result<String, String> {
-    let question = args["question"]
-        .as_str()
-        .ok_or("Missing 'question' parameter")?;
-
-    let header = args["header"]
-        .as_str()
-        .ok_or("Missing 'header' parameter")?;
-
-    let options = args["options"]
-        .as_array()
-        .ok_or("Missing 'options' parameter (must be an array)")?;
-
-    if options.is_empty() {
-        return Err("options array cannot be empty".to_string());
-    }
-
-    let multiple = args["multiple"].as_bool().unwrap_or(false);
-
-    println!("\n--- Question: {} ---", header);
-    println!("{}", question);
-    println!();
-
-    for (i, opt) in options.iter().enumerate() {
-        let label = opt["label"].as_str().unwrap_or("?");
-        let desc = opt["description"].as_str().unwrap_or("");
-        println!("  {}. {} - {}", i + 1, label, desc);
-    }
-    println!();
-
-    if multiple {
-        println!("Enter option numbers separated by commas (or type your own answer):");
-    } else {
-        println!("Enter option number (or type your own answer):");
-    }
-
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| format!("Failed to read input: {}", e))?;
-
-    let input = input.trim();
-
-    if input.is_empty() {
-        return Err("No answer provided".to_string());
-    }
-
-    if multiple {
-        let selections: Vec<&str> = input.split(',').map(|s| s.trim()).collect();
-        let mut selected_labels = Vec::new();
-
-        for sel in &selections {
-            if let Ok(idx) = sel.parse::<usize>() {
-                if idx > 0 && idx <= options.len() {
-                    if let Some(label) = options[idx - 1]["label"].as_str() {
-                        selected_labels.push(label.to_string());
-                    }
-                } else {
-                    return Ok(format!("[User answer] {}", input));
-                }
-            } else {
-                return Ok(format!("[User answer] {}", input));
-            }
-        }
-
-        Ok(format!("[User selected] {}", selected_labels.join(", ")))
-    } else {
-        if let Ok(idx) = input.parse::<usize>() {
-            if idx > 0 && idx <= options.len() {
-                if let Some(label) = options[idx - 1]["label"].as_str() {
-                    return Ok(format!("[User selected] {}", label));
-                }
-            }
-        }
-
-        Ok(format!("[User answer] {}", input))
-    }
 }

@@ -60,7 +60,6 @@ inventory::submit!(ToolRegistration {
         description: "Display directory tree structure with depth control. Shows files and directories in a hierarchical format, respecting .gitignore-style skip directories. Use this to quickly understand project layout without reading individual files.",
         parameters: params_tree,
         execute: execute_tree,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin", "core"],
     }
 });

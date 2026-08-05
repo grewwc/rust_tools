@@ -162,7 +162,6 @@ inventory::submit!(ToolRegistration {
         description: "Spawn a fire-and-forget background process in the Agent OS. Returns the PID immediately and does NOT return the process's result — the scheduler runs it autonomously and you only observe it via IPC (read_mailbox / wait_process) or its side effects. Use this for long-running background processes, two-way IPC collaboration, or work whose output you do not need to collect back. If you need the task's result returned to you, use task_spawn instead.",
         parameters: params_spawn_process,
         execute: execute_spawn_process,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -201,7 +200,6 @@ inventory::submit!(ToolRegistration {
         description: "Suspend the current process for a number of scheduler ticks, then resume it later via the ready queue.",
         parameters: params_sleep_process,
         execute: execute_sleep_process,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -245,7 +243,6 @@ inventory::submit!(ToolRegistration {
         description: "Suspend the current process until the specified child process (PID) terminates. You will be awakened via your mailbox with the child's result.",
         parameters: params_wait_process,
         execute: execute_wait_process,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -293,7 +290,6 @@ inventory::submit!(ToolRegistration {
         description: "Terminate a child or descendant process when the current process has management capability.",
         parameters: params_kill_process,
         execute: execute_kill_process,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -341,7 +337,6 @@ inventory::submit!(ToolRegistration {
         description: "Send an Inter-Process Communication (IPC) message to another running process's mailbox.",
         parameters: params_send_ipc,
         execute: execute_send_ipc,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -380,7 +375,6 @@ inventory::submit!(ToolRegistration {
         description: "Collect a terminated child or descendant process and remove it from the process table.",
         parameters: params_reap_process,
         execute: execute_reap_process,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -412,10 +406,9 @@ fn execute_read_mailbox(_args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "read_mailbox",
-        description: "Read all pending IPC messages, wake-up notifications, and child process termination results from your mailbox. Calling this empties the mailbox. When the mailbox contains async tool wake-up messages, use them to decide whether to call tool_status, tool_wait, tool_cancel, or continue reasoning with already available results.",
+        description: "Read all pending IPC messages, wake-up notifications, and child process termination results from your mailbox. Calling this empties the mailbox. When the mailbox contains subagent wake-up messages, use them to decide whether to call task_status, task_wait, task_cancel, or continue reasoning with already available results.",
         parameters: params_read_mailbox,
         execute: execute_read_mailbox,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -452,7 +445,6 @@ inventory::submit!(ToolRegistration {
         description: "Set an environment variable in the current process's Context Manager. Child processes will inherit this context.",
         parameters: params_set_env,
         execute: execute_set_env,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -525,7 +517,6 @@ inventory::submit!(ToolRegistration {
         description: "List all processes in the Agent OS with their PID, parent PID, state, priority, quota, and name. Use this to inspect the process tree before deciding to kill, wait, or reap.",
         parameters: params_ps_processes,
         execute: execute_ps_processes,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -625,7 +616,6 @@ inventory::submit!(ToolRegistration {
         description: "List AIOS IPC channels and result pipes with owner tags, queued messages, and named ref holders. By default this shows only hanging result pipes that still have refs, buffered messages, or are not closed yet.",
         parameters: params_ps_ipc,
         execute: execute_ps_ipc,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -689,7 +679,6 @@ inventory::submit!(ToolRegistration {
         description: "Send a POSIX-like signal to a child or descendant process. SIGCANCEL=request cooperative cancellation of current turn/tool work, SIGTERM=request graceful termination, SIGSTOP=pause execution, SIGCONT=resume paused process, SIGKILL=immediate forced termination (cascades to grandchildren).",
         parameters: params_signal_process,
         execute: execute_signal_process,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -726,7 +715,6 @@ inventory::submit!(ToolRegistration {
         description: "Assign a process to a process group. Processes in the same group can be signaled together with signal_process_group.",
         parameters: params_set_process_group,
         execute: execute_set_process_group,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -777,7 +765,6 @@ inventory::submit!(ToolRegistration {
         description: "Send a signal to all processes in a process group. Useful for batch operations like stopping or terminating a group of related processes.",
         parameters: params_signal_process_group,
         execute: execute_signal_process_group,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -814,7 +801,6 @@ inventory::submit!(ToolRegistration {
         description: "Create a new shared memory region with a key-value pair. Other processes can read and write this data. Fails if the key already exists.",
         parameters: params_shm_create,
         execute: execute_shm_create,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -879,7 +865,6 @@ inventory::submit!(ToolRegistration {
         description: "Read the value of a shared memory region by key. Returns degraded data with warning if owner has terminated or data is corrupted. Fails only if key not found or permission denied with no fallback.",
         parameters: params_shm_read,
         execute: execute_shm_read,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -914,7 +899,6 @@ inventory::submit!(ToolRegistration {
         description: "Update the value of an existing shared memory region. Fails if the key does not exist (use shm_create first).",
         parameters: params_shm_write,
         execute: execute_shm_write,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -947,7 +931,6 @@ inventory::submit!(ToolRegistration {
         description: "Delete a shared memory region by key.",
         parameters: params_shm_delete,
         execute: execute_shm_delete,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -982,7 +965,6 @@ inventory::submit!(ToolRegistration {
         description: "Set the working directory for the current process. Child processes will inherit this directory.",
         parameters: params_set_working_dir,
         execute: execute_set_working_dir,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });
@@ -1037,7 +1019,6 @@ inventory::submit!(ToolRegistration {
         description: "Spawn a daemon process that automatically restarts when it terminates (up to max_restarts times). Useful for long-running background services like file watchers or knowledge indexers.",
         parameters: params_spawn_daemon,
         execute: execute_spawn_daemon,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "executor"],
     }
 });

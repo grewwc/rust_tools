@@ -345,6 +345,56 @@ static TASK_WAIT_STATES: LazyLock<Mutex<FxHashMap<TaskWaitKey, TaskWaitState>>> 
 
 const OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX: &str = "[pending-subagent-tasks]";
 
+/// 最近一次 `task_spawn` / `task_spawn_batch` 成功产生的任务 id 列表，用于检测
+/// "lone spawn" 反模式：spawn 单个任务后立即 `task_wait` 收集它。该场景没有并发
+/// 收益，应该用同步 `task` 工具（spawn + wait 只会更慢）。提示是轻量规范引导：
+/// 只提示一次、绝不拒绝或阻塞，模型可忽略（例如它确实在 spawn 与 wait 之间插入了
+/// 父侧工作）。
+struct LastSpawnBatch {
+    task_ids: Vec<String>,
+    hinted: bool,
+}
+static LAST_SPAWN_BATCH: LazyLock<Mutex<Option<LastSpawnBatch>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn record_last_spawn_batch(task_ids: Vec<String>) {
+    *LAST_SPAWN_BATCH.lock().unwrap() = Some(LastSpawnBatch {
+        task_ids,
+        hinted: false,
+    });
+}
+
+/// 若本次 wait 的 task_ids 命中"最近一次 spawn 是单个任务"且尚未提示过，
+/// 返回一次规范提示文本（消费 hinted 标志，保证整轮会话只提示一次）。
+fn lone_spawn_hint_note(waited_task_ids: &[String]) -> Option<String> {
+    let mut guard = match LAST_SPAWN_BATCH.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let record = guard.as_mut()?;
+    if record.hinted || record.task_ids.len() != 1 {
+        return None;
+    }
+    let sole_id = &record.task_ids[0];
+    if !waited_task_ids.contains(sole_id) {
+        return None;
+    }
+    record.hinted = true;
+    Some(
+        "[tool_followup:lone_spawn]\n\
+         This task_wait collects the only task spawned by the most recent task_spawn call. \
+         Spawning a single task and waiting on it adds no concurrency: for one-task handoffs use \
+         the synchronous `task` tool instead of task_spawn + task_wait. \
+         (If you intentionally ran parent-side work between spawn and wait, ignore this hint.)"
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn reset_last_spawn_batch_for_test() {
+    *LAST_SPAWN_BATCH.lock().unwrap() = None;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutstandingTaskSnapshot {
     task_id: String,
@@ -820,7 +870,6 @@ inventory::submit!(ToolRegistration {
         description: "Launch a specialized subagent synchronously and return its final output. The current agent blocks until the subagent finishes. Use this for a single focused side investigation when you need the result before continuing. For multiple parallel subagents prefer task_spawn + task_wait. The runtime auto-selects a subagent when 'agent' is omitted.",
         parameters: params_task,
         execute: execute_task,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -894,10 +943,9 @@ fn params_task_spawn_batch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_spawn",
-        description: "Launch a subagent task asynchronously and return immediately with a task_id, so you can fan out several independent subtasks and let them run concurrently. For a SINGLE delegated subtask whose result you need back, prefer the synchronous `task` — a lone task_spawn immediately followed by task_wait runs no more concurrently than `task` and only adds overhead. After spawning, continue any independent parent-side work instead of immediately calling task_wait; use task_status for a non-blocking snapshot. Call task_wait only when the parent is blocked on results or has no productive work left. The returned task_id remains collectable until its result is consumed.",
+        description: "Launch a subagent task asynchronously and return immediately with a task_id, so you can fan out several independent subtasks and let them run concurrently. For a SINGLE delegated subtask whose result you need back, prefer the synchronous `task` — a lone task_spawn immediately followed by task_wait runs no more concurrently than `task` and only adds overhead. After spawning, continue independent parent-side work; use task_status for a non-blocking snapshot and call task_wait only when blocked on results. The returned task_id remains collectable until its result is consumed.",
         parameters: params_task_spawn,
         execute: execute_task_spawn,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -908,7 +956,6 @@ inventory::submit!(ToolRegistration {
         description: "Spawn multiple independent subagent tasks in one deterministic batch. Every item is preflight-validated before any child starts, then spawn attempts run in input order and the returned task entries preserve that order. Runtime spawn failures are reported per item without hiding already-started tasks.",
         parameters: params_task_spawn_batch,
         execute: execute_task_spawn_batch,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -1302,6 +1349,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_spawn")?;
     let prepared = prepare_subagent_task(args)?;
     let spawned = spawn_subagent_kernel_task(&prepared)?;
+    record_last_spawn_batch(vec![spawned.task_id.clone()]);
 
     Ok(format!(
         "Task spawned: task_id={}, pid={}, agent={}, model={}, inherit={}\nContinue independent parent-side work now. Do not call task_wait immediately unless the parent is blocked on this result; use task_status for a non-blocking snapshot.",
@@ -1340,10 +1388,12 @@ pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
 
     let mut spawned_count = 0usize;
     let mut entries = Vec::with_capacity(prepared.len());
+    let mut spawned_ids = Vec::with_capacity(prepared.len());
     for (index, task) in prepared.iter().enumerate() {
         match spawn_subagent_kernel_task(task) {
             Ok(spawned) => {
                 spawned_count += 1;
+                spawned_ids.push(spawned.task_id.clone());
                 entries.push(serde_json::json!({
                     "index": index,
                     "status": "spawned",
@@ -1363,6 +1413,9 @@ pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
                 "inherit": task.inherit.describe(),
             })),
         }
+    }
+    if !spawned_ids.is_empty() {
+        record_last_spawn_batch(spawned_ids);
     }
 
     Ok(serde_json::to_string_pretty(&serde_json::json!({
@@ -1393,7 +1446,6 @@ inventory::submit!(ToolRegistration {
         description: "Retry a terminal failed, timed-out, or cancelled subagent as a new linked attempt using the original task configuration. Returns a new task_id; collect and integrate the old and new attempts separately.",
         parameters: params_task_retry,
         execute: execute_task_retry,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -1475,10 +1527,9 @@ fn params_task_wait() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_wait",
-        description: "Wait for one or more asynchronously spawned subagent tasks (started by task_spawn) to complete and collect their results. Do NOT pass tool_spawn task_ids here -- use tool_wait for those. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. The `timeout_secs` argument is a per-call wait budget — when it elapses without satisfying the policy, the call returns with already-collected results AND a clear note that the remaining subagents are still running; you can call task_wait again with the same task_ids to keep waiting (or pass `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
+        description: "Wait for one or more asynchronously spawned subagent tasks (started by task_spawn) to complete and collect their results. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. `timeout_secs` is a per-call budget: on expiry it returns already-collected results plus a note that the rest are still running, and you may call it again with the same task_ids (or pass `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
         parameters: params_task_wait,
         execute: execute_task_wait,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -1491,22 +1542,6 @@ inventory::submit!(ToolHistoryPolicyRegistration {
         counts_toward_precision_inline_budget: false,
     },
 });
-
-fn execute_tool_spawn_placeholder(_args: &Value) -> Result<String, String> {
-    Err("tool_spawn is handled by the runtime".to_string())
-}
-
-fn execute_tool_wait_placeholder(_args: &Value) -> Result<String, String> {
-    Err("tool_wait is handled by the runtime".to_string())
-}
-
-fn execute_tool_status_placeholder(_args: &Value) -> Result<String, String> {
-    Err("tool_status is handled by the runtime".to_string())
-}
-
-fn execute_tool_cancel_placeholder(_args: &Value) -> Result<String, String> {
-    Err("tool_cancel is handled by the runtime".to_string())
-}
 
 fn ensure_top_level_task_orchestration(tool_name: &str) -> Result<(), String> {
     if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
@@ -1630,6 +1665,8 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             already_delivered.len()
         ));
     }
+    // lone-spawn 规范提示：只计算一次（消费 hinted 标志），后续返回点统一附加。
+    let lone_spawn_hint = lone_spawn_hint_note(&task_ids);
     let wait_key = task_wait_key(
         &current_session_id,
         current_owner_pid,
@@ -1803,11 +1840,14 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         registry.remove(tid);
     }
     if let Some(message) = wait_message {
-        return Ok(message);
+        return Ok(append_lone_spawn_hint(message, lone_spawn_hint.as_deref()));
     }
     if wait_policy == WaitPolicy::Any && !ready.is_empty() {
         clear_task_wait_state(&wait_key);
-        return Ok(ready.join("\n\n---\n\n"));
+        return Ok(append_lone_spawn_hint(
+            ready.join("\n\n---\n\n"),
+            lone_spawn_hint.as_deref(),
+        ));
     }
     if !pending.is_empty() {
         // Surface partial progress instead of dropping it on the floor.
@@ -1839,14 +1879,28 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             }
         }
         clear_task_wait_state(&wait_key);
-        return Ok(parts.join("\n\n---\n\n"));
+        return Ok(append_lone_spawn_hint(
+            parts.join("\n\n---\n\n"),
+            lone_spawn_hint.as_deref(),
+        ));
     }
 
     for tid in &task_ids {
         registry.remove(tid);
     }
     clear_task_wait_state(&wait_key);
-    Ok(ready.join("\n\n---\n\n"))
+    Ok(append_lone_spawn_hint(
+        ready.join("\n\n---\n\n"),
+        lone_spawn_hint.as_deref(),
+    ))
+}
+
+fn append_lone_spawn_hint(mut text: String, hint: Option<&str>) -> String {
+    if let Some(hint) = hint {
+        text.push_str("\n\n");
+        text.push_str(hint);
+    }
+    text
 }
 
 /// 向 subagent 的 result channel 写入一条终态结果并终止其 kernel 进程。用于
@@ -1970,7 +2024,6 @@ inventory::submit!(ToolRegistration {
         description: "Show status of all asynchronously spawned tasks. Lists task_id, agent, model, and current state (running/completed/failed) without blocking. For tasks that have already finished, their output is included inline and collected immediately, so you can use completed results right away without calling task_wait.",
         parameters: params_task_status,
         execute: execute_task_status,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -2078,7 +2131,6 @@ inventory::submit!(ToolRegistration {
         description: "Acknowledge durable subagent results after incorporating or explicitly rejecting them. Every delivered task_id must be integrated before a normal final answer.",
         parameters: params_task_integrate,
         execute: execute_task_integrate,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -2113,10 +2165,9 @@ fn params_task_cancel() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_cancel",
-        description: "Cancel one or more asynchronously spawned subagent tasks (started by task_spawn) that are still running. Do NOT pass tool_spawn task_ids here -- use tool_cancel for those. Cancelling terminates the subagent process and fills its result slot with a 'cancelled' terminal result, so a subsequent task_wait/task_status reports it as cancelled rather than hanging. Use this to abandon a stuck or no-longer-needed background subagent instead of repeatedly calling task_wait.",
+        description: "Cancel one or more asynchronously spawned subagent tasks (started by task_spawn) that are still running. Cancelling terminates the subagent process and fills its result slot with a 'cancelled' terminal result, so a subsequent task_wait/task_status reports it as cancelled rather than hanging. Use this to abandon a stuck or no-longer-needed background subagent instead of repeatedly calling task_wait.",
         parameters: params_task_cancel,
         execute: execute_task_cancel,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });

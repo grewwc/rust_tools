@@ -3848,6 +3848,7 @@ mod tests {
             std::env::temp_dir().join(format!("ai-tool-round-checkpoint-{}", uuid::Uuid::new_v4()));
         let history_file = session_root.join("history.sqlite");
         let mut app = test_app_with_tools(&["read_file"]);
+        app.config.history_file = history_file.clone();
         app.session_history_file = history_file.clone();
         app.session_id = "checkpoint-test".to_string();
 

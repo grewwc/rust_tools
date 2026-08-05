@@ -629,15 +629,24 @@ pub async fn do_request_json(
         stream,
     );
 
-    for attempt in 1..=REQUEST_MAX_ATTEMPTS {
-        let api_key = api_key_for_request_model(app, model);
+    // 辅助请求也必须复用主请求的 provider key 轮换。`a -n` 等路径走这里；
+    // 若只取首个结果，会在通用 `api_key` 失效时跳过 `opencode.api_key_*`。
+    let primary_key = api_key_for_request_model(app, model);
+    let adapter = adapter_for(models::model_adapter(model), &endpoint);
+    let keys_to_try = adapter.collect_api_keys(&primary_key);
+    let total_keys = keys_to_try.len();
+    let mut key_idx = 0usize;
+    let mut attempt = 1usize;
+
+    loop {
+        let api_key = &keys_to_try[key_idx];
         let t0 = Instant::now();
         token_budget::wait_for_request_budget(
             app,
             model,
             &endpoint,
             &request_model,
-            &api_key,
+            api_key,
             token_budget::calibrate_prompt_tokens_for_budget(
                 token_budget::estimate_json_request_tokens(&request_body),
                 app.last_known_prompt_tokens,
@@ -649,7 +658,7 @@ pub async fn do_request_json(
         .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
         // 非流式辅助请求：每次尝试 60 秒超时
         let send_future = async {
-            let resp = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+            let resp = apply_request_auth(app.client.post(&endpoint), &endpoint, api_key)
                 .header("Content-Type", "application/json")
                 .json(&request_body)
                 .send()
@@ -680,6 +689,7 @@ pub async fn do_request_json(
                         attempt,
                         REQUEST_MAX_ATTEMPTS
                     ));
+                    attempt += 1;
                     continue;
                 }
                 return Err("do_request_json: all attempts timed out".into());
@@ -729,12 +739,28 @@ pub async fn do_request_json(
                     Err(err) => return Err(Box::new(err)),
                 };
                 let err = RequestError::status(status, body);
+                if should_rotate_key(&err) && key_idx + 1 < total_keys {
+                    let next_key_idx = key_idx + 1;
+                    super::emit_request_diagnostic(format_args!(
+                        "[{}] key #{} failed, trying next key #{} ({} remaining)",
+                        adapter.label(),
+                        key_idx,
+                        next_key_idx,
+                        total_keys - next_key_idx
+                    ));
+                    key_idx = next_key_idx;
+                    continue;
+                }
                 if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
                     let delay = retry_after_delay.unwrap_or_else(|| retry_delay(attempt));
                     if sleep_with_cancel(app, delay).await {
                         return Err(Box::new(RequestError::cancelled(
                             "request canceled by user during retry wait",
                         )));
+                    }
+                    attempt += 1;
+                    if status_code == 429 {
+                        key_idx = 0;
                     }
                     continue;
                 }
@@ -748,14 +774,13 @@ pub async fn do_request_json(
                             "request canceled by user during retry wait",
                         )));
                     }
+                    attempt += 1;
                     continue;
                 }
                 return Err(err.into());
             }
         }
     }
-
-    Err("request failed after all attempts".into())
 }
 
 /// 流式聚合请求：发起 `stream: true` 请求，逐 chunk 累积 `delta.content`，
@@ -893,13 +918,20 @@ pub async fn do_request_text_streaming(
         model, &endpoint, messages, true, None, true,
     );
 
-    for attempt in 1..=REQUEST_MAX_ATTEMPTS {
-        let api_key = api_key_for_request_model(app, model);
+    let primary_key = api_key_for_request_model(app, model);
+    let adapter = adapter_for(models::model_adapter(model), &endpoint);
+    let keys_to_try = adapter.collect_api_keys(&primary_key);
+    let total_keys = keys_to_try.len();
+    let mut key_idx = 0usize;
+    let mut attempt = 1usize;
+
+    loop {
+        let api_key = &keys_to_try[key_idx];
         let retry_policy = request_retry_policy_for_current_context();
         let estimated_prompt_tokens = token_budget::estimate_json_request_tokens(&request_body);
         let client = app.client.clone();
         let build_request = || {
-            apply_request_auth(client.post(&endpoint), &endpoint, &api_key)
+            apply_request_auth(client.post(&endpoint), &endpoint, api_key)
                 .header("Content-Type", "application/json")
                 .json(&request_body)
         };
@@ -914,7 +946,7 @@ pub async fn do_request_text_streaming(
                 model,
                 &endpoint,
                 &request_model,
-                &api_key,
+                api_key,
                 estimated_prompt_tokens,
                 build_request,
                 retry_policy.hedged_backup_after_secs(),
@@ -939,12 +971,28 @@ pub async fn do_request_text_streaming(
                         Err(err) => return Err(Box::new(err)),
                     };
                     let err = RequestError::status(status, body);
+                    if should_rotate_key(&err) && key_idx + 1 < total_keys {
+                        let next_key_idx = key_idx + 1;
+                        super::emit_request_diagnostic(format_args!(
+                            "[{}] key #{} failed, trying next key #{} ({} remaining)",
+                            adapter.label(),
+                            key_idx,
+                            next_key_idx,
+                            total_keys - next_key_idx
+                        ));
+                        key_idx = next_key_idx;
+                        continue;
+                    }
                     if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
                         let delay = retry_delay(attempt);
                         if sleep_with_cancel(app, delay).await {
                             return Err(Box::new(RequestError::cancelled(
                                 "request canceled by user during retry wait",
                             )));
+                        }
+                        attempt += 1;
+                        if status.as_u16() == 429 {
+                            key_idx = 0;
                         }
                         continue;
                     }
@@ -960,6 +1008,7 @@ pub async fn do_request_text_streaming(
                             "request canceled by user during retry wait",
                         )));
                     }
+                    attempt += 1;
                     continue;
                 }
                 return Err(Box::new(err));
@@ -973,6 +1022,7 @@ pub async fn do_request_text_streaming(
                         attempt,
                         REQUEST_MAX_ATTEMPTS
                     ));
+                    attempt += 1;
                     continue;
                 }
                 return Err("do_request_text_streaming: all attempts timed out".into());
@@ -1087,10 +1137,9 @@ pub async fn do_request_text_streaming(
                 attempt,
                 REQUEST_MAX_ATTEMPTS
             ));
+            attempt += 1;
             continue;
         }
         return Ok(content);
     }
-
-    Err("do_request_text_streaming: failed after all attempts".into())
 }

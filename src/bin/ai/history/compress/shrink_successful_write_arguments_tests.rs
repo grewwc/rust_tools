@@ -325,3 +325,37 @@ fn medium_arguments_not_shrunk_and_not_archived() {
     );
     let _ = std::fs::remove_dir_all(&overflow_dir);
 }
+
+/// 长归档路径吃光全部 target 预算时，ToolArguments stub 的 preview 会退化为空串。
+/// 修复前这种 `"preview": ""` stub 会被写回历史，模型随后把
+/// `_context_overflow_truncated` / `archive_file_path` / `preview` 当成真实参数名
+/// 回发，形成死循环（见会话 ab41bc6d）。修复后应直接放弃截断、保留原 arguments，
+/// 且不落盘归档。
+#[test]
+fn empty_preview_stub_rejected_when_path_eats_budget() {
+    // 构造超长 overflow 目录名，使归档路径长度逼近/超过 target(160)。
+    let long_segment = "d".repeat(140);
+    let overflow_dir = std::env::temp_dir().join(long_segment);
+    let original_args = format!(
+        r#"{{"file_path":"/tmp/x.txt","content":"{}"}}"#,
+        "c".repeat(400)
+    );
+    let mut message = assistant_call_args("call-x", "write_file", &original_args);
+    // original≈460, target=160：reduce_by=300。
+    let reduced = truncate_mutable_field(
+        &mut message,
+        MutableMessageField::ToolArguments(0),
+        300,
+        Some(&overflow_dir),
+    );
+    assert!(
+        !reduced,
+        "must reject truncation when preview budget is exhausted"
+    );
+    let args = &message.tool_calls.as_ref().unwrap()[0].function.arguments;
+    assert_eq!(args, &original_args, "arguments must be left intact");
+    assert!(
+        !overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists(),
+        "no archive write when truncation is rejected"
+    );
+}

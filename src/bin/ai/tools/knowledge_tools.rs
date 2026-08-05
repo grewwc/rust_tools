@@ -226,7 +226,6 @@ inventory::submit!(ToolRegistration {
         description: "Save user-directed content to the global knowledge base with optional category and tags. Use guideline categories like `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` for durable principles/constraints that can be retrieved explicitly.",
         parameters: params_knowledge_save,
         execute: execute_knowledge_save,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -305,7 +304,6 @@ inventory::submit!(ToolRegistration {
         description: "Delete a knowledge entry by id. Use knowledge_list or knowledge_search first to find the id.",
         parameters: params_knowledge_forget,
         execute: execute_knowledge_forget,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -318,7 +316,7 @@ fn params_knowledge_search() -> Value {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Keywords to match. Use knowledge_semantic_search for paraphrases or related concepts."
+                "description": "Keywords to match. For paraphrases or related concepts, enable `knowledge_semantic_search` via `enable_tools` first."
             },
             "category": {
                 "type": "string",
@@ -399,10 +397,9 @@ fn knowledge_search_entry_visible(entry: &AgentMemoryEntry, category: Option<&st
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_search",
-        description: "Search saved knowledge by keywords. For paraphrases or related concepts, use knowledge_semantic_search.",
+        description: "Search saved knowledge by keywords. For paraphrases or related concepts, enable `knowledge_semantic_search` via `enable_tools` first.",
         parameters: params_knowledge_search,
         execute: execute_knowledge_search,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin", "core"],
     }
 });
@@ -511,7 +508,6 @@ inventory::submit!(ToolRegistration {
         description: "List recent knowledge base entries. Shows id, category, and content preview.",
         parameters: params_knowledge_list,
         execute: execute_knowledge_list,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin", "core"],
     }
 });
@@ -746,7 +742,6 @@ inventory::submit!(ToolRegistration {
         description: "Two-phase knowledge consolidation. First call with action=\"read_all\" to get all entries; then call with action=\"execute\", delete_ids=[...], and/or save_entries=[...] to apply a consolidation plan. The agent analyzes which entries are useful, obsolete, or mergeable.",
         parameters: params_knowledge_consolidate,
         execute: execute_knowledge_consolidate,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });

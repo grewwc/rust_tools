@@ -34,6 +34,39 @@ fn prompt_cache_metrics_reports_hit_rate() {
 }
 
 #[test]
+fn waiting_hint_tool_name_is_single_line_and_terminal_safe() {
+    assert_eq!(
+        sanitize_waiting_hint_tool_name("apply_\x1b[31mpatch\n next\tstep"),
+        "apply_patch next step"
+    );
+    assert_eq!(sanitize_waiting_hint_tool_name("\n\t"), "tool");
+}
+
+#[test]
+fn idle_timeout_discards_unconfirmed_tool_call_and_marks_stream_error() {
+    let mut app = test_app();
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.content.stream_idle_timed_out = true;
+    state.content.tool_calls_map.insert(
+        0,
+        ToolCallBuilder {
+            id: "call-timeout".to_string(),
+            tool_type: "function".to_string(),
+            function_name: "apply_patch".to_string(),
+            arguments: r#"{"patch":"partial but currently valid"}"#.to_string(),
+            printed_arguments_len: 0,
+        },
+    );
+
+    let result = finalize_stream_response(&mut app, &markers, state).unwrap();
+
+    assert_eq!(result.outcome, StreamOutcome::Truncated);
+    assert!(result.stream_error);
+    assert!(result.tool_calls.is_empty());
+}
+
+#[test]
 fn degenerate_reasoning_repetition_requires_three_long_contentful_copies() {
     let phrase = "需要先确认当前上下文是否仍然有效，然后再继续执行。";
     assert!(!has_degenerate_repetition(&phrase.repeat(2)));

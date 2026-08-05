@@ -49,11 +49,9 @@ impl ConfigW {
     }
 
     fn parse_line(&mut self, line: &str) {
+        let line = strip_inline_comment(line);
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            return;
-        }
-        if trimmed.starts_with('#') || trimmed.starts_with("//") {
             return;
         }
 
@@ -77,6 +75,38 @@ impl ConfigW {
         self.index.insert(key.clone(), self.entries.len());
         self.entries.push((key, val));
     }
+}
+
+fn strip_inline_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut previous = None;
+
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            previous = Some(ch);
+            continue;
+        }
+        if ch == '\\' && quote.is_some() {
+            escaped = true;
+            previous = Some(ch);
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            match quote {
+                Some(open) if open == ch => quote = None,
+                None => quote = Some(ch),
+                _ => {}
+            }
+        } else if quote.is_none() && previous.is_none_or(char::is_whitespace) {
+            if ch == '#' || line[idx..].starts_with("//") {
+                return &line[..idx];
+            }
+        }
+        previous = Some(ch);
+    }
+    line
 }
 
 fn normalize_value(v: &str) -> String {
@@ -153,5 +183,22 @@ k3="a=b=c"
         assert_eq!(cfg.get("k1", ""), "v1");
         assert_eq!(cfg.get("k2", ""), "v2");
         assert_eq!(cfg.get("k3", ""), "a=b=c");
+    }
+
+    #[test]
+    fn test_parse_line_strips_inline_comments_outside_quotes() {
+        let cfg = ConfigW::parse(
+            "opencode.api_key_active = \"active-key\" # account\n\
+             # opencode.api_key = \"disabled-key\"\n\
+             endpoint = https://example.com/v1 // comment\n\
+             quoted_hash = \"value # remains\"\n\
+             compact_hash = value#remains",
+        );
+
+        assert_eq!(cfg.get("opencode.api_key_active", ""), "active-key");
+        assert_eq!(cfg.get_opt("opencode.api_key"), None);
+        assert_eq!(cfg.get("endpoint", ""), "https://example.com/v1");
+        assert_eq!(cfg.get("quoted_hash", ""), "value # remains");
+        assert_eq!(cfg.get("compact_hash", ""), "value#remains");
     }
 }

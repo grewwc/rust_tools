@@ -255,9 +255,13 @@ pub(super) fn enforce_protected_precision_group_budget(
             })
             .collect();
 
+        // 已外溢成 stub / 空文本的结果不再计入可用预算：它们已被固定协议文本占用，
+        // 记入会让 total_chars 虚高，导致同组其它结果被多外溢。
         let mut total_chars = precision_results
             .iter()
-            .map(|(idx, _)| value_to_string(&messages[*idx].content).chars().count())
+            .map(|(idx, _)| value_to_string(&messages[*idx].content))
+            .filter(|text| !text.trim().is_empty() && !is_preserved_tool_overflow_stub(text))
+            .map(|text| text.chars().count())
             .sum::<usize>();
         precision_results.sort_unstable_by_key(|(idx, _)| {
             std::cmp::Reverse(value_to_string(&messages[*idx].content).chars().count())
@@ -291,13 +295,21 @@ pub(super) fn enforce_protected_precision_group_budget(
                     .and_then(|id| id_to_tool_args.get(id))
                     .map(|args| build_tool_overflow_recall_lines(&tool_name, args))
                     .unwrap_or_default();
-                messages[idx].content = Value::String(build_preserved_tool_overflow_stub(
-                    &path,
-                    &tool_name,
-                    &text,
-                    &recall_lines,
-                ));
-                total_chars = total_chars.saturating_sub(text_len);
+                let stub =
+                    build_preserved_tool_overflow_stub(&path, &tool_name, &text, &recall_lines);
+                // 外溢必须严格腾出空间：小结果换成更大的 stub 是膨胀而非压缩，
+                // 会虚增预算占用且让模型看不到真实结果（死循环放大因素）。
+                // 膨胀时删除刚写的文件、保留原文，与 Path C 的防膨胀守卫一致。
+                let stub_chars = stub.chars().count();
+                if stub_chars >= text_len {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                messages[idx].content = Value::String(stub);
+                // 记账必须计入 stub 自身占用：只减原文会低估剩余占用，让预算判定失真。
+                total_chars = total_chars
+                    .saturating_sub(text_len)
+                    .saturating_add(stub_chars);
             }
         }
     }
@@ -601,6 +613,45 @@ mod tests {
             &messages[1].content
         )));
         assert_eq!(value_to_string(&messages[2].content).len(), 10_000);
+        let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
+    fn precision_budget_never_expands_small_results_into_larger_stubs() {
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-precision-group-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut call = assistant_call("small", "read_file");
+        call.tool_calls.as_mut().unwrap().push(ToolCall {
+            id: "big".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        });
+        let mut messages = vec![
+            call,
+            tool_result("small", &"s".repeat(100)),
+            tool_result("big", &"b".repeat(10_000)),
+        ];
+
+        enforce_protected_precision_group_budget(
+            &mut messages,
+            1,
+            200,
+            Some(&overflow_dir),
+            &FxHashSet::default(),
+            false,
+        );
+
+        // 小结果（100 字符）换成带长路径的 stub 反而膨胀：必须保留原文内联。
+        assert_eq!(value_to_string(&messages[1].content), "s".repeat(100));
+        // 大结果被外溢成 stub，且 stub 严格短于原文。
+        let stub = value_to_string(&messages[2].content);
+        assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
+        assert!(stub.chars().count() < 10_000, "{stub}");
         let _ = std::fs::remove_dir_all(overflow_dir);
     }
 

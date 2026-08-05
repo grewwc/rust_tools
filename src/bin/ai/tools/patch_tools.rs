@@ -25,7 +25,7 @@ fn params_apply_patch() -> Value {
             },
             "patch": {
                 "type": "string",
-                "description": "The edit to apply. Prefer the smallest format that fits:\n\n(A) One substring on one uniquely identifiable line:\n```\n*** Begin Patch\n*** Replace in line: <absolute/path>\nanchor: <substring that uniquely identifies the target line>\nold: <exact substring on that line to replace>\nnew: <replacement substring>\n*** End Patch\n```\n\n(B) Larger edits, multiple files, additions, or deletions:\n```\n*** Begin Patch\n*** Update File: <absolute/path>\n@@\n <unchanged context line>\n-<line to remove>\n+<line to add>\n <unchanged context line>\n*** End Patch\n```\nUse `*** Add File: <path>` with `+`-prefixed content and `*** Delete File: <path>` with no body. Repeat sections for multiple files.\n\n(C) Plain one-file unified diff: pass `file_path`, or include `---` / `+++` headers. It cannot delete files.\n\nCopy file text exactly, but omit `read_file`'s `<number>\\t` prefix. Context and removed lines must match the current file, including indentation. Do not use Markdown fences, mix formats, or send a zero-change patch.\n\nSize guidance: patches larger than ~4KB are likely to be truncated by the context manager before reaching this tool; split them into multiple apply_patch calls (each with a few hunks) or write the patch to a temp file and pass `patch_file`. Batch multiple hunks in one call only when each hunk has uniquely identifiable context; for structurally similar blocks (e.g. repeated closures), apply one patch per block."
+                "description": "The edit to apply. Prefer the smallest format that fits:\n\n(A) One substring on one uniquely identifiable line:\n```\n*** Begin Patch\n*** Replace in line: <absolute/path>\nanchor: <substring that uniquely identifies the target line>\nold: <exact substring on that line to replace>\nnew: <replacement substring>\n*** End Patch\n```\n\n(B) Larger edits, multiple files, additions, or deletions:\n```\n*** Begin Patch\n*** Update File: <absolute/path>\n@@\n <unchanged context line>\n-<line to remove>\n+<line to add>\n <unchanged context line>\n*** End Patch\n```\nUse `*** Add File: <path>` with `+`-prefixed content and `*** Delete File: <path>` with no body. Repeat sections for multiple files.\n\n(C) Plain unified diff: single-file diffs need `file_path` or `---` / `+++` headers; multi-file diffs (git-style `diff --git` headers or `---`/`+++` pairs) are split and applied per file automatically. It cannot delete files.\n\nCopy file text exactly, but omit `read_file`'s `<number>\\t` prefix. Context and removed lines must match the current file, including indentation. Do not use Markdown fences, mix formats, or send a zero-change patch.\n\nSize guidance: patches larger than ~4KB are likely to be truncated by the context manager before reaching this tool; split them into multiple apply_patch calls (each with a few hunks) or write the patch to a temp file and pass `patch_file`. Batch multiple hunks in one call only when each hunk has uniquely identifiable context; for structurally similar blocks (e.g. repeated closures), apply one patch per block."
             },
             "patch_file": {
                 "type": "string",
@@ -38,10 +38,9 @@ fn params_apply_patch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply localized file edits. For one substring on one line, use `*** Replace in line:`. For larger or multi-file changes, use a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, or `*** Delete File:` sections. A plain unified diff is accepted only for one file and then needs `file_path` or a diff header. Copy source text exactly, without `read_file` line-number prefixes. On failure, rebuild from the current text echoed in the error. For large patches, write the patch to a temp file (write_file(temp=true)) and pass its path as `patch_file` instead of the inline `patch` text.",
+        description: "Apply localized file edits. For one substring on one line, use `*** Replace in line:`. For larger or multi-file changes, use a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, or `*** Delete File:` sections. A plain unified diff is also accepted; multi-file diffs (git-style `diff --git` headers or `---`/`+++` pairs) are split and applied per file automatically, and `file_path` is needed only when the diff has no header. Copy source text exactly, without `read_file` line-number prefixes. On failure, rebuild from the current text echoed in the error. For large patches, write the patch to a temp file (write_file(temp=true)) and pass its path as `patch_file` instead of the inline `patch` text.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["executor", "builtin", "core"],
     }
 });
@@ -390,6 +389,71 @@ fn parse_unified_diff_header_target(patch: &str) -> UnifiedDiffHeaderTarget {
 fn file_path_from_unified_diff_header(patch: &str) -> Option<String> {
     let parsed = parse_unified_diff_header_target(patch);
     (parsed.paths.len() == 1).then(|| parsed.paths[0].clone())
+}
+
+/// 将多文件 unified diff（git diff 输出或模型手写）按文件拆分为 (目标路径, 该文件 diff 片段)。
+/// 片段保留原始文本（含自己的文件头与 hunks），目标路径按与 parse_unified_diff_header_target
+/// 相同的语义解析（`diff --git` 优先；无 `diff --git` 头时按相邻 `--- `/`+++ ` 对切分，且
+/// 要求后跟 hunk header，避免把 hunk 正文中形似文件头的增删行当成文件边界）。
+/// 任一片段解析不出唯一目标路径时返回 Err——结构不可靠时明确报错，绝不静默错写。
+fn split_unified_diff_by_file(patch: &str) -> Result<Vec<(String, String)>, String> {
+    let lines: Vec<&str> = patch.lines().collect();
+    let has_git_headers = lines.iter().any(|line| line.starts_with("diff --git "));
+    let mut starts: Vec<usize> = Vec::new();
+    if has_git_headers {
+        for (i, line) in lines.iter().enumerate() {
+            if line.starts_with("diff --git ") {
+                starts.push(i);
+            }
+        }
+    } else {
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].starts_with("--- ") {
+                let mut j = i + 1;
+                while j < lines.len() && lines[j].trim().is_empty() {
+                    j += 1;
+                }
+                if j < lines.len() && lines[j].starts_with("+++ ") {
+                    let mut k = j + 1;
+                    while k < lines.len() && lines[k].trim().is_empty() {
+                        k += 1;
+                    }
+                    if k < lines.len() && lines[k].starts_with("@@") {
+                        starts.push(i);
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    if starts.is_empty() {
+        return Err(
+            "multi-file unified diff: could not find per-file section boundaries (`diff --git ` \
+             headers or `--- `/`+++ ` header pairs followed by hunks)"
+                .to_string(),
+        );
+    }
+    let mut sections = Vec::with_capacity(starts.len());
+    for (idx, &start) in starts.iter().enumerate() {
+        let end = starts.get(idx + 1).copied().unwrap_or(lines.len());
+        let section = lines[start..end].join("\n");
+        let parsed = parse_unified_diff_header_target(&section);
+        if parsed.paths.len() != 1 {
+            return Err(format!(
+                "multi-file unified diff: section {}/{} could not be resolved to exactly one \
+                 target path (found {}). Use a `*** Begin Patch` envelope with one \
+                 `*** Update File:` section per file instead.",
+                idx + 1,
+                starts.len(),
+                parsed.paths.len()
+            ));
+        }
+        sections.push((parsed.paths[0].clone(), section));
+    }
+    Ok(sections)
 }
 
 /// 为 driver 的 scoped-instruction preflight 与 stale-patch 账本提供统一目标提取语义。
@@ -2023,6 +2087,29 @@ fn prepare_patch_write(
     })
 }
 
+/// 按"已切分好的单文件 unified diff 片段"准备写入（多文件 unified diff 路径用）。
+/// 与 prepare_patch_write 的区别：section 自带 `--- `/`+++ ` 文件头与 `@@` hunks，
+/// 不再走 envelope 归一化，直接交给 apply_unified_patch（parse_unified_hunks 会跳过
+/// 非 `@@` 行），因此可以原样复用 unified-diff 的容错匹配语义。
+fn prepare_patch_write_from_section(
+    path: &Path,
+    store: &FileStore,
+    section: &str,
+) -> Result<PreparedPatchWrite, String> {
+    let before = if path.exists() {
+        Some(store.read_to_string().map_err(|err| err.to_string())?)
+    } else {
+        None
+    };
+    let original = before.as_deref().unwrap_or_default();
+    let action = PreparedPatchAction::Write(apply_unified_patch(original, section)?);
+    Ok(PreparedPatchWrite {
+        path: path.to_path_buf(),
+        before,
+        action,
+    })
+}
+
 /// 拒绝最终内容与原文件完全相同的写入，避免工具报告成功却没有产生实际改动。
 fn ensure_patch_writes_change(writes: &[PreparedPatchWrite]) -> Result<(), String> {
     for write in writes {
@@ -2323,11 +2410,96 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
     }
 
     let header_target = parse_unified_diff_header_target(&patch);
-    if header_target.paths.len() > 1 {
-        return Err(format!(
-            "single-file unified diff declares multiple file targets ({}); use one `*** Begin Patch` envelope with a section for each file",
-            header_target.paths.join(", ")
+    // 多文件 unified diff（git diff 输出或模型手写）：自动按文件拆分后逐个 prepare，
+    // 全部成功再统一 commit——与 Begin Patch 信封的批量语义一致（原子、同路径叠加）。
+    // 注意：同文件多 section（两个 `diff --git a/x b/x`）经 header 解析去重后 paths.len()==1，
+    // 因此以 split 出的 section 数（>1）或解析出的不同路径数（>1）为准，二者都走拆分路径。
+    let split_sections = split_unified_diff_by_file(&patch);
+    let multi_file_sections = match &split_sections {
+        Ok(sections) if sections.len() > 1 || header_target.paths.len() > 1 => Some(sections),
+        Ok(_) => None,
+        Err(err) if header_target.paths.len() > 1 => {
+            return Err(format!("multi-file unified diff could not be split: {err}"));
+        }
+        Err(_) => None, // 无文件头（裸 hunks 靠 file_path 定位）：单文件路径
+    };
+    if let Some(sections) = multi_file_sections {
+        emit(&format!(
+            "parsing multi-file unified diff ({} file(s))",
+            sections.len()
         ));
+        let mut writes: Vec<PreparedPatchWrite> = Vec::with_capacity(sections.len());
+        let mut write_indexes: FxHashMap<PathBuf, usize> = FxHashMap::default();
+        for (idx, (target, section)) in sections.iter().enumerate() {
+            if parse_unified_diff_header_target(section).deletes_file {
+                return Err(format!(
+                    "[section {}/{}] unified diff deletion (`+++ /dev/null`) is not supported \
+                     because unified mode writes file content; use a `*** Begin Patch` envelope \
+                     with `*** Delete File: {target}` so deletion is explicit",
+                    idx + 1,
+                    sections.len()
+                ));
+            }
+            let store = FileStore::new(PathBuf::from(target));
+            let path = store.path().to_path_buf();
+            emit(&format!(
+                "target [{}/{}]: {}",
+                idx + 1,
+                sections.len(),
+                path.display()
+            ));
+            emit("validating write access");
+            store
+                .validate_write_access()
+                .map_err(|err| err.to_string())?;
+            if let Some(&write_idx) = write_indexes.get(&path) {
+                // 同一文件出现多个 section 时按序叠加（语义同信封分支）。
+                emit("applying after previous section for same file");
+                let action = {
+                    let current = match &writes[write_idx].action {
+                        PreparedPatchAction::Write(next) => Some(next.as_str()),
+                        PreparedPatchAction::Delete => None,
+                    };
+                    let original = current.unwrap_or_default();
+                    apply_unified_patch(original, section).map(PreparedPatchAction::Write)
+                }
+                .map_err(|err| {
+                    format!(
+                        "[section {}/{}] failed while preparing patch for {}: {err}",
+                        idx + 1,
+                        sections.len(),
+                        path.display()
+                    )
+                })?;
+                writes[write_idx].action = action;
+            } else {
+                let write = prepare_patch_write_from_section(&path, &store, section).map_err(
+                    |err| {
+                        format!(
+                            "[section {}/{}] failed while preparing patch for {}: {err}",
+                            idx + 1,
+                            sections.len(),
+                            path.display()
+                        )
+                    },
+                )?;
+                write_indexes.insert(path.clone(), writes.len());
+                writes.push(write);
+            }
+        }
+        ensure_patch_writes_change(&writes)?;
+        for write in &writes {
+            match &write.action {
+                PreparedPatchAction::Write(next) => {
+                    emit(&format!("writing {} byte(s)", next.len()))
+                }
+                PreparedPatchAction::Delete => emit("deleting file"),
+            }
+        }
+        commit_patch_writes(&writes)?;
+        let success = format_patch_success(&writes);
+        emit(&success);
+        return Ok(success);
     }
     if header_target.deletes_file {
         return Err(
@@ -3530,14 +3702,108 @@ mod tests {
     }
 
     #[test]
-    fn execute_apply_patch_rejects_multi_file_diff_even_with_explicit_path() {
-        let patch = "diff --git a/one.rs b/one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/two.rs b/two.rs\n--- a/two.rs\n+++ b/two.rs\n@@ -1 +1 @@\n-c\n+d\n";
-        let err = execute_apply_patch(&serde_json::json!({
-            "file_path": "one.rs",
-            "patch": patch,
-        }))
-        .expect_err("single-file mode must reject a multi-file diff");
-        assert!(err.contains("multiple file targets"), "err was: {err}");
+    fn execute_apply_patch_applies_multi_file_diff_automatically() {
+        // 多文件 unified diff（git diff 输出风格）：不再报错，自动按文件拆分后原子应用。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("multi_file_diff_auto");
+        let a = base.join("one.txt");
+        let b = base.join("two.txt");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&a, "old_a\n").unwrap();
+        fs::write(&b, "old_b\n").unwrap();
+
+        let patch = "diff --git a/one.txt b/one.txt\n--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old_a\n+new_a\ndiff --git a/two.txt b/two.txt\n--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-old_b\n+new_b\n";
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let result = execute_apply_patch(&serde_json::json!({
+                // 多文件 diff 自带路径，冗余 file_path 应被忽略
+                "file_path": "one.txt",
+                "patch": patch,
+            }))
+            .expect("multi-file unified diff should apply automatically");
+            assert!(
+                result.starts_with("Successfully patched 2 files:"),
+                "result: {result}"
+            );
+        });
+
+        assert_eq!(fs::read_to_string(&a).unwrap(), "new_a\n");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "new_b\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_applies_multi_file_diff_without_git_headers() {
+        // 无 `diff --git` 头、仅 `---`/`+++` 对的多文件 diff：按相邻文件头对切分。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("multi_file_diff_no_git");
+        let a = base.join("a.txt");
+        let b = base.join("b.txt");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+
+        let patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-beta\n+BETA\n";
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let result = execute_apply_patch(&serde_json::json!({ "patch": patch }))
+                .expect("multi-file diff without git headers should apply");
+            assert!(
+                result.starts_with("Successfully patched 2 files:"),
+                "result: {result}"
+            );
+        });
+
+        assert_eq!(fs::read_to_string(&a).unwrap(), "ALPHA\n");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "BETA\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_multi_file_diff_same_file_sections_stack() {
+        // 同一文件出现多个 section（同路径叠加语义，与信封分支一致）。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("multi_file_diff_stack");
+        let a = base.join("a.txt");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+
+        let patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -3 +3 @@\n-gamma\n+GAMMA\n";
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let result = execute_apply_patch(&serde_json::json!({ "patch": patch }))
+                .expect("same-file sections in multi-file diff should stack");
+            assert!(
+                !result.starts_with("Successfully patched 2 files:"),
+                "same file should be committed once: {result}"
+            );
+        });
+
+        assert_eq!(fs::read_to_string(&a).unwrap(), "ALPHA\nbeta\nGAMMA\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_multi_file_diff_is_atomic_on_failure() {
+        // 任一文件 prepare 失败则整体不提交，之前已 prepare 的文件也不落盘。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("multi_file_diff_atomic");
+        let a = base.join("a.txt");
+        let b = base.join("b.txt");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&a, "old_a\n").unwrap();
+        fs::write(&b, "current_b\n").unwrap();
+
+        let patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old_a\n+new_a\ndiff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-missing_b\n+new_b\n";
+        let err = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            execute_apply_patch(&serde_json::json!({ "patch": patch }))
+                .expect_err("second file mismatch should abort whole multi-file diff")
+        });
+
+        assert!(
+            err.contains("failed while preparing patch for"),
+            "err was: {err}"
+        );
+        assert_eq!(fs::read_to_string(&a).unwrap(), "old_a\n");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "current_b\n");
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

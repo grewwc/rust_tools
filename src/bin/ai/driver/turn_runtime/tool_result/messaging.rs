@@ -181,7 +181,9 @@ fn save_context_checkpoint(
     summary: &str,
     body: &str,
 ) -> std::io::Result<std::path::PathBuf> {
-    let assets_dir = SessionStore::new(&app.session_history_file)
+    // 与其余会话资产（overflow、tool_overflow、task-evidence）保持一致：
+    // 基于 config.history_file 定位资产根，避免 session_history_file 导致 root 偏移到嵌套目录。
+    let assets_dir = SessionStore::new(app.config.history_file.as_path())
         .session_assets_dir(&app.session_id)
         .join("context-checkpoints");
     save_context_checkpoint_in_dir(&assets_dir, index, summary, body)
@@ -226,7 +228,8 @@ fn save_working_context_checkpoint(
     summary: &str,
     body: &str,
 ) -> std::io::Result<PathBuf> {
-    let assets_dir = SessionStore::new(&app.session_history_file)
+    // 与 save_context_checkpoint 同理：统一基于 config.history_file，避免嵌套目录偏移。
+    let assets_dir = SessionStore::new(app.config.history_file.as_path())
         .session_assets_dir(&app.session_id)
         .join("context-checkpoints");
     fs::create_dir_all(&assets_dir)?;
@@ -1551,6 +1554,26 @@ mod tests {
         .expect("plan result should create working checkpoint marker");
         let first_marker = first_message.content.as_str().unwrap_or_default();
         let first_path = checkpoint_path_from_marker(first_marker);
+
+        // 回归断言：checkpoint 必须落在 config.history_file 对应的资产根下，
+        // 不能因为 session_history_file 指向嵌套路径而偏移到 `<root>/<id>.sessions/`。
+        let expected_dir = SessionStore::new(app.config.history_file.as_path())
+            .session_assets_dir(&app.session_id)
+            .join("context-checkpoints");
+        let expected_dir = expected_dir.canonicalize().unwrap_or(expected_dir);
+        assert!(
+            first_path.canonicalize().unwrap_or_else(|_| first_path.clone()).starts_with(&expected_dir),
+            "checkpoint should live under config.history_file asset root: {}",
+            first_path.display()
+        );
+        let nested_dir = SessionStore::new(app.session_history_file.as_path())
+            .session_assets_dir(&app.session_id)
+            .join("context-checkpoints");
+        assert!(
+            !nested_dir.exists(),
+            "nested checkpoint dir must not exist: {}",
+            nested_dir.display()
+        );
 
         assert_eq!(
             first_path.file_name().and_then(|name| name.to_str()),

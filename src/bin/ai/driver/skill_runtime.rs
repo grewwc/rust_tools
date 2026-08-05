@@ -1132,38 +1132,6 @@ fn build_system_prompt(
         );
     }
 
-    if has_tool(available_tools, "tool_spawn")
-        || has_tool(available_tools, "tool_wait")
-        || has_tool(available_tools, "tool_status")
-        || has_tool(available_tools, "tool_cancel")
-    {
-        let mut lines = Vec::new();
-        if has_tool(available_tools, "tool_spawn") {
-            lines.push("Use `tool_spawn` for parallel independent tool calls, but do not use it to parallelize `read_file`; keep code-grounding reads serial.".to_string());
-        }
-        let async_tool_controls = available_tool_names_in_order(
-            available_tools,
-            &["tool_wait", "tool_status", "tool_cancel"],
-        );
-        if !async_tool_controls.is_empty() {
-            lines.push(format!(
-                "Use {} to join, inspect, or drop async tool branches as needed.",
-                format_tool_names(&async_tool_controls)
-            ));
-        }
-        if has_tool(available_tools, "read_mailbox") {
-            lines.push(
-                "If wake-up messages identify finished tasks, act on them immediately instead of re-querying.".to_string(),
-            );
-        }
-        push_tool_guidance_section(
-            &mut b,
-            ContextKind::Behavior,
-            "Async Tool Orchestration:",
-            lines,
-        );
-    }
-
     if has_tool(available_tools, "task_spawn")
         || has_tool(available_tools, "task_wait")
         || has_tool(available_tools, "task_status")
@@ -1177,6 +1145,7 @@ fn build_system_prompt(
                 lines.push("Use `task_spawn` to fan out MULTIPLE focused, independent subtasks concurrently. For a single delegated subtask, one spawned task immediately joined by `task_wait` gains no concurrency and just adds overhead.".to_string());
             }
             lines.push("Qualify a subtask only when it has a distinct, bounded goal, can proceed without another branch's result, and is substantial enough that its expected latency or context benefit outweighs handoff and synthesis overhead.".to_string());
+            lines.push("When shared discovery must happen before work can be divided, keep that discovery sequential; after it reveals multiple distinct branches, reassess once whether delegation has clear net benefit. Do not spawn by default: account for rate limits, tool availability, and coordination or synthesis cost, and keep the work in the parent when the benefit is marginal or uncertain.".to_string());
             if has_tool(available_tools, "task_spawn_batch") {
                 lines.push("Once you identify multiple qualifying subtasks with no data dependency, prefer one `task_spawn_batch` call so dispatch and returned task ids preserve input order. Then continue every independent parent-side step while they run. Do NOT call `task_wait` merely because tasks are running, and do not spawn-wait-spawn-wait serially.".to_string());
             } else {
@@ -1202,15 +1171,6 @@ fn build_system_prompt(
         if has_tool(available_tools, "task_spawn") {
             lines.push("By default a subagent reuses your (parent) model; only override the `model` field when the subtask is clearly lighter or heavier than your own.".to_string());
             lines.push("Give each subagent a focused context: for narrow leaf tasks prefer `inherit=\"none\"` or `inherit=\"cwd\"`; only use `inherit=\"all\"` when the subtask genuinely needs the full conversation.".to_string());
-        }
-        if has_tool(available_tools, "tool_spawn")
-            || has_tool(available_tools, "tool_wait")
-            || has_tool(available_tools, "tool_status")
-        {
-            lines.push(
-                "`task_*` and `tool_*` are distinct families: do not confuse their IDs."
-                    .to_string(),
-            );
         }
         push_tool_guidance_section(
             &mut b,
@@ -1957,6 +1917,13 @@ mod tests {
         assert!(
             prompt.contains("latency or context benefit outweighs handoff and synthesis overhead")
         );
+        // 任何任务都可先串行建立不可分割的共享事实；分支形成后只重新评估一次，并考虑限流等运行风险。
+        assert!(prompt.contains("When shared discovery must happen before work can be divided"));
+        assert!(prompt.contains("keep that discovery sequential"));
+        assert!(prompt.contains("reassess once whether delegation has clear net benefit"));
+        assert!(prompt.contains("Do not spawn by default"));
+        assert!(prompt.contains("account for rate limits, tool availability"));
+        assert!(prompt.contains("benefit is marginal or uncertain"));
         assert!(prompt.contains("Do not delegate merely to create parallelism"));
         assert!(prompt.contains("tightly coupled or overlapping work"));
         assert!(prompt.contains("continue every independent parent-side step while they run"));
@@ -2125,20 +2092,6 @@ mod tests {
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
         assert!(prompt.contains("discover and enable matching `mcp_*` tools first"));
-    }
-
-    #[test]
-    fn system_prompt_does_not_encourage_tool_spawn_for_code_grounding_parallelism() {
-        let mut available = SkipSet::new(16);
-        available.insert("tool_spawn".to_string());
-        available.insert("tool_wait".to_string());
-        available.insert("tool_status".to_string());
-        let prompt =
-            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
-                .render_system_prompt();
-        assert!(prompt.contains("do not use it to parallelize `read_file`"));
-        assert!(prompt.contains("keep code-grounding reads serial"));
-        assert!(!prompt.contains("Use `tool_spawn` for parallel independent tool calls."));
     }
 
     #[test]
