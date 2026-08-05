@@ -7,53 +7,6 @@ use crate::ai::tools::common::{
     ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
 };
 
-fn params_plan() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "steps": {
-                "type": "array",
-                "maxItems": 20,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "step": {
-                            "type": "integer",
-                            "description": "Step number (1-based)."
-                        },
-                        "action": {
-                            "type": "string",
-                            "description": "What to do in this step (e.g., 'read src/main.rs', 'run cargo build', 'apply patch to fix X')."
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Why this step is needed and what we expect to learn or achieve."
-                        },
-                        "tool": {
-                            "type": "string",
-                            "description": "The primary tool you plan to use for this step (e.g., 'read_file', 'execute_command', 'apply_patch', 'knowledge_search'). Use 'none' if no tool is needed."
-                        },
-                        "parallelizable": {
-                            "type": "boolean",
-                            "description": "Whether this step can run in parallel with the previous step (no data dependency). Default: false."
-                        },
-                        "delegate": {
-                            "type": "boolean",
-                            "description": "Whether this step should be delegated to a subagent. A delegated step implies `parallelizable: true` (a subagent should not block the parent synchronously), so `delegate: true` automatically counts as parallelizable; set `parallelizable` explicitly only when it is true without delegation. Multiple independent delegated steps are dispatched concurrently (task_spawn + task_wait); a lone delegated step runs via the synchronous `task` tool."
-                        }
-                    },
-                    "required": ["step", "action"]
-                },
-                "description": "Ordered list of steps to accomplish the task."
-            },
-            "summary": {
-                "type": "string",
-                "description": "Brief one-line summary of the overall plan."
-            }
-        },
-        "required": ["steps"]
-    })
-}
 
 fn execute_plan(args: &Value) -> Result<String, String> {
     let steps = args["steps"]
@@ -167,8 +120,8 @@ fn execute_plan(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "plan",
-        description: "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. A step marked `delegate: true` implies `parallelizable: true` (delegation is inherently async). Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly.",
-        parameters: params_plan,
+        description: "",
+
         execute: execute_plan,
         groups: &["builtin", "core"],
     }

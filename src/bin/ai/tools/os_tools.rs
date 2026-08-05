@@ -59,50 +59,6 @@ fn parse_capabilities(args: &Value) -> Option<ProcessCapabilities> {
 }
 
 // 1. spawn_process
-fn params_spawn_process() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "Short name for the process."
-            },
-            "goal": {
-                "type": "string",
-                "description": "The specific goal or task for the sub-process to accomplish."
-            },
-            "priority": {
-                "type": "integer",
-                "description": "Process priority. 0 is highest, 255 is lowest. Default is 10."
-            },
-            "quota_turns": {
-                "type": "integer",
-                "description": "Max number of tool calling turns allowed for this process before it is forcefully yielded. Default is 10."
-            },
-            "capabilities": {
-                "type": "object",
-                "description": "Optional exact capability set for the child process. Omitted means inherit the parent capabilities.",
-                "properties": {
-                    "spawn": { "type": "boolean" },
-                    "wait": { "type": "boolean" },
-                    "ipc_send": { "type": "boolean" },
-                    "ipc_receive": { "type": "boolean" },
-                    "env_write": { "type": "boolean" },
-                    "manage_children": { "type": "boolean" },
-                    "sleep": { "type": "boolean" },
-                    "reap": { "type": "boolean" },
-                    "signal": { "type": "boolean" }
-                }
-            },
-            "allowed_tools": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Optional whitelist of tool names this process is allowed to call. Omitted means inherit parent's whitelist. Empty array means no restriction."
-            }
-        },
-        "required": ["name", "goal"]
-    })
-}
 
 fn execute_spawn_process(args: &Value) -> Result<String, String> {
     let name = args["name"]
@@ -159,24 +115,13 @@ fn execute_spawn_process(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "spawn_process",
-        description: "Spawn a fire-and-forget background process in the Agent OS. Returns the PID immediately and does NOT return the process's result — the scheduler runs it autonomously and you only observe it via IPC (read_mailbox / wait_process) or its side effects. Use this for long-running background processes, two-way IPC collaboration, or work whose output you do not need to collect back. If you need the task's result returned to you, use task_spawn instead.",
-        parameters: params_spawn_process,
+        description: "",
+
         execute: execute_spawn_process,
         groups: &["builtin", "executor"],
     }
 });
 
-fn params_sleep_process() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "turns": {
-                "type": "integer",
-                "description": "How many scheduler ticks to sleep. Minimum is 1."
-            }
-        }
-    })
-}
 
 fn execute_sleep_process(args: &Value) -> Result<String, String> {
     let turns = args["turns"].as_u64().unwrap_or(1);
@@ -197,26 +142,14 @@ fn execute_sleep_process(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "sleep_process",
-        description: "Suspend the current process for a number of scheduler ticks, then resume it later via the ready queue.",
-        parameters: params_sleep_process,
+        description: "",
+
         execute: execute_sleep_process,
         groups: &["builtin", "executor"],
     }
 });
 
 // 2. wait_process
-fn params_wait_process() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "pid": {
-                "type": "integer",
-                "description": "The Process ID (PID) to wait for."
-            }
-        },
-        "required": ["pid"]
-    })
-}
 
 fn execute_wait_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"]
@@ -240,29 +173,13 @@ fn execute_wait_process(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "wait_process",
-        description: "Suspend the current process until the specified child process (PID) terminates. You will be awakened via your mailbox with the child's result.",
-        parameters: params_wait_process,
+        description: "",
+
         execute: execute_wait_process,
         groups: &["builtin", "executor"],
     }
 });
 
-fn params_kill_process() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "pid": {
-                "type": "integer",
-                "description": "Child or descendant PID to terminate."
-            },
-            "reason": {
-                "type": "string",
-                "description": "Reason recorded in the target process result."
-            }
-        },
-        "required": ["pid"]
-    })
-}
 
 fn execute_kill_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"]
@@ -287,30 +204,14 @@ fn execute_kill_process(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "kill_process",
-        description: "Terminate a child or descendant process when the current process has management capability.",
-        parameters: params_kill_process,
+        description: "",
+
         execute: execute_kill_process,
         groups: &["builtin", "executor"],
     }
 });
 
 // 3. send_ipc_message
-fn params_send_ipc() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "pid": {
-                "type": "integer",
-                "description": "The target Process ID (PID) to send the message to."
-            },
-            "message": {
-                "type": "string",
-                "description": "The message content to send."
-            }
-        },
-        "required": ["pid", "message"]
-    })
-}
 
 fn execute_send_ipc(args: &Value) -> Result<String, String> {
     let pid = args["pid"]
@@ -334,25 +235,13 @@ fn execute_send_ipc(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "send_ipc_message",
-        description: "Send an Inter-Process Communication (IPC) message to another running process's mailbox.",
-        parameters: params_send_ipc,
+        description: "",
+
         execute: execute_send_ipc,
         groups: &["builtin", "executor"],
     }
 });
 
-fn params_reap_process() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "pid": {
-                "type": "integer",
-                "description": "Terminated child or descendant PID to collect and remove from the process table."
-            }
-        },
-        "required": ["pid"]
-    })
-}
 
 fn execute_reap_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"]
@@ -372,20 +261,14 @@ fn execute_reap_process(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "reap_process",
-        description: "Collect a terminated child or descendant process and remove it from the process table.",
-        parameters: params_reap_process,
+        description: "",
+
         execute: execute_reap_process,
         groups: &["builtin", "executor"],
     }
 });
 
 // 4. read_mailbox
-fn params_read_mailbox() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {}
-    })
-}
 
 fn execute_read_mailbox(_args: &Value) -> Result<String, String> {
     if let Ok(guard) = GLOBAL_OS.lock() {
@@ -406,24 +289,14 @@ fn execute_read_mailbox(_args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "read_mailbox",
-        description: "Read all pending IPC messages, wake-up notifications, and child process termination results from your mailbox. Calling this empties the mailbox. When the mailbox contains subagent wake-up messages, use them to decide whether to call task_status, task_wait, task_cancel, or continue reasoning with already available results.",
-        parameters: params_read_mailbox,
+        description: "",
+
         execute: execute_read_mailbox,
         groups: &["builtin", "executor"],
     }
 });
 
 // 5. env tools
-fn params_set_env() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "key": { "type": "string" },
-            "value": { "type": "string" }
-        },
-        "required": ["key", "value"]
-    })
-}
 
 fn execute_set_env(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'")?;
@@ -442,19 +315,13 @@ fn execute_set_env(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "set_env",
-        description: "Set an environment variable in the current process's Context Manager. Child processes will inherit this context.",
-        parameters: params_set_env,
+        description: "",
+
         execute: execute_set_env,
         groups: &["builtin", "executor"],
     }
 });
 
-fn params_ps_processes() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {}
-    })
-}
 
 fn execute_ps_processes(_args: &Value) -> Result<String, String> {
     if let Ok(guard) = GLOBAL_OS.lock() {
@@ -514,29 +381,13 @@ fn execute_ps_processes(_args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "ps_processes",
-        description: "List all processes in the Agent OS with their PID, parent PID, state, priority, quota, and name. Use this to inspect the process tree before deciding to kill, wait, or reap.",
-        parameters: params_ps_processes,
+        description: "",
+
         execute: execute_ps_processes,
         groups: &["builtin", "executor"],
     }
 });
 
-fn params_ps_ipc() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "scope": {
-                "type": "string",
-                "enum": ["result_pipes", "all"],
-                "description": "Which channels to show. result_pipes focuses on task/async tool result pipes. all shows every channel."
-            },
-            "only_hanging": {
-                "type": "boolean",
-                "description": "When true, only show channels that are still live or not yet reclaimable. Default is true."
-            }
-        }
-    })
-}
 
 fn is_hanging_channel(snapshot: &ChannelMetaSnapshot) -> bool {
     snapshot.ref_count > 0 || snapshot.queued_len > 0 || !snapshot.closed
@@ -613,30 +464,13 @@ fn execute_ps_ipc(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "ps_ipc",
-        description: "List AIOS IPC channels and result pipes with owner tags, queued messages, and named ref holders. By default this shows only hanging result pipes that still have refs, buffered messages, or are not closed yet.",
-        parameters: params_ps_ipc,
+        description: "",
+
         execute: execute_ps_ipc,
         groups: &["builtin", "executor"],
     }
 });
 
-fn params_signal_process() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "pid": {
-                "type": "integer",
-                "description": "Target child or descendant PID to signal."
-            },
-            "signal": {
-                "type": "string",
-                "enum": ["SIGCANCEL", "SIGTERM", "SIGSTOP", "SIGCONT", "SIGKILL"],
-                "description": "Signal to send: SIGCANCEL=cooperative cancel current turn/tool work, SIGTERM=graceful termination, SIGSTOP=pause, SIGCONT=resume, SIGKILL=immediate termination with cascade."
-            }
-        },
-        "required": ["pid", "signal"]
-    })
-}
 
 fn execute_signal_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"]
@@ -676,8 +510,8 @@ fn execute_signal_process(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "signal_process",
-        description: "Send a POSIX-like signal to a child or descendant process. SIGCANCEL=request cooperative cancellation of current turn/tool work, SIGTERM=request graceful termination, SIGSTOP=pause execution, SIGCONT=resume paused process, SIGKILL=immediate forced termination (cascades to grandchildren).",
-        parameters: params_signal_process,
+        description: "",
+
         execute: execute_signal_process,
         groups: &["builtin", "executor"],
     }
@@ -685,16 +519,6 @@ inventory::submit!(ToolRegistration {
 
 // --- Process Group ---
 
-fn params_set_process_group() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "pid": { "type": "integer", "description": "PID of the process to assign to a group." },
-            "pgid": { "type": "integer", "description": "Process Group ID to assign. Use a new ID to create a group." }
-        },
-        "required": ["pid", "pgid"]
-    })
-}
 
 fn execute_set_process_group(args: &Value) -> Result<String, String> {
     let pid = args["pid"].as_u64().ok_or("Missing 'pid'.")?;
@@ -712,27 +536,13 @@ fn execute_set_process_group(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "set_process_group",
-        description: "Assign a process to a process group. Processes in the same group can be signaled together with signal_process_group.",
-        parameters: params_set_process_group,
+        description: "",
+
         execute: execute_set_process_group,
         groups: &["builtin", "executor"],
     }
 });
 
-fn params_signal_process_group() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "pgid": { "type": "integer", "description": "Process Group ID to signal." },
-            "signal": {
-                "type": "string",
-                "enum": ["SIGTERM", "SIGSTOP", "SIGCONT", "SIGKILL"],
-                "description": "Signal to send to all processes in the group."
-            }
-        },
-        "required": ["pgid", "signal"]
-    })
-}
 
 fn execute_signal_process_group(args: &Value) -> Result<String, String> {
     let pgid = args["pgid"].as_u64().ok_or("Missing 'pgid'.")?;
@@ -762,8 +572,8 @@ fn execute_signal_process_group(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "signal_process_group",
-        description: "Send a signal to all processes in a process group. Useful for batch operations like stopping or terminating a group of related processes.",
-        parameters: params_signal_process_group,
+        description: "",
+
         execute: execute_signal_process_group,
         groups: &["builtin", "executor"],
     }
@@ -771,16 +581,6 @@ inventory::submit!(ToolRegistration {
 
 // --- Shared Memory IPC ---
 
-fn params_shm_create() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "key": { "type": "string", "description": "Unique key for the shared memory region." },
-            "value": { "type": "string", "description": "Initial value to store." }
-        },
-        "required": ["key", "value"]
-    })
-}
 
 fn execute_shm_create(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'.")?;
@@ -798,22 +598,13 @@ fn execute_shm_create(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "shm_create",
-        description: "Create a new shared memory region with a key-value pair. Other processes can read and write this data. Fails if the key already exists.",
-        parameters: params_shm_create,
+        description: "",
+
         execute: execute_shm_create,
         groups: &["builtin", "executor"],
     }
 });
 
-fn params_shm_read() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "key": { "type": "string", "description": "Key of the shared memory region to read." }
-        },
-        "required": ["key"]
-    })
-}
 
 fn execute_shm_read(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'.")?;
@@ -862,23 +653,13 @@ fn execute_shm_read(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "shm_read",
-        description: "Read the value of a shared memory region by key. Returns degraded data with warning if owner has terminated or data is corrupted. Fails only if key not found or permission denied with no fallback.",
-        parameters: params_shm_read,
+        description: "",
+
         execute: execute_shm_read,
         groups: &["builtin", "executor"],
     }
 });
 
-fn params_shm_write() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "key": { "type": "string", "description": "Key of the shared memory region to update." },
-            "value": { "type": "string", "description": "New value to write." }
-        },
-        "required": ["key", "value"]
-    })
-}
 
 fn execute_shm_write(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'.")?;
@@ -896,22 +677,13 @@ fn execute_shm_write(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "shm_write",
-        description: "Update the value of an existing shared memory region. Fails if the key does not exist (use shm_create first).",
-        parameters: params_shm_write,
+        description: "",
+
         execute: execute_shm_write,
         groups: &["builtin", "executor"],
     }
 });
 
-fn params_shm_delete() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "key": { "type": "string", "description": "Key of the shared memory region to delete." }
-        },
-        "required": ["key"]
-    })
-}
 
 fn execute_shm_delete(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'.")?;
@@ -928,8 +700,8 @@ fn execute_shm_delete(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "shm_delete",
-        description: "Delete a shared memory region by key.",
-        parameters: params_shm_delete,
+        description: "",
+
         execute: execute_shm_delete,
         groups: &["builtin", "executor"],
     }
@@ -937,15 +709,6 @@ inventory::submit!(ToolRegistration {
 
 // --- Working Directory ---
 
-fn params_set_working_dir() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "dir": { "type": "string", "description": "Absolute path to set as the working directory for the current process." }
-        },
-        "required": ["dir"]
-    })
-}
 
 fn execute_set_working_dir(args: &Value) -> Result<String, String> {
     let dir = args["dir"].as_str().ok_or("Missing 'dir'.")?;
@@ -962,8 +725,8 @@ fn execute_set_working_dir(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "set_working_dir",
-        description: "Set the working directory for the current process. Child processes will inherit this directory.",
-        parameters: params_set_working_dir,
+        description: "",
+
         execute: execute_set_working_dir,
         groups: &["builtin", "executor"],
     }
@@ -971,19 +734,6 @@ inventory::submit!(ToolRegistration {
 
 // --- Daemon Process ---
 
-fn params_spawn_daemon() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": { "type": "string", "description": "Short name for the daemon process." },
-            "goal": { "type": "string", "description": "The goal or task for the daemon to accomplish on each run." },
-            "priority": { "type": "integer", "description": "Process priority. Default is 10." },
-            "quota_turns": { "type": "integer", "description": "Max turns per run. Default is 10." },
-            "max_restarts": { "type": "integer", "description": "Maximum number of automatic restarts when the daemon terminates. Default is 3." }
-        },
-        "required": ["name", "goal"]
-    })
-}
 
 fn execute_spawn_daemon(args: &Value) -> Result<String, String> {
     let name = args["name"].as_str().ok_or("Missing 'name'.")?;
@@ -1016,8 +766,8 @@ fn execute_spawn_daemon(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "spawn_daemon",
-        description: "Spawn a daemon process that automatically restarts when it terminates (up to max_restarts times). Useful for long-running background services like file watchers or knowledge indexers.",
-        parameters: params_spawn_daemon,
+        description: "",
+
         execute: execute_spawn_daemon,
         groups: &["builtin", "executor"],
     }
@@ -1107,7 +857,8 @@ mod tests {
     #[test]
     fn spawn_process_schema_exposes_signal_capability() {
         assert_eq!(
-            params_spawn_process()["properties"]["capabilities"]["properties"]["signal"],
+            crate::ai::tools::registry::tool_metadata::tool_parameters("spawn_process")
+                ["properties"]["capabilities"]["properties"]["signal"],
             serde_json::json!({ "type": "boolean" })
         );
     }

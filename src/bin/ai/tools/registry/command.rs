@@ -7,30 +7,6 @@ use crate::ai::tools::common::{
 };
 use crate::ai::tools::service::command::execute_command;
 
-fn params_execute_command() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "Shell command to run. For long-running servers, background and redirect output: `cmd > /tmp/app.log 2>&1 & sleep 2 && curl -s localhost:PORT/...`. Never run a foreground server directly."
-            },
-            "cwd": {
-                "type": "string",
-                "description": "Working directory (default: current directory)."
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Timeout in seconds, 1-300 (default: 30)."
-            },
-            "pty": {
-                "type": "boolean",
-                "description": "Required. Use true for interactive CLIs (QR codes, prompts, full-screen); false otherwise. No keyboard input forwarding."
-            }
-        },
-        "required": ["command", "pty"]
-    })
-}
 
 fn execute_command_streaming_registered(
     args: &Value,
@@ -42,8 +18,8 @@ fn execute_command_streaming_registered(
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "execute_command",
-        description: "Run a shell command. Destructive/network/escalation commands are blocked. Output is truncated past a char cap with shown-vs-total counts; narrow or page instead of re-running with different variants. Failures include exit code.",
-        parameters: params_execute_command,
+        description: "",
+
         execute: execute_command,
         groups: &["builtin", "core"],
     }

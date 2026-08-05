@@ -1,0 +1,16 @@
+{
+  "name": "knowledge_forget",
+  "description": "Delete a knowledge entry by id. Use knowledge_list or knowledge_search first to find the id.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "Memory entry id to delete. Use knowledge_list or knowledge_search first to find the id."
+      }
+    },
+    "required": [
+      "id"
+    ]
+  }
+}

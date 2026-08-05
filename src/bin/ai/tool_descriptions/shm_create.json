@@ -1,0 +1,21 @@
+{
+  "name": "shm_create",
+  "description": "Create a new shared memory region with a key-value pair. Other processes can read and write this data. Fails if the key already exists.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "key": {
+        "type": "string",
+        "description": "Unique key for the shared memory region."
+      },
+      "value": {
+        "type": "string",
+        "description": "Initial value to store."
+      }
+    },
+    "required": [
+      "key",
+      "value"
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "set_env",
+  "description": "Set an environment variable in the current process's Context Manager. Child processes will inherit this context.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "key": {
+        "type": "string"
+      },
+      "value": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "key",
+      "value"
+    ]
+  }
+}

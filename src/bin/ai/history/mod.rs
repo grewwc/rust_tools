@@ -18,7 +18,8 @@ use crate::ai::types::App;
 #[allow(unused_imports)]
 pub(in crate::ai) use blob::{
     append_history, append_history_messages, append_history_messages_for_model, build_message_arr,
-    delete_history_artifacts, replace_history_messages, truncate_history_messages,
+    delete_history_artifacts, parse_history_blob, replace_history_messages,
+    truncate_history_messages,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use checkpoint::{CheckpointInfo, CheckpointStore};
@@ -32,7 +33,7 @@ pub(in crate::ai) use compress::{
     mid_turn_llm_summarize,
 };
 #[allow(unused_imports)]
-pub(in crate::ai) use markdown::messages_to_markdown;
+pub(in crate::ai) use markdown::{messages_to_markdown, messages_to_markdown_capped};
 pub(in crate::ai) use sessions::generate_session_summary;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::strip_think_tags;
@@ -124,6 +125,35 @@ pub(in crate::ai) fn delete_subagent_history(path: &Path) -> io::Result<()> {
     // 令 SESSION_STATE_LOCKS map 无界增长。放在磁盘清理之后、不影响其错误传播。
     sqlite::remove_session_state_lock_entry(path);
     history_result.and(lock_result)
+}
+
+/// 超时保留场景下子代理历史文件的新路径（`<原路径>.timeout-preserved`）。
+pub(in crate::ai) fn preserved_subagent_history_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.timeout-preserved", path.display()))
+}
+
+/// 预超时硬超时后保留子代理已写入的历史：把主历史文件改名（而非删除）以便父代理
+/// 提取超时前的工作产物；同时清理原路径的 SQLite sidecar 与状态锁，避免锁残留。
+/// 返回保留后的路径；历史文件不存在时返回 `None`（调用方按原逻辑清理即可）。
+pub(in crate::ai) fn preserve_subagent_history(path: &Path) -> Option<PathBuf> {
+    if !path.exists() {
+        return None;
+    }
+    let preserved = preserved_subagent_history_path(path);
+    if std::fs::rename(path, &preserved).is_err() {
+        // rename 失败（跨设备/权限）时退化为复制；复制仍失败则放弃保留。
+        if std::fs::copy(path, &preserved).is_err() {
+            return None;
+        }
+    }
+    // 主文件已改名/复制保留，这里只清理原路径的 SQLite sidecar。
+    let base = path.to_string_lossy().to_string();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(Path::new(&format!("{base}{suffix}")));
+    }
+    let _ = sqlite::delete_session_state_lock(path);
+    sqlite::remove_session_state_lock_entry(path);
+    Some(preserved)
 }
 
 /// 清理 sub-agent 私有 memory 文件：jsonl 本体 + 派生的 `.db` 索引（连同其
@@ -625,5 +655,35 @@ mod tests {
                 .sum::<Duration>()
                 < CONTEXT_SNAPSHOT_WRITE_DEADLINE
         );
+    }
+
+    #[test]
+    fn preserve_subagent_history_renames_instead_of_deleting() {
+        let dir = std::env::temp_dir().join(format!(
+            "preserve_subagent_history_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let history = dir.join("subagent-1-2.jsonl");
+        std::fs::write(&history, "{\"role\":\"user\",\"content\":\"hello\"}\n").unwrap();
+
+        // 保留：主文件改名为 `<path>.timeout-preserved`，原路径不再存在。
+        let preserved = preserve_subagent_history(&history).expect("preserve should succeed");
+        assert_eq!(preserved, preserved_subagent_history_path(&history));
+        assert!(!history.exists(), "original history must be renamed away");
+        assert!(preserved.exists(), "preserved copy must exist");
+        assert!(
+            preserved.to_string_lossy().ends_with(".timeout-preserved"),
+            "preserved path should carry the .timeout-preserved suffix"
+        );
+
+        // 幂等：再次调用（原路径已不存在）返回 None，不报错。
+        assert!(preserve_subagent_history(&history).is_none());
+
+        // 文件不存在时返回 None。
+        assert!(preserve_subagent_history(&dir.join("missing.jsonl")).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,37 @@
+{
+  "name": "task",
+  "description": "Launch a specialized subagent synchronously and return its final output. The current agent blocks until the subagent finishes. Use this for a single focused side investigation when you need the result before continuing. For multiple parallel subagents prefer task_spawn + task_wait. The runtime auto-selects a subagent when 'agent' is omitted.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "description": {
+        "type": "string",
+        "description": "Short description of what this task will do (3-10 words)."
+      },
+      "prompt": {
+        "type": "string",
+        "description": "The task/prompt to send to the subagent. Be specific about what you want accomplished."
+      },
+      "agent": {
+        "type": "string",
+        "description": "Optional subagent name. Leave empty to let the runtime auto-select the best subagent for this task."
+      },
+      "model": {
+        "type": "string",
+        "description": "Optional model override. By default the subagent reuses your (parent) model; only override when the subtask is clearly lighter (use a lighter model to save cost/latency) or heavier than your own."
+      },
+      "inherit": {
+        "type": "string",
+        "description": "Optional inheritance control. Accepts 'all' (inherit history, memory, cwd, skills), 'none' (fresh sub-agent context), or a comma-separated list selecting some of: history, memory, cwd, skills. If omitted, defaults to cwd+skills only, with both history and memory kept private. For narrow leaf tasks, prefer 'none' or 'cwd' to give the subagent a focused context; only use 'all' when the subtask genuinely depends on the full conversation."
+      },
+      "response_schema": {
+        "type": "object",
+        "description": "Optional JSON Schema for the subagent's final output. When provided, the child must return exactly one JSON value matching this schema."
+      }
+    },
+    "required": [
+      "description",
+      "prompt"
+    ]
+  }
+}

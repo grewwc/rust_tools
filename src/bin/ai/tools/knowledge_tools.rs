@@ -74,35 +74,6 @@ fn rag_timestamp_for_entry(entry: &AgentMemoryEntry) -> u64 {
 
 // ─── knowledge_save ──────────────────────────────────────────────────────────
 
-fn params_knowledge_save() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "content": {
-                "type": "string",
-                "description": "Content to save to memory."
-            },
-            "category": {
-                "type": "string",
-                "description": "Category label (default: \"user_memory\"). Use `common_sense` / `coding_guideline` / `preference` / `user_preference` / `safety_rules` for durable principles or constraints; use `user_memory` / `project_info` / `architecture` / `decision_log` for factual knowledge."
-            },
-            "tags": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Optional tags for categorization."
-            },
-            "source": {
-                "type": "string",
-                "description": "Optional source context (e.g. user command, project name)."
-            },
-            "priority": {
-                "type": "integer",
-                "description": "Priority level 0-255. 255=permanent (never delete), 100-200=high, 50-99=normal, 0-49=low. Default follows category semantics: `user_memory`=150, `common_sense`/`coding_guideline`/`preference`/`user_preference`=210, `safety_rules`=255."
-            }
-        },
-        "required": ["content"]
-    })
-}
 
 fn execute_knowledge_save(args: &Value) -> Result<String, String> {
     let prepared = prepare_memory_save_entry(
@@ -223,8 +194,8 @@ fn sync_entry_to_rag(entry: &AgentMemoryEntry) -> Option<String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_save",
-        description: "Save user-directed content to the global knowledge base with optional category and tags. Use guideline categories like `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` for durable principles/constraints that can be retrieved explicitly.",
-        parameters: params_knowledge_save,
+        description: "",
+
         execute: execute_knowledge_save,
         groups: &["builtin", "core"],
     }
@@ -232,18 +203,6 @@ inventory::submit!(ToolRegistration {
 
 // ─── knowledge_forget ────────────────────────────────────────────────────────
 
-fn params_knowledge_forget() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "id": {
-                "type": "string",
-                "description": "Memory entry id to delete. Use knowledge_list or knowledge_search first to find the id."
-            }
-        },
-        "required": ["id"]
-    })
-}
 
 fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
     let id = args["id"]
@@ -301,8 +260,8 @@ fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_forget",
-        description: "Delete a knowledge entry by id. Use knowledge_list or knowledge_search first to find the id.",
-        parameters: params_knowledge_forget,
+        description: "",
+
         execute: execute_knowledge_forget,
         groups: &["builtin"],
     }
@@ -310,26 +269,6 @@ inventory::submit!(ToolRegistration {
 
 // ─── knowledge_search ────────────────────────────────────────────────────────
 
-fn params_knowledge_search() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Keywords to match. For paraphrases or related concepts, enable `knowledge_semantic_search` via `enable_tools` first."
-            },
-            "category": {
-                "type": "string",
-                "description": "Filter by category."
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Max results (default: 10)."
-            }
-        },
-        "required": ["query"]
-    })
-}
 
 fn execute_knowledge_search(args: &Value) -> Result<String, String> {
     let query = args["query"]
@@ -397,8 +336,8 @@ fn knowledge_search_entry_visible(entry: &AgentMemoryEntry, category: Option<&st
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_search",
-        description: "Search saved knowledge by keywords. For paraphrases or related concepts, enable `knowledge_semantic_search` via `enable_tools` first.",
-        parameters: params_knowledge_search,
+        description: "",
+
         execute: execute_knowledge_search,
         groups: &["builtin", "core"],
     }
@@ -406,17 +345,6 @@ inventory::submit!(ToolRegistration {
 
 // ─── knowledge_list ──────────────────────────────────────────────────────────
 
-fn params_knowledge_list() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "limit": {
-                "type": "integer",
-                "description": "Max entries to show (default: 20, max: 100)."
-            }
-        }
-    })
-}
 
 fn execute_knowledge_list(args: &Value) -> Result<String, String> {
     let limit = args["limit"]
@@ -505,8 +433,8 @@ fn execute_knowledge_list(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_list",
-        description: "List recent knowledge base entries. Shows id, category, and content preview.",
-        parameters: params_knowledge_list,
+        description: "",
+
         execute: execute_knowledge_list,
         groups: &["builtin", "core"],
     }
@@ -514,39 +442,6 @@ inventory::submit!(ToolRegistration {
 
 // ─── knowledge_consolidate ─────────────────────────────────────────────────
 
-fn params_knowledge_consolidate() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["read_all", "execute"],
-                "description": "\"read_all\" returns every knowledge entry for analysis; \"execute\" deletes & saves entries per your consolidation plan."
-            },
-            "delete_ids": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "List of entry IDs to delete (only used when action=\"execute\")."
-            },
-            "save_entries": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "content": { "type": "string", "description": "The consolidated note content." },
-                        "category": { "type": "string", "description": "Category (default: user_memory)." },
-                        "tags": { "type": "array", "items": { "type": "string" } },
-                        "source": { "type": "string" },
-                        "priority": { "type": "integer", "description": "0-255. 255=permanent." }
-                    },
-                    "required": ["content"]
-                },
-                "description": "New entries to save (only used when action=\"execute\"). Saved after deletions."
-            }
-        },
-        "required": ["action"]
-    })
-}
 
 fn execute_knowledge_consolidate(args: &Value) -> Result<String, String> {
     let action = args["action"].as_str().ok_or("Missing 'action'.")?;
@@ -739,8 +634,8 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_consolidate",
-        description: "Two-phase knowledge consolidation. First call with action=\"read_all\" to get all entries; then call with action=\"execute\", delete_ids=[...], and/or save_entries=[...] to apply a consolidation plan. The agent analyzes which entries are useful, obsolete, or mergeable.",
-        parameters: params_knowledge_consolidate,
+        description: "",
+
         execute: execute_knowledge_consolidate,
         groups: &["builtin"],
     }
@@ -801,7 +696,8 @@ mod tests {
 
     #[test]
     fn test_knowledge_save_params() {
-        let params = params_knowledge_save();
+        let params =
+            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_save");
         assert!(
             params["required"]
                 .as_array()
@@ -813,7 +709,8 @@ mod tests {
 
     #[test]
     fn test_knowledge_forget_params() {
-        let params = params_knowledge_forget();
+        let params =
+            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_forget");
         assert!(
             params["required"]
                 .as_array()
@@ -824,7 +721,8 @@ mod tests {
 
     #[test]
     fn test_knowledge_search_params() {
-        let params = params_knowledge_search();
+        let params =
+            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_search");
         assert!(
             params["required"]
                 .as_array()
@@ -910,7 +808,8 @@ mod tests {
 
     #[test]
     fn test_knowledge_list_params() {
-        let params = params_knowledge_list();
+        let params =
+            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_list");
         // limit is optional, so no required
         assert!(
             params["required"]
@@ -956,7 +855,8 @@ mod tests {
 
     #[test]
     fn test_knowledge_consolidate_params() {
-        let params = params_knowledge_consolidate();
+        let params =
+            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_consolidate");
         assert!(
             params["required"]
                 .as_array()

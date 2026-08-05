@@ -62,43 +62,6 @@ struct OverflowSearchParams<'a> {
     scope: SearchScope,
 }
 
-fn params_search_overflow() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Search term. Plain substring by default; pass is_regex=true for regex. Searches the current session's overflow archive (content moved out of context during compression)."
-            },
-            "scope": {
-                "type": "string",
-                "enum": ["all", "history", "tool_outputs"],
-                "description": "Where to search (default: all). 'history' = overflow-history.md (folded original messages); 'tool_outputs' = tool-overflow-compressed/ (full snapshots of individual tool results)."
-            },
-            "file_pattern": {
-                "type": "string",
-                "description": "Optional glob pattern to restrict which archive files are searched (e.g. '*execute_command*' to only look at command-output snapshots). Applies to the tool_outputs scope."
-            },
-            "is_regex": {
-                "type": "boolean",
-                "description": "Treat query as a regex (default: false, literal substring)."
-            },
-            "case_sensitive": {
-                "type": "boolean",
-                "description": "Case-sensitive match (default: true)."
-            },
-            "context_lines": {
-                "type": "integer",
-                "description": "Context lines around each match (default: 2, max: 5)."
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Max matching lines across all files (default: 50, max: 200). If results are truncated, narrow the query (more specific terms, scope, file_pattern) or reduce context_lines/max_results."
-            }
-        },
-        "required": ["query"]
-    })
-}
 
 fn execute_search_overflow(args: &Value) -> Result<String, String> {
     let query = args["query"].as_str().ok_or("Missing 'query' parameter")?;
@@ -179,8 +142,8 @@ fn run_overflow_search(
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "search_overflow",
-        description: "Search session content moved out of context. Returns verbatim excerpts with file paths and line numbers; use read_file only when more context is needed.",
-        parameters: params_search_overflow,
+        description: "",
+
         execute: execute_search_overflow,
         groups: &["builtin", "core"],
     }

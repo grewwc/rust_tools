@@ -1,0 +1,21 @@
+{
+  "name": "shm_write",
+  "description": "Update the value of an existing shared memory region. Fails if the key does not exist (use shm_create first).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "key": {
+        "type": "string",
+        "description": "Key of the shared memory region to update."
+      },
+      "value": {
+        "type": "string",
+        "description": "New value to write."
+      }
+    },
+    "required": [
+      "key",
+      "value"
+    ]
+  }
+}

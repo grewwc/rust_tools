@@ -65,6 +65,7 @@ fn push_project_target(targets: &mut Vec<PathBuf>, seen: &mut FastSet<String>, r
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ExecuteCommandSegmentEffect {
     pub(super) mutation: bool,
+    pub(super) project_mutation: bool,
     pub(super) scope_review: bool,
     pub(super) behavior_check: bool,
     pub(super) success_guaranteed: bool,
@@ -118,7 +119,10 @@ fn is_read_only_segment(tokens: &[String]) -> bool {
     match program {
         "cd" | "pwd" | "ls" | "cat" | "rg" | "grep" | "head" | "tail" | "wc" | "stat" | "file"
         | "which" | "type" | "echo" | "printf" | "sleep" | "true" | "false" | "test" | "sort"
-        | "uniq" | "cut" | "find" => true,
+        | "uniq" | "cut" | "find" | "comm" | "tr" => true,
+        "sed" => !tokens
+            .iter()
+            .any(|token| token == "-i" || token.starts_with("-i")),
         "git" => matches!(
             subcommand,
             "diff"
@@ -308,6 +312,7 @@ fn analyze_execute_command(command: &str, initial_cwd: &Path) -> ExecuteCommandA
     let mut analysis = ExecuteCommandAnalysis::default();
     let mut cwd = normalize_lexical(initial_cwd);
     let mut seen = FastSet::default();
+    let project_root = project_root_dir();
     let segments = crate::ai::tools::service::audit::split_unquoted_command_segments(command);
     let success_guaranteed = segments.iter().all(|segment| {
         matches!(
@@ -341,40 +346,60 @@ fn analyze_execute_command(command: &str, initial_cwd: &Path) -> ExecuteCommandA
         let (mut command_targets, known_mutator) = mutation_target_tokens(&tokens);
         raw_targets.append(&mut command_targets);
         let mutation = has_redirection || !read_only;
-        analysis.effects.push(ExecuteCommandSegmentEffect {
-            mutation,
-            scope_review,
-            behavior_check,
-            success_guaranteed,
-        });
         if !mutation {
+            analysis.effects.push(ExecuteCommandSegmentEffect {
+                scope_review,
+                behavior_check,
+                success_guaranteed,
+                ..Default::default()
+            });
             continue;
         }
         let mut resolved_any = false;
+        let mut project_mutation = false;
         for raw_target in raw_targets {
             if let Some(target) = resolve_command_path(&cwd, &raw_target) {
+                project_mutation |= path_is_in_project(&target, &project_root);
                 let key = target.to_string_lossy().into_owned();
                 if seen.insert(key) {
                     analysis.mutation_targets.push(target);
                 }
                 resolved_any = true;
             } else {
+                project_mutation |= path_is_in_project(&cwd, &project_root);
                 if !analysis.unknown_mutation_bases.contains(&cwd) {
                     analysis.unknown_mutation_bases.push(cwd.clone());
                 }
             }
         }
         if !read_only && (!known_mutator || !resolved_any) {
+            project_mutation |= path_is_in_project(&cwd, &project_root);
             if !analysis.unknown_mutation_bases.contains(&cwd) {
                 analysis.unknown_mutation_bases.push(cwd.clone());
             }
         }
+        analysis.effects.push(ExecuteCommandSegmentEffect {
+            mutation,
+            project_mutation,
+            scope_review,
+            behavior_check,
+            success_guaranteed,
+        });
     }
     analysis
 }
 
 pub(super) fn execute_command_segment_effects(command: &str) -> Vec<ExecuteCommandSegmentEffect> {
     analyze_execute_command(command, Path::new(".")).effects
+}
+
+pub(super) fn execute_command_segment_effects_for_args(
+    args: &Value,
+) -> Vec<ExecuteCommandSegmentEffect> {
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    analyze_execute_command(command, &command_base_dir(args)).effects
 }
 
 pub(super) fn execute_command_may_mutate(command: &str) -> bool {
@@ -652,20 +677,38 @@ fn request_interrupt_futex_ready() -> bool {
     crate::ai::driver::signal::request_interrupt_ready()
 }
 
-async fn wait_for_request_interrupt(shutdown: Arc<AtomicBool>, cancel_stream: Arc<AtomicBool>) {
+/// 请求等待期间被打断的原因。
+enum RequestInterruptKind {
+    /// 用户主动取消（Ctrl+C / shutdown / cancel_stream）。
+    User,
+    /// 父代理预超时收口信号：放弃当前请求，立即进入强制收口迭代。
+    WrapUp,
+}
+
+async fn wait_for_request_interrupt(
+    shutdown: Arc<AtomicBool>,
+    cancel_stream: Arc<AtomicBool>,
+) -> RequestInterruptKind {
     let notify = crate::ai::driver::signal::request_interrupt_notify();
     loop {
         if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref())
             || request_interrupt_futex_ready()
         {
-            return;
+            return RequestInterruptKind::User;
+        }
+        // 预超时收口信号（task-local，不影响全局中断状态，也不会误伤并行后台 turn）。
+        if crate::ai::driver::runtime_ctx::has_subagent_wrap_up_pending() {
+            return RequestInterruptKind::WrapUp;
         }
         // 注册等待 future 后再次检查，避免 signal_request_interrupt 与注册之间的 race。
         let notified = notify.notified();
         if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref())
             || request_interrupt_futex_ready()
         {
-            return;
+            return RequestInterruptKind::User;
+        }
+        if crate::ai::driver::runtime_ctx::has_subagent_wrap_up_pending() {
+            return RequestInterruptKind::WrapUp;
         }
         // 50ms 兜底兼容外部 futex 唤醒（不经 Notify 通道）。
         tokio::select! {
@@ -1095,14 +1138,22 @@ pub(super) async fn execute_turn_iteration(
             iteration,
             compression_report,
         ) => response,
-        _ = wait_for_request_interrupt(shutdown.clone(), cancel_stream.clone()) => {
-            return Ok(interrupted_iteration_execution(
-                app,
-                one_shot_mode,
-                turn_messages,
-                persisted_turn_messages,
-                should_quit,
-            ));
+        interrupt_kind = wait_for_request_interrupt(shutdown.clone(), cancel_stream.clone()) => {
+            match interrupt_kind {
+                RequestInterruptKind::User => {
+                    return Ok(interrupted_iteration_execution(
+                        app,
+                        one_shot_mode,
+                        turn_messages,
+                        persisted_turn_messages,
+                        should_quit,
+                    ));
+                }
+                // 预超时收口：放弃当前请求，由 orchestrator 立即进入强制收口迭代。
+                RequestInterruptKind::WrapUp => {
+                    return Ok(IterationExecution::WrapUpFinal);
+                }
+            }
         }
     };
 
@@ -1495,6 +1546,24 @@ mod tests {
                 false
             )
             .is_empty()
+        );
+
+        let args = serde_json::from_str::<Value>(&call.function.arguments).unwrap();
+        let effects = super::execute_command_segment_effects_for_args(&args);
+        assert!(effects.iter().any(|effect| effect.mutation));
+        assert!(
+            effects.iter().all(|effect| !effect.project_mutation),
+            "写入系统临时目录不应被视为项目变更"
+        );
+
+        call.function.arguments =
+            r#"{"command":"printf ready > .agent-ready.log","pty":false}"#.to_string();
+        let args = serde_json::from_str::<Value>(&call.function.arguments).unwrap();
+        assert!(
+            super::execute_command_segment_effects_for_args(&args)
+                .iter()
+                .any(|effect| effect.project_mutation),
+            "相对路径重定向仍应被视为项目变更"
         );
 
         for command in [

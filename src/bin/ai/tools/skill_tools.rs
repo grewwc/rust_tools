@@ -57,18 +57,6 @@ pub(crate) fn take_pending_user_input_request() -> bool {
         .unwrap_or(false)
 }
 
-fn params_activate_skill() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "Exact name of the skill to activate."
-            }
-        },
-        "required": ["name"]
-    })
-}
 
 pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
     let name = args["name"].as_str().unwrap_or("").trim();
@@ -99,18 +87,6 @@ pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
     ))
 }
 
-fn params_request_user_input() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "question": {
-                "type": "string",
-                "description": "The concise information, decision, or confirmation needed from the user."
-            }
-        },
-        "required": ["question"]
-    })
-}
 
 /// 标记当前 skill 正在等待用户输入。工具结果仅供模型接续生成面向用户的问题；
 /// 真正的跨轮状态由 driver 在本 turn 结束时保存，避免工具层直接修改会话状态。
@@ -133,11 +109,8 @@ pub(crate) fn execute_request_user_input(args: &Value) -> Result<String, String>
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "activate_skill",
-        description: "Activate a specific skill by name so its full prompt and tool set load into the current turn. \
-                      If the appropriate skill is not known, proactively use `list_skills` after identifying a concrete specialized need or when the user asks about available skills; do not infer such a need from technical keywords or a routine source-code, repository, file, or terminal investigation alone. \
-                      Activate only when one listed skill clearly and materially improves the user's task; do not activate for generic work, loose keyword overlap, or just in case. \
-                      Activation is scoped to the current user turn and unloads automatically at turn end.",
-        parameters: params_activate_skill,
+        description: "",
+
         execute: execute_activate_skill,
         // skill 发现/激活是低频能力：默认不随每轮 core 展开常驻，模型按需经
         // `enable_tools` 启用，压缩每轮 tools schema token。仍保留 builtin 组，
@@ -149,8 +122,8 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "request_user_input",
-        description: "When an active skill needs information, a decision, or confirmation from the user before it can continue, use this tool instead of merely ending with a question. The driver restores that skill only for the user's immediately following normal message.",
-        parameters: params_request_user_input,
+        description: "",
+
         execute: execute_request_user_input,
         // 这是 driver 直接按名称注入的控制工具，不能通过 manifest 的 tool_groups 暴露。
         groups: &[],
@@ -160,21 +133,6 @@ inventory::submit!(ToolRegistration {
 const DEFAULT_SKILL_LIST_LIMIT: usize = 50;
 const MAX_SKILL_LIST_LIMIT: usize = 100;
 
-fn params_list_skills() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Optional concise keyword or phrase to filter skill names and descriptions. Omit to browse the installed catalog."
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Maximum number of matching skills to return (default 50, maximum 100)."
-            }
-        }
-    })
-}
 
 fn skill_list_limit(args: &Value) -> usize {
     args["limit"]
@@ -242,27 +200,13 @@ pub(crate) fn execute_list_skills(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "list_skills",
-        description: "Browse installed skill names and descriptions without activating anything. \
-                      Use this proactively when the user asks about available skills, or after identifying a concrete, genuinely specialized need for domain context, an established workflow, bundled resources, or dedicated tools and you need to identify the right skill. \
-                      Do not browse merely because a task contains technical keywords or involves a routine source-code, repository, file, or terminal investigation.",
-        parameters: params_list_skills,
+        description: "",
+
         execute: execute_list_skills,
         groups: &["builtin"],
     }
 });
 
-fn params_load_skill() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "Exact name of the skill to read."
-            }
-        },
-        "required": ["name"]
-    })
-}
 
 /// 渲染 load_skill 的返回：头部元信息 + skill 正文（+ 可选 bundled 资源目录）。
 fn render_loaded_skill(skill: &SkillManifest) -> String {
@@ -325,80 +269,19 @@ pub(crate) fn execute_load_skill(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "load_skill",
-        description: "Read a skill's full contents (its prompt body, system prompt, and bundled resource directory if any) by name, without changing the current turn. \
-                      Use this when you need to inspect, learn from, or modify an existing skill (e.g. authoring or debugging skills) — it only returns text, it does NOT activate the skill or alter your tool set. \
-                      Reading a skill does not change the current turn or tool set.",
-        parameters: params_load_skill,
+        description: "",
+
         execute: execute_load_skill,
         groups: &["builtin"],
     }
 });
 
-fn params_save_skill() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "Skill identifier used in the YAML front matter (and default filename)."
-            },
-            "description": {
-                "type": "string",
-                "description": "Short summary shown in skill lists and matching."
-            },
-            "prompt": {
-                "type": "string",
-                "description": "Full skill prompt body (Markdown). Saved after the YAML front matter."
-            },
-            "system_prompt": {
-                "type": "string",
-                "description": "Optional additional system prompt text to include in the YAML front matter."
-            },
-            "tools": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Explicit tool names that the skill is allowed to use."
-            },
-            "tool_groups": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Tool groups that the skill is allowed to use (e.g. builtin, executor; legacy openclaw is still accepted)."
-            },
-            "mcp_servers": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Required MCP server names needed to run this skill."
-            },
-            "priority": {
-                "type": "integer",
-                "description": "Optional match priority; higher values take precedence."
-            },
-            "author": {
-                "type": "string",
-                "description": "Author string (default: \"agent\")."
-            },
-            "version": {
-                "type": "string",
-                "description": "Version string (default: \"1.0.0\")."
-            },
-            "file_name": {
-                "type": "string",
-                "description": "Optional output filename; it will be sanitized and forced to end with .skill."
-            },
-            "overwrite": {
-                "type": "boolean",
-                "description": "If false, fail when the target file already exists (default: true)."
-            }
-        },
-        "required": ["name", "prompt"]
-    })
-}
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "save_skill",
-        description: "Render and save a .skill file (YAML front matter + prompt body) into the configured skills directory.",
-        parameters: params_save_skill,
+        description: "",
+
         execute: execute_save_skill,
         groups: &["builtin"],
     }
@@ -617,24 +500,30 @@ mod tests {
 
     #[test]
     fn skill_discovery_descriptions_preserve_proactive_boundary() {
-        let list_skills = crate::ai::tools::registry::common::get_tool_spec("list_skills")
+        let list_spec = crate::ai::tools::registry::common::get_tool_spec("list_skills")
             .expect("list_skills should be registered");
-        assert!(list_skills.description.contains("Use this proactively"));
-        assert!(list_skills.description.contains("technical keywords"));
+        let list_skills = crate::ai::tools::registry::tool_metadata::tool_description(
+            list_spec.name,
+            list_spec.description,
+        );
+        assert!(list_skills.contains("Use this proactively"));
+        assert!(list_skills.contains("technical keywords"));
         assert!(
             list_skills
-                .description
                 .contains("routine source-code, repository, file, or terminal investigation")
         );
 
-        let activate_skill = crate::ai::tools::registry::common::get_tool_spec("activate_skill")
+        let activate_spec = crate::ai::tools::registry::common::get_tool_spec("activate_skill")
             .expect("activate_skill should be registered");
+        let activate_skill = crate::ai::tools::registry::tool_metadata::tool_description(
+            activate_spec.name,
+            activate_spec.description,
+        );
         assert!(
             activate_skill
-                .description
                 .contains("proactively use `list_skills`")
         );
-        assert!(activate_skill.description.contains("technical keywords"));
+        assert!(activate_skill.contains("technical keywords"));
     }
 
     #[test]

@@ -1,0 +1,8 @@
+{
+  "name": "task_status",
+  "description": "Show status of all asynchronously spawned tasks. Lists task_id, agent, model, and current state (running/completed/failed) without blocking. For tasks that have already finished, their output is included inline and collected immediately, so you can use completed results right away without calling task_wait.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

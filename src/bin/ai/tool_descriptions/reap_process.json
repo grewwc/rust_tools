@@ -1,0 +1,16 @@
+{
+  "name": "reap_process",
+  "description": "Collect a terminated child or descendant process and remove it from the process table.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pid": {
+        "type": "integer",
+        "description": "Terminated child or descendant PID to collect and remove from the process table."
+      }
+    },
+    "required": [
+      "pid"
+    ]
+  }
+}

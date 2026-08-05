@@ -63,8 +63,10 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
     use a parsed control channel before it can influence the user-facing prompt.
 18. **Redirect notes never quote user content.** Keep redirect text fixed and
     runtime-owned; retain the exact input only in its user-role message.
-19. **Completion claims require evidence.** Recheck unsupported post-mutation
-    completion claims once; otherwise persist and display an explicit warning.
+19. **Completion claims require evidence.** Recheck unsupported post-project-
+   mutation completion claims once; temp-only command side effects do not count.
+   Otherwise persist and display one explicit warning. A warning-only response is
+   still an incomplete final and receives the normal one-time synthesis grace.
 20. **Scheduler blocking is event-driven.** Foreground waits, background-task
     completion, shutdown, and wall-clock deadlines wake the driver through the
     scheduler notifier; never restore fixed-interval polling sleeps in the main loop.

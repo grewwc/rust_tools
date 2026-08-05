@@ -15,31 +15,12 @@ use crate::ai::tools::common::ToolStreamingRegistration;
 use crate::ai::tools::storage::file_store::FileStore;
 use crate::ai::tools::storage::temp_registry;
 
-fn params_apply_patch() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "Absolute target path for a single-file unified diff. Optional when the patch carries a git-style header or a `*** Update File:` envelope (the path is read from the patch). Ignored for `*** Begin Patch` envelopes, since each section declares its own path. `path` is accepted as an alias."
-            },
-            "patch": {
-                "type": "string",
-                "description": "The edit to apply. Prefer the smallest format that fits:\n\n(A) One substring on one uniquely identifiable line:\n```\n*** Begin Patch\n*** Replace in line: <absolute/path>\nanchor: <substring that uniquely identifies the target line>\nold: <exact substring on that line to replace>\nnew: <replacement substring>\n*** End Patch\n```\n\n(B) Larger edits, multiple files, additions, or deletions:\n```\n*** Begin Patch\n*** Update File: <absolute/path>\n@@\n <unchanged context line>\n-<line to remove>\n+<line to add>\n <unchanged context line>\n*** End Patch\n```\nUse `*** Add File: <path>` with `+`-prefixed content and `*** Delete File: <path>` with no body. Repeat sections for multiple files.\n\n(C) Plain unified diff: single-file diffs need `file_path` or `---` / `+++` headers; multi-file diffs (git-style `diff --git` headers or `---`/`+++` pairs) are split and applied per file automatically. It cannot delete files.\n\nCopy file text exactly, but omit `read_file`'s `<number>\\t` prefix. Context and removed lines must match the current file, including indentation. Do not use Markdown fences, mix formats, or send a zero-change patch.\n\nSize guidance: patches larger than ~4KB are likely to be truncated by the context manager before reaching this tool; split them into multiple apply_patch calls (each with a few hunks) or write the patch to a temp file and pass `patch_file`. Batch multiple hunks in one call only when each hunk has uniquely identifiable context; for structurally similar blocks (e.g. repeated closures), apply one patch per block."
-            },
-            "patch_file": {
-                "type": "string",
-                "description": "Optional absolute path to a file containing the patch text (alternative to `patch`). Use for large patches: write the patch to a temp file with write_file(temp=true) (which registers it in the session temp registry), then pass its path here so the tool-call payload stays small. The file must be a session temp file or inside the current working directory. Pass either `patch` or `patch_file`, not both."
-            }
-        }
-    })
-}
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply localized file edits. For one substring on one line, use `*** Replace in line:`. For larger or multi-file changes, use a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, or `*** Delete File:` sections. A plain unified diff is also accepted; multi-file diffs (git-style `diff --git` headers or `---`/`+++` pairs) are split and applied per file automatically, and `file_path` is needed only when the diff has no header. Copy source text exactly, without `read_file` line-number prefixes. On failure, rebuild from the current text echoed in the error. For large patches, write the patch to a temp file (write_file(temp=true)) and pass its path as `patch_file` instead of the inline `patch` text.",
-        parameters: params_apply_patch,
+        description: "",
+
         execute: execute_apply_patch,
         groups: &["executor", "builtin", "core"],
     }
@@ -2588,7 +2569,7 @@ mod tests {
     use super::{
         PatchEnvelopeOp, apply_inline_replace, apply_patch_target_paths_from_patch,
         apply_unified_patch, execute_apply_patch, file_path_from_unified_diff_header,
-        params_apply_patch, parse_patch_envelope, parse_patch_envelopes,
+        parse_patch_envelope, parse_patch_envelopes,
         parse_unified_diff_header_target, parse_unified_hunks, strip_code_fence,
     };
     use crate::ai::test_support::ENV_LOCK;
@@ -2606,7 +2587,7 @@ mod tests {
 
     #[test]
     fn apply_patch_schema_does_not_expose_legacy_dry_run() {
-        let schema = params_apply_patch();
+        let schema = crate::ai::tools::registry::tool_metadata::tool_parameters("apply_patch");
         assert!(schema["properties"].get("dry_run").is_none());
     }
 

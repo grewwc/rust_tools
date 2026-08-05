@@ -15,30 +15,6 @@ use crate::ai::tools::storage::rag_store::{ensure_rag_store, get_rag_store};
 
 // ─── knowledge_semantic_search ───────────────────────────────────────────────
 
-fn params_semantic_search() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Meaning-based query; falls back to keyword search without embeddings."
-            },
-            "category": {
-                "type": "string",
-                "description": "Filter by category (optional)."
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Max results (default: 5)."
-            },
-            "hybrid": {
-                "type": "boolean",
-                "description": "Use hybrid search (BM25 + vector). Default: true."
-            }
-        },
-        "required": ["query"]
-    })
-}
 
 fn execute_semantic_search(args: &Value) -> Result<String, String> {
     // 确保 embedding provider 已初始化（与 note_search 一致：在入口处调用 warm_up）。
@@ -167,8 +143,8 @@ fn execute_semantic_search(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_semantic_search",
-        description: "Search saved knowledge by meaning; falls back to keyword search without embeddings.",
-        parameters: params_semantic_search,
+        description: "",
+
         execute: execute_semantic_search,
         groups: &["builtin"],
     }
@@ -176,12 +152,6 @@ inventory::submit!(ToolRegistration {
 
 // ─── knowledge_rebuild_index ─────────────────────────────────────────────────
 
-fn params_rebuild_index() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {}
-    })
-}
 
 fn execute_rebuild_index(_args: &Value) -> Result<String, String> {
     // 确保 embedding provider 已初始化（与 note_search / semantic_search 一致）。
@@ -209,8 +179,8 @@ fn execute_rebuild_index(_args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_rebuild_index",
-        description: "Rebuild the vector index from the current memory store. Use this after bulk changes or if the index seems out of sync.",
-        parameters: params_rebuild_index,
+        description: "",
+
         execute: execute_rebuild_index,
         groups: &["builtin"],
     }
@@ -222,7 +192,8 @@ mod tests {
 
     #[test]
     fn test_semantic_search_params() {
-        let params = params_semantic_search();
+        let params =
+            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_semantic_search");
         assert!(
             params["required"]
                 .as_array()
@@ -233,7 +204,8 @@ mod tests {
 
     #[test]
     fn test_rebuild_index_params() {
-        let params = params_rebuild_index();
+        let params =
+            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_rebuild_index");
         // No required parameters
         assert!(
             params["required"]

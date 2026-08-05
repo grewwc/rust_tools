@@ -21,6 +21,14 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
    `ToolSpec` or reintroduce name-keyed policy chains in `history/compress/`.
    Same-turn same-argument result reuse is opt-in via `ToolReplayRegistration`;
    never infer replay safety from read-like tool names.
+   Built-in tool metadata (name + description + JSON-schema `parameters`) lives
+   as one JSON file per tool under `src/bin/ai/tool_descriptions/<tool>.json`;
+   `build.rs` auto-discovers and embeds them. Tool registrations keep empty
+   descriptions as fallbacks and no longer carry parameter schemas in code;
+   both are resolved through `registry::tool_metadata` when building tool
+   definitions/summaries. A test pins every registered tool to a non-empty
+   builtin metadata entry, so a missing/mismatched JSON fails loudly instead
+   of silently degrading to an empty description.
 5. **History policy semantics.** `lossy_compress` and `prune` are orthogonal.
    Preserve truth for `plan`, `read_file`, `execute_command` diagnostics, and
    subagent task tools with explicit overflow stubs/file pointers, not lossy

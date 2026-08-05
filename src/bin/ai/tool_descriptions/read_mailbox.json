@@ -1,0 +1,8 @@
+{
+  "name": "read_mailbox",
+  "description": "Read all pending IPC messages, wake-up notifications, and child process termination results from your mailbox. Calling this empties the mailbox. When the mailbox contains subagent wake-up messages, use them to decide whether to call task_status, task_wait, task_cancel, or continue reasoning with already available results.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

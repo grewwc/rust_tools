@@ -1,0 +1,13 @@
+{
+  "name": "knowledge_list",
+  "description": "List recent knowledge base entries. Shows id, category, and content preview.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "limit": {
+        "type": "integer",
+        "description": "Max entries to show (default: 20, max: 100)."
+      }
+    }
+  }
+}

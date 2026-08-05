@@ -489,12 +489,13 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
         if tool_call.function.name == "execute_command" {
             let effects = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
                 .ok()
-                .and_then(|args| args.get("command")?.as_str().map(str::to_owned))
-                .map(|command| super::super::iteration::execute_command_segment_effects(&command))
+                .map(|args| {
+                    super::super::iteration::execute_command_segment_effects_for_args(&args)
+                })
                 .unwrap_or_default();
             for effect in effects {
                 let had_mutation = state.successful_mutation;
-                if effect.mutation {
+                if effect.project_mutation {
                     state.successful_mutation = true;
                     state.successful_post_mutation_verification = false;
                     state.successful_post_mutation_scope_review = false;
@@ -593,6 +594,32 @@ const NO_TOOL_SYNTHESIS_RETRY_NOTE: &str = "The previous no-tool synthesis respo
 const NO_TOOL_SYNTHESIS_WARNING: &str = "模型连续两次在无工具收尾阶段返回工具调用；运行时已停止重试。请仅依据此前已获得的证据判断任务状态，未验证的部分应视为未完成。";
 const REASONING_ONLY_RETRY_MARKER: &str = "[reasoning-only-retry]";
 const REASONING_ONLY_RETRY_NOTE: &str = "The previous response contained hidden reasoning but no visible assistant answer. This is the one automatic recovery attempt. Retry the step normally with the same capabilities, including tools and internal reasoning when needed, and ensure the response eventually includes visible assistant content.";
+
+fn append_runtime_warning_once(text: &mut String, warning: &str) {
+    if text.contains(warning) {
+        return;
+    }
+    if !text.trim().is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(warning);
+}
+
+fn contains_only_runtime_warnings(text: &str) -> bool {
+    let mut saw_warning = false;
+    for paragraph in text
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if paragraph.starts_with("[Runtime warning]") {
+            saw_warning = true;
+        } else {
+            return false;
+        }
+    }
+    saw_warning
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DanglingFinalRecoveryAction {
@@ -738,7 +765,10 @@ fn looks_like_dangling_action_final(
         .map(|index| &final_text[..index])
         .unwrap_or(final_text)
         .trim();
-    if candidate.is_empty() || candidate.chars().count() > 900 || candidate.contains("```") {
+    if candidate.is_empty() {
+        return contains_only_runtime_warnings(final_text);
+    }
+    if candidate.chars().count() > 900 || candidate.contains("```") {
         return false;
     }
 
@@ -850,7 +880,7 @@ fn dangling_final_recovery_action(
         role: ROLE_INTERNAL_NOTE.to_string(),
         content: serde_json::Value::String(format!(
             "{DANGLING_FINAL_RECOVERY_MARKER}\n\
-             Your previous response ended with a promise to read, inspect, or verify more, but it did not deliver findings or a conclusion.\n\
+             Your previous response did not deliver findings or a conclusion; it only promised more inspection or repeated runtime warnings.\n\
              This is a one-time synthesis recovery, not a new investigation round. Do not call tools.\n\
              Based only on evidence already present in the context, give the final answer now. If evidence is insufficient, state the exact unresolved gap and why it could not be verified; do not narrate future actions."
         )),
@@ -2345,6 +2375,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
 ) -> Result<TurnLoopStep, Box<dyn std::error::Error>> {
     match execution {
         IterationExecution::Exit(outcome) => Ok(TurnLoopStep::Return(outcome)),
+        // 预超时收口由 orchestrator 在调用本函数前拦截处理，这里只是穷尽匹配的兜底。
+        IterationExecution::WrapUpFinal => Ok(TurnLoopStep::Continue),
         IterationExecution::RequestFailed(text) => {
             *final_assistant_text = text;
             Ok(TurnLoopStep::Break)
@@ -2556,17 +2588,17 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     return Ok(TurnLoopStep::Continue);
                 }
                 DanglingFinalRecoveryAction::Warn => {
-                    stream_result.assistant_text.push_str("\n\n");
-                    stream_result
-                        .assistant_text
-                        .push_str(DANGLING_FINAL_WARNING);
+                    append_runtime_warning_once(
+                        &mut stream_result.assistant_text,
+                        DANGLING_FINAL_WARNING,
+                    );
                 }
             }
             if warn_unverified_completion {
-                stream_result.assistant_text.push_str("\n\n");
-                stream_result
-                    .assistant_text
-                    .push_str(COMPLETION_EVIDENCE_WARNING);
+                append_runtime_warning_once(
+                    &mut stream_result.assistant_text,
+                    COMPLETION_EVIDENCE_WARNING,
+                );
             }
             let was_truncated_by_length = stream_result.truncated_by_length;
             record_final_stream_response(
@@ -4533,6 +4565,40 @@ mod tests {
     }
 
     #[test]
+    fn completion_evidence_gate_ignores_execute_command_temp_redirections() {
+        let command = test_tool_call(
+            "call_command",
+            "execute_command",
+            serde_json::json!({
+                "command": "grep -rhoE 'name: \"[a-z_]+\"' src/bin/ai/tools/ | sed 's/name: //' | tr -d '\"' | sort -u > /tmp/registered.txt; ls src/bin/ai/tool_descriptions/ | sed 's/.json//' | sort -u > /tmp/jsonnames.txt; comm -23 /tmp/registered.txt /tmp/jsonnames.txt",
+                "cwd": crate::ai::driver::runtime_ctx::effective_cwd().unwrap(),
+            }),
+        );
+        let turn_messages = vec![
+            assistant_tool_call_message(command),
+            tool_result_message("call_command", "48 registrations match 48 JSON files"),
+        ];
+        let evidence = completion_evidence_state(&turn_messages);
+        let mut messages = turn_messages.clone();
+
+        assert!(
+            !evidence.successful_mutation,
+            "系统临时文件不应触发项目变更证据门"
+        );
+        assert_eq!(
+            completion_evidence_gate_action(
+                &mut messages,
+                &turn_messages,
+                "名称完全对齐，没有发现漂移。",
+                false,
+                2,
+                16,
+            ),
+            CompletionEvidenceGateAction::Allow
+        );
+    }
+
+    #[test]
     fn completion_evidence_gate_accepts_successful_post_mutation_check() {
         let mutation = test_tool_call(
             "call_write",
@@ -5497,6 +5563,31 @@ mod tests {
             &turn_messages,
             "Let me inspect the final dispatch branch.",
         ));
+        assert!(looks_like_dangling_action_final(
+            "Audit the scheduler changes",
+            &turn_messages,
+            COMPLETION_EVIDENCE_WARNING,
+        ));
+        assert!(!looks_like_dangling_action_final(
+            "Audit the scheduler changes",
+            &turn_messages,
+            &format!("{COMPLETION_EVIDENCE_WARNING}\n\nConclusion: no drift was found."),
+        ));
+
+        let mut warning_only_messages = turn_messages.clone();
+        assert_eq!(
+            dangling_final_recovery_action(
+                "Audit the scheduler changes",
+                &mut warning_only_messages,
+                &turn_messages,
+                COMPLETION_EVIDENCE_WARNING,
+            ),
+            DanglingFinalRecoveryAction::RetryWithoutTools
+        );
+
+        let mut warning_text = COMPLETION_EVIDENCE_WARNING.to_string();
+        append_runtime_warning_once(&mut warning_text, COMPLETION_EVIDENCE_WARNING);
+        assert_eq!(warning_text.matches(COMPLETION_EVIDENCE_WARNING).count(), 1);
     }
 
     #[test]

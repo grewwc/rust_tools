@@ -1,0 +1,29 @@
+{
+  "name": "tree",
+  "description": "Display directory tree structure with depth control. Shows files and directories in a hierarchical format, respecting .gitignore-style skip directories. Use this to quickly understand project layout without reading individual files.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Root directory to display (default: \".\")."
+      },
+      "max_depth": {
+        "type": "integer",
+        "description": "Maximum depth to recurse (default: 3, max: 6)."
+      },
+      "show_hidden": {
+        "type": "boolean",
+        "description": "Include hidden files/directories (default: false)."
+      },
+      "dirs_only": {
+        "type": "boolean",
+        "description": "Only show directories, not files (default: false)."
+      },
+      "file_pattern": {
+        "type": "string",
+        "description": "Optional glob filter for files (e.g. \"*.rs\"). Directories are always shown for structure."
+      }
+    }
+  }
+}

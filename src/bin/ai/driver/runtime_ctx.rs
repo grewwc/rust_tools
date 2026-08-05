@@ -282,6 +282,14 @@ pub(crate) fn take_subagent_wrap_up_request() -> bool {
         .unwrap_or(false)
 }
 
+/// 非消费式检查：父代理是否已发出预超时收口请求。用于在当前模型请求等待期间
+/// 中断请求并立即进入强制收口迭代（见 `iteration.rs` 的请求中断分支）。
+pub(crate) fn has_subagent_wrap_up_pending() -> bool {
+    SUBAGENT_WRAP_UP_SIGNAL
+        .try_with(|signal| signal.load(Ordering::Acquire))
+        .unwrap_or(false)
+}
+
 /// Try to read the current `DRIVER_CTX`. Returns `None` when called from a
 /// thread that has no active scope (e.g. unit tests or one-shot tool
 /// invocations outside a turn).

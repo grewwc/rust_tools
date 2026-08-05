@@ -1,0 +1,16 @@
+{
+  "name": "wait_process",
+  "description": "Suspend the current process until the specified child process (PID) terminates. You will be awakened via your mailbox with the child's result.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pid": {
+        "type": "integer",
+        "description": "The Process ID (PID) to wait for."
+      }
+    },
+    "required": [
+      "pid"
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "knowledge_search",
+  "description": "Search saved knowledge by keywords. For paraphrases or related concepts, enable `knowledge_semantic_search` via `enable_tools` first.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Keywords to match. For paraphrases or related concepts, enable `knowledge_semantic_search` via `enable_tools` first."
+      },
+      "category": {
+        "type": "string",
+        "description": "Filter by category."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Max results (default: 10)."
+      }
+    },
+    "required": [
+      "query"
+    ]
+  }
+}

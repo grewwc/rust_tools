@@ -1,0 +1,40 @@
+{
+  "name": "task_integrate",
+  "description": "Acknowledge durable subagent results after incorporating or explicitly rejecting them. Every delivered task_id must be integrated before a normal final answer.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "tasks": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string"
+            },
+            "disposition": {
+              "type": "string",
+              "enum": [
+                "accepted",
+                "rejected",
+                "superseded"
+              ]
+            },
+            "summary": {
+              "type": "string",
+              "description": "What the parent concluded from this result and how it affects the remaining work."
+            }
+          },
+          "required": [
+            "task_id",
+            "disposition",
+            "summary"
+          ]
+        }
+      }
+    },
+    "required": [
+      "tasks"
+    ]
+  }
+}

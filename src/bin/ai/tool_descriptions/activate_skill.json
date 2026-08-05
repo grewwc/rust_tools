@@ -1,0 +1,16 @@
+{
+  "name": "activate_skill",
+  "description": "Activate a specific skill by name so its full prompt and tool set load into the current turn. If the appropriate skill is not known, proactively use `list_skills` after identifying a concrete specialized need or when the user asks about available skills; do not infer such a need from technical keywords or a routine source-code, repository, file, or terminal investigation alone. Activate only when one listed skill clearly and materially improves the user's task; do not activate for generic work, loose keyword overlap, or just in case. Activation is scoped to the current user turn and unloads automatically at turn end.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Exact name of the skill to activate."
+      }
+    },
+    "required": [
+      "name"
+    ]
+  }
+}

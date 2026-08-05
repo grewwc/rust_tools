@@ -37,6 +37,9 @@ pub(super) enum IterationExecution {
     /// 本轮响应被截断（服务端 finish_reason=length，或工具调用 arguments JSON
     /// 不完整被丢弃）。应注入"收缩单次输出"提示后自动重试，而非静默完成。
     Truncated(crate::ai::types::StreamResult),
+    /// 预超时收口信号在模型请求中途触发：放弃当前请求，由 orchestrator 立即
+    /// 进入强制收口（无工具）迭代，而不是等当前迭代自然结束。
+    WrapUpFinal,
     FinalResponse(crate::ai::types::StreamResult),
     ToolCall(ToolCallExecution),
 }

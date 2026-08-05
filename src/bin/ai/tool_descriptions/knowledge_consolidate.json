@@ -1,0 +1,60 @@
+{
+  "name": "knowledge_consolidate",
+  "description": "Two-phase knowledge consolidation. First call with action=\"read_all\" to get all entries; then call with action=\"execute\", delete_ids=[...], and/or save_entries=[...] to apply a consolidation plan. The agent analyzes which entries are useful, obsolete, or mergeable.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": [
+          "read_all",
+          "execute"
+        ],
+        "description": "\"read_all\" returns every knowledge entry for analysis; \"execute\" deletes & saves entries per your consolidation plan."
+      },
+      "delete_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "List of entry IDs to delete (only used when action=\"execute\")."
+      },
+      "save_entries": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string",
+              "description": "The consolidated note content."
+            },
+            "category": {
+              "type": "string",
+              "description": "Category (default: user_memory)."
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "source": {
+              "type": "string"
+            },
+            "priority": {
+              "type": "integer",
+              "description": "0-255. 255=permanent."
+            }
+          },
+          "required": [
+            "content"
+          ]
+        },
+        "description": "New entries to save (only used when action=\"execute\"). Saved after deletions."
+      }
+    },
+    "required": [
+      "action"
+    ]
+  }
+}

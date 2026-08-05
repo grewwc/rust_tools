@@ -1,0 +1,21 @@
+{
+  "name": "ps_ipc",
+  "description": "List AIOS IPC channels and result pipes with owner tags, queued messages, and named ref holders. By default this shows only hanging result pipes that still have refs, buffered messages, or are not closed yet.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "scope": {
+        "type": "string",
+        "enum": [
+          "result_pipes",
+          "all"
+        ],
+        "description": "Which channels to show. result_pipes focuses on task/async tool result pipes. all shows every channel."
+      },
+      "only_hanging": {
+        "type": "boolean",
+        "description": "When true, only show channels that are still live or not yet reclaimable. Default is true."
+      }
+    }
+  }
+}

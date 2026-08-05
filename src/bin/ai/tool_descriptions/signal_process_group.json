@@ -1,0 +1,27 @@
+{
+  "name": "signal_process_group",
+  "description": "Send a signal to all processes in a process group. Useful for batch operations like stopping or terminating a group of related processes.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pgid": {
+        "type": "integer",
+        "description": "Process Group ID to signal."
+      },
+      "signal": {
+        "type": "string",
+        "enum": [
+          "SIGTERM",
+          "SIGSTOP",
+          "SIGCONT",
+          "SIGKILL"
+        ],
+        "description": "Signal to send to all processes in the group."
+      }
+    },
+    "required": [
+      "pgid",
+      "signal"
+    ]
+  }
+}

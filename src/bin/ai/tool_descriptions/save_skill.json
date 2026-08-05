@@ -1,0 +1,70 @@
+{
+  "name": "save_skill",
+  "description": "Render and save a .skill file (YAML front matter + prompt body) into the configured skills directory.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Skill identifier used in the YAML front matter (and default filename)."
+      },
+      "description": {
+        "type": "string",
+        "description": "Short summary shown in skill lists and matching."
+      },
+      "prompt": {
+        "type": "string",
+        "description": "Full skill prompt body (Markdown). Saved after the YAML front matter."
+      },
+      "system_prompt": {
+        "type": "string",
+        "description": "Optional additional system prompt text to include in the YAML front matter."
+      },
+      "tools": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Explicit tool names that the skill is allowed to use."
+      },
+      "tool_groups": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Tool groups that the skill is allowed to use (e.g. builtin, executor; legacy openclaw is still accepted)."
+      },
+      "mcp_servers": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Required MCP server names needed to run this skill."
+      },
+      "priority": {
+        "type": "integer",
+        "description": "Optional match priority; higher values take precedence."
+      },
+      "author": {
+        "type": "string",
+        "description": "Author string (default: \"agent\")."
+      },
+      "version": {
+        "type": "string",
+        "description": "Version string (default: \"1.0.0\")."
+      },
+      "file_name": {
+        "type": "string",
+        "description": "Optional output filename; it will be sanitized and forced to end with .skill."
+      },
+      "overwrite": {
+        "type": "boolean",
+        "description": "If false, fail when the target file already exists (default: true)."
+      }
+    },
+    "required": [
+      "name",
+      "prompt"
+    ]
+  }
+}

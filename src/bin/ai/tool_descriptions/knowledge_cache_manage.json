@@ -1,0 +1,37 @@
+{
+  "name": "knowledge_cache_manage",
+  "description": "Manage knowledge cache: view stats, clear volatile cache, or force refresh.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "Action: stats, clear_volatile, refresh",
+        "enum": [
+          "stats",
+          "clear_volatile",
+          "refresh"
+        ]
+      },
+      "topic": {
+        "type": "string",
+        "description": "Topic to refresh (required for refresh action)."
+      },
+      "category": {
+        "type": "string",
+        "description": "Category for filtering."
+      },
+      "query": {
+        "type": "string",
+        "description": "Search query for refresh."
+      },
+      "limit": {
+        "type": "string",
+        "description": "Limit for refresh results."
+      }
+    },
+    "required": [
+      "action"
+    ]
+  }
+}

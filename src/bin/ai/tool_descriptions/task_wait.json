@@ -1,0 +1,31 @@
+{
+  "name": "task_wait",
+  "description": "Wait for one or more asynchronously spawned subagent tasks (started by task_spawn) to complete and collect their results. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. `timeout_secs` is a per-call budget: on expiry it returns already-collected results plus a note that the rest are still running, and you may call it again with the same task_ids (or pass `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "task_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Array of task_id strings returned by task_spawn."
+      },
+      "timeout_secs": {
+        "type": "integer",
+        "description": "Wait budget for THIS call (clamped to [1, 60], default 30). task_wait suspends the parent, so call it only after independent parent-side work is exhausted. Hitting this budget does NOT cancel or stall the subagent — it only means the wait policy was not satisfied within this call. The subagent keeps running; use task_status for a non-blocking snapshot while other work remains."
+      },
+      "wait_policy": {
+        "type": "string",
+        "enum": [
+          "all",
+          "any"
+        ],
+        "description": "Optional. 'any' (default) returns as soon as the first task finishes so the parent can resume promptly. 'all' waits until every pending task has finished. Remaining tasks stay alive and can be retrieved later."
+      }
+    },
+    "required": [
+      "task_ids"
+    ]
+  }
+}

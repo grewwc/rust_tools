@@ -1,0 +1,8 @@
+{
+  "name": "knowledge_rebuild_index",
+  "description": "Rebuild the vector index from the current memory store. Use this after bulk changes or if the index seems out of sync.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

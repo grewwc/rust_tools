@@ -1,0 +1,17 @@
+{
+  "name": "list_skills",
+  "description": "Browse installed skill names and descriptions without activating anything. Use this proactively when the user asks about available skills, or after identifying a concrete, genuinely specialized need for domain context, an established workflow, bundled resources, or dedicated tools and you need to identify the right skill. Do not browse merely because a task contains technical keywords or involves a routine source-code, repository, file, or terminal investigation.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Optional concise keyword or phrase to filter skill names and descriptions. Omit to browse the installed catalog."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of matching skills to return (default 50, maximum 100)."
+      }
+    }
+  }
+}

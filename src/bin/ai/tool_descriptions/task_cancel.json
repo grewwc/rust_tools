@@ -1,0 +1,23 @@
+{
+  "name": "task_cancel",
+  "description": "Cancel one or more asynchronously spawned subagent tasks (started by task_spawn) that are still running. Cancelling terminates the subagent process and fills its result slot with a 'cancelled' terminal result, so a subsequent task_wait/task_status reports it as cancelled rather than hanging. Use this to abandon a stuck or no-longer-needed background subagent instead of repeatedly calling task_wait.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "task_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Array of async subagent task ids (from task_spawn) to cancel."
+      },
+      "reason": {
+        "type": "string",
+        "description": "Optional reason for canceling these tasks."
+      }
+    },
+    "required": [
+      "task_ids"
+    ]
+  }
+}

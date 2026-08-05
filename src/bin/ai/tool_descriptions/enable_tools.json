@@ -1,0 +1,27 @@
+{
+  "name": "enable_tools",
+  "description": "List or activate additional tools that are not loaded by default. Use 'list' to see available tools, enabling specific tools by name makes them available in subsequent calls. Use this when you need specialized capabilities like memory, knowledge base, web browsing, or MCP server tools.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "operation": {
+        "type": "string",
+        "enum": [
+          "list",
+          "enable"
+        ],
+        "description": "list: show available but not yet loaded tools. enable: activate tools by name so they become available in subsequent calls."
+      },
+      "tools": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Tool names to enable (required for 'enable' operation)."
+      }
+    },
+    "required": [
+      "operation"
+    ]
+  }
+}

@@ -17,7 +17,6 @@ use chrono::Local;
 pub(crate) struct ToolSpec {
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
-    pub(crate) parameters: fn() -> Value,
     pub(crate) execute: fn(&Value) -> Result<String, String>,
     pub(crate) groups: &'static [&'static str],
 }
@@ -385,8 +384,11 @@ pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: reg.spec.name.to_string(),
-                description: reg.spec.description.to_string(),
-                parameters: (reg.spec.parameters)(),
+                description: super::tool_metadata::tool_description(
+                    reg.spec.name,
+                    reg.spec.description,
+                ),
+                parameters: super::tool_metadata::tool_parameters(reg.spec.name),
             },
         };
         tools.insert(tool_def.function.name.clone(), tool_def);
@@ -408,7 +410,10 @@ pub(crate) fn tool_summaries_for_groups(groups: &[&str]) -> Vec<(String, String)
         {
             continue;
         }
-        tools.insert(reg.spec.name.to_string(), reg.spec.description.to_string());
+        tools.insert(
+            reg.spec.name.to_string(),
+            super::tool_metadata::tool_description(reg.spec.name, reg.spec.description),
+        );
     }
 
     tools.into_iter().collect()
@@ -426,8 +431,8 @@ pub(crate) fn get_tool_definitions_by_names(names: &[String]) -> Vec<ToolDefinit
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: spec.name.to_string(),
-                description: spec.description.to_string(),
-                parameters: (spec.parameters)(),
+                description: super::tool_metadata::tool_description(spec.name, spec.description),
+                parameters: super::tool_metadata::tool_parameters(spec.name),
             },
         };
         tools.insert(tool_def.function.name.clone(), tool_def);
@@ -466,7 +471,10 @@ pub(crate) fn deferred_eager_load_tool_summaries() -> Vec<(String, String)> {
         SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
     for reg in inventory::iter::<ToolRegistration> {
         if groups_defer_eager_load(reg.spec.groups) {
-            tools.insert(reg.spec.name.to_string(), reg.spec.description.to_string());
+            tools.insert(
+                reg.spec.name.to_string(),
+                super::tool_metadata::tool_description(reg.spec.name, reg.spec.description),
+            );
         }
     }
     tools.into_iter().collect()

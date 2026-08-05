@@ -224,8 +224,13 @@ pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
                 tool_type: "function".to_string(),
                 function: crate::ai::types::FunctionDefinition {
                     name: reg.spec.name.to_string(),
-                    description: reg.spec.description.to_string(),
-                    parameters: (reg.spec.parameters)(),
+                    description: crate::ai::tools::registry::tool_metadata::tool_description(
+                        reg.spec.name,
+                        reg.spec.description,
+                    ),
+                    parameters: crate::ai::tools::registry::tool_metadata::tool_parameters(
+                        reg.spec.name,
+                    ),
                 },
             });
         }
@@ -261,7 +266,13 @@ fn available_tools_not_active() -> Vec<(String, String)> {
             && subagent_may_enable_tool(reg.spec.name)
             && !active.iter().any(|a| a == reg.spec.name)
         {
-            result.push((reg.spec.name.to_string(), reg.spec.description.to_string()));
+            result.push((
+                reg.spec.name.to_string(),
+                crate::ai::tools::registry::tool_metadata::tool_description(
+                    reg.spec.name,
+                    reg.spec.description,
+                ),
+            ));
         }
     }
     for tool in mcp_tools {
@@ -274,24 +285,6 @@ fn available_tools_not_active() -> Vec<(String, String)> {
     result
 }
 
-fn params_enable_tools() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "operation": {
-                "type": "string",
-                "enum": ["list", "enable"],
-                "description": "list: show available but not yet loaded tools. enable: activate tools by name so they become available in subsequent calls."
-            },
-            "tools": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Tool names to enable (required for 'enable' operation)."
-            }
-        },
-        "required": ["operation"]
-    })
-}
 
 fn execute_enable_tools(args: &Value) -> Result<String, String> {
     let operation = args["operation"]
@@ -429,8 +422,8 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "enable_tools",
-        description: "List or activate additional tools that are not loaded by default. Use 'list' to see available tools, enabling specific tools by name makes them available in subsequent calls. Use this when you need specialized capabilities like memory, knowledge base, web browsing, or MCP server tools.",
-        parameters: params_enable_tools,
+        description: "",
+
         execute: execute_enable_tools,
         groups: &["builtin", "core"],
     }

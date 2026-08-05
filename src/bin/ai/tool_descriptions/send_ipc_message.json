@@ -1,0 +1,21 @@
+{
+  "name": "send_ipc_message",
+  "description": "Send an Inter-Process Communication (IPC) message to another running process's mailbox.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pid": {
+        "type": "integer",
+        "description": "The target Process ID (PID) to send the message to."
+      },
+      "message": {
+        "type": "string",
+        "description": "The message content to send."
+      }
+    },
+    "required": [
+      "pid",
+      "message"
+    ]
+  }
+}

@@ -461,8 +461,7 @@ pub(super) fn parse_bare_xml_tool_body(tool_name: &str, body: &str) -> Option<St
 }
 
 fn single_required_string_argument_key(tool_name: &str) -> Option<String> {
-    let spec = crate::ai::tools::registry::common::get_tool_spec(tool_name)?;
-    let schema = (spec.parameters)();
+    let schema = crate::ai::tools::registry::tool_metadata::tool_parameters(tool_name);
     let schema = schema.as_object()?;
     let required = schema.get("required")?.as_array()?;
     if required.len() != 1 {

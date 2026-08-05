@@ -827,48 +827,13 @@ pub(crate) fn epoll_wait_many_channels(
     epoll_wait_many(os, label, &sources, wait_policy, timeout_ticks)
 }
 
-fn task_inherit_schema_description() -> &'static str {
-    "Optional inheritance control. Accepts 'all' (inherit history, memory, cwd, skills), 'none' (fresh sub-agent context), or a comma-separated list selecting some of: history, memory, cwd, skills. If omitted, defaults to cwd+skills only, with both history and memory kept private. For narrow leaf tasks, prefer 'none' or 'cwd' to give the subagent a focused context; only use 'all' when the subtask genuinely depends on the full conversation."
-}
 
-fn params_task() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "description": {
-                "type": "string",
-                "description": "Short description of what this task will do (3-10 words)."
-            },
-            "prompt": {
-                "type": "string",
-                "description": "The task/prompt to send to the subagent. Be specific about what you want accomplished."
-            },
-            "agent": {
-                "type": "string",
-                "description": "Optional subagent name. Leave empty to let the runtime auto-select the best subagent for this task."
-            },
-            "model": {
-                "type": "string",
-                "description": "Optional model override. By default the subagent reuses your (parent) model; only override when the subtask is clearly lighter (use a lighter model to save cost/latency) or heavier than your own."
-            },
-            "inherit": {
-                "type": "string",
-                "description": task_inherit_schema_description()
-            },
-            "response_schema": {
-                "type": "object",
-                "description": "Optional JSON Schema for the subagent's final output. When provided, the child must return exactly one JSON value matching this schema."
-            }
-        },
-        "required": ["description", "prompt"]
-    })
-}
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task",
-        description: "Launch a specialized subagent synchronously and return its final output. The current agent blocks until the subagent finishes. Use this for a single focused side investigation when you need the result before continuing. For multiple parallel subagents prefer task_spawn + task_wait. The runtime auto-selects a subagent when 'agent' is omitted.",
-        parameters: params_task,
+        description: "",
+
         execute: execute_task,
         groups: &["builtin", "core"],
     }
@@ -891,60 +856,13 @@ pub(crate) fn execute_task(_args: &Value) -> Result<String, String> {
     Err("task is handled by the runtime".to_string())
 }
 
-fn params_task_spawn() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "description": {
-                "type": "string",
-                "description": "Short description of what this task will do (3-10 words)."
-            },
-            "prompt": {
-                "type": "string",
-                "description": "The task/prompt to send to the subagent. Be specific about what you want accomplished."
-            },
-            "agent": {
-                "type": "string",
-                "description": "Optional subagent name. Leave empty to let the runtime auto-select the best subagent."
-            },
-            "model": {
-                "type": "string",
-                "description": "Optional model override. By default the subagent reuses your (parent) model; only override when the subtask is clearly lighter (use a lighter model to save cost/latency) or heavier than your own."
-            },
-            "inherit": {
-                "type": "string",
-                "description": task_inherit_schema_description()
-            },
-            "response_schema": {
-                "type": "object",
-                "description": "Optional JSON Schema for the subagent's final output. When provided, the child must return exactly one JSON value matching this schema."
-            }
-        },
-        "required": ["description", "prompt"]
-    })
-}
 
-fn params_task_spawn_batch() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "tasks": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": MAX_SUBAGENT_SPAWN_BATCH_SIZE,
-                "description": "Independent subagent tasks to preflight and spawn in input order.",
-                "items": params_task_spawn()
-            }
-        },
-        "required": ["tasks"]
-    })
-}
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_spawn",
-        description: "Launch a subagent task asynchronously and return immediately with a task_id, so you can fan out several independent subtasks and let them run concurrently. For a SINGLE delegated subtask whose result you need back, prefer the synchronous `task` — a lone task_spawn immediately followed by task_wait runs no more concurrently than `task` and only adds overhead. After spawning, continue independent parent-side work; use task_status for a non-blocking snapshot and call task_wait only when blocked on results. The returned task_id remains collectable until its result is consumed.",
-        parameters: params_task_spawn,
+        description: "",
+
         execute: execute_task_spawn,
         groups: &["builtin", "core"],
     }
@@ -953,8 +871,8 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_spawn_batch",
-        description: "Spawn multiple independent subagent tasks in one deterministic batch. Every item is preflight-validated before any child starts, then spawn attempts run in input order and the returned task entries preserve that order. Runtime spawn failures are reported per item without hiding already-started tasks.",
-        parameters: params_task_spawn_batch,
+        description: "",
+
         execute: execute_task_spawn_batch,
         groups: &["builtin", "core"],
     }
@@ -1427,24 +1345,12 @@ pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
     .expect("serializing task_spawn_batch result cannot fail"))
 }
 
-fn params_task_retry() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "task_id": {
-                "type": "string",
-                "description": "Terminal failed, timed-out, or cancelled task_id to retry with the same agent, prompt, model, inheritance, tools, and MCP configuration."
-            }
-        },
-        "required": ["task_id"]
-    })
-}
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_retry",
-        description: "Retry a terminal failed, timed-out, or cancelled subagent as a new linked attempt using the original task configuration. Returns a new task_id; collect and integrate the old and new attempts separately.",
-        parameters: params_task_retry,
+        description: "",
+
         execute: execute_task_retry,
         groups: &["builtin", "core"],
     }
@@ -1501,34 +1407,12 @@ fn execute_task_retry(args: &Value) -> Result<String, String> {
     ))
 }
 
-fn params_task_wait() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "task_ids": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Array of task_id strings returned by task_spawn."
-            },
-            "timeout_secs": {
-                "type": "integer",
-                "description": "Wait budget for THIS call (clamped to [1, 60], default 30). task_wait suspends the parent, so call it only after independent parent-side work is exhausted. Hitting this budget does NOT cancel or stall the subagent — it only means the wait policy was not satisfied within this call. The subagent keeps running; use task_status for a non-blocking snapshot while other work remains."
-            },
-            "wait_policy": {
-                "type": "string",
-                "enum": ["all", "any"],
-                "description": "Optional. 'any' (default) returns as soon as the first task finishes so the parent can resume promptly. 'all' waits until every pending task has finished. Remaining tasks stay alive and can be retrieved later."
-            }
-        },
-        "required": ["task_ids"]
-    })
-}
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_wait",
-        description: "Wait for one or more asynchronously spawned subagent tasks (started by task_spawn) to complete and collect their results. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. `timeout_secs` is a per-call budget: on expiry it returns already-collected results plus a note that the rest are still running, and you may call it again with the same task_ids (or pass `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
-        parameters: params_task_wait,
+        description: "",
+
         execute: execute_task_wait,
         groups: &["builtin", "core"],
     }
@@ -2011,18 +1895,12 @@ pub(crate) fn reap_timed_out_subagents() {
     });
 }
 
-fn params_task_status() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {}
-    })
-}
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_status",
-        description: "Show status of all asynchronously spawned tasks. Lists task_id, agent, model, and current state (running/completed/failed) without blocking. For tasks that have already finished, their output is included inline and collected immediately, so you can use completed results right away without calling task_wait.",
-        parameters: params_task_status,
+        description: "",
+
         execute: execute_task_status,
         groups: &["builtin", "core"],
     }
@@ -2037,32 +1915,6 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
-fn params_task_integrate() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "tasks": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": { "type": "string" },
-                        "disposition": {
-                            "type": "string",
-                            "enum": ["accepted", "rejected", "superseded"]
-                        },
-                        "summary": {
-                            "type": "string",
-                            "description": "What the parent concluded from this result and how it affects the remaining work."
-                        }
-                    },
-                    "required": ["task_id", "disposition", "summary"]
-                }
-            }
-        },
-        "required": ["tasks"]
-    })
-}
 
 fn execute_task_integrate(args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_integrate")?;
@@ -2128,8 +1980,8 @@ fn execute_task_integrate(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_integrate",
-        description: "Acknowledge durable subagent results after incorporating or explicitly rejecting them. Every delivered task_id must be integrated before a normal final answer.",
-        parameters: params_task_integrate,
+        description: "",
+
         execute: execute_task_integrate,
         groups: &["builtin", "core"],
     }
@@ -2144,29 +1996,12 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
-fn params_task_cancel() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "task_ids": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Array of async subagent task ids (from task_spawn) to cancel."
-            },
-            "reason": {
-                "type": "string",
-                "description": "Optional reason for canceling these tasks."
-            }
-        },
-        "required": ["task_ids"]
-    })
-}
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_cancel",
-        description: "Cancel one or more asynchronously spawned subagent tasks (started by task_spawn) that are still running. Cancelling terminates the subagent process and fills its result slot with a 'cancelled' terminal result, so a subsequent task_wait/task_status reports it as cancelled rather than hanging. Use this to abandon a stuck or no-longer-needed background subagent instead of repeatedly calling task_wait.",
-        parameters: params_task_cancel,
+        description: "",
+
         execute: execute_task_cancel,
         groups: &["builtin", "core"],
     }

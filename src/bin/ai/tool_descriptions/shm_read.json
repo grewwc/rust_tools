@@ -1,0 +1,16 @@
+{
+  "name": "shm_read",
+  "description": "Read the value of a shared memory region by key. Returns degraded data with warning if owner has terminated or data is corrupted. Fails only if key not found or permission denied with no fallback.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "key": {
+        "type": "string",
+        "description": "Key of the shared memory region to read."
+      }
+    },
+    "required": [
+      "key"
+    ]
+  }
+}

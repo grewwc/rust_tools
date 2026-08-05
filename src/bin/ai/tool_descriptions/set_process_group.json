@@ -1,0 +1,21 @@
+{
+  "name": "set_process_group",
+  "description": "Assign a process to a process group. Processes in the same group can be signaled together with signal_process_group.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pid": {
+        "type": "integer",
+        "description": "PID of the process to assign to a group."
+      },
+      "pgid": {
+        "type": "integer",
+        "description": "Process Group ID to assign. Use a new ID to create a group."
+      }
+    },
+    "required": [
+      "pid",
+      "pgid"
+    ]
+  }
+}

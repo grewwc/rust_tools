@@ -1,0 +1,8 @@
+{
+  "name": "ps_processes",
+  "description": "List all processes in the Agent OS with their PID, parent PID, state, priority, quota, and name. Use this to inspect the process tree before deciding to kill, wait, or reap.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

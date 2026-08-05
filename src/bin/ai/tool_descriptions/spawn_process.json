@@ -1,0 +1,69 @@
+{
+  "name": "spawn_process",
+  "description": "Spawn a fire-and-forget background process in the Agent OS. Returns the PID immediately and does NOT return the process's result — the scheduler runs it autonomously and you only observe it via IPC (read_mailbox / wait_process) or its side effects. Use this for long-running background processes, two-way IPC collaboration, or work whose output you do not need to collect back. If you need the task's result returned to you, use task_spawn instead.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Short name for the process."
+      },
+      "goal": {
+        "type": "string",
+        "description": "The specific goal or task for the sub-process to accomplish."
+      },
+      "priority": {
+        "type": "integer",
+        "description": "Process priority. 0 is highest, 255 is lowest. Default is 10."
+      },
+      "quota_turns": {
+        "type": "integer",
+        "description": "Max number of tool calling turns allowed for this process before it is forcefully yielded. Default is 10."
+      },
+      "capabilities": {
+        "type": "object",
+        "description": "Optional exact capability set for the child process. Omitted means inherit the parent capabilities.",
+        "properties": {
+          "spawn": {
+            "type": "boolean"
+          },
+          "wait": {
+            "type": "boolean"
+          },
+          "ipc_send": {
+            "type": "boolean"
+          },
+          "ipc_receive": {
+            "type": "boolean"
+          },
+          "env_write": {
+            "type": "boolean"
+          },
+          "manage_children": {
+            "type": "boolean"
+          },
+          "sleep": {
+            "type": "boolean"
+          },
+          "reap": {
+            "type": "boolean"
+          },
+          "signal": {
+            "type": "boolean"
+          }
+        }
+      },
+      "allowed_tools": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional whitelist of tool names this process is allowed to call. Omitted means inherit parent's whitelist. Empty array means no restriction."
+      }
+    },
+    "required": [
+      "name",
+      "goal"
+    ]
+  }
+}

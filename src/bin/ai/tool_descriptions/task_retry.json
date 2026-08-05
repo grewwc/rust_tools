@@ -1,0 +1,16 @@
+{
+  "name": "task_retry",
+  "description": "Retry a terminal failed, timed-out, or cancelled subagent as a new linked attempt using the original task configuration. Returns a new task_id; collect and integrate the old and new attempts separately.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "task_id": {
+        "type": "string",
+        "description": "Terminal failed, timed-out, or cancelled task_id to retry with the same agent, prompt, model, inheritance, tools, and MCP configuration."
+      }
+    },
+    "required": [
+      "task_id"
+    ]
+  }
+}

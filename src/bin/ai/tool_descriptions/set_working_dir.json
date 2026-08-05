@@ -1,0 +1,16 @@
+{
+  "name": "set_working_dir",
+  "description": "Set the working directory for the current process. Child processes will inherit this directory.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "dir": {
+        "type": "string",
+        "description": "Absolute path to set as the working directory for the current process."
+      }
+    },
+    "required": [
+      "dir"
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "knowledge_semantic_search",
+  "description": "Search saved knowledge by meaning; falls back to keyword search without embeddings.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Meaning-based query; falls back to keyword search without embeddings."
+      },
+      "category": {
+        "type": "string",
+        "description": "Filter by category (optional)."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Max results (default: 5)."
+      },
+      "hybrid": {
+        "type": "boolean",
+        "description": "Use hybrid search (BM25 + vector). Default: true."
+      }
+    },
+    "required": [
+      "query"
+    ]
+  }
+}

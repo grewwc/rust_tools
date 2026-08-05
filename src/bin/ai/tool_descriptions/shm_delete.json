@@ -1,0 +1,16 @@
+{
+  "name": "shm_delete",
+  "description": "Delete a shared memory region by key.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "key": {
+        "type": "string",
+        "description": "Key of the shared memory region to delete."
+      }
+    },
+    "required": [
+      "key"
+    ]
+  }
+}

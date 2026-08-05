@@ -55,6 +55,14 @@ impl AiConfig {
     // ── Agents ─────────────────────────────────────────────
     pub const AGENTS_DIR: &str = "ai.agents.dir";
 
+    // ── Tool descriptions ──────────────────────────────────
+    /// 用户工具描述覆盖目录（`tool_descriptions/*.json` 同名文件覆盖内置元数据）。
+    /// 优先级低于 `AIO_TOOL_DESCRIPTIONS_DIR` 环境变量，高于
+    /// `~/.config/rust_tools/tool_descriptions/` 与可执行文件同目录的
+    /// `tool_descriptions/`（详见 `tools/registry/tool_metadata.rs` 模块文档）。
+    /// 留空 = 不启用该层覆盖。
+    pub const TOOL_DESCRIPTIONS_DIR: &str = "ai.tool_descriptions.dir";
+
     // ── Memory ─────────────────────────────────────────────
     pub const MEMORY_FILE: &str = "ai.memory.file";
     pub const MEMORY_SEARCH_ARCHIVES_ENABLE: &str = "ai.memory.search_archives.enable";

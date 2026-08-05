@@ -1,0 +1,20 @@
+{
+  "name": "kill_process",
+  "description": "Terminate a child or descendant process when the current process has management capability.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pid": {
+        "type": "integer",
+        "description": "Child or descendant PID to terminate."
+      },
+      "reason": {
+        "type": "string",
+        "description": "Reason recorded in the target process result."
+      }
+    },
+    "required": [
+      "pid"
+    ]
+  }
+}

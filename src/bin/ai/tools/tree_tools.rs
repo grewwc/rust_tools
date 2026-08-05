@@ -26,39 +26,12 @@ const SKIP_DIRS: &[&str] = &[
 const MAX_ENTRIES: usize = 2000;
 const MAX_OUTPUT_CHARS: usize = 32_000;
 
-fn params_tree() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Root directory to display (default: \".\")."
-            },
-            "max_depth": {
-                "type": "integer",
-                "description": "Maximum depth to recurse (default: 3, max: 6)."
-            },
-            "show_hidden": {
-                "type": "boolean",
-                "description": "Include hidden files/directories (default: false)."
-            },
-            "dirs_only": {
-                "type": "boolean",
-                "description": "Only show directories, not files (default: false)."
-            },
-            "file_pattern": {
-                "type": "string",
-                "description": "Optional glob filter for files (e.g. \"*.rs\"). Directories are always shown for structure."
-            }
-        }
-    })
-}
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "tree",
-        description: "Display directory tree structure with depth control. Shows files and directories in a hierarchical format, respecting .gitignore-style skip directories. Use this to quickly understand project layout without reading individual files.",
-        parameters: params_tree,
+        description: "",
+
         execute: execute_tree,
         groups: &["builtin", "core"],
     }

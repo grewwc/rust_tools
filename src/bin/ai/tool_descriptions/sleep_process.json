@@ -1,0 +1,13 @@
+{
+  "name": "sleep_process",
+  "description": "Suspend the current process for a number of scheduler ticks, then resume it later via the ready queue.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "turns": {
+        "type": "integer",
+        "description": "How many scheduler ticks to sleep. Minimum is 1."
+      }
+    }
+  }
+}

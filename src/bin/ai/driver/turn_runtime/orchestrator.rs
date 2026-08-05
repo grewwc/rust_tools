@@ -980,19 +980,14 @@ struct ToolRoundCheckpoint {
 
 fn checkpoint_tool_call_effects(tool_call: &crate::ai::types::ToolCall) -> (bool, bool) {
     if tool_call.function.name != "execute_command" {
-        return (
-            tool_call_is_successful_mutation_candidate(tool_call),
-            false,
-        );
+        return (tool_call_is_successful_mutation_candidate(tool_call), false);
     }
-    let effects =
-        serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
-            .ok()
-            .and_then(|args| args.get("command")?.as_str().map(str::to_owned))
-            .map(|command| super::iteration::execute_command_segment_effects(&command))
-            .unwrap_or_default();
+    let effects = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+        .ok()
+        .map(|args| super::iteration::execute_command_segment_effects_for_args(&args))
+        .unwrap_or_default();
     (
-        effects.iter().any(|effect| effect.mutation),
+        effects.iter().any(|effect| effect.project_mutation),
         effects
             .iter()
             .any(|effect| effect.scope_review || effect.behavior_check),
@@ -4489,6 +4484,16 @@ async fn run_turn_body(
             Ok(e) => e,
             Err(err) => break 'turn Err(err),
         };
+        // 预超时收口信号在模型请求中途触发：放弃当前请求，立即进入强制收口迭代，
+        // 而不是等当前（可能很长的）迭代自然结束。消费信号，避免下一轮迭代顶部重复注入。
+        if matches!(&execution, IterationExecution::WrapUpFinal) {
+            let _ = crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request();
+            pre_timeout_wrap_up_requested = true;
+            record_force_final_reason(&mut messages, "subagent_pre_timeout_wrap_up", iteration);
+            force_final_response = true;
+            inject_subagent_pre_timeout_wrap_up_note(&mut messages);
+            continue 'turn;
+        }
         let was_final_response = matches!(&execution, IterationExecution::FinalResponse(_));
         let had_tool_call_execution = matches!(&execution, IterationExecution::ToolCall(_));
         // 搭车采集：图片摘要尚未解决时，缓存本轮 tool-call 响应的未截断原文

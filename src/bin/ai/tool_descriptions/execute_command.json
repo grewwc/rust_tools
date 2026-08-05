@@ -1,0 +1,29 @@
+{
+  "name": "execute_command",
+  "description": "Run a shell command. Destructive/network/escalation commands are blocked. Output is truncated past a char cap with shown-vs-total counts; narrow or page instead of re-running with different variants. Failures include exit code.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "Shell command to run. For long-running servers, background and redirect output: `cmd > /tmp/app.log 2>&1 & sleep 2 && curl -s localhost:PORT/...`. Never run a foreground server directly."
+      },
+      "cwd": {
+        "type": "string",
+        "description": "Working directory (default: current directory)."
+      },
+      "timeout": {
+        "type": "integer",
+        "description": "Timeout in seconds, 1-300 (default: 30)."
+      },
+      "pty": {
+        "type": "boolean",
+        "description": "Required. Use true for interactive CLIs (QR codes, prompts, full-screen); false otherwise. No keyboard input forwarding."
+      }
+    },
+    "required": [
+      "command",
+      "pty"
+    ]
+  }
+}

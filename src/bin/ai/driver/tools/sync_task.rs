@@ -23,7 +23,7 @@
 // =============================================================================
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{
     Arc,
@@ -54,14 +54,17 @@ struct SyncSubagentHistoryGuard {
     path: PathBuf,
     memory_path: Option<PathBuf>,
     cwd_dir: Option<PathBuf>,
+    /// 硬超时前置位：Drop 时保留子代理历史（改名而非删除），供父代理提取超时前证据。
+    preserve_on_drop: Arc<AtomicBool>,
 }
 
 impl SyncSubagentHistoryGuard {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, preserve_on_drop: Arc<AtomicBool>) -> Self {
         Self {
             path,
             memory_path: None,
             cwd_dir: None,
+            preserve_on_drop,
         }
     }
 
@@ -82,7 +85,23 @@ impl SyncSubagentHistoryGuard {
 
 impl Drop for SyncSubagentHistoryGuard {
     fn drop(&mut self) {
-        if let Err(error) = history::delete_subagent_history(&self.path) {
+        if self.preserve_on_drop.load(Ordering::Acquire) {
+            // 硬超时：保留子代理已写入的历史（改名而非删除），供父代理提取超时前证据。
+            match history::preserve_subagent_history(&self.path) {
+                Some(preserved) => {
+                    eprintln!("[Warning] preserved sync subagent history at {}", preserved.display());
+                }
+                None => {
+                    // 历史文件不存在（子代理尚未写入任何内容），按原逻辑清理。
+                    if let Err(error) = history::delete_subagent_history(&self.path) {
+                        eprintln!(
+                            "[Warning] failed to clean up sync subagent history {}: {error}",
+                            self.path.display()
+                        );
+                    }
+                }
+            }
+        } else if let Err(error) = history::delete_subagent_history(&self.path) {
             eprintln!(
                 "[Warning] failed to clean up sync subagent history {}: {error}",
                 self.path.display()
@@ -196,10 +215,15 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     } else {
         runtime_ctx::make_subagent_cwd(&scratch_base, &task_id)
     };
-    let history_cleanup = SyncSubagentHistoryGuard::new(child_history.clone())
+    // 硬超时前由父进程置位，guard Drop 时保留子代理历史（改名而非删除）。
+    let preserve_history_on_timeout = Arc::new(AtomicBool::new(false));
+    let history_cleanup = SyncSubagentHistoryGuard::new(
+        child_history.clone(),
+        preserve_history_on_timeout.clone(),
+    )
         .with_scoped_artifacts(private_memory_path.clone(), private_cwd_dir.clone());
     // 无论是否继承，子代理都只写自己的历史文件，绝不能写回父 canonical history。
-    task_app.session_history_file = child_history;
+    task_app.session_history_file = child_history.clone();
 
     if let Some(agent) =
         agents::find_agent_by_name(ctx.agent_manifests.as_ref(), &prepared.agent_name)
@@ -377,6 +401,8 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     });
     if join_result.is_err() {
         subagent_cancel.store(true, Ordering::Release);
+        // 硬超时：先置位让 guard Drop 保留历史（改名而非删除），再 abort。
+        preserve_history_on_timeout.store(true, Ordering::Release);
         subagent_handle.abort();
     }
     // `abort` 只发出取消请求；必须等任务真正退出后才能删除仍可能被它写入的 DB。
@@ -385,6 +411,12 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
 
     let duration = started.elapsed();
     let elapsed_secs = duration.as_secs_f64();
+
+    // 硬超时：guard 已把子代理历史改名保留，这里提取超时前的工作产物发布到 result slot，
+    // 避免 15 分钟工作全部丢失（此前超时只返回空结果）。
+    if join_result.is_err() {
+        publish_timeout_evidence(&child_history, &result_slot);
+    }
 
     let captured_result = result_slot
         .try_lock()
@@ -549,6 +581,44 @@ async fn wait_for_sync_task_completion_with_wrap_up(
             "subagent task exceeded hard timeout of {}s",
             hard_timeout.as_secs()
         )),
+    }
+}
+
+/// 硬超时后把子代理已写入历史的工作产物提取出来，发布到 result slot。
+/// 父代理随后在失败结果里能看到超时前的证据节选与保留文件路径，而不是空结果
+/// （此前超时路径把 15 分钟的工作产物全部丢弃）。
+fn publish_timeout_evidence(
+    child_history: &Path,
+    result_slot: &runtime_ctx::SubagentResultSlot,
+) {
+    let preserved = history::preserved_subagent_history_path(child_history);
+    if !preserved.exists() {
+        return;
+    }
+    // 读取最近 40 条消息（含工具输出，`build_message_arr` 自动取尾部），渲染为节选。
+    let messages = match history::build_message_arr(40, &preserved) {
+        Ok(messages) => messages,
+        Err(error) => {
+            eprintln!("[Warning] failed to read preserved subagent history: {error}");
+            return;
+        }
+    };
+    if messages.is_empty() {
+        return;
+    }
+    let session_label = preserved.to_string_lossy();
+    let excerpt =
+        history::messages_to_markdown_capped(&messages, &session_label, 8000);
+    let payload = format!(
+        "[Timeout] 子代理已达到硬超时上限，未在限定时间内产出最终结论。\n\n\
+         超时前已完成的工作产物已保留（完整历史）：\n{}\n\n\
+         超时前最后的工作记录（节选）：\n\n{}",
+        preserved.display(),
+        excerpt.trim(),
+    );
+    if let Ok(mut guard) = result_slot.try_lock() {
+        guard.parent_payload = payload;
+        guard.final_assistant_text = String::new();
     }
 }
 
@@ -922,7 +992,7 @@ mod tests {
         std::fs::write(cwd_path.join("scratch.txt"), b"scratch").unwrap();
 
         drop(
-            SyncSubagentHistoryGuard::new(child_path.clone())
+            SyncSubagentHistoryGuard::new(child_path.clone(), Arc::new(AtomicBool::new(false)))
                 .with_scoped_artifacts(Some(memory_path.clone()), Some(cwd_path.clone())),
         );
 
@@ -966,7 +1036,7 @@ mod tests {
                 + "\n",
         )
         .unwrap();
-        let guard = SyncSubagentHistoryGuard::new(child_path)
+        let guard = SyncSubagentHistoryGuard::new(child_path, Arc::new(AtomicBool::new(false)))
             .with_scoped_artifacts(Some(private_memory.clone()), None);
 
         assert_eq!(
