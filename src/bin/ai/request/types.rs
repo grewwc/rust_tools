@@ -54,6 +54,11 @@ pub(crate) struct RequestBody<'a> {
     /// request model name 反查失败。`#[serde(skip)]`：非 chat-completions 字段。
     #[serde(skip)]
     pub(crate) reasoning_encrypted_replay: bool,
+    /// 本轮请求的 prompt token 字符估算（build_request_body 内计算一次，
+    /// 供 TPM budget 等复用，避免对同一历史重复全量遍历）。`#[serde(skip)]`：
+    /// 不参与任何 wire 编码。
+    #[serde(skip)]
+    pub(crate) estimated_prompt_tokens: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]

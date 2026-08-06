@@ -225,6 +225,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
             .with_scoped_artifacts(private_memory_path.clone(), private_cwd_dir.clone());
     // 无论是否继承，子代理都只写自己的历史文件，绝不能写回父 canonical history。
     task_app.session_history_file = child_history.clone();
+    let _ = crate::ai::driver::commands::session::restore_prune_marks_for_history(&mut task_app);
 
     if let Some(agent) =
         agents::find_agent_by_name(ctx.agent_manifests.as_ref(), &prepared.agent_name)

@@ -101,11 +101,23 @@ pub(crate) fn clamp_max_tokens_for_prompt(
     model_max: u32,
     known_prompt_tokens: Option<u64>,
 ) -> u32 {
+    clamp_with_estimated_prompt(
+        model,
+        estimate_request_prompt_tokens(messages, tools),
+        model_max,
+        known_prompt_tokens,
+    )
+}
+
+/// `clamp_max_tokens_for_prompt` 的已估算变体：调用方（build_request_body）已算过
+/// `estimate_request_prompt_tokens`，传入复用，避免对同一历史重复全量遍历。
+fn clamp_with_estimated_prompt(
+    model: &str,
+    est_prompt: usize,
+    model_max: u32,
+    known_prompt_tokens: Option<u64>,
+) -> u32 {
     let window = models::context_window_tokens(model);
-    // 本轮实际消息量的字符估算（保守：每 token ~2 字符）。工具 schema 也会随请求
-    // 一起发送、占用 prompt 窗口，故把其序列化长度折算进 prompt token--启用大量
-    // 工具/MCP 时不计入会显著高估可用输出预算，导致 prompt+输出撞爆窗口。
-    let est_prompt = estimate_request_prompt_tokens(messages, tools);
     // 优先使用服务端返回的实际 prompt_tokens，比字符估算精确得多。但该值来自
     // *上一轮* 请求：若这一轮刚发生历史压缩，prompt 骤降，而回填的 known 仍是
     // 压缩前的高值--直接用它会把 remaining 误算成接近 0，clamp 触底到
@@ -165,14 +177,11 @@ pub(super) fn build_request_body<'a>(
     // 钳制，避免 prompt + 请求的输出上限一起挤爆 token 窗口（GLM 长上下文下反复
     // 截断 -> 重试死循环的根因）。未声明 max_output_tokens 的模型保持不下发字段，
     // wire 行为不变。
+    // est_prompt 只计算一次：既用于 clamp，也复用于 TPM budget（transport 层读取
+    // `RequestBody::estimated_prompt_tokens`），避免同轮重复遍历历史。
+    let est_prompt = estimate_request_prompt_tokens(messages, tools.as_ref());
     let max_tokens = models::max_output_tokens(model).map(|model_max| {
-        clamp_max_tokens_for_prompt(
-            model,
-            messages,
-            tools.as_ref(),
-            model_max,
-            known_prompt_tokens,
-        )
+        clamp_with_estimated_prompt(model, est_prompt, model_max, known_prompt_tokens)
     });
     // 零输出截断自适应：当上一轮检测到 completion=0 + finish_reason=length 时，
     // orchestrator 会把 max_tokens_override 设为更小的值。此处用该值替换 clamp 结果，
@@ -195,5 +204,6 @@ pub(super) fn build_request_body<'a>(
         max_tokens,
         reasoning_items,
         reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
+        estimated_prompt_tokens: est_prompt,
     }
 }

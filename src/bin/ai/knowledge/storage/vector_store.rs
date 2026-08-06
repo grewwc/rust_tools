@@ -50,6 +50,13 @@ pub struct VectorStore {
     conn: Mutex<Connection>,
     embedder: Box<dyn VectorEmbedder>,
     index_path: PathBuf,
+    /// 全表内存缓存（load_all 结果）及其 SQLite data_version。
+    cache: Mutex<Option<CachedEntries>>,
+}
+
+struct CachedEntries {
+    data_version: i64,
+    entries: Vec<VectorEntry>,
 }
 
 impl VectorStore {
@@ -75,6 +82,7 @@ impl VectorStore {
             conn: Mutex::new(conn),
             embedder,
             index_path: path.to_path_buf(),
+            cache: Mutex::new(None),
         })
     }
 
@@ -103,6 +111,10 @@ impl VectorStore {
             params![entry.id, payload],
         )
         .map_err(|e| format!("Failed to write: {}", e))?;
+        *self
+            .cache
+            .lock()
+            .map_err(|e| format!("cache poisoned: {e}"))? = None;
         Ok(())
     }
 
@@ -112,6 +124,10 @@ impl VectorStore {
         let affected = conn
             .execute("DELETE FROM vec_entries WHERE id = ?1", params![id])
             .map_err(|e| format!("Failed to delete: {}", e))?;
+        *self
+            .cache
+            .lock()
+            .map_err(|e| format!("cache poisoned: {e}"))? = None;
         Ok(affected > 0)
     }
 
@@ -154,26 +170,60 @@ impl VectorStore {
 
     /// 加载所有条目（必要时按 category 过滤）。供 search/count 等共用。
     fn load_all(&self, category: Option<&str>) -> Result<Vec<VectorEntry>, String> {
+        // 固定锁顺序为 conn -> cache，并保持 conn 锁直到缓存发布完成，避免同实例
+        // 写入在查询完成与缓存发布之间插入。每次命中前用持久连接的 data_version
+        // 校验跨进程/另一连接写入。
         let conn = self.lock_conn()?;
+        let data_version = conn
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .map_err(|e| format!("Failed to read data_version: {e}"))?;
+        {
+            let guard = self
+                .cache
+                .lock()
+                .map_err(|e| format!("cache poisoned: {e}"))?;
+            if let Some(cached) = guard
+                .as_ref()
+                .filter(|cached| cached.data_version == data_version)
+            {
+                return Ok(match category {
+                    Some(cat) => cached
+                        .entries
+                        .iter()
+                        .filter(|e| e.category == cat)
+                        .cloned()
+                        .collect(),
+                    None => cached.entries.clone(),
+                });
+            }
+        }
         let mut stmt = conn
             .prepare("SELECT payload FROM vec_entries")
             .map_err(|e| format!("Failed to prepare: {}", e))?;
         let rows = stmt
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
             .map_err(|e| format!("Failed to query: {}", e))?;
-        let mut out = Vec::new();
+        // 始终加载全量条目并缓存完整集，避免首次调用带 category 时缓存了
+        // 过滤子集导致后续 load_all(None) 返回不完整结果。
+        let mut all = Vec::new();
         for row in rows {
             let bytes = row.map_err(|e| format!("Failed to iterate: {}", e))?;
             let entry: VectorEntry = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("Failed to deserialize: {}", e))?;
-            if let Some(cat) = category {
-                if entry.category != cat {
-                    continue;
-                }
-            }
-            out.push(entry);
+            all.push(entry);
         }
-        Ok(out)
+        drop(stmt);
+        *self
+            .cache
+            .lock()
+            .map_err(|e| format!("cache poisoned: {e}"))? = Some(CachedEntries {
+            data_version,
+            entries: all.clone(),
+        });
+        Ok(match category {
+            Some(cat) => all.iter().filter(|e| e.category == cat).cloned().collect(),
+            None => all,
+        })
     }
 
     /// Semantic search — cosine similarity top-k.
@@ -399,6 +449,158 @@ mod tests {
         assert!(store.get("stale_legacy_hash").unwrap().is_none());
         assert!(store.get("mem_current").unwrap().is_some());
 
+        cleanup_sqlite(&path);
+    }
+
+    #[test]
+    fn load_all_caches_full_dataset_not_filtered_subset() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_vector_cache_{ts}.db"));
+        cleanup_sqlite(&path);
+
+        let store = VectorStore::new(&path, Box::new(FakeEmbedder)).unwrap();
+        store
+            .upsert(VectorEntry {
+                id: "e1".to_string(),
+                content: "first".to_string(),
+                category: "user_memory".to_string(),
+                tags: vec![],
+                embedding: vec![1.0, 0.0],
+                timestamp: 0,
+            })
+            .unwrap();
+        store
+            .upsert(VectorEntry {
+                id: "e2".to_string(),
+                content: "second".to_string(),
+                category: "coding_guideline".to_string(),
+                tags: vec![],
+                embedding: vec![0.0, 1.0],
+                timestamp: 0,
+            })
+            .unwrap();
+
+        // 首次调用带 category 过滤——修复前会缓存过滤子集。
+        let filtered = store.load_all(Some("user_memory")).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "e1");
+
+        // 后续无过滤调用必须返回全量，而非缓存的子集。
+        let all = store.load_all(None).unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "load_all(None) must return all entries, not cached subset"
+        );
+
+        // 交叉验证：换一个 category 也能命中缓存并正确过滤。
+        let other = store.load_all(Some("coding_guideline")).unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].id, "e2");
+
+        cleanup_sqlite(&path);
+    }
+
+    #[test]
+    fn load_all_invalidates_cache_after_external_connection_write() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_vector_external_cache_{ts}.db"));
+        cleanup_sqlite(&path);
+
+        let store = VectorStore::new(&path, Box::new(FakeEmbedder)).unwrap();
+        store
+            .upsert(VectorEntry {
+                id: "e1".to_string(),
+                content: "first".to_string(),
+                category: "user_memory".to_string(),
+                tags: vec![],
+                embedding: vec![1.0, 0.0],
+                timestamp: 0,
+            })
+            .unwrap();
+        assert_eq!(store.load_all(None).unwrap().len(), 1);
+
+        let external = Connection::open(&path).unwrap();
+        let entry = VectorEntry {
+            id: "e2".to_string(),
+            content: "second".to_string(),
+            category: "coding_guideline".to_string(),
+            tags: vec![],
+            embedding: vec![0.0, 1.0],
+            timestamp: 0,
+        };
+        let payload = serde_json::to_vec(&entry).unwrap();
+        external
+            .execute(
+                "INSERT INTO vec_entries (id, payload) VALUES (?1, ?2)",
+                params![entry.id, payload],
+            )
+            .unwrap();
+
+        assert_eq!(store.load_all(None).unwrap().len(), 2);
+        cleanup_sqlite(&path);
+    }
+
+    #[test]
+    fn concurrent_upsert_and_load_all_publish_fresh_cache() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_vector_concurrent_cache_{ts}.db"));
+        cleanup_sqlite(&path);
+
+        let store = std::sync::Arc::new(VectorStore::new(&path, Box::new(FakeEmbedder)).unwrap());
+        store
+            .upsert(VectorEntry {
+                id: "before".to_string(),
+                content: "before".to_string(),
+                category: "user_memory".to_string(),
+                tags: vec![],
+                embedding: vec![1.0, 0.0],
+                timestamp: 0,
+            })
+            .unwrap();
+        assert_eq!(store.load_all(None).unwrap().len(), 1);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader_store = std::sync::Arc::clone(&store);
+        let reader_barrier = std::sync::Arc::clone(&barrier);
+        let reader = std::thread::spawn(move || {
+            reader_barrier.wait();
+            for _ in 0..100 {
+                let _ = reader_store.load_all(None).unwrap();
+            }
+        });
+        barrier.wait();
+        store
+            .upsert(VectorEntry {
+                id: "after".to_string(),
+                content: "after".to_string(),
+                category: "user_memory".to_string(),
+                tags: vec![],
+                embedding: vec![0.0, 1.0],
+                timestamp: 0,
+            })
+            .unwrap();
+        reader.join().unwrap();
+
+        let ids: std::collections::HashSet<_> = store
+            .load_all(None)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from(["before".to_string(), "after".to_string()])
+        );
         cleanup_sqlite(&path);
     }
 }

@@ -63,8 +63,9 @@ fn is_prune_protected_tool(tool_name: &str) -> bool {
 /// 较低阈值：2 次即卸载，兼顾激进回收与「单个 stray token 不误触发」的迟滞。
 pub(crate) const PRUNE_THRESHOLD: u8 = 2;
 
-/// 历史消息少于该值时不注入裁剪提示（太短无需裁剪）。
-pub(crate) const PRUNE_PROMPT_MIN_MESSAGES: usize = 20;
+/// 只有达到该体量的旧工具结果才值得把裁剪协议暴露给模型。
+/// 实际替换仍会比较生成后的 stub，确保任何路径下都只缩不涨。
+const PRUNE_MIN_CONTENT_CHARS: usize = 4_096;
 
 /// 系统提示中注入的裁剪协议说明。
 /// 保持简短，避免占用过多 token。
@@ -181,6 +182,20 @@ pub(crate) fn active_prunable_tool_ids(messages: &[Message]) -> FxHashSet<String
         .iter()
         .filter_map(|message| {
             if !is_prunable_message(message) {
+                return None;
+            }
+            if message
+                .content
+                .as_str()
+                .is_some_and(is_preserved_tool_overflow_stub)
+            {
+                return None;
+            }
+            if message
+                .content
+                .as_str()
+                .is_none_or(|content| content.chars().count() < PRUNE_MIN_CONTENT_CHARS)
+            {
                 return None;
             }
             let id = message.tool_call_id.as_ref()?;
@@ -309,6 +324,11 @@ pub(crate) fn apply_pruning(
         ) else {
             continue;
         };
+        // 裁剪的目标是回收上下文；短结果若换成更长的路径 stub 只会反向膨胀。
+        // 归档是内容寻址且幂等，即使已写出也不会在后续请求重复制造副本。
+        if stub.chars().count() >= freed {
+            continue;
+        }
 
         if !report.tools.iter().any(|name| name == tool_name) {
             report.tools.push(tool_name.to_string());
@@ -321,9 +341,12 @@ pub(crate) fn apply_pruning(
     report
 }
 
-/// 判断当前历史长度是否值得注入裁剪提示。
-pub(crate) fn should_inject_prune_prompt(message_count: usize) -> bool {
-    message_count >= PRUNE_PROMPT_MIN_MESSAGES
+/// 仅在当前请求里确实存在可裁剪的旧工具结果时注入协议。
+///
+/// 这比固定消息数阈值更贴近能力边界：短对话里的超大旧结果可以及时回收；
+/// 没有工具候选的长纯对话则不浪费 prompt token。
+pub(crate) fn should_inject_prune_prompt(messages: &[Message]) -> bool {
+    !active_prunable_tool_ids(messages).is_empty()
 }
 
 /// 在模型请求投影中按需注入裁剪协议，且保证重复调用不产生重复提示。
@@ -331,7 +354,7 @@ pub(crate) fn ensure_prune_protocol_prompt(messages: &mut Vec<Message>) -> bool 
     if messages.iter().any(|message| {
         message.role == "system"
             && matches!(&message.content, Value::String(text) if text == PRUNE_PROTOCOL_PROMPT)
-    }) || !should_inject_prune_prompt(messages.len())
+    }) || !should_inject_prune_prompt(messages)
     {
         return false;
     }
@@ -616,7 +639,7 @@ mod tests {
             make_assistant_tool_call("call_old", "execute_command"),
             make_tool_message(
                 "call_old",
-                "very long outdated result that should be pruned",
+                &"very long outdated result that should be pruned\n".repeat(100),
             ),
             make_assistant_tool_call("call_keep", "execute_command"),
             make_tool_message("call_keep", "still relevant result"),
@@ -700,7 +723,7 @@ mod tests {
         let build = || {
             vec![
                 make_assistant_tool_call("call_old", "read_file"),
-                make_tool_message("call_old", "stable archived body"),
+                make_tool_message("call_old", &"stable archived body\n".repeat(100)),
                 make_assistant_tool_call("call_r1", "execute_command"),
                 make_tool_message("call_r1", "recent 1"),
                 make_assistant_tool_call("call_r2", "execute_command"),
@@ -722,6 +745,7 @@ mod tests {
         apply_pruning(&mut m2, &marks, Some(overflow_dir.as_path()));
         let stub2 = m2[1].content.as_str().unwrap().to_string();
 
+        assert!(stub1.contains("file_path:"));
         assert_eq!(stub1, stub2, "stub must be stable across turns");
 
         std::fs::remove_dir_all(&overflow_dir).ok();
@@ -775,7 +799,7 @@ mod tests {
             make_user_message("important user question"),
             make_assistant_message("important assistant response"),
             make_assistant_tool_call("call_1", "execute_command"),
-            make_tool_message("call_1", "outdated tool result"),
+            make_tool_message("call_1", &"outdated tool result\n".repeat(100)),
             make_assistant_tool_call("call_2", "execute_command"),
             make_tool_message("call_2", "current tool result"),
             make_assistant_tool_call("call_3", "execute_command"),
@@ -808,7 +832,7 @@ mod tests {
             make_assistant_tool_call("call_plan", "plan"),
             make_tool_message("call_plan", "task plan"),
             make_assistant_tool_call("call_old", "execute_command"),
-            make_tool_message("call_old", "old command output"),
+            make_tool_message("call_old", &"old command output\n".repeat(500)),
             make_assistant_tool_call("call_recent_1", "execute_command"),
             make_tool_message("call_recent_1", "recent 1"),
             make_assistant_tool_call("call_recent_2", "execute_command"),
@@ -836,7 +860,7 @@ mod tests {
             make_assistant_tool_call("call_plan", "plan"),
             make_tool_message("call_plan", "task plan"),
             make_assistant_tool_call("call_read", "read_file"),
-            make_tool_message("call_read", "old file contents already used"),
+            make_tool_message("call_read", &"old file contents already used\n".repeat(500)),
             make_assistant_tool_call("call_recent_1", "execute_command"),
             make_tool_message("call_recent_1", "recent 1"),
             make_assistant_tool_call("call_recent_2", "execute_command"),
@@ -870,7 +894,7 @@ mod tests {
             make_assistant_tool_call("call_plan", "plan"),
             make_tool_message("call_plan", "task plan"),
             make_assistant_tool_call("call_old", "execute_command"),
-            make_tool_message("call_old", "old command output"),
+            make_tool_message("call_old", &"old command output\n".repeat(1_000)),
             make_assistant_tool_call("call_recent_1", "execute_command"),
             make_tool_message("call_recent_1", "recent 1"),
             make_assistant_tool_call("call_recent_2", "execute_command"),
@@ -896,20 +920,39 @@ mod tests {
 
     #[test]
     fn test_should_inject_prune_prompt() {
-        assert!(!should_inject_prune_prompt(0));
-        assert!(!should_inject_prune_prompt(PRUNE_PROMPT_MIN_MESSAGES - 1));
-        assert!(should_inject_prune_prompt(PRUNE_PROMPT_MIN_MESSAGES));
-        assert!(should_inject_prune_prompt(100));
+        let mut messages = vec![make_user_message("long dialog without tools")];
+        assert!(!should_inject_prune_prompt(&messages));
+
+        for index in 0..4 {
+            let id = format!("call_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, &"recent result ".repeat(500)));
+        }
+        assert!(
+            !should_inject_prune_prompt(&messages),
+            "the four protected recent groups are not prune candidates"
+        );
+
+        messages.push(make_assistant_tool_call("call_4", "execute_command"));
+        messages.push(make_tool_message("call_4", &"newest result ".repeat(500)));
+        assert!(
+            should_inject_prune_prompt(&messages),
+            "once a fifth group makes an old result eligible, inject the protocol"
+        );
     }
 
     #[test]
     fn test_prune_protocol_activates_at_same_turn_request_boundary_once() {
-        let mut messages = (0..PRUNE_PROMPT_MIN_MESSAGES - 1)
-            .map(|index| make_user_message(&format!("message {index}")))
-            .collect::<Vec<_>>();
+        let mut messages = vec![make_user_message("same-turn request")];
+        for index in 0..4 {
+            let id = format!("call_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, &"recent result ".repeat(500)));
+        }
 
         assert!(!ensure_prune_protocol_prompt(&mut messages));
-        messages.push(make_assistant_message("same-turn growth"));
+        messages.push(make_assistant_tool_call("call_4", "execute_command"));
+        messages.push(make_tool_message("call_4", &"newest result ".repeat(500)));
         assert!(ensure_prune_protocol_prompt(&mut messages));
         assert!(!ensure_prune_protocol_prompt(&mut messages));
         assert_eq!(
@@ -925,17 +968,15 @@ mod tests {
     fn test_prepare_request_projection_prunes_without_mutating_canonical_copy() {
         let overflow_dir = make_overflow_dir();
         let mut request_messages = vec![make_user_message("system-sized request")];
+        let old_result = "old result that reached the prune threshold\n".repeat(1_000);
         request_messages.extend([
             make_assistant_tool_call("call_old", "execute_command"),
-            make_tool_message("call_old", "old result that reached the prune threshold"),
+            make_tool_message("call_old", &old_result),
         ]);
         for index in 0..4 {
             let id = format!("call_recent_{index}");
             request_messages.push(make_assistant_tool_call(&id, "execute_command"));
             request_messages.push(make_tool_message(&id, "recent result"));
-        }
-        while request_messages.len() < PRUNE_PROMPT_MIN_MESSAGES {
-            request_messages.push(make_user_message("padding"));
         }
         let canonical_messages = request_messages.clone();
         let marks = [("call_old".to_string(), PRUNE_THRESHOLD)]
@@ -951,7 +992,7 @@ mod tests {
         assert_eq!(second.pruned_count, 0);
         assert_eq!(
             canonical_messages[2].content.as_str(),
-            Some("old result that reached the prune threshold")
+            Some(old_result.as_str())
         );
         let pruned_content = request_messages
             .iter()
@@ -964,9 +1005,59 @@ mod tests {
                 .iter()
                 .filter(|message| message.content.as_str() == Some(PRUNE_PROTOCOL_PROMPT))
                 .count(),
+            0,
+            "after the only old candidate is pruned, the protocol prompt is no longer needed"
+        );
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
+    }
+
+    #[test]
+    fn test_pruning_never_replaces_short_result_with_longer_stub() {
+        let overflow_dir = make_overflow_dir();
+        let mut messages = vec![make_user_message("request")];
+        messages.extend([
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", "ok"),
+        ]);
+        for index in 0..4 {
+            let id = format!("call_recent_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, "recent result"));
+        }
+        let marks = [("call_old".to_string(), PRUNE_THRESHOLD)]
+            .into_iter()
+            .collect();
+
+        let report = apply_pruning(&mut messages, &marks, Some(overflow_dir.as_path()));
+
+        assert_eq!(report.pruned_count, 0);
+        assert_eq!(messages[2].content.as_str(), Some("ok"));
+        std::fs::remove_dir_all(&overflow_dir).ok();
+    }
+
+    #[test]
+    fn test_pruned_stub_is_not_an_active_candidate() {
+        let overflow_dir = make_overflow_dir();
+        let mut messages = vec![make_user_message("request")];
+        messages.extend([
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", &"old result ".repeat(200)),
+        ]);
+        for index in 0..4 {
+            let id = format!("call_recent_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, "recent result"));
+        }
+        let marks = [("call_old".to_string(), PRUNE_THRESHOLD)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            apply_pruning(&mut messages, &marks, Some(overflow_dir.as_path())).pruned_count,
             1
         );
 
+        assert!(!active_prunable_tool_ids(&messages).contains("call_old"));
         std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
@@ -987,11 +1078,11 @@ mod tests {
 
         let mut messages = vec![
             make_assistant_tool_call("call_1", "execute_command"),
-            make_tool_message("call_1", "result 1"),
+            make_tool_message("call_1", &"result 1\n".repeat(100)),
             make_assistant_tool_call("call_2", "execute_command"),
-            make_tool_message("call_2", "result 2"),
+            make_tool_message("call_2", &"result 2\n".repeat(100)),
             make_assistant_tool_call("call_3", "execute_command"),
-            make_tool_message("call_3", "result 3"),
+            make_tool_message("call_3", &"result 3\n".repeat(100)),
             make_assistant_tool_call("call_4", "execute_command"),
             make_tool_message("call_4", "old unmarked result"),
             make_assistant_tool_call("call_5", "execute_command"),

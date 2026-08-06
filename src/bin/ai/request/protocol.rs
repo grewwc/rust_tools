@@ -21,12 +21,16 @@ pub(in crate::ai::request) struct ResponsesReasoningReplayStats {
 }
 
 impl RequestProtocolDialect {
-    pub(super) fn build_http_body(self, request: &RequestBody<'_>) -> Value {
+    /// 序列化请求为 wire 字节。chat-completions 直接 `to_vec` 成体，
+    /// 避免先 `to_value` 深克隆整棵请求再二次序列化（历史/工具 schema
+    /// 越大浪费越明显）；responses 方言仍需先构造 Value 再序列化。
+    pub(super) fn build_http_body(self, request: &RequestBody<'_>) -> Vec<u8> {
         match self {
             Self::ChatCompletions => {
-                serde_json::to_value(request).expect("chat-completions body should serialize")
+                serde_json::to_vec(request).expect("chat-completions body should serialize")
             }
-            Self::Responses => build_responses_request_body(request),
+            Self::Responses => serde_json::to_vec(&build_responses_request_body(request))
+                .expect("responses body should serialize"),
         }
     }
 }
@@ -35,7 +39,7 @@ pub(crate) fn build_http_body_for_request(
     model: &str,
     endpoint: &str,
     request: &RequestBody<'_>,
-) -> Value {
+) -> Vec<u8> {
     models::request_protocol_dialect(model, endpoint).build_http_body(request)
 }
 
@@ -81,7 +85,7 @@ pub(crate) fn build_http_body_for_json_messages(
     stream: bool,
     reasoning_effort: Option<&str>,
     include_stream_usage: bool,
-) -> Value {
+) -> Vec<u8> {
     let request_messages = json_messages_to_request_messages(messages);
     let (thinking, reasoning_effort, reasoning) =
         resolve_reasoning_wire_controls(model, endpoint, false, reasoning_effort);
@@ -100,6 +104,7 @@ pub(crate) fn build_http_body_for_json_messages(
         max_tokens: None,
         reasoning_items: None,
         reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
+        estimated_prompt_tokens: 0,
     };
     build_http_body_for_request(model, endpoint, &request)
 }

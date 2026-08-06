@@ -153,6 +153,8 @@ pub(in crate::ai) fn preserve_subagent_history(path: &Path) -> Option<PathBuf> {
     }
     let _ = sqlite::delete_session_state_lock(path);
     sqlite::remove_session_state_lock_entry(path);
+    sqlite::remove_history_revision_cache_entry(path);
+    sqlite::remove_history_revision_cache_entry(&preserved);
     Some(preserved)
 }
 
@@ -168,6 +170,7 @@ pub(in crate::ai) fn delete_subagent_memory(memory_path: &Path) -> io::Result<()
         }
         None => Ok(()),
     };
+    crate::ai::tools::storage::memory_store::remove_knowledge_dedup_cache_entry(memory_path);
     jsonl_result.and(db_result)
 }
 
@@ -178,9 +181,9 @@ pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::{
     append_skill_activation_event_sqlite, append_tool_execution_outcomes_sqlite,
-    read_recent_messages_sqlite, read_skill_activation_events_sqlite,
+    read_llm_prune_marks_sqlite, read_recent_messages_sqlite, read_skill_activation_events_sqlite,
     read_stale_patch_targets_sqlite, read_tool_execution_outcomes_sqlite,
-    read_tool_message_ids_sqlite, write_stale_patch_targets_sqlite,
+    read_tool_message_ids_sqlite, write_llm_prune_marks_sqlite, write_stale_patch_targets_sqlite,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use suspended::{
@@ -686,6 +689,26 @@ mod tests {
 
         // 文件不存在时返回 None。
         assert!(preserve_subagent_history(&dir.join("missing.jsonl")).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_subagent_history_removes_revision_cache_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "delete_subagent_history_revision_cache_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let history = dir.join("subagent-1-2.sqlite");
+        std::fs::File::create(&history).unwrap();
+
+        assert_eq!(sqlite::read_history_revision(&history), Some(0));
+        assert!(sqlite::history_revision_cache_contains(&history));
+
+        delete_subagent_history(&history).unwrap();
+        assert!(!sqlite::history_revision_cache_contains(&history));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

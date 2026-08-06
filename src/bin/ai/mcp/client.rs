@@ -150,10 +150,13 @@ type ServerId = String;
 pub(in crate::ai) struct McpClient {
     pub(in crate::ai) servers: SkipMap<ServerId, Mutex<McpServerConnection>>,
     next_id: AtomicU64,
-    cached_tool_definitions: Vec<ToolDefinition>,
-    cached_resources: Vec<(String, McpResource)>,
-    cached_prompts: Vec<(String, McpPrompt)>,
-    cached_server_prefixes: Vec<(String, String)>,
+    // 用 Arc 共享：`routing_snapshot` 每轮被 orchestrator 调用，
+    // 深克隆整个工具/资源/提示缓存代价高（工具 schema 越大越明显）；
+    // Arc::clone 为 O(1)，且 metadata 缓存只整体替换、不原地修改。
+    cached_tool_definitions: Arc<Vec<ToolDefinition>>,
+    cached_resources: Arc<Vec<(String, McpResource)>>,
+    cached_prompts: Arc<Vec<(String, McpPrompt)>>,
+    cached_server_prefixes: Arc<Vec<(String, String)>>,
 }
 
 impl McpClient {
@@ -161,10 +164,10 @@ impl McpClient {
         Self {
             servers: SkipMap::default(),
             next_id: AtomicU64::new(1),
-            cached_tool_definitions: Vec::new(),
-            cached_resources: Vec::new(),
-            cached_prompts: Vec::new(),
-            cached_server_prefixes: Vec::new(),
+            cached_tool_definitions: Arc::new(Vec::new()),
+            cached_resources: Arc::new(Vec::new()),
+            cached_prompts: Arc::new(Vec::new()),
+            cached_server_prefixes: Arc::new(Vec::new()),
         }
     }
 
@@ -172,10 +175,10 @@ impl McpClient {
         Self {
             servers: SkipMap::default(),
             next_id: AtomicU64::new(self.next_id.load(Ordering::Relaxed)),
-            cached_tool_definitions: self.cached_tool_definitions.clone(),
-            cached_resources: self.cached_resources.clone(),
-            cached_prompts: self.cached_prompts.clone(),
-            cached_server_prefixes: self.cached_server_prefixes.clone(),
+            cached_tool_definitions: Arc::clone(&self.cached_tool_definitions),
+            cached_resources: Arc::clone(&self.cached_resources),
+            cached_prompts: Arc::clone(&self.cached_prompts),
+            cached_server_prefixes: Arc::clone(&self.cached_server_prefixes),
         }
     }
 
@@ -381,10 +384,10 @@ impl McpClient {
         }
 
         rust_tools::sortw::stable_sort_by(&mut server_prefixes, |a, b| b.1.len().cmp(&a.1.len()));
-        self.cached_tool_definitions = tool_definitions;
-        self.cached_resources = resources;
-        self.cached_prompts = prompts;
-        self.cached_server_prefixes = server_prefixes;
+        self.cached_tool_definitions = Arc::new(tool_definitions);
+        self.cached_resources = Arc::new(resources);
+        self.cached_prompts = Arc::new(prompts);
+        self.cached_server_prefixes = Arc::new(server_prefixes);
     }
 
     fn next_request_id(&self) -> u64 {
@@ -655,7 +658,7 @@ impl McpClient {
     }
 
     pub(in crate::ai) fn get_all_tools(&self) -> Vec<ToolDefinition> {
-        self.cached_tool_definitions.clone()
+        self.cached_tool_definitions.as_ref().clone()
     }
 
     pub(in crate::ai) fn parse_tool_name_for_known_server(
@@ -666,7 +669,7 @@ impl McpClient {
             return None;
         }
 
-        for (server_name, prefix) in &self.cached_server_prefixes {
+        for (server_name, prefix) in self.cached_server_prefixes.as_ref() {
             if let Some(tool_name) = full_name.strip_prefix(prefix)
                 && !tool_name.is_empty()
             {
@@ -678,21 +681,21 @@ impl McpClient {
     }
 
     pub(in crate::ai) fn get_all_resources(&self) -> Vec<(String, McpResource)> {
-        self.cached_resources.clone()
+        self.cached_resources.as_ref().clone()
     }
 
     pub(in crate::ai) fn get_all_prompts(&self) -> Vec<(String, McpPrompt)> {
-        self.cached_prompts.clone()
+        self.cached_prompts.as_ref().clone()
     }
 
     pub(in crate::ai) fn disconnect_all(&mut self) {
         for (_, conn) in self.servers.drain() {
             drop(conn);
         }
-        self.cached_tool_definitions.clear();
-        self.cached_resources.clear();
-        self.cached_prompts.clear();
-        self.cached_server_prefixes.clear();
+        self.cached_tool_definitions = Arc::new(Vec::new());
+        self.cached_resources = Arc::new(Vec::new());
+        self.cached_prompts = Arc::new(Vec::new());
+        self.cached_server_prefixes = Arc::new(Vec::new());
     }
 }
 

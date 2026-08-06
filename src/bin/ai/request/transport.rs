@@ -18,7 +18,7 @@ use super::super::{
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_SUCCESS, ACCENT_WARN, RESET};
 
 use super::aux::charge_llm_usage_to_kernel;
-use super::builder::{build_request_body, estimate_request_prompt_tokens};
+use super::builder::build_request_body;
 use super::error::{
     REQUEST_MAX_ATTEMPTS, RequestError, RequestErrorKind, RequestRetryPolicy,
     STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model, apply_request_auth,
@@ -237,8 +237,10 @@ async fn request_messages_with_key(
 ) -> Result<Response, RequestError> {
     let protocol = models::request_protocol_dialect(model, endpoint);
     let http_body = protocol.build_http_body(request_body);
+    // 复用 build_request_body 内已算好的字符估算（同一 RequestBody），
+    // 避免对同一历史再次全量遍历 + 工具 schema 再次序列化。
     let estimated_prompt_tokens = token_budget::calibrate_prompt_tokens_for_budget(
-        estimate_request_prompt_tokens(request_body.messages, request_body.tools.as_ref()),
+        request_body.estimated_prompt_tokens,
         app.last_known_prompt_tokens,
         app.last_known_cached_prompt_tokens,
     );
@@ -247,7 +249,7 @@ async fn request_messages_with_key(
         let build_request = || {
             apply_request_auth(client.post(endpoint), endpoint, api_key)
                 .header("Content-Type", "application/json")
-                .json(&http_body)
+                .body(http_body.clone())
         };
         let response = match tokio::time::timeout(
             Duration::from_secs(retry_policy.header_timeout_secs),
@@ -648,7 +650,7 @@ pub async fn do_request_json(
             &request_model,
             api_key,
             token_budget::calibrate_prompt_tokens_for_budget(
-                token_budget::estimate_json_request_tokens(&request_body),
+                token_budget::estimate_serialized_request_tokens(&request_body),
                 app.last_known_prompt_tokens,
                 app.last_known_cached_prompt_tokens,
             ),
@@ -660,7 +662,7 @@ pub async fn do_request_json(
         let send_future = async {
             let resp = apply_request_auth(app.client.post(&endpoint), &endpoint, api_key)
                 .header("Content-Type", "application/json")
-                .json(&request_body)
+                .body(request_body.clone())
                 .send()
                 .await?;
             Ok::<_, reqwest::Error>(resp)
@@ -928,12 +930,12 @@ pub async fn do_request_text_streaming(
     loop {
         let api_key = &keys_to_try[key_idx];
         let retry_policy = request_retry_policy_for_current_context();
-        let estimated_prompt_tokens = token_budget::estimate_json_request_tokens(&request_body);
+        let estimated_prompt_tokens = token_budget::estimate_serialized_request_tokens(&request_body);
         let client = app.client.clone();
         let build_request = || {
             apply_request_auth(client.post(&endpoint), &endpoint, api_key)
                 .header("Content-Type", "application/json")
-                .json(&request_body)
+                .body(request_body.clone())
         };
         // 等待响应头：握手 + 服务端开始返回。流式下这一步很快。
         // 使用 hedged backup：如果 primary 在短时间内没响应，自动发 backup 请求。

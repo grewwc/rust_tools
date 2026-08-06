@@ -171,6 +171,16 @@ pub(super) fn estimate_json_request_tokens(value: &Value) -> usize {
         .max(1)
 }
 
+/// 已序列化字节的 token 估算：`estimate_json_request_tokens` 的字节变体，
+/// 直接按字节长度估算，避免对同一请求体再次全量序列化。
+pub(super) fn estimate_serialized_request_tokens(bytes: &[u8]) -> usize {
+    const CHARS_PER_TOKEN_CONSERVATIVE: usize = 2;
+    std::str::from_utf8(bytes)
+        .map(|s| s.chars().count().div_ceil(CHARS_PER_TOKEN_CONSERVATIVE))
+        .unwrap_or_else(|_| bytes.len().div_ceil(CHARS_PER_TOKEN_CONSERVATIVE))
+        .max(1)
+}
+
 pub(super) async fn wait_for_request_budget(
     app: &App,
     model: &str,

@@ -162,7 +162,7 @@ pub(crate) async fn summarize_history_via_model(
     // 但迟迟不回到提示符"的卡死。用显式超时兜底，超时即放弃摘要（保持原始历史）。
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
-        .json(&http_body)
+        .body(http_body)
         .send();
     let response = match tokio::time::timeout(Duration::from_secs(60), send_future).await {
         Ok(r) => r.ok()?,
@@ -452,7 +452,7 @@ pub(crate) async fn generate_session_title_via_model(
 
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
-        .json(&http_body)
+        .body(http_body)
         .send();
 
     let response = match tokio::time::timeout(

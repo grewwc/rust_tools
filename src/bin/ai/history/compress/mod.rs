@@ -1564,7 +1564,12 @@ fn emergency_cap_messages_to_fit(
     if truncated_any {
         insert_overflow_archive_note_if_exists(messages, overflow_dir);
     }
-    let inner = truncate_mutable_messages_to_fit(messages, max_chars, overflow_dir, protected_tool_call_ids);
+    let inner = truncate_mutable_messages_to_fit(
+        messages,
+        max_chars,
+        overflow_dir,
+        protected_tool_call_ids,
+    );
     truncated_any || inner
 }
 
@@ -1615,7 +1620,8 @@ const CONTEXT_OVERFLOW_TRUNCATED_PREFIX: &str = "[context-overflow-truncated]";
 
 /// 判断文本是否已经是 overflow-truncated marker（归档已落盘，路径内嵌在文本中）。
 fn is_context_overflow_truncated_marker(text: &str) -> bool {
-    text.trim_start().starts_with(CONTEXT_OVERFLOW_TRUNCATED_PREFIX)
+    text.trim_start()
+        .starts_with(CONTEXT_OVERFLOW_TRUNCATED_PREFIX)
         && text.contains("archived at: ")
 }
 
@@ -1631,7 +1637,8 @@ fn build_context_overflow_pointer(text: &str, target: usize) -> Option<String> {
                 .map(|(_, rest)| rest.split([';', '\n']).next().unwrap_or(rest).trim())
         })?;
     // 优先尝试保留预览的完整形态（若 target 足够大）。
-    let full_pointer = format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} full original archived at: {path}\n");
+    let full_pointer =
+        format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} full original archived at: {path}\n");
     if full_pointer.chars().count() <= target {
         return Some(full_pointer);
     }
@@ -2202,7 +2209,8 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 // 短路 `&&` 保证 commit 失败时根本不会触碰归档；commit 成功后若归档
                 // 失败，`best` 不更新、上下文仍保留 earlier，无数据丢失（仅剩幂等
                 // 哈希命名的折叠文件）。
-                if after < best_after && tail_plan.commit()
+                if after < best_after
+                    && tail_plan.commit()
                     && archive_messages_to_overflow(earlier, Some(overflow_dir.as_path())).is_some()
                 {
                     best = Some(out);

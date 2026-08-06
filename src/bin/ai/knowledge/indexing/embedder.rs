@@ -154,6 +154,22 @@ struct RemoteEmbeddingProvider {
 }
 
 impl RemoteEmbeddingProvider {
+    /// 共享 embedding HTTP client：避免每次远程调用反复新建连接（TCP+TLS 握手）。
+    /// timeout 取首个 provider 的配置（warm_up 只安装一次 provider，配置固定）。
+    fn shared_client(timeout: std::time::Duration) -> Option<&'static reqwest::blocking::Client> {
+        static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>> =
+            std::sync::OnceLock::new();
+        CLIENT
+            .get_or_init(|| {
+                reqwest::blocking::Client::builder()
+                    .timeout(timeout)
+                    .connect_timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .ok()
+            })
+            .as_ref()
+    }
+
     /// 在独立 std 线程里跑 reqwest::blocking，避免在 tokio 运行时线程上
     /// 直接使用 blocking client 触发 "blocking inside runtime" panic。
     fn request(&self, inputs: Vec<String>) -> Option<Vec<Vec<f32>>> {
@@ -166,11 +182,7 @@ impl RemoteEmbeddingProvider {
         let timeout = self.timeout;
 
         let handle = std::thread::spawn(move || -> Option<Vec<Vec<f32>>> {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(timeout)
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .build()
-                .ok()?;
+            let client = RemoteEmbeddingProvider::shared_client(timeout)?;
 
             let body = serde_json::json!({
                 "model": model,

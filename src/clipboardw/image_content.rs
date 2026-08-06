@@ -214,8 +214,12 @@ pub fn watch_clipboard_bridge() -> Result<(), Box<dyn std::error::Error>> {
     Err("oo --watch is only supported on macOS (run it on your local machine)".into())
 }
 
+pub fn resolved_save_path(fname: &str) -> String {
+    add_suffix(fname, ".jpg", || !fname.contains('.'))
+}
+
 pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let fname: String = add_suffix(fname, ".jpg", || !fname.contains('.'));
+    let fname = resolved_save_path(fname);
 
     // Helper function to try saving from clipboard via OSC 52.
     // Handles two cases:

@@ -183,7 +183,7 @@ pub(crate) async fn describe_image_for_digest(
 
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
-        .json(&http_body)
+        .body(http_body)
         .send();
     let response = match tokio::time::timeout(
         Duration::from_secs(DIGEST_REQUEST_HEADER_TIMEOUT_SECS),

@@ -430,11 +430,51 @@ pub(super) fn parse_prune_meta_and_update_marks(
         crate::ai::history::compress::llm_prune::parse_prune_from_hidden_meta(hidden_meta);
     let active_tool_ids =
         crate::ai::history::compress::llm_prune::active_prunable_tool_ids(messages);
+    let before = app.prune_marks.clone();
     crate::ai::history::compress::llm_prune::update_prune_marks(
         &mut app.prune_marks,
         &prune_ids,
         &active_tool_ids,
     );
+    if app.prune_marks != before
+        && let Err(error) = crate::ai::history::write_llm_prune_marks_sqlite(
+            &app.session_history_file,
+            &app.prune_marks,
+        )
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+    {
+        eprintln!("[context-prune] failed to persist mark state: {error}");
+    }
+
+    let mut accepted = prune_ids
+        .iter()
+        .filter(|id| active_tool_ids.contains(*id))
+        .cloned()
+        .collect::<FxHashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    accepted.sort();
+    if !accepted.is_empty() && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        let shown = accepted
+            .iter()
+            .take(4)
+            .map(|id| {
+                let count = app.prune_marks.get(id).copied().unwrap_or(0);
+                format!(
+                    "{id} ({count}/{})",
+                    crate::ai::history::compress::llm_prune::PRUNE_THRESHOLD
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = (accepted.len() > 4)
+            .then(|| format!(", +{} more", accepted.len() - 4))
+            .unwrap_or_default();
+        crate::ai::driver::print::print_tool_note_line(
+            "context-prune",
+            &format!("model marked {shown}{suffix}"),
+        );
+    }
     remaining_meta
 }
 
@@ -1402,7 +1442,7 @@ mod tests {
         TOOL_RESULT_RAW_HARD_CAP_CHARS, append_tool_result_messages,
         append_tool_result_messages_for_model, build_code_inspection_working_memory,
         collect_repo_inspection_findings, describe_tool_call, is_repo_inspection_tool,
-        prepare_tool_results_for_history,
+        parse_prune_meta_and_update_marks, prepare_tool_results_for_history,
     };
     use super::{
         WORKING_CHECKPOINT_FILE_NAME, extract_context_checkpoints, save_context_checkpoint_in_dir,
@@ -1516,6 +1556,58 @@ mod tests {
             .and_then(|rest| rest.split(']').next())
             .map(PathBuf::from)
             .expect("marker should contain checkpoint path")
+    }
+
+    #[test]
+    fn prune_hidden_meta_updates_and_persists_session_marks() {
+        let history_root = std::env::temp_dir().join(format!(
+            "ai-prune-meta-persist-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut app = test_app(history_root.join("history.sqlite"));
+        let _ = std::fs::remove_file(&app.session_history_file);
+        let mut messages = Vec::new();
+        for index in 0..5 {
+            let id = format!("call_{index}");
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![tool_call(
+                    &id,
+                    "execute_command",
+                    serde_json::json!({}),
+                )]),
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            messages.push(Message {
+                role: "tool".to_string(),
+                content: Value::String("old output\n".repeat(500)),
+                tool_calls: None,
+                tool_call_id: Some(id),
+                reasoning_content: None,
+            });
+        }
+
+        let remaining =
+            parse_prune_meta_and_update_marks(&mut app, &messages, "prune:call_0\nkeep this note");
+        assert_eq!(remaining, "keep this note");
+        assert_eq!(app.prune_marks.get("call_0"), Some(&1));
+        assert_eq!(
+            crate::ai::history::read_llm_prune_marks_sqlite(&app.session_history_file)
+                .unwrap()
+                .get("call_0"),
+            Some(&1)
+        );
+
+        parse_prune_meta_and_update_marks(&mut app, &messages, "prune:call_0");
+        assert_eq!(
+            crate::ai::history::read_llm_prune_marks_sqlite(&app.session_history_file)
+                .unwrap()
+                .get("call_0"),
+            Some(&crate::ai::history::compress::llm_prune::PRUNE_THRESHOLD)
+        );
+        let _ = std::fs::remove_dir_all(history_root);
     }
 
     #[test]

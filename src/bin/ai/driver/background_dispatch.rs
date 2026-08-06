@@ -616,6 +616,7 @@ pub(super) fn dispatch_background_batch(
             }
         };
         task_app.session_history_file = effective_history;
+        let _ = crate::ai::driver::commands::session::restore_prune_marks_for_history(&mut task_app);
         let task_driver_ctx = runtime_ctx::DriverContext::new(
             task_app.clone(),
             task_mcp.clone(),

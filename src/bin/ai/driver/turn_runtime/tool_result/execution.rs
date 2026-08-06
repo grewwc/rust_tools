@@ -443,6 +443,7 @@ fn tool_result_completed_successfully(content: &serde_json::Value) -> bool {
 }
 
 const COMPLETION_EVIDENCE_REQUIRED_MARKER: &str = "self_note:completion_evidence_required";
+const COMPLETION_EVIDENCE_UNVERIFIED_NOTE: &str = "runtime:completion_evidence_unverified\nA final response was recorded after a project mutation without observed post-mutation verification.";
 const COMPLETION_EVIDENCE_WARNING: &str = "[Runtime warning] Completion/impact claim is unverified: no successful post-mutation check, test, diff, or status command was observed.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2599,6 +2600,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     &mut stream_result.assistant_text,
                     COMPLETION_EVIDENCE_WARNING,
                 );
+                record_hidden_self_note(app, turn_messages, COMPLETION_EVIDENCE_UNVERIFIED_NOTE);
             }
             let was_truncated_by_length = stream_result.truncated_by_length;
             record_final_stream_response(
@@ -4327,8 +4329,15 @@ mod tests {
 
         assert!(matches!(second_step, TurnLoopStep::Break));
         assert!(final_assistant_recorded);
-        assert!(final_assistant_text.starts_with("已修复。\n\n"));
+        assert!(final_assistant_text.starts_with("已修复。"));
         assert!(final_assistant_text.contains(COMPLETION_EVIDENCE_WARNING));
+        assert!(messages.iter().any(|message| {
+            message.role == "assistant"
+                && message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.contains(COMPLETION_EVIDENCE_WARNING))
+        }));
         assert_eq!(
             messages
                 .iter()
@@ -4341,6 +4350,13 @@ mod tests {
                 .count(),
             1
         );
+        assert!(turn_messages.iter().any(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.contains(COMPLETION_EVIDENCE_UNVERIFIED_NOTE))
+        }));
     }
 
     #[test]
@@ -5566,12 +5582,12 @@ mod tests {
         assert!(looks_like_dangling_action_final(
             "Audit the scheduler changes",
             &turn_messages,
-            COMPLETION_EVIDENCE_WARNING,
+            "[Runtime warning] Completion claim is unverified.",
         ));
         assert!(!looks_like_dangling_action_final(
             "Audit the scheduler changes",
             &turn_messages,
-            &format!("{COMPLETION_EVIDENCE_WARNING}\n\nConclusion: no drift was found."),
+            "[Runtime warning] Completion claim is unverified.\n\nConclusion: no drift was found.",
         ));
 
         let mut warning_only_messages = turn_messages.clone();
@@ -5580,14 +5596,14 @@ mod tests {
                 "Audit the scheduler changes",
                 &mut warning_only_messages,
                 &turn_messages,
-                COMPLETION_EVIDENCE_WARNING,
+                "[Runtime warning] Completion claim is unverified.",
             ),
             DanglingFinalRecoveryAction::RetryWithoutTools
         );
 
-        let mut warning_text = COMPLETION_EVIDENCE_WARNING.to_string();
-        append_runtime_warning_once(&mut warning_text, COMPLETION_EVIDENCE_WARNING);
-        assert_eq!(warning_text.matches(COMPLETION_EVIDENCE_WARNING).count(), 1);
+        let mut warning_text = DANGLING_FINAL_WARNING.to_string();
+        append_runtime_warning_once(&mut warning_text, DANGLING_FINAL_WARNING);
+        assert_eq!(warning_text.matches(DANGLING_FINAL_WARNING).count(), 1);
     }
 
     #[test]

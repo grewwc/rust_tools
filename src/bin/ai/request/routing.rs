@@ -140,7 +140,7 @@ Skills:
     // 辅助请求（skill 路由），15 秒超时兜底，理由同上。
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
-        .json(&http_body)
+        .body(http_body)
         .send();
     let response = match tokio::time::timeout(Duration::from_secs(15), send_future).await {
         Ok(r) => r.ok()?,

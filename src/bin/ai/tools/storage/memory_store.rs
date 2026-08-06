@@ -31,6 +31,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use super::memory_index::MemoryIndex;
 use super::with_memory_file_lock;
@@ -222,6 +223,51 @@ pub(crate) enum KnowledgeAppendOutcome {
     Duplicate { existing_id: Option<String> },
 }
 
+/// knowledge_save 幂等去重的进程内缓存：按文件指纹 (len, mtime) 失效。
+/// 文件被其它进程写入/轮转/GC 重写后指纹变化 -> 缓存清空回退全文件扫描，
+/// 因此正确性与无缓存时完全一致，只是重复保存从 O(全文件) 变成 O(1)。
+struct KnowledgeDedupCache {
+    fingerprint: (u64, SystemTime),
+    /// (category, note, source, tags) 规范化后的等价 key -> 已存在条目 id。
+    seen: FxHashMap<(String, String, String, Vec<String>), Option<String>>,
+}
+
+impl KnowledgeDedupCache {
+    fn empty() -> Self {
+        Self {
+            fingerprint: (0, SystemTime::UNIX_EPOCH),
+            seen: FxHashMap::default(),
+        }
+    }
+}
+
+static KNOWLEDGE_DEDUP_CACHE: LazyLock<Mutex<FxHashMap<PathBuf, KnowledgeDedupCache>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// 私有 memory 文件结束生命周期时移除对应去重缓存，避免已删除的 sub-agent
+/// 路径在长生命周期父进程中持续累积。删除缓存不影响持久化数据；后续若路径被
+/// 复用，会按当前文件指纹重新构建。
+pub(crate) fn remove_knowledge_dedup_cache_entry(path: &Path) {
+    if let Ok(mut cache) = KNOWLEDGE_DEDUP_CACHE.lock() {
+        cache.remove(path);
+    }
+}
+
+fn memory_file_fingerprint(path: &Path) -> (u64, SystemTime) {
+    std::fs::metadata(path)
+        .map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+        .unwrap_or((0, SystemTime::UNIX_EPOCH))
+}
+
+fn equivalent_knowledge_key(entry: &AgentMemoryEntry) -> (String, String, String, Vec<String>) {
+    (
+        entry.category.trim().to_lowercase(),
+        normalize_learning_note(&entry.note),
+        entry.source.as_deref().unwrap_or("").trim().to_lowercase(),
+        normalized_knowledge_tags(&entry.tags),
+    )
+}
+
 impl MemoryStore {
     pub(crate) fn from_env_or_config() -> Self {
         Self {
@@ -254,13 +300,47 @@ impl MemoryStore {
     ) -> Result<KnowledgeAppendOutcome, String> {
         let entry = cap_memory_entry(entry);
         self.ensure_memory_file_for_lock()?;
+        let key = equivalent_knowledge_key(&entry);
+        // 指纹校验和缓存命中判定在文件锁内执行，确保与扫描/追加/整理看到
+        // 一致的文件状态，避免外部写入已改库但缓存返回错误 Duplicate 的竞态。
         super::with_memory_file_lock(&self.path, || {
+            let fingerprint = memory_file_fingerprint(&self.path);
+            let cache_hit = {
+                let mut cache = KNOWLEDGE_DEDUP_CACHE.lock().unwrap();
+                let path_cache = cache.entry(self.path.clone()).or_insert_with(|| {
+                    let mut c = KnowledgeDedupCache::empty();
+                    c.fingerprint = fingerprint;
+                    c
+                });
+                if path_cache.fingerprint != fingerprint {
+                    path_cache.fingerprint = fingerprint;
+                    path_cache.seen.clear();
+                }
+                path_cache.seen.get(&key).cloned()
+            };
+            if let Some(existing_id) = cache_hit {
+                return Ok(KnowledgeAppendOutcome::Duplicate { existing_id });
+            }
+            // 缓存 miss：在文件锁内扫描文件
             if let Some(existing) = self.find_equivalent_knowledge(&entry)? {
+                let mut cache = KNOWLEDGE_DEDUP_CACHE.lock().unwrap();
+                cache
+                    .entry(self.path.clone())
+                    .or_insert_with(KnowledgeDedupCache::empty)
+                    .seen
+                    .insert(key.clone(), existing.id.clone());
                 return Ok(KnowledgeAppendOutcome::Duplicate {
                     existing_id: existing.id,
                 });
             }
             self.append_entry_while_locked(&entry)?;
+            let new_fp = memory_file_fingerprint(&self.path);
+            let mut cache = KNOWLEDGE_DEDUP_CACHE.lock().unwrap();
+            let path_cache = cache
+                .entry(self.path.clone())
+                .or_insert_with(KnowledgeDedupCache::empty);
+            path_cache.seen.insert(key.clone(), entry.id.clone());
+            path_cache.fingerprint = new_fp;
             Ok(KnowledgeAppendOutcome::Appended)
         })
     }
@@ -701,15 +781,21 @@ impl MemoryStore {
         let cap = limit.saturating_mul(10).min(200).max(limit);
         let mut top_idx: Vec<(f64, usize)> =
             scored.iter().take(cap).map(|(s, i)| (*s, *i)).collect();
-        let qv = embedder::embed_text(&query_lc);
-        if let Some(qv) = qv {
-            let texts: Vec<String> = top_idx.iter().map(|&(_, i)| docs[i].1.clone()).collect();
-            let batch = embedder::embed_texts(&texts);
+        // 查询与候选合并为一次批量远程请求，省一次 HTTP round-trip。
+        // 语义与拆分调用等价：任一步失败都回退纯 BM25 排序。
+        let mut embed_inputs: Vec<String> = Vec::with_capacity(top_idx.len() + 1);
+        embed_inputs.push(query_lc.clone());
+        embed_inputs.extend(top_idx.iter().map(|&(_, i)| docs[i].1.clone()));
+        let batch_all = embedder::embed_texts(&embed_inputs);
+        if let Some(qv) = batch_all.as_ref().and_then(|v| v.first()).cloned() {
+            let batch: Vec<Vec<f32>> = batch_all
+                .as_ref()
+                .map(|v| v.get(1..).map(|s| s.to_vec()).unwrap_or_default())
+                .unwrap_or_default();
             let mut rescored: Vec<(f64, usize)> = Vec::with_capacity(top_idx.len());
             for (idx, &(_s, i)) in top_idx.iter().enumerate() {
                 let emb = batch
-                    .as_ref()
-                    .and_then(|v| v.get(idx))
+                    .get(idx)
                     .map(|v| similarity::cosine_similarity(&qv, v))
                     .unwrap_or(0.0);
                 let base = _s;
@@ -1034,6 +1120,54 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db"));
+    }
+
+    #[test]
+    fn delete_subagent_memory_removes_only_its_knowledge_dedup_cache_entry() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rt_mem_cache_lifecycle_{ts}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let removed_path = dir.join("agent_memory.subagent-removed.jsonl");
+        let retained_path = dir.join("agent_memory.subagent-retained.jsonl");
+        let entry = AgentMemoryEntry {
+            id: Some("mem_cache_lifecycle".to_string()),
+            timestamp: "2025-01-05T00:00:00Z".to_string(),
+            category: "user_memory".to_string(),
+            note: "Cache lifecycle test entry.".to_string(),
+            tags: vec!["test".to_string()],
+            source: Some("test".to_string()),
+            priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+
+        for path in [&removed_path, &retained_path] {
+            let store = MemoryStore::for_tests_with_path(path.clone());
+            assert_eq!(
+                store.append_idempotent_knowledge(&entry).unwrap(),
+                KnowledgeAppendOutcome::Appended
+            );
+        }
+        {
+            let cache = KNOWLEDGE_DEDUP_CACHE.lock().unwrap();
+            assert!(cache.contains_key(&removed_path));
+            assert!(cache.contains_key(&retained_path));
+        }
+
+        crate::ai::history::delete_subagent_memory(&removed_path).unwrap();
+
+        {
+            let cache = KNOWLEDGE_DEDUP_CACHE.lock().unwrap();
+            assert!(!cache.contains_key(&removed_path));
+            assert!(cache.contains_key(&retained_path));
+        }
+
+        crate::ai::history::delete_subagent_memory(&retained_path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

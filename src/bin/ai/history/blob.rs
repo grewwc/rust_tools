@@ -151,6 +151,9 @@ pub(in crate::ai) fn delete_history_artifacts(path: &Path) -> io::Result<()> {
     remove_one(Path::new(&format!("{base}-wal")))?;
     remove_one(Path::new(&format!("{base}-shm")))?;
     remove_one(Path::new(&format!("{base}-journal")))?;
+    // 所有 history 删除入口最终都会走到这里；同步回收进程内 revision 缓存，
+    // 避免按 session/sub-agent 唯一路径持续累积陈旧条目。
+    super::sqlite::remove_history_revision_cache_entry(path);
     Ok(())
 }
 

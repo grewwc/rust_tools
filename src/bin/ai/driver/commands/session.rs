@@ -71,6 +71,7 @@ pub(in crate::ai) fn clear_session_local_runtime_state(app: &mut App) {
     app.forced_question = None;
     app.last_skill_bias = None;
     app.stale_patch_targets.clear();
+    app.prune_marks.clear();
 }
 
 fn load_stale_patch_targets(
@@ -98,6 +99,51 @@ pub(in crate::ai) fn restore_session_local_runtime_state(app: &mut App) -> std::
     let store = SessionStore::new(app.config.history_file.as_path());
     app.stale_patch_targets =
         load_stale_patch_targets(&store, &app.session_id, &app.session_history_file)?;
+    restore_prune_marks_for_history(app)
+}
+
+/// 按当前 `session_history_file` 恢复模型裁剪计数。子代理拥有独立 history，
+/// 不能沿用 `App::clone` 带来的父会话内存态；resume 也必须从子 history 恢复。
+pub(in crate::ai) fn restore_prune_marks_for_history(app: &mut App) -> std::io::Result<()> {
+    app.prune_marks.clear();
+    let mut prune_marks =
+        match crate::ai::history::read_llm_prune_marks_sqlite(&app.session_history_file) {
+            Ok(marks) => marks,
+            Err(error) => {
+                if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                    eprintln!("[context-prune] failed to restore mark state: {error}");
+                }
+                return Ok(());
+            }
+        };
+    if !prune_marks.is_empty() {
+        // Meta 可能来自 rewind/branch 前的更长历史。恢复前只保留目标 session 当前
+        // 投影里仍存在且允许裁剪的 id，避免旧计数误绑定到已删除或受保护结果。
+        let messages =
+            match crate::ai::history::build_message_arr(usize::MAX, &app.session_history_file) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                        eprintln!("[context-prune] failed to validate restored marks: {error}");
+                    }
+                    return Ok(());
+                }
+            };
+        let active_ids =
+            crate::ai::history::compress::llm_prune::active_prunable_tool_ids(&messages);
+        let before = prune_marks.len();
+        prune_marks.retain(|id, count| *count > 0 && active_ids.contains(id));
+        if prune_marks.len() != before {
+            if let Err(error) = crate::ai::history::write_llm_prune_marks_sqlite(
+                &app.session_history_file,
+                &prune_marks,
+            ) && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+            {
+                eprintln!("[context-prune] failed to reconcile restored marks: {error}");
+            }
+        }
+    }
+    app.prune_marks = prune_marks;
     Ok(())
 }
 
@@ -127,6 +173,7 @@ fn switch_app_to_session(
     app.session_id = session_id.to_string();
     app.session_history_file = history_file;
     app.stale_patch_targets = stale_patch_targets;
+    restore_prune_marks_for_history(app)?;
     app.sync_persona_session_binding();
     Ok(())
 }
@@ -1071,7 +1118,8 @@ mod tests {
         cli::ParsedCli,
         history::{
             Message, SessionInfo, SuspendedSessionStore, append_history_messages,
-            read_stale_patch_targets_sqlite, write_stale_patch_targets_sqlite,
+            read_stale_patch_targets_sqlite, write_llm_prune_marks_sqlite,
+            write_stale_patch_targets_sqlite,
         },
         types::{AgentContext, AppConfig, FunctionCall, SkillBiasMemory, ToolCall},
     };
@@ -1181,6 +1229,7 @@ mod tests {
                 ]);
             })
             .await;
+        app.prune_marks.insert("source-call".to_string(), 1);
 
         try_handle_session_command(&mut app, "/sessions new").unwrap();
 
@@ -1188,6 +1237,7 @@ mod tests {
         assert!(app.forced_skill.is_none());
         assert!(app.forced_question.is_none());
         assert!(app.attached_image_files.is_empty());
+        assert!(app.prune_marks.is_empty());
         assert!(
             app.agent_context
                 .as_ref()
@@ -1211,15 +1261,41 @@ mod tests {
         let store = SessionStore::new(app.config.history_file.as_path());
         let target_id = "sess-target";
         let target_path = store.session_history_file(target_id);
-        append_history_messages(
-            &target_path,
-            &[Message {
-                role: "user".to_string(),
-                content: Value::String("target session".to_string()),
-                tool_calls: None,
+        let mut target_messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("target session".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        for index in 0..5 {
+            let id = format!("call_{index}");
+            target_messages.push(Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![ToolCall {
+                    id: id.clone(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "execute_command".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
                 tool_call_id: None,
                 reasoning_content: None,
-            }],
+            });
+            target_messages.push(Message {
+                role: "tool".to_string(),
+                content: Value::String("target result\n".repeat(1_000)),
+                tool_calls: None,
+                tool_call_id: Some(id),
+                reasoning_content: None,
+            });
+        }
+        append_history_messages(&target_path, &target_messages).unwrap();
+        write_llm_prune_marks_sqlite(
+            &target_path,
+            &[("call_0".to_string(), 2_u8)].into_iter().collect(),
         )
         .unwrap();
         let target = PathBuf::from("/tmp/target-session.rs");
@@ -1230,6 +1306,7 @@ mod tests {
         .unwrap();
         app.stale_patch_targets
             .insert(PathBuf::from("/tmp/source-session.rs"));
+        app.prune_marks.insert("source-call".to_string(), 1);
 
         try_handle_session_command(&mut app, "/sessions use sess-target").unwrap();
 
@@ -1237,12 +1314,68 @@ mod tests {
             app.stale_patch_targets,
             rustc_hash::FxHashSet::from_iter([target])
         );
+        assert_eq!(app.prune_marks.get("call_0"), Some(&2));
+        assert!(!app.prune_marks.contains_key("source-call"));
 
         try_handle_session_command(&mut app, "/sessions new").unwrap();
         assert!(
             app.stale_patch_targets.is_empty(),
             "a brand-new session must not inherit the previous session ledger"
         );
+        assert!(app.prune_marks.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_session_state_restores_only_active_prune_marks() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let session_id = app.session_id.clone();
+        let path = store.session_history_file(&session_id);
+        let mut messages = Vec::new();
+        for index in 0..5 {
+            let id = format!("call_{index}");
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![ToolCall {
+                    id: id.clone(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "execute_command".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            messages.push(Message {
+                role: "tool".to_string(),
+                content: Value::String("result\n".repeat(1_000)),
+                tool_calls: None,
+                tool_call_id: Some(id),
+                reasoning_content: None,
+            });
+        }
+        append_history_messages(&path, &messages).unwrap();
+        let persisted = [
+            ("call_0".to_string(), 1_u8),
+            ("missing".to_string(), 2_u8),
+            // 最近四组受保护，恢复时不得继续携带旧计数。
+            ("call_4".to_string(), 2_u8),
+        ]
+        .into_iter()
+        .collect();
+        write_llm_prune_marks_sqlite(&path, &persisted).unwrap();
+
+        restore_session_local_runtime_state(&mut app).unwrap();
+
+        assert_eq!(app.prune_marks.len(), 1);
+        assert_eq!(app.prune_marks.get("call_0"), Some(&1));
         let _ = fs::remove_dir_all(root);
     }
 

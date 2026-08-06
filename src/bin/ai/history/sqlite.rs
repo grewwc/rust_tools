@@ -26,10 +26,39 @@ use super::{
 };
 
 const STALE_PATCH_TARGETS_META_KEY: &str = "stale_patch_targets_v1";
+const LLM_PRUNE_MARKS_META_KEY: &str = "llm_prune_marks_v1";
 const LAST_ACTIVITY_META_KEY: &str = "last_activity_unix_ms";
 
 static SESSION_STATE_LOCKS: LazyLock<Mutex<FxHashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// history_revision 的进程内缓存：指纹 (主库 len/mtime, WAL sidecar len/mtime) 失效。
+///
+/// `read_history_revision` 每次调用都 `Connection::open` + SQL 查询（每轮上下文
+/// 缓存校验 + session 列表刷新会调用多次），而 revision 只在消息写入时才变化。
+/// 这里用文件元数据指纹缓存结果：本进程/外部进程写入都会改变主库或 WAL sidecar
+/// 的 len/mtime，指纹失配即重查，语义与无缓存一致。
+///
+/// **WAL 关键**：history DB 启用 WAL 模式，提交只写 `-wal` sidecar，主库
+/// len/mtime 在 checkpoint 前可以完全不变。若指纹仅覆盖主库，有存活连接时
+/// 缓存会持续返回旧 revision，破坏 `history_revision` 作为跨连接信号的语义。
+/// 因此指纹同时覆盖主库和 `-wal` sidecar，任一变化即失效。
+static HISTORY_REVISION_CACHE: LazyLock<
+    Mutex<FxHashMap<PathBuf, (((u64, Option<SystemTime>), (u64, Option<SystemTime>)), i64)>>,
+> = LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+fn history_file_fingerprint(path: &Path) -> ((u64, Option<SystemTime>), (u64, Option<SystemTime>)) {
+    let main = std::fs::metadata(path)
+        .map(|m| (m.len(), m.modified().ok()))
+        .unwrap_or((0, None));
+    // WAL 模式下提交先落 `-wal` sidecar，主库 mtime 在 checkpoint 前不变；
+    // 将 sidecar 元数据纳入指纹，确保未 checkpoint 的写入也能触发缓存失效。
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    let wal = std::fs::metadata(&wal_path)
+        .map(|m| (m.len(), m.modified().ok()))
+        .unwrap_or((0, None));
+    (main, wal)
+}
 
 fn session_state_lock_path(path: &Path) -> PathBuf {
     let file_name = path
@@ -371,6 +400,17 @@ fn add_column_if_missing(
 /// 读到的初值不随外部写入而变（实测新连接恒返回 2），因此无法作为跨连接缓存
 /// 失效依据。缺失（老库尚未写入过 revision）时返回 0，与"从未修改"一致。
 pub(in crate::ai) fn read_history_revision(path: &Path) -> Option<i64> {
+    // 进程内缓存：指纹 (主库 len/mtime, WAL sidecar len/mtime) 未变即复用上次
+    // 结果，避免每次调用都新开连接 + SQL 查询（每轮上下文缓存校验 / session
+    // 列表刷新高频调用）。
+    let fingerprint = history_file_fingerprint(path);
+    if let Ok(cache) = HISTORY_REVISION_CACHE.lock() {
+        if let Some((cached_fp, rev)) = cache.get(path) {
+            if *cached_fp == fingerprint {
+                return Some(*rev);
+            }
+        }
+    }
     let conn = Connection::open(path).ok()?;
     // meta 表可能尚未创建（全新库）或尚未写入过 revision：两种情况都视为 0
     // （"从未修改"），保证返回值稳定可比。只有连接本身打不开才返回 None。
@@ -382,7 +422,27 @@ pub(in crate::ai) fn read_history_revision(path: &Path) -> Option<i64> {
         )
         .optional()
         .unwrap_or(None);
-    Some(value.unwrap_or(0))
+    let revision = value.unwrap_or(0);
+    if let Ok(mut cache) = HISTORY_REVISION_CACHE.lock() {
+        cache.insert(path.to_path_buf(), (fingerprint, revision));
+    }
+    Some(revision)
+}
+
+/// 清理指定 history 路径的 revision 缓存条目。
+/// 在 history 文件删除或改名时调用，避免缓存随 session/sub-agent 唯一路径
+/// 无限增长。
+pub(in crate::ai) fn remove_history_revision_cache_entry(path: &Path) {
+    if let Ok(mut cache) = HISTORY_REVISION_CACHE.lock() {
+        cache.remove(path);
+    }
+}
+
+#[cfg(test)]
+pub(in crate::ai) fn history_revision_cache_contains(path: &Path) -> bool {
+    HISTORY_REVISION_CACHE
+        .lock()
+        .is_ok_and(|cache| cache.contains_key(path))
 }
 
 /// 记录最近一次消息写入时间；同一毫秒内连续写入也保持单调递增。
@@ -1073,6 +1133,95 @@ pub(in crate::ai) fn write_stale_patch_targets_sqlite(
         .map_err(|error| io::Error::other(error.to_string()))?;
         Ok(())
     })
+}
+
+/// 读取当前 session 的模型引导裁剪计数。缺失或非 SQLite history 安全退化为空。
+pub(in crate::ai) fn read_llm_prune_marks_sqlite(path: &Path) -> io::Result<FxHashMap<String, u8>> {
+    if !blob::is_sqlite_path(path) || !path.exists() {
+        return Ok(FxHashMap::default());
+    }
+    let conn = open_history_db(path)?;
+    let table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(FxHashMap::default());
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1 LIMIT 1",
+            params![LLM_PRUNE_MARKS_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let Some(raw) = raw else {
+        return Ok(FxHashMap::default());
+    };
+    let entries = serde_json::from_str::<Vec<(String, u8)>>(&raw).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid LLM prune mark metadata: {error}"),
+        )
+    })?;
+    Ok(entries
+        .into_iter()
+        .filter(|(id, count)| !id.trim().is_empty() && *count > 0)
+        .take(1_024)
+        .collect())
+}
+
+/// 原子替换当前 session 的模型引导裁剪计数。该旁路状态不改变 canonical
+/// messages，因此不递增 history_revision；空表直接删除 meta，避免遗留空状态。
+pub(in crate::ai) fn write_llm_prune_marks_sqlite(
+    path: &Path,
+    marks: &FxHashMap<String, u8>,
+) -> io::Result<()> {
+    if !blob::is_sqlite_path(path) {
+        return Ok(());
+    }
+    let mut entries = marks
+        .iter()
+        .filter(|(id, count)| !id.trim().is_empty() && **count > 0)
+        .map(|(id, count)| (id.clone(), *count))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let encoded =
+        serde_json::to_string(&entries).map_err(|error| io::Error::other(error.to_string()))?;
+    with_session_state_lock(path, || {
+        let conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        if entries.is_empty() {
+            conn.execute(
+                "DELETE FROM meta WHERE key=?1",
+                params![LLM_PRUNE_MARKS_META_KEY],
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        } else {
+            conn.execute(
+                "INSERT INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, created_at=excluded.created_at",
+                params![LLM_PRUNE_MARKS_META_KEY, encoded],
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+        Ok(())
+    })
+}
+
+fn clear_llm_prune_marks_meta(conn: &Connection) -> io::Result<()> {
+    conn.execute(
+        "DELETE FROM meta WHERE key=?1",
+        params![LLM_PRUNE_MARKS_META_KEY],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
 }
 
 /// outcome 只属于同一 `tool_call_id` 的 tool 消息。历史替换、压缩或分支截断后
@@ -1908,6 +2057,7 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
             .map_err(|e| io::Error::other(e.to_string()))?;
         tx.execute("DELETE FROM skill_activation_events", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
+        clear_llm_prune_marks_meta(&tx)?;
         bump_history_revision(&tx)?;
         return tx.commit().map_err(|e| io::Error::other(e.to_string()));
     }
@@ -1924,6 +2074,7 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
         tx.execute("DELETE FROM messages WHERE id > ?1", params![cutoff_id])
             .map_err(|e| io::Error::other(e.to_string()))?;
         invalidate_context_snapshot(&tx)?;
+        clear_llm_prune_marks_meta(&tx)?;
     }
     prune_orphan_tool_execution_outcomes(&tx)?;
     bump_history_revision(&tx)?;
@@ -1976,6 +2127,7 @@ fn truncate_messages_to_user_turns_sqlite_unlocked(
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
         invalidate_context_snapshot(&tx)?;
+        clear_llm_prune_marks_meta(&tx)?;
     }
     prune_orphan_tool_execution_outcomes(&tx)?;
     bump_history_revision(&tx)?;
@@ -2394,6 +2546,61 @@ mod tests {
     }
 
     #[test]
+    fn history_revision_cache_invalidates_on_wal_write_with_live_connection() {
+        // 验证：有存活连接时 WAL 写入不 checkpoint 主库，但 `-wal` sidecar 变化
+        // 必须使 revision 缓存失效，否则缓存返回旧值。
+        let dir = std::env::temp_dir().join(format!(
+            "hist_rev_wal_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+
+        append_history_sqlite(&path, vec![msg("user", "first")]).unwrap();
+        let r1 = read_history_revision(&path).unwrap();
+        assert!(r1 > 0);
+
+        // 保持连接存活，阻止 WAL checkpoint 回写主库
+        let guard = rusqlite::Connection::open(&path).unwrap();
+
+        // 短生命连接写入：WAL 增长但主库 mtime 可能不变
+        append_history_sqlite(&path, vec![msg("user", "second")]).unwrap();
+
+        // 缓存必须失效（WAL sidecar 元数据变化），返回新 revision
+        let r2 = read_history_revision(&path).unwrap();
+        assert!(
+            r2 > r1,
+            "revision must increment even with live connection: {r1} -> {r2}"
+        );
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn llm_prune_marks_round_trip_and_clear_on_history_truncate() {
+        let dir = std::env::temp_dir().join(format!(
+            "llm_prune_marks_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.sqlite");
+        append_history_sqlite(&path, vec![msg("user", "seed")]).unwrap();
+
+        let marks = [("call_b".to_string(), 2_u8), ("call_a".to_string(), 1_u8)]
+            .into_iter()
+            .collect::<FxHashMap<_, _>>();
+        write_llm_prune_marks_sqlite(&path, &marks).unwrap();
+        assert_eq!(read_llm_prune_marks_sqlite(&path).unwrap(), marks);
+
+        truncate_messages_sqlite(&path, 0).unwrap();
+        assert!(read_llm_prune_marks_sqlite(&path).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn stale_patch_targets_survive_history_replacement_and_clear_with_session() {
         let dir = std::env::temp_dir().join(format!(
             "stale_patch_meta_test_{}_{}",
@@ -2586,11 +2793,18 @@ mod tests {
 
         append_skill_activation_event_sqlite(&path, &event).unwrap();
 
-        assert_eq!(read_skill_activation_events_sqlite(&path).unwrap(), vec![event]);
+        assert_eq!(
+            read_skill_activation_events_sqlite(&path).unwrap(),
+            vec![event]
+        );
         assert!(read_all_messages_sqlite(&path).unwrap().is_empty());
 
         clear_session_history_sqlite(&path).unwrap();
-        assert!(read_skill_activation_events_sqlite(&path).unwrap().is_empty());
+        assert!(
+            read_skill_activation_events_sqlite(&path)
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

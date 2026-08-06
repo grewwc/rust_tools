@@ -65,8 +65,9 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
     runtime-owned; retain the exact input only in its user-role message.
 19. **Completion claims require evidence.** Recheck unsupported post-project-
    mutation completion claims once; temp-only command side effects do not count.
-   Otherwise persist and display one explicit warning. A warning-only response is
-   still an incomplete final and receives the normal one-time synthesis grace.
+   Otherwise append one explicit runtime warning to the user-visible final and
+   persist the unverified state for later context. A warning-only response is still
+   an incomplete final and receives the normal one-time synthesis grace.
 20. **Scheduler blocking is event-driven.** Foreground waits, background-task
     completion, shutdown, and wall-clock deadlines wake the driver through the
     scheduler notifier; never restore fixed-interval polling sleeps in the main loop.
@@ -82,3 +83,6 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
     model request, apply eligible prune marks to the transient `messages`
     projection before normal context budgeting, archive full tool output before
     replacing it with a recall stub, and never mutate canonical `turn_messages`.
+    Prune confirmation counts are session-scoped durable runtime state: restore
+    and filter them against the live prunable ids, clear them on history rewind,
+    and never leak them across session/persona switches.

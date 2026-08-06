@@ -26,7 +26,8 @@
 // =============================================================================
 
 use crate::types::{FastMap, FastSet};
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::path::PathBuf;
 
 use crate::kernel::{
@@ -144,6 +145,10 @@ pub struct LocalOS {
     /// epoll registry: epoll id -> registrations.
     pub(super) epolls: FastMap<u64, EpollEntry>,
     pub(super) next_epoll_id: u64,
+    /// 到期唤醒堆：(until_tick, pid)。与进程 state 中的 until_tick/timeout_tick
+    /// 一一对应；进程被提前唤醒/终止后条目变为 stale，pop 时验证后丢弃。
+    /// 避免 advance_ticks / next_wakeup_tick 每次全表扫描 sleeping 进程。
+    wakeup_heap: BinaryHeap<Reverse<(u64, u64)>>,
 }
 
 /// 内核内部使用的 daemon 登记条目（含活引用 token）。对外只暴露 Snapshot。
@@ -202,6 +207,7 @@ impl LocalOS {
             processes: FastMap::default(),
             ready_queue: VecDeque::new(),
             ready_set: FastSet::default(),
+            wakeup_heap: BinaryHeap::new(),
             wait_queue: FastMap::default(),
             children_by_parent: FastMap::default(),
             next_pid: 1,
@@ -937,6 +943,9 @@ impl Syscall for LocalOS {
         }
 
         let timeout_tick = timeout_ticks.map(|ticks| self.tick.saturating_add(ticks.max(1)));
+        if let Some(tt) = timeout_tick {
+            self.wakeup_heap.push(Reverse((tt, current)));
+        }
         if let Some(current_proc) = self.processes.get_mut(&current) {
             current_proc.state = ProcessState::Waiting {
                 reason: WaitReason::Events {
@@ -1080,6 +1089,7 @@ impl Syscall for LocalOS {
         if let Some(proc) = self.processes.get_mut(&current) {
             proc.state = ProcessState::Sleeping { until_tick };
         }
+        self.wakeup_heap.push(Reverse((until_tick, current)));
         self.current_pid = None;
         self.yield_requested = true;
         Ok(until_tick)
@@ -1530,44 +1540,48 @@ impl KernelInternal for LocalOS {
             return;
         }
         self.tick = self.tick.saturating_add(ticks);
-        let mut wake_sleeping_pids = Vec::new();
-        let mut wake_async_timeout_pids = Vec::new();
-        for (pid, proc) in self.processes.iter() {
-            if let ProcessState::Sleeping { until_tick } = proc.state
-                && until_tick <= self.tick
-            {
-                wake_sleeping_pids.push(*pid);
+        // 从唤醒堆弹出所有到期条目；stale（进程已被提前唤醒/终止/改状态）直接丢弃。
+        while let Some(Reverse((until_tick, pid))) = self.wakeup_heap.peek() {
+            let (until_tick, pid) = (*until_tick, *pid);
+            if until_tick > self.tick {
+                break;
+            }
+            self.wakeup_heap.pop();
+            let is_sleeping = matches!(
+                self.processes.get(&pid).map(|p| &p.state),
+                Some(ProcessState::Sleeping { until_tick: t }) if *t == until_tick
+            );
+            if is_sleeping {
+                if let Some(proc) = self.processes.get_mut(&pid) {
+                    proc.state = ProcessState::Ready;
+                    proc.mailbox.push_back(format!(
+                        "Sleep finished at scheduler tick {}.",
+                        self.tick
+                    ));
+                }
+                self.enqueue_ready(pid);
                 continue;
             }
-            if let ProcessState::Waiting {
-                reason:
-                    WaitReason::Events {
-                        timeout_tick: Some(until_tick),
+            let is_timeout = matches!(
+                self.processes.get(&pid).map(|p| &p.state),
+                Some(ProcessState::Waiting {
+                    reason: WaitReason::Events {
+                        timeout_tick: Some(t),
                         ..
-                    },
-            } = &proc.state
-                && *until_tick <= self.tick
-            {
-                wake_async_timeout_pids.push(*pid);
+                    }
+                }) if *t == until_tick
+            );
+            if is_timeout {
+                if let Some(proc) = self.processes.get_mut(&pid) {
+                    proc.state = ProcessState::Ready;
+                    proc.mailbox.push_back(format!(
+                        "Event wait timeout reached at scheduler tick {}.",
+                        self.tick
+                    ));
+                }
+                self.enqueue_ready(pid);
             }
-        }
-        for pid in wake_sleeping_pids {
-            if let Some(proc) = self.processes.get_mut(&pid) {
-                proc.state = ProcessState::Ready;
-                proc.mailbox
-                    .push_back(format!("Sleep finished at scheduler tick {}.", self.tick));
-            }
-            self.enqueue_ready(pid);
-        }
-        for pid in wake_async_timeout_pids {
-            if let Some(proc) = self.processes.get_mut(&pid) {
-                proc.state = ProcessState::Ready;
-                proc.mailbox.push_back(format!(
-                    "Event wait timeout reached at scheduler tick {}.",
-                    self.tick
-                ));
-            }
-            self.enqueue_ready(pid);
+            // 其余情况为 stale 条目，已 pop 丢弃。
         }
     }
 
@@ -1576,20 +1590,9 @@ impl KernelInternal for LocalOS {
     }
 
     fn next_wakeup_tick(&self) -> Option<u64> {
-        self.processes
-            .values()
-            .filter_map(|process| match &process.state {
-                ProcessState::Sleeping { until_tick } => Some(*until_tick),
-                ProcessState::Waiting {
-                    reason:
-                        WaitReason::Events {
-                            timeout_tick: Some(timeout_tick),
-                            ..
-                        },
-                } => Some(*timeout_tick),
-                _ => None,
-            })
-            .min()
+        // 堆顶即最早到期；stale 顶部只会在 advance_ticks 时被清理，
+        // 这里返回其 tick 只会让调用者提前醒来，不会错过更早的唤醒。
+        self.wakeup_heap.peek().map(|Reverse((t, _))| *t)
     }
 
     fn has_ready(&self) -> bool {

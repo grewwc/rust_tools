@@ -1173,8 +1173,9 @@ fn json_messages_aux_body_uses_responses_protocol_for_modelhub_models() {
         json!({"role": "user", "content": "classify this"}),
     ];
 
-    let body =
+    let body_bytes =
         build_http_body_for_json_messages("gpt-5.5", &endpoint, &messages, false, None, false);
+    let body: Value = serde_json::from_slice(&body_bytes).expect("body should be valid JSON");
 
     assert_eq!(body["model"], models::request_model_name("gpt-5.5"));
     assert!(body.get("messages").is_none());
@@ -1278,6 +1279,7 @@ fn responses_request_body_omits_assistant_reasoning_from_message_content() {
         max_tokens: None,
         reasoning_items: None,
         reasoning_encrypted_replay: false,
+        estimated_prompt_tokens: 0,
     };
 
     let body = super::build_responses_request_body(&request);
@@ -1325,6 +1327,7 @@ fn responses_request_body_emits_bare_function_call_for_tool_turn() {
         max_tokens: None,
         reasoning_items: None,
         reasoning_encrypted_replay: false,
+        estimated_prompt_tokens: 0,
     };
 
     let body = super::build_responses_request_body(&request);
@@ -1367,6 +1370,7 @@ fn responses_request_body_drops_empty_text_content_items() {
         max_tokens: None,
         reasoning_items: None,
         reasoning_encrypted_replay: false,
+        estimated_prompt_tokens: 0,
     };
 
     let body = super::build_responses_request_body(&request);
@@ -1429,6 +1433,7 @@ fn responses_request_body_omits_include_without_encrypted_replay() {
         max_tokens: None,
         reasoning_items: None,
         reasoning_encrypted_replay: false,
+        estimated_prompt_tokens: 0,
     };
 
     let body = super::build_responses_request_body(&request);
@@ -1480,6 +1485,7 @@ fn responses_request_body_replays_reasoning_items_before_function_call() {
         max_tokens: None,
         reasoning_items: Some(&items),
         reasoning_encrypted_replay: true,
+        estimated_prompt_tokens: 0,
     };
 
     let body = super::build_responses_request_body(&request);
@@ -1529,6 +1535,7 @@ fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items
         max_tokens: None,
         reasoning_items: Some(&empty),
         reasoning_encrypted_replay: true,
+        estimated_prompt_tokens: 0,
     };
 
     let body = super::build_responses_request_body(&request);
@@ -2133,6 +2140,72 @@ fn normalize_messages_wraps_midstream_self_note_in_user_assistant_handoff() {
 }
 
 #[test]
+fn normalize_messages_keeps_completion_evidence_diagnostic_visible_to_next_model_turn() {
+    const DIAGNOSTIC: &str = "runtime:completion_evidence_unverified\nA final response was recorded after a project mutation without observed post-mutation verification.";
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("base system".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("修复图片保存后的提示".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("已修复。".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(format!("self_note:\n{DIAGNOSTIC}")),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("继续检查一下".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let normalized = normalize_messages_for_request(&messages);
+    assert_eq!(normalized[2].content, Value::String("已修复。".to_string()));
+    assert!(
+        !normalized[0]
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains(DIAGNOSTIC))
+    );
+    assert!(
+        normalized[3]
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains("Runtime context handoff"))
+    );
+    assert_eq!(normalized[4].role, "assistant");
+    assert!(
+        normalized[4]
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains(DIAGNOSTIC))
+    );
+    assert_eq!(normalized[5].role, "user");
+    assert_eq!(normalized[5].content, Value::String("继续检查一下".to_string()));
+}
+
+#[test]
 fn strip_unavailable_tool_hints_removes_internal_note_tool_hint() {
     let mut messages = vec![Message {
         role: "system".to_string(),
@@ -2689,6 +2762,7 @@ fn responses_request_body_converts_chat_multimodal_content_to_input_items() {
         max_tokens: None,
         reasoning_items: None,
         reasoning_encrypted_replay: false,
+        estimated_prompt_tokens: 0,
     };
 
     let body = super::build_responses_request_body(&request);
@@ -2780,6 +2854,7 @@ fn responses_request_body_does_not_emit_input_image_for_system_multimodal_conten
         max_tokens: None,
         reasoning_items: None,
         reasoning_encrypted_replay: false,
+        estimated_prompt_tokens: 0,
     };
 
     let body = super::build_responses_request_body(&request);

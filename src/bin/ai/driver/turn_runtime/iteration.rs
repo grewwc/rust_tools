@@ -787,11 +787,25 @@ fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Messa
         let store = SessionStore::new(app.config.history_file.as_path());
         store.session_assets_dir(&app.session_id)
     };
+    let candidate_count = llm_prune::active_prunable_tool_ids(messages).len();
+    let had_protocol = messages
+        .iter()
+        .any(|message| message.content.as_str() == Some(llm_prune::PRUNE_PROTOCOL_PROMPT));
     let report = llm_prune::prepare_request_projection(
         messages,
         &app.prune_marks,
         Some(overflow_dir.as_path()),
     );
+    let protocol_injected = !had_protocol
+        && messages
+            .iter()
+            .any(|message| message.content.as_str() == Some(llm_prune::PRUNE_PROTOCOL_PROMPT));
+    if protocol_injected && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        crate::ai::driver::print::print_tool_note_line(
+            "context-prune",
+            &format!("model pruning enabled for {candidate_count} old tool result(s)"),
+        );
+    }
     if report.pruned_count == 0 {
         return;
     }

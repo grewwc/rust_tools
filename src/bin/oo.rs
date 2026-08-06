@@ -38,8 +38,14 @@ fn is_ssh() -> bool {
         || std::env::var("SSH_TTY").is_ok()
 }
 
-fn try_paste_image_via_osc52(fname: &str) -> Result<(), String> {
-    clipboardw::image_content::save_to_file(fname).map_err(|e| e.to_string())
+fn try_paste_image_via_osc52(fname: &str) -> Result<String, String> {
+    let saved_path = clipboardw::image_content::resolved_save_path(fname);
+    clipboardw::image_content::save_to_file(fname).map_err(|e| e.to_string())?;
+    Ok(saved_path)
+}
+
+fn saved_file_message(path: &str) -> String {
+    format!("save to file: {path}")
 }
 
 fn handle_paste_to_file(fname: &str) -> Result<(), String> {
@@ -58,14 +64,17 @@ fn handle_paste_to_file(fname: &str) -> Result<(), String> {
     }
 
     if clipboardw::binary_content::save_to_file(fname).is_ok() {
+        println!("save to file: {fname}");
         return Ok(());
     }
     if clipboardw::string_content::save_to_file(fname).is_ok() {
+        // string_content::save_to_file 内部已经打印 "save to file: ..."
         return Ok(());
     }
 
     // First attempt at image via OSC52.
-    if try_paste_image_via_osc52(fname).is_ok() {
+    if let Ok(saved_path) = try_paste_image_via_osc52(fname) {
+        println!("{}", saved_file_message(&saved_path));
         return Ok(());
     }
 
@@ -80,7 +89,8 @@ fn handle_paste_to_file(fname: &str) -> Result<(), String> {
         let mut line = String::new();
         let _ = stdin.lock().read_line(&mut line);
 
-        if try_paste_image_via_osc52(fname).is_ok() {
+        if let Ok(saved_path) = try_paste_image_via_osc52(fname) {
+            println!("{}", saved_file_message(&saved_path));
             return Ok(());
         }
     }
@@ -144,5 +154,16 @@ fn main() {
         }
     } else {
         Cli::command().print_help().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_image_save_message_uses_resolved_jpg_path() {
+        let path = clipboardw::image_content::resolved_save_path(DEFAULT_FILE_NAME);
+        assert_eq!(saved_file_message(&path), "save to file: output.jpg");
     }
 }

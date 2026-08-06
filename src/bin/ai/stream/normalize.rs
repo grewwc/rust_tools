@@ -18,17 +18,19 @@ pub(super) fn parse_stream_payload(
         return ParsedStreamPayload::Done;
     }
 
-    // 在调用 adapter 解析之前，先检测 provider 在流中途返回的 error 对象。
-    // StreamChunk 所有字段都是 #[serde(default)]，{"error":{...}} 会被静默反序列化
-    // 为空 chunk 然后丢弃，导致用户看到空响应且无任何错误提示。
-    if let Some(err_msg) = extract_provider_error(payload) {
-        return ParsedStreamPayload::Error(err_msg);
-    }
-
     if let Some(event_type) = event_type {
         if let Some(parsed) = parse_sse_event_payload(event_type, payload) {
             return parsed;
         }
+    }
+
+    // 非 SSE 事件路径：在调用 adapter 解析之前，先检测 provider 在流中途返回的
+    // error 对象。StreamChunk 所有字段都是 #[serde(default)]，{"error":{...}}
+    // 会被静默反序列化为空 chunk 然后丢弃，导致用户看到空响应且无任何错误提示。
+    // SSE 路径的 error 检测已并入 parse_sse_event_payload 的同一次 JSON 解析，
+    // 避免每个 chunk 双重解析。
+    if let Some(err_msg) = extract_provider_error(payload) {
+        return ParsedStreamPayload::Error(err_msg);
     }
 
     adapter.parse_provider_chunk(payload)
@@ -42,11 +44,17 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     if event_type == "done" || event_type == "[done]" {
         return Some(ParsedStreamPayload::Done);
     }
+    // 统一解析一次并复用：各事件分支共享同一 Value，避免每个 chunk 双重 JSON
+    // 解析；顶层 error 对象检测也在此完成（StreamChunk 全字段 #[serde(default)]，
+    // 纯 error payload 会被静默反序列化为空 chunk 丢弃）。
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if let Some(err_msg) = value.get("error").and_then(extract_error_message) {
+        return Some(ParsedStreamPayload::Error(err_msg));
+    }
     if event_type == "response.completed" {
         // Responses API 的最终用量嵌在 response.usage，而不是兼容流的顶层
         // usage。将其包装成普通 chunk，复用既有的用量落账路径；仍不能把该
         // 事件视为 [DONE]，因为连接关闭才是流结束信号。
-        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
         let usage = value.get("response")?.get("usage")?.clone();
         let usage = serde_json::from_value(usage).ok()?;
         return Some(ParsedStreamPayload::Chunk(StreamChunk {
@@ -57,7 +65,6 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     // OpenAI Responses API 错误/不完整事件——必须显式处理，否则会 fallthrough
     // 到 parse_provider_chunk 被当成空 chunk 静默丢弃。
     if event_type == "response.failed" {
-        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
         let msg = value
             .get("response")
             .and_then(|r| r.get("error"))
@@ -66,7 +73,6 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
         return Some(ParsedStreamPayload::Error(msg));
     }
     if event_type == "response.incomplete" {
-        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
         let reason = value
             .get("response")
             .and_then(|r| r.get("incomplete_details"))
@@ -79,13 +85,11 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     }
     // 部分 provider 用 SSE event: error 携带错误对象
     if event_type == "error" {
-        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
         let msg = extract_error_message(&value)
             .unwrap_or_else(|| "stream error event (no detail)".to_string());
         return Some(ParsedStreamPayload::Error(msg));
     }
 
-    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
     if let Some(parsed) = parse_function_call_arguments_event(event_type.as_str(), &value) {
         return Some(parsed);
     }

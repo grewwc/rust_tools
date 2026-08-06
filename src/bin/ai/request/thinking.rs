@@ -254,7 +254,7 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     // 仅 connect_timeout 不覆盖“连上但服务端不回响应头”的永久阻塞。
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
-        .json(&http_body)
+        .body(http_body)
         .send();
     let response = match tokio::time::timeout(Duration::from_secs(15), send_future).await {
         Ok(r) => r.ok()?,
