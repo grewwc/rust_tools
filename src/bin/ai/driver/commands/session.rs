@@ -448,6 +448,24 @@ pub fn try_handle_session_command(
             }
         }
         "suspend" | "bg" | "detach" => {
+            // 与 Ctrl+C 挂起路径（`should_suspend_session_on_sigint`）保持一致：
+            // `--session` 显式指定的 id 总是挂起；否则若 session 还没有任何用户消息，
+            // 主循环退出时的 `cleanup_one_shot` 会把这个空 session 删除，若此处仍写入
+            // 挂起条目，就会留下指向已删除 session 的悬空绑定，下次启动 `a` 会尝试恢复
+            // 一个不存在的会话。
+            let should_suspend = if app.cli.session.is_some() {
+                true
+            } else {
+                let session_store = SessionStore::new(app.config.history_file.as_path());
+                !session_store
+                    .is_empty_session(&app.session_id)
+                    .unwrap_or(false)
+            };
+            if !should_suspend {
+                println!("当前 session 为空，直接退出（不挂起）。");
+                crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
+                return Ok(true);
+            }
             match SuspendedSessionStore::new().suspend_current_terminal(
                 &app.session_id,
                 app.config.history_file.as_path(),
@@ -1349,6 +1367,21 @@ mod tests {
         }
 
         let mut app = test_app(&root);
+        // 写入一条用户消息，使 session 非空（否则新的空 session 保护会拒绝挂起，
+        // 因为主循环退出时会删除空 session，留下悬空绑定）。
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let path = store.session_history_file(&app.session_id);
+        append_history_messages(
+            &path,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("hello".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
         try_handle_session_command(&mut app, "/sessions suspend").unwrap();
 
         assert!(app.shutdown.load(Ordering::Relaxed));
@@ -1359,6 +1392,39 @@ mod tests {
         assert_eq!(entry.session_id, app.session_id);
         assert_eq!(entry.history_file, app.config.history_file);
         assert_eq!(entry.persona_id, app.active_persona.id);
+
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+            std::env::remove_var("TERM_SESSION_ID");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bg_on_empty_session_does_not_write_dangling_binding() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let suspended_root = root.join("suspended");
+        unsafe {
+            std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+            std::env::set_var("TERM_SESSION_ID", "term-empty");
+        }
+
+        let mut app = test_app(&root);
+        // 不写入任何用户消息，session 为空。
+        try_handle_session_command(&mut app, "/bg").unwrap();
+
+        // 仍请求退出，但不能留下挂起绑定（否则主循环删除空 session 后成为悬空绑定）。
+        assert!(app.shutdown.load(Ordering::Relaxed));
+        let entries = SuspendedSessionStore::new()
+            .peek_entries_for_terminal_key("terminal:term-empty")
+            .unwrap();
+        assert!(
+            entries.is_empty(),
+            "empty session must not be suspended, got {entries:?}"
+        );
 
         unsafe {
             std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
