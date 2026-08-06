@@ -1078,7 +1078,10 @@ fn shell_segment_is_nav_or_env(segment: &str) -> bool {
     let Some(program) = tokens.next() else {
         return false;
     };
-    matches!(program.rsplit('/').next().unwrap_or(program), "cd" | "export")
+    matches!(
+        program.rsplit('/').next().unwrap_or(program),
+        "cd" | "export"
+    )
 }
 
 fn execute_command_is_read_only(command: &str) -> bool {
@@ -1242,10 +1245,7 @@ fn extract_round_targets_inner(
             if let Some(ToolResultProgressStatus::BlockedOutsideWorkspace(path)) =
                 results_by_call_id.get(tc.id.as_str())
             {
-                targets.push(format!(
-                    "{}:blocked-outside-root:{path}",
-                    tc.function.name
-                ));
+                targets.push(format!("{}:blocked-outside-root:{path}", tc.function.name));
                 continue;
             }
         }
@@ -2239,10 +2239,7 @@ mod tests {
         assert_eq!(supervisor.effective_max_iterations(1), 1);
         for expected_rounds in 1..=MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS {
             assert!(supervisor.grant_scoped_preflight_grace());
-            assert_eq!(
-                supervisor.effective_max_iterations(1),
-                1 + expected_rounds
-            );
+            assert_eq!(supervisor.effective_max_iterations(1), 1 + expected_rounds);
         }
         assert!(!supervisor.grant_scoped_preflight_grace());
         assert_eq!(
@@ -2303,7 +2300,10 @@ mod tests {
         let c = vec!["tree::{\"path\":\"src/bin\"}".to_string()];
 
         // 不足窗口不误报。
-        assert!(!detect_tool_loop(&[a.clone(), b.clone(), c.clone()], TOOL_LOOP_SOFT_WINDOW));
+        assert!(!detect_tool_loop(
+            &[a.clone(), b.clone(), c.clone()],
+            TOOL_LOOP_SOFT_WINDOW
+        ));
         // 3 周期 + 1 前缀正好填满 soft 窗口 4：应触发 Soft。
         assert!(detect_tool_loop(
             &[a.clone(), b.clone(), c.clone(), a.clone()],
@@ -2311,7 +2311,14 @@ mod tests {
         ));
         // 完整 hard 窗口（6 轮整周期）仍触发，且整除路径不受影响。
         assert!(detect_tool_loop(
-            &[a.clone(), b.clone(), c.clone(), a.clone(), b.clone(), c.clone()],
+            &[
+                a.clone(),
+                b.clone(),
+                c.clone(),
+                a.clone(),
+                b.clone(),
+                c.clone()
+            ],
             TOOL_LOOP_HARD_WINDOW
         ));
         // 前缀不匹配（第 4 轮与周期无关）不得误报。
@@ -2324,11 +2331,17 @@ mod tests {
     #[test]
     fn execute_command_is_read_only_skips_nav_segments_and_requires_all_substantive_read_only() {
         // 前导 cd/export 无副作用，应跳过：`cd X && git status` 是只读。
-        assert!(execute_command_is_read_only("cd /tmp && git status --short"));
-        assert!(execute_command_is_read_only("cd /tmp && export FOO=1 && ls -la"));
+        assert!(execute_command_is_read_only(
+            "cd /tmp && git status --short"
+        ));
+        assert!(execute_command_is_read_only(
+            "cd /tmp && export FOO=1 && ls -la"
+        ));
         // 任一实质段可能变更 → 非只读（堵住旧实现「只看首段」的盲区）。
         assert!(!execute_command_is_read_only("ls /tmp && rm -rf build"));
-        assert!(!execute_command_is_read_only("cd /tmp && git checkout master"));
+        assert!(!execute_command_is_read_only(
+            "cd /tmp && git checkout master"
+        ));
         // 纯只读命令仍成立。
         assert!(execute_command_is_read_only("git log --oneline -5"));
         assert!(execute_command_is_read_only("ls -la /tmp"));
@@ -3740,7 +3753,11 @@ mod tests {
         let blocked = "Error: write_file failed: File error (/out/x.json): Write blocked: \
              path '/out/x.json' is outside the allowed write directory (effective_cwd).";
         let mut messages = Vec::new();
-        messages.push(pb_write_file_msg_with_content("/out/x.json", "w1", "data\n"));
+        messages.push(pb_write_file_msg_with_content(
+            "/out/x.json",
+            "w1",
+            "data\n",
+        ));
         messages.push(pb_tool_result("w1", blocked));
         assert!(
             !round_has_mutation(&messages),
@@ -3749,8 +3766,15 @@ mod tests {
 
         // 对照：成功写入仍算 mutation。
         let mut ok = Vec::new();
-        ok.push(pb_write_file_msg_with_content("in-root.json", "w2", "data\n"));
-        ok.push(pb_tool_result("w2", "Successfully wrote to /work/in-root.json"));
+        ok.push(pb_write_file_msg_with_content(
+            "in-root.json",
+            "w2",
+            "data\n",
+        ));
+        ok.push(pb_tool_result(
+            "w2",
+            "Successfully wrote to /work/in-root.json",
+        ));
         assert!(
             round_has_mutation(&ok),
             "a successful write must still count as mutation progress"
@@ -4214,8 +4238,7 @@ pub(in crate::ai::driver) async fn run_turn(
     // `/audit` 是用户直接请求的同步子代理调用。必须在父 DRIVER_CTX 已建立、
     // 子 agent 尚未进入递归 turn 前处理，才能复用 task 的隔离与证据生命周期。
     if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
-        if let Some(command) = crate::ai::driver::commands::audit::parse_audit_command(&question)
-        {
+        if let Some(command) = crate::ai::driver::commands::audit::parse_audit_command(&question) {
             return Ok(execute_audit_command(command, should_quit));
         }
     }
@@ -4232,29 +4255,25 @@ pub(in crate::ai::driver) async fn run_turn(
     let _foreground_turn_guard = (!crate::ai::driver::runtime_ctx::has_subagent_result_slot())
         .then(crate::ai::driver::signal::ForegroundTurnGuard::enter);
     crate::ai::driver::runtime_ctx::TURN_IDENTITY
-        .scope(
-            (session_id, turn_id),
-            async {
-                // enable_tools 的 per-turn 状态必须跟随整个 future，而不能只依赖
-                // run_turn_body 的 happy-path 尾部清理；abort / early return 也会 Drop。
-                let _enable_turn_guard =
-                    crate::ai::tools::enable_tools::EnableTurnStateGuard::enter();
-                run_turn_body(
-                    app,
-                    mcp_client,
-                    skill_manifests,
-                    history_count,
-                    turn_index,
-                    question,
-                    attachments_text,
-                    next_model,
-                    precomputed_ocr,
-                    one_shot_mode,
-                    should_quit,
-                )
-                .await
-            },
-        )
+        .scope((session_id, turn_id), async {
+            // enable_tools 的 per-turn 状态必须跟随整个 future，而不能只依赖
+            // run_turn_body 的 happy-path 尾部清理；abort / early return 也会 Drop。
+            let _enable_turn_guard = crate::ai::tools::enable_tools::EnableTurnStateGuard::enter();
+            run_turn_body(
+                app,
+                mcp_client,
+                skill_manifests,
+                history_count,
+                turn_index,
+                question,
+                attachments_text,
+                next_model,
+                precomputed_ocr,
+                one_shot_mode,
+                should_quit,
+            )
+            .await
+        })
         .await
 }
 
@@ -4438,8 +4457,7 @@ async fn run_turn_body(
         }
         {
             let mc = mcp_client.lock().unwrap();
-            let required_project_targets =
-                std::mem::take(&mut pending_scoped_project_targets);
+            let required_project_targets = std::mem::take(&mut pending_scoped_project_targets);
             refresh_skill_turn_for_iteration(
                 app,
                 &mc,
@@ -4453,11 +4471,7 @@ async fn run_turn_body(
         }
         if crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request() {
             pre_timeout_wrap_up_requested = true;
-            record_force_final_reason(
-                &mut messages,
-                "subagent_pre_timeout_wrap_up",
-                iteration,
-            );
+            record_force_final_reason(&mut messages, "subagent_pre_timeout_wrap_up", iteration);
             force_final_response = true;
             inject_subagent_pre_timeout_wrap_up_note(&mut messages);
         }
@@ -4887,11 +4901,7 @@ async fn run_turn_body(
                     &question,
                     "low-yield-hard-stop",
                 );
-                record_force_final_reason(
-                    &mut messages,
-                    "low_yield_repetition",
-                    iteration,
-                );
+                record_force_final_reason(&mut messages, "low_yield_repetition", iteration);
                 force_final_response = true;
             }
             ToolLoopSignal::Soft => {
@@ -4914,11 +4924,7 @@ async fn run_turn_body(
                     &question,
                     "tool-loop-hard-stop",
                 );
-                record_force_final_reason(
-                    &mut messages,
-                    "tool_loop",
-                    iteration,
-                );
+                record_force_final_reason(&mut messages, "tool_loop", iteration);
                 force_final_response = true;
             }
             ToolLoopSignal::LowProgressSoft => {
@@ -4958,11 +4964,7 @@ async fn run_turn_body(
                     &question,
                     "low-progress-hard-stop",
                 );
-                record_force_final_reason(
-                    &mut messages,
-                    "progress_no_progress",
-                    iteration,
-                );
+                record_force_final_reason(&mut messages, "progress_no_progress", iteration);
                 force_final_response = true;
             }
         }

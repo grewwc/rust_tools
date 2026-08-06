@@ -516,7 +516,6 @@ fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
     if run_result.ok {
         echo_tool_output(name, &run_result.tool_result.content);
     }
-
 }
 
 fn reserve_current_process_tool_call_budget(tool_call: &ToolCall) -> Result<(), RunOneResult> {
@@ -665,12 +664,7 @@ fn run_one(
     }
 
     let result = execute_with_safe_retry(&prepared.route, &tool_call.function.name, || {
-        execute_prepared_tool_call(
-            shared_mcp_client,
-            tool_call,
-            &prepared,
-            observer,
-        )
+        execute_prepared_tool_call(shared_mcp_client, tool_call, &prepared, observer)
     });
     let run_result = finalize_execution_result(
         session_id,
@@ -1166,7 +1160,8 @@ fn should_store_or_load_tool_cache(tool_name: &str, args: &Value) -> bool {
     // 目前只有 read_file 缓存具备可校验的环境指纹。搜索/目录/MCP 读取类工具虽然是
     // 只读，但其结果会随外部状态变化；没有对应 fingerprint 时不落盘/不命中缓存，
     // 避免把陈旧检索结果直接回放给模型。
-    tool_name == TOOL_CACHE_READ_FILE_TOOL && !collect_tool_cache_file_fingerprints(tool_name, args).is_empty()
+    tool_name == TOOL_CACHE_READ_FILE_TOOL
+        && !collect_tool_cache_file_fingerprints(tool_name, args).is_empty()
 }
 
 fn build_tool_cache_key(name: &str, args: &Value) -> String {

@@ -533,10 +533,8 @@ fn load_project_instruction_docs_from(cwd: &Path) -> Vec<ProjectInstructionDoc> 
             }
         }
         let candidates = discover_project_instruction_docs(cwd);
-        let docs = limit_project_instruction_docs(
-            candidates.clone(),
-            PROJECT_INSTRUCTION_MAX_TOTAL_CHARS,
-        );
+        let docs =
+            limit_project_instruction_docs(candidates.clone(), PROJECT_INSTRUCTION_MAX_TOTAL_CHARS);
         cache.insert(
             key,
             ProjectInstructionCacheEntry {
@@ -567,10 +565,8 @@ fn load_project_instruction_candidates_from(cwd: &Path) -> Vec<ProjectInstructio
             return entry.candidates.clone();
         }
         let candidates = discover_project_instruction_docs(cwd);
-        let docs = limit_project_instruction_docs(
-            candidates.clone(),
-            PROJECT_INSTRUCTION_MAX_TOTAL_CHARS,
-        );
+        let docs =
+            limit_project_instruction_docs(candidates.clone(), PROJECT_INSTRUCTION_MAX_TOTAL_CHARS);
         cache.insert(
             key,
             ProjectInstructionCacheEntry {

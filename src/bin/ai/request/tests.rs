@@ -1,6 +1,6 @@
 use super::builder::MIN_OUTPUT_TOKENS_FLOOR;
-use super::*;
 use super::protocol::build_http_body_for_json_messages;
+use super::*;
 use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
 use crate::ai::{cli::ParsedCli, types::AppConfig};
 use serde_json::Value;
@@ -1665,10 +1665,7 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
     // 回归：OpenCode DeepSeek 默认会下发顶层 reasoning_effort，
     // 此时请求体不会再带 `thinking` 对象；但历史 tool-call assistant
     // 仍必须补齐空 reasoning_content，否则压缩后续写会稳定 400。
-    normalize_reasoning_content_replay_for_model(
-        "deepseek-v4-flash-free-opencode",
-        &mut messages,
-    );
+    normalize_reasoning_content_replay_for_model("deepseek-v4-flash-free-opencode", &mut messages);
     assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
 
     let body = build_request_body(
@@ -1736,10 +1733,7 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
     assert_eq!(volcano_glm_messages[0].reasoning_content, None);
 
     let mut untagged_glm_messages = vec![assistant.clone()];
-    normalize_reasoning_content_replay_for_model(
-        "glm-5.2-opencode",
-        &mut untagged_glm_messages,
-    );
+    normalize_reasoning_content_replay_for_model("glm-5.2-opencode", &mut untagged_glm_messages);
     assert_eq!(untagged_glm_messages[0].reasoning_content, None);
 
     let mut deepseek_messages = vec![assistant];
@@ -1975,7 +1969,10 @@ fn normalize_messages_keeps_model_derived_notes_out_of_system_role() {
     assert!(!head_text.contains("working memory"));
 
     assert_eq!(
-        normalized.iter().map(|message| message.role.as_str()).collect::<Vec<_>>(),
+        normalized
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>(),
         vec!["system", "user", "assistant", "user", "assistant", "system"]
     );
     assert!(
@@ -2037,7 +2034,10 @@ fn normalize_messages_prioritizes_working_memory_before_summary_and_self_note() 
     assert!(!system_text.contains("## History Summary"));
     assert!(!system_text.contains("## Self Notes"));
     assert_eq!(
-        normalized.iter().map(|message| message.role.as_str()).collect::<Vec<_>>(),
+        normalized
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>(),
         vec!["system", "user", "assistant"]
     );
     assert!(
@@ -2097,8 +2097,19 @@ fn normalize_messages_wraps_midstream_self_note_in_user_assistant_handoff() {
 
     let normalized = normalize_messages_for_request(&messages);
     assert_eq!(
-        normalized.iter().map(|message| message.role.as_str()).collect::<Vec<_>>(),
-        vec!["system", "user", "assistant", "user", "assistant", "user", "assistant"]
+        normalized
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "system",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user",
+            "assistant"
+        ]
     );
     assert!(
         normalized[3]
@@ -2123,18 +2134,18 @@ fn normalize_messages_wraps_midstream_self_note_in_user_assistant_handoff() {
 #[test]
 fn strip_unavailable_tool_hints_removes_internal_note_tool_hint() {
     let mut messages = vec![Message {
-            role: "system".to_string(),
-            content: Value::String(
-                "Current code-inspection working memory:\n\
+        role: "system".to_string(),
+        content: Value::String(
+            "Current code-inspection working memory:\n\
                  - read_file(file=src/main.rs)\n\
                  - use `execute_command` only when a shell check is needed.\n\
                  Treat these findings as already-known context."
-                    .to_string(),
-            ),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        }];
+                .to_string(),
+        ),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
 
     let available = ["read_file", "tree"]
         .into_iter()

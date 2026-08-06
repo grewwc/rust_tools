@@ -22,7 +22,7 @@ use crate::ai::tools::common::{
     ToolRegistration, ToolSpec,
 };
 use crate::ai::tools::storage::file_store::current_session_assets_dir;
-use crate::ai::tools::text_grep_tools::{run_content_search, ContentSearchOptions};
+use crate::ai::tools::text_grep_tools::{ContentSearchOptions, run_content_search};
 
 /// 归档单文件大小上限：会话可能积累远超普通源文件（2 MiB）的 overflow 文件，
 /// 读入内存逐行匹配即可，不必与普通搜索共用同一上限。
@@ -61,7 +61,6 @@ struct OverflowSearchParams<'a> {
     file_pattern: Option<&'a str>,
     scope: SearchScope,
 }
-
 
 fn execute_search_overflow(args: &Value) -> Result<String, String> {
     let query = args["query"].as_str().ok_or("Missing 'query' parameter")?;
@@ -219,7 +218,10 @@ mod tests {
         let dir = make_temp_dir();
         seed_archive(&dir);
         let out = run_overflow_search(&dir, &params("foo")).unwrap();
-        assert!(out.contains("overflow-history.md"), "history file in results: {out}");
+        assert!(
+            out.contains("overflow-history.md"),
+            "history file in results: {out}"
+        );
         assert!(
             out.contains("tool-overflow-compressed/20260804T140000Z-execute_command-deadbeef.txt"),
             "tool output in results: {out}"
@@ -248,8 +250,14 @@ mod tests {
         p.scope = SearchScope::ToolOutputs;
         p.file_pattern = Some("*execute_command*");
         let out = run_overflow_search(&dir, &p).unwrap();
-        assert!(out.contains("execute_command"), "command snapshot matched: {out}");
-        assert!(!out.contains("read_file"), "read_file snapshot excluded: {out}");
+        assert!(
+            out.contains("execute_command"),
+            "command snapshot matched: {out}"
+        );
+        assert!(
+            !out.contains("read_file"),
+            "read_file snapshot excluded: {out}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

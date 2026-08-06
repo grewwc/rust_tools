@@ -89,7 +89,10 @@ impl Drop for SyncSubagentHistoryGuard {
             // 硬超时：保留子代理已写入的历史（改名而非删除），供父代理提取超时前证据。
             match history::preserve_subagent_history(&self.path) {
                 Some(preserved) => {
-                    eprintln!("[Warning] preserved sync subagent history at {}", preserved.display());
+                    eprintln!(
+                        "[Warning] preserved sync subagent history at {}",
+                        preserved.display()
+                    );
                 }
                 None => {
                     // 历史文件不存在（子代理尚未写入任何内容），按原逻辑清理。
@@ -217,11 +220,9 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     };
     // 硬超时前由父进程置位，guard Drop 时保留子代理历史（改名而非删除）。
     let preserve_history_on_timeout = Arc::new(AtomicBool::new(false));
-    let history_cleanup = SyncSubagentHistoryGuard::new(
-        child_history.clone(),
-        preserve_history_on_timeout.clone(),
-    )
-        .with_scoped_artifacts(private_memory_path.clone(), private_cwd_dir.clone());
+    let history_cleanup =
+        SyncSubagentHistoryGuard::new(child_history.clone(), preserve_history_on_timeout.clone())
+            .with_scoped_artifacts(private_memory_path.clone(), private_cwd_dir.clone());
     // 无论是否继承，子代理都只写自己的历史文件，绝不能写回父 canonical history。
     task_app.session_history_file = child_history.clone();
 
@@ -287,8 +288,9 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     // Slot used by the sub-agent's `finalize_turn` to publish its final
     // assistant text. Created here, scoped via `SUBAGENT_RESULT_SLOT` over
     // the spawned future, and read once the sub-agent returns.
-    let result_slot: runtime_ctx::SubagentResultSlot =
-        Arc::new(tokio::sync::Mutex::new(runtime_ctx::SubagentResult::default()));
+    let result_slot: runtime_ctx::SubagentResultSlot = Arc::new(tokio::sync::Mutex::new(
+        runtime_ctx::SubagentResult::default(),
+    ));
     let result_slot_for_scope = result_slot.clone();
     // Slot the sub-agent writes its current execution phase into; the wait
     // loop reads it to annotate the heartbeat line ("… · calling model").
@@ -587,10 +589,7 @@ async fn wait_for_sync_task_completion_with_wrap_up(
 /// 硬超时后把子代理已写入历史的工作产物提取出来，发布到 result slot。
 /// 父代理随后在失败结果里能看到超时前的证据节选与保留文件路径，而不是空结果
 /// （此前超时路径把 15 分钟的工作产物全部丢弃）。
-fn publish_timeout_evidence(
-    child_history: &Path,
-    result_slot: &runtime_ctx::SubagentResultSlot,
-) {
+fn publish_timeout_evidence(child_history: &Path, result_slot: &runtime_ctx::SubagentResultSlot) {
     let preserved = history::preserved_subagent_history_path(child_history);
     if !preserved.exists() {
         return;
@@ -607,8 +606,7 @@ fn publish_timeout_evidence(
         return;
     }
     let session_label = preserved.to_string_lossy();
-    let excerpt =
-        history::messages_to_markdown_capped(&messages, &session_label, 8000);
+    let excerpt = history::messages_to_markdown_capped(&messages, &session_label, 8000);
     let payload = format!(
         "[Timeout] 子代理已达到硬超时上限，未在限定时间内产出最终结论。\n\n\
          超时前已完成的工作产物已保留（完整历史）：\n{}\n\n\
@@ -771,7 +769,10 @@ mod tests {
 
         assert!(!phase.chars().any(char::is_control));
         assert!(!line.chars().any(char::is_control));
-        assert!(line.ends_with('…'), "long heartbeat should be truncated: {line}");
+        assert!(
+            line.ends_with('…'),
+            "long heartbeat should be truncated: {line}"
+        );
         assert!(unicode_width::UnicodeWidthStr::width(line.as_str()) <= 48);
         unsafe { std::env::remove_var("COLUMNS") };
     }

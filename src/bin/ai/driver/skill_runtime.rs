@@ -201,9 +201,10 @@ impl SkillTurnGuard {
         required_targets: &[PathBuf],
         observed_targets: &[PathBuf],
     ) {
-        if let Some(prompt) =
-            build_scoped_project_instruction_prompt_with_priority(required_targets, observed_targets)
-        {
+        if let Some(prompt) = build_scoped_project_instruction_prompt_with_priority(
+            required_targets,
+            observed_targets,
+        ) {
             self.push_section(ContextKind::Policy, &prompt);
         }
     }
@@ -1158,7 +1159,10 @@ fn build_system_prompt(
             lines.push("Call `task_wait` only when the parent is blocked on subagent results or has no productive independent work left. Keep its per-call timeout short (normally 30-60 seconds) and prefer `wait_policy=\"any\"` so the parent resumes on the first useful result.".to_string());
         }
         if has_tool(available_tools, "task_status") {
-            lines.push("Use `task_status` for a non-blocking peek while continuing parent-side work.".to_string());
+            lines.push(
+                "Use `task_status` for a non-blocking peek while continuing parent-side work."
+                    .to_string(),
+            );
             lines.push("Before finishing your answer, call `task_status` to confirm no spawned subagent is still running. Never silently drop a spawned task.".to_string());
         }
         if has_tool(available_tools, "task_integrate") {
@@ -2005,7 +2009,6 @@ mod tests {
         assert!(prompt.contains("do not batch reads or re-read evidence already visible"));
     }
 
-
     #[test]
     fn system_prompt_uses_success_criteria_for_normal_and_goal_convergence() {
         let available = SkipSet::new(16);
@@ -2050,9 +2053,7 @@ mod tests {
 
         assert!(prompt.contains("stop repeating that approach, not the whole task"));
         assert!(prompt.contains("Continue with a materially different safe recovery"));
-        assert!(!prompt.contains(
-            "after 3 failed attempts on the same issue, stop and report"
-        ));
+        assert!(!prompt.contains("after 3 failed attempts on the same issue, stop and report"));
     }
 
     #[test]

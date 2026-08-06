@@ -7,12 +7,12 @@ use super::{
     encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels, execute_task_cancel,
     execute_task_integrate, execute_task_retry, execute_task_spawn, execute_task_spawn_batch,
     execute_task_status, execute_task_wait, expire_task_wait_states_for_test,
-    format_task_result_with_id,
-    insert_task_entry_for_test, is_encoded_task_goal, is_retryable_task_status,
-    parse_task_wait_options, prepare_subagent_task, reap_timed_out_subagents, register_retry_spec,
-    remove_task_entry, render_outstanding_task_anchor, select_subagent,
-    validate_subagent_response, wait_sources_for_channel_and_futex, wake_expired_task_waits,
-    with_task_entry_by_pid, wrap_subagent_prompt,
+    format_task_result_with_id, insert_task_entry_for_test, is_encoded_task_goal,
+    is_retryable_task_status, parse_task_wait_options, prepare_subagent_task,
+    reap_timed_out_subagents, register_retry_spec, remove_task_entry,
+    render_outstanding_task_anchor, select_subagent, validate_subagent_response,
+    wait_sources_for_channel_and_futex, wake_expired_task_waits, with_task_entry_by_pid,
+    wrap_subagent_prompt,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 use crate::ai::cli::ParsedCli;
@@ -134,8 +134,8 @@ fn task_wait_hints_lone_spawn_and_consumes_hint_once() {
     super::reset_last_spawn_batch_for_test();
     super::record_last_spawn_batch(vec!["t-1".to_string()]);
 
-    let hint = super::lone_spawn_hint_note(&["t-1".to_string()])
-        .expect("lone spawn+wait should hint");
+    let hint =
+        super::lone_spawn_hint_note(&["t-1".to_string()]).expect("lone spawn+wait should hint");
     assert!(hint.contains("lone_spawn"));
     assert!(hint.contains("synchronous `task`"));
 

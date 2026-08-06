@@ -186,7 +186,8 @@ fn count_code_signals(note: &str) -> usize {
 
 fn count_artifact_signals(note: &str, tokens: &[String]) -> usize {
     let mut count = 0usize;
-    if note.contains(".rs") || note.contains(".ts") || note.contains(".py") || note.contains(".md") {
+    if note.contains(".rs") || note.contains(".ts") || note.contains(".py") || note.contains(".md")
+    {
         count += 1;
     }
     count += tokens

@@ -136,10 +136,7 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
             "background"
         };
 
-        let (summary, modified) = previews
-            .get(&s.session_id)
-            .cloned()
-            .unwrap_or((None, None));
+        let (summary, modified) = previews.get(&s.session_id).cloned().unwrap_or((None, None));
 
         println!("  [{tag:<11}]  pid={:<8}  session={}", s.pid, s.session_id);
         if let Some(m) = &modified {

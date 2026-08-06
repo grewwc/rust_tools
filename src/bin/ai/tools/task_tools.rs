@@ -827,8 +827,6 @@ pub(crate) fn epoll_wait_many_channels(
     epoll_wait_many(os, label, &sources, wait_policy, timeout_ticks)
 }
 
-
-
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task",
@@ -855,8 +853,6 @@ inventory::submit!(ToolHistoryPolicyRegistration {
 pub(crate) fn execute_task(_args: &Value) -> Result<String, String> {
     Err("task is handled by the runtime".to_string())
 }
-
-
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
@@ -911,8 +907,8 @@ fn wrap_subagent_prompt(
 ) -> String {
     let response_contract = response_schema
         .map(|schema| {
-            let schema = serde_json::to_string_pretty(schema)
-                .unwrap_or_else(|_| schema.to_string());
+            let schema =
+                serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string());
             format!(
                 "Required response contract:\n\
                  - Return exactly one JSON value matching the schema below.\n\
@@ -958,15 +954,13 @@ pub(crate) fn validate_subagent_response(
         return Ok(());
     };
     let instance: Value = serde_json::from_str(output.trim()).map_err(|error| {
-        format!(
-            "Subagent response is not valid JSON required by response_schema: {error}"
-        )
+        format!("Subagent response is not valid JSON required by response_schema: {error}")
     })?;
     let validator = jsonschema::validator_for(schema)
         .map_err(|error| format!("Invalid response_schema: {error}"))?;
-    validator.validate(&instance).map_err(|error| {
-        format!("Subagent response did not match response_schema: {error}")
-    })
+    validator
+        .validate(&instance)
+        .map_err(|error| format!("Subagent response did not match response_schema: {error}"))
 }
 
 /// Parse and validate a `task` / `task_spawn` tool call payload, run subagent
@@ -1155,13 +1149,10 @@ fn spawn_subagent_kernel_task_attempt(
             },
         );
     }
-    TASK_PROGRESS_REGISTRY
-        .lock()
-        .unwrap()
-        .insert(
-            task_id.clone(),
-            crate::ai::driver::runtime_ctx::new_subagent_progress_slot(),
-        );
+    TASK_PROGRESS_REGISTRY.lock().unwrap().insert(
+        task_id.clone(),
+        crate::ai::driver::runtime_ctx::new_subagent_progress_slot(),
+    );
     register_retry_spec(
         &task_id,
         crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
@@ -1345,7 +1336,6 @@ pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
     .expect("serializing task_spawn_batch result cannot fail"))
 }
 
-
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_retry",
@@ -1406,7 +1396,6 @@ fn execute_task_retry(args: &Value) -> Result<String, String> {
         record.prepared.inherit.describe()
     ))
 }
-
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
@@ -1895,7 +1884,6 @@ pub(crate) fn reap_timed_out_subagents() {
     });
 }
 
-
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_status",
@@ -1914,7 +1902,6 @@ inventory::submit!(ToolHistoryPolicyRegistration {
         counts_toward_precision_inline_budget: false,
     },
 });
-
 
 fn execute_task_integrate(args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_integrate")?;
@@ -1995,7 +1982,6 @@ inventory::submit!(ToolHistoryPolicyRegistration {
         counts_toward_precision_inline_budget: false,
     },
 });
-
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {

@@ -397,10 +397,9 @@ pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
             json!(["reasoning.encrypted_content"]),
         );
     }
-    if let Some(tools) = responses_tools(
-        request.tools.as_ref(),
-        request.enable_search == Some(true),
-    ) {
+    if let Some(tools) =
+        responses_tools(request.tools.as_ref(), request.enable_search == Some(true))
+    {
         object.insert("tools".to_string(), tools);
     }
     if let Some(tool_choice) = &request.tool_choice {

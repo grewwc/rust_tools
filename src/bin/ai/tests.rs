@@ -1253,7 +1253,6 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
     );
 }
 
-
 #[test]
 fn dedup_skips_byte_identical_overflow_archived_stubs() {
     // 回归测试（真实案例 session c0ad15e6，msg 471/472）：
@@ -1326,7 +1325,6 @@ fn dedup_skips_byte_identical_overflow_archived_stubs() {
         "all five overflow-archived stubs must be preserved so each keeps its own recall pointer"
     );
 }
-
 
 #[test]
 fn compression_spills_old_user_message_to_session_temp_file() {

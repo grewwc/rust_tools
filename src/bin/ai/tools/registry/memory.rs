@@ -5,7 +5,6 @@
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 use crate::ai::tools::service::knowledge_update::execute_knowledge_cache_manage;
 
-
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_cache_manage",

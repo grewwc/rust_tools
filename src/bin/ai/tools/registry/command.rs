@@ -7,7 +7,6 @@ use crate::ai::tools::common::{
 };
 use crate::ai::tools::service::command::execute_command;
 
-
 fn execute_command_streaming_registered(
     args: &Value,
     on_chunk: &mut crate::ai::tools::common::ToolStreamWriter<'_>,

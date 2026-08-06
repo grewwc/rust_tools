@@ -6,9 +6,9 @@
 //   /memo <text>       —— 把指定文本经模型整理后保存为 memo
 // =============================================================================
 
+use super::status_line::{clear_status, print_status, show_status};
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::types::App;
-use super::status_line::{clear_status, print_status, show_status};
 
 /// 判断输入是否为 `/memo` 命令；若是则异步执行保存，返回 `Ok(true)`。
 pub(crate) async fn try_handle_memo_command(
@@ -37,10 +37,7 @@ pub(crate) async fn try_handle_memo_command(
     Ok(true)
 }
 
-async fn execute_memo_save(
-    app: &mut App,
-    arg: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std::error::Error>> {
     let store = MemoryStore::from_env_or_config();
 
     // 1) 确定要保存的原始文本
@@ -51,7 +48,9 @@ async fn execute_memo_save(
         match last_assistant_conclusion(app)? {
             Some(text) => text,
             None => {
-                show_status("[memo] 未找到上一轮的模型结论，请先进行一次对话，或使用 /memo <text> 手动指定内容。");
+                show_status(
+                    "[memo] 未找到上一轮的模型结论，请先进行一次对话，或使用 /memo <text> 手动指定内容。",
+                );
                 return Ok(());
             }
         }
@@ -76,17 +75,18 @@ async fn execute_memo_save(
             "content": raw_text,
         }),
     ];
-    let note_content = match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
-        Ok(response) => crate::ai::request::extract_response_text(&response)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(raw_text.clone()),
-        Err(err) => {
-            clear_status();
-            show_status(&format!("[memo] 整理失败，保存原始输入: {}", err));
-            raw_text.clone()
-        }
-    };
+    let note_content =
+        match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
+            Ok(response) => crate::ai::request::extract_response_text(&response)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(raw_text.clone()),
+            Err(err) => {
+                clear_status();
+                show_status(&format!("[memo] 整理失败，保存原始输入: {}", err));
+                raw_text.clone()
+            }
+        };
 
     clear_status();
 
@@ -108,7 +108,11 @@ async fn execute_memo_save(
     match store.append(&entry) {
         Ok(()) => {
             let preview: String = note_content.chars().take(80).collect();
-            let suffix = if note_content.chars().count() > 80 { "..." } else { "" };
+            let suffix = if note_content.chars().count() > 80 {
+                "..."
+            } else {
+                ""
+            };
             show_status(&format!("[memo] 已保存: {}{}", preview, suffix));
         }
         Err(err) => {

@@ -10,10 +10,10 @@
 //!   PID 存活探测清理残留文件。
 //! - 文件内容仅为 PID 的十进制文本，与 `a -bg` 的 cwd PID 文件格式一致。
 
+use rustc_hash::FxHashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use rustc_hash::FxHashMap;
 
 /// 写入并管理 sessions 目录下的 `<session_id>.<pid>.pid` 文件。
 /// 创建时写入 PID，Drop 时删除文件。
@@ -223,7 +223,11 @@ pub(in crate::ai) fn discover_lsof_sessions(
         return Vec::new();
     }
     // lsof -p 接受逗号分隔的 PID 列表
-    let joined = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+    let joined = pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let output = match std::process::Command::new("lsof")
         .arg("-p")
         .arg(&joined)
@@ -313,9 +317,7 @@ pub(in crate::ai) fn list_a_pids() -> Vec<i32> {
     match output {
         Ok(o) => {
             let text = String::from_utf8_lossy(&o.stdout);
-            text.lines()
-                .filter_map(|l| l.trim().parse().ok())
-                .collect()
+            text.lines().filter_map(|l| l.trim().parse().ok()).collect()
         }
         Err(_) => {
             // pgrep 不可用时，回退到 ps：输出 pid + comm，过滤 comm=="a"

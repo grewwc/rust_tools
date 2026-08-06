@@ -26,7 +26,6 @@ const SKIP_DIRS: &[&str] = &[
 const MAX_ENTRIES: usize = 2000;
 const MAX_OUTPUT_CHARS: usize = 32_000;
 
-
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "tree",

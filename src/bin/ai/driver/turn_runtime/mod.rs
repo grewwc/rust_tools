@@ -31,10 +31,10 @@ mod tool_result;
 mod types;
 
 pub(super) use orchestrator::run_turn;
-pub(in crate::ai::driver) use tool_result::stale_patch_targets_from_messages;
 #[cfg(test)]
 use persistence::persist_pending_turn_messages;
 pub(crate) use prepare::QuestionShape;
+pub(in crate::ai::driver) use tool_result::stale_patch_targets_from_messages;
 #[cfg(test)]
 use tool_result::{prepare_recent_tool_result, prepare_tool_result};
 pub(super) use types::TurnOutcome;
@@ -96,10 +96,7 @@ pub(super) async fn maybe_generate_session_title(app: &super::App, run_in_backgr
     finalize::maybe_generate_session_title(app, run_in_background).await;
 }
 
-pub(super) async fn maybe_generate_session_title_for_input(
-    app: &super::App,
-    user_input: &str,
-) {
+pub(super) async fn maybe_generate_session_title_for_input(app: &super::App, user_input: &str) {
     finalize::maybe_generate_session_title_for_input(app, user_input).await;
 }
 
@@ -708,5 +705,4 @@ mod tests {
 
         let _ = store.delete_session(&app.session_id);
     }
-
 }

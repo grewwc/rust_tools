@@ -7,9 +7,9 @@
 
 use std::path::PathBuf;
 
+use super::status_line::show_status;
 use crate::ai::driver::input;
 use crate::ai::types::App;
-use super::status_line::show_status;
 
 pub fn try_handle_export_command(
     app: &mut App,
@@ -70,7 +70,10 @@ fn execute_export(app: &App, arg: &str) -> Result<(), Box<dyn std::error::Error>
     let display_path = target_path.display();
     let line_count = text.lines().count();
     let char_count = text.chars().count();
-    show_status(&format!("[export] 已导出到 {} ({} 行, {} 字符)", display_path, line_count, char_count));
+    show_status(&format!(
+        "[export] 已导出到 {} ({} 行, {} 字符)",
+        display_path, line_count, char_count
+    ));
 
     Ok(())
 }

@@ -66,12 +66,7 @@ pub(crate) fn log_path() -> Option<PathBuf> {
 /// 落在 session 运行时目录（assets / 子代理 scratch / checkpoint 等）下的路径直接
 /// 跳过——它们不是主 agent 的项目改动，不应污染审计视图。过大的 before/after 内容
 /// 会被截断，避免日志随会话无界增长。
-pub(crate) fn record(
-    path: &std::path::Path,
-    op: &str,
-    before: Option<&str>,
-    after: Option<&str>,
-) {
+pub(crate) fn record(path: &std::path::Path, op: &str, before: Option<&str>, after: Option<&str>) {
     let Some(assets_dir) = current_session_assets_dir() else {
         // 无活动 driver context（测试 / 一次性调用）：静默跳过。
         return;
@@ -130,12 +125,10 @@ fn append_entry(log_path: &std::path::Path, entry: &MutationEntry) {
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _guard = APPEND_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-    {
+    let _guard = APPEND_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
         // 单次 write_all：整行（含换行）一起写，配合 O_APPEND 原子追加。
         let _ = file.write_all(line.as_bytes());
     }
@@ -167,7 +160,12 @@ mod tests {
     #[test]
     fn record_is_safe_noop_without_driver_context() {
         // 无活动 driver context 时 record / read_all 必须静默空操作，绝不 panic。
-        record(std::path::Path::new("/tmp/nonexistent_audit_test.rs"), "write", None, Some("x"));
+        record(
+            std::path::Path::new("/tmp/nonexistent_audit_test.rs"),
+            "write",
+            None,
+            Some("x"),
+        );
         assert!(read_all().is_empty());
         assert!(log_path().is_none());
     }
@@ -177,7 +175,10 @@ mod tests {
         let assets = std::path::Path::new("/home/u/.history_file.sessions/abc.assets");
         assert!(should_skip(&assets.join("tmp/scratch.rs"), assets));
         assert!(should_skip(&assets.join("mutation_log.jsonl"), assets));
-        assert!(!should_skip(std::path::Path::new("/proj/src/main.rs"), assets));
+        assert!(!should_skip(
+            std::path::Path::new("/proj/src/main.rs"),
+            assets
+        ));
     }
 
     #[test]
@@ -187,10 +188,16 @@ mod tests {
         let assets = std::path::Path::new("/home/u/.history_file.sessions/abc.assets");
         let root = std::path::Path::new("/home/u/.history_file.sessions");
         assert!(should_skip(&root.join("subagent-cwd-t1/foo.rs"), assets));
-        assert!(should_skip(&root.join("checkpoints/abc/gen-1/x.sqlite"), assets));
+        assert!(should_skip(
+            &root.join("checkpoints/abc/gen-1/x.sqlite"),
+            assets
+        ));
         assert!(should_skip(&root.join("def.assets/tmp/y.rs"), assets));
         // sessions root 之外的真实项目改动仍要记录。
-        assert!(!should_skip(std::path::Path::new("/proj/src/main.rs"), assets));
+        assert!(!should_skip(
+            std::path::Path::new("/proj/src/main.rs"),
+            assets
+        ));
     }
 
     #[test]
@@ -249,7 +256,9 @@ mod tests {
 
     #[test]
     fn read_entries_returns_empty_for_missing_file() {
-        let entries = read_entries(std::path::Path::new("/nonexistent/.agent/mutation_log.jsonl"));
+        let entries = read_entries(std::path::Path::new(
+            "/nonexistent/.agent/mutation_log.jsonl",
+        ));
         assert!(entries.is_empty());
     }
 

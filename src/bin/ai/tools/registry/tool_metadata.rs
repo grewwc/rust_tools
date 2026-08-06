@@ -209,10 +209,7 @@ mod tests {
         let metadata = load_metadata();
         assert!(metadata.contains_key("read_file"));
         assert!(metadata["read_file"].description.contains("line-numbered"));
-        assert!(metadata["read_file"]
-            .parameters
-            .get("properties")
-            .is_some());
+        assert!(metadata["read_file"].parameters.get("properties").is_some());
         // 所有内置文件都应成功解析。
         assert_eq!(
             metadata.len(),
@@ -245,7 +242,7 @@ mod tests {
         // 注意：这里用 load_builtin_metadata()（不掺用户目录覆盖），并把内置
         // 清单按「文件名 stem」和「内部 name」分别建表，以暴露二者不一致。
         let metadata = load_builtin_metadata();
-        let mut missing = Vec::new();      // 注册了但无 JSON（或内部 name 不匹配）
+        let mut missing = Vec::new(); // 注册了但无 JSON（或内部 name 不匹配）
         let mut empty_desc = Vec::new();
         let mut bad_schema = Vec::new();
         for reg in inventory::iter::<ToolRegistration> {
@@ -258,8 +255,8 @@ mod tests {
                     }
                     // schema 合法：type=="object" 且 properties 是对象（可能为空对象）。
                     let props = entry.parameters.get("properties");
-                    let is_object_schema = entry.parameters.get("type").and_then(|v| v.as_str())
-                        == Some("object");
+                    let is_object_schema =
+                        entry.parameters.get("type").and_then(|v| v.as_str()) == Some("object");
                     if !(is_object_schema && props.map(|v| v.is_object()).unwrap_or(false)) {
                         bad_schema.push(name.to_string());
                     }

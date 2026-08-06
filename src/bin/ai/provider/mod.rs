@@ -178,10 +178,7 @@ mod tests {
             ReasoningEffort::parse("extra-high"),
             Some(ReasoningEffort::XHigh)
         );
-        assert_eq!(
-            ReasoningEffort::parse("max"),
-            Some(ReasoningEffort::Max)
-        );
+        assert_eq!(ReasoningEffort::parse("max"), Some(ReasoningEffort::Max));
         assert_eq!(
             ReasoningEffort::parse("MAXIMUM"),
             Some(ReasoningEffort::Max)

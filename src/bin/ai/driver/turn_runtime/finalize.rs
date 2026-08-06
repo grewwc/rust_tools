@@ -201,9 +201,8 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
     let task_app = app.clone();
     let session_id = task_app.session_id.clone();
     // 后台任务不拥有前台终端：压缩的告警/日志不得抢占前台输出光标。
-    tokio::spawn(crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(
-        true,
-        async move {
+    tokio::spawn(
+        crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, async move {
             let compact_result = if at_boundary {
                 compact_session_history_at_boundary_with_app(&task_app).await
             } else {
@@ -213,8 +212,8 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
                 eprintln!("[Warning] Failed to compact persisted history: {}", err);
             }
             mark_session_compaction_finished(&session_id);
-        },
-    ));
+        }),
+    );
 }
 
 /// 收尾阶段的持久化压缩派发。交互式 turn 走后台（不阻塞前台回到 prompt）；
@@ -242,7 +241,10 @@ fn session_title_messages(
     mut persisted_messages: Vec<Message>,
     pending_user_input: Option<&str>,
 ) -> Vec<Message> {
-    let Some(user_input) = pending_user_input.map(str::trim).filter(|input| !input.is_empty()) else {
+    let Some(user_input) = pending_user_input
+        .map(str::trim)
+        .filter(|input| !input.is_empty())
+    else {
         return persisted_messages;
     };
 

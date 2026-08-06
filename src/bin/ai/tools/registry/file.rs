@@ -6,8 +6,6 @@ use crate::ai::tools::service::file::{
     execute_read_file, execute_write_file, execute_write_file_streaming,
 };
 
-
-
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "read_file",

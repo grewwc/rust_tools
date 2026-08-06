@@ -1367,8 +1367,14 @@ mod tests {
         );
         assert_eq!(cleaned, "");
         let mut it = events.into_iter();
-        assert_eq!(it.next(), Some(InternalToolCallStreamEvent::Begin("enable_tools".to_string())));
-        let InternalToolCallStreamEvent::Args(args) = it.next().expect("expected args event") else {
+        assert_eq!(
+            it.next(),
+            Some(InternalToolCallStreamEvent::Begin(
+                "enable_tools".to_string()
+            ))
+        );
+        let InternalToolCallStreamEvent::Args(args) = it.next().expect("expected args event")
+        else {
             panic!("expected args event");
         };
         let parsed: serde_json::Value = serde_json::from_str(&args).unwrap();

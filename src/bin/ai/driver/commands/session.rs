@@ -355,8 +355,8 @@ pub fn try_handle_session_command(
         "list" | "ls" | "" | "verbose" => {
             // 默认不递归统计每个 session 的大小（assets 递归是 `/ss` 的唯一重活）；
             // 只有显式 `verbose`（`/ss verbose` 或 `/ss list verbose`）才并行统计。
-            let verbose = action == "verbose"
-                || parts.next().map(|t| t == "verbose").unwrap_or(false);
+            let verbose =
+                action == "verbose" || parts.next().map(|t| t == "verbose").unwrap_or(false);
             let mut sessions = store.list_sessions()?;
             if verbose {
                 // 大小按需并行统计：list_sessions 只读元数据，assets 递归统计放到这里多核并行。
@@ -403,8 +403,7 @@ pub fn try_handle_session_command(
             println!("history: {}", app.session_history_file.display());
             // 显示 session 摘要
             // 只读当前 session 的预览，避免扫描并统计全部 session。
-            if let Ok(Some((summary, modified_local))) =
-                store.read_session_preview(&app.session_id)
+            if let Ok(Some((summary, modified_local))) = store.read_session_preview(&app.session_id)
             {
                 if let Some(summary) = &summary {
                     println!("summary: {}", summary);
@@ -1176,9 +1175,7 @@ mod tests {
         );
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((source_session_id, 1), async {
-                assert!(
-                    crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty()
-                );
+                assert!(crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty());
             })
             .await;
         let _ = fs::remove_dir_all(root);
@@ -1333,9 +1330,7 @@ mod tests {
         assert!(app.forced_question.is_none());
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((source_session_id, 1), async {
-                assert!(
-                    crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty()
-                );
+                assert!(crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty());
             })
             .await;
         let _ = fs::remove_dir_all(root);

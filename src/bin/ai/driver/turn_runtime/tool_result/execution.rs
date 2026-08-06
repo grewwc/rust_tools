@@ -2644,16 +2644,15 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     &app.stale_patch_targets,
                     &tool_call_execution.stream_result.tool_calls,
                 );
-            let scoped_preflight_targets = if !*force_final_response
-                && !patch_retry_needs_fresh_read
-            {
-                mutation_scoped_instruction_preflight_targets(
-                    messages,
-                    &tool_call_execution.stream_result.tool_calls,
-                )
-            } else {
-                Vec::new()
-            };
+            let scoped_preflight_targets =
+                if !*force_final_response && !patch_retry_needs_fresh_read {
+                    mutation_scoped_instruction_preflight_targets(
+                        messages,
+                        &tool_call_execution.stream_result.tool_calls,
+                    )
+                } else {
+                    Vec::new()
+                };
             let scoped_preflight_needed = !scoped_preflight_targets.is_empty();
             let rejection_reason = if *force_final_response {
                 Some(ToolCallRejectionReason::NoToolHandoff)

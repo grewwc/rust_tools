@@ -25,8 +25,12 @@ pub fn print_interactive_help() {
     println!("    /share [output.md]        export current session as shareable markdown");
     println!("    /close                    close and delete current session, then exit");
     println!("    /proc                     show running sessions (interactive + background)");
-    println!("    /memo [text]              save last assistant conclusion (or given text) as memo to knowledge base");
-    println!("    /export [file.md]         save last assistant conclusion to a markdown file (default: _summary.md)");
+    println!(
+        "    /memo [text]              save last assistant conclusion (or given text) as memo to knowledge base"
+    );
+    println!(
+        "    /export [file.md]         save last assistant conclusion to a markdown file (default: _summary.md)"
+    );
     println!(
         "    /goal [target]            enter goal mode: agent persists until the goal is done"
     );
@@ -55,7 +59,9 @@ pub fn print_interactive_help() {
     println!("    /sessions current         show current session info");
     println!("    /sessions new             create and switch to new session");
     println!("    /sessions use <id>        switch to specified session");
-    println!("    /fork                     fork current session into a new branch (keeps original) and switch");
+    println!(
+        "    /fork                     fork current session into a new branch (keeps original) and switch"
+    );
     println!("    /sessions suspend         suspend current session and return to shell");
     println!("    /sessions bound           list suspended sessions bound to current terminal");
     println!("    /sessions delete <id> [more...]     delete one or more sessions");

@@ -513,8 +513,14 @@ fn recover_inline_tool_calls_respects_anthropic_string_attr() {
     assert_eq!(calls.len(), 1);
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
     assert_eq!(args["operation"], "enable");
-    assert_eq!(args["dry_run"], "true", "string=\"true\" must keep 'true' as string");
-    assert_eq!(args["count"], "123", "string=\"true\" must keep '123' as string");
+    assert_eq!(
+        args["dry_run"], "true",
+        "string=\"true\" must keep 'true' as string"
+    );
+    assert_eq!(
+        args["count"], "123",
+        "string=\"true\" must keep '123' as string"
+    );
     assert_eq!(args["tools"][0], "a");
     assert_eq!(args["tools"][1], "b");
 }
@@ -550,7 +556,10 @@ fn recover_inline_tool_calls_respects_anthropic_xml_string_attr() {
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
     // string="true" -> "enable" 必须是字符串，不得被当成标识符。
     assert_eq!(args["operation"], "enable");
-    assert!(args["operation"].is_string(), "string=\"true\" 必须保持字符串");
+    assert!(
+        args["operation"].is_string(),
+        "string=\"true\" 必须保持字符串"
+    );
     // string="false" -> 数组 JSON 正常解析。
     assert_eq!(args["tools"][0], "mcp_excel_open_workbook");
 }
@@ -576,10 +585,20 @@ fn recover_inline_tool_calls_handles_anthropic_xml_string_true_attr() {
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
     assert_eq!(args["operation"], "enable", "string=true -> 字符串");
     assert!(args["operation"].is_string());
-    assert_eq!(args["tools"], serde_json::json!(["read_file", "write_file"]), "string=false -> 原生 JSON 数组");
-    assert_eq!(args["verbose"], "true", "看起来像 bool 但 string=true -> 字符串 \"true\"");
+    assert_eq!(
+        args["tools"],
+        serde_json::json!(["read_file", "write_file"]),
+        "string=false -> 原生 JSON 数组"
+    );
+    assert_eq!(
+        args["verbose"], "true",
+        "看起来像 bool 但 string=true -> 字符串 \"true\""
+    );
     assert!(args["verbose"].is_string());
-    assert_eq!(args["count"], "123", "看起来像数字但 string=true -> 字符串 \"123\"");
+    assert_eq!(
+        args["count"], "123",
+        "看起来像数字但 string=true -> 字符串 \"123\""
+    );
     assert!(args["count"].is_string());
 }
 

@@ -122,7 +122,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-
 fn execute_sleep_process(args: &Value) -> Result<String, String> {
     let turns = args["turns"].as_u64().unwrap_or(1);
     if let Ok(guard) = GLOBAL_OS.lock() {
@@ -179,7 +178,6 @@ inventory::submit!(ToolRegistration {
         groups: &["builtin", "executor"],
     }
 });
-
 
 fn execute_kill_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"]
@@ -241,7 +239,6 @@ inventory::submit!(ToolRegistration {
         groups: &["builtin", "executor"],
     }
 });
-
 
 fn execute_reap_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"]
@@ -322,7 +319,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-
 fn execute_ps_processes(_args: &Value) -> Result<String, String> {
     if let Ok(guard) = GLOBAL_OS.lock() {
         if let Some(os) = guard.as_ref() {
@@ -387,7 +383,6 @@ inventory::submit!(ToolRegistration {
         groups: &["builtin", "executor"],
     }
 });
-
 
 fn is_hanging_channel(snapshot: &ChannelMetaSnapshot) -> bool {
     snapshot.ref_count > 0 || snapshot.queued_len > 0 || !snapshot.closed
@@ -471,7 +466,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-
 fn execute_signal_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"]
         .as_u64()
@@ -519,7 +513,6 @@ inventory::submit!(ToolRegistration {
 
 // --- Process Group ---
 
-
 fn execute_set_process_group(args: &Value) -> Result<String, String> {
     let pid = args["pid"].as_u64().ok_or("Missing 'pid'.")?;
     let pgid = args["pgid"].as_u64().ok_or("Missing 'pgid'.")?;
@@ -542,7 +535,6 @@ inventory::submit!(ToolRegistration {
         groups: &["builtin", "executor"],
     }
 });
-
 
 fn execute_signal_process_group(args: &Value) -> Result<String, String> {
     let pgid = args["pgid"].as_u64().ok_or("Missing 'pgid'.")?;
@@ -581,7 +573,6 @@ inventory::submit!(ToolRegistration {
 
 // --- Shared Memory IPC ---
 
-
 fn execute_shm_create(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'.")?;
     let value = args["value"].as_str().ok_or("Missing 'value'.")?;
@@ -604,7 +595,6 @@ inventory::submit!(ToolRegistration {
         groups: &["builtin", "executor"],
     }
 });
-
 
 fn execute_shm_read(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'.")?;
@@ -660,7 +650,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-
 fn execute_shm_write(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'.")?;
     let value = args["value"].as_str().ok_or("Missing 'value'.")?;
@@ -683,7 +672,6 @@ inventory::submit!(ToolRegistration {
         groups: &["builtin", "executor"],
     }
 });
-
 
 fn execute_shm_delete(args: &Value) -> Result<String, String> {
     let key = args["key"].as_str().ok_or("Missing 'key'.")?;
@@ -709,7 +697,6 @@ inventory::submit!(ToolRegistration {
 
 // --- Working Directory ---
 
-
 fn execute_set_working_dir(args: &Value) -> Result<String, String> {
     let dir = args["dir"].as_str().ok_or("Missing 'dir'.")?;
     if let Ok(guard) = GLOBAL_OS.lock() {
@@ -733,7 +720,6 @@ inventory::submit!(ToolRegistration {
 });
 
 // --- Daemon Process ---
-
 
 fn execute_spawn_daemon(args: &Value) -> Result<String, String> {
     let name = args["name"].as_str().ok_or("Missing 'name'.")?;
@@ -857,8 +843,8 @@ mod tests {
     #[test]
     fn spawn_process_schema_exposes_signal_capability() {
         assert_eq!(
-            crate::ai::tools::registry::tool_metadata::tool_parameters("spawn_process")
-                ["properties"]["capabilities"]["properties"]["signal"],
+            crate::ai::tools::registry::tool_metadata::tool_parameters("spawn_process")["properties"]
+                ["capabilities"]["properties"]["signal"],
             serde_json::json!({ "type": "boolean" })
         );
     }

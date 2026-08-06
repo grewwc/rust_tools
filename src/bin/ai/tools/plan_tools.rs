@@ -7,7 +7,6 @@ use crate::ai::tools::common::{
     ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
 };
 
-
 fn execute_plan(args: &Value) -> Result<String, String> {
     let steps = args["steps"]
         .as_array()

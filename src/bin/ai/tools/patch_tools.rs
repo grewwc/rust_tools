@@ -15,7 +15,6 @@ use crate::ai::tools::common::ToolStreamingRegistration;
 use crate::ai::tools::storage::file_store::FileStore;
 use crate::ai::tools::storage::temp_registry;
 
-
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
@@ -2254,7 +2253,10 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
             }
             emit(&format!("reading patch from {}", resolved.display()));
             let content = store.read_to_string().map_err(|err| {
-                format!("patch_file '{}' could not be read: {err}", resolved.display())
+                format!(
+                    "patch_file '{}' could not be read: {err}",
+                    resolved.display()
+                )
             })?;
             (content, true)
         }
@@ -2454,16 +2456,15 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
                 })?;
                 writes[write_idx].action = action;
             } else {
-                let write = prepare_patch_write_from_section(&path, &store, section).map_err(
-                    |err| {
+                let write =
+                    prepare_patch_write_from_section(&path, &store, section).map_err(|err| {
                         format!(
                             "[section {}/{}] failed while preparing patch for {}: {err}",
                             idx + 1,
                             sections.len(),
                             path.display()
                         )
-                    },
-                )?;
+                    })?;
                 write_indexes.insert(path.clone(), writes.len());
                 writes.push(write);
             }
@@ -2569,8 +2570,8 @@ mod tests {
     use super::{
         PatchEnvelopeOp, apply_inline_replace, apply_patch_target_paths_from_patch,
         apply_unified_patch, execute_apply_patch, file_path_from_unified_diff_header,
-        parse_patch_envelope, parse_patch_envelopes,
-        parse_unified_diff_header_target, parse_unified_hunks, strip_code_fence,
+        parse_patch_envelope, parse_patch_envelopes, parse_unified_diff_header_target,
+        parse_unified_hunks, strip_code_fence,
     };
     use crate::ai::test_support::ENV_LOCK;
     use std::{fs, path::PathBuf};
@@ -2983,14 +2984,15 @@ mod tests {
     /// patch_file 指向 cwd 之外且未登记在 temp registry 的路径必须被明确拒绝。
     #[test]
     fn apply_patch_rejects_patch_file_outside_cwd_and_registry() {
-        let outside = std::env::temp_dir().join(format!(
-            "ai_patch_outside_{}.patch",
-            uuid::Uuid::new_v4()
-        ));
+        let outside =
+            std::env::temp_dir().join(format!("ai_patch_outside_{}.patch", uuid::Uuid::new_v4()));
         std::fs::write(&outside, "@@ -1,1 +1,1 @@\n-foo\n+bar\n").unwrap();
         let args = serde_json::json!({ "patch_file": outside.to_string_lossy() });
         let err = execute_apply_patch(&args).unwrap_err();
-        assert!(err.contains("not an allowed patch source"), "err was: {err}");
+        assert!(
+            err.contains("not an allowed patch source"),
+            "err was: {err}"
+        );
     }
 
     /// context mismatch 且文件里完全找不到部分匹配时（no-partial-match 分支），

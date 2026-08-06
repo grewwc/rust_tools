@@ -257,12 +257,10 @@ mod tests {
 
     #[test]
     fn accepts_external_skill_manifest_event() {
-        let roots = vec![PathBuf::from(
-            "/tmp/.trae-cn/extensions/pylance/skills",
-        )];
-        let event = Event::new(EventKind::Any).add_path(
-            PathBuf::from("/tmp/.trae-cn/extensions/pylance/skills/refactor/SKILL.md"),
-        );
+        let roots = vec![PathBuf::from("/tmp/.trae-cn/extensions/pylance/skills")];
+        let event = Event::new(EventKind::Any).add_path(PathBuf::from(
+            "/tmp/.trae-cn/extensions/pylance/skills/refactor/SKILL.md",
+        ));
 
         assert!(is_relevant_skill_event(
             &event,

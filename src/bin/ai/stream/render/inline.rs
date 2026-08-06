@@ -165,14 +165,17 @@ fn starts_clickable_terminal_target(s: &str, mut start: usize) -> bool {
 
     let end = s[start..]
         .char_indices()
-        .find_map(|(offset, ch)| (!ch.is_ascii() || ch.is_ascii_whitespace()).then_some(start + offset))
+        .find_map(|(offset, ch)| {
+            (!ch.is_ascii() || ch.is_ascii_whitespace()).then_some(start + offset)
+        })
         .unwrap_or(s.len());
     is_clickable_terminal_target(&s[start..end])
 }
 
 fn is_clickable_terminal_target(token: &str) -> bool {
     let token = token.trim_end_matches(['.', ',', ';', ':', ')', ']']);
-    if token.starts_with("https://") || token.starts_with("http://") || token.starts_with("file://") {
+    if token.starts_with("https://") || token.starts_with("http://") || token.starts_with("file://")
+    {
         return true;
     }
 

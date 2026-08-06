@@ -57,7 +57,6 @@ pub(crate) fn take_pending_user_input_request() -> bool {
         .unwrap_or(false)
 }
 
-
 pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
     let name = args["name"].as_str().unwrap_or("").trim();
     if name.is_empty() {
@@ -86,7 +85,6 @@ pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
         skill.name
     ))
 }
-
 
 /// 标记当前 skill 正在等待用户输入。工具结果仅供模型接续生成面向用户的问题；
 /// 真正的跨轮状态由 driver 在本 turn 结束时保存，避免工具层直接修改会话状态。
@@ -132,7 +130,6 @@ inventory::submit!(ToolRegistration {
 
 const DEFAULT_SKILL_LIST_LIMIT: usize = 50;
 const MAX_SKILL_LIST_LIMIT: usize = 100;
-
 
 fn skill_list_limit(args: &Value) -> usize {
     args["limit"]
@@ -207,7 +204,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-
 /// 渲染 load_skill 的返回：头部元信息 + skill 正文（+ 可选 bundled 资源目录）。
 fn render_loaded_skill(skill: &SkillManifest) -> String {
     let mut out = String::new();
@@ -275,7 +271,6 @@ inventory::submit!(ToolRegistration {
         groups: &["builtin"],
     }
 });
-
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
@@ -519,10 +514,7 @@ mod tests {
             activate_spec.name,
             activate_spec.description,
         );
-        assert!(
-            activate_skill
-                .contains("proactively use `list_skills`")
-        );
+        assert!(activate_skill.contains("proactively use `list_skills`"));
         assert!(activate_skill.contains("technical keywords"));
     }
 

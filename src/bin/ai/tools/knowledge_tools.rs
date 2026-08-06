@@ -74,7 +74,6 @@ fn rag_timestamp_for_entry(entry: &AgentMemoryEntry) -> u64 {
 
 // ─── knowledge_save ──────────────────────────────────────────────────────────
 
-
 fn execute_knowledge_save(args: &Value) -> Result<String, String> {
     let prepared = prepare_memory_save_entry(
         args,
@@ -203,7 +202,6 @@ inventory::submit!(ToolRegistration {
 
 // ─── knowledge_forget ────────────────────────────────────────────────────────
 
-
 fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
     let id = args["id"]
         .as_str()
@@ -268,7 +266,6 @@ inventory::submit!(ToolRegistration {
 });
 
 // ─── knowledge_search ────────────────────────────────────────────────────────
-
 
 fn execute_knowledge_search(args: &Value) -> Result<String, String> {
     let query = args["query"]
@@ -344,7 +341,6 @@ inventory::submit!(ToolRegistration {
 });
 
 // ─── knowledge_list ──────────────────────────────────────────────────────────
-
 
 fn execute_knowledge_list(args: &Value) -> Result<String, String> {
     let limit = args["limit"]
@@ -441,7 +437,6 @@ inventory::submit!(ToolRegistration {
 });
 
 // ─── knowledge_consolidate ─────────────────────────────────────────────────
-
 
 fn execute_knowledge_consolidate(args: &Value) -> Result<String, String> {
     let action = args["action"].as_str().ok_or("Missing 'action'.")?;
@@ -696,8 +691,7 @@ mod tests {
 
     #[test]
     fn test_knowledge_save_params() {
-        let params =
-            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_save");
+        let params = crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_save");
         assert!(
             params["required"]
                 .as_array()
@@ -709,8 +703,7 @@ mod tests {
 
     #[test]
     fn test_knowledge_forget_params() {
-        let params =
-            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_forget");
+        let params = crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_forget");
         assert!(
             params["required"]
                 .as_array()
@@ -721,8 +714,7 @@ mod tests {
 
     #[test]
     fn test_knowledge_search_params() {
-        let params =
-            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_search");
+        let params = crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_search");
         assert!(
             params["required"]
                 .as_array()
@@ -808,8 +800,7 @@ mod tests {
 
     #[test]
     fn test_knowledge_list_params() {
-        let params =
-            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_list");
+        let params = crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_list");
         // limit is optional, so no required
         assert!(
             params["required"]

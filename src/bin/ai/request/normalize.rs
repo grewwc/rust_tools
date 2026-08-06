@@ -19,16 +19,13 @@ use crate::ai::types::App;
 const IMAGE_PLACEHOLDER: &str = "[image omitted]";
 const HISTORY_SUMMARY_CONTEXT_HEADER: &str = "[Compressed history summary for task continuity. Use it to continue earlier work without rediscovering context. \
 Do not rerun tools solely because information is summarized; verify a factual claim only when the current decision needs exact evidence and no cited source already establishes it.]";
-const MODEL_SELF_NOTE_CONTEXT_HEADER: &str =
-    "[Model-authored note from an earlier turn; this is not authoritative evidence. \
+const MODEL_SELF_NOTE_CONTEXT_HEADER: &str = "[Model-authored note from an earlier turn; this is not authoritative evidence. \
 Treat every claim as unverified unless it is backed by tool output or a cited source, \
 and re-check it before using it as a conclusion.]";
-const DERIVED_CONTEXT_HANDOFF: &str =
-    "[Runtime context handoff, not a new end-user request. The next assistant message contains \
+const DERIVED_CONTEXT_HANDOFF: &str = "[Runtime context handoff, not a new end-user request. The next assistant message contains \
 derived context from earlier turns. Use it only as described there, then continue to the latest \
 actual user request later in this conversation.]";
-const DERIVED_CONTEXT_RETURN: &str =
-    "[Runtime context handoff complete, not a new end-user request. Continue with the next recorded \
+const DERIVED_CONTEXT_RETURN: &str = "[Runtime context handoff complete, not a new end-user request. Continue with the next recorded \
 conversation message and ultimately follow the latest actual user request.]";
 
 fn flatten_multimodal_content_to_text(content: &Value) -> Option<String> {
@@ -931,12 +928,27 @@ mod resolved_tool_failure_tests {
 
         fold_resolved_tool_failures(&mut projected, &outcomes);
 
-        assert!(projected[0].content.as_str().unwrap().starts_with("[resolved tool failure:"));
-        assert!(projected[1].content.as_str().unwrap().starts_with("[resolved tool failure:"));
+        assert!(
+            projected[0]
+                .content
+                .as_str()
+                .unwrap()
+                .starts_with("[resolved tool failure:")
+        );
+        assert!(
+            projected[1]
+                .content
+                .as_str()
+                .unwrap()
+                .starts_with("[resolved tool failure:")
+        );
         assert_eq!(projected[2].content, original[2].content);
         assert_eq!(projected[3].content, original[3].content);
         assert_eq!(projected[4].content, original[4].content);
-        assert_eq!(original[0].content, Value::String("Error: first diagnostic".to_string()));
+        assert_eq!(
+            original[0].content,
+            Value::String("Error: first diagnostic".to_string())
+        );
         assert_eq!(projected[0].role, "tool");
         assert_eq!(projected[0].tool_call_id.as_deref(), Some("fail-1"));
     }

@@ -1,6 +1,6 @@
 use super::{
-    CachedFileFingerprint, TOOL_CACHE_TTL_MINUTES, ToolCachePayload, ToolFailureKind,
-    ToolRoute, build_tool_cache_key, classify_tool_error, collect_tool_cache_file_fingerprints,
+    CachedFileFingerprint, TOOL_CACHE_TTL_MINUTES, ToolCachePayload, ToolFailureKind, ToolRoute,
+    build_tool_cache_key, classify_tool_error, collect_tool_cache_file_fingerprints,
     execute_tool_calls, execute_with_safe_retry, is_cacheable_tool_name,
     is_parallel_safe_tool_call, is_tool_cache_entry_fresh, parallel_safe_batch_len,
     should_retry_once, should_store_or_load_tool_cache, tool_cache_validation_matches,
@@ -23,7 +23,10 @@ fn subagent_tool_phase_includes_file_target_without_rendering() {
         super::subagent_tool_phase("read_file", &args),
         "using read_file · /repo/src/main.rs"
     );
-    assert_eq!(super::subagent_tool_phase("task_status", &json!({})), "using task_status");
+    assert_eq!(
+        super::subagent_tool_phase("task_status", &json!({})),
+        "using task_status"
+    );
 }
 
 #[test]
@@ -45,15 +48,20 @@ fn execution_signature_canonicalizes_arguments_and_tracks_environment() {
         },
     };
 
-    let first = super::tool_execution_outcome("session", "/repo", &ToolRoute::Builtin, &first, false);
-    let second = super::tool_execution_outcome("session", "/repo", &ToolRoute::Builtin, &second, true);
+    let first =
+        super::tool_execution_outcome("session", "/repo", &ToolRoute::Builtin, &first, false);
+    let second =
+        super::tool_execution_outcome("session", "/repo", &ToolRoute::Builtin, &second, true);
     assert_eq!(first.execution_signature, second.execution_signature);
 
     let different_cwd = super::tool_execution_outcome(
         "session",
         "/other",
         &ToolRoute::Builtin,
-        &ToolCall { id: "third".to_string(), ..first_tool_call() },
+        &ToolCall {
+            id: "third".to_string(),
+            ..first_tool_call()
+        },
         true,
     );
     assert_ne!(first.execution_signature, different_cwd.execution_signature);

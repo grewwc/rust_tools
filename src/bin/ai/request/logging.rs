@@ -63,9 +63,7 @@ impl TransientStatusLine {
             let _ = write!(std::io::stderr(), "\r\x1b[2K\x1b[2m{text}\x1b[0m");
             let _ = std::io::stderr().flush();
             self.visible = true;
-        } else if text != self.last_text
-            && self.last_emitted.elapsed() >= MIN_NON_TTY_INTERVAL
-        {
+        } else if text != self.last_text && self.last_emitted.elapsed() >= MIN_NON_TTY_INTERVAL {
             eprintln!("[Info] {text}");
             self.last_emitted = std::time::Instant::now();
         }

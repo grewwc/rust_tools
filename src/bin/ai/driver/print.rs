@@ -143,8 +143,14 @@ pub(in crate::ai) fn format_tool_status_with_file_target(
         format!(
             "{}  {}·{} {}{}{} {}{}{}",
             status_line,
-            ACCENT_MUTED, RESET, ACCENT_SECONDARY, path_part, RESET,
-            ACCENT_COMMAND, line_part, RESET,
+            ACCENT_MUTED,
+            RESET,
+            ACCENT_SECONDARY,
+            path_part,
+            RESET,
+            ACCENT_COMMAND,
+            line_part,
+            RESET,
         )
     } else {
         format!(

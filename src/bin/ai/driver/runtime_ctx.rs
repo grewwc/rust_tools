@@ -192,10 +192,7 @@ pub(crate) fn is_resume_turn() -> bool {
 
 /// 把父侧 payload 与原始最终正文一起发布到 active result slot。顶层前台
 /// turn 没有安装 slot 时静默跳过。
-pub(crate) async fn publish_subagent_result(
-    parent_payload: &str,
-    final_assistant_text: &str,
-) {
+pub(crate) async fn publish_subagent_result(parent_payload: &str, final_assistant_text: &str) {
     if parent_payload.trim().is_empty() {
         return;
     }
@@ -216,7 +213,9 @@ pub(crate) fn has_subagent_result_slot() -> bool {
 
 /// 当前任务是否拥有 terminal 输出权。默认允许；后台 subagent 作用域显式关闭。
 pub(crate) fn terminal_output_enabled() -> bool {
-    !SUPPRESS_TERMINAL_OUTPUT.try_with(|value| *value).unwrap_or(false)
+    !SUPPRESS_TERMINAL_OUTPUT
+        .try_with(|value| *value)
+        .unwrap_or(false)
 }
 
 /// Publish the sub-agent's current execution phase into the active phase
@@ -438,7 +437,10 @@ mod tests {
             subagent_progress_snapshot(&slot)
         });
 
-        assert_eq!(rendered.as_deref(), Some("calling model · plan: inspect the task path"));
+        assert_eq!(
+            rendered.as_deref(),
+            Some("calling model · plan: inspect the task path")
+        );
     }
 
     #[tokio::test]
@@ -455,7 +457,11 @@ mod tests {
             .await;
 
         let result = slot.lock().await.clone();
-        assert!(result.parent_payload.starts_with("[Subagent tool evidence]"));
+        assert!(
+            result
+                .parent_payload
+                .starts_with("[Subagent tool evidence]")
+        );
         assert_eq!(result.final_assistant_text, "{\"ok\":true}");
     }
 

@@ -1,7 +1,7 @@
 use ratatui::{
     layout::Alignment,
-    layout::Rect,
     layout::Position,
+    layout::Rect,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -556,7 +556,7 @@ mod tests {
         backend::TestBackend,
         layout::{Position, Rect},
     };
-    use tui_textarea::{TextArea, CursorMove};
+    use tui_textarea::{CursorMove, TextArea};
     use unicode_width::UnicodeWidthStr;
 
     fn display_width(s: &str) -> usize {

@@ -617,7 +617,10 @@ fn truncating_reasoning_refuses_empty_preview_stub_for_long_archive_paths() {
         100,
         Some(overflow_dir.as_path()),
     ));
-    assert_eq!(message.reasoning_content.as_deref(), Some(reasoning.as_str()));
+    assert_eq!(
+        message.reasoning_content.as_deref(),
+        Some(reasoning.as_str())
+    );
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
 

@@ -781,7 +781,10 @@ async fn consolidate_scope(
     delete_id_set.extend(merge_delete_ids);
 
     if delete_id_set.is_empty() && new_entries.is_empty() {
-        println!("✅ [{}] Already well-organized. Nothing to change.", scope.label());
+        println!(
+            "✅ [{}] Already well-organized. Nothing to change.",
+            scope.label()
+        );
         return Ok(());
     }
 
@@ -882,17 +885,14 @@ pub(super) async fn handle_note_delete(
     };
 
     // 检索候选条目。
-    let candidates = match crate::ai::tools::service::memory::search_memo_candidates(
-        &query,
-        10,
-        false,
-    ) {
-        Ok(c) => c,
-        Err(err) => {
-            eprintln!("[note-delete] 检索失败: {}", err);
-            return Err(err.into());
-        }
-    };
+    let candidates =
+        match crate::ai::tools::service::memory::search_memo_candidates(&query, 10, false) {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("[note-delete] 检索失败: {}", err);
+                return Err(err.into());
+            }
+        };
     if candidates.is_empty() {
         println!(
             "[note-delete] 没有找到与「{}」相关的可删除 memo 条目。",
@@ -1106,18 +1106,15 @@ pub(super) async fn handle_note_edit(
     let spinner = SearchSpinner::start("匹配知识库条目");
 
     // 检索候选条目。
-    let candidates = match crate::ai::tools::service::memory::search_memo_candidates(
-        &query,
-        10,
-        false,
-    ) {
-        Ok(c) => c,
-        Err(err) => {
-            spinner.stop();
-            eprintln!("{NE} 检索失败: {}", err);
-            return Err(err.into());
-        }
-    };
+    let candidates =
+        match crate::ai::tools::service::memory::search_memo_candidates(&query, 10, false) {
+            Ok(c) => c,
+            Err(err) => {
+                spinner.stop();
+                eprintln!("{NE} 检索失败: {}", err);
+                return Err(err.into());
+            }
+        };
     if candidates.is_empty() {
         spinner.stop();
         println!("{NE} 没有找到与「{}」相关的可修改 memo 条目。", query);
@@ -1376,8 +1373,12 @@ mod tests {
         let merge_plan_refs: Vec<&serde_json::Value> = merge_plan.iter().collect();
 
         let eligible_ids = FxHashSet::from_iter(["id_a", "id_b", "ignored"].into_iter());
-        let (delete_ids, merged_count, new_entries) =
-            build_consolidation_merge_entries("memo", Some("test"), &merge_plan_refs, &eligible_ids);
+        let (delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(
+            "memo",
+            Some("test"),
+            &merge_plan_refs,
+            &eligible_ids,
+        );
 
         assert_eq!(merged_count, 2);
         assert_eq!(delete_ids.len(), 2);

@@ -17,10 +17,10 @@ use super::{
     blob::{delete_assets_dir, delete_history_artifacts},
     markdown::messages_to_markdown,
     sqlite::{
-        backup_sqlite, read_all_messages_sqlite, read_first_user_prompt_sqlite,
-        read_session_list_metadata_sqlite, read_session_title_origin_sqlite,
-        read_session_title_sqlite, remap_context_checkpoint_paths_sqlite, with_session_state_lock,
-        write_session_title_sqlite, SessionListMetadata,
+        SessionListMetadata, backup_sqlite, read_all_messages_sqlite,
+        read_first_user_prompt_sqlite, read_session_list_metadata_sqlite,
+        read_session_title_origin_sqlite, read_session_title_sqlite,
+        remap_context_checkpoint_paths_sqlite, with_session_state_lock, write_session_title_sqlite,
     },
     types::Message,
 };
@@ -430,45 +430,40 @@ impl SessionStore {
                             let assets_dir = self.session_assets_dir(&id);
                             let checkpoints_dir = self.checkpoints_dir(&id);
                             // 顶层指纹命中缓存时跳过递归遍历；遍历失败按旧语义记 0 且不写缓存。
-                            let (assets_size, checkpoints_size, recompute) =
-                                match (
-                                    Self::dir_two_level_fingerprint(&assets_dir),
-                                    Self::dir_two_level_fingerprint(&checkpoints_dir),
-                                ) {
-                                    (Ok(assets_fp), Ok(checkpoints_fp)) => {
-                                        let fingerprint =
-                                            format!("{assets_fp}\u{1f}{checkpoints_fp}");
-                                        match cache.get(&id) {
-                                            Some((cached_fp, cached_assets, cached_checkpoints))
-                                                if *cached_fp == fingerprint =>
-                                            {
-                                                (*cached_assets, *cached_checkpoints, None)
-                                            }
-                                            _ => {
-                                                match directory_size(&assets_dir).and_then(
-                                                    |assets| {
-                                                        directory_size(&checkpoints_dir).map(
-                                                            |checkpoints| (assets, checkpoints),
-                                                        )
-                                                    },
-                                                ) {
-                                                    Ok((assets, checkpoints)) => (
+                            let (assets_size, checkpoints_size, recompute) = match (
+                                Self::dir_two_level_fingerprint(&assets_dir),
+                                Self::dir_two_level_fingerprint(&checkpoints_dir),
+                            ) {
+                                (Ok(assets_fp), Ok(checkpoints_fp)) => {
+                                    let fingerprint = format!("{assets_fp}\u{1f}{checkpoints_fp}");
+                                    match cache.get(&id) {
+                                        Some((cached_fp, cached_assets, cached_checkpoints))
+                                            if *cached_fp == fingerprint =>
+                                        {
+                                            (*cached_assets, *cached_checkpoints, None)
+                                        }
+                                        _ => {
+                                            match directory_size(&assets_dir).and_then(|assets| {
+                                                directory_size(&checkpoints_dir)
+                                                    .map(|checkpoints| (assets, checkpoints))
+                                            }) {
+                                                Ok((assets, checkpoints)) => (
+                                                    assets,
+                                                    checkpoints,
+                                                    Some((
+                                                        id.clone(),
+                                                        fingerprint,
                                                         assets,
                                                         checkpoints,
-                                                        Some((
-                                                            id.clone(),
-                                                            fingerprint,
-                                                            assets,
-                                                            checkpoints,
-                                                        )),
-                                                    ),
-                                                    Err(_) => (0, 0, None),
-                                                }
+                                                    )),
+                                                ),
+                                                Err(_) => (0, 0, None),
                                             }
                                         }
                                     }
-                                    _ => (0, 0, None),
-                                };
+                                }
+                                _ => (0, 0, None),
+                            };
                             let sqlite_path = self.session_history_file(&id);
                             let mut total = file_size_if_exists(&sqlite_path)
                                 .unwrap_or(0)
@@ -547,7 +542,11 @@ impl SessionStore {
                 ("d", 0u64, mtime)
             } else if file_type.is_file() {
                 let metadata = entry.metadata()?;
-                ("f", metadata.len(), Self::metadata_mtime_nanos(&metadata).unwrap_or(0))
+                (
+                    "f",
+                    metadata.len(),
+                    Self::metadata_mtime_nanos(&metadata).unwrap_or(0),
+                )
             } else {
                 // 符号链接等既不递归也不计入大小，与 directory_size 的语义一致。
                 ("o", 0u64, 0)
@@ -561,7 +560,9 @@ impl SessionStore {
                 };
                 for sub in sub_entries {
                     let Ok(sub) = sub else { continue };
-                    let Ok(sub_type) = sub.file_type() else { continue };
+                    let Ok(sub_type) = sub.file_type() else {
+                        continue;
+                    };
                     let sub_name = sub.file_name().to_string_lossy().into_owned();
                     let (sub_kind, sub_size, sub_mtime) = if sub_type.is_dir() {
                         let mtime = fs::metadata(sub.path())
@@ -570,12 +571,20 @@ impl SessionStore {
                             .unwrap_or(0);
                         ("d", 0u64, mtime)
                     } else if sub_type.is_file() {
-                        let Ok(metadata) = sub.metadata() else { continue };
-                        ("f", metadata.len(), Self::metadata_mtime_nanos(&metadata).unwrap_or(0))
+                        let Ok(metadata) = sub.metadata() else {
+                            continue;
+                        };
+                        (
+                            "f",
+                            metadata.len(),
+                            Self::metadata_mtime_nanos(&metadata).unwrap_or(0),
+                        )
                     } else {
                         ("o", 0u64, 0)
                     };
-                    parts.push(format!("{name}/{sub_kind}|{sub_name}|{sub_size}|{sub_mtime}"));
+                    parts.push(format!(
+                        "{name}/{sub_kind}|{sub_name}|{sub_size}|{sub_mtime}"
+                    ));
                 }
             }
         }
@@ -615,7 +624,12 @@ impl SessionStore {
         let entries: Vec<(String, String, u64, u64)> = cache
             .iter()
             .map(|(id, (fingerprint, assets_size, checkpoints_size))| {
-                (id.clone(), fingerprint.clone(), *assets_size, *checkpoints_size)
+                (
+                    id.clone(),
+                    fingerprint.clone(),
+                    *assets_size,
+                    *checkpoints_size,
+                )
             })
             .collect();
         let payload =
@@ -1970,7 +1984,8 @@ mod tests {
 
         // 删除 session 后，缓存条目应被同步移除（不依赖下一次 attach 的 retain 自愈）。
         assert!(store.delete_session(&session_id).unwrap());
-        let cache = SessionStore::load_session_size_cache(&store.root.join(SESSION_SIZE_CACHE_FILE));
+        let cache =
+            SessionStore::load_session_size_cache(&store.root.join(SESSION_SIZE_CACHE_FILE));
         assert!(!cache.contains_key(&session_id));
 
         // 清理临时目录。

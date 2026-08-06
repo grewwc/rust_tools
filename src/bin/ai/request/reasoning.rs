@@ -91,24 +91,24 @@ pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages
         if exact_replay {
             // exact continuation state 只能由同一模型生成。未标记内容（例如切换前
             // GPT 的 reasoning）和其他 exact 模型的状态都不能跨模型回放。
-            message.reasoning_content = message.reasoning_content.as_deref().and_then(
-                |reasoning| {
+            message.reasoning_content =
+                message.reasoning_content.as_deref().and_then(|reasoning| {
                     crate::ai::history::compress::decode_reasoning_replay_for_model(
                         model, reasoning,
                     )
-                },
-            );
+                });
             continue;
         }
         if shape_only_replay {
-            let carries_exact_replay_marker = message
-                .reasoning_content
-                .as_deref()
-                .is_some_and(|reasoning| {
-                    reasoning.starts_with(
-                        crate::ai::history::compress::PERSISTED_REASONING_REPLAY_PREFIX,
-                    )
-                });
+            let carries_exact_replay_marker =
+                message
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|reasoning| {
+                        reasoning.starts_with(
+                            crate::ai::history::compress::PERSISTED_REASONING_REPLAY_PREFIX,
+                        )
+                    });
             if carries_exact_replay_marker {
                 message.reasoning_content = Some(String::new());
             } else {

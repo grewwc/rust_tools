@@ -526,10 +526,7 @@ mod tests {
     #[test]
     fn test_update_prune_marks_distinct_ids_accumulate_monotonically() {
         let mut marks = FxHashMap::default();
-        let active: FxHashSet<String> = ["A", "B", "C"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let active: FxHashSet<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
 
         // 每轮标不同 id（真实模型行为）。
         update_prune_marks(&mut marks, &["A".to_string()], &active);

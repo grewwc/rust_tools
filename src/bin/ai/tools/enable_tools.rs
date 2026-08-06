@@ -285,7 +285,6 @@ fn available_tools_not_active() -> Vec<(String, String)> {
     result
 }
 
-
 fn execute_enable_tools(args: &Value) -> Result<String, String> {
     let operation = args["operation"]
         .as_str()

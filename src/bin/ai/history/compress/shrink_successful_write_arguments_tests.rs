@@ -69,18 +69,32 @@ fn shrink_successful_write_outside_window() {
     let protected = FxHashSet::default();
     shrink_successful_write_arguments(&mut messages, Some(&overflow_dir), &protected);
 
-    let stub = &messages[3].tool_calls.as_ref().unwrap()[0].function.arguments;
+    let stub = &messages[3].tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments;
     assert!(
         stub.contains("\"_context_overflow_truncated\""),
         "stub should mark truncation: {stub}"
     );
-    assert!(stub.contains("file_path"), "stub preview keeps file_path anchor");
-    assert!(stub.contains("archive_file_path"), "stub keeps archive pointer");
+    assert!(
+        stub.contains("file_path"),
+        "stub preview keeps file_path anchor"
+    );
+    assert!(
+        stub.contains("archive_file_path"),
+        "stub keeps archive pointer"
+    );
     // 原文归档：overflow 目录下出现归档文件，且不含窗口内组。
     let archive_path = overflow_dir.join(OVERFLOW_HISTORY_FILENAME);
-    assert!(archive_path.is_file(), "originals archived to overflow-history.md");
+    assert!(
+        archive_path.is_file(),
+        "originals archived to overflow-history.md"
+    );
     let archived = std::fs::read_to_string(&archive_path).unwrap();
-    assert!(archived.contains("\"content\""), "archived keeps original args");
+    assert!(
+        archived.contains("\"content\""),
+        "archived keeps original args"
+    );
     let _ = std::fs::remove_dir_all(&overflow_dir);
 }
 
@@ -97,7 +111,9 @@ fn keep_write_arguments_inside_recent_window() {
     let protected = FxHashSet::default();
     shrink_successful_write_arguments(&mut messages, Some(&overflow_dir), &protected);
 
-    let args = &messages[2].tool_calls.as_ref().unwrap()[0].function.arguments;
+    let args = &messages[2].tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments;
     assert_eq!(args, &big_args, "recent window keeps full arguments");
     assert!(!overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists());
     let _ = std::fs::remove_dir_all(&overflow_dir);
@@ -110,7 +126,10 @@ fn failed_write_keeps_arguments() {
     let mut messages = vec![msg("system", "s"), msg("user", "do")];
     let big_args = big_write_args();
     messages.push(assistant_call_args("call-w", "write_file", &big_args));
-    messages.push(tool_result("call-w", "Error: write_file failed: permission denied"));
+    messages.push(tool_result(
+        "call-w",
+        "Error: write_file failed: permission denied",
+    ));
     for i in 0..4 {
         let id = format!("call-{i}");
         messages.push(assistant_call_args(&id, "text_grep", r#"{"pattern": "x"}"#));
@@ -120,7 +139,9 @@ fn failed_write_keeps_arguments() {
     let protected = FxHashSet::default();
     shrink_successful_write_arguments(&mut messages, Some(&overflow_dir), &protected);
 
-    let args = &messages[2].tool_calls.as_ref().unwrap()[0].function.arguments;
+    let args = &messages[2].tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments;
     assert_eq!(args, &big_args, "failed write keeps full arguments");
     assert!(!overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists());
     let _ = std::fs::remove_dir_all(&overflow_dir);
@@ -137,7 +158,10 @@ fn shrink_successful_apply_patch_outside_window() {
         "new line".repeat(200)
     );
     messages.push(assistant_call_args("call-p", "apply_patch", &big_args));
-    messages.push(tool_result("call-p", "Successfully patched /tmp/a.rs; +1 -1 (1 lines)"));
+    messages.push(tool_result(
+        "call-p",
+        "Successfully patched /tmp/a.rs; +1 -1 (1 lines)",
+    ));
     for i in 0..4 {
         let id = format!("call-{i}");
         messages.push(assistant_call_args(&id, "text_grep", r#"{"pattern": "x"}"#));
@@ -147,7 +171,9 @@ fn shrink_successful_apply_patch_outside_window() {
     let protected = FxHashSet::default();
     shrink_successful_write_arguments(&mut messages, Some(&overflow_dir), &protected);
 
-    let stub = &messages[3].tool_calls.as_ref().unwrap()[0].function.arguments;
+    let stub = &messages[3].tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments;
     assert!(stub.contains("\"_context_overflow_truncated\""));
     assert!(overflow_dir.join(OVERFLOW_HISTORY_FILENAME).is_file());
     let _ = std::fs::remove_dir_all(&overflow_dir);
@@ -170,7 +196,9 @@ fn short_arguments_unchanged() {
     let protected = FxHashSet::default();
     shrink_successful_write_arguments(&mut messages, Some(&overflow_dir), &protected);
 
-    let args = &messages[2].tool_calls.as_ref().unwrap()[0].function.arguments;
+    let args = &messages[2].tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments;
     assert_eq!(args, &small_args);
     assert!(!overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists());
     let _ = std::fs::remove_dir_all(&overflow_dir);
@@ -202,12 +230,18 @@ fn idempotent_when_already_replaced() {
 
     // 第二次调用：stub 不变，归档文件不再增长。
     shrink_successful_write_arguments(&mut messages, Some(&overflow_dir), &protected);
-    let stub_after_second = &messages[3].tool_calls.as_ref().unwrap()[0].function.arguments;
+    let stub_after_second = &messages[3].tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments;
     assert_eq!(stub_after_second, &stub_after_first);
-    let archive_after_second = std::fs::read_to_string(overflow_dir.join(OVERFLOW_HISTORY_FILENAME))
-        .unwrap()
-        .len();
-    assert_eq!(archive_after_second, archive_after_first, "no duplicate archive");
+    let archive_after_second =
+        std::fs::read_to_string(overflow_dir.join(OVERFLOW_HISTORY_FILENAME))
+            .unwrap()
+            .len();
+    assert_eq!(
+        archive_after_second, archive_after_first,
+        "no duplicate archive"
+    );
     let _ = std::fs::remove_dir_all(&overflow_dir);
 }
 
@@ -229,7 +263,9 @@ fn protected_call_ids_never_shrunk() {
     protected.insert("call-w".to_string());
     shrink_successful_write_arguments(&mut messages, Some(&overflow_dir), &protected);
 
-    let args = &messages[2].tool_calls.as_ref().unwrap()[0].function.arguments;
+    let args = &messages[2].tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments;
     assert_eq!(args, &big_args);
     assert!(!overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists());
     let _ = std::fs::remove_dir_all(&overflow_dir);
@@ -252,7 +288,9 @@ fn non_write_tools_ignored() {
     let protected = FxHashSet::default();
     shrink_successful_write_arguments(&mut messages, Some(&overflow_dir), &protected);
 
-    let args = &messages[2].tool_calls.as_ref().unwrap()[0].function.arguments;
+    let args = &messages[2].tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments;
     assert_eq!(args, &big_args);
     assert!(!overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists());
     let _ = std::fs::remove_dir_all(&overflow_dir);
@@ -274,7 +312,9 @@ fn no_overflow_dir_still_works() {
     let protected = FxHashSet::default();
     shrink_successful_write_arguments(&mut messages, None, &protected);
 
-    let stub = &messages[2].tool_calls.as_ref().unwrap()[0].function.arguments;
+    let stub = &messages[2].tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments;
     assert!(stub.contains("\"_context_overflow_truncated\""));
 }
 
@@ -316,8 +356,13 @@ fn medium_arguments_not_shrunk_and_not_archived() {
                 .is_some_and(|calls| calls[0].id == "call-m")
         })
         .unwrap();
-    let args = &messages[write_idx].tool_calls.as_ref().unwrap()[0].function.arguments;
-    assert_eq!(args, &medium_args, "medium args stay intact when stub cannot shrink");
+    let args = &messages[write_idx].tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments;
+    assert_eq!(
+        args, &medium_args,
+        "medium args stay intact when stub cannot shrink"
+    );
     // 关键断言：没有写入任何归档条目（修复前这里会写一份永远用不上的重复原文）。
     assert!(
         !overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists(),

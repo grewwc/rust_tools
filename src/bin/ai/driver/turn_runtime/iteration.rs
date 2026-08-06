@@ -546,8 +546,7 @@ pub(super) fn refresh_skill_turn_for_iteration(
             )
         });
     let project_targets = project_instruction_target_paths(messages);
-    new_skill_turn
-        .push_scoped_project_instructions(required_project_targets, &project_targets);
+    new_skill_turn.push_scoped_project_instructions(required_project_targets, &project_targets);
     if inherited_restore.is_some() {
         new_skill_turn.set_restore_agent_context(inherited_restore);
     }

@@ -89,9 +89,21 @@ fn builtin_build_agent_prompt_preserves_end_to_end_behavior_tracing() {
     let agent = parse_agent_front_matter(content).unwrap();
 
     assert!(agent.prompt.contains("Trace behavior before editing"));
-    assert!(agent.prompt.contains("transformations, branches, retries, and consumers"));
-    assert!(agent.prompt.contains("do not infer a value's meaning or completeness"));
-    assert!(agent.prompt.contains("Prove behavior, not just compilation"));
+    assert!(
+        agent
+            .prompt
+            .contains("transformations, branches, retries, and consumers")
+    );
+    assert!(
+        agent
+            .prompt
+            .contains("do not infer a value's meaning or completeness")
+    );
+    assert!(
+        agent
+            .prompt
+            .contains("Prove behavior, not just compilation")
+    );
 }
 
 #[test]
@@ -109,8 +121,16 @@ fn builtin_audit_agent_enforces_evidence_driven_review() {
     assert_eq!(agent.max_steps, Some(256));
     assert!(agent.disable_mcp_tools);
     assert!(agent.prompt.contains("Falsify candidate findings"));
-    assert!(agent.prompt.contains("An unresolved hypothesis is not a finding"));
-    assert!(agent.prompt.contains("newly introduced behavior from pre-existing behavior"));
+    assert!(
+        agent
+            .prompt
+            .contains("An unresolved hypothesis is not a finding")
+    );
+    assert!(
+        agent
+            .prompt
+            .contains("newly introduced behavior from pre-existing behavior")
+    );
 }
 
 #[test]

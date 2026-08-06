@@ -15,7 +15,6 @@ use crate::ai::tools::storage::rag_store::{ensure_rag_store, get_rag_store};
 
 // ─── knowledge_semantic_search ───────────────────────────────────────────────
 
-
 fn execute_semantic_search(args: &Value) -> Result<String, String> {
     // 确保 embedding provider 已初始化（与 note_search 一致：在入口处调用 warm_up）。
     // GLOBAL_PROVIDER 是 OnceLock，重复调用无副作用；未配置 key 时 is_ready() 仍为 false，
@@ -151,7 +150,6 @@ inventory::submit!(ToolRegistration {
 });
 
 // ─── knowledge_rebuild_index ─────────────────────────────────────────────────
-
 
 fn execute_rebuild_index(_args: &Value) -> Result<String, String> {
     // 确保 embedding provider 已初始化（与 note_search / semantic_search 一致）。

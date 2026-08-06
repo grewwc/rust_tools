@@ -1573,10 +1573,8 @@ mod tests {
 
     #[test]
     fn render_history_preview_expands_archived_user_messages() {
-        let root = std::env::temp_dir().join(format!(
-            "ai-history-archived-preview-{}",
-            Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("ai-history-archived-preview-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let history_path = root.join("history.sqlite");
         let archive_path = root.join("overflow-history.md");

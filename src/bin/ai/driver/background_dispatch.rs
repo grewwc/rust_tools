@@ -659,10 +659,9 @@ pub(super) fn dispatch_background_batch(
         // payload below so `task_wait` can surface what the
         // sub-agent actually produced (instead of just "completed
         // with empty output").
-        let result_slot_for_payload: runtime_ctx::SubagentResultSlot =
-            std::sync::Arc::new(tokio::sync::Mutex::new(
-                runtime_ctx::SubagentResult::default(),
-            ));
+        let result_slot_for_payload: runtime_ctx::SubagentResultSlot = std::sync::Arc::new(
+            tokio::sync::Mutex::new(runtime_ctx::SubagentResult::default()),
+        );
         let result_slot_for_scope = result_slot_for_payload.clone();
 
         let inner_fut = TASK_PID.scope(Some(pid), async move {
@@ -689,10 +688,7 @@ pub(super) fn dispatch_background_batch(
             }
             .map_err(|e| format!("{}", e));
             let captured_result = if result_channel_id.is_some() {
-                result_slot_for_payload
-                    .lock()
-                    .await
-                    .clone()
+                result_slot_for_payload.lock().await.clone()
             } else {
                 runtime_ctx::SubagentResult::default()
             };

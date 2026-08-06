@@ -227,7 +227,11 @@ fn format_mutation_log(
             .and_then(|c| std::path::Path::new(path).strip_prefix(c).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
-        let net = match (last_op.as_str(), first_before.is_some(), last_after.is_some()) {
+        let net = match (
+            last_op.as_str(),
+            first_before.is_some(),
+            last_after.is_some(),
+        ) {
             ("delete", _, _) => "deleted",
             (_, false, true) => "created",
             _ => "modified",
@@ -427,13 +431,17 @@ model_reason=inherited parent agent current model\n\
         );
 
         assert!(
-            terminal_audit_result(&payload).starts_with("[audit] Audit subagent finished without a final answer")
+            terminal_audit_result(&payload)
+                .starts_with("[audit] Audit subagent finished without a final answer")
         );
     }
 
     #[test]
     fn compose_audit_prompt_passes_instruction_through_when_no_changes() {
-        assert_eq!(compose_audit_prompt("review the diff", ""), "review the diff");
+        assert_eq!(
+            compose_audit_prompt("review the diff", ""),
+            "review the diff"
+        );
     }
 
     #[test]

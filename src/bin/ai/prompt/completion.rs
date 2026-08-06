@@ -150,9 +150,7 @@ impl CommandCompleter {
     }
 
     /// 用运行时 manifest 快照更新技能补全缓存。
-    pub(in crate::ai) fn set_skill_manifests(
-        manifests: &[crate::ai::skills::SkillManifest],
-    ) {
+    pub(in crate::ai) fn set_skill_manifests(manifests: &[crate::ai::skills::SkillManifest]) {
         if let Ok(mut guard) = SKILL_NAME_CANDIDATES.write() {
             *guard = Some(Self::skill_candidates_from_manifests(manifests));
         }
@@ -375,7 +373,9 @@ impl CommandCompleter {
 
     /// `/model effort` 的第三个 token 候选：推理强度档位 + auto/off。
     fn model_effort_levels() -> &'static [&'static str] {
-        &["minimal", "low", "medium", "high", "xhigh", "max", "auto", "off"]
+        &[
+            "minimal", "low", "medium", "high", "xhigh", "max", "auto", "off",
+        ]
     }
 
     fn session_subcommands() -> &'static [&'static str] {
@@ -563,15 +563,11 @@ impl CommandCompleter {
                                 .collect(),
                         );
                     }
-                    "/sessions" | ":sessions" | "/ss" | ":ss" => {
-                        Self::session_subcommands()
-                    }
+                    "/sessions" | ":sessions" | "/ss" | ":ss" => Self::session_subcommands(),
                     "/history" | ":history" => Self::history_subcommands(),
                     "/personas" | ":personas" => Self::persona_subcommands(),
                     "/usage" | ":usage" => Self::usage_subcommands(),
-                    "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => {
-                        Self::checkpoint_subcommands()
-                    }
+                    "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => Self::checkpoint_subcommands(),
                     "/model" | ":model" => Self::model_subcommands(),
                     _ => &[],
                 };
@@ -1398,7 +1394,9 @@ mod tests {
         let (start, candidates) = CommandCompleter::complete_for_line("/model effort ", 14);
         assert_eq!(start, 14);
         let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
-        for level in ["minimal", "low", "medium", "high", "xhigh", "max", "auto", "off"] {
+        for level in [
+            "minimal", "low", "medium", "high", "xhigh", "max", "auto", "off",
+        ] {
             assert!(
                 labels.iter().any(|x| x == level),
                 "expected level `{}` in candidates: {:?}",

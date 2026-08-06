@@ -1562,7 +1562,10 @@ mod tests {
             .join("context-checkpoints");
         let expected_dir = expected_dir.canonicalize().unwrap_or(expected_dir);
         assert!(
-            first_path.canonicalize().unwrap_or_else(|_| first_path.clone()).starts_with(&expected_dir),
+            first_path
+                .canonicalize()
+                .unwrap_or_else(|_| first_path.clone())
+                .starts_with(&expected_dir),
             "checkpoint should live under config.history_file asset root: {}",
             first_path.display()
         );

@@ -1520,8 +1520,11 @@ fn truncate_mutable_field(
     // 归档路径可由 overflow_dir 直接推导（与 OverflowSink::new 同源），因此先以该
     // 路径完成尺寸判定、真正归档放最后：若 stub 不会严格短于原文，直接放弃，避免
     // 「先归档后判定失败」导致同一字段每轮压缩重复归档、溢出文件无界增长。
-    let archive_path_hint: Option<String> = overflow_dir
-        .map(|dir| dir.join(OVERFLOW_HISTORY_FILENAME).to_string_lossy().into_owned());
+    let archive_path_hint: Option<String> = overflow_dir.map(|dir| {
+        dir.join(OVERFLOW_HISTORY_FILENAME)
+            .to_string_lossy()
+            .into_owned()
+    });
     match field {
         MutableMessageField::Content => {
             if is_preserved_tool_overflow_content(&message.content) {
@@ -1549,7 +1552,10 @@ fn truncate_mutable_field(
                 if preview_budget < MIN_CONTENT_PREVIEW_CHARS {
                     return None;
                 }
-                Some(format!("{prefix}{}", keep_ends_by_chars(&text, preview_budget)))
+                Some(format!(
+                    "{prefix}{}",
+                    keep_ends_by_chars(&text, preview_budget)
+                ))
             };
             let Some(truncated) = build_truncated(archive_path_hint.as_deref()) else {
                 return false;
@@ -1561,8 +1567,7 @@ fn truncate_mutable_field(
             // 判定通过才落盘归档；用真实返回路径重建（正常与 hint 完全一致）。
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
-            let truncated =
-                build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
+            let truncated = build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
             message.content = Value::String(truncated);
             true
         }
@@ -1604,8 +1609,7 @@ fn truncate_mutable_field(
             // 判定通过才落盘归档；用真实返回路径重建（正常与 hint 完全一致）。
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
-            let truncated =
-                build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
+            let truncated = build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
             message.reasoning_content = Some(truncated);
             true
         }
@@ -1643,15 +1647,13 @@ fn truncate_mutable_field(
                 .count();
             let mut preview_budget = target.saturating_sub(fixed_chars);
             let mut preview_text = keep_ends_by_chars(&arguments, preview_budget);
-            let mut truncated =
-                build_truncated(archive_path_hint.as_deref(), preview_text.clone());
+            let mut truncated = build_truncated(archive_path_hint.as_deref(), preview_text.clone());
             // JSON escaping 可能让一个预览字符占用多个序列化字符，按实际超额收紧。
             while truncated.chars().count() > target && preview_budget > 0 {
                 let excess = truncated.chars().count() - target;
                 preview_budget = preview_budget.saturating_sub(excess.max(1));
                 preview_text = keep_ends_by_chars(&arguments, preview_budget);
-                truncated =
-                    build_truncated(archive_path_hint.as_deref(), preview_text.clone());
+                truncated = build_truncated(archive_path_hint.as_deref(), preview_text.clone());
             }
             // 循环收敛后再判定（初始预算够，但 JSON escaping 把它收紧到阈值以下的情况
             // 也要拦住）：预览不足以承载真实参数信息时放弃截断。
@@ -1730,7 +1732,8 @@ fn shrink_successful_write_arguments(
             if name != "write_file" && name != "apply_patch" {
                 continue;
             }
-            if protected_recent_call_ids.contains(&call.id) || protected_tool_call_ids.contains(&call.id)
+            if protected_recent_call_ids.contains(&call.id)
+                || protected_tool_call_ids.contains(&call.id)
             {
                 continue;
             }
@@ -2715,9 +2718,10 @@ fn is_content_overflow_archived_stub(content: &Value) -> bool {
     if is_preserved_tool_overflow_content(content) {
         return true;
     }
-    content
-        .as_str()
-        .is_some_and(|text| text.trim_start().starts_with("[context-overflow-truncated]"))
+    content.as_str().is_some_and(|text| {
+        text.trim_start()
+            .starts_with("[context-overflow-truncated]")
+    })
 }
 
 fn render_dedup_tool_stub(
