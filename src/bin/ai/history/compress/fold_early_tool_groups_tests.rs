@@ -85,6 +85,23 @@ fn archive_file_path_from_text(text: &str) -> String {
         .to_string()
 }
 
+fn recursive_file_count(path: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                recursive_file_count(&path)
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
 #[test]
 fn folds_early_groups_in_a_single_bloated_turn() {
     let messages = single_turn_with_groups(10, 2_000);
@@ -101,6 +118,138 @@ fn folds_early_groups_in_a_single_bloated_turn() {
         "folding must reduce size: {after} !< {before}"
     );
     assert_tool_pairs_consistent(&folded);
+}
+
+#[test]
+fn rejected_speculative_fold_has_no_archive_side_effects() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-rejected-fold-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("system", "s"), msg("user", "检查短结果")];
+    for index in 0..5 {
+        let id = format!("short-read-{index}");
+        messages.push(assistant_call(&id, "read_file"));
+        messages.push(tool_result(&id, "ok"));
+    }
+    let before = serde_json::to_string(&messages).unwrap();
+    let budget = messages_total_chars(&messages).saturating_sub(1);
+
+    let changed = fold_noncompressible_tool_groups_to_fit(
+        &mut messages,
+        budget,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
+
+    assert!(!changed, "larger fold stubs must be rejected");
+    assert_eq!(serde_json::to_string(&messages).unwrap(), before);
+    assert!(
+        !overflow_dir.exists(),
+        "planning a rejected fold must not create archives"
+    );
+}
+
+#[test]
+fn accepted_fold_archives_are_idempotent_across_rebuilds() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-idempotent-fold-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("system", "s"), msg("user", "检查长结果")];
+    for index in 0..8 {
+        let id = format!("long-read-{index}");
+        messages.push(assistant_call(&id, "read_file"));
+        messages.push(tool_result(&id, &format!("{index}:{}", "x".repeat(2_000))));
+    }
+
+    let (first, first_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
+    let first_file_count = recursive_file_count(&overflow_dir);
+    assert_eq!(first_groups, 4);
+    assert!(first_file_count > 0);
+    assert!(!overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists());
+
+    let (second, second_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
+    assert_eq!(second_groups, first_groups);
+    assert_eq!(
+        serde_json::to_string(&second).unwrap(),
+        serde_json::to_string(&first).unwrap()
+    );
+    assert_eq!(
+        recursive_file_count(&overflow_dir),
+        first_file_count,
+        "rebuilding the same fold must reuse content-addressed archives"
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn fold_archive_failure_keeps_raw_tool_group() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-failed-fold-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&overflow_dir, "not a directory").unwrap();
+    let mut messages = vec![msg("system", "s"), msg("user", "保留原始证据")];
+    for index in 0..5 {
+        let id = format!("failed-archive-read-{index}");
+        messages.push(assistant_call(&id, "read_file"));
+        messages.push(tool_result(&id, &"x".repeat(2_000)));
+    }
+    let before = serde_json::to_string(&messages).unwrap();
+
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
+
+    assert_eq!(folded_groups, 0);
+    assert_eq!(serde_json::to_string(&folded).unwrap(), before);
+    assert_tool_pairs_consistent(&folded);
+
+    let _ = std::fs::remove_file(overflow_dir);
+}
+
+#[test]
+fn removable_messages_are_archived_in_one_batch() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-batched-trim-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("system", "s")];
+    for index in 0..20 {
+        messages.push(msg(
+            ROLE_INTERNAL_NOTE,
+            &format!(
+                "compressed_tool_round: old-{index}\n{}\n{}",
+                COMPRESSED_TOOL_EVIDENCE_MARKER,
+                "x".repeat(400)
+            ),
+        ));
+    }
+    for index in 0..4 {
+        messages.push(msg("user", &format!("user-{index}")));
+        messages.push(msg("assistant", &format!("answer-{index}")));
+    }
+    let budget = 1;
+
+    assert!(trim_removable_messages_batch(
+        &mut messages,
+        budget,
+        Some(overflow_dir.as_path()),
+    ));
+
+    let archive = std::fs::read_to_string(overflow_dir.join(OVERFLOW_HISTORY_FILENAME)).unwrap();
+    assert_eq!(archive.matches("## 移出消息原文").count(), 1);
+    assert!(archive.contains("old-0"));
+    assert!(archive.contains("old-19"));
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
 #[test]
@@ -1307,8 +1456,13 @@ fn preserves_read_file_for_pending_patch_path() {
         .expect("pending-patch 路径的 read_file 组不应被折叠");
     let _ = rf; // 仅断言其存在且 role 仍为 assistant
     assert_tool_pairs_consistent(&folded);
-    let archive = std::fs::read_to_string(overflow_dir.join(OVERFLOW_HISTORY_FILENAME))
-        .expect("other folded groups should create overflow archive");
+    let group_archive_dir = overflow_dir.join(FOLDED_TOOL_GROUP_ARCHIVE_DIR);
+    let archive = std::fs::read_dir(&group_archive_dir)
+        .expect("other folded groups should create content-addressed archives")
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         !archive.contains("PENDING_READ_SENTINEL"),
         "pending-patch read group must not be archived while it remains inline"

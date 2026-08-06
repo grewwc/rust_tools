@@ -36,10 +36,12 @@
               "type": "array",
               "items": {
                 "type": "string"
-              }
+              },
+              "description": "Optional tags for categorization."
             },
             "source": {
-              "type": "string"
+              "type": "string",
+              "description": "Optional source context recorded with the entry (e.g. user command, project name)."
             },
             "priority": {
               "type": "integer",

@@ -77,6 +77,7 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
         current_agent_manifest: None,
         pending_files: None,
         forced_skill: None,
+        forced_skill_source: None,
         pending_skill_continuation: None,
         forced_question: None,
         attached_image_files: Vec::new(),
@@ -167,6 +168,7 @@ fn resolve_model_is_unicode_safe() {
         current_agent_manifest: None,
         pending_files: None,
         forced_skill: None,
+        forced_skill_source: None,
         pending_skill_continuation: None,
         forced_question: None,
         attached_image_files: Vec::new(),
@@ -1812,21 +1814,39 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
     // 命中的压缩路径（二者都携带指向归档文件的 `file_path:`，断言召回契约而非某条路径
     // 的字面文案）：
     //   - spill stub：`Output preserved for tool `read_file` ... - file_path: ...`
-    //   - fold note ：`compressed_tool_round: ... - read_file => - file_path: ...`
-    let recall = compressed
+    //   - fold note ：`compressed_tool_round: ... - read_file => - archive_file_path: ...`
+    //     （二级折叠有意把内部 overflow 路径重命名为 `archive_file_path`，避免伪装成
+    //     普通 `file_path` 主线索；同条 note 里的 `- original_file_path:` 指向源码
+    //     文件而非归档，不能当作归档指针。）
+    //
+    // 注意：不能用 `split("file_path: ").nth(1)` 这种子串切分——fold note 里
+    // `- original_file_path:` 排在 `- archive_file_path:` 前面，子串切分会误把
+    // 源码文件路径当成归档路径（历史 bug：读到 src/lib.rs 仅 1305 字节）。
+    let file_path = compressed
         .iter()
         .find_map(|m| {
             let text = m.content.as_str()?;
-            (text.contains("read_file") && text.contains("file_path: ")).then_some(text.to_string())
+            let candidates: Vec<&str> = text
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    line.strip_prefix("- archive_file_path: ")
+                        .or_else(|| line.strip_prefix("- file_path: "))
+                        .map(str::trim)
+                })
+                .collect();
+            // 优先选择携带完整零压缩内容的 per-tool 归档；若所有候选都不足阈值
+            // （spill 直接命中的 stub 场景下 file_path 就指向完整文件），回退首个候选。
+            let full = candidates
+                .iter()
+                .copied()
+                .find(|c| std::fs::read(c).map(|b| b.len() >= 8000).unwrap_or(false));
+            let hit = full.or_else(|| candidates.into_iter().next())?;
+            Some(hit)
         })
         .unwrap_or_else(|| {
-            panic!("expected read_file recall anchor after mid-turn compression: {compressed:#?}")
+            panic!("expected read_file recall archive path after mid-turn compression: {compressed:#?}")
         });
-    let file_path = recall
-        .split("file_path: ")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .expect("recall anchor should carry an overflow file path");
     let archived = std::fs::read(file_path).unwrap_or_else(|e| {
         panic!("overflow file referenced by recall anchor should exist: {file_path}: {e}")
     });

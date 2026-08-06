@@ -66,6 +66,7 @@ pub(in crate::ai) fn clear_session_local_runtime_state(app: &mut App) {
     }
     app.attached_image_files.clear();
     app.forced_skill = None;
+    app.forced_skill_source = None;
     app.pending_skill_continuation = None;
     app.forced_question = None;
     app.last_skill_bias = None;
@@ -1125,6 +1126,7 @@ mod tests {
             current_agent_manifest: None,
             pending_files: None,
             forced_skill: Some("feishu-upload-md".to_string()),
+            forced_skill_source: None,
             pending_skill_continuation: None,
             forced_question: Some("把 markdown 发到飞书".to_string()),
             attached_image_files: vec!["/tmp/demo.png".to_string()],

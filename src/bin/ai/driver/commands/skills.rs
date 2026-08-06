@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::ai::{skills::SkillManifest, types::App};
+use crate::ai::{
+    skills::SkillManifest,
+    types::{App, ForcedSkillSource},
+};
 
 fn pending_skill_name(app: &App) -> Option<&str> {
     app.forced_skill.as_deref()
@@ -115,6 +118,7 @@ pub fn try_handle_skills_command(
             match found {
                 Some(name) => {
                     app.forced_skill = Some(name.clone());
+                    app.forced_skill_source = Some(ForcedSkillSource::SkillsCommandNextTurn);
                     println!("Skill selected for next turn: {name}");
                     println!("Ask your next question naturally, or mention @skills:{name} inline.");
                 }
@@ -157,10 +161,12 @@ pub fn try_handle_skills_command(
                         // /skills <name> <rest>：提取 rest 作为本轮问题
                         let rest = extract_rest_after_skill_name(&normalized_for_rest);
                         app.forced_skill = Some(name);
+                        app.forced_skill_source = Some(ForcedSkillSource::SkillsCommandInline);
                         app.forced_question = rest;
                         return Ok(true);
                     }
                     app.forced_skill = Some(name.clone());
+                    app.forced_skill_source = Some(ForcedSkillSource::SkillsCommandNextTurn);
                     println!("Skill selected for next turn: {name}");
                     println!("Ask your next question naturally, or mention @skills:{name} inline.");
                 }
@@ -256,5 +262,11 @@ mod tests {
         // /skill code-review 帮我review 这段代码 并给出建议
         let r = extract_rest_after_skill_name("skill code-review 帮我review 这段代码 并给出建议");
         assert_eq!(r.as_deref(), Some("帮我review 这段代码 并给出建议"));
+    }
+
+    #[test]
+    fn rest_with_multiline_question() {
+        let r = extract_rest_after_skill_name("skills bytedcli\n帮我检查最近的飞书消息");
+        assert_eq!(r.as_deref(), Some("帮我检查最近的飞书消息"));
     }
 }

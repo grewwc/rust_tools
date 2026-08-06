@@ -4,9 +4,10 @@ use crate::ai::{
         load_scoped_project_instruction_docs_for_target_priority,
         load_scoped_project_instruction_docs_for_targets,
     },
+    history::{self, SkillActivationEvent},
     mcp::McpClient,
     skills::SkillManifest,
-    types::{App, ToolDefinition},
+    types::{App, ForcedSkillSource, ToolDefinition},
 };
 use crate::commonw::configw;
 use rust_tools::cw::SkipSet;
@@ -1358,12 +1359,36 @@ pub(super) fn force_activate_named_skill(
     Some(guard)
 }
 
+fn record_forced_skill_activation(
+    app: &App,
+    source: ForcedSkillSource,
+    requested_skill: &str,
+    injected_skill: Option<&str>,
+    outcome: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    history::append_skill_activation_event_sqlite(
+        &app.session_history_file,
+        &SkillActivationEvent {
+            requested_skill: requested_skill.to_string(),
+            injected_skill: injected_skill.map(str::to_string),
+            source: source.label().to_string(),
+            outcome: outcome.to_string(),
+        },
+    )?;
+    let injected = injected_skill.unwrap_or("<none>");
+    super::commands::status_line::print_status(&format!(
+        "[skill] requested={requested_skill} injected={injected} source={} outcome={outcome}",
+        source.label()
+    ));
+    Ok(())
+}
+
 pub(super) fn prepare_skill_for_turn(
     app: &mut App,
     mcp_client: &McpClient,
     skill_manifests: &[SkillManifest],
     question: &str,
-) -> SkillTurnGuard {
+) -> Result<SkillTurnGuard, Box<dyn std::error::Error>> {
     let cfg = configw::get_all_config();
     let debug = cfg
         .get_opt("ai.skills.debug")
@@ -1374,10 +1399,12 @@ pub(super) fn prepare_skill_for_turn(
     // 用户通过 `@skills:<name>` 在输入框中显式选择的强制 skill 最高优先。
     // 这是 per-turn 语义：消费后立即清空，下一轮不再强制注入。
     // 它也是用户显式离开等待中 skill 的信号，不能让旧续接抢回本轮。
-    if app.forced_skill.is_some() {
+    let forced_skill = app.forced_skill.take();
+    let forced_source = app.forced_skill_source.take();
+    if forced_skill.is_some() {
         app.pending_skill_continuation = None;
     }
-    if let Some(forced) = app.forced_skill.take() {
+    if let Some(forced) = forced_skill {
         if let Some(skill) = skill_manifests
             .iter()
             .find(|s| s.name == forced)
@@ -1391,16 +1418,27 @@ pub(super) fn prepare_skill_for_turn(
             if let Some(guard) =
                 force_activate_named_skill(app, mcp_client, skill_manifests, question, &name)
             {
+                if let Some(source) = forced_source {
+                    record_forced_skill_activation(app, source, &forced, Some(&name), "injected")?;
+                }
                 if debug {
                     eprintln!("[skills] forced via @skills: {}", name);
                 }
-                return guard;
+                return Ok(guard);
+            }
+            if let Some(source) = forced_source {
+                record_forced_skill_activation(app, source, &forced, None, "activation-failed")?;
             }
         } else if debug {
             eprintln!(
                 "[skills] forced @skills:{} not found, no auto-activation",
                 forced
             );
+            if let Some(source) = forced_source {
+                record_forced_skill_activation(app, source, &forced, None, "not-found")?;
+            }
+        } else if let Some(source) = forced_source {
+            record_forced_skill_activation(app, source, &forced, None, "not-found")?;
         }
     }
 
@@ -1417,7 +1455,7 @@ pub(super) fn prepare_skill_for_turn(
                 if debug {
                     eprintln!("[skills] continuing requested skill: {name}");
                 }
-                return guard;
+                return Ok(guard);
             }
         } else if debug {
             eprintln!(
@@ -1438,7 +1476,7 @@ pub(super) fn prepare_skill_for_turn(
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
     let mut guard = build_skill_turn_guard(app, mcp_client, skill);
     guard.matched_skill_name = matched_skill_name;
-    guard
+    Ok(guard)
 }
 
 #[cfg(test)]
@@ -1584,7 +1622,8 @@ mod tests {
             &mcp_client,
             std::slice::from_ref(&external),
             "the requested answer",
-        );
+        )
+        .unwrap();
         assert_eq!(guard.matched_skill_name(), Some(external.name.as_str()));
         assert!(app.pending_skill_continuation.is_none());
         drop(guard);
@@ -1594,7 +1633,8 @@ mod tests {
             &mcp_client,
             std::slice::from_ref(&external),
             "an unrelated new request",
-        );
+        )
+        .unwrap();
         assert_eq!(next_guard.matched_skill_name(), None);
         drop(next_guard);
 
@@ -1607,7 +1647,8 @@ mod tests {
             &mcp_client,
             &[external, replacement],
             "use the explicitly selected skill",
-        );
+        )
+        .unwrap();
         assert_eq!(forced_guard.matched_skill_name(), Some("replacement"));
         assert!(app.pending_skill_continuation.is_none());
     }

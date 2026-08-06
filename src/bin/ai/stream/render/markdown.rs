@@ -1013,8 +1013,12 @@ pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
         return line.to_string();
     }
 
-    // 需要截断：预留 1 列给省略号，保证含省略号后仍不超过 cols。
-    let budget = cols.saturating_sub(1).max(1);
+    // 需要截断：仅剩一列时只能显示省略号；否则预留 1 列给省略号，保证含省略号后
+    // 仍不超过 cols。
+    if cols == 1 {
+        return "…".to_string();
+    }
+    let budget = cols - 1;
     let mut out = String::with_capacity(line.len());
     let mut col = 0usize;
     for ch in line.chars() {
@@ -1047,6 +1051,16 @@ pub(in crate::ai) fn wrap_line_to_terminal_rows_with_reserve(
     let mut col = 0usize;
     for ch in line.chars() {
         let w = terminal_cell_width(ch);
+        // 当前可用区域只有一列时，宽字符无法不触发终端自动折行。以单列 ASCII
+        // 占位符代替，优先守住“每个返回片段恰好一物理行”的重绘不变量。
+        if w > cols {
+            if !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+                col = 0;
+            }
+            rows.push("?".to_string());
+            continue;
+        }
         if col > 0 && col + w > cols {
             rows.push(std::mem::take(&mut current));
             col = 0;

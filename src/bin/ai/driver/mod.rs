@@ -454,6 +454,7 @@ pub(in crate::ai) async fn run_with_cli(
             Some(cli.files.clone())
         },
         forced_skill: None,
+        forced_skill_source: None,
         pending_skill_continuation: None,
         forced_question: None,
         current_model,

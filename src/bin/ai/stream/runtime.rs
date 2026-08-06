@@ -20,7 +20,10 @@ use super::{
     MarkdownStreamRenderer,
     extract::{StreamTextEvent, extract_chunk_events_streaming, normalize_stream_text},
     framing, normalize,
-    render::markdown::{live_preview_cursor_rows, wrap_line_to_terminal_rows_with_reserve},
+    render::markdown::{
+        clamp_line_to_terminal_row_with_reserve, live_preview_cursor_rows,
+        wrap_line_to_terminal_rows_with_reserve,
+    },
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{StreamChunkStep, StreamMarkers, StreamProcessingState, ToolCallBuilder},
 };
@@ -1224,8 +1227,8 @@ fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str
 /// 只覆盖 thinking 正文窗口（折叠摘要 + 最近可见行），header 不在此列。
 ///
 /// header（`thinking`）在折叠激活时打印一次并锚定在正文之上，之后每次重画都只
-/// 擦除并重写正文。正文行数上限为 `max_visible_lines + 1`（折叠摘要），恒定落在可视
-/// 视口内，因此相对擦除永远够得着，不会随窗口滚入 scrollback
+/// 擦除并重写正文。正文最多展示 `max_visible_lines` 条物理内容行和一条折叠摘要，恒定
+/// 落在可视视口内，因此相对擦除永远够得着，不会随窗口滚入 scrollback
 /// 而失步——即便失步，也无法再生出第二个 header，从根上杜绝「孤儿 header 叠加」。
 fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     let mut out = io::stdout();
@@ -1244,6 +1247,7 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
         &body_lines,
         marker_lines,
         fold.rewrite_right_margin_cols,
+        fold.max_visible_lines,
     );
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
@@ -1303,6 +1307,7 @@ fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
         &body_lines,
         marker_lines,
         fold.rewrite_right_margin_cols,
+        fold.max_visible_lines,
     );
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
@@ -1382,8 +1387,12 @@ fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<St
 /// 输出换行，光标始终停在最后一行，避免 xterm.js 把末尾 LF 解释成额外滚屏。
 fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
     let (lines, marker_lines) = thinking_fold_window_lines(fold);
-    let (window, rows, _) =
-        render_thinking_fold_window_lines(&lines, marker_lines, fold.rewrite_right_margin_cols);
+    let (window, rows, _) = render_thinking_fold_window_lines(
+        &lines,
+        marker_lines,
+        fold.rewrite_right_margin_cols,
+        fold.max_visible_lines,
+    );
     (window, rows)
 }
 
@@ -1391,40 +1400,73 @@ fn render_thinking_fold_window_lines(
     lines: &[String],
     marker_lines: usize,
     rewrite_right_margin_cols: usize,
+    max_visible_rows: usize,
 ) -> (String, usize, Vec<String>) {
     if lines.is_empty() {
         return (String::new(), 0, Vec::new());
     }
+
+    let reserve_cols = THINKING_FOLD_BODY_INDENT_WIDTH + rewrite_right_margin_cols;
+    let marker_lines = marker_lines.min(lines.len());
+    let mut wrapped_content_rows = Vec::new();
+    for line in lines.iter().skip(marker_lines) {
+        wrapped_content_rows.extend(wrap_line_to_terminal_rows_with_reserve(line, reserve_cols));
+    }
+    let hidden_wrapped_rows = wrapped_content_rows.len().saturating_sub(max_visible_rows);
+    let marker = if hidden_wrapped_rows > 0 {
+        // 已按物理行截断时，首个被隐藏的内容可能来自一条仍在输出的逻辑行，不能再
+        // 报告不精确的“earlier lines”计数。
+        Some("… more".to_string())
+    } else if marker_lines > 0 {
+        Some(lines[0].clone())
+    } else {
+        None
+    };
+    let mut rows_to_render = Vec::with_capacity(
+        wrapped_content_rows
+            .len()
+            .saturating_sub(hidden_wrapped_rows)
+            .saturating_add(usize::from(marker.is_some())),
+    );
+    if let Some(marker) = marker {
+        // 折叠提示必须永远只占一物理行；正文才允许逐行包裹。
+        rows_to_render.push((
+            clamp_line_to_terminal_row_with_reserve(&marker, reserve_cols),
+            true,
+        ));
+    }
+    rows_to_render.extend(
+        wrapped_content_rows
+            .into_iter()
+            .skip(hidden_wrapped_rows)
+            .map(|line| (line, false)),
+    );
+
     let mut out = String::new();
-    let mut rendered_lines = Vec::with_capacity(lines.len());
-    // 折叠正文固定内缩；超长 thinking 手动换成多条同缩进视觉行。xterm.js 集成终端
-    // 额外留出右边距，避免 delayed-wrap 产生未计入 cursor-up 的物理行。
+    let mut rendered_lines = Vec::with_capacity(rows_to_render.len());
+    // 折叠正文固定内缩。正文最多保留 max_visible_rows 条包裹后的物理行；若还需
+    // 隐藏内容，单行折叠提示不计入正文预算。每个包裹段本身恰好占一个物理行，
+    // xterm.js 集成终端额外留出右边距。
     let mut rows = 0usize;
     let mut first_rendered_row = true;
 
-    for (idx, line) in lines.iter().enumerate() {
-        let wrapped = wrap_line_to_terminal_rows_with_reserve(
-            line,
-            THINKING_FOLD_BODY_INDENT_WIDTH + rewrite_right_margin_cols,
-        );
-        for body in wrapped {
-            if !first_rendered_row {
-                out.push_str("\r\n");
-            }
-            first_rendered_row = false;
-            let rendered_line = format!("{THINKING_FOLD_BODY_INDENT}{body}");
-            rows += live_preview_cursor_rows(&rendered_line);
-            if idx < marker_lines {
-                out.push_str(ACCENT_MUTED);
-                out.push_str(&rendered_line);
-                out.push_str("\x1b[0m");
-            } else {
-                out.push_str(DIM);
-                out.push_str(&rendered_line);
-                out.push_str(RESET);
-            }
-            rendered_lines.push(rendered_line);
+    for (wrapped_row, is_marker) in rows_to_render {
+        if !first_rendered_row {
+            out.push_str("\r\n");
         }
+        first_rendered_row = false;
+        let rendered_line = format!("{THINKING_FOLD_BODY_INDENT}{wrapped_row}");
+        rows += 1;
+        if is_marker {
+            out.push_str(ACCENT_MUTED);
+            out.push_str(&rendered_line);
+            out.push_str("\x1b[0m");
+        } else {
+            out.push_str(DIM);
+            out.push_str(&rendered_line);
+            out.push_str(RESET);
+        }
+        rendered_lines.push(rendered_line);
     }
 
     (out, rows, rendered_lines)

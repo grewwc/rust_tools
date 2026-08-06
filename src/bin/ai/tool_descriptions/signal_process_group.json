@@ -16,7 +16,7 @@
           "SIGCONT",
           "SIGKILL"
         ],
-        "description": "Signal to send to all processes in the group."
+        "description": "Signal to broadcast to every process in the group: SIGTERM=graceful termination, SIGSTOP=pause execution, SIGCONT=resume paused processes, SIGKILL=immediate forced termination."
       }
     },
     "required": [

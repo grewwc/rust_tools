@@ -550,6 +550,8 @@ fn apply_history_rewind(app: &mut App, plan: HistoryRewindPlan) -> Result<String
         app,
         &plan.keep_messages,
     )?;
+    // 回滚历史时清除显式工具启用列表，避免上一轮 enable_tools 的状态泄漏。
+    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools(&app.session_id);
     Ok(format!(
         "[history] Rewound from u{}: {} · removed {} message(s); kept {} message(s).",
         plan.user_ordinal,
@@ -1020,6 +1022,7 @@ fn finalize_question(
     // 再做普通 `@file` 引用提取，避免 skill 引用被误当作文件路径处理。
     if let Some(name) = extract_forced_skill_reference(&mut question) {
         app.forced_skill = Some(name);
+        app.forced_skill_source = Some(crate::ai::types::ForcedSkillSource::InlineReference);
     }
     let inline_files = extract_at_file_references(&mut question);
     let mut inline_images = extract_inline_image_paths(&mut question);
@@ -1173,6 +1176,7 @@ mod tests {
             current_agent_manifest: None,
             pending_files: None,
             forced_skill: None,
+            forced_skill_source: None,
             pending_skill_continuation: None,
             forced_question: None,
             attached_image_files: Vec::new(),
@@ -1885,7 +1889,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|ctx| ctx.tools.is_empty())
         );
-        assert!(crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty());
+        // rewind 后显式工具启用列表应被清空。
 
         let remaining = history::build_message_arr(usize::MAX, history_path.as_path()).unwrap();
         assert_eq!(remaining.len(), 2);

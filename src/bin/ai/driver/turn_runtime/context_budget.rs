@@ -146,6 +146,11 @@ pub(super) fn apply_pre_request_context_budget(
     let (compressed, _, after_chars) =
         crate::ai::history::mid_turn_compress(drained, target_chars, Some(overflow_dir.as_path()));
     *messages = compressed;
+    // mid_turn_compress 把压缩状态提示插在最后一个 user 之后（工具循环场景下这是
+    // 当前轮活动区）。但请求边界要求 current user 必须是发送序列的最后一条，故这里
+    // 把该提示前移到 current user 之前：既维持 user 末尾契约，又让模型仍能看到
+    // 「本次用的是压缩投影、勿把可恢复证据误判为上下文已满」（见 CONTEXT_COMPACTION_STATE）。
+    reposition_context_compaction_state_before_last_user(messages);
     report.after_chars = after_chars;
     report.changed = report.changed || after_chars < after_lossless_chars;
 
@@ -168,6 +173,30 @@ pub(super) fn apply_pre_request_context_budget(
         }
     }
     report
+}
+
+/// mid_turn_compress 会把 `CONTEXT_COMPACTION_STATE` 提示插在最后一个 user
+/// 之后。请求边界要求 current user 必须是发送序列的最后一条，故这里把该提示前移
+/// 到最后一个 user **之前**：既维持 user 末尾契约，又保住提示对模型的可见性。
+/// note 内容原样搬移，不重构文本（单一来源仍在 compress 模块）。
+fn reposition_context_compaction_state_before_last_user(messages: &mut Vec<Message>) {
+    let Some(note_index) = messages
+        .iter()
+        .position(crate::ai::history::compress::is_context_compaction_state)
+    else {
+        return;
+    };
+    let Some(last_user_index) = messages.iter().rposition(|m| m.role == "user") else {
+        // 无 user 消息：请求边界契约不适用，保持原样。
+        return;
+    };
+    // 已在最后一个 user 之前，无需移动。
+    if note_index < last_user_index {
+        return;
+    }
+    let note = messages.remove(note_index);
+    // remove 发生在 last_user_index 之后，last_user_index 不变；插到它之前。
+    messages.insert(last_user_index, note);
 }
 
 #[derive(Debug, Default)]
@@ -496,6 +525,7 @@ mod tests {
             current_agent_manifest: None,
             pending_files: None,
             forced_skill: None,
+            forced_skill_source: None,
             pending_skill_continuation: None,
             forced_question: None,
             attached_image_files: Vec::new(),
@@ -577,6 +607,41 @@ mod tests {
         assert!(report.before_chars > report.target_chars);
         assert_eq!(messages[0], system);
         assert_eq!(messages.last().unwrap(), &current_user);
+    }
+
+    #[test]
+    fn context_budget_keeps_compaction_state_visible_before_last_user() {
+        let history_file = std::env::temp_dir().join(format!(
+            "context-budget-compaction-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(history_file);
+        let current_user = msg("user", "latest user input must stay exact");
+        let mut messages = vec![
+            msg("system", "system prompt must stay exact"),
+            msg("assistant", "old narration ".repeat(4_000)),
+            current_user.clone(),
+        ];
+
+        let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+
+        // 实际压缩生效才会注入压缩状态提示。
+        assert!(report.changed);
+        // current user 仍是发送序列最后一条（请求边界契约）。
+        assert_eq!(messages.last().unwrap(), &current_user);
+        // 压缩状态提示对模型可见，且被前移到最后一个 user 之前。
+        let note_index = messages
+            .iter()
+            .position(crate::ai::history::compress::is_context_compaction_state)
+            .expect("compaction state note must remain visible to the model");
+        let last_user_index = messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .expect("current user present");
+        assert!(
+            note_index < last_user_index,
+            "compaction note must sit before the last user message"
+        );
     }
 
     #[test]

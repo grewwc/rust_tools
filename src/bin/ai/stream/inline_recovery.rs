@@ -464,15 +464,23 @@ fn single_required_string_argument_key(tool_name: &str) -> Option<String> {
     let schema = crate::ai::tools::registry::tool_metadata::tool_parameters(tool_name);
     let schema = schema.as_object()?;
     let required = schema.get("required")?.as_array()?;
-    if required.len() != 1 {
-        return None;
-    }
-    let key = required.first()?.as_str()?;
     let props = schema.get("properties")?.as_object()?;
-    let prop = props.get(key)?.as_object()?;
-    match prop.get("type")?.as_str() {
-        Some("string") => Some(key.to_string()),
-        _ => None,
+    // 找到所有 required 中类型为 string 的参数。
+    // 当且仅当恰好有一个 required string 参数时，裸文本 body 映射到它；
+    // 其它 required 非 string 参数（如 execute_command 的 pty: bool）由运行时默认值填充。
+    let mut string_keys = Vec::new();
+    for item in required {
+        let key = item.as_str()?;
+        if let Some(prop) = props.get(key).and_then(|v| v.as_object()) {
+            if prop.get("type").and_then(|v| v.as_str()) == Some("string") {
+                string_keys.push(key);
+            }
+        }
+    }
+    if string_keys.len() == 1 {
+        Some(string_keys[0].to_string())
+    } else {
+        None
     }
 }
 

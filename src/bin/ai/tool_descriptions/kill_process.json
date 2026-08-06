@@ -1,6 +1,6 @@
 {
   "name": "kill_process",
-  "description": "Terminate a child or descendant process when the current process has management capability.",
+  "description": "Force-terminate a child or descendant process (equivalent to SIGKILL) when the current process has management capability. The reason is recorded in the target process result. For graceful termination use signal_process with SIGTERM; for pausing/resuming use SIGSTOP/SIGCONT; for cooperative cancellation use SIGCANCEL.",
   "parameters": {
     "type": "object",
     "properties": {

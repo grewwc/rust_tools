@@ -10,7 +10,8 @@
           "type": "object",
           "properties": {
             "task_id": {
-              "type": "string"
+              "type": "string",
+              "description": "The task_id returned by task_spawn / task_spawn_batch (or task_retry) of the delivered result being integrated."
             },
             "disposition": {
               "type": "string",
@@ -18,7 +19,8 @@
                 "accepted",
                 "rejected",
                 "superseded"
-              ]
+              ],
+              "description": "How the parent treats the result: 'accepted' = incorporated into the work, 'rejected' = reviewed but deliberately not used, 'superseded' = replaced by a newer attempt or result."
             },
             "summary": {
               "type": "string",

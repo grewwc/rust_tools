@@ -13,13 +13,48 @@ use super::super::types::{Message, ROLE_INTERNAL_NOTE, ROLE_SYSTEM, retained_tur
 use super::text_utils::truncate_to_chars;
 use super::tool_overflow::{
     build_tool_overflow_recall_lines, is_non_compressible_tool, is_preserved_user_or_image_stub,
-    preserve_noncompressible_tool_result_for_fold,
+    plan_noncompressible_tool_result_for_fold,
 };
 use super::{
-    COMPRESSED_TOOL_EVIDENCE_MARKER, archive_messages_to_overflow, is_archive_note_message,
-    is_compressed_tool_evidence_note, is_context_checkpoint_marker, is_summary_message,
-    keep_recent_user_turns_when_trimming, normalize_whitespace, value_to_string,
+    COMPRESSED_TOOL_EVIDENCE_MARKER, PlannedArchiveWrite, content_sha256_hex,
+    is_archive_note_message, is_compressed_tool_evidence_note, is_context_checkpoint_marker,
+    is_summary_message, keep_recent_user_turns_when_trimming, normalize_whitespace,
+    value_to_string,
 };
+
+pub(super) const FOLDED_TOOL_GROUP_ARCHIVE_DIR: &str = "folded-tool-groups";
+
+pub(super) struct ToolGroupFoldPlan {
+    messages: Vec<Message>,
+    folded_groups: usize,
+    archives: Vec<PlannedArchiveWrite>,
+}
+
+impl ToolGroupFoldPlan {
+    fn unchanged(messages: &[Message]) -> Self {
+        Self {
+            messages: messages.to_vec(),
+            folded_groups: 0,
+            archives: Vec::new(),
+        }
+    }
+
+    pub(super) fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub(super) fn folded_groups(&self) -> usize {
+        self.folded_groups
+    }
+
+    pub(super) fn commit(&self) -> bool {
+        self.archives.iter().all(PlannedArchiveWrite::commit)
+    }
+
+    pub(super) fn into_result(self) -> (Vec<Message>, usize) {
+        (self.messages, self.folded_groups)
+    }
+}
 
 pub(super) fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
     let assistant_idx = messages.iter().position(|m| {
@@ -142,14 +177,13 @@ fn is_protected_leading_system_like_message(message: &Message) -> bool {
         || is_context_checkpoint_marker(message)
 }
 
-/// 渐进式卸载：把一个 (assistant tool_calls + 配套 tool 结果) 整组折叠成单条
-/// `internal_note`。不可有损压缩的结果先写入会话 asset，再在 stub 中保留回读路径；
-/// 普通结果保留压缩后的关键结论，避免后续轮次重复劳动。
-pub(super) fn fold_tool_call_group_to_stub(
+/// 规划把一个 `(assistant tool_calls + 配套 tool 结果)` 整组折叠成单条
+/// `internal_note`。这里只生成确定性路径和待写内容，不执行任何文件 I/O。
+fn plan_tool_call_group_fold(
     messages: &[Message],
     group: &[usize],
     overflow_dir: Option<&Path>,
-) -> Option<Message> {
+) -> Option<(Message, Vec<PlannedArchiveWrite>)> {
     if group.is_empty() {
         return None;
     }
@@ -160,12 +194,21 @@ pub(super) fn fold_tool_call_group_to_stub(
         return None;
     }
 
+    let mut archives = Vec::new();
     let archive_file_path = if let Some(dir) = overflow_dir {
         let group_messages = group
             .iter()
             .filter_map(|idx| messages.get(*idx).cloned())
             .collect::<Vec<_>>();
-        Some(archive_messages_to_overflow(&group_messages, Some(dir))?)
+        let raw_messages = serde_json::to_string_pretty(&group_messages).ok()?;
+        let content =
+            format!("# 折叠工具组原文\n\nraw_message_json:\n```json\n{raw_messages}\n```\n");
+        let digest = content_sha256_hex(content.as_bytes());
+        let path = dir
+            .join(FOLDED_TOOL_GROUP_ARCHIVE_DIR)
+            .join(format!("{digest}.md"));
+        archives.push(PlannedArchiveWrite::new(path.clone(), content));
+        Some(path.to_string_lossy().to_string())
     } else {
         None
     };
@@ -213,7 +256,7 @@ pub(super) fn fold_tool_call_group_to_stub(
                 }
             })
             .unwrap_or_default();
-        let recall = tool_result_recall_text(tc, &result_text, overflow_dir)?;
+        let recall = tool_result_recall_text(tc, &result_text, overflow_dir, &mut archives)?;
         let invocation = tool_call_invocation_recall(tc);
         let target = tool_call_target_recall(tc);
         lines.push(format!(
@@ -234,13 +277,16 @@ pub(super) fn fold_tool_call_group_to_stub(
         lines.push("compression_decision: reuse the evidence above before repeating the same read/search/list/command action; only re-run or re-read if exact omitted text is required or the underlying target changed.".to_string());
     }
 
-    Some(Message {
-        role: ROLE_INTERNAL_NOTE.to_string(),
-        content: Value::String(lines.join("\n")),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    })
+    Some((
+        Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(lines.join("\n")),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        archives,
+    ))
 }
 
 fn parsed_tool_args(tool_call: &ToolCall) -> Option<Value> {
@@ -371,6 +417,7 @@ fn tool_result_recall_text(
     tool_call: &ToolCall,
     result_text: &str,
     overflow_dir: Option<&Path>,
+    archives: &mut Vec<PlannedArchiveWrite>,
 ) -> Option<String> {
     let tool_name = tool_call.function.name.as_str();
     let already_archived = result_text
@@ -388,12 +435,16 @@ fn tool_result_recall_text(
 
     let original_recall_lines =
         build_tool_overflow_recall_lines(&tool_call.function.name, &tool_call.function.arguments);
-    let preserved = preserve_noncompressible_tool_result_for_fold(
+    let (preserved, archive) = plan_noncompressible_tool_result_for_fold(
         overflow_dir,
+        &tool_call.id,
         tool_name,
         result_text,
         &original_recall_lines,
     )?;
+    if let Some(archive) = archive {
+        archives.push(archive);
+    }
     let file_path_line = preserved_file_path_line(&preserved);
     let archive_path_line = preserved_archive_file_path_line(&preserved);
 
@@ -824,13 +875,13 @@ fn group_reads_pending_patch_target(
 /// 断裂（OpenAI 协议要求二者成对）。含 `is_non_compressible_tool` 的组也会被
 /// 折叠，但 stub 内保留其 `file_path:` 召回锚点。
 ///
-/// 返回 `(folded_messages, folded_group_count)`。
-pub(super) fn fold_early_tool_groups(
+/// 返回纯内存 [`ToolGroupFoldPlan`]；调用方确认采用候选后必须显式 `commit`。
+pub(super) fn plan_early_tool_groups(
     messages: &[Message],
     keep_recent_groups: usize,
     overflow_dir: Option<&Path>,
     protected_tool_call_ids: &FxHashSet<String>,
-) -> (Vec<Message>, usize) {
+) -> ToolGroupFoldPlan {
     // 定位所有 assistant(tool_calls) 起始位置，作为工具组锚点。
     let group_anchors: Vec<usize> = messages
         .iter()
@@ -845,7 +896,7 @@ pub(super) fn fold_early_tool_groups(
         })
         .collect();
     if group_anchors.len() <= keep_recent_groups {
-        return (messages.to_vec(), 0);
+        return ToolGroupFoldPlan::unchanged(messages);
     }
     // 最近 keep_recent_groups 个工具组逐字保留；更早的折叠。
     // keep_recent_groups=0 时折叠全部工具组（fold_before_anchor 取消息末尾），
@@ -866,6 +917,7 @@ pub(super) fn fold_early_tool_groups(
 
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut folded_groups = 0usize;
+    let mut archives = Vec::new();
     let mut idx = 0usize;
     while idx < messages.len() {
         let message = &messages[idx];
@@ -902,8 +954,7 @@ pub(super) fn fold_early_tool_groups(
                 cursor += 1;
             }
             // pending-patch 目标路径的 read_file 组跳过折叠，逐字保留。必须在构造
-            // stub 之前判断，因为构造过程会归档原始组；否则每次压缩尝试都会把同一
-            // 个受保护组重复追加到 overflow-history.md。
+            // stub 之前判断，避免给不会被采纳的受保护组生成无意义归档计划。
             if group_reads_pending_patch_target(messages, &group, &pending_patch_paths) {
                 for &gi in &group {
                     out.push(messages[gi].clone());
@@ -911,8 +962,11 @@ pub(super) fn fold_early_tool_groups(
                 idx = cursor;
                 continue;
             }
-            if let Some(stub) = fold_tool_call_group_to_stub(messages, &group, overflow_dir) {
+            if let Some((stub, group_archives)) =
+                plan_tool_call_group_fold(messages, &group, overflow_dir)
+            {
                 out.push(stub);
+                archives.extend(group_archives);
                 folded_groups += 1;
                 idx = cursor;
                 continue;
@@ -921,5 +975,29 @@ pub(super) fn fold_early_tool_groups(
         out.push(message.clone());
         idx += 1;
     }
-    (out, folded_groups)
+    ToolGroupFoldPlan {
+        messages: out,
+        folded_groups,
+        archives,
+    }
+}
+
+/// 非 speculative 调用的便利入口：规划成功后立即提交；归档失败则保留原消息，
+/// 绝不生成指向不存在证据的折叠 stub。
+pub(super) fn fold_early_tool_groups(
+    messages: &[Message],
+    keep_recent_groups: usize,
+    overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &FxHashSet<String>,
+) -> (Vec<Message>, usize) {
+    let plan = plan_early_tool_groups(
+        messages,
+        keep_recent_groups,
+        overflow_dir,
+        protected_tool_call_ids,
+    );
+    if !plan.commit() {
+        return (messages.to_vec(), 0);
+    }
+    plan.into_result()
 }

@@ -130,12 +130,12 @@ impl StreamRenderState {
     }
 }
 
-/// Thinking 折叠状态：维护一个滚动窗口，只在终端展示最近 N 行 thinking 内容，
-/// 旧的行被折叠起来，同时保持流式实时输出。
+/// Thinking 折叠状态：维护一个滚动窗口，只在终端展示最近 N 条正文物理行，
+/// 旧内容被折叠起来，同时保持流式实时输出。
 pub(super) struct ThinkingFoldState {
-    /// 最大可见行数（不含折叠提示行）
+    /// 最大可见正文物理行数（不含单行折叠提示）
     pub(super) max_visible_lines: usize,
-    /// 已完成的 thinking 行（ring buffer，只保留最近 max_visible_lines 行）
+    /// 已完成的 thinking 逻辑行（ring buffer，只保留最近 max_visible_lines 个候选行）
     pub(super) recent_lines: VecDeque<String>,
     /// 当前正在流式输出的不完整行
     pub(super) current_line: String,
@@ -144,7 +144,7 @@ pub(super) struct ThinkingFoldState {
     /// 当前折叠窗口（仅正文，不含 header）占用的 terminal 物理行数。光标停在正文
     /// 最后一行，而不是窗口下方的空白行；重画时只需向上移动 `window_rows - 1`。
     pub(super) window_rows: usize,
-    /// 上次真正写到 terminal 的正文纯文本行（含缩进/截断，不含 ANSI / header），用于在
+    /// 上次真正写到 terminal 的正文纯文本物理行（含缩进/包裹，不含 ANSI / header），用于在
     /// terminal resize 后按**当前**列宽重算旧窗口会占多少物理行，避免 cursor-up 擦不干净。
     pub(super) rendered_body_lines: Vec<String>,
     /// 重画正文时额外保留的右侧列数。xterm.js 在最后一列使用 delayed-wrap，若正文恰好

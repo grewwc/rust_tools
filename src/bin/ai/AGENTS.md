@@ -55,6 +55,10 @@ rules in the nearest child `AGENTS.md`.
     stay assistant-derived and unverified. Never promote prior assistant wording
     into a system-level fact; project assistant-derived context via
     user/assistant handoff pairs only.
+11. **Compression side effects.** Speculative context-fold candidates must remain
+    pure until selected. Persist lossless evidence only for accepted candidates,
+    use deterministic/idempotent asset paths, and retain raw messages when an
+    archive commit fails.
 
 ## Scoped guides
 

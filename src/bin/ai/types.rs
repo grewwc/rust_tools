@@ -50,6 +50,7 @@ impl Clone for App {
             current_agent_manifest: self.current_agent_manifest.clone(),
             pending_files: self.pending_files.clone(),
             forced_skill: self.forced_skill.clone(),
+            forced_skill_source: self.forced_skill_source,
             // 该状态只属于 foreground 的下一条用户消息；`App` clone 还会用于
             // DriverContext、subagent 与后台任务，不能让它们继承这次续接。
             pending_skill_continuation: None,
@@ -98,6 +99,8 @@ pub(super) struct App {
     /// 用户通过 `@skills:<name>` 在输入框中显式选择、仅对**本轮**生效的强制 skill。
     /// turn 准备阶段读取后强制注入该 skill，并在该 turn 结束后清空，下一轮不再强制。
     pub(super) forced_skill: Option<String>,
+    /// `forced_skill` 的来源。只有显式用户选择会携带该值，用于本轮持久化审计。
+    pub(super) forced_skill_source: Option<ForcedSkillSource>,
     /// 当前 skill 通过 `request_user_input` 明确请求用户输入后保存的一次性续接。
     /// 下一条普通用户消息消费它；显式 skill 选择或会话切换会覆盖/清除它。
     pub(super) pending_skill_continuation: Option<PendingSkillContinuation>,
@@ -220,6 +223,24 @@ pub(super) struct SkillBiasMemory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PendingSkillContinuation {
     pub(super) skill_name: String,
+}
+
+/// 用户显式指定强制 skill 的入口。保留来源可区分命令解析问题与注入问题。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForcedSkillSource {
+    SkillsCommandInline,
+    SkillsCommandNextTurn,
+    InlineReference,
+}
+
+impl ForcedSkillSource {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::SkillsCommandInline => "/skills-inline",
+            Self::SkillsCommandNextTurn => "/skills-next-turn",
+            Self::InlineReference => "@skills",
+        }
+    }
 }
 
 /// Schema definition for a tool that can be offered to the AI model,

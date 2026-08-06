@@ -263,8 +263,13 @@ pub fn execute_knowledge_cache_manage(args: &Value) -> Result<String, String> {
             if let Some(query) = args["query"].as_str() {
                 context.insert("query".to_string(), query.to_string());
             }
-            if let Some(limit) = args["limit"].as_str() {
-                context.insert("limit".to_string(), limit.to_string());
+            // limit 在 schema 中声明为 integer；同时兼容字符串形式。
+            let limit_val = args["limit"]
+                .as_u64()
+                .map(|n| n.to_string())
+                .or_else(|| args["limit"].as_str().map(|s| s.to_string()));
+            if let Some(limit) = limit_val {
+                context.insert("limit".to_string(), limit);
             }
 
             let content = get_knowledge_with_cache(topic, &context, true)?;

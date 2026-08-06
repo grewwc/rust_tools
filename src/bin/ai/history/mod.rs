@@ -177,7 +177,8 @@ pub(in crate::ai) use sqlite::read_context_history_sqlite;
 pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::{
-    append_tool_execution_outcomes_sqlite, read_recent_messages_sqlite,
+    append_skill_activation_event_sqlite, append_tool_execution_outcomes_sqlite,
+    read_recent_messages_sqlite, read_skill_activation_events_sqlite,
     read_stale_patch_targets_sqlite, read_tool_execution_outcomes_sqlite,
     read_tool_message_ids_sqlite, write_stale_patch_targets_sqlite,
 };
@@ -192,7 +193,9 @@ pub(in crate::ai) use task_evidence::{
     render_unintegrated_task_evidence_resilient, task_evidence_exists,
 };
 #[allow(unused_imports)]
-pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE, ToolExecutionOutcome};
+pub(in crate::ai) use types::{
+    COLON, MAX_HISTORY_TURNS, Message, NEWLINE, SkillActivationEvent, ToolExecutionOutcome,
+};
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
 pub(in crate::ai) const ROLE_INTERNAL_NOTE: &str = types::ROLE_INTERNAL_NOTE;

@@ -1,6 +1,6 @@
 {
   "name": "task_spawn_batch",
-  "description": "Spawn multiple independent subagent tasks in one deterministic batch. Every item is preflight-validated before any child starts, then spawn attempts run in input order and the returned task entries preserve that order. Runtime spawn failures are reported per item without hiding already-started tasks.",
+  "description": "Spawn multiple independent subagent tasks (1 to 8 per batch) in one deterministic batch. Every item is preflight-validated before any child starts, then spawn attempts run in input order and the returned task entries preserve that order. Runtime spawn failures are reported per item without hiding already-started tasks.",
   "parameters": {
     "type": "object",
     "properties": {

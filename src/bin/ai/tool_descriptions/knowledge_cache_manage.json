@@ -26,8 +26,8 @@
         "description": "Search query for refresh."
       },
       "limit": {
-        "type": "string",
-        "description": "Limit for refresh results."
+        "type": "integer",
+        "description": "Max number of knowledge entries to refresh (optional; only used by the refresh action). Defaults to 10 when omitted."
       }
     },
     "required": [

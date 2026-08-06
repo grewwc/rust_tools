@@ -18,6 +18,16 @@ pub(in crate::ai) struct ToolExecutionOutcome {
     pub(in crate::ai) succeeded: bool,
 }
 
+/// 显式 skill 选择在 turn 准备阶段的实际注入结果。该旁路记录不进入模型消息，
+/// 用于区分命令解析、状态传递与 skill 注入三个阶段的问题。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ai) struct SkillActivationEvent {
+    pub(in crate::ai) requested_skill: String,
+    pub(in crate::ai) injected_skill: Option<String>,
+    pub(in crate::ai) source: String,
+    pub(in crate::ai) outcome: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(in crate::ai) struct Message {
     pub(in crate::ai) role: String,

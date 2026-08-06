@@ -280,6 +280,7 @@ pub(super) fn test_app(current_agent: &str) -> App {
         current_agent_manifest: None,
         pending_files: None,
         forced_skill: None,
+        forced_skill_source: None,
         pending_skill_continuation: None,
         forced_question: None,
         attached_image_files: Vec::new(),

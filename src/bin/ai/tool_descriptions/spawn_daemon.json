@@ -14,7 +14,7 @@
       },
       "priority": {
         "type": "integer",
-        "description": "Process priority. Default is 10."
+        "description": "Process priority on a 0-255 scale (0=highest, 255=lowest). Default is 10."
       },
       "quota_turns": {
         "type": "integer",

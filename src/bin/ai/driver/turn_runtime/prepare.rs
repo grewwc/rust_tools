@@ -350,7 +350,7 @@ pub(super) async fn prepare_turn(
     )?;
     let mut skill_turn = {
         let mc = mcp_client.lock().unwrap();
-        skill_runtime::prepare_skill_for_turn(app, &mc, skill_manifests, question)
+        skill_runtime::prepare_skill_for_turn(app, &mc, skill_manifests, question)?
     };
 
     {

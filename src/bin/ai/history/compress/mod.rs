@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::ai::types::App;
 
@@ -14,8 +15,10 @@ mod tool_groups;
 mod tool_overflow;
 
 use text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
+#[cfg(test)]
+use tool_groups::{FOLDED_TOOL_GROUP_ARCHIVE_DIR, fold_early_tool_groups};
 use tool_groups::{
-    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, first_trim_candidate, fold_early_tool_groups,
+    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, first_trim_candidate, plan_early_tool_groups,
     recent_tool_group_message_indices, recent_tool_result_groups,
 };
 #[cfg(test)]
@@ -192,6 +195,63 @@ const PRESERVED_IMAGE_OVERFLOW_DIR: &str = "image-overflow-preserved";
 const PRESERVED_CONTENT_STUB_PREFIX: &str = "[[PRESERVED_CONTENT_STUB_V1]]";
 const USER_OVERFLOW_SPILL_MIN_CHARS: usize = 1_024;
 const IMAGE_OVERFLOW_SPILL_MIN_CHARS: usize = 512;
+
+#[derive(Clone)]
+pub(super) struct PlannedArchiveWrite {
+    path: PathBuf,
+    content: String,
+}
+
+impl PlannedArchiveWrite {
+    pub(super) fn new(path: PathBuf, content: String) -> Self {
+        Self { path, content }
+    }
+
+    /// 把规划阶段的归档原子落盘。路径包含内容指纹，因此已存在文件可直接复用；
+    /// 并发 writer 即使同时写临时文件，最终也只会留下同一份确定性目标文件。
+    pub(super) fn commit(&self) -> bool {
+        if self.path.is_file() {
+            return true;
+        }
+        let Some(parent) = self.path.parent() else {
+            return false;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+        let Some(file_name) = self.path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let temporary = parent.join(format!(
+            ".{file_name}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(self.content.as_bytes())?;
+            file.sync_data()?;
+            std::fs::rename(&temporary, &self.path)
+        })();
+        if result.is_ok() || self.path.is_file() {
+            let _ = std::fs::remove_file(&temporary);
+            return true;
+        }
+        let _ = std::fs::remove_file(temporary);
+        false
+    }
+}
+
+pub(super) fn content_sha256_hex(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 pub(super) struct OverflowSink {
     path: PathBuf,
@@ -907,19 +967,56 @@ fn fold_noncompressible_tool_groups_to_fit(
         if messages_total_chars(messages) <= max_chars {
             break;
         }
-        let (folded, folded_groups) =
-            fold_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids);
-        if folded_groups == 0 {
+        let plan =
+            plan_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids);
+        if plan.folded_groups() == 0 {
             continue;
         }
         // 折叠必须带来净下降才采纳，否则丢弃本次结果继续收紧 keep_recent，
-        // 严防「组数变了但字符没降」导致的循环空转。
-        if messages_total_chars(&folded) < messages_total_chars(messages) {
+        // 严防「组数变了但字符没降」导致的循环空转。规划阶段没有文件副作用，
+        // 只有确认采纳后才 commit 归档。
+        if messages_total_chars(plan.messages()) < messages_total_chars(messages) && plan.commit() {
+            let (folded, _) = plan.into_result();
             *messages = folded;
             made_progress = true;
         }
     }
     made_progress
+}
+
+/// 批量移除可裁的普通消息，并在一次 flush 中归档。旧实现每删一条就重新进入外层
+/// 循环并 `sync_data`，tool-heavy 历史会把数百条 assistant 消息放大成数百次同步
+/// 写。这里先在候选副本上完成整批裁剪；归档失败时不采纳候选，原消息保持不变。
+fn trim_removable_messages_batch(
+    messages: &mut Vec<Message>,
+    max_chars: usize,
+    overflow_dir: Option<&Path>,
+) -> bool {
+    let mut candidate = messages.clone();
+    let mut removed = Vec::new();
+    // 维护运行期字符总量：字符数是 message_billable_chars 的纯加和，每轮删掉一条
+    // 消息精确减掉其计费字符，避免每轮对 candidate 做 O(n) 全量重扫（循环多轮时
+    // 会把整段 O(n²)）。candidate 仅在本循环内被 remove 修改，总量始终精确。
+    let mut total = messages_total_chars(&candidate);
+    while total > max_chars {
+        let Some(index) = first_trim_candidate(&candidate, max_chars) else {
+            break;
+        };
+        if candidate[index].role == "user" {
+            break;
+        }
+        let removed_msg = candidate.remove(index);
+        total = total.saturating_sub(message_billable_chars(&removed_msg));
+        removed.push(removed_msg);
+    }
+    if removed.is_empty() {
+        return false;
+    }
+    if overflow_dir.is_some() && archive_messages_to_overflow(&removed, overflow_dir).is_none() {
+        return false;
+    }
+    *messages = candidate;
+    true
 }
 
 fn shrink_messages_to_fit(
@@ -1011,18 +1108,12 @@ fn shrink_messages_to_fit(
                 // 避免同一小 user 被反复选中造成死循环。
                 break;
             }
-            // 其余可裁候选（assistant 纯叙述、compressed_tool_round 等，first_trim_candidate
-            // 已排除 tool 与带 tool_calls 的 assistant）删除前先零压缩归档。若有
-            // overflow_dir 但写入失败，保留原文并退出裁剪循环，避免制造不可恢复丢失。
-            if let Some(dir) = overflow_dir {
-                let removed = messages[idx].clone();
-                if archive_messages_to_overflow(std::slice::from_ref(&removed), Some(dir)).is_none()
-                {
-                    break;
-                }
+            // 其余可裁候选（assistant 纯叙述、compressed_tool_round 等）集中归档，
+            // 避免逐条 append + sync_data。批量归档失败时原消息保持不变。
+            if trim_removable_messages_batch(&mut messages, max_chars, overflow_dir) {
+                continue;
             }
-            messages.remove(idx);
-            continue;
+            break;
         }
         break;
     }
@@ -1114,7 +1205,11 @@ fn shrink_messages_to_fit_with_summary(
     let mut messages_before_first_drop: Option<Vec<Message>> = None;
     let mut dropped: Vec<Message> = Vec::new();
 
-    while messages_total_chars(&messages) > max_chars {
+    // 运行期字符总量：单条删除精确减掉 message_billable_chars，折叠/外溢是整体性
+    // 批量变更，各自分支里统一重算，语义与每轮 `messages_total_chars(&messages)`
+    // 完全等价，但避免多轮循环时对整条消息序列反复 O(n) 全量重扫。
+    let mut total = messages_total_chars(&messages);
+    while total > max_chars {
         // 一次性批量折叠超出预算的所有非保护工具组（compressible + non-compressible
         // 都通过 [`fold_early_tool_groups`] 处理）——理由同
         // [`shrink_messages_to_fit`]，避免单组 fold 循环迭代几十轮注入
@@ -1125,18 +1220,22 @@ fn shrink_messages_to_fit_with_summary(
             overflow_dir,
             protected_tool_call_ids,
         ) {
+            total = messages_total_chars(&messages);
             continue;
         }
         if let Some(idx) = first_trim_candidate(&messages, max_chars) {
             if messages_before_first_drop.is_none() {
                 messages_before_first_drop = Some(messages.clone());
             }
-            dropped.push(messages.remove(idx));
+            let removed_msg = messages.remove(idx);
+            total = total.saturating_sub(message_billable_chars(&removed_msg));
+            dropped.push(removed_msg);
             continue;
         }
         if let Some(dir) = overflow_dir
             && try_spill_preserved_message_to_stub(&mut messages, dir, max_chars)
         {
+            total = messages_total_chars(&messages);
             continue;
         }
         break;
@@ -1465,7 +1564,8 @@ fn emergency_cap_messages_to_fit(
     if truncated_any {
         insert_overflow_archive_note_if_exists(messages, overflow_dir);
     }
-    truncate_mutable_messages_to_fit(messages, max_chars, overflow_dir, protected_tool_call_ids)
+    let inner = truncate_mutable_messages_to_fit(messages, max_chars, overflow_dir, protected_tool_call_ids);
+    truncated_any || inner
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1511,6 +1611,35 @@ fn choose_larger_mutable_field(
     }
 }
 
+const CONTEXT_OVERFLOW_TRUNCATED_PREFIX: &str = "[context-overflow-truncated]";
+
+/// 判断文本是否已经是 overflow-truncated marker（归档已落盘，路径内嵌在文本中）。
+fn is_context_overflow_truncated_marker(text: &str) -> bool {
+    text.trim_start().starts_with(CONTEXT_OVERFLOW_TRUNCATED_PREFIX)
+        && text.contains("archived at: ")
+}
+
+/// 从已存在的 overflow-truncated marker 中提取归档路径，折叠为最小指针。
+/// 当 target 太小时丢弃 head+tail 预览，只保留 marker + 路径 + 回读提示。
+/// 返回 None 表示无法解析路径或折叠后不会变短。
+fn build_context_overflow_pointer(text: &str, target: usize) -> Option<String> {
+    let path = text
+        .lines()
+        .find_map(|line| line.split_once("archived at: ").map(|(_, p)| p.trim()))
+        .or_else(|| {
+            text.split_once("archived at: ")
+                .map(|(_, rest)| rest.split([';', '\n']).next().unwrap_or(rest).trim())
+        })?;
+    // 优先尝试保留预览的完整形态（若 target 足够大）。
+    let full_pointer = format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} full original archived at: {path}\n");
+    if full_pointer.chars().count() <= target {
+        return Some(full_pointer);
+    }
+    // target 仍然不够：只保留单行路径指针（无预览、无冗余文案）。
+    let minimal = format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} archived at: {path}");
+    (minimal.chars().count() < text.chars().count()).then_some(minimal)
+}
+
 fn truncate_mutable_field(
     message: &mut Message,
     field: MutableMessageField,
@@ -1533,6 +1662,18 @@ fn truncate_mutable_field(
             let text = value_to_string(&message.content);
             let original_chars = text.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
+            // 字段已经是 overflow-truncated marker（归档已存在，路径内嵌在文本中）：
+            // 无需再次落盘，允许折叠为最小指针（marker + 路径，无预览），避免
+            // PATH_C_PER_MSG_CAP(8000) > hard_target(如 5000) 时内层无法继续收敛。
+            if is_context_overflow_truncated_marker(&text) {
+                if let Some(pointer) = build_context_overflow_pointer(&text, target) {
+                    if pointer.chars().count() < original_chars {
+                        message.content = Value::String(pointer);
+                        return true;
+                    }
+                }
+                return false;
+            }
             // 预览预算不足时 stub 只剩长路径、不含任何实际内容（假截断）：
             // 小结果（如 task_status 轮询结果）被换成空预览 stub 后模型无法判断
             // 真实状态，会陷入「状态确认不了 → 无限轮询」死循环。宁可保留原文
@@ -2024,51 +2165,54 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 build_persisted_summary_text_with_app(app, &summary_source, summary_max_chars)
                     .await;
             if !summary.trim().is_empty() {
-                // Path A 会用摘要替换 earlier 原文；若归档失败，跳过该路径并保留
-                // 原始 messages 进入后续折叠/硬预算兜底，避免摘要成为唯一证据。
-                if let Some(archive_file_path) =
-                    archive_messages_to_overflow(earlier, Some(overflow_dir.as_path()))
+                let archive_file_path = overflow_dir.join(OVERFLOW_HISTORY_FILENAME);
+                let tail_plan = plan_early_tool_groups(
+                    &messages[split_at..],
+                    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS,
+                    Some(overflow_dir.as_path()),
+                    &protected_tool_call_ids,
+                );
+                let mut out =
+                    Vec::with_capacity(preserved_system_end + 2 + (messages.len() - split_at));
+                // 1. 头部 system / internal_note（agent 指令等）原样保留
+                out.extend_from_slice(&messages[..preserved_system_end]);
+                // 2. 摘要作为 internal_note 注入（normalize_messages_for_request 会把
+                //    它归类成 Summary heading 并合并进 system 消息）
+                out.push(Message {
+                    role: ROLE_INTERNAL_NOTE.to_string(),
+                    content: Value::String(format!(
+                        "[mid-turn-summary] 早期工具调用与对话已被 LLM 摘要：\n{summary}"
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+                insert_archive_note_if_missing(
+                    &mut out,
+                    build_overflow_placeholder(&archive_file_path.to_string_lossy()),
+                );
+                // 2b. 回填被抽出的 context checkpoint 标记，保留其可回读索引
+                out.extend(checkpoint_markers.iter().cloned());
+                // 3. 尾窗折叠先纯规划；整个 Path A 确认优于当前 best 后再统一写盘。
+                out.extend_from_slice(tail_plan.messages());
+                let after = messages_total_chars(&out);
+                // 先提交尾窗折叠，确认候选被采纳后再归档 earlier：archive 是追加式写
+                // overflow-history.md（非幂等），若提前归档而 commit 失败，`earlier`
+                // 已落盘但上下文未采纳 `out`，下轮压缩会重复归档同一批消息 → 孤儿累积。
+                // 短路 `&&` 保证 commit 失败时根本不会触碰归档；commit 成功后若归档
+                // 失败，`best` 不更新、上下文仍保留 earlier，无数据丢失（仅剩幂等
+                // 哈希命名的折叠文件）。
+                if after < best_after && tail_plan.commit()
+                    && archive_messages_to_overflow(earlier, Some(overflow_dir.as_path())).is_some()
                 {
-                    let mut out =
-                        Vec::with_capacity(preserved_system_end + 2 + (messages.len() - split_at));
-                    // 1. 头部 system / internal_note（agent 指令等）原样保留
-                    out.extend_from_slice(&messages[..preserved_system_end]);
-                    // 2. 摘要作为 internal_note 注入（normalize_messages_for_request 会把
-                    //    它归类成 Summary heading 并合并进 system 消息）
-                    out.push(Message {
-                        role: ROLE_INTERNAL_NOTE.to_string(),
-                        content: Value::String(format!(
-                            "[mid-turn-summary] 早期工具调用与对话已被 LLM 摘要：\n{summary}"
-                        )),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                    });
-                    insert_archive_note_if_missing(
-                        &mut out,
-                        build_overflow_placeholder(&archive_file_path),
-                    );
-                    // 2b. 回填被抽出的 context checkpoint 标记，保留其可回读索引
-                    out.extend(checkpoint_markers.iter().cloned());
-                    // 3. 尾窗：保留 user 逐字 + 最近若干工具组逐字，更早工具组折叠成 stub
-                    let (tail, _) = fold_early_tool_groups(
-                        &messages[split_at..],
-                        MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS,
-                        Some(overflow_dir.as_path()),
-                        &protected_tool_call_ids,
-                    );
-                    out.extend(tail);
-                    let after = messages_total_chars(&out);
-                    if after < best_after {
-                        best = Some(out);
-                        best_after = after;
-                    }
-                    // 有效压缩且达标 → 直接返回
-                    if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS
-                        && best_after <= hard_target
-                    {
-                        return (best.unwrap(), before, best_after, true);
-                    }
+                    best = Some(out);
+                    best_after = after;
+                }
+                // 有效压缩且达标 → 直接返回
+                if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS
+                    && best_after <= hard_target
+                {
+                    return (best.unwrap(), before, best_after, true);
                 }
             }
         }
@@ -2087,17 +2231,18 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
             break;
         }
         let current = best.as_ref().unwrap_or(&messages);
-        let (folded, folded_groups) = fold_early_tool_groups(
+        let plan = plan_early_tool_groups(
             current,
             keep_recent,
             Some(overflow_dir.as_path()),
             &protected_tool_call_ids,
         );
-        if folded_groups == 0 {
+        if plan.folded_groups() == 0 {
             continue;
         }
-        let after = messages_total_chars(&folded);
-        if after < best_after {
+        let after = messages_total_chars(plan.messages());
+        if after < best_after && plan.commit() {
+            let (folded, _) = plan.into_result();
             best = Some(folded);
             best_after = after;
         }

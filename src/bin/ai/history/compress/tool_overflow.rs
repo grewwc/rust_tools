@@ -19,10 +19,11 @@ use super::tool_groups::{recent_tool_group_message_indices, recent_tool_result_g
 use super::{
     COMPRESSED_TOOL_EVIDENCE_MARKER, IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_GROUPS,
     PRESERVED_CONTENT_STUB_PREFIX, PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR,
-    PRESERVED_USER_OVERFLOW_DIR, USER_OVERFLOW_SPILL_MIN_CHARS, automatic_summary_body,
-    dedup_adjacent, keep_recent_user_turns_when_trimming, message_contains_image,
-    normalize_whitespace, redact_images_except_last, strip_nested_prior_summary_prefixes,
-    tool_message_indices, value_to_string,
+    PRESERVED_USER_OVERFLOW_DIR, PlannedArchiveWrite, USER_OVERFLOW_SPILL_MIN_CHARS,
+    automatic_summary_body, content_sha256_hex, dedup_adjacent,
+    keep_recent_user_turns_when_trimming, message_contains_image, normalize_whitespace,
+    redact_images_except_last, strip_nested_prior_summary_prefixes, tool_message_indices,
+    value_to_string,
 };
 
 const PRESERVED_TOOL_OVERFLOW_STUB_PREFIX: &str = "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]";
@@ -860,32 +861,36 @@ pub(super) fn is_non_compressible_tool(tool_name: &str) -> bool {
     !crate::ai::tools::registry::common::tool_history_policy(tool_name).allows_lossy_compress()
 }
 
-/// 将尚未外溢的高精度工具结果写入会话 asset，并返回带 `file_path` 的稳定 stub。
+/// 为尚未外溢的高精度工具结果规划确定性 asset 和带 `file_path` 的稳定 stub。
 ///
-/// 工具组折叠会移除原始 `tool` 消息；对不可有损压缩的结果，必须先走这条路径，
-/// 否则折叠 note 只剩一行首句，完整诊断将没有任何可回读的真相来源。已有 stub
-/// 直接复用，避免同一结果在多轮压缩中反复写出副本。调用方可额外传入
-/// `original_*` 锚点，让 stub 自身就明确区分「原始目标」与「内部归档文件」。
-pub(super) fn preserve_noncompressible_tool_result_for_fold(
+/// 本函数只生成 [`PlannedArchiveWrite`]，不触碰文件系统。调用方确认采用整个 fold
+/// 方案后再统一 commit，避免被拒绝的 speculative fold 留下磁盘副作用。已有 stub
+/// 直接复用，不产生新写入。
+pub(super) fn plan_noncompressible_tool_result_for_fold(
     overflow_dir: Option<&Path>,
+    tool_call_id: &str,
     tool_name: &str,
     content: &str,
     recall_lines: &[String],
-) -> Option<String> {
+) -> Option<(String, Option<PlannedArchiveWrite>)> {
     if is_preserved_tool_overflow_stub(content) {
-        return Some(content.to_string());
+        return Some((content.to_string(), None));
     }
-    let path =
-        overflow_dir.and_then(|dir| write_preserved_tool_overflow_file(dir, tool_name, content))?;
-    Some(build_preserved_tool_overflow_stub(
-        &path,
-        tool_name,
-        content,
-        recall_lines,
+    let overflow_dir = overflow_dir?;
+    let safe_tool = sanitize_overflow_name_component(tool_name);
+    let identity = format!("{tool_call_id}\0{content}");
+    let digest = content_sha256_hex(identity.as_bytes());
+    let path = overflow_dir
+        .join(PRESERVED_TOOL_OVERFLOW_DIR)
+        .join(format!("folded-{safe_tool}-{}.txt", &digest[..24]));
+    let stub = build_preserved_tool_overflow_stub(&path, tool_name, content, recall_lines);
+    Some((
+        stub,
+        Some(PlannedArchiveWrite::new(path, content.to_string())),
     ))
 }
 
-/// 同 [`preserve_noncompressible_tool_result_for_fold`]，但归档文件名由
+/// LLM prune 路径使用的即时稳定归档；与 fold 的两阶段计划相互独立。文件名由
 /// `tool_call_id` 确定性派生（而非随机 uuid + 时间戳）。
 ///
 /// LLM 引导裁剪（`llm_prune::apply_pruning`）作用于每次模型请求前的临时 `messages`
@@ -947,6 +952,8 @@ fn sanitize_overflow_name_component(raw: &str) -> String {
         .collect::<String>()
 }
 
+/// 非 speculative 的即时外溢路径仍使用独立文件。fold 不得调用本函数；fold 的
+/// 写入统一由 `PlannedArchiveWrite` 在候选被采纳后提交。
 fn write_preserved_tool_overflow_file(
     overflow_dir: &Path,
     tool_name: &str,

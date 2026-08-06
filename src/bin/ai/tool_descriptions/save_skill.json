@@ -59,7 +59,7 @@
       },
       "overwrite": {
         "type": "boolean",
-        "description": "If false, fail when the target file already exists (default: true)."
+        "description": "Whether to overwrite an existing file at the target path (default: true; set false to fail instead of overwriting)."
       }
     },
     "required": [

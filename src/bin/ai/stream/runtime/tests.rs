@@ -187,6 +187,7 @@ fn test_app() -> App {
         current_agent_manifest: None,
         pending_files: None,
         forced_skill: None,
+        forced_skill_source: None,
         pending_skill_continuation: None,
         forced_question: None,
         attached_image_files: Vec::new(),
@@ -1343,7 +1344,55 @@ fn thinking_fold_window_counts_current_line_inside_visible_budget() {
 }
 
 #[test]
-fn thinking_fold_window_rows_follow_wrapped_terminal_height() {
+fn thinking_fold_window_wraps_long_lines_to_terminal_width() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("COLUMNS", "12");
+    }
+
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.max_visible_lines = 4;
+    fold.total_lines = 1;
+    fold.recent_lines
+        .push_back("12345678901234567890".to_string());
+    fold.current_line = "abcdef".to_string();
+
+    let (window, rows) = render_thinking_fold_window(fold);
+
+    let plain_lines = window
+        .lines()
+        .map(crate::ai::stream::extract::strip_ansi_codes)
+        .collect::<Vec<_>>();
+    // COLUMNS=12，reserve = 缩进 4 → 有效宽度 8 列。长行按 8 列自然折行，
+    // 每个包裹段本身就是一个物理行，且恰好落在 4 条正文物理行的可见预算内。
+    assert_eq!(plain_lines, vec![
+        "    12345678",
+        "    90123456",
+        "    7890",
+        "    abcdef",
+    ]);
+    assert_eq!(rows, 4);
+    for visible in &plain_lines {
+        assert!(
+            visible.starts_with(THINKING_FOLD_BODY_INDENT),
+            "thinking body should stay nested under header: {visible:?}"
+        );
+        assert!(
+            unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 12,
+            "line exceeds terminal width: {visible:?}"
+        );
+    }
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
+fn thinking_fold_window_caps_wrapped_content_to_physical_row_budget() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1360,24 +1409,60 @@ fn thinking_fold_window_rows_follow_wrapped_terminal_height() {
     fold.current_line = "abcdef".to_string();
 
     let (window, rows) = render_thinking_fold_window(fold);
-
     let plain_lines = window
         .lines()
         .map(crate::ai::stream::extract::strip_ansi_codes)
         .collect::<Vec<_>>();
-    assert_eq!(
-        plain_lines,
-        vec!["    12345678", "    90123456", "    7890", "    abcdef"]
-    );
-    assert_eq!(rows, 4);
-    // 每条手动换行后的视觉行都不超过终端列宽（12），且仍缩进在 thinking 块内。
+
+    // 逻辑行未超限也可能因包裹超过物理行预算；此时保留最新两行，并以单行提示
+    // 占据额外的一行，保证 cursor-up 擦除的范围恒定有界。
+    assert_eq!(plain_lines, vec!["    … more", "    7890", "    abcdef"]);
+    assert_eq!(rows, 3);
+    assert!(rows <= fold.max_visible_lines + 1);
     for visible in &plain_lines {
         assert!(
-            visible.starts_with(THINKING_FOLD_BODY_INDENT),
-            "thinking body should stay nested under header: {visible:?}"
-        );
-        assert!(
             unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 12,
+            "line exceeds terminal width: {visible:?}"
+        );
+    }
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
+fn one_column_fold_content_keeps_row_accounting_safe() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("COLUMNS", "5");
+    }
+
+    // 缩进占 4 列时，正文和折叠提示只剩一列。截断提示必须仍是一列，宽字符则以
+    // 单列占位符表示，不能让终端自行折行而使擦除行数少算。
+    assert_eq!(
+        crate::ai::stream::clamp_line_to_terminal_row_with_reserve("marker", 4),
+        "…"
+    );
+
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.max_visible_lines = 2;
+    fold.current_line = "中a".to_string();
+
+    let (window, rows) = render_thinking_fold_window(fold);
+    let plain_lines = window
+        .lines()
+        .map(crate::ai::stream::extract::strip_ansi_codes)
+        .collect::<Vec<_>>();
+
+    assert_eq!(plain_lines, vec!["    ?", "    a"]);
+    assert_eq!(rows, 2);
+    for visible in &plain_lines {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 5,
             "line exceeds terminal width: {visible:?}"
         );
     }
@@ -1402,7 +1487,7 @@ fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
 
     let mut state = StreamProcessingState::new();
     let fold = &mut state.render.thinking_fold;
-    fold.max_visible_lines = 2;
+    fold.max_visible_lines = 5;
     fold.rewrite_right_margin_cols = fold_rewrite_right_margin_cols(Some("vscode"));
     fold.total_lines = 1;
     fold.recent_lines
@@ -1415,16 +1500,15 @@ fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
         .map(crate::ai::stream::extract::strip_ansi_codes)
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        plain_lines,
-        vec![
-            "    123456",
-            "    789012",
-            "    345678",
-            "    90",
-            "    abcdef"
-        ]
-    );
+    // COLUMNS=12，reserve = 缩进 4 + xterm.js 右边距 2 = 6 → 有效宽度 6 列。
+    // 长行按 6 列自然折行，每个包裹段恰好一个物理行，与 xterm.js delayed-wrap 解耦。
+    assert_eq!(plain_lines, vec![
+        "    123456",
+        "    789012",
+        "    345678",
+        "    90",
+        "    abcdef",
+    ]);
     assert_eq!(rows, 5);
     assert!(
         !window.ends_with('\n'),

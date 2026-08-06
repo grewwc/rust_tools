@@ -22,7 +22,7 @@ use crate::ai::types::ToolCall;
 use super::{
     blob,
     compress::{self, COMPRESSED_TOOL_EVIDENCE_MARKER, is_summary_note_text, value_to_string},
-    types::{Message, ROLE_INTERNAL_NOTE, ToolExecutionOutcome},
+    types::{Message, ROLE_INTERNAL_NOTE, SkillActivationEvent, ToolExecutionOutcome},
 };
 
 const STALE_PATCH_TARGETS_META_KEY: &str = "stale_patch_targets_v1";
@@ -322,6 +322,14 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             tool_call_id TEXT PRIMARY KEY,
             execution_signature TEXT NOT NULL,
             succeeded INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        CREATE TABLE IF NOT EXISTS skill_activation_events (
+            id INTEGER PRIMARY KEY,
+            requested_skill TEXT NOT NULL,
+            injected_skill TEXT,
+            source TEXT NOT NULL,
+            outcome TEXT NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );",
     )
@@ -896,6 +904,80 @@ pub(in crate::ai) fn read_tool_execution_outcomes_sqlite(
                 tool_call_id: row.get(0)?,
                 execution_signature: row.get(1)?,
                 succeeded: row.get::<_, i64>(2)? != 0,
+            })
+        })
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// 持久化显式 skill 选择的实际注入结果。该记录是诊断旁路，不会污染 canonical
+/// messages 或模型上下文。
+pub(in crate::ai) fn append_skill_activation_event_sqlite(
+    path: &Path,
+    event: &SkillActivationEvent,
+) -> io::Result<()> {
+    if !blob::is_sqlite_path(path) {
+        return Ok(());
+    }
+    with_session_state_lock(path, || {
+        let mut conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        let tx = conn
+            .transaction()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO skill_activation_events
+                (requested_skill, injected_skill, source, outcome)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                event.requested_skill,
+                event.injected_skill,
+                event.source,
+                event.outcome,
+            ],
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        bump_history_revision(&tx)?;
+        tx.commit()
+            .map_err(|error| io::Error::other(error.to_string()))
+    })
+}
+
+/// 读取 session 内的显式 skill 注入审计记录。旧会话没有该旁路表时安全退化为空。
+pub(in crate::ai) fn read_skill_activation_events_sqlite(
+    path: &Path,
+) -> io::Result<Vec<SkillActivationEvent>> {
+    if !blob::is_sqlite_path(path) || !path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = open_history_db(path)?;
+    let table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type='table' AND name='skill_activation_events'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT requested_skill, injected_skill, source, outcome
+             FROM skill_activation_events ORDER BY created_at ASC, rowid ASC",
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SkillActivationEvent {
+                requested_skill: row.get(0)?,
+                injected_skill: row.get(1)?,
+                source: row.get(2)?,
+                outcome: row.get(3)?,
             })
         })
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -1782,6 +1864,8 @@ fn clear_session_history_sqlite_unlocked(path: &Path) -> io::Result<()> {
     invalidate_context_snapshot(&tx)?;
     tx.execute("DELETE FROM tool_execution_outcomes", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute("DELETE FROM skill_activation_events", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
     // 保留 history_revision 行：它是缓存失效计数器，须跨 clear **单调递增**。
     // history_generation 是快照并发写的 fencing token，clear 后也必须单调递增；
     // turn_seq 同样是 session 级身份，清空上下文不能让旧序号被复用。
@@ -1821,6 +1905,8 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
             .map_err(|e| io::Error::other(e.to_string()))?;
         invalidate_context_snapshot(&tx)?;
         tx.execute("DELETE FROM tool_execution_outcomes", [])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        tx.execute("DELETE FROM skill_activation_events", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
         bump_history_revision(&tx)?;
         return tx.commit().map_err(|e| io::Error::other(e.to_string()));
@@ -2475,6 +2561,36 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skill_activation_events_preserve_injection_audit_without_messages() {
+        let dir = std::env::temp_dir().join(format!(
+            "skill_activation_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        let event = SkillActivationEvent {
+            requested_skill: "bytedcli".to_string(),
+            injected_skill: Some("bytedcli".to_string()),
+            source: "/skills-inline".to_string(),
+            outcome: "injected".to_string(),
+        };
+
+        append_skill_activation_event_sqlite(&path, &event).unwrap();
+
+        assert_eq!(read_skill_activation_events_sqlite(&path).unwrap(), vec![event]);
+        assert!(read_all_messages_sqlite(&path).unwrap().is_empty());
+
+        clear_session_history_sqlite(&path).unwrap();
+        assert!(read_skill_activation_events_sqlite(&path).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

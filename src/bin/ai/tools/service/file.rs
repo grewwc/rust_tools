@@ -759,63 +759,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_appends_symbol_outline_for_supported_language() {
-        let path = make_temp_path("outline").with_extension("rs");
-        let content = "fn alpha() {}\n\nstruct Beta {\n    x: i32,\n}\n\nfn gamma() {}\n";
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, content).unwrap();
-
-        let args = serde_json::json!({
-            "file_path": path.to_string_lossy(),
-            "offset": 1,
-            "limit": 100
-        });
-        let output = execute_read_file(&args).unwrap();
-        assert!(output.contains("Symbol outline"), "output: {output}");
-        assert!(output.contains("alpha"), "output: {output}");
-        assert!(output.contains("Beta"), "output: {output}");
-        assert!(output.contains("gamma"), "output: {output}");
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_read_file_no_outline_for_unsupported_language() {
-        let path = make_temp_path("plain").with_extension("txt");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "just some plain text\nno symbols here\n").unwrap();
-
-        let args = serde_json::json!({
-            "file_path": path.to_string_lossy(),
-            "offset": 1,
-            "limit": 100
-        });
-        let output = execute_read_file(&args).unwrap();
-        assert!(!output.contains("Symbol outline"), "output: {output}");
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_read_file_skips_outline_for_later_chunks() {
-        let path = make_temp_path("outline_late").with_extension("rs");
-        let content = "fn alpha() {}\n\nstruct Beta {\n    x: i32,\n}\n\nfn gamma() {}\n";
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, content).unwrap();
-
-        let args = serde_json::json!({
-            "file_path": path.to_string_lossy(),
-            "offset": 3,
-            "limit": 2
-        });
-        let output = execute_read_file(&args).unwrap();
-        assert!(!output.contains("Symbol outline"), "output: {output}");
-        assert!(output.contains("Beta"), "output: {output}");
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
     fn test_file_tools_accept_path_alias() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let path = make_temp_path("path_alias").with_extension("txt");
