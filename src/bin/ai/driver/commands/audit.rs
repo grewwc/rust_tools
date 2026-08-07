@@ -9,6 +9,11 @@ pub(crate) const AUDIT_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(15 
 pub(crate) const AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(5 * 60);
 
 const SUBAGENT_FINAL_ANSWER_MARKER: &str = "[Subagent final answer]\n";
+const AUDIT_PROGRESS_PROTOCOL: &str = "===== 审计增量交付协议 =====\n\
+每完成一个独立检查分支，必须在继续调用工具前输出一条以 `AUDIT_CHECKPOINT:` 开头的简短进度记录，包含：已检查范围、带 file:line 的阶段性发现、仍待验证的问题。\n\
+不要等到最终回答才首次汇总发现；checkpoint 是可恢复的阶段性证据。\n\
+收到收尾信号后立即停止扩展调查，基于已有 checkpoint 和工具证据生成最终审计结论。\n\
+===== 审计增量交付协议结束 =====";
 
 /// `/audit` 需要在已有 DRIVER_CTX 的 turn 内启动同步子代理，因此这里只识别命令，
 /// 实际执行由 turn_runtime 在进入模型循环前完成。
@@ -117,8 +122,9 @@ pub(crate) fn build_audit_prompt(instruction: &str) -> String {
 
 /// 纯函数：把用户指令与采集到的改动上下文拼成子代理输入，便于单测。
 fn compose_audit_prompt(instruction: &str, changes_context: &str) -> String {
+    let instruction = format!("{instruction}\n\n{AUDIT_PROGRESS_PROTOCOL}");
     if changes_context.is_empty() {
-        return instruction.to_string();
+        return instruction;
     }
     format!(
         "{instruction}\n\n\
@@ -437,11 +443,11 @@ model_reason=inherited parent agent current model\n\
     }
 
     #[test]
-    fn compose_audit_prompt_passes_instruction_through_when_no_changes() {
-        assert_eq!(
-            compose_audit_prompt("review the diff", ""),
-            "review the diff"
-        );
+    fn compose_audit_prompt_requires_incremental_checkpoints_without_changes() {
+        let prompt = compose_audit_prompt("review the diff", "");
+        assert!(prompt.starts_with("review the diff\n\n"));
+        assert!(prompt.contains("AUDIT_CHECKPOINT:"));
+        assert!(prompt.contains("不要等到最终回答才首次汇总发现"));
     }
 
     #[test]

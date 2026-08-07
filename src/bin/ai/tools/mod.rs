@@ -75,6 +75,8 @@ const SUBAGENT_ORCHESTRATION_TOOL_NAMES: &[&str] = &[
     "task_status",
     "task_integrate",
     "task_cancel",
+    "manage_team",
+    "run_agent_graph",
 ];
 
 pub(crate) fn is_subagent_orchestration_tool_name(name: &str) -> bool {

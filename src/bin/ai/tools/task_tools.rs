@@ -26,6 +26,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod agent_team;
+
 const MAX_TASK_REGISTRY_SIZE: usize = 100;
 const DEFAULT_TASK_PRIORITY: u8 = 20;
 const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
@@ -188,6 +190,7 @@ impl InheritOptions {
 /// **不变量**：本注册表中的 `pid` 必须始终对应 kernel process table 里同一个
 /// 进程；结果必须先由 `task_wait` / `task_status` 持久化到 evidence ledger，
 /// 再移除注册表条目和 IPC 资源。容量满时拒绝新任务，绝不驱逐未收取结果。
+#[derive(Clone)]
 pub(crate) struct AsyncTaskEntry {
     pub(crate) session_id: String,
     pub(crate) result_observed: bool,
@@ -2598,6 +2601,23 @@ fn persist_rendered_task_evidence(
     .map_err(|error| format!("failed to persist task evidence for {task_id}: {error}"))
 }
 
+/// 读取当前会话中指定 task_id 的已持久化证据状态（status + payload）。
+/// 无 driver 上下文或未持久化时返回 None（与持久化端保持一致的宽松语义）。
+fn read_persisted_task_evidence_status(
+    session_id: &str,
+    task_id: &str,
+) -> Result<Option<(String, String)>, String> {
+    let Some(context) = crate::ai::driver::runtime_ctx::try_current() else {
+        return Ok(None);
+    };
+    crate::ai::history::read_task_evidence_status_payload(
+        context.app_proto.config.history_file.as_path(),
+        session_id,
+        task_id,
+    )
+    .map_err(|error| format!("failed to read task evidence for {task_id}: {error}"))
+}
+
 fn collect_missing_task_result(task_id: &str, entry: &AsyncTaskEntry) -> Result<String, String> {
     let result = StoredTaskResult {
         status: "failed".to_string(),
@@ -2640,6 +2660,111 @@ fn collect_ready_task_result(
         .unwrap()
         .take(&task_id.to_string());
     Ok(Some(rendered))
+}
+
+pub(super) enum OwnedTaskPoll {
+    Pending {
+        state: String,
+    },
+    Terminal {
+        result: StoredTaskResult,
+        rendered: String,
+    },
+}
+
+/// Team/Graph 编排器使用的非阻塞收集入口。
+///
+/// 与 `task_status` 保持同一条真相路径：先持久化 evidence，再消费 channel，最后
+/// 清理 IPC 与 registry。这样图执行器不会建立第二套 subagent 结果协议，也不会
+/// 绕过 context rebuild 所依赖的 durable evidence。
+pub(super) fn poll_owned_task_result(task_id: &str) -> Result<OwnedTaskPoll, String> {
+    let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+    let current_owner_pid = current_task_owner_pid()?;
+    let entry = {
+        let registry = TASK_REGISTRY.lock().unwrap();
+        let entry = match registry.get_ref(&task_id.to_string()) {
+            Some(entry) => entry,
+            None => {
+                // 条目缺失：正常流程里条目只在 poll 到 Terminal 并持久化证据后才被移除。
+                // 若本会话已持久化该任务的证据（H1 回归「已 poll 但 checkpoint 未保存」的
+                // 唯一途径），返回幂等 Terminal 让 graph/team checkpoint 自愈，而非永久卡死；
+                // 无证据则仍是真错误。
+                if let Some((status, payload)) =
+                    read_persisted_task_evidence_status(&current_session_id, task_id)?
+                {
+                    return Ok(OwnedTaskPoll::Terminal {
+                        result: StoredTaskResult {
+                            status,
+                            output: payload.clone(),
+                            error: None,
+                            progress: None,
+                        },
+                        rendered: payload,
+                    });
+                }
+                return Err(format!("Unknown graph-managed task_id: {task_id}"));
+            }
+        };
+        if !task_entry_owned_by(entry, &current_session_id, current_owner_pid) {
+            return Err(format!(
+                "Task {task_id} is not owned by the current process/session"
+            ));
+        }
+        entry.clone()
+    };
+
+    let poll = with_os_kernel(|os| {
+        if let Some(result) = read_task_result(os, entry.result_channel_id, false)? {
+            let rendered = format_task_result_with_id(task_id, &entry, result.clone());
+            persist_rendered_task_evidence(task_id, &entry, &result.status, &rendered)?;
+            if read_task_result(os, entry.result_channel_id, true)?.is_none() {
+                return Err(format!(
+                    "task result for {task_id} disappeared after durable persistence"
+                ));
+            }
+            mark_task_retry_status(task_id, &result.status);
+            TASK_PROGRESS_REGISTRY
+                .lock()
+                .unwrap()
+                .take(&task_id.to_string());
+            cleanup_collected_task(os, &entry, "subagent result collected by agent graph");
+            return Ok(OwnedTaskPoll::Terminal { result, rendered });
+        }
+
+        if is_task_pending(os, entry.pid)? {
+            return Ok(OwnedTaskPoll::Pending {
+                state: task_state_string(os, entry.result_channel_id, entry.pid)?,
+            });
+        }
+
+        let result = StoredTaskResult {
+            status: "failed".to_string(),
+            output: String::new(),
+            error: Some(format!(
+                "Subagent process pid={} terminated without publishing any output.",
+                entry.pid
+            )),
+            progress: current_task_progress(task_id),
+        };
+        let rendered = format_task_result_with_id(task_id, &entry, result.clone());
+        persist_rendered_task_evidence(task_id, &entry, &result.status, &rendered)?;
+        mark_task_retry_status(task_id, &result.status);
+        TASK_PROGRESS_REGISTRY
+            .lock()
+            .unwrap()
+            .take(&task_id.to_string());
+        cleanup_collected_task(
+            os,
+            &entry,
+            "graph-managed subagent terminated without output",
+        );
+        Ok(OwnedTaskPoll::Terminal { result, rendered })
+    })?;
+
+    if matches!(poll, OwnedTaskPoll::Terminal { .. }) {
+        TASK_REGISTRY.lock().unwrap().remove(&task_id.to_string());
+    }
+    Ok(poll)
 }
 
 /// 收集终态结果后统一释放 IPC，并把对应 kernel 进程终止、回收。

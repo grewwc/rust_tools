@@ -451,6 +451,8 @@ pub struct LlmUsageReport {
     pub model: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// `completion_tokens` 中属于隐藏 reasoning/thinking 的子集。
+    pub reasoning_tokens: u64,
     /// cached prompt tokens（如果 provider 支持）。
     /// 目前仅做 trace，不折算 cost。
     pub cached_prompt_tokens: u64,
@@ -479,6 +481,8 @@ pub struct LlmUsageRecord {
     pub model: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// `completion_tokens` 中属于隐藏 reasoning/thinking 的子集。
+    pub reasoning_tokens: u64,
     /// 总 token 数（prompt + completion）。
     pub total_tokens: u64,
     /// cached prompt tokens（如果 provider 支持）。

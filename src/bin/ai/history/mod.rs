@@ -193,7 +193,8 @@ pub(in crate::ai) use suspended::{
 pub(in crate::ai) use task_evidence::render_unintegrated_task_evidence;
 pub(in crate::ai) use task_evidence::{
     DeliveredTaskEvidence, integrate_task_evidence, record_delivered_task_evidence,
-    render_unintegrated_task_evidence_resilient, task_evidence_exists,
+    read_task_evidence_status_payload, render_unintegrated_task_evidence_resilient,
+    task_evidence_exists,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{

@@ -225,7 +225,7 @@
   },
   {
     "key": "deepseek-v4-flash-volcano",
-    "name": "ark-code-latest",
+    "name": "deepseek-v4-flash",
     "endpoint": "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
     "api_key_config_key": "volcano.api_key",
     "quality_tier": "strong",
@@ -236,7 +236,7 @@
     "tools_default_enabled": true,
     "enable_thinking": true,
     "reasoning_content_replay": true,
-    "default_reasoning_effort": "high",
+    "default_reasoning_effort": "max",
     "subagent_priority": 80,
     "context_window_tokens": 1024000,
     "max_output_tokens": 65536

@@ -99,3 +99,9 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
     one log). `/audit` reads this log (via `current_session_assets_dir()`, needs
     `DRIVER_CTX`) to show the main agent's own changes without concurrent work
     contaminating the view; falls back to `git diff` only when the log is empty.
+15. **Team/Graph orchestration reuses task truth.** `manage_team` and
+    `run_agent_graph` checkpoint only orchestration state under the current session;
+    all actual agent work still flows through the kernel task registry, durable task
+    evidence, integration, cancellation, owner/session checks, and top-level depth
+    guard. On owner restart, running orchestration nodes become resumable pending work
+    instead of being inferred successful.

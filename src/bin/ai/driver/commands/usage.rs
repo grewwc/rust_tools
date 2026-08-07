@@ -112,11 +112,12 @@ fn print_totals_only(window: Option<u64>) {
     match store::query_totals(window) {
         Some(t) => {
             println!(
-                "  {:<14} calls={:>6}  in={:>7}  out={:>7}  total={:>7}",
+                "  {:<14} calls={:>6}  in={:>7}  out={:>7}  think={:>7}  total={:>7}",
                 format!("[{}]", label),
                 format_number(t.calls),
                 format_number(t.input),
                 format_number(t.output),
+                format_number(t.reasoning),
                 format_number(t.total)
             );
         }
@@ -135,16 +136,17 @@ fn print_models_breakdown(window: Option<u64>) {
             rows.sort_by(|a, b| b.calls.cmp(&a.calls));
             println!("  [{} models]  sorted by calls ↓", label);
             println!(
-                "      {:<24} {:>6}  {:>7}  {:>7}  {:>7}",
-                "model", "calls", "in", "out", "total"
+                "      {:<24} {:>6}  {:>7}  {:>7}  {:>7}  {:>7}",
+                "model", "calls", "in", "out", "think", "total"
             );
             for r in rows.iter().filter(|r| r.calls > 0) {
                 println!(
-                    "      {:<24} {:>6}  {:>7}  {:>7}  {:>7}",
+                    "      {:<24} {:>6}  {:>7}  {:>7}  {:>7}  {:>7}",
                     r.model,
                     format_number(r.calls),
                     format_number(r.input),
                     format_number(r.output),
+                    format_number(r.reasoning),
                     format_number(r.total)
                 );
             }
@@ -161,25 +163,25 @@ fn print_window(window: Option<u64>) {
         Some(t) => {
             // 表头行的标签列宽度与下方模型行的列宽度对齐：
             // 表头 = 2 空格 + 22 宽标签 = 24；模型行 = 6 空格 + 18 宽模型名 = 24。
-            // 这样 calls/in/out/total 各列在表头与模型行之间垂直对齐。列宽收窄到
-            // 实际内容尺寸（模型名 ≤17 字符、缩写数字 ≤5 字符），整行约 77 列，
-            // 避免在 80 列终端里把 total= 的值折到下一行。
+            // 这样 calls/in/out/think/total 各列在表头与模型行之间垂直对齐。
             println!(
-                "  {:<22} calls={:>6}  in={:>7}  out={:>7}  total={:>7}",
+                "  {:<22} calls={:>6}  in={:>7}  out={:>7}  think={:>7}  total={:>7}",
                 format!("[{}]", label),
                 format_number(t.calls),
                 format_number(t.input),
                 format_number(t.output),
+                format_number(t.reasoning),
                 format_number(t.total)
             );
             if let Some(rows) = store::query_by_model(window) {
                 for r in rows.iter().filter(|r| r.calls > 0) {
                     println!(
-                        "      {:<18} calls={:>6}  in={:>7}  out={:>7}  total={:>7}",
+                        "      {:<18} calls={:>6}  in={:>7}  out={:>7}  think={:>7}  total={:>7}",
                         r.model,
                         format_number(r.calls),
                         format_number(r.input),
                         format_number(r.output),
+                        format_number(r.reasoning),
                         format_number(r.total)
                     );
                 }

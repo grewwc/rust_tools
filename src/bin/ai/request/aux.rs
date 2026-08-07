@@ -582,10 +582,16 @@ pub(crate) fn charge_llm_usage_via_kernel(
         .as_ref()
         .map(|d| d.cached_tokens)
         .unwrap_or(0);
+    let reasoning = usage
+        .completion_tokens_details
+        .as_ref()
+        .map(|d| d.reasoning_tokens)
+        .unwrap_or(0);
     let report = aios_kernel::primitives::LlmUsageReport {
         model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
+        reasoning_tokens: reasoning,
         cached_prompt_tokens: cached,
         latency_ms,
     };

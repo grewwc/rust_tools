@@ -1,0 +1,188 @@
+{
+  "name": "manage_team",
+  "description": "Create and operate a durable Rust-native agent team. Team state is checkpointed in the current session; logical members can claim, dispatch, complete, message, inspect, advance, or cancel dependency-aware tasks. Dispatched work reuses the existing leaf-subagent kernel and task evidence path. Use action=create first, then reuse the returned team_id.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "action"
+    ],
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": [
+          "create",
+          "add_task",
+          "claim",
+          "dispatch",
+          "advance",
+          "complete",
+          "send_message",
+          "status",
+          "cancel"
+        ]
+      },
+      "team_id": {
+        "type": "string",
+        "description": "Team UUID returned by create.",
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+      },
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Non-empty team name."
+      },
+      "goal": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Non-empty team goal."
+      },
+      "members": {
+        "type": "array",
+        "maxItems": 32,
+        "items": {
+          "type": "object",
+          "required": [
+            "id",
+            "role"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.-]{1,96}$",
+              "maxLength": 96
+            },
+            "role": {
+              "type": "string",
+              "minLength": 1
+            },
+            "agent": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "inherit": {
+              "type": "string",
+              "description": "none, all, cwd, memory, history, skills, or a comma-separated combination."
+            },
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "budget": {
+        "type": "object",
+        "properties": {
+          "max_parallel": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8
+          },
+          "max_tasks": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 512
+          },
+          "max_total_attempts": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4096,
+            "description": "Total spawn attempts across the team; must be >= max_tasks and <= 4096."
+          },
+          "max_messages": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2048
+          }
+        }
+      },
+      "task": {
+        "type": "object",
+        "required": [
+          "title",
+          "prompt"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]{1,96}$",
+            "maxLength": 96
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64000
+          },
+          "assignee": {
+            "type": "string"
+          },
+          "depends_on": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "task_id": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_.-]{1,96}$",
+        "maxLength": 96
+      },
+      "member_id": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_.-]{1,96}$",
+        "maxLength": 96
+      },
+      "lease_secs": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 86400,
+        "description": "Claim lease in seconds, clamped to 1..=86400."
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "completed",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "output": {
+        "type": "string"
+      },
+      "error": {
+        "type": "string"
+      },
+      "from": {
+        "type": "string",
+        "description": "Sender: 'parent' or a member id."
+      },
+      "to": {
+        "type": "string",
+        "description": "Member id, 'parent', or * for broadcast."
+      },
+      "body": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 16000
+      },
+      "reason": {
+        "type": "string",
+        "description": "Optional cancel reason recorded on cancelled tasks; defaults to 'team cancelled by parent'."
+      },
+      "dispatch": {
+        "type": "boolean",
+        "description": "For advance, dispatch newly-ready tasks after collecting terminal work. Defaults true."
+      }
+    }
+  }
+}

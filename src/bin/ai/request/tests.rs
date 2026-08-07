@@ -255,6 +255,34 @@ fn stream_usage_does_not_double_count_reasoning_when_completion_present() {
 }
 
 #[test]
+fn stream_usage_prefers_completion_derived_from_total_over_reasoning_subset() {
+    let usage: StreamUsage = serde_json::from_value(serde_json::json!({
+        "prompt_tokens": 800,
+        "completion_tokens": 0,
+        "total_tokens": 1400,
+        "completion_tokens_details": { "reasoning_tokens": 512 },
+    }))
+    .unwrap();
+    let usage = usage.normalized();
+    assert_eq!(usage.prompt_tokens, 800);
+    assert_eq!(usage.completion_tokens, 600);
+    assert_eq!(usage.total_tokens, 1400);
+}
+
+#[test]
+fn stream_usage_derives_prompt_from_total_and_reasoning_only_details() {
+    let usage: StreamUsage = serde_json::from_value(serde_json::json!({
+        "total_tokens": 1400,
+        "completion_tokens_details": { "reasoning_tokens": 512 },
+    }))
+    .unwrap();
+    let usage = usage.normalized();
+    assert_eq!(usage.prompt_tokens, 888);
+    assert_eq!(usage.completion_tokens, 512);
+    assert_eq!(usage.total_tokens, 1400);
+}
+
+#[test]
 fn prompt_cache_breakpoint_wraps_first_system_message() {
     let mut messages = vec![
         Message {

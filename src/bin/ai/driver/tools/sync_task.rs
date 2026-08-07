@@ -49,6 +49,8 @@ use super::super::runtime_ctx::DriverContext;
 /// minutes is enough to return useful partial evidence without wedging the
 /// parent turn for an interactive session.
 const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(600);
+const TIMEOUT_RECOVERY_MAX_CHARS: usize = 24_000;
+const TIMEOUT_RECOVERY_TAIL_MESSAGES: usize = 40;
 
 struct SyncSubagentHistoryGuard {
     path: PathBuf,
@@ -395,7 +397,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
             rx,
             wait_shutdown,
             wait_cancel,
-            phase_slot,
+            phase_slot.clone(),
             started,
             hard_timeout,
             wrap_up_lead_time,
@@ -417,8 +419,17 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
 
     // 硬超时：guard 已把子代理历史改名保留，这里提取超时前的工作产物发布到 result slot，
     // 避免 15 分钟工作全部丢失（此前超时只返回空结果）。
-    if join_result.is_err() {
-        publish_timeout_evidence(&child_history, &result_slot);
+    if let Err(timeout_error) = &join_result {
+        let timeout_phase = phase_slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        publish_timeout_evidence(
+            &child_history,
+            &result_slot,
+            timeout_error,
+            &format!("{timeout_phase:?}"),
+        );
     }
 
     let captured_result = result_slot
@@ -590,35 +601,71 @@ async fn wait_for_sync_task_completion_with_wrap_up(
 /// 硬超时后把子代理已写入历史的工作产物提取出来，发布到 result slot。
 /// 父代理随后在失败结果里能看到超时前的证据节选与保留文件路径，而不是空结果
 /// （此前超时路径把 15 分钟的工作产物全部丢弃）。
-fn publish_timeout_evidence(child_history: &Path, result_slot: &runtime_ctx::SubagentResultSlot) {
+fn publish_timeout_evidence(
+    child_history: &Path,
+    result_slot: &runtime_ctx::SubagentResultSlot,
+    timeout_error: &str,
+    phase: &str,
+) {
     let preserved = history::preserved_subagent_history_path(child_history);
-    if !preserved.exists() {
-        return;
-    }
-    // 读取最近 40 条消息（含工具输出，`build_message_arr` 自动取尾部），渲染为节选。
-    let messages = match history::build_message_arr(40, &preserved) {
-        Ok(messages) => messages,
-        Err(error) => {
-            eprintln!("[Warning] failed to read preserved subagent history: {error}");
-            return;
+    // 读取最近消息（含工具输出）作为可恢复证据；读取失败也必须发布结构化诊断，
+    // 不能让硬超时退化成没有任何上下文的空结果。
+    let (excerpt, extraction_error) = if preserved.exists() {
+        match history::build_message_arr(TIMEOUT_RECOVERY_TAIL_MESSAGES, &preserved) {
+            Ok(messages) => (
+                history::messages_to_markdown_capped(
+                    &messages,
+                    &preserved.to_string_lossy(),
+                    TIMEOUT_RECOVERY_MAX_CHARS,
+                ),
+                None,
+            ),
+            Err(error) => (String::new(), Some(error.to_string())),
         }
+    } else {
+        (
+            String::new(),
+            Some("preserved child history was not found".to_string()),
+        )
     };
-    if messages.is_empty() {
-        return;
-    }
-    let session_label = preserved.to_string_lossy();
-    let excerpt = history::messages_to_markdown_capped(&messages, &session_label, 8000);
-    let payload = format!(
-        "[Timeout] 子代理已达到硬超时上限，未在限定时间内产出最终结论。\n\n\
-         超时前已完成的工作产物已保留（完整历史）：\n{}\n\n\
-         超时前最后的工作记录（节选）：\n\n{}",
-        preserved.display(),
+    let payload = format_timeout_recovery_payload(
+        timeout_error,
+        phase,
+        &preserved,
         excerpt.trim(),
+        extraction_error.as_deref(),
     );
     if let Ok(mut guard) = result_slot.try_lock() {
-        guard.parent_payload = payload;
-        guard.final_assistant_text = String::new();
+        if guard.parent_payload.trim().is_empty() && guard.final_assistant_text.trim().is_empty() {
+            guard.parent_payload = payload;
+        }
     }
+}
+
+fn format_timeout_recovery_payload(
+    timeout_error: &str,
+    phase: &str,
+    preserved: &Path,
+    excerpt: &str,
+    extraction_error: Option<&str>,
+) -> String {
+    let status = if timeout_error.contains("exceeded hard timeout") {
+        "timed_out"
+    } else {
+        "interrupted"
+    };
+    let evidence = if excerpt.is_empty() {
+        "未恢复到非空消息；请结合下方诊断和保留路径继续排查。"
+    } else {
+        excerpt
+    };
+    let extraction = extraction_error
+        .map(|error| format!("\nhistory_extraction_error: {error}"))
+        .unwrap_or_default();
+    format!(
+        "SUBAGENT_TIMEOUT_RECOVERY_V1\nstatus: {status}\nerror: {timeout_error}\nlast_phase: {phase}\npreserved_child_history: {}{extraction}\n\n## 中断前已完成的工作（恢复节选）\n\n{evidence}\n\n以上是阶段性证据而非完整审计结论；后续应从这些证据继续，而不是从零重跑。",
+        preserved.display(),
+    )
 }
 
 /// 构造最多占一个终端物理行的 subagent 心跳。长路径、计划等阶段详情必须按当前
@@ -1058,6 +1105,38 @@ mod tests {
                 .contains("durable synchronous conclusion")
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn timeout_recovery_payload_keeps_partial_audit_work() {
+        let payload = format_timeout_recovery_payload(
+            "audit subagent exceeded hard timeout (900s)",
+            "CallingTool",
+            Path::new("/tmp/audit-timeout.sqlite"),
+            "AUDIT_CHECKPOINT: checked src/a.rs; finding at src/a.rs:42",
+            None,
+        );
+
+        assert!(payload.contains("SUBAGENT_TIMEOUT_RECOVERY_V1"));
+        assert!(payload.contains("last_phase: CallingTool"));
+        assert!(payload.contains("src/a.rs:42"));
+        assert!(payload.contains("/tmp/audit-timeout.sqlite"));
+        assert!(payload.contains("不是从零重跑"));
+    }
+
+    #[test]
+    fn timeout_recovery_payload_exposes_missing_history_diagnostic() {
+        let payload = format_timeout_recovery_payload(
+            "audit subagent exceeded hard timeout (900s)",
+            "WaitingForModel",
+            Path::new("/tmp/missing.sqlite"),
+            "",
+            Some("preserved child history was not found"),
+        );
+
+        assert!(payload.contains("history_extraction_error"));
+        assert!(payload.contains("preserved child history was not found"));
+        assert!(payload.contains("未恢复到非空消息"));
     }
 
     #[test]

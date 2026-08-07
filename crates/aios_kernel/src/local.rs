@@ -2415,6 +2415,7 @@ impl LlmOps for LocalOS {
                 model: report.model,
                 prompt_tokens: report.prompt_tokens,
                 completion_tokens: report.completion_tokens,
+                reasoning_tokens: report.reasoning_tokens.min(report.completion_tokens),
                 total_tokens,
                 cached_prompt_tokens: report.cached_prompt_tokens,
                 latency_ms: report.latency_ms,
@@ -5576,6 +5577,7 @@ mod tests {
                 model: "gpt-test".into(),
                 prompt_tokens: 1_000,
                 completion_tokens: 500,
+                reasoning_tokens: 0,
                 cached_prompt_tokens: 100,
                 latency_ms: 42,
             },
@@ -5601,6 +5603,7 @@ mod tests {
                 model: "mystery-model".into(),
                 prompt_tokens: 123,
                 completion_tokens: 45,
+                reasoning_tokens: 0,
                 cached_prompt_tokens: 0,
                 latency_ms: 0,
             },
@@ -5637,6 +5640,7 @@ mod tests {
                 model: "g".into(),
                 prompt_tokens: 1_000,
                 completion_tokens: 0,
+                reasoning_tokens: 0,
                 cached_prompt_tokens: 0,
                 latency_ms: 0,
             },
@@ -5666,6 +5670,7 @@ mod tests {
                 model: "m".into(),
                 prompt_tokens: 10,
                 completion_tokens: 5,
+                reasoning_tokens: 0,
                 cached_prompt_tokens: 0,
                 latency_ms: 77,
             },
@@ -5697,6 +5702,7 @@ mod tests {
                 model: "m".into(),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 30,
                 cached_prompt_tokens: 10,
                 latency_ms: 7,
             },
@@ -5707,6 +5713,7 @@ mod tests {
                 model: "m".into(),
                 prompt_tokens: 200,
                 completion_tokens: 80,
+                reasoning_tokens: 0,
                 cached_prompt_tokens: 0,
                 latency_ms: 0,
             },
@@ -5720,6 +5727,7 @@ mod tests {
         assert_eq!(all[0].model, "m");
         assert_eq!(all[0].prompt_tokens, 100);
         assert_eq!(all[0].completion_tokens, 50);
+        assert_eq!(all[0].reasoning_tokens, 30);
         assert_eq!(all[0].total_tokens, 150);
         assert_eq!(all[0].cached_prompt_tokens, 10);
         assert_eq!(all[0].latency_ms, 7);
@@ -5750,6 +5758,7 @@ mod tests {
                     model: "m".into(),
                     prompt_tokens: i,
                     completion_tokens: 0,
+                    reasoning_tokens: 0,
                     cached_prompt_tokens: 0,
                     latency_ms: 0,
                 },

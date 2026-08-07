@@ -1,0 +1,225 @@
+{
+  "name": "run_agent_graph",
+  "description": "Run a checkpointed Rust-native agent graph on top of the existing task/kernel runtime. Static mode executes a validated conditional DAG with reducers. Dynamic mode implements Graph-of-Agents-style initial answers, learned pairwise relevance scoring, topology selection, forward and reverse message propagation, then max or judge pooling. Use action=start, then call action=advance until lifecycle is terminal.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "action"
+    ],
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": [
+          "start",
+          "advance",
+          "status",
+          "cancel"
+        ]
+      },
+      "graph_id": {
+        "type": "string",
+        "description": "Graph UUID returned by start."
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "static",
+          "dynamic"
+        ]
+      },
+      "name": {
+        "type": "string"
+      },
+      "question": {
+        "type": "string"
+      },
+      "max_parallel": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 8
+      },
+      "static_graph": {
+        "type": "object",
+        "required": [
+          "nodes"
+        ],
+        "properties": {
+          "initial_state": {
+            "type": "object"
+          },
+          "nodes": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "description",
+                "prompt"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "prompt": {
+                  "type": "string"
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "inherit": {
+                  "type": "string"
+                },
+                "response_schema": {
+                  "type": "object"
+                },
+                "output_key": {
+                  "type": "string"
+                },
+                "reducer": {
+                  "type": "string",
+                  "enum": [
+                    "replace",
+                    "append_array",
+                    "merge_object",
+                    "concat"
+                  ]
+                },
+                "max_retries": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "edges": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "type": "object",
+              "required": [
+                "from",
+                "to"
+              ],
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                },
+                "condition": {
+                  "type": "object",
+                  "required": [
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "always",
+                        "on_success",
+                        "on_failure",
+                        "output_contains",
+                        "json_pointer_equals"
+                      ]
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "pointer": {
+                      "type": "string"
+                    },
+                    "value": {}
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "dynamic_graph": {
+        "type": "object",
+        "required": [
+          "candidates"
+        ],
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 16,
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "role"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "prompt": {
+                  "type": "string"
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "inherit": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "policy": {
+            "type": "object",
+            "properties": {
+              "min_selected": {
+                "type": "integer",
+                "minimum": 2
+              },
+              "max_selected": {
+                "type": "integer",
+                "minimum": 2
+              },
+              "relevance_threshold": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "edge_threshold": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "pool": {
+                "type": "string",
+                "enum": [
+                  "max",
+                  "judge"
+                ]
+              },
+              "pool_agent": {
+                "type": "string"
+              },
+              "pool_model": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

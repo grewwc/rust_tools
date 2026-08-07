@@ -96,10 +96,8 @@ pub(crate) struct StreamUsage {
     #[serde(default, alias = "input_tokens_details")]
     pub(crate) prompt_tokens_details: Option<StreamPromptTokensDetails>,
     /// OpenAI reasoning models / qwen thinking mode report the reasoning slice
-    /// here. Most providers already fold this into `completion_tokens`, so we
-    /// only use it as a floor (see [`StreamUsage::normalized`]) to avoid
-    /// double-counting while still recovering output tokens when a provider
-    /// reports reasoning separately and leaves `completion_tokens` at 0.
+    /// here. It is a subset of `completion_tokens`, not an additional amount;
+    /// normalization therefore uses it only as a floor instead of adding it.
     #[serde(default, alias = "output_tokens_details")]
     pub(crate) completion_tokens_details: Option<StreamCompletionTokensDetails>,
 }
@@ -108,33 +106,36 @@ impl StreamUsage {
     /// Backfill omitted token components from whatever the provider did report,
     /// so downstream accounting does not under-count.
     ///
-    /// Rules (all conservative, never inflate beyond reported totals):
+    /// Rules:
     /// - If exactly one of prompt/completion is missing but `total_tokens`
     ///   covers the other, derive the missing component as the remainder.
-    /// - If `completion_tokens` is 0 but a separate `reasoning_tokens` slice is
-    ///   present, treat reasoning tokens as the output floor.
+    /// - Treat a separate `reasoning_tokens` slice as a floor for completion;
+    ///   reasoning is already included by providers that report completion.
     /// - Keep `total_tokens` consistent (>= prompt + completion) for display.
     pub(crate) fn normalized(mut self) -> Self {
-        // Reasoning-only providers: recover output tokens from the details slice.
-        if self.completion_tokens == 0 {
-            if let Some(reasoning) = self
-                .completion_tokens_details
-                .as_ref()
-                .map(|d| d.reasoning_tokens)
-                .filter(|&r| r > 0)
-            {
-                self.completion_tokens = reasoning;
-            }
-        }
-
         // Derive a missing component from the total when the total is larger
-        // than the single component we do have.
+        // than the single component we do have. This must happen before applying
+        // the reasoning floor: reasoning is only a subset of completion, so using
+        // it first would hide a larger completion value derivable from total.
         if self.total_tokens > 0 {
             if self.completion_tokens == 0 && self.prompt_tokens > 0 {
                 self.completion_tokens = self.total_tokens.saturating_sub(self.prompt_tokens);
             } else if self.prompt_tokens == 0 && self.completion_tokens > 0 {
                 self.prompt_tokens = self.total_tokens.saturating_sub(self.completion_tokens);
             }
+        }
+
+        let reasoning = self
+            .completion_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+        self.completion_tokens = self.completion_tokens.max(reasoning);
+
+        // If the provider supplied only total + reasoning details, the floor
+        // above gives us enough information to recover the prompt remainder.
+        if self.prompt_tokens == 0 && self.total_tokens > self.completion_tokens {
+            self.prompt_tokens = self.total_tokens - self.completion_tokens;
         }
 
         // Keep total at least the sum of the parts for honest display.

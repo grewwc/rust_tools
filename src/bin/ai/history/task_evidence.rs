@@ -355,6 +355,35 @@ pub(in crate::ai) fn task_evidence_exists(
     })
 }
 
+/// 按 task_id 读取已持久化的任务证据（status + payload）。
+/// 供 poll_owned_task_result 幂等回放：registry 条目已随 poll 移除、但 checkpoint
+/// 未保存时，据此返回幂等 Terminal 使 graph/team checkpoint 自愈，而非永久卡死。
+pub(in crate::ai) fn read_task_evidence_status_payload(
+    history_file: &Path,
+    session_id: &str,
+    task_id: &str,
+) -> io::Result<Option<(String, String)>> {
+    SessionStore::validate_session_id(session_id)?;
+    let (path, _) = task_evidence_paths(history_file, session_id);
+    with_store_lock(history_file, session_id, || {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let connection = open_store(history_file, session_id)?;
+        let mut statement = connection
+            .prepare("SELECT status, payload FROM task_evidence WHERE task_id = ?1")
+            .map_err(|error| sqlite_error("prepare read task evidence status", error))?;
+        let mut rows = statement
+            .query_map([task_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| sqlite_error("query read task evidence status", error))?;
+        let row = rows
+            .next()
+            .transpose()
+            .map_err(|error| sqlite_error("step read task evidence status", error))?;
+        Ok(row)
+    })
+}
+
 pub(in crate::ai) fn render_unintegrated_task_evidence(
     history_file: &Path,
     session_id: &str,

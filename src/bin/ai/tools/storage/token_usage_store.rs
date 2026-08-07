@@ -83,6 +83,7 @@ fn open_store() -> Result<Connection, String> {
             model         TEXT NOT NULL,
             input_tokens  INTEGER NOT NULL,
             output_tokens  INTEGER NOT NULL,
+            reasoning_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens   INTEGER NOT NULL,
             cost_micros    INTEGER NOT NULL DEFAULT 0
         );
@@ -92,7 +93,10 @@ fn open_store() -> Result<Connection, String> {
     .map_err(|e| format!("init token_usage schema: {e}"))?;
 
     // 渐进式迁移：为存量库添加新增列（忽略"列已存在"错误）。
-    let migrations = ["ALTER TABLE token_usage ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0"];
+    let migrations = [
+        "ALTER TABLE token_usage ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE token_usage ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0",
+    ];
     for sql in &migrations {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -161,8 +165,8 @@ pub(crate) fn persist_drained(records: &[LlmUsageRecord], new_head: u64) {
     {
         let mut stmt = match tx.prepare_cached(
             "INSERT INTO token_usage (created_at, model, input_tokens, output_tokens, \
-             total_tokens, cost_micros) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             reasoning_tokens, total_tokens, cost_micros) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -176,10 +180,13 @@ pub(crate) fn persist_drained(records: &[LlmUsageRecord], new_head: u64) {
                 r.model,
                 r.prompt_tokens as i64,
                 r.completion_tokens as i64,
+                r.reasoning_tokens as i64,
                 r.total_tokens as i64,
                 r.cost_micros as i64,
             ]) {
                 eprintln!("[TokenUsage] insert failed: {e}");
+                // 整批回滚并保留 drain 游标，避免跳过失败记录造成永久漏计。
+                return;
             } else {
                 inserted += 1;
             }
@@ -221,6 +228,8 @@ pub(crate) struct UsageTotals {
     pub calls: u64,
     pub input: u64,
     pub output: u64,
+    /// `output` 中属于 reasoning/thinking 的子集。
+    pub reasoning: u64,
     pub total: u64,
     pub cost_micros: u64,
 }
@@ -232,6 +241,8 @@ pub(crate) struct UsageByModel {
     pub calls: u64,
     pub input: u64,
     pub output: u64,
+    /// `output` 中属于 reasoning/thinking 的子集。
+    pub reasoning: u64,
     pub total: u64,
     pub cost_micros: u64,
 }
@@ -243,6 +254,8 @@ pub(crate) struct DailyUsage {
     pub calls: u64,
     pub input: u64,
     pub output: u64,
+    /// `output` 中属于 reasoning/thinking 的子集。
+    pub reasoning: u64,
     pub total: u64,
     pub cost_micros: u64,
 }
@@ -259,6 +272,7 @@ pub(crate) fn query_totals(window_secs: Option<u64>) -> Option<UsageTotals> {
     let sql = "SELECT COUNT(*), \
                COALESCE(SUM(input_tokens),0), \
                COALESCE(SUM(output_tokens),0), \
+               COALESCE(SUM(reasoning_tokens),0), \
                COALESCE(SUM(total_tokens),0), \
                COALESCE(SUM(cost_micros),0) \
                FROM token_usage WHERE (?1 IS NULL OR created_at >= ?1)";
@@ -267,8 +281,9 @@ pub(crate) fn query_totals(window_secs: Option<u64>) -> Option<UsageTotals> {
             calls: row.get::<_, i64>(0)? as u64,
             input: row.get::<_, i64>(1)? as u64,
             output: row.get::<_, i64>(2)? as u64,
-            total: row.get::<_, i64>(3)? as u64,
-            cost_micros: row.get::<_, i64>(4)? as u64,
+            reasoning: row.get::<_, i64>(3)? as u64,
+            total: row.get::<_, i64>(4)? as u64,
+            cost_micros: row.get::<_, i64>(5)? as u64,
         })
     })
     .ok()
@@ -285,10 +300,11 @@ pub(crate) fn query_by_model(window_secs: Option<u64>) -> Option<Vec<UsageByMode
     let sql = "SELECT model, COUNT(*), \
                COALESCE(SUM(input_tokens),0), \
                COALESCE(SUM(output_tokens),0), \
+               COALESCE(SUM(reasoning_tokens),0), \
                COALESCE(SUM(total_tokens),0), \
                COALESCE(SUM(cost_micros),0) \
                FROM token_usage WHERE (?1 IS NULL OR created_at >= ?1) \
-               GROUP BY model ORDER BY 5 DESC";
+               GROUP BY model ORDER BY 6 DESC";
     let mut stmt = conn.prepare(sql).ok()?;
     let rows = stmt
         .query_map(params![cutoff], |row| {
@@ -297,8 +313,9 @@ pub(crate) fn query_by_model(window_secs: Option<u64>) -> Option<Vec<UsageByMode
                 calls: row.get::<_, i64>(1)? as u64,
                 input: row.get::<_, i64>(2)? as u64,
                 output: row.get::<_, i64>(3)? as u64,
-                total: row.get::<_, i64>(4)? as u64,
-                cost_micros: row.get::<_, i64>(5)? as u64,
+                reasoning: row.get::<_, i64>(4)? as u64,
+                total: row.get::<_, i64>(5)? as u64,
+                cost_micros: row.get::<_, i64>(6)? as u64,
             })
         })
         .ok()?;
@@ -345,6 +362,7 @@ fn query_daily_impl(days: u64, limit: Option<i64>) -> Option<Vec<DailyUsage>> {
                COUNT(*), \
                COALESCE(SUM(input_tokens),0), \
                COALESCE(SUM(output_tokens),0), \
+               COALESCE(SUM(reasoning_tokens),0), \
                COALESCE(SUM(total_tokens),0), \
                COALESCE(SUM(cost_micros),0) \
         FROM token_usage \
@@ -365,8 +383,9 @@ fn query_daily_impl(days: u64, limit: Option<i64>) -> Option<Vec<DailyUsage>> {
             calls: row.get::<_, i64>(1)? as u64,
             input: row.get::<_, i64>(2)? as u64,
             output: row.get::<_, i64>(3)? as u64,
-            total: row.get::<_, i64>(4)? as u64,
-            cost_micros: row.get::<_, i64>(5)? as u64,
+            reasoning: row.get::<_, i64>(4)? as u64,
+            total: row.get::<_, i64>(5)? as u64,
+            cost_micros: row.get::<_, i64>(6)? as u64,
         })
     }) {
         Ok(r) => r,

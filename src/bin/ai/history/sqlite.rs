@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     fs,
     fs::OpenOptions,
     io,
@@ -31,6 +32,55 @@ const LAST_ACTIVITY_META_KEY: &str = "last_activity_unix_ms";
 
 static SESSION_STATE_LOCKS: LazyLock<Mutex<FxHashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+// 每个工作线程缓存一个最近打开的 history 连接，避免每次 read/write 都
+// `Connection::open` + PRAGMA 初始化，并让 `prepare_cached` 的语句缓存
+// 真正跨调用复用。
+//
+// 安全性：
+// - `thread_local` 保证连接只在所属线程上被访问，`Connection` 不是 `Sync`
+//   也因此不会被并发使用。
+// - 读取路径本身不持有 per-session `Mutex`（并发 writer 仍会通过各自连接写入），
+//   但每次读取都新开一个 `conn.transaction()` 并在同一调用内 commit：WAL 的
+//   per-transaction 快照因此始终读到最新已提交状态，复用连接不会读到陈旧数据。
+// - `(dev, ino, len)` 指纹只负责一件事：在复用前校验底层文件未被 rename/replace
+//   整体替换。文件替换操作（rollback/compact/reset）会改变 inode，此时丢弃旧
+//   连接、重新打开，语义与每次新开连接完全一致。
+thread_local! {
+    static CACHED_HISTORY_CONN: RefCell<Option<CachedHistoryConn>> = const { RefCell::new(None) };
+}
+
+struct CachedHistoryConn {
+    path: PathBuf,
+    fingerprint: FileFingerprint,
+    conn: Connection,
+}
+
+#[derive(PartialEq, Eq)]
+struct FileFingerprint {
+    dev: u64,
+    ino: u64,
+    len: u64,
+}
+
+#[cfg(unix)]
+fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
+    use std::os::unix::fs::MetadataExt;
+    FileFingerprint {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        len: metadata.len(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
+    FileFingerprint {
+        dev: 0,
+        ino: 0,
+        len: metadata.len(),
+    }
+}
 
 /// history_revision 的进程内缓存：指纹 (主库 len/mtime, WAL sidecar len/mtime) 失效。
 ///
@@ -86,7 +136,10 @@ pub(super) fn delete_session_state_lock(path: &Path) -> io::Result<()> {
 pub(super) fn remove_session_state_lock_entry(path: &Path) {
     let mut locks = SESSION_STATE_LOCKS
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+        .unwrap_or_else(|poison| {
+            warn_session_lock_poison(path, "history lock registry");
+            poison.into_inner()
+        });
     if let Some(existing) = locks.get(path)
         && Arc::strong_count(existing) == 1
     {
@@ -103,13 +156,19 @@ pub(super) fn with_session_state_lock<T>(
     let lock = {
         let mut locks = SESSION_STATE_LOCKS
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(|poison| {
+                warn_session_lock_poison(path, "history lock registry");
+                poison.into_inner()
+            });
         locks
             .entry(path.to_path_buf())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     };
-    let _guard = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _guard = lock.lock().unwrap_or_else(|poison| {
+        warn_session_lock_poison(path, "per-session history state lock");
+        poison.into_inner()
+    });
 
     let lock_path = session_state_lock_path(path);
     if let Some(parent) = lock_path.parent() {
@@ -132,6 +191,19 @@ pub(super) fn with_session_state_lock<T>(
         let _ = libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
     }
     result
+}
+
+/// 锁中毒意味着此前持锁线程在持有进程内 history 锁时 panic。
+/// 磁盘上的跨进程 `flock` 与 SQLite 事务仍是真实的安全边界，因此这里
+/// 继续恢复执行（保持原有语义），但不再静默：打印一次性告警，便于排查
+/// 导致 panic 的上游缺陷。
+fn warn_session_lock_poison(path: &Path, which: &str) {
+    eprintln!(
+        "[Warning] {} was poisoned (a previous holder panicked). \
+         Recovering, but the earlier panic should be investigated. path={}",
+        which,
+        path.display()
+    );
 }
 
 fn session_state_lock_timeout(path: &Path) -> io::Error {
@@ -169,6 +241,7 @@ fn with_session_state_lock_until<T>(
                     .clone();
             }
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                warn_session_lock_poison(path, "history lock registry");
                 let mut locks = poisoned.into_inner();
                 break locks
                     .entry(path.to_path_buf())
@@ -183,7 +256,10 @@ fn with_session_state_lock_until<T>(
     let _guard = loop {
         match lock.try_lock() {
             Ok(guard) => break guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                warn_session_lock_poison(path, "per-session history state lock");
+                break poisoned.into_inner();
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
                 wait_for_session_state_lock(path, deadline)?;
             }
@@ -263,12 +339,55 @@ fn open_history_db_with_busy_timeout(
 }
 
 fn try_open_history_db(path: &Path, busy_timeout: Duration) -> Result<Connection, io::Error> {
+    let conn = fresh_connection(path, busy_timeout)?;
+    Ok(conn)
+}
+
+fn fresh_connection(path: &Path, busy_timeout: Duration) -> Result<Connection, io::Error> {
     let conn = Connection::open(path).map_err(|error| sqlite_error(path, "open", error))?;
     conn.busy_timeout(busy_timeout)
         .map_err(|error| sqlite_error(path, "set busy_timeout", error))?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|error| sqlite_error(path, "set journal_mode=WAL", error))?;
     Ok(conn)
+}
+
+/// 在缓存的 history 连接上执行一个只读操作。连接按线程缓存，并在底层文件
+/// inode/大小变化（rollback/compact/reset 等替换操作）时自动重连，语义与
+/// 每次新开连接一致，但省掉了每轮 turn 的 open + PRAGMA 与语句重编译开销。
+///
+/// 注意：返回的借用数据不能逃逸出闭包（`Connection` 不是 `Sync`，且连接
+/// 归 thread_local 所有）。仅用于热路径只读查询。
+fn with_cached_read_conn<T>(
+    path: &Path,
+    busy_timeout: Duration,
+    op: impl FnOnce(&mut Connection) -> io::Result<T>,
+) -> Result<T, io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| io::Error::other(format!("metadata {}: {error}", path.display())))?;
+    let fingerprint = file_fingerprint(&metadata);
+    let path_owned = path.to_path_buf();
+
+    CACHED_HISTORY_CONN.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let need_reconnect = match slot.as_ref() {
+            Some(cached) => cached.path != path_owned || cached.fingerprint != fingerprint,
+            None => true,
+        };
+        if need_reconnect {
+            let conn = fresh_connection(&path_owned, busy_timeout)?;
+            *slot = Some(CachedHistoryConn {
+                path: path_owned,
+                fingerprint,
+                conn,
+            });
+        }
+        let cached = slot.as_mut().expect("cached connection just initialized");
+        op(&mut cached.conn)
+    })
 }
 
 fn sqlite_error_kind(error: &RusqliteError) -> io::ErrorKind {
@@ -1475,8 +1594,16 @@ pub(in crate::ai) fn read_context_history_sqlite(
     path: &Path,
     projection_fingerprint: &str,
 ) -> io::Result<ContextHistory> {
-    let mut conn = open_history_db(path)?;
-    init_history_schema(&conn)?;
+    with_cached_read_conn(path, Duration::from_secs(2), |conn| {
+        read_context_history_on_conn(conn, projection_fingerprint)
+    })
+}
+
+fn read_context_history_on_conn(
+    conn: &mut Connection,
+    projection_fingerprint: &str,
+) -> io::Result<ContextHistory> {
+    init_history_schema(conn)?;
     let tx = conn
         .transaction()
         .map_err(|error| io::Error::other(error.to_string()))?;

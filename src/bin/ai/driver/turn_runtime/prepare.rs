@@ -340,14 +340,26 @@ pub(super) async fn prepare_turn(
             );
         }
     }
-    let history = build_context_history(
-        history_count,
-        &app.session_history_file,
-        app.config.history_max_chars,
-        app.config.history_keep_last,
-        app.config.history_summary_max_chars,
-        overflow_dir.clone(),
-    )?;
+    // build_context_history 走 SQLite/文件 I/O，是同步阻塞调用。在多线程
+    // runtime 上把它移到 spawn_blocking，避免阻塞 tokio worker 线程。
+    let history_file = app.session_history_file.clone();
+    let history_max_chars = app.config.history_max_chars;
+    let history_keep_last = app.config.history_keep_last;
+    let history_summary_max_chars = app.config.history_summary_max_chars;
+    let history = tokio::task::spawn_blocking(move || {
+        build_context_history(
+            history_count,
+            &history_file,
+            history_max_chars,
+            history_keep_last,
+            history_summary_max_chars,
+            overflow_dir,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("context history task failed: {e}"))?
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let mut skill_turn = {
         let mc = mcp_client.lock().unwrap();
         skill_runtime::prepare_skill_for_turn(app, &mc, skill_manifests, question)?

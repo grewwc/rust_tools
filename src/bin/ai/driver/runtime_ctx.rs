@@ -37,6 +37,7 @@
 //     healthy auto-selected model; explicit model overrides do not.
 // =============================================================================
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -289,11 +290,52 @@ pub(crate) fn has_subagent_wrap_up_pending() -> bool {
         .unwrap_or(false)
 }
 
+// =============================================================================
+// 并行只读批次线程的 DRIVER_CTX 回退
+// =============================================================================
+// `run_parallel_readonly_batch` 用 `std::thread::scope` 在原始 OS 线程上执行
+// 只读工具。tokio task-local `DRIVER_CTX` 只对安装它的 tokio 任务可见，在这些
+// 线程上 `try_with` 必然失败，导致依赖会话上下文的工具（如 search_overflow 的
+// `current_session_assets_dir`）在批量并行时硬失败。批次线程在运行前把父任务
+// 的上下文安装到下面的回退槽，`try_current()` 在 task-local 缺失时改读它；
+// 线程退出（guard drop）时恢复原值，不会泄漏到其它线程。
+thread_local! {
+    static THREAD_CTX_FALLBACK: RefCell<Option<Arc<DriverContext>>> =
+        const { RefCell::new(None) };
+}
+
+/// RAII 守卫：在 `std::thread::scope` 批次线程内临时安装/恢复 `DRIVER_CTX`
+/// 回退，让只读工具在这些线程上仍能解析会话上下文。
+pub(crate) struct DriverCtxThreadFallback {
+    previous: Option<Arc<DriverContext>>,
+}
+
+impl DriverCtxThreadFallback {
+    /// 安装回退上下文；返回的守卫在 drop 时恢复该线程之前的值。
+    pub(crate) fn install(ctx: Option<Arc<DriverContext>>) -> Self {
+        let previous =
+            THREAD_CTX_FALLBACK.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), ctx));
+        Self { previous }
+    }
+}
+
+impl Drop for DriverCtxThreadFallback {
+    fn drop(&mut self) {
+        THREAD_CTX_FALLBACK.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
 /// Try to read the current `DRIVER_CTX`. Returns `None` when called from a
 /// thread that has no active scope (e.g. unit tests or one-shot tool
-/// invocations outside a turn).
+/// invocations outside a turn). Falls back to the thread-installed
+/// [`DriverCtxThreadFallback`] value on raw threads (parallel readonly batch).
 pub(crate) fn try_current() -> Option<Arc<DriverContext>> {
-    DRIVER_CTX.try_with(Arc::clone).ok()
+    DRIVER_CTX
+        .try_with(Arc::clone)
+        .ok()
+        .or_else(|| THREAD_CTX_FALLBACK.with(|slot| slot.borrow().clone()))
 }
 
 pub(crate) fn auto_model_fallback_spec() -> Option<AutoModelFallbackSpec> {
@@ -533,5 +575,43 @@ mod tests {
     fn is_resume_turn_true_inside_scope() {
         let got = IS_RESUME_TURN.sync_scope(true, || is_resume_turn());
         assert!(got);
+    }
+
+    #[test]
+    fn try_current_falls_back_to_thread_installed_ctx_on_raw_threads() {
+        // 回归：并行只读批次在 `std::thread::scope` 的原始 OS 线程上运行，tokio
+        // task-local `DRIVER_CTX` 在这些线程上不存在（search_overflow 批量并行曾
+        // 因此硬失败）。批次线程安装 `DriverCtxThreadFallback` 回退后，
+        // `try_current()` 必须仍能解析出上下文；线程退出时回退自动恢复，且各
+        // 线程之间互不泄漏。
+        let ctx = DriverContext::new(
+            crate::ai::driver::tests::test_app("build"),
+            Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        assert!(try_current().is_none(), "测试线程默认无 DRIVER_CTX");
+
+        std::thread::scope(|scope| {
+            scope.spawn({
+                let ctx = Arc::clone(&ctx);
+                move || {
+                    assert!(try_current().is_none(), "原始线程上默认无 DRIVER_CTX");
+                    let guard = DriverCtxThreadFallback::install(Some(ctx));
+                    assert!(
+                        try_current().is_some(),
+                        "安装回退后 try_current() 必须能解析上下文"
+                    );
+                    drop(guard);
+                    assert!(try_current().is_none(), "guard drop 后恢复无上下文");
+                }
+            });
+            scope.spawn(move || {
+                // 并发线程互不影响：回退是线程局部的。
+                assert!(try_current().is_none());
+            });
+        });
+
+        assert!(try_current().is_none(), "线程退出后回退不泄漏到测试线程");
     }
 }

@@ -979,11 +979,22 @@ fn run_parallel_readonly_batch(
         }
     }
 
+    // 批次线程是 `std::thread::scope` 创建的原始 OS 线程，tokio task-local
+    // `DRIVER_CTX` 在这些线程上不可见。先在 driver 任务内捕获上下文，再在每条
+    // 批次线程安装回退，否则依赖会话上下文的只读工具（如 search_overflow 解析
+    // session assets 目录）在批量并行时会硬失败。
+    let batch_ctx = crate::ai::driver::runtime_ctx::try_current();
     std::thread::scope(|scope| {
         let handles: Vec<_> = batch
             .iter()
             .map(|tool_call| {
+                let ctx = batch_ctx.clone();
                 scope.spawn(move || {
+                    let _ctx_fallback = ctx.as_ref().map(|driver_ctx| {
+                        crate::ai::driver::runtime_ctx::DriverCtxThreadFallback::install(
+                            Some(std::sync::Arc::clone(driver_ctx)),
+                        )
+                    });
                     let mut no_observer: Option<&mut dyn ToolExecutionObserver> = None;
                     run_one(
                         mcp_client,
