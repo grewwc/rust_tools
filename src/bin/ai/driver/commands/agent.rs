@@ -37,7 +37,6 @@ pub fn try_handle_agent_command(
             println!("  /agent                    list available agents");
             println!("  /agent <name>             switch to an agent");
             println!("  /agent current            show current agent");
-            println!("  /agent auto               restore automatic agent routing");
             println!("  /agent reload             reload agents from disk (hot-discovery)");
             println!();
         }
@@ -73,11 +72,11 @@ pub fn try_handle_agent_command(
             if let Some(agent) = agents::find_agent_by_name(agent_manifests, &app.current_agent) {
                 println!("Current agent: {}", app.current_agent);
                 println!(
-                    "Routing mode: {}",
+                    "Selection source: {}",
                     if app.cli.agent.is_some() {
-                        "manual"
+                        "explicit"
                     } else {
-                        "auto"
+                        "session default"
                     }
                 );
                 println!("Description: {}", agent.description);
@@ -96,16 +95,8 @@ pub fn try_handle_agent_command(
             }
         }
         "auto" => {
-            let was_manual = app.cli.agent.take().is_some();
-            println!("Agent auto-routing is now enabled.");
-            if was_manual {
-                println!(
-                    "Current agent remains '{}' for now and may auto-switch on the next user request.",
-                    app.current_agent
-                );
-            } else {
-                println!("Agent routing was already in auto mode.");
-            }
+            println!("Automatic primary-agent routing is not available.");
+            println!("Use /agent <name> to select a primary agent explicitly.");
         }
         "reload" => {
             let old_count = agent_manifests.len();

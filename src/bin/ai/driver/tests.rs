@@ -3,7 +3,7 @@ use super::{
     DispatchOutcomeTag, ProcessDispatchMeta, SCHED_COOLDOWN_EPOCHS_DEFAULT,
     SCHEDULER_DISPATCH_META, SCHEDULER_TICK_DURATION, SchedulerClock, background_execute_limit,
     background_pop_limit, build_background_process_question, decode_background_process_task_goal,
-    has_pending_foreground_process, maybe_auto_route_agent, one_shot_cli_mode,
+    has_pending_foreground_process, one_shot_cli_mode,
     reset_scheduler_test_state, resolve_background_subagent_override,
     resolve_startup_session_choice, resolve_startup_session_choice_with_selector,
     should_preload_mcp, should_publish_subagent_task_result,
@@ -266,10 +266,6 @@ pub(super) fn test_app(current_agent: &str) -> App {
             history_keep_last: 8,
             history_summary_max_chars: 4000,
             intent_model: None,
-            agent_route_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/bin/ai/config/agent_route/agent_route_model.json"),
-            skill_match_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/bin/ai/config/skill_match/skill_match_model.json"),
         },
         session_id: String::new(),
         session_history_file: PathBuf::new(),
@@ -322,10 +318,6 @@ fn test_startup_config(base_history_file: &std::path::Path) -> AppConfig {
         history_keep_last: 8,
         history_summary_max_chars: 4000,
         intent_model: None,
-        agent_route_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src/bin/ai/config/agent_route/agent_route_model.json"),
-        skill_match_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src/bin/ai/config/skill_match/skill_match_model.json"),
     }
 }
 
@@ -802,62 +794,6 @@ fn startup_choice_rejects_resume_and_new_session_together() {
     assert!(err.to_string().contains("--new-session"));
 }
 
-#[test]
-fn auto_route_switches_to_build_for_code_question_when_enabled() {
-    // auto-routing 默认禁用（见 auto_agent_routing_enabled）。这里通过临时
-    // config 打开 heuristic 策略，验证一个明显匹配 build 的代码问题会
-    // 正确选择 build agent。
-    let _guard = crate::ai::test_support::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-
-    let cfg_path = std::env::temp_dir().join(format!(
-        "rt_auto_route_{}.configw",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::write(
-        &cfg_path,
-        "ai.agents.auto_route.enable = true\nai.agents.auto_route.strategy = heuristic\n",
-    )
-    .unwrap();
-    let old_cfg = std::env::var_os("CONFIGW_PATH");
-    unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
-    crate::commonw::configw::refresh();
-
-    let build = primary_agent(
-        "build",
-        "Build agent for code development, compilation, debugging, bug fixing, and feature implementation",
-    );
-    let plan = primary_agent(
-        "plan",
-        "Planning agent for analysis, code review, strategy, and architecture",
-    );
-    // 起始 agent 必须不同于目标，否则 choose_semantic_route 会因
-    // best.agent.name == current_agent 而直接返回 None。
-    let mut app = test_app("plan");
-
-    maybe_auto_route_agent(
-        &mut app,
-        &[build.clone(), plan.clone()],
-        "fix the bug and debug the compilation error",
-    );
-
-    // 恢复 config，避免污染其它测试。
-    match old_cfg {
-        Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
-        None => unsafe { std::env::remove_var("CONFIGW_PATH") },
-    }
-    crate::commonw::configw::refresh();
-    let _ = std::fs::remove_file(&cfg_path);
-
-    assert_eq!(app.current_agent, "build");
-    assert_eq!(
-        app.current_agent_manifest
-            .as_ref()
-            .map(|agent| agent.name.as_str()),
-        Some("build")
-    );
-}
 
 #[test]
 fn read_recent_history_sqlite_preserves_previous_ordering() {

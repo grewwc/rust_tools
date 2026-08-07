@@ -61,22 +61,6 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4000);
     let intent_model = cfg.get_opt(AiConfig::INTENT_MODEL);
-    let agent_route_model_path = cfg
-        .get_opt("ai.agents.auto_route.model_path")
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/bin/ai/config/agent_route/agent_route_model.json")
-                .display()
-                .to_string()
-        });
-    let skill_match_model_path = cfg
-        .get_opt("ai.skills.match_model_path")
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/bin/ai/config/skill_match/skill_match_model.json")
-                .display()
-                .to_string()
-        });
     let history_file = PathBuf::from(expanduser(&history_file).as_ref());
     Ok(AppConfig {
         api_key,
@@ -88,8 +72,6 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         history_keep_last,
         history_summary_max_chars,
         intent_model,
-        agent_route_model_path: PathBuf::from(expanduser(&agent_route_model_path).as_ref()),
-        skill_match_model_path: PathBuf::from(expanduser(&skill_match_model_path).as_ref()),
     })
 }
 

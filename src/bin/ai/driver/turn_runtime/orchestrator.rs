@@ -5054,6 +5054,7 @@ async fn run_turn_body(
                 &question,
                 &final_assistant_text,
                 final_assistant_recorded,
+                terminal_dedupe_candidate.as_deref(),
                 final_skill_name.as_deref(),
                 &mut turn_messages,
                 one_shot_mode,

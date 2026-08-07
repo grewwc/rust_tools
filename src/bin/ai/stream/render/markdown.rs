@@ -1362,6 +1362,36 @@ mod tests {
     }
 
     #[test]
+    fn plain_body_is_emitted_before_stream_finish_and_not_repeated_on_flush() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+
+        let streamed = renderer
+            .write_chunk_for_test("正文实时输出\n", false)
+            .unwrap();
+        let mut grid = VtGrid::new(80);
+        grid.feed(&streamed);
+        assert_eq!(
+            grid.screen()
+                .into_iter()
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>(),
+            vec!["正文实时输出".to_string()],
+            "plain body must already be visible before stream finish"
+        );
+
+        let flushed = renderer.flush_pending_for_test().unwrap();
+        grid.feed(&flushed);
+        assert_eq!(
+            grid.screen()
+                .into_iter()
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>(),
+            vec!["正文实时输出".to_string()],
+            "plain body must not appear twice when the stream finishes"
+        );
+    }
+
+    #[test]
     fn pending_header_flush_rewrites_to_plain_markdown_line() {
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "80") };
@@ -2157,9 +2187,9 @@ make_llm_call_publisher | 一致 | 同一条 on_call complete callback
         unsafe { std::env::set_var("COLUMNS", "96") };
 
         let md = "\
-| | Skill 路由（已修复） | Agent 路由（你看到的问题） |
+| | Skill 路由（已移除） | Agent 路由（已移除） |
 | --- | --- | --- |
-| 代码机制 | skill_runtime.rs -> prepare_skill_for_turn TF-IDF 预激活 skill ✅ 已移除 ✅ 能，仅保留显式 activate_skill | agent_router.rs -> maybe_auto_route_agent TF-IDF + logistic regression 自动切换 agent ❌ 仍在 ❌ 不能，没有 activate_agent 工具 build prompt-skill 因为 \"Skill\" 命中了 prompt-skill agent 的 routing_tags |
+| 代码机制 | skill_runtime.rs -> prepare_skill_for_turn 仅保留显式 activate_skill | agent_routing.rs 自动路由已整体移除，agent 由显式 agent 字段或默认路由选择 |
 ";
 
         let stream = render_full_stream(md, false);

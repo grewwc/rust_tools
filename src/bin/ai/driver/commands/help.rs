@@ -47,7 +47,6 @@ pub fn print_interactive_help() {
     println!("    /agent                    list available agents");
     println!("    /agent <name>             switch to an agent");
     println!("    /agent current            show current agent");
-    println!("    /agent auto               restore automatic agent routing");
     println!();
     println!("  Skill management:");
     println!("    /skills                   list available skills");

@@ -135,8 +135,6 @@ mod tests {
                 history_keep_last: 10,
                 history_summary_max_chars: 4000,
                 intent_model: None,
-                agent_route_model_path: std::path::PathBuf::new(),
-                skill_match_model_path: std::path::PathBuf::new(),
             },
             session_id: "test".to_string(),
             session_history_file: std::path::PathBuf::new(),

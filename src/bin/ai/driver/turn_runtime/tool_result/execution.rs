@@ -590,6 +590,8 @@ enum FinalClaimKind {
 
 const DANGLING_FINAL_RECOVERY_MARKER: &str = "[dangling-final-recovery]";
 const DANGLING_FINAL_WARNING: &str = "[Runtime warning] The model still described a future inspection step after a one-time no-tool wrap-up retry, so this turn ended without a complete conclusion.";
+const UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER: &str = "[unsupported-runtime-limit-retry]";
+const UNSUPPORTED_RUNTIME_LIMIT_WARNING: &str = "[Runtime warning] The model claimed that a read-only phase limit prevented changes, but no matching runtime/tool evidence was observed; the requested work may be incomplete.";
 const NO_TOOL_SYNTHESIS_RETRY_MARKER: &str = "[no-tool-synthesis-retry]";
 const NO_TOOL_SYNTHESIS_RETRY_NOTE: &str = "The previous no-tool synthesis response incorrectly returned a tool call. Do not call any tool. Produce the final answer now from the evidence already present in the conversation, and explicitly mark anything unverified as incomplete.";
 const NO_TOOL_SYNTHESIS_WARNING: &str = "模型连续两次在无工具收尾阶段返回工具调用；运行时已停止重试。请仅依据此前已获得的证据判断任务状态，未验证的部分应视为未完成。";
@@ -604,6 +606,11 @@ fn append_runtime_warning_once(text: &mut String, warning: &str) {
         text.push_str("\n\n");
     }
     text.push_str(warning);
+}
+
+fn append_user_visible_final_notice(target: &mut Option<String>, notice: &str) {
+    let text = target.get_or_insert_with(String::new);
+    append_runtime_warning_once(text, notice);
 }
 
 fn contains_only_runtime_warnings(text: &str) -> bool {
@@ -626,6 +633,13 @@ fn contains_only_runtime_warnings(text: &str) -> bool {
 enum DanglingFinalRecoveryAction {
     Allow,
     RetryWithoutTools,
+    Warn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsupportedRuntimeLimitAction {
+    Allow,
+    ReopenWithTools,
     Warn,
 }
 
@@ -736,6 +750,119 @@ fn question_requests_plan(question: &str) -> bool {
     ]
     .iter()
     .any(|marker| contains_active_plan_request_phrase(&question, marker))
+}
+
+fn text_claims_read_only_phase_limit(text: &str) -> bool {
+    if [
+        "触发了只读阶段上限",
+        "触发只读阶段上限",
+        "达到了只读阶段上限",
+        "达到只读阶段上限",
+        "到达了只读阶段上限",
+        "到达只读阶段上限",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        return true;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    [
+        "hit the read-only phase limit",
+        "reached the read-only phase limit",
+        "triggered the read-only phase limit",
+        "hit the read only phase limit",
+        "reached the read only phase limit",
+        "triggered the read only phase limit",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn text_admits_changes_not_applied(text: &str) -> bool {
+    if [
+        "尚未写入",
+        "尚未修改",
+        "还未写入",
+        "还未修改",
+        "未能写入",
+        "未能修改",
+        "无法写入",
+        "无法修改",
+        "没有写入",
+        "没有修改",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        return true;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    [
+        "no changes were made",
+        "have not written",
+        "haven't written",
+        "could not write",
+        "couldn't write",
+        "unable to write",
+        "unable to modify",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// 不把模型自述的执行限制当作运行时事实：只有当前 turn 的工具/运行时证据确实
+/// 报告同一限制时才放行。对已知的“只读阶段上限”幻觉只重开一次，并保留工具。
+fn unsupported_runtime_limit_action(
+    question: &str,
+    messages: &mut Vec<Message>,
+    turn_messages: &[Message],
+    final_text: &str,
+    turn_had_tool_error: bool,
+    force_final_response: bool,
+    iteration: usize,
+    max_iterations: usize,
+) -> UnsupportedRuntimeLimitAction {
+    if question_requests_plan(question)
+        || !text_claims_read_only_phase_limit(final_text)
+        || !text_admits_changes_not_applied(final_text)
+        || (turn_had_tool_error
+            && turn_messages.iter().any(|message| {
+                (message.role == "tool" || message.role == ROLE_INTERNAL_NOTE)
+                    && message
+                        .content
+                        .as_str()
+                        .is_some_and(text_claims_read_only_phase_limit)
+            }))
+    {
+        return UnsupportedRuntimeLimitAction::Allow;
+    }
+
+    let already_retried = messages.iter().any(|message| {
+        message.role == ROLE_INTERNAL_NOTE
+            && message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER))
+    });
+    if already_retried || force_final_response || iteration >= max_iterations {
+        return UnsupportedRuntimeLimitAction::Warn;
+    }
+
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(format!(
+            "{UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER}\n\
+             The previous final claimed that a read-only phase limit prevented the requested changes, but no tool or runtime evidence in this turn reported such a limit.\n\
+             Continue the requested work with the available tools. If an operation is actually blocked, attempt it and report the exact observed error. Do not invent execution phases or limits."
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    UnsupportedRuntimeLimitAction::ReopenWithTools
 }
 
 /// 识别「口头承诺继续读/查，但既没有 tool call、也没有交付结论」的悬空最终响应。
@@ -2384,7 +2511,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
         }
         IterationExecution::EmptyResponse => {
             // 模型返回空响应（无文本、无工具调用、无思考内容），自动重试
-            let _ = writeln!(std::io::stderr(), "  ⚠ 模型返回空响应，自动重试…");
             Ok(TurnLoopStep::Continue)
         }
         IterationExecution::Truncated(stream_result) => {
@@ -2394,105 +2520,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 // 简单重试即可。日志已在 orchestrator 层打印。
                 Ok(TurnLoopStep::Continue)
             } else {
-                let degenerate_repetition = stream_result
-                    .finish_reason_value
-                    .as_deref()
-                    .is_some_and(|reason| reason == DEGENERATE_REPETITION_FINISH_REASON);
-                if degenerate_repetition {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  ⚠ 检测到模型推理内容持续重复，已中止本次生成并纠偏重试…"
-                    );
-                } else {
-                    // 真截断：模型撞输出上限或工具 JSON 半截。保留已产出的
-                    // 可见文本作为上下文，并注入一条收缩重写提示后自动重试。
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  ⚠ 模型响应被截断（疑似输出上限），提示收缩后自动重试…"
-                    );
-                }
-                // 打印截断诊断信息，便于排查截断原因。
-                let partial = stream_result.assistant_text.trim();
-                let reasoning = stream_result.reasoning_text.trim();
-                // 截断原因诊断
-                if stream_result.truncated_by_length && partial.is_empty() {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  ├─ 截断原因: finish_reason=length，无可见文本输出"
-                    );
-                    if !reasoning.is_empty() {
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "  ├─ reasoning 已产出 {} 字符（可能 reasoning 耗尽了 token 预算）",
-                            stream_result.reasoning_text.len()
-                        );
-                        let r_snippet = if reasoning.len() > 600 {
-                            let rchar_count = reasoning.chars().count();
-                            let head: String = reasoning.chars().take(300).collect();
-                            let tail: String = reasoning.chars().skip(rchar_count - 300).collect();
-                            format!("{}…[共 {} 字符]…{}", head, rchar_count, tail)
-                        } else {
-                            reasoning.to_string()
-                        };
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "  ├─ reasoning 片段:\n{}\n  ├─ （结束）",
-                            r_snippet
-                        );
-                    } else {
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "  ├─ 无 reasoning 输出（模型可能刚开始就被掐断）"
-                        );
-                    }
-                } else if !partial.is_empty() {
-                    let snippet = if partial.chars().count() > 600 {
-                        let char_count = partial.chars().count();
-                        let head: String = partial.chars().take(300).collect();
-                        let tail: String = partial.chars().skip(char_count - 300).collect();
-                        format!("{}…[截断，共 {} 字符]…{}", head, char_count, tail)
-                    } else {
-                        partial.to_string()
-                    };
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  ├─ 已产出的部分文本（{} 字符）:\n{}\n  ├─ （结束）",
-                        partial.len(),
-                        snippet
-                    );
-                    if !reasoning.is_empty() {
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "  ├─ reasoning 内容已产出 {} 字符",
-                            stream_result.reasoning_text.len()
-                        );
-                    }
-                } else {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  ├─ 无可见文本、无 reasoning（可能 tool call JSON 被截断丢弃）"
-                    );
-                }
-                // 打印服务端返回的 finish_reason 原始值和 usage 统计，
-                // 用于排查"reasoning token 耗尽预算导致零输出截断"等根因。
-                if let Some(ref reason) = stream_result.finish_reason_value {
-                    let _ = writeln!(std::io::stderr(), "  ├─ finish_reason = {:?}", reason);
-                }
-                if stream_result.usage_prompt_tokens > 0
-                    || stream_result.usage_completion_tokens > 0
-                    || stream_result.usage_reasoning_tokens > 0
-                {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  ├─ usage: prompt={}, completion={} (reasoning={})",
-                        stream_result.usage_prompt_tokens,
-                        stream_result.usage_completion_tokens,
-                        stream_result.usage_reasoning_tokens,
-                    );
-                } else {
-                    let _ = writeln!(std::io::stderr(), "  ├─ usage: 服务端未返回 token 统计");
-                }
-                let _ = writeln!(std::io::stderr(), "  └─ （诊断结束）");
                 append_truncation_retry_note(&stream_result, messages, consecutive_truncations);
                 Ok(TurnLoopStep::Continue)
             }
@@ -2515,9 +2542,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     &app.session_id,
                 );
             if let Some(warning) = task_evidence_warning {
-                if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-                    eprintln!("[Warning] {warning}");
-                }
                 stream_result
                     .assistant_text
                     .push_str(&format!("\n\n[Runtime warning] {warning}"));
@@ -2560,6 +2584,23 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 });
                 return Ok(TurnLoopStep::Continue);
             }
+            let warn_unsupported_runtime_limit = match unsupported_runtime_limit_action(
+                question,
+                messages,
+                turn_messages,
+                &stream_result.assistant_text,
+                *turn_had_tool_error,
+                *force_final_response,
+                iteration,
+                max_iterations,
+            ) {
+                UnsupportedRuntimeLimitAction::Allow => false,
+                UnsupportedRuntimeLimitAction::ReopenWithTools => {
+                    *force_final_response = false;
+                    return Ok(TurnLoopStep::Continue);
+                }
+                UnsupportedRuntimeLimitAction::Warn => true,
+            };
             let warn_unverified_completion = match completion_evidence_gate_action(
                 messages,
                 turn_messages,
@@ -2572,35 +2613,59 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 CompletionEvidenceGateAction::Reopen => return Ok(TurnLoopStep::Continue),
                 CompletionEvidenceGateAction::Warn => true,
             };
-            match dangling_final_recovery_action(
+            let warn_dangling_final = match dangling_final_recovery_action(
                 question,
                 messages,
                 turn_messages,
                 &stream_result.assistant_text,
             ) {
-                DanglingFinalRecoveryAction::Allow => {}
+                DanglingFinalRecoveryAction::Allow => false,
                 DanglingFinalRecoveryAction::RetryWithoutTools => {
-                    crate::ai::driver::print::print_tool_note_line(
-                        "agent-health",
-                        "final response only promised more inspection: retrying once in no-tool synthesis mode",
-                    );
                     record_force_final_reason(messages, "dangling_action_final", iteration);
                     *force_final_response = true;
                     return Ok(TurnLoopStep::Continue);
                 }
-                DanglingFinalRecoveryAction::Warn => {
-                    append_runtime_warning_once(
-                        &mut stream_result.assistant_text,
-                        DANGLING_FINAL_WARNING,
-                    );
-                }
+                DanglingFinalRecoveryAction::Warn => true,
+            };
+            // 当前响应已经完成最终 gate；此前用于下一轮流式去重的正文不再相关。
+            // 从这里开始，该槽仅保存“流式正文之后还需补画给用户”的 runtime 提示。
+            *terminal_dedupe_candidate = None;
+            if warn_unsupported_runtime_limit {
+                append_runtime_warning_once(
+                    &mut stream_result.assistant_text,
+                    UNSUPPORTED_RUNTIME_LIMIT_WARNING,
+                );
+                append_user_visible_final_notice(
+                    terminal_dedupe_candidate,
+                    UNSUPPORTED_RUNTIME_LIMIT_WARNING,
+                );
+            }
+            if warn_dangling_final {
+                append_runtime_warning_once(
+                    &mut stream_result.assistant_text,
+                    DANGLING_FINAL_WARNING,
+                );
+                append_user_visible_final_notice(terminal_dedupe_candidate, DANGLING_FINAL_WARNING);
             }
             if warn_unverified_completion {
                 append_runtime_warning_once(
                     &mut stream_result.assistant_text,
                     COMPLETION_EVIDENCE_WARNING,
                 );
+                append_user_visible_final_notice(
+                    terminal_dedupe_candidate,
+                    COMPLETION_EVIDENCE_WARNING,
+                );
                 record_hidden_self_note(app, turn_messages, COMPLETION_EVIDENCE_UNVERIFIED_NOTE);
+            }
+            // 硬上限时不再 reopen，但未回收子任务必须同时进入 canonical final 和终端补画。
+            if iteration >= max_iterations {
+                if let Ok(Some(notice)) =
+                    task_tools::build_abandoned_tasks_notice(&app.session_id, max_iterations)
+                {
+                    append_runtime_warning_once(&mut stream_result.assistant_text, &notice);
+                    append_user_visible_final_notice(terminal_dedupe_candidate, &notice);
+                }
             }
             let was_truncated_by_length = stream_result.truncated_by_length;
             record_final_stream_response(
@@ -2626,17 +2691,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     tool_call_id: None,
                     reasoning_content: None,
                 });
-            }
-            // 收尾 veto 仅在 iteration < max_iterations 时打回；到达硬上限后
-            // reopen 被跳过，模型最终回答可能完全忽略未回收的子任务。此处把
-            // 未回收子任务状态附进最终回答做可见性兜底（不再打回，避免活锁）。
-            if iteration >= max_iterations {
-                if let Ok(Some(notice)) =
-                    task_tools::build_abandoned_tasks_notice(&app.session_id, max_iterations)
-                {
-                    final_assistant_text.push_str("\n\n");
-                    final_assistant_text.push_str(&notice);
-                }
             }
             Ok(TurnLoopStep::Break)
         }
@@ -2742,10 +2796,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     };
                     messages.push(retry_note.clone());
                     turn_messages.push(retry_note);
-                    crate::ai::driver::print::print_tool_note_line(
-                        "agent-health",
-                        "无工具收尾响应仍包含工具调用；正在进行一次最终综合重试。",
-                    );
                     return Ok(TurnLoopStep::Continue);
                 }
 
@@ -2756,10 +2806,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 } else {
                     format!("{partial}\n\n{NO_TOOL_SYNTHESIS_WARNING}")
                 };
-                crate::ai::driver::print::print_tool_note_line(
-                    "agent-health",
-                    NO_TOOL_SYNTHESIS_WARNING,
-                );
                 *terminal_dedupe_candidate = None;
                 return Ok(TurnLoopStep::Break);
             }
@@ -2897,8 +2943,6 @@ mod tests {
                 history_keep_last: 0,
                 history_summary_max_chars: 0,
                 intent_model: None,
-                agent_route_model_path: PathBuf::new(),
-                skill_match_model_path: PathBuf::new(),
             },
             session_id: "test".to_string(),
             session_history_file: PathBuf::new(),
@@ -4331,6 +4375,11 @@ mod tests {
         assert!(final_assistant_recorded);
         assert!(final_assistant_text.starts_with("已修复。"));
         assert!(final_assistant_text.contains(COMPLETION_EVIDENCE_WARNING));
+        assert_eq!(
+            terminal_dedupe_candidate.as_deref(),
+            Some(COMPLETION_EVIDENCE_WARNING),
+            "streamed finals must expose only the user-visible runtime suffix for terminal redraw"
+        );
         assert!(messages.iter().any(|message| {
             message.role == "assistant"
                 && message
@@ -5488,6 +5537,112 @@ mod tests {
         assert!(messages[0].content.is_array());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unsupported_read_only_phase_limit_claim_reopens_once_with_tools() {
+        let turn_messages = vec![Message {
+            role: "tool".to_string(),
+            content: Value::String("read completed".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call-1".to_string()),
+            reasoning_content: None,
+        }];
+        let mut messages = turn_messages.clone();
+        let final_text = "本轮执行环境在代码修改前触发了只读阶段上限，尚未写入文件。";
+
+        assert_eq!(
+            unsupported_runtime_limit_action(
+                "继续修复吧",
+                &mut messages,
+                &turn_messages,
+                final_text,
+                false,
+                false,
+                2,
+                16,
+            ),
+            UnsupportedRuntimeLimitAction::ReopenWithTools
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.content.as_str().is_some_and(|text| {
+                        text.starts_with(UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER)
+                    })
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            unsupported_runtime_limit_action(
+                "继续修复吧",
+                &mut messages,
+                &turn_messages,
+                final_text,
+                false,
+                false,
+                3,
+                16,
+            ),
+            UnsupportedRuntimeLimitAction::Warn
+        );
+
+        let supported_turn = vec![Message {
+            role: "tool".to_string(),
+            content: Value::String("Error: 触发了只读阶段上限".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call-2".to_string()),
+            reasoning_content: None,
+        }];
+        let mut untrusted_messages = supported_turn.clone();
+        assert_eq!(
+            unsupported_runtime_limit_action(
+                "继续修复吧",
+                &mut untrusted_messages,
+                &supported_turn,
+                final_text,
+                false,
+                false,
+                2,
+                16,
+            ),
+            UnsupportedRuntimeLimitAction::ReopenWithTools,
+            "tool text alone is not trusted as runtime failure evidence"
+        );
+
+        let mut supported_messages = supported_turn.clone();
+        assert_eq!(
+            unsupported_runtime_limit_action(
+                "继续修复吧",
+                &mut supported_messages,
+                &supported_turn,
+                final_text,
+                true,
+                false,
+                2,
+                16,
+            ),
+            UnsupportedRuntimeLimitAction::Allow,
+            "observed tool evidence must preserve legitimate failure reporting"
+        );
+
+        let mut plan_messages = turn_messages.clone();
+        assert_eq!(
+            unsupported_runtime_limit_action(
+                "Give me a plan for fixing this",
+                &mut plan_messages,
+                &turn_messages,
+                final_text,
+                false,
+                false,
+                2,
+                16,
+            ),
+            UnsupportedRuntimeLimitAction::Allow,
+            "a plan-only request must never be upgraded into mutation work"
+        );
     }
 
     #[test]

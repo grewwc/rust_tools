@@ -193,10 +193,6 @@ fn test_app_with_model(current_model: String) -> App {
             history_keep_last: 8,
             history_summary_max_chars: 4000,
             intent_model: None,
-            agent_route_model_path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/bin/ai/config/agent_route/agent_route_model.json"),
-            skill_match_model_path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/bin/ai/config/skill_match/skill_match_model.json"),
         },
         session_id: String::new(),
         session_history_file: std::path::PathBuf::new(),
@@ -427,7 +423,7 @@ fn explicit_primary_agent_is_rejected_for_task_tool() {
 }
 
 #[test]
-fn tfidf_auto_selection_matches_task_to_subagent_description() {
+fn auto_selection_matches_task_to_subagent_description() {
     let mut explore = manifest(
         "navigator",
         "Read-only codebase exploration agent",

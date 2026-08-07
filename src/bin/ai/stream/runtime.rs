@@ -1013,11 +1013,7 @@ fn commit_visible_content(
         return Ok(());
     }
 
-    if render_terminal && state.content.thinking_open {
-        // 普通 assistant 正文可能只是工具调用前的阶段性结论，甚至会在
-        // completion evidence / subagent evidence gate 中被打回。它仍会在下方
-        // 写入 StreamResult，作为后续模型轮次的内部上下文；只有整个 turn 真正
-        // 接受的最终正文才由 finalize_turn 一次性渲染。
+    if render_terminal {
         if markers.subagent_preview_enabled() {
             write_subagent_content_folded(content.as_str(), state)?;
         } else {

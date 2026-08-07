@@ -458,7 +458,8 @@ impl MemoryStore {
         }))
     }
 
-    /// 批量应用“删除 + 新增”变更并一次性原子重写 JSONL。
+    /// 批量应用“删除 + 新增”变更。先准备全部目标内容，再在同一主文件锁内提交；
+    /// 中途失败时恢复已提交文件，避免当前文件与轮转归档只更新一部分。
     /// JSONL 仍是 source of truth；SQLite 索引在成功写回后做 best-effort 全量重建。
     pub(crate) fn apply_batch_update(
         &self,
@@ -473,47 +474,96 @@ impl MemoryStore {
         }
         let id_set: FxHashSet<&str> = delete_ids.iter().copied().collect();
         super::with_memory_file_lock(&self.path, || {
-            let content = match std::fs::read_to_string(&self.path) {
-                Ok(content) => content,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(err) => return Err(format!("Failed to read memory file: {err}")),
-            };
-
-            let mut kept = Vec::new();
-            let mut deleted = 0usize;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
-                    if entry.id.as_deref().map_or(false, |id| id_set.contains(id)) {
-                        deleted += 1;
-                        continue;
-                    }
-                    kept.push(entry);
-                }
-            }
-            kept.extend(new_entries.iter().cloned());
-
             if let Some(parent) = self.path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|err| format!("Failed to create memory dir: {err}"))?;
             }
-            Self::write_all_entries(&self.path, &kept)?;
+            let mut paths = if id_set.is_empty() {
+                vec![self.path.clone()]
+            } else {
+                self.memory_files_to_scan_consolidate()?
+            };
+            if !paths.contains(&self.path) {
+                paths.insert(0, self.path.clone());
+            }
 
-            if let Some(idx) = memory_index_for(&self.path)
-                && let Err(err) = idx.rebuild_from_source()
-            {
-                trace_memory_event(
-                    "memory.index.rebuild_failed",
-                    "MemoryIndex rebuild failed after batch rewrite; index may drift",
-                    &[("path", self.path.display().to_string()), ("error", err)],
-                );
+            let mut rewrites = Vec::new();
+            let mut deleted_total = 0usize;
+            for path in paths {
+                let is_current = path == self.path;
+                let original = match fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound && is_current => None,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(format!("Failed to read memory file {}: {err}", path.display()));
+                    }
+                };
+                let content = original
+                    .as_deref()
+                    .map(std::str::from_utf8)
+                    .transpose()
+                    .map_err(|err| format!("Invalid UTF-8 in memory file {}: {err}", path.display()))?
+                    .unwrap_or_default();
+                let mut kept = Vec::new();
+                let mut deleted = 0usize;
+                for line in content.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                    if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
+                        if entry.id.as_deref().is_some_and(|id| id_set.contains(id)) {
+                            deleted += 1;
+                        } else {
+                            kept.push(entry);
+                        }
+                    }
+                }
+                if is_current {
+                    kept.extend(new_entries.iter().cloned());
+                }
+                if is_current || deleted > 0 {
+                    deleted_total += deleted;
+                    rewrites.push((path, original, kept));
+                }
+            }
+
+            let mut committed: Vec<usize> = Vec::new();
+            for (path, _, entries) in &rewrites {
+                if let Err(commit_err) = Self::write_all_entries(path, entries) {
+                    let mut rollback_errors = Vec::new();
+                    for &index in committed.iter().rev() {
+                        let (written_path, written_original, _) = &rewrites[index];
+                        let result = match written_original {
+                            Some(bytes) => atomic_write_file(written_path, bytes),
+                            None => match fs::remove_file(written_path) {
+                                Ok(()) => Ok(()),
+                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                                Err(err) => Err(err),
+                            },
+                        };
+                        if let Err(err) = result {
+                            rollback_errors.push(format!("{}: {err}", written_path.display()));
+                        }
+                    }
+                    let rollback_suffix = if rollback_errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; rollback also failed for {}", rollback_errors.join(", "))
+                    };
+                    return Err(format!(
+                        "Failed to commit memory batch at {}: {commit_err}{rollback_suffix}",
+                        path.display()
+                    ));
+                }
+                committed.push(committed.len());
+            }
+
+            for (path, _, _) in &rewrites {
+                if path == &self.path || derive_db_path(path).is_some_and(|db| db.exists()) {
+                    rebuild_index_for_path(path);
+                }
             }
 
             Ok(MemoryBatchUpdateReport {
-                deleted,
+                deleted: deleted_total,
                 appended: new_entries.len(),
             })
         })
@@ -532,61 +582,78 @@ impl MemoryStore {
             .unwrap_or(3);
 
         let mut files: Vec<PathBuf> = Vec::new();
-        if search_archives || include_archives {
-            if let Some(parent) = self.path.parent() {
-                let base = self
-                    .path
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("")
-                    .to_string();
-                let legacy_base = self
-                    .path
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("")
-                    .to_string();
-                let archive_prefix = format!("{base}.");
-                let legacy_migration_prefix = format!("{legacy_base}.legacy-migrate-");
-                let mut archives = Vec::new();
-                for entry in fs::read_dir(parent).map_err(|e| format!("{}", e))? {
-                    let entry = entry.map_err(|e| format!("{}", e))?;
-                    let file_name = entry.file_name().to_str().unwrap_or("").to_string();
-                    let is_rotation_archive = file_name.starts_with(&archive_prefix);
-                    // 旧版迁移曾将原始 JSONL 留为
-                    // `agent_memory.legacy-migrate-<timestamp>.jsonl.bak`。它不符合
-                    // 当前 rotation 的 `<base>.{timestamp}` 命名；仅在 -ns 等显式
-                    // 要求查归档时纳入，避免普通当前文件检索读取过期迁移快照。
-                    let is_legacy_migration_backup = include_archives
-                        && file_name.starts_with(&legacy_migration_prefix)
-                        && file_name.ends_with(".jsonl.bak");
-                    if !is_rotation_archive && !is_legacy_migration_backup {
-                        continue;
-                    }
-                    let meta = entry.metadata().map_err(|e| format!("{}", e))?;
-                    if !meta.is_file() {
-                        continue;
-                    }
-                    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    archives.push((entry.path(), modified));
-                }
-                archives.sort_by_key(|(_, modified)| *modified);
-                if include_archives {
-                    // 显式请求扫描归档（如 -ns memo 检索）：不截断，
-                    // 确保被 rotation 移入旧归档的历史 memo 仍可检索。
-                    // keep_last_archives 截断仅用于 search_archives.enable
-                    // 全局配置开启时的全量搜索性能优化。
-                    for (path, _) in archives {
-                        files.push(path);
-                    }
-                } else {
-                    let take_from = archives.len().saturating_sub(keep_last_archives);
-                    for (path, _) in archives.into_iter().skip(take_from) {
-                        files.push(path);
-                    }
-                }
-            }
+        let archives = self.collect_archive_files(include_archives)?;
+        if include_archives {
+            // 显式请求扫描归档（如 -ns memo 检索）：不截断，
+            // 确保被 rotation 移入旧归档的历史 memo 仍可检索。
+            // keep_last_archives 截断仅用于 search_archives.enable
+            // 全局配置开启时的全量搜索性能优化。
+            files.extend(archives.into_iter().map(|(path, _)| path));
+        } else if search_archives {
+            let take_from = archives.len().saturating_sub(keep_last_archives);
+            files.extend(archives.into_iter().skip(take_from).map(|(path, _)| path));
         }
+        files.push(self.path.clone());
+        Ok(files)
+    }
+
+    /// 收集归档文件（轮转归档 + 可选 legacy 迁移备份），按修改时间升序返回。
+    fn collect_archive_files(
+        &self,
+        include_legacy_backups: bool,
+    ) -> Result<Vec<(PathBuf, SystemTime)>, String> {
+        let Some(parent) = self.path.parent() else {
+            return Ok(Vec::new());
+        };
+        let base = self
+            .path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("")
+            .to_string();
+        let legacy_base = self
+            .path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or("")
+            .to_string();
+        let archive_prefix = format!("{base}.");
+        let legacy_migration_prefix = format!("{legacy_base}.legacy-migrate-");
+        let mut archives = Vec::new();
+        for entry in fs::read_dir(parent).map_err(|e| format!("{}", e))? {
+            let entry = entry.map_err(|e| format!("{}", e))?;
+            let file_name = entry.file_name().to_str().unwrap_or("").to_string();
+            let is_rotation_archive = file_name.starts_with(&archive_prefix);
+            // 旧版迁移曾将原始 JSONL 留为
+            // `agent_memory.legacy-migrate-<timestamp>.jsonl.bak`。它不符合
+            // 当前 rotation 的 `<base>.{timestamp}` 命名；仅在 -ns 等显式
+            // 要求查归档时纳入，避免普通当前文件检索读取过期迁移快照。
+            let is_legacy_migration_backup = include_legacy_backups
+                && file_name.starts_with(&legacy_migration_prefix)
+                && file_name.ends_with(".jsonl.bak");
+            if !is_rotation_archive && !is_legacy_migration_backup {
+                continue;
+            }
+            let meta = entry.metadata().map_err(|e| format!("{}", e))?;
+            if !meta.is_file() {
+                continue;
+            }
+            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            archives.push((entry.path(), modified));
+        }
+        archives.sort_by_key(|(_, modified)| *modified);
+        Ok(archives)
+    }
+
+    /// --consolidate-knowledge 专用扫描：包含全部轮转归档，不含 legacy 迁移备份。
+    /// 整理需要看到被 rotation 移入归档的历史条目；迁移备份只是只读历史快照，
+    /// 不应进入整理视野（也不会被改写）。
+    fn memory_files_to_scan_consolidate(&self) -> Result<Vec<PathBuf>, String> {
+        let mut files: Vec<PathBuf> = self
+            .collect_archive_files(false)?
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
         files.push(self.path.clone());
         Ok(files)
     }
@@ -1249,6 +1316,96 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn apply_batch_update_deletes_across_rotation_archives() {
+        let dir = std::env::temp_dir().join(format!(
+            "rt_mem_archive_test_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let current = dir.join("agent_memory.jsonl");
+        let archive = dir.join("agent_memory.jsonl.20260101000000");
+        let entry_with_id = |id: &str, note: &str, ts: &str| AgentMemoryEntry {
+            id: Some(id.to_string()),
+            timestamp: ts.to_string(),
+            category: "user_memory".to_string(),
+            note: note.to_string(),
+            tags: Vec::new(),
+            source: None,
+            priority: Some(150),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+        let write_lines = |path: &std::path::Path, entries: &[AgentMemoryEntry]| {
+            let mut buf = String::new();
+            for entry in entries {
+                buf.push_str(&serde_json::to_string(entry).unwrap());
+                buf.push('\n');
+            }
+            std::fs::write(path, buf).unwrap();
+        };
+        let read_ids = |path: &std::path::Path| -> Vec<String> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<AgentMemoryEntry>(line.trim()).ok())
+                .filter_map(|entry| entry.id)
+                .collect()
+        };
+        // 当前文件：cur_a 保留、cur_b 删除；归档：arch_c 删除、arch_d 保留。
+        write_lines(
+            &current,
+            &[
+                entry_with_id("cur_a", "keep me", "2025-01-01T00:00:00Z"),
+                entry_with_id("cur_b", "drop me", "2025-01-01T00:00:01Z"),
+            ],
+        );
+        write_lines(
+            &archive,
+            &[
+                entry_with_id("arch_c", "drop in archive", "2025-01-01T00:00:02Z"),
+                entry_with_id("arch_d", "keep in archive", "2025-01-01T00:00:03Z"),
+            ],
+        );
+
+        let store = MemoryStore::for_tests_with_path(current.clone());
+        let merged = entry_with_id("merged_1", "merged note", "2025-01-02T00:00:00Z");
+        let report = store
+            .apply_batch_update(&["cur_b", "arch_c"], &[merged.clone()])
+            .unwrap();
+
+        assert_eq!(
+            report,
+            MemoryBatchUpdateReport {
+                deleted: 2,
+                appended: 1
+            }
+        );
+        assert_eq!(
+            read_ids(&current),
+            vec!["cur_a".to_string(), "merged_1".to_string()]
+        );
+        assert_eq!(read_ids(&archive), vec!["arch_d".to_string()]);
+
+        // all_with_archives 应同时看到主文件与轮转归档中的条目。
+        let all_ids: Vec<String> = store
+            .all_with_archives()
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| entry.id)
+            .collect();
+        assert_eq!(all_ids.len(), 3);
+        assert!(all_ids.contains(&"cur_a".to_string()));
+        assert!(all_ids.contains(&"arch_d".to_string()));
+        assert!(all_ids.contains(&"merged_1".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn compute_similarity(entry: &AgentMemoryEntry, query_lc: &str) -> f64 {
@@ -1893,6 +2050,32 @@ impl MemoryStore {
     pub fn all(&self) -> Result<Vec<AgentMemoryEntry>, String> {
         self.search("", usize::MAX)
             .map(|results| results.into_iter().map(|(e, _score)| e).collect())
+    }
+
+    /// 获取全部记忆（含全部轮转归档，不含 legacy 迁移备份）。
+    /// 供 --consolidate-knowledge 使用：整理需要看到被 rotation 移入
+    /// 归档的历史条目，否则它们永远不会进入整理视野。
+    pub(crate) fn all_with_archives(&self) -> Result<Vec<AgentMemoryEntry>, String> {
+        let mut entries = Vec::new();
+        for p in self.memory_files_to_scan_consolidate()? {
+            if !p.exists() {
+                continue;
+            }
+            let file =
+                fs::File::open(&p).map_err(|e| format!("Failed to read memory file: {e}"))?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line.map_err(|e| format!("Failed to read memory file: {e}"))?;
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
+                    entries.push(entry);
+                }
+            }
+        }
+        Ok(entries)
     }
 
     /// 记录记忆被使用（增加引用次数）。

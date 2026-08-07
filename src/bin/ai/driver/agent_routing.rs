@@ -1,17 +1,15 @@
 //! Agent routing: skill manifest loading, primary agent activation,
-//! auto-routing, hot-reload, and runtime manifest initialization.
+//! hot-reload, and runtime manifest initialization.
 //!
 //! Extracted from `driver/mod.rs` (review Finding #1, Phase 2).
 
 use std::sync::Arc;
 
-use super::{agent_router, note_search};
 use crate::ai::{
     agents::{self, AgentManifest},
     skills::{self, SkillManifest},
     types::App,
 };
-use crate::commonw::configw;
 
 #[crate::ai::agent_hang_span(
     "pre-fix",
@@ -56,91 +54,6 @@ pub(super) fn has_pending_foreground_process(app: &App) -> bool {
     })
 }
 
-/// Check if auto-agent routing is enabled in config.
-/// Auto-routing selects the best agent based on the question content.
-///
-/// 默认禁用：TF-IDF + logistic regression 的浅层文本匹配误报率高（如问题中
-/// 出现 "skill" 就切到 prompt-skill agent），且 agent 切换会改变 system
-/// prompt / 工具集 / model tier，影响整轮对话。用户可通过 `-a <agent>`
-/// 手动指定，或配置 `ai.agents.auto_route.enable = true` 重新启用。
-pub(super) fn auto_agent_routing_enabled() -> bool {
-    !configw::get_all_config()
-        .get_opt("ai.agents.auto_route.enable")
-        .unwrap_or_else(|| "false".to_string())
-        .trim()
-        .eq_ignore_ascii_case("false")
-}
-
-/// Get auto-routing strategy from config: "model" or "heuristic".
-pub(super) fn auto_route_strategy() -> String {
-    configw::get_all_config()
-        .get_opt("ai.agents.auto_route.strategy")
-        .unwrap_or_else(|| "model".to_string())
-        .trim()
-        .to_lowercase()
-}
-
-/// Auto-route to a different agent based on question content.
-/// Activated when:
-///   1. No explicit agent specified via CLI (-a/--agent)
-///   2. Auto-routing is enabled in config
-///   3. A suitable agent is found based on the question
-///
-/// Uses either:
-///   - model strategy: Use ML model to predict best agent
-///   - heuristic strategy: Rule-based routing
-pub(super) fn maybe_auto_route_agent(
-    app: &mut App,
-    agent_manifests: &[AgentManifest],
-    question: &str,
-) {
-    if app.cli.agent.is_some() || !auto_agent_routing_enabled() {
-        return;
-    }
-
-    let history = note_search::read_recent_history(app);
-    let decision = match auto_route_strategy().as_str() {
-        "heuristic" => {
-            let router = agent_router::HeuristicRouter;
-            agent_router::AgentRouter::route(
-                &router,
-                agent_manifests,
-                question,
-                &history,
-                &app.current_agent,
-            )
-        }
-        _ => {
-            let model_path = app.config.agent_route_model_path.clone();
-            let router = agent_router::ModelRouter::new(model_path);
-            agent_router::AgentRouter::route(
-                &router,
-                agent_manifests,
-                question,
-                &history,
-                &app.current_agent,
-            )
-        }
-    };
-    let Some(decision) = decision else {
-        return;
-    };
-
-    let Some(agent) = agents::find_agent_by_name(agent_manifests, &decision.agent_name) else {
-        return;
-    };
-    if !agent.is_primary() || agent.disabled {
-        return;
-    }
-
-    let old_agent = app.current_agent.clone();
-    activate_primary_agent(app, agent);
-
-    println!(
-        "\n[Agent 自动切换: {} → {}] (原因: {})\n",
-        old_agent, app.current_agent, decision.reason
-    );
-}
 
 /// Loads all agents fresh from disk, enabling hot-reload of newly added/modified agents.
 /// 发生变化时返回待展示消息，由前台 driver 在结束动态状态行后统一输出。

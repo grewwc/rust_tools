@@ -1333,7 +1333,7 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     _question: &str,
     preferred_skill_name: Option<&str>,
 ) -> SkillTurnGuard {
-    // 不再做 TF-IDF 重路由：iteration > 1 时仅按名字保持上一轮的 skill。
+    // iteration > 1 时仅按名字保持上一轮的 skill，不再做文本相似度重路由。
     // 模型如需切换可通过 activate_skill 显式请求。
     let skill =
         preferred_skill_name.and_then(|name| skill_manifests.iter().find(|s| s.name == name));
@@ -2862,7 +2862,4 @@ mod tests {
         assert!(!names.contains(&"apply_patch".to_string()));
     }
 
-    fn model_path() -> std::path::PathBuf {
-        crate::ai::driver::skill_match_model::default_model_path()
-    }
 }

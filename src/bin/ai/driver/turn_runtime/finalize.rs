@@ -16,6 +16,7 @@ use super::{TurnOutcome, persistence::persist_pending_turn_messages_for_model};
 const SUBAGENT_TOOL_EVIDENCE_MAX_CALLS: usize = 8;
 const SUBAGENT_TOOL_EVIDENCE_MAX_CHARS_PER_RESULT: usize = 700;
 const SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS: usize = 4_000;
+const MODEL_CONTEXT_ECHO_PREFIX: &str = "[Model-authored note from an earlier turn;";
 static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
 /// 与标题任务同构的 in-flight 去重：避免同一 session 同时跑多次持久化压缩
@@ -45,6 +46,35 @@ fn ensure_final_assistant_recorded(
         tool_call_id: None,
         reasoning_content: None,
     });
+}
+
+/// 模型偶尔会把 request projection 中的 internal_note 原样回显。仅供模型消费的
+/// runtime note 必须留在 canonical history，但不能作为用户可见回答打印到 terminal。
+/// 已流式输出的回答只补画 runtime 显式标记为用户可见的追加提示。
+fn terminal_final_text_to_render(
+    final_assistant_text: &str,
+    final_assistant_recorded: bool,
+    user_visible_suffix: Option<&str>,
+) -> Option<String> {
+    // 已写入 canonical history 的最终模型响应此前已经由 stream runtime 实时输出；
+    // finalize 只补画未经过流式响应的本地 fallback，避免整段正文在终端重复一次。
+    if final_assistant_recorded {
+        return user_visible_suffix
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+    }
+    let terminal_text = final_assistant_text
+        .split_once("\n\n[Runtime warning]")
+        .map_or(final_assistant_text, |(visible, _)| visible);
+    let trimmed = terminal_text.trim_start();
+    if trimmed.starts_with(MODEL_CONTEXT_ECHO_PREFIX)
+        || trimmed.starts_with("self_note:")
+        || trimmed.starts_with("[Runtime warning]")
+    {
+        return None;
+    }
+    Some(terminal_text.to_string())
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -320,6 +350,7 @@ pub(super) async fn finalize_turn(
     question: &str,
     final_assistant_text: &str,
     final_assistant_recorded: bool,
+    user_visible_final_suffix: Option<&str>,
     active_skill_name: Option<&str>,
     turn_messages: &mut Vec<Message>,
     one_shot_mode: bool,
@@ -346,9 +377,16 @@ pub(super) async fn finalize_turn(
             final_assistant_recorded,
             turn_messages,
         );
-        if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        if crate::ai::driver::runtime_ctx::terminal_output_enabled()
+            && let Some(visible_text) =
+                terminal_final_text_to_render(
+                    final_assistant_text,
+                    final_assistant_recorded,
+                    user_visible_final_suffix,
+                )
+        {
             print_assistant_banner_with_app_and_skill(Some(app), active_skill_name);
-            crate::ai::stream::render_markdown_block(final_assistant_text)?;
+            crate::ai::stream::render_markdown_block(&visible_text)?;
         }
         persist_pending_turn_messages_for_model(
             app,
@@ -608,6 +646,59 @@ mod tests {
     fn subagent_parent_result_without_tools_is_plain_final_text() {
         let output = format_subagent_result_for_parent("done", &[]);
         assert_eq!(output, "done");
+    }
+
+    #[test]
+    fn terminal_final_text_only_renders_unstreamed_visible_fallbacks() {
+        assert_eq!(
+            terminal_final_text_to_render("实时正文", true, None),
+            None,
+            "streamed model text must not be redrawn during finalize"
+        );
+        assert_eq!(
+            terminal_final_text_to_render(
+                "[Model-authored note from an earlier turn; this is not authoritative evidence.]\nself_note:completion_evidence_required",
+                false,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_final_text_to_render("self_note:completion_evidence_required", false, None),
+            None
+        );
+        assert_eq!(
+            terminal_final_text_to_render(
+                "[Runtime warning] Completion is unverified.",
+                false,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_final_text_to_render("本地 fallback。", false, None),
+            Some("本地 fallback。".to_string())
+        );
+        assert_eq!(
+            terminal_final_text_to_render("完成修复。", false, None),
+            Some("完成修复。".to_string())
+        );
+        assert_eq!(
+            terminal_final_text_to_render(
+                "完成修复。\n\n[Runtime warning] Completion is unverified.",
+                false,
+                None,
+            ),
+            Some("完成修复。".to_string())
+        );
+        assert_eq!(
+            terminal_final_text_to_render(
+                "已流式输出。\n\n[Runtime warning] Completion is unverified.",
+                true,
+                Some("[Runtime warning] Completion is unverified."),
+            ),
+            Some("[Runtime warning] Completion is unverified.".to_string())
+        );
     }
 
     #[test]

@@ -6,10 +6,6 @@ use std::time::{Duration, Instant};
 use crate::ai::tools::os_tools::GLOBAL_OS;
 use crate::ai::{
     agents::{self, AgentManifest, AgentModelTier},
-    driver::{
-        TextSimilarityFeatures, build_idf_from_documents, cosine_tfidf_similarity,
-        normalize_text_for_similarity,
-    },
     models,
     tools::common::{
         ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
@@ -26,7 +22,7 @@ use aios_kernel::{
     },
 };
 use rust_tools::cw::{SkipMap, SkipSet};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -2703,17 +2699,62 @@ fn subagent_document_text(agent: &AgentManifest) -> String {
     if !agent.prompt.trim().is_empty() {
         parts.push(agent.prompt.chars().take(1500).collect());
     }
-    normalize_text_for_similarity(&parts.join("\n"))
+    parts.join("\n")
 }
 
+/// 从文本提取 2-4 元字符 n-gram 集合（小写、空白折叠归一化）。
+/// 仅用于集合相似度计算，不含词频 / 逆文档频率等权重。
+fn char_ngram_set_from_text(input: &str) -> FxHashSet<String> {
+    let mut normalized = String::with_capacity(input.len());
+    let mut prev_space = false;
+    for ch in input.to_lowercase().chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                normalized.push(' ');
+            }
+            prev_space = true;
+        } else {
+            normalized.push(ch);
+            prev_space = false;
+        }
+    }
+    let normalized = normalized.trim();
+    if normalized.is_empty() {
+        return FxHashSet::default();
+    }
+    let chars: Vec<char> = format!("^{normalized}$").chars().collect();
+    let mut set = FxHashSet::default();
+    for n in 2..=4 {
+        if chars.len() < n {
+            continue;
+        }
+        for window in chars.windows(n) {
+            let token: String = window.iter().collect();
+            if token.trim().is_empty() {
+                continue;
+            }
+            set.insert(token);
+        }
+    }
+    set
+}
+
+/// 子代理自动选择：基于归一化文本的字符 n-gram 集合重叠度（Jaccard）打分。
 fn auto_subagent_score(
     agent: &AgentManifest,
     task_text: &str,
-    idf: &FxHashMap<String, f64>,
 ) -> f64 {
-    let query = TextSimilarityFeatures::from_text(task_text);
-    let doc = TextSimilarityFeatures::from_text(&subagent_document_text(agent));
-    cosine_tfidf_similarity(&query.ngram_tf, &doc.ngram_tf, idf)
+    let query = char_ngram_set_from_text(task_text);
+    let doc = char_ngram_set_from_text(&subagent_document_text(agent));
+    if query.is_empty() || doc.is_empty() {
+        return 0.0;
+    }
+    let intersection = query.intersection(&doc).count();
+    let union = query.len() + doc.len() - intersection;
+    if union == 0 {
+        return 0.0;
+    }
+    intersection as f64 / union as f64
 }
 
 #[derive(Debug)]
@@ -2769,22 +2810,16 @@ fn select_subagent<'a>(
     }
 
     let task_text = format!("{description}\n{prompt}");
-    let doc_tfs: Vec<FxHashMap<String, f64>> = subagents
-        .iter()
-        .map(|agent| TextSimilarityFeatures::from_text(&subagent_document_text(agent)).ngram_tf)
-        .collect();
-    let doc_refs: Vec<&FxHashMap<String, f64>> = doc_tfs.iter().collect();
-    let idf = build_idf_from_documents(&doc_refs);
 
     subagents
         .into_iter()
         .max_by(|a, b| {
-            auto_subagent_score(a, &task_text, &idf)
-                .total_cmp(&auto_subagent_score(b, &task_text, &idf))
+            auto_subagent_score(a, &task_text)
+                .total_cmp(&auto_subagent_score(b, &task_text))
                 .then_with(|| b.name.cmp(&a.name))
         })
         .map(|agent| {
-            let score = auto_subagent_score(agent, &task_text, &idf);
+            let score = auto_subagent_score(agent, &task_text);
             SelectedSubagent {
                 agent,
                 auto_selected: true,

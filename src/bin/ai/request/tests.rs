@@ -343,8 +343,6 @@ fn test_app() -> App {
             history_keep_last: 0,
             history_summary_max_chars: 0,
             intent_model: None,
-            agent_route_model_path: PathBuf::new(),
-            skill_match_model_path: PathBuf::new(),
         },
         session_id: String::new(),
         session_history_file: PathBuf::new(),

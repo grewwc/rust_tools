@@ -7,7 +7,7 @@
 // - Session management (history, state persistence)
 // - Process OS initialization (kernel creation)
 // - MCP client initialization
-// - Agent loading and auto-routing
+// - Agent loading and activation
 // - The main run_loop() that coordinates foreground and background processes
 //
 // Key concepts:
@@ -45,7 +45,6 @@ use crate::ai::{
 };
 use crate::commonw::configw;
 
-pub mod agent_router;
 mod agent_routing;
 mod background_dispatch;
 pub mod commands;
@@ -66,11 +65,8 @@ mod scheduler;
 mod session;
 pub mod session_pid;
 pub mod signal;
-pub mod skill_match_model;
-pub mod skill_ranking;
 pub mod skill_runtime;
 mod skill_watcher;
-pub mod text_similarity;
 pub mod thinking;
 pub mod tools;
 pub mod turn_runtime;
@@ -85,7 +81,6 @@ pub use model::*;
 use process_context::*;
 use scheduler::*;
 use session::*;
-pub use text_similarity::*;
 
 tokio::task_local! {
     pub(super) static TASK_PID: Option<u64>;
@@ -1033,7 +1028,6 @@ async fn run_loop(
             should_quit = false;
             continue;
         }
-        maybe_auto_route_agent(app, &*agent_manifests, &question);
 
         if !one_shot_mode {
             announce_mcp_loading_if_needed(&mcp_probe, mcp_initialized, &mut mcp_loading_announced);

@@ -817,11 +817,17 @@ async fn consolidate_scope(
 /// 3. 每条内容截断到**40 字**（之前 80 字）
 /// 4. 用 JSON 数组格式（比文本格式更省 token）
 /// 5. 英文 system prompt（模型响应更快）
+///
+/// 读取范围：主文件 + 全部轮转归档（all_with_archives）。被 rotation 移入
+/// 归档的历史 memo / 知识同样进入整理视野；对应删除会在 apply_batch_update
+/// 中落到归档文件本身。
 pub(super) async fn handle_consolidate_knowledge(
     app: &App,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = MemoryStore::from_env_or_config();
-    let all_entries = store.all().map_err(|e| format!("读取失败：{}", e))?;
+    let all_entries = store
+        .all_with_archives()
+        .map_err(|e| format!("读取失败：{}", e))?;
 
     if all_entries.is_empty() {
         println!("📭 知识库为空，无需整理。");

@@ -1157,10 +1157,6 @@ mod tests {
                 history_keep_last: 8,
                 history_summary_max_chars: 4000,
                 intent_model: None,
-                agent_route_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("src/bin/ai/config/agent_route/agent_route_model.json"),
-                skill_match_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("src/bin/ai/config/skill_match/skill_match_model.json"),
             },
             session_id: session_id.clone(),
             session_history_file: session_store.session_history_file(&session_id),

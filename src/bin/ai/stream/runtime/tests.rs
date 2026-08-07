@@ -175,8 +175,6 @@ fn test_app() -> App {
             history_keep_last: 0,
             history_summary_max_chars: 0,
             intent_model: None,
-            agent_route_model_path: PathBuf::new(),
-            skill_match_model_path: PathBuf::new(),
         },
         session_id: String::new(),
         session_history_file: PathBuf::new(),
@@ -1368,12 +1366,10 @@ fn thinking_fold_window_wraps_long_lines_to_terminal_width() {
         .collect::<Vec<_>>();
     // COLUMNS=12，reserve = 缩进 4 → 有效宽度 8 列。长行按 8 列自然折行，
     // 每个包裹段本身就是一个物理行，且恰好落在 4 条正文物理行的可见预算内。
-    assert_eq!(plain_lines, vec![
-        "    12345678",
-        "    90123456",
-        "    7890",
-        "    abcdef",
-    ]);
+    assert_eq!(
+        plain_lines,
+        vec!["    12345678", "    90123456", "    7890", "    abcdef",]
+    );
     assert_eq!(rows, 4);
     for visible in &plain_lines {
         assert!(
@@ -1502,13 +1498,16 @@ fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
 
     // COLUMNS=12，reserve = 缩进 4 + xterm.js 右边距 2 = 6 → 有效宽度 6 列。
     // 长行按 6 列自然折行，每个包裹段恰好一个物理行，与 xterm.js delayed-wrap 解耦。
-    assert_eq!(plain_lines, vec![
-        "    123456",
-        "    789012",
-        "    345678",
-        "    90",
-        "    abcdef",
-    ]);
+    assert_eq!(
+        plain_lines,
+        vec![
+            "    123456",
+            "    789012",
+            "    345678",
+            "    90",
+            "    abcdef",
+        ]
+    );
     assert_eq!(rows, 5);
     assert!(
         !window.ends_with('\n'),

@@ -76,9 +76,12 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
     (no reset of iteration/tool accounting). If a no-tool synthesis still emits a
     tool call, reject and retry synthesis once before warning and stopping. Never
     replace a required verification round with no-tool synthesis.
-22. **Tool-round narration stays internal.** Assistant text emitted alongside
-    tool calls or rejected candidate finals remains model/history context but is
-    not rendered in the terminal; render only the turn-final assistant response.
+22. **Terminal rendering never mutates conversation state.** Visible assistant
+    text streams live to the terminal as it arrives, including tool-round
+    narration and candidate finals that a gate may later reject or warn on.
+    Terminal output is a non-authoritative preview: the persisted
+    `assistant_text`/`turn_messages` remain the single source of truth for
+    history, context, and gate decisions, and rendering must never alter them.
 23. **Model-guided offloading is request-boundary work.** Before every logical
     model request, apply eligible prune marks to the transient `messages`
     projection before normal context budgeting, archive full tool output before
@@ -86,3 +89,7 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
     Prune confirmation counts are session-scoped durable runtime state: restore
     and filter them against the live prunable ids, clear them on history rewind,
     and never leak them across session/persona switches.
+24. **Execution limits require runtime evidence.** Do not accept a model-authored
+    read-only phase/limit claim as the reason requested changes were skipped unless
+    the current turn contains matching runtime or tool evidence. Reopen once with
+    tools preserved; at a hard stop, make the unsupported claim visible.
