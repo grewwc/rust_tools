@@ -50,8 +50,13 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
    Multi-file unified diffs (git-style `diff --git` headers or `---`/`+++` pairs)
    are auto-split and applied per file (atomic, same-path sections stack);
    deletions still require an explicit envelope; `*** Replace in line:` is the
-   low-friction single-line substring edit. Context-mismatch / ambiguous /
-   out-of-order errors echo current text as
+   low-friction single-line substring edit. Its `old` first tries an exact
+   substring match, then falls back to confusable-normalized + whitespace-trimmed
+   matching (still unique-only; multi-match and not-found stay errors, and a
+   `read_file` line-number prefix copied into `old` is never auto-stripped).
+   Multi-hunk unified failures prefix every context-mismatch / ambiguous /
+   out-of-order diagnostic with the failing hunk index (`Hunk N/M:`). Such errors
+   echo current text as
    a prefix-free, paste-ready block (`<<<PATCH_TEXT` ... `PATCH_TEXT>>>`) so the
    model can rebuild without re-reading; classify the diagnostic before the
    block (so source text cannot mimic an error), and for multi-file patches
@@ -68,7 +73,13 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
    (split into multiple calls, or pass `patch_file` = a session temp file via
    `write_file(temp=true)` or a file under `effective_cwd`; `patch_file` has its
    own 64K safety cap, so it is the path for large patches); `@@ -0` normalizes
-   to insert-at-start (line 1).
+   to insert-at-start (line 1). Truncation heuristic: when an inline patch ends
+   with an unclosed `*** End Patch`, a partial `***` marker, or a bare `@@` hunk
+   header with no body, the tool flags it as likely cut off by the context
+   manager (stream warning + appended error note pointing to `patch_file`).
+   Pure-insert hunks (only `+` lines, no context/remove) on non-empty files are
+   located by line number only, so the success message appends a note to re-read
+   with `read_file` if the file changed.
 10. **Subagent tools are top-level only.** Hide and reject the `task` family when
     `SUBAGENT_DEPTH > 0`; `enable_tools` must not restore it. Scope tasks by
     session + owner pid, persist results before IPC cleanup, and require

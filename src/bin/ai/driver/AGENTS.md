@@ -31,9 +31,9 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
    delivered results before IPC cleanup, keep delivery distinct from
    integration, restore unintegrated evidence after context rebuild, and
    preserve isolated-memory artifacts when permanent-memory merge fails.
-   Sync/audit hard timeouts must preserve child history and publish a bounded
-   recovery payload with the last runtime phase; audit work should emit
-   incremental checkpoints so a missing final answer does not erase progress.
+   Sync/audit hard timeouts must preserve child history, publish a bounded
+   recovery payload with the last runtime phase, and emit incremental
+   checkpoints so a missing final answer does not erase progress.
    **Depth guard:** only the top-level agent may delegate to a child; child
    subagents must work directly when orchestration tools are hidden.
 9. **Code-grounding reads stay serial.** Do not batch `read_file` calls in the

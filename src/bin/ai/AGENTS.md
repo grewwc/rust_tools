@@ -7,7 +7,7 @@ rules in the nearest child `AGENTS.md`.
 
 ## Runtime layout
 
-- `config*` / `config/`: config loading and schema
+- `config.rs` / `config_schema.rs`: config loading and schema
 - `models.rs` / `models.json`: model registry access, platform naming, metadata
 - `prompt/`: prompt assembly and multiline extraction
 - `skills.rs` / `agents.rs`: skill + agent manifests; `builtin_agents/` holds

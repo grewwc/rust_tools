@@ -79,6 +79,9 @@ struct PreparedPatchWrite {
     path: PathBuf,
     before: Option<String>,
     action: PreparedPatchAction,
+    /// 应用过程中产生的提示（如纯插入 hunk 仅按行号定位），随成功消息一并返回，
+    /// 提醒模型在文件已变更时需 read_file 复核。
+    hints: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -775,19 +778,39 @@ fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<Stri
     let original_lines: Vec<&str> = original.lines().collect();
     let target_line = original_lines[line_idx];
 
-    // --- old 用精确子串匹配确定替换位置（不归一化），杜绝位置偏移 ---
+    // --- old 先用精确子串匹配确定替换位置（不归一化），杜绝位置偏移 ---
     let occurrences: Vec<usize> = target_line.match_indices(&old).map(|(i, _)| i).collect();
-    let pos = match occurrences.len() {
+    let (pos, match_len) = match occurrences.len() {
+        1 => (occurrences[0], old.len()),
         0 => {
-            return Err(format!(
-                "Replace in line: `old` substring not found in matched line {}. \
-                 The anchor matched this line, but `old` must appear verbatim \
-                 (no Unicode normalization). Line content: {:?}",
-                line_idx + 1,
-                target_line
-            ));
+            // 精确匹配失败时的宽容兜底：confusable 归一化 + 首尾空白容忍。
+            // 仅用于定位；替换边界按匹配到的原字节区间，写入内容由 new 构造。
+            match find_tolerant_old_match(target_line, &old) {
+                Ok((start, end)) => (start, end - start),
+                Err(TolerantMatchError::Ambiguous(n)) => {
+                    return Err(format!(
+                        "Replace in line: after Unicode normalization `old` matches {n} \
+                         positions in line {}. It must be unique within the line. \
+                         Make `old` longer or more specific. Line content: {:?}",
+                        line_idx + 1,
+                        target_line
+                    ));
+                }
+                Err(TolerantMatchError::NoMatch) => {
+                    return Err(format!(
+                        "Replace in line: `old` substring not found in matched line {} \
+                         (even with Unicode/whitespace tolerance). Line content: {:?}\n\
+                         Tips: copy `old` from the actual file, not from memory. If you \
+                         copied it from a `read_file` result, do NOT include the \
+                         line-number prefix (e.g. `    42<TAB>`); copy only the code part \
+                         of the line. Watch for smart quotes / dashes / non-breaking \
+                         spaces that may differ from the file.",
+                        line_idx + 1,
+                        target_line
+                    ));
+                }
+            }
         }
-        1 => occurrences[0],
         n => {
             return Err(format!(
                 "Replace in line: `old` substring appears {n} times in line {}. \
@@ -806,7 +829,7 @@ fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<Stri
         "{}{}{}",
         &target_line[..pos],
         new,
-        &target_line[pos + old.len()..]
+        &target_line[pos + match_len..]
     );
 
     // 重建文件，保留原始行尾换行行为
@@ -927,6 +950,23 @@ fn strip_number_prefix_anchored<'a>(expected: &'a str, actual: &str) -> &'a str 
     expected
 }
 
+/// 单个字符的 confusable 归一化（严格的 1:1 映射，不做任何宽度扩展）。
+/// 与 [`normalize_confusables`] 共用，确保"整串归一化"和"逐字符等价判定"行为一致。
+fn normalize_confusable_char(c: char) -> char {
+    match c {
+        // --- dash 系 ---
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+        | '\u{2212}' => '-',
+        // --- smart double quotes ---
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{2033}' => '"',
+        // --- smart single quotes ---
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2032}' => '\'',
+        // --- 不间断空格系 ---
+        '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{2060}' => ' ',
+        other => other,
+    }
+}
+
 /// 将常见的 Unicode "confusable" 字符归一化为 ASCII 等价形式。
 ///
 /// 仅用于 patch 匹配的 **定位判定**（lines_match），绝不参与输出内容构造。
@@ -935,20 +975,51 @@ fn strip_number_prefix_anchored<'a>(expected: &'a str, actual: &str) -> &'a str 
 /// - smart quotes（" " ' ' ‛ ‟）-> '"' / "'"
 /// - 不间断空格（NBSP U+00A0、NNBSP U+202F 等）-> 普通空格
 fn normalize_confusables(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            // --- dash 系 ---
-            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
-            | '\u{2212}' => '-',
-            // --- smart double quotes ---
-            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{2033}' => '"',
-            // --- smart single quotes ---
-            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2032}' => '\'',
-            // --- 不间断空格系 ---
-            '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{2060}' => ' ',
-            other => other,
-        })
-        .collect()
+    s.chars().map(normalize_confusable_char).collect()
+}
+
+/// 在 `line` 中定位 `old` 的**宽容匹配**（仅用于 `*** Replace in line:` 的
+/// `old` 兜底定位）：
+/// - 逐字符 confusable 归一化等价（1:1，见 [`normalize_confusable_char`]），
+///   因此 em-dash/smart quotes/NBSP 与 ASCII 等价形式互相可匹配；
+/// - 忽略 `old` 首尾空白（模型常因缩进复刻把前导空格带进 `old`）。
+///
+/// 返回匹配在原行中的 (byte_start, byte_end)。要求唯一：多处匹配返回
+/// [`TolerantMatchError::Ambiguous`]。匹配到后仍按原字节区间切片替换，
+/// 写入内容由 `new` 构造，不会把归一化后的字符写进文件。
+fn find_tolerant_old_match(line: &str, old: &str) -> Result<(usize, usize), TolerantMatchError> {
+    let needle: Vec<char> = old.trim().chars().collect();
+    let hay: Vec<char> = line.chars().collect();
+    if needle.is_empty() || needle.len() > hay.len() {
+        return Err(TolerantMatchError::NoMatch);
+    }
+    // 预计算每个 char 的 byte offset，O(n) 一次，避免逐位置 nth()。
+    let byte_offsets: Vec<usize> = line.char_indices().map(|(b, _)| b).collect();
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    'outer: for i in 0..=(hay.len() - needle.len()) {
+        for (j, &nc) in needle.iter().enumerate() {
+            if normalize_confusable_char(hay[i + j]) != normalize_confusable_char(nc) {
+                continue 'outer;
+            }
+        }
+        let byte_start = byte_offsets[i];
+        let byte_end = byte_offsets
+            .get(i + needle.len())
+            .copied()
+            .unwrap_or(line.len());
+        found.push((byte_start, byte_end));
+    }
+    match found.len() {
+        0 => Err(TolerantMatchError::NoMatch),
+        1 => Ok(found[0]),
+        n => Err(TolerantMatchError::Ambiguous(n)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TolerantMatchError {
+    NoMatch,
+    Ambiguous(usize),
 }
 
 fn lines_match_exact(actual: &str, expected: &str, mode: MatchMode) -> bool {
@@ -1056,16 +1127,23 @@ fn all_hunk_match_positions(
     positions
 }
 
-fn describe_ambiguous_hunk(orig_lines: &[String], positions: &[usize]) -> String {
+fn describe_ambiguous_hunk(
+    orig_lines: &[String],
+    positions: &[usize],
+    hunk_idx: usize,
+    hunk_total: usize,
+) -> String {
     let shown: Vec<String> = positions
         .iter()
         .take(8)
         .map(|pos| (pos + 1).to_string())
         .collect();
     let mut msg = format!(
-        "ambiguous patch: hunk context matched {} locations (1-based lines: {}{}). \
+        "Hunk {}/{}: ambiguous patch: hunk context matched {} locations (1-based lines: {}{}). \
          Add more unique surrounding context, preferably both before and after the edit, \
          or split the edit around a uniquely matching removed line.\n",
+        hunk_idx + 1,
+        hunk_total,
         positions.len(),
         shown.join(", "),
         if positions.len() > 8 { ", ..." } else { "" }
@@ -1501,9 +1579,17 @@ fn describe_hunks_out_of_order(
     hunk: &UnifiedHunk,
     matched_pos: Option<usize>,
     cursor: usize,
+    hunk_idx: usize,
+    hunk_total: usize,
 ) -> String {
-    let mut msg = String::from(
-        "hunks out of order: this hunk matches a location earlier in the file than a previous hunk in the same section. Unified-diff hunks must be ordered by ascending file line number. Reorder the hunks by their position in the file (top to bottom), or split unrelated edits into separate `*** Replace in line:` sections.\n",
+    let mut msg = format!(
+        "Hunk {}/{}: hunks out of order: this hunk matches a location earlier in the file \
+         than a previous hunk in the same section. Unified-diff hunks must be ordered by \
+         ascending file line number. Reorder the hunks by their position in the file \
+         (top to bottom), or split unrelated edits into separate `*** Replace in line:` \
+         sections.\n",
+        hunk_idx + 1,
+        hunk_total
     );
     if hunk.old_start > 0 {
         msg.push_str(&format!(
@@ -1535,12 +1621,21 @@ fn describe_hunks_out_of_order(
 
 /// 构造带上下文的 "context mismatch" 错误：列出 patch 期望匹配的行，以及原文件
 /// 在标称位置附近的实际行，帮助模型快速自我修正，而不是只看到一句 "context mismatch"。
-fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> String {
+fn describe_context_mismatch(
+    orig_lines: &[String],
+    hunk: &UnifiedHunk,
+    hunk_idx: usize,
+    hunk_total: usize,
+) -> String {
     let expected = hunk_expected_lines(hunk);
     let nominal = hunk.old_start.saturating_sub(1);
 
-    let mut msg = String::from(
-        "context mismatch: patch hunk could not be located. Rebuild the patch from the current file text shown below (re-read the file only if the shown context is not enough).\n",
+    let mut msg = format!(
+        "Hunk {}/{}: context mismatch: patch hunk could not be located. Rebuild the patch \
+         from the current file text shown below (re-read the file only if the shown context \
+         is not enough).\n",
+        hunk_idx + 1,
+        hunk_total
     );
     if hunk.old_start == 0 {
         msg.push_str(
@@ -1686,6 +1781,8 @@ fn locate_hunk(
     hunk: &UnifiedHunk,
     cursor: usize,
     mode: MatchMode,
+    hunk_idx: usize,
+    hunk_total: usize,
 ) -> Result<Option<usize>, String> {
     let old_len = hunk_old_line_count(hunk);
     if old_len == 0 {
@@ -1699,6 +1796,8 @@ fn locate_hunk(
                 hunk,
                 Some(nominal),
                 cursor,
+                hunk_idx,
+                hunk_total,
             ));
         }
         return if nominal <= orig_lines.len() {
@@ -1726,7 +1825,12 @@ fn locate_hunk(
         if let Some(pos) = disambiguate_by_declared_line(&forward, hunk) {
             return Ok(Some(pos));
         }
-        return Err(describe_ambiguous_hunk(orig_lines, &forward));
+        return Err(describe_ambiguous_hunk(
+            orig_lines,
+            &forward,
+            hunk_idx,
+            hunk_total,
+        ));
     }
     // forward 已经过滤了 p >= cursor，所以这里不会有 "hunks out of order"。
     // 之前回退到 find_hunk_offset（±50 窗口）会在唯一匹配超出窗口时误报
@@ -1741,15 +1845,20 @@ fn locate_hunk(
             hunk,
             Some(earliest),
             cursor,
+            hunk_idx,
+            hunk_total,
         ))
     } else {
         Ok(None)
     }
 }
 
-fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
+fn apply_unified_patch_with_hints(
+    original: &str,
+    patch: &str,
+) -> Result<(String, Vec<String>), String> {
     let had_trailing_newline = original.ends_with('\n');
-    let hunks = parse_unified_hunks(patch)?;
+    let hunks = parse_unified_hunks(patch).map_err(|err| append_truncated_patch_hint(patch, err))?;
     if !hunks.iter().any(|hunk| {
         hunk.lines
             .iter()
@@ -1759,50 +1868,74 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
     }
     let orig_lines: Vec<String> = original.lines().map(|s| s.to_string()).collect();
 
+    let active_hunks: Vec<&UnifiedHunk> = hunks
+        .iter()
+        .filter(|hunk| {
+            hunk.lines
+                .iter()
+                .any(|line| matches!(line, UnifiedLine::Remove(_) | UnifiedLine::Add(_)))
+        })
+        .collect();
+    let hunk_total = active_hunks.len();
+
     let mut out: Vec<String> = Vec::new();
     let mut cursor = 0usize;
 
-    for hunk in hunks.iter().filter(|hunk| {
-        hunk.lines
-            .iter()
-            .any(|line| matches!(line, UnifiedLine::Remove(_) | UnifiedLine::Add(_)))
-    }) {
+    for (hunk_idx, hunk) in active_hunks.iter().enumerate() {
         // 先做严格匹配（仅容忍行尾空白）。严格匹配全文件都定位不到时，再用忽略
         // 前导缩进的宽松模式兜底一次——对齐 `git apply --ignore-whitespace`，
         // 解决模型对 markdown/嵌套列表/代码块缩进复刻不准导致的 context mismatch。
-        let (apply_at, mode, context_policy) =
-            match locate_hunk(&orig_lines, hunk, cursor, MatchMode::Strict)? {
-                Some(at) => (at, MatchMode::Strict, ContextPolicy::Require),
-                None => match locate_hunk(&orig_lines, hunk, cursor, MatchMode::IgnoreIndent)? {
-                    Some(at) => (at, MatchMode::IgnoreIndent, ContextPolicy::Require),
-                    None => match locate_hunk_with_fuzzy_context(
+        let (apply_at, mode, context_policy) = match locate_hunk(
+            &orig_lines,
+            hunk,
+            cursor,
+            MatchMode::Strict,
+            hunk_idx,
+            hunk_total,
+        )? {
+            Some(at) => (at, MatchMode::Strict, ContextPolicy::Require),
+            None => match locate_hunk(
+                &orig_lines,
+                hunk,
+                cursor,
+                MatchMode::IgnoreIndent,
+                hunk_idx,
+                hunk_total,
+            )? {
+                Some(at) => (at, MatchMode::IgnoreIndent, ContextPolicy::Require),
+                None => match locate_hunk_with_fuzzy_context(
+                    &orig_lines,
+                    hunk,
+                    cursor,
+                    MatchMode::Strict,
+                ) {
+                    Ok(Some(candidate)) => {
+                        (candidate.pos, MatchMode::Strict, ContextPolicy::Fuzz)
+                    }
+                    _ => match locate_hunk_with_fuzzy_context(
                         &orig_lines,
                         hunk,
                         cursor,
-                        MatchMode::Strict,
-                    ) {
-                        Ok(Some(candidate)) => {
-                            (candidate.pos, MatchMode::Strict, ContextPolicy::Fuzz)
+                        MatchMode::IgnoreIndent,
+                    )? {
+                        Some(candidate) => {
+                            (candidate.pos, MatchMode::IgnoreIndent, ContextPolicy::Fuzz)
                         }
-                        _ => match locate_hunk_with_fuzzy_context(
-                            &orig_lines,
-                            hunk,
-                            cursor,
-                            MatchMode::IgnoreIndent,
-                        )? {
-                            Some(candidate) => {
-                                (candidate.pos, MatchMode::IgnoreIndent, ContextPolicy::Fuzz)
-                            }
-                            None => return Err(describe_context_mismatch(&orig_lines, hunk)),
-                        },
+                        None => {
+                            return Err(describe_context_mismatch(
+                                &orig_lines, hunk, hunk_idx, hunk_total,
+                            ))
+                        }
                     },
                 },
-            };
+            },
+        };
 
         out.extend_from_slice(&orig_lines[cursor..apply_at]);
-        let (hunk_out, new_idx) =
-            try_apply_hunk_at(&orig_lines, hunk, apply_at, mode, context_policy)
-                .ok_or_else(|| describe_context_mismatch(&orig_lines, hunk))?;
+        let (hunk_out, new_idx) = try_apply_hunk_at(&orig_lines, hunk, apply_at, mode, context_policy)
+            .ok_or_else(|| {
+                describe_context_mismatch(&orig_lines, hunk, hunk_idx, hunk_total)
+            })?;
         out.extend(hunk_out);
         cursor = new_idx;
     }
@@ -1812,7 +1945,84 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
     if had_trailing_newline {
         s.push('\n');
     }
-    Ok(s)
+    let hints = pure_insert_hint(original, &hunks).into_iter().collect();
+    Ok((s, hints))
+}
+
+fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
+    apply_unified_patch_with_hints(original, patch).map(|(content, _)| content)
+}
+
+/// 纯插入 hunk（只有 `+` 行、无 context/remove 行）在非空文件上不经过任何内容
+/// 验证，仅按 `@@` 声明的行号定位。命中时返回提示，提醒模型若文件在读取后
+/// 发生过变更，需用 read_file 复核插入位置。
+fn pure_insert_hint(original: &str, hunks: &[UnifiedHunk]) -> Option<String> {
+    if original.is_empty() {
+        return None;
+    }
+    let any_pure_insert = hunks.iter().any(|hunk| {
+        !hunk.lines.is_empty()
+            && hunk
+                .lines
+                .iter()
+                .all(|line| matches!(line, UnifiedLine::Add(_)))
+    });
+    any_pure_insert.then(|| {
+        "hunk(s) had no context lines and were located by line number only; if the file changed \
+         since you read it, re-read it with read_file to confirm the insertion landed where \
+         intended"
+            .to_string()
+    })
+}
+
+/// 轻量截断启发：内联 patch 被上下文管理器截断时，末尾常呈残缺结构（未闭合的
+/// envelope、以裸 hunk header 或半个 `***` 标记结尾）。命中时在错误文本里追加
+/// 改用 `patch_file` 的替代路径，避免模型在误导性的解析错误上重复重试同一份
+/// 残缺 patch。
+fn truncated_patch_hint(patch: &str) -> Option<&'static str> {
+    let trimmed = patch.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let last = lines.last().unwrap().trim_end();
+    // 1) 以 envelope 标记开头但全篇未闭合
+    let starts_envelope = lines
+        .iter()
+        .any(|line| line.trim_start().starts_with("*** Begin Patch"));
+    if starts_envelope
+        && !lines.iter().any(|line| {
+            let t = line.trim();
+            t == "*** End Patch" || t == "*** End of File"
+        })
+    {
+        return Some("the patch starts with `*** Begin Patch` but has no closing `*** End Patch`");
+    }
+    // 2) 以残缺 `***` 分节/结尾标记收尾（如 `*** End Patc`、`*** Update File: /pa`）
+    let last_trimmed = last.trim();
+    if last.starts_with("*** ")
+        && last_trimmed != "*** End Patch"
+        && last_trimmed != "*** End of File"
+    {
+        return Some("the patch ends with a partial `***` section marker");
+    }
+    // 3) 以 hunk header 收尾（其后没有内容行）：hunk 至少需要一个 ` `/`-`/`+` 体行
+    if last.trim_start().starts_with("@@") {
+        return Some("the patch ends with a `@@` hunk header and no body lines after it");
+    }
+    None
+}
+
+/// 解析失败时若截断启发命中，把可执行的替代路径追加到错误文本末尾。
+fn append_truncated_patch_hint(patch: &str, err: String) -> String {
+    match truncated_patch_hint(patch) {
+        Some(hint) => format!(
+            "{err}\n\nnote: {hint}. The patch was likely cut off by the context manager \
+             mid-flight. Retry with a smaller inline patch, or write the patch to a temp file \
+             with write_file(temp=true) and pass its path as `patch_file`."
+        ),
+        None => err,
+    }
 }
 
 fn emit_stream_line(on_chunk: &mut ToolStreamWriter<'_>, line: &str) {
@@ -1890,20 +2100,27 @@ fn diff_stats_for_write(write: &PreparedPatchWrite) -> (usize, usize, usize) {
 }
 
 fn format_patch_success(writes: &[PreparedPatchWrite]) -> String {
-    if writes.len() == 1 {
+    let mut message = if writes.len() == 1 {
         let (added, removed, total) = diff_stats_for_write(&writes[0]);
-        return format!(
+        format!(
             "Successfully patched {}; +{added} -{removed} ({total} lines)",
             writes[0].path.display()
-        );
-    }
-    let mut message = format!("Successfully patched {} files:", writes.len());
+        )
+    } else {
+        let mut m = format!("Successfully patched {} files:", writes.len());
+        for write in writes {
+            let (added, removed, total) = diff_stats_for_write(write);
+            m.push_str(&format!(
+                "\n- {}; +{added} -{removed} ({total} lines)",
+                write.path.display()
+            ));
+        }
+        m
+    };
     for write in writes {
-        let (added, removed, total) = diff_stats_for_write(write);
-        message.push_str(&format!(
-            "\n- {}; +{added} -{removed} ({total} lines)",
-            write.path.display()
-        ));
+        for hint in &write.hints {
+            message.push_str(&format!("\nnote: {hint}"));
+        }
     }
     message
 }
@@ -1980,7 +2197,7 @@ fn prepare_patch_action_from_content(
     path: &Path,
     current: Option<&str>,
     envelope: &PatchEnvelope,
-) -> Result<PreparedPatchAction, String> {
+) -> Result<(PreparedPatchAction, Vec<String>), String> {
     match envelope.op {
         PatchEnvelopeOp::Delete => {
             if !envelope.body_lines.is_empty() {
@@ -1999,7 +2216,7 @@ fn prepare_patch_action_from_content(
                 ));
             }
             validate_delete_target(path)?;
-            Ok(PreparedPatchAction::Delete)
+            Ok((PreparedPatchAction::Delete, Vec::new()))
         }
         PatchEnvelopeOp::ReplaceInLine => {
             let original = current.ok_or_else(|| {
@@ -2008,9 +2225,10 @@ fn prepare_patch_action_from_content(
                     path.display()
                 )
             })?;
-            Ok(PreparedPatchAction::Write(apply_inline_replace(
-                original, envelope,
-            )?))
+            Ok((
+                PreparedPatchAction::Write(apply_inline_replace(original, envelope)?),
+                Vec::new(),
+            ))
         }
         PatchEnvelopeOp::Update => {
             let original = current.ok_or_else(|| {
@@ -2020,10 +2238,8 @@ fn prepare_patch_action_from_content(
                 )
             })?;
             let normalized_patch = normalize_patch_envelope_body(envelope)?;
-            Ok(PreparedPatchAction::Write(apply_unified_patch(
-                original,
-                &normalized_patch,
-            )?))
+            let (next, hints) = apply_unified_patch_with_hints(original, &normalized_patch)?;
+            Ok((PreparedPatchAction::Write(next), hints))
         }
         PatchEnvelopeOp::Add => {
             if current.is_some() {
@@ -2033,10 +2249,8 @@ fn prepare_patch_action_from_content(
                 );
             }
             let normalized_patch = normalize_patch_envelope_body(envelope)?;
-            Ok(PreparedPatchAction::Write(apply_unified_patch(
-                "",
-                &normalized_patch,
-            )?))
+            let (next, hints) = apply_unified_patch_with_hints("", &normalized_patch)?;
+            Ok((PreparedPatchAction::Write(next), hints))
         }
     }
 }
@@ -2051,12 +2265,14 @@ fn prepare_patch_write(
     } else {
         None
     };
-    let action = if matches!(envelope.op, PatchEnvelopeOp::Update | PatchEnvelopeOp::Add) {
+    let (action, hints) =
+        if matches!(envelope.op, PatchEnvelopeOp::Update | PatchEnvelopeOp::Add) {
         // 首次处理某个文件时沿用磁盘存在性检查，保持单 section 行为不变；
         // 重复同文件 section 由 prepare_patch_action_from_content 按内存状态处理。
         let normalized_patch = normalize_patch_envelope(path, envelope)?;
         let original = before.as_deref().unwrap_or_default();
-        PreparedPatchAction::Write(apply_unified_patch(original, &normalized_patch)?)
+        apply_unified_patch_with_hints(original, &normalized_patch)
+            .map(|(next, hints)| (PreparedPatchAction::Write(next), hints))?
     } else {
         prepare_patch_action_from_content(path, before.as_deref(), envelope)?
     };
@@ -2064,6 +2280,7 @@ fn prepare_patch_write(
         path: path.to_path_buf(),
         before,
         action,
+        hints,
     })
 }
 
@@ -2082,11 +2299,13 @@ fn prepare_patch_write_from_section(
         None
     };
     let original = before.as_deref().unwrap_or_default();
-    let action = PreparedPatchAction::Write(apply_unified_patch(original, section)?);
+    let (next, hints) = apply_unified_patch_with_hints(original, section)?;
+    let action = PreparedPatchAction::Write(next);
     Ok(PreparedPatchWrite {
         path: path.to_path_buf(),
         before,
         action,
+        hints,
     })
 }
 
@@ -2274,6 +2493,16 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         }
     };
     let patch = strip_code_fence(&raw_patch);
+    // 截断启发：内联 patch 若以未闭合 envelope / 残缺 `***` 标记 / 裸 hunk header
+    // 收尾，很可能是被上下文管理器截断。无论后续是成功还是报错，都先给出提示，
+    // 避免模型把残缺文本当成自己的语法错误反复重试。
+    if let Some(hint) = truncated_patch_hint(&patch) {
+        emit(&format!(
+            "warning: {hint}; the patch may have been truncated by the context manager \
+             mid-flight. If it applies incompletely, retry with a smaller inline patch or pass \
+             the patch via `patch_file` (write_file(temp=true))."
+        ));
+    }
     if from_file {
         // patch_file 的目的就是承载大补丁（内联 patch 会被上下文管理器截断），因此不受
         // 8K 内联限制；只设一个宽松的安全上限，防止模型误读超大文件。
@@ -2303,7 +2532,9 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
     }
     emit("parsing patch envelope");
     let initial_file_path = optional_file_path_arg(args);
-    if let Some(envelopes) = parse_patch_envelopes(&patch)? {
+    if let Some(envelopes) = parse_patch_envelopes(&patch)
+        .map_err(|err| append_truncated_patch_hint(&patch, err))?
+    {
         // 信封（无论单文件/多文件）内各 section 已声明各自目标路径，file_path 是
         // 多余的。模型常在多文件信封时冗余传 file_path，与其硬报错浪费一轮，不如
         // 静默忽略并用信封路径（信封路径才是权威来源）。
@@ -2343,7 +2574,7 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
             }
             if let Some(&write_idx) = write_indexes.get(&path) {
                 emit("applying after previous section for same file");
-                let action = {
+                let (action, hints) = {
                     let current = match &writes[write_idx].action {
                         PreparedPatchAction::Write(next) => Some(next.as_str()),
                         PreparedPatchAction::Delete => None,
@@ -2359,6 +2590,7 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
                     )
                 })?;
                 writes[write_idx].action = action;
+                writes[write_idx].hints.extend(hints);
             } else {
                 let write = prepare_patch_write(&path, &store, envelope).map_err(|err| {
                     format!(
@@ -2438,13 +2670,14 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
             if let Some(&write_idx) = write_indexes.get(&path) {
                 // 同一文件出现多个 section 时按序叠加（语义同信封分支）。
                 emit("applying after previous section for same file");
-                let action = {
+                let (action, hints) = {
                     let current = match &writes[write_idx].action {
                         PreparedPatchAction::Write(next) => Some(next.as_str()),
                         PreparedPatchAction::Delete => None,
                     };
                     let original = current.unwrap_or_default();
-                    apply_unified_patch(original, section).map(PreparedPatchAction::Write)
+                    apply_unified_patch_with_hints(original, section)
+                        .map(|(next, hints)| (PreparedPatchAction::Write(next), hints))
                 }
                 .map_err(|err| {
                     format!(
@@ -2455,6 +2688,7 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
                     )
                 })?;
                 writes[write_idx].action = action;
+                writes[write_idx].hints.extend(hints);
             } else {
                 let write =
                     prepare_patch_write_from_section(&path, &store, section).map_err(|err| {
@@ -2533,11 +2767,13 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         emit("creating new file from patch");
         None
     };
-    let next = apply_unified_patch(before.as_deref().unwrap_or_default(), &patch)?;
+    let (next, hints) =
+        apply_unified_patch_with_hints(before.as_deref().unwrap_or_default(), &patch)?;
     let write = PreparedPatchWrite {
         path: path.clone(),
         before,
         action: PreparedPatchAction::Write(next),
+        hints,
     };
     ensure_patch_writes_change(std::slice::from_ref(&write))?;
     if legacy_dry_run {
@@ -2569,9 +2805,10 @@ pub(crate) fn execute_apply_patch_streaming(
 mod tests {
     use super::{
         PatchEnvelopeOp, apply_inline_replace, apply_patch_target_paths_from_patch,
-        apply_unified_patch, execute_apply_patch, file_path_from_unified_diff_header,
-        parse_patch_envelope, parse_patch_envelopes, parse_unified_diff_header_target,
-        parse_unified_hunks, strip_code_fence,
+        apply_unified_patch, apply_unified_patch_with_hints, execute_apply_patch,
+        file_path_from_unified_diff_header, parse_patch_envelope, parse_patch_envelopes,
+        parse_unified_diff_header_target, parse_unified_hunks, strip_code_fence,
+        truncated_patch_hint,
     };
     use crate::ai::test_support::ENV_LOCK;
     use std::{fs, path::PathBuf};
@@ -2868,6 +3105,115 @@ mod tests {
         let result =
             apply_unified_patch(original, patch).expect("@@ -0 insert at top should apply");
         assert_eq!(result, "head\ntop\nfirst\nsecond\n");
+    }
+
+    /// 纯插入 hunk（只有 `+` 行）在非空文件上仅按行号定位、无内容验证，
+    /// 成功时应返回提示，提醒模型文件变更后需 read_file 复核。
+    #[test]
+    fn apply_unified_patch_pure_insert_reports_line_number_hint() {
+        let original = "first\nsecond\n";
+        let patch = "@@ -2,0 +3,2 @@\n+mid1\n+mid2\n";
+        let (result, hints) =
+            apply_unified_patch_with_hints(original, patch).expect("pure insert should apply");
+        assert_eq!(result, "first\nmid1\nmid2\nsecond\n");
+        assert!(
+            hints.iter().any(|h| h.contains("line number")),
+            "pure insert should carry a line-number hint, hints were: {hints:?}"
+        );
+    }
+
+    /// 有 context/remove 行的 hunk 经过内容验证，不产生纯插入提示。
+    #[test]
+    fn apply_unified_patch_no_hint_for_context_anchored_hunks() {
+        let original = "first\nsecond\n";
+        let patch = "@@ -1,2 +1,2 @@\n first\n-second\n+changed\n";
+        let (result, hints) =
+            apply_unified_patch_with_hints(original, patch).expect("context hunk should apply");
+        assert_eq!(result, "first\nchanged\n");
+        assert!(
+            hints.is_empty(),
+            "context-anchored hunk should have no hints: {hints:?}"
+        );
+    }
+
+    /// 空文件上的纯插入是新建文件的常规流程，不产生提示。
+    #[test]
+    fn apply_unified_patch_pure_insert_on_empty_file_has_no_hint() {
+        let patch = "@@ -0,0 +1,2 @@\n+a\n+b\n";
+        let (result, hints) =
+            apply_unified_patch_with_hints("", patch).expect("add file should apply");
+        assert_eq!(result, "a\nb");
+        assert!(
+            hints.is_empty(),
+            "empty-file insert should have no hints: {hints:?}"
+        );
+    }
+
+    /// 纯插入提示应随成功消息返回（format_patch_success 追加 note）。
+    #[test]
+    fn apply_patch_success_message_includes_pure_insert_hint() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("pure_insert_hint");
+        let target = base.join("target.txt");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&target, "first\nsecond\n").unwrap();
+
+        let patch = "@@ -2,0 +3,2 @@\n+mid1\n+mid2\n";
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let result = execute_apply_patch(&serde_json::json!({
+                "patch": patch,
+                "file_path": "target.txt",
+            }))
+            .expect("pure insert should succeed");
+            assert!(result.contains("Successfully patched"), "result was: {result}");
+            assert!(
+                result.contains("line number"),
+                "success message should carry the pure-insert hint: {result}"
+            );
+        });
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "first\nmid1\nmid2\nsecond\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// 截断启发：识别未闭合 envelope、残缺 `***` 标记、裸 hunk header 结尾；
+    /// 合法收尾不误报。
+    #[test]
+    fn truncated_patch_hint_heuristics() {
+        assert!(
+            truncated_patch_hint(
+                "*** Begin Patch\n*** Update File: x.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n"
+            )
+            .is_some(),
+            "unclosed envelope should be flagged"
+        );
+        assert!(
+            truncated_patch_hint("@@ -1,1 +1,1 @@\n-a\n+b\n@@").is_some(),
+            "trailing bare @@ should be flagged"
+        );
+        assert!(
+            truncated_patch_hint("@@ -1,1 +1,1 @@\n-a\n+b\n*** End Patc").is_some(),
+            "partial *** marker should be flagged"
+        );
+        // 合法收尾不误报
+        assert!(truncated_patch_hint("@@ -1,1 +1,1 @@\n-a\n+b\n").is_none());
+        assert!(
+            truncated_patch_hint(
+                "*** Begin Patch\n*** Update File: x.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n*** End Patch\n"
+            )
+            .is_none()
+        );
+    }
+
+    /// 未闭合的 envelope（截断）解析失败时，错误应附带截断提示与 patch_file
+    /// 替代路径，避免模型把残缺文本当成自己的语法错误反复重试。
+    #[test]
+    fn apply_patch_unclosed_envelope_error_hints_truncation_and_patch_file() {
+        let patch = "*** Begin Patch\n*** Update File: missing.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n";
+        let args = serde_json::json!({ "patch": patch });
+        let err = execute_apply_patch(&args).unwrap_err();
+        assert!(err.contains("patch_file"), "err was: {err}");
+        assert!(err.contains("cut off"), "err was: {err}");
     }
 
     /// patch 缺失时给出截断提示和 patch_file 替代路径。
@@ -4281,19 +4627,68 @@ mod tests {
     }
 
     #[test]
-    fn inline_replace_old_must_match_verbatim() {
-        // old 里有 em-dash，但文件里是 ASCII hyphen -> old 精确匹配失败
+    fn inline_replace_old_tolerates_confusable() {
+        // old 里有 em-dash，文件里是 ASCII hyphen：精确匹配失败后，
+        // 宽容兜底（confusable 1:1 归一化）应能定位并替换。
         let original = "the quick-brown fox\n";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
             "test.txt",
-            &["anchor: quick", "old: quick—brown", "new: slow—brown"],
+            &["anchor: quick", "old: quick—brown", "new: slow-brown"],
+        );
+        let result =
+            apply_inline_replace(original, &envelope).expect("confusable old should match");
+        // 输出由 new 构造，保留文件原有内容；只替换匹配到的区间
+        assert_eq!(result, "the slow-brown fox\n");
+    }
+
+    #[test]
+    fn inline_replace_old_tolerates_whitespace() {
+        // old 带前导/尾随空白（模型缩进复刻不准）-> 宽容匹配忽略首尾空白
+        let original = "let x = 42;\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.rs",
+            &["anchor: let x", "old:   x = 42  ", "new: x = 99"],
+        );
+        let result =
+            apply_inline_replace(original, &envelope).expect("whitespace-trimmed old should match");
+        assert_eq!(result, "let x = 99;\n");
+    }
+
+    #[test]
+    fn inline_replace_old_not_found_mentions_line_prefix_hint() {
+        // old 从 read_file 复制时把行号前缀也带进来了 -> 不应静默匹配，报错并给出提示。
+        // 宽容匹配不做前缀剥离（会污染文件内容），这里验证错误信息有指引。
+        let original = "let x = 42;\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.rs",
+            &["anchor: let x", "old:     1\tlet x = 42;", "new: let x = 99;"],
         );
         let err = apply_inline_replace(original, &envelope)
-            .expect_err("old with em-dash should not match ASCII hyphen");
+            .expect_err("old with line-number prefix should fail");
         assert!(
-            err.contains("not found in matched line"),
-            "error should mention old not found: {err}"
+            err.contains("line-number prefix"),
+            "error should hint at line-number prefix: {err}"
+        );
+    }
+
+    #[test]
+    fn inline_replace_old_confusable_ambiguous() {
+        // 精确匹配为零（em-dash/en-dash 都不是 hyphen），归一化后 old 在行内出现
+        // 多次 -> 报错（而不是猜一个）
+        let original = "a—b a–b\n";
+        let envelope = make_envelope(
+            PatchEnvelopeOp::ReplaceInLine,
+            "test.txt",
+            &["anchor: a—b", "old: a-b", "new: c-d"],
+        );
+        let err = apply_inline_replace(original, &envelope)
+            .expect_err("old matching 2 positions after normalization should fail");
+        assert!(
+            err.contains("matches 2 positions"),
+            "error should mention ambiguity after normalization: {err}"
         );
     }
 
