@@ -1087,27 +1087,6 @@ fn build_system_prompt(
                 "Use `spawn_process` only for fire-and-forget background work whose result you do NOT need back (long-running processes, two-way IPC collaboration). It returns a PID, not a result.".to_string(),
             );
         }
-        if has_tool(available_tools, "task_spawn") && has_tool(available_tools, "task_wait") {
-            if has_tool(available_tools, "task") {
-                let batch_guidance = if has_tool(available_tools, "task_spawn_batch") {
-                    "Reserve `task_spawn_batch` + `task_wait` for fanning out MULTIPLE independent subtasks concurrently"
-                } else {
-                    "Reserve multiple `task_spawn` calls + `task_wait` for fanning out MULTIPLE independent subtasks concurrently"
-                };
-                lines.push(format!(
-                    "If you need the delegated work's result back: for a SINGLE subtask use the synchronous `task` (it runs the subagent and returns its result in one call). {batch_guidance} — a lone `task_spawn` immediately followed by `task_wait` is just a slower `task`."
-                ));
-            } else {
-                let fan_out_guidance = if has_tool(available_tools, "task_spawn_batch") {
-                    "For multiple independent subtasks, prefer one ordered `task_spawn_batch` call, then collect with a single `task_wait`."
-                } else {
-                    "For multiple independent subtasks, spawn them all in one response first, then collect with a single `task_wait`."
-                };
-                lines.push(format!(
-                    "If you need the delegated work's result back, use `task_spawn` + `task_wait`. {fan_out_guidance}"
-                ));
-            }
-        }
         let process_tools = available_tool_names_in_order(
             available_tools,
             &["wait_process", "kill_process", "reap_process"],
@@ -1979,9 +1958,11 @@ mod tests {
 
     #[test]
     fn system_prompt_routes_single_delegation_to_sync_task_when_available() {
-        // When the synchronous `task` tool is also available, both the Planning
-        // and Async orchestration guidance must steer a SINGLE delegated subtask
-        // to `task` instead of a lone task_spawn+task_wait.
+        // The Async Subagent Orchestration section is the single authority for
+        // task routing. When the synchronous `task` tool is also available, a
+        // SINGLE delegated subtask must be steered to `task` instead of a lone
+        // task_spawn+task_wait; the Planning section must not repeat that rule
+        // (dedup keeps token cost down without losing guidance).
         let mut available = SkipSet::new(16);
         available.insert("task".to_string());
         available.insert("task_spawn".to_string());
@@ -1993,14 +1974,51 @@ mod tests {
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
 
-        // Planning & Sub-process Execution section (has_tool("task") branch).
-        assert!(prompt.contains("for a SINGLE subtask use the synchronous `task`"));
-        // Async Subagent Orchestration section (has_tool("task") branch).
+        // Canonical home: Async Subagent Orchestration section (task branch).
         assert!(
             prompt.contains(
                 "For a single delegated subtask whose result you need back, prefer the synchronous `task`"
             )
         );
+        // The Planning section no longer duplicates the routing rule...
+        assert!(!prompt.contains("for a SINGLE subtask use the synchronous `task`"));
+        assert!(!prompt.contains("is just a slower `task`"));
+        // ...but still keeps its own unique plan/delegate guidance.
+        assert!(prompt.contains("Simple tasks: act directly. Complex ones: call `plan` first."));
+        assert!(prompt.contains("mark `delegate: true` only for independent steps"));
+    }
+
+    #[test]
+    fn system_prompt_task_only_tools_skip_empty_planning_section() {
+        // Edge case: only task_* tools available (no plan / spawn_process /
+        // process / ipc). The Planning section's outer gate includes
+        // task_spawn/task_wait, so the section *would* open - but with no
+        // plan/sub-process/ipc tools every inner block is skipped, `lines`
+        // stays empty, and push_tool_guidance_section early-returns. Routing
+        // guidance must come solely from the Async section, with no empty
+        // Planning header left over.
+        let mut available = SkipSet::new(16);
+        available.insert("task".to_string());
+        available.insert("task_spawn".to_string());
+        available.insert("task_wait".to_string());
+        available.insert("task_status".to_string());
+        available.insert("task_integrate".to_string());
+        available.insert("task_cancel".to_string());
+        available.insert("task_spawn_batch".to_string());
+
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+
+        // No empty Planning section header.
+        assert!(!prompt.contains("Planning & Sub-process Execution:"));
+        // Routing guidance still present, from the Async section alone.
+        assert!(
+            prompt.contains(
+                "For a single delegated subtask whose result you need back, prefer the synchronous `task`"
+            )
+        );
+        assert!(prompt.contains("Async Subagent Orchestration (task_*):"));
     }
 
     #[test]

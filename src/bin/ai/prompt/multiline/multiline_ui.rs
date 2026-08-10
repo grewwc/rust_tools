@@ -194,7 +194,8 @@ fn submitted_input_preview_lines(content: &str) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut lines = content.lines();
     let marker = crate::ai::theme::ACCENT_SUCCESS;
-    let body = crate::ai::theme::ACCENT_INPUT;
+    // 提交后预览用深紫，与编辑态暖灰区分，在白底/深底上都清晰可辨。
+    let body = crate::ai::theme::ACCENT_SUBMITTED;
     if let Some(first) = lines.next() {
         // 加粗绿色 `>` 标记 + 低饱和暖灰正文，与 textarea 编辑态颜色一致。
         rendered.push(format!("\x1b[1m{marker}❯\x1b[0m {body}{first}\x1b[0m"));
@@ -527,7 +528,7 @@ mod tests {
     #[test]
     fn submitted_input_preview_formats_single_and_multi_line_content() {
         let marker = crate::ai::theme::ACCENT_SUCCESS;
-        let body = crate::ai::theme::ACCENT_INPUT;
+        let body = crate::ai::theme::ACCENT_SUBMITTED;
         let reset = "\x1b[0m";
         assert_eq!(
             submitted_input_preview_lines("hello"),
