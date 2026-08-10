@@ -194,7 +194,7 @@ fn submitted_input_preview_lines(content: &str) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut lines = content.lines();
     let marker = crate::ai::theme::ACCENT_SUCCESS;
-    // 提交后预览用深紫，与编辑态暖灰区分，在白底/深底上都清晰可辨。
+    // 提交后预览用柔和中紫，与编辑态暖灰区分，在白底/深底上都清晰可辨。
     let body = crate::ai::theme::ACCENT_SUBMITTED;
     if let Some(first) = lines.next() {
         // 加粗绿色 `>` 标记 + 低饱和暖灰正文，与 textarea 编辑态颜色一致。
