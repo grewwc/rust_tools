@@ -1,6 +1,6 @@
 {
   "name": "spawn_process",
-  "description": "Spawn a fire-and-forget background process in the Agent OS. Returns the PID immediately and does NOT return the process's result — the scheduler runs it autonomously and you only observe it via IPC (read_mailbox / wait_process) or its side effects. Use this for long-running background processes, two-way IPC collaboration, or work whose output you do not need to collect back. If you need the task's result returned to you, use task_spawn instead.",
+  "description": "Spawn a fire-and-forget background process in the Agent OS. Returns the PID immediately and does NOT return the process's result — the scheduler runs it autonomously; you observe it only via IPC (read_mailbox / wait_process) or side effects. Use for long-running background processes, two-way IPC collaboration, or work whose output you do not need back. If you need the result returned, use task_spawn instead.",
   "parameters": {
     "type": "object",
     "properties": {

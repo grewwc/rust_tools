@@ -17,7 +17,7 @@
           "SIGCONT",
           "SIGKILL"
         ],
-        "description": "Signal to send: SIGCANCEL=cooperative cancel current turn/tool work, SIGTERM=graceful termination, SIGSTOP=pause, SIGCONT=resume, SIGKILL=immediate termination with cascade."
+        "description": "Signal to send (meanings in description)."
       }
     },
     "required": [

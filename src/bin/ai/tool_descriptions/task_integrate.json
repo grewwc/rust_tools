@@ -24,7 +24,7 @@
             },
             "summary": {
               "type": "string",
-              "description": "What the parent concluded from this result and how it affects the remaining work."
+              "description": "What the parent concluded and how it affects the remaining work."
             }
           },
           "required": [

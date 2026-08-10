@@ -10,7 +10,7 @@
       },
       "value": {
         "type": "string",
-        "description": "Value to assign. Child processes spawned afterward inherit this variable."
+        "description": "Value to assign."
       }
     },
     "required": [

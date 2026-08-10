@@ -1,6 +1,6 @@
 {
   "name": "task_wait",
-  "description": "Wait for one or more asynchronously spawned subagent tasks (started by task_spawn) to complete and collect their results. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. `timeout_secs` is a per-call budget: on expiry it returns already-collected results plus a note that the rest are still running, and you may call it again with the same task_ids (or pass `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
+  "description": "Wait for one or more asynchronously spawned subagent tasks (from task_spawn) to complete and collect their results. Polls all tasks in parallel, so total wait equals the slowest task. `timeout_secs` is a per-call budget: on expiry it returns collected results plus a note that the rest are still running; call again with the same task_ids (or `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -13,7 +13,7 @@
       },
       "timeout_secs": {
         "type": "integer",
-        "description": "Wait budget for THIS call (clamped to [1, 60], default 30). task_wait suspends the parent, so call it only after independent parent-side work is exhausted. Hitting this budget does NOT cancel or stall the subagent — it only means the wait policy was not satisfied within this call. The subagent keeps running; use task_status for a non-blocking snapshot while other work remains."
+        "description": "Wait budget for THIS call (clamped to [1, 60], default 30). Suspends the parent, so call only after independent work is exhausted. Hitting the budget does NOT cancel or stall the subagent; it keeps running — use task_status while other work remains."
       },
       "wait_policy": {
         "type": "string",
@@ -21,7 +21,7 @@
           "all",
           "any"
         ],
-        "description": "Optional. 'any' (default) returns as soon as the first task finishes so the parent can resume promptly. 'all' waits until every pending task has finished. Remaining tasks stay alive and can be retrieved later."
+        "description": "Optional. 'any' (default) returns on the first finisher so the parent resumes promptly; 'all' waits until every pending task finishes. Remaining tasks stay alive and can be retrieved later."
       }
     },
     "required": [

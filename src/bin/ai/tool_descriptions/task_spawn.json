@@ -1,6 +1,6 @@
 {
   "name": "task_spawn",
-  "description": "Launch a subagent task asynchronously and return immediately with a task_id, so you can fan out several independent subtasks and let them run concurrently. For a SINGLE delegated subtask whose result you need back, prefer the synchronous `task` — a lone task_spawn immediately followed by task_wait runs no more concurrently than `task` and only adds overhead. After spawning, continue independent parent-side work; use task_status for a non-blocking snapshot and call task_wait only when blocked on results. The returned task_id remains collectable until its result is consumed.",
+  "description": "Launch a subagent task asynchronously and return immediately with a task_id, letting several independent subtasks run concurrently. For a SINGLE delegated subtask whose result you need back, prefer the synchronous `task` — a lone task_spawn followed by task_wait is no more concurrent and only adds overhead. After spawning, continue independent parent-side work; use task_status for non-blocking snapshots and call task_wait only when blocked on results. The task_id stays collectable until its result is consumed.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -18,15 +18,15 @@
       },
       "model": {
         "type": "string",
-        "description": "Optional model override. By default the subagent reuses your (parent) model; only override when the subtask is clearly lighter (use a lighter model to save cost/latency) or heavier than your own."
+        "description": "Optional model override. Default: reuse parent model; override only when the subtask is clearly lighter or heavier."
       },
       "inherit": {
         "type": "string",
-        "description": "Optional inheritance control. Accepts 'all' (inherit history, memory, cwd, skills), 'none' (fresh sub-agent context), or a comma-separated list selecting some of: history, memory, cwd, skills. If omitted, defaults to cwd+skills only, with both history and memory kept private. For narrow leaf tasks, prefer 'none' or 'cwd' to give the subagent a focused context; only use 'all' when the subtask genuinely depends on the full conversation."
+        "description": "Optional inheritance control: 'all' (history, memory, cwd, skills), 'none' (fresh context), or a comma-separated subset of history, memory, cwd, skills. Default: cwd+skills only (history and memory kept private). Prefer 'none' or 'cwd' for narrow leaf tasks; use 'all' only when the subtask depends on the full conversation."
       },
       "response_schema": {
         "type": "object",
-        "description": "Optional JSON Schema for the subagent's final output. When provided, the child must return exactly one JSON value matching this schema."
+        "description": "Optional JSON Schema for the final output; the child must return exactly one value matching it."
       }
     },
     "required": [

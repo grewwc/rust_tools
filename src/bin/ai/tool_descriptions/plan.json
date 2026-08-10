@@ -1,6 +1,6 @@
 {
   "name": "plan",
-  "description": "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. A step marked `delegate: true` implies `parallelizable: true` (delegation is inherently async). Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly.",
+  "description": "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. `delegate: true` implies `parallelizable: true` (delegation is inherently async). Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -24,7 +24,7 @@
             },
             "tool": {
               "type": "string",
-              "description": "The primary tool you plan to use for this step (e.g., 'read_file', 'execute_command', 'apply_patch', 'knowledge_search'). Use 'none' if no tool is needed."
+              "description": "Primary tool for this step (e.g. 'read_file', 'execute_command', 'apply_patch', 'knowledge_search'). Use 'none' if no tool is needed."
             },
             "parallelizable": {
               "type": "boolean",
@@ -32,7 +32,7 @@
             },
             "delegate": {
               "type": "boolean",
-              "description": "Whether this step should be delegated to a subagent. A delegated step implies `parallelizable: true` (a subagent should not block the parent synchronously), so `delegate: true` automatically counts as parallelizable; set `parallelizable` explicitly only when it is true without delegation. Multiple independent delegated steps are dispatched concurrently (task_spawn + task_wait); a lone delegated step runs via the synchronous `task` tool."
+              "description": "Whether this step should be delegated to a subagent. `delegate: true` implies `parallelizable: true` (a subagent should not block the parent synchronously); set `parallelizable` explicitly only when true without delegation. Multiple independent delegated steps dispatch concurrently (task_spawn + task_wait); a lone delegated step runs via the synchronous `task`."
             }
           },
           "required": [

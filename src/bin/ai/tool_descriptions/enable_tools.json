@@ -10,7 +10,7 @@
           "list",
           "enable"
         ],
-        "description": "list: show available but not yet loaded tools. enable: activate tools by name so they become available in subsequent calls."
+        "description": "list: show unloaded available tools; enable: activate tools by name for subsequent calls."
       },
       "tools": {
         "type": "array",

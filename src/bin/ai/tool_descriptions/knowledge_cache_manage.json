@@ -6,7 +6,7 @@
     "properties": {
       "action": {
         "type": "string",
-        "description": "Action: stats, clear_volatile, refresh",
+        "description": "Action to run",
         "enum": [
           "stats",
           "clear_volatile",

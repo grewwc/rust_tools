@@ -1,6 +1,6 @@
 {
   "name": "list_skills",
-  "description": "Browse installed skill names and descriptions without activating anything. Use this proactively when the user asks about available skills, or after identifying a concrete, genuinely specialized need for domain context, an established workflow, bundled resources, or dedicated tools and you need to identify the right skill. Do not browse merely because a task contains technical keywords or involves a routine source-code, repository, file, or terminal investigation.",
+  "description": "Browse installed skill names and descriptions without activating anything. Use proactively when the user asks about available skills, or after identifying a concrete, genuinely specialized need for domain context, an established workflow, bundled resources, or dedicated tools. Do not browse merely because a task contains technical keywords or involves a routine source-code, repository, file, or terminal investigation.",
   "parameters": {
     "type": "object",
     "properties": {

@@ -1,6 +1,6 @@
 {
   "name": "request_user_input",
-  "description": "When an active skill needs information, a decision, or confirmation from the user before it can continue, use this tool instead of merely ending with a question. The driver restores that skill only for the user's immediately following normal message.",
+  "description": "When an active skill needs information, a decision, or confirmation from the user before continuing, use this instead of merely ending with a question. The driver restores that skill only for the user's immediately following normal message.",
   "parameters": {
     "type": "object",
     "properties": {

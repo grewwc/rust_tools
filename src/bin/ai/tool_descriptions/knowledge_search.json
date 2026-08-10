@@ -6,7 +6,7 @@
     "properties": {
       "query": {
         "type": "string",
-        "description": "Keywords to match. For paraphrases or related concepts, enable `knowledge_semantic_search` via `enable_tools` first."
+        "description": "Keywords to match."
       },
       "category": {
         "type": "string",

@@ -6,7 +6,7 @@
     "properties": {
       "pid": {
         "type": "integer",
-        "description": "Terminated child or descendant PID to collect and remove from the process table."
+        "description": "Terminated child or descendant PID."
       }
     },
     "required": [

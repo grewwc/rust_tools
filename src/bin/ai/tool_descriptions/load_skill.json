@@ -1,6 +1,6 @@
 {
   "name": "load_skill",
-  "description": "Read a skill's full contents (its prompt body, system prompt, and bundled resource directory if any) by name, without changing the current turn. Use this when you need to inspect, learn from, or modify an existing skill (e.g. authoring or debugging skills) — it only returns text; it does NOT activate the skill or alter your tool set.",
+  "description": "Read a skill's full contents (prompt body, system prompt, bundled resource directory if any) by name, without changing the current turn. Use to inspect, learn from, or modify an existing skill (e.g. authoring or debugging). Returns text only; it does NOT activate the skill or alter your tool set.",
   "parameters": {
     "type": "object",
     "properties": {

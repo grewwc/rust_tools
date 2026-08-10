@@ -1,6 +1,6 @@
 {
   "name": "spawn_daemon",
-  "description": "Spawn a daemon process that automatically restarts when it terminates (up to max_restarts times). Useful for long-running background services like file watchers or knowledge indexers.",
+  "description": "Spawn a daemon process that automatically restarts when it terminates (up to max_restarts times). For long-running background services like file watchers or knowledge indexers.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -14,15 +14,15 @@
       },
       "priority": {
         "type": "integer",
-        "description": "Process priority on a 0-255 scale (0=highest, 255=lowest). Default is 10."
+        "description": "Process priority 0-255 (0=highest, 255=lowest). Default 10."
       },
       "quota_turns": {
         "type": "integer",
-        "description": "Max turns per run. Default is 10."
+        "description": "Max turns per run. Default 10."
       },
       "max_restarts": {
         "type": "integer",
-        "description": "Maximum number of automatic restarts when the daemon terminates. Default is 3."
+        "description": "Max automatic restarts after termination. Default 3."
       }
     },
     "required": [

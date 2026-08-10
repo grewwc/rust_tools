@@ -1,12 +1,12 @@
 {
   "name": "write_file",
-  "description": "Write content to a file, replacing its entire contents (no append, no merge). Returns the absolute path on success.\n- temp=false (default): write to an absolute path; parent directories are created if missing. For modifying an existing file, prefer apply_patch instead of a full rewrite.\n- temp=true: pass a relative filename (e.g. `script.py`); it is written under the per-session temp directory and cleaned up when the session ends. Absolute paths are rejected.",
+  "description": "Write content to a file, replacing its entire contents (no append, no merge). Returns the absolute path on success. temp=false (default) writes to an absolute path (parent dirs created); temp=true writes a relative filename under the per-session temp dir, cleaned up at session end. For modifying an existing file, prefer apply_patch.",
   "parameters": {
     "type": "object",
     "properties": {
       "file_path": {
         "type": "string",
-        "description": "Path to the file to write. When temp=false (default), an absolute path; parent directories are created if missing. When temp=true, a relative filename only (e.g. `script.py`) written under the per-session temp directory — an absolute path is rejected."
+        "description": "Path to the file to write: absolute (temp=false) or relative filename (temp=true); absolute paths are rejected when temp=true."
       },
       "content": {
         "type": "string",
@@ -14,7 +14,7 @@
       },
       "temp": {
         "type": "boolean",
-        "description": "When true, write file_path (a relative filename) under the per-session temp directory. Use this for scratch/intermediate files (scripts, data dumps, test fixtures). An absolute path is rejected. Temp files are automatically cleaned up when the session ends. (default: false)"
+        "description": "When true, write under the per-session temp directory; use for scratch/intermediate files (scripts, data dumps, test fixtures). Temp files are cleaned up when the session ends. (default: false)"
       }
     },
     "required": [

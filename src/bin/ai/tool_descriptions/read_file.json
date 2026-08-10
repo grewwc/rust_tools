@@ -10,11 +10,11 @@
       },
       "offset": {
         "type": "integer",
-        "description": "1-based line number to start reading from (default: 1)."
+        "description": "1-based starting line (default: 1)."
       },
       "limit": {
         "type": "integer",
-        "description": "Number of lines to read (default: 1000). During discovery, use a large limit for a broad overview; once you have located the relevant region (a symbol or line range), pass a small limit (e.g. 20-40) to read just that slice and avoid pulling unrelated lines. Very large results are additionally capped by a per-read character limit; when that happens the output ends with a truncation notice telling you the exact offset to continue from."
+        "description": "Number of lines to read (default: 1000). Use a large limit for a broad overview, a small one (e.g. 20-40) for a precise slice. Very large results are capped; a truncation notice gives the offset to continue from."
       }
     },
     "required": [

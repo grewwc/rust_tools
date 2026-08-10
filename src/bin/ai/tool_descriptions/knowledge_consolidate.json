@@ -10,7 +10,7 @@
           "read_all",
           "execute"
         ],
-        "description": "\"read_all\" returns every knowledge entry for analysis; \"execute\" deletes & saves entries per your consolidation plan."
+        "description": "\"read_all\" returns every entry for analysis; \"execute\" applies deletions and saves."
       },
       "delete_ids": {
         "type": "array",
