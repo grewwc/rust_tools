@@ -2,6 +2,7 @@ use crate::ai::mcp::{McpClient, SharedMcpClient};
 use crate::ai::types::App;
 use serde_json::json;
 use std::path::Path;
+use std::time::Duration;
 
 pub fn resolve_model_for_input(
     app: &App,
@@ -13,7 +14,8 @@ pub fn resolve_model_for_input(
     // 2) A trailing " -<digit>" selects one of the built-in models (and strips the suffix).
     // 3) Otherwise, keep the current model.
     // Image attachments no longer force a VL model switch — OCR text extraction
-    // (run in driver/mod.rs before this function) provides text for the current model.
+    // (a subagent parse run in driver/mod.rs before this function) provides text
+    // for the current model.
     app.current_model.clone()
 }
 
@@ -24,7 +26,7 @@ pub fn attachment_forced_model(
     _has_usable_ocr_for_images: bool,
 ) -> Option<String> {
     // Text-only models with image attachments stay on the current model.
-    // OCR text extraction (run in driver/mod.rs before this function) handles
+    // A subagent image parse (run in driver/mod.rs before this function) handles
     // extracting readable text for the LLM.
     None
 }
@@ -158,9 +160,151 @@ pub fn ocr_images_for_attached_input(
     }))
 }
 
+/// 非 VL 模型收到附带图片时，不再由主 agent 直接调用 OCR 工具，而是派发一个
+/// 固定使用 VL 模型的同步 subagent 解析图片，解析完成后再回到主 agent。
+/// 返回的 OcrExtraction 复用 precomputed_ocr 注入管线，把解析结果喂给主 agent。
+const IMAGE_PARSE_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+pub(in crate::ai) async fn parse_attached_images_via_subagent(
+    image_files: &[String],
+) -> Result<Option<OcrExtraction>, String> {
+    if image_files.is_empty() {
+        return Ok(None);
+    }
+
+    // 固定用系统配置的默认 VL 模型，保证 subagent 通过 read_file 能直接"看到"图片，
+    // 而不是退回主 agent 直接调 OCR。若系统没有配置任何 VL 模型，default_vl_model()
+    // 会回落到默认模型，subagent 内部会退化为自行 OCR。
+    let vl_model = crate::ai::models::default_vl_model();
+
+    let file_list = image_files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("{}. {}", i + 1, f))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        "主 agent 使用的是纯文本模型，无法直接看到图片。请逐张解析以下图片文件：\n\
+         {file_list}\n\n\
+         对每张图片调用 read_file 读取，然后完整、忠实、详细地输出图片中的全部内容\
+         （所有可见文字、图表、结构、界面元素、布局等），不要遗漏、不要总结。\n\n\
+         输出要求：\n\
+         1. 按文件顺序逐张输出，每张以 \"<!-- IMAGE: <文件名> -->\" 开头；\n\
+         2. 解析结果将作为主 agent 获取图片信息的唯一来源，必须完整可读；\n\
+         3. 只输出图片解析结果，不要讨论其他话题。"
+    );
+
+    let args = json!({
+        "description": "解析附带图片",
+        "prompt": prompt,
+        "agent": "build",
+        "model": vl_model,
+    });
+
+    // 与 /audit 相同：同步派发一个 subagent 解析图片，等它完成后再回到主 agent。
+    // 失败时不静默返回 None（否则主 agent 既无图片内容也无失败提示，只能凭空猜），
+    // 而是构造带 error 标记的占位 OcrExtraction，让 prepare 阶段注入可见提示。
+    let result = match crate::ai::driver::tools::execute_direct_subagent_task(
+        "subagent-image-parse",
+        &args,
+        IMAGE_PARSE_SUBAGENT_HARD_TIMEOUT,
+        None,
+    ) {
+        Ok(r) => r,
+        Err(e) => return Ok(Some(failed_image_parse_extraction(image_files, &e))),
+    };
+
+    let text = extract_subagent_output_text(&result.content);
+    if text.trim().is_empty() {
+        return Ok(Some(failed_image_parse_extraction(
+            image_files,
+            "subagent 未产出任何可用的图片解析文本",
+        )));
+    }
+
+    let file_names: Vec<String> = image_files
+        .iter()
+        .map(|f| {
+            Path::new(f)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(f)
+                .to_string()
+        })
+        .collect();
+    let images = file_names
+        .iter()
+        .map(|name| OcrImageSummary {
+            file_name: name.clone(),
+            extracted_chars: text.chars().count(),
+            error: None,
+        })
+        .collect();
+    Ok(Some(OcrExtraction {
+        tool_name: "subagent:image_parse".to_string(),
+        content: text,
+        images,
+    }))
+}
+
+/// 构造图片解析失败的占位结果：每张图标记 error，content 为可见的失败提示，
+/// 使主 agent 至少能看到图片解析失败而不是静默丢失图片内容。
+fn failed_image_parse_extraction(image_files: &[String], reason: &str) -> OcrExtraction {
+    let file_names: Vec<String> = image_files
+        .iter()
+        .map(|f| {
+            Path::new(f)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(f)
+                .to_string()
+        })
+        .collect();
+    let images = file_names
+        .iter()
+        .map(|name| OcrImageSummary {
+            file_name: name.clone(),
+            extracted_chars: 0,
+            error: Some(reason.to_string()),
+        })
+        .collect();
+    OcrExtraction {
+        tool_name: "subagent:image_parse".to_string(),
+        content: format!("[IMAGE PARSE FAILED: {reason}]"),
+        images,
+    }
+}
+
+/// 从同步 subagent 的渲染结果中剥离 [task_id=...] / [Task: ...] 状态头与
+/// 尾部提醒，只保留 subagent 的最终解析文本。
+fn extract_subagent_output_text(content: &str) -> String {
+    let reminder = crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER;
+    let mut text = content.to_string();
+    if let Some(pos) = text.find(reminder) {
+        text.truncate(pos);
+    }
+    // 显式按前缀剥离确定性包装行（[task_id=...] 状态头、agent/model 选择说明、
+    // 错误行、空输出占位），而不是无条件 skip(1)，避免非 subagent 渲染内容被误删首行。
+    text.lines()
+        .skip_while(|line| line.starts_with("[task_id="))
+        .skip_while(|line| {
+            line.starts_with("[Task:")
+                || line.starts_with("agent_reason=")
+                || line.starts_with("model_reason=")
+                || line.starts_with("Error:")
+                || line.starts_with("(subagent did not produce")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::preferred_ocr_image_tool_name;
+    use super::{extract_subagent_output_text, failed_image_parse_extraction, preferred_ocr_image_tool_name};
+    use crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER;
 
     #[test]
     fn prefers_configured_ocr_extract_image_tool_when_available() {
@@ -180,5 +324,73 @@ mod tests {
             "mcp_other_server_ocr_pdf",
         ]);
         assert_eq!(selected, Some("mcp_some_server_ocr_image"));
+    }
+
+    #[test]
+    fn extracts_clean_text_from_subagent_output() {
+        let rendered = format!(
+            "[task_id=42]\n\
+             [Task: 解析附带图片 via build @ some-vl] COMPLETED after 3.2s\n\
+             agent_reason=explicit agent override\n\
+             model_reason=explicit model override\n\
+             <!-- IMAGE: a.png -->\n\
+             图片中的文字内容……\n\
+             <!-- /IMAGE -->\n\
+             {}",
+            SUBAGENT_PARENT_SUMMARY_REMINDER
+        );
+        let text = extract_subagent_output_text(&rendered);
+        assert_eq!(
+            text,
+            "<!-- IMAGE: a.png -->\n图片中的文字内容……\n<!-- /IMAGE -->"
+        );
+    }
+
+    #[test]
+    fn returns_empty_text_for_wrapper_only_output() {
+        let rendered = format!(
+            "[task_id=42]\n\
+             [Task: 解析附带图片 via build @ some-vl] COMPLETED after 3.2s\n\
+             agent_reason=explicit agent override\n\
+             model_reason=explicit model override\n\
+             {}",
+            SUBAGENT_PARENT_SUMMARY_REMINDER
+        );
+        assert!(extract_subagent_output_text(&rendered).is_empty());
+    }
+
+    #[test]
+    fn returns_empty_text_for_placeholder_only_output() {
+        // 生产路径：subagent 无最终文本时 format_subagent_output 会 push 占位符行，
+        // 该行与 agent_reason/model_reason 一样属于确定性包装，不应作为图片内容注入主 agent。
+        let rendered = format!(
+            "[task_id=42]\n\
+             [Task: 解析附带图片 via build @ some-vl] COMPLETED after 3.2s\n\
+             agent_reason=explicit agent override\n\
+             model_reason=explicit model override\n\
+             (subagent did not produce any final assistant text)\n\
+             {}",
+            SUBAGENT_PARENT_SUMMARY_REMINDER
+        );
+        assert!(extract_subagent_output_text(&rendered).is_empty());
+    }
+
+    #[test]
+    fn failed_image_parse_extraction_marks_every_image_and_exposes_reason() {
+        // P1-a 回归：subagent 派发失败 / 空文本时必须返回带 error 的占位结果，
+        // 而不是静默 Ok(None)，prepare 阶段才能注入 [IMAGE PARSE FAILED: ...] 提示。
+        let files = vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()];
+        let ocr = failed_image_parse_extraction(&files, "subagent 超时");
+
+        assert_eq!(ocr.tool_name, "subagent:image_parse");
+        assert!(ocr.content.contains("[IMAGE PARSE FAILED: subagent 超时]"));
+        assert_eq!(ocr.images.len(), 2);
+        for (img, expect_name) in ocr.images.iter().zip(["a.png", "b.png"]) {
+            assert_eq!(img.file_name, expect_name);
+            assert_eq!(img.extracted_chars, 0);
+            assert_eq!(img.error.as_deref(), Some("subagent 超时"));
+        }
+        // 失败占位不可作为可用 OCR 文本消费（has_usable_text 为 false）。
+        assert!(!ocr.has_usable_text());
     }
 }

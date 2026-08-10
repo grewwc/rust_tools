@@ -119,7 +119,7 @@ fn assemble_effective_question(
 
     if let Some((tool_name, content)) = image_ocr {
         effective_question = format!(
-            "{}\n\n[Auto OCR From Attached Images via {}]\n{}",
+            "{}\n\n[Attached Image Content via {}]\n{}",
             effective_question, tool_name, content
         );
     }
@@ -378,8 +378,12 @@ pub(super) async fn prepare_turn(
     // critic gate 必须观察模型实际收到的完整用户输入，而不只是剥离 @file 后的
     // 短问题正文。文本附件、OCR 内容与原生图片都属于 artifact-backed 输入。
     let has_images = !app.attached_image_files.is_empty();
+    // 放行失败占位（images 全部带 error）：图片解析失败时也要把 [IMAGE PARSE FAILED: ...]
+    // 提示注入 prompt，避免主 agent 静默丢失图片内容。
     let usable_ocr = if has_images && !crate::ai::models::supports_image_input(next_model) {
-        precomputed_ocr.as_ref().filter(|ocr| ocr.has_usable_text())
+        precomputed_ocr.as_ref().filter(|ocr| {
+            ocr.has_usable_text() || ocr.images.iter().any(|img| img.error.is_some())
+        })
     } else {
         None
     };
@@ -828,7 +832,7 @@ mod tests {
             Some(("mcp_ocr_extract", "src/main.rs:42\npanic!()")),
         );
 
-        assert!(effective_question.contains("[Auto OCR From Attached Images via mcp_ocr_extract]"));
+        assert!(effective_question.contains("[Attached Image Content via mcp_ocr_extract]"));
         assert!(should_inject_integrated_critic(&effective_question, false));
         // 原生视觉模型不会产生 OCR 文本，但图片本身仍是 artifact-backed 输入。
         assert!(should_inject_integrated_critic("描述这张图", true));

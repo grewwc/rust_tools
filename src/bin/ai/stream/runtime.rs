@@ -44,6 +44,9 @@ const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
 /// 比 idle 超时更长，因为某些模型冷启动或排队需要时间。
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
 /// terminal 下 thinking 可见窗口的默认高度。只影响展示，不影响 reasoning 累积。
+/// 流式过程显示最近 N 行（默认 2）；思考结束时 `finalize_fold` 会强制折叠为纯摘要
+/// （临时按 0 行窗口重画），避免模型在 thinking 尾部复述的结论/问句与最终回答在
+/// 终端重复显示。
 const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 2;
 /// thinking / subagent 折叠正文缩进：header/footer 用 2 空格，正文再内缩一层。
 const THINKING_FOLD_BODY_INDENT: &str = "    ";
@@ -1277,14 +1280,19 @@ fn erase_fold_body(out: &mut impl Write, rows: usize) -> io::Result<()> {
 
 /// Thinking 结束时的最终渲染：覆盖正文窗口，输出最终折叠摘要 + "done thinking"。
 pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
-    finalize_fold(&mut state.render.thinking_fold)
+    finalize_fold(&mut state.render.thinking_fold, true)
 }
 
 fn finalize_subagent_preview_fold(state: &mut StreamProcessingState) -> io::Result<()> {
-    finalize_fold(&mut state.render.subagent_fold)
+    // subagent 预览收尾保留窗口正文：子代理的最终输出应留在终端可见，
+    // 不套用 thinking 的「强制 0 行纯摘要」收尾（那会把关键结论一并折叠）。
+    finalize_fold(&mut state.render.subagent_fold, false)
 }
 
-fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
+fn finalize_fold(
+    fold: &mut super::state::ThinkingFoldState,
+    collapse_body: bool,
+) -> io::Result<()> {
     if !fold.active {
         return Ok(());
     }
@@ -1298,6 +1306,13 @@ fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
         fold.header_drawn = true;
     }
 
+    // thinking 收尾折叠为纯摘要（0 行窗口），不显示正文行：思考尾部常复述结论/问句，
+    // 若保留可见行会与紧随其后的最终回答在终端重复。subagent 预览收尾不折叠，
+    // 保留最近可见窗口行，让子代理最终输出对用户可见。
+    let saved_max_visible_lines = fold.max_visible_lines;
+    if collapse_body {
+        fold.max_visible_lines = 0;
+    }
     let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
     let (body, body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
         &body_lines,
@@ -1305,6 +1320,7 @@ fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
         fold.rewrite_right_margin_cols,
         fold.max_visible_lines,
     );
+    fold.max_visible_lines = saved_max_visible_lines;
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
     }
@@ -1338,6 +1354,10 @@ fn thinking_fold_hidden_count(fold: &super::state::ThinkingFoldState) -> usize {
 }
 
 fn thinking_fold_visible_lines(fold: &super::state::ThinkingFoldState) -> Vec<&str> {
+    // 0 行窗口 = 纯摘要模式：连当前未完成行也不显示，避免结论复述泄漏到终端。
+    if fold.max_visible_lines == 0 {
+        return Vec::new();
+    }
     let current_line = usize::from(!fold.current_line.is_empty());
     let visible_completed = fold.max_visible_lines.saturating_sub(current_line);
     let completed_skip = fold.recent_lines.len().saturating_sub(visible_completed);

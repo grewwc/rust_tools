@@ -446,6 +446,27 @@ const COMPLETION_EVIDENCE_REQUIRED_MARKER: &str = "self_note:completion_evidence
 const COMPLETION_EVIDENCE_UNVERIFIED_NOTE: &str = "runtime:completion_evidence_unverified\nA final response was recorded after a project mutation without observed post-mutation verification.";
 const COMPLETION_EVIDENCE_WARNING: &str = "[Runtime warning] Completion/impact claim is unverified: no successful post-mutation check, test, diff, or status command was observed.";
 
+const INJECTED_CONTEXT_ECHO_RETRY_MARKER: &str = "[injected-context-echo-retry]";
+const INJECTED_CONTEXT_ECHO_RETRY_NOTE: &str = "Your previous response reproduced a runtime-injected context note verbatim instead of answering. \
+Runtime notes are context for you only; they are never the user-facing answer. \
+Do not quote, restate, or continue any runtime note — including lines that begin with \
+\"[Model-authored note from an earlier turn\", \"[Compressed history summary\", \"[Runtime context handoff\", or \"self_note:\". \
+Produce the actual answer to the user's request now, using tools first if verification is still required; if you cannot verify, state that limitation in your own words.";
+const INJECTED_CONTEXT_ECHO_STOP: &str =
+    "[模型复述了运行时内部提示，没有给出真实回答，请重试或切换模型]";
+
+/// runtime 注入到 request projection 的上下文笔记前缀。这些都是运行时自撰文本，
+/// 合法的用户可见回答绝不会以它们开头；模型把它们原样当答案回吐即为 echo。
+/// 源字符串定义在 `request/normalize.rs`（`MODEL_SELF_NOTE_CONTEXT_HEADER`、
+/// `HISTORY_SUMMARY_CONTEXT_HEADER`、`DERIVED_CONTEXT_HANDOFF/RETURN`）与本文件的
+/// `COMPLETION_EVIDENCE_REQUIRED_MARKER`；此处按稳定前缀匹配，避免跨模块暴露长常量。
+const INJECTED_CONTEXT_ECHO_PREFIXES: &[&str] = &[
+    "[Model-authored note from an earlier turn",
+    "[Compressed history summary for task continuity.",
+    "[Runtime context handoff",
+    "self_note:",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionEvidenceGateAction {
     Allow,
@@ -865,6 +886,51 @@ fn unsupported_runtime_limit_action(
     UnsupportedRuntimeLimitAction::ReopenWithTools
 }
 
+/// 去掉行内 code span（反引号包裹的片段）后返回纯散文，避免 `foo.rs`、`.ok()`、
+/// `a:b` 等代码里的 . : 等符号污染句子计数与冒号收尾判定。仅在反引号成对时剥离；
+/// 反引号数量为奇数（残缺/未配对）时原样返回，避免误删正文尾部。
+fn strip_inline_code_spans(text: &str) -> String {
+    if text.matches('`').count() % 2 != 0 {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    for ch in text.chars() {
+        if ch == '`' {
+            in_code = !in_code;
+            continue;
+        }
+        if !in_code {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// 统计"散文句末标点"数量，用于判断一段文本更像"多句、成形的结论"还是一句
+/// "我马上去做 X"的旁白。CJK 的 。！？ 恒计为句末；ASCII 的 . ! ? 仅当其后是
+/// 空白或文本结尾时才计入——否则 `driver/mod.rs`、`.ok().flatten()`、`3.14` 里的
+/// 点号会被误计为句子，把短旁白伪装成成形结论，从而绕过 dangling-final 门禁
+/// （这正是模型"停在半句"却被静默当作 final 收尾的根因之一）。
+fn prose_sentence_terminator_count(text: &str) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut count = 0usize;
+    for (index, ch) in chars.iter().enumerate() {
+        match ch {
+            '。' | '！' | '？' => count += 1,
+            '.' | '!' | '?' => {
+                let next_is_prose_boundary =
+                    chars.get(index + 1).is_none_or(|next| next.is_whitespace());
+                if next_is_prose_boundary {
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
 /// 识别「口头承诺继续读/查，但既没有 tool call、也没有交付结论」的悬空最终响应。
 ///
 /// 保持保守：只检查已有工具证据的非计划型任务、较短且无结构化结论的文本。
@@ -900,7 +966,16 @@ fn looks_like_dangling_action_final(
         return false;
     }
 
-    let structured_lines = candidate
+    // 分类只看散文语义，先剥掉行内 code span，避免 `foo.rs`/`.ok()`/`a:b` 里的
+    // 符号污染句子计数与冒号收尾判定。
+    let prose = strip_inline_code_spans(candidate);
+    let prose = prose.trim();
+    if prose.is_empty() {
+        // 正文全是代码片段、剥离后无散文：不是"停在半句的旁白"，保守放行。
+        return false;
+    }
+
+    let structured_lines = prose
         .lines()
         .map(str::trim_start)
         .filter(|line| {
@@ -912,52 +987,61 @@ fn looks_like_dangling_action_final(
                     .is_some_and(|(prefix, _)| prefix.chars().all(|ch| ch.is_ascii_digit()))
         })
         .count();
-    let sentence_ends = candidate
-        .chars()
-        .filter(|ch| matches!(ch, '.' | '!' | '?' | '。' | '！' | '？'))
-        .count();
+    let sentence_ends = prose_sentence_terminator_count(prose);
     if structured_lines >= 2 || sentence_ends > 4 {
         return false;
     }
 
-    let lower = candidate.to_ascii_lowercase();
-    let has_future_inspection = [
-        "let me read",
-        "let me inspect",
-        "let me check",
-        "let me examine",
-        "let me look at",
-        "let me review",
-        "let me trace",
-        "let me verify",
-        "let me investigate",
-        "let me search",
-        "let me open",
-        "i'll read",
-        "i'll inspect",
-        "i'll check",
-        "i'll examine",
-        "i will read",
-        "i will inspect",
-        "i will check",
-        "i will examine",
-        "我再读",
-        "我再看",
-        "我再检查",
-        "让我再读",
-        "让我再看",
-        "让我检查",
-        "接下来我会读",
-        "接下来我会看",
-        "接下来我会检查",
-        "接下来让我",
-        "下一步我会读",
-        "下一步我会检查",
-        "现在我来读",
-        "现在我来检查",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
+    // 强信号：正文以冒号结尾 = 典型的"我马上做 X："预告，本应紧跟一次工具调用
+    // 或列表，却在此被切断。这类"停在半句"的悬空 final 与具体措辞无关，因此不依赖
+    // 下面的未来动作词表——词表只能覆盖有限的固定说法，正是 id=455 那类
+    // "先看…检查…：" 文本此前同时穿透 stream 分类器与本门禁的根因。
+    //
+    // 判据落在**原始 candidate**（未剥离 code span）的末字符上，而非剥离后的
+    // prose：`See the fix: \`bar()\`` 这类结尾是 code span、确实交付了内容的正常
+    // final，末字符是反引号而非冒号，不应被误判；只有冒号本身就是最后一个可见
+    // 字符时，才是真正被切断的预告。
+    let ends_with_dangling_colon = candidate.ends_with(':') || candidate.ends_with('：');
+
+    let lower = prose.to_ascii_lowercase();
+    let has_future_inspection = ends_with_dangling_colon
+        || [
+            "let me read",
+            "let me inspect",
+            "let me check",
+            "let me examine",
+            "let me look at",
+            "let me review",
+            "let me trace",
+            "let me verify",
+            "let me investigate",
+            "let me search",
+            "let me open",
+            "i'll read",
+            "i'll inspect",
+            "i'll check",
+            "i'll examine",
+            "i will read",
+            "i will inspect",
+            "i will check",
+            "i will examine",
+            "我再读",
+            "我再看",
+            "我再检查",
+            "让我再读",
+            "让我再看",
+            "让我检查",
+            "接下来我会读",
+            "接下来我会看",
+            "接下来我会检查",
+            "接下来让我",
+            "下一步我会读",
+            "下一步我会检查",
+            "现在我来读",
+            "现在我来检查",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
     if !has_future_inspection {
         return false;
     }
@@ -1103,6 +1187,58 @@ fn completion_evidence_gate_action(
         reasoning_content: None,
     });
     CompletionEvidenceGateAction::Reopen
+}
+
+/// 判断最终响应是否只是把 runtime 注入的上下文笔记原样回吐（regurgitate），而没有
+/// 给出真正的回答。命中特征：剥掉 runtime 事后追加的 `[Runtime warning]` 段后，
+/// 剩余可见正文以某个注入笔记前缀开头。这类响应对用户毫无价值，且会把内部提示
+/// 泄漏到终端（弱模型在 completion-evidence / dangling 等门禁 reopen 后尤其常见）。
+///
+/// 保持保守：只看「整段正文即注入笔记」的情形。模型若在正文里引用/讨论这些前缀
+/// （即前缀不在开头、或其后还有自撰内容）不算 echo，交由其它门禁处理。
+fn looks_like_injected_context_echo(final_text: &str) -> bool {
+    // runtime 可能在真正回答之后追加 `\n\n[Runtime warning] ...`；分类只看模型正文。
+    let visible = final_text
+        .split_once("\n\n[Runtime warning]")
+        .map_or(final_text, |(before, _)| before);
+    let visible = visible.trim();
+    if visible.is_empty() {
+        return false;
+    }
+    INJECTED_CONTEXT_ECHO_PREFIXES
+        .iter()
+        .any(|prefix| visible.starts_with(prefix))
+}
+
+/// echo 门禁：命中回吐时给一次无工具（保留 reopen 语义前的能力）合成重试机会，
+/// 第二次仍回吐则停轮并给用户可见的错误说明，避免注入笔记被当成答案持久化/渲染。
+fn injected_context_echo_recovery_action(
+    messages: &mut Vec<Message>,
+    final_text: &str,
+) -> DanglingFinalRecoveryAction {
+    if !looks_like_injected_context_echo(final_text) {
+        return DanglingFinalRecoveryAction::Allow;
+    }
+    let already_retried = messages.iter().any(|message| {
+        message.role == ROLE_INTERNAL_NOTE
+            && message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(INJECTED_CONTEXT_ECHO_RETRY_MARKER))
+    });
+    if already_retried {
+        return DanglingFinalRecoveryAction::Warn;
+    }
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(format!(
+            "{INJECTED_CONTEXT_ECHO_RETRY_MARKER}\n{INJECTED_CONTEXT_ECHO_RETRY_NOTE}"
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    DanglingFinalRecoveryAction::RetryWithoutTools
 }
 
 fn read_only_tool_signature(tool_call: &ToolCall) -> Option<String> {
@@ -2583,6 +2719,22 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     reasoning_content: None,
                 });
                 return Ok(TurnLoopStep::Continue);
+            }
+            // 注入笔记回吐门禁：优先于其它 final 门禁。模型把 runtime 上下文笔记
+            // 原样当答案吐回（弱模型在前面各类 reopen 之后尤其常见）时，这段文本
+            // 既无回答价值又会把内部提示泄漏到终端并持久化成 final。命中即给一次
+            // 无工具合成重试；仍回吐则停轮并给用户可见错误，而不是接受它。
+            match injected_context_echo_recovery_action(messages, &stream_result.assistant_text) {
+                DanglingFinalRecoveryAction::Allow => {}
+                DanglingFinalRecoveryAction::RetryWithoutTools => {
+                    record_force_final_reason(messages, "injected_context_echo", iteration);
+                    *force_final_response = true;
+                    return Ok(TurnLoopStep::Continue);
+                }
+                DanglingFinalRecoveryAction::Warn => {
+                    *final_assistant_text = INJECTED_CONTEXT_ECHO_STOP.to_string();
+                    return Ok(TurnLoopStep::Break);
+                }
             }
             let warn_unsupported_runtime_limit = match unsupported_runtime_limit_action(
                 question,
@@ -5759,6 +5911,171 @@ mod tests {
         let mut warning_text = DANGLING_FINAL_WARNING.to_string();
         append_runtime_warning_once(&mut warning_text, DANGLING_FINAL_WARNING);
         assert_eq!(warning_text.matches(DANGLING_FINAL_WARNING).count(), 1);
+    }
+
+    #[test]
+    fn prose_sentence_counter_ignores_code_symbol_dots() {
+        // 代码符号里的点号不应被计为句末：`driver/mod.rs`、`.ok().flatten()`、行号
+        // `1057-1080` 里的 . 后面都不是空白/结尾。
+        assert_eq!(
+            prose_sentence_terminator_count(
+                "检查 driver/mod.rs:1057-1080 的 .ok().flatten() 吞错逻辑"
+            ),
+            0
+        );
+        // 真正的句末（. 后跟空白，或 CJK 。！？）仍应计入。
+        assert_eq!(
+            prose_sentence_terminator_count("First done. Second done! Third?"),
+            3
+        );
+        assert_eq!(prose_sentence_terminator_count("第一。第二！第三？"), 3);
+        // 结尾的 . 也算句末（其后是文本结尾）。
+        assert_eq!(prose_sentence_terminator_count("Done."), 1);
+    }
+
+    #[test]
+    fn strip_inline_code_spans_removes_paired_backticks_only() {
+        assert_eq!(
+            strip_inline_code_spans("检查 `driver/mod.rs` 的 `.ok()` 逻辑"),
+            "检查  的  逻辑"
+        );
+        // 反引号未配对（奇数）时原样返回，避免误删正文尾部。
+        assert_eq!(
+            strip_inline_code_spans("half `open span"),
+            "half `open span"
+        );
+    }
+
+    #[test]
+    fn dangling_final_detects_mid_introduction_colon_stop() {
+        // 真实回归：会话 b884d15f 消息 id=455。模型在长工具链末尾停在"先看…检查…："
+        // 这条以冒号收尾、预告工具调用却没有 tool call 的旁白上，此前同时穿透了
+        // stream 分类器（判 Completed）与 dangling 门禁（代码符号污染句子计数 +
+        // 措辞不在词表），被静默当作 final 收尾，用户被迫手动唤醒。
+        let turn_messages = vec![Message {
+            role: "tool".to_string(),
+            content: Value::String("git status output".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call-1".to_string()),
+            reasoning_content: None,
+        }];
+        let final_text = "11 个文件与 review.md 声称一致。现在逐项检查 review.md 列出的问题。先看 P1-a（图片解析失败静默丢失）——检查 `driver/mod.rs:1057-1080` 的 `.ok().flatten()` 吞错逻辑：";
+        assert!(
+            looks_like_dangling_action_final(
+                "分析这个 agent 的会话历史",
+                &turn_messages,
+                final_text,
+            ),
+            "以冒号收尾、代码符号密集的悬空预告必须被识别为 dangling final"
+        );
+    }
+
+    #[test]
+    fn dangling_final_colon_signal_respects_conclusion_and_structure_guards() {
+        let turn_messages = vec![Message {
+            role: "tool".to_string(),
+            content: Value::String("evidence".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call-1".to_string()),
+            reasoning_content: None,
+        }];
+
+        // 冒号收尾但已交付结论：结论标记优先，不判 dangling。
+        assert!(!looks_like_dangling_action_final(
+            "审查这段代码",
+            &turn_messages,
+            "结论：run loop 的 wake 路径已覆盖，没有缺陷。补充说明如下：",
+        ));
+        // 冒号收尾但后面紧跟已交付的列表：structured_lines 守卫先行，不判 dangling。
+        assert!(!looks_like_dangling_action_final(
+            "审查这段代码",
+            &turn_messages,
+            "发现两个问题：\n- 第一个问题\n- 第二个问题",
+        ));
+        // 正文以 code span 结尾（末字符是反引号而非冒号）= 已交付内容，不误判。
+        assert!(!looks_like_dangling_action_final(
+            "审查这段代码",
+            &turn_messages,
+            "修复点在 `foo.rs` 的 `bar()`",
+        ));
+        // 纯冒号收尾的裸预告 = dangling。
+        assert!(looks_like_dangling_action_final(
+            "审查这段代码",
+            &turn_messages,
+            "现在开始逐项核对第一处改动：",
+        ));
+    }
+
+    #[test]
+    fn injected_context_echo_is_detected_only_when_it_is_the_whole_answer() {
+        // 真实回归：session 7ac3d771 消息 id=263。模型把 completion-evidence reopen
+        // 提示 + self_note 头原样当答案吐回，泄漏到终端并被持久化成 final。
+        let echoed = "[Model-authored note from an earlier turn; this is not authoritative evidence. Treat every claim as unverified unless it is backed by tool output or a cited source, and re-check it before using it as a conclusion.]\nself_note:completion_evidence_required\nA successful project mutation occurred in the current user turn, but no successful post-mutation verification was observed.";
+        assert!(looks_like_injected_context_echo(echoed));
+
+        // runtime 事后追加的 [Runtime warning] 段不影响判定——只看模型正文。
+        let echoed_with_warning = format!(
+            "{echoed}\n\n[Runtime warning] Completion/impact claim is unverified: no successful post-mutation check was observed."
+        );
+        assert!(looks_like_injected_context_echo(&echoed_with_warning));
+
+        // 裸 self_note: 前缀。
+        assert!(looks_like_injected_context_echo(
+            "self_note:completion_evidence_required\ninspect the diff first."
+        ));
+        // 历史摘要头 / handoff 头。
+        assert!(looks_like_injected_context_echo(
+            "[Compressed history summary for task continuity. Use it to ...]\nearlier work"
+        ));
+        assert!(looks_like_injected_context_echo(
+            "[Runtime context handoff, not a new end-user request. ...]"
+        ));
+
+        // 真实回答：即便引用了这些前缀，只要不在开头就不算 echo。
+        assert!(!looks_like_injected_context_echo(
+            "修复完成。运行时会注入形如 self_note: 的提示，但那是内部上下文。"
+        ));
+        assert!(!looks_like_injected_context_echo(
+            "P2-a 已修完，62 个 fold 测试全绿。"
+        ));
+        // 纯 [Runtime warning]（无模型正文）交由其它门禁处理，不算 echo。
+        assert!(!looks_like_injected_context_echo(
+            "\n\n[Runtime warning] Completion/impact claim is unverified."
+        ));
+    }
+
+    #[test]
+    fn injected_context_echo_gets_exactly_one_no_tool_recovery_then_stops() {
+        let echoed = "[Model-authored note from an earlier turn; this is not authoritative evidence.]\nself_note:completion_evidence_required\nThis is not a final answer.";
+        let mut messages: Vec<Message> = Vec::new();
+
+        // 第一次命中：注入一次无工具重试提示。
+        assert_eq!(
+            injected_context_echo_recovery_action(&mut messages, echoed),
+            DanglingFinalRecoveryAction::RetryWithoutTools
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .content
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(INJECTED_CONTEXT_ECHO_RETRY_MARKER))
+                })
+                .count(),
+            1
+        );
+        // 第二次仍回吐：停轮（Warn），不再无限重试。
+        assert_eq!(
+            injected_context_echo_recovery_action(&mut messages, echoed),
+            DanglingFinalRecoveryAction::Warn
+        );
+        // 正常回答放行。
+        assert_eq!(
+            injected_context_echo_recovery_action(&mut messages, "修复完成，测试全绿。"),
+            DanglingFinalRecoveryAction::Allow
+        );
     }
 
     #[test]

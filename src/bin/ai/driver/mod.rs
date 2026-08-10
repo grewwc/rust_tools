@@ -1057,12 +1057,24 @@ async fn run_loop(
         let precomputed_ocr = if !app.attached_image_files.is_empty()
             && !crate::ai::models::is_vl_model(&app.current_model)
         {
-            crate::ai::driver::model::ocr_images_for_attached_input(
-                mcp_client,
-                &app.attached_image_files,
-            )
-            .ok()
-            .flatten()
+            // 非 VL 模型收到附带图片时，不再由主 agent 直接调用 OCR 工具，而是派发一个
+            // 固定使用 VL 模型的 subagent 解析图片，解析完成后再回到主 agent。
+            let image_parse_ctx = runtime_ctx::DriverContext::new(
+                app.clone(),
+                mcp_client.clone(),
+                skill_manifests.clone(),
+                agent_manifests.clone(),
+            );
+            runtime_ctx::DRIVER_CTX
+                .scope(
+                    image_parse_ctx,
+                    crate::ai::driver::model::parse_attached_images_via_subagent(
+                        &app.attached_image_files,
+                    ),
+                )
+                .await
+                .ok()
+                .flatten()
         } else {
             None
         };

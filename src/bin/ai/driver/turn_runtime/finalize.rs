@@ -184,6 +184,16 @@ pub(in crate::ai::driver::turn_runtime) fn should_generate_session_title_in_back
     !one_shot_mode && !should_quit
 }
 
+fn should_compact_session_history_in_background(
+    one_shot_mode: bool,
+    should_quit: bool,
+    is_subagent: bool,
+) -> bool {
+    // 子代理 history 由调用方的生命周期 guard 管理；压缩若脱离当前 future，
+    // guard 可能先删除临时 SQLite，后台任务随后访问已不存在的文件。
+    !is_subagent && !one_shot_mode && !should_quit
+}
+
 fn mark_session_title_generation_started(session_id: &str) -> bool {
     let mut in_flight = SESSION_TITLE_IN_FLIGHT
         .lock()
@@ -246,8 +256,9 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
     );
 }
 
-/// 收尾阶段的持久化压缩派发。交互式 turn 走后台（不阻塞前台回到 prompt）；
-/// one-shot / 即将退出的进程走前台 `.await`，确保进程结束前 snapshot 已落盘。
+/// 收尾阶段的持久化压缩派发。前台交互式 turn 走后台（不阻塞前台回到 prompt）；
+/// one-shot、即将退出的进程及子代理走前台 `.await`，确保 snapshot 在所属 history
+/// 的生命周期结束前落盘。
 async fn dispatch_finalize_compaction(app: &App, at_boundary: bool, run_in_background: bool) {
     if run_in_background {
         spawn_background_compaction(app, at_boundary);
@@ -404,14 +415,18 @@ pub(super) async fn finalize_turn(
         // goal 模式下，run_loop 通过此标志判定目标是否完成：
         // 一轮结束时没有调用任何工具 = agent 已交付最终结果。
         app.last_turn_had_tool_calls = had_tool_calls;
-        // 持久化压缩：交互式 turn 派发到后台，避免答案交付后前台再干等一次
-        // CPU 压缩 + SQLite 写事务（快照只是写回缓存，下一轮从 canonical 重算）。
-        // one-shot / 即将退出时走前台 await，确保进程结束前 snapshot 已落盘。
+        // 持久化压缩：前台交互式 turn 派发到后台，避免答案交付后再等待 CPU 压缩
+        // 与 SQLite 写事务（快照只是写回缓存，下一轮从 canonical 重算）。
+        // one-shot、即将退出及子代理 turn 走当前 future，避免所属 history 先结束生命周期。
         // `at_boundary` = 本轮没有再调工具（答案已交付），用更激进的阈值。
         dispatch_finalize_compaction(
             app,
             !had_tool_calls,
-            should_generate_session_title_in_background(one_shot_mode, should_quit),
+            should_compact_session_history_in_background(
+                one_shot_mode,
+                should_quit,
+                crate::ai::driver::runtime_ctx::has_subagent_result_slot(),
+            ),
         )
         .await;
         // 尝试为当前对话生成 LLM 概括性标题（如果尚未生成且已有足够上下文）。
@@ -818,6 +833,22 @@ mod tests {
         assert!(!should_generate_session_title_in_background(true, false));
         assert!(!should_generate_session_title_in_background(false, true));
         assert!(!should_generate_session_title_in_background(true, true));
+    }
+
+    #[test]
+    fn persisted_history_compaction_stays_within_subagent_lifetime() {
+        assert!(should_compact_session_history_in_background(
+            false, false, false
+        ));
+        assert!(!should_compact_session_history_in_background(
+            false, false, true
+        ));
+        assert!(!should_compact_session_history_in_background(
+            true, false, false
+        ));
+        assert!(!should_compact_session_history_in_background(
+            false, true, false
+        ));
     }
 
     #[test]

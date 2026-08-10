@@ -719,15 +719,18 @@ fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
         reasoning_content: None,
     }];
 
-    // Alibaba 默认：enable_thinking/enable_search，无未经模型声明的 effort 字段。
-    // 用唯一 key 定位模型（生产链路一致），避免共享 name 命中歧义条目。
+    // Alibaba 声明 top_level wire 的模型：enable_thinking/enable_search +
+    // 顶层 reasoning_effort。用唯一 key 定位模型（生产链路一致），避免共享
+    // name 命中歧义条目。
     let alibaba_model = crate::ai::model_names::all()
         .iter()
         .find(|model| {
-            model.adapter == ApiProvider::Alibaba && model.reasoning_effort_wire.is_none()
+            model.adapter == ApiProvider::Alibaba
+                && model.reasoning_effort_wire
+                    == Some(crate::ai::model_names::ReasoningEffortWire::TopLevel)
         })
         .map(|model| model.key.clone())
-        .expect("models.json must contain an Alibaba model using the adapter-default effort wire");
+        .expect("models.json must contain an Alibaba model declaring top_level effort wire");
     let alibaba = build_request_body(
         &alibaba_model,
         &messages,
@@ -750,7 +753,7 @@ fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
     assert_eq!(
         serde_json::to_string(&alibaba).unwrap(),
         format!(
-            r#"{{"model":"{alibaba_wire_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true{alibaba_max_tokens_field}}}"#
+            r#"{{"model":"{alibaba_wire_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true,"reasoning_effort":"high"{alibaba_max_tokens_field}}}"#
         )
     );
 
@@ -868,7 +871,7 @@ fn build_request_body_sends_provider_model_name_for_key_handle() {
 }
 
 #[test]
-fn opencode_deepseek_reasoning_effort_suppresses_thinking_object() {
+fn opencode_deepseek_sends_thinking_object_alongside_reasoning_effort() {
     let messages = vec![Message {
         role: "user".to_string(),
         content: Value::String("hi".to_string()),
@@ -895,12 +898,18 @@ fn opencode_deepseek_reasoning_effort_suppresses_thinking_object() {
             None,
         );
         let json = serde_json::to_value(&body).unwrap();
+        // DeepSeek 方言始终下发 thinking 对象；顶层 reasoning_effort 按 adapter
+        // 规则照常下发（网关实测两者可共存，无 wire 冲突）。
+        assert_eq!(
+            json.pointer("/thinking/type").and_then(|v| v.as_str()),
+            Some("enabled"),
+            "{model}"
+        );
         assert_eq!(
             json.get("reasoning_effort").and_then(|v| v.as_str()),
             Some("high"),
             "{model}"
         );
-        assert!(json.get("thinking").is_none(), "{model}");
     }
 }
 
@@ -1021,17 +1030,21 @@ fn dashscope_glm_uses_top_level_effort_and_exact_reasoning_replay() {
 fn dashscope_qwen_metadata_matches_documented_thinking_controls() {
     assert_eq!(
         models::default_reasoning_effort("qwen3.7-plus-alibaba"),
-        None
+        Some(crate::ai::provider::ReasoningEffort::High)
     );
     assert_eq!(
         models::default_reasoning_effort("qwen3.7-max-alibaba"),
-        None
+        Some(crate::ai::provider::ReasoningEffort::High)
+    );
+    assert_eq!(
+        models::default_reasoning_effort("qwen3.6-flash-alibaba"),
+        Some(crate::ai::provider::ReasoningEffort::High)
     );
     assert!(models::enable_thinking("qwen3.6-flash-alibaba"));
 }
 
 #[test]
-fn opencode_deepseek_aux_reasoning_effort_omits_disabled_thinking_object() {
+fn opencode_deepseek_aux_disabled_thinking_object_ignores_effort() {
     let endpoint = crate::ai::provider::OPENCODE_DEFAULT_ENDPOINT.to_string();
     let (thinking, top_level_reasoning_effort, nested_reasoning) = resolve_reasoning_wire_controls(
         "deepseek-v4-flash-opencode",
@@ -1040,7 +1053,15 @@ fn opencode_deepseek_aux_reasoning_effort_omits_disabled_thinking_object() {
         Some("high"),
     );
 
-    assert!(thinking.is_empty());
+    // DeepSeek 方言始终下发 thinking:{"type":"disabled"}；顶层 reasoning_effort
+    // 按 adapter 规则照常下发（网关实测 thinking:disabled 优先于 effort 生效）。
+    assert_eq!(
+        thinking
+            .get("thinking")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("disabled")
+    );
     assert_eq!(top_level_reasoning_effort, Some("high"));
     assert!(nested_reasoning.is_none());
 }
@@ -1696,9 +1717,9 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
         reasoning_content: None,
     }];
 
-    // 回归：OpenCode DeepSeek 默认会下发顶层 reasoning_effort，
-    // 此时请求体不会再带 `thinking` 对象；但历史 tool-call assistant
-    // 仍必须补齐空 reasoning_content，否则压缩后续写会稳定 400。
+    // 回归：OpenCode DeepSeek 始终下发 `thinking` 对象（disabled 时优先于顶层
+    // reasoning_effort 生效）；历史 tool-call assistant 仍必须补齐空
+    // reasoning_content，否则压缩后续写会稳定 400。
     normalize_reasoning_content_replay_for_model("deepseek-v4-flash-free-opencode", &mut messages);
     assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
 
@@ -1720,7 +1741,10 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
         value.get("reasoning_effort").and_then(|v| v.as_str()),
         Some("high")
     );
-    assert!(value.get("thinking").is_none());
+    assert_eq!(
+        value.pointer("/thinking/type").and_then(|v| v.as_str()),
+        Some("disabled")
+    );
     let echoed = value
         .get("messages")
         .and_then(|v| v.as_array())
@@ -1943,7 +1967,10 @@ fn alibaba_request_body_keeps_extension_flags() {
         value.get("enable_search").and_then(|v| v.as_bool()),
         Some(true)
     );
-    assert!(value.get("reasoning_effort").is_none());
+    assert_eq!(
+        value.get("reasoning_effort").and_then(|v| v.as_str()),
+        Some("high")
+    );
     assert!(value.get("reasoning").is_none());
 }
 

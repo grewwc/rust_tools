@@ -65,15 +65,15 @@ impl ThinkingDialect for EnableThinkingDialect {
 }
 
 /// DeepSeek（经 OpenCode Zen 网关）：`{"thinking": {"type": "enabled"|"disabled"}}`。
-/// DeepSeek 忽略 `enable_thinking`，只认这个对象。
-/// 但在 OpenCode 上若已走顶层 `reasoning_effort`，该对象必须省略，避免 wire 冲突。
+/// DeepSeek 原生忽略 `enable_thinking`，只认这个对象。网关实测（2026-08）：
+/// `thinking` 对象与顶层 `reasoning_effort` 可共存、无 wire 冲突；且
+/// `thinking:{"type":"disabled"}` 优先于任意 `reasoning_effort` 生效，是唯一
+/// 可靠的思考关闭开关。因此本方言始终下发 `thinking` 对象（顶层
+/// `reasoning_effort` 由请求层按 adapter 规则照常下发）。
 pub(in crate::ai) struct DeepSeekThinkingDialect;
 
 impl ThinkingDialect for DeepSeekThinkingDialect {
-    fn fields(&self, enable: bool, top_level_reasoning_effort: Option<&str>) -> Map<String, Value> {
-        if top_level_reasoning_effort.is_some() {
-            return Map::new();
-        }
+    fn fields(&self, enable: bool, _top_level_reasoning_effort: Option<&str>) -> Map<String, Value> {
         let kind = if enable { "enabled" } else { "disabled" };
         let mut map = Map::new();
         map.insert("thinking".to_string(), json!({ "type": kind }));
@@ -82,6 +82,12 @@ impl ThinkingDialect for DeepSeekThinkingDialect {
 
     fn requires_reasoning_content_echo(&self) -> bool {
         true
+    }
+
+    fn reasoning_effort_reduces_thinking(&self) -> bool {
+        // 网关实测：reasoning_effort 的 low/max 都保持思考开启、无分级差异，
+        // 思考是二元开关（thinking 对象）。截断重试降 effort 无效，必须直接关 thinking。
+        false
     }
 }
 

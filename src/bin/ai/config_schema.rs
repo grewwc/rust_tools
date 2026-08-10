@@ -133,8 +133,10 @@ impl AiConfig {
     pub const PROMPT_CACHE_SHOW_METRICS: &str = "ai.prompt_cache.show_metrics";
 
     // ── Output ─────────────────────────────────────────────
-    /// Thinking 流式输出在 terminal 中最多保留多少行可见窗口。默认 4。
-    /// 设为 0 可关闭折叠，恢复完整实时输出。仅影响终端展示，不影响模型上下文。
+    /// Thinking 流式输出在 terminal 中最多保留多少行可见窗口。默认 2：流式过程
+    /// 显示最近 2 行，思考结束时自动折叠为纯摘要，避免 thinking 尾部复述的结论
+    /// 与最终回答在终端重复。设为 0 显示完整实时输出；设为 N 显示最近 N 行。
+    /// 仅影响终端展示，不影响模型上下文。
     pub const OUTPUT_THINKING_MAX_VISIBLE_LINES: &str = "ai.output.thinking.max_visible_lines";
 
     // ── Token usage stats ──────────────────────────────────

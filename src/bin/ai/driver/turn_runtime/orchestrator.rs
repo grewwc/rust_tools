@@ -100,6 +100,14 @@ const PROGRESS_FREE_EXPLORE_ROUNDS: usize = 20;
 /// 此阈值只注入一次非阻断式广度检查，不把新目标判成无进展，避免压缩大型排查
 /// 任务的正当探索空间。
 const READ_ONLY_BREADTH_CHECK_TARGETS: usize = 32;
+/// 纯只读发散硬停阈值：本 turn 从未发生任何 mutation，却已累计触碰这么多个
+/// **不同**的只读目标仍未收口。`seen_targets` 是单调集合、全程不被任何 reset
+/// 清空，因此「累计不同只读目标数」与内容新颖度完全解耦——不会被「每轮换新目标 /
+/// 读到新字节复位常规无进展计数」绕过（这正是常规 soft→hard 阶梯对纯只读发散
+/// 失效的根因）。仅在零 mutation（纯调查）时作为最后一道刹车强制收口；任何
+/// 「读+改」任务都不受影响。取 `READ_ONLY_BREADTH_CHECK_TARGETS` 的 3 倍，给大型
+/// 只读排查留足空间，又远早于迭代硬上限。
+const READ_ONLY_BREADTH_HARD_STOP_TARGETS: usize = 96;
 /// 宽限窗口：软提示后，若模型给出了「实质不同的理由」（新目标 / reasoning 指纹
 /// 变化），则在该窗口内不升级，给它继续探索的空间。
 const PROGRESS_GRACE_WINDOW: usize = 6;
@@ -1477,6 +1485,9 @@ enum ToolLoopSignal {
     LowProgressHard,
     /// 已覆盖大量不同目标，提醒先汇总当前证据和唯一关键缺口。
     ReadOnlyBreadth,
+    /// 纯只读发散最后一道刹车：本 turn 零 mutation，却已累计触碰远超广度阈值的
+    /// 不同只读目标仍未收口。与内容新颖度解耦，切换无工具收口模式强制作答。
+    ReadOnlyBreadthHard,
 }
 
 /// Progress Budget 的运行时状态。挂在 `TurnSupervisor` 上，按「信息增益」而非
@@ -1501,6 +1512,11 @@ struct ProgressLedger {
     ledger_injected: bool,
     hard_injected: bool,
     read_only_breadth_injected: bool,
+    /// 本 turn 是否发生过任何 mutation 动作。一旦为真，纯只读发散硬停永久让路
+    /// （「读+改」任务不受该刹车约束）。单调置位，不被 reset 清除。
+    observed_mutation_this_turn: bool,
+    /// 纯只读发散硬停的一次性门（`ReadOnlyBreadthHard` 只触发一次）。
+    read_only_breadth_hard_injected: bool,
     /// 新的 low-progress episode 最早允许注入 soft 的迭代号。实质进展会重置当前
     /// episode，但保留该 cooldown，防止复杂任务被同一提示反复打断。
     next_episode_iteration: usize,
@@ -1779,6 +1795,24 @@ impl TurnSupervisor {
             }
             self.progress.consecutive_no_progress = 0;
             self.progress.last_reasoning_fp = reasoning_fp;
+            // 记录本 turn 是否发生过 mutation：一旦有过实质变更，纯只读发散硬停
+            // 永久让路（seen_targets 增长在「读+改」任务里是正常工作面，不该收口）。
+            if round_had_mutation {
+                self.progress.observed_mutation_this_turn = true;
+            }
+            // 纯只读发散最后一道刹车：本 turn 从未 mutation，却已累计触碰远超广度
+            // 阈值的不同只读目标仍未收口。`seen_targets` 单调、不被任何 reset 清空，
+            // 因此这条判据与「新目标/新字节复位常规无进展计数」完全解耦，是唯一能
+            // 兜住「持续换目标的纯调查发散」的信号。让位于普通 breadth 提示之后，
+            // 只触发一次并强制收口。
+            if !self.progress.read_only_breadth_hard_injected
+                && !self.progress.observed_mutation_this_turn
+                && self.iteration > free_explore_rounds
+                && self.progress.seen_targets.len() >= READ_ONLY_BREADTH_HARD_STOP_TARGETS
+            {
+                self.progress.read_only_breadth_hard_injected = true;
+                return ToolLoopSignal::ReadOnlyBreadthHard;
+            }
             if !self.progress.read_only_breadth_injected
                 && !round_had_mutation
                 && added_new_target
@@ -3418,6 +3452,78 @@ mod tests {
         assert_eq!(supervisor.progress.consecutive_no_progress, 0);
     }
 
+    /// 纯只读发散（零 mutation，持续换新目标读取）必须在累计目标数达到
+    /// `READ_ONLY_BREADTH_HARD_STOP_TARGETS` 时被强制收口——即便每轮都读到新目标
+    /// / 新字节而使常规无进展计数被反复复位。这条判据与内容新颖度解耦，是本次
+    /// 「诊断 agent 只读发散两小时不收口」事故的最终刹车。
+    #[test]
+    fn progress_budget_pure_readonly_divergence_hard_stops_after_breadth_ceiling() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let mut saw_hard_stop_at = None;
+        for i in 1..=(READ_ONLY_BREADTH_HARD_STOP_TARGETS + 4) {
+            supervisor.next_iteration();
+            // 每轮都读一个全新文件并拿到成功结果：既是新目标又是新证据，
+            // 常规 no-progress 计数始终为 0，只有解耦的广度硬停能兜住。
+            pb_successful_read_round(
+                &mut messages,
+                &format!("src/probe_{i}.rs"),
+                0,
+                &format!("tc-{i}"),
+                &format!("unique content for probe {i}"),
+            );
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            if matches!(signal, ToolLoopSignal::ReadOnlyBreadthHard) {
+                saw_hard_stop_at = Some(i);
+                break;
+            }
+        }
+        assert_eq!(
+            saw_hard_stop_at,
+            Some(READ_ONLY_BREADTH_HARD_STOP_TARGETS),
+            "pure read-only divergence must hard-stop exactly at the breadth ceiling"
+        );
+        assert_eq!(
+            supervisor.progress.consecutive_no_progress, 0,
+            "hard stop must be independent of the (reset-every-round) no-progress counter"
+        );
+    }
+
+    /// 一旦本 turn 发生过任何 mutation，广度硬停永久让路：正常「读大量文件 + 改」
+    /// 的实现型任务不受该刹车约束，避免劣化 agent 效果。
+    #[test]
+    fn progress_budget_breadth_hard_stop_never_fires_after_mutation() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        // 第 1 轮就做一次成功 mutation，置位 observed_mutation_this_turn。
+        supervisor.next_iteration();
+        messages.push(pb_apply_patch_msg("patch-1"));
+        messages.push(pb_tool_result(
+            "patch-1",
+            "Successfully patched src/lib.rs; +3 -1 (2 lines)",
+        ));
+        let _ = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(supervisor.progress.observed_mutation_this_turn);
+
+        // 随后大量只读探索远超硬停阈值，也绝不能触发 ReadOnlyBreadthHard。
+        for i in 1..=(READ_ONLY_BREADTH_HARD_STOP_TARGETS + 8) {
+            supervisor.next_iteration();
+            pb_successful_read_round(
+                &mut messages,
+                &format!("src/after_mut_{i}.rs"),
+                0,
+                &format!("rc-{i}"),
+                &format!("post-mutation probe {i}"),
+            );
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            assert!(
+                !matches!(signal, ToolLoopSignal::ReadOnlyBreadthHard),
+                "breadth hard-stop must never fire once a mutation happened this turn (round {i})"
+            );
+        }
+        assert!(!supervisor.progress.read_only_breadth_hard_injected);
+    }
+
     #[test]
     fn progress_budget_does_not_inject_readonly_breadth_after_mutation() {
         let mut supervisor = TurnSupervisor::default();
@@ -4965,6 +5071,20 @@ async fn run_turn_body(
                     "low-progress-hard-stop",
                 );
                 record_force_final_reason(&mut messages, "progress_no_progress", iteration);
+                force_final_response = true;
+            }
+            ToolLoopSignal::ReadOnlyBreadthHard => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "read-only breadth hard-stop: no mutation after wide investigation, switching to no-tool handoff",
+                );
+                inject_low_progress_hard_stop_note(&mut messages);
+                supervisor.maybe_inject_task_anchor(
+                    &mut messages,
+                    &question,
+                    "read-only-breadth-hard-stop",
+                );
+                record_force_final_reason(&mut messages, "read_only_breadth", iteration);
                 force_final_response = true;
             }
         }

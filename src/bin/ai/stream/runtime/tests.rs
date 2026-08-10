@@ -1342,6 +1342,41 @@ fn thinking_fold_window_counts_current_line_inside_visible_budget() {
 }
 
 #[test]
+fn thinking_fold_zero_window_is_pure_summary() {
+    // 0 行窗口 = 纯摘要：已完成的正文行与未完成行都不进入可见窗口。
+    // `finalize_fold` 在思考收尾时临时使用该语义，避免 thinking 尾部复述的
+    // 结论/问句与最终回答在终端重复显示（流式过程仍按 max_visible_lines 展示）。
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("COLUMNS", "200");
+    }
+
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.max_visible_lines = 0;
+    fold.total_lines = 3;
+    fold.recent_lines.push_back("line-1".to_string());
+    fold.recent_lines.push_back("line-2".to_string());
+    fold.recent_lines.push_back("line-3".to_string());
+    fold.current_line = "conclusion? 需要我帮你吗".to_string();
+
+    assert!(thinking_fold_visible_lines(fold).is_empty());
+
+    let (window, _) = render_thinking_fold_window(fold);
+    assert!(window.contains("earlier lines"));
+    assert!(!window.contains("line-1"));
+    assert!(!window.contains("line-2"));
+    assert!(!window.contains("line-3"));
+    assert!(!window.contains("conclusion"));
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
 fn thinking_fold_window_wraps_long_lines_to_terminal_width() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()

@@ -144,6 +144,20 @@ fn is_read_only_segment(tokens: &[String]) -> bool {
         "npm" | "pnpm" | "yarn" => matches!(subcommand, "test" | "check"),
         "make" => matches!(subcommand, "test" | "check"),
         "pytest" => true,
+        // `bytedcli` 是 ByteDance 内部平台 CLI（codebase/db/faas/log 等子命令
+        // 都是远端 API 查询/操作），默认不写本地项目文件，故按只读归类；
+        // 但 `--output`/`--output-dir`/`--manifest` 会显式写本地文件
+        // （如 `codebase mr artifacts download --output-dir ...`），必须视为变更。
+        "bytedcli" => {
+            !tokens.iter().any(|token| {
+                token == "--output"
+                    || token == "--output-dir"
+                    || token == "--manifest"
+                    || token.starts_with("--output=")
+                    || token.starts_with("--output-dir=")
+                    || token.starts_with("--manifest=")
+            })
+        }
         _ => false,
     }
 }
@@ -1608,6 +1622,40 @@ mod tests {
         call.function.arguments =
             r#"{"command":"git -c core.pager=cat --no-pager diff -- src","pty":false}"#.to_string();
         assert!(super::project_instruction_target_paths_from_tool_calls(&[call], false).is_empty());
+    }
+
+    #[test]
+    fn bytedcli_remote_queries_are_not_project_mutations() {
+        // bytedcli 只做远端 API 查询/操作，不应触发 completion 证据门禁的
+        // 项目变更判定，也不应推导出项目指令目标。
+        for command in [
+            "bytedcli codebase mr get -R \"byteapi/bytedcli\"",
+            "bytedcli --json codebase commit list -R \"byteapi/bytedcli\" --revision master",
+            "bytedcli codebase mr diff 42 -R \"byteapi/bytedcli\"",
+        ] {
+            let args = serde_json::json!({"command": command, "pty": false});
+            let effects = super::execute_command_segment_effects_for_args(&args);
+            assert!(!effects.is_empty(), "{command}");
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| !effect.mutation && !effect.project_mutation),
+                "bytedcli 远端查询不应被视为项目变更: {command}"
+            );
+        }
+
+        // `mr artifacts download` 显式写本地文件（--output-dir），
+        // 即使不经 shell 重定向也必须被识别为项目变更。
+        let args = serde_json::json!({
+            "command": "bytedcli codebase mr artifacts download -R \"byteapi/bytedcli\" 42 --output-dir ./artifacts",
+            "pty": false
+        });
+        let effects = super::execute_command_segment_effects_for_args(&args);
+        assert!(effects.iter().any(|effect| effect.mutation));
+        assert!(
+            effects.iter().any(|effect| effect.project_mutation),
+            "bytedcli 显式输出到项目目录仍应视为项目变更"
+        );
     }
 
     #[test]
