@@ -836,6 +836,31 @@ fn clamp_ignores_stale_high_known_prompt_after_compression() {
 }
 
 #[test]
+fn deepseek_v4_flash_short_prompt_keeps_declared_output_budget() {
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    // 若回退到 strong tier 的 200K 窗口，此处会被压到约 198K；1M 窗口下应保留
+    // DeepSeek V4 Flash 声明的完整补全预算。
+    for model in [
+        "deepseek-v4-flash-opencode",
+        "deepseek-v4-flash-0731-alibaba",
+    ] {
+        let model_max = super::super::models::max_output_tokens(model).unwrap();
+        assert_eq!(
+            clamp_max_tokens_for_prompt(model, &messages, None, model_max, None),
+            model_max,
+            "{model}"
+        );
+    }
+}
+
+#[test]
 fn build_request_body_sends_provider_model_name_for_key_handle() {
     let messages = vec![Message {
         role: "user".to_string(),

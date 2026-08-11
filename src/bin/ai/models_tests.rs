@@ -306,6 +306,19 @@ fn model_key_selects_duplicate_name_provider() {
 }
 
 #[test]
+fn deepseek_v4_flash_routes_declare_full_context_budget() {
+    // DeepSeek V4 Flash 的 393,216 输出上限需要 1M 上下文窗口配合；不能回退到
+    // strong tier 的 200K 保守默认值，否则 builder 会过早压缩 max_tokens。
+    for key in [
+        "deepseek-v4-flash-opencode",
+        "deepseek-v4-flash-0731-alibaba",
+    ] {
+        assert_eq!(context_window_tokens(key), 1_000_000, "{key}");
+        assert_eq!(max_output_tokens(key), Some(393_216), "{key}");
+    }
+}
+
+#[test]
 fn platform_changes_model_handle_but_legacy_adapter_handle_still_resolves() {
     let volcano = "glm-5.2-volcano";
     let def = super::model_names::find_by_identifier(volcano)
