@@ -515,6 +515,8 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
                     super::super::iteration::execute_command_segment_effects_for_args(&args)
                 })
                 .unwrap_or_default();
+            let output_confirms_behavior_check =
+                behavior_check_output_confirms_success(&message.content);
             for effect in effects {
                 let had_mutation = state.successful_mutation;
                 if effect.project_mutation {
@@ -524,7 +526,8 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
                     state.successful_post_mutation_behavior_check = false;
                 }
                 if had_mutation
-                    && effect.success_guaranteed
+                    && (effect.success_guaranteed
+                        || (effect.behavior_check && output_confirms_behavior_check))
                     && (effect.scope_review || effect.behavior_check)
                 {
                     state.successful_post_mutation_verification = true;
@@ -541,6 +544,22 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
     }
 
     state
+}
+
+fn behavior_check_output_confirms_success(content: &serde_json::Value) -> bool {
+    let text = content.as_str().unwrap_or_default().to_ascii_lowercase();
+    if text.contains("test result: failed")
+        || text.contains("\nfailures:")
+        || text.contains("error:")
+        || text.contains("error[")
+        || text.contains("could not compile")
+    {
+        return false;
+    }
+
+    text.contains("test result: ok")
+        || (text.contains("finished") && text.contains("target(s)"))
+        || text.contains("all tests passed")
 }
 
 pub(in crate::ai::driver::turn_runtime) fn completion_tool_result_succeeded(
@@ -4853,6 +4872,99 @@ mod tests {
                     .as_str()
                     .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER))
         }));
+    }
+
+    #[test]
+    fn completion_evidence_gate_accepts_piped_check_with_success_sentinel() {
+        let command = "cargo test --bin a replayed_content_part_added 2>&1 | tail -6";
+        let mutation = test_tool_call(
+            "call_write",
+            "write_file",
+            serde_json::json!({ "file_path": "/tmp/project/lib.rs", "content": "new" }),
+        );
+        let verification = test_tool_call(
+            "call_check",
+            "execute_command",
+            serde_json::json!({ "command": command }),
+        );
+        let args = serde_json::json!({ "command": command });
+        let effects =
+            super::super::super::iteration::execute_command_segment_effects_for_args(&args);
+        assert!(
+            effects.iter().any(|effect| effect.behavior_check),
+            "expected behavior check effect for {command:?}: {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| effect.project_mutation && !effect.behavior_check),
+            "non-check segment must not reset verification after the check: {effects:?}"
+        );
+        let turn_messages = vec![
+            assistant_tool_call_message(mutation),
+            tool_result_message("call_write", "Successfully wrote to /tmp/project/lib.rs"),
+            assistant_tool_call_message(verification),
+            tool_result_message(
+                "call_check",
+                "running 1 test\n\
+                 test ai::stream::runtime::tests::replayed_content_part_added_does_not_duplicate_visible_text ... ok\n\n\
+                 test result: ok. 1 passed; 0 failed; 0 ignored; 1748 filtered out; finished in 0.00s",
+            ),
+        ];
+        assert!(behavior_check_output_confirms_success(
+            &turn_messages[3].content
+        ));
+        let evidence = completion_evidence_state(&turn_messages);
+        assert!(evidence.successful_mutation);
+        assert!(evidence.successful_post_mutation_verification);
+        let mut messages = turn_messages.clone();
+
+        assert_eq!(
+            completion_evidence_gate_action(
+                &mut messages,
+                &turn_messages,
+                "Implemented and verified.",
+                false,
+                2,
+                16,
+            ),
+            CompletionEvidenceGateAction::Allow
+        );
+    }
+
+    #[test]
+    fn completion_evidence_gate_rejects_piped_check_without_success_sentinel() {
+        let mutation = test_tool_call(
+            "call_write",
+            "write_file",
+            serde_json::json!({ "file_path": "/tmp/project/lib.rs", "content": "new" }),
+        );
+        let verification = test_tool_call(
+            "call_check",
+            "execute_command",
+            serde_json::json!({
+                "command": "cargo check --bin a 2>&1 | tail -5"
+            }),
+        );
+        let turn_messages = vec![
+            assistant_tool_call_message(mutation),
+            tool_result_message("call_write", "Successfully wrote to /tmp/project/lib.rs"),
+            assistant_tool_call_message(verification),
+            tool_result_message("call_check", "error[E0425]: cannot find value `x` in this scope"),
+        ];
+        let mut messages = turn_messages.clone();
+
+        assert_eq!(
+            completion_evidence_gate_action(
+                &mut messages,
+                &turn_messages,
+                "Implemented and verified.",
+                false,
+                2,
+                16,
+            ),
+            CompletionEvidenceGateAction::Reopen
+        );
     }
 
     #[test]

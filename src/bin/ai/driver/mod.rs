@@ -1069,6 +1069,7 @@ async fn run_loop(
                 .scope(
                     image_parse_ctx,
                     crate::ai::driver::model::parse_attached_images_via_subagent(
+                        mcp_client,
                         &app.attached_image_files,
                     ),
                 )

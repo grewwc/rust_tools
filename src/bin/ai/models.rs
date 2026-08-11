@@ -131,6 +131,14 @@ pub(super) fn reasoning_content_replay_enabled(model: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 该模型的推理链是否内联在 `content` 通道里（预填 `<think>` 模板），需要流式层
+/// 用悬空的 `</think>` 把泄漏的推理拆回 reasoning。缺省关闭。
+pub(super) fn reasoning_in_content_enabled(model: &str) -> bool {
+    model_def(model)
+        .map(|m| m.reasoning_in_content)
+        .unwrap_or(false)
+}
+
 pub(super) fn model_adapter(model: &str) -> ApiProvider {
     model_def(model).map(|m| m.adapter).unwrap_or_default()
 }

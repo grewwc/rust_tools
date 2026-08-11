@@ -83,6 +83,15 @@ pub struct ModelDef {
     /// 的协议不同；缺省关闭，避免无关模型累积或泄露隐藏推理文本。
     #[serde(default)]
     pub reasoning_content_replay: bool,
+    /// 可选：该模型的推理链是否内联在 `content` 通道里，而非独立的
+    /// `reasoning_content` 字段。少数 reasoner 网关（实测 volcano ark `/coding`
+    /// 端点的 deepseek-v4 / glm 系列）采用「预填 `<think>`」对话模板：思考文本
+    /// 直接写进 `content`，整段仅以一个悬空的 `</think>` 收尾，从不产生
+    /// `reasoning_content`。开启后，流式层会在 content 通道用 `</think>` 把泄漏的
+    /// 推理链拆回 reasoning，避免思考链与正式答案一起落进可见正文（表现为“最终
+    /// 答案输出两遍”）。缺省关闭：未声明的模型行为完全不变。
+    #[serde(default)]
+    pub reasoning_in_content: bool,
     /// 子 agent 模型选择优先级（越大越优先）。同 tier 内按此值降序排列。
     /// 缺省为 0，用户可在 ~/.config/rust_tools/models.json 中覆盖以调整偏好，
     /// 无需重新编译。

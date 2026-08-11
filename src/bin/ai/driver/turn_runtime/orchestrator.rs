@@ -4345,7 +4345,7 @@ pub(in crate::ai::driver) async fn run_turn(
     // 子 agent 尚未进入递归 turn 前处理，才能复用 task 的隔离与证据生命周期。
     if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
         if let Some(command) = crate::ai::driver::commands::audit::parse_audit_command(&question) {
-            return Ok(execute_audit_command(command, should_quit));
+            return Ok(execute_audit_command(app, command, should_quit));
         }
     }
     // 把 (session_id, turn_id) 注入 task_local，让下游工具调用与反馈
@@ -4384,29 +4384,54 @@ pub(in crate::ai::driver) async fn run_turn(
 }
 
 fn execute_audit_command(
+    app: &App,
     command: crate::ai::driver::commands::audit::AuditCommand,
     should_quit: bool,
 ) -> TurnOutcome {
     match command {
         crate::ai::driver::commands::audit::AuditCommand::Usage => {
-            println!("Usage: /audit <instruction>");
+            println!("Usage: /audit [--fast] <instruction>");
+            println!("  --fast  快速审计：当前会话模型 + high 思考 + 更少步数 + 更短超时，适合轻量复查");
         }
-        crate::ai::driver::commands::audit::AuditCommand::Run(instruction) => {
+        crate::ai::driver::commands::audit::AuditCommand::Run { instruction, fast } => {
             // 默认只继承 cwd/skills，避免把无关的父对话和 memory 带入审计任务。
             // 但子代理完全看不到父对话，必须显式告知 main agent 当前改了什么：
             // 经常多个需求并行改动，子代理只有看到当前工作区 diff 才能判断哪些属于本次审计。
             let prompt = crate::ai::driver::commands::audit::build_audit_prompt(&instruction);
-            let description = format!("/audit {instruction}");
-            let args = serde_json::json!({
+            let description = if fast {
+                format!("/audit --fast {instruction}")
+            } else {
+                format!("/audit {instruction}")
+            };
+            // fast 模式：audit-fast agent（更少步数）承载轻量审计契约，模型固定用
+            // 当前会话模型（绕过 prompt 难度分类对 tier 的自动抬升），thinking 固定
+            // high；超时同步缩短。
+            let agent_name = if fast { "audit-fast" } else { "audit" };
+            let (hard_timeout, wrap_up_lead_time) = if fast {
+                (
+                    crate::ai::driver::commands::audit::FAST_AUDIT_SUBAGENT_HARD_TIMEOUT,
+                    Some(crate::ai::driver::commands::audit::FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME),
+                )
+            } else {
+                (
+                    crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
+                    Some(crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME),
+                )
+            };
+            let mut args = serde_json::json!({
                 "description": description,
                 "prompt": prompt,
-                "agent": "audit",
+                "agent": agent_name,
             });
+            if fast {
+                args["model"] = serde_json::Value::String(app.current_model.clone());
+                args["reasoning_effort"] = serde_json::Value::String("high".to_string());
+            }
             match crate::ai::driver::tools::execute_direct_subagent_task(
                 "slash-audit",
                 &args,
-                crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
-                Some(crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME),
+                hard_timeout,
+                wrap_up_lead_time,
             ) {
                 Ok(result) => println!(
                     "\n{}",

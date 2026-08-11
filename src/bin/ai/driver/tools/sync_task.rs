@@ -186,6 +186,37 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     })?;
 
     let mut task_app = ctx.app_proto.clone();
+    // 驱动内部分派可选参数（模型调用的 task 工具 schema 不含这两个字段，不会命中）：
+    // - `image_files`：把图片直接附加到子代理首条 user 消息，让 VL 模型第一轮就看到
+    //   图，省掉「先 read_file、再在下一轮重复附加 base64」的冗余往返；
+    // - `reasoning_effort`：压低纯转录等简单子任务的思考档位（如图片解析用 minimal）。
+    if let Some(images) = args.get("image_files").and_then(|v| v.as_array()) {
+        task_app.attached_image_files = images
+            .iter()
+            .filter_map(|v| v.as_str())
+            // build_content 用原始路径 fs::read，不解析 cwd；把相对路径按 effective_cwd
+            // 转绝对，与原 read_file 流程的解析语义保持一致，避免 CWD 错位打不开图。
+            .map(|s| {
+                let p = std::path::Path::new(s);
+                if p.is_absolute() {
+                    s.to_string()
+                } else {
+                    crate::ai::driver::runtime_ctx::effective_cwd()
+                        .unwrap_or_default()
+                        .join(p)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            })
+            .collect();
+    }
+    if let Some(level) = args
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .and_then(crate::ai::provider::ReasoningEffort::parse)
+    {
+        task_app.cli.reasoning_effort_override = Some(Some(level));
+    }
     // 关键：子 agent 不再与父 agent 共享 shutdown/streaming/cancel_stream 标志。
     // 共享会让一次针对子 agent 的 Ctrl+C 误置全局 shutdown、连带关掉主 agent
     // （子 agent 卡在静默 prepare 阶段、streaming=false 时尤甚）。给它一组全新的

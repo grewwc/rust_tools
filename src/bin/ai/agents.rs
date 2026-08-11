@@ -29,6 +29,7 @@ use crate::commonw::{configw, utils::expanduser};
 const BUILTIN_AGENTS: &[(&str, &str)] = &[
     ("build.agent", include_str!("builtin_agents/build.agent")),
     ("audit.agent", include_str!("builtin_agents/audit.agent")),
+    ("audit-fast.agent", include_str!("builtin_agents/audit-fast.agent")),
 ];
 const PROJECT_INSTRUCTION_FILENAMES: &[&str] = &[
     "AGENTS.md",

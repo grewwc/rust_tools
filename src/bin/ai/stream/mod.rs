@@ -6,6 +6,7 @@ mod render;
 mod runtime;
 mod splitter;
 mod state;
+mod think_demux;
 
 pub(in crate::ai) use normalize::try_parse_stream_chunk_loose;
 pub(super) use render::markdown::MarkdownStreamRenderer;

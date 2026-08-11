@@ -36,6 +36,11 @@ pub(crate) struct ShellSegment {
     pub(crate) join: ShellJoin,
 }
 
+fn ampersand_is_redirection_operator(bytes: &[u8], index: usize) -> bool {
+    (index > 0 && matches!(bytes[index - 1], b'>' | b'<'))
+        || (index + 1 < bytes.len() && bytes[index + 1] == b'>')
+}
+
 /// 以 unquoted 的 `&&` / `||` / `;` / `|` / `\n` 为分隔符，把整条命令拆成
 /// 独立段。单/双引号内的分隔符不会触发拆分；单引号 heredoc body 内的换行也会
 /// 被跳过（heredoc body 内容是字面量，不应被拆分逻辑消费）。
@@ -124,6 +129,10 @@ pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment
                 push_current(&mut segments, &mut current, current_join);
                 current_join = ShellJoin::Other;
                 i += 2;
+            }
+            b'&' if ampersand_is_redirection_operator(bytes, i) => {
+                current.push('&');
+                i += 1;
             }
             // 单字符分隔符
             b';' | b'|' | b'&' => {
@@ -1693,6 +1702,26 @@ mod tests {
                 "d".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn split_preserves_fd_duplication_redirections() {
+        let segments =
+            split_unquoted_command_segments("cargo test --bin a 2>&1 | tail -6 && echo done");
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| (segment.command.as_str(), segment.join))
+                .collect::<Vec<_>>(),
+            vec![
+                ("cargo test --bin a 2>&1", ShellJoin::Start),
+                ("tail -6", ShellJoin::Other),
+                ("echo done", ShellJoin::And),
+            ]
+        );
+
+        let segs = split_unquoted_segments("cmd &>out && cat out");
+        assert_eq!(segs, vec!["cmd &>out".to_string(), "cat out".to_string()]);
     }
 
     #[test]

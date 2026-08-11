@@ -8,6 +8,13 @@ pub(crate) const AUDIT_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(15 
 /// 工作产物丢失。5 分钟让收口信号能在请求中途打断并强制产出最终结论。
 pub(crate) const AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(5 * 60);
 
+/// `/audit --fast` 的硬超时：当前会话模型 + high 思考 + 步数受限，正常一轮快速
+/// 审计几分钟内应能完成；8 分钟硬超时兜底，避免长时间占用前台。
+pub(crate) const FAST_AUDIT_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(8 * 60);
+/// 快速审计的收口预留：3 分钟足够在请求中途打断并产出最终结论，
+/// 同时保留同步 task 的收口保护语义。
+pub(crate) const FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(3 * 60);
+
 const SUBAGENT_FINAL_ANSWER_MARKER: &str = "[Subagent final answer]\n";
 const AUDIT_PROGRESS_PROTOCOL: &str = "===== 审计增量交付协议 =====\n\
 每完成一个独立检查分支，必须在继续调用工具前输出一条以 `AUDIT_CHECKPOINT:` 开头的简短进度记录，包含：已检查范围、带 file:line 的阶段性发现、仍待验证的问题。\n\
@@ -19,7 +26,7 @@ const AUDIT_PROGRESS_PROTOCOL: &str = "===== 审计增量交付协议 =====\n\
 /// 实际执行由 turn_runtime 在进入模型循环前完成。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuditCommand {
-    Run(String),
+    Run { instruction: String, fast: bool },
     Usage,
 }
 
@@ -41,9 +48,39 @@ pub(crate) fn parse_audit_command(input: &str) -> Option<AuditCommand> {
     let instruction = remainder.trim();
     if instruction.is_empty() {
         Some(AuditCommand::Usage)
+    } else if let Some(rest) = strip_fast_flag(instruction) {
+        if rest.is_empty() {
+            // `/audit --fast` 单独出现：没有要审计的指令，同样按用法提示处理。
+            Some(AuditCommand::Usage)
+        } else {
+            Some(AuditCommand::Run {
+                instruction: rest.to_string(),
+                fast: true,
+            })
+        }
     } else {
-        Some(AuditCommand::Run(instruction.to_string()))
+        Some(AuditCommand::Run {
+            instruction: instruction.to_string(),
+            fast: false,
+        })
     }
+}
+
+/// 识别指令开头的 `--fast` / `-f` 快速模式标志；不是标志则返回 None。
+fn strip_fast_flag(instruction: &str) -> Option<&str> {
+    let rest = instruction
+        .strip_prefix("--fast")
+        .or_else(|| instruction.strip_prefix("-f"))?;
+    // 标志必须是完整单词：`--fast` 后跟空白才剥离，`--fastly` 之类不动。
+    if instruction.len() != rest.len()
+        && rest
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace())
+    {
+        return None;
+    }
+    Some(rest.trim_start())
 }
 
 /// 同步 `/audit` 的完整 payload 会作为主 agent 的证据持久化；终端只显示子代理的
@@ -341,6 +378,7 @@ mod tests {
 
     use super::{
         AUDIT_SUBAGENT_HARD_TIMEOUT, AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME, AuditCommand,
+        FAST_AUDIT_SUBAGENT_HARD_TIMEOUT, FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
         compose_audit_prompt, diff_snippet, format_mutation_log, parse_audit_command,
         terminal_audit_result,
     };
@@ -359,14 +397,64 @@ mod tests {
     }
 
     #[test]
+    fn fast_audit_shorter_timeouts_than_full_audit() {
+        assert!(FAST_AUDIT_SUBAGENT_HARD_TIMEOUT < AUDIT_SUBAGENT_HARD_TIMEOUT);
+        assert!(
+            FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME < AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME
+        );
+    }
+
+    #[test]
     fn parse_audit_command_recognizes_instruction_and_alias() {
         assert_eq!(
             parse_audit_command("/audit review the current diff"),
-            Some(AuditCommand::Run("review the current diff".to_string()))
+            Some(AuditCommand::Run {
+                instruction: "review the current diff".to_string(),
+                fast: false,
+            })
         );
         assert_eq!(
             parse_audit_command(":audit inspect src/bin/a.rs"),
-            Some(AuditCommand::Run("inspect src/bin/a.rs".to_string()))
+            Some(AuditCommand::Run {
+                instruction: "inspect src/bin/a.rs".to_string(),
+                fast: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_audit_command_recognizes_fast_flag() {
+        assert_eq!(
+            parse_audit_command("/audit --fast review the diff"),
+            Some(AuditCommand::Run {
+                instruction: "review the diff".to_string(),
+                fast: true,
+            })
+        );
+        assert_eq!(
+            parse_audit_command("/audit -f check src/lib.rs"),
+            Some(AuditCommand::Run {
+                instruction: "check src/lib.rs".to_string(),
+                fast: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_audit_command_fast_flag_without_instruction_is_usage() {
+        assert_eq!(parse_audit_command("/audit --fast"), Some(AuditCommand::Usage));
+        assert_eq!(parse_audit_command("/audit -f  "), Some(AuditCommand::Usage));
+    }
+
+    #[test]
+    fn parse_audit_command_does_not_confuse_fast_prefix_with_word() {
+        // `--fastly` 不是标志；指令原样保留。
+        assert_eq!(
+            parse_audit_command("/audit --fastly failing path"),
+            Some(AuditCommand::Run {
+                instruction: "--fastly failing path".to_string(),
+                fast: false,
+            })
         );
     }
 

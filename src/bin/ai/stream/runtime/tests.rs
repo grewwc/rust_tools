@@ -47,6 +47,7 @@ fn idle_timeout_discards_unconfirmed_tool_call_and_marks_stream_error() {
     let mut app = test_app();
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
+    let mut current_history = String::new();
     state.content.stream_idle_timed_out = true;
     state.content.tool_calls_map.insert(
         0,
@@ -59,7 +60,7 @@ fn idle_timeout_discards_unconfirmed_tool_call_and_marks_stream_error() {
         },
     );
 
-    let result = finalize_stream_response(&mut app, &markers, state).unwrap();
+    let result = finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
 
     assert_eq!(result.outcome, StreamOutcome::Truncated);
     assert!(result.stream_error);
@@ -120,7 +121,7 @@ fn thinking_fold_defaults_to_configured_lines_for_tty() {
 }
 
 #[test]
-fn subagent_preview_suppresses_thinking_markers_and_reuses_visible_text() {
+fn stream_text_event_to_content_ignores_thinking_events() {
     let mut markers = StreamMarkers::new();
     markers.enable_subagent_preview("build");
 
@@ -140,7 +141,7 @@ fn subagent_preview_suppresses_thinking_markers_and_reuses_visible_text() {
             StreamEventMergeMode::Append,
             "",
         ),
-        Some("step one".to_string())
+        None
     );
     assert_eq!(
         stream_text_event_to_content(
@@ -702,6 +703,59 @@ fn response_completed_event_does_not_block_late_snapshot_text() {
 }
 
 #[test]
+fn replayed_content_part_added_does_not_duplicate_visible_text() {
+    // 用户可见"结论输出两遍"：兼容网关把 content_part.added（output_text）的
+    // 全量文本在 output_text.delta 增量之后再次下发。Append 模式原样渲染会
+    // 重复正文；ReplayedChunk 应对 content 计算未见后缀后只渲染新增部分。
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    // 1) delta 增量先渲染部分正文
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"修复完成"}"#,
+    )
+    .unwrap();
+    assert_eq!(state.content.assistant_text, "修复完成");
+
+    // 2) content_part.added 重发该 part 的完整文本（协议多路径下发）
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.content_part.added"),
+        r#"{"part":{"type":"output_text","text":"修复完成，验证通过。"}}"#,
+    )
+    .unwrap();
+    // 已见前缀被吞掉，只追加未见后缀
+    assert_eq!(state.content.assistant_text, "修复完成，验证通过。");
+    assert_eq!(current_history, "修复完成，验证通过。");
+
+    // 3) 再次重发完全相同文本：完全重叠，不再追加
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.content_part.added"),
+        r#"{"part":{"type":"output_text","text":"修复完成，验证通过。"}}"#,
+    )
+    .unwrap();
+    assert_eq!(state.content.assistant_text, "修复完成，验证通过。");
+    assert_eq!(current_history, "修复完成，验证通过。");
+}
+
+#[test]
 fn stream_payload_meaningful_progress_includes_new_reasoning_chunks() {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
@@ -797,6 +851,31 @@ fn stream_payload_meaningful_progress_includes_new_reasoning_chunks() {
     .unwrap();
     assert!(finish_reason.meaningful_progress);
     assert_eq!(state.content.finish_reason_value.as_deref(), Some("stop"));
+}
+
+#[test]
+fn repeated_reasoning_deltas_preserve_model_output() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    for _ in 0..2 {
+        let outcome = process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            Some("response.reasoning_summary_text.delta"),
+            r#"{"delta":"same step"}"#,
+        )
+        .unwrap();
+        assert!(outcome.meaningful_progress);
+    }
+
+    assert_eq!(state.content.reasoning_text, "same stepsame step");
+    assert!(current_history.is_empty());
 }
 
 #[tokio::test]
@@ -1070,8 +1149,9 @@ fn inline_tool_call_fallback_does_not_persist_protocol_as_hidden_meta() {
     let mut state = StreamProcessingState::new();
     state.content.assistant_text = REPORTED_FULLWIDTH_DSML_TOOL_CALL.to_string();
     let mut app = test_app();
+    let mut current_history = String::new();
 
-    let result = finalize_stream_response(&mut app, &markers, state).unwrap();
+    let result = finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
 
     assert_eq!(result.outcome, StreamOutcome::ToolCall);
     assert_eq!(result.tool_calls.len(), 1);
@@ -2172,4 +2252,231 @@ fn recover_inline_tool_calls_normalizes_fullwidth_dsml_prefix() {
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
     assert_eq!(args["file_path"], "/tmp/x");
     assert_eq!(args["patch"], "---");
+}
+
+/// 复现 session bc1f2e88 故障：预填 `<think>` 模板的 reasoner 把推理链写进 content
+/// 通道、仅以悬空 `</think>` 收尾。arm 拆分器后，`</think>` 之前的泄漏推理必须进入
+/// reasoning_text（渲染进 thinking 折叠），只有 `</think>` 之后的正式答案才进
+/// assistant_text，杜绝“最终答案输出两遍”。
+#[test]
+fn armed_demuxer_splits_leaked_reasoning_from_visible_content() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.content.content_think_demuxer.arm();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    // 推理链跨多个 content chunk 到达，其中 `</think>` 被切在 chunk 边界上。
+    for payload in [
+        r#"{"choices":[{"delta":{"content":"Let me consolidate. "}}]}"#,
+        r#"{"choices":[{"delta":{"content":"I have enough evidence.</thi"}}]}"#,
+        r#"{"choices":[{"delta":{"content":"nk>## 结论\n不是 bug。"}}]}"#,
+    ] {
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            provider::openai_adapter(),
+            None,
+            payload,
+        )
+        .unwrap();
+    }
+
+    // `</think>` 之后的正式答案是唯一的可见正文；推理链不得泄漏进 assistant_text。
+    assert_eq!(state.content.assistant_text, "## 结论\n不是 bug。");
+    assert!(!state.content.assistant_text.contains("Let me consolidate"));
+    assert!(!state.content.assistant_text.contains("</think>"));
+    // 泄漏的推理被拆回 reasoning 通道。
+    assert!(
+        state
+            .content
+            .reasoning_text
+            .contains("Let me consolidate. I have enough evidence.")
+    );
+}
+
+#[test]
+fn demuxer_buffered_content_counts_as_stream_progress() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.content.content_think_demuxer.arm();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    let outcome = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        r#"{"choices":[{"delta":{"content":"long reasoning without close yet"}}]}"#,
+    )
+    .unwrap();
+
+    assert!(outcome.meaningful_progress);
+    assert!(state.content.assistant_text.is_empty());
+    assert!(state.content.reasoning_text.is_empty());
+}
+
+#[test]
+fn demuxer_flush_without_close_tag_commits_visible_content() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.content.content_think_demuxer.arm();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        r#"{"choices":[{"delta":{"content":"visible fallback without close"}}]}"#,
+    )
+    .unwrap();
+    assert!(state.content.assistant_text.is_empty());
+
+    let result = finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
+
+    assert_eq!(result.assistant_text, "visible fallback without close");
+    assert_eq!(current_history, "visible fallback without close");
+}
+
+#[test]
+fn replayed_content_part_after_demux_close_does_not_replay_reasoning_prefix() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.content.content_think_demuxer.arm();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        r#"{"choices":[{"delta":{"content":"reasoning</think>answer"}}]}"#,
+    )
+    .unwrap();
+    assert_eq!(state.content.assistant_text, "answer");
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.content_part.added"),
+        r#"{"part":{"type":"output_text","text":"reasoning</think>answer"}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(state.content.assistant_text, "answer");
+    assert_eq!(current_history, "answer");
+    assert_eq!(state.content.reasoning_text, "reasoning");
+}
+
+#[test]
+fn output_text_snapshot_after_demux_close_does_not_replay_reasoning_prefix() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.content.content_think_demuxer.arm();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"reasoning</think>answer"}"#,
+    )
+    .unwrap();
+    assert_eq!(state.content.assistant_text, "answer");
+
+    let snapshot = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.done"),
+        r#"{"text":"reasoning</think>answer"}"#,
+    )
+    .unwrap();
+
+    assert!(!snapshot.meaningful_progress);
+    assert_eq!(state.content.assistant_text, "answer");
+    assert_eq!(current_history, "answer");
+    assert_eq!(state.content.reasoning_text, "reasoning");
+}
+
+#[test]
+fn output_text_snapshot_can_finish_a_partially_streamed_demux_capture() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.content.content_think_demuxer.arm();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"reasoning"}"#,
+    )
+    .unwrap();
+    assert!(state.content.assistant_text.is_empty());
+
+    let snapshot = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.done"),
+        r#"{"text":"reasoning</think>answer"}"#,
+    )
+    .unwrap();
+
+    assert!(snapshot.meaningful_progress);
+    assert_eq!(state.content.assistant_text, "answer");
+    assert_eq!(current_history, "answer");
+    assert_eq!(state.content.reasoning_text, "reasoning");
+}
+
+/// 反向断言：未 arm 的普通模型（走独立 reasoning_content 字段）行为完全不变——
+/// content 里即便出现字面量 `</think>` 也原样落进可见正文，绝不被吞。
+#[test]
+fn unarmed_demuxer_leaves_content_untouched() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        r#"{"choices":[{"delta":{"content":"see </think> literal"}}]}"#,
+    )
+    .unwrap();
+
+    assert_eq!(state.content.assistant_text, "see </think> literal");
+    assert!(state.content.reasoning_text.is_empty());
 }

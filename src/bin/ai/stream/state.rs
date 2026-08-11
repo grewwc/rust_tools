@@ -14,6 +14,7 @@ use super::{
         AnthropicXmlToolCallStreamer, BareXmlToolCallStreamer, HermesXmlToolCallStreamer,
         InternalToolCallStreamer, StreamSplitter,
     },
+    think_demux::ContentThinkDemuxer,
 };
 
 pub(super) const THINKING_TAG_TEXT: &str = "╭─ thinking";
@@ -233,6 +234,11 @@ pub(super) struct StreamContentState {
     pub(super) saw_reasoning_output: bool,
     pub(super) tool_calls_map: SkipMap<usize, ToolCallBuilder>,
     pub(super) assistant_text: String,
+    /// content 通道已消费过的原始文本（先于 think demux）。Responses 兼容网关会把
+    /// `output_text.delta` 已经流过的 part 再通过 `content_part.added` 全量重发；
+    /// 这里按原始 content 去重，避免 demux 关闭后把完整 `<think>...</think>正文`
+    /// 当成新正文再次追加。
+    pub(super) content_replay_text: String,
     pub(super) hidden_meta: String,
     /// 累积模型返回的 reasoning_content 原文（不含展示用的 thinking 标记），
     /// 终轮结束后通过 StreamResult 透传给 history，
@@ -249,6 +255,10 @@ pub(super) struct StreamContentState {
     pub(super) bare_xml_tool_call_streamer: BareXmlToolCallStreamer,
     /// 有状态命名空间 marker 归一化器：跨 chunk 复原被截断的 `<｜｜DSML｜｜…>`。
     pub(super) inline_markup_normalizer: InlineMarkupNormalizer,
+    /// 把内联在 content 通道里的推理链（预填 `<think>` 模板）用悬空 `</think>`
+    /// 拆回 reasoning。默认直通（未 arm 的模型零影响）；仅对声明
+    /// `reasoning_in_content` 的模型在 `stream_response` 里 arm。
+    pub(super) content_think_demuxer: ContentThinkDemuxer,
 }
 
 impl StreamContentState {
@@ -263,6 +273,7 @@ impl StreamContentState {
             saw_reasoning_output: false,
             tool_calls_map: SkipMap::default(),
             assistant_text: String::new(),
+            content_replay_text: String::new(),
             hidden_meta: String::new(),
             reasoning_text: String::new(),
             reasoning_items: Vec::new(),
@@ -273,6 +284,7 @@ impl StreamContentState {
             anthropic_tool_call_streamer: AnthropicXmlToolCallStreamer::new(),
             bare_xml_tool_call_streamer: BareXmlToolCallStreamer::new(),
             inline_markup_normalizer: InlineMarkupNormalizer::new(),
+            content_think_demuxer: ContentThinkDemuxer::new(),
         }
     }
 }
@@ -294,6 +306,11 @@ pub(in crate::ai) enum ParsedStreamPayload {
     Ignore,
     Done,
     Chunk(StreamChunk),
+    /// content_part.added（output_text 类型）携带的是该 part 当前已存在的完整文本，
+    /// 与 output_text.delta 增量重叠，属于协议多路径重发而非模型新增内容。
+    /// 按增量格式解析（think_demux 拆分等仍生效），但流层会对 content 额外做
+    /// 未见后缀去重，避免正文跨事件路径重复渲染。
+    ReplayedChunk(StreamChunk),
     SnapshotChunk(StreamChunk),
     /// Responses 协议返回的完整 `reasoning` output item（含 `id` /
     /// `encrypted_content` / `summary`）。用于同 turn 工具链回放：原样透传给

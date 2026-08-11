@@ -242,6 +242,14 @@ fn parse_content_part_event(
             "", &text,
         )));
     }
+    if event_type.ends_with(".added") {
+        // output_text 类型的 content_part.added 同样是协议重发：携带该 part 当前
+        // 已存在的完整文本，与 output_text.delta 增量重叠。按增量格式解析但标记为
+        // 重发（ReplayedChunk），由流层对 content 做未见后缀去重，避免正文跨事件
+        // 路径重复渲染（用户可见"结论输出两遍"）。output_text 的 .done 保持
+        // SnapshotChunk 不变（快照去重已覆盖）。
+        return Some(ParsedStreamPayload::ReplayedChunk(single_delta_chunk(&text, "")));
+    }
     Some(textual_event_chunk(event_type, &text, ""))
 }
 
@@ -727,17 +735,36 @@ mod tests {
     }
 
     #[test]
-    fn content_part_added_event_maps_to_content_chunk() {
+    fn content_part_added_event_maps_to_replayed_content_chunk() {
         let payload = r#"{"part":{"type":"output_text","text":"hello"}}"#;
         match parse_stream_payload(
             provider::openai_adapter(),
             payload,
             Some("response.content_part.added"),
         ) {
-            ParsedStreamPayload::Chunk(chunk) => {
+            // added 事件携带 part 已存在的完整文本，属协议重发，标记为
+            // ReplayedChunk 由流层对 content 做未见后缀去重。
+            ParsedStreamPayload::ReplayedChunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.content, "hello");
             }
-            _ => panic!("expected content-part chunk"),
+            _ => panic!("expected replayed content-part chunk"),
+        }
+    }
+
+    #[test]
+    fn content_part_done_event_stays_snapshot_content_chunk() {
+        // output_text 的 .done 保持 SnapshotChunk（快照去重已覆盖），不受 added
+        // 重发标记影响。
+        let payload = r#"{"part":{"type":"output_text","text":"done text"}}"#;
+        match parse_stream_payload(
+            provider::openai_adapter(),
+            payload,
+            Some("response.content_part.done"),
+        ) {
+            ParsedStreamPayload::SnapshotChunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content, "done text");
+            }
+            _ => panic!("expected snapshot content-part chunk"),
         }
     }
 

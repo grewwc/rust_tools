@@ -10,7 +10,7 @@ use crate::ai::{
     driver::{print::sanitize_for_terminal, runtime_ctx},
     models,
     provider::{self, ProviderAdapter},
-    request::StreamChunk,
+    request::{StreamChunk, merge_reasoning_fragments},
     theme::{ACCENT_MUTED, DIM, RESET},
     types::{App, StreamOutcome, StreamResult, take_stream_cancelled},
 };
@@ -91,6 +91,12 @@ pub(super) async fn stream_response(
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
     let mut markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
+    // 预填 `<think>` 模板的 reasoner 把推理链内联在 content 通道，仅以悬空
+    // `</think>` 收尾、从不产生 reasoning_content。为这类模型 arm 拆分器，把泄漏的
+    // 推理拆回 reasoning，避免思考链与正式答案一起落进可见正文。
+    if models::reasoning_in_content_enabled(&app.current_model) {
+        state.content.content_think_demuxer.arm();
+    }
     configure_thinking_fold(&mut state);
     configure_subagent_preview_fold(app, &mut state, &mut markers);
     let adapter = provider::adapter_for(
@@ -181,7 +187,7 @@ pub(super) async fn stream_response(
         }
     }
 
-    finalize_stream_response(app, &markers, state)
+    finalize_stream_response(app, current_history, &markers, state)
 }
 
 /// 是否在终端显示「等待模型输出」的紧凑状态提示。
@@ -439,7 +445,12 @@ async fn process_pending_tail(
         if !state.framing.sse_event_data.trim().is_empty() {
             if flush_sse_event(app, current_history, markers, state, adapter)?.should_stop {
                 let final_state = std::mem::replace(state, StreamProcessingState::new());
-                return Ok(Some(finalize_stream_response(app, markers, final_state)?));
+                return Ok(Some(finalize_stream_response(
+                    app,
+                    current_history,
+                    markers,
+                    final_state,
+                )?));
             }
         }
         return Ok(None);
@@ -453,13 +464,19 @@ async fn process_pending_tail(
     }
     if flush_sse_event(app, current_history, markers, state, adapter)?.should_stop {
         let final_state = std::mem::replace(state, StreamProcessingState::new());
-        return Ok(Some(finalize_stream_response(app, markers, final_state)?));
+        return Ok(Some(finalize_stream_response(
+            app,
+            current_history,
+            markers,
+            final_state,
+        )?));
     }
     Ok(None)
 }
 
 fn finalize_stream_response(
     app: &mut App,
+    current_history: &mut String,
     markers: &StreamMarkers,
     mut state: StreamProcessingState,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
@@ -484,7 +501,18 @@ fn finalize_stream_response(
         finalize_subagent_preview_fold(&mut state)?;
     }
 
-    flush_inline_markup_normalizer(app, markers, &mut state)?;
+    flush_inline_markup_normalizer(app, current_history, markers, &mut state)?;
+
+    // 冲刷内联 `</think>` 拆分器的残留。仍处捕获态说明 `</think>` 从未到达：
+    // withhold 设计下整段缓冲按 **content** 安全回退（宁可降级为「思考泄漏进正文」
+    // 也不丢失可见答案）。未 arm 的模型此处恒为空。
+    let (residual_reasoning, residual_content) = state.content.content_think_demuxer.flush();
+    if !residual_reasoning.is_empty() {
+        state.content.reasoning_text.push_str(&residual_reasoning);
+    }
+    if !residual_content.is_empty() {
+        commit_visible_content(app, current_history, markers, &mut state, residual_content)?;
+    }
 
     if render_terminal {
         flush_terminal_splitter(&mut state, markers)?;
@@ -1070,6 +1098,7 @@ fn normalize_end_thinking_boundary(
 /// 被暂存的内容丢失。
 fn flush_inline_markup_normalizer(
     app: &mut App,
+    current_history: &mut String,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1090,8 +1119,7 @@ fn flush_inline_markup_normalizer(
     if !cleaned.is_empty() {
         let content = normalize_stream_text(cleaned);
         if !content.is_empty() {
-            let mut current_history = String::new();
-            commit_visible_content(app, &mut current_history, markers, state, content)?;
+            commit_visible_content(app, current_history, markers, state, content)?;
         }
     }
     Ok(())
@@ -1522,7 +1550,7 @@ fn process_stream_payload(
     event_type: Option<&str>,
     payload: &str,
 ) -> Result<StreamPayloadOutcome, Box<dyn std::error::Error>> {
-    let (mut chunk, merge_mode) =
+    let (mut chunk, merge_mode, is_replayed) =
         match normalize::parse_stream_payload(adapter, payload, event_type) {
             super::state::ParsedStreamPayload::Ignore => {
                 return Ok(StreamPayloadOutcome::default());
@@ -1538,10 +1566,13 @@ fn process_stream_payload(
                 return Ok(StreamPayloadOutcome::default());
             }
             super::state::ParsedStreamPayload::Chunk(chunk) => {
-                (chunk, StreamEventMergeMode::Append)
+                (chunk, StreamEventMergeMode::Append, false)
+            }
+            super::state::ParsedStreamPayload::ReplayedChunk(chunk) => {
+                (chunk, StreamEventMergeMode::Append, true)
             }
             super::state::ParsedStreamPayload::SnapshotChunk(chunk) => {
-                (chunk, StreamEventMergeMode::AppendMissingSuffix)
+                (chunk, StreamEventMergeMode::AppendMissingSuffix, false)
             }
         };
 
@@ -1587,6 +1618,50 @@ fn process_stream_payload(
 
     state.content.empty_choice_chunks = 0;
 
+    // content_part.added / output_text.done 可能重发已存在正文，与 output_text.delta
+    // 增量重叠：用 **demux 前的原始 content 通道文本** 做未见后缀计算。仅用
+    // assistant_text 去重会在 demux 已关闭后失效：重发的 `reasoning</think>answer`
+    // 前缀与可见正文 `answer` 对不上，会把 reasoning 再次泄漏到正文。
+    let mut content_channel_progress = false;
+    if let Some(choice) = chunk.choices.first_mut()
+        && !choice.delta.content.is_empty()
+    {
+        if is_replayed || matches!(merge_mode, StreamEventMergeMode::AppendMissingSuffix) {
+            choice.delta.content =
+                unseen_suffix(&state.content.content_replay_text, &choice.delta.content);
+        }
+        if !choice.delta.content.is_empty() {
+            state
+                .content
+                .content_replay_text
+                .push_str(&choice.delta.content);
+            content_channel_progress = true;
+        }
+    }
+
+    // 预填 `<think>` 模板拆分：这类 reasoner 把推理链写进 content 通道、仅以悬空
+    // `</think>` 收尾。捕获态下 withhold--content 暂存于拆分器缓冲区、不向任何通道
+    // 增量吐出，直到 `</think>` 到达才一次性把前缀归入 delta.reasoning_content（复用
+    // 既有 thinking 折叠与累积路径）、正文留在 content。若 `</think>` 始终未到达，
+    // flush 时整段按 content 安全回退。未 arm 的模型此处直通、零影响。快照(.done)
+    // 先在上方按原始 content 通道去重，只把未见后缀送入有状态拆分器，因此不会重复
+    // 计数。content_channel_progress 会刷新 idle 计时器，避免长思考被 withhold 误判为
+    // 首包/空闲超时。
+    if let Some(choice) = chunk.choices.first_mut()
+        && !choice.delta.content.is_empty()
+    {
+        let (reasoning, content) = state
+            .content
+            .content_think_demuxer
+            .push(&choice.delta.content);
+        choice.delta.content = content;
+        if !reasoning.is_empty() {
+            // 与既有语义一致：reasoning_content 可与推理片段拼接续写。
+            choice.delta.reasoning_content =
+                merge_reasoning_fragments(&choice.delta.reasoning_content, &reasoning);
+        }
+    }
+
     // reasoning_content 去重：Responses API 对同一段推理摘要会通过多条事件路径重复
     // 下发（reasoning_summary_text.{delta,done} 与 content_part.{added,done} 的
     // summary_text 携带相同内容）。此前仅对 SnapshotChunk（.done）做未见后缀去重，
@@ -1601,23 +1676,17 @@ fn process_stream_payload(
         .first()
         .map(|c| c.delta.reasoning_content.clone())
         .unwrap_or_default();
-    let deduped_reasoning = if !original_reasoning.is_empty() {
-        unseen_suffix(&state.content.reasoning_text, &original_reasoning)
-    } else {
-        String::new()
+    let emitted_reasoning = match merge_mode {
+        StreamEventMergeMode::Append => original_reasoning.clone(),
+        StreamEventMergeMode::AppendMissingSuffix => {
+            unseen_suffix(&state.content.reasoning_text, &original_reasoning)
+        }
     };
-    let reasoning_progress = !deduped_reasoning.is_empty();
+    let reasoning_progress = !emitted_reasoning.is_empty();
 
     if !original_reasoning.is_empty() {
         state.content.saw_reasoning_output = true;
-        match merge_mode {
-            StreamEventMergeMode::Append => {
-                state.content.reasoning_text.push_str(&original_reasoning);
-            }
-            StreamEventMergeMode::AppendMissingSuffix => {
-                state.content.reasoning_text.push_str(&deduped_reasoning);
-            }
-        }
+        state.content.reasoning_text.push_str(&emitted_reasoning);
 
         // 某些长工具链上下文会诱发模型在 thinking 中逐字复读同一句话。继续读取只会
         // 消耗输出预算并让终端看似卡死；升级为可重试截断，交给上层降低推理档位。
@@ -1635,9 +1704,9 @@ fn process_stream_payload(
     let recovered_inline_events =
         recover_protocol_only_inline_tool_call_snapshot(&mut chunk, merge_mode, state);
 
-    // 渲染消费去重后的后缀，避免跨事件路径的 thinking 重复输出。
+    // 增量事件保留模型原始文本；快照事件仅渲染未见后缀，避免协议重发。
     if let Some(choice) = chunk.choices.first_mut() {
-        choice.delta.reasoning_content = deduped_reasoning;
+        choice.delta.reasoning_content = emitted_reasoning;
     }
 
     let external_tool_progress =
@@ -1658,8 +1727,11 @@ fn process_stream_payload(
     internal_tool_call_events.extend(recovered_inline_events);
     let (saw_hallucinated_marker, internal_tool_progress) =
         process_internal_tool_calls(app, markers, state, internal_tool_call_events);
-    let mut meaningful_progress =
-        reasoning_progress || saw_finish_reason || external_tool_progress || internal_tool_progress;
+    let mut meaningful_progress = content_channel_progress
+        || reasoning_progress
+        || saw_finish_reason
+        || external_tool_progress
+        || internal_tool_progress;
     if saw_hallucinated_marker {
         // 模型在可见正文里自编自演「工具调用→工具结果」，吐出系统从不生成的内部
         // 协议标记（`<function_results>` 等）。streamer 已把整块剥离，这里停流并复用
@@ -1683,6 +1755,11 @@ fn process_stream_payload(
         match event {
             StreamTextEvent::AppendHiddenMeta(text) => {
                 state.content.hidden_meta.push_str(&text);
+            }
+            StreamTextEvent::OpenThinking
+            | StreamTextEvent::AppendThinking(_)
+            | StreamTextEvent::CloseThinking => {
+                render_thinking_event(markers, state, &event)?;
             }
             other => {
                 let Some(content) = stream_text_event_to_content(
@@ -1833,16 +1910,71 @@ enum StreamEventMergeMode {
     AppendMissingSuffix,
 }
 
+fn render_thinking_event(
+    markers: &StreamMarkers,
+    state: &mut StreamProcessingState,
+    event: &StreamTextEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !runtime_ctx::terminal_output_enabled() {
+        return Ok(());
+    }
+
+    match event {
+        StreamTextEvent::OpenThinking => {
+            if markers.subagent_preview_enabled() {
+                return Ok(());
+            }
+            clear_waiting_hint(state)?;
+            maybe_write_stream_content(
+                &format!("\n{}\n", markers.thinking_tag),
+                state,
+                markers,
+                true,
+            )?;
+        }
+        StreamTextEvent::AppendThinking(text) => {
+            if text.is_empty() {
+                return Ok(());
+            }
+            clear_waiting_hint(state)?;
+            if markers.subagent_preview_enabled() {
+                write_subagent_content_folded(text, state)?;
+            } else {
+                maybe_write_stream_content(text, state, markers, true)?;
+            }
+        }
+        StreamTextEvent::CloseThinking => {
+            if markers.subagent_preview_enabled() {
+                return Ok(());
+            }
+            clear_waiting_hint(state)?;
+            if state.render.thinking_fold.active {
+                finalize_thinking_fold(state)?;
+            } else {
+                maybe_write_stream_content(
+                    &format!("{}\n", markers.end_thinking_tag),
+                    state,
+                    markers,
+                    true,
+                )?;
+            }
+        }
+        StreamTextEvent::AppendContent(_) | StreamTextEvent::AppendHiddenMeta(_) => {}
+    }
+
+    Ok(())
+}
+
 fn stream_text_event_to_content(
     event: &StreamTextEvent,
     markers: &StreamMarkers,
     merge_mode: StreamEventMergeMode,
     assistant_text: &str,
 ) -> Option<String> {
+    // Thinking 事件只允许走 render_thinking_event() 的终端展示路径，不能进入
+    // assistant_text/current_history。这里故意只返回可见正文。
     if markers.subagent_preview_enabled() {
         return match event {
-            StreamTextEvent::OpenThinking | StreamTextEvent::CloseThinking => None,
-            StreamTextEvent::AppendThinking(text) => (!text.is_empty()).then(|| text.clone()),
             StreamTextEvent::AppendContent(text) => match merge_mode {
                 StreamEventMergeMode::Append => (!text.is_empty()).then(|| text.clone()),
                 StreamEventMergeMode::AppendMissingSuffix => {
@@ -1850,13 +1982,14 @@ fn stream_text_event_to_content(
                     (!suffix.is_empty()).then_some(suffix)
                 }
             },
-            StreamTextEvent::AppendHiddenMeta(_) => None,
+            StreamTextEvent::OpenThinking
+            | StreamTextEvent::AppendThinking(_)
+            | StreamTextEvent::CloseThinking
+            | StreamTextEvent::AppendHiddenMeta(_) => None,
         };
     }
 
     match event {
-        StreamTextEvent::OpenThinking => Some(format!("\n{}\n", markers.thinking_tag)),
-        StreamTextEvent::AppendThinking(text) => (!text.is_empty()).then(|| text.clone()),
         StreamTextEvent::AppendContent(text) => match merge_mode {
             StreamEventMergeMode::Append => (!text.is_empty()).then(|| text.clone()),
             StreamEventMergeMode::AppendMissingSuffix => {
@@ -1864,8 +1997,10 @@ fn stream_text_event_to_content(
                 (!suffix.is_empty()).then_some(suffix)
             }
         },
-        StreamTextEvent::AppendHiddenMeta(_) => None,
-        StreamTextEvent::CloseThinking => Some(format!("{}\n", markers.end_thinking_tag)),
+        StreamTextEvent::OpenThinking
+        | StreamTextEvent::AppendThinking(_)
+        | StreamTextEvent::CloseThinking
+        | StreamTextEvent::AppendHiddenMeta(_) => None,
     }
 }
 

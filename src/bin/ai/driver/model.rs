@@ -160,22 +160,49 @@ pub fn ocr_images_for_attached_input(
     }))
 }
 
-/// 非 VL 模型收到附带图片时，不再由主 agent 直接调用 OCR 工具，而是派发一个
-/// 固定使用 VL 模型的同步 subagent 解析图片，解析完成后再回到主 agent。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachedImageParseRoute {
+    VlSubagent,
+    Ocr,
+}
+
+fn attached_image_parse_route(vl_model: &str) -> AttachedImageParseRoute {
+    if crate::ai::models::supports_image_input(vl_model) {
+        AttachedImageParseRoute::VlSubagent
+    } else {
+        AttachedImageParseRoute::Ocr
+    }
+}
+
+/// 非 VL 模型收到附带图片时，优先派发固定使用 VL 模型的同步 subagent；系统没有
+/// 可用 VL 模型时改走静态 OCR，避免把图片附件降级成纯文本文件名。
 /// 返回的 OcrExtraction 复用 precomputed_ocr 注入管线，把解析结果喂给主 agent。
 const IMAGE_PARSE_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 pub(in crate::ai) async fn parse_attached_images_via_subagent(
+    mcp_client: &SharedMcpClient,
     image_files: &[String],
 ) -> Result<Option<OcrExtraction>, String> {
     if image_files.is_empty() {
         return Ok(None);
     }
 
-    // 固定用系统配置的默认 VL 模型，保证 subagent 通过 read_file 能直接"看到"图片，
-    // 而不是退回主 agent 直接调 OCR。若系统没有配置任何 VL 模型，default_vl_model()
-    // 会回落到默认模型，subagent 内部会退化为自行 OCR。
+    // 固定用系统配置的默认 VL 模型，图片通过 image_files 参数直接附加到子代理首条
+    // user 消息，第一轮就能直接"看到"图，省掉 read_file 的冗余往返。
     let vl_model = crate::ai::models::default_vl_model();
+    if attached_image_parse_route(&vl_model) == AttachedImageParseRoute::Ocr {
+        return match ocr_images_for_attached_input(mcp_client, image_files) {
+            Ok(Some(ocr)) => Ok(Some(ocr)),
+            Ok(None) => Ok(Some(failed_image_parse_extraction(
+                image_files,
+                "未配置可用的 VL 模型，且未发现 OCR 工具",
+            ))),
+            Err(e) => Ok(Some(failed_image_parse_extraction(
+                image_files,
+                &format!("OCR fallback failed: {e}"),
+            ))),
+        };
+    }
 
     let file_list = image_files
         .iter()
@@ -185,10 +212,12 @@ pub(in crate::ai) async fn parse_attached_images_via_subagent(
         .join("\n");
 
     let prompt = format!(
-        "主 agent 使用的是纯文本模型，无法直接看到图片。请逐张解析以下图片文件：\n\
+        "主 agent 使用的是纯文本模型，无法直接看到图片。以下图片已作为附件直接附加到\
+         本对话中，你第一轮就能看到它们，请逐张解析：\n\
          {file_list}\n\n\
-         对每张图片调用 read_file 读取，然后完整、忠实、详细地输出图片中的全部内容\
-         （所有可见文字、图表、结构、界面元素、布局等），不要遗漏、不要总结。\n\n\
+         完整、忠实、详细地输出每张图片中的全部内容\
+         （所有可见文字、图表、结构、界面元素、布局等），不要遗漏、不要总结。\
+         图片已在对话中直接可见，无需调用 read_file 等工具。\n\n\
          输出要求：\n\
          1. 按文件顺序逐张输出，每张以 \"<!-- IMAGE: <文件名> -->\" 开头；\n\
          2. 解析结果将作为主 agent 获取图片信息的唯一来源，必须完整可读；\n\
@@ -200,6 +229,11 @@ pub(in crate::ai) async fn parse_attached_images_via_subagent(
         "prompt": prompt,
         "agent": "build",
         "model": vl_model,
+        // 把图片文件显式交给子代理：VL 模型第一轮直接看到图，避免先 read_file、
+        // 再在下一轮重复附加 base64 的冗余往返（省一轮模型请求 + 一次重复传图）。
+        "image_files": image_files,
+        // 纯转录任务不需要 high 思考链，压到 minimal 档加速解析。
+        "reasoning_effort": "minimal",
     });
 
     // 与 /audit 相同：同步派发一个 subagent 解析图片，等它完成后再回到主 agent。
@@ -303,7 +337,10 @@ fn extract_subagent_output_text(content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_subagent_output_text, failed_image_parse_extraction, preferred_ocr_image_tool_name};
+    use super::{
+        AttachedImageParseRoute, attached_image_parse_route, extract_subagent_output_text,
+        failed_image_parse_extraction, preferred_ocr_image_tool_name,
+    };
     use crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER;
 
     #[test]
@@ -324,6 +361,14 @@ mod tests {
             "mcp_other_server_ocr_pdf",
         ]);
         assert_eq!(selected, Some("mcp_some_server_ocr_image"));
+    }
+
+    #[test]
+    fn non_vl_default_routes_attached_images_to_ocr() {
+        assert_eq!(
+            attached_image_parse_route("definitely-not-a-vl-model"),
+            AttachedImageParseRoute::Ocr
+        );
     }
 
     #[test]
