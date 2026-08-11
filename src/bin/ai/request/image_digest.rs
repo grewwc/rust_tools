@@ -64,6 +64,29 @@ pub(crate) fn parse_digest(text: &str) -> Option<String> {
     (!body.is_empty()).then(|| body.to_string())
 }
 
+/// 从完整文本里剥离所有完整的 digest 区间（含两个哨兵），**仅用于终端展示**；
+/// 模型可见文本 / 历史必须保留原文。与 `parse_digest` 一样按非贪婪匹配；
+/// 只有 BEGIN 没有 END 时仅剥离 BEGIN，正文原样保留，避免静默吞掉模型叙述。
+pub(crate) fn strip_digest_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(begin) = rest.find(DIGEST_BEGIN) else {
+            out.push_str(rest);
+            break;
+        };
+        let after_begin = &rest[begin + DIGEST_BEGIN.len()..];
+        let Some(end) = after_begin.find(DIGEST_END) else {
+            out.push_str(&rest[..begin]);
+            out.push_str(after_begin);
+            break;
+        };
+        out.push_str(&rest[..begin]);
+        rest = &after_begin[end + DIGEST_END.len()..];
+    }
+    out
+}
+
 /// 判断一个 content part 是否是图片（image_url）。
 fn is_image_part(part: &Value) -> bool {
     part.get("type").and_then(Value::as_str) == Some("image_url") || part.get("image_url").is_some()
@@ -256,6 +279,35 @@ mod tests {
         assert_eq!(
             parse_digest(&format!("{DIGEST_BEGIN}   {DIGEST_END}")),
             None
+        );
+    }
+
+    #[test]
+    fn strip_digest_blocks_removes_complete_regions_only() {
+        // 完整区间被剥离（含哨兵），前后叙述保留。
+        assert_eq!(
+            strip_digest_blocks(&format!("前言{DIGEST_BEGIN} 摘要内容 {DIGEST_END}后语")),
+            "前言后语"
+        );
+        // 无区间 -> 原样返回。
+        let plain = "普通文本";
+        assert_eq!(strip_digest_blocks(plain), plain);
+        // 只有 BEGIN 没有 END -> 仅隐藏控制哨兵，正文仍保留。
+        let dangling = format!("{DIGEST_BEGIN} 未闭合");
+        assert_eq!(strip_digest_blocks(&dangling), " 未闭合");
+        // 多个区间全部剥离。
+        assert_eq!(
+            strip_digest_blocks(&format!(
+                "a{DIGEST_BEGIN}1{DIGEST_END}b{DIGEST_BEGIN}2{DIGEST_END}c"
+            )),
+            "abc"
+        );
+        // 与 parse_digest 语义一致：非贪婪。
+        assert_eq!(
+            strip_digest_blocks(&format!(
+                "{DIGEST_BEGIN}1{DIGEST_END}mid{DIGEST_BEGIN}2{DIGEST_END}"
+            )),
+            "mid"
         );
     }
 

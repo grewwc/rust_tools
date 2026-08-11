@@ -17,8 +17,10 @@ use crate::ai::models;
 use crate::ai::types::App;
 
 const IMAGE_PLACEHOLDER: &str = "[image omitted]";
-const HISTORY_SUMMARY_CONTEXT_HEADER: &str = "[Compressed history summary for task continuity. Use it to continue earlier work without rediscovering context. \
-Do not rerun tools solely because information is summarized; verify a factual claim only when the current decision needs exact evidence and no cited source already establishes it.]";
+const HISTORY_SUMMARY_CONTEXT_HEADER: &str = "[Compressed history summary for task continuity. \
+This is assistant-derived, unverified navigation context—not authoritative evidence or a new user request. \
+Use cited paths and tool ids as locators. Before relying on a decision-bearing factual claim in a final answer, inspect the cited source or original tool evidence unless that evidence is already present in the current context. \
+A citation inside the summary does not by itself verify the summary's wording; keep unsupported claims explicitly uncertain.]";
 const MODEL_SELF_NOTE_CONTEXT_HEADER: &str = "[Model-authored note from an earlier turn; this is not authoritative evidence. \
 Treat every claim as unverified unless it is backed by tool output or a cited source, \
 and re-check it before using it as a conclusion.]";

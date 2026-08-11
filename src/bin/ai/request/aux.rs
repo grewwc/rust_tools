@@ -22,6 +22,72 @@ use crate::ai::{
 pub(super) const SESSION_TITLE_REQUEST_TIMEOUT_SECS: u64 = 90;
 pub(super) const SESSION_TITLE_BODY_TIMEOUT_SECS: u64 = 45;
 
+fn is_exported_message_heading(line: &str) -> bool {
+    ["### 👤 ", "### 🤖 ", "### ⚙️ ", "### 🔧 ", "### 📝 "]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+}
+
+/// 从被截断的中段提取关键行时保留消息角色，避免把助手旧结论误当成工具事实。
+fn extract_middle_keypoints(
+    middle_segment: &str,
+    initial_heading: Option<&str>,
+    char_budget: usize,
+) -> String {
+    let mut current_heading = initial_heading;
+    let mut emitted_heading: Option<&str> = None;
+    let mut keypoints = String::new();
+    let mut keypoint_chars = 0usize;
+
+    for line in middle_segment.lines() {
+        if is_exported_message_heading(line) {
+            current_heading = Some(line);
+            continue;
+        }
+
+        let lower = line.to_lowercase();
+        let is_key = lower.contains("error")
+            || lower.contains("fail")
+            || lower.contains("panic")
+            || lower.contains("fix")
+            || lower.contains("diff")
+            || lower.contains("apply_patch")
+            || lower.contains("write_file")
+            || lower.contains("decision")
+            || lower.contains("conclusion")
+            || lower.contains("结论")
+            || lower.contains("修复")
+            || lower.contains("错误");
+        let trimmed = line.trim();
+        if !is_key || trimmed.is_empty() {
+            continue;
+        }
+
+        let heading_chars = if current_heading != emitted_heading {
+            current_heading.map_or(0, |heading| heading.chars().count() + 1)
+        } else {
+            0
+        };
+        let chunk_chars = heading_chars + trimmed.chars().count() + 1;
+        if keypoint_chars + chunk_chars > char_budget {
+            break;
+        }
+
+        if current_heading != emitted_heading
+            && let Some(heading) = current_heading
+        {
+            keypoints.push_str(heading);
+            keypoints.push('\n');
+            emitted_heading = Some(heading);
+        }
+        keypoints.push_str(trimmed);
+        keypoints.push('\n');
+        keypoint_chars += chunk_chars;
+    }
+
+    keypoints
+}
+
 /// 用 LLM 将较早的对话历史压缩成摘要文本，供 context-budget 压缩器使用。
 ///
 /// 三段式截断（head 12k + middle keypoints 4k + tail 6k），比 head+tail
@@ -64,38 +130,13 @@ pub(crate) async fn summarize_history_via_model(
         } else {
             String::new()
         };
-        let mut keypoints = String::new();
-        let mut keypoint_chars = 0usize;
         const MID_KEYPOINTS_BUDGET: usize = 4_000;
-        for line in middle_segment.lines() {
-            let lower = line.to_lowercase();
-            let is_key = lower.contains("error")
-                || lower.contains("fail")
-                || lower.contains("panic")
-                || lower.contains("fix")
-                || lower.contains("diff")
-                || lower.contains("apply_patch")
-                || lower.contains("write_file")
-                || lower.contains("decision")
-                || lower.contains("conclusion")
-                || lower.contains("结论")
-                || lower.contains("修复")
-                || lower.contains("错误");
-            if !is_key {
-                continue;
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let chunk_len = trimmed.chars().count() + 1;
-            if keypoint_chars + chunk_len > MID_KEYPOINTS_BUDGET {
-                break;
-            }
-            keypoints.push_str(trimmed);
-            keypoints.push('\n');
-            keypoint_chars += chunk_len;
-        }
+        let initial_heading = head
+            .lines()
+            .rev()
+            .find(|line| is_exported_message_heading(line));
+        let keypoints =
+            extract_middle_keypoints(&middle_segment, initial_heading, MID_KEYPOINTS_BUDGET);
 
         if keypoints.trim().is_empty() {
             format!("{head}\n\n[... older transcript omitted for summary budget ...]\n\n{tail}")
@@ -117,6 +158,7 @@ pub(crate) async fn summarize_history_via_model(
 - 只输出纯文本，不要 markdown 代码块，不要解释。\n\
 - 必须保留：用户明确要求、文件路径/函数名/工具名、关键报错、当前工作、未完成任务，以及可回读的来源路径或工具调用。\n\
 - 严格区分三类内容：工具/源码直接支持的已验证事实、助手此前提出但尚未验证的判断、仍待确认的问题。不得因为一句话来自助手就把它改写成事实或修复结论。\n\
+- 只有输入中直接可见的工具/源码证据才能支持“已验证”；助手旧结论或其引用的路径只能作为回读定位，不能仅凭引用就升级为事实。\n\
 - 已验证事实必须尽量附带来源（文件路径、命令或工具名）；没有来源时标注“来源未保留”。冲突证据和不确定性必须保留，不得替模型做确定性裁决。\n\
 - 优先保留用户决定和有来源的事实，删除寒暄、重复确认、冗长日志。\n\
 - 使用下面这些标题，并且每个标题下用 `- ` 开头的短行：\n\
@@ -273,6 +315,16 @@ fn compact_session_title_transcript(dialog: &[String]) -> String {
 mod session_title_tests {
     use super::*;
     use crate::ai::history::Message;
+
+    #[test]
+    fn middle_keypoints_keep_role_provenance() {
+        let middle = "Conclusion: guessed cause\n\n---\n\n### 🔧 TOOL\n\nError: direct diagnostic\n";
+
+        let keypoints = extract_middle_keypoints(middle, Some("### 🤖 ASSISTANT"), 1_000);
+
+        assert!(keypoints.contains("### 🤖 ASSISTANT\nConclusion: guessed cause"));
+        assert!(keypoints.contains("### 🔧 TOOL\nError: direct diagnostic"));
+    }
 
     #[test]
     fn title_transcript_keeps_text_and_omits_images() {

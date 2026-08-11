@@ -637,6 +637,8 @@ const NO_TOOL_SYNTHESIS_RETRY_NOTE: &str = "The previous no-tool synthesis respo
 const NO_TOOL_SYNTHESIS_WARNING: &str = "模型连续两次在无工具收尾阶段返回工具调用；运行时已停止重试。请仅依据此前已获得的证据判断任务状态，未验证的部分应视为未完成。";
 const REASONING_ONLY_RETRY_MARKER: &str = "[reasoning-only-retry]";
 const REASONING_ONLY_RETRY_NOTE: &str = "The previous response contained hidden reasoning but no visible assistant answer. This is the one automatic recovery attempt. Retry the step normally with the same capabilities, including tools and internal reasoning when needed, and ensure the response eventually includes visible assistant content.";
+const REASONING_ONLY_SYNTHESIS_MARKER: &str = "[reasoning-only-synthesis]";
+const REASONING_ONLY_SYNTHESIS_NOTE: &str = "Two consecutive responses contained hidden reasoning but no visible assistant answer. Produce the concrete user-facing final answer now. Do not call tools and do not return hidden reasoning alone.";
 
 fn append_runtime_warning_once(text: &mut String, warning: &str) {
     if text.contains(warning) {
@@ -2176,7 +2178,16 @@ fn handle_tool_call_round(
         }
     }
 
-    Ok(None)
+    Ok(terminal_dedupe_candidate_from_assistant_text(
+        &tool_call_execution.stream_result.assistant_text,
+    ))
+}
+
+/// 终端去重候选必须与实际可见正文对齐：digest 是给模型看的附加图片理解内容，
+/// 终端不会展示，因此候选同样剥离后再比较或兜底渲染。
+fn terminal_dedupe_candidate_from_assistant_text(assistant_text: &str) -> Option<String> {
+    let visible_text = crate::ai::request::strip_digest_blocks(assistant_text.trim());
+    (!visible_text.is_empty()).then(|| visible_text.to_string())
 }
 
 fn execute_tool_calls_with_suppressed_read_only_calls(
@@ -2723,10 +2734,31 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                             .as_str()
                             .is_some_and(|text| text.starts_with(REASONING_ONLY_RETRY_MARKER))
                 });
-                if already_retried {
+                let already_forced_synthesis = messages.iter().any(|message| {
+                    message.role == ROLE_INTERNAL_NOTE
+                        && message
+                            .content
+                            .as_str()
+                            .is_some_and(|text| text.starts_with(REASONING_ONLY_SYNTHESIS_MARKER))
+                });
+                if already_forced_synthesis || iteration >= max_iterations {
                     *final_assistant_text =
                         "[模型只返回了思考内容，没有给出最终回答，请重试或切换模型]".to_string();
                     return Ok(TurnLoopStep::Break);
+                }
+                if already_retried || *force_final_response {
+                    messages.push(Message {
+                        role: ROLE_INTERNAL_NOTE.to_string(),
+                        content: serde_json::Value::String(format!(
+                            "{REASONING_ONLY_SYNTHESIS_MARKER}\n{REASONING_ONLY_SYNTHESIS_NOTE}"
+                        )),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                    app.cli.thinking_disabled_override = true;
+                    *force_final_response = true;
+                    return Ok(TurnLoopStep::Continue);
                 }
                 messages.push(Message {
                     role: ROLE_INTERNAL_NOTE.to_string(),
@@ -2781,7 +2813,14 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 max_iterations,
             ) {
                 CompletionEvidenceGateAction::Allow => false,
-                CompletionEvidenceGateAction::Reopen => return Ok(TurnLoopStep::Continue),
+                CompletionEvidenceGateAction::Reopen => {
+                    // 当前候选结论已经由 stream runtime 实时输出；证据门禁要求重开时，
+                    // 把它交给下一轮 terminal dedupe，避免模型验证后原样回答导致结论重画。
+                    *terminal_dedupe_candidate = terminal_dedupe_candidate_from_assistant_text(
+                        &stream_result.assistant_text,
+                    );
+                    return Ok(TurnLoopStep::Continue);
+                }
                 CompletionEvidenceGateAction::Warn => true,
             };
             let warn_dangling_final = match dangling_final_recovery_action(
@@ -4146,6 +4185,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(step, TurnLoopStep::Continue));
+        assert_eq!(terminal_dedupe_candidate.as_deref(), Some("先读文件。"));
         let checkpoint_marker = turn_messages
             .iter()
             .find_map(|message| {
@@ -4507,6 +4547,7 @@ mod tests {
         assert!(matches!(first_step, TurnLoopStep::Continue));
         assert!(final_assistant_text.is_empty());
         assert!(!final_assistant_recorded);
+        assert_eq!(terminal_dedupe_candidate.as_deref(), Some("已修复。"));
         assert_eq!(
             messages
                 .iter()
@@ -5089,7 +5130,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_only_final_response_stops_after_dedicated_retry() {
+    fn reasoning_only_final_response_forces_no_thinking_synthesis_after_normal_retry() {
         let mut app = test_app_with_tools(&["read_file"]);
         let mcp = crate::ai::mcp::McpClient::new();
         let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
@@ -5146,14 +5187,62 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(step, TurnLoopStep::Break));
+        assert!(matches!(step, TurnLoopStep::Continue));
+        assert!(app.cli.thinking_disabled_override);
+        assert!(force_final_response);
+        assert!(final_assistant_text.is_empty());
+        assert!(!final_assistant_recorded);
+        assert!(messages.iter().any(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(REASONING_ONLY_SYNTHESIS_MARKER))
+        }));
+        assert!(turn_messages.is_empty());
+
+        let second_step = handle_iteration_execution(
+            &mut app,
+            "compare two yaml files",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Completed,
+                tool_calls: Vec::new(),
+                assistant_text: String::new(),
+                hidden_meta: String::new(),
+                reasoning_text: "Still hidden reasoning".to_string(),
+                reasoning_items: Vec::new(),
+                skip_response_drain: true,
+                truncated_by_length: false,
+                stream_error: false,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_cached_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            3,
+            16,
+            0,
+            &mut false,
+        )
+        .unwrap();
+
+        assert!(matches!(second_step, TurnLoopStep::Break));
         assert_eq!(
             final_assistant_text,
             "[模型只返回了思考内容，没有给出最终回答，请重试或切换模型]"
         );
-        assert!(!final_assistant_recorded);
-        assert_eq!(messages.len(), 1);
-        assert!(turn_messages.is_empty());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::ai::config_schema::AiConfig;
 use crate::ai::mcp::SharedMcpClient;
 use crate::ai::{
-    driver::{print::print_ocr_summary, skill_runtime},
+    driver::skill_runtime,
     history::{
         Message, ROLE_INTERNAL_NOTE, build_context_history, compact_session_history_with_app,
     },
@@ -544,9 +544,7 @@ pub(super) async fn prepare_turn(
     // intentionally keeps the original user question without the reminder.
     let context_reminder = skill_turn.context_reminder();
     let (user_content, persisted_question_text) = {
-        if let Some(ocr) = usable_ocr {
-            print_ocr_summary(ocr);
-        }
+        // OCR 摘要是附加的图片理解内容：只进模型可见的 final_question，不回显终端。
         let content =
             request::build_content(next_model, &final_question, &app.attached_image_files)?;
         (content, final_question)

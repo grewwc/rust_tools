@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use rust_tools::cw::SkipMap;
 
 use crate::ai::{
-    request::StreamChunk,
+    request::{StreamChunk, DIGEST_BEGIN, DIGEST_END},
     types::{FunctionCall, StreamResult, ToolCall},
 };
 
@@ -17,6 +17,8 @@ use super::{
     think_demux::ContentThinkDemuxer,
 };
 
+/// 流文本协议标记（嵌入 history / assistant_text，终端展示时会再映射为
+/// header/footer 标签，见 `ThinkingFoldState` 与 markdown 渲染器）。
 pub(super) const THINKING_TAG_TEXT: &str = "╭─ thinking";
 pub(super) const END_THINKING_TAG_TEXT: &str = "╰─ done thinking";
 
@@ -112,6 +114,9 @@ pub(super) struct StreamRenderState {
     pub(super) terminal_splitter: StreamSplitter,
     pub(super) thinking_fold: ThinkingFoldState,
     pub(super) subagent_fold: ThinkingFoldState,
+    /// 终端展示专用：剥离 `<<<IMAGE_DIGEST>>> ... <<<END_IMAGE_DIGEST>>>` 区间
+    /// （模型可见文本 / 历史不受影响），并处理哨兵被跨 chunk 拆散的情况。
+    pub(super) digest_filter: DigestTerminalFilter,
 }
 
 impl StreamRenderState {
@@ -127,8 +132,92 @@ impl StreamRenderState {
             terminal_splitter: StreamSplitter::new(),
             thinking_fold: ThinkingFoldState::new(),
             subagent_fold: ThinkingFoldState::new_with_labels("subagent", "done subagent", false),
+            digest_filter: DigestTerminalFilter::new(),
         }
     }
+}
+
+/// 终端展示用的图片摘要区域过滤器：把 digest 区间从**终端输出**里剥离，
+/// 跨 chunk 正确处理哨兵被拆散的情况；模型可见文本不走这里。
+pub(super) struct DigestTerminalFilter {
+    /// 是否已越过 BEGIN 哨兵（正在 digest 区间内）。
+    in_digest: bool,
+    /// 尾部暂存：等待确认是否构成哨兵前缀（最多保留最长哨兵长度 - 1）。
+    pending: String,
+    /// 已确认进入 digest 区间后暂存的文本（仅在流结束时仍未闭合才回退输出）。
+    suppressed: String,
+}
+
+impl DigestTerminalFilter {
+    fn new() -> Self {
+        Self {
+            in_digest: false,
+            pending: String::new(),
+            suppressed: String::new(),
+        }
+    }
+
+    /// 输入一段流式内容，返回其中**可以写终端**的部分。
+    pub(super) fn push(&mut self, content: &str) -> String {
+        let mut out = String::with_capacity(content.len());
+        self.pending.push_str(content);
+        loop {
+            let target = if self.in_digest { DIGEST_END } else { DIGEST_BEGIN };
+            let Some(idx) = self.pending.find(target) else { break };
+            if self.in_digest {
+                // 丢弃 digest 区间内容（含 END 哨兵），回到普通状态
+                self.in_digest = false;
+                self.suppressed.clear();
+                self.pending.drain(..idx + target.len());
+            } else {
+                // 输出 BEGIN 之前的文本，进入 digest 区间
+                out.push_str(&self.pending[..idx]);
+                self.in_digest = true;
+                self.pending.drain(..idx + target.len());
+            }
+        }
+        if self.in_digest {
+            // digest 区间内只保留确实可能组成 END 的后缀，其余移入 suppressed。
+            let hold_len = marker_prefix_suffix_len(&self.pending, DIGEST_END);
+            let commit_len = self.pending.len() - hold_len;
+            if commit_len > 0 {
+                let committed: String = self.pending.drain(..commit_len).collect();
+                self.suppressed.push_str(&committed);
+            }
+        } else {
+            // 普通状态只保留确实可能组成 BEGIN 的后缀。普通正文必须立即放行，
+            // 不能固定扣留尾巴后在 flush 时绕过去重/样式管线。
+            let hold_len = marker_prefix_suffix_len(&self.pending, DIGEST_BEGIN);
+            let emit_len = self.pending.len() - hold_len;
+            out.push_str(&self.pending[..emit_len]);
+            self.pending.drain(..emit_len);
+        }
+        out
+    }
+
+    /// 流结束时冲刷：若 digest 区间从未闭合，把暂存内容回退输出
+    /// （宁可展示完整叙述，也不静默丢内容）；哨兵前缀尾巴也一并输出。
+    pub(super) fn flush(&mut self) -> String {
+        let mut out = String::new();
+        if self.in_digest {
+            out.push_str(&std::mem::take(&mut self.suppressed));
+            self.in_digest = false;
+        }
+        out.push_str(&std::mem::take(&mut self.pending));
+        out
+    }
+}
+
+/// 返回 `text` 末尾与 `marker` 前缀重合的最长字节数。
+fn marker_prefix_suffix_len(text: &str, marker: &str) -> usize {
+    let max_len = text.len().min(marker.len().saturating_sub(1));
+    for len in (1..=max_len).rev() {
+        let start = text.len() - len;
+        if text.is_char_boundary(start) && marker.starts_with(&text[start..]) {
+            return len;
+        }
+    }
+    0
 }
 
 /// Thinking 折叠状态：维护一个滚动窗口，只在终端展示最近 N 条正文物理行，
@@ -153,13 +242,13 @@ pub(super) struct ThinkingFoldState {
     pub(super) rewrite_right_margin_cols: usize,
     /// 是否处于活跃的 thinking 折叠模式
     pub(super) active: bool,
-    /// header（`thinking`）是否已落地。header 只打印一次并被锚定在重画区域之上，
-    /// 绝不随正文一起被 cursor-up 擦除重画——这样即便正文擦除失步也无法再生出第二个
-    /// header，从根上杜绝「孤儿 header 叠加」的渲染 bug。
+    /// header（`○ thinking`）是否已落地。流式重画绝不随正文一起擦除/重画；收尾时才会
+    /// 在原位将它改为 `✓ thinking`。这样即便正文擦除失步也无法再生出第二个 header，
+    /// 从根上杜绝「孤儿 header 叠加」的渲染 bug。
     pub(super) header_drawn: bool,
-    /// 折叠块 header 文案（如 `thinking` / `subagent explore`）。
+    /// 折叠块 header 文案（如 `○ thinking` / `subagent explore`）。
     pub(super) header_label: String,
-    /// 折叠块 footer 文案（如 `done thinking` / `done subagent explore`）。
+    /// 折叠块 footer 文案（如 `✓ thinking` / `done subagent explore`）。
     pub(super) footer_label: String,
     /// 是否在折叠窗口里跳过空白行。thinking 适合紧凑展示；subagent 正文保持原样。
     pub(super) skip_blank_lines: bool,
@@ -167,7 +256,9 @@ pub(super) struct ThinkingFoldState {
 
 impl ThinkingFoldState {
     pub(super) fn new() -> Self {
-        Self::new_with_labels("thinking", "done thinking", true)
+        // thinking 过程用 `○ thinking` 标识进行中，结束后用 `✓ thinking` 收口
+        // （对勾代替 "done"），避免「thinking / done thinking」成对文字的冗余。
+        Self::new_with_labels("○ thinking", "✓ thinking", true)
     }
 
     pub(super) fn new_with_labels(
@@ -353,4 +444,63 @@ pub(super) struct InternalToolCall {
     pub(super) tool_type: String,
     pub(super) function_name: String,
     pub(super) arguments: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DigestTerminalFilter;
+    use crate::ai::request::{DIGEST_BEGIN, DIGEST_END};
+
+    #[test]
+    fn digest_filter_strips_region_across_chunk_boundaries() {
+        let mut f = DigestTerminalFilter::new();
+        let mut out = String::new();
+        // 普通叙述立即透出。
+        out.push_str(&f.push("我先看一下界面。"));
+        // BEGIN 哨兵被拆散到两个 chunk
+        out.push_str(&f.push(&DIGEST_BEGIN[..10]));
+        out.push_str(&f.push(&DIGEST_BEGIN[10..]));
+        // digest 区间内容被吞掉
+        out.push_str(&f.push("界面上有一个搜索框，右下角是按钮"));
+        // END 哨兵被拆散
+        out.push_str(&f.push(&DIGEST_END[..8]));
+        out.push_str(&f.push(&DIGEST_END[8..]));
+        // 后续叙述恢复透出
+        out.push_str(&f.push("接下来我操作一下。"));
+        out.push_str(&f.flush());
+        assert_eq!(out, "我先看一下界面。接下来我操作一下。");
+    }
+
+    #[test]
+    fn digest_filter_flush_recovers_unclosed_region() {
+        let mut f = DigestTerminalFilter::new();
+        let mut out = String::new();
+        out.push_str(&f.push("叙述开始"));
+        out.push_str(&f.push(DIGEST_BEGIN));
+        let body = "被截断的摘要正文很长，必须保持原始顺序，不能把尾部移到开头。";
+        out.push_str(&f.push(body));
+        // 流结束仍未闭合：回退输出暂存内容，避免静默丢叙述
+        out.push_str(&f.flush());
+        assert_eq!(out, format!("叙述开始{body}"));
+        assert_eq!(f.flush(), "");
+    }
+
+    #[test]
+    fn digest_filter_multiple_regions_and_adjacent_text() {
+        let mut f = DigestTerminalFilter::new();
+        let text = format!(
+            "a{DIGEST_BEGIN}1{DIGEST_END}b{DIGEST_BEGIN}2{DIGEST_END}c"
+        );
+        let mut out = f.push(&text);
+        out.push_str(&f.flush());
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn digest_filter_keeps_partial_sentinel_tail_until_flush() {
+        let mut f = DigestTerminalFilter::new();
+        // 流在普通文本中结束：尾部可能是哨兵前缀的部分在 flush 时透出
+        assert_eq!(f.push("结尾写着 <<<IMAGE_"), "结尾写着 ");
+        assert_eq!(f.flush(), "<<<IMAGE_");
+    }
 }

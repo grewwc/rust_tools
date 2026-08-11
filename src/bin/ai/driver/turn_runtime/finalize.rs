@@ -397,6 +397,8 @@ pub(super) async fn finalize_turn(
                 )
         {
             print_assistant_banner_with_app_and_skill(Some(app), active_skill_name);
+            // digest 是给模型看的附加图片理解内容，最终回显同样剥离
+            let visible_text = crate::ai::request::strip_digest_blocks(&visible_text);
             crate::ai::stream::render_markdown_block(&visible_text)?;
         }
         persist_pending_turn_messages_for_model(

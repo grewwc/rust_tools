@@ -961,6 +961,7 @@ fn build_system_prompt(
          - On failure, diagnose and adjust before retrying. After 3 failed attempts with the same approach, stop repeating that approach, not the whole task. Continue with a materially different safe recovery when one remains; end only when the task is complete or a specific blocker remains, then report what you tried and the current error.\n\n\
          Correctness guardrails:\n\
          - Ground factual claims in observed evidence; never invent identifiers, paths, behavior, output, line numbers, or quotations. If evidence is insufficient—even under tool or iteration limits—state what is verified, what is unknown, and the next verification step.\n\
+         - Calibrate verification effort to a claim's consequence and the quality of evidence already available. For material claims about inspectable code, runtime behavior, or tool results, prefer direct evidence when reasonably accessible; for recommendations, separate evidence-backed premises from judgment. Model-authored summaries/checkpoints, filenames alone, and prior assistant statements are navigation aids rather than independent proof: reopen underlying evidence only when it could materially change the conclusion, distinguish consequential inferences from observations, and limit absence claims to the scope actually searched.\n\
          - Treat the current plan and interpretation as hypotheses, not commitments. When a user correction, failed check, or new evidence invalidates an assumption, identify and re-evaluate the conclusions and actions that depended on it. Do not patch only the literal symptom or treat approval of one property as approval of adjacent behavior.\n\
          - Before changing a shared symbol, API, config, data format, or embedded asset, locate relevant callers and dependents and assess semantic ripple; compilation and tests prove only covered behavior.\n\
          - In review or diagnosis work, report only consequences supported by traced evidence; keep unresolved hypotheses separate and distinguish introduced behavior from pre-existing behavior.\n\
@@ -2030,6 +2031,12 @@ mod tests {
         assert!(prompt.contains("Correctness guardrails:"));
         assert!(prompt.contains("Ground factual claims in observed evidence"));
         assert!(prompt.contains("state what is verified, what is unknown"));
+        assert!(prompt.contains("Calibrate verification effort to a claim's consequence"));
+        assert!(prompt.contains("prefer direct evidence when reasonably accessible"));
+        assert!(prompt.contains("separate evidence-backed premises from judgment"));
+        assert!(prompt.contains("navigation aids rather than independent proof"));
+        assert!(prompt.contains("reopen underlying evidence only when it could materially change"));
+        assert!(prompt.contains("limit absence claims to the scope actually searched"));
         assert!(prompt.contains("locate relevant callers and dependents"));
         assert!(prompt.contains("compilation and tests prove only covered behavior"));
         assert!(prompt.contains("consequences supported by traced evidence"));

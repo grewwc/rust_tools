@@ -81,8 +81,9 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
     replace a required verification round with no-tool synthesis.
 22. **Terminal rendering never mutates conversation state.** Visible assistant
     text streams live to the terminal as it arrives, including tool-round
-    narration and candidate finals that a gate may later reject or warn on.
-    Terminal output is a non-authoritative preview: the persisted
+    narration and candidate finals that a gate may later reject or warn on;
+    terminal-only dedupe may suppress an exact replay of narration already shown
+    in the preceding tool round. Terminal output is a non-authoritative preview: the persisted
     `assistant_text`/`turn_messages` remain the single source of truth for
     history, context, and gate decisions, and rendering must never alter them.
 23. **Model-guided offloading is request-boundary work.** Before every logical

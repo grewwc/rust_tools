@@ -4,7 +4,8 @@ use super::{
     default_model, determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
     endpoint_supports_anonymous_auth, initial_model, max_output_tokens,
     merge_agent_tier_with_difficulty, model_adapter, model_platform_label, model_quality_tier,
-    parse_disabled_model_tokens, request_model_name, request_protocol_dialect,
+    parse_disabled_model_tokens, reasoning_in_content_enabled, request_model_name,
+    request_protocol_dialect,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 use crate::ai::cli::ParsedCli;
@@ -316,6 +317,14 @@ fn platform_changes_model_handle_but_legacy_adapter_handle_still_resolves() {
     // 这里必须显式配置，不能回退到 flagship 的保守 256K 默认窗口。
     assert_eq!(context_window_tokens(volcano), 1_024_000);
     assert_eq!(max_output_tokens(volcano), Some(65_536));
+}
+
+#[test]
+fn volcano_models_keep_dedicated_reasoning_channel() {
+    // 火山 GLM/DeepSeek 流会独立返回 reasoning_content；若再 arm content demux，
+    // 正文会被截留到流结束，遇到 </think> 时还会被错误归入 thinking。
+    assert!(!reasoning_in_content_enabled("deepseek-v4-flash-volcano"));
+    assert!(!reasoning_in_content_enabled("glm-5.2-volcano"));
 }
 
 #[test]

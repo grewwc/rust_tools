@@ -830,9 +830,9 @@ impl MarkdownStreamRenderer {
             self.code_line_number = 0;
 
             let label = if trimmed == THINKING_TAG_TEXT {
-                "thinking"
+                "○ thinking"
             } else {
-                "done thinking"
+                "✓ thinking"
             };
             return format!("{indent}{ACCENT_MUTED}{label}\x1b[0m\n");
         }
@@ -1520,8 +1520,8 @@ mod tests {
 
         let start_visible = strip_ansi_for_test(&start);
         let end_visible = strip_ansi_for_test(&end);
-        assert_eq!(start_visible, "thinking\n");
-        assert_eq!(end_visible, "done thinking\n");
+        assert_eq!(start_visible, "○ thinking\n");
+        assert_eq!(end_visible, "✓ thinking\n");
     }
 
     #[test]
@@ -1532,7 +1532,7 @@ mod tests {
         let out = renderer.consume_line(END_THINKING_TAG_TEXT, false);
 
         let visible = strip_ansi_for_test(&out);
-        assert_eq!(visible, "done thinking\n");
+        assert_eq!(visible, "✓ thinking\n");
     }
 
     #[test]

@@ -2044,9 +2044,10 @@ fn normalize_messages_keeps_model_derived_notes_out_of_system_role() {
     );
     assert!(normalized[2].content.as_str().is_some_and(|text| {
         text.contains("Compressed history summary")
-            && text.contains("Do not rerun tools solely")
+            && text.contains("unverified navigation context")
+            && text.contains("citation inside the summary does not by itself verify")
             && text.contains("history summary")
-            && !text.contains("not authoritative evidence")
+            && text.contains("not authoritative evidence")
     }));
     assert_eq!(normalized[5].content.as_str(), Some("working memory"));
 }
@@ -2112,7 +2113,8 @@ fn normalize_messages_prioritizes_working_memory_before_summary_and_self_note() 
     let self_note = derived_text.find("## Self Notes").unwrap();
     assert!(summary < self_note);
     assert!(derived_text.contains("Compressed history summary"));
-    assert!(derived_text.contains("Do not rerun tools solely"));
+    assert!(derived_text.contains("unverified navigation context"));
+    assert!(derived_text.contains("citation inside the summary does not by itself verify"));
     assert!(derived_text.contains("not authoritative evidence"));
 }
 

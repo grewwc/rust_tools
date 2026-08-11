@@ -34,6 +34,53 @@ fn prompt_cache_metrics_reports_hit_rate() {
 }
 
 #[test]
+fn terminal_dedupe_recognizes_exact_replayed_tool_round_narration() {
+    let mut state = StreamProcessingState::new();
+    state.render.terminal_dedupe = Some(TerminalDedupeState {
+        candidate: "结论已经在工具调用前展示。".to_string(),
+        buffered_terminal_output: "结论已经在工具调用前".to_string(),
+    });
+
+    assert!(terminal_dedupe_still_matches(&state));
+    assert!(!terminal_dedupe_buffer_is_complete_match(&state));
+
+    let dedupe = state.render.terminal_dedupe.as_mut().unwrap();
+    dedupe.buffered_terminal_output.push_str("展示。");
+    state.content.assistant_text = dedupe.buffered_terminal_output.clone();
+
+    assert!(terminal_dedupe_buffer_is_complete_match(&state));
+    assert!(final_assistant_matches_terminal_dedupe(&state));
+}
+
+#[test]
+fn terminal_dedupe_ignores_digest_blocks_in_final_assistant_text() {
+    let mut state = StreamProcessingState::new();
+    state.render.terminal_dedupe = Some(TerminalDedupeState {
+        candidate: "结论已经展示。".to_string(),
+        buffered_terminal_output: "结论已经展示。".to_string(),
+    });
+    state.content.assistant_text = format!(
+        "结论已经展示。{}内部图片摘要{}",
+        crate::ai::request::DIGEST_BEGIN,
+        crate::ai::request::DIGEST_END
+    );
+
+    assert!(final_assistant_matches_terminal_dedupe(&state));
+}
+
+#[test]
+fn terminal_dedupe_releases_content_after_visible_divergence() {
+    let mut state = StreamProcessingState::new();
+    state.render.terminal_dedupe = Some(TerminalDedupeState {
+        candidate: "旧结论".to_string(),
+        buffered_terminal_output: "新结论".to_string(),
+    });
+
+    assert!(!terminal_dedupe_still_matches(&state));
+    assert!(!terminal_dedupe_buffer_is_complete_match(&state));
+}
+
+#[test]
 fn waiting_hint_tool_name_is_single_line_and_terminal_safe() {
     assert_eq!(
         sanitize_waiting_hint_tool_name("apply_\x1b[31mpatch\n next\tstep"),
@@ -1584,11 +1631,7 @@ fn one_column_fold_content_keeps_row_accounting_safe() {
 }
 
 #[test]
-fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
-    assert_eq!(fold_rewrite_right_margin_cols(Some("vscode")), 2);
-    assert_eq!(fold_rewrite_right_margin_cols(Some("Trae")), 2);
-    assert_eq!(fold_rewrite_right_margin_cols(Some("iTerm.app")), 0);
-
+fn fold_window_keeps_last_terminal_columns_unused_without_terminal_detection() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1599,7 +1642,7 @@ fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
     let mut state = StreamProcessingState::new();
     let fold = &mut state.render.thinking_fold;
     fold.max_visible_lines = 5;
-    fold.rewrite_right_margin_cols = fold_rewrite_right_margin_cols(Some("vscode"));
+    fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
     fold.total_lines = 1;
     fold.recent_lines
         .push_back("12345678901234567890".to_string());
@@ -1611,8 +1654,8 @@ fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
         .map(crate::ai::stream::extract::strip_ansi_codes)
         .collect::<Vec<_>>();
 
-    // COLUMNS=12，reserve = 缩进 4 + xterm.js 右边距 2 = 6 → 有效宽度 6 列。
-    // 长行按 6 列自然折行，每个包裹段恰好一个物理行，与 xterm.js delayed-wrap 解耦。
+    // COLUMNS=12，reserve = 缩进 4 + 通用右边距 2 = 6 → 有效宽度 6 列。
+    // 不依赖 TERM_PROGRAM 识别，长行也始终避开 delayed-wrap 列。
     assert_eq!(
         plain_lines,
         vec![
@@ -1631,7 +1674,7 @@ fn xtermjs_fold_window_keeps_last_terminal_column_unused() {
     for visible in &plain_lines {
         assert!(
             unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 10,
-            "xterm.js rewrite line reaches delayed-wrap column: {visible:?}"
+            "fold rewrite line reaches delayed-wrap column: {visible:?}"
         );
     }
 
@@ -1743,6 +1786,39 @@ fn thinking_fold_window_body_excludes_anchored_header() {
     assert!(window.contains("line-1"));
     assert!(window.contains("line-2"));
     assert_eq!(rows, 3);
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
+fn completed_thinking_fold_replaces_anchored_header_in_place() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("COLUMNS", "200");
+    }
+
+    let mut fold = super::super::state::ThinkingFoldState::new();
+    fold.active = true;
+    fold.header_drawn = true;
+    fold.max_visible_lines = 2;
+    fold.total_lines = 3;
+    fold.window_rows = 2;
+    fold.rendered_body_lines = vec!["    second line".to_string(), "    third line".to_string()];
+    let mut out = Vec::new();
+
+    finalize_fold_to(&mut out, &mut fold, true).unwrap();
+
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!(
+            "\r\x1b[1A\x1b[0J\r\x1b[1A\r\x1b[2K  {ACCENT_MUTED}✓ thinking · 3 lines\x1b[0m\r\n{ACCENT_MUTED}    … 3 earlier lines\x1b[0m"
+        )
+    );
+    assert!(!fold.active);
 
     unsafe {
         std::env::remove_var("COLUMNS");

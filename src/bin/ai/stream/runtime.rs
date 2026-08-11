@@ -25,7 +25,10 @@ use super::{
         wrap_line_to_terminal_rows_with_reserve,
     },
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
-    state::{StreamChunkStep, StreamMarkers, StreamProcessingState, ToolCallBuilder},
+    state::{
+        StreamChunkStep, StreamMarkers, StreamProcessingState, TerminalDedupeState,
+        ToolCallBuilder,
+    },
 };
 
 /// Maximum number of decode errors before giving up and returning partial content
@@ -51,9 +54,10 @@ const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 2;
 /// thinking / subagent 折叠正文缩进：header/footer 用 2 空格，正文再内缩一层。
 const THINKING_FOLD_BODY_INDENT: &str = "    ";
 const THINKING_FOLD_BODY_INDENT_WIDTH: usize = 4;
-/// xterm.js 在右边界使用 delayed-wrap；折叠重画额外留两列，避免终端宽度或字符宽度
-/// 存在一列偏差时仍触发隐式换行，把旧窗口逐帧泄漏进 scrollback。
-const XTERMJS_FOLD_RIGHT_MARGIN_COLS: usize = 2;
+/// 终端右边界通常使用 delayed-wrap；折叠重画统一额外留两列，避免终端标识缺失、
+/// 宽度或字符宽度存在一列偏差时触发未计入 cursor-up 的隐式换行，把旧窗口尾部残留
+/// 在 `✓` 下方。
+const FOLD_REWRITE_RIGHT_MARGIN_COLS: usize = 2;
 /// 推理流连续重复的最短片段和判定次数。只检测 reasoning，避免把用户要求生成的重复
 /// 正文（表格、代码、测试数据等）误判为模型退化。
 const MIN_REASONING_REPEAT_CHARS: usize = 16;
@@ -87,10 +91,17 @@ pub(super) async fn stream_response(
     app: &mut App,
     response: &mut reqwest::Response,
     current_history: &mut String,
-    _terminal_dedupe_candidate: Option<&str>,
+    terminal_dedupe_candidate: Option<&str>,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
     let mut markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
+    state.render.terminal_dedupe = terminal_dedupe_candidate
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+        .map(|candidate| TerminalDedupeState {
+            candidate: candidate.to_string(),
+            buffered_terminal_output: String::new(),
+        });
     // 预填 `<think>` 模板的 reasoner 把推理链内联在 content 通道，仅以悬空
     // `</think>` 收尾、从不产生 reasoning_content。为这类模型 arm 拆分器，把泄漏的
     // 推理拆回 reasoning，避免思考链与正式答案一起落进可见正文。
@@ -248,8 +259,7 @@ fn configure_thinking_fold(state: &mut StreamProcessingState) {
             .get_opt(AiConfig::OUTPUT_THINKING_MAX_VISIBLE_LINES)
             .as_deref(),
     );
-    state.render.thinking_fold.rewrite_right_margin_cols =
-        fold_rewrite_right_margin_cols(std::env::var("TERM_PROGRAM").ok().as_deref());
+    state.render.thinking_fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
 }
 
 fn configure_subagent_preview_fold(
@@ -257,8 +267,7 @@ fn configure_subagent_preview_fold(
     state: &mut StreamProcessingState,
     markers: &mut StreamMarkers,
 ) {
-    state.render.subagent_fold.rewrite_right_margin_cols =
-        fold_rewrite_right_margin_cols(std::env::var("TERM_PROGRAM").ok().as_deref());
+    state.render.subagent_fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
     if !io::stdout().is_terminal() || runtime_ctx::current_subagent_depth() == 0 {
         state.render.subagent_fold.max_visible_lines = usize::MAX;
         return;
@@ -276,18 +285,6 @@ fn configure_subagent_preview_fold(
         markers.subagent_fold_footer.as_deref(),
     ) {
         state.render.subagent_fold.set_labels(header, footer);
-    }
-}
-
-fn fold_rewrite_right_margin_cols(term_program: Option<&str>) -> usize {
-    let Some(term_program) = term_program else {
-        return 0;
-    };
-    let term_program = term_program.to_ascii_lowercase();
-    if term_program.contains("vscode") || term_program.contains("trae") {
-        XTERMJS_FOLD_RIGHT_MARGIN_COLS
-    } else {
-        0
     }
 }
 
@@ -344,7 +341,7 @@ fn immediate_cancel_result(app: &App, state: &mut StreamProcessingState) -> Opti
 }
 
 /// 取消/中断时的 thinking 折叠收尾：折叠窗口若仍活跃，必须先擦掉当前窗口并落一个
-/// `done thinking` 收口，否则半截 thinking 窗口会被留在屏幕上，下一轮重试
+/// `✓` 收口，否则半截 thinking 窗口会被留在屏幕上，下一轮重试
 /// 的 fresh state 会在其下方再画一个新 header——累积成「重复 header + 大段空白」。
 fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
     if runtime_ctx::terminal_output_enabled() {
@@ -486,6 +483,7 @@ fn finalize_stream_response(
     }
 
     if render_terminal && state.content.thinking_open {
+        flush_digest_filter_to_terminal(markers, &mut state, true)?;
         if state.render.thinking_fold.active {
             finalize_thinking_fold(&mut state)?;
         } else {
@@ -515,7 +513,11 @@ fn finalize_stream_response(
     }
 
     if render_terminal {
+        // 残留也必须经过去重/折叠/样式管线，不能直接写终端。
+        flush_digest_filter_to_terminal(markers, &mut state, false)?;
         flush_terminal_splitter(&mut state, markers)?;
+        let suppress_duplicate = final_assistant_matches_terminal_dedupe(&state);
+        disable_terminal_dedupe(&mut state, suppress_duplicate)?;
         state.render.markdown.flush_pending()?;
     }
 
@@ -768,6 +770,9 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 
     if runtime_ctx::terminal_output_enabled() {
         if state.content.thinking_open {
+            let _ = flush_digest_filter_to_terminal(markers, state, true);
+        }
+        if state.content.thinking_open {
             let _ = write_stream_content(
                 &format!("\n{}\n", markers.end_thinking_tag),
                 &mut state.render.markdown,
@@ -779,6 +784,10 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         if state.render.subagent_fold.active {
             let _ = finalize_subagent_preview_fold(state);
         }
+        let _ = flush_digest_filter_to_terminal(markers, state, false);
+        let _ = flush_terminal_splitter(state, markers);
+        let suppress_duplicate = final_assistant_matches_terminal_dedupe(state);
+        let _ = disable_terminal_dedupe(state, suppress_duplicate);
         let _ = state.render.markdown.flush_pending();
     }
 
@@ -988,7 +997,7 @@ fn process_internal_tool_calls(
                 {
                     // 流式阶段不再打印工具名/参数（open_tool_call_line 与
                     // write_tool_call_arguments_stream 均为 no-op），因此这里只需
-                    // 复位颜色即可。绝不能用 println!——那会在「done thinking」与后续
+                    // 复位颜色即可。绝不能用 println!——那会在「✓」与后续
                     // 输出之间凭空插入一行空行（外部 delta 工具路径本就不打这行）。
                     if runtime_ctx::terminal_output_enabled() {
                         print!("\x1b[0m");
@@ -1045,11 +1054,13 @@ fn commit_visible_content(
     }
 
     if render_terminal {
+        // digest 是给模型看的附加图片理解内容，终端展示时剥离（历史/assistant_text 保留原文）
+        let terminal_content = state.render.digest_filter.push(&content);
         if markers.subagent_preview_enabled() {
-            write_subagent_content_folded(content.as_str(), state)?;
+            write_subagent_content_folded(terminal_content.as_str(), state)?;
         } else {
             maybe_write_stream_content(
-                content.as_str(),
+                terminal_content.as_str(),
                 state,
                 markers,
                 state.content.thinking_open,
@@ -1150,7 +1161,11 @@ fn write_stream_split_segment(
         StreamSplitSegment::Marker {
             marker_index: _,
             text,
-        } => write_stream_content_to_terminal(&text, &mut state.render.markdown, false),
+        } => {
+            let suppress_duplicate = terminal_dedupe_buffer_is_complete_match(state);
+            disable_terminal_dedupe(state, suppress_duplicate)?;
+            write_stream_content_to_terminal(&text, &mut state.render.markdown, false)
+        }
     }
 }
 
@@ -1166,7 +1181,60 @@ fn maybe_write_plain_stream_text(
         return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
     }
 
+    if let Some(dedupe) = state.render.terminal_dedupe.as_mut() {
+        dedupe.buffered_terminal_output.push_str(content);
+        if terminal_dedupe_still_matches(state) {
+            return Ok(());
+        }
+        disable_terminal_dedupe(state, false)?;
+        return Ok(());
+    }
+
     write_stream_content_to_terminal(content, &mut state.render.markdown, false)
+}
+
+fn terminal_dedupe_still_matches(state: &StreamProcessingState) -> bool {
+    let Some(dedupe) = state.render.terminal_dedupe.as_ref() else {
+        return false;
+    };
+    let buffered = dedupe.buffered_terminal_output.as_str();
+    let candidate = dedupe.candidate.as_str();
+    candidate.starts_with(buffered)
+        || (buffered.starts_with(candidate) && buffered[candidate.len()..].trim().is_empty())
+}
+
+fn terminal_dedupe_buffer_is_complete_match(state: &StreamProcessingState) -> bool {
+    state.render.terminal_dedupe.as_ref().is_some_and(|dedupe| {
+        dedupe.buffered_terminal_output.trim() == dedupe.candidate.trim()
+    })
+}
+
+fn final_assistant_matches_terminal_dedupe(state: &StreamProcessingState) -> bool {
+    state
+        .render
+        .terminal_dedupe
+        .as_ref()
+        .is_some_and(|dedupe| {
+            crate::ai::request::strip_digest_blocks(&state.content.assistant_text).trim()
+                == dedupe.candidate.trim()
+        })
+}
+
+fn disable_terminal_dedupe(
+    state: &mut StreamProcessingState,
+    suppress_buffered: bool,
+) -> io::Result<()> {
+    let Some(dedupe) = state.render.terminal_dedupe.take() else {
+        return Ok(());
+    };
+    if !suppress_buffered && !dedupe.buffered_terminal_output.is_empty() {
+        write_stream_content_to_terminal(
+            &dedupe.buffered_terminal_output,
+            &mut state.render.markdown,
+            false,
+        )?;
+    }
+    Ok(())
 }
 
 fn is_standalone_stream_marker(content: &str, marker: &str) -> bool {
@@ -1253,7 +1321,7 @@ fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str
 
 /// 只覆盖 thinking 正文窗口（折叠摘要 + 最近可见行），header 不在此列。
 ///
-/// header（`thinking`）在折叠激活时打印一次并锚定在正文之上，之后每次重画都只
+/// header（`○`）在折叠激活时打印一次并锚定在正文之上，之后每次重画都只
 /// 擦除并重写正文。正文最多展示 `max_visible_lines` 条物理内容行和一条折叠摘要，恒定
 /// 落在可视视口内，因此相对擦除永远够得着，不会随窗口滚入 scrollback
 /// 而失步——即便失步，也无法再生出第二个 header，从根上杜绝「孤儿 header 叠加」。
@@ -1293,6 +1361,32 @@ fn write_fold_header(
     write!(out, "  {ACCENT_MUTED}{}\x1b[0m\r\n", fold.header_label)
 }
 
+/// thinking 收尾时直接落最终 header；用于尚未写过进行中 header 的空折叠。
+fn write_thinking_fold_completion_header(
+    out: &mut impl Write,
+    fold: &super::state::ThinkingFoldState,
+    line_count: usize,
+) -> io::Result<()> {
+    write!(
+        out,
+        "  {ACCENT_MUTED}{} · {line_count} lines\x1b[0m\r\n",
+        fold.footer_label,
+    )
+}
+
+/// 将锚定的 `○ thinking` 原位改写为完成态，而不在正文下另起一条 `✓ thinking`。
+///
+/// 调用前 `erase_fold_body` 已让光标回到 header 下方的正文首行；因此上移一行、清空
+/// header 后重写即可。折叠正文仍按原逻辑绘制在新 header 下方。
+fn replace_thinking_fold_header(
+    out: &mut impl Write,
+    fold: &super::state::ThinkingFoldState,
+    line_count: usize,
+) -> io::Result<()> {
+    write!(out, "\r\x1b[1A\r\x1b[2K")?;
+    write_thinking_fold_completion_header(out, fold, line_count)
+}
+
 /// 正文渲染后光标停在最后一条物理行，而不是额外的空白行。重画时因此只需上移
 /// `rows - 1`；先回到行首再擦到屏幕底部，可覆盖窗口变窄后产生的 reflow 行。
 fn erase_fold_body(out: &mut impl Write, rows: usize) -> io::Result<()> {
@@ -1306,7 +1400,7 @@ fn erase_fold_body(out: &mut impl Write, rows: usize) -> io::Result<()> {
     write!(out, "\x1b[0J")
 }
 
-/// Thinking 结束时的最终渲染：覆盖正文窗口，输出最终折叠摘要 + "done thinking"。
+/// Thinking 结束时的最终渲染：覆盖正文窗口，并把锚定的 `○` 原位改为 `✓`。
 pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
     finalize_fold(&mut state.render.thinking_fold, true)
 }
@@ -1321,15 +1415,36 @@ fn finalize_fold(
     fold: &mut super::state::ThinkingFoldState,
     collapse_body: bool,
 ) -> io::Result<()> {
+    let mut out = io::stdout();
+    finalize_fold_to(&mut out, fold, collapse_body)
+}
+
+/// 折叠收尾写入实现；抽出 writer 以便回归测试精确验证终端光标序列。
+fn finalize_fold_to(
+    mut out: &mut impl Write,
+    fold: &mut super::state::ThinkingFoldState,
+    collapse_body: bool,
+) -> io::Result<()> {
     if !fold.active {
         return Ok(());
     }
 
-    let mut out = io::stdout();
     let erase_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
     erase_fold_body(&mut out, erase_rows)?;
-    // 若正文从未渲染过（header 尚未落地），补一个 header 以保证块结构完整。
-    if !fold.header_drawn {
+    // thinking 的完成态要替换进行中 header，而不是在正文下再打印一条 footer。
+    // 若折叠尚未真正落地，直接写完成态，避免短暂出现 `○ thinking`。
+    let line_count = fold
+        .total_lines
+        .saturating_add(usize::from(!fold.current_line.is_empty()));
+    if collapse_body {
+        if fold.header_drawn {
+            replace_thinking_fold_header(&mut out, fold, line_count)?;
+        } else {
+            write_thinking_fold_completion_header(&mut out, fold, line_count)?;
+            fold.header_drawn = true;
+        }
+    } else if !fold.header_drawn {
+        // subagent 预览维持既有 header/footer 两行布局。
         write_fold_header(&mut out, fold)?;
         fold.header_drawn = true;
     }
@@ -1355,18 +1470,17 @@ fn finalize_fold(
     fold.window_rows = body_rows;
     fold.rendered_body_lines = rendered_body_lines;
 
-    // 结尾同时给出规模，避免用户还要从折叠提示反推本次 thinking 的长度。
-    let line_count = fold
-        .total_lines
-        .saturating_add(usize::from(!fold.current_line.is_empty()));
-    if body_rows > 0 {
-        out.write_all(b"\r\n")?;
+    if !collapse_body {
+        // subagent 预览保留既有 footer；thinking 的规模信息已写入被原位替换的 header。
+        if body_rows > 0 {
+            out.write_all(b"\r\n")?;
+        }
+        write!(
+            out,
+            "  {ACCENT_MUTED}{} · {line_count} lines\x1b[0m\r\n",
+            fold.footer_label,
+        )?;
     }
-    write!(
-        out,
-        "  {ACCENT_MUTED}{} · {line_count} lines\x1b[0m\r\n",
-        fold.footer_label,
-    )?;
     out.flush()?;
 
     // 重置折叠状态
@@ -1921,6 +2035,7 @@ fn render_thinking_event(
 
     match event {
         StreamTextEvent::OpenThinking => {
+            flush_digest_filter_to_terminal(markers, state, false)?;
             if markers.subagent_preview_enabled() {
                 return Ok(());
             }
@@ -1937,13 +2052,19 @@ fn render_thinking_event(
                 return Ok(());
             }
             clear_waiting_hint(state)?;
+            // digest 是给模型看的附加图片理解内容，thinking 通道的终端展示同样剥离
+            let terminal_text = state.render.digest_filter.push(text);
+            if terminal_text.is_empty() {
+                return Ok(());
+            }
             if markers.subagent_preview_enabled() {
-                write_subagent_content_folded(text, state)?;
+                write_subagent_content_folded(terminal_text.as_str(), state)?;
             } else {
-                maybe_write_stream_content(text, state, markers, true)?;
+                maybe_write_stream_content(terminal_text.as_str(), state, markers, true)?;
             }
         }
         StreamTextEvent::CloseThinking => {
+            flush_digest_filter_to_terminal(markers, state, true)?;
             if markers.subagent_preview_enabled() {
                 return Ok(());
             }
@@ -1963,6 +2084,23 @@ fn render_thinking_event(
     }
 
     Ok(())
+}
+
+fn flush_digest_filter_to_terminal(
+    markers: &StreamMarkers,
+    state: &mut StreamProcessingState,
+    dimmed: bool,
+) -> io::Result<()> {
+    let residual = state.render.digest_filter.flush();
+    if residual.is_empty() || !runtime_ctx::terminal_output_enabled() {
+        return Ok(());
+    }
+    clear_waiting_hint(state)?;
+    if markers.subagent_preview_enabled() {
+        write_subagent_content_folded(&residual, state)
+    } else {
+        maybe_write_stream_content(&residual, state, markers, dimmed)
+    }
 }
 
 fn stream_text_event_to_content(
