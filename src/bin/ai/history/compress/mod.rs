@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use crate::ai::types::App;
 
 use super::types::{
-    MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, is_internal_note_role, is_system_like_role,
+    MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, is_internal_note_role,
+    is_runtime_synthetic_user_message, is_system_like_role, last_real_user_index,
     retained_turn_start,
 };
 
@@ -901,7 +902,10 @@ pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Me
     let messages = sanitize_persisted_history_messages(messages);
     let user_turns = messages
         .iter()
-        .filter(|message| message.role == "user")
+        .filter(|message| {
+            // 合成的 user 消息（图片 followup 等）不构成真实轮次，避免提前截断历史。
+            message.role == "user" && !is_runtime_synthetic_user_message(message)
+        })
         .count();
     if user_turns <= MAX_HISTORY_TURNS {
         return messages;
@@ -969,7 +973,7 @@ async fn compact_persisted_history_with_app_inner(
     let messages = sanitize_persisted_history_messages(messages);
     let user_turns = messages
         .iter()
-        .filter(|message| message.role == "user")
+        .filter(|message| message.role == "user" && !is_runtime_synthetic_user_message(message))
         .count();
     if user_turns <= threshold_turns {
         return messages;
@@ -2086,10 +2090,10 @@ fn messages_total_chars(messages: &[Message]) -> usize {
 
 fn current_turn_precision_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String> {
     let mut out = rustc_hash::FxHashSet::default();
-    let Some(current_turn_start) = messages.iter().rposition(|message| message.role == "user")
-    else {
-        return out;
-    };
+    // 合成 user 消息不构成轮次边界：否则本轮早前轮次的 precision 工具结果
+    // 会失去保护，被 Path C 有损截断。若完全没有真实 user，则整段历史都是
+    // 当前合成轮，和 retained_turn_start 的保守边界保持一致。
+    let current_turn_start = last_real_user_index(messages).unwrap_or(0);
     for message in messages.iter().skip(current_turn_start) {
         let Some(tool_calls) = &message.tool_calls else {
             continue;
@@ -2110,10 +2114,8 @@ fn current_turn_precision_tool_call_ids(messages: &[Message]) -> rustc_hash::FxH
 /// `task_wait` 等聚合结果不参与 precision 配额，但其正文同样不能被 Path C 截断。
 fn current_turn_lossless_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String> {
     let mut out = rustc_hash::FxHashSet::default();
-    let Some(current_turn_start) = messages.iter().rposition(|message| message.role == "user")
-    else {
-        return out;
-    };
+    // 没有真实 user 时，不能把合成轮中的不可有损结果暴露给 Path C。
+    let current_turn_start = last_real_user_index(messages).unwrap_or(0);
     for message in messages.iter().skip(current_turn_start) {
         let Some(tool_calls) = &message.tool_calls else {
             continue;
@@ -2177,10 +2179,7 @@ pub(in crate::ai) fn is_context_compaction_state(message: &Message) -> bool {
 
 fn upsert_context_compaction_state(messages: &mut Vec<Message>) {
     messages.retain(|message| !is_context_compaction_state(message));
-    let insert_at = messages
-        .iter()
-        .rposition(|message| message.role == "user")
-        .map_or(messages.len(), |index| index + 1);
+    let insert_at = last_real_user_index(messages).map_or(messages.len(), |index| index + 1);
     messages.insert(
         insert_at,
         Message {

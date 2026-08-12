@@ -192,13 +192,15 @@ pub(in crate::ai) use suspended::{
 #[cfg(test)]
 pub(in crate::ai) use task_evidence::render_unintegrated_task_evidence;
 pub(in crate::ai) use task_evidence::{
-    DeliveredTaskEvidence, integrate_task_evidence, record_delivered_task_evidence,
-    read_task_evidence_status_payload, render_unintegrated_task_evidence_resilient,
+    DeliveredTaskEvidence, integrate_task_evidence, read_task_evidence_status_payload,
+    record_delivered_task_evidence, render_unintegrated_task_evidence_resilient,
     task_evidence_exists,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{
     COLON, MAX_HISTORY_TURNS, Message, NEWLINE, SkillActivationEvent, ToolExecutionOutcome,
+    clear_runtime_message_metadata, is_runtime_synthetic_user_message, last_real_user_index,
+    runtime_synthetic_user_message,
 };
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
@@ -571,7 +573,7 @@ async fn compact_session_history_with_app_inner(
     let original_chars = messages_total_chars_pub(&messages);
     let user_turns = messages
         .iter()
-        .filter(|message| message.role == "user")
+        .filter(|message| message.role == "user" && !is_runtime_synthetic_user_message(message))
         .count();
     let exceeds_context_budget =
         app.config.history_max_chars > 0 && original_chars > app.config.history_max_chars;

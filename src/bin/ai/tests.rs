@@ -2727,8 +2727,8 @@ fn context_history_summary_keeps_tool_names_and_results() {
         .and_then(|m| m.content.as_str())
         .unwrap_or_default()
         .to_string();
-    assert!(summary.contains("工具证据摘要"));
-    assert!(summary.contains("助手先前回答（未独立验证）"));
+    assert!(summary.contains("Verified facts and sources"));
+    assert!(summary.contains("Assistant's previous answer (not independently verified)"));
     assert!(summary.contains("tree"));
     assert!(summary.contains("issue-0"));
     assert!(summary.contains("ERROR") || summary.contains("repeated failure"));

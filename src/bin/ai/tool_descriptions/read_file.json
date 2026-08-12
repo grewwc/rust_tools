@@ -1,12 +1,12 @@
 {
   "name": "read_file",
-  "description": "Read a line-numbered excerpt from a local file (regular files only; directories are not supported; absolute paths only). Use offset/limit to page: a large limit for a broad overview during discovery, a small limit for a precise line-range read once you know the region you need.",
+  "description": "Read a line-numbered excerpt from a local file (regular files only; directories are not supported). Paths may be absolute or relative to the effective working directory shown in the system prompt. Use offset/limit to page: a large limit for a broad overview during discovery, a small limit for a precise line-range read once you know the region you need. Set use_line_numbers=false to get the raw content without line-number prefixes (e.g. to copy exact text into apply_patch).",
   "parameters": {
     "type": "object",
     "properties": {
       "file_path": {
         "type": "string",
-        "description": "Absolute path to a regular file to read (directories are not supported; some sensitive paths are blocked)."
+        "description": "Path to a regular file to read, either absolute or relative to the effective working directory (directories are not supported; some sensitive paths are blocked)."
       },
       "offset": {
         "type": "integer",
@@ -15,6 +15,10 @@
       "limit": {
         "type": "integer",
         "description": "Number of lines to read (default: 1000). Use a large limit for a broad overview, a small one (e.g. 20-40) for a precise slice. Very large results are capped; a truncation notice gives the offset to continue from."
+      },
+      "use_line_numbers": {
+        "type": "boolean",
+        "description": "Whether to prefix each line with its 1-based line number (default: true). Set to false to return the raw file content; offset/limit paging and the truncation notice still apply."
       }
     },
     "required": [

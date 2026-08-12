@@ -1,7 +1,10 @@
 use rustc_hash::FxHashSet;
 use serde_json::Value;
 
-use crate::ai::{history::Message, types::App};
+use crate::ai::{
+    history::{Message, last_real_user_index},
+    types::App,
+};
 
 use super::mid_turn_compress_soft_threshold;
 
@@ -186,7 +189,7 @@ fn reposition_context_compaction_state_before_last_user(messages: &mut Vec<Messa
     else {
         return;
     };
-    let Some(last_user_index) = messages.iter().rposition(|m| m.role == "user") else {
+    let Some(last_user_index) = last_real_user_index(messages) else {
         // 无 user 消息：请求边界契约不适用，保持原样。
         return;
     };
@@ -327,7 +330,9 @@ fn fill_segment_summary(report: &mut ContextBudgetReport, messages: &[Message]) 
 }
 
 fn classify_segments(messages: &[Message]) -> Vec<ContextSegment> {
-    let last_user_index = messages.iter().rposition(|message| message.role == "user");
+    // 合成 user 消息不构成轮次边界：真实用户消息必须保持 Critical/Never 保护，
+    // 否则会被降级为 RecentUser 而可被 offload。
+    let last_user_index = last_real_user_index(messages);
     let precision_tool_ids = precision_tool_call_ids(messages);
     messages
         .iter()
@@ -434,7 +439,7 @@ fn is_precision_tool(tool_name: &str) -> bool {
 }
 
 fn collect_protected_messages(messages: &[Message]) -> Vec<ProtectedMessage> {
-    let last_user_index = messages.iter().rposition(|message| message.role == "user");
+    let last_user_index = last_real_user_index(messages);
     messages
         .iter()
         .enumerate()
@@ -630,10 +635,7 @@ mod tests {
             .iter()
             .position(crate::ai::history::compress::is_context_compaction_state)
             .expect("compaction state note must remain visible to the model");
-        let last_user_index = messages
-            .iter()
-            .rposition(|m| m.role == "user")
-            .expect("current user present");
+        let last_user_index = last_real_user_index(&messages).expect("current user present");
         assert!(
             note_index < last_user_index,
             "compaction note must sit before the last user message"

@@ -927,16 +927,16 @@ impl ToolRoundCheckpointPhase {
     fn guidance(self) -> &'static str {
         match self {
             Self::Explore => {
-                "当前仍处于只读取证阶段：总结已确认事实与唯一缺口，只选择一个最有信息增益的下一步；优先精准检索或一次足够大的读取，停止扩展无关证据面。"
+                "Still in the read-only evidence-gathering phase: summarize confirmed facts and the single remaining gap, then pick only the one next step with the highest information gain; prefer a precise search or one sufficiently large read, and stop expanding the unrelated evidence surface."
             }
             Self::ImplementedNeedsVerification => {
-                "最近已成功修改状态：不要重新扩展探索或继续无关修改；运行最窄且能覆盖该变更的检查/测试，必要时查看 diff/status，然后立即收尾。"
+                "State has recently been modified successfully: do not resume exploration or continue unrelated changes; run the narrowest check/test that covers the change, check diff/status if needed, then wrap up immediately."
             }
             Self::VerifiedNeedsFinalization => {
-                "已观察到成功验证：除非存在一个明确且会改变结论的缺口，否则不要继续调用工具；直接总结改动、验证结果与剩余风险并完成答复。"
+                "Successful verification observed: unless there is a clear gap that would change the conclusion, do not call any more tools; summarize the changes, verification results, and remaining risks, and complete the answer."
             }
             Self::RecoveringFromError => {
-                "最近的修改或验证失败：只诊断当前失败并进行一次针对性修复/重试，不要扩展到无关问题；若仍受阻，明确报告阻塞点并收尾。"
+                "A recent change or verification failed: diagnose only the current failure and make one targeted fix/retry without expanding into unrelated issues; if still blocked, clearly report the blocker and wrap up."
             }
         }
     }
@@ -968,12 +968,12 @@ impl ToolRoundCheckpointLevel {
 
     fn guidance(self) -> &'static str {
         match self {
-            Self::Review => "这是非错误、非工具失败的一次性阶段检查点。",
+            Self::Review => "This is a one-time phase checkpoint that is not an error or a tool failure.",
             Self::Restrict => {
-                "这是第二级检查点：先列出剩余必要工作，只允许完成关键修复与最小验证，不再扩大任务范围。"
+                "This is the second-level checkpoint: first list the remaining necessary work, then only complete critical fixes and minimal verification; do not expand the task scope."
             }
             Self::Finalize => {
-                "这是第三级检查点：基于现有证据收尾；除非当前验证失败且一次针对性修复可直接解决，否则不要继续调用工具。"
+                "This is the third-level checkpoint: wrap up based on existing evidence; do not call further tools unless the current verification failed and one targeted fix can resolve it directly."
             }
         }
     }
@@ -1424,8 +1424,8 @@ fn inject_task_anchor_note(
     use serde_json::Value;
     let goal = truncate_chars(question.trim(), TASK_ANCHOR_MAX_QUESTION_CHARS);
     let note = format!(
-        "[task-anchor] reason={reason}, iteration={iteration}.\n主任务目标: {goal}\n\
-请优先保持目标连续性：\n- 先总结目前已确认事实\n- 明确下一步唯一动作\n- 若信息不足，说明阻塞点并停止重复工具调用"
+        "[task-anchor] reason={reason}, iteration={iteration}.\nPrimary task goal: {goal}\n\
+Keep goal continuity in mind:\n- First summarize the facts confirmed so far\n- State the single next action\n- If information is insufficient, describe the blocker and stop repeating tool calls"
     );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -1931,11 +1931,11 @@ impl TurnSupervisor {
 fn inject_loop_breaker_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[loop-detected] 你最近 4 轮都在用相同参数调用相同工具；此前的工具结果仍在上下文中，重复调用不会产生新信息。\n\
-        不要再次调用这一组相同参数。先基于已有证据决定下一步：\n\
-        (a) 信息已足够时，直接执行实质动作或回答用户；\n\
-        (b) 信息不足时，只能选择一个不同且具体的动作（例如读取未覆盖的行范围、搜索新的符号/目标，或修改文件）；\n\
-        (c) 确实无法继续时，说明缺少的唯一关键信息及原因。";
+    let note = "[loop-detected] You have called the same tool with the same arguments for the last 4 rounds; the earlier tool results are still in context, so repeating the call would produce no new information.\n\
+        Do not call that same argument set again. Decide the next step from the existing evidence:\n\
+        (a) If you have enough information, perform a substantive action or answer the user directly;\n\
+        (b) If information is insufficient, pick only one different and concrete action (e.g. read a previously uncovered line range, search a new symbol/target, or modify a file);\n\
+        (c) If you truly cannot proceed, state the single missing key piece of information and why.";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
@@ -1948,9 +1948,9 @@ fn inject_loop_breaker_note(messages: &mut Vec<crate::ai::history::Message>) {
 fn inject_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[loop-hard-stop] 你在收到重复调用提示后，仍连续 6 轮用相同参数调用相同工具，判定为无效循环。\n\
-        从现在起进入无工具收口模式：不要再发起任何工具调用；\n\
-        请基于已有信息给出阶段总结与当前结论；若任务仍未完成，明确说明缺口、剩余工作与建议的下一步。";
+    let note = "[loop-hard-stop] Despite the repeat-call notice, you called the same tool with the same arguments for 6 consecutive rounds; this is judged an ineffective loop.\n\
+        From now on you are in no-tool wrap-up mode: do not issue any more tool calls;\n\
+        give a phase summary and current conclusion based on existing information; if the task is not yet complete, clearly state the gap, remaining work, and suggested next steps.";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
@@ -2001,10 +2001,10 @@ pub(super) fn record_force_final_reason(
 fn inject_coarse_loop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[low-yield-repetition] 你最近多轮都在对同一目标调用同一工具，主要变化只是翻页/检索窗口参数。\n\
-        这常常意味着低收益重复，但不一定是错误：如果这些调用分别服务于不同且明确的子问题，可以继续；\n\
-        否则请优先：(a) 一次读取更大的行范围（提高 read_file 的 limit）或用检索工具一次定位；\n\
-        (b) 复用已读到的内容，不要重复读同一文件同一段；(c) 若信息已足够，就直接作答。";
+    let note = "[low-yield-repetition] You have been calling the same tool on the same target for several rounds, with the main variation being only paging/search-window parameters.\n\
+        This often means low-yield repetition, but it is not necessarily an error: if the calls serve distinct and well-defined sub-questions, you may continue;\n\
+        otherwise prefer: (a) reading a larger line range at once (raise read_file's limit) or locating with a search tool in one shot;\n\
+        (b) reusing content you already read instead of re-reading the same file/segment; (c) if you already have enough information, answer directly.";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
@@ -2020,11 +2020,11 @@ fn inject_coarse_loop_note(messages: &mut Vec<crate::ai::history::Message>) {
 fn inject_target_repeat_loop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[low-yield-repetition] 你最近多轮一直在对同一个目标（同一文件 / 同一检索目标）反复取证，\n\
-        只是每轮换了不同的工具或搭配了不同的陪衬调用来绕过重复——但你并没有得到新信息。\n\
-        请停下来做一件事：直接复用你已经读到 / 搜到的关于该目标的内容，不要再换一个工具去查同一个东西。\n\
-        然后二选一：(a) 若信息已足够，立即执行下一步实质动作或直接作答；\n\
-        (b) 若确需继续，请明确写下你还缺哪一条『关于该目标的新信息』、以及为什么换工具能拿到它。";
+    let note = "[low-yield-repetition] For several rounds you have kept re-gathering evidence on the same target (the same file / the same search target),\n\
+        merely switching tools or padding each round with different side calls to dodge the repetition — but you gained no new information.\n\
+        Stop and do one thing: reuse what you already read/searched about that target instead of checking the same thing with another tool.\n\
+        Then choose one: (a) if you have enough information, immediately take the next substantive action or answer directly;\n\
+        (b) if you really must continue, write down exactly which new piece of information about that target is still missing and why switching tools would obtain it.";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
@@ -2039,9 +2039,9 @@ fn inject_target_repeat_loop_note(messages: &mut Vec<crate::ai::history::Message
 fn inject_coarse_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[low-yield-hard-stop] 你已连续多轮对同一目标重复调用 `execute_command`，变化主要只是窗口/排序细节，判定为无效探索。\n\
-        从现在起进入无工具收口模式：不要再发起任何工具调用；\n\
-        请基于已有信息给出阶段总结与当前结论；若任务仍未完成，明确说明当前缺口、剩余工作与建议的下一步。";
+    let note = "[low-yield-hard-stop] You have repeatedly called `execute_command` on the same target for several rounds, varying mainly window/sort details; this is judged ineffective exploration.\n\
+        From now on you are in no-tool wrap-up mode: do not issue any more tool calls;\n\
+        give a phase summary and current conclusion based on existing information; if the task is not yet complete, clearly state the current gap, remaining work, and suggested next steps.";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
@@ -2060,19 +2060,19 @@ fn inject_coarse_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Mess
 /// 重复（本次事故的直接成因）。硬停 / 迭代上限等 force-final 提示不套用本约束——
 /// 那时正文就是最终答复。
 const SELF_NOTE_REFLECTION_CHANNEL_HINT: &str = "\n\
-    重要（落点约束）：上面要求你写下的账本 / 归纳属于内部自省，必须整段写在 \
-    `<meta:self_note>` 与 `</meta:self_note>` 之间；这段内容不会展示给用户、但会保留在你的后续上下文里。\n\
-    面向用户的正文本轮应保持为空或仅承载「继续执行的下一步」，只有在你确实可以收尾时才写真正的最终结论。";
+    Important (placement constraint): the ledger / summary asked for above is internal self-reflection; write it in full \
+    between `<meta:self_note>` and `</meta:self_note>`; it is not shown to the user but stays in your subsequent context.\n\
+    Keep the user-facing text of this round empty or limited to the next step you are continuing with; write a real final conclusion only when you are genuinely wrapping up.";
 
 /// 反思式提示，不阻断工具——给模型解释「为什么还要继续同方向」和继续探索的权利。
 fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-        "[low-progress-review] 运行时最近没有观察到新的目标、成功状态变更或新的工具结果内容。\n\
-        这是启发式检查，不代表同一目标上的工作一定无效，也不要仅因本提示放弃必要步骤。\n\
-        继续调用工具前，请确认：下一次调用会补哪条尚缺证据，以及什么结果会结束该分支。\n\
-        若现有证据已足够，就完成最窄验证并作答；若不足，可按上述明确缺口继续。\
+        "[low-progress-review] The runtime recently observed no new target, success-state change, or new tool-result content.\n\
+        This is a heuristic check; it does not mean the work on the same target is necessarily ineffective, and do not drop necessary steps just because of this note.\n\
+        Before calling a tool, confirm which missing piece of evidence the next call would add, and what result would end this branch.\n\
+        If existing evidence is enough, run the narrowest verification and answer; if not, you may continue along the clearly stated gap.\
         {SELF_NOTE_REFLECTION_CHANNEL_HINT}"
     );
     messages.push(Message {
@@ -2090,12 +2090,12 @@ fn inject_read_only_breadth_note(messages: &mut Vec<crate::ai::history::Message>
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-        "[read-only-breadth-check] 你已在只读分析中覆盖了大量不同目标资源，\n\
-        这可能是必要的广泛排查，也可能已经从『补关键证据』滑向『不断扩分支』。\n\
-        工具仍然可用；但在继续前，请先用不超过 6 行写下：\n\
-        1) 已确认事实（最多 3 条）；2) 当前结论或最可能解释；\n\
-        3) 仍缺的唯一关键证据；4) 下一步唯一工具动作。\n\
-        如果已经足够回答，请直接给出结论，不要为了再次确认而继续扩展搜索面。{SELF_NOTE_REFLECTION_CHANNEL_HINT}"
+        "[read-only-breadth-check] You have already covered many different target resources in read-only analysis,\n\
+        which may be a necessary broad sweep, or may have slid from filling key evidence into endlessly expanding branches.\n\
+        Tools remain available; but before continuing, write down in at most 6 lines:\n\
+        1) confirmed facts (at most 3); 2) current conclusion or most likely explanation;\n\
+        3) the single still-missing key evidence; 4) the single next tool action.\n\
+        If you can already answer, give the conclusion directly instead of expanding the search surface just to re-confirm. {SELF_NOTE_REFLECTION_CHANNEL_HINT}"
     );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -2112,13 +2112,13 @@ fn inject_progress_ledger_note(messages: &mut Vec<crate::ai::history::Message>) 
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-        "[low-progress-ledger] 在上一阶段检查后的响应窗口内，运行时仍未观察到新的目标、\n\
-        成功状态变更或新的工具结果内容。若要继续，请先用不超过 6 行写出决策账本：\n\
-        1) 已确认事实（bullet，最多 3 条）\n\
-        2) 仍待解决的唯一关键问题\n\
-        3) 候选分支 A / B 及你现在选哪个、为什么\n\
-        4) 基于所选分支的下一步唯一动作\n\
-        若缺口明确，可继续执行该动作；若无法表述缺口，就基于现有证据收尾。\
+        "[low-progress-ledger] Within the response window after the previous phase check, the runtime still observed no new target,\n\
+        success-state change, or new tool-result content. To continue, first write a decision ledger in at most 6 lines:\n\
+        1) confirmed facts (bullets, at most 3)\n\
+        2) the single key question still to resolve\n\
+        3) candidate branches A / B and which you pick now, and why\n\
+        4) the single next action based on the chosen branch\n\
+        If the gap is clear, you may execute that action; if you cannot articulate a gap, wrap up on existing evidence.\
         {SELF_NOTE_REFLECTION_CHANNEL_HINT}"
     );
     messages.push(Message {
@@ -2134,10 +2134,10 @@ fn inject_progress_ledger_note(messages: &mut Vec<crate::ai::history::Message>) 
 fn inject_low_progress_hard_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[low-progress-hard-stop] 经软提示、响应窗口与记账后，运行时仍未观察到可测进展。\n\
-        为避免继续消耗预算，现在进入无工具收口模式：不要再发起任何工具调用；\n\
-        请基于已收集到的信息给出阶段结论：已确认了什么、还差什么、\n\
-        以及若要完成任务建议的下一步（若是变更类任务，直接说明应改哪些文件、怎么改）。";
+    let note = "[low-progress-hard-stop] After soft notices, response windows, and the ledger, the runtime still observed no measurable progress.\n\
+        To avoid burning more budget, you are now in no-tool wrap-up mode: do not issue any more tool calls;\n\
+        give a phase conclusion based on the information gathered: what has been confirmed, what is still missing,\n\
+        and the suggested next step to finish the task (for change tasks, state directly which files to modify and how).";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
@@ -2156,10 +2156,10 @@ fn inject_tool_round_checkpoint_note(
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-        "[tool-round-checkpoint] level={} phase={} round={iteration} threshold={}。\n\
+        "[tool-round-checkpoint] level={} phase={} round={iteration} threshold={}.\n\
         {}\n\
         {}\n\
-        checkpoint 不改变委派标准：不要因上下文或迭代压力转交当前分支，只委派原本就独立、有界且值得委派的子任务。",
+        Checkpoint does not change delegation rules: do not hand off the current branch due to context or iteration pressure; delegate only sub-tasks that are genuinely independent, bounded, and worth delegating.",
         checkpoint.level.label(),
         checkpoint.phase.recent_progress(),
         checkpoint.threshold,
@@ -2183,9 +2183,9 @@ fn inject_iteration_limit_reflect_note(
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-        "[iteration-limit] 你已经迭代 {max_iterations} 轮但仍未收敛。\n\
-        请用现有信息直接回答用户。如果信息不足，请明确告诉用户卡在哪里、\
-        缺什么资料、建议下一步怎么做——不要再发起任何工具调用。"
+        "[iteration-limit] You have iterated {max_iterations} rounds without converging.\n\
+        Answer the user directly with the information you have. If information is insufficient, clearly tell the user where you are stuck,\
+        what material is missing, and a suggested next step — do not issue any more tool calls."
     );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -2201,10 +2201,10 @@ fn inject_subagent_pre_timeout_wrap_up_note(messages: &mut Vec<crate::ai::histor
     use crate::ai::history::Message;
     use serde_json::Value;
 
-    let note = "[subagent-pre-timeout-wrap-up] 当前同步子任务的前台等待时间即将耗尽。\n\
-        现在进入无工具收口模式：不要再发起新的工具调用或扩展新的审计分支。\n\
-        请立即基于已收集的证据输出最终答复：先列出已验证的结论；\n\
-        将尚未验证的风险单独标注，绝不可猜测。";
+    let note = "[subagent-pre-timeout-wrap-up] The foreground wait time for the current synchronous sub-task is about to run out.\n\
+        You are now in no-tool wrap-up mode: do not issue new tool calls or expand into new audit branches.\n\
+        Immediately produce a final answer based on the evidence gathered: first list the verified conclusions;\n\
+        separately mark risks that are not yet verified — never guess.";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
@@ -2227,8 +2227,8 @@ mod tests {
             .last()
             .and_then(|message| message.content.as_str())
             .expect("wrap-up note should be textual");
-        assert!(note.contains("无工具收口模式"));
-        assert!(note.contains("最终答复"));
+        assert!(note.contains("no-tool wrap-up mode"));
+        assert!(note.contains("final answer"));
         assert!(!note.contains("`/audit`"));
     }
 
@@ -2942,8 +2942,8 @@ mod tests {
         inject_coarse_loop_note(&mut messages);
         let text = messages[0].content.as_str().unwrap_or_default().to_string();
         assert!(text.contains("[low-yield-repetition]"));
-        assert!(text.contains("不同且明确的子问题"));
-        assert!(text.contains("不一定是错误"));
+        assert!(text.contains("distinct and well-defined sub-questions"));
+        assert!(text.contains("not necessarily an error"));
     }
 
     #[test]
@@ -3915,8 +3915,8 @@ mod tests {
         inject_target_repeat_loop_note(&mut messages);
         let text = messages[0].content.as_str().unwrap_or_default().to_string();
         assert!(text.contains("[low-yield-repetition]"));
-        assert!(text.contains("同一个目标"));
-        assert!(text.contains("换一个工具去查同一个东西"));
+        assert!(text.contains("the same target"));
+        assert!(text.contains("checking the same thing with another tool"));
     }
 
     #[test]
@@ -4673,10 +4673,10 @@ async fn run_turn_body(
                 if consecutive_empty_responses > 5 {
                     let _ = writeln!(
                         std::io::stderr(),
-                        "  ✗ 连续 {} 次空响应，停止重试",
+                        "  ✗ {} consecutive empty responses; giving up retry",
                         consecutive_empty_responses
                     );
-                    final_assistant_text = "[模型连续返回空响应，请重试或切换模型]".to_string();
+                    final_assistant_text = "[Model returned empty responses repeatedly; please retry or switch models]".to_string();
                     break 'turn Ok(None);
                 }
             } else {
@@ -4700,17 +4700,17 @@ async fn run_turn_body(
                     if consecutive_stream_errors > MAX_STREAM_ERROR_RETRIES {
                         let _ = writeln!(
                             std::io::stderr(),
-                            "  ✗ 连续 {} 次响应流读取中断，停止重试",
+                            "  ✗ {} consecutive response-stream read interruptions; giving up retry",
                             consecutive_stream_errors
                         );
                         final_assistant_text =
-                            "[响应流多次读取中断，疑似服务端不稳定，请稍后重试或切换模型]"
+                            "[Response stream interrupted repeatedly; the server may be unstable. Please retry later or switch models]"
                                 .to_string();
                         break 'turn Ok(None);
                     }
                     let _ = writeln!(
                         std::io::stderr(),
-                        "  ⚠ 响应流读取中断（连续第 {consecutive_stream_errors} 次）；正在自动重试，连续超过 {MAX_STREAM_ERROR_RETRIES} 次时停止…"
+                        "  ⚠ Response-stream read interrupted (consecutive #{consecutive_stream_errors}); auto-retrying, stopping after {MAX_STREAM_ERROR_RETRIES} consecutive failures…"
                     );
                 } else {
                     // 真截断：模型撞输出上限或工具 JSON 半截。
@@ -4735,7 +4735,7 @@ async fn run_turn_body(
                         let halved = (current_max / 2).max(4096);
                         let _ = writeln!(
                             std::io::stderr(),
-                            "  ⚠ 零输出截断（completion=0），max_tokens {} → {} 自动降级重试",
+                            "  ⚠ Zero-output truncation (completion=0); auto-downgrading max_tokens {} → {} and retrying",
                             current_max,
                             halved
                         );
@@ -4798,7 +4798,7 @@ async fn run_turn_body(
                 {
                     let _ = writeln!(
                         std::io::stderr(),
-                        "  ▲ 连续 {} 次输出被截断，保留已产出的部分文本",
+                        "  ▲ {} consecutive truncated outputs; keeping the partial text produced so far",
                         consecutive_truncations
                     );
                     final_assistant_text = partial_text.to_string();
@@ -4811,14 +4811,14 @@ async fn run_turn_body(
                 {
                     let _ = writeln!(
                         std::io::stderr(),
-                        "  ✗ 连续 {} 次响应被截断，停止重试",
+                        "  ✗ {} consecutive truncated responses; giving up retry",
                         consecutive_truncations
                     );
                     // 保留模型已产出的部分文本（若有），比直接丢弃更有价值。
                     final_assistant_text = if has_visible_text {
                         partial_text.to_string()
                     } else {
-                        "[模型输出多次被截断，请缩小单次操作规模（如分块写文件）或切换模型]"
+                        "[Model output truncated repeatedly; please shrink per-operation scope (e.g., write files in chunks) or switch models]"
                             .to_string()
                     };
                     break 'turn Ok(None);

@@ -801,9 +801,10 @@ fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<Stri
                         "Replace in line: `old` substring not found in matched line {} \
                          (even with Unicode/whitespace tolerance). Line content: {:?}\n\
                          Tips: copy `old` from the actual file, not from memory. If you \
-                         copied it from a `read_file` result, do NOT include the \
-                         line-number prefix (e.g. `    42<TAB>`); copy only the code part \
-                         of the line. Watch for smart quotes / dashes / non-breaking \
+                         need fresh source text, re-read with `read_file` \
+                         (use_line_numbers=false) so the output has no line-number \
+                         prefixes and you can copy the exact line content. Watch for \
+                         smart quotes / dashes / non-breaking \
                          spaces that may differ from the file.",
                         line_idx + 1,
                         target_line
@@ -1734,7 +1735,7 @@ fn describe_context_mismatch(
     }
 
     msg.push_str(
-        "Hint: rebuild the patch from the copy-verbatim block above (the text between <<<PATCH_TEXT and PATCH_TEXT>>>), which is the exact current file content with NO line-number prefix. For a small change, a `*** Replace in line:` section (anchor/old/new) is the most reliable. If the shown context is insufficient, re-read the file with read_file and copy only the code after each `<number>\\t` prefix.",
+        "Hint: rebuild the patch from the copy-verbatim block above (the text between <<<PATCH_TEXT and PATCH_TEXT>>>), which is the exact current file content with NO line-number prefix. For a small change, a `*** Replace in line:` section (anchor/old/new) is the most reliable. If the shown context is insufficient, re-read the file with read_file(use_line_numbers=false) to get raw content without line-number prefixes, then copy the exact text.",
     );
     msg
 }

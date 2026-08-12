@@ -11,7 +11,8 @@ use rustc_hash::FxHashSet;
 use serde_json::Value;
 
 use crate::ai::history::{
-    Message, ROLE_SYSTEM, is_internal_note_role, is_summary_note_text, is_system_like_role,
+    Message, ROLE_SYSTEM, clear_runtime_message_metadata, is_internal_note_role,
+    is_summary_note_text, is_system_like_role,
 };
 use crate::ai::models;
 use crate::ai::types::App;
@@ -594,6 +595,14 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         out
     }
 
+    // canonical history 需要保留 runtime 来源旁路以重建真实 user 边界；provider
+    // payload 不得看到内部 metadata，所以在所有 request projection 逻辑之前清除。
+    let mut request_messages = messages.to_vec();
+    request_messages
+        .iter_mut()
+        .for_each(clear_runtime_message_metadata);
+    let messages = request_messages.as_slice();
+
     let first_system_idx = messages.iter().position(|m| m.role == ROLE_SYSTEM);
     let Some(first_system_idx) = first_system_idx else {
         let mut projected = Vec::with_capacity(messages.len() + 1);
@@ -884,6 +893,34 @@ pub(crate) fn fold_resolved_tool_failures(
         message.content = Value::String(format!(
             "[resolved tool failure: a later invocation with the identical tool, arguments, and execution environment succeeded; failed_tool_call_id={tool_call_id}; successful_tool_call_id={successful_tool_call_id}; original diagnostics omitted]"
         ));
+    }
+}
+
+#[cfg(test)]
+mod synthetic_user_projection_tests {
+    use super::*;
+    use crate::ai::history::{is_runtime_synthetic_user_message, runtime_synthetic_user_message};
+
+    #[test]
+    fn request_projection_removes_runtime_origin_without_changing_content() {
+        let content = serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "x.png"}},
+            {"type": "text", "text": "[runtime-synthetic-user] ordinary content"}
+        ]);
+        let synthetic = runtime_synthetic_user_message(content.clone());
+        assert!(is_runtime_synthetic_user_message(&synthetic));
+
+        let normalized = normalize_messages_for_request(&[synthetic]);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].role, "user");
+        assert_eq!(normalized[0].content, content);
+        assert_eq!(normalized[0].reasoning_content, None);
+        assert!(!is_runtime_synthetic_user_message(&normalized[0]));
+        assert!(
+            !serde_json::to_string(&normalized[0])
+                .unwrap()
+                .contains("runtime-origin:synthetic-user")
+        );
     }
 }
 

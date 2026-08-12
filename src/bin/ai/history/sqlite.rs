@@ -134,12 +134,10 @@ pub(super) fn delete_session_state_lock(path: &Path) -> io::Result<()> {
 /// `Arc::strong_count == 1`（无其他线程正持有该锁的克隆）时移除，避免摘除一把
 /// 正在被 `with_session_state_lock` 使用的锁，从而破坏该路径的互斥语义。
 pub(super) fn remove_session_state_lock_entry(path: &Path) {
-    let mut locks = SESSION_STATE_LOCKS
-        .lock()
-        .unwrap_or_else(|poison| {
-            warn_session_lock_poison(path, "history lock registry");
-            poison.into_inner()
-        });
+    let mut locks = SESSION_STATE_LOCKS.lock().unwrap_or_else(|poison| {
+        warn_session_lock_poison(path, "history lock registry");
+        poison.into_inner()
+    });
     if let Some(existing) = locks.get(path)
         && Arc::strong_count(existing) == 1
     {
@@ -154,12 +152,10 @@ pub(super) fn with_session_state_lock<T>(
     operation: impl FnOnce() -> io::Result<T>,
 ) -> io::Result<T> {
     let lock = {
-        let mut locks = SESSION_STATE_LOCKS
-            .lock()
-            .unwrap_or_else(|poison| {
-                warn_session_lock_poison(path, "history lock registry");
-                poison.into_inner()
-            });
+        let mut locks = SESSION_STATE_LOCKS.lock().unwrap_or_else(|poison| {
+            warn_session_lock_poison(path, "history lock registry");
+            poison.into_inner()
+        });
         locks
             .entry(path.to_path_buf())
             .or_insert_with(|| Arc::new(Mutex::new(())))

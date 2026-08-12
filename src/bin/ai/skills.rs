@@ -31,7 +31,10 @@ use rust_tools::cw::SkipMap;
 use crate::ai::config_schema::AiConfig;
 use crate::commonw::{configw, utils::expanduser};
 
-const BUILTIN_SKILLS: &[(&str, &str)] = &[];
+const BUILTIN_SKILLS: &[(&str, &str)] = &[(
+    "audit_own_changes.skill",
+    include_str!("builtin_skills/audit_own_changes.skill"),
+)];
 
 fn default_skill_version() -> String {
     "1.0.0".to_string()

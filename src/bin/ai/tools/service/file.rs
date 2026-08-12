@@ -17,6 +17,7 @@ pub(crate) fn render_line_excerpt(
     start: usize,
     end: usize,
     max_chars: Option<usize>,
+    with_line_numbers: bool,
 ) -> RenderedLineExcerpt {
     let lines: Vec<&str> = content.lines().collect();
     let mut text = String::new();
@@ -24,7 +25,11 @@ pub(crate) fn render_line_excerpt(
     let mut truncated_mid_line = false;
 
     for (idx, line) in lines[start..end].iter().enumerate() {
-        let rendered = format!("{:>6}\t{}", start + idx + 1, line);
+        let rendered = if with_line_numbers {
+            format!("{:>6}\t{}", start + idx + 1, line)
+        } else {
+            line.to_string()
+        };
         if let Some(limit) = max_chars {
             if !text.is_empty() {
                 if text.chars().count().saturating_add(1) >= limit {
@@ -104,18 +109,24 @@ fn read_file_number_prefix_rest(line: &str) -> Option<&str> {
     Some(rest)
 }
 
-/// 仅对会话归档的 `overflow-history.md` 与 `read_file` 外溢快照剥离一层展示行号。
+/// 仅对会话归档的 `overflow-history.md` 剥离一层展示行号。
 ///
-/// 普通用户文件里合法的 `123\t...`/TSV 内容不应被误判并篡改；而无限重读循环里
-/// 真正会出现 N 重行号嵌套的，是归档历史文件和保存的旧 `read_file` 输出。
+/// `read_file` 外溢快照保存的是先前工具调用的完整渲染结果。重读时应直接保留
+/// 该结果里的原始行号，而不是剥离后按 asset 的相对行号重新编号；否则既不再是
+/// 精确快照，也会把 `use_line_numbers=false` 的真实 `123\t...` 内容误当展示层。
 fn should_strip_rendered_line_number_layer(path: &std::path::Path) -> bool {
-    is_read_file_overflow_artifact(path)
-        || (path.file_name().and_then(|name| name.to_str()) == Some("overflow-history.md")
-            && path
-                .parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".assets")))
+    path.file_name().and_then(|name| name.to_str()) == Some("overflow-history.md")
+        && path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".assets"))
+}
+
+/// 历史 `read_file` 快照已经包含调用当时选择的展示形式。为避免外层再添一层
+/// asset 相对行号，回读快照时保持其原始渲染；普通文件仍遵从调用方的开关。
+fn should_render_read_file_line_numbers(path: &std::path::Path, requested: bool) -> bool {
+    requested && !is_read_file_overflow_artifact(path)
 }
 
 fn truncate_chars_to_limit(text: &str, max_chars: usize) -> String {
@@ -193,7 +204,19 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     let start = offset.saturating_sub(1).min(total);
     let end = (start + limit).min(total);
 
-    let excerpt = render_line_excerpt(&content, start, end, Some(MAX_READ_FILE_RESULT_CHARS));
+    // 默认带行号（grounding 轴）；use_line_numbers=false 时返回原始内容，
+    // 便于把结果直接作为 apply_patch 的精确源文本或其他工具的输入。
+    let use_line_numbers = should_render_read_file_line_numbers(
+        store.path(),
+        args["use_line_numbers"].as_bool().unwrap_or(true),
+    );
+    let excerpt = render_line_excerpt(
+        &content,
+        start,
+        end,
+        Some(MAX_READ_FILE_RESULT_CHARS),
+        use_line_numbers,
+    );
     // 用实际渲染行数计算续读锚点：字符上限可能在请求的 `end` 之前就截断，
     // 若沿用 `end` 会让续读 offset 跳过未显示的行（静默丢数据）。
     let shown_end = start + excerpt.shown_lines;
@@ -567,6 +590,63 @@ mod tests {
     }
 
     #[test]
+    fn test_read_file_raw_mode_returns_content_without_line_numbers() {
+        // 原始内容本身包含形如 `  7\tvalue` 的行：raw 模式必须原样返回，
+        // 不带行号前缀、也不受 strip 逻辑影响（strip 只作用于归档路径）。
+        let path = make_temp_path("raw");
+        let content = "alpha\nbeta\n  7\tvalue\nlast";
+        fs::write(&path, content).unwrap();
+
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 100,
+            "use_line_numbers": false
+        });
+        let output = execute_read_file(&args).unwrap();
+        assert_eq!(output, content, "raw output: {output}");
+        assert!(!output.contains("truncated"), "output: {output}");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_raw_mode_preserves_paging_and_notice() {
+        let path = make_temp_path("raw_page");
+        fs::write(&path, "a\nb\nc\nd\ne").unwrap();
+
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 2,
+            "limit": 2,
+            "use_line_numbers": false
+        });
+        let output = execute_read_file(&args).unwrap();
+        assert!(output.starts_with("b\nc"), "output: {output}");
+        assert!(output.contains("truncated"), "output: {output}");
+        assert!(output.contains("offset=4"), "output: {output}");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_defaults_to_line_numbers() {
+        // 缺省（未传 use_line_numbers）时行为必须与历史一致：带行号前缀。
+        let path = make_temp_path("default_ln");
+        fs::write(&path, "alpha\nbeta").unwrap();
+
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 100
+        });
+        let output = execute_read_file(&args).unwrap();
+        assert!(output.starts_with("     1\talpha"), "output: {output}");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_read_file_respects_offset_limit() {
         let path = make_temp_path("lines");
         let lines: Vec<String> = (1..=20).map(|i| format!("line {}", i)).collect();
@@ -609,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_strips_rendered_line_number_layer_for_session_archives() {
+    fn test_read_file_preserves_session_archive_rendering_rules() {
         let session_assets = make_temp_path("overflow_history_assets").with_extension("assets");
         fs::create_dir_all(&session_assets).unwrap();
         let overflow_history = session_assets.join("overflow-history.md");
@@ -631,12 +711,24 @@ mod tests {
             "output should not contain nested line numbers: {output}"
         );
 
-        // read_file 快照需要当前 driver 会话授权；无上下文的 service 单测只验证
-        // 会话归档的渲染规则，正反授权边界由 storage::file_store 的回归测试覆盖。
-        fs::write(&read_file_snapshot, "     1\talpha\n     2\tbeta\n").unwrap();
-        assert_eq!(
-            strip_rendered_line_number_layer(&fs::read_to_string(&read_file_snapshot).unwrap()),
-            "alpha\nbeta"
+        // read_file 快照需要当前 driver 会话授权；无上下文的 service 单测验证其
+        // 重渲染规则，正反授权边界由 storage::file_store 的回归测试覆盖。
+        let snapshot = "   120\talpha\n   121\tbeta\n";
+        fs::write(&read_file_snapshot, snapshot).unwrap();
+        assert!(!should_strip_rendered_line_number_layer(&read_file_snapshot));
+        assert!(!should_render_read_file_line_numbers(&read_file_snapshot, true));
+        let rendered = render_line_excerpt(
+            &fs::read_to_string(&read_file_snapshot).unwrap(),
+            0,
+            2,
+            None,
+            should_render_read_file_line_numbers(&read_file_snapshot, true),
+        );
+        assert_eq!(rendered.text, "   120\talpha\n   121\tbeta");
+        assert!(
+            !rendered.text.contains("     1\t   120\talpha"),
+            "snapshot must not gain a second, asset-relative line-number layer: {}",
+            rendered.text
         );
 
         let _ = fs::remove_dir_all(&session_assets);

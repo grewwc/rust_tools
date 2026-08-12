@@ -32,7 +32,7 @@
             },
             "delegate": {
               "type": "boolean",
-              "description": "Whether this step should be delegated to a subagent. `delegate: true` implies `parallelizable: true` (a subagent should not block the parent synchronously); set `parallelizable` explicitly only when true without delegation. Multiple independent delegated steps dispatch concurrently (task_spawn + task_wait); a lone delegated step runs via the synchronous `task`."
+              "description": "Whether this step should be delegated to a subagent. `delegate: true` implies `parallelizable: true` (a subagent should not block the parent synchronously); set `parallelizable` explicitly only when true without delegation. Multiple independent delegated steps run concurrently; a lone delegated step runs synchronously."
             }
           },
           "required": [

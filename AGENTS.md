@@ -74,7 +74,7 @@ in between. Prefer an existing focused test before running one.
 
 ## High-Value Pitfalls
 
-1. `.agent` files are compiled into `a` via `include_str!` (editing recompiles); `.skill` files load at runtime from the skills dir (no recompile).
+1. `.agent` files are compiled into `a` via `include_str!` (editing recompiles); builtin `.skill` files under `src/bin/ai/builtin_skills/` are compiled in via `include_str!` too; user `.skill` files load at runtime from the skills dir (no recompile).
 2. `src/bin/ff/` is embedded into `a` via `include!`; changes there affect the agent binary.
 3. `runtime_ctx::effective_cwd()` is the working-directory authority for tools and sub-agents.
 4. `objc2*` dependencies are macOS-only.

@@ -95,10 +95,9 @@ fn maybe_emit_responses_reasoning_replay_diagnostic(
     // 加密 reasoning item 只在当前 turn 的工具链中通过内存侧信道回放；历史 turn
     // 已经无法忠实回放，且由 history checkpoint/工具证据承担语义保真。诊断只统计
     // 最新 user 之后的当前 turn，避免每次请求都对旧历史发噪音。
-    let current_turn_start = messages
-        .iter()
-        .rposition(|message| message.role == "user")
-        .unwrap_or(0);
+    // 合成 user 消息（证据交接、图片 followup）不构成轮次边界。
+    let current_turn_start =
+        crate::ai::history::last_real_user_index(messages).unwrap_or(0);
     let stats = super::protocol::responses_reasoning_replay_stats(
         &messages[current_turn_start..],
         Some(reasoning_items),

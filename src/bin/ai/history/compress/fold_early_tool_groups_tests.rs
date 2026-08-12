@@ -1202,6 +1202,34 @@ fn current_turn_precision_results_stay_raw_during_mid_turn_compress() {
 }
 
 #[test]
+fn mid_turn_compress_preserves_current_reasoning_only_retry_marker() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-reasoning-retry-marker-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let retry_marker = "[reasoning-only-retry]\nAutomatic recovery attempt 1/2";
+    let mut messages = vec![
+        msg("system", "system prompt"),
+        msg("user", "当前轮必须继续生成最终回答"),
+        msg(ROLE_INTERNAL_NOTE, retry_marker),
+    ];
+    for index in 0..10 {
+        let id = format!("grep-{index}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, &"old tool evidence\n".repeat(500)));
+    }
+
+    let (compressed, before, after) = mid_turn_compress(messages, 2_000, Some(&overflow_dir));
+
+    assert!(after < before, "test must exercise the compression path");
+    assert!(compressed.iter().any(|message| {
+        message.role == ROLE_INTERNAL_NOTE && message.content.as_str() == Some(retry_marker)
+    }), "current-turn retry marker must survive mid-turn compression");
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
 fn current_turn_task_wait_is_protected_from_path_c_lossy_truncation() {
     let messages = vec![
         msg("system", "system prompt"),
@@ -1220,6 +1248,29 @@ fn current_turn_task_wait_is_protected_from_path_c_lossy_truncation() {
     assert!(
         lossless_ids.contains("wait-1"),
         "Path C must preserve task_wait instead of truncating its conclusion"
+    );
+}
+
+#[test]
+fn synthetic_only_history_protects_non_compressible_tool_results() {
+    let messages = vec![
+        msg("system", "background session bootstrap"),
+        assistant_call("read-1", "read_file"),
+        tool_result("read-1", &"source evidence\n".repeat(800)),
+        assistant_call("wait-1", "task_wait"),
+        tool_result("wait-1", &"subagent conclusion\n".repeat(800)),
+    ];
+
+    let precision_ids = current_turn_precision_tool_call_ids(&messages);
+    let lossless_ids = current_turn_lossless_tool_call_ids(&messages);
+
+    assert!(
+        precision_ids.contains("read-1"),
+        "a history without a real user boundary is one conservative synthetic turn"
+    );
+    assert!(
+        lossless_ids.contains("read-1") && lossless_ids.contains("wait-1"),
+        "Path C must not truncate non-compressible results in a synthetic-only history"
     );
 }
 
@@ -1273,10 +1324,13 @@ fn leading_compressed_tool_evidence_notes_are_not_immortal_prefix_context() {
     );
     // 问题 4 修复：internal note 不再重复归档（正文证据已在 folded group 文件）；
     // 归档文件可能不存在（本场景无正文消息被裁），存在时也绝不含 note 文本。
-    let archived = std::fs::read_to_string(overflow_dir.join("overflow-history.md"))
-        .unwrap_or_default();
+    let archived =
+        std::fs::read_to_string(overflow_dir.join("overflow-history.md")).unwrap_or_default();
     assert!(!archived.contains("compressed_tool_round"), "{archived}");
-    assert!(!archived.contains(COMPRESSED_TOOL_EVIDENCE_MARKER), "{archived}");
+    assert!(
+        !archived.contains(COMPRESSED_TOOL_EVIDENCE_MARKER),
+        "{archived}"
+    );
 
     let _ = std::fs::remove_dir_all(overflow_dir);
 }

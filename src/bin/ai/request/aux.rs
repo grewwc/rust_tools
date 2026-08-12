@@ -153,18 +153,18 @@ pub(crate) async fn summarize_history_via_model(
         Message {
             role: "system".to_string(),
             content: Value::String(format!(
-                "你是一个软件开发对话历史压缩器。你的任务是把较早对话压缩成后续 coding agent 能继续工作的摘要。\n\
-输出要求：\n\
-- 只输出纯文本，不要 markdown 代码块，不要解释。\n\
-- 必须保留：用户明确要求、文件路径/函数名/工具名、关键报错、当前工作、未完成任务，以及可回读的来源路径或工具调用。\n\
-- 严格区分三类内容：工具/源码直接支持的已验证事实、助手此前提出但尚未验证的判断、仍待确认的问题。不得因为一句话来自助手就把它改写成事实或修复结论。\n\
-- 只有输入中直接可见的工具/源码证据才能支持“已验证”；助手旧结论或其引用的路径只能作为回读定位，不能仅凭引用就升级为事实。\n\
-- 已验证事实必须尽量附带来源（文件路径、命令或工具名）；没有来源时标注“来源未保留”。冲突证据和不确定性必须保留，不得替模型做确定性裁决。\n\
-- 优先保留用户决定和有来源的事实，删除寒暄、重复确认、冗长日志。\n\
-- 使用下面这些标题，并且每个标题下用 `- ` 开头的短行：\n\
-主要请求:\n用户决定:\n已验证事实与来源:\n未验证的助手判断:\n冲突与未知:\n当前工作:\n待办任务:\n\
-- 如果某项没有内容，写 `- 无`。\n\
-- 总长度尽量控制在 {} 个字符以内。",
+                "You are a software development conversation-history compressor. Your task is to compress the earlier conversation into a summary that a later coding agent can keep working from.\n\
+Output requirements:\n\
+- Output plain text only; no markdown code blocks, no explanations.\n\
+- Must retain: explicit user requests, file paths / function names / tool names, key errors, current work, unfinished tasks, and re-readable source paths or tool invocations.\n\
+- Strictly distinguish three categories: verified facts directly supported by tool/source evidence, assistant judgments raised earlier but not yet verified, and open questions still to be confirmed. Never rewrite a statement from the assistant into a fact or a fix conclusion just because it came from the assistant.\n\
+- Only tool/source evidence directly visible in the input can support \"verified\"; an assistant's older conclusion or the paths it cites are only read-back locators and cannot be upgraded to facts by citation alone.\n\
+- Verified facts should carry a source (file path, command, or tool name) when possible; when there is no source, mark it \"source not retained\". Conflicting evidence and uncertainty must be preserved; do not make determinacy rulings on the model's behalf.\n\
+- Prioritize user decisions and sourced facts; drop small talk, repeated confirmations, and verbose logs.\n\
+- Use the headings below, with short lines starting with `- ` under each:\n\
+Main request:\nUser decisions:\nVerified facts and sources:\nUnverified assistant judgments:\nConflicts and unknowns:\nCurrent work:\nPending tasks:\n\
+- If a section has no content, write `- none`.\n\
+- Keep the total length within about {} characters.",
                 max_chars
             )),
             tool_calls: None,
@@ -173,7 +173,7 @@ pub(crate) async fn summarize_history_via_model(
         },
         Message {
             role: "user".to_string(),
-            content: Value::String(format!("请压缩下面的较早对话：\n\n{}", transcript)),
+            content: Value::String(format!("Please compress the earlier conversation below:\n\n{}", transcript)),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,

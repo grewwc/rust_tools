@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::ai::config_schema::AiConfig;
-use crate::ai::history::Message;
+use crate::ai::history::{Message, is_runtime_synthetic_user_message};
 use crate::ai::models;
 use crate::ai::types::App;
 use crate::commonw::configw;
@@ -96,10 +96,15 @@ pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message
 }
 
 pub(crate) fn latest_user_message_text(messages: &[Message]) -> Option<String> {
+    // 跳过合成 user 消息（task-evidence handoff、图片 followup 等）：它们注入在
+    // 真实 user 之后，若不跳过会取到交接说明而非用户真正的问题，污染 thinking
+    // 短路与模型 gate 判定。
     messages
         .iter()
         .rev()
-        .find(|message| message.role == "user")
+        .find(|message| {
+            message.role == "user" && !is_runtime_synthetic_user_message(message)
+        })
         .and_then(extract_message_text)
 }
 

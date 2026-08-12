@@ -1,3 +1,19 @@
+//! ThinkingOrchestrator — 思维引导子系统（生产未注册）。
+//!
+//! **生产死路径**：`App.observers` 在生产中恒为空（`driver/mod.rs` 中
+//! `observers: Vec::new()`），本模块仅在 `#[cfg(test)]` 下导出、仅被测试
+//! helper 构造。`on_prepare_rich` / `on_finalize` / `on_tool_result` 在生产
+//! 路径中永远不会被调用。
+//!
+//! 因此本模块定义的 `<think:begin_*>` / `<think:reset_thinking/>` 标签在
+//! 生产中既不会向模型宣告（`[Thinking Protocol]` 注入不执行），也不会被
+//! 消费（`apply_think_tags` 不执行）。
+//!
+//! 生产中真正生效的隐藏自省通道是 `<meta:self_note>` / `<context_checkpoint>`，
+//! 由 `stream/extract.rs` 解析、`record_hidden_self_note` 落盘——与本模块无关。
+//! 本模块的标签使用 `think:` 前缀正是为了与此区分。
+//!
+//! 待 JSON 控制协议与主回答解耦后再显式接回（见 `driver/mod.rs` 注释）。
 use rust_tools::cw::SkipSet;
 
 use crate::ai::driver::observer::{
@@ -77,8 +93,8 @@ impl ThinkingOrchestrator {
         // Verification / GoalDirected by keyword matching — that is just
         // substring-based pseudo-understanding. Instead:
         //
-        //   * If the LLM explicitly requested a mode via a <meta:begin_*>
-        //     meta-tag in a previous turn, that mode is already established
+        //   * If the LLM explicitly requested a mode via a <think:begin_*>
+        //     think-tag in a previous turn, that mode is already established
         //     and its state (thought_tree / verification / goal_manager) is
         //     present.
         //   * on_prepare activates whatever state currently exists; we do not
@@ -161,12 +177,12 @@ impl ThinkingOrchestrator {
         }
     }
 
-    fn apply_meta_tags(&mut self, text: &str) {
+    fn apply_think_tags(&mut self, text: &str) {
         // Explicit tag extraction — not keyword guessing. The LLM controls
         // thinking state lifecycle by emitting these literal tags.
 
-        // <meta:reset_thinking/> — clear all thinking state
-        if text.contains("<meta:reset_thinking/>") || text.contains("<meta:reset_thinking />") {
+        // <think:reset_thinking/> — clear all thinking state
+        if text.contains("<think:reset_thinking/>") || text.contains("<think:reset_thinking />") {
             self.thought_tree = None;
             self.verification = None;
             self.stagnation_turns = 0;
@@ -174,8 +190,8 @@ impl ThinkingOrchestrator {
             self.current_tree_node_id = None;
         }
 
-        // <meta:begin_tree_of_thoughts>...</meta:begin_tree_of_thoughts>
-        if let Some(root_thought) = extract_tag(text, "meta:begin_tree_of_thoughts") {
+        // <think:begin_tree_of_thoughts>...</think:begin_tree_of_thoughts>
+        if let Some(root_thought) = extract_tag(text, "think:begin_tree_of_thoughts") {
             if self.thought_tree.is_none() {
                 self.thought_tree = Some(ThoughtTree::new(&root_thought, 4, 3));
             }
@@ -183,8 +199,8 @@ impl ThinkingOrchestrator {
             self.active_modes.insert(ThinkingMode::TreeOfThoughts);
         }
 
-        // <meta:begin_verification>...</meta:begin_verification>
-        if let Some(hypothesis) = extract_tag(text, "meta:begin_verification") {
+        // <think:begin_verification>...</think:begin_verification>
+        if let Some(hypothesis) = extract_tag(text, "think:begin_verification") {
             if self.verification.is_none() {
                 self.verification = Some(VerificationWorkflow::new(hypothesis));
             }
@@ -192,8 +208,8 @@ impl ThinkingOrchestrator {
             self.active_modes.insert(ThinkingMode::VerificationLoop);
         }
 
-        // <meta:begin_goal>...</meta:begin_goal>
-        if let Some(goal_desc) = extract_tag(text, "meta:begin_goal") {
+        // <think:begin_goal>...</think:begin_goal>
+        if let Some(goal_desc) = extract_tag(text, "think:begin_goal") {
             if self.goal_manager.active_goal().is_none() {
                 let goal_id = self.goal_manager.create_goal(goal_desc);
                 self.goal_manager.activate_goal(&goal_id);
@@ -206,16 +222,16 @@ impl ThinkingOrchestrator {
     fn build_system_prompt_injection(&mut self) -> Option<String> {
         let mut parts = Vec::new();
 
-        // Advertise the meta-tag protocol only once per conversation.
+        // Advertise the think-tag protocol only once per conversation.
         // After the first injection, the LLM already knows the protocol.
         if !self.protocol_injected {
             self.protocol_injected = true;
             parts.push(
                 "[Thinking Protocol] Emit tags in your reply (hidden from user): \
-                 <meta:begin_tree_of_thoughts>Q</meta:begin_tree_of_thoughts> \
-                 | <meta:begin_verification>H</meta:begin_verification> \
-                 | <meta:begin_goal>G</meta:begin_goal> \
-                 | <meta:reset_thinking/>."
+                 <think:begin_tree_of_thoughts>Q</think:begin_tree_of_thoughts> \
+                 | <think:begin_verification>H</think:begin_verification> \
+                 | <think:begin_goal>G</think:begin_goal> \
+                 | <think:reset_thinking/>."
                     .to_string(),
             );
         }
@@ -378,7 +394,7 @@ pub struct ThinkingOutcome {
 }
 
 fn extract_tag(text: &str, tag: &str) -> Option<String> {
-    // Supports attributes: <meta:begin_verification priority="high">content</meta:begin_verification>
+    // Supports attributes: <think:begin_verification priority="high">content</think:begin_verification>
     // We search for the open tag prefix, then find the first '>' after it,
     // then find the matching close tag.
     let open_prefix = format!("<{}", tag);
@@ -419,7 +435,7 @@ impl TurnObserver for ThinkingOrchestrator {
     ) -> crate::ai::driver::observer::PrepareOutput {
         use crate::ai::driver::observer::{PrepareOutput, SectionKind};
 
-        // Activate existing state (creation happens in on_finalize via meta-tags).
+        // Activate existing state (creation happens in on_finalize via think-tags).
         if self.thought_tree.is_some() {
             self.active_modes.insert(ThinkingMode::TreeOfThoughts);
         }
@@ -553,10 +569,10 @@ impl TurnObserver for ThinkingOrchestrator {
     fn on_finalize(&mut self, ctx: &FinalizeContext) -> ObserverOutput {
         let mut display_lines = Vec::new();
 
-        // Parse meta-tags from the LLM's assistant output (final_text).
-        // This is where <meta:begin_*> / <meta:reset_thinking/> tags live,
+        // Parse think-tags from the LLM's assistant output (final_text).
+        // This is where <think:begin_*> / <think:reset_thinking/> tags live,
         // because the LLM emits them in its reply, not in the user question.
-        self.apply_meta_tags(&ctx.final_text);
+        self.apply_think_tags(&ctx.final_text);
 
         // 防死循环：思维子系统（验证/思维树/目标分解）的 on_finalize 不解析 LLM 的 JSON 回复，
         // 因此 advance_step / add_branch / decompose_active 从未被调用，工作流永久卡在初始状态。
@@ -637,10 +653,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_meta_tag_activates_verification() {
+    fn explicit_think_tag_activates_verification() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.apply_meta_tags(
-            "<meta:begin_verification>server crashes under high load</meta:begin_verification>",
+        orch.apply_think_tags(
+            "<think:begin_verification>server crashes under high load</think:begin_verification>",
         );
         let decision = orch.analyze_question("anything");
         assert!(
@@ -651,10 +667,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_meta_tag_activates_goal() {
+    fn explicit_think_tag_activates_goal() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.apply_meta_tags(
-            "<meta:begin_goal>Refactor the entire networking layer</meta:begin_goal>",
+        orch.apply_think_tags(
+            "<think:begin_goal>Refactor the entire networking layer</think:begin_goal>",
         );
         let decision = orch.analyze_question("anything");
         assert!(decision.active_modes.contains(&ThinkingMode::GoalDirected));
@@ -662,11 +678,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_meta_tags_can_activate_multiple_modes() {
+    fn explicit_think_tags_can_activate_multiple_modes() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.apply_meta_tags(
-            "<meta:begin_verification>bug hypothesis</meta:begin_verification>\
-             <meta:begin_goal>refactor error handling</meta:begin_goal>",
+        orch.apply_think_tags(
+            "<think:begin_verification>bug hypothesis</think:begin_verification>\
+             <think:begin_goal>refactor error handling</think:begin_goal>",
         );
         let decision = orch.analyze_question("anything");
         assert!(
@@ -678,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn question_without_meta_tags_activates_no_modes() {
+    fn question_without_think_tags_activates_no_modes() {
         let mut orch = ThinkingOrchestrator::new();
         let decision = orch.analyze_question("Why does the server crash under high load?");
         assert!(decision.active_modes.is_empty());
@@ -686,11 +702,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_meta_tag_clears_state() {
+    fn reset_think_tag_clears_state() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.apply_meta_tags("<meta:begin_verification>h1</meta:begin_verification>");
+        orch.apply_think_tags("<think:begin_verification>h1</think:begin_verification>");
         assert!(orch.verification.is_some());
-        orch.apply_meta_tags("<meta:reset_thinking/>");
+        orch.apply_think_tags("<think:reset_thinking/>");
         assert!(orch.verification.is_none());
         assert!(orch.active_modes.is_empty());
     }
@@ -698,7 +714,7 @@ mod tests {
     #[test]
     fn process_tool_result_scores_tree() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.apply_meta_tags("<meta:begin_tree_of_thoughts>root</meta:begin_tree_of_thoughts>");
+        orch.apply_think_tags("<think:begin_tree_of_thoughts>root</think:begin_tree_of_thoughts>");
         orch.process_tool_result("read_file", "found relevant code", true);
     }
 
@@ -716,7 +732,7 @@ mod tests {
     #[test]
     fn on_conversation_end_clears_goals() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.apply_meta_tags("<meta:begin_goal>Refactor the system</meta:begin_goal>");
+        orch.apply_think_tags("<think:begin_goal>Refactor the system</think:begin_goal>");
         assert!(orch.goal_manager.active_goal().is_some());
         orch.on_conversation_end();
         assert!(orch.goal_manager.active_goal().is_none());

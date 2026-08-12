@@ -10,8 +10,8 @@ rules in the nearest child `AGENTS.md`.
 - `config.rs` / `config_schema.rs`: config loading and schema
 - `models.rs` / `models.json`: model registry access, platform naming, metadata
 - `prompt/`: prompt assembly and multiline extraction
-- `skills.rs` / `agents.rs`: skill + agent manifests; `builtin_agents/` holds
-  `.agent` files compiled in via `include_str!`
+- `skills.rs` / `agents.rs`: skill + agent manifests; `builtin_agents/` holds `.agent`
+  files and `builtin_skills/` holds builtin `.skill` files, both compiled in via `include_str!`
 - `driver/`: turn orchestration, prompt/tool loop, and skill runtime
 - `history/`: canonical persistence, context projection/compression, and task evidence
 - `request/`: LLM request execution, retry, error handling, routing,
@@ -59,6 +59,20 @@ rules in the nearest child `AGENTS.md`.
     pure until selected. Persist lossless evidence only for accepted candidates,
     use deterministic/idempotent asset paths, and retain raw messages when an
     archive commit fails.
+12. **Synthetic user messages are not turn boundaries.** Any runtime-injected
+    `role == "user"` message (subagent evidence handoff, auto image followup,
+    etc.) must be built with `history::runtime_synthetic_user_message`; never
+    infer runtime origin from user-controlled content. Request normalization must
+    clear the internal origin sidecar before provider serialization. All
+    current-turn boundary scans (scoped instruction targets, current-turn tool
+    protection, dedupe bounds, compression/retention) must use
+    `history::last_real_user_index` / `is_runtime_synthetic_user_message`,
+    never a bare `rposition(role == "user")`.
+13. **Model-visible runtime notes are English.** Base prompt, gate notes, and
+    injected internal notes share one wording system (e.g. "unverified").
+    New model-visible notes/warnings must be written in English; keep Chinese
+    only in code comments, model-output keyword matching lists, and
+    user-facing terminal/CLI text.
 
 ## Scoped guides
 

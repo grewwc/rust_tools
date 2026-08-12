@@ -11,7 +11,11 @@ use std::path::{Path, PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
-use crate::ai::{request, tools::tool_history_policy, types::App};
+use crate::ai::{
+    request,
+    tools::{storage::file_store::FileStore, tool_history_policy},
+    types::App,
+};
 
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
 use super::text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
@@ -71,7 +75,7 @@ pub(super) fn normalize_internal_notes_for_summary_model(messages: &mut Vec<Mess
                 let body = strip_nested_prior_summary_prefixes(body);
                 if !body.is_empty() {
                     message.content = Value::String(format!(
-                        "已有历史摘要（供本次压缩吸收，不要逐字复制）：\n{}",
+                        "Existing history summary (for this compression to absorb; do not copy verbatim):\n{}",
                         summarize_text(&body, 2_000)
                     ));
                     out.push(message);
@@ -341,22 +345,44 @@ pub(super) fn spill_protected_precision_to_fit(
             }
             let tool_name = id_to_tool_name.get(id)?;
             let text = value_to_string(&message.content);
+            // 当前轮若直接回读本 session 的 archive，Path C 不能再复制一份原文。
+            // 复用原 asset 的指针既保住 hard target，又避免「外溢→回读→再外溢」循环。
+            let existing_asset_path = if tool_name == "read_file" {
+                id_to_tool_args
+                    .get(id)
+                    .and_then(|args| preserved_tool_overflow_read_file_path(args, overflow_dir))
+            } else {
+                None
+            };
             (!text.trim().is_empty()
                 && !is_preserved_tool_overflow_stub(&text)
                 && !tool_history_policy(tool_name).allows_lossy_compress())
-            .then(|| (idx, tool_name.clone(), text.chars().count()))
+            .then(|| {
+                (
+                    idx,
+                    tool_name.clone(),
+                    existing_asset_path,
+                    text.chars().count(),
+                )
+            })
         })
         .collect::<Vec<_>>();
-    candidates.sort_unstable_by_key(|(_, _, chars)| std::cmp::Reverse(*chars));
+    candidates.sort_unstable_by_key(|(_, _, _, chars)| std::cmp::Reverse(*chars));
 
     let mut spilled = 0usize;
-    for (idx, tool_name, _) in candidates {
+    for (idx, tool_name, existing_asset_path, _) in candidates {
         if super::messages_total_chars(messages) <= hard_target_chars {
             break;
         }
         let text = value_to_string(&messages[idx].content);
-        let Some(path) = write_preserved_tool_overflow_file(overflow_dir, &tool_name, &text) else {
-            continue;
+        let (path, wrote_new_archive) = if let Some(path) = existing_asset_path {
+            (path, false)
+        } else {
+            let Some(path) = write_preserved_tool_overflow_file(overflow_dir, &tool_name, &text)
+            else {
+                continue;
+            };
+            (path, true)
         };
         let recall_lines = messages[idx]
             .tool_call_id
@@ -371,11 +397,15 @@ pub(super) fn spill_protected_precision_to_fit(
             if pointer_stub.chars().count() < text.chars().count() {
                 pointer_stub
             } else {
-                let _ = std::fs::remove_file(path);
+                if wrote_new_archive {
+                    let _ = std::fs::remove_file(&path);
+                }
                 continue;
             }
         } else {
-            let _ = std::fs::remove_file(path);
+            if wrote_new_archive {
+                let _ = std::fs::remove_file(&path);
+            }
             continue;
         };
         messages[idx].content = Value::String(replacement);
@@ -408,6 +438,29 @@ pub(super) fn build_tool_call_arguments_index(messages: &[Message]) -> FxHashMap
         }
     }
     out
+}
+
+/// 返回 `read_file` 直接读取的本 session 工具溢出归档路径。
+///
+/// Path C 对一般工具结果必须落盘，以保住 hard target；但 archive 本身已经是
+/// runtime 写入的稳定资产，再复制一次只会让模型在回读大文件时持续产生新 archive。
+/// 仅复用 `tool-overflow-compressed` 的直接子文件：session asset 根中的 `tmp`、
+/// checkpoint 等文件可在同一 session 后续被写入；若直接保留其指针，历史结果会
+/// 随源文件变化。两端 canonicalize 后再判断目录，避免 `..` 或 symlink 越过边界。
+fn preserved_tool_overflow_read_file_path(arguments: &str, overflow_dir: &Path) -> Option<PathBuf> {
+    let args = serde_json::from_str::<Value>(arguments).ok()?;
+    let raw_path = value_string_from_keys(&args, &["file_path", "path", "filePath"])?;
+    let preserved_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).canonicalize().ok()?;
+    // 必须与 read_file 共用相同的 relative-path 解析规则；直接 canonicalize 会错误地
+    // 以进程 cwd 为基准，忽略 subagent 的 effective_cwd。
+    let source_path = FileStore::new(PathBuf::from(raw_path))
+        .path()
+        .canonicalize()
+        .ok()?;
+    if !source_path.is_file() || source_path.parent() != Some(preserved_dir.as_path()) {
+        return None;
+    }
+    Some(source_path)
 }
 
 #[cfg(test)]
@@ -704,6 +757,109 @@ mod tests {
         }
         assert!(super::super::messages_total_chars(&messages) <= 4_000);
         let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
+    fn path_c_reuses_reread_session_asset_instead_of_rearchiving_it() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let test_root =
+            std::env::temp_dir().join(format!("ai-reread-session-asset-{}", uuid::Uuid::new_v4()));
+        let effective_cwd = test_root.join("workspace");
+        let overflow_dir = effective_cwd.join("session-assets");
+        let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let archive_path = archive_dir.join("prior-read.txt");
+        let content = "previously preserved evidence\n".repeat(800);
+        std::fs::write(&archive_path, &content).unwrap();
+        let relative_archive_path = archive_path
+            .strip_prefix(&effective_cwd)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let arguments = serde_json::json!({
+            "file_path": relative_archive_path,
+            "offset": 1,
+            "limit": 10_000,
+        })
+        .to_string();
+        let mut protected = FxHashSet::default();
+        protected.insert("reread".to_string());
+        let mut messages = vec![
+            assistant_call_args("reread", "read_file", &arguments),
+            tool_result("reread", &content),
+        ];
+
+        let spilled = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .sync_scope(effective_cwd, || {
+                spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), &protected)
+            });
+
+        assert_eq!(spilled, 1);
+        let stub = value_to_string(&messages[1].content);
+        let file_path = stub
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
+            .expect("reused stub must retain the existing archive pointer");
+        assert_eq!(Path::new(file_path), archive_path.canonicalize().unwrap());
+        assert!(stub.contains("- original_range: lines=1..10000"));
+        assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
+        assert_eq!(std::fs::read_to_string(&archive_path).unwrap(), content);
+        let _ = std::fs::remove_dir_all(test_root);
+    }
+
+    #[test]
+    fn path_c_snapshots_mutable_session_temp_asset_instead_of_reusing_it() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let test_root =
+            std::env::temp_dir().join(format!("ai-reread-session-temp-{}", uuid::Uuid::new_v4()));
+        let effective_cwd = test_root.join("workspace");
+        let overflow_dir = effective_cwd.join("session-assets");
+        let temp_dir = overflow_dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let temp_path = temp_dir.join("mutable.txt");
+        let content = "temporary evidence before mutation\n".repeat(800);
+        std::fs::write(&temp_path, &content).unwrap();
+        let relative_temp_path = temp_path
+            .strip_prefix(&effective_cwd)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let arguments = serde_json::json!({
+            "file_path": relative_temp_path,
+            "offset": 1,
+            "limit": 10_000,
+        })
+        .to_string();
+        let mut protected = FxHashSet::default();
+        protected.insert("reread".to_string());
+        let mut messages = vec![
+            assistant_call_args("reread", "read_file", &arguments),
+            tool_result("reread", &content),
+        ];
+
+        let spilled = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .sync_scope(effective_cwd, || {
+                spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), &protected)
+            });
+
+        assert_eq!(spilled, 1);
+        let stub = value_to_string(&messages[1].content);
+        let snapshot_path = stub
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
+            .map(PathBuf::from)
+            .expect("mutable session file must be snapshotted into an overflow archive");
+        assert_ne!(snapshot_path, temp_path.canonicalize().unwrap());
+        assert!(snapshot_path.starts_with(overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR)));
+        assert_eq!(std::fs::read_to_string(&snapshot_path).unwrap(), content);
+
+        std::fs::write(&temp_path, "temporary evidence after mutation\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&snapshot_path).unwrap(), content);
+        let _ = std::fs::remove_dir_all(test_root);
     }
 
     #[test]
@@ -2085,37 +2241,37 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
     fn render_line(turn: &TurnSummary) -> String {
         let mut line = String::new();
         if turn.count > 1 {
-            line.push_str(&format!("重复×{} ", turn.count));
+            line.push_str(&format!("repeated ×{} ", turn.count));
         }
         if !turn.topic_label.is_empty() {
-            line.push_str("主题: ");
+            line.push_str("Topic: ");
             line.push_str(&turn.topic_label);
             line.push_str(" | ");
         }
         if !turn.user.is_empty() {
-            line.push_str("用户: ");
+            line.push_str("User: ");
             line.push_str(&turn.user);
         }
         if !turn.assistant_final.is_empty() {
             if !line.is_empty() {
                 line.push_str(" | ");
             }
-            line.push_str("助手先前回答（未独立验证）: ");
+            line.push_str("Assistant's previous answer (not independently verified): ");
             line.push_str(&turn.assistant_final);
         }
         if !turn.tool_names.is_empty() {
             if !line.is_empty() {
                 line.push_str(" | ");
             }
-            line.push_str("工具: ");
+            line.push_str("Tools: ");
             line.push_str(&turn.tool_names.join(", "));
         }
         if !turn.tool_highlights.is_empty() {
             if !line.is_empty() {
                 line.push_str(" | ");
             }
-            line.push_str("关键: ");
-            line.push_str(&turn.tool_highlights.join("；"));
+            line.push_str("Key: ");
+            line.push_str(&turn.tool_highlights.join(", "));
         }
         line
     }
@@ -2133,7 +2289,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
         }
         if !turn.tool_highlights.is_empty() {
             line.push_str(" => ");
-            line.push_str(&turn.tool_highlights.join("；"));
+            line.push_str(&turn.tool_highlights.join(", "));
         }
         Some(line)
     }
@@ -2179,7 +2335,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
                     if !normalized.is_empty() {
                         push_unique_limited(
                             &mut pre_summary_lines,
-                            format!("- 更早摘要: {normalized}"),
+                            format!("- Earlier summary: {normalized}"),
                             3,
                         );
                     }
@@ -2275,7 +2431,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
     let reserved_tool_chars = if known_tool_lines.is_empty() {
         0
     } else {
-        let tool_blob = format!("工具证据摘要:\n{}", known_tool_lines.join("\n"));
+        let tool_blob = format!("Verified facts and sources:\n{}", known_tool_lines.join("\n"));
         tool_blob.chars().count().min(max_chars / 3)
     };
     let body_budget = max_chars
@@ -2283,7 +2439,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
         .max(max_chars / 2);
     let mut lines: Vec<String> = Vec::new();
     if !initial_goal.is_empty()
-        && !push_line_with_budget(&mut lines, format!("初始目标: {initial_goal}"), body_budget)
+        && !push_line_with_budget(&mut lines, format!("Main request: {initial_goal}"), body_budget)
     {
         return summarize_text(&lines.join("\n"), max_chars);
     }
@@ -2299,7 +2455,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
     }
 
     if !known_tool_lines.is_empty() {
-        let _ = push_line_with_budget(&mut lines, "工具证据摘要:".to_string(), max_chars);
+        let _ = push_line_with_budget(&mut lines, "Verified facts and sources:".to_string(), max_chars);
         for line in known_tool_lines {
             if !push_line_with_budget(&mut lines, line, max_chars) {
                 break;
@@ -2309,23 +2465,23 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
 
     if !recent_turns.is_empty() {
         let _ = push_line_with_budget(&mut lines, String::new(), max_chars);
-        let _ = push_line_with_budget(&mut lines, "当前工作:".to_string(), max_chars);
+        let _ = push_line_with_budget(&mut lines, "Current work:".to_string(), max_chars);
         for t in &recent_turns {
             let mut parts = Vec::new();
             if !t.topic_label.is_empty() {
-                parts.push(format!("主题: {}", t.topic_label));
+                parts.push(format!("Topic: {}", t.topic_label));
             }
             if !t.user.is_empty() {
-                parts.push(format!("用户: {}", t.user));
+                parts.push(format!("User: {}", t.user));
             }
             if !t.assistant_final.is_empty() {
-                parts.push(format!("助手先前回答（未独立验证）: {}", t.assistant_final));
+                parts.push(format!("Assistant's previous answer (not independently verified): {}", t.assistant_final));
             }
             if !t.tool_names.is_empty() {
-                parts.push(format!("工具: {}", t.tool_names.join(", ")));
+                parts.push(format!("Tools: {}", t.tool_names.join(", ")));
             }
             if !t.tool_highlights.is_empty() {
-                parts.push(format!("关键: {}", t.tool_highlights.join("；")));
+                parts.push(format!("Key: {}", t.tool_highlights.join(", ")));
             }
             let line = format!("- {}", parts.join(" | "));
             if !push_line_with_budget(&mut lines, summarize_text(&line, 600), max_chars) {
@@ -2336,7 +2492,7 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
 
     if !pending_tasks.is_empty() {
         let _ = push_line_with_budget(&mut lines, String::new(), max_chars);
-        let _ = push_line_with_budget(&mut lines, "待办任务:".to_string(), max_chars);
+        let _ = push_line_with_budget(&mut lines, "Pending tasks:".to_string(), max_chars);
         for task in &pending_tasks {
             if !push_line_with_budget(
                 &mut lines,

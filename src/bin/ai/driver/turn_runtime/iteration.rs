@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use crate::ai::{
     driver::{drain_response, input, skill_runtime},
-    history::{Message, ROLE_INTERNAL_NOTE, compress::llm_prune},
+    history::{
+        Message, ROLE_INTERNAL_NOTE, compress::llm_prune, last_real_user_index,
+    },
     mcp::McpClient,
     request::{self, do_request_messages, do_request_messages_without_tools},
     stream,
@@ -501,10 +503,10 @@ pub(super) fn project_instruction_target_paths_from_tool_calls(
 }
 
 fn project_instruction_target_paths(messages: &[Message]) -> Vec<PathBuf> {
-    let current_turn_start = messages
-        .iter()
-        .rposition(|message| message.role == "user")
-        .unwrap_or(0);
+    // 以最后一个**真实** user 消息为本轮起点：运行时合成的 user 消息
+    // （证据交接、图片 followup）不构成轮次边界，否则 scoped 指令目标
+    // 会被错误地界定在合成消息之后，导致目标目录的 AGENTS.md 从系统提示中消失。
+    let current_turn_start = last_real_user_index(messages).unwrap_or(0);
     let mut targets = Vec::new();
     let mut seen = FastSet::default();
     for message in messages.iter().skip(current_turn_start) {
@@ -674,11 +676,11 @@ fn handle_request_error(
         eprintln!("[Error] {}", err_text);
     }
     if err_text.contains("function.arguments") && err_text.contains("must be in JSON format") {
-        eprintln!("[Info] 检测到模型返回了非法 tool arguments，本轮已跳过，继续下一轮对话。");
+        eprintln!("[Info] Model returned invalid tool arguments; skipped this round and continued to the next round.");
     } else {
-        eprintln!("[Info] 本轮请求失败，已保持会话存活，可直接继续提问。");
+        eprintln!("[Info] Request failed this round; session kept alive, you can keep asking.");
     }
-    "[本轮请求失败，请重试或换个问法]".to_string()
+    "[Request failed this round; please retry or rephrase]".to_string()
 }
 
 fn request_interrupt_pending(shutdown: &AtomicBool, cancel_stream: &AtomicBool) -> bool {
@@ -732,15 +734,15 @@ async fn wait_for_request_interrupt(
 }
 
 pub(in crate::ai::driver::turn_runtime) fn no_tool_handoff_note() -> &'static str {
-    "进入无工具收口模式：本 turn 不要再调用任何工具。\n\
-请基于已经收集到的信息输出一条收口/交接回复：\n\
-1. 先总结已确认事实与当前结论；\n\
-2. 能直接回答用户的部分就直接回答；\n\
-3. 若任务仍未完成，明确说明剩余工作、阻塞点和建议的下一步；\n\
-4. 不要把未完成任务伪装成已完成。\n\
-5. 收口不等于可以编：本提示只是要求你停止调用工具，绝不授权你猜测或编造。\
-凡是未经工具/源码确认的标识符、路径、命令输出、行号或引文，都不得当作事实陈述；\
-对不确定的部分，如实标注“未验证”并给出下一步验证方式，如实的“未验证”永远优于编造的完整答案。"
+    "Enter no-tool wrap-up mode: do not call any tools for the rest of this turn.\n\
+Produce a wrap-up/handoff reply based on the information already gathered:\n\
+1. First summarize confirmed facts and the current conclusion;\n\
+2. Directly answer the parts of the user's question you can answer;\n\
+3. If the task is not yet complete, clearly state the remaining work, blockers, and suggested next steps;\n\
+4. Do not dress up an unfinished task as completed.\n\
+5. Wrap-up does not authorize fabrication: this note only asks you to stop calling tools; it never authorizes guessing or making things up.\
+Identifiers, paths, command output, line numbers, or quotes not confirmed by a tool or the source code must not be stated as fact;\
+for uncertain parts, label them honestly as \"unverified\" and give the next verification step — an honest \"unverified\" is always better than a fabricated complete answer."
 }
 
 fn clear_outstanding_task_anchor(messages: &mut Vec<Message>) {
@@ -1317,7 +1319,7 @@ pub(super) async fn execute_turn_iteration(
                 let stream_result = StreamResult {
                     outcome: StreamOutcome::Completed,
                     tool_calls: Vec::new(),
-                    assistant_text: "[响应解析失败，请重试]".to_string(),
+                    assistant_text: "[Response parsing failed; please retry]".to_string(),
                     hidden_meta: String::new(),
                     reasoning_text: String::new(),
                     reasoning_items: Vec::new(),
@@ -1386,11 +1388,11 @@ mod tests {
     #[test]
     fn no_tool_handoff_note_requires_summary_and_next_steps() {
         let note = no_tool_handoff_note();
-        assert!(note.contains("不要再调用任何工具"));
-        assert!(note.contains("总结已确认事实与当前结论"));
-        assert!(note.contains("剩余工作、阻塞点和建议的下一步"));
-        assert!(note.contains("不要把未完成任务伪装成已完成"));
-        assert!(note.contains("收口不等于可以编"));
+        assert!(note.contains("do not call any tools"));
+        assert!(note.contains("summarize confirmed facts and the current conclusion"));
+        assert!(note.contains("remaining work, blockers, and suggested next steps"));
+        assert!(note.contains("Do not dress up an unfinished task as completed"));
+        assert!(note.contains("does not authorize fabrication"));
     }
 
     #[test]

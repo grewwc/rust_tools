@@ -233,9 +233,9 @@ fn session_overflow_dir_component(path: &Path) -> Option<&'static str> {
 
 /// 是否为会话压缩器保存的 `read_file` 结果快照。
 ///
-/// 这类文件需要正常回读，但 service 层必须在重新渲染前剥离旧的行号前缀，防止
-/// `read_file` 的展示格式在多次召回时不断嵌套。不能只依赖 `original_file_path`：
-/// 原始文件可能已经变更、删除，或无法复现当时的截断结果。
+/// 这类文件需要正常回读，但 service 层必须保留归档中的原始展示形式，避免
+/// `read_file` 再额外添加 asset 相对行号。不能只依赖 `original_file_path`：原始
+/// 文件可能已经变更、删除，或无法复现当时的截断结果。
 pub(crate) fn is_read_file_overflow_artifact(path: &Path) -> bool {
     session_overflow_dir_component(path) == Some("tool-overflow-compressed")
         && overflow_artifact_tool_name(path).as_deref() == Some("read_file")

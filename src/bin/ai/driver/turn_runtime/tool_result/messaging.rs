@@ -70,7 +70,7 @@ pub(super) fn record_hidden_self_note(
                     reasoning_content: None,
                 });
                 format!(
-                    "[context_checkpoint save_failed] {} (正文已作为 self_note 保留)",
+                    "[context_checkpoint save_failed] {} (body kept as self_note)",
                     summary
                 )
             }

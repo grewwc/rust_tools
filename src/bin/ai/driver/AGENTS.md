@@ -45,8 +45,9 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
     mutation/progress from the pre-compression tool-call snapshot, not only from
     compressed `messages`.
 12. **Runtime environment is prompt context.** The base system prompt must include
-    the current OS, architecture, and shell so generated commands target the actual
-    execution platform.
+    the current OS, architecture, shell, and authoritative effective cwd so generated
+    commands and relative tool paths target the actual execution environment. Keep cwd
+    distinct from project root unless the latter is independently established.
 13. **Foreground owns the terminal.** Background subagents must not write live
     model/thinking/tool/ANSI output to stdout/stderr; they publish results through
     task IPC for `task_wait` / `task_status`. The driver may expose one compact
@@ -97,3 +98,8 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
     read-only phase/limit claim as the reason requested changes were skipped unless
     the current turn contains matching runtime or tool evidence. Reopen once with
     tools preserved; at a hard stop, make the unsupported claim visible.
+25. **Question guidance is default-path only.** The "Asking the user" behavior
+    block is injected by `build_system_prompt` only when no skill is active,
+    `goal_mode` is None, and `is_background` is false. Never move it into agent
+    text or unconditional prompt sections; goal mode must stay autonomous and
+    background mode has no terminal to answer.

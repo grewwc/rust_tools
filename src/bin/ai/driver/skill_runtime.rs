@@ -18,17 +18,20 @@ use super::{DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS};
 type ToolDef = ToolDefinition;
 
 /// 运行时上下文，传入 build_system_prompt 实现条件渲染。
-/// 当前只有 goal_mode；未来可扩展 task_type / persona 等。
+/// 当前有 goal_mode 与 is_background；未来可扩展 task_type / persona 等。
 #[derive(Clone, Default)]
 pub(super) struct PromptContext {
     /// 非 None 表示处于 goal 模式，值为目标描述文本。
     pub goal_mode: Option<String>,
+    /// 后台模式（-bg）：终端已脱离，不应注入"向用户提问"引导。
+    pub is_background: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ContextKind {
     Identity,
     Behavior,
+    Capability,
     Policy,
     Fact,
 }
@@ -60,15 +63,16 @@ impl SystemPromptBuilder {
     }
 
     fn render_system_prompt(&self) -> String {
-        // 按语义类别分组渲染：同一 kind（identity/behavior/policy）的所有段落
+        // 按语义类别分组渲染：同一 kind（identity/behavior/capability/policy）的所有段落
         // 合并进同一对 tag，组内保持插入顺序。这样 persona 等"在 build_system_prompt
         // 之后追加"的 identity 段不会被甩到 prompt 末尾，而是与通用 identity 聚拢；
         // behavior/policy 也不再因 push 时机裂成多簇，减少 tag 噪音、让优先级层次
         // 对模型更清晰。Fact 段不在 system prompt 渲染（走 context reminder 注入当前
         // user 消息），故不在白名单内、自然被排除。
-        const RENDER_ORDER: [(ContextKind, &str); 3] = [
+        const RENDER_ORDER: [(ContextKind, &str); 4] = [
             (ContextKind::Identity, "identity"),
             (ContextKind::Behavior, "behavior"),
+            (ContextKind::Capability, "capabilities"),
             (ContextKind::Policy, "policy"),
         ];
         let mut out = String::new();
@@ -148,11 +152,15 @@ fn runtime_environment_prompt() -> String {
             (!shell_name.is_empty()).then_some(shell_name)
         })
         .unwrap_or_else(|| "unknown".to_string());
+    let effective_cwd = super::runtime_ctx::effective_cwd()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
 
     format!(
         "Execution environment:\n\
          - Operating system: {os_label} (`{os}`); architecture: `{arch}`.\n\
          - Shell: `{shell}`.\n\
+         - Effective working directory: `{effective_cwd}`. Relative tool paths resolve against this directory; it is not necessarily the project root.\n\
          - Write commands for this OS/shell. Do not use commands or package managers from another OS unless the user asks for cross-platform guidance or you first verify they exist here."
     )
 }
@@ -799,9 +807,9 @@ fn build_system_prompt(
         if let Some(agent_text) = &agent_extra {
             s.push_str("\n\n[Agent instructions]\n");
             s.push_str(agent_text.trim());
-            s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill.");
+            s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill. Neither skill nor agent instructions override the correctness guardrails (including git-safety rules) or policy sections, which always take precedence.");
         } else {
-            s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ.");
+            s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ, except the correctness guardrails (including git-safety rules) and policy sections, which always take precedence.");
         }
         s
     } else {
@@ -821,17 +829,28 @@ fn build_system_prompt(
              - After the call, present that question to the user and wait. The runtime restores this skill for only the user's immediately following normal message; an explicit skill selection overrides it.",
         );
     }
+    // 非 skill 轮次的提问引导，只在默认交互路径注入：
+    // skill 轮已有 request_user_input 交接协议，goal 模式要求自主推进，
+    // background 模式终端已脱离，三种情况都不注入。
+    if skill.is_none() && ctx.goal_mode.is_none() && !ctx.is_background {
+        b.push(
+            ContextKind::Behavior,
+            "Asking the user:\n\
+             - When you are genuinely blocked — a product decision only the user can make, missing required input, or a risky irreversible action — ask promptly instead of guessing, stalling, or silently picking a risky default.\n\
+             - Do not ask when you can reasonably decide: when several approaches are valid, choose the clearly safer, more local one and proceed. Routine details, reversible choices, and multi-step execution are yours to handle.\n\
+             - Ask by ending your reply with a clear question in plain text, then wait for the user's answer.",
+        );
+    }
     b.push(ContextKind::Behavior, runtime_environment_prompt());
 
     if let Some(resource_path) = skill
         .and_then(|skill| skill.resource_path.as_deref())
         .filter(|path| !path.trim().is_empty())
     {
-        b.push_labeled(
-            ContextKind::Fact,
-            "Active Skill Resources",
+        b.push(
+            ContextKind::Capability,
             format!(
-                "The active skill includes bundled resources at `{}`. When the skill instructions refer to bundled files, scripts, references, examples, or assets, inspect this directory with available file tools and use the relevant resources.",
+                "Active Skill Resources:\nThe active skill includes bundled resources at `{}`. When the skill instructions refer to bundled files, scripts, references, examples, or assets, inspect this directory with available file tools and use the relevant resources.",
                 resource_path.trim()
             ),
         );
@@ -862,6 +881,18 @@ fn build_system_prompt(
          - Continue only while a criterion is unresolved and the next call can verify it, rule out a live hypothesis, or complete required work.\n\
          - Stop when all criteria are verified or a specific blocker remains. A partial result must state what is confirmed, what is unknown, and the next verification step; evidence count alone is not a stopping rule. Do not pursue perfect certainty or unrelated detail.",
     );
+
+    // ── 压缩上下文找回：absence 主张必须先检索会话归档，不能直接断言"没找到" ──
+    if has_tool(available_tools, "search_overflow") {
+        b.push(
+            ContextKind::Behavior,
+            "Compressed context recovery:\n\
+             - Compressed-out evidence is not lost: the compression pipeline archives truncated/folded tool output and folded messages verbatim into the session overflow archive and leaves stubs/pointers in history.\n\
+             - Before asserting \"not found\", \"does not exist\", or \"was not mentioned\", search the session archive with `search_overflow` first — absence claims must cover the archived scope, not just the current context window.\n\
+             - `search_overflow` returns verbatim excerpts with absolute file paths and line numbers; follow up with `read_file` on an exact hit only when you need more surrounding context.\n\
+             - Narrow with `scope` (history / tool_outputs / all) or `file_pattern` only when you know where the content lives; otherwise default to `scope=all`.",
+        );
+    }
 
     // ── 行为规则：根据 goal 模式条件渲染 ──
     // 两种模式共用上面的 success-criteria 收敛规则；这里只表达作用域与续执行差异。
@@ -1081,6 +1112,20 @@ fn build_system_prompt(
         push_tool_guidance_section(&mut b, ContextKind::Policy, "Knowledge retrieval:", lines);
     }
 
+    // ── 知识缓存维护：仅在缓存疑似过期或需要排查时使用，不是常规步骤 ──
+    if has_tool(available_tools, "knowledge_cache_manage") {
+        push_tool_guidance_section(
+            &mut b,
+            ContextKind::Policy,
+            "Knowledge cache maintenance:",
+            vec![
+                "Use `knowledge_cache_manage(action=stats)` only to inspect the knowledge cache; do not call it as a routine step.".to_string(),
+                "Use `action=refresh` with a `topic` only when cached knowledge answers look stale or outdated — it forces a re-fetch of that topic.".to_string(),
+                "Use `action=clear_volatile` only when the project structure has changed and time-limited cached knowledge may be stale; stable entries are never touched.".to_string(),
+            ],
+        );
+    }
+
     if has_tool(available_tools, "write_file") {
         let mut lines = Vec::new();
         if has_tool(available_tools, "write_file") {
@@ -1091,7 +1136,7 @@ fn build_system_prompt(
                 "`write_file(temp=true)` writes to the per-session temp directory. When `temp=true`, pass a relative filename only (e.g. `script.py`); an absolute path is rejected to avoid accidentally writing into the project tree.".to_string(),
             );
             lines.push(
-                "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` will accumulate. `execute_command` cannot run `rm` either (blocked by sandbox).".to_string(),
+                "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` will accumulate. `execute_command` cannot run `rm` either — that is a command-policy blacklist, not a filesystem sandbox: allowed commands run directly against the real workspace.".to_string(),
             );
             if has_tool(available_tools, "apply_patch") {
                 lines.push(
@@ -1151,12 +1196,13 @@ fn build_skill_turn_guard(
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
     let ctx = PromptContext {
         goal_mode: app.goal_mode.clone(),
+        is_background: app.cli.background,
     };
     let mut builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools, &ctx);
     if has_tool(&available_tools, "enable_tools")
         && let Some(catalog) = build_hidden_mcp_tool_catalog(&all_mcp_tools, &mcp_tools)
     {
-        builder.push(ContextKind::Fact, catalog);
+        builder.push(ContextKind::Capability, catalog);
     }
     // executor/openclaw agent 的重执行原语被 manifest_tool_definitions 剔除出常驻集，
     // 这里补一条「可 enable」提示保证模型可感知（其它只读 agent 不声明该组、不注入）。
@@ -1164,7 +1210,7 @@ fn build_skill_turn_guard(
         && declares_executor_group(skill, active_agent.as_ref())
         && let Some(catalog) = build_hidden_execution_primitive_catalog(&available_tools)
     {
-        builder.push(ContextKind::Fact, catalog);
+        builder.push(ContextKind::Capability, catalog);
     }
     push_project_context(&mut builder);
     if !app.active_persona.is_default() {
@@ -1749,20 +1795,63 @@ mod tests {
         assert!(!prompt.contains("cargo_test"));
         assert!(!prompt.contains("execute_command"));
         assert!(!prompt.contains("apply_patch"));
+        assert!(!prompt.contains("Compressed context recovery:"));
+        assert!(!prompt.contains("Knowledge cache maintenance:"));
     }
 
     #[test]
-    fn system_prompt_includes_runtime_environment() {
-        let available = SkipSet::new(16);
+    fn system_prompt_bridges_compressed_context_recovery_via_search_overflow() {
+        // search_overflow 是 core 常驻工具，但必须显式桥接压缩管线：
+        // 上下文被压缩后，absence 主张要先检索会话归档，不能直接断言"没找到"。
+        let mut available = SkipSet::new(16);
+        available.insert("search_overflow".to_string());
+
         let prompt =
             build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
+
+        assert!(prompt.contains("Compressed context recovery:"));
+        assert!(prompt.contains("search the session archive with `search_overflow`"));
+        assert!(prompt.contains("absence claims must cover the archived scope"));
+        assert!(prompt.contains("verbatim excerpts"));
+        assert!(prompt.contains("scope=all"));
+    }
+
+    #[test]
+    fn system_prompt_guides_knowledge_cache_manage_when_loaded() {
+        let mut available = SkipSet::new(16);
+        available.insert("knowledge_cache_manage".to_string());
+
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+
+        assert!(prompt.contains("Knowledge cache maintenance:"));
+        assert!(prompt.contains("action=stats"));
+        assert!(prompt.contains("action=refresh"));
+        assert!(prompt.contains("action=clear_volatile"));
+    }
+
+    #[test]
+    fn system_prompt_includes_runtime_environment_and_effective_cwd() {
+        let available = SkipSet::new(16);
+        let effective_cwd = std::env::temp_dir().join("rust_tools_prompt_cwd");
+        let prompt = SUBAGENT_CWD.sync_scope(effective_cwd.clone(), || {
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt()
+        });
 
         assert!(prompt.contains("Execution environment:"));
         assert!(prompt.contains("Operating system:"));
         assert!(prompt.contains(std::env::consts::OS));
         assert!(prompt.contains(std::env::consts::ARCH));
         assert!(prompt.contains("Shell:"));
+        assert!(prompt.contains(&format!(
+            "Effective working directory: `{}`",
+            effective_cwd.display()
+        )));
+        assert!(prompt.contains("Relative tool paths resolve against this directory"));
+        assert!(prompt.contains("not necessarily the project root"));
         assert!(prompt.contains("Write commands for this OS/shell"));
     }
 
@@ -2010,12 +2099,61 @@ mod tests {
             &Box::new(available),
             &PromptContext {
                 goal_mode: Some("analyze the design".to_string()),
+                is_background: false,
             },
         )
         .render_system_prompt();
         assert!(goal.contains("Analysis-only goals are complete"));
         assert!(!goal.contains("your job is to act, not analyze"));
         assert!(!goal.contains("every detail of the goal is complete"));
+    }
+
+    #[test]
+    fn asking_user_guidance_only_on_default_interactive_path() {
+        let available = Box::new(SkipSet::new(16));
+        let build_agent = agent("build", vec![]);
+
+        let interactive = build_system_prompt(
+            Some(&build_agent),
+            None,
+            &available,
+            &PromptContext::default(),
+        )
+        .render_system_prompt();
+        assert!(interactive.contains("Asking the user:"));
+
+        let goal = build_system_prompt(
+            Some(&build_agent),
+            None,
+            &available,
+            &PromptContext {
+                goal_mode: Some("finish the goal".to_string()),
+                is_background: false,
+            },
+        )
+        .render_system_prompt();
+        assert!(!goal.contains("Asking the user:"));
+
+        let background = build_system_prompt(
+            Some(&build_agent),
+            None,
+            &available,
+            &PromptContext {
+                goal_mode: None,
+                is_background: true,
+            },
+        )
+        .render_system_prompt();
+        assert!(!background.contains("Asking the user:"));
+
+        let skill_turn = build_system_prompt(
+            Some(&build_agent),
+            Some(&skill("humanizer", "Rewrite text naturally")),
+            &available,
+            &PromptContext::default(),
+        )
+        .render_system_prompt();
+        assert!(!skill_turn.contains("Asking the user:"));
     }
 
     #[test]
@@ -2267,6 +2405,45 @@ mod tests {
     }
 
     #[test]
+    fn render_keeps_capabilities_in_system_prompt_out_of_fact_reminder() {
+        let mut builder = SystemPromptBuilder::new();
+        builder.push(
+            ContextKind::Capability,
+            "Configured MCP tools can be loaded with `enable_tools`.",
+        );
+        builder.push_labeled(ContextKind::Fact, "Project Type", "Rust project.");
+
+        let prompt = builder.render_system_prompt();
+        let reminder = builder.render_context_reminder().unwrap();
+
+        assert!(prompt.contains("<capabilities>"));
+        assert!(prompt.contains("Configured MCP tools can be loaded"));
+        assert!(!prompt.contains("You should not respond to this context"));
+        assert!(!reminder.contains("Configured MCP tools can be loaded"));
+        assert!(reminder.contains("Project Type"));
+    }
+
+    #[test]
+    fn active_skill_resources_are_system_capabilities() {
+        let available = SkipSet::new(16);
+        let mut active_skill = skill("resource-skill", "Uses bundled references");
+        active_skill.resource_path = Some("/private/resource-skill/resources".to_string());
+
+        let builder = build_system_prompt(
+            None,
+            Some(&active_skill),
+            &Box::new(available),
+            &PromptContext::default(),
+        );
+        let prompt = builder.render_system_prompt();
+        let reminder = builder.render_context_reminder().unwrap_or_default();
+
+        assert!(prompt.contains("Active Skill Resources:"));
+        assert!(prompt.contains("/private/resource-skill/resources"));
+        assert!(!reminder.contains("/private/resource-skill/resources"));
+    }
+
+    #[test]
     fn active_skill_prompt_precedes_agent_prompt_and_declares_priority() {
         let available = SkipSet::new(16);
         let mut build_agent = agent("build", vec![]);
@@ -2287,6 +2464,20 @@ mod tests {
         assert!(skill_pos < agent_pos);
         assert!(prompt.contains("primary behavior contract"));
         assert!(prompt.contains("skill instructions override agent instructions"));
+    }
+
+    #[test]
+    fn skill_only_prompt_keeps_guardrails_non_overridable() {
+        let available = SkipSet::new(16);
+        let mut humanizer = skill("humanizer", "Rewrite text naturally");
+        humanizer.prompt = "You are a writing editor.".to_string();
+
+        let prompt = build_system_prompt(None, Some(&humanizer), &Box::new(available), &PromptContext::default())
+            .render_system_prompt();
+
+        assert!(prompt.contains("skill instructions override generic assistant guidelines"));
+        assert!(prompt.contains("except the correctness guardrails (including git-safety rules) and policy sections, which always take precedence"));
+        assert!(!prompt.contains("[Agent instructions]"));
     }
 
     #[test]

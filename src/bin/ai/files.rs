@@ -98,6 +98,7 @@ fn render_text_attachment_block(file: &str) -> io::Result<String> {
         0,
         ATTACHMENT_INLINE_MAX_LINES.min(total_lines),
         Some(ATTACHMENT_INLINE_MAX_CHARS),
+        true,
     );
     if !preview.text.is_empty() {
         out.push_str(&preview.text);

@@ -1,12 +1,12 @@
 {
   "name": "write_file",
-  "description": "Write content to a file, replacing its entire contents (no append, no merge). Returns the absolute path on success. temp=false (default) writes to an absolute path (parent dirs created); temp=true writes a relative filename under the per-session temp dir, cleaned up at session end. For modifying an existing file, prefer apply_patch.",
+  "description": "Write content to a file, replacing its entire contents (no append, no merge). Returns the absolute path on success. temp=false (default) accepts an absolute path or a path relative to the effective working directory (parent dirs created); temp=true writes a relative filename under the per-session temp dir, cleaned up at session end. For modifying an existing file, prefer apply_patch.",
   "parameters": {
     "type": "object",
     "properties": {
       "file_path": {
         "type": "string",
-        "description": "Path to the file to write: absolute (temp=false) or relative filename (temp=true); absolute paths are rejected when temp=true."
+        "description": "Path to the file to write: absolute or relative to the effective working directory when temp=false; relative filename when temp=true (absolute paths are rejected)."
       },
       "content": {
         "type": "string",

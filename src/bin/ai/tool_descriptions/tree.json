@@ -6,7 +6,7 @@
     "properties": {
       "path": {
         "type": "string",
-        "description": "Root directory to display (default: \".\")."
+        "description": "Root directory to display. Relative paths resolve against the effective working directory shown in the system prompt (default: \".\")."
       },
       "max_depth": {
         "type": "integer",
