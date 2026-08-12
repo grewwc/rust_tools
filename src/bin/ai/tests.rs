@@ -1742,6 +1742,126 @@ async fn mid_turn_llm_summary_path_a_preserves_raw_archive_pointer() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
+    // 回归测试：经过持久化压缩后，较早的 user 消息被替换成 internal_note 摘要，
+    // 投影里可见的 role=="user" 边界不足 keep_recent_turns（=2）。retained_turn_start
+    // 返回 0 导致 Path A 被整体跳过，残留的 assistant(tool_calls)/tool 记录（受协议
+    // 配对保护、无法逐条删除）无法被 LLM 语义摘要回收，上下文只增不减。
+    // 修复后：split_at 回退到第一个 user 消息位置，system-like 摘要/归档标记仍由
+    // preserved_system_end 保留，二者之间的旧对话区段可被 Path A 正常摘要。
+    let app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
+    let big_tool_output = "x".repeat(12_000);
+    let messages = vec![
+        Message {
+            role: "system".into(),
+            content: Value::String("system prompt".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        // 前置压缩产生的摘要 + 归档标记（internal_note，system-like，受保护）
+        Message {
+            role: "internal_note".into(),
+            content: Value::String("长期记忆摘要（压缩保留）：之前的对话已完成。".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "internal_note".into(),
+            content: Value::String("归档：早期轮次已存档于 overflow 文件。".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        // 残留的旧 assistant(tool_calls)+tool（受协议配对保护，无法逐条删除）
+        Message {
+            role: "assistant".into(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_old_1".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: "{\"path\":\"old.rs\"}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "tool".into(),
+            content: Value::String(big_tool_output),
+            tool_calls: None,
+            tool_call_id: Some("call_old_1".into()),
+            reasoning_content: None,
+        },
+        // 最近 2 个 user 轮（受保护尾部）
+        Message {
+            role: "user".into(),
+            content: Value::String("请继续修改这个文件".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".into(),
+            content: Value::String("好的，我来处理。".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".into(),
+            content: Value::String("完成了吗".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".into(),
+            content: Value::String("已完成。".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let before = messages_total_chars_pub(&messages);
+    let (compressed, _before, after, _) =
+        mid_turn_llm_summarize(&app, messages, 2, 1_000, 20_000).await;
+    assert!(
+        after < before,
+        "应发生压缩：after={} before={}",
+        after,
+        before
+    );
+    // Path A 应对旧前缀生成 [mid-turn-summary] 摘要；修复前 split_at==0 导致 Path A 被跳过
+    let has_mid_turn_summary = compressed.iter().any(|message| {
+        message
+            .content
+            .as_str()
+            .is_some_and(|text| text.starts_with("[mid-turn-summary]"))
+    });
+    assert!(
+        has_mid_turn_summary,
+        "Path A 应对旧前缀生成 [mid-turn-summary] 摘要，实际 roles: {:?}",
+        compressed.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+    );
+    // 旧的大块 tool 输出应被摘要回收，不再以原文出现在结果里
+    let still_has_raw_tool_output = compressed.iter().any(|message| {
+        message
+            .content
+            .as_str()
+            .is_some_and(|text| text.len() > 5_000)
+    });
+    assert!(
+        !still_has_raw_tool_output,
+        "旧的大块 tool 输出应被摘要回收"
+    );
+}
+
 #[test]
 fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present() {
     // 回归测试：mid-turn 压缩传入 overflow_dir 后，read_file 等「不可压缩」

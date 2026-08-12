@@ -743,4 +743,195 @@ mod tests {
         assert!(tool_content.contains("- file_path:"));
         assert!(!tool_content.contains("tool_output_lines:"));
     }
+
+    /// 回归覆盖两条路径：工具密集历史经常规压缩已达标时，不调用有损 LLM 摘要；
+    /// 只有压缩后仍超阈值的对话密集历史才调用 LLM，并有效缩小上下文。
+    #[tokio::test]
+    async fn llm_summary_runs_only_when_post_compression_context_still_exceeds_threshold() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // 1. 本地 mock LLM 服务器：完整读取 Content-Length 后返回 OpenAI 格式响应
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served_clone = served.clone();
+        let server = std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                        // 读请求头
+                        let mut buf = [0u8; 8192];
+                        let mut header = Vec::new();
+                        loop {
+                            let n = sock.read(&mut buf).unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            header.extend_from_slice(&buf[..n]);
+                            if header.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        // 读完整 body（按 Content-Length）
+                        let head = String::from_utf8_lossy(&header).to_string();
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.trim();
+                                l.strip_prefix("Content-Length:")
+                                    .or_else(|| l.strip_prefix("content-length:"))
+                                    .and_then(|v| v.trim().parse().ok())
+                            })
+                            .unwrap_or(0);
+                        // header 中可能已包含部分 body（\r\n\r\n 之后）
+                        let body_start = header
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| p + 4)
+                            .unwrap_or(header.len());
+                        let mut body = header[body_start..].to_vec();
+                        let mut got = body.len();
+                        while got < len {
+                            let mut chunk = vec![0u8; len - got];
+                            let n = sock.read(&mut chunk).unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            body.extend_from_slice(&chunk[..n]);
+                            got += n;
+                        }
+                        let body_str = String::from_utf8_lossy(&body).to_string();
+                        let body_preview: String = body_str.chars().take(200).collect();
+                        assert!(
+                            body_str.contains("摘要") || body_str.contains("summar"),
+                            "mock 收到的请求体不像是摘要请求: {}",
+                            body_preview
+                        );
+                        let resp_body = r#"{"choices":[{"message":{"content":"MOCK_SUMMARY: 早期工具调用与对话要点 1/2/3。"}}]}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            resp_body.len(),
+                            resp_body
+                        );
+                        let _ = sock.write_all(resp.as_bytes());
+                        served_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            }
+        });
+
+        // 2. app：endpoint 指向 mock；history_max_chars 贴近生产默认
+        let history_file = std::env::temp_dir().join(format!(
+            "llm_summary_repro_{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut app = test_app(history_file);
+        app.config.endpoint = format!("http://{addr}");
+        app.config.history_max_chars = 90_000;
+        app.session_id = format!("llm_summary_repro_{}", uuid::Uuid::new_v4());
+
+        // 3. 工具密集超长会话：常规压缩可以安全降到阈值内，不应再做有损摘要。
+        let mut messages = vec![msg("system", "你是测试助手，请遵循项目规则。")];
+        for turn in 0..4 {
+            messages.push(msg("user", format!("第 {turn} 轮：请帮我检查代码")));
+            messages.push(assistant_tool_call(&format!("call_{turn}"), "read_file"));
+            messages.push(tool_result(
+                &format!("call_{turn}"),
+                format!("line {turn}: {}", "x".repeat(60_000)),
+            ));
+            messages.push(msg(
+                "assistant",
+                format!("第 {turn} 轮完成：发现 {}。", "y".repeat(2_000)),
+            ));
+        }
+        messages.push(msg("user", "最后：请总结以上所有结果"));
+
+        let before = crate::ai::history::messages_total_chars_pub(&messages);
+        assert!(
+            before > 180_000,
+            "测试会话应远超 pre-request LLM 阈值，实际 {before}"
+        );
+
+        // 4. 先验证常规压缩达标后门控保持关闭，保留精确上下文。
+        let mut work = messages.clone();
+        let report = apply_pre_request_context_budget(&app, &app.current_model, &mut work);
+        let llm_threshold =
+            crate::ai::driver::turn_runtime::pre_request_llm_summary_threshold(
+                &app.current_model,
+                app.config.history_max_chars,
+            );
+        let gate_open = crate::ai::driver::turn_runtime::should_try_llm_summary(
+            &app.session_id,
+            report.after_chars,
+            llm_threshold,
+        );
+        assert!(
+            !gate_open,
+            "常规压缩已达标后不应调用有损 LLM 摘要: after_chars={} threshold={}",
+            report.after_chars,
+            llm_threshold
+        );
+
+        // 5. 大量小段旧 user 消息不能被常规压缩静默删除；压缩后仍超阈值时，
+        //    LLM 摘要作为兜底应真正执行。每段低于 user 原文外溢阈值，确保覆盖该路径。
+        let mut summary_work = vec![msg("system", "你是测试助手，请遵循项目规则。")];
+        for turn in 0..220 {
+            summary_work.push(msg(
+                "user",
+                format!("第 {turn} 轮问题：{}", "u".repeat(900)),
+            ));
+            summary_work.push(msg("assistant", format!("第 {turn} 轮简短答复")));
+        }
+        summary_work.push(msg("user", "最后：请总结以上所有结果"));
+        let dense_report =
+            apply_pre_request_context_budget(&app, &app.current_model, &mut summary_work);
+        assert!(
+            dense_report.after_chars > llm_threshold,
+            "测试历史经常规压缩后应仍超阈值: after_chars={} threshold={}",
+            dense_report.after_chars,
+            llm_threshold
+        );
+        assert!(
+            crate::ai::driver::turn_runtime::should_try_llm_summary(
+                &app.session_id,
+                dense_report.after_chars,
+                llm_threshold,
+            ),
+            "压缩后仍超阈值时 LLM 摘要门控应打开"
+        );
+
+        let (after_msgs, llm_before, llm_after, was_effective) =
+            crate::ai::history::mid_turn_llm_summarize(
+                &app,
+                summary_work,
+                2,
+                4_000,
+                app.config.history_max_chars,
+            )
+            .await;
+
+        server.join().unwrap();
+        assert!(
+            served.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "mock LLM 服务器没有收到任何摘要请求"
+        );
+        assert!(was_effective, "LLM 摘要执行但被认为无效");
+        assert!(
+            llm_after < llm_before,
+            "LLM 摘要后体积未下降: {llm_before} -> {llm_after}"
+        );
+        assert!(
+            after_msgs.iter().any(|m| {
+                m.role == "internal_note"
+                    && m.content.to_string().contains("mid-turn-summary")
+            }),
+            "结果中缺少 [mid-turn-summary] 摘要 note"
+        );
+    }
 }

@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use crate::ai::types::App;
 
 use super::types::{
-    MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start,
+    MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, is_internal_note_role, is_system_like_role,
+    retained_turn_start,
 };
 
 pub(crate) mod llm_prune;
@@ -18,7 +19,8 @@ use text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 #[cfg(test)]
 use tool_groups::{FOLDED_TOOL_GROUP_ARCHIVE_DIR, fold_early_tool_groups};
 use tool_groups::{
-    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, first_trim_candidate, plan_early_tool_groups,
+    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, first_trim_candidate,
+    is_protected_leading_system_like_message, plan_early_tool_groups,
     recent_tool_group_message_indices, recent_tool_result_groups,
 };
 #[cfg(test)]
@@ -27,7 +29,8 @@ use tool_overflow::{
     age_out_overflow_stub_previews, build_persisted_summary_text,
     build_persisted_summary_text_with_app, cap_oversized_tool_results_for_context,
     enforce_protected_precision_group_budget, is_non_compressible_tool,
-    is_preserved_tool_overflow_content, minimize_overflow_stubs_for_hard_budget,
+    is_preserved_tool_overflow_content, is_preserved_user_or_image_stub,
+    merge_old_user_overflow_stubs, minimize_overflow_stubs_for_hard_budget,
     normalize_preserved_message_stubs_for_model, prepare_tool_messages_structured,
     spill_oversized_preserved_messages, spill_protected_precision_to_fit, tool_line_signature,
     try_spill_preserved_message_to_stub,
@@ -122,6 +125,29 @@ fn keep_recent_user_turns_when_trimming(messages: &[Message], budget: usize) -> 
     keep
 }
 
+/// 批量裁剪不能在执行中重算保护边界，因此低预算目标必须从一开始就采用
+/// 48K 以下的三轮保护策略；否则第三近用户轮次可能在总量跨过 48K 前已被删除。
+fn keep_recent_user_turns_for_batch(messages: &[Message], budget: usize) -> usize {
+    let total_chars = messages_total_chars(messages);
+    let mut keep = if budget > 0 && budget <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
+        3
+    } else if total_chars <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
+        3
+    } else {
+        2
+    };
+    if budget > 0 {
+        while keep > 1 {
+            let tail_start = retained_turn_start(messages, keep);
+            if messages_total_chars(&messages[tail_start..]) <= budget {
+                break;
+            }
+            keep -= 1;
+        }
+    }
+    keep
+}
+
 /// 暴露给同 crate 的常量访问器，避免在 mod.rs 中复制阈值数字。
 pub(in crate::ai) fn persisted_history_keep_recent_turns() -> usize {
     PERSISTED_HISTORY_KEEP_RECENT_TURNS
@@ -189,6 +215,7 @@ pub(super) fn is_compressed_tool_evidence_note(m: &Message) -> bool {
 
 const PERSISTED_HISTORY_SUMMARY_MAX_CHARS: usize = 8_000;
 const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
+const INTERNAL_NOTE_OVERFLOW_DIR: &str = "internal-note-overflow";
 const PRESERVED_TOOL_OVERFLOW_DIR: &str = "tool-overflow-compressed";
 const PRESERVED_USER_OVERFLOW_DIR: &str = "user-overflow-preserved";
 const PRESERVED_IMAGE_OVERFLOW_DIR: &str = "image-overflow-preserved";
@@ -390,6 +417,53 @@ pub(super) fn archive_messages_to_overflow(
     sink.push_messages(messages);
     sink.flush()
         .then(|| sink.file_path().to_string_lossy().to_string())
+}
+
+/// 内部注记可能是折叠证据、恢复指令或运行时持久状态，不能静默删除。每条按
+/// 内容指纹写入独立文件，重复压缩只复用同一路径，不会 append 同一正文。
+fn archive_internal_notes_deduplicated(
+    messages: &[Message],
+    overflow_dir: Option<&Path>,
+) -> Result<Option<PathBuf>, ()> {
+    let notes: Vec<&Message> = messages
+        .iter()
+        .filter(|message| message.role == ROLE_INTERNAL_NOTE)
+        .collect();
+    if notes.is_empty() {
+        return Ok(None);
+    }
+    let Some(root) = overflow_dir else {
+        return Err(());
+    };
+    let archive_dir = root.join(INTERNAL_NOTE_OVERFLOW_DIR);
+    for message in notes {
+        let raw_json = serde_json::to_string_pretty(message).map_err(|_| ())?;
+        let body = format!(
+            "# 内部上下文注记原文\n\n{}\n\nraw_message_json:\n```json\n{}\n```\n",
+            value_to_string(&message.content),
+            raw_json
+        );
+        let digest = content_sha256_hex(body.as_bytes());
+        let write = PlannedArchiveWrite::new(archive_dir.join(format!("{digest}.md")), body);
+        if !write.commit() {
+            return Err(());
+        }
+    }
+    Ok(Some(archive_dir))
+}
+
+fn insert_internal_note_archive_note_if_needed(
+    messages: &mut Vec<Message>,
+    archive_dir: Option<&Path>,
+) {
+    let Some(archive_dir) = archive_dir else {
+        return;
+    };
+    let archive_note = format!(
+        "{ARCHIVE_NOTE_PREFIX}\n较早的内部上下文注记已逐字归档。\n归档目录: {}\n需要回顾时使用 search_overflow（scope=all）定位，再用 read_file 精读文件。",
+        archive_dir.to_string_lossy()
+    );
+    insert_archive_note_if_missing(messages, archive_note);
 }
 
 fn archive_truncated_field_to_overflow(
@@ -992,30 +1066,85 @@ fn trim_removable_messages_batch(
     max_chars: usize,
     overflow_dir: Option<&Path>,
 ) -> bool {
-    let mut candidate = messages.clone();
+    // 单趟扫描 + 重建，替代旧实现「每轮 first_trim_candidate + Vec::remove」：
+    // 旧循环每轮都会全量重扫（keep_recent_user_turns_when_trimming /
+    // retained_turn_start / 头部保护 run 各 O(n)），删除又是 O(n) memmove，
+    // 整体 O(n²)，数千条 tool-heavy 历史会明显卡顿。这里把保护尾窗与字符总量
+    // 在移除前一次性算好，之后只做 O(n) 扫描 + O(n) 重建。
+    let keep_recent_user_turns = keep_recent_user_turns_for_batch(messages, max_chars);
+    let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
+    let mut total = messages_total_chars(messages);
+    if total <= max_chars {
+        return false;
+    }
+
+    let candidate = messages.clone();
     let mut removed = Vec::new();
-    // 维护运行期字符总量：字符数是 message_billable_chars 的纯加和，每轮删掉一条
-    // 消息精确减掉其计费字符，避免每轮对 candidate 做 O(n) 全量重扫（循环多轮时
-    // 会把整段 O(n²)）。candidate 仅在本循环内被 remove 修改，总量始终精确。
-    let mut total = messages_total_chars(&candidate);
-    while total > max_chars {
-        let Some(index) = first_trim_candidate(&candidate, max_chars) else {
-            break;
-        };
-        if candidate[index].role == "user" {
-            break;
+    let mut kept = Vec::with_capacity(candidate.len());
+    let mut index = 0usize;
+    let mut in_protected_leading_run = true;
+    for message in candidate {
+        // 头部受保护的 system-like run（系统提示词、历史摘要、归档指针、checkpoint）
+        // 整段跳过，与 first_trim_candidate 语义一致。
+        let head_protected =
+            in_protected_leading_run && is_protected_leading_system_like_message(&message);
+        if head_protected {
+            kept.push(message);
+            index += 1;
+            continue;
         }
-        let removed_msg = candidate.remove(index);
-        total = total.saturating_sub(message_billable_chars(&removed_msg));
-        removed.push(removed_msg);
+        in_protected_leading_run = false;
+
+        // 与 first_trim_candidate 的可删判定一致：checkpoint / 外溢 stub / tool /
+        // assistant(tool_calls) 均不可单删。user 在此路径不可删（OffloadOnly，只能
+        // 外溢）——跳过而不是 break：避免首个 user 之后的大量可裁候选失去批量移除
+        // 机会（旧行为 break 后只能靠 truncate 兜底，与 with_summary 的「丢弃 +
+        // 归档」语义不一致）。字符总量精确维护：每删一条减去 message_billable_chars，
+        // 一旦 total <= max_chars 即停止移除，与旧循环的停止条件一致。
+        let removable = index < protected_tail_start
+            && !is_context_checkpoint_marker(&message)
+            && !is_preserved_user_or_image_stub(&value_to_string(&message.content))
+            && message.role != "tool"
+            && !(message.role == "assistant"
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .map(|c| !c.is_empty())
+                    .unwrap_or(false))
+            && message.role != "user";
+        if removable && total > max_chars {
+            total = total.saturating_sub(message_billable_chars(&message));
+            removed.push(message);
+        } else {
+            kept.push(message);
+        }
+        index += 1;
     }
     if removed.is_empty() {
         return false;
     }
-    if overflow_dir.is_some() && archive_messages_to_overflow(&removed, overflow_dir).is_none() {
+    // 普通消息仍追加到统一历史归档；internal_note 单独按内容指纹写入确定性文件。
+    // 后者既避免静默丢失恢复指令/持久状态，也避免重复压缩时 append 同一正文。
+    let archive_candidates: Vec<Message> = removed
+        .iter()
+        .filter(|m| !is_internal_note_role(&m.role))
+        .cloned()
+        .collect();
+    let internal_archive_dir = match archive_internal_notes_deduplicated(&removed, overflow_dir) {
+        Ok(path) => path,
+        Err(()) => return false,
+    };
+    let archive_ok = match overflow_dir {
+        Some(dir) if !archive_candidates.is_empty() => {
+            archive_messages_to_overflow(&archive_candidates, Some(dir)).is_some()
+        }
+        _ => true,
+    };
+    if !archive_ok {
         return false;
     }
-    *messages = candidate;
+    *messages = kept;
+    insert_internal_note_archive_note_if_needed(messages, internal_archive_dir.as_deref());
     true
 }
 
@@ -1062,6 +1191,11 @@ fn shrink_messages_to_fit(
     // 约束：tool-heavy 会话尾窗过大时自动缩窗，把更早的 stub 暴露给老化折叠。
     let keep_recent_turns = keep_recent_user_turns_when_trimming(&messages, max_chars);
     age_out_overflow_stub_previews(&mut messages, keep_recent_turns);
+    // user/image 外溢 stub 没有 tool 锚点可老化：其预览本身就是单行指针，且
+    // first_trim_candidate / truncate / emergency cap 都不会再触碰它们，长会话
+    // 会让 stub 单调累积（尤其图片消息 512 阈值 < 名义成本时）。把保护尾窗之外
+    // 的旧 stub 合并成一条带归档目录的指针，占位开销从 O(N) 收敛到 O(1)。
+    merge_old_user_overflow_stubs(&mut messages, keep_recent_turns);
 
     // 主动精简「已成功写入」的 write_file/apply_patch 巨型 arguments：文件落盘、
     // 结果确认成功后全文不再有语义价值，无需等预算压力即可先替换为归档 stub。
@@ -1191,6 +1325,9 @@ fn shrink_messages_to_fit_with_summary(
     // 尾窗轮数同样受 max_chars 字节上限约束（见 keep_recent_user_turns_when_trimming）。
     let keep_recent_turns = keep_recent_user_turns_when_trimming(&messages, max_chars);
     age_out_overflow_stub_previews(&mut messages, keep_recent_turns);
+    // 与 plain shrink 对称：合并保护尾窗之外的 user/image 外溢 stub，防止占位
+    // 消息随会话时长单调累积。
+    merge_old_user_overflow_stubs(&mut messages, keep_recent_turns);
 
     // 与 shrink_messages_to_fit 对称：成功写入的 write_file/apply_patch 巨型
     // arguments 主动替换为归档 stub（保护窗口与失败结果保留）。
@@ -1204,6 +1341,7 @@ fn shrink_messages_to_fit_with_summary(
     // 放到原本保留的 system prompt 之前，破坏 provider 要求的消息顺序。
     let mut messages_before_first_drop: Option<Vec<Message>> = None;
     let mut dropped: Vec<Message> = Vec::new();
+    let mut dropped_internal_notes: Vec<Message> = Vec::new();
 
     // 运行期字符总量：单条删除精确减掉 message_billable_chars，折叠/外溢是整体性
     // 批量变更，各自分支里统一重算，语义与每轮 `messages_total_chars(&messages)`
@@ -1229,7 +1367,11 @@ fn shrink_messages_to_fit_with_summary(
             }
             let removed_msg = messages.remove(idx);
             total = total.saturating_sub(message_billable_chars(&removed_msg));
-            dropped.push(removed_msg);
+            if is_internal_note_role(&removed_msg.role) {
+                dropped_internal_notes.push(removed_msg);
+            } else {
+                dropped.push(removed_msg);
+            }
             continue;
         }
         if let Some(dir) = overflow_dir
@@ -1243,6 +1385,11 @@ fn shrink_messages_to_fit_with_summary(
 
     let dropped_has_user_turn = dropped.iter().any(|m| m.role == "user");
     let has_leading_summary_now = messages.first().map(is_summary_message).unwrap_or(false);
+    let internal_archive_dir =
+        match archive_internal_notes_deduplicated(&dropped_internal_notes, overflow_dir) {
+            Ok(path) => path,
+            Err(()) => return messages_before_first_drop.unwrap_or(messages),
+        };
 
     if !dropped.is_empty() {
         if let Some(dir) = overflow_dir {
@@ -1346,6 +1493,8 @@ fn shrink_messages_to_fit_with_summary(
             }
         }
     }
+
+    insert_internal_note_archive_note_if_needed(&mut messages, internal_archive_dir.as_deref());
 
     if messages_total_chars(&messages) > max_chars {
         truncate_mutable_messages_to_fit(
@@ -2141,7 +2290,21 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     let mut best_after = before;
 
     // === Path A：跨轮 LLM 摘要 ===
-    let split_at = retained_turn_start(&messages, keep_recent_turns);
+    // 先按"保留最近 keep_recent_turns 个 user 轮"算切点。经过前置投影压缩后，
+    // 较早的 user 消息可能已被替换成 internal_note 摘要（role != "user"），导致
+    // 投影里可见的 user 边界不足 keep_recent_turns，retained_turn_start 返回 0。
+    // 但这并不代表没有可压缩的旧内容--第一个 user 消息之前仍可能残留被协议配对
+    // 保护的 assistant(tool_calls)/tool 记录（无法逐条删除）。此时把切点回退到
+    // 第一个 user 消息位置：尾部用户轮仍受保护，前缀的 system-like 摘要/归档标记
+    // 由 preserved_system_end 保留，二者之间的旧对话区段可被 LLM 摘要回收。
+    let mut split_at = retained_turn_start(&messages, keep_recent_turns);
+    if split_at == 0 {
+        if let Some(first_user) = messages.iter().position(|m| m.role == "user") {
+            if first_user > 0 {
+                split_at = first_user;
+            }
+        }
+    }
     if split_at > 0 && split_at < messages.len() {
         // 保留头部前缀连续的 system-like 消息（agent 指令等），只摘要其后的对话
         // 区段。早期版本直接丢弃 messages[0] 的 system prompt，会让模型立刻失去
@@ -3158,6 +3321,8 @@ mod coalesce_summary_notes_tests;
 mod dedup_adjacent_tests;
 #[cfg(test)]
 mod fold_early_tool_groups_tests;
+#[cfg(test)]
+mod overflow_stub_merge_tests;
 #[cfg(test)]
 mod shrink_successful_write_arguments_tests;
 #[cfg(test)]

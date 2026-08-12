@@ -130,9 +130,12 @@ pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Optio
 
         // 已外溢到会话文件的 user/image 占位 stub 不删：它只是一个指向归档
         // 文件的指针（原文零压缩保存在磁盘上），删掉会让模型彻底失去线索。
-        // 普通的 user / 含图片消息仍可被裁剪：大体量内容已由 proactive spill
-        // 提前搬到文件，剩下的小体量旧 user 轮次应进入「丢弃 + 摘要」路径，
-        // 否则 30+ 轮纯文本对话永远无法收敛进预算，且早期目标会被静默丢失。
+        // 普通 user / 含图片消息是否可删由调用方路径决定，这里只负责上报候选：
+        // - with_summary：丢弃 + 归档 + 摘要（返回 user 即授权删除，早期目标由
+        //   摘要承接，否则 30+ 轮纯文本对话永远无法收敛进预算）；
+        // - plain shrink / 批量裁剪：user 只能 OffloadOnly——先外溢搬盘，失败则
+        //   plain shrink 必须 break（否则同一 user 会无限重复返回），batch 跳过
+        //   该 user 继续扫描后续候选，绝不能 remove 原文。
         if is_preserved_user_or_image_stub(&value_to_string(&message.content)) {
             index += 1;
             continue;
@@ -162,7 +165,7 @@ pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Optio
     None
 }
 
-fn is_protected_leading_system_like_message(message: &Message) -> bool {
+pub(super) fn is_protected_leading_system_like_message(message: &Message) -> bool {
     if message.role == ROLE_SYSTEM {
         return true;
     }

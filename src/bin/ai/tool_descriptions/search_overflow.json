@@ -15,11 +15,11 @@
           "history",
           "tool_outputs"
         ],
-        "description": "Where to search (default: all). 'history' = overflow-history.md (folded messages); 'tool_outputs' = tool-overflow-compressed/ (full snapshots of tool results)."
+        "description": "Where to search (default: all). 'all' also includes folded-tool-groups/ and internal-note-overflow/; 'history' = overflow-history.md; 'tool_outputs' = tool-overflow-compressed/ (full snapshots of individual tool results)."
       },
       "file_pattern": {
         "type": "string",
-        "description": "Optional glob to restrict searched archive files (e.g. '*execute_command*'). Applies to the tool_outputs scope."
+        "description": "Optional glob to restrict searched archive files (e.g. '*execute_command*')."
       },
       "is_regex": {
         "type": "boolean",

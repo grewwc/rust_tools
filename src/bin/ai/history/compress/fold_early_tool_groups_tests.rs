@@ -246,8 +246,13 @@ fn removable_messages_are_archived_in_one_batch() {
 
     let archive = std::fs::read_to_string(overflow_dir.join(OVERFLOW_HISTORY_FILENAME)).unwrap();
     assert_eq!(archive.matches("## 移出消息原文").count(), 1);
-    assert!(archive.contains("old-0"));
-    assert!(archive.contains("old-19"));
+    // 正文消息（assistant 纯文本）被整批归档……
+    assert!(archive.contains("answer-0"));
+    assert!(archive.contains("answer-2"));
+    // ……但 internal note 不再重复 append（问题 4 修复：note 正文证据已在各自
+    // 磁盘文件，重复归档会让 overflow-history.md 随压缩次数单调膨胀）。
+    assert!(!archive.contains("old-0"));
+    assert!(!archive.contains(COMPRESSED_TOOL_EVIDENCE_MARKER));
 
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
@@ -1266,13 +1271,12 @@ fn leading_compressed_tool_evidence_notes_are_not_immortal_prefix_context() {
         remaining_evidence < 8,
         "stale compressed evidence notes should not remain an immortal prefix"
     );
+    // 问题 4 修复：internal note 不再重复归档（正文证据已在 folded group 文件）；
+    // 归档文件可能不存在（本场景无正文消息被裁），存在时也绝不含 note 文本。
     let archived = std::fs::read_to_string(overflow_dir.join("overflow-history.md"))
-        .expect("trimmed compressed evidence should be archived before removal");
-    assert!(archived.contains("compressed_tool_round"), "{archived}");
-    assert!(
-        archived.contains(COMPRESSED_TOOL_EVIDENCE_MARKER),
-        "{archived}"
-    );
+        .unwrap_or_default();
+    assert!(!archived.contains("compressed_tool_round"), "{archived}");
+    assert!(!archived.contains(COMPRESSED_TOOL_EVIDENCE_MARKER), "{archived}");
 
     let _ = std::fs::remove_dir_all(overflow_dir);
 }

@@ -18,12 +18,12 @@ use super::text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use super::tool_groups::{recent_tool_group_message_indices, recent_tool_result_groups};
 use super::{
     COMPRESSED_TOOL_EVIDENCE_MARKER, IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_GROUPS,
-    PRESERVED_CONTENT_STUB_PREFIX, PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR,
-    PRESERVED_USER_OVERFLOW_DIR, PlannedArchiveWrite, USER_OVERFLOW_SPILL_MIN_CHARS,
-    automatic_summary_body, content_sha256_hex, dedup_adjacent,
-    keep_recent_user_turns_when_trimming, message_contains_image, normalize_whitespace,
-    redact_images_except_last, strip_nested_prior_summary_prefixes, tool_message_indices,
-    value_to_string,
+    KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX, PRESERVED_CONTENT_STUB_PREFIX,
+    PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR, PRESERVED_USER_OVERFLOW_DIR,
+    PlannedArchiveWrite, USER_OVERFLOW_SPILL_MIN_CHARS, automatic_summary_body, content_sha256_hex,
+    dedup_adjacent, keep_recent_user_turns_when_trimming, message_contains_image,
+    normalize_whitespace, redact_images_except_last, strip_nested_prior_summary_prefixes,
+    tool_message_indices, value_to_string,
 };
 
 const PRESERVED_TOOL_OVERFLOW_STUB_PREFIX: &str = "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]";
@@ -1301,8 +1301,146 @@ fn build_overflow_content_preview(content: &str) -> String {
     out.trim_end().to_string()
 }
 
+const MERGED_PRESERVED_USER_STUB_PREFIX: &str = "较早的用户内容已归档（共 ";
+const MERGED_PRESERVED_ARCHIVE_DIR_PREFIX: &str = "归档目录: ";
+
+fn parse_merged_preserved_message_stub(text: &str) -> Option<(usize, Vec<String>)> {
+    let count = text
+        .strip_prefix(MERGED_PRESERVED_USER_STUB_PREFIX)?
+        .split_once(" 条")?
+        .0
+        .parse::<usize>()
+        .ok()?;
+    if count == 0 {
+        return None;
+    }
+
+    let mut dirs = Vec::new();
+    for line in text.lines() {
+        // 兼容首版合并 stub 使用的「归档文件」字段；该字段实际存放目录。
+        let Some(dir) = line
+            .strip_prefix(MERGED_PRESERVED_ARCHIVE_DIR_PREFIX)
+            .or_else(|| line.strip_prefix("归档文件: "))
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+        else {
+            continue;
+        };
+        if !dirs.iter().any(|existing| existing == dir) {
+            dirs.push(dir.to_string());
+        }
+    }
+    (!dirs.is_empty()).then_some((count, dirs))
+}
+
+fn build_merged_preserved_message_stub(count: usize, dirs: &[String]) -> String {
+    let mut merged =
+        format!("较早的用户内容已归档（共 {count} 条，原文零压缩保存在会话归档目录）。\n");
+    for dir in dirs {
+        merged.push_str(MERGED_PRESERVED_ARCHIVE_DIR_PREFIX);
+        merged.push_str(dir);
+        merged.push('\n');
+    }
+    merged.push_str(
+        "这是一条上下文归档提示，不是用户的新请求。仅当当前任务确实依赖较早用户原文且现有摘要不足时，逐个使用 tree 列出上述归档目录，再按时间戳和类型定位 JSON 文件，最后使用 read_file 读取具体文件；不要对目录直接调用 read_file。",
+    );
+    merged
+}
+
+/// 将保护尾窗之外的 user/image 外溢 stub 合并为一条带归档目录的指针。
+///
+/// user/image stub 是 role=user 的占位消息：`first_trim_candidate` / truncate /
+/// emergency cap / tool-only 老化折叠都不会再触碰它们，长会话（尤其图片消息按
+/// 名义成本计费后）会让 stub 单调累积且没有任何收敛路径。把旧 stub 折叠成
+/// 单条合并指针后，占位开销从 O(N) 收敛到 O(1)；原文仍在磁盘零压缩保存，
+/// 目录 + 时间戳命名可通过 tree + read_file 回读。只合并保护尾窗之外的 stub，最近几轮保持
+/// 逐条指针以便精确召回。
+pub(super) fn merge_old_user_overflow_stubs(
+    messages: &mut Vec<Message>,
+    keep_recent_user_turns: usize,
+) {
+    const MERGE_MIN_STUB_COUNT: usize = 4;
+
+    // 后续 mid-turn 摘要仍会按最近 2/3 个真实 user 边界切分。即使当前预算已把
+    // keep_recent_user_turns 降到 1，也不能把这些结构边界一并折叠进 internal_note，
+    // 否则 retained_turn_start 会误判为“历史不足”，整段旧历史将无法进入摘要。
+    let structural_tail_turns =
+        keep_recent_user_turns.max(KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX);
+    let protected_tail_start = retained_turn_start(messages, structural_tail_turns);
+    let mut stub_indices = Vec::new();
+    let mut merged_stub_count = 0usize;
+    let mut single_stub_count = 0usize;
+    let mut archived_message_count = 0usize;
+    let mut dirs: Vec<String> = Vec::new();
+    for (idx, message) in messages.iter().take(protected_tail_start).enumerate() {
+        let Value::String(text) = &message.content else {
+            continue;
+        };
+        if let Some((count, merged_dirs)) = parse_merged_preserved_message_stub(text) {
+            stub_indices.push(idx);
+            merged_stub_count += 1;
+            archived_message_count = archived_message_count.saturating_add(count);
+            for dir in merged_dirs {
+                if !dirs.iter().any(|existing| existing == &dir) {
+                    dirs.push(dir);
+                }
+            }
+            continue;
+        }
+        if message.role != "user" {
+            continue;
+        }
+        let Some((_kind, file_path)) = parse_preserved_message_stub(text) else {
+            continue;
+        };
+        stub_indices.push(idx);
+        single_stub_count += 1;
+        archived_message_count = archived_message_count.saturating_add(1);
+        if let Some(parent) = Path::new(&file_path).parent() {
+            let dir = parent.to_string_lossy().into_owned();
+            if !dirs.iter().any(|d| d == &dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    // 尚无合并指针时至少积累 4 条才折叠；已有合并指针后，新老 stub 都并回同一条，
+    // 避免每新增 4 条就永久多出一个合并指针，重新退化为 O(N)。
+    // 旧版快照可能已含 role=user 的合并指针（修复前生成）。即使本轮无需重新折叠
+    // （只有一条合并指针且无新增单条 stub），也必须把已有合并指针的角色迁移为
+    // internal_note，否则 retained_turn_start 会继续把它当成真实 user 边界，
+    // 污染后续摘要切点。
+    for &idx in &stub_indices {
+        let is_merged = match &messages[idx].content {
+            Value::String(text) => parse_merged_preserved_message_stub(text).is_some(),
+            _ => false,
+        };
+        if is_merged && messages[idx].role != ROLE_INTERNAL_NOTE {
+            messages[idx].role = ROLE_INTERNAL_NOTE.to_string();
+        }
+    }
+    if dirs.is_empty()
+        || (merged_stub_count == 0 && single_stub_count < MERGE_MIN_STUB_COUNT)
+        || (merged_stub_count == 1 && single_stub_count == 0)
+    {
+        return;
+    }
+
+    let merged = build_merged_preserved_message_stub(archived_message_count, &dirs);
+
+    // 从后往前删除，避免下标失效；合并指针写到第一条 stub 的 Message 上。
+    // 它描述的是运行时归档元数据，不是新的用户请求；若继续保留 `user` 角色，
+    // 删除其余 stub 后会伪造轮次边界，使后续 tail/摘要切分把多轮旧消息误判
+    // 成一个近期用户轮次。
+    for &idx in stub_indices.iter().skip(1).rev() {
+        messages.remove(idx);
+    }
+    messages[stub_indices[0]].role = ROLE_INTERNAL_NOTE.to_string();
+    messages[stub_indices[0]].content = Value::String(merged);
+}
+
 pub(super) fn is_preserved_user_or_image_stub(text: &str) -> bool {
-    parse_preserved_message_stub(text).is_some()
+    parse_merged_preserved_message_stub(text).is_some()
+        || parse_preserved_message_stub(text).is_some()
 }
 
 fn parse_preserved_message_stub(text: &str) -> Option<(String, String)> {
@@ -1334,6 +1472,13 @@ pub(in crate::ai) fn normalize_preserved_message_stubs_for_model(messages: &mut 
         let Value::String(text) = &message.content else {
             continue;
         };
+        if let Some((count, dirs)) = parse_merged_preserved_message_stub(text) {
+            message.content = Value::String(build_merged_preserved_message_stub(count, &dirs));
+            // 合并指针是运行时归档元数据，不是用户请求；旧版快照可能仍以
+            // role=user 落盘，在此兜底迁移，避免污染 user/assistant 配对。
+            message.role = ROLE_INTERNAL_NOTE.to_string();
+            continue;
+        }
         let Some((kind, file_path)) = parse_preserved_message_stub(text) else {
             continue;
         };

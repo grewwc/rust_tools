@@ -12,7 +12,6 @@ use crate::ai::{
 use crate::commonw::configw;
 use rust_tools::cw::SkipSet;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
 
 use super::{DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS};
 
@@ -612,86 +611,6 @@ fn mcp_tools_for_turn(
     select_mcp_tools(mcp_client.get_all_tools(), skill, active_agent)
 }
 
-struct CapabilityEntry {
-    use_case: &'static str,
-    tools: &'static [&'static str],
-    hint: &'static str,
-}
-
-const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
-    CapabilityEntry {
-        use_case: "Persist user-facing facts, preferences, or decisions for later recall.",
-        tools: &["knowledge_save"],
-        hint: "Do NOT just acknowledge — actually call knowledge_save so the information persists in the user-facing knowledge base.",
-    },
-    CapabilityEntry {
-        use_case: "Recall previously saved user-facing information.",
-        tools: &["knowledge_search", "knowledge_list"],
-        hint: "",
-    },
-    CapabilityEntry {
-        use_case: "Inspect saved knowledge such as prior decisions, preferences, or known context.",
-        tools: &["knowledge_search", "knowledge_list"],
-        hint: "",
-    },
-    CapabilityEntry {
-        use_case: "Search remembered knowledge by semantic similarity rather than exact wording.",
-        tools: &["knowledge_semantic_search"],
-        hint: "",
-    },
-    CapabilityEntry {
-        use_case: "Work with Feishu/Lark documents, wikis, sheets, or doc exports.",
-        tools: &[
-            "mcp_feishu_docs_get_text_by_url",
-            "mcp_feishu_doc_create_from_markdown",
-        ],
-        hint: "For Feishu/Lark docs or sheets, enable the relevant MCP tools before proceeding.",
-    },
-];
-
-fn build_capability_catalog(available_tools: &Box<SkipSet<String>>) -> Option<String> {
-    // 缓存键：可用工具集合的哈希。同一会话/同一 agent 在工具集不变时复用。
-    let cache_key = capability_catalog_cache_key(available_tools);
-    if let Some(hit) = capability_catalog_cache_get(cache_key) {
-        return hit;
-    }
-
-    let mut lines = Vec::new();
-    for entry in CAPABILITY_CATALOG {
-        let missing: Vec<String> = entry
-            .tools
-            .iter()
-            .filter(|name| !available_tools.contains_str(name))
-            .map(|name| (*name).to_string())
-            .collect();
-        if missing.is_empty() {
-            continue;
-        }
-        let mut line = format!("- Need: {} → enable {:?}", entry.use_case, missing);
-        if !entry.hint.is_empty() {
-            line.push_str(" — ");
-            line.push_str(entry.hint);
-        }
-        lines.push(line);
-    }
-    let result = if lines.is_empty() {
-        None
-    } else {
-        let mut out = String::from(
-            "Capability catalog (not yet loaded — enable as needed):\n\
-             When the task clearly requires one of the capabilities below, call `enable_tools(operation=enable, tools=[...])` \
-             with the listed tools before proceeding.\n",
-        );
-        for line in lines {
-            out.push_str(&line);
-            out.push('\n');
-        }
-        Some(out)
-    };
-    capability_catalog_cache_put(cache_key, result.clone());
-    result
-}
-
 fn build_hidden_mcp_tool_catalog(
     all_mcp_tools: &[ToolDef],
     loaded_mcp_tools: &[ToolDef],
@@ -774,35 +693,6 @@ fn build_hidden_execution_primitive_catalog(
     }
     out.push('.');
     Some(out)
-}
-
-fn capability_catalog_cache_key(available_tools: &Box<SkipSet<String>>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut tools: Vec<String> = available_tools.iter().map(|s| s.to_string()).collect();
-    tools.sort();
-    let mut hasher = rustc_hash::FxHasher::default();
-    for t in &tools {
-        t.hash(&mut hasher);
-        0u8.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-static CAPABILITY_CATALOG_CACHE: LazyLock<Mutex<Option<(u64, Option<String>)>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-fn capability_catalog_cache_get(key: u64) -> Option<Option<String>> {
-    let cache = CAPABILITY_CATALOG_CACHE.lock().ok()?;
-    cache
-        .as_ref()
-        .filter(|(k, _)| *k == key)
-        .map(|(_, v)| v.clone())
-}
-
-fn capability_catalog_cache_put(key: u64, value: Option<String>) {
-    if let Ok(mut cache) = CAPABILITY_CATALOG_CACHE.lock() {
-        *cache = Some((key, value));
-    }
 }
 
 fn build_project_instruction_prompt() -> Option<String> {
@@ -961,6 +851,7 @@ fn build_system_prompt(
          - On failure, diagnose and adjust before retrying. After 3 failed attempts with the same approach, stop repeating that approach, not the whole task. Continue with a materially different safe recovery when one remains; end only when the task is complete or a specific blocker remains, then report what you tried and the current error.\n\n\
          Correctness guardrails:\n\
          - Ground factual claims in observed evidence; never invent identifiers, paths, behavior, output, line numbers, or quotations. If evidence is insufficient—even under tool or iteration limits—state what is verified, what is unknown, and the next verification step.\n\
+         - Every concrete specific you assert—identifier, path, signature, line number, config key, or tool output—must trace to evidence observed in this session, not to memory or plausibility. If you cannot point to that evidence, either confirm it with one targeted lookup when the claim is consequential, or state it is unverified; an explicit \"unverified\" or \"I don't know\" beats a confident guess. This is a labeling and abstention rule, not license to re-verify settled facts or exhaustively sweep every case.\n\
          - Calibrate verification effort to a claim's consequence and the quality of evidence already available. For material claims about inspectable code, runtime behavior, or tool results, prefer direct evidence when reasonably accessible; for recommendations, separate evidence-backed premises from judgment. Model-authored summaries/checkpoints, filenames alone, and prior assistant statements are navigation aids rather than independent proof: reopen underlying evidence only when it could materially change the conclusion, distinguish consequential inferences from observations, and limit absence claims to the scope actually searched.\n\
          - Treat the current plan and interpretation as hypotheses, not commitments. When a user correction, failed check, or new evidence invalidates an assumption, identify and re-evaluate the conclusions and actions that depended on it. Do not patch only the literal symptom or treat approval of one property as approval of adjacent behavior.\n\
          - Before changing a shared symbol, API, config, data format, or embedded asset, locate relevant callers and dependents and assess semantic ripple; compilation and tests prove only covered behavior.\n\
@@ -990,8 +881,8 @@ fn build_system_prompt(
         b.push(
             ContextKind::Behavior,
             "Scope Discipline & Stopping Criteria:\n\
-             - Investigate the user's explicit request plus only the direct dependencies needed to answer or implement it correctly. Do not read unrelated files, run tangential searches, or make out-of-scope changes.
-             - Do not implement unsolicited refactors or optimizations. You may report an adjacent critical correctness, data-loss, or security risk when evidence shows it directly affects the requested work.
+             - Investigate the user's explicit request plus only the direct dependencies needed to answer or implement it correctly. Do not read unrelated files, run tangential searches, or make out-of-scope changes.\n\
+             - Do not implement unsolicited refactors or optimizations. You may report an adjacent critical correctness, data-loss, or security risk when evidence shows it directly affects the requested work.\n\
              - For broad requests, identify the success criteria and investigation boundaries, then cover each criterion without expanding into unrelated areas.",
         );
         b.push(
@@ -1764,21 +1655,6 @@ mod tests {
     }
 
     #[test]
-    fn capability_catalog_only_references_registered_tools() {
-        // 能力目录会提示模型按需启用工具；若引用已删除的 builtin，会造成无效调用。
-        // mcp_* 是运行时/外部工具名，不在 Rust builtin registry 中。
-        for entry in super::CAPABILITY_CATALOG {
-            for tool_name in entry.tools {
-                assert!(
-                    crate::ai::tools::registry::common::is_registered_tool_name(tool_name)
-                        || tool_name.starts_with("mcp_"),
-                    "capability catalog references unregistered tool: {tool_name}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn declares_executor_group_only_true_for_executor_agents() {
         let build_agent = executor_group_agent("build");
         assert!(declares_executor_group(None, Some(&build_agent)));
@@ -2044,6 +1920,38 @@ mod tests {
         assert!(prompt.contains("distinguish introduced behavior from pre-existing behavior"));
         assert!(prompt.contains("reset, checkout, restore, stash drop"));
         assert!(prompt.contains("temporary branch/worktree or stash push then pop"));
+        // Anti-hallucination bullet: every concrete specific must trace to
+        // session-observed evidence, with explicit abstention allowed — and it
+        // must NOT be read as license to re-verify settled facts or sweep every
+        // case (efficiency guard the user explicitly required).
+        assert!(prompt.contains("must trace to evidence observed in this session"));
+        assert!(prompt.contains("not to memory or plausibility"));
+        assert!(prompt.contains("beats a confident guess"));
+        assert!(prompt.contains(
+            "labeling and abstention rule, not license to re-verify settled facts or exhaustively sweep every case"
+        ));
+    }
+
+    #[test]
+    fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
+        // Regression: the non-goal Scope Discipline block once dropped the
+        // `\n\` line-continuation on two bullets, baking ~13 spaces of source
+        // indentation into the rendered prompt. Assert every rendered line is
+        // left-trimmed (no leading whitespace leaks from the source literal).
+        let available = SkipSet::new(16);
+        let prompt =
+            build_system_prompt(None, None, &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+        assert!(prompt.contains("Scope Discipline & Stopping Criteria:"));
+        // The three bullets must each start at column 0 (bullet marker), not be
+        // prefixed by leaked source indentation.
+        assert!(prompt
+            .contains("\n- Investigate the user's explicit request plus only the direct dependencies"));
+        assert!(prompt.contains("\n- Do not implement unsolicited refactors or optimizations."));
+        assert!(prompt.contains("\n- For broad requests, identify the success criteria"));
+        // Guard against the exact defect: no bullet prefixed by leading spaces.
+        assert!(!prompt.contains("\n             - Do not implement unsolicited refactors"));
+        assert!(!prompt.contains("\n             - For broad requests, identify"));
     }
 
     #[test]
@@ -2400,16 +2308,6 @@ mod tests {
         assert!(prompt.contains("Reuse a successful knowledge search"));
         assert!(prompt.contains("Use `knowledge_list` when asked what is remembered"));
         assert!(!prompt.contains("call `memory_save`"));
-    }
-
-    #[test]
-    fn capability_catalog_routes_remember_requests_to_knowledge_save() {
-        let mut available = SkipSet::new(16);
-        available.insert("enable_tools".to_string());
-
-        let catalog = super::build_capability_catalog(&Box::new(available)).expect("catalog");
-        assert!(catalog.contains("knowledge_save"));
-        assert!(!catalog.contains("memory_save"));
     }
 
     fn temp_dir(name: &str) -> PathBuf {

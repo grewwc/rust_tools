@@ -3,6 +3,8 @@
 //! 上下文压缩后，被移出的原文零压缩归档到会话 assets 目录：
 //! - `overflow-history.md`：被折叠的原始消息（用户/助手/工具结果）
 //! - `tool-overflow-compressed/`：单条工具结果的完整快照
+//! - `folded-tool-groups/`：整组折叠工具调用的原始消息
+//! - `internal-note-overflow/`：被预算裁剪的内部上下文注记
 //!
 //! 模型需要找回被压缩的内容时，read_file 只能按已知路径分页读取；而压缩后
 //! 模型往往只知道"大致有哪些内容"，不知道精确路径/行号。search_overflow
@@ -34,7 +36,7 @@ const NO_MATCHES_MARKER: &str = "No matches found.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SearchScope {
-    /// 全部归档内容：overflow-history.md + tool-overflow-compressed/
+    /// 全部会话归档内容。
     All,
     /// 仅 overflow-history.md（被折叠的原始消息）
     History,
@@ -101,11 +103,19 @@ fn run_overflow_search(
         SearchScope::All => vec![
             assets_dir.join("overflow-history.md"),
             assets_dir.join("tool-overflow-compressed"),
+            assets_dir.join("folded-tool-groups"),
+            assets_dir.join("internal-note-overflow"),
         ],
     };
 
     let mut sections: Vec<String> = Vec::new();
+    // max_results 描述的是"跨所有根的匹配上限"，不是每个根各自的上限。
+    // 把它作为共享剩余额度，每个根消耗后递减，避免 scope=all 时最多返回 ~4 倍。
+    let mut remaining = params.max_results;
     for root in &roots {
+        if remaining == 0 {
+            break;
+        }
         if !root.exists() {
             continue; // 归档尚未生成该文件/目录时静默跳过
         }
@@ -114,7 +124,7 @@ fn run_overflow_search(
             is_regex: params.is_regex,
             case_sensitive: params.case_sensitive,
             context_lines: params.context_lines,
-            max_results: params.max_results,
+            max_results: remaining,
             file_pattern: params.file_pattern,
             extensions: None,
             // 展示绝对路径：read_file 按 effective_cwd() 解析相对路径，相对路径
@@ -124,7 +134,10 @@ fn run_overflow_search(
         };
         match run_content_search(root, &options) {
             Ok(out) if out == NO_MATCHES_MARKER => {}
-            Ok(out) => sections.push(out),
+            Ok(out) => {
+                remaining = remaining.saturating_sub(extract_match_count(&out));
+                sections.push(out);
+            }
             Err(e) => return Err(e),
         }
     }
@@ -162,7 +175,19 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
-#[cfg(test)]
+/// 从 run_content_search 的输出首行提取匹配数。
+
+/// 从 run_content_search 的输出首行提取匹配数。
+/// 首行格式固定为 "N match(es) in M file(s)"。
+fn extract_match_count(output: &str) -> usize {
+    output
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 mod tests {
     use super::*;
     use std::fs;
@@ -199,6 +224,12 @@ mod tests {
             "read_file content\nbar line\n",
         )
         .unwrap();
+        let folded_dir = dir.join("folded-tool-groups");
+        fs::create_dir_all(&folded_dir).unwrap();
+        fs::write(folded_dir.join("group.md"), "folded foo evidence\n").unwrap();
+        let note_dir = dir.join("internal-note-overflow");
+        fs::create_dir_all(&note_dir).unwrap();
+        fs::write(note_dir.join("note.md"), "internal foo state\n").unwrap();
     }
 
     fn params(query: &str) -> OverflowSearchParams<'_> {
@@ -227,6 +258,8 @@ mod tests {
             "tool output in results: {out}"
         );
         assert!(out.contains("foo line 1"));
+        assert!(out.contains("folded-tool-groups/group.md"), "{out}");
+        assert!(out.contains("internal-note-overflow/note.md"), "{out}");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -286,6 +319,35 @@ mod tests {
         let dir = make_temp_dir(); // 空目录：两个根都不存在
         let out = run_overflow_search(&dir, &params("foo")).unwrap();
         assert!(out.contains("No matches found"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn search_all_scope_shares_max_results_across_roots() {
+        let dir = make_temp_dir();
+        // 每个根都放入大量匹配行，确保每个根都能独立命中 max_results 次
+        fs::write(dir.join("overflow-history.md"), &"alpha\n".repeat(100)).unwrap();
+        let tool_dir = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tool_dir).unwrap();
+        fs::write(tool_dir.join("a.txt"), &"alpha\n".repeat(100)).unwrap();
+        let folded_dir = dir.join("folded-tool-groups");
+        fs::create_dir_all(&folded_dir).unwrap();
+        fs::write(folded_dir.join("a.md"), &"alpha\n".repeat(100)).unwrap();
+        let note_dir = dir.join("internal-note-overflow");
+        fs::create_dir_all(&note_dir).unwrap();
+        fs::write(note_dir.join("a.md"), &"alpha\n".repeat(100)).unwrap();
+
+        let mut p = params("alpha");
+        p.max_results = 5;
+        p.context_lines = 0;
+        let out = run_overflow_search(&dir, &p).unwrap();
+
+        // max_results 是跨所有根的共享上限，4 个根不能各自返回 5 条
+        let section_count = out.matches("match(es) in").count();
+        assert_eq!(
+            section_count, 1,
+            "max_results 应作为共享额度：期望仅 1 个根返回结果，实际 {section_count} 个: {out}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }
