@@ -38,11 +38,13 @@
 // =============================================================================
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use crate::ai::{
     agents::AgentManifest, mcp::SharedMcpClient, models::AutoModelFallbackSpec,
@@ -64,26 +66,126 @@ pub(crate) struct SubagentResult {
 /// then reads it once the child returns.
 pub(crate) type SubagentResultSlot = Arc<Mutex<SubagentResult>>;
 
-/// 子代理的实时进度。`phase` 随模型请求和工具调用变化，最近一次持久化的
-/// 工作计划则跨 phase 保留，供父代理的单行状态渲染器组合展示。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+const SUBAGENT_PROGRESS_TIMELINE_CAPACITY: usize = 12;
+const SUBAGENT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubagentProgressEventKind {
+    Phase,
+    Checkpoint,
+}
+
+impl SubagentProgressEventKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Phase => "phase",
+            Self::Checkpoint => "checkpoint",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SubagentProgressEvent {
+    pub(crate) sequence: u64,
+    pub(crate) kind: SubagentProgressEventKind,
+    pub(crate) elapsed: Duration,
+    pub(crate) summary: String,
+}
+
+/// 所有父代理可观测路径共用的结构化快照。展示、唤醒、持久化和硬超时恢复
+/// 都从这里投影，避免各自拼装一份语义不一致的状态。
+#[derive(Debug, Clone)]
+pub(crate) struct SubagentProgressSnapshot {
+    pub(crate) phase: String,
+    pub(crate) checkpoint_summary: Option<String>,
+    pub(crate) elapsed: Duration,
+    pub(crate) stale_for: Duration,
+    pub(crate) checkpoint_due: bool,
+    pub(crate) sequence: u64,
+    pub(crate) timeline: Vec<SubagentProgressEvent>,
+}
+
+impl SubagentProgressSnapshot {
+    pub(crate) fn display(&self) -> String {
+        let mut display = match self.checkpoint_summary.as_deref() {
+            Some(summary) if !summary.is_empty() => {
+                format!("{} · plan: {summary}", self.phase)
+            }
+            _ => self.phase.clone(),
+        };
+        display.push_str(&format!(
+            " · elapsed {} · last activity {} ago",
+            format_progress_duration(self.elapsed),
+            format_progress_duration(self.stale_for)
+        ));
+        if self.checkpoint_due {
+            display.push_str(" · checkpoint due");
+        }
+        display
+    }
+}
+
+/// 子代理的实时进度。事件时间线保持有界，长期诊断证据由 task 层低频持久化。
+#[derive(Debug, Clone)]
 pub(crate) struct SubagentProgress {
     phase: String,
     checkpoint_summary: Option<String>,
+    started_at: Instant,
+    updated_at: Instant,
+    last_checkpoint_at: Option<Instant>,
+    last_checkpoint_reminder_at: Option<Instant>,
+    sequence: u64,
+    timeline: VecDeque<SubagentProgressEvent>,
 }
 
 impl SubagentProgress {
     fn new(phase: &str) -> Self {
+        let now = Instant::now();
+        let phase = compact_progress_text(phase, 80);
+        let mut timeline = VecDeque::with_capacity(SUBAGENT_PROGRESS_TIMELINE_CAPACITY);
+        timeline.push_back(SubagentProgressEvent {
+            sequence: 1,
+            kind: SubagentProgressEventKind::Phase,
+            elapsed: Duration::ZERO,
+            summary: phase.clone(),
+        });
         Self {
-            phase: compact_progress_text(phase, 80),
+            phase,
             checkpoint_summary: None,
+            started_at: now,
+            updated_at: now,
+            last_checkpoint_at: None,
+            last_checkpoint_reminder_at: None,
+            sequence: 1,
+            timeline,
         }
     }
 
-    pub(crate) fn display(&self) -> String {
-        match self.checkpoint_summary.as_deref() {
-            Some(summary) if !summary.is_empty() => format!("{} · plan: {summary}", self.phase),
-            _ => self.phase.clone(),
+    fn push_event(&mut self, kind: SubagentProgressEventKind, summary: String, now: Instant) {
+        self.sequence = self.sequence.saturating_add(1);
+        self.updated_at = now;
+        if self.timeline.len() == SUBAGENT_PROGRESS_TIMELINE_CAPACITY {
+            self.timeline.pop_front();
+        }
+        self.timeline.push_back(SubagentProgressEvent {
+            sequence: self.sequence,
+            kind,
+            elapsed: now.saturating_duration_since(self.started_at),
+            summary,
+        });
+    }
+
+    fn snapshot(&self, now: Instant) -> SubagentProgressSnapshot {
+        let checkpoint_reference = self.last_checkpoint_at.unwrap_or(self.started_at);
+        SubagentProgressSnapshot {
+            phase: self.phase.clone(),
+            checkpoint_summary: self.checkpoint_summary.clone(),
+            elapsed: now.saturating_duration_since(self.started_at),
+            stale_for: now.saturating_duration_since(self.updated_at),
+            checkpoint_due: now.saturating_duration_since(checkpoint_reference)
+                >= SUBAGENT_CHECKPOINT_INTERVAL,
+            sequence: self.sequence,
+            timeline: self.timeline.iter().cloned().collect(),
         }
     }
 }
@@ -150,6 +252,9 @@ tokio::task_local! {
     /// current execution phase here so the spawning `task` tool's heartbeat
     /// line can surface it. Absence means "no parent is showing a heartbeat".
     pub(crate) static SUBAGENT_PHASE: SubagentPhaseSlot;
+    /// 后台异步任务的稳定 task id。进度发布器据此把统一快照低频持久化并唤醒
+    /// 对应父进程；同步 `task` 没有该作用域，仍可通过共享 slot 展示心跳。
+    pub(crate) static SUBAGENT_TASK_ID: String;
     /// 父同步等待即将到达硬超时时置位；子代理只消费一次，用于请求其立即收口。
     pub(crate) static SUBAGENT_WRAP_UP_SIGNAL: SubagentWrapUpSignal;
     /// 后台 subagent 不拥有 terminal。其完整响应仍照常解析、持久化并通过 result
@@ -226,11 +331,17 @@ pub(crate) fn publish_subagent_phase(phase: &str) {
     let Ok(slot) = SUBAGENT_PHASE.try_with(|slot| slot.clone()) else {
         return;
     };
-    if let Ok(mut guard) = slot.lock() {
-        let phase = compact_progress_text(phase, 80);
-        if guard.phase != phase {
-            guard.phase = phase;
+    let phase = compact_progress_text(phase, 80);
+    let snapshot = match slot.lock() {
+        Ok(mut guard) if guard.phase != phase => {
+            guard.phase = phase.clone();
+            guard.push_event(SubagentProgressEventKind::Phase, phase, Instant::now());
+            Some(guard.snapshot(Instant::now()))
         }
+        _ => None,
+    };
+    if let Some(snapshot) = snapshot {
+        publish_progress_update(&snapshot, SubagentProgressEventKind::Phase);
     }
 }
 
@@ -240,13 +351,34 @@ pub(crate) fn publish_subagent_checkpoint_summary(summary: &str) {
     let Ok(slot) = SUBAGENT_PHASE.try_with(|slot| slot.clone()) else {
         return;
     };
-    if let Ok(mut guard) = slot.lock() {
-        let summary = summary
-            .strip_prefix("working_checkpoint:")
-            .unwrap_or(summary)
-            .trim();
-        guard.checkpoint_summary = Some(compact_progress_text(summary, 120));
+    let summary = summary
+        .strip_prefix("working_checkpoint:")
+        .unwrap_or(summary)
+        .trim();
+    let summary = compact_progress_text(summary, 120);
+    let snapshot = match slot.lock() {
+        Ok(mut guard) => {
+            let now = Instant::now();
+            guard.checkpoint_summary = Some(summary.clone());
+            guard.last_checkpoint_at = Some(now);
+            guard.push_event(SubagentProgressEventKind::Checkpoint, summary, now);
+            Some(guard.snapshot(now))
+        }
+        Err(_) => None,
+    };
+    if let Some(snapshot) = snapshot {
+        publish_progress_update(&snapshot, SubagentProgressEventKind::Checkpoint);
     }
+}
+
+fn publish_progress_update(
+    snapshot: &SubagentProgressSnapshot,
+    kind: SubagentProgressEventKind,
+) {
+    let Ok(task_id) = SUBAGENT_TASK_ID.try_with(Clone::clone) else {
+        return;
+    };
+    crate::ai::tools::task_tools::record_subagent_progress_update(&task_id, snapshot, kind);
 }
 
 pub(crate) fn new_subagent_progress_slot() -> SubagentPhaseSlot {
@@ -254,7 +386,39 @@ pub(crate) fn new_subagent_progress_slot() -> SubagentPhaseSlot {
 }
 
 pub(crate) fn subagent_progress_snapshot(slot: &SubagentPhaseSlot) -> Option<String> {
-    slot.lock().ok().map(|progress| progress.display())
+    subagent_progress_state_snapshot(slot).map(|progress| progress.display())
+}
+
+pub(crate) fn subagent_progress_state_snapshot(
+    slot: &SubagentPhaseSlot,
+) -> Option<SubagentProgressSnapshot> {
+    slot.lock()
+        .ok()
+        .map(|progress| progress.snapshot(Instant::now()))
+}
+
+/// 长任务的 checkpoint 由运行时状态决定，而不是依赖模型记住固定轮次。
+/// 每个到期窗口最多注入一次提醒；成功发布 checkpoint 后重新计时。
+pub(crate) fn take_subagent_checkpoint_due_reminder() -> bool {
+    let Ok(slot) = SUBAGENT_PHASE.try_with(|slot| slot.clone()) else {
+        return false;
+    };
+    let Ok(mut progress) = slot.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    let checkpoint_reference = progress.last_checkpoint_at.unwrap_or(progress.started_at);
+    if now.saturating_duration_since(checkpoint_reference) < SUBAGENT_CHECKPOINT_INTERVAL {
+        return false;
+    }
+    if progress
+        .last_checkpoint_reminder_at
+        .is_some_and(|last| now.saturating_duration_since(last) < SUBAGENT_CHECKPOINT_INTERVAL)
+    {
+        return false;
+    }
+    progress.last_checkpoint_reminder_at = Some(now);
+    true
 }
 
 fn compact_progress_text(value: &str, max_chars: usize) -> String {
@@ -271,6 +435,17 @@ fn compact_progress_text(value: &str, max_chars: usize) -> String {
         format!("{prefix}…")
     } else {
         prefix
+    }
+}
+
+pub(crate) fn format_progress_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3_600, (seconds % 3_600) / 60)
     }
 }
 
@@ -479,10 +654,28 @@ mod tests {
             subagent_progress_snapshot(&slot)
         });
 
-        assert_eq!(
-            rendered.as_deref(),
-            Some("calling model · plan: inspect the task path")
-        );
+        let rendered = rendered.expect("progress snapshot");
+        assert!(rendered.starts_with("calling model · plan: inspect the task path"));
+        assert!(rendered.contains("elapsed "));
+        assert!(rendered.contains("last activity "));
+    }
+
+    #[test]
+    fn subagent_progress_timeline_is_bounded_and_keeps_latest_events() {
+        let mut progress = SubagentProgress::new("starting");
+        let start = progress.started_at;
+        for index in 0..20 {
+            progress.push_event(
+                SubagentProgressEventKind::Phase,
+                format!("phase-{index}"),
+                start + Duration::from_secs(index + 1),
+            );
+        }
+
+        let snapshot = progress.snapshot(start + Duration::from_secs(21));
+        assert_eq!(snapshot.timeline.len(), SUBAGENT_PROGRESS_TIMELINE_CAPACITY);
+        assert_eq!(snapshot.timeline.first().unwrap().summary, "phase-8");
+        assert_eq!(snapshot.timeline.last().unwrap().summary, "phase-19");
     }
 
     #[tokio::test]

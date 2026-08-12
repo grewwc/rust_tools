@@ -50,7 +50,7 @@ pub fn print_interactive_help() {
     println!();
     println!("  Skill management:");
     println!("    /skills                   list available skills");
-    println!("    /skills <name>            select & activate a skill");
+    println!("    /skills <name>...          select & activate skills (multiple allowed)");
     println!();
     println!("  Session management:");
     println!("    /sessions [list]          list all sessions (default, no sizes)");

@@ -380,7 +380,7 @@ fn test_app() -> App {
         current_agent: String::new(),
         current_agent_manifest: None,
         pending_files: None,
-        forced_skill: None,
+        forced_skills: Vec::new(),
         forced_skill_source: None,
         pending_skill_continuation: None,
         forced_question: None,

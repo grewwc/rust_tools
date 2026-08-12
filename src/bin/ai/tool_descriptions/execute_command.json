@@ -6,7 +6,7 @@
     "properties": {
       "command": {
         "type": "string",
-        "description": "Shell command to run. For long-running servers, background and redirect: `cmd > /tmp/app.log 2>&1 & sleep 2 && curl -s localhost:PORT/...`. Never run a foreground server directly."
+        "description": "Shell command to run. For long-running servers, background and redirect: `cmd > /tmp/app.log 2>&1 & sleep 2 && curl -s localhost:PORT/...`. Never run a foreground server directly. Do NOT pipe interactive commands through `tail`/`grep`/`tee`/`head` — those buffer all output until the command exits, and an interactive command that waits for input never exits, so you will see nothing and the run will be killed as stalled."
       },
       "cwd": {
         "type": "string",
@@ -14,11 +14,11 @@
       },
       "timeout": {
         "type": "integer",
-        "description": "Timeout in seconds, 1-300 (default: 30)."
+        "description": "Timeout in seconds, 1-300 (default: 60)."
       },
       "pty": {
         "type": "boolean",
-        "description": "Required. Use true for interactive CLIs (QR codes, prompts, full-screen); false otherwise. No keyboard input forwarding."
+        "description": "Required. Use true for interactive CLIs (QR codes, prompts, full-screen); false otherwise. No keyboard input forwarding. Interactive commands that wait for human input (e.g. QR-code login) are auto-terminated after a short silent period (~10-20s) and their partial output (including any QR code) is returned with a clear diagnosis — prefer the CLI's non-blocking/headless flags (e.g. `--begin`/`--complete`, `--qr-image`, `--no-terminal-qr`, `-y`) for such flows instead of a blocking PTY."
       }
     },
     "required": [

@@ -4589,7 +4589,7 @@ async fn run_turn_body(
         {
             let mc = mcp_client.lock().unwrap();
             let required_project_targets = std::mem::take(&mut pending_scoped_project_targets);
-            refresh_skill_turn_for_iteration(
+            let scoped_project_instructions_ready = refresh_skill_turn_for_iteration(
                 app,
                 &mc,
                 skill_manifests,
@@ -4599,6 +4599,17 @@ async fn run_turn_body(
                 &required_project_targets,
                 &mut messages,
             );
+            if !scoped_project_instructions_ready {
+                let targets = required_project_targets
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                break 'turn Err(std::io::Error::other(format!(
+                    "failed to load target-scoped project instructions before mutation: {targets}"
+                ))
+                .into());
+            }
         }
         if crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request() {
             pre_timeout_wrap_up_requested = true;
@@ -4606,7 +4617,7 @@ async fn run_turn_body(
             force_final_response = true;
             inject_subagent_pre_timeout_wrap_up_note(&mut messages);
         }
-        let active_skill_name = skill_turn.matched_skill_name().map(str::to_string);
+        let active_skill_name = skill_turn.primary_skill_name().map(str::to_string);
         let compression_report = std::mem::take(&mut supervisor.pending_compression_report);
         let mut response_model = None;
         let execution = match execute_turn_iteration(
@@ -4846,7 +4857,7 @@ async fn run_turn_body(
                 &mut final_assistant_recorded,
                 &mut force_final_response,
                 &mut terminal_dedupe_candidate,
-                skill_turn.matched_skill_name().is_none(),
+                skill_turn.matched_skill_names().is_empty(),
                 iteration,
                 effective_max_iterations,
                 consecutive_truncations,
@@ -5177,13 +5188,15 @@ async fn run_turn_body(
     // 这避免了按自然语言问号/关键词猜测，外部 skill 也无需修改自身 manifest。
     let requested_user_input = crate::ai::tools::skill_tools::take_pending_user_input_request();
     if requested_user_input && loop_result.is_ok() && !app.last_turn_interrupted {
-        if let Some(skill_name) = skill_turn.matched_skill_name().map(str::to_owned) {
+        if !skill_turn.matched_skill_names().is_empty() {
             app.pending_skill_continuation =
-                Some(crate::ai::types::PendingSkillContinuation { skill_name });
+                Some(crate::ai::types::PendingSkillContinuation {
+                    skill_names: skill_turn.matched_skill_names().to_vec(),
+                });
         }
     }
 
-    let final_skill_name = skill_turn.matched_skill_name().map(str::to_owned);
+    let final_skill_name = skill_turn.primary_skill_name().map(str::to_owned);
     skill_turn.restore_agent_context(app);
 
     match loop_result {

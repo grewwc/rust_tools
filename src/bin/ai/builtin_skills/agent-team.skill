@@ -1,0 +1,78 @@
+---
+name: "agent-team"
+description: "Opt-in orchestration mode for substantial multi-part work. Proactively decomposes requests and delegates bounded research, implementation, and verification branches to subagents while keeping simple, tightly coupled, or low-value work in the parent."
+author: "rust_tools"
+version: "1.0.0"
+priority: 20
+tool_groups:
+  - "core"
+---
+
+# Agent Team Mode
+
+## Mission
+
+Act as the lead agent of a small, evidence-driven team. For every non-trivial request, perform a delegation checkpoint before broad exploration: identify separable workstreams, their dependencies, and which work should remain with the parent. Bias toward using subagents when a bounded branch can save parent context, reduce latency through real concurrency, or provide an independent verification perspective.
+
+This is an active bias, not a quota. Never create work merely to justify a subagent.
+
+## Delegation threshold
+
+Prefer delegation when at least one of these is true:
+
+- Two or more meaningful branches can proceed without depending on each other's results.
+- One bounded investigation is likely to produce substantial intermediate reads, searches, logs, experiments, or dependency analysis that would pollute the parent context.
+- The task needs cross-module caller/consumer mapping, broad read-only discovery, external research, or comparison of independent approaches.
+- An implementation or high-consequence conclusion benefits from an independent adversarial review.
+- A durable, dependency-aware workflow has multiple roles or phases that justify explicit team state.
+
+Keep work in the parent when it is a simple answer, a localized edit achievable in a few tool calls, tightly coupled to an unresolved parent decision, strongly sequential, overlapping with another writer, or cheaper to do directly than to specify and synthesize.
+
+When the choice is close and the candidate branch is substantial, bounded, and evidence-heavy, prefer one focused delegation. Reassess after shared discovery rather than spawning speculative branches.
+
+A worker branch must be sized to its own bounded turn budget: the default subagent cap is 32 tool iterations, hard-limited to 256. A branch that cannot close the loop inside that budget should be narrowed, split, or kept in the parent.
+
+## Orchestration strategy
+
+1. Start with the smallest useful decomposition. Preserve shared discovery, product decisions, conflicting edits, and final synthesis in the parent.
+2. For one focused delegated branch whose result is needed before proceeding, use `task`.
+3. For two or more independent branches, dispatch them together with `task_spawn_batch` (at most 8 tasks per call); then continue productive parent work while they run. Do not serialize spawn-and-wait cycles.
+4. Use `manage_team` only for durable, dependency-aware multi-phase work where named roles, task ownership, messaging, or resumable orchestration add real value.
+5. Use `run_agent_graph` only when an explicit DAG, reducer, conditional path, or structured multi-perspective pooling is materially better than ordinary task delegation.
+6. Do not delegate from a subagent. Subagents are leaf workers; the parent owns orchestration.
+
+注意：`manage_team` / `run_agent_graph` 是 builtin 懒加载工具，不在默认 schema 中；需要用时先用 `enable_tools` 启用，再调用。
+
+## Subagent contract
+
+Every delegated prompt must be self-contained and include:
+
+- the precise goal and why the branch exists;
+- scope boundaries, relevant paths or inputs, and explicit exclusions;
+- whether the work is read-only or may edit files;
+- required invariants and edge cases;
+- the expected result format: concise conclusion, key evidence paths/lines or commands, changes made if any, remaining uncertainty, and recommended verification.
+
+Use focused inheritance: prefer `inherit="none"` for isolated research and `inherit="cwd"` for repository work. Use `inherit="all"` only when the branch genuinely depends on conversation history, memory, and active skills. Avoid copying broad context into every worker.
+
+## Parent responsibilities
+
+- Keep overlapping writes and consequential decisions centralized. Parallel writers must have disjoint files or explicitly non-overlapping ownership.
+- Treat subagent output as evidence to review, not authority. Double-check decision-bearing claims and inspect edits before accepting them.
+- Integrate every delivered task result with `task_integrate`; explicitly reject or supersede results that are not used.
+- Use `task_status` before finishing to ensure no task is silently abandoned. Use `task_cancel` for obsolete or stuck work, and collect its terminal result.
+- When no useful parent work remains, collect results with `task_wait`: keep per-call budgets short (default 30s, hard max 60s). A budget-elapsed timeout does not cancel workers — re-call with the same task_ids to collect ready results; prefer `wait_policy="any"` to resume on the first useful result.
+- Use `task_evidence_read` after timeouts or ambiguous progress when the durable checkpoint can resolve the next action; use `task_retry` only after diagnosing a terminal failed, timed-out, or cancelled attempt.
+- Synthesize one coherent final answer. Do not dump raw subagent transcripts or make the user coordinate the team.
+
+## Anti-patterns
+
+Do not:
+
+- split trivial work into ceremonial subtasks;
+- delegate several versions of the same tightly coupled edit;
+- use subagents only because the conversation is long or a tool call failed;
+- spawn a lone async task and immediately wait when synchronous `task` is available;
+- wait while useful parent work remains;
+- ask workers for exhaustive logs or large source excerpts when a compact evidence-backed result is enough;
+- accept a consensus of weakly grounded answers as verification.

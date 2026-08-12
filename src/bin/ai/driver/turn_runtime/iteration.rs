@@ -529,49 +529,73 @@ pub(super) fn refresh_skill_turn_for_iteration(
     skill_turn: &mut super::super::skill_runtime::SkillTurnGuard,
     required_project_targets: &[PathBuf],
     messages: &mut [Message],
-) {
+) -> bool {
     if iteration <= 1 {
-        return;
+        return required_project_targets.is_empty();
     }
 
-    let prev_skill = skill_turn.matched_skill_name().map(|s| s.to_string());
+    let prev_skills = skill_turn.matched_skill_names().to_vec();
     let inherited_restore = skill_turn.take_restore_agent_context();
 
-    // 模型通过 activate_skill 工具显式请求激活某个 skill 时优先采纳：直接按名字
-    // 强制激活，跳过自动路由打分。名字校验在工具侧已做（必须真实存在），这里
-    // 用 skill_manifests 再兜一次，未命中则回退到自动路由。
-    let requested = crate::ai::tools::skill_tools::take_pending_skill_activation();
-    let mut new_skill_turn = requested
-        .as_deref()
-        .and_then(|name| {
-            skill_runtime::force_activate_named_skill(
-                app,
-                mcp_client,
-                skill_manifests,
-                question,
-                name,
-            )
-        })
+    // 模型通过 activate_skill / deactivate_skill 工具显式请求变更时优先采纳：
+    // 按名字强制激活，跳过自动路由打分。名字校验在工具侧已做（必须真实存在），
+    // 这里用 skill_manifests 再兜一次，未命中则回退到自动路由。
+    // 多 skill：pending action 可以是 Add（追加）或 Remove（移除），同一 turn 内
+    // 的多次调用按顺序全部应用（队列语义，不做后写覆盖），作用于当前活动集。
+    use crate::ai::tools::skill_tools::PendingSkillAction;
+    let actions = crate::ai::tools::skill_tools::take_pending_skill_action();
+    let mut current_names = prev_skills.clone();
+    for action in &actions {
+        match action {
+            PendingSkillAction::Add(name) => {
+                if !current_names.iter().any(|n| n == name) {
+                    current_names.push(name.clone());
+                }
+            }
+            PendingSkillAction::Remove(name) => {
+                current_names.retain(|n| n != name);
+            }
+        }
+    }
+    let mut new_skill_turn = if !actions.is_empty() {
+        skill_runtime::force_activate_named_skill(
+            app,
+            mcp_client,
+            skill_manifests,
+            question,
+            &current_names,
+        )
         .unwrap_or_else(|| {
             skill_runtime::rebuild_skill_turn_with_existing_selection(
                 app,
                 mcp_client,
                 skill_manifests,
                 question,
-                prev_skill.as_deref(),
+                &current_names,
             )
-        });
+        })
+    } else {
+        skill_runtime::rebuild_skill_turn_with_existing_selection(
+            app,
+            mcp_client,
+            skill_manifests,
+            question,
+            &current_names,
+        )
+    };
     let project_targets = project_instruction_target_paths(messages);
-    new_skill_turn.push_scoped_project_instructions(required_project_targets, &project_targets);
+    let scoped_project_instructions_ready = new_skill_turn
+        .push_scoped_project_instructions(required_project_targets, &project_targets);
     if inherited_restore.is_some() {
         new_skill_turn.set_restore_agent_context(inherited_restore);
     }
-    let next_skill = new_skill_turn.matched_skill_name().map(|s| s.to_string());
+    let next_skills = new_skill_turn.matched_skill_names().to_vec();
 
-    if prev_skill != next_skill {
-        match next_skill.as_deref() {
-            Some(name) => println!("[skill switched: {}]", name.cyan()),
-            None => println!("[skill switched: <none>]"),
+    if prev_skills != next_skills {
+        if next_skills.is_empty() {
+            println!("[skill switched: <none>]");
+        } else {
+            println!("[skill switched: {}]", next_skills.join(", ").cyan());
         }
     }
 
@@ -587,6 +611,7 @@ pub(super) fn refresh_skill_turn_for_iteration(
             system_message.content = Value::String(next_prompt.to_string());
         }
     }
+    scoped_project_instructions_ready
 }
 
 fn continue_or_quit(should_quit: bool) -> TurnOutcome {
@@ -865,6 +890,18 @@ async fn request_model_response(
     _iteration: usize,
     mut compression_report: CompressionReport,
 ) -> Result<(reqwest::Response, String), request::RequestError> {
+    if crate::ai::driver::runtime_ctx::take_subagent_checkpoint_due_reminder() {
+        messages.push(Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(
+                "[runtime checkpoint due] This subagent has run for at least one checkpoint interval without publishing durable progress. Before the next long operation, emit a concise <context_checkpoint> containing verified progress, evidence, and the next decision-relevant step."
+                    .to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
     if force_final_response {
         clear_outstanding_task_anchor(messages);
     } else {

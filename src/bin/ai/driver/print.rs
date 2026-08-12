@@ -50,6 +50,23 @@ pub fn print_tool_note_line(label: &str, value: &str) {
     println!("{}", format_tool_note_line(label, value));
 }
 
+/// 强制激活 skill 的诊断必须作为普通终端行输出。
+/// 不能使用会原地重绘的 status line：后续流式输出会与其共享光标位置而发生拼接。
+pub(in crate::ai) fn print_skill_activation_note(
+    requested_skill: &str,
+    injected_skill: Option<&str>,
+    source: &str,
+    outcome: &str,
+) {
+    if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        return;
+    }
+    println!(
+        "{}",
+        format_skill_activation_note(requested_skill, injected_skill, source, outcome)
+    );
+}
+
 pub fn print_tool_command_line(command: &str) {
     if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;
@@ -269,6 +286,21 @@ pub(in crate::ai) fn format_tool_note_line(label: &str, value: &str) -> String {
     format!(
         "  {}│{} {}{}:{} {}{}{}",
         ACCENT_RULE, RESET, BOLD, label, RESET, ACCENT_MUTED, value, RESET
+    )
+}
+
+pub(in crate::ai) fn format_skill_activation_note(
+    requested_skill: &str,
+    injected_skill: Option<&str>,
+    source: &str,
+    outcome: &str,
+) -> String {
+    let injected = injected_skill.unwrap_or("<none>");
+    format_tool_note_line(
+        "skill",
+        &format!(
+            "requested={requested_skill} injected={injected} source={source} outcome={outcome}"
+        ),
     )
 }
 
@@ -526,10 +558,10 @@ pub fn print_mcp_tools(report: &McpInitReport, mcp_client: &McpClient) {
 mod tests {
     use super::{
         format_assistant_banner, format_empty_state, format_ocr_summary_block,
-        format_section_header, format_section_item, format_section_note, format_tool_command_line,
-        format_tool_header, format_tool_output_block, format_tool_output_line,
-        format_tool_output_prefix, format_tool_status_completed,
-        format_tool_status_with_file_target, sanitize_for_terminal,
+        format_section_header, format_section_item, format_section_note,
+        format_skill_activation_note, format_tool_command_line, format_tool_header,
+        format_tool_output_block, format_tool_output_line, format_tool_output_prefix,
+        format_tool_status_completed, format_tool_status_with_file_target, sanitize_for_terminal,
     };
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
     use crate::ai::theme::{ACCENT_COMMAND, ACCENT_SECONDARY};
@@ -653,6 +685,23 @@ mod tests {
         let visible = strip_ansi_for_test(&rendered);
         assert_eq!(visible, "  │ $ cargo check --bin a");
         assert!(rendered.contains(ACCENT_COMMAND));
+    }
+
+    #[test]
+    fn skill_activation_note_is_a_regular_terminal_line() {
+        let rendered = format_skill_activation_note(
+            "audit_own_changes",
+            Some("audit_own_changes"),
+            "/skills-inline",
+            "injected",
+        );
+
+        assert_eq!(
+            strip_ansi_for_test(&rendered),
+            "  │ skill: requested=audit_own_changes injected=audit_own_changes source=/skills-inline outcome=injected"
+        );
+        assert!(!rendered.contains('\r'));
+        assert!(!rendered.contains("\x1b[2K"));
     }
 
     #[test]

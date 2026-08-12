@@ -555,12 +555,36 @@ impl CommandCompleter {
             } else {
                 let sources: &[&str] = match first {
                     "/skills" | ":skills" | "/skill" | ":skill" => {
+                        // 已输入的参数 token（光标前去掉命令本身）——多 skill 补全时
+                        // 排除已选名字，支持 `/skills a <TAB>` 继续选下一个。
+                        let consumed: Vec<&str> = before[..token_start]
+                            .split_whitespace()
+                            .skip(1)
+                            .collect();
+                        let mut candidates: Vec<CompletionCandidate> = Vec::new();
+                        if consumed.is_empty() {
+                            // 第一个参数位置：子命令字面量也参与提示（`/skills us<TAB>` → use）
+                            for sub in Self::skills_subcommands() {
+                                if sub.starts_with(token) {
+                                    candidates.push(CompletionCandidate {
+                                        display: format!("{sub} · subcommand"),
+                                        replacement: sub.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        for c in Self::skill_name_candidates() {
+                            if c.replacement.starts_with(token)
+                                && !consumed
+                                    .iter()
+                                    .any(|t| t.eq_ignore_ascii_case(&c.replacement))
+                            {
+                                candidates.push(c);
+                            }
+                        }
                         return (
                             token_start,
-                            Self::skill_name_candidates()
-                                .into_iter()
-                                .filter(|c| c.replacement.starts_with(token))
-                                .collect(),
+                            candidates,
                         );
                     }
                     "/sessions" | ":sessions" | "/ss" | ":ss" => Self::session_subcommands(),

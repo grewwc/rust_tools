@@ -448,7 +448,7 @@ pub(in crate::ai) async fn run_with_cli(
         } else {
             Some(cli.files.clone())
         },
-        forced_skill: None,
+        forced_skills: Vec::new(),
         forced_skill_source: None,
         pending_skill_continuation: None,
         forced_question: None,

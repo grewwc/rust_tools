@@ -1086,8 +1086,8 @@ pub(in crate::ai) fn read_tool_execution_outcomes_sqlite(
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
-/// 持久化显式 skill 选择的实际注入结果。该记录是诊断旁路，不会污染 canonical
-/// messages 或模型上下文。
+/// 持久化显式 skill 选择的实际注入结果。原始记录是诊断旁路，不会污染 canonical
+/// messages；运行时可从成功记录导出有界的历史事实。
 pub(in crate::ai) fn append_skill_activation_event_sqlite(
     path: &Path,
     event: &SkillActivationEvent,

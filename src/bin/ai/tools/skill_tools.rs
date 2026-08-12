@@ -9,13 +9,25 @@ use crate::ai::config_schema::AiConfig;
 use crate::ai::skills::SkillManifest;
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 
-/// 模型通过 `activate_skill` 工具显式请求激活的 skill 名称（待 driver 在下一个
-/// iteration 读取并应用）。
+/// 模型通过 `activate_skill` / `deactivate_skill` 工具请求的 skill 变更动作（待
+/// driver 在下一个 iteration 读取并应用）。
 ///
 /// 工具是纯函数 `fn(&Value) -> Result<String, String>`，拿不到 `App`，因此沿用
 /// `enable_tools.rs` 的"工具写全局状态 → driver 读取"桥接模式。这里只需要一个
-/// 极小的待激活槽位，故用单个 `RwLock<Option<String>>` 而非完整状态结构。
-pub(crate) static PENDING_SKILL_ACTIVATION: LazyLock<RwLock<FastMap<(String, usize), String>>> =
+/// 极小的待激活槽位，故用单个 `RwLock<FastMap>` 而非完整状态结构。支持多 skill
+/// 同时激活：`Add` 追加到活动集，`Remove` 从活动集移除。同一 turn 内多次调用会
+/// 按调用顺序累积为队列，driver 一次性全部应用（不做"后写覆盖"）。
+
+/// 模型请求的 skill 变更动作。driver 在下一个 iteration 读取并应用到当前活动集。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PendingSkillAction {
+    /// 追加一个 skill 到当前活动集（已存在则忽略）
+    Add(String),
+    /// 从当前活动集移除一个 skill
+    Remove(String),
+}
+
+pub(crate) static PENDING_SKILL_ACTIVATION: LazyLock<RwLock<FastMap<(String, usize), Vec<PendingSkillAction>>>> =
     LazyLock::new(|| RwLock::new(FastMap::default()));
 
 /// `request_user_input` 在本轮内记录的明确交互边界。按 `(session_id, turn_id)` 隔离，
@@ -29,18 +41,19 @@ fn current_turn_identity() -> (String, usize) {
         .unwrap_or_default()
 }
 
-fn set_pending_skill_activation(name: String) {
+fn set_pending_skill_action(action: PendingSkillAction) {
     if let Ok(mut slot) = PENDING_SKILL_ACTIVATION.write() {
-        slot.insert(current_turn_identity(), name);
+        slot.entry(current_turn_identity()).or_default().push(action);
     }
 }
 
-/// driver 侧调用：取出并清空待激活的 skill 名称。
-pub(crate) fn take_pending_skill_activation() -> Option<String> {
+/// driver 侧调用：取出并清空本 turn 的全部待处理 skill 变更动作。
+pub(crate) fn take_pending_skill_action() -> Vec<PendingSkillAction> {
     PENDING_SKILL_ACTIVATION
         .write()
         .ok()
         .and_then(|mut slot| slot.remove(&current_turn_identity()))
+        .unwrap_or_default()
 }
 
 pub(crate) fn clear_pending_user_input_request() {
@@ -78,11 +91,27 @@ pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
         ));
     };
 
-    set_pending_skill_activation(skill.name.clone());
+    set_pending_skill_action(PendingSkillAction::Add(skill.name.clone()));
     Ok(format!(
-        "Skill '{}' will be activated on the next step: its prompt and tool set load into the current turn. \
-         It is scoped to this user turn and unloads automatically when the turn ends.",
+        "Skill '{}' added to the active skill set for this turn. Its prompt and tools merge with any other active skills. \
+         If another skill is already active, both are active simultaneously (skills compose additively; the first activated skill is primary). \
+         The skill set is scoped to this user turn and unloads automatically when the turn ends. \
+         Use `deactivate_skill` to remove a skill from the active set.",
         skill.name
+    ))
+}
+
+pub(crate) fn execute_deactivate_skill(args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return Err("deactivate_skill requires a non-empty 'name'.".to_string());
+    }
+
+    set_pending_skill_action(PendingSkillAction::Remove(name.to_string()));
+    Ok(format!(
+        "Skill '{}' will be removed from the active skill set on the next step. \
+         If it was the only active skill, no skill will be active afterwards.",
+        name
     ))
 }
 
@@ -113,6 +142,17 @@ inventory::submit!(ToolRegistration {
         // skill 发现/激活是低频能力：默认不随每轮 core 展开常驻，模型按需经
         // `enable_tools` 启用，压缩每轮 tools schema token。仍保留 builtin 组，
         // 保证可被动态启用。
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "deactivate_skill",
+        description: "",
+
+        execute: execute_deactivate_skill,
+        // 与 activate_skill 同属低频控制工具：默认不常驻，按需经 enable_tools 启用。
         groups: &["builtin"],
     }
 });
@@ -421,9 +461,11 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
 mod tests {
     use super::{
         build_skill_file_content, clear_pending_user_input_request, execute_activate_skill,
-        execute_load_skill, execute_request_user_input, render_loaded_skill, render_skill_catalog,
-        take_pending_skill_activation, take_pending_user_input_request,
+        execute_deactivate_skill, execute_load_skill, execute_request_user_input,
+        render_loaded_skill, render_skill_catalog, take_pending_skill_action,
+        take_pending_user_input_request,
     };
+    use super::PendingSkillAction;
     use crate::ai::driver::runtime_ctx::TURN_IDENTITY;
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};
@@ -436,7 +478,7 @@ mod tests {
         let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
         let err = execute_activate_skill(&serde_json::json!({"name": "  "})).unwrap_err();
         assert!(err.contains("non-empty"));
-        assert!(take_pending_skill_activation().is_none());
+        assert!(take_pending_skill_action().is_empty());
     }
 
     #[test]
@@ -446,7 +488,7 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("No skill named"));
         // 未命中不应写入待激活槽位，避免乱激活。
-        assert!(take_pending_skill_activation().is_none());
+        assert!(take_pending_skill_action().is_empty());
     }
 
     #[test]
@@ -459,12 +501,28 @@ mod tests {
         };
         let out = execute_activate_skill(&serde_json::json!({"name": name})).unwrap();
         assert!(out.contains(&name));
-        assert_eq!(
-            take_pending_skill_activation().as_deref(),
-            Some(name.as_str())
-        );
+        let actions = take_pending_skill_action();
+        assert_eq!(actions, vec![PendingSkillAction::Add(name.clone())]);
         // take 应清空槽位。
-        assert!(take_pending_skill_activation().is_none());
+        assert!(take_pending_skill_action().is_empty());
+    }
+
+    #[test]
+    fn multiple_actions_in_one_turn_accumulate_in_order() {
+        let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
+        // 同一 turn 内连续多次变更动作应按顺序累积，而不是后写覆盖（回归：多
+        // skill 叠加时代价槽位曾是单个 action，第二次调用会静默丢失第一次）。
+        execute_deactivate_skill(&serde_json::json!({"name": "alpha"})).unwrap();
+        execute_deactivate_skill(&serde_json::json!({"name": "beta"})).unwrap();
+        let actions = take_pending_skill_action();
+        assert_eq!(
+            actions,
+            vec![
+                PendingSkillAction::Remove("alpha".to_string()),
+                PendingSkillAction::Remove("beta".to_string()),
+            ]
+        );
+        assert!(take_pending_skill_action().is_empty());
     }
 
     #[test]

@@ -446,6 +446,15 @@ where
 /// `Disconnected`，因此必须用固定宽限期兜底，绝不能无限等待。
 const DRAIN_GRACE: Duration = Duration::from_millis(100);
 
+/// PTY 交互命令的"停滞"判定：命令在 PTY 上存活却长时间没有输出时，几乎可以断定它在
+/// 等待人类输入（扫码、密码、菜单选择），而 agent 无法提供输入；输出被管道（如
+/// `| tail`）缓冲时更是从头到尾都看不到。此时提前终止并返回部分输出 + 明确诊断，
+/// 避免静默挂起直到 60-300s 的超时兜底。
+/// - `PTY_STALL_AFTER_OUTPUT`：命令已产生过输出后，连续静默超过该时长即判定停滞。
+/// - `PTY_STALL_SILENT_START`：命令从启动起就毫无输出、且持续运行超过该时长即判定停滞。
+const PTY_STALL_AFTER_OUTPUT: Duration = Duration::from_secs(10);
+const PTY_STALL_SILENT_START: Duration = Duration::from_secs(20);
+
 fn drain_channel<F>(
     rx: &Receiver<(StreamKind, Vec<u8>)>,
     stdout_buf: &mut Vec<u8>,
@@ -500,6 +509,8 @@ pub struct CommandRunResult {
     pub stderr: Vec<u8>,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// PTY 命令被判"停滞"（存活但长时间无输出，疑似等待交互输入）并被提前终止。
+    pub stalled: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -554,6 +565,11 @@ fn result_to_output(r: CommandRunResult) -> io::Result<Output> {
         Err(io::Error::new(io::ErrorKind::TimedOut, "timeout"))
     } else if r.cancelled {
         Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+    } else if r.stalled {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "stalled (likely waiting for interactive input)",
+        ))
     } else {
         Ok(Output {
             status: r.status.expect("non-killed result must carry a status"),
@@ -615,6 +631,7 @@ where
         on_background_group,
         false,
         INHERITED_ENV_POLICY,
+        None,
     )
 }
 
@@ -640,6 +657,7 @@ where
         on_background_group,
         false,
         NON_INTERACTIVE_ENV_POLICY,
+        None,
     )
 }
 
@@ -669,6 +687,7 @@ where
         on_background_group,
         true,
         PSEUDO_TERMINAL_ENV_POLICY,
+        None,
     )
 }
 
@@ -681,6 +700,9 @@ fn run_cmd_output_streaming_with_timeout_tracked_inner<F, C, G>(
     mut on_background_group: G,
     pseudo_terminal: bool,
     env_policy: CommandEnvPolicy,
+    // PTY 停滞判定阈值 `(after_output, silent_start)`；`None` 时使用默认值。测试可注入
+    // 极小值快速验证停滞路径，生产路径始终为 `None`。
+    pty_stall: Option<(Duration, Duration)>,
 ) -> io::Result<CommandRunResult>
 where
     F: FnMut(&[u8]),
@@ -739,6 +761,9 @@ where
     let mut stderr_buf = Vec::new();
 
     let deadline = Instant::now() + timeout;
+    // PTY 停滞判定用：命令启动时间、最近一次收到输出的时间。
+    let started_at = Instant::now();
+    let mut last_output_at = started_at;
     let status = loop {
         while let Ok((kind, chunk)) = rx.try_recv() {
             accumulate_chunk(
@@ -748,6 +773,7 @@ where
                 &mut stderr_buf,
                 &mut on_chunk,
             );
+            last_output_at = Instant::now();
         }
 
         match child.try_wait() {
@@ -772,7 +798,45 @@ where
                         stderr: stderr_buf,
                         timed_out: false,
                         cancelled: true,
+                        stalled: false,
                     });
+                }
+                // PTY 交互命令停滞判定：命令存活却长时间没有输出，几乎可以断定它在等待
+                // 人类输入（扫码、密码、菜单选择），agent 无法提供输入；输出被管道（如
+                // `| tail`）缓冲时更是一点都看不到。提前终止并返回已捕获的部分输出 +
+                // stalled 标记，让上层给出"等待交互输入"的明确诊断，而不是静默挂到
+                // 60-300s 的超时兜底。
+                if pseudo_terminal {
+                    let now = Instant::now();
+                    let (after_output, silent_start) = pty_stall.unwrap_or((
+                        PTY_STALL_AFTER_OUTPUT,
+                        PTY_STALL_SILENT_START,
+                    ));
+                    let produced_output = !stdout_buf.is_empty() || !stderr_buf.is_empty();
+                    let stalled = if produced_output {
+                        now.duration_since(last_output_at) >= after_output
+                    } else {
+                        now.duration_since(started_at) >= silent_start
+                    };
+                    if stalled {
+                        terminate_child(&mut child);
+                        let killed_status = child.wait().ok();
+                        drain_channel(
+                            &rx,
+                            &mut stdout_buf,
+                            &mut stderr_buf,
+                            &mut on_chunk,
+                            DRAIN_GRACE,
+                        );
+                        return Ok(CommandRunResult {
+                            status: killed_status,
+                            stdout: stdout_buf,
+                            stderr: stderr_buf,
+                            timed_out: false,
+                            cancelled: false,
+                            stalled: true,
+                        });
+                    }
                 }
                 if Instant::now() >= deadline {
                     // 超时：同样杀掉整个进程组，避免后台进程继续持有管道。
@@ -793,16 +857,20 @@ where
                         stderr: stderr_buf,
                         timed_out: true,
                         cancelled: false,
+                        stalled: false,
                     });
                 }
                 match rx.recv_timeout(Duration::from_millis(20)) {
-                    Ok((kind, chunk)) => accumulate_chunk(
-                        kind,
-                        &chunk,
-                        &mut stdout_buf,
-                        &mut stderr_buf,
-                        &mut on_chunk,
-                    ),
+                    Ok((kind, chunk)) => {
+                        accumulate_chunk(
+                            kind,
+                            &chunk,
+                            &mut stdout_buf,
+                            &mut stderr_buf,
+                            &mut on_chunk,
+                        );
+                        last_output_at = Instant::now();
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => {}
                 }
@@ -832,6 +900,7 @@ where
         stderr: stderr_buf,
         timed_out: false,
         cancelled: false,
+        stalled: false,
     })
 }
 
@@ -977,6 +1046,93 @@ mod tests {
                 String::from_utf8_lossy(&result.stdout)
             );
             assert!(result.stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_pty_stall_terminates_interactive_command_and_preserves_partial_output() {
+        // 交互命令（如扫码登录）打印输出后等待人类输入：应快速判"停滞"并终止，
+        // 保留已捕获的部分输出（二维码），而不是静默挂到超时兜底。
+        #[cfg(unix)]
+        {
+            let started = Instant::now();
+            let result = super::run_cmd_output_streaming_with_timeout_tracked_inner(
+                "printf 'qr-code-block'; sleep 30",
+                RunCmdOptions::default(),
+                Duration::from_secs(60),
+                |_| {},
+                || false,
+                |_| {},
+                true,
+                super::PSEUDO_TERMINAL_ENV_POLICY,
+                Some((Duration::from_millis(300), Duration::from_millis(600))),
+            )
+            .expect("PTY command should run");
+
+            let elapsed = started.elapsed();
+            assert!(result.stalled, "expected stall kill: {result:?}");
+            assert!(!result.timed_out && !result.cancelled);
+            assert!(
+                String::from_utf8_lossy(&result.stdout).contains("qr-code-block"),
+                "partial output must be preserved: {:?}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "stall kill must be fast, took {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pty_stall_terminates_silent_command() {
+        // 从启动起就毫无输出的 PTY 命令（例如输出被 `| tail` 管道缓冲吞掉）：
+        // silent-start 阈值到期后同样判停滞，避免无信息地挂满整个超时。
+        #[cfg(unix)]
+        {
+            let started = Instant::now();
+            let result = super::run_cmd_output_streaming_with_timeout_tracked_inner(
+                "sleep 30",
+                RunCmdOptions::default(),
+                Duration::from_secs(60),
+                |_| {},
+                || false,
+                |_| {},
+                true,
+                super::PSEUDO_TERMINAL_ENV_POLICY,
+                Some((Duration::from_millis(600), Duration::from_millis(300))),
+            )
+            .expect("PTY command should run");
+
+            assert!(
+                result.stalled,
+                "silent PTY command must be stall-killed: {result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "silent stall kill must be fast"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stall_guard_only_applies_to_pty_runs() {
+        // 非 PTY 路径不受停滞判定影响：仍由常规超时兜底（打印输出后静默的普通命令
+        // 如编译/下载可以合法地长时间无输出）。
+        #[cfg(unix)]
+        {
+            let result = run_cmd_output_streaming_with_timeout(
+                "printf 'output'; sleep 30",
+                RunCmdOptions::default(),
+                Duration::from_millis(300),
+                |_| {},
+                || false,
+            );
+
+            assert!(matches!(
+                result.as_ref().map_err(|err| err.kind()),
+                Err(std::io::ErrorKind::TimedOut)
+            ));
         }
     }
 

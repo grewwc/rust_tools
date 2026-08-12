@@ -1,6 +1,6 @@
 {
   "name": "task_wait",
-  "description": "Wait for one or more asynchronously spawned subagent tasks (from task_spawn) to complete and collect their results. Polls all tasks in parallel, so total wait equals the slowest task. `timeout_secs` is a per-call budget: on expiry it returns collected results plus a note that the rest are still running; call again with the same task_ids (or `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
+  "description": "Wait for one or more asynchronously spawned subagent tasks (from task_spawn) to complete and collect their results. Polls all tasks in parallel, so total wait equals the slowest task. Parked and budget-elapsed responses include the pending tasks' latest live progress/checkpoint snapshots. `timeout_secs` is a per-call budget: on expiry it returns collected results plus a note that the rest are still running; call again with the same task_ids (or `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
   "parameters": {
     "type": "object",
     "properties": {

@@ -41,6 +41,7 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "task_retry",
     "task_wait",
     "task_status",
+    "task_evidence_read",
     "task_integrate",
 ];
 
@@ -55,6 +56,7 @@ const EAGER_BASELINE_TOOL_NAMES: &[&str] = &[
     "task_retry",
     "task_wait",
     "task_status",
+    "task_evidence_read",
     "task_integrate",
 ];
 
@@ -73,6 +75,7 @@ const SUBAGENT_ORCHESTRATION_TOOL_NAMES: &[&str] = &[
     "task_retry",
     "task_wait",
     "task_status",
+    "task_evidence_read",
     "task_integrate",
     "task_cancel",
     "manage_team",

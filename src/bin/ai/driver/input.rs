@@ -780,11 +780,11 @@ fn extract_at_file_references(question: &mut String) -> crate::ai::types::FilePa
 /// 从输入中提取并移除 `@skills:<name>` / `@skill:<name>` 引用（用户通过补全选择的
 /// 强制 skill）。返回最后一个命中的 skill 名（多次出现以最后一个为准）。被提取的
 /// token 从 `question` 中删除，避免污染发送给模型的文本。
-fn extract_forced_skill_reference(question: &mut String) -> Option<String> {
+fn extract_forced_skill_references(question: &mut String) -> Vec<String> {
     let chars: Vec<char> = question.chars().collect();
     let mut rewritten = String::with_capacity(question.len());
     let mut i = 0usize;
-    let mut selected: Option<String> = None;
+    let mut selected: Vec<String> = Vec::new();
 
     while i < chars.len() {
         if chars[i] != '@' || !at_ref_can_start(&chars, i) {
@@ -813,7 +813,9 @@ fn extract_forced_skill_reference(question: &mut String) -> Option<String> {
         if name.is_some_and(|n| !n.is_empty()) {
             // 用原始大小写截取 skill 名（保持与 manifest 匹配时的展示一致）。
             let raw_name: String = token.chars().skip(prefix_len).collect();
-            selected = Some(raw_name);
+            if !selected.iter().any(|n| n.eq_ignore_ascii_case(&raw_name)) {
+                selected.push(raw_name);
+            }
             i = idx;
             continue;
         }
@@ -822,7 +824,7 @@ fn extract_forced_skill_reference(question: &mut String) -> Option<String> {
         i += 1;
     }
 
-    if selected.is_some() {
+    if !selected.is_empty() {
         // 清理因移除 token 可能残留的多余空白。
         *question = rewritten.trim().to_string();
     }
@@ -1018,10 +1020,12 @@ fn finalize_question(
     mut question: String,
     history_count: usize,
 ) -> Result<QuestionContext, Box<dyn Error>> {
-    // 先提取 `@skills:<name>`（用户经补全显式选择、仅本轮强制注入的 skill），
-    // 再做普通 `@file` 引用提取，避免 skill 引用被误当作文件路径处理。
-    if let Some(name) = extract_forced_skill_reference(&mut question) {
-        app.forced_skill = Some(name);
+    // 先提取 `@skills:<name>`（用户经补全显式选择、仅本轮强制注入的 skill 列表，
+    // 可写多个：`@skills:a @skills:b`），再做普通 `@file` 引用提取，
+    // 避免 skill 引用被误当作文件路径处理。
+    let forced_skills = extract_forced_skill_references(&mut question);
+    if !forced_skills.is_empty() {
+        app.forced_skills = forced_skills;
         app.forced_skill_source = Some(crate::ai::types::ForcedSkillSource::InlineReference);
     }
     let inline_files = extract_at_file_references(&mut question);
@@ -1064,7 +1068,7 @@ fn finalize_question(
 mod tests {
     use super::{
         HistoryAction, HistoryPreviewOptions, HistoryRewindTarget, HistoryRoleFilter, LocalCommand,
-        apply_history_rewind, extract_at_file_references, extract_forced_skill_reference,
+        apply_history_rewind, extract_at_file_references, extract_forced_skill_references,
         finalize_question, highlight_history_keyword, last_assistant_conclusion_text,
         parse_history_preview_options, parse_local_command, plan_history_rewind,
         render_history_preview, render_history_replay, resolve_inline_image_path,
@@ -1115,8 +1119,8 @@ mod tests {
     #[test]
     fn extract_forced_skill_reference_strips_token_and_returns_name() {
         let mut q = "请帮我 @skills:code-review 看看这段代码".to_string();
-        let name = extract_forced_skill_reference(&mut q);
-        assert_eq!(name.as_deref(), Some("code-review"));
+        let names = extract_forced_skill_references(&mut q);
+        assert_eq!(names, vec!["code-review"]);
         assert!(!q.contains("@skills:"));
         assert!(q.contains("请帮我"));
         assert!(q.contains("看看这段代码"));
@@ -1125,8 +1129,8 @@ mod tests {
     #[test]
     fn extract_forced_skill_reference_supports_singular_and_keeps_case() {
         let mut q = "@skill:MySkill do it".to_string();
-        let name = extract_forced_skill_reference(&mut q);
-        assert_eq!(name.as_deref(), Some("MySkill"));
+        let names = extract_forced_skill_references(&mut q);
+        assert_eq!(names, vec!["MySkill"]);
         assert_eq!(q, "do it");
     }
 
@@ -1134,10 +1138,19 @@ mod tests {
     fn extract_forced_skill_reference_ignores_midword_and_bare() {
         // 词中间的 `@` 不是边界，不应被当作技能引用。
         let mut q = "email@skills:foo".to_string();
-        assert!(extract_forced_skill_reference(&mut q).is_none());
+        assert!(extract_forced_skill_references(&mut q).is_empty());
         // 裸 `@skills`（无 `:name`）不构成显式选择。
         let mut q2 = "@skills".to_string();
-        assert!(extract_forced_skill_reference(&mut q2).is_none());
+        assert!(extract_forced_skill_references(&mut q2).is_empty());
+    }
+
+    #[test]
+    fn extract_forced_skill_references_accumulates_multiple_and_dedupes() {
+        // 多次引用累加、保持顺序、去重。
+        let mut q = "@skills:code-review @skills:docs-review @skills:Code-Review 帮我看看".to_string();
+        let names = extract_forced_skill_references(&mut q);
+        assert_eq!(names, vec!["code-review", "docs-review"]);
+        assert_eq!(q, "帮我看看");
     }
 
     fn any_vl_model_name() -> String {
@@ -1171,7 +1184,7 @@ mod tests {
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,
-            forced_skill: None,
+            forced_skills: Vec::new(),
             forced_skill_source: None,
             pending_skill_continuation: None,
             forced_question: None,
@@ -1822,7 +1835,7 @@ mod tests {
         let mut app = test_app();
         app.session_history_file = history_path.clone();
         app.session_id = "sess-rewind".to_string();
-        app.forced_skill = Some("demo-skill".to_string());
+        app.forced_skills = vec!["demo-skill".to_string()];
         app.forced_question = Some("follow this branch".to_string());
         app.attached_image_files = vec!["/tmp/demo.png".to_string()];
         app.last_skill_bias = Some(SkillBiasMemory {
@@ -1876,7 +1889,7 @@ mod tests {
                 .expect("daemon should still be registered")
         };
         assert_eq!(daemon_state, DaemonState::Cancelled);
-        assert!(app.forced_skill.is_none());
+        assert!(app.forced_skills.is_empty());
         assert!(app.forced_question.is_none());
         assert!(app.attached_image_files.is_empty());
         assert!(app.last_skill_bias.is_none());

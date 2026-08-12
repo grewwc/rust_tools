@@ -791,6 +791,7 @@ pub(super) fn dispatch_background_batch(
             Box::pin(runtime_ctx::PERSONA_MEMORY_PATH.scope(persona_memory_path.clone(), wrapped));
         wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
         wrapped = Box::pin(runtime_ctx::SUBAGENT_PHASE.scope(phase_slot, wrapped));
+        wrapped = Box::pin(runtime_ctx::SUBAGENT_TASK_ID.scope(scope_task_id.clone(), wrapped));
         if let Some(mem_path) = scoped_memory_path {
             // sub-agent 默认私有 memory：finalize 后把白名单条目
             // (is_permanent_memory) 合并回主 memory 文件，让 long-term

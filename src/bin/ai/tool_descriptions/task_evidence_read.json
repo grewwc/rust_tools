@@ -1,0 +1,14 @@
+{
+  "name": "task_evidence_read",
+  "description": "Read the durable, bounded progress evidence for one asynchronous subagent task. Returns the latest structured snapshot plus its recent phase/checkpoint timeline, including elapsed and staleness data. Use this for precise diagnosis after a timeout or when task_status summaries are insufficient.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "task_id": {
+        "type": "string",
+        "description": "The asynchronous task_id returned by task_spawn or task_spawn_batch."
+      }
+    },
+    "required": ["task_id"]
+  }
+}

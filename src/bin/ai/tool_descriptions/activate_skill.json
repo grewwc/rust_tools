@@ -1,6 +1,6 @@
 {
   "name": "activate_skill",
-  "description": "Activate a specific skill by name so its full prompt and tool set load into the current turn. If the right skill is not known, use `list_skills` after identifying a concrete specialized need or when the user asks about available skills; do not infer such a need from technical keywords or a routine source-code, repository, file, or terminal investigation alone. Activate only when one listed skill clearly and materially improves the user's task; not for generic work, loose keyword overlap, or just in case. Scoped to the current turn; unloads automatically at turn end.",
+  "description": "Add a specific skill by name to the active skill set so its full prompt and tool set load into the current turn. Multiple skills can be active simultaneously; their prompts and tools merge additively (the first activated skill is primary). If the right skill is not known, use `list_skills` after identifying a concrete specialized need or when the user asks about available skills; do not infer such a need from technical keywords or a routine source-code, repository, file, or terminal investigation alone. Activate only when one listed skill clearly and materially improves the user's task; not for generic work, loose keyword overlap, or just in case. Use `deactivate_skill` to remove a skill from the active set. Scoped to the current turn; unloads automatically at turn end.",
   "parameters": {
     "type": "object",
     "properties": {

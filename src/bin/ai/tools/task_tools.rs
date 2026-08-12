@@ -1,9 +1,12 @@
 use serde_json::Value;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::ai::tools::os_tools::GLOBAL_OS;
+use crate::ai::tools::storage::file_store::current_session_assets_dir;
 use crate::ai::{
     agents::{self, AgentManifest, AgentModelTier},
     models,
@@ -65,6 +68,8 @@ const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 60;
 /// 终止它并写入 timeout 终态结果，避免主 agent 陷入"超时->续等->再超时"空转
 /// 或后台进程永久占用资源。1 小时远大于正常完成时长，仅在真正卡死时兜底。
 const SUBAGENT_WALL_CLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const SUBAGENT_PROGRESS_NOTIFY_INTERVAL: Duration = Duration::from_secs(15);
+const SUBAGENT_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Granular control over which slices of the parent agent's execution
 /// context are inherited by a spawned sub-agent. Defaults are cwd+skills=true
@@ -223,6 +228,8 @@ pub(crate) struct AsyncTaskEntry {
     /// wall-clock 起始时间，用于 `prune_completed_tasks` LRU；不能由 kernel
     /// `created_at_tick` 替代。
     pub(crate) started_at: Instant,
+    pub(crate) last_progress_notification_at: Option<Instant>,
+    pub(crate) last_progress_persisted_at: Option<Instant>,
 }
 
 /// 异步子任务注册表，键为 task_id（UUID 字符串），值见 [`AsyncTaskEntry`]。
@@ -235,6 +242,9 @@ static TASK_REGISTRY: LazyLock<Mutex<SkipMap<String, AsyncTaskEntry>>> =
 static TASK_PROGRESS_REGISTRY: LazyLock<
     Mutex<SkipMap<String, crate::ai::driver::runtime_ctx::SubagentPhaseSlot>>,
 > = LazyLock::new(|| Mutex::new(SkipMap::default()));
+/// 进度证据写入频率低且文件很小，用一把进程内锁保证同一 task 的快照不会通过
+/// 共享临时路径互相截断；落盘前再比较顺序，避免迟到的旧快照覆盖新证据。
+static TASK_PROGRESS_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TASK_RETRY_REGISTRY: LazyLock<Mutex<SkipMap<String, RetryableTaskSpec>>> =
     LazyLock::new(|| Mutex::new(SkipMap::default()));
 
@@ -262,6 +272,153 @@ fn current_task_progress(task_id: &str) -> Option<String> {
     let slot = task_progress_slot(task_id)?;
     let value = crate::ai::driver::runtime_ctx::subagent_progress_snapshot(&slot)?;
     (!value.is_empty()).then_some(value)
+}
+
+fn append_task_progress_snapshots(output: &mut String, task_ids: &[String]) {
+    let snapshots = task_ids
+        .iter()
+        .filter_map(|task_id| {
+            current_task_progress(task_id).map(|progress| format!("- {task_id}: {progress}"))
+        })
+        .collect::<Vec<_>>();
+    if snapshots.is_empty() {
+        return;
+    }
+    output.push_str("\nLatest progress snapshots:\n");
+    output.push_str(&snapshots.join("\n"));
+}
+
+/// 接收子代理发布的统一结构化快照。内存状态更新不做节流；父进程唤醒和磁盘
+/// 快照分别做边沿节流，checkpoint 始终立即传播，避免长任务静默或造成事件风暴。
+pub(crate) fn record_subagent_progress_update(
+    task_id: &str,
+    snapshot: &crate::ai::driver::runtime_ctx::SubagentProgressSnapshot,
+    kind: crate::ai::driver::runtime_ctx::SubagentProgressEventKind,
+) {
+    let now = Instant::now();
+    let update = {
+        let mut registry = TASK_REGISTRY.lock().unwrap();
+        let Some(entry) = registry.get_mut(&task_id.to_string()) else {
+            return;
+        };
+        let persist = kind
+            == crate::ai::driver::runtime_ctx::SubagentProgressEventKind::Checkpoint
+            || entry.last_progress_persisted_at.is_none_or(|last| {
+                now.saturating_duration_since(last) >= SUBAGENT_PROGRESS_PERSIST_INTERVAL
+            });
+        let notify = kind
+            == crate::ai::driver::runtime_ctx::SubagentProgressEventKind::Checkpoint
+            || entry.last_progress_notification_at.is_none_or(|last| {
+                now.saturating_duration_since(last) >= SUBAGENT_PROGRESS_NOTIFY_INTERVAL
+            });
+        if persist {
+            entry.last_progress_persisted_at = Some(now);
+        }
+        if notify {
+            entry.last_progress_notification_at = Some(now);
+        }
+        (persist, notify, entry.owner_pid)
+    };
+
+    if update.0 && persist_subagent_progress_snapshot(task_id, snapshot).is_err() {
+        let mut registry = TASK_REGISTRY.lock().unwrap();
+        if let Some(entry) = registry.get_mut(&task_id.to_string())
+            && entry.last_progress_persisted_at == Some(now)
+        {
+            // 本次落盘失败时撤销节流标记，让下一条进度事件立即重试。
+            entry.last_progress_persisted_at = None;
+        }
+    }
+    if update.1 {
+        let _ = with_os_kernel(|os| {
+            os.wake_process(
+                update.2,
+                format!("[TASK_PROGRESS] task_id={task_id}; {}", snapshot.display()),
+            );
+            Ok(())
+        });
+        crate::ai::driver::notify_scheduler();
+    }
+}
+
+fn task_progress_file_path(task_id: &str) -> Result<PathBuf, String> {
+    if task_id.is_empty()
+        || !task_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err("invalid task id for progress evidence".to_string());
+    }
+    let assets = current_session_assets_dir()
+        .ok_or_else(|| "session assets directory is unavailable".to_string())?;
+    Ok(assets.join("task-progress").join(format!("{task_id}.json")))
+}
+
+fn persist_subagent_progress_snapshot(
+    task_id: &str,
+    snapshot: &crate::ai::driver::runtime_ctx::SubagentProgressSnapshot,
+) -> Result<(), String> {
+    let path = task_progress_file_path(task_id)?;
+    persist_subagent_progress_snapshot_at(&path, task_id, snapshot)
+}
+
+fn persist_subagent_progress_snapshot_at(
+    path: &std::path::Path,
+    task_id: &str,
+    snapshot: &crate::ai::driver::runtime_ctx::SubagentProgressSnapshot,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "progress evidence path has no parent".to_string())?;
+    let elapsed_ms = snapshot.elapsed.as_millis().min(u64::MAX as u128) as u64;
+    let timeline = snapshot
+        .timeline
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "sequence": event.sequence,
+                "kind": event.kind.as_str(),
+                "elapsed_ms": event.elapsed.as_millis().min(u64::MAX as u128) as u64,
+                "summary": event.summary,
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = serde_json::json!({
+        "version": 1,
+        "task_id": task_id,
+        "phase": snapshot.phase,
+        "checkpoint_summary": snapshot.checkpoint_summary,
+        "elapsed_ms": elapsed_ms,
+        "stale_for_ms": snapshot.stale_for.as_millis().min(u64::MAX as u128) as u64,
+        "checkpoint_due": snapshot.checkpoint_due,
+        "sequence": snapshot.sequence,
+        "timeline": timeline,
+    });
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|err| err.to_string())?;
+    let candidate_order = (snapshot.sequence, elapsed_ms);
+    let _guard = TASK_PROGRESS_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Ok(existing) = fs::read(path)
+        && let Ok(existing) = serde_json::from_slice::<Value>(&existing)
+        && existing.get("task_id").and_then(Value::as_str) == Some(task_id)
+        && let (Some(sequence), Some(elapsed_ms)) = (
+            existing.get("sequence").and_then(Value::as_u64),
+            existing.get("elapsed_ms").and_then(Value::as_u64),
+        )
+        && (sequence, elapsed_ms) >= candidate_order
+    {
+        return Ok(());
+    }
+
+    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    let temp_path = path.with_extension(format!("json.{}.tmp", Uuid::new_v4().simple()));
+    fs::write(&temp_path, bytes).map_err(|err| err.to_string())?;
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 fn register_retry_spec(
@@ -401,6 +558,7 @@ struct OutstandingTaskSnapshot {
     agent_name: String,
     model: String,
     description: String,
+    progress: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -581,13 +739,12 @@ pub(crate) fn wake_expired_task_waits() {
                 continue;
             }
             let task_ids = key.task_ids.join(", ");
-            let _ = os.wake_process(
-                key.owner_pid,
-                format!(
-                    "[TASK_WAIT_TIMEOUT]\nWall-clock task_wait budget elapsed after {}s. Re-call `task_wait` with the same task_ids to collect any ready results and receive the budget-elapsed status. task_ids=[{}]",
-                    state.timeout_secs, task_ids
-                ),
+            let mut message = format!(
+                "[TASK_WAIT_TIMEOUT]\nWall-clock task_wait budget elapsed after {}s. Re-call `task_wait` with the same task_ids to collect any ready results and receive the budget-elapsed status. task_ids=[{}]",
+                state.timeout_secs, task_ids
             );
+            append_task_progress_snapshots(&mut message, &key.task_ids);
+            let _ = os.wake_process(key.owner_pid, message);
         }
         Ok(())
     });
@@ -1143,6 +1300,8 @@ fn spawn_subagent_kernel_task_attempt(
                 selection_explanation: prepared.selection_explanation.clone(),
                 inherit: prepared.inherit,
                 started_at: Instant::now(),
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
                 abort_handle: None,
                 cancel_stream: Arc::new(AtomicBool::new(false)),
             },
@@ -1684,9 +1843,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     WaitPolicy::Any => "any",
                     WaitPolicy::All => "all",
                 };
-                let still_pending: Vec<&str> =
-                    pending.iter().map(|(tid, _)| tid.as_str()).collect();
-                parts.push(format!(
+                let still_pending = pending
+                    .iter()
+                    .map(|(tid, _)| tid.clone())
+                    .collect::<Vec<_>>();
+                let mut parked_message = format!(
                     "[task_wait PARKED] Yielded CPU so {} pending subagent task(s) can run. \
                     This is normal cooperative scheduling, NOT a timeout and NOT a stall — the wait budget \
                     ({timeout_secs}s, wait_policy={policy_label}) has NOT elapsed. The scheduler will wake this \
@@ -1702,7 +1863,9 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                         .map(|id| id.to_string())
                         .collect::<Vec<_>>()
                         .join(", ")
-                ));
+                );
+                append_task_progress_snapshots(&mut parked_message, &still_pending);
+                parts.push(parked_message);
                 return Ok(Some(parts.join("\n\n---\n\n")));
             }
         }
@@ -1727,12 +1890,15 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         if !ready.is_empty() {
             parts.push(ready.join("\n\n---\n\n"));
         }
-        let pending_ids: Vec<&str> = pending.iter().map(|(tid, _)| tid.as_str()).collect();
+        let pending_ids = pending
+            .iter()
+            .map(|(tid, _)| tid.clone())
+            .collect::<Vec<_>>();
         let policy_label = match wait_policy {
             WaitPolicy::Any => "any",
             WaitPolicy::All => "all",
         };
-        parts.push(format!(
+        let mut elapsed_message = format!(
             "[task_wait BUDGET ELAPSED] {} pending subagent task(s) still running in the background. \
             wait_policy={policy_label}, timeout_secs={timeout_secs}. The subagent(s) are NOT stalled and NOT cancelled; \
             their result channels and completion futexes remain alive. \
@@ -1741,10 +1907,12 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             (consider `wait_policy=\"any\"` if you only need the first finisher).",
             pending.len(),
             pending_ids.join(", ")
-        ));
+        );
+        append_task_progress_snapshots(&mut elapsed_message, &pending_ids);
+        parts.push(elapsed_message);
         // 仅清理已经 ready 的 task_id 对应的 registry 条目；pending 任务必须保留，
         // 否则下次 task_wait 会因 "Unknown task_id" 失败。
-        let pending_set: SkipSet<&str> = pending_ids.iter().copied().collect();
+        let pending_set: SkipSet<&str> = pending_ids.iter().map(String::as_str).collect();
         for tid in &task_ids {
             if !pending_set.contains(&tid.as_str()) {
                 registry.remove(tid);
@@ -1895,6 +2063,59 @@ inventory::submit!(ToolRegistration {
 
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task_status",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Never,
+        counts_toward_precision_inline_budget: false,
+    },
+});
+
+pub(crate) fn execute_task_evidence_read(args: &Value) -> Result<String, String> {
+    ensure_top_level_task_orchestration("task_evidence_read")?;
+    let task_id = args
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("Missing non-empty 'task_id' parameter")?;
+    let owner_pid = current_task_owner_pid()?;
+    if let Some(entry_owner) = with_task_entry(task_id, |entry| entry.owner_pid) {
+        if entry_owner != owner_pid {
+            return Err(format!("Task {task_id} is owned by another process"));
+        }
+    }
+
+    if let Some(slot) = task_progress_slot(task_id)
+        && let Some(snapshot) =
+            crate::ai::driver::runtime_ctx::subagent_progress_state_snapshot(&slot)
+    {
+        persist_subagent_progress_snapshot(task_id, &snapshot).map_err(|error| {
+            format!("Failed to persist current progress evidence for task {task_id}: {error}")
+        })?;
+    }
+    let path = task_progress_file_path(task_id)?;
+    match fs::read_to_string(&path) {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "No persisted progress evidence for task {task_id}; the task may not have emitted a phase transition or checkpoint yet"
+        )),
+        Err(error) => Err(format!(
+            "Failed to read progress evidence for task {task_id}: {error}"
+        )),
+    }
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "task_evidence_read",
+        description: "",
+        execute: execute_task_evidence_read,
+        groups: &["builtin", "core"],
+    }
+});
+
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "task_evidence_read",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::Never,
@@ -2260,6 +2481,9 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
                 "{:<19} {:<8} {:<14} {:<14} {:<11} {}",
                 short_id, pid, agent_name, model, state_str, description
             ));
+            if let Some(progress) = current_task_progress(tid) {
+                lines.push(format!("  progress[{tid}]: {progress}"));
+            }
             let entry = AsyncTaskEntry {
                 session_id: current_session_id.clone(),
                 result_observed: false,
@@ -2275,6 +2499,8 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
                 selection_explanation: String::new(),
                 inherit: InheritOptions::default(),
                 started_at: *started_at,
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
                 abort_handle: None,
                 cancel_stream: Arc::new(AtomicBool::new(false)),
             };
@@ -2352,6 +2578,7 @@ fn collect_outstanding_task_snapshots(
                 agent_name: agent_name.clone(),
                 model: model.clone(),
                 description: description.clone(),
+                progress: current_task_progress(task_id),
             });
         }
         Ok(snapshots)
@@ -2383,6 +2610,9 @@ fn render_outstanding_task_anchor(snapshots: &[OutstandingTaskSnapshot]) -> Stri
             snapshot.model,
             snapshot.description
         ));
+        if let Some(progress) = &snapshot.progress {
+            lines.push(format!("  progress: {progress}"));
+        }
     }
     lines.push(
         "Required next step: use `task_wait` with the same task_ids to collect results, or `task_status` for a non-blocking snapshot. Before ending the turn, ensure every listed task_id has been handled — including failures."
@@ -2431,6 +2661,9 @@ pub(crate) fn build_abandoned_tasks_notice(
             snapshot.model,
             snapshot.description
         ));
+        if let Some(progress) = &snapshot.progress {
+            lines.push(format!("  progress: {progress}"));
+        }
     }
     lines.push(
         "Required follow-up: re-run this turn and collect these results with `task_wait` / `task_status` for the listed task_ids."

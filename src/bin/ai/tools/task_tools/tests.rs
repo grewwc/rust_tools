@@ -16,7 +16,10 @@ use super::{
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 use crate::ai::cli::ParsedCli;
-use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+use crate::ai::driver::runtime_ctx::{
+    DRIVER_CTX, DriverContext, SubagentProgressEvent, SubagentProgressEventKind,
+    SubagentProgressSnapshot,
+};
 use crate::ai::mcp::McpClient;
 use crate::ai::tools::registry::common::tool_history_policy;
 use crate::ai::types::{App, AppConfig};
@@ -62,6 +65,64 @@ fn prepared_retry_task() -> PreparedSubagentTask {
         selection_explanation: "test fixture".to_string(),
         inherit: InheritOptions::default(),
     }
+}
+
+fn progress_snapshot(sequence: u64, elapsed_secs: u64, phase: &str) -> SubagentProgressSnapshot {
+    SubagentProgressSnapshot {
+        phase: phase.to_string(),
+        checkpoint_summary: None,
+        elapsed: Duration::from_secs(elapsed_secs),
+        stale_for: Duration::ZERO,
+        checkpoint_due: false,
+        sequence,
+        timeline: vec![SubagentProgressEvent {
+            sequence,
+            kind: SubagentProgressEventKind::Phase,
+            elapsed: Duration::from_secs(elapsed_secs),
+            summary: phase.to_string(),
+        }],
+    }
+}
+
+#[test]
+fn concurrent_progress_persistence_keeps_newest_valid_snapshot() {
+    let root = std::env::temp_dir().join(format!(
+        "task-progress-race-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let path = root.join("task.json");
+    let newer_path = path.clone();
+    let older_path = path.clone();
+    let (newer_done_tx, newer_done_rx) = std::sync::mpsc::channel();
+
+    let newer_writer = std::thread::spawn(move || {
+        super::persist_subagent_progress_snapshot_at(
+            &newer_path,
+            "task",
+            &progress_snapshot(2, 20, "newer"),
+        )
+        .unwrap();
+        newer_done_tx.send(()).unwrap();
+    });
+    let older_writer = std::thread::spawn(move || {
+        newer_done_rx.recv().unwrap();
+        super::persist_subagent_progress_snapshot_at(
+            &older_path,
+            "task",
+            &progress_snapshot(1, 10, "older"),
+        )
+        .unwrap();
+    });
+    newer_writer.join().unwrap();
+    older_writer.join().unwrap();
+
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(persisted["sequence"], 2);
+    assert_eq!(persisted["phase"], "newer");
+    let entries = std::fs::read_dir(&root).unwrap().count();
+    assert_eq!(entries, 1, "临时快照文件不应残留");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -202,7 +263,7 @@ fn test_app_with_model(current_model: String) -> App {
         current_agent: "build".to_string(),
         current_agent_manifest: None,
         pending_files: None,
-        forced_skill: None,
+        forced_skills: Vec::new(),
         forced_skill_source: None,
         pending_skill_continuation: None,
         forced_question: None,
@@ -700,6 +761,8 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
         selection_explanation: "model_reason=auto-selected".to_string(),
         inherit: InheritOptions::default(),
         abort_handle: None,
+        last_progress_notification_at: None,
+        last_progress_persisted_at: None,
         cancel_stream: Arc::new(AtomicBool::new(false)),
         started_at: Instant::now(),
     };
@@ -811,6 +874,8 @@ fn task_wait_rejects_foreign_session_task_ids() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
             cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
@@ -832,6 +897,8 @@ fn task_wait_rejects_foreign_session_task_ids() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
             cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
@@ -1025,6 +1092,8 @@ fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() 
                 selection_explanation: "explicit override".to_string(),
                 inherit: InheritOptions::default(),
                 abort_handle: None,
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
                 cancel_stream: Arc::new(AtomicBool::new(false)),
                 started_at: Instant::now(),
             },
@@ -1109,6 +1178,8 @@ fn task_cancel_refuses_same_session_foreign_owner_task() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
             cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
@@ -1179,6 +1250,8 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
             cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
@@ -1193,6 +1266,8 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
         })
         .expect("first task_wait should park");
     assert!(parked.contains("[task_wait PARKED]"));
+    assert!(parked.contains("Latest progress snapshots:"));
+    assert!(parked.contains(&format!("- {task_id}: starting")));
 
     expire_task_wait_states_for_test();
     wake_expired_task_waits();
@@ -1205,11 +1280,13 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
             proc.state,
             aios_kernel::kernel::ProcessState::Ready
         ));
-        assert!(
-            proc.mailbox
-                .iter()
-                .any(|message| message.contains("[TASK_WAIT_TIMEOUT]"))
-        );
+        let timeout_message = proc
+            .mailbox
+            .iter()
+            .find(|message| message.contains("[TASK_WAIT_TIMEOUT]"))
+            .expect("timeout wake-up message should be queued");
+        assert!(timeout_message.contains("Latest progress snapshots:"));
+        assert!(timeout_message.contains(&format!("- {task_id}: starting")));
         let resumed = os
             .pop_foreground_ready()
             .expect("expired wait should wake owner");
@@ -1226,6 +1303,8 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
         .expect("expired task_wait should report budget elapsed");
     assert!(elapsed.contains("[task_wait BUDGET ELAPSED]"));
     assert!(!elapsed.contains("[task_wait PARKED]"));
+    assert!(elapsed.contains("Latest progress snapshots:"));
+    assert!(elapsed.contains(&format!("- {task_id}: starting")));
 
     assert!(remove_task_entry(&task_id).is_some());
     let mut os = app.os.lock().unwrap();
@@ -1288,6 +1367,8 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
             cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
@@ -1308,6 +1389,7 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
     assert!(output.contains("Completed task results below (already collected"));
     assert!(output.contains("subagent final answer"));
     assert!(output.contains("COMPLETED"));
+    assert!(output.contains(&format!("progress[{task_id}]: starting")));
     assert!(remove_task_entry(&task_id).is_none());
 
     let os = app.os.lock().unwrap();
@@ -1416,6 +1498,8 @@ fn task_wait_any_returns_ready_result_without_waiting_for_pending_task() {
                 selection_explanation: "explicit override".to_string(),
                 inherit: InheritOptions::default(),
                 abort_handle: None,
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
                 cancel_stream: Arc::new(AtomicBool::new(false)),
                 started_at: Instant::now(),
             },
@@ -1501,6 +1585,8 @@ fn task_status_cleans_up_terminated_task_without_result() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
             cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
@@ -1652,6 +1738,8 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: Some(abort_handle),
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
             cancel_stream: cancel_stream.clone(),
             started_at: Instant::now(),
         },
@@ -1751,6 +1839,8 @@ async fn discarding_session_tasks_aborts_workers_and_releases_results() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: Some(worker.abort_handle()),
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
             cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
         },
@@ -1833,6 +1923,8 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: Some(abort_handle),
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
             cancel_stream: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now() - SUBAGENT_WALL_CLOCK_TIMEOUT - Duration::from_secs(1),
         },
@@ -1922,6 +2014,8 @@ async fn task_wait_wall_clock_timeout_aborts_worker_before_publishing_result() {
             selection_explanation: "explicit override".to_string(),
             inherit: InheritOptions::default(),
             abort_handle: Some(worker.abort_handle()),
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
             cancel_stream: cancel_stream.clone(),
             started_at: Instant::now() - SUBAGENT_WALL_CLOCK_TIMEOUT - Duration::from_secs(1),
         },
@@ -2011,6 +2105,8 @@ fn task_entry_can_be_looked_up_by_pid() {
                 selection_explanation: "explicit override".to_string(),
                 inherit: InheritOptions::default(),
                 abort_handle: None,
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
                 cancel_stream: Arc::new(AtomicBool::new(false)),
                 started_at: Instant::now(),
             },
@@ -2042,6 +2138,7 @@ fn outstanding_task_anchor_lists_ids_and_required_follow_up() {
             agent_name: "explore".to_string(),
             model: "qwen3.7-max".to_string(),
             description: "inspect parser".to_string(),
+            progress: Some("running command · plan: inspect parser".to_string()),
         },
         OutstandingTaskSnapshot {
             task_id: "task_beta".to_string(),
@@ -2049,12 +2146,14 @@ fn outstanding_task_anchor_lists_ids_and_required_follow_up() {
             agent_name: "build".to_string(),
             model: "gpt-5.5".to_string(),
             description: "verify fix".to_string(),
+            progress: None,
         },
     ]);
 
     assert!(note.contains("[pending-subagent-tasks]"));
     assert!(note.contains("Outstanding task_ids: [task_alpha, task_beta]"));
     assert!(note.contains("task_id=task_alpha status=running"));
+    assert!(note.contains("progress: running command · plan: inspect parser"));
     assert!(note.contains("task_id=task_beta status=completed"));
     assert!(note.contains("use `task_wait` with the same task_ids"));
 }

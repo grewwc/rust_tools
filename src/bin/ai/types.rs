@@ -47,7 +47,7 @@ impl Clone for App {
             current_agent: self.current_agent.clone(),
             current_agent_manifest: self.current_agent_manifest.clone(),
             pending_files: self.pending_files.clone(),
-            forced_skill: self.forced_skill.clone(),
+            forced_skills: self.forced_skills.clone(),
             forced_skill_source: self.forced_skill_source,
             // 该状态只属于 foreground 的下一条用户消息；`App` clone 还会用于
             // DriverContext、subagent 与后台任务，不能让它们继承这次续接。
@@ -94,15 +94,16 @@ pub(super) struct App {
     pub(super) current_agent: String,
     pub(super) current_agent_manifest: Option<AgentManifest>,
     pub(super) pending_files: Option<String>,
-    /// 用户通过 `@skills:<name>` 在输入框中显式选择、仅对**本轮**生效的强制 skill。
-    /// turn 准备阶段读取后强制注入该 skill，并在该 turn 结束后清空，下一轮不再强制。
-    pub(super) forced_skill: Option<String>,
-    /// `forced_skill` 的来源。只有显式用户选择会携带该值，用于本轮持久化审计。
+    /// 用户通过 `@skills:<name>` 或 `/skills <name>...` 在输入框中显式选择、仅对
+    /// **本轮**生效的强制 skill 列表（保持选择顺序，第一个为 primary）。
+    /// turn 准备阶段读取后强制注入这些 skill，并在该 turn 结束后清空，下一轮不再强制。
+    pub(super) forced_skills: Vec<String>,
+    /// `forced_skills` 的来源。只有显式用户选择会携带该值，用于本轮持久化审计。
     pub(super) forced_skill_source: Option<ForcedSkillSource>,
     /// 当前 skill 通过 `request_user_input` 明确请求用户输入后保存的一次性续接。
     /// 下一条普通用户消息消费它；显式 skill 选择或会话切换会覆盖/清除它。
     pub(super) pending_skill_continuation: Option<PendingSkillContinuation>,
-    /// 当 /skills <name> <rest> 时，<rest> 作为本轮问题使用。
+    /// 当 /skills <name>... <rest> 时，<rest> 作为本轮问题使用。
     pub(super) forced_question: Option<String>,
     pub(super) attached_image_files: Vec<String>,
     pub(super) shutdown: Arc<AtomicBool>,
@@ -220,7 +221,8 @@ pub(super) struct SkillBiasMemory {
 /// 模糊的跨轮 skill 偏好使用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PendingSkillContinuation {
-    pub(super) skill_name: String,
+    /// 当前活动 skill 列表（多 skill 叠加时保留全部，第一条为主 skill）。
+    pub(super) skill_names: Vec<String>,
 }
 
 /// 用户显式指定强制 skill 的入口。保留来源可区分命令解析问题与注入问题。

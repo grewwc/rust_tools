@@ -65,7 +65,7 @@ pub(in crate::ai) fn clear_session_local_runtime_state(app: &mut App) {
         ctx.tools.clear();
     }
     app.attached_image_files.clear();
-    app.forced_skill = None;
+    app.forced_skills.clear();
     app.forced_skill_source = None;
     app.pending_skill_continuation = None;
     app.forced_question = None;
@@ -1169,7 +1169,7 @@ mod tests {
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,
-            forced_skill: Some("feishu-upload-md".to_string()),
+            forced_skills: vec!["feishu-upload-md".to_string()],
             forced_skill_source: None,
             pending_skill_continuation: None,
             forced_question: Some("把 markdown 发到飞书".to_string()),
@@ -1230,7 +1230,7 @@ mod tests {
         try_handle_session_command(&mut app, "/sessions new").unwrap();
 
         assert!(app.last_skill_bias.is_none());
-        assert!(app.forced_skill.is_none());
+        assert!(app.forced_skills.is_empty());
         assert!(app.forced_question.is_none());
         assert!(app.attached_image_files.is_empty());
         assert!(app.prune_marks.is_empty());
@@ -1475,7 +1475,7 @@ mod tests {
         try_handle_session_command(&mut app, "/sessions branch 1").unwrap();
 
         assert!(app.last_skill_bias.is_none());
-        assert!(app.forced_skill.is_none());
+        assert!(app.forced_skills.is_empty());
         assert!(app.forced_question.is_none());
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((source_session_id, 1), async {

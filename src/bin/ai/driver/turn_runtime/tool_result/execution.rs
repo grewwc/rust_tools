@@ -3164,7 +3164,7 @@ mod tests {
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,
-            forced_skill: None,
+            forced_skills: Vec::new(),
             forced_skill_source: None,
             pending_skill_continuation: None,
             forced_question: None,
@@ -5400,6 +5400,8 @@ mod tests {
             task_id.clone(),
             crate::ai::tools::task_tools::AsyncTaskEntry {
                 session_id: app.session_id.clone(),
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
                 result_observed: false,
                 owner_pid: pid,
                 pid,
@@ -5520,6 +5522,8 @@ mod tests {
             task_id.clone(),
             crate::ai::tools::task_tools::AsyncTaskEntry {
                 session_id: app.session_id.clone(),
+                last_progress_notification_at: None,
+                last_progress_persisted_at: None,
                 result_observed: false,
                 owner_pid: pid,
                 pid,

@@ -14,7 +14,9 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
    must not mutate conversation state behind the driver's back.
 3. **Prompt assembly stays explicit.** Avoid duplicating instructions across
    system prompts, hidden catalogs, skill prompts, and reminders; keep reminder
-   text consistent with the registry behavior.
+   text consistent with the registry behavior. The Trust boundary block is
+   injected exactly once by `build_system_prompt`; skill prompts and reminders
+   must not repeat or reword it.
 4. **History is evidence.** Compression and pruning must preserve tool outputs,
    subagent results, and truncation state through explicit stubs or file pointers;
    never silently summarize away the only source of truth.
@@ -56,6 +58,11 @@ and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
     skill across turns only after its `request_user_input` control tool succeeds;
     consume that continuation on the next normal turn, let an explicit skill pin
     override it, and never infer it from response wording or question marks.
+    **Multi-skill:** multiple skills can be active simultaneously (ordered list,
+    first is primary). `activate_skill` adds to the set, `deactivate_skill` removes.
+    Tools and MCP servers merge (union, deduplicated); `disable_*` flags are
+    most-restrictive (any skill disabling wins). Cross-turn continuation preserves
+    the entire active skill set, not just one.
 15. **Persist the actual response model.** Automatic request fallback does not
     rewrite `app.current_model`; model-dependent projection and canonical-history
     provenance use the model that actually produced each response.

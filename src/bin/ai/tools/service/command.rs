@@ -91,6 +91,23 @@ fn format_command_result(output: CommandRunResult, timeout_secs: u64) -> String 
         format!("{stdout_trimmed}\n{stderr_trimmed}")
     };
 
+    if output.stalled {
+        // PTY 交互命令停滞：命令存活但长时间没有输出，几乎可以断定它在等待人类输入
+        // （扫码、密码、菜单），agent 无法提供输入；输出被管道（如 `| tail`）缓冲时
+        // 更是从头到尾都看不到。给出明确诊断 + 已捕获的部分输出（典型：二维码），
+        // 而不是让模型把结果误解为普通超时后盲目重试同一条命令。
+        let partial = if combined.trim().is_empty() {
+            "(no output was captured before termination)".to_string()
+        } else {
+            format!(
+                "Partial output captured before termination:\n{}",
+                combined.trim()
+            )
+        };
+        let msg = "Command appears to be waiting for interactive input and was terminated: it kept running without producing output for a sustained period. This usually means the command is interactive — e.g. a QR-code login, a password prompt, or a menu — and cannot proceed without human input; or its output is buffered by a pipe (like `| tail`), which only flushes when the command exits, so nothing was visible. If the command is a long-running server or daemon, run it in the background instead (append `&` and redirect output to a log file). For login flows, prefer the CLI's non-blocking options (e.g. `--begin`/`--complete`, `--qr-image`, `--no-terminal-qr`, `-y`).";
+        return truncate_chars(&format!("{msg}\n{partial}"), MAX_COMMAND_OUTPUT_CHARS);
+    }
+
     if output.timed_out || output.cancelled {
         let reason = if output.timed_out {
             format!("Command timed out after {timeout_secs}s and was terminated.")
@@ -149,7 +166,7 @@ where
 
     let output =
         command_runner::run_command_streaming(command, cwd, timeout, pseudo_terminal, on_chunk)?;
-    let interrupted = output.timed_out || output.cancelled;
+    let interrupted = output.timed_out || output.cancelled || output.stalled;
     let formatted = format_command_result(output, timeout);
     if interrupted {
         Err(formatted)
@@ -213,6 +230,7 @@ mod tests {
                 stderr: b"last diagnostic\n".to_vec(),
                 timed_out: true,
                 cancelled: false,
+                stalled: false,
             },
             30,
         );
@@ -220,6 +238,42 @@ mod tests {
         assert!(out.contains("Partial output captured"), "out: {out}");
         assert!(out.contains("progress before timeout"), "out: {out}");
         assert!(out.contains("last diagnostic"), "out: {out}");
+    }
+
+    #[test]
+    fn stalled_result_explains_interactive_wait_and_keeps_partial_output() {
+        let out = format_command_result(
+            CommandRunResult {
+                status: None,
+                stdout: b"scan this QR: QR-CONTENT\n".to_vec(),
+                stderr: Vec::new(),
+                timed_out: false,
+                cancelled: false,
+                stalled: true,
+            },
+            60,
+        );
+        assert!(out.contains("waiting for interactive input"), "out: {out}");
+        assert!(out.contains("QR-CONTENT"), "out: {out}");
+        assert!(out.contains("`| tail`"), "out: {out}");
+        assert!(!out.contains("timed out"), "must not read as a timeout: {out}");
+    }
+
+    #[test]
+    fn stalled_result_without_output_stays_informative() {
+        let out = format_command_result(
+            CommandRunResult {
+                status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                timed_out: false,
+                cancelled: false,
+                stalled: true,
+            },
+            60,
+        );
+        assert!(out.contains("no output was captured"), "out: {out}");
+        assert!(out.contains("waiting for interactive input"), "out: {out}");
     }
 
     // ---- resolve_command_timeout ----
