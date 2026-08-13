@@ -142,21 +142,33 @@ pub(super) fn prepare_tool_messages_structured(
             if !is_explicitly_protected
                 && !protected_indices.contains(&idx)
                 && text.chars().count() > max_chars_per_msg
-                && let Some(path) = overflow_dir
-                    .and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
             {
-                let recall_lines = message
-                    .tool_call_id
-                    .as_deref()
-                    .and_then(|id| id_to_tool_args.get(id))
-                    .map(|args| build_tool_overflow_recall_lines(name, args))
-                    .unwrap_or_default();
-                message.content = Value::String(build_preserved_tool_overflow_stub(
-                    &path,
-                    name,
-                    &text,
-                    &recall_lines,
-                ));
+                // 回读本 session 已归档 asset 时复用既有文件，避免「外溢→回读→
+                // 再外溢」每次铸造新 uuid 文件（与 Path C 复用逻辑一致）。
+                let existing_asset_path = overflow_dir.and_then(|dir| {
+                    message
+                        .tool_call_id
+                        .as_deref()
+                        .and_then(|id| id_to_tool_args.get(id))
+                        .and_then(|args| preserved_tool_overflow_path_in_arguments(name, args, dir))
+                });
+                if let Some(path) = existing_asset_path.or_else(|| {
+                    overflow_dir
+                        .and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
+                }) {
+                    let recall_lines = message
+                        .tool_call_id
+                        .as_deref()
+                        .and_then(|id| id_to_tool_args.get(id))
+                        .map(|args| build_tool_overflow_recall_lines(name, args))
+                        .unwrap_or_default();
+                    message.content = Value::String(build_preserved_tool_overflow_stub(
+                        &path,
+                        name,
+                        &text,
+                        &recall_lines,
+                    ));
+                }
             }
             continue;
         }
@@ -205,8 +217,20 @@ pub(super) fn cap_oversized_tool_results_for_context(
             .and_then(|id| id_to_tool_args.get(id))
             .map(|args| build_tool_overflow_recall_lines(tool_name, args))
             .unwrap_or_default();
-        let replacement = overflow_dir
-            .and_then(|dir| write_preserved_tool_overflow_file(dir, tool_name, &text))
+        // 回读本 session 已归档 asset（read_file / execute_command cat 指向
+        // tool-overflow-compressed/ 直接子文件）时复用既有文件，而不是再铸造一个
+        // 随机名新文件——否则「外溢→回读→再外溢」会在每次回读时生成新 archive，
+        // 模型永远沿新指针重读，形成无界链。与 Path C 的复用逻辑保持一致。
+        let existing_asset_path = overflow_dir.and_then(|dir| {
+            tool_call_id
+                .and_then(|id| id_to_tool_args.get(id))
+                .and_then(|args| preserved_tool_overflow_path_in_arguments(tool_name, args, dir))
+        });
+        let replacement = existing_asset_path
+            .or_else(|| {
+                overflow_dir
+                    .and_then(|dir| write_preserved_tool_overflow_file(dir, tool_name, &text))
+            })
             .map(|path| {
                 build_preserved_tool_overflow_stub(&path, tool_name, &text, &recall_lines)
             })
@@ -292,30 +316,49 @@ pub(super) fn enforce_protected_precision_group_budget(
                 continue;
             }
             let text_len = text.chars().count();
-            if let Some(path) = write_preserved_tool_overflow_file(overflow_dir, &tool_name, &text)
-            {
-                let recall_lines = messages[idx]
-                    .tool_call_id
-                    .as_deref()
-                    .and_then(|id| id_to_tool_args.get(id))
-                    .map(|args| build_tool_overflow_recall_lines(&tool_name, args))
-                    .unwrap_or_default();
-                let stub =
-                    build_preserved_tool_overflow_stub(&path, &tool_name, &text, &recall_lines);
-                // 外溢必须严格腾出空间：小结果换成更大的 stub 是膨胀而非压缩，
-                // 会虚增预算占用且让模型看不到真实结果（死循环放大因素）。
-                // 膨胀时删除刚写的文件、保留原文，与 Path C 的防膨胀守卫一致。
-                let stub_chars = stub.chars().count();
-                if stub_chars >= text_len {
-                    let _ = std::fs::remove_file(&path);
+            // 回读本 session 已归档的 asset（read_file 指向 tool-overflow-compressed/
+            // 直接子文件）时复用既有文件，而不是再铸造一个随机名新文件——否则
+            // 「外溢→回读→再外溢」会在每次回读时生成新 archive，形成无界链，
+            // 模型永远拿不到稳定的内容。与 Path C 的复用逻辑保持一致。
+            let tool_call_id = messages[idx].tool_call_id.as_deref();
+            let existing_asset_path = tool_call_id
+                .and_then(|id| id_to_tool_args.get(id))
+                .and_then(|args| preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir));
+            let (path, wrote_new) = if let Some(path) = existing_asset_path {
+                (path, false)
+            } else {
+                let Some(path) =
+                    write_preserved_tool_overflow_file(overflow_dir, &tool_name, &text)
+                else {
                     continue;
+                };
+                (path, true)
+            };
+            let recall_lines = messages[idx]
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| id_to_tool_args.get(id))
+                .map(|args| build_tool_overflow_recall_lines(&tool_name, args))
+                .unwrap_or_default();
+            let stub =
+                build_preserved_tool_overflow_stub(&path, &tool_name, &text, &recall_lines);
+            // 外溢必须严格腾出空间：小结果换成更大的 stub 是膨胀而非压缩，
+            // 会虚增预算占用且让模型看不到真实结果（死循环放大因素）。
+            // 膨胀时删除刚写的文件、保留原文，与 Path C 的防膨胀守卫一致。
+            // 只删除本次新建的文件：复用的 asset 归其它消息的外溢所有，
+            // 删除会让那条消息的 stub 悬空（历史会话出现过归档文件被删的故障）。
+            let stub_chars = stub.chars().count();
+            if stub_chars >= text_len {
+                if wrote_new {
+                    let _ = std::fs::remove_file(&path);
                 }
-                messages[idx].content = Value::String(stub);
-                // 记账必须计入 stub 自身占用：只减原文会低估剩余占用，让预算判定失真。
-                total_chars = total_chars
-                    .saturating_sub(text_len)
-                    .saturating_add(stub_chars);
+                continue;
             }
+            messages[idx].content = Value::String(stub);
+            // 记账必须计入 stub 自身占用：只减原文会低估剩余占用，让预算判定失真。
+            total_chars = total_chars
+                .saturating_sub(text_len)
+                .saturating_add(stub_chars);
         }
     }
 }
@@ -347,13 +390,9 @@ pub(super) fn spill_protected_precision_to_fit(
             let text = value_to_string(&message.content);
             // 当前轮若直接回读本 session 的 archive，Path C 不能再复制一份原文。
             // 复用原 asset 的指针既保住 hard target，又避免「外溢→回读→再外溢」循环。
-            let existing_asset_path = if tool_name == "read_file" {
-                id_to_tool_args
-                    .get(id)
-                    .and_then(|args| preserved_tool_overflow_read_file_path(args, overflow_dir))
-            } else {
-                None
-            };
+            let existing_asset_path = id_to_tool_args
+                .get(id)
+                .and_then(|args| preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir));
             (!text.trim().is_empty()
                 && !is_preserved_tool_overflow_stub(&text)
                 && !tool_history_policy(tool_name).allows_lossy_compress())
@@ -442,7 +481,7 @@ pub(super) fn build_tool_call_arguments_index(messages: &[Message]) -> FxHashMap
 
 /// 返回 `read_file` 直接读取的本 session 工具溢出归档路径。
 ///
-/// Path C 对一般工具结果必须落盘，以保住 hard target；但 archive 本身已经是
+/// 对一般工具结果必须落盘，以保住 hard target；但 archive 本身已经是
 /// runtime 写入的稳定资产，再复制一次只会让模型在回读大文件时持续产生新 archive。
 /// 仅复用 `tool-overflow-compressed` 的直接子文件：session asset 根中的 `tmp`、
 /// checkpoint 等文件可在同一 session 后续被写入；若直接保留其指针，历史结果会
@@ -450,6 +489,34 @@ pub(super) fn build_tool_call_arguments_index(messages: &[Message]) -> FxHashMap
 fn preserved_tool_overflow_read_file_path(arguments: &str, overflow_dir: &Path) -> Option<PathBuf> {
     let args = serde_json::from_str::<Value>(arguments).ok()?;
     let raw_path = value_string_from_keys(&args, &["file_path", "path", "filePath"])?;
+    archived_asset_path_from_raw(&raw_path, overflow_dir)
+}
+
+/// 统一识别「读取本 session 归档 asset」的直接文件路径，供两条主路径与 Path C 复用
+/// 既有 archive，避免「外溢→回读→再外溢」每次回读都铸造新 uuid 文件、让模型沿
+/// 新指针无限重读。
+///
+/// - `read_file`：`file_path` / `path` / `filePath` 字段；
+/// - `execute_command`：`command` 字符串内嵌的归档路径（`cat`/`head`/`grep` 等）。
+/// 其余工具不返回路径（复用语义不适用，行为与旧 `read_file` 守卫一致）。
+fn preserved_tool_overflow_path_in_arguments(
+    tool_name: &str,
+    arguments: &str,
+    overflow_dir: &Path,
+) -> Option<PathBuf> {
+    let args = serde_json::from_str::<Value>(arguments).ok()?;
+    match tool_name {
+        "read_file" => preserved_tool_overflow_read_file_path(arguments, overflow_dir),
+        "execute_command" => {
+            let command = value_string_from_keys(&args, &["command"])?;
+            archived_asset_path_in_command(&command, overflow_dir)
+        }
+        _ => None,
+    }
+}
+
+/// 校验 raw 路径为 `tool-overflow-compressed` 的直接子文件；两端 canonicalize。
+fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) -> Option<PathBuf> {
     let preserved_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).canonicalize().ok()?;
     // 必须与 read_file 共用相同的 relative-path 解析规则；直接 canonicalize 会错误地
     // 以进程 cwd 为基准，忽略 subagent 的 effective_cwd。
@@ -461,6 +528,45 @@ fn preserved_tool_overflow_read_file_path(arguments: &str, overflow_dir: &Path) 
         return None;
     }
     Some(source_path)
+}
+
+/// 从 execute_command 的 `command` 字符串中识别「读取本 session 归档 asset」的路径。
+/// 匹配 archive 直接子文件的绝对路径、相对 effective_cwd 的路径或裸文件名
+/// （文件名含 uuid，基本唯一）。archive 数量有限，每轮压缩扫描成本可接受。
+fn archived_asset_path_in_command(command: &str, overflow_dir: &Path) -> Option<PathBuf> {
+    let preserved_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).canonicalize().ok()?;
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
+    for entry in std::fs::read_dir(&preserved_dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        // 与 read_file 路径（archived_asset_path_from_raw）一致：拒绝指向
+        // `tool-overflow-compressed` 目录外的 symlink 目标。
+        if !canonical.is_file() || canonical.parent() != Some(preserved_dir.as_path()) {
+            continue;
+        }
+        let abs = canonical.to_string_lossy().into_owned();
+        if command.contains(&abs) {
+            return Some(canonical);
+        }
+        if let Some(cwd) = &cwd
+            && let Ok(rel) = canonical.strip_prefix(cwd)
+            && let Some(rel_str) = rel.to_str()
+            && command.contains(rel_str)
+        {
+            return Some(canonical);
+        }
+        if let Some(name) = canonical.file_name().and_then(|n| n.to_str())
+            && command.contains(name)
+        {
+            return Some(canonical);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -707,6 +813,204 @@ mod tests {
         assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
         assert!(stub.chars().count() < 10_000, "{stub}");
         let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
+    fn enforce_group_budget_reuses_reread_archive_asset_instead_of_rearchiving() {
+        // 回读已归档 asset 的 read_file 结果（跨 turn 后不再是 protected）再次进入
+        // group 外溢时，必须复用既有归档文件（stub 指向同一文件），而不是铸造
+        // 随机名新文件——否则「外溢→回读→再外溢」每次回读都会生成新 archive，
+        // 形成无界链，模型永远拿不到稳定的内容。
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-precision-group-reuse-{}",
+            uuid::Uuid::new_v4()
+        ));
+        // 1) 用 Path C 生成一个归档 asset
+        let mut messages = vec![
+            assistant_call("spill", "read_file"),
+            tool_result("spill", &"x".repeat(1_000)),
+            assistant_call("recent", "read_file"),
+            tool_result("recent", "recent result"),
+        ];
+        let mut protected = FxHashSet::default();
+        protected.insert("spill".to_string());
+        let stub1 = spill_protected_precision_to_fit(
+            &mut messages,
+            80,
+            Some(&overflow_dir),
+            &protected,
+        );
+        assert!(stub1 > 0);
+        let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+        let archive_path = std::fs::read_dir(&archive_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let raw = std::fs::read_to_string(&archive_path).unwrap();
+
+        // 2) 模型回读该归档：结果(1000 字符) 超过 group inline 预算 → 触发 enforce 外溢
+        let read_args = serde_json::json!({ "file_path": archive_path.to_string_lossy() });
+        let mut messages = vec![
+            assistant_call_args("re-read", "read_file", &read_args.to_string()),
+            tool_result("re-read", &raw),
+        ];
+        enforce_protected_precision_group_budget(
+            &mut messages,
+            1,
+            120,
+            Some(&overflow_dir),
+            &FxHashSet::default(),
+            false,
+        );
+
+        // 3) 复用既有 asset：目录仍只有 1 个文件，且 stub 指向同一个 archive_path
+        assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
+        let stub_text = value_to_string(&messages[1].content);
+        assert!(is_preserved_tool_overflow_stub(&stub_text), "{stub_text}");
+        assert!(
+            stub_text.contains(archive_path.to_str().unwrap()),
+            "{stub_text}"
+        );
+        let _ = std::fs::remove_dir_all(&overflow_dir);
+    }
+
+    #[test]
+    fn cap_oversized_reuses_reread_archive_asset_instead_of_rearchiving() {
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-cap-reread-reuse-{}",
+            uuid::Uuid::new_v4()
+        ));
+        // 1) 先由 cap 自身写一个归档 asset
+        let mut messages = vec![
+            assistant_call("first", "read_file"),
+            tool_result("first", &"y".repeat(70_000)),
+        ];
+        let capped =
+            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir));
+        assert!(capped > 0);
+        let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+        let archive_path = std::fs::read_dir(&archive_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let raw = std::fs::read_to_string(&archive_path).unwrap();
+
+        // 2) 模型回读归档（正文 70k > 64k hard cap）→ 复用既有文件，不写新文件
+        let read_args = serde_json::json!({ "file_path": archive_path.to_string_lossy() });
+        let mut messages = vec![
+            assistant_call_args("re-read", "read_file", &read_args.to_string()),
+            tool_result("re-read", &raw),
+        ];
+        let capped =
+            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir));
+        assert_eq!(capped, 1);
+        assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
+        let stub_text = value_to_string(&messages[1].content);
+        assert!(is_preserved_tool_overflow_stub(&stub_text), "{stub_text}");
+        assert!(
+            stub_text.contains(archive_path.to_str().unwrap()),
+            "{stub_text}"
+        );
+        let _ = std::fs::remove_dir_all(&overflow_dir);
+    }
+
+    #[test]
+    fn prepare_structured_reuses_reread_archive_asset_instead_of_rearchiving() {
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-prepare-reread-reuse-{}",
+            uuid::Uuid::new_v4()
+        ));
+        // 1) 先由 prepare 写一个归档 asset（旧 read_file 结果，超出 480 阈值、非尾窗）
+        let mut messages = vec![
+            assistant_call("first", "read_file"),
+            tool_result("first", &"z".repeat(2_000)),
+        ];
+        prepare_tool_messages_structured(
+            &mut messages,
+            480,
+            0,
+            Some(&overflow_dir),
+            &FxHashSet::default(),
+        );
+        let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+        let archive_path = std::fs::read_dir(&archive_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let raw = std::fs::read_to_string(&archive_path).unwrap();
+
+        // 2) 模型回读归档，结果再进 prepare（非保护、非尾窗）→ 复用既有文件
+        let read_args = serde_json::json!({ "file_path": archive_path.to_string_lossy() });
+        let mut messages = vec![
+            assistant_call_args("re-read", "read_file", &read_args.to_string()),
+            tool_result("re-read", &raw),
+        ];
+        prepare_tool_messages_structured(
+            &mut messages,
+            480,
+            0,
+            Some(&overflow_dir),
+            &FxHashSet::default(),
+        );
+        assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
+        let stub_text = value_to_string(&messages[1].content);
+        assert!(is_preserved_tool_overflow_stub(&stub_text), "{stub_text}");
+        assert!(
+            stub_text.contains(archive_path.to_str().unwrap()),
+            "{stub_text}"
+        );
+        let _ = std::fs::remove_dir_all(&overflow_dir);
+    }
+
+    #[test]
+    fn cap_reuses_execute_command_cat_archive_instead_of_rearchiving() {
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-cap-cat-reuse-{}",
+            uuid::Uuid::new_v4()
+        ));
+        // 1) 先由 cap 写一个 execute_command 归档 asset
+        let mut messages = vec![
+            assistant_call("run", "execute_command"),
+            tool_result("run", &"log line\n".repeat(30_000)),
+        ];
+        let capped =
+            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir));
+        assert!(capped > 0);
+        let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+        let archive_path = std::fs::read_dir(&archive_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let raw = std::fs::read_to_string(&archive_path).unwrap();
+
+        // 2) 模型用 `cat <archive>` 回读归档正文（> hard cap）→ 复用既有文件
+        let run_args = serde_json::json!({
+            "command": format!("cat {}", archive_path.to_string_lossy()),
+            "pty": false,
+        });
+        let mut messages = vec![
+            assistant_call_args("re-cat", "execute_command", &run_args.to_string()),
+            tool_result("re-cat", &raw),
+        ];
+        let capped =
+            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir));
+        assert_eq!(capped, 1);
+        assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
+        let stub_text = value_to_string(&messages[1].content);
+        assert!(is_preserved_tool_overflow_stub(&stub_text), "{stub_text}");
+        assert!(
+            stub_text.contains(archive_path.to_str().unwrap()),
+            "{stub_text}"
+        );
+        let _ = std::fs::remove_dir_all(&overflow_dir);
     }
 
     #[test]

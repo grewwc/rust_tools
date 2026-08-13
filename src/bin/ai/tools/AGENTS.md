@@ -60,8 +60,8 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
    `read_file` line-number prefix copied into `old` is never auto-stripped).
    Multi-hunk unified failures prefix every context-mismatch / ambiguous /
    out-of-order diagnostic with the failing hunk index (`Hunk N/M:`). Such errors
-   echo current text as
-   a prefix-free, paste-ready block (`<<<PATCH_TEXT` ... `PATCH_TEXT>>>`) so the
+   echo current text as a prefix-free, paste-ready block
+   (`<<<PATCH_TEXT` ... `PATCH_TEXT>>>`) so the
    model can rebuild without re-reading; classify the diagnostic before the
    block (so source text cannot mimic an error), and for multi-file patches
    block only the failed target. Only an ambiguous match trips the stale-patch
@@ -108,7 +108,7 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
     `<session_assets>/mutation_log.jsonl` (before/after capped, op, seq); it
     never affects the real write (failures silently dropped). Skip every path
     under the sessions root (assets, subagent scratch `subagent-cwd-*` siblings,
-    checkpoints) - session runtime artifacts, not project changes; skipping the
+    checkpoints) — session runtime artifacts, not project changes; skipping the
     whole root keeps parallel subagent writes out of view. Appends are
     serialized by a process-global lock (main agent + parallel subagents share
     one log). `/audit` reads this log (via `current_session_assets_dir()`, needs

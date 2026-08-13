@@ -113,7 +113,7 @@ const INTERNAL_COMMANDS: &[&str] = &[
 
 const FILES_USAGE: &str = "input file names (repeat -f or use comma-separated list)";
 const NOTE_SEARCH_USAGE: &str =
-    "search knowledge base (memo category) and answer using positional prompt";
+    "search knowledge base (memo category); with a positional query answer once, without it enter interactive memo search";
 const GENERATE_COMPLETIONS_USAGE: &str =
     "generate shell completion script (bash/zsh/fish) and exit";
 const REASONING_EFFORT_USAGE: &str = "reasoning effort: minimal | low | medium | high | xhigh | max | off (clears default; support depends on the selected model)";
@@ -492,7 +492,8 @@ pub(super) fn print_help() {
     println!("  a -bg refactor the auth       Run in background (logs to <id>.log)");
     println!("  a --stop <session-id>         Stop a background session");
     println!("  a -n \"TODO: remember this\"    Save a memo and exit");
-    println!("  a -ns \"meeting notes\"         Search memos with AI\n");
+    println!("  a -ns \"meeting notes\"         Search memos with AI (one-shot)");
+    println!("  a -ns                        Enter interactive memo search\n");
 
     // ── Options ──────────────────────────────────────────────────
     parser.print_defaults();

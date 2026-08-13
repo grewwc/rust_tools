@@ -22,7 +22,7 @@ src/bin/*.rs                # one-off/experimental CLI tools (c, j, secret, pdf,
 crates/aios_kernel/         # scheduler / IPC / process state machine
 crates/rust_tools_macros/   # proc macros
 crates/mcp_stdio/           # shared MCP-over-stdio skeleton (lib): JSON-RPC transport + run<McpServer> loop
-crates/mcp_browser/         # standalone MCP server: browser automation; macOS default AppleScript driver reuses the user's running Chrome (new tab, keep cookies, never quits it, never steals focus); Windows/Linux use CDP attach (MCP_BROWSER_WS_URL=http://127.0.0.1:9222 against a --remote-debugging-port Chrome); plain CDP = controlled instance
+crates/mcp_browser/         # standalone MCP server: browser automation; macOS AppleScript driver reuses the user's running Chrome, Windows/Linux use CDP attach or a controlled instance (details in crates/mcp_browser/AGENTS.md)
 crates/mcp_excel/           # standalone MCP server: real Microsoft Excel automation via AppleScript (osascript)
 tests/                      # integration tests
 models.json                 # model registry

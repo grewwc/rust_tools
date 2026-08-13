@@ -10,17 +10,100 @@ use serde_json::Value;
 use super::builder::build_request_body;
 use super::types::StreamUsage;
 use super::{
-    api_key_for_request_model, apply_request_auth, control_model_for_aux_tasks,
-    endpoint_for_request_model, extract_router_content,
+    apply_request_auth, control_model_for_aux_tasks, endpoint_for_request_model,
+    extract_router_content,
 };
 use crate::ai::{
-    history::{Message, messages_to_markdown},
+    history::{Message, is_runtime_synthetic_user_message, messages_to_markdown},
+    models, provider::adapter_for,
     types::App,
 };
 
 /// 会话标题请求的超时（秒）。后台辅助任务，用宽松超时避免阻塞主流程。
 pub(super) const SESSION_TITLE_REQUEST_TIMEOUT_SECS: u64 = 90;
 pub(super) const SESSION_TITLE_BODY_TIMEOUT_SECS: u64 = 45;
+
+/// 辅助请求（标题/摘要）的 API key 轮换候选列表。
+///
+/// 与主请求链路（transport.rs）一致：primary key 解析后，再经
+/// adapter.collect_api_keys 收集 provider 专属命名 key（如 opencode.api_key_xxx）。
+/// 此前辅助请求只用 primary key，命名 key 配置下会回退到全局 api_key，该 key 对
+/// 网关失效时 401 静默失败 → session 无标题/无摘要（f319d490 / 9833f002）。
+fn aux_request_key_candidates(model: &str, endpoint: &str, global_fallback: &str) -> Vec<String> {
+    let primary = models::api_key_for_model(model, global_fallback);
+    adapter_for(models::model_adapter(model), endpoint).collect_api_keys(&primary)
+}
+
+/// 发送辅助 LLM 请求（POST chat/completions），key 轮换直到成功。
+///
+/// 对每个 key 单独套用超时，避免单个 key 挂起拖慢后台辅助任务。
+/// 返回 2xx 响应体文本；全部 key 失败时返回最后一个错误的 (kind, message)，
+/// kind 与 record_title_failure 的错误分类一致。
+async fn send_aux_chat_request_with_key_rotation(
+    app: &App,
+    model: &str,
+    endpoint: &str,
+    http_body: Vec<u8>,
+    header_timeout: Duration,
+    body_timeout: Duration,
+) -> Result<String, (String, String)> {
+    let keys = aux_request_key_candidates(model, endpoint, &app.config.api_key);
+    let mut last_err: (String, String) = ("http_error".to_string(), "unknown".to_string());
+
+    for (idx, api_key) in keys.iter().enumerate() {
+        if idx > 0 {
+            super::emit_request_diagnostic(format_args!(
+                "[aux] key #{} failed, trying next key #{} ({} remaining)",
+                idx - 1,
+                idx,
+                keys.len() - idx
+            ));
+        }
+
+        let send_future = apply_request_auth(app.client.post(endpoint), endpoint, api_key)
+            .header("Content-Type", "application/json")
+            .body(http_body.clone())
+            .send();
+
+        let response = match tokio::time::timeout(header_timeout, send_future).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                last_err = ("request_error".to_string(), e.to_string());
+                continue;
+            }
+            Err(_) => {
+                last_err = (
+                    "request_timeout".to_string(),
+                    format!("{}s", header_timeout.as_secs()),
+                );
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            last_err = ("http_error".to_string(), format!("HTTP {status}"));
+            continue;
+        }
+
+        let text = match tokio::time::timeout(body_timeout, response.text()).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                last_err = ("body_read_error".to_string(), e.to_string());
+                continue;
+            }
+            Err(_) => {
+                last_err = (
+                    "body_timeout".to_string(),
+                    format!("{}s", body_timeout.as_secs()),
+                );
+                continue;
+            }
+        };
+        return Ok(text);
+    }
+    Err(last_err)
+}
 
 fn is_exported_message_heading(line: &str) -> bool {
     ["### 👤 ", "### 🤖 ", "### ⚙️ ", "### 🔧 ", "### 📝 "]
@@ -195,34 +278,28 @@ Main request:\nUser decisions:\nVerified facts and sources:\nUnverified assistan
         None,
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
-    let api_key = api_key_for_request_model(app, &control_model);
     let http_body =
         super::protocol::build_http_body_for_request(&control_model, &endpoint, &request_body);
     // 历史摘要是 turn 收尾的后台辅助请求（任务边界压缩会在每次答案交付后触发）。
     // 主 client 只有 connect_timeout、没有整体 timeout，若摘要模型接受连接后迟迟
     // 不返回响应头，这里的裸 .send()/.text() 会永久阻塞、CPU 0，表现为"答案已输出
     // 但迟迟不回到提示符"的卡死。用显式超时兜底，超时即放弃摘要（保持原始历史）。
-    let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
-        .header("Content-Type", "application/json")
-        .body(http_body)
-        .send();
-    let response = match tokio::time::timeout(Duration::from_secs(60), send_future).await {
-        Ok(r) => r.ok()?,
-        Err(_) => {
+    // key 按 collect_api_keys 轮换（与主请求链路一致）：命名 key 配置下仅用
+    // primary 会对网关 401 静默失败 → 无摘要。全部 key 失败时放弃摘要。
+    let text = match send_aux_chat_request_with_key_rotation(
+        app,
+        &control_model,
+        &endpoint,
+        http_body,
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err((kind, msg)) => {
             super::emit_request_diagnostic(format_args!(
-                "[summary] timeout (60s) waiting for response headers, skipping"
-            ));
-            return None;
-        }
-    };
-    if !response.status().is_success() {
-        return None;
-    }
-    let text = match tokio::time::timeout(Duration::from_secs(30), response.text()).await {
-        Ok(r) => r.ok()?,
-        Err(_) => {
-            super::emit_request_diagnostic(format_args!(
-                "[summary] timeout (30s) reading response body, skipping"
+                "[summary] request failed ({kind}: {msg}), skipping"
             ));
             return None;
         }
@@ -266,6 +343,10 @@ fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<S
         // 工具结果常常很长、且不等于用户想解决的问题。只给标题模型用户意图和
         // 最终回答，避免工具输出抢占有限的标题上下文窗口。
         .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        // 子代理证据交接等运行时合成的 user 消息不是真实轮次（AGENTS.md 不变式
+        // 12），若当成「用户: ...」喂给标题模型，多 skill/子代理会话的转录会被
+        // 交接内容污染，导致模型回退到「帮我/请…」式低质量标题而被过滤。
+        .filter(|message| !is_runtime_synthetic_user_message(message))
         .filter(|message| {
             !message
                 .tool_calls
@@ -289,6 +370,18 @@ fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<S
             Some(format!("{role}: {content}"))
         })
         .collect()
+}
+
+/// 把会话标题生成的静默失败写入决策日志，替代被注释掉的 eprintln。
+/// 标题任务在后台 spawn 中执行，eprintln 不可见；决策日志是唯一可观测渠道。
+fn record_title_failure(app: &App, reason: &str, detail: &str) {
+    crate::ai::driver::decision_log::log_session_title_failure(
+        crate::ai::driver::decision_log::get_decision_log_store(),
+        &app.session_id,
+        crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+        reason,
+        detail,
+    );
 }
 
 const SESSION_TITLE_TRANSCRIPT_MAX_CHARS: usize = 8_000;
@@ -381,6 +474,29 @@ mod session_title_tests {
     }
 
     #[test]
+    fn title_transcript_skips_runtime_synthetic_user_messages() {
+        use crate::ai::history::runtime_synthetic_user_message;
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Value::String("修复 session title".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            // agent-team 等多子代理场景：子代理证据交接被写成运行时合成的 user 消息，
+            // 不应以「用户: …」的形式混入标题转录。
+            runtime_synthetic_user_message(Value::String(
+                "[Subagent evidence] 子代理交接内容...".to_string(),
+            )),
+        ];
+
+        let dialog = session_title_dialog_lines(&messages);
+
+        assert_eq!(dialog, vec!["用户: 修复 session title"]);
+    }
+
+    #[test]
     fn title_transcript_ignores_tool_output_and_keeps_final_answer() {
         let messages = vec![
             Message {
@@ -430,6 +546,43 @@ mod session_title_tests {
         assert!(transcript.ends_with('b'));
         assert!(transcript.contains("\n…\n"));
         assert!(transcript.chars().count() <= SESSION_TITLE_TRANSCRIPT_MAX_CHARS);
+    }
+
+    #[test]
+    fn aux_request_key_candidates_prefers_named_provider_key() {
+        // 回归：命名 key（opencode.api_key_xxx）配置下，辅助请求（标题/摘要）的
+        // key 候选必须与主请求一致优先使用命名 key；此前只用 primary key 会回退
+        // 到全局 api_key（对网关失效时 401 静默失败 → session 无标题/无摘要）。
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let old_configw_path = std::env::var_os("CONFIGW_PATH");
+        let dir = std::env::temp_dir().join(format!("configw_aux_key_test_{}", std::process::id()));
+        let path = dir.join("configW");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            "api_key = \"global-invalid\"\nopencode.api_key_grewwc = \"named-valid\"\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("CONFIGW_PATH", &path) };
+        crate::commonw::configw::refresh();
+
+        let keys = aux_request_key_candidates(
+            "deepseek-v4-flash-opencode",
+            crate::ai::provider::OPENCODE_DEFAULT_ENDPOINT,
+            "global-invalid",
+        );
+        assert_eq!(keys, vec!["named-valid", "global-invalid"]);
+
+        // 清理：恢复原有 CONFIGW_PATH（若有），避免影响同进程后续测试
+        match old_configw_path {
+            Some(old) => unsafe { std::env::set_var("CONFIGW_PATH", old) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -498,72 +651,40 @@ pub(crate) async fn generate_session_title_via_model(
         None,
     );
     let endpoint = endpoint_for_request_model(app, &title_model);
-    let api_key = api_key_for_request_model(app, &title_model);
     let http_body =
         super::protocol::build_http_body_for_request(&title_model, &endpoint, &request_body);
 
-    let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
-        .header("Content-Type", "application/json")
-        .body(http_body)
-        .send();
-
-    let response = match tokio::time::timeout(
-        std::time::Duration::from_secs(SESSION_TITLE_REQUEST_TIMEOUT_SECS),
-        send_future,
+    // key 按 collect_api_keys 轮换（与主请求链路一致）：命名 key
+    // （opencode.api_key_xxx）配置下仅用 primary key 会对网关 401 静默失败，
+    // 导致 session 标题长期停留在 fallback。失败时记录最后一个 key 的错误。
+    let text = match send_aux_chat_request_with_key_rotation(
+        app,
+        &title_model,
+        &endpoint,
+        http_body,
+        Duration::from_secs(SESSION_TITLE_REQUEST_TIMEOUT_SECS),
+        Duration::from_secs(SESSION_TITLE_BODY_TIMEOUT_SECS),
     )
     .await
     {
-        Ok(Ok(r)) => r,
-        Ok(Err(_)) => {
-            // eprintln!("[session-title] request error: {e}");
-            return None;
-        }
-        Err(_) => {
-            // eprintln!(
-            // "[session-title] timeout ({}s) sending request, skipping",
-            // SESSION_TITLE_REQUEST_TIMEOUT_SECS
-            // );
-            return None;
-        }
-    };
-
-    let status = response.status();
-    if !status.is_success() {
-        // eprintln!("[session-title] HTTP {status}, skipping");
-        return None;
-    }
-
-    let text = match tokio::time::timeout(
-        std::time::Duration::from_secs(SESSION_TITLE_BODY_TIMEOUT_SECS),
-        response.text(),
-    )
-    .await
-    {
-        Ok(Ok(t)) => t,
-        Ok(Err(_)) => {
-            // eprintln!("[session-title] body read error: {e}");
-            return None;
-        }
-        Err(_) => {
-            // eprintln!(
-            // "[session-title] timeout ({}s) reading body, skipping",
-            // SESSION_TITLE_BODY_TIMEOUT_SECS
-            // );
+        Ok(text) => text,
+        Err((kind, msg)) => {
+            record_title_failure(app, &kind, &msg);
             return None;
         }
     };
 
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
-        Err(_) => {
-            // eprintln!("[session-title] JSON parse error: {e}");
+        Err(e) => {
+            record_title_failure(app, "json_parse_error", &e.to_string());
             return None;
         }
     };
     let content = match extract_router_content(&v) {
         Some(c) => c,
         None => {
-            // eprintln!("[session-title] extract_router_content returned None");
+            record_title_failure(app, "extract_router_content_none", "");
             return None;
         }
     };
@@ -584,6 +705,7 @@ pub(crate) async fn generate_session_title_via_model(
         .to_string();
 
     if cleaned.is_empty() {
+        record_title_failure(app, "empty_title_after_cleanup", &trimmed);
         return None;
     }
 

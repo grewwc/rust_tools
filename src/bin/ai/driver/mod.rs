@@ -139,11 +139,20 @@ impl SchedulerClock {
     }
 
     async fn wait(&mut self, app: &App) {
-        let wake_after = {
+        let kernel_wake_after = {
             let os = app.os.lock().unwrap_or_else(|err| err.into_inner());
             os.next_wakeup_tick().map(|wake_tick| {
                 self.duration_until_ticks(wake_tick.saturating_sub(os.current_tick()).max(1))
             })
+        };
+        // task_wait 使用真实 wall-clock 预算，不能只依赖一次性的 delayed notify。
+        // 将其 deadline 直接纳入 scheduler wait，即使通知丢失也会准时重新扫描并唤醒前台。
+        let task_wait_wake_after =
+            crate::ai::tools::task_tools::next_task_wait_wakeup_delay();
+        let wake_after = match (kernel_wake_after, task_wait_wake_after) {
+            (Some(kernel), Some(task_wait)) => Some(kernel.min(task_wait)),
+            (Some(delay), None) | (None, Some(delay)) => Some(delay),
+            (None, None) => None,
         };
         let started_at = tokio::time::Instant::now();
         if let Some(delay) = wake_after {
@@ -253,6 +262,11 @@ const DEFAULT_MAX_ITERATIONS: usize = 64 * 64;
 const EXECUTOR_MAX_ITERATIONS: usize = 64 * 64;
 
 fn one_shot_cli_mode(cli: &cli::ParsedCli) -> bool {
+    // `a -ns` 无实质内容时自动进入交互模式（等同 `-ns -i`），不算 one-shot，
+    // 否则会触发 one-shot 清理语义（退出即删会话、失败不续跑等）。
+    if note_search::note_search_interactive_mode(cli) {
+        return false;
+    }
     !cli.args.is_empty() && !cli.interactive
 }
 
@@ -285,7 +299,7 @@ fn suspend_session_on_sigint(app: &App) {
 fn decision_log_persist_enabled() -> bool {
     configw::get_all_config()
         .get_opt(AiConfig::DECISION_LOG_PERSIST_ENABLE)
-        .unwrap_or_else(|| "false".to_string())
+        .unwrap_or_else(|| "true".to_string())
         .trim()
         .eq_ignore_ascii_case("true")
 }
@@ -523,9 +537,10 @@ pub(in crate::ai) async fn run_with_cli(
             .await;
     }
 
-    // 处理 --note-search / -ns：默认单轮 notebook 检索后直接退出；若带 `-i`
-    // 则进入交互模式，由 run_loop 在每轮输入时继续执行 notebook 检索问答。
-    if app.cli.note_search && !app.cli.interactive {
+    // 处理 --note-search / -ns：带查询内容时默认单轮 notebook 检索后直接退出；
+    // 不带实质内容（如 `a -ns`）或带 `-i` 时进入交互模式，由 run_loop 在每轮
+    // 输入时继续执行 notebook 检索问答。
+    if app.cli.note_search && !note_search::note_search_interactive_mode(&app.cli) {
         return runtime_ctx::PERSONA_MEMORY_PATH
             .scope(
                 app.current_persona_memory_file(),

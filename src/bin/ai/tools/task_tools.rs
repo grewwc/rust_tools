@@ -288,7 +288,7 @@ fn append_task_progress_snapshots(output: &mut String, task_ids: &[String]) {
     output.push_str(&snapshots.join("\n"));
 }
 
-/// 接收子代理发布的统一结构化快照。内存状态更新不做节流；父进程唤醒和磁盘
+/// 接收子代理发布的统一结构化快照。内存状态更新不做节流；状态行刷新通知和磁盘
 /// 快照分别做边沿节流，checkpoint 始终立即传播，避免长任务静默或造成事件风暴。
 pub(crate) fn record_subagent_progress_update(
     task_id: &str,
@@ -317,7 +317,7 @@ pub(crate) fn record_subagent_progress_update(
         if notify {
             entry.last_progress_notification_at = Some(now);
         }
-        (persist, notify, entry.owner_pid)
+        (persist, notify)
     };
 
     if update.0 && persist_subagent_progress_snapshot(task_id, snapshot).is_err() {
@@ -330,13 +330,14 @@ pub(crate) fn record_subagent_progress_update(
         }
     }
     if update.1 {
-        let _ = with_os_kernel(|os| {
-            os.wake_process(
-                update.2,
-                format!("[TASK_PROGRESS] task_id={task_id}; {}", snapshot.display()),
-            );
-            Ok(())
-        });
+        // 进度事件只刷新前台状态行（notify_scheduler 让调度循环 tick 一次去重绘
+        // subagent 状态行），**绝不** wake_process 把已 park 的父代理拨回 Ready。
+        // 否则每 15s 一次的进度就会强制父代理跑一整轮模型调用、只为再 park 一次，
+        // 把前台变成「每 ~9s 烧一次推理」的忙等自旋（见 agent-team fan-out 卡死）。
+        // 真正需要唤醒父代理的是三条终态路径，它们各自独立触发，不依赖这里：
+        //   1. 子任务完成/失败：channel_send + futex_store → notify_events_completed；
+        //   2. task_wait 预算耗尽：wake_expired_task_waits；
+        //   3. task_cancel：定向翻 cancel futex。
         crate::ai::driver::notify_scheduler();
     }
 }
@@ -703,6 +704,21 @@ fn clear_task_wait_state(key: &TaskWaitKey) {
     states.remove(key);
 }
 
+/// 调度器下一次必须检查 task_wait wall-clock deadline 的剩余时间。
+///
+/// delayed notify 只是提前唤醒信号，不能作为 deadline 的唯一真相来源：若通知任务
+/// 未成功注册或通知发生竞态，调度器仍必须按这里返回的真实 deadline 自行醒来。
+pub(crate) fn next_task_wait_wakeup_delay() -> Option<Duration> {
+    let now = Instant::now();
+    TASK_WAIT_STATES
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|state| !state.expired)
+        .map(|state| state.deadline.saturating_duration_since(now))
+        .min()
+}
+
 #[cfg(test)]
 pub(crate) fn expire_task_wait_states_for_test() {
     let mut states = TASK_WAIT_STATES.lock().unwrap();
@@ -711,6 +727,11 @@ pub(crate) fn expire_task_wait_states_for_test() {
         state.deadline = expired_at;
         state.expired = false;
     }
+}
+
+#[cfg(test)]
+pub(crate) fn task_wait_state_count_for_test() -> usize {
+    TASK_WAIT_STATES.lock().unwrap().len()
 }
 
 pub(crate) fn wake_expired_task_waits() {
@@ -732,9 +753,22 @@ pub(crate) fn wake_expired_task_waits() {
         return;
     }
 
-    let _ = with_os_kernel(|os| {
+    // 逐个唤醒到期 owner；同时记录 owner 进程已不存在/已终止的 wait key。
+    // wake_process 只会把处于 Waiting 的 owner 拨回 Ready（非 Waiting 时 owner 本就
+    // 已被调度，唤醒丢失无害），但 owner 已 Terminated 时唤醒彻底落空，其 wait state
+    // 会以 expired=true 永久滞留在全局表里——既漏内存，也让 next_task_wait_wakeup_delay
+    // 之外再无任何清理路径。这里把这些孤儿 key 收集出来，随后统一删除以自愈。
+    let orphaned = with_os_kernel(|os| {
         let mut woken: SkipSet<u64> = SkipSet::default();
+        let mut orphaned: Vec<TaskWaitKey> = Vec::new();
         for (key, state) in expired {
+            let owner_alive = os
+                .get_process(key.owner_pid)
+                .is_some_and(|proc| !matches!(proc.state, ProcessState::Terminated));
+            if !owner_alive {
+                orphaned.push(key);
+                continue;
+            }
             if !woken.insert(key.owner_pid) {
                 continue;
             }
@@ -746,8 +780,16 @@ pub(crate) fn wake_expired_task_waits() {
             append_task_progress_snapshots(&mut message, &key.task_ids);
             let _ = os.wake_process(key.owner_pid, message);
         }
-        Ok(())
-    });
+        Ok(orphaned)
+    })
+    .unwrap_or_default();
+
+    if !orphaned.is_empty() {
+        let mut states = TASK_WAIT_STATES.lock().unwrap();
+        for key in orphaned {
+            states.remove(&key);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

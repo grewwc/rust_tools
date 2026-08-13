@@ -3,7 +3,7 @@ use crate::ai::{
     history::{
         Message, SessionTitle, SessionTitleOrigin, compact_session_history_at_boundary_with_app,
         compact_session_history_with_app, generate_session_summary, is_low_quality_session_title,
-        normalize_generated_session_title, value_to_string,
+        is_runtime_synthetic_user_message, normalize_generated_session_title, value_to_string,
     },
     types::App,
 };
@@ -301,7 +301,12 @@ fn session_title_messages(
 
 fn has_session_title_source(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
-        message.role == "user" && !value_to_string(&message.content).trim().is_empty()
+        message.role == "user"
+            // 子代理证据交接等运行时合成的 user 消息不是真实轮次（AGENTS.md
+            // 不变式 12），不能作为标题来源；否则 agent-team 这类多子代理会话
+            // 会把交接内容当成用户意图，导致标题生成被污染。
+            && !is_runtime_synthetic_user_message(message)
+            && !value_to_string(&message.content).trim().is_empty()
     })
 }
 
@@ -309,7 +314,7 @@ fn has_session_title_source(messages: &[Message]) -> bool {
 fn fallback_session_title(messages: &[Message]) -> String {
     messages
         .iter()
-        .filter(|message| message.role == "user")
+        .filter(|message| message.role == "user" && !is_runtime_synthetic_user_message(message))
         .map(|message| value_to_string(&message.content))
         .map(|text| normalize_generated_session_title(&generate_session_summary(&text)))
         .find(|title| !title.is_empty())
@@ -572,10 +577,25 @@ async fn generate_session_title_if_missing(app: &App, pending_user_input: Option
         return;
     }
 
-    let generated_title = crate::ai::request::generate_session_title_via_model(app, &all_messages)
+    let model_title = crate::ai::request::generate_session_title_via_model(app, &all_messages)
         .await
-        .map(|title| normalize_generated_session_title(&title))
-        .filter(|title| !title.is_empty() && !is_low_quality_session_title(title));
+        .map(|title| normalize_generated_session_title(&title));
+
+    // 模型返回了标题但被质量过滤拒掉——这是「有请求、无结果」的静默路径，必须落
+    // 决策日志，否则无法区分传输失败与低质量回退（两者都表现为长期 fallback 标题）。
+    if let Some(title) = model_title.as_deref()
+        && (title.is_empty() || is_low_quality_session_title(title))
+    {
+        crate::ai::driver::decision_log::log_session_title_failure(
+            crate::ai::driver::decision_log::get_decision_log_store(),
+            &app.session_id,
+            crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+            "low_quality_filtered",
+            title,
+        );
+    }
+    let generated_title =
+        model_title.filter(|title| !title.is_empty() && !is_low_quality_session_title(title));
 
     // 网络请求期间，另一个进程可能已写入标题；重新读取后只在仍可升级时覆盖。
     let current = store
@@ -827,6 +847,27 @@ mod tests {
         assert_eq!(fallback_session_title(&messages), "修复标题显示延迟");
         assert!(has_session_title_source(&messages));
         assert!(!has_session_title_source(&[]));
+    }
+
+    #[test]
+    fn session_title_source_and_fallback_skip_runtime_synthetic_user_messages() {
+        use crate::ai::history::runtime_synthetic_user_message;
+
+        let synthetic = runtime_synthetic_user_message(Value::String(
+            "[Subagent evidence] 子代理交接内容...".to_string(),
+        ));
+        // 只有运行时合成 user 消息时，不能视为有真实标题来源
+        assert!(!has_session_title_source(&[synthetic.clone()]));
+
+        let real = Message {
+            role: "user".to_string(),
+            content: Value::String("修复 session title".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        assert!(has_session_title_source(&[synthetic, real.clone()]));
+        assert_eq!(fallback_session_title(&[real]), "修复 session title");
     }
 
     #[test]

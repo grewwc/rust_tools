@@ -8,8 +8,8 @@ rules in the nearest child `AGENTS.md`.
 ## Runtime layout
 
 - `config.rs` / `config_schema.rs`: config loading and schema
-- `models.rs` / `models.json`: model registry access, platform naming, metadata
-- `prompt/`: prompt assembly and multiline extraction
+- `models.rs` / `models.json` (repo root, read at runtime via `model_names.rs`; user override `~/.config/rust_tools/models.json`): model registry access, platform naming, metadata
+- `prompt.rs` / `prompt/`: prompt assembly and multiline extraction
 - `skills.rs` / `agents.rs`: skill + agent manifests; `builtin_agents/` holds `.agent`
   files and `builtin_skills/` holds builtin `.skill` files, both compiled in via `include_str!`
 - `driver/`: turn orchestration, prompt/tool loop, and skill runtime

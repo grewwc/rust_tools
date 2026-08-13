@@ -95,6 +95,11 @@ driver-owned infrastructure around them:
 20. **Scheduler blocking is event-driven.** Foreground waits, background-task
     completion, shutdown, and wall-clock deadlines wake the driver through the
     scheduler notifier; never restore fixed-interval polling sleeps in the main loop.
+    Subagent progress events are display-only: they may `notify_scheduler` to
+    refresh the foreground status line, but must never `wake_process` a parked
+    parent back to Ready — only completion (channel/futex events), the `task_wait`
+    wall-clock budget waker, and cancel may re-drive a parked parent, else every
+    throttled progress tick forces a full model turn that just re-parks (busy-spin).
 21. **Incomplete finals get one synthesis grace.** A tool-backed final that only
     promises another read/check is not completion: retry once with tools disabled
     (no reset of iteration/tool accounting). If a no-tool synthesis still emits a
@@ -104,8 +109,8 @@ driver-owned infrastructure around them:
     text streams live to the terminal as it arrives, including tool-round
     narration and candidate finals that a gate may later reject or warn on;
     terminal-only dedupe may suppress an exact replay of narration already shown
-    in the preceding tool round. Terminal output is a non-authoritative preview: the persisted
-    `assistant_text`/`turn_messages` remain the single source of truth for
+    in the preceding tool round. Terminal output is a non-authoritative preview: the
+    persisted `assistant_text`/`turn_messages` remain the single source of truth for
     history, context, and gate decisions, and rendering must never alter them.
 23. **Model-guided offloading is request-boundary work.** Before every logical
     model request, apply eligible prune marks to the transient `messages`

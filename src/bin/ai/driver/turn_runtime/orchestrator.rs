@@ -119,6 +119,22 @@ const PROGRESS_NO_PROGRESS_HARD_MARGIN: usize = 16;
 /// scoped instruction preflight 使用独立预算，不消耗正常工具迭代；上限防止模型
 /// 通过不断切换新目录无限延长单 turn。
 const MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS: usize = 8;
+
+#[derive(Default)]
+struct ScopedPreflightTargets {
+    required: Vec<std::path::PathBuf>,
+}
+
+impl ScopedPreflightTargets {
+    fn required(&self) -> &[std::path::PathBuf] {
+        &self.required
+    }
+
+    fn record_pause(&mut self, targets: Vec<std::path::PathBuf>) {
+        self.required = targets;
+    }
+}
+
 /// 变更类工具：调用这些动作（或产出 final text）即视为本轮有实质动作、算进展。
 const MUTATION_TOOL_NAMES: &[&str] = &[
     "apply_patch",
@@ -850,7 +866,11 @@ fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bool {
                 // 每次重试都会清零 no-progress 预算，使进展预算 loop guard 永远
                 // 攒不满窗口——模型可对同一个被拒路径反复 write_file / apply_patch
                 // 而不被收口（见 write blocked 循环）。结果缺失（None）保守计为
-                // 推进，避免把真实改动误判为无进展而过早停。
+                // 推进，避免把真实改动误判为无进展而过早停。temp write / dry-run
+                // 只改 session 临时态，不得让纯只读广度刹车永久失效。
+                if !tool_call_is_successful_mutation_candidate(tc) {
+                    return false;
+                }
                 match tool_results_by_call_id.get(tc.id.as_str()) {
                     Some(text) => matches!(
                         classify_tool_result_progress(text),
@@ -860,6 +880,45 @@ fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bool {
                 }
             }
             _ => true,
+        }
+    })
+}
+
+/// 纯只读广度硬停只应被真实项目修改关闭；plan / task 生命周期等虽然算任务进展，
+/// 但不能把后续无限串行扫描伪装成「读+改」实现任务。
+fn round_has_project_mutation(messages: &[crate::ai::history::Message]) -> bool {
+    let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
+        return false;
+    };
+    let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
+        return false;
+    };
+    let tool_results_by_call_id: FxHashMap<&str, &str> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| {
+            Some((
+                message.tool_call_id.as_deref()?,
+                message.content.as_str().unwrap_or_default(),
+            ))
+        })
+        .collect();
+    tool_calls.iter().any(|tool_call| {
+        let (project_mutation, _) = checkpoint_tool_call_effects(tool_call);
+        if !project_mutation {
+            return false;
+        }
+        match tool_call.function.name.as_str() {
+            "write_file" | "apply_patch" => tool_results_by_call_id
+                .get(tool_call.id.as_str())
+                .is_none_or(|text| {
+                    matches!(
+                        classify_tool_result_progress(text),
+                        ToolResultProgressStatus::Success
+                    )
+                }),
+            "execute_command" => true,
+            _ => false,
         }
     })
 }
@@ -1512,9 +1571,10 @@ struct ProgressLedger {
     ledger_injected: bool,
     hard_injected: bool,
     read_only_breadth_injected: bool,
-    /// 本 turn 是否发生过任何 mutation 动作。一旦为真，纯只读发散硬停永久让路
-    /// （「读+改」任务不受该刹车约束）。单调置位，不被 reset 清除。
-    observed_mutation_this_turn: bool,
+    /// 本 turn 是否发生过项目 mutation。一旦为真，纯只读发散硬停永久让路
+    /// （「读+改」任务不受该刹车约束）。plan / task 生命周期只算进展，不置位。
+    /// 单调置位，不被 reset 清除。
+    observed_project_mutation_this_turn: bool,
     /// 纯只读发散硬停的一次性门（`ReadOnlyBreadthHard` 只触发一次）。
     read_only_breadth_hard_injected: bool,
     /// 新的 low-progress episode 最早允许注入 soft 的迭代号。实质进展会重置当前
@@ -1749,6 +1809,7 @@ impl TurnSupervisor {
         // 新目标/变更动作后清空。同一目标返回新内容时只重置 Progress Budget，保留
         // exact/coarse detector 对重复翻页模式的一次性提醒能力。
         let round_had_mutation = round_has_mutation(progress_messages);
+        let round_had_project_mutation = round_has_project_mutation(progress_messages);
         let mut added_new_target = false;
         for t in extract_round_targets(progress_messages) {
             if self.progress.seen_targets.insert(t) {
@@ -1795,18 +1856,18 @@ impl TurnSupervisor {
             }
             self.progress.consecutive_no_progress = 0;
             self.progress.last_reasoning_fp = reasoning_fp;
-            // 记录本 turn 是否发生过 mutation：一旦有过实质变更，纯只读发散硬停
-            // 永久让路（seen_targets 增长在「读+改」任务里是正常工作面，不该收口）。
-            if round_had_mutation {
-                self.progress.observed_mutation_this_turn = true;
+            // 只有真实项目变更才永久关闭纯只读发散硬停。plan / task 生命周期虽是任务
+            // 进展，但不能让后续无限串行扫描绕过这个最终刹车。
+            if round_had_project_mutation {
+                self.progress.observed_project_mutation_this_turn = true;
             }
-            // 纯只读发散最后一道刹车：本 turn 从未 mutation，却已累计触碰远超广度
+            // 纯只读发散最后一道刹车：本 turn 从未修改项目，却已累计触碰远超广度
             // 阈值的不同只读目标仍未收口。`seen_targets` 单调、不被任何 reset 清空，
             // 因此这条判据与「新目标/新字节复位常规无进展计数」完全解耦，是唯一能
             // 兜住「持续换目标的纯调查发散」的信号。让位于普通 breadth 提示之后，
             // 只触发一次并强制收口。
             if !self.progress.read_only_breadth_hard_injected
-                && !self.progress.observed_mutation_this_turn
+                && !self.progress.observed_project_mutation_this_turn
                 && self.iteration > free_explore_rounds
                 && self.progress.seen_targets.len() >= READ_ONLY_BREADTH_HARD_STOP_TARGETS
             {
@@ -2086,16 +2147,24 @@ fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::history::Message>
 
 /// ReadOnly 广度检查：新目标仍算信息增益；这里只在目标面过宽时提醒先归纳，
 /// 不阻断工具，避免把大型排查任务误判为低进展。
-fn inject_read_only_breadth_note(messages: &mut Vec<crate::ai::history::Message>) {
+fn inject_read_only_breadth_note(
+    messages: &mut Vec<crate::ai::history::Message>,
+    agent_team_active: bool,
+) {
     use crate::ai::history::Message;
     use serde_json::Value;
+    let team_guidance = if agent_team_active {
+        "\nBecause `agent-team` is active, do not continue a broad serial sweep: delegate any genuinely independent remaining branches now, or state the concrete dependency that makes delegation unsafe."
+    } else {
+        ""
+    };
     let note = format!(
         "[read-only-breadth-check] You have already covered many different target resources in read-only analysis,\n\
         which may be a necessary broad sweep, or may have slid from filling key evidence into endlessly expanding branches.\n\
         Tools remain available; but before continuing, write down in at most 6 lines:\n\
         1) confirmed facts (at most 3); 2) current conclusion or most likely explanation;\n\
         3) the single still-missing key evidence; 4) the single next tool action.\n\
-        If you can already answer, give the conclusion directly instead of expanding the search surface just to re-confirm. {SELF_NOTE_REFLECTION_CHANNEL_HINT}"
+        If you can already answer, give the conclusion directly instead of expanding the search surface just to re-confirm.{team_guidance} {SELF_NOTE_REFLECTION_CHANNEL_HINT}"
     );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -2280,6 +2349,16 @@ mod tests {
             supervisor.effective_max_iterations(1),
             1 + MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS
         );
+    }
+
+    #[test]
+    fn scoped_preflight_targets_survive_intervening_prompt_rebuilds() {
+        let target = std::path::PathBuf::from("src/bin/ai/driver/turn_runtime/orchestrator.rs");
+        let mut targets = ScopedPreflightTargets::default();
+        targets.record_pause(vec![target.clone()]);
+
+        assert_eq!(targets.required(), [target.as_path()]);
+        assert_eq!(targets.required(), [target.as_path()]);
     }
 
     #[test]
@@ -3149,6 +3228,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_team_temp_write_does_not_disable_read_only_progress_guard() {
+        let temp_write_round = checkpoint_tool_round(
+            "temp-write",
+            "write_file",
+            serde_json::json!({
+                "file_path": "probe.py",
+                "content": "print('ok')\n",
+                "temp": true,
+            }),
+            "File written successfully",
+        );
+
+        assert!(!round_has_mutation(&temp_write_round));
+    }
+
+    #[test]
+    fn agent_team_delegation_does_not_disable_read_only_progress_guard() {
+        let mut messages = checkpoint_tool_round(
+            "spawn-1",
+            "task_spawn",
+            serde_json::json!({
+                "description": "inspect independent branch",
+                "prompt": "Inspect one independent branch and report evidence.",
+            }),
+            r#"{"task_id":"child-1"}"#,
+        );
+        assert!(round_has_mutation(&messages));
+        assert!(!round_has_project_mutation(&messages));
+
+        let mut supervisor = TurnSupervisor::default();
+        supervisor.next_iteration();
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(matches!(signal, ToolLoopSignal::None));
+        assert!(!supervisor.progress.observed_project_mutation_this_turn);
+
+        let mut hard_stopped = false;
+        for i in 1..=(READ_ONLY_BREADTH_HARD_STOP_TARGETS + 4) {
+            supervisor.next_iteration();
+            pb_successful_read_round(
+                &mut messages,
+                &format!("src/after_delegation_{i}.rs"),
+                0,
+                &format!("read-{i}"),
+                &format!("independent evidence {i}"),
+            );
+            let signal =
+                supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            if matches!(signal, ToolLoopSignal::ReadOnlyBreadthHard) {
+                hard_stopped = true;
+                break;
+            }
+        }
+        assert!(
+            hard_stopped,
+            "delegation is progress, but must not permanently disable the read-only breadth ceiling"
+        );
+    }
+
+    #[test]
+    fn agent_team_read_only_breadth_note_redirects_to_delegation() {
+        let mut team_messages = Vec::new();
+        inject_read_only_breadth_note(&mut team_messages, true);
+        let team_note = team_messages[0]
+            .content
+            .as_str()
+            .expect("breadth note should be text");
+        assert!(team_note.contains("`agent-team` is active"));
+        assert!(team_note.contains("delegate any genuinely independent remaining branches"));
+
+        let mut ordinary_messages = Vec::new();
+        inject_read_only_breadth_note(&mut ordinary_messages, false);
+        let ordinary_note = ordinary_messages[0]
+            .content
+            .as_str()
+            .expect("breadth note should be text");
+        assert!(!ordinary_note.contains("`agent-team` is active"));
+    }
+
     // ===== Progress Budget（行为信号进展预算）测试 =====
     // 这些用例都刻意让每轮工具签名各不相同（不同 path），从而绕过 exact/coarse
     // 「签名重复」检测，专门验证第三层 assess_progress 的「信息增益」判定：成功的
@@ -3495,7 +3653,7 @@ mod tests {
     fn progress_budget_breadth_hard_stop_never_fires_after_mutation() {
         let mut supervisor = TurnSupervisor::default();
         let mut messages = Vec::new();
-        // 第 1 轮就做一次成功 mutation，置位 observed_mutation_this_turn。
+        // 第 1 轮就做一次成功项目 mutation，置位 observed_project_mutation_this_turn。
         supervisor.next_iteration();
         messages.push(pb_apply_patch_msg("patch-1"));
         messages.push(pb_tool_result(
@@ -3503,7 +3661,7 @@ mod tests {
             "Successfully patched src/lib.rs; +3 -1 (2 lines)",
         ));
         let _ = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
-        assert!(supervisor.progress.observed_mutation_this_turn);
+        assert!(supervisor.progress.observed_project_mutation_this_turn);
 
         // 随后大量只读探索远超硬停阈值，也绝不能触发 ReadOnlyBreadthHard。
         for i in 1..=(READ_ONLY_BREADTH_HARD_STOP_TARGETS + 8) {
@@ -4538,9 +4696,10 @@ async fn run_turn_body(
     // 摘要而按用户决定保留原图——两种情况都不再每轮重试，避免反复发兜底请求。
     let mut pending_digest_source: Option<String> = None;
     let mut image_digest_resolved = false;
-    // preflight 拒绝的 mutation 目标必须在下一次 prompt 重建时优先获得 scoped
-    // 指令预算；不能再与本轮所有历史读取目标竞争，否则会稳定重复暂停。
-    let mut pending_scoped_project_targets = Vec::new();
+    // preflight 拒绝的 mutation 目标必须在本 turn 后续每次 prompt 重建时优先获得
+    // scoped 指令预算；不能只消费一次，因为中间读取和 mid-turn 压缩可能让同一
+    // mutation 的目标从可观测历史消失，继而被重复暂停。
+    let mut scoped_preflight_targets = ScopedPreflightTargets::default();
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         let effective_max_iterations = supervisor.effective_max_iterations(max_iterations);
@@ -4588,7 +4747,6 @@ async fn run_turn_body(
         }
         {
             let mc = mcp_client.lock().unwrap();
-            let required_project_targets = std::mem::take(&mut pending_scoped_project_targets);
             let scoped_project_instructions_ready = refresh_skill_turn_for_iteration(
                 app,
                 &mc,
@@ -4596,11 +4754,11 @@ async fn run_turn_body(
                 &question,
                 iteration,
                 &mut skill_turn,
-                &required_project_targets,
+                scoped_preflight_targets.required(),
                 &mut messages,
             );
             if !scoped_project_instructions_ready {
-                let targets = required_project_targets
+                let targets = scoped_preflight_targets.required()
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
@@ -4869,7 +5027,7 @@ async fn run_turn_body(
             match step {
                 TurnLoopStep::ScopedPreflightContinue(targets) => {
                     if supervisor.grant_scoped_preflight_grace() {
-                        pending_scoped_project_targets = targets;
+                        scoped_preflight_targets.record_pause(targets);
                         // 该轮没有执行 mutation，也不应计入 progress/loop 统计。
                         continue 'turn;
                     }
@@ -5093,7 +5251,11 @@ async fn run_turn_body(
                     "agent-health",
                     "read-only analysis breadth is high: requesting evidence summary before expanding further",
                 );
-                inject_read_only_breadth_note(&mut messages);
+                let agent_team_active = skill_turn
+                    .matched_skill_names()
+                    .iter()
+                    .any(|name| name == "agent-team");
+                inject_read_only_breadth_note(&mut messages, agent_team_active);
             }
             ToolLoopSignal::LowProgressHard => {
                 crate::ai::driver::print::print_tool_note_line(

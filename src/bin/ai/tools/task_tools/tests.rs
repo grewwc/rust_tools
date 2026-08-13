@@ -9,8 +9,9 @@ use super::{
     execute_task_status, execute_task_wait, expire_task_wait_states_for_test,
     format_task_result_with_id, insert_task_entry_for_test, is_encoded_task_goal,
     is_retryable_task_status, parse_task_wait_options, prepare_subagent_task,
-    reap_timed_out_subagents, register_retry_spec, remove_task_entry,
-    render_outstanding_task_anchor, select_subagent, validate_subagent_response,
+    reap_timed_out_subagents, record_subagent_progress_update, register_retry_spec,
+    remove_task_entry, render_outstanding_task_anchor, select_subagent,
+    task_wait_state_count_for_test, validate_subagent_response,
     wait_sources_for_channel_and_futex, wake_expired_task_waits, with_task_entry_by_pid,
     wrap_subagent_prompt,
 };
@@ -1312,7 +1313,6 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
             started_at: Instant::now(),
         },
     );
-
     let parked = crate::ai::driver::runtime_ctx::TURN_IDENTITY
         .sync_scope((app.session_id.clone(), 0usize), || {
             execute_task_wait(&serde_json::json!({
@@ -1322,8 +1322,9 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
         })
         .expect("first task_wait should park");
     assert!(parked.contains("[task_wait PARKED]"));
-    assert!(parked.contains("Latest progress snapshots:"));
-    assert!(parked.contains(&format!("- {task_id}: starting")));
+    let scheduler_wake_after = super::next_task_wait_wakeup_delay()
+        .expect("parked task_wait must expose its wall-clock deadline to the scheduler");
+    assert!(scheduler_wake_after <= Duration::from_secs(1));
 
     expire_task_wait_states_for_test();
     wake_expired_task_waits();
@@ -1336,13 +1337,10 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
             proc.state,
             aios_kernel::kernel::ProcessState::Ready
         ));
-        let timeout_message = proc
-            .mailbox
+        proc.mailbox
             .iter()
             .find(|message| message.contains("[TASK_WAIT_TIMEOUT]"))
             .expect("timeout wake-up message should be queued");
-        assert!(timeout_message.contains("Latest progress snapshots:"));
-        assert!(timeout_message.contains(&format!("- {task_id}: starting")));
         let resumed = os
             .pop_foreground_ready()
             .expect("expired wait should wake owner");
@@ -1359,8 +1357,6 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
         .expect("expired task_wait should report budget elapsed");
     assert!(elapsed.contains("[task_wait BUDGET ELAPSED]"));
     assert!(!elapsed.contains("[task_wait PARKED]"));
-    assert!(elapsed.contains("Latest progress snapshots:"));
-    assert!(elapsed.contains(&format!("- {task_id}: starting")));
 
     assert!(remove_task_entry(&task_id).is_some());
     let mut os = app.os.lock().unwrap();
@@ -1445,7 +1441,6 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
     assert!(output.contains("Completed task results below (already collected"));
     assert!(output.contains("subagent final answer"));
     assert!(output.contains("COMPLETED"));
-    assert!(output.contains(&format!("progress[{task_id}]: starting")));
     assert!(remove_task_entry(&task_id).is_none());
 
     let os = app.os.lock().unwrap();
@@ -2212,4 +2207,213 @@ fn outstanding_task_anchor_lists_ids_and_required_follow_up() {
     assert!(note.contains("progress: running command · plan: inspect parser"));
     assert!(note.contains("task_id=task_beta status=completed"));
     assert!(note.contains("use `task_wait` with the same task_ids"));
+}
+
+#[test]
+fn subagent_progress_update_never_wakes_parked_parent() {
+    // 回归 agent-team fan-out 卡死：进度事件曾用 wake_process 把已 park 的父代理拨回
+    // Ready，逼它每 15s 跑一整轮模型只为再 park 一次（前台忙等自旋）。修复后进度
+    // 事件只刷新状态行，绝不改变父代理调度态。
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (owner_pid, child_pid, channel, futex) = {
+        let mut os = app.os.lock().unwrap();
+        let owner_pid = os.begin_foreground("owner".to_string(), "goal".to_string(), 10, 8, None);
+        let child_pid = os
+            .spawn(
+                Some(owner_pid),
+                "pending-child".to_string(),
+                "pending goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let channel = os.channel_create(Some(child_pid), 1, "pending-result".to_string());
+        let futex = os.futex_create(0, "pending-complete".to_string());
+        // 让 owner 真正进入 Waiting：等待一个永不完成的独立事件（模拟 task_wait park）。
+        os.set_current_pid(Some(owner_pid));
+        let park_event = os.futex_event_id(futex).expect("futex has an event id");
+        os.wait_on_events(vec![park_event], WaitPolicy::All, None)
+            .expect("owner should park on the pending event");
+        (owner_pid, child_pid, channel.raw(), futex)
+    };
+
+    insert_task_entry_for_test(
+        task_id.clone(),
+        AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            result_observed: false,
+            owner_pid,
+            pid: child_pid,
+            result_channel_id: channel,
+            completion_futex_addr: futex,
+            description: "pending task".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+        },
+    );
+
+    // 首次进度事件（未节流，一定 notify）：修复后只应刷新状态行，不得动 owner。
+    record_subagent_progress_update(
+        &task_id,
+        &progress_snapshot(1, 5, "calling model"),
+        SubagentProgressEventKind::Phase,
+    );
+
+    {
+        let os = app.os.lock().unwrap();
+        let proc = os
+            .get_process(owner_pid)
+            .expect("owner process should still exist");
+        assert!(
+            matches!(proc.state, aios_kernel::kernel::ProcessState::Waiting { .. }),
+            "progress update must NOT flip a parked parent to Ready (was {:?})",
+            proc.state
+        );
+        assert!(
+            !proc
+                .mailbox
+                .iter()
+                .any(|message| message.contains("[TASK_PROGRESS]")),
+            "progress update must not inject a wake-up mailbox message into a parked parent"
+        );
+    }
+
+    assert!(remove_task_entry(&task_id).is_some());
+    let mut os = app.os.lock().unwrap();
+    os.set_current_pid(Some(owner_pid));
+    os.kill_process(child_pid, "test cleanup".to_string())
+        .unwrap();
+    drop(os);
+    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        *guard = None;
+    }
+}
+
+#[test]
+fn wake_expired_task_waits_reaps_orphaned_state_when_owner_gone() {
+    // 回归「expired 未回收」缺口：owner 已终止但 wait state 仍在，此前 wake_process
+    // 落空、状态以 expired=true 永久滞留（内存泄漏 + 再无清理路径）。修复后 waker
+    // 检测到 owner 已不存在/终止即删除该孤儿状态，自愈。
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (supervisor_pid, owner_pid, child_pid, channel, futex) = {
+        let mut os = app.os.lock().unwrap();
+        // supervisor 作为 foreground root，owner 挂在它下面——这样 supervisor 可以
+        // 合法终止 owner（kill_process 只允许终止自己的后代），模拟父代理异常退出。
+        let supervisor_pid =
+            os.begin_foreground("supervisor".to_string(), "goal".to_string(), 10, 8, None);
+        let owner_pid = os
+            .spawn(
+                Some(supervisor_pid),
+                "owner".to_string(),
+                "owner goal".to_string(),
+                20,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        let child_pid = os
+            .spawn(
+                Some(owner_pid),
+                "pending-child".to_string(),
+                "pending goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let channel = os.channel_create(Some(child_pid), 1, "pending-result".to_string());
+        let futex = os.futex_create(0, "pending-complete".to_string());
+        // execute_task_wait 按 current pid 记账 owner；切到 owner 建立 wait state。
+        os.set_current_pid(Some(owner_pid));
+        (supervisor_pid, owner_pid, child_pid, channel.raw(), futex)
+    };
+
+    insert_task_entry_for_test(
+        task_id.clone(),
+        AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            result_observed: false,
+            owner_pid,
+            pid: child_pid,
+            result_channel_id: channel,
+            completion_futex_addr: futex,
+            description: "pending task".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+        },
+    );
+
+    // 建立一条 parked wait state，然后强制过期。
+    let parked = crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .sync_scope((app.session_id.clone(), 0usize), || {
+            execute_task_wait(&serde_json::json!({
+                "task_ids": [task_id.clone()],
+                "timeout_secs": 1,
+            }))
+        })
+        .expect("first task_wait should park");
+    assert!(parked.contains("[task_wait PARKED]"));
+    assert!(
+        task_wait_state_count_for_test() >= 1,
+        "parked task_wait must record a wait state"
+    );
+
+    // owner 终止：模拟父代理在 park 后异常退出，留下孤儿 wait state。
+    // kill_process 只允许终止自己的后代，故从 supervisor（owner 的父）发起终止。
+    {
+        let mut os = app.os.lock().unwrap();
+        os.set_current_pid(Some(supervisor_pid));
+        os.kill_process(owner_pid, "owner gone".to_string())
+            .unwrap();
+    }
+
+    expire_task_wait_states_for_test();
+    wake_expired_task_waits();
+
+    assert_eq!(
+        task_wait_state_count_for_test(),
+        0,
+        "orphaned wait state (terminated owner) must be reaped, not left lingering"
+    );
+
+    let _ = remove_task_entry(&task_id);
+    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        *guard = None;
+    }
 }

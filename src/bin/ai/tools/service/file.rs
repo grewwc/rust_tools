@@ -201,7 +201,24 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     };
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
-    let start = offset.saturating_sub(1).min(total);
+    // offset 越界或文件为空时不能静默返回空串：模型会把「空结果」误判为
+    // 「文件为空」，进而得出错误结论（历史会话曾把归档文件读成空后反复重试）。
+    // 这里显式区分两种异常情况，正常分页路径保持原有行为。
+    if total == 0 {
+        return Ok(
+            "... [note: file is empty (0 lines); read_file returned no lines. \
+Verify the path or use execute_command to inspect the file.]"
+                .to_string(),
+        );
+    }
+    if offset > total {
+        return Ok(format!(
+            "... [note: offset {offset} is beyond the end of file (total: {total} lines); \
+no lines shown. Continue with offset=1 to read from the start, or offset={total} \
+to read the last line.]"
+        ));
+    }
+    let start = offset.saturating_sub(1);
     let end = (start + limit).min(total);
 
     // 默认带行号（grounding 轴）；use_line_numbers=false 时返回原始内容，
@@ -400,6 +417,54 @@ mod tests {
             assert!(output.contains("Hello, integration test!"));
             assert!(output.contains("Line 2"));
             assert!(output.contains("Line 3"));
+        });
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_offset_beyond_eof_returns_diagnostic() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("offset_beyond_eof");
+        fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        let base = path.parent().unwrap().to_path_buf();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base, || {
+            let read_args = serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "offset": 99,
+                "limit": 10
+            });
+            let read_result = execute_read_file(&read_args);
+            assert!(read_result.is_ok(), "read failed: {:?}", read_result);
+            let output = read_result.unwrap();
+            // 修复前 offset 越界会静默返回 ""，模型误判为「文件为空」；
+            // 现在必须返回带总行数的明确诊断。
+            assert!(output.contains("beyond the end of file"), "{output}");
+            assert!(output.contains("total: 3"), "{output}");
+        });
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_empty_file_returns_diagnostic() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("empty_file");
+        fs::write(&path, "").unwrap();
+        let base = path.parent().unwrap().to_path_buf();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base, || {
+            let read_args = serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "offset": 1,
+                "limit": 100
+            });
+            let read_result = execute_read_file(&read_args);
+            assert!(read_result.is_ok(), "read failed: {:?}", read_result);
+            let output = read_result.unwrap();
+            assert!(output.contains("empty"), "{output}");
+            assert!(!output.is_empty(), "must not silently return empty");
         });
 
         let _ = fs::remove_file(&path);

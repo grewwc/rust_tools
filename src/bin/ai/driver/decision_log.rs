@@ -33,6 +33,8 @@ pub enum DecisionType {
     ReflectionTrigger,
     /// 调度器分发与评估
     SchedulerDispatch,
+    /// 会话标题等辅助 LLM 任务
+    SessionTitle,
 }
 
 /// 决策记录
@@ -528,6 +530,35 @@ pub fn log_scheduler_dispatch(
             } else {
                 "scheduler decision indicates risk".to_string()
             },
+            user_feedback: None,
+        }),
+        execution_time_ms: None,
+    });
+}
+
+/// 辅助函数：记录会话标题生成失败（传输/HTTP/解析/低质量被拒等静默路径）。
+/// 标题生成失败历史上只留注释掉的 eprintln，用户无法区分「请求超时」与
+/// 「模型返回了但被质量过滤拒掉」，导致 session 长期停留在 fallback 标题而不可观测。
+pub fn log_session_title_failure(
+    store: &DecisionLogStore,
+    session_id: &str,
+    turn_id: usize,
+    reason: &str,
+    detail: &str,
+) {
+    store.log(DecisionLog {
+        timestamp: 0,
+        session_id: session_id.to_string(),
+        turn_id,
+        decision_type: DecisionType::SessionTitle,
+        context: "session_title_generation".to_string(),
+        alternatives_considered: vec!["fallback_title".to_string()],
+        chosen_option: "fallback_title".to_string(),
+        reasoning: reason.to_string(),
+        confidence: None,
+        outcome: Some(Outcome {
+            success: false,
+            message: detail.to_string(),
             user_feedback: None,
         }),
         execution_time_ms: None,

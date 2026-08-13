@@ -40,7 +40,15 @@ pub(super) fn read_recent_history(app: &App) -> Vec<crate::ai::history::Message>
 }
 
 pub(super) fn note_search_interactive_mode(cli: &ParsedCli) -> bool {
-    cli.note_search && cli.interactive
+    if !cli.note_search {
+        return false;
+    }
+    if cli.interactive {
+        return true;
+    }
+    // `a -ns` 不带实质查询内容（空白符不算）时自动进入交互模式，等同 `a -ns -i`；
+    // 带查询内容时才保持 one-shot 单轮检索。
+    !cli.args.iter().any(|arg| !arg.trim().is_empty())
 }
 
 /// 如果剪贴板有图片，使用视觉模型理解内容；
@@ -1328,6 +1336,37 @@ pub(super) async fn handle_note_edit(
 mod tests {
     use super::*;
     use crate::ai::history::Message;
+
+    #[test]
+    fn note_search_mode_detection() {
+        // `a -ns xxx`：带查询内容 → one-shot 单轮检索。
+        let one_shot = crate::ai::cli::parse_cli_args(
+            vec!["a".to_string(), "-ns".to_string(), "trait object".to_string()].into_iter(),
+        );
+        assert!(one_shot.note_search);
+        assert!(!note_search_interactive_mode(&one_shot));
+
+        // `a -ns`：无实质内容 → 自动进入交互模式（等同 `a -ns -i`）。
+        let auto = crate::ai::cli::parse_cli_args(vec!["a".to_string(), "-ns".to_string()].into_iter());
+        assert!(auto.note_search);
+        assert!(note_search_interactive_mode(&auto));
+
+        // 空白/空字符串不算内容。
+        let blank = crate::ai::cli::parse_cli_args(
+            vec!["a".to_string(), "-ns".to_string(), "   ".to_string()].into_iter(),
+        );
+        assert!(note_search_interactive_mode(&blank));
+
+        // `a -ns -i`：显式交互模式，保持原语义。
+        let explicit = crate::ai::cli::parse_cli_args(
+            vec!["a".to_string(), "-ns".to_string(), "-i".to_string()].into_iter(),
+        );
+        assert!(note_search_interactive_mode(&explicit));
+
+        // 未开启 -ns：即使无内容也不是 notebook 检索交互模式。
+        let no_ns = crate::ai::cli::parse_cli_args(vec!["a".to_string()].into_iter());
+        assert!(!note_search_interactive_mode(&no_ns));
+    }
 
     #[test]
     fn note_search_followup_query_includes_recent_history() {

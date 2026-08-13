@@ -141,7 +141,7 @@ impl AiConfig {
 
     // ── Token usage stats ──────────────────────────────────
     /// When true, persist the per-session DecisionLog sidecar JSONL file.
-    /// Default false; the in-memory DecisionLogStore remains enabled.
+    /// Default true; the in-memory DecisionLogStore remains enabled.
     pub const DECISION_LOG_PERSIST_ENABLE: &str = "ai.decision_log.persist.enable";
     /// When false, disable recording LLM token usage to the SQLite stats
     /// table. Default true.
