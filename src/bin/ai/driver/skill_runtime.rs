@@ -184,7 +184,54 @@ impl SkillTurnGuard {
 
     pub(super) fn context_reminder(&mut self) -> Option<String> {
         if self.cached_context_reminder.is_none() {
-            self.cached_context_reminder = Some(self.builder.render_context_reminder());
+            let mut parts: Vec<String> = Vec::new();
+            // 活动 skill 的"末尾指针"：长上下文（多轮对话 + 工具循环）下 system
+            // prompt 位于上下文最前，skill 指令容易被长中间段稀释；在最后一个 user
+            // 消息开头注入一条简短指针，把"turn 开始时生效的 skill 名单（快照）"
+            // 重新锚定到请求附近（近因位置），保证模型在长上下文里仍按 skill 契约
+            // 执行。指针刻意用 "at turn start" 而非 "for this turn"：user 消息只在
+            // turn 开头构建一次，而 mid-turn 可通过 activate_skill/deactivate_skill
+            // 变更生效集，快照式表述保证指针永不为假；当前生效集一律以 system
+            // prompt 的 [Skill instructions]（每 iteration 重建、权威、可命中缓存）
+            // 为准。本指针只进请求投影（turn_messages 不含 reminder），且当前 user
+            // 消息本就是 cache miss，故不破坏上游 prompt cache。仅当有活动 skill
+            // 时注入。
+            if !self.matched_skill_names.is_empty() {
+                let mut pointer = String::new();
+                if self.matched_skill_names.len() == 1 {
+                    pointer.push_str(&format!(
+                        "Active skill at turn start: {}.\n",
+                        self.matched_skill_names[0]
+                    ));
+                    pointer.push_str(
+                        "Treat its instructions in the system prompt's [Skill instructions] \
+                         section as the primary behavior contract for this turn.",
+                    );
+                } else {
+                    pointer.push_str(
+                        "Active skills at turn start (in activation order, first is primary):\n",
+                    );
+                    for (i, name) in self.matched_skill_names.iter().enumerate() {
+                        use std::fmt::Write;
+                        let _ = writeln!(pointer, "  {}. {}", i + 1, name);
+                    }
+                    pointer.push_str(
+                        "Treat their instructions in the system prompt's [Skill instructions] \
+                         section as the primary behavior contract for this turn; when they \
+                         conflict, later skills override earlier ones, except that guardrails \
+                         always take precedence.",
+                    );
+                }
+                parts.push(format!("<system-reminder>\n{}\n</system-reminder>", pointer));
+            }
+            if let Some(rest) = self.builder.render_context_reminder() {
+                parts.push(rest);
+            }
+            self.cached_context_reminder = Some(if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            });
         }
         self.cached_context_reminder.clone().flatten()
     }
@@ -2854,6 +2901,61 @@ mod tests {
         });
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_reminder_injects_active_skill_pointer_into_user_message_reminder() {
+        let mut guard = super::SkillTurnGuard {
+            restore_agent_context: None,
+            builder: SystemPromptBuilder::new(),
+            cached_system_prompt: None,
+            cached_context_reminder: None,
+            matched_skill_names: vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+            ],
+        };
+        let reminder = guard
+            .context_reminder()
+            .expect("reminder should be present with active skills");
+        assert!(reminder.contains("<system-reminder>"));
+        assert!(reminder.contains(
+            "Active skills at turn start (in activation order, first is primary):"
+        ));
+        assert!(reminder.contains("  1. alpha"));
+        assert!(reminder.contains("  2. beta"));
+        assert!(reminder.contains("  3. gamma"));
+        assert!(reminder.contains("[Skill instructions]"));
+        assert!(reminder.contains("primary behavior contract for this turn"));
+    }
+
+    #[test]
+    fn context_reminder_single_active_skill_uses_singular_pointer() {
+        let mut guard = super::SkillTurnGuard {
+            restore_agent_context: None,
+            builder: SystemPromptBuilder::new(),
+            cached_system_prompt: None,
+            cached_context_reminder: None,
+            matched_skill_names: vec!["solo".to_string()],
+        };
+        let reminder = guard
+            .context_reminder()
+            .expect("reminder should be present with an active skill");
+        assert!(reminder.contains("Active skill at turn start: solo."));
+        assert!(!reminder.contains("in activation order"));
+    }
+
+    #[test]
+    fn context_reminder_omits_skill_pointer_without_active_skills() {
+        let mut guard = super::SkillTurnGuard {
+            restore_agent_context: None,
+            builder: SystemPromptBuilder::new(),
+            cached_system_prompt: None,
+            cached_context_reminder: None,
+            matched_skill_names: Vec::new(),
+        };
+        assert!(guard.context_reminder().is_none());
     }
 
     #[test]
