@@ -49,6 +49,13 @@ const TOOL_LOOP_HARD_WINDOW: usize = 6;
 const TOOL_LOOP_COARSE_WINDOW: usize = 5;
 const TOOL_LOOP_COARSE_HARD_WINDOW: usize = 8;
 const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_COARSE_HARD_WINDOW + 2;
+/// 同目标「从头重读」重扫检测阈值。翻页+换页宽+混轮循环（同一文件反复从文件头
+/// 开始读，offset/limit/页宽每轮都变，整轮签名永不相等）绕过了 exact/coarse/
+/// target 三道整轮检测；这里按目标累计「从文件头开始读」的次数——第 3 次注入
+/// 软提示，第 4 次硬停止。write_file/apply_patch 修改该目标会清零（编辑后从头
+/// 重读验证是合法行为）。计数不随 soft 清空、不被 made_progress 重置。
+const TARGET_RESCAN_SOFT_THRESHOLD: u32 = 3;
+const TARGET_RESCAN_HARD_THRESHOLD: u32 = 4;
 const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
 
 /// 计算 coarse 签名时需剥离的「易变翻页/窗口」参数键。剥离后同一文件的不同
@@ -660,6 +667,36 @@ fn normalize_generic_shell_segment(program: &str, tokens: &[String]) -> String {
     }
 }
 
+/// 判断 shell 参数 token 是否是「翻页/窗口」类数字字面量：纯数字、+N/−N 字节
+/// 偏移、sed/awk 行号区间（1,40p / 40,80 / 5p / 1,$p）。这类字面量只描述读哪个
+/// 窗口，不是目标资源本身。coarse 签名里保留它们会让「同一文件换窗口翻页」的
+/// 每轮签名互不相同，使 coarse / target-repeat 两道检测都抓不到翻页循环——这与
+/// read_file 的 offset/limit 被 strip_volatile_args 剥离同理。剥掉后，
+/// `tail -c +2401 f | head -c 2400` 与 `tail -c +2402 f | head -c 1400`
+/// 折叠为同一签名 `tail:f`，翻页循环即可被粗粒度检测命中。其余非数字字面量
+/// （version2、s/foo/bar/g 等）不受影响。
+fn is_numeric_window_literal(token: &str) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    let body = token.trim_start_matches(['+', '-']);
+    if !body.is_empty() && body.chars().all(|ch| ch.is_ascii_digit()) {
+        return true;
+    }
+    // sed/awk 行号区间或命令尾字母：仅当 token 由「数字 + 可选逗号/$ + 少数命令
+    // 尾字母」构成时才算窗口字面量，其余（如 version2）保留。
+    let mut saw_digit = false;
+    for (idx, ch) in token.chars().enumerate() {
+        match ch {
+            '0'..='9' => saw_digit = true,
+            ',' | '$' => {}
+            'p' | 'd' | 'q' | 's' | 'g' | 'w' | 'a' | 'i' | 'c' if idx > 0 && saw_digit => {}
+            _ => return false,
+        }
+    }
+    saw_digit
+}
+
 fn collect_shell_target_tokens(
     tokens: &[String],
     start: usize,
@@ -686,7 +723,7 @@ fn collect_shell_target_tokens(
             out.push(normalize_path_like_token(token));
             continue;
         }
-        if keep_literals && !token.chars().all(|ch| ch.is_ascii_digit()) {
+        if keep_literals && !is_numeric_window_literal(token) {
             out.push(token.to_string());
         }
     }
@@ -1449,6 +1486,124 @@ fn extract_round_evidence_fingerprints(messages: &[crate::ai::history::Message])
     fingerprints
 }
 
+/// 归一化重扫检测的目标路径：去掉 `./` 前缀后与目标提取共用同一归一路径。
+fn normalize_rescan_path(path: &str) -> String {
+    normalize_path_like_token(path.strip_prefix("./").unwrap_or(path))
+}
+
+/// 命令是否「从文件头开始读」（整体读取，或从第 1 行 / 第 1 字节开始的分页）。
+fn command_reads_from_top(cmd: &str) -> bool {
+    let cmd = cmd.trim_start();
+    for prefix in ["cat ", "head ", "less ", "more ", "view ", "nl "] {
+        if cmd.starts_with(prefix) {
+            return true;
+        }
+    }
+    // tail -c +1 / tail -n +1：从开头分页；tail -c +2401 等从中间开始，不算。
+    if let Some(rest) = cmd.strip_prefix("tail ") {
+        let mut tokens = rest.split_whitespace();
+        if matches!(tokens.next(), Some("-c") | Some("-n")) && tokens.next() == Some("+1") {
+            return true;
+        }
+    }
+    // sed -n '1,40p' / sed -n "1,40p" / sed -n 1,40p：从第 1 行开始。
+    if let Some(rest) = cmd.strip_prefix("sed ") {
+        if let Some(expr) = rest.trim_start().strip_prefix("-n ") {
+            let expr = expr.trim_start();
+            let expr = expr
+                .strip_prefix('\'')
+                .or_else(|| expr.strip_prefix('"'))
+                .unwrap_or(expr);
+            return expr.starts_with("1,") || expr.starts_with("1;");
+        }
+    }
+    false
+}
+
+/// 命令中第一个路径 token（用于确定「从头重读」的目标文件）。
+fn first_path_token(cmd: &str) -> Option<String> {
+    cmd.split_whitespace()
+        .find(|token| looks_like_path_token(token) || token.contains('.'))
+        .map(|token| token.trim_matches(['\'', '"', '`']).to_string())
+}
+
+/// 提取最近一轮「从文件头开始读」的目标路径：read_file 的 offset 缺省/0/1；
+/// execute_command 中 cat/head/less/more/view/nl/tail -c +1/sed -n 1, 等。
+fn extract_round_from_top_read_targets(messages: &[crate::ai::history::Message]) -> Vec<String> {
+    use serde_json::Value;
+    let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
+        return Vec::new();
+    };
+    let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for call in tool_calls.iter() {
+        let Ok(args) = serde_json::from_str::<Value>(call.function.arguments.as_str()) else {
+            continue;
+        };
+        let Some(map) = args.as_object() else {
+            continue;
+        };
+        match call.function.name.as_str() {
+            "read_file" => {
+                let Some(path) = ["file_path", "path"]
+                    .iter()
+                    .find_map(|key| map.get(*key).and_then(|v| v.as_str()))
+                else {
+                    continue;
+                };
+                let offset = map.get("offset").and_then(|v| v.as_i64());
+                if offset.is_none() || offset == Some(0) || offset == Some(1) {
+                    out.push(normalize_rescan_path(path));
+                }
+            }
+            "execute_command" => {
+                let Some(command) = map.get("command").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if command_reads_from_top(command) {
+                    if let Some(path) = first_path_token(command) {
+                        out.push(normalize_rescan_path(&path));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 提取最近一轮被 write_file/apply_patch 直接修改的目标路径（修改后从头重读
+/// 属于合法验证，应清零重扫计数）。
+fn extract_round_mutated_targets(messages: &[crate::ai::history::Message]) -> Vec<String> {
+    use serde_json::Value;
+    let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
+        return Vec::new();
+    };
+    let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for call in tool_calls.iter() {
+        if !is_direct_file_mutation_tool(&call.function.name) {
+            continue;
+        }
+        let Ok(args) = serde_json::from_str::<Value>(call.function.arguments.as_str()) else {
+            continue;
+        };
+        let Some(map) = args.as_object() else {
+            continue;
+        };
+        for key in ["file_path", "path"] {
+            if let Some(path) = map.get(key).and_then(|v| v.as_str()) {
+                out.push(normalize_rescan_path(path));
+            }
+        }
+    }
+    out
+}
+
 /// 稳定的「无进展」软阈值。免费探索区内返回 usize::MAX（永不触发）。
 ///
 /// 旧逻辑会在长任务后段从 5 轮递减到 3 / 2 轮，导致任务越复杂、越接近收尾，
@@ -1530,6 +1685,11 @@ enum ToolLoopSignal {
     /// 工具）逃过了 exact/coarse 整轮比较，但某个 read_file 文件
     /// 在窗口每一轮都出现。温和提示一次。
     TargetRepeat,
+    /// 同一目标被反复「从头重读」（翻页页宽不断变化、混入每轮新归档路径的循环）。
+    /// 温和提示一次。
+    TargetRescan,
+    /// 同一目标从头重读超过硬阈值：切换无工具收口模式强制作答。
+    TargetRescanHard,
     /// `execute_command` 在同一 coarse 目标上长时间空转，直接强制收敛。
     CoarseHard,
     Soft,
@@ -1580,6 +1740,12 @@ struct ProgressLedger {
     /// 新的 low-progress episode 最早允许注入 soft 的迭代号。实质进展会重置当前
     /// episode，但保留该 cooldown，防止复杂任务被同一提示反复打断。
     next_episode_iteration: usize,
+    /// 每个目标本轮内「从文件头开始读」的次数（重扫检测）。与签名历史解耦：
+    /// soft 清空历史、每轮新目标重置无进展计数，都影响不到它；write_file/
+    /// apply_patch 修改该目标时清零（编辑后从头重读验证合法）。
+    from_top_reads: FxHashMap<String, u32>,
+    /// 已注入过 TargetRescan 软提示的目标（每目标本轮一次）。
+    rescan_note_injected: FxHashSet<String>,
 }
 
 impl ProgressLedger {
@@ -1604,6 +1770,12 @@ impl ProgressLedger {
     fn reset_after_truncation(&mut self) {
         self.reset_escalation();
         self.next_episode_iteration = 0;
+        // 截断恢复后从头重读属于合法的上下文重建：re-scan 计数与提示标记必须随历史一并清空，
+        // 否则恢复后的首次从头重读会继承旧计数直接触发 hard-stop。
+        // 注意不能并入 reset_escalation：实质进展路径不得清空该计数（混轮新目标会不断重置
+        // 无进展计数，re-scan 计数正是针对该逃逸的独立防线）。
+        self.from_top_reads.clear();
+        self.rescan_note_injected.clear();
     }
 }
 
@@ -1783,6 +1955,38 @@ impl TurnSupervisor {
         {
             self.target_repeat_note_injected = true;
             return ToolLoopSignal::TargetRepeat;
+        }
+        // 同目标「从头重读」重扫检测：翻页+换页宽+混轮循环的最终防线。上面三道
+        // 整轮检测都要求「整轮签名集合相等/每轮共现同一目标」，而这类循环每轮
+        // offset/limit/页宽都在变、还混着每轮不同的新归档路径与 execute_command，
+        // 整轮集合永远不相等；soft 命中后历史还会被清空、每轮新目标又把无进展
+        // 计数重置。这里按「目标文件」累计从文件头开始的读取次数（cat/head/
+        // tail -c +1/read_file offset=1 …），不依赖整轮签名集合——页宽怎么换、
+        // 混了多少新目标都影响不到计数。write_file/apply_patch 修改该文件时
+        // 清零（编辑后从头重读验证是合法行为）。软提示一次后继续累计，第 4 次
+        // 从头重读直接硬停止。
+        let mutated_targets = extract_round_mutated_targets(signature_messages);
+        for target in mutated_targets {
+            self.progress.from_top_reads.remove(&target);
+            self.progress.rescan_note_injected.remove(&target);
+        }
+        let from_top_targets = extract_round_from_top_read_targets(signature_messages);
+        let mut rescan_signal: Option<ToolLoopSignal> = None;
+        for target in from_top_targets {
+            let reads = self.progress.from_top_reads.entry(target.clone()).or_insert(0);
+            *reads += 1;
+            if *reads >= TARGET_RESCAN_HARD_THRESHOLD {
+                rescan_signal = Some(ToolLoopSignal::TargetRescanHard);
+                break;
+            }
+            if *reads >= TARGET_RESCAN_SOFT_THRESHOLD
+                && self.progress.rescan_note_injected.insert(target)
+            {
+                rescan_signal = Some(ToolLoopSignal::TargetRescan);
+            }
+        }
+        if let Some(signal) = rescan_signal {
+            return signal;
         }
         // exact/coarse 均未命中「签名重复」型循环时，交给 Progress Budget 补位：
         // 抓「参数每轮都变、但整体不推进任务」的发散型 loop。
@@ -2086,6 +2290,39 @@ fn inject_target_repeat_loop_note(messages: &mut Vec<crate::ai::history::Message
         Stop and do one thing: reuse what you already read/searched about that target instead of checking the same thing with another tool.\n\
         Then choose one: (a) if you have enough information, immediately take the next substantive action or answer directly;\n\
         (b) if you really must continue, write down exactly which new piece of information about that target is still missing and why switching tools would obtain it.";
+    messages.push(Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+/// 同目标「从头重读」重扫软提示：同一文件被反复从文件头开始读（页宽每轮都变、
+/// 或混入每轮不同的新归档路径），已累计多次从头重读。
+fn inject_target_rescan_note(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = "[target-rescan] The same file has been re-read from the beginning repeatedly (page size / window changes every round, often mixed with new archive paths each round).\n\
+        If you have already covered the full content, converge now and answer based on the evidence you have; if you really must re-read it, write down exactly which new piece of information you expect to gain and why.";
+    messages.push(Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+/// 同目标「从头重读」重扫硬停止：同一文件从头重读超过硬阈值，判定为翻页+混轮
+/// 循环，强制无工具收口。
+fn inject_target_rescan_hard_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = "[low-yield-hard-stop] The same file has been re-read from the beginning too many times with different page sizes / windows; this is judged a pagination loop.\n\
+        From now on you are in no-tool wrap-up mode: do not issue any more tool calls;\n\
+        give a phase summary and current conclusion based on existing information; if the task is not yet complete, clearly state the current gap, remaining work, and suggested next steps.";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
@@ -2529,7 +2766,7 @@ mod tests {
 
         // 新的一轮重复必须重新先得到 soft，而不是沿用旧状态直接 hard-stop。
         for i in 0..TOOL_LOOP_SOFT_WINDOW {
-            messages.push(pb_read_msg("src/other.rs", &format!("retry-{i}")));
+            pb_successful_read_round(&mut messages, "src/other.rs", 5, &format!("retry-{i}"), "body");
             let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
             if i == TOOL_LOOP_SOFT_WINDOW - 1 {
                 assert!(matches!(signal, ToolLoopSignal::Soft));
@@ -2600,7 +2837,7 @@ mod tests {
                 tool_type: "function".to_string(),
                 function: crate::ai::types::FunctionCall {
                     name: "read_file".to_string(),
-                    arguments: "{\"path\":\"src/main.rs\"}".to_string(),
+                    arguments: "{\"path\":\"src/main.rs\",\"offset\":5}".to_string(),
                 },
             }]),
             tool_call_id: None,
@@ -2752,6 +2989,64 @@ mod tests {
         assert_eq!(a, "ls:/data01/dataagent_be/logs");
         assert_eq!(a, b);
         assert_eq!(b, c);
+    }
+
+    #[test]
+    fn coarse_execute_command_signature_collapses_middle_paging_offsets() {
+        // 翻页循环逃逸根因：tail -c +N / sed -n 'N,Mp' 的偏移字面量此前被保留在
+        // coarse 签名里，同一文件换窗口翻页时每轮签名互不相同，coarse / target-repeat
+        // 都抓不到。偏移/行号区间属于「窗口」而非目标资源，应被剥掉（与 read_file 的
+        // offset/limit 剥离同理），使翻页变体折叠为同一签名。
+        let a = coarse_execute_command_signature("tail -c +2401 src/all_desc.txt | head -c 2400");
+        let b = coarse_execute_command_signature("tail -c +4801 src/all_desc.txt | head -c 2400");
+        let c = coarse_execute_command_signature("tail -c +1 src/all_desc.txt | head -c 1400");
+        assert_eq!(a, "tail:src/all_desc.txt");
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        let d = coarse_execute_command_signature("sed -n '40,80p' src/all_desc.txt");
+        let e = coarse_execute_command_signature("sed -n '1,40p' src/all_desc.txt");
+        assert_eq!(d, "sed:src/all_desc.txt");
+        assert_eq!(d, e);
+        // 不同目标文件仍保持区分，避免误合并。
+        assert_ne!(a, coarse_execute_command_signature("tail -c +2401 other.txt"));
+    }
+
+    #[test]
+    fn coarse_catches_middle_paging_loop_never_from_top() {
+        // 纯「翻页」循环：同一文件反复从中间偏移读（tail -c +N，每轮偏移不同、
+        // 永不为 +1，from-top 重扫检测抓不到）。整轮原始命令各不相同，exact 落空；
+        // 修复前 coarse 签名保留偏移字面量，整轮 coarse 集合也永不相等，循环一直
+        // 逃逸到迭代上限。修复后偏移被剥掉，全部折叠为 `tail:<file>`：第 5 轮触发
+        // Coarse 软提示，第 8 轮触发 CoarseHard 硬停。
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let file = "src/all_desc.txt";
+        let mut signals = Vec::new();
+        for i in 0..TOOL_LOOP_COARSE_HARD_WINDOW {
+            let offset = 2401 + i * 2400; // 中间偏移，永不为 1（from-top）。
+            pb_execute_command_round(
+                &mut messages,
+                &format!("tail -c +{offset} {file} | head -c 2400"),
+                &format!("p{i}"),
+            );
+            signals.push(supervisor.record_tool_signatures(
+                &messages,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            ));
+        }
+        assert!(
+            matches!(signals[TOOL_LOOP_COARSE_WINDOW - 1], ToolLoopSignal::Coarse),
+            "5th middle-paging round should hit Coarse, got {:?}",
+            signals[TOOL_LOOP_COARSE_WINDOW - 1]
+        );
+        assert!(
+            matches!(
+                signals[TOOL_LOOP_COARSE_HARD_WINDOW - 1],
+                ToolLoopSignal::CoarseHard
+            ),
+            "8th middle-paging round should hit CoarseHard, got {:?}",
+            signals[TOOL_LOOP_COARSE_HARD_WINDOW - 1]
+        );
     }
 
     #[test]
@@ -3417,6 +3712,20 @@ mod tests {
         }
     }
 
+    fn pb_execute_command_round(
+        messages: &mut Vec<crate::ai::history::Message>,
+        command: &str,
+        id: &str,
+    ) {
+        messages.push(pb_execute_command_msg(command, id));
+        messages.push(pb_tool_result(id, &format!("output of {command}")));
+    }
+
+    fn pb_read_round(messages: &mut Vec<crate::ai::history::Message>, path: &str, id: &str) {
+        messages.push(pb_read_msg(path, id));
+        messages.push(pb_tool_result(id, &format!("body of {path}")));
+    }
+
     fn pb_task_tool_msg(
         tool_name: &str,
         args: serde_json::Value,
@@ -3851,7 +4160,7 @@ mod tests {
                         tool_type: "function".to_string(),
                         function: crate::ai::types::FunctionCall {
                             name: "read_file".to_string(),
-                            arguments: "{\"path\":\"src/bin/ai/mod.rs\"}".to_string(),
+                            arguments: "{\"path\":\"src/bin/ai/mod.rs\",\"offset\":100}".to_string(),
                         },
                     },
                     // 每轮不同的陪衬目录读取：让整轮签名各不相等，逃过整轮判等。
@@ -3937,6 +4246,164 @@ mod tests {
         assert!(!supervisor.target_repeat_note_injected);
         assert!(supervisor.tool_target_history.iter().all(Vec::is_empty));
         assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+    }
+
+    #[test]
+    fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
+        // 复现 f319d490 会话的真实逃逸模式：同一文件从文件头反复读取（每轮页宽
+        // 变化：2400B → 1400B → read_file 行分页），中间混入每轮不同的新归档
+        // 路径——整轮签名永不相等，exact/coarse/target-repeat 三道整轮检测全部
+        // 落空；重扫计数按目标累计、与整轮签名解耦：第 3 次从头读注入软提示，
+        // 第 4 次从头读硬停止。
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let file = "src/all_desc.txt";
+
+        // 第 1 次从头读（tail -c +1）+ 后续分页。
+        pb_execute_command_round(&mut messages, &format!("tail -c +1 {file} | head -c 2400"), "t0");
+        assert_eq!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+        for i in 1..3 {
+            let offset = i * 2400 + 1;
+            pb_execute_command_round(
+                &mut messages,
+                &format!("tail -c +{offset} {file} | head -c 2400"),
+                &format!("t0p{i}"),
+            );
+            assert_eq!(
+                supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+                ToolLoopSignal::None
+            );
+        }
+        // 混入每轮不同的新归档路径读取（此前三道检测的逃逸关键）。
+        pb_read_round(&mut messages, &format!("{file}.archive-1"), "a1");
+        assert_eq!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+        // 第 2 次从头读：换成 1400 字节页宽。
+        pb_execute_command_round(&mut messages, &format!("tail -c +1 {file} | head -c 1400"), "t1");
+        assert_eq!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+        pb_execute_command_round(&mut messages, &format!("tail -c +1401 {file} | head -c 1400"), "t1p1");
+        // 修复后：tail/sed 的偏移/行号字面量被剥掉，窗口 [tail,tail,archive,
+        // tail,tail] 折叠成 3 周期 [tail,tail,archive]，coarse 在填满窗口时
+        // 提前命中（比 from-top 重扫更早抓住这个翻页+混轮循环）。
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(
+            matches!(signal, ToolLoopSignal::Coarse),
+            "paging+archive mixed window should now hit Coarse, got {signal:?}"
+        );
+        pb_read_round(&mut messages, &format!("{file}.archive-2"), "a2");
+        assert_eq!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None
+        );
+        // 第 3 次从头读（read_file offset 缺省）→ 软提示。
+        pb_read_round(&mut messages, file, "r3");
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(
+            matches!(signal, ToolLoopSignal::TargetRescan),
+            "expected TargetRescan at 3rd from-top read, got {signal:?}"
+        );
+        // 第 4 次从头读（offset=0）→ 硬停止。
+        pb_successful_read_round(&mut messages, file, 0, "r4", "content page");
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(
+            matches!(signal, ToolLoopSignal::TargetRescanHard),
+            "expected TargetRescanHard at 4th from-top read, got {signal:?}"
+        );
+    }
+
+    #[test]
+    fn target_rescan_resets_on_write_file_edit() {
+        // 编辑后从头重读是合法验证：write_file 修改目标清零重扫计数，
+        // 读→改→读 循环不应触发任何重扫信号。
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let target = "src/config.toml";
+        for i in 0..3 {
+            pb_read_round(&mut messages, target, &format!("r{i}"));
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            assert_eq!(signal, ToolLoopSignal::None, "round r{i} must not signal");
+            let id = format!("w{i}");
+            messages.push(pb_write_file_msg(target, &id));
+            messages.push(pb_tool_result(&id, "Successfully wrote file."));
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            assert_eq!(signal, ToolLoopSignal::None, "round w{i} must not signal");
+        }
+        assert!(
+            !supervisor.progress.from_top_reads.contains_key(target),
+            "write_file must reset the from-top counter"
+        );
+    }
+
+    #[test]
+    fn target_rescan_ignores_monotonic_pagination() {
+        // 单调向前翻页（offset 递增、从不回头）不是重扫：只计 1 次从头读。
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let file = "src/big-file.rs";
+        for i in 0..8 {
+            let offset = i * 100;
+            pb_successful_read_round(&mut messages, file, offset, &format!("p{i}"), &format!("page-{i}"));
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            assert!(
+                !matches!(signal, ToolLoopSignal::TargetRescan | ToolLoopSignal::TargetRescanHard),
+                "monotonic pagination must not trigger rescan at round {i}: {signal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_rescan_helper_detects_from_top_reads() {
+        use crate::ai::driver::turn_runtime::orchestrator::{
+            command_reads_from_top, extract_round_from_top_read_targets, first_path_token,
+            normalize_rescan_path,
+        };
+        for from_top in [
+            "cat /tmp/a.txt",
+            "head -c 2400 /tmp/a.txt",
+            "less /tmp/a.txt",
+            "more /tmp/a.txt",
+            "view /tmp/a.txt",
+            "nl -ba /tmp/a.txt",
+            "tail -c +1 /tmp/a.txt | head -c 2400",
+            "tail -n +1 /tmp/a.txt",
+            "sed -n '1,40p' /tmp/a.txt",
+            "sed -n 1,40p /tmp/a.txt",
+        ] {
+            assert!(command_reads_from_top(from_top), "expected from-top: {from_top}");
+        }
+        for not_from_top in [
+            "tail -c +2401 /tmp/a.txt | head -c 2400",
+            "tail -n +40 /tmp/a.txt",
+            "sed -n '40,80p' /tmp/a.txt",
+            "grep -n pattern /tmp/a.txt",
+            "ls /tmp",
+        ] {
+            assert!(!command_reads_from_top(not_from_top), "expected NOT from-top: {not_from_top}");
+        }
+        assert_eq!(
+            first_path_token("tail -c +1 /tmp/a.txt | head -c 2400").as_deref(),
+            Some("/tmp/a.txt")
+        );
+        assert_eq!(first_path_token("head -c 2400 /tmp/a.txt").as_deref(), Some("/tmp/a.txt"));
+        assert_eq!(normalize_rescan_path("./src/a.rs"), normalize_rescan_path("src/a.rs"));
+        // read_file offset 缺省/0/1 → from-top；offset=100 → 不是。
+        let mut messages = Vec::new();
+        messages.push(pb_read_msg("/tmp/a.txt", "no-offset"));
+        assert_eq!(
+            extract_round_from_top_read_targets(&messages),
+            vec!["/tmp/a.txt".to_string()]
+        );
+        let mut messages = Vec::new();
+        pb_successful_read_round(&mut messages, "/tmp/a.txt", 100, "off-100", "body");
+        assert!(extract_round_from_top_read_targets(&messages).is_empty());
     }
 
     #[test]
@@ -5133,7 +5600,7 @@ async fn run_turn_body(
                 && should_try_llm_summary(&app.session_id, after, mid_turn_hard)
             {
                 let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
-                let (after_msgs, llm_before, llm_after, was_effective) =
+                let (after_msgs, llm_before, llm_after, was_effective, llm_summary_inserted) =
                     crate::ai::history::mid_turn_llm_summarize(
                         app,
                         drained,
@@ -5149,6 +5616,7 @@ async fn run_turn_body(
                     llm_before,
                     llm_after,
                     was_effective,
+                    llm_summary_inserted,
                 );
                 compression_report.emit();
             } else {
@@ -5189,6 +5657,27 @@ async fn run_turn_body(
                     "possible low-yield repetition detected (same target across mixed tool rounds): injecting converge hint",
                 );
                 inject_target_repeat_loop_note(&mut messages);
+            }
+            ToolLoopSignal::TargetRescan => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "same file re-read from the beginning repeatedly (pagination loop): injecting converge hint",
+                );
+                inject_target_rescan_note(&mut messages);
+            }
+            ToolLoopSignal::TargetRescanHard => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "same file re-read from the beginning past the hard threshold (pagination loop): switching to no-tool handoff",
+                );
+                inject_target_rescan_hard_stop_note(&mut messages);
+                supervisor.maybe_inject_task_anchor(
+                    &mut messages,
+                    &question,
+                    "target-rescan-hard-stop",
+                );
+                record_force_final_reason(&mut messages, "target_rescan", iteration);
+                force_final_response = true;
             }
             ToolLoopSignal::CoarseHard => {
                 crate::ai::driver::print::print_tool_note_line(
