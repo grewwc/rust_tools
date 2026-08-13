@@ -53,19 +53,33 @@ impl CompressionReport {
 
     /// `effective` 只表示净节省是否达到摘要有效阈值；false 时硬预算兜底仍可能
     /// 已经缩小并替换请求上下文，不能误报为 skipped。
+    /// `llm_summary_inserted` 表示这次压缩是否真的执行并注入了 `[mid-turn-summary]`。
+    /// 为 false 且 `after < before` 时，下降全部来自机械路径（折叠/截断/外溢），
+    /// 报告为 "skipped (no LLM summary), mechanical-only"，避免把纯机械压缩
+    /// 误报成"调用了 LLM 摘要"（用户曾看到 `pre-request LLM ... chars` 但实际
+    /// 未触发 LLM 的可观测性问题）。
     pub(super) fn record_llm_summary_attempt(
         &mut self,
         label: impl Into<String>,
         before: usize,
         after: usize,
         effective: bool,
+        llm_summary_inserted: bool,
     ) {
         let label = label.into();
-        if effective {
-            self.record(label, before, after);
+        if llm_summary_inserted {
+            if effective {
+                self.record(label, before, after);
+            } else {
+                self.record(
+                    format!("{label} partial (below effective-savings threshold)"),
+                    before,
+                    after,
+                );
+            }
         } else if after < before {
             self.record(
-                format!("{label} partial (below effective-savings threshold)"),
+                format!("{label} skipped (no LLM summary), mechanical-only"),
                 before,
                 after,
             );
@@ -322,6 +336,7 @@ mod tests {
             182_259,
             181_000,
             false,
+            true,
         );
 
         assert_eq!(
@@ -329,6 +344,29 @@ mod tests {
             Some(
                 "pre-request LLM (limit 180000) partial \
                  (below effective-savings threshold): 182259 → 181000 chars"
+            )
+        );
+    }
+
+    #[test]
+    fn llm_summary_mechanical_only_reduction_is_not_reported_as_llm() {
+        // 用户观测到的问题：单轮 + 巨量工具输出的 session 里 LLM 摘要实际被跳过
+        // （无可摘要的旧对话），但净下降达到有效阈值后被报告成 `... LLM ... chars`，
+        // 看起来像调用了 LLM。这里验证机械路径下降被标记为 skipped (no LLM summary)。
+        let mut report = CompressionReport::default();
+        report.record_llm_summary_attempt(
+            "pre-request LLM (limit 180000)",
+            581_560,
+            569_677,
+            true,
+            false,
+        );
+
+        assert_eq!(
+            report.render().as_deref(),
+            Some(
+                "pre-request LLM (limit 180000) skipped (no LLM summary), \
+                 mechanical-only: 581560 → 569677 chars"
             )
         );
     }

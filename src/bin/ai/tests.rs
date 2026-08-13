@@ -1639,7 +1639,7 @@ async fn mid_turn_llm_summary_reaches_hard_target_after_effective_early_folding(
     }
 
     let hard_target = 5_000;
-    let (compressed, before, after, did_summarize) =
+    let (compressed, before, after, did_summarize, _llm_summary_inserted) =
         mid_turn_llm_summarize(&app, messages, 4, 2_000, hard_target).await;
 
     assert!(before > hard_target + 20_000);
@@ -1707,7 +1707,7 @@ async fn mid_turn_llm_summary_path_a_preserves_raw_archive_pointer() {
         },
     ];
 
-    let (compressed, before, after, _) =
+    let (compressed, before, after, _, _) =
         mid_turn_llm_summarize(&app, messages, 1, 1_000, 20_000).await;
 
     assert!(after < before, "Path A should reduce earlier history");
@@ -1829,7 +1829,7 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
     ];
 
     let before = messages_total_chars_pub(&messages);
-    let (compressed, _before, after, _) =
+    let (compressed, _before, after, _, _) =
         mid_turn_llm_summarize(&app, messages, 2, 1_000, 20_000).await;
     assert!(
         after < before,

@@ -949,7 +949,7 @@ async fn request_model_response(
         // 取消安全：传入 messages 的 **clone** 而非 `mem::take`。若本次摘要 await
         // 期间被 Ctrl+C 中断，请求 future 被 drop，`messages` 仍保有原始完整内容，
         // 不会退化成空 Vec 导致后续请求发出空上下文 / 丢失消息状态。
-        let (after_msgs, llm_before, llm_after, was_effective) =
+        let (after_msgs, llm_before, llm_after, was_effective, llm_summary_inserted) =
             crate::ai::history::mid_turn_llm_summarize(
                 app,
                 messages.clone(),
@@ -964,6 +964,7 @@ async fn request_model_response(
             llm_before,
             llm_after,
             was_effective,
+            llm_summary_inserted,
         );
         record_llm_summary_attempt_chars(&session_id, llm_after);
     }

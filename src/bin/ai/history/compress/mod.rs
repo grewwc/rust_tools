@@ -2269,16 +2269,19 @@ const PATH_C_PER_MSG_CAP: usize = 8_000;
 ///   - Path C 兜底（per-message 截断）：渐进式折叠后仍超 `hard_target` 时，
 ///     对尾窗内单个超大非 system 消息做 head+tail 截断。这是绝对最后手段。
 /// 头部所有 system / internal_note（agent 指令、工具列表、全局指引）始终原样保留。
-/// 返回 `(messages_after, before, after, was_effective)`；`was_effective` 仅在
-/// 净下降 ≥ [`MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS`] 时为 true。false 不代表返回的
-/// messages 未变化；硬预算兜底可能产生低于有效阈值的部分下降。
+/// 返回 `(messages_after, before, after, was_effective, llm_summary_inserted)`；
+/// `was_effective` 仅在净下降 ≥ [`MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS`] 时为 true。
+/// false 不代表返回的 messages 未变化；硬预算兜底可能产生低于有效阈值的部分下降。
+/// `llm_summary_inserted` 表示 Path A 是否真的执行并注入了 `[mid-turn-summary]`：
+/// 为 false 且 `after < before` 说明下降全部来自机械路径（折叠/截断/外溢），
+/// 供上层报告区分"LLM 摘要已执行"与"纯机械压缩"，避免误报。
 pub(in crate::ai) async fn mid_turn_llm_summarize(
     app: &App,
     messages: Vec<Message>,
     keep_recent_turns: usize,
     summary_max_chars: usize,
     hard_target: usize,
-) -> (Vec<Message>, usize, usize, bool) {
+) -> (Vec<Message>, usize, usize, bool, bool) {
     let before = messages_total_chars(&messages);
     let overflow_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
         .session_assets_dir(&app.session_id);
@@ -2287,6 +2290,8 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // best 追踪迄今为止体积最小的结果；None 表示仍使用原始 messages。
     let mut best: Option<Vec<Message>> = None;
     let mut best_after = before;
+    // Path A 是否真的执行并注入了 [mid-turn-summary]（见返回注释）。
+    let mut llm_summary_inserted = false;
 
     // === Path A：跨轮 LLM 摘要 ===
     // 先按"保留最近 keep_recent_turns 个 user 轮"算切点。经过前置投影压缩后，
@@ -2377,12 +2382,13 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 {
                     best = Some(out);
                     best_after = after;
+                    llm_summary_inserted = true;
                 }
                 // 有效压缩且达标 → 直接返回
                 if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS
                     && best_after <= hard_target
                 {
-                    return (best.unwrap(), before, best_after, true);
+                    return (best.unwrap(), before, best_after, true, true);
                 }
             }
         }
@@ -2422,7 +2428,13 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // 会跳过下面的硬兜底，让「旧组已省很多、最新一组仍单独超窗」继续发出超限请求。
     if best_after <= hard_target {
         let was_effective = before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS;
-        return (best.unwrap_or(messages), before, best_after, was_effective);
+        return (
+            best.unwrap_or(messages),
+            before,
+            best_after,
+            was_effective,
+            llm_summary_inserted,
+        );
     }
 
     // === Path C 兜底：预算感知的结构保留截断 ===
@@ -2454,6 +2466,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         before,
         after,
         savings >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS,
+        llm_summary_inserted,
     )
 }
 

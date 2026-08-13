@@ -908,7 +908,7 @@ mod tests {
             "压缩后仍超阈值时 LLM 摘要门控应打开"
         );
 
-        let (after_msgs, llm_before, llm_after, was_effective) =
+        let (after_msgs, llm_before, llm_after, was_effective, llm_summary_inserted) =
             crate::ai::history::mid_turn_llm_summarize(
                 &app,
                 summary_work,
@@ -924,6 +924,10 @@ mod tests {
             "mock LLM 服务器没有收到任何摘要请求"
         );
         assert!(was_effective, "LLM 摘要执行但被认为无效");
+        assert!(
+            llm_summary_inserted,
+            "LLM 摘要执行后应报告已注入 [mid-turn-summary]"
+        );
         assert!(
             llm_after < llm_before,
             "LLM 摘要后体积未下降: {llm_before} -> {llm_after}"
