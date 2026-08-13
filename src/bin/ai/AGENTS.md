@@ -24,6 +24,12 @@ rules in the nearest child `AGENTS.md`.
 - `stream/`: streaming protocol, chunk extraction, state machine, and
   terminal/TUI rendering (under `stream/render/`)
 - `cli.rs` / `theme.rs` / `background.rs`: CLI entry, theming, background tasks
+- `persona.rs`: persona switching (per-session identity overlay, `PersonaProfile`/`PersonaStore`)
+- `files.rs` / `types.rs`: file/text parse helpers and shared types (`FileParseResult`, ...)
+- `model_names.rs`: `ModelDef` registry lookup and platform/model handle helpers
+- `request_protocol.rs`: request wire-protocol dialects (chat-completions vs responses)
+- `errors.rs`: structured `AiError` enum (alternative to pervasive `Result<T, String>`)
+- `tool_descriptions/`: tool description JSONs, auto-discovered by `build.rs`
 
 ## Runtime-wide invariants
 

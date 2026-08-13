@@ -1417,6 +1417,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
     let prepared = prepare_subagent_task(args)?;
     let spawned = spawn_subagent_kernel_task(&prepared)?;
     record_last_spawn_batch(vec![spawned.task_id.clone()]);
+    record_subagent_spawn_audit(&spawned.task_id, &prepared);
 
     Ok(format!(
         "Task spawned: task_id={}, pid={}, agent={}, model={}, inherit={}\nContinue independent parent-side work now. Do not call task_wait immediately unless the parent is blocked on this result; use task_status for a non-blocking snapshot.",
@@ -1461,6 +1462,7 @@ pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
             Ok(spawned) => {
                 spawned_count += 1;
                 spawned_ids.push(spawned.task_id.clone());
+                record_subagent_spawn_audit(&spawned.task_id, task);
                 entries.push(serde_json::json!({
                     "index": index,
                     "status": "spawned",
@@ -2116,6 +2118,69 @@ inventory::submit!(ToolRegistration {
 
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task_evidence_read",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Never,
+        counts_toward_precision_inline_budget: false,
+    },
+});
+
+/// 呈现当前会话的完整子代理调用台账（spawn 审计）。
+///
+/// 与 `task_evidence_read`（单任务进度证据）互补：这里是模型可见的审计视图，
+/// 回答「这个 agent 会话里到底调用过哪些 subagent、何时、用了哪个 agent/model、
+/// 结果是否已交付/已整合」，即使结果早已被收集或历史被压缩也仍然可查。
+pub(crate) fn execute_task_audit(_args: &Value) -> Result<String, String> {
+    ensure_top_level_task_orchestration("task_audit")?;
+    let Some(context) = crate::ai::driver::runtime_ctx::try_current() else {
+        return Err("No driver context available for task audit".to_string());
+    };
+    let records = crate::ai::history::read_task_spawn_audit(
+        context.app_proto.config.history_file.as_path(),
+        &context.app_proto.session_id,
+    )
+    .map_err(|error| format!("failed to read subagent spawn audit: {error}"))?;
+    if records.is_empty() {
+        return Ok(
+            "No subagent calls recorded in this session yet. Use `task` / `task_spawn` / \
+             `task_spawn_batch` to delegate work; every spawn is persisted here."
+                .to_string(),
+        );
+    }
+    let mut lines = Vec::with_capacity(records.len());
+    for record in records.iter().rev() {
+        let delivered = record.delivered_at_unix_ms;
+        let integrated = match record.integrated_at_unix_ms {
+            Some(ts) => format!("{ts}"),
+            None => "no".to_string(),
+        };
+        lines.push(format!(
+            "task_id={} status={} agent={} model={} delivered_ms={} integrated={}\n  description: {}",
+            record.task_id, record.status, record.agent_name, record.model, delivered, integrated,
+            record.description,
+        ));
+        if let Some(disposition) = &record.disposition {
+            lines.push(format!("  disposition: {disposition}"));
+        }
+    }
+    Ok(format!(
+        "[subagent-call-audit] {} record(s) in this session (newest delivered first; undelivered at bottom):\n{}",
+        records.len(),
+        lines.join("\n")
+    ))
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "task_audit",
+        description: "",
+        execute: execute_task_audit,
+        groups: &["builtin", "core"],
+    }
+});
+
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "task_audit",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::Never,
@@ -2808,6 +2873,24 @@ fn format_task_result_with_id(
         ));
     }
     rendered
+}
+
+/// spawn 成功后写入持久化审计占位记录（delivered_at=0），结果交付时
+/// `record_delivered_task_evidence` 会覆盖同一 task_id 的状态字段，因此台账
+/// 始终能回答「当前 agent 是否调用过子代理、何时、哪个 agent/model」。
+/// 审计写入是 best-effort：失败不阻塞 spawn 本身。
+fn record_subagent_spawn_audit(task_id: &str, prepared: &PreparedSubagentTask) {
+    let Some(context) = crate::ai::driver::runtime_ctx::try_current() else {
+        return;
+    };
+    let _ = crate::ai::history::record_task_spawn_audit(
+        context.app_proto.config.history_file.as_path(),
+        &context.app_proto.session_id,
+        task_id,
+        &prepared.description,
+        &prepared.agent_name,
+        &prepared.model,
+    );
 }
 
 fn persist_rendered_task_evidence(

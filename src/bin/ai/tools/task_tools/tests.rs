@@ -324,7 +324,8 @@ fn prepare_subagent_task_auto_selects_model_and_fallback() {
         "rt_subagent_model_{}.configw",
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::write(&cfg_path, "").unwrap();
+    // 默认已改为继承主 agent 模型；显式关闭继承，强制走自动选择路径。
+    std::fs::write(&cfg_path, "ai.subagent.model_inherit = false\n").unwrap();
     let old_cfg = std::env::var_os("CONFIGW_PATH");
     unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
     crate::commonw::configw::refresh();
@@ -378,6 +379,61 @@ fn prepare_subagent_task_auto_selects_model_and_fallback() {
         prepared
             .prompt
             .contains("Parent task prompt:\nFind where task spawning is implemented.")
+    );
+}
+
+#[test]
+fn prepare_subagent_task_inherits_parent_model_by_default() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let cfg_path = std::env::temp_dir().join(format!(
+        "rt_subagent_inherit_{}.configw",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&cfg_path, "").unwrap();
+    let old_cfg = std::env::var_os("CONFIGW_PATH");
+    unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
+    crate::commonw::configw::refresh();
+
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("models.json must contain at least one model");
+    let navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
+        AgentMode::Subagent,
+    );
+    let ctx = DriverContext::new(
+        test_app_with_model(current_model.clone()),
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![navigator]),
+    );
+    let args = serde_json::json!({
+        "description": "Locate task tool",
+        "prompt": "Find where task spawning is implemented.",
+        "agent": "navigator"
+    });
+
+    let prepared = DRIVER_CTX.sync_scope(ctx, || prepare_subagent_task(&args));
+
+    match old_cfg {
+        Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+        None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+    }
+    crate::commonw::configw::refresh();
+    let _ = std::fs::remove_file(&cfg_path);
+
+    let prepared = prepared.unwrap();
+    assert_eq!(prepared.model, current_model);
+    assert!(!prepared.is_model_auto_selected);
+    assert!(prepared.auto_model_fallback.is_none());
+    assert!(
+        prepared
+            .selection_explanation
+            .contains("model_reason=inherited parent agent current model")
     );
 }
 

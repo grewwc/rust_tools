@@ -1,6 +1,6 @@
 {
   "name": "signal_process",
-  "description": "Send a POSIX-like signal to a child or descendant process. SIGCANCEL=request cooperative cancellation of current turn/tool work, SIGTERM=request graceful termination, SIGSTOP=pause execution, SIGCONT=resume paused process, SIGKILL=immediate forced termination (cascades to grandchildren).",
+  "description": "Send a lifecycle signal to a child or descendant process.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -17,7 +17,7 @@
           "SIGCONT",
           "SIGKILL"
         ],
-        "description": "Signal to send (meanings in description)."
+        "description": "Signal to send: SIGCANCEL cooperatively cancels current work; SIGTERM requests graceful termination; SIGSTOP pauses; SIGCONT resumes; SIGKILL terminates immediately and cascades to descendants."
       }
     },
     "required": [

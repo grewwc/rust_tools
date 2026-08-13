@@ -6,7 +6,7 @@
     "properties": {
       "turns": {
         "type": "integer",
-        "description": "Scheduler ticks to sleep. Minimum 1."
+        "description": "Scheduler ticks to sleep. Minimum and default 1."
       }
     }
   }

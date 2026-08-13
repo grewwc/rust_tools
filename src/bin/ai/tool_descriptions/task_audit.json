@@ -1,0 +1,8 @@
+{
+  "name": "task_audit",
+  "description": "Show the full durable ledger of subagent calls in the current session: every task_id spawned by this agent (or its ancestors in this session), its status, agent, model, whether the result was delivered and integrated, and the description. Answers 'did I call a subagent for X?' even after the result was collected or context was compressed. Read-only; never blocks.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

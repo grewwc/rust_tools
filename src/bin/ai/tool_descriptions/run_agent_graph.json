@@ -1,6 +1,6 @@
 {
   "name": "run_agent_graph",
-  "description": "Run a checkpointed Rust-native agent graph on top of the existing task/kernel runtime. Static mode executes a validated conditional DAG with reducers. Dynamic mode implements Graph-of-Agents-style initial answers, learned pairwise relevance scoring, topology selection, forward and reverse message propagation, then max or judge pooling. Use action=start, then call action=advance until lifecycle is terminal.",
+  "description": "Start, advance, inspect, or cancel a checkpointed agent graph. Static mode runs a conditional DAG and reduces node outputs into shared state. Dynamic mode selects relevant candidates, propagates messages, and pools a final answer.",
   "parameters": {
     "type": "object",
     "required": [
@@ -14,42 +14,50 @@
           "advance",
           "status",
           "cancel"
-        ]
+        ],
+        "description": "Operation to perform. start requires mode, question, and the matching graph definition; advance, status, and cancel require graph_id. Call advance until the graph is terminal."
       },
       "graph_id": {
         "type": "string",
-        "description": "Graph UUID returned by start."
+        "description": "Graph UUID returned by start; required for advance, status, and cancel."
       },
       "mode": {
         "type": "string",
         "enum": [
           "static",
           "dynamic"
-        ]
+        ],
+        "description": "Graph strategy for start: static runs static_graph; dynamic runs dynamic_graph."
       },
       "name": {
-        "type": "string"
+        "type": "string",
+        "description": "Optional graph name for start. Default agent-graph."
       },
       "question": {
-        "type": "string"
+        "type": "string",
+        "description": "Non-empty problem or objective given to the graph."
       },
       "max_parallel": {
         "type": "integer",
         "minimum": 1,
-        "maximum": 8
+        "maximum": 8,
+        "description": "Maximum concurrent graph tasks. Default 4; clamped to 1..=8."
       },
       "static_graph": {
         "type": "object",
+        "description": "Static-mode definition: shared initial state, executable nodes, and conditional dependency edges.",
         "required": [
           "nodes"
         ],
         "properties": {
           "initial_state": {
-            "type": "object"
+            "type": "object",
+            "description": "Initial shared JSON state. Defaults to an empty object."
           },
           "nodes": {
             "type": "array",
             "maxItems": 128,
+            "description": "DAG nodes to execute (maximum 128). Node ids must be unique.",
             "items": {
               "type": "object",
               "required": [
@@ -59,28 +67,36 @@
               ],
               "properties": {
                 "id": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Unique node identifier."
                 },
                 "description": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Short explanation of the node's responsibility."
                 },
                 "prompt": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Instructions executed by this node."
                 },
                 "agent": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Optional agent profile name for the node task."
                 },
                 "model": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Optional model override for the node task."
                 },
                 "inherit": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Context inherited by the node task: none, all, cwd, memory, history, skills, or a comma-separated combination."
                 },
                 "response_schema": {
-                  "type": "object"
+                  "type": "object",
+                  "description": "Optional JSON Schema constraining the node's final output."
                 },
                 "output_key": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Shared-state key receiving the reduced node output. Defaults to the node id."
                 },
                 "reducer": {
                   "type": "string",
@@ -89,11 +105,13 @@
                     "append_array",
                     "merge_object",
                     "concat"
-                  ]
+                  ],
+                  "description": "How to combine this output with the current output_key value. Default replace."
                 },
                 "max_retries": {
                   "type": "integer",
-                  "minimum": 0
+                  "minimum": 0,
+                  "description": "Maximum retries after a failed node attempt. Default 0."
                 }
               }
             }
@@ -101,6 +119,7 @@
           "edges": {
             "type": "array",
             "maxItems": 1024,
+            "description": "Directed dependencies between nodes (maximum 1024). Defaults to no edges.",
             "items": {
               "type": "object",
               "required": [
@@ -109,13 +128,16 @@
               ],
               "properties": {
                 "from": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Predecessor node id."
                 },
                 "to": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Successor node id."
                 },
                 "condition": {
                   "type": "object",
+                  "description": "Optional gate evaluated after the predecessor finishes. Defaults to always.",
                   "required": [
                     "kind"
                   ],
@@ -128,15 +150,20 @@
                         "on_failure",
                         "output_contains",
                         "json_pointer_equals"
-                      ]
+                      ],
+                      "description": "Gate type. output_contains uses text; json_pointer_equals uses pointer and value."
                     },
                     "text": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Substring required in the predecessor output for output_contains."
                     },
                     "pointer": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "JSON Pointer into the predecessor output for json_pointer_equals."
                     },
-                    "value": {}
+                    "value": {
+                      "description": "Expected JSON value for json_pointer_equals."
+                    }
                   }
                 }
               }
@@ -146,6 +173,7 @@
       },
       "dynamic_graph": {
         "type": "object",
+        "description": "Dynamic-mode definition: candidate agents plus optional topology and pooling policy.",
         "required": [
           "candidates"
         ],
@@ -154,6 +182,7 @@
             "type": "array",
             "minItems": 2,
             "maxItems": 16,
+            "description": "Candidate agents considered for the graph (2 to 16). Candidate ids must be unique.",
             "items": {
               "type": "object",
               "required": [
@@ -162,59 +191,73 @@
               ],
               "properties": {
                 "id": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Unique candidate identifier."
                 },
                 "role": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Candidate specialty used during relevance scoring and answer generation."
                 },
                 "prompt": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Optional candidate-specific instructions."
                 },
                 "agent": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Optional agent profile name for this candidate."
                 },
                 "model": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Optional model override for this candidate."
                 },
                 "inherit": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Context inherited by candidate tasks: none, all, cwd, memory, history, skills, or a comma-separated combination."
                 }
               }
             }
           },
           "policy": {
             "type": "object",
+            "description": "Optional candidate-selection, edge-selection, and final-pooling policy.",
             "properties": {
               "min_selected": {
                 "type": "integer",
-                "minimum": 2
+                "minimum": 2,
+                "description": "Minimum candidates retained after relevance scoring. Default 2."
               },
               "max_selected": {
                 "type": "integer",
-                "minimum": 2
+                "minimum": 2,
+                "description": "Maximum candidates retained after relevance scoring. Default 4."
               },
               "relevance_threshold": {
                 "type": "number",
                 "minimum": 0,
-                "maximum": 1
+                "maximum": 1,
+                "description": "Minimum candidate relevance score. Default 0.2."
               },
               "edge_threshold": {
                 "type": "number",
                 "minimum": 0,
-                "maximum": 1
+                "maximum": 1,
+                "description": "Minimum pairwise relevance score for a message edge. Default 0.35."
               },
               "pool": {
                 "type": "string",
                 "enum": [
                   "max",
                   "judge"
-                ]
+                ],
+                "description": "Final-answer strategy: max selects the highest-scored answer; judge asks a pooling agent to synthesize one. Default judge."
               },
               "pool_agent": {
-                "type": "string"
+                "type": "string",
+                "description": "Optional agent profile for judge pooling."
               },
               "pool_model": {
-                "type": "string"
+                "type": "string",
+                "description": "Optional model override for judge pooling."
               }
             }
           }

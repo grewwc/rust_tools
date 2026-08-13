@@ -14,42 +14,51 @@
       },
       "priority": {
         "type": "integer",
-        "description": "Process priority. 0 is highest, 255 is lowest. Default is 10."
+        "description": "Process priority 0-255 (0=highest, 255=lowest). Default 10."
       },
       "quota_turns": {
         "type": "integer",
-        "description": "Max number of tool calling turns allowed for this process before it is forcefully yielded. Default is 10."
+        "description": "Maximum tool-calling turns per scheduler run before the process yields. Default 10."
       },
       "capabilities": {
         "type": "object",
         "description": "Optional exact capability set for the child process. Omitted means inherit the parent capabilities.",
         "properties": {
           "spawn": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Allow spawning child processes."
           },
           "wait": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Allow waiting for child processes."
           },
           "ipc_send": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Allow sending IPC messages."
           },
           "ipc_receive": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Allow receiving IPC messages."
           },
           "env_write": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Allow modifying process-local environment variables."
           },
           "manage_children": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Allow managing child-process lifecycle."
           },
           "sleep": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Allow suspending the current process."
           },
           "reap": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Allow reaping terminated child processes."
           },
           "signal": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Allow signaling child or descendant processes."
           }
         }
       },
@@ -58,7 +67,7 @@
         "items": {
           "type": "string"
         },
-        "description": "Optional whitelist of tool names this process is allowed to call. Omitted means inherit parent's whitelist. Empty array means no restriction."
+        "description": "Additional tool names allowed alongside the baseline tool set. Omitted inherits the parent's allowlist; an empty array leaves tool access unrestricted."
       }
     },
     "required": [

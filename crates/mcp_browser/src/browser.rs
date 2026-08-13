@@ -90,6 +90,42 @@ pub struct BrowserSession {
     pub pending_human: Option<String>,
 }
 
+/// 会话顶层抽象：受控 Chrome（CDP）vs. 驱动用户已打开的 Chrome（AppleScript）。
+pub enum Session {
+    Cdp(BrowserSession),
+    AppleScript(crate::applescript::ApplescriptSession),
+}
+
+/// 驱动模式选择，由 `MCP_BROWSER_DRIVER` 环境变量决定。
+///
+/// - 默认 `applescript`：复用用户已打开的 Chrome（新开标签页，绝不退出用户浏览器）。
+/// - `cdp`：启动一个受控的新 Chrome 实例（历史行为）。
+/// - 设置 `MCP_BROWSER_WS_URL` 时恒为 `cdp`（显式 attach 已有调试端口实例）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverMode {
+    AppleScript,
+    Cdp,
+}
+
+impl DriverMode {
+    pub fn from_env() -> Self {
+        if std::env::var("MCP_BROWSER_WS_URL").ok().is_some() {
+            return DriverMode::Cdp;
+        }
+        match std::env::var("MCP_BROWSER_DRIVER").ok().as_deref() {
+            Some("cdp") | Some("CDP") => DriverMode::Cdp,
+            _ if cfg!(target_os = "macos") => DriverMode::AppleScript,
+            // 非 macOS 平台没有 osascript，默认退到受控实例
+            // （配合 MCP_BROWSER_WS_URL 可 attach 用户自启的调试端口实例）。
+            _ => DriverMode::Cdp,
+        }
+    }
+
+    pub fn is_applescript(&self) -> bool {
+        matches!(self, DriverMode::AppleScript)
+    }
+}
+
 impl BrowserSession {
     /// 懒启动一个受控 Chrome 并打开一个空白页。
     ///
@@ -102,6 +138,9 @@ impl BrowserSession {
     pub async fn launch() -> Result<Self, String> {
         let (browser, mut handler, temp_profile_dir) =
             if let Ok(ws) = std::env::var("MCP_BROWSER_WS_URL") {
+                let ws = resolve_ws_url(&ws).await.map_err(|e| {
+                    format!("failed to resolve MCP_BROWSER_WS_URL ({ws}): {e}")
+                })?;
                 let (browser, handler) = Browser::connect(ws).await.map_err(|e| {
                     format!("failed to connect to browser at MCP_BROWSER_WS_URL: {e}")
                 })?;
@@ -162,15 +201,98 @@ impl BrowserSession {
         })
     }
 
-    /// 关闭浏览器并中止 Handler 轮询任务。best-effort。
+    /// 关闭会话并中止 Handler 轮询任务。best-effort。
+    ///
+    /// 关键保护：attach 模式（MCP_BROWSER_WS_URL，也就是用户自己的 Chrome）
+    /// 绝不对浏览器整体 close（那会退出用户的浏览器），只关我们创建的会话
+    /// 标签页；只有自启的受控实例才整体 close。
     pub async fn shutdown(mut self) {
-        let _ = self.browser.close().await;
+        if self.temp_profile_dir.is_some() {
+            let _ = self.browser.close().await;
+        } else {
+            let _ = self.page.close().await;
+        }
         self.handler_task.abort();
         // 仅清理自动生成的临时 profile；用户显式指定的目录保留（持久化登录态）。
         if let Some(dir) = self.temp_profile_dir.take() {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+}
+
+/// 把 MCP_BROWSER_WS_URL 统一成 chromiumoxide 需要的 ws:// 地址：
+/// - `ws://` / `wss://` 原样返回；
+/// - `http://host:port` 或裸 `host:port` 则自动请求 `/json/version` 取
+///   `webSocketDebuggerUrl`，省去手工复制一长串 ws 地址（Windows/Linux 上
+///   配合 `--remote-debugging-port` 使用，等价于"复用用户已开的 Chrome"）。
+async fn resolve_ws_url(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if input.starts_with("ws://") || input.starts_with("wss://") {
+        return Ok(input.to_string());
+    }
+    let (host, port) = {
+        let base = input
+            .strip_prefix("http://")
+            .or_else(|| input.strip_prefix("https://"))
+            .unwrap_or(input);
+        // 只取 "host:port" 部分，忽略用户可能贴上的 /devtools/... 路径。
+        let hp = base.split('/').next().unwrap_or(base);
+        match hp.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(hp).rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+                (h.to_string(), p.to_string())
+            }
+            _ => {
+                return Err(format!(
+                    "无法解析主机端口（应为 host:port 或 http://host:port）: {input}"
+                ))
+            }
+        }
+    };
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        http_get(&host, &port, "/json/version"),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "连接 {host}:{port} 超时——Chrome 是否以 --remote-debugging-port={port} 启动？"
+        )
+    })??;
+    let (status, body) = resp;
+    if !status.starts_with("200") {
+        return Err(format!("{host}:{port}/json/version 返回 {status}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("解析调试端点响应失败: {e}"))?;
+    let ws = v["webSocketDebuggerUrl"]
+        .as_str()
+        .ok_or_else(|| "调试端点响应里没有 webSocketDebuggerUrl".to_string())?;
+    Ok(ws.to_string())
+}
+
+/// 极简 HTTP GET（只面向 127.0.0.1 这类本地调试端点，零新增依赖）。
+async fn http_get(host: &str, port: &str, path: &str) -> Result<(String, String), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let port: u16 = port.parse().map_err(|_| format!("端口不合法: {port}"))?;
+    let mut s = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|e| format!("连接 {host}:{port} 失败: {e}"))?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nUser-Agent: mcp_browser\r\n\r\n"
+    );
+    s.write_all(req.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("")
+        .to_string();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    Ok((status, body))
 }
 
 /// 若尚无会话则懒启动一个，然后返回可变引用。

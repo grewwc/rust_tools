@@ -3,15 +3,31 @@
 ## Scope
 
 Standalone stdio JSON-RPC **MCP server** giving the `a` Agent browser automation
-(navigate / click / type / extract / screenshot ...) by driving an installed
-Chrome via `chromiumoxide` (Chrome DevTools Protocol). Not a library - a single
-binary the Agent spawns as an MCP subprocess.
+(navigate / click / type / extract / screenshot ...). **Two drivers, one server**:
+
+- **AppleScript driver (default, `MCP_BROWSER_DRIVER=applescript`)** — drives the
+  **user's already-open Chrome** via `osascript` (`execute javascript`), opens a
+  new tab in their browser, inherits their cookies/login, and **never quits
+  their browser**. No profile copying, no re-login.
+- **CDP driver (`MCP_BROWSER_DRIVER=cdp` or with `MCP_BROWSER_WS_URL` set)** —
+  `chromiumoxide` (Chrome DevTools Protocol). Without
+  `MCP_BROWSER_WS_URL`: a controlled new Chrome instance (throwaway profile).
+  With `MCP_BROWSER_WS_URL`: **attach-only** to an already-running Chrome —
+  the value may be a `ws://` URL **or** `http://host:port` / bare `host:port`
+  (auto-fetches `webSocketDebuggerUrl` from `/json/version`). This is the
+  **Windows/Linux reuse-your-browser path** (start Chrome once with
+  `--remote-debugging-port=9222`), inherits cookies, and `close_browser`
+  there only closes the session tab - the user's browser is never shut down.
+  Non-macOS builds default to `cdp` (no `osascript`).
+
+Not a library - a single binary the Agent spawns as an MCP subprocess.
 
 ## Layout
 
 ```text
-src/main.rs      # #[tokio::main(multi_thread)]; BrowserServer { session } + impl mcp_stdio::McpServer; startup gc + mcp_stdio::run()
-src/browser.rs   # BrowserSession { browser, page, handler_task, temp_profile_dir, pending_human }, launch(), ensure_session(), shutdown(), gc_stale_profiles()
+src/main.rs      # #[tokio::main(multi_thread)]; BrowserServer { mode: DriverMode, session: Option<Session> } + impl mcp_stdio::McpServer; per-mode dispatch + shutdown override; startup gc + mcp_stdio::run()
+src/browser.rs   # BrowserSession { browser, page, handler_task, temp_profile_dir, pending_human }, launch(), ensure_session(), shutdown(), gc_stale_profiles(); + Session enum (Cdp | AppleScript) + DriverMode::from_env()
+src/applescript.rs # AppleScript driver: ApplescriptSession { window_id, tab_id, pending_human } + osascript runner + 13 tool impls (same arg keys as tools.rs)
 src/tools.rs     # initialize/tools_list schemas + handle_tools_call() dispatch + 13 tool impls
 ```
 
@@ -39,6 +55,11 @@ printf '%s\n' \
 For a full Chrome round-trip add a `tools/call` with `navigate`. Set
 `MCP_BROWSER_HEADLESS=1` to avoid popping a window. No focused unit tests
 (runtime behavior needs a real Chrome); the gate is the build + smoke test.
+
+**AppleScript-driver smoke** (drive the running Chrome, opens ONE new tab):
+user's Chrome needs the one-time *Allow JavaScript from Apple Events* toggle;
+pipe `initialize` + `tools/call navigate` (harmless URL) + `close_browser` -
+the tab must open in the session window and close without touching other tabs.
 
 ## Invariants (do not break)
 
@@ -115,10 +136,67 @@ For a full Chrome round-trip add a `tools/call` with `navigate`. Set
    prepend `[HUMAN_ACTION_PENDING: <category>]` to their output so the model is
    reminded to stop and hand control to the user instead of blindly continuing.
 
+## AppleScript driver (reuse the user's open Chrome)
+
+Default mode (`MCP_BROWSER_DRIVER=applescript`): the server drives the
+**already-running** Chrome via `osascript` - opens ONE session tab in the user's
+front window, inherits their real cookies/login, waits at `wait_for_human` when
+a captcha/login/payment flow needs the human, and **never quits the user's
+browser**. `close_browser`/`shutdown` only close the session tab. Login state
+therefore survives across agent sessions - no re-login each time.
+
+Same 13 tools (names/args/result shape identical to CDP; `tools_list` comes
+from tools.rs so the host needs zero changes). `wait_for_human` here is never
+`unavailable` (the window is always visible); everything else follows the CDP
+contract above.
+
+Dedicated invariants:
+1. **Never steal the user's screen focus.** No script calls `activate` -
+   plain Apple events (query / `execute javascript` / `set URL` / close) do
+   not bring Chrome forward. The only unavoidable exception: Chrome self-
+   activates whenever a new tab is created (both `make new tab` and
+   `open -g` trigger it - verified). `open_tab` therefore records the
+   frontmost app (lsappinfo, no permissions) *before* creating the tab and
+   restores focus *after* via `open -b <bundle id>` (fallback `open -a
+   <display name>`; `open -a "飞书"` fails because its registered name is
+   "Lark", hence bundle-id-first). Restore is skipped when the user was
+   already in Chrome. Session ops always address `window id W` + `whose id
+   is "T"` (**integer** window id + **quoted** tab id - `whose id =` /
+   string window ids fail with -1719/-1728), so if events land on a
+   different instance every op fails dry ("会话标签页/窗口已丢失") instead
+   of mutating foreign tabs.
+2. **One-time setting: "Allow JavaScript from Apple Events".** Disabled by
+   default; the server detects the disabled error (its text carries the
+   `applescript` support URL in every locale) and returns the exact
+   menu-path instruction (View > Developer > Allow JavaScript from Apple
+   Events) - never a raw parse error.
+3. **JS embeds into one AppleScript string literal**: escape `\`, `"` and
+   newlines (`\n`) via `esc_applescript`; multi-line JS (detect script, wait
+   polling) is fine. The whole script goes to `osascript -` via stdin (see
+   `run_osascript`), no temp files.
+4. **One session tab, reused.** `navigate` re-sets `URL of` the session tab
+   unless it vanished (then a fresh tab in the session window; the very first
+   session uses the front window). The tab becomes the active tab *of its
+   window* (so `screencapture -l` captures the right content and
+   `wait_for_human`'s visible window works) but the *window itself* stays in
+   the background - focus was restored to the pre-creation app (invariant
+   #1).
+5. **Synthetic events**: JS `click()`, native-setter `value` + `input`/`change`
+   events, `KeyboardEvent` dispatch (Enter also `form.requestSubmit()` unless
+   defaultPrevented). Covers forms/links; real OS key chords / drag&drop are
+   not reproduced. `full_page` screenshots unsupported (error); window
+   screenshots go through `screencapture -l <window id>` and need the host
+   process granted *Screen Recording* permission.
+6. **Every osascript call is wrapped in `with_timeout`** (same 90s cap) -
+   hung Chrome can't outlive the host timeout. CDP-only env vars
+   (`MCP_BROWSER_USER_DATA_DIR`, `MCP_BROWSER_HEADLESS`, `MCP_BROWSER_CHROME`,
+   `MCP_BROWSER_WS_URL` behavior wins over driver mode) don't apply here.
+
 ## Environment variables
 
 | Var | Default | Meaning |
 |---|---|---|
+| `MCP_BROWSER_DRIVER` | auto: `applescript` on macOS, else `cdp` | `applescript` = drive the user's running Chrome (never quit it, never steal focus); `cdp` = controlled Chrome instance. `MCP_BROWSER_WS_URL` forces `cdp`. |
 | `MCP_BROWSER_HEADLESS` | `0` (headed) | `1`/`true` = headless |
 | `MCP_BROWSER_CHROME` | `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` | Chrome executable |
 | `MCP_BROWSER_WS_URL` | (unset) | If set, attach via `Browser::connect` instead of launching |

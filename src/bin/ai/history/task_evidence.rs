@@ -235,12 +235,45 @@ pub(in crate::ai) fn record_delivered_task_evidence(
     })
 }
 
+/// 记录一次子代理调用（spawn）的持久化审计占位记录。
+///
+/// 与 `record_delivered_task_evidence` 共用同一张 `task_evidence` 表：spawn 先落一条
+/// `delivered_at=0` 的占位行，结果交付时按 task_id 覆盖为真实状态与载荷。占位行
+/// 不会被 `read_unintegrated_task_evidence` 投影（该查询要求 `delivered_at > 0`），
+/// 避免驱动把「从未交付的 spawn」误当成待整合证据而触发 reopen。
+pub(in crate::ai) fn record_task_spawn_audit(
+    history_file: &Path,
+    session_id: &str,
+    task_id: &str,
+    description: &str,
+    agent_name: &str,
+    model: &str,
+) -> io::Result<()> {
+    with_store_lock(history_file, session_id, || {
+        let connection = open_store(history_file, session_id)?;
+        connection
+            .execute(
+                "INSERT INTO task_evidence (
+                    task_id, description, agent_name, model, status, payload, summary,
+                    delivered_at_unix_ms, integrated_at_unix_ms, disposition, integration_summary
+                 ) VALUES (?1, ?2, ?3, ?4, 'spawned', '', '', 0, NULL, NULL, NULL)
+                 ON CONFLICT(task_id) DO NOTHING",
+                params![task_id, description, agent_name, model],
+            )
+            .map_err(|error| sqlite_error("record subagent spawn audit", error))?;
+        Ok(())
+    })
+}
+
 fn read_records_from_connection(
     connection: &Connection,
     only_unintegrated: bool,
 ) -> io::Result<Vec<TaskEvidenceRecord>> {
     let where_clause = if only_unintegrated {
-        " WHERE integrated_at_unix_ms IS NULL"
+        // 只把「已交付但尚未整合」的结果视为待整合证据；spawn 占位记录
+        // （delivered_at=0）属于审计记录而非未整合结果，避免驱动在结果
+        // 从未交付时误触发 reopen。
+        " WHERE integrated_at_unix_ms IS NULL AND delivered_at_unix_ms > 0"
     } else {
         ""
     };
@@ -295,6 +328,15 @@ pub(in crate::ai) fn read_unintegrated_task_evidence(
     session_id: &str,
 ) -> io::Result<Vec<TaskEvidenceRecord>> {
     read_records(history_file, session_id, true)
+}
+
+/// 读取当前会话的完整子代理调用台账（含已交付与未交付记录），
+/// 供 `task_audit` 工具呈现「是否调用过子代理」的可信审计视图。
+pub(in crate::ai) fn read_task_spawn_audit(
+    history_file: &Path,
+    session_id: &str,
+) -> io::Result<Vec<TaskEvidenceRecord>> {
+    read_records(history_file, session_id, false)
 }
 
 pub(in crate::ai) fn integrate_task_evidence(
@@ -708,6 +750,81 @@ mod tests {
                 .unwrap()
                 .len(),
             8
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn spawn_audit_is_durable_and_not_mistaken_for_unintegrated_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "task-evidence-audit-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let history_file = root.join("history.sqlite");
+        let session_id = "task-evidence-audit";
+
+        // spawn 占位记录：delivered=0，属于审计而非待整合证据。
+        record_task_spawn_audit(
+            &history_file,
+            session_id,
+            "task-a",
+            "check parser edge case",
+            "build",
+            "test-model",
+        )
+        .unwrap();
+        assert!(
+            read_unintegrated_task_evidence(&history_file, session_id)
+                .unwrap()
+                .is_empty(),
+            "spawn placeholder must not project as unintegrated evidence"
+        );
+        let audit = read_task_spawn_audit(&history_file, session_id).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].task_id, "task-a");
+        assert_eq!(audit[0].status, "spawned");
+        assert_eq!(audit[0].delivered_at_unix_ms, 0);
+        assert_eq!(audit[0].description, "check parser edge case");
+
+        // 结果交付后同一行被覆盖为真实状态，台账仍可查询。
+        record_delivered_task_evidence(
+            &history_file,
+            session_id,
+            DeliveredTaskEvidence {
+                task_id: "task-a",
+                description: "check parser edge case",
+                agent_name: "build",
+                model: "test-model",
+                status: "completed",
+                payload: "[Subagent final answer]\nedge case is fine",
+            },
+        )
+        .unwrap();
+        let audit = read_task_spawn_audit(&history_file, session_id).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].status, "completed");
+        assert!(audit[0].delivered_at_unix_ms > 0);
+        assert_eq!(audit[0].summary, "edge case is fine");
+
+        // 整合后台账仍保留（integrated 标记可见），不再出现在未整合投影。
+        assert!(
+            integrate_task_evidence(
+                &history_file,
+                session_id,
+                "task-a",
+                "accepted",
+                "used"
+            )
+            .unwrap()
+        );
+        let audit = read_task_spawn_audit(&history_file, session_id).unwrap();
+        assert_eq!(audit[0].disposition.as_deref(), Some("accepted"));
+        assert!(audit[0].integrated_at_unix_ms.is_some());
+        assert!(
+            read_unintegrated_task_evidence(&history_file, session_id)
+                .unwrap()
+                .is_empty()
         );
 
         let _ = fs::remove_dir_all(root);

@@ -77,6 +77,7 @@ const SUBAGENT_ORCHESTRATION_TOOL_NAMES: &[&str] = &[
     "task_status",
     "task_evidence_read",
     "task_integrate",
+    "task_audit",
     "task_cancel",
     "manage_team",
     "run_agent_graph",

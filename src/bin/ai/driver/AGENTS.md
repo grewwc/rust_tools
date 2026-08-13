@@ -4,7 +4,20 @@
 
 Applies to `src/bin/ai/driver/**` and nearby driver-facing glue. Key areas are
 prompt assembly in `skill_runtime.rs`, turn orchestration in `turn_runtime/`,
-and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`.
+and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`, plus the
+driver-owned infrastructure around them:
+
+- `scheduler.rs` / `background_dispatch.rs`: background process scheduling
+  (epochs, dispatch scoring, cooldown/circuit-breaker) and dispatch
+- `session.rs` / `process_context.rs` / `runtime_ctx.rs`: session start/resume,
+  history-path + background-context helpers, and the authoritative runtime
+  context (`effective_cwd`)
+- `agent_routing.rs`: skill manifest loading, primary agent activation, hot-reload
+- `mcp_init.rs` / `mcp_lifecycle.rs`: MCP server bootstrap and lifecycle
+- `model.rs` / `input.rs` / `signal.rs` / `hooks.rs`: model resolution for
+  input, user input, SIGINT handling, and lifecycle hooks
+- `observer.rs` / `decision_log.rs` / `note_search.rs` / `skill_watcher.rs`:
+  turn observation, decision logging, note search, and skill-file watching
 
 ## Key invariants
 

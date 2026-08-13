@@ -1,6 +1,6 @@
 {
   "name": "apply_patch",
-  "description": "Apply localized file edits. For one substring on one line, use `*** Replace in line:`. For larger or multi-file changes, use a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:`, or `*** Delete File:` sections. A plain unified diff is also accepted; multi-file diffs (git-style `diff --git` headers or `---`/`+++` pairs) are split and applied per file automatically, and `file_path` is needed only when the diff has no header. Copy source text exactly, without `read_file` line-number prefixes — re-read with `read_file(use_line_numbers=false)` to get prefix-free raw output. On failure, rebuild from the current text echoed in the error. For large patches, write the patch to a temp file (write_file(temp=true)) and pass its path as `patch_file` instead of the inline `patch` text.",
+  "description": "Apply localized file edits using `*** Replace in line:`, a `*** Begin Patch` envelope, or a unified diff. Prefer the smallest format that fits; use patch_file for large patches.",
   "parameters": {
     "type": "object",
     "properties": {

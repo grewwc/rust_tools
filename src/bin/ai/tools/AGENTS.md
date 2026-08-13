@@ -38,7 +38,11 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
    with an explicit `*** Delete File:` section. Paths already registered in the
    session temp registry (e.g. a subagent's isolated temp dir) are writable by
    `write_file`/`apply_patch` even outside `effective_cwd`/allowed roots — the
-   registry is the authoritative same-session temp allowlist.
+   registry is the authoritative same-session temp allowlist. The user skills
+   directory (`ai.skills.dir`, default `~/.config/rust_tools/skills`) is also an
+   always-writable root for `apply_patch`/`write_file` so the model can create
+   and edit user `.skill` files outside `effective_cwd`/allowed roots; keep that
+   carve-out in sync with `configured_write_roots` in `storage/file_store.rs`.
 7. **Process groups.** `execute_command` runs in its own process group. Keep
    background pgids in the in-memory session registry and kill by process group at
    teardown; do not persist pgids across restarts.

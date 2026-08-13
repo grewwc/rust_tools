@@ -353,7 +353,8 @@ fn config_extra_sensitive_substrings() -> Vec<String> {
 }
 
 /// 计算当前生效的可写根目录集合：`ai.sandbox.allowed_roots` 非空时用其配置，
-/// 为空（默认）时退回 `effective_cwd()`；session 临时目录始终追加为可写根。
+/// 为空（默认）时退回 `effective_cwd()`；session 临时目录与用户技能目录
+/// （`ai.skills.dir`，默认 `~/.config/rust_tools/skills`）始终追加为可写根。
 /// 返回值同时用于写权限校验与「写被拒」错误提示中的可写路径建议，避免两处漂移。
 fn configured_write_roots(base: &Path) -> Vec<PathBuf> {
     let raw = crate::commonw::configw::get_all_config().get(
@@ -376,6 +377,18 @@ fn configured_write_roots(base: &Path) -> Vec<PathBuf> {
         if !roots.iter().any(|r| temp.starts_with(r)) {
             roots.push(temp);
         }
+    }
+    // 用户技能目录（ai.skills.dir，默认 ~/.config/rust_tools/skills）始终可写：
+    // 模型需要创建 / 编辑用户 .skill 文件，该目录在 effective_cwd / allowed_roots
+    // 之外，不能因此被 apply_patch / write_file 沙箱拦截（save_skill 已直接写该目录）。
+    let skills = crate::ai::skills::skills_dir();
+    let skills = if skills.is_absolute() {
+        normalize_lexical(&skills)
+    } else {
+        normalize_lexical(&base.join(skills))
+    };
+    if !roots.iter().any(|r| skills.starts_with(r)) {
+        roots.push(skills);
     }
     roots
 }
@@ -711,6 +724,20 @@ mod tests {
         assert!(
             path_within_allowed_roots(&target),
             "session temp dir path must be within allowed write roots: {}",
+            target.display()
+        );
+    }
+
+    #[test]
+    fn skills_dir_is_always_writable() {
+        // 用户技能目录（ai.skills.dir，默认 ~/.config/rust_tools/skills）即使不在
+        // effective_cwd / allowed_roots 之下也应可写：模型需要用 apply_patch /
+        // write_file 创建、编辑用户 .skill 文件，不能因此被沙箱拦截。
+        let skills = crate::ai::skills::skills_dir();
+        let target = skills.join(format!("sandbox-test-{}.skill", uuid::Uuid::new_v4()));
+        assert!(
+            path_within_allowed_roots(&target),
+            "skills dir path must be within allowed write roots: {}",
             target.display()
         );
     }

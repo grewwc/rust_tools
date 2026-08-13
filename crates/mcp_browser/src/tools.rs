@@ -14,7 +14,7 @@ use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
 
 /// 每操作超时（毫秒）。默认 90s，短于宿主 request_timeout_ms（建议 120s），
 /// 使超时由 server 侧兜底、返回干净错误，而非被宿主 kill 掉整个会话。
-fn op_timeout_ms() -> u64 {
+pub(crate) fn op_timeout_ms() -> u64 {
     std::env::var("MCP_BROWSER_OP_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -781,7 +781,7 @@ async fn tool_screenshot(
 
 /// 解析截图落盘路径：显式 path > MCP_BROWSER_SCREENSHOT_DIR > 系统临时目录/mcp_browser。
 /// 目录不存在则创建；返回绝对路径。
-fn resolve_screenshot_path(explicit: Option<String>) -> Result<PathBuf, JsonRpcErr> {
+pub(crate) fn resolve_screenshot_path(explicit: Option<String>) -> Result<PathBuf, JsonRpcErr> {
     let path = if let Some(p) = explicit {
         PathBuf::from(p)
     } else {
