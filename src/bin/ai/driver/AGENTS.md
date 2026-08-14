@@ -4,8 +4,9 @@
 
 Applies to `src/bin/ai/driver/**` and nearby driver-facing glue. Key areas are
 prompt assembly in `skill_runtime.rs`, turn orchestration in `turn_runtime/`,
-and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs`, plus the
-driver-owned infrastructure around them:
+and driver-side subagent lifecycle in `turn_runtime/orchestrator.rs` (with
+split siblings `loop_detection.rs` / `checkpoint.rs` / `progress.rs` / `notes.rs`
+/ `tests.rs`), plus the driver-owned infrastructure around them:
 
 - `scheduler.rs` / `background_dispatch.rs`: background process scheduling
   (epochs, dispatch scoring, cooldown/circuit-breaker) and dispatch
