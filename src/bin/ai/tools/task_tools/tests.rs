@@ -193,6 +193,9 @@ fn task_spawn_batch_rejects_unbounded_fan_out() {
 
 #[test]
 fn task_wait_hints_lone_spawn_and_consumes_hint_once() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     super::reset_last_spawn_batch_for_test();
     super::record_last_spawn_batch(vec!["t-1".to_string()]);
 
@@ -208,6 +211,9 @@ fn task_wait_hints_lone_spawn_and_consumes_hint_once() {
 
 #[test]
 fn task_wait_no_hint_for_multi_task_spawn() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     super::reset_last_spawn_batch_for_test();
     super::record_last_spawn_batch(vec!["t-1".to_string(), "t-2".to_string()]);
     assert!(
@@ -219,6 +225,9 @@ fn task_wait_no_hint_for_multi_task_spawn() {
 
 #[test]
 fn task_wait_no_hint_when_waiting_unrelated_task() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     super::reset_last_spawn_batch_for_test();
     super::record_last_spawn_batch(vec!["t-1".to_string()]);
     assert!(
@@ -232,6 +241,9 @@ fn task_wait_no_hint_when_waiting_unrelated_task() {
 
 #[test]
 fn task_wait_no_hint_after_newer_spawn() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     super::reset_last_spawn_batch_for_test();
     super::record_last_spawn_batch(vec!["t-1".to_string()]);
     super::record_last_spawn_batch(vec!["t-2".to_string()]);

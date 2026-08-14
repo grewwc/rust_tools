@@ -2500,7 +2500,7 @@ fn history_retains_turns_under_cap() {
         let path =
             std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
         for i in 0..turns {
-            append_history_messages(
+            append_history_messages_retry_transient(
                 &path,
                 &[
                     Message {
@@ -2534,6 +2534,31 @@ fn history_retains_turns_under_cap() {
     }
 }
 
+/// sqlite 首次打开/WAL 初始化在并行测试负载下可能瞬时报 SQLITE_IOERR（映射为 WouldBlock），
+/// 属于瞬时错误：短退避重试几次（与生产 async 路径的 WouldBlock 重试语义一致）。
+fn append_history_messages_retry_transient(
+    path: &std::path::Path,
+    messages: &[Message],
+) -> std::io::Result<()> {
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..5 {
+        match append_history_messages(path, messages) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                last_err = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "transient append retries exhausted",
+        )
+    }))
+}
+
 #[test]
 fn canonical_history_never_compacts_old_turns() {
     let turns = MAX_HISTORY_TURNS + 50;
@@ -2541,7 +2566,7 @@ fn canonical_history_never_compacts_old_turns() {
         let path =
             std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
         for i in 0..turns {
-            append_history_messages(
+            append_history_messages_retry_transient(
                 &path,
                 &[
                     Message {
@@ -2595,7 +2620,7 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
     let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
 
     for i in 0..240 {
-        append_history_messages(
+        append_history_messages_retry_transient(
             &path,
             &[
                 Message {
@@ -2645,7 +2670,7 @@ fn context_history_keep_last_counts_user_turns_not_raw_messages() {
     let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
 
     for i in 0..6 {
-        append_history_messages(
+        append_history_messages_retry_transient(
             &path,
             &[
                 Message {
@@ -2715,7 +2740,7 @@ fn context_history_summary_keeps_tool_names_and_results() {
     let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
 
     for i in 0..8 {
-        append_history_messages(
+        append_history_messages_retry_transient(
             &path,
             &[
                 Message {
