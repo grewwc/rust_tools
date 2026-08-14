@@ -1,6 +1,6 @@
 ---
 name: audit-fast
-description: Quick bounded code review (fast mode: current session model with high reasoning, fewer steps, shorter timeout)
+description: Quick bounded code review for light/simple changes ONLY (current session model, high thinking, fewer steps, shorter timeout). Not the default audit agent — substantive audits must use the audit agent.
 mode: all
 color: info
 model_tier: standard

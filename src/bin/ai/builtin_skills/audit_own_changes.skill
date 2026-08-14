@@ -1,7 +1,7 @@
 ---
 name: audit_own_changes
 version: 1.0.0
-description: 在 main agent 完成某个用户需求的改动后使用。根据自己本次的改动生成审计指令，用 task 工具（agent: audit / audit-fast）启动审计 subagent，或请用户执行 /audit -f，只审计 main agent 自己做的改动、不审计其他人的改动；随后 main agent 接管并 double check 审计结果，据此做下一步改动。
+description: 在 main agent 完成某个用户需求的改动后使用。根据自己本次的改动生成审计指令，用 task 工具（agent: audit）启动完整审计 subagent（仅轻量复查才用 agent: audit-fast），或请用户执行 /audit（完整审计；仅轻量复查用 /audit -f），只审计 main agent 自己做的改动、不审计其他人的改动；随后 main agent 接管并 double check 审计结果，据此做下一步改动。
 author: rust_tools
 priority: 0
 ---
@@ -27,8 +27,8 @@ priority: 0
 
 先澄清：`/audit [-f] <指令>` 是**用户键入的交互命令**（运行时在模型循环前拦截执行），**模型无法自己调用它**；它也不是 shell 命令——**不要**用 execute_command 执行 `/audit ...`，shell 里没有该命令，会直接失败。
 
-- **标准路径（模型自主启动）**：用 `task` 工具启动审计 subagent，把 xxxx 作为 prompt 传入；可指定 `agent: "audit"`（轻量复查用 `agent: "audit-fast"`）。此路径不会自动注入本会话改动上下文，因此 xxxx 必须完全自包含（见第 1 步），必要时在 xxxx 中要求子代理用 git diff / read_file 自行核对。
-- **可选（用户在场）**：把 xxxx 交给用户执行 `/audit -f xxxx`（`-f` 即 fast 模式：当前会话模型 + high 思考 + 更少步数 + 更短超时）。运行时会自动附带本会话 main agent 已做的文件改动上下文，审计 subagent 基于 xxxx 圈定的边界做审计。
+- **标准路径（模型自主启动）**：用 `task` 工具启动审计 subagent，把 xxxx 作为 prompt 传入；默认用 `agent: "audit"`（完整审计），**仅当本次改动小、风险低（轻量复查）时才用 `agent: "audit-fast"`**——按任务复杂性自行判断，不要默认降级到 audit-fast；用户明确要求 audit/审计时一律用 `audit`。此路径不会自动注入本会话改动上下文，因此 xxxx 必须完全自包含（见第 1 步），必要时在 xxxx 中要求子代理用 git diff / read_file 自行核对。
+- **可选（用户在场）**：把 xxxx 交给用户执行 `/audit xxxx`（默认完整审计）；仅当本次改动小、风险低（轻量复查）时建议用户加 `-f`（fast 模式：当前会话模型 + high 思考 + 更少步数 + 更短超时）。运行时会自动附带本会话 main agent 已做的文件改动上下文，审计 subagent 基于 xxxx 圈定的边界做审计。
 
 ### 3. subagent 审计完成后：接管 + double check
 

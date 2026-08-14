@@ -1,6 +1,6 @@
 ---
 name: audit
-description: Evidence-driven reviewer for code changes, regressions, security, reliability, and agent-behavior degradation
+description: Default full audit agent: evidence-driven reviewer for code changes, regressions, security, reliability, and agent-behavior degradation. Use for substantive audits — audit-fast is only for light/simple changes.
 mode: all
 color: warning
 model_tier: heavy
