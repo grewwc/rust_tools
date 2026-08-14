@@ -27,7 +27,7 @@ mod iteration;
 mod orchestrator;
 mod persistence;
 mod prepare;
-mod tool_result;
+pub(in crate::ai) mod tool_result;
 mod types;
 
 pub(super) use orchestrator::run_turn;
