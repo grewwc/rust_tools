@@ -35,6 +35,8 @@ pub enum DecisionType {
     SchedulerDispatch,
     /// 会话标题等辅助 LLM 任务
     SessionTitle,
+    /// 截断重试时的 reasoning effort 降档决策
+    TruncationDowngrade,
 }
 
 /// 决策记录
@@ -429,6 +431,41 @@ pub fn log_tool_invocation(
         confidence,
         outcome: None,
         execution_time_ms: Some(execution_time_ms),
+    });
+}
+
+/// 辅助函数：记录截断重试时的 reasoning effort 降档决策。
+/// 用于事后审计"哪个会话、哪一轮、因何种截断被降档/未降档"。
+pub fn log_truncation_downgrade(
+    store: &DecisionLogStore,
+    session_id: &str,
+    turn_id: usize,
+    model: &str,
+    consecutive_truncations: usize,
+    reasoning_tokens: u64,
+    completion_tokens: u64,
+    downgraded: bool,
+    note: &str,
+) {
+    store.log(DecisionLog {
+        timestamp: 0, // Will be set by log()
+        session_id: session_id.to_string(),
+        turn_id,
+        decision_type: DecisionType::TruncationDowngrade,
+        context: format!(
+            "model={} truncation#{} reasoning={}/{} completion tokens",
+            model, consecutive_truncations, reasoning_tokens, completion_tokens
+        ),
+        alternatives_considered: vec![],
+        chosen_option: if downgraded {
+            "reasoning_effort downgraded".to_string()
+        } else {
+            "reasoning_effort kept".to_string()
+        },
+        reasoning: note.to_string(),
+        confidence: None,
+        outcome: None,
+        execution_time_ms: None,
     });
 }
 

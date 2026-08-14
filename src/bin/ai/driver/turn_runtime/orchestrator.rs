@@ -73,6 +73,10 @@ const MAX_STREAM_ERROR_RETRIES: usize = 16;
 /// 连续「模型输出过长 / 工具调用 JSON 半截」截断的重试上限。
 /// stream_error 使用独立上限，不参与该计数。
 const MAX_MODEL_TRUNCATION_RETRIES: usize = 3;
+/// reasoning 占 completion tokens 的比例阈值：达到即判定为「推理吃光预算」型
+/// 截断，此时降 reasoning_effort 能直接缩短思考链、把预算让给正文；低于该阈值
+/// 说明截断主因是正文过长，降档无收益（模型没在推理），只注入收缩提示即可。
+const REASONING_BUDGET_DOMINANCE_RATIO: f64 = 0.5;
 
 /// === 长循环感知的中段压缩 ===
 /// 中段压缩的软阈值按模型 token 窗口换算（flagship 256K → ~135K 字符）。对
@@ -1167,23 +1171,75 @@ async fn run_turn_body(
                         crate::ai::models::reasoning_effort_reduces_thinking(&next_model);
 
                     if effort_helps {
-                        // 渐进式 reasoning effort 降档，把输出预算从 reasoning 让给实际内容。
-                        // resolve_reasoning_effort 每次迭代实时读该字段，改了立即对下一次生效。
-                        //
-                        // 1 次截断 → Low（减半推理开销）
-                        // 2 次截断 → None（显式最低档，真正的推理下限）
-                        // 3 次以上 → 完全禁用 reasoning（不下发 effort 字段）+ 关 thinking
-                        //
-                        // 用显式 `None`（下发 `reasoning_effort: "none"`）而非省略字段：
-                        // 省略字段会让服务端回退到自身默认档（gpt-5.x 默认 medium），
-                        // 反而把推理预算调高，破坏阶梯单调性。`None` 是各 gpt-5.x 版本
-                        // 都支持的真正下限，取代已被 gpt-5.6 系列移除、会触发 400 的
-                        // `Minimal`。
-                        app.cli.reasoning_effort_override = Some(match consecutive_truncations {
-                            1 => Some(crate::ai::provider::ReasoningEffort::Low),
-                            2 => Some(crate::ai::provider::ReasoningEffort::None),
-                            _ => None, // Some(None) = 禁用 reasoning，不下发 effort 字段
-                        });
+                        // 截断类型分流：区分「推理吃光预算」与「正文过长」两种截断。
+                        // 用服务端上报的 reasoning_tokens 占比判断——推理占比高时降档
+                        // 有效（直接缩短思考链、把预算让给正文）；正文过长时降档救不了
+                        // 预算（模型没在推理），白损失质量，只靠注入的收缩提示即可。
+                        // reasoning_tokens 未上报（0）或 completion 为 0 时按「未知」
+                        // 保守处理，走降档阶梯保底，避免新逻辑对不报 usage 明细的
+                        // provider 造成回归。
+                        let reasoning_reported = stream_result.usage_reasoning_tokens > 0
+                            && stream_result.usage_completion_tokens > 0;
+                        let reasoning_dominant = reasoning_reported
+                            && stream_result.usage_reasoning_tokens as f64
+                                / stream_result.usage_completion_tokens as f64
+                                >= REASONING_BUDGET_DOMINANCE_RATIO;
+                        let text_too_long = reasoning_reported && !reasoning_dominant;
+
+                        if !text_too_long {
+                            // 渐进式 reasoning effort 降档，把输出预算从 reasoning 让给
+                            // 实际内容。resolve_reasoning_effort 每次迭代实时读该字段，
+                            // 改了立即对下一次生效。
+                            //
+                            // 1 次截断 → High（略降推理开销）
+                            // 2 次截断 → Medium（进一步缩短思考链）
+                            // 3 次以上 → Low（保留最小推理能力的下限）
+                            //
+                            // 相比旧版 2 次即归零（None/禁用）的重度阉割，这里保留推理
+                            // 能力更温和：实测 effort 每降一档能省约 15-20% 预算，且模型
+                            // 仍保留思考能力。thinking 关闭只留给第 3 次兜底（见下）。
+                            // 本阶梯刻意不下发 `reasoning_effort: "none"`：显式 none 会
+                            // 彻底阉割推理，而省略字段会让服务端回退到自身默认档
+                            // （gpt-5.x 默认 medium）反而调高预算，两者都不适合作为
+                            // 截断收敛手段。
+                            app.cli.reasoning_effort_override =
+                                Some(match consecutive_truncations {
+                                    1 => Some(crate::ai::provider::ReasoningEffort::High),
+                                    2 => Some(crate::ai::provider::ReasoningEffort::Medium),
+                                    _ => Some(crate::ai::provider::ReasoningEffort::Low),
+                                });
+                            let note = if reasoning_dominant {
+                                "reasoning ate the output budget; downgrading effort to free budget for visible text"
+                            } else {
+                                "reasoning usage unreported; conservative effort downgrade"
+                            };
+                            crate::ai::driver::decision_log::log_truncation_downgrade(
+                                crate::ai::driver::decision_log::get_decision_log_store(),
+                                &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+                                crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+                                &next_model,
+                                consecutive_truncations,
+                                stream_result.usage_reasoning_tokens,
+                                stream_result.usage_completion_tokens,
+                                true,
+                                note,
+                            );
+                        } else {
+                            // 正文过长型截断：不降 effort（模型没在推理，降了也救不了
+                            // 预算），仅靠已注入的 output_truncated 收缩提示让模型缩小
+                            // 输出。记录决策供事后审计。
+                            crate::ai::driver::decision_log::log_truncation_downgrade(
+                                crate::ai::driver::decision_log::get_decision_log_store(),
+                                &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+                                crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+                                &next_model,
+                                consecutive_truncations,
+                                stream_result.usage_reasoning_tokens,
+                                stream_result.usage_completion_tokens,
+                                false,
+                                "visible text dominated the output budget; keeping effort, prompting shrink only",
+                            );
+                        }
                         // effort 阶梯走到第 3 档仍截断，说明仅靠降 effort 已不足以收敛，
                         // 叠加强制关闭 thinking 作为兜底，把整个输出预算让给可见内容。
                         if consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES {
