@@ -559,7 +559,7 @@ mod tests {
             list_spec.name,
             list_spec.description,
         );
-        assert!(list_skills.contains("Use this proactively"));
+        assert!(list_skills.contains("Use proactively"));
         assert!(list_skills.contains("technical keywords"));
         assert!(
             list_skills
@@ -572,7 +572,7 @@ mod tests {
             activate_spec.name,
             activate_spec.description,
         );
-        assert!(activate_skill.contains("proactively use `list_skills`"));
+        assert!(activate_skill.contains("use `list_skills`"));
         assert!(activate_skill.contains("technical keywords"));
     }
 

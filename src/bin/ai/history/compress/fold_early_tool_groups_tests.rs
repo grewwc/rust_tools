@@ -902,7 +902,7 @@ fn summary_model_input_drops_ephemeral_internal_notes() {
     );
     assert!(note.contains("src/lib.rs"), "{note}");
     let note = value_to_string(&messages[2].content);
-    assert!(note.contains("已有历史摘要"), "{note}");
+    assert!(note.contains("Existing history summary"), "{note}");
     assert!(note.contains("初始目标: 保留"), "{note}");
     assert!(!note.contains("self_note"), "{note}");
     assert!(!note.contains("tool_followup"), "{note}");

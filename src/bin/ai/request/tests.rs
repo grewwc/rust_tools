@@ -1888,7 +1888,10 @@ fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
 /// 否则默认开启的长推理链会撑爆辅助任务超时。
 #[test]
 fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
-    for model in ["qwen3.7-plus", "deepseek-v4-pro", "kimi-k2.7-code"] {
+    // 仅 DashScope（alibaba adapter）模型走 enable_thinking 字段；
+    // deepseek-v4-pro 已迁往 OpenCode 网关（走 thinking 对象，见下方断言），
+    // kimi-k2.7-code 已不在 models.json 注册表中。
+    for model in ["qwen3.7-plus", "qwen3.7-max", "deepseek-v4-flash-0731"] {
         let mut body = json!({ "model": model, "messages": [], "stream": false });
         apply_aux_thinking_fields(model, &mut body);
         assert_eq!(

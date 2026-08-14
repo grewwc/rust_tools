@@ -656,7 +656,7 @@ fn history_compression_inserts_summary_and_keeps_recent() {
             .content
             .as_str()
             .unwrap_or_default()
-            .contains("初始目标: u0")
+            .contains("Main request: u0")
     );
     assert_eq!(
         compressed.last().unwrap().content,
@@ -711,7 +711,7 @@ fn history_compression_summarizes_when_keep_last_exceeds_turns_but_budget_overfl
         "summary header missing: {note_text:?}"
     );
     assert!(
-        note_text.contains("初始目标: QUESTION_00"),
+        note_text.contains("Main request: QUESTION_00"),
         "summary should preserve the initial goal, got: {note_text:?}"
     );
     // The summary should at least preserve a non-trivial textual trace of
@@ -1878,8 +1878,48 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         reasoning_content: None,
     }];
     // 10 组 read_file 调用，每条结果超过 8000 字符且内容各异，避免先命中
-    // byte-identical dedup；远端组（非最近 6 条）应被外溢。
-    for i in 0..10usize {
+    // byte-identical dedup。前 6 组放在真实 user 消息之前，模拟「上一轮未被
+    // 压缩的 read_file 输出」——不在当前 turn 保护窗内、也不在最近 keep_recent
+    // 组内，应被零压缩外溢。
+    for i in 0..6usize {
+        let id = format!("call_{i}");
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.clone(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: format!(
+                        r#"{{"filePath":"src/lib.rs","startLine":{},"endLine":{}}}"#,
+                        i + 1,
+                        i + 40
+                    ),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        messages.push(Message {
+            role: "tool".to_string(),
+            content: Value::String(format!("chunk-{i:02}\n{}", "y".repeat(8000))),
+            tool_calls: None,
+            tool_call_id: Some(id),
+            reasoning_content: None,
+        });
+    }
+
+    // 真实 user 轮次边界：此后的 read_file 结果属于当前 turn，受 precision
+    // 保护并作为最近工具组保留全文，验证「当前轮不误伤」。
+    messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String("continue".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    for i in 6..10usize {
         let id = format!("call_{i}");
         messages.push(Message {
             role: "assistant".to_string(),

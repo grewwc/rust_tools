@@ -845,7 +845,10 @@ mod tests {
         assert_eq!(
             crate::ai::tools::registry::tool_metadata::tool_parameters("spawn_process")["properties"]
                 ["capabilities"]["properties"]["signal"],
-            serde_json::json!({ "type": "boolean" })
+            serde_json::json!({
+                "type": "boolean",
+                "description": "Allow signaling child or descendant processes."
+            })
         );
     }
 
