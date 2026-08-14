@@ -47,8 +47,9 @@ fn execute_plan(args: &Value) -> Result<String, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("unspecified");
 
-        // delegate implies parallelizable — subagent dispatch is inherently async, a
-        // delegate=true without parallelizable=true would block the parent unnecessarily.
+        // delegate 与 parallelizable 相互独立：delegate 表示"该步交给 subagent 做"（串行或
+        // 并行均可）；parallelizable 表示"与前置步无数据依赖，可并发"（显式声明，不再由
+        // delegate 蕴含）。串行委派步应逐个走同步 `task`，绝不能因 delegate 被当成并发步。
         let delegate = step_obj
             .get("delegate")
             .and_then(|v| v.as_bool())
@@ -56,8 +57,7 @@ fn execute_plan(args: &Value) -> Result<String, String> {
         let parallelizable = step_obj
             .get("parallelizable")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || delegate;
+            .unwrap_or(false);
 
         let prefix = if parallelizable { "  || " } else { "" };
         let tags = if delegate { " [delegate]" } else { "" };
@@ -70,7 +70,7 @@ fn execute_plan(args: &Value) -> Result<String, String> {
         }
     }
 
-    // 统计可委派/可并行步骤。delegate 自动计入 parallelizable。
+    // 统计可委派/可并行步骤。delegate 不再自动计入 parallelizable。
     let delegate_count: usize = steps
         .iter()
         .filter_map(|s| s.get("delegate").and_then(|v| v.as_bool()))
@@ -78,15 +78,27 @@ fn execute_plan(args: &Value) -> Result<String, String> {
         .count();
     let parallel_count: usize = steps
         .iter()
-        .filter_map(|s| {
-            let d = s.get("delegate").and_then(|v| v.as_bool()).unwrap_or(false);
-            let p = s
-                .get("parallelizable")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            Some(d || p)
-        })
+        .filter_map(|s| s.get("parallelizable").and_then(|v| v.as_bool()))
         .filter(|&b| b)
+        .count();
+    let parallel_delegates: usize = steps
+        .iter()
+        .filter(|s| {
+            s.get("delegate").and_then(|v| v.as_bool()).unwrap_or(false)
+                && s.get("parallelizable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+        })
+        .count();
+    let serial_delegates: usize = steps
+        .iter()
+        .filter(|s| {
+            s.get("delegate").and_then(|v| v.as_bool()).unwrap_or(false)
+                && !s
+                    .get("parallelizable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+        })
         .count();
 
     formatted.push_str(&format!("\n---\n{} step(s) planned.", steps.len()));
@@ -99,17 +111,21 @@ fn execute_plan(args: &Value) -> Result<String, String> {
     if parallel_count > 0 {
         formatted.push_str(&format!(" {} step(s) can run in parallel.", parallel_count));
     }
-    // 委派派发建议按 delegate 步数量给出，而非 parallel_count：delegate 蕴含
-    // parallelizable，故 parallel_count 恒 >= delegate_count，用它判分支会让
-    // "单个委派" 分支变成死代码。直接按 delegate_count 分档——
-    //   - 多个独立委派步 → 并行 task_spawn + 单次 task_wait；
-    //   - 单个委派步     → 同步 `task`（lone task_spawn+task_wait 无并发收益）。
-    if delegate_count >= 2 {
-        formatted.push_str(" Launch the independent delegated steps concurrently via task_spawn, then collect with a single task_wait.");
-    } else if delegate_count == 1 {
-        formatted.push_str(" Run the single delegated step with the synchronous `task` tool (async spawn+wait adds overhead without concurrency for one task).");
+    // 委派派发建议：并行委派步（delegate && parallelizable）走并发 task_spawn；串行委派步
+    // （delegate && !parallelizable）逐个走同步 `task`，父进程在 prompt 中传递所需上下文。
+    if delegate_count > 0 {
+        if parallel_delegates >= 2 {
+            formatted.push_str(" Launch the parallel delegated steps concurrently via task_spawn, then collect with a single task_wait.");
+        } else if parallel_delegates == 1 && serial_delegates == 0 {
+            formatted.push_str(" Run the single delegated step with the synchronous `task` tool (async spawn+wait adds overhead without concurrency for one task).");
+        } else if parallel_delegates == 1 {
+            formatted.push_str(" Spawn the single parallel delegated step via task_spawn while you run the serial ones, then collect it with task_wait.");
+        }
+        if serial_delegates > 0 {
+            formatted.push_str(" Run serial delegated steps one at a time with the synchronous `task`, passing the needed context from prior results in the prompt; never run dependent steps concurrently.");
+        }
     } else {
-        formatted.push_str(" Proceed to execute.");
+        formatted.push_str(" Proceed to execute, but reconsider: any substantive step with real intermediate reads or commands is usually better delegated to a subagent (cleaner, focused context); keep only trivial single-tool steps and final review in the parent.");
     }
     formatted.push('\n');
 
@@ -220,8 +236,7 @@ mod tests {
             ]
         });
         let result = execute_plan(&args).unwrap();
-        // delegate=true should imply parallelizable=true (both prefix same), and the
-        // delegate-guidance branch must fire because delegate>0 AND parallel>0.
+        // 显式 parallelizable=true + delegate=true：两个并行委派步 → 并发 task_spawn 分支。
         assert!(result.contains("||"));
         assert!(result.contains("[delegate]"));
         assert!(result.contains("2 step(s) marked for delegation."));
@@ -231,9 +246,10 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_delegate_without_explicit_parallelizable_counts_as_parallel() {
-        // delegate=true without explicit parallelizable: the implicit-implication rule
-        // must still treat the step as parallelizable, so parallel-aware guidance fires.
+    fn test_plan_delegate_without_parallelizable_stays_serial() {
+        // delegate=true without explicit parallelizable: the step is SERIAL — it must not
+        // get the parallel prefix or parallel counting, and guidance routes it to the
+        // sequential synchronous `task`, not concurrent task_spawn.
         let args = serde_json::json!({
             "summary": "Delegate a single independent module fix",
             "steps": [
@@ -246,22 +262,21 @@ mod tests {
             ]
         });
         let result = execute_plan(&args).unwrap();
-        // delegate-only step still gets parallel prefix and parallel-aware counting.
-        assert!(result.contains("||"));
+        assert!(!result.contains("||"));
         assert!(result.contains("[delegate]"));
         assert!(result.contains("1 step(s) marked for delegation."));
-        assert!(result.contains("1 step(s) can run in parallel."));
-        // A LONE delegated step is routed to the synchronous `task`, not an
-        // async task_spawn+task_wait (which gains no concurrency for one task).
+        assert!(!result.contains("can run in parallel."));
+        // 串行委派步 → 逐个同步 `task`；绝不并发。
         assert!(result.contains("synchronous `task`"));
+        assert!(result.contains("one at a time"));
         assert!(!result.contains("task_spawn"));
         assert!(!result.contains("Proceed to execute."));
     }
 
     #[test]
     fn test_plan_no_delegate_no_parallel_advises_proceed_to_execute() {
-        // Zero delegated and zero parallelizable steps: guidance must fall back to
-        // "Proceed to execute." with no delegation advice.
+        // Zero delegated steps: guidance falls back to "Proceed to execute." but nudges
+        // the model to reconsider delegating substantive steps.
         let args = serde_json::json!({
             "summary": "Sequential read then patch",
             "steps": [
@@ -278,20 +293,21 @@ mod tests {
             ]
         });
         let result = execute_plan(&args).unwrap();
-        assert!(result.contains("Proceed to execute."));
+        assert!(result.contains("Proceed to execute"));
+        assert!(result.contains("reconsider"));
         assert!(!result.contains("task_spawn"));
         assert!(!result.contains("[delegate]"));
     }
 
     #[test]
-    fn test_plan_multiple_delegates_advise_concurrent_task_spawn() {
-        // Two independent delegated steps: guidance must recommend concurrent
+    fn test_plan_multiple_parallel_delegates_advise_concurrent_task_spawn() {
+        // Two delegated steps with explicit parallelizable: guidance recommends concurrent
         // task_spawn + a single task_wait, not the synchronous `task`.
         let args = serde_json::json!({
             "summary": "Two independent module fixes",
             "steps": [
-                { "step": 1, "action": "Fix module A", "tool": "apply_patch", "delegate": true },
-                { "step": 2, "action": "Fix module B", "tool": "apply_patch", "delegate": true }
+                { "step": 1, "action": "Fix module A", "tool": "apply_patch", "delegate": true, "parallelizable": true },
+                { "step": 2, "action": "Fix module B", "tool": "apply_patch", "delegate": true, "parallelizable": true }
             ]
         });
         let result = execute_plan(&args).unwrap();
@@ -299,5 +315,42 @@ mod tests {
         assert!(result.contains("concurrently via task_spawn"));
         assert!(result.contains("single task_wait"));
         assert!(!result.contains("synchronous `task`"));
+    }
+
+    #[test]
+    fn test_plan_multiple_serial_delegates_advise_sequential_task() {
+        // Two delegated steps WITHOUT parallelizable are dependent/serial: they must run
+        // one at a time via the synchronous `task` — never concurrently via task_spawn.
+        let args = serde_json::json!({
+            "summary": "Two dependent module fixes",
+            "steps": [
+                { "step": 1, "action": "Fix module A", "tool": "apply_patch", "delegate": true },
+                { "step": 2, "action": "Fix module B", "tool": "apply_patch", "delegate": true }
+            ]
+        });
+        let result = execute_plan(&args).unwrap();
+        assert!(result.contains("2 step(s) marked for delegation."));
+        assert!(result.contains("one at a time with the synchronous `task`"));
+        assert!(result.contains("never run dependent steps concurrently"));
+        assert!(!result.contains("can run in parallel."));
+        assert!(!result.contains("task_spawn"));
+    }
+
+    #[test]
+    fn test_plan_mixed_parallel_and_serial_delegates() {
+        // 一个并行委派步 + 一个串行委派步：并行步用 task_spawn 并发跑，串行步逐个同步
+        // `task`，两条建议都出现。
+        let args = serde_json::json!({
+            "summary": "One independent fix plus one dependent step",
+            "steps": [
+                { "step": 1, "action": "Fix module A", "tool": "apply_patch", "delegate": true, "parallelizable": true },
+                { "step": 2, "action": "Fix module B", "tool": "apply_patch", "delegate": true }
+            ]
+        });
+        let result = execute_plan(&args).unwrap();
+        assert!(result.contains("Spawn the single parallel delegated step via task_spawn"));
+        assert!(result.contains("one at a time with the synchronous `task`"));
+        assert!(result.contains("1 step(s) can run in parallel."));
+        assert!(result.contains("2 step(s) marked for delegation."));
     }
 }

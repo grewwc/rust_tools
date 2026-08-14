@@ -1,6 +1,6 @@
 {
   "name": "plan",
-  "description": "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. `delegate: true` implies `parallelizable: true` (delegation is inherently async). Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly.",
+  "description": "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. Delegate every substantive step to a subagent - serial or parallel - so each step runs with a clean, focused context and you review the results; keep in the parent only trivial single-tool steps, tightly coupled overlapping edits, and final review/synthesis. Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -28,11 +28,11 @@
             },
             "parallelizable": {
               "type": "boolean",
-              "description": "Whether this step can run in parallel with the previous step (no data dependency). Default: false."
+              "description": "Whether this step can run in parallel with the previous step (no data dependency on earlier steps). Default: false. Only meaningful when set explicitly - it no longer follows from `delegate`; a delegated step is serial unless you set this to true."
             },
             "delegate": {
               "type": "boolean",
-              "description": "Whether this step should be delegated to a subagent. `delegate: true` implies `parallelizable: true` (a subagent should not block the parent synchronously); set `parallelizable` explicitly only when true without delegation. Multiple independent delegated steps run concurrently; a lone delegated step runs synchronously."
+              "description": "Whether this step should be delegated to a subagent. Delegate every substantive step, serial or parallel: the subagent runs with a clean, focused context and you review its result. Serial delegated steps run one at a time via the synchronous `task` (hand the needed context from prior results in the prompt); steps with `parallelizable: true` run concurrently via task_spawn. Keep in the parent only trivial single-tool steps, tightly coupled overlapping edits, and final review/synthesis."
             }
           },
           "required": [

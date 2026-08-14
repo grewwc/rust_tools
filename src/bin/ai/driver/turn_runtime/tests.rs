@@ -1071,7 +1071,7 @@ fn agent_team_read_only_breadth_note_redirects_to_delegation() {
         .as_str()
         .expect("breadth note should be text");
     assert!(team_note.contains("`agent-team` is active"));
-    assert!(team_note.contains("delegate any genuinely independent remaining branches"));
+    assert!(team_note.contains("delegate any remaining branches now"));
 
     let mut ordinary_messages = Vec::new();
     inject_read_only_breadth_note(&mut ordinary_messages, false);

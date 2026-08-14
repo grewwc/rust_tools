@@ -358,9 +358,10 @@ impl ThinkingOrchestrator {
 
     // ── P3: 上下文预算感知的委派提醒 ──────────────────────────────
     //
-    // 当对话已经很长（turn_index 超过阈值）且 agent 拥有 task_spawn 工具时，
-    // 注入一条提醒：仅把边界清晰且有净收益的独立分支委派给 subagent，避免主 agent
-    // 上下文继续膨胀导致注意力分散和 token 浪费，也避免为并发而无效扇出。
+    // 当对话已经很长（turn_index 超过阈值）且 agent 拥有 task 工具时，
+    // 注入一条提醒：把剩余聚焦、有界的子步骤（串行或并行皆可）委派给 subagent，
+    // 换取干净子上下文，避免主 agent 上下文继续膨胀导致注意力分散和 token 浪费，
+    // 但不要把当前未解决分支整块丢给子代理逃避压力。
     const CONTEXT_BUDGET_TURN_THRESHOLD: usize = 12;
 
     fn build_context_budget_nudge(
@@ -387,11 +388,12 @@ impl ThinkingOrchestrator {
         Some(format!(
             "[Context Budget] This conversation has been going for {}+ turns. \
              Your context is growing large, which can disperse attention and waste tokens. \
-             If the remaining work contains focused, independent, bounded sub-parts likely to generate \
-             substantial intermediate evidence, context isolation is a valid benefit when the subagent \
-             can return a concise evidence-backed result. {}. Do not delegate merely because the \
-             conversation is long, and do not hand off tightly coupled or unresolved work. Reserve your \
-             context for orchestration, consequential decisions, and synthesis.",
+             If the remaining work contains focused, bounded sub-parts (serial or parallel) likely to \
+             generate substantial intermediate evidence, context isolation is a valid benefit when the \
+             subagent can return a concise evidence-backed result. {}. Delegate those sub-parts one at a \
+             time (serial) or concurrently (parallel), then review their results; do not hand off the \
+             current unresolved branch just to escape context pressure. Reserve your context for \
+             orchestration, consequential decisions, and synthesis.",
             turn_index,
             routing,
         ))
@@ -758,11 +760,12 @@ mod tests {
         let tools = vec!["task".to_string(), "task_spawn".to_string()];
         // 低于阈值 → 不注入
         assert!(orch.build_context_budget_nudge(5, &tools).is_none());
-        // 达到阈值且拥有 task_spawn → 注入，但仍保留有净收益的委派门槛。
+        // 达到阈值且拥有 task_spawn → 注入；串行/并行子步骤都可委派，但不得整块甩锅。
         let nudge = orch.build_context_budget_nudge(15, &tools).unwrap();
         assert!(nudge.contains("context isolation is a valid benefit"));
         assert!(nudge.contains("Use task for one focused investigation"));
-        assert!(nudge.contains("Do not delegate merely because the conversation is long"));
+        assert!(nudge.contains("Delegate those sub-parts one at a time"));
+        assert!(nudge.contains("do not hand off the current unresolved branch"));
         // 只有同步 task 时也应提醒；两个委派工具都没有时才不注入。
         let task_only = vec!["task".to_string()];
         assert!(

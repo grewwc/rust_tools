@@ -331,6 +331,98 @@ impl CommandCompleter {
         candidates
     }
 
+    /// 模型名补全匹配等级：
+    /// - 0：replacement 前缀匹配（原行为，大小写不敏感）
+    /// - 1：“名称 + 平台”两段式匹配，如 `deep-v` → `deepseek-v4-flash-volcano`
+    /// - 2：逐段前缀匹配，如 `deep-v` → 所有 `deepseek-v4-*`
+    /// 不匹配返回 None。
+    fn model_token_match_rank(
+        token: &str,
+        model: &crate::ai::model_names::ModelDef,
+    ) -> Option<u8> {
+        let token = token.trim().to_ascii_lowercase();
+        // 空 token（如 `/model ` 后直接按 Tab）时，空前缀匹配所有模型（原行为）。
+        let replacement = Self::model_replacement(model).to_ascii_lowercase();
+        if replacement.starts_with(&token) {
+            return Some(0);
+        }
+        // 两段式：最后一个分段当作平台前缀，如 `deep-v` → `deep` + 平台 `v`。
+        if let Some((head, tail)) = token.rsplit_once(['-', '.', '_', '/', ':', ' ']) {
+            if !head.is_empty() && !tail.is_empty() {
+                let key = model.key.to_ascii_lowercase();
+                let name = model.name.to_ascii_lowercase();
+                let platform = crate::ai::model_names::platform_slug(model).to_ascii_lowercase();
+                let head_matches = key.starts_with(&head) || name.starts_with(&head);
+                if head_matches && platform.starts_with(tail) {
+                    return Some(1);
+                }
+            }
+        }
+        // 逐段前缀匹配：query 每段在候选各段中按顺序前缀命中（允许跳段）。
+        if Self::segments_prefix_match(&token, &Self::model_searchable_text(model).to_ascii_lowercase()) {
+            return Some(2);
+        }
+        None
+    }
+
+    /// 用于逐段匹配的搜索文本：key + name + platform + aliases。
+    fn model_searchable_text(model: &crate::ai::model_names::ModelDef) -> String {
+        let mut text = format!("{} {}", model.key, model.name);
+        let platform = crate::ai::model_names::platform_slug(model);
+        if !platform.is_empty() {
+            text.push(' ');
+            text.push_str(&platform);
+        }
+        for alias in &model.aliases {
+            text.push(' ');
+            text.push_str(alias);
+        }
+        text
+    }
+
+    /// 把 query 与 candidate 按 `- . _ / : 空白` 分段，要求 query 的每一段
+    /// 都能按顺序前缀命中 candidate 的某一段（允许跳段）。
+    fn segments_prefix_match(query: &str, candidate: &str) -> bool {
+        let q_segments: Vec<&str> = query
+            .split(['-', '.', '_', '/', ':', ' '])
+            .filter(|seg| !seg.is_empty())
+            .collect();
+        if q_segments.is_empty() {
+            return false;
+        }
+        let c_segments: Vec<&str> = candidate
+            .split(['-', '.', '_', '/', ':', ' '])
+            .filter(|seg| !seg.is_empty())
+            .collect();
+        let mut qi = 0;
+        for seg in &c_segments {
+            if seg.starts_with(q_segments[qi]) {
+                qi += 1;
+                if qi == q_segments.len() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 通用名称补全匹配等级（agent / skill 等）：
+    /// - 0：replacement 前缀匹配（原行为，大小写不敏感）
+    /// - 1：逐段前缀匹配（replacement），如 `fast` → `audit-fast`、`own` → `audit_own_changes`
+    /// 只匹配名称本身：描述仅用于展示、不参与匹配（避免 `audit_o` 误命中描述中
+    /// 含 "audits of" 等词的无关 skill）。
+    /// 不匹配返回 None。
+    fn name_token_match_rank(token: &str, replacement: &str) -> Option<u8> {
+        let token = token.trim().to_ascii_lowercase();
+        if replacement.to_ascii_lowercase().starts_with(&token) {
+            return Some(0);
+        }
+        if Self::segments_prefix_match(&token, &replacement.to_ascii_lowercase()) {
+            return Some(1);
+        }
+        None
+    }
+
     fn agent_subcommands() -> &'static [&'static str] {
         &["help", "list", "current", "use", "auto", "reload"]
     }
@@ -358,9 +450,19 @@ impl CommandCompleter {
             // 同步回退到磁盘扫描，与技能补全 SKILL_NAME_CANDIDATES=None 的回退一致。
             Self::agent_candidates_from_manifests(&crate::ai::agents::load_all_agents())
         };
-        candidates
+        // 智能匹配：前缀（rank 0）> 逐段前缀（rank 1，如 `fast` → `audit-fast`），
+        // 与 model 补全一致。只匹配名称，描述仅用于展示。
+        let mut matched: Vec<(u8, CompletionCandidate)> = candidates
             .into_iter()
-            .filter(|candidate| candidate.replacement.starts_with(token))
+            .filter_map(|candidate| {
+                Self::name_token_match_rank(token, &candidate.replacement)
+                    .map(|rank| (rank, candidate))
+            })
+            .collect();
+        matched.sort_by_key(|(rank, _)| *rank);
+        matched
+            .into_iter()
+            .map(|(_, candidate)| candidate)
             .collect()
     }
 
@@ -510,10 +612,23 @@ impl CommandCompleter {
                 match second {
                     None => {
                         // 第二个 token：模型名（带 current 置顶）+ `/model` 子命令字面量。
-                        // 模型名放在前面以保留"当前模型 == 第一项"的体验。
-                        let mut merged: Vec<CompletionCandidate> = Self::model_name_candidates()
+                        // 模型名用智能匹配（前缀 > 名称+平台两段式 > 逐段前缀），
+                        // 使 `deep-v` 也能补全到 `deepseek-v4-flash-volcano`。
+                        let mut matched: Vec<(u8, CompletionCandidate)> =
+                            Self::model_name_candidates()
+                                .into_iter()
+                                .filter_map(|candidate| {
+                                    let model = crate::ai::model_names::find_by_identifier(
+                                        &candidate.replacement,
+                                    )?;
+                                    Self::model_token_match_rank(token, model)
+                                        .map(|rank| (rank, candidate))
+                                })
+                                .collect();
+                        matched.sort_by_key(|(rank, _)| *rank);
+                        let mut merged: Vec<CompletionCandidate> = matched
                             .into_iter()
-                            .filter(|candidate| candidate.replacement.starts_with(token))
+                            .map(|(_, candidate)| candidate)
                             .collect();
                         merged.extend(
                             Self::model_subcommands()
@@ -561,27 +676,40 @@ impl CommandCompleter {
                             .split_whitespace()
                             .skip(1)
                             .collect();
-                        let mut candidates: Vec<CompletionCandidate> = Vec::new();
+                        let mut matched: Vec<(u8, CompletionCandidate)> = Vec::new();
                         if consumed.is_empty() {
                             // 第一个参数位置：子命令字面量也参与提示（`/skills us<TAB>` → use）
                             for sub in Self::skills_subcommands() {
                                 if sub.starts_with(token) {
-                                    candidates.push(CompletionCandidate {
-                                        display: format!("{sub} · subcommand"),
-                                        replacement: sub.to_string(),
-                                    });
+                                    matched.push((
+                                        0,
+                                        CompletionCandidate {
+                                            display: format!("{sub} · subcommand"),
+                                            replacement: sub.to_string(),
+                                        },
+                                    ));
                                 }
                             }
                         }
                         for c in Self::skill_name_candidates() {
-                            if c.replacement.starts_with(token)
-                                && !consumed
-                                    .iter()
-                                    .any(|t| t.eq_ignore_ascii_case(&c.replacement))
+                            if consumed
+                                .iter()
+                                .any(|t| t.eq_ignore_ascii_case(&c.replacement))
                             {
-                                candidates.push(c);
+                                continue;
+                            }
+                            if let Some(rank) =
+                                Self::name_token_match_rank(token, &c.replacement)
+                            {
+                                matched.push((rank, c));
                             }
                         }
+                        // 稳定排序：同 rank 保持子命令在前、skill 按 manifest 顺序。
+                        matched.sort_by_key(|(rank, _)| *rank);
+                        let candidates: Vec<CompletionCandidate> = matched
+                            .into_iter()
+                            .map(|(_, candidate)| candidate)
+                            .collect();
                         return (
                             token_start,
                             candidates,
@@ -622,12 +750,12 @@ impl CommandCompleter {
 
 /// 技能补全。触发与过滤规则（`<filter>` 大小写不敏感）：
 /// - `@ski` / `@skil` / `@skill` / `@skills`（"skills" 的前缀，≥3 字符）：列出全部 skill；
-/// - `@skill<filter>` / `@skills<filter>`：输完关键字后直接续打字母即按前缀过滤，
+/// - `@skill<filter>` / `@skills<filter>`：输完关键字后直接续打字母即按名称过滤，
 ///   例如 `@skillhum` → 匹配以 `hum` 开头的 skill；
 /// - `@skill:<filter>` / `@skills:<filter>`：带冒号的等价写法（补全选中后插入的规范形式）。
 ///
-/// 前缀匹配用项目内的 [`Trie`](rust_tools::cw::Trie) 实现：把全部 skill 名（小写）插入
-/// 字典树，再用 `words_with_prefix` 取出命中集合。选中后行内变成 `@skills:<name>`，
+/// 匹配用 [`CommandCompleter::name_token_match_rank`] 的智能匹配（前缀 > 逐段前缀），
+/// 如 `@skills:own` → `audit_own_changes`。选中后行内变成 `@skills:<name>`，
 /// 本轮对话将强制注入该 skill。返回 `(token_start, candidates)`，token_start 是 `@` 的字节偏移。
 fn complete_skill_reference(before: &str) -> Option<(usize, Vec<CompletionCandidate>)> {
     let (token_start, token) = find_skill_reference_token(before)?;
@@ -636,32 +764,14 @@ fn complete_skill_reference(before: &str) -> Option<(usize, Vec<CompletionCandid
 
     let skills = CommandCompleter::skill_name_candidates();
 
-    // 任一切分得到空过滤词 ⇒ 仍在输入关键字（如 `@skill`/`@skills`），列出全部。
-    let list_all = filters.iter().any(|f| f.is_empty());
-
-    // 否则用 Trie 做前缀匹配：小写 skill 名 → 命中集合（多种切分取并集）。
-    let matched: Option<rust_tools::commonw::FastSet<String>> = if list_all {
-        None
-    } else {
-        let mut trie = rust_tools::cw::Trie::new();
-        for skill in &skills {
-            trie.insert(&skill.replacement.to_ascii_lowercase());
-        }
-        let mut set = rust_tools::commonw::FastSet::default();
-        for filter in &filters {
-            for word in trie.words_with_prefix(filter) {
-                set.insert(word);
-            }
-        }
-        Some(set)
-    };
-
+    // 每个 filter 独立做智能匹配，多种切分取并集（任一命中即保留）。
+    // 空 filter（仍在输入 `@skill`/`@skills`）空前缀匹配全部，等价于"列出全部"。
     let mut candidates = Vec::new();
     for skill in &skills {
-        if let Some(set) = &matched {
-            if !set.contains(&skill.replacement.to_ascii_lowercase()) {
-                continue;
-            }
+        if !filters.iter().any(|filter| {
+            CommandCompleter::name_token_match_rank(filter, &skill.replacement).is_some()
+        }) {
+            continue;
         }
         candidates.push(CompletionCandidate {
             display: skill.display.clone(),
@@ -1038,6 +1148,52 @@ mod tests {
     }
 
     #[test]
+    fn command_completion_agent_name_matches_segments() {
+        let manifests = crate::ai::agents::load_all_agents();
+        CommandCompleter::set_agent_manifests(&manifests);
+        if !crate::ai::agents::get_primary_agents(&manifests)
+            .iter()
+            .any(|a| a.name == "audit-fast")
+        {
+            return; // 无该 agent 时跳过
+        }
+        // 分段匹配：`fast` 不是 `audit-fast` 的前缀，但能命中其第二段。
+        let (_, direct) = CommandCompleter::complete_for_line("/agent fast", 11);
+        assert!(
+            direct
+                .iter()
+                .any(|candidate| candidate.replacement == "audit-fast"),
+            "expected audit-fast for `/agent fast`: {:?}",
+            direct.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+        );
+        let (_, use_cmd) = CommandCompleter::complete_for_line("/agent use fast", 15);
+        assert!(
+            use_cmd
+                .iter()
+                .any(|candidate| candidate.replacement == "audit-fast"),
+            "expected audit-fast for `/agent use fast`: {:?}",
+            use_cmd.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn command_completion_skill_name_matches_segments() {
+        let skills = crate::ai::skills::load_all_skills();
+        if !skills.iter().any(|s| s.name == "audit_own_changes") {
+            return; // 无该 skill 时跳过
+        }
+        // 分段匹配：`own` 不是 `audit_own_changes` 的前缀，但能命中其第二段。
+        let (_, candidates) = CommandCompleter::complete_for_line("/skills own", 11);
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.replacement == "audit_own_changes"),
+            "expected audit_own_changes for `/skills own`: {:?}",
+            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn agent_candidates_fall_back_to_disk_scan_before_cache_is_filled() {
         // 全新启动、driver 尚未调用 set_agent_manifests（缓存为 None）时，
         // agent 名补全必须能同步扫描出候选，否则新会话首条输入前的
@@ -1292,7 +1448,7 @@ mod tests {
         let Some(first) = skills.first() else {
             return;
         };
-        // 取首字母作为前缀，结果里所有候选名都应以该前缀开头。
+        // 取首字母作为过滤词，所有候选名都应通过智能匹配（前缀或分段）。
         let ch = first.name.chars().next().unwrap();
         let line = format!("@skills:{ch}");
         let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
@@ -1300,8 +1456,12 @@ mod tests {
         for c in &candidates {
             let name = c.replacement.strip_prefix("@skills:").unwrap();
             assert!(
-                name.to_ascii_lowercase()
-                    .starts_with(&ch.to_ascii_lowercase().to_string())
+                CommandCompleter::name_token_match_rank(
+                    &ch.to_ascii_lowercase().to_string(),
+                    name,
+                )
+                .is_some(),
+                "candidate {name} should match filter {ch}"
             );
         }
     }
@@ -1327,7 +1487,7 @@ mod tests {
         }
         let line = format!("@skill{take}");
         let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
-        // 目标 skill 必须在候选里，且所有候选名都以该前缀开头（取并集的两种切分均符合）。
+        // 目标 skill 必须在候选里，且所有候选名都通过智能匹配（取并集的两种切分均符合）。
         assert!(
             candidates
                 .iter()
@@ -1337,7 +1497,50 @@ mod tests {
         );
         for c in &candidates {
             let name = c.replacement.strip_prefix("@skills:").unwrap();
-            assert!(name.to_ascii_lowercase().starts_with(&take));
+            assert!(
+                CommandCompleter::name_token_match_rank(&take, name).is_some(),
+                "candidate {name} should match filter {take}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_reference_completion_matches_segments() {
+        let skills = crate::ai::skills::load_all_skills();
+        if !skills.iter().any(|s| s.name == "audit_own_changes") {
+            return; // 无该 skill 时跳过
+        }
+        // 分段匹配：`own` 不是 `audit_own_changes` 的前缀，但能命中其第二段。
+        let (_, candidates) = CommandCompleter::complete_for_line("@skills:own", 11);
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.replacement == "@skills:audit_own_changes"),
+            "expected audit_own_changes for `@skills:own`: {:?}",
+            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn skill_completion_matches_name_not_description() {
+        // 回归：`/skills audit_o` 只能命中名称匹配的 skill（audit_own_changes），
+        // 不得因为某 skill 描述含 "audits of" 等词而误匹配（如 TRAE-security-review）。
+        let line = "/skills audit_o";
+        let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.replacement == "audit_own_changes"),
+            "expected audit_own_changes for `{line}`: {:?}",
+            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+        );
+        for c in &candidates {
+            // 每个候选都必须能仅凭名称匹配到 `audit_o`（描述不得参与匹配）。
+            assert!(
+                CommandCompleter::name_token_match_rank("audit_o", &c.replacement).is_some(),
+                "candidate {} matched via description only",
+                c.replacement
+            );
         }
     }
 
@@ -1375,6 +1578,70 @@ mod tests {
         assert_eq!(
             candidates.first().map(|c| c.replacement.as_str()),
             Some(current.as_str())
+        );
+    }
+
+    #[test]
+    fn model_completion_deep_keeps_prefix_behavior() {
+        let (_, candidates) = CommandCompleter::complete_for_line("/model deep", 11);
+        let repls: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        assert!(
+            repls.iter().any(|r| r.starts_with("deepseek-")),
+            "expected deepseek models for `/model deep`: {:?}",
+            repls
+        );
+    }
+
+    #[test]
+    fn model_completion_deep_v_completes_volcano_deepseek() {
+        if crate::ai::model_names::find_by_identifier("deepseek-v4-flash-volcano").is_none() {
+            return; // models.json 无该模型时跳过
+        }
+        let (_, candidates) = CommandCompleter::complete_for_line("/model deep-v", 13);
+        let repls: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        assert!(
+            repls.iter().any(|r| r == "deepseek-v4-flash-volcano"),
+            "expected volcano deepseek for `/model deep-v`: {:?}",
+            repls
+        );
+        // volcano 的 deepseek 应排在其它 deepseek-v4 模型前面（两段式匹配优先）。
+        let volcano_idx = repls
+            .iter()
+            .position(|r| r == "deepseek-v4-flash-volcano")
+            .expect("volcano deepseek should be a candidate");
+        for (idx, r) in repls.iter().enumerate() {
+            if r.starts_with("deepseek-v4-") && r.as_str() != "deepseek-v4-flash-volcano" {
+                assert!(
+                    idx > volcano_idx,
+                    "volcano deepseek should rank before other deepseek-v4 models: {:?}",
+                    repls
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_completion_glm_v_completes_glm_volcano() {
+        if crate::ai::model_names::find_by_identifier("glm-5.2-volcano").is_none() {
+            return; // models.json 无该模型时跳过
+        }
+        let (_, candidates) = CommandCompleter::complete_for_line("/model glm-v", 12);
+        let repls: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        assert!(
+            repls.iter().any(|r| r == "glm-5.2-volcano"),
+            "expected glm volcano for `/model glm-v`: {:?}",
+            repls
+        );
+    }
+
+    #[test]
+    fn model_completion_deepseek_v4_f_keeps_prefix_behavior() {
+        let (_, candidates) = CommandCompleter::complete_for_line("/model deepseek-v4-f", 20);
+        let repls: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        assert!(
+            repls.iter().any(|r| r.starts_with("deepseek-v4-flash-")),
+            "expected deepseek-v4-flash models for `/model deepseek-v4-f`: {:?}",
+            repls
         );
     }
 

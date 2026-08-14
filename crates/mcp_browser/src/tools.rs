@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use chromiumoxide::page::ScreenshotParams;
+use chromiumoxide::page::{Page, ScreenshotParams};
 use serde_json::{Value, json};
 
 use crate::browser::{BrowserSession, ensure_session};
@@ -322,6 +322,25 @@ fn pending_warning(s: &BrowserSession) -> String {
 
 // ---- 各工具实现 ----
 
+/// 轮询等待元素出现：每 200ms 一次 `querySelector`，到 `timeout_ms` 仍未出现则报错。
+/// 与 AppleScript 驱动的 `wait_for_selector`（applescript.rs）行为对齐，
+/// 使 `wait_selector` 在两个驱动下语义一致（真等待，而非单次查找）。
+async fn wait_for_selector(page: &Page, selector: &str, timeout_ms: u64) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if page.find_element(selector).await.is_ok() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "等待超时：{}ms 内未找到选择器 '{}'",
+                timeout_ms, selector
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 async fn tool_navigate(
     session: &mut Option<BrowserSession>,
     args: &Value,
@@ -343,10 +362,9 @@ async fn tool_navigate(
             .await
             .map_err(|e| format!("wait_for_navigation failed: {e}"))?;
         if let Some(sel) = &wait_selector {
-            s.page
-                .find_element(sel.clone())
+            wait_for_selector(&s.page, sel, 30_000)
                 .await
-                .map_err(|e| format!("wait_selector '{sel}' not found: {e}"))?;
+                .map_err(|e| format!("navigate 等待元素超时：{e}（可忽略后继续，用 wait_for 重试）"))?;
         }
         let title = s.page.get_title().await.ok().flatten().unwrap_or_default();
         let final_url = s.page.url().await.ok().flatten().unwrap_or(url.clone());

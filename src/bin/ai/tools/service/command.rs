@@ -67,8 +67,8 @@ fn truncate_chars(content: &str, max_chars: usize) -> String {
     output.push_str(&head);
     output.push_str(&format!(
         "\n... [truncated: omitted middle; showing first {head_chars} and last {tail_chars} of {total_chars} chars \
-(~{head_lines} + {tail_lines} of {total_lines} lines). The omitted middle is NOT shown — expected matches may be there, not absent. \
-Do not re-run near-identical variants; narrow or page the result instead (e.g. `grep -c`, a more specific pattern, or `sed -n 'START,ENDp'`).]\n"
+(~{head_lines} + {tail_lines} of {total_lines} lines); expected matches may be there, not absent. \
+Do not re-run near-identical variants; narrow the query instead (e.g. `grep -c` or a more specific pattern). To page a local file, prefer `read_file` with offset/limit; `sed -n 'START,ENDp'` only for line paging, `head -c`/`tail -c +N` for byte windows or non-text files.]\n"
     ));
     output.push_str(&tail);
     output
@@ -218,6 +218,10 @@ mod tests {
         assert!(
             out.contains("Do not re-run near-identical variants"),
             "must steer the model away from blind retries"
+        );
+        assert!(
+            out.contains("`read_file` with offset/limit"),
+            "must steer file paging toward read_file over sed: {out}"
         );
     }
 

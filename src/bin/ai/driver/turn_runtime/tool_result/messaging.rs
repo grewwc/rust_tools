@@ -392,8 +392,7 @@ fn render_plan_steps(args: Option<&Value>) -> Option<String> {
         let parallelizable = step
             .get("parallelizable")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || delegate;
+            .unwrap_or(false);
         let mut tags = Vec::new();
         if parallelizable {
             tags.push("parallelizable");

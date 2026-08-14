@@ -1213,7 +1213,7 @@ fn build_system_prompt(
         if has_tool(available_tools, "plan") {
             lines.push("Simple tasks: act directly. Complex ones: call `plan` first.".to_string());
             if has_tool(available_tools, "task_spawn") {
-                lines.push("When planning, mark `delegate: true` only for independent steps whose expected benefit outweighs handoff and synthesis overhead. `delegate: true` implies `parallelizable: true` (delegation is inherently async); set `parallelizable: true` explicitly only for parallel steps that you will execute yourself.".to_string());
+                lines.push("When planning, mark `delegate: true` on every substantive step, serial or parallel: a subagent starts with a clean, focused context and the parent reviews its result. Keep in the parent only trivial single-tool steps, tightly coupled overlapping edits, and final review/synthesis. `parallelizable: true` means the step has no dependency on earlier steps (concurrent task_spawn); delegated steps without it run one at a time via the synchronous `task`, with the parent handing the needed context in the prompt.".to_string());
             }
         }
         if has_tool(available_tools, "spawn_process") {
@@ -1259,8 +1259,8 @@ fn build_system_prompt(
             } else {
                 lines.push("Use `task_spawn` to fan out MULTIPLE focused, independent subtasks concurrently. For a single delegated subtask, one spawned task immediately joined by `task_wait` gains no concurrency and just adds overhead.".to_string());
             }
-            lines.push("Qualify a subtask only when it has a distinct, bounded goal, can proceed without another branch's result, and is substantial enough that its expected latency or context-isolation benefit outweighs handoff and synthesis overhead.".to_string());
-            lines.push("When shared discovery must happen before work can be divided, keep that discovery sequential; after it reveals multiple distinct branches, reassess once whether delegation has clear net benefit. Do not spawn by default: account for rate limits, tool availability, and coordination or synthesis cost, and keep the work in the parent when the benefit is marginal or uncertain.".to_string());
+            lines.push("Qualify a subtask when it has a distinct, bounded goal and is substantial enough that its expected latency or context-isolation benefit outweighs handoff and synthesis overhead; a serial step qualifies when the parent can hand it the needed context (prior results) in the prompt.".to_string());
+            lines.push("When shared discovery must happen before work can be divided, keep that discovery sequential; after it reveals multiple distinct branches, reassess once whether delegation has clear net benefit. Do not spawn dependent steps concurrently: account for rate limits, tool availability, and coordination or synthesis cost, and keep the work in the parent when the benefit is marginal or uncertain.".to_string());
             lines.push("A single high-noise investigation may still qualify for the synchronous `task` when it can keep substantial intermediate reads, searches, logs, or experiments out of the parent context and return a concise evidence-backed result; multiple parallel branches are not required for context isolation to have value.".to_string());
             lines.push("Prefer delegating broad read-only discovery, cross-module caller or consumer mapping, noisy log or dependency research, and independent adversarial verification. Keep final decisions, overlapping edits, and end-to-end synthesis in the parent.".to_string());
             lines.push("Give each subagent an explicit result contract: return a concise conclusion, the key evidence paths/lines or commands, remaining uncertainty, and suggested verification; do not return raw logs, exhaustive search output, or large source excerpts unless requested.".to_string());
@@ -1269,8 +1269,8 @@ fn build_system_prompt(
             } else {
                 lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in the same response (multiple `task_spawn` calls in one turn). Then continue every independent parent-side step while they run. Do NOT call `task_wait` merely because tasks are running, and do not spawn-wait-spawn-wait serially.".to_string());
             }
-            lines.push("Do not delegate merely to create parallelism. Keep simple tasks, single-file localized changes, tightly coupled or overlapping work, strongly sequential work, and work you can finish directly with a few tool calls in the parent.".to_string());
-            lines.push("Context isolation is a valid delegation benefit only for independently bounded work that is expected to generate substantial intermediate evidence and can return a concise result. Context pressure alone does not justify handing off tightly coupled or unresolved work; iteration limits, tool failures, and recovery steps are not delegation benefits.".to_string());
+            lines.push("Do not delegate merely to create parallelism; serial steps can still be delegated one at a time via the synchronous `task`. Keep in the parent only tiny single-tool steps, tightly coupled or overlapping edits, and final review/synthesis; never run dependent steps concurrently.".to_string());
+            lines.push("Context isolation is a valid delegation benefit for any bounded step, serial or parallel, that is expected to generate substantial intermediate evidence and can return a concise result. Context pressure alone does not justify handing off tightly coupled or unresolved work; iteration limits, tool failures, and recovery steps are not delegation benefits.".to_string());
         }
         if has_tool(available_tools, "task_wait") {
             lines.push("Call `task_wait` only when the parent is blocked on subagent results or has no productive independent work left. Keep its per-call timeout short (normally 30-60 seconds) and prefer `wait_policy=\"any\"` so the parent resumes on the first useful result.".to_string());
@@ -1291,7 +1291,7 @@ fn build_system_prompt(
 
         if has_tool(available_tools, "task_spawn") {
             lines.push("By default a subagent reuses your (parent) model; only override the `model` field when the subtask is clearly lighter or heavier than your own.".to_string());
-            lines.push("Give each subagent a focused context: for narrow leaf tasks prefer `inherit=\"none\"` or `inherit=\"cwd\"`; only use `inherit=\"all\"` when the subtask genuinely needs the full conversation.".to_string());
+            lines.push("Give each subagent a focused context: the default `inherit` (cwd + skills, no history/memory) is right for delegated steps that touch the workspace; use `inherit=\"none\"` only for pure analysis that never touches the workspace; use `inherit=\"all\"` only when the subtask genuinely needs the full conversation.".to_string());
         }
         push_tool_guidance_section(
             &mut b,
@@ -2165,6 +2165,7 @@ mod tests {
     #[test]
     fn system_prompt_uses_criterion_based_parallel_delegation() {
         let mut available = SkipSet::new(16);
+        available.insert("plan".to_string());
         available.insert("task_spawn".to_string());
         available.insert("task_wait".to_string());
         available.insert("task_status".to_string());
@@ -2173,8 +2174,11 @@ mod tests {
             build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
 
-        // 并行仅适用于有净收益、边界清晰且互不依赖的工作，不能为并发而委派。
+        // 委派是实质步骤的默认选择（串行或并行皆可），但必须有清晰边界；父进程保留
+        // 琐碎步骤、紧密耦合编辑与最终评审，且绝不并发运行有依赖的步骤。
         assert!(prompt.contains("fan out MULTIPLE focused, independent subtasks concurrently"));
+        assert!(prompt.contains("mark `delegate: true` on every substantive step"));
+        assert!(prompt.contains("delegated steps without it run one at a time via the synchronous `task`"));
         assert!(prompt.contains("distinct, bounded goal"));
         assert!(prompt.contains(
             "latency or context-isolation benefit outweighs handoff and synthesis overhead"
@@ -2183,11 +2187,11 @@ mod tests {
         assert!(prompt.contains("When shared discovery must happen before work can be divided"));
         assert!(prompt.contains("keep that discovery sequential"));
         assert!(prompt.contains("reassess once whether delegation has clear net benefit"));
-        assert!(prompt.contains("Do not spawn by default"));
+        assert!(prompt.contains("Do not spawn dependent steps concurrently"));
         assert!(prompt.contains("account for rate limits, tool availability"));
         assert!(prompt.contains("benefit is marginal or uncertain"));
         assert!(prompt.contains("Do not delegate merely to create parallelism"));
-        assert!(prompt.contains("tightly coupled or overlapping work"));
+        assert!(prompt.contains("tightly coupled or overlapping edits"));
         // 单个高噪声调查也可以为隔离上下文而委派，但结果必须压缩且可复核。
         assert!(prompt.contains("A single high-noise investigation may still qualify"));
         assert!(prompt.contains("broad read-only discovery"));
@@ -2229,7 +2233,7 @@ mod tests {
         assert!(!prompt.contains("is just a slower `task`"));
         // ...but still keeps its own unique plan/delegate guidance.
         assert!(prompt.contains("Simple tasks: act directly. Complex ones: call `plan` first."));
-        assert!(prompt.contains("mark `delegate: true` only for independent steps"));
+        assert!(prompt.contains("mark `delegate: true` on every substantive step"));
     }
 
     #[test]

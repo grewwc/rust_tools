@@ -542,6 +542,61 @@ fn model_selector_words() -> String {
         .join(" ")
 }
 
+/// 模型选择器 + 平台 slug 的 `'selector|platform'` 列表，供 bash/zsh 生成
+/// “名称 + 平台”两段式智能补全。
+fn model_meta_words() -> String {
+    crate::ai::model_names::all()
+        .into_iter()
+        .map(|m| {
+            let handle = crate::ai::model_names::model_handle(m);
+            let platform = crate::ai::model_names::platform_slug(m);
+            format!("'{}|{}'", handle, platform)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// skill 名称列表，供 bash/zsh 生成补全。只喂名字、不含描述：
+/// `_a_name_rank` 的 rank-1 两段式分支会把 `|` 后的次字段当作匹配对象，
+/// 若把 description 放进去会造成“描述误命中”（交互式补全明确只按名称匹配，
+/// 见 prompt/completion.rs 的 name_token_match_rank）。条目不带 `|` 时次字段
+/// 为空，rank-1 自然不会命中；rank-0 前缀与 rank-2 逐段匹配仍按名称生效。
+fn skill_meta_words() -> String {
+    crate::ai::skills::load_all_skills()
+        .into_iter()
+        .map(|s| shell_single_quote(&s.name))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 主 agent 名称列表，供 bash/zsh 生成补全。同 skill_meta_words，只喂名字、
+/// 不含描述，避免 rank-1 两段式把 description 当次字段造成“描述误命中”。
+fn agent_meta_words() -> String {
+    crate::ai::agents::get_primary_agents(&crate::ai::agents::load_all_agents())
+        .into_iter()
+        .map(|a| shell_single_quote(&a.name))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// skill 名称（空格分隔），供 fish 前缀补全使用。
+fn skill_names() -> String {
+    crate::ai::skills::load_all_skills()
+        .into_iter()
+        .map(|s| s.name)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 主 agent 名称（空格分隔），供 fish 前缀补全使用。
+fn agent_names() -> String {
+    crate::ai::agents::get_primary_agents(&crate::ai::agents::load_all_agents())
+        .into_iter()
+        .map(|a| a.name.clone())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn generate_bash(
     info: &[(String, String, String, Vec<String>)],
     _is_bool: fn(&str) -> bool,
@@ -593,12 +648,25 @@ fn generate_bash(
     );
     println!("  local agent_sub='help list current use auto'");
     println!("  local model_sub='current list help effort'");
-    println!(
-        "  local model_selectors={}",
-        shell_single_quote(&model_selector_words())
-    );
+    println!("  local skill_sub='help list current use'");
+    println!("  local -a _a_model_meta=({})", model_meta_words());
+    println!("  local -a _a_skill_meta=({})", skill_meta_words());
+    println!("  local -a _a_agent_meta=({})", agent_meta_words());
     println!("  local effort_levels='minimal low medium high xhigh max auto off'");
     println!();
+    // `--model`/`-m` 的值：智能匹配模型名。
+    println!("  if [[ \"$prev\" == \"--model\" || \"$prev\" == \"-m\" ]]; then");
+    println!("    COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_model_meta[@]}}\"))");
+    println!("    return 0");
+    println!("  fi");
+    println!("  if [[ \"$cur\" == --model=* || \"$cur\" == -m=* ]]; then");
+    println!("    local _mdl_ip='--model='");
+    println!("    [[ \"$cur\" == -m=* ]] && _mdl_ip='-m='");
+    println!("    local -a _vals");
+    println!("    _vals=($(_a_name_matches \"${{cur#$_mdl_ip}}\" \"${{_a_model_meta[@]}}\"))");
+    println!("    COMPREPLY=(\"${{_vals[@]/#/$_mdl_ip}}\")");
+    println!("    return 0");
+    println!("  fi");
     // COMP_WORDS[0] 是命令名 a，内部命令位于 COMP_WORDS[1]。
     println!("  if [ \"$COMP_CWORD\" -ge 2 ]; then");
     println!("    case \"${{COMP_WORDS[1]}}\" in");
@@ -611,13 +679,20 @@ fn generate_bash(
     println!("      /sessions|:sessions|/ss|:ss)");
     println!("        COMPREPLY=($(compgen -W \"$session_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /agent|:agent|/agents|:agents)");
-    println!("        COMPREPLY=($(compgen -W \"$agent_sub\" -- \"$cur\")); return 0 ;;");
+    println!("        if [ \"$COMP_CWORD\" -ge 3 ] && [ \"${{COMP_WORDS[2]}}\" = \"use\" ]; then");
+    println!("          COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_agent_meta[@]}}\"))");
+    println!("        else");
+    println!("          COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_agent_meta[@]}}\") $(compgen -W \"$agent_sub\" -- \"$cur\"))");
+    println!("        fi");
+    println!("        return 0 ;;");
+    println!("      /skills|:skills|/skill|:skill)");
+    println!("        COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_skill_meta[@]}}\") $(compgen -W \"$skill_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /personas|:personas)");
     println!("        COMPREPLY=($(compgen -W \"$persona_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /model|:model)");
     println!("        if [ \"$COMP_CWORD\" -eq 2 ]; then");
     println!(
-        "          COMPREPLY=($(compgen -W \"$model_selectors $model_sub\" -- \"$cur\")); return 0"
+        "          COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_model_meta[@]}}\") $(compgen -W \"$model_sub\" -- \"$cur\")); return 0"
     );
     println!("        fi");
     println!(
@@ -633,6 +708,69 @@ fn generate_bash(
     println!("  return 0");
     println!("}}");
     println!("complete -F _a_completions a");
+    print!(
+        "{}",
+        r#"# 智能名称匹配：0=前缀, 1=名称+次字段两段式, 2=逐段前缀（与交互式补全一致）
+_a_name_rank() {
+  local query="$1" word="$2" platform="$3"
+  case "$word" in
+    "$query"*) printf '0\n'; return 0 ;;
+  esac
+  local qseg="${query##*[._/-]}"
+  if [ -n "$qseg" ] && [ "$qseg" != "$query" ]; then
+    local qhead="${query%[._/-]*}"
+    if [ -n "$qhead" ]; then
+      case "$word" in
+        "$qhead"*)
+          case "$platform" in
+            "$qseg"*) printf '1\n'; return 0 ;;
+          esac
+          ;;
+      esac
+    fi
+  fi
+  local qs="${query//[._\/-]/ }" ws="${word//[._\/-]/ }"
+  local -a qa wa
+  read -r -a qa <<< "$qs"
+  read -r -a wa <<< "$ws"
+  local qi=0 w
+  for w in "${wa[@]}"; do
+    if (( qi < ${#qa[@]} )) && [[ "$w" == "${qa[$qi]}"* ]]; then
+      qi=$((qi + 1))
+      (( qi == ${#qa[@]} )) && { printf '2\n'; return 0; }
+    fi
+  done
+  return 1
+}
+_a_name_matches() {
+  local query="$1" entry w p r
+  local -a r0 r1 r2
+  shift
+  for entry in "$@"; do
+    # 无 `|` 的条目（skill/agent 只喂名字）没有次字段；若直接取 `${entry#*|}`，
+    # 会返回整个名字，导致 rank-1 两段式误把名字当次字段命中。次字段只属于
+    # 带 `|` 的 model 条目（rank-1 仅用于 model 的 name|platform）。
+    if [[ "$entry" == *"|"* ]]; then
+      w="${entry%%|*}"
+      p="${entry#*|}"
+    else
+      w="$entry"
+      p=""
+    fi
+    r="$(_a_name_rank "$query" "$w" "$p")"
+    case "$r" in
+      0) r0+=("$w") ;;
+      1) r1+=("$w") ;;
+      2) r2+=("$w") ;;
+    esac
+  done
+  # 空数组在 bash<4.4 + set -u 下展开会报 unbound variable，逐组判空输出。
+  (( ${#r0[@]} )) && printf '%s\n' "${r0[@]}"
+  (( ${#r1[@]} )) && printf '%s\n' "${r1[@]}"
+  (( ${#r2[@]} )) && printf '%s\n' "${r2[@]}"
+}
+"#
+    );
 }
 
 fn generate_zsh(
@@ -687,10 +825,89 @@ fn generate_zsh(
         "  local -a _a_persona_subcmds=(help list ls current cur create new use select switch delete del rm)"
     );
     println!("  local -a _a_model_subcmds=(current list help effort)");
-    println!("  local -a _a_model_selectors=({})", model_selector_words());
+    println!("  local -a _a_skill_subcmds=(help list current use)");
+    println!("  local -a _a_model_meta=({})", model_meta_words());
+    println!("  local -a _a_skill_meta=({})", skill_meta_words());
+    println!("  local -a _a_agent_meta=({})", agent_meta_words());
     println!("  local -a _a_effort_levels=(minimal low medium high xhigh max auto off)");
-    println!("  local -a _a_model_entries");
-    println!("  _a_model_entries=($_a_model_selectors $_a_model_subcmds)");
+    print!(
+        "{}",
+        r#"  # 智能名称匹配：0=前缀, 1=名称+次字段两段式, 2=逐段前缀（与交互式补全一致）
+  _a_name_rank() {
+    local query="$1" word="$2" platform="$3"
+    case "$word" in
+      "$query"*) print -r -- 0; return 0 ;;
+    esac
+    local qseg="${query##*[._/-]}"
+    if [[ -n "$qseg" && "$qseg" != "$query" ]]; then
+      local qhead="${query%[._/-]*}"
+      if [[ -n "$qhead" ]]; then
+        case "$word" in
+          "$qhead"*)
+            case "$platform" in
+              "$qseg"*) print -r -- 1; return 0 ;;
+            esac
+            ;;
+        esac
+      fi
+    fi
+    local qs="${query//[._\/-]/ }" ws="${word//[._\/-]/ }"
+    local -a qa wa
+    qa=(${(s: :)qs})
+    wa=(${(s: :)ws})
+    local qi=1 w
+    for w in $wa; do
+      if (( qi <= ${#qa} )) && [[ "$w" == "${qa[$qi]}"* ]]; then
+        (( qi++ ))
+        (( qi > ${#qa} )) && { print -r -- 2; return 0; }
+      fi
+    done
+    return 1
+  }
+  # 通用候选生成：第一个参数是 `'name|secondary'` 条目数组的名字，
+  # 按 rank 0/1/2 分组后 compadd（与交互式补全一致）。
+  _a_name_candidates() {
+    local -a _r0 _r1 _r2
+    local entry w p r
+    local -a _meta
+    _meta=(${(@P)1})
+    for entry in "${_meta[@]}"; do
+      # 无 `|` 的条目（skill/agent 只喂名字）没有次字段；若直接取 `${entry#*|}`，
+      # 会返回整个名字，导致 rank-1 两段式误把名字当次字段命中。次字段只属于
+      # 带 `|` 的 model 条目（rank-1 仅用于 model 的 name|platform）。
+      if [[ "$entry" == *"|"* ]]; then
+        w="${entry%%|*}"
+        p="${entry#*|}"
+      else
+        w="$entry"
+        p=""
+      fi
+      r="$(_a_name_rank "$PREFIX" "$w" "$p")"
+      case "$r" in
+        0) _r0+=("$w") ;;
+        1) _r1+=("$w") ;;
+        2) _r2+=("$w") ;;
+      esac
+    done
+    compadd -S ' ' -- $_r0 $_r1 $_r2
+  }
+"#
+    );
+    // `--model`/`-m` 的值：智能匹配模型名。
+    println!("  if [[ \"$words[CURRENT-1]\" == --model* || \"$words[CURRENT-1]\" == -m* ]]; then");
+    println!("    _a_name_candidates _a_model_meta");
+    println!("    return");
+    println!("  fi");
+    // `--model=VALUE` / `-m=VALUE`（等号形式）：把 `--model=` 设为 IPREFIX，
+    // 只对等号后的部分做匹配，候选插入时保留前缀。
+    println!("  if [[ \"$words[CURRENT]\" == --model=* || \"$words[CURRENT]\" == -m=* ]]; then");
+    println!("    local _mdl_ip='--model='");
+    println!("    [[ \"$words[CURRENT]\" == -m=* ]] && _mdl_ip='-m='");
+    println!("    PREFIX=\"${{PREFIX#$_mdl_ip}}\"");
+    println!("    IPREFIX=\"$_mdl_ip\"");
+    println!("    _a_name_candidates _a_model_meta");
+    println!("    return");
+    println!("  fi");
     println!();
     // 若正在补全内部命令的子命令，先按子命令处理并 return，
     // 避免回落到 flags / 顶层命令补全。
@@ -720,7 +937,29 @@ fn generate_zsh(
     println!("        _describe 'session subcommand' _a_session_subcmds && return");
     println!("        ;;");
     println!("      /agent|:agent|/agents|:agents)");
-    println!("        _describe 'agent subcommand' _a_agent_subcmds && return");
+    println!("        if (( CURRENT >= 4 )) && [[ \"$words[3]\" == \"use\" ]]; then");
+    println!("          _a_name_candidates _a_agent_meta && return");
+    println!("        fi");
+    println!("        if (( CURRENT <= 3 )); then");
+    println!("          _a_name_candidates _a_agent_meta");
+    println!("          local _ag_sub");
+    println!("          for _ag_sub in \"${{_a_agent_subcmds[@]}}\"; do");
+    println!("            [[ \"$_ag_sub\" == \"$PREFIX\"* ]] && compadd -S ' ' -- \"$_ag_sub\"");
+    println!("          done");
+    println!("          return");
+    println!("        fi");
+    println!("        return");
+    println!("        ;;");
+    println!("      /skills|:skills|/skill|:skill)");
+    println!("        if (( CURRENT <= 3 )); then");
+    println!("          _a_name_candidates _a_skill_meta");
+    println!("          local _sk_sub");
+    println!("          for _sk_sub in \"${{_a_skill_subcmds[@]}}\"; do");
+    println!("            [[ \"$_sk_sub\" == \"$PREFIX\"* ]] && compadd -S ' ' -- \"$_sk_sub\"");
+    println!("          done");
+    println!("          return");
+    println!("        fi");
+    println!("        return");
     println!("        ;;");
     println!("      /personas|:personas)");
     println!("        _describe 'persona subcommand' _a_persona_subcmds && return");
@@ -730,7 +969,12 @@ fn generate_zsh(
     println!("          _describe 'reasoning effort' _a_effort_levels && return");
     println!("        fi");
     println!("        if (( CURRENT <= 3 )); then");
-    println!("          _describe 'model selector or subcommand' _a_model_entries && return");
+    println!("          _a_name_candidates _a_model_meta");
+    println!("          local _m_sub");
+    println!("          for _m_sub in \"${{_a_model_subcmds[@]}}\"; do");
+    println!("            [[ \"$_m_sub\" == \"$PREFIX\"* ]] && compadd -S ' ' -- \"$_m_sub\"");
+    println!("          done");
+    println!("          return");
     println!("        fi");
     println!("        return");
     println!("        ;;");
@@ -776,11 +1020,31 @@ fn generate_fish(
         "complete -c a -n '__fish_seen_subcommand_from /model :model' -a '{}' -d 'model selector'",
         model_selector_words().replace('\'', "\\'")
     );
+    // `--model`/`-m` 的值：模型选择器。fish 的 `-a` 自带前缀过滤，
+    // 无法像 bash/zsh 那样做分段匹配，但 `a --model dee<TAB>` 这类前缀场景可用。
+    println!(
+        "complete -c a -l model -r -a '{}' -d 'model selector'",
+        model_selector_words().replace('\'', "\\'")
+    );
+    println!(
+        "complete -c a -s m -r -a '{}' -d 'model selector'",
+        model_selector_words().replace('\'', "\\'")
+    );
     println!(
         "complete -c a -n '__fish_seen_subcommand_from /model :model' -a 'current list help effort' -d 'model command'"
     );
     println!(
         "complete -c a -n '__fish_seen_subcommand_from effort' -a 'minimal low medium high xhigh max auto off' -d 'reasoning effort'"
+    );
+    // skill/agent 名补全：fish 的 `-a` 只能前缀匹配，无法像 bash/zsh 那样做
+    // 两段式智能匹配（平台限制），这里仅补全名字本身。
+    println!(
+        "complete -c a -n '__fish_seen_subcommand_from /skills :skills /skill :skill' -a '{}' -d 'skill name'",
+        skill_names().replace('\'', "\\'")
+    );
+    println!(
+        "complete -c a -n '__fish_seen_subcommand_from /agent :agent /agents :agents' -a '{}' -d 'agent name'",
+        agent_names().replace('\'', "\\'")
     );
 }
 

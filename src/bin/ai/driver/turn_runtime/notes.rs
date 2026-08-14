@@ -229,7 +229,7 @@ pub(super) fn inject_read_only_breadth_note(
     use crate::ai::history::Message;
     use serde_json::Value;
     let team_guidance = if agent_team_active {
-        "\nBecause `agent-team` is active, do not continue a broad serial sweep: delegate any genuinely independent remaining branches now, or state the concrete dependency that makes delegation unsafe."
+        "\nBecause `agent-team` is active, do not continue a broad serial sweep: delegate any remaining branches now (serial ones one at a time via the synchronous `task`, passing prior results), or state the concrete dependency that makes delegation unsafe."
     } else {
         ""
     };
@@ -303,7 +303,7 @@ pub(super) fn inject_tool_round_checkpoint_note(
         "[tool-round-checkpoint] level={} phase={} round={iteration} threshold={}.\n\
         {}\n\
         {}\n\
-        Checkpoint does not change delegation rules: do not hand off the current branch due to context or iteration pressure; delegate only sub-tasks that are genuinely independent, bounded, and worth delegating.",
+        Checkpoint does not change delegation rules: do not hand off the current branch due to context or iteration pressure; delegate bounded sub-steps (serial or parallel) and review their results.",
         checkpoint.level.label(),
         checkpoint.phase.recent_progress(),
         checkpoint.threshold,
