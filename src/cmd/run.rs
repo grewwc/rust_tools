@@ -4,6 +4,7 @@
 
 use crate::{commonw::utils::expanduser, strw::split::split_space_keep_symbol};
 
+use std::borrow::Cow;
 use std::{
     ffi::OsString,
     fs::File,
@@ -77,9 +78,9 @@ fn is_shell_boundary(byte: Option<u8>) -> bool {
 /// 这里只识别“引号外确实需要 shell 解释”的语法，避免把双引号内的字面量
 /// `<` / `>` / `|` 之类误判为必须走 `sh -c`。
 ///
-/// 注意：本函数仍保守地把单引号、反斜杠等视为需要 shell，因为当前
-/// `build_no_shell_command` 只实现了双引号分组，不负责完整复刻 shell 的
-/// 转义/引用语义。
+/// 注意：本函数仍保守地把单引号、反斜杠、`$`（变量展开）等视为需要 shell，
+/// 因为当前 `build_no_shell_command` 只实现了双引号分组，不负责完整复刻
+/// shell 的转义/引用/变量展开语义。
 fn should_use_shell(command: &str) -> bool {
     let bytes = command.as_bytes();
     let mut i = 0usize;
@@ -94,9 +95,7 @@ fn should_use_shell(command: &str) -> bool {
                     i += 1;
                     continue;
                 }
-                b'$' if i + 1 < bytes.len() && matches!(bytes[i + 1], b'(' | b'{') => {
-                    return true;
-                }
+                b'$' => return true,
                 _ => {
                     i += 1;
                     continue;
@@ -109,7 +108,7 @@ fn should_use_shell(command: &str) -> bool {
                 in_double = true;
             }
             b'\'' | b'\\' | b'`' => return true,
-            b'$' if i + 1 < bytes.len() && matches!(bytes[i + 1], b'(' | b'{') => return true,
+            b'$' => return true,
             b'|' | b'>' | b'<' | b';' | b'&' | b'*' | b'?' => return true,
             b'#' if is_shell_boundary(i.checked_sub(1).map(|idx| bytes[idx])) => return true,
             // `(` 只有在 token 起始边界上才视为 shell 分组/子 shell 语法；
@@ -206,12 +205,21 @@ fn build_no_shell_command(command: &str, opts: RunCmdOptions<'_>) -> io::Result<
         return Err(io::Error::other("empty command"));
     };
 
-    let mut cmd = Command::new(program);
+    // 程序名同样支持前导 `~` 展开（与 shell 语义一致）；引号包裹的按字面量处理。
+    let mut cmd = if program.starts_with('"') {
+        Command::new(program)
+    } else {
+        match expanduser(program) {
+            Cow::Borrowed(p) => Command::new(p),
+            Cow::Owned(p) => Command::new(p),
+        }
+    };
     if let Some(dir) = opts.cwd {
         cmd.current_dir(dir);
     }
-    // 处理参数，展开用户路径。
+    // 处理参数，展开未加引号的前导 `~`（shell 语义）。
     // 非 shell 路径下，双引号只承担“分组”职责，不应作为字面量传给子进程。
+    // 引号内的前导 `~` 是字面量，不做展开（如 `echo "~"` 应输出 `~`）。
     // 这里不尝试复刻完整 shell 语义；更复杂的单引号/反斜杠转义仍由
     // `should_use_shell` 保守地导向 shell 路径。
     iter.for_each(|arg| {
@@ -220,7 +228,13 @@ fn build_no_shell_command(command: &str, opts: RunCmdOptions<'_>) -> io::Result<
         } else {
             arg.to_string()
         };
-        let new_arg = expanduser(&normalized_arg);
+        // shell 规则：只有「word 首字符为未加引号的 `~`」才展开；
+        // 引号开头（`"~"`）或 `~` 后紧跟引号（`~"x"`、`~"/foo"`）都是字面量。
+        let new_arg = if arg.starts_with('"') || arg.starts_with(r#"~""#) {
+            Cow::Borrowed(normalized_arg.as_str())
+        } else {
+            expanduser(&normalized_arg)
+        };
         if new_arg == normalized_arg {
             cmd.arg(OsString::from(new_arg.as_ref()));
         } else {
@@ -994,6 +1008,79 @@ mod tests {
     #[test]
     fn test_should_use_shell_does_not_treat_hash_in_word_as_comment() {
         assert!(!should_use_shell("printf %s foo#bar"));
+    }
+
+    #[test]
+    fn test_should_use_shell_routes_variable_expansion_to_shell() {
+        // 普通 `$VAR` 是 shell 变量展开，必须走 shell 路径，否则会作为字面量传给子进程。
+        assert!(should_use_shell("echo $HOME"));
+        assert!(should_use_shell(r#"echo "$HOME""#));
+        assert!(should_use_shell("ls $DIR"));
+        assert!(should_use_shell("echo $?"));
+    }
+
+    #[test]
+    fn test_run_cmd_output_expands_plain_variable_in_shell() {
+        #[cfg(unix)]
+        {
+            let home = std::env::var("HOME").unwrap();
+            let output = run_cmd_output("echo $HOME", RunCmdOptions::default()).unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), home);
+        }
+    }
+
+    #[test]
+    fn test_run_cmd_output_keeps_quoted_tilde_literal() {
+        // shell 语义：引号内的 `~` 是字面量，不应展开。
+        #[cfg(unix)]
+        {
+            let output = run_cmd_output(r#"echo "~""#, RunCmdOptions::default()).unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), "~");
+        }
+    }
+
+    #[test]
+    fn test_run_cmd_output_keeps_tilde_followed_by_quote_literal() {
+        // shell 语义：`~` 后紧跟引号同样不展开（`~"/foo"` → 字面量 `~/foo`，
+        // `~"x"` → 字面量 `~x`），与 `sh` 实测行为一致。
+        #[cfg(unix)]
+        {
+            let output = run_cmd_output(r#"echo ~"/foo""#, RunCmdOptions::default()).unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), r#"~/foo"#);
+
+            let output = run_cmd_output(r#"echo ~"x""#, RunCmdOptions::default()).unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), r#"~x"#);
+        }
+    }
+
+    #[test]
+    fn test_run_cmd_output_expands_unquoted_tilde() {
+        #[cfg(unix)]
+        {
+            let home = std::env::var("HOME").unwrap();
+            let output = run_cmd_output("echo ~", RunCmdOptions::default()).unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), home);
+        }
+    }
+
+    #[test]
+    fn test_build_no_shell_command_expands_program_tilde() {
+        // 程序位置的前导 `~` 也应展开，与参数位置、shell 语义保持一致。
+        #[cfg(unix)]
+        {
+            let home = std::env::var("HOME").unwrap();
+            let cmd =
+                super::build_no_shell_command("~/bin/prog --flag", RunCmdOptions::default())
+                    .unwrap();
+            let program = cmd.get_program().to_string_lossy().into_owned();
+            assert!(program.starts_with(&home), "program={program}");
+            assert!(program.ends_with("/bin/prog"), "program={program}");
+        }
     }
 
     #[test]

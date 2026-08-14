@@ -3327,7 +3327,12 @@ mod tests {
                 crate::ai::agents::load_scoped_project_instruction_docs_for_targets(&targets);
             let loaded = docs
                 .iter()
-                .map(|doc| format!("From {}:\n{}", doc.path, doc.content))
+                .map(|doc| {
+                    format!(
+                        "<instructions path=\"{}\">\n{}\n</instructions>",
+                        doc.path, doc.content
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             messages[0].content = Value::String(format!("base system\n{loaded}"));

@@ -441,8 +441,11 @@ pub(super) async fn prepare_turn(
         for (kind, label, content) in &output.sections {
             match kind {
                 crate::ai::driver::observer::SectionKind::Behavior => {
-                    skill_turn.push_section(skill_runtime::ContextKind::Behavior, content);
-                    let _ = label;
+                    skill_turn.push_labeled_section(
+                        skill_runtime::ContextKind::Behavior,
+                        label,
+                        content,
+                    );
                 }
                 crate::ai::driver::observer::SectionKind::Fact => {
                     skill_turn.push_labeled_section(
