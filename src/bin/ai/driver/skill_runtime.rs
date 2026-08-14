@@ -58,7 +58,12 @@ impl SystemPromptBuilder {
     fn push_labeled(&mut self, kind: ContextKind, label: &str, content: impl Into<String>) {
         let content = content.into();
         if !content.trim().is_empty() {
-            self.sections.push((kind, Some(label.to_string()), content));
+            let label = label.trim();
+            self.sections.push((
+                kind,
+                (!label.is_empty()).then(|| label.to_string()),
+                content,
+            ));
         }
     }
 
@@ -78,7 +83,7 @@ impl SystemPromptBuilder {
         let mut out = String::new();
         for (group_kind, tag) in RENDER_ORDER {
             let mut group = String::new();
-            for (kind, _, content) in &self.sections {
+            for (kind, label, content) in &self.sections {
                 if *kind != group_kind {
                     continue;
                 }
@@ -88,6 +93,11 @@ impl SystemPromptBuilder {
                 }
                 if !group.is_empty() {
                     group.push_str("\n\n");
+                }
+                if let Some(label) = label {
+                    group.push_str("## ");
+                    group.push_str(label.trim());
+                    group.push('\n');
                 }
                 group.push_str(trimmed);
             }
@@ -119,7 +129,7 @@ impl SystemPromptBuilder {
         );
         for (label, content) in &facts {
             if let Some(key) = label {
-                out.push_str(&format!("# {}\n{}\n\n", key, content.trim()));
+                out.push_str(&format!("## {}\n{}\n\n", key, content.trim()));
             } else {
                 out.push_str(&format!("{}\n\n", content.trim()));
             }
@@ -157,8 +167,7 @@ fn runtime_environment_prompt() -> String {
         .unwrap_or_else(|error| format!("<unavailable: {error}>"));
 
     format!(
-        "Execution environment:\n\
-         - Operating system: {os_label} (`{os}`); architecture: `{arch}`.\n\
+        "- Operating system: {os_label} (`{os}`); architecture: `{arch}`.\n\
          - Shell: `{shell}`.\n\
          - Effective working directory: `{effective_cwd}`. Relative tool paths resolve against this directory; it is not necessarily the project root.\n\
          - Write commands for this OS/shell. Do not use commands or package managers from another OS unless the user asks for cross-platform guidance or you first verify they exist here."
@@ -192,7 +201,7 @@ impl SkillTurnGuard {
             // 执行。指针刻意用 "at turn start" 而非 "for this turn"：user 消息只在
             // turn 开头构建一次，而 mid-turn 可通过 activate_skill/deactivate_skill
             // 变更生效集，快照式表述保证指针永不为假；当前生效集一律以 system
-            // prompt 的 [Skill instructions]（每 iteration 重建、权威、可命中缓存）
+            // prompt 的 `<skill_instructions>`（每 iteration 重建、权威、可命中缓存）
             // 为准。本指针只进请求投影（turn_messages 不含 reminder），且当前 user
             // 消息本就是 cache miss，故不破坏上游 prompt cache。仅当有活动 skill
             // 时注入。
@@ -204,7 +213,7 @@ impl SkillTurnGuard {
                         self.matched_skill_names[0]
                     ));
                     pointer.push_str(
-                        "Treat its instructions in the system prompt's [Skill instructions] \
+                        "Treat its instructions in the system prompt's <skill_instructions> \
                          section as the primary behavior contract for this turn.",
                     );
                 } else {
@@ -216,7 +225,7 @@ impl SkillTurnGuard {
                         let _ = writeln!(pointer, "  {}. {}", i + 1, name);
                     }
                     pointer.push_str(
-                        "Treat their instructions in the system prompt's [Skill instructions] \
+                        "Treat their instructions in the system prompt's <skill_instructions> \
                          section as the primary behavior contract for this turn; when they \
                          conflict, later skills override earlier ones, except that guardrails \
                          always take precedence.",
@@ -261,7 +270,11 @@ impl SkillTurnGuard {
             required_targets,
             observed_targets,
         ) {
-            self.push_section(ContextKind::Policy, &prompt);
+            self.push_labeled_section(
+                ContextKind::Policy,
+                "Target-scoped project instructions",
+                &prompt,
+            );
         }
         !scoped_project_instructions_missing(self.system_prompt(), required_targets)
     }
@@ -541,8 +554,7 @@ fn push_tool_guidance_section(
         return;
     }
 
-    let mut section = String::from(title);
-    section.push('\n');
+    let mut section = String::new();
     for line in lines {
         section.push_str("- ");
         section.push_str(&line);
@@ -551,7 +563,7 @@ fn push_tool_guidance_section(
     if section.ends_with('\n') {
         section.pop();
     }
-    builder.push(kind, section);
+    builder.push_labeled(kind, title, section);
 }
 
 fn backticked_tool(name: &str) -> String {
@@ -778,6 +790,23 @@ fn build_hidden_execution_primitive_catalog(
     Some(out)
 }
 
+/// XML 属性值转义：`&` `<` `>` `"` `'`。
+/// 用于 `<instructions path="...">` 的 path 属性，避免路径中的引号/尖括号破坏 XML 结构。
+fn escape_xml_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn build_project_instruction_prompt() -> Option<String> {
     let docs = load_project_instruction_docs();
     if docs.is_empty() {
@@ -785,12 +814,15 @@ fn build_project_instruction_prompt() -> Option<String> {
     }
 
     let mut out = String::from(
-        "Project-local instructions:\n\
-         - The current working directory provides project-specific instruction documents.\n\
+        "- The current working directory provides project-specific instruction documents.\n\
          - Follow these repo-local constraints and preferences unless they conflict with higher-priority system, developer, or user instructions.\n",
     );
     for doc in docs {
-        out.push_str(&format!("\nFrom {}:\n{}\n", doc.path, doc.content.trim()));
+        out.push_str(&format!(
+            "\n<instructions path=\"{}\">\n{}\n</instructions>\n",
+            escape_xml_attr(&doc.path),
+            doc.content.trim()
+        ));
     }
     Some(out)
 }
@@ -811,12 +843,15 @@ fn build_scoped_project_instruction_prompt_with_priority(
         return None;
     }
     let mut out = String::from(
-        "Target-scoped project instructions:\n\
-         - These documents apply to files already touched in this turn.\n\
+        "- These documents apply to files already touched in this turn.\n\
          - A rule from a deeper directory is more specific and overrides a conflicting general project rule.\n",
     );
     for doc in docs {
-        out.push_str(&format!("\nFrom {}:\n{}\n", doc.path, doc.content.trim()));
+        out.push_str(&format!(
+            "\n<instructions path=\"{}\">\n{}\n</instructions>\n",
+            escape_xml_attr(&doc.path),
+            doc.content.trim()
+        ));
     }
     Some(out)
 }
@@ -827,12 +862,21 @@ pub(super) fn scoped_project_instructions_missing(
 ) -> bool {
     load_scoped_project_instruction_docs_for_targets(targets)
         .iter()
-        .any(|doc| !system_prompt.contains(&format!("From {}:", doc.path)))
+        .any(|doc| {
+            !system_prompt.contains(&format!(
+                "<instructions path=\"{}\">",
+                escape_xml_attr(&doc.path)
+            ))
+        })
 }
 
 fn push_project_instruction_context(builder: &mut SystemPromptBuilder) {
     if let Some(project_prompt) = build_project_instruction_prompt() {
-        builder.push(ContextKind::Policy, project_prompt);
+        builder.push_labeled(
+            ContextKind::Policy,
+            "Project-local instructions",
+            project_prompt,
+        );
     }
 }
 
@@ -948,11 +992,13 @@ fn build_system_prompt(
             );
             header
         };
-        s.push_str("\n\n[Skill instructions]\n");
+        s.push_str("\n\n<skill_instructions>\n");
         s.push_str(skill_text.trim());
+        s.push_str("\n</skill_instructions>");
         if let Some(agent_text) = &agent_extra {
-            s.push_str("\n\n[Agent instructions]\n");
+            s.push_str("\n\n<agent_instructions>\n");
             s.push_str(agent_text.trim());
+            s.push_str("\n</agent_instructions>");
             s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill. Neither skill nor agent instructions override the correctness guardrails (including git-safety rules) or policy sections, which always take precedence.");
         } else {
             s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ, except the correctness guardrails (including git-safety rules) and policy sections, which always take precedence.");
@@ -987,7 +1033,11 @@ fn build_system_prompt(
              - Ask by ending your reply with a clear question in plain text, then wait for the user's answer.",
         );
     }
-    b.push(ContextKind::Behavior, runtime_environment_prompt());
+    b.push_labeled(
+        ContextKind::Behavior,
+        "Execution environment",
+        runtime_environment_prompt(),
+    );
 
     // 多 skill：逐个输出 resource_path（仅当有值）
     for skill in skills {
@@ -1391,10 +1441,7 @@ fn build_skill_turn_guard(
         );
     }
     if !app.active_persona.is_default() {
-        let mut persona_prompt = format!(
-            "Persistent persona:\n- Name: {}\n",
-            app.active_persona.name.trim()
-        );
+        let mut persona_prompt = format!("- Name: {}\n", app.active_persona.name.trim());
         if !app.active_persona.avatar.trim().is_empty() {
             persona_prompt.push_str(&format!("- Avatar: {}\n", app.active_persona.avatar.trim()));
         }
@@ -1405,7 +1452,7 @@ fn build_skill_turn_guard(
         persona_prompt.push_str(
             "\n\nApply this persona consistently across turns, but never let it override higher-priority agent, skill, policy, or user instructions.",
         );
-        builder.push(ContextKind::Identity, persona_prompt);
+        builder.push_labeled(ContextKind::Identity, "Persistent persona", persona_prompt);
     }
     let max_iterations = resolve_max_iterations(active_agent.as_ref(), executor_active);
     let restore_agent_context =
@@ -1626,9 +1673,9 @@ mod tests {
         build_hidden_execution_primitive_catalog, build_hidden_mcp_tool_catalog,
         build_project_instruction_prompt, build_scoped_project_instruction_prompt,
         build_system_prompt, builtin_tools_for_skill, declares_executor_group,
-        ensure_required_baseline_tools, filter_mcp_tools_by_allowed_servers, has_tool,
-        manifest_tool_definitions, merge_with_runtime_enabled_tools, push_project_context,
-        resolve_max_iterations, select_mcp_tools, tool_uses_mcp_server,
+        ensure_required_baseline_tools, escape_xml_attr, filter_mcp_tools_by_allowed_servers,
+        has_tool, manifest_tool_definitions, merge_with_runtime_enabled_tools,
+        push_project_context, resolve_max_iterations, select_mcp_tools, tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
@@ -2066,7 +2113,7 @@ mod tests {
                 .render_system_prompt()
         });
 
-        assert!(prompt.contains("Execution environment:"));
+        assert!(prompt.contains("## Execution environment"));
         assert!(prompt.contains("Operating system:"));
         assert!(prompt.contains(std::env::consts::OS));
         assert!(prompt.contains(std::env::consts::ARCH));
@@ -2708,6 +2755,24 @@ mod tests {
     }
 
     #[test]
+    fn render_uses_markdown_headings_for_labeled_system_sections() {
+        let mut builder = SystemPromptBuilder::new();
+        builder.push_labeled(
+            ContextKind::Behavior,
+            "Runtime guard",
+            "Verify before claiming completion.",
+        );
+        builder.push_labeled(ContextKind::Behavior, "  ", "Unlabeled fallback.");
+
+        let prompt = builder.render_system_prompt();
+
+        assert!(prompt.contains(
+            "<behavior>\n## Runtime guard\nVerify before claiming completion.\n\nUnlabeled fallback.\n</behavior>"
+        ));
+        assert!(!prompt.contains("## \n"));
+    }
+
+    #[test]
     fn render_keeps_capabilities_in_system_prompt_out_of_fact_reminder() {
         let mut builder = SystemPromptBuilder::new();
         builder.push(
@@ -2724,6 +2789,7 @@ mod tests {
         assert!(!prompt.contains("You should not respond to this context"));
         assert!(!reminder.contains("Configured MCP tools can be loaded"));
         assert!(reminder.contains("Project Type"));
+        assert!(reminder.contains("## Project Type"));
     }
 
     #[test]
@@ -2763,8 +2829,10 @@ mod tests {
         .render_system_prompt();
 
         let skill_pos = prompt.find("Active skill: humanizer").unwrap();
-        let agent_pos = prompt.find("[Agent instructions]").unwrap();
+        let agent_pos = prompt.find("<agent_instructions>").unwrap();
         assert!(skill_pos < agent_pos);
+        assert!(prompt.contains("<skill_instructions>\nYou are a writing editor.\n</skill_instructions>"));
+        assert!(prompt.contains("<agent_instructions>\nYou are the build agent.\n</agent_instructions>"));
         assert!(prompt.contains("primary behavior contract"));
         assert!(prompt.contains("skill instructions override agent instructions"));
     }
@@ -2780,7 +2848,7 @@ mod tests {
 
         assert!(prompt.contains("skill instructions override generic assistant guidelines"));
         assert!(prompt.contains("except the correctness guardrails (including git-safety rules) and policy sections, which always take precedence"));
-        assert!(!prompt.contains("[Agent instructions]"));
+        assert!(!prompt.contains("<agent_instructions>"));
     }
 
     #[test]
@@ -2832,13 +2900,31 @@ mod tests {
             .sync_scope(nested.clone(), build_project_instruction_prompt)
             .expect("project instruction prompt");
 
-        assert!(prompt.contains("Project-local instructions:"));
+        assert!(
+            prompt.contains("- The current working directory provides project-specific instruction documents.")
+        );
+        assert!(prompt.contains("<instructions path="));
         assert!(prompt.contains("AGENTS.md"));
         assert!(prompt.contains("Use cargo fmt before commit."));
         assert!(prompt.contains("claude.md"));
         assert!(prompt.contains("Web app uses pnpm."));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn escape_xml_attr_escapes_all_five_special_chars() {
+        assert_eq!(
+            escape_xml_attr("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
+        // 普通路径原样保留
+        assert_eq!(
+            escape_xml_attr("/src/bin/ai/AGENTS.md"),
+            "/src/bin/ai/AGENTS.md"
+        );
+        // 空串安全
+        assert_eq!(escape_xml_attr(""), "");
     }
 
     #[test]
@@ -2862,7 +2948,10 @@ mod tests {
             })
             .expect("target-scoped instruction prompt");
 
-        assert!(prompt.contains("Target-scoped project instructions:"));
+        assert!(
+            prompt.contains("- These documents apply to files already touched in this turn.")
+        );
+        assert!(prompt.contains("<instructions path="));
         assert!(prompt.contains("AI runtime rules."));
         assert!(prompt.contains("Driver-specific rules."));
         assert!(!prompt.contains("Root safety rules."));
@@ -2926,7 +3015,7 @@ mod tests {
         assert!(reminder.contains("  1. alpha"));
         assert!(reminder.contains("  2. beta"));
         assert!(reminder.contains("  3. gamma"));
-        assert!(reminder.contains("[Skill instructions]"));
+        assert!(reminder.contains("<skill_instructions>"));
         assert!(reminder.contains("primary behavior contract for this turn"));
     }
 
@@ -3014,7 +3103,7 @@ mod tests {
             builder.render_system_prompt()
         });
 
-        assert!(prompt.contains("Project-local instructions:"));
+        assert!(prompt.contains("## Project-local instructions"));
         assert!(prompt.contains("Always follow repo safety rules."));
 
         let _ = fs::remove_dir_all(root);
@@ -3040,7 +3129,7 @@ mod tests {
             builder.render_system_prompt()
         });
 
-        assert!(prompt.contains("Project-local instructions:"));
+        assert!(prompt.contains("## Project-local instructions"));
         assert!(prompt.contains("Always follow repo safety rules."));
 
         let _ = fs::remove_dir_all(root);
@@ -3066,7 +3155,7 @@ mod tests {
             builder.render_system_prompt()
         });
 
-        assert!(prompt.contains("Project-local instructions:"));
+        assert!(prompt.contains("## Project-local instructions"));
         assert!(prompt.contains("Always follow repo safety rules."));
 
         let _ = fs::remove_dir_all(root);

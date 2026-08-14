@@ -1,6 +1,6 @@
 mod execution;
 mod messaging;
-mod overflow;
+pub(in crate::ai) mod overflow;
 mod preview;
 
 pub(in crate::ai::driver) use execution::stale_patch_targets_from_messages;

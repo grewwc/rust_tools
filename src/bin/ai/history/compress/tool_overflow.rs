@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
+use crate::ai::driver::turn_runtime::tool_result::overflow::extract_key_lines;
 use crate::ai::{
     request,
     tools::{storage::file_store::FileStore, tool_history_policy},
@@ -684,6 +685,27 @@ mod tests {
         assert!(anchor.contains("完整结果快照"), "anchor: {anchor}");
 
         let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
+    fn preserved_stub_preview_includes_line_numbered_key_lines() {
+        // read_file 输出带 `{:>6}\t` 行号前缀：key_lines 应解析前缀、用真实行号
+        // 做 L 标签（而不是被前缀挡住匹配而全部落空），让长文件外溢后仍能按行号定位。
+        let content = "\
+     1\tuse std::fmt;\n\
+     2\t\n\
+     3\tpub fn main() {\n\
+     4\t    let x = 1;\n\
+     5\t}\n\
+     6\tfn helper() {}\n\
+     7\t//! crate docs\n\
+     8\tstruct Foo;\n";
+        let preview = build_overflow_content_preview(content);
+        assert!(preview.contains("- key_lines (5):"), "preview: {preview}");
+        assert!(preview.contains("L1: use std::fmt;"), "preview: {preview}");
+        assert!(preview.contains("L3: pub fn main()"), "preview: {preview}");
+        assert!(preview.contains("L6: fn helper()"), "preview: {preview}");
+        assert!(preview.contains("L8: struct Foo;"), "preview: {preview}");
     }
 
     #[test]
@@ -1726,6 +1748,7 @@ fn build_overflow_content_preview(content: &str) -> String {
     const HEAD_LINES: usize = 8;
     const TAIL_LINES: usize = 4;
     const MAX_LINE_CHARS: usize = 200;
+    const MAX_KEY_LINES: usize = 20;
 
     let truncate_line = |line: &str| -> String {
         if line.chars().count() > MAX_LINE_CHARS {
@@ -1739,6 +1762,18 @@ fn build_overflow_content_preview(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     let mut out = String::from("Preview (for recall; not exhaustive):\n");
+    // 源码/文本类大结果：附带头带行号的结构索引（fn/struct/impl/use/错误等关键行），
+    // 与捕获期 overflow stub 的 key_lines 对齐。压缩外溢后模型仍能按行号定位目标
+    // 区域，只重读需要的 range，避免大文件（数千行）中段只能盲目重读。
+    let key_lines = extract_key_lines(content, MAX_KEY_LINES);
+    if !key_lines.is_empty() {
+        out.push_str(&format!("- key_lines ({}):\n", key_lines.len()));
+        for line in &key_lines {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
     if total <= HEAD_LINES + TAIL_LINES {
         for line in &lines {
             out.push_str(&truncate_line(line));

@@ -180,7 +180,7 @@ pub(super) fn build_model_overflow_stub(
 /// - 标记：`TODO`/`FIXME`
 ///
 /// 每行截断到 200 字符以控制 stub 体积。最多保留 `max` 行。
-fn extract_key_lines(content: &str, max: usize) -> Vec<String> {
+pub(in crate::ai) fn extract_key_lines(content: &str, max: usize) -> Vec<String> {
     let mut result = Vec::with_capacity(max);
     for (idx, line) in content.lines().enumerate() {
         if result.len() >= max {
@@ -190,7 +190,13 @@ fn extract_key_lines(content: &str, max: usize) -> Vec<String> {
         if trimmed.is_empty() {
             continue;
         }
-        let lower = trimmed.to_ascii_lowercase();
+        // read_file 输出带 `{:>6}\t` 行号前缀：前缀会挡住 fn/struct 等前缀匹配，
+        // 剥掉前缀、用真实行号做 L 标签，让长文件外溢后的结构索引真正可用。
+        let (label, matched) = match split_line_number_prefix(trimmed) {
+            Some((no, rest)) => (no, rest.trim()),
+            None => (idx, trimmed),
+        };
+        let lower = matched.to_ascii_lowercase();
         let is_key = lower.starts_with("fn ")
             || lower.starts_with("pub fn ")
             || lower.starts_with("pub(crate) fn ")
@@ -227,16 +233,31 @@ fn extract_key_lines(content: &str, max: usize) -> Vec<String> {
             || lower.contains(": error")
             || lower.contains(": warning");
         if is_key {
-            let truncated = if trimmed.chars().count() > 200 {
-                let kept: String = trimmed.chars().take(200).collect();
-                format!("L{idx}: {kept} …")
+            let truncated = if matched.chars().count() > 200 {
+                let kept: String = matched.chars().take(200).collect();
+                format!("L{label}: {kept} …")
             } else {
-                format!("L{idx}: {trimmed}")
+                format!("L{label}: {matched}")
             };
             result.push(truncated);
         }
     }
     result
+}
+
+/// 解析 read_file 输出的 `{:>6}\t{content}` 行号前缀，返回 (真实行号, 前缀后的正文)。
+/// 非该格式（如普通命令输出）返回 None，保持原有 `L{idx}` 语义。
+fn split_line_number_prefix(trimmed: &str) -> Option<(usize, &str)> {
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i >= bytes.len() || bytes[i] != b'\t' {
+        return None;
+    }
+    let no: usize = trimmed[..i].parse().ok()?;
+    Some((no, &trimmed[i + 1..]))
 }
 
 fn json_type_name(value: &Value) -> &'static str {
