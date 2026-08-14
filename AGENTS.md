@@ -66,7 +66,7 @@ in between. Prefer an existing focused test before running one.
 3. **Collections**: prefer `rustc-hash` FxHashMap/FxHashSet via existing re-exports.
 4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
 5. **AI tools**: schema/registration in `tools/registry/`, logic in `tools/service/`.
-6. **Focused changes**: do not modify unrelated code; avoid opportunistic refactors or formatting churn - if truly necessary, explain first and get confirmation.
+6. **Focused changes**: do not proactively modify files unrelated to the requirements - change only what the current task requires (plus minimal direct supporting changes). No opportunistic refactors, cleanup, or formatting churn in unrelated files; if something outside scope needs fixing, report it or ask for confirmation first.
 7. **Tests**: keep close to the changed module; serial tests use `test_support::ENV_LOCK`.
 8. **Extensibility**: prefer data-driven/registration-based design over hardcoded `if`/`else` chains. Additive, optional registration over modifying shared structs.
 9. **AGENTS.md maintenance**: after every code change, check whether the nearest scoped `AGENTS.md` (or this root file) needs updating. **Delete or revise** stale content - do not merely append. Outdated rules that contradict current behavior are worse than missing rules.

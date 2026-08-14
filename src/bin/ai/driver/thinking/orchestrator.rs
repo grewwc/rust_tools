@@ -463,7 +463,7 @@ impl TurnObserver for ThinkingOrchestrator {
         let decision = self.analyze_question(&ctx.question);
         let mut sections: Vec<(SectionKind, String, String)> = Vec::new();
         if let Some(injection) = decision.inject_into_system_prompt {
-            sections.push((SectionKind::Behavior, "Behavior".to_string(), injection));
+            sections.push((SectionKind::Behavior, "behavior".to_string(), injection));
         }
         if decision
             .active_modes
@@ -474,7 +474,7 @@ impl TurnObserver for ThinkingOrchestrator {
                     self.current_tree_node_id = Some(current);
                     sections.push((
                         SectionKind::Behavior,
-                        "Reasoning Tree".to_string(),
+                        "reasoning_tree".to_string(),
                         tree.generate_thinking_prompt(current),
                     ));
                 }
@@ -538,7 +538,7 @@ impl TurnObserver for ThinkingOrchestrator {
                         }
                     );
                 } else if !prompt.is_empty() {
-                    sections.push((SectionKind::Behavior, "Verification".to_string(), prompt));
+                    sections.push((SectionKind::Behavior, "verification".to_string(), prompt));
                 }
             }
         }
@@ -546,7 +546,7 @@ impl TurnObserver for ThinkingOrchestrator {
             if let Some(goal) = self.goal_manager.active_goal() {
                 sections.push((
                     SectionKind::Behavior,
-                    "Goal Decomposition".to_string(),
+                    "goal_decomposition".to_string(),
                     goal.generate_decomposition_prompt(),
                 ));
             }
@@ -569,7 +569,7 @@ impl TurnObserver for ThinkingOrchestrator {
                 self.build_context_budget_nudge(ctx.turn_index, &ctx.available_tool_names)
             {
                 self.context_budget_nudge_injected = true;
-                sections.push((SectionKind::Behavior, "Context Budget".to_string(), nudge));
+                sections.push((SectionKind::Behavior, "context_budget".to_string(), nudge));
             }
         }
 
