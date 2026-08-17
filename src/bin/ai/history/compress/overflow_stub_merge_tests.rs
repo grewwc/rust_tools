@@ -131,7 +131,7 @@ fn merged_stub_survives_request_normalization_with_all_directories() {
     messages[merged_idx].content = Value::String(legacy);
 
     // 模拟合并后的上下文进入下一次真实请求入口。
-    let normalized = compress_messages_for_context(messages, 100_000, 0, 0, None);
+    let normalized = compress_messages_for_context(messages, 100_000, 0, 0, None, None);
     let merged = normalized
         .iter()
         .map(|message| value_to_string(&message.content))

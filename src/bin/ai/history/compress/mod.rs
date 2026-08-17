@@ -43,8 +43,9 @@ pub(in crate::ai) const TOOL_RESULT_RAW_HARD_CAP_CHARS: usize = 64_000;
 pub(in crate::ai) fn cap_raw_tool_results_for_context(
     messages: &mut [Message],
     overflow_dir: Option<&Path>,
+    cwd: Option<&Path>,
 ) -> usize {
-    cap_oversized_tool_results_for_context(messages, TOOL_RESULT_RAW_HARD_CAP_CHARS, overflow_dir)
+    cap_oversized_tool_results_for_context(messages, TOOL_RESULT_RAW_HARD_CAP_CHARS, overflow_dir, cwd)
 }
 
 /// 所有"自动压缩摘要" note 的前缀。写入端（生成摘要 note）与识别端
@@ -583,6 +584,7 @@ pub(in crate::ai) fn compress_messages_for_context(
     keep_last: usize,
     summary_max_chars: usize,
     overflow_dir: Option<PathBuf>,
+    cwd: Option<&Path>,
 ) -> Vec<Message> {
     // 历史库中可能仍有旧版 JSON stub。它是压缩器的内部协议，不能原样交给模型，
     // 否则模型会把它当普通用户文本甚至直接复述到最终回复中。
@@ -611,6 +613,7 @@ pub(in crate::ai) fn compress_messages_for_context(
             max_chars,
             summary_max_chars,
             overflow_dir.as_deref(),
+            cwd,
             &rustc_hash::FxHashSet::default(),
         );
     }
@@ -623,6 +626,7 @@ pub(in crate::ai) fn compress_messages_for_context(
             max_chars,
             summary_max_chars,
             overflow_dir.as_deref(),
+            cwd,
             &rustc_hash::FxHashSet::default(),
         );
     }
@@ -659,6 +663,7 @@ pub(in crate::ai) fn compress_messages_for_context(
         max_chars,
         summary_max_chars,
         overflow_dir.as_deref(),
+        cwd,
         &rustc_hash::FxHashSet::default(),
     )
 }
@@ -1156,6 +1161,7 @@ fn shrink_messages_to_fit(
     mut messages: Vec<Message>,
     max_chars: usize,
     overflow_dir: Option<&Path>,
+    cwd: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> Vec<Message> {
     if max_chars == 0 {
@@ -1178,6 +1184,7 @@ fn shrink_messages_to_fit(
         480,
         KEEP_RECENT_TOOL_GROUPS,
         overflow_dir,
+            cwd,
         protected_tool_call_ids,
     );
     // 先无条件外溢体量过大的旧 user/图片消息（保护尾窗除外），与
@@ -1287,6 +1294,7 @@ fn shrink_messages_to_fit_with_summary(
     max_chars: usize,
     summary_max_chars: usize,
     overflow_dir: Option<&Path>,
+    cwd: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> Vec<Message> {
     if max_chars == 0 {
@@ -1306,6 +1314,7 @@ fn shrink_messages_to_fit_with_summary(
         480,
         KEEP_RECENT_TOOL_GROUPS,
         overflow_dir,
+            cwd,
         protected_tool_call_ids,
     );
     enforce_protected_precision_group_budget(
@@ -1313,6 +1322,7 @@ fn shrink_messages_to_fit_with_summary(
         KEEP_RECENT_TOOL_GROUPS,
         max_chars / 2,
         overflow_dir,
+            cwd,
         protected_tool_call_ids,
         false,
     );
@@ -2202,6 +2212,7 @@ pub(in crate::ai) fn mid_turn_compress(
     messages: Vec<Message>,
     soft_threshold: usize,
     overflow_dir: Option<&Path>,
+    cwd: Option<&Path>,
 ) -> (Vec<Message>, usize, usize) {
     let before = messages_total_chars(&messages);
     let messages = trim_compressed_tool_evidence_to_inline_budget(messages, overflow_dir);
@@ -2237,6 +2248,7 @@ pub(in crate::ai) fn mid_turn_compress(
         480,
         KEEP_RECENT_TOOL_GROUPS,
         overflow_dir,
+            cwd,
         &protected_tool_call_ids,
     );
     if messages_total_chars(&out) <= soft_threshold {
@@ -2244,7 +2256,7 @@ pub(in crate::ai) fn mid_turn_compress(
         return (out, before, after);
     }
     // 3. 仍超额：用 shrink_messages_to_fit 走"折叠 tool group + 整体兜底"
-    out = shrink_messages_to_fit(out, soft_threshold, overflow_dir, &protected_tool_call_ids);
+    out = shrink_messages_to_fit(out, soft_threshold, overflow_dir, cwd, &protected_tool_call_ids);
     let after = messages_total_chars(&out);
     (out, before, after)
 }
@@ -2281,6 +2293,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     keep_recent_turns: usize,
     summary_max_chars: usize,
     hard_target: usize,
+    cwd: Option<&Path>,
 ) -> (Vec<Message>, usize, usize, bool, bool) {
     let before = messages_total_chars(&messages);
     let overflow_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
@@ -2450,6 +2463,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         &mut result,
         hard_target,
         Some(overflow_dir.as_path()),
+        cwd,
         &lossless_tool_call_ids,
     );
     emergency_cap_messages_to_fit(

@@ -325,7 +325,11 @@ pub(super) async fn prepare_turn(
     // 写回缓存，build_context_history 始终从 canonical 重算），否则前台补一次压缩
     // 落盘，避免每轮重复请求期摘要。
     if super::finalize::mark_session_compaction_started(&app.session_id) {
-        let compact_result = compact_session_history_with_app(app).await;
+        let compact_result = compact_session_history_with_app(
+            app,
+            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+        )
+        .await;
         super::finalize::mark_session_compaction_finished(&app.session_id);
         if let Err(err) = compact_result
             && crate::ai::driver::runtime_ctx::terminal_output_enabled()
@@ -341,6 +345,7 @@ pub(super) async fn prepare_turn(
     let history_max_chars = app.config.history_max_chars;
     let history_keep_last = app.config.history_keep_last;
     let history_summary_max_chars = app.config.history_summary_max_chars;
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
     let history = tokio::task::spawn_blocking(move || {
         build_context_history(
             history_count,
@@ -349,6 +354,7 @@ pub(super) async fn prepare_turn(
             history_keep_last,
             history_summary_max_chars,
             overflow_dir,
+            cwd.as_deref(),
         )
         .map_err(|e| e.to_string())
     })

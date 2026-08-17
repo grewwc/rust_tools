@@ -9,6 +9,20 @@ mod suspended;
 mod task_evidence;
 mod types;
 
+/// 历史压缩器依赖的"模型摘要"端口（依赖倒置）：
+/// 持久层不直接调用请求执行管线，由 request/aux.rs 为 `App` 实现后注入。
+///
+/// 注意：`&self` 与 `messages` 复用同一个生命周期 `'a`。摘要 future 同时借用
+/// 二者，若让它们各自独立，返回的 `Box<dyn Future + Send + '_>` 无法同时满足
+/// 两个借用生命期的类型检查（`lifetime may not live long enough`）。
+pub(in crate::ai) trait HistoryMessageSummarizer {
+    fn summarize_history_messages<'a>(
+        &'a self,
+        messages: &'a [Message],
+        max_chars: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>;
+}
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -356,6 +370,7 @@ pub(in crate::ai) fn build_context_history(
     history_keep_last: usize,
     history_summary_max_chars: usize,
     overflow_dir: Option<PathBuf>,
+    cwd: Option<&Path>,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
     let projection_fingerprint = context_projection_fingerprint(
         history_max_chars,
@@ -384,7 +399,7 @@ pub(in crate::ai) fn build_context_history(
     };
     // canonical 层刻意保留 raw 工具结果；请求层必须重新执行同一物理上限，
     // 防止 snapshot 水位之后的 SQLite tail 绕过 current-turn 投影。
-    compress::cap_raw_tool_results_for_context(&mut history, overflow_dir.as_deref());
+    compress::cap_raw_tool_results_for_context(&mut history, overflow_dir.as_deref(), cwd);
     let out = if history_max_chars == 0 {
         if history_count >= history.len() {
             history
@@ -403,6 +418,7 @@ pub(in crate::ai) fn build_context_history(
             keep_last,
             history_summary_max_chars,
             overflow_dir,
+            cwd,
         )
     };
     store_cached_context_history(cache_key, out.clone());
@@ -524,21 +540,24 @@ pub(in crate::ai) fn reserve_turn_index(history_file: &Path) -> io::Result<usize
 
 pub(in crate::ai) async fn compact_session_history_with_app(
     app: &App,
+    cwd: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    compact_session_history_with_app_inner(app, false).await
+    compact_session_history_with_app_inner(app, false, cwd).await
 }
 
 /// 任务边界触发的压缩：阈值更激进（160 vs 200），适合 turn 收尾且 agent 没有
 /// 再调工具的"答案已交付"时刻调用。
 pub(in crate::ai) async fn compact_session_history_at_boundary_with_app(
     app: &App,
+    cwd: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    compact_session_history_with_app_inner(app, true).await
+    compact_session_history_with_app_inner(app, true, cwd).await
 }
 
 async fn compact_session_history_with_app_inner(
     app: &App,
     at_boundary: bool,
+    cwd: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let history_file = &app.session_history_file;
     let store = SessionStore::new(app.config.history_file.as_path());
@@ -597,6 +616,7 @@ async fn compact_session_history_with_app_inner(
             app.config.history_keep_last,
             app.config.history_summary_max_chars,
             Some(overflow_dir),
+            cwd,
         )
     } else if at_boundary {
         compress::compact_persisted_history_at_boundary_with_app(app, messages.clone()).await

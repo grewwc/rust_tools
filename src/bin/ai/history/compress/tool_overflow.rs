@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
-use crate::ai::driver::turn_runtime::tool_result::overflow::extract_key_lines;
+use crate::ai::files::extract_key_lines;
 use crate::ai::{
-    request,
+    history::HistoryMessageSummarizer,
     tools::{storage::file_store::FileStore, tool_history_policy},
     types::App,
 };
@@ -46,13 +46,14 @@ pub(super) async fn build_persisted_summary_text_with_app(
         360,
         KEEP_RECENT_TOOL_GROUPS,
         None,
+        None,
         &FxHashSet::default(),
     );
     redact_images_except_last(&mut prepared, 0);
     dedup_adjacent(&mut prepared);
     normalize_internal_notes_for_summary_model(&mut prepared);
 
-    if let Some(summary) = request::summarize_history_via_model(app, &prepared, max_chars).await {
+    if let Some(summary) = app.summarize_history_messages(&prepared, max_chars).await {
         let summary = normalize_whitespace(&summary);
         if !summary.is_empty() {
             return summary;
@@ -105,6 +106,7 @@ pub(super) fn prepare_tool_messages_structured(
     max_chars_per_msg: usize,
     keep_recent_groups: usize,
     overflow_dir: Option<&Path>,
+    cwd: Option<&Path>,
     protected_tool_call_ids: &FxHashSet<String>,
 ) {
     let id_to_tool_name = build_tool_call_name_index(messages);
@@ -145,17 +147,24 @@ pub(super) fn prepare_tool_messages_structured(
                 && text.chars().count() > max_chars_per_msg
             {
                 // 回读本 session 已归档 asset 时复用既有文件，避免「外溢→回读→
-                // 再外溢」每次铸造新 uuid 文件（与 Path C 复用逻辑一致）。
+                // 再外溢」每次铸造新文件（与 Path C 复用逻辑一致）。
                 let existing_asset_path = overflow_dir.and_then(|dir| {
                     message
                         .tool_call_id
                         .as_deref()
                         .and_then(|id| id_to_tool_args.get(id))
-                        .and_then(|args| preserved_tool_overflow_path_in_arguments(name, args, dir))
+                        .and_then(|args| preserved_tool_overflow_path_in_arguments(name, args, dir, cwd))
                 });
+                let reused_existing = existing_asset_path.is_some();
                 if let Some(path) = existing_asset_path.or_else(|| {
-                    overflow_dir
-                        .and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
+                    overflow_dir.and_then(|dir| {
+                        write_preserved_tool_overflow_file(
+                            dir,
+                            message.tool_call_id.as_deref(),
+                            name,
+                            &text,
+                        )
+                    })
                 }) {
                     let recall_lines = message
                         .tool_call_id
@@ -163,12 +172,21 @@ pub(super) fn prepare_tool_messages_structured(
                         .and_then(|id| id_to_tool_args.get(id))
                         .map(|args| build_tool_overflow_recall_lines(name, args))
                         .unwrap_or_default();
-                    message.content = Value::String(build_preserved_tool_overflow_stub(
-                        &path,
-                        name,
-                        &text,
-                        &recall_lines,
-                    ));
+                    let stub =
+                        build_preserved_tool_overflow_stub(&path, name, &text, &recall_lines);
+                    // 防膨胀：外溢必须真正腾出空间。小结果（如几百字节的 grep 输出）
+                    // 换成带完整预览的 stub 往往比原文更大，只会虚增占用、还逼模型
+                    // 去回读归档——正是「读结果一直被归档成 stub」的成因。膨胀时保留
+                    // 原文；仅删除本次新建的文件（复用的 asset 归其它消息的外溢所有，
+                    // 删除会让那条消息的 stub 悬空）。与 enforce_protected_precision_
+                    // group_budget / spill_protected_precision_to_fit 的守卫一致。
+                    if stub.chars().count() >= text.chars().count() {
+                        if !reused_existing {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    } else {
+                        message.content = Value::String(stub);
+                    }
                 }
             }
             continue;
@@ -195,6 +213,7 @@ pub(super) fn cap_oversized_tool_results_for_context(
     messages: &mut [Message],
     hard_cap_chars: usize,
     overflow_dir: Option<&Path>,
+    cwd: Option<&Path>,
 ) -> usize {
     if hard_cap_chars == 0 {
         return 0;
@@ -225,12 +244,13 @@ pub(super) fn cap_oversized_tool_results_for_context(
         let existing_asset_path = overflow_dir.and_then(|dir| {
             tool_call_id
                 .and_then(|id| id_to_tool_args.get(id))
-                .and_then(|args| preserved_tool_overflow_path_in_arguments(tool_name, args, dir))
+                .and_then(|args| preserved_tool_overflow_path_in_arguments(tool_name, args, dir, cwd))
         });
         let replacement = existing_asset_path
             .or_else(|| {
-                overflow_dir
-                    .and_then(|dir| write_preserved_tool_overflow_file(dir, tool_name, &text))
+                overflow_dir.and_then(|dir| {
+                    write_preserved_tool_overflow_file(dir, tool_call_id, tool_name, &text)
+                })
             })
             .map(|path| {
                 build_preserved_tool_overflow_stub(&path, tool_name, &text, &recall_lines)
@@ -262,6 +282,7 @@ pub(super) fn enforce_protected_precision_group_budget(
     keep_recent_groups: usize,
     inline_budget: usize,
     overflow_dir: Option<&Path>,
+    cwd: Option<&Path>,
     protected_tool_call_ids: &FxHashSet<String>,
     allow_overflow_protected: bool,
 ) {
@@ -324,13 +345,16 @@ pub(super) fn enforce_protected_precision_group_budget(
             let tool_call_id = messages[idx].tool_call_id.as_deref();
             let existing_asset_path = tool_call_id
                 .and_then(|id| id_to_tool_args.get(id))
-                .and_then(|args| preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir));
+                .and_then(|args| preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir, cwd));
             let (path, wrote_new) = if let Some(path) = existing_asset_path {
                 (path, false)
             } else {
-                let Some(path) =
-                    write_preserved_tool_overflow_file(overflow_dir, &tool_name, &text)
-                else {
+                let Some(path) = write_preserved_tool_overflow_file(
+                    overflow_dir,
+                    tool_call_id,
+                    &tool_name,
+                    &text,
+                ) else {
                     continue;
                 };
                 (path, true)
@@ -372,6 +396,7 @@ pub(super) fn spill_protected_precision_to_fit(
     messages: &mut [Message],
     hard_target_chars: usize,
     overflow_dir: Option<&Path>,
+    cwd: Option<&Path>,
     protected_tool_call_ids: &FxHashSet<String>,
 ) -> usize {
     let Some(overflow_dir) = overflow_dir else {
@@ -393,7 +418,7 @@ pub(super) fn spill_protected_precision_to_fit(
             // 复用原 asset 的指针既保住 hard target，又避免「外溢→回读→再外溢」循环。
             let existing_asset_path = id_to_tool_args
                 .get(id)
-                .and_then(|args| preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir));
+                .and_then(|args| preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir, cwd));
             (!text.trim().is_empty()
                 && !is_preserved_tool_overflow_stub(&text)
                 && !tool_history_policy(tool_name).allows_lossy_compress())
@@ -418,8 +443,12 @@ pub(super) fn spill_protected_precision_to_fit(
         let (path, wrote_new_archive) = if let Some(path) = existing_asset_path {
             (path, false)
         } else {
-            let Some(path) = write_preserved_tool_overflow_file(overflow_dir, &tool_name, &text)
-            else {
+            let Some(path) = write_preserved_tool_overflow_file(
+                overflow_dir,
+                messages[idx].tool_call_id.as_deref(),
+                &tool_name,
+                &text,
+            ) else {
                 continue;
             };
             (path, true)
@@ -504,13 +533,14 @@ fn preserved_tool_overflow_path_in_arguments(
     tool_name: &str,
     arguments: &str,
     overflow_dir: &Path,
+    cwd: Option<&Path>,
 ) -> Option<PathBuf> {
     let args = serde_json::from_str::<Value>(arguments).ok()?;
     match tool_name {
         "read_file" => preserved_tool_overflow_read_file_path(arguments, overflow_dir),
         "execute_command" => {
             let command = value_string_from_keys(&args, &["command"])?;
-            archived_asset_path_in_command(&command, overflow_dir)
+            archived_asset_path_in_command(&command, overflow_dir, cwd)
         }
         _ => None,
     }
@@ -534,9 +564,8 @@ fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) -> Option<P
 /// 从 execute_command 的 `command` 字符串中识别「读取本 session 归档 asset」的路径。
 /// 匹配 archive 直接子文件的绝对路径、相对 effective_cwd 的路径或裸文件名
 /// （文件名含 uuid，基本唯一）。archive 数量有限，每轮压缩扫描成本可接受。
-fn archived_asset_path_in_command(command: &str, overflow_dir: &Path) -> Option<PathBuf> {
+fn archived_asset_path_in_command(command: &str, overflow_dir: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     let preserved_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).canonicalize().ok()?;
-    let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
     for entry in std::fs::read_dir(&preserved_dir).ok()?.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -622,6 +651,7 @@ mod tests {
             80,
             1,
             Some(&overflow_dir),
+            None,
             &FxHashSet::default(),
         );
         let first_stub = value_to_string(&messages[1].content);
@@ -634,6 +664,7 @@ mod tests {
             80,
             1,
             Some(&overflow_dir),
+            None,
             &FxHashSet::default(),
         );
         assert_eq!(value_to_string(&messages[1].content), first_stub);
@@ -664,6 +695,7 @@ mod tests {
             80,
             1,
             Some(&overflow_dir),
+            None,
             &FxHashSet::default(),
         );
         let stub = value_to_string(&messages[1].content);
@@ -730,6 +762,7 @@ mod tests {
             80,
             1,
             Some(&overflow_dir),
+            None,
             &FxHashSet::default(),
         );
         let stub = value_to_string(&messages[1].content);
@@ -787,6 +820,7 @@ mod tests {
             1,
             200,
             Some(&overflow_dir),
+            None,
             &FxHashSet::default(),
             false,
         );
@@ -824,6 +858,7 @@ mod tests {
             1,
             200,
             Some(&overflow_dir),
+            None,
             &FxHashSet::default(),
             false,
         );
@@ -860,6 +895,7 @@ mod tests {
             &mut messages,
             80,
             Some(&overflow_dir),
+            None,
             &protected,
         );
         assert!(stub1 > 0);
@@ -883,6 +919,7 @@ mod tests {
             1,
             120,
             Some(&overflow_dir),
+            None,
             &FxHashSet::default(),
             false,
         );
@@ -910,7 +947,7 @@ mod tests {
             tool_result("first", &"y".repeat(70_000)),
         ];
         let capped =
-            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir));
+            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
         assert!(capped > 0);
         let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
         let archive_path = std::fs::read_dir(&archive_dir)
@@ -928,7 +965,7 @@ mod tests {
             tool_result("re-read", &raw),
         ];
         let capped =
-            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir));
+            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
         assert_eq!(capped, 1);
         assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
         let stub_text = value_to_string(&messages[1].content);
@@ -956,6 +993,7 @@ mod tests {
             480,
             0,
             Some(&overflow_dir),
+            None,
             &FxHashSet::default(),
         );
         let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
@@ -978,6 +1016,7 @@ mod tests {
             480,
             0,
             Some(&overflow_dir),
+            None,
             &FxHashSet::default(),
         );
         assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
@@ -987,6 +1026,89 @@ mod tests {
             stub_text.contains(archive_path.to_str().unwrap()),
             "{stub_text}"
         );
+        let _ = std::fs::remove_dir_all(&overflow_dir);
+    }
+
+    #[test]
+    fn prepare_structured_spill_is_deterministic_across_reprojections() {
+        // P1 回归：同一条 canonical tool 结果在两次独立的投影里被外溢时，必须映射到
+        // 同一个确定性归档文件，而不是每轮铸造一个随机名新副本（旧行为在单会话里
+        // 造成 368 个文件仅 211 份唯一内容的无界膨胀）。两次投影用**不同**的
+        // overflow_dir 无法体现幂等，因此复用同一个 dir 模拟同一 session 的逐轮压缩。
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-prepare-deterministic-spill-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+        // 单行长结果：预览经行截断后 stub 显著小于原文 → 确实外溢（不触发防膨胀守卫）。
+        let big = "b".repeat(4_000);
+        let build = || {
+            vec![
+                assistant_call("spill", "read_file"),
+                tool_result("spill", &big),
+                assistant_call("recent", "read_file"),
+                tool_result("recent", "recent result"),
+            ]
+        };
+
+        let mut first = build();
+        prepare_tool_messages_structured(&mut first, 480, 1, Some(&overflow_dir), None, &FxHashSet::default());
+        let first_stub = value_to_string(&first[1].content);
+        assert!(is_preserved_tool_overflow_stub(&first_stub), "{first_stub}");
+        assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
+
+        // 第二次投影：同一条 canonical 结果（同 tool_call_id + 同正文）再次被压缩。
+        // 确定性命名 → 命中既有文件、不新增副本，stub 文本逐轮稳定。
+        let mut second = build();
+        prepare_tool_messages_structured(&mut second, 480, 1, Some(&overflow_dir), None, &FxHashSet::default());
+        let second_stub = value_to_string(&second[1].content);
+        assert_eq!(
+            second_stub, first_stub,
+            "重投影后 stub 文本必须稳定（prompt cache 不断裂）"
+        );
+        assert_eq!(
+            std::fs::read_dir(&archive_dir).unwrap().count(),
+            1,
+            "同一结果重复外溢不得铸造新归档文件"
+        );
+
+        let _ = std::fs::remove_dir_all(&overflow_dir);
+    }
+
+    #[test]
+    fn prepare_structured_keeps_small_multiline_result_inline() {
+        // P2 回归：一个几百字节的多行 grep 结果（> max_chars_per_msg 但很小），
+        // 换成带完整 head/tail 预览的 stub 反而更大。防膨胀守卫必须保留原文内联，
+        // 不写归档文件——否则模型看到「已卸载，请重读」而反复回读（会话 9f4d0fae 的
+        // 「读结果一直被归档成 stub」正是此路径：673 字符 grep 被换成更大的 stub）。
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-prepare-small-inline-{}",
+            uuid::Uuid::new_v4()
+        ));
+        // 20 行、每行 ~30 字符 ≈ 600 字符：超过 max_chars_per_msg=480，但整段会被
+        // 预览逐字包含，stub 必然不小于原文。
+        let grep_like = (0..20)
+            .map(|i| format!("src/bin/ai/mod.rs:{i}: use crate::ai::x;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(grep_like.chars().count() > 480);
+        let mut messages = vec![
+            assistant_call("grep", "execute_command"),
+            tool_result("grep", &grep_like),
+            assistant_call("recent", "read_file"),
+            tool_result("recent", "recent result"),
+        ];
+
+        prepare_tool_messages_structured(&mut messages, 480, 1, Some(&overflow_dir), None, &FxHashSet::default());
+
+        let content = value_to_string(&messages[1].content);
+        assert_eq!(content, grep_like, "小的多行精确结果必须保留原文内联");
+        assert!(!is_preserved_tool_overflow_stub(&content), "不应被换成 stub");
+        // 没有归档文件被写出（膨胀时删除新建文件；此处应压根没写成功的净收益）。
+        let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+        let archived = std::fs::read_dir(&archive_dir).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(archived, 0, "膨胀结果不得留下归档文件");
+
         let _ = std::fs::remove_dir_all(&overflow_dir);
     }
 
@@ -1002,7 +1124,7 @@ mod tests {
             tool_result("run", &"log line\n".repeat(30_000)),
         ];
         let capped =
-            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir));
+            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
         assert!(capped > 0);
         let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
         let archive_path = std::fs::read_dir(&archive_dir)
@@ -1023,7 +1145,7 @@ mod tests {
             tool_result("re-cat", &raw),
         ];
         let capped =
-            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir));
+            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
         assert_eq!(capped, 1);
         assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
         let stub_text = value_to_string(&messages[1].content);
@@ -1051,7 +1173,7 @@ mod tests {
         }
 
         let spilled =
-            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), &protected);
+            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected);
 
         // 覆盖 Path C 的后半段：spill 后仍超预算时会进入 emergency cap。所有
         // preserved stub 必须先缩成不可截断的最小指针，不能再被通用 head/tail 截断。
@@ -1119,7 +1241,7 @@ mod tests {
 
         let spilled = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
             .sync_scope(effective_cwd, || {
-                spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), &protected)
+                spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected)
             });
 
         assert_eq!(spilled, 1);
@@ -1169,7 +1291,7 @@ mod tests {
 
         let spilled = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
             .sync_scope(effective_cwd, || {
-                spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), &protected)
+                spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected)
             });
 
         assert_eq!(spilled, 1);
@@ -1204,7 +1326,7 @@ mod tests {
         ];
 
         let spilled =
-            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), &protected);
+            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected);
 
         assert_eq!(spilled, 1, "task_wait 大结果应被 Path C 无损外溢");
         let stub = value_to_string(&messages[1].content);
@@ -1235,7 +1357,7 @@ mod tests {
         let before = super::super::messages_total_chars(&messages);
 
         let spilled =
-            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), &protected);
+            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected);
 
         assert_eq!(spilled, 0);
         assert_eq!(value_to_string(&messages[1].content), "ok");
@@ -1434,24 +1556,29 @@ fn sanitize_overflow_name_component(raw: &str) -> String {
         .collect::<String>()
 }
 
-/// 非 speculative 的即时外溢路径仍使用独立文件。fold 不得调用本函数；fold 的
-/// 写入统一由 `PlannedArchiveWrite` 在候选被采纳后提交。
+/// 非 speculative 的即时外溢路径。文件名由 `(tool_call_id, content)` 确定性派生
+/// （而非随机 uuid + 时间戳）：同一条 canonical tool 结果在后续 turn 重建投影时会被
+/// 反复外溢，随机命名会让「每轮压缩铸造一份新副本」无界膨胀（实测单会话 368 个归档
+/// 文件仅 211 份唯一内容），且模型沿 stub 回读时指针每轮漂移、永远拿不到稳定内容。
+/// 确定性命名后同一结果幂等映射到同一文件：已存在则复用、不重复写盘，stub 文本逐轮
+/// 稳定（与 fold 的 `folded-`、prune 的 `pruned-` 归档命名策略一致）。
+/// fold 不得调用本函数；fold 的写入统一由 `PlannedArchiveWrite` 在候选被采纳后提交。
 fn write_preserved_tool_overflow_file(
     overflow_dir: &Path,
+    tool_call_id: Option<&str>,
     tool_name: &str,
     content: &str,
 ) -> Option<PathBuf> {
     let dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
     std::fs::create_dir_all(&dir).ok()?;
     let safe_tool = sanitize_overflow_name_component(tool_name);
-    let file_name = format!(
-        "{}-{}-{}.txt",
-        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
-        safe_tool,
-        uuid::Uuid::new_v4().simple()
-    );
-    let path = dir.join(file_name);
-    std::fs::write(&path, content).ok()?;
+    let identity = format!("{}\0{content}", tool_call_id.unwrap_or(""));
+    let digest = content_sha256_hex(identity.as_bytes());
+    let path = dir.join(format!("spilled-{safe_tool}-{}.txt", &digest[..24]));
+    // 幂等：内容不随轮次变化，已存在则不重复写盘（也保住 prompt cache 稳定）。
+    if !path.exists() {
+        std::fs::write(&path, content).ok()?;
+    }
     Some(path)
 }
 

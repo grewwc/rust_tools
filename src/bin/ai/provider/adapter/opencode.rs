@@ -5,7 +5,7 @@
 //! MiniMax always-on）由 `thinking` 方言模块统一处理，不在此实现。
 
 use crate::ai::config_schema::AiConfig;
-use crate::ai::stream::{ParsedStreamPayload, try_parse_stream_chunk_loose};
+use crate::ai::request::{ParsedStreamPayload, try_parse_stream_chunk_loose};
 
 use super::{OPENCODE_DEFAULT_ENDPOINT, ProviderAdapter};
 

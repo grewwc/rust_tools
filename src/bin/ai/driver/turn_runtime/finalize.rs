@@ -244,9 +244,17 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
     tokio::spawn(
         crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, async move {
             let compact_result = if at_boundary {
-                compact_session_history_at_boundary_with_app(&task_app).await
+                compact_session_history_at_boundary_with_app(
+                    &task_app,
+                    crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+                )
+                .await
             } else {
-                compact_session_history_with_app(&task_app).await
+                compact_session_history_with_app(
+                    &task_app,
+                    crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+                )
+                .await
             };
             if let Err(err) = compact_result {
                 eprintln!("[Warning] Failed to compact persisted history: {}", err);
@@ -265,9 +273,17 @@ async fn dispatch_finalize_compaction(app: &App, at_boundary: bool, run_in_backg
         return;
     }
     let compact_result = if at_boundary {
-        compact_session_history_at_boundary_with_app(app).await
+        compact_session_history_at_boundary_with_app(
+            app,
+            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+        )
+        .await
     } else {
-        compact_session_history_with_app(app).await
+        compact_session_history_with_app(
+            app,
+            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+        )
+        .await
     };
     if let Err(err) = compact_result
         && crate::ai::driver::runtime_ctx::terminal_output_enabled()

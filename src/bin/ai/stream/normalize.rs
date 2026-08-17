@@ -483,29 +483,6 @@ fn extract_error_message(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn try_parse_stream_chunk(payload: &str) -> Option<StreamChunk> {
-    let mut chunk = serde_json::from_str::<StreamChunk>(payload).ok()?;
-    chunk.merge_reasoning();
-    Some(chunk)
-}
-
-pub(in crate::ai) fn try_parse_stream_chunk_loose(payload: &str) -> Option<StreamChunk> {
-    if let Some(chunk) = try_parse_stream_chunk(payload) {
-        return Some(chunk);
-    }
-
-    let trimmed = payload.trim();
-    let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) else {
-        return None;
-    };
-    if start >= end {
-        return None;
-    }
-
-    let candidate = &trimmed[start..=end];
-    try_parse_stream_chunk(candidate)
-}
-
 #[cfg(test)]
 mod tests {
     use super::parse_stream_payload;

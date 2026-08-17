@@ -1747,9 +1747,16 @@ mod tests {
         ];
         append_history_messages(&history_path, &messages).unwrap();
 
-        let before_context =
-            history::build_context_history(usize::MAX, history_path.as_path(), 0, 8, 4000, None)
-                .unwrap();
+        let before_context = history::build_context_history(
+            usize::MAX,
+            history_path.as_path(),
+            0,
+            8,
+            4000,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             before_context
                 .iter()
@@ -1771,9 +1778,16 @@ mod tests {
             searchable_history_content(&remaining[1].content),
             "first answer"
         );
-        let after_context =
-            history::build_context_history(usize::MAX, history_path.as_path(), 0, 8, 4000, None)
-                .unwrap();
+        let after_context = history::build_context_history(
+            usize::MAX,
+            history_path.as_path(),
+            0,
+            8,
+            4000,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(after_context.len(), 2);
         assert!(!after_context.iter().any(|message| {
             let content = searchable_history_content(&message.content);

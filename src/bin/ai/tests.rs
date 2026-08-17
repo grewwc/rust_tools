@@ -640,7 +640,7 @@ fn history_compression_inserts_summary_and_keeps_recent() {
     append_history(&path, &blob).unwrap();
 
     let messages = build_message_arr(100, &path).unwrap();
-    let compressed = compress_messages_for_context(messages, 1800, 4, 200, None);
+    let compressed = compress_messages_for_context(messages, 1800, 4, 200, None, None);
 
     assert!(!compressed.is_empty());
     assert_eq!(compressed[0].role, crate::ai::history::ROLE_INTERNAL_NOTE);
@@ -692,7 +692,7 @@ fn history_compression_summarizes_when_keep_last_exceeds_turns_but_budget_overfl
     let messages = build_message_arr(300, &path).unwrap();
     // keep_last=256 models the default configured history window; max_chars=4000
     // is far smaller than the raw history size (30 turns * ~560 bytes ~= 17k).
-    let compressed = compress_messages_for_context(messages, 4000, 256, 600, None);
+    let compressed = compress_messages_for_context(messages, 4000, 256, 600, None, None);
 
     assert!(!compressed.is_empty());
     assert_eq!(
@@ -757,7 +757,7 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
 
     let messages = build_message_arr(100, &path).unwrap();
     let compressed =
-        compress_messages_for_context(messages, 2000, 256, 400, Some(overflow_dir.clone()));
+        compress_messages_for_context(messages, 2000, 256, 400, Some(overflow_dir.clone()), None);
 
     let first_msg = compressed.first().expect("should have messages");
     assert_eq!(
@@ -830,7 +830,7 @@ fn overflow_flush_failure_restores_dropped_messages_without_data_loss() {
     let messages = build_message_arr(100, &path).unwrap();
     let original_user_count = messages.iter().filter(|m| m.role == "user").count();
     let compressed =
-        compress_messages_for_context(messages, 2000, 256, 400, Some(overflow_dir.clone()));
+        compress_messages_for_context(messages, 2000, 256, 400, Some(overflow_dir.clone()), None);
 
     // flush 失败 → 绝不删历史：全部 user 原文必须仍在返回值中（旧代码会静默丢弃）。
     let kept_user_count = compressed.iter().filter(|m| m.role == "user").count();
@@ -896,14 +896,14 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
         });
         messages.push(Message {
             role: "tool".to_string(),
-            content: Value::String("x".repeat(4000)),
+            content: Value::String("x".repeat(28_000)),
             tool_calls: None,
             tool_call_id: Some(id),
             reasoning_content: None,
         });
     }
 
-    let compressed = compress_messages_for_context(messages, 20_000, 256, 400, Some(overflow_dir));
+    let compressed = compress_messages_for_context(messages, 20_000, 2, 400, Some(overflow_dir), None);
 
     let stub = compressed
         .iter()
@@ -983,7 +983,7 @@ fn overflow_stub_recall_anchor_survives_compaction() {
     let before = messages_total_chars_pub(&messages);
     let budget = 40_000usize;
     let compressed =
-        compress_messages_for_context(messages, budget, 256, 400, Some(overflow_dir.clone()));
+        compress_messages_for_context(messages, budget, 256, 400, Some(overflow_dir.clone()), None);
     let after = messages_total_chars_pub(&compressed);
 
     // 总量显著下降并收敛进预算（tool-heavy 会话不再结构性卡死）。
@@ -1060,7 +1060,7 @@ fn compression_keeps_recent_non_compressible_tool_output_verbatim() {
     });
 
     let compressed =
-        compress_messages_for_context(messages, 32_000, 256, 400, Some(overflow_dir.clone()));
+        compress_messages_for_context(messages, 32_000, 256, 400, Some(overflow_dir.clone()), None);
 
     // 最近这条 read_file 结果既不应被外溢成 stub，也不应被裁剪：逐字可见。
     assert!(
@@ -1188,7 +1188,7 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
 
     // overflow_dir=None：隔离 dedup 行为，避免保留下来的那一份全文再被 offload
     // 到磁盘 stub（offload 阈值 480 字符是另一条正交路径，已有专门测试覆盖）。
-    let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None);
+    let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None, None);
 
     let full_identical = compressed
         .iter()
@@ -1294,7 +1294,7 @@ fn dedup_skips_byte_identical_overflow_archived_stubs() {
         messages.push(t);
     }
 
-    let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None);
+    let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None, None);
 
     // 关键断言：绝不能产生任何 "reuse the canonical full result" 的 byte-identical
     // dedup stub——那会把已截断的 stub 谎报成可复用全文。
@@ -1395,7 +1395,7 @@ fn compression_spills_old_user_message_to_session_temp_file() {
     ];
 
     let compressed =
-        compress_messages_for_context(messages, 2_000, 256, 400, Some(overflow_dir.clone()));
+        compress_messages_for_context(messages, 2_000, 256, 400, Some(overflow_dir.clone()), None);
 
     let stub = compressed
         .iter()
@@ -1500,7 +1500,7 @@ fn compression_spills_old_image_message_to_session_temp_file() {
     ];
 
     let compressed =
-        compress_messages_for_context(messages, 2_000, 256, 400, Some(overflow_dir.clone()));
+        compress_messages_for_context(messages, 2_000, 256, 400, Some(overflow_dir.clone()), None);
 
     let stub = compressed
         .iter()
@@ -1569,7 +1569,7 @@ fn mid_turn_compress_preserves_latest_user_message() {
         },
     ];
 
-    let (compressed, before, after) = mid_turn_compress(messages, 4000, None);
+    let (compressed, before, after) = mid_turn_compress(messages, 4000, None, None);
     assert!(after <= before, "compression should not expand payload");
 
     let has_latest_user = compressed
@@ -1640,7 +1640,7 @@ async fn mid_turn_llm_summary_reaches_hard_target_after_effective_early_folding(
 
     let hard_target = 5_000;
     let (compressed, before, after, did_summarize, _llm_summary_inserted) =
-        mid_turn_llm_summarize(&app, messages, 4, 2_000, hard_target).await;
+        mid_turn_llm_summarize(&app, messages, 4, 2_000, hard_target, None).await;
 
     assert!(before > hard_target + 20_000);
     assert!(did_summarize);
@@ -1708,7 +1708,7 @@ async fn mid_turn_llm_summary_path_a_preserves_raw_archive_pointer() {
     ];
 
     let (compressed, before, after, _, _) =
-        mid_turn_llm_summarize(&app, messages, 1, 1_000, 20_000).await;
+        mid_turn_llm_summarize(&app, messages, 1, 1_000, 20_000, None).await;
 
     assert!(after < before, "Path A should reduce earlier history");
     assert!(compressed.iter().any(|message| {
@@ -1830,7 +1830,7 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
 
     let before = messages_total_chars_pub(&messages);
     let (compressed, _before, after, _, _) =
-        mid_turn_llm_summarize(&app, messages, 2, 1_000, 20_000).await;
+        mid_turn_llm_summarize(&app, messages, 2, 1_000, 20_000, None).await;
     assert!(
         after < before,
         "应发生压缩：after={} before={}",
@@ -1953,7 +1953,7 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         .map(|m| m.content.as_str().map(|s| s.chars().count()).unwrap_or(0))
         .sum::<usize>();
     let (compressed, reported_before, reported_after) =
-        mid_turn_compress(messages, 36_000, Some(overflow_dir.as_path()));
+        mid_turn_compress(messages, 36_000, Some(overflow_dir.as_path()), None);
 
     assert!(reported_before >= before);
     assert!(
@@ -2058,7 +2058,7 @@ fn large_image_does_not_evict_tool_history_from_budget() {
 
     // soft_threshold 36K：若图片仍按 base64 长度计费（900K），会判为超额并
     // 触发压缩，把 tool 结果删掉。修复后图片仅计 ~1K，总预算远低于阈值。
-    let (compressed, before, after) = mid_turn_compress(messages, 36_000, None);
+    let (compressed, before, after) = mid_turn_compress(messages, 36_000, None, None);
     assert!(
         before <= 36_000,
         "image must not dominate the char budget (got {before})"
@@ -2150,7 +2150,7 @@ fn mid_turn_compress_preserves_recent_two_user_messages() {
         },
     ];
 
-    let (compressed, before, after) = mid_turn_compress(messages, 4_000, None);
+    let (compressed, before, after) = mid_turn_compress(messages, 4_000, None, None);
     assert!(after <= before, "compression should not expand payload");
 
     let has_previous_user = compressed
@@ -2243,7 +2243,7 @@ fn mid_turn_compress_prefers_three_recent_user_turns_when_context_is_small_enoug
         },
     ];
 
-    let (compressed, _before, _after) = mid_turn_compress(messages, 4_000, None);
+    let (compressed, _before, _after) = mid_turn_compress(messages, 4_000, None, None);
 
     let has_user2 = compressed
         .iter()
@@ -2333,7 +2333,7 @@ fn mid_turn_compress_keeps_tool_pairs_consistent() {
         },
     ];
 
-    let (compressed, _before, _after) = mid_turn_compress(messages, 4_000, None);
+    let (compressed, _before, _after) = mid_turn_compress(messages, 4_000, None, None);
 
     let mut assistant_tool_ids = SkipSet::default();
     for message in &compressed {
@@ -2642,7 +2642,7 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
         .unwrap();
     }
 
-    let context = build_context_history(32, &path, 6000, 32, 2000, None).unwrap();
+    let context = build_context_history(32, &path, 6000, 32, 2000, None, None).unwrap();
 
     assert!(!context.is_empty());
     assert_eq!(
@@ -2713,7 +2713,7 @@ fn context_history_keep_last_counts_user_turns_not_raw_messages() {
         .unwrap();
     }
 
-    let context = build_context_history(2, &path, 100_000, 2, 2_000, None).unwrap();
+    let context = build_context_history(2, &path, 100_000, 2, 2_000, None, None).unwrap();
 
     let user_questions = context
         .iter()
@@ -2786,7 +2786,7 @@ fn context_history_summary_keeps_tool_names_and_results() {
         .unwrap();
     }
 
-    let context = build_context_history(2, &path, 1_800, 2, 1_000, None).unwrap();
+    let context = build_context_history(2, &path, 1_800, 2, 1_000, None, None).unwrap();
     let summary = context
         .first()
         .and_then(|m| m.content.as_str())
@@ -2811,7 +2811,7 @@ fn context_history_cache_invalidates_after_history_changes() {
     )
     .unwrap();
 
-    let first = build_context_history(8, &path, 10_000, 8, 2_000, None).unwrap();
+    let first = build_context_history(8, &path, 10_000, 8, 2_000, None, None).unwrap();
     assert_eq!(first.len(), 2);
 
     std::thread::sleep(std::time::Duration::from_millis(2));
@@ -2821,7 +2821,7 @@ fn context_history_cache_invalidates_after_history_changes() {
     )
     .unwrap();
 
-    let second = build_context_history(8, &path, 10_000, 8, 2_000, None).unwrap();
+    let second = build_context_history(8, &path, 10_000, 8, 2_000, None, None).unwrap();
     assert_eq!(second.len(), 4);
     assert_eq!(
         second.last().unwrap().content,
@@ -2875,7 +2875,7 @@ fn context_history_caps_oversized_canonical_tail_without_mutating_canonical_data
     .unwrap();
 
     // 即使关闭常规 history 压缩，绝对安全上限仍应投影超大 canonical tail。
-    let context = build_context_history(8, &path, 0, 8, 2_000, Some(overflow_dir.clone())).unwrap();
+    let context = build_context_history(8, &path, 0, 8, 2_000, Some(overflow_dir.clone()), None).unwrap();
     let projected = context
         .iter()
         .find(|message| message.role == "tool")
@@ -2992,7 +2992,7 @@ fn sqlite_context_fastpath_keeps_existing_history_summary() {
     ];
     append_history_messages(&path, &messages).unwrap();
 
-    let context = build_context_history(2, &path, 10_000, 2, 2_000, None).unwrap();
+    let context = build_context_history(2, &path, 10_000, 2, 2_000, None, None).unwrap();
     assert_eq!(context[0].role, crate::ai::history::ROLE_INTERNAL_NOTE);
     assert!(
         context[0]

@@ -373,6 +373,7 @@ fn build_note_search_chat_history(
         app.config.history_keep_last,
         app.config.history_summary_max_chars,
         overflow_dir,
+        crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
     )?;
 
     Ok(history

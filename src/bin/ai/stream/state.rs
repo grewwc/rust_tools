@@ -3,9 +3,10 @@ use std::collections::VecDeque;
 use rust_tools::cw::SkipMap;
 
 use crate::ai::{
-    request::{StreamChunk, DIGEST_BEGIN, DIGEST_END},
+    request::{DIGEST_BEGIN, DIGEST_END},
     types::{FunctionCall, StreamResult, ToolCall},
 };
+pub(in crate::ai) use crate::ai::request::ParsedStreamPayload;
 
 use super::{
     MarkdownStreamRenderer,
@@ -391,24 +392,6 @@ pub(super) enum StreamChunkStep {
     Continue { meaningful_progress: bool },
     Stop,
     Return(StreamResult),
-}
-
-pub(in crate::ai) enum ParsedStreamPayload {
-    Ignore,
-    Done,
-    Chunk(StreamChunk),
-    /// content_part.added（output_text 类型）携带的是该 part 当前已存在的完整文本，
-    /// 与 output_text.delta 增量重叠，属于协议多路径重发而非模型新增内容。
-    /// 按增量格式解析（think_demux 拆分等仍生效），但流层会对 content 额外做
-    /// 未见后缀去重，避免正文跨事件路径重复渲染。
-    ReplayedChunk(StreamChunk),
-    SnapshotChunk(StreamChunk),
-    /// Responses 协议返回的完整 `reasoning` output item（含 `id` /
-    /// `encrypted_content` / `summary`）。用于同 turn 工具链回放：原样透传给
-    /// 后续请求的 input，使模型保留上一跳推理上下文。不进持久化历史。
-    ReasoningItem(serde_json::Value),
-    /// provider 在流中途返回了 error 对象或 error 事件，携带可读错误信息。
-    Error(String),
 }
 
 #[derive(Default)]

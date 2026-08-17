@@ -15,7 +15,9 @@ rules in the nearest child `AGENTS.md`.
 - `driver/`: turn orchestration, prompt/tool loop, and skill runtime
 - `history/`: canonical persistence, context projection/compression, and task evidence
 - `request/`: LLM request execution, retry, error handling, routing,
-  normalization, and thinking/reasoning support
+  normalization, and thinking/reasoning support; `request/wire_parse.rs`
+  holds stream wire-protocol parse primitives shared by provider adapters and
+  `stream/` normalization (kept here to avoid a provider ↔ stream cycle)
 - `provider/`: provider adapters and wire-format differences
 - `tools/`: tool registry, service implementations, storage, and display/history
   policy metadata
@@ -25,7 +27,9 @@ rules in the nearest child `AGENTS.md`.
   terminal/TUI rendering (under `stream/render/`)
 - `cli.rs` / `theme.rs` / `background.rs`: CLI entry, theming, background tasks
 - `persona.rs`: persona switching (per-session identity overlay, `PersonaProfile`/`PersonaStore`)
-- `files.rs` / `types.rs`: file/text parse helpers and shared types (`FileParseResult`, ...)
+- `files.rs` / `types.rs`: file/text parse helpers and shared types
+  (`FileParseResult`, ...); `extract_key_lines` (overflow stub recall anchors)
+  lives here so `history/` does not depend on `driver/`
 - `model_names.rs`: `ModelDef` registry lookup and platform/model handle helpers
 - `request_protocol.rs`: request wire-protocol dialects (chat-completions vs responses)
 - `errors.rs`: structured `AiError` enum (alternative to pervasive `Result<T, String>`)

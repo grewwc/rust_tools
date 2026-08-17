@@ -1418,6 +1418,7 @@ async fn run_turn_body(
                 drained,
                 mid_turn_soft,
                 Some(overflow_dir.as_path()),
+                crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
             );
             messages = compressed;
             supervisor.mark_compress(after);
@@ -1438,6 +1439,7 @@ async fn run_turn_body(
                         MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
                         MID_TURN_LLM_SUMMARY_MAX_CHARS,
                         history_max_chars,
+                    crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
                     )
                     .await;
                 messages = after_msgs;

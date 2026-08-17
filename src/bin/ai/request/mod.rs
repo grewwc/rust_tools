@@ -14,11 +14,12 @@ mod thinking;
 mod token_budget;
 mod transport;
 mod types;
+mod wire_parse;
 
 #[cfg(test)]
 use aux::{SESSION_TITLE_BODY_TIMEOUT_SECS, SESSION_TITLE_REQUEST_TIMEOUT_SECS};
 pub(crate) use aux::{
-    charge_llm_usage_to_kernel, generate_session_title_via_model, summarize_history_via_model,
+    charge_llm_usage_to_kernel, generate_session_title_via_model,
 };
 #[allow(unused_imports)]
 pub(crate) use error::{
@@ -60,6 +61,7 @@ pub(crate) use types::{
     RequestBody, StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall, StreamToolCall,
     StreamUsage, merge_reasoning_fragments,
 };
+pub(in crate::ai) use wire_parse::{ParsedStreamPayload, try_parse_stream_chunk_loose};
 // 外部 re-export（build_content 被 driver 多处调用）
 #[allow(unused_imports)]
 pub(crate) use builder::{build_content, clamp_max_tokens_for_prompt};

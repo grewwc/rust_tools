@@ -23,7 +23,7 @@ mod thinking;
 
 use serde_json::Value;
 
-use crate::ai::stream::{ParsedStreamPayload, try_parse_stream_chunk_loose};
+use crate::ai::request::{ParsedStreamPayload, try_parse_stream_chunk_loose};
 
 use super::ApiProvider;
 

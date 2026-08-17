@@ -835,6 +835,7 @@ fn summary_shrink_preserves_system_order_when_archive_write_fails() {
         500,
         200,
         Some(overflow_dir.as_path()),
+        None,
         &FxHashSet::default(),
     );
 
@@ -1183,7 +1184,7 @@ fn current_turn_precision_results_stay_raw_during_mid_turn_compress() {
     ));
     messages.push(tool_result("read-2", &content));
 
-    let (compressed, _, _) = mid_turn_compress(messages, 2_000, Some(&overflow_dir));
+    let (compressed, _, _) = mid_turn_compress(messages, 2_000, Some(&overflow_dir), None);
     let results = compressed
         .iter()
         .filter(|message| message.role == "tool")
@@ -1219,7 +1220,7 @@ fn mid_turn_compress_preserves_current_reasoning_only_retry_marker() {
         messages.push(tool_result(&id, &"old tool evidence\n".repeat(500)));
     }
 
-    let (compressed, before, after) = mid_turn_compress(messages, 2_000, Some(&overflow_dir));
+    let (compressed, before, after) = mid_turn_compress(messages, 2_000, Some(&overflow_dir), None);
 
     assert!(after < before, "test must exercise the compression path");
     assert!(compressed.iter().any(|message| {
@@ -1307,7 +1308,7 @@ fn leading_compressed_tool_evidence_notes_are_not_immortal_prefix_context() {
         "summary/system prefix should stay protected, but compressed tool evidence should not"
     );
 
-    let (compressed, before, after) = mid_turn_compress(messages, 2_000, Some(&overflow_dir));
+    let (compressed, before, after) = mid_turn_compress(messages, 2_000, Some(&overflow_dir), None);
     assert!(after < before, "compression should make progress");
     assert!(
         compressed.iter().any(|message| message.role == "user"
@@ -1354,7 +1355,7 @@ fn compressed_tool_evidence_has_independent_inline_budget() {
 
     // 整体远低于全局 100K 预算，仍应由工具证据自己的 12K 上限主动收敛。
     let compressed =
-        compress_messages_for_context(messages, 100_000, 256, 8_000, Some(overflow_dir.clone()));
+        compress_messages_for_context(messages, 100_000, 256, 8_000, Some(overflow_dir.clone()), None);
     let evidence = compressed
         .iter()
         .filter(|message| is_compressed_tool_evidence_note(message))

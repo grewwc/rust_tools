@@ -147,7 +147,12 @@ pub(super) fn apply_pre_request_context_budget(
     let original = messages.clone();
     let drained = std::mem::take(messages);
     let (compressed, _, after_chars) =
-        crate::ai::history::mid_turn_compress(drained, target_chars, Some(overflow_dir.as_path()));
+        crate::ai::history::mid_turn_compress(
+            drained,
+            target_chars,
+            Some(overflow_dir.as_path()),
+            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+        );
     *messages = compressed;
     // mid_turn_compress 把压缩状态提示插在最后一个 user 之后（工具循环场景下这是
     // 当前轮活动区）。但请求边界要求 current user 必须是发送序列的最后一条，故这里
@@ -915,6 +920,7 @@ mod tests {
                 2,
                 4_000,
                 app.config.history_max_chars,
+                crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
             )
             .await;
 

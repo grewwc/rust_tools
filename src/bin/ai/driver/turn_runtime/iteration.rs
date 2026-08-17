@@ -934,7 +934,12 @@ fn reactive_shrink_context_after_overflow(
     };
     let drained = std::mem::take(messages);
     let (compressed, _before, after) =
-        crate::ai::history::mid_turn_compress(drained, target_chars, Some(overflow_dir.as_path()));
+        crate::ai::history::mid_turn_compress(
+            drained,
+            target_chars,
+            Some(overflow_dir.as_path()),
+            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+        );
     *messages = compressed;
     after
 }
@@ -1074,6 +1079,7 @@ async fn request_model_response(
                 MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
                 MID_TURN_LLM_SUMMARY_MAX_CHARS,
                 app.config.history_max_chars,
+                crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
             )
             .await;
         *messages = after_msgs;

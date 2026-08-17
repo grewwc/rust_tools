@@ -14,7 +14,10 @@ use super::{
     extract_router_content,
 };
 use crate::ai::{
-    history::{Message, is_runtime_synthetic_user_message, messages_to_markdown},
+    history::{
+        HistoryMessageSummarizer, Message, is_runtime_synthetic_user_message,
+        messages_to_markdown,
+    },
     models, provider::adapter_for,
     types::App,
 };
@@ -308,6 +311,16 @@ Main request:\nUser decisions:\nVerified facts and sources:\nUnverified assistan
     let content = extract_router_content(&v)?;
     let trimmed = content.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+impl HistoryMessageSummarizer for App {
+    fn summarize_history_messages<'a>(
+        &'a self,
+        messages: &'a [Message],
+        max_chars: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(summarize_history_via_model(self, messages, max_chars))
+    }
 }
 
 fn session_title_text_content(content: &Value) -> String {
