@@ -19,6 +19,37 @@ use crate::ai::theme::{
     ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MathBlockDelimiter {
+    Dollars,
+    Brackets,
+}
+
+impl MathBlockDelimiter {
+    fn opening(line: &str) -> Option<Self> {
+        match line {
+            "$$" => Some(Self::Dollars),
+            "\\[" => Some(Self::Brackets),
+            _ => None,
+        }
+    }
+
+    fn closes(self, line: &str) -> bool {
+        matches!(
+            (self, line),
+            (Self::Dollars, "$$") | (Self::Brackets, "\\]")
+        )
+    }
+}
+
+fn indent_math_block(rendered: &str, indent: &str) -> String {
+    rendered
+        .split('\n')
+        .map(|line| format!("{indent}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(in crate::ai) struct MarkdownStreamRenderer {
     tty: bool,
     enabled: bool,
@@ -27,7 +58,9 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     code_block_indent: String,
     code_block_lang: Option<String>,
     code_line_number: usize,
-    in_math_block: bool,
+    math_block_delimiter: Option<MathBlockDelimiter>,
+    math_block_indent: String,
+    math_line_candidate_buffered: bool,
     bol: bool,
     line_buf: String,
     line_preview_emitted: bool,
@@ -48,6 +81,8 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     html_table_buf: String,
     html_table_preview_height: usize,
     html_table_indent: String,
+    // 数学块缓冲区：积累 $$/\[/\] 之间的内容，块结束后一次性渲染
+    math_block_buf: Vec<String>,
 }
 
 impl MarkdownStreamRenderer {
@@ -65,7 +100,9 @@ impl MarkdownStreamRenderer {
             code_block_indent: String::new(),
             code_block_lang: None,
             code_line_number: 0,
-            in_math_block: false,
+            math_block_delimiter: None,
+            math_block_indent: String::new(),
+            math_line_candidate_buffered: false,
             bol: false,
             line_buf: String::new(),
             line_preview_emitted: false,
@@ -79,6 +116,7 @@ impl MarkdownStreamRenderer {
             html_table_buf: String::new(),
             html_table_preview_height: 0,
             html_table_indent: String::new(),
+            math_block_buf: Vec::new(),
         }
     }
 
@@ -166,12 +204,27 @@ impl MarkdownStreamRenderer {
             }
             let line = std::mem::take(&mut self.line_buf);
             let rendered = self.consume_line(&line, self.line_preview_emitted);
+            self.math_line_candidate_buffered = false;
             self.line_preview_emitted = false;
             self.line_preview_height = 0;
             self.code_preview_segment_width = 0;
             if !rendered.is_empty() {
                 out.write_all(rendered.as_bytes())?;
                 self.bol = rendered.ends_with('\n');
+            }
+        }
+
+        if self.math_block_delimiter.take().is_some() {
+            let indent = std::mem::take(&mut self.math_block_indent);
+            let rendered = indent_math_block(
+                &super::math::render_math_block(&self.math_block_buf),
+                &indent,
+            );
+            self.math_block_buf.clear();
+            if !rendered.is_empty() {
+                out.write_all(rendered.as_bytes())?;
+                out.write_all(b"\n")?;
+                self.bol = true;
             }
         }
 
@@ -243,6 +296,7 @@ impl MarkdownStreamRenderer {
         }
 
         let line = std::mem::take(&mut self.line_buf);
+        self.math_line_candidate_buffered = false;
 
         // 纯空行且不在代码块/数学块/表格上下文：先缓存，不立即落地。等真实内容跟进
         // 时照数补回（段间空行不受影响）；若直到 flush 仍无内容，则作为尾随空行丢弃，
@@ -250,7 +304,7 @@ impl MarkdownStreamRenderer {
         if !self.line_preview_emitted
             && line.trim().is_empty()
             && !self.in_code_block
-            && !self.in_math_block
+            && self.math_block_delimiter.is_none()
             && !self.in_html_table
             && matches!(self.table_state, TableState::None)
         {
@@ -299,6 +353,29 @@ impl MarkdownStreamRenderer {
         // "预测终端折行行数"这一残像/叠表根因。
         if self.should_buffer_table_line() {
             return Ok(());
+        }
+
+        // 数学块及其独占行分隔符必须整行缓冲。否则实时预览会先把原始 TeX 输出到
+        // 屏幕，换行后再追加 Unicode 成品，造成重复内容。行首空白也先短暂缓冲；
+        // 一旦确认不是数学分隔符，就一次性补发此前缓存的前缀。
+        if !self.in_code_block {
+            let trimmed = self.line_buf.trim_start();
+            let is_math_candidate = self.math_block_delimiter.is_some()
+                || matches!(trimmed, "" | "$" | "$$" | "\\" | "\\[" | "\\]");
+            if is_math_candidate {
+                self.math_line_candidate_buffered = true;
+                return Ok(());
+            }
+            if self.math_line_candidate_buffered {
+                self.math_line_candidate_buffered = false;
+                if self.dimmed {
+                    out.write_all(b"\x1b[2m")?;
+                }
+                out.write_all(self.line_buf.as_bytes())?;
+                self.line_preview_emitted = true;
+                self.line_preview_height = self.current_line_preview_height();
+                return Ok(());
+            }
         }
         self.handle_realtime_output(out, ch)
     }
@@ -435,12 +512,28 @@ impl MarkdownStreamRenderer {
             }
             let line = std::mem::take(&mut self.line_buf);
             let rendered = self.consume_line(&line, self.line_preview_emitted);
+            self.math_line_candidate_buffered = false;
             self.line_preview_emitted = false;
             self.line_preview_height = 0;
             self.code_preview_segment_width = 0;
             if !rendered.is_empty() {
                 out.write_all(rendered.as_bytes())?;
                 self.bol = rendered.ends_with('\n');
+            }
+        }
+
+        // 先消费最后一段无换行文本，再收尾未闭合数学块；否则末行会漏出为原始 TeX。
+        if self.math_block_delimiter.take().is_some() {
+            let indent = std::mem::take(&mut self.math_block_indent);
+            let rendered = indent_math_block(
+                &super::math::render_math_block(&self.math_block_buf),
+                &indent,
+            );
+            self.math_block_buf.clear();
+            if !rendered.is_empty() {
+                let line = format!("{ACCENT_SECONDARY}{rendered}\x1b[0m\n");
+                out.write_all(line.as_bytes())?;
+                self.bol = true;
             }
         }
 
@@ -510,6 +603,16 @@ impl MarkdownStreamRenderer {
     }
 
     pub(in crate::ai) fn consume_line(&mut self, line: &str, preview_emitted: bool) -> String {
+        // 数学块中的 `|` 是公式内容，不得先进入 Markdown 表格状态机。
+        if self.math_block_delimiter.is_some() {
+            let rendered = self.render_line_no_table(line);
+            if preview_emitted && !line.is_empty() {
+                let preview_height = self.line_preview_height.max(1);
+                return format!("\x1b[{preview_height}A\r\x1b[0J{rendered}");
+            }
+            return rendered;
+        }
+
         // HTML 表格缓冲：正在收集 <table>...</table> 内容
         if self.in_html_table {
             return self.consume_html_table_line(line, preview_emitted);
@@ -897,17 +1000,30 @@ impl MarkdownStreamRenderer {
             return out;
         }
 
-        if trimmed == "$$" || trimmed == "\\[" || trimmed == "\\]" {
-            self.in_math_block = !self.in_math_block;
+        if let Some(delimiter) = self.math_block_delimiter {
+            if delimiter.closes(trimmed) {
+                self.math_block_delimiter = None;
+                let block_indent = std::mem::take(&mut self.math_block_indent);
+                let rendered = indent_math_block(
+                    &super::math::render_math_block(&self.math_block_buf),
+                    &block_indent,
+                );
+                self.math_block_buf.clear();
+                if !rendered.is_empty() {
+                    return format!("{base}{ACCENT_SECONDARY}{rendered}\x1b[0m\n");
+                }
+                return "\n".to_string();
+            }
+
+            self.math_block_buf.push(rest.trim_end().to_string());
             return "\n".to_string();
         }
 
-        if self.in_math_block {
-            if line.is_empty() {
-                return "\n".to_string();
-            }
-            let math = crate::ai::stream::render_math_tex_to_unicode(rest.trim_end());
-            return format!("{indent}{base}{ACCENT_SECONDARY}{math}\x1b[0m\n");
+        if let Some(delimiter) = MathBlockDelimiter::opening(trimmed) {
+            self.math_block_delimiter = Some(delimiter);
+            self.math_block_indent = indent.to_string();
+            self.math_block_buf.clear();
+            return "\n".to_string();
         }
 
         if let Some((level, title)) = parse_heading(trimmed) {
@@ -2373,5 +2489,46 @@ make_llm_call_publisher | 一致 | 同一条 on_call complete callback
                 "split table line exceeds terminal width ({width}):\n{visible}\n\n{rendered}"
             );
         }
+    }
+
+    #[test]
+    fn display_math_is_buffered_and_flushed_without_raw_tex_preview() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let mut output = renderer
+            .write_block_for_test(
+                "  $$\n  \\begin{aligned}\n  x &= 1 | 2 \\\\ y &= 2\n  \\end{aligned}\n  $$\n",
+                false,
+            )
+            .unwrap();
+        output.push_str(&renderer.flush_pending_for_test().unwrap());
+
+        let visible = crate::ai::stream::extract::strip_ansi_codes(&output);
+        assert!(!visible.contains("$$"), "got: {visible}");
+        assert!(!visible.contains("\\begin"), "got: {visible}");
+        assert!(!visible.contains('&'), "got: {visible}");
+        assert!(visible.contains('|'), "got: {visible}");
+        assert_eq!(visible.matches('x').count(), 1, "got: {visible}");
+        assert_eq!(visible.matches('y').count(), 1, "got: {visible}");
+        for line in visible.lines().filter(|line| line.contains(['x', 'y'])) {
+            assert!(line.starts_with("  "), "got: {visible}");
+        }
+    }
+
+    #[test]
+    fn unmatched_display_closer_does_not_open_a_math_block() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let _ = renderer.consume_line("\\]", false);
+        assert!(renderer.math_block_delimiter.is_none());
+    }
+
+    #[test]
+    fn flush_includes_unterminated_math_block_final_line() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let mut output = renderer.write_block_for_test("$$\nx^2", false).unwrap();
+        output.push_str(&renderer.flush_pending_for_test().unwrap());
+
+        let visible = crate::ai::stream::extract::strip_ansi_codes(&output);
+        assert!(visible.contains("x²"), "got: {visible}");
+        assert!(!visible.contains("x^2"), "got: {visible}");
     }
 }

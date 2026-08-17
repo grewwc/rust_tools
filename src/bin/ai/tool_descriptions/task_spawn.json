@@ -1,6 +1,6 @@
 {
   "name": "task_spawn",
-  "description": "Launch a subagent task asynchronously and return immediately with a task_id, letting several independent subtasks run concurrently. For a SINGLE delegated subtask whose result you need back, prefer the synchronous `task` — a lone task_spawn followed by task_wait is no more concurrent and only adds overhead. After spawning, continue independent parent-side work; use task_status for non-blocking snapshots and call task_wait only when blocked on results. The task_id stays collectable until its result is consumed.",
+  "description": "Launch a subagent task asynchronously and return immediately with a task_id, letting several independent subtasks run concurrently. For a SINGLE delegated subtask whose result you need back, prefer the synchronous `task` — a lone task_spawn followed by task_wait is no more concurrent and only adds overhead. After spawning, continue independent parent-side work. The task_id stays collectable until its result is consumed.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -14,15 +14,15 @@
       },
       "agent": {
         "type": "string",
-        "description": "Optional subagent name. Leave empty to let the runtime auto-select the best subagent."
+        "description": "Optional subagent name (default: auto-select)."
       },
       "model": {
         "type": "string",
-        "description": "Optional model override. Default: reuse parent model; override only when the subtask is clearly lighter or heavier."
+        "description": "Optional model override. Default: reuse parent model."
       },
       "inherit": {
         "type": "string",
-        "description": "Optional inheritance control: 'all' (history, memory, cwd, skills), 'none' (fresh context), or a comma-separated subset of history, memory, cwd, skills. Default: cwd+skills only (history and memory kept private). Keep the default (or 'cwd') for delegated steps that touch the workspace - serial steps hand off via files. Use 'none' only for pure analysis that never touches the workspace; 'all' only when the subtask depends on the full conversation."
+        "description": "Optional inheritance control: 'all' (history, memory, cwd, skills), 'none' (fresh context), or a comma-separated subset of history, memory, cwd, skills. Default: cwd+skills only (history and memory kept private)."
       },
       "response_schema": {
         "type": "object",

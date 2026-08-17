@@ -139,6 +139,7 @@
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
+    "default_reasoning_effort": "max",
     "subagent_priority": 80
   },
   {
@@ -163,7 +164,8 @@
     "tools_default_enabled": true,
     "enable_thinking": true,
     "subagent_priority": 80,
-    "endpoint": "https://opencode.ai/zen/go/v1/chat/completions"
+    "endpoint": "https://opencode.ai/zen/go/v1/chat/completions",
+    "default_reasoning_effort": "max"
   },
   {
     "key": "hy3-free",

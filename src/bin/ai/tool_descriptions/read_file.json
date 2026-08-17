@@ -1,6 +1,6 @@
 {
   "name": "read_file",
-  "description": "Read a line-numbered excerpt from a local file (regular files only; directories are not supported). Paths may be absolute or relative to the effective working directory shown in the system prompt. Use offset/limit to page: a large limit for a broad overview during discovery, a small limit for a precise line-range read once you know the region you need. Set use_line_numbers=false to get the raw content without line-number prefixes (e.g. to copy exact text into apply_patch).",
+  "description": "Read a line-numbered excerpt from a local file (regular files only; directories are not supported). Set use_line_numbers=false to get the raw content without line-number prefixes (e.g. to copy exact text into apply_patch).",
   "parameters": {
     "type": "object",
     "properties": {

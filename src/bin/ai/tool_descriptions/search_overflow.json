@@ -1,6 +1,6 @@
 {
   "name": "search_overflow",
-  "description": "Search session content moved out of context. Returns verbatim excerpts with file paths and line numbers; use read_file only when more context is needed.",
+  "description": "Search session content moved out of context. Returns verbatim excerpts with file paths and line numbers.",
   "parameters": {
     "type": "object",
     "properties": {

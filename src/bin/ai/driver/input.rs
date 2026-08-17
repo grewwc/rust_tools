@@ -1986,9 +1986,13 @@ mod tests {
 }
 
 fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
+    let model_label = crate::ai::models::model_display_label(&app.current_model);
+    let reasoning_effort_label =
+        crate::ai::request::reasoning_effort_display_label(app, &app.current_model);
     if let Some(editor) = app.prompt_editor.as_mut() {
         crate::ai::prompt::completion::CommandCompleter::set_current_model_hint(&app.current_model);
-        editor.set_current_model_label(crate::ai::models::model_display_label(&app.current_model));
+        editor.set_current_model_label(&model_label);
+        editor.set_current_reasoning_effort_label(reasoning_effort_label);
         editor.set_session_id(app.session_id.clone());
         // 设置 session 主题：从当前 session 的首条用户消息生成概括性标题。
         // 若 session 尚无用户消息（新 session），显示 "new session"。
@@ -2022,7 +2026,7 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     // 无 TUI 编辑器时，在输入提示前打印一行简短的模型提示。
     println!(
         "  {ACCENT_MUTED}[{ACCENT_SUCCESS}{}{ACCENT_MUTED}]{RESET}",
-        crate::ai::models::model_display_label(&app.current_model),
+        model_label,
     );
 
     let mut lines = Vec::new();

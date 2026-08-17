@@ -113,54 +113,157 @@ fn segment_verification_effect(tokens: &[String]) -> (bool, bool) {
     (scope_review, behavior_check)
 }
 
-fn is_read_only_segment(tokens: &[String]) -> bool {
+/// 单段命令的写文件意图分类。
+///
+/// 只读/非只读两态语义被并入这个三态分类：非只读里混着两种语义——
+/// - `WriteIntended`：已知程序显式写本地文件（`sed -i`、`bytedcli --output-dir`、
+///   `git commit`、`cargo build` 等），或者 known mutator；
+/// - `Unknown`：未知程序（`python3`/`node`/`perl -e` 等解释器、脚本），既没有
+///   只读知识也没有写知识——它可能写也可能不写。
+///
+/// 未知程序即使从项目 cwd 运行也没有任何写入证据，不能据此判定"项目已被变更"；
+/// 否则只读的 python/node 校验会被误判为项目变更，污染 checkpoint 阶段提示
+/// 等下游。completion 证据门禁只认可可证明的工具级变更（apply_patch /
+/// write_file），不依赖本分类；但本分类仍服务于 checkpoint 阶段提示等下游。
+/// 解释器无法穷尽（不能用白名单枚举），所以必须靠写入证据而不是程序名归类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentWriteKind {
+    ReadOnly,
+    WriteIntended,
+    Unknown,
+}
+
+fn segment_write_kind(tokens: &[String]) -> SegmentWriteKind {
     let Some(program) = command_program(tokens) else {
-        return true;
+        return SegmentWriteKind::ReadOnly;
     };
     let subcommand = command_subcommand(tokens).unwrap_or_default();
     match program {
         "cd" | "pwd" | "ls" | "cat" | "rg" | "grep" | "head" | "tail" | "wc" | "stat" | "file"
         | "which" | "type" | "echo" | "printf" | "sleep" | "true" | "false" | "test" | "sort"
-        | "uniq" | "cut" | "find" | "comm" | "tr" => true,
-        "sed" => !tokens
-            .iter()
-            .any(|token| token == "-i" || token.starts_with("-i")),
-        "git" => matches!(
-            subcommand,
-            "diff"
-                | "status"
-                | "log"
-                | "show"
-                | "reflog"
-                | "branch"
-                | "rev-parse"
-                | "ls-files"
-                | "grep"
-                | "blame"
-        ),
-        "cargo" => matches!(
-            subcommand,
-            "check" | "test" | "clippy" | "build" | "metadata"
-        ),
-        "go" => subcommand == "test",
-        "npm" | "pnpm" | "yarn" => matches!(subcommand, "test" | "check"),
-        "make" => matches!(subcommand, "test" | "check"),
-        "pytest" => true,
+        | "uniq" | "cut" | "find" | "comm" | "tr" => SegmentWriteKind::ReadOnly,
+        "sed" => {
+            if tokens
+                .iter()
+                .any(|token| token == "-i" || token.starts_with("-i"))
+            {
+                SegmentWriteKind::WriteIntended
+            } else {
+                SegmentWriteKind::ReadOnly
+            }
+        }
+        "git" => {
+            // 子命令可能不在索引 1：`git -C <repo> tag -l` / `git --git-dir=... tag` 等
+            // 全局选项会前置。`tag`/`worktree` 分支需要的是"子命令后的第一个参数"
+            // （`subcommand_index + 1`），硬编码 `tokens.get(2)` 会把全局选项的值
+            // （如 `-C` 的路径）误当成 tag/worktree 的实参，把只读查询判成写 refs。
+            let subcommand_index =
+                crate::ai::tools::service::audit::command_subcommand_index(tokens).unwrap_or(1);
+            let tag_worktree_arg = tokens.get(subcommand_index + 1).map(|s| s.as_str());
+            if matches!(
+                subcommand,
+                "diff"
+                    | "status"
+                    | "log"
+                    | "show"
+                    | "reflog"
+                    | "branch"
+                    | "rev-parse"
+                    | "ls-files"
+                    | "grep"
+                    | "blame"
+                    | "ls-remote"
+                    | "remote"
+                    | "fetch"
+            ) {
+                SegmentWriteKind::ReadOnly
+            } else if subcommand == "tag" {
+                // `git tag`（无参数）与 `git tag -l/--list/-n/...` 是只读查询；
+                // 其余形式（`git tag <name>`、`-a/-d/-m/-s/-f` 等）会写 refs，视为写。
+                // `-l/-n/--list/--sort/--format` 支持附着值形式（`-n1`、`-ln`、
+                // `--sort=...`、`--format=...`），同样只读，按前缀匹配；git tag 的
+                // 写 flag（`-a/-d/-f/-m/-s/-u/-F/-e`）与这些前缀无冲突。
+                let read_only_tag_arg = |arg: &str| {
+                    arg == "-l"
+                        || arg == "--list"
+                        || arg == "-n"
+                        || arg == "--format"
+                        || arg == "--sort"
+                        || arg == "-v"
+                        || arg == "--verify"
+                        || arg == "--contains"
+                        || arg == "--merged"
+                        || arg == "--no-merged"
+                        || arg == "--points-at"
+                        || arg.starts_with("-l")
+                        || arg.starts_with("-n")
+                        || arg.starts_with("--list")
+                        || arg.starts_with("--sort")
+                        || arg.starts_with("--format")
+                };
+                match tag_worktree_arg {
+                    None => SegmentWriteKind::ReadOnly,
+                    Some(arg) if read_only_tag_arg(arg) => SegmentWriteKind::ReadOnly,
+                    Some(_) => SegmentWriteKind::WriteIntended,
+                }
+            } else if subcommand == "worktree" {
+                // `git worktree list` 只读；`add/remove/prune/move/repair/lock/unlock` 写。
+                match tag_worktree_arg {
+                    None | Some("list") => SegmentWriteKind::ReadOnly,
+                    Some(_) => SegmentWriteKind::WriteIntended,
+                }
+            } else {
+                SegmentWriteKind::WriteIntended
+            }
+        }
+        "cargo" => {
+            if matches!(subcommand, "check" | "test" | "clippy" | "build" | "metadata") {
+                SegmentWriteKind::ReadOnly
+            } else {
+                SegmentWriteKind::WriteIntended
+            }
+        }
+        "go" => {
+            if subcommand == "test" {
+                SegmentWriteKind::ReadOnly
+            } else {
+                SegmentWriteKind::WriteIntended
+            }
+        }
+        "npm" | "pnpm" | "yarn" => {
+            if matches!(subcommand, "test" | "check") {
+                SegmentWriteKind::ReadOnly
+            } else {
+                SegmentWriteKind::WriteIntended
+            }
+        }
+        "make" => {
+            if matches!(subcommand, "test" | "check") {
+                SegmentWriteKind::ReadOnly
+            } else {
+                SegmentWriteKind::WriteIntended
+            }
+        }
+        "pytest" => SegmentWriteKind::ReadOnly,
         // `bytedcli` 是 ByteDance 内部平台 CLI（codebase/db/faas/log 等子命令
         // 都是远端 API 查询/操作），默认不写本地项目文件，故按只读归类；
         // 但 `--output`/`--output-dir`/`--manifest` 会显式写本地文件
         // （如 `codebase mr artifacts download --output-dir ...`），必须视为变更。
         "bytedcli" => {
-            !tokens.iter().any(|token| {
+            if tokens.iter().any(|token| {
                 token == "--output"
                     || token == "--output-dir"
                     || token == "--manifest"
                     || token.starts_with("--output=")
                     || token.starts_with("--output-dir=")
                     || token.starts_with("--manifest=")
-            })
+            }) {
+                SegmentWriteKind::WriteIntended
+            } else {
+                SegmentWriteKind::ReadOnly
+            }
         }
-        _ => false,
+        _ => SegmentWriteKind::Unknown,
     }
 }
 
@@ -252,9 +355,9 @@ fn mutation_target_tokens(tokens: &[String]) -> (Vec<String>, bool) {
             positional_tokens(tokens, 1).into_iter().skip(1).collect()
         }
         "perl"
-            if tokens
-                .iter()
-                .any(|token| token.starts_with("-pi") || token.starts_with("-ip")) =>
+            if tokens.iter().any(|token| {
+                token.starts_with("-pi") || token.starts_with("-ip") || token.starts_with("-i")
+            }) =>
         {
             positional_tokens(tokens, 1)
         }
@@ -269,6 +372,8 @@ fn mutation_target_tokens(tokens: &[String]) -> (Vec<String>, bool) {
         _ => Vec::new(),
     };
     targets.retain(|target| !target.chars().all(|ch| ch.is_ascii_digit()));
+    // `perl` 是解释器，只有 `-p/-i`（就地编辑）形态才"按设计写文件"；
+    // 裸 `perl -e '...'` 与 python3/node 一样没有任何写入证据。
     let known_mutator = matches!(
         program,
         "touch"
@@ -285,14 +390,16 @@ fn mutation_target_tokens(tokens: &[String]) -> (Vec<String>, bool) {
             | "chown"
             | "chgrp"
             | "sed"
-            | "perl"
             | "git"
             | "cargo"
             | "npm"
             | "pnpm"
             | "yarn"
             | "make"
-    );
+    ) || (program == "perl"
+        && tokens.iter().any(|token| {
+            token.starts_with("-pi") || token.starts_with("-ip") || token.starts_with("-i")
+        }));
     (targets, known_mutator)
 }
 
@@ -358,9 +465,16 @@ fn analyze_execute_command(command: &str, initial_cwd: &Path) -> ExecuteCommandA
         let (scope_review, behavior_check) = segment_verification_effect(&tokens);
         let mut raw_targets = redirection_targets(&segment.command);
         let has_redirection = !raw_targets.is_empty();
-        let read_only = is_read_only_segment(&tokens);
+        let write_kind = segment_write_kind(&tokens);
+        let read_only = matches!(write_kind, SegmentWriteKind::ReadOnly);
         let (mut command_targets, known_mutator) = mutation_target_tokens(&tokens);
         raw_targets.append(&mut command_targets);
+        // 只有"已知会写本地文件"的程序（WriteIntended 或 known mutator）才能仅凭
+        // cwd 在项目内判定为项目变更；未知程序（python3/node/...）没有任何写入
+        // 证据，兜底置位会把只读校验误判为变更，触发 completion 证据门禁
+        // （`successful_post_mutation_verification` 被重置）导致模型重复输出结论。
+        let known_writer =
+            matches!(write_kind, SegmentWriteKind::WriteIntended) || known_mutator;
         let mutation = has_redirection || !read_only;
         if !mutation {
             analysis.effects.push(ExecuteCommandSegmentEffect {
@@ -382,14 +496,18 @@ fn analyze_execute_command(command: &str, initial_cwd: &Path) -> ExecuteCommandA
                 }
                 resolved_any = true;
             } else {
-                project_mutation |= path_is_in_project(&cwd, &project_root);
+                if known_writer {
+                    project_mutation |= path_is_in_project(&cwd, &project_root);
+                }
                 if !analysis.unknown_mutation_bases.contains(&cwd) {
                     analysis.unknown_mutation_bases.push(cwd.clone());
                 }
             }
         }
         if !read_only && (!known_mutator || !resolved_any) {
-            project_mutation |= path_is_in_project(&cwd, &project_root);
+            if known_writer {
+                project_mutation |= path_is_in_project(&cwd, &project_root);
+            }
             if !analysis.unknown_mutation_bases.contains(&cwd) {
                 analysis.unknown_mutation_bases.push(cwd.clone());
             }
@@ -1695,6 +1813,115 @@ mod tests {
         assert!(
             effects.iter().any(|effect| effect.project_mutation),
             "bytedcli 显式输出到项目目录仍应视为项目变更"
+        );
+    }
+
+    #[test]
+    fn git_readonly_listing_queries_are_not_project_mutations() {
+        // 回归：git 只读查询子命令（tag -l / worktree list / ls-remote / remote -v /
+        // fetch）之前被当作 WriteIntended（白名单外的 git 子命令一律视为写），从项目
+        // cwd 触发 cwd 兜底误判为 project_mutation。这会在同一轮里重置
+        // successful_post_mutation_verification：例如 `git status --short &&
+        // git worktree list && git tag -l` 中，git status 的校验证据被后面误判的
+        // worktree list / tag -l 重置，导致 completion 证据门禁误报"未观察到变更后
+        // 校验"（会话 a48935d1 消息 169/170 即因此被 Warn，结论被迫带上错误的未校验警告）。
+        for command in [
+            "git tag -l \"V2.78*\"",
+            "git tag | grep -c foo",
+            "git worktree list",
+            "git ls-remote --tags origin",
+            "git remote -v",
+            "git fetch --tags",
+            "git status --short && git worktree list && git tag -l",
+            // 全局选项前置时子命令不在索引 1，`tag`/`worktree` 必须取
+            // 子命令后的第一个参数而非硬编码的第三 token（`-C` 的值不是实参）。
+            "git -C . tag -l \"V2.78*\"",
+            "git -C . worktree list",
+            // 只读查询 flag 的附着值形式（`-n1`/`-ln`/`--sort=`/`--format=`）。
+            "git tag -n1",
+            "git tag -ln \"v*\"",
+            "git tag --sort=-creatordate",
+            "git tag --format='%(refname:short)'",
+        ] {
+            let args = serde_json::json!({"command": command, "pty": false});
+            let effects = super::execute_command_segment_effects_for_args(&args);
+            assert!(!effects.is_empty(), "{command}");
+            assert!(
+                effects.iter().all(|effect| !effect.project_mutation),
+                "git 只读查询不应被视为项目变更: {command}"
+            );
+        }
+
+        // git 真正写 refs / 工作区的形态仍应判定为项目变更。
+        for command in [
+            "git worktree add /tmp/wt HEAD",
+            "git worktree remove /tmp/wt",
+            "git tag -a v1.0 -m \"release\"",
+            "git tag -d old-tag",
+            "git commit -am \"x\"",
+        ] {
+            let args = serde_json::json!({"command": command, "pty": false});
+            let effects = super::execute_command_segment_effects_for_args(&args);
+            assert!(
+                effects.iter().any(|effect| effect.project_mutation),
+                "git 写操作应视为项目变更: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_interpreter_readonly_checks_are_not_project_mutations() {
+        // 回归：python3/node/perl -e 等"未知程序"从项目 cwd 跑只读校验时，
+        // 之前会被 cwd 兜底误判为 project_mutation，触发 completion 证据门禁
+        // （重置 successful_post_mutation_verification），导致模型被迫重复输出
+        // 结论（会话 9cec82e3 最后三轮 277/310/329 均因此触发）。
+        // 修复：只有"已知会写本地文件"的程序（WriteIntended 或 known mutator）
+        // 才允许仅凭 cwd 判定项目变更；未知程序必须靠写入证据（重定向/可解析的
+        // 项目内目标）才能判定，不能靠枚举解释器名（无法穷尽）。
+        for command in [
+            "python3 -c \"import json; print('ok')\"",
+            "node -e \"console.log('ok')\"",
+            "perl -e 'print qq{ok\\n}'",
+        ] {
+            let args = serde_json::json!({"command": command, "pty": false});
+            let effects = super::execute_command_segment_effects_for_args(&args);
+            assert!(!effects.is_empty(), "{command}");
+            assert!(
+                effects.iter().all(|effect| !effect.project_mutation),
+                "未知解释器的只读校验不应被视为项目变更: {command}"
+            );
+        }
+
+        // 未知解释器 + shell 重定向写入项目文件：按写入证据仍判定为项目变更。
+        let args = serde_json::json!({
+            "command": "python3 -c \"print('x')\" > generated.json",
+            "pty": false
+        });
+        let effects = super::execute_command_segment_effects_for_args(&args);
+        assert!(
+            effects.iter().any(|effect| effect.project_mutation),
+            "未知解释器通过重定向写入项目文件仍应视为项目变更"
+        );
+
+        // perl 仅 -p/-i（就地编辑）形态是已知写者；目标文件解析后应视为项目变更。
+        for command in [
+            "perl -pi -e 's/foo/bar/' src/main.rs",
+            "perl -i -pe 's/foo/bar/' src/main.rs",
+        ] {
+            let args = serde_json::json!({"command": command, "pty": false});
+            let effects = super::execute_command_segment_effects_for_args(&args);
+            assert!(
+                effects.iter().any(|effect| effect.project_mutation),
+                "perl 就地编辑项目文件应视为项目变更: {command}"
+            );
+        }
+
+        // 已知写者（npm install）的 cwd 兜底保持不变。
+        let args = serde_json::json!({"command": "npm install", "pty": false});
+        let effects = super::execute_command_segment_effects_for_args(&args);
+        assert!(
+            effects.iter().any(|effect| effect.project_mutation),
+            "npm install 在项目 cwd 下仍应视为项目变更"
         );
     }
 

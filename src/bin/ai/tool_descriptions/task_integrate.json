@@ -6,7 +6,7 @@
     "properties": {
       "tasks": {
         "type": "array",
-        "description": "Delivered subagent results to acknowledge. Each item must identify the task, record its disposition, and summarize the parent's conclusion.",
+        "description": "Delivered subagent results; each item needs task_id, disposition, and a conclusion summary.",
         "items": {
           "type": "object",
           "properties": {

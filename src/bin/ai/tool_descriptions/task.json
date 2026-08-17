@@ -1,6 +1,6 @@
 {
   "name": "task",
-  "description": "Launch a specialized subagent synchronously and return its final output. The current agent blocks until the subagent finishes. Use this for a single focused side investigation when you need the result before continuing. For multiple parallel subagents prefer task_spawn + task_wait. The runtime auto-selects a subagent when 'agent' is omitted.",
+  "description": "Launch a specialized subagent synchronously and return its final output. Use this for a single focused side investigation when you need the result before continuing. For multiple parallel subagents prefer task_spawn + task_wait.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -14,7 +14,7 @@
       },
       "agent": {
         "type": "string",
-        "description": "Optional subagent name. Leave empty to let the runtime auto-select the best subagent for this task."
+        "description": "Optional subagent name (default: auto-select)."
       },
       "model": {
         "type": "string",

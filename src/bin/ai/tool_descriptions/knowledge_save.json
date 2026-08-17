@@ -1,6 +1,6 @@
 {
   "name": "knowledge_save",
-  "description": "Save user-directed content to the global knowledge base with optional category and tags. Guideline categories like `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` suit durable principles/constraints that can be retrieved explicitly.",
+  "description": "Save user-directed content to the global knowledge base with optional category and tags.",
   "parameters": {
     "type": "object",
     "properties": {

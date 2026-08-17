@@ -1,6 +1,6 @@
 {
   "name": "tree",
-  "description": "Display directory tree structure with depth control. Shows files and directories in a hierarchical format, respecting .gitignore-style skip directories. Use this to quickly understand project layout without reading individual files.",
+  "description": "Display directory tree structure with depth control, respecting .gitignore-style skip directories. Use this to quickly understand project layout without reading individual files.",
   "parameters": {
     "type": "object",
     "properties": {

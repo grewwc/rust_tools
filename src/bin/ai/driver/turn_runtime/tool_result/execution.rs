@@ -480,15 +480,32 @@ enum CompletionEvidenceGateAction {
 
 #[derive(Default)]
 pub(in crate::ai::driver::turn_runtime) struct CompletionEvidenceState {
+    /// 会话中是否发生过任意变更（工具级或命令级）。保留给 checkpoint 阶段提示
+    /// 等下游使用；门控决策只用 `successful_tool_level_mutation`（见下），
+    /// 因为命令级“变更”是意图分类，可能把只读命令误判为变更。
     pub(in crate::ai::driver::turn_runtime) successful_mutation: bool,
+    /// 是否发生过可证明的工具级变更（apply_patch / write_file 成功）。
+    /// 这是门控唯一可信的变更证据：命令级“变更”可能误报，基于它 Reopen/Warn
+    /// 会逼模型重复输出结论（白名单永远加不完，只能放弃依赖该分类）。
+    successful_tool_level_mutation: bool,
     pub(in crate::ai::driver::turn_runtime) successful_post_mutation_verification: bool,
     successful_post_mutation_scope_review: bool,
     successful_post_mutation_behavior_check: bool,
+    /// 变更后是否运行过任何成功的工具调用（命令或只读工具，如 read_file）。
+    /// 分类器无法穷尽识别验证命令（如 python3 脚本），这类调用虽不足以证明
+    /// “检查通过”，但证明模型做了变更后工作；有它时门控静默 Allow —— 注入
+    /// “未观察到检查”的断言是虚假的，会诱导模型防御性重述结论。
+    successful_post_mutation_activity: bool,
+    /// 变更后是否出现过“已知检查失败”（如 cargo check 输出未确认成功）。
+    /// 这是可证明事实而非分类不确定性；失败不会因后续良性调用清零。有它时
+    /// 门控走 Warn —— 模型在已知检查失败后声称完成，诚实警告不会造成虚假重复。
+    successful_post_mutation_failed_check: bool,
 }
 
 /// 只扫描当前 user turn 的规范消息，并按 `tool_call_id` 将调用与结果配对。
-/// 每次成功 mutation 都会使之前的验证失效；同一复合命令中只有纯 `&&`
-/// 成功链里的后续检查才能覆盖最新改动。
+/// 只有可证明的工具级 mutation（apply_patch / write_file 成功）会使之前的
+/// 验证失效；命令级“变更”是意图分类，可能误报，不再参与门禁信号重置。
+/// 同一复合命令中只有纯 `&&` 成功链里的后续检查才能覆盖最新改动。
 pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
     turn_messages: &[Message],
 ) -> CompletionEvidenceState {
@@ -521,13 +538,23 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
                 .unwrap_or_default();
             let output_confirms_behavior_check =
                 behavior_check_output_confirms_success(&message.content);
-            for effect in effects {
+            // 命令级判定：整条命令是否有输出失败的已知检查。
+            // `cargo check | tail -5` 报错时，tail 段本身不是检查，若按段判定
+            // 会被误记为“变更后活动”，必须整条命令一起看。
+            let mut command_has_failed_known_check = false;
+            for effect in &effects {
+                command_has_failed_known_check |=
+                    effect.behavior_check && !output_confirms_behavior_check;
+            }
+            let had_mutation_before_command = state.successful_mutation;
+            for effect in &effects {
                 let had_mutation = state.successful_mutation;
+                // 命令级变更只记账到 successful_mutation（供 checkpoint 阶段
+                // 提示等下游使用），不再重置门禁信号：命令级“变更”是意图分类，
+                // 可能把只读命令误判为变更，重置会让门禁误以为“变更后什么都没
+                // 做”，进而虚假 Reopen/Warn，逼模型重复输出结论。
                 if effect.project_mutation {
                     state.successful_mutation = true;
-                    state.successful_post_mutation_verification = false;
-                    state.successful_post_mutation_scope_review = false;
-                    state.successful_post_mutation_behavior_check = false;
                 }
                 if had_mutation
                     && (effect.success_guaranteed
@@ -539,11 +566,34 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
                     state.successful_post_mutation_behavior_check |= effect.behavior_check;
                 }
             }
+            // 命令级“变更后活动”：变更后运行了没有输出失败的已知检查的成功
+            // 命令，记为变更后活动。分类器认不出的验证命令（python3 脚本）以及
+            // 命令级变更本身都落在这里；有它时门控静默 Allow —— 它证明模型做了
+            // 变更后工作，注入“未观察到检查”的断言是虚假的，会诱导模型重述结论。
+            // 反之，已知检查失败（如 cargo check 输出未确认成功）是可证明事实，
+            // 单独记账，后续良性调用不得把它清零。
+            if had_mutation_before_command {
+                if command_has_failed_known_check {
+                    state.successful_post_mutation_failed_check = true;
+                } else {
+                    state.successful_post_mutation_activity = true;
+                }
+            }
         } else if tool_call_is_successful_mutation_candidate(tool_call) {
+            // 工具级变更（apply_patch / write_file）是门禁唯一可信的变更证据，
+            // 每次成功都会使之前的验证失效。
             state.successful_mutation = true;
+            state.successful_tool_level_mutation = true;
             state.successful_post_mutation_verification = false;
             state.successful_post_mutation_scope_review = false;
             state.successful_post_mutation_behavior_check = false;
+            state.successful_post_mutation_activity = false;
+            state.successful_post_mutation_failed_check = false;
+        } else if state.successful_mutation {
+            // 变更后的成功只读/信息工具（read_file、search_overflow 等）也算
+            // 变更后活动：否则 apply_patch → read_file → final 会被误判为
+            // “什么都没做”而 Reopen，逼模型重复输出结论。
+            state.successful_post_mutation_activity = true;
         }
     }
 
@@ -645,6 +695,11 @@ const REASONING_ONLY_SYNTHESIS_MARKER: &str = "[reasoning-only-synthesis]";
 const REASONING_ONLY_SYNTHESIS_NOTE: &str = "Multiple consecutive responses contained hidden reasoning but no visible assistant answer. Produce the concrete user-facing final answer now. Do not call tools and do not return hidden reasoning alone.";
 /// 仅返回思考内容时,最多自动重试的次数(达到上限后才进入最后一次无思考合成)。
 const REASONING_ONLY_MAX_RETRIES: usize = 3;
+const REASONING_ONLY_SYNTHESIS_RETRY_MARKER: &str = "[reasoning-only-synthesis-retry]";
+const REASONING_ONLY_SYNTHESIS_RETRY_NOTE: &str = "The response still contained hidden reasoning with no visible assistant answer, even after the synthesis instruction. Produce the concrete user-facing final answer now; do not call tools and do not return hidden reasoning alone.";
+/// 已强制无思考合成后仍仅返回思考内容时,最多再自动重试的次数;超过后停轮
+/// 给出用户可见错误,避免逐轮重复同字节请求空转到 max_iterations。
+const REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES: usize = 2;
 
 fn append_runtime_warning_once(text: &mut String, warning: &str) {
     if text.contains(warning) {
@@ -1186,6 +1241,28 @@ fn completion_evidence_gate_action(
         }
     };
     if !evidence.successful_mutation || evidence_is_sufficient {
+        return CompletionEvidenceGateAction::Allow;
+    }
+
+    // 门禁只在“可证明的工具级变更”上行动。命令级“变更”是意图分类，可能把
+    // 只读命令误判为变更（白名单永远加不完），基于它 Reopen/Warn 会逼模型
+    // 重复输出结论 —— 这正是运行时唯一能彻底避免的错误重复源。
+    if !evidence.successful_tool_level_mutation {
+        return CompletionEvidenceGateAction::Allow;
+    }
+
+    // 已知检查失败（可证明事实，非分类不确定性）优先于“变更后活动”：即使
+    // 后续有良性工具调用把 activity 置回 true，失败事实也要保留并走 Warn ——
+    // 模型在已知检查失败后声称完成，诚实警告不会造成虚假重复。
+    if evidence.successful_post_mutation_failed_check {
+        return CompletionEvidenceGateAction::Warn;
+    }
+
+    // 变更后做过任何成功工作（无论是否被识别为“验证”）：分类器认不出的验证
+    // 命令（python3 脚本）、只读工具（read_file）都算。此时静默 Allow ——
+    // 注入“未观察到检查”的断言是虚假的，会让模型防御性重述结论；只有可证明
+    // 的“变更后零活动”才配 Reopen/Warn。
+    if evidence.successful_post_mutation_activity {
         return CompletionEvidenceGateAction::Allow;
     }
 
@@ -2742,10 +2819,49 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                             .as_str()
                             .is_some_and(|text| text.starts_with(REASONING_ONLY_SYNTHESIS_MARKER))
                 });
-                if already_forced_synthesis || iteration >= max_iterations {
+                // 迭代硬上限仍是最终兜底：到达 max_iterations 停轮并给出用户可见错误。
+                if iteration >= max_iterations {
                     *final_assistant_text = "[Model returned only reasoning content without a final answer; please retry or switch models]"
                         .to_string();
                     return Ok(TurnLoopStep::Break);
+                }
+                if already_forced_synthesis {
+                    // 已强制过无思考合成仍空转：保留 synthesis 笔记与
+                    // force_final_response / thinking_disabled_override，不重复注入
+                    // synthesis 笔记。但该路径 force_final_response 已置位，
+                    // orchestrator 的 tool-loop / progress-budget / checkpoint 二级
+                    // 刹车全部失效，且本类被归类为 FinalResponse，consecutive_empty /
+                    // truncation / stream_error 兜底计数器也不会计数——若逐轮重复同
+                    // 字节请求，对确定性模型将徒劳空转到 max_iterations。这里用轻量
+                    // 重试标记显式计数：每轮注入一次新标记（也让每轮请求携带新上下文），
+                    // 达到 REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES 后停轮给出用户
+                    // 可见错误。
+                    let post_synthesis_retries = messages
+                        .iter()
+                        .filter(|message| {
+                            message.role == ROLE_INTERNAL_NOTE
+                                && message.content.as_str().is_some_and(|text| {
+                                    text.starts_with(REASONING_ONLY_SYNTHESIS_RETRY_MARKER)
+                                })
+                        })
+                        .count();
+                    if post_synthesis_retries >= REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES {
+                        *final_assistant_text = "[Model returned only reasoning content without a final answer; please retry or switch models]"
+                            .to_string();
+                        return Ok(TurnLoopStep::Break);
+                    }
+                    messages.push(Message {
+                        role: ROLE_INTERNAL_NOTE.to_string(),
+                        content: serde_json::Value::String(format!(
+                            "{REASONING_ONLY_SYNTHESIS_RETRY_MARKER}\n{REASONING_ONLY_SYNTHESIS_RETRY_NOTE}\n(Automatic recovery attempt {}/{} after forced synthesis)",
+                            post_synthesis_retries + 1,
+                            REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES
+                        )),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                    return Ok(TurnLoopStep::Continue);
                 }
                 if retry_count >= REASONING_ONLY_MAX_RETRIES || *force_final_response {
                     messages.push(Message {
@@ -4629,6 +4745,113 @@ mod tests {
     }
 
     #[test]
+    fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently() {
+        // 模型变更后只用分类器认不出的命令验证（python3 脚本）：变更后确有
+        // 活动，但无“被识别的检查”。此时应静默 Allow —— 既不 Reopen 也不
+        // 追加“未观察到检查”的虚假警告（也不记内部注记），否则模型会防御性
+        // 重述结论。这正是“重复输出结论”的根源，运行时永远不该成为它的来源。
+        let mutation = test_tool_call(
+            "call_patch",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: /tmp/project/lib.rs\n@@\n-old\n+new\n*** End Patch"
+            }),
+        );
+        let unrecognized_check = test_tool_call(
+            "call_verify",
+            "execute_command",
+            serde_json::json!({ "command": "python3 /tmp/project/verify.py" }),
+        );
+        let evidence_messages = vec![
+            assistant_tool_call_message(mutation),
+            tool_result_message("call_patch", "Successfully patched 1 file."),
+            assistant_tool_call_message(unrecognized_check),
+            tool_result_message("call_verify", "all checks passed"),
+        ];
+        let evidence = completion_evidence_state(&evidence_messages);
+        assert!(evidence.successful_mutation);
+        assert!(!evidence.successful_post_mutation_verification);
+        assert!(
+            evidence.successful_post_mutation_activity,
+            "python3 校验虽未被识别为检查，也应记为变更后活动"
+        );
+
+        let mut app = test_app_with_tools(&["apply_patch", "execute_command"]);
+        let shared_mcp =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let mut messages = evidence_messages.clone();
+        let mut turn_messages = evidence_messages;
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = false;
+        let mut terminal_dedupe_candidate = None;
+        let mut turn_had_tool_error = false;
+
+        let final_response = || {
+            IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Completed,
+                assistant_text: "已修复。".to_string(),
+                skip_response_drain: true,
+                ..Default::default()
+            })
+        };
+        let step = handle_iteration_execution(
+            &mut app,
+            "fix the bug",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            final_response(),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            2,
+            16,
+            0,
+            &mut turn_had_tool_error,
+        )
+        .unwrap();
+
+        // 第一次 final 就直接收尾（静默 Allow），不 Reopen、不追加警告，
+        // 模型不会重述结论。
+        assert!(matches!(step, TurnLoopStep::Break));
+        assert!(final_assistant_recorded);
+        assert!(final_assistant_text.starts_with("已修复。"));
+        assert!(
+            !final_assistant_text.contains(COMPLETION_EVIDENCE_WARNING),
+            "变更后活动静默 Allow，不应追加'未观察到检查'的虚假警告"
+        );
+        assert!(
+            !turn_messages.iter().any(|message| {
+                message.role == ROLE_INTERNAL_NOTE
+                    && message.content.as_str().is_some_and(|text| {
+                        text.starts_with(COMPLETION_EVIDENCE_UNVERIFIED_NOTE)
+                    })
+            }),
+            "变更后活动静默 Allow，不应记入'未观察到验证'的内部注记"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.role == ROLE_INTERNAL_NOTE
+                        && message.content.as_str().is_some_and(|text| {
+                            text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER)
+                        })
+                })
+                .count(),
+            0,
+            "有变更后活动时不应注入 completion_evidence_required 重开笔记"
+        );
+    }
+
+    #[test]
     fn completion_evidence_gate_precedes_dangling_final_recovery() {
         let mutation = test_tool_call(
             "call_patch",
@@ -4983,7 +5206,11 @@ mod tests {
     }
 
     #[test]
-    fn completion_evidence_gate_rejects_piped_check_without_success_sentinel() {
+    fn completion_evidence_gate_warns_on_piped_check_without_success_sentinel() {
+        // `cargo check 2>&1 | tail -5` 输出是错误信息：检查确实运行了，但输出
+        // 无法确认成功，等于“失败的已知检查”（可证明事实）。模型此时声称完成
+        // 应被诚实警告（Warn），而非 Reopen —— 模型已尝试过检查，再逼它“去跑
+        // 检查”会制造重复输出；警告 + 内部注记足以驱动下一轮收敛。
         let mutation = test_tool_call(
             "call_write",
             "write_file",
@@ -5016,12 +5243,15 @@ mod tests {
                 2,
                 16,
             ),
-            CompletionEvidenceGateAction::Reopen
+            CompletionEvidenceGateAction::Warn
         );
     }
 
     #[test]
-    fn completion_evidence_gate_accepts_mutation_then_check_in_same_command() {
+    fn completion_evidence_gate_allows_command_level_mutation_with_same_command_check() {
+        // 纯命令级变更 + 同一命令内的成功检查（printf > 文件 && cargo check）。
+        // 命令级“变更”是意图分类，门禁只认可证明的工具级变更，因此一律 Allow；
+        // 成功检查不会被惩罚，但也不再是门禁放行的依据。
         let command = test_tool_call(
             "call_command",
             "execute_command",
@@ -5049,7 +5279,63 @@ mod tests {
     }
 
     #[test]
-    fn completion_evidence_gate_rejects_unreliable_compound_command() {
+    fn completion_evidence_gate_warns_after_failed_check_even_with_later_activity() {
+        // apply_patch → 已知检查失败（cargo check 输出未确认成功）→ 后续良性
+        // 命令（ls）。良性调用把 activity 置回 true，但失败是可证明事实，不得
+        // 被静默放行：门控应 Warn（诚实警告，非分类不确定性，不会造成虚假重复），
+        // 而不是 Allow。
+        let mutation = test_tool_call(
+            "call_patch",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: /tmp/project/lib.rs\n@@\n-old\n+new\n*** End Patch"
+            }),
+        );
+        let failed_check = test_tool_call(
+            "call_check",
+            "execute_command",
+            serde_json::json!({ "command": "cargo check --bin a 2>&1 | tail -5" }),
+        );
+        let benign = test_tool_call(
+            "call_ls",
+            "execute_command",
+            serde_json::json!({ "command": "ls" }),
+        );
+        let turn_messages = vec![
+            assistant_tool_call_message(mutation),
+            tool_result_message("call_patch", "Successfully patched 1 file."),
+            assistant_tool_call_message(failed_check),
+            tool_result_message("call_check", "error[E0425]: cannot find value `x` in this scope"),
+            assistant_tool_call_message(benign),
+            tool_result_message("call_ls", "src  target"),
+        ];
+        let mut messages = turn_messages.clone();
+
+        let evidence = completion_evidence_state(&turn_messages);
+        assert!(evidence.successful_tool_level_mutation);
+        assert!(evidence.successful_post_mutation_failed_check);
+        assert!(evidence.successful_post_mutation_activity);
+
+        assert_eq!(
+            completion_evidence_gate_action(
+                &mut messages,
+                &turn_messages,
+                "已修复。",
+                false,
+                2,
+                16,
+            ),
+            CompletionEvidenceGateAction::Warn
+        );
+    }
+
+    #[test]
+    fn completion_evidence_gate_allows_command_level_mutation_without_tool_evidence() {
+        // 纯命令级变更（sed -i ... ; cargo check）：没有 apply_patch / write_file
+        // 这类可证明的工具级变更。命令级“变更”是意图分类，可能把只读命令误判为
+        // 变更（白名单永远加不完），基于它 Reopen 会逼模型重复输出结论。因此
+        // 门禁对纯命令级变更一律静默 Allow —— 收敛强度让位于“绝不错误地制造
+        // 重复输出”这一更高优先级不变式。
         let command = test_tool_call(
             "call_command",
             "execute_command",
@@ -5072,7 +5358,7 @@ mod tests {
                 2,
                 16,
             ),
-            CompletionEvidenceGateAction::Reopen
+            CompletionEvidenceGateAction::Allow
         );
     }
 
@@ -5250,7 +5536,238 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(second_step, TurnLoopStep::Break));
+        // 已强制合成后模型仍返回 reasoning-only:不再提前停轮,保持强制状态继续
+        // 自动重试,且不重复注入 synthesis 笔记;但每次注入一个轻量
+        // synthesis-retry 标记(计入 REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES),
+        // 避免逐轮重复同字节请求空转。
+        assert!(matches!(second_step, TurnLoopStep::Continue));
+        assert!(app.cli.thinking_disabled_override);
+        assert!(force_final_response);
+        assert!(final_assistant_text.is_empty());
+        let synthesis_markers = messages
+            .iter()
+            .filter(|message| {
+                message.role == ROLE_INTERNAL_NOTE
+                    && message
+                        .content
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(REASONING_ONLY_SYNTHESIS_MARKER))
+            })
+            .count();
+        assert_eq!(synthesis_markers, 1);
+        let synthesis_retry_markers = messages
+            .iter()
+            .filter(|message| {
+                message.role == ROLE_INTERNAL_NOTE
+                    && message
+                        .content
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(REASONING_ONLY_SYNTHESIS_RETRY_MARKER))
+            })
+            .count();
+        assert_eq!(synthesis_retry_markers, 1);
+    }
+
+    #[test]
+    fn reasoning_only_final_response_stops_after_bounded_post_synthesis_retries() {
+        // 已强制无思考合成后模型仍返回 reasoning-only:只允许有限次带新标记的重试
+        // (REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES),超过后停轮并给出用户可见
+        // 错误——避免逐轮重复同字节请求空转到 max_iterations。
+        let mut app = test_app_with_tools(&["read_file"]);
+        let mcp = crate::ai::mcp::McpClient::new();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
+        let mut messages = vec![Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: serde_json::Value::String(format!(
+                "{REASONING_ONLY_SYNTHESIS_MARKER}\n{REASONING_ONLY_SYNTHESIS_NOTE}"
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = true;
+        let mut terminal_dedupe_candidate = None;
+
+        let stream_result = || {
+            IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Completed,
+                tool_calls: Vec::new(),
+                assistant_text: String::new(),
+                hidden_meta: String::new(),
+                reasoning_text: "Still hidden reasoning".to_string(),
+                reasoning_items: Vec::new(),
+                skip_response_drain: true,
+                truncated_by_length: false,
+                stream_error: false,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_cached_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
+            })
+        };
+        fn synthesis_retry_markers(messages: &[Message]) -> usize {
+            messages
+                .iter()
+                .filter(|message| {
+                    message.role == ROLE_INTERNAL_NOTE
+                        && message.content.as_str().is_some_and(|text| {
+                            text.starts_with(REASONING_ONLY_SYNTHESIS_RETRY_MARKER)
+                        })
+                })
+                .count()
+        }
+
+        // 第一次命中(尚无 synthesis-retry 标记):注入新标记并继续。
+        let step = handle_iteration_execution(
+            &mut app,
+            "compare two yaml files",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            stream_result(),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            3,
+            16,
+            0,
+            &mut false,
+        )
+        .unwrap();
+        assert!(matches!(step, TurnLoopStep::Continue));
+        assert!(final_assistant_text.is_empty());
+        assert_eq!(synthesis_retry_markers(&messages), 1);
+
+        // 第二次命中:注入第二个标记并继续。
+        let second_step = handle_iteration_execution(
+            &mut app,
+            "compare two yaml files",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            stream_result(),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            4,
+            16,
+            0,
+            &mut false,
+        )
+        .unwrap();
+        assert!(matches!(second_step, TurnLoopStep::Continue));
+        assert!(final_assistant_text.is_empty());
+        assert_eq!(synthesis_retry_markers(&messages), 2);
+
+        // 第三次命中:达到上限,停轮并给出用户可见错误。
+        let last_step = handle_iteration_execution(
+            &mut app,
+            "compare two yaml files",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            stream_result(),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            5,
+            16,
+            0,
+            &mut false,
+        )
+        .unwrap();
+        assert!(matches!(last_step, TurnLoopStep::Break));
+        assert_eq!(
+            final_assistant_text,
+            "[Model returned only reasoning content without a final answer; please retry or switch models]"
+        );
+    }
+
+    #[test]
+    fn reasoning_only_final_response_max_iterations_is_final_backstop() {
+        // 迭代硬上限仍是最终兜底:即便已强制合成后的重试未达上限,到达
+        // max_iterations 也停轮并给出用户可见错误。
+        let mut app = test_app_with_tools(&["read_file"]);
+        let mcp = crate::ai::mcp::McpClient::new();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
+        let mut messages = vec![Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: serde_json::Value::String(format!(
+                "{REASONING_ONLY_SYNTHESIS_MARKER}\n{REASONING_ONLY_SYNTHESIS_NOTE}"
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = true;
+        let mut terminal_dedupe_candidate = None;
+
+        let stream_result = || {
+            IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Completed,
+                tool_calls: Vec::new(),
+                assistant_text: String::new(),
+                hidden_meta: String::new(),
+                reasoning_text: "Still hidden reasoning".to_string(),
+                reasoning_items: Vec::new(),
+                skip_response_drain: true,
+                truncated_by_length: false,
+                stream_error: false,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_cached_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
+            })
+        };
+
+        // 合成后重试未达上限,但已到 max_iterations:停轮并给出用户可见错误。
+        let last_step = handle_iteration_execution(
+            &mut app,
+            "compare two yaml files",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            stream_result(),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            16,
+            16,
+            0,
+            &mut false,
+        )
+        .unwrap();
+        assert!(matches!(last_step, TurnLoopStep::Break));
         assert_eq!(
             final_assistant_text,
             "[Model returned only reasoning content without a final answer; please retry or switch models]"

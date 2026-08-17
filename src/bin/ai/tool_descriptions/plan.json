@@ -1,6 +1,6 @@
 {
   "name": "plan",
-  "description": "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. Delegate every substantive step to a subagent - serial or parallel - so each step runs with a clean, focused context and you review the results; keep in the parent only trivial single-tool steps, tightly coupled overlapping edits, and final review/synthesis. Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly.",
+  "description": "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -28,7 +28,7 @@
             },
             "parallelizable": {
               "type": "boolean",
-              "description": "Whether this step can run in parallel with the previous step (no data dependency on earlier steps). Default: false. Only meaningful when set explicitly - it no longer follows from `delegate`; a delegated step is serial unless you set this to true."
+              "description": "Whether this step can run in parallel with the previous step (no data dependency on earlier steps). Default: false; not implied by `delegate` (delegated steps are serial unless set)."
             },
             "delegate": {
               "type": "boolean",

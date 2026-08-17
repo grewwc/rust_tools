@@ -70,6 +70,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     status_msg: Option<&str>,
     completion_panel: Option<&CompletionPanel>,
     model_label: &str,
+    reasoning_effort_label: &str,
     session_topic: Option<&str>,
 ) -> Option<u16> {
     let area = f.area();
@@ -183,6 +184,18 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                     .add_modifier(Modifier::BOLD),
             ),
         ];
+        if !reasoning_effort_label.is_empty() {
+            spans.push(Span::styled(
+                "  |  reasoning: ",
+                Style::default().fg(Color::Rgb(100, 116, 139)),
+            ));
+            spans.push(Span::styled(
+                reasoning_effort_label,
+                Style::default()
+                    .fg(Color::Rgb(96, 165, 250))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         // 在 model 同行展示 session 主题
         let topic_text = match session_topic {
             Some(t) if !t.is_empty() => t,
@@ -663,9 +676,23 @@ mod tests {
         terminal
             .draw(|f| {
                 viewport_area = f.area();
-                render_multiline_popup(f, &mut textarea, None, None, "glm-5.2-super-relay", None);
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "glm-5.2-super-relay",
+                    "max",
+                    None,
+                );
             })
             .unwrap();
+
+        let rendered = (viewport_area.y..viewport_area.bottom())
+            .map(|y| buffer_row(terminal.backend(), y, viewport_area.x, viewport_area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("reasoning: max"));
 
         let popup_width = viewport_area
             .width
@@ -694,7 +721,15 @@ mod tests {
         terminal
             .draw(|f| {
                 viewport_area = f.area();
-                render_multiline_popup(f, &mut textarea, None, None, "glm-5.2-super-relay", None);
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "glm-5.2-super-relay",
+                    "max",
+                    None,
+                );
             })
             .unwrap();
 
@@ -738,7 +773,15 @@ mod tests {
         terminal
             .draw(|f| {
                 viewport_area = f.area();
-                render_multiline_popup(f, &mut textarea, None, None, "glm-5.2-super-relay", None);
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "glm-5.2-super-relay",
+                    "max",
+                    None,
+                );
             })
             .unwrap();
 

@@ -326,6 +326,7 @@ impl PromptEditor {
                             status_msg.as_deref(),
                             completion_panel.as_ref(),
                             &self.current_model_label,
+                            &self.current_reasoning_effort_label,
                             self.session_topic.as_deref(),
                         );
                         if force_repaint {

@@ -69,6 +69,8 @@ pub(super) struct PromptEditor {
     pending_status_msg: Option<String>,
     /// 当前模型显示名，用于在输入框顶部展示模型提示（输入时即可看到将使用的模型）。
     current_model_label: String,
+    /// 当前请求生效的推理强度，用于在输入框顶部与模型提示同行展示。
+    current_reasoning_effort_label: String,
     /// 当前 session 主题，用于在输入框顶部与模型提示同行展示。
     session_topic: Option<String>,
     /// 当前前台编辑器的后台标题变更订阅。
@@ -115,6 +117,7 @@ impl PromptEditor {
             pending_prefill: None,
             pending_status_msg: None,
             current_model_label: String::new(),
+            current_reasoning_effort_label: String::new(),
             session_topic: None,
             session_title_update_subscription,
             session_title_updates: Mutex::new(session_title_updates),
@@ -135,6 +138,11 @@ impl PromptEditor {
     /// 设置当前模型显示名，下一次 `read_multi_line` 会在输入框顶部展示。
     pub(super) fn set_current_model_label(&mut self, label: impl Into<String>) {
         self.current_model_label = label.into();
+    }
+
+    /// 设置当前请求生效的推理强度，下一次 `read_multi_line` 会与模型提示同行展示。
+    pub(super) fn set_current_reasoning_effort_label(&mut self, label: impl Into<String>) {
+        self.current_reasoning_effort_label = label.into();
     }
 
     /// 更新当前绑定的 session。`PromptEditor` 生命周期跨 `/session` 切换，

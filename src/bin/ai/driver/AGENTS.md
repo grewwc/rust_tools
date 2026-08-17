@@ -90,9 +90,17 @@ split siblings `loop_detection.rs` / `checkpoint.rs` / `progress.rs` / `notes.rs
     runtime-owned; retain the exact input only in its user-role message.
 19. **Completion claims require evidence.** Recheck unsupported post-project-
    mutation completion claims once; temp-only command side effects do not count.
-   Otherwise append one explicit runtime warning to the user-visible final and
-   persist the unverified state for later context. A warning-only response is still
-   an incomplete final and receives the normal one-time synthesis grace.
+   The gate acts only on provable tool-level mutation (`apply_patch`/`write_file`):
+   command-level "mutation" is intent classification and never triggers
+   Reopen/Warn (silent Allow), and any successful post-mutation activity —
+   unrecognized verification commands (e.g. `python3` scripts) or read-only tools
+   included — also silently Allows; only provable zero activity after a tool-level
+   mutation reopens once, then warns. A known failed check after mutation (`cargo
+   check` output not confirmed successful) is a provable fact that overrides
+   activity and warns immediately. Otherwise append one explicit runtime warning
+   to the user-visible final and persist the unverified state for later context. A
+   warning-only response is still an incomplete final and receives the normal
+   one-time synthesis grace.
 20. **Scheduler blocking is event-driven.** Foreground waits, background-task
     completion, shutdown, and wall-clock deadlines wake the driver through the
     scheduler notifier; never restore fixed-interval polling sleeps in the main loop.

@@ -344,6 +344,26 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
             continue;
         }
 
+        // \(math\) 行内公式：要求配对，与 $...$ 同等处理。
+        if !code && !math && bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            if let Some(close) = find_unescaped_delim(s, i + 2, "\\)") {
+                let content = &s[i + 2..close - 2];
+                math = true;
+                apply_style(&mut out, base, bold, italic, code, math);
+                out.push_str(&crate::ai::stream::render_math_tex_to_unicode(
+                    content.trim(),
+                ));
+                math = false;
+                apply_style(&mut out, base, bold, italic, code, math);
+                i = close;
+                continue;
+            }
+            // 未配对：按字面输出
+            out.push('\\');
+            i += 1;
+            continue;
+        }
+
         // $math$ / $$display$$：要求配对，避免把单独的"$5"、"$PATH"等 $ 字符
         // 误识为公式起点，把行尾全部当成 LaTeX 渲染。
         if !code && bytes[i] == b'$' && !math {
@@ -450,6 +470,17 @@ fn strip_inline_md_markers(s: &str) -> String {
                 i += delim.len();
                 continue;
             }
+        }
+        // \(math\) 行内公式
+        if !code && !math && bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            if let Some(end) = find_unescaped_delim(s, i + 2, "\\)") {
+                out.push_str(&crate::ai::stream::render_math_tex_to_unicode(
+                    &s[i + 2..end - 2],
+                ));
+                i = end;
+                continue;
+            }
+            // 未配对：输出原字符
         }
         let ch = s[i..].chars().next().unwrap();
         if math && !code {
@@ -612,6 +643,15 @@ fn wrap_overlong_atomic_markdown_span(s: &str, width: usize) -> Vec<String> {
     let Some((prefix, inner, suffix)) = split_atomic_markdown_span(s) else {
         return wrap_plain_visible_text(s, width);
     };
+    // `\(...\)` 内可能包含 `\alpha` 这类不可拆分的 TeX 控制词。先整体渲染成
+    // Unicode，再按终端宽度换行，避免通用字符切分把命令拆成 `\alp` / `ha`。
+    let rendered_inner;
+    let inner = if prefix == "\\(" {
+        rendered_inner = crate::ai::stream::render_math_tex_to_unicode(inner);
+        rendered_inner.as_str()
+    } else {
+        inner
+    };
     wrap_plain_visible_text(inner, width)
         .into_iter()
         .map(|chunk| format!("{prefix}{chunk}{suffix}"))
@@ -621,6 +661,9 @@ fn wrap_overlong_atomic_markdown_span(s: &str, width: usize) -> Vec<String> {
 fn split_atomic_markdown_span(s: &str) -> Option<(&str, &str, &str)> {
     if s.starts_with("```") || s.starts_with("~~~") {
         return None;
+    }
+    if s.starts_with("\\(") && s.ends_with("\\)") && s.len() >= 4 {
+        return Some((&s[..2], &s[2..s.len() - 2], &s[s.len() - 2..]));
     }
     for delim in ["~~", "$$", "`", "$", "*"] {
         if s.starts_with(delim) && s.ends_with(delim) && s.len() >= delim.len() * 2 {
@@ -699,6 +742,12 @@ fn take_atomic_markdown_span(s: &str, start: usize) -> Option<(String, usize)> {
 
     if rest.starts_with("$$") {
         let end = find_unescaped_delim(s, start + 2, "$$")?;
+        return Some((s[start..end].to_string(), end));
+    }
+
+    // \(math\) 行内公式
+    if rest.starts_with("\\(") {
+        let end = find_unescaped_delim(s, start + 2, "\\)")?;
         return Some((s[start..end].to_string(), end));
     }
 
@@ -946,5 +995,49 @@ mod tests {
     fn cjk_punctuation_without_clickable_target_stays_literal() {
         let text = "时间：12点，普通说明。公式：$https://x.com$。";
         assert_eq!(normalize_cjk_punct_around_path(text), text);
+    }
+
+    #[test]
+    fn paren_math_renders_inline() {
+        // \(x_1\) 应识别为行内数学并渲染下标
+        let rendered = render_inline_md(r"其中 \(x_1\) 是变量", "");
+        assert!(rendered.contains("x₁"), "got: {rendered}");
+        assert!(
+            !rendered.contains("\\("),
+            "markers should be consumed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn paren_math_in_markdown_table_cell() {
+        // 表格单元格内 \(...\) 也能被 strip_inline_md_markers 处理
+        let stripped = strip_inline_md_markers(r"公式 \(NCF_0=-8600\)");
+        assert!(stripped.contains("NCF₀=-8600"), "got: {stripped}");
+        assert!(!stripped.contains("\\("), "got: {stripped}");
+    }
+
+    #[test]
+    fn unpaired_paren_math_is_literal() {
+        // 未配对的 \( 应作为字面文本输出
+        let rendered = render_inline_md(r"半公式 \(x_1", "");
+        assert!(rendered.contains(r"\(x_1"), "got: {rendered}");
+    }
+
+    #[test]
+    fn long_paren_math_keeps_balanced_markers_when_wrapped() {
+        let wrapped = wrap_md_cell(r"\(\alpha\alpha\alpha\alpha\alpha\)", 4);
+        assert!(wrapped.len() > 1, "got: {wrapped:?}");
+        assert!(
+            wrapped
+                .iter()
+                .all(|line| line.starts_with(r"\(") && line.ends_with(r"\)")),
+            "got: {wrapped:?}"
+        );
+        let rendered = wrapped
+            .iter()
+            .map(|line| render_inline_md(line, ""))
+            .collect::<String>();
+        assert_eq!(rendered.matches('α').count(), 5, "got: {rendered}");
+        assert!(!rendered.contains("alp"), "got: {rendered}");
     }
 }

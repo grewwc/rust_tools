@@ -190,3 +190,12 @@ pub(crate) fn resolve_reasoning_effort(app: &App, model: &str) -> Option<Reasoni
     }
     models::default_reasoning_effort(model)
 }
+
+/// 返回输入框中展示的当前请求推理强度。未下发字段时明确标注为服务端默认值，
+/// 避免把「无模型默认档位」误显示为某个具体 effort。
+pub(crate) fn reasoning_effort_display_label(app: &App, model: &str) -> &'static str {
+    match resolve_reasoning_effort(app, model) {
+        Some(effort) => effort.as_str(),
+        None => "server default",
+    }
+}
