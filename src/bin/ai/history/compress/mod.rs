@@ -2943,9 +2943,6 @@ fn dedup_repeated_tool_results(
                 continue;
             }
         };
-        if protected_tool_call_ids.contains(&occurrence.tool_call_id) {
-            continue;
-        }
         let signature_key = (occurrence.tool_name.clone(), occurrence.args_norm.clone());
         let signature_canonical = seen.get(&signature_key).cloned();
         if signature_canonical.is_none() {
@@ -2959,6 +2956,11 @@ fn dedup_repeated_tool_results(
         // 同时避免旧失败覆盖后续成功重试的有效结果。
         // orphan 的保护逻辑（上面的 `!protected_indices.contains`）已经单独处理，
         // 不受这里影响。
+        // 内容级去重同样作用于 current-turn precision 保护的调用（本轮内的
+        // read_file 重读）：同一轮内对同一文件逐字节相同的重读是纯冗余，折叠较早
+        // 副本、保留逆序首见（最新）全文即可。这不违反"precision 结果保持 raw"
+        // 不变式——最新副本仍是 raw 全文，旧副本只是回指它；同时直接切断
+        // "同轮内全文重读堆积 → 近端 offload → 失忆再重读"的环。
         if tool_uses_content_identity_dedup(&occurrence.tool_name) {
             // read_file/检索类工具**内容不同的版本**必须零压缩保留（Invariant：
             // precision 结果不做 lossy 裁剪）。但**逐字节相同**的重复副本是纯冗余，
@@ -2993,6 +2995,12 @@ fn dedup_repeated_tool_results(
                     messages[idx].content = Value::String(stub);
                 }
             }
+            continue;
+        }
+        // 签名级去重仍跳过 current-turn precision 保护的调用：args 变体本身携带
+        // 信息（offset/limit/use_line_numbers 不同就不该折叠），避免误伤本轮正在
+        // 使用的读取。上面的内容级去重已经处理了"真正逐字节相同"的情况。
+        if protected_tool_call_ids.contains(&occurrence.tool_call_id) {
             continue;
         }
         // 逆序首见即最新调用；把更早的同签名结果折叠为 stub。

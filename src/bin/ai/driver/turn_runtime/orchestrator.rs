@@ -56,6 +56,10 @@ const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_COARSE_HARD_WINDOW + 2;
 /// 重读验证是合法行为）。计数不随 soft 清空、不被 made_progress 重置。
 const TARGET_RESCAN_SOFT_THRESHOLD: u32 = 3;
 const TARGET_RESCAN_HARD_THRESHOLD: u32 = 4;
+/// 从头重读计数窗口（轮）：目标距上次从头读取超过该轮数时，计数视为过期并从 1
+/// 重新累计。真正的翻页循环每轮/隔轮都从头读同一文件 → 计数不会过期、4 轮内必然
+/// 触发；上下文压缩后跨多轮的合法重读 → 计数过期，不会累积到硬阈值。
+const TARGET_RESCAN_WINDOW_ROUNDS: usize = 8;
 const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
 
 /// 计算 coarse 签名时需剥离的「易变翻页/窗口」参数键。剥离后同一文件的不同
@@ -196,7 +200,7 @@ struct TurnSupervisor {
     progress: ProgressLedger,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolLoopSignal {
     None,
     /// 近似低收益重复：同一工具反复命中同一目标资源（忽略翻页参数）。温和提示一次。
@@ -207,9 +211,9 @@ enum ToolLoopSignal {
     TargetRepeat,
     /// 同一目标被反复「从头重读」（翻页页宽不断变化、混入每轮新归档路径的循环）。
     /// 温和提示一次。
-    TargetRescan,
+    TargetRescan(String, u32),
     /// 同一目标从头重读超过硬阈值：切换无工具收口模式强制作答。
-    TargetRescanHard,
+    TargetRescanHard(String, u32),
     /// `execute_command` 在同一 coarse 目标上长时间空转，直接强制收敛。
     CoarseHard,
     Soft,
@@ -260,10 +264,12 @@ struct ProgressLedger {
     /// 新的 low-progress episode 最早允许注入 soft 的迭代号。实质进展会重置当前
     /// episode，但保留该 cooldown，防止复杂任务被同一提示反复打断。
     next_episode_iteration: usize,
-    /// 每个目标本轮内「从文件头开始读」的次数（重扫检测）。与签名历史解耦：
-    /// soft 清空历史、每轮新目标重置无进展计数，都影响不到它；write_file/
-    /// apply_patch 修改该目标时清零（编辑后从头重读验证合法）。
-    from_top_reads: FxHashMap<String, u32>,
+    /// 每个目标「从文件头开始读」的重扫计数（重扫检测）。元组第一位是窗口内
+    /// 从头读的次数，第二位是上次从头读的 iteration（超过 TARGET_RESCAN_WINDOW_ROUNDS
+    /// 轮未从头读则清零重计）。与签名历史解耦：soft 清空历史、每轮新目标重置无进展
+    /// 计数，都影响不到它；本轮有任何 write_file/apply_patch 实质改动时整表清零
+    /// （编辑后从头重读是合法行为，不能误判为翻页循环）。
+    from_top_reads: FxHashMap<String, (u32, usize)>,
     /// 已注入过 TargetRescan 软提示的目标（每目标本轮一次）。
     rescan_note_injected: FxHashSet<String>,
 }
@@ -485,24 +491,43 @@ impl TurnSupervisor {
         // 混了多少新目标都影响不到计数。write_file/apply_patch 修改该文件时
         // 清零（编辑后从头重读验证是合法行为）。软提示一次后继续累计，第 4 次
         // 从头重读直接硬停止。
-        let mutated_targets = extract_round_mutated_targets(signature_messages);
-        for target in mutated_targets {
-            self.progress.from_top_reads.remove(&target);
-            self.progress.rescan_note_injected.remove(&target);
+        // 本轮有实质文件改动（write_file/apply_patch，任意目标）→ 编辑后的验证性
+        // 重读是合法行为，整表清空 rescan 计数，避免「读 A 改 B」的多文件工作流被
+        // 误判为翻页循环。注意不能用 round_has_mutation：它把 sed/awk 等非只读
+        // execute_command 也当 mutation，会把 sed 只读重读误判为「实质改动」而架空
+        // rescan 检测（command_reads_from_top 反而把 sed -n 1 当作从头读）。
+        if !extract_round_mutated_targets(signature_messages).is_empty() {
+            self.progress.from_top_reads.clear();
+            self.progress.rescan_note_injected.clear();
         }
         let from_top_targets = extract_round_from_top_read_targets(signature_messages);
         let mut rescan_signal: Option<ToolLoopSignal> = None;
         for target in from_top_targets {
-            let reads = self.progress.from_top_reads.entry(target.clone()).or_insert(0);
-            *reads += 1;
-            if *reads >= TARGET_RESCAN_HARD_THRESHOLD {
-                rescan_signal = Some(ToolLoopSignal::TargetRescanHard);
+            let entry = self
+                .progress
+                .from_top_reads
+                .entry(target.clone())
+                .or_insert((0, self.iteration));
+            // 窗口过期：距上次从头读取超过 WINDOW 轮 → 旧计数作废，重新累计。
+            if self.iteration.saturating_sub(entry.1) > TARGET_RESCAN_WINDOW_ROUNDS {
+                *entry = (0, self.iteration);
+                // 衰减 = 进入新的重读 episode：同步清除该目标的软提示标记，让每一段
+                // 循环都能拿到自己的 soft 预警。否则 rescan_note_injected 保留上一段的
+                // 标记，第二段累计到 soft 时 insert 返回 false → 跳过软提示直接硬停，
+                // 与 soft→hard 升级不变量冲突（mutation/截断清空路径都成对清除）。
+                self.progress.rescan_note_injected.remove(&target);
+            }
+            entry.0 += 1;
+            entry.1 = self.iteration;
+            let reads = entry.0;
+            if reads >= TARGET_RESCAN_HARD_THRESHOLD {
+                rescan_signal = Some(ToolLoopSignal::TargetRescanHard(target, reads));
                 break;
             }
-            if *reads >= TARGET_RESCAN_SOFT_THRESHOLD
-                && self.progress.rescan_note_injected.insert(target)
+            if reads >= TARGET_RESCAN_SOFT_THRESHOLD
+                && self.progress.rescan_note_injected.insert(target.clone())
             {
-                rescan_signal = Some(ToolLoopSignal::TargetRescan);
+                rescan_signal = Some(ToolLoopSignal::TargetRescan(target, reads));
             }
         }
         if let Some(signal) = rescan_signal {
@@ -1017,7 +1042,7 @@ async fn run_turn_body(
         }
         if crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request() {
             pre_timeout_wrap_up_requested = true;
-            record_force_final_reason(&mut messages, "subagent_pre_timeout_wrap_up", iteration);
+            record_force_final_reason(&mut messages, "subagent_pre_timeout_wrap_up", iteration, None);
             force_final_response = true;
             inject_subagent_pre_timeout_wrap_up_note(&mut messages);
         }
@@ -1049,7 +1074,7 @@ async fn run_turn_body(
         if matches!(&execution, IterationExecution::WrapUpFinal) {
             let _ = crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request();
             pre_timeout_wrap_up_requested = true;
-            record_force_final_reason(&mut messages, "subagent_pre_timeout_wrap_up", iteration);
+            record_force_final_reason(&mut messages, "subagent_pre_timeout_wrap_up", iteration, None);
             force_final_response = true;
             inject_subagent_pre_timeout_wrap_up_note(&mut messages);
             continue 'turn;
@@ -1335,6 +1360,7 @@ async fn run_turn_body(
                         &mut messages,
                         "scoped_preflight_budget_exhausted",
                         iteration,
+                        None,
                     );
                     force_final_response = true;
                     continue 'turn;
@@ -1491,25 +1517,29 @@ async fn run_turn_body(
                 );
                 inject_target_repeat_loop_note(&mut messages);
             }
-            ToolLoopSignal::TargetRescan => {
+            ToolLoopSignal::TargetRescan(target, reads) => {
                 crate::ai::driver::print::print_tool_note_line(
                     "agent-health",
-                    "same file re-read from the beginning repeatedly (pagination loop): injecting converge hint",
+                    &format!(
+                        "same file re-read from the beginning {reads} times (pagination loop): injecting converge hint (target: {target})"
+                    ),
                 );
-                inject_target_rescan_note(&mut messages);
+                inject_target_rescan_note(&mut messages, &target, reads);
             }
-            ToolLoopSignal::TargetRescanHard => {
+            ToolLoopSignal::TargetRescanHard(target, reads) => {
                 crate::ai::driver::print::print_tool_note_line(
                     "agent-health",
-                    "same file re-read from the beginning past the hard threshold (pagination loop): switching to no-tool handoff",
+                    &format!(
+                        "same file re-read from the beginning past the hard threshold (pagination loop): switching to no-tool handoff (target: {target}, reads: {reads})"
+                    ),
                 );
-                inject_target_rescan_hard_stop_note(&mut messages);
+                inject_target_rescan_hard_stop_note(&mut messages, &target, reads);
                 supervisor.maybe_inject_task_anchor(
                     &mut messages,
                     &question,
                     "target-rescan-hard-stop",
                 );
-                record_force_final_reason(&mut messages, "target_rescan", iteration);
+                record_force_final_reason(&mut messages, "target_rescan", iteration, Some(&target));
                 force_final_response = true;
             }
             ToolLoopSignal::CoarseHard => {
@@ -1523,7 +1553,7 @@ async fn run_turn_body(
                     &question,
                     "low-yield-hard-stop",
                 );
-                record_force_final_reason(&mut messages, "low_yield_repetition", iteration);
+                record_force_final_reason(&mut messages, "low_yield_repetition", iteration, None);
                 force_final_response = true;
             }
             ToolLoopSignal::Soft => {
@@ -1546,7 +1576,7 @@ async fn run_turn_body(
                     &question,
                     "tool-loop-hard-stop",
                 );
-                record_force_final_reason(&mut messages, "tool_loop", iteration);
+                record_force_final_reason(&mut messages, "tool_loop", iteration, None);
                 force_final_response = true;
             }
             ToolLoopSignal::LowProgressSoft => {
@@ -1590,7 +1620,7 @@ async fn run_turn_body(
                     &question,
                     "low-progress-hard-stop",
                 );
-                record_force_final_reason(&mut messages, "progress_no_progress", iteration);
+                record_force_final_reason(&mut messages, "progress_no_progress", iteration, None);
                 force_final_response = true;
             }
             ToolLoopSignal::ReadOnlyBreadthHard => {
@@ -1604,7 +1634,7 @@ async fn run_turn_body(
                     &question,
                     "read-only-breadth-hard-stop",
                 );
-                record_force_final_reason(&mut messages, "read_only_breadth", iteration);
+                record_force_final_reason(&mut messages, "read_only_breadth", iteration, None);
                 force_final_response = true;
             }
         }

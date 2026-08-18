@@ -70,6 +70,7 @@ pub(in crate::ai::driver::turn_runtime) fn record_force_final_reason(
     messages: &mut Vec<crate::ai::history::Message>,
     reason: &str,
     iteration: usize,
+    target: Option<&str>,
 ) {
     use crate::ai::history::{Message, ROLE_INTERNAL_NOTE};
     use serde_json::Value;
@@ -84,10 +85,23 @@ pub(in crate::ai::driver::turn_runtime) fn record_force_final_reason(
         return;
     }
 
+    // 持久化到决策日志（磁盘 JSONL）：no-tool-handoff 根因的事后可观测通道。决策日志
+    // 是会话旁路记录、不进入模型上下文，因此不存在 internal note 被提升为 system 的
+    // 重放问题；canonical turn_messages 里的控制状态仍只保留在本次请求投影中。
+    crate::ai::driver::decision_log::log_runtime_stop(
+        crate::ai::driver::decision_log::get_decision_log_store(),
+        &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+        crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+        reason,
+        target,
+        iteration,
+    );
+
+    let target_suffix = target.map(|t| format!(", target={t}")).unwrap_or_default();
     let event = Message {
         role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(format!(
-            "{TOOL_STOP_REASON_PREFIX} reason={reason}, iteration={iteration}, action=no_tool_handoff"
+            "{TOOL_STOP_REASON_PREFIX} reason={reason}, iteration={iteration}, action=no_tool_handoff{target_suffix}"
         )),
         tool_calls: None,
         tool_call_id: None,
@@ -139,14 +153,21 @@ pub(super) fn inject_target_repeat_loop_note(messages: &mut Vec<crate::ai::histo
 
 /// 同目标「从头重读」重扫软提示：同一文件被反复从文件头开始读（页宽每轮都变、
 /// 或混入每轮不同的新归档路径），已累计多次从头重读。
-pub(super) fn inject_target_rescan_note(messages: &mut Vec<crate::ai::history::Message>) {
+pub(super) fn inject_target_rescan_note(
+    messages: &mut Vec<crate::ai::history::Message>,
+    target: &str,
+    reads: u32,
+) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[target-rescan] The same file has been re-read from the beginning repeatedly (page size / window changes every round, often mixed with new archive paths each round).\n\
-        If you have already covered the full content, converge now and answer based on the evidence you have; if you really must re-read it, write down exactly which new piece of information you expect to gain and why.";
+    let note = format!(
+        "[target-rescan] File `{target}` has been re-read from the beginning {reads} times within the recent window.\n\
+        If you have already covered the full content, converge now and answer based on the evidence you have; if you still need more of that file, delegate the remaining exploration to a subagent with the exact file and range to inspect.\n\
+        If you really must re-read it yourself, write down exactly which new piece of information you expect to gain and why."
+    );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
-        content: Value::String(note.to_string()),
+        content: Value::String(note),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
@@ -155,15 +176,21 @@ pub(super) fn inject_target_rescan_note(messages: &mut Vec<crate::ai::history::M
 
 /// 同目标「从头重读」重扫硬停止：同一文件从头重读超过硬阈值，判定为翻页+混轮
 /// 循环，强制无工具收口。
-pub(super) fn inject_target_rescan_hard_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
+pub(super) fn inject_target_rescan_hard_stop_note(
+    messages: &mut Vec<crate::ai::history::Message>,
+    target: &str,
+    reads: u32,
+) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[low-yield-hard-stop] The same file has been re-read from the beginning too many times with different page sizes / windows; this is judged a pagination loop.\n\
+    let note = format!(
+        "[low-yield-hard-stop] File `{target}` has been re-read from the beginning {reads} times within recent rounds; this is judged a pagination loop.\n\
         From now on you are in no-tool wrap-up mode: do not issue any more tool calls;\n\
-        give a phase summary and current conclusion based on existing information; if the task is not yet complete, clearly state the current gap, remaining work, and suggested next steps.";
+        give a phase summary and current conclusion based on existing information; if the task is not yet complete, clearly state the current gap, remaining work, and suggested next steps."
+    );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
-        content: Value::String(note.to_string()),
+        content: Value::String(note),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,

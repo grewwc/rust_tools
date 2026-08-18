@@ -22,8 +22,8 @@ fn subagent_pre_timeout_wrap_up_note_requires_immediate_final_answer() {
 fn force_final_reason_is_request_only_and_deduplicated() {
     let mut messages = Vec::new();
 
-    record_force_final_reason(&mut messages, "iteration_limit", 24);
-    record_force_final_reason(&mut messages, "tool_loop_exact", 25);
+    record_force_final_reason(&mut messages, "iteration_limit", 24, None);
+    record_force_final_reason(&mut messages, "tool_loop_exact", 25, None);
 
     assert_eq!(messages.len(), 1);
     let note = messages[0]
@@ -1787,14 +1787,14 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
     pb_read_round(&mut messages, file, "r3");
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(
-        matches!(signal, ToolLoopSignal::TargetRescan),
+        matches!(signal, ToolLoopSignal::TargetRescan(..)),
         "expected TargetRescan at 3rd from-top read, got {signal:?}"
     );
     // 第 4 次从头读（offset=0）→ 硬停止。
     pb_successful_read_round(&mut messages, file, 0, "r4", "content page");
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(
-        matches!(signal, ToolLoopSignal::TargetRescanHard),
+        matches!(signal, ToolLoopSignal::TargetRescanHard(..)),
         "expected TargetRescanHard at 4th from-top read, got {signal:?}"
     );
 }
@@ -1833,10 +1833,172 @@ fn target_rescan_ignores_monotonic_pagination() {
         pb_successful_read_round(&mut messages, file, offset, &format!("p{i}"), &format!("page-{i}"));
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         assert!(
-            !matches!(signal, ToolLoopSignal::TargetRescan | ToolLoopSignal::TargetRescanHard),
+            !matches!(
+                signal,
+                ToolLoopSignal::TargetRescan(..) | ToolLoopSignal::TargetRescanHard(..)
+            ),
             "monotonic pagination must not trigger rescan at round {i}: {signal:?}"
         );
     }
+}
+
+#[test]
+fn target_rescan_window_decays_stale_counts() {
+    // 上下文压缩后跨多轮的合法重读不应累积：距上次从头读取超过窗口轮数
+    // （TARGET_RESCAN_WINDOW_ROUNDS=8）时，计数过期并从 1 重新累计。
+    let mut supervisor = TurnSupervisor::default();
+    let mut messages = Vec::new();
+    let target = "src/spaced-file.rs";
+    // 第 1 次从头读，iteration=1 → 计数 1。
+    supervisor.iteration = 1;
+    pb_execute_command_round(&mut messages, &format!("tail -c +1 {target} | head -c 2400"), "r1");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    // 跨 10 轮后再从头读（gap=10 > 8）→ 计数过期，重新从 1 计，不触发。
+    supervisor.iteration = 11;
+    pb_execute_command_round(&mut messages, &format!("cat {target}"), "r11");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None
+    );
+    // 窗口内连续重读：每轮命令互异（tail/cat/sed/nl/head），避免误触精确/粗粒度
+    // 循环检测。第 2 次（累计 2）不触发，第 3 次软提示，第 4 次硬停止。
+    supervisor.iteration = 12;
+    pb_execute_command_round(&mut messages, &format!("sed -n 1,40p {target}"), "r12");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None,
+        "round r12"
+    );
+    supervisor.iteration = 13;
+    pb_execute_command_round(&mut messages, &format!("nl -ba {target}"), "r13");
+    assert!(
+        matches!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::TargetRescan(..)
+        ),
+        "round r13 should soft-signal"
+    );
+    supervisor.iteration = 14;
+    pb_execute_command_round(&mut messages, &format!("head -n 200 {target}"), "r14");
+    assert!(
+        matches!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::TargetRescanHard(..)
+        ),
+        "round r14 should hard-stop"
+    );
+}
+
+#[test]
+fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
+    // 回归：衰减开启新的重读 episode，每一段循环都必须拿到自己的 soft 预警。
+    // 旧实现衰减时只重置计数、不清 rescan_note_injected，第二段累计到 soft 时
+    // insert 返回 false → 跳过软提示直接硬停（soft→hard 升级不变量被破坏）。
+    let mut supervisor = TurnSupervisor::default();
+    let mut messages = Vec::new();
+    let target = "src/episode-file.rs";
+    // Episode 1：第 1/2 次不触发，第 3 次软提示并记录 rescan_note_injected。
+    for (iter, cmd) in [
+        (1, format!("tail -c +1 {target} | head -c 2400")),
+        (2, format!("cat {target}")),
+        (3, format!("sed -n 1,40p {target}")),
+    ] {
+        supervisor.iteration = iter;
+        pb_execute_command_round(&mut messages, &cmd, &format!("r{iter}"));
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        if iter == 3 {
+            assert!(
+                matches!(signal, ToolLoopSignal::TargetRescan(..)),
+                "episode1 round r3 should soft-signal"
+            );
+        } else {
+            assert_eq!(signal, ToolLoopSignal::None, "episode1 round r{iter}");
+        }
+    }
+    // 跨 9 轮（gap=9 > TARGET_RESCAN_WINDOW_ROUNDS=8）→ 计数衰减并从 1 重新计，
+    // 同时软提示标记必须随 episode 一并清除（本次修复点）。
+    supervisor.iteration = 12;
+    pb_execute_command_round(&mut messages, &format!("nl -ba {target}"), "r12");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None,
+        "decay round r12"
+    );
+    // Episode 2：第 2 次不触发，第 3 次必须再次软提示——本段自己的预警，
+    // 不能因为上一段已提示过就跳过 soft 直接硬停。
+    supervisor.iteration = 13;
+    pb_execute_command_round(&mut messages, &format!("head -n 200 {target}"), "r13");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None,
+        "episode2 round r13"
+    );
+    supervisor.iteration = 14;
+    pb_execute_command_round(&mut messages, &format!("less {target}"), "r14");
+    assert!(
+        matches!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::TargetRescan(..)
+        ),
+        "episode2 round r14 should get its own soft warning"
+    );
+}
+
+#[test]
+fn target_rescan_resets_on_other_file_mutation() {
+    // 多文件工作流：编辑任意目标（不限于被重读的目标）都整表清空 rescan 计数，
+    // 后续对另一文件的验证性从头重读从 1 重新累计，不应被误判为翻页循环。
+    let mut supervisor = TurnSupervisor::default();
+    let mut messages = Vec::new();
+    let target = "src/read-a.rs";
+    // 两种不同签名（offset 0 / 1）的从头读，各累计一次。
+    for (offset, id) in [(0usize, "r1"), (1usize, "r2")] {
+        supervisor.iteration = id.trim_start_matches('r').parse().unwrap();
+        pb_successful_read_round(&mut messages, target, offset, id, "line:0");
+        assert_eq!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None,
+            "round {id}"
+        );
+    }
+    // 第 3 轮：编辑其他文件 B → 整表清空 A 的计数。
+    supervisor.iteration = 4;
+    let id = "w4";
+    messages.push(pb_write_file_msg("src/edit-b.rs", id));
+    messages.push(pb_tool_result(id, "Successfully wrote file."));
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None,
+        "edit-other-file round must not signal"
+    );
+    // 编辑后从头重读 A 重新从 1 计：cat / offset=0 / offset=1 三种互异签名。
+    // 第 2 次不触发，第 3 次才软提示。
+    supervisor.iteration = 5;
+    pb_execute_command_round(&mut messages, &format!("cat {target}"), "c5");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None,
+        "round r5"
+    );
+    supervisor.iteration = 6;
+    pb_successful_read_round(&mut messages, target, 0, "r6", "line:0");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None,
+        "round r6"
+    );
+    supervisor.iteration = 7;
+    pb_successful_read_round(&mut messages, target, 1, "r7", "line:0");
+    assert!(
+        matches!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::TargetRescan(..)
+        ),
+        "round r7 should soft-signal"
+    );
 }
 
 #[test]

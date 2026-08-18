@@ -1159,7 +1159,7 @@ fn folded_tool_group_reconstructs_checkpoint_when_tool_call_has_no_text() {
 }
 
 #[test]
-fn current_turn_precision_results_stay_raw_during_mid_turn_compress() {
+fn current_turn_identical_reread_folds_earlier_copy_and_keeps_newest_raw() {
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-current-turn-precision-{}",
         uuid::Uuid::new_v4()
@@ -1191,12 +1191,24 @@ fn current_turn_precision_results_stay_raw_during_mid_turn_compress() {
         .map(|message| value_to_string(&message.content))
         .collect::<Vec<_>>();
 
-    assert_eq!(results, vec![content.clone(), content]);
+    // 内容级去重同样作用于本轮 precision 保护的 read_file：较早的逐字节相同副本
+    // 折叠为回指最新副本的 stub（最新副本仍是 raw 全文），既保持"precision 最新
+    // 结果 raw"不变式，又切断同轮内全文重读堆积。
+    assert_eq!(results.len(), 2, "两个 read_file 结果仍在：较早副本折叠为 stub、最新副本 raw");
     assert!(
-        results.iter().all(|text| {
-            !text.contains("[deduped:") && !text.contains("Output preserved for tool")
-        }),
-        "current-turn precision outputs must stay raw: {results:?}"
+        results[0].contains("[deduped: byte-identical") && results[0].contains("No need to re-read"),
+        "较早的逐字节相同副本应折叠为回指最新副本的 stub，实际: {}",
+        &results[0][..results[0].len().min(160)]
+    );
+    assert!(
+        results[0].contains("canonical_message_index"),
+        "stub 应回指最新 raw 副本的 message index"
+    );
+    assert_eq!(results[1], content, "最新副本保持 raw 全文");
+    assert!(
+        !results[1].contains("[deduped:") && !results[1].contains("Output preserved for tool"),
+        "最新 precision 输出必须保持 raw: {}",
+        &results[1][..results[1].len().min(160)]
     );
 
     let _ = std::fs::remove_dir_all(overflow_dir);

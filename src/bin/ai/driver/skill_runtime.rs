@@ -1072,6 +1072,7 @@ fn build_system_prompt(
          - Give every call a concrete, decision-relevant goal. Before another exploratory call, identify the question it should answer; stop when the branch is resolved or another call cannot change the decision. Do not read speculatively.\n\
          - Before editing, inspect the target and applicable scoped instructions; follow the deepest scope. Make the smallest local change.\n\
          - Keep code reads narrow and serial: locate first, read one needed region at a time in a sufficiently broad chunk, and do not batch reads or re-read evidence already visible.\n\
+         - Edit files with a targeted read->patch flow: read only the region you are about to change (use offset/limit, never re-read a whole file you already have), then apply_patch immediately. If the patch fails, re-read only the failed region. If you have re-read the same file repeatedly without editing it, stop re-reading: patch from the content already in context, or delegate that file's modification to a subagent.\n\
          - On failure, diagnose and adjust before retrying. After 3 failed attempts with the same approach, stop repeating that approach, not the whole task. Continue with a materially different safe recovery when one remains; end only when the task is complete or a specific blocker remains, then report what you tried and the current error.\n\
          </tool_usage>\n\n\
          <correctness_guardrails>\n\

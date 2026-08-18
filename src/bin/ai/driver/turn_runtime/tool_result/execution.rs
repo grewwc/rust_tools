@@ -2896,7 +2896,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             match injected_context_echo_recovery_action(messages, &stream_result.assistant_text) {
                 DanglingFinalRecoveryAction::Allow => {}
                 DanglingFinalRecoveryAction::RetryWithoutTools => {
-                    record_force_final_reason(messages, "injected_context_echo", iteration);
+                    record_force_final_reason(messages, "injected_context_echo", iteration, None);
                     *force_final_response = true;
                     return Ok(TurnLoopStep::Continue);
                 }
@@ -2949,7 +2949,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             ) {
                 DanglingFinalRecoveryAction::Allow => false,
                 DanglingFinalRecoveryAction::RetryWithoutTools => {
-                    record_force_final_reason(messages, "dangling_action_final", iteration);
+                    record_force_final_reason(messages, "dangling_action_final", iteration, None);
                     *force_final_response = true;
                     return Ok(TurnLoopStep::Continue);
                 }
@@ -3164,7 +3164,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     *final_assistant_text = text;
                     return Ok(TurnLoopStep::Break);
                 }
-                record_force_final_reason(messages, "iteration_limit", iteration);
+                record_force_final_reason(messages, "iteration_limit", iteration, None);
                 *force_final_response = true;
             } else {
                 // AIOS: kernel is the authoritative source for tool-call quota.
@@ -3201,6 +3201,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                                     messages,
                                     "kernel_turn_rlimit",
                                     iteration,
+                                    None,
                                 );
                                 *force_final_response = true;
                             }
@@ -3209,6 +3210,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                                     messages,
                                     "kernel_tool_call_rlimit",
                                     iteration,
+                                    None,
                                 );
                                 *force_final_response = true;
                             }
@@ -3222,7 +3224,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                             ..
                         }
                     ) {
-                        record_force_final_reason(messages, "kernel_tool_call_rlimit", iteration);
+                        record_force_final_reason(messages, "kernel_tool_call_rlimit", iteration, None);
                         *force_final_response = true;
                     }
                 }

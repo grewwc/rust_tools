@@ -37,6 +37,8 @@ pub enum DecisionType {
     SessionTitle,
     /// 截断重试时的 reasoning effort 降档决策
     TruncationDowngrade,
+    /// 运行时强制无工具收尾（no-tool handoff）的根因记录
+    RuntimeStop,
 }
 
 /// 决策记录
@@ -463,6 +465,34 @@ pub fn log_truncation_downgrade(
             "reasoning_effort kept".to_string()
         },
         reasoning: note.to_string(),
+        confidence: None,
+        outcome: None,
+        execution_time_ms: None,
+    });
+}
+
+/// 记录运行时强制无工具收尾（no-tool handoff）的根因，供事后审计。
+/// 只写入决策日志（会话旁路、不进入模型上下文），避免 internal note 被提升为
+/// system 后永久重放；stop 原因同时会注入本次请求投影供模型收尾。
+pub fn log_runtime_stop(
+    store: &DecisionLogStore,
+    session_id: &str,
+    turn_id: usize,
+    reason: &str,
+    target: Option<&str>,
+    iteration: usize,
+) {
+    store.log(DecisionLog {
+        timestamp: 0, // Will be set by log()
+        session_id: session_id.to_string(),
+        turn_id,
+        decision_type: DecisionType::RuntimeStop,
+        context: format!("reason={reason}, iteration={iteration}"),
+        alternatives_considered: vec![],
+        chosen_option: "no_tool_handoff".to_string(),
+        reasoning: target
+            .map(|t| format!("target={t}"))
+            .unwrap_or_default(),
         confidence: None,
         outcome: None,
         execution_time_ms: None,
