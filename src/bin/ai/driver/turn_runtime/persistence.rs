@@ -38,6 +38,18 @@ pub(in crate::ai::driver::turn_runtime) fn persist_pending_turn_messages_for_mod
         return true;
     }
 
+    // 唤醒笔记去重（方案1）：同一进程、同一批 task_ids 的 TASK_WAIT_TIMEOUT "仍在等待"
+    // 笔记只在历史保留最新一条——先把尾部同身份的旧等待笔记折叠掉，再由下面的 append
+    // 把最新一条追加到尾部。best-effort，失败不阻塞正常追加。
+    if *persisted_turn_messages == 0 {
+        if let Some(first) = turn_messages.first() {
+            let _ = crate::ai::history::coalesce_repeated_wait_wake_notes(
+                &app.session_history_file,
+                first,
+            );
+        }
+    }
+
     if let Err(err) = append_history_messages_for_model(
         &app.session_history_file,
         &turn_messages[*persisted_turn_messages..],

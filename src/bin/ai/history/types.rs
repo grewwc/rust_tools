@@ -91,6 +91,61 @@ pub(crate) fn is_system_like_role(role: &str) -> bool {
     role == ROLE_SYSTEM || is_internal_note_role(role)
 }
 
+/// 从 main-role internal_note 的唤醒文本中解析"同一进程、同一批 task_ids 的
+/// TASK_WAIT_TIMEOUT 仍在等待"身份 (pid, 排序去重后的 task_ids)。
+///
+/// 仅当文本形如 `[Process N Woke Up] ...New mailbox messages:...[TASK_WAIT_TIMEOUT]...task_ids=[a, b]`
+/// 且 mailbox 恰好含一个 TASK_WAIT_TIMEOUT 消息时返回 Some，用于唤醒笔记去重
+/// （同一身份只保留最新一条"仍在等待"状态）；其它情况（真实结果唤醒、普通问题、
+/// 多个等待集合并发唤醒）返回 None，不做去重。
+pub(in crate::ai) fn parse_still_waiting_wake_identity(text: &str) -> Option<(u64, Vec<String>)> {
+    let t = text.trim_start();
+    // 1) 前缀 "[Process N Woke Up]"
+    let rest = t.strip_prefix("[Process ")?;
+    let digit_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digit_len == 0 {
+        return None;
+    }
+    let pid: u64 = rest[..digit_len].parse().ok()?;
+    if !rest[digit_len..].starts_with(" Woke Up]") {
+        return None;
+    }
+
+    // 2) mailbox 部分：位于 "New mailbox messages:\n" 与 "\n\nWake-up handling rules:" 之间
+    const MAILBOX_MARKER: &str = "New mailbox messages:\n";
+    let start = t.find(MAILBOX_MARKER)? + MAILBOX_MARKER.len();
+    let end = t[start..]
+        .find("\n\nWake-up handling rules:")
+        .map(|i| start + i)
+        .unwrap_or(t.len());
+    let mailbox = &t[start.min(end)..end];
+
+    // 3) 恰好一个 TASK_WAIT_TIMEOUT 消息才去重（多个不同等待集合并发时不做折叠）
+    if mailbox.matches("[TASK_WAIT_TIMEOUT]").count() != 1 {
+        return None;
+    }
+
+    // 4) 提取首个 task_ids=[...]（位于 TASK_WAIT_TIMEOUT 引导行，优先于进度快照内容）
+    const IDS_MARKER: &str = "task_ids=[";
+    let idx = mailbox.find(IDS_MARKER)?;
+    let after = &mailbox[idx + IDS_MARKER.len()..];
+    let close = after.find(']')?;
+    let mut ids: Vec<String> = after[..close]
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    ids.sort();
+    ids.dedup();
+    Some((pid, ids))
+}
+
+/// 唤醒笔记去重（`coalesce_repeated_wait_wake_notes`）扫描历史时查看的尾部消息条数。
+pub(in crate::ai) const WAKE_NOTE_DEDUP_SCAN: usize = 512;
+
 pub(in crate::ai) fn retained_turn_start(messages: &[Message], max_user_turns: usize) -> usize {
     if max_user_turns == 0 || messages.is_empty() {
         return messages.len();
@@ -199,5 +254,69 @@ mod tests {
         assert_eq!(retained_turn_start(&messages, 2), 0);
         // max=1 时从第 2 轮开始。
         assert_eq!(retained_turn_start(&messages, 1), 2);
+    }
+
+    fn wake_note_text(pid: u64, ids: &[&str], checkpoint: &str) -> String {
+        // 与 driver/process_context.rs format_wakeup_prompt + task_tools.rs 的
+        // TASK_WAIT_TIMEOUT 消息格式保持一致：mailbox 位于 "New mailbox messages:\n"
+        // 与 "\n\nWake-up handling rules:" 之间，且恰好含一条 TASK_WAIT_TIMEOUT。
+        format!(
+            "[Process {pid} Woke Up] Original goal: test goal\n\
+             New mailbox messages:\n\
+             [TASK_WAIT_TIMEOUT]\n\
+             Wall-clock task_wait budget elapsed after 30s. Re-call `task_wait` with the same task_ids to collect any ready results and receive the budget-elapsed status. task_ids=[{}]\n\
+             Progress: {checkpoint}\n\
+             \n\
+             Wake-up handling rules:\n- rule\n\nResume execution based on the goal and these messages.",
+            ids.join(", ")
+        )
+    }
+
+    #[test]
+    fn still_waiting_wake_identity_matches_wait_timeout() {
+        let note = wake_note_text(6, &["task_b", "task_a", "task_b"], "checkpoint-1");
+        // pid 解析正确；task_ids 排序 + 去重后作为身份。
+        assert_eq!(
+            parse_still_waiting_wake_identity(&note),
+            Some((6, vec!["task_a".to_string(), "task_b".to_string()]))
+        );
+    }
+
+    #[test]
+    fn still_waiting_wake_identity_rejects_other_wakes() {
+        // 真实结果唤醒：mailbox 无 TASK_WAIT_TIMEOUT，不去重。
+        let result_wake = format!(
+            "[Process 6 Woke Up] Original goal: g\nNew mailbox messages:\n[EVENT_WAKE]\nresult channel ready\n\nWake-up handling rules:\n- rule\n\nResume execution based on the goal and these messages."
+        );
+        assert_eq!(parse_still_waiting_wake_identity(&result_wake), None);
+
+        // 非唤醒消息 / 空文本。
+        assert_eq!(parse_still_waiting_wake_identity("普通用户消息"), None);
+        assert_eq!(parse_still_waiting_wake_identity(""), None);
+
+        // 前缀缺失或 pid 为空。
+        assert_eq!(
+            parse_still_waiting_wake_identity(
+                "Custom prefix\nNew mailbox messages:\n[TASK_WAIT_TIMEOUT]\ntask_ids=[a]"
+            ),
+            None
+        );
+        assert_eq!(parse_still_waiting_wake_identity("[Process ] Woke Up] g"), None);
+
+        // 多个等待集合并发唤醒：mailbox 含多条 TASK_WAIT_TIMEOUT，不去重。
+        let multi = format!(
+            "[Process 6 Woke Up] Original goal: g\nNew mailbox messages:\n[TASK_WAIT_TIMEOUT]\ntask_ids=[a]\n[TASK_WAIT_TIMEOUT]\ntask_ids=[b]\n\nWake-up handling rules:\n- rule\n\nResume execution based on the goal and these messages."
+        );
+        assert_eq!(parse_still_waiting_wake_identity(&multi), None);
+
+        // 缺 task_ids=[...] 或 ids 为空。
+        let no_ids = format!(
+            "[Process 6 Woke Up] Original goal: g\nNew mailbox messages:\n[TASK_WAIT_TIMEOUT]\nbudget elapsed\n\nWake-up handling rules:\n- rule\n\nResume execution based on the goal and these messages."
+        );
+        assert_eq!(parse_still_waiting_wake_identity(&no_ids), None);
+        let empty_ids = format!(
+            "[Process 6 Woke Up] Original goal: g\nNew mailbox messages:\n[TASK_WAIT_TIMEOUT]\ntask_ids=[]\n\nWake-up handling rules:\n- rule\n\nResume execution based on the goal and these messages."
+        );
+        assert_eq!(parse_still_waiting_wake_identity(&empty_ids), None);
     }
 }

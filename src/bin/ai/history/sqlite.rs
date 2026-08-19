@@ -1445,6 +1445,85 @@ pub(in crate::ai) fn replace_all_messages_sqlite(
     })
 }
 
+/// 唤醒笔记去重（方案1）：同一进程、同一批 task_ids 的 TASK_WAIT_TIMEOUT "仍在等待"
+/// 唤醒笔记只保留最新一条。调用方在准备追加一条内省笔记时调用本函数：
+/// 删除历史尾部 `WAKE_NOTE_DEDUP_SCAN` 条消息内所有与待追加笔记身份相同的旧等待笔记
+/// （由调用方随后把最新一条追加到尾部）；非"仍在等待"唤醒笔记或未命中时返回 `Ok(false)`。
+pub(in crate::ai) fn coalesce_repeated_wait_wake_notes_sqlite(
+    path: &Path,
+    note: &Message,
+) -> io::Result<bool> {
+    with_session_state_lock(path, || {
+        coalesce_repeated_wait_wake_notes_sqlite_unlocked(path, note)
+    })
+}
+
+fn coalesce_repeated_wait_wake_notes_sqlite_unlocked(
+    path: &Path,
+    note: &Message,
+) -> io::Result<bool> {
+    // fast path：非"仍在等待"唤醒笔记时不做任何 IO
+    if note.role != super::types::ROLE_INTERNAL_NOTE {
+        return Ok(false);
+    }
+    let Some(text) = note.content.as_str() else {
+        return Ok(false);
+    };
+    let Some(identity) = super::types::parse_still_waiting_wake_identity(text) else {
+        return Ok(false);
+    };
+
+    let mut conn = open_history_db(path)?;
+    init_history_schema(&conn)?;
+    let mut stmt = conn
+        .prepare(
+            // 与 blob 后端语义一致：窗口是历史尾部 WAKE_NOTE_DEDUP_SCAN 条消息（不限角色），
+            // 再对其中 internal_note 行做身份匹配 —— LIMIT 先于角色过滤生效。
+            "SELECT id, content
+             FROM (SELECT id, content, role FROM messages ORDER BY id DESC LIMIT ?1)
+             WHERE role = ?2
+             ORDER BY id ASC",
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let rows = stmt
+        .query_map(
+            params![
+                super::types::WAKE_NOTE_DEDUP_SCAN as i64,
+                super::types::ROLE_INTERNAL_NOTE
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut to_delete = Vec::<i64>::new();
+    for row in rows {
+        let (id, content_json) = row.map_err(|e| io::Error::other(e.to_string()))?;
+        let content = decode_message_content(&content_json);
+        let Some(content_text) = content.as_str() else {
+            continue;
+        };
+        if super::types::parse_still_waiting_wake_identity(content_text).as_ref()
+            == Some(&identity)
+        {
+            to_delete.push(id);
+        }
+    }
+    if to_delete.is_empty() {
+        return Ok(false);
+    }
+
+    drop(stmt);
+    let tx = conn
+        .transaction()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    for id in &to_delete {
+        tx.execute("DELETE FROM messages WHERE id=?1", params![id])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    }
+    bump_history_revision(&tx)?;
+    tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(true)
+}
+
 fn replace_all_messages_sqlite_unlocked(path: &Path, messages: &[Message]) -> io::Result<()> {
     let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;
@@ -3241,6 +3320,142 @@ mod tests {
             lock_thread.join().unwrap().unwrap();
             writer_thread.join().unwrap().unwrap();
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn wake_note_text(pid: u64, ids: &[&str], checkpoint: &str) -> String {
+        format!(
+            "[Process {pid} Woke Up] Original goal: test goal\nNew mailbox messages:\n[TASK_WAIT_TIMEOUT]\nWall-clock task_wait budget elapsed after 30s. Re-call `task_wait` with the same task_ids to collect any ready results and receive the budget-elapsed status. task_ids=[{}]\nProgress: {checkpoint}\n\nWake-up handling rules:\n- rule\n\nResume execution based on the goal and these messages.",
+            ids.join(", ")
+        )
+    }
+
+    #[test]
+    fn wait_wake_notes_coalesce_keeps_latest_in_sqlite_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "wait_wake_coalesce_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+
+        append_history_sqlite(
+            &path,
+            vec![
+                msg("user", "goal"),
+                msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a", "task_b"], "checkpoint-1")),
+                msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a", "task_b"], "checkpoint-2")),
+                msg(ROLE_INTERNAL_NOTE, &wake_note_text(7, &["task_x"], "checkpoint-3")),
+            ],
+        )
+        .unwrap();
+
+        let latest =
+            msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a", "task_b"], "checkpoint-4"));
+        assert!(coalesce_repeated_wait_wake_notes_sqlite(&path, &latest).unwrap());
+        // 调用方随后把最新一条追加到尾部。
+        append_history_sqlite(&path, vec![latest]).unwrap();
+
+        let notes: Vec<_> = read_all_messages_sqlite(&path)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.role == ROLE_INTERNAL_NOTE)
+            .collect();
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].content.as_str().unwrap().contains("checkpoint-3"));
+        assert!(notes[1].content.as_str().unwrap().contains("checkpoint-4"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_wake_coalesce_sqlite_window_is_last_total_messages() {
+        let dir = std::env::temp_dir().join(format!(
+            "sqlite_wake_dedup_window_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+
+        // 与 blob 后端一致的窗口语义：扫描历史尾部 WAKE_NOTE_DEDUP_SCAN 条消息（不限角色），
+        // 而非“最近 WAKE_NOTE_DEDUP_SCAN 条 internal_note”。
+        // 旧等待笔记在第 1 条，其后跟 WAKE_NOTE_DEDUP_SCAN+1 条 user 消息，故其在窗口外，
+        // 不应被删除（若按 internal_note 窗口扫描则会被命中删除）。
+        let mut history = vec![msg(
+            ROLE_INTERNAL_NOTE,
+            &wake_note_text(6, &["task_a"], "checkpoint-old"),
+        )];
+        history.extend(
+            (0..crate::ai::history::types::WAKE_NOTE_DEDUP_SCAN as usize + 1)
+                .map(|i| msg("user", &format!("filler {i}"))),
+        );
+        append_history_sqlite(&path, history).unwrap();
+
+        let latest =
+            msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a"], "checkpoint-new"));
+        assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &latest).unwrap());
+
+        let notes: Vec<_> = read_all_messages_sqlite(&path)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.role == ROLE_INTERNAL_NOTE)
+            .collect();
+        // 窗口外的旧等待笔记保留，未被误删。
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].content.as_str().unwrap().contains("checkpoint-old"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_wake_coalesce_sqlite_is_noop_when_nothing_matches() {
+        let dir = std::env::temp_dir().join(format!(
+            "wait_wake_coalesce_noop_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        append_history_sqlite(
+            &path,
+            vec![
+                msg("user", "goal"),
+                msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a"], "checkpoint-1")),
+            ],
+        )
+        .unwrap();
+
+        // 同一 pid 但不同 task 集合：身份不同，不去重。
+        let other = msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_z"], "checkpoint-x"));
+        assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &other).unwrap());
+
+        // 非 internal_note 消息：fast path 不做任何 IO。
+        assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &msg("user", "hello")).unwrap());
+
+        // 真实结果唤醒（parse 为 None）：不去重。
+        let result_wake = msg(
+            ROLE_INTERNAL_NOTE,
+            "[Process 6 Woke Up] Original goal: g\nNew mailbox messages:\n[EVENT_WAKE]\nready\n\nWake-up handling rules:\n- rule\n\nResume execution based on the goal and these messages.",
+        );
+        assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &result_wake).unwrap());
+
+        // 数据库不存在：best-effort 返回 false，不报错。
+        // 注意：必须用有效 wait note 才能越过 fast path，真正走到 open_history_db 分支。
+        let missing = dir.join("missing.db");
+        let wait_note = msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a"], "c"));
+        assert!(!coalesce_repeated_wait_wake_notes_sqlite(&missing, &wait_note).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

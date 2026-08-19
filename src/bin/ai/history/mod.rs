@@ -32,7 +32,8 @@ use crate::ai::types::App;
 #[allow(unused_imports)]
 pub(in crate::ai) use blob::{
     append_history, append_history_messages, append_history_messages_for_model, build_message_arr,
-    delete_history_artifacts, parse_history_blob, replace_history_messages,
+    coalesce_repeated_wait_wake_notes, delete_history_artifacts, parse_history_blob,
+    replace_history_messages,
     truncate_history_messages,
 };
 #[allow(unused_imports)]
