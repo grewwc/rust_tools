@@ -14,9 +14,10 @@
 //!   AppleEvent 调度到会话窗口/标签页，绝不 `activate`——activate 会把焦点抢走）。
 //! - 页面交互全部通过 JS（click/输入/按键为合成事件；对依赖真实键盘/`hasFocus` 的
 //!   站点可能无效——这是本模式的固有限制）。
-//! - 截图走 `screencapture -l <窗口id>`（需要屏幕录制权限），不支持整页截图。
+//! - 截图走 `screencapture -l <窗口id>`（需要屏幕录制权限）；`full_page`
+//!   自动降级为窗口截图并回退到 rect/全屏，避免模型传参即失败。
 //! - 会话标签页被用户手动关闭时，后续操作会得到"标签页已丢失"的明确报错，可
-//!   navigate 重建。
+//!   navigate 重建（`screenshot` 例外：无窗口时自动 `about:blank` 重建）。
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -26,6 +27,25 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use crate::tools::{op_timeout_ms, resolve_screenshot_path};
+
+/// 单次 screencapture 调用：成功 Ok(())，失败 Err(stderr trimmed)。
+async fn screencapture_capture(args: &[&str]) -> Result<(), String> {
+    let child = Command::new("/usr/sbin/screencapture")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("screencapture 启动失败: {}", e))?;
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("screencapture 失败: {}", e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
 
 /// 所有 osascript 调用都只发 Apple 事件、绝不 activate Chrome（activate 会把
 /// 用户屏幕焦点抢到 Chrome）。唯一例外：新建标签页时 Chrome 会自行激活到前台，
@@ -623,46 +643,91 @@ end tell"#,
         }
     }
 
-    /// 截图：screencapture 按窗口 id 抓取（需要屏幕录制权限）。
-    pub async fn screenshot(&self, path: &str, full_page: bool) -> Result<String, String> {
-        if full_page {
-            return Err("full_page 整页截图仅支持 CDP 模式；AppleScript 模式按窗口抓取".to_string());
+    /// 查询 Chrome 窗口 bounds：返回 (x, y, w, h)。失败 None（窗口已关等）。
+    async fn window_bounds(&self, wid: &str) -> Option<(i32, i32, i32, i32)> {
+        let script = format!(
+            "tell application \"Google Chrome\"\n  get bounds of window id {}\nend tell",
+            wid
+        );
+        let out = run_osascript(&script).await.ok()?;
+        // 形如 "0, 44, 1440, 878" 或 "{0, 44, 1440, 878}"
+        let s = out.trim().trim_matches(|c| c == '{' || c == '}').trim().to_string();
+        let parts: Vec<&str> = s.split(',').collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        let parse = |p: &str| p.trim().parse::<i32>().ok();
+        let x1 = parse(parts[0])?;
+        let y1 = parse(parts[1])?;
+        let x2 = parse(parts[2])?;
+        let y2 = parse(parts[3])?;
+        let w = x2 - x1;
+        let h = y2 - y1;
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        Some((x1, y1, w, h))
+    }
+
+    /// 截图：优先 `screencapture -l <wid>`，失败则 `bounds -> -R`，再退化全屏兜底。
+    /// `full_page` 在 AppleScript 下自动降级为窗口截图（返回 warning 而非 Err，避免
+    /// 模型重试死循环）。`&mut self` 以便无窗口时自动 `open_tab("about:blank")`。
+    pub async fn screenshot(&mut self, path: &str, full_page: bool) -> Result<(String, String), String> {
+        let full_page_warn = if full_page {
+            " [warn: AppleScript 模式不支持 full_page，已按窗口截图]"
+        } else {
+            ""
+        };
+        // 无窗口或标签页已丢失时，自动新建空白标签页（首次 screenshot 前无需 navigate）。
+        let needs_open = match (&self.window_id, &self.tab_id) {
+            (Some(_), Some(_)) => !self.tab_alive().await,
+            _ => true,
+        };
+        if needs_open {
+            if let Err(e) = self.open_tab("about:blank").await {
+                return Err(format!(
+                    "还没有会话窗口且自动创建失败：{}（请先调用 navigate）",
+                    translate_err(&e)
+                ));
+            }
         }
         let wid = self
             .window_id
             .clone()
             .ok_or("还没有会话窗口：请先调用 navigate")?;
-        // 先确保窗口存在
-        let alive = self.tab_alive().await;
-        if !alive {
-            return Err("会话标签页已丢失：请重新 navigate".to_string());
-        }
         let parent = std::path::Path::new(path)
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         std::fs::create_dir_all(&parent).map_err(|e| format!("创建截图目录失败: {}", e))?;
-        let child = Command::new("/usr/sbin/screencapture")
-            .arg("-l")
-            .arg(&wid)
-            .arg("-x")
-            .arg(path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("screencapture 启动失败: {}", e))?;
-        let out = child
-            .wait_with_output()
-            .await
-            .map_err(|e| format!("screencapture 失败: {}", e))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr).to_string();
-            return Err(format!(
-                "screencapture 失败（可能需要屏幕录制权限: 系统设置>隐私与安全性>屏幕录制，勾选本终端应用）：{}",
-                err.trim()
-            ));
+        // 1) 窗口级抓取（最精准，保留阴影/圆角由系统处理）
+        if screencapture_capture(&["-l", &wid, "-x", path]).await.is_ok() {
+            // 二次校验文件确实落盘且非空（窗口隐藏时可能 0 字节）
+            if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+                return Ok((path.to_string(), full_page_warn.to_string()));
+            }
         }
-        Ok(path.to_string())
+        // 2) rect 兜底：用 Chrome bounds 换算 -R x,y,w,h
+        if let Some((x, y, w, h)) = self.window_bounds(&wid).await {
+            let rect = format!("{},{},{},{}", x, y, w, h);
+            if screencapture_capture(&["-R", &rect, "-x", path]).await.is_ok()
+                && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+            {
+                let note = format!("{} [fallback: rect {}]", full_page_warn, rect);
+                return Ok((path.to_string(), note));
+            }
+        }
+        // 3) 全屏兜底（窗口不可见/隐藏时仍能出图，避免彻底失败）
+        if screencapture_capture(&["-x", path]).await.is_ok()
+            && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+        {
+            let note = format!("{} [fallback: fullscreen - 窗口不可见已退化为全屏]", full_page_warn);
+            return Ok((path.to_string(), note));
+        }
+        Err(format!(
+            "screencapture 失败（窗口 {} 无法捕获）。请检查：1) 系统设置>隐私与安全性>屏幕录制，已勾选启动本工具的终端应用（Terminal/iTerm/VS Code/Cursor/Arc 等，授权后需重启该应用）；2) Chrome 窗口保持可见、未最小化且不在别的 Space/Stage Manager 隐藏中。重试或切 CDP 模式：MCP_BROWSER_DRIVER=cdp",
+            wid
+        ))
     }
 }
 
@@ -856,9 +921,9 @@ pub async fn handle_tools_call(
             let full_page = args.get("full_page").and_then(Value::as_bool).unwrap_or(false);
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
-                let p = session.screenshot(&out_path.to_string_lossy(), full_page).await?;
+                let (p, extra) = session.screenshot(&out_path.to_string_lossy(), full_page).await?;
                 let tag = session.detect_user_action_required().await.map_or(String::new(), |c| user_action_tag(&c));
-                Ok(format!("{pend}Saved screenshot to {p} (full_page={full_page}){tag}"))
+                Ok(format!("{pend}Saved screenshot to {p} (full_page={full_page}){extra}{tag}"))
             })
             .await?;
             Ok(text_content(&summary))

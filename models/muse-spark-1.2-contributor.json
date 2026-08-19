@@ -1,0 +1,15 @@
+{
+  "key": "muse-spark-1.2-contributor",
+  "name": "muse-spark-1.2-contributor",
+  "adapter": "opencode",
+  "request_protocol": "responses",
+  "quality_tier": "strong",
+  "is_vl": true,
+  "search_enabled": true,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "default_reasoning_effort": "xhigh",
+  "subagent_priority": 80,
+  "reasoning_encrypted_replay": true,
+  "endpoint": "https://opencode.ai/zen/go/v1/responses"
+}
