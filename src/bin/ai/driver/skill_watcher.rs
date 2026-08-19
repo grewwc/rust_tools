@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::agent_routing::load_skill_manifests;
 use crate::ai::{prompt::completion::CommandCompleter, skills};
@@ -19,21 +19,35 @@ const SKILL_WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const SKILL_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SKILL_WATCH_EVENT_QUEUE_SIZE: usize = 64;
 
-/// 后台文件监听器。它直接更新补全缓存，并把完整快照发送给 driver 在安全点接管。
+type SkillManifestSnapshot = Arc<Vec<skills::SkillManifest>>;
+type LatestSkillManifestSlot = Arc<Mutex<Option<SkillManifestSnapshot>>>;
+
+/// 后台文件监听器。它直接更新补全缓存，并保留最新完整快照供 driver 在安全点接管。
 pub(super) struct SkillManifestWatcher {
-    updates: Receiver<Arc<Vec<skills::SkillManifest>>>,
+    latest_update: LatestSkillManifestSlot,
     shutdown: Arc<AtomicBool>,
 }
 
 impl SkillManifestWatcher {
-    /// 取走累计的最新快照；旧快照已过期，无需让 driver 逐一应用。
+    /// 取走最新快照；旧快照已在写入时替换，无需让 driver 逐一应用。
     pub(super) fn take_latest(&mut self) -> Option<Arc<Vec<skills::SkillManifest>>> {
-        let mut latest = None;
-        while let Ok(update) = self.updates.try_recv() {
-            latest = Some(update);
-        }
-        latest
+        take_latest_skill_manifests(&self.latest_update)
     }
+}
+
+fn replace_latest_skill_manifests(
+    slot: &Mutex<Option<SkillManifestSnapshot>>,
+    manifests: SkillManifestSnapshot,
+) {
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(manifests);
+}
+
+fn take_latest_skill_manifests(
+    slot: &Mutex<Option<SkillManifestSnapshot>>,
+) -> Option<SkillManifestSnapshot> {
+    slot.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
 }
 
 impl Drop for SkillManifestWatcher {
@@ -109,7 +123,8 @@ pub(super) fn start_skill_manifest_watcher(
             .map_err(|err| format!("监听技能目录 {} 失败：{err}", root.display()))?;
     }
 
-    let (updates_tx, updates) = mpsc::channel();
+    let latest_update = Arc::new(Mutex::new(None));
+    let worker_latest_update = Arc::clone(&latest_update);
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = Arc::clone(&shutdown);
     let user_cache_dir = user_skills_dir.join(".cache");
@@ -119,7 +134,7 @@ pub(super) fn start_skill_manifest_watcher(
             run_skill_manifest_watcher(
                 watcher,
                 event_rx,
-                updates_tx,
+                worker_latest_update,
                 worker_shutdown,
                 watch_roots,
                 user_cache_dir,
@@ -127,7 +142,10 @@ pub(super) fn start_skill_manifest_watcher(
         })
         .map_err(|err| format!("启动技能监听线程失败：{err}"))?;
 
-    Ok(Some(SkillManifestWatcher { updates, shutdown }))
+    Ok(Some(SkillManifestWatcher {
+        latest_update,
+        shutdown,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -135,7 +153,7 @@ fn run_skill_manifest_watcher(
     // watcher 必须在线程内持有，否则离开 start 函数时会停止接收文件系统事件。
     _watcher: RecommendedWatcher,
     event_rx: Receiver<Event>,
-    updates_tx: mpsc::Sender<Arc<Vec<skills::SkillManifest>>>,
+    latest_update: LatestSkillManifestSlot,
     shutdown: Arc<AtomicBool>,
     watch_roots: Vec<PathBuf>,
     user_cache_dir: PathBuf,
@@ -151,9 +169,7 @@ fn run_skill_manifest_watcher(
 
         let manifests = Arc::new(load_skill_manifests(false));
         CommandCompleter::set_skill_manifests(manifests.as_slice());
-        if updates_tx.send(manifests).is_err() {
-            break;
-        }
+        replace_latest_skill_manifests(&latest_update, manifests);
     }
 }
 
@@ -203,6 +219,9 @@ fn debounce_skill_changes(
 }
 
 fn is_relevant_skill_event(event: &Event, watch_roots: &[PathBuf], user_cache_dir: &Path) -> bool {
+    if matches!(&event.kind, EventKind::Access(_)) {
+        return false;
+    }
     event.paths.iter().any(|path| {
         !path.starts_with(user_cache_dir) && watch_roots.iter().any(|root| path.starts_with(root))
     })
@@ -210,10 +229,40 @@ fn is_relevant_skill_event(event: &Event, watch_roots: &[PathBuf], user_cache_di
 
 #[cfg(test)]
 mod tests {
-    use notify::{Event, EventKind};
-    use std::path::PathBuf;
+    use notify::{Event, EventKind, event::AccessKind};
+    use std::{path::PathBuf, sync::Mutex};
 
-    use super::is_relevant_skill_event;
+    use super::{
+        is_relevant_skill_event, replace_latest_skill_manifests, take_latest_skill_manifests,
+    };
+
+    #[test]
+    fn skill_watcher_rejects_access_events() {
+        let skills_dir = PathBuf::from("/tmp/skills");
+        let event = Event::new(EventKind::Access(AccessKind::Any))
+            .add_path(skills_dir.join("existing.skill"));
+
+        assert!(!is_relevant_skill_event(
+            &event,
+            std::slice::from_ref(&skills_dir),
+            &skills_dir.join(".cache"),
+        ));
+    }
+
+    #[test]
+    fn skill_watcher_latest_snapshot_replaces_previous_update() {
+        let slot = Mutex::new(None);
+        let first = std::sync::Arc::new(Vec::new());
+        let latest = std::sync::Arc::new(Vec::new());
+
+        replace_latest_skill_manifests(&slot, std::sync::Arc::clone(&first));
+        replace_latest_skill_manifests(&slot, std::sync::Arc::clone(&latest));
+
+        let received = take_latest_skill_manifests(&slot).expect("应保留最新快照");
+        assert!(std::sync::Arc::ptr_eq(&received, &latest));
+        assert!(!std::sync::Arc::ptr_eq(&received, &first));
+        assert!(take_latest_skill_manifests(&slot).is_none());
+    }
 
     #[test]
     fn ignores_skill_package_cache_events() {
