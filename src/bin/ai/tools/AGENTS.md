@@ -103,6 +103,10 @@ Applies to `src/bin/ai/tools/**`. Layer separation: schema/metadata in
     blocking pagers, editors, prompts, and color; explicit PTY runs preserve
     interactive terminal behavior. Analyze mutating commands before execution
     and automatically load scoped instructions for inferred project targets.
+    `git commit`-family commands (`git commit`, `git -C <dir> commit`, ...) are
+    gated in `service/command.rs`: they prompt the user for confirmation in an
+    interactive terminal and fail closed (never hang, never auto-run) when stdin
+    is not a terminal.
 14. **Mutation log is best-effort and session-scoped.** `FileStore::write_all`
     and `apply_patch` delete/rollback paths append a JSONL entry to
     `<session_assets>/mutation_log.jsonl` (before/after capped, op, seq); it

@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::io::IsTerminal;
 
 use crate::ai::config_schema::AiConfig;
 use crate::ai::tools::storage::command_runner;
@@ -77,6 +78,63 @@ Do not re-run near-identical variants; narrow the query instead (e.g. `grep -c` 
 // =========================================================================
 // 执行逻辑（校验已移至 audit 模块）
 // =========================================================================
+
+/// 判断命令是否为 git 提交类命令（`git commit` / `git -C <dir> commit` 等），
+/// 命中后需要先向用户确认再执行。按空白切 token，避免误伤 `git log | grep commit`
+/// 之类的普通命令。
+fn is_git_commit_command(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i] != "git" {
+            i += 1;
+            continue;
+        }
+        // 跳过 git 全局选项及其取值（-C <path>、-c <key>=<val>、--git-dir=... 等），
+        // 它们可能出现在 `git` 与子命令之间。
+        let mut j = i + 1;
+        loop {
+            match tokens.get(j).copied() {
+                Some(tok) if tok == "-C" || tok == "-c" || tok == "--git-dir"
+                    || tok == "--work-tree" || tok == "--namespace" => j += 2,
+                Some(tok) if tok.starts_with("--git-dir=")
+                    || tok.starts_with("--work-tree=")
+                    || tok.starts_with("--namespace=") => j += 1,
+                _ => break,
+            }
+        }
+        if tokens.get(j).copied() == Some("commit") {
+            return true;
+        }
+        i = j.saturating_add(1);
+    }
+    false
+}
+
+/// git 提交前请求用户确认。
+/// - 交互终端：红色高亮提示，y 放行，n / Ctrl+C / Esc 取消。
+/// - 非交互环境：直接拒绝（fail-closed），既避免后台进程挂在读输入上，也避免静默提交。
+fn confirm_git_commit_if_needed(command: &str) -> Result<(), String> {
+    if !is_git_commit_command(command) {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(
+            "Command blocked: git commit requires user confirmation, but stdin is not an \
+             interactive terminal. Do not retry the commit; report to the user and wait for \
+             explicit confirmation (or have them run it in an interactive session)."
+                .to_string(),
+        );
+    }
+    let confirmed = crate::commonw::prompt::prompt_yes_or_no_danger(&format!(
+        "\nConfirm git commit:\n{command}\nProceed? (y/n): "
+    ));
+    match confirmed {
+        Some(true) => Ok(()),
+        Some(false) => Err("git commit canceled by user".to_string()),
+        None => Err("git commit canceled by user (Ctrl+C)".to_string()),
+    }
+}
 
 fn format_command_result(output: CommandRunResult, timeout_secs: u64) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -164,6 +222,9 @@ where
     super::audit::validate_execute_command(command)
         .map_err(|reason| format!("Command blocked: {reason}"))?;
 
+    // git 提交类命令先向用户确认（非交互环境 fail-closed）。
+    confirm_git_commit_if_needed(command)?;
+
     let output =
         command_runner::run_command_streaming(command, cwd, timeout, pseudo_terminal, on_chunk)?;
     let interrupted = output.timed_out || output.cancelled || output.stalled;
@@ -189,9 +250,55 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_COMMAND_OUTPUT_CHARS, format_command_result, resolve_command_timeout, truncate_chars,
+        MAX_COMMAND_OUTPUT_CHARS, confirm_git_commit_if_needed, format_command_result,
+        is_git_commit_command, resolve_command_timeout, truncate_chars,
     };
     use crate::cmd::run::CommandRunResult;
+
+    // ---- is_git_commit_command ----
+
+    #[test]
+    fn commit_detection_matches_plain_git_commit() {
+        assert!(is_git_commit_command("git commit -m \"fix x\""));
+        assert!(is_git_commit_command("git commit"));
+        assert!(is_git_commit_command("git commit --amend"));
+    }
+
+    #[test]
+    fn commit_detection_skips_global_options() {
+        assert!(is_git_commit_command("git -C /repo commit -m x"));
+        assert!(is_git_commit_command("git --git-dir=/repo/.git commit"));
+        assert!(is_git_commit_command("git -c user.name=X commit"));
+    }
+
+    #[test]
+    fn commit_detection_finds_commit_in_command_chains() {
+        assert!(is_git_commit_command("git add -A && git commit -m x"));
+        assert!(is_git_commit_command("git -C /repo add . && git -C /repo commit"));
+    }
+
+    #[test]
+    fn commit_detection_ignores_non_commit_commands() {
+        assert!(!is_git_commit_command("git status"));
+        assert!(!is_git_commit_command("git log --oneline | grep commit"));
+        assert!(!is_git_commit_command("git svn commit"));
+        assert!(!is_git_commit_command("echo 'git commit' > note.txt"));
+        assert!(!is_git_commit_command("git commitmessage"));
+    }
+
+    #[test]
+    fn commit_confirmation_fails_closed_without_terminal() {
+        // 测试环境 stdin 非终端：提交类命令必须被拒绝，且不挂起。
+        let err = confirm_git_commit_if_needed("git commit -m x").unwrap_err();
+        assert!(err.contains("blocked"), "err: {err}");
+        assert!(err.contains("confirmation"), "err: {err}");
+    }
+
+    #[test]
+    fn commit_confirmation_passes_through_non_commit_commands() {
+        assert!(confirm_git_commit_if_needed("git status").is_ok());
+        assert!(confirm_git_commit_if_needed("echo hello").is_ok());
+    }
 
     // ---- truncate_chars ----
 
