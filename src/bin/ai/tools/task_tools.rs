@@ -1035,10 +1035,12 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// `task` / `task_wait` / `task_status` 都可能承载 subagent 的唯一可见结果。
-// 这些结果一旦被有损压缩或 LLM prune，主 agent 就可能失去对已完成子任务的
-// grounding 感知。统一禁止 lossy 与 prune；若内容过大，交给 overflow stub +
-// file_path 承接，而不是删成不可复原的摘要。
+// `task` / `task_spawn` / `task_spawn_batch` / `task_wait` / `task_status`
+// 都可能承载 subagent 的唯一可见结果：spawn 系列的参数（子代理 prompt /
+// response schema）与返回值（task_id 列表）是后续 wait/status/integrate 的
+// 必需输入；结果一旦被有损压缩或 LLM prune，主 agent 就可能失去对已完成
+// 子任务的 grounding 感知。统一禁止 lossy 与 prune；若内容过大，交给
+// overflow stub + file_path 承接，而不是删成不可复原的摘要。
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task",
     policy: ToolHistoryPolicy {
@@ -1070,6 +1072,24 @@ inventory::submit!(ToolRegistration {
         execute: execute_task_spawn_batch,
         groups: &["builtin", "core"],
     }
+});
+
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "task_spawn",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Never,
+        counts_toward_precision_inline_budget: false,
+    },
+});
+
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "task_spawn_batch",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Never,
+        counts_toward_precision_inline_budget: false,
+    },
 });
 
 /// Pre-flight subagent task spec produced from a `task` / `task_spawn` tool

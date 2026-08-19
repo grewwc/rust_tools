@@ -719,4 +719,17 @@ mod history_policy_tests {
         assert!(policy.allows_lossy_compress());
         assert!(policy.allows_prune());
     }
+
+    #[test]
+    fn subagent_spawn_tools_block_lossy_and_prune() {
+        // task_spawn / task_spawn_batch 的参数（子代理 prompt / response schema）与
+        // 返回值（task_id 列表）是后续 wait/status/integrate 的必需输入。漏注册会让
+        // 它们退回默认策略 (Allow/Allow)，折叠后证据退化成结果首字符（原始参数不参与
+        // recall），主 agent 会失去对已 spawn 子任务的 grounding。这条断言把契约钉死。
+        for name in ["task_spawn", "task_spawn_batch"] {
+            let policy = tool_history_policy(name);
+            assert!(!policy.allows_lossy_compress(), "{name} must block lossy compress");
+            assert!(!policy.allows_prune(), "{name} must block prune");
+        }
+    }
 }
