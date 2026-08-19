@@ -23,7 +23,7 @@ fn any_model_name() -> String {
     super::model_names::all()
         .first()
         .map(|m| m.name.clone())
-        .expect("models.json is empty")
+        .expect("model registry is empty")
 }
 
 fn vl_model_name_at(index: usize) -> Option<String> {
@@ -361,7 +361,7 @@ fn determine_vl_model_supports_selector_and_fuzzy_name() {
     let first_vl = any_vl_model_handle();
     assert_eq!(
         zero, first_vl,
-        "selector \"0\" should pick first VL in models.json"
+        "selector \"0\" should pick first VL in model registry"
     );
     // empty 仅要求是 VL 模型即可（best-by-tier 可能与 first_vl 不同）。
     assert!(
@@ -385,7 +385,7 @@ fn determine_vl_model_supports_selector_and_fuzzy_name() {
 #[test]
 fn tools_default_flag_is_respected_per_model_entry() {
     // 以前这里硬编码 qwen3.5-flash / qwen3-max 的 tools_enabled 行为；这两个模型
-    // 已经从 models.json 中移除。改成扫描真实条目，校验 models::tools_enabled
+    // 已经从模型注册表中移除。改成扫描真实条目，校验 models::tools_enabled
     // 与 ModelDef.tools_default_enabled 的对齐关系，仍能守住"配置即真相"的不变量。
     for def in super::model_names::all() {
         assert_eq!(

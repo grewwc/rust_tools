@@ -232,7 +232,7 @@ fn disabled_model_tokens_accept_names_and_keys() {
     let models = super::model_names::all();
     let model_def = models
         .first()
-        .expect("models.json should contain at least one model");
+        .expect("model registry should contain at least one model");
     let disabled =
         parse_disabled_model_tokens(&format!(" {}, {}\nfoo ", model_def.name, model_def.key));
     assert!(disabled.contains(&model_def.name.to_ascii_lowercase()));
@@ -241,13 +241,13 @@ fn disabled_model_tokens_accept_names_and_keys() {
 }
 
 /// 选取一个真实存在的、adapter=Alibaba 的模型名做用例输入；
-/// 这样测试不会因为 models.json 增删个别条目而失效。
+/// 这样测试不会因为模型注册表（models/）增删个别条目而失效。
 fn first_alibaba_model_name() -> String {
     super::model_names::all()
         .iter()
         .find(|m| m.adapter == ApiProvider::Alibaba)
         .map(|m| m.name.clone())
-        .expect("models.json must contain at least one Alibaba-adapter model")
+        .expect("model registry must contain at least one Alibaba-adapter model")
 }
 
 fn first_alibaba_vl_model_name() -> Option<String> {
@@ -276,7 +276,7 @@ fn known_model_entries_resolve_exactly_by_name() {
 
 #[test]
 fn model_keys_resolve_to_model_handles() {
-    // 用 models.json 中第一个真实条目反向校验 key→handle 的映射，
+    // 用模型注册表中第一个真实条目反向校验 key→handle 的映射，
     // 而不是硬编码具体 key。
     let first = super::model_names::all()
         .first()
@@ -286,7 +286,7 @@ fn model_keys_resolve_to_model_handles() {
                 super::model_names::model_handle(m).to_string(),
             )
         })
-        .expect("models.json must contain at least one entry");
+        .expect("model registry must contain at least one entry");
     assert_eq!(determine_model(&first.0), first.1);
 }
 
@@ -294,7 +294,7 @@ fn model_keys_resolve_to_model_handles() {
 fn model_key_selects_duplicate_name_provider() {
     let key = "deepseek-v4-flash-opencode";
     let def = super::model_names::find_by_identifier(key)
-        .expect("models.json should contain opencode deepseek-v4-flash");
+        .expect("model registry should contain opencode deepseek-v4-flash");
 
     assert_eq!(def.name, "deepseek-v4-flash");
     assert_eq!(def.adapter, ApiProvider::OpenCode);
@@ -322,7 +322,7 @@ fn deepseek_v4_flash_routes_declare_full_context_budget() {
 fn platform_changes_model_handle_but_legacy_adapter_handle_still_resolves() {
     let volcano = "glm-5.2-volcano";
     let def = super::model_names::find_by_identifier(volcano)
-        .expect("models.json should contain volcano glm-5.2");
+        .expect("model registry should contain volcano glm-5.2");
     assert_eq!(super::model_names::model_handle(def), volcano);
     assert_eq!(determine_model("glm-5.2-compatible"), volcano);
     assert_eq!(model_platform_label(volcano), "volcano");
@@ -366,7 +366,7 @@ fn known_model_entries_carry_adapter_and_quality_tier() {
 
 #[test]
 fn endpoint_for_known_model_prefers_model_config_over_global_fallback() {
-    // 任意一个在 models.json 中显式声明 endpoint 的条目都应该优先使用自身配置。
+    // 任意一个在模型注册表中显式声明 endpoint 的条目都应该优先使用自身配置。
     let (name, expected) = super::model_names::all()
         .iter()
         .filter_map(|m| {
@@ -379,7 +379,7 @@ fn endpoint_for_known_model_prefers_model_config_over_global_fallback() {
             std::ptr::eq(resolved, *m).then(|| (m.name.clone(), endpoint.to_string()))
         })
         .next()
-        .expect("models.json must contain a selectable entry with an explicit endpoint");
+        .expect("model registry must contain a selectable entry with an explicit endpoint");
     let endpoint = endpoint_for_model(
         &name,
         "https://example.com/should-not-be-used/v1/chat/completions",
@@ -414,7 +414,7 @@ fn endpoint_for_alibaba_model_prefers_model_config() {
                 .filter(|e| !e.is_empty())
                 .map(|e| (m.name.clone(), e.to_string()))
         })
-        .expect("models.json must contain at least one Alibaba entry with endpoint");
+        .expect("model registry must contain at least one Alibaba entry with endpoint");
     let endpoint = endpoint_for_model(&name, "");
     assert_eq!(endpoint, expected);
     assert_eq!(endpoint, ALIBABA_DEFAULT_ENDPOINT);
@@ -451,7 +451,7 @@ fn known_model_without_endpoint_uses_provider_default_before_global_fallback() {
         .iter()
         .find(|m| m.adapter == ApiProvider::OpenCode && m.endpoint.is_none())
         .map(|m| super::model_names::model_handle(m).to_string())
-        .expect("models.json must contain at least one OpenCode entry without endpoint");
+        .expect("model registry must contain at least one OpenCode entry without endpoint");
     let endpoint = endpoint_for_model(&model, "https://example.com/v1/chat/completions");
     assert_eq!(endpoint, OPENCODE_DEFAULT_ENDPOINT);
 }
@@ -482,7 +482,7 @@ fn default_model_prefers_high_quality_alibaba_or_compatible_model() {
     //  1. 必须是 non-vl
     //  2. quality_tier 必须不低于所有同 adapter-偏好下的候选
     let def = super::model_names::find_by_identifier(&default_model())
-        .expect("default model must exist in models.json");
+        .expect("default model must exist in model registry");
     assert!(!def.is_vl, "default model should be non-VL");
 
     let best_non_vl_tier = super::model_names::all()
@@ -490,15 +490,15 @@ fn default_model_prefers_high_quality_alibaba_or_compatible_model() {
         .filter(|m| !m.is_vl)
         .map(|m| m.quality_tier)
         .max()
-        .expect("models.json must contain at least one non-VL model");
+        .expect("model registry must contain at least one non-VL model");
     assert_eq!(def.quality_tier, best_non_vl_tier);
 }
 
 #[test]
 fn opencode_model_entries_do_not_advertise_thinking_when_disabled() {
     // 以前这里是固定模型名 gpt-5.4-pro 的强制断言；现在改为针对任意一个
-    // 在 models.json 中明确声明 enable_thinking=false 的 opencode 模型，
-    // 校验 enable_thinking() 与配置一致。这样 models.json 的具体条目变更
+    // 在模型注册表中明确声明 enable_thinking=false 的 opencode 模型，
+    // 校验 enable_thinking() 与配置一致。这样模型注册表的具体条目变更
     // 不会再让本测试失效，但仍然能守住"不要把 false 误读成 true"的不变量。
     let candidate = super::model_names::all()
         .iter()
@@ -510,7 +510,7 @@ fn opencode_model_entries_do_not_advertise_thinking_when_disabled() {
 }
 
 #[test]
-/// 回归测试：api_key_config_key 字段在 models.json 中可能是加密的（enc:...），
+/// 回归测试：api_key_config_key 字段在模型注册表中可能是加密的（enc:...），
 /// api_key_for_model 必须先解密再作为 key 名去 configw 查找。
 /// 修复前：加密字符串直接作为 key 名查找 -> 查不到 -> fallthrough 到全局 api_key -> 401。
 fn api_key_config_key_decrypts_before_configw_lookup() {
@@ -519,7 +519,7 @@ fn api_key_config_key_decrypts_before_configw_lookup() {
 
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
-    // 在 models.json 中找一个 api_key_config_key 加密的模型
+    // 在模型注册表中找一个 api_key_config_key 加密的模型
     let target = super::model_names::all().iter().find_map(|m| {
         let enc = m.api_key_config_key.as_deref()?;
         if !secret::is_encrypted(enc) {

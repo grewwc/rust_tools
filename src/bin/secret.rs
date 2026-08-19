@@ -6,7 +6,7 @@
 //! secret decrypt "enc:xxxxx"     # 输出明文
 //! ```
 //!
-//! 加密后的值可以直接放入 models.json 的 api_key 字段，
+//! 加密后的值可以直接放入模型注册表（models/）的 api_key 字段，
 //! 运行时会自动解密。
 
 use rust_tools::commonw::secret;
@@ -66,7 +66,7 @@ fn print_usage() {
   secret decrypt "enc:aBcDeFgHiJkLmNoPqRsT..."
   # 输出: my-api-key-12345
 
-加密后的值可直接放入 models.json:
+加密后的值可直接放入模型注册表（models/）:
   "api_key": "enc:aBcDeFgHiJkLmNoPqRsT..."
 "#
     );

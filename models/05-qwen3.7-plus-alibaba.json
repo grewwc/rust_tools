@@ -1,0 +1,19 @@
+{
+  "key": "qwen3.7-plus-alibaba",
+  "aliases": [
+    "QWEN_PLUS_LATEST",
+    "qwen3.7-plus-compatible"
+  ],
+  "name": "qwen3.7-plus",
+  "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+  "quality_tier": "strong",
+  "adapter": "alibaba",
+  "is_vl": true,
+  "search_enabled": true,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "reasoning_effort_wire": "top_level",
+  "default_reasoning_effort": "high",
+  "subagent_priority": 0,
+  "max_output_tokens": 65536
+}

@@ -70,7 +70,7 @@ pub(in crate::ai) trait ProviderAdapter: Sync {
         None
     }
 
-    /// 该 provider 的默认 endpoint（模型未在 models.json 显式声明时使用）。
+    /// 该 provider 的默认 endpoint（模型未在模型注册表显式声明时使用）。
     fn default_endpoint(&self) -> &'static str;
 
     /// 读取 API key 时的配置键候选链（按优先级）。

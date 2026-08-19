@@ -1113,7 +1113,7 @@ mod tests {
         crate::ai::model_names::all()
             .first()
             .map(|m| m.name.clone())
-            .expect("models.json is empty")
+            .expect("model registry is empty")
     }
 
     #[test]

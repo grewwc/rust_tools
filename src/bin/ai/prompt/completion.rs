@@ -1324,7 +1324,7 @@ mod tests {
         let model = crate::ai::model_names::all()
             .first()
             .map(|m| crate::ai::model_names::model_handle(m))
-            .expect("models.json is empty");
+            .expect("model registry is empty");
 
         let (_, pairs) = completer
             .complete("/model", 6, &Context::new(&history))
@@ -1342,7 +1342,7 @@ mod tests {
         let current = crate::ai::model_names::all()
             .first()
             .map(|m| crate::ai::model_names::model_handle(m))
-            .expect("models.json is empty");
+            .expect("model registry is empty");
         CommandCompleter::set_current_model_hint(&current);
 
         let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
@@ -1570,7 +1570,7 @@ mod tests {
         let current = crate::ai::model_names::all()
             .first()
             .map(|m| crate::ai::model_names::model_handle(m))
-            .expect("models.json is empty");
+            .expect("model registry is empty");
         CommandCompleter::set_current_model_hint(&current);
 
         let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
@@ -1595,7 +1595,7 @@ mod tests {
     #[test]
     fn model_completion_deep_v_completes_volcano_deepseek() {
         if crate::ai::model_names::find_by_identifier("deepseek-v4-flash-volcano").is_none() {
-            return; // models.json 无该模型时跳过
+            return; // 模型注册表（models/）无该模型时跳过
         }
         let (_, candidates) = CommandCompleter::complete_for_line("/model deep-v", 13);
         let repls: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
@@ -1623,7 +1623,7 @@ mod tests {
     #[test]
     fn model_completion_glm_v_completes_glm_volcano() {
         if crate::ai::model_names::find_by_identifier("glm-5.2-volcano").is_none() {
-            return; // models.json 无该模型时跳过
+            return; // 模型注册表（models/）无该模型时跳过
         }
         let (_, candidates) = CommandCompleter::complete_for_line("/model glm-v", 12);
         let repls: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();

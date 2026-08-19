@@ -6,7 +6,7 @@
 //! 各 provider adapter 不必再认识彼此的思考 wire 格式。
 //!
 //! [`thinking_dialect_for`] 的分派与 [`super::adapter_for`] 一一对应（同样以
-//! provider + endpoint 决定网关），因此对 models.json 中所有模型的 wire 输出
+//! provider + endpoint 决定网关），因此对模型注册表中所有模型的 wire 输出
 //! 与旧的 per-adapter `thinking_fields` 逐字节等价。
 //!
 //! 三种方言：

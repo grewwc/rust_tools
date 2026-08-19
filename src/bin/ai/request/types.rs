@@ -38,7 +38,7 @@ pub(crate) struct RequestBody<'a> {
     /// 必须显式声明，否则 token 用量无法统计、`/usage` 会漏计。非流式时为 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stream_options: Option<Value>,
-    /// 单次响应最大输出 token 数（来自 models.json 的 `max_output_tokens`）。
+    /// 单次响应最大输出 token 数（来自模型注册表 models/ 的 `max_output_tokens`）。
     /// 缺省不下发，沿用 provider 默认补全上限；显式指定可缓解长输出被截断。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
@@ -48,7 +48,7 @@ pub(crate) struct RequestBody<'a> {
     /// 不参与 chat-completions 序列化，也绝不落盘。
     #[serde(skip)]
     pub(crate) reasoning_items: Option<&'a FxHashMap<String, Vec<Value>>>,
-    /// 模型能力位（来自 models.json `reasoning_encrypted_replay`）：开启后
+    /// 模型能力位（来自模型注册表 models/ 的 `reasoning_encrypted_replay`）：开启后
     /// Responses 请求带 `include: ["reasoning.encrypted_content"]` 索取加密推理项。
     /// 在 builder 阶段用原始 model key 解析，避免 protocol 层用（可能加密的）
     /// request model name 反查失败。`#[serde(skip)]`：非 chat-completions 字段。

@@ -1,0 +1,19 @@
+{
+  "key": "gpt-5.5",
+  "name": "enc:IKeEnDgBgytuFsfzJM6c+5qXyVOcgZu1L4s=",
+  "endpoint": "enc:Lh51RHWUngr1mKckIbMUVi3ERzAEh7tTCaVSnQSYA3xW70azwJjgEIAFGxPtDRdXHKSCjZK6CNsLiek=",
+  "api_key_config_key": "enc:SCFOXKeZe4sUmK9SqBGBdX6vHNsQ1Po=",
+  "quality_tier": "flagship",
+  "adapter": "compatible",
+  "is_vl": true,
+  "search_enabled": true,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "request_protocol": "responses",
+  "default_reasoning_effort": "xhigh",
+  "reasoning_effort_conflicts_with_tools": false,
+  "reasoning_encrypted_replay": true,
+  "subagent_priority": 50,
+  "max_output_tokens": 128000,
+  "request_tpm_limit": 600000
+}

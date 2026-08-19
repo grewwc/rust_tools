@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use crate::commonw::utils::expanduser;
@@ -61,7 +61,7 @@ pub struct ModelDef {
     /// 真实上限的值可缓解截断；缺省（None）时不下发 `max_tokens`，沿用历史行为。
     #[serde(default, alias = "max_tokens", alias = "max_completion_tokens")]
     pub max_output_tokens: Option<u32>,
-    /// 可选：请求层的 prompt-token-per-minute 预检预算。仅当 `models.json`
+    /// 可选：请求层的 prompt-token-per-minute 预检预算。仅当模型注册表
     /// 显式配置此字段时，请求层才会在发送前等待；未配置（或为 0）则完全跳过
     /// TPM 预检，避免用错误的默认值误伤不同 provider / key。
     #[serde(default)]
@@ -93,8 +93,8 @@ pub struct ModelDef {
     #[serde(default)]
     pub reasoning_in_content: bool,
     /// 子 agent 模型选择优先级（越大越优先）。同 tier 内按此值降序排列。
-    /// 缺省为 0，用户可在 ~/.config/rust_tools/models.json 中覆盖以调整偏好，
-    /// 无需重新编译。
+    /// 缺省为 0，用户可在 ~/.config/rust_tools/models/（或旧版单文件
+    /// ~/.config/rust_tools/models.json）中覆盖以调整偏好，无需重新编译。
     #[serde(default)]
     pub subagent_priority: i32,
 
@@ -107,7 +107,7 @@ pub struct ModelDef {
     /// 可选：默认推理强度档位。具体 wire 形状优先使用上面的模型级覆盖，否则由
     /// provider adapter 决定。CLI / `/model effort` 命令的覆盖优先级高于这里。
     ///
-    /// 在 `models.json` 中可填以下值（大小写不敏感）：
+    /// 在模型注册表（models/ 目录）中可填以下值（大小写不敏感）：
     /// - `"auto"` / `"none"` / `"off"` 或字段省略：等同 `None`，请求中不带
     ///   `reasoning_effort` 字段（与历史行为兼容）；
     /// - `"minimal"` / `"low"` / `"medium"` / `"high"` / `"xhigh"` / `"max"`：对应档位。
@@ -240,7 +240,19 @@ pub fn legacy_adapter_handle(model: &ModelDef) -> Option<String> {
     }
 }
 
-fn user_config_path() -> PathBuf {
+/// 用户模型注册表目录（新格式，推荐）：`~/.config/rust_tools/models/`，
+/// 约定与内置 `models/` 目录一致（每个模型一个 JSON 文件）。
+fn user_config_dir() -> PathBuf {
+    let home = expanduser("~/.config/rust_tools/models");
+    match home {
+        std::borrow::Cow::Owned(s) => PathBuf::from(s),
+        std::borrow::Cow::Borrowed(s) => PathBuf::from(s),
+    }
+}
+
+/// 兼容旧格式：单文件 `~/.config/rust_tools/models.json` 用户覆盖。
+/// 新目录格式存在时优先，旧文件仅作回退。
+fn legacy_user_config_path() -> PathBuf {
     let home = expanduser("~/.config/rust_tools/models.json");
     match home {
         std::borrow::Cow::Owned(s) => PathBuf::from(s),
@@ -248,46 +260,95 @@ fn user_config_path() -> PathBuf {
     }
 }
 
-fn builtin_config_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models.json")
+fn builtin_config_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models")
 }
 
-fn load_models_from_path(path: &PathBuf) -> Vec<ModelDef> {
+/// 解析单个模型文件：支持单个对象 `{...}` 或对象数组 `[{...}]` 两种形式。
+/// 读取/解析失败返回 `None`（已打印错误信息）。
+fn load_models_from_file(path: &Path) -> Option<Vec<ModelDef>> {
     let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("[model_names] failed to read {}: {}", path.display(), e);
+            return None;
+        }
     };
-    serde_json::from_str(&content).unwrap_or_else(|e| {
-        eprintln!("[model_names] failed to parse {}: {}", path.display(), e);
-        Vec::new()
-    })
+    // 先按数组解析（兼容合并文件），失败再按单个对象解析。
+    if let Ok(models) = serde_json::from_str::<Vec<ModelDef>>(&content) {
+        return Some(models);
+    }
+    match serde_json::from_str::<ModelDef>(&content) {
+        Ok(model) => Some(vec![model]),
+        Err(e) => {
+            eprintln!("[model_names] failed to parse {}: {}", path.display(), e);
+            None
+        }
+    }
+}
+
+/// 读取目录下所有 `*.json` 模型文件（按文件名排序，保证加载顺序确定）。
+/// `strict` 为 true 时任一文件读取/解析失败返回 `None`（内置注册表用，
+/// 直接退出以免静默降级）；为 false 时跳过坏文件继续加载（用户注册表用）。
+fn load_models_from_dir(dir: &Path, strict: bool) -> Option<Vec<ModelDef>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("[model_names] failed to read {}: {}", dir.display(), e);
+            return None;
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
+        .collect();
+    paths.sort();
+    let mut models = Vec::new();
+    for path in paths {
+        match load_models_from_file(&path) {
+            Some(file_models) => models.extend(file_models),
+            None if strict => return None,
+            None => {}
+        }
+    }
+    Some(models)
 }
 
 fn load_user_models() -> Vec<ModelDef> {
-    let path = user_config_path();
-    if path.exists() {
-        load_models_from_path(&path)
+    // 新格式目录优先；不存在时兼容旧版单文件覆盖。
+    let dir = user_config_dir();
+    if dir.is_dir() {
+        return load_models_from_dir(&dir, false).unwrap_or_default();
+    }
+    let legacy = legacy_user_config_path();
+    if legacy.exists() {
+        load_models_from_file(&legacy).unwrap_or_default()
     } else {
         Vec::new()
     }
 }
 
 fn load_builtin_models() -> Vec<ModelDef> {
-    let path = builtin_config_path();
-    if !path.exists() {
+    let dir = builtin_config_dir();
+    if !dir.is_dir() {
         eprintln!(
-            "[model_names] builtin models.json not found at {}",
-            path.display()
+            "[model_names] builtin models dir not found at {}",
+            dir.display()
         );
         std::process::exit(1);
     }
-    let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        eprintln!("[model_names] failed to read {}: {}", path.display(), e);
-        std::process::exit(1);
-    });
-    serde_json::from_str(&content).unwrap_or_else(|e| {
-        eprintln!("[model_names] failed to parse {}: {}", path.display(), e);
-        std::process::exit(1);
+    load_models_from_dir(&dir, true).unwrap_or_else(|| {
+        eprintln!(
+            "[model_names] failed to load builtin models from {}",
+            dir.display()
+        );
+        std::process::exit(1)
     })
 }
 

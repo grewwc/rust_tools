@@ -346,7 +346,7 @@ fn prepare_subagent_task_auto_selects_model_and_fallback() {
     let current_model = crate::ai::model_names::all()
         .first()
         .map(|model| crate::ai::model_names::model_handle(model))
-        .expect("models.json must contain at least one model");
+        .expect("model registry must contain at least one model");
     let navigator = manifest(
         "navigator",
         "Read-only codebase navigation agent",
@@ -412,7 +412,7 @@ fn prepare_subagent_task_inherits_parent_model_by_default() {
     let current_model = crate::ai::model_names::all()
         .first()
         .map(|model| crate::ai::model_names::model_handle(model))
-        .expect("models.json must contain at least one model");
+        .expect("model registry must contain at least one model");
     let navigator = manifest(
         "navigator",
         "Read-only codebase navigation agent",
@@ -577,7 +577,7 @@ fn auto_selection_matches_task_to_subagent_description() {
 
 #[test]
 fn selection_explanation_mentions_quality_tier_for_auto_model_choice() {
-    // 之前这里硬编码 "qwen3-max"；该模型已经从 models.json 移除。
+    // 之前这里硬编码 "qwen3-max"；该模型已经从模型注册表移除。
     // 改为从真实条目中找一个 Alibaba+flagship 的模型，确保解释里出现
     // "flagship" 和 "alibaba" 这两个 tier/adapter 关键字。
     use crate::ai::provider::{ApiProvider, ModelQualityTier};
@@ -588,7 +588,7 @@ fn selection_explanation_mentions_quality_tier_for_auto_model_choice() {
     let Some(model) = model else {
         eprintln!(
             "[test] skipping selection_explanation_mentions_quality_tier_for_auto_model_choice: \
-                 no Alibaba+Flagship model present in models.json"
+                 no Alibaba+Flagship model present in model registry"
         );
         return;
     };

@@ -26,7 +26,7 @@ pub(super) struct ParsedCli {
     /// 通过 `--interactive` / `-i` 开启；与 `-ns` 联用时，后续每轮都会继续走 notebook 检索问答。
     pub(super) interactive: bool,
     /// 用户对推理强度档位的会话级覆盖。语义说明：
-    /// - `None`：未设置，遵循 [models.json](../../../models.json) 的模型默认值；
+    /// - `None`：未设置，遵循模型注册表（[models/](../../../../models)）的模型默认值；
     /// - `Some(Some(level))`：强制使用该档位（minimal/low/medium/high）；
     /// - `Some(None)`：用户显式关闭，请求里不带 `reasoning_effort` 字段。
     ///

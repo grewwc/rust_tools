@@ -332,7 +332,7 @@ pub(in crate::ai) async fn run_with_cli(
     // cli 已由调用方解析完毕（run() 或 background 入口），此处直接使用。
 
     // 纯本地命令（帮助、列工具/技能/agent）不调用 LLM，必须在 ensure_models_available /
-    // load_config 之前处理：否则 models.json 为空或配置损坏时，连 `a --help` 都跑不起来，
+    // load_config 之前处理：否则模型注册表（models/）为空或配置损坏时，连 `a --help` 都跑不起来，
     // 形成“想看帮助先得把环境配好”的死循环。
     if cli.help {
         cli::print_help();

@@ -16,7 +16,7 @@ impl AiConfig {
     pub const MODEL_ENDPOINT: &str = "ai.model.endpoint";
     /// Subagent model selection inherits the parent agent's current model by
     /// default. Set to "false" or "0" to use the auto-selection logic instead
-    /// (models.json subagent_priority / task difficulty classification).
+    /// (model registry subagent_priority / task difficulty classification).
     pub const SUBAGENT_MODEL_INHERIT: &str = "ai.subagent.model_inherit";
     pub const MODEL_API_KEY: &str = "api_key";
     pub const MODEL_OPENCODE_API_KEY: &str = "opencode.api_key";

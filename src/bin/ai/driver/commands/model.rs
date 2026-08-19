@@ -301,7 +301,7 @@ mod tests {
             current_model: crate::ai::model_names::all()
                 .first()
                 .map(|m| crate::ai::model_names::model_handle(m))
-                .expect("models.json is empty"),
+                .expect("model registry is empty"),
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,

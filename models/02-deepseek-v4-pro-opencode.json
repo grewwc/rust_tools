@@ -1,0 +1,16 @@
+{
+  "key": "deepseek-v4-pro-opencode",
+  "name": "deepseek-v4-pro",
+  "adapter": "opencode",
+  "quality_tier": "strong",
+  "is_vl": false,
+  "search_enabled": true,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "subagent_priority": 85,
+  "default_reasoning_effort": "max",
+  "reasoning_content_replay": true,
+  "context_window_tokens": 1000000,
+  "max_output_tokens": 393216,
+  "endpoint": "https://opencode.ai/zen/go/v1/chat/completions"
+}

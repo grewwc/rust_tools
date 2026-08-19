@@ -8,7 +8,7 @@ rules in the nearest child `AGENTS.md`.
 ## Runtime layout
 
 - `config.rs` / `config_schema.rs`: config loading and schema
-- `models.rs` / `models.json` (repo root, read at runtime via `model_names.rs`; user override `~/.config/rust_tools/models.json`): model registry access, platform naming, metadata
+- `models.rs` / `models/` (repo root dir, read at runtime via `model_names.rs`; user override dir `~/.config/rust_tools/models/` or legacy single file `~/.config/rust_tools/models.json`): model registry access, platform naming, metadata
 - `prompt.rs` / `prompt/`: prompt assembly and multiline extraction
 - `skills.rs` / `agents.rs`: skill + agent manifests; `builtin_agents/` holds `.agent`
   files and `builtin_skills/` holds builtin `.skill` files, both compiled in via `include_str!`
@@ -46,7 +46,7 @@ rules in the nearest child `AGENTS.md`.
    provider wire behavior in `provider/` adapter hooks, not scattered
    conditionals.
 4. **Model metadata.** `ApiProvider` is the request adapter axis; platform
-   naming and model metadata live in `models.json`.
+   naming and model metadata live in `models/`.
 5. **Tool contracts.** Tool names, schemas, display/history policy are
    registry-driven; execution logic stays out of registry metadata.
 6. **Lazy capability loading.** Hidden tool/MCP catalogs, prompt hints, and

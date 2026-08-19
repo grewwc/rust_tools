@@ -25,7 +25,7 @@ crates/mcp_stdio/           # shared MCP-over-stdio skeleton (lib): JSON-RPC tra
 crates/mcp_browser/         # standalone MCP server: browser automation; macOS AppleScript driver reuses the user's running Chrome, Windows/Linux use CDP attach or a controlled instance (details in crates/mcp_browser/AGENTS.md)
 crates/mcp_excel/           # standalone MCP server: real Microsoft Excel automation via AppleScript (osascript)
 tests/                      # integration tests
-models.json                 # model registry
+models/                     # per-model JSON registry (read at runtime)
 ```
 
 > `mcp_browser` / `mcp_excel` are standalone binary crates (not deps of `a`),

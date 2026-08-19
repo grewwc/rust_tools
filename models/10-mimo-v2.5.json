@@ -1,0 +1,13 @@
+{
+  "key": "mimo-v2.5",
+  "name": "mimo-v2.5",
+  "adapter": "opencode",
+  "quality_tier": "basic",
+  "is_vl": true,
+  "search_enabled": true,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "subagent_priority": 80,
+  "endpoint": "https://opencode.ai/zen/go/v1/chat/completions",
+  "default_reasoning_effort": "max"
+}

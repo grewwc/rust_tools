@@ -140,7 +140,7 @@ pub(crate) fn apply_aux_thinking_fields(model: &str, body: &mut Value) {
 
 /// 是否开启 opt-in 的显式 prompt cache 断点注入。
 ///
-/// `cache_control` 是 provider/model 级能力，由 `models.json` 的
+/// `cache_control` 是 provider/model 级能力，由模型注册表（models/）的
 /// `explicit_prompt_cache` 字段声明；普通 OpenAI 兼容模型不一定接受该扩展字段。
 pub(super) fn prompt_cache_enabled_for_model(model: &str) -> bool {
     prompt_cache_config_enabled() && models::explicit_prompt_cache_enabled(model)
@@ -182,7 +182,7 @@ pub(super) fn apply_prompt_cache_breakpoint(messages: &mut [Message]) {
 /// 1. CLI 参数 `--reasoning-effort` 或 `/model effort <x>` 留下的覆盖
 ///    （存储在 [`App.cli.reasoning_effort_override`]，其中 `Some(None)`
 ///    表示用户显式关闭，`None` 表示未设置）；
-/// 2. [models.json](../../../models.json) 中该模型的默认 `reasoning_effort`；
+/// 2. 模型注册表（[models/](../../../../models)）中该模型的默认 `reasoning_effort`；
 /// 3. `None` -- 不注入字段，保持服务端默认行为。
 pub(crate) fn resolve_reasoning_effort(app: &App, model: &str) -> Option<ReasoningEffort> {
     if let Some(override_value) = app.cli.reasoning_effort_override.as_ref() {

@@ -1,0 +1,15 @@
+{
+  "key": "mimo-v2.5-free-opencode",
+  "aliases": [
+    "MiMo V2.5 Free"
+  ],
+  "name": "mimo-v2.5-free",
+  "adapter": "opencode",
+  "quality_tier": "basic",
+  "is_vl": true,
+  "search_enabled": true,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "default_reasoning_effort": "max",
+  "subagent_priority": 80
+}

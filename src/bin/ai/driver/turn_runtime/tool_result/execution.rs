@@ -6526,7 +6526,7 @@ mod tests {
             .iter()
             .find(|m| m.is_vl)
             .map(|m| m.name.clone())
-            .expect("models.json must contain at least one VL model");
+            .expect("model registry must contain at least one VL model");
 
         let mut messages = Vec::new();
         let mut turn_messages = Vec::new();

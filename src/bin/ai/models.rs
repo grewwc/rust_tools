@@ -56,7 +56,7 @@ pub(super) fn enable_thinking(model: &str) -> bool {
     model_def(model).map(|m| m.enable_thinking).unwrap_or(false)
 }
 
-/// 返回该模型在 [models.json](../../../models.json) 中声明的默认推理强度
+/// 返回该模型在模型注册表（[models/](../../../../models)）中声明的默认推理强度
 /// （`reasoning_effort`）。CLI / `/model effort` 命令的覆盖会在
 /// `request::resolve_reasoning_effort` 里优先生效，此处仅给出"模型默认"。
 pub(super) fn default_reasoning_effort(model: &str) -> Option<ReasoningEffort> {
@@ -90,14 +90,14 @@ pub(super) fn reasoning_effort_conflicts_with_tools(model: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 返回该模型在 [models.json](../../../models.json) 中声明的单次响应最大输出
+/// 返回该模型在模型注册表（[models/](../../../../models)）中声明的单次响应最大输出
 /// token 数（`max_output_tokens`）。缺省时为 `None`，请求不下发 `max_tokens`，
 /// 沿用 provider 默认补全上限。
 pub(super) fn max_output_tokens(model: &str) -> Option<u32> {
     model_def(model).and_then(|m| m.max_output_tokens)
 }
 
-/// 返回该模型在 [models.json](../../../models.json) 中声明的请求层 TPM 预检预算。
+/// 返回该模型在模型注册表（[models/](../../../../models)）中声明的请求层 TPM 预检预算。
 /// 仅当显式配置了正整数时返回 `Some(limit)`；未配置或为 0 都视为关闭预检等待。
 pub(super) fn request_tpm_limit(model: &str) -> Option<u64> {
     model_def(model)
@@ -107,7 +107,7 @@ pub(super) fn request_tpm_limit(model: &str) -> Option<u64> {
 
 /// 返回该模型当前生效的请求协议方言。
 ///
-/// 优先使用 models.json 中显式声明的 `request_protocol`；未声明时按 endpoint
+/// 优先使用模型注册表（models/）中显式声明的 `request_protocol`；未声明时按 endpoint
 /// 做兼容推断，以便历史配置在不改文件时也维持原有 wire 行为。
 pub(super) fn request_protocol_dialect(model: &str, endpoint: &str) -> RequestProtocolDialect {
     model_def(model)
@@ -197,7 +197,7 @@ fn maybe_decrypt(value: &str) -> String {
 pub(super) fn api_key_for_model(model: &str, global_fallback: &str) -> String {
     let cfg = configw::get_all_config();
 
-    // 1. 字面量 api_key（models.json 直接写明，最高优先级）
+    // 1. 字面量 api_key（模型注册表 models/ 直接写明，最高优先级）
     if let Some(value) = model_def(model)
         .and_then(|m| m.api_key.as_deref())
         .map(str::trim)
@@ -259,7 +259,7 @@ fn default_context_window_tokens_for_tier(tier: ModelQualityTier) -> usize {
 }
 
 /// 返回模型上下文窗口（token）。
-/// 若 models.json 未声明，按质量档位给出保守默认值，供压缩预算动态估算使用。
+/// 若模型注册表（models/）未声明，按质量档位给出保守默认值，供压缩预算动态估算使用。
 pub(super) fn context_window_tokens(model: &str) -> usize {
     if let Some(def) = model_def(model) {
         return def
@@ -292,7 +292,7 @@ fn vl_model_search_candidates() -> Vec<(String, String)> {
 }
 
 fn default_model() -> String {
-    // 依赖前置 [`ensure_models_available`] 在 run() 入口就检查过 models.json，
+    // 依赖前置 [`ensure_models_available`] 在 run() 入口就检查过模型注册表（models/），
     // 这里的 fallback 路径（vl 模型缺失时）总会拿到至少一个候选。
     // 最后兜底返回空串避免 process::exit；上层若真的拿到空串会立即报错。
     choose_default_model_name(false)
@@ -337,12 +337,14 @@ fn model_auto_select_enabled(model: &ModelDef, disabled: &[String]) -> bool {
 pub(super) fn ensure_models_available() -> Result<(), String> {
     if model_names::all().is_empty() {
         return Err(
-            "[model_names] models.json is empty; please populate it before launching ai"
+            "[model_names] model registry is empty; please populate models/ before launching ai"
                 .to_string(),
         );
     }
     if choose_default_model_name(false).is_none() && choose_default_model_name(true).is_none() {
-        return Err("[model_names] no usable default model; check models.json entries".to_string());
+        return Err(
+            "[model_names] no usable default model; check model registry entries".to_string(),
+        );
     }
     Ok(())
 }
@@ -718,7 +720,7 @@ fn classify_subagent_task_difficulty(description: &str, prompt: &str) -> Subagen
     SubagentTaskDifficulty::Standard
 }
 
-/// 基于 models.json 中的 subagent_priority 字段选择子 agent 模型。
+/// 根据模型注册表（models/）中的 subagent_priority 字段选择子 agent 模型。
 /// priority 越大越优先；同 priority 时按 quality_tier 和 target_tier 适配度排序。
 fn pick_subagent_model(require_thinking: bool, target_tier: ModelStrengthTier) -> String {
     pick_subagent_model_excluding(require_thinking, target_tier, None).unwrap_or_else(default_model)

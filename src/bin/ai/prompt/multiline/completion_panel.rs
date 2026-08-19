@@ -235,7 +235,7 @@ mod tests {
         let current = crate::ai::model_names::all()
             .first()
             .map(|m| crate::ai::model_names::model_handle(m))
-            .expect("models.json is empty");
+            .expect("model registry is empty");
         CommandCompleter::set_current_model_hint(&current);
 
         let mut textarea = TextArea::new(vec!["/model".to_string()]);
@@ -326,7 +326,7 @@ mod tests {
         let current = crate::ai::model_names::all()
             .first()
             .map(|m| crate::ai::model_names::model_handle(m))
-            .expect("models.json is empty");
+            .expect("model registry is empty");
         CommandCompleter::set_current_model_hint(&current);
 
         let mut textarea = TextArea::new(vec!["/model".to_string()]);

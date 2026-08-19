@@ -351,7 +351,7 @@ fn prompt_cache_model_support_rejects_plain_openai_model() {
     let Some(model) = first_openai_model_name() else {
         eprintln!(
             "[test] skipping prompt_cache_model_support_rejects_plain_openai_model: \
-                 no OpenAi model present in models.json"
+                 no OpenAi model present in model registry"
         );
         return;
     };
@@ -671,7 +671,7 @@ async fn response_body_read_observes_request_interrupt_source() {
 }
 
 /// 找一个真实存在的 OpenAi-adapter 模型名做测试输入，避免硬编码
-/// 具体模型字符串导致 models.json 变更后测试失效。
+/// 具体模型字符串导致模型注册表（models/）变更后测试失效。
 fn first_openai_model_name() -> Option<String> {
     crate::ai::model_names::all()
         .iter()
@@ -730,7 +730,7 @@ fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
                     == Some(crate::ai::model_names::ReasoningEffortWire::TopLevel)
         })
         .map(|model| model.key.clone())
-        .expect("models.json must contain an Alibaba model declaring top_level effort wire");
+        .expect("model registry must contain an Alibaba model declaring top_level effort wire");
     let alibaba = build_request_body(
         &alibaba_model,
         &messages,
@@ -1471,7 +1471,7 @@ fn responses_request_body_includes_encrypted_reasoning_flag_for_capable_model() 
     );
     assert!(
         request.reasoning_encrypted_replay,
-        "gpt-5.5 declares reasoning_encrypted_replay=true in models.json"
+        "gpt-5.5 declares reasoning_encrypted_replay=true in model registry"
     );
 
     let body = super::build_responses_request_body(&request);
@@ -1857,7 +1857,7 @@ fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
     }];
 
     let model = first_model_key_for_adapter(crate::ai::provider::ApiProvider::Alibaba)
-        .expect("models.json must contain at least one Alibaba-adapter model");
+        .expect("model registry must contain at least one Alibaba-adapter model");
 
     // gate 关闭 → enable_thinking:false
     let disabled = build_request_body(
@@ -1890,7 +1890,7 @@ fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
 fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
     // 仅 DashScope（alibaba adapter）模型走 enable_thinking 字段；
     // deepseek-v4-pro 已迁往 OpenCode 网关（走 thinking 对象，见下方断言），
-    // kimi-k2.7-code 已不在 models.json 注册表中。
+    // kimi-k2.7-code 已不在模型注册表（models/）中。
     for model in ["qwen3.7-plus", "qwen3.7-max", "deepseek-v4-flash-0731"] {
         let mut body = json!({ "model": model, "messages": [], "stream": false });
         apply_aux_thinking_fields(model, &mut body);
@@ -1930,7 +1930,7 @@ fn openai_request_body_omits_nonstandard_flags() {
     let Some(model) = first_openai_model_name() else {
         eprintln!(
             "[test] skipping openai_request_body_omits_nonstandard_flags: \
-                 no OpenAi model present in models.json"
+                 no OpenAi model present in model registry"
         );
         return;
     };
@@ -2750,14 +2750,14 @@ fn normalize_messages_dedupes_context_checkpoints_by_path_before_limit() {
 
 #[test]
 fn openai_image_content_uses_object_image_url_shape() {
-    // 仅当 models.json 中存在一个 OpenAi-provider 且 is_vl=true 的模型时
+    // 仅当模型注册表（models/）中存在一个 OpenAi-provider 且 is_vl=true 的模型时
     // 才能验证"以 {image_url:{url:...}} 对象形状下发图像"的协议契约。
-    // 真实环境下没有这种模型时（例如 models.json 只有 Compatible VL），
+    // 真实环境下没有这种模型时（例如模型注册表只有 Compatible VL），
     // 这条契约无从验证，跳过即可。
     let Some(model) = first_openai_vl_model_name() else {
         eprintln!(
             "[test] skipping openai_image_content_uses_object_image_url_shape: \
-                 no OpenAi+VL model present in models.json"
+                 no OpenAi+VL model present in model registry"
         );
         return;
     };
@@ -2787,7 +2787,7 @@ fn alibaba_image_content_also_uses_object_image_url_shape() {
     let Some(model) = first_alibaba_vl_model_name() else {
         eprintln!(
             "[test] skipping alibaba_image_content_also_uses_object_image_url_shape: \
-                 no Alibaba+VL model present in models.json"
+                 no Alibaba+VL model present in model registry"
         );
         return;
     };
@@ -2968,7 +2968,7 @@ fn normalize_messages_downgrades_image_content_for_text_only_models() {
         .map(|m| m.name.clone())
     else {
         eprintln!(
-            "[test] skipping normalize_messages_downgrades_image_content_for_text_only_models: no text-only model present in models.json"
+            "[test] skipping normalize_messages_downgrades_image_content_for_text_only_models: no text-only model present in model registry"
         );
         return;
     };

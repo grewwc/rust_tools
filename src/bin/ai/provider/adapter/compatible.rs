@@ -6,7 +6,7 @@
 //! - 透传 `enable_search`
 //! - 思考开关由 `thinking` 方言模块以 `enable_thinking: bool` 发送
 //!
-//! 但 `models.json` 里也把大量「纯 OpenAI 兼容」端点（如内部 modelhub、其他
+//! 但模型注册表（models/）里也把大量「纯 OpenAI 兼容」端点（如内部 modelhub、其他
 //! 第三方 OpenAI 兼容网关）挂在 `adapter: "compatible"` 下。这些端点严格遵循
 //! OpenAI 协议，只接受顶层 `reasoning_effort`，不识别 `enable_thinking` /
 //! `enable_search` / 嵌套 `reasoning`，发送这些字段会直接 400
