@@ -5,14 +5,19 @@ use crate::ai::{
         runtime_synthetic_user_message,
     },
     mcp::{McpClient, SharedMcpClient},
+    middleware::tool::build_tool_executor_chain,
+    ports::tool::{ToolExecOutput, ToolExecutor},
     stream::clamp_line_to_terminal_row_with_reserve,
     tools::{storage::file_store::FileStore, task_tools},
     types::{App, ToolCall},
 };
+use rust_tools::commonw::FastSet;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    future::Future,
     io::Write,
     path::PathBuf,
+    pin::Pin,
 };
 
 use super::super::persistence::persist_pending_turn_messages_for_model;
@@ -1350,8 +1355,37 @@ fn read_only_tool_signature(tool_call: &ToolCall) -> Option<String> {
         return None;
     }
 
-    let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
+    let mut args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
         .unwrap_or_else(|_| serde_json::Value::String(tool_call.function.arguments.clone()));
+    // P3：execute_command 仅当命令可证明只读时才允许同轮复用——变更型命令
+    // （cargo test、git commit 等）的结果不能当作可复用证据，否则会掩盖状态变化。
+    // 只读判定会含 cargo 验证类子命令（evidence 指纹归一化需要）；但对同轮重放
+    // 而言构建校验输出含易变进度/时长行且必须观察最新状态，故在此额外排除。
+    if tool_call.function.name == "execute_command" {
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !crate::ai::driver::turn_runtime::checkpoint::execute_command_is_read_only(command)
+            || crate::ai::driver::turn_runtime::checkpoint::command_is_cargo_verify(command)
+        {
+            return None;
+        }
+    }
+    // P3：read_file 路径归一化，`./x` 与 `x` 视为同一读取（与 P1-1 证据指纹对齐）。
+    if tool_call.function.name == "read_file" {
+        if let Some(obj) = args.as_object_mut() {
+            for key in ["file_path", "path", "filePath"] {
+                if let Some(value) = obj.get_mut(key) {
+                    if let Some(path) = value.as_str() {
+                        *value = serde_json::Value::String(
+                            crate::ai::driver::turn_runtime::progress::normalize_rescan_path(path),
+                        );
+                    }
+                }
+            }
+        }
+    }
     let args_json = serde_json::to_string(&args).unwrap_or_else(|_| args.to_string());
     Some(format!("{}\n{}", tool_call.function.name, args_json))
 }
@@ -2163,10 +2197,63 @@ fn streamed_tool_result_is_failure(tool_call: &ToolCall, run_result: &tools::Run
             && run_result.tool_result.content.starts_with("Exit code:"))
 }
 
+/// Step 5：按轮构建的 ToolExecutor 适配器，把端口契约桥接到真实派发。
+///
+/// 持有真实派发所需的全部上下文；`&McpClient` 在 `execute` 内由 `SharedMcpClient`
+/// 的 `routing_snapshot()` 快照取得，不跨派发持锁（避免与子代理 `run_turn`/`tools/mod.rs`
+/// 中 MCP 分支对同一把 `Mutex` 的二次 `lock()` 形成死锁）。调用方 `mcp_client` 参数在
+/// 生产中同样是 `routing_snapshot()` 值（空 servers，经共享的 `cached_server_prefixes` Arc
+/// 与真实 client 同源路由，见 orchestrator.rs:1093），与快照路由结果等价；真实 MCP
+/// 执行始终走 `shared_mcp_client`。
+struct RoundToolExecutorAdapter {
+    session_id: String,
+    shared_mcp_client: SharedMcpClient,
+    allowed_tool_names: FastSet<String>,
+    suppressed_read_only_results: HashMap<String, String>,
+    iteration: usize,
+}
+
+impl ToolExecutor for RoundToolExecutorAdapter {
+    fn execute<'a>(
+        &'a self,
+        app: &'a mut App,
+        tool_calls: Vec<ToolCall>,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolExecOutput, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut observer = TerminalToolObserver::new(app);
+            let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
+            // 不跨派发持锁：取一个不持锁的 routing_snapshot 快照作路由，避免临时
+            // MutexGuard 活到整条 let 语句结束。否则同步 `task` 子代理在另一线程的
+            // `run_turn`（prepare.rs 的 `mcp_client.lock()`）会永远拿不到这把锁，而父
+            // 线程又阻塞等子代理返回 → 跨线程死锁（症状：subagent 卡在 preparing context）。
+            // 详见本文件测试辅助 mcp_snapshot 的注释。
+            let snapshot = self.shared_mcp_client.lock().unwrap().routing_snapshot();
+            let result = execute_tool_calls_with_suppressed_read_only_calls(
+                &self.session_id,
+                &snapshot,
+                &self.shared_mcp_client,
+                &tool_calls,
+                &self.allowed_tool_names,
+                Some(&mut observer),
+                self.iteration,
+                &self.suppressed_read_only_results,
+            )
+            // 派发返回 `Box<dyn Error>`（非 Send+Sync），端口要求 Send+Sync：
+            // 用 `io::Error` 包装保留错误消息，供上游按字符串展示。
+            .map_err(|e| std::io::Error::other(format!("tool dispatch failed: {e}")))?;
+            Ok(result.into_tool_exec_output())
+        })
+    }
+}
+
 fn handle_tool_call_round(
     app: &mut App,
     source_model: &str,
-    mcp_client: &McpClient,
+    // Step 5 起真实派发改由 RoundToolExecutorAdapter 从 shared_mcp_client 加锁取 `&McpClient`；
+    // 该参数保留以兼容既有调用方。生产中它是 routing_snapshot() 值，路由经共享
+    // `cached_server_prefixes` 与真实 client 等价，真实 MCP 执行走 shared_mcp_client。
+    _mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
     tool_call_execution: &ToolCallExecution,
     messages: &mut Vec<Message>,
@@ -2186,18 +2273,42 @@ fn handle_tool_call_round(
     let mut exec_result = if let Some(reason) = rejection_reason {
         reject_tool_calls(&tool_call_execution.stream_result.tool_calls, reason)
     } else {
-        let mut observer = TerminalToolObserver::new(app);
-        let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
-        execute_tool_calls_with_suppressed_read_only_calls(
-            &app.session_id,
-            mcp_client,
-            shared_mcp_client,
-            &tool_call_execution.stream_result.tool_calls,
-            &tool_call_execution.allowed_tool_names,
-            Some(&mut observer),
+        // Step 5：按轮构建 ToolExecutor 链，真实派发作为内层适配器；
+        // 空中间件链 = 恒等，零行为变化。
+        let adapter = RoundToolExecutorAdapter {
+            session_id: app.session_id.clone(),
+            shared_mcp_client: shared_mcp_client.clone(),
+            allowed_tool_names: tool_call_execution.allowed_tool_names.clone(),
+            suppressed_read_only_results: suppressed_read_only_results.clone(),
             iteration,
-            suppressed_read_only_results,
-        )?
+        };
+        let executor = build_tool_executor_chain(app.tool_middlewares.clone(), Box::new(adapter));
+        // 端口 `execute` 为 async；本路径为同步驱动（含无 tokio runtime 的测试线程），
+        // 用 futures_executor::block_on 在当前线程阻塞执行（独立执行器，任意上下文可用）。
+        let output = futures_executor::block_on(executor.execute(
+            app,
+            tool_call_execution.stream_result.tool_calls.clone(),
+        ))
+        // 端口错误为 `Box<dyn Error + Send + Sync>`，本函数返回 `Box<dyn Error>`（Sized 约束），
+        // 先映射为 `io::Error` 再 `?` 传播；不加前缀，保留中间件/派发自带的上下文。
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let ToolExecOutput {
+            tool_results,
+            assistant_messages,
+            executed_tool_calls,
+            cached_hits,
+            execution_outcomes,
+            had_error,
+        } = output;
+        // 中间件注入的 assistant 消息（当前空链恒为空）：字段保留，挂载留给后续中间件能力。
+        let _unwired_assistant_messages = assistant_messages;
+        ExecuteToolCallsResult {
+            executed_tool_calls,
+            tool_results,
+            cached_hits,
+            execution_outcomes,
+            had_error,
+        }
     };
     let persisted_tool_call_ids =
         crate::ai::history::read_tool_message_ids_sqlite(&app.session_history_file)
@@ -3072,6 +3183,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             } else {
                 Vec::new()
             };
+            // 工具轮执行前钩子（on_before_tools → ExecuteTools.before）。
+            app.fire_before_tools_hooks();
             *terminal_dedupe_candidate = handle_tool_call_round(
                 app,
                 source_model,
@@ -3260,6 +3373,13 @@ mod tests {
         name: TEST_REPLAY_TOOL,
     });
 
+    /// 取一个不持锁的 McpClient 快照（与生产 orchestrator 的 routing_snapshot 模式一致）。
+    /// 直接把 `shared.lock().unwrap()` 的 guard 传进 handle_iteration_execution 会让
+    /// guard 活到整个调用语句结束，而 adapter 执行时会对同一把锁二次加锁 → 自死锁。
+    fn mcp_snapshot(shared: &SharedMcpClient) -> McpClient {
+        shared.lock().unwrap().routing_snapshot()
+    }
+
     fn test_app_with_tools(tool_names: &[&str]) -> App {
         App {
             cli: ParsedCli::default(),
@@ -3321,6 +3441,9 @@ mod tests {
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
             stale_patch_targets: Default::default(),
+            tool_middlewares: Vec::new(),
+            llm_middlewares: Vec::new(),
+            hooks: Default::default(),
         }
     }
 
@@ -3408,7 +3531,7 @@ mod tests {
             let step = handle_iteration_execution(
                 &mut app,
                 "change the file",
-                &shared_mcp_client.lock().unwrap(),
+                &mcp_snapshot(&shared_mcp_client),
                 &shared_mcp_client,
                 IterationExecution::ToolCall(ToolCallExecution {
                     stream_result: crate::ai::types::StreamResult {
@@ -4078,21 +4201,93 @@ mod tests {
 
     #[test]
     fn mutable_disk_and_ipc_tools_are_not_replay_registered() {
-        for name in [
-            "read_mailbox",
-            "shm_read",
-            "read_file",
-            "list_skills",
-            "load_skill",
-        ] {
+        // IPC / 技能列表读取的是当前进程或外部可变状态：必须针对当前状态执行。
+        for name in ["read_mailbox", "shm_read", "list_skills", "load_skill"] {
             let call = test_tool_call("call", name, serde_json::json!({}));
             assert!(
                 read_only_tool_signature(&call).is_none(),
                 "{name} must execute against current external state"
             );
         }
+        // read_file 与「可证明只读」的 execute_command 登记为同轮可复用快照；
+        // 变更型命令被 read_only_tool_signature 的只读闸门拦截，仍必须真实执行。
+        let read = test_tool_call("read", "read_file", serde_json::json!({ "file_path": "/tmp/a" }));
+        assert!(read_only_tool_signature(&read).is_some());
+        let ro_cmd = test_tool_call(
+            "ro",
+            "execute_command",
+            serde_json::json!({ "command": "cat /tmp/a" }),
+        );
+        assert!(read_only_tool_signature(&ro_cmd).is_some());
+        let mutating = test_tool_call(
+            "mutating",
+            "execute_command",
+            serde_json::json!({ "command": "cargo check" }),
+        );
+        assert!(read_only_tool_signature(&mutating).is_none());
+        // 多段命令含 cargo 验证段也必须排除：首个实质段非 cargo 时不得提前放行。
+        let chained = test_tool_call(
+            "chained",
+            "execute_command",
+            serde_json::json!({ "command": "echo hi && cargo check" }),
+        );
+        assert!(read_only_tool_signature(&chained).is_none());
         let stable = test_tool_call("stable", TEST_REPLAY_TOOL, serde_json::json!({}));
         assert!(read_only_tool_signature(&stable).is_some());
+    }
+
+    #[test]
+    fn duplicate_read_file_call_is_suppressed_and_invalidated_by_mutation() {
+        let read_args = serde_json::json!({ "file_path": "tmp/dup-read.rs" });
+        let previous = test_tool_call("call_previous", "read_file", read_args.clone());
+        let current = test_tool_call("call_current", "read_file", read_args.clone());
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_previous", "fn one() {}\n"),
+        ];
+        let suppressed = duplicate_read_only_call_ids(&messages, std::slice::from_ref(&current));
+        assert_eq!(
+            suppressed.len(),
+            1,
+            "identical successful read_file must be suppressed"
+        );
+        assert!(suppressed.contains("call_current"));
+
+        // 归一化：`./x` 与 `x`（相对路径）视为同一读取，签名一致。
+        let current_rel = test_tool_call(
+            "call_current_rel",
+            "read_file",
+            serde_json::json!({ "file_path": "./tmp/dup-read.rs" }),
+        );
+        let suppressed_rel =
+            duplicate_read_only_call_ids(&messages, std::slice::from_ref(&current_rel));
+        assert_eq!(
+            suppressed_rel.len(),
+            1,
+            "`./x` must share the read_file signature of `x`"
+        );
+
+        // 两次读取之间发生成功变更调用（write_file）：旧快照失效，必须真实读取。
+        let messages_with_write = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_previous",
+                "read_file",
+                read_args.clone(),
+            )),
+            tool_result_message("call_previous", "fn one() {}\n"),
+            assistant_tool_call_message(test_tool_call(
+                "call_write",
+                "write_file",
+                serde_json::json!({ "file_path": "tmp/dup-read.rs", "content": "fn two() {}\n" }),
+            )),
+            tool_result_message("call_write", "wrote 12 bytes"),
+        ];
+        let after_write = test_tool_call("call_after_write", "read_file", read_args);
+        assert!(
+            duplicate_read_only_call_ids(&messages_with_write, std::slice::from_ref(&after_write))
+                .is_empty(),
+            "read_file after a successful mutation must execute against current state"
+        );
     }
 
     #[test]
@@ -4124,7 +4319,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "read the file",
-            &shared_mcp_client.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp_client),
             &shared_mcp_client,
             IterationExecution::ToolCall(ToolCallExecution {
                 stream_result: crate::ai::types::StreamResult {
@@ -4212,7 +4407,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "update the file",
-            &shared_mcp_client.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp_client),
             &shared_mcp_client,
             IterationExecution::ToolCall(ToolCallExecution {
                 stream_result: crate::ai::types::StreamResult {
@@ -4279,7 +4474,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "read the file and continue",
-            &shared_mcp_client.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp_client),
             &shared_mcp_client,
             IterationExecution::ToolCall(ToolCallExecution {
                 stream_result: crate::ai::types::StreamResult {
@@ -4651,7 +4846,7 @@ mod tests {
         let first_step = handle_iteration_execution(
             &mut app,
             "fix the bug",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             final_response(),
             &mut messages,
@@ -4690,7 +4885,7 @@ mod tests {
         let second_step = handle_iteration_execution(
             &mut app,
             "fix the bug",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             final_response(),
             &mut messages,
@@ -4801,7 +4996,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "fix the bug",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             final_response(),
             &mut messages,
@@ -4881,7 +5076,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "fix the bug",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             IterationExecution::FinalResponse(crate::ai::types::StreamResult {
                 outcome: crate::ai::types::StreamOutcome::Completed,
@@ -4971,7 +5166,7 @@ mod tests {
         let first = handle_iteration_execution(
             &mut app,
             "finish",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             final_response(),
             &mut messages,
@@ -5011,7 +5206,7 @@ mod tests {
         let second = handle_iteration_execution(
             &mut app,
             "finish",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             final_response(),
             &mut messages,
@@ -5380,7 +5575,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             IterationExecution::FinalResponse(crate::ai::types::StreamResult {
                 outcome: crate::ai::types::StreamOutcome::Completed,
@@ -5453,7 +5648,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             IterationExecution::FinalResponse(crate::ai::types::StreamResult {
                 outcome: crate::ai::types::StreamOutcome::Completed,
@@ -5504,7 +5699,7 @@ mod tests {
         let second_step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             IterationExecution::FinalResponse(crate::ai::types::StreamResult {
                 outcome: crate::ai::types::StreamOutcome::Completed,
@@ -5628,7 +5823,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             stream_result(),
             &mut messages,
@@ -5654,7 +5849,7 @@ mod tests {
         let second_step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             stream_result(),
             &mut messages,
@@ -5680,7 +5875,7 @@ mod tests {
         let last_step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             stream_result(),
             &mut messages,
@@ -5751,7 +5946,7 @@ mod tests {
         let last_step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             stream_result(),
             &mut messages,
@@ -5822,7 +6017,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             stream_result("Still hidden reasoning"),
             &mut messages,
@@ -5867,7 +6062,7 @@ mod tests {
         let second_step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             stream_result("Still hidden reasoning again"),
             &mut messages,
@@ -5963,7 +6158,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "wrap up",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             IterationExecution::FinalResponse(crate::ai::types::StreamResult {
                 outcome: crate::ai::types::StreamOutcome::Completed,
@@ -6080,7 +6275,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "wrap up",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             IterationExecution::FinalResponse(crate::ai::types::StreamResult {
                 outcome: crate::ai::types::StreamOutcome::Completed,
@@ -6149,7 +6344,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "write a big script",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             IterationExecution::Truncated(crate::ai::types::StreamResult {
                 outcome: crate::ai::types::StreamOutcome::Truncated,
@@ -6225,7 +6420,7 @@ mod tests {
             handle_iteration_execution(
                 &mut app,
                 "write a big script",
-                &shared_mcp.lock().unwrap(),
+                &mcp_snapshot(&shared_mcp),
                 &shared_mcp,
                 IterationExecution::Truncated(crate::ai::types::StreamResult {
                     outcome: crate::ai::types::StreamOutcome::Truncated,
@@ -6307,7 +6502,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "write a big script",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             IterationExecution::Truncated(crate::ai::types::StreamResult {
                 outcome: crate::ai::types::StreamOutcome::Truncated,
@@ -6394,7 +6589,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "summarize findings",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             IterationExecution::ToolCall(ToolCallExecution {
                 stream_result: crate::ai::types::StreamResult {
@@ -6458,7 +6653,7 @@ mod tests {
         let step = handle_iteration_execution(
             &mut app,
             "summarize findings",
-            &shared_mcp.lock().unwrap(),
+            &mcp_snapshot(&shared_mcp),
             &shared_mcp,
             IterationExecution::ToolCall(ToolCallExecution {
                 stream_result: crate::ai::types::StreamResult {
@@ -7174,4 +7369,242 @@ mod tests {
             std::slice::from_ref(&failed_delete)
         ));
     }
+
+    #[test]
+    fn registered_tool_middleware_intercepts_real_dispatch_round() {
+        // Step 5 集成验证：注册在 `app.tool_middlewares` 的中间件必须真实拦截
+        // `handle_tool_call_round` 的派发轮（空链之外的中间件行为路径）。
+        #[derive(Debug)]
+        struct CountingMiddleware {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl crate::ai::middleware::ToolMiddleware for CountingMiddleware {
+            fn name(&self) -> &'static str {
+                "counting"
+            }
+            fn wrap(
+                &self,
+                inner: Box<dyn crate::ai::ports::tool::ToolExecutor>,
+            ) -> Box<dyn crate::ai::ports::tool::ToolExecutor> {
+                struct CountingExecutor {
+                    inner: Box<dyn crate::ai::ports::tool::ToolExecutor>,
+                    calls: Arc<std::sync::atomic::AtomicUsize>,
+                }
+                impl crate::ai::ports::tool::ToolExecutor for CountingExecutor {
+                    fn execute<'a>(
+                        &'a self,
+                        app: &'a mut App,
+                        tool_calls: Vec<ToolCall>,
+                    ) -> Pin<
+                        Box<
+                            dyn Future<
+                                    Output = Result<
+                                        crate::ai::ports::tool::ToolExecOutput,
+                                        Box<dyn std::error::Error + Send + Sync>,
+                                    >,
+                                > + Send
+                                + 'a,
+                        >,
+                    > {
+                        Box::pin(async move {
+                            self.calls
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            self.inner.execute(app, tool_calls).await
+                        })
+                    }
+                }
+                Box::new(CountingExecutor {
+                    inner,
+                    calls: self.calls.clone(),
+                })
+            }
+        }
+
+        let mut app = test_app_with_tools(&["execute_command"]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        app.tool_middlewares
+            .push(Arc::new(CountingMiddleware { calls: calls.clone() }));
+
+        let mcp = crate::ai::mcp::McpClient::new();
+        let shared_mcp = Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut turn_had_tool_error = false;
+        let result = handle_tool_call_round(
+            &mut app,
+            "",
+            &mcp,
+            &shared_mcp,
+            &ToolCallExecution {
+                stream_result: crate::ai::types::StreamResult {
+                    outcome: crate::ai::types::StreamOutcome::ToolCall,
+                    tool_calls: vec![ToolCall {
+                        id: "call_mw_1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "execute_command".to_string(),
+                            arguments: serde_json::json!({ "command": "echo middleware-intercept" })
+                                .to_string(),
+                        },
+                    }],
+                    assistant_text: String::new(),
+                    hidden_meta: String::new(),
+                    reasoning_text: String::new(),
+                    reasoning_items: Vec::new(),
+                    skip_response_drain: true,
+                    truncated_by_length: false,
+                    stream_error: false,
+                    finish_reason_value: None,
+                    usage_prompt_tokens: 0,
+                    usage_cached_prompt_tokens: 0,
+                    usage_completion_tokens: 0,
+                    usage_reasoning_tokens: 0,
+                },
+                allowed_tool_names: ["execute_command".to_string()].into_iter().collect(),
+            },
+            &mut messages,
+            &mut turn_messages,
+            true,
+            &mut persisted_turn_messages,
+            1,
+            None,
+            &HashMap::new(),
+            &mut turn_had_tool_error,
+        );
+        assert!(
+            result.is_ok(),
+            "round should succeed with middleware, got {:?}",
+            result.err()
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "registered middleware must intercept the dispatch round exactly once"
+        );
+        assert!(
+            !messages.is_empty(),
+            "tool result messages should be produced through the chain"
+        );
+    }
+
+    #[test]
+    fn tool_round_releases_live_mcp_lock_before_dispatch() {
+        struct McpLockProbeMiddleware {
+            shared_mcp: SharedMcpClient,
+            lock_was_available: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl std::fmt::Debug for McpLockProbeMiddleware {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("McpLockProbeMiddleware").finish()
+            }
+        }
+        impl crate::ai::middleware::ToolMiddleware for McpLockProbeMiddleware {
+            fn name(&self) -> &'static str {
+                "mcp_lock_probe"
+            }
+
+            fn wrap(
+                &self,
+                inner: Box<dyn crate::ai::ports::tool::ToolExecutor>,
+            ) -> Box<dyn crate::ai::ports::tool::ToolExecutor> {
+                struct McpLockProbeExecutor {
+                    inner: Box<dyn crate::ai::ports::tool::ToolExecutor>,
+                    shared_mcp: SharedMcpClient,
+                    lock_was_available: Arc<std::sync::atomic::AtomicBool>,
+                }
+                impl crate::ai::ports::tool::ToolExecutor for McpLockProbeExecutor {
+                    fn execute<'a>(
+                        &'a self,
+                        app: &'a mut App,
+                        tool_calls: Vec<ToolCall>,
+                    ) -> Pin<
+                        Box<
+                            dyn Future<
+                                    Output = Result<
+                                        crate::ai::ports::tool::ToolExecOutput,
+                                        Box<dyn std::error::Error + Send + Sync>,
+                                    >,
+                                > + Send
+                                + 'a,
+                        >,
+                    > {
+                        Box::pin(async move {
+                            let available = self.shared_mcp.try_lock().is_ok();
+                            self.lock_was_available
+                                .store(available, std::sync::atomic::Ordering::SeqCst);
+                            self.inner.execute(app, tool_calls).await
+                        })
+                    }
+                }
+                Box::new(McpLockProbeExecutor {
+                    inner,
+                    shared_mcp: self.shared_mcp.clone(),
+                    lock_was_available: self.lock_was_available.clone(),
+                })
+            }
+        }
+
+        let mut app = test_app_with_tools(&["execute_command"]);
+        let shared_mcp = Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let lock_was_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.tool_middlewares.push(Arc::new(McpLockProbeMiddleware {
+            shared_mcp: shared_mcp.clone(),
+            lock_was_available: lock_was_available.clone(),
+        }));
+
+        let mcp = crate::ai::mcp::McpClient::new();
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut turn_had_tool_error = false;
+        let result = handle_tool_call_round(
+            &mut app,
+            "",
+            &mcp,
+            &shared_mcp,
+            &ToolCallExecution {
+                stream_result: crate::ai::types::StreamResult {
+                    outcome: crate::ai::types::StreamOutcome::ToolCall,
+                    tool_calls: vec![ToolCall {
+                        id: "call_mcp_lock_probe".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "execute_command".to_string(),
+                            arguments: serde_json::json!({ "command": "echo mcp-lock-probe" })
+                                .to_string(),
+                        },
+                    }],
+                    assistant_text: String::new(),
+                    hidden_meta: String::new(),
+                    reasoning_text: String::new(),
+                    reasoning_items: Vec::new(),
+                    skip_response_drain: true,
+                    truncated_by_length: false,
+                    stream_error: false,
+                    finish_reason_value: None,
+                    usage_prompt_tokens: 0,
+                    usage_cached_prompt_tokens: 0,
+                    usage_completion_tokens: 0,
+                    usage_reasoning_tokens: 0,
+                },
+                allowed_tool_names: ["execute_command".to_string()].into_iter().collect(),
+            },
+            &mut messages,
+            &mut turn_messages,
+            true,
+            &mut persisted_turn_messages,
+            1,
+            None,
+            &HashMap::new(),
+            &mut turn_had_tool_error,
+        );
+
+        assert!(result.is_ok(), "tool round should complete: {:?}", result.err());
+        assert!(
+            lock_was_available.load(std::sync::atomic::Ordering::SeqCst),
+            "tool dispatch must not retain the live MCP mutex; a synchronous task subagent needs it while preparing context"
+        );
+    }
+
 }

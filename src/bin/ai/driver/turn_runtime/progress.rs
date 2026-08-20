@@ -230,6 +230,7 @@ pub(super) fn extract_round_evidence_fingerprints(messages: &[crate::ai::history
 
         // 变更/调度工具由 round_has_mutation 单独判定。execute_command 只有明确只读时
         // 才把返回内容当作证据，避免一次成功写操作被重复记账。
+        let mut read_only_command: Option<String> = None;
         if MUTATION_TOOL_NAMES.contains(&tool_name) {
             if tool_name != "execute_command" {
                 continue;
@@ -243,17 +244,57 @@ pub(super) fn extract_round_evidence_fingerprints(messages: &[crate::ai::history
             if !execute_command_is_read_only(command) {
                 continue;
             }
+            read_only_command = Some(command.to_string());
         }
 
-        fingerprints.push(content_fingerprint(&format!("{tool_name}\0{text}")));
+        // cargo 验证命令（check/test/build 等）输出含易变编译进度/时长行：同一源码
+        // 下重复运行的结果只有时长抖动，若按原始文本指纹会被误判为「新证据」而刷新
+        // no-progress 预算（f08171fc 循环逃逸的同款通道）。归一化后再指纹，
+        // 使相同验证结果 → 相同指纹。
+        let fingerprint_text = match read_only_command.as_deref() {
+            Some(command) if command_is_cargo_verify(command) => normalize_verify_output(text),
+            _ => text.to_string(),
+        };
+        fingerprints.push(content_fingerprint(&format!("{tool_name}\0{fingerprint_text}")));
     }
     fingerprints.sort_unstable();
     fingerprints.dedup();
     fingerprints
 }
 
+/// 归一化验证类命令输出中的易变部分：丢弃编译进度/运行行（Compiling/Checking/
+/// Finished/Running/Blocking 等），并抹平 `finished in 0.01s` 时长后缀，使
+/// 「相同源码、相同验证结果」产出相同指纹。保留 test result 等稳定信息行。
+pub(super) fn normalize_verify_output(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with("Compiling ")
+                || trimmed.starts_with("Checking ")
+                || trimmed.starts_with("Building ")
+                || trimmed.starts_with("Finished ")
+                || trimmed.starts_with("Running ")
+                || trimmed.starts_with("Doc-tests ")
+                || trimmed.starts_with("Blocking ")
+                || trimmed.starts_with("Updating ")
+                || trimmed.starts_with("Downloading ")
+                || trimmed.starts_with("Removing "))
+        })
+        .map(|line| {
+            if let Some(idx) = line.rfind(" finished in ") {
+                let tail = &line[idx..];
+                if tail.trim_end().ends_with('s') {
+                    return line[..idx].trim_end().to_string();
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 归一化重扫检测的目标路径：去掉 `./` 前缀后与目标提取共用同一归一路径。
-pub(super) fn normalize_rescan_path(path: &str) -> String {
+pub(crate) fn normalize_rescan_path(path: &str) -> String {
     normalize_path_like_token(path.strip_prefix("./").unwrap_or(path))
 }
 
@@ -303,8 +344,27 @@ pub(super) fn extract_round_from_top_read_targets(messages: &[crate::ai::history
     let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
         return Vec::new();
     };
+    // 只统计「实际读到内容」的从头读：失败或被沙箱拦截的 execute_command/read_file
+    // 没有产出任何内容，不应计入重扫计数——否则被拒的 blocked 命令也会累计，触发
+    // 与真实翻页循环无关的 TargetRescan。与 extract_round_targets 共用同一结果分类。
+    let results_by_call_id: FxHashMap<&str, ToolResultProgressStatus> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| {
+            let call_id = message.tool_call_id.as_deref()?;
+            let text = message.content.as_str().unwrap_or_default();
+            Some((call_id, classify_tool_result_progress(text)))
+        })
+        .collect();
     let mut out = Vec::new();
     for call in tool_calls.iter() {
+        if matches!(
+            results_by_call_id.get(call.id.as_str()),
+            Some(ToolResultProgressStatus::Failure)
+                | Some(ToolResultProgressStatus::BlockedOutsideWorkspace(_))
+        ) {
+            continue;
+        }
         let Ok(args) = serde_json::from_str::<Value>(call.function.arguments.as_str()) else {
             continue;
         };

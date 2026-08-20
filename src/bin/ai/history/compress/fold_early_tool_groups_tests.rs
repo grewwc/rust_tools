@@ -819,6 +819,76 @@ fn hard_budget_truncation_falls_back_when_archive_write_fails() {
 }
 
 #[test]
+fn inline_content_fallback_is_not_rearchived_as_full_original() {
+    let mut message = msg("assistant", &"x".repeat(4_000));
+    assert!(truncate_mutable_field(
+        &mut message,
+        MutableMessageField::Content,
+        3_200,
+        None,
+    ));
+    let first = value_to_string(&message.content);
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-inline-stub-{}", uuid::Uuid::new_v4()));
+
+    assert!(truncate_mutable_field(
+        &mut message,
+        MutableMessageField::Content,
+        first.chars().count().saturating_sub(160),
+        Some(overflow_dir.as_path()),
+    ));
+    let collapsed = value_to_string(&message.content);
+    assert!(collapsed.contains("full original was not archived"));
+    assert!(!collapsed.contains("archived at:"));
+    assert!(
+        !overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists(),
+        "a preview-only fallback must not later be represented as an archived full original"
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn inline_tool_arguments_fallback_is_not_rearchived_as_full_original() {
+    let mut message = assistant_call("call-w", "write_file");
+    let arguments = format!(
+        r#"{{"file_path":"/tmp/out.txt","content":"{}"}}"#,
+        "x".repeat(4_000)
+    );
+    message.tool_calls.as_mut().unwrap()[0].function.arguments = arguments;
+    assert!(truncate_mutable_field(
+        &mut message,
+        MutableMessageField::ToolArguments(0),
+        800,
+        None,
+    ));
+    let first = message.tool_calls.as_ref().unwrap()[0]
+        .function
+        .arguments
+        .clone();
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-inline-args-stub-{}", uuid::Uuid::new_v4()));
+
+    assert!(truncate_mutable_field(
+        &mut message,
+        MutableMessageField::ToolArguments(0),
+        first.chars().count().saturating_sub(160),
+        Some(overflow_dir.as_path()),
+    ));
+    let collapsed: Value =
+        serde_json::from_str(&message.tool_calls.as_ref().unwrap()[0].function.arguments)
+            .expect("compact fallback pointer must remain JSON");
+    assert_eq!(collapsed["archive_file_path"], Value::Null);
+    assert_eq!(collapsed["original_unavailable"], Value::Bool(true));
+    assert!(
+        !overflow_dir.join(OVERFLOW_HISTORY_FILENAME).exists(),
+        "a preview-only fallback must not later be represented as an archived full original"
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
 fn summary_shrink_preserves_system_order_when_archive_write_fails() {
     let blocked_dir =
         std::env::temp_dir().join(format!("ai-summary-blocked-{}", uuid::Uuid::new_v4()));
@@ -908,6 +978,43 @@ fn summary_model_input_drops_ephemeral_internal_notes() {
     assert!(!note.contains("self_note"), "{note}");
     assert!(!note.contains("tool_followup"), "{note}");
     assert!(!note.contains("应去重"), "{note}");
+}
+
+#[test]
+fn zero_budget_second_pass_preserves_existing_summary_note() {
+    // 生产路径回归：prepare_turn 先用 history_summary_max_chars 构建含早期对话
+    // 摘要的投影，orchestrator 随后用 summary_max_chars=0 的压缩器做第二轮预算
+    // 检查。旧摘要 note 落在 older 段时不得被静默丢弃。
+    let mut messages = vec![msg(
+        ROLE_INTERNAL_NOTE,
+        "对话摘要（自动压缩，以下为早期对话要点）：\n初始目标: 修复压缩回归",
+    )];
+    for i in 0..6 {
+        messages.push(msg("user", &format!("第 {i} 轮请求")));
+        messages.push(msg("assistant", &format!("第 {i} 轮回答")));
+    }
+
+    let compressed = compress_messages_for_context(
+        messages, 100_000, // 预算充足，只验证 older 段过滤逻辑
+        2,       // keep_last=2：摘要 note 位于 older 段
+        0,       // summary_max_chars=0：不重建摘要，旧摘要必须保留
+        None, None,
+    );
+
+    let texts: Vec<String> = compressed
+        .iter()
+        .map(|m| value_to_string(&m.content))
+        .collect();
+    assert!(
+        texts.iter().any(|t| t.contains("对话摘要（自动压缩")),
+        "existing summary note must survive the zero-budget second pass: {texts:?}"
+    );
+    assert!(texts.iter().any(|t| t.contains("第 5 轮请求")), "{texts:?}");
+    assert!(texts.iter().any(|t| t.contains("第 4 轮请求")), "{texts:?}");
+    assert!(
+        !texts.iter().any(|t| t.contains("第 0 轮请求")),
+        "older raw turns remain replaced by their summary: {texts:?}"
+    );
 }
 
 fn assistant_call_args(id: &str, name: &str, arguments: &str) -> Message {
@@ -1194,9 +1301,14 @@ fn current_turn_identical_reread_folds_earlier_copy_and_keeps_newest_raw() {
     // 内容级去重同样作用于本轮 precision 保护的 read_file：较早的逐字节相同副本
     // 折叠为回指最新副本的 stub（最新副本仍是 raw 全文），既保持"precision 最新
     // 结果 raw"不变式，又切断同轮内全文重读堆积。
-    assert_eq!(results.len(), 2, "两个 read_file 结果仍在：较早副本折叠为 stub、最新副本 raw");
+    assert_eq!(
+        results.len(),
+        2,
+        "两个 read_file 结果仍在：较早副本折叠为 stub、最新副本 raw"
+    );
     assert!(
-        results[0].contains("[deduped: byte-identical") && results[0].contains("No need to re-read"),
+        results[0].contains("[deduped: byte-identical")
+            && results[0].contains("No need to re-read"),
         "较早的逐字节相同副本应折叠为回指最新副本的 stub，实际: {}",
         &results[0][..results[0].len().min(160)]
     );
@@ -1235,9 +1347,12 @@ fn mid_turn_compress_preserves_current_reasoning_only_retry_marker() {
     let (compressed, before, after) = mid_turn_compress(messages, 2_000, Some(&overflow_dir), None);
 
     assert!(after < before, "test must exercise the compression path");
-    assert!(compressed.iter().any(|message| {
-        message.role == ROLE_INTERNAL_NOTE && message.content.as_str() == Some(retry_marker)
-    }), "current-turn retry marker must survive mid-turn compression");
+    assert!(
+        compressed.iter().any(|message| {
+            message.role == ROLE_INTERNAL_NOTE && message.content.as_str() == Some(retry_marker)
+        }),
+        "current-turn retry marker must survive mid-turn compression"
+    );
 
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
@@ -1366,8 +1481,14 @@ fn compressed_tool_evidence_has_independent_inline_budget() {
     assert!(compressed_tool_evidence_exceeds_inline_budget(&messages));
 
     // 整体远低于全局 100K 预算，仍应由工具证据自己的 12K 上限主动收敛。
-    let compressed =
-        compress_messages_for_context(messages, 100_000, 256, 8_000, Some(overflow_dir.clone()), None);
+    let compressed = compress_messages_for_context(
+        messages,
+        100_000,
+        256,
+        8_000,
+        Some(overflow_dir.clone()),
+        None,
+    );
     let evidence = compressed
         .iter()
         .filter(|message| is_compressed_tool_evidence_note(message))

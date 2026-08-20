@@ -53,6 +53,7 @@ fn any_vl_model_handle() -> String {
 fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::App {
     super::types::App {
         cli: super::cli::ParsedCli::default(),
+        hooks: Default::default(),
         config: super::types::AppConfig {
             api_key: String::new(),
             base_history_file: PathBuf::new(),
@@ -97,6 +98,8 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
         stale_patch_targets: Default::default(),
+        tool_middlewares: Vec::new(),
+        llm_middlewares: Vec::new(),
     }
 }
 
@@ -150,6 +153,7 @@ fn resolve_model_is_unicode_safe() {
     let cancel_stream = Arc::new(AtomicBool::new(false));
     let app = super::types::App {
         cli,
+        hooks: Default::default(),
         config,
         session_id: String::new(),
         session_history_file: PathBuf::new(),
@@ -184,6 +188,8 @@ fn resolve_model_is_unicode_safe() {
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
         stale_patch_targets: Default::default(),
+        tool_middlewares: Vec::new(),
+        llm_middlewares: Vec::new(),
     };
 
     let mut question = "a 什么是rust的一个crate？".to_string();

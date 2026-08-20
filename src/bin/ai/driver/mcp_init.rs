@@ -207,7 +207,7 @@ async fn prepare_mcp_initialization_from_path_inner(
             Ok(conn) => {
                 client
                     .servers
-                    .insert(name.clone(), std::sync::Mutex::new(conn));
+                    .insert(name.clone(), std::sync::Arc::new(std::sync::Mutex::new(conn)));
             }
             Err(err) => {
                 eprintln!("[mcp] failed to connect to server {}: {}", name, err);
@@ -335,8 +335,7 @@ fn connect_single_server(
         cmd.env(key, value);
     }
 
-    let mut process = cmd
-        .spawn()
+    let mut process = crate::fork_guard::spawn(&mut cmd)
         .map_err(|e| format!("Failed to start MCP server '{}': {}", name, e))?;
 
     let stdin = process.stdin.take().ok_or("Failed to get stdin")?;

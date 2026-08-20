@@ -213,6 +213,7 @@ fn stream_text_event_to_content_ignores_thinking_events() {
 fn test_app() -> App {
     App {
         cli: ParsedCli::default(),
+        hooks: Default::default(),
         config: AppConfig {
             api_key: String::new(),
             base_history_file: PathBuf::new(),
@@ -257,6 +258,8 @@ fn test_app() -> App {
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
         stale_patch_targets: Default::default(),
+        tool_middlewares: Vec::new(),
+        llm_middlewares: Vec::new(),
     }
 }
 
@@ -1687,11 +1690,20 @@ fn fold_window_keeps_last_terminal_columns_unused_without_terminal_detection() {
 fn fold_body_erase_starts_from_the_last_rendered_row() {
     let mut one_row = Vec::new();
     erase_fold_body(&mut one_row, 1).expect("erase one-row fold body");
-    assert_eq!(one_row, b"\r\x1b[0J");
+    assert_eq!(one_row, b"\r\r\x1b[2K\r");
 
     let mut four_rows = Vec::new();
     erase_fold_body(&mut four_rows, 4).expect("erase four-row fold body");
-    assert_eq!(four_rows, b"\r\x1b[3A\x1b[0J");
+    assert_eq!(
+        four_rows,
+        b"\r\x1b[3A\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[3A\r"
+    );
+    assert!(
+        !four_rows
+            .windows(b"\x1b[0J".len())
+            .any(|window| window == b"\x1b[0J"),
+        "bounded erase must not clear the side-note footer"
+    );
 }
 
 #[test]
@@ -2536,6 +2548,39 @@ fn output_text_snapshot_can_finish_a_partially_streamed_demux_capture() {
 /// 反向断言：未 arm 的普通模型（走独立 reasoning_content 字段）行为完全不变——
 /// content 里即便出现字面量 `</think>` 也原样落进可见正文，绝不被吞。
 #[test]
+fn stream_filters_rewrite_visible_content_before_commit() {
+    // 过滤器：把 "secret" 改写为 "[REDACTED]"。
+    struct RedactFilter;
+    impl crate::ai::ports::stream::StreamFilter for RedactFilter {
+        fn filter(&self, chunk: &str) -> Option<String> {
+            Some(chunk.replace("secret", "[REDACTED]"))
+        }
+        fn name(&self) -> &'static str {
+            "redact"
+        }
+    }
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    // Step 6：注入过滤器链，验证 `process_stream_payload` 的可见内容提交点
+    // 应用了过滤器（改写进入 assistant_text / history，原文不出现）。
+    state.filters = crate::ai::ports::stream::FilterChain::new().push(RedactFilter);
+    let mut app = test_app();
+    let mut current_history = String::new();
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        r#"{"choices":[{"delta":{"content":"hello secret world"}}]}"#,
+    )
+    .unwrap();
+    assert_eq!(state.content.assistant_text, "hello [REDACTED] world");
+    assert_eq!(current_history, "hello [REDACTED] world");
+    assert!(!state.content.assistant_text.contains("secret"));
+}
+
 fn unarmed_demuxer_leaves_content_untouched() {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();

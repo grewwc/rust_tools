@@ -13,6 +13,9 @@ mod mcp;
 mod model_names;
 mod models;
 mod persona;
+mod pipeline;
+mod ports;
+mod middleware;
 mod prompt;
 mod provider;
 mod request;
@@ -36,10 +39,33 @@ mod test_support {
 }
 
 /// 同步入口：在创建 tokio runtime 之前判断是否进入后台模式。
-/// 后台模式需要先 daemonize（fork）再构建 runtime——在多线程 runtime 启动后
-/// fork 会丢失 worker 线程导致死锁，因此必须在 runtime 之前完成 detach。
+/// 后台模式不 fork：父进程用 posix_spawn 重新 exec 一个全新的
+/// `a --daemon-child <session>` 作为 daemon（见 `background::spawn_daemon_child`），
+/// 避免 fork 把父进程半初始化的 CF/os_log/objc 状态带进子进程。
 pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = cli::parse_cli_args(std::env::args());
+    // 内部 daemon 标记：后台模式父进程在参数最前面加上
+    // `--daemon-child <session_id>`，这里剥离后按正常参数解析，再路由到
+    // daemon 子进程入口（`background::run_background_child`）。
+    let mut args: Vec<String> = std::env::args().collect();
+    let daemon_session = if args.get(1).map(String::as_str) == Some("--daemon-child") {
+        let sid = args.get(2).cloned();
+        args.drain(1..3);
+        sid
+    } else {
+        None
+    };
+
+    if daemon_session.is_some() {
+        // 新 exec 的子进程必须在解析 CLI / 创建 runtime 前建立独立 session。
+        // 不能用 `process_group(0)` 代替：它只设置 PGID，且会使 `setsid` 失败。
+        background::detach_daemon_session()?;
+    }
+
+    let cli = cli::parse_cli_args(args.into_iter());
+
+    if let Some(session_id) = daemon_session {
+        return background::run_background_child(cli, session_id);
+    }
     if cli.background {
         return background::run_background(cli);
     }

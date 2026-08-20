@@ -175,6 +175,42 @@ fn execute_command_is_read_only_skips_nav_segments_and_requires_all_substantive_
     // 纯只读命令仍成立。
     assert!(execute_command_is_read_only("git log --oneline -5"));
     assert!(execute_command_is_read_only("ls -la /tmp"));
+    // cargo 验证子命令不改源码 → 只读；重复运行同一验证命令不应再计为 Mutation。
+    assert!(execute_command_is_read_only("cargo check --bin a"));
+    assert!(execute_command_is_read_only(
+        "cd /Users/bytedance/rust_tools && cargo test --bin a focused_test"
+    ));
+    assert!(execute_command_is_read_only("cargo build --release"));
+    assert!(execute_command_is_read_only("cargo clippy"));
+    assert!(execute_command_is_read_only("cargo fmt --check"));
+    // 会改写源码 / 执行任意程序 → 非只读。
+    assert!(!execute_command_is_read_only("cargo add serde"));
+    assert!(!execute_command_is_read_only("cargo fmt"));
+    assert!(!execute_command_is_read_only("cargo clippy --fix"));
+    assert!(!execute_command_is_read_only("cargo run --bin a"));
+}
+
+#[test]
+fn cargo_verify_evidence_normalizes_volatile_output() {
+    // 同一验证结果（仅时长/编译进度不同）→ 归一化后相同 → 指纹相同。
+    let a = normalize_verify_output(
+        "   Compiling rust_tools v0.1.0 (/Users/bytedance/rust_tools)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s\n     Running unittests src/lib.rs (target/debug/deps/rust_tools-0123abc)\nrunning 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    );
+    let b = normalize_verify_output(
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s\nrunning 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+    );
+    assert_eq!(a, b);
+    assert!(a.contains("2 passed"));
+    // 不同验证结果（失败）→ 归一化后仍不同。
+    let c = normalize_verify_output(
+        "running 2 tests\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    );
+    assert_ne!(a, c);
+    // 判定函数：cargo 验证子命令（可带 cd 前导段）→ true；非 cargo / 非验证 → false。
+    assert!(command_is_cargo_verify("cargo test --bin a focused_test"));
+    assert!(command_is_cargo_verify("cd /tmp && cargo check --bin a"));
+    assert!(!command_is_cargo_verify("git status"));
+    assert!(!command_is_cargo_verify("cargo run --bin a"));
 }
 
 #[test]
@@ -1763,11 +1799,14 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
         ToolLoopSignal::None
     );
-    // 第 2 次从头读：换成 1400 字节页宽。
+    // 第 2 次从头读：换成 1400 字节页宽 → 软提示（soft 阈值=2）。
     pb_execute_command_round(&mut messages, &format!("tail -c +1 {file} | head -c 1400"), "t1");
-    assert_eq!(
-        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
-        ToolLoopSignal::None
+    assert!(
+        matches!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::TargetRescan(..)
+        ),
+        "round t1 应软提示：第 2 次从头读"
     );
     pb_execute_command_round(&mut messages, &format!("tail -c +1401 {file} | head -c 1400"), "t1p1");
     // 修复后：tail/sed 的偏移/行号字面量被剥掉，窗口 [tail,tail,archive,
@@ -1783,12 +1822,13 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
         ToolLoopSignal::None
     );
-    // 第 3 次从头读（read_file offset 缺省）→ 软提示。
+    // 第 3 次从头读（read_file offset 缺省）→ 无新信号（软提示已在本 episode 注入）。
     pb_read_round(&mut messages, file, "r3");
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
-    assert!(
-        matches!(signal, ToolLoopSignal::TargetRescan(..)),
-        "expected TargetRescan at 3rd from-top read, got {signal:?}"
+    assert_eq!(
+        signal,
+        ToolLoopSignal::None,
+        "3rd from-top read: soft already injected this episode (fires once), got {signal:?}"
     );
     // 第 4 次从头读（offset=0）→ 硬停止。
     pb_successful_read_round(&mut messages, file, 0, "r4", "content page");
@@ -1864,22 +1904,22 @@ fn target_rescan_window_decays_stale_counts() {
         ToolLoopSignal::None
     );
     // 窗口内连续重读：每轮命令互异（tail/cat/sed/nl/head），避免误触精确/粗粒度
-    // 循环检测。第 2 次（累计 2）不触发，第 3 次软提示，第 4 次硬停止。
+    // 循环检测。第 2 次（累计 2）软提示，第 3 次无新信号（软提示已注入），第 4 次硬停止。
     supervisor.iteration = 12;
     pb_execute_command_round(&mut messages, &format!("sed -n 1,40p {target}"), "r12");
-    assert_eq!(
-        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
-        ToolLoopSignal::None,
-        "round r12"
-    );
-    supervisor.iteration = 13;
-    pb_execute_command_round(&mut messages, &format!("nl -ba {target}"), "r13");
     assert!(
         matches!(
             supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
             ToolLoopSignal::TargetRescan(..)
         ),
-        "round r13 should soft-signal"
+        "round r12: 第 2 次（累计 2）软提示"
+    );
+    supervisor.iteration = 13;
+    pb_execute_command_round(&mut messages, &format!("nl -ba {target}"), "r13");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None,
+        "round r13: 第 3 次（累计 3）软提示已在本 episode 注入，不再重复"
     );
     supervisor.iteration = 14;
     pb_execute_command_round(&mut messages, &format!("head -n 200 {target}"), "r14");
@@ -1900,7 +1940,7 @@ fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let target = "src/episode-file.rs";
-    // Episode 1：第 1/2 次不触发，第 3 次软提示并记录 rescan_note_injected。
+    // Episode 1：第 1 次不触发，第 2 次软提示并记录 rescan_note_injected，第 3 次无新信号。
     for (iter, cmd) in [
         (1, format!("tail -c +1 {target} | head -c 2400")),
         (2, format!("cat {target}")),
@@ -1909,11 +1949,13 @@ fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
         supervisor.iteration = iter;
         pb_execute_command_round(&mut messages, &cmd, &format!("r{iter}"));
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
-        if iter == 3 {
+        if iter == 2 {
             assert!(
                 matches!(signal, ToolLoopSignal::TargetRescan(..)),
-                "episode1 round r3 should soft-signal"
+                "episode1 round r2 should soft-signal (soft threshold=2)"
             );
+        } else if iter == 3 {
+            assert_eq!(signal, ToolLoopSignal::None, "episode1 round r3: soft injected once");
         } else {
             assert_eq!(signal, ToolLoopSignal::None, "episode1 round r{iter}");
         }
@@ -1927,23 +1969,23 @@ fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
         ToolLoopSignal::None,
         "decay round r12"
     );
-    // Episode 2：第 2 次不触发，第 3 次必须再次软提示——本段自己的预警，
-    // 不能因为上一段已提示过就跳过 soft 直接硬停。
+    // Episode 2：第 2 次再次软提示——本段自己的预警，
+    // 不能因为上一段已提示过就跳过 soft 直接硬停；第 3 次无新信号。
     supervisor.iteration = 13;
     pb_execute_command_round(&mut messages, &format!("head -n 200 {target}"), "r13");
-    assert_eq!(
-        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
-        ToolLoopSignal::None,
-        "episode2 round r13"
-    );
-    supervisor.iteration = 14;
-    pb_execute_command_round(&mut messages, &format!("less {target}"), "r14");
     assert!(
         matches!(
             supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
             ToolLoopSignal::TargetRescan(..)
         ),
-        "episode2 round r14 should get its own soft warning"
+        "episode2 round r13 should get its own soft warning"
+    );
+    supervisor.iteration = 14;
+    pb_execute_command_round(&mut messages, &format!("less {target}"), "r14");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None,
+        "episode2 round r14: soft already injected this episode"
     );
 }
 
@@ -1958,11 +2000,15 @@ fn target_rescan_resets_on_other_file_mutation() {
     for (offset, id) in [(0usize, "r1"), (1usize, "r2")] {
         supervisor.iteration = id.trim_start_matches('r').parse().unwrap();
         pb_successful_read_round(&mut messages, target, offset, id, "line:0");
-        assert_eq!(
-            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
-            ToolLoopSignal::None,
-            "round {id}"
-        );
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        if id == "r1" {
+            assert_eq!(signal, ToolLoopSignal::None, "round {id}");
+        } else {
+            assert!(
+                matches!(signal, ToolLoopSignal::TargetRescan(..)),
+                "round {id}: 第 2 次从头读软提示"
+            );
+        }
     }
     // 第 3 轮：编辑其他文件 B → 整表清空 A 的计数。
     supervisor.iteration = 4;
@@ -1975,7 +2021,7 @@ fn target_rescan_resets_on_other_file_mutation() {
         "edit-other-file round must not signal"
     );
     // 编辑后从头重读 A 重新从 1 计：cat / offset=0 / offset=1 三种互异签名。
-    // 第 2 次不触发，第 3 次才软提示。
+    // 第 2 次软提示，第 3 次无新信号（软提示已注入）。
     supervisor.iteration = 5;
     pb_execute_command_round(&mut messages, &format!("cat {target}"), "c5");
     assert_eq!(
@@ -1985,19 +2031,19 @@ fn target_rescan_resets_on_other_file_mutation() {
     );
     supervisor.iteration = 6;
     pb_successful_read_round(&mut messages, target, 0, "r6", "line:0");
-    assert_eq!(
-        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
-        ToolLoopSignal::None,
-        "round r6"
-    );
-    supervisor.iteration = 7;
-    pb_successful_read_round(&mut messages, target, 1, "r7", "line:0");
     assert!(
         matches!(
             supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
             ToolLoopSignal::TargetRescan(..)
         ),
-        "round r7 should soft-signal"
+        "round r6 should soft-signal (编辑后第 2 次从头读)"
+    );
+    supervisor.iteration = 7;
+    pb_successful_read_round(&mut messages, target, 1, "r7", "line:0");
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None,
+        "round r7: soft already injected this episode"
     );
 }
 

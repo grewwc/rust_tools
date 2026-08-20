@@ -523,6 +523,13 @@ pub(crate) fn current_subagent_depth() -> usize {
     SUBAGENT_DEPTH.try_with(|d| *d).unwrap_or(0)
 }
 
+/// Read the current sub-agent task id when inside a sub-agent dispatch.
+/// Returns None on foreground turns. Exposed for `side_note::current_target_id`
+/// so file-queue routing can distinguish foreground vs per-task queues.
+pub(crate) fn try_subagent_task_id() -> Option<String> {
+    SUBAGENT_TASK_ID.try_with(|id| id.clone()).ok()
+}
+
 /// Read the optional sub-agent memory path override. `None` means
 /// "fall back to persona memory file / shared memory file".
 pub(crate) fn override_memory_path() -> Option<PathBuf> {

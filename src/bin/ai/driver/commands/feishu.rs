@@ -83,7 +83,7 @@ pub fn try_handle_feishu_auth_command(
         } else {
             "xdg-open"
         };
-        let _ = Command::new(program).arg(&url).status();
+        let _ = crate::fork_guard::status(Command::new(program).arg(&url));
     }
 
     println!("等待授权回调（{redirect_uri}）...");

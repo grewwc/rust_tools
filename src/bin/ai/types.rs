@@ -15,7 +15,14 @@ use serde_json::Value;
 
 use aios_kernel::kernel::SharedKernel;
 
-use super::{agents::AgentManifest, cli::ParsedCli, persona::PersonaProfile, prompt::PromptEditor};
+use super::{
+    agents::AgentManifest,
+    cli::ParsedCli,
+    pipeline::HookRegistry,
+    middleware::{RequestMiddleware, ToolMiddleware},
+    persona::PersonaProfile,
+    prompt::PromptEditor,
+};
 
 /// Configuration for the AI application, including API credentials,
 /// endpoint, model settings, and conversation history parameters.
@@ -64,6 +71,12 @@ impl Clone for App {
             os: self.os.clone(),
             agent_reload_counter: self.agent_reload_counter,
             observers: Vec::new(),
+            // 与 `observers` 一致：进程级工具中间件策略不随 clone 传播（子代理/后台各自独立）。
+            tool_middlewares: Vec::new(),
+            // 与 `tool_middlewares` 一致：进程级 LLM 请求中间件策略不随 clone 传播。
+            llm_middlewares: Vec::new(),
+            // 与 `observers`/`tool_middlewares` 一致：进程级 hook 注册表不随 clone 传播。
+            hooks: HookRegistry::new(),
             last_known_prompt_tokens: self.last_known_prompt_tokens,
             last_known_cached_prompt_tokens: self.last_known_cached_prompt_tokens,
             goal_mode: self.goal_mode.clone(),
@@ -116,6 +129,16 @@ pub(super) struct App {
     pub(super) os: SharedKernel,
     pub(super) agent_reload_counter: Option<usize>,
     pub(super) observers: Vec<Box<dyn crate::ai::driver::observer::TurnObserver>>,
+    /// 工具执行中间件链（Step 5：按轮构建 `build_tool_executor_chain`，空链 = 零行为变化）。
+    /// 用 `Arc` 共享：`dyn` 中间件不可 Clone，Arc 引用计数可在每轮建链时安全复制。
+    pub(super) tool_middlewares: Vec<Arc<dyn ToolMiddleware>>,
+    /// 进程级 LLM 请求中间件链（与 `tool_middlewares` 一致：`request_model_response`
+    /// 每次请求经 `build_llm_client_chain` 建链；空链 = 零行为变化）。
+    /// 用 `Arc` 共享：与 `tool_middlewares` 同理，可在每次请求建链时安全复制。
+    pub(super) llm_middlewares: Vec<Arc<dyn RequestMiddleware>>,
+    /// 进程级 hook 注册表（Step 3：driver turn 生命周期钩子）。
+    /// 空注册表 = 零行为变化；turn 起点/终点在 `run_turn` 触发。
+    pub(super) hooks: HookRegistry,
     /// 上一次请求服务端返回的实际 prompt_tokens（来自 usage 统计）。
     /// 用于在下一次请求的 max_tokens clamp 中替代字符估算，提高精度。
     pub(super) last_known_prompt_tokens: Option<u64>,

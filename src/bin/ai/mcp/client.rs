@@ -148,7 +148,7 @@ pub(in crate::ai) type SharedMcpClient = Arc<std::sync::Mutex<McpClient>>;
 type ServerId = String;
 
 pub(in crate::ai) struct McpClient {
-    pub(in crate::ai) servers: SkipMap<ServerId, Mutex<McpServerConnection>>,
+    pub(in crate::ai) servers: SkipMap<ServerId, Arc<Mutex<McpServerConnection>>>,
     next_id: AtomicU64,
     // 用 Arc 共享：`routing_snapshot` 每轮被 orchestrator 调用，
     // 深克隆整个工具/资源/提示缓存代价高（工具 schema 越大越明显）；
@@ -211,8 +211,7 @@ impl McpClient {
             cmd.env(key, value);
         }
 
-        let mut process = cmd
-            .spawn()
+        let mut process = crate::fork_guard::spawn(&mut cmd)
             .map_err(|e| format!("Failed to start MCP server '{}': {}", name, e))?;
 
         let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
@@ -244,7 +243,7 @@ impl McpClient {
         conn.resources = self.list_resources(&mut conn)?;
         conn.prompts = self.list_prompts(&mut conn)?;
 
-        self.servers.insert(name.to_string(), Mutex::new(conn));
+        self.servers.insert(name.to_string(), Arc::new(Mutex::new(conn)));
         self.rebuild_metadata_cache();
         Ok(())
     }
@@ -299,8 +298,7 @@ impl McpClient {
             cmd.env(key, value);
         }
 
-        let mut process = cmd
-            .spawn()
+        let mut process = crate::fork_guard::spawn(&mut cmd)
             .map_err(|e| format!("Failed to restart MCP server: {}", e))?;
         let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
         let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
@@ -657,8 +655,127 @@ impl McpClient {
         // unreachable
     }
 
+    /// 共享客户端的工具调用入口：不在持有 `SharedMcpClient` 外锁期间执行阻塞 IO。
+    /// 旧的 `McpClient::call_tool(&self, ...)` 要求调用方已持有外锁（`guard.call_tool`），
+    /// 会导致外锁在 `writeln` / `read_response_line_with_timeout` / `restart_connection`
+    /// 期间一直被占用，阻塞其他 server 的 `tool_definitions` / `is_available`。
+    /// 此方法改为：短暂持有外锁仅做 `servers` 查找与 `next_id` 分配，随后释放外锁，
+    /// 仅持有 per-server 的 `Mutex<McpServerConnection>` 执行 IO；`restart` 时遵循
+    /// `外锁 -> 内锁` 顺序（先释放内锁再重新获取），避免 `内锁 -> 外锁` 死锁。
+    pub(in crate::ai) fn call_tool_on_shared(
+        shared: &SharedMcpClient,
+        server_name: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<String, String> {
+        let conn_arc = {
+            let guard = shared
+                .lock()
+                .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+            guard
+                .servers
+                .get_str_ref(server_name)
+                .cloned()
+                .ok_or_else(|| format!("Server not found: {}", server_name))?
+        };
+        let fetch_next_id = |shared: &SharedMcpClient| -> Result<u64, String> {
+            let guard = shared
+                .lock()
+                .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+            Ok(guard.next_id.fetch_add(1, Ordering::Relaxed))
+        };
+        let id1 = fetch_next_id(shared)?;
+        let params1 = json!({ "name": tool_name, "arguments": arguments.clone() });
+        let first = {
+            let mut conn = conn_arc
+                .lock()
+                .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+            Self::send_request_to_conn(&mut *conn, id1, "tools/call", Some(params1))
+        };
+        match first {
+            Ok(result) => {
+                let content = result["content"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|c| c["text"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return Ok(content);
+            }
+            Err(err) if Self::is_user_interrupt_error(&err) => {
+                let restart_res = {
+                    let guard = shared
+                        .lock()
+                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                    let mut conn = conn_arc
+                        .lock()
+                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                    guard.restart_connection(&mut *conn)
+                };
+                return match restart_res {
+                    Ok(()) => Err(format!(
+                        "MCP tool call canceled by user (Ctrl+C): {}",
+                        tool_name
+                    )),
+                    Err(restart_err) => Err(format!(
+                        "MCP tool call canceled by user (Ctrl+C): {} | restart failed: {}",
+                        tool_name, restart_err
+                    )),
+                };
+            }
+            Err(err) if Self::is_transport_error(&err) || Self::is_protocol_desync_error(&err) => {
+                let restart_res = {
+                    let guard = shared
+                        .lock()
+                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                    let mut conn = conn_arc
+                        .lock()
+                        .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                    guard.restart_connection(&mut *conn)
+                };
+                match restart_res {
+                    Ok(()) => {
+                        let id2 = fetch_next_id(shared)?;
+                        let params2 = json!({ "name": tool_name, "arguments": arguments });
+                        let mut conn2 = conn_arc
+                            .lock()
+                            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                        let result =
+                            Self::send_request_to_conn(&mut *conn2, id2, "tools/call", Some(params2))?;
+                        let content = result["content"]
+                            .as_array()
+                            .and_then(|arr| arr.first())
+                            .and_then(|c| c["text"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        return Ok(content);
+                    }
+                    Err(restart_err) => {
+                        let kind = if Self::is_protocol_desync_error(&err) {
+                            "Protocol desync"
+                        } else {
+                            "Transport error"
+                        };
+                        return Err(format!(
+                            "{}: {} | restart failed: {}",
+                            kind, err, restart_err
+                        ));
+                    }
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
     pub(in crate::ai) fn get_all_tools(&self) -> Vec<ToolDefinition> {
         self.cached_tool_definitions.as_ref().clone()
+    }
+
+    /// 返回缓存的工具定义的 `Arc` 快照，避免在持有 `SharedMcpClient` 外锁期间
+    /// 克隆整个 `Vec<ToolDefinition>`（O(n)），来降低 `tool_definitions` 对
+    /// 外锁的持有时长，缓解与 `call_tool` 阻塞 IO 的锁争用。
+    pub(in crate::ai) fn cached_tool_definitions_arc(&self) -> Arc<Vec<ToolDefinition>> {
+        Arc::clone(&self.cached_tool_definitions)
     }
 
     pub(in crate::ai) fn parse_tool_name_for_known_server(

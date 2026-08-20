@@ -249,11 +249,10 @@ pub fn compute_file_hash(path: &Path) -> Result<String, String> {
 pub fn get_git_commit(repo_path: &Path) -> Result<String, String> {
     use std::process::Command;
 
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to run git: {}", e))?;
+    let output = crate::fork_guard::output(
+        Command::new("git").args(["rev-parse", "HEAD"]).current_dir(repo_path),
+    )
+    .map_err(|e| format!("Failed to run git: {}", e))?;
 
     if output.status.success() {
         let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -268,20 +267,22 @@ pub fn get_git_status(repo_path: &Path) -> Result<GitStatus, String> {
     use std::process::Command;
 
     // 检查工作树状态
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to run git status: {}", e))?;
+    let output = crate::fork_guard::output(
+        Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(repo_path),
+    )
+    .map_err(|e| format!("Failed to run git status: {}", e))?;
 
     let status_output = String::from_utf8_lossy(&output.stdout);
     let has_uncommitted_changes = !status_output.trim().is_empty();
 
     // 检查是否有未推送的提交
-    let output = Command::new("git")
-        .args(["log", "@{u}..HEAD"])
-        .current_dir(repo_path)
-        .output();
+    let output = crate::fork_guard::output(
+        Command::new("git")
+            .args(["log", "@{u}..HEAD"])
+            .current_dir(repo_path),
+    );
 
     let has_unpushed_commits = output
         .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())

@@ -62,6 +62,10 @@ fn overflow_archive_path(message: &Message) -> Option<PathBuf> {
 }
 
 fn parse_overflow_history(markdown: &str) -> Vec<Message> {
+    if let Some(messages) = parse_lossless_raw_messages(markdown) {
+        return messages;
+    }
+
     let mut messages = Vec::new();
     let mut current_role: Option<&str> = None;
     let mut content_lines = Vec::<&str>::new();
@@ -76,6 +80,62 @@ fn parse_overflow_history(markdown: &str) -> Vec<Message> {
     }
     finish_message(&mut messages, current_role, &mut content_lines);
     messages
+}
+
+/// 优先读取归档里随展示文本一同保存的原始 `Message` JSON。
+///
+/// Markdown 正文只是给人和搜索工具看的投影；仅靠标题反解析会丢失
+/// `tool_call_id` / `tool_calls` / `model` 等元数据，也会被正文中的同名标题干扰。
+/// 若发现原始 JSON 但任一块损坏，则整体退回旧版 Markdown 解析，避免静默只恢复
+/// 一部分消息。
+fn parse_lossless_raw_messages(markdown: &str) -> Option<Vec<Message>> {
+    const REMOVED_MESSAGES_BATCH: &str = "## 移出消息原文";
+    const TRUNCATED_FIELD_BATCH: &str = "## 截断字段原文";
+    const RAW_MARKER: &str = "raw_message_json:";
+
+    let mut messages = Vec::new();
+    let mut in_removed_messages_batch = false;
+    let mut saw_raw_marker = false;
+    let mut lines = markdown.lines();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed == REMOVED_MESSAGES_BATCH {
+            in_removed_messages_batch = true;
+            continue;
+        }
+        if trimmed == TRUNCATED_FIELD_BATCH || trimmed.starts_with("# Overflow History Archive") {
+            in_removed_messages_batch = false;
+            continue;
+        }
+        if !in_removed_messages_batch || trimmed != RAW_MARKER {
+            continue;
+        }
+
+        saw_raw_marker = true;
+        if lines.next().map(str::trim) != Some("```json") {
+            return None;
+        }
+        let mut json = String::new();
+        let mut closed = false;
+        for json_line in lines.by_ref() {
+            if json_line.trim() == "```" {
+                closed = true;
+                break;
+            }
+            json.push_str(json_line);
+            json.push('\n');
+        }
+        if !closed {
+            return None;
+        }
+        let Ok(message) = serde_json::from_str::<Message>(json.trim_end()) else {
+            return None;
+        };
+        messages.push(message);
+    }
+
+    saw_raw_marker.then_some(messages)
 }
 
 fn overflow_heading_role(line: &str) -> Option<&'static str> {
@@ -160,5 +220,57 @@ mod tests {
             messages[0].content.as_str(),
             Some("question\n\n### Details\n\nstill user content")
         );
+    }
+
+    #[test]
+    fn lossless_raw_json_restores_tool_metadata_and_heading_content() {
+        let raw = serde_json::json!({
+            "role": "tool",
+            "content": "before\n## 用户\nafter",
+            "tool_calls": null,
+            "tool_call_id": "call-42",
+            "reasoning_content": "verified provenance"
+        });
+        let markdown = format!(
+            "# Overflow History Archive\n\n## 移出消息原文\n\n## 工具结果\n\nbefore\n## 用户\nafter\n\nraw_message_json:\n```json\n{raw}\n```\n"
+        );
+
+        let messages = parse_overflow_history(&markdown);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "tool");
+        assert_eq!(messages[0].content.as_str(), Some("before\n## 用户\nafter"));
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call-42"));
+        assert_eq!(
+            messages[0].reasoning_content.as_deref(),
+            Some("verified provenance")
+        );
+    }
+
+    #[test]
+    fn lossless_raw_json_restores_multiple_messages_in_one_batch() {
+        let user = serde_json::json!({
+            "role": "user",
+            "content": "first",
+            "tool_calls": null,
+            "tool_call_id": null,
+            "reasoning_content": null
+        });
+        let assistant = serde_json::json!({
+            "role": "assistant",
+            "content": "before\n## 用户\nafter",
+            "tool_calls": null,
+            "tool_call_id": null,
+            "reasoning_content": null
+        });
+        let markdown = format!(
+            "# Overflow History Archive\n\n## 移出消息原文\n\n## 用户\n\nfirst\n\nraw_message_json:\n```json\n{user}\n```\n\n## 助手\n\nbefore\n## 用户\nafter\n\nraw_message_json:\n```json\n{assistant}\n```\n"
+        );
+
+        let messages = parse_overflow_history(&markdown);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content.as_str(), Some("first"));
+        assert_eq!(messages[1].content.as_str(), Some("before\n## 用户\nafter"));
     }
 }

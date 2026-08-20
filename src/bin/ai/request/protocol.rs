@@ -38,8 +38,11 @@ impl RequestProtocolDialect {
 pub(crate) fn build_http_body_for_request(
     model: &str,
     endpoint: &str,
-    request: &RequestBody<'_>,
+    request: &mut RequestBody<'_>,
 ) -> Vec<u8> {
+    // Step 4: provider 差异收敛到 Adapter hook —— 所有请求路径序列化前统一触发。
+    crate::ai::provider::adapter_for(models::model_adapter(model), endpoint)
+        .adapt_request(request);
     models::request_protocol_dialect(model, endpoint).build_http_body(request)
 }
 
@@ -90,7 +93,7 @@ pub(crate) fn build_http_body_for_json_messages(
     let (thinking, reasoning_effort, reasoning) =
         resolve_reasoning_wire_controls(model, endpoint, false, reasoning_effort);
     let stream_options = (stream && include_stream_usage).then(|| json!({ "include_usage": true }));
-    let request = RequestBody {
+    let mut request = RequestBody {
         model: models::request_model_name(model),
         messages: &request_messages,
         stream,
@@ -106,7 +109,7 @@ pub(crate) fn build_http_body_for_json_messages(
         reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
         estimated_prompt_tokens: 0,
     };
-    build_http_body_for_request(model, endpoint, &request)
+    build_http_body_for_request(model, endpoint, &mut request)
 }
 
 pub(crate) fn extract_response_text(v: &Value) -> Option<String> {

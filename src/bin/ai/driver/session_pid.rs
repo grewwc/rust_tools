@@ -228,11 +228,12 @@ pub(in crate::ai) fn discover_lsof_sessions(
         .map(|p| p.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let output = match std::process::Command::new("lsof")
-        .arg("-p")
-        .arg(&joined)
-        .arg("-Fpcn")
-        .output()
+    let output = match crate::fork_guard::output(
+        std::process::Command::new("lsof")
+            .arg("-p")
+            .arg(&joined)
+            .arg("-Fpcn"),
+    )
     {
         Ok(o) if o.status.success() || !o.stdout.is_empty() => o,
         _ => return Vec::new(),
@@ -286,12 +287,13 @@ pub(in crate::ai) fn tty_map_for_pids(pids: &[i32]) -> FxHashMap<i32, bool> {
         .map(|p| p.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let output = std::process::Command::new("ps")
-        .arg("-o")
-        .arg("pid=,tt=")
-        .arg("-p")
-        .arg(&joined)
-        .output();
+    let output = crate::fork_guard::output(
+        std::process::Command::new("ps")
+            .arg("-o")
+            .arg("pid=,tt=")
+            .arg("-p")
+            .arg(&joined),
+    );
     let Ok(o) = output else {
         return map;
     };
@@ -310,10 +312,9 @@ pub(in crate::ai) fn tty_map_for_pids(pids: &[i32]) -> FxHashMap<i32, bool> {
 /// 列出所有正在运行的 `a` 进程的 PID（通过 `pgrep -x a`，回退 `ps`）。
 pub(in crate::ai) fn list_a_pids() -> Vec<i32> {
     // pgrep -x a：精确匹配进程名为 "a" 的进程
-    let output = std::process::Command::new("pgrep")
-        .arg("-x")
-        .arg("a")
-        .output();
+    let output = crate::fork_guard::output(
+        std::process::Command::new("pgrep").arg("-x").arg("a"),
+    );
     match output {
         Ok(o) => {
             let text = String::from_utf8_lossy(&o.stdout);
@@ -321,10 +322,9 @@ pub(in crate::ai) fn list_a_pids() -> Vec<i32> {
         }
         Err(_) => {
             // pgrep 不可用时，回退到 ps：输出 pid + comm，过滤 comm=="a"
-            let alt = std::process::Command::new("ps")
-                .arg("-eo")
-                .arg("pid=,comm=")
-                .output();
+            let alt = crate::fork_guard::output(
+                std::process::Command::new("ps").arg("-eo").arg("pid=,comm="),
+            );
             match alt {
                 Ok(o) => {
                     let text = String::from_utf8_lossy(&o.stdout);
@@ -421,10 +421,8 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let sid = "shared-session";
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child =
+            crate::fork_guard::spawn(std::process::Command::new("sleep").arg("30")).unwrap();
         let child_pid = i32::try_from(child.id()).unwrap();
         let child_path = dir.join(format!("{sid}.{child_pid}.pid"));
         fs::write(&child_path, child_pid.to_string()).unwrap();

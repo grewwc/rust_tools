@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::ai::tools::command_tools::execute_command_streaming;
 use crate::ai::tools::common::{
     ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
-    ToolRegistration, ToolSpec, ToolStreamingRegistration,
+    ToolRegistration, ToolReplayRegistration, ToolSpec, ToolStreamingRegistration,
 };
 use crate::ai::tools::service::command::execute_command;
 
@@ -34,6 +34,13 @@ inventory::submit!(ToolHistoryPolicyRegistration {
         prune: ToolPrunePolicy::Allow,
         counts_toward_precision_inline_budget: true,
     },
+});
+
+// execute_command 只有在命令可证明只读（白名单程序 / 只读 git 子命令）时才登记为
+// 同轮可复用快照；变更型命令被 read_only_tool_signature 的只读闸门拦截，仍真实执行
+// 并失效既有读快照。
+inventory::submit!(ToolReplayRegistration {
+    name: "execute_command",
 });
 
 inventory::submit!(ToolStreamingRegistration {

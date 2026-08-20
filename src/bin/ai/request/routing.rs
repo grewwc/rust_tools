@@ -119,7 +119,7 @@ Skills:
     ];
 
     let control_model = control_model_for_aux_tasks(app);
-    let request_body = build_request_body(
+        let mut request_body = build_request_body(
         &control_model,
         &messages,
         false,
@@ -136,7 +136,7 @@ Skills:
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
     let http_body =
-        super::protocol::build_http_body_for_request(&control_model, &endpoint, &request_body);
+        super::protocol::build_http_body_for_request(&control_model, &endpoint, &mut request_body);
     // 辅助请求（skill 路由），15 秒超时兜底，理由同上。
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")

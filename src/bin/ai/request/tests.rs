@@ -361,6 +361,7 @@ fn prompt_cache_model_support_rejects_plain_openai_model() {
 fn test_app() -> App {
     App {
         cli: ParsedCli::default(),
+        hooks: Default::default(),
         config: AppConfig {
             api_key: String::new(),
             base_history_file: PathBuf::new(),
@@ -405,6 +406,8 @@ fn test_app() -> App {
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
         stale_patch_targets: Default::default(),
+        tool_middlewares: Vec::new(),
+        llm_middlewares: Vec::new(),
     }
 }
 

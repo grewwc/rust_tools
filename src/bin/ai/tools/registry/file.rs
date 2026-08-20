@@ -1,6 +1,6 @@
 use crate::ai::tools::common::{
     ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
-    ToolRegistration, ToolSpec, ToolStreamingRegistration,
+    ToolRegistration, ToolReplayRegistration, ToolSpec, ToolStreamingRegistration,
 };
 use crate::ai::tools::service::file::{
     execute_read_file, execute_write_file, execute_write_file_streaming,
@@ -26,6 +26,13 @@ inventory::submit!(ToolHistoryPolicyRegistration {
         prune: ToolPrunePolicy::Allow,
         counts_toward_precision_inline_budget: true,
     },
+});
+
+// read_file 是纯读取，同轮内视为稳定快照：只有两次读取之间没有任何可能变更状态的
+// 调用返回时才允许复用，且抑制消息只指向上下文中的原结果、不伪造新数据。路径在
+// read_only_tool_signature 中归一化，`./x` 与 `x` 视为同一读取。
+inventory::submit!(ToolReplayRegistration {
+    name: "read_file",
 });
 
 inventory::submit!(ToolRegistration {

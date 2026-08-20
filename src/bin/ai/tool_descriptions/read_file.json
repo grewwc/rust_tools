@@ -12,6 +12,10 @@
         "type": "integer",
         "description": "1-based starting line (default: 1)."
       },
+      "char_offset": {
+        "type": "integer",
+        "description": "0-based character offset within the first selected line. Use the continuation value returned when a very long line is truncated."
+      },
       "limit": {
         "type": "integer",
         "description": "Number of lines to read (default: 1000). Use a large limit for a broad overview, a small one (e.g. 20-40) for a precise slice. Very large results are capped; a truncation notice gives the offset to continue from."

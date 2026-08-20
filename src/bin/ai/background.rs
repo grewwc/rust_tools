@@ -1,9 +1,11 @@
 //! 后台模式：把 agent 从终端 detach 出来，关闭终端后 agent 仍能继续运行。
 //!
-//! 关键点是 daemonize 必须发生在 tokio runtime 创建之前——
-//! fork 只会拷贝调用线程，多线程 runtime 的其它 worker 线程不会进入子进程，
-//! 在 runtime 启动后再 fork 会导致子进程里的 runtime 残缺、死锁。
-//! 因此本模块的入口是同步函数，由 `ai::entry` 在构建 runtime 之前调用。
+//! 实现方式：不用 libc::fork（fork 会把父进程半初始化的 CF/os_log/objc 状态复制进子进程，
+//! 后台任务一旦触发 getaddrinfo / Foundation 等路径就会 SIGBUS / abort，
+//! 即此前 `-bg` 的 objc_initializeAfterForkError / "child side of fork pre-exec" 崩溃），
+//! 而是用 posix_spawn 重新 exec 一个全新的 `a --daemon-child <session>` 进程作为 daemon
+//!（见 [`spawn_daemon_child`]）。因此本模块的入口是同步函数：父进程只负责拉起子进程
+//! 并重定向标准流；daemon 子进程会在解析 CLI 前调用 `setsid` 创建独立会话，再执行任务。
 
 use std::path::{Path, PathBuf};
 use std::process;
@@ -17,7 +19,11 @@ const BACKGROUND_DIRECTIVE: &str = "\n\n[后台模式提示] 你正在后台模�
 中途遇到问题就继续排查、调用工具解决，而不是请求人工输入或提前结束。\
 完成后把最终结论/产出清晰输出即可。";
 
-/// 后台模式入口（同步）：在创建 tokio runtime 之前完成 daemonize。
+/// 后台模式父进程入口（同步）：在创建 tokio runtime 之前把 daemon 子进程拉起来。
+///
+/// 先在本函数里完成交互式读任务描述（仍持有 TTY），随后用 posix_spawn 重新 exec
+/// 一个全新进程作为 daemon（见 [`spawn_daemon_child`]），然后父进程 `exit(0)`
+/// 让 shell 立刻返回。任务执行体在 [`run_background_child`] 中。
 pub(super) fn run_background(mut cli: ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
     // 生成 session id（同时作为日志文件名）。
     let session_id = cli
@@ -26,8 +32,8 @@ pub(super) fn run_background(mut cli: ParsedCli) -> Result<(), Box<dyn std::erro
         .clone();
 
     // 后台模式：优先使用位置参数作为任务描述；若未提供位置参数，
-    // 则在 daemonize 之前（仍持有 TTY）交互式读取多行输入——
-    // detach 后 stdin 会被重定向到 /dev/null，无法再交互输入。
+    // 则在下发子进程之前（仍持有 TTY）交互式读取多行输入——
+    // 子进程 stdin 会被重定向到 /dev/null，无法再交互输入。
     if cli.args.is_empty() {
         match read_task_interactively(&cli, &session_id)? {
             Some(s) if !s.trim().is_empty() => cli.args = vec![s],
@@ -38,19 +44,32 @@ pub(super) fn run_background(mut cli: ParsedCli) -> Result<(), Box<dyn std::erro
         }
     }
 
-    // 把"不要中途停止"指令拼到用户问题里（next_question 会 join cli.args）。
-    cli.args.push(BACKGROUND_DIRECTIVE.to_string());
-
     let log_path = std::path::PathBuf::from(format!("{session_id}.log"));
 
-    // detach 前先在原终端上提示用户日志位置，方便后续 tail 查看进度。
+    // 下发前先在原终端上提示用户日志位置，方便后续 tail 查看进度。
     eprintln!("[background] session id : {session_id}");
     eprintln!("[background] log file   : {}", log_path.display());
     eprintln!("[background] 正在脱离终端，关闭本终端不会影响 agent 运行。");
 
-    daemonize(&log_path)?;
+    spawn_daemon_child(&cli, &session_id, &log_path)?;
 
-    // ---------- 以下在 daemon 子进程中执行 ----------
+    // 父进程退出，shell 立刻返回。
+    process::exit(0)
+}
+
+/// daemon 子进程入口：由 `ai::entry` 在识别到 `--daemon-child <session_id>` 时调用。
+///
+/// 该进程是全新 exec 出来的，不经过任何 fork，因此不会继承父进程半初始化的
+/// CF/os_log/objc 状态，也就不会触发 `objc_initializeAfterForkError` 或
+/// "child side of fork pre-exec" 这类崩溃。
+pub(super) fn run_background_child(
+    mut cli: ParsedCli,
+    session_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    cli.session = Some(session_id.clone());
+
+    // 把"不要中途停止"指令拼到用户问题里（next_question 会 join cli.args）。
+    cli.args.push(BACKGROUND_DIRECTIVE.to_string());
 
     let pid_path = PathBuf::from(format!("{session_id}.pid"));
     write_pid_file(&pid_path)?;
@@ -66,6 +85,27 @@ pub(super) fn run_background(mut cli: ParsedCli) -> Result<(), Box<dyn std::erro
     let _ = std::fs::remove_file(&pid_path);
 
     result
+}
+
+/// 创建独立 session，脱离启动后台任务的控制终端。
+///
+/// 此函数只由新 exec 的 daemon 子进程在创建 runtime 前调用。不能用
+/// `CommandExt::process_group(0)` 替代：后者只会调用 `setpgid`，并会让子进程
+/// 成为进程组首领，从而使 `setsid` 失败。
+#[cfg(unix)]
+pub(super) fn detach_daemon_session() -> std::io::Result<()> {
+    if unsafe { libc::setsid() } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(super) fn detach_daemon_session() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "daemon child session detach 仅支持 unix",
+    ))
 }
 
 /// 在 daemonize 之前交互式读取后台任务描述。
@@ -156,56 +196,237 @@ fn write_pid_file(pid_path: &Path) -> std::io::Result<()> {
     std::fs::write(pid_path, pid.to_string())
 }
 
-/// 经典 double-fork + setsid 把进程变成 daemon，并把 stdout/stderr 重定向到日志文件，
-/// stdin 重定向到 /dev/null。父进程直接 exit(0)，让 shell 立刻返回。
+/// 把已解析的 `ParsedCli` 序列化为 daemon 子进程的 argv（不含 argv[0]）。
 ///
-/// 该函数只在子进程（daemon）中返回；两个父进程分支都会 `exit(0)`。
+/// 修复原有 `spawn_daemon_child` 直接 `std::env::args_os().skip(1)` 导致的
+/// 「无位置参数 + 交互输入」场景丢失任务描述的 bug：父进程在 `run_background`
+/// 中通过 `read_task_interactively` 把任务写入 `cli.args`，但子进程若仍用
+/// 原始 `env::args` 则收不到该任务，只会执行空 prompt + 后台 directive。
+/// 本函数改以 `cli` 为唯一真实来源重建参数，确保交互读到的任务被传递。
+pub(crate) fn build_daemon_args(cli: &ParsedCli, session_id: &str) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let mut args: Vec<OsString> = Vec::new();
+    // 内部 daemon 标记，`ai::entry` 会剥离它并注入 session_id
+    args.push(OsString::from("--daemon-child"));
+    args.push(OsString::from(session_id));
+
+    if let Some(ref v) = cli.model {
+        args.push(OsString::from("--model"));
+        args.push(OsString::from(v));
+    }
+    if let Some(ref v) = cli.agent {
+        args.push(OsString::from("--agent"));
+        args.push(OsString::from(v));
+    }
+    if cli.clear {
+        args.push(OsString::from("--clear"));
+    }
+    if cli.new_session {
+        args.push(OsString::from("--new-session"));
+    }
+    if cli.resume {
+        args.push(OsString::from("--resume"));
+    }
+    if let Some(ref v) = cli.session {
+        if v != session_id {
+            args.push(OsString::from("--session"));
+            args.push(OsString::from(v));
+        }
+    }
+    if !cli.files.trim().is_empty() {
+        args.push(OsString::from("--files"));
+        args.push(OsString::from(&cli.files));
+    }
+    if cli.list_tools {
+        args.push(OsString::from("--list-tools"));
+    }
+    if cli.list_mcp_tools {
+        args.push(OsString::from("--list-mcp-tools"));
+    }
+    if cli.list_skills {
+        args.push(OsString::from("--list-skills"));
+    }
+    if cli.list_agents {
+        args.push(OsString::from("--list-agents"));
+    }
+    if cli.no_skills {
+        args.push(OsString::from("--no-skills"));
+    }
+    if !cli.mcp_config.trim().is_empty() {
+        args.push(OsString::from("--mcp-config"));
+        args.push(OsString::from(&cli.mcp_config));
+    }
+    if cli.help {
+        args.push(OsString::from("--help"));
+    }
+    if cli.interactive {
+        args.push(OsString::from("--interactive"));
+    }
+    if let Some(ref eff) = cli.reasoning_effort_override {
+        args.push(OsString::from("--reasoning-effort"));
+        match eff {
+            Some(level) => args.push(OsString::from(level.as_str())),
+            None => args.push(OsString::from("off")),
+        }
+    }
+    if cli.note_search {
+        args.push(OsString::from("--note-search"));
+    }
+    if cli.note_flag {
+        args.push(OsString::from("--note"));
+        if let Some(ref v) = cli.note {
+            args.push(OsString::from(v));
+        }
+    }
+    if let Some(ref v) = cli.note_delete {
+        args.push(OsString::from("--note-delete"));
+        args.push(OsString::from(v));
+    }
+    if let Some(ref v) = cli.note_edit {
+        args.push(OsString::from("--note-edit"));
+        args.push(OsString::from(v));
+    }
+    if cli.consolidate_knowledge {
+        args.push(OsString::from("--consolidate-knowledge"));
+    }
+    if cli.generate_completions {
+        args.push(OsString::from("--generate-completions"));
+    }
+    for a in &cli.args {
+        args.push(OsString::from(a));
+    }
+    args
+}
+
+/// 用 posix_spawn 拉一个全新 exec 的 `a --daemon-child <session>` 作为 daemon：
+///
+/// - stdin -> /dev/null，stdout/stderr -> 日志文件（与旧 double-fork 行为一致）；
+/// - daemon 子进程会在解析 CLI 前调用 `setsid`，创建独立 session 并脱离控制终端；
+/// - 走 `fork_guard::spawn`（macOS 上 std `Command` 用 posix_spawn，不做用户态 fork），
+///   不执行 pthread_atfork / CF / objc 的 fork 安全检查，
+///   从根上消除 `-bg` 模式下"fork 后继承损坏的 CF/os_log 状态"这一类崩溃。
+///
+/// 该函数在父进程中返回；父进程随后 `exit(0)`，让 shell 立刻返回。
 #[cfg(unix)]
-fn daemonize(log_path: &Path) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
+fn spawn_daemon_child(cli: &ParsedCli, session_id: &str, log_path: &Path) -> std::io::Result<()> {
+    use std::ffi::OsString;
 
-    // 第一次 fork：父进程退出，子进程不再是进程组首领。
-    match unsafe { libc::fork() } {
-        -1 => return Err(std::io::Error::last_os_error()),
-        0 => {}
-        _ => process::exit(0),
-    }
+    let exe = std::env::current_exe()?;
+    let args: Vec<OsString> = build_daemon_args(cli, session_id);
 
-    // 成为新会话组长，脱离控制终端。
-    if unsafe { libc::setsid() } == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // 第二次 fork：确保 daemon 不会再意外获取控制终端。
-    match unsafe { libc::fork() } {
-        -1 => return Err(std::io::Error::last_os_error()),
-        0 => {}
-        _ => process::exit(0),
-    }
-
-    // 重定向标准流：stdin <- /dev/null，stdout/stderr -> 日志文件。
     let dev_null = std::fs::OpenOptions::new().read(true).open("/dev/null")?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)?;
 
-    unsafe {
-        libc::dup2(dev_null.as_raw_fd(), 0);
-        libc::dup2(log.as_raw_fd(), 1);
-        libc::dup2(log.as_raw_fd(), 2);
-    }
-    // dup2 之后 fd 0/1/2 已指向目标，可以关闭原始句柄。
-    drop(dev_null);
-    drop(log);
-
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&args)
+        .stdin(dev_null)
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    crate::fork_guard::spawn(&mut cmd)?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn daemonize(_log_path: &Path) -> std::io::Result<()> {
+fn spawn_daemon_child(_cli: &ParsedCli, _session_id: &str, _log_path: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "background mode (-bg) 仅支持 unix（double-fork daemonize）",
+        "background mode (-bg) 仅支持 unix（posix_spawn daemonize）",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::cli::parse_cli_args;
+
+    #[test]
+    fn daemon_args_contains_interactively_entered_task() {
+        // 回归：a -bg 无位置参数时，父进程在 read_task_interactively 中把任务写入 cli.args，
+        // 子进程必须通过 ParsedCli 重新序列化收到同一任务，而不是用原始 env::args。
+        let mut cli = parse_cli_args(["a".to_string(), "-bg".to_string()].into_iter());
+        assert!(cli.args.is_empty());
+        assert!(cli.background);
+        // 模拟交互输入
+        let interactive_task = "请帮我重构 auth 模块并补充单测".to_string();
+        cli.args = vec![interactive_task.clone()];
+        // run_background 会先生成 session_id 并写入 cli.session
+        let session_id = "test-session-123".to_string();
+        cli.session = Some(session_id.clone());
+
+        let args = build_daemon_args(&cli, &session_id);
+        // 必须包含 --daemon-child <session> 前缀
+        assert_eq!(args[0].to_string_lossy(), "--daemon-child");
+        assert_eq!(args[1].to_string_lossy(), session_id);
+        // 必须包含交互输入的任务（作为位置参数在末尾）
+        let args_str: Vec<String> = args.iter().map(|s| s.to_string_lossy().to_string()).collect();
+        assert!(
+            args_str.contains(&interactive_task),
+            "daemon args 应包含交互输入的任务，实际 args={args_str:?}"
+        );
+        // 不应包含重复的 --background（子进程已是 daemon）
+        assert!(
+            !args_str.iter().any(|s| s == "--background" || s == "-bg"),
+            "daemon args 不应包含 --background/-bg，实际 args={args_str:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_args_preserves_cli_flags_and_positional() {
+        let cli = parse_cli_args(
+            [
+                "a".to_string(),
+                "--model".to_string(),
+                "gpt-test".to_string(),
+                "--files".to_string(),
+                "a.txt,b.txt".to_string(),
+                "-bg".to_string(),
+                "fix the bug".to_string(),
+            ]
+            .into_iter(),
+        );
+        let session_id = "sess-xyz".to_string();
+        let mut cli = cli;
+        cli.session = Some(session_id.clone());
+        let args = build_daemon_args(&cli, &session_id);
+        let args_str: Vec<String> = args.iter().map(|s| s.to_string_lossy().to_string()).collect();
+        assert!(args_str.contains(&"--model".to_string()));
+        assert!(args_str.contains(&"gpt-test".to_string()));
+        assert!(args_str.contains(&"--files".to_string()));
+        assert!(args_str.contains(&"a.txt,b.txt".to_string()));
+        assert!(args_str.contains(&"fix the bug".to_string()));
+    }
+
+    #[test]
+    fn daemon_args_roundtrip_via_parse() {
+        // 确保序列化后的 args 能被 parse_cli_args 正确还原
+        let mut cli = parse_cli_args(
+            [
+                "a".to_string(),
+                "--model".to_string(),
+                "my-model".to_string(),
+                "--reasoning-effort".to_string(),
+                "high".to_string(),
+                "-bg".to_string(),
+                "do something important".to_string(),
+            ]
+            .into_iter(),
+        );
+        let session_id = "roundtrip-sess".to_string();
+        cli.session = Some(session_id.clone());
+        let daemon_args = build_daemon_args(&cli, &session_id);
+        // 去掉前两项 --daemon-child <session>，剩余部分模拟子进程在 ai::entry 剥离后的 argv
+        let child_argv: Vec<String> = std::iter::once("a".to_string())
+            .chain(daemon_args.iter().skip(2).map(|s| s.to_string_lossy().to_string()))
+            .collect();
+        let reparsed = parse_cli_args(child_argv.into_iter());
+        assert_eq!(reparsed.args, vec!["do something important".to_string()]);
+        assert_eq!(reparsed.model.as_deref(), Some("my-model"));
+        assert_eq!(
+            reparsed.reasoning_effort_override,
+            Some(Some(crate::ai::provider::ReasoningEffort::High))
+        );
+    }
 }

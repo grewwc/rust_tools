@@ -354,7 +354,7 @@ fn background_group_alive(_pgid: u32) -> bool {
 /// println!("输出：{}", String::from_utf8_lossy(&output.stdout));
 /// ```
 pub fn run_cmd_output(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Output> {
-    build_command(command, opts)?.output()
+    crate::fork_guard::output(&mut build_command(command, opts)?)
 }
 
 /// 执行命令并带超时控制
@@ -735,7 +735,7 @@ where
             cmd.stderr(Stdio::from(slave));
             configure_child_process_group_with_controlling_terminal(&mut cmd);
 
-            let child = cmd.spawn()?;
+            let child = crate::fork_guard::spawn(&mut cmd)?;
             let (tx, rx) = mpsc::channel::<(StreamKind, Vec<u8>)>();
             // PTY 将 stdout/stderr 合并到同一个 master；用 stdout 槽保存，保持上层
             // "合并输出" 的既有结果语义。
@@ -755,7 +755,7 @@ where
         cmd.stderr(Stdio::piped());
         configure_child_process_group(&mut cmd);
 
-        let mut child = cmd.spawn()?;
+        let mut child = crate::fork_guard::spawn(&mut cmd)?;
         let stdout = child
             .stdout
             .take()

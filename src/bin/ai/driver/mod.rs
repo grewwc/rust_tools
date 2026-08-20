@@ -51,6 +51,7 @@ pub mod commands;
 pub mod decision_log;
 pub mod embedding;
 pub mod hooks;
+pub mod hook_registry;
 pub mod input;
 pub mod mcp_init;
 mod mcp_lifecycle;
@@ -64,6 +65,7 @@ pub mod runtime_ctx;
 mod scheduler;
 mod session;
 pub mod session_pid;
+pub mod side_note;
 pub mod signal;
 pub mod skill_runtime;
 mod skill_watcher;
@@ -501,6 +503,9 @@ pub(in crate::ai) async fn run_with_cli(
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
         stale_patch_targets: Default::default(),
+        tool_middlewares: Vec::new(),
+        llm_middlewares: Vec::new(),
+        hooks: Default::default(),
     };
     commands::session::restore_session_local_runtime_state(&mut app)?;
     if let Some(notice) = startup_notice {

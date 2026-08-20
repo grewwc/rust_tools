@@ -21,15 +21,30 @@ static SIGINT_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Ctrl+C，若只看全局 shutdown/streaming 标志会直接把整个主 agent 关掉
 /// （子 agent 还卡在静默的 prepare 阶段、streaming=false，于是走 Shutdown 分支）。
 ///
-/// 注册表让 SIGINT 先定向取消“最近一个前台子 agent”：第一次 Ctrl+C 只翻该子
+/// 注册表让 SIGINT 先定向取消"最近一个前台子 agent"：第一次 Ctrl+C 只翻该子
 /// agent 自己的 cancel 标志（绝不碰全局 shutdown），父 turn 拿到子 agent 的取消
-/// 错误后继续存活；若子 agent 卡死、再次按 Ctrl+C 才落回正常的 shutdown/exit。
+/// 错误后继续存活；若子 agent 卡死（已请求取消仍留在栈里）、再次按 Ctrl+C 则直接
+/// 锁无关强制退出——软取消已证明无效，且前台 turn 活动标志会把 sigint_action
+/// 永久锁在 CancelStream 上（见 probe_foreground_subagent）。
 ///
 /// 用栈支持嵌套子 agent：定向取消总是作用于栈顶（最深、最新派发）的那个。
 struct ForegroundSubagent {
     id: u64,
+    /// 子 agent 私有的 cancel 标志，翻位后由进程级中断通知唤醒其等待路径。
     cancel: Arc<AtomicBool>,
+    /// 是否已请求过取消（用于把"二次 Ctrl+C"识别为卡死升级）。
     cancel_requested: bool,
+}
+
+/// 一次 SIGINT 对前台子 agent 的探测结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForegroundSubagentProbe {
+    /// 没有可定向的子 agent（栈空），本次中断未被消费，走正常 sigint_action。
+    None,
+    /// 已定向取消栈顶子 agent（翻了其 cancel 标志并发通知），本次中断被消费。
+    Cancelled,
+    /// 栈顶子 agent 此前已被请求取消却仍未退出 → 卡死，软取消已无效，应强制退出。
+    Stuck,
 }
 
 static FOREGROUND_SUBAGENTS: LazyLock<Mutex<Vec<ForegroundSubagent>>> =
@@ -97,22 +112,24 @@ impl Drop for ForegroundSubagentGuard {
     }
 }
 
-/// 尝试把一次 SIGINT 定向到栈顶前台子 agent。
+/// 探测一次 SIGINT 应如何作用于栈顶前台子 agent，并可能定向取消它。
 ///
-/// 返回 `true` 表示“已消费”：翻了子 agent 的 cancel 标志、发了中断通知，调用方
-/// 不应再走全局 shutdown/exit。返回 `false` 表示没有可定向的子 agent（栈空），
-/// 或栈顶子 agent 此前已被请求取消却仍未退出（判定为卡死，应升级到全局 shutdown）。
-fn try_cancel_foreground_subagent() -> bool {
+/// 见 [`ForegroundSubagentProbe`] 的三个变体的语义。其中 `Stuck` 是此前
+/// `try_cancel_foreground_subagent() -> bool` 用 `false` 糊在一起的两种情况之一
+/// （栈空 / 卡死），调用方必须区分：栈空走正常 sigint_action，卡死则直接强制退出，
+/// 否则会被 `foreground_turn_active()==true` 永久锁在 CancelStream 上。
+fn probe_foreground_subagent() -> ForegroundSubagentProbe {
     let cancel_flag = {
         let Ok(mut stack) = FOREGROUND_SUBAGENTS.lock() else {
-            return false;
+            return ForegroundSubagentProbe::None;
         };
         let Some(top) = stack.last_mut() else {
-            return false;
+            return ForegroundSubagentProbe::None;
         };
         if top.cancel_requested {
-            // 已请求过取消但子 agent 还在栈里 → 视为卡死，升级到全局 shutdown。
-            return false;
+            // 已请求过取消但子 agent 还在栈里 → 卡死。软取消已证明无效（若有效，
+            // 该 guard 早已随 execute_sync_task 返回而 drop），必须升级到强制退出。
+            return ForegroundSubagentProbe::Stuck;
         }
         top.cancel_requested = true;
         top.cancel.clone()
@@ -124,7 +141,27 @@ fn try_cancel_foreground_subagent() -> bool {
     // 的 cancel_flag 形参在被唤醒后重新检查其私有 cancel_stream。
     notify_request_interrupt_waiters();
     let _ = crate::ai::tools::registry::common::try_request_tool_cancel();
-    true
+    ForegroundSubagentProbe::Cancelled
+}
+
+/// 锁无关的强制退出兜底：用于用户已明确多次 Ctrl+C（Exit 分支）或前台子 agent
+/// 卡死（Stuck 升级）的路径。绝不在此路径调用任何会锁 kernel 的函数
+/// （request_tool_cancel / request_shutdown 都会拿锁）——若某个后台任务正持有
+/// kernel 锁，这里会阻塞，导致 process::exit 永远执行不到，表现为"Ctrl+C 关不掉"。
+/// 先关闭 stdin 以便阻塞在 read 上的输入线程返回。
+#[inline]
+#[cfg_attr(not(test), allow(unused_variables))] // shutdown 仅测试分支使用，非 test 构建避免 unused 告警
+fn force_exit_after_sigint(shutdown: &AtomicBool) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::close(libc::STDIN_FILENO);
+    }
+    #[cfg(not(test))]
+    std::process::exit(130);
+    #[cfg(test)]
+    {
+        shutdown.store(true, Ordering::Relaxed);
+    }
 }
 
 pub(in crate::ai) fn request_interrupt_notify() -> &'static Notify {
@@ -145,9 +182,22 @@ pub(in crate::ai) fn handle_sigint(
 ) {
     // 若已请求过 shutdown，用户的二次 Ctrl+C 是明确的退出诉求：必须优先、无条件
     // 退出，绝不能被“定向取消子 agent”拦截（否则关不掉）。其余情况下先尝试把这次
-    // 中断定向给前台子 agent（见 try_cancel_foreground_subagent 的语义）。
-    if !shutdown.load(Ordering::Relaxed) && try_cancel_foreground_subagent() {
-        return;
+    // 中断定向给前台子 agent（见 probe_foreground_subagent 的语义）。
+    if !shutdown.load(Ordering::Relaxed) {
+        match probe_foreground_subagent() {
+            ForegroundSubagentProbe::Cancelled => return,
+            ForegroundSubagentProbe::Stuck => {
+                // 栈顶子 agent 已请求取消却仍未退出（卡死）。此时前台 turn 的活动
+                // 标志恒为 true，若照常调用 sigint_action 会永远停在 CancelStream
+                // （只设软标志，主线程早已 park，无人轮询）——这正是"Ctrl+C 关不掉"
+                // 的根因。软取消已证明无效，且运行时可能已楔死（worker 卡锁导致
+                // Notify/定时器无人轮询），shutdown 分支依赖运行时观察同样救不了，
+                // 只能走锁无关的强制退出兜底（见 force_exit_after_sigint）。
+                force_exit_after_sigint(shutdown);
+                return;
+            }
+            ForegroundSubagentProbe::None => {}
+        }
     }
     match sigint_action(shutdown, streaming, cancel_stream, foreground_turn_active()) {
         SigintAction::CancelStream => {
@@ -166,20 +216,7 @@ pub(in crate::ai) fn handle_sigint(
             let _ = crate::ai::tools::registry::common::try_request_tool_cancel();
         }
         SigintAction::Exit => {
-            // 用户已二次 Ctrl+C，明确要求退出：必须无条件、优先退出。
-            // 不能在此之前调用任何会锁 kernel 的函数（request_tool_cancel /
-            // request_shutdown 都会 os.lock()）——若某个后台任务正持有 kernel 锁，
-            // 这里会阻塞，导致 std::process::exit 永远执行不到，表现为"Ctrl+C 关不掉"。
-            #[cfg(unix)]
-            unsafe {
-                let _ = libc::close(libc::STDIN_FILENO);
-            }
-            #[cfg(not(test))]
-            std::process::exit(130);
-            #[cfg(test)]
-            {
-                shutdown.store(true, Ordering::Relaxed);
-            }
+            force_exit_after_sigint(shutdown);
         }
     }
 }
@@ -388,7 +425,7 @@ mod tests {
     use super::{
         ForegroundSubagentGuard, ForegroundTurnGuard, SigintAction, foreground_turn_active,
         request_shutdown, request_sigint_shutdown, sigint_action, take_sigint_shutdown_request,
-        try_cancel_foreground_subagent,
+        handle_sigint, probe_foreground_subagent, ForegroundSubagentProbe,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -499,11 +536,51 @@ mod tests {
         let _registration = ForegroundSubagentGuard::register(cancel.clone());
 
         // 第一次 SIGINT：定向取消子 agent，翻它自己的 cancel 标志、不碰全局 shutdown。
-        assert!(try_cancel_foreground_subagent());
+        assert_eq!(
+            probe_foreground_subagent(),
+            ForegroundSubagentProbe::Cancelled
+        );
         assert!(cancel.load(Ordering::Relaxed));
 
-        // 第二次 SIGINT：子 agent 仍在栈里（卡死）→ 不再消费，升级到全局 shutdown。
-        assert!(!try_cancel_foreground_subagent());
+        // 第二次 SIGINT：子 agent 仍在栈里（卡死）→ 不再消费，判定为卡死。
+        assert_eq!(probe_foreground_subagent(), ForegroundSubagentProbe::Stuck);
+
+        super::clear_request_interrupt();
+    }
+
+    #[test]
+    fn stuck_foreground_subagent_escapes_cancel_stream() {
+        // 回归测试：前台子 agent 卡死（已请求取消仍留在栈里）时，即使前台 turn 活动
+        // 标志为 true（父 turn 阻塞在 execute_sync_task 未返回），二次 Ctrl+C 也必须
+        // 直接退出，而不是落入 sigint_action 的 CancelStream（只设软标志，主线程
+        // park 无人轮询，表现为"Ctrl+C 关不掉"）。
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        super::clear_request_interrupt();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _registration = ForegroundSubagentGuard::register(cancel.clone());
+
+        // 第一次 SIGINT：定向取消子 agent，被消费。
+        assert_eq!(
+            probe_foreground_subagent(),
+            ForegroundSubagentProbe::Cancelled
+        );
+        assert!(cancel.load(Ordering::Relaxed));
+
+        // 模拟父 turn 仍阻塞在 execute_sync_task：抬起前台 turn 活动标志——
+        // 这正是此前把 sigint_action 永久锁在 CancelStream 上的条件。
+        let _turn = ForegroundTurnGuard::enter();
+        let shutdown = AtomicBool::new(false);
+        let streaming = AtomicBool::new(false);
+        let cancel_stream = AtomicBool::new(false);
+
+        // 第二次 SIGINT：卡死 + 前台 turn 活动 → 必须直接强制退出，
+        // 不能被 CancelStream 吞掉（test 模式下 force_exit_after_sigint 置 shutdown）。
+        handle_sigint(&shutdown, &streaming, &cancel_stream);
+        assert!(shutdown.load(Ordering::Relaxed));
+        assert!(!cancel_stream.load(Ordering::Relaxed));
 
         super::clear_request_interrupt();
     }
@@ -514,7 +591,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         // 栈空时不应消费这次中断，调用方据此走正常 shutdown/exit。
-        assert!(!try_cancel_foreground_subagent());
+        assert_eq!(
+            probe_foreground_subagent(),
+            ForegroundSubagentProbe::None
+        );
     }
 
     #[test]
@@ -529,7 +609,10 @@ mod tests {
             let _registration = ForegroundSubagentGuard::register(cancel.clone());
         }
         // guard 已 drop：栈里不再有该条目，定向取消无对象可消费。
-        assert!(!try_cancel_foreground_subagent());
+        assert_eq!(
+            probe_foreground_subagent(),
+            ForegroundSubagentProbe::None
+        );
 
         super::clear_request_interrupt();
     }

@@ -49,6 +49,7 @@ pub mod clipboardw;
 pub mod cmd;
 pub mod commonw;
 pub mod cw;
+pub mod fork_guard;
 pub mod jsonw;
 pub mod pdfw;
 pub mod sortw;

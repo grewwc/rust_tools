@@ -28,7 +28,7 @@ use crate::ai::tools::text_grep_tools::{ContentSearchOptions, run_content_search
 
 /// 归档单文件大小上限：会话可能积累远超普通源文件（2 MiB）的 overflow 文件，
 /// 读入内存逐行匹配即可，不必与普通搜索共用同一上限。
-const OVERFLOW_MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
+const OVERFLOW_MAX_FILE_SIZE: u64 = u64::MAX;
 /// 每个文件最多保留多少条 snippet（与共享引擎的 MAX_MATCHES 一致）。
 const MAX_MATCHES: usize = 200;
 /// 归档内无匹配时引擎的返回串（与 run_content_search 的实现保持一致）。
@@ -105,26 +105,34 @@ fn run_overflow_search(
             assets_dir.join("tool-overflow-compressed"),
             assets_dir.join("folded-tool-groups"),
             assets_dir.join("internal-note-overflow"),
+            assets_dir.join("user-overflow-preserved"),
+            assets_dir.join("image-overflow-preserved"),
         ],
     };
 
+    let roots: Vec<_> = roots.into_iter().filter(|root| root.exists()).collect();
+    if roots.is_empty() {
+        return Ok(format!(
+            "No matches found in the session archive for query: '{}'",
+            params.query
+        ));
+    }
     let mut sections: Vec<String> = Vec::new();
-    // max_results 描述的是"跨所有根的匹配上限"，不是每个根各自的上限。
-    // 把它作为共享剩余额度，每个根消耗后递减，避免 scope=all 时最多返回 ~4 倍。
-    let mut remaining = params.max_results;
-    for root in &roots {
-        if remaining == 0 {
-            break;
-        }
-        if !root.exists() {
-            continue; // 归档尚未生成该文件/目录时静默跳过
+    // 为每个归档根预留份额，避免 overflow-history 的早期高频命中耗尽共享额度，
+    // 令后面的工具组、内部注记或用户/图片保全归档永久不可见。
+    let base_quota = params.max_results / roots.len();
+    let extra = params.max_results % roots.len();
+    for (root_index, root) in roots.iter().enumerate() {
+        let root_quota = base_quota + usize::from(root_index < extra);
+        if root_quota == 0 {
+            continue;
         }
         let options = ContentSearchOptions {
             query: params.query,
             is_regex: params.is_regex,
             case_sensitive: params.case_sensitive,
             context_lines: params.context_lines,
-            max_results: remaining,
+            max_results: root_quota,
             file_pattern: params.file_pattern,
             extensions: None,
             // 展示绝对路径：read_file 按 effective_cwd() 解析相对路径，相对路径
@@ -134,10 +142,7 @@ fn run_overflow_search(
         };
         match run_content_search(root, &options) {
             Ok(out) if out == NO_MATCHES_MARKER => {}
-            Ok(out) => {
-                remaining = remaining.saturating_sub(extract_match_count(&out));
-                sections.push(out);
-            }
+            Ok(out) => sections.push(out),
             Err(e) => return Err(e),
         }
     }
@@ -174,19 +179,6 @@ inventory::submit!(ToolHistoryPolicyRegistration {
         counts_toward_precision_inline_budget: true,
     },
 });
-
-/// 从 run_content_search 的输出首行提取匹配数。
-
-/// 从 run_content_search 的输出首行提取匹配数。
-/// 首行格式固定为 "N match(es) in M file(s)"。
-fn extract_match_count(output: &str) -> usize {
-    output
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().next())
-        .and_then(|n| n.parse::<usize>().ok())
-        .unwrap_or(0)
-}
 
 mod tests {
     use super::*;
@@ -230,6 +222,12 @@ mod tests {
         let note_dir = dir.join("internal-note-overflow");
         fs::create_dir_all(&note_dir).unwrap();
         fs::write(note_dir.join("note.md"), "internal foo state\n").unwrap();
+        let user_dir = dir.join("user-overflow-preserved");
+        fs::create_dir_all(&user_dir).unwrap();
+        fs::write(user_dir.join("user.md"), "preserved foo request\n").unwrap();
+        let image_dir = dir.join("image-overflow-preserved");
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(image_dir.join("image.md"), "preserved foo image context\n").unwrap();
     }
 
     fn params(query: &str) -> OverflowSearchParams<'_> {
@@ -260,6 +258,8 @@ mod tests {
         assert!(out.contains("foo line 1"));
         assert!(out.contains("folded-tool-groups/group.md"), "{out}");
         assert!(out.contains("internal-note-overflow/note.md"), "{out}");
+        assert!(out.contains("user-overflow-preserved/user.md"), "{out}");
+        assert!(out.contains("image-overflow-preserved/image.md"), "{out}");
         fs::remove_dir_all(&dir).ok();
     }
 

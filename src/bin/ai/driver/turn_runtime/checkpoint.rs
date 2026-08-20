@@ -199,7 +199,79 @@ pub(super) fn shell_segment_is_read_only(segment: &str) -> bool {
         }
         return false;
     }
+    // `cargo check/test/build` 等验证命令不改源码：重复运行同一验证命令（相同源码、
+    // 相同结果）不构成实质进展，不应再被 round_has_mutation 计为 Mutation 而刷新
+    // no-progress 预算（f08171fc 循环正是靠反复 `cargo test` 逃逸升级）。
+    if program == "cargo" {
+        let (subcommand, fix_flag, check_flag) = parse_cargo_tokens(tokens);
+        return match subcommand {
+            Some("check" | "test" | "build" | "bench" | "doc" | "metadata" | "tree") => true,
+            // `clippy --fix` 会改写源码 → 非只读；`fmt` 仅 `--check` 时只读。
+            Some("clippy") => !fix_flag,
+            Some("fmt") => check_flag,
+            _ => false,
+        };
+    }
     READ_ONLY_COMMAND_PROGRAMS.contains(&program)
+}
+
+/// 解析 `cargo` 子命令与 `--fix`/`--check` 标志，跳过 `--config`/`--manifest-path`
+/// 等取值选项。返回 `(子命令, 是否 --fix, 是否 --check)`。
+fn parse_cargo_tokens<'a>(
+    tokens: impl Iterator<Item = &'a str>,
+) -> (Option<&'a str>, bool, bool) {
+    let mut subcommand = None;
+    let mut skip_next = false;
+    let mut fix_flag = false;
+    let mut check_flag = false;
+    for token in tokens {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        match token {
+            "-C" | "-c" | "--config" | "--manifest-path" | "--target-dir" | "--lockfile-path" => {
+                skip_next = true;
+            }
+            "--fix" => fix_flag = true,
+            "--check" => check_flag = true,
+            _ if token.starts_with('-') => {}
+            _ if subcommand.is_none() => subcommand = Some(token),
+            _ => {}
+        }
+    }
+    (subcommand, fix_flag, check_flag)
+}
+
+/// cargo 验证类子命令：输出含易变编译进度/时长行，evidence 指纹需归一化。
+/// 集合含 `clippy`/`fmt` 属过包含（`clippy --fix`/裸 `fmt` 不满足只读判定，
+/// 输出根本不会进入 evidence 归一化分支）——过包含因只读门控而无害。
+const CARGO_VERIFY_SUBCOMMANDS: &[&str] = &[
+    "check", "test", "build", "bench", "doc", "metadata", "tree", "clippy", "fmt",
+];
+
+/// 命令（可带 `cd`/`export` 前导段）是否为 cargo 验证类子命令。供 evidence 指纹
+/// 归一化复用与 shell_segment_is_read_only 同一套子命令解析。
+pub(crate) fn command_is_cargo_verify(command: &str) -> bool {
+    for segment in split_shell_segments_for_coarse(command) {
+        if shell_segment_is_nav_or_env(&segment) {
+            continue;
+        }
+        let mut tokens = segment.split_whitespace();
+        let Some(program) = tokens.next() else {
+            continue;
+        };
+        if program.rsplit('/').next().unwrap_or(program) != "cargo" {
+            // 非 cargo 段跳过：`echo hi && cargo check` 这类多段命令只要含任一
+            // cargo 验证段即视为构建校验，必须排除出同轮重放。
+            continue;
+        }
+        let (subcommand, _, _) = parse_cargo_tokens(tokens);
+        if subcommand.is_some_and(|sub| CARGO_VERIFY_SUBCOMMANDS.contains(&sub)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `cd` / `export` 只改变工作目录或环境，不写文件系统，本身无副作用。作为前导段
@@ -215,7 +287,7 @@ pub(super) fn shell_segment_is_nav_or_env(segment: &str) -> bool {
     )
 }
 
-pub(super) fn execute_command_is_read_only(command: &str) -> bool {
+pub(crate) fn execute_command_is_read_only(command: &str) -> bool {
     // 跳过前导 `cd`/`export` 段后，要求**所有**实质段都只读才算只读；任一实质段
     // 可能变更即视为变更（安全方向：避免把真实改动误判为无进展而过早收口）。
     let mut saw_substantive = false;

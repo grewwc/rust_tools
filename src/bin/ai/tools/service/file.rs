@@ -10,6 +10,7 @@ pub(crate) struct RenderedLineExcerpt {
     pub(crate) text: String,
     pub(crate) shown_lines: usize,
     pub(crate) truncated_mid_line: bool,
+    pub(crate) next_char_offset: Option<usize>,
 }
 
 pub(crate) fn render_line_excerpt(
@@ -19,16 +20,30 @@ pub(crate) fn render_line_excerpt(
     max_chars: Option<usize>,
     with_line_numbers: bool,
 ) -> RenderedLineExcerpt {
+    render_line_excerpt_from_char(content, start, end, max_chars, with_line_numbers, 0)
+}
+
+fn render_line_excerpt_from_char(
+    content: &str,
+    start: usize,
+    end: usize,
+    max_chars: Option<usize>,
+    with_line_numbers: bool,
+    first_line_char_offset: usize,
+) -> RenderedLineExcerpt {
     let lines: Vec<&str> = content.lines().collect();
     let mut text = String::new();
     let mut shown_lines = 0usize;
     let mut truncated_mid_line = false;
+    let mut next_char_offset = None;
 
     for (idx, line) in lines[start..end].iter().enumerate() {
+        let line_char_offset = if idx == 0 { first_line_char_offset } else { 0 };
+        let line: String = line.chars().skip(line_char_offset).collect();
         let rendered = if with_line_numbers {
             format!("{:>6}\t{}", start + idx + 1, line)
         } else {
-            line.to_string()
+            line
         };
         if let Some(limit) = max_chars {
             if !text.is_empty() {
@@ -46,6 +61,13 @@ pub(crate) fn render_line_excerpt(
                 text.push_str(&truncate_chars_to_limit(&rendered, remaining));
                 shown_lines += 1;
                 truncated_mid_line = true;
+                let prefix_chars = if with_line_numbers {
+                    format!("{:>6}\t", start + idx + 1).chars().count()
+                } else {
+                    0
+                };
+                next_char_offset =
+                    Some(line_char_offset + remaining.saturating_sub(prefix_chars + 1));
                 break;
             }
         } else if !text.is_empty() {
@@ -60,6 +82,7 @@ pub(crate) fn render_line_excerpt(
         text,
         shown_lines,
         truncated_mid_line,
+        next_char_offset,
     }
 }
 
@@ -192,6 +215,7 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     }
 
     let offset = args["offset"].as_u64().unwrap_or(1) as usize;
+    let char_offset = args["char_offset"].as_u64().unwrap_or(0) as usize;
     let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
     let raw_content = store.read_to_string().map_err(|e| e.to_string())?;
     let content = if should_strip_rendered_line_number_layer(store.path()) {
@@ -220,6 +244,12 @@ to read the last line.]"
     }
     let start = offset.saturating_sub(1);
     let end = (start + limit).min(total);
+    let first_line_chars = lines[start].chars().count();
+    if char_offset > first_line_chars {
+        return Err(format!(
+            "char_offset {char_offset} exceeds line {offset} length ({first_line_chars} chars)"
+        ));
+    }
 
     // 默认带行号（grounding 轴）；use_line_numbers=false 时返回原始内容，
     // 便于把结果直接作为 apply_patch 的精确源文本或其他工具的输入。
@@ -227,12 +257,13 @@ to read the last line.]"
         store.path(),
         args["use_line_numbers"].as_bool().unwrap_or(true),
     );
-    let excerpt = render_line_excerpt(
+    let excerpt = render_line_excerpt_from_char(
         &content,
         start,
         end,
         Some(MAX_READ_FILE_RESULT_CHARS),
         use_line_numbers,
+        char_offset,
     );
     // 用实际渲染行数计算续读锚点：字符上限可能在请求的 `end` 之前就截断，
     // 若沿用 `end` 会让续读 offset 跳过未显示的行（静默丢数据）。
@@ -245,6 +276,7 @@ to read the last line.]"
         total,
         size_capped,
         excerpt.truncated_mid_line,
+        excerpt.next_char_offset,
     );
     Ok(rendered)
 }
@@ -271,6 +303,7 @@ fn append_truncation_notice(
     total: usize,
     size_capped: bool,
     truncated_mid_line: bool,
+    next_char_offset: Option<usize>,
 ) -> String {
     let remaining = total.saturating_sub(shown_end);
     if remaining == 0 && !truncated_mid_line {
@@ -281,17 +314,20 @@ fn append_truncation_notice(
     }
     let continue_offset = shown_end + 1;
     if size_capped {
-        rendered.push_str(&format!(
-            "... [truncated: output capped at {MAX_READ_FILE_RESULT_CHARS} chars; showing lines {}-{} of {}; {} more line(s) not shown. Continue with offset={} to read the rest.]",
-            start + 1,
-            shown_end,
-            total,
-            remaining,
-            continue_offset
-        ));
         if truncated_mid_line {
+            if let Some(next_char_offset) = next_char_offset {
+                rendered.push_str(&format!(
+                    "... [truncated: output capped at {MAX_READ_FILE_RESULT_CHARS} chars; line {shown_end} was truncated mid-line. Continue that same line with offset={shown_end}, char_offset={next_char_offset}, limit=1.]"
+                ));
+            }
+        } else {
             rendered.push_str(&format!(
-                "\n... [note: line {shown_end} was truncated mid-line due to size; the remainder of that line is omitted.]"
+                "... [truncated: output capped at {MAX_READ_FILE_RESULT_CHARS} chars; showing lines {}-{} of {}; {} more line(s) not shown. Continue with offset={} to read the rest.]",
+                start + 1,
+                shown_end,
+                total,
+                remaining,
+                continue_offset
             ));
         }
     } else {
@@ -418,6 +454,42 @@ mod tests {
             assert!(output.contains("Line 2"));
             assert!(output.contains("Line 3"));
         });
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_can_continue_inside_one_very_long_line() {
+        let path = make_temp_path("single_long_line");
+        let content = format!(
+            "{}END_MARKER",
+            "x".repeat(MAX_READ_FILE_RESULT_CHARS + 2_000)
+        );
+        fs::write(&path, content).unwrap();
+
+        let first = execute_read_file(&serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 1
+        }))
+        .unwrap();
+        let marker = "char_offset=";
+        let start = first.find(marker).expect("char continuation present") + marker.len();
+        let next_char_offset: usize = first[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap();
+
+        let second = execute_read_file(&serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "char_offset": next_char_offset,
+            "limit": 1
+        }))
+        .unwrap();
+        assert!(second.contains("END_MARKER"), "{second}");
 
         let _ = fs::remove_file(&path);
     }
@@ -780,8 +852,13 @@ mod tests {
         // 重渲染规则，正反授权边界由 storage::file_store 的回归测试覆盖。
         let snapshot = "   120\talpha\n   121\tbeta\n";
         fs::write(&read_file_snapshot, snapshot).unwrap();
-        assert!(!should_strip_rendered_line_number_layer(&read_file_snapshot));
-        assert!(!should_render_read_file_line_numbers(&read_file_snapshot, true));
+        assert!(!should_strip_rendered_line_number_layer(
+            &read_file_snapshot
+        ));
+        assert!(!should_render_read_file_line_numbers(
+            &read_file_snapshot,
+            true
+        ));
         let rendered = render_line_excerpt(
             &fs::read_to_string(&read_file_snapshot).unwrap(),
             0,

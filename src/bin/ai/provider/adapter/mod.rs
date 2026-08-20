@@ -50,7 +50,9 @@ pub(in crate::ai) const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v
 ///
 /// 默认方法实现「OpenAI 兼容族」的通用行为；Alibaba / Compatible / OpenCode 通过
 /// override 表达自身差异。
-pub(in crate::ai) trait ProviderAdapter: Sync {
+/// 所有 provider 差异通过此 trait 收敛，避免在 `request/*` / `stream/*` 散落 `if provider == ...`。
+/// 新增 provider 差异时优先在此添加 hook，而不是在调用方加分支。
+pub(crate) trait ProviderAdapter: Send + Sync {
     /// 流式解析失败日志使用的标签，也用于诊断。
     fn label(&self) -> &'static str;
 
@@ -75,6 +77,13 @@ pub(in crate::ai) trait ProviderAdapter: Sync {
 
     /// 读取 API key 时的配置键候选链（按优先级）。
     fn api_key_candidates(&self) -> &'static [&'static str];
+
+    /// 统一请求拦截钩子：在请求体序列化前改写 `RequestBody`（provider 特有形态）。
+    /// 默认恒等（零行为变更），各 adapter 可覆写以注入/改写字段。
+    /// 由 `request::protocol::build_http_body_for_request` 对所有请求路径统一触发。
+    fn adapt_request(&self, request: &mut crate::ai::request::RequestBody<'_>) {
+        let _ = request;
+    }
 
     /// 收集该 provider 可用的所有 API key（含轮换候选）。
     /// 默认只返回主 key；覆写以提供多个备选 key（如 OpenCode 的配置 entries）。

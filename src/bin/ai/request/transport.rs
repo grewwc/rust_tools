@@ -230,12 +230,11 @@ async fn request_messages_with_key(
     app: &mut App,
     model: &str,
     api_key: &str,
-    request_body: &RequestBody<'_>,
+    request_body: &mut RequestBody<'_>,
     retry_policy: &RequestRetryPolicy,
     endpoint: &str,
 ) -> Result<Response, RequestError> {
-    let protocol = models::request_protocol_dialect(model, endpoint);
-    let http_body = protocol.build_http_body(request_body);
+    let http_body = super::protocol::build_http_body_for_request(model, endpoint, request_body);
     // 复用 build_request_body 内已算好的字符估算（同一 RequestBody），
     // 避免对同一历史再次全量遍历 + 工具 schema 再次序列化。
     let estimated_prompt_tokens = token_budget::calibrate_prompt_tokens_for_budget(
@@ -468,7 +467,7 @@ async fn do_request_messages_with_tool_mode(
         &normalized_messages,
         &turn_reasoning_items,
     );
-    let request_body = build_request_body(
+    let mut request_body = build_request_body(
         model,
         &normalized_messages,
         stream,
@@ -510,7 +509,7 @@ async fn do_request_messages_with_tool_mode(
                 app,
                 model,
                 api_key,
-                &request_body,
+                &mut request_body,
                 &retry_policy,
                 &endpoint,
             )

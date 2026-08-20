@@ -237,7 +237,7 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     ];
 
     let control_model = control_model_for_aux_tasks(app);
-    let request_body = build_request_body(
+    let mut request_body = build_request_body(
         &control_model,
         &gate_messages,
         false,
@@ -254,7 +254,7 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
     let http_body =
-        super::protocol::build_http_body_for_request(&control_model, &endpoint, &request_body);
+        super::protocol::build_http_body_for_request(&control_model, &endpoint, &mut request_body);
     // 辅助请求（thinking gate），15 秒超时兜底：主 client 无整体 timeout，
     // 仅 connect_timeout 不覆盖“连上但服务端不回响应头”的永久阻塞。
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)

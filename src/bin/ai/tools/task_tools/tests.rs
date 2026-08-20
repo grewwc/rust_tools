@@ -257,6 +257,7 @@ fn task_wait_no_hint_after_newer_spawn() {
 fn test_app_with_model(current_model: String) -> App {
     App {
         cli: ParsedCli::default(),
+        hooks: Default::default(),
         config: AppConfig {
             api_key: String::new(),
             base_history_file: std::path::PathBuf::new(),
@@ -299,6 +300,8 @@ fn test_app_with_model(current_model: String) -> App {
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
         stale_patch_targets: Default::default(),
+        tool_middlewares: Vec::new(),
+        llm_middlewares: Vec::new(),
     }
 }
 

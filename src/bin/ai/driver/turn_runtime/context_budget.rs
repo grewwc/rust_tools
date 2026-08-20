@@ -553,6 +553,9 @@ mod tests {
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
             stale_patch_targets: Default::default(),
+            tool_middlewares: Vec::new(),
+            llm_middlewares: Vec::new(),
+            hooks: Default::default(),
         }
     }
 

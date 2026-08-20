@@ -12,6 +12,7 @@ pub(super) const MUTATION_TOOL_NAMES: &[&str] = &[
     "apply_patch",
     "write_file",
     "plan",
+    "plan_update",
     "task_spawn",
     "task_spawn_batch",
     "task_wait",

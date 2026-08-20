@@ -620,7 +620,7 @@ fn tesseract_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
         cmd.arg("-l").arg(lang);
     }
 
-    let out = cmd.output().map_err(|e| {
+    let out = crate::fork_guard::output(&mut cmd).map_err(|e| {
         let _ = std::fs::remove_file(&input_path);
         if e.kind() == std::io::ErrorKind::NotFound {
             "tesseract not found in PATH (install tesseract-ocr)".to_string()
@@ -683,6 +683,8 @@ fn map_lang_for_tesseract(lang: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn macos_vision_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
+    // 持全局 fork 锁：串行化与其它线程的子进程 spawn，避免 fork 与 ObjC 类初始化竞态。
+    let _guard = crate::fork_guard::lock();
     use std::{ffi::CString, ptr::NonNull};
 
     use objc2::runtime::AnyObject;

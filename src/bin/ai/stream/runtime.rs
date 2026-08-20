@@ -26,8 +26,7 @@ use super::{
     },
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{
-        StreamChunkStep, StreamMarkers, StreamProcessingState, TerminalDedupeState,
-        ToolCallBuilder,
+        StreamChunkStep, StreamMarkers, StreamProcessingState, TerminalDedupeState, ToolCallBuilder,
     },
 };
 
@@ -194,7 +193,13 @@ pub(super) async fn stream_response(
         state.content.stream_idle_timed_out = true;
         if runtime_ctx::terminal_output_enabled() {
             clear_waiting_hint(&mut state)?;
-            eprintln!("  ⚠ 响应流连续 {timeout_secs} 秒无有效进展，按流中断处理…");
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            writeln!(
+                out,
+                "  ⚠ 响应流连续 {timeout_secs} 秒无有效进展，按流中断处理…"
+            )?;
+            out.flush()?;
         }
     }
 
@@ -1204,20 +1209,18 @@ fn terminal_dedupe_still_matches(state: &StreamProcessingState) -> bool {
 }
 
 fn terminal_dedupe_buffer_is_complete_match(state: &StreamProcessingState) -> bool {
-    state.render.terminal_dedupe.as_ref().is_some_and(|dedupe| {
-        dedupe.buffered_terminal_output.trim() == dedupe.candidate.trim()
-    })
-}
-
-fn final_assistant_matches_terminal_dedupe(state: &StreamProcessingState) -> bool {
     state
         .render
         .terminal_dedupe
         .as_ref()
-        .is_some_and(|dedupe| {
-            crate::ai::request::strip_digest_blocks(&state.content.assistant_text).trim()
-                == dedupe.candidate.trim()
-        })
+        .is_some_and(|dedupe| dedupe.buffered_terminal_output.trim() == dedupe.candidate.trim())
+}
+
+fn final_assistant_matches_terminal_dedupe(state: &StreamProcessingState) -> bool {
+    state.render.terminal_dedupe.as_ref().is_some_and(|dedupe| {
+        crate::ai::request::strip_digest_blocks(&state.content.assistant_text).trim()
+            == dedupe.candidate.trim()
+    })
 }
 
 fn disable_terminal_dedupe(
@@ -1326,7 +1329,8 @@ fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str
 /// 落在可视视口内，因此相对擦除永远够得着，不会随窗口滚入 scrollback
 /// 而失步——即便失步，也无法再生出第二个 header，从根上杜绝「孤儿 header 叠加」。
 fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
-    let mut out = io::stdout();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
     // 只擦除上一次的正文区域；header 已锚定在其上方，绝不触碰。
     // 注意：terminal 缩窄后，旧正文会被终端按当前宽度自动 reflow 成更多物理行；
     // 这里不能只信缓存的 window_rows，而要按"上次正文在当前宽度下会占几行"重算。
@@ -1397,7 +1401,19 @@ fn erase_fold_body(out: &mut impl Write, rows: usize) -> io::Result<()> {
     if rows > 1 {
         write!(out, "\x1b[{}A", rows - 1)?;
     }
-    write!(out, "\x1b[0J")
+    // 不能用 CSI 0J：它会从正文首行清到物理屏幕末端，越过 DECSTBM 滚动
+    // 区并擦掉底部 side-note composer。只逐行清除已渲染的正文窗口，最后把
+    // 光标恢复到正文首行，保持后续重画的相对光标语义不变。
+    for row in 0..rows {
+        write!(out, "\r\x1b[2K")?;
+        if row + 1 < rows {
+            write!(out, "\x1b[1B")?;
+        }
+    }
+    if rows > 1 {
+        write!(out, "\x1b[{}A", rows - 1)?;
+    }
+    write!(out, "\r")
 }
 
 /// Thinking 结束时的最终渲染：覆盖正文窗口，并把锚定的 `○` 原位改为 `✓`。
@@ -1415,7 +1431,8 @@ fn finalize_fold(
     fold: &mut super::state::ThinkingFoldState,
     collapse_body: bool,
 ) -> io::Result<()> {
-    let mut out = io::stdout();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
     finalize_fold_to(&mut out, fold, collapse_body)
 }
 
@@ -1882,6 +1899,15 @@ fn process_stream_payload(
                     merge_mode,
                     &state.content.assistant_text,
                 ) else {
+                    continue;
+                };
+                if content.is_empty() {
+                    continue;
+                }
+                // Step 6：可插拔流过滤器（`state.filters`，端口在 ports/stream.rs）。
+                // 空链直通（零行为变化）；None = 丢弃该 chunk 的可见文本，不入
+                // assistant_text / 终端，也不参与下面的退化重复检测。
+                let Some(content) = state.filters.apply(content) else {
                     continue;
                 };
                 if content.is_empty() {

@@ -11,7 +11,9 @@ use crate::ai::{
         Message, ROLE_INTERNAL_NOTE, compress::llm_prune, last_real_user_index,
     },
     mcp::McpClient,
-    request::{self, do_request_messages, do_request_messages_without_tools},
+    middleware::request::build_llm_client_chain,
+    ports::{DefaultLlmClient, LlmClient, LlmRequest},
+    request,
     stream,
     tools::task_tools,
     types::{App, StreamOutcome, StreamResult},
@@ -1005,6 +1007,40 @@ fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Messa
         "elapsed_ms": __agent_hang_elapsed_ms,
     }
 )]
+/// 构建真实请求使用的 LLM client 链：默认空链 = 直接走 `DefaultLlmClient`（零行为变更）；
+/// 注册了 `RequestMiddleware` 时按注册顺序包裹（重试/短路/审计等在生产请求中生效）。
+fn build_llm_request_client(app: &App) -> Box<dyn LlmClient> {
+    build_llm_client_chain(app.llm_middlewares.clone(), Box::new(DefaultLlmClient))
+}
+
+/// 经 client 链发送一次 LLM 请求，并把错误收敛回 `RequestError`：
+/// 默认链原样透传（downcast 成功，fallback/超限分类行为不变）；
+/// 自定义中间件产生的非 `RequestError` 错误视为本地策略失败，不触发模型 fallback。
+async fn send_llm_request(
+    client: &dyn LlmClient,
+    app: &mut App,
+    model: &str,
+    messages: &mut Vec<Message>,
+    tools_enabled: bool,
+) -> Result<reqwest::Response, request::RequestError> {
+    let request = LlmRequest {
+        model: model.to_string(),
+        messages: messages.clone(),
+        stream: true,
+        tools_enabled,
+    };
+    match client.send(app, request).await {
+        Ok(response) => Ok(response.response),
+        Err(err) => match err.downcast::<request::RequestError>() {
+            Ok(inner) => Err(*inner),
+            Err(opaque) => Err(request::RequestError::status(
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                opaque.to_string(),
+            )),
+        },
+    }
+}
+
 async fn request_model_response(
     app: &mut App,
     next_model: &str,
@@ -1013,6 +1049,9 @@ async fn request_model_response(
     _iteration: usize,
     mut compression_report: CompressionReport,
 ) -> Result<(reqwest::Response, String), request::RequestError> {
+    // 请求构建前钩子（on_before_request → BuildRequest.before），先于任何 app 状态变更触发。
+    // 传入正在构建的真实请求消息，让钩子可检查/改写。
+    app.fire_before_request_hooks(messages);
     if crate::ai::driver::runtime_ctx::take_subagent_checkpoint_due_reminder() {
         messages.push(Message {
             role: ROLE_INTERNAL_NOTE.to_string(),
@@ -1114,12 +1153,13 @@ async fn request_model_response(
     // 二者互斥。
     const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 4;
     let mut overflow_retries = 0usize;
+    let llm_client = build_llm_request_client(app);
     loop {
         let mut actual_model = next_model.to_string();
         let mut request_result = if force_final_response {
-            do_request_messages_without_tools(app, next_model, messages, true).await
+            send_llm_request(&*llm_client, app, next_model, messages, false).await
         } else {
-            do_request_messages(app, next_model, messages, true).await
+            send_llm_request(&*llm_client, app, next_model, messages, true).await
         };
         if let Err(err) = &request_result
             && let Some(fallback_spec) = auto_model_fallback_spec
@@ -1139,9 +1179,9 @@ async fn request_model_response(
                 }
                 actual_model = fallback_model.clone();
                 request_result = if force_final_response {
-                    do_request_messages_without_tools(app, &fallback_model, messages, true).await
+                    send_llm_request(&*llm_client, app, &fallback_model, messages, false).await
                 } else {
-                    do_request_messages(app, &fallback_model, messages, true).await
+                    send_llm_request(&*llm_client, app, &fallback_model, messages, true).await
                 };
                 if let Err(fallback_err) = &request_result
                     && request::should_temporarily_disable_auto_selected_model(fallback_err)
@@ -1400,6 +1440,8 @@ pub(super) async fn execute_turn_iteration(
         .await
         {
             Ok(stream_result) => {
+                // 流解析成功路径的收尾钩子（on_after_stream → ParseStream.after）。
+                app.fire_after_stream_hooks();
                 return finalize_stream_interaction(
                     app,
                     &mut response,
@@ -1447,10 +1489,11 @@ pub(super) async fn execute_turn_iteration(
                     }
 
                     request::clear_stale_request_interrupt_before_request(app);
+        let llm_client = build_llm_request_client(app);
                     let retry_request = if force_final_response {
-                        do_request_messages_without_tools(app, &actual_model, messages, true).await
+            send_llm_request(&*llm_client, app, &actual_model, messages, false).await
                     } else {
-                        do_request_messages(app, &actual_model, messages, true).await
+            send_llm_request(&*llm_client, app, &actual_model, messages, true).await
                     };
                     match retry_request {
                         Ok(new_response) => {
@@ -1514,14 +1557,113 @@ pub(super) async fn execute_turn_iteration(
 mod tests {
     use super::super::{record_llm_summary_attempt_chars, should_try_llm_summary};
     use super::{
-        StreamingFlagGuard, no_tool_handoff_note, project_instruction_target_paths,
-        refresh_outstanding_task_anchor, request_interrupt_pending,
+        App, LlmClient, LlmRequest, StreamingFlagGuard, build_llm_request_client,
+        no_tool_handoff_note, project_instruction_target_paths, refresh_outstanding_task_anchor,
+        request, request_interrupt_pending, send_llm_request,
     };
     use crate::ai::history::{Message, ROLE_INTERNAL_NOTE};
+    use crate::ai::middleware::RequestMiddleware;
+    use crate::ai::ports::LlmResponse;
     use crate::ai::types::{FunctionCall, ToolCall};
     use serde_json::Value;
-    use std::sync::atomic::AtomicBool;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, atomic::Ordering};
+
+    // ------------------------------------------------------------------
+    // RequestMiddleware 链已接入真实请求路径（P2 修复回归保护）：
+    // `app.llm_middlewares` 注册的中间件必须在生产请求建链
+    // （build_llm_request_client）与发送（send_llm_request）时生效。
+    // ------------------------------------------------------------------
+
+    struct CountingRequestMiddleware {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RequestMiddleware for CountingRequestMiddleware {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        fn wrap(&self, inner: Box<dyn LlmClient>) -> Box<dyn LlmClient> {
+            struct Wrapper {
+                inner: Box<dyn LlmClient>,
+                calls: Arc<AtomicUsize>,
+            }
+            impl LlmClient for Wrapper {
+                fn send<'a>(
+                    &'a self,
+                    app: &'a mut App,
+                    req: LlmRequest,
+                ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>
+                {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.inner.send(app, req)
+                }
+            }
+            Box::new(Wrapper {
+                inner,
+                calls: Arc::clone(&self.calls),
+            })
+        }
+    }
+
+    struct ShortCircuitRequestMiddleware;
+
+    impl RequestMiddleware for ShortCircuitRequestMiddleware {
+        fn name(&self) -> &'static str {
+            "short-circuit"
+        }
+        fn wrap(&self, inner: Box<dyn LlmClient>) -> Box<dyn LlmClient> {
+            struct Wrapper {
+                _inner: Box<dyn LlmClient>,
+            }
+            impl LlmClient for Wrapper {
+                fn send<'a>(
+                    &'a self,
+                    _app: &'a mut App,
+                    _req: LlmRequest,
+                ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>
+                {
+                    Box::pin(async {
+                        Err(Box::new(request::RequestError::cancelled(
+                            "short-circuited by test middleware".to_string(),
+                        )) as Box<dyn std::error::Error + Send + Sync>)
+                    })
+                }
+            }
+            Box::new(Wrapper { _inner: inner })
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_middlewares_chain_used_by_real_request_path() {
+        let mut app = crate::ai::middleware::test_util::test_app();
+        let calls = Arc::new(AtomicUsize::new(0));
+        app.llm_middlewares.push(Arc::new(CountingRequestMiddleware {
+            calls: Arc::clone(&calls),
+        }));
+
+        // 建链必须来自 app.llm_middlewares；空 endpoint 下内层 DefaultLlmClient
+        // 请求必然失败，但中间件 send 一定被调用（证明生产路径确实走了链）。
+        let client = build_llm_request_client(&app);
+        let mut messages = Vec::new();
+        let _ = send_llm_request(&*client, &mut app, "gpt-4o", &mut messages, true).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn llm_middleware_short_circuit_error_surfaces_as_request_error() {
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.llm_middlewares.push(Arc::new(ShortCircuitRequestMiddleware));
+
+        let client = build_llm_request_client(&app);
+        let mut messages = Vec::new();
+        let err = send_llm_request(&*client, &mut app, "gpt-4o", &mut messages, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("short-circuited by test middleware"));
+    }
 
     #[test]
     fn streaming_flag_guard_resets_on_drop() {

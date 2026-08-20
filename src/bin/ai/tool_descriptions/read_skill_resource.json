@@ -1,0 +1,22 @@
+{
+  "name": "read_skill_resource",
+  "description": "Read a single bundled resource file from an installed skill package (references/examples/scripts). Path is relative to the skill's resource directory as shown by `list_skill_resources` or `load_skill`.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Skill name as shown in `list_skills`."
+      },
+      "path": {
+        "type": "string",
+        "description": "Relative path inside the skill's bundled resource directory, e.g. 'references/guide.md' or 'examples/demo.md'."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of characters to return (default: 50000). Longer files are truncated with a hint."
+      }
+    },
+    "required": ["name", "path"]
+  }
+}

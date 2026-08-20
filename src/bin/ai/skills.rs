@@ -82,6 +82,9 @@ pub(super) struct SkillManifest {
     pub(super) priority: i32,
     #[serde(default)]
     pub(super) excludes: Vec<String>,
+    /// 若为子 skill，指向父 skill 的 name。
+    #[serde(default)]
+    pub(super) parent: Option<String>,
     #[serde(skip)]
     pub(super) source_path: Option<String>,
     #[serde(skip)]
@@ -120,10 +123,15 @@ impl SkillManifest {
             "priority": self.priority,
             "source_path": self.source_path,
             "resource_path": self.resource_path,
+            "parent": self.parent,
         });
         let mut hasher = Sha256::new();
         hasher.update(payload.to_string().as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+    /// 是否为子 skill
+    pub(super) fn is_subskill(&self) -> bool {
+        self.parent.is_some()
     }
 }
 
@@ -245,6 +253,7 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
     let mut disable_mcp_tools = false;
     let mut system_prompt: Option<String> = None;
     let mut priority: i32 = 0;
+    let mut parent: Option<String> = None;
 
     let mut body = String::new();
     let mut in_front_matter = true;
@@ -314,6 +323,7 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
                 "tool_groups" => tool_groups = parse_list_value(unquoted),
                 "mcp_servers" => mcp_servers = parse_list_value(unquoted),
                 "excludes" => excludes = parse_list_value(unquoted),
+                "parent" => parent = Some(unquoted.to_string()).filter(|s| !s.trim().is_empty()),
                 _ => {}
             }
         } else {
@@ -344,6 +354,7 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
         system_prompt: system_prompt.filter(|s| !s.trim().is_empty()),
         priority,
         excludes,
+        parent: parent.filter(|s| !s.trim().is_empty()),
         source_path: None,
         resource_path: None,
     })
@@ -486,7 +497,16 @@ fn load_skills_from_package_dir(dir: &Path) -> Vec<SkillManifest> {
     collect_skill_packages(dir)
         .into_iter()
         .filter_map(|(resource_root, manifest_path)| {
-            parse_skill_package_manifest(&manifest_path, &resource_root, None).ok()
+            let mut skill = parse_skill_package_manifest(&manifest_path, &resource_root, None).ok()?;
+            if skill.parent.is_none() {
+                if let Some(inferred) = infer_parent_from_filesystem(&resource_root) {
+                    skill.parent = Some(inferred);
+                }
+            }
+            if skill.parent.as_deref() == Some(skill.name.as_str()) {
+                skill.parent = None;
+            }
+            Some(skill)
         })
         .collect()
 }
@@ -502,7 +522,17 @@ fn load_skills_from_zip_package(zip_path: &Path, skills_dir: &Path) -> Vec<Skill
                 .strip_prefix(&extract_root)
                 .unwrap_or(manifest_path.as_path());
             let source_label = format!("{}!{}", zip_path.display(), relative_manifest.display());
-            parse_skill_package_manifest(&manifest_path, &resource_root, Some(source_label)).ok()
+            let mut skill =
+                parse_skill_package_manifest(&manifest_path, &resource_root, Some(source_label)).ok()?;
+            if skill.parent.is_none() {
+                if let Some(inferred) = infer_parent_from_filesystem(&resource_root) {
+                    skill.parent = Some(inferred);
+                }
+            }
+            if skill.parent.as_deref() == Some(skill.name.as_str()) {
+                skill.parent = None;
+            }
+            Some(skill)
         })
         .collect()
 }
@@ -515,23 +545,102 @@ fn is_ignored_package_entry_name(name: &str) -> bool {
 /// 取 4 留出余量，同时避免在异常深的目录树上无限递归。
 const MAX_SKILL_PACKAGE_DEPTH: usize = 4;
 
+/// 子 skill 容器目录名。仅使用 `subskills` 白名单，避免与集合布局 `skills/<pkg>` 冲突。
+/// 历史曾包含 `skills`，会导致 `feishu/skills/<pkg>` 这类集合内容被误判为子 skill。
+const SUBSKILL_CONTAINER_DIRS: &[&str] = &["subskills"];
+
+/// 尝试从文件系统布局推断子 skill 的父名。
+/// 约定：`parent/subskills/child/SKILL.md` ⇒ 父名为 parent 的 skill 名（取 manifest 中 `name`）。
+/// 若无法解析父 manifest（缺失或非法），则返回 `None`，调用方应要求子 skill 显式声明 `parent`，
+/// 避免回退到目录名与 manifest.name 不一致而产生孤儿 parent。
+fn infer_parent_from_filesystem(resource_root: &Path) -> Option<String> {
+    let container = resource_root.parent()?;
+    let container_name = container.file_name()?.to_str()?;
+    if !SUBSKILL_CONTAINER_DIRS
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(container_name))
+    {
+        return None;
+    }
+    let parent_root = container.parent()?;
+    // 仅当 parent_root 自身是合法 package 时才视为父，否则不推断（避免把集合根当父）。
+    let manifest = find_skill_manifest_in_package_dir(parent_root)?;
+    let content = fs::read_to_string(&manifest).ok()?;
+    let parsed = parse_skill_front_matter(&content).ok()?;
+    let name = parsed.name.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// 收集 `parent_root` 下所有子 skill 包（仅扫描 `SUBSKILL_CONTAINER_DIRS` 的直接子目录）。
+fn collect_subskills_for_parent(parent_root: &Path) -> Vec<(PathBuf, PathBuf)> {
+    // 二次确认：仅当 parent_root 自身是 package 时才扫描子 skill，避免集合根被误判。
+    if find_skill_manifest_in_package_dir(parent_root).is_none() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for container in SUBSKILL_CONTAINER_DIRS {
+        let container_path = parent_root.join(container);
+        if !container_path.is_dir() {
+            continue;
+        }
+        let Ok(rd) = fs::read_dir(&container_path) else {
+            continue;
+        };
+        let mut children = rd
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !path.is_dir() {
+                    return None;
+                }
+                let name = path.file_name()?.to_str()?;
+                if is_ignored_package_entry_name(name) {
+                    return None;
+                }
+                Some(path)
+            })
+            .collect::<Vec<_>>();
+        rust_tools::sortw::stable_sort_by(&mut children, |a, b| a.cmp(b));
+        for child in children {
+            if let Some(manifest) = find_skill_manifest_in_package_dir(&child) {
+                // 子 skill 去重：同一父下同名目录已通过 manifest name 去重由上层处理，
+                // 此处按路径收集，后续 load_all_skills 按 name 去重。
+                out.push((child, manifest));
+            }
+        }
+    }
+    out
+}
+
 /// 收集 `root` 下的所有 skill 包，返回每个包的 `(resource_root, manifest_path)`。
 ///
-/// - 若 `root` 自身就是一个包（直接含 manifest），只返回它本身，且**不再向下递归**：
-///   单包目录 / 单包 zip（如 argos-tools）保持原有行为，包内 `references/*.skill`
-///   等资源文件不会被误判为独立 skill。
+/// - 若 `root` 自身就是一个包（直接含 manifest），返回它本身**外加**其子 skill：
+///   仅扫描 `subskills` 容器下的直接子包；`references/*.skill`
+///   等仍不会被误判为 skill（原有保证保留）。
 /// - 否则把 `root` 当作"集合"（如 feishu，其布局为 `feishu/skills/<pkg>/SKILL.md`），
 ///   逐层下钻收集所有**最上层**的包；命中某个目录是包后即停止深入该目录。
 ///
 /// 磁盘目录集合与解压后的 zip 集合通过同一条逻辑处理，无需对 `skills/` 之类的容器
 /// 名做硬编码判断。
 fn collect_skill_packages(root: &Path) -> Vec<(PathBuf, PathBuf)> {
-    // 单包短路：root 直接是一个包，按原语义返回单个，不下钻。
+    // 单包短路：root 直接是一个包，返回自身 + 其子 skill（若有）。
     if let Some(manifest) = find_skill_manifest_in_package_dir(root) {
-        return vec![(root.to_path_buf(), manifest)];
+        let mut out = vec![(root.to_path_buf(), manifest)];
+        out.extend(collect_subskills_for_parent(root));
+        rust_tools::sortw::stable_sort_by(&mut out, |a, b| a.0.cmp(&b.0));
+        return out;
     }
     let mut out = Vec::new();
     collect_skill_packages_recursive(root, MAX_SKILL_PACKAGE_DEPTH, &mut out);
+    // 为每个已发现的父包追加其子 skill
+    let parents = out.clone();
+    for (parent_root, _) in parents {
+        out.extend(collect_subskills_for_parent(&parent_root));
+    }
     rust_tools::sortw::stable_sort_by(&mut out, |a, b| a.0.cmp(&b.0));
     out
 }

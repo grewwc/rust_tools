@@ -19,6 +19,7 @@ use crate::ai::{
     },
     history::ToolExecutionOutcome,
     mcp::{McpClient, SharedMcpClient},
+    ports::ToolExecOutput,
     tools as builtin_tools,
     tools::os_tools::GLOBAL_OS,
     tools::storage::memory_store::{AgentMemoryEntry, MemoryStore},
@@ -82,6 +83,28 @@ pub(super) struct ExecuteToolCallsResult {
     /// 结构化信号，供下游 reflection/evolution 判定 turn 质量时使用，
     /// 替代旧版扫描 assistant 答案文本找 "error"/"failed" 的脆弱做法。
     pub(super) had_error: bool,
+}
+
+impl ExecuteToolCallsResult {
+    /// 转换为端口输出：透传真实派发的全部字段，供 ToolExecutor 链无损失消费
+    /// （`assistant_messages` 恒为空，由中间件链在需要时填充）。
+    pub(super) fn into_tool_exec_output(self) -> ToolExecOutput {
+        let ExecuteToolCallsResult {
+            executed_tool_calls,
+            tool_results,
+            cached_hits,
+            execution_outcomes,
+            had_error,
+        } = self;
+        ToolExecOutput {
+            tool_results,
+            assistant_messages: Vec::new(),
+            executed_tool_calls,
+            cached_hits,
+            execution_outcomes,
+            had_error,
+        }
+    }
 }
 
 pub(super) struct RunOneResult {
@@ -601,6 +624,24 @@ fn run_one(
 
     if let Err(result) = confirm_tool_execution(tool_call, &prepared.args) {
         return (prepared.route, result);
+    }
+
+    // 实时 side-note：lead-agent → subagent（或前景）。在工具分发层直接处理，无需 MCP 往返。
+    if tool_call.function.name == "send_side_note" {
+        let res = crate::ai::tools::service::side_note::handle_send_side_note(
+            &tool_call.id,
+            &prepared.args,
+        );
+        let run_result = finalize_execution_result(
+            session_id,
+            tool_call,
+            &prepared,
+            res,
+            allowed_tool_names,
+            true,
+            false,
+        );
+        return (prepared.route, run_result);
     }
 
     if let Ok(guard) = GLOBAL_OS.lock() {

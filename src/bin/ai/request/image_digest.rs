@@ -197,12 +197,12 @@ pub(crate) async fn describe_image_for_digest(
 
     // 禁用工具、非流式（与 summarize_history_via_model 一致：两个 false 分别是
     // stream / enable_thinking，其余 tools/tool_choice/reasoning 全 None）。
-    let request_body = build_request_body(
+    let mut request_body = build_request_body(
         model, &messages, false, false, None, None, None, None, None, None, None,
     );
     let endpoint = endpoint_for_request_model(app, model);
     let api_key = api_key_for_request_model(app, model);
-    let http_body = super::protocol::build_http_body_for_request(model, &endpoint, &request_body);
+    let http_body = super::protocol::build_http_body_for_request(model, &endpoint, &mut request_body);
 
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")

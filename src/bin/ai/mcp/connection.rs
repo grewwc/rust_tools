@@ -136,13 +136,14 @@ mod tests {
 
     #[test]
     fn dropping_mcp_connection_kills_and_reaps_child() {
-        let mut process = Command::new("/bin/sleep")
-            .arg("30")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut process = crate::fork_guard::spawn(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let pid = process.id() as libc::pid_t;
         let stdin = process.stdin.take().unwrap();
         let stdout = process.stdout.take().unwrap();

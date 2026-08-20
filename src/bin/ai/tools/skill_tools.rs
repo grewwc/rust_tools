@@ -205,16 +205,31 @@ fn render_skill_catalog(skills: &[SkillManifest], query: &str, limit: usize) -> 
     let total = matches.len();
     let shown = total.min(limit);
     let mut out = format!("Installed skills ({shown} shown of {total}):\n");
+    // 统计父 skill -> 子 skill 数量，用于给父 skill 加标注
+    let mut parent_has_children: FastSet<String> = FastSet::default();
+    for s in skills.iter() {
+        if let Some(p) = s.parent.as_deref() {
+            parent_has_children.insert(p.to_string());
+        }
+    }
     for skill in matches.into_iter().take(shown) {
         let description = skill
             .description
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        if description.is_empty() {
-            out.push_str(&format!("- `{}`\n", skill.name));
+        let is_parent = parent_has_children.contains(skill.name.as_str());
+        let name_display = if let Some(parent) = skill.parent.as_deref() {
+            format!("{} (sub-skill of {})", skill.name, parent)
+        } else if is_parent {
+            format!("{} [has sub-skills]", skill.name)
         } else {
-            out.push_str(&format!("- `{}` — {description}\n", skill.name));
+            skill.name.clone()
+        };
+        if description.is_empty() {
+            out.push_str(&format!("- `{}`\n", name_display));
+        } else {
+            out.push_str(&format!("- `{}` — {description}\n", name_display));
         }
     }
     if total > shown {
@@ -225,6 +240,11 @@ fn render_skill_catalog(skills: &[SkillManifest], query: &str, limit: usize) -> 
     out.push_str(
         "This catalog is metadata only and does not activate a skill. Call `activate_skill(name=...)` only when one listed skill clearly and materially helps the current task.",
     );
+    if parent_has_children.is_empty() {
+        // 无子 skill 时不额外提示
+    } else {
+        out.push_str(" Sub-skills can be activated independently via `activate_skill`; parent skills list their sub-skills in `load_skill`.");
+    }
     out
 }
 
@@ -244,14 +264,99 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+/// 采集 `resource_path` 下的文件列表（相对路径），用于 `load_skill` / 资源工具的展示。
+/// `subdir` 需为安全的相对路径（仅允许单级 category 或空），内部会校验不穿越且 canonical 后仍在 base 内。
+fn collect_resource_files(resource_path: &str, subdir: Option<&str>) -> Vec<String> {
+    use std::path::Path;
+    let base = Path::new(resource_path);
+    // 先校验 base 存在且可 canonicalize（防 symlink 攻击前置检查）
+    let Ok(canonical_base) = std::fs::canonicalize(base) else {
+        // base 不存在或不可解析时返回空（调用方已处理 resource_path 不存在的情况）
+        if !base.is_dir() {
+            return Vec::new();
+        }
+        // 退化：base 存在但 canonicalize 失败（如权限），仍尝试直接列
+        let mut files = Vec::new();
+        collect_files_recursive(base, base, &mut files, 120);
+        rust_tools::sortw::stable_sort_by(&mut files, |a, b| a.cmp(b));
+        return files;
+    };
+    let target_base = match subdir {
+        Some(s) if !s.trim().is_empty() => {
+            let cleaned = s.trim().trim_matches('/').replace('\\', "/");
+            // 严格校验：不允许 `..`、绝对路径、含 `/` 的多级穿越
+            if cleaned.is_empty() || cleaned.contains("..") || Path::new(&cleaned).is_absolute() {
+                return Vec::new();
+            }
+            // category 仅允许单段且为常见资源目录
+            if cleaned.contains('/') {
+                return Vec::new();
+            }
+            // 白名单校验（与文档一致）
+            const ALLOWED_CATEGORIES: &[&str] = &["references", "examples", "scripts"];
+            if !ALLOWED_CATEGORIES.contains(&cleaned.as_str()) {
+                return Vec::new();
+            }
+            let joined = base.join(&cleaned);
+            // canonical 校验：若目标存在则必须仍在 base 内；不存在则视为合法空目录
+            match std::fs::canonicalize(&joined) {
+                Ok(canonical_joined) if !canonical_joined.starts_with(&canonical_base) => {
+                    return Vec::new();
+                }
+                Ok(canonical_joined) => canonical_joined,
+                Err(_) => {
+                    // 目标不存在时检查 joined 的 parent 是否仍在 base 内（防 `references/../etc` 类构造）
+                    // 已通过 `..` 检查，此处认为不存在即空
+                    return Vec::new();
+                }
+            }
+        }
+        _ => canonical_base.clone(),
+    };
+    if !target_base.is_dir() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    collect_files_recursive(&target_base, &target_base, &mut files, 120);
+    rust_tools::sortw::stable_sort_by(&mut files, |a, b| a.cmp(b));
+    files
+}
+
+fn collect_files_recursive(root: &std::path::Path, cur: &std::path::Path, out: &mut Vec<String>, cap: usize) {
+    if out.len() >= cap {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(cur) else { return; };
+    let mut entries = rd.flatten().collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.path().cmp(&b.path()));
+    for entry in entries {
+        if out.len() >= cap { break; }
+        let path = entry.path();
+        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if file_name.starts_with('.') { continue; }
+        if path.is_dir() {
+            collect_files_recursive(root, &path, out, cap);
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.display().to_string());
+            }
+        }
+    }
+}
+
 /// 渲染 load_skill 的返回：头部元信息 + skill 正文（+ 可选 bundled 资源目录）。
-fn render_loaded_skill(skill: &SkillManifest) -> String {
+fn render_loaded_skill_with_all(skill: &SkillManifest, all: &[SkillManifest]) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Skill: {}\n", skill.name));
     if !skill.description.trim().is_empty() {
         out.push_str(&format!("description: {}\n", skill.description.trim()));
     }
     out.push_str(&format!("version: {}\n", skill.version));
+    if let Some(parent) = skill.parent.as_deref()
+        && !parent.trim().is_empty()
+    {
+        out.push_str(&format!("parent: {parent}\nsub-skill of: {parent}\n"));
+    }
     if let Some(system_prompt) = skill.system_prompt.as_deref()
         && !system_prompt.trim().is_empty()
     {
@@ -268,17 +373,51 @@ fn render_loaded_skill(skill: &SkillManifest) -> String {
             out.push('\n');
         }
     }
-    // 只有当 skill 真带 bundled 资源时才暴露其目录。这是显式 load 单个 skill 的
-    // 合法用途（agent 需要读 references/*）；默认运行时不会因为列举 skill 元信息
-    // 而泄露本地路径。
+    // 只有当 skill 真带 bundled 资源时才暴露其目录，并列出 references/examples/scripts 等文件。
     if let Some(resource_path) = skill.resource_path.as_deref()
         && !resource_path.trim().is_empty()
     {
         out.push_str(&format!(
             "\n## resources\nBundled resource directory: {resource_path}\n"
         ));
+        let list = collect_resource_files(resource_path, None);
+        if list.is_empty() {
+            out.push_str("(no bundled files found under references/examples/scripts)\n");
+        } else {
+            out.push_str("Bundled files (relative to resource dir):\n");
+            for rel in list.iter().take(80) {
+                out.push_str(&format!("- {rel}\n"));
+            }
+            if list.len() > 80 {
+                out.push_str(&format!("... and {} more files\n", list.len() - 80));
+            }
+            out.push_str("Use `read_skill_resource(name, path)` or `read_file` with the absolute resource directory to read any file.\n");
+        }
+        // 列出子 skill（由调用方传入的 all，避免全量 IO 重复）
+    }
+    let children: Vec<&SkillManifest> = all.iter().filter(|s| s.parent.as_deref() == Some(skill.name.as_str())).collect();
+    if !children.is_empty() {
+        out.push_str("\n## sub-skills\nThis skill contains sub-skills:\n");
+        for ch in children {
+            let desc = ch.description.split_whitespace().collect::<Vec<_>>().join(" ");
+            if desc.is_empty() {
+                out.push_str(&format!("- `{}`\n", ch.name));
+            } else {
+                out.push_str(&format!("- `{}` — {desc}\n", ch.name));
+            }
+        }
+        if skill.resource_path.is_some() {
+            out.push_str("Activate any sub-skill via `activate_skill(name=...)` or load its details via `load_skill`.\n");
+        } else {
+            out.push_str("Activate any sub-skill via `activate_skill(name=...)`.\n");
+        }
     }
     out
+}
+
+fn render_loaded_skill(skill: &SkillManifest) -> String {
+    let all = crate::ai::skills::load_all_skills();
+    render_loaded_skill_with_all(skill, &all)
 }
 
 pub(crate) fn execute_load_skill(args: &Value) -> Result<String, String> {
@@ -299,7 +438,7 @@ pub(crate) fn execute_load_skill(args: &Value) -> Result<String, String> {
         ));
     };
 
-    Ok(render_loaded_skill(skill))
+    Ok(render_loaded_skill_with_all(skill, &skills))
 }
 
 inventory::submit!(ToolRegistration {
@@ -308,6 +447,144 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_load_skill,
+        groups: &["builtin"],
+    }
+});
+
+// ===== 新增：读取 skill 资源的工具 =====
+
+fn resolve_skill_for_resource(name: &str) -> Result<SkillManifest, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("skill name is empty".to_string());
+    }
+    let skills = crate::ai::skills::load_all_skills();
+    skills
+        .into_iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| format!("No skill named '{name}'"))
+}
+
+fn validate_resource_relative_path(path: &str) -> Result<String, String> {
+    let p = path.trim().trim_matches('/').replace('\\', "/");
+    if p.is_empty() {
+        return Err("resource path is empty".to_string());
+    }
+    if p.contains("..") {
+        return Err("resource path must not contain '..'".to_string());
+    }
+    if std::path::Path::new(&p).is_absolute() {
+        return Err("resource path must be relative".to_string());
+    }
+    Ok(p)
+}
+
+pub(crate) fn execute_list_skill_resources(args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().unwrap_or("").trim();
+    let category = args["category"].as_str().unwrap_or("").trim();
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(80)
+        .clamp(1, 200);
+    // 严格校验 category：仅允许空或白名单，且不含路径穿越字符
+    if !category.is_empty() {
+        const ALLOWED: &[&str] = &["references", "examples", "scripts"];
+        if category.contains("..") || category.contains('/') || category.contains('\\') {
+            return Err(format!("Invalid category '{category}': must be one of references/examples/scripts and must not contain path separators"));
+        }
+        if !ALLOWED.contains(&category) {
+            return Err(format!("Invalid category '{category}': allowed values are references, examples, scripts"));
+        }
+    }
+    let skill = resolve_skill_for_resource(name)?;
+    let resource_path = skill
+        .resource_path
+        .as_deref()
+        .ok_or_else(|| format!("Skill '{name}' has no bundled resource directory (single-file skill)"))?;
+    let subdir = if category.is_empty() { None } else { Some(category) };
+    let files = collect_resource_files(resource_path, subdir);
+    if files.is_empty() {
+        let dir_label = if let Some(c) = subdir {
+            format!("{resource_path}/{c}")
+        } else {
+            resource_path.to_string()
+        };
+        return Ok(format!("No files found under {dir_label}"));
+    }
+    let total = files.len();
+    let shown = total.min(limit);
+    let mut out = format!(
+        "Resources for skill '{}' under '{}' ({} shown of {}):\n",
+        skill.name,
+        subdir.unwrap_or("."),
+        shown,
+        total
+    );
+    for rel in files.iter().take(shown) {
+        // 尝试推断大小
+        let abs = std::path::Path::new(resource_path).join(rel);
+        let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+        out.push_str(&format!("- {rel} ({size} bytes)\n"));
+    }
+    if total > shown {
+        out.push_str(&format!("... and {} more files (use limit to see more)\n", total - shown));
+    }
+    out.push_str("Use `read_skill_resource(name, path)` to read a file.\n");
+    Ok(out)
+}
+
+pub(crate) fn execute_read_skill_resource(args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().unwrap_or("").trim();
+    let path = args["path"].as_str().unwrap_or("").trim();
+    if name.is_empty() || path.is_empty() {
+        return Err("read_skill_resource requires non-empty 'name' and 'path'".to_string());
+    }
+    let skill = resolve_skill_for_resource(name)?;
+    let resource_path = skill
+        .resource_path
+        .as_deref()
+        .ok_or_else(|| format!("Skill '{name}' has no bundled resource directory"))?;
+    let rel = validate_resource_relative_path(path)?;
+    let abs = std::path::Path::new(resource_path).join(&rel);
+    // 规范化后确保仍在 resource_path 内（防路径穿越）
+    let canonical_base = std::fs::canonicalize(resource_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(resource_path));
+    let canonical_target = std::fs::canonicalize(&abs)
+        .map_err(|e| format!("Failed to resolve resource path '{rel}': {e}"))?;
+    if !canonical_target.starts_with(&canonical_base) {
+        return Err("resource path escapes skill resource directory".to_string());
+    }
+    let content = std::fs::read_to_string(&canonical_target)
+        .map_err(|e| format!("Failed to read resource '{rel}': {e}"))?;
+    const MAX_READ: usize = 64 * 1024;
+    if content.len() > MAX_READ {
+        let truncated = &content[..MAX_READ];
+        Ok(format!(
+            "{truncated}\n\n... truncated: {} bytes total, showing first {} bytes. Use read_file with offset/limit for paging.",
+            content.len(),
+            MAX_READ
+        ))
+    } else {
+        Ok(content)
+    }
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "list_skill_resources",
+        description: "",
+        execute: execute_list_skill_resources,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "read_skill_resource",
+        description: "",
+        execute: execute_read_skill_resource,
         groups: &["builtin"],
     }
 });
@@ -348,7 +625,8 @@ fn yaml_quote(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-fn safe_skill_file_name(name: &str) -> String {
+/// 共享的 skill 名净化核心：小写、保留 alnum/`-`/`_`/` .`，其余转 `-`，合并 `--`，trim `-`/` .`。
+fn sanitize_skill_basename(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 8);
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
@@ -360,17 +638,36 @@ fn safe_skill_file_name(name: &str) -> String {
     while out.contains("--") {
         out = out.replace("--", "-");
     }
-    let out = out.trim_matches('-').to_string();
-    let out = if out.is_empty() {
+    let out = out.trim_matches(|c| c == '-' || c == '.').to_string();
+    if out.is_empty() {
         "skill".to_string()
     } else {
         out
-    };
-    if out.ends_with(".skill") {
-        out
-    } else {
-        format!("{out}.skill")
     }
+}
+
+fn safe_skill_file_name(name: &str) -> String {
+    let base = sanitize_skill_basename(name);
+    // 使用 strip_suffix 精确判断，避免 trim_end_matches 誤刪字符集
+    if base.to_ascii_lowercase().ends_with(".skill") {
+        base
+    } else {
+        format!("{base}.skill")
+    }
+}
+
+fn safe_skill_dir_name(name: &str) -> String {
+    let mut base = sanitize_skill_basename(name);
+    // 去除 .skill 後綴（若有），保持文件與目錄 basename 一致：a.b.skill ↔ a.b
+    if base.to_ascii_lowercase().ends_with(".skill") {
+        if let Some(stripped) = base.get(..base.len() - ".skill".len()) {
+            base = stripped.trim_end_matches('-').trim_end_matches('.').to_string();
+            if base.is_empty() {
+                base = "skill".to_string();
+            }
+        }
+    }
+    base
 }
 
 fn render_string_list_field(out: &mut String, key: &str, items: &[String]) {
@@ -398,6 +695,7 @@ fn build_skill_file_content(args: &Value) -> Result<String, String> {
     let version = args["version"].as_str().unwrap_or("1.0.0").trim();
     let system_prompt = args["system_prompt"].as_str().unwrap_or("").trim();
     let priority = args["priority"].as_i64().unwrap_or(0);
+    let parent = args["parent"].as_str().unwrap_or("").trim();
     let tools = parse_string_array(&args["tools"]);
     let tool_groups = parse_string_array(&args["tool_groups"]);
     let mcp_servers = parse_string_array(&args["mcp_servers"]);
@@ -410,6 +708,9 @@ fn build_skill_file_content(args: &Value) -> Result<String, String> {
     }
     out.push_str(&format!("author: {}\n", yaml_quote(author)));
     out.push_str(&format!("version: {}\n", yaml_quote(version)));
+    if !parent.is_empty() {
+        out.push_str(&format!("parent: {}\n", yaml_quote(parent)));
+    }
     if !system_prompt.is_empty() {
         out.push_str(&format!("system_prompt: {}\n", yaml_quote(system_prompt)));
     }
@@ -425,36 +726,305 @@ fn build_skill_file_content(args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+// ===== save_skill：支持 package 布局（references/examples/scripts + subskills）=====
+
+fn parse_resources_arg(args: &Value) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    // 通用字段 `resources: [{path, content}]`
+    if let Some(arr) = args.get("resources").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                let path = obj
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let content = obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if path.is_empty() {
+                    return Err("resources[]: each entry requires non-empty 'path'".to_string());
+                }
+                validate_resource_relative_path(path)?;
+                out.push((path.to_string(), content.to_string()));
+            } else {
+                return Err("resources[] entries must be objects with 'path' and 'content'".to_string());
+            }
+        }
+    }
+    // 分类快捷字段：references / examples / scripts，各为同形数组，若 path 不含目录则自动补前缀
+    for (key, prefix) in [("references", "references"), ("examples", "examples"), ("scripts", "scripts")] {
+        if let Some(arr) = args.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(obj) = item.as_object() {
+                    let raw_path = obj.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    let path = if raw_path.is_empty() {
+                        return Err(format!("{key}[]: each entry requires 'path'"));
+                    } else if raw_path.contains('/') {
+                        raw_path.to_string()
+                    } else {
+                        format!("{prefix}/{raw_path}")
+                    };
+                    validate_resource_relative_path(&path)?;
+                    out.push((path, content.to_string()));
+                } else {
+                    return Err(format!("{key}[] entries must be objects with 'path' and 'content'"));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn parse_subskills_arg(args: &Value) -> Result<Vec<Value>, String> {
+    let Some(arr) = args.get("subskills").and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (idx, item) in arr.iter().enumerate() {
+        let obj = item.as_object().ok_or_else(|| format!("subskills[{idx}] must be an object"))?;
+        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let prompt = obj.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if name.is_empty() {
+            return Err(format!("subskills[{idx}].name is required and must be non-empty"));
+        }
+        if prompt.is_empty() {
+            return Err(format!("subskills[{idx}].prompt is required and must be non-empty"));
+        }
+        out.push(item.clone());
+    }
+    Ok(out)
+}
+
+fn write_resource_files(base_dir: &std::path::Path, resources: &[(String, String)]) -> Result<(), String> {
+    write_resource_files_with_overwrite(base_dir, resources, true)
+}
+
+fn write_resource_files_with_overwrite(
+    base_dir: &std::path::Path,
+    resources: &[(String, String)],
+    overwrite: bool,
+) -> Result<(), String> {
+    // 确保 base_dir 存在并可 canonicalize（前置校验）
+    fs::create_dir_all(base_dir)
+        .map_err(|e| format!("Failed to create dir {}: {e}", base_dir.display()))?;
+    let canonical_base = fs::canonicalize(base_dir)
+        .unwrap_or_else(|_| base_dir.to_path_buf());
+    for (rel, content) in resources {
+        let rel_clean = rel.trim().trim_matches('/').replace('\\', "/");
+        // 复用已有校验（含 ..、绝对路径）
+        let validated = validate_resource_relative_path(&rel_clean)
+            .map_err(|e| format!("Invalid resource path '{rel}': {e}"))?;
+        let target = base_dir.join(&validated);
+        // 创建父目录前先做路径穿越预检：target 的 parent canonical 必须在 base 内
+        if let Some(parent) = target.parent() {
+            // parent 可能尚不存在，校验其“预期”路径的前缀字符级穿越
+            // 使用组件级检查：若 validated 含 `..` 已在上一步拦截，此处再做 canonical 校验
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create dir {}: {e}", parent.display()))?;
+            // 对已创建的 parent 做 canonical 校验
+            if let Ok(canonical_parent) = fs::canonicalize(parent) {
+                if !canonical_parent.starts_with(&canonical_base) {
+                    return Err(format!("Resource path escapes package directory: {validated}"));
+                }
+            }
+        }
+        if target.exists() && !overwrite {
+            return Err(format!(
+                "Resource already exists and overwrite=false: {}",
+                target.display()
+            ));
+        }
+        fs::write(&target, content).map_err(|e| format!("Failed to write resource {validated}: {e}"))?;
+        // 写入后二次校验（处理 symlink 竞态）
+        if let (Ok(cb), Ok(ct)) = (fs::canonicalize(&canonical_base), fs::canonicalize(&target)) {
+            if !ct.starts_with(&cb) {
+                let _ = fs::remove_file(&target);
+                return Err(format!("Resource path escapes package directory: {validated}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
-    let name = args["name"].as_str().ok_or("Missing name")?.trim();
+    let name = args["name"].as_str().ok_or("Missing name")?.trim().to_string();
     if name.is_empty() {
         return Err("name is empty".to_string());
     }
-    let content = build_skill_file_content(args)?;
+    // 提前解析可选的复杂包能力
+    let resources = parse_resources_arg(args)?;
+    let subskills = parse_subskills_arg(args)?;
+    let has_package_features = !resources.is_empty() || !subskills.is_empty();
+
     let dir = resolve_configured_skills_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create skills dir: {e}"))?;
-
-    let file_name = args["file_name"]
-        .as_str()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| safe_skill_file_name(name));
-    let file_name = safe_skill_file_name(&file_name);
-    let path = dir.join(file_name);
     let overwrite = args["overwrite"].as_bool().unwrap_or(true);
-    if path.exists() && !overwrite {
-        return Err(format!(
-            "Skill file already exists and overwrite=false: {}",
-            path.display()
-        ));
+
+    if !has_package_features {
+        // 兼容旧行为：单文件 `*.skill`
+        let content = build_skill_file_content(args)?;
+        let file_name = args["file_name"]
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| safe_skill_file_name(&name));
+        let file_name = safe_skill_file_name(&file_name);
+        let path = dir.join(file_name);
+        if path.exists() && !overwrite {
+            return Err(format!(
+                "Skill file already exists and overwrite=false: {}",
+                path.display()
+            ));
+        }
+        fs::write(&path, content).map_err(|e| format!("Failed to write skill file: {e}"))?;
+        return Ok(format!("Skill saved: {}\nSkill name: {}", path.display(), name));
     }
 
-    fs::write(&path, content).map_err(|e| format!("Failed to write skill file: {e}"))?;
-    Ok(format!(
-        "Skill saved: {}\nSkill name: {}",
-        path.display(),
-        name
-    ))
+    // ===== 包布局：`skills_dir/<package_dir>/SKILL.md` + resources + subskills =====
+    // 事前校验：子 skill 去重与环检测
+    {
+        use rustc_hash::FxHashSet;
+        let mut seen_names: FxHashSet<String> = FxHashSet::default();
+        let mut seen_dirs: FxHashSet<String> = FxHashSet::default();
+        for sub in &subskills {
+            let sub_name = sub["name"].as_str().unwrap_or("").trim().to_string();
+            if sub_name.is_empty() {
+                continue;
+            }
+            if sub_name == name {
+                return Err(format!("Subskill name must not equal parent skill name: '{sub_name}'"));
+            }
+            if let Some(ep) = sub.get("parent").and_then(|v| v.as_str()) {
+                let ep = ep.trim();
+                if !ep.is_empty() && ep == sub_name {
+                    return Err(format!("Subskill '{sub_name}' parent must not be itself"));
+                }
+            }
+            if !seen_names.insert(sub_name.clone()) {
+                return Err(format!("Duplicate subskill name: '{sub_name}'"));
+            }
+            let dir_name = safe_skill_dir_name(&sub_name);
+            if !seen_dirs.insert(dir_name.clone()) {
+                return Err(format!("Duplicate subskill directory name (sanitized collision): '{sub_name}' -> '{dir_name}'"));
+            }
+        }
+    }
+    let package_dir_name = safe_skill_dir_name(&name);
+    let package_dir = dir.join(&package_dir_name);
+    let legacy_file = dir.join(safe_skill_file_name(&name));
+    if package_dir.exists() && !overwrite {
+        return Err(format!("Skill package already exists and overwrite=false: {}", package_dir.display()));
+    }
+    if legacy_file.exists() && !overwrite {
+        return Err(format!("Legacy skill file blocks package creation and overwrite=false: {}", legacy_file.display()));
+    }
+    let main_content = build_skill_file_content(args)?;
+    let tmp_dir = dir.join(format!(".tmp-{}-{}", package_dir_name, std::process::id()));
+    if tmp_dir.exists() {
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+    let write_result: Result<Vec<String>, String> = (|| {
+        fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create temp skill package dir: {e}"))?;
+        let main_manifest = tmp_dir.join("SKILL.md");
+        fs::write(&main_manifest, &main_content).map_err(|e| format!("Failed to write skill manifest: {e}"))?;
+        if !resources.is_empty() {
+            write_resource_files(&tmp_dir, &resources)?;
+        }
+        let mut created_subskills: Vec<String> = Vec::new();
+        for sub in &subskills {
+            let sub_name = sub["name"].as_str().unwrap_or("").trim().to_string();
+            let sub_obj = sub.as_object().unwrap();
+            let mut sub_args = sub.clone();
+            if sub_obj.get("parent").and_then(|v| v.as_str()).unwrap_or("").trim().is_empty() {
+                if let Some(map) = sub_args.as_object_mut() {
+                    map.insert("parent".to_string(), Value::String(name.clone()));
+                }
+            }
+            let sub_content = build_skill_file_content(&sub_args)?;
+            let sub_dir_name = safe_skill_dir_name(&sub_name);
+            let sub_dir = tmp_dir.join("subskills").join(&sub_dir_name);
+            fs::create_dir_all(&sub_dir).map_err(|e| format!("Failed to create subskill dir {}: {e}", sub_dir.display()))?;
+            let sub_manifest = sub_dir.join("SKILL.md");
+            fs::write(&sub_manifest, sub_content).map_err(|e| format!("Failed to write subskill {sub_name}: {e}"))?;
+            if let Some(arr) = sub.get("resources").and_then(|v| v.as_array()) {
+                let mut sub_resources: Vec<(String, String)> = Vec::new();
+                for item in arr {
+                    if let Some(obj) = item.as_object() {
+                        let p = obj.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                        let c = obj.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        validate_resource_relative_path(&p)?;
+                        sub_resources.push((p, c));
+                    }
+                }
+                if !sub_resources.is_empty() {
+                    write_resource_files(&sub_dir, &sub_resources)?;
+                }
+            }
+            for (key, prefix) in [("references", "references"), ("examples", "examples"), ("scripts", "scripts")] {
+                if let Some(arr) = sub.get(key).and_then(|v| v.as_array()) {
+                    let mut cat_resources: Vec<(String, String)> = Vec::new();
+                    for item in arr {
+                        if let Some(obj) = item.as_object() {
+                            let raw = obj.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                            let c = obj.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let path = if raw.contains('/') { raw } else { format!("{prefix}/{raw}") };
+                            validate_resource_relative_path(&path)?;
+                            cat_resources.push((path, c));
+                        }
+                    }
+                    if !cat_resources.is_empty() {
+                        write_resource_files(&sub_dir, &cat_resources)?;
+                    }
+                }
+            }
+            created_subskills.push(sub_name);
+        }
+        Ok(created_subskills)
+    })();
+    let created_subskills = match write_result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+    };
+    // 原子发布：若目标已存在，先备份再替换，避免 remove+rename 窗口内崩溃导致数据丢失
+    if package_dir.exists() {
+        let backup = dir.join(format!(".bak-{}-{}", package_dir_name, std::process::id()));
+        if backup.exists() {
+            let _ = fs::remove_dir_all(&backup);
+        }
+        fs::rename(&package_dir, &backup)
+            .map_err(|e| format!("Failed to backup existing skill package {}: {e}", package_dir.display()))?;
+        match fs::rename(&tmp_dir, &package_dir) {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&backup);
+            }
+            Err(e) => {
+                // 回滚：尽力恢复原目录
+                let _ = fs::rename(&backup, &package_dir);
+                let _ = fs::remove_dir_all(&tmp_dir);
+                return Err(format!("Failed to publish skill package {}: {e}", package_dir.display()));
+            }
+        }
+    } else {
+        fs::rename(&tmp_dir, &package_dir)
+            .map_err(|e| format!("Failed to publish skill package {}: {e}", package_dir.display()))?;
+    }
+    if legacy_file.exists() {
+        let _ = fs::remove_file(&legacy_file);
+    }
+    let mut msg = format!("Skill package saved: {}\nSkill name: {}\nManifest: SKILL.md", package_dir.display(), name);
+    if !resources.is_empty() {
+        msg.push_str(&format!("\nResources: {} file(s)", resources.len()));
+    }
+    if !created_subskills.is_empty() {
+        msg.push_str(&format!("\nSub-skills: {}", created_subskills.join(", ")));
+    }
+    Ok(msg)
 }
 
 #[cfg(test)]
@@ -667,6 +1237,7 @@ mod tests {
             system_prompt: None,
             priority: 0,
             excludes: Vec::new(),
+            parent: None,
             source_path: None,
             resource_path: None,
         }

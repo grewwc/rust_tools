@@ -286,6 +286,7 @@ mod tests {
             system_prompt: None,
             priority: 0,
             excludes: Vec::new(),
+            parent: None,
             source_path: None,
             resource_path: None,
         }

@@ -45,7 +45,12 @@ pub(in crate::ai) fn cap_raw_tool_results_for_context(
     overflow_dir: Option<&Path>,
     cwd: Option<&Path>,
 ) -> usize {
-    cap_oversized_tool_results_for_context(messages, TOOL_RESULT_RAW_HARD_CAP_CHARS, overflow_dir, cwd)
+    cap_oversized_tool_results_for_context(
+        messages,
+        TOOL_RESULT_RAW_HARD_CAP_CHARS,
+        overflow_dir,
+        cwd,
+    )
 }
 
 /// 所有"自动压缩摘要" note 的前缀。写入端（生成摘要 note）与识别端
@@ -654,7 +659,13 @@ pub(in crate::ai) fn compress_messages_for_context(
     out.extend(
         older
             .iter()
-            .filter(|message| is_context_checkpoint_marker(message))
+            .filter(|message| {
+                // 摘要预算为 0（生产路径第二轮压缩等场景）时不会重建摘要；旧的摘要/
+                // 归档 note 本身就是"早期对话的压缩表示"，必须与 checkpoint marker
+                // 一样保留，否则 prepare_turn 已生成的摘要会在第二轮压缩中被静默丢弃。
+                is_context_checkpoint_marker(message)
+                    || (summary_max_chars == 0 && is_summary_or_archive_note(message))
+            })
             .cloned(),
     );
     out.extend_from_slice(recent);
@@ -1184,7 +1195,7 @@ fn shrink_messages_to_fit(
         480,
         KEEP_RECENT_TOOL_GROUPS,
         overflow_dir,
-            cwd,
+        cwd,
         protected_tool_call_ids,
     );
     // 先无条件外溢体量过大的旧 user/图片消息（保护尾窗除外），与
@@ -1314,7 +1325,7 @@ fn shrink_messages_to_fit_with_summary(
         480,
         KEEP_RECENT_TOOL_GROUPS,
         overflow_dir,
-            cwd,
+        cwd,
         protected_tool_call_ids,
     );
     enforce_protected_precision_group_budget(
@@ -1322,7 +1333,7 @@ fn shrink_messages_to_fit_with_summary(
         KEEP_RECENT_TOOL_GROUPS,
         max_chars / 2,
         overflow_dir,
-            cwd,
+        cwd,
         protected_tool_call_ids,
         false,
     );
@@ -1780,17 +1791,17 @@ fn choose_larger_mutable_field(
 }
 
 const CONTEXT_OVERFLOW_TRUNCATED_PREFIX: &str = "[context-overflow-truncated]";
+const CONTEXT_OVERFLOW_UNARCHIVED_POINTER: &str = "[context-overflow-truncated] full original was not archived; inline preview omitted to meet context budget.";
 
-/// 判断文本是否已经是 overflow-truncated marker（归档已落盘，路径内嵌在文本中）。
-fn is_context_overflow_truncated_marker(text: &str) -> bool {
+/// 判断文本是否已经是 overflow-truncated stub。无论原文是否成功落盘，它都不能在
+/// 后续压缩中被当成原文重新归档，否则会把仅存的预览误标为可完整回读的原文。
+fn is_context_overflow_truncated_stub(text: &str) -> bool {
     text.trim_start()
         .starts_with(CONTEXT_OVERFLOW_TRUNCATED_PREFIX)
-        && text.contains("archived at: ")
 }
 
-/// 从已存在的 overflow-truncated marker 中提取归档路径，折叠为最小指针。
-/// 当 target 太小时丢弃 head+tail 预览，只保留 marker + 路径 + 回读提示。
-/// 返回 None 表示无法解析路径或折叠后不会变短。
+/// 将已存在的 overflow-truncated stub 折叠为最小终态：有归档时保留路径；无归档
+/// 时明确说明完整原文不可回读，不能伪造归档指针。
 fn build_context_overflow_pointer(text: &str, target: usize) -> Option<String> {
     let path = text
         .lines()
@@ -1798,16 +1809,66 @@ fn build_context_overflow_pointer(text: &str, target: usize) -> Option<String> {
         .or_else(|| {
             text.split_once("archived at: ")
                 .map(|(_, rest)| rest.split([';', '\n']).next().unwrap_or(rest).trim())
-        })?;
-    // 优先尝试保留预览的完整形态（若 target 足够大）。
-    let full_pointer =
-        format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} full original archived at: {path}\n");
-    if full_pointer.chars().count() <= target {
-        return Some(full_pointer);
+        });
+    if let Some(path) = path {
+        // 优先尝试保留预览的完整形态（若 target 足够大）。
+        let full_pointer =
+            format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} full original archived at: {path}\n");
+        if full_pointer.chars().count() <= target {
+            return Some(full_pointer);
+        }
+        // target 仍然不够：只保留单行路径指针（无预览、无冗余文案）。
+        let minimal = format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} archived at: {path}");
+        return (minimal.chars().count() < text.chars().count()).then_some(minimal);
     }
-    // target 仍然不够：只保留单行路径指针（无预览、无冗余文案）。
-    let minimal = format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} archived at: {path}");
-    (minimal.chars().count() < text.chars().count()).then_some(minimal)
+    (CONTEXT_OVERFLOW_UNARCHIVED_POINTER.chars().count() <= target
+        && CONTEXT_OVERFLOW_UNARCHIVED_POINTER.chars().count() < text.chars().count())
+    .then(|| CONTEXT_OVERFLOW_UNARCHIVED_POINTER.to_string())
+}
+
+/// 已截断的 tool arguments 同样是终态。归档失败后只有 preview 留在上下文里，不能在
+/// 后续压缩中把它重新写盘并谎称保存了完整原始 arguments。
+fn is_context_overflow_truncated_tool_arguments(arguments: &str) -> bool {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .get("_context_overflow_truncated")
+                .and_then(Value::as_bool)
+                == Some(true)
+                && value.get("archive_file_path").is_some()
+        })
+}
+
+fn build_context_overflow_tool_arguments_pointer(arguments: &str, target: usize) -> Option<String> {
+    let value = serde_json::from_str::<Value>(arguments).ok()?;
+    if value
+        .get("_context_overflow_truncated")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || value.get("archive_file_path").is_none()
+    {
+        return None;
+    }
+    let archived_path = value
+        .get("archive_file_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty());
+    let pointer = match archived_path {
+        Some(path) => serde_json::json!({
+            "_context_overflow_truncated": true,
+            "archive_file_path": path,
+        })
+        .to_string(),
+        None => serde_json::json!({
+            "_context_overflow_truncated": true,
+            "archive_file_path": Value::Null,
+            "original_unavailable": true,
+        })
+        .to_string(),
+    };
+    (pointer.chars().count() <= target && pointer.chars().count() < arguments.chars().count())
+        .then_some(pointer)
 }
 
 fn truncate_mutable_field(
@@ -1835,7 +1896,7 @@ fn truncate_mutable_field(
             // 字段已经是 overflow-truncated marker（归档已存在，路径内嵌在文本中）：
             // 无需再次落盘，允许折叠为最小指针（marker + 路径，无预览），避免
             // PATH_C_PER_MSG_CAP(8000) > hard_target(如 5000) 时内层无法继续收敛。
-            if is_context_overflow_truncated_marker(&text) {
+            if is_context_overflow_truncated_stub(&text) {
                 if let Some(pointer) = build_context_overflow_pointer(&text, target) {
                     if pointer.chars().count() < original_chars {
                         message.content = Value::String(pointer);
@@ -1868,14 +1929,13 @@ fn truncate_mutable_field(
                     keep_ends_by_chars(&text, preview_budget)
                 ))
             };
-            let Some(truncated) = build_truncated(archive_path_hint.as_deref()) else {
+            let Some(truncated) = build_truncated(archive_path_hint.as_deref())
+                .filter(|candidate| candidate.chars().count() < original_chars)
+            else {
                 return false;
             };
-            // 固定协议文本可能比目标预算还长；只有严格变短才提交。
-            if truncated.chars().count() >= original_chars {
-                return false;
-            }
-            // 判定通过才落盘归档；用真实返回路径重建（正常与 hint 完全一致）。
+            // 仅当归档形式能保留足量 preview 时才截断；归档实际失败后才降级到
+            // 无路径内联 stub，避免把正常的长路径归档降格为不可回读的预览。
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
             let truncated = build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
@@ -1911,13 +1971,11 @@ fn truncate_mutable_field(
                     keep_ends_by_chars(reasoning, preview_budget)
                 ))
             };
-            let Some(truncated) = build_truncated(archive_path_hint.as_deref()) else {
+            let Some(truncated) = build_truncated(archive_path_hint.as_deref())
+                .filter(|candidate| candidate.chars().count() < original_chars)
+            else {
                 return false;
             };
-            if truncated.chars().count() >= original_chars {
-                return false;
-            }
-            // 判定通过才落盘归档；用真实返回路径重建（正常与 hint 完全一致）。
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
             let truncated = build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
@@ -1935,9 +1993,26 @@ fn truncate_mutable_field(
             };
             let original_chars = arguments.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
+            if is_context_overflow_truncated_tool_arguments(&arguments) {
+                let Some(pointer) =
+                    build_context_overflow_tool_arguments_pointer(&arguments, target)
+                else {
+                    return false;
+                };
+                let Some(call) = message
+                    .tool_calls
+                    .as_mut()
+                    .and_then(|calls| calls.get_mut(call_index))
+                else {
+                    return false;
+                };
+                call.function.arguments = pointer;
+                return true;
+            }
             // 固定 JSON 前缀 + 长归档路径可能吃光全部 target 预算（fixed_chars >=
-            // target 时 preview_budget 直接为 0），产出 preview 为空（或仅剩 1~2 个
-            // 字符）的 stub。这类 stub 不含任何实际参数信息，模型会把
+            // target 时 preview_budget 直接为 0）。此时拒绝截断：完整原文仍比没有
+            // 回读入口的极短预览更有价值。preview 为空（或仅剩 1~2 个字符）的 stub
+            // 不含任何实际参数信息，模型会把
             // `_context_overflow_truncated` / `archive_file_path` / `preview` 这些
             // 协议 key 误当成真实参数名回发，形成「stub 参数 → 工具返回指针 → 再发
             // stub 参数」的死循环。此处只拦空/近乎空的 preview；对巨大 arguments，
@@ -1953,30 +2028,29 @@ fn truncate_mutable_field(
                 })
                 .to_string()
             };
-            let fixed_chars = build_truncated(archive_path_hint.as_deref(), String::new())
-                .chars()
-                .count();
-            let mut preview_budget = target.saturating_sub(fixed_chars);
-            let mut preview_text = keep_ends_by_chars(&arguments, preview_budget);
-            let mut truncated = build_truncated(archive_path_hint.as_deref(), preview_text.clone());
-            // JSON escaping 可能让一个预览字符占用多个序列化字符，按实际超额收紧。
-            while truncated.chars().count() > target && preview_budget > 0 {
-                let excess = truncated.chars().count() - target;
-                preview_budget = preview_budget.saturating_sub(excess.max(1));
-                preview_text = keep_ends_by_chars(&arguments, preview_budget);
-                truncated = build_truncated(archive_path_hint.as_deref(), preview_text.clone());
-            }
-            // 循环收敛后再判定（初始预算够，但 JSON escaping 把它收紧到阈值以下的情况
-            // 也要拦住）：预览不足以承载真实参数信息时放弃截断。
-            if preview_text.chars().count() < MIN_TOOL_ARGS_PREVIEW_CHARS {
+            let build_candidate = |path: Option<&str>| -> Option<String> {
+                let fixed_chars = build_truncated(path, String::new()).chars().count();
+                let mut preview_budget = target.saturating_sub(fixed_chars);
+                let mut preview_text = keep_ends_by_chars(&arguments, preview_budget);
+                let mut candidate = build_truncated(path, preview_text.clone());
+                // JSON escaping 可能让一个预览字符占用多个序列化字符，按实际超额收紧。
+                while candidate.chars().count() > target && preview_budget > 0 {
+                    let excess = candidate.chars().count() - target;
+                    preview_budget = preview_budget.saturating_sub(excess.max(1));
+                    preview_text = keep_ends_by_chars(&arguments, preview_budget);
+                    candidate = build_truncated(path, preview_text.clone());
+                }
+                (preview_text.chars().count() >= MIN_TOOL_ARGS_PREVIEW_CHARS
+                    && candidate.chars().count() < original_chars)
+                    .then_some(candidate)
+            };
+            let Some(truncated) = build_candidate(archive_path_hint.as_deref()) else {
                 return false;
-            }
-            if truncated.chars().count() >= original_chars {
-                return false; // stub 不会更短：不归档、不改消息。
-            }
-            // 判定通过才落盘归档；用真实返回路径重建（正常与 hint 完全一致）。
+            };
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
+            // 写盘失败时重新按无路径 stub 计算 preview，避免无效路径白白挤掉上下文。
+            let truncated = build_candidate(archive_file_path.as_deref()).unwrap_or(truncated);
             let Some(call) = message
                 .tool_calls
                 .as_mut()
@@ -1985,7 +2059,7 @@ fn truncate_mutable_field(
                 return false;
             };
             // arguments 必须继续是合法 JSON；直接截字符串会让 provider 拒绝整次请求。
-            call.function.arguments = build_truncated(archive_file_path.as_deref(), preview_text);
+            call.function.arguments = truncated;
             true
         }
     }
@@ -2248,7 +2322,7 @@ pub(in crate::ai) fn mid_turn_compress(
         480,
         KEEP_RECENT_TOOL_GROUPS,
         overflow_dir,
-            cwd,
+        cwd,
         &protected_tool_call_ids,
     );
     if messages_total_chars(&out) <= soft_threshold {
@@ -2256,7 +2330,13 @@ pub(in crate::ai) fn mid_turn_compress(
         return (out, before, after);
     }
     // 3. 仍超额：用 shrink_messages_to_fit 走"折叠 tool group + 整体兜底"
-    out = shrink_messages_to_fit(out, soft_threshold, overflow_dir, cwd, &protected_tool_call_ids);
+    out = shrink_messages_to_fit(
+        out,
+        soft_threshold,
+        overflow_dir,
+        cwd,
+        &protected_tool_call_ids,
+    );
     let after = messages_total_chars(&out);
     (out, before, after)
 }

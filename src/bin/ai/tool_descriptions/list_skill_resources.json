@@ -1,0 +1,22 @@
+{
+  "name": "list_skill_resources",
+  "description": "List bundled resource files for an installed skill package (references/examples/scripts). Use proactively after `load_skill` to discover what reference material is available.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Skill name as shown in `list_skills`."
+      },
+      "category": {
+        "type": "string",
+        "description": "Optional filter: 'references', 'examples', or 'scripts'. When omitted, all bundled resources are listed."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of files to list (default: 100, max: 500)."
+      }
+    },
+    "required": ["name"]
+  }
+}

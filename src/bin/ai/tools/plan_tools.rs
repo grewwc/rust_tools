@@ -17,119 +17,22 @@ fn execute_plan(args: &Value) -> Result<String, String> {
         return Err("Plan must contain at least one step.".to_string());
     }
 
-    let mut formatted = String::new();
-    if !summary.is_empty() {
-        formatted.push_str(&format!("Plan: {}\n\n", summary));
-    }
-
-    for step_val in steps {
-        let step_obj = step_val
-            .as_object()
-            .ok_or("Each step must be a JSON object.")?;
-
-        let step_num = step_obj
-            .get("step")
-            .and_then(|v| v.as_u64())
-            .ok_or("Each step must have an integer 'step' field.")?;
-
-        let action = step_obj
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or("Each step must have an 'action' string field.")?;
-
-        let reason = step_obj
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        let tool = step_obj
-            .get("tool")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unspecified");
-
-        // delegate 与 parallelizable 相互独立：delegate 表示"该步交给 subagent 做"（串行或
-        // 并行均可）；parallelizable 表示"与前置步无数据依赖，可并发"（显式声明，不再由
-        // delegate 蕴含）。串行委派步应逐个走同步 `task`，绝不能因 delegate 被当成并发步。
-        let delegate = step_obj
-            .get("delegate")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let parallelizable = step_obj
-            .get("parallelizable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let prefix = if parallelizable { "  || " } else { "" };
-        let tags = if delegate { " [delegate]" } else { "" };
-        formatted.push_str(&format!(
-            "{}Step {}. [{}]{} {}\n",
-            prefix, step_num, tool, tags, action
-        ));
-        if !reason.is_empty() {
-            formatted.push_str(&format!("  Reason: {}\n", reason));
-        }
-    }
-
-    // 统计可委派/可并行步骤。delegate 不再自动计入 parallelizable。
-    let delegate_count: usize = steps
-        .iter()
-        .filter_map(|s| s.get("delegate").and_then(|v| v.as_bool()))
-        .filter(|&b| b)
-        .count();
-    let parallel_count: usize = steps
-        .iter()
-        .filter_map(|s| s.get("parallelizable").and_then(|v| v.as_bool()))
-        .filter(|&b| b)
-        .count();
-    let parallel_delegates: usize = steps
-        .iter()
-        .filter(|s| {
-            s.get("delegate").and_then(|v| v.as_bool()).unwrap_or(false)
-                && s.get("parallelizable")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-        })
-        .count();
-    let serial_delegates: usize = steps
-        .iter()
-        .filter(|s| {
-            s.get("delegate").and_then(|v| v.as_bool()).unwrap_or(false)
-                && !s
-                    .get("parallelizable")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-        })
-        .count();
-
-    formatted.push_str(&format!("\n---\n{} step(s) planned.", steps.len()));
-    if delegate_count > 0 {
-        formatted.push_str(&format!(
-            " {} step(s) marked for delegation.",
-            delegate_count
-        ));
-    }
-    if parallel_count > 0 {
-        formatted.push_str(&format!(" {} step(s) can run in parallel.", parallel_count));
-    }
-    // 委派派发建议：并行委派步（delegate && parallelizable）走并发 task_spawn；串行委派步
-    // （delegate && !parallelizable）逐个走同步 `task`，父进程在 prompt 中传递所需上下文。
-    if delegate_count > 0 {
-        if parallel_delegates >= 2 {
-            formatted.push_str(" Launch the parallel delegated steps concurrently via task_spawn, then collect with a single task_wait.");
-        } else if parallel_delegates == 1 && serial_delegates == 0 {
-            formatted.push_str(" Run the single delegated step with the synchronous `task` tool (async spawn+wait adds overhead without concurrency for one task).");
-        } else if parallel_delegates == 1 {
-            formatted.push_str(" Spawn the single parallel delegated step via task_spawn while you run the serial ones, then collect it with task_wait.");
-        }
-        if serial_delegates > 0 {
-            formatted.push_str(" Run serial delegated steps one at a time with the synchronous `task`, passing the needed context from prior results in the prompt; never run dependent steps concurrently.");
+    // 渲染走统一路径：按当前参数构建状态模型并经 `PlanState::render` 输出（与
+    // `plan_update` 共用同一渲染路径，不再在 execute_plan 里维护一套重复格式化）。
+    // 随后尝试把本次规划登记为会话级状态（plan_update 据此更新）；登记失败不阻塞
+    // plan 输出本身，但追加提示行，避免损坏/不可写的状态文件被静默吞没。
+    let rendered = crate::ai::tools::plan_state::PlanState::build(summary, steps, None)?.render();
+    if let Some(app) = crate::ai::driver::runtime_ctx::try_current().map(|ctx| ctx.app_proto.clone()) {
+        match crate::ai::tools::plan_state::record_plan(&app, summary, steps) {
+            // 登记成功：按持久化状态渲染（重规划时保留已完成步骤的后缀与进度行）。
+            Ok(state) => Ok(state.render()),
+            Err(e) => Ok(format!(
+                "{rendered}\nWarning: could not register this plan as session state (plan_update will fail until this is fixed): {e}\n"
+            )),
         }
     } else {
-        formatted.push_str(" Proceed to execute, but reconsider: any substantive step with real intermediate reads or commands is usually better delegated to a subagent (cleaner, focused context); keep only trivial single-tool steps and final review in the parent.");
+        Ok(rendered)
     }
-    formatted.push('\n');
-
-    Ok(formatted)
 }
 
 inventory::submit!(ToolRegistration {
@@ -352,5 +255,98 @@ mod tests {
         assert!(result.contains("one at a time with the synchronous `task`"));
         assert!(result.contains("1 step(s) can run in parallel."));
         assert!(result.contains("2 step(s) marked for delegation."));
+    }
+
+    #[test]
+    fn test_replan_echo_keeps_completed_steps_status() {
+        use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+        use crate::ai::mcp::{McpClient, SharedMcpClient};
+        use crate::ai::tools::plan_state::StepStatus;
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Drop guard：即使断言 panic 也保证临时目录被清理，避免测试失败泄漏垃圾目录。
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        // 回归：plan_update 把步骤标记为 done 后，重新调用 `plan`（修订计划、续会话
+        // 压缩后重锚定都会触发）的回显必须带持久化的状态后缀与进度行。此前 execute_plan
+        // 只按原始参数渲染，重规划后已完成步骤的状态从回显中消失，agent 会误以为进度
+        // 丢失而从头开始。
+        let base = std::env::temp_dir().join(format!(
+            "plan-tools-replan-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _guard = TempDirGuard(base.clone());
+        let mut app = crate::ai::middleware::test_util::test_app();
+        // plan 状态路径由 `session_history_file` 推导（见 plan_state::store::plan_state_path），
+        // 不是 `config.history_file`。必须把它指到临时目录内，否则测试会把 plan-state.json
+        // 写到共享的 `default.assets/`（session_history_file 为空时的回退路径），造成跨测试
+        // 运行的状态泄漏与"首轮通过、次轮必挂"的抖动。
+        app.session_history_file = base.join("session.sqlite");
+        app.session_id = "plan-tools-replan-test".to_string();
+
+        let args = serde_json::json!({
+            "summary": "Sequential read then patch",
+            "steps": [
+                { "step": 1, "action": "Read file A", "tool": "read_file" },
+                { "step": 2, "action": "Patch file A", "tool": "apply_patch" }
+            ]
+        });
+
+        let ctx = DriverContext::new(
+            app.clone(),
+            Arc::new(Mutex::new(McpClient::new())) as SharedMcpClient,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+
+        let result = DRIVER_CTX.sync_scope(ctx, || {
+            // 首次规划：全新计划，全部 pending，无状态后缀。
+            let first = execute_plan(&args).unwrap();
+            assert!(!first.contains("(done)"));
+            assert!(!first.contains("Progress: 1/2 steps done."));
+
+            // 完成第 1 步并落盘（即 plan_update 走过的 load→mutate→save 路径）。
+            crate::ai::tools::plan_state::update_plan_step(
+                &app,
+                1,
+                StepStatus::Done,
+                None,
+            )
+            .unwrap();
+
+            // 重新调用 plan（同参数重新规划）：回显必须保留已完成步骤的 (done) 后缀，
+            // 并显示进度行；未完成的第 2 步保持无状态后缀。
+            let replan = execute_plan(&args).unwrap();
+            assert!(
+                replan.contains("Step 1. [read_file] Read file A (done)"),
+                "completed step must keep (done) suffix in re-plan echo:\n{replan}"
+            );
+            assert!(
+                replan.contains("Progress: 1/2 steps done."),
+                "re-plan echo must show progress line:\n{replan}"
+            );
+            assert!(
+                replan.contains("Step 2. [apply_patch] Patch file A\n"),
+                "pending step must stay suffix-free in re-plan echo:\n{replan}"
+            );
+            replan
+        });
+
+        assert!(
+            result.contains("(done)"),
+            "re-plan echo must keep (done) for the completed step:\n{result}"
+        );
     }
 }

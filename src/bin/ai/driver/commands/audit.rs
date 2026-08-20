@@ -362,10 +362,9 @@ fn is_inside_git_work_tree(cwd: &Path) -> bool {
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> String {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
+    crate::fork_guard::output(
+        std::process::Command::new("git").args(args).current_dir(cwd),
+    )
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())

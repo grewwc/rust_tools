@@ -151,8 +151,8 @@ pub(super) fn inject_target_repeat_loop_note(messages: &mut Vec<crate::ai::histo
     });
 }
 
-/// 同目标「从头重读」重扫软提示：同一文件被反复从文件头开始读（页宽每轮都变、
-/// 或混入每轮不同的新归档路径），已累计多次从头重读。
+    /// 同目标「从头重读」重扫软提示：同一文件被反复从文件头开始读（页宽每轮都变、
+    /// 或混入每轮不同的新归档路径），已累计多次从头重读。
 pub(super) fn inject_target_rescan_note(
     messages: &mut Vec<crate::ai::history::Message>,
     target: &str,
@@ -161,9 +161,10 @@ pub(super) fn inject_target_rescan_note(
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-        "[target-rescan] File `{target}` has been re-read from the beginning {reads} times within the recent window.\n\
-        If you have already covered the full content, converge now and answer based on the evidence you have; if you still need more of that file, delegate the remaining exploration to a subagent with the exact file and range to inspect.\n\
-        If you really must re-read it yourself, write down exactly which new piece of information you expect to gain and why."
+            "[target-rescan] File `{target}` has been re-read from the beginning {reads} times within the recent window.\n\
+            If you have already covered the full content, converge now and answer based on the evidence you have; if you still need more of that file, delegate the remaining exploration to a subagent with the exact file and range to inspect.\n\
+            Re-reading the same range injects byte-identical content: it is suppressed/deduped and does NOT count as new progress. What you already read is still in this turn's context (or archived - see its preserved stub's `file_path`); do not re-read it from the top. Continue from the exact offset you last reached, or use `search_overflow` to locate the archived content.\n\
+            If you really must re-read it yourself, write down exactly which new piece of information you expect to gain and why."
     );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -174,7 +175,7 @@ pub(super) fn inject_target_rescan_note(
     });
 }
 
-/// 同目标「从头重读」重扫硬停止：同一文件从头重读超过硬阈值，判定为翻页+混轮
+    /// 同目标「从头重读」重扫硬停止：同一文件从头重读超过硬阈值，判定为翻页+混轮
 /// 循环，强制无工具收口。
 pub(super) fn inject_target_rescan_hard_stop_note(
     messages: &mut Vec<crate::ai::history::Message>,
@@ -184,7 +185,8 @@ pub(super) fn inject_target_rescan_hard_stop_note(
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-        "[low-yield-hard-stop] File `{target}` has been re-read from the beginning {reads} times within recent rounds; this is judged a pagination loop.\n\
+            "[low-yield-hard-stop] File `{target}` has been re-read from the beginning {reads} times within recent rounds; this is judged a pagination loop.\n\
+            The content you already read is still available in this turn's context or archived (see preserved stubs' `file_path`); base your conclusion on it instead of re-reading.\n\
         From now on you are in no-tool wrap-up mode: do not issue any more tool calls;\n\
         give a phase summary and current conclusion based on existing information; if the task is not yet complete, clearly state the current gap, remaining work, and suggested next steps."
     );

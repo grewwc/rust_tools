@@ -31,6 +31,9 @@ pub(in crate::ai) mod tool_result;
 mod types;
 
 pub(super) use orchestrator::run_turn;
+// 早期步骤将 checkpoint/progress 声明为 orchestrator 私有子模块，但 execution.rs 以
+// `turn_runtime::checkpoint|progress` 引用；此处 re-export 恢复 turn_runtime 层可见性。
+pub(crate) use orchestrator::{checkpoint, progress};
 #[cfg(test)]
 use persistence::persist_pending_turn_messages;
 pub(crate) use prepare::QuestionShape;
@@ -467,6 +470,9 @@ mod tests {
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
             stale_patch_targets: Default::default(),
+            tool_middlewares: Vec::new(),
+            llm_middlewares: Vec::new(),
+            hooks: Default::default(),
         }
     }
 

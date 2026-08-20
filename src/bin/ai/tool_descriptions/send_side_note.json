@@ -1,0 +1,18 @@
+{
+  "name": "send_side_note",
+  "description": "Send a real-time side-note to a running subagent task to guide it when it drifts. The note is injected at the next iteration before the subagent's next LLM request.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "task_id": {
+        "type": "string",
+        "description": "Target subagent task id (from `task` / `task_spawn`). For foreground guidance use empty or omit."
+      },
+      "note": {
+        "type": "string",
+        "description": "Guidance content (keep concise, 1-3 sentences, max 8000 chars)."
+      }
+    },
+    "required": ["note"]
+  }
+}

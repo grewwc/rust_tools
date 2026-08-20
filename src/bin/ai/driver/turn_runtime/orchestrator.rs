@@ -54,7 +54,8 @@ const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_COARSE_HARD_WINDOW + 2;
 /// target 三道整轮检测；这里按目标累计「从文件头开始读」的次数——第 3 次注入
 /// 软提示，第 4 次硬停止。write_file/apply_patch 修改该目标会清零（编辑后从头
 /// 重读验证是合法行为）。计数不随 soft 清空、不被 made_progress 重置。
-const TARGET_RESCAN_SOFT_THRESHOLD: u32 = 3;
+// P1-2：同一文件连续 2 次「从头重读」即发软提示，尽早引导模型停止翻页式重读。
+const TARGET_RESCAN_SOFT_THRESHOLD: u32 = 2;
 const TARGET_RESCAN_HARD_THRESHOLD: u32 = 4;
 /// 从头重读计数窗口（轮）：目标距上次从头读取超过该轮数时，计数视为过期并从 1
 /// 重新累计。真正的翻页循环每轮/隔轮都从头读同一文件 → 计数不会过期、4 轮内必然
@@ -156,13 +157,13 @@ impl ScopedPreflightTargets {
 // 因此这里必须用 #[path] 显式固定到同级文件，否则报 E0583。
 
 #[path = "checkpoint.rs"]
-mod checkpoint;
+pub(crate) mod checkpoint;
 #[path = "loop_detection.rs"]
 mod loop_detection;
 #[path = "notes.rs"]
 mod notes;
 #[path = "progress.rs"]
-mod progress;
+pub(crate) mod progress;
 
 use checkpoint::*;
 use loop_detection::*;
@@ -770,46 +771,75 @@ pub(in crate::ai::driver) async fn run_turn(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
-    // `/audit` 是用户直接请求的同步子代理调用。必须在父 DRIVER_CTX 已建立、
-    // 子 agent 尚未进入递归 turn 前处理，才能复用 task 的隔离与证据生命周期。
-    if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
-        if let Some(command) = crate::ai::driver::commands::audit::parse_audit_command(&question) {
-            return Ok(execute_audit_command(app, command, should_quit));
-        }
-    }
-    // 把 (session_id, turn_id) 注入 task_local，让下游工具调用与反馈
-    // 写入路径能拿到正确身份。turn_id 由 session SQLite 原子分配，包含普通、
-    // resume 和 internal turn，跨重启/多进程也不会重复。
-    let session_id = app.session_id.clone();
+    // Step 3：turn 起点钩子（保留原配对语义，必须在 /audit 短路之前触发）
+    // 先分配真实 turn 身份（session SQLite 原子递增）再触发起点钩子：
+    // 让 on_turn_start / on_turn_end 读到真实 turn_index，而非伪造的 0。
+    // 分配失败 = 本轮未开始，直接返回，不触发任何生命周期钩子（起点/终点配对保持）。
     let turn_index = history::reserve_turn_index(&app.session_history_file)?;
-    let turn_id = turn_index;
-    // 仅前台主 turn 抬起「turn 活动」标志：子 agent（sync / background）持有私有
-    // 信号标志，且都通过 SUBAGENT_RESULT_SLOT 作用域执行，据此排除。该标志让
-    // prepare / 思考 / 阶段切换 / mid-turn 压缩等 streaming=false 的空窗里的
-    // Ctrl+C 也走「取消本轮」而非「退出会话」。guard 随本 future drop 自动落下。
-    let _foreground_turn_guard = (!crate::ai::driver::runtime_ctx::has_subagent_result_slot())
-        .then(crate::ai::driver::signal::ForegroundTurnGuard::enter);
-    crate::ai::driver::runtime_ctx::TURN_IDENTITY
-        .scope((session_id, turn_id), async {
-            // enable_tools 的 per-turn 状态必须跟随整个 future，而不能只依赖
-            // run_turn_body 的 happy-path 尾部清理；abort / early return 也会 Drop。
-            let _enable_turn_guard = crate::ai::tools::enable_tools::EnableTurnStateGuard::enter();
-            run_turn_body(
-                app,
-                mcp_client,
-                skill_manifests,
-                history_count,
-                turn_index,
-                question,
-                attachments_text,
-                next_model,
-                precomputed_ocr,
-                one_shot_mode,
-                should_quit,
-            )
+    app.fire_turn_start_hooks(turn_index);
+
+    let result = (async {
+        // `/audit` 是用户直接请求的同步子代理调用。必须在父 DRIVER_CTX 已建立、
+        // 子 agent 尚未进入递归 turn 前处理，才能复用 task 的隔离与证据生命周期。
+        if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
+            if let Some(command) = crate::ai::driver::commands::audit::parse_audit_command(&question) {
+                return Ok(execute_audit_command(app, command, should_quit));
+            }
+        }
+        // 把 (session_id, turn_id) 注入 task_local，让下游工具调用与反馈
+        // 写入路径能拿到正确身份。turn_id 由 session SQLite 原子分配，包含普通、
+        // resume 和 internal turn，跨重启/多进程也不会重复。
+        let session_id = app.session_id.clone();
+        let turn_id = turn_index;
+        // 仅前台主 turn 抬起「turn 活动」标志：子 agent（sync / background）持有私有
+        // 信号标志，且都通过 SUBAGENT_RESULT_SLOT 作用域执行，据此排除。该标志让
+        // prepare / 思考 / 阶段切换 / mid-turn 压缩等 streaming=false 的空窗里的
+        // Ctrl+C 也走「取消本轮」而非「退出会话」。guard 随本 future drop 自动落下。
+        let _foreground_turn_guard = (!crate::ai::driver::runtime_ctx::has_subagent_result_slot())
+            .then(crate::ai::driver::signal::ForegroundTurnGuard::enter);
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY
+            .scope((session_id, turn_id), async {
+                // enable_tools 的 per-turn 状态必须跟随整个 future，而不能只依赖
+                // run_turn_body 的 happy-path 尾部清理；abort / early return 也会 Drop。
+                let _enable_turn_guard = crate::ai::tools::enable_tools::EnableTurnStateGuard::enter();
+                // 整个 turn（prepare / 流式 / thinking / 工具执行 / finalize）期间开启
+                // 同终端 side-note 输入监听（Ctrl+G）。RAII 守卫随本 future 结束 drop，
+                // 恢复 canonical 终端，保证 turn 之间 prompt_user 输入框不受残留 cbreak
+                // 影响。子 agent（depth>0）/ 后台（终端输出抑制）/ 非 tty stdin 由
+                // side_note_input_enabled() 排除；turn 内无其它 stdin 消费者（输入框只在
+                // turn 之间打开，request_user_input 仅置标记不读 stdin），cbreak 全程接管
+                // stdin 无冲突。
+                let _side_note_input =
+                    if crate::ai::stream::side_note_input::side_note_input_enabled() {
+                        Some(crate::ai::stream::side_note_input::SideNoteInputGuard::spawn(
+                            app.session_history_file.clone(),
+                        ))
+                    } else {
+                        None
+                    };
+                run_turn_body(
+                    app,
+                    mcp_client,
+                    skill_manifests,
+                    history_count,
+                    turn_index,
+                    question,
+                    attachments_text,
+                    next_model,
+                    precomputed_ocr,
+                    one_shot_mode,
+                    should_quit,
+                )
+                .await
+            })
             .await
-        })
-        .await
+    })
+    .await;
+
+    // Step 3：turn 终点钩子。覆盖所有返回路径（含 /audit 短路），与起点配对。
+    app.fire_turn_end_hooks(turn_index);
+
+    result
 }
 
 fn execute_audit_command(
@@ -930,6 +960,11 @@ async fn run_turn_body(
         &mut persisted_turn_messages,
     );
 
+    // 历史预算压缩由 prepare_turn 统一负责（按 history_max_chars 构建带摘要/溢出指针的
+    // 投影），mid-turn 预算路径负责长轮次兜底；此处不再挂第二遍 pipeline（无论真压还是
+    // observe-only 都会引入每 turn 的 clone+推演开销，且真压第二遍会丢不可恢复的上下文）。
+    // pipeline 模块仍保留为可选的测试/观测基建，需要时在调用方按 stage 显式挂载。
+
     let mut supervisor = TurnSupervisor::default();
     let mut force_final_response = false;
     let mut pre_timeout_wrap_up_requested = false;
@@ -1045,6 +1080,23 @@ async fn run_turn_body(
             record_force_final_reason(&mut messages, "subagent_pre_timeout_wrap_up", iteration, None);
             force_final_response = true;
             inject_subagent_pre_timeout_wrap_up_note(&mut messages);
+        }
+        // side-note 实时引导：每次迭代顶部把文件队列里的引导注入上下文，下一轮 LLM 立刻可见。
+        // 对前景任务与 subagent 均生效；subagent 通过 task_local SUBAGENT_TASK_ID
+        // （回退到 AIOS_SUBAGENT_TASK_ID / SUBAGENT_TASK_ID 环境变量）区分目标。
+        // 统一走 side_note::poll_and_inject 避免两套注入路径分叉与原文回显泄露。
+        {
+            let before = messages.len();
+            let cnt =
+                crate::ai::driver::side_note::poll_and_inject(&app.session_history_file, &mut messages);
+            if cnt > 0 {
+                let injected = messages[before..].to_vec();
+                turn_messages.extend(injected);
+                crate::ai::driver::print::print_tool_note_line(
+                    "side-note",
+                    &format!("injected {cnt} note(s)"),
+                );
+            }
         }
         let active_skill_name = skill_turn.primary_skill_name().map(str::to_string);
         let compression_report = std::mem::take(&mut supervisor.pending_compression_report);

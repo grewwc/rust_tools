@@ -1,6 +1,6 @@
 {
   "name": "plan",
-  "description": "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly.",
+  "description": "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly. The plan is the roadmap for the whole task: keep its status current with `plan_update` and revise it with a fresh `plan` call when the task's shape changes.",
   "parameters": {
     "type": "object",
     "properties": {

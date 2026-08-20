@@ -58,7 +58,7 @@ fn open_browser(url: &str) {
     } else {
         "xdg-open"
     };
-    let _ = std::process::Command::new(program).arg(url).status();
+    let _ = crate::fork_guard::status(std::process::Command::new(program).arg(url));
 }
 
 fn run_feishu_oauth_flow(

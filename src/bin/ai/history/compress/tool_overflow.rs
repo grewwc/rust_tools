@@ -153,7 +153,9 @@ pub(super) fn prepare_tool_messages_structured(
                         .tool_call_id
                         .as_deref()
                         .and_then(|id| id_to_tool_args.get(id))
-                        .and_then(|args| preserved_tool_overflow_path_in_arguments(name, args, dir, cwd))
+                        .and_then(|args| {
+                            preserved_tool_overflow_path_in_arguments(name, args, dir, cwd)
+                        })
                 });
                 let reused_existing = existing_asset_path.is_some();
                 if let Some(path) = existing_asset_path.or_else(|| {
@@ -244,7 +246,9 @@ pub(super) fn cap_oversized_tool_results_for_context(
         let existing_asset_path = overflow_dir.and_then(|dir| {
             tool_call_id
                 .and_then(|id| id_to_tool_args.get(id))
-                .and_then(|args| preserved_tool_overflow_path_in_arguments(tool_name, args, dir, cwd))
+                .and_then(|args| {
+                    preserved_tool_overflow_path_in_arguments(tool_name, args, dir, cwd)
+                })
         });
         let replacement = existing_asset_path
             .or_else(|| {
@@ -345,7 +349,9 @@ pub(super) fn enforce_protected_precision_group_budget(
             let tool_call_id = messages[idx].tool_call_id.as_deref();
             let existing_asset_path = tool_call_id
                 .and_then(|id| id_to_tool_args.get(id))
-                .and_then(|args| preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir, cwd));
+                .and_then(|args| {
+                    preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir, cwd)
+                });
             let (path, wrote_new) = if let Some(path) = existing_asset_path {
                 (path, false)
             } else {
@@ -365,8 +371,7 @@ pub(super) fn enforce_protected_precision_group_budget(
                 .and_then(|id| id_to_tool_args.get(id))
                 .map(|args| build_tool_overflow_recall_lines(&tool_name, args))
                 .unwrap_or_default();
-            let stub =
-                build_preserved_tool_overflow_stub(&path, &tool_name, &text, &recall_lines);
+            let stub = build_preserved_tool_overflow_stub(&path, &tool_name, &text, &recall_lines);
             // 外溢必须严格腾出空间：小结果换成更大的 stub 是膨胀而非压缩，
             // 会虚增预算占用且让模型看不到真实结果（死循环放大因素）。
             // 膨胀时删除刚写的文件、保留原文，与 Path C 的防膨胀守卫一致。
@@ -416,9 +421,9 @@ pub(super) fn spill_protected_precision_to_fit(
             let text = value_to_string(&message.content);
             // 当前轮若直接回读本 session 的 archive，Path C 不能再复制一份原文。
             // 复用原 asset 的指针既保住 hard target，又避免「外溢→回读→再外溢」循环。
-            let existing_asset_path = id_to_tool_args
-                .get(id)
-                .and_then(|args| preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir, cwd));
+            let existing_asset_path = id_to_tool_args.get(id).and_then(|args| {
+                preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir, cwd)
+            });
             (!text.trim().is_empty()
                 && !is_preserved_tool_overflow_stub(&text)
                 && !tool_history_policy(tool_name).allows_lossy_compress())
@@ -548,7 +553,10 @@ fn preserved_tool_overflow_path_in_arguments(
 
 /// 校验 raw 路径为 `tool-overflow-compressed` 的直接子文件；两端 canonicalize。
 fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) -> Option<PathBuf> {
-    let preserved_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).canonicalize().ok()?;
+    let preserved_dir = overflow_dir
+        .join(PRESERVED_TOOL_OVERFLOW_DIR)
+        .canonicalize()
+        .ok()?;
     // 必须与 read_file 共用相同的 relative-path 解析规则；直接 canonicalize 会错误地
     // 以进程 cwd 为基准，忽略 subagent 的 effective_cwd。
     let source_path = FileStore::new(PathBuf::from(raw_path))
@@ -564,8 +572,15 @@ fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) -> Option<P
 /// 从 execute_command 的 `command` 字符串中识别「读取本 session 归档 asset」的路径。
 /// 匹配 archive 直接子文件的绝对路径、相对 effective_cwd 的路径或裸文件名
 /// （文件名含 uuid，基本唯一）。archive 数量有限，每轮压缩扫描成本可接受。
-fn archived_asset_path_in_command(command: &str, overflow_dir: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
-    let preserved_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).canonicalize().ok()?;
+fn archived_asset_path_in_command(
+    command: &str,
+    overflow_dir: &Path,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    let preserved_dir = overflow_dir
+        .join(PRESERVED_TOOL_OVERFLOW_DIR)
+        .canonicalize()
+        .ok()?;
     for entry in std::fs::read_dir(&preserved_dir).ok()?.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -707,14 +722,20 @@ mod tests {
             stub.contains("- original_range: lines=120..159"),
             "stub: {stub}"
         );
-        assert!(stub.contains("完整结果快照"), "stub: {stub}");
+        assert!(
+            stub.contains("Archived snapshot of an earlier read"),
+            "stub: {stub}"
+        );
 
         let anchor = collapse_overflow_stub_to_anchor(&stub).expect("stub should collapse");
         assert!(
             anchor.contains("- original_file_path: src/lib.rs"),
             "anchor: {anchor}"
         );
-        assert!(anchor.contains("完整结果快照"), "anchor: {anchor}");
+        assert!(
+            anchor.contains("Archived snapshot of an earlier read"),
+            "anchor: {anchor}"
+        );
 
         let _ = std::fs::remove_dir_all(overflow_dir);
     }
@@ -772,7 +793,7 @@ mod tests {
         );
         assert!(stub.contains("- original_cwd: /repo"), "stub: {stub}");
         assert!(
-            stub.contains("优先根据 `original_command` / `original_cwd` 继续判断"),
+            stub.contains("Continue from `original_command` / `original_cwd`"),
             "stub: {stub}"
         );
 
@@ -878,10 +899,8 @@ mod tests {
         // group 外溢时，必须复用既有归档文件（stub 指向同一文件），而不是铸造
         // 随机名新文件——否则「外溢→回读→再外溢」每次回读都会生成新 archive，
         // 形成无界链，模型永远拿不到稳定的内容。
-        let overflow_dir = std::env::temp_dir().join(format!(
-            "ai-precision-group-reuse-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let overflow_dir =
+            std::env::temp_dir().join(format!("ai-precision-group-reuse-{}", uuid::Uuid::new_v4()));
         // 1) 用 Path C 生成一个归档 asset
         let mut messages = vec![
             assistant_call("spill", "read_file"),
@@ -937,17 +956,19 @@ mod tests {
 
     #[test]
     fn cap_oversized_reuses_reread_archive_asset_instead_of_rearchiving() {
-        let overflow_dir = std::env::temp_dir().join(format!(
-            "ai-cap-reread-reuse-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let overflow_dir =
+            std::env::temp_dir().join(format!("ai-cap-reread-reuse-{}", uuid::Uuid::new_v4()));
         // 1) 先由 cap 自身写一个归档 asset
         let mut messages = vec![
             assistant_call("first", "read_file"),
             tool_result("first", &"y".repeat(70_000)),
         ];
-        let capped =
-            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
+        let capped = cap_oversized_tool_results_for_context(
+            &mut messages,
+            64_000,
+            Some(&overflow_dir),
+            None,
+        );
         assert!(capped > 0);
         let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
         let archive_path = std::fs::read_dir(&archive_dir)
@@ -964,8 +985,12 @@ mod tests {
             assistant_call_args("re-read", "read_file", &read_args.to_string()),
             tool_result("re-read", &raw),
         ];
-        let capped =
-            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
+        let capped = cap_oversized_tool_results_for_context(
+            &mut messages,
+            64_000,
+            Some(&overflow_dir),
+            None,
+        );
         assert_eq!(capped, 1);
         assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
         let stub_text = value_to_string(&messages[1].content);
@@ -979,10 +1004,8 @@ mod tests {
 
     #[test]
     fn prepare_structured_reuses_reread_archive_asset_instead_of_rearchiving() {
-        let overflow_dir = std::env::temp_dir().join(format!(
-            "ai-prepare-reread-reuse-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let overflow_dir =
+            std::env::temp_dir().join(format!("ai-prepare-reread-reuse-{}", uuid::Uuid::new_v4()));
         // 1) 先由 prepare 写一个归档 asset（旧 read_file 结果，超出 480 阈值、非尾窗）
         let mut messages = vec![
             assistant_call("first", "read_file"),
@@ -1052,7 +1075,14 @@ mod tests {
         };
 
         let mut first = build();
-        prepare_tool_messages_structured(&mut first, 480, 1, Some(&overflow_dir), None, &FxHashSet::default());
+        prepare_tool_messages_structured(
+            &mut first,
+            480,
+            1,
+            Some(&overflow_dir),
+            None,
+            &FxHashSet::default(),
+        );
         let first_stub = value_to_string(&first[1].content);
         assert!(is_preserved_tool_overflow_stub(&first_stub), "{first_stub}");
         assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
@@ -1060,7 +1090,14 @@ mod tests {
         // 第二次投影：同一条 canonical 结果（同 tool_call_id + 同正文）再次被压缩。
         // 确定性命名 → 命中既有文件、不新增副本，stub 文本逐轮稳定。
         let mut second = build();
-        prepare_tool_messages_structured(&mut second, 480, 1, Some(&overflow_dir), None, &FxHashSet::default());
+        prepare_tool_messages_structured(
+            &mut second,
+            480,
+            1,
+            Some(&overflow_dir),
+            None,
+            &FxHashSet::default(),
+        );
         let second_stub = value_to_string(&second[1].content);
         assert_eq!(
             second_stub, first_stub,
@@ -1081,10 +1118,8 @@ mod tests {
         // 换成带完整 head/tail 预览的 stub 反而更大。防膨胀守卫必须保留原文内联，
         // 不写归档文件——否则模型看到「已卸载，请重读」而反复回读（会话 9f4d0fae 的
         // 「读结果一直被归档成 stub」正是此路径：673 字符 grep 被换成更大的 stub）。
-        let overflow_dir = std::env::temp_dir().join(format!(
-            "ai-prepare-small-inline-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let overflow_dir =
+            std::env::temp_dir().join(format!("ai-prepare-small-inline-{}", uuid::Uuid::new_v4()));
         // 20 行、每行 ~30 字符 ≈ 600 字符：超过 max_chars_per_msg=480，但整段会被
         // 预览逐字包含，stub 必然不小于原文。
         let grep_like = (0..20)
@@ -1099,14 +1134,26 @@ mod tests {
             tool_result("recent", "recent result"),
         ];
 
-        prepare_tool_messages_structured(&mut messages, 480, 1, Some(&overflow_dir), None, &FxHashSet::default());
+        prepare_tool_messages_structured(
+            &mut messages,
+            480,
+            1,
+            Some(&overflow_dir),
+            None,
+            &FxHashSet::default(),
+        );
 
         let content = value_to_string(&messages[1].content);
         assert_eq!(content, grep_like, "小的多行精确结果必须保留原文内联");
-        assert!(!is_preserved_tool_overflow_stub(&content), "不应被换成 stub");
+        assert!(
+            !is_preserved_tool_overflow_stub(&content),
+            "不应被换成 stub"
+        );
         // 没有归档文件被写出（膨胀时删除新建文件；此处应压根没写成功的净收益）。
         let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
-        let archived = std::fs::read_dir(&archive_dir).map(|d| d.count()).unwrap_or(0);
+        let archived = std::fs::read_dir(&archive_dir)
+            .map(|d| d.count())
+            .unwrap_or(0);
         assert_eq!(archived, 0, "膨胀结果不得留下归档文件");
 
         let _ = std::fs::remove_dir_all(&overflow_dir);
@@ -1114,17 +1161,19 @@ mod tests {
 
     #[test]
     fn cap_reuses_execute_command_cat_archive_instead_of_rearchiving() {
-        let overflow_dir = std::env::temp_dir().join(format!(
-            "ai-cap-cat-reuse-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let overflow_dir =
+            std::env::temp_dir().join(format!("ai-cap-cat-reuse-{}", uuid::Uuid::new_v4()));
         // 1) 先由 cap 写一个 execute_command 归档 asset
         let mut messages = vec![
             assistant_call("run", "execute_command"),
             tool_result("run", &"log line\n".repeat(30_000)),
         ];
-        let capped =
-            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
+        let capped = cap_oversized_tool_results_for_context(
+            &mut messages,
+            64_000,
+            Some(&overflow_dir),
+            None,
+        );
         assert!(capped > 0);
         let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
         let archive_path = std::fs::read_dir(&archive_dir)
@@ -1144,8 +1193,12 @@ mod tests {
             assistant_call_args("re-cat", "execute_command", &run_args.to_string()),
             tool_result("re-cat", &raw),
         ];
-        let capped =
-            cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
+        let capped = cap_oversized_tool_results_for_context(
+            &mut messages,
+            64_000,
+            Some(&overflow_dir),
+            None,
+        );
         assert_eq!(capped, 1);
         assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
         let stub_text = value_to_string(&messages[1].content);
@@ -1172,8 +1225,13 @@ mod tests {
             messages.push(tool_result(&id, &"line of exact evidence\n".repeat(600)));
         }
 
-        let spilled =
-            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected);
+        let spilled = spill_protected_precision_to_fit(
+            &mut messages,
+            0,
+            Some(&overflow_dir),
+            None,
+            &protected,
+        );
 
         // 覆盖 Path C 的后半段：spill 后仍超预算时会进入 emergency cap。所有
         // preserved stub 必须先缩成不可截断的最小指针，不能再被通用 head/tail 截断。
@@ -1239,9 +1297,15 @@ mod tests {
             tool_result("reread", &content),
         ];
 
-        let spilled = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
-            .sync_scope(effective_cwd, || {
-                spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected)
+        let spilled =
+            crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(effective_cwd, || {
+                spill_protected_precision_to_fit(
+                    &mut messages,
+                    0,
+                    Some(&overflow_dir),
+                    None,
+                    &protected,
+                )
             });
 
         assert_eq!(spilled, 1);
@@ -1289,9 +1353,15 @@ mod tests {
             tool_result("reread", &content),
         ];
 
-        let spilled = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
-            .sync_scope(effective_cwd, || {
-                spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected)
+        let spilled =
+            crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(effective_cwd, || {
+                spill_protected_precision_to_fit(
+                    &mut messages,
+                    0,
+                    Some(&overflow_dir),
+                    None,
+                    &protected,
+                )
             });
 
         assert_eq!(spilled, 1);
@@ -1325,8 +1395,13 @@ mod tests {
             tool_result("wait", &"aggregated subagent conclusion\n".repeat(600)),
         ];
 
-        let spilled =
-            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected);
+        let spilled = spill_protected_precision_to_fit(
+            &mut messages,
+            0,
+            Some(&overflow_dir),
+            None,
+            &protected,
+        );
 
         assert_eq!(spilled, 1, "task_wait 大结果应被 Path C 无损外溢");
         let stub = value_to_string(&messages[1].content);
@@ -1356,8 +1431,13 @@ mod tests {
         ];
         let before = super::super::messages_total_chars(&messages);
 
-        let spilled =
-            spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected);
+        let spilled = spill_protected_precision_to_fit(
+            &mut messages,
+            0,
+            Some(&overflow_dir),
+            None,
+            &protected,
+        );
 
         assert_eq!(spilled, 0);
         assert_eq!(value_to_string(&messages[1].content), "ok");
@@ -1398,7 +1478,7 @@ mod tests {
         // 工具名保留（新格式用 "Output preserved for tool"）。
         assert!(anchor.contains("Output preserved for tool `read_file`"));
         // read_file 类型的归档有"通常无需重新读取"提示（而非旧的诱导式 "use read_file"）。
-        assert!(anchor.contains("完整结果快照"));
+        assert!(anchor.contains("Archived snapshot of an earlier read"));
         // 仍是合法 stub（前缀不变），后续压缩链继续按 stub 豁免识别。
         assert!(is_preserved_tool_overflow_stub(&anchor));
         // 体量骤降。
@@ -1621,15 +1701,15 @@ fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'s
         .any(|line| line.starts_with("- original_command: "));
     match tool_name {
         "read_file" if has_original_file_path => {
-            "（这是之前读取文件的完整结果快照。若只需当前文件内容，优先读取 `original_file_path`；若原文件已变更、删除，或需要当时的精确输出，可用 `read_file` 分页读取 `file_path`。）"
+            "Archived snapshot of an earlier read. `original_range` marks lines already covered - for current content, read `original_file_path` past that range (identical re-reads are deduped); read `file_path` only for the exact historical output."
         }
         "read_file" => {
-            "（这是之前读取文件的完整结果快照。仅在预览不足且需要当时的精确输出时，用 `read_file` 分页读取 `file_path`。）"
+            "Archived snapshot of an earlier read. Read `file_path` only if the preview is insufficient and you need the exact output; identical re-reads are deduped."
         }
         "execute_command" if has_original_command => {
-            "（这是之前命令输出的归档；优先根据 `original_command` / `original_cwd` 继续判断，不要把 `file_path` 当作源码文件去读。仅在需要完整日志时才读取。）"
+            "Archived command output. Continue from `original_command` / `original_cwd`; `file_path` is a text archive, not a source file - read it only for the full log."
         }
-        _ => "（如需查看完整输出，可用 read_file 读取此文件；若预览已足够回答问题则忽略。）",
+        _ => "Archived output; `file_path` holds the full text. Read it only if the preview is insufficient.",
     }
 }
 
@@ -1768,18 +1848,18 @@ fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
             .iter()
             .any(|line| line.starts_with("- original_file_path: "))
         {
-            "（这是之前读取文件的完整结果快照。若只需当前文件内容，优先读取 `original_file_path`；若需要当时的精确输出，可用 `read_file` 分页读取 `file_path`。）"
+            "Archived snapshot of an earlier read. Read `original_file_path` for current content, `file_path` only for the exact historical output."
         } else {
-            "（这是之前读取文件的完整结果快照；若需要当时的精确输出，可用 `read_file` 分页读取 `file_path`。）"
+            "Archived snapshot of an earlier read; read `file_path` only for the exact historical output."
         }
     } else if tool_name == "execute_command"
         && recall_lines
             .iter()
             .any(|line| line.starts_with("- original_command: "))
     {
-        "（这是之前命令输出的归档；通常无需回读本归档，优先依据 `original_command` / `original_cwd` 继续判断。）"
+        "Archived command output; usually no re-read needed - continue from `original_command` / `original_cwd`."
     } else {
-        "（如需完整输出可用 read_file 读取。）"
+        "Full output at `file_path`; read it only if needed."
     };
     let mut out = format!(
         "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
@@ -2897,7 +2977,10 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
     let reserved_tool_chars = if known_tool_lines.is_empty() {
         0
     } else {
-        let tool_blob = format!("Verified facts and sources:\n{}", known_tool_lines.join("\n"));
+        let tool_blob = format!(
+            "Verified facts and sources:\n{}",
+            known_tool_lines.join("\n")
+        );
         tool_blob.chars().count().min(max_chars / 3)
     };
     let body_budget = max_chars
@@ -2905,7 +2988,11 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
         .max(max_chars / 2);
     let mut lines: Vec<String> = Vec::new();
     if !initial_goal.is_empty()
-        && !push_line_with_budget(&mut lines, format!("Main request: {initial_goal}"), body_budget)
+        && !push_line_with_budget(
+            &mut lines,
+            format!("Main request: {initial_goal}"),
+            body_budget,
+        )
     {
         return summarize_text(&lines.join("\n"), max_chars);
     }
@@ -2921,7 +3008,11 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
     }
 
     if !known_tool_lines.is_empty() {
-        let _ = push_line_with_budget(&mut lines, "Verified facts and sources:".to_string(), max_chars);
+        let _ = push_line_with_budget(
+            &mut lines,
+            "Verified facts and sources:".to_string(),
+            max_chars,
+        );
         for line in known_tool_lines {
             if !push_line_with_budget(&mut lines, line, max_chars) {
                 break;
@@ -2941,7 +3032,10 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
                 parts.push(format!("User: {}", t.user));
             }
             if !t.assistant_final.is_empty() {
-                parts.push(format!("Assistant's previous answer (not independently verified): {}", t.assistant_final));
+                parts.push(format!(
+                    "Assistant's previous answer (not independently verified): {}",
+                    t.assistant_final
+                ));
             }
             if !t.tool_names.is_empty() {
                 parts.push(format!("Tools: {}", t.tool_names.join(", ")));

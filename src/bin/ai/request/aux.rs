@@ -14,11 +14,9 @@ use super::{
     extract_router_content,
 };
 use crate::ai::{
-    history::{
-        HistoryMessageSummarizer, Message, is_runtime_synthetic_user_message,
-        messages_to_markdown,
-    },
-    models, provider::adapter_for,
+    history::{HistoryMessageSummarizer, Message, is_runtime_synthetic_user_message},
+    models,
+    provider::adapter_for,
     types::App,
 };
 
@@ -174,6 +172,224 @@ fn extract_middle_keypoints(
     keypoints
 }
 
+fn truncate_summary_fragment(fragment: &str, max_chars: usize) -> String {
+    let total = fragment.chars().count();
+    if total <= max_chars {
+        return fragment.to_string();
+    }
+    if max_chars < 80 {
+        return fragment.chars().take(max_chars).collect();
+    }
+
+    let marker = "\n...[message excerpt truncated]...\n";
+    let marker_chars = marker.chars().count();
+    let payload = max_chars.saturating_sub(marker_chars);
+    let head = payload * 2 / 3;
+    let tail = payload.saturating_sub(head);
+    let prefix: String = fragment.chars().take(head).collect();
+    let suffix: String = fragment
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}{marker}{suffix}")
+}
+
+fn push_summary_text(out: &mut String, text: &str, max_chars: usize) -> bool {
+    let used = out.chars().count();
+    let remaining = max_chars.saturating_sub(used);
+    let text_chars = text.chars().count();
+    out.extend(text.chars().take(remaining));
+    text_chars <= remaining
+}
+
+fn render_summary_message(message: &Message, max_chars: usize) -> String {
+    let mut out = String::with_capacity(max_chars.min(6_000));
+    push_summary_text(
+        &mut out,
+        &format!("### {}\n\n", message.role.to_uppercase()),
+        max_chars,
+    );
+    let content_budget = max_chars.saturating_mul(2) / 5;
+    let mut content = String::with_capacity(content_budget);
+    match &message.content {
+        Value::String(text) => {
+            push_summary_text(
+                &mut content,
+                &truncate_summary_fragment(text, content_budget),
+                content_budget,
+            );
+        }
+        Value::Array(parts) => {
+            for part in parts {
+                let text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.get("content").and_then(Value::as_str));
+                if let Some(text) = text {
+                    if !push_summary_text(&mut content, text, content_budget)
+                        || !push_summary_text(&mut content, "\n", content_budget)
+                    {
+                        break;
+                    }
+                } else if !push_summary_text(
+                    &mut content,
+                    "[non-text content omitted from summary input]\n",
+                    content_budget,
+                ) {
+                    break;
+                }
+            }
+        }
+        other => {
+            push_summary_text(
+                &mut content,
+                &truncate_summary_fragment(&other.to_string(), content_budget),
+                content_budget,
+            );
+        }
+    }
+    push_summary_text(&mut out, &content, max_chars);
+
+    if let Some(tool_calls) = &message.tool_calls {
+        // 先输出所有调用的身份信息，再分配参数预算，避免超大 arguments 把后续
+        // call id/name 从摘要器视野中挤掉。
+        for call in tool_calls {
+            let metadata = format!(
+                "\nTool call: id={} type={} name={}\n",
+                truncate_summary_fragment(&call.id, 256),
+                truncate_summary_fragment(&call.tool_type, 128),
+                truncate_summary_fragment(&call.function.name, 256),
+            );
+            if !push_summary_text(&mut out, &metadata, max_chars) {
+                return out;
+            }
+        }
+        let argument_budget = (max_chars / 5).max(128) / tool_calls.len().max(1);
+        for call in tool_calls {
+            let arguments = format!(
+                "Tool arguments for {}: {}\n",
+                truncate_summary_fragment(&call.id, 128),
+                truncate_summary_fragment(&call.function.arguments, argument_budget),
+            );
+            if !push_summary_text(&mut out, &arguments, max_chars) {
+                return out;
+            }
+        }
+    }
+    if let Some(tool_call_id) = &message.tool_call_id {
+        push_summary_text(
+            &mut out,
+            &format!(
+                "\nTool result for call id: {}\n",
+                truncate_summary_fragment(tool_call_id, 256)
+            ),
+            max_chars,
+        );
+    }
+    if let Some(reasoning) = &message.reasoning_content {
+        let remaining = max_chars.saturating_sub(out.chars().count());
+        push_summary_text(
+            &mut out,
+            &format!(
+                "\nReasoning: {}",
+                truncate_summary_fragment(reasoning, remaining.saturating_sub(12))
+            ),
+            max_chars,
+        );
+    }
+    out
+}
+
+/// 按消息选样构造摘要器输入，避免单个超大消息吞掉全部预算。
+fn build_summary_history_input(messages: &[Message], max_chars: usize) -> String {
+    if messages.is_empty() || max_chars == 0 {
+        return String::new();
+    }
+
+    let last_index = messages.len().saturating_sub(1);
+    let mut candidates: Vec<(usize, usize, String)> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let raw = render_summary_message(message, 6_000);
+            let lower = raw.to_ascii_lowercase();
+            let is_recent = last_index.saturating_sub(index) < 8;
+            let is_priority_role =
+                matches!(message.role.as_str(), "system" | "user" | "internal_note");
+            let has_keypoint = [
+                "error",
+                "failed",
+                "failure",
+                "panic",
+                "fix",
+                "fixed",
+                "decision",
+                "root cause",
+                "warning",
+                "错误",
+                "失败",
+                "修复",
+                "决定",
+                "根因",
+                "警告",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle));
+            let score = usize::from(is_recent) * 1_000
+                + usize::from(is_priority_role) * 700
+                + usize::from(has_keypoint) * 500
+                + usize::from(index < 2) * 300
+                + index.min(200);
+            let per_message_cap = if is_priority_role { 6_000 } else { 3_000 };
+            (
+                index,
+                score,
+                truncate_summary_fragment(&raw, per_message_cap),
+            )
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    let separator = "\n\n[...chronological messages omitted...]\n\n";
+    let separator_chars = separator.chars().count();
+    let mut selected = vec![false; messages.len()];
+    let mut used = 0usize;
+    for (index, _, fragment) in &candidates {
+        let fragment_chars = fragment.chars().count();
+        let extra = fragment_chars + usize::from(used > 0) * separator_chars;
+        if used + extra <= max_chars {
+            selected[*index] = true;
+            used += extra;
+        }
+    }
+
+    let mut ordered: Vec<(usize, &String)> = candidates
+        .iter()
+        .filter(|(index, _, _)| selected[*index])
+        .map(|(index, _, fragment)| (*index, fragment))
+        .collect();
+    ordered.sort_by_key(|(index, _)| *index);
+
+    let mut out = String::with_capacity(used.min(max_chars));
+    let mut previous_index = None;
+    for (index, fragment) in ordered {
+        if let Some(previous) = previous_index
+            && index != previous + 1
+        {
+            out.push_str(separator);
+        } else if previous_index.is_some() {
+            out.push('\n');
+        }
+        out.push_str(fragment);
+        previous_index = Some(index);
+    }
+    out
+}
+
 /// 用 LLM 将较早的对话历史压缩成摘要文本，供 context-budget 压缩器使用。
 ///
 /// 三段式截断（head 12k + middle keypoints 4k + tail 6k），比 head+tail
@@ -187,53 +403,9 @@ pub(crate) async fn summarize_history_via_model(
         return None;
     }
 
-    let transcript = messages_to_markdown(messages, &app.session_id);
-    // 三段式截断：head 12k + middle 关键命中 4k + tail 6k，总计 22k 字符。
-    // 比原先 head 16k + tail 6k 多保留中段的 error/fix/decision 行，避免
-    // 摘要器只看见"开头任务陈述 + 末尾收尾"而漏掉中段关键改动。
-    let transcript = if transcript.chars().count() > 24_000 {
-        let head: String = transcript.chars().take(12_000).collect();
-        let tail: String = transcript
-            .chars()
-            .rev()
-            .take(6_000)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-
-        // 中段关键行抽取：从 head 之后、tail 之前的中间部分挑选 error/fail/panic/
-        // fix/diff/apply_patch/decision 等关键标记行，控制在 4k 字符内。
-        let total_chars = transcript.chars().count();
-        let mid_start_chars = 12_000usize;
-        let mid_end_chars = total_chars.saturating_sub(6_000);
-        let middle_segment: String = if mid_end_chars > mid_start_chars {
-            transcript
-                .chars()
-                .skip(mid_start_chars)
-                .take(mid_end_chars - mid_start_chars)
-                .collect()
-        } else {
-            String::new()
-        };
-        const MID_KEYPOINTS_BUDGET: usize = 4_000;
-        let initial_heading = head
-            .lines()
-            .rev()
-            .find(|line| is_exported_message_heading(line));
-        let keypoints =
-            extract_middle_keypoints(&middle_segment, initial_heading, MID_KEYPOINTS_BUDGET);
-
-        if keypoints.trim().is_empty() {
-            format!("{head}\n\n[... older transcript omitted for summary budget ...]\n\n{tail}")
-        } else {
-            format!(
-                "{head}\n\n[... middle segment compressed; keypoints below ...]\n{keypoints}\n[... end of middle keypoints ...]\n\n{tail}"
-            )
-        }
-    } else {
-        transcript
-    };
+    // 按消息优先级选样，避免一个超大早期消息吞掉预算；同时保留最近消息、
+    // 用户请求、错误和决策，且最终按原始时间顺序呈现。
+    let transcript = build_summary_history_input(messages, 22_000);
 
     let messages = vec![
         Message {
@@ -259,7 +431,10 @@ Main request:\nUser decisions:\nVerified facts and sources:\nUnverified assistan
         },
         Message {
             role: "user".to_string(),
-            content: Value::String(format!("Please compress the earlier conversation below:\n\n{}", transcript)),
+            content: Value::String(format!(
+                "Please compress the earlier conversation below:\n\n{}",
+                transcript
+            )),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -267,7 +442,7 @@ Main request:\nUser decisions:\nVerified facts and sources:\nUnverified assistan
     ];
 
     let control_model = control_model_for_aux_tasks(app);
-    let request_body = build_request_body(
+    let mut request_body = build_request_body(
         &control_model,
         &messages,
         false,
@@ -282,7 +457,7 @@ Main request:\nUser decisions:\nVerified facts and sources:\nUnverified assistan
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
     let http_body =
-        super::protocol::build_http_body_for_request(&control_model, &endpoint, &request_body);
+        super::protocol::build_http_body_for_request(&control_model, &endpoint, &mut request_body);
     // 历史摘要是 turn 收尾的后台辅助请求（任务边界压缩会在每次答案交付后触发）。
     // 主 client 只有 connect_timeout、没有整体 timeout，若摘要模型接受连接后迟迟
     // 不返回响应头，这里的裸 .send()/.text() 会永久阻塞、CPU 0，表现为"答案已输出
@@ -424,12 +599,66 @@ mod session_title_tests {
 
     #[test]
     fn middle_keypoints_keep_role_provenance() {
-        let middle = "Conclusion: guessed cause\n\n---\n\n### 🔧 TOOL\n\nError: direct diagnostic\n";
+        let middle =
+            "Conclusion: guessed cause\n\n---\n\n### 🔧 TOOL\n\nError: direct diagnostic\n";
 
         let keypoints = extract_middle_keypoints(middle, Some("### 🤖 ASSISTANT"), 1_000);
 
         assert!(keypoints.contains("### 🤖 ASSISTANT\nConclusion: guessed cause"));
         assert!(keypoints.contains("### 🔧 TOOL\nError: direct diagnostic"));
+    }
+
+    #[test]
+    fn summary_input_keeps_later_user_request_after_huge_message() {
+        let messages = vec![
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("early-noise".repeat(20_000)),
+                tool_calls: None,
+                tool_call_id: Some("call-huge".to_string()),
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("LATEST_EXPLICIT_REQUEST".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        let transcript = build_summary_history_input(&messages, 8_000);
+
+        assert!(
+            transcript.contains("LATEST_EXPLICIT_REQUEST"),
+            "{transcript}"
+        );
+        assert!(transcript.chars().count() <= 8_000);
+    }
+
+    #[test]
+    fn summary_message_keeps_tool_identity_when_arguments_are_huge() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "tool dispatch",
+            "tool_calls": [{
+                "id": "call-important",
+                "type": "function",
+                "function": {
+                    "name": "execute_command",
+                    "arguments": "x".repeat(100_000)
+                }
+            }],
+            "tool_call_id": null,
+            "reasoning_content": null
+        }))
+        .unwrap();
+
+        let rendered = render_summary_message(&message, 2_000);
+
+        assert!(rendered.contains("id=call-important"), "{rendered}");
+        assert!(rendered.contains("name=execute_command"), "{rendered}");
+        assert!(rendered.chars().count() <= 2_000);
     }
 
     #[test]
@@ -650,7 +879,7 @@ pub(crate) async fn generate_session_title_via_model(
         },
     ];
 
-    let request_body = build_request_body(
+    let mut request_body = build_request_body(
         &title_model,
         &title_messages,
         false,
@@ -665,7 +894,7 @@ pub(crate) async fn generate_session_title_via_model(
     );
     let endpoint = endpoint_for_request_model(app, &title_model);
     let http_body =
-        super::protocol::build_http_body_for_request(&title_model, &endpoint, &request_body);
+        super::protocol::build_http_body_for_request(&title_model, &endpoint, &mut request_body);
 
     // key 按 collect_api_keys 轮换（与主请求链路一致）：命名 key
     // （opencode.api_key_xxx）配置下仅用 primary key 会对网关 401 静默失败，

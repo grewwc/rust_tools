@@ -4,6 +4,7 @@ mod inline_recovery;
 mod normalize;
 mod render;
 mod runtime;
+pub(crate) mod side_note_input;
 mod splitter;
 mod state;
 mod think_demux;

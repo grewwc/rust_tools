@@ -1,6 +1,6 @@
 {
   "name": "save_skill",
-  "description": "Render and save a .skill file (YAML front matter + prompt body) into the configured skills directory.",
+  "description": "Render and save a skill into the configured skills directory. Simple skills are saved as a single .skill file; complex skills with references/examples/scripts and nested sub-skills are saved as a directory package (SKILL.md + subskills/). Use proactively to persist reusable skills, including splitting a complex skill into multiple sub-skills.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -55,11 +55,94 @@
       },
       "file_name": {
         "type": "string",
-        "description": "Optional output filename; it will be sanitized and forced to end with .skill."
+        "description": "Optional output filename for simple single-file mode (forces .skill suffix, sanitized). In package mode (when resources/references/examples/scripts/subskills are provided) this field is IGNORED — directory name is derived from `name` via safe_skill_dir_name; do not rely on file_name to name the package directory."
       },
       "overwrite": {
         "type": "boolean",
-        "description": "Whether to overwrite an existing file at the target path (default: true; set false to fail instead of overwriting)."
+        "description": "Whether to overwrite an existing file/directory at the target path (default: true; set false to fail instead of overwriting)."
+      },
+      "resources": {
+        "type": "array",
+        "description": "Optional bundled resources to save alongside the skill. Each entry has `path` (relative, e.g. 'references/guide.md', 'examples/demo.md', 'scripts/tool.py') and `content`. When any resources or subskills are provided, the skill is saved as a directory package (SKILL.md + resource files).",
+        "items": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Relative path inside the skill package, e.g. 'references/api.md' or 'scripts/helper.py'. Must not be absolute or contain '..'."
+            },
+            "content": {
+              "type": "string",
+              "description": "File content to write."
+            }
+          },
+          "required": ["path", "content"]
+        }
+      },
+      "references": {
+        "type": "array",
+        "description": "Convenience alias for resources under references/. Each entry has `path` (filename or relative) and `content`. Merged with `resources`.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "content": { "type": "string" }
+          },
+          "required": ["path", "content"]
+        }
+      },
+      "examples": {
+        "type": "array",
+        "description": "Convenience alias for resources under examples/. Same shape as `references`.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "content": { "type": "string" }
+          },
+          "required": ["path", "content"]
+        }
+      },
+      "scripts": {
+        "type": "array",
+        "description": "Convenience alias for resources under scripts/. Same shape as `references`.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "content": { "type": "string" }
+          },
+          "required": ["path", "content"]
+        }
+      },
+      "subskills": {
+        "type": "array",
+        "description": "Optional sub-skills to save nested under this skill's package (saved as subskills/<sub-name>/SKILL.md). Allows splitting a complex skill into focused sub-skills that can be activated independently. Each sub-skill requires `name` and `prompt`; may also include `description`, `system_prompt`, `tools`, `tool_groups`, `mcp_servers`, `priority`, and `resources`.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string", "description": "Sub-skill name (globally unique; suggested '<parent>/<sub>' or '<parent>-<sub>')." },
+            "description": { "type": "string" },
+            "prompt": { "type": "string", "description": "Sub-skill prompt body (required)." },
+            "system_prompt": { "type": "string" },
+            "tools": { "type": "array", "items": { "type": "string" } },
+            "tool_groups": { "type": "array", "items": { "type": "string" } },
+            "mcp_servers": { "type": "array", "items": { "type": "string" } },
+            "priority": { "type": "integer" },
+            "resources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "path": { "type": "string" },
+                  "content": { "type": "string" }
+                },
+                "required": ["path", "content"]
+              }
+            }
+          },
+          "required": ["name", "prompt"]
+        }
       }
     },
     "required": [

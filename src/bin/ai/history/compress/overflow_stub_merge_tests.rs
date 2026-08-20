@@ -379,3 +379,36 @@ fn normalize_preserved_message_stubs_migrates_old_user_role_merged_stub() {
         "normalize 应把旧版 role=user 合并指针迁移为 internal_note: {messages:?}"
     );
 }
+
+/// 回归：生产路径第二轮压缩（summary_max_chars == 0）不得丢弃
+/// prepare_turn 已生成的早期对话摘要 note / 归档 note。
+#[test]
+fn second_pass_zero_summary_budget_keeps_early_summary_and_archive_notes() {
+    let messages = vec![
+        note("历史摘要（自动压缩）: 早期对话的压缩表示……"),
+        note("长期记忆归档\n较早的内部上下文注记已逐字归档。"),
+        msg("user", "u1"),
+        msg("assistant", "a1"),
+        msg("user", "u2"),
+        msg("assistant", "a2"),
+        msg("user", "最近的用户轮次"),
+    ];
+    // keep_last=1：仅最近一个真实 user 轮次留在尾窗，摘要/归档 note 落入 older 段。
+    // summary_max_chars=0：不重建摘要，旧摘要 note 必须像 checkpoint 一样保留，
+    // 否则 orchestrator 的第二轮压缩会静默丢掉 prepare_turn 生成的摘要。
+    let out = compress_messages_for_context(messages, 1_000_000, 1, 0, None, None);
+    let texts: Vec<String> = out.iter().map(|m| value_to_string(&m.content)).collect();
+    assert!(
+        texts.iter().any(|t| t.starts_with("历史摘要（自动压缩")),
+        "第二轮压缩不得丢弃早期摘要 note: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.starts_with("长期记忆归档")),
+        "第二轮压缩不得丢弃归档 note: {texts:?}"
+    );
+    assert!(
+        out.iter()
+            .any(|m| m.role == "user" && value_to_string(&m.content) == "最近的用户轮次"),
+        "最近的用户轮次必须保留: {texts:?}"
+    );
+}

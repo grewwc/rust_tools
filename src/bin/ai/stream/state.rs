@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use rust_tools::cw::SkipMap;
 
 use crate::ai::{
+    ports::stream::FilterChain,
     request::{DIGEST_BEGIN, DIGEST_END},
     types::{FunctionCall, StreamResult, ToolCall},
 };
@@ -64,6 +65,9 @@ pub(super) struct StreamProcessingState {
     pub(super) framing: StreamFramingState,
     pub(super) render: StreamRenderState,
     pub(super) content: StreamContentState,
+    /// 可插拔流过滤器链（Step 6：在 `process_stream_payload` 的可见内容提交点
+    /// 应用；空链 = 直通，零行为变化）。
+    pub(super) filters: FilterChain,
     /// Last-seen `(echoed_model, usage)` from any chunk during this stream.
     /// Handed to the kernel's `/dev/llm` when the stream finalizes.
     pub(super) pending_llm_usage: Option<(String, super::super::request::StreamUsage)>,
@@ -75,6 +79,7 @@ impl StreamProcessingState {
             framing: StreamFramingState::new(),
             render: StreamRenderState::new(),
             content: StreamContentState::new(),
+            filters: FilterChain::new(),
             pending_llm_usage: None,
         }
     }

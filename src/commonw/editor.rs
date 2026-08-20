@@ -24,7 +24,7 @@ pub fn input_with_editor(initial: &str, use_vscode: bool) -> io::Result<String> 
 
 fn launch_editor(path: &Path, use_vscode: bool) -> io::Result<()> {
     if use_vscode {
-        match Command::new("code").arg("--wait").arg(path).status() {
+        match crate::fork_guard::status(Command::new("code").arg("--wait").arg(path)) {
             Ok(status) if status.success() => return Ok(()),
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -33,18 +33,19 @@ fn launch_editor(path: &Path, use_vscode: bool) -> io::Result<()> {
     }
 
     let status = if let Some(editor_cmd) = configured_editor() {
-        Command::new("sh")
-            .arg("-c")
-            .arg("exec $EDITOR_CMD \"$1\"")
-            .arg("sh")
-            .arg(path)
-            .env("EDITOR_CMD", editor_cmd)
-            .status()?
+        crate::fork_guard::status(
+            Command::new("sh")
+                .arg("-c")
+                .arg("exec $EDITOR_CMD \"$1\"")
+                .arg("sh")
+                .arg(path)
+                .env("EDITOR_CMD", editor_cmd),
+        )?
     } else {
-        match Command::new("vim").arg(path).status() {
+        match crate::fork_guard::status(Command::new("vim").arg(path)) {
             Ok(status) => status,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Command::new("vi").arg(path).status()?
+                crate::fork_guard::status(Command::new("vi").arg(path))?
             }
             Err(e) => return Err(e),
         }
