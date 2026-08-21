@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 use std::time::Duration;
 
 use crossterm::{
@@ -27,14 +27,13 @@ use crate::ai::prompt::{PromptEditor, interrupted_error};
 const MAX_VIEWPORT_HEIGHT: u16 = 11;
 /// textarea 最大行数上限（大终端下的舒适值）。
 const MAX_TEXTAREA_LINES: u16 = 7;
-/// 普通编辑态的 chrome 固定行数：model(1) + help(2)。
+/// 普通编辑态的 chrome 固定行数：model(1) + help(1)。
 /// 不再绘制装饰性 divider，避免 terminal resize 后横线残影堆积。
-const VIEWPORT_CHROME_LINES: u16 = 3;
+const VIEWPORT_CHROME_LINES: u16 = 2;
 /// textarea 最小行数，用于 clamp 计算。
 const MIN_TEXTAREA_LINES: u16 = 2;
-/// 空输入时保持更紧凑：只保留 1 行输入区 + 固定 chrome，减少上一轮输出与
-/// model/help 区之间的空白。
-const EMPTY_VIEWPORT_HEIGHT: u16 = 1 + VIEWPORT_CHROME_LINES;
+/// 空输入时为 textarea 预留 3 行，再加上固定 chrome。
+const EMPTY_VIEWPORT_HEIGHT: u16 = 3 + VIEWPORT_CHROME_LINES;
 
 /// 补全面板一次最多显示的候选行数，与 `render::COMPLETION_WINDOW` 对齐。
 const PANEL_COMPLETION_WINDOW: u16 = 12;
@@ -46,7 +45,7 @@ const MAX_COMPLETION_VIEWPORT_HEIGHT: u16 = PANEL_CHROME_LINES + PANEL_COMPLETIO
 
 fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
     let available_rows = terminal_rows.saturating_sub(2).max(1);
-    // 空输入默认保持紧凑，避免把 cursor 放在一个很高的空白 textarea 左上角。
+    // 空输入默认保留 3 行 textarea，避免输入区过窄。
     if prefill.is_none_or(str::is_empty) {
         return EMPTY_VIEWPORT_HEIGHT
             .min(available_rows)
@@ -95,6 +94,36 @@ fn build_inline_terminal(height: u16) -> io::Result<MultilineTerminal> {
         },
     )
     .map_err(|err| io::Error::other(err.to_string()))
+}
+
+/// 删除 inline viewport 曾经预留的真实终端行。
+///
+/// Ratatui 会通过换行预留 `Viewport::Inline` 的高度；常规 clear 只能擦除单元格，
+/// 不能收回这些行。标准 ANSI `CSI Ps M` 会删除光标处起的行，让提交后的预览紧接
+/// 上一轮输出。部分终端对删行后的残余单元格或光标位置处理不一致，因此最后再回到
+/// 顶行并清除其后的区域，保证下一次普通输出从该顶行开始。返回值表示是否拥有足够的
+/// 最后一帧状态来执行行删除。
+fn delete_inline_viewport_rows<W: Write>(
+    output: &mut W,
+    viewport_top_row: Option<u16>,
+    viewport_height: Option<u16>,
+) -> io::Result<bool> {
+    let (Some(top_row), Some(height)) = (viewport_top_row, viewport_height) else {
+        return Ok(false);
+    };
+    if height == 0 {
+        return Ok(false);
+    }
+
+    execute!(output, cursor::MoveTo(0, top_row))?;
+    output.write_all(format!("\x1b[{height}M").as_bytes())?;
+    execute!(
+        output,
+        cursor::MoveTo(0, top_row),
+        Clear(ClearType::FromCursorDown),
+    )?;
+    output.flush()?;
+    Ok(true)
 }
 
 /// 清除 inline viewport 后，将光标重新锚定到旧 viewport 顶部。
@@ -228,13 +257,12 @@ impl PromptEditor {
             let _ = execute!(io::stdout(), EnableBracketedPaste);
         }
 
-        // Inline viewport 初始化会通过 append_lines() 真实撑开终端区域。空输入默认保持
-        // 紧凑，避免每轮回答后和下一轮光标之间出现大段空白；编辑已有内容时再按预填行数
-        // 放大，给 textarea 保留足够空间。
-        // fallback 必须与「空输入紧凑高度」一致：某些终端（如 VS Code 集成终端）在
+        // Inline viewport 初始化会通过 append_lines() 真实撑开终端区域。空输入默认保留
+        // 3 行 textarea；编辑已有内容时再按预填行数放大，给 textarea 保留足够空间。
+        // fallback 必须与空输入预留高度一致：某些终端（如 VS Code 集成终端）在
         // 特定时序下 ioctl(TIOCGWINSZ) 会短暂失败，此时若回落到一个更大的值，textarea
         // 顶部会多撑出额外空行，表现为正文与 model/help 之间的大段空白。用
-        // EMPTY_VIEWPORT_HEIGHT 兜底可保证拿不到尺寸时仍是最紧凑的空框。
+        // EMPTY_VIEWPORT_HEIGHT 兜底可保证拿不到尺寸时仍保留所需的输入空间。
         let mut base_viewport_height = terminal_size()
             .map(|(_, h)| multiline_viewport_height(h, self.pending_prefill.as_deref()))
             .unwrap_or(EMPTY_VIEWPORT_HEIGHT);
@@ -250,6 +278,9 @@ impl PromptEditor {
         // 退出时按“最后一次实际渲染到哪里”来清理 viewport；不能依赖创建 Terminal
         // 那一刻的 cursor 位置，因为补全面板/textarea 扩容会重建 inline viewport。
         let mut last_viewport_top_row: Option<u16> = None;
+        // `Viewport::Inline` 会预留真实终端行；退出时必须删除最后实际渲染的高度，
+        // 而不是基于 base 高度推算（补全面板和短终端都会改变实际高度）。
+        let mut last_viewport_height: Option<u16> = None;
         // resize reflow 后 viewport 的绝对坐标会变化，但 cursor 在 viewport 内的相对行
         // 不变；记录该偏移用于在下一次 autoresize 前清掉旧帧。
         let mut last_cursor_offset_row: Option<u16> = None;
@@ -320,6 +351,7 @@ impl PromptEditor {
                     .draw(|f| {
                         let area = f.area();
                         last_viewport_top_row = Some(area.y);
+                        last_viewport_height = Some(area.height);
                         last_cursor_offset_row = render_multiline_popup(
                             f,
                             &mut textarea,
@@ -373,13 +405,22 @@ impl PromptEditor {
             }
         })();
 
-        // 退出 TUI：先让 ratatui 按“当前实际 viewport 状态”清一次，
-        // 再用最后一次渲染时记录的顶行做兜底清除，确保补全面板/扩容 textarea
-        // 都不会留下残影。
+        // 退出 TUI：Ratatui 清屏只会擦除字符，必须另外删掉 Inline viewport 实际追加的
+        // 行，否则下一条提交预览或模型输出会出现在这些空白行之后。
         let _ = terminal.hide_cursor();
-        let _ = terminal.clear();
+        let can_delete_rows = last_viewport_top_row
+            .is_some_and(|_| last_viewport_height.is_some_and(|height| height > 0));
+        if !can_delete_rows {
+            let _ = terminal.clear();
+        }
         drop(terminal);
-        if let Some(top_row) = last_viewport_top_row {
+        if can_delete_rows {
+            let _ = delete_inline_viewport_rows(
+                &mut io::stdout(),
+                last_viewport_top_row,
+                last_viewport_height,
+            );
+        } else if let Some(top_row) = last_viewport_top_row {
             let _ = execute!(
                 io::stdout(),
                 cursor::MoveTo(0, top_row),
@@ -418,9 +459,27 @@ mod tests {
     };
 
     use super::{
-        clear_and_reanchor_inline_viewport, clear_reflowed_inline_viewport, force_frame_repaint,
-        multiline_viewport_height, submitted_input_preview_lines, viewport_height_with_completion,
+        clear_and_reanchor_inline_viewport, clear_reflowed_inline_viewport,
+        delete_inline_viewport_rows, force_frame_repaint, multiline_viewport_height,
+        submitted_input_preview_lines, viewport_height_with_completion,
     };
+
+    #[test]
+    fn inline_viewport_row_deletion_moves_to_top_and_deletes_rendered_height() {
+        let mut output = Vec::new();
+
+        assert!(delete_inline_viewport_rows(&mut output, Some(4), Some(3)).unwrap());
+        assert_eq!(output, b"\x1b[5;1H\x1b[3M\x1b[5;1H\x1b[J");
+    }
+
+    #[test]
+    fn inline_viewport_row_deletion_requires_a_nonempty_rendered_viewport() {
+        for (top_row, height) in [(None, Some(3)), (Some(4), None), (Some(4), Some(0))] {
+            let mut output = Vec::new();
+            assert!(!delete_inline_viewport_rows(&mut output, top_row, height).unwrap());
+            assert!(output.is_empty());
+        }
+    }
 
     #[test]
     fn forced_repaint_clears_character_missing_from_ratatui_back_buffer() {
@@ -481,15 +540,15 @@ mod tests {
 
     #[test]
     fn multiline_viewport_height_scales_with_terminal() {
-        // 空输入：更紧凑，viewport = 1 行输入区 + chrome(3) = 4
-        assert_eq!(multiline_viewport_height(30, None), 4);
-        assert_eq!(multiline_viewport_height(30, Some("")), 4);
+        // 空输入：viewport = 3 行输入区 + chrome(2) = 5
+        assert_eq!(multiline_viewport_height(30, None), 5);
+        assert_eq!(multiline_viewport_height(30, Some("")), 5);
         // 有预填但内容短于 base：保持 base 大小
-        assert_eq!(multiline_viewport_height(30, Some("one line")), 10);
-        // 小终端：terminal=12, available=10，空输入仍保持 4 行紧凑 viewport
-        assert_eq!(multiline_viewport_height(12, None), 4);
-        // 大终端下空输入仍保持紧凑
-        assert_eq!(multiline_viewport_height(40, None), 4);
+        assert_eq!(multiline_viewport_height(30, Some("one line")), 9);
+        // 小终端：terminal=12, available=10，空输入仍保留 3 行输入区
+        assert_eq!(multiline_viewport_height(12, None), 5);
+        // 大终端下空输入仍保留 3 行输入区
+        assert_eq!(multiline_viewport_height(40, None), 5);
     }
 
     #[test]
@@ -499,8 +558,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // terminal=40: available=38, base_textarea=7, content=20→clamp(7,7)=7, viewport=10
-        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 10);
+        // terminal=40: available=38, base_textarea=7, content=20→clamp(7,7)=7, viewport=9
+        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 9);
         assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
         assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
         assert_eq!(multiline_viewport_height(4, None), 2); // available=2，仍受可用行数约束
@@ -508,14 +567,14 @@ mod tests {
 
     #[test]
     fn completion_viewport_grows_with_candidates_without_shrinking_base() {
-        // 无面板：保持 base 高度（4）。
-        assert_eq!(viewport_height_with_completion(30, 4, None), 4);
-        // 1 个候选：面板需要 1+2(边框)=3 + 2(chrome)=5，大于 base，撑到 5。
-        assert_eq!(viewport_height_with_completion(30, 4, Some(1)), 5);
+        // 无面板：保持空输入的 base 高度（5）。
+        assert_eq!(viewport_height_with_completion(30, 5, None), 5);
+        // 1 个候选：面板需要 1+2(边框)=3 + 2(chrome)=5，与 base 相同。
+        assert_eq!(viewport_height_with_completion(30, 5, Some(1)), 5);
         // 3 个候选：3+2+2=7 > base，viewport 撑高到 7，多出的 3 行给面板。
-        assert_eq!(viewport_height_with_completion(30, 4, Some(3)), 7);
+        assert_eq!(viewport_height_with_completion(30, 5, Some(3)), 7);
         // 大量候选：补全态上限单独放宽到 16，可容纳 12 行候选 + 边框 + 压缩 chrome。
-        assert_eq!(viewport_height_with_completion(30, 4, Some(50)), 16);
+        assert_eq!(viewport_height_with_completion(30, 5, Some(50)), 16);
     }
 
     #[test]

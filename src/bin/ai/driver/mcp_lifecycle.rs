@@ -1,14 +1,13 @@
-//! MCP lifecycle: preload task management, initialization, and status display.
+//! MCP lifecycle: preload task management and initialization.
 //!
 //! Extracted from `driver/mod.rs` (review Finding #1, Phase 2).
 
-use std::io::Write;
 use std::sync::atomic::Ordering;
 
 use super::{
     McpConfigProbe, McpInitReport, PreparedMcpInit, apply_prepared_mcp_init,
     prepare_mcp_initialization_from_path, prepare_mcp_initialization_from_path_interruptible,
-    print, signal,
+    signal,
 };
 use crate::ai::{mcp::SharedMcpClient, types::App};
 
@@ -19,47 +18,6 @@ pub(super) fn apply_prepared_mcp_with_shared_client(
 ) -> McpInitReport {
     let mut guard = mcp_client.lock().unwrap_or_else(|err| err.into_inner());
     apply_prepared_mcp_init(app, &mut guard, prepared)
-}
-
-pub(super) fn announce_mcp_loading_if_needed(
-    mcp_probe: &McpConfigProbe,
-    mcp_initialized: bool,
-    mcp_loading_announced: &mut bool,
-) {
-    if *mcp_loading_announced || mcp_initialized || !mcp_probe.exists {
-        return;
-    }
-    print!(
-        "{}",
-        print::format_section_header(
-            "mcp",
-            Some(&format!(
-                "{} configured servers · loading...",
-                mcp_probe.server_count
-            ))
-        )
-    );
-    std::io::stdout().flush().ok();
-    *mcp_loading_announced = true;
-}
-
-pub(super) fn emit_mcp_loaded_header(report: &McpInitReport, mcp_loading_announced: &mut bool) {
-    if !report.loaded {
-        return;
-    }
-
-    let header = print::format_section_header(
-        "mcp",
-        Some(&format!(
-            "{} servers, {} tools",
-            report.server_count, report.tool_count
-        )),
-    );
-    if *mcp_loading_announced {
-        print!("\r\x1b[2K{}\n", header);
-    } else {
-        println!("{header}");
-    }
 }
 
 pub(super) async fn finalize_mcp_preload_task(
@@ -92,7 +50,6 @@ pub(super) async fn try_finalize_mcp_preload(
     mcp_client: &SharedMcpClient,
     mcp_probe: &McpConfigProbe,
     mcp_initialized: &mut bool,
-    mcp_loading_announced: &mut bool,
     mcp_preload_task: &mut Option<tokio::task::JoinHandle<Option<PreparedMcpInit>>>,
 ) {
     if *mcp_initialized || !mcp_probe.exists {
@@ -107,12 +64,11 @@ pub(super) async fn try_finalize_mcp_preload(
     }
 
     let task = mcp_preload_task.take().unwrap();
-    let Some(report) = finalize_mcp_preload_task(app, mcp_client, mcp_probe, task).await else {
+    let Some(_) = finalize_mcp_preload_task(app, mcp_client, mcp_probe, task).await else {
         return;
     };
 
     *mcp_initialized = true;
-    emit_mcp_loaded_header(&report, mcp_loading_announced);
 }
 
 pub(super) async fn ensure_mcp_initialized_for_turn(
@@ -120,16 +76,10 @@ pub(super) async fn ensure_mcp_initialized_for_turn(
     mcp_client: &SharedMcpClient,
     mcp_probe: &McpConfigProbe,
     mcp_initialized: &mut bool,
-    mcp_loading_announced: &mut bool,
     mcp_preload_task: &mut Option<tokio::task::JoinHandle<Option<PreparedMcpInit>>>,
-    show_status: bool,
 ) {
     if *mcp_initialized || !mcp_probe.exists {
         return;
-    }
-
-    if show_status {
-        announce_mcp_loading_if_needed(mcp_probe, *mcp_initialized, mcp_loading_announced);
     }
 
     let report = if let Some(task) = mcp_preload_task.take() {
@@ -141,14 +91,11 @@ pub(super) async fn ensure_mcp_initialized_for_turn(
         ))
     };
 
-    let Some(report) = report else {
+    let Some(_) = report else {
         return;
     };
 
     *mcp_initialized = true;
-    if show_status {
-        emit_mcp_loaded_header(&report, mcp_loading_announced);
-    }
 }
 
 pub(super) fn spawn_mcp_preload_task(

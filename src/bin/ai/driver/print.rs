@@ -422,8 +422,9 @@ pub(in crate::ai) fn echo_tool_args(tool_name: &str, args_json: &str) {
 }
 
 /// 若工具配置了 `print_result`，把输出内容回显到终端；否则为空操作。
+/// 若工具配置了 `display` 变换，终端回显的是变换后的紧凑内容，模型仍收到完整 `content`。
 /// 是否回显由工具自身提交的 `ToolDisplayConfig` 决定，调用方无需感知具体工具名。
-pub(in crate::ai) fn echo_tool_output(tool_name: &str, content: &str) {
+pub(in crate::ai) fn echo_tool_output(tool_name: &str, content: &str, args_json: &str) {
     if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;
     }
@@ -431,7 +432,15 @@ pub(in crate::ai) fn echo_tool_output(tool_name: &str, content: &str) {
     if !config.print_result {
         return;
     }
-    for line in format_tool_output_block(content) {
+    let shown = match config.display {
+        Some(transform) => {
+            let args = serde_json::from_str::<serde_json::Value>(args_json.trim())
+                .unwrap_or(serde_json::Value::Null);
+            transform(content, &args)
+        }
+        None => content.to_string(),
+    };
+    for line in format_tool_output_block(&shown) {
         println!("{line}");
     }
 }

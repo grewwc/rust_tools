@@ -2,8 +2,9 @@
 //
 // 主 agent 在模型流式输出时 stdin 处于空闲（交互式输入框未打开）。本模块在 cbreak
 // 模式（关闭 ICANON/ECHO，保留 ISIG/OPOST）下轮询监听 Ctrl+G（0x07）：命中后弹单行
-// 输入，回车提交为 `from="user"` 的 side-note 写入 foreground 队列，下一轮迭代由
-// `driver::side_note::poll_and_inject` 注入 LLM 上下文。
+// 输入，Esc / F2 / Alt+Enter 提交为 `from="user"` 的 side-note 写入 foreground 队列，
+// 下一轮迭代由 `driver::side_note::poll_and_inject` 注入 LLM 上下文。输入中再次按
+// Ctrl+G 放弃当前草稿；回车不发送（与主输入"回车=换行、Esc/F2 提交"的键位语义对齐）。
 //
 // 设计要点：
 // - 保留 ISIG：Ctrl+C 仍走现有 SIGINT 中断路径，不破坏流式中断语义。
@@ -13,9 +14,9 @@
 //   退出并等待终端恢复，避免遗留 cbreak 状态影响后续输入框。
 use std::{
     io::{self, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -39,7 +40,7 @@ const SHUTDOWN_WAIT_MS: u64 = 250;
 const STARTUP_WAIT_MS: u64 = 250;
 /// 底部 composer 固定占用的物理行数。模型输出在其上方的滚动区域连续滚动。
 const FOOTER_ROWS: u16 = 1;
-const COMPOSER_PREFIX: &str = "  [side-note] > ";
+const COMPOSER_PREFIX: &str = "  [side-note] Esc/F2 send · Ctrl+G cancel > ";
 const COMPOSER_CURSOR: char = '▌';
 
 /// 以 DECSTBM 保留的终端底部 footer。所有输出仍在主屏，避免 alternate screen
@@ -214,25 +215,10 @@ impl SideNoteInputGuard {
             if task_stop.load(Ordering::Relaxed) {
                 return;
             }
-            let footer = match FooterReservation::enter(&task_stop) {
-                Ok(footer) => Arc::new(Mutex::new(footer)),
-                Err(_) => {
-                    // 无法建立隔离 footer 时宁可禁用本 turn 的 Ctrl+G，也不能退回
-                    // 与 stdout 流式渲染争用同一行的 stderr 输入提示。
-                    let _ = ready_tx.send(false);
-                    return;
-                }
-            };
-            if task_stop.load(Ordering::Relaxed) {
-                if let Ok(mut footer) = footer.lock() {
-                    let _ = footer.leave();
-                }
-                return;
-            }
-            // 在 listener 已拿到 cbreak/footer 后再让本 turn 继续。这样连续模型输出
-            // 从第一行就受滚动区约束；启动超时则通过 stop 让任务无副作用退出。
+            // 监听器只接管 stdin；未按 Ctrl+G 时绝不设置滚动区域或移动 stdout，
+            // 避免普通 turn 的状态/正文被无条件推到终端底部。
             let _ = ready_tx.send(true);
-            side_note_input_loop(&history_file, &task_stop, term, footer);
+            side_note_input_loop(&history_file, &task_stop, term);
         });
         if !ready_rx
             .recv_timeout(Duration::from_millis(STARTUP_WAIT_MS))
@@ -388,27 +374,15 @@ fn composer_line_parts(input: &[char], cols: usize) -> (&'static str, String, St
     (prefix, visible, caret.map(String::from).unwrap_or_default())
 }
 
-fn redraw_input(footer: &Arc<Mutex<FooterReservation>>, input: &[char]) -> io::Result<()> {
-    let mut footer = footer
-        .lock()
-        .map_err(|_| io::Error::other("side-note footer mutex poisoned"))?;
+fn redraw_input(footer: &mut FooterReservation, input: &[char]) -> io::Result<()> {
     footer.draw(input)
 }
 
-fn clear_input(footer: &Arc<Mutex<FooterReservation>>) -> io::Result<()> {
-    let mut footer = footer
-        .lock()
-        .map_err(|_| io::Error::other("side-note footer mutex poisoned"))?;
+fn clear_input(footer: &mut FooterReservation) -> io::Result<()> {
     footer.clear()
 }
 
-fn refresh_footer(
-    footer: &Arc<Mutex<FooterReservation>>,
-    input: Option<&[char]>,
-) -> io::Result<()> {
-    let mut footer = footer
-        .lock()
-        .map_err(|_| io::Error::other("side-note footer mutex poisoned"))?;
+fn refresh_footer(footer: &mut FooterReservation, input: Option<&[char]>) -> io::Result<()> {
     footer.refresh()?;
     if let Some(input) = input {
         footer.draw(input)?;
@@ -416,16 +390,110 @@ fn refresh_footer(
     Ok(())
 }
 
-fn side_note_input_loop(
-    history_file: &PathBuf,
-    stop: &AtomicBool,
-    _term: CbreakTerm,
-    footer: Arc<Mutex<FooterReservation>>,
-) {
+/// 发送当前草稿（Esc/F2/Alt+Enter 提交键共用）：内容为空时仅退出输入模式；
+/// 非空时写入 foreground 队列。写入失败保留草稿并继续 composer，不静默丢失指令。
+fn submit_draft(
+    history_file: &Path,
+    footer: &mut FooterReservation,
+    input: &mut Vec<char>,
+    pending: &mut Vec<u8>,
+    in_input: &mut bool,
+) -> io::Result<()> {
+    let content: String = input.drain(..).collect();
+    pending.clear();
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        *in_input = false;
+        return clear_input(footer);
+    }
+    // 不在 transcript 中插入确认行：模型可能正流式生成一个 Markdown 段落，
+    // 额外换行会改变其语义布局。footer 清除即为发送反馈。
+    match push_side_note(history_file, &content, "user", None) {
+        Ok(_) => {
+            *in_input = false;
+            clear_input(footer)
+        }
+        Err(_) => {
+            // 保留草稿并继续显示 composer，避免静默丢失用户指令；可再次按
+            // Esc/F2 重试，或 Ctrl+G 放弃。
+            input.extend(content.chars());
+            redraw_input(footer, input)
+        }
+    }
+}
+
+/// 带超时的单字节读取（仅用于 Esc 后判定是否为提交型功能键序列）。
+/// 返回 None 表示超时或 stdin 关闭/出错。
+fn read_byte_timeout(timeout_ms: i32) -> Option<u8> {
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pollfd 为栈上独占可变引用。
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret < 0 {
+            // EINTR（SIGINT/SIGWINCH 等）：与主循环一致重试，而不是把"被信号打断"
+            // 误判为"裸 Esc 无跟随字节"而提交草稿。
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if ret == 0 {
+            return None; // 超时：无跟随字节，即裸 Esc
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            return None;
+        }
+        let mut byte = [0u8; 1];
+        // SAFETY: 单字节栈缓冲，poll 已确认可读，阻塞 read 立即返回。
+        let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
+        if n == 1 {
+            return Some(byte[0]);
+        }
+        if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue; // read 被信号打断，重试
+        }
+        return None; // EOF 或错误
+    }
+}
+
+/// 判定 ESC（0x1b）后的按键是否为提交键：裸 Esc、F2（`ESC O Q` / `ESC [ 1 2 ~`）、
+/// Alt+Enter（`ESC \r` / `ESC \n`）。终端在单个写突发内发出完整功能键序列，跟随
+/// 字节几乎立即可达；无论是否提交，本函数都会消费掉 ESC 之后的全部跟随字节，
+/// 避免方向键等其他序列的字节混入草稿。
+fn is_submit_escape() -> bool {
+    const ESCAPE_FOLLOWUP_MS: i32 = 30;
+    match read_byte_timeout(ESCAPE_FOLLOWUP_MS) {
+        None => true,                    // 裸 Esc
+        Some(0x0d) | Some(0x0a) => true, // Alt+Enter
+        Some(0x4f) => {
+            // SS3 形式：`ESC O Q` → F2；其余（F1/F3/F4 等）吞掉并忽略。
+            read_byte_timeout(ESCAPE_FOLLOWUP_MS) == Some(0x51)
+        }
+        Some(0x5b) => {
+            // CSI 形式：读至 `~` 终止符；`ESC [ 1 2 ~` → F2，其余忽略。
+            let mut seq = Vec::new();
+            loop {
+                match read_byte_timeout(ESCAPE_FOLLOWUP_MS) {
+                    Some(0x7e) => return seq == b"12",
+                    Some(b) => seq.push(b),
+                    None => return false,
+                }
+            }
+        }
+        Some(_) => false,
+    }
+}
+
+fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: CbreakTerm) {
     // 输入模式：UTF-8 字节累积缓冲 + 已解析字符 + 已回显列数
     let mut pending: Vec<u8> = Vec::new();
     let mut input: Vec<char> = Vec::new();
     let mut in_input = false;
+    let mut footer: Option<FooterReservation> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -443,8 +511,12 @@ fn side_note_input_loop(
                 // EINTR：终端尺寸变化（SIGWINCH）等信号会中断 poll，属正常现象，
                 // 重新计算 footer 位置；其余错误（fd 失效等）才退出监听。
                 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                    if refresh_footer(&footer, in_input.then_some(input.as_slice())).is_err() {
-                        break;
+                    if let Some(active_footer) = footer.as_mut() {
+                        if refresh_footer(active_footer, in_input.then_some(input.as_slice()))
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -456,7 +528,10 @@ fn side_note_input_loop(
                 // 草稿即使被异步重画短暂清掉也会在 50ms 内恢复，而无需把所有 renderer
                 // 的成熟重写状态机改成另一套光标协议。
                 if in_input {
-                    if redraw_input(&footer, &input).is_err() {
+                    let Some(active_footer) = footer.as_mut() else {
+                        break;
+                    };
+                    if redraw_input(active_footer, &input).is_err() {
                         break;
                     }
                 }
@@ -489,11 +564,21 @@ fn side_note_input_loop(
         if !in_input {
             // 监听状态：仅 Ctrl+G 进入输入模式；Ctrl+C 由 SIGINT 路径处理（读到即退出）
             if b == CTRL_G {
-                in_input = true;
                 input.clear();
                 pending.clear();
-                if redraw_input(&footer, &input).is_err() {
-                    break;
+                match FooterReservation::enter(stop) {
+                    Ok(mut active_footer) => {
+                        if redraw_input(&mut active_footer, &input).is_err() {
+                            let _ = active_footer.leave();
+                            break;
+                        }
+                        footer = Some(active_footer);
+                        in_input = true;
+                    }
+                    Err(_) => {
+                        // 当前尺寸无法安全建立 footer 时忽略本次 Ctrl+G；监听继续，
+                        // 用户调整终端尺寸后可以重试。
+                    }
                 }
             } else if b == 0x03 {
                 break; // 流式期间 Ctrl+C：主循环中断处理，监听任务退出
@@ -504,59 +589,67 @@ fn side_note_input_loop(
         // 输入模式：控制字节直接处理，其余按 UTF-8 累积解码
         match b {
             0x0d | 0x0a => {
-                // 回车提交
-                let content: String = input.drain(..).collect();
-                pending.clear();
-                let content = content.trim().to_string();
-                if content.is_empty() {
-                    in_input = false;
-                    if clear_input(&footer).is_err() {
-                        break;
-                    }
-                } else {
-                    // 不在 transcript 中插入确认行：模型可能正流式生成一个 Markdown
-                    // 段落，额外换行会改变其语义布局。footer 清除即为发送反馈。
-                    match push_side_note(history_file, &content, "user", None) {
-                        Ok(_) => {
-                            in_input = false;
-                            if clear_input(&footer).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => {
-                            // 保留草稿并继续显示 composer，避免静默丢失用户指令；用户可
-                            // 再次回车重试，或 Esc 放弃。
-                            input.extend(content.chars());
-                            if redraw_input(&footer, &input).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
+                // 回车不再发送：与主输入"回车=换行、Esc/F2 提交"的键位语义对齐。
+                // 单行 composer 下回车直接忽略，避免误触提交。
             }
             0x7f | 0x08 => {
                 // backspace：重绘单行 viewport，长输入不会在 footer 自动换行。
                 if input.pop().is_some() {
                     pending.clear(); // 避免半字符残留与后续字节拼出非法序列
-                    if redraw_input(&footer, &input).is_err() {
+                    let Some(active_footer) = footer.as_mut() else {
+                        break;
+                    };
+                    if redraw_input(active_footer, &input).is_err() {
                         break;
                     }
                 }
             }
             0x1b => {
-                // Esc 取消当前草稿，不向 history 队列写入内容。
+                // Esc / F2 / Alt+Enter：提交草稿。is_submit_escape 会消费掉 F2 等
+                // 功能键的完整转义序列，避免其跟随字节混入草稿；方向键等其他序列
+                // 被吞掉而不提交。
+                if is_submit_escape() {
+                    let Some(active_footer) = footer.as_mut() else {
+                        break;
+                    };
+                    if submit_draft(
+                        history_file,
+                        active_footer,
+                        &mut input,
+                        &mut pending,
+                        &mut in_input,
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                    if !in_input {
+                        if let Some(mut finished_footer) = footer.take() {
+                            let _ = finished_footer.leave();
+                        }
+                    }
+                }
+            }
+            0x07 => {
+                // 再次 Ctrl+G：放弃当前草稿并退出输入模式（取消）。
                 input.clear();
                 pending.clear();
                 in_input = false;
-                if clear_input(&footer).is_err() {
-                    break;
+                if let Some(mut finished_footer) = footer.take() {
+                    if clear_input(&mut finished_footer).is_err() {
+                        let _ = finished_footer.leave();
+                        break;
+                    }
+                    let _ = finished_footer.leave();
                 }
             }
             0x03 => {
                 // 输入中 Ctrl+C：SIGINT 已触发主中断，放弃本条输入
                 input.clear();
                 pending.clear();
-                let _ = clear_input(&footer);
+                if let Some(active_footer) = footer.as_mut() {
+                    let _ = clear_input(active_footer);
+                }
                 break;
             }
             _ => {
@@ -569,7 +662,10 @@ fn side_note_input_loop(
                             }
                             input.push(ch);
                         }
-                        if redraw_input(&footer, &input).is_err() {
+                        let Some(active_footer) = footer.as_mut() else {
+                            break;
+                        };
+                        if redraw_input(active_footer, &input).is_err() {
                             break;
                         }
                         pending.clear();
@@ -586,11 +682,11 @@ fn side_note_input_loop(
     }
     // 循环退出（stop / EOF / 错误 / Ctrl+C）：由监听线程独占完成终端清理，避免 guard
     // 在阻塞 poll 尚未返回时抢先重置滚动区域。
-    if in_input {
-        let _ = clear_input(&footer);
-    }
-    if let Ok(mut footer) = footer.lock() {
-        let _ = footer.leave();
+    if let Some(mut active_footer) = footer {
+        if in_input {
+            let _ = clear_input(&mut active_footer);
+        }
+        let _ = active_footer.leave();
     }
 }
 
@@ -617,26 +713,28 @@ mod tests {
     #[test]
     fn input_viewport_keeps_the_tail_on_one_line() {
         let input: Vec<char> = "abcdefghijklmnopqrstuvwxyz".chars().collect();
-        let visible = input_viewport(&input, 24);
+        // cols 取能容纳完整 COMPOSER_PREFIX 的宽度，验证完整提示前缀下的单行约束。
+        let visible = input_viewport(&input, 60);
         assert!(visible.starts_with('…'));
         assert!(visible.ends_with("vwxyz"));
         let total_width = display_width(COMPOSER_PREFIX.chars())
             + display_width(visible.chars())
             + char_width(COMPOSER_CURSOR)
             + 1;
-        assert!(total_width <= 24);
+        assert!(total_width <= 60);
     }
 
     #[test]
     fn input_viewport_keeps_wide_characters_intact() {
         let input: Vec<char> = "前缀-修复这些问题-🚀".chars().collect();
-        let visible = input_viewport(&input, 28);
+        // 同上：用能容纳完整前缀的宽度验证宽字符（CJK/emoji）不被截断。
+        let visible = input_viewport(&input, 64);
         assert!(visible.contains('🚀'));
         let total_width = display_width(COMPOSER_PREFIX.chars())
             + display_width(visible.chars())
             + char_width(COMPOSER_CURSOR)
             + 1;
-        assert!(total_width <= 28);
+        assert!(total_width <= 64);
     }
 
     #[test]

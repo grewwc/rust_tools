@@ -1,6 +1,6 @@
 {
   "name": "task_spawn",
-  "description": "Launch a subagent task asynchronously and return immediately with a task_id, letting several independent subtasks run concurrently. For a SINGLE delegated subtask whose result you need back, prefer the synchronous `task` — a lone task_spawn followed by task_wait is no more concurrent and only adds overhead. After spawning, continue independent parent-side work. The task_id stays collectable until its result is consumed.",
+  "description": "Launch a subagent asynchronously and return its task_id immediately; spawned subtasks run concurrently. Use for independent subtasks. For a SINGLE subtask whose result you need, prefer the synchronous `task` — a lone task_spawn + task_wait adds no concurrency, only overhead. Continue parent-side work meanwhile; the task_id stays valid until its result is consumed — collect with task_wait, acknowledge with task_integrate. Top-level agent only: nested subagents error — do the work directly.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -14,19 +14,19 @@
       },
       "agent": {
         "type": "string",
-        "description": "Optional subagent name (default: auto-select)."
+        "description": "Optional subagent name (default: auto-select). Omit unless you know the exact name."
       },
       "model": {
         "type": "string",
-        "description": "Optional model override. Default: reuse parent model."
+        "description": "Optional model override. Default: reuse parent model; override only when the subtask is clearly lighter or heavier."
       },
       "inherit": {
         "type": "string",
-        "description": "Optional inheritance control: 'all' (history, memory, cwd, skills), 'none' (fresh context), or a comma-separated subset of history, memory, cwd, skills. Default: cwd+skills only (history and memory kept private)."
+        "description": "Pass a plain string: 'all', 'none', or a comma-separated subset of history/memory/cwd/skills. Default: cwd+skills (history/memory private) — keep it for workspace-touching steps, serial steps hand off via files; 'none' for pure analysis; 'all' only when the subtask needs the full conversation."
       },
       "response_schema": {
         "type": "object",
-        "description": "Optional JSON Schema for the final output; the child must return exactly one value matching it."
+        "description": "Optional JSON Schema object the subagent's single returned value must match, e.g. {\"type\": \"string\"} — not a bare type name."
       }
     },
     "required": [

@@ -537,7 +537,7 @@ fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
         echo_tool_args(name, &tool_call.function.arguments);
     }
     if run_result.ok {
-        echo_tool_output(name, &run_result.tool_result.content);
+        echo_tool_output(name, &run_result.tool_result.content, &tool_call.function.arguments);
     }
 }
 

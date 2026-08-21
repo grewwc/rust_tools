@@ -1,6 +1,6 @@
 {
   "name": "task",
-  "description": "Launch a specialized subagent synchronously and return its final output. Use this for a single focused side investigation when you need the result before continuing. For multiple parallel subagents prefer task_spawn + task_wait.",
+  "description": "Run one subagent synchronously (blocks the turn) and return its final output. Use for a single focused side investigation whose result you need before continuing; for parallel work use task_spawn. Top-level agent only: nested subagents error — do the work directly.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -14,7 +14,7 @@
       },
       "agent": {
         "type": "string",
-        "description": "Optional subagent name (default: auto-select)."
+        "description": "Optional subagent name (default: auto-select). Omit unless you know the exact name."
       },
       "model": {
         "type": "string",
@@ -22,11 +22,11 @@
       },
       "inherit": {
         "type": "string",
-        "description": "Optional inheritance control: 'all' (history, memory, cwd, skills), 'none' (fresh context), or a comma-separated subset of history, memory, cwd, skills. Default: cwd+skills only (history and memory kept private). Keep the default (or 'cwd') for delegated steps that touch the workspace - serial steps hand off via files. Use 'none' only for pure analysis that never touches the workspace; 'all' only when the subtask depends on the full conversation."
+        "description": "Pass a plain string: 'all', 'none', or a comma-separated subset of history/memory/cwd/skills. Default: cwd+skills (history/memory private) — keep it for workspace-touching steps, serial steps hand off via files; 'none' for pure analysis; 'all' only when the subtask needs the full conversation."
       },
       "response_schema": {
         "type": "object",
-        "description": "Optional JSON Schema for the final output; the child must return exactly one value matching it."
+        "description": "Optional JSON Schema object the subagent's single returned value must match, e.g. {\"type\": \"string\"} — not a bare type name."
       }
     },
     "required": [

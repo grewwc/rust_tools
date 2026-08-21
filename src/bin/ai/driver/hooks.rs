@@ -1,6 +1,6 @@
 //! 生命周期钩子（lifecycle hooks）。
 //!
-//! 用户可在配置中为以下事件挂载任意 shell 命令：
+//! 用户可在 ~/.configW 配置中为以下事件挂载任意 shell 命令：
 //! - `ai.hooks.on_turn_start` / `ai.hooks.on_turn_end`
 //! - `ai.hooks.before_tool`   / `ai.hooks.after_tool`
 //! - `ai.hooks.on_session_end`

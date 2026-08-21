@@ -46,12 +46,19 @@ inventory::collect!(ToolStreamingRegistration);
 /// 默认全部为 `false`，仅对用户可见性价值较高的工具（如 `plan`）显式开启。
 /// 通过独立的 `ToolDisplayRegistration` 提交，不改动现有 `ToolSpec`，
 /// 保持向后兼容。
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+
+/// 终端回显的内容变换：把完整工具结果压缩为紧凑回显文本。
+/// 签名 `fn(完整结果, 调用参数) -> 回显文本`；`None` 表示原样回显完整结果。
+pub(crate) type ToolDisplayTransform = fn(&str, &Value) -> String;
+
+#[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct ToolDisplayConfig {
     /// 是否在终端打印工具调用入参。
     pub(crate) print_args: bool,
     /// 是否在终端打印工具输出结果。
     pub(crate) print_result: bool,
+    /// 可选的终端回显变换：模型仍收到完整 `content`，终端只回显变换后的紧凑文本。
+    pub(crate) display: Option<ToolDisplayTransform>,
 }
 
 /// 可选的终端回显注册：只给需要回显入参/结果的 builtin tool 使用。

@@ -22,6 +22,9 @@ impl PlanState {
     ///
     /// 格式与旧版 `execute_plan` 保持一致；仅在存在非 pending 步骤时追加
     /// `Progress: x/y steps done` 行与每步状态后缀（含可选 note）。
+    /// `compact_plan_update_echo`（mod.rs）按本函数的行格式提取步骤行/进度行，
+    /// 修改本函数行格式时需同步更新其匹配逻辑（`compact_echo_stays_in_sync_with_render_format`
+    /// 测试会锁定该耦合）。
     pub(crate) fn render(&self) -> String {
         let total = self.steps.len();
         let done = self.done_count();

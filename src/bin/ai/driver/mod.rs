@@ -735,7 +735,6 @@ async fn run_loop(
     let one_shot_mode = one_shot_cli_mode(&app.cli);
     let mut should_quit = one_shot_mode;
     let mut mcp_initialized = false;
-    let mut mcp_loading_announced = false;
     let mut manifests_loaded = false;
     let mut skill_watcher = None;
     let mut skill_watcher_started = false;
@@ -991,10 +990,6 @@ async fn run_loop(
             *skill_manifests = updated;
         }
 
-        if !one_shot_mode {
-            announce_mcp_loading_if_needed(&mcp_probe, mcp_initialized, &mut mcp_loading_announced);
-        }
-
         if try_handle_interactive_command(
             app,
             mcp_client,
@@ -1050,14 +1045,11 @@ async fn run_loop(
         }
 
         if !one_shot_mode {
-            announce_mcp_loading_if_needed(&mcp_probe, mcp_initialized, &mut mcp_loading_announced);
-
             try_finalize_mcp_preload(
                 app,
                 mcp_client,
                 &mcp_probe,
                 &mut mcp_initialized,
-                &mut mcp_loading_announced,
                 &mut mcp_preload_task,
             )
             .await;
@@ -1068,9 +1060,7 @@ async fn run_loop(
             mcp_client,
             &mcp_probe,
             &mut mcp_initialized,
-            &mut mcp_loading_announced,
             &mut mcp_preload_task,
-            !one_shot_mode,
         )
         .await;
 
