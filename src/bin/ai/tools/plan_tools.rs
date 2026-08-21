@@ -51,6 +51,7 @@ inventory::submit!(ToolDisplayRegistration {
     config: ToolDisplayConfig {
         print_args: false,
         print_result: true,
+        emphasize_result: false,
         display: None,
     },
 });

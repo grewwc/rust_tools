@@ -57,6 +57,9 @@ pub(crate) struct ToolDisplayConfig {
     pub(crate) print_args: bool,
     /// 是否在终端打印工具输出结果。
     pub(crate) print_result: bool,
+    /// 结果正文是否使用常规亮度回显；默认沿用低优先级的 `DIM`。
+    /// 仅用于少数需要略微突出、但不应增加高饱和颜色或粗体的工具结果。
+    pub(crate) emphasize_result: bool,
     /// 可选的终端回显变换：模型仍收到完整 `content`，终端只回显变换后的紧凑文本。
     pub(crate) display: Option<ToolDisplayTransform>,
 }

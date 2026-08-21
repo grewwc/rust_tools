@@ -206,11 +206,23 @@ pub(in crate::ai) fn format_tool_output_prefix() -> String {
 }
 
 pub(in crate::ai) fn format_tool_output_line(line: &str) -> String {
+    format_tool_output_line_with_dim(line, true)
+}
+
+fn format_emphasized_tool_output_line(line: &str) -> String {
+    format_tool_output_line_with_dim(line, false)
+}
+
+fn format_tool_output_line_with_dim(line: &str, dim: bool) -> String {
     let sanitized = sanitize_for_terminal(line);
     if sanitized.is_empty() {
         format!("  {}│{}", ACCENT_RULE, RESET)
     } else {
-        format!("  {}│{} {}{}{}", ACCENT_RULE, RESET, DIM, sanitized, RESET)
+        let body_style = if dim { DIM } else { "" };
+        format!(
+            "  {}│{} {}{}{}",
+            ACCENT_RULE, RESET, body_style, sanitized, RESET
+        )
     }
 }
 
@@ -312,11 +324,22 @@ pub(in crate::ai) fn format_tool_command_line(command: &str) -> String {
 }
 
 pub(in crate::ai) fn format_tool_output_block(content: &str) -> Vec<String> {
+    format_tool_output_block_with_formatter(content, format_tool_output_line)
+}
+
+fn format_emphasized_tool_output_block(content: &str) -> Vec<String> {
+    format_tool_output_block_with_formatter(content, format_emphasized_tool_output_line)
+}
+
+fn format_tool_output_block_with_formatter(
+    content: &str,
+    format_line: fn(&str) -> String,
+) -> Vec<String> {
     if content.trim().is_empty() {
         return vec![format_tool_note_line("result", "no output")];
     }
 
-    content.lines().map(format_tool_output_line).collect()
+    content.lines().map(format_line).collect()
 }
 
 /// 从文件类工具的 arguments JSON 中提取目标文件名，用于终端提示。
@@ -440,7 +463,12 @@ pub(in crate::ai) fn echo_tool_output(tool_name: &str, content: &str, args_json:
         }
         None => content.to_string(),
     };
-    for line in format_tool_output_block(&shown) {
+    let lines = if config.emphasize_result {
+        format_emphasized_tool_output_block(&shown)
+    } else {
+        format_tool_output_block(&shown)
+    };
+    for line in lines {
         println!("{line}");
     }
 }
@@ -569,11 +597,12 @@ mod tests {
         format_assistant_banner, format_empty_state, format_ocr_summary_block,
         format_section_header, format_section_item, format_section_note,
         format_skill_activation_note, format_tool_command_line, format_tool_header,
-        format_tool_output_block, format_tool_output_line, format_tool_output_prefix,
+        format_emphasized_tool_output_block, format_tool_output_block, format_tool_output_line,
+        format_tool_output_prefix,
         format_tool_status_completed, format_tool_status_with_file_target, sanitize_for_terminal,
     };
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
-    use crate::ai::theme::{ACCENT_COMMAND, ACCENT_SECONDARY};
+    use crate::ai::theme::{ACCENT_COMMAND, ACCENT_SECONDARY, DIM};
 
     fn strip_ansi_for_test(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -680,6 +709,26 @@ mod tests {
     fn tool_output_line_formats_single_line() {
         let visible = strip_ansi_for_test(&format_tool_output_line("hello"));
         assert_eq!(visible, "  │ hello");
+    }
+
+    #[test]
+    fn emphasized_tool_output_block_preserves_content_without_dim() {
+        let content = "Step 2 → running\x03\nProgress: 1/3 steps done";
+        let normal = format_tool_output_block(content);
+        let emphasized = format_emphasized_tool_output_block(content);
+
+        assert_eq!(
+            normal
+                .iter()
+                .map(|line| strip_ansi_for_test(line))
+                .collect::<Vec<_>>(),
+            emphasized
+                .iter()
+                .map(|line| strip_ansi_for_test(line))
+                .collect::<Vec<_>>()
+        );
+        assert!(normal.iter().all(|line| line.contains(DIM)));
+        assert!(emphasized.iter().all(|line| !line.contains(DIM)));
     }
 
     #[test]

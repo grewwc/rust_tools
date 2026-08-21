@@ -109,6 +109,7 @@ inventory::submit!(ToolDisplayRegistration {
     config: ToolDisplayConfig {
         print_args: false,
         print_result: true,
+        emphasize_result: true,
         display: Some(compact_plan_update_echo),
     },
 });
