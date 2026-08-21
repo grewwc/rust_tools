@@ -94,7 +94,7 @@ pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
     set_pending_skill_action(PendingSkillAction::Add(skill.name.clone()));
     Ok(format!(
         "Skill '{}' added to the active skill set for this turn. Its prompt and tools merge with any other active skills. \
-         If another skill is already active, both are active simultaneously (skills compose additively; the first activated skill is primary). \
+         If another skill is already active, both are active simultaneously (skills compose additively as equal peers; none is primary). \
          The skill set is scoped to this user turn and unloads automatically when the turn ends. \
          Use `deactivate_skill` to remove a skill from the active set.",
         skill.name

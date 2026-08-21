@@ -45,10 +45,11 @@ use super::super::runtime_ctx::DriverContext;
 
 /// Hard upper bound on how long a synchronous `task` tool call may block
 /// the parent agent. Keeps a runaway sub-agent from wedging the foreground
-/// turn forever. Subagents are leaf tasks with a separate iteration cap; ten
-/// minutes is enough to return useful partial evidence without wedging the
-/// parent turn for an interactive session.
-const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(600);
+/// turn forever. Subagents are leaf tasks with a separate iteration cap;
+/// fifteen minutes gives complex sub-tasks (multi-step research, cross-module
+/// refactors, audits) enough budget to return useful partial evidence without
+/// wedging the parent turn for an interactive session.
+const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const TIMEOUT_RECOVERY_MAX_CHARS: usize = 24_000;
 const TIMEOUT_RECOVERY_TAIL_MESSAGES: usize = 40;
 
@@ -142,7 +143,7 @@ fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubag
     Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped))
 }
 
-/// 执行模型通过 `task` 工具发起的同步子代理。普通工具调用可使用完整五分钟预算；
+/// 执行模型通过 `task` 工具发起的同步子代理。普通工具调用可使用完整硬超时预算（当前 15 分钟）；
 /// 仅 driver 的显式命令可选择在硬超时前请求子代理收口。
 pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
     execute_sync_task_with_hard_timeout(tool_call_id, args, SYNC_TASK_HARD_TIMEOUT)
@@ -970,8 +971,8 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_sync_task_hard_timeout_remains_ten_minutes() {
-        assert_eq!(SYNC_TASK_HARD_TIMEOUT, Duration::from_secs(10 * 60));
+    fn ordinary_sync_task_hard_timeout_remains_fifteen_minutes() {
+        assert_eq!(SYNC_TASK_HARD_TIMEOUT, Duration::from_secs(15 * 60));
     }
 
     #[test]

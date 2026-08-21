@@ -63,6 +63,11 @@ const MIN_REASONING_REPEAT_CHARS: usize = 16;
 const MAX_REASONING_REPEAT_CHARS: usize = 512;
 const REASONING_REPEAT_COUNT: usize = 3;
 const DEGENERATE_REPETITION_FINISH_REASON: &str = "degenerate_repetition";
+/// 流式工具调用参数累积上限（单轮所有工具调用的参数总量）。
+/// 模型一旦开启工具调用就应快速收口；若参数持续增长直到越过上限（例如在
+/// apply_patch 里无限循环拼接同一段正文），说明输出退化。既有退化重复检测只覆盖
+/// reasoning/assistant 文本，不查工具参数，这里补总量兜底，避免无限等待与内存膨胀。
+const MAX_TOOL_ARG_BYTES: usize = 1 << 20; // 1 MiB
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StreamPayloadOutcome {
@@ -560,15 +565,18 @@ fn finalize_stream_response(
     let (mut tool_calls, dropped_malformed) =
         collect_valid_tool_calls(&mut state.content.tool_calls_map);
     state.content.dropped_malformed_tool_call = dropped_malformed;
-    if stream_error {
+    if stream_error || state.content.tool_args_cap_exceeded {
         // 未收到 finish_reason 就 idle timeout，无法证明工具调用已经完整；即使当前
-        // arguments 恰好是合法 JSON，也不能提前执行可能仍在生成中的操作。
+        // arguments 恰好是合法 JSON，也不能提前执行可能仍在生成中的操作。工具参数
+        // 超过上限被掐断同理：模型被强制停流，参数未必完整。
         tool_calls.clear();
     }
 
     // Fallback：部分 provider 会把 function call 作为普通 content 返回，而不走
     // delta.tool_calls[]。流式解析未命中时，对完整 assistant_text 再做一次保守恢复。
-    if !stream_error && tool_calls.is_empty() {
+    // 参数超限被掐断与 idle timeout 同理：模型被强制停流，assistant_text 里
+    // 出现的疑似内联工具调用同样不可信，一并跳过恢复，避免绕过上面的丢弃逻辑。
+    if !stream_error && !state.content.tool_args_cap_exceeded && tool_calls.is_empty() {
         if let Some(recovered) = recover_inline_tool_calls(&state.content.assistant_text) {
             tool_calls = recovered;
             // 协议载荷既不是 assistant 正文，也不是模型 self_note。恢复成功后直接
@@ -1872,6 +1880,31 @@ fn process_stream_payload(
         state.content.finish_reason_value = Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
         if runtime_ctx::terminal_output_enabled() {
             eprintln!("\n  ⚠ 检测到模型伪造工具结果标记（输出退化），停止当前响应并自动重试…");
+        }
+        return Ok(StreamPayloadOutcome::stop_with_progress());
+    }
+
+    // 工具参数总量上限兜底：模型开启工具调用后应快速收口（id/name/少量参数）。
+    // 若参数流持续增长直到越过 MAX_TOOL_ARG_BYTES，说明模型在无限循环吐参数
+    // （本次事故即 apply_patch 参数 20+ 分钟不停流）。这类退化没有文本重复特征
+    // （每次都在拼新内容），退化重复检测抓不到，必须靠总量兜底；命中即停流并
+    // 复用 degenerate_repetition 降档重试路径，避免永远等不到 End/finish_reason。
+    let tool_arg_bytes = state
+        .content
+        .tool_calls_map
+        .iter()
+        .map(|(_index, builder)| builder.arguments.len())
+        .sum::<usize>();
+    if tool_arg_bytes > MAX_TOOL_ARG_BYTES {
+        state.content.finish_reason_seen = true;
+        state.content.finish_reason_value = Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
+        // 流是被掐断的：模型可能仍在生成参数，截止瞬间恰好合法的 JSON 也不能
+        // 当完整工具调用执行（与 stream_idle_timed_out 同一原则）。
+        state.content.tool_args_cap_exceeded = true;
+        if runtime_ctx::terminal_output_enabled() {
+            eprintln!(
+                "\n  ⚠ 工具调用参数累积超过上限（{tool_arg_bytes} 字节 > {MAX_TOOL_ARG_BYTES}），判定输出退化，停止当前响应并自动重试…"
+            );
         }
         return Ok(StreamPayloadOutcome::stop_with_progress());
     }

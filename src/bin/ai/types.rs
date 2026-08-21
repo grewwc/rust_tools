@@ -108,7 +108,7 @@ pub(super) struct App {
     pub(super) current_agent_manifest: Option<AgentManifest>,
     pub(super) pending_files: Option<String>,
     /// 用户通过 `@skills:<name>` 或 `/skills <name>...` 在输入框中显式选择、仅对
-    /// **本轮**生效的强制 skill 列表（保持选择顺序，第一个为 primary）。
+    /// **本轮**生效的强制 skill 列表（保持选择顺序，多 skill 平权）。
     /// turn 准备阶段读取后强制注入这些 skill，并在该 turn 结束后清空，下一轮不再强制。
     pub(super) forced_skills: Vec<String>,
     /// `forced_skills` 的来源。只有显式用户选择会携带该值，用于本轮持久化审计。
@@ -244,7 +244,7 @@ pub(super) struct SkillBiasMemory {
 /// 模糊的跨轮 skill 偏好使用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PendingSkillContinuation {
-    /// 当前活动 skill 列表（多 skill 叠加时保留全部，第一条为主 skill）。
+    /// 当前活动 skill 列表（多 skill 叠加时保留全部，平权无主次）。
     pub(super) skill_names: Vec<String>,
 }
 

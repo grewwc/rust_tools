@@ -11,6 +11,8 @@ pub(in crate::ai) const ACCENT_MUTED: &str = "\x1b[38;2;148;163;184m";
 pub(in crate::ai) const ACCENT_INPUT_RGB: (u8, u8, u8) = (215, 212, 206);
 pub(in crate::ai) const ACCENT_INPUT: &str = "\x1b[38;2;215;212;206m";
 pub(in crate::ai) const ACCENT_SUCCESS: &str = "\x1b[38;2;134;194;166m";
+/// 强调工具结果：与终端主题中代码强调文字一致的浅绿。
+pub(in crate::ai) const ACCENT_EMPHASIZED_OUTPUT: &str = "\x1b[38;2;152;195;121m";
 pub(in crate::ai) const ACCENT_WARN: &str = "\x1b[38;2;245;158;11m";
 pub(in crate::ai) const ACCENT_DANGER: &str = "\x1b[38;2;251;113;133m";
 pub(in crate::ai) const ACCENT_RULE: &str = "\x1b[38;2;71;85;105m";

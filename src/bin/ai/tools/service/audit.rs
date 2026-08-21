@@ -768,13 +768,26 @@ pub(crate) fn effective_command_tokens(segment: &str) -> Vec<String> {
     current
 }
 
-fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
-    let is_shell = matches!(program, "bash" | "sh" | "zsh" | "ksh" | "dash");
-    // 脚本解释器同样支持 `-c` / `-e` 直接传入并执行代码字符串，会绕过分段黑名单验证。
-    let is_interpreter = matches!(
+fn is_shell_program(program: &str) -> bool {
+    matches!(program, "bash" | "sh" | "zsh" | "ksh" | "dash")
+}
+
+// 脚本解释器同样支持 `-c` / `-e` 直接传入并执行代码字符串，会绕过分段黑名单验证。
+fn is_interpreter_program(program: &str) -> bool {
+    matches!(
         program,
         "python" | "python3" | "perl" | "ruby" | "node" | "php" | "awk" | "lua"
-    );
+    )
+}
+
+fn is_python_program(program: &str) -> bool {
+    matches!(program, "python" | "python3")
+}
+
+/// 出现 `-c` / `--command`（shell）、`-c` / `-e`（解释器）这类"二次解释"选项。
+fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
+    let is_shell = is_shell_program(program);
+    let is_interpreter = is_interpreter_program(program);
     if !is_shell && !is_interpreter {
         return false;
     }
@@ -787,15 +800,213 @@ fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
         if !tok.starts_with('-') || tok == "-" {
             return false;
         }
-        if is_shell && (tok == "-c" || tok == "--command") {
+        // 成组短选项也可能带 `-c` / `-e`（如 `bash -lc`、`perl -le`、`node -pe`）。
+        // 只匹配长度 >2 的单横线 token：`--norc` 等长选项、以及已被精确匹配的
+        // `-c` / `-e`（注意 token 已小写化，`-C` noclobber 会与 `-c` 混同，属既有误拦）不误伤。
+        let grouped = !tok.starts_with("--") && tok.len() > 2;
+        if is_shell && (tok == "-c" || tok == "--command" || (grouped && tok.contains('c'))) {
             return true;
         }
-        if is_interpreter && (tok == "-c" || tok == "-e") {
+        if is_interpreter
+            && (tok == "-c" || tok == "-e" || (grouped && (tok.contains('c') || tok.contains('e'))))
+        {
             return true;
         }
         i += 1;
     }
     false
+}
+
+/// 提取 `python -c <code>` 的代码字符串（tokenizer 已去除 shell 引号）。
+/// - `Ok(None)`：没有 `-c` 选项（如 `python3 script.py` / `python3 -m mod`），不涉及代码串。
+/// - `Ok(Some(code))`：提取到字面代码串。
+/// - `Err`：出现 `-c` 但代码串无法静态获取（缺失 / 为空 / 来自 shell 变量展开），fail-closed。
+fn python_c_argument(tokens: &[String]) -> Result<Option<String>, String> {
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" || !tok.starts_with('-') || tok == "-" {
+            // 选项区结束，`-c` 未出现 → 普通脚本 / 模块执行。
+            return Ok(None);
+        }
+        // `-W` / `-X` / `-m` 消费一个值参数（附着形式 `-Wfoo` 或独立 `-W foo`），
+        // 值本身不是 `-c`，跳过它们继续找。
+        if matches!(tok, "-W" | "-X" | "-m")
+            || tok.starts_with("-W")
+            || tok.starts_with("-X")
+            || tok.starts_with("-m")
+        {
+            if matches!(tok, "-W" | "-X" | "-m") {
+                i += 1; // 跳过值参数 token
+            }
+            i += 1;
+            continue;
+        }
+        if tok == "-c" {
+            return match tokens.get(i + 1) {
+                Some(code) => Ok(Some(code.clone())),
+                None => Err("`-c` requires a code argument".to_string()),
+            };
+        }
+        if let Some(code) = tok.strip_prefix("-c") {
+            // 附着形式 `-cCODE`。
+            return if code.is_empty() {
+                Err("`-c` requires a non-empty code argument".to_string())
+            } else {
+                Ok(Some(code.to_string()))
+            };
+        }
+        // 成组的短选项可能包含 `-c`（如 `-uc` 等价于 `-u -c`，`-Oc` 等价于 `-O -c`）。
+        if tok.contains('c') {
+            return match tokens.get(i + 1) {
+                Some(code) => Ok(Some(code.clone())),
+                None => Err("`-c` requires a code argument".to_string()),
+            };
+        }
+        i += 1;
+    }
+    Ok(None)
+}
+
+/// 校验 `python -c` 传入的代码字符串（静态、best-effort）：去空白 + 小写压平后扫描
+/// 危险原语，命中即拒绝（fail-closed）。注释 / 字符串里的字样也会被命中，属可接受的
+/// 误拦（安全优先）。
+///
+/// 说明：这是与整个命令审计同级的静态防线，不是沙箱——刻意混淆的代码理论上总能找到
+/// 盲点；但相比"一刀切拦截"，它把 python `-c` 从"不可审计"变为"可审计"，并覆盖
+/// 直接调用与常见混淆入口（getattr / __import__ / exec / eval / 双下划线逃逸链等）。
+fn validate_python_code(code: &str) -> Result<(), String> {
+    // 代码串里出现 `$` / 反引号，说明内容可能来自 shell 变量展开（如
+    // `python3 -c $CODE`），审计看不到展开后的内容 → fail-closed。
+    if code.contains('$') || code.contains('`') {
+        return Err(
+            "python -c code must be a literal quoted string without shell expansion (`$`)"
+                .to_string(),
+        );
+    }
+    let compact: String = code
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if compact.is_empty() {
+        return Err("python -c requires a non-empty code string".to_string());
+    }
+
+    const DANGEROUS_PYTHON_PATTERNS: &[&str] = &[
+        // —— 执行外部命令 / 进程控制 ——
+        "os.system",
+        "os.popen",
+        "os.spawn",
+        "os.exec",
+        "os.fork",
+        "os.kill",
+        "os.killpg",
+        "subprocess.",
+        "importsubprocess",
+        "fromsubprocess",
+        // 危险模块的任意导入形式（含 `import X as` / `from X import *`）一律拦截：
+        // 否则 `from os import system; system("...")` / `import os as o; o.system(...)`
+        // / `import os; x = os; x.system(...)` 都能绕开上面的 `os.system` 直匹配。
+        "importos",
+        "fromos",
+        "importposix",
+        "fromposix",
+        "importshutil",
+        "fromshutil",
+        "importsocket",
+        "fromsocket",
+        "importctypes",
+        "fromctypes",
+        "importpty",
+        "frompty",
+        "importmarshal",
+        "frommarshal",
+        "importpickle",
+        "frompickle",
+        "importtelnetlib",
+        "fromtelnetlib",
+        "importftplib",
+        "fromftplib",
+        "importsmtplib",
+        "fromsmtplib",
+        "importpwn",
+        "frompwn",
+        "importcommands",
+        "fromcommands",
+        "importimportlib",
+        "fromimportlib",
+        // 经 `sys.modules` 取出已加载的 os 再调用（如 `import json` 内部会加载 os）。
+        "sys.modules",
+        "commands.getoutput",
+        "signal.kill",
+        "pty.",
+        // —— 文件破坏 / 权限 / 所有权 / 链接 / 重命名 ——
+        "os.remove",
+        "os.unlink",
+        "os.rmdir",
+        "os.removedirs",
+        "os.chmod",
+        "os.chown",
+        "os.chflags",
+        "os.rename",
+        "os.replace",
+        "os.link",
+        "os.symlink",
+        "os.truncate",
+        "os.mkfifo",
+        "os.mknod",
+        "os.setuid",
+        "os.setgid",
+        "shutil.rmtree",
+        "shutil.move",
+        "shutil.chown",
+        // Path(...) 方法调用形式（`.unlink()` 等）；`).replace(` 同时覆盖 os.replace。
+        ").unlink(",
+        ").rmdir(",
+        ").rename(",
+        ").replace(",
+        ").chmod(",
+        ").chown(",
+        ").symlink_to(",
+        ").write_text(",
+        ").write_bytes(",
+        ").truncate(",
+        // —— 动态执行 / 动态导入（混淆与逃逸入口）——
+        "eval(",
+        "exec(",
+        "execfile(",
+        "compile(",
+        "__import__",
+        "importlib.",
+        "getattr(",
+        "setattr(",
+        "__builtins__",
+        "__globals__",
+        "__subclasses__",
+        "ctypes.",
+        "marshal.",
+        "pickle.loads",
+        // —— 网络 / 监听（对应 shell 侧 nc / telnet / socat 黑名单）——
+        "socket.",
+        "http.server",
+        "baseserver",
+        "socketserver",
+        "telnetlib.",
+        "ftplib.",
+        "smtplib.",
+        "asyncio.start_server",
+        "pwn.",
+    ];
+
+    for pattern in DANGEROUS_PYTHON_PATTERNS {
+        if compact.contains(pattern) {
+            return Err(format!(
+                "python -c code contains blocked primitive '{pattern}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn find_has_blocked_exec_semantics(tokens: &[String]) -> Option<&str> {
@@ -1566,12 +1777,35 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         }
     }
 
-    // 拦下 `bash -c "..."` / `sh -c` / `zsh -c` 这种"二次解释"形式。
-    // 直接执行脚本（`bash script.sh`）仍然允许，避免把脚本参数里的 `-c` 误判为 shell 选项。
-    if shell_c_option_present(program, command_tokens) {
+    // `bash -c "..."` / `sh -c` / `zsh -c` 这种"二次解释"把字符串当 shell 代码执行，
+    // 等于绕过分段黑名单，一律拦截。直接执行脚本（`bash script.sh`）仍然允许。
+    if is_shell_program(program) && shell_c_option_present(program, command_tokens) {
         return Err(format!(
             "shell `{program} -c ...` re-interprets a string as shell code; \
              run the literal command directly instead"
+        ));
+    }
+    // `python -c '...'` 的代码串同样会被当成程序执行，但代码串本身可以静态校验
+    // （validate_python_code）：干净放行、命中危险原语拦截——比一刀切拦截更可用，
+    // 且不弱于原保证。提取不到代码串（缺失 / shell 变量展开）时 fail-closed。
+    // 其他解释器（perl / ruby / node / php / awk / lua）没有对应扫描器，保持原样拦截。
+    if is_python_program(program) {
+        match python_c_argument(command_tokens) {
+            Ok(Some(code)) => validate_python_code(&code)?,
+            // 无 `-c`：`python3 script.py` / `python3 -m mod`，与 `bash run.sh` 同级，
+            // 不审计脚本文件内容。
+            Ok(None) => {}
+            Err(reason) => {
+                return Err(format!(
+                    "python `{program} -c` code cannot be verified ({reason}); \
+                     pass a literal quoted code string or write a script file instead"
+                ))
+            }
+        }
+    } else if is_interpreter_program(program) && shell_c_option_present(program, command_tokens) {
+        return Err(format!(
+            "interpreter `{program} -c` re-interprets a string as code and is blocked; \
+             write a script file and run `{program} script` instead"
         ));
     }
 
@@ -1629,6 +1863,49 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
             if let Some(reason) = blocked_git_destructive(&raw_command_tokens[idx..]) {
                 return Err(reason.to_string());
             }
+        }
+        // 间接执行的解释器 `-c` / `-e` 同样要校验，否则 `env bash -c '...'` /
+        // `env perl -e '...'` / `xargs python3 -c '...'` 可借包装器绕开直接路径的拦截。
+        if is_python_program(nested) {
+            match python_c_argument(&command_tokens[idx..]) {
+                Ok(Some(code)) => validate_python_code(&code)?,
+                Ok(None) => {}
+                Err(reason) => {
+                    return Err(format!(
+                        "python `{nested} -c` code cannot be verified via '{program}' ({reason})"
+                    ))
+                }
+            }
+        } else if (is_shell_program(nested) || is_interpreter_program(nested))
+            && shell_c_option_present(nested, &command_tokens[idx..])
+        {
+            return Err(format!(
+                "indirect `{nested} -c` re-interpretation via '{program}' is blocked"
+            ));
+        }
+    }
+
+    // 叠层包装（`nohup env python3 -c '...'`、`env env bash -c '...'`）会逐层绕过
+    // 上面的单层间接检查：用 effective_command_tokens 深解到最内层命令再校验一次。
+    let effective = effective_command_tokens(command);
+    if let Some(eff_program) = effective.first() {
+        if is_python_program(eff_program) {
+            match python_c_argument(&effective) {
+                Ok(Some(code)) => validate_python_code(&code)?,
+                Ok(None) => {}
+                Err(reason) => {
+                    return Err(format!(
+                        "python `{eff_program} -c` code cannot be verified inside '{command}' \
+                         ({reason})"
+                    ))
+                }
+            }
+        } else if (is_shell_program(eff_program) || is_interpreter_program(eff_program))
+            && shell_c_option_present(eff_program, &effective)
+        {
+            return Err(format!(
+                "nested `{eff_program} -c` re-interpretation inside '{command}' is blocked"
+            ));
         }
     }
 
@@ -2097,5 +2374,104 @@ mod tests {
     #[test]
     fn home_env_var_escape_blocked() {
         assert!(validate("cp foo.txt $HOME/../../..").is_err());
+    }
+
+    // ---- python -c 代码串审计 ----
+
+    #[test]
+    fn python_dash_c_clean_code_allowed() {
+        assert!(validate("python3 -c 'print(1 + 1)'").is_ok());
+        assert!(validate(r#"python3 -c "import json; print(json.load(open('x.json')))""#).is_ok());
+        assert!(validate("python -c 'print(sum(i*i for i in range(10)))'").is_ok());
+        assert!(validate("python3 -u -c 'print(\"hi\")'").is_ok());
+        assert!(validate("python3 -c'print(1)'").is_ok());
+        assert!(validate("python3 -W ignore -c 'print(1)'").is_ok());
+        assert!(validate("python3 -c 'print(len(\"abc\"))'").is_ok());
+        assert!(validate("python3 -c 'import re; print(re.findall(r\"\\d+\", \"a1b2\"))'").is_ok());
+    }
+
+    #[test]
+    fn python_dash_c_dangerous_code_blocked() {
+        let err = validate("python3 -c 'import os; os.system(\"rm -rf /\")'").unwrap_err();
+        assert!(err.contains("blocked primitive"), "got: {err}");
+        assert!(validate("python3 -c 'os.remove(\"x\")'").is_err());
+        assert!(validate("python3 -c 'import subprocess; subprocess.run([\"ls\"])'").is_err());
+        assert!(validate("python3 -c 'from subprocess import call; call(\"ls\")'").is_err());
+        assert!(validate("python3 -c 'eval(\"1+1\")'").is_err());
+        assert!(validate("python3 -c 'exec(\"x=1\")'").is_err());
+        assert!(validate("python3 -c 'getattr(os, \"system\")(\"rm -rf /\")'").is_err());
+        assert!(validate("python3 -c '__import__(\"os\").system(\"id\")'").is_err());
+        assert!(validate("python3 -c 'shutil.rmtree(\"d\")'").is_err());
+        assert!(validate("python3 -c 'import socket; socket.socket()'").is_err());
+        assert!(validate("python3 -c 'ctypes.CDLL(None).system(\"id\")'").is_err());
+        assert!(validate("python3 -c 'Path(\"x\").unlink()'").is_err());
+        // 危险模块的任意导入形式（from-import / 别名 / 变量复制 / sys.modules）。
+        assert!(validate("python3 -c 'from os import system; system(\"rm -rf /\")'").is_err());
+        assert!(validate("python3 -c 'import os as o; o.system(\"id\")'").is_err());
+        assert!(validate("python3 -c 'import os; x = os; x.system(\"id\")'").is_err());
+        assert!(validate("python3 -c 'import sys; sys.modules[\"os\"].system(\"id\")'").is_err());
+        assert!(validate("python3 -c 'import posix; posix.system(\"id\")'").is_err());
+        assert!(validate("python3 -c 'import signal; signal.kill(1, 9)'").is_err());
+        // 常见混淆：去掉空白 / 改大小写后仍能命中。
+        assert!(validate("python3 -c 'os . system(\"id\")'").is_err());
+        assert!(validate("python3 -c 'OS.SYSTEM(\"id\")'").is_err());
+        // 成组短选项 `-uc` 等价于 `-u -c`。
+        assert!(validate("python3 -uc 'os.system(\"id\")'").is_err());
+        // `__subclasses__` 沙箱逃逸链。
+        assert!(validate("python3 -c '().__class__.__bases__[0].__subclasses__()'").is_err());
+    }
+
+    #[test]
+    fn python_dash_c_unverifiable_code_blocked() {
+        // 代码来自 shell 变量展开，无法静态验证 → fail-closed。
+        assert!(validate("python3 -c $CODE").is_err());
+        assert!(validate("CODE=x python3 -c $CODE").is_err());
+        assert!(validate("python3 -c \"$CODE\"").is_err());
+        // 缺失 / 空代码。
+        assert!(validate("python3 -c").is_err());
+        assert!(validate("python3 -c ''").is_err());
+        // 成组短选项里带 `-c` 但缺代码。
+        assert!(validate("python3 -uc").is_err());
+    }
+
+    #[test]
+    fn python_without_dash_c_unchanged() {
+        assert!(validate("python3 script.py").is_ok());
+        assert!(validate("python3 -m json.tool < data.json").is_ok());
+        assert!(validate("python3 --version").is_ok());
+    }
+
+    #[test]
+    fn grouped_short_options_caught() {
+        // 成组短选项同样会带出 `-c` / `-e`：`bash -lc` / `perl -le` / `node -pe` /
+        // `ruby -ne` 与 `-c` / `-e` 等价，不能放行。
+        assert!(validate("bash -lc 'rm -rf /'").is_err());
+        assert!(validate("perl -le 'system(\"rm -rf /\")'").is_err());
+        assert!(validate("node -pe 'require(\"child_process\").execSync(\"id\")'").is_err());
+        assert!(validate("ruby -ne 'puts 1'").is_err());
+        // 不带 `-c` / `-e` 的合法短选项不受影响（`-e` 对 shell 是 errexit，不是代码；
+        // `--norc` 是长选项）。
+        assert!(validate("bash -e script.sh").is_ok());
+        assert!(validate("bash --norc script.sh").is_ok());
+        assert!(validate("perl -w script.pl").is_ok());
+    }
+
+    #[test]
+    fn indirect_interpreter_dash_c_audited() {
+        // 干净的间接 python -c 仍然放行。
+        assert!(validate("env python3 -c 'print(1)'").is_ok());
+        assert!(validate("nohup env python3 -c 'print(1)'").is_ok());
+        assert!(validate("env env python3 -c 'print(1)'").is_ok());
+        // 包装器不再能借 `-c` 绕过校验。
+        let err = validate("env python3 -c 'os.system(\"id\")'").unwrap_err();
+        assert!(err.contains("blocked primitive"), "got: {err}");
+        assert!(validate("xargs python3 -c 'os.system(\"id\")'").is_err());
+        assert!(validate("nohup python3 -c 'os.system(\"id\")'").is_err());
+        // 叠层包装（`nohup env python3 -c ...`）同样被深解拦截。
+        assert!(validate("nohup env python3 -c 'os.system(\"id\")'").is_err());
+        assert!(validate("env bash -c 'echo ok && rm -rf /'").is_err());
+        assert!(validate("timeout 10 bash -c 'rm -rf /'").is_err());
+        assert!(validate("env perl -e 'system(\"rm -rf /\")'").is_err());
+        assert!(validate("env env bash -c 'rm -rf /'").is_err());
     }
 }

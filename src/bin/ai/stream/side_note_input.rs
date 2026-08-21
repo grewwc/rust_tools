@@ -20,21 +20,21 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
+    thread::{self, JoinHandle},
     time::Duration,
 };
-
-use tokio::task::JoinHandle;
 
 use crate::ai::{
     driver::{runtime_ctx, side_note::push_side_note},
     theme::{ACCENT_MUTED, RESET},
 };
+use crate::commonw::prompt::{acquire_background_stdin, foreground_stdin_requested};
 
 /// Ctrl+G（BEL）
 const CTRL_G: u8 = 0x07;
 /// poll 轮询间隔（毫秒）：同时约束 stop 标志的响应延迟。
 const POLL_MS: i32 = 50;
-/// Drop 时等待监听任务收尾（恢复终端）的上限。
+/// Drop 时等待监听线程确认已释放 stdin / cbreak 的上限。
 const SHUTDOWN_WAIT_MS: u64 = 250;
 /// 启动时等待 listener 完成终端接管的上限；超时则不让尚未开始的 task 修改终端。
 const STARTUP_WAIT_MS: u64 = 250;
@@ -42,6 +42,10 @@ const STARTUP_WAIT_MS: u64 = 250;
 const FOOTER_ROWS: u16 = 1;
 const COMPOSER_PREFIX: &str = "  [side-note] Esc/F2 send · Ctrl+G cancel > ";
 const COMPOSER_CURSOR: char = '▌';
+
+fn should_yield_stdin(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::Relaxed) || foreground_stdin_requested()
+}
 
 /// 以 DECSTBM 保留的终端底部 footer。所有输出仍在主屏，避免 alternate screen
 /// 隐藏 transcript；composer 每次重绘会保存/恢复输出光标，因此不影响模型持续输出。
@@ -52,7 +56,7 @@ struct FooterReservation {
 
 impl FooterReservation {
     fn enter(stop: &AtomicBool) -> io::Result<Self> {
-        if stop.load(Ordering::Relaxed) {
+        if should_yield_stdin(stop) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "side-note stopped",
@@ -76,7 +80,7 @@ impl FooterReservation {
     fn apply_reservation(&self, stop: &AtomicBool) -> io::Result<()> {
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        if stop.load(Ordering::Relaxed) {
+        if should_yield_stdin(stop) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "side-note stopped",
@@ -191,6 +195,7 @@ pub(crate) fn side_note_input_enabled() -> bool {
 /// RAII 守卫：持有后台监听任务，drop 时请求退出并等待终端恢复。
 pub(crate) struct SideNoteInputGuard {
     stop: Arc<AtomicBool>,
+    terminal_released: mpsc::Receiver<()>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -199,36 +204,67 @@ impl SideNoteInputGuard {
         let stop = Arc::new(AtomicBool::new(false));
         let task_stop = stop.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let task = tokio::task::spawn_blocking(move || {
-            // 若 guard 已在 blocking task 获得线程前被 drop，绝不能事后切换 cbreak
-            // 或设置滚动区域；否则下一轮 prompt 会继承孤立的终端状态。
-            if task_stop.load(Ordering::Relaxed) {
-                return;
-            }
-            let term = match CbreakTerm::enter() {
-                Ok(term) => term,
-                Err(_) => {
-                    let _ = ready_tx.send(false);
-                    return;
+        let (terminal_released_tx, terminal_released) = mpsc::sync_channel(1);
+        let task = thread::Builder::new()
+            .name("a-side-note-input".to_owned())
+            .spawn(move || {
+                let mut ready_tx = Some(ready_tx);
+                loop {
+                    if task_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // 工具确认等前台 prompt 与本监听器可能处于同一个 turn。租约保证任何
+                    // 时刻只有一个 stdin reader / termios owner；前台结束后监听器重新接管。
+                    let Some(stdin_owner) = acquire_background_stdin() else {
+                        thread::sleep(Duration::from_millis(POLL_MS as u64));
+                        continue;
+                    };
+                    // 若 guard 已在线程获得执行权前被 drop，绝不能事后切换 cbreak
+                    // 或设置滚动区域；否则下一轮 prompt 会继承孤立的终端状态。
+                    if should_yield_stdin(&task_stop) {
+                        drop(stdin_owner);
+                        continue;
+                    }
+                    let term = match CbreakTerm::enter() {
+                        Ok(term) => term,
+                        Err(_) => break,
+                    };
+                    if should_yield_stdin(&task_stop) {
+                        drop(term);
+                        drop(stdin_owner);
+                        continue;
+                    }
+                    // 监听器只接管 stdin；未按 Ctrl+G 时绝不设置滚动区域或移动 stdout，
+                    // 避免普通 turn 的状态/正文被无条件推到终端底部。
+                    if let Some(ready_tx) = ready_tx.take() {
+                        let _ = ready_tx.send(true);
+                    }
+                    let resume_after_foreground =
+                        side_note_input_loop(&history_file, &task_stop, term);
+                    drop(stdin_owner);
+                    if !resume_after_foreground {
+                        break;
+                    }
                 }
-            };
-            if task_stop.load(Ordering::Relaxed) {
-                return;
-            }
-            // 监听器只接管 stdin；未按 Ctrl+G 时绝不设置滚动区域或移动 stdout，
-            // 避免普通 turn 的状态/正文被无条件推到终端底部。
-            let _ = ready_tx.send(true);
-            side_note_input_loop(&history_file, &task_stop, term);
-        });
-        if !ready_rx
-            .recv_timeout(Duration::from_millis(STARTUP_WAIT_MS))
-            .unwrap_or(false)
+                if let Some(ready_tx) = ready_tx {
+                    let _ = ready_tx.send(false);
+                }
+                // 只能在输入循环返回且 CbreakTerm 已析构后确认；收到此消息即保证该
+                // 线程不会再 poll/read stdin，也不再持有 cbreak 终端状态。
+                let _ = terminal_released_tx.send(());
+            })
+            .ok();
+        if task.is_none()
+            || !ready_rx
+                .recv_timeout(Duration::from_millis(STARTUP_WAIT_MS))
+                .unwrap_or(false)
         {
             stop.store(true, Ordering::Relaxed);
         }
         SideNoteInputGuard {
             stop,
-            task: Some(task),
+            terminal_released,
+            task,
         }
     }
 }
@@ -236,17 +272,12 @@ impl SideNoteInputGuard {
 impl Drop for SideNoteInputGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(task) = self.task.take() {
-            let deadline = std::time::Instant::now() + Duration::from_millis(SHUTDOWN_WAIT_MS);
-            while std::time::Instant::now() < deadline {
-                if task.is_finished() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            // 不 abort：poll 以 POLL_MS(50ms) 粒度检查 stop，监听任务会自行清除
-            // footer、重置滚动区域并恢复 CbreakTerm。abort 无法中断阻塞的 poll，反而
-            // 会在终端尚未恢复时放行，与后续 prompt_user 的 raw mode 形成竞态。
+        let _ = self
+            .terminal_released
+            .recv_timeout(Duration::from_millis(SHUTDOWN_WAIT_MS));
+        if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
+            // 仅回收已完成线程；超时后绝不 join 尚未结束的 worker，保证 Drop 有硬上限。
+            let _ = self.task.take().expect("checked above").join();
         }
     }
 }
@@ -390,52 +421,100 @@ fn refresh_footer(footer: &mut FooterReservation, input: Option<&[char]>) -> io:
     Ok(())
 }
 
+/// 在不持有终端职责的独立线程写入 side-note；监听线程只按 poll 周期等待结果，stop
+/// 到达后立即放弃等待并进入终端清理，不能被文件系统 I/O 拖住。
+fn persist_side_note_interruptibly(
+    history_file: &Path,
+    content: &str,
+    stop: &AtomicBool,
+) -> Option<bool> {
+    let history_file = history_file.to_path_buf();
+    let content = content.to_owned();
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    if thread::Builder::new()
+        .name("a-side-note-persist".to_owned())
+        .spawn(move || {
+            let persisted = push_side_note(&history_file, &content, "user", None).is_ok();
+            let _ = result_tx.send(persisted);
+        })
+        .is_err()
+    {
+        return Some(false);
+    }
+
+    loop {
+        if should_yield_stdin(stop) {
+            return None;
+        }
+        match result_rx.recv_timeout(Duration::from_millis(POLL_MS as u64)) {
+            Ok(persisted) => {
+                return (!should_yield_stdin(stop)).then_some(persisted);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(false),
+        }
+    }
+}
+
 /// 发送当前草稿（Esc/F2/Alt+Enter 提交键共用）：内容为空时仅退出输入模式；
 /// 非空时写入 foreground 队列。写入失败保留草稿并继续 composer，不静默丢失指令。
 fn submit_draft(
     history_file: &Path,
+    stop: &AtomicBool,
     footer: &mut FooterReservation,
     input: &mut Vec<char>,
     pending: &mut Vec<u8>,
     in_input: &mut bool,
 ) -> io::Result<()> {
-    let content: String = input.drain(..).collect();
+    let content: String = input.iter().collect();
     pending.clear();
     let content = content.trim().to_string();
     if content.is_empty() {
+        input.clear();
         *in_input = false;
         return clear_input(footer);
     }
     // 不在 transcript 中插入确认行：模型可能正流式生成一个 Markdown 段落，
     // 额外换行会改变其语义布局。footer 清除即为发送反馈。
-    match push_side_note(history_file, &content, "user", None) {
-        Ok(_) => {
+    match persist_side_note_interruptibly(history_file, &content, stop) {
+        Some(true) => {
+            input.clear();
             *in_input = false;
             clear_input(footer)
         }
-        Err(_) => {
+        Some(false) => {
             // 保留草稿并继续显示 composer，避免静默丢失用户指令；可再次按
             // Esc/F2 重试，或 Ctrl+G 放弃。
-            input.extend(content.chars());
             redraw_input(footer, input)
         }
+        None => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "side-note listener stopped while persisting",
+        )),
     }
 }
 
 /// 带超时的单字节读取（仅用于 Esc 后判定是否为提交型功能键序列）。
-/// 返回 None 表示超时或 stdin 关闭/出错。
-fn read_byte_timeout(timeout_ms: i32) -> Option<u8> {
+/// 返回 None 表示超时、收到 stop，或 stdin 关闭/出错。
+fn read_byte_timeout(timeout_ms: i32, stop: &AtomicBool) -> Option<u8> {
+    let deadline = std::time::Instant::now()
+        + Duration::from_millis(u64::try_from(timeout_ms.max(0)).unwrap_or_default());
     loop {
+        if should_yield_stdin(stop) || std::time::Instant::now() >= deadline {
+            return None;
+        }
         let mut pfd = libc::pollfd {
             fd: libc::STDIN_FILENO,
             events: libc::POLLIN,
             revents: 0,
         };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let wait_ms = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
         // SAFETY: pollfd 为栈上独占可变引用。
-        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        let ret = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
         if ret < 0 {
-            // EINTR（SIGINT/SIGWINCH 等）：与主循环一致重试，而不是把"被信号打断"
-            // 误判为"裸 Esc 无跟随字节"而提交草稿。
+            // EINTR（SIGINT/SIGWINCH 等）重试，但仍受 deadline / stop 约束，不能让
+            // 正在退出的监听线程无限停在转义序列解析中。
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -445,6 +524,10 @@ fn read_byte_timeout(timeout_ms: i32) -> Option<u8> {
             return None; // 超时：无跟随字节，即裸 Esc
         }
         if pfd.revents & libc::POLLIN == 0 {
+            return None;
+        }
+        // poll 返回与 guard 请求退出之间可能已有下一轮输入到达；不要吞掉它。
+        if should_yield_stdin(stop) {
             return None;
         }
         let mut byte = [0u8; 1];
@@ -464,22 +547,24 @@ fn read_byte_timeout(timeout_ms: i32) -> Option<u8> {
 /// Alt+Enter（`ESC \r` / `ESC \n`）。终端在单个写突发内发出完整功能键序列，跟随
 /// 字节几乎立即可达；无论是否提交，本函数都会消费掉 ESC 之后的全部跟随字节，
 /// 避免方向键等其他序列的字节混入草稿。
-fn is_submit_escape() -> bool {
+fn is_submit_escape(stop: &AtomicBool) -> bool {
     const ESCAPE_FOLLOWUP_MS: i32 = 30;
-    match read_byte_timeout(ESCAPE_FOLLOWUP_MS) {
-        None => true,                    // 裸 Esc
-        Some(0x0d) | Some(0x0a) => true, // Alt+Enter
+    const MAX_CSI_BYTES: usize = 16;
+    match read_byte_timeout(ESCAPE_FOLLOWUP_MS, stop) {
+        None => !should_yield_stdin(stop), // 裸 Esc；停止/前台抢占时绝不提交草稿
+        Some(0x0d) | Some(0x0a) => true,   // Alt+Enter
         Some(0x4f) => {
             // SS3 形式：`ESC O Q` → F2；其余（F1/F3/F4 等）吞掉并忽略。
-            read_byte_timeout(ESCAPE_FOLLOWUP_MS) == Some(0x51)
+            read_byte_timeout(ESCAPE_FOLLOWUP_MS, stop) == Some(0x51)
         }
         Some(0x5b) => {
             // CSI 形式：读至 `~` 终止符；`ESC [ 1 2 ~` → F2，其余忽略。
             let mut seq = Vec::new();
             loop {
-                match read_byte_timeout(ESCAPE_FOLLOWUP_MS) {
+                match read_byte_timeout(ESCAPE_FOLLOWUP_MS, stop) {
                     Some(0x7e) => return seq == b"12",
-                    Some(b) => seq.push(b),
+                    Some(b) if seq.len() < MAX_CSI_BYTES => seq.push(b),
+                    Some(_) => return false,
                     None => return false,
                 }
             }
@@ -488,7 +573,8 @@ fn is_submit_escape() -> bool {
     }
 }
 
-fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: CbreakTerm) {
+/// 返回 true 表示因前台 prompt 抢占而退出，调用方应在 prompt 结束后重新接管 stdin。
+fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: CbreakTerm) -> bool {
     // 输入模式：UTF-8 字节累积缓冲 + 已解析字符 + 已回显列数
     let mut pending: Vec<u8> = Vec::new();
     let mut input: Vec<char> = Vec::new();
@@ -496,7 +582,7 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
     let mut footer: Option<FooterReservation> = None;
 
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if should_yield_stdin(stop) {
             break;
         }
         let b = {
@@ -507,6 +593,9 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
             };
             // SAFETY: pollfd 为栈上独占可变引用。
             let ret = unsafe { libc::poll(&mut pfd, 1, POLL_MS) };
+            if should_yield_stdin(stop) {
+                break;
+            }
             if ret < 0 {
                 // EINTR：终端尺寸变化（SIGWINCH）等信号会中断 poll，属正常现象，
                 // 重新计算 footer 位置；其余错误（fd 失效等）才退出监听。
@@ -542,6 +631,10 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
                     break; // stdin 关闭/出错，退出监听
                 }
                 continue;
+            }
+            // 退出与 stdin 就绪同时发生时，把字节留给随后打开的 prompt。
+            if should_yield_stdin(stop) {
+                break;
             }
             let mut byte = [0u8; 1];
             // SAFETY: 单字节栈缓冲，poll 已确认可读，阻塞 read 立即返回。
@@ -608,12 +701,13 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
                 // Esc / F2 / Alt+Enter：提交草稿。is_submit_escape 会消费掉 F2 等
                 // 功能键的完整转义序列，避免其跟随字节混入草稿；方向键等其他序列
                 // 被吞掉而不提交。
-                if is_submit_escape() {
+                if is_submit_escape(stop) {
                     let Some(active_footer) = footer.as_mut() else {
                         break;
                     };
                     if submit_draft(
                         history_file,
+                        stop,
                         active_footer,
                         &mut input,
                         &mut pending,
@@ -688,6 +782,7 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
         }
         let _ = active_footer.leave();
     }
+    foreground_stdin_requested() && !stop.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -708,6 +803,80 @@ mod tests {
         // 非交互 stdin（管道/CI）下绝不应启用，避免监听任务污染重定向输入。
         // 无论本机 stdin 是否为 tty，该查询都不应 panic。
         let _ = side_note_input_enabled();
+    }
+
+    #[test]
+    fn guard_drop_is_bounded_when_non_terminal_worker_blocks() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let (terminal_released_tx, terminal_released) = mpsc::sync_channel(1);
+        let (worker_release_tx, worker_release_rx) = mpsc::channel();
+        let task = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                thread::yield_now();
+            }
+            let _ = terminal_released_tx.send(());
+            // 模拟终端职责已结束、但后续非终端工作永久阻塞的 worker。
+            let _ = worker_release_rx.recv();
+        });
+        let guard = SideNoteInputGuard {
+            stop,
+            terminal_released,
+            task: Some(task),
+        };
+
+        let (drop_done_tx, drop_done_rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(guard);
+            let _ = drop_done_tx.send(());
+        });
+
+        if drop_done_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            let _ = worker_release_tx.send(());
+            let _ = dropper.join();
+            panic!("SideNoteInputGuard::drop exceeded its bounded wait");
+        }
+        let _ = worker_release_tx.send(());
+        let _ = dropper.join();
+    }
+
+    #[test]
+    fn guard_drop_waits_for_normal_listener_cleanup_ack() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener_stop = stop.clone();
+        let terminal_owned = Arc::new(AtomicBool::new(true));
+        let listener_terminal_owned = terminal_owned.clone();
+        let (terminal_released_tx, terminal_released) = mpsc::sync_channel(1);
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        let task = thread::spawn(move || {
+            while !listener_stop.load(Ordering::Relaxed) {
+                thread::yield_now();
+            }
+            let _ = cleanup_rx.recv();
+            listener_terminal_owned.store(false, Ordering::Relaxed);
+            let _ = terminal_released_tx.send(());
+        });
+        let guard = SideNoteInputGuard {
+            stop,
+            terminal_released,
+            task: Some(task),
+        };
+
+        let (drop_done_tx, drop_done_rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(guard);
+            let _ = drop_done_tx.send(());
+        });
+
+        assert!(
+            drop_done_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err()
+        );
+        let _ = cleanup_tx.send(());
+        assert!(drop_done_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(!terminal_owned.load(Ordering::Relaxed));
+        let _ = dropper.join();
     }
 
     #[test]

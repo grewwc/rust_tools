@@ -115,6 +115,40 @@ fn idle_timeout_discards_unconfirmed_tool_call_and_marks_stream_error() {
 }
 
 #[test]
+fn tool_arg_cap_discards_unconfirmed_tool_call_and_marks_truncated() {
+    // 工具参数累积超过上限被掐断时，即使截止瞬间的 JSON 恰好合法，也不能把
+    // 半截工具调用交给执行层（与 idle timeout 同一原则）。必须丢弃并走
+    // degenerate_repetition 的可重试 Truncated 路径，而不是执行部分参数。
+    let mut app = test_app();
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut current_history = String::new();
+    state.content.finish_reason_seen = true;
+    state.content.finish_reason_value = Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
+    state.content.tool_args_cap_exceeded = true;
+    state.content.tool_calls_map.insert(
+        0,
+        ToolCallBuilder {
+            id: "call-cap".to_string(),
+            tool_type: "function".to_string(),
+            function_name: "apply_patch".to_string(),
+            // 截止瞬间恰好是合法 JSON，也不应被执行。
+            arguments: r#"{"patch":"partial but currently valid"}"#.to_string(),
+            printed_arguments_len: 0,
+        },
+    );
+    // assistant_text 里出现疑似内联工具调用的 JSON（会被 recover_inline_tool_calls
+    // 识别），参数超限场景下同样不可信，不能被恢复执行，否则绕过上面的丢弃逻辑。
+    state.content.assistant_text =
+        r#"{"function":{"name":"apply_patch","arguments":"{}"},"id":"call-recover"}"#.to_string();
+
+    let result = finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
+
+    assert_eq!(result.outcome, StreamOutcome::Truncated);
+    assert!(result.tool_calls.is_empty());
+}
+
+#[test]
 fn degenerate_reasoning_repetition_requires_three_long_contentful_copies() {
     let phrase = "需要先确认当前上下文是否仍然有效，然后再继续执行。";
     assert!(!has_degenerate_repetition(&phrase.repeat(2)));

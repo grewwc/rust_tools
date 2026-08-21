@@ -328,6 +328,10 @@ pub(super) struct StreamContentState {
     /// 撞上输出上限被截断时最典型：JSON 半截 → 被丢弃 → 本轮无有效工具调用。
     /// 若仅凭"无工具调用 + 有文本"会被误判为正常完成而静默结束。
     pub(super) dropped_malformed_tool_call: bool,
+    /// 工具调用参数累积超过 `MAX_TOOL_ARG_BYTES` 上限被强制停流。与
+    /// `stream_idle_timed_out` 同理：流是被运行时掐断的，模型可能仍在生成，
+    /// 不能把截止瞬间恰好合法的 JSON 当成完整工具调用交给执行层。
+    pub(super) tool_args_cap_exceeded: bool,
     pub(super) saw_reasoning_output: bool,
     pub(super) tool_calls_map: SkipMap<usize, ToolCallBuilder>,
     pub(super) assistant_text: String,
@@ -367,6 +371,7 @@ impl StreamContentState {
             stream_idle_timed_out: false,
             finish_reason_value: None,
             dropped_malformed_tool_call: false,
+            tool_args_cap_exceeded: false,
             saw_reasoning_output: false,
             tool_calls_map: SkipMap::default(),
             assistant_text: String::new(),

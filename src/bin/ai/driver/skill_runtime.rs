@@ -182,7 +182,7 @@ pub(super) struct SkillTurnGuard {
     builder: SystemPromptBuilder,
     cached_system_prompt: Option<String>,
     cached_context_reminder: Option<Option<String>>,
-    /// 当前活动 skill 列表（有序，第一条为主 skill）。
+    /// 当前活动 skill 列表（有序，多 skill 平权，无主次之分）。
     matched_skill_names: Vec<String>,
 }
 
@@ -221,7 +221,7 @@ impl SkillTurnGuard {
                     );
                 } else {
                     pointer.push_str(
-                        "Active skills at turn start (in activation order, first is primary):\n",
+                        "Active skills at turn start (in activation order):\n",
                     );
                     for (i, name) in self.matched_skill_names.iter().enumerate() {
                         use std::fmt::Write;
@@ -229,8 +229,8 @@ impl SkillTurnGuard {
                     }
                     pointer.push_str(
                         "Treat their instructions in the system prompt's <skill_instructions> \
-                         section as the primary behavior contract for this turn; when they \
-                         conflict, later skills override earlier ones, except that guardrails \
+                         section as the primary behavior contract for this turn; all active \
+                         skills are equal peers that compose additively, and guardrails \
                          always take precedence.",
                     );
                 }
@@ -282,12 +282,12 @@ impl SkillTurnGuard {
         !scoped_project_instructions_missing(self.system_prompt(), required_targets)
     }
 
-    /// 返回当前所有活动 skill 名称（有序，第一条为主 skill）。
+    /// 返回当前所有活动 skill 名称（有序，多 skill 平权）。
     pub(super) fn matched_skill_names(&self) -> &[String] {
         &self.matched_skill_names
     }
 
-    /// 返回主 skill 名称（活动列表的第一条）。多 skill 场景下用于显示/日志。
+    /// 返回活动列表的第一条 skill 名称，仅用于显示/日志（多 skill 平权，无主次之分）。
     pub(super) fn primary_skill_name(&self) -> Option<&str> {
         self.matched_skill_names.first().map(|s| s.as_str())
     }
@@ -981,17 +981,18 @@ fn build_system_prompt(
         } else {
             // 多 skill：列出全部，说明叠加规则
             let mut header = String::from(
-                "Active skills (in activation order, first is primary):\n\
-                 You are operating under these skills for the current turn. Treat the skill \
-                 instructions as the primary behavior contract for this turn.\n",
+                "Active skills (in activation order):\n\
+                 You are operating under these skills for the current turn. All active skills \
+                 are equal peers and compose additively; none takes precedence over another. \
+                 Treat their instructions as the primary behavior contract for this turn.\n",
             );
             for (i, skill) in skills.iter().enumerate() {
                 use std::fmt::Write;
                 let _ = writeln!(header, "  {}. {}", i + 1, skill.name);
             }
             header.push_str(
-                "When skill instructions conflict, later skills override earlier ones, \
-                 except that guardrails always take precedence.",
+                "When skill instructions conflict, no skill overrides another; guardrails \
+                 always take precedence.",
             );
             header
         };
@@ -3106,7 +3107,7 @@ mod tests {
             .expect("reminder should be present with active skills");
         assert!(reminder.contains("<system-reminder>"));
         assert!(reminder.contains(
-            "Active skills at turn start (in activation order, first is primary):"
+            "Active skills at turn start (in activation order):"
         ));
         assert!(reminder.contains("  1. alpha"));
         assert!(reminder.contains("  2. beta"));

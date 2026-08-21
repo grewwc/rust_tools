@@ -4,8 +4,9 @@ use crate::ai::{
     mcp::McpClient,
     skills::SkillManifest,
     theme::{
-        ACCENT_COMMAND, ACCENT_DANGER, ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY,
-        ACCENT_SUCCESS, ACCENT_TOOL_NAME, ACCENT_WARN, BOLD, DIM, RESET,
+        ACCENT_COMMAND, ACCENT_DANGER, ACCENT_EMPHASIZED_OUTPUT, ACCENT_MUTED, ACCENT_PRIMARY,
+        ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS, ACCENT_TOOL_NAME, ACCENT_WARN, BOLD, DIM,
+        RESET,
     },
     types::App,
 };
@@ -218,7 +219,11 @@ fn format_tool_output_line_with_dim(line: &str, dim: bool) -> String {
     if sanitized.is_empty() {
         format!("  {}│{}", ACCENT_RULE, RESET)
     } else {
-        let body_style = if dim { DIM } else { "" };
+        let body_style = if dim {
+            DIM
+        } else {
+            ACCENT_EMPHASIZED_OUTPUT
+        };
         format!(
             "  {}│{} {}{}{}",
             ACCENT_RULE, RESET, body_style, sanitized, RESET
@@ -602,7 +607,7 @@ mod tests {
         format_tool_status_completed, format_tool_status_with_file_target, sanitize_for_terminal,
     };
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
-    use crate::ai::theme::{ACCENT_COMMAND, ACCENT_SECONDARY, DIM};
+    use crate::ai::theme::{ACCENT_COMMAND, ACCENT_EMPHASIZED_OUTPUT, ACCENT_SECONDARY, DIM};
 
     fn strip_ansi_for_test(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -729,6 +734,12 @@ mod tests {
         );
         assert!(normal.iter().all(|line| line.contains(DIM)));
         assert!(emphasized.iter().all(|line| !line.contains(DIM)));
+        assert!(normal
+            .iter()
+            .all(|line| !line.contains(ACCENT_EMPHASIZED_OUTPUT)));
+        assert!(emphasized
+            .iter()
+            .all(|line| line.contains(ACCENT_EMPHASIZED_OUTPUT)));
     }
 
     #[test]

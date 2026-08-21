@@ -655,7 +655,6 @@ pub(super) fn refresh_skill_turn_for_iteration(
     }
 
     let prev_skills = skill_turn.matched_skill_names().to_vec();
-    let inherited_restore = skill_turn.take_restore_agent_context();
 
     // 模型通过 activate_skill / deactivate_skill 工具显式请求变更时优先采纳：
     // 按名字强制激活，跳过自动路由打分。名字校验在工具侧已做（必须真实存在），
@@ -677,6 +676,24 @@ pub(super) fn refresh_skill_turn_for_iteration(
             }
         }
     }
+    // 无任何变更时复用现有 guard（跳过全量重建）：无 pending action、skill 集未动，
+    // 且 preflight 必需的 + 本轮已触碰文件的 scoped 项目指令都已就绪。重建的开销不止
+    // 是重渲染：会重拉 MCP 工具集、重读 SQLite 激活历史，并整体置换 ctx.tools，导致
+    // 上游 prompt cache 在长 turn 里连续失效。若 observed 目标新增了带指令的文件，
+    // 其指令尚未出现在现有 prompt 中，则仍走重建路径补充。
+    if actions.is_empty() && current_names == prev_skills {
+        let project_targets = project_instruction_target_paths(messages);
+        if !skill_runtime::scoped_project_instructions_missing(
+            skill_turn.system_prompt(),
+            required_project_targets,
+        ) && !skill_runtime::scoped_project_instructions_missing(
+            skill_turn.system_prompt(),
+            &project_targets,
+        ) {
+            return true;
+        }
+    }
+    let inherited_restore = skill_turn.take_restore_agent_context();
     let mut new_skill_turn = if !actions.is_empty() {
         skill_runtime::force_activate_named_skill(
             app,
