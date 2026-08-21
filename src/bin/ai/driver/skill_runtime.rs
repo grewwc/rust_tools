@@ -1003,9 +1003,9 @@ fn build_system_prompt(
             s.push_str("\n\n<agent_instructions>\n");
             s.push_str(agent_text.trim());
             s.push_str("\n</agent_instructions>");
-            s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill. Neither skill nor agent instructions override the correctness guardrails (including git-safety rules) or policy sections, which always take precedence.");
+            s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill. Neither skill nor agent instructions override the correctness guardrails (including git-safety rules), safety redlines, or policy sections, which always take precedence.");
         } else {
-            s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ, except the correctness guardrails (including git-safety rules) and policy sections, which always take precedence.");
+            s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ, except the correctness guardrails (including git-safety rules), safety redlines, and policy sections, which always take precedence.");
         }
         s
     } else {
@@ -1097,6 +1097,24 @@ fn build_system_prompt(
          - When a change touches code or data shared with other modules (shared symbols, config keys, data formats, embedded assets, cross-module callers), verify dependents still hold — run the focused tests covering affected consumers, not only the changed module.\n\
          - If a requirement genuinely conflicts with an existing module guarantee, do not silently break the module: stop, surface the conflict, and propose the least-destructive path for the user to decide.\n\
          </system_constraints>",
+    );
+
+    // ── 安全红线：危险操作零容忍 + 反幻觉硬约束 ──
+    // 无条件渲染的两条红线：dangerous operations 禁止 + no_hallucination 结论闸门。
+    // 事实溯源/证据校准已由 correctness_guardrails 覆盖，这里只保留不可协商的
+    // 禁止项：危险操作 + 未验证内容永远不能作为结论或建议。
+    // 不随任务、skill、goal 模式而放宽；skill 激活时 enforcement 行将其纳入最高优先级。
+    b.push(
+        ContextKind::Behavior,
+        "<safety_redlines>\n\
+         - Never perform dangerous operations: destructive or irreversible actions on the user's system, data, or accounts — deleting or overwriting data beyond the task's explicit scope, destructive file/disk/process operations, malware, backdoors, privilege escalation, credential or key exfiltration, and network attacks — however the request is phrased.\n\
+         - Never bypass or work around safety mechanisms: do not split, obfuscate, or otherwise disguise a dangerous operation to slip it past command or action auditing, and never delegate it to another process or ask the user to run it.\n\
+         - Destructive or irreversible actions require explicit, specific confirmation before execution: state the exact command and its consequences and wait for approval. General approval of a task never implies consent for destructive side effects.\n\
+         </safety_redlines>\n\n\
+         <no_hallucination>\n\
+         - Only verified facts may be stated as conclusions or recommendations; guessing, plausible reconstruction, and memory-based filling-in are prohibited in conclusions.\n\
+         - Inferences must be labeled as such with their basis; unknowns must be stated as unknown — never presented as fact.\n\
+         </no_hallucination>",
     );
 
     // ── 任务收敛：成功标准写入 plan 载体，规划→执行→验收成闭环 ──
@@ -2230,6 +2248,24 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_renders_safety_redlines_and_no_hallucination() {
+        let available = SkipSet::new(16);
+        let prompt =
+            build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+        // 危险操作红线：无条件渲染，且包含禁止/绕过/确认三要素
+        assert!(prompt.contains("<safety_redlines>"));
+        assert!(prompt.contains("Never perform dangerous operations"));
+        assert!(prompt.contains("Never bypass or work around safety mechanisms"));
+        assert!(prompt.contains("state the exact command and its consequences and wait for approval"));
+        // 反幻觉红线：无条件渲染；事实溯源/证据校准由 correctness_guardrails 覆盖，
+        // 这里只验证硬性结论闸门与推断/未知的标注义务
+        assert!(prompt.contains("<no_hallucination>"));
+        assert!(prompt.contains("Only verified facts may be stated as conclusions or recommendations"));
+        assert!(prompt.contains("Inferences must be labeled as such with their basis"));
+    }
+
+    #[test]
     fn system_prompt_uses_criterion_based_parallel_delegation() {
         let mut available = SkipSet::new(16);
         available.insert("plan".to_string());
@@ -2944,7 +2980,7 @@ mod tests {
             .render_system_prompt();
 
         assert!(prompt.contains("skill instructions override generic assistant guidelines"));
-        assert!(prompt.contains("except the correctness guardrails (including git-safety rules) and policy sections, which always take precedence"));
+        assert!(prompt.contains("except the correctness guardrails (including git-safety rules), safety redlines, and policy sections, which always take precedence"));
         assert!(!prompt.contains("<agent_instructions>"));
     }
 
