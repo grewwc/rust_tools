@@ -5,8 +5,9 @@ fn print_model_help() {
     println!();
     println!("  /model                              list available models");
     println!("  /model current                      show current model & effort");
-    println!("  /model <selector>                   switch to a model");
+    println!("  /model <selector> [<question>...]   switch to a model");
     println!("                                      e.g. /model deepseek-v4-flash-opencode");
+    println!("                                      (text after the selector is asked on this turn)");
     println!("  /model effort                       show current reasoning effort");
     println!("  /model effort <minimal|low|medium|high|xhigh|max>");
     println!("                                      override reasoning effort");
@@ -117,7 +118,7 @@ pub fn try_handle_model_command(
     let Some(cmd) = parts.next() else {
         return Ok(false);
     };
-    if cmd != "model" {
+    if cmd != "model" && cmd != "models" {
         return Ok(false);
     }
 
@@ -222,16 +223,33 @@ pub fn try_handle_model_command(
         return Ok(true);
     }
 
-    let target = remainder;
+    let raw = remainder;
 
-    if target.is_empty() {
+    if raw.is_empty() {
         println!("missing model selector. try: /model <name-platform>");
         print_model_list(app);
         return Ok(true);
     }
 
-    let Some(model) = model_names::find_by_identifier(target) else {
-        println!("Model not found: {}", target);
+    // 支持行内问题：`/model <selector> [<question>...]`，question 可直接换行跟在
+    // selector 之后（与 `/skills <name>... <question>` 一致）。模型 selector 是
+    // 单 token：先整体尝试命中（保留空格归一化 selector 的既有行为），未命中时取
+    // 首个 token 作为 selector，其余文本作为本轮问题。
+    let mut selector = raw;
+    let mut inline_question: Option<String> = None;
+    if let Some(first) = raw.split_whitespace().next()
+        && model_names::find_by_identifier(raw).is_none()
+        && model_names::find_by_identifier(first).is_some()
+    {
+        selector = first;
+        let rest = raw[first.len()..].trim();
+        if !rest.is_empty() {
+            inline_question = Some(rest.to_string());
+        }
+    }
+
+    let Some(model) = model_names::find_by_identifier(selector) else {
+        println!("Model not found: {}", raw);
         print_model_list(app);
         return Ok(true);
     };
@@ -242,6 +260,11 @@ pub fn try_handle_model_command(
         .map(model_handle)
         .unwrap_or_else(|| old_model.trim().to_string());
     if old_handle.eq_ignore_ascii_case(&next_model) {
+        if let Some(question) = inline_question {
+            // 模型未变但带了行内问题：问题仍照常送入本轮。
+            app.forced_question = Some(question);
+            return Ok(true);
+        }
         println!(
             "Model unchanged: {}",
             models::model_display_label(&next_model)
@@ -270,6 +293,9 @@ pub fn try_handle_model_command(
             ""
         },
     );
+    if let Some(question) = inline_question {
+        app.forced_question = Some(question);
+    }
     Ok(true)
 }
 
@@ -368,5 +394,121 @@ mod tests {
         assert!(handled);
         assert_eq!(app.current_model, original);
         assert!(app.cli.model.is_none());
+    }
+
+    #[test]
+    fn model_command_with_inline_question_switches_and_forces_question() {
+        let models = crate::ai::model_names::all();
+        if models.len() < 2 {
+            return;
+        }
+        let mut app = test_app();
+        let target = crate::ai::model_names::model_handle(models[1]);
+        let question = "帮我看看这段代码";
+
+        let handled =
+            try_handle_model_command(&mut app, &format!("/model {target} {question}")).unwrap();
+
+        assert!(handled);
+        assert_eq!(app.current_model, target);
+        assert_eq!(app.cli.model.as_deref(), Some(target.as_str()));
+        assert_eq!(app.forced_question.as_deref(), Some(question));
+    }
+
+    #[test]
+    fn model_command_multiline_question() {
+        // /model <selector>\n<question>：换行后的文本作为本轮问题
+        let models = crate::ai::model_names::all();
+        if models.len() < 2 {
+            return;
+        }
+        let mut app = test_app();
+        let target = crate::ai::model_names::model_handle(models[1]);
+
+        let handled = try_handle_model_command(
+            &mut app,
+            &format!("/model {target}\n帮我检查最近的变更"),
+        )
+        .unwrap();
+
+        assert!(handled);
+        assert_eq!(app.current_model, target);
+        assert_eq!(app.forced_question.as_deref(), Some("帮我检查最近的变更"));
+    }
+
+    #[test]
+    fn model_command_no_question_does_not_force() {
+        let models = crate::ai::model_names::all();
+        if models.len() < 2 {
+            return;
+        }
+        let mut app = test_app();
+        let target = crate::ai::model_names::model_handle(models[1]);
+
+        let handled = try_handle_model_command(&mut app, &format!("/model {target}")).unwrap();
+
+        assert!(handled);
+        assert_eq!(app.current_model, target);
+        assert!(app.forced_question.is_none());
+    }
+
+    #[test]
+    fn model_command_unknown_selector_with_question_is_not_found() {
+        let mut app = test_app();
+        let original = app.current_model.clone();
+
+        let handled =
+            try_handle_model_command(&mut app, "/model no-such-model-xyz 帮我看看").unwrap();
+
+        assert!(handled);
+        assert_eq!(app.current_model, original);
+        assert!(app.forced_question.is_none());
+    }
+
+    #[test]
+    fn model_command_unchanged_model_with_question_still_forces_question() {
+        let mut app = test_app();
+        let current = app.current_model.clone();
+
+        let handled =
+            try_handle_model_command(&mut app, &format!("/model {current} 帮我看看")).unwrap();
+
+        assert!(handled);
+        assert_eq!(app.current_model, current);
+        assert_eq!(app.forced_question.as_deref(), Some("帮我看看"));
+    }
+
+    #[test]
+    fn models_alias_switches_model() {
+        let models = crate::ai::model_names::all();
+        if models.len() < 2 {
+            return;
+        }
+        let mut app = test_app();
+        let target = crate::ai::model_names::model_handle(models[1]);
+
+        let handled = try_handle_model_command(&mut app, &format!("/models {target}")).unwrap();
+
+        assert!(handled);
+        assert_eq!(app.current_model, target);
+        assert_eq!(app.cli.model.as_deref(), Some(target.as_str()));
+    }
+
+    #[test]
+    fn models_alias_with_inline_question_forces_question() {
+        let models = crate::ai::model_names::all();
+        if models.len() < 2 {
+            return;
+        }
+        let mut app = test_app();
+        let target = crate::ai::model_names::model_handle(models[1]);
+        let question = "帮我看看这段代码";
+
+        let handled =
+            try_handle_model_command(&mut app, &format!("/models {target} {question}")).unwrap();
+
+        assert!(handled);
+        assert_eq!(app.current_model, target);
+        assert_eq!(app.forced_question.as_deref(), Some(question));
     }
 }

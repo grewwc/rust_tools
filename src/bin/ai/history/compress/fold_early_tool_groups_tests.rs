@@ -701,6 +701,55 @@ fn path_c_preserves_exact_replay_reasoning_verbatim() {
 }
 
 #[test]
+fn encrypted_reasoning_replay_roundtrip_same_model() {
+    let model = "muse-spark-1.2-contributor";
+    let items = vec![
+        serde_json::json!({"type":"reasoning","encrypted_content":"AAA","summary":[]}),
+        serde_json::json!({"type":"reasoning","encrypted_content":"BBB","summary":[]}),
+    ];
+    let encoded = encode_encrypted_reasoning_replay_state(model, &items);
+    assert!(encoded.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX));
+    // 与 exact-replay 前缀互不误认。
+    assert!(!encoded.starts_with(PERSISTED_REASONING_REPLAY_PREFIX));
+
+    let decoded = decode_encrypted_reasoning_replay_for_model(model, &encoded)
+        .expect("same-model decode should succeed");
+    assert_eq!(decoded, items);
+}
+
+#[test]
+fn encrypted_reasoning_replay_rejects_cross_model() {
+    let items = vec![serde_json::json!({"type":"reasoning","encrypted_content":"X"})];
+    let encoded = encode_encrypted_reasoning_replay_state("muse-spark-1.2-contributor", &items);
+    // 切换/回退到其它模型：解码必须返回 None，绝不把 A 的加密状态喂给 B。
+    assert!(decode_encrypted_reasoning_replay_for_model("gpt-5.6-terra", &encoded).is_none());
+    // exact-replay 解码器也不得误解码加密前缀 payload。
+    assert!(
+        decode_reasoning_replay_for_model("muse-spark-1.2-contributor", &encoded).is_none()
+    );
+}
+
+#[test]
+fn encrypted_reasoning_marker_survives_persist_sanitize() {
+    let model = "muse-spark-1.2-contributor";
+    let items = vec![serde_json::json!({"type":"reasoning","encrypted_content":"ENC","summary":[]})];
+    let mut assistant = assistant_call("spark-call", "read_file");
+    assistant.reasoning_content = Some(encode_encrypted_reasoning_replay_state(model, &items));
+
+    // 持久化 sanitize 不得把带标记的加密连续性状态裁掉（幂等保留）。
+    let sanitized = sanitize_message_for_persisted_history_for_model(model, &assistant);
+    let encoded = sanitized
+        .reasoning_content
+        .as_deref()
+        .expect("encrypted replay marker must survive persist sanitize");
+    assert!(encoded.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX));
+    assert_eq!(
+        decode_encrypted_reasoning_replay_for_model(model, encoded),
+        Some(items)
+    );
+}
+
+#[test]
 fn truncating_mutable_content_archives_original_field() {
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-truncate-field-{}", uuid::Uuid::new_v4()));

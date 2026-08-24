@@ -33,7 +33,8 @@ use super::normalize::{
 };
 use super::reasoning::{
     apply_prompt_cache_breakpoint, normalize_reasoning_content_replay_for_model,
-    prompt_cache_enabled_for_model, resolve_reasoning_effort,
+    prompt_cache_enabled_for_model, reconstruct_encrypted_reasoning_items_for_model,
+    resolve_reasoning_effort,
 };
 use super::thinking::resolve_thinking;
 use super::token_budget;
@@ -440,6 +441,14 @@ async fn do_request_messages_with_tool_mode(
             model
         ));
     }
+    // 加密推理侧信道重建：必须在 `normalize_reasoning_content_replay_for_model` 之前，
+    // 因为后者会把 encrypted-replay 模型的 `reasoning_content`（我们落库的编码 blob）剥离。
+    // 内存侧信道（当轮最新）优先，落库 blob 只补历史空缺；随后照常剥离 wire 投影里的字段。
+    let turn_reasoning_items = reconstruct_encrypted_reasoning_items_for_model(
+        model,
+        &normalized_messages,
+        &app.turn_reasoning_items,
+    );
     // 最终 wire 投影按模型能力决定 reasoning_content 的回放语义：GLM 保留
     // tool-call assistant 的原文，DeepSeek 仅补空字段形状，其余模型一律剥离。
     // 这与本轮 enable_thinking gate 不同，必须在每次请求前统一收口。
@@ -458,9 +467,6 @@ async fn do_request_messages_with_tool_mode(
         reasoning_effort
     };
     let endpoint = endpoint_for_request_model(app, model);
-    // 把 reasoning items 侧信道快照到局部，避免 `request_body` 长期持有对 `app`
-    // 的不可变借用（后续 key 轮换循环需要 `&mut app`）。
-    let turn_reasoning_items = app.turn_reasoning_items.clone();
     maybe_emit_responses_reasoning_replay_diagnostic(
         model,
         &endpoint,

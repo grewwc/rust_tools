@@ -900,6 +900,29 @@ fn push_project_context(builder: &mut SystemPromptBuilder) {
     push_project_type_context(builder);
 }
 
+/// 会话（session）上下文：告诉模型当前 session 及其数据布局，使它在任何项目
+/// （包括与 rust_tools 无关的目录）里都能定位、排查 sessionid 相关问题，并对
+/// 指定 session 的内容做只读交互。模型只读：不写入、不修改、不删除 session 数据。
+fn session_context_prompt(session_id: &str, session_history_file: &Path, history_file: &Path) -> String {
+    let sessions_root = crate::ai::history::SessionStore::new(history_file)
+        .sessions_root()
+        .display()
+        .to_string();
+    format!(
+        "- This agent run is bound to one session. Current session id: `{}`. Its canonical history file: `{}`.\n\
+         - All sessions live under the sessions root `{}` (derived from the history file as `<filename-stem>.sessions` in the same directory; default `~/.history_file.sessions`). A session id (a UUID) maps to:\n\
+         \x20 - `<id>.sqlite` — canonical message history (SQLite tables `messages`, `meta`, `context_messages`, `context_snapshot`, `tool_execution_outcomes`, `skill_activation_events`).\n\
+         \x20 - `<id>.assets/` — session assets: folded/overflow tool output, context checkpoints, images, etc.\n\
+         \x20 - `.<id>.sqlite.state.lock` and `<id>.<pid>.pid` — lock / live-process markers.\n\
+         - When asked to debug a session-id problem or to inspect a session's content (e.g. \"look at session <id>\"), first locate the sessions root (e.g. `ls <root>`), then read the SQLite with read-only `sqlite3` queries (`.tables`, `SELECT ...`) or read asset/meta files with `read_file`. This layout is independent of the current project, so apply it in any working directory.\n\
+         - Read-only rule: you may inspect session data, but never write to, modify, delete, or create session files or sessions; session lifecycle is user-controlled via the `/sessions` command.\n\
+         ",
+        session_id,
+        session_history_file.display(),
+        sessions_root,
+    )
+}
+
 const MAX_SKILL_ACTIVATION_HISTORY_ENTRIES: usize = 6;
 
 /// 把成功的显式 skill 选择投影为有界的 runtime fact。原始旁路记录不进入
@@ -1493,6 +1516,11 @@ fn build_skill_turn_guard(
         builder.push(ContextKind::Capability, catalog);
     }
     push_project_context(&mut builder);
+    builder.push_labeled(
+        ContextKind::Behavior,
+        "session_context",
+        session_context_prompt(&app.session_id, &app.session_history_file, &app.config.history_file),
+    );
     if let Ok(events) = history::read_skill_activation_events_sqlite(&app.session_history_file)
         && let Some(reminder) = build_skill_activation_history_reminder(&events)
     {
@@ -1738,6 +1766,7 @@ mod tests {
         ensure_required_baseline_tools, escape_xml_attr, filter_mcp_tools_by_allowed_servers,
         has_tool, manifest_tool_definitions, merge_with_runtime_enabled_tools,
         push_project_context, resolve_max_iterations, select_mcp_tools, tool_uses_mcp_server,
+        session_context_prompt,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
@@ -1748,6 +1777,7 @@ mod tests {
     use crate::ai::types::{FunctionDefinition, PendingSkillContinuation, ToolDefinition};
     use rust_tools::cw::SkipSet;
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::{LazyLock, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2210,6 +2240,33 @@ mod tests {
         assert!(prompt.contains("Relative tool paths resolve against this directory"));
         assert!(prompt.contains("not necessarily the project root"));
         assert!(prompt.contains("Write commands for this OS/shell"));
+    }
+
+    #[test]
+    fn session_context_prompt_mentions_id_layout_and_read_only_rule() {
+        let mut builder = SystemPromptBuilder::new();
+        builder.push_labeled(
+            ContextKind::Behavior,
+            "session_context",
+            session_context_prompt(
+                "f6bb0f1c-ce48-4283-96ab-27ab297ed6b7",
+                Path::new(
+                    "/Users/u/.history_file.sessions/f6bb0f1c-ce48-4283-96ab-27ab297ed6b7.sqlite",
+                ),
+                Path::new("/Users/u/.history_file.sqlite"),
+            ),
+        );
+        let rendered = builder.render_system_prompt();
+        assert!(
+            rendered.contains("<session_context>")
+                && !rendered.contains("<session_context>\n<session_context>")
+                && rendered.contains("f6bb0f1c-ce48-4283-96ab-27ab297ed6b7")
+                && rendered.contains(".history_file.sessions")
+                && rendered.contains("<id>.sqlite")
+                && rendered.contains("sqlite3")
+                && rendered.contains("Read-only rule"),
+            "session_context must carry the id, storage layout, read paths and the read-only rule; got:\n{rendered}"
+        );
     }
 
     #[test]

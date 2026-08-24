@@ -23,6 +23,25 @@ the nearest child `AGENTS.md`.
 - `persona.rs` / `files.rs` / `types.rs` / `errors.rs` / `request_protocol.rs`: persona, file helpers (`extract_key_lines`), shared types, `AiError`, request dialect
 - `tool_descriptions/`: per-tool JSON schemas auto-discovered by `build.rs`
 
+## Session storage & sessionid debugging
+
+Sessions are the unit of conversation persistence; a session id is a UUID (36 chars).
+
+- **Sessions root**: `<parent>/<file-stem>.sessions` next to the history file (default
+  `~/.history_file.sessions`); derive it via `SessionStore::new(&history_file).sessions_root()`.
+- **Per session** (id validated by `SessionStore::validate_session_id`):
+  - `<id>.sqlite` — canonical history. Tables: `messages`, `meta`, `context_messages`,
+    `context_snapshot`, `tool_execution_outcomes`, `skill_activation_events`.
+  - `<id>.assets/` — session assets: `folded-tool-groups/`, `tool-overflow-compressed/`,
+    `context-checkpoints/`, images, etc.
+  - `.<id>.sqlite.state.lock` (state lock) and `<id>.<pid>.pid` (live-process marker).
+- **Model visibility**: `build_skill_turn_guard` (`driver/skill_runtime.rs`) injects a labeled
+  `session_context` system-prompt section with the current session id, the sessions root, and the
+  storage layout. This lets the model debug sessionid problems and read a session's content
+  **read-only** (`read_file` on assets/meta, read-only `sqlite3` SELECT) in *any* project — the
+  layout is independent of the working directory. Model writes to session data are forbidden;
+  session lifecycle is user-controlled via `/sessions`.
+
 ## Runtime-wide invariants
 
 1. **Verification.** Follow root ladder; keep Cargo commands scoped.

@@ -103,7 +103,7 @@ fn stdout_is_tty() -> bool {
 ///
 /// - 需要终端支持 OSC52 查询
 /// - 会临时修改终端设置为非规范模式
-/// - 超时时间为 1.5 秒
+/// - 读取超时自适应：首字节 3s、空闲 1s、绝对上限 120s
 fn read_osc52_bytes() -> Option<Vec<u8>> {
     if !stdin_is_tty() || !stdout_is_tty() {
         return None;
@@ -144,23 +144,54 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
     }
 
     // 使用 libc::read 读取响应（绕过 stdin 缓冲）
-    let timeout_ms: libc::c_int = 1500;
+    //
+    // `oo -B` 桥接的图片 base64 会让 OSC52 响应达到数 MB（响应内容 = base64(base64(图片))），
+    // 固定 1.5s 短超时会在传输中途放弃并恢复 ECHO，导致响应尾部被远端 pty 回显到终端
+    // （表现为终端刷出一大段 base64）。因此改为：
+    //   - 首字节超时：终端不支持 OSC52 查询时不会响应，避免无限等待
+    //   - 收到结束标记 `\x07` / `\x1b\\` 立即结束
+    //   - 空闲超时：已收到数据但长时间无新数据，视为传输结束
+    //   - 绝对上限兜底
     let result = (|| {
         let mut response = Vec::new();
-        let mut buf = [0u8; 1024];
-        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms as u64);
+        let mut buf = [0u8; 65536];
 
-        while std::time::Instant::now() < deadline {
-            // 使用 poll 等待数据可读，避免忙等
+        let first_byte_timeout = Duration::from_secs(3);
+        let idle_timeout = Duration::from_millis(1000);
+        let absolute_timeout = Duration::from_secs(120);
+
+        let start = std::time::Instant::now();
+        let mut last_data = start;
+
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= absolute_timeout {
+                break;
+            }
+            // 一直没收到任何数据（终端不支持 OSC52 查询）
+            if response.is_empty() && elapsed >= first_byte_timeout {
+                break;
+            }
+            // 已收到数据，但长时间没有新数据 → 认为传输结束
+            if !response.is_empty() && last_data.elapsed() >= idle_timeout {
+                break;
+            }
+
+            // poll 超时不超过剩余的首字节/空闲预算，避免忙等
+            let mut poll_timeout = 200i32;
+            if response.is_empty() {
+                let remain = first_byte_timeout.saturating_sub(elapsed);
+                poll_timeout = poll_timeout.min(remain.as_millis().max(1) as i32);
+            } else {
+                let remain = idle_timeout.saturating_sub(last_data.elapsed());
+                poll_timeout = poll_timeout.min(remain.as_millis().max(1) as i32);
+            }
+
             let mut pollfd = libc::pollfd {
                 fd: libc::STDIN_FILENO,
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let remaining = deadline
-                .duration_since(std::time::Instant::now())
-                .as_millis() as i32;
-            let poll_timeout = remaining.min(200).max(1);
             let n_ready = unsafe { libc::poll(&mut pollfd, 1, poll_timeout) };
             if n_ready <= 0 {
                 continue;
@@ -175,7 +206,8 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
             if n > 0 {
                 let n = n as usize;
                 response.extend_from_slice(&buf[..n]);
-                // 检查响应结束标记
+                last_data = std::time::Instant::now();
+                // 收到响应结束标记后立即停止
                 if response.contains(&b'\x07') || response.windows(2).any(|w| w == b"\x1b\\") {
                     break;
                 }
@@ -200,6 +232,9 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
         None
     })();
 
+    // 恢复终端设置前先清空尚未读取的输入（超时放弃时可能残留响应尾部），
+    // 避免 ECHO 恢复后残留内容被回显到终端。
+    unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
     // 恢复原始终端设置
     unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original_termios) };
 

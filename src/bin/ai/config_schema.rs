@@ -164,4 +164,14 @@ impl AiConfig {
     pub const SCHEDULER_COST_PENALTY_DIVISOR_MICROS: &str =
         "ai.scheduler.cost_penalty_divisor_micros";
     pub const SCHEDULER_TOKEN_PENALTY_DIVISOR: &str = "ai.scheduler.token_penalty_divisor";
+
+    // ── Diff / changes ───────────────────────────────────────
+    /// 外部 diff 编辑器偏好：`code` / `cursor` / `idea` / `git` / `open` / `auto`。
+    /// `auto` 会按优先级探测：code → cursor → idea → open。
+    pub const DIFF_EDITOR: &str = "ai.diff.editor";
+    /// 是否在变更视图中附加 git 状态（默认 true，git 仓库外自动忽略）。
+    pub const DIFF_INCLUDE_GIT: &str = "ai.diff.include_git";
+    /// 通过外部编辑器打开 diff 时是否直接传入 patch 文件（true）或按文件的
+    /// `before/after` 临时副本以 `code --diff` 形式打开（false，默认）。
+    pub const DIFF_OPEN_PATCH_FILE: &str = "ai.diff.open_patch_file";
 }

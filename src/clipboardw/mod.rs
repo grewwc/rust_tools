@@ -6,6 +6,7 @@
 //!
 //! - [`binary_content`] - 二进制剪贴板内容处理
 //! - [`image_content`] - 图片剪贴板内容处理
+//! - [`paste`] - 统一粘贴：一次读取剪贴板并按内容类型保存
 //! - [`string_content`] - 文本剪贴板内容处理
 //!
 //! ## 功能特性
@@ -61,9 +62,11 @@
 
 pub mod binary_content;
 pub mod image_content;
+pub mod paste;
 pub mod string_content;
 
 // 重新导出常用函数
+pub use paste::paste_to_file;
 pub use string_content::{
     copy_from_file, get_clipboard_content, get_clipboard_raw_bytes_via_osc52, save_to_file,
     set_clipboard_content,

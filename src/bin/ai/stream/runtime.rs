@@ -1700,8 +1700,12 @@ fn process_stream_payload(
             }
             super::state::ParsedStreamPayload::ReasoningItem(item) => {
                 // 捕获完整 reasoning item（含 encrypted_content）供同 turn 工具链回放。
-                // 不产生可见输出，也不进持久化历史。
-                state.content.reasoning_items.push(item);
+                // 不产生可见输出，也不进持久化历史。Spark 等模型可能在同一 tool_call
+                // 前产生多段 reasoning（不同 id），需全部保留；网关若在 .added 与
+                // .done 重复发送同一真实载荷则需去重，避免回放重复触发 400。
+                if !state.content.reasoning_items.contains(&item) {
+                    state.content.reasoning_items.push(item);
+                }
                 return Ok(StreamPayloadOutcome::default());
             }
             super::state::ParsedStreamPayload::Chunk(chunk) => {

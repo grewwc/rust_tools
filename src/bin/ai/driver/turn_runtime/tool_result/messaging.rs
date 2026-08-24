@@ -942,6 +942,27 @@ pub(super) fn append_tool_result_messages_for_model(
         reasoning_content: (!stream_reasoning_text.is_empty())
             .then(|| stream_reasoning_text.to_string()),
     };
+    // Responses 加密推理落库：encrypted-replay 模型不返回明文 reasoning（summary 恒空），
+    // 其推理只以 encrypted_content item 形式存在。若不落库，仅存于内存侧信道
+    // `turn_reasoning_items`，跨轮 clear / Ctrl+C 后 resume 都会丢失，导致模型"失忆"
+    // （实测：不回放会让"仅存在于私有推理中的状态"跨轮丢失）。这里把本轮 items 连同
+    // 来源模型编码进 canonical 的 `reasoning_content`，与 exact-replay 的明文回放共用
+    // 「带标记则跨压缩保留、按模型解码」的机制；空 items 时保持 None，行为不变。
+    let raw_assistant = if !stream_reasoning_items.is_empty()
+        && crate::ai::models::reasoning_encrypted_replay_enabled(source_model)
+    {
+        Message {
+            reasoning_content: Some(
+                crate::ai::history::compress::encode_encrypted_reasoning_replay_state(
+                    source_model,
+                    stream_reasoning_items,
+                ),
+            ),
+            ..raw_assistant
+        }
+    } else {
+        raw_assistant
+    };
     let mut assistant_msg = raw_assistant.clone();
     assistant_msg.content = Value::String(narration);
     let projected_assistant =

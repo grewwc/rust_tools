@@ -1,0 +1,24 @@
+{
+  "name": "show_changes",
+  "description": "Show all file changes recorded in the current session (plus optional git diff fallback). Returns a compact summary with per-file status and a unified diff snippet. Use this before concluding a task to verify modifications.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Optional file path filter — when set, only changes touching this path (substring match) are shown."
+      },
+      "include_git": {
+        "type": "boolean",
+        "description": "When true (default), include `git diff`/`git status` as fallback when the session mutation log is empty. Set false to show only explicit session writes/patches."
+      },
+      "limit_snippet": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 4000,
+        "description": "Maximum lines of unified diff snippet to include (default 120, 0 = header only)."
+      }
+    },
+    "required": []
+  }
+}

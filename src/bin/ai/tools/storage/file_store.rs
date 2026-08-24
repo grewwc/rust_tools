@@ -403,7 +403,7 @@ fn writable_roots_for_hint() -> Vec<PathBuf> {
 
 /// 当 `ai.sandbox.allowed_roots` 非空时，文件路径必须位于其中某个根之下。
 /// 为空（默认）时，退回到 `effective_cwd()` 作为单一沙箱根目录。
-fn path_within_allowed_roots(path: &Path) -> bool {
+pub(crate) fn path_within_allowed_roots(path: &Path) -> bool {
     // 相对路径基于 effective_cwd 解析为绝对路径后再归一化。
     let base =
         crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
@@ -412,7 +412,7 @@ fn path_within_allowed_roots(path: &Path) -> bool {
 }
 
 /// 纯函数：归一化 `path`（相对则基于 `base`）后判断是否落在任一 `roots` 之下。
-fn path_within_roots(path: &Path, base: &Path, roots: &[PathBuf]) -> bool {
+pub(crate) fn path_within_roots(path: &Path, base: &Path, roots: &[PathBuf]) -> bool {
     if roots.is_empty() {
         return true;
     }

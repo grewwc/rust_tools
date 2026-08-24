@@ -120,6 +120,56 @@ pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages
     }
 }
 
+/// 从落库消息里重建 Responses 加密推理回放的侧信道 map（key = 首个 tool_call id）。
+///
+/// 背景：encrypted-replay 模型的加密推理在产出当轮存于内存 `turn_reasoning_items`，
+/// 但那是 turn 级、每轮清空、进程退出即失。跨轮 / Ctrl+C 后 resume 时，只能从落库到
+/// `reasoning_content` 的编码 blob 恢复。此函数扫描当前请求投影（已随压缩自然裁剪，
+/// 因此天然只回放"未被折叠的近期轮"，与 exact-replay 的回放范围一致），把每个带标记、
+/// 且来源模型匹配当前模型的 assistant tool-call 回合解码回 items，挂到其首个 tool_call id。
+///
+/// 仅补充 `live` 中缺失的 key：内存侧信道（当轮最新捕获）优先，落库解码只填历史空缺，
+/// 因此同一 key 不会被旧值覆盖。跨模型（标记里的模型≠当前模型）解码返回 None，自动跳过。
+pub(super) fn reconstruct_encrypted_reasoning_items_for_model(
+    model: &str,
+    messages: &[Message],
+    live: &rustc_hash::FxHashMap<String, Vec<Value>>,
+) -> rustc_hash::FxHashMap<String, Vec<Value>> {
+    let mut merged = live.clone();
+    if !models::reasoning_encrypted_replay_enabled(model) {
+        return merged;
+    }
+    for message in messages {
+        if message.role != "assistant" {
+            continue;
+        }
+        let Some(first_call_id) = message
+            .tool_calls
+            .as_ref()
+            .and_then(|calls| calls.first())
+            .map(|call| call.id.clone())
+        else {
+            continue;
+        };
+        if merged.contains_key(&first_call_id) {
+            continue;
+        }
+        let Some(encoded) = message.reasoning_content.as_deref() else {
+            continue;
+        };
+        if let Some(items) =
+            crate::ai::history::compress::decode_encrypted_reasoning_replay_for_model(
+                model, encoded,
+            )
+        {
+            if !items.is_empty() {
+                merged.insert(first_call_id, items);
+            }
+        }
+    }
+    merged
+}
+
 /// 把 provider adapter 给出的思考字段合并进辅助/后台请求体。
 ///
 /// 辅助（非主链路）与后台请求固定关闭思考（`enable_thinking=false`），
@@ -197,5 +247,78 @@ pub(crate) fn reasoning_effort_display_label(app: &App, model: &str) -> &'static
     match resolve_reasoning_effort(app, model) {
         Some(effort) => effort.as_str(),
         None => "server default",
+    }
+}
+
+#[cfg(test)]
+mod encrypted_replay_reconstruct_tests {
+    use super::reconstruct_encrypted_reasoning_items_for_model;
+    use crate::ai::history::Message;
+    use crate::ai::history::compress::encode_encrypted_reasoning_replay_state;
+    use crate::ai::types::{FunctionCall, ToolCall};
+    use rustc_hash::FxHashMap;
+    use serde_json::{Value, json};
+
+    fn assistant_call_with_reasoning(id: &str, reasoning: Option<String>) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: reasoning,
+        }
+    }
+
+    #[test]
+    fn rebuilds_items_from_encoded_history_for_encrypted_model() {
+        let model = "muse-spark-1.2-contributor";
+        let items = vec![json!({"type":"reasoning","encrypted_content":"ENC"})];
+        let messages = vec![assistant_call_with_reasoning(
+            "call-1",
+            Some(encode_encrypted_reasoning_replay_state(model, &items)),
+        )];
+        let rebuilt =
+            reconstruct_encrypted_reasoning_items_for_model(model, &messages, &FxHashMap::default());
+        assert_eq!(rebuilt.get("call-1"), Some(&items));
+    }
+
+    #[test]
+    fn live_side_channel_takes_precedence_over_history() {
+        let model = "muse-spark-1.2-contributor";
+        let stale = vec![json!({"encrypted_content":"OLD"})];
+        let fresh = vec![json!({"encrypted_content":"NEW"})];
+        let messages = vec![assistant_call_with_reasoning(
+            "call-1",
+            Some(encode_encrypted_reasoning_replay_state(model, &stale)),
+        )];
+        let mut live: FxHashMap<String, Vec<Value>> = FxHashMap::default();
+        live.insert("call-1".to_string(), fresh.clone());
+        let rebuilt = reconstruct_encrypted_reasoning_items_for_model(model, &messages, &live);
+        // 内存侧信道（当轮最新）优先，落库旧值不得覆盖。
+        assert_eq!(rebuilt.get("call-1"), Some(&fresh));
+    }
+
+    #[test]
+    fn non_encrypted_model_is_untouched() {
+        let model = "glm-5.2-opencode";
+        let items = vec![json!({"encrypted_content":"ENC"})];
+        // 即便历史里带加密标记，非 encrypted-replay 模型也不重建（返回 live 原样）。
+        let messages = vec![assistant_call_with_reasoning(
+            "call-1",
+            Some(encode_encrypted_reasoning_replay_state(
+                "muse-spark-1.2-contributor",
+                &items,
+            )),
+        )];
+        let rebuilt =
+            reconstruct_encrypted_reasoning_items_for_model(model, &messages, &FxHashMap::default());
+        assert!(rebuilt.is_empty());
     }
 }

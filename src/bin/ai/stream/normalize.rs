@@ -17,6 +17,61 @@ pub(super) fn parse_stream_payload(
     if payload == "[DONE]" {
         return ParsedStreamPayload::Done;
     }
+    if let Some(event_type) = event_type {
+        let normalized_event_type = event_type.trim();
+        if normalized_event_type.eq_ignore_ascii_case("done")
+            || normalized_event_type.eq_ignore_ascii_case("[done]")
+        {
+            return ParsedStreamPayload::Done;
+        }
+        if (normalized_event_type.eq_ignore_ascii_case("error")
+            || normalized_event_type.eq_ignore_ascii_case("response.failed")
+            || normalized_event_type.eq_ignore_ascii_case("response.incomplete"))
+            && let Some(parsed) = parse_sse_event_payload(event_type, payload)
+        {
+            return parsed;
+        }
+    }
+
+    // 部分网关（opencode zen / enc 加密通道）缺少准确的 SSE `event:` 名，事件类型仅
+    // 内嵌在 JSON 顶层 `type` 字段里。`response.output_item.done` 携带的
+    // encrypted reasoning 会被 event 名分支忽略或被 adapter 宽松 chunk 解析静默吞掉，
+    // 导致无法在下一轮 tool 请求中回放；未来网关若把完整载荷移到 `.added` 也需覆盖。
+    // 这里先按 JSON type 补一次 output_item 解析，仅 reasoning 捕获会命中，其余 item
+    // 类型维持既有路径；用 contains 预筛避免对普通 delta chunk 多做 JSON 解析。
+    if payload.contains("response.output_item.done")
+        || payload.contains("response.output_item.added")
+    {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+            if let Some(err_msg) = value.get("error").and_then(extract_error_message) {
+                return ParsedStreamPayload::Error(err_msg);
+            }
+            if let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) {
+                if event_type == "response.output_item.done"
+                    || event_type == "response.output_item.added"
+                {
+                    if let Some(parsed) = parse_output_item_event(event_type, &value) {
+                        match &parsed {
+                            ParsedStreamPayload::ReasoningItem(_) => return parsed,
+                            ParsedStreamPayload::Ignore => {
+                                // 仅 reasoning 的 stub 需要在此截获为 Ignore；其余类型（如 message）
+                                // 必须落回 adapter 宽松解析，避免把 message done 吞成 Ignore。
+                                let is_reasoning = value
+                                    .get("item")
+                                    .and_then(|v| v.get("type"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|t| t.eq_ignore_ascii_case("reasoning"));
+                                if is_reasoning {
+                                    return parsed;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if let Some(event_type) = event_type {
         if let Some(parsed) = parse_sse_event_payload(event_type, payload) {
@@ -188,16 +243,28 @@ fn parse_output_item_event(
         .trim()
         .to_ascii_lowercase();
 
-    // 只捕获 `.done` 上的 reasoning item：`.added` 虽然也带 `encrypted_content` 字段，
-    // 但那是固定长度的占位 stub（实测恒为同一短串），完整可回放的加密载荷只在 `.done`
-    // 落地。没有加密载荷就无法忠实回放，交回上层退化为不回传，避免送半截 item 触发 400。
+    // 捕获 reasoning item：`.done` 上的完整 `encrypted_content` 始终可回放；`.added`
+    // 在现网是固定短串 stub（不可回放、回放会 400），但若未来网关把完整载荷移到
+    // `.added` 需前向兼容。约定阈值：real 载荷实测 900-1500 长度，stub 恒为短串
+    // （<100），以 256 为分界足以区分二者且不误伤短推理链的加密块。
     if item_type == "reasoning" {
-        if event_type == "response.output_item.done"
-            && item
-                .get("encrypted_content")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|content| !content.is_empty())
-        {
+        let encrypted_len = item
+            .get("encrypted_content")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        if encrypted_len == 0 {
+            return Some(ParsedStreamPayload::Ignore);
+        }
+        const REASONING_ENCRYPTED_ADDED_MIN_LEN: usize = 256;
+        let is_real = if event_type == "response.output_item.done" {
+            true
+        } else if event_type == "response.output_item.added" {
+            encrypted_len >= REASONING_ENCRYPTED_ADDED_MIN_LEN
+        } else {
+            false
+        };
+        if is_real {
             return Some(ParsedStreamPayload::ReasoningItem(item.clone()));
         }
         return Some(ParsedStreamPayload::Ignore);
@@ -500,6 +567,66 @@ mod tests {
     }
 
     #[test]
+    fn embedded_output_item_done_captures_reasoning_despite_sse_event_name() {
+        // 模拟缺少或发送不准确 SSE `event:` 名的网关：事件类型内嵌在 JSON 顶层
+        // `type` 字段，encrypted reasoning 必须仍能被捕获，否则无法在下一轮
+        // tool 请求中回放。`unknown.done` 还覆盖通用 SSE 分支提前 Ignore 的情况。
+        let payload = r#"{"type":"response.output_item.done","sequence_number":1,"item":{"id":"rs_reason","type":"reasoning","encrypted_content":"enc-xyz"}}"#;
+        for event_type in [None, Some(""), Some("message"), Some("unknown.done")] {
+            match parse_stream_payload(provider::opencode_adapter(), payload, event_type) {
+                ParsedStreamPayload::ReasoningItem(item) => {
+                    assert_eq!(item["type"], "reasoning");
+                    assert_eq!(item["encrypted_content"], "enc-xyz");
+                }
+                _ => panic!("expected reasoning item for event type {event_type:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_event_name_takes_precedence_over_embedded_reasoning_item() {
+        let payload = r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"enc-xyz"}}"#;
+        for event_type in ["done", "[DONE]", " done "] {
+            assert!(matches!(
+                parse_stream_payload(provider::opencode_adapter(), payload, Some(event_type)),
+                ParsedStreamPayload::Done
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_error_takes_precedence_over_embedded_reasoning_item() {
+        let payload = r#"{"type":"response.output_item.done","error":{"message":"boom"},"item":{"type":"reasoning","encrypted_content":"enc-xyz"}}"#;
+        for event_type in [None, Some("message"), Some("unknown.done")] {
+            assert!(matches!(
+                parse_stream_payload(provider::opencode_adapter(), payload, event_type),
+                ParsedStreamPayload::Error(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn sse_error_event_name_takes_precedence_over_embedded_reasoning_item() {
+        let payload = r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"enc-xyz"}}"#;
+        for event_type in ["error", "response.failed", "response.incomplete"] {
+            assert!(matches!(
+                parse_stream_payload(provider::opencode_adapter(), payload, Some(event_type)),
+                ParsedStreamPayload::Error(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn no_event_line_non_reasoning_done_falls_through_to_adapter() {
+        // 非 reasoning 的 output_item.done 不应被补路径截获，仍走 adapter 宽松解析。
+        let payload = r#"{"type":"response.output_item.done","sequence_number":1,"item":{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"hi"}]}}"#;
+        match parse_stream_payload(provider::opencode_adapter(), payload, None) {
+            ParsedStreamPayload::Chunk(_) => {}
+            _ => panic!("expected chunk from adapter path"),
+        }
+    }
+
+    #[test]
     fn openrouter_endpoint_uses_openrouter_adapter() {
         let adapter = provider::adapter_for(
             crate::ai::provider::ApiProvider::OpenAi,
@@ -515,6 +642,36 @@ mod tests {
             "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
         );
         assert_eq!(adapter.label(), "alibaba");
+    }
+
+    #[test]
+    fn reasoning_added_with_short_stub_is_ignored() {
+        // 现网 `.added` 为短 stub，不可回放；长度 <256 应被忽略
+        let payload = r#"{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"short-stub"}}"#;
+        for event_type in [Some("response.output_item.added"), None, Some(""), Some("message")] {
+            match parse_stream_payload(provider::opencode_adapter(), payload, event_type) {
+                ParsedStreamPayload::Ignore => {}
+                _ => panic!("expected Ignore for short stub added for {event_type:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_added_with_long_encrypted_content_is_captured_via_fallback() {
+        // 前向兼容：若网关把完整加密载荷移到 `.added`，长度 >=256 应被捕获
+        let long = "a".repeat(512);
+        let payload = format!(
+            r#"{{"type":"response.output_item.added","item":{{"id":"rs_1","type":"reasoning","encrypted_content":"{long}"}}}}"#
+        );
+        for event_type in [Some("response.output_item.added"), None, Some(""), Some("message")] {
+            match parse_stream_payload(provider::opencode_adapter(), &payload, event_type) {
+                ParsedStreamPayload::ReasoningItem(item) => {
+                    assert_eq!(item["type"], "reasoning");
+                    assert_eq!(item["encrypted_content"].as_str().unwrap().len(), 512);
+                }
+                _ => panic!("expected ReasoningItem for long added for {event_type:?}"),
+            }
+        }
     }
 
     #[test]

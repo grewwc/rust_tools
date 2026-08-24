@@ -1,11 +1,18 @@
 use serde_json::Value;
-use std::io::IsTerminal;
+use std::{
+    fs::File,
+    io::{IsTerminal, Read},
+    path::Path,
+};
 
 use crate::ai::config_schema::AiConfig;
 use crate::ai::tools::storage::command_runner;
 use crate::cmd::run::CommandRunResult;
 
 const MAX_COMMAND_OUTPUT_CHARS: usize = 16_000;
+/// 将 `$(cat /absolute/literal/path)` 物化为一个普通 shell 参数时的读取上限。
+/// 限制可防止工具在校验之前意外读取无限流或超大文件；常规 JSON / DSL 参数远小于此值。
+const MAX_LITERAL_FILE_SUBSTITUTION_BYTES: usize = 64 * 1024;
 
 /// 内置默认超时与上限（秒），可被 sandbox 配置覆盖。
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 60;
@@ -36,6 +43,122 @@ fn config_command_timeout_bounds() -> (u64, u64) {
 /// 纯函数：把请求的超时秒数夹在 `[1, max]` 范围内，缺省时用 `default`。
 fn resolve_command_timeout(requested: Option<u64>, default: u64, max: u64) -> u64 {
     requested.unwrap_or(default).clamp(1, max)
+}
+
+/// 把 UTF-8 数据编码成一个完整的 POSIX shell 单词。单引号内不发生展开；遇到单引号时
+/// 用 `'<backslash><quote>'` 过渡到下一段单引号字面量，文件内容不会成为 shell 代码。
+fn shell_single_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn read_literal_file_substitution(path: &str) -> Result<String, String> {
+    let file = File::open(path)
+        .map_err(|err| format!("cannot open literal file substitution '{path}': {err}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("cannot stat literal file substitution '{path}': {err}"))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "literal file substitution '{path}' must name a regular file"
+        ));
+    }
+    if metadata.len() > MAX_LITERAL_FILE_SUBSTITUTION_BYTES as u64 {
+        return Err(format!(
+            "literal file substitution '{path}' exceeds the {}-byte limit",
+            MAX_LITERAL_FILE_SUBSTITUTION_BYTES
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut limited = file.take((MAX_LITERAL_FILE_SUBSTITUTION_BYTES + 1) as u64);
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("cannot read literal file substitution '{path}': {err}"))?;
+    if bytes.len() > MAX_LITERAL_FILE_SUBSTITUTION_BYTES {
+        return Err(format!(
+            "literal file substitution '{path}' exceeds the {}-byte limit",
+            MAX_LITERAL_FILE_SUBSTITUTION_BYTES
+        ));
+    }
+    let contents = String::from_utf8(bytes)
+        .map_err(|_| format!("literal file substitution '{path}' must be valid UTF-8"))?;
+    if contents.contains('\0') {
+        return Err(format!(
+            "literal file substitution '{path}' must not contain NUL bytes"
+        ));
+    }
+    Ok(contents)
+}
+
+/// 执行无害命令替换的内部命令并捕获输出，用于物化 `"$(harmless_cmd)"`。
+fn execute_inner_shell_command(inner: &str, cwd: Option<&str>) -> Result<String, String> {
+    // 复用现有 runner，超时 10s 足以覆盖 date/echo/git 等短命令，又避免长阻塞
+    let output = crate::ai::tools::storage::command_runner::run_command(inner, cwd, 10)
+        .map_err(|err| format!("failed to execute substitution '{inner}': {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "substitution command '{inner}' failed with exit code {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| format!("substitution '{inner}' produced non-UTF-8 output"))?;
+    if stdout.len() > MAX_LITERAL_FILE_SUBSTITUTION_BYTES {
+        return Err(format!(
+            "substitution '{inner}' output exceeds the {}-byte limit",
+            MAX_LITERAL_FILE_SUBSTITUTION_BYTES
+        ));
+    }
+    if stdout.contains('\0') {
+        return Err(format!(
+            "substitution '{inner}' output contains NUL bytes"
+        ));
+    }
+    // bash 的 $(...) 会剥离所有末尾换行，这里复刻该语义
+    Ok(stdout.trim_end_matches(|c| c == '\n' || c == '\r').to_string())
+}
+
+/// 对审计层已证明安全的无害 `"$(...)"` 做数据物化，支持 `cat` 字面量与通用无害命令。
+/// 随后仍对替换后的命令做完整审计，因此替换结果若成为被禁程序名或危险参数仍会被拦截。
+fn materialize_safe_shell_substitutions(command: &str, cwd: Option<&str>) -> Result<String, String> {
+    let substitutions = super::audit::safe_shell_substitutions(command);
+    if substitutions.is_empty() {
+        // 回退到旧的 cat 物化以兼容仅含 cat 的历史路径（实际上 safe_shell 已覆盖 cat，此分支仅为无替换时的快速返回）
+        return Ok(command.to_string());
+    }
+    let mut materialized = command.to_string();
+    for substitution in substitutions.into_iter().rev() {
+        let contents = match substitution.kind {
+            super::audit::SafeShellSubstitutionKind::FileRead { path } => {
+                read_literal_file_substitution(&path)?
+            }
+            super::audit::SafeShellSubstitutionKind::Command { inner } => {
+                // 内层同样需经过完整的门禁：先重做 validate（防分类放宽），再做 git commit 确认（fail-closed）。
+                // 审计算法的 Command 分类仅保证内层曾通过 validate，但不拦截 git commit；若此处
+                // 不单独确认，则 `echo "$(git commit -am x)"` 会在外层确认前已提交，物化后外层
+                // 仅剩 `echo '...'`，导致确认门被绕过。
+                super::audit::validate_execute_command(&inner)
+                    .map_err(|reason| format!("inner substitution blocked: {reason}"))?;
+                confirm_git_commit_if_needed(&inner)?;
+                execute_inner_shell_command(&inner, cwd)?
+            }
+        };
+        materialized.replace_range(
+            substitution.start..substitution.end,
+            &shell_single_quote(&contents),
+        );
+    }
+    Ok(materialized)
 }
 
 /// 截断过长输出时同时保留头尾，并在中间附带**可操作的元信息**：总量、已显示量，
@@ -80,33 +203,48 @@ Do not re-run near-identical variants; narrow the query instead (e.g. `grep -c` 
 // =========================================================================
 
 /// 判断命令是否为 git 提交类命令（`git commit` / `git -C <dir> commit` 等），
-/// 命中后需要先向用户确认再执行。按空白切 token，避免误伤 `git log | grep commit`
-/// 之类的普通命令。
+/// 命中后需要先向用户确认再执行。复用审计层词法解析，保证物化后的带引号参数也不会
+/// 绕过确认，并避免把 `echo 'git commit'` 之类的数据误判为真实命令。
 fn is_git_commit_command(command: &str) -> bool {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    let mut i = 0usize;
-    while i < tokens.len() {
-        if tokens[i] != "git" {
-            i += 1;
+    for segment in super::audit::split_unquoted_segments(command) {
+        let tokens = super::audit::effective_command_tokens(&segment);
+        let Some(program) = tokens
+            .first()
+            .and_then(|token| Path::new(token).file_name().and_then(|name| name.to_str()))
+        else {
+            continue;
+        };
+        if program != "git" {
             continue;
         }
+
         // 跳过 git 全局选项及其取值（-C <path>、-c <key>=<val>、--git-dir=... 等），
         // 它们可能出现在 `git` 与子命令之间。
-        let mut j = i + 1;
+        let mut j = 1usize;
         loop {
-            match tokens.get(j).copied() {
-                Some(tok) if tok == "-C" || tok == "-c" || tok == "--git-dir"
-                    || tok == "--work-tree" || tok == "--namespace" => j += 2,
-                Some(tok) if tok.starts_with("--git-dir=")
-                    || tok.starts_with("--work-tree=")
-                    || tok.starts_with("--namespace=") => j += 1,
+            match tokens.get(j).map(String::as_str) {
+                Some(tok)
+                    if tok == "-C"
+                        || tok == "-c"
+                        || tok == "--git-dir"
+                        || tok == "--work-tree"
+                        || tok == "--namespace" =>
+                {
+                    j += 2
+                }
+                Some(tok)
+                    if tok.starts_with("--git-dir=")
+                        || tok.starts_with("--work-tree=")
+                        || tok.starts_with("--namespace=") =>
+                {
+                    j += 1
+                }
                 _ => break,
             }
         }
-        if tokens.get(j).copied() == Some("commit") {
+        if tokens.get(j).map(String::as_str) == Some("commit") {
             return true;
         }
-        i = j.saturating_add(1);
     }
     false
 }
@@ -212,21 +350,24 @@ fn execute_command_inner<F>(args: &Value, on_chunk: F) -> Result<String, String>
 where
     F: FnMut(&[u8]),
 {
-    let command = args["command"].as_str().ok_or("Missing command")?;
+    let raw_command = args["command"].as_str().ok_or("Missing command")?;
     let cwd = args["cwd"].as_str().filter(|dir| !dir.trim().is_empty());
+    // 优先物化无害的 "$(...)"（含 cat 字面量与通用无害命令），物化后仍做完整审计
+    let command = materialize_safe_shell_substitutions(raw_command, cwd)
+        .map_err(|reason| format!("Command blocked: {reason}"))?;
     let pseudo_terminal = args["pty"].as_bool().unwrap_or(false);
     let (default_timeout, max_timeout) = config_command_timeout_bounds();
     let timeout = resolve_command_timeout(args["timeout"].as_u64(), default_timeout, max_timeout);
 
     // 命令安全校验委托给 audit 模块。
-    super::audit::validate_execute_command(command)
+    super::audit::validate_execute_command(&command)
         .map_err(|reason| format!("Command blocked: {reason}"))?;
 
     // git 提交类命令先向用户确认（非交互环境 fail-closed）。
-    confirm_git_commit_if_needed(command)?;
+    confirm_git_commit_if_needed(&command)?;
 
     let output =
-        command_runner::run_command_streaming(command, cwd, timeout, pseudo_terminal, on_chunk)?;
+        command_runner::run_command_streaming(&command, cwd, timeout, pseudo_terminal, on_chunk)?;
     let interrupted = output.timed_out || output.cancelled || output.stalled;
     let formatted = format_command_result(output, timeout);
     if interrupted {
@@ -250,10 +391,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_COMMAND_OUTPUT_CHARS, confirm_git_commit_if_needed, format_command_result,
-        is_git_commit_command, resolve_command_timeout, truncate_chars,
+        confirm_git_commit_if_needed, execute_command, format_command_result,
+        is_git_commit_command, resolve_command_timeout, truncate_chars, MAX_COMMAND_OUTPUT_CHARS,
     };
     use crate::cmd::run::CommandRunResult;
+    use serde_json::json;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temporary_file_path(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rust_tools_{label}_{}_{}",
+            std::process::id(),
+            nonce
+        ))
+    }
 
     // ---- is_git_commit_command ----
 
@@ -262,6 +420,7 @@ mod tests {
         assert!(is_git_commit_command("git commit -m \"fix x\""));
         assert!(is_git_commit_command("git commit"));
         assert!(is_git_commit_command("git commit --amend"));
+        assert!(is_git_commit_command("git 'commit' -m message"));
     }
 
     #[test]
@@ -274,7 +433,9 @@ mod tests {
     #[test]
     fn commit_detection_finds_commit_in_command_chains() {
         assert!(is_git_commit_command("git add -A && git commit -m x"));
-        assert!(is_git_commit_command("git -C /repo add . && git -C /repo commit"));
+        assert!(is_git_commit_command(
+            "git -C /repo add . && git -C /repo commit"
+        ));
     }
 
     #[test]
@@ -295,9 +456,55 @@ mod tests {
     }
 
     #[test]
+    fn execute_command_blocks_git_commit_inside_substitution_without_terminal() {
+        // P0 回归：非 TTY 下 `echo "$(git commit ...)"` 必须被 fail-closed 拦截，
+        // 不能通过命令替换绕过确认门禁静默执行。
+        let err = execute_command(&json!({
+            "command": r#"echo "$(git commit -am x)""#,
+            "pty": false,
+            "timeout": 5,
+        }))
+        .unwrap_err();
+        assert!(err.contains("blocked"), "err: {err}");
+        assert!(err.contains("confirmation"), "err: {err}");
+    }
+
+    #[test]
     fn commit_confirmation_passes_through_non_commit_commands() {
         assert!(confirm_git_commit_if_needed("git status").is_ok());
         assert!(confirm_git_commit_if_needed("echo hello").is_ok());
+    }
+
+    #[test]
+    fn execute_command_materializes_file_data_for_any_simple_outer_command() {
+        let path = temporary_file_path("safe_file_read_substitution");
+        let contents = "literal $(whoami); 'quoted'";
+        fs::write(&path, contents).expect("write test file");
+
+        let result = execute_command(&json!({
+            "command": format!(r#"printf '%s' "$(cat {})""#, path.display()),
+            "pty": false,
+            "timeout": 5,
+        }));
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(result.unwrap(), contents);
+    }
+
+    #[test]
+    fn file_read_substitution_content_still_passes_command_audit() {
+        let path = temporary_file_path("unsafe_file_read_substitution");
+        fs::write(&path, "rm").expect("write test file");
+
+        let result = execute_command(&json!({
+            "command": format!(r#""$(cat {})" -rf /tmp/rust_tools_audit_test"#, path.display()),
+            "pty": false,
+            "timeout": 5,
+        }));
+        let _ = fs::remove_file(&path);
+
+        let err = result.unwrap_err();
+        assert!(err.contains("rm"), "err: {err}");
     }
 
     // ---- truncate_chars ----
@@ -367,7 +574,10 @@ mod tests {
         assert!(out.contains("waiting for interactive input"), "out: {out}");
         assert!(out.contains("QR-CONTENT"), "out: {out}");
         assert!(out.contains("`| tail`"), "out: {out}");
-        assert!(!out.contains("timed out"), "must not read as a timeout: {out}");
+        assert!(
+            !out.contains("timed out"),
+            "must not read as a timeout: {out}"
+        );
     }
 
     #[test]

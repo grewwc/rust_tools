@@ -1,5 +1,6 @@
 pub mod agent;
 pub(crate) mod audit;
+pub(crate) mod changes;
 pub mod checkpoint;
 pub mod export;
 pub mod feishu;
@@ -48,6 +49,9 @@ pub fn try_handle_local_command(
         return Ok(true);
     }
     if try_handle_clear_command(input) {
+        return Ok(true);
+    }
+    if changes::try_handle_changes_command(input)? {
         return Ok(true);
     }
     if try_handle_goal_command(app, input)? {

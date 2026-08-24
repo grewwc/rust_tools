@@ -46,10 +46,10 @@ use super::super::runtime_ctx::DriverContext;
 /// Hard upper bound on how long a synchronous `task` tool call may block
 /// the parent agent. Keeps a runaway sub-agent from wedging the foreground
 /// turn forever. Subagents are leaf tasks with a separate iteration cap;
-/// fifteen minutes gives complex sub-tasks (multi-step research, cross-module
+/// ten minutes gives complex sub-tasks (multi-step research, cross-module
 /// refactors, audits) enough budget to return useful partial evidence without
 /// wedging the parent turn for an interactive session.
-const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TIMEOUT_RECOVERY_MAX_CHARS: usize = 24_000;
 const TIMEOUT_RECOVERY_TAIL_MESSAGES: usize = 40;
 
@@ -143,7 +143,7 @@ fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubag
     Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped))
 }
 
-/// 执行模型通过 `task` 工具发起的同步子代理。普通工具调用可使用完整硬超时预算（当前 15 分钟）；
+/// 执行模型通过 `task` 工具发起的同步子代理。普通工具调用可使用完整硬超时预算（当前 10 分钟）；
 /// 仅 driver 的显式命令可选择在硬超时前请求子代理收口。
 pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
     execute_sync_task_with_hard_timeout(tool_call_id, args, SYNC_TASK_HARD_TIMEOUT)
@@ -450,7 +450,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let elapsed_secs = duration.as_secs_f64();
 
     // 硬超时：guard 已把子代理历史改名保留，这里提取超时前的工作产物发布到 result slot，
-    // 避免 15 分钟工作全部丢失（此前超时只返回空结果）。
+    // 避免 10 分钟工作全部丢失（此前超时只返回空结果）。
     if let Err(timeout_error) = &join_result {
         let timeout_phase = phase_slot
             .lock()
@@ -632,7 +632,7 @@ async fn wait_for_sync_task_completion_with_wrap_up(
 
 /// 硬超时后把子代理已写入历史的工作产物提取出来，发布到 result slot。
 /// 父代理随后在失败结果里能看到超时前的证据节选与保留文件路径，而不是空结果
-/// （此前超时路径把 15 分钟的工作产物全部丢弃）。
+/// （此前超时路径把 10 分钟的工作产物全部丢弃）。
 fn publish_timeout_evidence(
     child_history: &Path,
     result_slot: &runtime_ctx::SubagentResultSlot,
@@ -971,8 +971,8 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_sync_task_hard_timeout_remains_fifteen_minutes() {
-        assert_eq!(SYNC_TASK_HARD_TIMEOUT, Duration::from_secs(15 * 60));
+    fn ordinary_sync_task_hard_timeout_remains_ten_minutes() {
+        assert_eq!(SYNC_TASK_HARD_TIMEOUT, Duration::from_secs(10 * 60));
     }
 
     #[test]
@@ -1022,7 +1022,20 @@ mod tests {
                 .unwrap(),
             "parent"
         );
+        child
+            .execute("INSERT INTO evidence VALUES ('child')", [])
+            .unwrap();
         drop(child);
+
+        let parent = rusqlite::Connection::open(&parent_path).unwrap();
+        assert_eq!(
+            parent
+                .query_row("SELECT COUNT(*) FROM evidence", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(parent);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1142,7 +1155,7 @@ mod tests {
     #[test]
     fn timeout_recovery_payload_keeps_partial_audit_work() {
         let payload = format_timeout_recovery_payload(
-            "audit subagent exceeded hard timeout (900s)",
+            "audit subagent exceeded hard timeout (600s)",
             "CallingTool",
             Path::new("/tmp/audit-timeout.sqlite"),
             "AUDIT_CHECKPOINT: checked src/a.rs; finding at src/a.rs:42",
@@ -1159,7 +1172,7 @@ mod tests {
     #[test]
     fn timeout_recovery_payload_exposes_missing_history_diagnostic() {
         let payload = format_timeout_recovery_payload(
-            "audit subagent exceeded hard timeout (900s)",
+            "audit subagent exceeded hard timeout (600s)",
             "WaitingForModel",
             Path::new("/tmp/missing.sqlite"),
             "",

@@ -709,6 +709,43 @@ pub(in crate::ai) fn decode_reasoning_replay_for_model(
         .then(|| payload.get("reasoning")?.as_str().map(str::to_owned))?
 }
 
+/// Responses 协议加密推理回放前缀。与 exact-replay（`PERSISTED_REASONING_REPLAY_PREFIX`）
+/// 分开，因为二者 payload 形状不同：exact 存明文 reasoning 字符串，加密存 provider
+/// 下发的 reasoning output-item（JSON 数组，含 `encrypted_content`）。分开前缀避免
+/// 请求端把两类 payload 混用、也让压缩/sanitize 层能用同一"带标记则保留"规则统一处理。
+pub(in crate::ai) const PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX: &str =
+    "\u{1e}aios:reasoning-encrypted-replay:v1\u{1f}";
+
+/// 把本轮捕获的加密 reasoning items 连同来源模型编码进单个字符串，供落库到
+/// `reasoning_content`。带 model 标记：切换/回退到其他模型时，请求端解码会因
+/// 模型不匹配而丢弃，避免把 A 模型的加密状态误喂给 B 模型（provider 会 400）。
+pub(in crate::ai) fn encode_encrypted_reasoning_replay_state(
+    model: &str,
+    items: &[Value],
+) -> String {
+    format!(
+        "{PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX}{}",
+        serde_json::json!({ "model": model, "items": items })
+    )
+}
+
+/// 从落库的 `reasoning_content` 解码出加密 reasoning items。仅当标记内的来源模型
+/// 与当前请求模型一致时才返回；否则返回 `None`（跨模型不回放）。
+pub(in crate::ai) fn decode_encrypted_reasoning_replay_for_model(
+    model: &str,
+    encoded: &str,
+) -> Option<Vec<Value>> {
+    let payload = encoded.strip_prefix(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX)?;
+    let payload: Value = serde_json::from_str(payload).ok()?;
+    if payload.get("model")?.as_str()? != model {
+        return None;
+    }
+    payload
+        .get("items")?
+        .as_array()
+        .map(|items| items.to_vec())
+}
+
 fn sanitize_message_for_persisted_history_inner(
     message: &Message,
     replay_source_model: Option<&str>,
@@ -748,8 +785,10 @@ fn sanitize_message_for_persisted_history_inner(
         .is_some_and(|tool_calls| !tool_calls.is_empty());
     if has_tool_calls {
         if let Some(reasoning) = sanitized.reasoning_content.as_mut() {
-            if reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX) {
-                // 已经是 context snapshot 中的 model-neutral 标记，保持幂等。
+            if reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX)
+                || reasoning.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX)
+            {
+                // 已经是带内部标记的连续性状态（exact 明文 / responses 加密），保持幂等。
             } else if let Some(model) = replay_source_model {
                 *reasoning = encode_reasoning_replay_state(model, reasoning);
             } else {
@@ -784,10 +823,10 @@ fn sanitize_persisted_history_messages(messages: Vec<Message>) -> Vec<Message> {
         // 只有带内部标记的 reasoning 才是运行时按模型能力显式保留的连续性状态；
         // 旧历史、导入文件和其他模型的裸 reasoning 仍按原策略删除。
         .map(|message| {
-            let preserve = message
-                .reasoning_content
-                .as_deref()
-                .is_some_and(|reasoning| reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX));
+            let preserve = message.reasoning_content.as_deref().is_some_and(|reasoning| {
+                reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX)
+                    || reasoning.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX)
+            });
             sanitize_message_for_persisted_history_inner(
                 &message,
                 preserve.then_some("already-tagged"),

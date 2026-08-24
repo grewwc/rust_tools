@@ -56,6 +56,10 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":model",
         "/audit",
         ":audit",
+        "/changes",
+        ":changes",
+        "/diff",
+        ":diff",
         "/agent",
         ":agent",
         "/personas",
@@ -189,6 +193,10 @@ impl CommandCompleter {
             ":model",
             "/audit",
             ":audit",
+            "/changes",
+            ":changes",
+            "/diff",
+            ":diff",
             "/agent",
             ":agent",
             "/personas",
@@ -500,6 +508,18 @@ impl CommandCompleter {
         &["save", "list", "rollback", "delete", "help"]
     }
 
+    /// `/changes` / `/diff` 的子命令（-- 长选项为主，与命令文档一致；
+    /// 裸词形式 `stat`/`json`/`patch`/`open`/`help` 同样被解析器接受）。
+    fn changes_subcommands() -> &'static [&'static str] {
+        &["--help", "--stat", "--json", "--patch", "--open"]
+    }
+
+    /// `/changes --open [editor]` 的编辑器候选（与 `changes::EditorKind::from_str`
+    /// 接受的别名一致，取规范名）。
+    fn changes_open_editors() -> &'static [&'static str] {
+        &["auto", "code", "vscode", "cursor", "idea", "git", "open"]
+    }
+
     fn history_subcommands() -> &'static [&'static str] {
         &[
             "full",
@@ -665,6 +685,42 @@ impl CommandCompleter {
                         candidates
                     }
                     Some("use") if words.next().is_none() => Self::agent_name_candidates(token),
+                    _ => Vec::new(),
+                }
+            } else if matches!(first, "/changes" | ":changes" | "/diff" | ":diff") {
+                match words.next() {
+                    None => {
+                        // `/changes --open=<prefix>` 粘连形式：补全编辑器名并回填整个前缀；
+                        // 否则按子命令字面量前缀过滤。
+                        if let Some(prefix) = token.strip_prefix("--open=") {
+                            let mut candidates = Self::plain_candidates(
+                                Self::changes_open_editors()
+                                    .iter()
+                                    .filter(|c| c.starts_with(prefix))
+                                    .map(|c| c.to_string()),
+                            );
+                            for c in &mut candidates {
+                                c.replacement = format!("--open={}", c.replacement);
+                                c.display = format!("--open={}", c.display);
+                            }
+                            candidates
+                        } else {
+                            Self::plain_candidates(
+                                Self::changes_subcommands()
+                                    .iter()
+                                    .filter(|c| c.starts_with(token))
+                                    .map(|c| c.to_string()),
+                            )
+                        }
+                    }
+                    Some("--open") | Some("open") if words.next().is_none() => {
+                        Self::plain_candidates(
+                            Self::changes_open_editors()
+                                .iter()
+                                .filter(|c| c.starts_with(token))
+                                .map(|c| c.to_string()),
+                        )
+                    }
                     _ => Vec::new(),
                 }
             } else {
@@ -1361,6 +1417,78 @@ mod tests {
         assert!(
             candidates.iter().any(|c| c.replacement == "/usage"),
             "expected /usage for /usa, got: {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trie_command_completion_expands_changes_prefix() {
+        // /cha → /changes（Trie 前缀匹配）
+        let (_, candidates) = CommandCompleter::complete_for_line("/cha", 4);
+        assert!(
+            candidates.iter().any(|c| c.replacement == "/changes"),
+            "expected /changes for /cha, got: {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
+        );
+        // /diff 别名精确匹配
+        let (_, candidates) = CommandCompleter::complete_for_line("/diff", 5);
+        assert!(
+            candidates.iter().any(|c| c.replacement == "/diff"),
+            "expected /diff for /diff, got: {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
+        );
+        // :changes 冒号形式同样补全
+        let (_, candidates) = CommandCompleter::complete_for_line(":ch", 3);
+        assert!(candidates.iter().any(|c| c.replacement == ":changes"));
+    }
+
+    #[test]
+    fn changes_subcommand_completion_lists_flags_and_editors() {
+        // `/changes --st` → --stat
+        let (_, candidates) =
+            CommandCompleter::complete_for_line("/changes --st", "/changes --st".len());
+        assert!(
+            candidates.iter().any(|c| c.replacement == "--stat"),
+            "expected --stat for `/changes --st`, got: {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
+        );
+        // `/changes --open c` → code / cursor
+        let (_, candidates) =
+            CommandCompleter::complete_for_line("/changes --open c", "/changes --open c".len());
+        assert!(candidates.iter().any(|c| c.replacement == "code"));
+        assert!(candidates.iter().any(|c| c.replacement == "cursor"));
+        assert!(!candidates.iter().any(|c| c.replacement == "idea"));
+        // `/changes --open=co` 粘连形式回填整个前缀
+        let (_, candidates) = CommandCompleter::complete_for_line(
+            "/changes --open=co",
+            "/changes --open=co".len(),
+        );
+        assert!(
+            candidates.iter().any(|c| c.replacement == "--open=code"),
+            "expected --open=code for `/changes --open=co`, got: {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
+        );
+        // `/diff --j` 别名同样走子命令补全
+        let (_, candidates) =
+            CommandCompleter::complete_for_line("/diff --j", "/diff --j".len());
+        assert!(
+            candidates.iter().any(|c| c.replacement == "--json"),
+            "expected --json for `/diff --j`, got: {:?}",
             candidates
                 .iter()
                 .map(|c| &c.replacement)

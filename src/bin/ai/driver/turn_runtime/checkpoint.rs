@@ -274,6 +274,34 @@ pub(crate) fn command_is_cargo_verify(command: &str) -> bool {
     false
 }
 
+/// 命令是否为"无信息量探针"：所有实质段都是 `echo`。
+///
+/// 背景：`echo "integrate"` / `echo "x"` 这类命令只读、必成功、输出等于回显字面量，
+/// 本身不携带对任务的新信息。但 evidence 指纹按输出内容取哈希，模型每换一个 echo
+/// 字符串就产生一个"新证据"、刷新 no-progress 预算，使进展刹车（soft→ledger→hard）
+/// 永远攒不满窗口——这正是 muse-spark 死循环里 `echo` 反复刷新预算的逃逸通道。
+///
+/// 判据刻意最窄：要求**每个**实质段（跳过 `cd`/`export` 前导）都是裸 `echo`。
+/// 只要含任一非 echo 段（如 `echo hi && cargo check`、`cat f`）即返回 false，
+/// 交回常规证据记账——避免把真实只读探查（`cat version.txt`→内容）误判为无信息。
+pub(crate) fn command_is_low_information_probe(command: &str) -> bool {
+    let mut saw_substantive = false;
+    for segment in split_shell_segments_for_coarse(command) {
+        if shell_segment_is_nav_or_env(&segment) {
+            continue;
+        }
+        saw_substantive = true;
+        let mut tokens = segment.split_whitespace();
+        let Some(program) = tokens.next() else {
+            return false;
+        };
+        if program.rsplit('/').next().unwrap_or(program) != "echo" {
+            return false;
+        }
+    }
+    saw_substantive
+}
+
 /// `cd` / `export` 只改变工作目录或环境，不写文件系统，本身无副作用。作为前导段
 /// 跳过，避免 `cd X && git status` 这类「游走 + 检查」命令被误判为变更。
 pub(super) fn shell_segment_is_nav_or_env(segment: &str) -> bool {

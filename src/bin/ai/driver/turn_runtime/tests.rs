@@ -191,6 +191,70 @@ fn execute_command_is_read_only_skips_nav_segments_and_requires_all_substantive_
 }
 
 #[test]
+fn low_information_probe_only_matches_pure_echo_commands() {
+    use super::checkpoint::command_is_low_information_probe;
+    // 纯 echo 探针（含 cd/export 前导）→ 无信息量，不应刷新 no-progress 预算。
+    assert!(command_is_low_information_probe("echo \"integrate\""));
+    assert!(command_is_low_information_probe("echo x"));
+    assert!(command_is_low_information_probe("cd /tmp && echo done"));
+    assert!(command_is_low_information_probe("echo a && echo b"));
+    // 含任何真实只读段 → 不是纯探针，仍照常记账（不误伤正当探查）。
+    assert!(!command_is_low_information_probe("cat version.txt"));
+    assert!(!command_is_low_information_probe("echo hi && cargo check --bin a"));
+    assert!(!command_is_low_information_probe("echo start && grep foo src.rs"));
+    assert!(!command_is_low_information_probe("ls -la"));
+    // 空命令 / 仅前导段 → 无实质 echo 段，不算探针。
+    assert!(!command_is_low_information_probe(""));
+    assert!(!command_is_low_information_probe("cd /tmp"));
+}
+
+#[test]
+fn distinct_echo_probes_do_not_each_count_as_new_evidence() {
+    use super::progress::extract_round_evidence_fingerprints;
+    let echo_round = |call_id: &str, cmd: &str, out: &str| {
+        vec![
+            crate::ai::history::Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(String::new()),
+                tool_calls: Some(vec![crate::ai::types::ToolCall {
+                    id: call_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: crate::ai::types::FunctionCall {
+                        name: "execute_command".to_string(),
+                        arguments: format!("{{\"command\":\"{cmd}\"}}"),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            crate::ai::history::Message {
+                role: "tool".to_string(),
+                content: serde_json::Value::String(out.to_string()),
+                tool_calls: None,
+                tool_call_id: Some(call_id.to_string()),
+                reasoning_content: None,
+            },
+        ]
+    };
+
+    // 互不相同的 echo 探针：修复前每个都产生新指纹刷新预算，修复后一律不计入证据。
+    assert!(
+        extract_round_evidence_fingerprints(&echo_round("c1", "echo \\\"integrate\\\"", "integrate"))
+            .is_empty(),
+        "echo probe must not count as new evidence"
+    );
+    assert!(
+        extract_round_evidence_fingerprints(&echo_round("c2", "echo \\\"x\\\"", "x")).is_empty()
+    );
+    // 对照：真实只读探查（cat 文件内容）仍应产生证据指纹，未被误伤。
+    assert!(
+        !extract_round_evidence_fingerprints(&echo_round("c3", "cat version.txt", "1.2.3"))
+            .is_empty(),
+        "genuine read-only inspection must still register as evidence"
+    );
+}
+
+#[test]
 fn cargo_verify_evidence_normalizes_volatile_output() {
     // 同一验证结果（仅时长/编译进度不同）→ 归一化后相同 → 指纹相同。
     let a = normalize_verify_output(

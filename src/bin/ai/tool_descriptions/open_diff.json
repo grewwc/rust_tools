@@ -1,0 +1,22 @@
+{
+  "name": "open_diff",
+  "description": "Open the current session's diffs in an external editor. In a git repository the diff is derived from `git diff` plus the session mutation log; outside git the patch file alone is opened. Returns the patch file path and the editor command used. editor may be 'auto', 'code' (VS Code), 'cursor', 'idea', 'git' (git difftool), 'open' (macOS). Set background to true to detach.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "editor": {
+        "type": "string",
+        "description": "Preferred editor. 'auto' (default) auto-detects: code → cursor → idea → open. Examples: 'code', 'cursor', 'idea', 'git', 'open', 'auto'."
+      },
+      "patch_file": {
+        "type": "string",
+        "description": "Optional custom output path for the combined patch file. When omitted a file under the session assets directory is created."
+      },
+      "as_patch": {
+        "type": "boolean",
+        "description": "When true, open the single combined patch file (default: from config ai.diff.open_patch_file). When false, attempt per-file before/after `code --diff` panes (only for VS Code/Cursor)."
+      }
+    },
+    "required": []
+  }
+}

@@ -1389,6 +1389,174 @@ fn find_matching_shell_paren(command: &str, open_idx: usize) -> Option<usize> {
     None
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ShellWordSpan {
+    start: usize,
+    end: usize,
+}
+
+/// 解析仅供受限文件读取替换使用的外层 shell 单词。这里刻意不复用
+/// `tokenize_shell_words`：后者会抹掉引号来源，无法证明 `$()` 确实位于一个完整的
+/// 双引号单词里。只接受无控制运算符、无转义、无额外活动展开的简单命令行。
+fn restricted_outer_shell_words(command: &str) -> Option<(Vec<ShellWordSpan>, Vec<usize>)> {
+    if command.bytes().any(|b| matches!(b, b'\n' | b'\r')) {
+        return None;
+    }
+
+    let bytes = command.as_bytes();
+    let mut words = Vec::new();
+    let mut active_dollars = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == bytes.len() {
+            break;
+        }
+
+        let start = i;
+        let mut in_single = false;
+        let mut in_double = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_single {
+                if b == b'\'' {
+                    in_single = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_double {
+                match b {
+                    b'"' => in_double = false,
+                    // 受限语法不接受反斜杠或反引号，避免它们改变引号和展开语义。
+                    b'\\' | b'`' => return None,
+                    b'$' => {
+                        if bytes.get(i + 1) != Some(&b'(') {
+                            return None;
+                        }
+                        active_dollars.push(i);
+                    }
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+            if b.is_ascii_whitespace() {
+                break;
+            }
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                // 外层不允许会改变命令结构、触发展开或 glob 的字符。
+                b'\\' | b'`' | b'$' | b'(' | b')' | b'{' | b'}' | b';' | b'&' | b'|' | b'<'
+                | b'>' | b'*' | b'?' | b'[' => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        if in_single || in_double {
+            return None;
+        }
+        words.push(ShellWordSpan { start, end: i });
+    }
+    Some((words, active_dollars))
+}
+
+/// 仅允许 ASCII 绝对路径，且不允许空、`.`、`..` 组件；这让 `cat` 的参数不含任何
+/// shell 展开、选项或额外命令片段。
+fn is_literal_absolute_path(path: &str) -> bool {
+    if !path.starts_with('/')
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+
+    let mut components = path.split('/');
+    components.next() == Some("")
+        && components
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+/// 无害 shell 替换的种类：优先尝试字面量文件读取（不执行 shell），否则执行无害命令并捕获输出。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SafeShellSubstitutionKind {
+    FileRead { path: String },
+    Command { inner: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SafeShellSubstitution {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) kind: SafeShellSubstitutionKind,
+}
+
+/// 识别简单外层命令中的无害 `"$(...)"` 替换并分类。
+///
+/// - 外层必须使用受限语法：无控制运算符、无转义、无额外活动展开，
+///   且每个 `$()` 都是完整双引号单词 `"$(inner)"`。
+/// - `inner` 若为 `cat /绝对路径字面量` 则走文件读取路径（不经过 shell 执行）。
+/// - 否则若 `inner` 本身能通过 `validate_execute_command`（即按现有黑名单被判定为无害），
+///   则视为可执行的无害命令替换。
+/// - 只要有一个 `$()` 不满足上述两类，就整体视为不安全，返回空以便上层注入校验拦截。
+pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstitution> {
+    let Some((words, active_dollars)) = restricted_outer_shell_words(command) else {
+        return Vec::new();
+    };
+    if active_dollars.is_empty() {
+        return Vec::new();
+    }
+    let mut substitutions = Vec::with_capacity(active_dollars.len());
+    for dollar_idx in active_dollars {
+        let Some(word) = words
+            .iter()
+            .find(|word| word.start <= dollar_idx && dollar_idx < word.end)
+            .copied()
+        else {
+            return Vec::new();
+        };
+        let raw_word = &command[word.start..word.end];
+        if dollar_idx != word.start + 1
+            || raw_word.len() < 5
+            || !raw_word.starts_with("\"$(")
+            || !raw_word.ends_with(")\"")
+        {
+            return Vec::new();
+        }
+        let inner = &command[word.start + 3..word.end - 2];
+        let inner_trim = inner.trim();
+        if inner_trim.is_empty() || inner_trim.contains('\0') {
+            return Vec::new();
+        }
+        if let Some(path) = inner_trim.strip_prefix("cat ") {
+            if is_literal_absolute_path(path) && inner_trim == format!("cat {path}") {
+                substitutions.push(SafeShellSubstitution {
+                    start: word.start,
+                    end: word.end,
+                    kind: SafeShellSubstitutionKind::FileRead { path: path.to_string() },
+                });
+                continue;
+            }
+        }
+        if validate_execute_command(inner_trim).is_ok() {
+            substitutions.push(SafeShellSubstitution {
+                start: word.start,
+                end: word.end,
+                kind: SafeShellSubstitutionKind::Command {
+                    inner: inner_trim.to_string(),
+                },
+            });
+        } else {
+            return Vec::new();
+        }
+    }
+    substitutions
+}
+
 /// 检查命令字符串中是否存在不安全的 shell 注入面。
 ///
 /// 本函数是 **shell-specific** 的安全检查，只应对经 shell 解释执行的命令
@@ -1951,9 +2119,9 @@ pub(crate) fn validate_execute_command(command: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ShellJoin, command_subcommand_index, effective_command_tokens,
+        command_subcommand_index, effective_command_tokens, safe_shell_substitutions,
         split_unquoted_command_segments, split_unquoted_segments, tokenize_shell_words,
-        validate_no_injection_surface,
+        validate_no_injection_surface, SafeShellSubstitutionKind, ShellJoin,
     };
 
     // ---- split_unquoted_segments ----
@@ -2195,6 +2363,70 @@ mod tests {
             err.contains("command substitution"),
             "expected $(...) blocked, got: {err}"
         );
+    }
+
+    #[test]
+    fn detects_literal_file_read_substitution_for_any_simple_outer_command() {
+        // safe_shell_substitutions 的 FileRead 分支（已取代删除的 safe_file_read_substitutions）
+        let substitutions = safe_shell_substitutions(
+            r#"curl --data "$(cat /tmp/request.json)" https://example.test/api"#,
+        );
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(
+            substitutions[0].kind,
+            SafeShellSubstitutionKind::FileRead {
+                path: "/tmp/request.json".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn literal_file_read_substitution_requires_a_complete_simple_shell_word() {
+        let kinds: Vec<_> = safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)""#)
+            .into_iter()
+            .map(|s| s.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![SafeShellSubstitutionKind::FileRead {
+                path: "/tmp/dsl.json".to_string()
+            }]
+        );
+        assert_eq!(safe_shell_substitutions(r#"bytedcli --dsl "$(cat /tmp/dsl.json)""#).len(), 1);
+        assert_eq!(
+            safe_shell_substitutions(r#"echo "$(cat /tmp/a)" "$(cat /tmp/b)""#).len(),
+            2
+        );
+        // 外层带管道/连接符 → 整个命令不识别为安全替换
+        assert!(safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" | jq ."#).is_empty());
+        assert!(safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" && id"#).is_empty());
+        // 非完整单词的 $() 仍是注入面
+        assert!(validate(r#"echo "$(cat /tmp/dsl.json)""#).is_err());
+        assert!(validate(r#"bytedcli --dsl "prefix$(cat /tmp/dsl.json)""#).is_err());
+        assert!(validate(r#"bytedcli --dsl "$(cat /tmp/dsl.json)suffix""#).is_err());
+    }
+
+    #[test]
+    fn file_read_substitution_requires_one_literal_absolute_path() {
+        // 非绝对、非字面路径不得物化为 FileRead（可回退为经 validate 的无害 Command）
+        for command in [
+            r#"echo "$(cat /tmp/a /tmp/b)""#,
+            r#"echo "$(cat $HOME/a)""#,
+            r#"echo "$(cat /tmp/a; id)""#,
+            r#"echo "$(cat /tmp/a$(id))""#,
+            r#"echo "$(cat /tmp/../secret)""#,
+            r#"echo "$(cat /tmp/*.json)""#,
+        ] {
+            let substitutions = safe_shell_substitutions(command);
+            assert!(
+                substitutions
+                    .iter()
+                    .all(|s| !matches!(s.kind, SafeShellSubstitutionKind::FileRead { .. })),
+                "unsafe cat path must not be materialized as FileRead: {command}"
+            );
+        }
+        // 嵌套 $() 整体拒绝
+        assert!(safe_shell_substitutions(r#"echo "$(cat /tmp/a$(id))""#).is_empty());
     }
 
     #[test]

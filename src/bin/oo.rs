@@ -38,12 +38,6 @@ fn is_ssh() -> bool {
         || std::env::var("SSH_TTY").is_ok()
 }
 
-fn try_paste_image_via_osc52(fname: &str) -> Result<String, String> {
-    let saved_path = clipboardw::image_content::resolved_save_path(fname);
-    clipboardw::image_content::save_to_file(fname).map_err(|e| e.to_string())?;
-    Ok(saved_path)
-}
-
 fn saved_file_message(path: &str) -> String {
     format!("save to file: {path}")
 }
@@ -63,42 +57,38 @@ fn handle_paste_to_file(fname: &str) -> Result<(), String> {
         }
     }
 
-    if clipboardw::binary_content::save_to_file(fname).is_ok() {
-        println!("save to file: {fname}");
-        return Ok(());
-    }
-    if clipboardw::string_content::save_to_file(fname).is_ok() {
-        // string_content::save_to_file 内部已经打印 "save to file: ..."
-        return Ok(());
-    }
+    // 统一粘贴入口：只读取一次剪贴板，按内容类型（图片/文本/二进制）
+    // 自动选择扩展名保存，避免旧实现 binary→string→image 三级联各自重新
+    // 查询一次 OSC52（大图每查一次都要重新传输整份剪贴板）。
+    let saved_path = match clipboardw::paste_to_file(fname) {
+        Ok(path) => path,
+        Err(e) => {
+            // In SSH sessions: OSC52 only carries text, so a natively-copied image won't arrive.
+            // Prompt the user to run `oo -B` on their local machine to re-encode the image as text,
+            // then retry once.
+            if is_ssh() && stdin_is_tty() {
+                eprintln!("No image data found in clipboard via OSC52.");
+                eprintln!("On your LOCAL machine, run:  oo -B");
+                eprintln!("Then press Enter here to retry...");
+                let stdin = io::stdin();
+                let mut line = String::new();
+                let _ = stdin.lock().read_line(&mut line);
 
-    // First attempt at image via OSC52.
-    if let Ok(saved_path) = try_paste_image_via_osc52(fname) {
-        println!("{}", saved_file_message(&saved_path));
-        return Ok(());
-    }
+                if let Ok(path) = clipboardw::paste_to_file(fname) {
+                    println!("{}", saved_file_message(&path));
+                    return Ok(());
+                }
+            }
 
-    // In SSH sessions: OSC52 only carries text, so a natively-copied image won't arrive.
-    // Prompt the user to run `oo -B` on their local machine to re-encode the image as text,
-    // then retry once.
-    if is_ssh() && stdin_is_tty() {
-        eprintln!("No image data found in clipboard via OSC52.");
-        eprintln!("On your LOCAL machine, run:  oo -B");
-        eprintln!("Then press Enter here to retry...");
-        let stdin = io::stdin();
-        let mut line = String::new();
-        let _ = stdin.lock().read_line(&mut line);
-
-        if let Ok(saved_path) = try_paste_image_via_osc52(fname) {
-            println!("{}", saved_file_message(&saved_path));
-            return Ok(());
+            return Err(format!(
+                "no image found in clipboard ({e})\n\
+                hint: on your LOCAL machine run `oo -B` to encode the image as text, then retry `oo -p {fname}` here"
+            ));
         }
-    }
+    };
 
-    Err(format!(
-        "no image found in clipboard\n\
-        hint: on your LOCAL machine run `oo -B` to encode the image as text, then retry `oo -p {fname}` here"
-    ))
+    println!("{}", saved_file_message(&saved_path));
+    Ok(())
 }
 
 fn handle_copy_from_file(fname: &str) -> bool {

@@ -244,6 +244,13 @@ pub(super) fn extract_round_evidence_fingerprints(messages: &[crate::ai::history
             if !execute_command_is_read_only(command) {
                 continue;
             }
+            // 无信息量探针（纯 `echo` 回显）不计入新证据：其输出恒等于回显字面量，
+            // 模型每换一个 echo 字符串就产生一个"新证据"刷新 no-progress 预算，使进展
+            // 刹车永远攒不满窗口（muse-spark 死循环的逃逸通道）。判据最窄——只有全 echo
+            // 段才跳过，含任何真实只读段（cat/grep/…）仍照常记账，不误伤正当探查。
+            if command_is_low_information_probe(command) {
+                continue;
+            }
             read_only_command = Some(command.to_string());
         }
 

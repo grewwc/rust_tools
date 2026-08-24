@@ -706,6 +706,52 @@ const REASONING_ONLY_SYNTHESIS_RETRY_NOTE: &str = "The response still contained 
 /// 给出用户可见错误,避免逐轮重复同字节请求空转到 max_iterations。
 const REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES: usize = 2;
 
+/// 收尾门因「未整合子任务证据」重开当前 turn 的独立配额标记与上限。
+///
+/// 背景：收尾门在仍有未整合 task evidence 时会打回一轮（reopen），要求模型
+/// `task_integrate`。但该 veto 原本只受 `iteration < max_iterations`（4096）约束，
+/// 且每次 reopen 都清掉旧提示 marker、无累计计数。当子任务是 TIMED_OUT 这类**永远
+/// 无法被整合**的死结、或模型持续拒绝调用 `task_integrate` 时，会逐轮无限重开、
+/// 空转到硬上限（muse-spark 死循环的放大器之一）。这里用不被清除的计数 marker
+/// 记录同一 turn 内的 reopen 次数，超过上限后不再重开，改走与 `iteration >=
+/// max_iterations` 相同的降级路径（附 warning + ledger 放行收尾）。
+const TASK_EVIDENCE_REOPEN_MARKER: &str = "[task-evidence-reopen-count]";
+/// 同一 turn 内「未整合证据 / 未收口子任务」重开的最大次数。取 3：给模型足够机会
+/// 在拿到 ledger 后调用 `task_integrate`，又远早于迭代硬上限，避免死结无限空转。
+const TASK_EVIDENCE_REOPEN_MAX: usize = 3;
+
+/// 统计当前 `messages` 中已注入的收尾门重开计数 marker 数量。marker 是不被
+/// reopen 清除的 internal_note，因此可跨迭代累计。
+fn task_evidence_reopen_count(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(TASK_EVIDENCE_REOPEN_MARKER))
+        })
+        .count()
+}
+
+/// 追加一条重开计数 marker（不被 reopen 的 retain 清除，用于跨迭代累计次数）。
+/// 与本文件其它 marker 一致：marker 前缀 + 一句人类可读说明，避免投影到模型时
+/// 出现无语义裸标签（internal_note 会被映射为 system/assistant，见 request/normalize）。
+fn push_task_evidence_reopen_marker(messages: &mut Vec<Message>, attempt: usize) {
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(format!(
+            "{TASK_EVIDENCE_REOPEN_MARKER}\nOutstanding subagent results were re-surfaced \
+             (attempt {attempt}/{TASK_EVIDENCE_REOPEN_MAX}). Call `task_integrate` for each \
+             listed task_id now; after the limit the turn will finalize with the evidence attached."
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
 fn append_runtime_warning_once(text: &mut String, warning: &str) {
     if text.contains(warning) {
         return;
@@ -2881,9 +2927,17 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             // 会无限活锁，而且每轮重置 force_final_response 还会反复顶掉 orchestrator
             // 的安全刹车（tool-loop / progress-budget / iteration-limit hard-stop）。
             // 到达硬上限后放行收尾，让 max_iterations 保持为权威天花板。
+            //
+            // 除硬上限外，再加一道**独立重开配额**：同一 turn 内重开次数达到
+            // TASK_EVIDENCE_REOPEN_MAX 后不再打回。否则 TIMED_OUT 这类永远无法整合的
+            // 死结、或模型持续拒绝 task_integrate 时，会逐轮无限重开、空转到 4096。
+            let reopen_count = task_evidence_reopen_count(messages);
+            let reopen_budget_exhausted = reopen_count >= TASK_EVIDENCE_REOPEN_MAX;
             if iteration < max_iterations
+                && !reopen_budget_exhausted
                 && reopen_turn_for_outstanding_subagent_tasks(messages, &app.session_id)
             {
+                push_task_evidence_reopen_marker(messages, reopen_count + 1);
                 *force_final_response = false;
                 return Ok(TurnLoopStep::Continue);
             }
@@ -2898,13 +2952,16 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     .push_str(&format!("\n\n[Runtime warning] {warning}"));
             }
             if let Some(ledger) = task_evidence_ledger {
-                if iteration < max_iterations {
+                if iteration < max_iterations && !reopen_budget_exhausted {
                     reopen_turn_for_unintegrated_task_evidence(messages, &ledger);
+                    push_task_evidence_reopen_marker(messages, reopen_count + 1);
                     *force_final_response = false;
                     return Ok(TurnLoopStep::Continue);
                 }
+                // 硬上限或重开配额耗尽：放行收尾，把未整合证据作为 warning + ledger
+                // 附到可见回答，交由用户/后续轮处理，而不是无限重开空转。
                 stream_result.assistant_text.push_str(
-                    "\n\n[Runtime warning] Subagent results remain unintegrated at the iteration limit.\n",
+                    "\n\n[Runtime warning] Subagent results remain unintegrated after repeated reopen attempts.\n",
                 );
                 stream_result.assistant_text.push_str(&ledger);
             }
@@ -3472,6 +3529,49 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("task_id=task-1")
+        );
+    }
+
+    #[test]
+    fn task_evidence_reopen_marker_counts_and_survives_reopen_retain() {
+        let mut messages: Vec<Message> = Vec::new();
+        assert_eq!(task_evidence_reopen_count(&messages), 0);
+
+        // 每次重开注入一个计数 marker；计数随之累加。
+        push_task_evidence_reopen_marker(&mut messages, 1);
+        assert_eq!(task_evidence_reopen_count(&messages), 1);
+        push_task_evidence_reopen_marker(&mut messages, 2);
+        assert_eq!(task_evidence_reopen_count(&messages), 2);
+
+        // 关键不变量：unintegrated-evidence reopen 的 retain 不得清掉计数 marker，
+        // 否则配额永远攒不满、退回无限重开。
+        reopen_turn_for_unintegrated_task_evidence(&mut messages, "[task-evidence-ledger]\ntask_id=t");
+        assert_eq!(
+            task_evidence_reopen_count(&messages),
+            2,
+            "reopen must not erase the reopen-count markers"
+        );
+    }
+
+    #[test]
+    fn task_evidence_reopen_quota_is_bounded() {
+        // 配额上限存在且远小于迭代硬上限（DEFAULT_MAX_ITERATIONS = 64*64 = 4096），
+        // 保证死结（TIMED_OUT / 拒绝 integrate）不会无限重开。
+        assert!(TASK_EVIDENCE_REOPEN_MAX >= 1);
+        assert!(TASK_EVIDENCE_REOPEN_MAX < 64 * 64);
+
+        let mut messages: Vec<Message> = Vec::new();
+        for attempt in 1..=TASK_EVIDENCE_REOPEN_MAX {
+            assert!(
+                task_evidence_reopen_count(&messages) < TASK_EVIDENCE_REOPEN_MAX,
+                "budget must not be exhausted before the cap"
+            );
+            push_task_evidence_reopen_marker(&mut messages, attempt);
+        }
+        assert_eq!(task_evidence_reopen_count(&messages), TASK_EVIDENCE_REOPEN_MAX);
+        assert!(
+            task_evidence_reopen_count(&messages) >= TASK_EVIDENCE_REOPEN_MAX,
+            "after the cap, reopen budget is exhausted and the turn finalizes"
         );
     }
 
