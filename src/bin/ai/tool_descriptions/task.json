@@ -1,6 +1,6 @@
 {
   "name": "task",
-  "description": "Run one subagent synchronously (blocks the turn) and return its final output. Use for a single focused side investigation whose result you need before continuing; for parallel work use task_spawn. Top-level agent only: nested subagents error — do the work directly.",
+  "description": "Run one subagent synchronously and return its final output. Use when one delegated result is needed before continuing; use `task_spawn` for independent concurrent work. Top-level agents only.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,7 +10,7 @@
       },
       "prompt": {
         "type": "string",
-        "description": "The task/prompt to send to the subagent. Be specific about what you want accomplished."
+        "description": "Self-contained instructions: goal, scope, relevant context, constraints, and expected output."
       },
       "agent": {
         "type": "string",

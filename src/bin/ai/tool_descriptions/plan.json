@@ -1,6 +1,6 @@
 {
   "name": "plan",
-  "description": "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly. The plan is the roadmap for the whole task: keep its status current with `plan_update` and revise it with a fresh `plan` call when the task's shape changes.",
+  "description": "Create or replace a plan for a complex task. Each step states the action, reason, and primary tool. Keep statuses current with `plan_update`; call `plan` again if the task shape changes. Skip planning for simple one-step work.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -28,11 +28,11 @@
             },
             "parallelizable": {
               "type": "boolean",
-              "description": "Whether this step can run in parallel with the previous step (no data dependency on earlier steps). Default: false; not implied by `delegate` (delegated steps are serial unless set)."
+              "description": "Whether this step can run in parallel with the previous step because no dependency exists. Default false; only meaningful for delegated work."
             },
             "delegate": {
               "type": "boolean",
-              "description": "Whether this step should be delegated to a subagent. Delegate every substantive step, serial or parallel: the subagent runs with a clean, focused context and you review its result. Serial delegated steps run one at a time via the synchronous `task` (hand the needed context from prior results in the prompt); steps with `parallelizable: true` run concurrently via task_spawn. Keep in the parent only trivial single-tool steps, tightly coupled overlapping edits, and final review/synthesis."
+              "description": "Whether to delegate this step. Set true for substantive bounded work; keep only trivial work, tightly coupled edits, and final review in the parent. Delegated steps run serially with `task` unless `parallelizable` enables concurrent `task_spawn`."
             }
           },
           "required": [

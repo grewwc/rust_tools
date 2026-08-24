@@ -1,6 +1,6 @@
 {
   "name": "task_spawn",
-  "description": "Launch a subagent asynchronously and return its task_id immediately; spawned subtasks run concurrently. Use for independent subtasks. For a SINGLE subtask whose result you need, prefer the synchronous `task` — a lone task_spawn + task_wait adds no concurrency, only overhead. Continue parent-side work meanwhile; the task_id stays valid until its result is consumed — collect with task_wait, acknowledge with task_integrate. Top-level agent only: nested subagents error — do the work directly.",
+  "description": "Start one subagent asynchronously and return its `task_id`. Use for independent work while the parent continues; collect with `task_wait` and acknowledge with `task_integrate`. For one result needed immediately, use `task`. Top-level agents only.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,7 +10,7 @@
       },
       "prompt": {
         "type": "string",
-        "description": "The task/prompt to send to the subagent. Be specific about what you want accomplished."
+        "description": "Self-contained instructions: goal, scope, relevant context, constraints, and expected output."
       },
       "agent": {
         "type": "string",

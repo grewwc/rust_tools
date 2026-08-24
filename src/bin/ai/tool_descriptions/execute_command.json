@@ -1,12 +1,12 @@
 {
   "name": "execute_command",
-  "description": "Run a shell command. Destructive/network/escalation commands are blocked. Output is truncated past a char cap with shown-vs-total counts; narrow or page instead of re-running variants. Failures include exit code.",
+  "description": "Run a shell command. Destructive, network, and privilege-escalation commands are blocked. Truncated output reports shown/total counts; narrow or page instead of rerunning variants. Failures report the exit code.",
   "parameters": {
     "type": "object",
     "properties": {
       "command": {
         "type": "string",
-        "description": "Shell command to run. For long-running servers, background and redirect: `cmd > /tmp/app.log 2>&1 & sleep 2 && curl -s localhost:PORT/...`. Never run a foreground server directly. Do NOT pipe interactive commands through `tail`/`grep`/`tee`/`head` — those buffer all output until the command exits, and an interactive command that waits for input never exits, so you will see nothing and the run will be killed as stalled."
+        "description": "Shell command. Background long-running servers and redirect their output before probing them; never run one in the foreground. Do not pipe interactive commands through `head`, `tail`, `grep`, or `tee`; they can wait for process exit and stall."
       },
       "cwd": {
         "type": "string",
@@ -18,7 +18,7 @@
       },
       "pty": {
         "type": "boolean",
-        "description": "Required. Use true for interactive CLIs (QR codes, prompts, full-screen); false otherwise. No keyboard input forwarding. Interactive commands that wait for human input (e.g. QR-code login) are auto-terminated after a short silent period (~10-20s) and their partial output (including any QR code) is returned with a clear diagnosis — prefer the CLI's non-blocking/headless flags (e.g. `--begin`/`--complete`, `--qr-image`, `--no-terminal-qr`, `-y`) for such flows instead of a blocking PTY."
+        "description": "Required. Use true for interactive CLIs (prompts, QR codes, full-screen UI), false otherwise. Keyboard input is not forwarded. Blocking interactive commands are stopped after about 10-20 seconds of silence and return partial output; prefer non-blocking or headless flags."
       }
     },
     "required": [
