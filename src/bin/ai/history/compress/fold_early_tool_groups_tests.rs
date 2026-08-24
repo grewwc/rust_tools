@@ -718,6 +718,50 @@ fn encrypted_reasoning_replay_roundtrip_same_model() {
 }
 
 #[test]
+fn encrypted_reasoning_replay_dedups_same_id_duplicate() {
+    // 网关会对同一 reasoning 资源重复下发 .added（部分载荷）与 .done（完整载荷）：
+    // id 相同、encrypted_content 长度不同。历史里可能因此落库同 id 的两项，解码
+    // 必须按 id 收敛、保留最长载荷，否则回放时同一资源 id 出现两次触发 modelhub
+    // -4003 (Duplicate item found)。
+    let model = "muse-spark-1.2-contributor";
+    let items = vec![
+        serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_duplicate",
+            "encrypted_content": "PARTIAL_908",
+            "summary": []
+        }),
+        serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_duplicate",
+            "encrypted_content": "FULL_1720_PAYLOAD",
+            "summary": []
+        }),
+    ];
+    let encoded = encode_encrypted_reasoning_replay_state(model, &items);
+    let decoded = decode_encrypted_reasoning_replay_for_model(model, &encoded)
+        .expect("same-model decode should succeed");
+    assert_eq!(decoded.len(), 1, "同 id 的两项必须收敛为一项");
+    assert_eq!(
+        decoded[0]
+            .get("encrypted_content")
+            .and_then(serde_json::Value::as_str),
+        Some("FULL_1720_PAYLOAD"),
+        "必须保留最长（完整）载荷"
+    );
+
+    // 不同 id 的项不受影响，全部保留。
+    let mixed = vec![
+        serde_json::json!({"type":"reasoning","id":"rs_a","encrypted_content":"A"}),
+        serde_json::json!({"type":"reasoning","id":"rs_b","encrypted_content":"B"}),
+    ];
+    let encoded_mixed = encode_encrypted_reasoning_replay_state(model, &mixed);
+    let decoded_mixed = decode_encrypted_reasoning_replay_for_model(model, &encoded_mixed)
+        .expect("same-model decode should succeed");
+    assert_eq!(decoded_mixed.len(), 2);
+}
+
+#[test]
 fn encrypted_reasoning_replay_rejects_cross_model() {
     let items = vec![serde_json::json!({"type":"reasoning","encrypted_content":"X"})];
     let encoded = encode_encrypted_reasoning_replay_state("muse-spark-1.2-contributor", &items);

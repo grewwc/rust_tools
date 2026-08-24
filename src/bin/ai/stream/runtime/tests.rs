@@ -2035,6 +2035,57 @@ fn snapshot_done_chunk_does_not_duplicate_already_streamed_prefix() {
 }
 
 #[test]
+fn reasoning_item_added_done_same_id_keeps_full_payload() {
+    // 网关会对同一 reasoning 资源重复下发 .added（部分载荷）与 .done（完整载荷）：
+    // id 相同、encrypted_content 长度不同（.added 携带 >=256 的真实部分载荷时同样
+    // 被捕获）。累积器必须按 id 收敛、保留最长载荷，否则回放时同一资源 id 出现
+    // 两次触发 modelhub 400 (-4003 Duplicate item found)。
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    let added_payload = format!(
+        r#"{{"output_index":0,"item":{{"type":"reasoning","id":"rs_same","encrypted_content":"{}"}}}}"#,
+        "A".repeat(300)
+    );
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_item.added"),
+        &added_payload,
+    )
+    .unwrap();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_item.done"),
+        r#"{"output_index":0,"item":{"type":"reasoning","id":"rs_same","encrypted_content":"FULL_LONGER_PAYLOAD"}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        state.content.reasoning_items.len(),
+        1,
+        "同 id 的 reasoning item 必须收敛为一项"
+    );
+    assert_eq!(
+        state.content.reasoning_items[0]
+            .get("encrypted_content")
+            .and_then(serde_json::Value::as_str),
+        Some("FULL_LONGER_PAYLOAD"),
+        "必须保留最长（完整）载荷"
+    );
+}
+
+#[test]
 fn tool_call_snapshot_done_does_not_duplicate_already_streamed_prefix() {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();

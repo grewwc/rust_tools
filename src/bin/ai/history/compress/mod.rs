@@ -740,10 +740,36 @@ pub(in crate::ai) fn decode_encrypted_reasoning_replay_for_model(
     if payload.get("model")?.as_str()? != model {
         return None;
     }
-    payload
-        .get("items")?
-        .as_array()
-        .map(|items| items.to_vec())
+    let mut items: Vec<Value> = payload.get("items")?.as_array()?.to_vec();
+    // 网关会对同一 reasoning 资源在 `.added`（部分载荷）与 `.done`（完整载荷）
+    // 重复下发，修复前的累积器按全字段相等去重未能收敛，历史里可能因此落库
+    // 同 id 的两项。按 id 去重、保留后到（`.done` 为协议最终权威状态）的一项，
+    // 否则回放时同一资源 id 出现两次，modelhub 返回 400 (-4003 Duplicate item found)。
+    dedup_reasoning_items_by_id(&mut items);
+    Some(items)
+}
+
+/// 按 `id` 收敛 reasoning items：同一资源保留后到的一项。
+///
+/// 网关会对同一 reasoning 资源在 `.added`（部分载荷）与 `.done`（完整载荷）
+/// 重复下发，二者 id 相同、内容不同，按全字段相等去重判不等，会留下重复 id；
+/// 回放时同一资源 id 出现两次，modelhub 返回 400 (-4003 Duplicate item found)。
+/// 这里按 id 收敛、保留后到的一项：流内 `.done` 恒晚于 `.added`，是协议最终
+/// 权威状态（携带完整载荷），后到者胜天然选中它。无 `id` 的项互不合并（保留
+/// 全部，避免误删）。
+pub(in crate::ai) fn dedup_reasoning_items_by_id(items: &mut Vec<Value>) {
+    let mut deduped: Vec<Value> = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        let id = item.get("id").cloned();
+        match deduped
+            .iter_mut()
+            .find(|existing| id.is_some() && existing.get("id") == id.as_ref())
+        {
+            Some(existing) => *existing = item,
+            None => deduped.push(item),
+        }
+    }
+    *items = deduped;
 }
 
 fn sanitize_message_for_persisted_history_inner(
