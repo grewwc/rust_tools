@@ -191,6 +191,7 @@ pub(in crate::ai) fn delete_subagent_memory(memory_path: &Path) -> io::Result<()
 
 #[cfg(test)]
 pub(in crate::ai) use sqlite::read_context_history_sqlite;
+pub(in crate::ai) use sqlite::{read_image_digest_sqlite, upsert_image_digest_sqlite};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
 #[allow(unused_imports)]

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ai::cli::ParsedCli;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
@@ -625,11 +625,16 @@ fn consolidation_candidates(
 
 // 处理 consolidate 计划里的 merge 项：只为有效 merge（ids 非空且 merged_content 非空）
 // 生成新条目，并把对应源 IDs 自动并入删除集合，避免"旧条目 + 合并条目"并存。
+//
+// originals 提供 id -> 完整条目的查找表，用于**无损合并**：模型只看到截断预览，
+// 凭记忆重写的 merged_content 会丢细节；用户 memo 是不可再生的笔记数据，新条目
+// 必须 = 模型摘要 + 全部源条目原文，整理绝不压缩/丢失内容。
 fn build_consolidation_merge_entries(
     category: &str,
     source: Option<&str>,
     merge_plan: &[&serde_json::Value],
     eligible_ids: &FxHashSet<&str>,
+    originals: &FxHashMap<&str, &AgentMemoryEntry>,
 ) -> (
     FxHashSet<String>,
     usize,
@@ -653,13 +658,26 @@ fn build_consolidation_merge_entries(
             continue;
         }
 
+        // 无损合并：模型摘要在前，全部源条目原文在后，保证细节不丢。
+        let mut note = content.to_string();
+        let original_texts: Vec<&str> = ids
+            .iter()
+            .filter_map(|id| originals.get(*id))
+            .map(|entry| entry.note.trim())
+            .filter(|text| !text.is_empty())
+            .collect();
+        if !original_texts.is_empty() {
+            note.push_str("\n\n--- 原文保留（合并来源）---\n");
+            note.push_str(&original_texts.join("\n\n"));
+        }
+
         merged_count += ids.len();
         merge_delete_ids.extend(ids.iter().map(|id| (*id).to_string()));
         new_entries.push(crate::ai::tools::storage::memory_store::AgentMemoryEntry {
             id: Some(crate::ai::tools::service::memory::next_memory_id()),
             timestamp: chrono::Local::now().to_rfc3339(),
             category: category.into(),
-            note: content.to_string(),
+            note,
             tags: vec!["consolidated".into()],
             source: source.map(str::to_string),
             priority: Some(150),
@@ -685,8 +703,13 @@ async fn consolidate_scope(
         let id = entry.id.as_deref().unwrap_or("unknown");
         let prio = entry.priority.unwrap_or(100);
         let ts_short: String = entry.timestamp.chars().take(10).collect();
-        let preview: String = if entry.note.chars().count() > 40 {
-            entry.note.chars().take(40).collect::<String>() + "…"
+        // 预览用于模型做合并/删除决策。500 字已能覆盖绝大多数 memo；
+        // 超长条目明确标注截断。落库时合并项仍保留完整原文（见
+        // build_consolidation_merge_entries），预览截断不会造成内容丢失。
+        let note_len = entry.note.chars().count();
+        let preview: String = if note_len > 500 {
+            entry.note.chars().take(500).collect::<String>()
+                + &format!("…[truncated, total {} chars]", note_len)
         } else {
             entry.note.clone()
         };
@@ -700,6 +723,12 @@ async fn consolidate_scope(
             "text": preview,
         }));
     }
+
+    // id -> 完整条目：合并时把源 memo 全文拼进新条目，保证整理不丢内容。
+    let originals: FxHashMap<&str, &AgentMemoryEntry> = candidates
+        .iter()
+        .filter_map(|entry| entry.id.as_deref().map(|id| (id, *entry)))
+        .collect();
 
     let sys = format!(
         "You are a knowledge curator. Analyze only the current scope: {}. \
@@ -779,6 +808,7 @@ async fn consolidate_scope(
         scope.merged_source(),
         &merge_plan,
         &eligible_ids,
+        &originals,
     );
 
     // 模型输出只能影响当前批次的候选 ID，保证 memo 与其它类别不会互相删除或合并。
@@ -820,10 +850,10 @@ async fn consolidate_scope(
 
 /// 处理 --consolidate-knowledge：读取全部知识条目 → 模型分析 → 执行整理。
 ///
-/// **优化策略**（避免 60s 超时）：
+/// **优化策略**（避免超时 / 控制 token）：
 /// 1. 只分析优先级 < 200 的条目（≥200 受保护）
 /// 2. memo 与其它类别分别按时间倒序取**最近 15 条**，绝不混合整理
-/// 3. 每条内容截断到**40 字**（之前 80 字）
+/// 3. 每条预览截断到 **500 字**；但合并落库时把源 memo 全文拼进新条目（无损）
 /// 4. 用 JSON 数组格式（比文本格式更省 token）
 /// 5. 英文 system prompt（模型响应更快）
 ///
@@ -1419,11 +1449,41 @@ mod tests {
         let merge_plan_refs: Vec<&serde_json::Value> = merge_plan.iter().collect();
 
         let eligible_ids = FxHashSet::from_iter(["id_a", "id_b", "ignored"].into_iter());
+        // 源条目原文：合并后必须无损保留，不能只留模型摘要。
+        let entry_a = AgentMemoryEntry {
+            id: Some("id_a".to_string()),
+            timestamp: "2026-07-24T00:00:00Z".to_string(),
+            category: "memo".to_string(),
+            note: "完整原文A：详细的排障步骤与具体命令".to_string(),
+            tags: Vec::new(),
+            source: Some("cli_note".to_string()),
+            priority: Some(150),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+        let entry_b = AgentMemoryEntry {
+            id: Some("id_b".to_string()),
+            timestamp: "2026-07-24T00:00:00Z".to_string(),
+            category: "memo".to_string(),
+            note: "完整原文B：关键标识符与复现步骤".to_string(),
+            tags: Vec::new(),
+            source: Some("cli_note".to_string()),
+            priority: Some(150),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+        let originals = FxHashMap::from_iter([
+            ("id_a", &entry_a),
+            ("id_b", &entry_b),
+        ]);
         let (delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(
             "memo",
             Some("test"),
             &merge_plan_refs,
             &eligible_ids,
+            &originals,
         );
 
         assert_eq!(merged_count, 2);
@@ -1438,7 +1498,11 @@ mod tests {
                 .as_deref()
                 .is_some_and(|id| id.starts_with("mem_"))
         );
-        assert_eq!(new_entries[0].note, "合并后的内容");
+        // 无损合并：摘要 + 全部源原文。
+        assert_eq!(
+            new_entries[0].note,
+            "合并后的内容\n\n--- 原文保留（合并来源）---\n完整原文A：详细的排障步骤与具体命令\n\n完整原文B：关键标识符与复现步骤"
+        );
         assert_eq!(new_entries[0].tags, vec!["consolidated".to_string()]);
     }
 
@@ -1477,11 +1541,16 @@ mod tests {
             "merged_content": "合并后的 memo"
         })];
         let merge_plan_refs: Vec<&serde_json::Value> = merge_plan.iter().collect();
+        let originals: FxHashMap<&str, &AgentMemoryEntry> = candidates
+            .iter()
+            .filter_map(|entry| entry.id.as_deref().map(|id| (id, *entry)))
+            .collect();
         let (delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(
             "memo",
             Some("cli_note"),
             &merge_plan_refs,
             &eligible_ids,
+            &originals,
         );
 
         assert_eq!(merged_count, 2);
@@ -1491,5 +1560,9 @@ mod tests {
         assert_eq!(new_entries.len(), 1);
         assert_eq!(new_entries[0].category, "memo");
         assert_eq!(new_entries[0].source.as_deref(), Some("cli_note"));
+        // 无损合并：源 memo 全文必须保留在新条目里。
+        assert!(new_entries[0].note.contains("合并后的 memo"));
+        assert!(new_entries[0].note.contains("memo_a 内容"));
+        assert!(new_entries[0].note.contains("memo_b 内容"));
     }
 }

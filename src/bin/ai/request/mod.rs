@@ -38,6 +38,7 @@ pub(crate) use error::{
 pub(crate) use image_digest::{
     content_has_image, describe_image_for_digest, digest_instruction, parse_digest,
     strip_digest_blocks, swap_images_with_digest, DIGEST_BEGIN, DIGEST_END,
+    last_image_user_message_fingerprint, replace_old_images_with_persisted_digests,
 };
 pub(in crate::ai) use logging::TransientStatusLine;
 pub(in crate::ai) use logging::emit_request_diagnostic;

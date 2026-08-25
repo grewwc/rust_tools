@@ -1049,11 +1049,14 @@ fn build_system_prompt(
     // 非 skill 轮次的提问引导，只在默认交互路径注入：
     // skill 轮已有 request_user_input 交接协议，goal 模式要求自主推进，
     // background 模式终端已脱离，三种情况都不注入。
+    // 引导同时锚定反幻觉：结论依赖用户私有信息时，提问优先于猜测/编造，
+    // 但可自查的信息仍先用工具查，不因"可以问"而放弃自主调查。
     if skills.is_empty() && ctx.goal_mode.is_none() && !ctx.is_background {
         b.push(
             ContextKind::Behavior,
             "<asking_the_user>\n\
              - When you are genuinely blocked — a product decision only the user can make, missing required input, or a risky irreversible action — ask promptly instead of guessing, stalling, or silently picking a risky default.\n\
+             - When a consequential conclusion depends on information only the user can provide — intent, preferences, requirements, or unstated constraints — ask one focused question rather than answering from assumption or invention; first exhaust everything you can find and verify yourself with tools.\n\
              - Do not ask when you can reasonably decide: when several approaches are valid, choose the clearly safer, more local one and proceed. Routine details, reversible choices, and multi-step execution are yours to handle.\n\
              - Ask by ending your reply with a clear question in plain text, then wait for the user's answer.\n\
              </asking_the_user>",
@@ -1103,6 +1106,7 @@ fn build_system_prompt(
          - Before changing a shared symbol, API, config, data format, or embedded asset, locate relevant callers and dependents and assess semantic ripple; compilation and tests prove only covered behavior.\n\
          - In review or diagnosis work, report only consequences supported by traced evidence; keep unresolved hypotheses separate and distinguish introduced behavior from pre-existing behavior.\n\
          - Never use reset, checkout, restore, stash drop, or similar commands to discard existing changes, including staged changes, for testing or verification. For a clean state, use a temporary branch/worktree or stash push then pop; for a real rollback, explain why and get confirmation.\n\
+         - Write comments for a reader who only has the code, not the author who just had the conversation: every comment must be self-contained, including the rationale behind a non-obvious choice and any conditions it depends on. Never reference a discussion-only shorthand or codename (e.g. \"as discussed\", \"plan A\") without defining it in the comment; if a decision codename is worth keeping, state what was decided and why, or point to a repo doc that does.\n\
          </correctness_guardrails>",
     );
 
@@ -2461,6 +2465,21 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_requires_self_contained_comments() {
+        // Comments rule lives in correctness_guardrails (always-precedence
+        // section), not in an agent/skill manifest — it must render for every
+        // session regardless of active agent or skill.
+        let available = SkipSet::new(16);
+        let prompt =
+            build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+        assert!(prompt.contains("<correctness_guardrails>"));
+        assert!(prompt.contains("Write comments for a reader who only has the code"));
+        assert!(prompt.contains("Never reference a discussion-only shorthand or codename"));
+        assert!(prompt.contains("state what was decided and why"));
+    }
+
+    #[test]
     fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
         // Regression: the non-goal Scope Discipline block once dropped the
         // `\n\` line-continuation on two bullets, baking ~13 spaces of source
@@ -2584,6 +2603,7 @@ mod tests {
         )
         .render_system_prompt();
         assert!(interactive.contains("<asking_the_user>"));
+        assert!(interactive.contains("information only the user can provide"));
 
         let goal = build_system_prompt(
             Some(&build_agent),

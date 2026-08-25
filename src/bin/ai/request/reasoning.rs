@@ -136,7 +136,9 @@ pub(super) fn reconstruct_encrypted_reasoning_items_for_model(
     live: &rustc_hash::FxHashMap<String, Vec<Value>>,
 ) -> rustc_hash::FxHashMap<String, Vec<Value>> {
     let mut merged = live.clone();
-    if !models::reasoning_encrypted_replay_enabled(model) {
+    if !models::reasoning_encrypted_replay_enabled(model)
+        || !crate::ai::history::compress::encrypted_reasoning_replay_runtime_enabled()
+    {
         return merged;
     }
     for message in messages {
@@ -255,6 +257,7 @@ mod encrypted_replay_reconstruct_tests {
     use super::reconstruct_encrypted_reasoning_items_for_model;
     use crate::ai::history::Message;
     use crate::ai::history::compress::encode_encrypted_reasoning_replay_state;
+    use crate::ai::test_support::ENV_LOCK;
     use crate::ai::types::{FunctionCall, ToolCall};
     use rustc_hash::FxHashMap;
     use serde_json::{Value, json};
@@ -278,6 +281,7 @@ mod encrypted_replay_reconstruct_tests {
 
     #[test]
     fn rebuilds_items_from_encoded_history_for_encrypted_model() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let model = "muse-spark-1.2-contributor";
         let items = vec![json!({"type":"reasoning","encrypted_content":"ENC"})];
         let messages = vec![assistant_call_with_reasoning(
@@ -291,6 +295,7 @@ mod encrypted_replay_reconstruct_tests {
 
     #[test]
     fn live_side_channel_takes_precedence_over_history() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let model = "muse-spark-1.2-contributor";
         let stale = vec![json!({"encrypted_content":"OLD"})];
         let fresh = vec![json!({"encrypted_content":"NEW"})];
@@ -307,6 +312,7 @@ mod encrypted_replay_reconstruct_tests {
 
     #[test]
     fn non_encrypted_model_is_untouched() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let model = "glm-5.2-opencode";
         let items = vec![json!({"encrypted_content":"ENC"})];
         // 即便历史里带加密标记，非 encrypted-replay 模型也不重建（返回 live 原样）。
@@ -320,5 +326,40 @@ mod encrypted_replay_reconstruct_tests {
         let rebuilt =
             reconstruct_encrypted_reasoning_items_for_model(model, &messages, &FxHashMap::default());
         assert!(rebuilt.is_empty());
+    }
+
+    #[test]
+    fn runtime_disable_env_short_circuits_reconstruction() {
+        use crate::ai::history::compress::encrypted_reasoning_replay_runtime_enabled;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 保存并恢复进程级 env，避免污染并行测试。
+        let saved = std::env::var("AIOS_DISABLE_ENCRYPTED_REPLAY").ok();
+
+        // SAFETY: 单测内串行 set/remove 同一 key 并在结束前恢复；本测试不与其它
+        // 依赖该 env 的测试并行断言。
+        unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", "1") };
+        assert!(!encrypted_reasoning_replay_runtime_enabled());
+        let model = "muse-spark-1.2-contributor";
+        let items = vec![json!({"encrypted_content":"ENC"})];
+        let messages = vec![assistant_call_with_reasoning(
+            "call-1",
+            Some(encode_encrypted_reasoning_replay_state(model, &items)),
+        )];
+        // 关闭时即便模型 capable、历史有编码 blob，也不重建。
+        assert!(
+            reconstruct_encrypted_reasoning_items_for_model(model, &messages, &FxHashMap::default())
+                .is_empty()
+        );
+
+        unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", "0") };
+        assert!(encrypted_reasoning_replay_runtime_enabled());
+
+        unsafe { std::env::remove_var("AIOS_DISABLE_ENCRYPTED_REPLAY") };
+        assert!(encrypted_reasoning_replay_runtime_enabled());
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", v) },
+            None => unsafe { std::env::remove_var("AIOS_DISABLE_ENCRYPTED_REPLAY") },
+        }
     }
 }

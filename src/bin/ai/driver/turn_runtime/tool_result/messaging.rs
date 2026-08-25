@@ -950,6 +950,7 @@ pub(super) fn append_tool_result_messages_for_model(
     // 「带标记则跨压缩保留、按模型解码」的机制；空 items 时保持 None，行为不变。
     let raw_assistant = if !stream_reasoning_items.is_empty()
         && crate::ai::models::reasoning_encrypted_replay_enabled(source_model)
+        && crate::ai::history::compress::encrypted_reasoning_replay_runtime_enabled()
     {
         Message {
             reasoning_content: Some(

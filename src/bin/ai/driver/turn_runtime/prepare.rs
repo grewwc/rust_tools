@@ -347,7 +347,7 @@ pub(super) async fn prepare_turn(
     let history_summary_max_chars = app.config.history_summary_max_chars;
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
     let history = tokio::task::spawn_blocking(move || {
-        build_context_history(
+        let mut history = build_context_history(
             history_count,
             &history_file,
             history_max_chars,
@@ -356,7 +356,15 @@ pub(super) async fn prepare_turn(
             overflow_dir,
             cwd.as_deref(),
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        // 跨 turn 图片摘要：用历史元数据里持久化的摘要替换旧 turn 的原图，
+        // 避免新一轮把上一 turn 的图片重复发给模型（对所有 VL 模型一致）。
+        crate::ai::request::replace_old_images_with_persisted_digests(
+            &history_file,
+            &mut history,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok::<_, String>(history)
     })
     .await
     .map_err(|e| format!("context history task failed: {e}"))?

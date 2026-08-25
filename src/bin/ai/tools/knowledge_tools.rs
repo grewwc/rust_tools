@@ -39,10 +39,22 @@
 /// knowledge_consolidate(
 ///   action: "execute",
 ///   delete_ids: ["id1", "id2"],
-///   save_entries: [{ content: "合并后的内容", category: "user_memory", ... }]
+///   save_entries: [{
+///     content: "合并后的内容",
+///     category: "user_memory",
+///     source_ids: ["id1", "id2"],  // 合并来源条目，保证无损
+///     ...
+///   }]
 /// )
 /// ```
 /// 工具把删除和新增合成为一次原子重写，避免“先删后增”中途失败导致丢数。
+///
+/// ## 无损保证
+/// 模型只能看到条目的截断预览（`read_all` 每条最多 500 字），因此合并多条
+/// 已有条目时，必须通过 `save_entries[].source_ids` 指明被合并的源条目 ID。
+/// 工具会把源条目的**完整原文**追加到新条目（`--- 原文保留（合并来源）---`
+/// 之后），并自动把这些源 ID 并入删除集合（合并条目取代它们，避免重复并存）。
+/// 整理绝不压缩/丢失内容——只有显式 `delete_ids` 才算删除。
 ///
 /// ## 整理原则（Agent 自行判断）
 /// - **保留**：仍有参考价值的决策、偏好、项目信息、安全规则
@@ -481,9 +493,10 @@ fn read_all_entries() -> Result<String, String> {
             let entry_id = entry.id.as_deref().unwrap_or("N/A");
             let ts = &entry.timestamp;
             let prio = entry.priority.unwrap_or(100);
-            // 截断过长的内容用于预览
-            let preview: String = if entry.note.chars().count() > 200 {
-                entry.note.chars().take(200).collect::<String>()
+            // 截断过长的内容用于预览；落库时合并会保留完整原文
+            // （见 execute_consolidation 的 source_ids 无损合并），预览截断不丢失内容。
+            let preview: String = if entry.note.chars().count() > 500 {
+                entry.note.chars().take(500).collect::<String>()
                     + &format!(
                         "\n       …[truncated, total {} chars]",
                         entry.note.chars().count()
@@ -516,7 +529,7 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
 
     // 收集待删除的 ID
-    let delete_ids: Vec<String> = args["delete_ids"]
+    let mut delete_ids: Vec<String> = args["delete_ids"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -538,8 +551,17 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
     let mut report = String::new();
     report.push_str("📦 Consolidation report:\n");
 
+    // 无损合并：模型只看到截断预览（read_all 每条最多 500 字），save_entries[].source_ids
+    // 指明该新条目合并了哪些源条目；落库时把源条目的完整原文拼进新条目，绝不压缩/丢失内容。
+    let all_entries = store.all()?;
+    let originals: std::collections::HashMap<&str, &AgentMemoryEntry> = all_entries
+        .iter()
+        .filter_map(|entry| entry.id.as_deref().map(|id| (id, entry)))
+        .collect();
+
     // 构建待保存的新条目
     let mut new_entries: Vec<AgentMemoryEntry> = Vec::new();
+    let mut preserved_count = 0usize;
     for entry_val in &save_entries_raw {
         let content = entry_val["content"]
             .as_str()
@@ -559,11 +581,39 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
             .map(|p| p as u8)
             .unwrap_or(150);
 
+        // 无损合并：模型摘要在前，全部源条目原文在后；源 ID 自动并入删除集合，
+        // 由合并条目取代它们，避免"旧条目 + 合并条目"并存。
+        let mut note = content.to_string();
+        if let Some(source_ids) = entry_val["source_ids"].as_array() {
+            let mut preserved_originals: Vec<&str> = Vec::new();
+            for v in source_ids {
+                let Some(sid) = v.as_str() else { continue };
+                if let Some(src) = originals.get(sid) {
+                    let trimmed = src.note.trim();
+                    if !trimmed.is_empty() {
+                        preserved_originals.push(trimmed);
+                    }
+                    if !delete_ids.iter().any(|d| d == sid) {
+                        delete_ids.push(sid.to_string());
+                    }
+                } else {
+                    report.push_str(&format!(
+                        "   ⚠️ source_ids references unknown entry: {sid}\n"
+                    ));
+                }
+            }
+            if !preserved_originals.is_empty() {
+                note.push_str("\n\n--- 原文保留（合并来源）---\n");
+                note.push_str(&preserved_originals.join("\n\n"));
+                preserved_count += preserved_originals.len();
+            }
+        }
+
         new_entries.push(AgentMemoryEntry {
             id: Some(next_memory_id()),
             timestamp: Local::now().to_rfc3339(),
             category: category.to_string(),
-            note: content.to_string(),
+            note,
             tags,
             source,
             priority: Some(priority),
@@ -571,6 +621,13 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
             owner_pgid: None,
             image_path: None,
         });
+    }
+
+    if preserved_count > 0 {
+        report.push_str(&format!(
+            "   Preserved full original content from {preserved_count} source entr{} (lossless merge)\n",
+            if preserved_count == 1 { "y" } else { "ies" }
+        ));
     }
 
     let id_refs: Vec<&str> = delete_ids.iter().map(String::as_str).collect();
@@ -1078,6 +1135,91 @@ mod tests {
         );
         assert_eq!(entries[0].note, "merged memo");
         assert_eq!(entries[0].category, "user_memory");
+
+        cleanup_memory_artifacts(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn test_execute_consolidation_preserves_full_source_content() {
+        let _guard = env_lock_guard();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_knowledge_consolidate_lossless_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let long_note_1 = format!(
+            "文档链接 https://example.com/docs/{} 完整路径\n第一行细节\n第二行细节\n第三行细节",
+            "abc123xyz"
+        );
+        let long_note_2 = "另一条完整原文，模型在 read_all 里只能看到前 500 字预览\n第二行原文\n第三行原文";
+
+        let seed = [
+            AgentMemoryEntry {
+                id: Some("mem_src_1".to_string()),
+                timestamp: "2025-01-01T00:00:00Z".to_string(),
+                category: "user_memory".to_string(),
+                note: long_note_1.clone(),
+                tags: vec!["a".to_string()],
+                source: None,
+                priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
+                image_path: None,
+            },
+            AgentMemoryEntry {
+                id: Some("mem_src_2".to_string()),
+                timestamp: "2025-01-01T00:00:01Z".to_string(),
+                category: "user_memory".to_string(),
+                note: long_note_2.to_string(),
+                tags: vec!["b".to_string()],
+                source: None,
+                priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
+                image_path: None,
+            },
+        ];
+        let mut buf = String::new();
+        for entry in &seed {
+            buf.push_str(&serde_json::to_string(entry).unwrap());
+            buf.push('\n');
+        }
+        std::fs::write(&path, buf).unwrap();
+
+        // 只给 source_ids，不给 delete_ids：源条目应被自动删除并替换为合并条目。
+        let report = execute_consolidation(&serde_json::json!({
+            "save_entries": [{
+                "content": "合并后的简短摘要",
+                "category": "user_memory",
+                "tags": ["consolidated"],
+                "priority": 150,
+                "source_ids": ["mem_src_1", "mem_src_2"]
+            }]
+        }))
+        .unwrap();
+
+        assert!(report.contains("Deleted: 2 entries"));
+        assert!(report.contains("Saved: 1 new entries"));
+        assert!(report.contains("lossless merge"));
+
+        let entries: Vec<AgentMemoryEntry> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<AgentMemoryEntry>(line.trim()).ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        // 无损：新条目必须包含全部源条目的完整原文，而不是只有模型重写的摘要。
+        assert!(entries[0].note.contains(long_note_1.as_str()));
+        assert!(entries[0].note.contains(long_note_2));
+        assert!(entries[0].note.contains("--- 原文保留（合并来源）---"));
+        assert!(entries[0].note.starts_with("合并后的简短摘要"));
 
         cleanup_memory_artifacts(&path);
         unsafe {

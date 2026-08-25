@@ -462,6 +462,12 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             value TEXT NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
+        CREATE TABLE IF NOT EXISTS image_digests (
+            message_key TEXT PRIMARY KEY,
+            digest TEXT NOT NULL,
+            image_paths TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
         CREATE TABLE IF NOT EXISTS tool_execution_outcomes (
             tool_call_id TEXT PRIMARY KEY,
             execution_signature TEXT NOT NULL,
@@ -1665,6 +1671,81 @@ fn read_projected_canonical_messages_after_id(
 /// 返回模型上下文层：最近一次可替换压缩快照，加上快照水位之后的原始消息投影。
 /// 读取在同一个 SQLite 快照事务中完成，因此 `source_message_id` 精确描述返回值已经
 /// 消费到的 canonical 水位；并发追加会自然成为下一次读取的 tail，不会被快照吞掉。
+///
+/// 跨 turn 图片摘要：把某条含图用户消息的图片摘要写入历史元数据表。
+/// `message_key` 是消息内容的稳定指纹（见 `request::image_message_fingerprint`），
+/// 摘要随消息走：下个 turn 加载历史时用同一指纹取回，替换旧图片避免重复发送。
+pub(in crate::ai) fn upsert_image_digest_sqlite(
+    path: &Path,
+    message_key: &str,
+    digest: &str,
+    image_paths: &[String],
+) -> io::Result<()> {
+    if !blob::is_sqlite_path(path) {
+        return Ok(());
+    }
+    let encoded_paths =
+        serde_json::to_string(image_paths).map_err(|error| io::Error::other(error.to_string()))?;
+    with_session_state_lock(path, || {
+        let conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        conn.execute(
+            "INSERT INTO image_digests (message_key, digest, image_paths, created_at)
+             VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(message_key) DO UPDATE SET
+                 digest = excluded.digest,
+                 image_paths = excluded.image_paths,
+                 created_at = excluded.created_at",
+            params![message_key, digest, encoded_paths],
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(())
+    })
+}
+
+/// 跨 turn 图片摘要：按消息内容指纹读取持久化的图片摘要。
+/// 返回 (摘要文本, 原图路径)；历史库没有该表 / 没有该 key 时返回 None（保持原图语义）。
+pub(in crate::ai) fn read_image_digest_sqlite(
+    path: &Path,
+    message_key: &str,
+) -> io::Result<Option<(String, Vec<String>)>> {
+    if !blob::is_sqlite_path(path) || !path.exists() {
+        return Ok(None);
+    }
+    let conn = open_history_db_read_only(path)?;
+    let has_table = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'image_digests'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .unwrap_or(false);
+    if !has_table {
+        return Ok(None);
+    }
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT digest, image_paths FROM image_digests WHERE message_key = ?1 LIMIT 1",
+            params![message_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    row.map(|(digest, paths_json)| {
+        serde_json::from_str::<Vec<String>>(&paths_json)
+            .map(|paths| (digest, paths))
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid image digest paths metadata: {error}"),
+                )
+            })
+    })
+    .transpose()
+}
+
 pub(in crate::ai) fn read_context_history_sqlite(
     path: &Path,
     projection_fingerprint: &str,

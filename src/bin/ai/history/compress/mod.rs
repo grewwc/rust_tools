@@ -716,6 +716,15 @@ pub(in crate::ai) fn decode_reasoning_replay_for_model(
 pub(in crate::ai) const PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX: &str =
     "\u{1e}aios:reasoning-encrypted-replay:v1\u{1f}";
 
+/// 加密推理跨轮回放的运行时总开关。默认开启；设 `AIOS_DISABLE_ENCRYPTED_REPLAY=1`
+/// 时短路落库与请求端重建，用于对照实验复现"修复前"行为（跨轮/resume 丢失加密推理）。
+/// 仅作实验脚手架，不改变默认产品行为。
+pub(in crate::ai) fn encrypted_reasoning_replay_runtime_enabled() -> bool {
+    std::env::var("AIOS_DISABLE_ENCRYPTED_REPLAY")
+        .map(|v| v.trim().is_empty() || v == "0")
+        .unwrap_or(true)
+}
+
 /// 把本轮捕获的加密 reasoning items 连同来源模型编码进单个字符串，供落库到
 /// `reasoning_content`。带 model 标记：切换/回退到其他模型时，请求端解码会因
 /// 模型不匹配而丢弃，避免把 A 模型的加密状态误喂给 B 模型（provider 会 400）。

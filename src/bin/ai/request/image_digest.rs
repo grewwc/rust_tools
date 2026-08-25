@@ -17,8 +17,14 @@
 //! 2. 兜底：若第一轮没拿到，进入第二轮前发一次专门的、禁用工具的一次性请求，
 //!    强制拿到摘要（见 [`describe_image_for_digest`]）。
 
-use std::time::Duration;
+use std::{
+    hash::{Hash, Hasher},
+    io,
+    path::Path,
+    time::Duration,
+};
 
+use rustc_hash::FxHasher;
 use serde_json::{Value, json};
 
 use super::builder::{build_content, build_request_body};
@@ -153,6 +159,55 @@ pub(crate) fn swap_images_with_digest(
     }));
     *content = Value::Array(kept);
     true
+}
+
+/// 跨 turn 图片摘要：为含图用户消息内容计算稳定指纹（内容哈希），
+/// 用作历史元数据里摘要记录的消息键。同一消息在持久化与加载时内容不变，
+/// 指纹跨进程稳定，因此能可靠地把摘要对应回原消息。
+pub(crate) fn image_message_fingerprint(content: &Value) -> String {
+    let mut hasher = FxHasher::default();
+    content.to_string().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// 跨 turn 图片摘要：取 `messages` 里最后一条含图 user 消息内容的指纹
+/// （即要持久化摘要的那条）。
+pub(crate) fn last_image_user_message_fingerprint(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user" && content_has_image(&m.content))
+        .map(|m| image_message_fingerprint(&m.content))
+}
+
+/// 跨 turn 图片摘要：加载历史后，把带持久化摘要的旧图片消息替换为摘要文本。
+/// 只改请求投影（prepare 阶段刚载入的 history），canonical 数据库不动；
+/// 没有持久化摘要的消息保持原图（首次发送语义）。
+pub(crate) fn replace_old_images_with_persisted_digests(
+    history_file: &Path,
+    messages: &mut [Message],
+) -> io::Result<usize> {
+    if !messages
+        .iter()
+        .any(|m| m.role == "user" && content_has_image(&m.content))
+    {
+        return Ok(0);
+    }
+    let mut replaced = 0;
+    for m in messages
+        .iter_mut()
+        .filter(|m| m.role == "user" && content_has_image(&m.content))
+    {
+        let fp = image_message_fingerprint(&m.content);
+        if let Some((digest, paths)) =
+            crate::ai::history::read_image_digest_sqlite(history_file, &fp)?
+        {
+            if swap_images_with_digest(&mut m.content, &digest, &paths) {
+                replaced += 1;
+            }
+        }
+    }
+    Ok(replaced)
 }
 
 /// 兜底：发一次专门的、禁用工具的一次性 VL 请求，强制拿到图片摘要。
@@ -388,5 +443,102 @@ mod tests {
         assert!(swap_images_with_digest(&mut content, "摘要", &[]));
         // 已无图片，第二次替换应为 no-op（避免重复追加 digest）。
         assert!(!swap_images_with_digest(&mut content, "摘要", &[]));
+    }
+
+    fn test_msg(role: &str, content: Value) -> Message {
+        Message {
+            role: role.to_string(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn image_content(url: &str, question: &str) -> Value {
+        Value::Array(vec![
+            json!({ "type": "image_url", "image_url": { "url": url } }),
+            json!({ "type": "text", "text": question }),
+        ])
+    }
+
+    #[test]
+    fn image_message_fingerprint_stable_and_distinct() {
+        let a = image_content("data:image/png;base64,AAAA", "问题");
+        let b = image_content("data:image/png;base64,BBBB", "问题");
+        // 同一内容指纹稳定（跨进程可复现，用于历史元数据 key）。
+        assert_eq!(image_message_fingerprint(&a), image_message_fingerprint(&a));
+        // 不同图片内容指纹不同，避免摘要错配。
+        assert_ne!(image_message_fingerprint(&a), image_message_fingerprint(&b));
+    }
+
+    #[test]
+    fn last_image_user_message_fingerprint_targets_last_image_user() {
+        let first = image_content("data:image/png;base64,AAAA", "q1");
+        let second = image_content("data:image/png;base64,BBBB", "q2");
+        let msgs = vec![
+            test_msg("user", first.clone()),
+            test_msg("assistant", Value::String("a1".into())),
+            test_msg("user", second.clone()),
+        ];
+        // 取最后一条含图 user 消息（对应当前 turn 的图片）。
+        assert_eq!(
+            last_image_user_message_fingerprint(&msgs).as_deref(),
+            Some(image_message_fingerprint(&second).as_str())
+        );
+        // 没有图片 -> None。
+        assert_eq!(
+            last_image_user_message_fingerprint(&[test_msg("user", Value::String("无图".into()))]),
+            None
+        );
+    }
+
+    #[test]
+    fn persisted_digest_replaces_old_image_on_load() {
+        let db = std::env::temp_dir().join(format!(
+            "image_digest_roundtrip_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let content = image_content("data:image/png;base64,AAAA", "上一轮问题");
+        let mut msgs = vec![
+            test_msg("assistant", Value::String("上一轮回复".into())),
+            test_msg("user", content.clone()),
+            test_msg("user", Value::String("本轮新问题".into())),
+        ];
+        let fp = image_message_fingerprint(&content);
+        crate::ai::history::upsert_image_digest_sqlite(
+            &db,
+            &fp,
+            "顶部是标题栏，左侧是导航",
+            &["/tmp/shot.png".to_string()],
+        )
+        .expect("upsert digest");
+        // 加载时替换：带持久化摘要的旧图片换成摘要文本。
+        let replaced =
+            replace_old_images_with_persisted_digests(&db, &mut msgs).expect("replace");
+        assert_eq!(replaced, 1);
+        assert!(!content_has_image(&msgs[1].content));
+        let joined = msgs[1].content.to_string();
+        assert!(joined.contains("顶部是标题栏，左侧是导航"));
+        assert!(joined.contains("/tmp/shot.png"));
+        // 无图片的普通 user 消息不受影响。
+        assert_eq!(msgs[2].content, Value::String("本轮新问题".into()));
+
+        // 没有持久化摘要的图片消息保持原图（首次发送语义）。
+        let mut fresh = vec![test_msg(
+            "user",
+            image_content("data:image/png;base64,BBBB", "另一张"),
+        )];
+        let replaced_none =
+            replace_old_images_with_persisted_digests(&db, &mut fresh).expect("replace");
+        assert_eq!(replaced_none, 0);
+        assert!(content_has_image(&fresh[0].content));
+
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(db.with_file_name(format!(
+            ".{}.state.lock",
+            db.file_name().unwrap().to_string_lossy()
+        )));
     }
 }

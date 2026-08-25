@@ -1002,6 +1002,10 @@ async fn run_turn_body(
     // 摘要而按用户决定保留原图——两种情况都不再每轮重试，避免反复发兜底请求。
     let mut pending_digest_source: Option<String> = None;
     let mut image_digest_resolved = false;
+    // 跨 turn 图片摘要：记录本轮解析出的摘要（内容指纹, 摘要, 原图路径），
+    // turn 正常结束时持久化进历史元数据表，下个 turn 加载历史时用同一指纹
+    // 取回摘要并替换旧图片，避免新一轮重复发送上一 turn 的图片。
+    let mut turn_digest: Option<(String, String, Vec<String>)> = None;
     // preflight 拒绝的 mutation 目标必须在本 turn 后续每次 prompt 重建时优先获得
     // scoped 指令预算；不能只消费一次，因为中间读取和 mid-turn 压缩可能让同一
     // mutation 的目标从可观测历史消失，继而被重复暂停。
@@ -1016,11 +1020,11 @@ async fn run_turn_body(
         // 放在 mcp 锁块之前：兜底请求含 .await，绝不能跨 std::Mutex 持锁。
         if !image_digest_resolved && iteration >= 2 {
             // 只处理「当前 turn」的用户图片：用 rposition 取最后一条含图 user 消息。
-            // messages 头部可能载入历史里更早 turn 的图片（若未被压缩外溢），但我们
-            // 采集/生成的摘要只描述当前 turn 的图片（指令注入在当前 user 消息、兜底用
-            // app.attached_image_files=当前 turn），拿它去替换旧图会张冠李戴。旧 turn
-            // 图片本就由压缩的 spill 外溢到文件，当前 turn 图片才是被 spill 豁免、每轮
-            // 重放的那张，正是要换掉的目标。
+            // messages 头部可能载入历史里更早 turn 的图片（只有无持久化摘要的旧图，
+            // 如老会话；有摘要的已在 prepare 阶段被替换成文本），但我们采集/生成的
+            // 摘要只描述当前 turn 的图片（指令注入在当前 user 消息、兜底用
+            // app.attached_image_files=当前 turn），拿它去替换旧图会张冠李戴。这里要
+            // 换掉的是当前 turn 这张原图——它在请求投影里每轮重放，正是 digest 的目标。
             if let Some(idx) = messages.iter().rposition(|m| {
                 m.role == "user" && crate::ai::request::content_has_image(&m.content)
             }) {
@@ -1045,6 +1049,19 @@ async fn run_turn_body(
                         &digest,
                         &image_paths,
                     );
+                    // 跨 turn 摘要：把本轮摘要记入 turn_digest，等 turn 正常结束时
+                    // 持久化进历史元数据（见下方 Ok(_) 分支），下个 turn 加载历史时
+                    // 用指纹取回摘要替换旧图，避免跨 turn 重复发图。
+                    // 指纹必须取自 turn_messages（canonical）而非刚替换的 messages[idx]：
+                    // 请求投影里带着注入的图片处理协议指令 / reminder，那些 part 不落库，
+                    // 加载侧（replace_old_images_with_persisted_digests）对库里持久化的
+                    // 原样内容算指纹，只有 canonical 版本才对得上。turn_messages 无含图
+                    // user 消息（resume turn 丢图等）时静默跳过，不持久化。
+                    if let Some(fp) =
+                        crate::ai::request::last_image_user_message_fingerprint(&turn_messages)
+                    {
+                        turn_digest = Some((fp, digest, image_paths));
+                    }
                 }
                 image_digest_resolved = true;
             } else {
@@ -1771,6 +1788,27 @@ async fn run_turn_body(
             Ok(outcome)
         }
         Ok(_) => {
+            // 跨 turn 图片摘要持久化（仅 turn 正常完成路径；打断/退出/报错分支不执行，
+            // 摘要丢弃，下轮会重发原图一次）。工具循环内解析到的摘要已记入 turn_digest；
+            // 单轮响应（无工具循环）时摘要块不执行，退而解析最终回复文本里的摘要。
+            let mut digest_to_persist = turn_digest.take();
+            if digest_to_persist.is_none() {
+                if let Some(digest) = crate::ai::request::parse_digest(&final_assistant_text) {
+                    if let Some(fp) =
+                        crate::ai::request::last_image_user_message_fingerprint(&turn_messages)
+                    {
+                        digest_to_persist = Some((fp, digest, app.attached_image_files.clone()));
+                    }
+                }
+            }
+            if let Some((fp, digest, paths)) = digest_to_persist {
+                let _ = crate::ai::history::upsert_image_digest_sqlite(
+                    &app.session_history_file,
+                    &fp,
+                    &digest,
+                    &paths,
+                );
+            }
             finalize_turn(
                 app,
                 &next_model,
