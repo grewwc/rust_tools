@@ -199,7 +199,14 @@ impl PromptEditor {
         }
         match self.read_multi_line_tui() {
             Ok(input) => Ok(input),
-            Err(err) if Self::is_cursor_position_timeout(&err) => self.read_multi_line_no_tty(),
+            Err(err) if Self::is_cursor_position_timeout(&err) => {
+                // TUI 初始化失败（如 ratatui 内部的光标位置查询 \x1b[6n 超时）后降级到
+                // 无 TUI 读取。迟到的 CPR 应答（如 \x1b[17;1R）可能已残留在 stdin 输入
+                // 缓冲：它既会在 cooked 模式下被回显，也会污染兜底读取的首行内容。
+                // 先丢弃这些残留字节再读取。
+                crate::ai::driver::input::clear_stdin_buffer();
+                self.read_multi_line_no_tty()
+            }
             Err(err) => Err(err),
         }
     }
@@ -211,14 +218,24 @@ impl PromptEditor {
     }
 
     fn read_multi_line_no_tty(&mut self) -> io::Result<Option<String>> {
+        use std::io::IsTerminal;
         self.notify_first_render();
         // 非 TTY 无法交互编辑：有预填且无管道输入时，直接返回预填原文。
         let prefill = self.pending_prefill.take();
         let _ = self.pending_status_msg.take();
         let stdin = io::stdin();
         let mut lines = Vec::new();
-        for line in stdin.lock().lines() {
-            lines.push(line?);
+        if stdin.is_terminal() {
+            // 从 TUI 降级到这里的场景下（如光标位置查询超时），stdin 仍是交互式 tty：
+            // EOF 永远不会到来，按行读到 EOF 会永久卡住、无法进入下一轮输入。读一行即返回。
+            if let Some(line) = stdin.lock().lines().next() {
+                lines.push(line?);
+            }
+        } else {
+            // 管道/重定向输入：按行消费全部内容直到 EOF。
+            for line in stdin.lock().lines() {
+                lines.push(line?);
+            }
         }
         if lines.is_empty() {
             return Ok(prefill);
