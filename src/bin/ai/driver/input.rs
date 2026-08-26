@@ -1596,7 +1596,7 @@ mod tests {
         let archive_path = root.join("overflow-history.md");
         std::fs::write(
             &archive_path,
-            "# 溢出对话历史\n\n---\n\n## 用户\n\nfirst archived user input\n\n## 助手\n\narchived answer\n\n## 用户\n\nsecond archived user input\n",
+            "# Overflow History Archive\n\n---\n\n## User\n\nfirst archived user input\n\n## Assistant\n\narchived answer\n\n## User\n\nsecond archived user input\n",
         )
         .unwrap();
 
@@ -1610,7 +1610,8 @@ mod tests {
             &history_path,
             &[
                 test_message("internal_note", &archive_note),
-                // 旧会话可能重复保存同一个回指，完整历史只能展开一次。
+                // Legacy sessions may persist the same archive back-pointer twice; the
+                // full history can only be expanded once.
                 test_message("internal_note", &archive_note),
                 test_message("user", "current inline user input"),
             ],

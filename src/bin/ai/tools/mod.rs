@@ -47,18 +47,10 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
 ];
 
 // Process-level allowlist needs to retain the full self-service capability above, but the manifest's resident schema only restores
-// the real execution baseline; skill discovery tools continue to be loaded on demand via `enable_tools`.
+// the real execution baseline; skill discovery, task orchestration, and knowledge tools are loaded on demand via `enable_tools`.
 const EAGER_BASELINE_TOOL_NAMES: &[&str] = &[
     "enable_tools",
     "read_file",
-    "task",
-    "task_spawn",
-    "task_spawn_batch",
-    "task_retry",
-    "task_wait",
-    "task_status",
-    "task_evidence_read",
-    "task_integrate",
 ];
 
 pub(crate) fn baseline_tool_names() -> &'static [&'static str] {

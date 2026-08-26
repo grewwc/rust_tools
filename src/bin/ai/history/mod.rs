@@ -45,7 +45,7 @@ pub(in crate::ai) use compress::value_to_string;
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::{
     is_summary_note_text, message_billable_chars, messages_total_chars_pub, mid_turn_compress,
-    mid_turn_llm_summarize,
+    mid_turn_llm_summarize, truncate_last_real_user_message_to_fit,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use markdown::{messages_to_markdown, messages_to_markdown_capped};

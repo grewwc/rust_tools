@@ -1,0 +1,16 @@
+{
+    "key": "glm-5.3-flash",
+    "name": "glm-5.3-flash",
+    "adapter": "opencode",
+    "quality_tier": "strong",
+    "is_vl": true,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true,
+    "reasoning_content_replay": true,
+    "subagent_priority": 85,
+    "default_reasoning_effort": "max",
+    "context_window_tokens": 262144,
+    "max_output_tokens": 131072,
+    "endpoint": "https://opencode.ai/zen/go/v1/chat/completions"
+}

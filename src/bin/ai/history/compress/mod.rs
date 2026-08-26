@@ -290,6 +290,10 @@ pub(super) fn content_sha256_hex(content: &[u8]) -> String {
 pub(super) struct OverflowSink {
     path: PathBuf,
     buffer: String,
+    /// Offset just past the leading file header / batch separator written by
+    /// `start_batch`; everything from here on is the stable batch payload used
+    /// for byte-identical dedup in `flush`.
+    payload_offset: usize,
 }
 
 impl OverflowSink {
@@ -298,20 +302,24 @@ impl OverflowSink {
         Self {
             path,
             buffer: String::new(),
+            payload_offset: 0,
         }
     }
 
     fn start_batch(&mut self, title: &str) {
         if self.buffer.is_empty() {
-            // 仅在归档文件尚未存在时写入头部说明；后续调用走 append 模式追加新批次。
-            // 每个新批次再加一个分隔行，方便人工/工具分块读取。
+            // Write the header only while the archive file does not exist yet;
+            // later flushes run in append mode and add new batches only.
+            // Each batch is preceded by a separator line so humans and tools can
+            // read the file in blocks.
             if !self.path.exists() {
                 self.buffer.push_str(
-                    "# 溢出对话历史\n\n以下内容因超出上下文窗口而被移出，模型可使用 read_file 工具读取此文件回顾。\n\n---\n\n",
+                    "# Overflow History Archive\n\nThe content below was moved out of the context window; use the read_file tool to read this file back when earlier context is needed.\n\n---\n\n",
                 );
             } else {
                 self.buffer.push_str("\n---\n\n");
             }
+            self.payload_offset = self.buffer.len();
         }
         if !title.trim().is_empty() {
             self.buffer.push_str("## ");
@@ -324,22 +332,22 @@ impl OverflowSink {
         if messages.is_empty() {
             return;
         }
-        self.start_batch("移出消息原文");
+        self.start_batch("Removed messages (verbatim)");
         for msg in messages {
             let text = value_to_string(&msg.content);
             match msg.role.as_str() {
                 "user" => {
-                    self.buffer.push_str("## 用户\n\n");
+                    self.buffer.push_str("## User\n\n");
                     self.buffer.push_str(&text);
                     self.buffer.push_str("\n\n");
                 }
                 "assistant" => {
-                    self.buffer.push_str("## 助手\n\n");
+                    self.buffer.push_str("## Assistant\n\n");
                     self.buffer.push_str(&text);
                     self.buffer.push_str("\n\n");
                 }
                 "tool" => {
-                    self.buffer.push_str("### 工具结果\n\n");
+                    self.buffer.push_str("### Tool result\n\n");
                     self.buffer.push_str(&text);
                     self.buffer.push_str("\n\n");
                 }
@@ -368,8 +376,8 @@ impl OverflowSink {
         let Some(original) = field.original_text(message) else {
             return false;
         };
-        self.start_batch("截断字段原文");
-        self.buffer.push_str("### 字段原文\n\n");
+        self.start_batch("Truncated field original text");
+        self.buffer.push_str("### Field original text\n\n");
         self.buffer.push_str("- role: ");
         self.buffer.push_str(&message.role);
         self.buffer.push('\n');
@@ -381,9 +389,9 @@ impl OverflowSink {
         self.buffer.push_str("- field: ");
         self.buffer.push_str(&field.archive_label());
         self.buffer.push_str("\n\n");
-        self.buffer.push_str("原文开始\n");
+        self.buffer.push_str("Begin original text\n");
         self.buffer.push_str(&original);
-        self.buffer.push_str("\n原文结束\n\n");
+        self.buffer.push_str("\nEnd original text\n\n");
         self.push_raw_message_json(message);
         true
     }
@@ -395,10 +403,29 @@ impl OverflowSink {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // Append mode keeps every historical batch forever. Repeated reactive
+        // rescues rebuild the same projection from unchanged canonical history,
+        // so they can re-archive byte-identical truncated-field payloads each
+        // round and grow this file once per round. Verify-before-append: when
+        // the pending payload already exists verbatim in the file, skip the
+        // write yet still report success — callers only rely on the archived
+        // bytes being readable back from file_path(). Read or UTF-8 failures
+        // fall through to a plain append (the previous behavior).
+        let already_archived = std::fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .is_some_and(|existing| {
+                let payload_start = self.payload_offset.min(self.buffer.len());
+                existing.contains(&self.buffer[payload_start..])
+            });
+        if already_archived {
+            return true;
+        }
         use std::io::Write;
-        // append 模式：避免每次压缩都把之前归档的更早历史覆盖丢失。
-        // 之前用 File::create 会清空文件，导致同一会话经历多轮压缩后只剩
-        // 最后一次 flush 的内容，长期记忆退化为短期记忆。
+        // Append mode: a later compress pass must never wipe what earlier
+        // passes archived. File::create would truncate the file, leaving only
+        // the final pass's batches and degrading long-term memory into
+        // short-term memory across multi-pass sessions.
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -426,8 +453,10 @@ pub(super) fn archive_messages_to_overflow(
         .then(|| sink.file_path().to_string_lossy().to_string())
 }
 
-/// 内部注记可能是折叠证据、恢复指令或运行时持久状态，不能静默删除。每条按
-/// 内容指纹写入独立文件，重复压缩只复用同一路径，不会 append 同一正文。
+/// Internal notes may hold folded evidence, recovery instructions, or runtime
+/// persisted state, so they must never be dropped silently. Each note is written
+/// to its own content-addressed file, so repeated compression rounds reuse the
+/// same path instead of appending the same body again.
 fn archive_internal_notes_deduplicated(
     messages: &[Message],
     overflow_dir: Option<&Path>,
@@ -446,7 +475,7 @@ fn archive_internal_notes_deduplicated(
     for message in notes {
         let raw_json = serde_json::to_string_pretty(message).map_err(|_| ())?;
         let body = format!(
-            "# 内部上下文注记原文\n\n{}\n\nraw_message_json:\n```json\n{}\n```\n",
+            "# Internal context note (verbatim)\n\n{}\n\nraw_message_json:\n```json\n{}\n```\n",
             value_to_string(&message.content),
             raw_json
         );
@@ -1713,10 +1742,16 @@ fn truncate_mutable_messages_to_fit_with_policy(
                 break;
             };
             let reduce_by = excess.min(reducible).max(1);
-            if !truncate_mutable_field(&mut messages[message_index], field, reduce_by, overflow_dir)
-            {
-                // 固定 marker / 归档路径可能已经是字段能达到的最小形态。
-                // 跳过无进展字段继续尝试其它候选，避免反复选择同一字段。
+            if !truncate_mutable_field(
+                &mut messages[message_index],
+                field,
+                reduce_by,
+                overflow_dir,
+                FieldArchivePolicy::BestEffort,
+            ) {
+                // A fixed marker / archive path may already be the smallest
+                // form the field can reach. Skip the no-progress field and try
+                // other candidates instead of re-selecting the same one.
                 blocked_fields.insert((message_index, field));
                 continue;
             }
@@ -1775,6 +1810,7 @@ fn emergency_cap_messages_to_fit(
                 MutableMessageField::Content,
                 content_chars - per_field_cap,
                 overflow_dir,
+                FieldArchivePolicy::BestEffort,
             );
         }
         if let Some(reasoning_chars) = message
@@ -1789,6 +1825,7 @@ fn emergency_cap_messages_to_fit(
                 MutableMessageField::Reasoning,
                 reasoning_chars - per_field_cap,
                 overflow_dir,
+                FieldArchivePolicy::BestEffort,
             );
         }
         let tool_call_count = message.tool_calls.as_ref().map(Vec::len).unwrap_or(0);
@@ -1805,6 +1842,7 @@ fn emergency_cap_messages_to_fit(
                     MutableMessageField::ToolArguments(call_index),
                     argument_chars - per_field_cap,
                     overflow_dir,
+                FieldArchivePolicy::BestEffort,
                 );
             }
         }
@@ -1867,31 +1905,37 @@ fn choose_larger_mutable_field(
 const CONTEXT_OVERFLOW_TRUNCATED_PREFIX: &str = "[context-overflow-truncated]";
 const CONTEXT_OVERFLOW_UNARCHIVED_POINTER: &str = "[context-overflow-truncated] full original was not archived; inline preview omitted to meet context budget.";
 
-/// 判断文本是否已经是 overflow-truncated stub。无论原文是否成功落盘，它都不能在
-/// 后续压缩中被当成原文重新归档，否则会把仅存的预览误标为可完整回读的原文。
+/// Whether text already has the overflow-truncated marker.
 fn is_context_overflow_truncated_stub(text: &str) -> bool {
     text.trim_start()
         .starts_with(CONTEXT_OVERFLOW_TRUNCATED_PREFIX)
 }
 
-/// 将已存在的 overflow-truncated stub 折叠为最小终态：有归档时保留路径；无归档
-/// 时明确说明完整原文不可回读，不能伪造归档指针。
-fn build_context_overflow_pointer(text: &str, target: usize) -> Option<String> {
-    let path = text
-        .lines()
+/// Extract the `archived at: <path>` target embedded in an overflow stub, if
+/// any. The canonical form puts the pointer on the first line; a legacy inline
+/// form cuts the path at `;` or end of line.
+fn embedded_archive_path(text: &str) -> Option<&str> {
+    text.lines()
         .find_map(|line| line.split_once("archived at: ").map(|(_, p)| p.trim()))
         .or_else(|| {
             text.split_once("archived at: ")
                 .map(|(_, rest)| rest.split([';', '\n']).next().unwrap_or(rest).trim())
-        });
+        })
+}
+
+/// Fold an existing overflow-truncated stub into its minimal terminal state:
+/// keep the archive path when one exists; when none exists, state plainly that
+/// the full original is not readable back, never fabricate an archive pointer.
+fn build_context_overflow_pointer(text: &str, target: usize) -> Option<String> {
+    let path = embedded_archive_path(text);
     if let Some(path) = path {
-        // 优先尝试保留预览的完整形态（若 target 足够大）。
+        // Prefer the full pointer form when it fits the target.
         let full_pointer =
             format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} full original archived at: {path}\n");
         if full_pointer.chars().count() <= target {
             return Some(full_pointer);
         }
-        // target 仍然不够：只保留单行路径指针（无预览、无冗余文案）。
+        // Otherwise keep only the single-line archive pointer.
         let minimal = format!("{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} archived at: {path}");
         return (minimal.chars().count() < text.chars().count()).then_some(minimal);
     }
@@ -1900,8 +1944,9 @@ fn build_context_overflow_pointer(text: &str, target: usize) -> Option<String> {
     .then(|| CONTEXT_OVERFLOW_UNARCHIVED_POINTER.to_string())
 }
 
-/// 已截断的 tool arguments 同样是终态。归档失败后只有 preview 留在上下文里，不能在
-/// 后续压缩中把它重新写盘并谎称保存了完整原始 arguments。
+/// Truncated tool arguments are terminal too. When archiving failed, only the
+/// preview remains; re-archiving it would falsely claim the full arguments are
+/// recoverable.
 fn is_context_overflow_truncated_tool_arguments(arguments: &str) -> bool {
     serde_json::from_str::<Value>(arguments)
         .ok()
@@ -1945,15 +1990,33 @@ fn build_context_overflow_tool_arguments_pointer(arguments: &str, target: usize)
         .then_some(pointer)
 }
 
+/// Archive-write policy for [`truncate_mutable_field`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldArchivePolicy {
+    /// On archive-write failure, still truncate to a preview-only inline stub.
+    /// Acceptable for rebuildable assistant/tool fields: losing the full text
+    /// costs precision, not the user's instruction.
+    BestEffort,
+    /// The field is the authoritative copy of a user instruction. Archive it
+    /// through the trusted session sink before every truncation, including
+    /// re-collapsing marker-prefixed text; never trust a path from its content.
+    /// Refuse without mutation when that write fails.
+    Required,
+}
+
 fn truncate_mutable_field(
     message: &mut Message,
     field: MutableMessageField,
     reduce_by: usize,
     overflow_dir: Option<&Path>,
+    archive_policy: FieldArchivePolicy,
 ) -> bool {
-    // 归档路径可由 overflow_dir 直接推导（与 OverflowSink::new 同源），因此先以该
-    // 路径完成尺寸判定、真正归档放最后：若 stub 不会严格短于原文，直接放弃，避免
-    // 「先归档后判定失败」导致同一字段每轮压缩重复归档、溢出文件无界增长。
+    // The archive path can be derived directly from overflow_dir (same source
+    // as OverflowSink::new), so size the stub against that path first and do
+    // the real archive write last: if the stub would not be strictly shorter
+    // than the original, give up immediately instead of archiving first and
+    // failing the size check afterwards (which would re-archive the same field
+    // every compression round and grow the overflow file without bound).
     let archive_path_hint: Option<String> = overflow_dir.map(|dir| {
         dir.join(OVERFLOW_HISTORY_FILENAME)
             .to_string_lossy()
@@ -1967,10 +2030,40 @@ fn truncate_mutable_field(
             let text = value_to_string(&message.content);
             let original_chars = text.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
-            // 字段已经是 overflow-truncated marker（归档已存在，路径内嵌在文本中）：
-            // 无需再次落盘，允许折叠为最小指针（marker + 路径，无预览），避免
-            // PATH_C_PER_MSG_CAP(8000) > hard_target(如 5000) 时内层无法继续收敛。
+            // BestEffort fields may reuse an embedded archive path. Required
+            // fields take the trusted re-archive path below instead.
             if is_context_overflow_truncated_stub(&text) {
+                // A Required field is authoritative user input. Never trust an
+                // `archived at:` path embedded in that user-controlled text:
+                // it may name an unrelated existing file. First prove that the
+                // trusted session sink can produce a shorter pointer, then
+                // archive the entire current field and point only at the path
+                // returned by that successful write.
+                if archive_policy == FieldArchivePolicy::Required {
+                    let pointer_for_path = |path: &str| {
+                        let canonical = format!(
+                            "{CONTEXT_OVERFLOW_TRUNCATED_PREFIX} full original archived at: {path}"
+                        );
+                        build_context_overflow_pointer(&canonical, target)
+                            .filter(|pointer| pointer.chars().count() < original_chars)
+                    };
+                    let Some(path_hint) = archive_path_hint.as_deref() else {
+                        return false;
+                    };
+                    if pointer_for_path(path_hint).is_none() {
+                        return false;
+                    }
+                    let Some(archive_file_path) =
+                        archive_truncated_field_to_overflow(message, field, overflow_dir)
+                    else {
+                        return false;
+                    };
+                    let Some(pointer) = pointer_for_path(&archive_file_path) else {
+                        return false;
+                    };
+                    message.content = Value::String(pointer);
+                    return true;
+                }
                 if let Some(pointer) = build_context_overflow_pointer(&text, target) {
                     if pointer.chars().count() < original_chars {
                         message.content = Value::String(pointer);
@@ -1979,10 +2072,13 @@ fn truncate_mutable_field(
                 }
                 return false;
             }
-            // 预览预算不足时 stub 只剩长路径、不含任何实际内容（假截断）：
-            // 小结果（如 task_status 轮询结果）被换成空预览 stub 后模型无法判断
-            // 真实状态，会陷入「状态确认不了 → 无限轮询」死循环。宁可保留原文
-            // 交给硬预算兜底，也不产出无信息 stub。
+            // When the preview budget is too small, the stub would be only a
+            // long path with no actual content (a fake truncation): a small
+            // result (e.g. a task_status poll) turned into an empty-preview
+            // stub leaves the model unable to judge the real state and can
+            // trap it in a "cannot confirm status → poll forever" loop. Keep
+            // the original and let the hard budget bail out instead of
+            // producing an information-free stub.
             const MIN_CONTENT_PREVIEW_CHARS: usize = 32;
             let build_truncated = |path: Option<&str>| -> Option<String> {
                 let prefix = path
@@ -2008,10 +2104,19 @@ fn truncate_mutable_field(
             else {
                 return false;
             };
-            // 仅当归档形式能保留足量 preview 时才截断；归档实际失败后才降级到
-            // 无路径内联 stub，避免把正常的长路径归档降格为不可回读的预览。
+            // Truncate only when the archived form keeps a meaningful preview;
+            // only after the archive write actually failed may we degrade to
+            // the no-path inline stub, so a good archive is never downgraded
+            // to an unreadable preview.
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
+            // Required policy (current user instruction): without an archived
+            // copy the preview-only stub would be the last surviving version of
+            // the instruction and could never be read back. Refuse and keep
+            // the original so the caller can surface the error.
+            if archive_file_path.is_none() && archive_policy == FieldArchivePolicy::Required {
+                return false;
+            }
             let truncated = build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
             message.content = Value::String(truncated);
             true
@@ -2020,15 +2125,16 @@ fn truncate_mutable_field(
             let Some(reasoning) = message.reasoning_content.as_deref() else {
                 return false;
             };
-            // exact replay payload 必须逐字回放；保留 marker 却截断 payload 会令请求层
-            // 解码失败。调用方应改裁其它字段，或在无法达标时保留该协议状态。
+            // Exact replay payloads must remain byte-for-byte intact. Keeping
+            // the marker while truncating its payload would break decoding in
+            // the request layer, so callers must shrink another field instead.
             if reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX) {
                 return false;
             }
             let original_chars = reasoning.chars().count();
             let target = original_chars.saturating_sub(reduce_by).max(160);
-            // 与 Content 分支对称：预览预算被长归档路径吃光时 stub 不含任何实际内容
-            // （假截断），模型无法据此判断推理状态，应拒绝截断保留原文交给硬预算兜底。
+            // As in Content, reject a stub whose long archive path leaves no
+            // meaningful preview; keep the original for the hard-budget path.
             const MIN_REASONING_PREVIEW_CHARS: usize = 32;
             let build_truncated = |path: Option<&str>| -> Option<String> {
                 let prefix = path
@@ -2052,6 +2158,11 @@ fn truncate_mutable_field(
             };
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
+            // Required policy: an unarchived stub must never replace the only
+            // copy of the field; refuse so the caller keeps the original.
+            if archive_file_path.is_none() && archive_policy == FieldArchivePolicy::Required {
+                return false;
+            }
             let truncated = build_truncated(archive_file_path.as_deref()).unwrap_or(truncated);
             message.reasoning_content = Some(truncated);
             true
@@ -2083,15 +2194,11 @@ fn truncate_mutable_field(
                 call.function.arguments = pointer;
                 return true;
             }
-            // 固定 JSON 前缀 + 长归档路径可能吃光全部 target 预算（fixed_chars >=
-            // target 时 preview_budget 直接为 0）。此时拒绝截断：完整原文仍比没有
-            // 回读入口的极短预览更有价值。preview 为空（或仅剩 1~2 个字符）的 stub
-            // 不含任何实际参数信息，模型会把
-            // `_context_overflow_truncated` / `archive_file_path` / `preview` 这些
-            // 协议 key 误当成真实参数名回发，形成「stub 参数 → 工具返回指针 → 再发
-            // stub 参数」的死循环。此处只拦空/近乎空的 preview；对巨大 arguments，
-            // 即便长路径吃掉大半预算，剩下几十上百字符的 preview 仍能锚定 file_path
-            // 等关键信息，属于有效截断，不应拒绝。
+            // A fixed JSON prefix plus a long archive path can consume the
+            // entire target. Reject empty or near-empty previews: they contain
+            // no real argument data and can make the model replay protocol keys
+            // as tool arguments. Larger previews remain useful even when the
+            // path consumes much of the budget.
             const MIN_TOOL_ARGS_PREVIEW_CHARS: usize = 8;
             let build_truncated = |path: Option<&str>, preview: String| {
                 serde_json::json!({
@@ -2107,7 +2214,8 @@ fn truncate_mutable_field(
                 let mut preview_budget = target.saturating_sub(fixed_chars);
                 let mut preview_text = keep_ends_by_chars(&arguments, preview_budget);
                 let mut candidate = build_truncated(path, preview_text.clone());
-                // JSON escaping 可能让一个预览字符占用多个序列化字符，按实际超额收紧。
+                // JSON escaping can expand characters; tighten by the measured
+                // serialized excess.
                 while candidate.chars().count() > target && preview_budget > 0 {
                     let excess = candidate.chars().count() - target;
                     preview_budget = preview_budget.saturating_sub(excess.max(1));
@@ -2123,7 +2231,13 @@ fn truncate_mutable_field(
             };
             let archive_file_path =
                 archive_truncated_field_to_overflow(message, field, overflow_dir);
-            // 写盘失败时重新按无路径 stub 计算 preview，避免无效路径白白挤掉上下文。
+            // Required policy: an unarchived stub must never replace the only
+            // copy of the field; refuse so the caller keeps the original.
+            if archive_file_path.is_none() && archive_policy == FieldArchivePolicy::Required {
+                return false;
+            }
+            // Recompute the preview against the no-path stub after the archive
+            // write failed, so a dead path does not eat the preview budget.
             let truncated = build_candidate(archive_file_path.as_deref()).unwrap_or(truncated);
             let Some(call) = message
                 .tool_calls
@@ -2132,7 +2246,8 @@ fn truncate_mutable_field(
             else {
                 return false;
             };
-            // arguments 必须继续是合法 JSON；直接截字符串会让 provider 拒绝整次请求。
+            // Arguments must remain valid JSON; slicing the string directly
+            // would make the provider reject the request.
             call.function.arguments = truncated;
             true
         }
@@ -2218,6 +2333,7 @@ fn shrink_successful_write_arguments(
                 MutableMessageField::ToolArguments(call_index),
                 original_chars.saturating_sub(240),
                 overflow_dir,
+                FieldArchivePolicy::BestEffort,
             ) {
                 changed = true;
             }
@@ -2240,6 +2356,53 @@ fn is_successful_write_result(tool_name: &str, result_text: &str) -> bool {
         "apply_patch" => trimmed.starts_with("Successfully patched"),
         _ => false,
     }
+}
+
+/// Last-resort rescue for the reactive overflow path, for the case where
+/// mid-turn compression can no longer make progress: its policies never
+/// truncate user messages, so an oversized current user message would
+/// otherwise fail the turn outright. Offloads the middle of the last **real**
+/// user message to the overflow archive and replaces it with a head+tail
+/// preview stub, using the same machinery as mutable assistant fields
+/// ([`truncate_mutable_field`]).
+///
+/// Only call this after the provider actually rejected the request: the
+/// pre-request soft budget must keep the current user message intact so
+/// legitimate large contexts reach the provider unchanged. Returns true when
+/// the message was truncated. Refuses (returns false, message untouched) when
+/// the overflow archive write fails: a preview-only stub would be the only
+/// surviving copy of the user's instruction and could never be read back, so
+/// the caller must surface the provider error instead of retrying on an
+/// unrecoverable fragment. Marker-prefixed content is always re-archived
+/// through the trusted session sink before it is collapsed, so an embedded
+/// user-controlled path is never treated as provenance.
+pub(in crate::ai) fn truncate_last_real_user_message_to_fit(
+    messages: &mut [Message],
+    target_chars: usize,
+    overflow_dir: Option<&Path>,
+) -> bool {
+    let total = messages_total_chars(messages);
+    if total <= target_chars {
+        return false;
+    }
+    let Some(index) = last_real_user_index(messages) else {
+        return false;
+    };
+    let message = &mut messages[index];
+    // Multimodal (array) content must not be flattened into a text stub —
+    // that would drop image parts. Only plain string content can be offloaded.
+    if message.content.as_str().is_none() {
+        return false;
+    }
+    truncate_mutable_field(
+        message,
+        MutableMessageField::Content,
+        total - target_chars,
+        overflow_dir,
+        // Required: the current user instruction must stay recoverable via
+        // the archive; without an archived copy the rescue must not fire.
+        FieldArchivePolicy::Required,
+    )
 }
 
 fn messages_total_chars(messages: &[Message]) -> usize {
@@ -3515,3 +3678,5 @@ mod overflow_stub_merge_tests;
 mod shrink_successful_write_arguments_tests;
 #[cfg(test)]
 mod tail_window_tests;
+#[cfg(test)]
+mod truncate_last_real_user_message_tests;

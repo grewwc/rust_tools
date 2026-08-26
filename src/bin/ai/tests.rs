@@ -805,7 +805,7 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
         &overflow_content[..overflow_content.len().min(200)]
     );
     assert!(
-        overflow_content.contains("溢出对话历史"),
+        overflow_content.contains("# Overflow History Archive"),
         "overflow file should have the header"
     );
 

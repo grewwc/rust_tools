@@ -1776,14 +1776,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "enable_tools"));
         assert!(names.iter().any(|name| name == "read_file"));
-        assert!(names.iter().any(|name| name == "knowledge_save"));
-        assert!(names.iter().any(|name| name == "knowledge_search"));
-        // skill 发现/激活是低频能力：默认不随每轮 core 展开常驻，改由
-        // `enable_tools` 按需启用（仍保留 builtin 组、可被动态启用）。
+        // skill 发现/激活、task 编排、knowledge 记忆都是低频能力：默认不随每轮
+        // core 展开常驻，改由 `enable_tools` 按需启用（仍保留 builtin 组、可被动态发现）。
         assert!(!names.iter().any(|name| name == "activate_skill"));
         assert!(!names.iter().any(|name| name == "list_skills"));
         assert!(!names.iter().any(|name| name == "load_skill"));
         assert!(!names.iter().any(|name| name == "save_skill"));
+        assert!(!names.iter().any(|name| name == "task_spawn"));
+        assert!(!names.iter().any(|name| name == "task_integrate"));
+        assert!(!names.iter().any(|name| name == "knowledge_save"));
+        assert!(!names.iter().any(|name| name == "knowledge_search"));
     }
 
     #[test]
@@ -1801,6 +1803,46 @@ mod tests {
         assert!(!names.iter().any(|name| name == "activate_skill"));
         assert!(!names.iter().any(|name| name == "list_skills"));
         assert!(!names.iter().any(|name| name == "load_skill"));
+    }
+
+    #[test]
+    fn skill_declaring_task_group_eagerly_loads_only_the_task_family() {
+        // Regression guard: task* were moved out of core (lazy builtin-only) so the
+        // default turn stays slim, but agent-team / audit_own_changes hard-require the
+        // task family in their flows (delegation / spawning the audit subagent). Their
+        // manifests declare the narrow `task` group so expansion loads exactly that
+        // family. The broad `builtin` tag means "nearly the whole registry" (it drags in
+        // run_agent_graph/save_skill/manage_team ~15KB of unrelated schemas), so those
+        // heavy non-flow tools must stay lazy under [core, task].
+        let names_for = |groups: Vec<String>| {
+            manifest_tool_definitions(&groups, &[])
+                .expect("non-empty manifest groups should resolve tool definitions")
+                .into_iter()
+                .map(|tool| tool.function.name)
+                .collect::<Vec<_>>()
+        };
+
+        let skill_groups =
+            names_for(vec!["core".to_string(), "task".to_string()]);
+        assert!(
+            skill_groups.iter().any(|name| name == "task_spawn"),
+            "skill with [core, task] must eagerly expose task_spawn"
+        );
+        assert!(skill_groups.iter().any(|name| name == "task"));
+        assert!(skill_groups.iter().any(|name| name == "task_integrate"));
+        assert!(
+            !skill_groups.iter().any(|name| name == "run_agent_graph"),
+            "[core, task] must not drag in heavyweight non-flow orchestration tools"
+        );
+        assert!(!skill_groups.iter().any(|name| name == "manage_team"));
+        assert!(!skill_groups.iter().any(|name| name == "save_skill"));
+        assert!(!skill_groups.iter().any(|name| name == "knowledge_save"));
+
+        let plain_groups = names_for(vec!["core".to_string(), "executor".to_string()]);
+        assert!(
+            !plain_groups.iter().any(|name| name == "task_spawn"),
+            "default [core, executor] manifest must keep task* lazy"
+        );
     }
 
     #[test]
@@ -1923,11 +1965,11 @@ mod tests {
         assert!(names.iter().any(|n| n == "apply_patch"));
         assert!(names.iter().any(|n| n == "write_file"));
         assert!(names.iter().any(|n| n == "read_file"));
-        // 常驻：baseline 自助/编排能力
+        // 常驻：baseline 自助能力（enable_tools 是渐进发现入口）
         assert!(names.iter().any(|n| n == "enable_tools"));
-        assert!(names.iter().any(|n| n == "task_spawn"));
 
-        // 懒加载：重执行原语不常驻
+        // 懒加载：重执行原语、task 编排（task_spawn 等）不常驻
+        assert!(!names.iter().any(|n| n == "task_spawn"));
         for deferred in [
             "spawn_process",
             "spawn_daemon",
@@ -3602,12 +3644,14 @@ mod tests {
         // 基础只读 / 检索能力应作为 baseline 常驻补回，避免窄白名单 skill 把
         // read_file 等最基本的阅读工具剔除，导致主 Agent 连用户点名的文件都读不了。
         assert!(names.contains(&"read_file".to_string()));
-        // 子 Agent 编排能力应作为 baseline 常驻补回，避免 skill 白名单把 task_*
-        // 全部剔除导致主 Agent 失去委派子 Agent 的能力。
-        assert!(names.contains(&"task".to_string()));
-        assert!(names.contains(&"task_spawn".to_string()));
-        assert!(names.contains(&"task_wait".to_string()));
-        assert!(names.contains(&"task_status".to_string()));
+        // task 编排 / knowledge 记忆系列已移出 baseline：窄白名单 skill 下不再被
+        // 自动补回，但主 Agent 仍可通过常驻的 enable_tools 渐进式发现并启用它们，
+        // 不会真正失去委派子 Agent 的能力。
+        assert!(!names.contains(&"task".to_string()));
+        assert!(!names.contains(&"task_spawn".to_string()));
+        assert!(!names.contains(&"task_wait".to_string()));
+        assert!(!names.contains(&"task_status".to_string()));
+        assert!(!names.contains(&"knowledge_save".to_string()));
         // 其它非 baseline 的内置工具仍不应被无端带入白名单。
         assert!(!names.contains(&"plan".to_string()));
         assert!(!names.contains(&"write_file".to_string()));

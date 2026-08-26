@@ -4,6 +4,9 @@ version: 1.0.0
 description: 在 main agent 完成某个用户需求的改动后使用。根据自己本次的改动生成审计指令，用 task 工具（agent: audit）启动完整审计 subagent（仅轻量复查才用 agent: audit-fast），或请用户执行 /audit（完整审计；仅轻量复查用 /audit -f），只审计 main agent 自己做的改动、不审计其他人的改动；随后 main agent 接管并 double check 审计结果，据此做下一步改动。
 author: rust_tools
 priority: 0
+tool_groups:
+  - "core"
+  - "task"
 ---
 # 自查审计：只审计 main agent 自己的改动
 

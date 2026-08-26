@@ -392,6 +392,7 @@ fn empty_preview_stub_rejected_when_path_eats_budget() {
         MutableMessageField::ToolArguments(0),
         300,
         Some(&overflow_dir),
+        FieldArchivePolicy::BestEffort,
     );
     assert!(
         !reduced,

@@ -492,6 +492,46 @@ mod tests {
     }
 
     #[test]
+    fn task_and_knowledge_tools_remain_dynamically_enabled() {
+        // task 编排系列与 knowledge 记忆系列已从 core 组降级为 builtin-only：
+        // 默认不随每轮常驻（省 token），但必须仍在 enable_tools 目录中可见、
+        // 可按需启用，保证模型能渐进式发现，而不是"隐形"。
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+
+        let output = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+        for name in [
+            "task",
+            "task_spawn",
+            "task_spawn_batch",
+            "task_retry",
+            "task_wait",
+            "task_status",
+            "task_evidence_read",
+            "task_audit",
+            "task_integrate",
+            "task_cancel",
+            "knowledge_save",
+            "knowledge_search",
+            "knowledge_list",
+        ] {
+            assert!(
+                output.contains(&format!("  - {name}:")),
+                "{name} must remain discoverable via enable_tools"
+            );
+        }
+
+        let enabled = execute_enable_tools(
+            &json!({"operation": "enable", "tools": ["task_spawn", "knowledge_search"]}),
+        )
+        .unwrap();
+        assert!(enabled.contains("Enabled 2 tool(s): task_spawn, knowledge_search"));
+    }
+
+    #[test]
     fn enable_known_mcp_tool_queues_mcp_activation() {
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()

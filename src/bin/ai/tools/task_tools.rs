@@ -1072,7 +1072,7 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_task,
-        groups: &["builtin", "core"],
+        groups: &["builtin", "task"],
     }
 });
 
@@ -1102,7 +1102,7 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_task_spawn,
-        groups: &["builtin", "core"],
+        groups: &["builtin", "task"],
     }
 });
 
@@ -1112,7 +1112,7 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_task_spawn_batch,
-        groups: &["builtin", "core"],
+        groups: &["builtin", "task"],
     }
 });
 
@@ -1609,7 +1609,7 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_task_retry,
-        groups: &["builtin", "core"],
+        groups: &["builtin", "task"],
     }
 });
 
@@ -1670,7 +1670,7 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_task_wait,
-        groups: &["builtin", "core"],
+        groups: &["builtin", "task"],
     }
 });
 
@@ -2196,7 +2196,7 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_task_status,
-        groups: &["builtin", "core"],
+        groups: &["builtin", "task"],
     }
 });
 
@@ -2249,7 +2249,7 @@ inventory::submit!(ToolRegistration {
         name: "task_evidence_read",
         description: "",
         execute: execute_task_evidence_read,
-        groups: &["builtin", "core"],
+        groups: &["builtin", "task"],
     }
 });
 
@@ -2313,7 +2313,7 @@ inventory::submit!(ToolRegistration {
         name: "task_audit",
         description: "",
         execute: execute_task_audit,
-        groups: &["builtin", "core"],
+        groups: &["builtin", "task"],
     }
 });
 
@@ -2393,7 +2393,7 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_task_integrate,
-        groups: &["builtin", "core"],
+        groups: &["builtin", "task"],
     }
 });
 
@@ -2412,7 +2412,7 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_task_cancel,
-        groups: &["builtin", "core"],
+        groups: &["builtin", "task"],
     }
 });
 

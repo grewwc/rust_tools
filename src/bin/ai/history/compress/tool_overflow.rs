@@ -689,6 +689,48 @@ mod tests {
     }
 
     #[test]
+    fn pruned_stable_archive_is_content_addressed() {
+        let overflow_dir = std::env::temp_dir().join(format!(
+            "ai-pruned-stable-content-addressed-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        // Same (tool, id, content) must map to one idempotent archive file.
+        let first = write_preserved_tool_overflow_file_stable(
+            &overflow_dir,
+            "call-1",
+            "read_file",
+            "result body",
+        )
+        .unwrap();
+        let second = write_preserved_tool_overflow_file_stable(
+            &overflow_dir,
+            "call-1",
+            "read_file",
+            "result body",
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "result body");
+
+        // Same call id with different content must NOT reuse the old file:
+        // a replayed tool call would otherwise read back stale bytes.
+        let replayed = write_preserved_tool_overflow_file_stable(
+            &overflow_dir,
+            "call-1",
+            "read_file",
+            "replayed body",
+        )
+        .unwrap();
+        assert_ne!(first, replayed);
+        assert_eq!(std::fs::read_to_string(&replayed).unwrap(), "replayed body");
+        let overflow_path = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+        assert_eq!(std::fs::read_dir(&overflow_path).unwrap().count(), 2);
+
+        let _ = std::fs::remove_dir_all(overflow_dir);
+    }
+
+    #[test]
     fn preserved_read_file_overflow_stub_keeps_original_target_anchor() {
         let overflow_dir = std::env::temp_dir().join(format!(
             "ai-tool-overflow-read-anchor-{}",
@@ -1574,14 +1616,21 @@ pub(super) fn plan_noncompressible_tool_result_for_fold(
     ))
 }
 
-/// LLM prune 路径使用的即时稳定归档；与 fold 的两阶段计划相互独立。文件名由
-/// `tool_call_id` 确定性派生（而非随机 uuid + 时间戳）。
+/// Immediate stable archive used by the LLM-prune path; independent of fold's
+/// two-phase planning. The file name is deterministically derived from
+/// `(tool_call_id, content)` (not a random uuid + timestamp), matching the
+/// content addressing of the `spilled-` / `folded-` archive naming strategies.
 ///
-/// LLM 引导裁剪（`llm_prune::apply_pruning`）作用于每次模型请求前的临时 `messages`
-/// 投影：同一条 canonical tool 消息在后续 turn 重建投影时会被再次裁剪。若沿用随机
-/// 文件名，则每轮都会写出新副本、生成不同 stub 文本 → prompt
-/// cache 从该点断裂 + 磁盘副本单调膨胀。用确定性文件名后，同一 `tool_call_id`
-/// 的归档幂等：文件已存在则跳过写入，stub 文本逐轮稳定。
+/// LLM-guided pruning (`llm_prune::apply_pruning`) operates on the temporary
+/// `messages` projection rebuilt before each model request, so the same
+/// canonical tool message gets pruned again whenever a later turn rebuilds the
+/// projection. Random file names would mint a fresh copy every turn and change
+/// the stub text each time, which breaks the prompt cache from that point on
+/// and grows disk copies monotonically. With a deterministic name, archiving is
+/// idempotent: an existing file is skipped and the stub text stays stable across
+/// turns. Hashing the content into the name keeps that idempotence honest when
+/// the same call id is replayed with different content — the write then targets
+/// a distinct file instead of blindly reusing stale bytes.
 pub(super) fn preserve_pruned_tool_result_stable(
     overflow_dir: Option<&Path>,
     tool_call_id: &str,
@@ -1603,7 +1652,8 @@ pub(super) fn preserve_pruned_tool_result_stable(
     ))
 }
 
-/// 以 `tool_call_id` 派生确定性文件名写出归档；文件已存在则直接复用，不重复写。
+/// Deterministic archive write for the pruned path; the naming rationale is
+/// documented on [`preserve_pruned_tool_result_stable`].
 fn write_preserved_tool_overflow_file_stable(
     overflow_dir: &Path,
     tool_call_id: &str,
@@ -1614,9 +1664,13 @@ fn write_preserved_tool_overflow_file_stable(
     std::fs::create_dir_all(&dir).ok()?;
     let safe_tool = sanitize_overflow_name_component(tool_name);
     let safe_id = sanitize_overflow_name_component(tool_call_id);
-    let file_name = format!("pruned-{safe_tool}-{safe_id}.txt");
+    let identity = format!("{tool_call_id}\0{content}");
+    let digest = content_sha256_hex(identity.as_bytes());
+    let file_name = format!("pruned-{safe_tool}-{safe_id}-{}.txt", &digest[..12]);
     let path = dir.join(file_name);
-    // 幂等：内容不随轮次变化，已存在则不重复写盘（也保住 prompt cache 稳定）。
+    // Idempotent for identical content: the same (id, content) maps to the same
+    // path, so an existing file is never rewritten and the stub text (and the
+    // prompt cache prefix) stays stable across turns.
     if !path.exists() {
         std::fs::write(&path, content).ok()?;
     }

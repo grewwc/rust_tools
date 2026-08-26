@@ -929,18 +929,27 @@ fn refresh_outstanding_task_anchor(messages: &mut Vec<Message>, session_id: &str
     });
 }
 
-/// Reactive 上下文收缩：仅在 provider 因上下文超限拒绝请求后调用。
+/// Reactive context shrink: only called after the provider rejects a request
+/// for exceeding the context window.
 ///
-/// 主动压缩（`apply_pre_request_context_budget` + LLM 摘要）已在请求前尽力把
-/// 上下文压到软阈值附近，但字符估算不是 token 的权威裁判——一次英文占比高、
-/// 或图片/工具 schema 额外开销大的请求，仍可能被 provider 的 tokenizer 判超限。
-/// 与其在本地用字符阈值主动 413（会误杀合法请求），不如把请求发出去，只在真正
-/// 被拒后再收缩重试。
+/// Proactive compression (`apply_pre_request_context_budget` + LLM summary)
+/// already tries to bring the context near the soft threshold before the
+/// request, but a char estimate is not an authoritative judge of tokens — a
+/// request heavy in English text, images, or tool-schema overhead can still be
+/// judged over-limit by the provider's tokenizer. Instead of failing locally
+/// on a char threshold (which would kill legitimate requests), send the
+/// request out and shrink only after a real rejection.
 ///
-/// 每次调用把目标预算在上次基础上再砍 25%（floor 兜底防止砍到 0），复用跨 turn
-/// 压缩管线 [`mid_turn_compress`](crate::ai::history::mid_turn_compress)（含
-/// Path C emergency 截断）强制收敛。返回压缩后的字符数；若无法再压缩（已触及
-/// system/current-user 不可裁下限），返回的字符数不会下降，调用方据此终止重试。
+/// Each call cuts the target budget by another 25% from the previous one (a
+/// floor keeps it from reaching 0), reusing the cross-turn compression
+/// pipeline [`mid_turn_compress`](crate::ai::history::mid_turn_compress)
+/// (including Path C emergency truncation) to force convergence. Returns the
+/// char count after compression. Compression policies never truncate user
+/// messages, so once they hit their floor the last resort is offloading the
+/// middle of the current user message to the overflow archive
+/// ([`truncate_last_real_user_message_to_fit`](crate::ai::history::truncate_last_real_user_message_to_fit));
+/// if even that makes no progress, the returned count does not drop and the
+/// caller stops retrying.
 fn reactive_shrink_context_after_overflow(
     app: &App,
     messages: &mut Vec<Message>,
@@ -952,7 +961,7 @@ fn reactive_shrink_context_after_overflow(
         store.session_assets_dir(&app.session_id)
     };
     let drained = std::mem::take(messages);
-    let (compressed, _before, after) =
+    let (compressed, before, after) =
         crate::ai::history::mid_turn_compress(
             drained,
             target_chars,
@@ -960,6 +969,22 @@ fn reactive_shrink_context_after_overflow(
             crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
         );
     *messages = compressed;
+    // A dead end here usually means the oversized body is the current user
+    // message itself: compression policies never truncate user messages. As a
+    // last resort, offload its middle to the overflow archive so the retry can
+    // converge instead of failing the turn outright. The rescue also refuses
+    // when the archive write fails — an unarchived preview of the current
+    // instruction would be unrecoverable — so the unshrunk total falls through
+    // to the caller's give-up path and the provider error surfaces.
+    if after >= before
+        && crate::ai::history::truncate_last_real_user_message_to_fit(
+            messages,
+            target_chars,
+            Some(overflow_dir.as_path()),
+        )
+    {
+        return crate::ai::history::messages_total_chars_pub(messages);
+    }
     after
 }
 
@@ -1216,7 +1241,8 @@ async fn request_model_response(
             && overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES
         {
             let before = crate::ai::history::messages_total_chars_pub(messages);
-            // 目标在当前实际大小基础上再砍 25%，floor 兜底防止砍到 0 触发 no-op。
+            // Cut the target by another 25% of the current size; the floor
+            // keeps it away from 0 so the shrink never becomes a no-op.
             let target = before
                 .saturating_mul(3)
                 .saturating_div(4)
@@ -1232,7 +1258,8 @@ async fn request_model_response(
                 );
                 continue;
             }
-            // 压不动了（system / current-user 已是不可裁下限）：再重试只会被同样拒绝。
+            // No progress even after the current-user-message rescue: retrying
+            // would only be rejected the same way again.
             crate::ai::driver::print::print_tool_note_line(
                 "context-overflow",
                 "provider rejected context but it cannot be compressed further",

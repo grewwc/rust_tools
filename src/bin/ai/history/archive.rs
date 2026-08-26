@@ -82,15 +82,21 @@ fn parse_overflow_history(markdown: &str) -> Vec<Message> {
     messages
 }
 
-/// 优先读取归档里随展示文本一同保存的原始 `Message` JSON。
+/// Prefer the raw `Message` JSON stored alongside the display text.
 ///
-/// Markdown 正文只是给人和搜索工具看的投影；仅靠标题反解析会丢失
-/// `tool_call_id` / `tool_calls` / `model` 等元数据，也会被正文中的同名标题干扰。
-/// 若发现原始 JSON 但任一块损坏，则整体退回旧版 Markdown 解析，避免静默只恢复
-/// 一部分消息。
+/// The Markdown body is only a projection for humans and search tools; parsing
+/// it back from headings alone would lose metadata such as `tool_call_id` /
+/// `tool_calls` / `model` and could be confused by identical headings inside the
+/// body. If raw JSON is found but any block is corrupt, fall back to the legacy
+/// Markdown parser for the whole file instead of silently restoring only part
+/// of the messages.
 fn parse_lossless_raw_messages(markdown: &str) -> Option<Vec<Message>> {
-    const REMOVED_MESSAGES_BATCH: &str = "## 移出消息原文";
-    const TRUNCATED_FIELD_BATCH: &str = "## 截断字段原文";
+    // Envelope text switched from Chinese to English; archives written by older
+    // builds may still hold either spelling, so both must keep parsing.
+    const REMOVED_MESSAGES_BATCH: &str = "## Removed messages (verbatim)";
+    const REMOVED_MESSAGES_BATCH_LEGACY: &str = "## 移出消息原文";
+    const TRUNCATED_FIELD_BATCH: &str = "## Truncated field original text";
+    const TRUNCATED_FIELD_BATCH_LEGACY: &str = "## 截断字段原文";
     const RAW_MARKER: &str = "raw_message_json:";
 
     let mut messages = Vec::new();
@@ -100,11 +106,14 @@ fn parse_lossless_raw_messages(markdown: &str) -> Option<Vec<Message>> {
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
-        if trimmed == REMOVED_MESSAGES_BATCH {
+        if trimmed == REMOVED_MESSAGES_BATCH || trimmed == REMOVED_MESSAGES_BATCH_LEGACY {
             in_removed_messages_batch = true;
             continue;
         }
-        if trimmed == TRUNCATED_FIELD_BATCH || trimmed.starts_with("# Overflow History Archive") {
+        if trimmed == TRUNCATED_FIELD_BATCH
+            || trimmed == TRUNCATED_FIELD_BATCH_LEGACY
+            || trimmed.starts_with("# Overflow History Archive")
+        {
             in_removed_messages_batch = false;
             continue;
         }
@@ -140,9 +149,9 @@ fn parse_lossless_raw_messages(markdown: &str) -> Option<Vec<Message>> {
 
 fn overflow_heading_role(line: &str) -> Option<&'static str> {
     match line.trim_end_matches('\r') {
-        "## 用户" => Some("user"),
-        "## 助手" => Some("assistant"),
-        "### 工具结果" => Some("tool"),
+        "## 用户" | "## User" => Some("user"),
+        "## 助手" | "## Assistant" => Some("assistant"),
+        "### 工具结果" | "### Tool result" => Some("tool"),
         "### system" => Some("system"),
         "### internal_note" => Some("internal_note"),
         _ => None,
@@ -272,5 +281,36 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content.as_str(), Some("first"));
         assert_eq!(messages[1].content.as_str(), Some("before\n## 用户\nafter"));
+    }
+
+    #[test]
+    fn lossless_raw_json_parses_english_envelope() {
+        // New archives write English envelope text; batch gating must behave
+        // exactly like the legacy Chinese format.
+        let user = serde_json::json!({
+            "role": "user",
+            "content": "first",
+            "tool_calls": null,
+            "tool_call_id": null,
+            "reasoning_content": null
+        });
+        let assistant = serde_json::json!({
+            "role": "assistant",
+            "content": "truncated original",
+            "tool_calls": null,
+            "tool_call_id": null,
+            "reasoning_content": null
+        });
+        let markdown = format!(
+            "# Overflow History Archive\n\n## Removed messages (verbatim)\n\n## User\n\nfirst\n\nraw_message_json:\n```json\n{user}\n```\n\n---\n\n## Truncated field original text\n\n### Field original text\n\n- role: assistant\n- field: content\n\nBegin original text\ntruncated original\nEnd original text\n\nraw_message_json:\n```json\n{assistant}\n```\n"
+        );
+
+        let messages = parse_overflow_history(&markdown);
+
+        // Only the removed-messages batch is restored; the truncated-field
+        // batch raw JSON must stay excluded.
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content.as_str(), Some("first"));
     }
 }

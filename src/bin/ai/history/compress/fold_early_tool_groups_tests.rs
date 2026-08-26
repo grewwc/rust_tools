@@ -245,7 +245,7 @@ fn removable_messages_are_archived_in_one_batch() {
     ));
 
     let archive = std::fs::read_to_string(overflow_dir.join(OVERFLOW_HISTORY_FILENAME)).unwrap();
-    assert_eq!(archive.matches("## 移出消息原文").count(), 1);
+    assert_eq!(archive.matches("## Removed messages (verbatim)").count(), 1);
     // 正文消息（assistant 纯文本）被整批归档……
     assert!(archive.contains("answer-0"));
     assert!(archive.contains("answer-2"));
@@ -668,6 +668,7 @@ fn path_c_preserves_exact_replay_reasoning_verbatim() {
         MutableMessageField::Reasoning,
         encoded.chars().count(),
         None,
+        FieldArchivePolicy::BestEffort,
     ));
     assert_eq!(
         directly_capped.reasoning_content.as_deref(),
@@ -805,6 +806,7 @@ fn truncating_mutable_content_archives_original_field() {
         MutableMessageField::Content,
         1_600,
         Some(overflow_dir.as_path()),
+        FieldArchivePolicy::BestEffort,
     ));
 
     let truncated = value_to_string(&message.content);
@@ -841,6 +843,7 @@ fn truncating_content_refuses_empty_preview_stub_for_long_archive_paths() {
         MutableMessageField::Content,
         100,
         Some(overflow_dir.as_path()),
+        FieldArchivePolicy::BestEffort,
     ));
     assert_eq!(value_to_string(&message.content), original);
     let _ = std::fs::remove_dir_all(overflow_dir);
@@ -863,6 +866,7 @@ fn truncating_reasoning_refuses_empty_preview_stub_for_long_archive_paths() {
         MutableMessageField::Reasoning,
         100,
         Some(overflow_dir.as_path()),
+        FieldArchivePolicy::BestEffort,
     ));
     assert_eq!(
         message.reasoning_content.as_deref(),
@@ -919,6 +923,7 @@ fn inline_content_fallback_is_not_rearchived_as_full_original() {
         MutableMessageField::Content,
         3_200,
         None,
+        FieldArchivePolicy::BestEffort,
     ));
     let first = value_to_string(&message.content);
     let overflow_dir =
@@ -929,6 +934,7 @@ fn inline_content_fallback_is_not_rearchived_as_full_original() {
         MutableMessageField::Content,
         first.chars().count().saturating_sub(160),
         Some(overflow_dir.as_path()),
+        FieldArchivePolicy::BestEffort,
     ));
     let collapsed = value_to_string(&message.content);
     assert!(collapsed.contains("full original was not archived"));
@@ -954,6 +960,7 @@ fn inline_tool_arguments_fallback_is_not_rearchived_as_full_original() {
         MutableMessageField::ToolArguments(0),
         800,
         None,
+        FieldArchivePolicy::BestEffort,
     ));
     let first = message.tool_calls.as_ref().unwrap()[0]
         .function
@@ -967,6 +974,7 @@ fn inline_tool_arguments_fallback_is_not_rearchived_as_full_original() {
         MutableMessageField::ToolArguments(0),
         first.chars().count().saturating_sub(160),
         Some(overflow_dir.as_path()),
+        FieldArchivePolicy::BestEffort,
     ));
     let collapsed: Value =
         serde_json::from_str(&message.tool_calls.as_ref().unwrap()[0].function.arguments)
