@@ -134,6 +134,22 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
             .and_then(|d| d.get("reason"))
             .and_then(|r| r.as_str())
             .unwrap_or("unknown");
+        // Mirrors @ai-sdk/openai's mapOpenAIResponseFinishReason: max_output_tokens
+        // truncation maps to finish_reason=length, keeping the partial text
+        // produced so far; usage is embedded in response.usage just like
+        // response.completed. Reuses the existing length-truncation decision:
+        // visible text finishes as a normal completion; only with no visible
+        // output at all does it escalate to a retryable Truncated.
+        if reason.eq_ignore_ascii_case("max_output_tokens") {
+            let mut chunk = stream_chunk_with_delta(StreamDelta::default());
+            if let Some(choice) = chunk.choices.first_mut() {
+                choice.finish_reason = Some("length".to_string());
+            }
+            if let Some(usage) = value.get("response").and_then(|r| r.get("usage")) {
+                chunk.usage = serde_json::from_value(usage.clone()).ok();
+            }
+            return Some(ParsedStreamPayload::Chunk(chunk));
+        }
         return Some(ParsedStreamPayload::Error(format!(
             "response incomplete: {reason}"
         )));
@@ -214,7 +230,7 @@ fn parse_function_call_arguments_event(
         }
     } else if !arguments.is_empty() {
         tool_call = Some(StreamToolCall {
-            index: extract_output_index(value),
+            index: Some(extract_output_index(value)),
             id: extract_call_identifier(value),
             tool_type: "function".to_string(),
             function: StreamFunctionCall {
@@ -433,7 +449,7 @@ fn extract_function_call_item(
     }
 
     Some(StreamToolCall {
-        index: fallback_index,
+        index: Some(fallback_index),
         id,
         tool_type: "function".to_string(),
         function: StreamFunctionCall { name, arguments },
@@ -804,12 +820,42 @@ mod tests {
         ) {
             ParsedStreamPayload::Chunk(chunk) => {
                 let tool_call = &chunk.choices[0].delta.tool_calls[0];
-                assert_eq!(tool_call.index, 2);
+                assert_eq!(tool_call.index, Some(2));
                 assert_eq!(tool_call.id, "fc_item_1");
                 assert_eq!(tool_call.tool_type, "function");
                 assert_eq!(tool_call.function.arguments, "{\"path\":\"a");
             }
             _ => panic!("expected tool-call delta chunk"),
+        }
+    }
+
+    #[test]
+    fn chat_completion_tool_call_without_index_keeps_none() {
+        // When the gateway omits index, it must not default to 0 (parallel calls
+        // would overwrite each other); keep None and let the stream layer compose
+        // grouping keys by call id.
+        let payload = r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#;
+        match parse_stream_payload(provider::openai_adapter(), payload, None) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.tool_calls[0].index, None);
+            }
+            _ => panic!("expected parsed chunk"),
+        }
+    }
+
+    #[test]
+    fn response_incomplete_max_output_tokens_maps_to_length_chunk() {
+        let payload = r#"{"response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":3,"output_tokens":7}}}"#;
+        match parse_stream_payload(
+            provider::openai_adapter(),
+            payload,
+            Some("response.incomplete"),
+        ) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
+                assert!(chunk.usage.is_some());
+            }
+            _ => panic!("expected length-truncation chunk"),
         }
     }
 
@@ -823,7 +869,7 @@ mod tests {
         ) {
             ParsedStreamPayload::SnapshotChunk(chunk) => {
                 let tool_call = &chunk.choices[0].delta.tool_calls[0];
-                assert_eq!(tool_call.index, 2);
+                assert_eq!(tool_call.index, Some(2));
                 assert_eq!(tool_call.function.arguments, "{\"path\":\"abc\"}");
             }
             _ => panic!("expected tool-call snapshot chunk"),
@@ -840,7 +886,7 @@ mod tests {
         ) {
             ParsedStreamPayload::Chunk(chunk) => {
                 let tool_call = &chunk.choices[0].delta.tool_calls[0];
-                assert_eq!(tool_call.index, 1);
+                assert_eq!(tool_call.index, Some(1));
                 assert_eq!(tool_call.id, "call_1");
                 assert_eq!(tool_call.function.name, "write_file");
                 assert_eq!(tool_call.function.arguments, "");
@@ -859,7 +905,7 @@ mod tests {
         ) {
             ParsedStreamPayload::SnapshotChunk(chunk) => {
                 let tool_call = &chunk.choices[0].delta.tool_calls[0];
-                assert_eq!(tool_call.index, 1);
+                assert_eq!(tool_call.index, Some(1));
                 assert_eq!(tool_call.id, "call_1");
                 assert_eq!(tool_call.function.name, "write_file");
                 assert_eq!(tool_call.function.arguments, "{\"path\":\"a.rs\"}");
@@ -1057,14 +1103,17 @@ mod tests {
 
     #[test]
     fn response_incomplete_event_surfaces_reason() {
-        let payload = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#;
+        // max_output_tokens truncation is already mapped to finish_reason=length
+        // (see the dedicated test above); other unknown reasons still surface as
+        // hard errors, keeping the reason text for debugging.
+        let payload = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#;
         match parse_stream_payload(
             provider::openai_adapter(),
             payload,
             Some("response.incomplete"),
         ) {
             ParsedStreamPayload::Error(msg) => {
-                assert!(msg.contains("max_output_tokens"), "msg was: {msg}");
+                assert!(msg.contains("content_filter"), "msg was: {msg}");
             }
             _ => panic!("response.incomplete should surface as Error"),
         }

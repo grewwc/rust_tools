@@ -26,7 +26,8 @@ use super::{
     },
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{
-        StreamChunkStep, StreamMarkers, StreamProcessingState, TerminalDedupeState, ToolCallBuilder,
+        StreamChunkStep, StreamContentState, StreamMarkers, StreamProcessingState,
+        TerminalDedupeState, ToolCallBuilder,
     },
 };
 
@@ -900,7 +901,10 @@ fn process_external_tool_calls_delta(
         {
             continue;
         }
-        let index = stream_tool_call.index;
+        let index = match stream_tool_call.index {
+            Some(idx) => idx,
+            None => resolve_indexless_tool_call_key(&mut state.content, &stream_tool_call.id),
+        };
         ensure_tool_calls_section_open(app, markers, state);
 
         let render_chunk = {
@@ -945,6 +949,32 @@ fn process_external_tool_calls_delta(
         }
     }
     meaningful_progress
+}
+
+/// Incrementally resolves cumulative keys for chat-completions tool calls whose
+/// `index` is missing. If everything fell onto the default key 0, parallel tool
+/// calls would merge into one; instead group by id: reuse the key of an existing
+/// builder with the same id, otherwise synthesize a stable key in
+/// [10000, usize::MAX) from a hash of the id (real provider indexes are single
+/// digits, so no collision). Parameter-continuation deltas with neither id nor
+/// index attach to the most recent call without an index; if there is none, fall
+/// back to the old-behavior key 0.
+fn resolve_indexless_tool_call_key(state: &mut StreamContentState, id: &str) -> usize {
+    if !id.is_empty() {
+        for (key, builder) in state.tool_calls_map.iter() {
+            if !builder.id.is_empty() && builder.id == id {
+                return *key;
+            }
+        }
+        let mut hash = 10000u64;
+        for byte in id.bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
+        }
+        let key = hash as usize;
+        state.last_indexless_tool_call_key = Some(key);
+        return key;
+    }
+    state.last_indexless_tool_call_key.unwrap_or(0)
 }
 
 fn append_tool_call_arguments(

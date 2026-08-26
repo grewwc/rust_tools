@@ -17,3 +17,4 @@ Cargo.lock
 history.sessions/
 history.sqlite
 history.sqlite-*
+.tmp*

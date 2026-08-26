@@ -131,13 +131,58 @@ impl SubagentStatusLine {
     }
 
     pub(super) fn refresh(&mut self, app: &App) {
-        let statuses = {
+        let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
+        let current_pid = std::process::id() as i32;
+        let mut session_ids = crate::ai::driver::session_pid::scan_all_session_pids(
+            store.sessions_root(),
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, pid, alive)| *alive && *pid == current_pid)
+        .map(|(session_id, _, _)| session_id)
+        .collect::<Vec<_>>();
+        if !session_ids.iter().any(|session_id| session_id == &app.session_id) {
+            session_ids.push(app.session_id.clone());
+        }
+        session_ids.sort();
+        session_ids.dedup();
+
+        let statuses_by_session = {
             let mut os = app.os.lock().unwrap_or_else(|err| err.into_inner());
-            crate::ai::tools::task_tools::subagent_terminal_statuses(
-                os.as_mut(),
-                app.session_id.as_str(),
-            )
+            session_ids
+                .into_iter()
+                .map(|session_id| {
+                    let statuses = crate::ai::tools::task_tools::subagent_terminal_statuses(
+                        os.as_mut(),
+                        &session_id,
+                    );
+                    (session_id, statuses)
+                })
+                .collect::<Vec<_>>()
         };
+
+        let mut statuses = Vec::new();
+        for (session_id, session_statuses) in statuses_by_session {
+            let snapshots = session_statuses
+                .iter()
+                .map(|status| crate::ai::driver::session_pid::AgentSnapshot {
+                    agent_name: status.agent_name.clone(),
+                    description: status.description.clone(),
+                    state: status.state.clone(),
+                    elapsed_secs: status.elapsed_secs,
+                    progress: status.progress.clone(),
+                })
+                .collect::<Vec<_>>();
+            let _ = crate::ai::driver::session_pid::write_agent_snapshots(
+                store.sessions_root(),
+                &session_id,
+                &snapshots,
+            );
+            if session_id == app.session_id {
+                statuses = session_statuses;
+            }
+        }
+
         if statuses.is_empty() {
             return;
         }
