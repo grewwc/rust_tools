@@ -340,3 +340,42 @@ fn distinct_truncated_payloads_still_append() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn corrupted_fingerprint_index_falls_back_to_plain_append() {
+    // A lost or garbage sidecar index must degrade to a duplicate append,
+    // never to a failed or silently skipped rescue.
+    let dir = overflow_dir("dedup-corrupt-index");
+    let big = "R".repeat(20_000);
+    let mut first = vec![
+        msg("user", Value::String(big.clone())),
+        msg("assistant", Value::String("ok".to_string())),
+    ];
+    assert!(truncate_last_real_user_message_to_fit(
+        &mut first,
+        5_000,
+        Some(&dir),
+    ));
+    let archive_path = archived_pointer(first[0].content.as_str().unwrap());
+    let before = std::fs::read_to_string(&archive_path).unwrap();
+
+    // Corrupt the sidecar so the memo cannot recognize the earlier payload.
+    let index_path =
+        std::path::PathBuf::from(format!("{}.fingerprints", archive_path.to_string()));
+    std::fs::write(&index_path, "not-a-fingerprint\n").unwrap();
+
+    let mut second = vec![
+        msg("user", Value::String(big)),
+        msg("assistant", Value::String("ok".to_string())),
+    ];
+    assert!(truncate_last_real_user_message_to_fit(
+        &mut second,
+        5_000,
+        Some(&dir),
+    ));
+    let after = std::fs::read_to_string(&archive_path).unwrap();
+    assert!(after.len() > before.len());
+    assert_eq!(after.matches("### Field original text").count(), 2);
+
+    let _ = std::fs::remove_dir_all(dir);
+}

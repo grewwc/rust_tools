@@ -292,8 +292,16 @@ pub(super) struct OverflowSink {
     buffer: String,
     /// Offset just past the leading file header / batch separator written by
     /// `start_batch`; everything from here on is the stable batch payload used
-    /// for byte-identical dedup in `flush`.
+    /// for sha256 fingerprint dedup in `flush`.
     payload_offset: usize,
+    /// Hex sha256 fingerprints of payloads already known to be archived, kept
+    /// as a persistent sidecar index next to the history file. Checking this
+    /// tiny index instead of scanning the ever-growing archive keeps every
+    /// flush O(payload) regardless of archive size. Entries are recorded only
+    /// AFTER their payload landed in the archive, so a crash between the two
+    /// degrades to one duplicate append rather than dropping evidence.
+    seen_payloads: rustc_hash::FxHashSet<String>,
+    seen_payloads_loaded: bool,
 }
 
 impl OverflowSink {
@@ -303,7 +311,15 @@ impl OverflowSink {
             path,
             buffer: String::new(),
             payload_offset: 0,
+            seen_payloads: rustc_hash::FxHashSet::default(),
+            seen_payloads_loaded: false,
         }
+    }
+
+    /// Sidecar next to the history file listing hex sha256 digests of every
+    /// payload previously appended there, one per line.
+    fn fingerprint_index_path(&self) -> PathBuf {
+        PathBuf::from(format!("{}.fingerprints", self.path.to_string_lossy()))
     }
 
     fn start_batch(&mut self, title: &str) {
@@ -406,19 +422,33 @@ impl OverflowSink {
         // Append mode keeps every historical batch forever. Repeated reactive
         // rescues rebuild the same projection from unchanged canonical history,
         // so they can re-archive byte-identical truncated-field payloads each
-        // round and grow this file once per round. Verify-before-append: when
-        // the pending payload already exists verbatim in the file, skip the
-        // write yet still report success — callers only rely on the archived
-        // bytes being readable back from file_path(). Read or UTF-8 failures
-        // fall through to a plain append (the previous behavior).
-        let already_archived = std::fs::read(&self.path)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .is_some_and(|existing| {
-                let payload_start = self.payload_offset.min(self.buffer.len());
-                existing.contains(&self.buffer[payload_start..])
-            });
-        if already_archived {
+        // round and grow this file once per round. Dedup consults the
+        // persistent fingerprint index instead of scanning the archive body:
+        // a hit skips the write yet still reports success — callers only rely
+        // on the archived bytes being readable back from file_path(). Index
+        // load failures merely re-enable plain appends, the pre-dedup
+        // behavior.
+        let payload_start = self.payload_offset.min(self.buffer.len());
+        let payload = &self.buffer[payload_start..];
+        if payload.is_empty() {
+            // Only the reusable header/separator is pending.
+            return true;
+        }
+        if !self.seen_payloads_loaded {
+            self.seen_payloads_loaded = true;
+            let fingerprints = std::fs::read_to_string(self.fingerprint_index_path())
+                .map(|text| {
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            self.seen_payloads.extend(fingerprints);
+        }
+        let digest = content_sha256_hex(payload.as_bytes());
+        if self.seen_payloads.contains(&digest) {
             return true;
         }
         use std::io::Write;
@@ -426,7 +456,7 @@ impl OverflowSink {
         // passes archived. File::create would truncate the file, leaving only
         // the final pass's batches and degrading long-term memory into
         // short-term memory across multi-pass sessions.
-        std::fs::OpenOptions::new()
+        let appended = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
@@ -434,7 +464,25 @@ impl OverflowSink {
                 f.write_all(self.buffer.as_bytes())?;
                 f.sync_data()
             })
-            .is_ok()
+            .is_ok();
+        if !appended {
+            return false;
+        }
+        // Record the fingerprint only after the bytes above are durably in the
+        // archive; an index-first ordering could make a crash silently drop
+        // the next identical payload while readers still expect its archived
+        // copy. Best effort: losing an index entry just costs one duplicate
+        // append later.
+        self.seen_payloads.insert(digest.clone());
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.fingerprint_index_path())
+            .and_then(|mut f| {
+                writeln!(f, "{digest}")?;
+                f.sync_data()
+            });
+        true
     }
 
     pub(super) fn file_path(&self) -> &Path {
