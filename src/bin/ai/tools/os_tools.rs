@@ -5,24 +5,24 @@ use serde_json::Value;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
-/// 全局 AIOS kernel 句柄，由 driver 启动时通过 [`init_os_tools_globals`] 注入。
+/// Global AIOS kernel handle, injected by the driver at startup via [`init_os_tools_globals`].
 ///
-/// **同步语义**：`GLOBAL_OS` 与 [`crate::ai::types::App::os`] 持有的是
-/// **同一个 `Arc<Mutex<Box<dyn Kernel>>>`**（即 `SharedKernel`），二者只是同一
-/// 内核句柄的两种取用方式：
-/// - `App.os`：driver 流程（foreground / background loop、turn_runtime）使用
-/// - `GLOBAL_OS`：tool 实现（位于 `os_tools.rs` 等）使用，因为 tool 没有
-///   `App` 引用
+/// **Synchronous semantics**: `GLOBAL_OS` and [`crate::ai::types::App::os`] hold
+/// **the same `Arc<Mutex<Box<dyn Kernel>>>`** (i.e. `SharedKernel`); they are just two ways
+/// to obtain the same kernel handle:
+/// - `App.os`: used by driver flows (foreground / background loop, turn_runtime)
+/// - `GLOBAL_OS`: used by tool implementations (in `os_tools.rs` etc.) because tools have no
+///   `App` reference
 ///
-/// 由于底层是同一个 `Arc<Mutex<...>>`，两条路径**互斥**地拿同一把锁；这意味着
-/// 不会出现"两把不同的锁"导致的真死锁，但**会触发 `std::sync::Mutex` 的重入死锁**
-/// （在持有 `app.os.lock()` 的同时，从同一线程进入调用 `GLOBAL_OS.lock()` 的
-/// tool 会立即阻塞或 panic）。所有同步调用方必须保证：在调用 tool 之前先释放
-/// `app.os` 的 lock guard。
+/// Since both wrap the same `Arc<Mutex<...>>`, the two paths take the same lock **exclusively**; this means
+/// there is no true deadlock from "two different locks", but it **can trigger `std::sync::Mutex` re-entrant deadlock**
+/// (calling into a tool that does `GLOBAL_OS.lock()` from the same thread while holding
+/// `app.os.lock()` will block or panic immediately). All synchronous callers must release
+/// the `app.os` lock guard before invoking a tool.
 ///
-/// 高频路径推荐通过 [`task_tools::with_os_kernel`](crate::ai::tools::task_tools)
-/// 访问，它会优先使用 `DRIVER_CTX` 中的引用而不是这个 static，从而减少
-/// 间接寻址。
+/// Hot paths should go through [`task_tools::with_os_kernel`](crate::ai::tools::task_tools),
+/// which prefers the reference in `DRIVER_CTX` over this static, reducing
+/// indirect lookups.
 pub static GLOBAL_OS: LazyLock<Mutex<Option<SharedKernel>>> = LazyLock::new(|| Mutex::new(None));
 
 pub fn init_os_tools_globals(os: SharedKernel) {

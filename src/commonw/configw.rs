@@ -140,9 +140,10 @@ pub fn refresh() {
     }
 }
 
-/// 返回当前配置的 Arc 共享视图。`ConfigW` 的 entries / index 都不小，
-/// 且 `get_all_config` 在 ai 模块单 turn 会被调到数十次；如果按值返回会
-/// 反复深拷贝。改为 Arc 后，调用方共享只读引用、命中缓存几乎零成本。
+/// Return an Arc-shared view of the current config. `ConfigW`'s entries / index are
+/// not small, and `get_all_config` is called dozens of times per turn in the ai
+/// module; returning by value would deep-copy repeatedly. With an Arc, callers share
+/// a read-only reference and cache hits cost almost nothing.
 pub fn get_all_config() -> Arc<ConfigW> {
     if let Ok(lock) = CACHE.read()
         && let Some(cfg) = lock.as_ref()

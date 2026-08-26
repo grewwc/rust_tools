@@ -2,17 +2,21 @@ use serde_json::Value;
 
 use super::{compress::value_to_string, types::Message};
 
-/// 默认硬上限：避免在极长 session 下构造 100MB+ 的中间字符串再截断。
-/// 调用方（如 summarize_history_via_model）即使只想要 12K 也会先在内存里
-/// 拼整个 markdown，因此这里加边界式累计是必要的兜底。
+/// Default hard cap: avoids building a 100MB+ intermediate string before
+/// truncating in extremely long sessions. Callers (such as
+/// summarize_history_via_model) assemble the entire markdown in memory even
+/// when they only want 12K, so a bounded accumulation here is a necessary
+/// safety net.
 const MESSAGES_TO_MARKDOWN_HARD_CAP: usize = 256 * 1024;
 
 pub(in crate::ai) fn messages_to_markdown(messages: &[Message], session_id: &str) -> String {
     messages_to_markdown_capped(messages, session_id, MESSAGES_TO_MARKDOWN_HARD_CAP)
 }
 
-/// 显式带字符预算的导出版本。预算用尽时立即终止追加，并在末尾标注被裁掉的消息数量。
-/// 单测 / sessions export 等需要更大预算的场景可直接调用本函数。
+/// Explicit export variant with a character budget. Appending stops as soon as
+/// the budget is exhausted and the number of dropped messages is noted at the
+/// end. Unit tests and scenarios such as sessions export that need a larger
+/// budget can call this function directly.
 pub(in crate::ai) fn messages_to_markdown_capped(
     messages: &[Message],
     session_id: &str,

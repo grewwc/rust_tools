@@ -252,7 +252,8 @@ pub fn apply_prepared_mcp_init(
     report
 }
 
-/// 异步连接单个 MCP 服务器（使用 spawn_blocking 包装阻塞操作）
+/// Asynchronously connect a single MCP server (wraps blocking operations with
+/// spawn_blocking).
 async fn connect_single_server_async(
     name: String,
     config: McpServerConfig,
@@ -308,7 +309,8 @@ mod tests {
     }
 }
 
-/// 同步连接单个 MCP 服务器（提取自 McpClient::connect_server）
+/// Synchronously connect a single MCP server (extracted from
+/// McpClient::connect_server).
 fn connect_single_server(
     name: &str,
     config: &McpServerConfig,
@@ -343,8 +345,8 @@ fn connect_single_server(
     let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
     let stderr_tail = spawn_stderr_drain(stderr);
 
-    // 设置 stdout 管道为非阻塞模式，使 BufReader::fill_buf 在管道
-    // 暂无数据时返回 WouldBlock 而非无限阻塞
+    // Set the stdout pipe to non-blocking mode so that BufReader::fill_buf
+    // returns WouldBlock when the pipe has no data instead of blocking forever.
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -364,7 +366,7 @@ fn connect_single_server(
         prompts: Vec::new(),
     };
 
-    // 使用独立的请求 ID 计数器
+    // Use a dedicated request-ID counter.
     let next_id = std::sync::atomic::AtomicU64::new(1);
 
     initialize_server(&mut conn, &next_id)?;
@@ -375,7 +377,8 @@ fn connect_single_server(
     Ok(conn)
 }
 
-// 以下函数提取自 McpClient，使用独立的 AtomicU64 计数器
+// The functions below are extracted from McpClient and use a dedicated
+// AtomicU64 counter.
 fn initialize_server(
     conn: &mut McpServerConnection,
     next_id: &std::sync::atomic::AtomicU64,
@@ -398,7 +401,9 @@ fn initialize_server(
 
     let id1 = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     send_request_to_conn(conn, id1, "initialize", Some(params))?;
-    // notifications/initialized 是通知（无 id，不等待响应），不能用请求形式发送
+
+    // notifications/initialized is a notification (no id, no response
+    // expected) and cannot be sent as a request.
     send_notification_to_conn(conn, "notifications/initialized", None)?;
     Ok(())
 }

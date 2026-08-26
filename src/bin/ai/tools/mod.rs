@@ -46,8 +46,8 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "task_integrate",
 ];
 
-// 进程级 allowlist 需要保留上面的完整自助能力，但 manifest 常驻 schema 只补回
-// 真正的执行 baseline；skill 发现工具继续通过 `enable_tools` 按需加载。
+// Process-level allowlist needs to retain the full self-service capability above, but the manifest's resident schema only restores
+// the real execution baseline; skill discovery tools continue to be loaded on demand via `enable_tools`.
 const EAGER_BASELINE_TOOL_NAMES: &[&str] = &[
     "enable_tools",
     "read_file",

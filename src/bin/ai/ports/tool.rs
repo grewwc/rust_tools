@@ -1,5 +1,5 @@
 // =============================================================================
-// ToolExecutor - 工具执行端口（依赖倒置）
+// ToolExecutor - tool execution port (dependency inversion)
 // =============================================================================
 use std::future::Future;
 use std::pin::Pin;
@@ -8,9 +8,9 @@ use crate::ai::{history::{Message, ToolExecutionOutcome}, types::{App, ToolCall,
 #[derive(Debug, Default)]
 pub(crate) struct ToolExecOutput {
     pub tool_results: Vec<ToolResult>,
-    /// 中间件可注入的 assistant 消息（如鉴权拒绝说明）；当前空链恒为空，驱动按需消费。
+    /// Assistant messages that middlewares may inject (e.g. an auth-denial explanation); the current empty chain always yields none, and the driver consumes them on demand.
     pub assistant_messages: Vec<Message>,
-    /// 以下字段透传真实派发的完整结果，保证驱动无损失消费（空链 = 恒等，零行为变化）。
+    /// These fields pass through the full results of the actual dispatch so the driver can consume them losslessly (empty chain = identity, zero behavior change).
     pub executed_tool_calls: Vec<ToolCall>,
     pub cached_hits: Vec<bool>,
     pub execution_outcomes: Vec<Option<ToolExecutionOutcome>>,

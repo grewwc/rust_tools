@@ -1,9 +1,10 @@
 // =============================================================================
-// stages - 可插拔压缩 / 流过滤的 Pipeline Stage 适配
+// stages - Pipeline Stage adapters for pluggable compression / stream filtering
 // =============================================================================
-// 将 `ports::history::Compressor` 与 `ports::stream::StreamFilter` 暴露为
-// `pipeline::Stage`，便于 driver 通过 `Pipeline` / `HookRegistry` / `Middleware` 组合。
-// 默认不启用（零行为变更），仅在显式 push 时生效。
+// Exposes `ports::history::Compressor` and `ports::stream::StreamFilter` as
+// `pipeline::Stage`s so the driver can compose them via `Pipeline` / `HookRegistry` /
+// `Middleware`. Disabled by default (zero behavior change); only effective when explicitly
+// pushed.
 
 use std::{future::Future, pin::Pin};
 
@@ -12,8 +13,8 @@ use super::stage::Stage;
 use crate::ai::ports::history::{Compressor, DefaultCompressor};
 use crate::ai::ports::stream::{FilterChain, StreamFilter};
 
-/// 压缩阶段：在 BuildRequest 之前对 `ctx.messages` 做可插拔压缩。
-/// 若 `max_chars==0` 则透传（与 `history::compress` 契约一致）。
+/// Compression stage: applies pluggable compression to `ctx.messages` before BuildRequest.
+/// Passes through when `max_chars==0` (consistent with the `history::compress` contract).
 pub struct CompressStage {
     name: &'static str,
     compressor: Box<dyn Compressor>,
@@ -34,7 +35,7 @@ impl CompressStage {
 
 impl Stage for CompressStage {
     fn name(&self) -> &'static str { self.name }
-    /// 压缩是构建请求前的预算检查辅助阶段，映射到 BudgetCheck。
+    /// Compression is a budget-check helper stage before building the request; maps to BudgetCheck.
     fn kind(&self) -> StageKind { StageKind::BudgetCheck }
     fn execute<'a, 'b>(
         &'a self,
@@ -51,9 +52,11 @@ impl Stage for CompressStage {
     }
 }
 
-/// 流过滤阶段：在 ParseStream 阶段前后插入过滤器链。
-/// 演示“独立阶段可插过滤器”：实际 chunk 过滤在 `stream::runtime` 循环内逐块 `chain.apply`，
-/// 本 Stage 仅负责在 Pipeline 中占位、记录 tags 供观测/测试，并在 before/after hook 中可替换 chain。
+/// Stream-filtering stage: inserts a filter chain before/after the ParseStream stage.
+/// Demonstrates "independent stages can plug in filters": actual chunk filtering happens via
+/// per-chunk `chain.apply` inside the `stream::runtime` loop; this Stage only occupies a slot
+/// in the Pipeline, records tags for observation/testing, and allows the chain to be replaced
+/// in the before/after hooks.
 pub struct DecodeStage {
     name: &'static str,
     before: FilterChain,
@@ -68,7 +71,8 @@ impl DecodeStage {
     pub fn push_after<F: StreamFilter + 'static>(mut self, f: F) -> Self { self.after = self.after.push(f); self }
     pub fn before_len(&self) -> usize { self.before.len() }
     pub fn after_len(&self) -> usize { self.after.len() }
-    /// 在 Pipeline 上下文中对某段文本模拟 after 链应用（便于单测验证链式行为）。
+    /// Simulates applying the after chain to a piece of text in a Pipeline context (for
+    /// unit-testing chain behavior).
     pub fn apply_after(&self, text: String) -> Option<String> {
         if self.after.is_empty() { Some(text) } else { self.after.apply(text) }
     }
@@ -83,16 +87,18 @@ impl Default for DecodeStage {
 
 impl Stage for DecodeStage {
     fn name(&self) -> &'static str { self.name }
-    /// 解码是请求侧历史解码/流过滤占位，映射到 Decode。
-    /// 注意不要映射到 ParseStream：后者是响应流解析的语义 kind，内层压缩 pipeline 若在此
-    /// 复用会与 driver 的 fire_after_stream_hooks（on_after_stream）双触发。
+    /// Decode is a request-side history-decoding / stream-filtering placeholder; maps to Decode.
+    /// Do not map it to ParseStream: that is the semantic kind for response-stream parsing, and
+    /// reusing it in the inner compression pipeline would double-fire
+    /// fire_after_stream_hooks (on_after_stream) with the driver.
     fn kind(&self) -> StageKind { StageKind::Decode }
     fn execute<'a, 'b>(
         &'a self,
         ctx: &'a mut PipelineContext<'b>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
         Box::pin(async move {
-            // 记录过滤器链指纹，便于 driver/hook 观测（零行为变更：不改 ctx.messages 实时流）
+            // Record a filter-chain fingerprint for driver/hook observation (zero behavior change:
+            // does not touch the live ctx.messages stream)
             if !self.before.is_empty() || !self.after.is_empty() {
                 ctx.tags.push(format!("decode:before={} after={}", self.before.len(), self.after.len()));
             }
@@ -120,7 +126,7 @@ mod tests {
 
     #[tokio::test]
     async fn compress_stage_uses_injected_compressor() {
-        // Noop 保持原样
+        // Noop keeps messages unchanged
         let app = leak_app();
         let messages = vec![msg("user", "a"), msg("assistant", "b"), msg("user", "c")];
         let mut ctx = PipelineContext::new(app, messages.clone(), 0);
@@ -134,8 +140,10 @@ mod tests {
 
     #[tokio::test]
     async fn inner_compress_pipeline_does_not_fire_parse_stream_hooks() {
-        // 回归：内层压缩 pipeline（CompressStage→DecodeStage）是请求侧压缩/解码，不是响应流解析，
-        // 不得触发 ParseStream 钩子——否则与 driver 的 fire_after_stream_hooks 双触发 on_after_stream。
+        // Regression: the inner compression pipeline (CompressStage→DecodeStage) is request-side
+        // compression/decoding, not response-stream parsing, so it must not fire ParseStream
+        // hooks -- otherwise on_after_stream would double-fire with the driver's
+        // fire_after_stream_hooks.
         let app = leak_app();
         let messages = vec![msg("user", "a"), msg("assistant", "b"), msg("user", "c")];
         let mut ctx = PipelineContext::new(app, messages, 0);
@@ -162,7 +170,7 @@ mod tests {
             .push(DecodeStage::default());
         pipeline.execute(&mut ctx, &hooks).await.unwrap();
 
-        // 仅 BudgetCheck.after 与 Decode.after 触发；ParseStream.after 不得出现。
+        // Only BudgetCheck.after and Decode.after fire; ParseStream.after must not appear.
         assert_eq!(
             *fired.lock().unwrap(),
             vec!["budget".to_string(), "decode".to_string()]
@@ -174,13 +182,15 @@ mod tests {
         let app = leak_app();
         let messages = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2"), msg("assistant", "a2"), msg("user", "u3")];
         let mut ctx = PipelineContext::new(app, messages, 0);
-        // max_chars 小，keep_last=1 预期触发裁剪（DefaultCompressor 走 history::compress 简化版）
+        // Small max_chars with keep_last=1 is expected to trigger truncation (DefaultCompressor
+        // uses a simplified history::compress)
         let stage = CompressStage::with_default(10, 1);
         let pipeline = crate::ai::pipeline::stage::Pipeline::new().push(stage);
         let tp = DefaultTurnPipeline::new("test-default", pipeline);
         let hooks = HookRegistry::new();
         tp.run(&mut ctx, &hooks).await.unwrap();
-        // 只要压缩后长度 <= 原长度且非空，即证明 compressor 被调用
+        // As long as the compressed length is <= the original and non-empty, the compressor
+        // was invoked
         assert!(!ctx.messages.is_empty());
         assert!(ctx.messages.len() <= 5);
     }

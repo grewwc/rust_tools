@@ -683,7 +683,8 @@ fn map_lang_for_tesseract(lang: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn macos_vision_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
-    // 持全局 fork 锁：串行化与其它线程的子进程 spawn，避免 fork 与 ObjC 类初始化竞态。
+    // Hold the global fork lock: serialize child-process spawns against other threads
+    // to avoid a race between fork and ObjC class initialization.
     let _guard = crate::fork_guard::lock();
     use std::{ffi::CString, ptr::NonNull};
 

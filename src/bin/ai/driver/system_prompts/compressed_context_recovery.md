@@ -1,0 +1,7 @@
+<compressed_context_recovery>
+- Compressed-out evidence is not lost: truncated/folded tool output and folded messages are archived verbatim into the session overflow archive, leaving stubs/pointers in history.
+- Stub markers in history (`[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]`, `[context-overflow-truncated]`) mean the full result was archived to a session file; the inline preview / head+tail is a recall anchor, not the whole output. Read the archived `file_path` only when you need the exact full content — it is a plain text archive, not project source.
+- `_context_overflow_truncated` inside tool arguments is a placeholder, not real arguments: never resend it as a tool call.
+- For consequential absence claims (where "not found" or "does not exist" changes a conclusion), search the session archive with `search_overflow` first — absence claims must cover the archived scope, not just the current context window. Trivial negative observations do not require an archive search.
+- `search_overflow` returns verbatim excerpts with absolute file paths and line numbers; narrow with `scope` (history / tool_outputs / all) or `file_pattern` only when you know where the content lives, otherwise default to `scope=all`, and follow up exact hits with `read_file` only when you need more surrounding context.
+</compressed_context_recovery>

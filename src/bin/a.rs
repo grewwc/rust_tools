@@ -2,7 +2,8 @@ mod ai;
 pub use rust_tools::*;
 
 fn main() {
-    // 使用同步入口，以便后台模式 (-bg) 在创建 tokio runtime 之前完成 daemonize。
+    // Use the synchronous entry point so that background mode (-bg) can finish
+    // daemonizing before the tokio runtime is created.
     if let Err(err) = ai::entry() {
         eprintln!("{err}");
         std::process::exit(1);

@@ -232,8 +232,13 @@ impl<'de> Deserialize<'de> for StreamDelta {
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct StreamToolCall {
+    /// Cumulative key provided by the server. `None` means the gateway omitted
+    /// `index` entirely (or sent explicit null): it must NOT fall back to the
+    /// serde default 0, or parallel tool calls would all collide onto the same
+    /// cumulative builder and overwrite each other; the stream layer resolves
+    /// composite keys by call id.
     #[serde(default)]
-    pub(crate) index: usize,
+    pub(crate) index: Option<usize>,
     #[serde(default, deserialize_with = "string_or_default")]
     pub(crate) id: String,
     #[serde(rename = "type", default, deserialize_with = "string_or_default")]

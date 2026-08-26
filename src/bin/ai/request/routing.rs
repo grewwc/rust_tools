@@ -1,10 +1,11 @@
-//! 技能路由（skill routing）逻辑。
+//! Skill routing logic.
 //!
-//! 通过辅助模型决定当前请求是否需要激活某个已注册 skill：
-//! - `select_skill_via_model`：对外入口，分块路由 + 置信度阈值
-//! - `select_skill_candidate_via_model`：单块候选选择
-//! - `parse_router_output` / `extract_router_content`：解析辅助模型 JSON 响应
-//! - `strip_json_fence`：去除 ```json 围栏
+//! Uses an auxiliary model to decide whether the current request should
+//! activate a registered skill:
+//! - `select_skill_via_model`: public entry point; chunked routing + confidence threshold
+//! - `select_skill_candidate_via_model`: single-chunk candidate selection
+//! - `parse_router_output` / `extract_router_content`: parse the auxiliary model's JSON response
+//! - `strip_json_fence`: strip ```json fences
 
 use std::time::{Duration, Instant};
 
@@ -137,7 +138,7 @@ Skills:
     let api_key = api_key_for_request_model(app, &control_model);
     let http_body =
         super::protocol::build_http_body_for_request(&control_model, &endpoint, &mut request_body);
-    // 辅助请求（skill 路由），15 秒超时兜底，理由同上。
+    // Auxiliary request (skill routing); 15-second timeout fallback, same rationale as above.
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
         .body(http_body)

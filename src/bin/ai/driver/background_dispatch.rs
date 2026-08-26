@@ -35,9 +35,11 @@ use super::{BgSubagentGuard, TASK_PID, terminate_and_cleanup};
 
 const MAX_SUBAGENT_STATUS_DETAILS: usize = 3;
 
-/// 后台 subagent 的历史只在进程仍可继续调度时保留。正常终止、失败、panic 或
-/// `task_cancel` 导致 future 被 abort 时都会通过 Drop 清理。私有 memory 文件与
-/// 独占 cwd scratch 目录与 history 同生命周期，一并在此回收，避免长跑堆积。
+/// Background subagent history is kept only while the process can still be
+/// scheduled. Normal termination, failure, panic, or a `task_cancel` that aborts
+/// the future are all cleaned up via Drop. Private memory files and the exclusive
+/// cwd scratch directory share history's lifetime and are reclaimed here too,
+/// preventing buildup over long runs.
 struct BackgroundSubagentHistoryGuard {
     path: Option<PathBuf>,
     memory_path: Option<PathBuf>,
@@ -53,8 +55,10 @@ impl BackgroundSubagentHistoryGuard {
         }
     }
 
-    /// 登记随任务派生、需与 history 同生命周期回收的私有 memory 文件与独占 cwd
-    /// scratch 目录。路径是确定性拼接，可在构造点一次算好传入。
+    /// Register the private memory files and exclusive cwd scratch directory that
+    /// are spawned with the task and must be reclaimed with history's lifetime.
+    /// Paths are built deterministically, so they can be computed once at
+    /// construction.
     fn with_scoped_artifacts(
         mut self,
         memory_path: Option<PathBuf>,
@@ -90,15 +94,17 @@ impl Drop for BackgroundSubagentHistoryGuard {
     }
 }
 
-/// 前台唯一的 subagent 状态展示。后台任务保持静默，只在调度循环的安全点刷新
-/// 一条紧凑状态行，避免并发正文或多行 ANSI 重绘打乱 terminal。
+/// The only foreground-facing subagent status display. Background tasks stay
+/// silent, refreshing one compact status line only at scheduler safe points, so
+/// concurrent prose or multi-line ANSI redraws never disturb the terminal.
 pub(super) struct SubagentStatusLine {
     last_line: Option<String>,
     is_tty: bool,
 }
 
-/// 状态栏字段必须保持单行且不能携带终端控制字符。任务描述来自模型参数，
-/// 因此不能直接写入前台 TTY。
+/// Status bar fields must stay single-line and carry no terminal control
+/// characters. The task description comes from model arguments, so it cannot be
+/// written to the foreground TTY directly.
 fn sanitize_status_field(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
     let mut pending_space = false;
@@ -125,13 +131,58 @@ impl SubagentStatusLine {
     }
 
     pub(super) fn refresh(&mut self, app: &App) {
-        let statuses = {
+        let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
+        let current_pid = std::process::id() as i32;
+        let mut session_ids = crate::ai::driver::session_pid::scan_all_session_pids(
+            store.sessions_root(),
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, pid, alive)| *alive && *pid == current_pid)
+        .map(|(session_id, _, _)| session_id)
+        .collect::<Vec<_>>();
+        if !session_ids.iter().any(|session_id| session_id == &app.session_id) {
+            session_ids.push(app.session_id.clone());
+        }
+        session_ids.sort();
+        session_ids.dedup();
+
+        let statuses_by_session = {
             let mut os = app.os.lock().unwrap_or_else(|err| err.into_inner());
-            crate::ai::tools::task_tools::subagent_terminal_statuses(
-                os.as_mut(),
-                app.session_id.as_str(),
-            )
+            session_ids
+                .into_iter()
+                .map(|session_id| {
+                    let statuses = crate::ai::tools::task_tools::subagent_terminal_statuses(
+                        os.as_mut(),
+                        &session_id,
+                    );
+                    (session_id, statuses)
+                })
+                .collect::<Vec<_>>()
         };
+
+        let mut statuses = Vec::new();
+        for (session_id, session_statuses) in statuses_by_session {
+            let snapshots = session_statuses
+                .iter()
+                .map(|status| crate::ai::driver::session_pid::AgentSnapshot {
+                    agent_name: status.agent_name.clone(),
+                    description: status.description.clone(),
+                    state: status.state.clone(),
+                    elapsed_secs: status.elapsed_secs,
+                    progress: status.progress.clone(),
+                })
+                .collect::<Vec<_>>();
+            let _ = crate::ai::driver::session_pid::write_agent_snapshots(
+                store.sessions_root(),
+                &session_id,
+                &snapshots,
+            );
+            if session_id == app.session_id {
+                statuses = session_statuses;
+            }
+        }
+
         if statuses.is_empty() {
             return;
         }
@@ -152,7 +203,8 @@ impl SubagentStatusLine {
         self.last_line = Some(line);
     }
 
-    /// 前台即将恢复流式输出或输入框前，把动态行固定并结束，之后不再占用光标行。
+    /// Before the foreground resumes streaming output or the input box, finalize
+    /// and end the dynamic line so it no longer occupies a cursor row.
     pub(super) fn finish(&mut self) {
         let Some(line) = self.last_line.take() else {
             return;
@@ -224,8 +276,9 @@ fn format_subagent_elapsed(elapsed_secs: u64) -> String {
 
 impl Drop for SubagentStatusLine {
     fn drop(&mut self) {
-        // 所有提前返回和错误路径都必须先结束未换行的动态状态行，避免 shell prompt
-        // 或后续错误文本接在状态栏末尾。
+        // Every early return and error path must first end the unterminated
+        // dynamic status line, so the shell prompt or later error text does not
+        // append to it.
         self.finish();
     }
 }
@@ -322,13 +375,13 @@ mod tests {
 
         let history = root.join("session.subagent-task_x.sqlite");
         std::fs::write(&history, b"db").unwrap();
-        // 私有 memory：jsonl 本体 + 派生 .db 及其 WAL sidecar。
+        // Private memory: the jsonl body + derived .db and its WAL sidecar.
         let memory = root.join("agent_memory.subagent-task_x.jsonl");
         std::fs::write(&memory, b"[]").unwrap();
         let memory_db = root.join("agent_memory.subagent-task_x.db");
         std::fs::write(&memory_db, b"db").unwrap();
         std::fs::write(format!("{}-wal", memory_db.display()), b"wal").unwrap();
-        // 独占 cwd scratch 目录（含内容，需递归删除）。
+        // Exclusive cwd scratch directory (including contents; needs recursive removal).
         let cwd = root.join("subagent-cwd-task_x");
         std::fs::create_dir_all(cwd.join("nested")).unwrap();
         std::fs::write(cwd.join("scratch.txt"), b"tmp").unwrap();
@@ -347,7 +400,7 @@ mod tests {
         );
         assert!(!cwd.exists(), "cwd scratch dir must be recursively cleaned");
 
-        // preserve() 必须让 memory/cwd 也一并保留（正常结束 / resume 场景）。
+        // preserve() must also keep memory/cwd (normal-end / resume scenarios).
         let history2 = root.join("session.subagent-task_y.sqlite");
         let memory2 = root.join("agent_memory.subagent-task_y.jsonl");
         let cwd2 = root.join("subagent-cwd-task_y");
@@ -480,8 +533,9 @@ pub(super) fn dispatch_background_batch(
             }
         };
         let mailbox_messages: Vec<String> = proc.mailbox.iter().cloned().collect();
-        // mailbox 非空时 build_background_process_question 走 format_wakeup_prompt，
-        // 生成的是系统调度通知（非用户输入），持久化时应标记为 internal_note。
+        // When the mailbox is non-empty, build_background_process_question goes
+        // through format_wakeup_prompt, producing a system scheduling notice
+        // (not user input), so it should be persisted marked as an internal_note.
         let is_resume_wakeup = !mailbox_messages.is_empty();
         if !mailbox_messages.is_empty() {
             let mut os = app.os.lock().unwrap();
@@ -549,12 +603,16 @@ pub(super) fn dispatch_background_batch(
     ) in task_specs
     {
         let mut task_app = app.clone();
-        // 后台任务必须拥有独立的 streaming/cancel_stream 标志：`App::clone` 默认与
-        // 父 App 共享同一组 Arc，多个并发后台 run_turn 会互相覆写 streaming、互相
-        // 清除 cancel（clear_stream_cancel 会重置共享 cancel_stream）。后台任务的
-        // cancel_stream 必须与 registry 条目共享：同步命令会轮询它并在 timeout/cancel
-        // 时杀掉实际 OS 进程组，单靠 Tokio abort 无法打断正在执行的同步 poll。
-        // shutdown 仍与父 App 共享：会话级退出需传播到后台任务让其优雅收尾。
+        // Background tasks need their own streaming/cancel_stream flags:
+        // `App::clone` by default shares the same Arc set with the parent App, so
+        // concurrent background run_turns would overwrite each other's streaming
+        // and cancel each other (clear_stream_cancel resets the shared
+        // cancel_stream). A background task's cancel_stream must be shared with
+        // its registry entry: the sync command polls it and kills the actual OS
+        // process group on timeout/cancel, and Tokio abort alone cannot interrupt
+        // an in-flight sync poll. shutdown still stays shared with the parent
+        // App: a session-level exit must propagate to background tasks so they
+        // can wind down gracefully.
         task_app.streaming = Arc::new(AtomicBool::new(false));
         task_app.cancel_stream = task_id
             .as_deref()
@@ -629,9 +687,11 @@ pub(super) fn dispatch_background_batch(
         let phase_slot_for_payload = phase_slot.clone();
         let parent_history_for_scopes = original_history_file.clone();
 
-        // 私有 memory 文件与独占 cwd scratch 目录都随任务派生，需与 history
-        // 同生命周期回收（正常结束由 preserve 保留，异常/abort/panic 由 Drop 清理）。
-        // 两者路径都必须复用建立时的同源逻辑，避免第二份定义漂移导致漏删/误删。
+        // Private memory files and the exclusive cwd scratch directory are
+        // spawned with the task and reclaimed with history's lifetime (preserve
+        // keeps them on normal end; Drop cleans them up on error/abort/panic).
+        // Both paths must reuse the same logic used at creation time, so a second
+        // divergent definition cannot cause missed or wrong deletions.
         let scoped_memory_path = (!inherit.memory).then(|| {
             runtime_ctx::make_subagent_memory_path(&parent_history_for_scopes, &scope_task_id)
         });
@@ -793,24 +853,28 @@ pub(super) fn dispatch_background_batch(
         wrapped = Box::pin(runtime_ctx::SUBAGENT_PHASE.scope(phase_slot, wrapped));
         wrapped = Box::pin(runtime_ctx::SUBAGENT_TASK_ID.scope(scope_task_id.clone(), wrapped));
         if let Some(mem_path) = scoped_memory_path {
-            // sub-agent 默认私有 memory：finalize 后把白名单条目
-            // (is_permanent_memory) 合并回主 memory 文件，让 long-term
-            // assets 能跨 task 共享，但普通 task_event 留在私有文件，
-            // 不污染主记忆。
+            // Subagents have private memory by default: after finalize,
+            // whitelisted entries (is_permanent_memory) are merged back into the
+            // main memory file so long-term assets can be shared across tasks,
+            // while ordinary task_events stay in the private file and never
+            // pollute main memory.
             wrapped = Box::pin(runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped));
         }
         if let Some(scratch) = scoped_cwd_dir {
             wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
         }
-        // 设置子代理嵌套深度，供 `task_spawn` / `task` 在子代理内部
-        // 检测递归扇出时使用。
+        // Set the subagent nesting depth, used by `task_spawn` / `task` to
+        // detect recursive fan-out inside subagents.
         wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(spawn_depth, wrapped));
-        // 后台任务只把最终结果交给 task_wait/task_status 聚合；禁止各 subagent
-        // 直接争用前台 terminal，避免并发流式输出和 ANSI 光标控制互相破坏。
+        // Background tasks only hand final results to task_wait/task_status
+        // aggregation; subagents are forbidden from contending for the foreground
+        // terminal directly, avoiding concurrent streaming output and ANSI cursor
+        // control corrupting each other.
         wrapped = Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped));
 
-        // 计入在途后台子 agent：guard 随 spawned future 一同 move 进任务，
-        // 任务结束（正常 / 错误 / panic）时 Drop 自动 dec，避免输入框被永久门控。
+        // Count the in-flight background subagent: the guard is moved into the
+        // task with the spawned future, and Drop auto-decrements on task end
+        // (normal/error/panic), so the input box is never gated permanently.
         let inflight_guard = BgSubagentGuard::new();
         let guarded_fut = async move {
             let _inflight_guard = inflight_guard;

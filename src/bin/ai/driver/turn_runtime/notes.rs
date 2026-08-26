@@ -29,8 +29,8 @@ Keep goal continuity in mind:\n- First summarize the facts confirmed so far\n- S
     });
 }
 
-/// 工具循环检测命中后，向 messages 注入一条 internal_note 让 agent 自我反思
-/// （而非直接 force_final，给 agent 一个跳出循环的机会）。
+/// After a tool-loop detection hit, inject an internal_note into messages so the agent can
+/// self-reflect (instead of force_final directly, giving the agent a chance to break the loop).
 pub(super) fn inject_loop_breaker_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
@@ -65,7 +65,7 @@ pub(super) fn inject_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::
 
 pub(super) const TOOL_STOP_REASON_PREFIX: &str = "[runtime-tool-stop]";
 
-/// 将进入无工具收口模式的首个根因仅写入当前 request context。
+/// Record the first root cause for entering no-tool wrap-up mode only in the current request context.
 pub(in crate::ai::driver::turn_runtime) fn record_force_final_reason(
     messages: &mut Vec<crate::ai::history::Message>,
     reason: &str,
@@ -85,9 +85,10 @@ pub(in crate::ai::driver::turn_runtime) fn record_force_final_reason(
         return;
     }
 
-    // 持久化到决策日志（磁盘 JSONL）：no-tool-handoff 根因的事后可观测通道。决策日志
-    // 是会话旁路记录、不进入模型上下文，因此不存在 internal note 被提升为 system 的
-    // 重放问题；canonical turn_messages 里的控制状态仍只保留在本次请求投影中。
+    // Persist to the decision log (disk JSONL): an observable channel for no-tool-handoff root
+    // causes. The decision log is a session-side record that never enters the model context, so
+    // there is no replay problem of an internal note being promoted to system; control state in
+    // canonical turn_messages still lives only in the current request projection.
     crate::ai::driver::decision_log::log_runtime_stop(
         crate::ai::driver::decision_log::get_decision_log_store(),
         &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
@@ -107,14 +108,17 @@ pub(in crate::ai::driver::turn_runtime) fn record_force_final_reason(
         tool_call_id: None,
         reasoning_content: None,
     };
-    // 运行时停止原因只属于本次请求投影；若写入 canonical turn_messages，下一轮会把
-    // 过期的 no-tool-handoff 控制状态重新提升为 system 并永久重放。
+    // Runtime stop reasons belong only to the current request projection; if written to canonical
+    // turn_messages, the next round would promote the stale no-tool-handoff control state back to
+    // system and replay it forever.
     messages.push(event);
 }
 
-/// 近似低收益重复命中：同一工具反复命中同一目标资源（仅翻页/检索参数在变）。
-/// 提醒 agent 判断这些调用是否真的在推进问题；若只是碎片化翻页则收敛，
-/// 若各轮服务于不同且明确的子问题则允许继续。软提示，不强制收敛。
+/// Approximate low-yield repetition hit: the same tool keeps hitting the same target resource
+/// (only paging/search-window parameters vary).
+/// Reminds the agent to judge whether these calls actually advance the problem: converge if it is
+/// just fragmented paging, continue if each round serves a distinct, well-defined sub-question.
+/// Soft notice; does not force convergence.
 pub(super) fn inject_coarse_loop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
@@ -131,9 +135,11 @@ pub(super) fn inject_coarse_loop_note(messages: &mut Vec<crate::ai::history::Mes
     });
 }
 
-/// 混合工具轮的目标级重复提示：同一目标被穿插在不同工具批次里反复取证。
-/// 与 coarse 提示同级（温和、不阻断），但措辞强调「换工具查同一个东西」这一
-/// 特定反模式，引导模型复用已读结果而非再换个工具重查一遍。
+/// Target-level repetition notice for mixed tool rounds: the same target keeps being re-examined
+/// across different tool batches.
+/// Same level as the coarse notice (gentle, non-blocking), but the wording highlights the specific
+/// anti-pattern of "checking the same thing with a different tool", steering the model to reuse
+/// what it already read instead of re-checking with yet another tool.
 pub(super) fn inject_target_repeat_loop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
@@ -151,8 +157,9 @@ pub(super) fn inject_target_repeat_loop_note(messages: &mut Vec<crate::ai::histo
     });
 }
 
-    /// 同目标「从头重读」重扫软提示：同一文件被反复从文件头开始读（页宽每轮都变、
-    /// 或混入每轮不同的新归档路径），已累计多次从头重读。
+    /// Soft notice for repeated "re-read from the top" rescans of the same target: the same file
+    /// keeps being read from the beginning (page width changes each round, or each round mixes in a
+    /// different new archive path), accumulating many full re-reads.
 pub(super) fn inject_target_rescan_note(
     messages: &mut Vec<crate::ai::history::Message>,
     target: &str,
@@ -175,8 +182,8 @@ pub(super) fn inject_target_rescan_note(
     });
 }
 
-    /// 同目标「从头重读」重扫硬停止：同一文件从头重读超过硬阈值，判定为翻页+混轮
-/// 循环，强制无工具收口。
+    /// Hard stop for "re-read from the top" rescans of the same target: full re-reads of the same
+    /// file exceed the hard threshold, judged a paging + mixed-round loop, forcing no-tool wrap-up.
 pub(super) fn inject_target_rescan_hard_stop_note(
     messages: &mut Vec<crate::ai::history::Message>,
     target: &str,
@@ -199,8 +206,9 @@ pub(super) fn inject_target_rescan_hard_stop_note(
     });
 }
 
-/// 低收益的 `execute_command` 粗粒度重复升级到 hard-stop：在同一 coarse 目标上
-/// 连续多轮只改窗口/排序细节，基本可判定为无效探索。
+/// Low-yield `execute_command` coarse repetition escalated to hard-stop: many consecutive rounds
+/// on the same coarse target only vary window/sort details, which is basically judged ineffective
+/// exploration.
 pub(super) fn inject_coarse_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
@@ -216,20 +224,24 @@ pub(super) fn inject_coarse_hard_loop_stop_note(messages: &mut Vec<crate::ai::hi
     });
 }
 
-/// Progress Budget 第一级（软反思）：连续多轮无可测信息增益。
-/// 收敛类提示在“工具仍可继续”的阶段（soft / breadth / ledger）要求模型写下的
-/// 账本 / 归纳属于**内部自省**，必须落在隐藏的 `<meta:self_note>…</meta:self_note>`
-/// 通道里：流层 [`push_text_with_hidden_meta`](crate::ai::stream) 会把它从可见输出
-/// 剥离、持久化成 internal_note，下一轮模型仍能读到。若不约束落点，模型会把这段
-/// 中途反思写进面向用户的正文，被立即流式呈现成「预结论」，并与真正的最终答复
-/// 重复（本次事故的直接成因）。硬停 / 迭代上限等 force-final 提示不套用本约束——
-/// 那时正文就是最终答复。
+/// Progress Budget level 1 (soft reflection): several consecutive rounds with no measurable
+/// information gain.
+/// For convergence-style notices while tools may still continue (soft / breadth / ledger), the
+/// ledger / summary the model is asked to write is **internal self-reflection** and must go into
+/// the hidden `<meta:self_note>...</meta:self_note>` channel: the stream layer
+/// [`push_text_with_hidden_meta`](crate::ai::stream) strips it from visible output, persists it
+/// as an internal_note, and the model still reads it next round. Without constraining the landing
+/// spot, the model would write this mid-reflection into the user-facing body, get it streamed
+/// immediately as a "preliminary conclusion", and duplicate the real final answer (the direct
+/// cause of that incident). Hard-stop / iteration-limit force-final notices do not apply this
+/// constraint -- there the body text is the final answer.
 pub(super) const SELF_NOTE_REFLECTION_CHANNEL_HINT: &str = "\n\
     Important (placement constraint): the ledger / summary asked for above is internal self-reflection; write it in full \
     between `<meta:self_note>` and `</meta:self_note>`; it is not shown to the user but stays in your subsequent context.\n\
     Keep the user-facing text of this round empty or limited to the next step you are continuing with; write a real final conclusion only when you are genuinely wrapping up.";
 
-/// 反思式提示，不阻断工具——给模型解释「为什么还要继续同方向」和继续探索的权利。
+/// Reflective notice that does not block tools -- gives the model the right to explain "why
+/// continue in the same direction" and to keep exploring.
 pub(super) fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
@@ -249,8 +261,9 @@ pub(super) fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::histor
     });
 }
 
-/// ReadOnly 广度检查：新目标仍算信息增益；这里只在目标面过宽时提醒先归纳，
-/// 不阻断工具，避免把大型排查任务误判为低进展。
+/// Read-only breadth check: new targets still count as information gain; this only reminds the
+/// model to consolidate first when the target surface is too broad, without blocking tools, so
+/// large investigations are not misjudged as low progress.
 pub(super) fn inject_read_only_breadth_note(
     messages: &mut Vec<crate::ai::history::Message>,
     agent_team_active: bool,
@@ -279,8 +292,9 @@ pub(super) fn inject_read_only_breadth_note(
     });
 }
 
-/// Progress Budget 第二级（记账）：软提示后仍无进展，要求写下轻量决策账本，
-/// 让模型显式说明继续探索的依据。仍不硬阻断工具。
+/// Progress Budget level 2 (ledger): still no progress after the soft notice; requires writing a
+/// lightweight decision ledger so the model explicitly states its basis for continuing. Still
+/// does not hard-block tools.
 pub(super) fn inject_progress_ledger_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
@@ -303,7 +317,8 @@ pub(super) fn inject_progress_ledger_note(messages: &mut Vec<crate::ai::history:
     });
 }
 
-/// Progress Budget 第三级（硬停）：软提示 + 记账后仍连续无进展，切换无工具收口。
+/// Progress Budget level 3 (hard stop): still no progress after soft notice + ledger, switch to
+/// no-tool wrap-up.
 pub(super) fn inject_low_progress_hard_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
@@ -320,7 +335,8 @@ pub(super) fn inject_low_progress_hard_stop_note(messages: &mut Vec<crate::ai::h
     });
 }
 
-/// 分级、阶段感知的工具轮次检查点；它调度下一步，但不把刚完成的工具标成失败。
+/// Tiered, phase-aware tool-round checkpoint; it schedules the next step but never marks a
+/// just-completed tool as failed.
 pub(super) fn inject_tool_round_checkpoint_note(
     messages: &mut Vec<crate::ai::history::Message>,
     iteration: usize,
@@ -348,7 +364,7 @@ pub(super) fn inject_tool_round_checkpoint_note(
     });
 }
 
-/// max_iterations 触发后的自反思 prompt（替代纯 force_final 举手投降）。
+/// Self-reflection prompt after max_iterations is hit (replaces an outright force_final surrender).
 pub(super) fn inject_iteration_limit_reflect_note(
     messages: &mut Vec<crate::ai::history::Message>,
     max_iterations: usize,
@@ -369,7 +385,8 @@ pub(super) fn inject_iteration_limit_reflect_note(
     });
 }
 
-/// 同步等待快到硬超时时，请子代理停止扩展新分支，优先交付可验证结论。
+/// When the synchronous wait is close to its hard timeout, ask the subagent to stop expanding new
+/// branches and prioritize delivering verifiable conclusions.
 pub(super) fn inject_subagent_pre_timeout_wrap_up_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;

@@ -1,47 +1,292 @@
-//! Session PID 注册：每个 `a` 进程启动时在 sessions 目录下写入
-//! `<session_id>.<pid>.pid` 文件，退出时自动删除。
+//! Session PID registration: every `a` process writes a `<session_id>.<pid>.pid`
+//! file under the sessions directory at startup and removes it on exit.
 //!
-//! `/proc` 命令通过扫描这些文件来发现所有正在运行的 session
-//! （前台 + `a -bg` 后台），而不是仅依赖 cwd 下的 `*.pid`（只有 `-bg` 才写）。
+//! The `/proc` command discovers all running sessions by scanning these files
+//! (foreground + `a -bg` background), instead of relying only on the cwd `*.pid`
+//! files (written only by `-bg`).
 //!
-//! 设计要点：
-//! - 使用 Drop guard 确保正常退出 / panic 时文件被清理。
-//! - 即使进程被 SIGKILL 杀死（Drop 不会执行），`/proc` 也会通过
-//!   PID 存活探测清理残留文件。
-//! - 文件内容仅为 PID 的十进制文本，与 `a -bg` 的 cwd PID 文件格式一致。
+//! Design notes:
+//! - A Drop guard cleans up the file on normal exit / panic.
+//! - Even if the process is SIGKILLed (Drop never runs), `/proc` also cleans
+//!   up leftover files via a PID-liveness probe.
+//! - File content is the decimal PID text only, matching the cwd PID file
+//!   format of `a -bg`.
 
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
 
-/// 写入并管理 sessions 目录下的 `<session_id>.<pid>.pid` 文件。
-/// 创建时写入 PID，Drop 时删除文件。
+/// A compact, cross-process view of one live subagent.
+///
+/// The owning `a` process writes these next to its session PID marker so a
+/// separate `a /proc` invocation can inspect subagents without reaching into
+/// another process's in-memory task registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::ai) struct AgentSnapshot {
+    pub(in crate::ai) agent_name: String,
+    pub(in crate::ai) description: String,
+    pub(in crate::ai) state: String,
+    pub(in crate::ai) elapsed_secs: u64,
+    pub(in crate::ai) progress: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentSnapshotFile {
+    process_start_token: String,
+    snapshots: Vec<AgentSnapshot>,
+}
+
+static OWN_PROCESS_START_TOKEN: OnceLock<Option<String>> = OnceLock::new();
+
+const MAX_AGENT_SNAPSHOTS: usize = 32;
+const MAX_AGENT_NAME_CHARS: usize = 64;
+const MAX_AGENT_STATE_CHARS: usize = 32;
+const MAX_AGENT_DETAIL_CHARS: usize = 512;
+const MAX_AGENT_SNAPSHOT_BYTES: u64 = 64 * 1024;
+
+fn truncate_snapshot_field(value: &str, limit: usize) -> String {
+    let mut truncated = value.chars().take(limit).collect::<String>();
+    if value.chars().nth(limit).is_some() {
+        truncated.push('…');
+    }
+    truncated
+}
+
+fn bounded_agent_snapshots(snapshots: &[AgentSnapshot]) -> Vec<AgentSnapshot> {
+    snapshots
+        .iter()
+        .take(MAX_AGENT_SNAPSHOTS)
+        .map(|snapshot| AgentSnapshot {
+            agent_name: truncate_snapshot_field(&snapshot.agent_name, MAX_AGENT_NAME_CHARS),
+            description: truncate_snapshot_field(&snapshot.description, MAX_AGENT_DETAIL_CHARS),
+            state: truncate_snapshot_field(&snapshot.state, MAX_AGENT_STATE_CHARS),
+            elapsed_secs: snapshot.elapsed_secs,
+            progress: snapshot
+                .progress
+                .as_deref()
+                .map(|progress| truncate_snapshot_field(progress, MAX_AGENT_DETAIL_CHARS)),
+        })
+        .collect()
+}
+
+fn agent_snapshots_are_bounded(snapshots: &[AgentSnapshot]) -> bool {
+    snapshots.len() <= MAX_AGENT_SNAPSHOTS
+        && snapshots.iter().all(|snapshot| {
+            snapshot.agent_name.chars().count() <= MAX_AGENT_NAME_CHARS + 1
+                && snapshot.description.chars().count() <= MAX_AGENT_DETAIL_CHARS + 1
+                && snapshot.state.chars().count() <= MAX_AGENT_STATE_CHARS + 1
+                && snapshot.progress.as_ref().is_none_or(|progress| {
+                    progress.chars().count() <= MAX_AGENT_DETAIL_CHARS + 1
+                })
+        })
+}
+
+fn read_bounded_snapshot_file(path: &std::path::Path) -> Option<AgentSnapshotFile> {
+    let file = fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_AGENT_SNAPSHOT_BYTES {
+        return None;
+    }
+
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_AGENT_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut content)
+        .ok()?;
+    if content.len() as u64 > MAX_AGENT_SNAPSHOT_BYTES {
+        return None;
+    }
+
+    let snapshot_file = serde_json::from_slice::<AgentSnapshotFile>(&content).ok()?;
+    agent_snapshots_are_bounded(&snapshot_file.snapshots).then_some(snapshot_file)
+}
+
+fn process_start_token(pid: i32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+fn own_process_start_token() -> Option<String> {
+    OWN_PROCESS_START_TOKEN
+        .get_or_init(|| process_start_token(std::process::id() as i32))
+        .clone()
+}
+
+fn agent_snapshot_path_for_pid_file(pid_file: &std::path::Path) -> PathBuf {
+    pid_file.with_extension("agents.json")
+}
+
+fn safe_session_id(session_id: &str) -> String {
+    session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}
+
+fn agent_snapshot_path(sessions_root: &std::path::Path, session_id: &str, pid: u32) -> PathBuf {
+    let safe_id = safe_session_id(session_id);
+    sessions_root.join(format!("{safe_id}.{pid}.agents.json"))
+}
+
+fn snapshot_directories(sessions_root: &std::path::Path) -> Vec<PathBuf> {
+    let base = resolve_sessions_base(sessions_root);
+    let mut directories = vec![sessions_root.to_path_buf()];
+    if base != sessions_root {
+        directories.push(base.clone());
+    }
+    if let Ok(entries) = fs::read_dir(&base) {
+        directories.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.is_dir() && path.extension().and_then(|suffix| suffix.to_str()) == Some("sessions")
+        }));
+    }
+    directories.sort();
+    directories.dedup();
+    directories
+}
+
+fn agent_snapshot_paths(
+    sessions_root: &std::path::Path,
+    session_id: &str,
+    pid: u32,
+) -> Vec<PathBuf> {
+    let safe_id = safe_session_id(session_id);
+    let marker_name = format!("{safe_id}.{pid}.pid");
+    let mut paths = vec![agent_snapshot_path(sessions_root, session_id, pid)];
+    for directory in snapshot_directories(sessions_root) {
+        if directory.join(&marker_name).is_file() {
+            paths.push(agent_snapshot_path(&directory, session_id, pid));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Publish the live subagent view for this process. An empty snapshot clears
+/// the sidecar so completed and collected tasks do not appear as active.
+pub(in crate::ai) fn clear_agent_snapshots(
+    sessions_root: &std::path::Path,
+    session_id: &str,
+) -> io::Result<()> {
+    let mut error = None;
+    for path in agent_snapshot_paths(sessions_root, session_id, std::process::id()) {
+        if let Err(err) = fs::remove_file(path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                error = Some(err);
+            }
+        }
+    }
+    error.map_or(Ok(()), Err)
+}
+
+pub(in crate::ai) fn write_agent_snapshots(
+    sessions_root: &std::path::Path,
+    session_id: &str,
+    snapshots: &[AgentSnapshot],
+) -> io::Result<()> {
+    let paths = agent_snapshot_paths(sessions_root, session_id, std::process::id());
+    if snapshots.is_empty() {
+        return clear_agent_snapshots(sessions_root, session_id);
+    }
+
+    let process_start_token = own_process_start_token().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "could not determine the current process start time",
+        )
+    })?;
+    let serialized = serde_json::to_vec(&AgentSnapshotFile {
+        process_start_token,
+        snapshots: bounded_agent_snapshots(snapshots),
+    })
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    if serialized.len() as u64 > MAX_AGENT_SNAPSHOT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "agent snapshot exceeds the size limit",
+        ));
+    }
+    for path in paths {
+        let temporary = path.with_extension("agents.json.tmp");
+        fs::write(&temporary, &serialized)?;
+        fs::rename(temporary, path)?;
+    }
+    Ok(())
+}
+
+/// Read the snapshots published by an active session PID. The sessions base
+/// may contain persona-specific `*.sessions` directories, so search each
+/// directory that `scan_all_session_pids` covers.
+pub(in crate::ai) fn read_agent_snapshots(
+    sessions_root: &std::path::Path,
+    session_id: &str,
+    pid: i32,
+) -> Vec<AgentSnapshot> {
+    let Ok(pid) = u32::try_from(pid) else {
+        return Vec::new();
+    };
+    for directory in snapshot_directories(sessions_root) {
+        let path = agent_snapshot_path(&directory, session_id, pid);
+        let Some(snapshot_file) = read_bounded_snapshot_file(&path) else {
+            continue;
+        };
+        if process_start_token(pid as i32).as_deref()
+            == Some(snapshot_file.process_start_token.as_str())
+        {
+            return snapshot_file.snapshots;
+        }
+    }
+    Vec::new()
+}
+
+/// Writes and manages the `<session_id>.<pid>.pid` file under the sessions
+/// directory. Writes the PID on creation and removes the file on Drop.
 pub(in crate::ai) struct SessionPidGuard {
     path: Option<PathBuf>,
+    sessions_root: Option<PathBuf>,
 }
 
 impl SessionPidGuard {
-    /// 在 `sessions_root` 目录下写入 `<session_id>.<pid>.pid`，内容为当前进程 PID。
-    /// 如果写入失败只打印警告，不阻断启动。
+/// Writes `<session_id>.<pid>.pid` under `sessions_root`, containing the current
+/// process PID. On write failure only prints a warning; never blocks startup.
     pub(in crate::ai) fn register(sessions_root: &std::path::Path, session_id: &str) -> Self {
         match mark_session_pid(sessions_root, session_id, false) {
-            Ok(path) => Self { path: Some(path) },
+            Ok(path) => Self {
+                path: Some(path),
+                sessions_root: Some(sessions_root.to_path_buf()),
+            },
             Err((path, err)) => {
                 eprintln!(
                     "[Warning] 无法写入 session PID 文件 ({}): {err}",
                     path.display()
                 );
-                Self { path: None }
+                Self {
+                    path: None,
+                    sessions_root: None,
+                }
             }
         }
     }
 }
 
-/// 为当前进程额外登记一个活跃 session。
+/// Additionally registers the current process as an active session.
 ///
-/// session 切换后保留旧标记是安全的：进程退出后扫描器会清理失效 PID；
-/// 更重要的是，prune 不会误删当前已经切换到的新 session。
+/// Session switches retain old markers until the process exits so prune cannot
+/// delete the newly selected session during the transition. `SessionPidGuard`
+/// removes every marker for its PID when the owning process exits.
 pub(in crate::ai) fn mark_session_pid(
     sessions_root: &std::path::Path,
     session_id: &str,
@@ -67,7 +312,9 @@ pub(in crate::ai) fn mark_session_pid(
                 format!("session '{}' no longer exists", session_id),
             ));
         }
-        fs::write(&path, pid.to_string())
+        fs::write(&path, pid.to_string())?;
+        let _ = fs::remove_file(agent_snapshot_path_for_pid_file(&path));
+        Ok(())
     })
     .map(|()| path.clone())
     .map_err(|err| (path, err))
@@ -75,8 +322,42 @@ pub(in crate::ai) fn mark_session_pid(
 
 impl Drop for SessionPidGuard {
     fn drop(&mut self) {
-        if let Some(ref path) = self.path {
+        if let Some(ref sessions_root) = self.sessions_root {
+            cleanup_current_process_markers(sessions_root);
+        } else if let Some(ref path) = self.path {
             let _ = fs::remove_file(path);
+            let _ = fs::remove_file(agent_snapshot_path_for_pid_file(path));
+        }
+    }
+}
+
+fn cleanup_current_process_markers(sessions_root: &std::path::Path) {
+    let base = resolve_sessions_base(sessions_root);
+    let mut directories = vec![sessions_root.to_path_buf()];
+    if base != sessions_root {
+        directories.push(base.clone());
+    }
+    if let Ok(entries) = fs::read_dir(&base) {
+        directories.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.is_dir() && path.extension().and_then(|suffix| suffix.to_str()) == Some("sessions")
+        }));
+    }
+
+    let pid_suffix = format!(".{}.pid", std::process::id());
+    for directory in directories {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&pid_suffix))
+            {
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(agent_snapshot_path_for_pid_file(&path));
+            }
         }
     }
 }
@@ -157,8 +438,9 @@ pub(in crate::ai) fn scan_session_pids(
         };
         let alive = pid_is_alive(pid);
         if !alive {
-            // 清理残留的 PID 文件
+            // Clean up leftover PID files
             let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(agent_snapshot_path_for_pid_file(&path));
         }
         let session_id = stem
             .rsplit_once('.')
@@ -390,6 +672,89 @@ mod tests {
     }
 
     #[test]
+    fn agent_snapshot_fields_are_bounded_before_persistence() {
+        let snapshots = (0..MAX_AGENT_SNAPSHOTS + 1)
+            .map(|_| AgentSnapshot {
+                agent_name: "n".repeat(MAX_AGENT_NAME_CHARS + 1),
+                description: "d".repeat(MAX_AGENT_DETAIL_CHARS + 1),
+                state: "s".repeat(MAX_AGENT_STATE_CHARS + 1),
+                elapsed_secs: 0,
+                progress: Some("p".repeat(MAX_AGENT_DETAIL_CHARS + 1)),
+            })
+            .collect::<Vec<_>>();
+
+        let bounded = bounded_agent_snapshots(&snapshots);
+        assert_eq!(bounded.len(), MAX_AGENT_SNAPSHOTS);
+        assert_eq!(bounded[0].agent_name.chars().count(), MAX_AGENT_NAME_CHARS + 1);
+        assert_eq!(bounded[0].description.chars().count(), MAX_AGENT_DETAIL_CHARS + 1);
+        assert_eq!(bounded[0].state.chars().count(), MAX_AGENT_STATE_CHARS + 1);
+        assert_eq!(
+            bounded[0].progress.as_ref().unwrap().chars().count(),
+            MAX_AGENT_DETAIL_CHARS + 1
+        );
+    }
+
+    #[test]
+    fn agent_snapshots_round_trip_and_clear() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-tools-agent-snapshots-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let sid = "test-session-001";
+        let snapshots = vec![AgentSnapshot {
+            agent_name: "researcher".to_string(),
+            description: "Inspect /proc output".to_string(),
+            state: "running".to_string(),
+            elapsed_secs: 42,
+            progress: Some("reading source".to_string()),
+        }];
+
+        write_agent_snapshots(&dir, sid, &snapshots).unwrap();
+        assert_eq!(
+            read_agent_snapshots(&dir, sid, std::process::id() as i32),
+            snapshots
+        );
+
+        clear_agent_snapshots(&dir, sid).unwrap();
+        assert!(read_agent_snapshots(&dir, sid, std::process::id() as i32).is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_snapshots_follow_session_markers_across_persona_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "rust-tools-agent-snapshot-personas-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let default_root = base.join("default.sessions");
+        let persona_root = base.join("persona.sessions");
+        fs::create_dir_all(&default_root).unwrap();
+        fs::create_dir_all(&persona_root).unwrap();
+        let sid = "session-default";
+        let snapshots = vec![AgentSnapshot {
+            agent_name: "researcher".to_string(),
+            description: "Continue work after a persona switch".to_string(),
+            state: "running".to_string(),
+            elapsed_secs: 8,
+            progress: None,
+        }];
+
+        mark_session_pid(&default_root, sid, false).unwrap();
+        write_agent_snapshots(&persona_root, sid, &snapshots).unwrap();
+        assert_eq!(
+            read_agent_snapshots(&default_root, sid, std::process::id() as i32),
+            snapshots
+        );
+
+        clear_agent_snapshots(&persona_root, sid).unwrap();
+        assert!(read_agent_snapshots(&default_root, sid, std::process::id() as i32).is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn scan_finds_registered_pids() {
         let dir =
             std::env::temp_dir().join(format!("rust-tools-pid-scan-{}", uuid::Uuid::new_v4()));
@@ -408,6 +773,37 @@ mod tests {
         for (_, pid, alive) in &results {
             assert!(*alive, "own PID should be alive");
             assert_eq!(*pid as u32, std::process::id());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_snapshot_guard_removes_markers_for_sessions_registered_after_startup() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-tools-pid-switch-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let pid = std::process::id();
+        let snapshots = vec![AgentSnapshot {
+            agent_name: "researcher".to_string(),
+            description: "Inspect cleanup".to_string(),
+            state: "running".to_string(),
+            elapsed_secs: 1,
+            progress: None,
+        }];
+
+        {
+            let _guard = SessionPidGuard::register(&dir, "session-first");
+            write_agent_snapshots(&dir, "session-first", &snapshots).unwrap();
+            mark_session_pid(&dir, "session-second", false).unwrap();
+            write_agent_snapshots(&dir, "session-second", &snapshots).unwrap();
+        }
+
+        for session_id in ["session-first", "session-second"] {
+            assert!(!dir.join(format!("{session_id}.{pid}.pid")).exists());
+            assert!(!dir.join(format!("{session_id}.{pid}.agents.json")).exists());
         }
 
         let _ = fs::remove_dir_all(&dir);

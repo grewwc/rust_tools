@@ -43,18 +43,20 @@ use crate::ai::driver::print::{
 };
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
-/// 适合"中段按行裁剪"的非精确概览工具。
+/// Tools suited to imprecise overview where the middle can be trimmed line by line.
 ///
-/// read_file(_lines) 的每一行都可能是
-/// agent 后续判断需要引用的精确证据，不能做有损中段抽样；这些工具只允许在
-/// 超过 inline 上限后 offload 到 session 文件，并在模型上下文里保留 path + stub。
+/// Every line of `read_file(_lines)` output can be exact evidence the agent may
+/// need to cite in later judgments, so lossy middle sampling is not allowed; these
+/// tools may only be offloaded to a session file after exceeding the inline limit,
+/// keeping `path` + a stub in the model context.
 fn supports_line_trim(tool_name: &str) -> bool {
     matches!(tool_name, "tree" | "ast_outline")
 }
 
-/// 把"中等大"（介于 MAX_TOOL_RESULT_LINE_TRIM_CHARS 和 MAX_TOOL_RESULT_INLINE_CHARS 之间）
-/// 的结构化输出折叠为：头 N 行 + 命中关键词的若干行 + 尾 M 行 + 中段标注。
-/// 不写盘、不破坏整体语义，只是把"中段冗余"压掉。
+/// Fold "medium-sized" structured output (between MAX_TOOL_RESULT_LINE_TRIM_CHARS and
+/// MAX_TOOL_RESULT_INLINE_CHARS) into: first N lines + a few keyword-matching lines +
+/// last M lines + a middle marker. Nothing is written to disk and the overall semantics
+/// are preserved; it only squeezes out the redundant middle.
 fn line_trim_middle(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -77,7 +79,7 @@ fn line_trim_middle(content: &str) -> String {
         }
     }
 
-    // 在中段（head_lines..tail_start）按关键字采样 8 行
+    // Sample up to 8 lines from the middle (head_lines..tail_start) by keyword
     let mut key_lines: Vec<(usize, &str)> = Vec::new();
     if tail_start > head_lines {
         for (i, line) in lines.iter().enumerate().take(tail_start).skip(head_lines) {
@@ -152,9 +154,10 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
 
     if char_count <= inline_limit && supports_line_trim(tool_name) {
         let trimmed = line_trim_middle(content);
-        // 复用 trimmed 的字节长度做廉价短路：trimmed 是从 content 里挑选若干行
-        // 拼接出来的（可能改动；保留 ASCII / UTF-8 不变），如果字节更短就一定是
-        // 字符更短，不必再做完整 chars().count() 双扫描。
+        // Reuse the trimmed byte length as a cheap short-circuit: trimmed is
+        // assembled from selected lines of content (possibly rewritten; ASCII/UTF-8
+        // preserved), so if it is shorter in bytes it is necessarily shorter in
+        // chars too — no need for a full chars().count() second scan.
         if trimmed.len() < content.len() && trimmed.chars().count() < char_count {
             return PreparedToolResult {
                 content_for_model: trimmed,
@@ -195,11 +198,13 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
     }
 }
 
-/// 当前轮刚产出的 tool result 需要先以 raw content 进入 messages，
-/// 让“最近 N 条工具结果保留原文”的保护从入口就成立，而不是先在这里被
-/// stub/summary 弱化，再指望后面的 `KEEP_RECENT_TOOL_MESSAGES` 兜底。
+/// Tool results just produced in the current round must enter messages as raw content
+/// first, so the “keep the last N tool results verbatim” protection holds from the
+/// entry point, instead of being weakened here by stub/summary and then relying on
+/// `KEEP_RECENT_TOOL_MESSAGES` to bail out later.
 ///
-/// 终端侧仍沿用原有 preview / overflow 文件逻辑，避免把超大结果整块刷到屏幕。
+/// The terminal side keeps the existing preview / overflow-file logic, so oversized
+/// results are not dumped wholesale to the screen.
 pub(in crate::ai::driver::turn_runtime) fn prepare_recent_tool_result(
     app: &App,
     tool_name: &str,
@@ -338,8 +343,9 @@ fn duplicate_read_only_suppressions(
     turn_messages: &[Message],
     tool_calls: &[ToolCall],
 ) -> HashMap<String, String> {
-    // 当前批次只要包含无法证明为只读的调用，就无法保证读取与状态变化的执行顺序；
-    // 此时必须真实读取，不能复用旧结果。
+    // If the current batch contains any call that cannot be proven read-only, the
+    // order between reads and state changes cannot be guaranteed; in that case we
+    // must really execute, not reuse old results.
     if tool_calls.iter().any(read_only_replay_invalidating_call) {
         return HashMap::new();
     }
@@ -347,10 +353,12 @@ fn duplicate_read_only_suppressions(
     let mut call_signatures = HashMap::new();
     let mut invalidating_call_ids = HashSet::new();
     let mut completed = HashMap::new();
-    // 从当前 turn 的规范原文建立锚点，再要求同一原文仍逐字存在于 request context。
-    // 这样 compression/dedup/overflow stub 以及 suppression 自身都不会成为新锚点。
+    // Build anchors from the canonical text of the current turn, then require that the
+    // same text still exists verbatim in the request context. This way compression/dedup/
+    // overflow stubs and the suppression itself never become new anchors.
     for message in turn_messages {
-        // 合成的 user 消息（图片 followup 等）不构成真实轮次边界，不重置去重状态。
+        // Synthetic user messages (image followups, etc.) are not real round boundaries
+        // and must not reset the dedup state.
         if message.role == "user" && !is_runtime_synthetic_user_message(message) {
             call_signatures.clear();
             invalidating_call_ids.clear();
@@ -369,8 +377,9 @@ fn duplicate_read_only_suppressions(
         if message.role == "tool"
             && let Some(call_id) = message.tool_call_id.as_deref()
         {
-            // 失败不代表没有副作用：shell 命令可能先写文件再非零退出。
-            // 任何未注册调用一旦返回，都保守失效旧快照。
+            // Failure does not imply no side effects: a shell command may write a file
+            // before exiting non-zero. Any unregistered call that returns conservatively
+            // invalidates old snapshots.
             if invalidating_call_ids.contains(call_id) {
                 completed.clear();
                 continue;
@@ -379,7 +388,8 @@ fn duplicate_read_only_suppressions(
                 && tool_result_completed_successfully(&message.content)
                 && tool_result_is_available_verbatim(messages, call_id, &message.content)
             {
-                // 只保留原调用锚点，不复制旧正文；原结果已经在当前 request context 中。
+                // Keep only the original call anchor, do not copy the old body; the
+                // original result is already in the current request context.
                 completed.insert(signature.clone(), call_id.to_string());
             }
         }
@@ -464,11 +474,13 @@ Produce the actual answer to the user's request now, using tools first if verifi
 const INJECTED_CONTEXT_ECHO_STOP: &str =
     "[Model echoed a runtime internal note instead of giving a real answer; please retry or switch models]";
 
-/// runtime 注入到 request projection 的上下文笔记前缀。这些都是运行时自撰文本，
-/// 合法的用户可见回答绝不会以它们开头；模型把它们原样当答案回吐即为 echo。
-/// 源字符串定义在 `request/normalize.rs`（`MODEL_SELF_NOTE_CONTEXT_HEADER`、
-/// `HISTORY_SUMMARY_CONTEXT_HEADER`、`DERIVED_CONTEXT_HANDOFF/RETURN`）、本文件的
-/// `COMPLETION_EVIDENCE_REQUIRED_MARKER`；此处按稳定前缀匹配，避免跨模块暴露长常量。
+/// Prefixes of context notes that the runtime injects into the request projection.
+/// These are all runtime-authored text; a legitimate user-visible answer never starts
+/// with them — if the model spits them back verbatim as its answer, that is an echo.
+/// The source strings are defined in `request/normalize.rs` (`MODEL_SELF_NOTE_CONTEXT_HEADER`,
+/// `HISTORY_SUMMARY_CONTEXT_HEADER`, `DERIVED_CONTEXT_HANDOFF/RETURN`) and in this file's
+/// `COMPLETION_EVIDENCE_REQUIRED_MARKER`; here we match on stable prefixes to avoid exposing
+/// long constants across modules.
 const INJECTED_CONTEXT_ECHO_PREFIXES: &[&str] = &[
     "[Model-authored note from an earlier turn",
     "[Compressed history summary for task continuity.",
@@ -485,32 +497,40 @@ enum CompletionEvidenceGateAction {
 
 #[derive(Default)]
 pub(in crate::ai::driver::turn_runtime) struct CompletionEvidenceState {
-    /// 会话中是否发生过任意变更（工具级或命令级）。保留给 checkpoint 阶段提示
-    /// 等下游使用；门控决策只用 `successful_tool_level_mutation`（见下），
-    /// 因为命令级“变更”是意图分类，可能把只读命令误判为变更。
+    /// Whether any change occurred in the session (tool-level or command-level). Kept
+    /// for downstream consumers such as checkpoint-phase hints; the gate decision only
+    /// uses `successful_tool_level_mutation` (see below), because command-level “changes”
+    /// are intent classification and may misjudge read-only commands as changes.
     pub(in crate::ai::driver::turn_runtime) successful_mutation: bool,
-    /// 是否发生过可证明的工具级变更（apply_patch / write_file 成功）。
-    /// 这是门控唯一可信的变更证据：命令级“变更”可能误报，基于它 Reopen/Warn
-    /// 会逼模型重复输出结论（白名单永远加不完，只能放弃依赖该分类）。
+    /// Whether a provable tool-level change occurred (apply_patch / write_file succeeded).
+    /// This is the only trusted change evidence for the gate: command-level “changes” can
+    /// be false positives, and Reopen/Warn based on them would force the model to repeat
+    /// conclusions (the allowlist can never be complete, so we drop reliance on that class).
     successful_tool_level_mutation: bool,
     pub(in crate::ai::driver::turn_runtime) successful_post_mutation_verification: bool,
     successful_post_mutation_scope_review: bool,
     successful_post_mutation_behavior_check: bool,
-    /// 变更后是否运行过任何成功的工具调用（命令或只读工具，如 read_file）。
-    /// 分类器无法穷尽识别验证命令（如 python3 脚本），这类调用虽不足以证明
-    /// “检查通过”，但证明模型做了变更后工作；有它时门控静默 Allow —— 注入
-    /// “未观察到检查”的断言是虚假的，会诱导模型防御性重述结论。
+    /// Whether any successful tool call ran after the mutation (a command or a read-only
+    /// tool such as read_file). The classifier cannot exhaustively recognize verification
+    /// commands (e.g. python3 scripts); such calls do not prove the check passed, but they
+    /// do prove the model did post-mutation work. When set, the gate silently Allows —
+    /// asserting “no check observed” would be false and would tempt the model to
+    /// defensively restate its conclusions.
     successful_post_mutation_activity: bool,
-    /// 变更后是否出现过“已知检查失败”（如 cargo check 输出未确认成功）。
-    /// 这是可证明事实而非分类不确定性；失败不会因后续良性调用清零。有它时
-    /// 门控走 Warn —— 模型在已知检查失败后声称完成，诚实警告不会造成虚假重复。
+    /// Whether a known check failure occurred after the mutation (e.g. cargo check output
+    /// that does not confirm success). This is provable fact, not classification
+    /// uncertainty; a failure is not cleared by later benign calls. When set, the gate
+    /// goes Warn — the model claimed completion after a known check failure, and an
+    /// honest warning causes no false repeat.
     successful_post_mutation_failed_check: bool,
 }
 
-/// 只扫描当前 user turn 的规范消息，并按 `tool_call_id` 将调用与结果配对。
-/// 只有可证明的工具级 mutation（apply_patch / write_file 成功）会使之前的
-/// 验证失效；命令级“变更”是意图分类，可能误报，不再参与门禁信号重置。
-/// 同一复合命令中只有纯 `&&` 成功链里的后续检查才能覆盖最新改动。
+/// Scan only the canonical messages of the current user turn, pairing each call with its
+/// result by `tool_call_id`. Only provable tool-level mutations (apply_patch / write_file
+/// succeeding) invalidate earlier verification; command-level “changes” are intent
+/// classification and may be false positives, so they no longer reset gate signals.
+/// Within one compound command, only later checks in a pure `&&` success chain can
+/// cover the latest change.
 pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
     turn_messages: &[Message],
 ) -> CompletionEvidenceState {
@@ -543,9 +563,10 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
                 .unwrap_or_default();
             let output_confirms_behavior_check =
                 behavior_check_output_confirms_success(&message.content);
-            // 命令级判定：整条命令是否有输出失败的已知检查。
-            // `cargo check | tail -5` 报错时，tail 段本身不是检查，若按段判定
-            // 会被误记为“变更后活动”，必须整条命令一起看。
+            // Command-level determination: whether the whole command output a failed known check.
+            // When `cargo check | tail -5` fails, the tail segment itself is not a check; if
+            // judged per segment it would be misrecorded as “post-mutation activity”, so the
+            // whole command must be considered together.
             let mut command_has_failed_known_check = false;
             for effect in &effects {
                 command_has_failed_known_check |=
@@ -554,10 +575,12 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
             let had_mutation_before_command = state.successful_mutation;
             for effect in &effects {
                 let had_mutation = state.successful_mutation;
-                // 命令级变更只记账到 successful_mutation（供 checkpoint 阶段
-                // 提示等下游使用），不再重置门禁信号：命令级“变更”是意图分类，
-                // 可能把只读命令误判为变更，重置会让门禁误以为“变更后什么都没
-                // 做”，进而虚假 Reopen/Warn，逼模型重复输出结论。
+                // Command-level changes are only recorded into successful_mutation (for
+                // downstream consumers such as checkpoint-phase hints) and no longer reset
+                // gate signals: command-level “changes” are intent classification and may
+                // misjudge read-only commands as changes; resetting would make the gate
+                // think “nothing was done after the mutation”, causing false Reopen/Warn
+                // and forcing the model to repeat conclusions.
                 if effect.project_mutation {
                     state.successful_mutation = true;
                 }
@@ -571,12 +594,16 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
                     state.successful_post_mutation_behavior_check |= effect.behavior_check;
                 }
             }
-            // 命令级“变更后活动”：变更后运行了没有输出失败的已知检查的成功
-            // 命令，记为变更后活动。分类器认不出的验证命令（python3 脚本）以及
-            // 命令级变更本身都落在这里；有它时门控静默 Allow —— 它证明模型做了
-            // 变更后工作，注入“未观察到检查”的断言是虚假的，会诱导模型重述结论。
-            // 反之，已知检查失败（如 cargo check 输出未确认成功）是可证明事实，
-            // 单独记账，后续良性调用不得把它清零。
+            // Command-level “post-mutation activity”: a successful command that ran after
+            // the mutation and output no failed known check is recorded as post-mutation
+            // activity. Verification commands the classifier cannot recognize (python3
+            // scripts) and command-level changes themselves land here; when set, the gate
+            // silently Allows — it proves the model did post-mutation work, so injecting
+            // an “no check observed” assertion would be false and would tempt the model
+            // to restate conclusions.
+            // Conversely, a known check failure (e.g. cargo check output that does not
+            // confirm success) is provable fact recorded separately; later benign calls
+            // must not clear it.
             if had_mutation_before_command {
                 if command_has_failed_known_check {
                     state.successful_post_mutation_failed_check = true;
@@ -585,8 +612,8 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
                 }
             }
         } else if tool_call_is_successful_mutation_candidate(tool_call) {
-            // 工具级变更（apply_patch / write_file）是门禁唯一可信的变更证据，
-            // 每次成功都会使之前的验证失效。
+            // Tool-level mutations (apply_patch / write_file) are the gate's only trusted
+            // change evidence; each success invalidates earlier verification.
             state.successful_mutation = true;
             state.successful_tool_level_mutation = true;
             state.successful_post_mutation_verification = false;
@@ -595,9 +622,10 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
             state.successful_post_mutation_activity = false;
             state.successful_post_mutation_failed_check = false;
         } else if state.successful_mutation {
-            // 变更后的成功只读/信息工具（read_file、search_overflow 等）也算
-            // 变更后活动：否则 apply_patch → read_file → final 会被误判为
-            // “什么都没做”而 Reopen，逼模型重复输出结论。
+            // Successful read-only/informational tools after the mutation (read_file,
+            // search_overflow, etc.) also count as post-mutation activity; otherwise
+            // apply_patch → read_file → final would be misjudged as “nothing done” and
+            // Reopened, forcing the model to repeat conclusions.
             state.successful_post_mutation_activity = true;
         }
     }
@@ -698,30 +726,37 @@ const REASONING_ONLY_RETRY_MARKER: &str = "[reasoning-only-retry]";
 const REASONING_ONLY_RETRY_NOTE: &str = "The previous response contained hidden reasoning but no visible assistant answer. Retry the step normally with the same capabilities, including tools and internal reasoning when needed, and ensure the response eventually includes visible assistant content.";
 const REASONING_ONLY_SYNTHESIS_MARKER: &str = "[reasoning-only-synthesis]";
 const REASONING_ONLY_SYNTHESIS_NOTE: &str = "Multiple consecutive responses contained hidden reasoning but no visible assistant answer. Produce the concrete user-facing final answer now. Do not call tools and do not return hidden reasoning alone.";
-/// 仅返回思考内容时,最多自动重试的次数(达到上限后才进入最后一次无思考合成)。
+/// Maximum automatic retries when the response contains only hidden reasoning
+/// (only after reaching this limit does the final no-reasoning synthesis kick in).
 const REASONING_ONLY_MAX_RETRIES: usize = 3;
 const REASONING_ONLY_SYNTHESIS_RETRY_MARKER: &str = "[reasoning-only-synthesis-retry]";
 const REASONING_ONLY_SYNTHESIS_RETRY_NOTE: &str = "The response still contained hidden reasoning with no visible assistant answer, even after the synthesis instruction. Produce the concrete user-facing final answer now; do not call tools and do not return hidden reasoning alone.";
-/// 已强制无思考合成后仍仅返回思考内容时,最多再自动重试的次数;超过后停轮
-/// 给出用户可见错误,避免逐轮重复同字节请求空转到 max_iterations。
+/// Maximum further automatic retries when the response still contains only hidden
+/// reasoning even after the forced no-reasoning synthesis; beyond that the round stops
+/// with a user-visible error, avoiding empty spins that repeat identical byte-for-byte
+/// requests up to max_iterations.
 const REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES: usize = 2;
 
-/// 收尾门因「未整合子任务证据」重开当前 turn 的独立配额标记与上限。
+/// Marker and cap for the completion gate's dedicated quota on reopening the current
+/// turn due to unintegrated subagent evidence.
 ///
-/// 背景：收尾门在仍有未整合 task evidence 时会打回一轮（reopen），要求模型
-/// `task_integrate`。但该 veto 原本只受 `iteration < max_iterations`（4096）约束，
-/// 且每次 reopen 都清掉旧提示 marker、无累计计数。当子任务是 TIMED_OUT 这类**永远
-/// 无法被整合**的死结、或模型持续拒绝调用 `task_integrate` 时，会逐轮无限重开、
-/// 空转到硬上限（muse-spark 死循环的放大器之一）。这里用不被清除的计数 marker
-/// 记录同一 turn 内的 reopen 次数，超过上限后不再重开，改走与 `iteration >=
-/// max_iterations` 相同的降级路径（附 warning + ledger 放行收尾）。
+/// Background: while task evidence remains unintegrated, the completion gate bounces the
+/// round back (reopen) and asks the model to `task_integrate`. But that veto was originally
+/// bounded only by `iteration < max_iterations` (4096), and each reopen cleared the old
+/// prompt marker with no accumulated count. When the subagent hit an **unintegratable**
+/// dead end such as TIMED_OUT, or the model kept refusing to call `task_integrate`, the turn
+/// would reopen forever and spin to the hard cap (one amplifier of the muse-spark dead loop).
+/// Here a persistent count marker records the reopen count within one turn; beyond the cap
+/// we stop reopening and fall back to the same degraded path as `iteration >= max_iterations`
+/// (attaching a warning and letting the ledger finalize).
 const TASK_EVIDENCE_REOPEN_MARKER: &str = "[task-evidence-reopen-count]";
-/// 同一 turn 内「未整合证据 / 未收口子任务」重开的最大次数。取 3：给模型足够机会
-/// 在拿到 ledger 后调用 `task_integrate`，又远早于迭代硬上限，避免死结无限空转。
+/// Maximum number of reopens within one turn for “unintegrated evidence / unclosed subagent”.
+/// Set to 3: enough chances for the model to call `task_integrate` once it has the ledger,
+/// yet well before the iteration hard cap, avoiding infinite spinning on dead ends.
 const TASK_EVIDENCE_REOPEN_MAX: usize = 3;
 
-/// 统计当前 `messages` 中已注入的收尾门重开计数 marker 数量。marker 是不被
-/// reopen 清除的 internal_note，因此可跨迭代累计。
+/// Count the completion-gate reopen markers already injected into the current `messages`.
+/// The marker is an internal_note that reopens do not clear, so it accumulates across iterations.
 fn task_evidence_reopen_count(messages: &[Message]) -> usize {
     messages
         .iter()
@@ -735,9 +770,10 @@ fn task_evidence_reopen_count(messages: &[Message]) -> usize {
         .count()
 }
 
-/// 追加一条重开计数 marker（不被 reopen 的 retain 清除，用于跨迭代累计次数）。
-/// 与本文件其它 marker 一致：marker 前缀 + 一句人类可读说明，避免投影到模型时
-/// 出现无语义裸标签（internal_note 会被映射为 system/assistant，见 request/normalize）。
+/// Append one reopen-count marker (not cleared by the reopen retain, used to accumulate
+/// the count across iterations). Consistent with the other markers in this file: marker
+/// prefix + one human-readable sentence, so the projection to the model never shows a
+/// bare semantics-free label (internal_note is mapped to system/assistant, see request/normalize).
 fn push_task_evidence_reopen_marker(messages: &mut Vec<Message>, attempt: usize) {
     messages.push(Message {
         role: ROLE_INTERNAL_NOTE.to_string(),
@@ -967,8 +1003,9 @@ fn text_admits_changes_not_applied(text: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-/// 不把模型自述的执行限制当作运行时事实：只有当前 turn 的工具/运行时证据确实
-/// 报告同一限制时才放行。对已知的“只读阶段上限”幻觉只重开一次，并保留工具。
+/// Do not treat the model's self-reported execution limits as runtime fact: only allow
+/// when the current turn's tool/runtime evidence actually reports the same limit. For
+/// the known “read-only phase limit” hallucination, reopen only once and keep the tools.
 fn unsupported_runtime_limit_action(
     question: &str,
     messages: &mut Vec<Message>,
@@ -1019,9 +1056,11 @@ fn unsupported_runtime_limit_action(
     UnsupportedRuntimeLimitAction::ReopenWithTools
 }
 
-/// 去掉行内 code span（反引号包裹的片段）后返回纯散文，避免 `foo.rs`、`.ok()`、
-/// `a:b` 等代码里的 . : 等符号污染句子计数与冒号收尾判定。仅在反引号成对时剥离；
-/// 反引号数量为奇数（残缺/未配对）时原样返回，避免误删正文尾部。
+/// Strip inline code spans (backtick-wrapped fragments) and return the plain prose, so
+/// symbols such as `.` `:` inside code like `foo.rs`, `.ok()`, `a:b` do not pollute the
+/// sentence count and the colon-termination check. Strip only when backticks are paired;
+/// when the backtick count is odd (truncated/unpaired), return the text unchanged to
+/// avoid deleting the tail of the prose.
 fn strip_inline_code_spans(text: &str) -> String {
     if text.matches('`').count() % 2 != 0 {
         return text.to_string();
@@ -1040,11 +1079,14 @@ fn strip_inline_code_spans(text: &str) -> String {
     out
 }
 
-/// 统计"散文句末标点"数量，用于判断一段文本更像"多句、成形的结论"还是一句
-/// "我马上去做 X"的旁白。CJK 的 。！？ 恒计为句末；ASCII 的 . ! ? 仅当其后是
-/// 空白或文本结尾时才计入——否则 `driver/mod.rs`、`.ok().flatten()`、`3.14` 里的
-/// 点号会被误计为句子，把短旁白伪装成成形结论，从而绕过 dangling-final 门禁
-/// （这正是模型"停在半句"却被静默当作 final 收尾的根因之一）。
+/// Count “prose sentence terminators” to decide whether a text is more like a
+/// “multi-sentence, formed conclusion” or a one-line “I'll go do X now” aside.
+/// The CJK full-stop/exclamation/question marks always count as terminators; ASCII
+/// `.` `!` `?` count only when followed by
+/// whitespace or the end of the text — otherwise dots in `driver/mod.rs`,
+/// `.ok().flatten()`, `3.14` would be miscounted as sentences, dressing a short aside
+/// up as a formed conclusion and slipping past the dangling-final gate (one root cause
+/// of a model “stopping mid-sentence” while being silently treated as a final response).
 fn prose_sentence_terminator_count(text: &str) -> usize {
     let chars: Vec<char> = text.chars().collect();
     let mut count = 0usize;
@@ -1064,11 +1106,13 @@ fn prose_sentence_terminator_count(text: &str) -> usize {
     count
 }
 
-/// 识别「口头承诺继续读/查，但既没有 tool call、也没有交付结论」的悬空最终响应。
+/// Detect a dangling final response that verbally promises to keep reading/checking but
+/// makes no tool call and delivers no conclusion.
 ///
-/// 保持保守：只检查已有工具证据的非计划型任务、较短且无结构化结论的文本。
-/// 这不是通用语义分类器，而是修复模型在长工具链末尾把下一步旁白误当 final 的
-/// 已知失败模式。
+/// Stay conservative: only check non-plan tasks with existing tool evidence and short
+/// texts without structured conclusions. This is not a general semantic classifier; it
+/// fixes the known failure mode where the model mistakes a next-step aside for a final
+/// response at the end of a long tool chain.
 fn looks_like_dangling_action_final(
     question: &str,
     turn_messages: &[Message],
@@ -1086,7 +1130,8 @@ fn looks_like_dangling_action_final(
         return false;
     }
 
-    // 运行时可能已附加其它告警；分类时只看模型原始可见文本。
+    // The runtime may have appended other warnings; classify only the model's raw
+    // visible text.
     let candidate = final_text
         .find("[Runtime warning]")
         .map(|index| &final_text[..index])
@@ -1099,12 +1144,14 @@ fn looks_like_dangling_action_final(
         return false;
     }
 
-    // 分类只看散文语义，先剥掉行内 code span，避免 `foo.rs`/`.ok()`/`a:b` 里的
-    // 符号污染句子计数与冒号收尾判定。
+    // Classification looks at prose semantics only; strip inline code spans first so
+    // symbols in `foo.rs`/`.ok()`/`a:b` do not pollute the sentence count and the
+    // colon-termination check.
     let prose = strip_inline_code_spans(candidate);
     let prose = prose.trim();
     if prose.is_empty() {
-        // 正文全是代码片段、剥离后无散文：不是"停在半句的旁白"，保守放行。
+        // The body is all code fragments with no prose left after stripping: not a
+        // “stopped mid-sentence” aside — allow conservatively.
         return false;
     }
 
@@ -1125,15 +1172,18 @@ fn looks_like_dangling_action_final(
         return false;
     }
 
-    // 强信号：正文以冒号结尾 = 典型的"我马上做 X："预告，本应紧跟一次工具调用
-    // 或列表，却在此被切断。这类"停在半句"的悬空 final 与具体措辞无关，因此不依赖
-    // 下面的未来动作词表——词表只能覆盖有限的固定说法，正是 id=455 那类
-    // "先看…检查…：" 文本此前同时穿透 stream 分类器与本门禁的根因。
+    // Strong signal: a body ending in a colon is the typical “I'll do X:” teaser that
+    // should be followed by a tool call or a list but is cut off here. This kind of
+    // “stopped mid-sentence” dangling final is independent of exact wording, so it does
+    // not rely on the future-action word list below — the list only covers a limited set
+    // of fixed phrases, which is exactly why id=455-style “first look at... check...:”
+    // text previously slipped through both the stream classifier and this gate.
     //
-    // 判据落在**原始 candidate**（未剥离 code span）的末字符上，而非剥离后的
-    // prose：`See the fix: \`bar()\`` 这类结尾是 code span、确实交付了内容的正常
-    // final，末字符是反引号而非冒号，不应被误判；只有冒号本身就是最后一个可见
-    // 字符时，才是真正被切断的预告。
+    // The criterion applies to the last character of the **raw candidate** (code spans
+    // not stripped), not the stripped prose: a normal final like `See the fix: \`bar()\``
+    // ends with a code span and really delivers content — its last character is a
+    // backtick, not a colon, so it must not be misjudged; only when the colon itself is
+    // the last visible character is it a genuinely truncated teaser.
     let ends_with_dangling_colon = candidate.ends_with(':') || candidate.ends_with('：');
 
     let lower = prose.to_ascii_lowercase();
@@ -1295,24 +1345,29 @@ fn completion_evidence_gate_action(
         return CompletionEvidenceGateAction::Allow;
     }
 
-    // 门禁只在“可证明的工具级变更”上行动。命令级“变更”是意图分类，可能把
-    // 只读命令误判为变更（白名单永远加不完），基于它 Reopen/Warn 会逼模型
-    // 重复输出结论 —— 这正是运行时唯一能彻底避免的错误重复源。
+    // The gate only acts on “provable tool-level mutations”. Command-level “changes” are
+    // intent classification and may misjudge read-only commands as changes (the allowlist
+    // can never be complete); Reopen/Warn based on them would force the model to repeat
+    // conclusions — the only source of erroneous repetition the runtime can fully avoid.
     if !evidence.successful_tool_level_mutation {
         return CompletionEvidenceGateAction::Allow;
     }
 
-    // 已知检查失败（可证明事实，非分类不确定性）优先于“变更后活动”：即使
-    // 后续有良性工具调用把 activity 置回 true，失败事实也要保留并走 Warn ——
-    // 模型在已知检查失败后声称完成，诚实警告不会造成虚假重复。
+    // A known check failure (provable fact, not classification uncertainty) takes
+    // precedence over “post-mutation activity”: even if later benign tool calls set
+    // activity back to true, the failure fact is kept and we go Warn — the model
+    // claimed completion after a known check failure, and an honest warning causes
+    // no false repetition.
     if evidence.successful_post_mutation_failed_check {
         return CompletionEvidenceGateAction::Warn;
     }
 
-    // 变更后做过任何成功工作（无论是否被识别为“验证”）：分类器认不出的验证
-    // 命令（python3 脚本）、只读工具（read_file）都算。此时静默 Allow ——
-    // 注入“未观察到检查”的断言是虚假的，会让模型防御性重述结论；只有可证明
-    // 的“变更后零活动”才配 Reopen/Warn。
+    // Any successful post-mutation work counts (whether or not it is recognized as
+    // “verification”): verification commands the classifier cannot recognize (python3
+    // scripts) and read-only tools (read_file) both qualify. Silently Allow here —
+    // injecting a “no check observed” assertion would be false and would make the model
+    // defensively restate its conclusions; only provable “zero post-mutation activity”
+    // deserves Reopen/Warn.
     if evidence.successful_post_mutation_activity {
         return CompletionEvidenceGateAction::Allow;
     }
@@ -1344,15 +1399,19 @@ fn completion_evidence_gate_action(
     CompletionEvidenceGateAction::Reopen
 }
 
-/// 判断最终响应是否只是把 runtime 注入的上下文笔记原样回吐（regurgitate），而没有
-/// 给出真正的回答。命中特征：剥掉 runtime 事后追加的 `[Runtime warning]` 段后，
-/// 剩余可见正文以某个注入笔记前缀开头。这类响应对用户毫无价值，且会把内部提示
-/// 泄漏到终端（弱模型在 completion-evidence / dangling 等门禁 reopen 后尤其常见）。
+/// Decide whether the final response merely regurgitates a context note the runtime
+/// injected, verbatim, without giving a real answer. Hit signature: after stripping the
+/// `[Runtime warning]` section the runtime appended post-hoc, the remaining visible body
+/// starts with some injected-note prefix. Such responses are worthless to the user and
+/// leak internal prompts to the terminal (especially common with weak models after a
+/// completion-evidence / dangling gate reopen).
 ///
-/// 保持保守：只看「整段正文即注入笔记」的情形。模型若在正文里引用/讨论这些前缀
-/// （即前缀不在开头、或其后还有自撰内容）不算 echo，交由其它门禁处理。
+/// Stay conservative: only handle the case where the whole body is an injected note. If
+/// the model quotes/discusses these prefixes in the body (prefix not at the start, or
+/// followed by its own text) it is not an echo and is left to the other gates.
 fn looks_like_injected_context_echo(final_text: &str) -> bool {
-    // runtime 可能在真正回答之后追加 `\n\n[Runtime warning] ...`；分类只看模型正文。
+    // The runtime may append `\n\n[Runtime warning] ...` after the real answer; classify
+    // only the model's body text.
     let visible = final_text
         .split_once("\n\n[Runtime warning]")
         .map_or(final_text, |(before, _)| before);
@@ -1365,8 +1424,9 @@ fn looks_like_injected_context_echo(final_text: &str) -> bool {
         .any(|prefix| visible.starts_with(prefix))
 }
 
-/// echo 门禁：命中回吐时给一次无工具（保留 reopen 语义前的能力）合成重试机会，
-/// 第二次仍回吐则停轮并给用户可见的错误说明，避免注入笔记被当成答案持久化/渲染。
+/// Echo gate: on a hit, give one no-tool synthesis retry (preserving pre-reopen
+/// capabilities); if the second response still regurgitates, stop the round with a
+/// user-visible error so injected notes are never persisted/rendered as the answer.
 fn injected_context_echo_recovery_action(
     messages: &mut Vec<Message>,
     final_text: &str,
@@ -1403,10 +1463,12 @@ fn read_only_tool_signature(tool_call: &ToolCall) -> Option<String> {
 
     let mut args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
         .unwrap_or_else(|_| serde_json::Value::String(tool_call.function.arguments.clone()));
-    // P3：execute_command 仅当命令可证明只读时才允许同轮复用——变更型命令
-    // （cargo test、git commit 等）的结果不能当作可复用证据，否则会掩盖状态变化。
-    // 只读判定会含 cargo 验证类子命令（evidence 指纹归一化需要）；但对同轮重放
-    // 而言构建校验输出含易变进度/时长行且必须观察最新状态，故在此额外排除。
+    // P3: execute_command is only replayable within the same turn when the command can be
+    // proven read-only — results of mutating commands (cargo test, git commit, etc.) must
+    // not be treated as reusable evidence, or state changes would be masked.
+    // The read-only check includes cargo-verify subcommands (needed for evidence-fingerprint
+    // normalization); but for same-turn replay, build-verification output contains volatile
+    // progress/duration lines and the latest state must be observed, so exclude them here.
     if tool_call.function.name == "execute_command" {
         let command = args
             .get("command")
@@ -1418,7 +1480,8 @@ fn read_only_tool_signature(tool_call: &ToolCall) -> Option<String> {
             return None;
         }
     }
-    // P3：read_file 路径归一化，`./x` 与 `x` 视为同一读取（与 P1-1 证据指纹对齐）。
+    // P3: normalize read_file paths so `./x` and `x` count as the same read (aligned with
+    // the P1-1 evidence fingerprints).
     if tool_call.function.name == "read_file" {
         if let Some(obj) = args.as_object_mut() {
             for key in ["file_path", "path", "filePath"] {
@@ -1436,9 +1499,10 @@ fn read_only_tool_signature(tool_call: &ToolCall) -> Option<String> {
     Some(format!("{}\n{}", tool_call.function.name, args_json))
 }
 
-/// `knowledge_search` 在一个 user turn 内是可复用的只读事实。通用重复保护只会
-/// 比较整批调用；这里按单条语义签名抑制重搜，因此同批的其它有效工具不会被连带
-/// 拒绝。任何知识写入都会使旧搜索失效，随后允许再次搜索。
+/// `knowledge_search` is reusable read-only fact within one user turn. The generic
+/// duplicate protection only compares whole batches; here we suppress re-searches per
+/// single semantic signature, so other valid tools in the same batch are not rejected
+/// as collateral. Any knowledge write invalidates old searches and allows searching again.
 fn duplicate_knowledge_search_call_ids(
     messages: &[Message],
     tool_calls: &[ToolCall],
@@ -1461,7 +1525,8 @@ fn duplicate_knowledge_search_call_ids(
 
     let mut completed_searches = HashSet::new();
     for message in messages.iter().rev() {
-        // 合成的 user 消息（证据交接等）不构成真实轮次边界，不得切断反向扫描。
+        // Synthetic user messages (evidence handoffs, etc.) are not real round boundaries
+        // and must not cut the reverse scan.
         if message.role == "user" && !is_runtime_synthetic_user_message(message) {
             break;
         }
@@ -1547,15 +1612,17 @@ fn extract_apply_patch_target_paths_from_patch(patch: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `apply_patch` 的 ambiguity 说明 patch 匹配不唯一，模型需要重新读取目标文件，
-/// 继续微调旧 patch 只会重复失败。这里查询 [`App::stale_patch_targets`] 运行时账本
-/// （由 [`update_stale_patch_targets`] 在每轮工具结果落定后维护）：目标文件在失败后
-/// 必须有一次成功的 `read_file` / `write_file` / `apply_patch`，才会从账本移除、允许
-/// 再次 patch。
+/// An `apply_patch` ambiguity means the patch does not match uniquely, so the model must
+/// re-read the target file; tweaking the old patch further only fails again. This consults
+/// the [`App::stale_patch_targets`] runtime ledger (maintained by
+/// [`update_stale_patch_targets`] after each round's tool results settle): a target stays
+/// in the ledger after a failure until one successful `read_file` / `write_file` /
+/// `apply_patch` removes it and allows patching again.
 ///
-/// 为什么不再扫描 `messages`：历史压缩会把失败的 apply_patch 组折叠成
-/// `internal_note` stub（丢失 `role=tool` 结果与 `assistant.tool_calls`），使基于
-/// 消息扫描的旧实现丢失 stale 状态、无法拦截重试。账本是不受压缩影响的真相源。
+/// Why not scan `messages` anymore: history compression folds failed apply_patch groups
+/// into `internal_note` stubs (dropping the `role=tool` result and `assistant.tool_calls`),
+/// so the old message-scanning implementation lost stale state and could not block retries.
+/// The ledger is a truth source immune to compression.
 fn patch_retry_requires_fresh_read(
     stale_patch_targets: &rustc_hash::FxHashSet<PathBuf>,
     tool_calls: &[ToolCall],
@@ -1571,16 +1638,19 @@ fn patch_retry_requires_fresh_read(
     })
 }
 
-/// 依据本轮真实执行的工具调用及其结果，增量维护 [`App::stale_patch_targets`] 账本。
+/// Incrementally maintain the [`App::stale_patch_targets`] ledger from the tool calls
+/// actually executed this round and their results.
 ///
-/// 规则（与旧的消息扫描等价，但状态存活于内存账本、不受历史压缩影响）：
-/// - `apply_patch` 成功（`Successfully patched`）→ 目标路径移出账本；
-/// - `apply_patch` 因 `ambiguous patch` 失败 → 仅将实际失败的目标路径记入账本；
-/// - `read_file` 非 `Error:` → 目标路径移出账本（已重新取真相）；
-/// - `write_file` 成功（`Successfully wrote to`）→ 目标路径移出账本。
+/// Rules (equivalent to the old message scan, but the state lives in an in-memory ledger
+/// unaffected by history compression):
+/// - `apply_patch` success (`Successfully patched`) → remove the target paths from the ledger;
+/// - `apply_patch` failure with `ambiguous patch` → record only the actually failed target paths;
+/// - `read_file` not starting with `Error:` → remove the target paths (truth has been re-read);
+/// - `write_file` success (`Successfully wrote to`) → remove the target paths.
 ///
-/// 只处理「有对应结果」的调用，路径统一经 [`patch_target_paths`] / [`file_tool_target_path`]
-/// 归一化，避免相对路径 / `~` / 绝对路径写法差异绕过门控。
+/// Only calls that have a corresponding result are processed; paths are normalized through
+/// [`patch_target_paths`] / [`file_tool_target_path`] so relative-path / `~` / absolute-path
+/// spelling differences cannot bypass the gate.
 fn update_stale_patch_targets(
     stale_patch_targets: &mut rustc_hash::FxHashSet<PathBuf>,
     executed_tool_calls: &[ToolCall],
@@ -1630,10 +1700,12 @@ fn update_stale_patch_targets(
     }
 }
 
-/// 从旧 session 仍保留的结构化工具消息重建 stale-patch 账本。
+/// Rebuild the stale-patch ledger from structured tool messages still retained in an
+/// old session.
 ///
-/// 新 session 直接从 SQLite meta 恢复；这里只服务于升级前尚无 meta 的旧库，
-/// 并在首次加载后立刻写回，避免后续历史压缩丢掉重建所需的 tool-call 配对。
+/// New sessions restore directly from the SQLite meta; this only serves old stores that
+/// predate the meta upgrade, and it writes back immediately after the first load so later
+/// history compression never drops the tool-call pairings needed for the rebuild.
 pub(in crate::ai::driver) fn stale_patch_targets_from_messages(
     messages: &[Message],
 ) -> rustc_hash::FxHashSet<PathBuf> {
@@ -1724,9 +1796,10 @@ fn file_tool_target_path(tool_call: &ToolCall) -> Option<PathBuf> {
     Some(FileStore::new(PathBuf::from(target)).path().to_path_buf())
 }
 
-/// 前台同步工具执行（尤其是 `execute_command` 的流式输出）也属于“当前 turn 的可中断
-/// 输出阶段”。若这里不抬起 `app.streaming`，Ctrl+C 会被 SIGINT 处理器误判成
-/// `Shutdown`，直接退出主进程，而不是取消当前工具轮次。
+/// Foreground synchronous tool execution (especially `execute_command`'s streamed output)
+/// is also part of the “interruptible output phase of the current turn”. Without raising
+/// `app.streaming` here, Ctrl+C would be misjudged by the SIGINT handler as `Shutdown`,
+/// exiting the main process instead of cancelling the current tool round.
 struct ToolExecutionStreamingGuard {
     flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1756,23 +1829,26 @@ struct TerminalToolObserver<'a> {
     visual_output_detected: bool,
     at_line_start: bool,
     streamed_any_output: bool,
-    // 流式输出折叠状态
+    // Streamed-output folding state
     allow_inline_fold_updates: bool,
     fold_total_lines: usize,
     tty_fold: TtyToolOutputFoldState,
 }
 
-// 典型终端二维码约 30–50 行；保留 64 行能完整展示扫码登录等一次性视觉输出，
-// 同时仍为构建日志等无界流式输出提供确定上限。
+// A typical terminal QR code is about 30–50 lines; keeping 64 lines shows one-shot
+// visual output such as QR-login in full while still bounding unbounded streamed output
+// such as build logs.
 const TOOL_OUTPUT_FOLD_MAX_VISIBLE: usize = 64;
-// 常规命令日志不应出现在终端；非 PTY 的流式输出只有连续的 block-glyph 网格才展示。
-// 这个上限既覆盖常见终端二维码，又避免长时间普通日志无限占用探测缓冲区。
+// Regular command logs should not appear in the terminal; non-PTY streamed output is
+// shown only when it forms a continuous block-glyph grid. This cap covers common terminal
+// QR codes while keeping long ordinary logs from growing the probe buffer without bound.
 const VISUAL_OUTPUT_PROBE_MAX_BYTES: usize = 16 * 1024;
 const VISUAL_OUTPUT_MIN_CONSECUTIVE_GRID_ROWS: usize = 3;
 const VISUAL_OUTPUT_MIN_BLOCK_GLYPHS_PER_ROW: usize = 8;
 
-/// 判断一行是否像由 Unicode block glyph 绘制的终端视觉输出（例如二维码）。
-/// 不根据命令名做白名单，避免把某个 CLI 的行为硬编码进通用执行器。
+/// Decide whether a line looks like terminal visual output drawn with Unicode block
+/// glyphs (e.g. a QR code). No command-name allowlist, so no CLI's behavior is hardcoded
+/// into the generic executor.
 fn is_terminal_visual_grid_line(line: &str) -> bool {
     line.chars()
         .filter(|ch| {
@@ -1785,7 +1861,8 @@ fn is_terminal_visual_grid_line(line: &str) -> bool {
         >= VISUAL_OUTPUT_MIN_BLOCK_GLYPHS_PER_ROW
 }
 
-/// 至少连续三行 block-glyph 网格才视作视觉输出，防止进度条或普通文本误触发。
+/// Only at least three consecutive block-glyph grid rows count as visual output, so
+/// progress bars or plain text cannot trigger a false positive.
 fn contains_terminal_visual_grid(text: &str) -> bool {
     let mut consecutive_rows = 0;
     for line in text.lines() {
@@ -1901,8 +1978,9 @@ fn render_tty_tool_output_fold_window(fold: &TtyToolOutputFoldState) -> (String,
     }
 
     let mut out = String::new();
-    // 每条行都被 clamp 成「最多占一个物理行」，窗口物理行数恒等于逻辑行数，
-    // cursor-up 擦除精确，不再因超长/宽字符输出行的自动折行让擦除行数算少而残留。
+    // Every line is clamped to “at most one physical row”, so the window's physical row
+    // count always equals its logical line count and cursor-up erasure is exact; auto-wrapped
+    // overlong/wide lines no longer leave residue from an undercounted erase.
     let mut rows = 0usize;
 
     if hidden_count > 0 {
@@ -1925,7 +2003,8 @@ fn render_tty_tool_output_fold_window(fold: &TtyToolOutputFoldState) -> (String,
     (out, rows)
 }
 
-/// 工具输出折叠行统一带 `  │ ` 前缀（4 列），正文按终端列宽减 4 clamp 成单物理行。
+/// Folded tool-output lines uniformly carry a `  │ ` prefix (4 columns); the body is
+/// clamped to a single physical row using the terminal width minus 4.
 fn clamp_tool_output_body(body: &str) -> String {
     const PREFIX_COLS: usize = 4;
     clamp_line_to_terminal_row_with_reserve(body, PREFIX_COLS)
@@ -1944,8 +2023,9 @@ impl<'a> TerminalToolObserver<'a> {
             at_line_start: true,
             streamed_any_output: false,
             fold_total_lines: 0,
-            // `\r` / `CSI 2K` 这类原地刷新只适合真实 TTY。IDE Chat / pipe /
-            // 日志采集场景不会解释 ANSI 光标控制，原样输出后就会泄漏成 `[2K`。
+            // In-place refresh sequences like `\r` / `CSI 2K` only suit a real TTY. IDE Chat /
+            // pipe / log-capture environments do not interpret ANSI cursor control, so passing
+            // them through verbatim would leak raw `[2K` sequences.
             allow_inline_fold_updates: std::io::IsTerminal::is_terminal(&std::io::stdout()),
             tty_fold: TtyToolOutputFoldState::default(),
         }
@@ -1970,10 +2050,12 @@ impl<'a> TerminalToolObserver<'a> {
         }
         self.reset_stream_state();
         self.active_stream_tool_call_id = Some(tool_call.id.clone());
-        // `pty: true` 是调用方对交互式终端能力的显式请求。完整转发这一路的输出，
-        // 让菜单、确认提示和登录引导可见；普通管道命令仍保持静默，避免日志淹没终端。
+        // `pty: true` is the caller's explicit request for interactive-terminal capability.
+        // Forward this path's output in full so menus, confirmation prompts, and login
+        // guides stay visible; ordinary piped commands remain silent so logs never flood
+        // the terminal.
         self.render_full_pty_stream = execute_command_uses_pseudo_terminal(tool_call);
-        // 流式输出内容本身已在实时渲染，无需额外标签。
+        // The streamed content is already rendered live; no extra label is needed.
     }
 
     fn push_stream_text(&mut self, text: &str) {
@@ -1981,8 +2063,9 @@ impl<'a> TerminalToolObserver<'a> {
             return;
         }
         self.streamed_any_output = true;
-        // 工具输出被禁用时仍记录已收到流，避免完成时误报“无输出”，但不可绕过
-        // runtime_ctx 的终端输出开关直接写 stdout。
+        // Even when tool output is disabled, still record that a stream was received so
+        // completion never falsely reports “no output”; but never bypass runtime_ctx's
+        // terminal-output switch to write straight to stdout.
         if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
             return;
         }
@@ -2014,7 +2097,8 @@ impl<'a> TerminalToolObserver<'a> {
         self.push_visual_output_text(&sanitized);
     }
 
-    /// 已确认存在视觉网格后，仍只展示构成网格的行；后续普通日志保持隐藏。
+    /// Once a visual grid has been confirmed, only show the rows that actually form the
+    /// grid; subsequent plain logs stay hidden.
     fn push_visual_output_text(&mut self, text: &str) {
         self.visual_output_line.push_str(text);
         while let Some(newline_at) = self.visual_output_line.find('\n') {
@@ -2025,7 +2109,8 @@ impl<'a> TerminalToolObserver<'a> {
             }
         }
 
-        // 非换行的普通日志不能无限堆积；二维码行会在换行到达后再做判定。
+        // Non-newline plain logs must not pile up without bound; QR-code rows are only
+        // judged once a newline arrives.
         if self.visual_output_line.len() > VISUAL_OUTPUT_PROBE_MAX_BYTES {
             self.visual_output_line.clear();
         }
@@ -2038,12 +2123,14 @@ impl<'a> TerminalToolObserver<'a> {
 
         let line = std::mem::take(&mut self.visual_output_line);
         if is_terminal_visual_grid_line(&line) {
-            // 补齐换行，避免紧随其后的完成状态与最后一行视觉输出粘连。
+            // Append a newline so the completion status that follows does not stick to
+            // the last visual-output line.
             self.render_visible_stream_text(&format!("{line}\n"));
         }
     }
 
-    /// 渲染已获准展示的流式文本：显式 PTY 输出，或已识别的视觉网格。
+    /// Render streamed text approved for display: explicit PTY output, or an identified
+    /// visual grid.
     fn render_visible_stream_text(&mut self, text: &str) {
         if self.allow_inline_fold_updates {
             let _ = self.tty_fold.push_text(text);
@@ -2121,19 +2208,20 @@ impl<'a> TerminalToolObserver<'a> {
     }
 
     fn print_prepared_tool_result(&mut self, prepared: &PreparedToolResult) {
-        // 终端不再打印工具输出内容，只保留状态行。
+        // The terminal no longer prints tool output content; only the status line is kept.
         let _ = prepared;
     }
 
     fn print_captured_command_output(&mut self, prepared: &PreparedToolResult) {
-        // 终端不再打印工具输出内容，只保留状态行。
+        // The terminal no longer prints tool output content; only the status line is kept.
         let _ = prepared;
     }
 }
 
-/// 只有 `execute_command` 显式请求 PTY 时才完整展示流式输出。PTY 是交互式 CLI
-/// （菜单、确认、扫码登录等）的 opt-in 信号；常规命令继续走视觉网格检测，避免把
-/// 所有构建/搜索日志写到终端。
+/// Streamed output is only shown in full when `execute_command` explicitly requests a
+/// PTY. A PTY is the opt-in signal for interactive CLIs (menus, confirmations, QR-login,
+/// etc.); regular commands keep going through visual-grid detection so build/search logs
+/// are not written to the terminal.
 fn execute_command_uses_pseudo_terminal(tool_call: &ToolCall) -> bool {
     tool_call.function.name == "execute_command"
         && serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
@@ -2142,13 +2230,15 @@ fn execute_command_uses_pseudo_terminal(tool_call: &ToolCall) -> bool {
             == Some(true)
 }
 
-/// 把 `execute_command` 等命令类工具的 arguments 渲染成单行可读的命令文本，
-/// 用于工具开始时在终端打印「输入」。多行命令折叠为单行，过长则截断。
-/// 解析失败（缺 `command` 字段或非法 JSON）时返回 None。
+/// Render the arguments of command-like tools (e.g. `execute_command`) into a single-line
+/// readable command text, printed in the terminal when the tool starts. Multi-line
+/// commands are folded to one line; overlong ones are truncated.
+/// Returns None when parsing fails (missing `command` field or invalid JSON).
 fn format_command_input(arguments: &str) -> Option<String> {
     let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let command = args.get("command")?.as_str()?;
-    // 折叠换行，避免一条命令在终端占多行打乱状态行布局
+    // Fold newlines so a command never spans multiple terminal lines and disturbs the
+    // status-line layout
     let mut line = command.replace('\n', " ⏎ ").replace('\r', "");
     const MAX_CHARS: usize = 200;
     if line.chars().count() > MAX_CHARS {
@@ -2243,14 +2333,16 @@ fn streamed_tool_result_is_failure(tool_call: &ToolCall, run_result: &tools::Run
             && run_result.tool_result.content.starts_with("Exit code:"))
 }
 
-/// Step 5：按轮构建的 ToolExecutor 适配器，把端口契约桥接到真实派发。
+/// Step 5: per-round ToolExecutor adapter that bridges the port contract to real dispatch.
 ///
-/// 持有真实派发所需的全部上下文；`&McpClient` 在 `execute` 内由 `SharedMcpClient`
-/// 的 `routing_snapshot()` 快照取得，不跨派发持锁（避免与子代理 `run_turn`/`tools/mod.rs`
-/// 中 MCP 分支对同一把 `Mutex` 的二次 `lock()` 形成死锁）。调用方 `mcp_client` 参数在
-/// 生产中同样是 `routing_snapshot()` 值（空 servers，经共享的 `cached_server_prefixes` Arc
-/// 与真实 client 同源路由，见 orchestrator.rs:1093），与快照路由结果等价；真实 MCP
-/// 执行始终走 `shared_mcp_client`。
+/// Holds all the context real dispatch needs; `&McpClient` is obtained inside `execute`
+/// from `SharedMcpClient`'s `routing_snapshot()` snapshot, so no lock is held across
+/// dispatch (avoiding a second `lock()` on the same `Mutex` deadlocking against the MCP
+/// branch in subagent `run_turn`/`tools/mod.rs`). The caller's `mcp_client` parameter is
+/// likewise a `routing_snapshot()` value in production (empty servers, routed from the
+/// same source as the real client through the shared `cached_server_prefixes` Arc, see
+/// orchestrator.rs:1093), equivalent to the snapshot routing result; real MCP execution
+/// always goes through `shared_mcp_client`.
 struct RoundToolExecutorAdapter {
     session_id: String,
     shared_mcp_client: SharedMcpClient,
@@ -2269,11 +2361,13 @@ impl ToolExecutor for RoundToolExecutorAdapter {
         Box::pin(async move {
             let mut observer = TerminalToolObserver::new(app);
             let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
-            // 不跨派发持锁：取一个不持锁的 routing_snapshot 快照作路由，避免临时
-            // MutexGuard 活到整条 let 语句结束。否则同步 `task` 子代理在另一线程的
-            // `run_turn`（prepare.rs 的 `mcp_client.lock()`）会永远拿不到这把锁，而父
-            // 线程又阻塞等子代理返回 → 跨线程死锁（症状：subagent 卡在 preparing context）。
-            // 详见本文件测试辅助 mcp_snapshot 的注释。
+            // Do not hold the lock across dispatch: take a non-locking routing_snapshot for
+            // routing so a temporary MutexGuard does not outlive the whole let statement.
+            // Otherwise a synchronous `task` subagent running `run_turn` on another thread
+            // (`mcp_client.lock()` in prepare.rs) would never acquire this lock, while the
+            // parent thread blocks waiting for the subagent to return → cross-thread
+            // deadlock (symptom: subagent stuck in preparing context).
+            // See the mcp_snapshot test-helper comments in this file.
             let snapshot = self.shared_mcp_client.lock().unwrap().routing_snapshot();
             let result = execute_tool_calls_with_suppressed_read_only_calls(
                 &self.session_id,
@@ -2285,8 +2379,9 @@ impl ToolExecutor for RoundToolExecutorAdapter {
                 self.iteration,
                 &self.suppressed_read_only_results,
             )
-            // 派发返回 `Box<dyn Error>`（非 Send+Sync），端口要求 Send+Sync：
-            // 用 `io::Error` 包装保留错误消息，供上游按字符串展示。
+            // Dispatch returns `Box<dyn Error>` (not Send+Sync) while the port requires
+            // Send+Sync: wrap in `io::Error` to preserve the error message for string
+            // display upstream.
             .map_err(|e| std::io::Error::other(format!("tool dispatch failed: {e}")))?;
             Ok(result.into_tool_exec_output())
         })
@@ -2296,9 +2391,11 @@ impl ToolExecutor for RoundToolExecutorAdapter {
 fn handle_tool_call_round(
     app: &mut App,
     source_model: &str,
-    // Step 5 起真实派发改由 RoundToolExecutorAdapter 从 shared_mcp_client 加锁取 `&McpClient`；
-    // 该参数保留以兼容既有调用方。生产中它是 routing_snapshot() 值，路由经共享
-    // `cached_server_prefixes` 与真实 client 等价，真实 MCP 执行走 shared_mcp_client。
+    // Since Step 5, real dispatch is handled by RoundToolExecutorAdapter, which locks
+    // shared_mcp_client to obtain `&McpClient`; this parameter is kept for compatibility
+    // with existing callers. In production it is a routing_snapshot() value — routing
+    // through the shared `cached_server_prefixes` is equivalent to the real client, and
+    // real MCP execution goes through shared_mcp_client.
     _mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
     tool_call_execution: &ToolCallExecution,
@@ -2319,8 +2416,8 @@ fn handle_tool_call_round(
     let mut exec_result = if let Some(reason) = rejection_reason {
         reject_tool_calls(&tool_call_execution.stream_result.tool_calls, reason)
     } else {
-        // Step 5：按轮构建 ToolExecutor 链，真实派发作为内层适配器；
-        // 空中间件链 = 恒等，零行为变化。
+        // Step 5: build the per-round ToolExecutor chain with real dispatch as the inner
+        // adapter; an empty middleware chain is the identity — zero behavior change.
         let adapter = RoundToolExecutorAdapter {
             session_id: app.session_id.clone(),
             shared_mcp_client: shared_mcp_client.clone(),
@@ -2329,14 +2426,16 @@ fn handle_tool_call_round(
             iteration,
         };
         let executor = build_tool_executor_chain(app.tool_middlewares.clone(), Box::new(adapter));
-        // 端口 `execute` 为 async；本路径为同步驱动（含无 tokio runtime 的测试线程），
-        // 用 futures_executor::block_on 在当前线程阻塞执行（独立执行器，任意上下文可用）。
+        // The port `execute` is async; this path is synchronous driving (including test
+        // threads without a tokio runtime), so futures_executor::block_on blocks the
+        // current thread (independent executor, usable in any context).
         let output = futures_executor::block_on(executor.execute(
             app,
             tool_call_execution.stream_result.tool_calls.clone(),
         ))
-        // 端口错误为 `Box<dyn Error + Send + Sync>`，本函数返回 `Box<dyn Error>`（Sized 约束），
-        // 先映射为 `io::Error` 再 `?` 传播；不加前缀，保留中间件/派发自带的上下文。
+        // The port error is `Box<dyn Error + Send + Sync>` while this function returns
+        // `Box<dyn Error>` (Sized constraint); map to `io::Error` first then propagate
+        // with `?`; no prefix is added so middleware/dispatch context is preserved.
         .map_err(|e| std::io::Error::other(e.to_string()))?;
         let ToolExecOutput {
             tool_results,
@@ -2346,7 +2445,8 @@ fn handle_tool_call_round(
             execution_outcomes,
             had_error,
         } = output;
-        // 中间件注入的 assistant 消息（当前空链恒为空）：字段保留，挂载留给后续中间件能力。
+        // Assistant messages injected by middleware (always empty with the current empty
+        // chain): the field is kept; mounting is left for future middleware capability.
         let _unwired_assistant_messages = assistant_messages;
         ExecuteToolCallsResult {
             executed_tool_calls,
@@ -2361,18 +2461,22 @@ fn handle_tool_call_round(
             .unwrap_or_default();
     uniquify_tool_call_occurrences(messages, &persisted_tool_call_ids, &mut exec_result);
     *turn_had_tool_error |= exec_result.had_error;
-    // apply_patch stale-target 账本必须在结果落定后、下一轮 guard 检查前更新。
-    // messages 不是可靠真相源：历史压缩会把失败组折叠成 internal_note；因此 live
-    // 状态放在 App，并同步写入当前 session 的 SQLite meta。被 guard 拒绝时产生的
-    // `apply_patch retry blocked` 文本既非成功也非 mismatch，对账本无副作用。
+    // The apply_patch stale-target ledger must be updated after results settle and before
+    // the next round's guard check. messages is not a reliable truth source: history
+    // compression folds failed groups into internal_note; so the live state lives on App
+    // and is mirrored into the current session's SQLite meta. The `apply_patch retry
+    // blocked` text produced when the guard rejects a call is neither success nor
+    // mismatch, so it has no effect on the ledger.
     update_stale_patch_targets(
         &mut app.stale_patch_targets,
         &exec_result.executed_tool_calls,
         &exec_result.tool_results,
     );
-    // 先于消息落盘写账本：若进程恰在两次写入之间崩溃，留下一个偏保守的 fresh-read
-    // 要求是安全的；反过来丢掉 mismatch 状态会在恢复 session 后放行陈旧 patch。
-    // 普通一次性临时 session 会在退出时删除，不为它单独创建 SQLite。
+    // Write the ledger before messages hit disk: if the process crashes between the two
+    // writes, leaving a conservative fresh-read requirement is safe; losing the mismatch
+    // state instead would let a stale patch through after session recovery.
+    // Ordinary one-off temp sessions are deleted on exit; no separate SQLite is created
+    // for them.
     let ephemeral_one_shot = one_shot_mode && app.cli.session.is_none();
     if !ephemeral_one_shot
         && let Err(error) = crate::ai::history::write_stale_patch_targets_sqlite(
@@ -2414,7 +2518,8 @@ fn handle_tool_call_round(
             &app.session_history_file,
             &outcomes,
         ) {
-            // 旁路状态写入失败时必须安全退化为“不折叠”，不能影响原始工具结果。
+            // If the bypass-state write fails, degrade safely to “do not fold” so the
+            // original tool result is unaffected.
             eprintln!("[Warning] failed to persist structured tool outcomes: {error}");
         }
     }
@@ -2424,8 +2529,9 @@ fn handle_tool_call_round(
     ))
 }
 
-/// 终端去重候选必须与实际可见正文对齐：digest 是给模型看的附加图片理解内容，
-/// 终端不会展示，因此候选同样剥离后再比较或兜底渲染。
+/// Terminal dedup candidates must align with the actually visible body: the digest is
+/// extra image-understanding content shown only to the model, never in the terminal, so
+/// candidates strip it too before comparing or falling back to rendering.
 fn terminal_dedupe_candidate_from_assistant_text(assistant_text: &str) -> Option<String> {
     let visible_text = crate::ai::request::strip_digest_blocks(assistant_text.trim());
     (!visible_text.is_empty()).then(|| visible_text.to_string())
@@ -2495,7 +2601,8 @@ fn execute_tool_calls_with_suppressed_read_only_calls(
                 tool_call_id: tool_call.id.clone(),
                 content: content.clone(),
             });
-            // 去重结果只是指向当前上下文中原调用的短锚点，并非真实缓存正文。
+            // A dedup result is only a short anchor pointing at the original call in the
+            // current context, not a real cached body.
             cached_hits.push(false);
             execution_outcomes.push(None);
             continue;
@@ -2527,9 +2634,10 @@ fn execute_tool_calls_with_suppressed_read_only_calls(
     })
 }
 
-/// `tool_call_id` 只保证单次模型响应内关联；部分 provider/fallback 会跨轮复用。
-/// 写入历史前将碰撞的 assistant/tool/outcome 三方一起改成新的 occurrence ID，
-/// 从而让后续压缩和结构化 outcome 永远按一次真实调用关联。
+/// `tool_call_id` only guarantees association within a single model response; some
+/// providers/fallbacks reuse ids across rounds. Before writing history, any colliding
+/// assistant/tool/outcome triple is rewritten to a fresh occurrence ID so later
+/// compression and structured outcomes always associate with one real call.
 fn uniquify_tool_call_occurrences(
     messages: &[Message],
     persisted_tool_call_ids: &[String],
@@ -2545,8 +2653,9 @@ fn uniquify_tool_call_occurrences(
             .iter()
             .filter_map(|message| message.tool_call_id.clone()),
     );
-    // context budget 可能已从 live messages 裁掉较早调用，完整持久化历史也必须
-    // 参与碰撞检测，避免新 occurrence 与已不在 live context 的旧消息重名。
+    // The context budget may have pruned earlier calls from live messages; the full
+    // persisted history must also join collision detection so a new occurrence never
+    // collides with an old message that is no longer in live context.
     used.extend(persisted_tool_call_ids.iter().cloned());
 
     for index in 0..result.executed_tool_calls.len() {
@@ -2663,10 +2772,13 @@ const TRUNCATION_RETRY_NOTE_PREFIX: &str = "tool_followup:output_truncated\n";
 const DEGENERATE_REPETITION_RETRY_NOTE_PREFIX: &str = "tool_followup:degenerate_repetition\n";
 const DEGENERATE_REPETITION_FINISH_REASON: &str = "degenerate_repetition";
 
-/// 在检测到本轮响应被截断后，把已产出的可见文本（若有）作为部分进展保留，并追加
-/// 一条收缩重写提示，指导模型下一轮缩小单次输出规模后重发被截断的操作。
+/// After detecting that this round's response was truncated, keep the visible text
+/// produced so far (if any) as partial progress and append a shrink-and-rewrite hint
+/// telling the model to reduce its per-output size next round before resending the
+/// truncated operation.
 ///
-/// 幂等：同一条提示不会重复注入，避免连续截断时堆叠多份相同 note。
+/// Idempotent: the same hint is never injected twice, so consecutive truncations do not
+/// stack duplicate notes.
 fn append_truncation_retry_note(
     stream_result: &crate::ai::types::StreamResult,
     messages: &mut Vec<Message>,
@@ -2679,14 +2791,17 @@ fn append_truncation_retry_note(
         .as_deref()
         .is_some_and(|reason| reason == DEGENERATE_REPETITION_FINISH_REASON);
 
-    // 保留模型已输出的可见文本作为"部分进展"，让重试时不至于完全丢失上下文。
-    // 截断场景下这段文本往往是半截的意图说明，仅作参考，不当作最终回答。
+    // Keep the visible text the model already produced as "partial progress" so a retry
+    // does not lose all context. Under truncation this text is usually a half-finished
+    // intent explanation; keep it for reference only, never as the final answer.
     //
-    // 仅写入内存 messages（本 turn 内可见），不写入 turn_messages 持久化轨道。
-    // 原因：partial text 是半截文本，不是有效的对话记录。连续截断时会累积
-    // 多条大体积 partial text，持久化后污染历史文件，下个 turn 加载时占据
-    // 大量字符预算，导致 compress_messages_for_context 压缩/丢弃正常对话历史，
-    // 表现为"历史清空"。与 truncation note 保持一致：过程性内容不持久化。
+    // Write only to in-memory messages (visible within this turn), not to the persisted
+    // turn_messages track. Reason: partial text is a half-finished fragment, not a valid
+    // conversation record. Consecutive truncations would accumulate multiple large partial
+    // texts that, if persisted, pollute the history file and consume a large character
+    // budget on the next turn's load, causing compress_messages_for_context to compress or
+    // drop normal conversation history — surfacing as "history cleared". Consistent with
+    // the truncation note: process-level content is never persisted.
     let partial = stream_result.assistant_text.trim();
     if !partial.is_empty() {
         messages.push(Message {
@@ -2698,11 +2813,12 @@ fn append_truncation_retry_note(
         });
     }
 
-    // 移除上一轮的截断/重复退化提示（如有），替换为携带最新计数的新提示。
-    // 早期版本是幂等的——只注入一次后跳过。但连续截断时模型得不到
-    // "已再次截断"的反馈，只看到和上次一样的上下文，大概率产出相似
-    // 长度的内容再被截断，陷入盲循环。改为每次更新计数，让模型感知
-    // 到严重程度在递增。
+    // Remove the previous truncation/repeat-degradation hint (if any) and replace it with
+    // one carrying the latest count. The early version was idempotent — injected once then
+    // skipped. But with consecutive truncations the model got no "truncated again" signal
+    // and saw the same context as before, so it would likely produce a similar-length
+    // output and get truncated again — a blind loop. Now the count is refreshed each time
+    // so the model sees the severity climbing.
     messages.retain(|message| {
         !(message.role == ROLE_INTERNAL_NOTE
             && message.content.as_str().is_some_and(|content| {
@@ -2744,9 +2860,11 @@ fn append_truncation_retry_note(
     );
     note.push_str("- Prefer small, incremental tool calls over emitting one oversized response;\n");
     note.push_str("- Re-send only the operation that got truncated; do not repeat steps that already completed successfully.");
-    // 过程性纠偏提示：仅在本 turn 内下发给 LLM，不写入 turn_messages 持久化轨道。
-    // 该提示只在"刚发生截断的下一轮"有意义；若持久化会在后续每个 turn 反复重放，
-    // 让模型永久性地畏手畏脚、输出规模受限——正是"一次变蠢后持续变蠢"的根因之一。
+    // Process-level corrective hint: only sent to the LLM within this turn, never written
+    // to the persisted turn_messages track. This hint only makes sense in the round right
+    // after a truncation; if persisted it would replay on every later turn, keeping the
+    // model permanently timid with constrained output size — one root cause of "once dumb,
+    // forever dumb".
     messages.push(Message {
         role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note),
@@ -2792,8 +2910,10 @@ fn append_auto_image_followup_message(
         return Ok(());
     }
 
-    // 合成的 user 消息（图片 followup）不构成真实轮次边界，必须带结构化运行时标记，
-    // 否则会把本轮起点推到 followup 之后，scoped 指令目标与当前轮工具保护全部失效。
+    // Synthetic user messages (image followups) are not real round boundaries and must
+    // carry a structured runtime marker; otherwise the round's start would be pushed past
+    // the followup, invalidating scoped-instruction targets and the current round's tool
+    // protections.
     let question = if question.trim().is_empty() {
         "Analyze the requested image file.".to_string()
     } else {
@@ -2900,21 +3020,24 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
 ) -> Result<TurnLoopStep, Box<dyn std::error::Error>> {
     match execution {
         IterationExecution::Exit(outcome) => Ok(TurnLoopStep::Return(outcome)),
-        // 预超时收口由 orchestrator 在调用本函数前拦截处理，这里只是穷尽匹配的兜底。
+        // Pre-timeout finalization is intercepted by the orchestrator before this
+        // function is called; this arm is only an exhaustive-match fallback.
         IterationExecution::WrapUpFinal => Ok(TurnLoopStep::Continue),
         IterationExecution::RequestFailed(text) => {
             *final_assistant_text = text;
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::EmptyResponse => {
-            // 模型返回空响应（无文本、无工具调用、无思考内容），自动重试
+            // The model returned an empty response (no text, no tool calls, no reasoning
+            // content); retry automatically.
             Ok(TurnLoopStep::Continue)
         }
         IterationExecution::Truncated(stream_result) => {
             if stream_result.stream_error {
-                // 流读取错误（服务端不稳定）导致的截断：不注入收缩提示，
-                // 不保留 partial text（流中断时的 partial 不可靠），
-                // 简单重试即可。日志已在 orchestrator 层打印。
+                // Truncation caused by a stream read error (unstable server): no shrink
+                // hint is injected and no partial text is kept (partial from an
+                // interrupted stream is unreliable); just retry. Logging already happens
+                // at the orchestrator layer.
                 Ok(TurnLoopStep::Continue)
             } else {
                 append_truncation_retry_note(&stream_result, messages, consecutive_truncations);
@@ -2922,15 +3045,20 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             }
         }
         IterationExecution::FinalResponse(mut stream_result) => {
-            // 收尾 veto：仍有未收口的 subagent task 时，打回一轮强制收集结果。
-            // 但必须尊重迭代硬上限——否则子任务永不到终态且模型拒绝 task_wait 时
-            // 会无限活锁，而且每轮重置 force_final_response 还会反复顶掉 orchestrator
-            // 的安全刹车（tool-loop / progress-budget / iteration-limit hard-stop）。
-            // 到达硬上限后放行收尾，让 max_iterations 保持为权威天花板。
+            // Completion veto: while unclosed subagent tasks remain, bounce the round
+            // back to force collecting their results. But the iteration hard cap must be
+            // respected — otherwise, when a subtask never reaches a terminal state and
+            // the model refuses task_wait, this would livelock forever, and resetting
+            // force_final_response every round would keep knocking out the
+            // orchestrator's safety brakes (tool-loop / progress-budget /
+            // iteration-limit hard-stop). Past the hard cap, finalization is allowed so
+            // max_iterations stays the authoritative ceiling.
             //
-            // 除硬上限外，再加一道**独立重开配额**：同一 turn 内重开次数达到
-            // TASK_EVIDENCE_REOPEN_MAX 后不再打回。否则 TIMED_OUT 这类永远无法整合的
-            // 死结、或模型持续拒绝 task_integrate 时，会逐轮无限重开、空转到 4096。
+            // On top of the hard cap, a **separate reopen quota** is added: once the
+            // reopen count within one turn reaches TASK_EVIDENCE_REOPEN_MAX, no more
+            // bounces happen. Otherwise dead ends that can never be integrated (like
+            // TIMED_OUT), or a model that keeps refusing task_integrate, would reopen
+            // forever and spin to 4096.
             let reopen_count = task_evidence_reopen_count(messages);
             let reopen_budget_exhausted = reopen_count >= TASK_EVIDENCE_REOPEN_MAX;
             if iteration < max_iterations
@@ -2958,8 +3086,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     *force_final_response = false;
                     return Ok(TurnLoopStep::Continue);
                 }
-                // 硬上限或重开配额耗尽：放行收尾，把未整合证据作为 warning + ledger
-                // 附到可见回答，交由用户/后续轮处理，而不是无限重开空转。
+                // Hard cap or reopen quota exhausted: allow finalization, attaching the
+                // unintegrated evidence as warning + ledger to the visible answer for the
+                // user/later rounds to handle, instead of spinning on endless reopens.
                 stream_result.assistant_text.push_str(
                     "\n\n[Runtime warning] Subagent results remain unintegrated after repeated reopen attempts.\n",
                 );
@@ -2969,7 +3098,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 && !stream_result.reasoning_text.trim().is_empty()
                 && stream_result.tool_calls.is_empty();
             if reasoning_only_completion {
-                // 用重试标记的数量记录已重试次数,支持多次自动重试。
+                // Count the retries via the number of retry markers, so multiple
+                // automatic retries are supported.
                 let retry_count = messages
                     .iter()
                     .filter(|message| {
@@ -2987,23 +3117,27 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                             .as_str()
                             .is_some_and(|text| text.starts_with(REASONING_ONLY_SYNTHESIS_MARKER))
                 });
-                // 迭代硬上限仍是最终兜底：到达 max_iterations 停轮并给出用户可见错误。
+                // The iteration hard cap remains the final fallback: at max_iterations the
+                // round stops with a user-visible error.
                 if iteration >= max_iterations {
                     *final_assistant_text = "[Model returned only reasoning content without a final answer; please retry or switch models]"
                         .to_string();
                     return Ok(TurnLoopStep::Break);
                 }
                 if already_forced_synthesis {
-                    // 已强制过无思考合成仍空转：保留 synthesis 笔记与
-                    // force_final_response / thinking_disabled_override，不重复注入
-                    // synthesis 笔记。但该路径 force_final_response 已置位，
-                    // orchestrator 的 tool-loop / progress-budget / checkpoint 二级
-                    // 刹车全部失效，且本类被归类为 FinalResponse，consecutive_empty /
-                    // truncation / stream_error 兜底计数器也不会计数——若逐轮重复同
-                    // 字节请求，对确定性模型将徒劳空转到 max_iterations。这里用轻量
-                    // 重试标记显式计数：每轮注入一次新标记（也让每轮请求携带新上下文），
-                    // 达到 REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES 后停轮给出用户
-                    // 可见错误。
+                    // Still spinning after a forced no-reasoning synthesis: keep the
+                    // synthesis note and force_final_response / thinking_disabled_override
+                    // in place and do not re-inject the synthesis note. But on this path
+                    // force_final_response is already set, so the orchestrator's secondary
+                    // brakes (tool-loop / progress-budget / checkpoint) are all disabled,
+                    // and since this is classified as FinalResponse, the consecutive_empty /
+                    // truncation / stream_error fallback counters never count either — if
+                    // the same byte-for-byte request were repeated each round, a
+                    // deterministic model would uselessly spin to max_iterations. So a
+                    // lightweight retry marker counts explicitly: one new marker per round
+                    // (which also gives each round's request fresh context), and after
+                    // REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES the round stops with a
+                    // user-visible error.
                     let post_synthesis_retries = messages
                         .iter()
                         .filter(|message| {
@@ -3057,10 +3191,12 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 });
                 return Ok(TurnLoopStep::Continue);
             }
-            // 注入笔记回吐门禁：优先于其它 final 门禁。模型把 runtime 上下文笔记
-            // 原样当答案吐回（弱模型在前面各类 reopen 之后尤其常见）时，这段文本
-            // 既无回答价值又会把内部提示泄漏到终端并持久化成 final。命中即给一次
-            // 无工具合成重试；仍回吐则停轮并给用户可见错误，而不是接受它。
+            // Injected-note regurgitation gate: takes priority over the other final gates.
+            // When the model spits a runtime context note back verbatim as its answer
+            // (especially common with weak models after the earlier kinds of reopen), the
+            // text has no answer value and leaks internal prompts to the terminal and into
+            // the persisted final. On a hit, give one no-tool synthesis retry; if it still
+            // regurgitates, stop the round with a user-visible error instead of accepting it.
             match injected_context_echo_recovery_action(messages, &stream_result.assistant_text) {
                 DanglingFinalRecoveryAction::Allow => {}
                 DanglingFinalRecoveryAction::RetryWithoutTools => {
@@ -3100,8 +3236,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             ) {
                 CompletionEvidenceGateAction::Allow => false,
                 CompletionEvidenceGateAction::Reopen => {
-                    // 当前候选结论已经由 stream runtime 实时输出；证据门禁要求重开时，
-                    // 把它交给下一轮 terminal dedupe，避免模型验证后原样回答导致结论重画。
+                    // The current candidate conclusion was already streamed live by the
+                    // stream runtime; when the evidence gate asks for a reopen, hand it to
+                    // the next round's terminal dedupe so a verbatim answer after
+                    // verification does not redraw the conclusion.
                     *terminal_dedupe_candidate = terminal_dedupe_candidate_from_assistant_text(
                         &stream_result.assistant_text,
                     );
@@ -3123,8 +3261,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 }
                 DanglingFinalRecoveryAction::Warn => true,
             };
-            // 当前响应已经完成最终 gate；此前用于下一轮流式去重的正文不再相关。
-            // 从这里开始，该槽仅保存“流式正文之后还需补画给用户”的 runtime 提示。
+            // The current response has passed the final gate; the body previously kept for
+            // the next round's streamed dedupe is no longer relevant. From here on, the
+            // slot only holds runtime hints that still need to be drawn for the user after
+            // the streamed body.
             *terminal_dedupe_candidate = None;
             if warn_unsupported_runtime_limit {
                 append_runtime_warning_once(
@@ -3154,7 +3294,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 );
                 record_hidden_self_note(app, turn_messages, COMPLETION_EVIDENCE_UNVERIFIED_NOTE);
             }
-            // 硬上限时不再 reopen，但未回收子任务必须同时进入 canonical final 和终端补画。
+            // At the hard cap we no longer reopen, but unreaped subtasks must still enter
+            // both the canonical final and the terminal redraw.
             if iteration >= max_iterations {
                 if let Ok(Some(notice)) =
                     task_tools::build_abandoned_tasks_notice(&app.session_id, max_iterations)
@@ -3172,9 +3313,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 final_assistant_text,
                 final_assistant_recorded,
             );
-            // finish_reason=length 但有可见文本：按 Completed 接受，但注入一条轻量
-            // 提示让模型知道输出可能不完整。不触发重试（避免推理模型 reasoning
-            // 占满预算时无意义循环），只在下轮请求里提醒模型自行检查/补全。
+            // finish_reason=length but with visible text: accept as Completed, but inject
+            // a light hint so the model knows the output may be incomplete. No retry is
+            // triggered (avoiding a pointless loop when a reasoning model fills its budget
+            // with reasoning); the hint only reminds the model to self-check/complete in
+            // the next request.
             if was_truncated_by_length {
                 let note = "self_note:output_length_warning\n\
                             The previous response hit the output length limit (finish_reason=length).\n\
@@ -3240,7 +3383,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             } else {
                 Vec::new()
             };
-            // 工具轮执行前钩子（on_before_tools → ExecuteTools.before）。
+            // Pre-tool-round hook (on_before_tools → ExecuteTools.before).
             app.fire_before_tools_hooks();
             *terminal_dedupe_candidate = handle_tool_call_round(
                 app,
@@ -3297,7 +3440,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     return Ok(TurnLoopStep::Continue);
                 }
 
-                // 第二次违规后停止，避免模型在已禁用工具的收尾阶段无限重试。
+                // Stop after the second violation so the model cannot retry forever in the
+                // finalization phase with disabled tools.
                 let partial = tool_call_execution.stream_result.assistant_text.trim();
                 *final_assistant_text = if partial.is_empty() {
                     NO_TOOL_SYNTHESIS_WARNING.to_string()
@@ -3322,9 +3466,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     let mut text = format!(
                         "Agent reached the tool iteration limit ({max_iterations}) without producing a final answer."
                     );
-                    // 到达硬上限放行收尾：把仍未回收的子任务状态附进最终回答做
-                    // 可见性兜底。此处不再打回模型（避免子任务永不到终态时无限
-                    // 活锁），仅确保未回收结果不被静默抛弃。
+                    // At the hard cap, allow finalization: attach the still-unreaped
+                    // subtask state to the final answer as a visibility fallback. The model
+                    // is not bounced again (avoiding an infinite livelock when a subtask
+                    // never reaches a terminal state); we only ensure unreaped results are
+                    // not silently dropped.
                     if let Ok(Some(notice)) =
                         task_tools::build_abandoned_tasks_notice(&app.session_id, max_iterations)
                     {
@@ -3338,8 +3484,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 *force_final_response = true;
             } else {
                 // AIOS: kernel is the authoritative source for tool-call quota.
-                // 当前 usage 已经超限、或下一次 tool call 会超限，都应该切到
-                // force-final，但 tool-call 配额本身不该阻断“无工具的最终回答”。
+                // Whether the current usage is already over budget or the next tool call
+                // would exceed it, we should switch to force-final; but the tool-call quota
+                // itself must not block a tool-free final answer.
                 use aios_kernel::primitives::{ResourceUsageDelta, RlimitDim, RlimitVerdict};
                 let os = app.os.lock().unwrap();
                 if let Some(pid) = os.current_process_id() {
@@ -3430,9 +3577,10 @@ mod tests {
         name: TEST_REPLAY_TOOL,
     });
 
-    /// 取一个不持锁的 McpClient 快照（与生产 orchestrator 的 routing_snapshot 模式一致）。
-    /// 直接把 `shared.lock().unwrap()` 的 guard 传进 handle_iteration_execution 会让
-    /// guard 活到整个调用语句结束，而 adapter 执行时会对同一把锁二次加锁 → 自死锁。
+    /// Take a non-locking McpClient snapshot (consistent with the production orchestrator's
+    /// routing_snapshot pattern). Passing `shared.lock().unwrap()`'s guard directly into
+    /// handle_iteration_execution would keep the guard alive until the whole call statement
+    /// ends, while the adapter locks the same mutex again during execution → self-deadlock.
     fn mcp_snapshot(shared: &SharedMcpClient) -> McpClient {
         shared.lock().unwrap().routing_snapshot()
     }
@@ -3537,14 +3685,14 @@ mod tests {
         let mut messages: Vec<Message> = Vec::new();
         assert_eq!(task_evidence_reopen_count(&messages), 0);
 
-        // 每次重开注入一个计数 marker；计数随之累加。
+        // Inject one count marker per reopen; the count accumulates with it.
         push_task_evidence_reopen_marker(&mut messages, 1);
         assert_eq!(task_evidence_reopen_count(&messages), 1);
         push_task_evidence_reopen_marker(&mut messages, 2);
         assert_eq!(task_evidence_reopen_count(&messages), 2);
 
-        // 关键不变量：unintegrated-evidence reopen 的 retain 不得清掉计数 marker，
-        // 否则配额永远攒不满、退回无限重开。
+        // Key invariant: the unintegrated-evidence reopen retain must not clear the count
+        // markers, or the quota would never fill and we would regress to endless reopens.
         reopen_turn_for_unintegrated_task_evidence(&mut messages, "[task-evidence-ledger]\ntask_id=t");
         assert_eq!(
             task_evidence_reopen_count(&messages),
@@ -3555,8 +3703,9 @@ mod tests {
 
     #[test]
     fn task_evidence_reopen_quota_is_bounded() {
-        // 配额上限存在且远小于迭代硬上限（DEFAULT_MAX_ITERATIONS = 64*64 = 4096），
-        // 保证死结（TIMED_OUT / 拒绝 integrate）不会无限重开。
+        // The quota cap exists and is far below the iteration hard cap (DEFAULT_MAX_ITERATIONS
+        // = 64*64 = 4096), guaranteeing that dead ends (TIMED_OUT / refusing to integrate)
+        // never reopen forever.
         assert!(TASK_EVIDENCE_REOPEN_MAX >= 1);
         assert!(TASK_EVIDENCE_REOPEN_MAX < 64 * 64);
 
@@ -3713,10 +3862,12 @@ mod tests {
         }
     }
 
-    /// 把一段 `assistant(tool_calls)` + `tool` 的消息序列按时间顺序回放进
-    /// stale-target 账本，等价于运行时逐轮调用 [`update_stale_patch_targets`]
-    /// 的累积效果。让 guard 测试仍用直观的「历史消息」表达场景，再据账本派生的
-    /// 门控行为断言——即覆盖修复后的完整链路（messages → 账本 → guard）。
+    /// Replay an `assistant(tool_calls)` + `tool` message sequence into the stale-target
+    /// ledger in chronological order, equivalent to the accumulated effect of calling
+    /// [`update_stale_patch_targets`] round by round at runtime. Guard tests can keep
+    /// expressing scenarios as intuitive “history messages” and then assert on the gate
+    /// behavior derived from the ledger — covering the full fixed chain
+    /// (messages → ledger → guard).
     fn ledger_from_messages(messages: &[Message]) -> rustc_hash::FxHashSet<PathBuf> {
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut tool_results: Vec<crate::ai::types::ToolResult> = Vec::new();
@@ -3916,8 +4067,9 @@ mod tests {
 
     #[test]
     fn browser_read_after_navigation_is_not_suppressed_as_duplicate() {
-        // 浏览器读取的是「当前页面」这一可变外部状态：navigate 到新页面后，同名同参的
-        // get_text 是对新页面的全新读取，不能因签名相同而被误判为重复抑制。
+        // Browser reads target the mutable external state of the “current page”: after
+        // navigating to a new page, a get_text with the same name and args is a fresh read
+        // of the new page and must not be mistaken for a duplicate and suppressed.
         let read_args = serde_json::json!({ "selector": "body" });
         let previous = test_tool_call("call_previous", "mcp_browser_get_text", read_args.clone());
         let current = test_tool_call("call_current", "mcp_browser_get_text", read_args);
@@ -4301,7 +4453,8 @@ mod tests {
 
     #[test]
     fn mutable_disk_and_ipc_tools_are_not_replay_registered() {
-        // IPC / 技能列表读取的是当前进程或外部可变状态：必须针对当前状态执行。
+        // IPC / skill-list reads target the current process's or external mutable state:
+        // they must execute against the current state.
         for name in ["read_mailbox", "shm_read", "list_skills", "load_skill"] {
             let call = test_tool_call("call", name, serde_json::json!({}));
             assert!(
@@ -4309,8 +4462,9 @@ mod tests {
                 "{name} must execute against current external state"
             );
         }
-        // read_file 与「可证明只读」的 execute_command 登记为同轮可复用快照；
-        // 变更型命令被 read_only_tool_signature 的只读闸门拦截，仍必须真实执行。
+        // read_file and provably read-only execute_command register as same-turn reusable
+        // snapshots; mutating commands rejected by read_only_tool_signature's read-only
+        // gate must still be really executed.
         let read = test_tool_call("read", "read_file", serde_json::json!({ "file_path": "/tmp/a" }));
         assert!(read_only_tool_signature(&read).is_some());
         let ro_cmd = test_tool_call(
@@ -4325,7 +4479,9 @@ mod tests {
             serde_json::json!({ "command": "cargo check" }),
         );
         assert!(read_only_tool_signature(&mutating).is_none());
-        // 多段命令含 cargo 验证段也必须排除：首个实质段非 cargo 时不得提前放行。
+        // Multi-segment commands containing a cargo verification segment must also be
+        // excluded: when the first substantive segment is not cargo, it must not be
+        // allowed through early.
         let chained = test_tool_call(
             "chained",
             "execute_command",
@@ -4353,7 +4509,8 @@ mod tests {
         );
         assert!(suppressed.contains("call_current"));
 
-        // 归一化：`./x` 与 `x`（相对路径）视为同一读取，签名一致。
+        // Normalize: `./x` and `x` (relative paths) count as the same read with
+        // identical signatures.
         let current_rel = test_tool_call(
             "call_current_rel",
             "read_file",
@@ -4367,7 +4524,8 @@ mod tests {
             "`./x` must share the read_file signature of `x`"
         );
 
-        // 两次读取之间发生成功变更调用（write_file）：旧快照失效，必须真实读取。
+        // A successful mutation call (write_file) between two reads invalidates the old
+        // snapshot: must really read.
         let messages_with_write = vec![
             assistant_tool_call_message(test_tool_call(
                 "call_previous",
@@ -4491,9 +4649,10 @@ mod tests {
                 "Error: apply_patch failed: ambiguous patch: hunk context matches 2 locations.",
             ),
         ];
-        // 账本才是 guard 的真相源：等价于上一轮 handle_tool_call_round 结束时
-        // update_stale_patch_targets 依据这段失败历史落定的状态。历史消息此后
-        // 即使被压缩折叠，账本仍独立存活。
+        // The ledger is the guard's truth source: equivalent to the state that
+        // update_stale_patch_targets settled from this failure history at the end of the
+        // previous handle_tool_call_round. Even if the history messages are later
+        // compressed/folded, the ledger survives independently.
         app.stale_patch_targets = ledger_from_messages(&messages);
         let mut turn_messages = Vec::new();
         let mut final_assistant_text = String::new();
@@ -4680,8 +4839,9 @@ mod tests {
 
     #[test]
     fn tty_tool_output_fold_window_keeps_latest_visible_lines() {
-        // 断言正文/标记原样存在；置宽 COLUMNS 以免与 COLUMNS=12 的 clamp 用例并发时
-        // 读到泄漏的窄列宽而被截断。
+        // Assert the body/marker exists verbatim; widen COLUMNS so it does not run
+        // concurrently with the COLUMNS=12 clamp case and read a leaked narrow width,
+        // truncating the output.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -4710,9 +4870,11 @@ mod tests {
 
         let (window, _) = render_tty_tool_output_fold_window(&fold);
         assert_eq!(window.matches("lines folded").count(), 1);
-        // 逐行去掉 ANSI 与 `  │ ` 前缀后按**精确**正文序列比较，而非 `contains("line-1")`：
-        // line-10..line-19 等可见行都把 "line-1" 当子串包含，子串断言会假失败（MAX_VISIBLE
-        // 从 8 提到 64 后暴露的测试脆弱性）。精确序列已同时证明 line-1 被折叠、其余按序保留。
+        // Compare the **exact** body sequence after stripping ANSI and the `  │ ` prefix
+        // per line, rather than `contains("line-1")`: visible lines like line-10..line-19
+        // all contain "line-1" as a substring, so substring assertions would falsely fail
+        // (test fragility exposed after raising MAX_VISIBLE from 8 to 64). The exact
+        // sequence simultaneously proves line-1 was folded and the rest kept in order.
         let body_tokens = window
             .lines()
             .map(|line| crate::ai::driver::print::sanitize_for_terminal(line))
@@ -4728,7 +4890,8 @@ mod tests {
 
     #[test]
     fn tty_tool_output_fold_window_preserves_mock_qr_output() {
-        // 模拟扫码登录命令输出：二维码通常为 30–50 行，不能被通用日志折叠策略截断。
+        // Simulate a QR-login command's output: QR codes are typically 30–50 lines and
+        // must not be truncated by the generic log-folding strategy.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -4758,7 +4921,8 @@ mod tests {
 
     #[test]
     fn terminal_visual_grid_detection_requires_a_block_glyph_grid() {
-        // 普通命令输出（如 git diff）即使有很多行，也不能被渲染到终端。
+        // Ordinary command output (e.g. git diff) must not be rendered to the terminal
+        // even when it has many lines.
         let git_diff = "diff --git a/file.rs b/file.rs\n@@ -1,3 +1,4 @@\n-old line\n+new line\n";
         assert!(!contains_terminal_visual_grid(git_diff));
 
@@ -4890,9 +5054,11 @@ mod tests {
         let (window, rows) = render_tty_tool_output_fold_window(&fold);
         let visible_lines = tty_tool_output_visible_lines(&fold);
 
-        // 每条渲染行被 clamp 成单物理行：窗口物理行数 == 1 折叠标记 + 可见逻辑行数。
+        // Every rendered line is clamped to a single physical row: the window's physical
+        // row count equals 1 fold marker + visible logical lines.
         assert_eq!(rows, 1 + visible_lines.len());
-        // 每条渲染行（去掉 `  │ ` 前缀与 ANSI 后）不超过终端列宽（12），cursor-up 精确。
+        // Each rendered line (after stripping the `  │ ` prefix and ANSI) does not exceed
+        // the terminal width (12), so cursor-up is exact.
         for line in window.lines() {
             let visible = crate::ai::driver::print::sanitize_for_terminal(line);
             assert!(
@@ -4902,7 +5068,8 @@ mod tests {
         }
         assert!(!window.contains("12345678901234567890"));
         assert!(window.contains("abcdef"));
-        // 超宽行被截断为省略号结尾，不再原样残留导致 cursor-up 少算行数。
+        // Overwide lines are truncated with an ellipsis ending instead of lingering
+        // verbatim and undercounting rows for cursor-up.
         assert!(window.contains('…'));
 
         unsafe {
@@ -5043,10 +5210,12 @@ mod tests {
 
     #[test]
     fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently() {
-        // 模型变更后只用分类器认不出的命令验证（python3 脚本）：变更后确有
-        // 活动，但无“被识别的检查”。此时应静默 Allow —— 既不 Reopen 也不
-        // 追加“未观察到检查”的虚假警告（也不记内部注记），否则模型会防御性
-        // 重述结论。这正是“重复输出结论”的根源，运行时永远不该成为它的来源。
+        // The model verified after the mutation only with commands the classifier cannot
+        // recognize (python3 scripts): there is real post-mutation activity but no
+        // “recognized check”. Silently Allow here — neither Reopen nor append a false
+        // “no check observed” warning (and record no internal note either), otherwise the
+        // model defensively restates its conclusions. This is exactly the root of
+        // “repeated conclusions”, and the runtime must never be its source.
         let mutation = test_tool_call(
             "call_patch",
             "apply_patch",
@@ -5115,8 +5284,8 @@ mod tests {
         )
         .unwrap();
 
-        // 第一次 final 就直接收尾（静默 Allow），不 Reopen、不追加警告，
-        // 模型不会重述结论。
+        // The first final is accepted directly (silent Allow) with no Reopen and no
+        // warning appended, so the model never restates its conclusion.
         assert!(matches!(step, TurnLoopStep::Break));
         assert!(final_assistant_recorded);
         assert!(final_assistant_text.starts_with("已修复。"));
@@ -5504,10 +5673,12 @@ mod tests {
 
     #[test]
     fn completion_evidence_gate_warns_on_piped_check_without_success_sentinel() {
-        // `cargo check 2>&1 | tail -5` 输出是错误信息：检查确实运行了，但输出
-        // 无法确认成功，等于“失败的已知检查”（可证明事实）。模型此时声称完成
-        // 应被诚实警告（Warn），而非 Reopen —— 模型已尝试过检查，再逼它“去跑
-        // 检查”会制造重复输出；警告 + 内部注记足以驱动下一轮收敛。
+        // `cargo check 2>&1 | tail -5` output is an error message: the check really ran,
+        // but the output cannot confirm success, which counts as a “failed known check”
+        // (provable fact). Claiming completion here deserves an honest Warn, not a
+        // Reopen — the model already tried the check, and pushing it to “run the check”
+        // again would produce repeated output; warning + internal note is enough to drive
+        // the next round toward convergence.
         let mutation = test_tool_call(
             "call_write",
             "write_file",
@@ -5546,9 +5717,11 @@ mod tests {
 
     #[test]
     fn completion_evidence_gate_allows_command_level_mutation_with_same_command_check() {
-        // 纯命令级变更 + 同一命令内的成功检查（printf > 文件 && cargo check）。
-        // 命令级“变更”是意图分类，门禁只认可证明的工具级变更，因此一律 Allow；
-        // 成功检查不会被惩罚，但也不再是门禁放行的依据。
+        // Pure command-level mutation + a successful check inside the same command
+        // (printf > file && cargo check). Command-level “mutations” are intent
+        // classification; the gate only accepts provable tool-level mutations, so this
+        // is always Allowed; the successful check is not punished, but it is no longer a
+        // basis for the gate to allow either.
         let command = test_tool_call(
             "call_command",
             "execute_command",
@@ -5577,10 +5750,11 @@ mod tests {
 
     #[test]
     fn completion_evidence_gate_warns_after_failed_check_even_with_later_activity() {
-        // apply_patch → 已知检查失败（cargo check 输出未确认成功）→ 后续良性
-        // 命令（ls）。良性调用把 activity 置回 true，但失败是可证明事实，不得
-        // 被静默放行：门控应 Warn（诚实警告，非分类不确定性，不会造成虚假重复），
-        // 而不是 Allow。
+        // apply_patch → known check failure (cargo check output does not confirm success)
+        // → later benign command (ls). The benign call resets activity to true, but the
+        // failure is provable fact and must not be silently allowed: the gate should Warn
+        // (an honest warning, not classification uncertainty, so no false repetition)
+        // rather than Allow.
         let mutation = test_tool_call(
             "call_patch",
             "apply_patch",
@@ -5628,11 +5802,13 @@ mod tests {
 
     #[test]
     fn completion_evidence_gate_allows_command_level_mutation_without_tool_evidence() {
-        // 纯命令级变更（sed -i ... ; cargo check）：没有 apply_patch / write_file
-        // 这类可证明的工具级变更。命令级“变更”是意图分类，可能把只读命令误判为
-        // 变更（白名单永远加不完），基于它 Reopen 会逼模型重复输出结论。因此
-        // 门禁对纯命令级变更一律静默 Allow —— 收敛强度让位于“绝不错误地制造
-        // 重复输出”这一更高优先级不变式。
+        // Pure command-level mutation (sed -i ... ; cargo check): there is no provable
+        // tool-level mutation like apply_patch / write_file. Command-level “mutations”
+        // are intent classification and may misjudge read-only commands as mutations
+        // (the allowlist can never be complete); Reopen based on them would force the
+        // model to repeat conclusions. So the gate silently Allows any pure command-level
+        // mutation — convergence strength yields to the higher-priority invariant of
+        // “never wrongly producing repeated output”.
         let command = test_tool_call(
             "call_command",
             "execute_command",
@@ -5833,10 +6009,11 @@ mod tests {
         )
         .unwrap();
 
-        // 已强制合成后模型仍返回 reasoning-only:不再提前停轮,保持强制状态继续
-        // 自动重试,且不重复注入 synthesis 笔记;但每次注入一个轻量
-        // synthesis-retry 标记(计入 REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES),
-        // 避免逐轮重复同字节请求空转。
+        // After the forced synthesis the model still returns reasoning-only: do not stop
+        // early; keep the forced state and continue auto-retrying without re-injecting the
+        // synthesis note; but inject one lightweight synthesis-retry marker per attempt
+        // (counted against REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES) to avoid empty
+        // spins on identical byte-for-byte requests.
         assert!(matches!(second_step, TurnLoopStep::Continue));
         assert!(app.cli.thinking_disabled_override);
         assert!(force_final_response);
@@ -5867,9 +6044,11 @@ mod tests {
 
     #[test]
     fn reasoning_only_final_response_stops_after_bounded_post_synthesis_retries() {
-        // 已强制无思考合成后模型仍返回 reasoning-only:只允许有限次带新标记的重试
-        // (REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES),超过后停轮并给出用户可见
-        // 错误——避免逐轮重复同字节请求空转到 max_iterations。
+        // After the forced no-reasoning synthesis the model still returns reasoning-only:
+        // only a limited number of retries with fresh markers is allowed
+        // (REASONING_ONLY_POST_SYNTHESIS_MAX_RETRIES); past that, stop the round with a
+        // user-visible error — avoiding empty spins on identical byte-for-byte requests
+        // up to max_iterations.
         let mut app = test_app_with_tools(&["read_file"]);
         let mcp = crate::ai::mcp::McpClient::new();
         let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
@@ -5919,7 +6098,7 @@ mod tests {
                 .count()
         }
 
-        // 第一次命中(尚无 synthesis-retry 标记):注入新标记并继续。
+        // First hit (no synthesis-retry marker yet): inject a new marker and continue.
         let step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
@@ -5945,7 +6124,7 @@ mod tests {
         assert!(final_assistant_text.is_empty());
         assert_eq!(synthesis_retry_markers(&messages), 1);
 
-        // 第二次命中:注入第二个标记并继续。
+        // Second hit: inject a second marker and continue.
         let second_step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
@@ -5971,7 +6150,7 @@ mod tests {
         assert!(final_assistant_text.is_empty());
         assert_eq!(synthesis_retry_markers(&messages), 2);
 
-        // 第三次命中:达到上限,停轮并给出用户可见错误。
+        // Third hit: the cap is reached; stop the round with a user-visible error.
         let last_step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
@@ -6002,8 +6181,9 @@ mod tests {
 
     #[test]
     fn reasoning_only_final_response_max_iterations_is_final_backstop() {
-        // 迭代硬上限仍是最终兜底:即便已强制合成后的重试未达上限,到达
-        // max_iterations 也停轮并给出用户可见错误。
+        // The iteration hard cap remains the final fallback: even if the post-synthesis
+        // retries have not hit their cap, reaching max_iterations also stops the round
+        // with a user-visible error.
         let mut app = test_app_with_tools(&["read_file"]);
         let mcp = crate::ai::mcp::McpClient::new();
         let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
@@ -6042,7 +6222,8 @@ mod tests {
             })
         };
 
-        // 合成后重试未达上限,但已到 max_iterations:停轮并给出用户可见错误。
+        // Post-synthesis retries have not hit their cap, but max_iterations was reached:
+        // stop the round with a user-visible error.
         let last_step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
@@ -6076,7 +6257,8 @@ mod tests {
         let mut app = test_app_with_tools(&["read_file"]);
         let mcp = crate::ai::mcp::McpClient::new();
         let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
-        // 已有 MAX-1 次普通重试,再次命中仍应继续普通重试,不提前进入合成。
+        // With MAX-1 ordinary retries already used, another hit should still continue
+        // ordinary retries rather than entering synthesis early.
         let mut messages: Vec<Message> = (0..REASONING_ONLY_MAX_RETRIES - 1)
             .map(|_| Message {
                 role: ROLE_INTERNAL_NOTE.to_string(),
@@ -6158,7 +6340,7 @@ mod tests {
                     .is_some_and(|text| text.starts_with(REASONING_ONLY_SYNTHESIS_MARKER))
         }));
 
-        // 达到上限后,下一次命中进入无思考合成。
+        // After reaching the cap, the next hit enters the no-reasoning synthesis.
         let second_step = handle_iteration_execution(
             &mut app,
             "compare two yaml files",
@@ -6315,8 +6497,10 @@ mod tests {
 
     #[test]
     fn final_response_at_iteration_ceiling_finishes_despite_outstanding_task() {
-        // 迭代硬上限是权威天花板：即使还有未收口的 subagent task，也不能无限
-        // 打回收尾（否则子任务永不到终态时会活锁，并反复顶掉安全刹车）。
+        // The iteration hard cap is the authoritative ceiling: even with unclosed
+        // subagent tasks remaining, finalization cannot be bounced indefinitely
+        // (otherwise it would livelock when a subtask never reaches a terminal state and
+        // repeatedly knock out the safety brakes).
         let _env_guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -6409,7 +6593,7 @@ mod tests {
         )
         .unwrap();
 
-        // 到达硬上限：不再打回，允许收尾。
+        // Hard cap reached: no more bounces; allow finalization.
         assert!(matches!(step, TurnLoopStep::Break));
         assert!(final_assistant_text.starts_with("done\n\n"));
         assert!(final_assistant_text.contains("1 spawned subagent task(s) were still outstanding"));
@@ -6478,23 +6662,24 @@ mod tests {
         )
         .unwrap();
 
-        // 截断应自动重试（Continue），不得静默完成。
+        // Truncation should auto-retry (Continue), never complete silently.
         assert!(matches!(step, TurnLoopStep::Continue));
         assert!(final_assistant_text.is_empty());
         assert!(!final_assistant_recorded);
-        // 部分可见文本被保留为 assistant 上下文。
+        // Partial visible text is preserved as assistant context.
         assert!(
             messages.iter().any(|m| m.role == "assistant"
                 && m.content.as_str() == Some("现在让我来编写一个综合脚本"))
         );
-        // partial text 不得写入 turn_messages 持久化轨道——连续截断时多条
-        // 大体积半截文本会污染历史文件，导致下个 turn 正常历史被压缩丢弃。
+        // Partial text must not be written to the persisted turn_messages track — with
+        // consecutive truncations, multiple large half-finished texts would pollute the
+        // history file and cause the next turn's normal history to be compressed away.
         assert!(
             !turn_messages.iter().any(|m| m.role == "assistant"
                 && m.content.as_str() == Some("现在让我来编写一个综合脚本")),
             "partial text must not leak into turn_messages (persistence track)"
         );
-        // 注入了一条收缩重写提示。
+        // A shrink-and-rewrite hint was injected.
         assert!(messages.iter().any(|m| {
             m.role == ROLE_INTERNAL_NOTE
                 && m.content
@@ -6564,9 +6749,11 @@ mod tests {
                         .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
             })
             .count();
-        // 旧 note 被移除、新 note 被注入，始终只有 1 条（而非堆叠 2 条）。
+        // The old note is removed and a new one injected, so there is always exactly 1
+        // (not 2 stacked).
         assert_eq!(note_count, 1, "重复截断应替换旧 note 而非堆叠");
-        // 第 2 次截断的 note 应携带计数 "2"，让模型感知严重程度递增。
+        // The second-truncation note should carry count "2" so the model perceives
+        // escalating severity.
         let note = messages.iter().find(|m| {
             m.role == ROLE_INTERNAL_NOTE
                 && m.content
@@ -6636,9 +6823,9 @@ mod tests {
         )
         .unwrap();
 
-        // 应该继续重试
+        // Should keep retrying
         assert!(matches!(step, TurnLoopStep::Continue));
-        // 不应注入收缩提示——流错误和输出大小无关
+        // Should not inject a shrink hint — stream errors are unrelated to output size
         let has_shrink_note = messages.iter().any(|m| {
             m.role == ROLE_INTERNAL_NOTE
                 && m.content
@@ -6646,7 +6833,7 @@ mod tests {
                     .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
         });
         assert!(!has_shrink_note, "stream_error 截断不应注入收缩提示");
-        // 不应保留 partial text——流中断时的 partial 不可靠
+        // Should not keep partial text — partial from an interrupted stream is unreliable
         let has_partial = messages.iter().any(|m| {
             m.role == "assistant"
                 && m.content
@@ -7069,21 +7256,23 @@ mod tests {
 
     #[test]
     fn prose_sentence_counter_ignores_code_symbol_dots() {
-        // 代码符号里的点号不应被计为句末：`driver/mod.rs`、`.ok().flatten()`、行号
-        // `1057-1080` 里的 . 后面都不是空白/结尾。
+        // Dots inside code symbols must not count as sentence endings: in
+        // `driver/mod.rs`, `.ok().flatten()`, and line ranges like `1057-1080`, the `.`
+        // is never followed by whitespace or end-of-text.
         assert_eq!(
             prose_sentence_terminator_count(
                 "检查 driver/mod.rs:1057-1080 的 .ok().flatten() 吞错逻辑"
             ),
             0
         );
-        // 真正的句末（. 后跟空白，或 CJK 。！？）仍应计入。
+        // Genuine sentence endings (. followed by whitespace, or the CJK
+        // full-stop/exclamation/question marks) still count.
         assert_eq!(
             prose_sentence_terminator_count("First done. Second done! Third?"),
             3
         );
         assert_eq!(prose_sentence_terminator_count("第一。第二！第三？"), 3);
-        // 结尾的 . 也算句末（其后是文本结尾）。
+        // A trailing . also counts as a sentence ending (followed by the end of the text).
         assert_eq!(prose_sentence_terminator_count("Done."), 1);
     }
 
@@ -7093,7 +7282,8 @@ mod tests {
             strip_inline_code_spans("检查 `driver/mod.rs` 的 `.ok()` 逻辑"),
             "检查  的  逻辑"
         );
-        // 反引号未配对（奇数）时原样返回，避免误删正文尾部。
+        // When backticks are unpaired (odd count), return the text unchanged to avoid
+        // deleting the tail of the prose.
         assert_eq!(
             strip_inline_code_spans("half `open span"),
             "half `open span"
@@ -7102,10 +7292,12 @@ mod tests {
 
     #[test]
     fn dangling_final_detects_mid_introduction_colon_stop() {
-        // 真实回归：会话 b884d15f 消息 id=455。模型在长工具链末尾停在"先看…检查…："
-        // 这条以冒号收尾、预告工具调用却没有 tool call 的旁白上，此前同时穿透了
-        // stream 分类器（判 Completed）与 dangling 门禁（代码符号污染句子计数 +
-        // 措辞不在词表），被静默当作 final 收尾，用户被迫手动唤醒。
+        // Real regression: session b884d15f message id=455. At the end of a long tool
+        // chain the model stopped on the aside "first look at... check...:" — a
+        // colon-terminated promise of a tool call with no tool call — which previously
+        // slipped through both the stream classifier (judged Completed) and the dangling
+        // gate (code symbols polluting the sentence count + wording not in the word list),
+        // being silently accepted as a final response and forcing the user to nudge it.
         let turn_messages = vec![Message {
             role: "tool".to_string(),
             content: Value::String("git status output".to_string()),
@@ -7134,25 +7326,28 @@ mod tests {
             reasoning_content: None,
         }];
 
-        // 冒号收尾但已交付结论：结论标记优先，不判 dangling。
+        // Colon-terminated but a conclusion was delivered: the conclusion marker takes
+        // priority, not dangling.
         assert!(!looks_like_dangling_action_final(
             "审查这段代码",
             &turn_messages,
             "结论：run loop 的 wake 路径已覆盖，没有缺陷。补充说明如下：",
         ));
-        // 冒号收尾但后面紧跟已交付的列表：structured_lines 守卫先行，不判 dangling。
+        // Colon-terminated but followed by a delivered list: the structured_lines guard
+        // runs first, not dangling.
         assert!(!looks_like_dangling_action_final(
             "审查这段代码",
             &turn_messages,
             "发现两个问题：\n- 第一个问题\n- 第二个问题",
         ));
-        // 正文以 code span 结尾（末字符是反引号而非冒号）= 已交付内容，不误判。
+        // Body ending with a code span (last char is a backtick, not a colon) = content
+        // delivered; no misjudgment.
         assert!(!looks_like_dangling_action_final(
             "审查这段代码",
             &turn_messages,
             "修复点在 `foo.rs` 的 `bar()`",
         ));
-        // 纯冒号收尾的裸预告 = dangling。
+        // A bare colon-terminated teaser with nothing after = dangling.
         assert!(looks_like_dangling_action_final(
             "审查这段代码",
             &turn_messages,
@@ -7162,36 +7357,40 @@ mod tests {
 
     #[test]
     fn injected_context_echo_is_detected_only_when_it_is_the_whole_answer() {
-        // 真实回归：session 7ac3d771 消息 id=263。模型把 completion-evidence reopen
-        // 提示 + self_note 头原样当答案吐回，泄漏到终端并被持久化成 final。
+        // Real regression: session 7ac3d771 message id=263. The model regurgitated the
+        // completion-evidence reopen hint + self_note header verbatim as its answer,
+        // leaking to the terminal and persisting as final.
         let echoed = "[Model-authored note from an earlier turn; this is not authoritative evidence. Treat every claim as unverified unless it is backed by tool output or a cited source, and re-check it before using it as a conclusion.]\nself_note:completion_evidence_required\nA successful project mutation occurred in the current user turn, but no successful post-mutation verification was observed.";
         assert!(looks_like_injected_context_echo(echoed));
 
-        // runtime 事后追加的 [Runtime warning] 段不影响判定——只看模型正文。
+        // The [Runtime warning] section appended post-hoc does not affect the verdict —
+        // only the model's body is considered.
         let echoed_with_warning = format!(
             "{echoed}\n\n[Runtime warning] Completion/impact claim is unverified: no successful post-mutation check was observed."
         );
         assert!(looks_like_injected_context_echo(&echoed_with_warning));
 
-        // 裸 self_note: 前缀。
+        // Bare self_note: prefix.
         assert!(looks_like_injected_context_echo(
             "self_note:completion_evidence_required\ninspect the diff first."
         ));
-        // 历史摘要头 / handoff 头。
+        // History-summary header / handoff header.
         assert!(looks_like_injected_context_echo(
             "[Compressed history summary for task continuity. Use it to ...]\nearlier work"
         ));
         assert!(looks_like_injected_context_echo(
             "[Runtime context handoff, not a new end-user request. ...]"
         ));
-        // 真实回答：即便引用了这些前缀，只要不在开头就不算 echo。
+        // A real answer: even quoting these prefixes, as long as they are not at the
+        // start, it is not an echo.
         assert!(!looks_like_injected_context_echo(
             "修复完成。运行时会注入形如 self_note: 的提示，但那是内部上下文。"
         ));
         assert!(!looks_like_injected_context_echo(
             "P2-a 已修完，62 个 fold 测试全绿。"
         ));
-        // 纯 [Runtime warning]（无模型正文）交由其它门禁处理，不算 echo。
+        // Pure [Runtime warning] (no model body) is handled by the other gates; not an
+        // echo.
         assert!(!looks_like_injected_context_echo(
             "\n\n[Runtime warning] Completion/impact claim is unverified."
         ));
@@ -7202,7 +7401,7 @@ mod tests {
         let echoed = "[Model-authored note from an earlier turn; this is not authoritative evidence.]\nself_note:completion_evidence_required\nThis is not a final answer.";
         let mut messages: Vec<Message> = Vec::new();
 
-        // 第一次命中：注入一次无工具重试提示。
+        // First hit: inject one no-tool retry hint.
         assert_eq!(
             injected_context_echo_recovery_action(&mut messages, echoed),
             DanglingFinalRecoveryAction::RetryWithoutTools
@@ -7219,12 +7418,12 @@ mod tests {
                 .count(),
             1
         );
-        // 第二次仍回吐：停轮（Warn），不再无限重试。
+        // Second time still regurgitating: stop the round (Warn), no infinite retries.
         assert_eq!(
             injected_context_echo_recovery_action(&mut messages, echoed),
             DanglingFinalRecoveryAction::Warn
         );
-        // 正常回答放行。
+        // A normal answer passes.
         assert_eq!(
             injected_context_echo_recovery_action(&mut messages, "修复完成，测试全绿。"),
             DanglingFinalRecoveryAction::Allow
@@ -7360,15 +7559,17 @@ mod tests {
         }
     }
 
-    /// 核心回归：apply_patch 因 ambiguous patch 失败后，账本记住 stale 目标；
-    /// 即便随后失败轮从 `messages` 里被历史压缩完全抹除（模拟折叠成
-    /// internal_note stub），guard 仍据账本拦截对同一路径的重试。这正是旧的
-    /// 消息扫描实现失效的场景。
+    /// Core regression: after apply_patch fails with ambiguous patch, the ledger
+    /// remembers the stale target; even when the failed round is later fully erased
+    /// from `messages` by history compression (simulated as folded into an
+    /// internal_note stub), the guard still blocks retries on the same path from the
+    /// ledger. This is exactly the scenario where the old message-scanning
+    /// implementation failed.
     #[test]
     fn stale_patch_guard_survives_history_compression_via_ledger() {
         let mut ledger: rustc_hash::FxHashSet<PathBuf> = Default::default();
 
-        // 第一轮：apply_patch 对 table.rs 失败（ambiguous patch）。
+        // Round 1: apply_patch fails on table.rs (ambiguous patch).
         let failed_patch = test_tool_call(
             "call_patch_1",
             "apply_patch",
@@ -7390,8 +7591,9 @@ mod tests {
             "failed patch target must be recorded in the ledger"
         );
 
-        // 模拟历史压缩：失败轮的结构化消息被折叠、从 messages 中彻底消失。
-        // 旧实现从 messages 反推 stale 状态，此刻会漏判；账本不受影响。
+        // Simulate history compression: the failed round's structured messages are
+        // folded and fully vanish from messages. The old implementation derived stale
+        // state from messages and would miss this; the ledger is unaffected.
         let retry_patch = test_tool_call(
             "call_patch_2",
             "apply_patch",
@@ -7403,8 +7605,9 @@ mod tests {
         );
     }
 
-    /// 成功的 read_file 对同一路径重新取真相后，账本释放该目标，guard 放行后续
-    /// patch。验证恢复链路能正常收敛（不会永久拦死）。
+    /// After a successful read_file re-reads the truth for the same path, the ledger
+    /// releases the target and the guard allows later patches. Verifies the recovery
+    /// chain converges normally (no permanent lockout).
     #[test]
     fn stale_patch_guard_clears_after_fresh_read() {
         let mut ledger: rustc_hash::FxHashSet<PathBuf> = Default::default();
@@ -7413,7 +7616,7 @@ mod tests {
             .to_path_buf();
         ledger.insert(normalized.clone());
 
-        // 成功 read_file 同一目标 → 账本释放。
+        // Successful read_file on the same target → the ledger releases it.
         let fresh_read = test_tool_call(
             "call_read_1",
             "read_file",
@@ -7472,8 +7675,9 @@ mod tests {
 
     #[test]
     fn registered_tool_middleware_intercepts_real_dispatch_round() {
-        // Step 5 集成验证：注册在 `app.tool_middlewares` 的中间件必须真实拦截
-        // `handle_tool_call_round` 的派发轮（空链之外的中间件行为路径）。
+        // Step 5 integration verification: middleware registered in
+        // `app.tool_middlewares` must really intercept the dispatch round of
+        // `handle_tool_call_round` (the middleware behavior path beyond the empty chain).
         #[derive(Debug)]
         struct CountingMiddleware {
             calls: Arc<std::sync::atomic::AtomicUsize>,

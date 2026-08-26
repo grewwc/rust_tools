@@ -1,24 +1,28 @@
-//! AppleScript 驱动模式：直接复用**用户已打开的 Chrome**（默认驱动方式）。
+//! AppleScript driver mode: drives the **user's already-open Chrome** directly (the default driver).
 //!
-//! 为什么需要它：CDP 只能接管"受控新开"的 Chrome，而 Chrome 136+ 拒绝在默认
-//! profile 上开启 `--remote-debugging-port`，所以用户日常打开的浏览器无法被 CDP
-//! attach。本模块改用 macOS 的 Apple Events（`osascript` + Chrome 的
-//! `execute javascript`）驱动用户已开的 Chrome：在**会话窗口开一个新标签页**，
-//! 全程复用用户真实 cookie/登录态，**绝不退出用户浏览器**。
+//! Why it exists: CDP can only attach to a "specially launched" Chrome, and Chrome 136+
+//! refuses to enable `--remote-debugging-port` on the default profile, so a browser the
+//! user opens in daily use cannot be attached via CDP. This module instead drives the
+//! user's running Chrome through macOS Apple Events (`osascript` + Chrome's
+//! `execute javascript`): it opens **a new tab in the session window** and reuses the
+//! user's real cookies/login state throughout, **never quitting the user's browser**.
 //!
-//! 前提：Chrome 需开启 "View > Developer > Allow JavaScript from Apple Events"
-//! （默认关闭，开启一次即可；未开启时会给出一条可操作的报错）。
+//! Prerequisite: Chrome must have "View > Developer > Allow JavaScript from Apple Events"
+//! enabled (off by default; enable once. When disabled, an actionable error is returned).
 //!
-//! 与 CDP 模式的关键差异：
-//! - 每个操作都是独立的 `osascript` 子进程（有状态只有 窗口id+标签页id，由本进程
-//!   AppleEvent 调度到会话窗口/标签页，绝不 `activate`——activate 会把焦点抢走）。
-//! - 页面交互全部通过 JS（click/输入/按键为合成事件；对依赖真实键盘/`hasFocus` 的
-//!   站点可能无效——这是本模式的固有限制）。
-//! - 截图走 `screencapture -l <窗口id>`（需要屏幕录制权限）；`full_page`
-//!   自动降级为窗口截图并回退到 rect/全屏，避免模型传参即失败。
-//! - 会话标签页被用户手动关闭时，后续操作会得到"标签页已丢失"的明确报错，可
-//!   navigate 重建（`screenshot` 例外：无窗口时自动 `about:blank` 重建）。
-
+//! Key differences from CDP mode:
+//! - Every operation is an independent `osascript` subprocess (the only state kept is
+//!   window id + tab id, dispatched by this process via Apple Events to the session
+//!   window/tab; it never `activate`s -- activating would steal focus).
+//! - All page interaction goes through JS (click/input/key are synthetic events; sites
+//!   that rely on real keyboard/`hasFocus` may not work -- an inherent limitation of
+//!   this mode).
+//! - Screenshots use `screencapture -l <window-id>` (requires screen-recording permission);
+//!   `full_page` automatically degrades to a window screenshot and falls back to
+//!   rect/fullscreen so the model never fails just from passing the argument.
+//! - If the user manually closes the session tab, later operations return an explicit
+//!   "tab lost" error that `navigate` can rebuild from (`screenshot` excepted: when no
+//!   window exists it automatically rebuilds via `about:blank`).
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -28,7 +32,7 @@ use tokio::process::Command;
 
 use crate::tools::{op_timeout_ms, resolve_screenshot_path};
 
-/// 单次 screencapture 调用：成功 Ok(())，失败 Err(stderr trimmed)。
+/// One screencapture invocation: Ok(()) on success, Err(stderr trimmed) on failure.
 async fn screencapture_capture(args: &[&str]) -> Result<(), String> {
     let child = Command::new("/usr/sbin/screencapture")
         .args(args)
@@ -47,12 +51,13 @@ async fn screencapture_capture(args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// 所有 osascript 调用都只发 Apple 事件、绝不 activate Chrome（activate 会把
-/// 用户屏幕焦点抢到 Chrome）。唯一例外：新建标签页时 Chrome 会自行激活到前台，
-/// 无法从源头阻止，见 open_tab 里的"记录前台 + 创建后还原焦点"。
+/// Every osascript call only sends Apple events and never activates Chrome (activating
+/// would steal the user's screen focus). The only exception: when a new tab is created,
+/// Chrome activates itself to the foreground and cannot be prevented at the source; see
+/// "record frontmost app + restore focus after creation" in open_tab.
 
-/// 读取当前前台应用的 (bundle id, 显示名)（lsappinfo 查询，无需任何系统权限）。
-/// 失败返回 None。
+/// Read the (bundle id, display name) of the current frontmost app (queried via
+/// lsappinfo, no system permissions required). Returns None on failure.
 fn frontmost_app() -> Option<(String, String)> {
     let raw = std::process::Command::new("lsappinfo")
         .arg("front")
@@ -62,8 +67,8 @@ fn frontmost_app() -> Option<(String, String)> {
     if asn.is_empty() {
         return None;
     }
-    // -only 单键输出形如 "LSDisplayName"="Google Chrome"；
-    // 统一取第一个 '=' 之后第一个引号对里的内容。
+    // `-only <key>` output looks like "LSDisplayName"="Google Chrome";
+    // always take the content of the first quoted pair after the first '='.
     let bid = ls_info(&asn, "bundleid");
     let name = ls_info(&asn, "name");
     match (bid, name) {
@@ -90,11 +95,14 @@ fn ls_info(asn: &str, key: &str) -> Option<String> {
     }
 }
 
-/// 把前台还给之前记录的应用，无需 Apple Events 授权（也就没有 per-app 的
-/// 自动化授权弹窗）。优先按 bundle id（`open -b`，中文显示名如 "飞书" 的
-/// 注册名其实是 "Lark"，按名字找会失败），失败再退回显示名 `open -a`。
-/// 建标签页时 Chrome 必激活自己，此函数用于创建后的焦点还原；失败静默忽略
-/// （应用恰好退出等，下次建标签页会再试）。用户本来就在 Chrome 里时不调用。
+/// Give focus back to the previously recorded app; no Apple Events authorization is
+/// needed (so no per-app automation permission dialog appears). Prefer bundle id
+/// (`open -b`; e.g. the app whose Chinese display name is "Feishu" is actually
+/// registered as "Lark", so looking it up by name would fail), falling back to the
+/// display name via `open -a`.
+/// Chrome always activates itself when creating a tab; this function restores focus
+/// after creation. Failures are silently ignored (e.g. the app just quit; the next tab
+/// creation retries). Not called when the user is already in Chrome.
 fn restore_focus(prev: Option<&(String, String)>) {
     let Some((bid, name)) = prev else { return };
     if bid == "com.google.Chrome" || name == "Google Chrome" {
@@ -108,14 +116,14 @@ fn restore_focus(prev: Option<&(String, String)>) {
     }
 }
 
-/// 分类的"需要人工操作"标签：与 tools.rs 的 detect 保持同款格式。
+/// Categorized "human action required" tag, in the same format as the detect logic in tools.rs.
 pub fn user_action_tag(category: &str) -> String {
     format!(
         "\n[USER_ACTION_REQUIRED: {category}] 页面需要用户手动完成操作。可调用 wait_for_human 阻塞等待用户在可见浏览器窗口完成，或直接停止自动化并请用户完成后告知继续。"
     )
 }
 
-/// 待人工操作时，改动类工具输出前的提醒（与 tools.rs 的 pending_warning 同款）。
+/// Warning prepended to mutating tools' output while a human action is pending (same as pending_warning in tools.rs).
 pub fn pending_warning(session: &ApplescriptSession) -> String {
     match &session.pending_human {
         Some(cat) => format!("[HUMAN_ACTION_PENDING: {}] ", cat),
@@ -123,9 +131,10 @@ pub fn pending_warning(session: &ApplescriptSession) -> String {
     }
 }
 
-/// 与 tools.rs 相同语义的人机校验检测：captcha/slider/sms_otp/twofa/login_required/
-/// payment_verify/identity_verify；captcha 是"存在且未解决"（关掉的弹层不算），
-/// 纯文本线索需"关键词+输入框"才报，避免误报。JS 求值后 JSON.stringify 成字符串。
+/// Human-verification detection with the same semantics as tools.rs: captcha/slider/
+/// sms_otp/twofa/login_required/payment_verify/identity_verify. captcha means "present
+/// and unsolved" (a dismissed popup does not count); text-only clues require a
+/// keyword + input field to avoid false positives. The JS result is JSON.stringify'd.
 pub const DETECT_USER_ACTION_JS: &str = r#"(function(){
   var vis = function(el){ return !!(el && el.offsetWidth && el.offsetHeight && el.getClientRects().length); };
   var out = null;
@@ -178,10 +187,10 @@ pub const DETECT_USER_ACTION_JS: &str = r#"(function(){
   return out ? out : null;
 })()"#;
 
-/// 执行一段 osascript（脚本经 stdin 传入），返回 stdout 末尾行（trim）。
+/// Run a block of osascript (passed via stdin); returns the last stdout line (trimmed).
 async fn run_osascript(script: &str) -> Result<String, String> {
     let mut child = Command::new("/usr/bin/osascript")
-        .arg("-") // 从 stdin 读脚本，避免命令行转义地狱
+        .arg("-") // Read the script from stdin to avoid command-line escaping hell.
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -200,7 +209,7 @@ async fn run_osascript(script: &str) -> Result<String, String> {
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
-        // 包含 "applescript"（支持 URL）=> 未开启"允许 Apple 事件中的 JavaScript"
+        // Contains "applescript" (supports URL) => "Allow JavaScript from Apple Events" is off
         if stderr.to_lowercase().contains("applescript") {
             return Err(format!(
                 "Chrome 未开启 AppleScript JavaScript 执行（execute javascript 被拒绝）。\
@@ -214,7 +223,7 @@ async fn run_osascript(script: &str) -> Result<String, String> {
     Ok(stdout.trim().to_string())
 }
 
-/// 转义用于嵌入 AppleScript 字符串字面量的文本（\\、\"、换行等）。
+/// Escape text for embedding in an AppleScript string literal (\\, \", newlines, etc.).
 fn esc_applescript(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
@@ -230,7 +239,7 @@ fn esc_applescript(s: &str) -> String {
     out
 }
 
-/// 会话：持有"用户已打开的 Chrome"里的窗口 id + 标签页 id。
+/// Session: holds the window id + tab id inside the user's already-open Chrome.
 #[derive(Debug, Default)]
 pub struct ApplescriptSession {
     pub window_id: Option<String>,
@@ -243,7 +252,7 @@ impl ApplescriptSession {
         Self::default()
     }
 
-    /// 在当前会话标签页上执行 JS；函数体必须返回字符串（通常 JSON.stringify）。
+    /// Execute JS on the current session tab; the function body must return a string (usually JSON.stringify).
     async fn js_on_session_tab(&self, js: &str) -> Result<String, String> {
         let (wid, tid) = match (&self.window_id, &self.tab_id) {
             (Some(w), Some(t)) => (w.clone(), t.clone()),
@@ -256,7 +265,7 @@ impl ApplescriptSession {
         run_osascript(&script).await.map_err(|e| translate_err(&e))
     }
 
-    /// 对会话标签页执行 JS，带超时（超时/错误都会转成可读信息）。
+    /// Execute JS on the session tab with a timeout (both timeouts and errors become readable messages).
     async fn exec_js(&self, js: &str) -> Result<String, String> {
         let js = js.to_string();
         let timeout = op_timeout_ms();
@@ -269,8 +278,9 @@ impl ApplescriptSession {
         }
     }
 
-    /// 导航：无会话标签页则新建（首个 tab），否则复用现有 tab 并 `set URL`。
-    /// 之后等待页面加载完成；有 wait_selector 时再等待元素出现。
+    /// Navigate: create a session tab if none exists (first tab), otherwise reuse the
+    /// existing tab and `set URL`. Then wait for the page to finish loading; if
+    /// wait_selector is given, also wait for the element to appear.
     pub async fn navigate(&mut self, url: &str, wait_selector: Option<&str>) -> Result<(), String> {
         self.pending_human = None;
         if self.tab_id.is_some() && self.tab_alive().await {
@@ -286,7 +296,7 @@ impl ApplescriptSession {
         } else {
             self.open_tab(url).await?;
         }
-        // 等待加载完成（最多 ~20s；到达时限也继续，页面可能因广告长载）。
+        // Wait for loading to finish (up to ~20s; keep going past the deadline since pages may load slowly due to ads).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let state = self.exec_js("document.readyState").await.unwrap_or_default();
@@ -303,7 +313,7 @@ impl ApplescriptSession {
         Ok(())
     }
 
-    /// 当前会话页的 (url, title)。
+    /// The (url, title) of the current session page.
     pub async fn url_title(&self) -> Result<(String, String), String> {
         let out = self
             .exec_js("JSON.stringify({url: location.href, title: document.title})")
@@ -316,13 +326,14 @@ impl ApplescriptSession {
         ))
     }
 
-    /// 在用户 Chrome 中为会话新建一个标签页（首次或标签页丢失时）。
-    /// 返回 (window_id, tab_id)。
+    /// Create a new tab for the session in the user's Chrome (first time or when the tab is lost).
+    /// Returns (window_id, tab_id).
     ///
-    /// 焦点处理：Chrome 收到"开新标签页"事件时必定自己激活到前台（实测
-    /// `make new tab` 与 `open -g` 都会抢焦点，无法从源头阻止），所以这里在
-    /// 创建前记录前台应用，创建成功后立即用 `open -a` 把焦点还回去，不让
-    /// 用户的屏幕被锁到新标签页。创建失败或用户本来就在 Chrome 里则不还原。
+    /// Focus handling: Chrome always activates itself when it receives a "new tab" event
+    /// (verified: both `make new tab` and `open -g` steal focus and cannot be prevented at
+    /// the source), so we record the frontmost app before creating and immediately hand
+    /// focus back with `open -a` afterwards, so the user's screen is not locked to the new
+    /// tab. No restore is done if creation fails or the user is already in Chrome.
     async fn open_tab(&mut self, url: &str) -> Result<(String, String), String> {
         let prev = frontmost_app();
         let script = format!(
@@ -350,7 +361,7 @@ end tell"#,
         }
     }
 
-    /// 标签页是否仍存在。
+    /// Whether the tab still exists.
     async fn tab_alive(&self) -> bool {
         let (wid, tid) = match (&self.window_id, &self.tab_id) {
             (Some(w), Some(t)) => (w.clone(), t.clone()),
@@ -363,7 +374,7 @@ end tell"#,
         run_osascript(&script).await.map(|s| s.trim() == "true").unwrap_or(false)
     }
 
-    /// 列出会话窗口里的标签页（#idx: url [active]）。
+    /// List the tabs in the session window (#idx: url [active]).
     pub async fn list_tabs(&self) -> Result<String, String> {
         let wid = match &self.window_id {
             Some(w) => w.clone(),
@@ -390,7 +401,7 @@ end tell"#,
         Ok(out.trim().to_string())
     }
 
-    /// 关闭会话标签页（不退出 Chrome，不动其它窗口/标签页）。
+    /// Close the session tab (does not quit Chrome or touch other windows/tabs).
     pub async fn close_session_tab(&mut self) -> Result<(), String> {
         if let (Some(w), Some(t)) = (&self.window_id.clone(), &self.tab_id.clone()) {
             let script = format!(
@@ -404,14 +415,14 @@ end tell"#,
                 return Ok(());
             }
         }
-        // 标签页已不在（用户自己关的）——视为"已关闭"，清状态即可
+        // The tab is already gone (closed by the user) -- treat it as "closed" and just clear the state.
         self.window_id = None;
         self.tab_id = None;
         self.pending_human = None;
         Ok(())
     }
 
-    /// 提取页面文本（selector 可选，缺省 body），cap 后追加检测标签。
+    /// Extract page text (selector optional, defaults to body); append the detection tag after capping.
     pub async fn get_text_sel(&self, selector: Option<&str>) -> Result<String, String> {
         let js = match selector {
             Some(sel) => format!(
@@ -429,7 +440,7 @@ end tell"#,
         Ok(cap_text(&inner))
     }
 
-    /// 提取页面 HTML（selector 可选，缺省 documentElement），cap 后追加检测标签。
+    /// Extract page HTML (selector optional, defaults to documentElement); append the detection tag after capping.
     pub async fn get_html_sel(&self, selector: Option<&str>) -> Result<String, String> {
         let js = match selector {
             Some(sel) => format!(
@@ -447,16 +458,16 @@ end tell"#,
         Ok(cap_text(&inner))
     }
 
-    /// 在页面内执行任意 JS 表达式（结果 JSON.stringify 后返回）。
+    /// Execute an arbitrary JS expression in the page (result returned after JSON.stringify).
     pub async fn evaluate_js(&self, expr: &str) -> Result<String, String> {
         let js = format!("JSON.stringify((() => {{ try {{ return ({}); }} catch(e) {{ return 'JS_ERROR: ' + e; }} }})())", expr);
-        // 用户表达式可能含换行（多行表达式合法），逐行拼接成单行
+        // User expressions may contain newlines (multi-line expressions are legal); join the lines into a single line.
         let js = js.lines().collect::<Vec<_>>().join(" ");
         let raw = self.exec_js(&js).await?;
         Ok(unquote(&raw))
     }
 
-    /// 等待元素出现（轮询），返回等待毫秒数。
+    /// Wait for an element to appear (polling); returns the number of milliseconds waited.
     pub async fn wait_for_selector(&self, selector: &str, timeout_ms: u64) -> Result<u64, String> {
         let sel = selector.to_string();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -473,7 +484,7 @@ end tell"#,
         }
     }
 
-    /// 滚动：x/y 为窗口坐标，或 selector 滚入视野。
+    /// Scroll: x/y are window coordinates, or scroll a selector into view.
     pub async fn scroll(&self, x: Option<i64>, y: Option<i64>, selector: Option<&str>) -> Result<(), String> {
         let js = if let Some(sel) = selector {
             format!(
@@ -491,7 +502,7 @@ end tell"#,
         Ok(())
     }
 
-    /// 点击（合成 click 事件 + 原生 setter 输入），返回输出文本。
+    /// Click (synthetic click event + native setter input); returns the output text.
     pub async fn click(&self, selector: &str) -> Result<String, String> {
         let sel = selector.to_string();
         let js = format!(
@@ -509,7 +520,7 @@ end tell"#,
         Ok(format!("Clicked {}", selector))
     }
 
-    /// 输入文本（原生 setter + input/change 事件，可提交表单）。
+    /// Type text (native setter + input/change events; can submit the form).
     pub async fn type_text(&self, selector: &str, text: &str, submit: bool) -> Result<String, String> {
         let sel = selector.to_string();
         let text_json = json!(text).to_string();
@@ -543,7 +554,7 @@ end tell"#,
         ))
     }
 
-    /// 按键（合成 keydown/keyup；Enter 在表单内会自动提交）。
+    /// Press a key (synthetic keydown/keyup; Enter auto-submits when inside a form).
     pub async fn press_key(&self, key: &str, selector: Option<&str>) -> Result<String, String> {
         let focus_js = match selector {
             Some(sel) => format!(
@@ -573,7 +584,7 @@ end tell"#,
         Ok(format!("Pressed {}", key))
     }
 
-    /// 人机校验检测（同款语义的 JS），返回类别或 None。
+    /// Human-verification detection (JS with the same semantics); returns the category or None.
     pub async fn detect_user_action_required(&self) -> Option<String> {
         let js = format!("JSON.stringify({})", DETECT_USER_ACTION_JS);
         let raw = self.exec_js(&js).await.ok()?;
@@ -585,8 +596,8 @@ end tell"#,
         }
     }
 
-    /// 等待用户人工处理（同款契约：status=resolved / still_waiting；60s 预算，
-    /// 2 次连续干净检测才判定解决）。
+    /// Wait for the user to handle it manually (same contract: status=resolved /
+    /// still_waiting; 60s budget, resolved only after 2 consecutive clean polls).
     pub async fn wait_for_human_tool(&mut self, expect: Option<&str>) -> String {
         let op_cap = op_timeout_ms();
         let ceiling = op_cap.saturating_sub(15_000).max(5_000);
@@ -598,7 +609,7 @@ end tell"#,
             .map(|e| e.trim().to_string())
             .filter(|e| !e.is_empty());
         loop {
-            // 每次轮询独立超时：挂起的轮询按"仍阻塞"处理
+            // Each poll has its own timeout: a hung poll counts as "still blocked".
             let poll = self.detect_user_action_required_guarded().await;
             match poll {
                 None => {
@@ -630,7 +641,8 @@ end tell"#,
         }
     }
 
-    /// 带 5s 轮询超时的检测：轮询挂起视为"仍阻塞"（返回 None 以外不判定）。
+    /// Detection with a 5s poll timeout: a hung poll is treated as "still blocked"
+    /// (anything other than None is not judged resolved).
     async fn detect_user_action_required_guarded(&self) -> Option<String> {
         match with_timeout(5000, async {
             Ok::<_, String>(self.detect_user_action_required().await)
@@ -643,14 +655,14 @@ end tell"#,
         }
     }
 
-    /// 查询 Chrome 窗口 bounds：返回 (x, y, w, h)。失败 None（窗口已关等）。
+    /// Query the Chrome window bounds: returns (x, y, w, h), or None on failure (e.g. window closed).
     async fn window_bounds(&self, wid: &str) -> Option<(i32, i32, i32, i32)> {
         let script = format!(
             "tell application \"Google Chrome\"\n  get bounds of window id {}\nend tell",
             wid
         );
         let out = run_osascript(&script).await.ok()?;
-        // 形如 "0, 44, 1440, 878" 或 "{0, 44, 1440, 878}"
+        // Looks like "0, 44, 1440, 878" or "{0, 44, 1440, 878}".
         let s = out.trim().trim_matches(|c| c == '{' || c == '}').trim().to_string();
         let parts: Vec<&str> = s.split(',').collect();
         if parts.len() != 4 {
@@ -669,16 +681,17 @@ end tell"#,
         Some((x1, y1, w, h))
     }
 
-    /// 截图：优先 `screencapture -l <wid>`，失败则 `bounds -> -R`，再退化全屏兜底。
-    /// `full_page` 在 AppleScript 下自动降级为窗口截图（返回 warning 而非 Err，避免
-    /// 模型重试死循环）。`&mut self` 以便无窗口时自动 `open_tab("about:blank")`。
+    /// Screenshot: prefer `screencapture -l <wid>`; on failure use `bounds -> -R`, then
+    /// fall back to fullscreen. Under AppleScript, `full_page` automatically degrades to
+    /// a window screenshot (returns a warning instead of Err to avoid a model retry loop).
+    /// Takes `&mut self` so it can auto-`open_tab("about:blank")` when no window exists.
     pub async fn screenshot(&mut self, path: &str, full_page: bool) -> Result<(String, String), String> {
         let full_page_warn = if full_page {
             " [warn: AppleScript 模式不支持 full_page，已按窗口截图]"
         } else {
             ""
         };
-        // 无窗口或标签页已丢失时，自动新建空白标签页（首次 screenshot 前无需 navigate）。
+        // When there is no window or the tab was lost, auto-create a blank tab (no navigate needed before the first screenshot).
         let needs_open = match (&self.window_id, &self.tab_id) {
             (Some(_), Some(_)) => !self.tab_alive().await,
             _ => true,
@@ -700,14 +713,14 @@ end tell"#,
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         std::fs::create_dir_all(&parent).map_err(|e| format!("创建截图目录失败: {}", e))?;
-        // 1) 窗口级抓取（最精准，保留阴影/圆角由系统处理）
+        // 1) Window-level capture (most precise; shadows/rounded corners are handled by the system).
         if screencapture_capture(&["-l", &wid, "-x", path]).await.is_ok() {
-            // 二次校验文件确实落盘且非空（窗口隐藏时可能 0 字节）
+            // Double-check the file actually landed and is non-empty (may be 0 bytes when the window is hidden).
             if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
                 return Ok((path.to_string(), full_page_warn.to_string()));
             }
         }
-        // 2) rect 兜底：用 Chrome bounds 换算 -R x,y,w,h
+        // 2) rect fallback: convert Chrome bounds to -R x,y,w,h.
         if let Some((x, y, w, h)) = self.window_bounds(&wid).await {
             let rect = format!("{},{},{},{}", x, y, w, h);
             if screencapture_capture(&["-R", &rect, "-x", path]).await.is_ok()
@@ -717,7 +730,7 @@ end tell"#,
                 return Ok((path.to_string(), note));
             }
         }
-        // 3) 全屏兜底（窗口不可见/隐藏时仍能出图，避免彻底失败）
+        // 3) fullscreen fallback (still produces an image when the window is invisible/hidden, avoiding total failure).
         if screencapture_capture(&["-x", path]).await.is_ok()
             && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
         {
@@ -731,7 +744,7 @@ end tell"#,
     }
 }
 
-/// osascript 错误转义：会话标签页/窗口丢失的报错给出可操作提示。
+/// osascript error translation: give actionable hints for lost session tab/window errors.
 fn translate_err(e: &str) -> String {
     let le = e.to_lowercase();
     if le.contains("applescript") && (le.contains("javascript") || le.contains("java script")) {
@@ -747,7 +760,7 @@ fn translate_err(e: &str) -> String {
     }
 }
 
-/// 去除 JSON.stringify 结果的外层引号（保留转义内容原文）。
+/// Strip the outer quotes from a JSON.stringify result (keeping the escaped content verbatim).
 fn unquote(s: &str) -> String {
     let s = s.trim();
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
@@ -776,7 +789,7 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
 }
 
 impl ApplescriptSession {
-    /// 会话结束收尾：只关掉会话标签页，绝不退出用户浏览器。
+    /// Session teardown: only close the session tab, never quit the user's browser.
     pub async fn shutdown(&mut self) {
         let _ = self.close_session_tab().await;
         self.window_id = None;
@@ -784,8 +797,9 @@ impl ApplescriptSession {
     }
 }
 
-/// 与 tools.rs 同名同参数 key 的 13 个工具；结果只放 content[0].text（cap 24K），
-/// 使用与 CDP 模式一致的 `[...]` 标记提醒模型。
+/// The 13 tools with the same names and argument keys as in tools.rs; results go only
+/// into content[0].text (capped at 24K), using the same `[...]` markers as CDP mode to
+/// remind the model.
 pub async fn handle_tools_call(
     session: &mut ApplescriptSession,
     params: Option<Value>,

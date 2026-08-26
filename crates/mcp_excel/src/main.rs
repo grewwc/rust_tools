@@ -1,15 +1,19 @@
-//! mcp_excel — 一个 stdio JSON-RPC MCP server，用 AppleScript(osascript) 驱动
-//! 已安装的 Microsoft Excel，为 `a` Agent 提供操作真实 Excel 软件的能力
-//! （打开/读单元格/读区域/写单元格/写区域/导出 CSV/列 sheet...）。
+//! mcp_excel -- a stdio JSON-RPC MCP server that drives an installed Microsoft Excel
+//! via AppleScript (osascript), giving the `a` Agent the ability to operate the real
+//! Excel app (open/read cells/read ranges/write cells/write ranges/export CSV/list sheets...).
 //!
-//! 设计要点见 crates/mcp_excel/AGENTS.md：
-//! - **无长活会话**：osascript 每次是独立子进程，Excel 应用自身维持工作簿的
-//!   打开态，跨调用共享；故 ExcelServer 不持有任何 session 状态，比 mcp_browser 简单。
-//! - 协议样板（stdin 主循环 / 方法分发 / 写回）复用 `mcp_stdio::run`；本文件只提供
-//!   `McpServer` 三段与工具集相关的实现，shutdown 用默认空实现。
-//! - 每操作超时由 with_timeout 兜底（默认 90s < 宿主 request_timeout_ms 120s），
-//!   超时返回不含 transport 触发词的干净 JSON-RPC 错误，避免被宿主 kill。
-//! - 存盘走 Rust 侧写文件（export_csv），绕过 Excel 沙盒版 save 的 -50 限制。
+//! Design points are in crates/mcp_excel/AGENTS.md:
+//! - **No long-lived session**: each osascript run is an independent subprocess; the
+//!   Excel app itself keeps workbooks open across calls, so ExcelServer holds no session
+//!   state at all, simpler than mcp_browser.
+//! - Protocol boilerplate (stdin main loop / method dispatch / write-back) is reused via
+//!   `mcp_stdio::run`; this file only implements the `McpServer` trio plus tool-related
+//!   code; shutdown uses the default no-op.
+//! - Per-operation timeouts are enforced by with_timeout (default 90s < host
+//!   request_timeout_ms 120s); timeouts return a clean JSON-RPC error without transport
+//!   trigger words, so the host does not kill us.
+//! - Saving writes files on the Rust side (export_csv), bypassing the -50 limit of
+//!   Excel's sandboxed save.
 
 mod osa;
 mod tools;
@@ -17,8 +21,9 @@ mod tools;
 use mcp_stdio::{JsonRpcErr, McpServer};
 use serde_json::Value;
 
-/// Excel MCP server——无会话，单元结构体。Excel 应用本身持有打开的工作簿态，
-/// 跨独立 osascript 子进程共享，故这里无需任何状态。
+/// Excel MCP server -- sessionless unit struct. The Excel app itself holds the open
+/// workbook state, shared across independent osascript subprocesses, so no state is
+/// needed here.
 struct ExcelServer;
 
 impl McpServer for ExcelServer {
@@ -31,7 +36,7 @@ impl McpServer for ExcelServer {
     async fn handle_tools_call(&mut self, params: Option<Value>) -> Result<Value, JsonRpcErr> {
         tools::handle_tools_call(params).await
     }
-    // shutdown 用默认空实现（无会话可关）。
+    // shutdown uses the default no-op implementation (no session to close).
 }
 
 #[tokio::main(flavor = "multi_thread")]

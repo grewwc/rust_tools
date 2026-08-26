@@ -1,65 +1,66 @@
-//! # 终端工具 (Terminal Tools)
+//! # Terminal Tools
 //!
-//! 本模块提供终端相关的工具功能，包括文件查找、路径处理、命令解析等。
+//! This module provides terminal-related utilities, including file lookup,
+//! path handling, and command parsing.
 //!
-//! ## 子模块概览
+//! ## Module overview
 //!
-//! - [`filepath`] - 文件路径处理（glob 匹配等）
-//! - [`find()`] - 文件查找功能
-//! - [`parser`] - 命令解析器
-//! - [`utils`] - 通用工具函数
+//! - [`filepath`] - file path handling (glob matching, etc.)
+//! - [`find()`] - file lookup
+//! - [`parser`] - command parser
+//! - [`utils`] - general-purpose helper functions
 //!
-//! ## 主要功能
+//! ## Main features
 //!
-//! ### 文件查找
+//! ### File lookup
 //!
-//! 提供强大的文件查找功能，支持：
-//! - 多目录并发查找
-//! - 文件类型过滤
-//! - 排除模式
-//! - 深度限制
+//! Provides a powerful file lookup that supports:
+//! - concurrent lookup across multiple directories
+//! - file-type filtering
+//! - exclude patterns
+//! - depth limits
 //!
 //! ```rust,ignore
 //! use rust_tools::terminalw::find;
 //!
-//! // find 函数需要 Arc<Task> 和 Arc<WaitGroup> 参数
-//! // 详细用法请参考 terminalw::find 模块文档
+//! // The find function requires Arc<Task> and Arc<WaitGroup> arguments
+//! // See the terminalw::find module docs for full usage
 //! ```
 //!
-//! ### Glob 匹配
+//! ### Glob matching
 //!
-//! 支持大小写不敏感的 glob 模式匹配：
+//! Supports case-insensitive glob pattern matching:
 //!
 //! ```rust,ignore
 //! use rust_tools::terminalw::{glob_paths, glob_case_insensitive};
 //!
-//! // 查找所有匹配模式的文件
+//! // Find all files matching the pattern
 //! let paths = glob_paths("*.rs", ".");
 //!
-//! // 大小写不敏感匹配
+//! // Case-insensitive matching
 //! let paths = glob_case_insensitive("README.md", ".");
 //! ```
 //!
-//! ### 命令解析
+//! ### Command parsing
 //!
-//! 解析终端命令和参数：
+//! Parses terminal commands and arguments:
 //!
 //! ```rust
 //! use rust_tools::terminalw::{Parser, ParserOption};
 //!
 //! let parser = Parser::new();
-//! // 解析命令...
+//! // Parse a command...
 //! ```
 //!
-//! ## 配置选项
+//! ## Configuration options
 //!
-//! 文件查找模块提供多个可配置的全局选项：
+//! The file lookup module offers several configurable global options:
 //!
-//! - [`MAX_LEVEL`] - 最大查找深度
-//! - [`COUNT`] - 是否显示计数
-//! - [`VERBOSE`] - 详细模式
-//! - [`EXTENSIONS`] - 文件扩展名过滤
-//! - [`EXCLUDE`] - 排除模式
+//! - [`MAX_LEVEL`] - maximum lookup depth
+//! - [`COUNT`] - whether to show counts
+//! - [`VERBOSE`] - verbose mode
+//! - [`EXTENSIONS`] - file-extension filtering
+//! - [`EXCLUDE`] - exclude patterns
 
 pub mod filepath;
 pub mod find;
@@ -67,7 +68,7 @@ mod internal;
 pub mod parser;
 pub mod utils;
 
-// 重新导出常用类型和函数
+// Re-export commonly used types and functions
 pub use filepath::{glob_case_insensitive, glob_paths};
 pub use find::{
     CHECK_EXTENSION, COUNT, EXCLUDE, EXTENSIONS, FILE_NAMES_NOT_CHECK, FILE_NAMES_TO_CHECK,

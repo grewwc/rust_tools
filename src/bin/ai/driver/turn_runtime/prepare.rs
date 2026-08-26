@@ -183,9 +183,10 @@ impl QuestionShape {
             || self.artifact_token_count >= 2
     }
 
-    /// 是否值得开启 deliberate thinking：具备 code/repo artifact、多行、
-    /// 列表、诊断形态，或长度足够。`has_diagnostic` 由调用方内联传入
-    /// （诊断形态不在 struct 字段内）。
+    /// Whether deliberate thinking is worthwhile: has a code/repo artifact, is
+    /// multi-line, list-shaped, diagnostic-shaped, or long enough.
+    /// `has_diagnostic` is passed in inline by the caller (the diagnostic shape
+    /// is not a struct field).
     pub(crate) fn needs_deliberate_thinking(self, has_diagnostic: bool) -> bool {
         self.has_code_or_repo_artifact()
             || self.nonempty_line_count >= 3
@@ -320,10 +321,13 @@ pub(super) async fn prepare_turn(
         Some(store.session_assets_dir(&app.session_id))
     };
     crate::ai::driver::runtime_ctx::publish_subagent_phase("preparing context");
-    // 收尾阶段可能因中断、请求错误或旧版本进程而未执行；其派发的后台压缩也可能
-    // 仍在进行。开始下一轮前再做一次轻量检查：若已有压缩在跑则跳过（快照只是
-    // 写回缓存，build_context_history 始终从 canonical 重算），否则前台补一次压缩
-    // 落盘，避免每轮重复请求期摘要。
+    // The finalize phase may not have run due to interruption, request errors, or
+    // an older-version process; its dispatched background compression may also
+    // still be running. Before the next turn, do a lightweight check: skip if a
+    // compression is already running (snapshots are just write-back cache;
+    // build_context_history always recomputes from canonical), otherwise run one
+    // foreground compression to disk, avoiding re-requesting an epoch summary
+    // every turn.
     if super::finalize::mark_session_compaction_started(&app.session_id) {
         let compact_result = compact_session_history_with_app(
             app,
@@ -339,8 +343,9 @@ pub(super) async fn prepare_turn(
             );
         }
     }
-    // build_context_history 走 SQLite/文件 I/O，是同步阻塞调用。在多线程
-    // runtime 上把它移到 spawn_blocking，避免阻塞 tokio worker 线程。
+    // build_context_history does SQLite/file I/O and is a synchronous blocking
+    // call. On a multi-threaded runtime, move it to spawn_blocking so tokio
+    // worker threads are not blocked.
     let history_file = app.session_history_file.clone();
     let history_max_chars = app.config.history_max_chars;
     let history_keep_last = app.config.history_keep_last;
@@ -357,8 +362,9 @@ pub(super) async fn prepare_turn(
             cwd.as_deref(),
         )
         .map_err(|e| e.to_string())?;
-        // 跨 turn 图片摘要：用历史元数据里持久化的摘要替换旧 turn 的原图，
-        // 避免新一轮把上一 turn 的图片重复发给模型（对所有 VL 模型一致）。
+        // Cross-turn image digests: replace prior turns' raw images with the
+        // digest persisted in history metadata, so a new turn does not re-send
+        // last turn's images to the model (consistent for all VL models).
         crate::ai::request::replace_old_images_with_persisted_digests(
             &history_file,
             &mut history,
@@ -384,11 +390,13 @@ pub(super) async fn prepare_turn(
         );
     }
 
-    // critic gate 必须观察模型实际收到的完整用户输入，而不只是剥离 @file 后的
-    // 短问题正文。文本附件、OCR 内容与原生图片都属于 artifact-backed 输入。
+    // The critic gate must observe the full user input the model actually
+    // receives, not just the short question body after @file is stripped. Text
+    // attachments, OCR content, and native images are all artifact-backed inputs.
     let has_images = !app.attached_image_files.is_empty();
-    // 放行失败占位（images 全部带 error）：图片解析失败时也要把 [IMAGE PARSE FAILED: ...]
-    // 提示注入 prompt，避免主 agent 静默丢失图片内容。
+    // Failed-placeholder pass-through (all images carry error): when image
+    // parsing fails, the [IMAGE PARSE FAILED: ...] hint must also be injected
+    // into the prompt so the main agent never silently loses image content.
     let usable_ocr = if has_images && !crate::ai::models::supports_image_input(next_model) {
         precomputed_ocr
             .as_ref()
@@ -416,7 +424,8 @@ pub(super) async fn prepare_turn(
 
     let mut messages = Vec::with_capacity(history.len() + 2);
 
-    // 提前收集可用工具名，供 observer 做上下文预算/委派决策。
+    // Collect available tool names up front for the observer's
+    // context-budget/delegation decisions.
     let available_tool_names: Vec<String> = app
         .agent_context
         .as_ref()
@@ -492,10 +501,11 @@ pub(super) async fn prepare_turn(
         skill_turn.push_section(skill_runtime::ContextKind::Behavior, &block);
     }
 
-    // C3 复杂任务自动提示已移除：build agent 的 Core Workflow Plan / Verify 步骤已覆盖
-    // 同样的"先列计划再动手"引导，重复注入会与 Autonomous Execution 段的
-    // "prefer acting over describing" 互相矛盾。`detect_complex_task` 保留
-    // 仅供测试观测形态信号。
+    // The C3 complex-task auto-hint was removed: the build agent's Core Workflow
+    // Plan / Verify steps already cover the same "plan first, then act"
+    // guidance, and re-injecting it would contradict the "prefer acting over
+    // describing" rule in the Autonomous Execution section. `detect_complex_task`
+    // remains only for tests to observe shape signals.
 
     let (task_evidence_ledger, task_evidence_warning) =
         crate::ai::history::render_unintegrated_task_evidence_resilient(
@@ -515,16 +525,21 @@ pub(super) async fn prepare_turn(
         tool_call_id: None,
         reasoning_content: None,
     });
-    // 用户重定向提醒：若历史中最近一条 assistant 仍是 tool-call 批次（即上一轮
-    // agent 在工具循环里结束、未给出最终文本回复，可能是 stuck loop、被打断、
-    // 或限额触发），注入一条纯 runtime-owned 的头部提醒，指向请求末尾真实的
-    // role=user 消息。绝不能把用户原文复制进 system-like note，否则会跨越信任
-    // 边界；也不能丢掉“新用户消息已重定向任务”这一信号，否则漫长 tool-only
-    // 历史会让模型继续上一轮未完成的循环。
+    // User redirection notice: if the most recent assistant message in history
+    // is still a tool-call batch (i.e. the agent ended inside the tool loop last
+    // turn without a final text reply -- possibly a stuck loop, an interruption,
+    // or a quota hit), inject a pure runtime-owned header notice pointing at the
+    // real role=user message at the end of the request. Never copy the user's
+    // original wording into a system-like note (that would cross the trust
+    // boundary), and never drop the "a new user message redirected the task"
+    // signal, or long tool-only history would make the model continue last
+    // turn's unfinished loop.
     //
-    // 提醒是 system-like role，[`first_trim_candidate`] 与 fold 路径都豁免它，
-    // mid-turn compress 内不会被打掉；它紧贴 system 之后，模型早期读到，即以
-    // "重定向信号"的姿态启动本轮，而不是把整段 stale 工具历史当成起跳点。
+    // The notice has a system-like role, and both [`first_trim_candidate`] and
+    // the fold path exempt it, so mid-turn compression never drops it; it sits
+    // right after system, the model reads it early, and starts this turn with a
+    // "redirected" stance instead of treating the whole stale tool history as
+    // the launch point.
     let prev_assistant_in_tool_loop = history
         .iter()
         .rev()
@@ -556,7 +571,8 @@ pub(super) async fn prepare_turn(
     // intentionally keeps the original user question without the reminder.
     let context_reminder = skill_turn.context_reminder();
     let (user_content, persisted_question_text) = {
-        // OCR 摘要是附加的图片理解内容：只进模型可见的 final_question，不回显终端。
+        // OCR digests are extra image-understanding content: they only enter the
+        // model-visible final_question and are not echoed to the terminal.
         let content =
             request::build_content(next_model, &final_question, &app.attached_image_files)?;
         (content, final_question)
@@ -589,11 +605,14 @@ pub(super) async fn prepare_turn(
         user_message.clone()
     };
     let mut request_user_message = request_user_message;
-    // VL 图片摘要协议：请求投影的用户消息若含内联图片，注入一段固定的“图片处理
-    // 协议”指令，要求模型本轮就产出一段可复用的图片摘要。后续轮次据此把图片 part
-    // 换成摘要文本（见 request::image_digest / orchestrator 的替换逻辑），避免在
-    // 工具循环里反复重放 base64 触发 Doubao/Ark 侧的 429 TPM 限流。
-    // 仅改请求投影（messages）；canonical turn_messages 保留原始图片。
+    // VL image digest protocol: if the request projection's user message
+    // contains inline images, inject a fixed "image handling protocol"
+    // instruction asking the model to produce a reusable image digest this very
+    // turn. Later turns swap the image parts for digest text (see
+    // request::image_digest / the orchestrator's replacement logic), avoiding
+    // repeated base64 replay inside the tool loop that would trip Doubao/Ark's
+    // 429 TPM throttling. Only the request projection (messages) changes;
+    // canonical turn_messages keep the raw images.
     if request::content_has_image(&request_user_message.content)
         && let Value::Array(parts) = &mut request_user_message.content
     {
@@ -604,12 +623,13 @@ pub(super) async fn prepare_turn(
     }
     messages.push(request_user_message);
     let mut turn_messages = Vec::with_capacity(8);
-    // 唤醒恢复 turn 的 prompt 是系统生成的通知，不是用户主动输入。
-    // 用 internal_note 持久化，使其在 /history user、history 压缩的
-    // user-turn 计数中被跳过，并在后续 turn 加载时被 normalize 为
-    // system 角色而非 user，避免模型误读为用户重复提问。
-    // 注意：发给 API 的 messages 数组仍保留 role:user（兼容性），
-    // 这里只改持久化轨道（turn_messages）的角色。
+    // A wake-up resume turn's prompt is a system-generated notice, not active
+    // user input. Persist it as an internal_note so it is skipped in /history
+    // user and history-compression user-turn counting, and gets normalized to
+    // the system role (not user) on later turn loads, so the model never misreads
+    // it as a repeated user question. Note: the messages array sent to the API
+    // still keeps role:user (for compatibility); only the persistence track
+    // (turn_messages) changes its role.
     turn_messages.push(persisted_user_turn_message(
         user_message,
         &persisted_question_text,
@@ -632,8 +652,9 @@ pub(super) async fn prepare_turn(
     })
 }
 
-/// C3: 复杂任务检测——仅基于结构信号的轻量启发式。
-/// 命中后只会注入一段 Policy 提示鼓励 agent 自行拆解，不强制激活 Thinking 引擎。
+/// C3: complex-task detection -- a lightweight heuristic based purely on
+/// structural signals. When it hits, only a Policy hint is injected encouraging
+/// the agent to break the task down; the Thinking engine is never force-activated.
 #[cfg(test)]
 fn detect_complex_task(question: &str) -> bool {
     QuestionShape::analyze(question).is_complex_task()
@@ -847,7 +868,8 @@ mod tests {
 
         assert!(effective_question.contains("[Attached Image Content via mcp_ocr_extract]"));
         assert!(should_inject_integrated_critic(&effective_question, false));
-        // 原生视觉模型不会产生 OCR 文本，但图片本身仍是 artifact-backed 输入。
+        // Native vision models produce no OCR text, but the images themselves
+        // are still artifact-backed inputs.
         assert!(should_inject_integrated_critic("描述这张图", true));
     }
 

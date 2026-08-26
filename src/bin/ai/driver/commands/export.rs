@@ -1,8 +1,8 @@
 // =============================================================================
-// /export 交互命令 —— 把最后一条模型结论导出为 markdown 文件
+// /export interactive command -- exports the last model conclusion to a markdown file
 // =============================================================================
-//   /export              —— 导出到当前目录 _summary.md
-//   /export xxx.md       —— 导出到指定 markdown 文件
+//   /export              -- export to _summary.md in the current directory
+//   /export xxx.md       -- export to the given markdown file
 // =============================================================================
 
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ fn extract_export_arg(input: &str) -> &str {
 }
 
 fn execute_export(app: &App, arg: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // 1) 确定输出路径
+    // 1) Determine the output path
     let target_path = if arg.is_empty() {
         default_export_path()
     } else {
@@ -45,7 +45,7 @@ fn execute_export(app: &App, arg: &str) -> Result<(), Box<dyn std::error::Error>
         }
     };
 
-    // 2) 取最后一条 assistant 结论
+    // 2) Fetch the last assistant conclusion
     let text = match input::last_assistant_conclusion_text(app)? {
         Some(t) => t,
         None => {
@@ -59,7 +59,7 @@ fn execute_export(app: &App, arg: &str) -> Result<(), Box<dyn std::error::Error>
         return Ok(());
     }
 
-    // 3) 写文件
+    // 3) Write the file
     if let Some(parent) = target_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -105,7 +105,7 @@ mod tests {
         assert!(is_export_command(":export"));
         assert!(is_export_command(":export foo.md"));
 
-        // 不应匹配的
+        // Cases that must not match
         assert!(!is_export_command("/export_foo"));
         assert!(!is_export_command("/foo"));
         assert!(!is_export_command(""));
@@ -113,8 +113,9 @@ mod tests {
     }
 }
 
-/// 纯函数：判断输入是否为 `/export` / `:export` 命令（不执行导出）。
-/// 拆分出来便于单测和分发器复用。
+/// Pure function: decides whether the input is a `/export` / `:export` command
+/// (without performing the export).
+/// Split out so it can be unit-tested and reused by the dispatcher.
 fn is_export_command(input: &str) -> bool {
     let trimmed = input.trim();
     if trimmed.is_empty() {

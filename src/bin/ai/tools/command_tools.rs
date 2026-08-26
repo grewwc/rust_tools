@@ -36,9 +36,9 @@ mod tests {
 
     #[test]
     fn test_execute_command_captures_stderr() {
-        // 注意：`sh -c "..."` 会被 validate_execute_command 拒绝（因为它是
-        // shell 二次解释，可绕过黑名单）。这里改用一个本身会写 stderr 的命令
-        // (`ls` 一个不存在的路径) 来验证 stderr 捕获。
+        // Note: `sh -c "..."` is rejected by validate_execute_command (it is a second
+        // shell interpretation that could bypass the blacklist). Use a command that
+        // writes to stderr on its own (`ls` on a nonexistent path) to verify capture.
         let args = serde_json::json!({
             "command": "ls /nonexistent_dir_for_test_xyz_12345"
         });

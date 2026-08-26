@@ -35,11 +35,12 @@ pub use share::try_handle_share_command;
 pub use skills::try_handle_skills_command;
 pub use usage::try_handle_usage_command;
 
-/// 处理不依赖 skill/agent manifest 的本地斜杠命令。
+/// Handle local slash commands that do not depend on skill/agent manifests.
 ///
-/// 这些命令（/usage、/help、/model、/goal 等）可在 manifest 加载之前先行分发，
-/// 命中且未注入 `forced_question` 时即可跳过昂贵的 manifest 扫描，显著降低
-/// one-shot 模式下纯只读命令（如 `a /usage`）的延迟。
+/// These commands (/usage, /help, /model, /goal, ...) can be dispatched before
+/// manifests load; when one matches without a `forced_question` injected, the
+/// expensive manifest scan is skipped, which notably cuts latency for
+/// read-only commands in one-shot mode (e.g. `a /usage`).
 pub fn try_handle_local_command(
     app: &mut App,
     mcp_client: &SharedMcpClient,
@@ -97,8 +98,9 @@ pub fn try_handle_interactive_command(
     if try_handle_local_command(app, mcp_client, input)? {
         return Ok(true);
     }
-    // `/audit` 必须保留到已有 DRIVER_CTX 的 turn 中执行，避免在本地命令阶段
-    // 丢失 session/task 身份；同时优先于同名 skill 的显式激活。
+    // `/audit` must be deferred to a turn that already has DRIVER_CTX, so the
+    // session/task identity is not lost during local-command dispatch; it also
+    // takes precedence over explicit activation of a skill with the same name.
     if audit::parse_audit_command(input).is_some() {
         return Ok(false);
     }

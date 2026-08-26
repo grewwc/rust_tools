@@ -58,11 +58,12 @@ pub(super) fn summarize_large_tool_output(content: &str) -> LargeToolSummary {
         };
     }
 
-    // 对文本内容提取结构化关键行（函数/类型定义、错误行等），
-    // 让模型拿到"文件大纲"级别的召回锚点，而非只有一行 summary。
+    // For text content, extract structured key lines (function/type definitions,
+    // error lines, etc.) so the model gets "file outline"-level recall anchors
+    // instead of only a one-line summary.
     let key_lines = extract_key_lines(content, 20);
 
-    // summary 仍取第一个错误行（如果有），否则取第一个非空行。
+    // summary still takes the first error line (if any), otherwise the first non-empty line.
     let summary = content
         .lines()
         .map(str::trim)
@@ -153,8 +154,9 @@ pub(super) fn build_model_overflow_stub(
             content_for_model.push_str(&format!("  - {sample}\n"));
         }
     }
-    // 文本内容：追加结构化关键行和 head 预览，让模型有足够的召回锚点
-    // 来判断是否需要重新 read_file，而不必盲目重读。
+    // For text content: append structured key lines and a head preview so the model
+    // has enough recall anchors to decide whether re-reading via read_file is needed,
+    // instead of blindly re-reading.
     if !summary.key_lines.is_empty() {
         content_for_model.push_str(&format!("- key_lines ({}):\n", summary.key_lines.len()));
         for line in &summary.key_lines {

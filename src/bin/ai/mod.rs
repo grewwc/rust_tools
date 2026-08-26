@@ -38,14 +38,16 @@ mod test_support {
     pub(super) static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 }
 
-/// 同步入口：在创建 tokio runtime 之前判断是否进入后台模式。
-/// 后台模式不 fork：父进程用 posix_spawn 重新 exec 一个全新的
-/// `a --daemon-child <session>` 作为 daemon（见 `background::spawn_daemon_child`），
-/// 避免 fork 把父进程半初始化的 CF/os_log/objc 状态带进子进程。
+/// Synchronous entry point: decides whether to enter background mode before creating
+/// the tokio runtime. Background mode does not fork: the parent re-execs a fresh
+/// `a --daemon-child <session>` as the daemon via posix_spawn (see
+/// `background::spawn_daemon_child`), avoiding fork carrying the parent's
+/// half-initialized CF/os_log/objc state into the child.
 pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
-    // 内部 daemon 标记：后台模式父进程在参数最前面加上
-    // `--daemon-child <session_id>`，这里剥离后按正常参数解析，再路由到
-    // daemon 子进程入口（`background::run_background_child`）。
+    // Internal daemon marker: the background-mode parent prepends
+    // `--daemon-child <session_id>` to the arguments; strip it here, parse the rest
+    // normally, then route to the daemon child entry point
+    // (`background::run_background_child`).
     let mut args: Vec<String> = std::env::args().collect();
     let daemon_session = if args.get(1).map(String::as_str) == Some("--daemon-child") {
         let sid = args.get(2).cloned();
@@ -56,8 +58,9 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if daemon_session.is_some() {
-        // 新 exec 的子进程必须在解析 CLI / 创建 runtime 前建立独立 session。
-        // 不能用 `process_group(0)` 代替：它只设置 PGID，且会使 `setsid` 失败。
+        // The freshly exec'd child must establish its own session before parsing the
+        // CLI / creating the runtime. `process_group(0)` is not a substitute: it only
+        // sets the PGID and would make `setsid` fail.
         background::detach_daemon_session()?;
     }
 

@@ -334,19 +334,26 @@ pub(super) struct StreamContentState {
     pub(super) tool_args_cap_exceeded: bool,
     pub(super) saw_reasoning_output: bool,
     pub(super) tool_calls_map: SkipMap<usize, ToolCallBuilder>,
+    /// Composite key resolved for the most recent tool call without an `index`,
+    /// used to attach later parameter-continuation deltas (which have neither id
+    /// nor index) onto that same tool call.
+    pub(super) last_indexless_tool_call_key: Option<usize>,
     pub(super) assistant_text: String,
-    /// content 通道已消费过的原始文本（先于 think demux）。Responses 兼容网关会把
-    /// `output_text.delta` 已经流过的 part 再通过 `content_part.added` 全量重发；
-    /// 这里按原始 content 去重，避免 demux 关闭后把完整 `<think>...</think>正文`
-    /// 当成新正文再次追加。
+    /// Raw text already consumed on the content channel (prior to think demux).
+    /// Responses-compatible gateways re-send parts already streamed via
+    /// `output_text.delta` through `content_part.added` in full; dedupe by raw
+    /// content here so a complete `thinking...` response body is not appended
+    /// again as new text once demux is closed.
     pub(super) content_replay_text: String,
     pub(super) hidden_meta: String,
-    /// 累积模型返回的 reasoning_content 原文（不含展示用的 thinking 标记），
-    /// 终轮结束后通过 StreamResult 透传给 history，
-    /// 以便下一轮请求把它原样回传给后端（DeepSeek thinking-mode 必须）。
+    /// Raw `reasoning_content` returned by the model (without the display-only
+    /// `thinking` markers), forwarded to history via StreamResult at the end of
+    /// the turn so the next turn can send it back verbatim to the backend
+    /// (required for DeepSeek thinking-mode).
     pub(super) reasoning_text: String,
-    /// 本轮从 Responses 流捕获的完整 `reasoning` output items（含 encrypted_content）。
-    /// 仅用于同 turn 工具链回放，不落持久化历史。
+    /// Complete `reasoning` output items captured from the Responses stream this
+    /// turn (including encrypted_content). Only used for same-turn tool-chain
+    /// replay; never persisted to history.
     pub(super) reasoning_items: Vec<serde_json::Value>,
     pub(super) hidden_meta_parse: HiddenMetaParseState,
     pub(super) internal_tool_call_idx: usize,
@@ -374,6 +381,7 @@ impl StreamContentState {
             tool_args_cap_exceeded: false,
             saw_reasoning_output: false,
             tool_calls_map: SkipMap::default(),
+            last_indexless_tool_call_key: None,
             assistant_text: String::new(),
             content_replay_text: String::new(),
             hidden_meta: String::new(),

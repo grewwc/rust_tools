@@ -19,7 +19,7 @@ pub fn print_assistant_banner_with_app(app: Option<&App>) {
     print_assistant_banner_with_app_and_skill(app, None);
 }
 
-/// 默认不打印 assistant 角色标记行；仅在 skill 已确认激活时保留可见标识。
+/// By default the assistant role label line is not printed; it is only kept visible once a skill has been confirmed active.
 pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: Option<&str>) {
     let Some(skill_name) = skill_name else {
         return;
@@ -33,8 +33,8 @@ pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: 
     );
 }
 
-/// 终端不再打印工具输出内容，只保留工具调用状态行。
-/// 工具结果仍会写入 messages 供模型使用，不影响 agent 效果。
+/// The terminal no longer prints tool output content, only tool call status lines.
+/// Tool results are still written to messages for the model; agent behavior is unaffected.
 pub fn print_tool_output_block(_content: &str) {}
 
 pub fn print_tool_output_line(line: &str) {
@@ -51,8 +51,8 @@ pub fn print_tool_note_line(label: &str, value: &str) {
     println!("{}", format_tool_note_line(label, value));
 }
 
-/// 强制激活 skill 的诊断必须作为普通终端行输出。
-/// 不能使用会原地重绘的 status line：后续流式输出会与其共享光标位置而发生拼接。
+/// Forced skill-activation diagnostics must be emitted as plain terminal lines.
+/// Do not use a status line that redraws in place: later streaming output would share its cursor position and get concatenated with it.
 pub(in crate::ai) fn print_skill_activation_note(
     requested_skill: &str,
     injected_skill: Option<&str>,
@@ -155,8 +155,8 @@ pub(in crate::ai) fn format_tool_status_with_file_target(
     target: &str,
 ) -> String {
     let target = sanitize_for_terminal(target);
-    // 当 target 包含行号信息（read_file 的 "path  lines X..Y"）时，
-    // 把路径和行号分开着色，避免同一行两种信息颜色重复。
+    // When target contains line-range info (read_file's "path  lines X..Y"),
+    // color the path and the line range separately so the two kinds of info on one line do not repeat the same color.
     if let Some((path_part, line_part)) = target.split_once("  lines ") {
         format!(
             "{}  {}·{} {}{}{} {}{}{}",
@@ -347,9 +347,9 @@ fn format_tool_output_block_with_formatter(
     content.lines().map(format_line).collect()
 }
 
-/// 从文件类工具的 arguments JSON 中提取目标文件名，用于终端提示。
-/// - `read_file` / `write_file`: `file_path` 字段
-/// - `apply_patch`: 优先 `file_path` / `path`，否则从 patch 文本的 `*** Update File:` 等行提取
+/// Extract the target file name from a file tool's arguments JSON, for the terminal prompt.
+/// - `read_file` / `write_file`: the `file_path` field
+/// - `apply_patch`: prefer `file_path` / `path`; otherwise extract from lines like `*** Update File:` in the patch text
 pub(in crate::ai) fn format_file_tool_target(tool_name: &str, args_json: &str) -> Option<String> {
     let args: serde_json::Value = serde_json::from_str(args_json.trim()).ok()?;
     match tool_name {
@@ -374,7 +374,7 @@ pub(in crate::ai) fn format_file_tool_target(tool_name: &str, args_json: &str) -
                 short
             }),
         "apply_patch" => {
-            // 优先从 file_path / path 参数取
+            // Prefer the file_path / path arguments
             for key in &["file_path", "path"] {
                 if let Some(p) = args
                     .get(*key)
@@ -384,7 +384,7 @@ pub(in crate::ai) fn format_file_tool_target(tool_name: &str, args_json: &str) -
                     return Some(short_path(p));
                 }
             }
-            // 其次从 patch 文本中提取第一个目标文件
+            // Otherwise extract the first target file from the patch text
             let patch = args.get("patch").and_then(|v| v.as_str())?;
             extract_first_patch_target(patch).map(|s| short_path(&s))
         }
@@ -392,7 +392,7 @@ pub(in crate::ai) fn format_file_tool_target(tool_name: &str, args_json: &str) -
     }
 }
 
-/// 从 patch 文本中提取第一个 `*** Update File:` / `*** Add File:` 行的目标路径。
+/// Extract the target path from the first `*** Update File:` / `*** Add File:` line in the patch text.
 fn extract_first_patch_target(patch: &str) -> Option<String> {
     for line in patch.lines() {
         let trimmed = line.trim_start();
@@ -406,9 +406,9 @@ fn extract_first_patch_target(patch: &str) -> Option<String> {
     None
 }
 
-/// 只保留路径最后两段（目录+文件名），截断过长的路径。
+/// Keep only the last two path segments (directory + file name), truncating over-long paths.
 fn short_path(p: &str) -> String {
-    // 优先取最后两段 /a/b/c/foo.rs → b/foo.rs
+    // Prefer the last two segments: /a/b/c/foo.rs → b/foo.rs
     let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
     let short = if parts.len() >= 2 {
         format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
@@ -428,8 +428,8 @@ fn short_path(p: &str) -> String {
     }
 }
 
-/// 若工具配置了 `print_args`，把调用入参回显到终端；否则为空操作。
-/// 是否回显由工具自身提交的 `ToolDisplayConfig` 决定，调用方无需感知具体工具名。
+/// If the tool is configured with `print_args`, echo the call arguments to the terminal; otherwise no-op.
+/// Whether to echo is decided by the `ToolDisplayConfig` submitted by the tool itself; callers need not know specific tool names.
 pub(in crate::ai) fn echo_tool_args(tool_name: &str, args_json: &str) {
     if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;
@@ -439,7 +439,7 @@ pub(in crate::ai) fn echo_tool_args(tool_name: &str, args_json: &str) {
         return;
     }
     let trimmed = args_json.trim();
-    // 尝试美化打印 JSON；解析失败时回退到原始文本。
+    // Try to pretty-print the JSON; fall back to the raw text if parsing fails.
     let pretty = serde_json::from_str::<serde_json::Value>(trimmed)
         .ok()
         .and_then(|v| serde_json::to_string_pretty(&v).ok())
@@ -449,9 +449,9 @@ pub(in crate::ai) fn echo_tool_args(tool_name: &str, args_json: &str) {
     }
 }
 
-/// 若工具配置了 `print_result`，把输出内容回显到终端；否则为空操作。
-/// 若工具配置了 `display` 变换，终端回显的是变换后的紧凑内容，模型仍收到完整 `content`。
-/// 是否回显由工具自身提交的 `ToolDisplayConfig` 决定，调用方无需感知具体工具名。
+/// If the tool is configured with `print_result`, echo the output to the terminal; otherwise no-op.
+/// If the tool configures a `display` transform, the terminal echoes the transformed compact content while the model still receives the full `content`.
+/// Whether to echo is decided by the `ToolDisplayConfig` submitted by the tool itself; callers need not know specific tool names.
 pub(in crate::ai) fn echo_tool_output(tool_name: &str, content: &str, args_json: &str) {
     if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;

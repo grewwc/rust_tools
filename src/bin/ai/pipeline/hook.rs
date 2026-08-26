@@ -1,28 +1,31 @@
 // =============================================================================
-// HookRegistry - 流水线钩子注册表（Turn Pipeline Hook）
+// HookRegistry - pipeline hook registry (Turn Pipeline Hook)
 // =============================================================================
-// 为每个 StageKind 提供 before / after 钩子插槽，解耦 driver 中散落的
-// 钩子调用（如 hooks::run_pre_turn / post_turn）。钩子为纯内存回调，
-// 不依赖子进程，适合单测与中间件注入。
+// Provides before/after hook slots for each StageKind, decoupling the hook
+// calls scattered through the driver (such as hooks::run_pre_turn /
+// post_turn). Hooks are pure in-memory callbacks with no subprocess
+// dependency, suitable for unit tests and middleware injection.
 
 use std::collections::HashMap;
 use super::context::{PipelineContext, StageKind};
 
-/// 钩子回调签名：同步、可失败；需要异步的用 block_on / 中间件链。
+/// Hook callback signature: synchronous and fallible; for async, use
+/// block_on / the middleware chain.
 pub type HookFn = Box<dyn Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>;
 
-/// 单个已注册钩子的元数据（便于调试与去重）
+/// Metadata for a single registered hook (for debugging and deduplication).
 pub struct HookEntry {
     pub name: &'static str,
     pub func: HookFn,
 }
 
-/// 按 StageKind + 时机（before/after）组织的注册表
+/// Registry organized by StageKind + timing (before/after).
 #[derive(Default)]
 pub struct HookRegistry {
     before: HashMap<StageKind, Vec<HookEntry>>,
     after: HashMap<StageKind, Vec<HookEntry>>,
-    /// 全局 turn 级钩子（不绑定具体 stage），如 on_turn_start / on_turn_end
+    /// Global turn-level hooks (not bound to a specific stage), such as
+    /// on_turn_start / on_turn_end.
     global_before: Vec<HookEntry>,
     global_after: Vec<HookEntry>,
 }
@@ -58,10 +61,13 @@ impl HookRegistry {
         self.global_after.push(HookEntry { name, func: Box::new(f) });
     }
 
-    /// 触发指定 stage 的 before 钩子（按注册顺序），遇错短路返回 Err
+    /// Fires the before hooks for the given stage (in registration order),
+    /// short-circuiting with Err on the first failure.
     pub fn fire_before(&self, ctx: &mut PipelineContext<'_>, kind: StageKind) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 让 ctx.stage 与正在触发的 stage 保持一致：无论调用方（runner / driver 钩子）
-        // 是否手动 advance，钩子观察到的 stage 都是真实的触发点，避免读到 new() 的 Prepare 默认值。
+        // Keep ctx.stage aligned with the stage being fired: regardless of
+        // whether the caller (runner / driver hooks) advances manually, hooks
+        // observe the real trigger point instead of the Prepare default from
+        // new().
         ctx.stage = kind;
         for h in self.global_before.iter().chain(self.before.get(&kind).into_iter().flatten()) {
             (h.func)(ctx)?;
@@ -77,7 +83,8 @@ impl HookRegistry {
         Ok(())
     }
 
-    /// 仅触发某个 stage 自身的 before 钩子（不含全局钩子，避免与 turn 级全局钩子重复触发）。
+    /// Fires only a stage's own before hooks (excluding global hooks, to avoid
+    /// double-firing turn-level global hooks).
     pub fn fire_stage_before(&self, ctx: &mut PipelineContext<'_>, kind: StageKind) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ctx.stage = kind;
         for h in self.before.get(&kind).into_iter().flatten() {
@@ -86,7 +93,7 @@ impl HookRegistry {
         Ok(())
     }
 
-    /// 仅触发某个 stage 自身的 after 钩子（不含全局钩子）。
+    /// Fires only a stage's own after hooks (excluding global hooks).
     pub fn fire_stage_after(&self, ctx: &mut PipelineContext<'_>, kind: StageKind) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ctx.stage = kind;
         for h in self.after.get(&kind).into_iter().flatten() {
@@ -95,7 +102,7 @@ impl HookRegistry {
         Ok(())
     }
 
-    /// 兼容旧 shell hooks 的空注册表快捷构造
+    /// Quick construction of an empty registry compatible with legacy shell hooks.
     pub fn is_empty(&self) -> bool {
         self.before.is_empty() && self.after.is_empty() && self.global_before.is_empty() && self.global_after.is_empty()
     }
@@ -107,7 +114,7 @@ impl HookRegistry {
         self.after.get(&kind).map(|v| v.len()).unwrap_or(0)
     }
 
-    /// 全局钩子触发（不绑定 StageKind）
+    /// Fires global hooks (not bound to a StageKind).
     pub fn fire_global_before(&self, ctx: &mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for h in &self.global_before { (h.func)(ctx)?; }
         Ok(())
@@ -129,8 +136,10 @@ mod tests {
     use super::*;
     use crate::ai::types::App;
     fn leak_app() -> &'static mut App {
-        // 复用 middleware 的合法 App 构造，避免 zeroed 对 PathBuf/Arc 等非零类型的 UB。
-        // pipeline 测试仅读写 tags，不依赖 App 字段内容。
+        // Reuse middleware's legitimate App construction to avoid the UB of
+        // zeroing non-zero-sized types such as PathBuf/Arc.
+        // The pipeline tests only read/write tags and do not rely on App
+        // field contents.
         let app = crate::ai::middleware::test_util::test_app();
         Box::leak(Box::new(app))
     }
@@ -144,7 +153,7 @@ mod tests {
         let mut ctx = PipelineContext::new(app, vec![], 0);
         reg.fire_before(&mut ctx, StageKind::Prepare).unwrap();
         assert_eq!(ctx.tags, vec!["a", "b"]);
-        // 泄漏的 App 不回收，避免 zeroed Drop 的 UB
+        // The leaked App is never reclaimed, avoiding zeroed Drop UB.
     }
 
     #[test]

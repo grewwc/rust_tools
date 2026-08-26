@@ -31,7 +31,8 @@ fn reject_server_request(
     })
 }
 
-/// 发送 JSON-RPC 请求到 MCP 服务器连接（独立函数，可在任何上下文中调用）
+/// Sends a JSON-RPC request to an MCP server connection (standalone function,
+/// callable from any context).
 pub(in crate::ai) fn send_request_to_conn(
     conn: &mut McpServerConnection,
     id: u64,
@@ -75,11 +76,13 @@ pub(in crate::ai) fn send_request_to_conn(
                 continue;
             }
             InboundJsonRpc::Response(response) => {
-                // 跳过无 id 的响应（id 为 null 或缺失）。
-                // 部分 MCP 服务器（如 mcp_ocr）会对 notifications/initialized
-                // 通知发送冗余确认响应 {"jsonrpc":"2.0","id":null,"result":{}}。
-                // 若不跳过，该响应会被错误地当作下一个请求的响应消费，
-                // 导致真正的响应滞留在缓冲区，引发 id mismatch 错误。
+                // Skip responses without an id (null or missing id).
+                // Some MCP servers (such as mcp_ocr) send a redundant
+                // acknowledgement {"jsonrpc":"2.0","id":null,"result":{}} for
+                // the notifications/initialized notification. If not skipped,
+                // that response would be consumed as the next request's reply,
+                // leaving the real response stuck in the buffer and causing an
+                // id mismatch error.
                 let Some(resp_id) = response.id else {
                     continue;
                 };
@@ -107,13 +110,15 @@ pub(in crate::ai) fn send_request_to_conn(
     }
 }
 
-/// 发送 JSON-RPC 通知到 MCP 服务器连接（无 id，不等待响应）。
+/// Sends a JSON-RPC notification to an MCP server connection (no id, does not
+/// wait for a response).
 ///
-/// MCP 协议中 `notifications/initialized` 等消息是通知而非请求：
-/// 不携带 `id` 字段，服务器不应返回响应。若错误地以请求形式发送
-/// （带 `id` 并等待响应），部分 MCP 服务器（如 Feishu）会因协议
-/// 违规而直接关闭 stdio 流，导致 "MCP server closed the stream
-/// unexpectedly" 错误。
+/// In the MCP protocol, messages such as `notifications/initialized` are
+/// notifications, not requests: they carry no `id` field and the server must
+/// not reply. If sent as a request instead (with an `id` and a wait for a
+/// response), some MCP servers (such as Feishu) close the stdio stream as a
+/// protocol violation, causing an "MCP server closed the stream unexpectedly"
+/// error.
 pub(in crate::ai) fn send_notification_to_conn(
     conn: &mut McpServerConnection,
     method: &str,
@@ -150,9 +155,10 @@ type ServerId = String;
 pub(in crate::ai) struct McpClient {
     pub(in crate::ai) servers: SkipMap<ServerId, Arc<Mutex<McpServerConnection>>>,
     next_id: AtomicU64,
-    // 用 Arc 共享：`routing_snapshot` 每轮被 orchestrator 调用，
-    // 深克隆整个工具/资源/提示缓存代价高（工具 schema 越大越明显）；
-    // Arc::clone 为 O(1)，且 metadata 缓存只整体替换、不原地修改。
+    // Shared via Arc: `routing_snapshot` is called by the orchestrator every
+    // turn, and deep-cloning the whole tool/resource/prompt cache is expensive
+    // (more so as tool schemas grow). Arc::clone is O(1), and the metadata
+    // cache is only ever replaced wholesale, never modified in place.
     cached_tool_definitions: Arc<Vec<ToolDefinition>>,
     cached_resources: Arc<Vec<(String, McpResource)>>,
     cached_prompts: Arc<Vec<(String, McpPrompt)>>,
@@ -435,7 +441,7 @@ impl McpClient {
                     continue;
                 }
                 InboundJsonRpc::Response(resp) => {
-                    // 跳过无 id 的响应（id 为 null 或缺失）
+                    // Skip responses without an id (null or missing id)
                     let Some(resp_id) = resp.id else {
                         continue;
                     };
@@ -489,7 +495,8 @@ impl McpClient {
 
         let id1 = self.next_request_id();
         Self::send_request_to_conn(conn, id1, "initialize", Some(params))?;
-        // notifications/initialized 是通知（无 id，不等待响应），不能用请求形式发送
+        // notifications/initialized is a notification (no id, no response
+        // expected); it must not be sent as a request.
         send_notification_to_conn(conn, "notifications/initialized", None)?;
         Ok(())
     }
@@ -655,13 +662,17 @@ impl McpClient {
         // unreachable
     }
 
-    /// 共享客户端的工具调用入口：不在持有 `SharedMcpClient` 外锁期间执行阻塞 IO。
-    /// 旧的 `McpClient::call_tool(&self, ...)` 要求调用方已持有外锁（`guard.call_tool`），
-    /// 会导致外锁在 `writeln` / `read_response_line_with_timeout` / `restart_connection`
-    /// 期间一直被占用，阻塞其他 server 的 `tool_definitions` / `is_available`。
-    /// 此方法改为：短暂持有外锁仅做 `servers` 查找与 `next_id` 分配，随后释放外锁，
-    /// 仅持有 per-server 的 `Mutex<McpServerConnection>` 执行 IO；`restart` 时遵循
-    /// `外锁 -> 内锁` 顺序（先释放内锁再重新获取），避免 `内锁 -> 外锁` 死锁。
+    /// Shared-client tool-call entry point: never performs blocking IO while
+    /// holding the `SharedMcpClient` outer lock. The old
+    /// `McpClient::call_tool(&self, ...)` required the caller to already hold
+    /// the outer lock (`guard.call_tool`), which kept it held throughout
+    /// `writeln` / `read_response_line_with_timeout` / `restart_connection`,
+    /// blocking other servers' `tool_definitions` / `is_available`. This
+    /// method instead holds the outer lock only briefly for the `servers`
+    /// lookup and `next_id` allocation, then releases it and does IO while
+    /// holding only the per-server `Mutex<McpServerConnection>`; on `restart`
+    /// it follows the outer-lock -> inner-lock order (releasing the inner lock
+    /// before reacquiring it) to avoid an inner-lock -> outer-lock deadlock.
     pub(in crate::ai) fn call_tool_on_shared(
         shared: &SharedMcpClient,
         server_name: &str,
@@ -771,9 +782,11 @@ impl McpClient {
         self.cached_tool_definitions.as_ref().clone()
     }
 
-    /// 返回缓存的工具定义的 `Arc` 快照，避免在持有 `SharedMcpClient` 外锁期间
-    /// 克隆整个 `Vec<ToolDefinition>`（O(n)），来降低 `tool_definitions` 对
-    /// 外锁的持有时长，缓解与 `call_tool` 阻塞 IO 的锁争用。
+    /// Returns an `Arc` snapshot of the cached tool definitions, avoiding a
+    /// full `Vec<ToolDefinition>` clone (O(n)) while holding the
+    /// `SharedMcpClient` outer lock. This shortens the outer-lock hold time of
+    /// `tool_definitions` and eases lock contention with `call_tool`'s blocking
+    /// IO.
     pub(in crate::ai) fn cached_tool_definitions_arc(&self) -> Arc<Vec<ToolDefinition>> {
         Arc::clone(&self.cached_tool_definitions)
     }

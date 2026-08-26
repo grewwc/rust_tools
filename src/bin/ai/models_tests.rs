@@ -240,8 +240,8 @@ fn disabled_model_tokens_accept_names_and_keys() {
     assert!(disabled.contains(&"foo".to_string()));
 }
 
-/// 选取一个真实存在的、adapter=Alibaba 的模型名做用例输入；
-/// 这样测试不会因为模型注册表（models/）增删个别条目而失效。
+/// Picks a real model name whose adapter is Alibaba as the test input;
+/// so the test does not break when individual entries in the model registry (models/) change.
 fn first_alibaba_model_name() -> String {
     super::model_names::all()
         .iter()
@@ -276,8 +276,8 @@ fn known_model_entries_resolve_exactly_by_name() {
 
 #[test]
 fn model_keys_resolve_to_model_handles() {
-    // 用模型注册表中第一个真实条目反向校验 key→handle 的映射，
-    // 而不是硬编码具体 key。
+    // Validate the key→handle mapping in reverse against the first real entry in
+    // the model registry, rather than hardcoding a specific key.
     let first = super::model_names::all()
         .first()
         .map(|m| {
@@ -307,8 +307,8 @@ fn model_key_selects_duplicate_name_provider() {
 
 #[test]
 fn deepseek_v4_flash_routes_declare_full_context_budget() {
-    // DeepSeek V4 Flash 的 393,216 输出上限需要 1M 上下文窗口配合；不能回退到
-    // strong tier 的 200K 保守默认值，否则 builder 会过早压缩 max_tokens。
+    // DeepSeek V4 Flash's 393,216 output cap needs the 1M context window; it must not
+    // fall back to strong tier's conservative 200K default, or the builder would clamp max_tokens too early.
     for key in [
         "deepseek-v4-flash-opencode",
         "deepseek-v4-flash-0731-alibaba",
@@ -326,16 +326,16 @@ fn platform_changes_model_handle_but_legacy_adapter_handle_still_resolves() {
     assert_eq!(super::model_names::model_handle(def), volcano);
     assert_eq!(determine_model("glm-5.2-compatible"), volcano);
     assert_eq!(model_platform_label(volcano), "volcano");
-    // 火山 Coding Plan 官方 OpenCode 配置声明 1,024K context / 64K output。
-    // 这里必须显式配置，不能回退到 flagship 的保守 256K 默认窗口。
+    // Volcengine Coding Plan's official OpenCode config declares 1,024K context / 64K output.
+    // It must be configured explicitly here and must not fall back to flagship's conservative 256K default window.
     assert_eq!(context_window_tokens(volcano), 1_024_000);
     assert_eq!(max_output_tokens(volcano), Some(65_536));
 }
 
 #[test]
 fn volcano_models_keep_dedicated_reasoning_channel() {
-    // 火山 GLM/DeepSeek 流会独立返回 reasoning_content；若再 arm content demux，
-    // 正文会被截留到流结束，遇到 </think> 时还会被错误归入 thinking。
+    // Volcengine GLM/DeepSeek streams return reasoning_content separately; if the content
+    // demux is also armed, the body is held back until the stream ends and would be misrouted into thinking on a response event.
     assert!(!reasoning_in_content_enabled("deepseek-v4-flash-volcano"));
     assert!(!reasoning_in_content_enabled("glm-5.2-volcano"));
 }
@@ -366,7 +366,7 @@ fn known_model_entries_carry_adapter_and_quality_tier() {
 
 #[test]
 fn endpoint_for_known_model_prefers_model_config_over_global_fallback() {
-    // 任意一个在模型注册表中显式声明 endpoint 的条目都应该优先使用自身配置。
+    // Any entry that explicitly declares an endpoint in the model registry should prefer its own config.
     let (name, expected) = super::model_names::all()
         .iter()
         .filter_map(|m| {
@@ -401,7 +401,7 @@ fn deepseek_v4_flash_selector_keeps_opencode_compatibility() {
 
 #[test]
 fn endpoint_for_alibaba_model_prefers_model_config() {
-    // 找一个 Alibaba adapter 且配置了 endpoint 的模型，确保走 model 配置。
+    // Find a model with an Alibaba adapter that has an endpoint configured, ensuring the model config is used.
     let (name, expected) = super::model_names::all()
         .iter()
         .find_map(|m| {
@@ -429,7 +429,7 @@ fn alibaba_model_entries_accept_alibaba_api_key_config() {
 
 #[test]
 fn openrouter_models_use_openrouter_endpoint_in_config() {
-    // 任何配置了 openrouter endpoint 的模型都该走 openrouter。
+    // Any model configured with an openrouter endpoint should go through openrouter.
     let openrouter_model = super::model_names::all()
         .iter()
         .find(|m| {
@@ -477,10 +477,10 @@ fn localhost_endpoint_supports_anonymous_auth() {
 
 #[test]
 fn default_model_prefers_high_quality_alibaba_or_compatible_model() {
-    // default_model 在 choose_default_model_name 中先按 Alibaba / Compatible adapter 过滤，
-    // 再退回到全集，并按 quality_tier 取最高。这里把不变量直接写在断言上：
-    //  1. 必须是 non-vl
-    //  2. quality_tier 必须不低于所有同 adapter-偏好下的候选
+    // default_model is filtered by Alibaba / Compatible adapter in choose_default_model_name,
+    // then falls back to the full set and picks the highest quality_tier. The invariant is
+    //  1. must be non-vl
+    //  2. quality_tier must be at least as high as every candidate under the same adapter preference
     let def = super::model_names::find_by_identifier(&default_model())
         .expect("default model must exist in model registry");
     assert!(!def.is_vl, "default model should be non-VL");
@@ -496,10 +496,10 @@ fn default_model_prefers_high_quality_alibaba_or_compatible_model() {
 
 #[test]
 fn opencode_model_entries_do_not_advertise_thinking_when_disabled() {
-    // 以前这里是固定模型名 gpt-5.4-pro 的强制断言；现在改为针对任意一个
-    // 在模型注册表中明确声明 enable_thinking=false 的 opencode 模型，
-    // 校验 enable_thinking() 与配置一致。这样模型注册表的具体条目变更
-    // 不会再让本测试失效，但仍然能守住"不要把 false 误读成 true"的不变量。
+    // This used to hard-assert the fixed model name gpt-5.4-pro; it now targets any
+    // opencode model that explicitly declares enable_thinking=false in the model registry,
+    // checking that enable_thinking() matches the config. Specific registry entry changes
+    // no longer break this test, while still guarding the invariant of not misreading false as true.
     let candidate = super::model_names::all()
         .iter()
         .find(|m| m.adapter == ApiProvider::OpenCode && !m.enable_thinking)
@@ -510,16 +510,16 @@ fn opencode_model_entries_do_not_advertise_thinking_when_disabled() {
 }
 
 #[test]
-/// 回归测试：api_key_config_key 字段在模型注册表中可能是加密的（enc:...），
-/// api_key_for_model 必须先解密再作为 key 名去 configw 查找。
-/// 修复前：加密字符串直接作为 key 名查找 -> 查不到 -> fallthrough 到全局 api_key -> 401。
+/// Regression test: the api_key_config_key field in the model registry may be encrypted (enc:...),
+/// so api_key_for_model must decrypt it first before using it as the key name in configw.
+/// Before the fix: the encrypted string was used directly as the key name -> not found -> fallthrough to the global api_key -> 401.
 fn api_key_config_key_decrypts_before_configw_lookup() {
     use crate::ai::test_support::ENV_LOCK;
     use crate::commonw::{configw, secret};
 
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
-    // 在模型注册表中找一个 api_key_config_key 加密的模型
+    // Find a model in the registry whose api_key_config_key is encrypted
     let target = super::model_names::all().iter().find_map(|m| {
         let enc = m.api_key_config_key.as_deref()?;
         if !secret::is_encrypted(enc) {
@@ -531,12 +531,12 @@ fn api_key_config_key_decrypts_before_configw_lookup() {
     });
 
     let Some((model_key, config_key_name)) = target else {
-        // 没有加密的 api_key_config_key 条目，无法测试此场景
+        // No encrypted api_key_config_key entries exist, so this scenario cannot be tested
         return;
     };
 
-    // secret_path() 依赖 config_path()，改变 CONFIGW_PATH 会导致密钥文件路径变化。
-    // 必须在改变 CONFIGW_PATH 之前读取真实密钥文件，并复制到临时目录。
+    // secret_path() depends on config_path(); changing CONFIGW_PATH moves the key file path.
+    // Read the real key file before changing CONFIGW_PATH and copy it into a temp directory.
     let real_secret_path = configw::config_path()
         .parent()
         .map(|p| p.join(".configW.secret"))
@@ -546,14 +546,14 @@ fn api_key_config_key_decrypts_before_configw_lookup() {
         return;
     };
 
-    // 创建临时目录，将密钥文件复制过去（保持解密能力）
+    // Create a temp directory and copy the key file into it (keeping it decryptable)
     let temp_dir =
         std::env::temp_dir().join(format!("rt_enc_test_{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&temp_dir).unwrap();
     let temp_secret = temp_dir.join(".configW.secret");
     std::fs::copy(&real_secret_path, &temp_secret).unwrap();
 
-    // 写入临时配置文件
+    // Write the temporary config file
     let cfg_path = temp_dir.join("configw");
     let test_value = "test-encrypted-key-resolution-value";
     std::fs::write(&cfg_path, format!("{config_key_name} = {test_value}\n")).unwrap();
@@ -562,10 +562,10 @@ fn api_key_config_key_decrypts_before_configw_lookup() {
     unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
     configw::refresh();
 
-    // global_fallback 故意设成一个不可能正确的值，确保不会 fallthrough
+    // Deliberately set global_fallback to a value that can never be right, so there is no fallthrough
     let resolved = api_key_for_model(&model_key, "GLOBAL_FALLBACK_SHOULD_NOT_BE_USED");
 
-    // 恢复环境
+    // Restore the environment
     match old_cfg {
         Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
         None => unsafe { std::env::remove_var("CONFIGW_PATH") },

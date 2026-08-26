@@ -1,13 +1,13 @@
-//! 密钥加密/解密工具
+//! Secret encryption/decryption tool
 //!
-//! 用法：
+//! Usage:
 //! ```sh
-//! secret encrypt "my-api-key"    # 输出 enc:xxxxx 格式
-//! secret decrypt "enc:xxxxx"     # 输出明文
+//! secret encrypt "my-api-key"    # prints enc:xxxxx
+//! secret decrypt "enc:xxxxx"     # prints the plaintext
 //! ```
 //!
-//! 加密后的值可以直接放入模型注册表（models/）的 api_key 字段，
-//! 运行时会自动解密。
+//! An encrypted value can be placed directly in the `api_key` field of the
+//! model registry (models/); the runtime decrypts it automatically.
 
 use rust_tools::commonw::secret;
 use std::env;

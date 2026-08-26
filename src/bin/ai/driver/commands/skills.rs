@@ -39,7 +39,8 @@ pub fn try_handle_skills_command(
         return Ok(false);
     }
     let action = parts.next().unwrap_or("list");
-    // 剩余 token 一次性收集：use/隐式选择都需要完整消费参数列表。
+    // Collect the remaining tokens at once: both `use` and implicit selection
+    // need to consume the full argument list.
     let rest_tokens: Vec<&str> = parts.collect();
 
     match action {
@@ -117,8 +118,9 @@ pub fn try_handle_skills_command(
                 return Ok(true);
             }
 
-            // 多个名字逐个解析（大小写不敏感、去重），未命中的单独提示，
-            // 某个名字失效不应拖垮整个集合。
+            // Resolve the names one by one (case-insensitive, deduplicated);
+            // unmatched names get their own hint, and one invalid name should
+            // not sink the whole set.
             let mut names: Vec<String> = Vec::new();
             let mut not_found: Vec<String> = Vec::new();
             for skill_name in &rest_tokens {
@@ -161,11 +163,14 @@ pub fn try_handle_skills_command(
                 );
             }
         }
-        // 隐式选择：输入 /skills <skillname> 直接应用，无需 use 关键字
+        // Implicit selection: /skills <skillname> applies directly without the
+        // use keyword.
         _ => {
-            // 贪婪收集连续匹配 skill 名的 token 作为技能集（保持输入顺序、按
-            // manifest 规范化、去重），其余 token 作为本轮问题正文；也支持
-            // skill 名与问题正文粘连（如 `/skill code-review帮我review`）。
+            // Greedily collect consecutive tokens that match a skill name as the
+            // skill set (keeping input order, normalized by manifest,
+            // deduplicated); the remaining tokens become this turn's question.
+            // Also supports a skill name glued to the question text (e.g.
+            // `/skill code-review` with the question glued on, no space).
             let mut tokens = Vec::with_capacity(rest_tokens.len() + 1);
             tokens.push(action);
             tokens.extend(rest_tokens);
@@ -189,7 +194,7 @@ pub fn try_handle_skills_command(
                     );
                 }
             } else if let Some(rest) = rest {
-                // /skills <name>... <rest>：rest 作为本轮问题
+                // /skills <name>... <rest>: rest becomes this turn's question.
                 app.forced_skills = names;
                 app.forced_skill_source = Some(ForcedSkillSource::SkillsCommandInline);
                 app.forced_question = Some(rest);
@@ -208,13 +213,17 @@ pub fn try_handle_skills_command(
     Ok(true)
 }
 
-/// 解析 /skills <name>... <rest...> 的隐式多 skill 选择。
-/// 贪婪收集**连续**匹配 skill 名的 token 作为技能集（大小写不敏感、按 manifest
-/// 规范化、去重、保持输入顺序），其余 token 作为本轮问题正文。
-/// skill 名是 kebab-case 标识符（ASCII 字母/数字/`-`/`_`）；一个 token 若整体
-/// 不匹配但其 ident 前缀匹配某个 skill 名，则视为「名字 + 无空格粘连的问题正文」
-/// （如 `/skill Code-Review帮我review`），粘连部分连同后续 token 一起作为问题。
-/// 返回 (规范名列表, rest)。
+/// Parse implicit multi-skill selection of the form /skills <name>... <rest...>.
+/// Greedily collects **consecutive** tokens that match a skill name as the skill
+/// set (case-insensitive, normalized by manifest, deduplicated, input order
+/// preserved); the remaining tokens become this turn's question.
+/// A skill name is a kebab-case identifier (ASCII letters/digits/`-`/`_`); a
+/// token that does not match as a whole but whose ident prefix matches a skill
+/// name is treated as "name + question text glued without a space" (e.g.
+/// `/skill Code-Review` with the question glued on), and the glued part
+/// together with the
+/// following tokens becomes the question.
+/// Returns (normalized name list, rest).
 fn resolve_implicit_selection<'m>(
     tokens: &[&'m str],
     skill_manifests: &[SkillManifest],
@@ -238,7 +247,7 @@ fn resolve_implicit_selection<'m>(
             push_name(&skill.name, &mut names);
             continue;
         }
-        // 整体不匹配：检查粘连形式（ident 前缀是 skill 名）。
+        // No whole-token match: check the glued form (ident prefix is a skill name).
         let mut consumed_as_skill = false;
         if let Some(pos) = token.find(|c: char| !is_ident(c)) {
             let prefix = &token[..pos];
@@ -254,7 +263,7 @@ fn resolve_implicit_selection<'m>(
         if !consumed_as_skill {
             rest_tokens.push(token);
         }
-        // 该 token 起（含其粘连正文）之后全部是问题正文。
+        // From this token on (including its glued body), everything is question text.
         rest_tokens.extend(iter.clone());
         break;
     }
@@ -303,7 +312,7 @@ mod tests {
 
     #[test]
     fn single_skill_with_question() {
-        // /skill code-review 帮我review
+        // /skill code-review <question>
         let (names, rest) = resolve("code-review 帮我review");
         assert_eq!(names, vec!["code-review"]);
         assert_eq!(rest.as_deref(), Some("帮我review"));
@@ -327,7 +336,7 @@ mod tests {
 
     #[test]
     fn multi_skills_with_question() {
-        // /skills code-review docs-review 帮我看看这段
+        // /skills code-review docs-review <question>
         let (names, rest) = resolve("code-review docs-review 帮我看看这段");
         assert_eq!(names, vec!["code-review", "docs-review"]);
         assert_eq!(rest.as_deref(), Some("帮我看看这段"));
@@ -335,7 +344,7 @@ mod tests {
 
     #[test]
     fn duplicate_names_deduplicated() {
-        // /skills code-review Code-Review → 去重且规范化大小写
+        // /skills code-review Code-Review → deduplicated and case-normalized
         let (names, rest) = resolve("code-review Code-Review");
         assert_eq!(names, vec!["code-review"]);
         assert_eq!(rest, None);
@@ -343,7 +352,8 @@ mod tests {
 
     #[test]
     fn unknown_token_starts_question() {
-        // 未命中 token 起视为问题正文：/skills code-review 不存在的skill 问题
+        // The first non-matching token starts the question:
+        // /skills code-review <unknown> <question>
         let (names, rest) = resolve("code-review 不存在的skill 问题");
         assert_eq!(names, vec!["code-review"]);
         assert_eq!(rest.as_deref(), Some("不存在的skill 问题"));
@@ -351,7 +361,7 @@ mod tests {
 
     #[test]
     fn glued_question_after_multi_skills() {
-        // /skills code-review docs-review帮我看看 → docs-review 后粘连问题正文
+        // /skills code-review docs-review + glued question → question text glued after docs-review
         let (names, rest) = resolve("code-review docs-review帮我看看");
         assert_eq!(names, vec!["code-review", "docs-review"]);
         assert_eq!(rest.as_deref(), Some("帮我看看"));
@@ -359,7 +369,7 @@ mod tests {
 
     #[test]
     fn glued_question_with_mixed_case() {
-        // /skill Code-Review帮我review → 粘连剥出后剩余作为问题
+        // /skill Code-Review + glued question → the remainder after stripping the glued name
         let (names, rest) = resolve("Code-Review帮我review");
         assert_eq!(names, vec!["code-review"]);
         assert_eq!(rest.as_deref(), Some("帮我review"));
@@ -367,8 +377,9 @@ mod tests {
 
     #[test]
     fn question_repeating_skill_name() {
-        // /skill code-review code-review帮我review：重复的 skill 名去重，
-        // 粘连正文只保留一次（不再把整段当作问题）。
+        // /skill code-review code-review + glued question: duplicate skill names are
+        // deduplicated and the glued body is kept only once (the whole string is
+        // no longer treated as the question).
         let (names, rest) = resolve("code-review code-review帮我review");
         assert_eq!(names, vec!["code-review"]);
         assert_eq!(rest.as_deref(), Some("帮我review"));
@@ -376,7 +387,7 @@ mod tests {
 
     #[test]
     fn multi_word_question() {
-        // /skill code-review 帮我review 这段代码 并给出建议
+        // /skill code-review <multi-word question>
         let (names, rest) = resolve("code-review 帮我review 这段代码 并给出建议");
         assert_eq!(names, vec!["code-review"]);
         assert_eq!(rest.as_deref(), Some("帮我review 这段代码 并给出建议"));
@@ -384,7 +395,7 @@ mod tests {
 
     #[test]
     fn multiline_question() {
-        // /skills bytedcli\n帮我检查最近的飞书消息
+        // /skills bytedcli <question>
         let (names, rest) = resolve("bytedcli 帮我检查最近的飞书消息");
         assert_eq!(names, vec!["bytedcli"]);
         assert_eq!(rest.as_deref(), Some("帮我检查最近的飞书消息"));
@@ -392,7 +403,8 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_no_names() {
-        // 不是任何 skill 名 → 无技能、无问题（命令层走 Unknown 分支）
+        // Matches no skill name → no skill, no question (the command layer takes
+        // the Unknown branch)
         let (names, rest) = resolve("fizzbuzz");
         assert!(names.is_empty());
         assert_eq!(rest.as_deref(), Some("fizzbuzz"));

@@ -256,7 +256,7 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
-    // 尝试通过 arboard 读取本地剪贴板图片
+    // Try reading the local clipboard image via arboard
     if let Ok(mut clipboard) = Clipboard::new() {
         if let Ok(image) = clipboard.get_image() {
             let save_result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -274,14 +274,14 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
             if save_result.is_ok() {
                 return Ok(());
             }
-            // arboard 保存失败，继续尝试 OSC52（SSH 场景）
+            // arboard save failed; fall through to OSC52 (SSH scenario)
         }
     }
 
-    // 回退：通过 OSC52 从远端终端读取剪贴板图片
-    // 支持两种格式：
-    //   1. 原生图片复制：终端返回 base64(原始图片字节)
-    //   2. oo -c 桥接复制：终端返回 base64(base64(图片字节))
+    // Fallback: read the clipboard image from the remote terminal via OSC52.
+    // Supports two formats:
+    //   1. Native image copy: the terminal returns base64(raw image bytes)
+    //   2. oo -c bridged copy: the terminal returns base64(base64(image bytes))
     match try_osc52_save(&fname) {
         Ok(_) => Ok(()),
         Err(e) => {

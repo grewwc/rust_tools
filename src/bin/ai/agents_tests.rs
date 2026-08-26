@@ -177,8 +177,8 @@ fn project_instruction_docs_fall_back_to_doc_ancestors_without_repo_markers() {
 
 #[test]
 fn project_instruction_docs_cache_invalidates_on_content_change() {
-    // 该测试锁住缓存语义：只要文件 mtime/len 变化就必须重新读盘，缓存
-    // 不能让 LLM 看到旧版指令。
+    // This test locks in the cache semantics: whenever the file's mtime/len changes, it
+    // must be re-read from disk so the cache can never expose stale instructions to the LLM.
     let root = temp_dir("project_docs_cache");
     fs::create_dir_all(root.join(".git")).unwrap();
     let agents_md = root.join("AGENTS.md");
@@ -188,12 +188,13 @@ fn project_instruction_docs_cache_invalidates_on_content_change() {
     assert_eq!(first.len(), 1);
     assert!(first[0].content.contains("v1: use pnpm."));
 
-    // 同样输入再调一次，结果应等价（命中缓存或不命中都允许，只要内容一致）。
+    // Calling again with the same input must give an equivalent result (a cache hit or
+    // miss are both fine, as long as the content matches).
     let cached = load_project_instruction_docs_from(&root);
     assert_eq!(cached, first);
 
-    // 改文件并睡眠确保 mtime 推进；同时显式让 len 变化，双重保险触发
-    // fingerprint 失配。
+    // Rewrite the file and sleep to make sure the mtime advances; also change the length
+    // explicitly as a second guarantee, so the fingerprint mismatch triggers.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     fs::write(
         &agents_md,

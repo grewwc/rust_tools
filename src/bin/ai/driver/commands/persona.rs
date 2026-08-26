@@ -196,6 +196,16 @@ fn switch_to_persona(app: &mut App, persona: PersonaProfile) {
     let session_store = SessionStore::new(app.config.history_file.as_path());
     app.session_id = session_id.clone();
     app.session_history_file = session_store.session_history_file(&session_id);
+    if let Err((path, error)) = crate::ai::driver::session_pid::mark_session_pid(
+        session_store.sessions_root(),
+        &session_id,
+        false,
+    ) {
+        eprintln!(
+            "[persona] failed to mark active session PID at {}: {error}",
+            path.display()
+        );
+    }
     if let Err(error) = super::session::restore_session_local_runtime_state(app) {
         eprintln!("[persona] failed to restore session-local state: {error}");
     }

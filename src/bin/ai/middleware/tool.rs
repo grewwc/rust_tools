@@ -1,32 +1,32 @@
 // =============================================================================
-// ToolMiddleware - 工具执行级中间件（装饰器模式）
+// ToolMiddleware - tool execution-level middleware (decorator pattern)
 // =============================================================================
 use crate::ai::ports::tool::ToolExecutor;
 use std::sync::Arc;
 
-/// 工具执行级中间件：以装饰器方式组合 `ports::ToolExecutor`（鉴权/审计等）。
+/// Tool execution-level middleware: composes `ports::ToolExecutor` via decorators (auth/audit, etc.).
 ///
-/// `wrap(inner)` 返回一个包装后的 executor；多层中间件通过嵌套 `wrap` 形成
-/// 洋葱链，与 `RequestMiddleware` / `ports::llm::LoggingLlmClient` 的装饰器
-/// 模式一致：
-/// - 装饰后的 executor 是普通 `ToolExecutor`，可跨多次 execute 复用；
-/// - 鉴权失败可直接短路返回，不调用 inner；
-/// - 审计在调用 `inner.execute(app, calls)` 前后记录。
+/// `wrap(inner)` returns a wrapped executor; multiple middleware layers form an
+/// onion chain via nested `wrap` calls, matching the decorator pattern used by
+/// `RequestMiddleware` / `ports::llm::LoggingLlmClient`:
+/// - The decorated executor is a regular `ToolExecutor` reusable across multiple execute calls;
+/// - Auth failures short-circuit and return without calling inner;
+/// - Auditing happens before and after calling `inner.execute(app, calls)`.
 pub trait ToolMiddleware: Send + Sync {
     fn name(&self) -> &'static str;
 
-    /// 将 `inner` 装饰为一个新的 `ToolExecutor`。实现方在 `execute` 中：
-    /// - 前置校验（鉴权）：失败直接返回，不调用 inner；
-    /// - 后置处理（审计/指标）：在调用 `inner.execute(app, calls)` 后记录。
+    /// Decorates `inner` into a new `ToolExecutor`. Implementations, inside `execute`:
+    /// - Pre-checks (auth): return immediately on failure without calling inner;
+    /// - Post-processing (audit/metrics): record after calling `inner.execute(app, calls)`.
     fn wrap(&self, inner: Box<dyn ToolExecutor>) -> Box<dyn ToolExecutor>;
 }
 
-/// 将 `Vec<Arc<dyn ToolMiddleware>>` 折叠为单一 `ToolExecutor`。
+/// Folds a `Vec<Arc<dyn ToolMiddleware>>` into a single `ToolExecutor`.
 ///
-/// - `middlewares[0]` 为最外层，与 `RequestMiddleware` 的 `build_llm_client_chain` 保持一致；
-/// - 空 `middlewares` 时直接返回 `inner`（零开销默认路径）；
-/// - 返回的 executor 可跨多次 `execute` 复用，语义与手动 `wrap` 嵌套等价：
-///   `build_tool_executor_chain(vec![m1,m2], inner) == m1.wrap(m2.wrap(inner))`。
+/// - `middlewares[0]` is the outermost, consistent with `RequestMiddleware`'s `build_llm_client_chain`;
+/// - An empty `middlewares` returns `inner` directly (zero-cost default path);
+/// - The returned executor is reusable across multiple `execute` calls, semantically
+///   equivalent to manual `wrap` nesting: `build_tool_executor_chain(vec![m1,m2], inner) == m1.wrap(m2.wrap(inner))`.
 pub(crate) fn build_tool_executor_chain(
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     inner: Box<dyn ToolExecutor>,
@@ -63,7 +63,7 @@ mod tests {
         }]
     }
 
-    /// 计数 executor：记录调用次数并返回空成功结果。
+    /// Counting executor: records the number of calls and returns an empty successful result.
     struct CountingExecutor {
         calls: Arc<AtomicUsize>,
     }
@@ -74,7 +74,7 @@ mod tests {
         }
     }
 
-    /// 计数中间件：每次 execute 递增计数并委托 inner（模拟审计层）。
+    /// Counting middleware: increments a counter on each execute and delegates to inner (simulating an audit layer).
     struct CountingMiddleware {
         calls: Arc<AtomicUsize>,
     }
@@ -99,7 +99,7 @@ mod tests {
         }
     }
 
-    /// 鉴权短路中间件：直接返回错误，不调用 inner。
+    /// Auth short-circuit middleware: returns an error directly without calling inner.
     struct AuthMiddleware;
     impl ToolMiddleware for AuthMiddleware {
         fn name(&self) -> &'static str { "auth" }
@@ -114,13 +114,13 @@ mod tests {
         }
     }
 
-    /// 多层装饰链可组合，且装饰后的 executor 可跨多次 execute 复用。
+    /// A multi-layer decorator chain composes, and the decorated executor is reusable across multiple execute calls.
     #[tokio::test]
     async fn decorator_chain_composes_and_reuses() {
         let inner_calls = Arc::new(AtomicUsize::new(0));
         let outer_calls = Arc::new(AtomicUsize::new(0));
 
-        // 外层计数 -> 内层计数 -> 真实 executor 的洋葱链
+        // Onion chain: outer counter -> inner counter -> real executor
         let executor: Box<dyn ToolExecutor> = CountingMiddleware { calls: Arc::clone(&outer_calls) }
             .wrap(CountingMiddleware { calls: Arc::clone(&inner_calls) }
                 .wrap(Box::new(CountingExecutor { calls: Arc::clone(&inner_calls) })));
@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(inner_calls.load(Ordering::SeqCst), 4, "内层中间件与真实 executor 各被调用 2 次");
     }
 
-    /// 鉴权短路中间件不调用 inner。
+    /// Auth short-circuit middleware does not call inner.
     #[tokio::test]
     async fn auth_middleware_skips_inner() {
         let inner_calls = Arc::new(AtomicUsize::new(0));

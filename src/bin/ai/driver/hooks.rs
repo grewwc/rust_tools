@@ -1,20 +1,21 @@
-//! 生命周期钩子（lifecycle hooks）。
+//! Lifecycle hooks.
 //!
-//! 用户可在 ~/.configW 配置中为以下事件挂载任意 shell 命令：
+//! Users can attach arbitrary shell commands to the following events in the ~/.configW config:
 //! - `ai.hooks.on_turn_start` / `ai.hooks.on_turn_end`
 //! - `ai.hooks.before_tool`   / `ai.hooks.after_tool`
 //! - `ai.hooks.on_session_end`
 //!
-//! 钩子以「尽力而为」方式执行：未配置时零开销；执行失败仅打印告警，绝不
-//! 中断主流程。由于底层 `RunCmdOptions` 不支持注入环境变量，这里把事件上下文
-//! 通过一段安全转义的 `export VAR='...'` 前缀拼到用户命令前面。
+//! Hooks run best-effort: zero overhead when unconfigured; a failure only
+//! prints a warning and never interrupts the main flow. Since the underlying
+//! `RunCmdOptions` cannot inject environment variables, the event context is
+//! prepended to the user command as a safely escaped `export VAR='...'` prefix.
 
 use crate::ai::config_schema::AiConfig;
 
-/// 钩子默认超时（秒）。
+/// Default hook timeout (seconds).
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
-/// 生命周期事件。`as_event_str` 同时作为传给钩子的 `AI_HOOK_EVENT` 值。
+/// Lifecycle event. `as_event_str` also serves as the `AI_HOOK_EVENT` value passed to hooks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HookEvent {
     TurnStart,
@@ -46,10 +47,10 @@ impl HookEvent {
     }
 }
 
-/// 触发某个生命周期事件对应的钩子。未配置则直接返回（零开销）。
+/// Fire the hook for a lifecycle event. Returns immediately when unconfigured (zero overhead).
 ///
-/// - `tool_name`: 仅 before/after tool 事件有意义，作为 `AI_TOOL_NAME`。
-/// - `tool_ok`:   仅 after tool 事件有意义，作为 `AI_TOOL_OK`（`true`/`false`）。
+/// - `tool_name`: only meaningful for before/after tool events; passed as `AI_TOOL_NAME`.
+/// - `tool_ok`:   only meaningful for after tool events; passed as `AI_TOOL_OK` (`true`/`false`).
 pub fn run_lifecycle_hook(event: HookEvent, tool_name: Option<&str>, tool_ok: Option<bool>) {
     let cfg = crate::commonw::configw::get_all_config();
     let command = cfg.get(event.config_key(), "");
@@ -68,7 +69,7 @@ pub fn run_lifecycle_hook(event: HookEvent, tool_name: Option<&str>, tool_ok: Op
 
     let full_command = build_hook_command(event, tool_name, tool_ok, command);
 
-    // 在 effective_cwd 下执行，与工具/命令保持一致的工作目录语义。
+    // Run under effective_cwd to keep the same working-directory semantics as tools/commands.
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
@@ -93,8 +94,8 @@ pub fn run_lifecycle_hook(event: HookEvent, tool_name: Option<&str>, tool_ok: Op
     }
 }
 
-/// 构造最终交给 shell 的命令：先 `export` 上下文变量（安全单引号转义），
-/// 再追加用户命令。
+/// Build the final command handed to the shell: first `export` the context
+/// variables (safe single-quote escaping), then append the user command.
 fn build_hook_command(
     event: HookEvent,
     tool_name: Option<&str>,
@@ -122,8 +123,8 @@ fn build_hook_command(
     prelude
 }
 
-/// 用单引号安全包裹字符串，使其作为单个 shell 字面量。
-/// 单引号本身用 `'\''` 序列转义。
+/// Safely wrap a string in single quotes so it is a single shell literal.
+/// A single quote itself is escaped with the `'\''` sequence.
 fn shell_single_quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
@@ -155,7 +156,7 @@ mod tests {
 
     #[test]
     fn shell_single_quote_neutralizes_injection() {
-        // 试图注入的 `; rm -rf /` 必须整体落在引号内，不能逃逸。
+        // An attempted injection like `; rm -rf /` must stay fully inside the quotes and cannot escape.
         let quoted = shell_single_quote("x; rm -rf /");
         assert_eq!(quoted, "'x; rm -rf /'");
     }

@@ -63,16 +63,17 @@ pub(crate) use types::{
     StreamUsage, merge_reasoning_fragments,
 };
 pub(in crate::ai) use wire_parse::{ParsedStreamPayload, try_parse_stream_chunk_loose};
-// 外部 re-export（build_content 被 driver 多处调用）
+// External re-exports (build_content is called from several places in the driver)
 #[allow(unused_imports)]
 pub(crate) use builder::{build_content, clamp_max_tokens_for_prompt};
 
-// 传输层：HTTP 请求发送、重试、超时、鉴权
+// Transport layer: HTTP request sending, retry, timeout, auth
 pub use transport::{do_request_json, do_request_text_streaming};
 pub(super) use transport::{do_request_messages, do_request_messages_without_tools, print_info};
 
-// ── 以下 private use 仅供 `tests` 子模块通过 `use super::*;` 访问 ──
-// 函数体已迁移至 `transport.rs`，mod.rs 本身不再直接使用这些项。
+// The private use statements below exist only for the `tests` submodule to
+// access via `use super::*;`. The function bodies have moved to `transport.rs`;
+// mod.rs itself no longer uses these items directly.
 #[cfg(test)]
 #[allow(unused_imports)]
 use std::time::{Duration, Instant};

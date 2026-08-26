@@ -1,40 +1,46 @@
 // =============================================================================
-// HistoryStore - 历史存储端口（依赖倒置）
+// HistoryStore - history storage port (dependency inversion)
 // =============================================================================
-// 之前 driver 直接调用 `crate::ai::history::{blob, sqlite::*}` 的具体函数，
-// 无法插入审计/加密/mock 等横切逻辑。现通过 trait 解耦，driver 只依赖抽象。
+// Previously the driver called concrete functions in `crate::ai::history::{blob, sqlite::*}`
+// directly, making it impossible to insert cross-cutting logic such as audit/encryption/mock.
+// Decoupled via a trait now; the driver depends only on the abstraction.
 use std::{io, path::{Path, PathBuf}};
 
 use crate::ai::history::Message;
 
 // =============================================================================
-// Compressor - 历史压缩策略端口（可插拔）
+// Compressor - history compression strategy port (pluggable)
 // =============================================================================
-/// 可插拔压缩器：将已加载的 messages 按预算裁剪/摘要。
-/// 默认实现委托现有 `history::compress` 逻辑，Noop 实现用于测试/旁路。
-/// 该 trait 设计为对象安全，支持 `Box<dyn Compressor>` 注入。
+/// Pluggable compressor: trims/summarizes the loaded messages to fit a budget.
+/// The default implementation delegates to the existing `history::compress` logic; the Noop
+/// implementation is used for tests/bypass. Object-safe, so it supports `Box<dyn Compressor>`
+/// injection.
 pub(crate) trait Compressor: Send + Sync {
     fn compress(&self, messages: Vec<Message>, max_chars: usize, keep_last: usize) -> Vec<Message>;
     fn name(&self) -> &str;
 }
 
-/// 默认压缩器：委托现有 `history::compress_messages_for_context`（summary=0 简化版）。
-/// 零行为变更默认路径仍走 `HistoryStore::build_context`，此实现仅在显式注入时生效；
-/// 如需完整 summary/overflow 能力，可在调用侧构造携带额外参数的自定义 Compressor。
+/// Default compressor: delegates to the existing `history::compress_messages_for_context` (the
+/// summary=0 simplified variant). Zero behavior change: the default path still goes through
+/// `HistoryStore::build_context`; this implementation only takes effect when explicitly injected.
+/// For full summary/overflow support, build a custom Compressor with extra parameters on the
+/// calling side.
 pub(crate) struct DefaultCompressor;
 impl Compressor for DefaultCompressor {
     fn compress(&self, messages: Vec<Message>, max_chars: usize, keep_last: usize) -> Vec<Message> {
         if max_chars == 0 || messages.is_empty() {
             return messages;
         }
-        // 透传到现有压缩逻辑（summary_max_chars=0, 无 overflow 归档），保持与硬编码路径语义一致；
-        // 完整路径仍由 HistoryStore::build_context 负责，零行为变更。
+        // Forward to the existing compression logic (summary_max_chars=0, no overflow archiving),
+        // keeping semantics identical to the hardcoded path; the full path is still owned by
+        // HistoryStore::build_context, with zero behavior change.
         crate::ai::history::compress_messages_for_context(messages, max_chars, keep_last, 0, None, None)
     }
     fn name(&self) -> &str { "default" }
 }
 
-/// 空操作压缩器：原样返回，不做任何裁剪/摘要，用于测试或禁用压缩。
+/// No-op compressor: returns messages as-is without trimming or summarizing, used in tests or to
+/// disable compression.
 pub(crate) struct NoopCompressor;
 impl Compressor for NoopCompressor {
     fn compress(&self, messages: Vec<Message>, _max_chars: usize, _keep_last: usize) -> Vec<Message> {
@@ -43,12 +49,14 @@ impl Compressor for NoopCompressor {
     fn name(&self) -> &str { "noop" }
 }
 
-/// 历史存储端口：对象安全、最小化、不泄露 SQLite/文本双后端细节。
-/// 保持 `pub(crate)` 以避免将内部 `RequestError` 等私有类型泄露到公共 API。
+/// History storage port: object-safe, minimal, and does not leak SQLite/text dual-backend
+/// details. Kept `pub(crate)` to avoid leaking private types such as the internal `RequestError`
+/// into the public API.
 pub(crate) trait HistoryStore: Send + Sync {
-    /// 读取可发送给模型的上下文投影（已做压缩、裁剪、溢出归档）。
-    /// `cwd` 用于相对路径的 overflow archive 复用判定；不可用时传 `None`
-    /// （与底层 `build_context_history` 的 `cwd: Option<&Path>` 契约一致）。
+    /// Reads the context projection that can be sent to the model (already compressed, trimmed,
+    /// and overflow-archived). `cwd` is used to decide overflow-archive reuse for relative
+    /// paths; pass `None` when unavailable (consistent with the `cwd: Option<&Path>` contract of
+    /// the underlying `build_context_history`).
     fn build_context(
         &self,
         history_count: usize,
@@ -60,9 +68,10 @@ pub(crate) trait HistoryStore: Send + Sync {
         cwd: Option<&Path>,
     ) -> io::Result<Vec<Message>>;
 
-    /// 可插拔压缩变体：允许调用方注入 `Compressor` 策略。
-    /// 默认实现保持向后兼容——忽略 compressor 透传到 `build_context`，保证零行为变更。
-    /// 具体 `HistoryStore` 可重写此方法以真正应用 `compressor.compress`。
+    /// Pluggable compression variant: lets the caller inject a `Compressor` strategy.
+    /// The default implementation stays backward compatible - it ignores the compressor and
+    /// forwards to `build_context`, guaranteeing zero behavior change. Concrete `HistoryStore`
+    /// implementations can override this method to actually apply `compressor.compress`.
     fn build_context_with_compressor(
         &self,
         history_count: usize,
@@ -86,7 +95,7 @@ pub(crate) trait HistoryStore: Send + Sync {
         )
     }
 
-    /// `Box<dyn Compressor>` 便捷重载，便于 `Pipeline` 中按所有权注入。
+    /// Convenience overload taking `Box<dyn Compressor>`, so `Pipeline` can inject it by ownership.
     fn build_context_with_boxed_compressor(
         &self,
         history_count: usize,
@@ -110,11 +119,12 @@ pub(crate) trait HistoryStore: Send + Sync {
         )
     }
 
-    /// 追加消息到 canonical 历史（原子写 + 溢出归档）。
+    /// Appends messages to the canonical history (atomic write + overflow archiving).
     fn append_messages(&self, history_file: &Path, msgs: &[Message]) -> io::Result<()>;
 
-    /// 模型感知的追加：sqlite 后端额外记录 source_model 溯源。
-    /// 默认实现退化到 `append_messages`，对不关心模型溯源的自定义 store 零破坏。
+    /// Model-aware append: the sqlite backend additionally records source_model provenance.
+    /// The default implementation degrades to `append_messages`, with zero breakage for custom
+    /// stores that do not care about model provenance.
     fn append_messages_for_model(
         &self,
         history_file: &Path,
@@ -125,11 +135,12 @@ pub(crate) trait HistoryStore: Send + Sync {
         self.append_messages(history_file, msgs)
     }
 
-    /// 加载原始历史（用于调试 / 重播）。
+    /// Loads raw history (for debugging / replay).
     fn load_messages(&self, history_file: &Path) -> io::Result<Vec<Message>>;
 }
 
-/// 默认实现：委托给现有 `history` 模块的具体函数，保持行为 100% 一致。
+/// Default implementation: delegates to the concrete functions in the existing `history` module,
+/// keeping behavior 100% identical.
 pub(crate) struct DefaultHistoryStore;
 
 impl HistoryStore for DefaultHistoryStore {
@@ -153,7 +164,8 @@ impl HistoryStore for DefaultHistoryStore {
             cwd,
         )
         .map_err(|e| {
-            // 保留原始 io::ErrorKind（如 WouldBlock）以支持 snapshot 重试等上层逻辑
+            // Preserve the original io::ErrorKind (e.g. WouldBlock) so upper layers can retry
+            // snapshots and similar operations.
             if e.is::<io::Error>() {
                 match e.downcast::<io::Error>() {
                     Ok(io_err) => *io_err,
@@ -176,11 +188,13 @@ impl HistoryStore for DefaultHistoryStore {
         _cwd: Option<&Path>,
         compressor: &dyn Compressor,
     ) -> io::Result<Vec<Message>> {
-        // 演示“真正插拔”：先加载原始历史，再委派 compressor。
-        // 与 `build_context` 的完整 sqlite+snapshop+cache 路径不同，此路径用于
-        // pipeline/测试中显式注入策略；默认业务仍走 `build_context`，零行为变更。
-        // 为避免与 cache 语义冲突，这里不走 `build_context_history` 的 cache，直接读取。
-        let _ = history_count; // 可插拔路径不按 history_count 截断，压缩器自行按 keep_last 决策
+        // Demonstrate "real pluggability": load the raw history first, then delegate to the
+        // compressor. Unlike the full sqlite+snapshot+cache path in `build_context`, this path
+        // is used when a strategy is explicitly injected from pipeline/tests; production behavior
+        // still goes through `build_context`, with zero behavior change.
+        // To avoid conflicting with cache semantics, this path bypasses `build_context_history`'s
+        // cache and reads directly.
+        let _ = history_count; // the pluggable path does not truncate by history_count; the compressor decides via keep_last
         let messages = self.load_messages(history_file)?;
         Ok(compressor.compress(messages, history_max_chars, history_keep_last))
     }
@@ -195,13 +209,15 @@ impl HistoryStore for DefaultHistoryStore {
         msgs: &[Message],
         source_model: &str,
     ) -> io::Result<()> {
-        // sqlite 后端把 source_model 写入 meta 列（模型溯源）；blob 后端退化到普通追加。
+        // The sqlite backend writes source_model into the meta column (model provenance); the
+        // blob backend degrades to a plain append.
         crate::ai::history::append_history_messages_for_model(history_file, msgs, source_model)
     }
 
     fn load_messages(&self, history_file: &Path) -> io::Result<Vec<Message>> {
-        // 正确分发 sqlite / blob 双后端（通过 build_message_arr 内部的 is_sqlite_path 判定），
-        // 避免将 sqlite 二进制用 read_to_string 静默丢弃为 empty。
+        // Dispatch correctly between the sqlite / blob backends (decided by is_sqlite_path inside
+        // build_message_arr), avoiding silent data loss when read_to_string would empty the
+        // sqlite binary.
         crate::ai::history::build_message_arr(usize::MAX, history_file).map_err(|e| {
             if e.is::<io::Error>() {
                 match e.downcast::<io::Error>() {
@@ -215,7 +231,7 @@ impl HistoryStore for DefaultHistoryStore {
     }
 }
 
-/// 内存实现：用于测试 / 中间件单测，不触及文件系统。
+/// In-memory implementation: used in tests / middleware unit tests; never touches the filesystem.
 #[cfg(test)]
 pub(crate) struct InMemoryHistoryStore {
     pub(crate) messages: std::sync::Mutex<Vec<Message>>,
@@ -261,8 +277,9 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }];
-        // Step 6：trait 默认实现忽略 source_model、退化到 `append_messages`，
-        // 对不关心模型溯源的自定义 store 零破坏。
+        // Step 6: the trait's default implementation ignores source_model and degrades to
+        // `append_messages`, with zero breakage for custom stores that do not care about model
+        // provenance.
         store
             .append_messages_for_model(Path::new("unused"), &msgs, "some-model")
             .unwrap();

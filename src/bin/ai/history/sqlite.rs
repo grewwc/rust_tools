@@ -33,19 +33,22 @@ const LAST_ACTIVITY_META_KEY: &str = "last_activity_unix_ms";
 static SESSION_STATE_LOCKS: LazyLock<Mutex<FxHashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
-// 每个工作线程缓存一个最近打开的 history 连接，避免每次 read/write 都
-// `Connection::open` + PRAGMA 初始化，并让 `prepare_cached` 的语句缓存
-// 真正跨调用复用。
+// Each worker thread caches its most recently opened history connection so that
+// every read/write avoids `Connection::open` + PRAGMA setup, and so that
+// `prepare_cached`'s statement cache is genuinely reused across calls.
 //
-// 安全性：
-// - `thread_local` 保证连接只在所属线程上被访问，`Connection` 不是 `Sync`
-//   也因此不会被并发使用。
-// - 读取路径本身不持有 per-session `Mutex`（并发 writer 仍会通过各自连接写入），
-//   但每次读取都新开一个 `conn.transaction()` 并在同一调用内 commit：WAL 的
-//   per-transaction 快照因此始终读到最新已提交状态，复用连接不会读到陈旧数据。
-// - `(dev, ino, len)` 指纹只负责一件事：在复用前校验底层文件未被 rename/replace
-//   整体替换。文件替换操作（rollback/compact/reset）会改变 inode，此时丢弃旧
-//   连接、重新打开，语义与每次新开连接完全一致。
+// Safety:
+// - `thread_local` guarantees the connection is only accessed from its owning
+//   thread; `Connection` is not `Sync` and is therefore never used concurrently.
+// - Read paths do not hold the per-session `Mutex` (concurrent writers still write
+//   through their own connections), but every read opens a fresh
+//   `conn.transaction()` and commits within the same call: WAL's per-transaction
+//   snapshot always sees the latest committed state, so a reused connection never
+//   reads stale data.
+// - The `(dev, ino, len)` fingerprint has a single job: verify before reuse that
+//   the underlying file was not renamed/replaced wholesale. File replacement
+//   operations (rollback/compact/reset) change the inode, in which case we drop
+//   the old connection and reopen, matching the semantics of opening a fresh one.
 thread_local! {
     static CACHED_HISTORY_CONN: RefCell<Option<CachedHistoryConn>> = const { RefCell::new(None) };
 }
@@ -82,17 +85,23 @@ fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
     }
 }
 
-/// history_revision 的进程内缓存：指纹 (主库 len/mtime, WAL sidecar len/mtime) 失效。
+/// In-process cache of `history_revision`, invalidated by file metadata
+/// fingerprints (main DB len/mtime, WAL sidecar len/mtime).
 ///
-/// `read_history_revision` 每次调用都 `Connection::open` + SQL 查询（每轮上下文
-/// 缓存校验 + session 列表刷新会调用多次），而 revision 只在消息写入时才变化。
-/// 这里用文件元数据指纹缓存结果：本进程/外部进程写入都会改变主库或 WAL sidecar
-/// 的 len/mtime，指纹失配即重查，语义与无缓存一致。
+/// `read_history_revision` runs `Connection::open` + an SQL query on every call
+/// (per-turn context cache validation + session list refresh call it several
+/// times), yet the revision only changes when messages are written. We therefore
+/// cache the result keyed by file metadata fingerprints: any write from this
+/// process or an external one changes the len/mtime of the main DB or the WAL
+/// sidecar, so a fingerprint mismatch triggers a re-query, with semantics
+/// identical to having no cache.
 ///
-/// **WAL 关键**：history DB 启用 WAL 模式，提交只写 `-wal` sidecar，主库
-/// len/mtime 在 checkpoint 前可以完全不变。若指纹仅覆盖主库，有存活连接时
-/// 缓存会持续返回旧 revision，破坏 `history_revision` 作为跨连接信号的语义。
-/// 因此指纹同时覆盖主库和 `-wal` sidecar，任一变化即失效。
+/// **WAL is critical**: the history DB runs in WAL mode, so commits only touch the
+/// `-wal` sidecar and the main DB len/mtime can stay unchanged before a checkpoint.
+/// If the fingerprint covered only the main DB, the cache would keep returning the
+/// old revision while a live connection exists, breaking `history_revision`'s role
+/// as a cross-connection signal. The fingerprint therefore covers both the main DB
+/// and the `-wal` sidecar; a change in either invalidates it.
 static HISTORY_REVISION_CACHE: LazyLock<
     Mutex<FxHashMap<PathBuf, (((u64, Option<SystemTime>), (u64, Option<SystemTime>)), i64)>>,
 > = LazyLock::new(|| Mutex::new(FxHashMap::default()));
@@ -101,8 +110,9 @@ fn history_file_fingerprint(path: &Path) -> ((u64, Option<SystemTime>), (u64, Op
     let main = std::fs::metadata(path)
         .map(|m| (m.len(), m.modified().ok()))
         .unwrap_or((0, None));
-    // WAL 模式下提交先落 `-wal` sidecar，主库 mtime 在 checkpoint 前不变；
-    // 将 sidecar 元数据纳入指纹，确保未 checkpoint 的写入也能触发缓存失效。
+    // In WAL mode commits land in the `-wal` sidecar first and the main DB mtime
+    // does not change before a checkpoint; including the sidecar metadata in the
+    // fingerprint ensures uncheckpointed writes still invalidate the cache.
     let wal_path = PathBuf::from(format!("{}-wal", path.display()));
     let wal = std::fs::metadata(&wal_path)
         .map(|m| (m.len(), m.modified().ok()))
@@ -126,13 +136,16 @@ pub(super) fn delete_session_state_lock(path: &Path) -> io::Result<()> {
     }
 }
 
-/// 回收 [`SESSION_STATE_LOCKS`] 中某路径的 per-path 锁条目。
+/// Reclaims a path's per-path lock entry from [`SESSION_STATE_LOCKS`].
 ///
-/// 子代理历史文件按 pid / task_id 唯一，若只删磁盘 `.state.lock` 文件而不回收
-/// 进程内 map 条目，长跑主会话派生大量子代理后 map 会无界增长直到进程退出。
-/// 这里在子代理生命周期结束（`delete_subagent_history`）时清理条目；仅当
-/// `Arc::strong_count == 1`（无其他线程正持有该锁的克隆）时移除，避免摘除一把
-/// 正在被 `with_session_state_lock` 使用的锁，从而破坏该路径的互斥语义。
+/// Subagent history files are unique per pid / task_id; if we only deleted the
+/// on-disk `.state.lock` file without reclaiming the in-process map entry, the map
+/// would grow without bound until process exit after a long-lived main session
+/// spawns many subagents. The entry is cleaned up when the subagent lifecycle ends
+/// (`delete_subagent_history`); it is removed only when `Arc::strong_count == 1`
+/// (no other thread still holds a clone of the lock), so we never yank a lock that
+/// `with_session_state_lock` is currently using and break mutual exclusion for
+/// that path.
 pub(super) fn remove_session_state_lock_entry(path: &Path) {
     let mut locks = SESSION_STATE_LOCKS.lock().unwrap_or_else(|poison| {
         warn_session_lock_poison(path, "history lock registry");
@@ -145,8 +158,10 @@ pub(super) fn remove_session_state_lock_entry(path: &Path) {
     }
 }
 
-/// 将会替换整个 live SQLite 文件的 rollback 与常规 canonical writer 串行化。
-/// 进程内 mutex 避免同进程线程间 `flock` 语义差异，文件锁负责跨进程互斥。
+/// Serializes rollbacks that replace the entire live SQLite file against the
+/// regular canonical writer. The in-process mutex avoids `flock` semantic
+/// differences between threads of the same process; the file lock handles
+/// cross-process mutual exclusion.
 pub(super) fn with_session_state_lock<T>(
     path: &Path,
     operation: impl FnOnce() -> io::Result<T>,
@@ -189,10 +204,11 @@ pub(super) fn with_session_state_lock<T>(
     result
 }
 
-/// 锁中毒意味着此前持锁线程在持有进程内 history 锁时 panic。
-/// 磁盘上的跨进程 `flock` 与 SQLite 事务仍是真实的安全边界，因此这里
-/// 继续恢复执行（保持原有语义），但不再静默：打印一次性告警，便于排查
-/// 导致 panic 的上游缺陷。
+/// A poisoned lock means a previous holder panicked while holding the in-process
+/// history lock. The on-disk cross-process `flock` and the SQLite transaction are
+/// still real safety boundaries, so we keep recovering here (preserving the
+/// original semantics), but no longer silently: a one-time warning is printed to
+/// help investigate the upstream defect that caused the panic.
 fn warn_session_lock_poison(path: &Path, which: &str) {
     eprintln!(
         "[Warning] {} was poisoned (a previous holder panicked). \
@@ -221,8 +237,9 @@ fn wait_for_session_state_lock(path: &Path, deadline: Instant) -> io::Result<()>
     Ok(())
 }
 
-/// 与 [`with_session_state_lock`] 相同，但把进程内 mutex 与跨进程 flock
-/// 一并限制在调用方给定的截止时间内，供短超时重试路径使用。
+/// Same as [`with_session_state_lock`], but bounds both the in-process mutex and
+/// the cross-process flock by the caller-supplied deadline, for short-timeout
+/// retry paths.
 fn with_session_state_lock_until<T>(
     path: &Path,
     deadline: Instant,
@@ -273,7 +290,8 @@ fn with_session_state_lock_until<T>(
         .open(lock_path)?;
     #[cfg(unix)]
     loop {
-        // SAFETY: `lock_file` 在整个临界区内保持打开，drop 时内核自动释放 flock。
+        // SAFETY: `lock_file` stays open for the whole critical section; the kernel
+        // releases the flock automatically when it is dropped.
         let status = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if status == 0 {
             break;
@@ -291,9 +309,11 @@ fn with_session_state_lock_until<T>(
     operation()
 }
 
-/// 模型实际请求所消费的可重建上下文。`messages` 永远是唯一的原始会话记录；
-/// 这里的消息只是一次压缩快照，加上 `source_message_id` 之后的新原始消息即可
-/// 重建当前上下文。`canonical_generation` 用于拒绝并发 rewind/clear 后的陈旧快照。
+/// The rebuildable context consumed by the model's actual request. `messages` is
+/// always the one canonical record of the session; the messages here are only a
+/// compression snapshot, and adding the raw messages after `source_message_id`
+/// rebuilds the current context. `canonical_generation` rejects stale snapshots
+/// produced by a concurrent rewind/clear.
 pub(in crate::ai) struct ContextHistory {
     pub(in crate::ai) messages: Vec<Message>,
     pub(in crate::ai) source_message_id: i64,
@@ -307,7 +327,7 @@ pub(in crate::ai) struct RecentTurnWindow {
     pub(in crate::ai) has_older_messages: bool,
 }
 
-/// `/ss` 列表展示所需的轻量元数据。
+/// Lightweight metadata needed for the `/ss` list display.
 pub(in crate::ai) struct SessionListMetadata {
     pub(in crate::ai) first_user_prompt: Option<String>,
     pub(in crate::ai) session_title: Option<String>,
@@ -326,11 +346,13 @@ fn open_history_db_with_busy_timeout(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // 本函数是同步的，且会被 async 调用者（compaction 的读/写路径）经 `?` 复用。
-    // 因此这里绝不做同步 sleep 重试 —— 那会阻塞 tokio worker。瞬时 I/O 失败
-    // （如并发首开 WAL 时的 SQLITE_IOERR_FSTAT）统一以 `WouldBlock` 返回，交给
-    // async 调用点的非阻塞重试循环（`tokio::time::sleep`）处理；纯同步调用点则
-    // 依赖 SQLite 自身的 busy_timeout。非瞬时错误按原语义直接上抛。
+    // This function is synchronous and is reused via `?` by async callers (the
+    // compaction read/write paths). It must therefore never retry with a blocking
+    // sleep — that would stall a tokio worker. Transient I/O failures (such as
+    // SQLITE_IOERR_FSTAT when concurrently opening the WAL for the first time) are
+    // uniformly reported as `WouldBlock` and left to the async call site's
+    // non-blocking retry loop (`tokio::time::sleep`); purely synchronous call sites
+    // rely on SQLite's own busy_timeout. Non-transient errors propagate unchanged.
     try_open_history_db(path, busy_timeout)
 }
 
@@ -348,12 +370,15 @@ fn fresh_connection(path: &Path, busy_timeout: Duration) -> Result<Connection, i
     Ok(conn)
 }
 
-/// 在缓存的 history 连接上执行一个只读操作。连接按线程缓存，并在底层文件
-/// inode/大小变化（rollback/compact/reset 等替换操作）时自动重连，语义与
-/// 每次新开连接一致，但省掉了每轮 turn 的 open + PRAGMA 与语句重编译开销。
+/// Runs a read-only operation on a cached history connection. Connections are
+/// cached per thread and automatically reconnected when the underlying file's
+/// inode/size changes (rollback/compact/reset and other replacement operations),
+/// giving the same semantics as opening a fresh connection each time while saving
+/// the per-turn open + PRAGMA and statement recompilation costs.
 ///
-/// 注意：返回的借用数据不能逃逸出闭包（`Connection` 不是 `Sync`，且连接
-/// 归 thread_local 所有）。仅用于热路径只读查询。
+/// Note: borrowed data must not escape the closure (`Connection` is not `Sync`
+/// and is owned by the thread_local). Intended only for hot-path read-only
+/// queries.
 fn with_cached_read_conn<T>(
     path: &Path,
     busy_timeout: Duration,
@@ -421,7 +446,8 @@ fn sqlite_error(path: &Path, operation: &str, error: RusqliteError) -> io::Error
     io::Error::new(kind, detail)
 }
 
-/// 会话列表只读元数据，不能因枚举而创建目录、初始化数据库或切换 journal mode。
+/// Read-only metadata for the session list; enumerating must not create
+/// directories, initialize the database, or switch the journal mode.
 fn open_history_db_read_only(path: &Path) -> Result<Connection, io::Error> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -488,7 +514,8 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
     add_column_if_missing(conn, "messages", "tool_call_id", "TEXT")?;
     add_column_if_missing(conn, "messages", "reasoning_content", "TEXT")?;
     add_column_if_missing(conn, "messages", "source_model", "TEXT")?;
-    // 旧快照无法证明符合当前投影策略，空 fingerprint 会让读取路径安全地忽略它。
+    // An old snapshot cannot prove it matches the current projection policy; an
+    // empty fingerprint lets the read path safely ignore it.
     add_column_if_missing(
         conn,
         "context_snapshot",
@@ -512,18 +539,24 @@ fn add_column_if_missing(
     }
 }
 
-/// 读取 history DB 的写入版本号（存于 meta 表 key='history_revision'）。
-/// 每次消息写入/删除/替换都会在同一事务内 `bump_history_revision` 递增该值，
-/// 因此它是一个**跨连接**单调递增的全局信号，可靠地反映"库内容是否变化"。
+/// Reads the history DB's write version (stored in the meta table under
+/// key='history_revision'). Every message write/delete/replace increments it via
+/// `bump_history_revision` in the same transaction, so it is a **cross-connection**
+/// monotonically increasing global signal that reliably reflects "did the DB
+/// content change".
 ///
-/// 不能用 `PRAGMA data_version` 代替：它是**连接局部**的比较值——每个新开的
-/// `Connection` 只把它当作"自本连接打开以来是否被其他连接改过"的基准，新连接
-/// 读到的初值不随外部写入而变（实测新连接恒返回 2），因此无法作为跨连接缓存
-/// 失效依据。缺失（老库尚未写入过 revision）时返回 0，与"从未修改"一致。
+/// `PRAGMA data_version` cannot replace it: it is a **connection-local** comparison
+/// value — each freshly opened `Connection` treats it only as "has the DB been
+/// changed by another connection since I opened", and a new connection's initial
+/// reading does not vary with external writes (a new connection consistently
+/// returns 2 in practice), so it cannot serve as a cross-connection cache
+/// invalidation signal. When the key is missing (an old DB that has never had a
+/// revision written), 0 is returned, consistent with "never modified".
 pub(in crate::ai) fn read_history_revision(path: &Path) -> Option<i64> {
-    // 进程内缓存：指纹 (主库 len/mtime, WAL sidecar len/mtime) 未变即复用上次
-    // 结果，避免每次调用都新开连接 + SQL 查询（每轮上下文缓存校验 / session
-    // 列表刷新高频调用）。
+    // In-process cache: if the fingerprint (main DB len/mtime, WAL sidecar
+    // len/mtime) is unchanged, reuse the previous result instead of opening a
+    // connection + SQL query on every call (context cache validation per turn /
+    // session list refresh call this frequently).
     let fingerprint = history_file_fingerprint(path);
     if let Ok(cache) = HISTORY_REVISION_CACHE.lock() {
         if let Some((cached_fp, rev)) = cache.get(path) {
@@ -533,8 +566,10 @@ pub(in crate::ai) fn read_history_revision(path: &Path) -> Option<i64> {
         }
     }
     let conn = Connection::open(path).ok()?;
-    // meta 表可能尚未创建（全新库）或尚未写入过 revision：两种情况都视为 0
-    // （"从未修改"），保证返回值稳定可比。只有连接本身打不开才返回 None。
+    // The meta table may not exist yet (brand-new DB) or may never have had a
+    // revision written: both cases are treated as 0 ("never modified") so the
+    // return value stays stable and comparable. Only an unopenable connection
+    // yields None.
     let value: Option<i64> = conn
         .query_row(
             "SELECT CAST(value AS INTEGER) FROM meta WHERE key='history_revision' LIMIT 1",
@@ -550,9 +585,9 @@ pub(in crate::ai) fn read_history_revision(path: &Path) -> Option<i64> {
     Some(revision)
 }
 
-/// 清理指定 history 路径的 revision 缓存条目。
-/// 在 history 文件删除或改名时调用，避免缓存随 session/sub-agent 唯一路径
-/// 无限增长。
+/// Removes the revision cache entry for the given history path.
+/// Called when a history file is deleted or renamed, so the cache does not grow
+/// without bound with every unique session/subagent path.
 pub(in crate::ai) fn remove_history_revision_cache_entry(path: &Path) {
     if let Ok(mut cache) = HISTORY_REVISION_CACHE.lock() {
         cache.remove(path);
@@ -566,7 +601,8 @@ pub(in crate::ai) fn history_revision_cache_contains(path: &Path) -> bool {
         .is_ok_and(|cache| cache.contains_key(path))
 }
 
-/// 记录最近一次消息写入时间；同一毫秒内连续写入也保持单调递增。
+/// Records the most recent message write time; consecutive writes within the same
+/// millisecond stay monotonically increasing.
 fn touch_session_activity(conn: &Connection) -> io::Result<()> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -584,7 +620,8 @@ fn touch_session_activity(conn: &Connection) -> io::Result<()> {
     Ok(())
 }
 
-/// 在写事务内递增历史版本，并同步刷新逻辑活动时间。
+/// Increments the history version inside a write transaction and refreshes the
+/// logical activity time in sync.
 fn bump_history_revision(conn: &Connection) -> io::Result<()> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('history_revision', '1')
@@ -607,7 +644,8 @@ fn history_generation(conn: &Connection) -> io::Result<i64> {
     .map_err(|error| io::Error::other(error.to_string()))
 }
 
-/// 任何会重写 canonical messages 的操作都必须使派生快照失效。
+/// Any operation that rewrites the canonical messages must invalidate derived
+/// snapshots.
 fn invalidate_context_snapshot(conn: &Connection) -> io::Result<()> {
     conn.execute("DELETE FROM context_messages", [])
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -622,11 +660,12 @@ fn invalidate_context_snapshot(conn: &Connection) -> io::Result<()> {
     Ok(())
 }
 
-/// 原子预留一个 session 全局 turn 序号。
+/// Atomically reserves a session-global turn sequence number.
 ///
-/// 序号写入 SQLite 元数据而不是保存在进程内存中，因此重启和多个进程并发恢复
-/// 同一 session 时也不会重复。旧 session 首次分配时从已持久化的 user turn 数
-/// 继续编号，兼容此前 `turn_index` 的语义。
+/// The number is stored in SQLite metadata rather than process memory, so restarts
+/// and multiple processes recovering the same session never produce duplicates.
+/// For an existing session the first allocation continues from the persisted
+/// user-turn count, matching the earlier `turn_index` semantics.
 pub(in crate::ai) fn reserve_turn_index_sqlite(path: &Path) -> io::Result<usize> {
     with_session_state_lock(path, || reserve_turn_index_sqlite_unlocked(path))
 }
@@ -668,12 +707,14 @@ fn reserve_turn_index_sqlite_unlocked(path: &Path) -> io::Result<usize> {
     usize::try_from(current).map_err(io::Error::other)
 }
 
-/// 读取回滚前 live 库的三个单调计数器：`history_generation`、
-/// `history_revision`、`turn_seq`。回滚会用 `backup_sqlite` 把 checkpoint 库
-/// 整库覆盖到 live 路径，这会把这三个计数器一起还原成 checkpoint 时刻的旧值，
-/// 破坏"跨回滚单调递增"不变量。本函数在覆盖前读取 live 值，供
-/// `rebase_metadata_after_rollback` 在覆盖后把它们抬高到 live 之上。
-/// 库不存在或 meta 行缺失时对应返回 0，与"从未修改"基准一致。
+/// Reads the live DB's three monotonic counters before a rollback:
+/// `history_generation`, `history_revision`, `turn_seq`. A rollback uses
+/// `backup_sqlite` to overwrite the live path with the whole checkpoint DB, which
+/// would restore all three counters to their old checkpoint-time values and break
+/// the "monotonic across rollbacks" invariant. This function reads the live values
+/// before the overwrite so that
+/// `rebase_metadata_after_rollback` raises them back above the live values after the overwrite.
+/// When the database is missing or the meta row is absent, each counter reads 0, matching the “never modified” baseline.
 pub(in crate::ai) struct LiveRollbackMetadata {
     pub(in crate::ai) generation: i64,
     pub(in crate::ai) revision: i64,
@@ -691,7 +732,7 @@ impl LiveRollbackMetadata {
 }
 
 pub(in crate::ai) fn read_live_rollback_metadata(path: &Path) -> io::Result<LiveRollbackMetadata> {
-    // `Connection::open` 会创建文件，这里只需读取已存在 live 库，缺失时按 0 基准返回。
+    // `Connection::open` would create the file; here we only need to read an existing live DB, falling back to the 0 baseline when it is missing.
     if !path.exists() {
         return Ok(LiveRollbackMetadata::zero());
     }
@@ -735,16 +776,16 @@ pub(in crate::ai) fn read_live_rollback_metadata(path: &Path) -> io::Result<Live
     })
 }
 
-/// 在 `backup_sqlite` 用 checkpoint 覆盖 live 库之后调用：清空派生快照
-/// （canonical 已回退到 checkpoint，旧快照不再匹配），并把三个单调计数器抬高到
-/// 回滚前 live 值之上，保证：
-/// - `history_generation` 严格大于 live 值 -> 任何仍持有旧 generation 的
-///   stale 快照写入会被 fencing 拒绝（`write_context_snapshot_sqlite` 的
-///   generation 比对返回 false）。
-/// - `turn_seq` 不低于 live 值 -> 回滚后新分配的 turn 序号不会复用已用过的序号。
-/// - `history_revision` 严格大于 live 值 -> 跨连接文件缓存能观测到变化并重载。
-/// 全程在一个 Immediate 事务内提交，避免覆盖后留下"已回滚但计数器未抬升"的
-/// 不一致窗口。
+/// Called after `backup_sqlite` overwrites the live DB with a checkpoint: clear the derived snapshots
+/// (canonical has rolled back to the checkpoint, so the old snapshots no longer match), and raise the three monotonic counters
+/// above their pre-rollback live values, guaranteeing:
+/// - `history_generation` is strictly greater than the live value -> any
+///     stale snapshot write still holding an old generation is rejected by fencing (the
+///     generation comparison in `write_context_snapshot_sqlite` returns false).
+/// - `turn_seq` is not lower than the live value -> turn numbers allocated after the rollback never reuse already-used numbers.
+/// - `history_revision` is strictly greater than the live value -> cross-connection file caches observe the change and reload.
+/// Everything commits in a single Immediate transaction, avoiding an inconsistent window of
+/// “rolled back but counters not raised” after the overwrite.
 pub(in crate::ai) fn rebase_metadata_after_rollback(
     path: &Path,
     live_generation: i64,
@@ -756,14 +797,14 @@ pub(in crate::ai) fn rebase_metadata_after_rollback(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    // canonical 已回退，旧派生快照（可能由 checkpoint 时刻的 generation 标记）
-    // 不再匹配，清空以强制下次读取从 canonical 重算。
+    // canonical has rolled back, so the old derived snapshots (possibly tagged with the generation at checkpoint time)
+    // no longer match; clear them to force the next read to recompute from canonical.
     tx.execute("DELETE FROM context_messages", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
     tx.execute("DELETE FROM context_snapshot", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
-    // 各计数器取 MAX(checkpoint 值, live 值) 再 +1（generation/revision 需严格
-    // 递增；turn_seq 取 live 值即可，因为 live 值是"下一个待分配序号"）。
+    // Each counter takes MAX(checkpoint value, live value) then +1 (generation/revision must strictly
+    // increase; turn_seq can simply take the live value, since it is the “next number to allocate”).
     let bump_gen = live_generation.saturating_add(1).max(0);
     let bump_rev = live_revision.saturating_add(1).max(0);
     let bump_turn = live_turn_seq.max(0);
@@ -789,9 +830,9 @@ pub(in crate::ai) fn rebase_metadata_after_rollback(
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
-/// 在 session 状态锁内准备一个已 rebase 的临时库，再通过 Online Backup 的原子
-/// rename 发布到 live 路径。崩溃发生在最终发布前时 live 库保持不变；发布后则元数据
-/// 已完整抬升，不存在“库已回滚但计数器仍是旧值”的中间状态。
+/// Prepare a rebased temporary DB inside the session state lock, then publish it to the live path
+/// via Online Backup's atomic rename. A crash before the final publish leaves the live DB unchanged; after the publish, metadata
+/// is fully raised, so there is no intermediate “DB rolled back but counters still stale” state.
 pub(in crate::ai) fn restore_sqlite_after_rollback(
     checkpoint: &Path,
     live_path: &Path,
@@ -810,8 +851,8 @@ pub(in crate::ai) fn restore_sqlite_after_rollback(
                 live.revision,
                 live.turn_seq,
             )?;
-            // 第二次 backup 会把 working 的 WAL 一并物化到最终临时主库，随后以
-            // 单次 rename 发布，避免只移动主文件而遗漏 rebase 事务。
+            // The second backup materializes the working WAL into the final temporary main DB, then
+            // publishes it with a single rename, so the rebase transaction is not dropped by moving only the main file.
             backup_sqlite(&working, live_path)
         })();
         let _ = fs::remove_file(&working);
@@ -820,10 +861,10 @@ pub(in crate::ai) fn restore_sqlite_after_rollback(
     })
 }
 
-/// 用 SQLite Online Backup API 创建一致快照，并以原子替换的方式写入目标。
-/// 直接复制 WAL 主文件会遗漏尚未 checkpoint 的页；backup API 会从 source 的同一
-/// SQLite 快照读取主库和 WAL。主库替换成功后会移除旧侧车文件，避免旧 WAL/SHM
-/// 与新主库混用。
+/// Create a consistent snapshot with the SQLite Online Backup API and write it to the target via atomic replacement.
+/// Copying the WAL main file directly would miss pages not yet checkpointed; the backup API reads both the main DB and the WAL
+/// from the same SQLite snapshot. After the main DB replacement succeeds, the old sidecar files are removed so a stale WAL/SHM
+/// cannot mix with the new main DB.
 pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<()> {
     if !source.exists() {
         return Err(io::Error::new(
@@ -857,32 +898,32 @@ pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<(
     result
 }
 
-/// 为子 agent 复制父会话的历史库到独立的 per-process 文件。
+/// Copy the parent session's history DB to a standalone per-process file for a sub-agent.
 ///
-/// `inherit.history` 语义应为「子 agent 可读父会话上下文，但写入不回灌父库」。
-/// 直接复用父库的 canonical 文件会让子 agent 的内部 prompt/tool trace 污染父会话，
-/// 并在多个并发子 agent 间交错写入同一 session。这里用 SQLite Online Backup 做一次
-/// 一致性快照拷贝，子 agent 后续只读写自己的 fork 文件，父库保持隔离。
+/// The `inherit.history` semantics are “the sub-agent may read the parent session's context, but writes must not flow back into the parent DB”.
+/// Reusing the parent DB's canonical file directly would let the sub-agent's internal prompt/tool traces pollute the parent session
+/// and interleave writes to the same session across concurrent sub-agents. Here we use SQLite Online Backup to make one
+/// consistent snapshot copy; the sub-agent only reads and writes its own fork file afterward, keeping the parent DB isolated.
 ///
-/// 父会话尚无历史文件（首次会话）时发布一个全新的空库，不能复用残留 child 库。
+/// When the parent session has no history file yet (first session), publish a brand-new empty DB instead of reusing a leftover child DB.
 pub(in crate::ai) fn fork_history_for_subagent(parent: &Path, child: &Path) -> io::Result<()> {
     with_session_state_lock(child, || match fs::metadata(parent) {
         Ok(_metadata) => {
-            // 确保子文件父目录存在，否则 backup_sqlite 的临时文件会创建失败。
+            // Ensure the child file's parent directory exists, or the temporary file for `backup_sqlite` would fail to be created.
             if let Some(dir) = child.parent() {
                 fs::create_dir_all(dir)?;
             }
             backup_sqlite(parent, child)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // 父会话尚无历史文件，子 agent 从空白历史开始。
+            // The parent session has no history file, so the sub-agent starts from a blank history.
             reset_history_for_subagent_unlocked(child)
         }
         Err(error) => Err(error),
     })
 }
 
-/// 首次派发无历史继承的子代理时，发布一个全新的空库，不能复用同 pid 的残留库。
+/// When dispatching a sub-agent for the first time without history inheritance, publish a brand-new empty DB instead of reusing a leftover DB for the same pid.
 pub(in crate::ai) fn reset_history_for_subagent(child: &Path) -> io::Result<()> {
     with_session_state_lock(child, || reset_history_for_subagent_unlocked(child))
 }
@@ -919,15 +960,15 @@ fn remove_sqlite_sidecars(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// 廉价查询当前 history DB 中 role='user' 的消息数。
-/// 用于 boundary compact 在 hot path 上"先 count 再决定是否全量读"，
-/// 避免每个 turn 收尾都把几万条消息（含大块 tool 输出）反序列化一遍。
+/// Cheaply count the number of messages with role='user' in the current history DB.
+/// This lets boundary compact “count first, then decide whether to do a full read” on the hot path,
+/// avoiding deserializing tens of thousands of messages (including large tool outputs) at the end of every turn.
 pub(in crate::ai) fn count_user_turns_sqlite(path: &Path) -> io::Result<usize> {
     if !path.exists() {
         return Ok(0);
     }
     let conn = open_history_db(path)?;
-    // schema 可能尚未创建（全新 session），messages 表不存在时直接返 0。
+    // The schema may not exist yet (brand-new session); return 0 directly when the messages table is missing.
     let table_exists: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'",
@@ -950,9 +991,9 @@ pub(in crate::ai) fn count_user_turns_sqlite(path: &Path) -> io::Result<usize> {
     Ok(count.max(0) as usize)
 }
 
-/// 廉价统计持久化消息的有效载荷大小，用于在 user turn 数尚少、但工具输出已经
-/// 很大时仍能触发历史落盘压缩。不能以 sqlite 文件大小判断：WAL/空闲页不会在
-/// 替换消息后立刻回收，会导致每轮都误判为超限。
+/// Cheaply measure the payload size of persisted messages, so history-to-disk compaction still triggers when the user-turn count is low
+/// but tool output has grown large. The sqlite file size cannot be used: WAL/free pages are not
+/// reclaimed right after messages are replaced, which would make every turn misjudge the budget as exceeded.
 pub(in crate::ai) fn total_message_chars_sqlite(path: &Path) -> io::Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -980,8 +1021,8 @@ pub(in crate::ai) fn total_message_chars_sqlite(path: &Path) -> io::Result<usize
     Ok(total.max(0) as usize)
 }
 
-/// 廉价统计已经折叠成 internal_note 的旧工具证据体积。它有独立于全局 history
-/// 预算的内联上限，避免少量 user turn 下逐条证据在达到总预算前持续累积。
+/// Cheaply measure the size of old tool evidence already folded into internal_notes. It has an inline cap independent of the global history
+/// budget, so individual evidence items cannot keep accumulating under few user turns before the total budget is hit.
 pub(in crate::ai) fn compressed_tool_evidence_chars_sqlite(path: &Path) -> io::Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -1011,8 +1052,8 @@ pub(in crate::ai) fn compressed_tool_evidence_chars_sqlite(path: &Path) -> io::R
     Ok(total.max(0) as usize)
 }
 
-/// 持久化每个真实工具调用的结构化成败与执行签名。工具结果正文仍只保存在
-/// `messages`，因此请求投影可折叠已解决错误，而人工历史仍保留原始诊断。
+/// Persist a structured success/failure and execution signature for every real tool call. The tool result body still lives only in
+/// `messages`, so the request projection can fold resolved errors while the human history keeps the original diagnostics.
 pub(in crate::ai) fn append_tool_execution_outcomes_sqlite(
     path: &Path,
     outcomes: &[ToolExecutionOutcome],
@@ -1051,8 +1092,8 @@ pub(in crate::ai) fn append_tool_execution_outcomes_sqlite(
     })
 }
 
-/// 读取请求投影所需的结构化工具结果。老会话没有旁路表时安全退化为空集合，
-/// 不对历史正文做任何基于自然语言的成败猜测。
+/// Read the structured tool results needed by the request projection. Older sessions without the side table safely degrade to an empty set,
+/// never guessing success/failure from natural language in the history body.
 pub(in crate::ai) fn read_tool_execution_outcomes_sqlite(
     path: &Path,
 ) -> io::Result<Vec<ToolExecutionOutcome>> {
@@ -1092,8 +1133,8 @@ pub(in crate::ai) fn read_tool_execution_outcomes_sqlite(
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
-/// 持久化显式 skill 选择的实际注入结果。原始记录是诊断旁路，不会污染 canonical
-/// messages；运行时可从成功记录导出有界的历史事实。
+/// Persist the actual injection result of explicit skill selection. The raw record is a diagnostic side channel and never pollutes canonical
+/// messages; at runtime, bounded historical facts can be derived from successful records.
 pub(in crate::ai) fn append_skill_activation_event_sqlite(
     path: &Path,
     event: &SkillActivationEvent,
@@ -1125,7 +1166,7 @@ pub(in crate::ai) fn append_skill_activation_event_sqlite(
     })
 }
 
-/// 读取 session 内的显式 skill 注入审计记录。旧会话没有该旁路表时安全退化为空。
+/// Read the audit records of explicit skill injection within a session. Older sessions without the side table safely degrade to empty.
 pub(in crate::ai) fn read_skill_activation_events_sqlite(
     path: &Path,
 ) -> io::Result<Vec<SkillActivationEvent>> {
@@ -1166,8 +1207,8 @@ pub(in crate::ai) fn read_skill_activation_events_sqlite(
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
-/// 读取持久化 tool 消息使用过的关联 ID。live context 可能已裁掉较早消息，
-/// 生成新 occurrence ID 时仍须避开完整历史中的这些 ID。
+/// Read the association IDs used by persisted tool messages. The live context may have pruned the older messages,
+/// but generating a new occurrence ID must still avoid these IDs from the full history.
 pub(in crate::ai) fn read_tool_message_ids_sqlite(path: &Path) -> io::Result<Vec<String>> {
     if !blob::is_sqlite_path(path) || !path.exists() {
         return Ok(Vec::new());
@@ -1186,9 +1227,9 @@ pub(in crate::ai) fn read_tool_message_ids_sqlite(path: &Path) -> io::Result<Vec
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
-/// 读取当前 session 的 stale-patch 账本。`None` 表示旧数据库尚未写入过该状态，
-/// 调用方应从仍可见的结构化消息回放一次并写回；`Some(empty)` 则表示已知为空，
-/// 不能再次扫描可能含旧失败记录的历史。
+/// Read the current session's stale-patch ledger. `None` means the database is old and has never written this state,
+/// so the caller should replay once from the still-visible structured messages and write it back; `Some(empty)` means it is known to be empty,
+/// so history that may contain old failure records must not be scanned again.
 pub(in crate::ai) fn read_stale_patch_targets_sqlite(
     path: &Path,
 ) -> io::Result<Option<FxHashSet<PathBuf>>> {
@@ -1229,9 +1270,9 @@ pub(in crate::ai) fn read_stale_patch_targets_sqlite(
     .transpose()
 }
 
-/// 原子替换当前 session 的 stale-patch 账本。空集合也显式写成 `[]`，用于区分
-/// “已知为空”与“旧数据库尚未初始化”；该运行时元数据不改变模型历史，故不递增
-/// `history_revision`。
+/// Atomically replace the current session's stale-patch ledger. An empty set is explicitly written as `[]` to distinguish
+/// “known empty” from “old database not yet initialized”; this runtime metadata does not change model history, so
+/// `history_revision` is not incremented.
 pub(in crate::ai) fn write_stale_patch_targets_sqlite(
     path: &Path,
     targets: &FxHashSet<PathBuf>,
@@ -1256,7 +1297,7 @@ pub(in crate::ai) fn write_stale_patch_targets_sqlite(
     })
 }
 
-/// 读取当前 session 的模型引导裁剪计数。缺失或非 SQLite history 安全退化为空。
+/// Read the current session's model-guided prune counts. Missing or non-SQLite history safely degrades to empty.
 pub(in crate::ai) fn read_llm_prune_marks_sqlite(path: &Path) -> io::Result<FxHashMap<String, u8>> {
     if !blob::is_sqlite_path(path) || !path.exists() {
         return Ok(FxHashMap::default());
@@ -1298,8 +1339,8 @@ pub(in crate::ai) fn read_llm_prune_marks_sqlite(path: &Path) -> io::Result<FxHa
         .collect())
 }
 
-/// 原子替换当前 session 的模型引导裁剪计数。该旁路状态不改变 canonical
-/// messages，因此不递增 history_revision；空表直接删除 meta，避免遗留空状态。
+/// Atomically replace the current session's model-guided prune counts. This side state does not change canonical
+/// messages, so `history_revision` is not incremented; an empty table deletes the meta row directly to avoid leaving empty state.
 pub(in crate::ai) fn write_llm_prune_marks_sqlite(
     path: &Path,
     marks: &FxHashMap<String, u8>,
@@ -1345,8 +1386,8 @@ fn clear_llm_prune_marks_meta(conn: &Connection) -> io::Result<()> {
     Ok(())
 }
 
-/// outcome 只属于同一 `tool_call_id` 的 tool 消息。历史替换、压缩或分支截断后
-/// 立即清掉失去消息所有者的旁路记录，避免已删除 occurrence 的状态污染保留历史。
+/// An outcome belongs only to the tool message with the same `tool_call_id`. After history replacement, compaction, or branch truncation,
+/// side records that have lost their message owner are cleared immediately, so a deleted occurrence's state cannot pollute the retained history.
 fn prune_orphan_tool_execution_outcomes(conn: &Connection) -> io::Result<()> {
     conn.execute(
         "DELETE FROM tool_execution_outcomes
@@ -1360,9 +1401,9 @@ fn prune_orphan_tool_execution_outcomes(conn: &Connection) -> io::Result<()> {
     Ok(())
 }
 
-/// 旧历史可能在 occurrence ID 修复前复用过 `tool_call_id`。一旦后续替换或
-/// 截断只保留其中一条，仅按当前消息计数就无法知道 outcome 原本属于哪一次，
-/// 因此必须在改变消息集合前永久丢弃这些歧义旁路状态。
+/// Older history may have reused `tool_call_id` before the occurrence IDs were fixed. Once a later replacement or
+/// truncation keeps only one of them, counting the current messages alone cannot tell which occurrence the outcome belonged to,
+/// so these ambiguous side states must be permanently discarded before the message set changes.
 fn drop_ambiguous_tool_execution_outcomes(conn: &Connection) -> io::Result<()> {
     conn.execute(
         "DELETE FROM tool_execution_outcomes
@@ -1381,8 +1422,8 @@ pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -
     append_history_sqlite_for_model(path, entries, None)
 }
 
-/// 只向 canonical history 追加原始消息。模型来源作为旁路元数据保存，绝不改写
-/// `Message` 本身；后续仅在构造可重建 context view 时生成协议专属投影。
+/// Only append raw messages to canonical history. The model origin is kept as side metadata and never rewrites
+/// `Message` itself; provider-specific projections are only produced later when building a rebuildable context view.
 pub(in crate::ai) fn append_history_sqlite_for_model(
     path: &Path,
     entries: Vec<Message>,
@@ -1451,10 +1492,10 @@ pub(in crate::ai) fn replace_all_messages_sqlite(
     })
 }
 
-/// 唤醒笔记去重（方案1）：同一进程、同一批 task_ids 的 TASK_WAIT_TIMEOUT "仍在等待"
-/// 唤醒笔记只保留最新一条。调用方在准备追加一条内省笔记时调用本函数：
-/// 删除历史尾部 `WAKE_NOTE_DEDUP_SCAN` 条消息内所有与待追加笔记身份相同的旧等待笔记
-/// （由调用方随后把最新一条追加到尾部）；非"仍在等待"唤醒笔记或未命中时返回 `Ok(false)`。
+/// Wake-note dedup (approach 1): for the same process and the same set of task_ids, only the latest
+/// TASK_WAIT_TIMEOUT “still waiting” wake note is kept. The caller calls this before appending an introspection note:
+/// it deletes all old waiting notes within the last `WAKE_NOTE_DEDUP_SCAN` messages whose identity matches the note about to be appended
+/// (the caller then appends the latest one at the tail); returns `Ok(false)` for non-“still waiting” wake notes or when nothing matches.
 pub(in crate::ai) fn coalesce_repeated_wait_wake_notes_sqlite(
     path: &Path,
     note: &Message,
@@ -1468,7 +1509,7 @@ fn coalesce_repeated_wait_wake_notes_sqlite_unlocked(
     path: &Path,
     note: &Message,
 ) -> io::Result<bool> {
-    // fast path：非"仍在等待"唤醒笔记时不做任何 IO
+    // fast path: no IO at all for wake notes that are not “still waiting”
     if note.role != super::types::ROLE_INTERNAL_NOTE {
         return Ok(false);
     }
@@ -1483,8 +1524,8 @@ fn coalesce_repeated_wait_wake_notes_sqlite_unlocked(
     init_history_schema(&conn)?;
     let mut stmt = conn
         .prepare(
-            // 与 blob 后端语义一致：窗口是历史尾部 WAKE_NOTE_DEDUP_SCAN 条消息（不限角色），
-            // 再对其中 internal_note 行做身份匹配 —— LIMIT 先于角色过滤生效。
+            // Consistent with the blob backend: the window is the last WAKE_NOTE_DEDUP_SCAN messages of the history (any role),
+            // then identity matching runs over the internal_note rows inside it — LIMIT applies before the role filter.
             "SELECT id, content
              FROM (SELECT id, content, role FROM messages ORDER BY id DESC LIMIT ?1)
              WHERE role = ?2
@@ -1668,13 +1709,13 @@ fn read_projected_canonical_messages_after_id(
     Ok(messages)
 }
 
-/// 返回模型上下文层：最近一次可替换压缩快照，加上快照水位之后的原始消息投影。
-/// 读取在同一个 SQLite 快照事务中完成，因此 `source_message_id` 精确描述返回值已经
-/// 消费到的 canonical 水位；并发追加会自然成为下一次读取的 tail，不会被快照吞掉。
+/// Return the model context layer: the latest replaceable compaction snapshot plus the projection of raw messages after the snapshot watermark.
+/// The read completes within a single SQLite snapshot transaction, so `source_message_id` exactly describes the canonical watermark
+/// that the returned value has consumed; concurrent appends naturally become the tail of the next read instead of being swallowed by the snapshot.
 ///
-/// 跨 turn 图片摘要：把某条含图用户消息的图片摘要写入历史元数据表。
-/// `message_key` 是消息内容的稳定指纹（见 `request::image_message_fingerprint`），
-/// 摘要随消息走：下个 turn 加载历史时用同一指纹取回，替换旧图片避免重复发送。
+/// Cross-turn image summary: write the image summary of a user message containing images into the history metadata table.
+/// `message_key` is a stable fingerprint of the message content (see `request::image_message_fingerprint`),
+/// so the summary travels with the message: the next turn loads the history, retrieves it with the same fingerprint, and replaces the old images to avoid resending them.
 pub(in crate::ai) fn upsert_image_digest_sqlite(
     path: &Path,
     message_key: &str,
@@ -1703,8 +1744,8 @@ pub(in crate::ai) fn upsert_image_digest_sqlite(
     })
 }
 
-/// 跨 turn 图片摘要：按消息内容指纹读取持久化的图片摘要。
-/// 返回 (摘要文本, 原图路径)；历史库没有该表 / 没有该 key 时返回 None（保持原图语义）。
+/// Cross-turn image summary: read the persisted image summary by the message content fingerprint.
+/// Returns (summary text, original image path); None when the history DB lacks the table or the key (preserving the original-image semantics).
 pub(in crate::ai) fn read_image_digest_sqlite(
     path: &Path,
     message_key: &str,
@@ -1814,9 +1855,9 @@ fn read_context_history_on_conn(
     })
 }
 
-/// 原子替换可重建的上下文快照。若读取快照后发生 rewind/clear 等 canonical 改写，
-/// generation 会变化，此时拒绝陈旧结果；普通并发 append 不改变 generation，且其
-/// message id 大于传入水位，后续读取会把它作为 tail 合并回来。
+/// Atomically replace the rebuildable context snapshot. If canonical is rewritten (rewind/clear, etc.) after the snapshot was read,
+/// the generation changes and the stale result is rejected; an ordinary concurrent append does not change the generation, and its
+/// message id is greater than the passed watermark, so a later read merges it back as the tail.
 pub(in crate::ai) fn write_context_snapshot_sqlite(
     path: &Path,
     messages: &[Message],
@@ -2094,9 +2135,9 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
         let Some(text) = message.content.as_str() else {
             continue;
         };
-        // 摘要前缀识别统一走 compress::is_summary_note_text（唯一真源）。
-        // 此前这里硬编码 3 种前缀、漏掉 `长期记忆摘要（压缩保留）`，导致 fastpath
-        // 找不到 overflow 路径产生的摘要接续点、每轮回退到全量慢路径重新压缩。
+        // Summary-prefix recognition uniformly goes through compress::is_summary_note_text (the single source of truth).
+        // Previously three prefixes were hardcoded here, missing `长期记忆摘要（压缩保留）`, so the fast path
+        // could not find the summary continuation point produced by the overflow path and fell back to a full slow re-compaction every turn.
         if is_summary_note_text(text) {
             return Ok(Some(message));
         }
@@ -2104,9 +2145,9 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
     Ok(None)
 }
 
-/// 读取滑动窗口之前最近的 context checkpoint markers。它们是正文 asset 的唯一
-/// 索引，不能因为 SQLite fast path 只加载 recent turns 而从请求上下文静默消失。
-/// 请求正规化层仍会将最终投影限制为最近 8 条。
+/// Read the most recent context checkpoint markers before the sliding window. They are the only
+/// index for the body assets and must not silently vanish from the request context just because the SQLite fast path only loads recent turns.
+/// The request normalization layer still restricts the final projection to the most recent 8 entries.
 pub(in crate::ai) fn read_context_checkpoint_markers_before_id_sqlite(
     history_file: &Path,
     before_message_id: i64,
@@ -2157,9 +2198,9 @@ pub(in crate::ai) fn read_context_checkpoint_markers_before_id_sqlite(
     Ok(markers)
 }
 
-/// 把 history 中 context checkpoint marker 的 assets 路径重定位到新 session。
-/// fork 时传入源 assets 目录做精确前缀替换；归档导入时源路径未知，会仅接受
-/// `context-checkpoints/<file>` 的受控相对尾部，避免把普通文本或任意绝对路径改写。
+/// Relocate the asset paths of the context checkpoint markers in the history to a new session.
+/// On fork, the source assets directory is passed in for an exact prefix replacement; on archive import the source path is unknown, so only
+/// the controlled relative tail of `context-checkpoints/<file>` is accepted, avoiding rewrites of arbitrary text or absolute paths.
 pub(in crate::ai) fn remap_context_checkpoint_paths_sqlite(
     history_file: &Path,
     source_assets: Option<&Path>,
@@ -2285,9 +2326,9 @@ fn clear_session_history_sqlite_unlocked(path: &Path) -> io::Result<()> {
         Err(err) => return Err(err),
     };
     init_history_schema(&conn)?;
-    // 事务包裹：DELETE messages / DELETE meta / bump revision 必须原子提交，
-    // 否则中途崩溃会留下"messages 已清空但 revision 未变"的不一致状态，
-    // 导致 context 缓存误判为未变化而继续供应旧历史。
+    // Transaction wrapper: DELETE messages / DELETE meta / bump revision must commit atomically,
+    // otherwise a crash in the middle leaves the inconsistent state “messages cleared but revision unchanged”,
+    // which would make the context cache misjudge that nothing changed and keep serving the old history.
     let tx = conn
         .transaction()
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -2298,11 +2339,11 @@ fn clear_session_history_sqlite_unlocked(path: &Path) -> io::Result<()> {
         .map_err(|e| io::Error::other(e.to_string()))?;
     tx.execute("DELETE FROM skill_activation_events", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
-    // 保留 history_revision 行：它是缓存失效计数器，须跨 clear **单调递增**。
-    // history_generation 是快照并发写的 fencing token，clear 后也必须单调递增；
-    // turn_seq 同样是 session 级身份，清空上下文不能让旧序号被复用。
-    // 若连同它一起删掉，bump 会从 1 重新开始，版本号回退后可能与早期缓存
-    // 条目的 revision 撞车，反而让已失效的旧历史被误命中。
+    // Keep the history_revision row: it is the cache-invalidation counter and must stay **monotonically increasing** across clears.
+    // history_generation is the fencing token for concurrent snapshot writes and must also increase monotonically after a clear;
+    // turn_seq is likewise session-scoped identity; clearing the context must not let old numbers be reused.
+    // If they were deleted along with the rest, the bump would restart at 1; after the version regresses it could collide with
+    // the revision of early cache entries, and already-invalidated old history would be wrongly hit.
     tx.execute(
         "DELETE FROM meta
          WHERE key NOT IN ('history_revision', 'history_generation', 'turn_seq')",
@@ -2313,8 +2354,8 @@ fn clear_session_history_sqlite_unlocked(path: &Path) -> io::Result<()> {
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
-/// 把 messages 表保留到前 `keep` 条（按 id 升序）。用于 session branch：
-/// 复制完整 sqlite 后再回滚到指定消息数。`keep == 0` 等价于 clear。
+/// Keep only the first `keep` rows of the messages table (ascending by id). Used for session branching:
+/// copy the full sqlite then roll back to the given message count. `keep == 0` is equivalent to clear.
 pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::Result<()> {
     with_session_state_lock(path, || truncate_messages_sqlite_unlocked(path, keep))
 }
@@ -2326,8 +2367,8 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
         Err(err) => return Err(err),
     };
     init_history_schema(&conn)?;
-    // 事务包裹：DELETE + bump revision 原子提交，避免中途崩溃留下
-    // "已删消息但 revision 未变"的不一致状态（context 缓存供应错误的空结果）。
+    // Transaction wrapper: DELETE + bump revision commit atomically, so a crash in the middle cannot leave
+    // the inconsistent “messages deleted but revision unchanged” state (the context cache serving a wrongly empty result).
     let tx = conn
         .transaction()
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -2344,7 +2385,7 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
         bump_history_revision(&tx)?;
         return tx.commit().map_err(|e| io::Error::other(e.to_string()));
     }
-    // 取前 `keep` 条的最大 id，删掉其后的所有行。
+    // Take the largest id among the first `keep` rows and delete every row after it.
     let cutoff: Option<i64> = tx
         .query_row(
             "SELECT id FROM messages ORDER BY id ASC LIMIT 1 OFFSET ?1",
@@ -2364,10 +2405,10 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
-/// 把 messages 表保留到前 `keep_turns` 个完整用户 turn。
+/// Keep the messages table down to the first `keep_turns` complete user turns.
 ///
-/// 用户 turn 从 `role='user'` 开始，到下一条用户消息前结束；按下一条用户消息
-/// 截断可让 assistant tool call 与随后的 tool result 留在同一侧。
+/// A user turn starts at a `role='user'` message and ends before the next user message; truncating at the next user message
+/// keeps an assistant tool call and its following tool result on the same side.
 pub(in crate::ai) fn truncate_messages_to_user_turns_sqlite(
     path: &Path,
     keep_turns: usize,
@@ -2439,8 +2480,8 @@ fn read_first_user_prompt_from_conn(conn: &Connection) -> io::Result<Option<Stri
         return Ok(meta);
     }
 
-    // 缓存的首条消息可能是图片/文本归档协议。继续向后查找第一条真实用户请求，
-    // 避免过滤内部协议后把已有会话错误显示成 `new session`。
+    // The cached first message may be an image/text archival protocol message. Keep scanning forward for the first real user request,
+    // so an existing session is not wrongly shown as `new session` after the internal protocol messages are filtered out.
     let mut stmt = conn
         .prepare("SELECT content FROM messages WHERE role='user' ORDER BY id ASC")
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -2461,7 +2502,7 @@ fn read_first_user_prompt_from_conn(conn: &Connection) -> io::Result<Option<Stri
     Ok((!prompts.is_empty()).then(|| prompts.join("\n---\n")))
 }
 
-/// 读取 session 标题（存储在 meta 表中，key='session_title'）。
+/// Read the session title (stored in the meta table under key='session_title').
 pub(in crate::ai) fn read_session_title_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
     Ok(read_session_title_from_conn(&conn))
@@ -2491,8 +2532,8 @@ fn read_i64_meta_from_conn(conn: &Connection, key: &str) -> Option<i64> {
     .and_then(|value| value.parse::<i64>().ok())
 }
 
-/// 旧 session 尚未写入显式活动时间时，以最后一条 canonical message 的创建时间
-/// 作为活动时间。`messages.created_at` 使用 Unix 秒，列表接口统一返回毫秒。
+/// When an older session has not written an explicit activity time, use the creation time of the last canonical message
+/// as the activity time. `messages.created_at` is in Unix seconds; the list interface uniformly returns milliseconds.
 fn read_latest_message_activity_unix_ms(conn: &Connection) -> Option<i64> {
     conn.query_row("SELECT MAX(created_at) FROM messages", [], |row| {
         row.get::<_, Option<i64>>(0)
@@ -2502,10 +2543,10 @@ fn read_latest_message_activity_unix_ms(conn: &Connection) -> Option<i64> {
     .and_then(|seconds| seconds.checked_mul(1_000))
 }
 
-/// 单次只读连接读取 `/ss` 列表的标题、首条用户请求与活动时间。
+/// Read the title, first user request, and activity time for the `/ss` list in a single read-only connection.
 ///
-/// 两项元数据沿用列表层原本的容错语义：单项查询失败不影响另一项，也不会让
-/// 一个损坏或旧格式的 session 阻断整个列表。
+/// The two metadata items keep the list layer's original fault-tolerance semantics: a failure in one query does not affect the other, nor does it let
+/// a corrupted or old-format session block the whole list.
 pub(in crate::ai) fn read_session_list_metadata_sqlite(
     path: &Path,
 ) -> io::Result<SessionListMetadata> {
@@ -2519,7 +2560,7 @@ pub(in crate::ai) fn read_session_list_metadata_sqlite(
     })
 }
 
-/// 读取 session 标题来源（`model` / `fallback`）；缺失时调用方按旧数据处理。
+/// Read the source of the session title (`model` / `fallback`); when missing, the caller treats it as legacy data.
 pub(in crate::ai) fn read_session_title_origin_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
     let origin: Option<String> = conn
@@ -2533,7 +2574,7 @@ pub(in crate::ai) fn read_session_title_origin_sqlite(path: &Path) -> io::Result
     Ok(origin.filter(|value| !value.trim().is_empty()))
 }
 
-/// 原子写入 session 标题及其来源，避免 fallback 被误认为模型标题而永久跳过升级。
+/// Atomically write the session title and its source, so a fallback is never mistaken for a model title and permanently skips upgrading.
 pub(in crate::ai) fn write_session_title_sqlite(
     path: &Path,
     title: &str,
@@ -2619,8 +2660,8 @@ mod tests {
 
     #[test]
     fn sqlite_error_classifies_transient_failures_as_retryable() {
-        // BUSY/LOCKED 与 SQLITE_IOERR 系统 I/O 失败（如并发首开 WAL 时的
-        // FSTAT/SHMOPEN）都属瞬时，必须归为 WouldBlock 供上层短退避重试。
+        // BUSY/LOCKED and SQLITE_IOERR system I/O failures (e.g. FSTAT/SHMOPEN when
+        // concurrently opening the WAL for the first time) are transient and must map to WouldBlock so the caller can retry with a short backoff.
         for result_code in [
             rusqlite::ffi::SQLITE_BUSY,
             rusqlite::ffi::SQLITE_LOCKED,
@@ -2638,7 +2679,7 @@ mod tests {
             assert_eq!(io_error.kind(), io::ErrorKind::WouldBlock);
         }
 
-        // 非瞬时失败（只读文件系统）不得重试。
+        // Non-transient failures (e.g. a read-only filesystem) must not be retried.
         let error = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
             None,
@@ -2726,14 +2767,14 @@ mod tests {
         let path = dir.join("history.db");
         append_history_sqlite(&path, vec![msg("user", "first"), msg("user", "second")]).unwrap();
 
-        // 旧 session 第一次升级时从已落盘的 user turn 数继续编号。
+        // When an older session is upgraded for the first time, numbering continues from the persisted user-turn count.
         assert_eq!(reserve_turn_index_sqlite(&path).unwrap(), 2);
         assert_eq!(reserve_turn_index_sqlite(&path).unwrap(), 3);
 
         clear_session_history_sqlite(&path).unwrap();
         assert_eq!(reserve_turn_index_sqlite(&path).unwrap(), 4);
 
-        // 每个线程都建立独立连接，覆盖多 runtime / 多进程相同的事务竞争路径。
+        // Each thread opens its own connection, covering the same transaction-contention paths across runtimes and processes.
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let path = path.clone();
@@ -2780,9 +2821,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P1 回归：`read_history_revision` 必须**跨连接**观察到写入递增。
-    /// 每次写路径都开新连接读版本号，模拟 build_context_history 的缓存失效判定。
-    /// 旧实现用连接局部的 `PRAGMA data_version`，新连接恒返回固定值，无法失效缓存。
+    /// P1 regression: `read_history_revision` must observe the write increment **across connections**.
+    /// Every write path opens a new connection to read the version, mimicking build_context_history's cache-invalidation check.
+    /// The old implementation used the connection-local `PRAGMA data_version`, which always returns a fixed value on new connections and cannot invalidate the cache.
     #[test]
     fn history_revision_increments_across_fresh_connections() {
         let dir = std::env::temp_dir().join(format!(
@@ -2796,7 +2837,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("history.db");
 
-        // 全新库尚未写入过 revision：视为 0（"从未修改"）。
+        // A brand-new DB has never written a revision: treat it as 0 (“never modified”).
         assert_eq!(read_history_revision(&path), Some(0));
 
         append_history_sqlite(&path, vec![msg("user", "hi")]).unwrap();
@@ -2815,7 +2856,7 @@ mod tests {
         let r4 = read_history_revision(&path).unwrap();
         assert!(r4 > r3, "truncate should bump: {r3} -> {r4}");
 
-        // clear 会 DELETE meta 后再 bump，结构与其它写路径不同，需单独覆盖。
+        // clear deletes the meta first and then bumps, a structure unlike the other write paths, so it needs its own coverage.
         append_history_sqlite(&path, vec![msg("user", "again")]).unwrap();
         let r5 = read_history_revision(&path).unwrap();
         clear_session_history_sqlite(&path).unwrap();
@@ -2830,8 +2871,8 @@ mod tests {
 
     #[test]
     fn history_revision_cache_invalidates_on_wal_write_with_live_connection() {
-        // 验证：有存活连接时 WAL 写入不 checkpoint 主库，但 `-wal` sidecar 变化
-        // 必须使 revision 缓存失效，否则缓存返回旧值。
+        // Verify: with a live connection, WAL writes do not checkpoint the main DB, but the `-wal` sidecar changes
+        // must invalidate the revision cache, or the cache would return a stale value.
         let dir = std::env::temp_dir().join(format!(
             "hist_rev_wal_{}_{}",
             std::process::id(),
@@ -2844,13 +2885,13 @@ mod tests {
         let r1 = read_history_revision(&path).unwrap();
         assert!(r1 > 0);
 
-        // 保持连接存活，阻止 WAL checkpoint 回写主库
+        // Keep the connection alive to prevent the WAL checkpoint from writing back to the main DB
         let guard = rusqlite::Connection::open(&path).unwrap();
 
-        // 短生命连接写入：WAL 增长但主库 mtime 可能不变
+        // Short-lived connection writes: the WAL grows but the main DB mtime may stay unchanged
         append_history_sqlite(&path, vec![msg("user", "second")]).unwrap();
 
-        // 缓存必须失效（WAL sidecar 元数据变化），返回新 revision
+        // The cache must invalidate (WAL sidecar metadata changed) and return the new revision
         let r2 = read_history_revision(&path).unwrap();
         assert!(
             r2 > r1,
@@ -2902,14 +2943,14 @@ mod tests {
             Some(targets.clone())
         );
 
-        // replace_all_messages 是持久化 history 压缩/改写路径；账本不能随消息形态丢失。
+        // replace_all_messages is the persisted-history compaction/rewrite path; the ledger must not be lost with the message shape.
         replace_all_messages_sqlite(&path, &[msg("user", "after compression")]).unwrap();
         assert_eq!(
             read_stale_patch_targets_sqlite(&path).unwrap(),
             Some(targets)
         );
 
-        // 显式空集合也要与“旧库尚无 meta”区分，防止恢复时误走 legacy 回放。
+        // An explicitly empty set must also be distinguished from “old DB with no meta yet”, so recovery never wrongly takes the legacy replay path.
         write_stale_patch_targets_sqlite(&path, &FxHashSet::default()).unwrap();
         assert_eq!(
             read_stale_patch_targets_sqlite(&path).unwrap(),
@@ -2973,8 +3014,8 @@ mod tests {
         append_history_sqlite(&path, vec![msg("user", "first prompt")]).unwrap();
         write_session_title_sqlite(&path, "generated title", "model").unwrap();
 
-        // 模拟尚未写入 last_activity_unix_ms 的旧 session。列表必须使用消息时间，
-        // 不能依赖会被只读连接创建/刷新的 SQLite -shm 文件时间。
+        // Simulate an older session that has not written last_activity_unix_ms. The list must use the message time,
+        // not the SQLite -shm file time, which a read-only connection creates/refreshes.
         let conn = open_history_db(&path).unwrap();
         conn.execute("UPDATE messages SET created_at = ?1", [1_700_000_000_i64])
             .unwrap();
@@ -3034,8 +3075,8 @@ mod tests {
                 .is_empty()
         );
 
-        // 旧历史可能已经复用过同一 ID；改变消息集合前必须永久丢弃其歧义 outcome，
-        // 否则删除较新的 occurrence 后会把它的状态错误绑定到保留的旧消息。
+        // Older history may have reused the same ID; before the message set changes, its ambiguous outcome must be permanently discarded,
+        // otherwise deleting the newer occurrence would wrongly bind its state to the retained older message.
         append_history_sqlite(
             &path,
             vec![
@@ -3439,7 +3480,7 @@ mod tests {
         let latest =
             msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a", "task_b"], "checkpoint-4"));
         assert!(coalesce_repeated_wait_wake_notes_sqlite(&path, &latest).unwrap());
-        // 调用方随后把最新一条追加到尾部。
+        // The caller then appends the latest one at the tail.
         append_history_sqlite(&path, vec![latest]).unwrap();
 
         let notes: Vec<_> = read_all_messages_sqlite(&path)
@@ -3467,10 +3508,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("history.db");
 
-        // 与 blob 后端一致的窗口语义：扫描历史尾部 WAKE_NOTE_DEDUP_SCAN 条消息（不限角色），
-        // 而非“最近 WAKE_NOTE_DEDUP_SCAN 条 internal_note”。
-        // 旧等待笔记在第 1 条，其后跟 WAKE_NOTE_DEDUP_SCAN+1 条 user 消息，故其在窗口外，
-        // 不应被删除（若按 internal_note 窗口扫描则会被命中删除）。
+        // Window semantics consistent with the blob backend: scan the last WAKE_NOTE_DEDUP_SCAN messages of the history (any role),
+        // not “the most recent WAKE_NOTE_DEDUP_SCAN internal_notes”.
+        // The old waiting note is at position 1, followed by WAKE_NOTE_DEDUP_SCAN+1 user messages, so it is outside the window
+        // and must not be deleted (an internal_note-window scan would have hit and removed it).
         let mut history = vec![msg(
             ROLE_INTERNAL_NOTE,
             &wake_note_text(6, &["task_a"], "checkpoint-old"),
@@ -3490,7 +3531,7 @@ mod tests {
             .into_iter()
             .filter(|m| m.role == ROLE_INTERNAL_NOTE)
             .collect();
-        // 窗口外的旧等待笔记保留，未被误删。
+        // The old waiting note outside the window is retained and not wrongly deleted.
         assert_eq!(notes.len(), 1);
         assert!(notes[0].content.as_str().unwrap().contains("checkpoint-old"));
 
@@ -3518,22 +3559,22 @@ mod tests {
         )
         .unwrap();
 
-        // 同一 pid 但不同 task 集合：身份不同，不去重。
+        // Same pid but a different task set: the identity differs, so no dedup.
         let other = msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_z"], "checkpoint-x"));
         assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &other).unwrap());
 
-        // 非 internal_note 消息：fast path 不做任何 IO。
+        // Non-internal_note message: the fast path does no IO.
         assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &msg("user", "hello")).unwrap());
 
-        // 真实结果唤醒（parse 为 None）：不去重。
+        // A real-result wake (parse returns None): no dedup.
         let result_wake = msg(
             ROLE_INTERNAL_NOTE,
             "[Process 6 Woke Up] Original goal: g\nNew mailbox messages:\n[EVENT_WAKE]\nready\n\nWake-up handling rules:\n- rule\n\nResume execution based on the goal and these messages.",
         );
         assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &result_wake).unwrap());
 
-        // 数据库不存在：best-effort 返回 false，不报错。
-        // 注意：必须用有效 wait note 才能越过 fast path，真正走到 open_history_db 分支。
+        // Missing database: best-effort returns false without error.
+        // Note: only a valid wait note gets past the fast path to actually reach the open_history_db branch.
         let missing = dir.join("missing.db");
         let wait_note = msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a"], "c"));
         assert!(!coalesce_repeated_wait_wake_notes_sqlite(&missing, &wait_note).unwrap());

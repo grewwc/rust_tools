@@ -1,14 +1,15 @@
 // =============================================================================
-// LlmClient - LLM 请求端口
+// LlmClient - LLM request port
 // =============================================================================
-// 之前 `request/transport.rs` 的 `do_request_messages` 直接被 driver/iteration 强耦合，
-// 无法插入重试、熔断、日志、mock 等中间件。现通过此 trait 解耦。
+// Previously `request/transport.rs`'s `do_request_messages` was tightly coupled to
+// driver/iteration, leaving no room to insert retry, circuit-breaking, logging, mock,
+// and other middleware. This trait decouples it.
 use std::future::Future;
 use std::pin::Pin;
 
 use crate::ai::history::Message;
 
-/// 统一的 LLM 请求描述（与 `request/builder.rs` 的内部结构解耦）。
+/// Unified LLM request description (decoupled from `request/builder.rs` internals).
 #[derive(Debug, Clone)]
 pub(crate) struct LlmRequest {
     pub model: String,
@@ -17,7 +18,8 @@ pub(crate) struct LlmRequest {
     pub tools_enabled: bool,
 }
 
-/// 统一的 LLM 响应句柄：透传 `reqwest::Response` + 实际使用的 model 名。
+/// Unified LLM response handle: passes through the `reqwest::Response` plus the model
+/// name actually used.
 pub(crate) struct LlmResponse {
     pub response: reqwest::Response,
     pub model: String,
@@ -31,7 +33,8 @@ pub(crate) trait LlmClient: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
 }
 
-/// 默认实现：委托给 `request::do_request_messages` / `do_request_messages_without_tools`
+/// Default implementation: delegates to `request::do_request_messages` /
+/// `do_request_messages_without_tools`
 pub(crate) struct DefaultLlmClient;
 
 impl LlmClient for DefaultLlmClient {
@@ -56,7 +59,8 @@ impl LlmClient for DefaultLlmClient {
     }
 }
 
-/// 装饰器：日志中间件（示例，展示如何无需改 driver 即可插横切）
+/// Decorator: logging middleware (example showing how to add cross-cutting behavior
+/// without touching the driver)
 pub(crate) struct LoggingLlmClient<C: LlmClient> {
     inner: C,
 }
@@ -85,10 +89,11 @@ impl<C: LlmClient> LlmClient for LoggingLlmClient<C> {
     }
 }
 
-/// 便捷构造：返回默认 `LlmClient`（`DefaultLlmClient`），供 driver 一行接入。
+/// Convenience constructor: returns the default `LlmClient` (`DefaultLlmClient`) so the
+/// driver can plug in with one line.
 ///
-/// 保持零行为变更：默认链仍走 `DefaultLlmClient` 行为；需要中间件时
-/// 通过 `middleware::request::build_llm_client_chain` 包装。
+/// Keeps zero behavior change: the default chain still uses `DefaultLlmClient`; when
+/// middleware is needed, wrap via `middleware::request::build_llm_client_chain`.
 pub(crate) fn default_llm_client() -> Box<dyn LlmClient> {
     Box::new(DefaultLlmClient)
 }

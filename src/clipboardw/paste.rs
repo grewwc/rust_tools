@@ -1,12 +1,14 @@
-//! 统一粘贴：读取剪贴板 → 识别内容类型 → 以合适的扩展名保存到文件。
+//! Unified paste: read the clipboard -> detect the content type -> save to a file with
+//! a suitable extension.
 //!
-//! 这是 `oo -p` 的粘贴入口。相比旧的 binary → string → image 三级联重试，
-//! 这里只读取一次剪贴板内容，并按类型自动选择保存方式：
+//! This is the paste entry point for `oo -p`. Unlike the old binary -> string -> image
+//! three-stage fallback retry, here the clipboard is read once and saved by type:
 //!
-//! - **SSH 会话**：通过 OSC52 只查询一次终端剪贴板，避免每次重试都重新传输
-//!   整份剪贴板内容（大图可达数 MB）；
-//! - **扩展名**：识别出的图片按实际格式取扩展名（`output.png` / `output.jpg`
-//!   等），文本加 `.txt`，其余二进制保留原文件名。
+//! - **SSH sessions**: query the terminal clipboard exactly once via OSC52, avoiding
+//!   retransmitting the whole clipboard on every retry (large images can be several MB);
+//! - **Extension**: detected images take the extension of their actual format
+//!   (`output.png` / `output.jpg` etc.), text gets `.txt`, and other binary keeps its
+//!   original file name.
 
 use std::{fs, io};
 
@@ -22,32 +24,32 @@ fn is_ssh_session() -> bool {
         || std::env::var("SSH_TTY").is_ok()
 }
 
-/// 剪贴板内容的分类结果
+/// Classification of the clipboard content
 #[derive(Debug)]
 enum SaveKind {
-    /// 图片字节（原生或经 base64 解码），保存为 `<fname>.<ext>`
+    /// Image bytes (native or base64-decoded), saved as `<fname>.<ext>`
     Image { data: Vec<u8>, ext: &'static str },
-    /// 文本，保存为 `<fname>.txt`
+    /// Text, saved as `<fname>.txt`
     Text(String),
-    /// 其他二进制（含 base64 包裹的任意文件），保存为 `<fname>`
+    /// Other binary (including arbitrary files wrapped in base64), saved as `<fname>`
     Binary(Vec<u8>),
 }
 
-/// 将剪贴板内容保存为文件，返回实际保存的路径。
+/// Saves the clipboard content to a file and returns the actual saved path.
 ///
-/// 读取顺序：
-/// 1. 本地会话：优先 arboard 原生图片（不触发 OSC52）；
-/// 2. 本地会话：arboard 文本；SSH 会话：一次 OSC52 读取终端剪贴板；
-/// 3. 按内容分类后以合适的扩展名写入。
+/// Read order:
+/// 1. Local session: prefer arboard native images (does not trigger OSC52);
+/// 2. Local session: arboard text; SSH session: read the terminal clipboard once via OSC52;
+/// 3. Classify the content and write it with a suitable extension.
 pub fn paste_to_file(fname: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // 1) 本地原生图片
+    // 1) Local native image
     if !is_ssh_session() {
         if let Some(path) = try_save_local_image(fname) {
             return Ok(path);
         }
     }
 
-    // 2) 一次读取：本地走 arboard，SSH 走 OSC52
+    // 2) Single read: arboard locally, OSC52 over SSH
     let raw: Vec<u8> = if is_ssh_session() {
         string_content::get_clipboard_raw_bytes_via_osc52()
             .ok_or_else(|| io::Error::other("no clipboard data via OSC52"))?
@@ -55,11 +57,11 @@ pub fn paste_to_file(fname: &str) -> Result<String, Box<dyn std::error::Error>> 
         string_content::get_clipboard_content().into_bytes()
     };
 
-    // 3) 分类并保存
+    // 3) Classify and save
     save_classified(fname, classify(&raw))
 }
 
-/// 本地 arboard 原生图片：保存为 `<fname>.jpg`。
+/// Local arboard native image: save as `<fname>.jpg`.
 fn try_save_local_image(fname: &str) -> Option<String> {
     let mut clipboard = Clipboard::new().ok()?;
     let image = clipboard.get_image().ok()?;
@@ -74,9 +76,9 @@ fn try_save_local_image(fname: &str) -> Option<String> {
     Some(path)
 }
 
-/// 按内容识别剪贴板数据的类型。
+/// Detects the type of the clipboard data from its content.
 fn classify(raw: &[u8]) -> SaveKind {
-    // 原生图片字节（OSC52 返回 base64(图片字节)，解码后即图片）
+    // Native image bytes (OSC52 returns base64(image bytes); decoding yields the image)
     if let Ok(format) = image::guess_format(raw) {
         if image::load_from_memory(raw).is_ok() {
             return SaveKind::Image {
@@ -86,7 +88,7 @@ fn classify(raw: &[u8]) -> SaveKind {
         }
     }
 
-    // 文本（含 base64 包裹的图片 / 二进制）
+    // Text (including base64-wrapped images / binaries)
     if let Ok(text) = std::str::from_utf8(raw) {
         if !text.is_empty() {
             let cleaned: String = text
@@ -97,7 +99,7 @@ fn classify(raw: &[u8]) -> SaveKind {
                 use base64::Engine as _;
                 use base64::engine::general_purpose;
                 if let Ok(decoded) = general_purpose::STANDARD.decode(&cleaned) {
-                    // base64 包裹的图片（oo -B / oo -c 桥接）
+                    // base64-wrapped image (oo -B / oo -c bridge)
                     if let Ok(format) = image::guess_format(&decoded) {
                         if image::load_from_memory(&decoded).is_ok() {
                             return SaveKind::Image {
@@ -106,7 +108,7 @@ fn classify(raw: &[u8]) -> SaveKind {
                             };
                         }
                     }
-                    // 其他 base64 包裹的二进制
+                    // Other base64-wrapped binary
                     return SaveKind::Binary(decoded);
                 }
             }
@@ -114,7 +116,7 @@ fn classify(raw: &[u8]) -> SaveKind {
         }
     }
 
-    // 其余原始字节
+    // Remaining raw bytes
     SaveKind::Binary(raw.to_vec())
 }
 
@@ -122,7 +124,7 @@ fn ext_of(format: image::ImageFormat) -> &'static str {
     format.extensions_str().first().copied().unwrap_or("jpg")
 }
 
-/// 图片保存路径：无扩展名时追加 `.ext`，已有扩展名则保留。
+/// Image save path: append `.ext` when there is no extension; keep an existing one.
 fn image_save_path(fname: &str, ext: &str) -> String {
     add_suffix(fname, &format!(".{ext}"), || !fname.contains('.'))
 }
@@ -215,7 +217,7 @@ mod tests {
 
     #[test]
     fn classify_whitespace_only_text() {
-        // 与旧的 string_content 路径一致：纯空白仍按文本保存
+        // Matches the legacy string_content path: whitespace-only content is still saved as text
         match classify(b"\n  \n") {
             SaveKind::Text(t) => assert_eq!(t, "\n  \n"),
             other => panic!("expected Text, got {other:?}"),

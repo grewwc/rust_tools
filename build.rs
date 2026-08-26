@@ -1,8 +1,9 @@
-//! 编译期扫描 `src/bin/ai/tool_descriptions/*.json`，
-//! 生成内置工具描述文件清单，供运行时加载。
+//! Compile-time scan of `src/bin/ai/tool_descriptions/*.json` that generates
+//! a manifest of built-in tool description files for runtime loading.
 //!
-//! 设计：build.rs 只列目录、不解析 JSON。生成的常量用 `include_str!`
-//! 嵌入每个文件内容；JSON 解析在运行时首次访问时完成（`OnceLock`）。
+//! Design: build.rs only lists the directory; it does not parse JSON. The
+//! generated constant embeds each file's contents via `include_str!`; JSON
+//! parsing happens lazily on first access at runtime (via `OnceLock`).
 
 use std::fs;
 use std::path::Path;
@@ -22,8 +23,9 @@ fn main() {
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            // 使用相对于 src/bin/ai/ 的路径（include_str! 在生成文件中解析，
-            // 生成文件位于 OUT_DIR，因此需要回到 CARGO_MANIFEST_DIR）。
+            // Use paths relative to src/bin/ai/ (include_str! resolves relative
+            // to the generated file in OUT_DIR, so we anchor back at
+            // CARGO_MANIFEST_DIR).
             let rel = path.to_string_lossy().replace('\\', "/");
             entries.push((stem, rel));
         }

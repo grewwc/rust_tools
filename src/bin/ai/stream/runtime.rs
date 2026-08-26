@@ -26,7 +26,8 @@ use super::{
     },
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{
-        StreamChunkStep, StreamMarkers, StreamProcessingState, TerminalDedupeState, ToolCallBuilder,
+        StreamChunkStep, StreamContentState, StreamMarkers, StreamProcessingState,
+        TerminalDedupeState, ToolCallBuilder,
     },
 };
 
@@ -39,34 +40,34 @@ const DECODE_ERROR_RETRY_DELAY_MS: u64 = 100;
 /// final snapshot immediately after the finish chunk.
 const FINISH_REASON_GRACE_MS: u64 = 750;
 
-/// 空闲超时：已收到内容后长时间无新 chunk 到达，视为服务端已静默结束。
-/// 部分 provider 在输出完毕后既不发送 finish_reason 也不关闭连接，只能靠此超时兜底。
+/// Idle timeout: after some content arrived, a long stretch without a new chunk means the server has silently finished.
+/// Some providers send neither finish_reason nor close the connection after finishing; only this timeout catches that.
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
-/// 首 chunk 超时：请求已发出但服务端迟迟不发第一个字节（排队/网关卡住等）。
-/// 比 idle 超时更长，因为某些模型冷启动或排队需要时间。
+/// First-chunk timeout: the request was sent but the server never sends the first byte (queued, stuck gateway, ...).
+/// Longer than the idle timeout, since some models take time to cold-start or queue.
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
-/// terminal 下 thinking 可见窗口的默认高度。只影响展示，不影响 reasoning 累积。
-/// 流式过程显示最近 N 行（默认 2）；思考结束时 `finalize_fold` 会强制折叠为纯摘要
-/// （临时按 0 行窗口重画），避免模型在 thinking 尾部复述的结论/问句与最终回答在
-/// 终端重复显示。
+/// Default visible-window height for `thinking` in the terminal. Only affects display, not reasoning accumulation.
+/// Streaming shows the most recent N lines (default 2); when thinking ends, `finalize_fold` forces a pure-summary
+/// fold (redraws with a 0-line window) so conclusions/questions restated at the tail of thinking are not shown twice
+/// alongside the final answer in the terminal.
 const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 2;
-/// thinking / subagent 折叠正文缩进：header/footer 用 2 空格，正文再内缩一层。
+/// Indentation for folded thinking/subagent bodies: header/footer use 2 spaces, body is indented one more level.
 const THINKING_FOLD_BODY_INDENT: &str = "    ";
 const THINKING_FOLD_BODY_INDENT_WIDTH: usize = 4;
-/// 终端右边界通常使用 delayed-wrap；折叠重画统一额外留两列，避免终端标识缺失、
-/// 宽度或字符宽度存在一列偏差时触发未计入 cursor-up 的隐式换行，把旧窗口尾部残留
-/// 在 `✓` 下方。
+/// Terminals usually wrap at the right edge with delayed-wrap; folded redraws always leave two extra columns so that
+/// a missing terminal flag or a one-column width/char-width drift cannot trigger an implicit wrap that was not counted
+/// in cursor-up, leaving residue from the old window under the `✓`.
 const FOLD_REWRITE_RIGHT_MARGIN_COLS: usize = 2;
-/// 推理流连续重复的最短片段和判定次数。只检测 reasoning，避免把用户要求生成的重复
-/// 正文（表格、代码、测试数据等）误判为模型退化。
+/// Shortest repeated fragment and decision count for reasoning-stream degeneration. Only reasoning is checked, so
+/// legitimately repeated body the model was asked to produce (tables, code, test data) is not misjudged as degeneration.
 const MIN_REASONING_REPEAT_CHARS: usize = 16;
 const MAX_REASONING_REPEAT_CHARS: usize = 512;
 const REASONING_REPEAT_COUNT: usize = 3;
 const DEGENERATE_REPETITION_FINISH_REASON: &str = "degenerate_repetition";
-/// 流式工具调用参数累积上限（单轮所有工具调用的参数总量）。
-/// 模型一旦开启工具调用就应快速收口；若参数持续增长直到越过上限（例如在
-/// apply_patch 里无限循环拼接同一段正文），说明输出退化。既有退化重复检测只覆盖
-/// reasoning/assistant 文本，不查工具参数，这里补总量兜底，避免无限等待与内存膨胀。
+/// Cap on accumulated streaming tool-call arguments (total across all tool calls in one turn).
+/// Once the model opens a tool call it should close quickly; if arguments keep growing until the cap is hit (e.g.
+/// an endless loop concatenating the same body in apply_patch), the output has degenerated. Existing degeneration
+/// detection only covers reasoning/assistant text, not tool arguments; this total cap is a backstop against infinite waits and memory growth.
 const MAX_TOOL_ARG_BYTES: usize = 1 << 20; // 1 MiB
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -106,9 +107,9 @@ pub(super) async fn stream_response(
             candidate: candidate.to_string(),
             buffered_terminal_output: String::new(),
         });
-    // 预填 `<think>` 模板的 reasoner 把推理链内联在 content 通道，仅以悬空
-    // `</think>` 收尾、从不产生 reasoning_content。为这类模型 arm 拆分器，把泄漏的
-    // 推理拆回 reasoning，避免思考链与正式答案一起落进可见正文。
+    // Reasoners with a prefilled `thinking` template inline their chain in the content channel and only close with a dangling
+    // `response`, never producing reasoning_content. Arm the splitter for such models to pull leaked
+    // reasoning back into reasoning, so the chain is not dumped into visible body together with the final answer.
     if models::reasoning_in_content_enabled(&app.current_model) {
         state.content.content_think_demuxer.arm();
     }
@@ -136,8 +137,8 @@ pub(super) async fn stream_response(
             return Ok(result);
         }
 
-        // 已有可执行/可见进展时用较短的 idle 超时；空包、usage-only、heartbeat
-        // 不刷新该计时器，避免 provider 持续推无效包导致 stream 永不收口。
+        // Use a shorter idle timeout when there is executable/visible progress; empty packets, usage-only and heartbeat
+        // do not refresh this timer, so a provider pushing useless packets cannot keep the stream open forever.
         let timeout_secs = if has_meaningful_progress(&state) {
             STREAM_IDLE_TIMEOUT_SECS
         } else {
@@ -211,9 +212,10 @@ pub(super) async fn stream_response(
     finalize_stream_response(app, current_history, &markers, state)
 }
 
-/// 是否在终端显示「等待模型输出」的紧凑状态提示。
-/// 对所有 TTY 会话生效。独立行写入并 flush，保证提示立即可见，
-/// 收到首个可见 chunk 时用 \x1b[1A\r\x1b[2K 清掉，不残留额外行。
+/// Whether to show a compact "waiting for model output" status hint in the terminal.
+/// Applies to all TTY sessions. Written and flushed on its own line so it appears
+/// immediately; once the first visible chunk arrives it is cleared with
+/// \x1b[1A\r\x1b[2K, leaving no extra lines behind.
 fn should_show_waiting_hint(app: &App) -> bool {
     runtime_ctx::terminal_output_enabled()
         && io::stdout().is_terminal()
@@ -224,7 +226,7 @@ fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     if state.render.waiting_hint_active {
         return Ok(());
     }
-    // 独立行等待提示：首个 chunk 到达时用 \x1b[1A\r\x1b[2K 清掉。
+    // Waiting hint on its own line: cleared with \x1b[1A\r\x1b[2K when the first chunk arrives.
     write_waiting_hint_line("waiting…")?;
     state.render.waiting_hint_active = true;
     state.render.waiting_hint_tool_call = false;
@@ -321,7 +323,7 @@ fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::
     {
         return Ok(());
     }
-    // 光标上移、清行后重写独立行，保持 buffering 状态可见。
+    // Move the cursor up, clear the line, then rewrite it so the buffering state stays visible.
     let stdout = io::stdout();
     let mut out = stdout.lock();
     write!(out, "\x1b[1A\r\x1b[2K")?;
@@ -335,7 +337,7 @@ pub(super) fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Resul
     if !state.render.waiting_hint_active {
         return Ok(());
     }
-    // 光标上移一行 + \r + 清行：擦掉独立提示行，让内容在原位输出。
+    // Cursor up one line + \r + clear line: erase the standalone hint line so content prints in place.
     let stdout = io::stdout();
     let mut out = stdout.lock();
     write!(out, "\x1b[1A\r\x1b[2K")?;
@@ -350,9 +352,10 @@ fn immediate_cancel_result(app: &App, state: &mut StreamProcessingState) -> Opti
     stream_interrupt_requested(app).then(|| cancelled_stream_result(state))
 }
 
-/// 取消/中断时的 thinking 折叠收尾：折叠窗口若仍活跃，必须先擦掉当前窗口并落一个
-/// `✓` 收口，否则半截 thinking 窗口会被留在屏幕上，下一轮重试
-/// 的 fresh state 会在其下方再画一个新 header——累积成「重复 header + 大段空白」。
+/// Thinking-fold cleanup on cancel/interrupt: if the fold window is still active we
+/// must erase the current window and settle with a `✓`; otherwise a half-drawn
+/// thinking window stays on screen, and the fresh state of the next retry draws a
+/// new header below it — stacking into a "duplicate header + large blank area".
 fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
     if runtime_ctx::terminal_output_enabled() {
         let _ = clear_waiting_hint(state);
@@ -447,8 +450,9 @@ async fn process_pending_tail(
     adapter: &'static dyn ProviderAdapter,
 ) -> Result<Option<StreamResult>, Box<dyn std::error::Error>> {
     if state.framing.pending.is_empty() {
-        // pending 为空时，仍需检查 sse_event_data 是否有未 flush 的最后一个事件。
-        // 部分 provider 在关闭连接前不发送最终空行（\n\n），导致最后一个 SSE 事件被丢弃。
+        // Even with pending empty, still check whether sse_event_data holds one last
+        // unflushed event. Some providers don't send the final blank line (\n\n)
+        // before closing the connection, which would drop the last SSE event.
         if !state.framing.sse_event_data.trim().is_empty() {
             if flush_sse_event(app, current_history, markers, state, adapter)?.should_stop {
                 let final_state = std::mem::replace(state, StreamProcessingState::new());
@@ -511,9 +515,9 @@ fn finalize_stream_response(
 
     flush_inline_markup_normalizer(app, current_history, markers, &mut state)?;
 
-    // 冲刷内联 `</think>` 拆分器的残留。仍处捕获态说明 `</think>` 从未到达：
-    // withhold 设计下整段缓冲按 **content** 安全回退（宁可降级为「思考泄漏进正文」
-    // 也不丢失可见答案）。未 arm 的模型此处恒为空。
+    // Flush whatever the inline `response` splitter still holds. Still capturing means `response` never arrived:
+    // under withhold the whole buffer safely falls back as **content** (better to degrade to "thinking leaked into body"
+    // than to lose the visible answer). Always empty for models that never arm the splitter.
     let (residual_reasoning, residual_content) = state.content.content_think_demuxer.flush();
     if !residual_reasoning.is_empty() {
         state.content.reasoning_text.push_str(&residual_reasoning);
@@ -523,7 +527,7 @@ fn finalize_stream_response(
     }
 
     if render_terminal {
-        // 残留也必须经过去重/折叠/样式管线，不能直接写终端。
+        // Residue must still go through the dedup/fold/style pipeline; it cannot be written straight to the terminal.
         flush_digest_filter_to_terminal(markers, &mut state, false)?;
         flush_terminal_splitter(&mut state, markers)?;
         let suppress_duplicate = final_assistant_matches_terminal_dedupe(&state);
@@ -537,7 +541,7 @@ fn finalize_stream_response(
 
     // AIOS: flush any pending LLM usage to kernel `/dev/llm` before returning.
     // Prefer the model echoed by the provider; fall back to what we requested.
-    // 先快照 usage 统计，供 StreamResult 截断诊断使用（take 会消费）。
+    // Snapshot usage stats first so StreamResult truncation diagnostics can use them (take() consumes).
     let usage_snapshot = state.pending_llm_usage.as_ref().map(|(_, u)| {
         let cached = u
             .prompt_tokens_details
@@ -566,21 +570,21 @@ fn finalize_stream_response(
         collect_valid_tool_calls(&mut state.content.tool_calls_map);
     state.content.dropped_malformed_tool_call = dropped_malformed;
     if stream_error || state.content.tool_args_cap_exceeded {
-        // 未收到 finish_reason 就 idle timeout，无法证明工具调用已经完整；即使当前
-        // arguments 恰好是合法 JSON，也不能提前执行可能仍在生成中的操作。工具参数
-        // 超过上限被掐断同理：模型被强制停流，参数未必完整。
+        // Idle timeout before finish_reason does not prove the tool call is complete; even if the current
+        // arguments happen to be valid JSON, an operation that may still be generating must not run early. The same
+        // applies when arguments were cut off by hitting the cap: the model was force-stopped, so arguments may be incomplete.
         tool_calls.clear();
     }
 
-    // Fallback：部分 provider 会把 function call 作为普通 content 返回，而不走
-    // delta.tool_calls[]。流式解析未命中时，对完整 assistant_text 再做一次保守恢复。
-    // 参数超限被掐断与 idle timeout 同理：模型被强制停流，assistant_text 里
-    // 出现的疑似内联工具调用同样不可信，一并跳过恢复，避免绕过上面的丢弃逻辑。
+    // Fallback: some providers return function calls as plain content instead of going through
+    // delta.tool_calls[]. When streaming parse misses, do one conservative recovery pass over the full assistant_text.
+    // Same principle as idle timeout when arguments were cut off at the cap: the model was force-stopped, so any
+    // suspected inline tool call in assistant_text is equally untrustworthy and is skipped, keeping the drop logic intact.
     if !stream_error && !state.content.tool_args_cap_exceeded && tool_calls.is_empty() {
         if let Some(recovered) = recover_inline_tool_calls(&state.content.assistant_text) {
             tool_calls = recovered;
-            // 协议载荷既不是 assistant 正文，也不是模型 self_note。恢复成功后直接
-            // 丢弃，避免 no-tool handoff 把 DSML/JSON 持久化为 internal_note。
+            // The protocol payload is neither assistant body nor a model self_note. After successful recovery, drop it
+            // outright so a no-tool handoff does not persist DSML/JSON as an internal_note.
             state.content.assistant_text.clear();
         }
     }
@@ -603,37 +607,37 @@ fn finalize_stream_response(
     } else {
         let has_text = !state.content.assistant_text.trim().is_empty();
         let has_reasoning = !state.content.reasoning_text.trim().is_empty();
-        // 截断优先判定：本轮无有效工具调用，但有工具调用被丢弃（arguments JSON 半截）。
-        // 这类"想干活但被切断"的情况若按 Completed 静默结束，会让大文件 write_file
-        // 等操作凭空消失。升级为可重试的 Truncated，由上层注入收缩提示后自动重试。
+        // Truncation takes priority: this turn had no valid tool calls, but some were dropped (half-cut arguments JSON).
+        // Ending such an "interrupted mid-work" turn silently as Completed would make large-file write_file
+        // operations vanish. Escalate to retryable Truncated so the upper layer injects a shrink hint and retries.
         //
-        // 注意：finish_reason=length（撞输出上限）本身并不触发 Truncated，因为推理模型
-        // 经常在 reasoning token 占满输出预算后返回 finish_reason=length，但可展示的
-        // assistant_text 实际上已完整。若同时有可见文本和 finish_reason=length，按
-        // Completed 处理，避免无意义的重试循环。只有在完全没有可见输出时，length 截断
-        // 才作为 Truncated 重试（此时模型可能刚开始输出就被掐断）。
+        // Note: finish_reason=length (hitting the output cap) alone does NOT trigger Truncated, because reasoning models
+        // often return finish_reason=length after reasoning tokens filled the output budget while the displayable
+        // assistant_text is actually complete. With both visible text and finish_reason=length, treat it as
+        // Completed to avoid pointless retry loops. Only when there is no visible output at all is length truncation
+        // retried as Truncated (the model may have been cut off right as it started outputting).
         if degenerate_repetition {
             StreamOutcome::Truncated
         } else if state.content.dropped_malformed_tool_call {
             StreamOutcome::Truncated
         } else if truncated_by_length && !has_text {
-            // finish_reason=length 且没有可见文本：模型可能只产出了 reasoning
-            // 就被掐断，或根本没输出。降 effort 重试，把预算让给实际内容。
+            // finish_reason=length with no visible text: the model may have produced only reasoning
+            // before being cut off, or produced nothing. Retry at a lower effort so budget goes to actual content.
             StreamOutcome::Truncated
         } else if has_reasoning && !has_text && !state.content.finish_reason_seen {
-            // reasoning-only 早停：只吐了思考、没有可见文本、也**没收到任何
-            // finish_reason** 就断流（idle 超时 / 提前 EOF，常见于 GLM 等
-            // enable_thinking 模型憋着思考链迟迟不产出可见内容，撞上 idle 超时
-            // 被掐断）。这类"思考到一半被切断"若按 Completed 静默结束，会让本轮
-            // 回答凭空为空。升级为可重试 Truncated，由上层降档 / 关 thinking 后重试。
+            // Reasoning-only early stop: the stream ended (idle timeout / early EOF, common for GLM and other
+            // enable_thinking models that sit on their chain without visible content and hit the idle timeout)
+            // with only thinking emitted, no visible text and **no finish_reason at all**. Ending such a
+            // "cut off mid-thinking" turn silently as Completed would leave the answer empty. Escalate to
+            // retryable Truncated; the upper layer downgrades / disables thinking and retries.
             //
-            // 与上面的 length 分支互补：length 是服务端显式报截断；这里是流早停、
-            // 根本没等到结束标记。区别于「正常 finish_reason=stop 的 reasoning-only
-            // 响应」——那种 finish_reason_seen=true，不进本分支，仍按 Completed。
+            // Complementary to the length branch above: length is an explicit server-side truncation; here the
+            // stream stopped early without ever seeing the end marker. Distinct from a normal finish_reason=stop
+            // reasoning-only response — there finish_reason_seen=true, so this branch is not entered and it stays Completed.
             StreamOutcome::Truncated
         } else if !has_text && !has_reasoning {
-            // 检测空响应：模型没有文本、没有工具调用、没有推理内容。
-            // 通常是 provider 端的问题（如限流、模型异常），触发重试。
+            // Detect empty responses: no text, no tool calls, no reasoning content.
+            // Usually a provider-side problem (rate limit, model error); trigger a retry.
             StreamOutcome::EmptyResponse
         } else {
             StreamOutcome::Completed
@@ -658,9 +662,9 @@ fn finalize_stream_response(
     })
 }
 
-/// 当开启 `ai.prompt_cache.show_metrics`（默认开）且本次请求命中了 prompt
-/// 缓存时，打印一行缓存命中指标。OpenAI / DashScope 等是服务端自动缓存，
-/// 这里只是把它们已经上报的 `cached_tokens` 可视化出来。
+/// When `ai.prompt_cache.show_metrics` (default on) is set and this request hit the prompt
+/// cache, print one line of cache-hit metrics. OpenAI / DashScope etc. cache server-side;
+/// this just visualizes the `cached_tokens` they already reported.
 fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::StreamUsage) {
     if !runtime_ctx::terminal_output_enabled() {
         return;
@@ -685,8 +689,8 @@ fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::StreamUsage) {
     }
 }
 
-/// 纯函数：根据 prompt_tokens / cached_tokens 生成可读的缓存命中行。
-/// 仅当确实有缓存命中（cached > 0）时返回 Some，避免无意义噪声。
+/// Pure function: build a readable cache-hit line from prompt_tokens / cached_tokens.
+/// Returns Some only when there really was a hit (cached > 0), to avoid pointless noise.
 fn format_prompt_cache_metrics(prompt_tokens: u64, cached_tokens: u64) -> Option<String> {
     if cached_tokens == 0 || prompt_tokens == 0 {
         return None;
@@ -806,8 +810,8 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 
     let (tool_calls, dropped_malformed) =
         collect_valid_tool_calls(&mut state.content.tool_calls_map);
-    // 解码错误兜底路径本身就是流被中途切断的产物；若还伴随工具调用被丢弃，
-    // 明确标记为截断以触发上层自动重试，而非静默按完成收尾。
+    // The decode-error fallback path is itself the product of a stream cut mid-way; if tool calls were also dropped,
+    // mark it as truncation to trigger the upper-layer automatic retry instead of silently finishing.
     let outcome = if dropped_malformed {
         StreamOutcome::Truncated
     } else {
@@ -823,7 +827,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         reasoning_items: std::mem::take(&mut state.content.reasoning_items),
         skip_response_drain: true,
         truncated_by_length: false,
-        // 流读取失败导致的截断，不是模型输出过长。
+        // Truncation caused by a stream read failure, not by over-long model output.
         stream_error: true,
         finish_reason_value: state.content.finish_reason_value.clone(),
         usage_prompt_tokens: 0,
@@ -871,8 +875,8 @@ fn open_tool_call_line(
     Ok(())
 }
 
-/// 终端不打印工具调用参数；流式接收阶段只显示可擦除的工具名状态提示，
-/// 实际执行行仍由工具执行层统一输出。
+/// The terminal does not print tool-call arguments; the streaming receive phase only shows an erasable
+/// tool-name status line, while the actual execution lines are printed uniformly by the tool execution layer.
 fn write_tool_call_arguments_stream(_arguments: &str) -> io::Result<()> {
     Ok(())
 }
@@ -897,7 +901,10 @@ fn process_external_tool_calls_delta(
         {
             continue;
         }
-        let index = stream_tool_call.index;
+        let index = match stream_tool_call.index {
+            Some(idx) => idx,
+            None => resolve_indexless_tool_call_key(&mut state.content, &stream_tool_call.id),
+        };
         ensure_tool_calls_section_open(app, markers, state);
 
         let render_chunk = {
@@ -944,6 +951,32 @@ fn process_external_tool_calls_delta(
     meaningful_progress
 }
 
+/// Incrementally resolves cumulative keys for chat-completions tool calls whose
+/// `index` is missing. If everything fell onto the default key 0, parallel tool
+/// calls would merge into one; instead group by id: reuse the key of an existing
+/// builder with the same id, otherwise synthesize a stable key in
+/// [10000, usize::MAX) from a hash of the id (real provider indexes are single
+/// digits, so no collision). Parameter-continuation deltas with neither id nor
+/// index attach to the most recent call without an index; if there is none, fall
+/// back to the old-behavior key 0.
+fn resolve_indexless_tool_call_key(state: &mut StreamContentState, id: &str) -> usize {
+    if !id.is_empty() {
+        for (key, builder) in state.tool_calls_map.iter() {
+            if !builder.id.is_empty() && builder.id == id {
+                return *key;
+            }
+        }
+        let mut hash = 10000u64;
+        for byte in id.bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
+        }
+        let key = hash as usize;
+        state.last_indexless_tool_call_key = Some(key);
+        return key;
+    }
+    state.last_indexless_tool_call_key.unwrap_or(0)
+}
+
 fn append_tool_call_arguments(
     existing: &mut String,
     incoming: &str,
@@ -962,8 +995,8 @@ fn append_tool_call_arguments(
     }
 }
 
-/// 消费内部工具调用流事件。返回值表示本批事件里是否检出了模型幻觉的内部工具协议
-/// 标记（`HallucinatedProtocolMarker`）——调用方据此停流并降档重试。
+/// Consume internal tool-call stream events. The return value indicates whether this batch detected a hallucinated
+/// internal tool-protocol marker (`HallucinatedProtocolMarker`) — the caller then stops the stream and retries downgraded.
 fn process_internal_tool_calls(
     app: &mut App,
     markers: &StreamMarkers,
@@ -1008,10 +1041,10 @@ fn process_internal_tool_calls(
             InternalToolCallStreamEvent::End => {
                 if state.render.current_printing_index == Some(state.content.internal_tool_call_idx)
                 {
-                    // 流式阶段不再打印工具名/参数（open_tool_call_line 与
-                    // write_tool_call_arguments_stream 均为 no-op），因此这里只需
-                    // 复位颜色即可。绝不能用 println!——那会在「✓」与后续
-                    // 输出之间凭空插入一行空行（外部 delta 工具路径本就不打这行）。
+                    // The streaming phase no longer prints tool name/arguments (open_tool_call_line and
+                    // write_tool_call_arguments_stream are no-ops), so only the color needs resetting here.
+                    // Never use println! — it would insert a blank line between the `✓` and the following output
+                    // (the external delta tool path never prints this line anyway).
                     if runtime_ctx::terminal_output_enabled() {
                         print!("\x1b[0m");
                     }
@@ -1023,8 +1056,8 @@ fn process_internal_tool_calls(
                 state.content.internal_tool_call_idx += 1;
             }
             InternalToolCallStreamEvent::HallucinatedProtocolMarker => {
-                // streamer 已把整块幻觉「工具结果」剥离不外显；这里只记录信号，
-                // 由调用方停流并走 degenerate_repetition 降档重试路径。
+                // The streamer already strips the whole hallucinated "tool result" so nothing is shown; only the signal
+                // is recorded here, and the caller stops the stream and takes the degenerate_repetition downgrade-retry path.
                 saw_hallucinated_marker = true;
             }
         }
@@ -1049,14 +1082,14 @@ fn commit_visible_content(
         clear_waiting_hint(state)?;
     }
 
-    // 当 thinking 折叠模式活跃且遇到 end_thinking_tag 时，做最终的折叠渲染
+    // When thinking fold mode is active and an end_thinking_tag arrives, do the final fold render
     if render_terminal
         && !state.content.thinking_open
         && state.render.thinking_fold.active
         && is_standalone_stream_marker(&content, &markers.end_thinking_tag)
     {
         finalize_thinking_fold(state)?;
-        // end_thinking_tag 内容只用于视觉分隔，不需要追加到 assistant_text
+        // end_thinking_tag content is only a visual separator; it must not be appended to assistant_text
         let text = content.replace(&markers.end_thinking_tag, "");
         let text = text.trim_matches('\n');
         if !text.is_empty() {
@@ -1067,7 +1100,7 @@ fn commit_visible_content(
     }
 
     if render_terminal {
-        // digest 是给模型看的附加图片理解内容，终端展示时剥离（历史/assistant_text 保留原文）
+        // digest is extra image-understanding content meant for the model; strip it for terminal display (history/assistant_text keep the original)
         let terminal_content = state.render.digest_filter.push(&content);
         if markers.subagent_preview_enabled() {
             write_subagent_content_folded(terminal_content.as_str(), state)?;
@@ -1116,10 +1149,10 @@ fn normalize_end_thinking_boundary(
     }
 }
 
-/// 流结束时冲刷 `InlineMarkupNormalizer` 缓存的尾部（可能是一个完整但收尾没
-/// 补齐的 marker，或普通文本），经与流式相同的解析链处理：识别成的 tool call
-/// 进入 tool_calls_map，剩余可见文本追加到 assistant_text，避免半截 marker 或
-/// 被暂存的内容丢失。
+/// At stream end, flush the tail cached by `InlineMarkupNormalizer` (a complete marker whose closing was never
+/// delivered, or plain text) through the same parse chain as streaming: recognized tool calls go into
+/// tool_calls_map and remaining visible text is appended to assistant_text, so no half-cut marker or
+/// buffered content is lost.
 fn flush_inline_markup_normalizer(
     app: &mut App,
     current_history: &mut String,
@@ -1136,8 +1169,8 @@ fn flush_inline_markup_normalizer(
     tool_events.extend(anthropic_events);
     tool_events.extend(bare_xml_events);
     if !tool_events.is_empty() {
-        // 冲刷阶段流已结束，无法再停流重试；此处即便检出幻觉标记，streamer 也已把
-        // 整块剥离，cleaned 不含协议标记，直接忽略返回值即可（不落盘幻觉正文）。
+        // The stream is over during flush, so we cannot stop and retry; even if a hallucination marker were detected,
+        // the streamer already stripped the whole block and cleaned contains no protocol markers, so the return value is ignored (no hallucinated body persisted).
         let _ = process_internal_tool_calls(app, markers, state, tool_events);
     }
     if !cleaned.is_empty() {
@@ -1252,8 +1285,8 @@ fn is_standalone_stream_marker(content: &str, marker: &str) -> bool {
     content.trim_matches('\n') == marker
 }
 
-/// Thinking 内容的折叠渲染：从第一行开始维护一个可重写窗口，
-/// 始终只在 terminal 中展示最近 N 行，超出部分折叠为一条摘要。
+/// Folded rendering of thinking content: maintain a rewritable window starting at the first line,
+/// always showing only the most recent N lines in the terminal and folding the rest into one summary line.
 fn write_thinking_content_folded(
     content: &str,
     state: &mut StreamProcessingState,
@@ -1268,7 +1301,7 @@ fn write_thinking_content_folded(
         return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
     }
 
-    // 控制行必须是独占 marker，本身不应与正文混写。
+    // Control lines must be exclusive markers; they must not be interleaved with body text.
     if is_standalone_stream_marker(content, &markers.thinking_tag) {
         if !fold.active {
             if state.render.markdown.has_unfinished_line() {
@@ -1330,18 +1363,18 @@ fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str
     }
 }
 
-/// 只覆盖 thinking 正文窗口（折叠摘要 + 最近可见行），header 不在此列。
+/// Covers only the thinking body window (fold summary + recent visible lines); the header is not included.
 ///
-/// header（`○`）在折叠激活时打印一次并锚定在正文之上，之后每次重画都只
-/// 擦除并重写正文。正文最多展示 `max_visible_lines` 条物理内容行和一条折叠摘要，恒定
-/// 落在可视视口内，因此相对擦除永远够得着，不会随窗口滚入 scrollback
-/// 而失步——即便失步，也无法再生出第二个 header，从根上杜绝「孤儿 header 叠加」。
+/// The header (`○`) is printed once when folding activates and stays anchored above the body; every redraw after that only
+/// erases and rewrites the body. The body shows at most `max_visible_lines` physical content lines plus one fold summary, and stays
+/// within the visible viewport, so relative erases always reach it and it never scrolls out of sync into the
+/// scrollback — and even if it did, no second header could be created, eliminating "orphan header stacking" at the root.
 fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    // 只擦除上一次的正文区域；header 已锚定在其上方，绝不触碰。
-    // 注意：terminal 缩窄后，旧正文会被终端按当前宽度自动 reflow 成更多物理行；
-    // 这里不能只信缓存的 window_rows，而要按"上次正文在当前宽度下会占几行"重算。
+    // Only erase the previous body region; the header is anchored above it and must never be touched.
+    // Note: after the terminal narrows, the terminal auto-reflows old body into more physical lines at the current width;
+    // so do not trust the cached window_rows — recompute how many rows the last body would take at the current width.
     let erase_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
     erase_fold_body(&mut out, erase_rows)?;
     if fold.active && !fold.header_drawn {
@@ -1365,7 +1398,7 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
     Ok(())
 }
 
-/// 打印锚定的折叠 header。只应在折叠激活后被调用一次。
+/// Print the anchored fold header. Should be called only once after folding activates.
 fn write_fold_header(
     out: &mut impl Write,
     fold: &super::state::ThinkingFoldState,
@@ -1373,7 +1406,7 @@ fn write_fold_header(
     write!(out, "  {ACCENT_MUTED}{}\x1b[0m\r\n", fold.header_label)
 }
 
-/// thinking 收尾时直接落最终 header；用于尚未写过进行中 header 的空折叠。
+/// Write the final header directly when thinking ends; used for an empty fold that never wrote an in-progress header.
 fn write_thinking_fold_completion_header(
     out: &mut impl Write,
     fold: &super::state::ThinkingFoldState,
@@ -1386,10 +1419,10 @@ fn write_thinking_fold_completion_header(
     )
 }
 
-/// 将锚定的 `○ thinking` 原位改写为完成态，而不在正文下另起一条 `✓ thinking`。
+/// Rewrite the anchored `○ thinking` in place to the completed state instead of printing a separate `✓ thinking` below the body.
 ///
-/// 调用前 `erase_fold_body` 已让光标回到 header 下方的正文首行；因此上移一行、清空
-/// header 后重写即可。折叠正文仍按原逻辑绘制在新 header 下方。
+/// Before this, `erase_fold_body` moved the cursor back to the first body line under the header; so move up one line,
+/// clear the header and rewrite it. The folded body is still drawn below the new header by the usual logic.
 fn replace_thinking_fold_header(
     out: &mut impl Write,
     fold: &super::state::ThinkingFoldState,
@@ -1399,8 +1432,8 @@ fn replace_thinking_fold_header(
     write_thinking_fold_completion_header(out, fold, line_count)
 }
 
-/// 正文渲染后光标停在最后一条物理行，而不是额外的空白行。重画时因此只需上移
-/// `rows - 1`；先回到行首再擦到屏幕底部，可覆盖窗口变窄后产生的 reflow 行。
+/// After rendering the body the cursor rests on the last physical line, not on an extra blank line; redraws therefore only need to move up
+/// `rows - 1`; returning to the line start before erasing to the screen bottom covers reflow lines produced by a narrowed window.
 fn erase_fold_body(out: &mut impl Write, rows: usize) -> io::Result<()> {
     if rows == 0 {
         return Ok(());
@@ -1409,9 +1442,9 @@ fn erase_fold_body(out: &mut impl Write, rows: usize) -> io::Result<()> {
     if rows > 1 {
         write!(out, "\x1b[{}A", rows - 1)?;
     }
-    // 不能用 CSI 0J：它会从正文首行清到物理屏幕末端，越过 DECSTBM 滚动
-    // 区并擦掉底部 side-note composer。只逐行清除已渲染的正文窗口，最后把
-    // 光标恢复到正文首行，保持后续重画的相对光标语义不变。
+    // CSI 0J cannot be used: it clears from the first body line to the end of the physical screen, crossing the DECSTBM scroll
+    // region and wiping out the side-note composer at the bottom. Clear only the rendered body window line by line, then restore
+    // the cursor to the first body line so relative-cursor semantics of later redraws stay unchanged.
     for row in 0..rows {
         write!(out, "\r\x1b[2K")?;
         if row + 1 < rows {
@@ -1424,14 +1457,14 @@ fn erase_fold_body(out: &mut impl Write, rows: usize) -> io::Result<()> {
     write!(out, "\r")
 }
 
-/// Thinking 结束时的最终渲染：覆盖正文窗口，并把锚定的 `○` 原位改为 `✓`。
+/// Final rendering when thinking ends: overwrite the body window and turn the anchored `○` into `✓` in place.
 pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
     finalize_fold(&mut state.render.thinking_fold, true)
 }
 
 fn finalize_subagent_preview_fold(state: &mut StreamProcessingState) -> io::Result<()> {
-    // subagent 预览收尾保留窗口正文：子代理的最终输出应留在终端可见，
-    // 不套用 thinking 的「强制 0 行纯摘要」收尾（那会把关键结论一并折叠）。
+    // Subagent preview keeps the window body at the end: the subagent's final output should stay visible in the terminal,
+    // so the "forced 0-line pure summary" ending used by thinking (which would fold the key conclusions too) is not applied.
     finalize_fold(&mut state.render.subagent_fold, false)
 }
 
@@ -1444,7 +1477,7 @@ fn finalize_fold(
     finalize_fold_to(&mut out, fold, collapse_body)
 }
 
-/// 折叠收尾写入实现；抽出 writer 以便回归测试精确验证终端光标序列。
+/// Fold-finalize writer implementation; extracted behind a writer so regression tests can verify terminal cursor sequences precisely.
 fn finalize_fold_to(
     mut out: &mut impl Write,
     fold: &mut super::state::ThinkingFoldState,
@@ -1456,8 +1489,8 @@ fn finalize_fold_to(
 
     let erase_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
     erase_fold_body(&mut out, erase_rows)?;
-    // thinking 的完成态要替换进行中 header，而不是在正文下再打印一条 footer。
-    // 若折叠尚未真正落地，直接写完成态，避免短暂出现 `○ thinking`。
+    // The thinking completed state replaces the in-progress header instead of printing another footer below the body.
+    // If the fold never actually landed, write the completed state directly to avoid a brief `○ thinking`.
     let line_count = fold
         .total_lines
         .saturating_add(usize::from(!fold.current_line.is_empty()));
@@ -1469,14 +1502,14 @@ fn finalize_fold_to(
             fold.header_drawn = true;
         }
     } else if !fold.header_drawn {
-        // subagent 预览维持既有 header/footer 两行布局。
+        // Subagent preview keeps the existing two-line header/footer layout.
         write_fold_header(&mut out, fold)?;
         fold.header_drawn = true;
     }
 
-    // thinking 收尾折叠为纯摘要（0 行窗口），不显示正文行：思考尾部常复述结论/问句，
-    // 若保留可见行会与紧随其后的最终回答在终端重复。subagent 预览收尾不折叠，
-    // 保留最近可见窗口行，让子代理最终输出对用户可见。
+    // Thinking finalize folds to a pure summary (0-line window) with no body lines: the tail of thinking often restates
+    // conclusions/questions, and keeping visible lines would duplicate the final answer that follows in the terminal. Subagent
+    // preview does not fold — it keeps the recent visible window lines so the subagent's final output stays visible.
     let saved_max_visible_lines = fold.max_visible_lines;
     if collapse_body {
         fold.max_visible_lines = 0;
@@ -1496,7 +1529,7 @@ fn finalize_fold_to(
     fold.rendered_body_lines = rendered_body_lines;
 
     if !collapse_body {
-        // subagent 预览保留既有 footer；thinking 的规模信息已写入被原位替换的 header。
+        // Subagent preview keeps its footer; thinking's scale info was already written into the in-place-replaced header.
         if body_rows > 0 {
             out.write_all(b"\r\n")?;
         }
@@ -1508,7 +1541,7 @@ fn finalize_fold_to(
     }
     out.flush()?;
 
-    // 重置折叠状态
+    // Reset fold state
     fold.reset();
     Ok(())
 }
@@ -1521,7 +1554,7 @@ fn thinking_fold_hidden_count(fold: &super::state::ThinkingFoldState) -> usize {
 }
 
 fn thinking_fold_visible_lines(fold: &super::state::ThinkingFoldState) -> Vec<&str> {
-    // 0 行窗口 = 纯摘要模式：连当前未完成行也不显示，避免结论复述泄漏到终端。
+    // 0-line window = pure summary mode: even the current incomplete line is hidden, so restated conclusions cannot leak to the terminal.
     if fold.max_visible_lines == 0 {
         return Vec::new();
     }
@@ -1565,9 +1598,9 @@ fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<St
     (lines, marker_lines)
 }
 
-/// 渲染折叠窗口的**正文**（折叠摘要 + 最近可见行），不含 header。
-/// header 由 `write_fold_header` 单独锚定打印。返回的行数即正文物理行数；正文末尾不
-/// 输出换行，光标始终停在最后一行，避免 xterm.js 把末尾 LF 解释成额外滚屏。
+/// Render the **body** of the fold window (fold summary + recent visible lines), without the header.
+/// The header is anchored and printed separately by `write_fold_header`. Returns the number of physical body lines; the body does not
+/// end with a newline and the cursor always stays on the last line, so xterm.js does not interpret a trailing LF as extra scrolling.
 fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
     let (lines, marker_lines) = thinking_fold_window_lines(fold);
     let (window, rows, _) = render_thinking_fold_window_lines(
@@ -1597,8 +1630,8 @@ fn render_thinking_fold_window_lines(
     }
     let hidden_wrapped_rows = wrapped_content_rows.len().saturating_sub(max_visible_rows);
     let marker = if hidden_wrapped_rows > 0 {
-        // 已按物理行截断时，首个被隐藏的内容可能来自一条仍在输出的逻辑行，不能再
-        // 报告不精确的“earlier lines”计数。
+        // When truncated at a physical line, the first hidden content may come from a still-streaming logical line, so the
+        // imprecise "earlier lines" count can no longer be reported.
         Some("… more".to_string())
     } else if marker_lines > 0 {
         Some(lines[0].clone())
@@ -1612,7 +1645,7 @@ fn render_thinking_fold_window_lines(
             .saturating_add(usize::from(marker.is_some())),
     );
     if let Some(marker) = marker {
-        // 折叠提示必须永远只占一物理行；正文才允许逐行包裹。
+        // The fold hint must always occupy exactly one physical line; only the body is allowed to wrap.
         rows_to_render.push((
             clamp_line_to_terminal_row_with_reserve(&marker, reserve_cols),
             true,
@@ -1627,9 +1660,9 @@ fn render_thinking_fold_window_lines(
 
     let mut out = String::new();
     let mut rendered_lines = Vec::with_capacity(rows_to_render.len());
-    // 折叠正文固定内缩。正文最多保留 max_visible_rows 条包裹后的物理行；若还需
-    // 隐藏内容，单行折叠提示不计入正文预算。每个包裹段本身恰好占一个物理行，
-    // xterm.js 集成终端额外留出右边距。
+    // Folded body has fixed indentation. The body keeps at most max_visible_rows wrapped physical lines; if more
+    // content must be hidden, the single-line fold hint does not count against the body budget. Each wrapped segment
+    // occupies exactly one physical line; extra right margin for the xterm.js integrated terminal.
     let mut rows = 0usize;
     let mut first_rendered_row = true;
 
@@ -1699,13 +1732,13 @@ fn process_stream_payload(
                 return Err(format!("provider stream error: {msg}").into());
             }
             super::state::ParsedStreamPayload::ReasoningItem(item) => {
-                // 捕获完整 reasoning item（含 encrypted_content）供同 turn 工具链回放。
-                // 不产生可见输出，也不进持久化历史。Spark 等模型可能在同一 tool_call
-                // 前产生多段 reasoning（不同 id），需全部保留。网关会对同一 reasoning
-                // 资源在 .added（部分载荷）与 .done（完整载荷）重复下发（id 相同、
-                // 内容不同），全字段相等去重判不等；按 id 收敛、保留后到的一项
-                // （.done 恒晚于 .added，为协议最终权威状态），否则回放时同一资源
-                // id 出现两次，modelhub 返回 400 (-4003)。
+                // Capture the full reasoning item (incl. encrypted_content) for same-turn tool-chain replay.
+                // Produces no visible output and never enters persisted history. Models like Spark may emit multiple
+                // reasoning segments (different ids) before one tool_call; all must be kept. The gateway re-sends the same
+                // reasoning resource in .added (partial payload) and .done (full payload) with identical ids but
+                // different content, so whole-field equality dedup would judge them unequal; converge by id and keep the
+                // later one (.done always comes after .added and is the protocol's authoritative final state), otherwise the same
+                // resource id appears twice during replay and modelhub returns 400 (-4003).
                 state.content.reasoning_items.push(item);
                 crate::ai::history::compress::dedup_reasoning_items_by_id(
                     &mut state.content.reasoning_items,
@@ -1740,8 +1773,8 @@ fn process_stream_payload(
         state.content.finish_reason_seen = true;
     }
 
-    // 记录最近一个非空 finish_reason 的具体值。`length` 表示服务端因输出上限
-    // 截断，是把本轮升级为可重试 Truncated 的关键信号。
+    // Record the most recent non-empty finish_reason value. `length` means the server cut output at the limit,
+    // the key signal for escalating this turn to retryable Truncated.
     if let Some(reason) = chunk.choices.iter().find_map(|choice| {
         choice
             .finish_reason
@@ -1765,10 +1798,10 @@ fn process_stream_payload(
 
     state.content.empty_choice_chunks = 0;
 
-    // content_part.added / output_text.done 可能重发已存在正文，与 output_text.delta
-    // 增量重叠：用 **demux 前的原始 content 通道文本** 做未见后缀计算。仅用
-    // assistant_text 去重会在 demux 已关闭后失效：重发的 `reasoning</think>answer`
-    // 前缀与可见正文 `answer` 对不上，会把 reasoning 再次泄漏到正文。
+    // content_part.added / output_text.done may re-send already-present body overlapping the output_text.delta
+    // increments: compute unseen suffixes from the **raw content-channel text before demux**. Deduping only by
+    // assistant_text fails once demux is closed: a re-sent `reasoning`answer` prefix no longer matches the visible
+    // `answer` body, and reasoning would leak into the body again.
     let mut content_channel_progress = false;
     if let Some(choice) = chunk.choices.first_mut()
         && !choice.delta.content.is_empty()
@@ -1786,14 +1819,14 @@ fn process_stream_payload(
         }
     }
 
-    // 预填 `<think>` 模板拆分：这类 reasoner 把推理链写进 content 通道、仅以悬空
-    // `</think>` 收尾。捕获态下 withhold--content 暂存于拆分器缓冲区、不向任何通道
-    // 增量吐出，直到 `</think>` 到达才一次性把前缀归入 delta.reasoning_content（复用
-    // 既有 thinking 折叠与累积路径）、正文留在 content。若 `</think>` 始终未到达，
-    // flush 时整段按 content 安全回退。未 arm 的模型此处直通、零影响。快照(.done)
-    // 先在上方按原始 content 通道去重，只把未见后缀送入有状态拆分器，因此不会重复
-    // 计数。content_channel_progress 会刷新 idle 计时器，避免长思考被 withhold 误判为
-    // 首包/空闲超时。
+    // Prefilled `thinking` template splitting: such reasoners write the chain into the content channel and only close with a dangling
+    // `response`. While capturing, withhold — content is buffered in the splitter and not emitted to any channel
+    // incrementally until `response` arrives, when the whole prefix is attributed at once to delta.reasoning_content (reusing
+    // the existing thinking fold & accumulation paths) and the body stays in content. If `response` never arrives,
+    // flush falls back the whole segment as content safely. Models that never arm it pass through with zero impact. Snapshots (.done)
+    // were deduped above on the raw content channel, so only unseen suffixes enter the stateful splitter and nothing is
+    // double-counted. content_channel_progress refreshes the idle timer, so a long withheld chain is not misjudged as
+    // first-packet/idle timeout.
     if let Some(choice) = chunk.choices.first_mut()
         && !choice.delta.content.is_empty()
     {
@@ -1803,21 +1836,19 @@ fn process_stream_payload(
             .push(&choice.delta.content);
         choice.delta.content = content;
         if !reasoning.is_empty() {
-            // 与既有语义一致：reasoning_content 可与推理片段拼接续写。
+            // Consistent with existing semantics: reasoning_content can concatenate with prior reasoning fragments.
             choice.delta.reasoning_content =
                 merge_reasoning_fragments(&choice.delta.reasoning_content, &reasoning);
         }
     }
 
-    // reasoning_content 去重：Responses API 对同一段推理摘要会通过多条事件路径重复
-    // 下发（reasoning_summary_text.{delta,done} 与 content_part.{added,done} 的
-    // summary_text 携带相同内容）。此前仅对 SnapshotChunk（.done）做未见后缀去重，
-    // Append 模式（.delta/.added）的 reasoning_content 未去重，导致跨事件路径的
-    // thinking 重复输出。这里统一对两种模式计算未见后缀，渲染时只输出新增部分。
-    //
-    // 累积到 reasoning_text 时区分模式：Append 累积原文以保留模型复读循环的退化检测
-    // （has_degenerate_reasoning_repetition 依赖连续重复）；Snapshot 累积去重后缀
-    // （快照是已见文本的重发，原文已在 Append 阶段累积过）。
+    // reasoning_content dedup: the Responses API re-sends the same reasoning summary through multiple event paths
+    // (reasoning_summary_text.{delta,done} and content_part.{added,done} carry identical summary_text). Previously only
+    // SnapshotChunk (.done) got unseen-suffix dedup; Append-mode (.delta/.added) reasoning_content was not deduped, causing
+    // duplicated thinking across event paths. Here both modes compute unseen suffixes, so rendering outputs only the new part.
+    // When accumulating into reasoning_text, distinguish modes: Append accumulates the original text to keep degeneration
+    // detection of model repetition loops (has_degenerate_reasoning_repetition depends on consecutive repeats); Snapshot
+    // accumulates the deduped suffix (a snapshot re-sends already-seen text whose original was accumulated during Append).
     let original_reasoning = chunk
         .choices
         .first()
@@ -1835,8 +1866,8 @@ fn process_stream_payload(
         state.content.saw_reasoning_output = true;
         state.content.reasoning_text.push_str(&emitted_reasoning);
 
-        // 某些长工具链上下文会诱发模型在 thinking 中逐字复读同一句话。继续读取只会
-        // 消耗输出预算并让终端看似卡死；升级为可重试截断，交给上层降低推理档位。
+        // Some long tool-chain contexts make the model verbatim-repeat one sentence in thinking. Continuing to read only
+        // burns the output budget and makes the terminal look stuck; escalate to retryable truncation and let the upper layer lower the reasoning tier.
         if has_degenerate_repetition(&state.content.reasoning_text) {
             state.content.finish_reason_seen = true;
             state.content.finish_reason_value =
@@ -1851,7 +1882,7 @@ fn process_stream_payload(
     let recovered_inline_events =
         recover_protocol_only_inline_tool_call_snapshot(&mut chunk, merge_mode, state);
 
-    // 增量事件保留模型原始文本；快照事件仅渲染未见后缀，避免协议重发。
+    // Incremental events keep the model's original text; snapshot events only render unseen suffixes to avoid protocol re-sends.
     if let Some(choice) = chunk.choices.first_mut() {
         choice.delta.reasoning_content = emitted_reasoning;
     }
@@ -1880,10 +1911,10 @@ fn process_stream_payload(
         || external_tool_progress
         || internal_tool_progress;
     if saw_hallucinated_marker {
-        // 模型在可见正文里自编自演「工具调用→工具结果」，吐出系统从不生成的内部
-        // 协议标记（`<function_results>` 等）。streamer 已把整块剥离，这里停流并复用
-        // degenerate_repetition 降档重试路径，避免幻觉正文落盘毒化下一轮请求。这是
-        // 零误伤信号：合法重复代码/措辞永不含内部协议标记，无需任何文本统计阈值。
+        // The model acts out "tool call → tool result" in visible body, emitting internal protocol markers that the system
+        // never generates (`<function_results>` etc.). The streamer already strips the whole block; here we stop the stream and
+        // reuse the degenerate_repetition downgrade-retry path so hallucinated body is never persisted to poison the next request. This is a
+        // zero-false-positive signal: legitimate repeated code/wording never contains internal protocol markers, so no text-statistical threshold is needed.
         state.content.finish_reason_seen = true;
         state.content.finish_reason_value = Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
         if runtime_ctx::terminal_output_enabled() {
@@ -1892,11 +1923,11 @@ fn process_stream_payload(
         return Ok(StreamPayloadOutcome::stop_with_progress());
     }
 
-    // 工具参数总量上限兜底：模型开启工具调用后应快速收口（id/name/少量参数）。
-    // 若参数流持续增长直到越过 MAX_TOOL_ARG_BYTES，说明模型在无限循环吐参数
-    // （本次事故即 apply_patch 参数 20+ 分钟不停流）。这类退化没有文本重复特征
-    // （每次都在拼新内容），退化重复检测抓不到，必须靠总量兜底；命中即停流并
-    // 复用 degenerate_repetition 降档重试路径，避免永远等不到 End/finish_reason。
+    // Total tool-argument cap as a backstop: after the model opens a tool call it should close quickly (id/name/few args).
+    // If the argument stream keeps growing until it passes MAX_TOOL_ARG_BYTES, the model is looping forever emitting arguments
+    // (the incident was apply_patch arguments streaming for 20+ minutes). Such degeneration has no text-repetition signature
+    // (new content every time), so repetition detection cannot catch it; only this total cap can. On hit, stop the stream and
+    // reuse the degenerate_repetition downgrade-retry path instead of waiting forever for End/finish_reason.
     let tool_arg_bytes = state
         .content
         .tool_calls_map
@@ -1906,8 +1937,8 @@ fn process_stream_payload(
     if tool_arg_bytes > MAX_TOOL_ARG_BYTES {
         state.content.finish_reason_seen = true;
         state.content.finish_reason_value = Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
-        // 流是被掐断的：模型可能仍在生成参数，截止瞬间恰好合法的 JSON 也不能
-        // 当完整工具调用执行（与 stream_idle_timed_out 同一原则）。
+        // The stream was cut off: the model may still be generating arguments, so even JSON that happens to be valid at
+        // the cut instant must not run as a complete tool call (same principle as stream_idle_timed_out).
         state.content.tool_args_cap_exceeded = true;
         if runtime_ctx::terminal_output_enabled() {
             eprintln!(
@@ -1945,9 +1976,9 @@ fn process_stream_payload(
                 if content.is_empty() {
                     continue;
                 }
-                // Step 6：可插拔流过滤器（`state.filters`，端口在 ports/stream.rs）。
-                // 空链直通（零行为变化）；None = 丢弃该 chunk 的可见文本，不入
-                // assistant_text / 终端，也不参与下面的退化重复检测。
+                // Step 6: pluggable stream filters (`state.filters`; the port lives in ports/stream.rs).
+                // An empty chain passes through (zero behavior change); None = drop this chunk's visible text, keep it out of
+                // assistant_text / the terminal, and out of the degeneration-repeat detection below.
                 let Some(content) = state.filters.apply(content) else {
                     continue;
                 };
@@ -1958,11 +1989,11 @@ fn process_stream_payload(
                 commit_visible_content(app, current_history, markers, state, content)?;
                 meaningful_progress |= state.content.assistant_text.len() > assistant_len_before;
 
-                // 与 reasoning 路径对称：模型也会在**可见输出**里退化成逐字复读同一
-                // 短语（本次事故即 assistant content 复读「我再重新读一遍…」直到撑满
-                // 输出预算，产出 16 万字符垃圾并落盘，毒化下一轮请求触发 provider
-                // 400 InvalidParameter）。此前退化守卫只挂在 reasoning_content 上，
-                // 可见文本完全失守。命中即置 finish_reason 并停流，交给上层降档重试。
+                // Symmetric to the reasoning path: the model can also degenerate into verbatim repetition of one phrase in the
+                // **visible output** (the incident was assistant content repeating one phrase verbatim until it filled the
+                // output budget, producing 160k chars of junk that got persisted and poisoned the next request, triggering a provider
+                // 400 InvalidParameter). Previously the degeneration guard only hung on reasoning_content, leaving visible
+                // text completely unguarded. On hit, set finish_reason and stop the stream; the upper layer retries downgraded.
                 if has_degenerate_repetition(&state.content.assistant_text) {
                     state.content.finish_reason_seen = true;
                     state.content.finish_reason_value =
@@ -1985,8 +2016,8 @@ fn process_stream_payload(
     })
 }
 
-/// OpenCode 等兼容网关偶尔会把完整 DSML 工具协议作为单个 content 快照返回。
-/// 在正文提交和终端渲染前识别这种完整包裹，避免只能在流末 fallback 恢复。
+/// Compatible gateways like OpenCode sometimes return the complete DSML tool protocol as a single content snapshot.
+/// Recognize such a full wrapper before body submission and terminal rendering, so we do not only recover via a stream-end fallback.
 fn recover_protocol_only_inline_tool_call_snapshot(
     chunk: &mut StreamChunk,
     merge_mode: StreamEventMergeMode,
@@ -2010,8 +2041,8 @@ fn recover_protocol_only_inline_tool_call_snapshot(
 
     choice.delta.content.clear();
     if matches!(merge_mode, StreamEventMergeMode::AppendMissingSuffix) {
-        // `.done` 快照会重发此前 delta 已解析的完整协议；只过滤语义相同的调用，
-        // 不能因已有其他工具调用就误吞真正新增的并行调用。
+        // A `.done` snapshot re-sends the full protocol already parsed from earlier deltas; filter only semantically equal calls,
+        // so genuinely new parallel calls are not swallowed just because other tool calls already exist.
         tool_calls.retain(|tool_call| {
             !state
                 .content
@@ -2048,15 +2079,15 @@ fn collected_tool_call_matches(
     }
 }
 
-/// 检测文本尾部是否出现三次连续、完全相同的长片段（退化复读循环）。
+/// Detect three consecutive, exactly-identical long fragments at the tail of the text (degenerate repetition loop).
 ///
-/// 同时用于 reasoning_content 与可见 assistant 输出：模型在长工具链上下文下可能
-/// 在思考链或正文里逐字复读同一句话，继续读取只会耗尽输出预算并把垃圾落盘。
-/// 使用字符而非字节比较以正确处理中文；要求片段包含足够多的字母、数字或中文等实际
-/// 内容，避免把分隔线、空白或 Markdown 标点误判为退化循环。
+/// Used for both reasoning_content and visible assistant output: under long tool-chain contexts the model may
+/// verbatim-repeat one sentence in the chain or body; continuing to read only drains the output budget and persists junk.
+/// Compares characters rather than bytes to handle Chinese correctly; the fragment must contain enough real content —
+/// letters, digits or Chinese characters — so separator lines, whitespace or Markdown punctuation are not misjudged as a degeneration loop.
 fn has_degenerate_repetition(text: &str) -> bool {
-    // 每个流 chunk 都会调用该检测，因此只保留足以覆盖最大候选片段的尾部，避免长推理
-    // 随上下文增长退化成反复扫描整段文本。
+    // This detector runs on every stream chunk, so only keep a tail large enough to cover the largest candidate fragment,
+    // avoiding a long reasoning that degrades into repeatedly scanning the whole text as context grows.
     let mut chars = text
         .chars()
         .rev()
@@ -2119,7 +2150,7 @@ fn render_thinking_event(
                 return Ok(());
             }
             clear_waiting_hint(state)?;
-            // digest 是给模型看的附加图片理解内容，thinking 通道的终端展示同样剥离
+            // digest is extra image-understanding content meant for the model; the thinking channel's terminal display strips it too
             let terminal_text = state.render.digest_filter.push(text);
             if terminal_text.is_empty() {
                 return Ok(());
@@ -2176,8 +2207,8 @@ fn stream_text_event_to_content(
     merge_mode: StreamEventMergeMode,
     assistant_text: &str,
 ) -> Option<String> {
-    // Thinking 事件只允许走 render_thinking_event() 的终端展示路径，不能进入
-    // assistant_text/current_history。这里故意只返回可见正文。
+    // Thinking events may only go through render_thinking_event()'s terminal display path; they must not enter
+    // assistant_text/current_history. Deliberately only visible body is returned here.
     if markers.subagent_preview_enabled() {
         return match event {
             StreamTextEvent::AppendContent(text) => match merge_mode {
@@ -2248,8 +2279,9 @@ fn unseen_suffix_after_visible_overlap(existing: &str, incoming: &str) -> Option
     for overlap_chars in (1..boundaries.len()).rev() {
         let split_idx = boundaries[overlap_chars];
         let overlap = &incoming[..split_idx];
-        // 纯空白（如 \n）的重叠几乎总是伪匹配——模型常以 \n 开始新段落，
-        // 而 assistant_text 也常以 \n 结尾。只有含可见字符的重叠才视为真正的重复。
+        // Overlaps of pure whitespace (e.g. \n) are almost always false matches — models often
+        // start a new paragraph with \n, and assistant_text often ends with \n. Only overlaps
+        // containing visible characters count as real repetition.
         if existing.ends_with(overlap) && overlap.chars().any(|c| !c.is_whitespace()) {
             return Some(incoming[split_idx..].to_string());
         }
@@ -2258,27 +2290,27 @@ fn unseen_suffix_after_visible_overlap(existing: &str, incoming: &str) -> Option
     None
 }
 
-/// 空白容忍的后缀去重。
+/// Whitespace-tolerant suffix dedup.
 ///
-/// 兼容旧历史/异常 provider 产生的空白差异：当 `assistant_text` 与最终
-/// `response.output_text.done` 快照仅在空白上不一致时，仍避免把已流式输出的整段
-/// 快照当作新内容重复追加。
+/// Tolerates whitespace differences from old history/abnormal providers: when `assistant_text` and the final
+/// `response.output_text.done` snapshot differ only in whitespace, still avoid re-appending the whole already-streamed
+/// snapshot as new content.
 ///
-/// 这里按"空白可跳过"的方式逐字符对齐 existing 与 incoming，找出 incoming 中已被
-/// existing 覆盖的前缀，返回 incoming 剩余的（保留原始空白）尾部。若 incoming 的可见
-/// 字符已全部被覆盖则返回 `Some("")`；若两者在可见字符上无法对齐则返回 `None`。
+/// Aligns existing and incoming character by character with "whitespace skippable" to find the incoming prefix already
+/// covered by existing, and returns the remaining incoming tail (original whitespace preserved). If all of incoming's visible
+/// characters are covered, returns `Some("")`; if the visible characters cannot align, returns `None`.
 fn unseen_suffix_whitespace_tolerant(existing: &str, incoming: &str) -> Option<String> {
     let e: Vec<(usize, char)> = existing.char_indices().collect();
     let i: Vec<(usize, char)> = incoming.char_indices().collect();
     let (mut ei, mut ii) = (0usize, 0usize);
 
-    // 跳过 incoming 开头的空白（快照常以换行开头，而 assistant_text 没有）
+    // Skip leading whitespace of incoming (snapshots often start with a newline while assistant_text does not)
     while ii < i.len() && i[ii].1.is_whitespace() {
         ii += 1;
     }
 
-    // last_matched_ii 记录 incoming 中最后一个被匹配上的可见字符之后的 Vec 下标，
-    // 用于在结束时定位"剩余未覆盖尾部"在 incoming 中的字节起点。
+    // last_matched_ii records the Vec index just after the last matched visible character in incoming,
+    // used to locate the byte start of the "remaining uncovered tail" in incoming at the end.
     let mut last_matched_ii = ii;
 
     while ei < e.len() && ii < i.len() {
@@ -2300,7 +2332,7 @@ fn unseen_suffix_whitespace_tolerant(existing: &str, incoming: &str) -> Option<S
             ii += 1;
             continue;
         }
-        // 两侧都是可见字符：必须相等才算对齐
+        // Both sides are visible characters: they must be equal to count as aligned
         if ec == ic {
             last_matched_ii = ii + 1;
             ei += 1;
@@ -2310,8 +2342,8 @@ fn unseen_suffix_whitespace_tolerant(existing: &str, incoming: &str) -> Option<S
         }
     }
 
-    // existing 已耗尽；incoming 中 last_matched_ii 之后的字节即为剩余（未覆盖）尾部。
-    // 若 incoming 也已全部匹配则 start_byte == incoming.len()，返回空串。
+    // existing is exhausted; the bytes after last_matched_ii in incoming are the remaining (uncovered) tail.
+    // If incoming is fully matched too, start_byte == incoming.len(), returning an empty string.
     let start_byte = i
         .get(last_matched_ii)
         .map(|(b, _)| *b)

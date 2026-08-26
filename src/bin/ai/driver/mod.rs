@@ -92,15 +92,17 @@ fn current_task_pid() -> Option<u64> {
     TASK_PID.try_with(|v| *v).unwrap_or(None)
 }
 
-/// 当前已派发、尚未结束的后台子 agent tokio 任务数量。
+/// Number of background subagent tokio tasks currently dispatched and not yet finished.
 ///
-/// 后台子 agent 通过 `tokio::spawn` 跑在 worker 线程上，会用 `println!`（裸 `\n`）
-/// 流式写终端。而交互式输入框（multiline TUI）会开启 raw mode，关闭 TTY 的 ONLCR，
-/// 此时裸 `\n` 不再补 `\r`，子 agent 的输出就会逐行右移（阶梯式错位）。
+/// Background subagents run on worker threads via `tokio::spawn` and stream to the
+/// terminal with `println!` (raw `\n`). The interactive input box (multiline TUI) turns
+/// on raw mode, which disables the TTY's ONLCR, so a raw `\n` no longer gets a `\r`
+/// appended and each subagent output line shifts right (staircase misalignment).
 ///
-/// 用这个计数器在"打开输入框前"判断是否仍有后台子 agent 在跑：只要 > 0 就不进入
-/// raw mode 输入框，让调度循环继续 tick、子 agent 在 cooked 模式下正常输出，避免
-/// 并发写终端造成的显示混乱（同时不丢失任何子 agent 输出）。
+/// Use this counter before opening the input box to tell whether background subagents
+/// are still running: as long as it is > 0, do not enter the raw-mode input box; let the
+/// scheduler loop keep ticking so subagents output normally in cooked mode, avoiding
+/// garbled concurrent terminal writes (without losing any subagent output).
 static BG_SUBAGENT_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_NOTIFY: Notify = Notify::const_new();
 const SCHEDULER_TICK_DURATION: Duration = Duration::from_millis(10);
@@ -147,8 +149,9 @@ impl SchedulerClock {
                 self.duration_until_ticks(wake_tick.saturating_sub(os.current_tick()).max(1))
             })
         };
-        // task_wait 使用真实 wall-clock 预算，不能只依赖一次性的 delayed notify。
-        // 将其 deadline 直接纳入 scheduler wait，即使通知丢失也会准时重新扫描并唤醒前台。
+        // task_wait uses a real wall-clock budget, so it cannot rely only on a one-shot
+        // delayed notify. Fold its deadline into the scheduler wait so the foreground is
+        // rescanned and woken on time even if a notification is lost.
         let task_wait_wake_after =
             crate::ai::tools::task_tools::next_task_wait_wakeup_delay();
         let wake_after = match (kernel_wake_after, task_wait_wake_after) {
@@ -179,8 +182,8 @@ fn bg_subagents_inflight() -> bool {
     BG_SUBAGENT_INFLIGHT.load(Ordering::Acquire) > 0
 }
 
-/// RAII 守卫：派发后台子 agent 前 `inc`，子 agent 任务结束（含 panic）时自动 `dec`，
-/// 保证计数不泄漏。
+/// RAII guard: `inc` before dispatching a background subagent, automatically `dec` when
+/// the subagent task ends (including on panic), so the count never leaks.
 pub(super) struct BgSubagentGuard;
 
 impl BgSubagentGuard {
@@ -208,10 +211,11 @@ fn should_auto_drop_terminated(os: &dyn aios_kernel::kernel::Syscall, pid: u64) 
         .unwrap_or(false)
 }
 
-/// 进程终止 + 清理 + 自动 drop 的统一收尾流程。
+/// Unified teardown flow for terminating a process: cleanup + drop.
 ///
-/// `set_current` 为 `true` 时，会先把 `pid` 标记为当前 pid（适用于先前调度切换走、
-/// 现在要终止它的场景）；为 `false` 时假设调用方已经在 `pid` 的上下文里。
+/// When `set_current` is `true`, the `pid` is first marked as the current pid (for the
+/// case where scheduling switched away earlier and we now want to terminate it); when
+/// `false`, the caller is assumed to already be in the `pid` context.
 pub(super) fn terminate_and_cleanup(
     os: &mut (dyn aios_kernel::kernel::Kernel + Send),
     pid: u64,
@@ -255,24 +259,28 @@ pub(super) fn format_rlimit_termination_result(verdict: RlimitVerdict) -> String
 }
 
 /// Default max LLM iterations allowed per turn (prevents infinite loops).
-/// 4096 过高：在「字节完全重复才停」与「跑满上限」之间缺乏中段治理，单轮可
-/// 堆出数十万字符上下文。中段断路器（orchestrator 的 iteration soft limit）
-/// 已负责及时收敛，这里作为硬上限收敛到更合理的量级即可。
+/// 4096 was too high: with no mid-turn governance between "stop only on byte-exact
+/// repetition" and "run to the cap", a single turn could pile up hundreds of thousands
+/// of characters of context. The mid-turn circuit breaker (the orchestrator's iteration
+/// soft limit) already handles timely convergence, so this hard cap just needs to clamp
+/// to a more reasonable magnitude.
 const DEFAULT_MAX_ITERATIONS: usize = 64 * 64;
 
 /// Max iterations for subagent (executor) processes
 const EXECUTOR_MAX_ITERATIONS: usize = 64 * 64;
 
 fn one_shot_cli_mode(cli: &cli::ParsedCli) -> bool {
-    // `a -ns` 无实质内容时自动进入交互模式（等同 `-ns -i`），不算 one-shot，
-    // 否则会触发 one-shot 清理语义（退出即删会话、失败不续跑等）。
+    // `a -ns` with no real content falls into interactive mode automatically (same as
+    // `-ns -i`), so it is not one-shot; otherwise it would trigger one-shot cleanup
+    // semantics (delete session on exit, no resume after failure, etc.).
     if note_search::note_search_interactive_mode(cli) {
         return false;
     }
     !cli.args.is_empty() && !cli.interactive
 }
 
-/// Ctrl+C 在 signal handler 中只设置标志；在 driver 事件循环里再安全地落盘当前会话。
+/// Ctrl+C only sets a flag in the signal handler; the driver event loop then safely
+/// persists the current session.
 fn should_suspend_session_on_sigint(app: &App) -> bool {
     if app.cli.session.is_some() {
         return true;
@@ -283,7 +291,8 @@ fn should_suspend_session_on_sigint(app: &App) -> bool {
 }
 
 fn suspend_session_on_sigint(app: &App) {
-    // 新建但尚未产生用户消息的会话会在退出清理阶段删除，不能留下指向它的挂起条目。
+    // A session that was just created but has no user messages yet will be deleted
+    // during exit cleanup, so it must not leave a suspended entry pointing at it.
     if !should_suspend_session_on_sigint(app) {
         return;
     }
@@ -324,24 +333,27 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_with_cli(cli).await
 }
 
-/// 用已解析好的 CLI 参数运行 AIOS。
-/// 供 background 模式等需要预先修改 cli（注入 session id / 持久化指令）的入口复用。
+/// Run AIOS with already-parsed CLI arguments.
+/// Reused by entry points such as background mode that need to modify the cli first
+/// (injecting a session id / persistence directives).
 pub(in crate::ai) async fn run_with_cli(
     cli: cli::ParsedCli,
 ) -> Result<(), Box<dyn std::error::Error>> {
     aios_kernel::kernel::register_current_pid_provider(current_task_pid);
 
-    // cli 已由调用方解析完毕（run() 或 background 入口），此处直接使用。
+    // The cli has already been parsed by the caller (run() or the background entry),
+    // so use it directly here.
 
-    // 纯本地命令（帮助、列工具/技能/agent）不调用 LLM，必须在 ensure_models_available /
-    // load_config 之前处理：否则模型注册表（models/）为空或配置损坏时，连 `a --help` 都跑不起来，
-    // 形成“想看帮助先得把环境配好”的死循环。
+    // Purely local commands (help, list tools/skills/agents) do not call the LLM and
+    // must be handled before ensure_models_available / load_config: otherwise, when the
+    // model registry (models/) is empty or the config is broken, even `a --help` fails
+    // to run, creating a dead loop where you must configure the environment to see help.
     if cli.help {
         cli::print_help();
         return Ok(());
     }
 
-    // --generate-completions: 生成 shell 补全脚本（纯本地，不调 LLM）
+    // --generate-completions: generate the shell completion script (purely local, no LLM)
     if cli.generate_completions {
         let shell = cli.args.first().cloned().unwrap_or_else(|| {
             std::env::var("SHELL")
@@ -393,7 +405,8 @@ pub(in crate::ai) async fn run_with_cli(
     let session_id = startup_choice.session_id.clone();
     let startup_notice = startup_choice.startup_notice.clone();
 
-    // 处理 --clear --session <id>：启动前清空指定 session 的 history 与 checkpoint。
+    // Handle --clear --session <id>: clear the history and checkpoint of the given
+    // session before startup.
     if cli.clear {
         let target = cli.session.as_deref().map(str::trim).unwrap_or("");
         if target.is_empty() {
@@ -410,15 +423,18 @@ pub(in crate::ai) async fn run_with_cli(
     if let Err(err) = session_store.ensure_root_dir() {
         eprintln!("[Warning] Failed to create sessions dir: {}", err);
     }
-    // 注册当前进程的 PID 到 sessions 目录，供 `/proc` 命令发现活跃 session。
-    // 必须早于任何 session 恢复/读取，避免 prune 在启动窗口内删除正在打开的 session。
-    // guard 在函数退出（正常返回 / panic）时自动删除 PID 文件；
-    // 即使被 SIGKILL 杀死，`/proc` 也会通过 PID 存活探测清理残留。
+    // Register the current process's PID in the sessions directory so the `/proc`
+    // command can discover active sessions. This must happen before any session
+    // restore/read to prevent prune from deleting an open session during the startup
+    // window. The guard removes the PID file automatically when the function exits
+    // (normal return or panic); even if SIGKILLed, `/proc` cleans up leftovers via PID
+    // liveness probing.
     let _session_pid_guard =
         session_pid::SessionPidGuard::register(session_store.sessions_root(), &session_id);
 
-    // 崩溃可能发生在 checkpoint rollback 发布 live SQLite 与 assets 之间；先完成
-    // 事务恢复，避免后续 turn 读取到跨版本的状态。
+    // A crash can occur between checkpoint rollback publishing the live SQLite and the
+    // assets; finish transaction recovery first so later turns never read
+    // cross-version state.
     session_store.recover_checkpoint_state(&session_id)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -435,7 +451,8 @@ pub(in crate::ai) async fn run_with_cli(
         );
     })?;
 
-    // 优先使用挂起 session 保存的模型（如果有），否则使用 CLI/配置的默认模型
+    // Prefer the model saved by the suspended session (if any), otherwise the default
+    // model from CLI/config.
     let current_model = if let Some(ref model) = startup_choice.model
         && !model.is_empty()
     {
@@ -446,10 +463,11 @@ pub(in crate::ai) async fn run_with_cli(
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
-    // one-shot 模式（如 `-n/-nd/-ne`）虽然携带位置参数，但后续流程仍可能回退到
-    // 交互式多行输入/编辑；例如 `-ne` 在命中条目后需要打开预填编辑器。
-    // 因此不要把 prompt editor 绑定到“无位置参数”这一条件，否则会出现
-    // “命中条目后没有输入空间，直接被判定为取消”的问题。
+    // One-shot modes (e.g. `-n/-nd/-ne`) carry positional args, but later flows may
+    // still fall back to interactive multiline input/editing; for example `-ne` opens a
+    // pre-filled editor after matching an entry. So do not bind the prompt editor to
+    // "no positional args", otherwise "no input space after matching an entry, judged
+    // as cancelled" can occur.
     let prompt_editor = Some(PromptEditor::new(
         &session_id,
         config.history_file.as_path(),
@@ -491,9 +509,11 @@ pub(in crate::ai) async fn run_with_cli(
         last_skill_bias: None,
         os: os_arc,
         agent_reload_counter: None,
-        // ThinkingOrchestrator 的 JSON 控制协议尚未与主回答解耦，也不会消费
-        // 自己要求模型生成的状态 JSON。生产请求不注册它，避免可选 observer
-        // 把用户回答劫持成 STRICT JSON；待改为独立控制调用后再显式接回。
+        // The ThinkingOrchestrator's JSON control protocol is not yet decoupled from
+        // the main answer, and it does not consume the state JSON it asks the model to
+        // produce. Production requests do not register it, so that optional observers
+        // never hijack user answers into STRICT JSON; re-attach it explicitly once it
+        // becomes an independent control call.
         observers: Vec::new(),
         last_known_prompt_tokens: None,
         last_known_cached_prompt_tokens: None,
@@ -511,7 +531,8 @@ pub(in crate::ai) async fn run_with_cli(
     if let Some(notice) = startup_notice {
         println!("{notice}");
     }
-    // 处理 --note-delete / -nd：输入一段话，模型自动匹配知识库条目，确认后删除。
+    // Handle --note-delete / -nd: the model matches a knowledge-base entry from the
+    // input text and deletes it after confirmation.
     if let Some(query) = app.cli.note_delete.clone() {
         return runtime_ctx::PERSONA_MEMORY_PATH
             .scope(
@@ -521,7 +542,8 @@ pub(in crate::ai) async fn run_with_cli(
             .await;
     }
 
-    // 处理 --note-edit / -ne：输入一段话，模型匹配知识库条目，在编辑器中改写后保存。
+    // Handle --note-edit / -ne: the model matches a knowledge-base entry from the input
+    // text, rewrites it in the editor, and saves.
     if let Some(query) = app.cli.note_edit.clone() {
         return runtime_ctx::PERSONA_MEMORY_PATH
             .scope(
@@ -531,8 +553,9 @@ pub(in crate::ai) async fn run_with_cli(
             .await;
     }
 
-    // 处理 --note / -n：快速保存 memo 到知识库并退出。
-    // 即使没有文本（只想保存剪贴板图片），只要传了 -n 也要进入保存流程。
+    // Handle --note / -n: quickly save a memo to the knowledge base and exit.
+    // Even with no text (just a clipboard image to save), entering the save flow when
+    // -n is passed.
     if app.cli.note_flag {
         return runtime_ctx::PERSONA_MEMORY_PATH
             .scope(
@@ -542,9 +565,9 @@ pub(in crate::ai) async fn run_with_cli(
             .await;
     }
 
-    // 处理 --note-search / -ns：带查询内容时默认单轮 notebook 检索后直接退出；
-    // 不带实质内容（如 `a -ns`）或带 `-i` 时进入交互模式，由 run_loop 在每轮
-    // 输入时继续执行 notebook 检索问答。
+    // Handle --note-search / -ns: with a query, run a single-turn notebook search and
+    // exit directly; with no real content (e.g. `a -ns`) or with `-i`, enter
+    // interactive mode where run_loop keeps answering notebook searches each turn.
     if app.cli.note_search && !note_search::note_search_interactive_mode(&app.cli) {
         return runtime_ctx::PERSONA_MEMORY_PATH
             .scope(
@@ -591,10 +614,10 @@ pub(in crate::ai) async fn run_with_cli(
         ctx.tools = super::tools::tool_definitions_for_groups(&["core"]);
     }
 
-    // 用 Arc 持有 manifests：每个 foreground turn / 后台子 agent 派发都要给
-    // DriverContext 一份快照，过去用 Arc::new(x.to_vec()) / Arc::new(x.clone())
-    // 会把全部 agent+skill 的 prompt 正文深拷贝一遍。改成 Arc 后这些快照退化
-    // 成廉价的指针 clone；reload 时整体替换 Arc 即可。
+    // Hold manifests behind an Arc: every foreground turn / background subagent
+    // dispatch hands DriverContext a snapshot. Previously Arc::new(x.to_vec()) /
+    // Arc::new(x.clone()) deep-copied every agent+skill prompt body. With an Arc these
+    // snapshots become cheap pointer clones; reload just replaces the Arc wholesale.
     let mut skill_manifests: Arc<Vec<SkillManifest>> = Arc::new(Vec::new());
     let mut agent_manifests: Arc<Vec<AgentManifest>> = Arc::new(Vec::new());
 
@@ -602,8 +625,9 @@ pub(in crate::ai) async fn run_with_cli(
         eprintln!("[persona] failed to persist session binding: {}", err);
     }
 
-    // 旧 session 可能还没有生成式标题；恢复时立即在后台补齐，避免必须再完成一个
-    // 新 turn 才触发，同时不让标题模型请求阻塞输入界面启动。
+    // Old sessions may lack a generative title; backfill it in the background right on
+    // restore so it is not deferred until a new turn completes, without letting the
+    // title model request block the input UI from starting.
     turn_runtime::maybe_generate_session_title(&app, true).await;
 
     run_loop(
@@ -616,8 +640,8 @@ pub(in crate::ai) async fn run_with_cli(
     .await
 }
 
-/// 处理一个 foreground ready 进程的恢复执行：构造 wake-up prompt、跑一轮 run_turn、
-/// 然后根据结果走 quota / 终止 / 失败收尾流程。
+/// Resume a foreground ready process: build the wake-up prompt, run one turn of
+/// run_turn, then follow the quota / termination / failure teardown flow per result.
 async fn run_foreground_resume(
     app: &mut App,
     mcp_client: &SharedMcpClient,
@@ -738,8 +762,10 @@ async fn run_loop(
     let mut manifests_loaded = false;
     let mut skill_watcher = None;
     let mut skill_watcher_started = false;
-    // 外部技能目录（尤其是 Trae 的递归目录）可能很大。交互模式下等输入框首帧
-    // 绘制完成后再在后台扫描；用户提交首条输入前仍会接管完整快照。
+    // External skill directories (especially Trae's recursive ones) can be large. In
+    // interactive mode scan in the background only after the input box's first frame
+    // is drawn; the full snapshot is still taken over before the user submits their
+    // first input.
     let mut initial_skill_manifests = if !one_shot_mode && !app.cli.no_skills {
         match skill_watcher::spawn_initial_skill_manifest_load() {
             Ok(loader) => Some(loader),
@@ -759,12 +785,14 @@ async fn run_loop(
     let mut subagent_status_line = SubagentStatusLine::new();
 
     let cleanup_one_shot = |app: &App| {
-        // 会话结束：清理本会话遗留的后台进程组（如 `python app.py &` 派生的
-        // 常驻服务）。在所有退出路径都会经过本闭包，故此处统一兜底。
+        // Session ending: clean up background process groups left by this session (e.g.
+        // resident services spawned via `python app.py &`). Every exit path goes
+        // through this closure, so this is the unified safety net.
         let _ = crate::ai::tools::storage::process_registry::kill_session(&app.session_id);
-        // one-shot 模式（且非恢复指定 session）：总是删除 session。
-        // 交互模式：如果未恢复已有 session 且当前 session 无任何用户消息
-        // （用户直接 Ctrl+C 退出，从未输入有效内容），也删除空 session。
+        // One-shot mode (and not restoring a given session): always delete the session.
+        // Interactive mode: if no existing session was restored and the current session
+        // has no user messages (user hit Ctrl+C directly without ever typing anything),
+        // also delete the empty session.
         if one_shot_mode && app.cli.session.is_none() {
             let store = SessionStore::new(app.config.history_file.as_path());
             let _ = store.delete_session(&app.session_id);
@@ -791,15 +819,19 @@ async fn run_loop(
     loop {
         let epoch = next_scheduler_epoch();
 
-        // 主动回收超过 wall-clock 总寿命的卡死 subagent 进程。task_wait 内的同名检查
-        // 只在主 agent 主动调用时触发；此处在调度事件发生后扫描，确保主 agent 去做别的事、
-        // 长期不调 task_wait 时，卡死的后台 subagent 也能被及时终止，避免永久占用
-        // 调度器资源。函数内分两步取锁（先 registry 后 kernel），不与 task_wait 的
-        // 锁顺序（registry -> kernel）形成环；且此处已释放 app.os 锁，无重入死锁。
+        // Proactively reap subagent processes stuck past their wall-clock lifetime.
+        // The same-named check inside task_wait only fires when the main agent calls it
+        // explicitly; scanning after scheduler events here ensures stuck background
+        // subagents are still terminated promptly even when the main agent moves on and
+        // never calls task_wait, avoiding permanently occupied scheduler resources. The
+        // function takes locks in two steps (registry first, then kernel), so it does
+        // not form a cycle with task_wait's lock order (registry -> kernel); and the
+        // app.os lock is already released here, so there is no re-entrant deadlock.
         crate::ai::tools::task_tools::reap_timed_out_subagents();
-        // `task_wait.timeout_secs` 是真实 wall-clock 预算，不依赖 scheduler tick
-        // 频率。到期后主动唤醒等待中的 foreground 进程，让下一次 task_wait 返回
-        // BUDGET ELAPSED，而不是因 tick 漂移无限续等。
+        // `task_wait.timeout_secs` is a real wall-clock budget that does not depend on
+        // the scheduler tick rate. On expiry, actively wake the waiting foreground
+        // process so the next task_wait returns BUDGET ELAPSED instead of waiting
+        // forever because of tick drift.
         crate::ai::tools::task_tools::wake_expired_task_waits();
 
         if let Some(counter) = app.agent_reload_counter.as_mut() {
@@ -859,9 +891,12 @@ async fn run_loop(
             continue;
         }
 
-        // 仍有后台子 agent 在途时，不打开交互式输入框（它会进入 raw mode，导致子 agent
-        // 的流式输出 `\n` 缺 `\r` 而逐行右移）。等待后台状态通知，等子 agent 在 cooked
-        // 模式下把输出写完、计数归零后再接收新输入。one-shot 模式没有交互输入框，不受影响。
+        // While background subagents are still in flight, do not open the interactive
+        // input box (it enters raw mode, so subagent streamed `\n` output lacks `\r` and
+        // shifts right line by line). Wait for the background status notification; only
+        // accept new input once subagents have finished writing in cooked mode and the
+        // count is back to zero. one-shot mode has no interactive input box, so it is
+        // unaffected.
         if !one_shot_mode && bg_subagents_inflight() {
             scheduler_clock.wait(app).await;
             continue;
@@ -870,9 +905,9 @@ async fn run_loop(
         subagent_status_line.finish();
 
         {
-            // ── Goal 模式自动续推 ──
-            // 当 goal 已设定且上一轮调用了工具时，跳过用户输入，直接注入
-            // continuation prompt 让 agent 继续推进目标。
+            // ── Goal mode auto-continuation ──
+            // When a goal is set and the last turn called tools, skip user input and
+            // inject a continuation prompt so the agent keeps pushing the goal forward.
             let goal_continuation = app
                 .goal_mode
                 .as_ref()
@@ -884,10 +919,12 @@ async fn run_loop(
                 attachments_text = String::new();
                 history_count = 0;
             } else {
-                // goal 激活但上一轮无工具调用：
-                // - 若是被 Ctrl+C 打断（last_turn_interrupted），保留 goal 模式，
-                //   静默回落到等待用户输入，不误报「Goal achieved」；
-                // - 否则视为目标已达成，打印提示并退出 goal 模式。
+                // Goal active but no tool calls in the last turn:
+                // - if interrupted by Ctrl+C (last_turn_interrupted), keep goal mode
+                //   and silently fall back to waiting for user input, without falsely
+                //   reporting "Goal achieved";
+                // - otherwise treat the goal as reached, print the notice, and exit
+                //   goal mode.
                 let goal_active = app.goal_mode.as_ref().map_or(false, |g| !g.is_empty());
                 if commands::goal::should_exit_goal_on_idle(
                     goal_active,
@@ -906,8 +943,10 @@ async fn run_loop(
                     .as_mut()
                     .and_then(|loader| loader.take_prompt_ready_notifier())
                 {
-                    // `-i <prompt>` 会直接消费 CLI 参数而不进入输入框，必须立即
-                    // 放行预加载线程，否则后续接管 manifest 时会永久等待通知。
+                    // `-i <prompt>` consumes the CLI argument directly without entering
+                    // the input box, so the preload thread must be released immediately,
+                    // otherwise it waits forever for a notification when taking over
+                    // the manifests later.
                     if !app.cli.args.is_empty() {
                         let _ = notifier.send(());
                     } else if let Some(editor) = app.prompt_editor.as_mut() {
@@ -931,11 +970,13 @@ async fn run_loop(
             }
         }
 
-        // ── 纯本地命令快速路径 ──
-        // /usage、/help、/model 等不依赖 skill/agent manifest 的命令先行分发。
-        // 命中且未注入 forced_question（无需继续 LLM 流程）时直接跳过昂贵的
-        // manifest 扫描——把 `a /usage` 等只读命令从 ~1s 降到 ~0.1s。
-        // /goal 等会注入 forced_question 继续对话，仍需加载 manifest。
+        // ── Local-command fast path ──
+        // Dispatch commands that do not depend on skill/agent manifests first
+        // (/usage, /help, /model, ...). When matched and no forced_question is
+        // injected (no need to continue the LLM flow), skip the expensive manifest
+        // scan — bringing read-only commands like `a /usage` from ~1s down to ~0.1s.
+        // Commands like /goal that inject a forced_question and continue the
+        // conversation still need the manifests loaded.
         if try_handle_local_command(app, mcp_client, &question)? {
             if let Some(rest) = app.forced_question.take() {
                 question = rest;
@@ -947,9 +988,10 @@ async fn run_loop(
             }
         }
 
-        // one-shot 模式直接取得 CLI 输入，交互模式则在用户提交首条输入前接管
-        // 已在首屏后扫描的 manifest。若预加载线程异常退出，则退回原有同步路径，
-        // 保证本轮的技能和 agent 语义完整。
+        // one-shot mode takes the CLI input directly; interactive mode adopts the
+        // manifests scanned right after the first screen before the user's first
+        // input. If the preload thread exits abnormally, fall back to the original
+        // synchronous path so this turn's skill and agent semantics stay complete.
         if !manifests_loaded {
             if let Some(loaded_skill_manifests) = initial_skill_manifests
                 .take()
@@ -972,8 +1014,9 @@ async fn run_loop(
             }
         }
 
-        // 监听线程只在首次快照就绪后启动：补全始终从内存快照读取，文件变更才
-        // 由后台线程重新扫描并替换该快照。
+        // The watcher thread starts only after the first snapshot is ready: completion
+        // always reads from the in-memory snapshot, and only file changes trigger a
+        // background rescan that replaces it.
         if !skill_watcher_started && !one_shot_mode {
             skill_watcher_started = true;
             match skill_watcher::start_skill_manifest_watcher(app.cli.no_skills) {
@@ -982,8 +1025,9 @@ async fn run_loop(
             }
         }
 
-        // 监听线程已同步刷新补全缓存；在输入提交后切换 driver 的运行时快照，
-        // 使紧接着的 /skills 命令和下一轮路由也能使用同一份新 manifest。
+        // The watcher thread has already refreshed the completion cache; after input is
+        // submitted, swap the driver's runtime snapshot so the following /skills
+        // command and the next turn's routing also use the same fresh manifests.
         if let Some(watcher) = skill_watcher.as_mut()
             && let Some(updated) = watcher.take_latest()
         {
@@ -997,7 +1041,8 @@ async fn run_loop(
             agent_manifests,
             skill_manifests,
         )? {
-            // /skills <name> <rest> 时，解析出的 rest 替换 question 继续问答
+            // For /skills <name> <rest>, the parsed rest replaces the question and the
+            // conversation continues.
             if let Some(rest) = app.forced_question.take() {
                 question = rest;
             } else {
@@ -1008,22 +1053,27 @@ async fn run_loop(
             }
         }
 
-        // /memo 命令需要异步调用模型做内容整理，单独在这里处理。
+        // The /memo command needs to call the model asynchronously to organize content,
+        // so it is handled separately here.
         if commands::memo::try_handle_memo_command(app, &question).await? {
             should_quit = false;
             continue;
         }
 
         if !one_shot_mode {
-            // 标题只依赖用户已经提交的输入，不应等待首轮模型响应完成。这里在 MCP 初始化、
-            // 图片预处理和主请求之前立即派发后台生成任务；结果写库后会通过 prompt update
-            // 通道通知前端，后续 request header 也会直接读到最新标题。
+            // The title depends only on the input the user already submitted, so it
+            // should not wait for the first model response. Dispatch the background
+            // generation task here immediately, before MCP init, image preprocessing,
+            // and the main request; once written to the store, the prompt update
+            // channel notifies the frontend, and later request headers read the latest
+            // title directly.
             turn_runtime::maybe_generate_session_title_for_input(app, &question).await;
         }
 
-        // ── Goal 模式等待状态 ──
-        // 用户输入 `/goal` 后，下一条非 slash 消息作为目标内容。
-        // 将目标包装成 goal prompt 发送给 LLM，同时更新 goal_mode。
+        // ── Goal mode wait state ──
+        // After the user types `/goal`, the next non-slash message becomes the goal
+        // content. It is wrapped into a goal prompt sent to the LLM while goal_mode is
+        // updated.
         if app.goal_mode.as_ref().map_or(false, |g| g.is_empty()) {
             let goal_text = question.clone();
             app.goal_mode = Some(goal_text.clone());
@@ -1067,8 +1117,9 @@ async fn run_loop(
         let precomputed_ocr = if !app.attached_image_files.is_empty()
             && !crate::ai::models::is_vl_model(&app.current_model)
         {
-            // 非 VL 模型收到附带图片时，不再由主 agent 直接调用 OCR 工具，而是派发一个
-            // 固定使用 VL 模型的 subagent 解析图片，解析完成后再回到主 agent。
+            // When a non-VL model receives attached images, the main agent no longer
+            // calls the OCR tool directly; instead a subagent pinned to a VL model
+            // parses the images, then control returns to the main agent.
             let image_parse_ctx = runtime_ctx::DriverContext::new(
                 app.clone(),
                 mcp_client.clone(),
@@ -1217,12 +1268,15 @@ async fn run_loop(
             }
         };
         app.session_history_file = original_history_file;
-        // task_wait / tool_wait 等协作式让出会让本轮 run_turn 以 `Continue` 返回，
-        // 而前台进程此时停在 Waiting（park），等后台子 agent 写回结果再被唤醒。
-        // one-shot 模式下 `should_quit` 恒为 true，若此处直接退出，就会在子 agent
-        // 还没被调度的瞬间结束进程（子 agent 永远停在 Ready）。因此：只要本轮是
-        // 让出（Continue）且仍有未终止的前台进程在等待，就继续 loop，让调度器派发
-        // 子 agent、收集结果并唤醒前台续跑，直到前台真正产出最终回答后再退出。
+        // Cooperative yields such as task_wait / tool_wait make this turn's run_turn
+        // return `Continue`, with the foreground process parked in Waiting until a
+        // background subagent writes back results and wakes it. In one-shot mode
+        // `should_quit` is always true; exiting here would kill the process the moment
+        // the subagent has not yet been scheduled (the subagent stays in Ready
+        // forever). So: as long as this turn yielded (Continue) and an unterminated
+        // foreground process is still waiting, keep looping so the scheduler dispatches
+        // the subagent, collects results, and wakes the foreground to resume, exiting
+        // only after the foreground truly produces its final answer.
         let parked_awaiting_subagents =
             matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Continue))
                 && has_pending_foreground_process(app);

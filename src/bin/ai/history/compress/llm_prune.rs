@@ -1,40 +1,40 @@
-//! LLM 引导的上下文裁剪（模型标记 → 延迟卸载）。
+//! LLM-guided context pruning (model marks → deferred offloading).
 //!
-//! 这是现有压缩逻辑的**补充**模块，不修改任何已有的压缩代码。
+//! This is a **supplement** to the existing compression logic; it does not modify any existing compression code.
 //!
-//! ## 原理
+//! ## How it works
 //!
-//! 每次调用模型时，在 system prompt 中追加一段简短提示，要求模型在
-//! 响应中使用 `<meta:self_note>prune:tool_call_id1,tool_call_id2</meta:self_note>`
-//! 标记当前不再需要的低价值 tool 消息（通常是过期的普通工具结果）。
+//! On every model call, a short prompt is appended to the system prompt asking the model to
+//! use `<meta:self_note>prune:tool_call_id1,tool_call_id2</meta:self_note>` in its response to
+//! mark tool messages that are no longer needed (usually stale ordinary tool results).
 //!
-//! - user / system / assistant / internal_note 等角色即
-//!   使被标记也永远不会被裁剪（见 `is_protected_role`）。
-//! - 仅 `role == "tool"` 且拥有 `tool_call_id` 的消息才可能被裁剪。
-//! - 工具自身通过 `ToolHistoryPolicyRegistration` 声明 `prune: Never` 的结果
-//!   （如 `plan`）永远不会被裁剪；`read_file` / 检索类 / `execute_command` 结果
-//!   虽「不可有损压缩」，但**允许**在过时后被 LLM 裁剪（两个维度正交）。
-//! - 累计被标记 **PRUNE_THRESHOLD** 次后，消息内容被卸载到会话 asset 磁盘，
-//!   inline 替换为**可召回 stub**（保留 `file_path` + 召回锚点 + head/tail 预览，
-//!   保留消息结构、不删除，避免破坏 tool_call ↔ tool_response 配对）。
-//! - 计数语义为「容忍静默 + 单调累计」而非「必须连续」：本轮模型未产出任何 prune
-//!   指令时计数完全不动（连续调工具的中间轮不会误清零）；被标记的 id 计数只增
-//!   （+1），未被标记的既有条目**保持不变、不衰减**，直到该 id 真正离开上下文或
-//!   被保护策略排除时才清除。之所以不衰减：模型每轮通常标记的是"这一轮新变陈旧
-//!   的结果"（每轮标不同 id），衰减会在计数到阈值前将其清零，使机制在最典型用法
-//!   下几乎永不触发。详见 [`update_prune_marks`]。
+//! - Roles such as user / system / assistant / internal_note are never pruned even if
+//!   they are marked (see `is_protected_role`).
+//! - Only messages with `role == "tool"` and a `tool_call_id` can be pruned.
+//! - Results whose tool declares `prune: Never` via `ToolHistoryPolicyRegistration`
+//!   (e.g. `plan`) are never pruned; `read_file` / retrieval / `execute_command` results
+//!   are "lossy-incompressible" but **may** still be pruned by the LLM once stale (the two dimensions are orthogonal).
+//! - After being marked **PRUNE_THRESHOLD** times cumulatively, the message content is offloaded to the session asset disk and
+//!   the inline text is replaced with a **recallable stub** (keeping `file_path` + a recall anchor + head/tail preview,
+//!   preserving the message structure without deletion, to avoid breaking the tool_call ↔ tool_response pairing).
+//! - Counting semantics are "silence-tolerant + monotonically accumulating" rather than "consecutive": if the model produces no prune
+//!   directives this round, the counts stay untouched (intermediate tool-only rounds do not wrongly reset them); marked ids only increase
+//!   (+1), and unmarked existing entries stay **unchanged, without decay**, until the id actually leaves the context or is
+//!   excluded by a protection policy. Why no decay: each round the model usually marks the results that "just became stale
+//!   this round" (different ids each round), so decay would zero counts before reaching the threshold and the mechanism would
+//!   almost never fire in the most typical usage. See [`update_prune_marks`].
 //!
-//! ## 安全保证（不丢真实信息）
+//! ## Safety guarantees (no loss of real information)
 //!
-//! 1. 不删除任何消息，不改变 messages 数组长度或顺序。
-//! 2. 不修改现有的 `compress/mod.rs` / `context_budget.rs` 逻辑。
-//! 3. 裁剪是**无损可召回**的：被裁剪的 tool 结果全文先写入会话 asset，inline
-//!    只替换为带 `file_path` 的召回 stub，模型可随时 `read_file` 取回完整原文。
-//! 4. **无归档目录（`overflow_dir=None`）时绝不裁剪**：宁可不压缩，也不做
-//!    不可逆的内容丢弃。
-//! 5. `apply_pruning` 只作用于每次模型请求使用的临时 `messages` 投影；持久化使用独立
-//!    的 canonical `turn_messages`，因此卸载不会污染真实历史。
-//! 6. 最近 `KEEP_RECENT_TOOL_GROUPS` 组工具结果始终保护，避免误裁剪当前轮所需结果。
+//! 1. No message is deleted; the messages array length and order are unchanged.
+//! 2. The existing `compress/mod.rs` / `context_budget.rs` logic is not modified.
+//! 3. Pruning is **lossless and recallable**: the full pruned tool result is first written to the session asset, and the inline text
+//!    is replaced only by a recall stub carrying `file_path`; the model can `read_file` the full original at any time.
+//! 4. **Never prune when there is no archive directory (`overflow_dir=None`)**: prefer not compressing over doing
+//!    an irreversible content drop.
+//! 5. `apply_pruning` only touches the temporary `messages` projection used per model request; persistence uses the separate
+//!    canonical `turn_messages`, so offloading never pollutes the real history.
+//! 6. The most recent `KEEP_RECENT_TOOL_GROUPS` groups of tool results are always protected, to avoid wrongly pruning results the current round still needs.
 
 use std::path::Path;
 
@@ -48,27 +48,27 @@ use super::tool_overflow::{
     is_preserved_tool_overflow_stub, preserve_pruned_tool_result_stable,
 };
 
-/// 判断某工具结果是否被其注册策略标记为「永不 LLM 裁剪」。
-/// 查询工具自身声明的 [`ToolHistoryPolicy`]（见各工具注册文件），
-/// 而非硬编码工具名。默认（未注册）允许裁剪；只有显式声明
-/// `prune: Never` 的工具（如 `plan`）返回 true。
+/// Returns whether a tool result is marked "never LLM-pruned" by its registered policy.
+/// Consults the [`ToolHistoryPolicy`] the tool itself declares (see each tool's registration file),
+/// rather than hardcoding tool names. By default (unregistered) pruning is allowed; only tools that
+/// explicitly declare `prune: Never` (e.g. `plan`) return true.
 fn is_prune_protected_tool(tool_name: &str) -> bool {
     !crate::ai::tools::registry::common::tool_history_policy(tool_name).allows_prune()
 }
 
-/// 累计被标记多少次后才卸载裁剪。
+/// How many cumulative marks are needed before a message is offloaded/pruned.
 ///
-/// 采用「容忍静默 + 单调累计」语义（见 [`update_prune_marks`]），因此这里的阈值
-/// 表示**累计**而非**连续**次数。裁剪本身无损可召回（全文落盘 + stub），因此可用
-/// 较低阈值：2 次即卸载，兼顾激进回收与「单个 stray token 不误触发」的迟滞。
+/// Uses "silence-tolerant + monotonically accumulating" semantics (see [`update_prune_marks`]), so the threshold here
+/// is a **cumulative** rather than **consecutive** count. Since pruning is lossless and recallable (full text archived + stub),
+/// a low threshold works: 2 marks offload the message, balancing aggressive reclamation with hysteresis against a single stray token.
 pub(crate) const PRUNE_THRESHOLD: u8 = 2;
 
-/// 只有达到该体量的旧工具结果才值得把裁剪协议暴露给模型。
-/// 实际替换仍会比较生成后的 stub，确保任何路径下都只缩不涨。
+/// Only old tool results reaching this size are worth exposing the pruning protocol to the model.
+/// The actual replacement still compares against the generated stub, ensuring the text only ever shrinks on every path.
 const PRUNE_MIN_CONTENT_CHARS: usize = 4_096;
 
-/// 系统提示中注入的裁剪协议说明。
-/// 保持简短，避免占用过多 token。
+/// The pruning-protocol instructions injected into the system prompt.
+/// Kept short to avoid consuming too many tokens.
 pub(crate) const PRUNE_PROTOCOL_PROMPT: &str = "\n## Context Management Protocol\n\
 When your context holds outdated tool results, actively reclaim space by marking them.\n\
 Each tool result in the history has a stable id (the `call_id` / `tool_call_id` shown on\n\
@@ -85,25 +85,25 @@ Rules:\n\
   and always protects recent results and plans.\n\
 - Put the `prune:` directive on its own line; if you also write a normal self_note, keep it in the same hidden note.";
 
-/// 判断该角色的消息是否受保护（永不被裁剪）。
+/// Returns whether messages of this role are protected (never pruned).
 fn is_protected_role(role: &str) -> bool {
     !matches!(role, "tool")
-    // tool 本身不受保护，其他所有角色都受保护
+    // tool is not protected; all other roles are
 }
 
-/// 同上，更清晰的写法。
+/// Same as above, written more clearly.
 fn is_prunable_message(msg: &Message) -> bool {
     msg.role == "tool" && msg.tool_call_id.is_some()
 }
 
-/// 从模型响应的 hidden_meta 中解析 prune 标记。
+/// Parses prune marks from the hidden_meta of a model response.
 ///
-/// hidden_meta 可能包含多行，其中以 `prune:` 开头的行是裁剪指令，
-/// 其余行是常规 self_note 内容（由调用方处理）。
+/// hidden_meta may span multiple lines; lines starting with `prune:` are pruning directives,
+/// the rest is regular self_note content (handled by the caller).
 ///
-/// 返回 `(prune_ids, remaining_meta)`:
-/// - `prune_ids`: 被标记的 tool_call_id 列表
-/// - `remaining_meta`: 移除了 prune 行后的剩余 hidden_meta（给 self_note 用）
+/// Returns `(prune_ids, remaining_meta)`:
+/// - `prune_ids`: the list of marked tool_call_ids
+/// - `remaining_meta`: the hidden_meta left after removing the prune lines (for the self_note)
 pub(crate) fn parse_prune_from_hidden_meta(hidden_meta: &str) -> (Vec<String>, String) {
     let mut prune_ids = Vec::new();
     let mut remaining_lines = Vec::new();
@@ -113,7 +113,7 @@ pub(crate) fn parse_prune_from_hidden_meta(hidden_meta: &str) -> (Vec<String>, S
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("prune:") {
             saw_prune = true;
-            // 解析逗号分隔的 tool_call_id 列表
+            // Parse the comma-separated tool_call_id list
             for id in rest.split(',') {
                 let id = id.trim();
                 if !id.is_empty() {

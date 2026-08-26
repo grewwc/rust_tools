@@ -1,5 +1,5 @@
 // =============================================================================
-// 端口中间件测试共用工具（仅测试编译）
+// Shared utilities for port-middleware tests (test-only compilation)
 // =============================================================================
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use crate::ai::types::AgentContext;
 use crate::ai::persona::default_persona;
 use crate::ai::types::{App, AppConfig};
 
-/// 构造一个最小可用 App 供端口中间件测试使用（mock client/executor 不读取 App 字段）。
+/// Builds a minimal usable App for port-middleware tests (the mock client/executor does not read App fields).
 pub fn test_app() -> App {
     let model = crate::ai::model_names::all()
         .first()

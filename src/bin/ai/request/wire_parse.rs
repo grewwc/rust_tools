@@ -1,10 +1,13 @@
-//! 流式线协议解析原语（provider 适配层与 stream 归一化层共享）。
+//! Streaming wire-protocol parsing primitives (shared between the provider adapter
+//! layer and the stream normalization layer).
 //!
-//! `ParsedStreamPayload` 原定义于 `stream/state.rs`，`try_parse_stream_chunk` /
-//! `try_parse_stream_chunk_loose` 原定义于 `stream/normalize.rs`。provider 适配层
-//! 需要这两个解析原语，而 stream 归一化层又依赖 provider 的 `ProviderAdapter`
-//! trait，形成 provider ↔ stream 互环。解析原语下沉到此中立的 request 子模块后，
-//! 双方统一经 `crate::ai::request` 引用，不再互相引用模块树。
+//! `ParsedStreamPayload` was originally defined in `stream/state.rs`, and
+//! `try_parse_stream_chunk` / `try_parse_stream_chunk_loose` in `stream/normalize.rs`.
+//! The provider adapter layer needs these two parsing primitives, while the stream
+//! normalization layer depends on the provider `ProviderAdapter` trait, forming a
+//! provider ↔ stream circular dependency. Once the primitives moved down into this
+//! neutral request submodule, both sides reference them uniformly through
+//! `crate::ai::request` without importing each other's module trees.
 
 use super::StreamChunk;
 
@@ -12,17 +15,21 @@ pub(in crate::ai) enum ParsedStreamPayload {
     Ignore,
     Done,
     Chunk(StreamChunk),
-    /// content_part.added（output_text 类型）携带的是该 part 当前已存在的完整文本，
-    /// 与 output_text.delta 增量重叠，属于协议多路径重发而非模型新增内容。
-    /// 按增量格式解析（think_demux 拆分等仍生效），但流层会对 content 额外做
-    /// 未见后缀去重，避免正文跨事件路径重复渲染。
+    /// `content_part.added` (output_text type) carries the complete text that currently
+    /// exists in that part, overlapping with the incremental `output_text.delta`. This is
+    /// a multi-path protocol re-delivery rather than new model content. It is still parsed
+    /// in delta form (think_demux splitting, etc. still apply), but the stream layer
+    /// additionally deduplicates content against the unseen suffix to avoid rendering the
+    /// body twice across event paths.
     ReplayedChunk(StreamChunk),
     SnapshotChunk(StreamChunk),
-    /// Responses 协议返回的完整 `reasoning` output item（含 `id` /
-    /// `encrypted_content` / `summary`）。用于同 turn 工具链回放：原样透传给
-    /// 后续请求的 input，使模型保留上一跳推理上下文。不进持久化历史。
+    /// A complete `reasoning` output item returned by the Responses protocol (with `id` /
+    /// `encrypted_content` / `summary`). Used for same-turn tool-chain replay: passed
+    /// through verbatim into the next request's input so the model retains the previous
+    /// hop's reasoning context. Never persisted into history.
     ReasoningItem(serde_json::Value),
-    /// provider 在流中途返回了 error 对象或 error 事件，携带可读错误信息。
+    /// The provider returned an error object or error event mid-stream, carrying a
+    /// human-readable error message.
     Error(String),
 }
 

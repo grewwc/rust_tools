@@ -1,4 +1,4 @@
-//! 纯文本截断与摘要工具函数。
+//! Plain-text truncation and summarization helper functions.
 
 pub(super) fn truncate_to_chars(s: &str, max_chars: usize) -> String {
     if max_chars == 0 {
@@ -72,9 +72,11 @@ pub(super) fn summarize_text(text: &str, target_chars: usize) -> String {
 }
 
 pub(super) fn keep_ends_by_chars(text: &str, target_chars: usize) -> String {
-    // 与 truncate_to_chars / summarize_text 一致：预算为 0 时无处放 head/tail，直接返回空串，
-    // 否则下方 `target_chars - head_budget - 1` 会在 target_chars==0 时下溢（debug 崩溃、
-    // release 回绕成 usize::MAX 导致 take/skip 反而放大文本）。
+    // Consistent with truncate_to_chars / summarize_text: when the budget is 0 there is no
+    // room for head/tail, so return an empty string directly; otherwise the
+    // `target_chars - head_budget - 1` below would underflow when target_chars==0 (crash in
+    // debug builds, and in release builds wrap to usize::MAX, causing take/skip to enlarge
+    // the text instead).
     if target_chars == 0 {
         return String::new();
     }
@@ -98,15 +100,17 @@ mod tests {
 
     #[test]
     fn keep_ends_by_chars_zero_budget_returns_empty_without_overflow() {
-        // 回归：prefix 撑爆 target 时预算会算成 0，旧实现在 `target - head - 1` 处下溢
-        // （debug 崩溃 / release 回绕成 usize::MAX 反而放大文本）。0 预算必须安全返回空串。
+        // Regression: when the prefix blows past the target the budget computes to 0, and the
+        // old implementation underflowed at `target - head - 1` (crash in debug / wrap to
+        // usize::MAX in release, enlarging the text). A 0 budget must safely return an empty
+        // string.
         assert_eq!(keep_ends_by_chars("non-empty text", 0), "");
         assert_eq!(keep_ends_by_chars("", 0), "");
     }
 
     #[test]
     fn keep_ends_by_chars_small_budget_stays_within_target() {
-        // 预算 >=1 时不得下溢，且结果字符数不超过 target。
+        // A budget >= 1 must not underflow, and the result's char count must not exceed target.
         for target in 1..=8 {
             let out = keep_ends_by_chars("abcdefghijklmnopqrstuvwxyz", target);
             assert!(

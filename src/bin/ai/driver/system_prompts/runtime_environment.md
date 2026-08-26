@@ -1,0 +1,4 @@
+- Operating system: {os_label} (`{os}`); architecture: `{arch}`.
+- Shell: `{shell}`.
+- Effective working directory: `{effective_cwd}`. Relative tool paths resolve against this directory; it is not necessarily the project root.
+- Write commands for this OS/shell. Do not use commands or package managers from another OS unless the user asks for cross-platform guidance or you first verify they exist here.

@@ -34,39 +34,49 @@ mod agent_team;
 const MAX_TASK_REGISTRY_SIZE: usize = 100;
 const DEFAULT_TASK_PRIORITY: u8 = 20;
 const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
-/// 子代理最大嵌套深度。depth=1 是顶层 agent 直接 spawn 的子代理。
-/// 子代理不允许继续 spawn 孙代理，避免递归扇出与结果无人收集。
+/// Maximum subagent nesting depth. depth=1 means a subagent spawned directly by a top-level agent.
+/// Subagents may not spawn their own sub-subagents, preventing recursive fan-out and results that
+/// nobody collects.
 pub(crate) const MAX_SUBAGENT_SPAWN_DEPTH: usize = 1;
-/// Subagent 是父 agent 的叶子取证/执行单元，不应继承主 agent 的完整长循环预算。
-/// 主 agent 仍保留自身 max_steps；这里只有 `task` / `task_spawn` 启动路径会钳制。
+/// A subagent is a leaf evidence-gathering/execution unit of its parent agent and must not inherit
+/// the main agent's full long-running loop budget. The main agent keeps its own max_steps; only
+/// the `task` / `task_spawn` launch path is clamped here.
 pub(crate) const SUBAGENT_MAX_ITERATIONS: usize = 32;
-/// 显式声明 `max_steps` 的 agent（如深度审计 `/audit`）可以突破默认 32 轮，
-/// 但任何子代理都不能超过这个绝对硬帽，防止失控子代理无限迭代。
+/// Agents that explicitly declare `max_steps` (such as the deep audit `/audit`) may exceed the
+/// default 32 rounds, but no subagent may go beyond this absolute hard cap, preventing a runaway
+/// subagent from iterating forever.
 pub(crate) const SUBAGENT_MAX_ITERATIONS_HARD_CAP: usize = 256;
-/// 单次批量委派的硬上限，与后台调度默认最大批次保持一致。
-/// schema 与执行入口都校验，避免绕过父级单次 tool-call 配额造成无界扇出。
+/// Hard cap on the number of tasks in a single batch delegation, matching the default maximum
+/// batch size of background scheduling. Both the schema and the execution entry point enforce it,
+/// so the parent's per-call tool quota cannot be bypassed to cause unbounded fan-out.
 const MAX_SUBAGENT_SPAWN_BATCH_SIZE: usize = 8;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
-/// 子代理结果只是主 agent 的证据输入，不是最终对用户的直接回答。
-/// 主 agent 拿到 payload 后仍需自行汇总结论、风险与下一步，再面向用户输出。
+/// A subagent's result is only evidence input for the main agent, not a final direct answer to the
+/// user. After receiving the payload, the main agent must still synthesize conclusions, risks, and
+/// next steps on its own before responding to the user.
 pub(crate) const SUBAGENT_PARENT_SUMMARY_REMINDER: &str = "Parent-agent follow-up: summarize the confirmed subagent conclusions in your own response to the user. Do not rely on the raw subagent transcript or terminal fold as the final user-facing answer.";
-/// 单次 `task_wait` 调用的默认等待预算（秒）。这只是 **本次调用的最长阻塞时间**，
-/// 不是 subagent 的总寿命：超时仅意味着"这次没等到结果"，主 agent 可以继续调
-/// `task_wait` 续等，subagent 仍在后台运行，channel/futex 也不会被销毁。
+/// Default wait budget for a single `task_wait` call (seconds). This is only the **maximum block
+/// time for this one call**, not the subagent's total lifetime: a timeout merely means "this call
+/// did not get the result yet". The main agent can keep calling `task_wait` to wait again; the
+/// subagent keeps running in the background and the channel/futex are not destroyed.
 ///
-/// 前台等待只提供短暂的收集窗口；长时间运行的子任务应与父 agent 的独立工作重叠，
-/// 而不是让父 agent 在 task_spawn 后立即挂起数分钟。
+/// Foreground waits only provide a short collection window; long-running subtasks should overlap
+/// with the parent agent's own work instead of suspending the parent for minutes right after
+/// task_spawn.
 const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 30;
-/// `task_wait.timeout_secs` 的硬上限，避免模型把 timeout 设成天文数字时彻底
-/// 阻塞 driver。最长 60 秒后必须把控制权还给父 agent，重新评估是继续本地工作、
-/// 非阻塞查看状态，还是确实需要再次等待。
+/// Hard upper bound for `task_wait.timeout_secs`, so the model cannot set an astronomically large
+/// timeout that would block the driver indefinitely. After at most 60 seconds, control must return
+/// to the parent agent, which re-evaluates whether to continue local work, check status
+/// non-blockingly, or genuinely wait again.
 const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 60;
 
-/// Subagent 的 wall-clock 总寿命上限。与单次 task_wait 的 `timeout_secs`（默认
-/// 30s、上限 60s）不同，这是进程级硬上限：subagent 存活超过此值（典型如卡在单个永不
-/// 返回的工具执行里、单 turn 内无 wall-clock 超时），task_wait 入口会主动
-/// 终止它并写入 timeout 终态结果，避免主 agent 陷入"超时->续等->再超时"空转
-/// 或后台进程永久占用资源。1 小时远大于正常完成时长，仅在真正卡死时兜底。
+/// Wall-clock lifetime cap for a subagent. Unlike a single task_wait's `timeout_secs` (default 30s,
+/// max 60s), this is a process-level hard limit: when a subagent outlives it (typically by getting
+/// stuck in a single tool execution that never returns, where a single turn has no wall-clock
+/// timeout), the task_wait entry point proactively terminates it and writes a timeout terminal
+/// result, so the main agent does not spin in a "timeout -> wait again -> timeout" loop or leave
+/// background processes holding resources forever. One hour far exceeds normal completion times
+/// and only acts as a safety net for genuinely stuck subagents.
 const SUBAGENT_WALL_CLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 const SUBAGENT_PROGRESS_NOTIFY_INTERVAL: Duration = Duration::from_secs(15);
 const SUBAGENT_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(10);
@@ -85,10 +95,11 @@ pub(crate) struct InheritOptions {
 
 impl Default for InheritOptions {
     fn default() -> Self {
-        // 默认只继承执行所需的 cwd/skills，不继承整段对话历史与 memory。
-        // 窄任务由父 agent 在 prompt 中显式传入必要上下文，避免 token 膨胀、注意力偏移，
-        // 以及 sub-agent 直接污染主 memory 文件。调用方仍可显式传 `inherit: "all"`
-        // 或 `inherit: "history,cwd,skills"` 退回旧行为。
+        // By default, inherit only the execution essentials (cwd/skills), not the full conversation
+        // history or memory. Narrow tasks get their necessary context passed explicitly by the
+        // parent agent in the prompt, avoiding token bloat, attention drift, and a subagent
+        // polluting the main memory file. Callers can still explicitly pass `inherit: "all"` or
+        // `inherit: "history,cwd,skills"` to restore the old behavior.
         Self {
             history: false,
             memory: false,
@@ -180,70 +191,82 @@ impl InheritOptions {
     }
 }
 
-/// Agent 层为每个异步子任务维护的注册表条目，用于 `task_spawn` / `task_wait` 流程。
+/// Registry entry maintained by the agent layer for each asynchronous subtask, used by the
+/// `task_spawn` / `task_wait` flows.
 ///
-/// **与 AIOS Kernel `Process` 的关系**：本结构体的部分字段（`pid`、`agent_name`、
-/// `description`、`started_at`）在 kernel `Process` 中已有等价物（`pid` / `name` /
-/// `goal` / `created_at_tick`），存在 **概念重叠**。重叠保留的原因：
+/// **Relationship to the AIOS Kernel `Process`**: some fields of this struct (`pid`, `agent_name`,
+/// `description`, `started_at`) already have equivalents in the kernel `Process` (`pid` / `name` /
+/// `goal` / `created_at_tick`), so there is **conceptual overlap**. Reasons the overlap is kept:
 ///
-/// 1. agent 特有字段（`result_channel_id`、`completion_futex_addr`、`inherit`、
-///    `selection_explanation`、`model`）在 kernel 进程表中没有对应位置；
-/// 2. agent 层需要在 task_id 这个稳定字符串键下做查询，而 kernel 用的是数值 pid；
-/// 3. kernel `created_at_tick` 是 logical tick，不能直接换算回 wall-clock 用于
-///    `prune_completed_tasks` 的 LRU 决策。
+/// 1. Agent-specific fields (`result_channel_id`, `completion_futex_addr`, `inherit`,
+///    `selection_explanation`, `model`) have no place in the kernel process table;
+/// 2. The agent layer needs to query under the stable string key task_id, while the kernel uses
+///    numeric pids;
+/// 3. The kernel's `created_at_tick` is a logical tick and cannot be converted back to wall-clock
+///    time for the LRU decision in `prune_completed_tasks`.
 ///
-/// **不变量**：本注册表中的 `pid` 必须始终对应 kernel process table 里同一个
-/// 进程；结果必须先由 `task_wait` / `task_status` 持久化到 evidence ledger，
-/// 再移除注册表条目和 IPC 资源。容量满时拒绝新任务，绝不驱逐未收取结果。
+/// **Invariant**: the `pid` in this registry must always correspond to the same process in the
+/// kernel process table; results must first be persisted to the evidence ledger by `task_wait` /
+/// `task_status` before the registry entry and IPC resources are removed. When at capacity, new
+/// tasks are rejected — uncollected results are never evicted.
 #[derive(Clone)]
 pub(crate) struct AsyncTaskEntry {
     pub(crate) session_id: String,
     pub(crate) result_observed: bool,
-    /// 直接拥有该 task 的父进程 pid。task_wait/status/cancel 只允许 owner
-    /// 进程观察自己 spawn 的子任务，避免同一 session 内父/兄弟任务互相污染。
+    /// pid of the parent process that directly owns this task. task_wait/status/cancel only allow
+    /// the owner process to observe its own spawned subtasks, preventing parent/sibling tasks
+    /// within the same session from interfering with each other.
     pub(crate) owner_pid: u64,
-    /// 与 kernel `Process.pid` 一致；agent 端额外保存便于通过 task_id 反查 pid。
+    /// Matches the kernel `Process.pid`; the agent side additionally stores it so the pid can be
+    /// looked up from a task_id.
     pub(crate) pid: u64,
     pub(crate) result_channel_id: u64,
     pub(crate) completion_futex_addr: FutexAddr,
-    /// 描述性文本；与 kernel `Process.goal` 不同——后者会带 TASK_GOAL_PREFIX
-    /// 前缀和完整 prompt。
+    /// Descriptive text; unlike kernel `Process.goal`, which carries the TASK_GOAL_PREFIX prefix
+    /// and the full prompt.
     pub(crate) description: String,
-    /// 子 agent 的逻辑名（用于查找注册的 AgentManifest，如 `"build"`）；与 kernel
-    /// `Process.name` 同源但 kernel 端 name 仅作显示。注意区分：`plan` 是工具名，
-    /// 不是 agent 名（仓库内未注册 `plan` subagent），不要将 `agent_name` 填为
-    /// `"plan"`——会把派名指向不存在的 manifest。
+    /// Logical name of the subagent (used to look up the registered AgentManifest, e.g. `"build"`);
+    /// shares its source with the kernel `Process.name`, but the kernel-side name is display-only.
+    /// Note the distinction: `plan` is a tool name, not an agent name (no `plan` subagent is
+    /// registered in this repo), so `agent_name` must not be set to `"plan"` — that would point the
+    /// dispatch at a manifest that does not exist.
     pub(crate) agent_name: String,
     pub(crate) model: String,
     pub(crate) is_model_auto_selected: bool,
     pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,
     pub(crate) selection_explanation: String,
     pub(crate) inherit: InheritOptions,
-    /// 真实 Tokio 子任务的取消句柄。kernel process 终止时必须同步 abort，
-    /// 否则网络请求或工具 Future 仍会在后台继续运行。
+    /// Cancellation handle of the real Tokio subtask. When the kernel process is terminated, the
+    /// handle must be aborted too, otherwise the network request or tool Future keeps running in
+    /// the background.
     pub(crate) abort_handle: Option<tokio::task::AbortHandle>,
-    /// 与子代理 App 共享的取消标志。同步执行中的命令无法被 Tokio abort 立即打断，
-    /// 因此 timeout/cancel 必须先置位，让命令 runner 杀掉实际 OS 进程组。
+    /// Cancellation flag shared with the subagent App. A synchronously executing command cannot be
+    /// interrupted immediately by a Tokio abort, so timeout/cancel must set this flag first, letting
+    /// the command runner kill the actual OS process group.
     pub(crate) cancel_stream: Arc<AtomicBool>,
-    /// wall-clock 起始时间，用于 `prune_completed_tasks` LRU；不能由 kernel
-    /// `created_at_tick` 替代。
+    /// Wall-clock start time, used by the `prune_completed_tasks` LRU; it cannot be replaced by the
+    /// kernel `created_at_tick`.
     pub(crate) started_at: Instant,
     pub(crate) last_progress_notification_at: Option<Instant>,
     pub(crate) last_progress_persisted_at: Option<Instant>,
 }
 
-/// 异步子任务注册表，键为 task_id（UUID 字符串），值见 [`AsyncTaskEntry`]。
+/// Registry of asynchronous subtasks, keyed by task_id (a UUID string); values are
+/// [`AsyncTaskEntry`].
 ///
-/// 与 AIOS kernel process table 是 **平行存储**：两者通过 `pid` 字段关联，但
-/// 各自有独立的字段集（参见 `AsyncTaskEntry` 注释）。访问方应通过 `with_task_entry`
-/// / `take_task_entry` 等 helper 函数来读写这里，避免直接持有 lock guard。
+/// This is **parallel storage** to the AIOS kernel process table: the two are linked through the
+/// `pid` field but each keeps its own independent set of fields (see the `AsyncTaskEntry`
+/// comments). Accessors should read/write this registry through helpers such as `with_task_entry`
+/// / `take_task_entry` rather than holding a lock guard directly.
 static TASK_REGISTRY: LazyLock<Mutex<SkipMap<String, AsyncTaskEntry>>> =
     LazyLock::new(|| Mutex::new(SkipMap::default()));
 static TASK_PROGRESS_REGISTRY: LazyLock<
     Mutex<SkipMap<String, crate::ai::driver::runtime_ctx::SubagentPhaseSlot>>,
 > = LazyLock::new(|| Mutex::new(SkipMap::default()));
-/// 进度证据写入频率低且文件很小，用一把进程内锁保证同一 task 的快照不会通过
-/// 共享临时路径互相截断；落盘前再比较顺序，避免迟到的旧快照覆盖新证据。
+/// Progress evidence is written infrequently and the files are small, so a single in-process lock
+/// guarantees that snapshots for the same task cannot truncate each other through the shared temp
+/// path; ordering is also compared before persisting, so a late stale snapshot cannot overwrite
+/// newer evidence.
 static TASK_PROGRESS_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TASK_RETRY_REGISTRY: LazyLock<Mutex<SkipMap<String, RetryableTaskSpec>>> =
     LazyLock::new(|| Mutex::new(SkipMap::default()));
@@ -288,8 +311,10 @@ fn append_task_progress_snapshots(output: &mut String, task_ids: &[String]) {
     output.push_str(&snapshots.join("\n"));
 }
 
-/// 接收子代理发布的统一结构化快照。内存状态更新不做节流；状态行刷新通知和磁盘
-/// 快照分别做边沿节流，checkpoint 始终立即传播，避免长任务静默或造成事件风暴。
+/// Receives the unified structured snapshots published by subagents. In-memory state updates are
+/// not throttled; status-line refresh notifications and disk snapshots are each edge-throttled
+/// separately, while checkpoints always propagate immediately — so long tasks neither stay silent
+/// nor cause an event storm.
 pub(crate) fn record_subagent_progress_update(
     task_id: &str,
     snapshot: &crate::ai::driver::runtime_ctx::SubagentProgressSnapshot,
@@ -325,19 +350,22 @@ pub(crate) fn record_subagent_progress_update(
         if let Some(entry) = registry.get_mut(&task_id.to_string())
             && entry.last_progress_persisted_at == Some(now)
         {
-            // 本次落盘失败时撤销节流标记，让下一条进度事件立即重试。
+            // Undo the throttle marker when this persist fails, so the next progress event retries
+            // immediately.
             entry.last_progress_persisted_at = None;
         }
     }
     if update.1 {
-        // 进度事件只刷新前台状态行（notify_scheduler 让调度循环 tick 一次去重绘
-        // subagent 状态行），**绝不** wake_process 把已 park 的父代理拨回 Ready。
-        // 否则每 15s 一次的进度就会强制父代理跑一整轮模型调用、只为再 park 一次，
-        // 把前台变成「每 ~9s 烧一次推理」的忙等自旋（见 agent-team fan-out 卡死）。
-        // 真正需要唤醒父代理的是三条终态路径，它们各自独立触发，不依赖这里：
-        //   1. 子任务完成/失败：channel_send + futex_store → notify_events_completed；
-        //   2. task_wait 预算耗尽：wake_expired_task_waits；
-        //   3. task_cancel：定向翻 cancel futex。
+        // Progress events only refresh the foreground status line (notify_scheduler makes the
+        // scheduling loop tick once to redraw the subagent status line); they must **never**
+        // wake_process a parked parent agent back to Ready. Otherwise a progress event every 15s
+        // would force the parent through a full model-call round trip just to park again, turning
+        // the foreground into busy-wait spinning that burns an inference every ~9s (see the
+        // agent-team fan-out stall). Only three terminal paths genuinely need to wake the parent,
+        // and each triggers independently without relying on this code:
+        //   1. Subtask finished/failed: channel_send + futex_store -> notify_events_completed;
+        //   2. task_wait budget exhausted: wake_expired_task_waits;
+        //   3. task_cancel: flips the cancel futex directly.
         crate::ai::driver::notify_scheduler();
     }
 }
@@ -502,11 +530,12 @@ static TASK_WAIT_STATES: LazyLock<Mutex<FxHashMap<TaskWaitKey, TaskWaitState>>> 
 
 const OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX: &str = "[pending-subagent-tasks]";
 
-/// 最近一次 `task_spawn` / `task_spawn_batch` 成功产生的任务 id 列表，用于检测
-/// "lone spawn" 反模式：spawn 单个任务后立即 `task_wait` 收集它。该场景没有并发
-/// 收益，应该用同步 `task` 工具（spawn + wait 只会更慢）。提示是轻量规范引导：
-/// 只提示一次、绝不拒绝或阻塞，模型可忽略（例如它确实在 spawn 与 wait 之间插入了
-/// 父侧工作）。
+/// Task id list produced by the most recent successful `task_spawn` / `task_spawn_batch`, used to
+/// detect the "lone spawn" anti-pattern: spawning a single task and immediately `task_wait`-ing to
+/// collect it. That scenario gains no concurrency and should use the synchronous `task` tool
+/// (spawn + wait is only slower). The hint is light normative guidance: it fires once, never
+/// rejects or blocks, and the model may ignore it (e.g. when it really did interleave parent-side
+/// work between spawn and wait).
 struct LastSpawnBatch {
     task_ids: Vec<String>,
     hinted: bool,
@@ -521,8 +550,9 @@ fn record_last_spawn_batch(task_ids: Vec<String>) {
     });
 }
 
-/// 若本次 wait 的 task_ids 命中"最近一次 spawn 是单个任务"且尚未提示过，
-/// 返回一次规范提示文本（消费 hinted 标志，保证整轮会话只提示一次）。
+/// If this wait's task_ids match "the most recent spawn was a single task" and the hint has not
+/// been shown yet, return the normative hint text once (consuming the hinted flag so it fires at
+/// most once per whole session turn).
 fn lone_spawn_hint_note(waited_task_ids: &[String]) -> Option<String> {
     let mut guard = match LAST_SPAWN_BATCH.lock() {
         Ok(guard) => guard,
@@ -576,10 +606,12 @@ pub(crate) struct OsTaskGoal {
     #[serde(default)]
     pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,
     pub(crate) selection_explanation: String,
-    /// 子代理嵌套深度：顶层 spawn 为 1，逐层递增。用于防止递归扇出。
+    /// Subagent nesting depth: 1 for a top-level spawn, incrementing per level. Used to prevent
+    /// recursive fan-out.
     #[serde(default)]
     pub(crate) spawn_depth: usize,
-    /// 可选的子代理最终响应 JSON Schema；旧任务载荷缺失时保持兼容。
+    /// Optional JSON Schema for the subagent's final response; stays compatible with old task
+    /// payloads where it is missing.
     #[serde(default)]
     pub(crate) response_schema: Option<Value>,
 }
@@ -603,14 +635,15 @@ pub(crate) fn decode_os_task_goal(goal: &str) -> Option<OsTaskGoal> {
     serde_json::from_str(payload).ok()
 }
 
-/// 在 AIOS kernel 上执行一段 mutable 操作。
+/// Runs a mutable operation on the AIOS kernel.
 ///
-/// 优先路径：从 `DRIVER_CTX` task-local 取出当前 turn 持有的 `SharedKernel`，
-/// 这样 `task_wait` / `task_spawn` 等高频路径直接复用 turn scope 已经持有的 Arc，
-/// 避免 `GLOBAL_OS` 这个全局 static 的额外锁与间接寻址。
+/// Preferred path: take the `SharedKernel` held by the current turn from the `DRIVER_CTX`
+/// task-local, so high-frequency paths such as `task_wait` / `task_spawn` reuse the Arc the turn
+/// scope already holds, avoiding the extra lock and indirection of the `GLOBAL_OS` global static.
 ///
-/// 回退路径：当调用方不在 `DRIVER_CTX` scope 中（例如 driver 启动早期或单测从同步
-/// 上下文调用 tool），仍使用 `GLOBAL_OS`，保证向后兼容。
+/// Fallback path: when the caller is not inside a `DRIVER_CTX` scope (e.g. early driver startup or
+/// a unit test invoking the tool from a synchronous context), fall back to `GLOBAL_OS` for backward
+/// compatibility.
 fn with_os_kernel<T>(f: impl FnOnce(&mut dyn Kernel) -> Result<T, String>) -> Result<T, String> {
     let shared: SharedKernel = match crate::ai::driver::runtime_ctx::try_current() {
         Some(ctx) => ctx.app_proto.os.clone(),
@@ -704,10 +737,11 @@ fn clear_task_wait_state(key: &TaskWaitKey) {
     states.remove(key);
 }
 
-/// 调度器下一次必须检查 task_wait wall-clock deadline 的剩余时间。
+/// Time remaining until the scheduler must next check task_wait wall-clock deadlines.
 ///
-/// delayed notify 只是提前唤醒信号，不能作为 deadline 的唯一真相来源：若通知任务
-/// 未成功注册或通知发生竞态，调度器仍必须按这里返回的真实 deadline 自行醒来。
+/// A delayed notify is only an early wake-up signal and cannot be the sole source of truth for
+/// the deadline: if the notification task was not registered successfully or a notify race
+/// occurs, the scheduler must still wake itself up at the real deadline returned here.
 pub(crate) fn next_task_wait_wakeup_delay() -> Option<Duration> {
     let now = Instant::now();
     TASK_WAIT_STATES
@@ -753,11 +787,13 @@ pub(crate) fn wake_expired_task_waits() {
         return;
     }
 
-    // 逐个唤醒到期 owner；同时记录 owner 进程已不存在/已终止的 wait key。
-    // wake_process 只会把处于 Waiting 的 owner 拨回 Ready（非 Waiting 时 owner 本就
-    // 已被调度，唤醒丢失无害），但 owner 已 Terminated 时唤醒彻底落空，其 wait state
-    // 会以 expired=true 永久滞留在全局表里——既漏内存，也让 next_task_wait_wakeup_delay
-    // 之外再无任何清理路径。这里把这些孤儿 key 收集出来，随后统一删除以自愈。
+    // Wake each expired owner one by one; meanwhile record the wait keys whose owner process no
+    // longer exists or has terminated. wake_process only returns an owner in the Waiting state to
+    // Ready (when not Waiting the owner is already scheduled, so a lost wake-up is harmless), but
+    // once the owner is Terminated the wake-up misses entirely and its wait state stays in the
+    // global table forever with expired=true — leaking memory and leaving no cleanup path beyond
+    // next_task_wait_wakeup_delay. These orphan keys are collected here and then deleted in bulk
+    // to self-heal.
     let orphaned = with_os_kernel(|os| {
         let mut woken: SkipSet<u64> = SkipSet::default();
         let mut orphaned: Vec<TaskWaitKey> = Vec::new();
@@ -894,23 +930,26 @@ fn wait_many_snapshot(
     Ok((ready, pending, event_ids))
 }
 
-/// 在 agent 层组合 kernel 提供的 epoll / channel / futex / event 原语，实现
-/// **跨多种等待源** 的 "等待任意一个完成" 语义，主要服务于 `task_wait` 工具。
+/// Combines the kernel's epoll / channel / futex / event primitives at the agent layer to
+/// implement a "wait for any of several sources to complete" semantic across **multiple wait
+/// source kinds**, primarily serving the `task_wait` tool.
 ///
-/// **设计定位**：本函数 *不是* 重新实现 kernel 的等待原语，而是把若干低层 API
-/// （`epoll_create` / `epoll_ctl` / `epoll_wait` / `wait_on_events`）按 agent
-/// 业务语义拼装：
-/// 1. 为 channel/futex 类等待源建立短暂的 epoll 集合，再 `epoll_wait` 取就绪集合；
-/// 2. 为 event 类等待源直接 `wait_on_events`；
-/// 3. 把两类结果归一化到 `EpollWaitManyOutcome`。
+/// **Design positioning**: this function does *not* re-implement the kernel's wait primitives; it
+/// assembles several low-level APIs (`epoll_create` / `epoll_ctl` / `epoll_wait` /
+/// `wait_on_events`) to the agent's business semantics:
+/// 1. Build a short-lived epoll set for channel/futex-style wait sources, then `epoll_wait` for
+///    the ready set;
+/// 2. For event-style wait sources, call `wait_on_events` directly;
+/// 3. Normalize both kinds of results into `EpollWaitManyOutcome`.
 ///
-/// **未来下沉建议**：当 kernel 加入对 `Vec<WaitManySource>` 的原生 syscall 支持
-/// （类似 epoll_pwait2 + EVENTFD 的混合模式）后，本函数可以变成对单次 syscall
-/// 的轻量包装。在迁移前，本函数保留当前的多步组合实现；任何对其行为的修改
-/// **必须保证 task_wait 在如下场景的回归**：
-/// - 全部 ready 立即返回（不会调用 epoll_wait）；
-/// - 全部 pending 时按 `wait_policy` 决定是否真正 suspend；
-/// - 混合就绪 + pending 时只返回就绪集，不引入额外阻塞。
+/// **Future lowering suggestion**: once the kernel gains native syscall support for
+/// `Vec<WaitManySource>` (similar to a hybrid of epoll_pwait2 + EVENTFD), this function can become
+/// a thin wrapper around a single syscall. Until that migration, this function keeps the current
+/// multi-step composite implementation; any behavior change **must keep task_wait regression-free
+/// in the following scenarios**:
+/// - all sources ready: return immediately (epoll_wait is not called);
+/// - all sources pending: decide whether to actually suspend according to `wait_policy`;
+/// - mixed ready + pending: return only the ready set, without adding extra blocking.
 pub(crate) fn epoll_wait_many(
     os: &mut dyn Kernel,
     label: &str,
@@ -968,9 +1007,10 @@ pub(crate) fn epoll_wait_many(
                     })
                 }
                 EpollWaitResult::Suspended { timeout_tick } => {
-                    // epoll_wait 内部已 consume 了 yield_requested 标志用于判定挂起；
-                    // 必须把它重新置位，否则 turn-loop 的 consume_yield_requested()
-                    // 读到 false，控制权无法交还调度器，已就绪的子 agent 永远不被派发。
+                    // epoll_wait internally consumed the yield_requested flag to decide whether it
+                    // suspended; it must be re-set here, otherwise the turn-loop's
+                    // consume_yield_requested() reads false, control is never returned to the
+                    // scheduler, and a ready subagent is never dispatched.
                     os.request_yield();
                     Ok(EpollWaitManyOutcome {
                         ready_sources,
@@ -986,8 +1026,9 @@ pub(crate) fn epoll_wait_many(
                     os.wait_on_events(event_ids.clone(), WaitPolicy::All, timeout_ticks)?;
                 let suspended = os.consume_yield_requested() || wake_tick.is_some();
                 if suspended {
-                    // 同上：本分支用 consume_yield_requested() 探测挂起，会清掉让出
-                    // 意图。确认挂起后重新置位，保证 turn-loop 能感知并交还调度权。
+                    // Same as above: this branch probes suspension via consume_yield_requested(),
+                    // which clears the yield intent. Once suspension is confirmed, re-set the flag
+                    // so the turn-loop can notice it and hand control back to the scheduler.
                     os.request_yield();
                 }
                 let (ready_sources, pending_sources, refreshed_event_ids) =
@@ -1036,11 +1077,12 @@ inventory::submit!(ToolRegistration {
 });
 
 // `task` / `task_spawn` / `task_spawn_batch` / `task_wait` / `task_status`
-// 都可能承载 subagent 的唯一可见结果：spawn 系列的参数（子代理 prompt /
-// response schema）与返回值（task_id 列表）是后续 wait/status/integrate 的
-// 必需输入；结果一旦被有损压缩或 LLM prune，主 agent 就可能失去对已完成
-// 子任务的 grounding 感知。统一禁止 lossy 与 prune；若内容过大，交给
-// overflow stub + file_path 承接，而不是删成不可复原的摘要。
+// may all carry the only visible result of a subagent: the spawn-family arguments (subagent
+// prompt / response schema) and return values (the task_id list) are required inputs for the
+// later wait/status/integrate calls; once a result is lossy-compressed or LLM-pruned, the main
+// agent can lose its grounding on already-finished subtasks. Lossy compression and pruning are
+// uniformly banned here; oversized content goes to an overflow stub + file_path instead of being
+// reduced to an unrecoverable summary.
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task",
     policy: ToolHistoryPolicy {
@@ -1210,8 +1252,9 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
     let inherit = InheritOptions::from_value(&args["inherit"])?;
     let response_schema = parse_response_schema(args)?;
 
-    // 优先从 DRIVER_CTX 中拿已缓存的 agent_manifests，避免每次 task_spawn 都重读磁盘。
-    // 当不在 DRIVER_CTX scope 中（极少见，例如单测），回退到 load_all_agents()。
+    // Prefer the agent_manifests cached in DRIVER_CTX, so each task_spawn does not re-read the
+    // disk. When not inside a DRIVER_CTX scope (rare, e.g. unit tests), fall back to
+    // load_all_agents().
     let cached = crate::ai::driver::runtime_ctx::try_current();
     let owned_fallback;
     let all_agents: &[AgentManifest] = if let Some(ref ctx) = cached {
@@ -1397,8 +1440,8 @@ pub(crate) fn with_task_entry<R>(task_id: &str, f: impl FnOnce(&AsyncTaskEntry) 
     registry.get_ref(&task_id.to_string()).map(f)
 }
 
-/// 关联实际执行子代理的 Tokio task，使取消和超时能够停止后台 Future，
-/// 而不只是终止 kernel 中的逻辑进程。
+/// Associates the Tokio task that actually runs the subagent, so cancellation and timeout can stop
+/// the background Future instead of only terminating the logical process in the kernel.
 pub(crate) fn set_task_abort_handle(task_id: &str, abort_handle: tokio::task::AbortHandle) -> bool {
     let mut registry = TASK_REGISTRY.lock().unwrap();
     let Some(entry) = registry.get_mut(&task_id.to_string()) else {
@@ -1421,8 +1464,9 @@ pub(crate) fn with_task_entry_by_pid<R>(
     None
 }
 
-/// 前台状态栏使用的只读快照。只暴露展示所需字段；subagent 正文仍只通过
-/// `task_wait` / `task_status` 返回，避免后台任务争用 terminal。
+/// Read-only snapshot used by the foreground status bar. Only exposes the fields needed for
+/// display; the subagent body text is still returned exclusively through `task_wait` /
+/// `task_status`, keeping background tasks from contending for the terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubagentTerminalStatus {
     pub(crate) description: String,
@@ -1506,7 +1550,8 @@ pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
         ));
     }
 
-    // 先完成整批 preflight，避免后续条目参数无效时前面的 child 已经启动。
+    // Complete the whole batch preflight first, so earlier children are not already started when a
+    // later entry has invalid arguments.
     let prepared = tasks
         .iter()
         .enumerate()
@@ -1680,14 +1725,18 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         return Err("task_ids array cannot be empty".to_string());
     }
 
-    // 单次 task_wait 调用的等待预算。详见 DEFAULT_TASK_WAIT_TIMEOUT_SECS 注释——
-    // 超时只意味着本次没等到，subagent 仍在跑、资源不会被释放。
+    // Wait budget for this single task_wait call. See the DEFAULT_TASK_WAIT_TIMEOUT_SECS comment —
+    // a timeout only means this call did not get the result; the subagent keeps running and no
+    // resources are released.
     let (timeout_secs, wait_policy) = parse_task_wait_options(args)?;
 
-    // wait_policy: "any" | "all"，默认 "any"，避免前台被最慢任务拖住。
-    // - all  — 等到所有 pending 任务都完成才返回（适合需要汇总）；
-    // - any  — 任一 pending 任务完成即返回，其余仍在跑、可继续 task_wait
-    //          （适合 fan-out 后想边收边推进）。
+    // wait_policy: "any" | "all", default "any", so the foreground is not held up by the slowest
+    // task.
+    // - all  — return only after every pending task completes (for when results must be
+    //          aggregated);
+    // - any  — return as soon as any pending task completes, the rest keep running and can be
+    //          collected by further task_wait calls (for fan-out where results are gathered as
+    //          they arrive).
     let current_owner_pid = current_task_owner_pid()?;
     let mut registry = TASK_REGISTRY.lock().unwrap();
     let mut foreign_session_task_ids = Vec::new();
@@ -1719,8 +1768,9 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             foreign_owner_task_ids.join(", ")
         ));
     }
-    // registry miss 既可能是已交付后正常清理，也可能是模型拼错、跨进程旧 id 或
-    // 注册表异常。只有 durable evidence ledger 中确有 tombstone 才能判定为已交付。
+    // A registry miss can mean either the task was normally cleaned up after delivery, or the
+    // model mistyped an id, referenced a stale cross-process id, or hit a registry anomaly. Only a
+    // tombstone actually present in the durable evidence ledger proves the task was delivered.
     let mut already_delivered = Vec::new();
     let mut unknown_task_ids = Vec::new();
     if !missing_task_ids.is_empty() {
@@ -1749,8 +1799,9 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             unknown_task_ids.join(", ")
         ));
     }
-    // 已交付 id 与仍 pending id 混用是预期输入：PARKED / BUDGET-ELAPSED 会要求模型
-    // 用同一组 ids 续等。这里只丢弃 ledger 已确认的 delivered ids。
+    // Mixing already-delivered ids with still-pending ones is expected input: PARKED /
+    // BUDGET-ELAPSED asks the model to keep waiting with the same set of ids. Only ids confirmed
+    // delivered by the ledger are dropped here.
     let task_ids = task_ids_filtered;
     if task_ids.is_empty() {
         return Ok(format!(
@@ -1760,7 +1811,8 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             already_delivered.len()
         ));
     }
-    // lone-spawn 规范提示：只计算一次（消费 hinted 标志），后续返回点统一附加。
+    // lone-spawn normative hint: computed only once (consuming the hinted flag), then uniformly
+    // appended at every later return point.
     let lone_spawn_hint = lone_spawn_hint_note(&task_ids);
     let wait_key = task_wait_key(
         &current_session_id,
@@ -1773,11 +1825,13 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
 
     let mut ready = Vec::new();
     let mut pending = Vec::new();
-    // 收集本次调用中已完成（成功 / 失败、channel/futex 已销毁、需要从 registry
-    // 删除）的 task_id；suspended 与 budget-elapsed 早返回路径也会用它清理。
+    // Collect the task_ids finished in this call (success / failure, channel/futex destroyed,
+    // needing removal from the registry); the suspended and budget-elapsed early-return paths also
+    // use it for cleanup.
     let mut finished: Vec<String> = Vec::new();
-    // `write_terminal_subagent_result` 只终止 kernel process，不会停止宿主 Tokio
-    // Future。先逐个 abort 已超出总寿命的 worker，再进入 kernel 临界区发布终态。
+    // `write_terminal_subagent_result` only terminates the kernel process; it does not stop the
+    // hosting Tokio Future. So first abort every worker that exceeded its total lifetime, then
+    // enter the kernel critical section to publish the terminal state.
     for tid in &task_ids {
         let entry = registry.get_ref(tid).expect("validated");
         if entry.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT {
@@ -1787,29 +1841,33 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             }
         }
     }
-    // closure 默认按引用借用 wait_policy / registry / pending / ready / finished，
-    // 不加 `move`，保证 closure 返回后外层 `if !pending.is_empty()` 等代码仍可访问。
+    // The closure borrows wait_policy / registry / pending / ready / finished by reference by
+    // default; no `move` is added, so code after the closure (e.g. `if !pending.is_empty()`) can
+    // still access them.
     let wait_message = with_os_kernel(|os| {
         for tid in &task_ids {
             let entry = registry.get_ref(tid).expect("validated");
-            // ⚠️ 这里之前曾按 `entry.started_at.elapsed() >= timeout_secs`
-            // 直接把任务标记为 TIMEOUT 并销毁 channel/futex —— 这是 bug：
-            // `started_at` 是 spawn 时间，不是本次 task_wait 的开始时间。如果
-            // 主 agent 在 spawn 后很久才第一次调 task_wait，所有任务都会
-            // **立刻** 被报为 TIMEOUT 且 result_channel 被销毁，subagent
-            // 真实结果永久丢失，主 agent 自然会以为 "subagent 卡住"。
+            // ⚠️ This block previously marked a task TIMEOUT and destroyed its channel/futex as
+            // soon as `entry.started_at.elapsed() >= timeout_secs` — that was a bug:
+            // `started_at` is the spawn time, not the start of this task_wait call. If the main
+            // agent first calls task_wait long after spawning, every task would be **immediately**
+            // reported as TIMEOUT and its result_channel destroyed, permanently losing the real
+            // subagent result while the main agent naturally concludes "subagent is stuck".
             //
-            // 现在的做法：只看 channel 上有没有就绪 payload；如果还没有，统一
-            // 走 pending 分支。单次 task_wait 预算由 TASK_WAIT_STATES 的真实
-            // wall-clock deadline 控制；driver run_loop 到期后唤醒 owner 进程，
-            // 下一次 task_wait 才返回 BUDGET ELAPSED。预算耗尽也 **绝不销毁
-            // channel/futex**，主 agent 可以继续调 task_wait 续等。
-            // wall-clock 总寿命检查：subagent 若超过 SUBAGENT_WALL_CLOCK_TIMEOUT
-            // 仍无结果（典型如卡在单个永不返回的工具执行里），主动终止并写入
-            // timeout 终态，使紧随其后的 read_task_result 立即读到结果，避免主
-            // agent 陷入"超时->续等->再超时"空转。区别于历史上用 started_at 对比
-            // 单次 timeout_secs 的 bug：这里用独立的、远大于单次 wait 预算的总
-            // 寿命上限，且写入失败结果而非销毁 channel，结果不会丢失。
+            // Current behavior: only look at whether a ready payload exists on the channel; if
+            // not, uniformly take the pending branch. The per-call task_wait budget is governed by
+            // the real wall-clock deadline in TASK_WAIT_STATES; the driver run_loop wakes the
+            // owner process when it expires, and only the next task_wait returns BUDGET ELAPSED.
+            // Budget exhaustion also **never destroys the channel/futex**, so the main agent can
+            // keep calling task_wait to wait longer.
+            // Wall-clock total-lifetime check: if a subagent still has no result past
+            // SUBAGENT_WALL_CLOCK_TIMEOUT (typically stuck in a single tool execution that never
+            // returns), terminate it proactively and write a timeout terminal result, so the
+            // immediately following read_task_result reads a result and the main agent does not
+            // spin in a "timeout -> wait again -> timeout" loop. Unlike the historical bug that
+            // compared started_at against the per-call timeout_secs, this uses an independent
+            // total-lifetime cap far larger than a single wait budget, and writes a failure result
+            // instead of destroying the channel, so no result is lost.
             if entry.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT {
                 write_terminal_subagent_result(
                     os,
@@ -1834,9 +1892,10 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 // Process is no longer pending and never wrote a result.
                 // Treat as failed-without-output and free the kernel
                 // resources so we do not leak channels/futexes.
-                // 子 agent 进程终止但未发布结果时，它不会运行自己的清理代码
-                // 来释放 producer holder，因此这里必须同时释放 consumer 和 producer，
-                // 否则 channel_destroy 因 ref_count != 0 失败，channel + futex 永久泄漏。
+                // When a subagent process terminated without publishing a result, it never ran its
+                // own cleanup to release the producer holder, so both the consumer and the producer
+                // must be released here; otherwise channel_destroy fails on a non-zero ref_count
+                // and the channel + futex leak permanently.
                 let rendered = collect_missing_task_result(tid, entry)?;
                 cleanup_collected_task(os, entry, "subagent terminated without output");
                 ready.push(rendered);
@@ -1844,7 +1903,8 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             }
         }
 
-        // `any` 在首次扫描已拿到结果时必须立即返回，不能再被其余 pending 任务挂起。
+        // With `any`, once the first scan already collected a result, we must return immediately
+        // instead of being suspended by the remaining pending tasks.
         if !pending.is_empty()
             && !wait_budget_elapsed
             && !(wait_policy == WaitPolicy::Any && !ready.is_empty())
@@ -1854,11 +1914,12 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 .map(|(tid, _)| tid.clone())
                 .collect::<Vec<_>>();
             let wait_sources = task_wait_sources(os, &pending_ids, &registry)?;
-            // `task_wait` 的 `wait_policy=all` 是工具层语义：返回前要收齐所有
-            // task 结果。但底层 park 不能用 `WaitPolicy::All` 等所有事件源，
-            // 因为 sources 里还包含用于中断当前进程的 cancel futex，它在正常路径
-            // 不会完成。这里等待“任一 task 事件”唤醒，再重新扫描所有 task 状态；
-            // 若还没收齐，模型可用相同 task_ids 继续调用 task_wait。
+            // `task_wait`'s `wait_policy=all` is tool-layer semantics: all task results must be
+            // collected before returning. The underlying park cannot use `WaitPolicy::All` to wait
+            // on every event source, because the sources also include the cancel futex used to
+            // interrupt the current process, which never completes on the normal path. So we wait
+            // for "any task event" to wake us, then re-scan all task states; if everything is not
+            // collected yet, the model can call task_wait again with the same task_ids.
             let wait = epoll_wait_many(
                 os,
                 &format!("task_wait:{}", pending_ids.join(",")),
@@ -1866,10 +1927,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 WaitPolicy::Any,
                 None,
             )?;
-            // 无论 epoll_wait_many 是否 suspended，都先 re-scan 收集在等待期间
-            // 变为就绪的结果。如果 suspended 且所有任务都已完成，直接返回结果
-            // （而不是 PARKED），避免 wait_policy=all 时模型被迫反复调用 task_wait。
-            // 仅当 re-scan 后仍有 pending 且确为 suspended 时才返回 PARKED。
+            // Whether or not epoll_wait_many suspended, always re-scan first to collect results
+            // that became ready during the wait. If it suspended and all tasks are now complete,
+            // return the results directly (instead of PARKED), so the model is not forced to call
+            // task_wait repeatedly under wait_policy=all. PARKED is returned only when tasks are
+            // still pending after the re-scan and the wait really did suspend.
             pending.clear();
             for tid in &pending_ids {
                 let entry = registry.get_ref(tid).expect("validated after wait");
@@ -1890,11 +1952,13 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     finished.push(tid.clone());
                 }
             }
-            // Re-scan 后仍有 pending 且确为 suspend（协作式让出，非预算耗尽），
-            // 返回 PARKED 并附带已收集的部分结果。这里 **绝不能** 用
-            // "BUDGET ELAPSED" 之类的终态措辞：suspend 是毫秒级同步返回的（不是
-            // 真的等满 timeout_secs），否则模型会把"刚发起等待就超时"误判成
-            // "子任务卡住"，从而提前放弃并转手动分析。
+            // Tasks are still pending after the re-scan and the wait really suspended (a
+            // cooperative yield, not budget exhaustion), so return PARKED with the partial results
+            // collected so far. Terminal wording like "BUDGET ELAPSED" must **never** be used
+            // here: a suspend returns synchronously within milliseconds (it does not really wait
+            // the full timeout_secs), otherwise the model would misread "timeout right after
+            // starting to wait" as "subtask stuck" and give up early to fall back to manual
+            // analysis.
             if !pending.is_empty()
                 && wait.suspended
                 && !(wait_policy == WaitPolicy::Any && !ready.is_empty())
@@ -1974,8 +2038,8 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         );
         append_task_progress_snapshots(&mut elapsed_message, &pending_ids);
         parts.push(elapsed_message);
-        // 仅清理已经 ready 的 task_id 对应的 registry 条目；pending 任务必须保留，
-        // 否则下次 task_wait 会因 "Unknown task_id" 失败。
+        // Only remove the registry entries for task_ids that are already ready; pending tasks must
+        // be kept, otherwise the next task_wait fails with "Unknown task_id".
         let pending_set: SkipSet<&str> = pending_ids.iter().map(String::as_str).collect();
         for tid in &task_ids {
             if !pending_set.contains(&tid.as_str()) {
@@ -2007,12 +2071,13 @@ fn append_lone_spawn_hint(mut text: String, hint: Option<&str>) -> String {
     text
 }
 
-/// 向 subagent 的 result channel 写入一条终态结果并终止其 kernel 进程。用于
-/// task_cancel（主动取消）与 wall-clock 总寿命超时。结果采用与
-/// `publish_background_task_failure` 相同的 status/output/error 格式，使
-/// task_wait / task_status 的收集路径能正常读到。本函数只释放 producer 端命名
-/// 所有权并 store futex 唤醒等待方；channel/futex 的 destroy 留给收集方（task_wait
-/// 的 ready 路径或 task_cancel 自身）完成，避免重复释放。
+/// Writes a terminal result to a subagent's result channel and terminates its kernel process.
+/// Used for task_cancel (explicit cancellation) and wall-clock total-lifetime timeout. The result
+/// uses the same status/output/error format as `publish_background_task_failure`, so the
+/// task_wait / task_status collection paths read it normally. This function only releases the
+/// producer-side named ownership and stores the futex to wake the waiter; destroying the
+/// channel/futex is left to the collector (task_wait's ready path or task_cancel itself) to avoid
+/// double release.
 fn write_terminal_subagent_result(
     os: &mut dyn aios_kernel::kernel::Kernel,
     task_id: &str,
@@ -2022,12 +2087,14 @@ fn write_terminal_subagent_result(
     status: &str,
     error: &str,
 ) {
-    // 调用方必须先 abort 实际执行 subagent 的 Tokio task；kernel process 状态本身
-    // 不会停止宿主进程里的 Future。随后再终止 kernel 进程并发布终态结果。
+    // The caller must first abort the Tokio task actually running the subagent; the kernel process
+    // state alone does not stop the Future inside the hosting process. Only then terminate the
+    // kernel process and publish the terminal result.
     let _ = os.kill_process(pid, format!("{}: {}", status, error));
-    // 再以 subagent 身份写终态结果并释放 producer 端（result channel 的 producer
-    // 所有权校验要求 current == pid）。进程虽已 terminated，但 channel/futex 资源
-    // 尚未回收（回收发生在 drop_terminated），故仍可写入。
+    // Then write the terminal result as the subagent and release the producer side (the result
+    // channel's producer ownership check requires current == pid). Although the process is already
+    // terminated, the channel/futex resources are not reclaimed yet (that happens in
+    // drop_terminated), so the write is still valid.
     let original = os.current_process_id();
     os.set_current_pid(Some(pid));
     let payload = serde_json::json!({
@@ -2044,25 +2111,31 @@ fn write_terminal_subagent_result(
     os.set_current_pid(original);
 }
 
-/// 调度器每 epoch 调用：扫描 TASK_REGISTRY 中超过 wall-clock 总寿命上限且仍在
-/// 运行的 subagent，终止其进程并写入 timeout 终态结果。
+/// Called by the scheduler every epoch: scans TASK_REGISTRY for subagents still running past the
+/// wall-clock total-lifetime cap, terminates their processes, and writes a timeout terminal
+/// result.
 ///
-/// 与 `task_wait` 内的 wall-clock 检查互补：task_wait 只在主 agent 主动调用时触发；
-/// 本函数在 driver run_loop 每 epoch 主动扫描，即使主 agent 去做别的事（长期不调
-/// task_wait），卡死的 subagent 进程也能被及时终止，避免永久占用调度器资源。
+/// Complements the wall-clock check inside `task_wait`: task_wait only triggers when the main
+/// agent actively calls it; this function proactively scans every epoch of the driver run_loop,
+/// so even if the main agent is busy elsewhere (not calling task_wait for a long time), a stuck
+/// subagent process is still terminated promptly instead of occupying scheduler resources
+/// forever.
 ///
-/// 资源语义：只 kill 进程 + 写终态结果，**不**销毁 channel/futex、**不**从 registry
-/// 移除——这些留给收集方（task_wait 的 ready 路径）完成，避免重复释放。进程被 kill
-/// 后 `is_task_pending` 返回 false，后续 epoch 扫描到同一 entry 会跳过，不会重复 kill。
+/// Resource semantics: only kill the process + write the terminal result; the channel/futex are
+/// **not** destroyed and the entry is **not** removed from the registry — those are left to the
+/// collector (task_wait's ready path) to avoid double release. After the process is killed,
+/// `is_task_pending` returns false, so a later epoch scanning the same entry skips it and does not
+/// kill it again.
 ///
-/// 锁顺序：分三步以避免与 task_wait（registry -> kernel）形成锁环——
-/// 1. 仅锁 TASK_REGISTRY 收集候选，立即释放；
-/// 2. 不持任何锁，abort 实际执行 subagent 的 Tokio task；
-/// 3. 仅锁 kernel（via with_os_kernel）执行 kill + 写结果。
-/// 两步绝不同时持有 registry 与 kernel（GLOBAL_OS 与 App.os 是同一把锁，参见
-/// os_tools.rs 的重入死锁警告）。
+/// Lock ordering: three steps to avoid forming a lock cycle with task_wait (registry -> kernel) —
+/// 1. Lock only TASK_REGISTRY to collect the candidates, then release immediately;
+/// 2. Holding no lock, abort the Tokio task actually running the subagent;
+/// 3. Lock only the kernel (via with_os_kernel) to kill + write the result.
+/// The registry and the kernel are never held simultaneously (GLOBAL_OS and App.os are the same
+/// lock; see the reentrant-deadlock warning in os_tools.rs).
 pub(crate) fn reap_timed_out_subagents() {
-    // Step 1：仅持 registry 锁，收集超时候选（pid / channel / futex），立即释放。
+    // Step 1: hold only the registry lock to collect timed-out candidates (pid / channel /
+    // futex), then release immediately.
     let candidates = {
         let registry = TASK_REGISTRY.lock().unwrap();
         registry
@@ -2083,19 +2156,21 @@ pub(crate) fn reap_timed_out_subagents() {
     if candidates.is_empty() {
         return;
     }
-    // Step 2：不持任何锁，先停止真实 Tokio Future，避免它与 timeout 终态并发写结果。
+    // Step 2: holding no lock, stop the real Tokio Future first so it cannot write a result
+    // concurrently with the timeout terminal state.
     for (_, _, _, _, abort_handle, cancel_stream) in &candidates {
         cancel_stream.store(true, Ordering::Release);
         if let Some(handle) = abort_handle {
             handle.abort();
         }
     }
-    // Step 3：仅持 kernel 锁，逐个检查是否仍在运行，是则 kill + 写 timeout 终态。
+    // Step 3: hold only the kernel lock and check each process; if still running, kill it + write
+    // the timeout terminal state.
     let _ = with_os_kernel(|os| {
         for (task_id, pid, result_channel_id, completion_futex_addr, _, _) in candidates {
             if !is_task_pending(os, pid)? {
-                // 进程已结束（正常完成 / 失败 / 被他人 kill），跳过；其结果与资源
-                // 清理交给收集方处理。
+                // The process already ended (completed normally / failed / killed by someone
+                // else); skip it — result and resource cleanup are handled by the collector.
                 continue;
             }
             write_terminal_subagent_result(
@@ -2187,11 +2262,12 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
-/// 呈现当前会话的完整子代理调用台账（spawn 审计）。
+/// Presents the complete subagent call ledger of the current session (spawn audit).
 ///
-/// 与 `task_evidence_read`（单任务进度证据）互补：这里是模型可见的审计视图，
-/// 回答「这个 agent 会话里到底调用过哪些 subagent、何时、用了哪个 agent/model、
-/// 结果是否已交付/已整合」，即使结果早已被收集或历史被压缩也仍然可查。
+/// Complements `task_evidence_read` (per-task progress evidence): this is a model-visible audit
+/// view answering "which subagents were called in this agent session, when, with which
+/// agent/model, and whether results were delivered/integrated" — still queryable even after the
+/// results were collected long ago or the history was compressed.
 pub(crate) fn execute_task_audit(_args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_audit")?;
     let Some(context) = crate::ai::driver::runtime_ctx::try_current() else {
@@ -2349,10 +2425,11 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
-/// 销毁一个 session 时终止并移除其全部异步 subagent。
+/// Terminates and removes all asynchronous subagents of a session when it is destroyed.
 ///
-/// 这条路径不保留可收集结果：父 session 已被用户显式删除，继续保留 registry、IPC
-/// 或后台 Future 只会让已删除的派生历史被重新创建。
+/// This path does not preserve collectable results: the parent session was explicitly deleted by
+/// the user, so keeping the registry, IPC, or background Futures would only let the deleted
+/// derived history be recreated.
 pub(crate) fn discard_tasks_for_session(session_id: &str) {
     let candidates = {
         let registry = TASK_REGISTRY.lock().unwrap();
@@ -2450,8 +2527,9 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
     let mut cancelled: Vec<String> = Vec::new();
     let mut already_finished: Vec<String> = Vec::new();
     let mut not_found: Vec<String> = Vec::new();
-    // 先只持 registry 锁复制取消所需信息，随后立即释放；Tokio task 的 abort 和
-    // kernel 终态写入都不能与 registry 锁重叠，避免与收集路径形成锁环。
+    // First copy the cancellation info under the registry lock only, then release immediately;
+    // neither the Tokio task abort nor the kernel terminal write may overlap with the registry
+    // lock, to avoid forming a lock cycle with the collection path.
     let candidates = {
         let registry = TASK_REGISTRY.lock().unwrap();
         task_ids
@@ -2477,8 +2555,9 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
             .collect::<Vec<_>>()
     };
 
-    // 必须先停止实际 Tokio Future，再进入 kernel 写 cancelled 终态；否则逻辑进程
-    // 已终止后，网络请求或工具调用仍可能在后台继续运行并与终态写入竞争。
+    // The real Tokio Future must be stopped before entering the kernel to write the cancelled
+    // terminal state; otherwise, after the logical process is terminated, network requests or
+    // tool calls can still run in the background and race with the terminal write.
     for (_, _, _, _, abort_handle, cancel_stream) in &candidates {
         cancel_stream.store(true, Ordering::Release);
         if let Some(handle) = abort_handle {
@@ -2487,11 +2566,13 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
     }
 
     for (tid, pid, result_channel_id, completion_futex_addr, _, _) in candidates {
-        // 仅对仍在运行的 subagent 执行取消。已结束（正常完成 / 失败 / 进程终止）的
-        // 任务不再 kill、也不再写终态结果——否则会向 channel 追加一条 "cancelled"
-        // 消息并销毁 channel，遮蔽/丢弃 subagent 的真实结果，且让后续 task_wait 拿
-        // 到错误的 cancelled 状态。已结束任务的 channel/futex/registry 清理留给收集
-        // 方（task_wait 的 ready / 失败路径，或 task_status 后的 task_wait）。
+        // Only cancel subagents that are still running. Tasks that already ended (completed
+        // normally / failed / process terminated) are neither killed nor given a terminal result —
+        // otherwise a "cancelled" message would be appended to the channel and the channel
+        // destroyed, masking/discarding the subagent's real result and making a later task_wait
+        // read a bogus cancelled state. Cleanup of channel/futex/registry for already-ended tasks
+        // is left to the collector (task_wait's ready / failure path, or a task_wait after
+        // task_status).
         let was_pending = with_os_kernel(|os| {
             if !is_task_pending(os, pid)? {
                 return Ok(false);
@@ -2582,11 +2663,12 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
         "TaskID              PID      Agent          Model          State       Description"
             .to_string(),
     ];
-    // 对已经把结果写回 channel 的子任务，直接 **消费并清理** 正文，附在表格后面。
-    // 否则模型即使看到 state=completed，也只能回头再调 task_wait 才能拿到输出；
-    // 更糟的是如果它把"seen completed in task_status"视为已处理，就会绕过收口守卫，
-    // 留下 registry 条目和 channel/futex 资源。这里既然已经把结果返回给模型，
-    // 就应视为已收集完成。
+    // For subtasks that already wrote their result back to the channel, **consume and clean up**
+    // the body directly and append it after the table. Otherwise, even if the model sees
+    // state=completed, it can only get the output by calling task_wait again; worse, if it treats
+    // "seen completed in task_status" as handled, it would bypass the collection guard and leave
+    // registry entries and channel/futex resources behind. Since the result is already returned
+    // to the model here, treat it as collected.
     let mut completed_outputs: Vec<String> = Vec::new();
     let mut finished_ids: Vec<String> = Vec::new();
     with_os_kernel(|os| {
@@ -2636,8 +2718,9 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
                 cleanup_collected_task(os, &entry, "subagent result collected by task_status");
                 finished_ids.push(tid.clone());
             } else if !is_task_pending(os, *pid)? {
-                // 与 task_wait 保持一致：进程已终止但没有写回结果时，也必须把任务
-                // 收口并释放双方的 channel ownership，避免仅轮询 task_status 时泄漏。
+                // Consistent with task_wait: when the process terminated without writing back a
+                // result, the task must also be closed out and both sides of the channel
+                // ownership released, so polling only task_status does not leak.
                 let rendered = collect_missing_task_result(tid, &entry)?;
                 completed_outputs.push(rendered);
                 cleanup_collected_task(
@@ -2759,10 +2842,12 @@ pub(crate) fn build_outstanding_task_anchor(session_id: &str) -> Result<Option<S
     Ok(Some(render_outstanding_task_anchor(&snapshots)))
 }
 
-/// 已到达迭代硬上限、不再打回模型时，把仍未回收的子任务状态拼进最终回答，
-/// 避免未回收结果被静默抛弃。与 `build_outstanding_task_anchor` 共用 snapshot
-/// 收集，但文案面向最终输出：此时不会再给模型继续的机会，因此不再要求模型
-/// “下一步调用 task_wait”，而是告知用户哪些子任务结果未被回收、需要重跑收集。
+/// When the iteration hard cap is reached and control will no longer be handed back to the model,
+/// fold the still-uncollected subtask states into the final answer so uncollected results are not
+/// silently dropped. Shares the snapshot collection with `build_outstanding_task_anchor`, but the
+/// wording targets the final output: the model gets no further chance to act, so instead of asking
+/// it to "call task_wait next", it tells the user which subtask results were not collected and
+/// need to be re-collected.
 pub(crate) fn build_abandoned_tasks_notice(
     session_id: &str,
     iteration_limit: usize,
@@ -2937,10 +3022,11 @@ fn format_task_result_with_id(
     rendered
 }
 
-/// spawn 成功后写入持久化审计占位记录（delivered_at=0），结果交付时
-/// `record_delivered_task_evidence` 会覆盖同一 task_id 的状态字段，因此台账
-/// 始终能回答「当前 agent 是否调用过子代理、何时、哪个 agent/model」。
-/// 审计写入是 best-effort：失败不阻塞 spawn 本身。
+/// After a successful spawn, writes a placeholder audit record (delivered_at=0); when the result
+/// is delivered, `record_delivered_task_evidence` overwrites the status fields for the same
+/// task_id, so the ledger can always answer "whether the current agent called a subagent, when,
+/// and with which agent/model". The audit write is best-effort: failure does not block the spawn
+/// itself.
 fn record_subagent_spawn_audit(task_id: &str, prepared: &PreparedSubagentTask) {
     let Some(context) = crate::ai::driver::runtime_ctx::try_current() else {
         return;
@@ -2979,8 +3065,9 @@ fn persist_rendered_task_evidence(
     .map_err(|error| format!("failed to persist task evidence for {task_id}: {error}"))
 }
 
-/// 读取当前会话中指定 task_id 的已持久化证据状态（status + payload）。
-/// 无 driver 上下文或未持久化时返回 None（与持久化端保持一致的宽松语义）。
+/// Reads the persisted evidence state (status + payload) for the given task_id in the current
+/// session. Returns None when there is no driver context or nothing has been persisted (a lenient
+/// semantic consistent with the persisting side).
 fn read_persisted_task_evidence_status(
     session_id: &str,
     task_id: &str,
@@ -3050,11 +3137,12 @@ pub(super) enum OwnedTaskPoll {
     },
 }
 
-/// Team/Graph 编排器使用的非阻塞收集入口。
+/// Non-blocking collection entry point used by the Team/Graph orchestrator.
 ///
-/// 与 `task_status` 保持同一条真相路径：先持久化 evidence，再消费 channel，最后
-/// 清理 IPC 与 registry。这样图执行器不会建立第二套 subagent 结果协议，也不会
-/// 绕过 context rebuild 所依赖的 durable evidence。
+/// Follows the same truth path as `task_status`: persist evidence first, then
+/// consume the channel, and finally clean up IPC and the registry. This way the
+/// graph executor does not build a second subagent result protocol and cannot
+/// bypass the durable evidence that context rebuild depends on.
 pub(super) fn poll_owned_task_result(task_id: &str) -> Result<OwnedTaskPoll, String> {
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let current_owner_pid = current_task_owner_pid()?;
@@ -3063,10 +3151,13 @@ pub(super) fn poll_owned_task_result(task_id: &str) -> Result<OwnedTaskPoll, Str
         let entry = match registry.get_ref(&task_id.to_string()) {
             Some(entry) => entry,
             None => {
-                // 条目缺失：正常流程里条目只在 poll 到 Terminal 并持久化证据后才被移除。
-                // 若本会话已持久化该任务的证据（H1 回归「已 poll 但 checkpoint 未保存」的
-                // 唯一途径），返回幂等 Terminal 让 graph/team checkpoint 自愈，而非永久卡死；
-                // 无证据则仍是真错误。
+                // Entry missing: in the normal flow an entry is only removed
+                // after the task is polled to Terminal and its evidence is
+                // persisted. If this session already persisted evidence for the
+                // task (the only path for the H1 regression "polled but
+                // checkpoint not saved"), return an idempotent Terminal so the
+                // graph/team checkpoint can self-heal instead of hanging
+                // forever; without evidence this is still a genuine error.
                 if let Some((status, payload)) =
                     read_persisted_task_evidence_status(&current_session_id, task_id)?
                 {
@@ -3145,11 +3236,14 @@ pub(super) fn poll_owned_task_result(task_id: &str) -> Result<OwnedTaskPoll, Str
     Ok(poll)
 }
 
-/// 收集终态结果后统一释放 IPC，并把对应 kernel 进程终止、回收。
+/// After collecting a terminal result, release all IPC and terminate and reap
+/// the corresponding kernel process.
 ///
-/// result payload 可在 driver 完成最终进程状态更新前唤醒父 agent；因此收集方不能只
-/// 尝试 `drop_terminated`。无论此时进程仍是 Ready/Running 还是已经 Terminated，
-/// terminal collection 都负责把“一次性 subagent task”收口，避免进程表持续增长。
+/// The result payload may wake the parent agent before the driver finishes
+/// updating the final process state; therefore the collector cannot rely on
+/// `drop_terminated` alone. Whether the process is still Ready/Running or
+/// already Terminated, terminal collection closes out the one-shot subagent
+/// task so the process table does not grow indefinitely.
 fn cleanup_collected_task(os: &mut dyn Kernel, entry: &AsyncTaskEntry, reason: &str) {
     let channel_id = ChannelId(entry.result_channel_id);
     let _ = os.channel_close(None, channel_id);
@@ -3162,8 +3256,10 @@ fn cleanup_collected_task(os: &mut dyn Kernel, entry: &AsyncTaskEntry, reason: &
         return;
     }
 
-    // 防御测试/损坏注册表把前台 owner 自身登记成 task pid；收集 subagent 结果绝不能
-    // 终止仍在运行的父进程。若它已经终止，下面仍会正常清理并 drop。
+    // Defend against tests or a corrupted registry registering the foreground
+    // owner itself as a task pid; collecting a subagent result must never
+    // terminate a still-running parent process. If it has already terminated,
+    // the cleanup below still runs normally and drops it.
     if entry.pid == entry.owner_pid
         && !matches!(
             os.get_process(entry.pid).map(|process| &process.state),
@@ -3173,8 +3269,10 @@ fn cleanup_collected_task(os: &mut dyn Kernel, entry: &AsyncTaskEntry, reason: &
         return;
     }
 
-    // kill_process 依赖 current pid 做父子权限校验。正常路径保留 owner 作为 current；
-    // session owner 已消失时退回到子进程自杀，确保删除 session 也不会遗留孤儿。
+    // kill_process uses the current pid for parent/child permission checks. The
+    // normal path keeps the owner as current; when the session owner is gone we
+    // fall back to the child terminating itself, so deleting a session never
+    // leaves an orphan behind.
     let collector_pid = if os.get_process(entry.owner_pid).is_some() {
         entry.owner_pid
     } else {
@@ -3205,8 +3303,10 @@ fn subagent_document_text(agent: &AgentManifest) -> String {
     parts.join("\n")
 }
 
-/// 从文本提取 2-4 元字符 n-gram 集合（小写、空白折叠归一化）。
-/// 仅用于集合相似度计算，不含词频 / 逆文档频率等权重。
+/// Extract the set of 2-4 character n-grams from text (lowercased, whitespace
+/// collapsed and normalized).
+/// Used only for set-similarity scoring; carries no term-frequency /
+/// inverse-document-frequency weights.
 fn char_ngram_set_from_text(input: &str) -> FxHashSet<String> {
     let mut normalized = String::with_capacity(input.len());
     let mut prev_space = false;
@@ -3242,7 +3342,8 @@ fn char_ngram_set_from_text(input: &str) -> FxHashSet<String> {
     set
 }
 
-/// 子代理自动选择：基于归一化文本的字符 n-gram 集合重叠度（Jaccard）打分。
+/// Subagent auto-selection: score by Jaccard overlap of the normalized-text
+/// character n-gram sets.
 fn auto_subagent_score(
     agent: &AgentManifest,
     task_text: &str,

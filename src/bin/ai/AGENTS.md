@@ -53,7 +53,7 @@ Sessions are the unit of conversation persistence; a session id is a UUID (36 ch
 7. **Derived-context provenance.** Runtime policy notes may map to `system`; model-authored self-notes/checkpoints stay `assistant`-derived and unverified. Never promote prior assistant wording into system fact; project via user/assistant handoff pairs only.
 8. **Synthetic user messages.** Runtime-injected `role=="user"` (subagent handoff, image followup, etc.) must use `history::runtime_synthetic_user_message` and be detected via `history::is_runtime_synthetic_user_message`/`last_real_user_index` — never bare `rposition(role=="user")`. Clear the origin sidecar in `request/normalize` before provider serialization.
 9. **Compression purity.** Speculative fold candidates stay pure until selected; persist evidence only for accepted candidates with deterministic asset paths; retain raw messages if archive commit fails.
-10. **Model-visible wording is English.** Base prompt / gate notes / injected notes use one English system; keep Chinese only in code comments, keyword-match lists, and terminal text.
+10. **Model-visible wording is English.** Base prompt / gate notes / injected notes use one English system; keep Chinese only in keyword-match lists and terminal text.
 
 ## Scoped guides
 

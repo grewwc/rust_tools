@@ -24,7 +24,8 @@ pub(super) use multiline::MultilineHistoryState;
 const LINE_REPL_HISTORY_FILE: &str = "~/.liner_history";
 const MAX_INPUT_CHARS: usize = 4000;
 
-/// 后台任务只发布标题变更；终端重绘仍由前台输入循环独占。
+/// Background tasks only publish title changes; terminal redraw stays exclusive
+/// to the foreground input loop.
 #[derive(Clone)]
 struct SessionTitleUpdate {
     session_id: String,
@@ -45,7 +46,7 @@ fn subscribe_session_title_updates() -> (u64, Receiver<SessionTitleUpdate>) {
     (subscriber_id, receiver)
 }
 
-/// 将已持久化的标题变更转交给当前前台编辑器。
+/// Forward a persisted title change to the current foreground editor.
 pub(in crate::ai) fn notify_session_title_updated(session_id: &str, title: &str) {
     let update = SessionTitleUpdate {
         session_id: session_id.to_string(),
@@ -63,20 +64,24 @@ pub(super) struct PromptEditor {
     session_id: String,
     session_store: SessionStore,
     session_image_dir: PathBuf,
-    /// 下一次 `read_multi_line` 的预填文本（用于编辑已有内容场景，读取后清空）。
+    /// Prefill text for the next `read_multi_line` (for editing existing content;
+    /// cleared after being read).
     pending_prefill: Option<String>,
-    /// 下一次 `read_multi_line` 初始展示的状态消息（读取后清空）。
+    /// Initial status message shown by the next `read_multi_line` (cleared after being read).
     pending_status_msg: Option<String>,
-    /// 当前模型显示名，用于在输入框顶部展示模型提示（输入时即可看到将使用的模型）。
+    /// Current model display name, shown as a model hint above the input box
+    /// (so the model in use is visible while typing).
     current_model_label: String,
-    /// 当前请求生效的推理强度，用于在输入框顶部与模型提示同行展示。
+    /// Reasoning effort active for the current request, shown on the same line
+    /// as the model hint above the input box.
     current_reasoning_effort_label: String,
-    /// 当前 session 主题，用于在输入框顶部与模型提示同行展示。
+    /// Current session topic, shown on the same line as the model hint above the input box.
     session_topic: Option<String>,
-    /// 当前前台编辑器的后台标题变更订阅。
+    /// Background title-change subscription for the current foreground editor.
     session_title_update_subscription: u64,
     session_title_updates: Mutex<Receiver<SessionTitleUpdate>>,
-    /// 首帧绘制完成后的单次通知。启动期的后台初始化可据此避开终端首屏渲染。
+    /// One-shot notification after the first frame is drawn. Startup background
+    /// initialization can use it to avoid terminal first-screen rendering.
     first_render_notifier: Option<Sender<()>>,
 }
 
@@ -125,50 +130,56 @@ impl PromptEditor {
         }
     }
 
-    /// 设置下一次多行输入的预填内容（编辑已有 memo 时用，读取一次后自动清空）。
+    /// Set the prefill content for the next multi-line input (used when editing
+    /// an existing memo; auto-cleared after one read).
     pub(super) fn set_prefill(&mut self, text: impl Into<String>) {
         self.pending_prefill = Some(text.into());
     }
 
-    /// 设置下一次多行输入初始展示的状态消息，避免在 TUI 外直接打印打乱输入框。
+    /// Set the status message shown initially by the next multi-line input,
+    /// avoiding direct prints outside the TUI that would disturb the input box.
     pub(super) fn set_status_message(&mut self, message: impl Into<String>) {
         self.pending_status_msg = Some(message.into());
     }
 
-    /// 设置当前模型显示名，下一次 `read_multi_line` 会在输入框顶部展示。
+    /// Set the current model display name; the next `read_multi_line` shows it
+    /// above the input box.
     pub(super) fn set_current_model_label(&mut self, label: impl Into<String>) {
         self.current_model_label = label.into();
     }
 
-    /// 设置当前请求生效的推理强度，下一次 `read_multi_line` 会与模型提示同行展示。
+    /// Set the reasoning effort active for the current request; the next
+    /// `read_multi_line` shows it on the same line as the model hint.
     pub(super) fn set_current_reasoning_effort_label(&mut self, label: impl Into<String>) {
         self.current_reasoning_effort_label = label.into();
     }
 
-    /// 更新当前绑定的 session。`PromptEditor` 生命周期跨 `/session` 切换，
-    /// 进入输入框前需要同步到 app 的当前 session。
+    /// Update the bound session. `PromptEditor` outlives `/session` switches,
+    /// so it must be synced to the app's current session before entering the input box.
     pub(super) fn set_session_id(&mut self, session_id: impl Into<String>) {
         self.session_id = session_id.into();
     }
 
-    /// 设置当前 session 主题，下一次 `read_multi_line` 会在模型提示同行展示。
+    /// Set the current session topic; the next `read_multi_line` shows it on the
+    /// same line as the model hint.
     pub(super) fn set_session_topic(&mut self, topic: Option<String>) {
         self.session_topic = topic;
     }
 
-    /// 设置下一次输入框首帧完成后的通知。
+    /// Set the notification fired once the next input box's first frame is drawn.
     pub(in crate::ai) fn set_first_render_notifier(&mut self, notifier: Sender<()>) {
         self.first_render_notifier = Some(notifier);
     }
 
-    /// 通知一次即可；发送端被消费后，后续重绘不会产生额外事件。
+    /// Notify only once; once the sender is consumed, later redraws produce no extra events.
     pub(in crate::ai::prompt) fn notify_first_render(&mut self) {
         if let Some(notifier) = self.first_render_notifier.take() {
             let _ = notifier.send(());
         }
     }
 
-    /// 在前台安全点应用后台标题更新，避免后台任务直接操作终端。
+    /// Apply pending background title updates at a foreground safe point, so
+    /// background tasks never touch the terminal directly.
     fn apply_pending_session_title_updates(&mut self) -> bool {
         let updates = {
             let receiver = self
@@ -220,7 +231,8 @@ impl PromptEditor {
     fn read_multi_line_no_tty(&mut self) -> io::Result<Option<String>> {
         use std::io::IsTerminal;
         self.notify_first_render();
-        // 非 TTY 无法交互编辑：有预填且无管道输入时，直接返回预填原文。
+        // Without a TTY there is no interactive editing: if a prefill exists and
+        // there is no piped input, return the prefill text as-is.
         let prefill = self.pending_prefill.take();
         let _ = self.pending_status_msg.take();
         let stdin = io::stdin();

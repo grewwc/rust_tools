@@ -1,16 +1,18 @@
 // =============================================================================
-// TurnPipeline - Turn 级流水线 Trait（将 orchestrator 扁平流程抽象为可替换对象）
+// TurnPipeline - turn-level pipeline trait (abstracts the orchestrator's flat
+// flow into a replaceable object)
 // =============================================================================
 use std::{future::Future, pin::Pin};
 use super::context::{PipelineContext, StageKind};
 use super::hook::HookRegistry;
 use super::stage::Pipeline;
 
-/// Turn 流水线抽象：driver 只依赖此 trait，不依赖具体 stage 组合与钩子实现。
-/// 便于单测 mock、中间件装饰、以及多租户/多模型分支替换。
+/// Turn pipeline abstraction: the driver depends only on this trait, not on the
+/// concrete stage composition or hook implementations. This eases unit-test
+/// mocking, middleware decoration, and multi-tenant/multi-model branch replacement.
 pub trait TurnPipeline: Send + Sync {
     fn name(&self) -> &'static str;
-    /// 执行整个 turn（内部可按需触发 HookRegistry 的 before/after）。
+    /// Execute the whole turn (may trigger HookRegistry before/after hooks internally).
     fn run<'a>(
         &'a self,
         ctx: &'a mut PipelineContext<'_>,
@@ -18,7 +20,7 @@ pub trait TurnPipeline: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
 }
 
-/// 默认实现：包裹 `Pipeline` + 钩子触发（按 StageKind 顺序触发 before/after）。
+/// Default implementation: wraps `Pipeline` + hook firing (before/after per StageKind order).
 pub struct DefaultTurnPipeline {
     name: &'static str,
     pipeline: Pipeline,
@@ -36,10 +38,12 @@ impl TurnPipeline for DefaultTurnPipeline {
         ctx: &'a mut PipelineContext<'_>,
         hooks: &'a HookRegistry,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
-        // 触发全局 before → Pipeline（迭代执行 stage，含 per-stage 钩子）→ 全局 after。
-        // `Stage::execute` / `Pipeline::execute` 将 ctx 的借用生命周期与
-        // `PipelineContext` 的内部生命周期解耦（`'a`/`'b` 分离），因此这里可以
-        // 用安全顺序 `&mut` 重借逐段执行，无需裸指针；future 也可保持 Send。
+        // Fire global before hooks, run the Pipeline (executing stages in
+        // sequence, including per-stage hooks), then fire global after hooks.
+        // `Stage::execute` / `Pipeline::execute` decouple ctx's borrow lifetime
+        // from `PipelineContext`'s internal lifetime (separate `'a`/`'b`), so we
+        // can execute each segment with safe sequential `&mut` reborrows, no raw
+        // pointers; the future also stays Send.
         let pipeline = &self.pipeline;
         Box::pin(async move {
             hooks.fire_before(ctx, StageKind::Prepare)?;
@@ -94,8 +98,9 @@ mod tests {
 
     #[tokio::test]
     async fn per_stage_hooks_fire() {
-        // 每个 stage 的 kind() 对应 BuildRequest，注册的 per-stage 钩子应环绕每个 stage 触发，
-        // 且全局钩子（before/after）不被 stage 级触发重复调用。
+        // Each stage's kind() is BuildRequest, so registered per-stage hooks
+        // should fire around every stage, and global hooks (before/after) must
+        // not be re-fired per stage.
         let pipeline = Pipeline::new().push(TagStage("s1")).push(TagStage("s2"));
         let tp = DefaultTurnPipeline::new("test-per-stage", pipeline);
         let mut hooks = HookRegistry::new();
@@ -106,7 +111,8 @@ mod tests {
         let app = leak_app();
         let mut ctx = PipelineContext::new(app, vec![], 0);
         tp.run(&mut ctx, &hooks).await.unwrap();
-        // 每个 stage 前后各触发一次 per-stage 钩子，全局钩子仅在 turn 首尾各一次。
+        // Per-stage hooks fire once around each stage; global hooks fire once at
+        // the very beginning and end of the turn.
         assert_eq!(ctx.tags, vec!["before", "b", "s1", "a", "b", "s2", "a", "after"]);
     }
 }
