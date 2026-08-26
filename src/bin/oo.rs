@@ -57,9 +57,10 @@ fn handle_paste_to_file(fname: &str) -> Result<(), String> {
         }
     }
 
-    // 统一粘贴入口：只读取一次剪贴板，按内容类型（图片/文本/二进制）
-    // 自动选择扩展名保存，避免旧实现 binary→string→image 三级联各自重新
-    // 查询一次 OSC52（大图每查一次都要重新传输整份剪贴板）。
+    // Unified paste entry: read the clipboard only once and pick the extension by content
+    // type (image/text/binary), avoiding the old implementation's binary→string→image
+    // chain where each step re-queried OSC52 (every query retransfers the whole clipboard
+    // for large images).
     let saved_path = match clipboardw::paste_to_file(fname) {
         Ok(path) => path,
         Err(e) => {

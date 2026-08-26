@@ -1,8 +1,9 @@
-//! Rust 原生的持久 Team Runtime。
+//! Rust-native persistent Team Runtime.
 //!
-//! Team 只维护一套持久状态，实际 agent 执行继续复用 `task_tools` 的 kernel process、
-//! channel/futex、结果 evidence 与取消协议。成员是跨 turn 的逻辑角色；每次派发仍是有界
-//! 叶子 subagent，避免引入第二套常驻进程真相源或突破 depth guard。
+//! The team keeps one set of persistent state, while actual agent execution keeps reusing
+//! the kernel process, channel/futex, result evidence, and cancellation protocol from
+//! `task_tools`. Members are logical cross-turn roles; each dispatch is still a bounded
+//! leaf subagent, avoiding a second resident-process source of truth or breaking the depth guard.
 
 use super::{
     OwnedTaskPoll, execute_task_cancel, poll_owned_task_result, prepare_subagent_task,
@@ -506,8 +507,9 @@ fn recover_team_owner(team: &mut TeamState) -> Result<(), String> {
         return Ok(());
     }
 
-    // App 重启后 kernel task registry 不再存在。将孤儿运行项恢复为 pending；attempts
-    // 已经计费，不回滚预算。这样 resume 可重派，但不会把中断执行当成成功。
+    // After an app restart the kernel task registry no longer exists. Restore orphaned
+    // running items to pending; attempts are already billed and the budget is not rolled
+    // back, so resume can re-dispatch without treating an interrupted execution as success.
     recover_orphaned_team_tasks(team);
     team.owner_pid = owner_pid;
     team.updated_at_unix_ms = now_unix_ms();
@@ -1016,11 +1018,14 @@ pub(super) fn collect_team_results(team: &mut TeamState) -> Result<Vec<String>, 
                 } else {
                     result.output.as_str()
                 };
-                // 历史集成失败不能冒泡：poll_owned_task_result 已消费 TASK_REGISTRY
-                // 条目并持久化证据，若在这里 `?` 传播，checkpoint 不会保存，磁盘上
-                // 任务仍为 Running，下一次 advance 会因任务已不在 registry 而永久
-                // 卡死（连 cancel_team 也会在 collect_team_results 处失败）。
-                // 因此集成改为尽力而为：终态已就地提交，失败仅追加一条备注。
+                // A failed history integration must not propagate: poll_owned_task_result
+                // already consumed the TASK_REGISTRY entry and persisted the evidence. If
+                // `?` propagated here, the checkpoint would not be saved, the task on disk
+                // would stay Running, and the next advance would hang forever because the
+                // task is no longer in the registry (even cancel_team would fail at
+                // collect_team_results).
+                // So integration is best-effort: the terminal state is already committed
+                // in place and a failure only appends a note.
                 if let Err(error) = integrate_runtime_result(&runtime_task_id, &result.status, summary) {
                     collected.push(format!("task {task_id} evidence integration failed: {error}"));
                 }
@@ -1047,10 +1052,12 @@ pub(super) fn collect_team_results(team: &mut TeamState) -> Result<Vec<String>, 
                 team.updated_at_unix_ms = now;
             }
             Err(error) => {
-                // 轮次中途错误绝不冒泡：poll 失败（任务丢失/所有权变更）时把任务
-                // 就地标记为失败并清掉 task 引用。若 `?` 冒泡，checkpoint 不会保存，
-                // 磁盘上任务仍带 runtime_task_id，下次 advance 对同一丢失任务重复
-                // poll，永久卡死（连 cancel_team 也会在 collect_team_results 处失败）。
+                // Mid-round errors must never propagate: when poll fails (task lost /
+                // ownership changed), mark the task failed in place and clear the task
+                // reference. If `?` propagated, the checkpoint would not be saved, the
+                // task on disk would still carry runtime_task_id, and the next advance
+                // would re-poll the same lost task and hang forever (even cancel_team
+                // would fail at collect_team_results).
                 let now = now_unix_ms();
                 let member_id = team
                     .tasks

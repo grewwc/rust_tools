@@ -1,7 +1,7 @@
-//! 请求协议类型。
+//! Request protocol dialect.
 //!
-//! 这是与 provider adapter 正交的另一根轴：同一 adapter 下，不同模型/endpoint
-//! 也可能走不同的 HTTP wire（例如 chat-completions 与 responses）。
+//! This is an axis orthogonal to the provider adapter: under the same adapter, different
+//! models/endpoints may also use different HTTP wires (e.g. chat-completions vs responses).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
 #[serde(rename_all = "snake_case")]

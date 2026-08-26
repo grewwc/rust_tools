@@ -1,25 +1,29 @@
-//! `/proc` 命令：展示当前正在运行的 session。
+//! `/proc` command: show the currently running sessions.
 //!
-//! 灵感来自 Unix 的 `/proc` 文件系统--把所有"活着"的 session 汇总在一张表里。
+//! Inspired by the Unix `/proc` filesystem: it summarizes all "live" sessions
+//! in one table.
 //!
-//! 数据来源（三重探测，逐层兜底）：
-//! 1. **PID 文件**（sessions 目录下的 `<id>.pid`）：新版本 `a` 启动时自动写入，
-//!    退出时自动删除。最可靠。
-//! 2. **`lsof` 扫描**：仅对未通过 PID 文件登记的 `a` 进程查询其打开的 `.sqlite`
-//!    文件（`lsof -p`），而非递归扫描整个 sessions 目录。兜底旧版本 `a` 启动的
-//!    session（它们不写 PID 文件），但对空闲等待输入的旧版本 session 可能漏报。
-//! 3. **`pgrep` 计数**：统计名为 `a` 的进程总数，用于提示
-//!    "有 N 个 a 进程在跑，但只识别出 M 个 session"。
+//! Data sources (triple probe, falling back layer by layer):
+//! 1. **PID files** (`<id>.pid` in the sessions directory): written automatically
+//!    when a newer `a` starts, removed automatically on exit. Most reliable.
+//! 2. **`lsof` scan**: only for `a` processes not registered via a PID file,
+//!    query the `.sqlite` files they have open (`lsof -p`), rather than
+//!    recursively scanning the whole sessions directory. Covers sessions started
+//!    by older versions of `a` (they do not write PID files), though idle
+//!    older-version sessions waiting for input may be missed.
+//! 3. **`pgrep` count**: counts all processes named `a`, to hint
+//!    "N `a` processes are running, but only M sessions were identified".
 //!
-//! 注意：通过 `/bg`、`/suspend` 等挂起的 session **不算**活跃--它们的进程已退出，
-//! 只是保存了状态供后续恢复。使用 `/sessions list` 查看所有已保存的 session。
+//! Note: sessions suspended via `/bg`, `/suspend`, etc. are **not** active:
+//! their processes have exited, only their state was saved for later recovery.
+//! Use `/sessions list` to see all saved sessions.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process;
 
 use crate::ai::{driver::session_pid, history::SessionStore, types::App};
 
-/// 合并后的活跃 session 记录。
+/// Merged active-session record.
 struct ActiveSession {
     session_id: String,
     pid: i32,
@@ -61,11 +65,11 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
     let current_pid = process::id() as i32;
     let sessions_root = store.sessions_root();
 
-    // ---- 收集活跃 session（三重探测）----
+    // ---- Collect active sessions (triple probe) ----
     let mut by_sid: BTreeMap<String, ActiveSession> = BTreeMap::new();
     let mut registered_pids: BTreeSet<i32> = BTreeSet::new();
 
-    // 1) PID 文件（扫描基目录及所有 *.sessions 子目录）
+    // 1) PID files (scan the base directory and all *.sessions subdirectories)
     for (sid, pid, alive) in session_pid::scan_all_session_pids(sessions_root)? {
         if alive {
             registered_pids.insert(pid);
@@ -77,9 +81,10 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
         }
     }
 
-    // 2) lsof 兜底（仅对未登记的 a 进程查询其打开的 .sqlite，避免 lsof +D 递归扫描）
+    // 2) lsof fallback (query only unregistered a processes for open .sqlite
+    //    files, avoiding a recursive lsof +D scan)
     let a_pids = session_pid::list_a_pids();
-    let total_a = a_pids.len().saturating_sub(1); // 减去自身
+    let total_a = a_pids.len().saturating_sub(1); // minus ourselves
     let unregistered: Vec<i32> = a_pids
         .into_iter()
         .filter(|&p| p != current_pid && !registered_pids.contains(&p))
@@ -92,7 +97,7 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
         });
     }
 
-    // 排除当前进程自身--`a /proc` 是一次性查询，不是真正的活跃 session。
+    // Exclude our own process: `a /proc` is a one-shot query, not a real active session.
     let sessions: Vec<&ActiveSession> = by_sid.values().filter(|s| s.pid != current_pid).collect();
     let identified = sessions.len();
 
@@ -109,13 +114,15 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
     println!("Active sessions ({identified}):");
     println!();
 
-    // 批量查询所有活跃 session 的 tty：单次 `ps` 取代逐进程 fork/exec。
+    // Query the tty of all active sessions in one batch: a single `ps` call
+    // instead of per-process fork/exec.
     let active_pids: Vec<i32> = sessions.iter().map(|s| s.pid).collect();
     let tty_map = session_pid::tty_map_for_pids(&active_pids);
 
-    // 仅读取活跃 session 的预览（summary + modified）。不要用 list_sessions()：
-    // 它会打开全部已保存 session 的 .sqlite，并递归统计每个 session 的
-    // assets/checkpoints 目录大小，而 /proc 只需要少数活跃 session 的文本预览。
+    // Read previews (summary + modified) for active sessions only. Do not use
+    // list_sessions(): it opens the .sqlite of every saved session and
+    // recursively counts each session's assets/checkpoints directory sizes,
+    // while /proc only needs a text preview of a few active sessions.
     let previews: BTreeMap<String, (Option<String>, Option<String>)> = sessions
         .iter()
         .map(|s| {
@@ -152,7 +159,7 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
         println!();
     }
 
-    // 提示未识别的进程
+    // Hint about unidentified processes
     if total_a > identified {
         let diff = total_a - identified;
         println!("Note: {diff} additional `a` process(es) running but session not identified");

@@ -36,104 +36,129 @@ use super::{
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
 };
 
-/// 工具调用循环检测窗口：
-/// - soft: 连续 4 轮调用 (tool_name, normalized_args) 完全一致，先注入反思提示
-/// - hard: 收到 soft 提示后仍连续 6 轮完全一致，直接强制收敛，不再继续工具循环
+/// Tool-call loop detection windows:
+/// - soft: 4 consecutive rounds with an identical (tool_name, normalized_args) pair trigger a
+///   reflection prompt
+/// - hard: 6 consecutive identical rounds after the soft prompt force convergence and stop the
+///   tool loop
 const TOOL_LOOP_SOFT_WINDOW: usize = 4;
 const TOOL_LOOP_HARD_WINDOW: usize = 6;
-/// 近似低收益重复窗口：连续 N 轮对「同一目标资源」调用同一工具（忽略
-/// offset/limit 等翻页参数）即命中。用于抓字节精确检测漏掉的「同文件反复
-/// 翻页 / 仅微调分页参数的重复检索」这类真实膨胀。先注入一次温和提示；
-/// 若继续长时间刷同一 coarse 目标（尤其 `execute_command` 的目录探测类命令），
-/// 则升级为 hard-stop，避免白跑上百轮。
+/// Approximate low-yield repetition window: N consecutive rounds that call the same tool on the
+/// same target resource (ignoring paging args such as offset/limit) count as a hit. This catches
+/// real bloat that byte-exact detection misses, such as repeatedly paging through the same file or
+/// re-running lookups that only tweak paging parameters. A single gentle prompt is injected first;
+/// if the model keeps hammering the same coarse target for a long time (especially directory-probing
+/// `execute_command` calls), it escalates to a hard stop to avoid burning hundreds of rounds.
 const TOOL_LOOP_COARSE_WINDOW: usize = 5;
 const TOOL_LOOP_COARSE_HARD_WINDOW: usize = 8;
 const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_COARSE_HARD_WINDOW + 2;
-/// 同目标「从头重读」重扫检测阈值。翻页+换页宽+混轮循环（同一文件反复从文件头
-/// 开始读，offset/limit/页宽每轮都变，整轮签名永不相等）绕过了 exact/coarse/
-/// target 三道整轮检测；这里按目标累计「从文件头开始读」的次数——第 3 次注入
-/// 软提示，第 4 次硬停止。write_file/apply_patch 修改该目标会清零（编辑后从头
-/// 重读验证是合法行为）。计数不随 soft 清空、不被 made_progress 重置。
-// P1-2：同一文件连续 2 次「从头重读」即发软提示，尽早引导模型停止翻页式重读。
+/// Re-scan thresholds for repeated "read from the top" on the same target. Pagination loops that
+/// change offset/limit/page width every round (always starting from the top of the same file) make
+/// the whole-round signature never match, evading the exact/coarse/target full-round checks; here we
+/// accumulate "reads started from the top" per target — the 3rd triggers a soft prompt and the 4th a
+/// hard stop. write_file/apply_patch on the target clears the count (re-reading from the top after
+/// an edit is legitimate). The count is neither cleared by soft prompts nor reset by made_progress.
+// P1-2: two consecutive "read from the top" calls on the same file fire the soft prompt early,
+// steering the model away from paging-style re-reads as soon as possible.
 const TARGET_RESCAN_SOFT_THRESHOLD: u32 = 2;
 const TARGET_RESCAN_HARD_THRESHOLD: u32 = 4;
-/// 从头重读计数窗口（轮）：目标距上次从头读取超过该轮数时，计数视为过期并从 1
-/// 重新累计。真正的翻页循环每轮/隔轮都从头读同一文件 → 计数不会过期、4 轮内必然
-/// 触发；上下文压缩后跨多轮的合法重读 → 计数过期，不会累积到硬阈值。
+/// Read-from-top count window (in rounds): when a target has not been read from the top for more
+/// than this many rounds, its count expires and restarts from 1. A real paging loop re-reads the
+/// same file from the top every round or every other round, so the count never expires and
+/// necessarily triggers within 4 rounds; a legitimate re-read spread across many rounds after
+/// context compression expires the count and never accumulates to the hard threshold.
 const TARGET_RESCAN_WINDOW_ROUNDS: usize = 8;
 const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
 
-/// 计算 coarse 签名时需剥离的「易变翻页/窗口」参数键。剥离后同一文件的不同
-/// 分页、同一检索的不同结果上限会折叠成同一 coarse 签名。
+/// Argument keys treated as "volatile paging/window" and stripped when computing coarse signatures.
+/// After stripping, different paginations of the same file or different result caps of the same
+/// lookup collapse into the same coarse signature.
 const VOLATILE_ARG_KEYS: &[&str] = &["offset", "limit", "page", "cursor", "max_results"];
 
-/// 工具轮次检查点的首个固定阈值。默认 turn 硬预算是 4096；24 / 48 / 96
-/// 三档检查点只调度收敛、不禁用工具，累计轮次也不会因 mutation 清零。
+/// First fixed threshold for tool-round checkpoints. The default turn hard budget is 4096; the
+/// 24 / 48 / 96 checkpoint tiers only schedule convergence, never disable tools, and the
+/// accumulated round count is not reset by mutation.
 const TOOL_ROUND_CHECKPOINT: usize = 24;
 const TOOL_ROUND_CHECKPOINT_MULTIPLIERS: [usize; 3] = [1, 2, 4];
 
-/// 连续「流读取中断型」截断（stream_error）的重试上限。超过即放弃本 turn，
-/// 避免服务端持续断流时无限重试（尤其后台任务的 max_iterations = usize::MAX）。
+/// Retry cap for consecutive "stream-read interrupted" truncations (stream_error). Past this we
+/// give up on the turn to avoid retrying forever while the server keeps dropping the stream
+/// (especially for background tasks whose max_iterations = usize::MAX).
 const MAX_STREAM_ERROR_RETRIES: usize = 16;
-/// 连续「模型输出过长 / 工具调用 JSON 半截」截断的重试上限。
-/// stream_error 使用独立上限，不参与该计数。
+/// Retry cap for consecutive "model output too long / truncated tool-call JSON" truncations.
+/// stream_error uses its own separate cap and does not count toward this one.
 const MAX_MODEL_TRUNCATION_RETRIES: usize = 3;
-/// reasoning 占 completion tokens 的比例阈值：达到即判定为「推理吃光预算」型
-/// 截断，此时降 reasoning_effort 能直接缩短思考链、把预算让给正文；低于该阈值
-/// 说明截断主因是正文过长，降档无收益（模型没在推理），只注入收缩提示即可。
+/// Ratio threshold of reasoning to completion tokens: at or above it, the truncation is classified
+/// as "reasoning ate the budget", where lowering reasoning_effort directly shortens the chain of
+/// thought and frees budget for visible text; below it, the truncation is mostly caused by overly
+/// long visible text, so downgrading yields nothing (the model is not reasoning) and only a shrink
+/// prompt should be injected.
 const REASONING_BUDGET_DOMINANCE_RATIO: f64 = 0.5;
 
-/// === 长循环感知的中段压缩 ===
-/// 中段压缩的软阈值按模型 token 窗口换算（flagship 256K → ~135K 字符）。对
-/// 「历史体积中等、但工具迭代轮次很多」的长循环 turn，历史峰值可能长期低于该
-/// 阈值 → 压缩全程不触发 → 每轮把「截至当前的完整历史 + 全部 tool schema」重发
-/// 一遍，累计发送量随迭代轮次 O(n²) 膨胀，几分钟内撞破 TPM 限流（真实案例：
-/// 一个 provider 重构会话单 turn 56 轮迭代，历史峰值仅 ~120K < 135K 阈值，
-/// turn 内累计发送 ~2.8M token 撞破 380K TPM 约 7 倍）。
+/// === Long-loop-aware mid-turn compression ===
+/// The mid-turn compression soft threshold is derived from the model's token window (flagship
+/// 256K → ~135K chars). For a long-loop turn with "moderate history size but many tool iterations",
+/// the history peak can stay below that threshold the whole time, so compression never fires and
+/// every round re-sends the full history-so-far plus every tool schema. Total bytes sent then grow
+/// O(n²) with iteration count and blow through the TPM limit within minutes (real case: a provider
+/// refactor session with 56 iterations in one turn, history peak ~120K < 135K threshold, sent
+/// ~2.8M tokens in-turn, exceeding the 380K TPM limit ~7x).
 ///
-/// 治理：一旦单 turn 工具迭代轮次达到该阈值，即认定进入「长循环」，把中段压缩的
-/// 有效软阈值下调到 [`MID_TURN_COMPRESS_SOFT_FLOOR`]（36K），让内容级去重
-/// （byte-identical 重读折叠）与旧结果裁剪尽早介入，遏制 O(n²) 累积。短 turn
-/// （迭代轮次未达阈值）保持原窗口比例阈值，不影响正常单轮大任务的探索空间。
+/// Mitigation: once a single turn's tool iteration count reaches this threshold we treat the turn as
+/// a long loop and lower the effective mid-turn soft threshold to [`MID_TURN_COMPRESS_SOFT_FLOOR`]
+/// (36K), so content-level dedup (folding byte-identical re-reads) and pruning of stale results kick
+/// in early to curb the O(n²) accumulation. Short turns (below the threshold) keep the
+/// window-derived ratio threshold, leaving normal single-turn large tasks their full exploration
+/// space.
 const LONG_LOOP_COMPRESS_ITERATION_THRESHOLD: usize = 12;
 
-/// === Progress Budget（信息增益进展预算）===
-/// 这是叠加在 exact / coarse 循环检测之上的第三层，用于治理「参数每轮都变、
-/// 但整体不推进任务」的发散型 loop——前两层按「签名重复」判定，结构上抓不到
-/// 每轮都在搜新符号 / 读新文件却始终零收敛的膨胀（真实案例：一个「删除方法」
-/// 的变更请求连续 60+ 轮只读取/检索、零 apply_patch）。
+/// === Progress Budget (information-gain progress budget) ===
+/// This is a third layer on top of the exact/coarse loop detectors, governing divergent loops whose
+/// parameters change every round but never advance the task — the first two layers judge by
+/// "signature repetition" and structurally cannot catch bloat that searches new symbols / reads new
+/// files every round while converging to nothing (real case: a "delete method" change request that
+/// spent 60+ consecutive rounds only reading/retrieving with zero apply_patch).
 ///
-/// 核心理念：不按「动作次数」计费，按「信息增益」这一**行为信号**计费——本轮
-/// 触碰到新目标资源（成功读取 / 检索到新目标），或调用了变更类工具，即算推进；
-/// 失败调用（无目标）与反复取证同一目标都不算。不再从用户问题文本去猜任务意图。
-/// 早期探索几乎免费；越往后，「继续但没进展」越要付出显式理由。惩罚对象是
-/// 「说不出理由的无进展重复」，而非探索本身。
+/// Core idea: charge by "information gain" — a behavioral signal — not by "number of actions".
+/// Touching a new target resource this round (successfully reading / retrieving a new target) or
+/// calling a mutation-class tool counts as progress; failed calls (no target) and repeatedly
+/// re-examining the same target do not. We no longer guess task intent from the user's question
+/// text. Early exploration is nearly free; the further along, the more "continuing without
+/// progress" must be justified explicitly. The thing being penalized is "unexplained,
+/// progress-free repetition", not exploration itself.
 ///
-/// 免费探索轮数：达到该轮次前，即使连续无进展也完全不打扰（删代码前先定位、
-/// 陌生代码库先摸索都是正常的）。
+/// Free-exploration rounds: before this many rounds, even continuous no-progress never prompts
+/// (locating code before deleting it, or exploring an unfamiliar codebase first, is normal).
 const PROGRESS_FREE_EXPLORE_ROUNDS: usize = 20;
-/// 已触碰大量不同目标仍未收口，说明可能从「补关键证据」滑向「不断扩分支」。
-/// 此阈值只注入一次非阻断式广度检查，不把新目标判成无进展，避免压缩大型排查
-/// 任务的正当探索空间。
+/// Touching many distinct targets without converging suggests the task may be sliding from
+/// "gathering key evidence" into "endlessly expanding branches". This threshold injects a single
+/// non-blocking breadth check only; it never counts new targets as no-progress, so legitimate
+/// exploration space in large investigations is preserved.
 const READ_ONLY_BREADTH_CHECK_TARGETS: usize = 32;
-/// 纯只读发散硬停阈值：本 turn 从未发生任何 mutation，却已累计触碰这么多个
-/// **不同**的只读目标仍未收口。`seen_targets` 是单调集合、全程不被任何 reset
-/// 清空，因此「累计不同只读目标数」与内容新颖度完全解耦——不会被「每轮换新目标 /
-/// 读到新字节复位常规无进展计数」绕过（这正是常规 soft→hard 阶梯对纯只读发散
-/// 失效的根因）。仅在零 mutation（纯调查）时作为最后一道刹车强制收口；任何
-/// 「读+改」任务都不受影响。取 `READ_ONLY_BREADTH_CHECK_TARGETS` 的 3 倍，给大型
-/// 只读排查留足空间，又远早于迭代硬上限。
+/// Pure read-only divergence hard-stop threshold: this many **distinct** read-only targets have been
+/// touched without converging while the turn never performed any mutation. `seen_targets` is a
+/// monotonic set that no reset ever clears, so the "distinct read-only targets accumulated" count is
+/// fully decoupled from content novelty — it cannot be bypassed by "new target every round / new
+/// bytes resetting the ordinary no-progress counter" (exactly why the ordinary soft→hard ladder
+/// fails on pure read-only divergence). It is the last brake forcing convergence only when there is
+/// zero mutation (pure investigation); any read+modify task is unaffected. Set at 3x
+/// `READ_ONLY_BREADTH_CHECK_TARGETS` to leave large read-only investigations room while still firing
+/// well before the iteration hard cap.
 const READ_ONLY_BREADTH_HARD_STOP_TARGETS: usize = 96;
-/// 宽限窗口：软提示后，若模型给出了「实质不同的理由」（新目标 / reasoning 指纹
-/// 变化），则在该窗口内不升级，给它继续探索的空间。
+/// Grace window: after a soft prompt, if the model offers a materially different justification (new
+/// target / changed reasoning fingerprint), escalation is paused within this window, giving it room
+/// to keep exploring.
 const PROGRESS_GRACE_WINDOW: usize = 6;
-/// 一次低进展 episode 被真实进展打断后，至少间隔这么多轮才允许再次注入 soft。
-/// 避免复杂任务在「探索 → 小进展 → 再探索」的正常节奏中反复收到同一收敛提示。
+/// After a low-progress episode is interrupted by real progress, at least this many rounds must pass
+/// before a soft prompt may be injected again, so complex tasks do not keep receiving the same
+/// convergence prompt in the normal "explore → small progress → explore again" rhythm.
 const PROGRESS_EPISODE_COOLDOWN: usize = 16;
-/// 从「软提示 / 记账」升级到「硬停收口」额外需要的连续无进展轮数。
+/// Extra consecutive no-progress rounds required to escalate from "soft prompt / ledger" to
+/// "hard-stop convergence".
 const PROGRESS_NO_PROGRESS_HARD_MARGIN: usize = 16;
-/// scoped instruction preflight 使用独立预算，不消耗正常工具迭代；上限防止模型
-/// 通过不断切换新目录无限延长单 turn。
+/// Scoped-instruction preflight uses a separate budget and does not consume normal tool iterations;
+/// this cap stops the model from indefinitely extending a single turn by switching directories
+/// repeatedly.
 const MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS: usize = 8;
 
 #[derive(Default)]
@@ -152,9 +177,10 @@ impl ScopedPreflightTargets {
 }
 
 
-// 子模块与 orchestrator.rs 同级存放。注意：crate 内另有同名模块 driver::thinking::orchestrator，
-// 同名时 rustc 会把本模块的子模块按“目录式”路径解析（会在 orchestrator/ 目录下查找），
-// 因此这里必须用 #[path] 显式固定到同级文件，否则报 E0583。
+// These submodules are stored as siblings of orchestrator.rs. Note the crate also has a module with
+// the same name, driver::thinking::orchestrator; on a name collision rustc resolves this module's
+// submodules by "directory-style" paths (looking under an orchestrator/ directory), so #[path] must
+// pin them to the sibling files explicitly, otherwise E0583 is raised.
 
 #[path = "checkpoint.rs"]
 pub(crate) mod checkpoint;
@@ -188,14 +214,14 @@ struct TurnSupervisor {
     task_anchor_injected: bool,
     last_compress_iteration: usize,
     last_compress_after_chars: usize,
-    /// 等待与下次 pre-request LLM 压缩结果合并输出的 mid-turn 状态。
+/// Mid-turn state waiting to be emitted together with the next pre-request LLM compression result.
     pending_compression_report: CompressionReport,
     tool_signature_history: Vec<Vec<String>>,
     tool_signature_history_coarse: Vec<Vec<String>>,
-    /// 每轮触碰的「coarse 目标资源」集合历史（同 read_file 文件 /
-    /// 同 execute_command coarse 命令，忽略翻页参数）。用于抓「整轮签名不
-    /// 相等、但同一目标被混在不同工具批次里反复取证」的循环——纯整轮签名比较对
-    /// 这类混合批次无能为力（每轮多一个陪衬工具即逃逸）。
+/// History of per-round "coarse target resource" sets (same read_file file / same coarse
+/// execute_command, ignoring paging args). Catches loops where whole-round signatures never match
+/// but the same target is repeatedly probed inside different tool batches — plain whole-round
+/// signature comparison cannot handle such mixed batches (adding one decoy tool per round evades it).
     tool_target_history: Vec<Vec<String>>,
     target_repeat_note_injected: bool,
     progress: ProgressLedger,
@@ -204,86 +230,104 @@ struct TurnSupervisor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolLoopSignal {
     None,
-    /// 近似低收益重复：同一工具反复命中同一目标资源（忽略翻页参数）。温和提示一次。
+/// Approximate low-yield repetition: the same tool keeps hitting the same target resource (ignoring
+/// paging args). Prompt gently once.
     Coarse,
-    /// 混合工具轮里同一目标资源被反复取证：整轮签名各不相等（每轮穿插不同陪衬
-    /// 工具）逃过了 exact/coarse 整轮比较，但某个 read_file 文件
-    /// 在窗口每一轮都出现。温和提示一次。
+/// The same target resource is probed repeatedly across mixed tool rounds: whole-round signatures
+/// all differ (each round weaves in different decoy tools), evading the exact/coarse whole-round
+/// comparison, but a particular read_file target appears in every round of the window. Prompt gently
+/// once.
     TargetRepeat,
-    /// 同一目标被反复「从头重读」（翻页页宽不断变化、混入每轮新归档路径的循环）。
-    /// 温和提示一次。
+/// The same target is repeatedly re-read from the top (a loop that keeps varying the paging width
+/// and mixing in new archive paths each round). Prompt gently once.
     TargetRescan(String, u32),
-    /// 同一目标从头重读超过硬阈值：切换无工具收口模式强制作答。
+/// The same target has been re-read from the top past the hard threshold: switch to no-tool handoff
+/// and force an answer.
     TargetRescanHard(String, u32),
-    /// `execute_command` 在同一 coarse 目标上长时间空转，直接强制收敛。
+/// `execute_command` spins idly on the same coarse target for too long; force convergence directly.
     CoarseHard,
     Soft,
     Hard,
-    /// Progress Budget 第一级：连续多轮无信息增益（既无新目标也无实质动作），
-    /// 注入反思式软提示，不阻断工具。
+/// Progress Budget level one: several consecutive rounds with no information gain (no new target and
+/// no substantive action) inject a reflective soft prompt without blocking tools.
     LowProgressSoft,
-    /// Progress Budget 第二级：软提示后仍无进展，要求写下轻量决策账本
-    /// （已确认事实 / 待解决问题 / 候选与已排除分支），仍不硬阻断。
+/// Progress Budget level two: still no progress after the soft prompt, ask for a lightweight
+/// decision ledger (confirmed facts / open questions / candidate and ruled-out branches), still not
+/// a hard block.
     LowProgressLedger,
-    /// Progress Budget 第三级：软提示 + 记账后仍连续无进展，切换无工具收口模式。
+/// Progress Budget level three: still no consecutive progress after the soft prompt and ledger,
+/// switch to no-tool handoff mode.
     LowProgressHard,
-    /// 已覆盖大量不同目标，提醒先汇总当前证据和唯一关键缺口。
+/// Many distinct targets have been covered; remind the model to first summarize current evidence
+/// and the single critical gap.
     ReadOnlyBreadth,
-    /// 纯只读发散最后一道刹车：本 turn 零 mutation，却已累计触碰远超广度阈值的
-    /// 不同只读目标仍未收口。与内容新颖度解耦，切换无工具收口模式强制作答。
+/// Last brake for pure read-only divergence: zero mutation in this turn, yet far more distinct
+/// read-only targets than the breadth threshold have been touched without converging. Decoupled
+/// from content novelty; switch to no-tool handoff and force an answer.
     ReadOnlyBreadthHard,
 }
 
-/// Progress Budget 的运行时状态。挂在 `TurnSupervisor` 上，按「信息增益」而非
-/// 动作次数计费；只惩罚「说不出理由的无进展重复」。进展是**行为信号**：本轮
-/// 触碰到新目标资源，或调用了变更类工具（`round_has_mutation`），即算推进；不再
-/// 从用户问题文本去猜任务意图。
+/// Runtime state for the Progress Budget, held on `TurnSupervisor`. Charged by "information gain"
+/// rather than number of actions; only "unexplained, progress-free repetition" is penalized.
+/// Progress is a behavioral signal: touching a new target resource this round or calling a
+/// mutation-class tool (`round_has_mutation`) counts as advancing; task intent is no longer guessed
+/// from the user's question text.
 #[derive(Default)]
 struct ProgressLedger {
-    /// 累计触碰过的目标资源（「新目标 = 信息增益」判定）。
+/// Accumulated target resources touched ("new target = information gain" judgment).
     seen_targets: FxHashSet<String>,
-    /// 累计见过的成功只读工具结果。新内容即使来自同一目标，也属于新证据。
+/// Accumulated successful read-only tool results seen. New content counts as new evidence even
+/// when it comes from the same target.
     seen_evidence_fingerprints: FxHashSet<u64>,
-    /// 连续无进展轮数。任意一轮判定为 Progress 即清零。
+/// Consecutive no-progress rounds. Cleared whenever any round is judged as progress.
     consecutive_no_progress: usize,
-    /// 上一轮 reasoning 指纹（软提示后指纹变化 → 视为给出新理由 → grace 宽限）。
+/// Previous round's reasoning fingerprint (a fingerprint change after a soft prompt is treated as a
+/// new justification and granted grace).
     last_reasoning_fp: Option<u64>,
-    /// grace 宽限截止迭代号：在此之前不升级，给模型继续探索的空间。
+/// Iteration until which grace lasts: no escalation before this point, giving the model room to
+/// keep exploring.
     grace_until_iteration: usize,
-    /// reasoning 变化每个 turn 最多换取一次 grace，避免靠逐轮改写理由无限续期。
+/// A reasoning change buys at most one grace per turn, preventing endless renewal by rewriting the
+/// justification every round.
     grace_consumed: bool,
     soft_injected: bool,
     ledger_injected: bool,
     hard_injected: bool,
     read_only_breadth_injected: bool,
-    /// 本 turn 是否发生过项目 mutation。一旦为真，纯只读发散硬停永久让路
-    /// （「读+改」任务不受该刹车约束）。plan / task 生命周期只算进展，不置位。
-    /// 单调置位，不被 reset 清除。
+/// Whether any project mutation happened this turn. Once true, the pure read-only divergence hard
+/// stop permanently yields (read+modify tasks are not bound by that brake). plan / task lifecycle
+/// counts only as progress and does not set this. Set monotonically, never cleared by reset.
     observed_project_mutation_this_turn: bool,
-    /// 纯只读发散硬停的一次性门（`ReadOnlyBreadthHard` 只触发一次）。
+/// One-shot gate for the pure read-only divergence hard stop (`ReadOnlyBreadthHard` fires once).
     read_only_breadth_hard_injected: bool,
-    /// 新的 low-progress episode 最早允许注入 soft 的迭代号。实质进展会重置当前
-    /// episode，但保留该 cooldown，防止复杂任务被同一提示反复打断。
+/// Earliest iteration at which a new low-progress episode may inject soft again. Substantive
+/// progress resets the current episode but keeps this cooldown, preventing complex tasks from being
+/// interrupted by the same prompt repeatedly.
     next_episode_iteration: usize,
-    /// 每个目标「从文件头开始读」的重扫计数（重扫检测）。元组第一位是窗口内
-    /// 从头读的次数，第二位是上次从头读的 iteration（超过 TARGET_RESCAN_WINDOW_ROUNDS
-    /// 轮未从头读则清零重计）。与签名历史解耦：soft 清空历史、每轮新目标重置无进展
-    /// 计数，都影响不到它；本轮有任何 write_file/apply_patch 实质改动时整表清零
-    /// （编辑后从头重读是合法行为，不能误判为翻页循环）。
+/// Per-target "read from the top" re-scan counts (re-scan detection). Tuple field one is the number
+/// of reads-from-top within the window; field two is the iteration of the last read-from-top (if a
+/// target has not been read from the top for more than TARGET_RESCAN_WINDOW_ROUNDS rounds the count
+/// expires and restarts). Decoupled from signature history: neither soft clearing the history nor a
+/// new target resetting the no-progress counter affects it; any write_file/apply_patch substantive
+/// change this round clears the whole table (re-reading from the top after an edit is legitimate
+/// and must not be misjudged as a paging loop).
     from_top_reads: FxHashMap<String, (u32, usize)>,
-    /// 已注入过 TargetRescan 软提示的目标（每目标本轮一次）。
+/// Targets that already received a TargetRescan soft prompt (once per target per round).
     rescan_note_injected: FxHashSet<String>,
 }
 
 impl ProgressLedger {
-    /// 重置升级阶梯：清空无进展计数与 soft/ledger/hard/grace 等一次性状态，
-    /// 让计费从零重新开始。两类场景共用：
-    /// 1. 截断重试（mark_truncation_skip）：截断清空历史后，重复读取是预期行为，
-    ///    与 exact/coarse 检测的 mark_truncation_skip 语义保持一致，避免截断恢复后的
-    ///    新循环跳过 soft 提示直接到 hard-stop。
-    /// 2. 实质进展（assess_progress 的 made_progress 分支）：软提示后模型给出真正推进
-    ///    任务的动作，应视为「这一轮提醒生效了」，给予完整的新预算而非继续累加，否则
-    ///    模型在长任务中只要早期发散过一次，后续每次收敛提醒都会更快滑向硬停。
+/// Reset the escalation ladder: clear the no-progress counter and the one-shot soft/ledger/hard/grace
+/// state so billing restarts from zero. Shared by two scenarios:
+/// 1. Truncation retry (mark_truncation_skip): after a truncation clears history, re-reading is
+///    expected behavior; keep the same semantics as mark_truncation_skip in the exact/coarse
+///    detectors so a new loop after truncation recovery cannot skip the soft prompt straight to
+///    hard-stop.
+/// 2. Substantive progress (the made_progress branch of assess_progress): when the model responds
+///    to a soft prompt with an action that genuinely advances the task, treat it as "this round's
+///    nudge worked" and grant a full fresh budget instead of continuing to accumulate — otherwise,
+///    in long tasks, one early divergence makes every later convergence nudge slide toward
+///    hard-stop faster.
     fn reset_escalation(&mut self) {
         self.consecutive_no_progress = 0;
         self.soft_injected = false;
@@ -293,14 +337,16 @@ impl ProgressLedger {
         self.grace_consumed = false;
     }
 
-    /// 截断是外部约束，不应继承上一 episode 的提示冷却。
+/// Truncation is an external constraint; it must not inherit the previous episode's prompt cooldown.
     fn reset_after_truncation(&mut self) {
         self.reset_escalation();
         self.next_episode_iteration = 0;
-        // 截断恢复后从头重读属于合法的上下文重建：re-scan 计数与提示标记必须随历史一并清空，
-        // 否则恢复后的首次从头重读会继承旧计数直接触发 hard-stop。
-        // 注意不能并入 reset_escalation：实质进展路径不得清空该计数（混轮新目标会不断重置
-        // 无进展计数，re-scan 计数正是针对该逃逸的独立防线）。
+// Re-reading from the top after truncation recovery is legitimate context rebuilding: the re-scan
+// counts and prompt marks must be cleared together with the history, otherwise the first read-from-top
+// after recovery inherits stale counts and jumps straight to hard-stop.
+// Note this must not be merged into reset_escalation: the substantive-progress path must not clear
+// these counts (new targets in mixed rounds keep resetting the no-progress counter; the re-scan
+// counts are exactly the independent defense against that escape).
         self.from_top_reads.clear();
         self.rescan_note_injected.clear();
     }
@@ -334,14 +380,15 @@ impl TurnSupervisor {
             && (self.last_compress_after_chars == 0 || delta_significant)
     }
 
-    /// 本轮实际生效的中段压缩软阈值。
-    ///
-    /// 长循环（工具迭代轮次 >= [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]）时把
-    /// 阈值下调到 [`MID_TURN_COMPRESS_SOFT_FLOOR`]，让内容级去重与旧结果裁剪尽早
-    /// 介入，遏制 O(n²) 累积重发；短 turn 保持按窗口换算的基准阈值，不影响正常
-    /// 单轮大任务。门控与实际 [`mid_turn_compress`](crate::ai::history::mid_turn_compress)
-    /// 调用必须共用本方法返回值——后者内部有 `before <= soft_threshold` 的 no-op
-    /// 早退，若两处阈值不一致会「门开了却压不动」。
+/// The mid-turn compression soft threshold actually in effect this round.
+///
+/// For long loops (tool iterations >= [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]) the threshold drops
+/// to [`MID_TURN_COMPRESS_SOFT_FLOOR`] so content-level dedup and pruning of stale results engage
+/// early, curbing the O(n²) re-send accumulation; short turns keep the window-derived baseline
+/// threshold, leaving normal single-turn large tasks unaffected. This gating and the actual
+/// [`mid_turn_compress`](crate::ai::history::mid_turn_compress) call must share this method's return
+/// value — the latter has a no-op early exit for `before <= soft_threshold`, and if the two
+/// thresholds disagree, the gate can open while compression does nothing.
     fn effective_mid_turn_soft_threshold(&self, base_soft: usize) -> usize {
         if self.iteration >= LONG_LOOP_COMPRESS_ITERATION_THRESHOLD {
             base_soft.min(MID_TURN_COMPRESS_SOFT_FLOOR)
@@ -355,9 +402,10 @@ impl TurnSupervisor {
         self.last_compress_after_chars = after_chars;
     }
 
-    /// 任务出现实质进展后，丢弃此前无效循环的样本并恢复 soft → hard 升级阶梯。
-    /// 否则模型已经响应 soft 提示而改做有效动作时，后续一次新的重复会跳过 soft，
-    /// 直接沿用旧标志进入 hard-stop。
+/// After substantive task progress, drop the samples of the earlier ineffective loop and restore the
+/// soft → hard escalation ladder. Otherwise, when the model has already responded to the soft prompt
+/// by switching to effective actions, a later single repetition would skip soft and reuse the stale
+/// flags straight into hard-stop.
     fn reset_tool_loop_escalation(&mut self) {
         self.tool_signature_history.clear();
         self.tool_signature_history_coarse.clear();
@@ -368,13 +416,15 @@ impl TurnSupervisor {
         self.target_repeat_note_injected = false;
     }
 
-    /// 截断重试时重置工具循环检测状态：截断是外部约束（输出上限 / 模型可用性波动），
-    /// 重试时重复调用相同工具属于预期行为，不应计入循环检测窗口。
-    /// 截断本身已有独立的 `consecutive_truncations` 上限兜底，不需要循环检测再叠加。
-    ///
-    /// 清空历史 + 跳过当前迭代的签名记录，使截断重试不被误判为循环。
-    /// 重置所有一次性标志：截断清空历史后，soft/coarse/hard 的完整升级阶梯
-    /// 应从零重新开始，否则截断恢复后形成的新循环会跳过 soft 提示直接到 hard-stop。
+/// Reset tool-loop detection state on truncation retry: truncation is an external constraint
+/// (output cap / model availability fluctuation), so re-invoking the same tools on retry is expected
+/// behavior and must not count toward the loop-detection window. Truncation already has its own
+/// independent `consecutive_truncations` cap; loop detection need not add another layer.
+///
+/// Clearing history plus skipping the current iteration's signature recording keeps truncation
+/// retries from being misjudged as a loop. All one-shot flags are reset: once truncation clears the
+/// history, the full soft/coarse/hard escalation ladder should restart from zero, otherwise a new
+/// loop formed after truncation recovery would skip the soft prompt straight to hard-stop.
     fn mark_truncation_skip(&mut self) {
         self.reset_tool_loop_escalation();
         self.skip_tool_signature_rounds += 1;
@@ -400,9 +450,9 @@ impl TurnSupervisor {
         } else {
             progress_messages
         };
-        // 截断重试跳过：清空历史后不记录本轮签名，避免截断重试
-        // 被误判为工具循环。`skip_tool_signature_rounds` 由
-        // `mark_truncation_skip()` 递增，每跳过一次递减。
+// Truncation-retry skip: after history is cleared, do not record this round's signature so
+// truncation retries are not misjudged as a tool loop. `skip_tool_signature_rounds` is incremented
+// by `mark_truncation_skip()` and decremented once per skipped round.
         if self.skip_tool_signature_rounds > 0 {
             self.skip_tool_signature_rounds -= 1;
             return ToolLoopSignal::None;
@@ -422,8 +472,9 @@ impl TurnSupervisor {
                 self.tool_signature_history_coarse.drain(0..drop);
             }
         }
-        // 目标级历史：与 coarse 签名平行维护，供混合工具轮的目标交集检测使用。
-        // 与 exact/coarse 一样受 TOOL_SIGNATURE_HISTORY_LIMIT 约束。
+// Target-level history: maintained in parallel with coarse signatures, used by the
+// target-intersection detection for mixed tool rounds. Bound by TOOL_SIGNATURE_HISTORY_LIMIT like
+// exact/coarse.
         self.tool_target_history
             .push(extract_round_probe_targets(signature_messages));
         if self.tool_target_history.len() > TOOL_SIGNATURE_HISTORY_LIMIT {
@@ -440,16 +491,20 @@ impl TurnSupervisor {
             && detect_tool_loop(&self.tool_signature_history, TOOL_LOOP_SOFT_WINDOW)
         {
             self.loop_breaker_injected = true;
-            // Soft 提示已明确要求停止重复调用。清空此前用于触发 soft 的样本，
-            // 让模型有完整的 hard window 来响应提示，而不是只再重复两轮就被强制
-            // 收口（旧逻辑中 soft=4、hard=6，实际恢复窗口只有两轮）。
+            // The soft prompt has explicitly asked to stop repeated calls. Clear the samples that
+            // triggered it, giving the model a full hard window to respond instead of being forced
+            // to converge after only two more rounds (in the old logic soft=4 and hard=6, leaving a
+            // real response window of just two rounds).
             self.tool_signature_history.clear();
-            // 设计洞补位：soft 只清了 exact 样本，但 coarse/target 历史未清，且它们
-            // 的一次性门（coarse_loop_note_injected / target_repeat_note_injected）
-            // 被下方 `!loop_breaker_injected` 永久挡死——模型 soft 后换一批参数继续
-            // 翻同一目标时，coarse/target 再也无法触发，直到迭代上限才被收口。这里把
-            // 两个门重新武装并清空对应历史，让「soft 后换姿势」的翻页 / 混合轮循环仍
-            // 能被后续 coarse/target 捕获（提示仍是一次性、soft 优先级，不额外加压）。
+            // Design-hole fix: soft only cleared the exact samples; coarse/target history was left
+            // intact, and their one-shot gates (coarse_loop_note_injected /
+            // target_repeat_note_injected) were permanently blocked by the `!loop_breaker_injected`
+            // check below — after soft, if the model keeps paging the same target with a different
+            // parameter set, coarse/target could never fire again until the iteration cap converged
+            // it. Here we re-arm both gates and clear the corresponding history so paging /
+            // mixed-round loops that "change posture after soft" can still be caught by later
+            // coarse/target detection (the prompt stays one-shot and soft-priority, adding no extra
+            // pressure).
             self.coarse_loop_note_injected = false;
             self.target_repeat_note_injected = false;
             self.tool_signature_history_coarse.clear();
@@ -465,17 +520,20 @@ impl TurnSupervisor {
             self.hard_loop_stop_injected = true;
             return ToolLoopSignal::CoarseHard;
         }
-        // 字节精确的 soft/hard 均未命中时，再看粗粒度：同一目标资源反复翻页/微调
-        // 检索参数的膨胀会在这里被抓到。仅提示一次，且让位于精确检测。
+        // When neither the byte-exact soft nor hard triggers, look at the coarse level: bloat from
+        // repeatedly paging the same target resource or fine-tuning lookup parameters is caught
+        // here. Prompt once only, and yield to exact detection.
         if !self.coarse_loop_note_injected
             && detect_tool_loop(&self.tool_signature_history_coarse, TOOL_LOOP_COARSE_WINDOW)
         {
             self.coarse_loop_note_injected = true;
             return ToolLoopSignal::Coarse;
         }
-        // 整轮签名（exact/coarse）都要求整轮集合相等，抓不到「同一目标混在不同工具
-        // 批次里反复取证」的混合轮循环。这里用目标交集补位：窗口内每轮都触碰同一
-        // 目标即命中。让位于上面所有整轮检测，且与 coarse 一样只提示一次。
+        // Whole-round signatures (exact/coarse) require the whole-round sets to be equal, so they
+        // miss mixed rounds that repeatedly probe the same target across different tool batches.
+        // Target intersection fills the gap here: hitting the same target every round within the
+        // window fires. Yields to all whole-round detections above and, like coarse, prompts only
+        // once.
         if !self.target_repeat_note_injected
             && !self.coarse_loop_note_injected
             && detect_target_repeat_loop(&self.tool_target_history, TOOL_LOOP_COARSE_WINDOW)
@@ -483,20 +541,25 @@ impl TurnSupervisor {
             self.target_repeat_note_injected = true;
             return ToolLoopSignal::TargetRepeat;
         }
-        // 同目标「从头重读」重扫检测：翻页+换页宽+混轮循环的最终防线。上面三道
-        // 整轮检测都要求「整轮签名集合相等/每轮共现同一目标」，而这类循环每轮
-        // offset/limit/页宽都在变、还混着每轮不同的新归档路径与 execute_command，
-        // 整轮集合永远不相等；soft 命中后历史还会被清空、每轮新目标又把无进展
-        // 计数重置。这里按「目标文件」累计从文件头开始的读取次数（cat/head/
-        // tail -c +1/read_file offset=1 …），不依赖整轮签名集合——页宽怎么换、
-        // 混了多少新目标都影响不到计数。write_file/apply_patch 修改该文件时
-        // 清零（编辑后从头重读验证是合法行为）。软提示一次后继续累计，第 4 次
-        // 从头重读直接硬停止。
-        // 本轮有实质文件改动（write_file/apply_patch，任意目标）→ 编辑后的验证性
-        // 重读是合法行为，整表清空 rescan 计数，避免「读 A 改 B」的多文件工作流被
-        // 误判为翻页循环。注意不能用 round_has_mutation：它把 sed/awk 等非只读
-        // execute_command 也当 mutation，会把 sed 只读重读误判为「实质改动」而架空
-        // rescan 检测（command_reads_from_top 反而把 sed -n 1 当作从头读）。
+        // Same-target "read from the top" re-scan detection: the last line of defense against
+        // paging + width-changing + mixed-round loops. The three whole-round detections above all
+        // require "whole-round signature sets equal / the same target co-occurring every round",
+        // while this kind of loop changes offset/limit/page width every round and mixes in new
+        // archive paths and execute_command calls, so the whole-round sets are never equal; after
+        // soft fires, history is cleared and each round's new target resets the no-progress
+        // counter. Here we accumulate read-from-top counts per target file (cat/head/
+        // tail -c +1/read_file offset=1 …), independent of whole-round signature sets — no matter
+        // how the page width changes or how many new targets are mixed in, the count is unaffected.
+        // write_file/apply_patch on that file clears it (re-reading from the top after an edit is
+        // legitimate). One soft prompt fires, then counting continues; the 4th read-from-top
+        // hard-stops.
+        // Substantive file changes this round (write_file/apply_patch, any target) → post-edit
+        // verifying re-reads are legitimate, so clear the whole rescan table to keep multi-file
+        // "read A, modify B" workflows from being misjudged as a paging loop. Note
+        // round_has_mutation cannot be used: it treats non-read-only execute_command like sed/awk
+        // as mutation, which would misjudge a sed read-only re-read as a "substantive change" and
+        // neutralize rescan detection (command_reads_from_top, in contrast, treats `sed -n 1` as a
+        // read-from-top).
         if !extract_round_mutated_targets(signature_messages).is_empty() {
             self.progress.from_top_reads.clear();
             self.progress.rescan_note_injected.clear();
@@ -509,13 +572,16 @@ impl TurnSupervisor {
                 .from_top_reads
                 .entry(target.clone())
                 .or_insert((0, self.iteration));
-            // 窗口过期：距上次从头读取超过 WINDOW 轮 → 旧计数作废，重新累计。
+            // Window expiry: if more than WINDOW rounds have passed since the last read-from-top,
+            // the old count is void and counting restarts.
             if self.iteration.saturating_sub(entry.1) > TARGET_RESCAN_WINDOW_ROUNDS {
                 *entry = (0, self.iteration);
-                // 衰减 = 进入新的重读 episode：同步清除该目标的软提示标记，让每一段
-                // 循环都能拿到自己的 soft 预警。否则 rescan_note_injected 保留上一段的
-                // 标记，第二段累计到 soft 时 insert 返回 false → 跳过软提示直接硬停，
-                // 与 soft→hard 升级不变量冲突（mutation/截断清空路径都成对清除）。
+                // Decay = entering a new re-read episode: clear the soft-prompt mark for that
+                // target in sync so every episode gets its own soft warning. Otherwise
+                // rescan_note_injected keeps the previous episode's mark; when the second episode
+                // accumulates to soft, insert returns false → skipping the soft prompt straight to
+                // hard-stop, contradicting the soft→hard escalation invariant (the
+                // mutation/truncation clear paths always clear the pair together).
                 self.progress.rescan_note_injected.remove(&target);
             }
             entry.0 += 1;
@@ -534,30 +600,37 @@ impl TurnSupervisor {
         if let Some(signal) = rescan_signal {
             return signal;
         }
-        // exact/coarse 均未命中「签名重复」型循环时，交给 Progress Budget 补位：
-        // 抓「参数每轮都变、但整体不推进任务」的发散型 loop。
+        // When neither exact nor coarse catches a "signature repetition" loop, hand off to the
+        // Progress Budget: it catches divergent loops whose parameters change every round but never
+        // advance the task.
         self.assess_progress(messages, progress_messages, free_explore_rounds)
     }
 
-    /// Progress Budget 判定：按「信息增益」而非动作次数计费。只在 exact/coarse
-    /// 签名检测未命中时补位调用。进展是纯**行为信号**，不再从问题文本猜意图：
+    /// Progress Budget judgment: charged by "information gain" rather than number of actions.
+    /// Called only as a fallback when the exact/coarse signature detection misses. Progress is a
+    /// pure behavioral signal; intent is no longer guessed from question text:
     ///
-    /// - 本轮触碰到新目标资源（`extract_round_targets` 首次出现）→ 信息增益，算进展；
-    /// - 成功只读工具返回了此前未见的新内容 → 新证据，算进展；
-    /// - 或本轮调用了变更类工具（`round_has_mutation`）→ 实质动作，算进展。
+    /// - Touching a new target resource this round (`extract_round_targets` first occurrence) →
+    ///   information gain, counts as progress;
+    /// - A successful read-only tool returning content not seen before → new evidence, counts as
+    ///   progress;
+    /// - Or calling a mutation-class tool this round (`round_has_mutation`) → substantive action,
+    ///   counts as progress.
     ///
-    /// 免费探索区（iteration <= free_explore_rounds）内完全不计费；退出后按稳定
-    /// 阈值升级：软提示 → 固定响应窗口 → 记账 → 硬停。soft episode 之间还有 turn 内
-    /// cooldown，避免复杂任务在正常的探索/推进节奏中反复收到同一提示。
+    /// Within the free-exploration zone (iteration <= free_explore_rounds) nothing is charged at
+    /// all; beyond it, escalation follows stable thresholds: soft prompt → fixed response window →
+    /// ledger → hard stop. There is also an in-turn cooldown between soft episodes so complex tasks
+    /// do not keep receiving the same prompt in their normal explore/advance rhythm.
     fn assess_progress(
         &mut self,
         messages: &[crate::ai::history::Message],
         progress_messages: &[crate::ai::history::Message],
         free_explore_rounds: usize,
     ) -> ToolLoopSignal {
-        // 三类进展信号分开保留：ReadOnlyBreadth 只由新目标触发；调用模式历史只在
-        // 新目标/变更动作后清空。同一目标返回新内容时只重置 Progress Budget，保留
-        // exact/coarse detector 对重复翻页模式的一次性提醒能力。
+        // Keep the three kinds of progress signals separate: ReadOnlyBreadth is triggered only by
+        // new targets; call-pattern history is cleared only after a new target / mutation action.
+        // When the same target returns new content, only the Progress Budget is reset, preserving
+        // the exact/coarse detectors' one-shot ability to warn about repeated paging patterns.
         let round_had_mutation = round_has_mutation(progress_messages);
         let round_had_project_mutation = round_has_project_mutation(progress_messages);
         let mut added_new_target = false;
@@ -577,8 +650,9 @@ impl TurnSupervisor {
         let reasoning_fp = extract_round_reasoning_fingerprint(progress_messages)
             .or_else(|| extract_round_reasoning_fingerprint(messages));
         if made_progress {
-            // 任意真实进展都结束当前 low-progress episode；next_episode_iteration 保留，
-            // 因而短暂推进后不会立刻再次注入 soft。seen targets/evidence 也跨轮累积。
+        // Any real progress ends the current low-progress episode; next_episode_iteration is
+        // preserved so a brief advance does not immediately re-inject soft. Seen targets/evidence
+        // also accumulate across rounds.
             let recovered_from_low_progress_episode = self.progress.soft_injected
                 || self.progress.ledger_injected
                 || self.progress.hard_injected
@@ -591,11 +665,13 @@ impl TurnSupervisor {
                     .max(self.iteration + PROGRESS_EPISODE_COOLDOWN);
                 self.progress.reset_escalation();
             }
-            // 只有**结构性进展**（新目标 / 变更动作）且此前已提示过 loop 时，才清空
-            // exact/coarse/target 重试窗口。新的只读结果内容已计入上面的 made_progress
-            // （Progress Budget 不会因高效翻页误升级），但**绝不**清空签名/目标历史：
-            // 否则同文件反复翻页会因每页内容不同而永远填不满 coarse 窗口，绕过循环刹车
-            // ——这正是「进展哈希须忽略 offset/limit 以防预算逃逸」不变量要防的情况。
+        // Only **structural** progress (new target / mutation action) with a previously injected
+        // loop prompt clears the exact/coarse/target retry windows. New read-only result content
+        // already counts toward made_progress above (the Progress Budget does not escalate on
+        // efficient paging), but signature / target history is **never** cleared: otherwise
+        // repeatedly paging the same file would never fill the coarse window because every page
+        // differs, bypassing the loop brake — exactly what the "progress hashes must ignore
+        // offset/limit to prevent budget escape" invariant guards against.
             if (round_had_mutation || added_new_target)
                 && (self.hard_loop_stop_injected
                     || self.loop_breaker_injected
@@ -606,16 +682,19 @@ impl TurnSupervisor {
             }
             self.progress.consecutive_no_progress = 0;
             self.progress.last_reasoning_fp = reasoning_fp;
-            // 只有真实项目变更才永久关闭纯只读发散硬停。plan / task 生命周期虽是任务
-            // 进展，但不能让后续无限串行扫描绕过这个最终刹车。
+        // Only a real project change permanently disables the pure read-only divergence hard stop.
+        // plan / task lifecycle is task progress, but it must not let later unbounded serial scans
+        // bypass this last brake.
             if round_had_project_mutation {
                 self.progress.observed_project_mutation_this_turn = true;
             }
-            // 纯只读发散最后一道刹车：本 turn 从未修改项目，却已累计触碰远超广度
-            // 阈值的不同只读目标仍未收口。`seen_targets` 单调、不被任何 reset 清空，
-            // 因此这条判据与「新目标/新字节复位常规无进展计数」完全解耦，是唯一能
-            // 兜住「持续换目标的纯调查发散」的信号。让位于普通 breadth 提示之后，
-            // 只触发一次并强制收口。
+        // Last brake for pure read-only divergence: the project was never modified this turn, yet
+        // far more distinct read-only targets than the breadth threshold have been touched without
+        // converging. `seen_targets` is monotonic and never cleared by any reset, so this criterion
+        // is fully decoupled from "new target / new bytes resetting the ordinary no-progress
+        // counter" — it is the only signal that can catch "pure-investigation divergence that keeps
+        // switching targets". Yielding after the ordinary breadth prompt, it fires once and forces
+        // convergence.
             if !self.progress.read_only_breadth_hard_injected
                 && !self.progress.observed_project_mutation_this_turn
                 && self.iteration > free_explore_rounds
@@ -636,8 +715,9 @@ impl TurnSupervisor {
             return ToolLoopSignal::None;
         }
 
-        // 免费探索区：探索完全免费，不计费也不升级（删代码前先定位、陌生代码库
-        // 先摸索都属正常）。仅更新 reasoning 指纹基线。
+            // Free-exploration zone: exploration is completely free — no charging, no escalation
+            // (locating code before deleting it, or feeling out an unfamiliar codebase, is normal).
+            // Only the reasoning fingerprint baseline is updated.
         if self.iteration <= free_explore_rounds {
             self.progress.last_reasoning_fp = reasoning_fp;
             return ToolLoopSignal::None;
@@ -645,9 +725,11 @@ impl TurnSupervisor {
 
         self.progress.consecutive_no_progress += 1;
 
-        // 每次 soft 后都给固定响应窗口。旧逻辑只有暴露 reasoning_content 且指纹变化
-        // 的模型才有 grace；不输出 reasoning 的模型会在下一轮立刻收到 ledger。基础
-        // 窗口结束后，新理由仍可额外延长一次，但不得滚动续期。
+            // Every soft prompt is followed by a fixed response window. In the old logic only
+            // models exposing reasoning_content with a changed fingerprint got grace; models that
+            // do not emit reasoning would receive the ledger in the very next round. After the base
+            // window ends, a new justification can extend it once more, but rolling renewal is not
+            // allowed.
         let reasoning_changed =
             reasoning_fp.is_some() && reasoning_fp != self.progress.last_reasoning_fp;
         self.progress.last_reasoning_fp = reasoning_fp;
@@ -665,8 +747,10 @@ impl TurnSupervisor {
             return ToolLoopSignal::None;
         }
 
-        // 升级阶梯严格按 软提示 → 记账 → 硬停 推进，每级一次性。硬停额外要求
-        // 连续无进展达到 soft_threshold + margin，避免越过软层直接收口。
+            // The escalation ladder proceeds strictly soft prompt → ledger → hard stop, each level
+            // one-shot. Hard stop additionally requires consecutive no-progress to reach
+            // soft_threshold + margin, so it cannot jump past the soft layers straight to
+            // convergence.
         if !self.progress.soft_injected {
             if self.iteration < self.progress.next_episode_iteration {
                 return ToolLoopSignal::None;
@@ -688,8 +772,9 @@ impl TurnSupervisor {
         ToolLoopSignal::None
     }
 
-    /// 分级工具轮次检查点：保留累计轮次，在 24 / 48 / 96（小预算按首档缩放）
-    /// 根据当前工作阶段注入不同调度提示。
+    /// Tiered tool-round checkpoints: keep the cumulative round count and inject different
+    /// scheduling prompts at 24 / 48 / 96 (scaled by the first tier for small budgets) depending on
+    /// the current work phase.
     fn maybe_inject_tool_round_checkpoint(
         &mut self,
         messages: &mut Vec<crate::ai::history::Message>,
@@ -771,44 +856,50 @@ pub(in crate::ai::driver) async fn run_turn(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
-    // Step 3：turn 起点钩子（保留原配对语义，必须在 /audit 短路之前触发）
-    // 先分配真实 turn 身份（session SQLite 原子递增）再触发起点钩子：
-    // 让 on_turn_start / on_turn_end 读到真实 turn_index，而非伪造的 0。
-    // 分配失败 = 本轮未开始，直接返回，不触发任何生命周期钩子（起点/终点配对保持）。
+        // Step 3: turn-start hook (preserving the original pairing semantics; must fire before the
+        // /audit shortcut). Allocate the real turn identity first (atomic increment in the session
+        // SQLite), then fire the start hook, so on_turn_start / on_turn_end read the real
+        // turn_index rather than a fake 0. Allocation failure = this round never started: return
+        // directly without firing any lifecycle hook (the start/end pairing is preserved).
     let turn_index = history::reserve_turn_index(&app.session_history_file)?;
     app.fire_turn_start_hooks(turn_index);
 
     let result = (async {
-        // `/audit` 是用户直接请求的同步子代理调用。必须在父 DRIVER_CTX 已建立、
-        // 子 agent 尚未进入递归 turn 前处理，才能复用 task 的隔离与证据生命周期。
+        // `/audit` is a synchronous subagent call directly requested by the user. It must be handled
+        // after the parent DRIVER_CTX is established but before the child agent enters a recursive
+        // turn, so that the task's isolation and evidence lifecycle can be reused.
         if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
             if let Some(command) = crate::ai::driver::commands::audit::parse_audit_command(&question) {
                 return Ok(execute_audit_command(app, command, should_quit));
             }
         }
-        // 把 (session_id, turn_id) 注入 task_local，让下游工具调用与反馈
-        // 写入路径能拿到正确身份。turn_id 由 session SQLite 原子分配，包含普通、
-        // resume 和 internal turn，跨重启/多进程也不会重复。
+        // Inject (session_id, turn_id) into task-local storage so downstream tool calls and
+        // feedback write paths see the correct identity. turn_id is allocated atomically by the
+        // session SQLite and covers normal, resume, and internal turns; it never repeats across
+        // restarts or processes.
         let session_id = app.session_id.clone();
         let turn_id = turn_index;
-        // 仅前台主 turn 抬起「turn 活动」标志：子 agent（sync / background）持有私有
-        // 信号标志，且都通过 SUBAGENT_RESULT_SLOT 作用域执行，据此排除。该标志让
-        // prepare / 思考 / 阶段切换 / mid-turn 压缩等 streaming=false 的空窗里的
-        // Ctrl+C 也走「取消本轮」而非「退出会话」。guard 随本 future drop 自动落下。
+        // Only the foreground main turn raises the "turn active" flag: child agents (sync /
+        // background) hold their own private signal flags and always run under a
+        // SUBAGENT_RESULT_SLOT scope, so they are excluded here. This flag makes Ctrl+C during
+        // streaming=false gaps — prepare / thinking / phase switches / mid-turn compression —
+        // cancel the current round instead of quitting the session. The guard is dropped
+        // automatically when this future drops.
         let _foreground_turn_guard = (!crate::ai::driver::runtime_ctx::has_subagent_result_slot())
             .then(crate::ai::driver::signal::ForegroundTurnGuard::enter);
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((session_id, turn_id), async {
-                // enable_tools 的 per-turn 状态必须跟随整个 future，而不能只依赖
-                // run_turn_body 的 happy-path 尾部清理；abort / early return 也会 Drop。
+        // enable_tools' per-turn state must track the entire future rather than relying only on
+        // run_turn_body's happy-path tail cleanup; abort / early returns also Drop it.
                 let _enable_turn_guard = crate::ai::tools::enable_tools::EnableTurnStateGuard::enter();
-                // 整个 turn（prepare / 流式 / thinking / 工具执行 / finalize）期间开启
-                // 同终端 side-note 输入监听（Ctrl+G）。RAII 守卫随本 future 结束 drop，
-                // 恢复 canonical 终端，保证 turn 之间 prompt_user 输入框不受残留 cbreak
-                // 影响。子 agent（depth>0）/ 后台（终端输出抑制）/ 非 tty stdin 由
-                // side_note_input_enabled() 排除；turn 内无其它 stdin 消费者（输入框只在
-                // turn 之间打开，request_user_input 仅置标记不读 stdin），cbreak 全程接管
-                // stdin 无冲突。
+        // Keep same-terminal side-note input listening (Ctrl+G) active for the whole turn
+        // (prepare / streaming / thinking / tool execution / finalize). The RAII guard drops when
+        // this future ends, restoring the canonical terminal so prompt_user input boxes between
+        // turns are not affected by leftover cbreak. Sub-agents (depth>0) / background (terminal
+        // output suppressed) / non-tty stdin are excluded by side_note_input_enabled(); no other
+        // stdin consumer exists inside a turn (the input box only opens between turns, and
+        // request_user_input only sets a flag without reading stdin), so cbreak owning stdin for
+        // the whole duration has no conflicts.
                 let _side_note_input =
                     if crate::ai::stream::side_note_input::side_note_input_enabled() {
                         Some(crate::ai::stream::side_note_input::SideNoteInputGuard::spawn(
@@ -836,7 +927,8 @@ pub(in crate::ai::driver) async fn run_turn(
     })
     .await;
 
-    // Step 3：turn 终点钩子。覆盖所有返回路径（含 /audit 短路），与起点配对。
+        // Step 3: turn-end hook. Covers every return path (including the /audit shortcut), paired
+        // with the start hook.
     app.fire_turn_end_hooks(turn_index);
 
     result
@@ -853,18 +945,21 @@ fn execute_audit_command(
             println!("  --fast  快速审计：当前会话模型 + high 思考 + 更少步数 + 更短超时，适合轻量复查");
         }
         crate::ai::driver::commands::audit::AuditCommand::Run { instruction, fast } => {
-            // 默认只继承 cwd/skills，避免把无关的父对话和 memory 带入审计任务。
-            // 但子代理完全看不到父对话，必须显式告知 main agent 当前改了什么：
-            // 经常多个需求并行改动，子代理只有看到当前工作区 diff 才能判断哪些属于本次审计。
+            // By default only cwd/skills are inherited, keeping unrelated parent conversation and
+            // memory out of the audit task. But the subagent cannot see the parent conversation at
+            // all, so it must be told explicitly what the main agent has changed: several
+            // requirements are often modified in parallel, and only by seeing the current workspace
+            // diff can the subagent judge which changes belong to this audit.
             let prompt = crate::ai::driver::commands::audit::build_audit_prompt(&instruction);
             let description = if fast {
                 format!("/audit --fast {instruction}")
             } else {
                 format!("/audit {instruction}")
             };
-            // fast 模式：audit-fast agent（更少步数）承载轻量审计契约，模型固定用
-            // 当前会话模型（绕过 prompt 难度分类对 tier 的自动抬升），thinking 固定
-            // high；超时同步缩短。
+            // fast mode: the audit-fast agent (fewer steps) carries the lightweight audit contract;
+            // the model is pinned to the current session model (bypassing the automatic tier bump
+            // from prompt-difficulty classification) and thinking is pinned to high; the timeout
+            // shrinks accordingly.
             let agent_name = if fast { "audit-fast" } else { "audit" };
             let (hard_timeout, wrap_up_lead_time) = if fast {
                 (
@@ -922,13 +1017,16 @@ async fn run_turn_body(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
-    // 每轮开始清除上一轮的打断标记，确保它只反映「本轮」是否被 Ctrl+C 打断。
+    // Clear the previous round's interrupt flag at the start of every round so it
+    // reflects only whether THIS round was interrupted by Ctrl+C.
     app.last_turn_interrupted = false;
-    // 请求用户输入是工具层到 driver 的 turn 级侧信道；先清除遗留状态，避免异常退出
-    // 的上一轮把续接误带入当前 turn。
+    // Requesting user input is a turn-level side channel from the tool layer to the
+    // driver; clear stale state first so an abnormally-exited previous round does not
+    // carry its pending continuation into the current turn.
     crate::ai::tools::skill_tools::clear_pending_user_input_request();
-    // reasoning items 侧信道是 turn 级内存态：每轮开始清空，避免上一轮的
-    // encrypted reasoning 泄漏到本轮请求（call_id 也不会再匹配）。
+    // The reasoning-items side channel is turn-scoped in-memory state: clear it at the
+    // start of each round so the previous round's encrypted reasoning does not leak
+    // into this round's request (its call_id would no longer match either).
     app.turn_reasoning_items.clear();
     let TurnPreparation {
         mut skill_turn,
@@ -960,10 +1058,13 @@ async fn run_turn_body(
         &mut persisted_turn_messages,
     );
 
-    // 历史预算压缩由 prepare_turn 统一负责（按 history_max_chars 构建带摘要/溢出指针的
-    // 投影），mid-turn 预算路径负责长轮次兜底；此处不再挂第二遍 pipeline（无论真压还是
-    // observe-only 都会引入每 turn 的 clone+推演开销，且真压第二遍会丢不可恢复的上下文）。
-    // pipeline 模块仍保留为可选的测试/观测基建，需要时在调用方按 stage 显式挂载。
+    // History-budget compression is owned by prepare_turn (it builds the projection with
+    // summaries / overflow pointers according to history_max_chars); the mid-turn budget
+    // path handles the fallback for very long rounds. Do not attach a second pipeline
+    // pass here — whether really compressing or observe-only, it would add clone+infer
+    // cost every turn, and a real second pass would drop unrecoverable context. The
+    // pipeline module stays as optional test/observation infrastructure; callers mount it
+    // explicitly per stage when needed.
 
     let mut supervisor = TurnSupervisor::default();
     let mut force_final_response = false;
@@ -972,59 +1073,78 @@ async fn run_turn_body(
     let mut final_assistant_recorded = false;
     let mut final_response_model = None::<String>;
     let mut terminal_dedupe_candidate = None;
-    // 收集本 turn 实际调用过的 explicit-enabled tool 名字，turn 末用于老化未用项。
+    // Collect the names of explicit-enabled tools actually called this turn; used to age
+    // out unused entries at the end of the turn.
     let mut tools_used_this_turn: rust_tools::cw::SkipSet<String> =
         rust_tools::cw::SkipSet::default();
     let mut consecutive_empty_responses: usize = 0;
     let mut consecutive_truncations: usize = 0;
-    // 独立统计"流读取中断型"截断（stream_error）。它与模型输出过长无关（网络抖动 /
-    // 服务端断流），因此不参与 reasoning 降档，也不累加 consecutive_truncations；
-    // 但持续断流仍需有上限兜底，否则 usize::MAX 迭代预算的后台任务会无限重试。
+    // Count stream-read-interruption truncations (stream_error) separately. They are
+    // unrelated to overlong model output (network jitter / server-side stream drop), so
+    // they neither participate in reasoning downgrades nor accumulate
+    // consecutive_truncations; still, sustained stream drops need a bounded fallback, or
+    // a background task with a usize::MAX iteration budget would retry forever.
     let mut consecutive_stream_errors: usize = 0;
     let mut turn_had_tool_error = false;
-    // 保存进入本 turn 时的 reasoning effort 覆盖值（可能是用户 `/model effort` 的
-    // 显式选择，或 None=用模型默认）。截断重试时会临时把它降到 Low，把输出 token
-    // 预算从 reasoning 让给实际内容；turn 结束后（含所有 break 出口）统一恢复，
-    // 不污染用户的会话级设置。
+    // Save the reasoning-effort override in effect when this turn starts (either the
+    // user's explicit `/model effort` choice, or None = model default). Truncation
+    // retries temporarily lower it to Low to give the output-token budget to actual
+    // content; restore it uniformly at turn end (including all break exits) so the
+    // user's session-level setting is never polluted.
     let saved_effort_override = app.cli.reasoning_effort_override;
-    // 同理保存 thinking 兜底开关：截断重试可能置位它以强制关闭 always-thinking
-    // 模型的思考链，turn 末统一恢复，不污染后续 turn。
+    // Likewise save the thinking fallback switch: truncation retries may set it to force
+    // the thinking chain of always-thinking models off; restore it at turn end so later
+    // turns are unaffected.
     let saved_thinking_disabled = app.cli.thinking_disabled_override;
-    // 同理保存 max_tokens 自适应覆盖：零输出截断时自动降 max_tokens 重试。
-    // 降级是临时的：一旦有正常输出（正常完成或正常截断）就恢复原始值，
-    // 因为原始值本身是合理的（首次请求能成功）。turn 末兜底恢复。
+    // Similarly save the adaptive max_tokens override: on a zero-output truncation we
+    // automatically lower max_tokens and retry. The downgrade is temporary — restore the
+    // original value as soon as there is normal output (normal completion or normal
+    // truncation), because the original value is itself reasonable (the first request
+    // succeeded). Also restored as a safety net at turn end.
     let saved_max_tokens_override = app.cli.max_tokens_override;
-    // 当前是否处于零输出降级状态。
+    // Whether we are currently in the zero-output downgraded state.
     let mut mt_downgraded = false;
-    // VL 图片摘要（429 TPM 缓解）状态：pending_digest_source 保存上一轮 tool-call
-    // 响应的未截断原文（含 reasoning），作为“搭车”解析摘要的来源；
-    // image_digest_resolved 一旦置位，表示图片已被摘要替换、或两条路径都拿不到
-    // 摘要而按用户决定保留原图——两种情况都不再每轮重试，避免反复发兜底请求。
+    // VL image-digest (429 TPM mitigation) state: pending_digest_source holds the
+    // untruncated raw text (including reasoning) of the previous round's tool-call
+    // response, used as the source to piggyback the digest parse; once
+    // image_digest_resolved is set, the image has either been replaced by a digest or,
+    // when neither path could obtain one, kept as the user decided — in both cases we
+    // stop retrying every round instead of repeatedly firing fallback requests.
     let mut pending_digest_source: Option<String> = None;
     let mut image_digest_resolved = false;
-    // 跨 turn 图片摘要：记录本轮解析出的摘要（内容指纹, 摘要, 原图路径），
-    // turn 正常结束时持久化进历史元数据表，下个 turn 加载历史时用同一指纹
-    // 取回摘要并替换旧图片，避免新一轮重复发送上一 turn 的图片。
+    // Cross-turn image digest: record this round's resolved digest (content fingerprint,
+    // digest, original image paths); persist it into the history metadata table on
+    // normal turn end, and on the next turn load history with the same fingerprint to
+    // retrieve the digest and replace the old image, avoiding resending the previous
+    // turn's image in the new round.
     let mut turn_digest: Option<(String, String, Vec<String>)> = None;
-    // preflight 拒绝的 mutation 目标必须在本 turn 后续每次 prompt 重建时优先获得
-    // scoped 指令预算；不能只消费一次，因为中间读取和 mid-turn 压缩可能让同一
-    // mutation 的目标从可观测历史消失，继而被重复暂停。
+    // Mutation targets rejected by preflight must get prioritized scoped-instruction
+    // budget at every subsequent prompt rebuild this turn; it cannot be consumed once,
+    // because intermediate reads and mid-turn compression may make the same mutation
+    // target disappear from observable history and get re-paused.
     let mut scoped_preflight_targets = ScopedPreflightTargets::default();
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         let effective_max_iterations = supervisor.effective_max_iterations(max_iterations);
-        // 从第二轮起，把请求投影里用户消息内联的图片换成上一轮产出的文字摘要，
-        // 避免在工具循环里反复重放 base64 触发 Doubao/Ark 侧 429 TPM 限流。
-        // 优先搭车解析上一轮响应；拿不到再发一次禁用工具的一次性 VL 请求兜底；
-        // 两者都失败则保留原图。只改请求投影 messages，canonical turn_messages 不动。
-        // 放在 mcp 锁块之前：兜底请求含 .await，绝不能跨 std::Mutex 持锁。
+        // From round two onward, replace the images inlined in user messages of the
+        // request projection with the textual digest produced in the previous round, to
+        // avoid replaying base64 in the tool loop and tripping Doubao/Ark-side 429 TPM
+        // rate limits. Prefer piggybacking the previous response to parse the digest;
+        // fall back to a single one-off VL request with tools disabled; if both fail,
+        // keep the original image. Only the request-projection messages change; the
+        // canonical turn_messages are untouched. Placed before the mcp-lock block: the
+        // fallback request contains .await and must never hold a std::Mutex across it.
         if !image_digest_resolved && iteration >= 2 {
-            // 只处理「当前 turn」的用户图片：用 rposition 取最后一条含图 user 消息。
-            // messages 头部可能载入历史里更早 turn 的图片（只有无持久化摘要的旧图，
-            // 如老会话；有摘要的已在 prepare 阶段被替换成文本），但我们采集/生成的
-            // 摘要只描述当前 turn 的图片（指令注入在当前 user 消息、兜底用
-            // app.attached_image_files=当前 turn），拿它去替换旧图会张冠李戴。这里要
-            // 换掉的是当前 turn 这张原图——它在请求投影里每轮重放，正是 digest 的目标。
+            // Handle only THIS turn's user images: use rposition to find the last user
+            // message containing an image. The head of `messages` may load images from
+            // earlier turns in history (only old images without a persisted digest, e.g.
+            // legacy sessions — ones with a digest were already replaced with text
+            // during prepare). But the digests we collect/generate describe only this
+            // turn's images (instruction injection lives in the current user message,
+            // and the fallback uses app.attached_image_files = current turn), so using
+            // them to replace old images would mismatch. What we swap out here is this
+            // turn's original image — replayed every round in the request projection and
+            // exactly the digest target.
             if let Some(idx) = messages.iter().rposition(|m| {
                 m.role == "user" && crate::ai::request::content_has_image(&m.content)
             }) {
@@ -1049,14 +1169,16 @@ async fn run_turn_body(
                         &digest,
                         &image_paths,
                     );
-                    // 跨 turn 摘要：把本轮摘要记入 turn_digest，等 turn 正常结束时
-                    // 持久化进历史元数据（见下方 Ok(_) 分支），下个 turn 加载历史时
-                    // 用指纹取回摘要替换旧图，避免跨 turn 重复发图。
-                    // 指纹必须取自 turn_messages（canonical）而非刚替换的 messages[idx]：
-                    // 请求投影里带着注入的图片处理协议指令 / reminder，那些 part 不落库，
-                    // 加载侧（replace_old_images_with_persisted_digests）对库里持久化的
-                    // 原样内容算指纹，只有 canonical 版本才对得上。turn_messages 无含图
-                    // user 消息（resume turn 丢图等）时静默跳过，不持久化。
+            // Cross-turn digest: record this round's digest into turn_digest; on normal turn
+            // completion it is persisted into the history metadata (see the Ok(_) branch below),
+            // and when the next turn loads history the fingerprint retrieves the digest to replace
+            // the old image, avoiding cross-turn image re-sends.
+            // The fingerprint must come from turn_messages (canonical), not the just-replaced
+            // messages[idx]: the request projection carries injected image-processing protocol
+            // instructions / reminders whose parts are not persisted, while the loading side
+            // (replace_old_images_with_persisted_digests) fingerprints the raw persisted content —
+            // only the canonical version matches. If turn_messages has no image-bearing user
+            // message (e.g. a resume turn dropped the image), skip silently without persisting.
                     if let Some(fp) =
                         crate::ai::request::last_image_user_message_fingerprint(&turn_messages)
                     {
@@ -1098,10 +1220,12 @@ async fn run_turn_body(
             force_final_response = true;
             inject_subagent_pre_timeout_wrap_up_note(&mut messages);
         }
-        // side-note 实时引导：每次迭代顶部把文件队列里的引导注入上下文，下一轮 LLM 立刻可见。
-        // 对前景任务与 subagent 均生效；subagent 通过 task_local SUBAGENT_TASK_ID
-        // （回退到 AIOS_SUBAGENT_TASK_ID / SUBAGENT_TASK_ID 环境变量）区分目标。
-        // 统一走 side_note::poll_and_inject 避免两套注入路径分叉与原文回显泄露。
+        // Side-note real-time guidance: at the top of every iteration, guidance queued in the file
+        // is injected into context so the next LLM request sees it immediately. Applies to
+        // foreground tasks and subagents alike; subagents are targeted via task-local
+        // SUBAGENT_TASK_ID (falling back to the AIOS_SUBAGENT_TASK_ID / SUBAGENT_TASK_ID env vars).
+        // Everything goes through side_note::poll_and_inject to avoid two injection paths diverging
+        // and leaking original text back.
         {
             let before = messages.len();
             let cnt =
@@ -1138,8 +1262,10 @@ async fn run_turn_body(
             Ok(e) => e,
             Err(err) => break 'turn Err(err),
         };
-        // 预超时收口信号在模型请求中途触发：放弃当前请求，立即进入强制收口迭代，
-        // 而不是等当前（可能很长的）迭代自然结束。消费信号，避免下一轮迭代顶部重复注入。
+            // The pre-timeout wrap-up signal fires mid-model-request: abandon the current request
+            // and enter a forced wrap-up iteration immediately instead of waiting for the current
+            // (possibly very long) iteration to finish naturally. Consume the signal so the next
+            // iteration's top does not inject it again.
         if matches!(&execution, IterationExecution::WrapUpFinal) {
             let _ = crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request();
             pre_timeout_wrap_up_requested = true;
@@ -1150,18 +1276,21 @@ async fn run_turn_body(
         }
         let was_final_response = matches!(&execution, IterationExecution::FinalResponse(_));
         let had_tool_call_execution = matches!(&execution, IterationExecution::ToolCall(_));
-        // 搭车采集：图片摘要尚未解决时，缓存本轮 tool-call 响应的未截断原文
-        // （assistant_text + reasoning_text）。下一轮循环开头据此尝试 parse 出摘要，
-        // 命中即可省掉一次兜底请求。必须用 stream_result 原文——写回 messages 的
-        // assistant narration 会被截断到 800 字符，可能截掉摘要尾部哨兵。
+                // Piggyback collection: while the image digest is unresolved, cache this round's
+                // untruncated tool-call response text (assistant_text + reasoning_text). At the top
+                // of the next loop round we try to parse a digest from it; a hit saves one fallback
+                // request. The stream_result raw text must be used — the assistant narration
+                // written back to messages is truncated to 800 chars and may cut off the digest's
+                // trailing sentinel.
         if !image_digest_resolved && let IterationExecution::ToolCall(tce) = &execution {
             let sr = &tce.stream_result;
             pending_digest_source = Some(format!("{}\n{}", sr.assistant_text, sr.reasoning_text));
         }
         {
             let mc = mcp_client.lock().unwrap().routing_snapshot();
-            // 用服务端返回的实际 prompt_tokens 校正后续请求的 max_tokens clamp。
-            // 字符估算偏保守（高估），服务端的实际值更准确，能减少不必要的钳小。
+                // Calibrate the max_tokens clamp of later requests with the actual prompt_tokens
+                // returned by the server. Char-based estimates are conservative (overestimating);
+                // the server's actual value is more accurate and reduces unnecessary clamping down.
             let usage_prompt = match &execution {
                 IterationExecution::Truncated(sr) | IterationExecution::FinalResponse(sr) => {
                     Some((sr.usage_prompt_tokens, sr.usage_cached_prompt_tokens))
@@ -1176,7 +1305,8 @@ async fn run_turn_body(
                 app.last_known_prompt_tokens = Some(pt);
                 app.last_known_cached_prompt_tokens = Some(cached.min(pt));
             }
-            // 空响应重试计数：连续 >2 次空响应则放弃，避免浪费迭代预算
+                // Empty-response retry count: give up after more than 5 consecutive empty
+                // responses to avoid wasting iteration budget
             if matches!(execution, IterationExecution::EmptyResponse) {
                 consecutive_empty_responses += 1;
                 if consecutive_empty_responses > 5 {
@@ -1191,19 +1321,23 @@ async fn run_turn_body(
             } else {
                 consecutive_empty_responses = 0;
             }
-            // 截断重试计数：连续多次被截断（输出上限/工具 JSON 半截）仍无法收敛时
-            // 放弃，避免无限重试烧预算。阈值取 3：给模型两次收缩重写的机会。
+                // Truncation retry count: give up when repeated truncations (output cap / truncated
+                // tool JSON) still cannot converge, to avoid endless retries burning budget. The
+                // threshold is 3: it gives the model two chances to shrink and rewrite.
             if let IterationExecution::Truncated(stream_result) = &execution {
                 consecutive_truncations += 1;
-                // 重置工具循环检测：截断重试期间的重复调用是预期行为，
-                // 不应被误判为工具死循环并触发 hard-stop 强制收敛。
+                // Reset tool-loop detection: repeated calls during truncation retries are expected
+                // behavior and must not be misjudged as a tool dead-loop that triggers a hard-stop
+                // convergence.
                 supervisor.mark_truncation_skip();
 
                 if stream_result.stream_error {
-                    // 流读取错误（网络抖动 / 服务端异常断流）导致的截断。
-                    // 模型并没有输出太多，降 reasoning_effort 和注入收缩提示都无意义。
-                    // 不累积 consecutive_truncations（这不是模型的错），但用独立计数
-                    // consecutive_stream_errors 兜底，避免服务端持续断流时无限重试。
+                // Truncation caused by stream-read errors (network jitter / abnormal server stream
+                // drop). The model did not output too much, so lowering reasoning_effort or
+                // injecting a shrink prompt is pointless. It does not accumulate into
+                // consecutive_truncations (it is not the model's fault), but a separate counter,
+                // consecutive_stream_errors, provides a cap so persistent server stream drops do
+                // not retry forever.
                     consecutive_truncations = 0;
                     consecutive_stream_errors += 1;
                     if consecutive_stream_errors > MAX_STREAM_ERROR_RETRIES {
@@ -1222,14 +1356,15 @@ async fn run_turn_body(
                         "  ⚠ Response-stream read interrupted (consecutive #{consecutive_stream_errors}); auto-retrying, stopping after {MAX_STREAM_ERROR_RETRIES} consecutive failures…"
                     );
                 } else {
-                    // 真截断：模型撞输出上限或工具 JSON 半截。
+                // Real truncation: the model hit the output cap or produced half-cut tool JSON.
                     consecutive_stream_errors = 0;
 
-                    // 零输出截断检测：completion=0 + finish_reason=length 说明服务端
-                    // 拒绝了 max_tokens 值（典型：relay/兼容层对超大 max_tokens 返回
-                    // 空响应而非报错）。此时降 reasoning_effort / 禁 thinking 都无济于事
-                    // ——问题不在模型输出太多，而在 max_tokens 本身被服务端拒绝。
-                    // 策略：将 max_tokens 减半后重试，直到服务端接受。
+                // Zero-output truncation detection: completion=0 + finish_reason=length means the
+                // server rejected the max_tokens value (typically a relay/compatibility layer
+                // returns an empty response for an oversized max_tokens instead of an error).
+                // Lowering reasoning_effort or disabling thinking is useless here — the problem is
+                // not that the model outputs too much but that max_tokens itself is rejected by
+                // the server. Strategy: halve max_tokens and retry until the server accepts it.
                     let is_zero_completion = stream_result.usage_completion_tokens == 0
                         && stream_result
                             .finish_reason_value
@@ -1251,27 +1386,30 @@ async fn run_turn_body(
                         app.cli.max_tokens_override = Some(halved);
                         mt_downgraded = true;
                     } else if mt_downgraded {
-                        // 正常截断（有输出但被打断）：服务端接受了当前 max_tokens，
-                        // 恢复原始值给后续迭代更大输出预算。
+                // Normal truncation (there was output but it was cut off): the server accepted the
+                // current max_tokens, so restore the original value to give later iterations a
+                // larger output budget.
                         app.cli.max_tokens_override = saved_max_tokens_override;
                         mt_downgraded = false;
                     }
 
-                    // 该模型降 reasoning_effort 是否真能缩短思考链。模型级 wire
-                    // 声明优先于 provider 默认：例如 DashScope DeepSeek 虽使用
-                    // enable_thinking 开关，但推理强度仍由顶层 reasoning_effort 控制。
-                    // 未声明有效 effort wire 的布尔开关方言才需要直接关闭 thinking。
+            // Whether lowering reasoning_effort actually shortens the thought chain for this model.
+            // Model-level wire declarations take precedence over provider defaults: for example
+            // DashScope DeepSeek uses the enable_thinking switch, yet reasoning intensity is still
+            // governed by the top-level reasoning_effort. Only boolean-switch dialects without a
+            // declared effective effort wire need thinking disabled outright.
                     let effort_helps =
                         crate::ai::models::reasoning_effort_reduces_thinking(&next_model);
 
                     if effort_helps {
-                        // 截断类型分流：区分「推理吃光预算」与「正文过长」两种截断。
-                        // 用服务端上报的 reasoning_tokens 占比判断——推理占比高时降档
-                        // 有效（直接缩短思考链、把预算让给正文）；正文过长时降档救不了
-                        // 预算（模型没在推理），白损失质量，只靠注入的收缩提示即可。
-                        // reasoning_tokens 未上报（0）或 completion 为 0 时按「未知」
-                        // 保守处理，走降档阶梯保底，避免新逻辑对不报 usage 明细的
-                        // provider 造成回归。
+            // Split truncation by type: distinguish "reasoning ate the budget" from "visible text
+            // too long". Judged by the server-reported reasoning_tokens share — when the reasoning
+            // share is high, downgrading is effective (it directly shortens the thought chain and
+            // hands budget to visible text); when the text is too long, downgrading cannot save the
+            // budget (the model is not reasoning) and only wastes quality, so the injected shrink
+            // prompt suffices. When reasoning_tokens is not reported (0) or completion is 0, treat
+            // it conservatively as "unknown" and fall through the downgrade ladder as a safety net,
+            // so the new logic does not regress providers that do not report usage details.
                         let reasoning_reported = stream_result.usage_reasoning_tokens > 0
                             && stream_result.usage_completion_tokens > 0;
                         let reasoning_dominant = reasoning_reported
@@ -1281,21 +1419,22 @@ async fn run_turn_body(
                         let text_too_long = reasoning_reported && !reasoning_dominant;
 
                         if !text_too_long {
-                            // 渐进式 reasoning effort 降档，把输出预算从 reasoning 让给
-                            // 实际内容。resolve_reasoning_effort 每次迭代实时读该字段，
-                            // 改了立即对下一次生效。
-                            //
-                            // 1 次截断 → High（略降推理开销）
-                            // 2 次截断 → Medium（进一步缩短思考链）
-                            // 3 次以上 → Low（保留最小推理能力的下限）
-                            //
-                            // 相比旧版 2 次即归零（None/禁用）的重度阉割，这里保留推理
-                            // 能力更温和：实测 effort 每降一档能省约 15-20% 预算，且模型
-                            // 仍保留思考能力。thinking 关闭只留给第 3 次兜底（见下）。
-                            // 本阶梯刻意不下发 `reasoning_effort: "none"`：显式 none 会
-                            // 彻底阉割推理，而省略字段会让服务端回退到自身默认档
-                            // （gpt-5.x 默认 medium）反而调高预算，两者都不适合作为
-                            // 截断收敛手段。
+            // Progressive reasoning-effort downgrade, handing output budget from reasoning over to
+            // actual content. resolve_reasoning_effort reads this field live every iteration, so a
+            // change takes effect on the very next request.
+            //
+            // 1 truncation → High (slightly reduce reasoning overhead)
+            // 2 truncations → Medium (shorten the thought chain further)
+            // 3+ truncations → Low (the floor that keeps minimal reasoning ability)
+            //
+            // Compared with the old version, which zeroed it after 2 truncations (None/disabled)
+            // and castrated reasoning heavily, keeping reasoning ability is gentler: measured
+            // savings are ~15-20% of budget per effort tier, and the model keeps its ability to
+            // think. Disabling thinking is reserved for the 3rd-truncation fallback (see below).
+            // This ladder deliberately never sends `reasoning_effort: "none"`: an explicit none
+            // castrates reasoning entirely, while omitting the field makes the server fall back to
+            // its own default tier (gpt-5.x defaults to medium), raising the budget — neither is
+            // suitable as a truncation-convergence mechanism.
                             app.cli.reasoning_effort_override =
                                 Some(match consecutive_truncations {
                                     1 => Some(crate::ai::provider::ReasoningEffort::High),
@@ -1319,9 +1458,9 @@ async fn run_turn_body(
                                 note,
                             );
                         } else {
-                            // 正文过长型截断：不降 effort（模型没在推理，降了也救不了
-                            // 预算），仅靠已注入的 output_truncated 收缩提示让模型缩小
-                            // 输出。记录决策供事后审计。
+            // Visible-text-too-long truncation: do not lower effort (the model is not reasoning, so
+            // lowering it cannot save budget); rely only on the already-injected output_truncated
+            // shrink prompt to make the model produce less. Record the decision for later audit.
                             crate::ai::driver::decision_log::log_truncation_downgrade(
                                 crate::ai::driver::decision_log::get_decision_log_store(),
                                 &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
@@ -1334,14 +1473,16 @@ async fn run_turn_body(
                                 "visible text dominated the output budget; keeping effort, prompting shrink only",
                             );
                         }
-                        // effort 阶梯走到第 3 档仍截断，说明仅靠降 effort 已不足以收敛，
-                        // 叠加强制关闭 thinking 作为兜底，把整个输出预算让给可见内容。
+            // If the effort ladder still truncates at tier 3, lowering effort alone is no longer
+            // enough to converge; force thinking off on top of it as a fallback, handing the entire
+            // output budget to visible content.
                         if consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES {
                             app.cli.thinking_disabled_override = true;
                         }
                     } else {
-                        // 降 effort 对该方言无效：不浪费重试轮次走无效阶梯，
-                        // 首次真截断即强制关闭 thinking，把整个输出预算让给可见内容。
+            // Lowering effort does not work for this dialect: do not waste retry rounds on a useless
+            // ladder; force thinking off at the first real truncation, handing the entire output
+            // budget to visible content.
                         app.cli.thinking_disabled_override = true;
                     }
                 }
@@ -1349,10 +1490,11 @@ async fn run_turn_body(
                 let partial_text = stream_result.assistant_text.trim();
                 let has_visible_text = !partial_text.is_empty();
 
-                // 模型已产出可见文本但仍连续撞长度上限（典型：推理模型 reasoning 占满
-                // 预算）。继续重试通常无帮助——模型会反复产出同样长度的内容。
-                // 给一次降档重试机会后即接受部分文本作为最终回答。
-                // 但 stream_error 场景不计入 consecutive_truncations，不会触发此分支。
+            // The model produced visible text but keeps hitting the length cap (typically a
+            // reasoning model whose reasoning fills the budget). Further retries usually do not
+            // help — the model will keep producing content of the same length. After one downgraded
+            // retry, accept the partial text as the final answer. stream_error scenarios do not
+            // count toward consecutive_truncations, so they never reach this branch.
                 if has_visible_text
                     && consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
                     && !stream_result.stream_error
@@ -1366,7 +1508,8 @@ async fn run_turn_body(
                     break 'turn Ok(None);
                 }
 
-                // stream_error 已在上面重置 consecutive_truncations=0，不会进入此分支。
+            // stream_error already reset consecutive_truncations to 0 above, so this branch is
+            // unreachable for it.
                 if consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
                     && !stream_result.stream_error
                 {
@@ -1375,7 +1518,8 @@ async fn run_turn_body(
                         "  ✗ {} consecutive truncated responses; giving up retry",
                         consecutive_truncations
                     );
-                    // 保留模型已产出的部分文本（若有），比直接丢弃更有价值。
+            // Keep whatever partial text the model already produced (if any) — it is more valuable
+            // than discarding it outright.
                     final_assistant_text = if has_visible_text {
                         partial_text.to_string()
                     } else {
@@ -1386,7 +1530,7 @@ async fn run_turn_body(
                 }
             } else {
                 consecutive_truncations = 0;
-                // 非截断：恢复因零输出降级的 max_tokens。
+            // Not a truncation: restore the max_tokens downgraded due to zero output.
                 if mt_downgraded {
                     app.cli.max_tokens_override = saved_max_tokens_override;
                     mt_downgraded = false;
@@ -1420,11 +1564,11 @@ async fn run_turn_body(
                 TurnLoopStep::ScopedPreflightContinue(targets) => {
                     if supervisor.grant_scoped_preflight_grace() {
                         scoped_preflight_targets.record_pause(targets);
-                        // 该轮没有执行 mutation，也不应计入 progress/loop 统计。
+        // This round performed no mutation and must not count toward progress/loop statistics.
                         continue 'turn;
                     }
-                    // 独立 preflight 预算耗尽后保持安全拒绝并收口，避免通过不断
-                    // 切换目录无限扩张迭代预算。
+            // Once the separate preflight budget is exhausted, keep a safe rejection and converge,
+            // so switching directories repeatedly cannot indefinitely expand the iteration budget.
                     record_force_final_reason(
                         &mut messages,
                         "scoped_preflight_budget_exhausted",
@@ -1458,8 +1602,8 @@ async fn run_turn_body(
                             }
                         }
                     }
-                    // 记录本轮 assistant 实际调用过的 tool 名字（去重），
-                    // 留给 turn 末用于老化未用 explicit tool。
+            // Record the tool names this round's assistant actually invoked (deduplicated), kept
+            // for aging out unused explicit tools at turn end.
                     if let Some(last_assistant) =
                         messages.iter().rev().find(|m| m.role == "assistant")
                         && let Some(tool_calls) = &last_assistant.tool_calls
@@ -1478,31 +1622,35 @@ async fn run_turn_body(
                 TurnLoopStep::Return(outcome) => break 'turn Ok(Some(outcome)),
             }
         }
-        // ↓↓↓ Continue 分支的后续处理（已离开 mc 锁，可以安全 await）↓↓↓
+        // ↓↓↓ Post-processing for the Continue branch (the mc lock has been released; awaiting is
+        // safe) ↓↓↓
         let progress_messages = if had_tool_call_execution {
             current_tool_round_messages(&messages)
         } else {
             Vec::new()
         };
 
-        // === Mid-turn 渐进式压缩 ===
-        // 每轮 tool 执行完毕后检查 messages 总字符；超过软阈值时
-        // 复用跨 turn 压缩管线，避免长链工具调用把上下文撑爆。
-        // 节流：①冷却 N 轮 ②增量小于 DELTA 时跳过，避免 no-op 反复压缩。
-        // 阈值按 history_max_chars 动态计算（floor 兜底），避免用户调整
-        // history_max_chars 后 mid-turn 阈值依旧死锁在 36K/80K。
+        // === Mid-turn progressive compression ===
+        // After each round's tool execution, check the total chars of messages; when it exceeds the
+        // soft threshold, reuse the cross-turn compression pipeline so long tool-call chains do not
+        // blow up the context. Throttling: ① a cooldown of N rounds ② skip when the delta is below
+        // DELTA, avoiding repeated no-op compression. The threshold is derived dynamically from
+        // history_max_chars (with a floor fallback) so it does not stay locked at 36K/80K after the
+        // user adjusts history_max_chars.
         let history_max_chars = app.config.history_max_chars;
         let mid_turn_soft_base = mid_turn_compress_soft_threshold(&next_model, history_max_chars);
-        // 长循环时把软阈值下调到 SOFT_FLOOR，遏制 O(n²) 累积重发（详见
-        // [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]）。门控与下面的实际
-        // mid_turn_compress 调用共用同一 `mid_turn_soft`，避免「门开了却 no-op」。
+            // For long loops, lower the soft threshold to SOFT_FLOOR to curb the O(n²) re-send
+            // accumulation (see [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]). The gate and the actual
+            // mid_turn_compress call below share the same `mid_turn_soft`, avoiding "the gate opens
+            // but compression no-ops".
         let mid_turn_soft = supervisor.effective_mid_turn_soft_threshold(mid_turn_soft_base);
         let mid_turn_hard = mid_turn_compress_hard_threshold(&next_model, history_max_chars);
         let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
         if supervisor.should_try_mid_turn_compress(total_chars, mid_turn_soft) {
-            // 与跨 turn 压缩（prepare.rs）一致地解析会话 overflow 目录：mid-turn
-            // 压缩据此把 read_file/grep 等「不可压缩」工具的大输出零压缩外溢到
-            // 文件 + 留预览 stub，既释放上下文又不丢信息（模型可重新 read_file）。
+            // Resolve the session overflow directory consistently with cross-turn compression
+            // (prepare.rs): mid-turn compression uses it to spill large outputs of "incompressible"
+            // tools like read_file/grep to files with zero compression plus a preview stub, freeing
+            // context without losing information (the model can read_file again).
             let overflow_dir = {
                 use crate::ai::history::SessionStore;
                 let store = SessionStore::new(app.config.history_file.as_path());
@@ -1521,8 +1669,9 @@ async fn run_turn_body(
             if after < before {
                 compression_report.record("mid-turn", before, after);
             }
-            // 硬阈值：无损 + 弱损管线之后仍超额，调用 LLM 摘要兜底，
-            // 把早期对话压成单条 internal_note，并将各压缩阶段合并为一条 status line。
+            // Hard threshold: if still over budget after the lossless + weakly-lossy pipelines,
+            // call the LLM summary fallback to fold early conversation into a single internal_note,
+            // and merge the compression stages into one status line.
             if after > mid_turn_hard
                 && should_try_llm_summary(&app.session_id, after, mid_turn_hard)
             {
@@ -1552,9 +1701,10 @@ async fn run_turn_body(
             }
         }
 
-        // === 工具循环检测 ===
-        // 若 execute 层已决定进入最终响应，就只保留 iteration-limit 调度，不再叠加
-        // loop/progress/checkpoint prompt。反过来，health hard-stop 也不应冒充 iteration limit。
+        // === Tool-loop detection ===
+        // If the execute layer has already decided to move to a final response, keep only the
+        // iteration-limit scheduling and do not stack loop/progress/checkpoint prompts on top.
+        // Conversely, a health hard-stop must not pose as an iteration limit either.
         let force_final_before_health = force_final_response;
         let tool_loop_signal = if force_final_before_health {
             ToolLoopSignal::None
@@ -1631,7 +1781,8 @@ async fn run_turn_body(
                     "tool-loop detected: injecting self-reflect prompt",
                 );
                 inject_loop_breaker_note(&mut messages);
-                // 高风险异常才注入一次任务锚点，降低目标漂移概率。
+                // Inject a task anchor once only for high-risk anomalies, to reduce the chance of
+                // goal drift.
                 supervisor.maybe_inject_task_anchor(&mut messages, &question, "tool-loop");
             }
             ToolLoopSignal::Hard => {
@@ -1708,10 +1859,11 @@ async fn run_turn_body(
             }
         }
 
-        // === 分级、阶段感知的工具轮次检查点 ===
-        // 使用 pre-compression 的当前工具轮判断阶段，累计轮次保持不变；检查点只调度
-        // 下一步，不把刚完成的 mutation 误报为失败。同一轮已有更具体的 health signal
-        // 时跳过 checkpoint，避免多个收敛 prompt 叠加。
+        // === Tiered, phase-aware tool-round checkpoints ===
+        // The phase is judged from the pre-compression current tool round while the accumulated
+        // round count stays unchanged; a checkpoint only schedules the next step and never reports
+        // the just-completed mutation as a failure. When a more specific health signal already
+        // fired this round, the checkpoint is skipped so multiple convergence prompts do not stack.
         let effective_max_iterations = supervisor.effective_max_iterations(max_iterations);
         if !health_signal_injected && !force_final_before_health {
             let checkpoint_phase = tool_round_checkpoint_phase(&progress_messages, &turn_messages);
@@ -1739,11 +1891,10 @@ async fn run_turn_body(
             }
         }
 
-        // === Iteration limit 自反思 ===
-        // execute.rs 在 iteration >= max_iterations 时会把
-        // force_final_response 置 true。此时除原有的 "Tool limit reached"
-        // system prompt 外，再额外补一条更具体的反思 prompt
-        // （只注入一次，避免重复刷屏）。
+        // === Iteration-limit self-reflection ===
+        // execute.rs sets force_final_response to true when iteration >= max_iterations. At that
+        // point, on top of the existing "Tool limit reached" system prompt, one more specific
+        // reflection prompt is injected (only once, to avoid spamming).
         supervisor.maybe_inject_iteration_limit_note(
             &mut messages,
             effective_max_iterations,
@@ -1754,21 +1905,24 @@ async fn run_turn_body(
         }
     };
 
-    // 恢复进入本 turn 前的 reasoning effort 覆盖值：截断重试可能把它临时降到了
-    // Low，这里统一还原（覆盖所有 break 'turn 出口），避免把降档泄漏到后续 turn
-    // 污染用户的会话级设置。
+            // Restore the reasoning-effort override from before this turn: truncation retries may
+            // have lowered it to Low temporarily; restore it uniformly here (covering every break
+            // 'turn exit) so the downgrade does not leak into later turns and pollute the user's
+            // session-level setting.
     app.cli.reasoning_effort_override = saved_effort_override;
     app.cli.thinking_disabled_override = saved_thinking_disabled;
     app.cli.max_tokens_override = saved_max_tokens_override;
 
-    // 老化未在本 turn 使用的 explicit-enabled tool。
-    // 连续 N 个 turn 闲置就 demote，避免"启用一次永久焊接"。
+            // Age out explicit-enabled tools that were not used this turn. After N consecutive
+            // turns of idle use they are demoted, preventing "enabled once, welded forever".
     crate::ai::tools::enable_tools::age_unused_explicit_tools(tools_used_this_turn.iter());
 
     let loop_result = loop_result.map_err(|e: Box<dyn std::error::Error>| e.to_string());
 
-    // 只有 active skill 明确通过工具请求用户输入、且本轮正常结束时才建立一次性续接。
-    // 这避免了按自然语言问号/关键词猜测，外部 skill 也无需修改自身 manifest。
+            // A one-shot continuation is set up only when an active skill explicitly requested user
+            // input through a tool AND this round ended normally. This avoids guessing from
+            // natural-language question marks / keywords, and external skills need no manifest
+            // changes.
     let requested_user_input = crate::ai::tools::skill_tools::take_pending_user_input_request();
     if requested_user_input && loop_result.is_ok() && !app.last_turn_interrupted {
         if !skill_turn.matched_skill_names().is_empty() {
@@ -1788,9 +1942,11 @@ async fn run_turn_body(
             Ok(outcome)
         }
         Ok(_) => {
-            // 跨 turn 图片摘要持久化（仅 turn 正常完成路径；打断/退出/报错分支不执行，
-            // 摘要丢弃，下轮会重发原图一次）。工具循环内解析到的摘要已记入 turn_digest；
-            // 单轮响应（无工具循环）时摘要块不执行，退而解析最终回复文本里的摘要。
+            // Cross-turn image-digest persistence (only on the normal turn-completion path; the
+            // interrupt / quit / error branches skip it, the digest is dropped, and the original
+            // image is re-sent once next round). Digests parsed inside the tool loop were already
+            // recorded in turn_digest; on a single-round response (no tool loop) the digest block
+            // does not run, so instead parse the digest from the final reply text.
             let mut digest_to_persist = turn_digest.take();
             if digest_to_persist.is_none() {
                 if let Some(digest) = crate::ai::request::parse_digest(&final_assistant_text) {

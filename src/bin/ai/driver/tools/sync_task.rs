@@ -57,7 +57,8 @@ struct SyncSubagentHistoryGuard {
     path: PathBuf,
     memory_path: Option<PathBuf>,
     cwd_dir: Option<PathBuf>,
-    /// 硬超时前置位：Drop 时保留子代理历史（改名而非删除），供父代理提取超时前证据。
+    /// Set before a hard timeout: on Drop, preserve the subagent history (rename instead of
+    /// delete) so the parent can extract pre-timeout evidence.
     preserve_on_drop: Arc<AtomicBool>,
 }
 
@@ -89,7 +90,8 @@ impl SyncSubagentHistoryGuard {
 impl Drop for SyncSubagentHistoryGuard {
     fn drop(&mut self) {
         if self.preserve_on_drop.load(Ordering::Acquire) {
-            // 硬超时：保留子代理已写入的历史（改名而非删除），供父代理提取超时前证据。
+            // Hard timeout: preserve the history the subagent has already written (rename instead
+            // of delete) for the parent to extract pre-timeout evidence.
             match history::preserve_subagent_history(&self.path) {
                 Some(preserved) => {
                     eprintln!(
@@ -98,7 +100,8 @@ impl Drop for SyncSubagentHistoryGuard {
                     );
                 }
                 None => {
-                    // 历史文件不存在（子代理尚未写入任何内容），按原逻辑清理。
+                    // History file missing (the subagent has not written anything yet); clean up
+                    // as before.
                     if let Err(error) = history::delete_subagent_history(&self.path) {
                         eprintln!(
                             "[Warning] failed to clean up sync subagent history {}: {error}",
@@ -133,8 +136,9 @@ impl Drop for SyncSubagentHistoryGuard {
     }
 }
 
-/// 子代理"运行中"心跳的刷新间隔。同步子 agent 自身不直接拥有 terminal；
-/// 前台等待循环用这条单行 heartbeat 展示进度，直到任务完成/取消/超时。
+/// Refresh interval for the subagent "running" heartbeat. A synchronous sub-agent does not own
+/// the terminal itself; the foreground wait loop uses this single-line heartbeat to show
+/// progress until the task completes / is cancelled / times out.
 const SUBAGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 type BoxedSubagentFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -143,15 +147,18 @@ fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubag
     Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped))
 }
 
-/// 执行模型通过 `task` 工具发起的同步子代理。普通工具调用可使用完整硬超时预算（当前 10 分钟）；
-/// 仅 driver 的显式命令可选择在硬超时前请求子代理收口。
+/// Runs a synchronous sub-agent requested by the model through the `task` tool. Ordinary tool
+/// calls may use the full hard-timeout budget (currently 10 minutes); only explicit driver
+/// commands may ask the sub-agent to wrap up before the hard timeout.
 pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
     execute_sync_task_with_hard_timeout(tool_call_id, args, SYNC_TASK_HARD_TIMEOUT)
 }
 
-/// 执行 driver 自己发起的同步子代理，并采用调用方明确选择的硬超时。
+/// Runs a synchronous sub-agent initiated by the driver itself, using the caller-chosen hard
+/// timeout.
 ///
-/// 该入口保持 crate 私有，避免模型工具参数把前台等待时间放大为无界值。
+/// This entry point stays crate-private so model tool arguments cannot inflate the foreground
+/// wait time into an unbounded value.
 pub(super) fn execute_sync_task_with_hard_timeout(
     tool_call_id: &str,
     args: &Value,
@@ -160,16 +167,17 @@ pub(super) fn execute_sync_task_with_hard_timeout(
     execute_sync_task_with_pre_timeout_wrap_up(tool_call_id, args, hard_timeout, None)
 }
 
-/// 与普通同步 `task` 相同，但允许显式命令在硬超时前预留一段时间，请子代理
-/// 停止扩展调查并基于现有证据收口。该参数不暴露给模型工具调用。
+/// Same as a normal synchronous `task`, but allows explicit commands to reserve some time before
+/// the hard timeout so the sub-agent can stop expanding its investigation and wrap up based on
+/// the evidence at hand. This parameter is not exposed to model tool calls.
 pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     tool_call_id: &str,
     args: &Value,
     hard_timeout: Duration,
     wrap_up_lead_time: Option<Duration>,
 ) -> Result<ToolResult, String> {
-    // 递归深度守卫：防止 mode:all 的 heavy agent 通过同步 `task`
-    // 无限嵌套委派。与 `spawn_subagent_kernel_task` 中的检查保持一致。
+    // Recursion depth guard: prevents a mode:all heavy agent from delegating through synchronous
+    // `task` into unbounded nesting. Consistent with the check in `spawn_subagent_kernel_task`.
     let parent_depth = runtime_ctx::current_subagent_depth();
     let child_depth = parent_depth + 1;
     if child_depth > task_tools::MAX_SUBAGENT_SPAWN_DEPTH {
@@ -187,16 +195,20 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     })?;
 
     let mut task_app = ctx.app_proto.clone();
-    // 驱动内部分派可选参数（模型调用的 task 工具 schema 不含这两个字段，不会命中）：
-    // - `image_files`：把图片直接附加到子代理首条 user 消息，让 VL 模型第一轮就看到
-    //   图，省掉「先 read_file、再在下一轮重复附加 base64」的冗余往返；
-    // - `reasoning_effort`：压低纯转录等简单子任务的思考档位（如图片解析用 minimal）。
+    // Driver-internal dispatch options (the task tool schema seen by model calls has neither
+    // field, so they never match):
+    // - `image_files`: attaches images directly to the sub-agent's first user message so a VL
+    //   model sees them in the first round, avoiding the redundant read_file-then-re-attach
+    //   base64 round trip;
+    // - `reasoning_effort`: lowers the reasoning level for simple sub-tasks such as pure
+    //   transcription (e.g. minimal for image parsing).
     if let Some(images) = args.get("image_files").and_then(|v| v.as_array()) {
         task_app.attached_image_files = images
             .iter()
             .filter_map(|v| v.as_str())
-            // build_content 用原始路径 fs::read，不解析 cwd；把相对路径按 effective_cwd
-            // 转绝对，与原 read_file 流程的解析语义保持一致，避免 CWD 错位打不开图。
+            // build_content reads with fs::read on the raw path without resolving cwd; resolve
+            // relative paths to absolute under effective_cwd to match the original read_file
+            // resolution semantics, so a CWD mismatch cannot leave images unreadable.
             .map(|s| {
                 let p = std::path::Path::new(s);
                 if p.is_absolute() {
@@ -218,10 +230,11 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     {
         task_app.cli.reasoning_effort_override = Some(Some(level));
     }
-    // 关键：子 agent 不再与父 agent 共享 shutdown/streaming/cancel_stream 标志。
-    // 共享会让一次针对子 agent 的 Ctrl+C 误置全局 shutdown、连带关掉主 agent
-    // （子 agent 卡在静默 prepare 阶段、streaming=false 时尤甚）。给它一组全新的
-    // 私有标志：定向取消只翻子 agent 自己的 cancel，父 agent 安然存活。
+    // Key: the sub-agent no longer shares shutdown/streaming/cancel_stream flags with the parent.
+    // Sharing would let a single Ctrl+C aimed at the sub-agent flip the global shutdown and take
+    // down the main agent too (worst when the sub-agent is stuck in the silent prepare phase with
+    // streaming=false). Give it a fresh set of private flags: targeted cancel only flips the
+    // sub-agent's own cancel, and the parent survives intact.
     let subagent_shutdown = Arc::new(AtomicBool::new(false));
     let subagent_streaming = Arc::new(AtomicBool::new(false));
     let subagent_cancel = Arc::new(AtomicBool::new(false));
@@ -252,12 +265,14 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     } else {
         runtime_ctx::make_subagent_cwd(&scratch_base, &task_id)
     };
-    // 硬超时前由父进程置位，guard Drop 时保留子代理历史（改名而非删除）。
+    // Set by the parent before a hard timeout; on guard Drop the sub-agent history is preserved
+    // (renamed, not deleted).
     let preserve_history_on_timeout = Arc::new(AtomicBool::new(false));
     let history_cleanup =
         SyncSubagentHistoryGuard::new(child_history.clone(), preserve_history_on_timeout.clone())
             .with_scoped_artifacts(private_memory_path.clone(), private_cwd_dir.clone());
-    // 无论是否继承，子代理都只写自己的历史文件，绝不能写回父 canonical history。
+    // Whether or not history is inherited, the sub-agent only writes its own history file and
+    // must never write back to the parent's canonical history.
     task_app.session_history_file = child_history.clone();
     let _ = crate::ai::driver::commands::session::restore_prune_marks_for_history(&mut task_app);
 
@@ -315,9 +330,10 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         task_agent_manifests_for_spawn.clone(),
     );
 
-    // 等待循环监听 **子 agent 自己** 的 shutdown/cancel 标志（而非父 agent 的）。
-    // 第一次 Ctrl+C 经 ForegroundSubagentGuard 定向翻 `subagent_cancel`，唤醒
-    // 等待循环、把子 agent 取消掉，父 agent 不受影响。
+    // The wait loop listens to the **sub-agent's own** shutdown/cancel flags (not the parent's).
+    // The first Ctrl+C goes through ForegroundSubagentGuard to flip `subagent_cancel` in a
+    // targeted way, waking the wait loop and cancelling the sub-agent while the parent is
+    // unaffected.
     let wait_shutdown = subagent_shutdown.clone();
     let wait_cancel = subagent_cancel.clone();
     // Slot used by the sub-agent's `finalize_turn` to publish its final
@@ -376,7 +392,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
 
     let mut memory_merge = None;
     if let Some(mem_path) = private_memory_path {
-        // sub-agent 默认私有 memory：merge 白名单条目回主文件
+        // Sub-agent memory is private by default: merge whitelisted entries back into the main file
         let main_path = persona_memory_path;
         let private_for_merge = mem_path.clone();
         wrapped = Box::pin(runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped));
@@ -411,19 +427,20 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     };
     let subagent_handle = tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, guarded));
 
-    // 把子 agent 的私有 cancel 标志登记到前台子 agent 注册表：Ctrl+C 时
-    // SIGINT 处理器会优先定向取消栈顶子 agent（翻这个标志），而不是关掉主 agent。
-    // guard 在本函数返回时自动注销，绝不泄漏陈旧条目。
+    // Register the sub-agent's private cancel flag in the foreground sub-agent registry: on
+    // Ctrl+C the SIGINT handler preferentially cancels the top-of-stack sub-agent (by flipping
+    // this flag) instead of shutting down the main agent. The guard unregisters automatically
+    // when this function returns, so stale entries never leak.
     let _foreground_guard =
         crate::ai::driver::signal::ForegroundSubagentGuard::register(subagent_cancel.clone());
 
-    // 等待 sub-agent：只由三个事件驱动，不再 50ms 轮询。
-    //   1. sub-agent oneshot 返回；
-    //   2. 子 agent 的 cancel/shutdown 通过 REQUEST_INTERRUPT_NOTIFY 唤醒；
-    //   3. hard timeout 到期。
+    // Wait for the sub-agent, driven only by three events (no more 50ms polling):
+    //   1. the sub-agent oneshot returns;
+    //   2. the sub-agent's cancel/shutdown wakes us via REQUEST_INTERRUPT_NOTIFY;
+    //   3. the hard timeout expires.
     //
-    // atomic flag 只作为条件判断，不作为唤醒机制；正常写入 cancel/shutdown 的入口
-    // 必须调用 signal_request_interrupt()/request_shutdown() 发送 Notify。
+    // The atomic flag is only a condition check, not a wake-up mechanism; every normal path that
+    // writes cancel/shutdown must call signal_request_interrupt()/request_shutdown() to send Notify.
     let join_result: Result<Result<(), String>, String> = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(wait_for_sync_task_completion_with_wrap_up(
             rx,
@@ -438,19 +455,22 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     });
     if join_result.is_err() {
         subagent_cancel.store(true, Ordering::Release);
-        // 硬超时：先置位让 guard Drop 保留历史（改名而非删除），再 abort。
+        // Hard timeout: set the flag first so guard Drop preserves the history (rename instead
+        // of delete), then abort.
         preserve_history_on_timeout.store(true, Ordering::Release);
         subagent_handle.abort();
     }
-    // `abort` 只发出取消请求；必须等任务真正退出后才能删除仍可能被它写入的 DB。
+    // `abort` only sends a cancel request; the DB, which the task may still be writing to, must
+    // not be deleted until the task has actually exited.
     let _ =
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(subagent_handle));
 
     let duration = started.elapsed();
     let elapsed_secs = duration.as_secs_f64();
 
-    // 硬超时：guard 已把子代理历史改名保留，这里提取超时前的工作产物发布到 result slot，
-    // 避免 10 分钟工作全部丢失（此前超时只返回空结果）。
+    // Hard timeout: the guard has already renamed the sub-agent history aside; here we extract
+    // the pre-timeout work product and publish it to the result slot, so 10 minutes of work is
+    // not lost (previously the timeout path only returned an empty result).
     if let Err(timeout_error) = &join_result {
         let timeout_phase = phase_slot
             .lock()
@@ -552,8 +572,9 @@ async fn wait_for_sync_task_completion_with_wrap_up(
     wrap_up_lead_time: Option<Duration>,
     wrap_up_signal: Option<runtime_ctx::SubagentWrapUpSignal>,
 ) -> Result<Result<(), String>, String> {
-    // 心跳只在交互式 TTY 下显示：它用 `\r` + 清行做单行原地刷新，管道/重定向
-    // 场景下这些控制序列会污染输出，所以非 TTY 直接关闭。
+    // The heartbeat is shown only on an interactive TTY: it uses `\r` + line clearing for
+    // single-line in-place refresh, and those control sequences would pollute output when piped
+    // or redirected, so non-TTY is disabled entirely.
     let show_heartbeat = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let wait_for_result = async {
         let mut wrap_up_deadline = wrap_up_lead_time.zip(wrap_up_signal).map(|(lead, signal)| {
@@ -565,8 +586,9 @@ async fn wait_for_sync_task_completion_with_wrap_up(
         let interrupt_notify = crate::ai::driver::signal::request_interrupt_notify();
         let mut heartbeat = tokio::time::interval(SUBAGENT_HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // interval 的第一次 tick 立即就绪，先吃掉它，让首个心跳延后一个间隔出现，
-        // 避免 subagent 很快就出首包时还闪一下心跳。
+        // The first tick of the interval is ready immediately; consume it first so the first
+        // heartbeat appears one interval later, avoiding a flicker when the subagent emits its
+        // first packet quickly.
         heartbeat.tick().await;
         let mut heartbeat_visible = false;
         loop {
@@ -579,8 +601,8 @@ async fn wait_for_sync_task_completion_with_wrap_up(
                 return Err("subagent task aborted: stream cancel requested".to_string());
             }
 
-            // 先注册 Notify future，再复查 atomic，避免 signal 在检查和
-            // 注册之间发生时丢唤醒。
+            // Register the Notify future before re-checking the atomic, so a signal arriving
+            // between the check and the registration cannot be lost.
             let notified = interrupt_notify.notified();
             if parent_shutdown.load(Ordering::Relaxed) || parent_cancel.load(Ordering::Relaxed) {
                 continue;
@@ -630,9 +652,10 @@ async fn wait_for_sync_task_completion_with_wrap_up(
     }
 }
 
-/// 硬超时后把子代理已写入历史的工作产物提取出来，发布到 result slot。
-/// 父代理随后在失败结果里能看到超时前的证据节选与保留文件路径，而不是空结果
-/// （此前超时路径把 10 分钟的工作产物全部丢弃）。
+/// After a hard timeout, extracts the work product the sub-agent already wrote to its history
+/// and publishes it to the result slot. The parent then sees a pre-timeout evidence excerpt and
+/// the preserved file path in the failure result instead of an empty one (the previous timeout
+/// path discarded all 10 minutes of work).
 fn publish_timeout_evidence(
     child_history: &Path,
     result_slot: &runtime_ctx::SubagentResultSlot,
@@ -640,8 +663,9 @@ fn publish_timeout_evidence(
     phase: &str,
 ) {
     let preserved = history::preserved_subagent_history_path(child_history);
-    // 读取最近消息（含工具输出）作为可恢复证据；读取失败也必须发布结构化诊断，
-    // 不能让硬超时退化成没有任何上下文的空结果。
+    // Read the recent messages (including tool output) as recoverable evidence; even a read
+    // failure must still publish a structured diagnosis so the hard timeout never degrades into
+    // an empty result with no context.
     let (excerpt, extraction_error) = if preserved.exists() {
         match history::build_message_arr(TIMEOUT_RECOVERY_TAIL_MESSAGES, &preserved) {
             Ok(messages) => (
@@ -700,8 +724,10 @@ fn format_timeout_recovery_payload(
     )
 }
 
-/// 构造最多占一个终端物理行的 subagent 心跳。长路径、计划等阶段详情必须按当前
-/// 终端宽度截断，否则终端自动折行后，下一次 `\r` 只能覆盖最后一行，旧状态会逐次累积。
+/// Builds a subagent heartbeat that occupies at most one physical terminal line. Long paths,
+/// plan and other phase details must be truncated to the current terminal width, otherwise the
+/// terminal auto-wraps and the next `\r` can only overwrite the last line, so stale state
+/// accumulates over time.
 fn render_heartbeat_line(elapsed: Duration, phase: &str) -> String {
     let secs = elapsed.as_secs();
     let phase = phase.trim();
@@ -713,8 +739,9 @@ fn render_heartbeat_line(elapsed: Duration, phase: &str) -> String {
     crate::ai::stream::clamp_line_to_terminal_row_with_reserve(&line, 0)
 }
 
-/// 原地刷新一行 subagent 运行心跳（不换行）。用 `\r` 回到行首 + `\x1b[2K`
-/// 清整行，保证多次心跳只占同一行；暗色显示以免喧宾夺主。
+/// Refreshes a single subagent heartbeat line in place (no newline). Uses `\r` to return to the
+/// line start plus `\x1b[2K` to clear the whole line, so repeated heartbeats occupy the same
+/// line; rendered dim so it does not distract.
 fn print_heartbeat_line(elapsed: Duration, phase: &str) {
     use std::io::Write;
     let line = render_heartbeat_line(elapsed, phase);
@@ -722,8 +749,9 @@ fn print_heartbeat_line(elapsed: Duration, phase: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// 清除当前心跳行（如果有）。在 subagent 开始输出 / 任务结束 / 被取消时调用，
-/// 确保心跳不残留、也不会和后续真实输出粘在同一行。
+/// Clears the current heartbeat line (if any). Called when the subagent starts emitting output,
+/// when the task ends, or when it is cancelled, ensuring the heartbeat never lingers or sticks
+/// to the same line as later real output.
 fn clear_heartbeat_line(show_heartbeat: bool, heartbeat_visible: &mut bool) {
     if show_heartbeat && *heartbeat_visible {
         use std::io::Write;

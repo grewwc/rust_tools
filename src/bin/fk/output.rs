@@ -92,9 +92,9 @@ mod tests {
 
     #[test]
     fn test_highlight_ranges_utf8_boundary() {
-        // "创建消息" — each CJK char is 3 bytes. "创" is bytes 0..3, "建" is 3..6, etc.
+        // The first two CJK characters are each 3 bytes: bytes 0..3 and 3..6, etc.
         let s = "创建消息到 aeolus_ada_messages, 返回 message_id";
-        // Range ending mid-char (byte 42 is inside '返' at bytes 41..44)
+        // Range ending mid-char (byte 42 is inside a CJK character spanning bytes 41..44)
         let out = highlight_ranges(s, vec![(0, 42)]);
         assert!(!out.is_empty());
     }

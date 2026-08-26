@@ -1,8 +1,8 @@
 use super::{LearningNoteAssessment, ReflectionQuality};
 
-/// 共享的显式知识保存质量评估。
+/// Shared quality assessment for explicit knowledge saves.
 ///
-/// 该评估只在用户或模型显式调用知识工具时运行，不会主动读取或召回知识库。
+/// This assessment only runs when the user or the model explicitly calls the knowledge tool; it never proactively reads or recalls the knowledge base.
 pub(crate) fn assess_learning_note_quality(note: &str) -> LearningNoteAssessment {
     let features = LearningNoteQualityFeatures::from_note(note);
     let actionable = features.directive_signals > 0

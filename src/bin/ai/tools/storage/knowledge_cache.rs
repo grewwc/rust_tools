@@ -7,69 +7,70 @@ use crate::ai::tools::storage::knowledge_types::{
 };
 use crate::commonw::utils::get_config_dir;
 
-/// 会话级知识缓存管理
+/// Session-level knowledge cache management
 ///
-/// 用于管理易变知识（如项目结构、代码内容）的缓存和过期检测
+/// Manages caching and expiry detection for volatile knowledge, such as
+/// project structure and code content.
 ///
-/// 策略：
-/// 1. 项目结构/代码信息 → 会话级缓存，30 分钟过期
-/// 2. 编码规范/用户偏好 → 长期记忆，不过期
-/// 3. 每次会话开始时检查缓存是否过期
-/// 4. 如果过期，重新检索并更新缓存
+/// Strategy:
+/// 1. Project structure / code info -> session-level cache, 30-minute expiry
+/// 2. Coding guidelines / user preferences -> long-term memory, never expires
+/// 3. At the start of each session, check whether the cache has expired
+/// 4. If expired, re-fetch and update the cache
 use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// 缓存的知识条目
+/// A cached knowledge entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedKnowledge {
-    /// 知识内容
+    /// Knowledge content
     pub content: String,
-    /// 缓存时间戳
+    /// Cache timestamp
     pub cached_at: u64,
-    /// 过期时间（秒）
+    /// Expiry time (seconds)
     pub ttl_seconds: u64,
-    /// 知识类型（旧版，保留兼容）
+    /// Knowledge type (legacy, kept for compatibility)
     pub knowledge_type: KnowledgeType,
-    /// 关联的上下文（如项目路径、文件列表等）
+    /// Associated context (such as project path, file list, etc.)
     pub context: SkipMap<String, String>,
-    /// 文件指纹（用于检测实际变化，仅 FileBased 类型）
+    /// File fingerprint (for detecting actual changes; FileBased types only)
     pub fingerprint: Option<KnowledgeFingerprint>,
-    /// 知识元数据（新版，包含验证策略）
+    /// Knowledge metadata (new version, includes the validation strategy)
     pub metadata: Option<KnowledgeMetadata>,
 }
 
-/// 知识类型
+/// Knowledge type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum KnowledgeType {
-    /// 项目结构（易变）
+    /// Project structure (volatile)
     ProjectStructure,
-    /// 代码内容（易变）
+    /// Code content (volatile)
     CodeContent,
-    /// 项目配置（中等变化）
+    /// Project configuration (moderate change frequency)
     ProjectConfig,
-    /// 编码规范（稳定）
+    /// Coding guideline (stable)
     CodingGuideline,
-    /// 用户偏好（稳定）
+    /// User preference (stable)
     UserPreference,
-    /// 其他
+    /// Other
     Other,
 }
 
 impl KnowledgeType {
-    /// 获取默认 TTL（秒）
+    /// Returns the default TTL (seconds)
     pub fn default_ttl(&self) -> u64 {
         match self {
-            KnowledgeType::ProjectStructure => 1800,    // 30 分钟
-            KnowledgeType::CodeContent => 1800,         // 30 分钟
-            KnowledgeType::ProjectConfig => 3600,       // 60 分钟
-            KnowledgeType::CodingGuideline => u64::MAX, // 永久
-            KnowledgeType::UserPreference => u64::MAX,  // 永久
-            KnowledgeType::Other => 3600,               // 默认 60 分钟
+            KnowledgeType::ProjectStructure => 1800,    // 30 minutes
+            KnowledgeType::CodeContent => 1800,         // 30 minutes
+            KnowledgeType::ProjectConfig => 3600,       // 60 minutes
+            KnowledgeType::CodingGuideline => u64::MAX, // permanent
+            KnowledgeType::UserPreference => u64::MAX,  // permanent
+            KnowledgeType::Other => 3600,               // default 60 minutes
         }
     }
 
-    /// 从分类字符串推断知识类型
+    /// Infers the knowledge type from a category string
     pub fn from_category(category: &str) -> Self {
         match category.to_lowercase().as_str() {
             "project_structure" | "project_info" => KnowledgeType::ProjectStructure,
@@ -82,7 +83,7 @@ impl KnowledgeType {
     }
 }
 
-/// 将新知识类型转换为旧知识类型（兼容层）
+/// Converts the new knowledge type to the legacy knowledge type (compatibility layer)
 fn convert_knowledge_type(new_type: &NewKnowledgeType) -> KnowledgeType {
     match new_type {
         NewKnowledgeType::FileBased => KnowledgeType::ProjectStructure,
@@ -95,7 +96,8 @@ fn convert_knowledge_type(new_type: &NewKnowledgeType) -> KnowledgeType {
 }
 
 impl CachedKnowledge {
-    /// 创建新的缓存知识（基础版本，不带指纹和元数据）
+    /// Creates a new cached knowledge entry (basic version, without fingerprint
+    /// or metadata)
     pub fn new(
         content: String,
         knowledge_type: KnowledgeType,
@@ -116,7 +118,7 @@ impl CachedKnowledge {
         }
     }
 
-    /// 创建带指纹的缓存知识（适用于 FileBased 类型）
+    /// Creates a cached knowledge entry with a fingerprint (for FileBased types)
     pub fn new_with_fingerprint(
         content: String,
         knowledge_type: KnowledgeType,
@@ -138,7 +140,8 @@ impl CachedKnowledge {
         }
     }
 
-    /// 创建带元数据的缓存知识（推荐，支持所有验证策略）
+    /// Creates a cached knowledge entry with metadata (recommended; supports
+    /// all validation strategies)
     pub fn new_with_metadata(
         content: String,
         metadata: KnowledgeMetadata,
@@ -156,7 +159,7 @@ impl CachedKnowledge {
         }
     }
 
-    /// 检查是否过期（仅基于时间）
+    /// Checks whether the entry has expired (time-based only)
     pub fn is_expired(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -164,18 +167,18 @@ impl CachedKnowledge {
             .as_secs();
 
         if self.ttl_seconds == u64::MAX {
-            return false; // 永不过期
+            return false; // never expires
         }
 
         now > self.cached_at + self.ttl_seconds
     }
 
-    /// 检查指纹是否有效（检测实际文件变化）
+    /// Checks whether the fingerprint is still valid (detects actual file changes)
     pub fn verify_fingerprint(&self) -> FingerprintVerificationResult {
         if let Some(ref fp) = self.fingerprint {
             fp.verify()
         } else {
-            // 没有指纹，假设有效
+            // No fingerprint; assume valid
             FingerprintVerificationResult {
                 is_valid: true,
                 changed_files: Vec::new(),
@@ -186,12 +189,14 @@ impl CachedKnowledge {
         }
     }
 
-    /// 检查是否需要刷新（综合所有验证策略）
+    /// Checks whether a refresh is needed (combining all validation strategies)
     pub fn needs_refresh(&self) -> bool {
-        // 新版元数据验证优先，其次再结合 TTL / 指纹做补充
+        // The new metadata validation takes precedence, with TTL / fingerprint
+        // as supplementary checks.
         if let Some(ref metadata) = self.metadata {
             match &metadata.validation {
-                // 指纹类：必须校验指纹是否仍然匹配，或 TTL 到期
+                // Fingerprint-based: the fingerprint must still match, or the
+                // TTL must have expired.
                 ValidationStrategy::Fingerprint { .. } => {
                     if self.is_expired() {
                         return true;
@@ -203,7 +208,8 @@ impl CachedKnowledge {
                         .unwrap_or(true);
                     return !fp_ok;
                 }
-                // 时间范围/外部检查/会话绑定/无校验：依赖元数据判定，同时允许 TTL 作为兜底
+                // Time range / external check / session bound / no validation:
+                // rely on the metadata decision, with TTL as a fallback.
                 _ => {
                     if !metadata.is_valid() {
                         return true;
@@ -213,7 +219,7 @@ impl CachedKnowledge {
             }
         }
 
-        // 兼容旧版：仅基于 TTL 与指纹
+        // Legacy compatibility: TTL and fingerprint only
         if self.is_expired() {
             return true;
         }
@@ -226,7 +232,7 @@ impl CachedKnowledge {
         false
     }
 
-    /// 执行验证并返回详细结果
+    /// Runs validation and returns the detailed result
     pub fn validate(&self) -> ValidationResult {
         if let Some(ref metadata) = self.metadata {
             let is_valid = metadata.is_valid();
@@ -345,7 +351,7 @@ impl CachedKnowledge {
                 suggestion,
             }
         } else {
-            // 旧版验证逻辑
+            // Legacy validation logic
             let is_valid = !self.needs_refresh();
             ValidationResult {
                 is_valid,
@@ -360,7 +366,7 @@ impl CachedKnowledge {
         }
     }
 
-    /// 获取剩余生存时间（秒）
+    /// Returns the remaining time to live (seconds)
     pub fn ttl_remaining(&self) -> u64 {
         if self.ttl_seconds == u64::MAX {
             return u64::MAX;
@@ -376,16 +382,16 @@ impl CachedKnowledge {
     }
 }
 
-/// 会话知识缓存管理器
+/// Session knowledge cache manager
 pub struct SessionKnowledgeCache {
-    /// 缓存的知识
+    /// Cached knowledge
     cache: SkipMap<String, CachedKnowledge>,
-    /// 缓存配置文件路径
+    /// Cache config file path
     cache_file: std::path::PathBuf,
 }
 
 impl SessionKnowledgeCache {
-    /// 创建新的缓存管理器
+    /// Creates a new cache manager
     pub fn new() -> Self {
         let cache_file = get_config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
@@ -398,7 +404,7 @@ impl SessionKnowledgeCache {
         }
     }
 
-    /// 从文件加载缓存
+    /// Loads the cache from file
     pub fn load(&mut self) -> Result<(), String> {
         if !self.cache_file.exists() {
             return Ok(());
@@ -410,13 +416,13 @@ impl SessionKnowledgeCache {
         let cache: SkipMap<String, CachedKnowledge> = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse cache file: {}", e))?;
 
-        // 过滤掉过期的条目
+        // Filter out expired entries
         self.cache = cache.into_iter().filter(|(_, v)| !v.is_expired()).collect();
 
         Ok(())
     }
 
-    /// 保存缓存到文件
+    /// Saves the cache to file
     pub fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.cache_file.parent() {
             std::fs::create_dir_all(parent)
@@ -432,26 +438,26 @@ impl SessionKnowledgeCache {
         Ok(())
     }
 
-    /// 获取缓存的知识
+    /// Gets a cached knowledge entry
     pub fn get(&self, key: &str) -> Option<&CachedKnowledge> {
         self.cache
             .get_ref(&key.to_string())
             .filter(|v| !v.is_expired())
     }
 
-    /// 设置缓存的知识
+    /// Sets a cached knowledge entry
     pub fn set(&mut self, key: String, knowledge: CachedKnowledge) {
         self.cache.insert(key, knowledge);
     }
 
-    /// 清除过期的缓存
+    /// Removes expired cache entries
     pub fn cleanup_expired(&mut self) -> usize {
         let before = self.cache.len();
         self.cache.retain(|_, v| !v.is_expired());
         before - self.cache.len()
     }
 
-    /// 清除所有易变知识的缓存
+    /// Clears all volatile knowledge from the cache
     pub fn clear_volatile(&mut self) {
         self.cache.retain(|_, v| {
             matches!(
@@ -461,15 +467,15 @@ impl SessionKnowledgeCache {
         });
     }
 
-    /// 检查是否需要重新检索某个主题
+    /// Checks whether a topic needs to be re-fetched
     pub fn needs_refresh(&self, key: &str) -> bool {
         match self.get(key) {
-            None => true,                         // 没有缓存，需要检索
-            Some(entry) => entry.needs_refresh(), // 综合判定是否需要刷新
+            None => true,                         // no cache, needs re-fetch
+            Some(entry) => entry.needs_refresh(), // combined refresh decision
         }
     }
 
-    /// 获取缓存统计信息
+    /// Returns cache statistics
     pub fn stats(&self) -> CacheStats {
         let total = self.cache.len();
         let expired = self.cache.values().filter(|v| v.is_expired()).count();
@@ -489,7 +495,7 @@ impl SessionKnowledgeCache {
     }
 }
 
-/// 缓存统计信息
+/// Cache statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheStats {
     pub total: usize,
@@ -504,7 +510,7 @@ impl Default for SessionKnowledgeCache {
     }
 }
 
-/// 生成缓存键
+/// Generates a cache key
 pub fn make_cache_key(topic: &str, context: &SkipMap<String, String>) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -512,7 +518,7 @@ pub fn make_cache_key(topic: &str, context: &SkipMap<String, String>) -> String 
     let mut hasher = DefaultHasher::new();
     topic.hash(&mut hasher);
 
-    // 对 context 排序后哈希，保证一致性
+    // Hash the context after sorting, for consistency
     let mut sorted_context: Vec<_> = context.iter().collect();
     sorted_context.sort_by(|a, b| a.0.cmp(b.0));
     for (k, v) in sorted_context {
@@ -552,7 +558,7 @@ mod tests {
             context,
         );
 
-        // 刚创建，不应该过期
+        // Just created; must not be expired
         assert!(!knowledge.is_expired());
         assert!(knowledge.ttl_remaining() <= 1800);
     }

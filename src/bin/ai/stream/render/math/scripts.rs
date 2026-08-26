@@ -1,4 +1,4 @@
-/// 上标 / 下标 Unicode 转换。
+/// Unicode superscript / subscript conversion.
 use super::structural::read_group_braced;
 
 pub(super) fn apply_super_subscripts(s: &str) -> String {

@@ -1,5 +1,5 @@
-//! `/checkpoint`（别名 `/cp`）交互命令：保存 / 列出 / 回滚 / 删除当前
-//! session 的对话历史检查点。
+//! Interactive `/checkpoint` command (alias `/cp`): save / list / roll back /
+//! delete conversation-history checkpoints for the current session.
 
 use crate::ai::{history::CheckpointStore, types::App};
 

@@ -36,7 +36,8 @@ impl McpServerConnection {
         &mut self.stdin
     }
 
-    /// 终止并回收 MCP 子进程。`Child` 自身的 Drop 不会执行这两步。
+    /// Terminate and reap the MCP child process. `Child`'s own Drop does not do these
+    /// two steps.
     pub(in crate::ai) fn shutdown_and_reap(&mut self) {
         match self.process.try_wait() {
             Ok(Some(_)) => return,

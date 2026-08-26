@@ -14,7 +14,8 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use super::agent_routing::load_skill_manifests;
 use crate::ai::{prompt::completion::CommandCompleter, skills};
 
-/// 连续保存或解压技能包会产生多条事件；只在事件静默一小段时间后重新加载一次。
+/// Saving or extracting a skill package emits many events; reload only once after
+/// the events have been quiet for a short debounce interval.
 const SKILL_WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const SKILL_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SKILL_WATCH_EVENT_QUEUE_SIZE: usize = 64;
@@ -22,14 +23,16 @@ const SKILL_WATCH_EVENT_QUEUE_SIZE: usize = 64;
 type SkillManifestSnapshot = Arc<Vec<skills::SkillManifest>>;
 type LatestSkillManifestSlot = Arc<Mutex<Option<SkillManifestSnapshot>>>;
 
-/// 后台文件监听器。它直接更新补全缓存，并保留最新完整快照供 driver 在安全点接管。
+/// Background file watcher. It updates the completion cache directly and keeps the
+/// latest complete snapshot for the driver to take over at a safe point.
 pub(super) struct SkillManifestWatcher {
     latest_update: LatestSkillManifestSlot,
     shutdown: Arc<AtomicBool>,
 }
 
 impl SkillManifestWatcher {
-    /// 取走最新快照；旧快照已在写入时替换，无需让 driver 逐一应用。
+    /// Take the latest snapshot; older ones are already replaced on write, so the
+    /// driver does not need to apply them one by one.
     pub(super) fn take_latest(&mut self) -> Option<Arc<Vec<skills::SkillManifest>>> {
         take_latest_skill_manifests(&self.latest_update)
     }
@@ -56,7 +59,8 @@ impl Drop for SkillManifestWatcher {
     }
 }
 
-/// 首次技能发现任务。工作线程会等到输入框首帧完成才开始扫描大目录。
+/// Initial skill-discovery task. The worker thread waits until the first input-frame
+/// renders before scanning large directories.
 pub(super) struct InitialSkillManifestLoader {
     prompt_ready_tx: Option<mpsc::Sender<()>>,
     updates: Receiver<Arc<Vec<skills::SkillManifest>>>,
@@ -72,18 +76,21 @@ impl InitialSkillManifestLoader {
     }
 }
 
-/// 在独立线程中完成首次技能发现。
+/// Runs the initial skill discovery on a separate thread.
 ///
-/// 外部技能目录可能很大；工作线程等到交互式首屏已经绘制后才扫描。完整快照会在
-/// 用户提交第一条输入前由 driver 接管；线程完成后立即更新补全缓存，因此用户思考
-/// 期间的 Tab 补全会自然变为完整结果。
+/// External skill directories can be large; the worker thread waits until the
+/// interactive first screen is drawn before scanning. The driver takes over the
+/// complete snapshot before the user submits the first input; the completion cache
+/// is updated as soon as the thread finishes, so Tab completion during the user's
+/// thinking time naturally becomes the full result.
 pub(super) fn spawn_initial_skill_manifest_load() -> Result<InitialSkillManifestLoader, String> {
     let (prompt_ready_tx, prompt_ready_rx) = mpsc::channel();
     let (updates_tx, updates) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("initial-skill-manifest-loader".to_string())
         .spawn(move || {
-            // 先让主线程完成首屏终端渲染，避免大目录扫描与启动期 I/O 竞争。
+            // Let the main thread finish rendering the first screen first, so the
+            // large-directory scan does not compete with startup I/O.
             if prompt_ready_rx.recv().is_err() {
                 return;
             }
@@ -98,7 +105,7 @@ pub(super) fn spawn_initial_skill_manifest_load() -> Result<InitialSkillManifest
     })
 }
 
-/// 启动技能目录监听。`--no-skills` 模式不创建 watcher。
+/// Starts watching the skill directories. `--no-skills` mode does not create a watcher.
 pub(super) fn start_skill_manifest_watcher(
     no_skills: bool,
 ) -> Result<Option<SkillManifestWatcher>, String> {
@@ -111,7 +118,8 @@ pub(super) fn start_skill_manifest_watcher(
     let (event_tx, event_rx) = mpsc::sync_channel(SKILL_WATCH_EVENT_QUEUE_SIZE);
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
         if let Ok(event) = result {
-            // 事件队列满时保留已有事件即可；随后仍会合并为一次 reload。
+            // If the event queue is full, dropping events is fine; they still merge
+            // into a single reload afterwards.
             let _ = event_tx.try_send(event);
         }
     })
@@ -150,7 +158,8 @@ pub(super) fn start_skill_manifest_watcher(
 
 #[allow(clippy::too_many_arguments)]
 fn run_skill_manifest_watcher(
-    // watcher 必须在线程内持有，否则离开 start 函数时会停止接收文件系统事件。
+    // The watcher must be held inside the thread; otherwise it stops receiving
+    // filesystem events once `start` returns.
     _watcher: RecommendedWatcher,
     event_rx: Receiver<Event>,
     latest_update: LatestSkillManifestSlot,

@@ -2,10 +2,12 @@ use serde_json::Value;
 
 /// Mirror an agent_hang_debug event into the AIOS kernel trace ring.
 ///
-/// 这是 Phase 0 trace 下沉的接入点：所有 `agent_hang_debug!` / `agent_hang_span`
-/// 展开后最终都会走到 `report_agent_hang_debug`，在这里镜像一份到
-/// `TraceOps::trace_event`，从而让内核 trace ring 成为所有 span/event 的权威副本。
-/// 后续可以逐步删除 HTTP 上报，改由 kernel ring 消费者统一输出。
+/// This is the integration point for Phase 0 trace sinking: every expansion of
+/// `agent_hang_debug!` / `agent_hang_span` eventually reaches
+/// `report_agent_hang_debug`, which mirrors a copy here into
+/// `TraceOps::trace_event`, making the kernel trace ring the authoritative
+/// copy of all spans/events. The HTTP reporting can later be phased out and
+/// replaced by unified output from kernel ring consumers.
 fn mirror_to_aios_trace(
     run_id: &str,
     hypothesis_id: &str,

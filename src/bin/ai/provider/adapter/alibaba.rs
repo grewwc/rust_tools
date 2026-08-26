@@ -1,9 +1,10 @@
-//! 阿里云百炼（DashScope）compatible-mode 适配器。
+//! Alibaba Bailian (DashScope) compatible-mode adapter.
 //!
-//! 端点：`https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`。
-//! 默认不发送推理强度字段，并接受 `enable_search` 扩展字段。DeepSeek / GLM
-//! 等模型的推理强度 wire 由模型注册表的模型级能力声明覆盖。
-//! 思考开关由 `thinking` 方言模块统一处理，不在此实现。
+//! Endpoint: `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`.
+//! By default no reasoning-effort field is sent, and the `enable_search` extension field
+//! is accepted. Reasoning-effort wire behavior for models such as DeepSeek / GLM is
+//! covered by the model-level capability declarations in the model registry.
+//! The thinking toggle is handled uniformly by the `thinking` dialect module, not here.
 
 use crate::ai::config_schema::AiConfig;
 

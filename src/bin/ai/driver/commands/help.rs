@@ -1,6 +1,6 @@
 use crate::ai::agents::{self, AgentManifest};
 
-/// 统一的交互式命令帮助信息
+/// Unified interactive command help message
 pub fn print_interactive_help() {
     println!("Interactive commands:");
     println!();

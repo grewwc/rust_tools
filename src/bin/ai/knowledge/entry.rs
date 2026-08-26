@@ -5,10 +5,11 @@ use std::path::{Component, Path};
 
 use super::types::Category;
 
-/// 环境本地路径属于一次性实现细节，不应保存为长期知识。
-/// 这里不再靠零散 substring 黑名单，而是：
-/// 1. 从 note 中抽取疑似文件系统路径；
-/// 2. 判断它是否是 home-relative / absolute / windows absolute 路径。
+/// Environment-local paths are one-off implementation details and should not
+/// be saved as long-term knowledge.
+/// Instead of a scattered substring blacklist, this:
+/// 1. Extracts suspected filesystem paths from the note;
+/// 2. Determines whether each is home-relative / absolute / Windows-absolute.
 pub(crate) fn note_has_local_env_path_leak(note: &str) -> bool {
     note.split_whitespace()
         .filter(|token| !is_web_url_token(token))

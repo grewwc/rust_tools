@@ -1,7 +1,10 @@
-//! 面向 **memory / knowledge / RAG 检索** 的相似度库（向量、Jaccard、Dice、Han
-//! 分词）。本模块抽自 `memory_store.rs` / `rag_store.rs` 以消除两份重复实现。
+//! Similarity library for **memory / knowledge / RAG retrieval** (vector,
+//! Jaccard, Dice, Han tokenization). This module was extracted from
+//! `memory_store.rs` / `rag_store.rs` to eliminate two duplicated
+//! implementations.
 //!
-//! 归一化时 **完全删除空格**（适合中文 token 粒度的相似度）。
+//! Normalization **fully removes whitespace** (suitable for similarity at the
+//! granularity of Chinese tokens).
 
 use rustc_hash::{FxHashMap, FxHashSet};
 

@@ -1,16 +1,17 @@
 // =============================================================================
-// /memo 交互命令 —— 把模型结论或指定文本保存到 memo 类型知识库
+// /memo interactive command: save a model conclusion or given text into the
+// memo-type knowledge base
 // =============================================================================
-// 类似 `a -n <text>` 的交互式版本：
-//   /memo              —— 把上一轮 assistant 的正文结论保存为 memo
-//   /memo <text>       —— 把指定文本经模型整理后保存为 memo
+// An interactive counterpart of `a -n <text>`:
+//   /memo              -- save the previous assistant turn's body text as a memo
+//   /memo <text>       -- have the model refine the given text and save it as a memo
 // =============================================================================
 
 use super::status_line::{clear_status, print_status, show_status};
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::types::App;
 
-/// 判断输入是否为 `/memo` 命令；若是则异步执行保存，返回 `Ok(true)`。
+/// Return `Ok(true)` when the input is a `/memo` command and run the save asynchronously.
 pub(crate) async fn try_handle_memo_command(
     app: &mut App,
     input: &str,
@@ -27,7 +28,7 @@ pub(crate) async fn try_handle_memo_command(
         return Ok(false);
     };
 
-    // 只接受精确的 `memo` 或 `memo ` 开头，避免误匹配类似 `/memorial` 这种。
+    // Only accept an exact `memo` or `memo ` prefix to avoid matching things like `/memorial`.
     if !rest.is_empty() && !rest.starts_with(' ') && !rest.starts_with('\t') {
         return Ok(false);
     }
@@ -40,11 +41,11 @@ pub(crate) async fn try_handle_memo_command(
 async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std::error::Error>> {
     let store = MemoryStore::from_env_or_config();
 
-    // 1) 确定要保存的原始文本
+    // 1) Determine the raw text to save
     let raw_text = if !arg.is_empty() {
         arg
     } else {
-        // 无参数：取上一轮 assistant 的结论正文
+        // No argument: take the previous assistant turn's conclusion body
         match last_assistant_conclusion(app)? {
             Some(text) => text,
             None => {
@@ -61,7 +62,7 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
         return Ok(());
     }
 
-    // 2) 调用模型整理内容，使其更适合作为知识库 memo
+    // 2) Have the model tidy up the content so it is more suitable as a knowledge-base memo
     print_status("[memo] 正在整理内容...");
     let model = crate::ai::models::initial_model(&app.cli);
     let messages = vec![
@@ -90,7 +91,7 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
 
     clear_status();
 
-    // 3) 保存到知识库 memo 类别
+    // 3) Save to the memo category in the knowledge base
     let now = chrono::Local::now().to_rfc3339();
     let entry = AgentMemoryEntry {
         id: Some(format!("mem_{}", uuid::Uuid::new_v4().simple())),
@@ -124,7 +125,7 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// 从会话历史中找到最近一条不含 tool_calls 的 assistant 消息正文。
+/// Find the body text of the most recent assistant message without tool_calls in session history.
 fn last_assistant_conclusion(app: &App) -> Result<Option<String>, Box<dyn std::error::Error>> {
     use crate::ai::history;
 
@@ -150,8 +151,8 @@ fn last_assistant_conclusion(app: &App) -> Result<Option<String>, Box<dyn std::e
     }))
 }
 
-/// 从历史消息的 content 字段中提取纯文本。
-/// content 可能是字符串，也可能是内容块数组（多模态）。
+/// Extract plain text from a historical message's content field.
+/// content may be a string or an array of content blocks (multimodal).
 fn searchable_content(content: &serde_json::Value) -> String {
     if let Some(s) = content.as_str() {
         return s.to_string();

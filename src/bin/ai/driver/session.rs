@@ -281,7 +281,7 @@ where
             };
             choice.history_file = entry.history_file.clone();
             choice.session_id = entry.session_id.clone();
-            // 恢复挂起时保存的模型，而非使用默认模型
+            // Restore the model saved at suspension time instead of using the default model.
             choice.model = entry.model.clone();
 
             let remaining = previews.len().saturating_sub(1);

@@ -1,6 +1,7 @@
-//! plan 渲染：与状态模型 / 持久化解耦。`PlanState::render` 是唯一渲染入口
-//! （`plan` / `plan_update` 共用）；委派/并行编排提示文案在 `delegation_guidance`，
-//! 与结构渲染分离。
+//! plan rendering: decoupled from the state model / persistence. `PlanState::render`
+//! is the only rendering entry point (shared by `plan` / `plan_update`); the
+//! delegation/parallel orchestration hints live in `delegation_guidance`, separate from
+//! structural rendering.
 
 use super::model::{PlanState, StepStatus};
 
@@ -18,13 +19,14 @@ impl StepStatus {
 
 impl PlanState {
 
-    /// 渲染完整计划文本（plan / plan_update 共用同一渲染路径）。
+    /// Renders the full plan text (plan / plan_update share the same rendering path).
     ///
-    /// 格式与旧版 `execute_plan` 保持一致；仅在存在非 pending 步骤时追加
-    /// `Progress: x/y steps done` 行与每步状态后缀（含可选 note）。
-    /// `compact_plan_update_echo`（mod.rs）按本函数的行格式提取步骤行/进度行，
-    /// 修改本函数行格式时需同步更新其匹配逻辑（`compact_echo_stays_in_sync_with_render_format`
-    /// 测试会锁定该耦合）。
+    /// The format stays consistent with the legacy `execute_plan`; only when non-pending
+    /// steps exist does it append a `Progress: x/y steps done` line plus a per-step status
+    /// suffix (including an optional note). `compact_plan_update_echo` (mod.rs) extracts
+    /// step/progress lines using this function's line format, so changing this format
+    /// requires updating its matching logic in sync (the
+    /// `compact_echo_stays_in_sync_with_render_format` test locks in that coupling).
     pub(crate) fn render(&self) -> String {
         let total = self.steps.len();
         let done = self.done_count();
@@ -85,14 +87,14 @@ impl PlanState {
         }
         let parallel_delegated = self.steps.iter().filter(|s| s.parallelizable && s.delegate).count();
         let serial_delegated = self.steps.iter().filter(|s| !s.parallelizable && s.delegate).count();
-        // 委派/并行编排提示文案见 `delegation_guidance`（与结构渲染分离）。
+        // Delegation/parallel orchestration hint copy lives in `delegation_guidance` (separate from structural rendering).
         formatted.push_str(&delegation_guidance(delegated, parallel_delegated, serial_delegated));
         formatted.push('\n');
         formatted
     }
 }
 
-/// 汇总进度文案：`2/5 steps done, 1 running, 1 failed.`
+/// Summarizes the progress copy: `2/5 steps done, 1 running, 1 failed.`
 fn progress_summary(done: usize, running: usize, failed: usize, skipped: usize, total: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
     if running > 0 {
@@ -111,13 +113,13 @@ fn progress_summary(done: usize, running: usize, failed: usize, skipped: usize, 
     }
 }
 
-/// 步骤状态 + 可选备注的渲染后缀：`(done)` / `(running, note: xx)` / 空字符串。
+/// Render suffix for a step status plus an optional note: `(done)` / `(running, note: xx)` / empty string.
 fn render_status_suffix(status: StepStatus, note: Option<&str>) -> String {
     let base = status.suffix();
     match note.filter(|n| !n.trim().is_empty()) {
         Some(n) if base.is_empty() => format!(" ({n})"),
         Some(n) => {
-            // note 并入同一对括号：`(running, note: xx)`。
+            // Merge the note into the same pair of parentheses: `(running, note: xx)`.
             let label = base.trim().trim_start_matches('(').trim_end_matches(')');
             format!(" ({label}, note: {n})")
         }
@@ -125,8 +127,9 @@ fn render_status_suffix(status: StepStatus, note: Option<&str>) -> String {
     }
 }
 
-/// 委派/并行编排提示文案（模型可见的操作建议），与计划结构渲染分离。
-/// 仅在存在委派步骤时给出编排建议；无委派时给出"推进但可考虑委派"的提示。
+/// Delegation/parallel orchestration hint copy (operation suggestions visible to the model),
+/// separate from structural plan rendering. Gives orchestration advice only when delegated
+/// steps exist; without delegation, it suggests proceeding but considering delegation.
 fn delegation_guidance(
     delegated: usize,
     parallel_delegated: usize,
@@ -163,7 +166,7 @@ mod tests {
         ]);
         let mut state = PlanState::build("Demo", raw.as_array().unwrap(), None).unwrap();
         let fresh = state.render();
-        // 全新计划：无进度行、无状态后缀。
+        // Fresh plan: no progress line, no status suffixes.
         assert!(fresh.contains("Plan: Demo"));
         assert!(!fresh.contains("Progress:"));
         assert!(fresh.contains("3 step(s) planned."));

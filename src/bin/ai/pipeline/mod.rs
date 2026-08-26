@@ -1,8 +1,9 @@
 // =============================================================================
-// Pipeline - Turn 流水线抽象
+// Pipeline - turn pipeline abstraction
 // =============================================================================
-// 将原来 `driver/turn_runtime/orchestrator.rs` 中 400+ 行的扁平过程拆为
-// 可组合的 Stage 链，每一 Stage 只依赖 `ports::*` 抽象，便于中间件插入。
+// Splits the former 400+ line flat process in `driver/turn_runtime/orchestrator.rs`
+// into a composable chain of Stages, each depending only on the `ports::*`
+// abstractions so middleware can be inserted easily.
 
 pub(crate) mod context;
 pub(crate) mod stage;

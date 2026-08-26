@@ -125,7 +125,7 @@ fn parallel_batch_stops_at_serial_grounding_tool() {
 #[test]
 fn parallel_batch_stops_at_mutating_tool() {
     let mcp = McpClient::new();
-    // write_file / execute_command 带副作用，不可并行，应在其处截断。
+    // write_file / execute_command have side effects and cannot run in parallel; the batch must stop there.
     assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("write_file")));
     assert!(!is_parallel_safe_tool_call(
         &mcp,
@@ -138,7 +138,7 @@ fn parallel_batch_stops_at_mutating_tool() {
 #[test]
 fn parallel_batch_excludes_non_cacheable_tools() {
     let mcp = McpClient::new();
-    // tree 不在只读可复用白名单内，必须顺序执行。
+    // tree is not in the read-only reusable whitelist, so it must run sequentially.
     assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("tree")));
 }
 
@@ -158,7 +158,7 @@ fn parallel_batch_caps_at_max_concurrency() {
 fn parallel_batch_not_formed_for_single_readonly_call() {
     let mcp = McpClient::new();
     let calls = vec![tool_call("knowledge_search"), tool_call("write_file")];
-    // 仅 1 个可并行调用，调用方应回退到顺序路径（batch_len == 1 < 2）。
+    // Only 1 parallel-safe call exists, so the caller falls back to the sequential path (batch_len == 1 < 2).
     assert_eq!(parallel_safe_batch_len(&mcp, &calls), 1);
 }
 

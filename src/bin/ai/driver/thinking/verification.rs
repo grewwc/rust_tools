@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-/// 按字符边界安全截断字符串，避免 `&s[..n]` 在 UTF-8 多字节字符中间 panic。
-/// `max_bytes` 是字节预算上限：截断后不会超过该字节数。
+/// Safely truncate a string at a character boundary, avoiding a panic in `&s[..n]`
+/// in the middle of a UTF-8 multi-byte character.
+/// `max_bytes` is the byte budget upper bound: the truncation never exceeds it.
 pub(super) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
-    // floor_char_boundary 从 max_bytes 向下找到合法字符边界
+    // Walk down from max_bytes to find a valid char boundary
     let mut boundary = max_bytes;
     while boundary > 0 && !s.is_char_boundary(boundary) {
         boundary -= 1;
@@ -274,22 +275,22 @@ mod tests {
 
     #[test]
     fn safe_truncate_handles_utf8_boundary() {
-        // 单个中文 3 字节，6 个中文 = 18 字节
+        // A single CJK char is 3 bytes; 6 CJK chars = 18 bytes
         let s = "中文测试字符";
-        // max_bytes=7 落在第 3 个字符的中间字节，应回退到字符边界
+        // max_bytes=7 lands in the middle byte of the 3rd char; must back off to a boundary
         let out = safe_truncate(s, 7);
         assert!(out.len() <= 7);
         assert!(s.starts_with(out));
-        // 不会 panic 且不会出现非法 UTF-8
+        // Must not panic and must not yield invalid UTF-8
         let _ = out.chars().count();
 
-        // emoji 也不会 panic
+        // Emoji must not panic either
         let emoji = "abc🎉🎉🎉";
         let out = safe_truncate(emoji, 5);
         assert!(out.len() <= 5);
         assert!(emoji.starts_with(out));
 
-        // 字节预算足够时原样返回
+        // Return unchanged when the byte budget is sufficient
         assert_eq!(safe_truncate("hi", 100), "hi");
     }
 

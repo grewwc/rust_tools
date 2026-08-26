@@ -1,50 +1,51 @@
-//! # 算法工具 (Algorithm Tools)
+//! # Algorithm Tools
 //!
-//! 本模块提供常用的算法实现，主要用于在有序数据上进行高效查找。
+//! This module provides common algorithm implementations, primarily for
+//! efficient lookups over sorted data.
 //!
-//! ## 功能概览
+//! ## Overview
 //!
-//! - [`bisect_left`] - 二分查找左边界（第一个大于等于目标值的位置）
-//! - [`bisect_right`] - 二分查找右边界（第一个大于目标值的位置）
+//! - [`bisect_left`] - binary search lower bound (first position >= target)
+//! - [`bisect_right`] - binary search upper bound (first position > target)
 //!
-//! ## 使用示例
+//! ## Usage examples
 //!
-//! ### 基本二分查找
+//! ### Basic binary search
 //!
 //! ```rust
 //! use rust_tools::algow::{bisect_left, bisect_right};
 //!
 //! let arr = [1, 3, 5, 7, 9];
 //!
-//! // 查找元素位置
+//! // Find the element position
 //! let pos = bisect_left(&arr, &5);
 //! assert_eq!(pos, 2);
 //!
-//! // 查找插入位置
+//! // Find the insertion position
 //! let insert_pos = bisect_right(&arr, &6);
 //! assert_eq!(insert_pos, 3);
 //! ```
 //!
-//! ### 处理重复元素
+//! ### Handling duplicate elements
 //!
 //! ```rust
 //! use rust_tools::algow::{bisect_left, bisect_right};
 //!
 //! let arr = [1, 3, 3, 3, 5];
 //!
-//! // 左边界：第一个 3 的位置
+//! // Lower bound: position of the first 3
 //! let left = bisect_left(&arr, &3);
 //! assert_eq!(left, 1);
 //!
-//! // 右边界：最后一个 3 的后一个位置
+//! // Upper bound: position right after the last 3
 //! let right = bisect_right(&arr, &3);
 //! assert_eq!(right, 4);
 //!
-//! // 所有等于 3 的元素范围：[left, right)
+//! // Range of all elements equal to 3: [left, right)
 //! assert_eq!(&arr[left..right], &[3, 3, 3]);
 //! ```
 //!
-//! ### 在字符串切片上使用
+//! ### Working with string slices
 //!
 //! ```rust
 //! use rust_tools::algow::bisect_left;
@@ -54,11 +55,11 @@
 //! assert_eq!(pos, 2);
 //! ```
 //!
-//! ## 性能特征
+//! ## Performance characteristics
 //!
-//! 所有算法的时间复杂度均为 O(log n)，空间复杂度为 O(1)。
+//! All algorithms run in O(log n) time and O(1) space.
 
 pub mod slice;
 
-// 重新导出常用函数
+// Re-export the commonly used functions
 pub use slice::{bisect_left, bisect_right};

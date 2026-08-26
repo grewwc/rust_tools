@@ -142,7 +142,7 @@ impl JsonlStore {
             return Ok(None);
         }
 
-        // 复用 rewrite 的 tmp+rename 原子写路径，避免崩溃后丢失整个文件。
+        // Reuse rewrite's tmp+rename atomic write path so a crash cannot lose the whole file.
         self.rewrite(&entries)?;
 
         Ok(deleted_entry)

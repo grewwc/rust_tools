@@ -1,19 +1,21 @@
-//! ThinkingOrchestrator — 思维引导子系统（生产未注册）。
+//! ThinkingOrchestrator - thinking-guidance subsystem (not registered in production).
 //!
-//! **生产死路径**：`App.observers` 在生产中恒为空（`driver/mod.rs` 中
-//! `observers: Vec::new()`），本模块仅在 `#[cfg(test)]` 下导出、仅被测试
-//! helper 构造。`on_prepare_rich` / `on_finalize` / `on_tool_result` 在生产
-//! 路径中永远不会被调用。
+//! **Production dead path**: `App.observers` is always empty in production (`observers: Vec::new()`
+//! in `driver/mod.rs`), so this module is exported only under `#[cfg(test)]` and constructed only
+//! by test helpers. `on_prepare_rich` / `on_finalize` / `on_tool_result` are never called on the
+//! production path.
 //!
-//! 因此本模块定义的 `<think:begin_*>` / `<think:reset_thinking/>` 标签在
-//! 生产中既不会向模型宣告（`[Thinking Protocol]` 注入不执行），也不会被
-//! 消费（`apply_think_tags` 不执行）。
+//! Consequently, the `<think:begin_*>` / `<think:reset_thinking/>` tags defined here are neither
+//! announced to the model in production (the `[Thinking Protocol]` injection does not run) nor
+//! consumed (`apply_think_tags` does not run).
 //!
-//! 生产中真正生效的隐藏自省通道是 `<meta:self_note>` / `<context_checkpoint>`，
-//! 由 `stream/extract.rs` 解析、`record_hidden_self_note` 落盘——与本模块无关。
-//! 本模块的标签使用 `think:` 前缀正是为了与此区分。
+//! The hidden introspection channel that actually works in production is
+//! `<meta:self_note>` / `<context_checkpoint>`, parsed by `stream/extract.rs` and persisted via
+//! `record_hidden_self_note` - unrelated to this module. The `think:` prefix used by this module's
+//! tags exists precisely to distinguish them from that channel.
 //!
-//! 待 JSON 控制协议与主回答解耦后再显式接回（见 `driver/mod.rs` 注释）。
+//! To be explicitly re-wired once the JSON control protocol is decoupled from the main answer
+//! (see the comment in `driver/mod.rs`).
 use rust_tools::cw::SkipSet;
 
 use crate::ai::driver::observer::{
@@ -160,7 +162,8 @@ impl ThinkingOrchestrator {
             }
         }
 
-        // 工具结果只更新当前 turn 的 thinking 状态，不写入长期经验或自动泛化。
+        // Tool results only update this turn's thinking state; they are not written to long-term
+        // experience or auto-generalized.
     }
 
     pub fn complete_verification_cycle(&mut self, outcome: VerificationOutcome) {
@@ -309,12 +312,12 @@ impl ThinkingOrchestrator {
         }
     }
 
-    /// 构造一段精简的 Working Memory 文本，注入下一轮 Fact 段。
-    /// 内容仅包含真正"跨 turn 还需要被 LLM 看到"的状态：
-    ///   - 当前 active goal（描述 + 下一步可执行的 sub-goal 列表）
-    ///   - 当前激活的 thinking 模式
-    ///   - 推理树当前节点 ID（如有）
-    /// 任一项都没有时返回 None，避免在 prompt 里塞空段。
+    /// Builds a concise Working Memory snippet to inject into the next turn's Fact block.
+    /// It contains only the state that genuinely needs to survive across turns for the LLM:
+    ///   - The current active goal (description + a list of next executable sub-goals)
+    ///   - The currently active thinking mode
+    ///   - The current node ID in the reasoning tree (if any)
+    /// Returns None when none of these are present, avoiding empty blocks in the prompt.
     fn build_working_memory_section(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
 
@@ -356,12 +359,13 @@ impl ThinkingOrchestrator {
         }
     }
 
-    // ── P3: 上下文预算感知的委派提醒 ──────────────────────────────
+    // -- P3: context-budget-aware delegation reminder -----------------------------
     //
-    // 当对话已经很长（turn_index 超过阈值）且 agent 拥有 task 工具时，
-    // 注入一条提醒：把剩余聚焦、有界的子步骤（串行或并行皆可）委派给 subagent，
-    // 换取干净子上下文，避免主 agent 上下文继续膨胀导致注意力分散和 token 浪费，
-    // 但不要把当前未解决分支整块丢给子代理逃避压力。
+    // When the conversation is already long (turn_index above the threshold) and the agent has
+    // task tools, inject a reminder: delegate the remaining focused, bounded sub-steps (serial or
+    // parallel) to subagents to get clean sub-contexts, keeping the main agent's context from
+    // bloating into distraction and token waste - but don't dump the entire unresolved branch
+    // onto a subagent to escape the pressure.
     const CONTEXT_BUDGET_TURN_THRESHOLD: usize = 12;
 
     fn build_context_budget_nudge(
@@ -552,9 +556,9 @@ impl TurnObserver for ThinkingOrchestrator {
             }
         }
 
-        // Working Memory：把 active goal + 最近一个推理节点 ID + 当前激活模式
-        // 作为一个 Fact 段注入下一轮 system prompt，这样 LLM 在 turn 间不必
-        // 重新猜"我之前在做什么"。仅在确实有内容时注入，避免空段。
+        // Working Memory: inject the active goal + the most recent reasoning node ID + the
+        // currently active mode as a Fact block into the next system prompt, so the LLM does not
+        // have to re-guess "what was I doing" between turns. Injected only when there is content.
         if let Some(working_memory) = self.build_working_memory_section() {
             sections.push((
                 SectionKind::Fact,
@@ -563,7 +567,8 @@ impl TurnObserver for ThinkingOrchestrator {
             ));
         }
 
-        // P3: 上下文预算感知 -- 当对话轮次超过阈值时，提醒模型委派剩余独立子任务。
+        // P3: context-budget awareness -- when the turn count exceeds the threshold, remind the
+        // model to delegate remaining independent sub-tasks.
         if !self.context_budget_nudge_injected {
             if let Some(nudge) =
                 self.build_context_budget_nudge(ctx.turn_index, &ctx.available_tool_names)
@@ -588,10 +593,12 @@ impl TurnObserver for ThinkingOrchestrator {
         // because the LLM emits them in its reply, not in the user question.
         self.apply_think_tags(&ctx.final_text);
 
-        // 防死循环：思维子系统（验证/思维树/目标分解）的 on_finalize 不解析 LLM 的 JSON 回复，
-        // 因此 advance_step / add_branch / decompose_active 从未被调用，工作流永久卡在初始状态。
-        // 这里通过 stagnation_turns 计数器跟踪连续未进展的轮次，超过阈值后自动重置，
-        // 防止每轮重复注入同一 prompt 浪费 token。
+        // Deadlock guard: the thinking subsystem (validation / thought tree / goal decomposition)
+        // on_finalize does not parse the LLM's JSON reply, so advance_step / add_branch /
+        // decompose_active are never invoked and the workflow would stay stuck in its initial
+        // state. A stagnation_turns counter tracks consecutive turns without progress and resets
+        // after exceeding the threshold, preventing repeated injection of the same prompt from
+        // wasting tokens.
         const MAX_STAGNATION_TURNS: usize = 3;
         if !self.active_modes.is_empty() {
             self.stagnation_turns += 1;
@@ -752,21 +759,23 @@ mod tests {
         assert!(orch.goal_manager.active_goal().is_none());
     }
 
-    // ── P3 单元测试 ──────────────────────────────────────────
+    // -- P3 unit tests --------------------------------------------------------------
 
     #[test]
     fn context_budget_nudge_only_after_threshold() {
         let orch = ThinkingOrchestrator::new();
         let tools = vec!["task".to_string(), "task_spawn".to_string()];
-        // 低于阈值 → 不注入
+        // Below threshold -> not injected
         assert!(orch.build_context_budget_nudge(5, &tools).is_none());
-        // 达到阈值且拥有 task_spawn → 注入；串行/并行子步骤都可委派，但不得整块甩锅。
+        // Threshold reached and task_spawn available -> injected; serial/parallel sub-steps may
+        // be delegated, but not the whole branch.
         let nudge = orch.build_context_budget_nudge(15, &tools).unwrap();
         assert!(nudge.contains("context isolation is a valid benefit"));
         assert!(nudge.contains("Use task for one focused investigation"));
         assert!(nudge.contains("Delegate those sub-parts one at a time"));
         assert!(nudge.contains("do not hand off the current unresolved branch"));
-        // 只有同步 task 时也应提醒；两个委派工具都没有时才不注入。
+        // Remind even when only the sync task tool exists; inject nothing only when neither
+        // delegation tool is present.
         let task_only = vec!["task".to_string()];
         assert!(
             orch.build_context_budget_nudge(15, &task_only)

@@ -58,7 +58,7 @@ Prefer an existing focused test before running one.
 ## Global Engineering Rules
 
 1. **Module boundaries**: `pub(super)` / `pub(crate)`.
-2. **Chinese comments** to match surrounding style.
+2. **English comments**: code comments are written in English (repo-wide Chinese-comment migration).
 3. **Collections**: `rustc-hash` FxHashMap/FxHashSet via re-exports.
 4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
 5. **AI tools**: schema in `tools/registry/`, logic in `tools/service/`.

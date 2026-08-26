@@ -32,8 +32,8 @@ fn terminal_preview_policy(tool_name: &str) -> ToolTerminalPreviewPolicy {
 }
 
 pub(super) fn truncate_chars(content: &str, max_chars: usize) -> String {
-    // 单次扫描：避免先 count() 再 enumerate() 两次 O(n)。take(max_chars) 之后
-    // 再 next() 探测是否还有剩余字符——有则补省略号。
+    // Single pass: avoid the two O(n) scans of count() then enumerate(). After
+    // take(max_chars), probe with next() for remaining chars — if any, append an ellipsis.
     let mut iter = content.chars();
     let mut out = String::new();
     for _ in 0..max_chars {

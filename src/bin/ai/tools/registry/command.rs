@@ -24,9 +24,11 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// 命令退出状态与编译/测试诊断是 agent 后续修复的直接证据。压缩时必须先落到
-// session asset 并留下回读路径，不能把失败日志降级为首行或仅一个 exit code。
-// 旧日志仍可由模型主动标记为过时后裁剪，因此这不会让会话上下文单调增长。
+// The command exit status and compile/test diagnostics are direct evidence the agent
+// uses when fixing issues later. When compressing, the full output must first be written
+// to a session asset with a read-back path; failure logs must not be degraded to just the
+// first line or a bare exit code. Old logs can still be pruned once the model explicitly
+// marks them stale, so this does not make the session context grow monotonically.
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "execute_command",
     policy: ToolHistoryPolicy {
@@ -36,9 +38,10 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
-// execute_command 只有在命令可证明只读（白名单程序 / 只读 git 子命令）时才登记为
-// 同轮可复用快照；变更型命令被 read_only_tool_signature 的只读闸门拦截，仍真实执行
-// 并失效既有读快照。
+// execute_command is only registered as a same-turn reusable snapshot when the command
+// is provably read-only (whitelisted programs / read-only git subcommands); mutating
+// commands are caught by read_only_tool_signature's read-only gate, still really execute,
+// and invalidate any existing read snapshot.
 inventory::submit!(ToolReplayRegistration {
     name: "execute_command",
 });

@@ -56,7 +56,8 @@ pub(super) fn has_pending_foreground_process(app: &App) -> bool {
 
 
 /// Loads all agents fresh from disk, enabling hot-reload of newly added/modified agents.
-/// 发生变化时返回待展示消息，由前台 driver 在结束动态状态行后统一输出。
+/// Returns a message to show when something changed; the foreground driver
+/// prints it after clearing the dynamic status line.
 pub(super) fn reload_agent_manifests(
     agent_manifests: &mut Arc<Vec<AgentManifest>>,
 ) -> Option<String> {
@@ -86,7 +87,8 @@ pub(super) fn reload_agent_manifests(
     Some(message)
 }
 
-/// 基于 manifest 关键字段计算稳定指纹，用于检测增删改三类变更。
+/// Computes a stable fingerprint from the key manifest fields, used to detect
+/// added, removed, and modified agents.
 pub(super) fn agent_manifests_fingerprint(agents: &[AgentManifest]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut entries: Vec<&AgentManifest> = agents.iter().collect();
@@ -160,7 +162,8 @@ pub(super) fn ensure_runtime_manifests_loaded(
     );
 }
 
-/// 安装已在后台发现的技能快照，避免交互式首屏等待磁盘扫描完成。
+/// Installs the skill snapshot already discovered in the background, avoiding
+/// an interactive first-screen wait for the disk scan to finish.
 pub(super) fn install_runtime_manifests(
     app: &mut App,
     skill_manifests: &mut Arc<Vec<SkillManifest>>,

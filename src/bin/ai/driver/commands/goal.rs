@@ -2,7 +2,8 @@ use colored::Colorize;
 
 use crate::ai::types::App;
 
-/// 构造 goal 模式的初始 prompt——把用户的目标包装成一条明确的、带有持续执行指令的 user message。
+/// Builds the initial goal-mode prompt: wraps the user's goal into an explicit
+/// user message with instructions to keep executing.
 pub(crate) fn build_goal_prompt(goal: &str) -> String {
     format!(
         "你正在 GOAL MODE 下工作。这是一个长期自主任务，目标是：\n\
@@ -16,7 +17,8 @@ pub(crate) fn build_goal_prompt(goal: &str) -> String {
     )
 }
 
-/// 构造 goal 模式的后续 continuation prompt——在上一轮结束后自动注入，驱动 agent 继续推进。
+/// Builds the goal-mode continuation prompt, injected automatically after the
+/// previous turn to drive the agent forward.
 pub(crate) fn build_goal_continuation_prompt(goal: &str) -> String {
     format!(
         "[GOAL MODE - 继续] 你的目标是：{goal}\n\
@@ -27,12 +29,15 @@ pub(crate) fn build_goal_continuation_prompt(goal: &str) -> String {
     )
 }
 
-/// goal 模式在「本轮未触发 continuation」时的收尾决策。
+/// End-of-turn decision for goal mode when no continuation was triggered this turn.
 ///
-/// run_loop 每轮开始时，若 goal 已设定且上一轮调用过工具，会注入 continuation
-/// prompt 继续推进（不进入本函数）。否则由本函数判定：上一轮无工具调用意味着
-/// 要么 agent 已交付最终结果（目标达成），要么本轮被 Ctrl+C 打断。二者都会把
-/// `had_tool_calls` 置 false，但语义相反——打断不代表达成，必须保留 goal 模式。
+/// At the start of each `run_loop` iteration, if a goal is set and the previous
+/// turn called tools, a continuation prompt is injected to keep going (this
+/// function is not reached). Otherwise this function decides: no tool calls in
+/// the previous turn means either the agent delivered its final result (goal
+/// achieved) or the turn was interrupted by Ctrl+C. Both set `had_tool_calls`
+/// to false, but their meaning is opposite: an interruption is not an
+/// achievement, so goal mode must be preserved.
 pub(crate) fn should_exit_goal_on_idle(
     goal_active: bool,
     one_shot_mode: bool,
@@ -41,13 +46,14 @@ pub(crate) fn should_exit_goal_on_idle(
     goal_active && !one_shot_mode && !interrupted
 }
 
-/// 处理 `/goal` 交互式命令。
+/// Handles the `/goal` interactive command.
 ///
-/// 用法：
-/// - `/goal`            — 进入 goal 等待状态，下一条用户输入将被作为目标
-/// - `/goal <内容>`      — 直接以 `<内容>` 为目标进入 goal 模式
-/// - `/goal exit`       — 退出 goal 模式（`/goal off`、`/goal stop` 同义）
-/// - `/goal status`     — 查看当前 goal 模式状态
+/// Usage:
+/// - `/goal`            -- enter the goal waiting state; the next user input
+///                         becomes the goal
+/// - `/goal <content>`  -- enter goal mode directly with `<content>` as the goal
+/// - `/goal exit`       -- exit goal mode (`/goal off`, `/goal stop` are synonyms)
+/// - `/goal status`     -- show the current goal mode state
 pub fn try_handle_goal_command(
     app: &mut App,
     input: &str,
@@ -59,7 +65,7 @@ pub fn try_handle_goal_command(
 
     let rest = trimmed["/goal".len()..].trim();
 
-    // /goal status — 查看状态
+    // /goal status -- show the state
     if rest.eq_ignore_ascii_case("status") {
         match &app.goal_mode {
             None => println!("Goal mode: {}", "off".dimmed()),
@@ -71,7 +77,7 @@ pub fn try_handle_goal_command(
         return Ok(true);
     }
 
-    // /goal exit / off / stop — 退出 goal 模式
+    // /goal exit / off / stop -- exit goal mode
     if rest.eq_ignore_ascii_case("exit")
         || rest.eq_ignore_ascii_case("off")
         || rest.eq_ignore_ascii_case("stop")
@@ -86,7 +92,7 @@ pub fn try_handle_goal_command(
         return Ok(true);
     }
 
-    // /goal <内容> — 直接设定目标并进入 goal 模式
+    // /goal <content> -- set the goal directly and enter goal mode
     if !rest.is_empty() {
         app.goal_mode = Some(rest.to_string());
         let prompt = build_goal_prompt(rest);
@@ -99,9 +105,9 @@ pub fn try_handle_goal_command(
         return Ok(true);
     }
 
-    // /goal — 进入等待状态，下一条输入作为目标
+    // /goal -- enter the waiting state; the next input becomes the goal
     if app.goal_mode.is_some() {
-        // 已在 goal 模式中，再次输入 /goal 无操作（避免覆盖已有目标）
+        // Already in goal mode; a bare /goal is a no-op (avoids overwriting the goal)
         println!(
             "{} Goal mode is already active. Use '/goal exit' to stop or '/goal status' to check.",
             "[goal]".yellow()
@@ -257,13 +263,13 @@ mod tests {
 
     #[test]
     fn idle_goal_exits_only_on_natural_completion() {
-        // 自然完成（未打断）→ 退出 goal 模式并提示。
+        // Natural completion (not interrupted) -> exit goal mode and notify.
         assert!(should_exit_goal_on_idle(true, false, false));
-        // 被 Ctrl+C 打断 → 保留 goal 模式，不误报达成。
+        // Interrupted by Ctrl+C -> keep goal mode; do not report a false completion.
         assert!(!should_exit_goal_on_idle(true, false, true));
-        // goal 未激活 → 无操作。
+        // Goal not active -> no-op.
         assert!(!should_exit_goal_on_idle(false, false, false));
-        // one-shot 模式 → 不管理 goal 生命周期。
+        // One-shot mode -> do not manage the goal lifecycle.
         assert!(!should_exit_goal_on_idle(true, true, false));
     }
 }

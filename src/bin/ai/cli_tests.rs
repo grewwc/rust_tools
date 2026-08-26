@@ -89,7 +89,7 @@ fn parse_cli_args_reads_resume_flag() {
 
 #[test]
 fn parse_cli_args_reads_background_flag() {
-    // 长格式 --background
+    // Long form --background
     let cli = super::parse_cli_args(
         [
             "a".to_string(),
@@ -101,7 +101,7 @@ fn parse_cli_args_reads_background_flag() {
     assert!(cli.background);
     assert_eq!(cli.args, vec!["fix the bug".to_string()]);
 
-    // 短别名 -bg
+    // Short alias -bg
     let cli = super::parse_cli_args(
         [
             "a".to_string(),
@@ -113,7 +113,7 @@ fn parse_cli_args_reads_background_flag() {
     assert!(cli.background);
     assert_eq!(cli.args, vec!["fix the bug".to_string()]);
 
-    // 不带 -bg 时默认 false
+    // Defaults to false when -bg is not given
     let cli = super::parse_cli_args(["a".to_string(), "fix the bug".to_string()].into_iter());
     assert!(!cli.background);
 }
@@ -126,7 +126,7 @@ fn parse_cli_args_reads_stop_flag() {
     );
     assert_eq!(cli.stop_session, Some("abc-123".to_string()));
 
-    // 不带 --stop 时默认为 None
+    // Defaults to None when --stop is not given
     let cli = super::parse_cli_args(["a".to_string()].into_iter());
     assert!(cli.stop_session.is_none());
 }

@@ -164,8 +164,8 @@ fn scan_dir_blocking(
     for entry in entries.flatten() {
         let p = entry.path();
         if p.is_dir() {
-            // 跳过 .git / target / node_modules 等巨型目录，避免全量递归
-            // 根目录自身不经过此检查，用户可显式传 path="target" 搜索其内部
+            // Skip huge directories such as .git / target / node_modules to avoid a full recursive walk.
+            // The root directory itself does not go through this check, so the user can explicitly pass path="target" to search inside it.
             let name = entry.file_name();
             if !rust_tools::commonw::is_skip_dir(&name.to_string_lossy()) {
                 subdirs.push(p);

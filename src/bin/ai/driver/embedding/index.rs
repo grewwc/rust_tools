@@ -12,17 +12,17 @@ use super::document::{SkillEmbeddingDocument, SkillEmbeddingDocumentSection};
 const SKILL_ROUTING_CATEGORY: &str = "skill-routing";
 const QUERY_EMBEDDING_CACHE_LIMIT: usize = 32;
 
-/// 短词条 query embedding 缓存：skill_match / 本地 skill 排序会频繁复用。
-/// 用项目自带的 cw::LruCache（FxHashMap O(1) 查询 + 双向链表 O(1) 淘汰），
-/// 替代之前 Vec 线性扫描 + remove(0) 双 O(n) 实现。
-/// Value 用 Arc 避免命中时 clone 整个 f32 向量。
+/// Cache for short-query embeddings: skill_match / local skill ranking reuse them often.
+/// Uses the project's cw::LruCache (FxHashMap for O(1) lookups + doubly-linked list for
+/// O(1) eviction) instead of the previous Vec linear scan + remove(0), both O(n).
+/// Values are wrapped in Arc so a hit never clones the whole f32 vector.
 static QUERY_EMBEDDING_CACHE: LazyLock<Mutex<LruCache<String, Arc<Vec<f32>>>>> =
     LazyLock::new(|| Mutex::new(LruCache::new(QUERY_EMBEDDING_CACHE_LIMIT)));
 
-/// 同时缓存最近若干 skills_hash 对应的 VectorStore + snapshot。
-/// 单槽缓存在 user 来回切 agent（每个 agent 暴露不同 skill 子集）时会
-/// thrash：一旦 hash 变了就要重建 SQLite + embedding。改为小型 LRU
-/// 后，常用的 4 套 skill 子集都能命中而无需重建。
+/// Also caches the VectorStore + snapshot for the most recent skills_hash values.
+/// A single-slot cache thrashes when the user switches between agents (each agent
+/// exposes a different skill subset): any hash change forces a rebuild of SQLite +
+/// embedding. With a small LRU, the usual skill subsets all hit without rebuilding.
 const CACHED_INDEX_CAPACITY: usize = 4;
 
 #[derive(Clone)]

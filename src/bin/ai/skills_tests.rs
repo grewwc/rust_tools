@@ -284,7 +284,7 @@ fn skill_watch_roots_exclude_builtin_skills_and_include_existing_skill_container
 
 #[test]
 fn load_skills_from_dir_supports_collection_directory() {
-    // feishu 式集合：collection/skills/<pkg>/SKILL.md，无根 manifest。
+    // Feishu-style collection: collection/skills/<pkg>/SKILL.md, with no root manifest.
     let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));
     let collection = dir.join("feishu");
     for (pkg, desc) in [("lark-base", "base skill"), ("lark-im", "im skill")] {
@@ -319,7 +319,8 @@ fn load_skills_from_dir_supports_collection_directory() {
 
 #[test]
 fn load_skills_from_dir_single_package_dir_does_not_descend() {
-    // 单包目录内若有 references/*.skill 资源，不能被误判为额外 skill。
+    // A references/*.skill resource inside a single-package directory must not be
+    // misdetected as an extra skill.
     let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));
     let package_dir = dir.join("argos-tools");
     std::fs::create_dir_all(package_dir.join("reference")).unwrap();

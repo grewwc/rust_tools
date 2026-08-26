@@ -93,7 +93,7 @@ pub(in crate::ai) struct OcrImageSummary {
     pub(in crate::ai) error: Option<String>,
 }
 
-/// 对附加图片执行 OCR，并返回可拼接进 prompt 的 Markdown 内容。
+/// Runs OCR on the attached images and returns Markdown content that can be spliced into the prompt.
 /// 返回格式: "<!-- OCR_IMAGE: filename -->\nocr_text\n<!-- /OCR_IMAGE -->"
 pub fn ocr_images_for_attached_input(
     mcp_client: &SharedMcpClient,
@@ -174,9 +174,11 @@ fn attached_image_parse_route(vl_model: &str) -> AttachedImageParseRoute {
     }
 }
 
-/// 非 VL 模型收到附带图片时，优先派发固定使用 VL 模型的同步 subagent；系统没有
-/// 可用 VL 模型时改走静态 OCR，避免把图片附件降级成纯文本文件名。
-/// 返回的 OcrExtraction 复用 precomputed_ocr 注入管线，把解析结果喂给主 agent。
+/// When a non-VL model receives attached images, prefer dispatching a synchronous
+/// subagent pinned to a VL model; fall back to static OCR when no VL model is available,
+/// so image attachments are not degraded to plain-text filenames.
+/// The returned OcrExtraction reuses the precomputed_ocr injection pipeline to feed the
+/// parsed result to the main agent.
 const IMAGE_PARSE_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 pub(in crate::ai) async fn parse_attached_images_via_subagent(
@@ -187,8 +189,9 @@ pub(in crate::ai) async fn parse_attached_images_via_subagent(
         return Ok(None);
     }
 
-    // 固定用系统配置的默认 VL 模型，图片通过 image_files 参数直接附加到子代理首条
-    // user 消息，第一轮就能直接"看到"图，省掉 read_file 的冗余往返。
+    // Always use the system-configured default VL model; images are attached directly to the
+    // subagent's first user message via the image_files argument, so the model can "see" the
+    // images on the first round, avoiding a redundant read_file round-trip.
     let vl_model = crate::ai::models::default_vl_model();
     if attached_image_parse_route(&vl_model) == AttachedImageParseRoute::Ocr {
         return match ocr_images_for_attached_input(mcp_client, image_files) {
@@ -229,16 +232,19 @@ pub(in crate::ai) async fn parse_attached_images_via_subagent(
         "prompt": prompt,
         "agent": "build",
         "model": vl_model,
-        // 把图片文件显式交给子代理：VL 模型第一轮直接看到图，避免先 read_file、
-        // 再在下一轮重复附加 base64 的冗余往返（省一轮模型请求 + 一次重复传图）。
+        // Hand the image files explicitly to the subagent: the VL model sees the images on the
+        // first round, avoiding the redundant read_file-then-reattach-base64 round-trip (saving one
+        // model request plus one duplicate image transfer).
         "image_files": image_files,
-        // 纯转录任务不需要 high 思考链，压到 minimal 档加速解析。
+        // A pure transcription task does not need a high reasoning chain; drop to minimal to speed up parsing.
         "reasoning_effort": "minimal",
     });
 
-    // 与 /audit 相同：同步派发一个 subagent 解析图片，等它完成后再回到主 agent。
-    // 失败时不静默返回 None（否则主 agent 既无图片内容也无失败提示，只能凭空猜），
-    // 而是构造带 error 标记的占位 OcrExtraction，让 prepare 阶段注入可见提示。
+    // Same as /audit: dispatch a synchronous subagent to parse the images, wait for it to
+    // finish, then return to the main agent. On failure do not silently return None (otherwise
+    // the main agent would have neither image content nor a failure hint and could only guess),
+    // but build a placeholder OcrExtraction marked with error so the prepare stage injects a
+    // visible notice.
     let result = match crate::ai::driver::tools::execute_direct_subagent_task(
         "subagent-image-parse",
         &args,
@@ -282,8 +288,9 @@ pub(in crate::ai) async fn parse_attached_images_via_subagent(
     }))
 }
 
-/// 构造图片解析失败的占位结果：每张图标记 error，content 为可见的失败提示，
-/// 使主 agent 至少能看到图片解析失败而不是静默丢失图片内容。
+/// Builds a placeholder result for image-parse failure: every image is marked with error and
+/// content carries a visible failure notice, so the main agent at least sees that parsing
+/// failed instead of silently losing the image content.
 fn failed_image_parse_extraction(image_files: &[String], reason: &str) -> OcrExtraction {
     let file_names: Vec<String> = image_files
         .iter()
@@ -310,16 +317,17 @@ fn failed_image_parse_extraction(image_files: &[String], reason: &str) -> OcrExt
     }
 }
 
-/// 从同步 subagent 的渲染结果中剥离 [task_id=...] / [Task: ...] 状态头与
-/// 尾部提醒，只保留 subagent 的最终解析文本。
+/// Strips the [task_id=...] / [Task: ...] status headers and the trailing reminder from a
+/// synchronous subagent's rendered output, keeping only the subagent's final parsed text.
 fn extract_subagent_output_text(content: &str) -> String {
     let reminder = crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER;
     let mut text = content.to_string();
     if let Some(pos) = text.find(reminder) {
         text.truncate(pos);
     }
-    // 显式按前缀剥离确定性包装行（[task_id=...] 状态头、agent/model 选择说明、
-    // 错误行、空输出占位），而不是无条件 skip(1)，避免非 subagent 渲染内容被误删首行。
+    // Explicitly strip deterministic wrapper lines by prefix ([task_id=...] status header,
+    // agent/model selection notes, error lines, empty-output placeholder) instead of an
+    // unconditional skip(1), so a non-subagent rendered first line is not deleted by mistake.
     text.lines()
         .skip_while(|line| line.starts_with("[task_id="))
         .skip_while(|line| {
@@ -406,8 +414,9 @@ mod tests {
 
     #[test]
     fn returns_empty_text_for_placeholder_only_output() {
-        // 生产路径：subagent 无最终文本时 format_subagent_output 会 push 占位符行，
-        // 该行与 agent_reason/model_reason 一样属于确定性包装，不应作为图片内容注入主 agent。
+        // Production path: when the subagent has no final text, format_subagent_output pushes a
+        // placeholder line; like agent_reason/model_reason it is deterministic wrapper output and
+        // must not be injected into the main agent as image content.
         let rendered = format!(
             "[task_id=42]\n\
              [Task: 解析附带图片 via build @ some-vl] COMPLETED after 3.2s\n\
@@ -422,8 +431,9 @@ mod tests {
 
     #[test]
     fn failed_image_parse_extraction_marks_every_image_and_exposes_reason() {
-        // P1-a 回归：subagent 派发失败 / 空文本时必须返回带 error 的占位结果，
-        // 而不是静默 Ok(None)，prepare 阶段才能注入 [IMAGE PARSE FAILED: ...] 提示。
+        // P1-a regression: on subagent dispatch failure / empty text we must return a placeholder
+        // marked with error instead of silently Ok(None), so the prepare stage can inject the
+        // [IMAGE PARSE FAILED: ...] notice.
         let files = vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()];
         let ocr = failed_image_parse_extraction(&files, "subagent 超时");
 
@@ -435,7 +445,7 @@ mod tests {
             assert_eq!(img.extracted_chars, 0);
             assert_eq!(img.error.as_deref(), Some("subagent 超时"));
         }
-        // 失败占位不可作为可用 OCR 文本消费（has_usable_text 为 false）。
+        // A failure placeholder must not be consumed as usable OCR text (has_usable_text is false).
         assert!(!ocr.has_usable_text());
     }
 }

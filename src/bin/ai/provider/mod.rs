@@ -44,15 +44,15 @@ pub(super) enum ModelQualityTier {
     Flagship,
 }
 
-/// LLM 推理强度档位。OpenAI / OpenRouter / OpenCode 等协议使用顶层
-/// `reasoning_effort`；DashScope compatible provider 使用嵌套
-/// `reasoning.effort`。
+/// LLM reasoning-effort tiers. Protocols like OpenAI / OpenRouter / OpenCode use a top-level
+/// `reasoning_effort`; the DashScope compatible provider uses a nested
+/// `reasoning.effort`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ReasoningEffort {
-    /// 显式最低档：下发 `reasoning_effort: "none"`。注意与「不下发字段」
-    /// （`override = Some(None)`，服务端默认档位接管）语义不同——`None` 是真正
-    /// 的推理下限。新一代 gpt-5.6 用它取代已被移除的 `minimal`。
+    /// Explicit lowest tier: sends `reasoning_effort: "none"`. Note this differs from "omit the field"
+    /// (`override = Some(None)`, where the server default takes over): `None` is the true
+    /// reasoning floor. The newer gpt-5.6 uses it in place of the removed `minimal`.
     None,
     Minimal,
     Low,
@@ -77,8 +77,8 @@ impl ReasoningEffort {
         }
     }
 
-    /// 解析 CLI / `/model effort` 命令传入的字符串。仅识别五个档位的字面量，
-    /// 大小写不敏感；`off`/`none`/`auto` 等控制语义由调用方自行处理。
+    /// Parses a string from the CLI / `/model effort` command. Only recognizes the five
+    /// tier literals case-insensitively; control semantics like `off`/`none`/`auto` are left to the caller.
     pub(super) fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "minimal" | "min" => Some(Self::Minimal),
@@ -203,65 +203,65 @@ mod tests {
 
     #[test]
     fn reasoning_effort_none_is_explicit_low_bound_not_user_parseable() {
-        // `None` 是显式最低档，下发 `reasoning_effort: "none"`。
+        // `None` is the explicit lowest tier, sending `reasoning_effort: "none"`.
         assert_eq!(ReasoningEffort::None.as_str(), "none");
-        // 但 `"none"` 作为用户/config 输入仍保留「省略字段」的控制语义，
-        // 不映射到 `None` 档位——该档位仅由截断降档阶梯内部使用。
+        // But `"none"` as user/config input keeps the "omit the field" control semantics,
+        // and does not map to the `None` tier, which is only used internally by the truncation downgrade ladder.
         assert_eq!(ReasoningEffort::parse("none"), None);
     }
 
     #[test]
     fn model_def_reasoning_effort_field_optional() {
-        // 不带字段时默认为 None
+        // Defaults to None when the field is absent
         let def: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true}"#,
         )
         .unwrap();
         assert!(def.reasoning_effort.is_none());
 
-        // 带字段时正确反序列化（新名）
+        // Deserializes correctly with the field present (new name)
         let def2: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"high"}"#,
         )
         .unwrap();
         assert_eq!(def2.reasoning_effort, Some(ReasoningEffort::High));
 
-        // xhigh 档位正确反序列化
+        // xhigh tier deserializes correctly
         let def_xhigh: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"xhigh"}"#,
         )
         .unwrap();
         assert_eq!(def_xhigh.reasoning_effort, Some(ReasoningEffort::XHigh));
 
-        // max 作为最高档位正确反序列化
+        // max as the highest tier deserializes correctly
         let def_max: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"max"}"#,
         )
         .unwrap();
         assert_eq!(def_max.reasoning_effort, Some(ReasoningEffort::Max));
 
-        // "auto" 等同于未设置
+        // "auto" is equivalent to unset
         let def3: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"auto"}"#,
         )
         .unwrap();
         assert!(def3.reasoning_effort.is_none());
 
-        // "off" 等同于未设置
+        // "off" is equivalent to unset
         let def4: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"off"}"#,
         )
         .unwrap();
         assert!(def4.reasoning_effort.is_none());
 
-        // 兼容旧的字段名 reasoning_effort
+        // Compatible with the old field name reasoning_effort
         let def5: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"reasoning_effort":"low"}"#,
         )
         .unwrap();
         assert_eq!(def5.reasoning_effort, Some(ReasoningEffort::Low));
 
-        // 非法值会报错
+        // Invalid values error out
         let bad: Result<ModelDef, _> = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"default_reasoning_effort":"bogus"}"#,
         );
@@ -270,21 +270,21 @@ mod tests {
 
     #[test]
     fn model_def_max_output_tokens_field_optional() {
-        // 不带字段时默认为 None，请求不下发 max_tokens（沿用历史行为）。
+        // When the field is absent, defaults to None and the request omits max_tokens (historical behavior).
         let def: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true}"#,
         )
         .unwrap();
         assert!(def.max_output_tokens.is_none());
 
-        // 规范字段名。
+        // Canonical field name.
         let def2: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"max_output_tokens":32768}"#,
         )
         .unwrap();
         assert_eq!(def2.max_output_tokens, Some(32768));
 
-        // 兼容别名 max_tokens / max_completion_tokens。
+        // Compatible aliases: max_tokens / max_completion_tokens.
         let def3: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"max_tokens":16000}"#,
         )

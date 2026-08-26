@@ -1,5 +1,5 @@
 // =============================================================================
-// PipelineContext - 流水线上下文（替代 driver 散传 7+ 参数）
+// PipelineContext - pipeline context (replaces the driver's ad-hoc 7+ parameter passing)
 // =============================================================================
 use crate::ai::{history::Message, types::App};
 
@@ -10,21 +10,22 @@ pub enum StageKind {
     BuildRequest,
     SendRequest,
     ParseStream,
-    /// 请求侧历史解码/流过滤占位（内层压缩 pipeline 用）；与 ParseStream（响应流解析）语义不同，
-    /// 独立 kind 避免与 on_after_stream 的 ParseStream.after 触发点重复。
+    /// Placeholder for request-side history decoding / stream filtering (used by the inner
+    /// compression pipeline); semantically distinct from ParseStream (response stream parsing),
+    /// with its own kind so it does not collide with the ParseStream.after trigger of on_after_stream.
     Decode,
     ExecuteTools,
     Persist,
     Finalize,
 }
 
-/// 在整个 Pipeline 生命周期内共享的可变上下文
+/// Mutable context shared across the entire Pipeline lifecycle
 pub struct PipelineContext<'a> {
     pub app: &'a mut App,
     pub messages: Vec<Message>,
     pub turn_index: usize,
     pub stage: StageKind,
-    /// 中间件可读写标签
+    /// Tags that middleware can read and write
     pub tags: Vec<String>,
 }
 

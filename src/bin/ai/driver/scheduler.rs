@@ -195,7 +195,8 @@ pub(super) fn scheduler_score(
     meta: ProcessDispatchMeta,
     epoch: u64,
 ) -> i64 {
-    // 更高优先级（更小 priority 值）+ 更久未被调度 + 更低失败 streak。
+    // Higher priority (smaller priority value) + longer since last dispatch +
+    // lower failure streak.
     let priority_score = (255u16.saturating_sub(proc.priority as u16) as i64) * 4;
     let quota_score = (proc.quota_turns.min(32) as i64) * 2;
     let age = epoch.saturating_sub(meta.last_dispatch_epoch).min(64) as i64;
@@ -564,7 +565,8 @@ pub(super) fn select_background_batch(
     deferred.append(&mut spill);
 
     let deferred_count = deferred.len();
-    // pop_all_ready 会把进程置 Running；对未执行者需要显式回到 ready。
+    // pop_all_ready puts processes into Running; those not executed must be
+    // explicitly requeued to ready.
     for proc in deferred {
         os.set_current_pid(Some(proc.pid));
         let _ = os.requeue_current();

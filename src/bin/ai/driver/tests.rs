@@ -373,7 +373,7 @@ fn sigint_does_not_suspend_new_empty_session() {
             .is_empty()
     );
 
-    // 显式恢复的会话即使暂时没有用户消息，也应保留原有挂起语义。
+    // A session explicitly resumed keeps its original suspension semantics even if it has no user messages yet.
     app.cli.session = Some(app.session_id.clone());
     assert!(should_suspend_session_on_sigint(&app));
 
@@ -1033,7 +1033,7 @@ fn background_task_disable_skills_uses_empty_skill_set() {
     .expect_err("resume 丢失 child history 时必须失败，不能让 SQLite 静默新建空库");
     assert!(error.contains("不存在"), "unexpected resume error: {error}");
 
-    // 请求继承历史但父会话尚未创建时，首次派发仍要覆盖复用 pid 遗留的 child 库。
+    // When history inheritance is requested but the parent session was never created, the first dispatch still overwrites a stale child DB left over from a reused pid.
     let stale = rusqlite::Connection::open(&process).unwrap();
     stale
         .execute("CREATE TABLE stale_parentless_evidence(value TEXT)", [])

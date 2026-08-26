@@ -1,8 +1,8 @@
-//! 请求协议方言。
+//! Request protocol dialect.
 //!
-//! provider adapter 负责「谁来发、字段长什么样」；而 `/v1/chat/completions`
-//! 与 `/v1/responses` 这种 endpoint 级 wire 差异，则集中在本模块处理，
-//! 避免把协议判断散落在 `transport.rs` / `builder.rs`。
+//! The provider adapter owns "who sends and what fields look like"; endpoint-level wire
+//! differences such as `/v1/chat/completions` vs `/v1/responses` are centralized in this
+//! module, so protocol decisions do not scatter across `transport.rs` / `builder.rs`.
 
 use serde_json::{Value, json};
 
@@ -21,9 +21,10 @@ pub(in crate::ai::request) struct ResponsesReasoningReplayStats {
 }
 
 impl RequestProtocolDialect {
-    /// 序列化请求为 wire 字节。chat-completions 直接 `to_vec` 成体，
-    /// 避免先 `to_value` 深克隆整棵请求再二次序列化（历史/工具 schema
-    /// 越大浪费越明显）；responses 方言仍需先构造 Value 再序列化。
+    /// Serializes the request into wire bytes. chat-completions goes straight through `to_vec`,
+    /// avoiding a `to_value` deep clone of the whole request before a second serialization (the
+    /// waste grows with history/tool schemas); the responses dialect still needs to build a Value
+    /// first, then serialize.
     pub(super) fn build_http_body(self, request: &RequestBody<'_>) -> Vec<u8> {
         match self {
             Self::ChatCompletions => {
@@ -40,7 +41,8 @@ pub(crate) fn build_http_body_for_request(
     endpoint: &str,
     request: &mut RequestBody<'_>,
 ) -> Vec<u8> {
-    // Step 4: provider 差异收敛到 Adapter hook —— 所有请求路径序列化前统一触发。
+    // Step 4: provider differences converge into the Adapter hook -- fired uniformly on every
+    // request path before serialization.
     crate::ai::provider::adapter_for(models::model_adapter(model), endpoint)
         .adapt_request(request);
     models::request_protocol_dialect(model, endpoint).build_http_body(request)
@@ -266,8 +268,8 @@ fn responses_content_items(role: &str, content: &Value) -> Vec<Value> {
     }
 }
 
-/// 过滤掉空文本的 content item：Responses API 会拒绝 `text` 为空串的
-/// `output_text` / `input_text`（返回 400 invalid_value）。
+/// Filters out content items with empty text: the Responses API rejects `output_text` /
+/// `input_text` whose `text` is an empty string (returns 400 invalid_value).
 fn responses_item_is_empty_text(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
@@ -279,11 +281,12 @@ fn responses_item_is_empty_text(item: &Value) -> bool {
 }
 
 fn responses_message_content(message: &Message) -> Vec<Value> {
-    // 注意：不要把 `reasoning_content` 回放成 message content 里的 `summary_text`。
-    // Responses API 的 message content 只接受 `output_text` / `refusal`，塞入
-    // `summary_text` 会 400。推理 summary 属于独立的 `reasoning` output item，
-    // 且回放需要服务端原始 item id / encrypted_content，我们持久化时并未保留，
-    // 因此无法忠实回放——直接不回传，交由本轮 `reasoning` 请求参数重新索取。
+    // Note: do not replay `reasoning_content` as `summary_text` in message content.
+    // The Responses API message content only accepts `output_text` / `refusal`; putting
+    // `summary_text` in causes a 400. Reasoning summaries are a separate `reasoning` output item,
+    // and replay would need the server-side original item id / encrypted_content, which we do not
+    // persist -- so faithful replay is impossible; do not send them back and let this round's
+    // `reasoning` request parameter fetch them anew.
     responses_content_items(&message.role, &message.content)
         .into_iter()
         .filter(|item| !responses_item_is_empty_text(item))
@@ -335,10 +338,11 @@ fn responses_input(
             .as_ref()
             .filter(|calls| !calls.is_empty())
         {
-            // Responses API 的工具回合是扁平 output-item 序列。若本 turn 侧信道
-            // 捕获到了该回合的 reasoning items（以首个 tool_call id 为 key），
-            // 先原样 splice 回去，让模型保留上一跳的推理上下文（encrypted），
-            // 再续上 function_call items。narration 文本仍不单独补发。
+            // A Responses API tool round is a flat sequence of output items. If this turn's
+            // side channel captured that round's reasoning items (keyed by the first tool_call id),
+            // splice them back verbatim so the model keeps the previous hop's reasoning context
+            // (encrypted), then continue with the function_call items. narration text is still not
+            // re-sent separately.
             if let Some(items) = reasoning_items
                 .zip(tool_calls.first())
                 .and_then(|(map, first)| map.get(&first.id))
@@ -396,9 +400,10 @@ pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
         "stream": request.stream,
     });
     let object = body.as_object_mut().expect("responses body is an object");
-    // 加密推理回放：显式索取 `reasoning.encrypted_content`，服务端才会在
-    // `response.output_item.done` 里下发带 encrypted_content 的 reasoning item，
-    // 供同 turn 工具链回放（见 responses_input）。仅对声明了该能力位的模型开启。
+    // Encrypted reasoning replay: only when explicitly requesting `reasoning.encrypted_content`
+    // does the server deliver a reasoning item carrying encrypted_content in
+    // `response.output_item.done`, for replay within the same turn's tool chain (see
+    // responses_input). Enabled only for models that advertise this capability bit.
     if request.reasoning_encrypted_replay {
         object.insert(
             "include".to_string(),
@@ -414,8 +419,9 @@ pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
         object.insert("tool_choice".to_string(), tool_choice.clone());
     }
     if let Some(effort) = request.reasoning_effort {
-        // Responses API 默认不会返回推理文本；显式索取 reasoning summary，
-        // provider 才会发送 response.reasoning_summary_text.* 事件。
+        // The Responses API does not return reasoning text by default; only when explicitly
+        // requesting a reasoning summary does the provider send response.reasoning_summary_text.*
+        // events.
         object.insert(
             "reasoning".to_string(),
             json!({ "effort": effort, "summary": "auto" }),

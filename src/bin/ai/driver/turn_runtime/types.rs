@@ -12,8 +12,9 @@ pub(super) struct LargeToolSummary {
     pub(super) summary: String,
     pub(super) top_level_keys: Vec<String>,
     pub(super) field_samples: Vec<String>,
-    /// 文本内容的结构化关键行（函数/类型定义、错误行等），
-    /// 为首次 overflow stub 提供召回锚点，让模型判断是否需要重新 read_file。
+    /// Structured key lines of the text content (function/type definitions, error lines, etc.),
+    /// providing recall anchors for the first overflow stub so the model can decide
+    /// whether it needs to re-read the file with read_file.
     pub(super) key_lines: Vec<String>,
 }
 
@@ -34,11 +35,13 @@ pub(super) enum IterationExecution {
     Exit(TurnOutcome),
     RequestFailed(String),
     EmptyResponse,
-    /// 本轮响应被截断（服务端 finish_reason=length，或工具调用 arguments JSON
-    /// 不完整被丢弃）。应注入"收缩单次输出"提示后自动重试，而非静默完成。
+    /// The response for this round was truncated (server finish_reason=length, or a tool-call
+    /// arguments JSON was dropped as incomplete). Retry automatically after injecting a
+    /// "shrink a single output" hint, rather than finishing silently.
     Truncated(crate::ai::types::StreamResult),
-    /// 预超时收口信号在模型请求中途触发：放弃当前请求，由 orchestrator 立即
-    /// 进入强制收口（无工具）迭代，而不是等当前迭代自然结束。
+    /// The pre-timeout wrap-up signal fires mid model request: abandon the current request and
+    /// have the orchestrator immediately enter a forced wrap-up (no-tool) iteration instead of
+    /// waiting for the current iteration to end naturally.
     WrapUpFinal,
     FinalResponse(crate::ai::types::StreamResult),
     ToolCall(ToolCallExecution),
@@ -46,8 +49,9 @@ pub(super) enum IterationExecution {
 
 pub(super) enum TurnLoopStep {
     Continue,
-    /// 本轮只执行了 target-scoped instruction preflight，没有产生文件副作用。
-    /// Orchestrator 可为它授予一次不占正常工具迭代预算的重试机会。
+    /// This round only ran the target-scoped instruction preflight and produced no file side
+    /// effects. The orchestrator may grant it one retry that does not count against the normal
+    /// tool-iteration budget.
     ScopedPreflightContinue(Vec<PathBuf>),
     Break,
     Return(TurnOutcome),

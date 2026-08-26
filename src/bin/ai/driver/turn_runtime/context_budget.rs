@@ -154,10 +154,12 @@ pub(super) fn apply_pre_request_context_budget(
             crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
         );
     *messages = compressed;
-    // mid_turn_compress 把压缩状态提示插在最后一个 user 之后（工具循环场景下这是
-    // 当前轮活动区）。但请求边界要求 current user 必须是发送序列的最后一条，故这里
-    // 把该提示前移到 current user 之前：既维持 user 末尾契约，又让模型仍能看到
-    // 「本次用的是压缩投影、勿把可恢复证据误判为上下文已满」（见 CONTEXT_COMPACTION_STATE）。
+    // mid_turn_compress inserts the compaction state note after the last user message (which is
+    // the current round's active region in tool-loop scenarios). But the request boundary requires
+    // the current user message to be the last item in the sent sequence, so here we move that note
+    // before the current user message: this keeps the user-last contract while still letting the
+    // model see "this round uses a compressed projection; do not mistake recoverable evidence for
+    // a full context" (see CONTEXT_COMPACTION_STATE).
     reposition_context_compaction_state_before_last_user(messages);
     report.after_chars = after_chars;
     report.changed = report.changed || after_chars < after_lossless_chars;
@@ -183,10 +185,11 @@ pub(super) fn apply_pre_request_context_budget(
     report
 }
 
-/// mid_turn_compress 会把 `CONTEXT_COMPACTION_STATE` 提示插在最后一个 user
-/// 之后。请求边界要求 current user 必须是发送序列的最后一条，故这里把该提示前移
-/// 到最后一个 user **之前**：既维持 user 末尾契约，又保住提示对模型的可见性。
-/// note 内容原样搬移，不重构文本（单一来源仍在 compress 模块）。
+/// mid_turn_compress inserts the `CONTEXT_COMPACTION_STATE` note after the last user
+/// message. The request boundary requires the current user message to be the last item in the
+/// sent sequence, so here we move the note **before** the last user message: this keeps the
+/// user-last contract while preserving the note's visibility to the model.
+/// The note content is moved verbatim, not rewritten (the single source stays in the compress module).
 fn reposition_context_compaction_state_before_last_user(messages: &mut Vec<Message>) {
     let Some(note_index) = messages
         .iter()
@@ -195,15 +198,15 @@ fn reposition_context_compaction_state_before_last_user(messages: &mut Vec<Messa
         return;
     };
     let Some(last_user_index) = last_real_user_index(messages) else {
-        // 无 user 消息：请求边界契约不适用，保持原样。
+        // No user message: the request-boundary contract does not apply, leave as is.
         return;
     };
-    // 已在最后一个 user 之前，无需移动。
+    // Already before the last user message, no move needed.
     if note_index < last_user_index {
         return;
     }
     let note = messages.remove(note_index);
-    // remove 发生在 last_user_index 之后，last_user_index 不变；插到它之前。
+    // remove happens after last_user_index, so that index is unchanged; insert before it.
     messages.insert(last_user_index, note);
 }
 
@@ -335,8 +338,8 @@ fn fill_segment_summary(report: &mut ContextBudgetReport, messages: &[Message]) 
 }
 
 fn classify_segments(messages: &[Message]) -> Vec<ContextSegment> {
-    // 合成 user 消息不构成轮次边界：真实用户消息必须保持 Critical/Never 保护，
-    // 否则会被降级为 RecentUser 而可被 offload。
+    // Synthetic user messages do not constitute a turn boundary: real user messages must keep
+    // Critical/Never protection, otherwise they would be downgraded to RecentUser and become offloadable.
     let last_user_index = last_real_user_index(messages);
     let precision_tool_ids = precision_tool_call_ids(messages);
     messages
@@ -464,9 +467,9 @@ fn protected_messages_preserved(messages: &[Message], protected: &[ProtectedMess
 }
 
 fn message_chars(message: &Message) -> usize {
-    // 统一走 history 层的权威计费口径（含 content + tool_calls + reasoning_content，
-    // 图片按名义成本），避免此处只算 content 导致带大 tool_calls/reasoning 的消息
-    // 在预算门控里被低估。
+    // Always use the authoritative billing metric from the history layer (content + tool_calls +
+    // reasoning_content, images at nominal cost) so that messages with large tool_calls/reasoning
+    // are not underestimated by this budget gate.
     crate::ai::history::message_billable_chars(message)
 }
 
@@ -634,11 +637,11 @@ mod tests {
 
         let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
 
-        // 实际压缩生效才会注入压缩状态提示。
+        // The compaction state note is only injected when actual compression took effect.
         assert!(report.changed);
-        // current user 仍是发送序列最后一条（请求边界契约）。
+        // The current user message is still the last item in the sent sequence (request-boundary contract).
         assert_eq!(messages.last().unwrap(), &current_user);
-        // 压缩状态提示对模型可见，且被前移到最后一个 user 之前。
+        // The compaction state note stays visible to the model and is moved before the last user message.
         let note_index = messages
             .iter()
             .position(crate::ai::history::compress::is_context_compaction_state)
@@ -724,8 +727,9 @@ mod tests {
                 )
             })
             .collect::<String>();
-        // 大体量 read_file 结果必须位于「最近 6 条工具结果」保护窗之外才会被外溢，
-        // 否则近端窗口会逐字保留（防止刚检索到的内容被卸载导致模型重复检索）。
+        // A large read_file result is only offloaded once it falls outside the "last 6 tool results"
+        // protection window; otherwise the near-end window keeps it verbatim (to prevent the model
+        // from re-searching content that was just retrieved).
         let mut messages = vec![
             msg("system", "system prompt must stay exact"),
             assistant_tool_call("call-1", "read_file"),
@@ -754,14 +758,15 @@ mod tests {
         assert!(!tool_content.contains("tool_output_lines:"));
     }
 
-    /// 回归覆盖两条路径：工具密集历史经常规压缩已达标时，不调用有损 LLM 摘要；
-    /// 只有压缩后仍超阈值的对话密集历史才调用 LLM，并有效缩小上下文。
+    /// Regression covering both paths: tool-dense history that already meets the budget after
+    /// regular compression never triggers the lossy LLM summary; only conversation-dense history
+    /// that still exceeds the threshold after compression calls the LLM and effectively shrinks the context.
     #[tokio::test]
     async fn llm_summary_runs_only_when_post_compression_context_still_exceeds_threshold() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
-        // 1. 本地 mock LLM 服务器：完整读取 Content-Length 后返回 OpenAI 格式响应
+        // 1. Local mock LLM server: read the full Content-Length then return an OpenAI-format response
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -773,7 +778,7 @@ mod tests {
                 match listener.accept() {
                     Ok((mut sock, _)) => {
                         let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-                        // 读请求头
+                        // Read the request headers
                         let mut buf = [0u8; 8192];
                         let mut header = Vec::new();
                         loop {
@@ -786,7 +791,7 @@ mod tests {
                                 break;
                             }
                         }
-                        // 读完整 body（按 Content-Length）
+                        // Read the full body (per Content-Length)
                         let head = String::from_utf8_lossy(&header).to_string();
                         let len: usize = head
                             .lines()
@@ -797,7 +802,7 @@ mod tests {
                                     .and_then(|v| v.trim().parse().ok())
                             })
                             .unwrap_or(0);
-                        // header 中可能已包含部分 body（\r\n\r\n 之后）
+                        // The header may already contain part of the body (after \r\n\r\n)
                         let body_start = header
                             .windows(4)
                             .position(|w| w == b"\r\n\r\n")
@@ -836,7 +841,7 @@ mod tests {
             }
         });
 
-        // 2. app：endpoint 指向 mock；history_max_chars 贴近生产默认
+        // 2. app: endpoint points at the mock; history_max_chars near the production default
         let history_file = std::env::temp_dir().join(format!(
             "llm_summary_repro_{}.jsonl",
             uuid::Uuid::new_v4()
@@ -846,7 +851,7 @@ mod tests {
         app.config.history_max_chars = 90_000;
         app.session_id = format!("llm_summary_repro_{}", uuid::Uuid::new_v4());
 
-        // 3. 工具密集超长会话：常规压缩可以安全降到阈值内，不应再做有损摘要。
+        // 3. Tool-dense, very long session: regular compression can safely stay under the threshold, so no lossy summary should run.
         let mut messages = vec![msg("system", "你是测试助手，请遵循项目规则。")];
         for turn in 0..4 {
             messages.push(msg("user", format!("第 {turn} 轮：请帮我检查代码")));
@@ -868,7 +873,7 @@ mod tests {
             "测试会话应远超 pre-request LLM 阈值，实际 {before}"
         );
 
-        // 4. 先验证常规压缩达标后门控保持关闭，保留精确上下文。
+        // 4. First verify the gate stays closed once regular compression meets the threshold, preserving exact context.
         let mut work = messages.clone();
         let report = apply_pre_request_context_budget(&app, &app.current_model, &mut work);
         let llm_threshold =
@@ -888,8 +893,9 @@ mod tests {
             llm_threshold
         );
 
-        // 5. 大量小段旧 user 消息不能被常规压缩静默删除；压缩后仍超阈值时，
-        //    LLM 摘要作为兜底应真正执行。每段低于 user 原文外溢阈值，确保覆盖该路径。
+        // 5. Many small old user messages cannot be silently dropped by regular compression; when
+        //    the context still exceeds the threshold after compression, the LLM summary fallback
+        //    must actually run. Each segment stays below the user-original offload threshold to cover this path.
         let mut summary_work = vec![msg("system", "你是测试助手，请遵循项目规则。")];
         for turn in 0..220 {
             summary_work.push(msg(

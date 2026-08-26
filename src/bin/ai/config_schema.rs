@@ -56,11 +56,12 @@ impl AiConfig {
     pub const AGENTS_DIR: &str = "ai.agents.dir";
 
     // ── Tool descriptions ──────────────────────────────────
-    /// 用户工具描述覆盖目录（`tool_descriptions/*.json` 同名文件覆盖内置元数据）。
-    /// 优先级低于 `AIO_TOOL_DESCRIPTIONS_DIR` 环境变量，高于
-    /// `~/.config/rust_tools/tool_descriptions/` 与可执行文件同目录的
-    /// `tool_descriptions/`（详见 `tools/registry/tool_metadata.rs` 模块文档）。
-    /// 留空 = 不启用该层覆盖。
+    /// User tool-description override directory (a `tool_descriptions/*.json`
+    /// file with the same name overrides built-in metadata). Lower priority
+    /// than the `AIO_TOOL_DESCRIPTIONS_DIR` environment variable, higher than
+    /// `~/.config/rust_tools/tool_descriptions/` and the `tool_descriptions/`
+    /// directory next to the executable (see the `tools/registry/tool_metadata.rs`
+    /// module docs). Empty = this override layer is disabled.
     pub const TOOL_DESCRIPTIONS_DIR: &str = "ai.tool_descriptions.dir";
 
     // ── Memory ─────────────────────────────────────────────
@@ -76,7 +77,8 @@ impl AiConfig {
     pub const MEMORY_ARCHIVES_MAX_BYTES: &str = "ai.memory.archives.max_bytes";
 
     // ── Response critic ───────────────────────────────────────
-    // 仅对当前回答做内联自检，不读取或召回知识库。
+    // Only performs an inline self-check on the current reply; does not read
+    // or retrieve from the knowledge base.
     pub const CRITIC_REVISE_ENABLE: &str = "ai.critic_revise.enable";
     pub const CRITIC_REVISE_INTEGRATED_ENABLE: &str = "ai.critic_revise.integrated.enable";
 
@@ -133,10 +135,13 @@ impl AiConfig {
     pub const PROMPT_CACHE_SHOW_METRICS: &str = "ai.prompt_cache.show_metrics";
 
     // ── Output ─────────────────────────────────────────────
-    /// Thinking 流式输出在 terminal 中最多保留多少行可见窗口。默认 2：流式过程
-    /// 显示最近 2 行，思考结束时自动折叠为纯摘要，避免 thinking 尾部复述的结论
-    /// 与最终回答在终端重复。设为 0 显示完整实时输出；设为 N 显示最近 N 行。
-    /// 仅影响终端展示，不影响模型上下文。
+    /// Maximum number of visible lines kept for the streaming thinking output
+    /// in the terminal. Default 2: shows the latest 2 lines while streaming
+    /// and auto-collapses to a plain summary when thinking ends, avoiding the
+    /// terminal repeating the conclusion that the thinking tail restates
+    /// alongside the final answer. Set to 0 for full live output; set to N to
+    /// show the latest N lines. Only affects terminal display, not the model
+    /// context.
     pub const OUTPUT_THINKING_MAX_VISIBLE_LINES: &str = "ai.output.thinking.max_visible_lines";
 
     // ── Token usage stats ──────────────────────────────────
@@ -166,12 +171,14 @@ impl AiConfig {
     pub const SCHEDULER_TOKEN_PENALTY_DIVISOR: &str = "ai.scheduler.token_penalty_divisor";
 
     // ── Diff / changes ───────────────────────────────────────
-    /// 外部 diff 编辑器偏好：`code` / `cursor` / `idea` / `git` / `open` / `auto`。
-    /// `auto` 会按优先级探测：code → cursor → idea → open。
+    /// Preferred external diff editor: `code` / `cursor` / `idea` / `git` /
+    /// `open` / `auto`. `auto` probes by priority: code → cursor → idea → open.
     pub const DIFF_EDITOR: &str = "ai.diff.editor";
-    /// 是否在变更视图中附加 git 状态（默认 true，git 仓库外自动忽略）。
+    /// Whether to attach git status in the changes view (default true; ignored
+    /// automatically outside a git repo).
     pub const DIFF_INCLUDE_GIT: &str = "ai.diff.include_git";
-    /// 通过外部编辑器打开 diff 时是否直接传入 patch 文件（true）或按文件的
-    /// `before/after` 临时副本以 `code --diff` 形式打开（false，默认）。
+    /// Whether opening a diff in an external editor passes the patch file
+    /// directly (true) or opens per-file `before/after` temp copies via
+    /// `code --diff` (false, default).
     pub const DIFF_OPEN_PATCH_FILE: &str = "ai.diff.open_patch_file";
 }

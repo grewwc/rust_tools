@@ -27,7 +27,8 @@ impl ReflectionQuality {
     }
 
     fn is_high_quality(&self) -> bool {
-        // 长期沉淀必须满足“可执行 + 可泛化”两条底线。
+        // Long-term retention requires meeting both "actionable" and
+        // "generalizable" baselines.
         self.actionable && self.generalizable
     }
 }

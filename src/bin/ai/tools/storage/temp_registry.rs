@@ -1,33 +1,34 @@
 // =============================================================================
 // Persistent temp-file registry
 // =============================================================================
-// agent 通过 `write_file(temp=true)` 创建的临时文件会在此注册表留下记录。
-// 注册表用于审计跟踪；临时文件在会话结束时由运行时统一清理。
+// Temporary files created by the agent via `write_file(temp=true)` leave a record in this
+// registry. The registry serves audit tracking; temp files are cleaned up by the runtime at
+// session end.
 //
-// 注册表以 JSON 文件持久化在 `<temp_dir>/temp_registry.json`
-// （`temp_dir` 优先为 `~/.history_file.sessions/<session>.assets/tmp/`，
-// 与 tool-overflow 同源，落在项目外；fallback 为系统临时目录），会话终止后重启仍可读取。
+// The registry persists as a JSON file at `<temp_dir>/temp_registry.json` (`temp_dir` prefers
+// `~/.history_file.sessions/<session>.assets/tmp/`, same origin as tool-overflow and outside
+// the project; fallback is the system temp dir), so it survives restarts after a session ends.
 // =============================================================================
 
 use std::path::PathBuf;
 
 use rust_tools::commonw::FastSet;
 
-/// 注册表文件名（相对于 temp_dir）。
+/// Registry file name (relative to temp_dir).
 const REGISTRY_FILENAME: &str = "temp_registry.json";
 
-/// 进程级互斥锁：保证 load-modify-save 操作的原子性。
+/// Process-level mutex guaranteeing atomicity of the load-modify-save operations.
 static REGISTRY_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
-/// 计算注册表文件路径。返回 `(temp_dir, registry_file_path)`。
+/// Computes the registry file paths. Returns `(temp_dir, registry_file_path)`.
 fn registry_paths() -> std::io::Result<(PathBuf, PathBuf)> {
     let temp_dir = crate::ai::driver::runtime_ctx::temp_dir()?;
     let registry_path = temp_dir.join(REGISTRY_FILENAME);
     Ok((temp_dir, registry_path))
 }
 
-/// 从磁盘加载注册表。文件不存在时返回空集合。
+/// Loads the registry from disk. Returns an empty set when the file does not exist.
 fn load_paths(registry_path: &std::path::Path) -> Result<FastSet<String>, String> {
     if !registry_path.exists() {
         return Ok(FastSet::default());
@@ -39,7 +40,7 @@ fn load_paths(registry_path: &std::path::Path) -> Result<FastSet<String>, String
     Ok(paths.into_iter().collect())
 }
 
-/// 将注册表写回磁盘。
+/// Writes the registry back to disk.
 fn save_paths(registry_path: &std::path::Path, paths: &FastSet<String>) -> Result<(), String> {
     if let Some(parent) = registry_path.parent() {
         std::fs::create_dir_all(parent)
@@ -54,8 +55,8 @@ fn save_paths(registry_path: &std::path::Path, paths: &FastSet<String>) -> Resul
     Ok(())
 }
 
-/// 注册一个临时文件路径（应传入解析后的绝对路径）。
-/// 重复注册同一路径是幂等的。
+/// Registers a temp file path (an already-resolved absolute path should be passed in).
+/// Registering the same path twice is idempotent.
 pub(crate) fn register(abs_path: &str) -> Result<(), String> {
     let _guard = REGISTRY_LOCK
         .lock()
@@ -67,7 +68,7 @@ pub(crate) fn register(abs_path: &str) -> Result<(), String> {
     save_paths(&registry_path, &paths)
 }
 
-/// 检查路径是否在注册表中。
+/// Checks whether a path is in the registry.
 pub(crate) fn is_registered(abs_path: &str) -> bool {
     let Ok(_guard) = REGISTRY_LOCK.lock() else {
         return false;
@@ -80,8 +81,8 @@ pub(crate) fn is_registered(abs_path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 从注册表中移除一个路径（删除成功后调用）。
-/// 路径不存在时静默成功。
+/// Removes a path from the registry (call after a successful delete).
+/// Succeeds silently when the path is absent.
 pub(crate) fn unregister(abs_path: &str) -> Result<(), String> {
     let _guard = REGISTRY_LOCK
         .lock()
@@ -93,7 +94,7 @@ pub(crate) fn unregister(abs_path: &str) -> Result<(), String> {
     save_paths(&registry_path, &paths)
 }
 
-/// 列出当前注册的所有路径（供调试 / 审计）。
+/// Lists all currently registered paths (for debugging / audit).
 #[allow(dead_code)]
 pub(crate) fn list_registered() -> Vec<String> {
     let Ok(_guard) = REGISTRY_LOCK.lock() else {
@@ -123,15 +124,15 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
 
         crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
-            // 注册前不存在
+            // Not registered before registering
             assert!(!is_registered("/nonexistent"));
-            // 注册后存在
+            // Registered after registering
             register("/tmp/foo.txt").unwrap();
             assert!(is_registered("/tmp/foo.txt"));
-            // 重复注册幂等
+            // Duplicate registration is idempotent
             register("/tmp/foo.txt").unwrap();
             assert!(is_registered("/tmp/foo.txt"));
-            // 注销后不存在
+            // Unregistered after unregistering
             unregister("/tmp/foo.txt").unwrap();
             assert!(!is_registered("/tmp/foo.txt"));
         });
@@ -142,14 +143,14 @@ mod tests {
     #[test]
     fn registry_persists_across_loads() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // temp_dir() 回退路径按 session_id（TURN_IDENTITY）隔离；用唯一 session
-        // 独占一个注册表文件，避免与其他并发测试 / 历史遗留条目共用
-        // `~/.agent_tmp/default/temp_registry.json` 造成计数污染。
+        // temp_dir()'s fallback path is isolated by session_id (TURN_IDENTITY); a unique session
+        // owns a registry file exclusively, avoiding count pollution from sharing
+        // `~/.agent_tmp/default/temp_registry.json` with other concurrent tests / legacy entries.
         let session_id = format!("temp_reg_persist_{}", uuid::Uuid::new_v4());
         crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope((session_id, 0usize), || {
             register("/tmp/a.txt").unwrap();
             register("/tmp/b.txt").unwrap();
-            // 重新加载后仍在
+            // Still present after reload
             assert!(is_registered("/tmp/a.txt"));
             assert!(is_registered("/tmp/b.txt"));
             let all = list_registered();

@@ -16,9 +16,11 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// read_file 是高精度 grounding 结果：内容复现代价高，禁止有损压缩（只能零压缩
-// 外溢到磁盘留指针）；但旧版本一旦被模型连续判定过时，就允许 LLM 裁剪释放上下文
-// ——「不可有损压缩」不等于「不可裁剪」。
+// read_file is a high-precision grounding result: reproducing its content is
+// expensive, so lossy compression is forbidden (only zero-compression spill to disk
+// with a pointer is allowed). But once the model repeatedly deems an old version
+// stale, the LLM may prune it to free context — "no lossy compression" does not mean
+// "no pruning".
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "read_file",
     policy: ToolHistoryPolicy {
@@ -28,9 +30,11 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     },
 });
 
-// read_file 是纯读取，同轮内视为稳定快照：只有两次读取之间没有任何可能变更状态的
-// 调用返回时才允许复用，且抑制消息只指向上下文中的原结果、不伪造新数据。路径在
-// read_only_tool_signature 中归一化，`./x` 与 `x` 视为同一读取。
+// read_file is a pure read and is treated as a stable snapshot within a turn: replay
+// is allowed only when no state-changing call ran between the two reads, and the
+// suppression message only points at the original result in context, never fabricates
+// new data. Paths are normalized in read_only_tool_signature, so `./x` and `x` count
+// as the same read.
 inventory::submit!(ToolReplayRegistration {
     name: "read_file",
 });

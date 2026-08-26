@@ -1,8 +1,9 @@
-//! OpenRouter 适配器。
+//! OpenRouter adapter.
 //!
-//! OpenRouter 不是独立的 `ApiProvider` 变体，而是 OpenAI 协议的 endpoint 变体
-//! （endpoint 含 `openrouter.ai`）。请求体字段与 OpenAI 完全一致，仅日志标签和
-//! 默认 endpoint / API key 候选链不同。
+//! OpenRouter is not an independent `ApiProvider` variant but an endpoint variant of the
+//! OpenAI protocol (the endpoint contains `openrouter.ai`). The request-body fields are
+//! identical to OpenAI; only the log label and the default endpoint / API key candidate
+//! chain differ.
 
 use crate::ai::config_schema::AiConfig;
 

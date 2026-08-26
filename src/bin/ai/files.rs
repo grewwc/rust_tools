@@ -124,15 +124,17 @@ fn render_text_attachment_block(file: &str) -> io::Result<String> {
     Ok(out)
 }
 
-/// 从文本内容中提取结构化关键行，为 overflow stub 提供召回锚点。
+/// Extract structured key lines from text content to provide recall anchors for the
+/// overflow stub.
 ///
-/// 识别的行类型（与 `line_trim_middle` 的中段采样保持一致）：
-/// - Rust/代码结构：`fn`/`pub fn`/`impl`/`struct`/`trait`/`enum`/`#[`/`mod`
-/// - 文档注释：`//!`/`///`
-/// - 错误/警告：`error`/`failed`/`panic`/`exception`/`timeout`/`warning`
-/// - 标记：`TODO`/`FIXME`
+/// Recognized line types (kept consistent with `line_trim_middle`'s mid-segment sampling):
+/// - Rust/code structure: `fn`/`pub fn`/`impl`/`struct`/`trait`/`enum`/`#[`/`mod`
+/// - Doc comments: `//!`/`///`
+/// - Errors/warnings: `error`/`failed`/`panic`/`exception`/`timeout`/`warning`
+/// - Markers: `TODO`/`FIXME`
 ///
-/// 每行截断到 200 字符以控制 stub 体积。最多保留 `max` 行。
+/// Each line is truncated to 200 chars to keep the stub compact. At most `max` lines
+/// are kept.
 pub(super) fn extract_key_lines(content: &str, max: usize) -> Vec<String> {
     let mut result = Vec::with_capacity(max);
     for (idx, line) in content.lines().enumerate() {
@@ -143,8 +145,9 @@ pub(super) fn extract_key_lines(content: &str, max: usize) -> Vec<String> {
         if trimmed.is_empty() {
             continue;
         }
-        // read_file 输出带 `{:>6}\t` 行号前缀：前缀会挡住 fn/struct 等前缀匹配，
-        // 剥掉前缀、用真实行号做 L 标签，让长文件外溢后的结构索引真正可用。
+        // read_file output carries a `{:>6}\t` line-number prefix, which would block
+        // prefix matches like fn/struct; strip it and use the real line number as the
+        // L label so the structural index of a long overflowed file actually works.
         let (label, matched) = match split_line_number_prefix(trimmed) {
             Some((no, rest)) => (no, rest.trim()),
             None => (idx, trimmed),
@@ -198,8 +201,9 @@ pub(super) fn extract_key_lines(content: &str, max: usize) -> Vec<String> {
     result
 }
 
-/// 解析 read_file 输出的 `{:>6}\t{content}` 行号前缀，返回 (真实行号, 前缀后的正文)。
-/// 非该格式（如普通命令输出）返回 None，保持原有 `L{idx}` 语义。
+/// Parse read_file output's `{:>6}\t{content}` line-number prefix, returning
+/// (real line number, body after the prefix). Returns None for non-matching formats
+/// (e.g. plain command output), keeping the original `L{idx}` semantics.
 fn split_line_number_prefix(trimmed: &str) -> Option<(usize, &str)> {
     let bytes = trimmed.as_bytes();
     let mut i = 0;

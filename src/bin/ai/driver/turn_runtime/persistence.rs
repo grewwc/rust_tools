@@ -3,9 +3,11 @@ use crate::ai::{
     types::App,
 };
 
-/// 依赖倒置入口：允许通过 `HistoryStore` 注入历史存储实现（审计/加密/mock/测试）。
-/// 保持与 `persist_pending_turn_messages` 相同的 `ephemeral` 与 `coalesce` 语义，
-/// 仅将最终的 `append` 下沉到端口，便于中间件在不改 driver 行数的前提下插桩。
+/// Dependency-inversion entry point: lets a `HistoryStore` be injected as the history
+/// storage implementation (audit/encryption/mock/testing).
+/// Keeps the same `ephemeral` and `coalesce` semantics as `persist_pending_turn_messages`
+/// and only pushes the final `append` down to the port, so middleware can instrument
+/// without changing any driver lines.
 pub(in crate::ai::driver::turn_runtime) fn persist_pending_turn_messages_with_store(
     history_file: &std::path::Path,
     source_model: &str,
@@ -32,8 +34,9 @@ pub(in crate::ai::driver::turn_runtime) fn persist_pending_turn_messages_with_st
         &turn_messages[*persisted_turn_messages..],
         source_model,
     ) {
-        // 追加失败仍保留与旧路径一致的 warning 文案；source_model 经端口下沉到
-        // sqlite 溯源列，不再在此层丢弃。
+        // Keep the same warning wording as the old path when the append fails;
+        // source_model is pushed down through the port to the sqlite provenance column
+        // and is no longer dropped at this layer.
         eprintln!("[Warning] Failed to save history: {}", err);
         return false;
     }
@@ -56,10 +59,12 @@ pub(in crate::ai::driver::turn_runtime) fn persist_pending_turn_messages(
     )
 }
 
-/// 使用实际产出这批消息的模型写入 canonical 来源元数据。
+/// Writes the canonical source metadata using the model that actually produced these
+/// messages.
 ///
-/// 自动 fallback 不会改写 `app.current_model`，因此响应路径必须显式传入
-/// provider 返回的实际模型；其余不含模型响应的中断路径可继续使用上面的默认入口。
+/// Auto-fallback does not rewrite `app.current_model`, so the response path must pass the
+/// actual model returned by the provider explicitly; other interrupt paths without a model
+/// response can keep using the default entry above.
 pub(in crate::ai::driver::turn_runtime) fn persist_pending_turn_messages_for_model(
     app: &App,
     source_model: &str,
@@ -67,12 +72,14 @@ pub(in crate::ai::driver::turn_runtime) fn persist_pending_turn_messages_for_mod
     turn_messages: &[Message],
     persisted_turn_messages: &mut usize,
 ) -> bool {
-    // one-shot 模式默认不落盘——普通一次性会话结束后会被 cleanup_one_shot
-    // 立即删除，持久化只是无谓的 I/O。但后台模式（a -bg）以及显式指定
-    // --session 的 one-shot（如 a -ss <id> "q"）会保留 session，必须落盘
-    // 才能让后续 /sessions 的标题、/history 等查看流程读到内容。
-    // Step 6：统一委托 store 端口（`DefaultHistoryStore`），默认实现与旧路径行为
-    // 100% 一致；source_model 经 `append_messages_for_model` 下沉到 sqlite 溯源列。
+    // One-shot mode does not persist by default: an ordinary one-off session is deleted
+    // by cleanup_one_shot right after it ends, so persisting is just wasted I/O. But
+    // background mode (a -bg) and one-shots with an explicit --session (e.g. a -ss <id> "q")
+    // keep the session, so they must persist for later flows like /sessions titles and
+    // /history to read the content.
+    // Step 6: uniformly delegate to the store port (`DefaultHistoryStore`); the default
+    // implementation is 100% identical to the old path, and source_model is pushed down
+    // to the sqlite provenance column via `append_messages_for_model`.
     persist_pending_turn_messages_with_store(
         &app.session_history_file,
         source_model,

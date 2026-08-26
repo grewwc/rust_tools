@@ -772,7 +772,8 @@ fn is_shell_program(program: &str) -> bool {
     matches!(program, "bash" | "sh" | "zsh" | "ksh" | "dash")
 }
 
-// 脚本解释器同样支持 `-c` / `-e` 直接传入并执行代码字符串，会绕过分段黑名单验证。
+// Script interpreters also accept `-c` / `-e` to pass and execute a code string directly,
+// which would bypass the per-segment blacklist validation.
 fn is_interpreter_program(program: &str) -> bool {
     matches!(
         program,

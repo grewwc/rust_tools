@@ -85,8 +85,8 @@ pub fn list_tags_feature(
     }
 }
 
-/// 为 shell 自动补全输出匹配前缀的 tag 名称（每行一个）。
-/// 被 `--complete-tags <prefix>` 调用。
+/// Print tag names matching the prefix for shell auto-completion (one per line).
+/// Invoked by `--complete-tags <prefix>`.
 pub fn complete_tags_feature(db: &MemoBackend, prefix: &str) {
     let prefix = prefix.trim();
     let tags = db
@@ -105,6 +105,6 @@ pub fn complete_tags_feature(db: &MemoBackend, prefix: &str) {
     for tag in &tags {
         let _ = writeln!(handle, "{}", tag.name);
     }
-    // 如果前缀非空且有匹配结果，打印第二遍（不带换行），
-    // 让 shell 的 compgen 知道应该直接填充而不是等待更多字符。
+    // If the prefix is non-empty and matches were found, print a second pass (without newlines)
+    // so shell compgen knows to fill in directly rather than wait for more characters.
 }

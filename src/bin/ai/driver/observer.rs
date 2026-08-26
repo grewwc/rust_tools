@@ -2,19 +2,21 @@ use serde_json::Value;
 
 pub struct PrepareContext {
     pub question: String,
-    /// 当前 turn 在 session 内持久化的全局序号（单调递增），
-    /// 普通、resume 和 internal turn 都会占用独立序号。
-    /// observer 可据此决定是否注入"上下文预算"提醒。
-    /// 0 表示该 session 首次调用。
+    /// Global, monotonically increasing turn index persisted within the session.
+    /// Normal, resume, and internal turns each consume their own index.
+    /// Observers can use it to decide whether to inject a "context budget" reminder.
+    /// 0 means this is the session's first call.
     pub turn_index: usize,
-    /// 当前 agent 可用的工具名列表，observer 可据此决定是否注入委派提示。
+    /// Names of the tools currently available to the agent; observers can use
+    /// this to decide whether to inject a delegation hint.
     pub available_tool_names: Vec<String>,
 }
 
 pub struct ToolResultContext<'a> {
     pub tool_name: String,
-    /// 工具结果原文：用借用而非 clone，避免 N 个 observer × 256K markdown
-    /// 时把内存复制成 O(N·M)。observer 内部如需保存可自行 to_string。
+    /// Raw tool result text. Borrowed rather than cloned to avoid copying
+    /// N observers x 256K of markdown into O(N*M) memory. Observers that need
+    /// to keep it can call to_string themselves.
     pub result_content: &'a str,
     pub success: bool,
 }

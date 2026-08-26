@@ -1,5 +1,6 @@
-// side_note.rs — 实时 side-note 文件队列 + 内存通知
-// 用户或 lead-agent 在 turn 执行过程中写入，执行中的 turn 在下一次迭代前 drain 并注入 LLM 上下文。
+// side_note.rs — real-time side-note file queue + in-memory notification
+// Written by the user or a lead agent during a turn; the running turn drains and
+// injects them into the LLM context before the next iteration.
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -29,11 +30,12 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-// 历史文件 -> session assets 目录：与 `plan_state` / `checkpoint` 共用同一 session assets 根。
-// `history_file` 始终是 `SessionStore::session_history_file(id)`（即 `<sessions_root>/<id>.sqlite`），
-// 因此 `parent` 即 sessions_root，`{stem}.assets` 即 `SessionStore::session_assets_dir(id)`。
-// 旧实现用 `"{file_name}.assets"`（含 `.sqlite` 后缀）导致路径为 `"<id>.sqlite.assets"`，与 plan 的
-// `"<id>.assets"` 分叉而丢注。新实现统一取 `file_stem`。
+// history file -> session assets dir: shares the same session assets root as `plan_state` / `checkpoint`.
+// `history_file` is always `SessionStore::session_history_file(id)` (i.e. `<sessions_root>/<id>.sqlite`),
+// so `parent` is sessions_root and `{stem}.assets` is `SessionStore::session_assets_dir(id)`.
+// The old implementation used `"{file_name}.assets"` (including the `.sqlite` suffix), producing
+// `"<id>.sqlite.assets"`, which diverged from plan's `"<id>.assets"` and dropped notes. The new
+// implementation uniformly uses `file_stem`.
 pub(crate) fn assets_dir_for_history(history_file: &Path) -> PathBuf {
     let parent = history_file.parent().unwrap_or_else(|| Path::new("."));
     let stem = history_file
@@ -63,10 +65,10 @@ fn sanitize_task_id(id: &str) -> String {
         .collect()
 }
 
-/// 写入一条 side-note（文件追加，原子性由 OS 保证单行追加）
+/// Append one side-note (file append; single-line append atomicity is guaranteed by the OS).
 ///
-/// `from` 建议取 "user" 或 lead 的 task_id / "lead"。
-/// `target`: None 表示发给 foreground；Some(task_id) 表示发给某个 subagent。
+/// `from` should be "user" or the lead agent's task_id / "lead".
+/// `target`: None means foreground; Some(task_id) means a specific subagent.
 pub fn push_side_note(
     history_file: &Path,
     content: &str,
@@ -91,7 +93,7 @@ pub fn push_side_note(
         target: target.map(|s| s.to_string()),
     };
     let line = serde_json::to_string(&note).map_err(|e| format!("encode side-note: {e}"))?;
-    // 追加写入，带文件锁避免并发截断
+    // Append-only write; single-line append atomicity avoids concurrent truncation.
     use std::io::Write;
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -102,12 +104,13 @@ pub fn push_side_note(
     Ok(file)
 }
 
-/// 排出并清空目标队列的所有 pending notes。调用方在迭代边界调用，若有新 note 立即注入。
-/// 使用 rename 原子化 drain：push 是 append，drain 侧 rename 旧文件到临时文件再读取，
-/// 避免 "先读后截断" 窗口中推送的新 note 被截断丢弃。
+/// Drain and clear all pending notes for the target queue. Called by the caller at iteration
+/// boundaries; new notes are injected immediately.
+/// Drain uses an atomic rename: push appends, while the drain side renames the old file to a temp
+/// file and reads it, avoiding notes pushed during the "read-then-truncate" window being dropped.
 pub fn drain_side_notes(history_file: &Path, target: Option<&str>) -> Vec<SideNote> {
     let file = side_note_file(history_file, target);
-    // 原子 drain：尝试把现有队列文件 rename 到临时文件，失败则说明无 pending。
+    // Atomic drain: try renaming the queue file to a temp file; failure means nothing is pending.
     let tmp = file.with_extension(format!("drain.{}.tmp", std::process::id()));
     let renamed = fs::rename(&file, &tmp).is_ok();
     let content = if renamed {
@@ -125,10 +128,11 @@ pub fn drain_side_notes(history_file: &Path, target: Option<&str>) -> Vec<SideNo
         if !file.exists() {
             return Vec::new();
         }
-        // 回退路径：跨盘等导致 rename 失败，降级为原子截断（仍有极小竞态，但仅在跨盘时触发）。
+        // Fallback path: rename can fail on cross-device moves etc.; degrade to atomic truncation
+        // (a tiny race remains, but only triggered on cross-device).
         match fs::read_to_string(&file) {
             Ok(c) => {
-                // 尽力原子截断：先写空临时文件再 rename 覆盖
+                // Best-effort atomic truncation: write an empty temp file first, then rename over it.
                 let empty_tmp = file.with_extension(format!("empty.{}.tmp", std::process::id()));
                 let _ = fs::write(&empty_tmp, "");
                 let _ = fs::rename(&empty_tmp, &file);
@@ -146,7 +150,7 @@ pub fn drain_side_notes(history_file: &Path, target: Option<&str>) -> Vec<SideNo
         if let Ok(note) = serde_json::from_str::<SideNote>(trimmed) {
             out.push(note);
         } else {
-            // 兼容旧格式：纯文本一行即一条 note
+            // Backward compatibility: a plain-text line is a single note.
             out.push(SideNote {
                 from: "user".to_string(),
                 content: trimmed.to_string(),
@@ -158,8 +162,8 @@ pub fn drain_side_notes(history_file: &Path, target: Option<&str>) -> Vec<SideNo
     out
 }
 
-/// 把 SideNote 转为可直接推入 LLM `messages` 的 user 消息
-/// 使用 `runtime_synthetic_user_message` 以避免被误判为真实 user 轮次边界。
+/// Convert SideNote into user messages that can be pushed straight into LLM `messages`.
+/// Uses `runtime_synthetic_user_message` to avoid being misjudged as a real user turn boundary.
 pub fn side_notes_to_messages(notes: Vec<SideNote>) -> Vec<Message> {
     notes
         .into_iter()
@@ -177,7 +181,7 @@ pub fn side_notes_to_messages(notes: Vec<SideNote>) -> Vec<Message> {
         .collect()
 }
 
-/// 便捷：排出并直接得到 Messages（空则返回空 Vec）
+/// Convenience: drain and directly return Messages (empty Vec when nothing pending).
 pub fn drain_side_notes_as_messages(history_file: &Path, target: Option<&str>) -> Vec<Message> {
     let notes = drain_side_notes(history_file, target);
     if notes.is_empty() {
@@ -186,16 +190,17 @@ pub fn drain_side_notes_as_messages(history_file: &Path, target: Option<&str>) -
     side_notes_to_messages(notes)
 }
 
-/// 当前进程的 target 标识：foreground 为 None，subagent 通过 task_local 或环境变量获知 task_id
+/// The current process's target identifier: None for foreground; subagents learn their task_id
+/// via task_local or environment variables.
 pub fn current_target_id() -> Option<String> {
-    // 优先 task_local（in-process subagent 由 background_dispatch 经 SUBAGENT_TASK_ID 注入）
+    // Prefer task_local (in-process subagents get SUBAGENT_TASK_ID injected by background_dispatch).
     if let Some(id) = crate::ai::driver::runtime_ctx::try_subagent_task_id() {
         let t = id.trim().to_string();
         if !t.is_empty() {
             return Some(t);
         }
     }
-    // 回退到环境变量：兼容进程隔离或外部注入，支持两种命名
+    // Fall back to env vars: supports process isolation or external injection; both namings accepted.
     for key in ["AIOS_SUBAGENT_TASK_ID", "SUBAGENT_TASK_ID", "AIOS_TASK_ID"] {
         if let Ok(v) = std::env::var(key) {
             let t = v.trim().to_string();
@@ -207,8 +212,9 @@ pub fn current_target_id() -> Option<String> {
     None
 }
 
-/// 供 turn 循环在每次模型请求前调用：排出当前 target 的 pending notes 并注入 messages。
-/// 返回注入的条数，供调用方决定是否需要打印提示。
+/// Called by the turn loop before each model request: drains pending notes for the current target
+/// and injects them into messages. Returns the number injected, so the caller can decide whether
+/// to print a hint.
 pub fn poll_and_inject(history_file: &Path, messages: &mut Vec<Message>) -> usize {
     let target = current_target_id();
     let target_ref = target.as_deref();
@@ -224,7 +230,7 @@ pub fn poll_and_inject(history_file: &Path, messages: &mut Vec<Message>) -> usiz
 mod tests {
     use super::*;
 
-    // 项目无 tempfile 依赖，沿用 std::env::temp_dir + uuid 的既有测试模式
+    // No tempfile dependency in this project; reuse the existing std::env::temp_dir + uuid pattern.
     fn temp_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("side_note_test_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -240,7 +246,7 @@ mod tests {
         let notes = drain_side_notes(&hist, None);
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].content, "hello");
-        // drain 后应为空
+        // should be empty after drain
         assert!(drain_side_notes(&hist, None).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

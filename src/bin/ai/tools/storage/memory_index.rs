@@ -1,22 +1,27 @@
-//! SQLite + FTS5 索引层 (方案 B)。
+//! SQLite + FTS5 index layer (Option B).
 //!
-//! JSONL 仍是事实来源；本模块给 `agent_memory.jsonl` 旁挂一份 SQLite 索引：
-//!   - `entries`        ：AgentMemoryEntry 的结构化镜像 + `hits / last_accessed` LFU 计数
-//!   - `entries_fts`    ：基于 FTS5 的全文倒排（虚拟表，content=entries），毫秒级关键词召回
-//!   - `meta`           ：`schema_version` / `source_mtime` / `source_len` 一致性元信息
+//! JSONL remains the source of truth; this module keeps a sidecar SQLite index for
+//! `agent_memory.jsonl`:
+//!   - `entries`        : structured mirror of AgentMemoryEntry + `hits / last_accessed` LFU counters
+//!   - `entries_fts`    : FTS5 full-text inverted index (virtual table, content=entries) for millisecond keyword recall
+//!   - `meta`           : consistency metadata `schema_version` / `source_mtime` / `source_len`
 //!
-//! 启动时调 [`MemoryIndex::open_or_init`] —— 文件 mtime/len 与上次记录一致就立即可用，
-//! 否则把整个 JSONL 重新摄入（rebuild）。重建发生在调用方线程内，因为只有这条路径
-//! 能保证后续 search/recent 不返回脏数据。daemon 异步重建留给 `record_drift_async`
-//! 在写入路径里使用：JSONL 已经更新但本进程懒得阻塞时排队后台修复。
+//! At startup call [`MemoryIndex::open_or_init`]: if the file mtime/len matches the last
+//! recorded values the index is immediately usable; otherwise the whole JSONL is
+//! re-ingested (rebuild). Rebuild runs on the caller's thread because only that path
+//! guarantees later search/recent calls never return stale data. Asynchronous rebuild
+//! by the daemon is left to `record_drift_async` on the write path: queue a background
+//! repair when the JSONL was updated but this process does not want to block.
 //!
-//! 设计要点
-//!   - 永远不在持有 `with_memory_file_lock` 之外的状态下做"读 JSONL → 写 DB"，
-//!     避免与 enforce/rotate/append 并发。
-//!   - JSONL 写失败时绝不写 DB；DB 写失败时记录 trace event，不阻断 JSONL 主路径
-//!     —— 保持 "JSONL = source of truth, DB = best-effort cache" 的约束。
-//!   - 没有 `PRAGMA user_version` / migrations 框架，沿用仓库其它处的
-//!     `CREATE TABLE IF NOT EXISTS` 模式 + `meta` 表里自管 `schema_version`。
+//! Design points
+//!   - Never do "read JSONL -> write DB" outside of holding `with_memory_file_lock`,
+//!     to avoid racing with enforce/rotate/append.
+//!   - Never write the DB when the JSONL write failed; a DB write failure records a
+//!     trace event and does not block the JSONL main path, keeping the constraint
+//!     "JSONL = source of truth, DB = best-effort cache".
+//!   - No `PRAGMA user_version` / migrations framework: follow the `CREATE TABLE IF
+//!     NOT EXISTS` pattern used elsewhere in the repo, and manage `schema_version`
+//!     inside the `meta` table.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -26,23 +31,24 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::memory_store::AgentMemoryEntry;
 
-/// schema 版本，每次破坏性 schema 变更 +1，触发全量重建
+/// Schema version; bump by 1 on every breaking schema change to trigger a full rebuild
 const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug)]
 pub(crate) struct MemoryIndex {
-    /// 索引文件路径，例如 `~/.config/rust_tools/agent_memory.db`
+    /// Index file path, e.g. `~/.config/rust_tools/agent_memory.db`
     db_path: PathBuf,
-    /// JSONL 事实来源路径，例如 `~/.config/rust_tools/agent_memory.jsonl`
+    /// JSONL source-of-truth path, e.g. `~/.config/rust_tools/agent_memory.jsonl`
     source_path: PathBuf,
-    /// SQLite 连接；放在 Mutex 里以支持多线程并发读写
-    /// （rusqlite::Connection 不是 Send + Sync, 但 Mutex<Connection> 是）。
+    /// SQLite connection; wrapped in a Mutex to support concurrent reads/writes from
+    /// multiple threads (rusqlite::Connection is not Send + Sync, but Mutex<Connection> is).
     conn: Mutex<Connection>,
 }
 
 impl MemoryIndex {
-    /// 打开 / 初始化索引；schema 不一致或 source 文件 mtime/len 与记录漂移时
-    /// **同步**重建。调用方应在持有 `with_memory_file_lock` 之内调用。
+    /// Open / initialize the index; rebuild **synchronously** when the schema differs
+    /// or the source file mtime/len drifts from what is recorded. Callers should invoke
+    /// this while holding `with_memory_file_lock`.
     pub(crate) fn open_or_init(db_path: PathBuf, source_path: PathBuf) -> Result<Self, String> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
@@ -50,7 +56,7 @@ impl MemoryIndex {
         }
         let conn = Connection::open(&db_path)
             .map_err(|e| format!("open sqlite at {}: {e}", db_path.display()))?;
-        // WAL 让"主进程写 + 后台 daemon 读"并发更友好。
+        // WAL makes "main process writes + background daemon reads" concurrency friendlier.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
 
@@ -61,7 +67,7 @@ impl MemoryIndex {
             source_path,
             conn: Mutex::new(conn),
         };
-        // 一致性检查 + 必要时重建
+        // Consistency check + rebuild if needed
         if me.is_drifted()? {
             me.rebuild_from_source()?;
         }
@@ -105,7 +111,7 @@ impl MemoryIndex {
         )
         .map_err(|e| format!("init schema: {e}"))?;
 
-        // schema_version 不匹配时清空所有表，触发后续 rebuild
+        // When schema_version mismatches, clear all tables to trigger a later rebuild
         let stored: Option<String> = conn
             .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |r| {
                 r.get(0)
@@ -128,7 +134,8 @@ impl MemoryIndex {
         Ok(())
     }
 
-    /// 比较 source JSONL 的 mtime/len 与 meta 中记录的值；任一不一致即视为漂移。
+    /// Compare the source JSONL mtime/len against the values recorded in meta;
+    /// any mismatch counts as drift.
     fn is_drifted(&self) -> Result<bool, String> {
         let (mtime, len) = read_source_signature(&self.source_path);
         let conn = self
@@ -170,7 +177,8 @@ impl MemoryIndex {
         Ok(())
     }
 
-    /// 读 JSONL 全量摄入，事务内完成。任何中途失败都回滚。
+    /// Full ingestion of the JSONL, completed inside a transaction;
+    /// any mid-way failure rolls back.
     pub(crate) fn rebuild_from_source(&self) -> Result<usize, String> {
         let content = match std::fs::read_to_string(&self.source_path) {
             Ok(c) => c,
@@ -199,7 +207,8 @@ impl MemoryIndex {
             .map_err(|e| format!("clear entries_fts: {e}"))?;
 
         for entry in &entries {
-            // 没有 id 的条目无法稳定建索引——跳过；search 路径会回退扫 JSONL。
+            // Entries without an id cannot be indexed reliably - skip them;
+            // the search path falls back to scanning the JSONL.
             let Some(id) = entry.id.as_deref() else {
                 continue;
             };
@@ -239,10 +248,11 @@ impl MemoryIndex {
         Ok(entries.len())
     }
 
-    /// 单条增量写入 —— 应当在 `MemoryStore::append` 成功 fsync JSONL 后调用。
+    /// Single incremental write - call only after `MemoryStore::append` has
+    /// successfully fsynced the JSONL.
     pub(crate) fn upsert_entry(&self, entry: &AgentMemoryEntry) -> Result<(), String> {
         let Some(id) = entry.id.as_deref() else {
-            return Ok(()); // 无 id 直接放弃索引，与 rebuild 一致
+            return Ok(()); // no id: skip indexing entirely, matching rebuild
         };
         let tags_json = serde_json::to_string(&entry.tags).unwrap_or_else(|_| "[]".into());
         let tags_text = entry.tags.join(" ");
@@ -277,7 +287,8 @@ impl MemoryIndex {
             ],
         )
         .map_err(|e| format!("upsert entries: {e}"))?;
-        // FTS5 做先 delete-then-insert：contentless 配置下 ON CONFLICT 行为不友好。
+        // FTS5 uses delete-then-insert: ON CONFLICT behavior is unfriendly
+        // under the contentless config.
         conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])
             .map_err(|e| format!("delete fts: {e}"))?;
         conn.execute(
@@ -286,7 +297,8 @@ impl MemoryIndex {
         )
         .map_err(|e| format!("insert fts: {e}"))?;
         drop(conn);
-        // signature 在 append 路径里由 MemoryStore 统一刷新，这里不刷
+        // The signature is refreshed centrally by MemoryStore on the append
+        // path; not refreshed here
         Ok(())
     }
 
@@ -306,8 +318,10 @@ impl MemoryIndex {
         self.write_source_signature()
     }
 
-    /// FTS5 全文检索；返回按 `bm25(entries_fts) + priority + recency + LFU` 综合排序后的 id 列表。
-    /// caller 拿 id 之后用 `MemoryStore::all()` 或后续传 id 的精确读取拿到完整条目。
+    /// FTS5 full-text search; returns the id list sorted by
+    /// `bm25(entries_fts) + priority + recency + LFU`.
+    /// The caller then uses `MemoryStore::all()` or a later exact id read
+    /// to fetch the full entries.
     pub(crate) fn search_ids(&self, query: &str, limit: usize) -> Result<Vec<String>, String> {
         let conn = self
             .conn
@@ -341,8 +355,9 @@ impl MemoryIndex {
         Ok(ids)
     }
 
-    /// 把命中条目的 hits 计数 +=1, last_access 设为当前秒数（unix）。
-    /// 这是 LFU 的核心；JSONL 端无法做原地 update，只在 SQLite 维护。
+    /// Increment the hits counter of matched entries by 1 and set last_access
+    /// to the current unix seconds. This is the core of LFU; the JSONL side
+    /// cannot update in place, so it is maintained only in SQLite.
     pub(crate) fn record_hits(&self, ids: &[String]) -> Result<(), String> {
         if ids.is_empty() {
             return Ok(());
@@ -367,7 +382,8 @@ impl MemoryIndex {
         Ok(())
     }
 
-    /// 取一组 entry 的 LFU 计数（搜索辅助；目前未广泛使用，预留给 GC 评分）。
+    /// Fetch an entry's LFU counters (search aid; not widely used yet,
+    /// reserved for GC scoring).
     #[allow(dead_code)]
     pub(crate) fn hits_for(&self, id: &str) -> Result<i64, String> {
         let conn = self
@@ -387,8 +403,9 @@ impl MemoryIndex {
     }
 }
 
-/// FTS5 MATCH 输入需要做基本转义；这里只允许字母数字 / 下划线 / CJK 字符 +
-/// 空白，其它都视为分隔符。我们最终把 token 用空格连起来作为隐式 OR 查询。
+/// FTS5 MATCH input needs basic escaping; here only alphanumerics / underscores /
+/// CJK characters plus whitespace are allowed, everything else is treated as a
+/// separator. We finally join tokens with spaces as an implicit OR query.
 fn sanitize_fts_query(q: &str) -> String {
     let mut out = String::new();
     let mut in_token = false;
@@ -406,7 +423,7 @@ fn sanitize_fts_query(q: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    // 给每个 token 加 `*` 让短前缀也能命中（FTS5 prefix search）。
+    // Append `*` to each token so short prefixes also match (FTS5 prefix search).
     trimmed
         .split_whitespace()
         .map(|t| format!("{}*", t))
@@ -515,7 +532,7 @@ mod tests {
         write_jsonl(&jsonl, &[entry("d1", "general", "first version", 100)]);
         let idx = MemoryIndex::open_or_init(db.clone(), jsonl.clone()).unwrap();
         assert!(!idx.search_ids("first", 5).unwrap().is_empty());
-        // 直接修改 JSONL 模拟外部进程写入
+        // Modify the JSONL directly to simulate an external process writing
         std::thread::sleep(std::time::Duration::from_millis(10));
         write_jsonl(
             &jsonl,

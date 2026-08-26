@@ -30,11 +30,14 @@ inventory::submit!(ToolStreamingRegistration {
     execute_streaming: execute_apply_patch_streaming,
 });
 
-// apply_patch 结果是当前轮「我刚改了哪个文件」的唯一精确证据，且失败诊断会回显
-// 整份当前文件文本（供模型无需重读即可重建补丁）。一旦被有损压缩/截断，模型就
-// 看不到补丁是否落地，会反复怀疑工具未被调用、原地重试——因此禁止有损压缩，并
-// 占用高精度 inline 预算以进入当前轮保护集合。与 execute_command 语义一致：旧的
-// 补丁结果仍可由模型主动标记过时后裁剪，不会让上下文单调增长。
+// The apply_patch result is the only precise evidence of "which file did I just modify" for the
+// current turn, and failure diagnostics echo the entire current file text (so the model can
+// rebuild the patch without re-reading). Once lossily compressed or truncated, the model cannot
+// see whether the patch landed, and will repeatedly suspect the tool was never called and retry
+// in place — hence lossy compression is forbidden, and apply_patch consumes high-precision inline
+// budget to enter the current-turn protected set. Consistent with execute_command semantics:
+// stale patch results can still be pruned by the model explicitly marking them outdated, so the
+// context won't grow monotonically.
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "apply_patch",
     policy: ToolHistoryPolicy {
@@ -62,8 +65,9 @@ enum PatchEnvelopeOp {
     Update,
     Add,
     Delete,
-    /// 行内子串替换：用 `anchor:` 定位行，在该行内将 `old:` 精确替换为 `new:`。
-    /// 不走 unified-diff 路径，由 `apply_inline_replace` 直接处理。
+    /// Inline substring replacement: use `anchor:` to locate the line, then exactly replace
+    /// `old:` with `new:` within that line.
+    /// Does not go through the unified-diff path; handled directly by `apply_inline_replace`.
     ReplaceInLine,
 }
 
@@ -79,8 +83,9 @@ struct PreparedPatchWrite {
     path: PathBuf,
     before: Option<String>,
     action: PreparedPatchAction,
-    /// 应用过程中产生的提示（如纯插入 hunk 仅按行号定位），随成功消息一并返回，
-    /// 提醒模型在文件已变更时需 read_file 复核。
+    /// Hints produced during application (e.g. pure-insert hunks are located by line number
+    /// only), returned together with the success message to remind the model to re-read the file
+    /// with read_file once it has changed.
     hints: Vec<String>,
 }
 
@@ -93,14 +98,15 @@ enum PreparedPatchAction {
 fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
     let mut hunks = Vec::new();
     let mut iter = patch.lines().peekable();
-    let mut patch_line_no: usize = 0; // 1-based，用于错误信息定位
+    let mut patch_line_no: usize = 0; // 1-based, used to locate positions in error messages
     let mut saw_content_before_header = false;
-    let mut saw_envelope_marker = false; // 检测到 *** Begin Patch / *** Update File: 等 envelope 标记
+    let mut saw_envelope_marker = false; // whether any envelope marker (*** Begin Patch / *** Update File: etc.) was seen
     while let Some(line) = iter.next() {
         patch_line_no += 1;
-        // 残缺 envelope 信号：parse_patch_envelopes 因首行非 `*** Begin Patch`
-        // 返回 None 后会误入 unified-diff 路径。记录是否出现过 envelope 开头/分节
-        // 标记，用于下方决定是否静默容忍尾部 `*** End Patch`。
+        // Malformed envelope signal: when parse_patch_envelopes returns None because the first
+        // line is not `*** Begin Patch`, the text would mistakenly fall into the unified-diff
+        // path. Record whether any envelope opening/section marker was seen, to decide below
+        // whether to silently tolerate a trailing `*** End Patch`.
         if line == "*** Begin Patch" || is_patch_section_header(line) {
             saw_envelope_marker = true;
         }
@@ -115,13 +121,15 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             continue;
         };
         let rest = rest.trim();
-        // 规范的 `*** Begin Patch` 信封（Codex/OpenAI 风格）用裸 `@@` 或
-        // `@@ <上下文标题> @@` 作为 hunk 分隔符，不带 `-N,M +N,M` 行号。仅当
-        // header 形如 `-N` 时解析标称行号；否则 old_start=0，交给 locate_hunk
-        // 的全文件搜索唯一定位，避免对规范信封格式报 "invalid hunk header"。
-        // 模型常把"插入到文件开头"错写成 `@@ -0,0 +1,3 @@`：git 语义中 -0 即
-        // "第 1 行之前插入"，因此归一化为 old_start=1，而不是当作无标称行号走
-        // 全文件搜索，导致后续报出误导性的 "declared line 0"。
+        // A canonical `*** Begin Patch` envelope (Codex/OpenAI style) uses a bare `@@` or
+        // `@@ <context title> @@` as the hunk separator, without `-N,M +N,M` line numbers. Only
+        // when the header looks like `-N` do we parse a nominal line number; otherwise
+        // old_start=0, letting locate_hunk's full-file search uniquely locate the hunk, avoiding
+        // a spurious "invalid hunk header" for the canonical envelope format.
+        // Models often write "insert at the start of the file" as `@@ -0,0 +1,3 @@`: in git
+        // semantics -0 means "insert before line 1", so we normalize to old_start=1 rather than
+        // treating it as having no nominal line number and running a full-file search, which
+        // would later report a misleading "declared line 0".
         let old_start = match rest.strip_prefix('-') {
             Some(after) => after
                 .split_whitespace()
@@ -138,13 +146,16 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             if next.starts_with("@@") {
                 break;
             }
-            // 容忍格式混用：模型常在纯 unified-diff hunk 末尾误带 `*** End Patch`
-            // 等 envelope 尾标记。这些标记不属于 unified-diff 内容，遇到即结束
-            // 当前 hunk（交由外层循环跳过），避免误报 invalid hunk line。
-            // 但若已检测到 envelope 开头/分节标记（saw_envelope_marker），说明这是
-            // 残缺 envelope 误入 unified-diff 路径，目标文件由 file_path 决定、而非
-            // envelope 声明--此时静默应用可能写到错误文件。故不 break，让该行落入
-            // 下方 _ => 分支报"格式混用"错误，由模型重建，绝不静默错写。
+            // Tolerate mixed formats: models often mistakenly append envelope tail markers such as
+            // `*** End Patch` at the end of a pure unified-diff hunk. These markers are not part of
+            // unified-diff content; when encountered we end the current hunk (letting the outer
+            // loop skip them), avoiding a false "invalid hunk line" error.
+            // But if an envelope opening/section marker was already detected
+            // (saw_envelope_marker), this is a malformed envelope that fell into the unified-diff
+            // path, where the target file is decided by file_path, not by the envelope
+            // declaration — silently applying could write to the wrong file. So we do NOT break;
+            // the line falls into the `_ =>` branch below to report a "mixed formats" error and
+            // let the model rebuild, never silently writing to the wrong file.
             if (next == "*** End Patch" || next == "*** End of File") && !saw_envelope_marker {
                 break;
             }
@@ -153,8 +164,9 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             if l.starts_with("\\ No newline at end of file") {
                 continue;
             }
-            // 空行（含 CRLF 下只剩 \r 的行）：模型常把空 context 行写成完全没有
-            // 前导空格的空行。按空 context 行处理，与 `git apply` 的宽容一致。
+            // Blank lines (including lines reduced to just `\r` under CRLF): models often write an
+            // empty context line with no leading space at all. Treat it as an empty context line,
+            // consistent with `git apply`'s tolerance.
             if l == "" || l == "\r" {
                 lines.push(UnifiedLine::Context(String::new()));
                 continue;
@@ -163,17 +175,18 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             let prefix = chars
                 .next()
                 .ok_or_else(|| format!("invalid hunk line at patch line {patch_line_no}: empty"))?;
-            // 容忍 CRLF：剥离行尾 \r，避免 Add 行把 \r 写入文件内容。
+            // Tolerate CRLF: strip the trailing \r so Add lines don't write \r into file content.
             let body = chars.as_str().strip_suffix('\r').unwrap_or(chars.as_str());
             match prefix {
                 ' ' => lines.push(UnifiedLine::Context(body.to_string())),
                 '-' => lines.push(UnifiedLine::Remove(body.to_string())),
                 '+' => lines.push(UnifiedLine::Add(body.to_string())),
                 _ => {
-                    // 特判 envelope 风格标记：说明 unified-diff 与 Begin/End Patch
-                    // 格式混用。结尾标记（*** End Patch / *** End of File）已在上方
-                    // break 容错；走到这里的是 *** Begin Patch / *** Update File: 等
-                    // 开头或分节标记，表示 patch 结构混乱，明确报错引导模型重建。
+                    // Special-case envelope-style markers: this means unified diff and Begin/End
+                    // Patch formats are mixed. Tail markers (*** End Patch / *** End of File) were
+                    // already tolerated via break above; what lands here is an opening or section
+                    // marker like *** Begin Patch / *** Update File:, indicating the patch
+                    // structure is confused — report a clear error guiding the model to rebuild.
                     if l.starts_with("*** ") {
                         return Err(format!(
                             "invalid hunk line at patch line {patch_line_no}: detected mixed \
@@ -191,11 +204,13 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
                 }
             }
         }
-        // 剥离尾部空 context 行：hunk body 循环只在遇到下一个 `@@` 才结束，所以
-        // hunk 之间或 patch 末尾的空行（分隔/尾随）会被吞进当前 hunk，变成末尾的
-        // 空 context 行，凭空要求原文件对应位置也有空行，导致本能匹配的 patch
-        // 报 context mismatch。真实的中间空行后面必然还有本 hunk 的内容行，不会被
-        // 误删；只有纯尾随的空 context 行才在此剥除。
+        // Strip trailing empty context lines: the hunk body loop only ends when the next `@@` is
+        // reached, so blank lines between hunks or at the end of the patch (separators/trailing)
+        // get swallowed into the current hunk as trailing empty context lines, demanding an empty
+        // line at the corresponding position of the original file for no reason and causing a
+        // patch that should match to report context mismatch. A genuine interior blank line is
+        // always followed by more content lines of this hunk, so it won't be wrongly removed; only
+        // purely trailing empty context lines are stripped here.
         while matches!(lines.last(), Some(UnifiedLine::Context(s)) if s.is_empty()) {
             lines.pop();
         }
@@ -227,8 +242,9 @@ struct UnifiedDiffHeaderTarget {
     deletes_file: bool,
 }
 
-/// 解析 git 的双引号路径 token。除常见 C 转义外也兼容 git quotePath 使用的三位八进制
-/// 字节，避免带空格或转义字符的合法路径被按空白切碎后写错目标。
+/// Parses a git double-quoted path token. Besides common C escapes, it also accepts the
+/// three-digit octal bytes used by git's quotePath, so that valid paths containing spaces or
+/// escaped characters are not split on whitespace and written to the wrong target.
 fn parse_git_path_token(input: &str) -> Option<(String, &str)> {
     let input = input.trim_start();
     if !input.starts_with('"') {
@@ -293,7 +309,7 @@ fn diff_marker_path(raw: &str) -> Option<String> {
     if raw.starts_with('"') {
         return parse_git_path_token(raw).map(|(path, _)| path);
     }
-    // `---`/`+++` 路径允许空格；仅 TAB 明确分隔可选时间戳。
+    // `---`/`+++` paths allow spaces; only a TAB explicitly separates the optional timestamp.
     Some(raw.split('\t').next().unwrap_or(raw).trim().to_string())
 }
 
@@ -305,9 +321,10 @@ fn record_diff_target(paths: &mut Vec<String>, path: Option<String>) {
     }
 }
 
-/// 收集完整 unified diff 中的所有文件目标。`diff --git` 与相邻的 `---`/`+++` 文件头
-/// 会交叉校验并去重；因此标准多文件 diff、带空格的引号路径，以及首个 hunk 后的后续
-/// 文件头都不会被静默误当成单文件 patch。
+/// Collects all file targets in a complete unified diff. `diff --git` and adjacent `---`/`+++`
+/// file headers are cross-checked and deduplicated; therefore a standard multi-file diff,
+/// quoted paths with spaces, and subsequent file headers after the first hunk are never silently
+/// mistaken for a single-file patch.
 fn parse_unified_diff_header_target(patch: &str) -> UnifiedDiffHeaderTarget {
     let lines: Vec<&str> = patch.lines().collect();
     let mut parsed = UnifiedDiffHeaderTarget::default();
@@ -333,8 +350,9 @@ fn parse_unified_diff_header_target(patch: &str) -> UnifiedDiffHeaderTarget {
         else {
             continue;
         };
-        // 文件头后必须紧跟（可跨空行）hunk header。否则正文中恰好相邻的
-        // `--- ...` / `+++ ...` 增删行会被误判为第二个文件目标。
+        // A hunk header must follow the file header (blank lines allowed in between). Otherwise
+        // adjacent `--- ...` / `+++ ...` add/remove lines in the body would be misjudged as a
+        // second file target.
         let followed_by_hunk = lines[index + 2..]
             .iter()
             .find(|line| !line.is_empty())
@@ -352,8 +370,9 @@ fn parse_unified_diff_header_target(patch: &str) -> UnifiedDiffHeaderTarget {
         record_diff_target(&mut parsed.paths, target);
     }
 
-    // 容忍只有一个 `+++` 或 `---` 文件头的模型输出，但只在没有更完整来源时回退，
-    // 且仅扫描首个 hunk 之前，避免把正文中形似文件头的增删行当作目标。
+    // Tolerate model output with only a single `+++` or `---` file header, but only fall back when
+    // there is no more complete source, and only scan before the first hunk to avoid treating
+    // add/remove lines that look like file headers in the body as targets.
     if parsed.paths.is_empty() {
         for line in lines.iter().take_while(|line| !line.starts_with("@@")) {
             let raw = line
@@ -374,11 +393,15 @@ fn file_path_from_unified_diff_header(patch: &str) -> Option<String> {
     (parsed.paths.len() == 1).then(|| parsed.paths[0].clone())
 }
 
-/// 将多文件 unified diff（git diff 输出或模型手写）按文件拆分为 (目标路径, 该文件 diff 片段)。
-/// 片段保留原始文本（含自己的文件头与 hunks），目标路径按与 parse_unified_diff_header_target
-/// 相同的语义解析（`diff --git` 优先；无 `diff --git` 头时按相邻 `--- `/`+++ ` 对切分，且
-/// 要求后跟 hunk header，避免把 hunk 正文中形似文件头的增删行当成文件边界）。
-/// 任一片段解析不出唯一目标路径时返回 Err——结构不可靠时明确报错，绝不静默错写。
+/// Splits a multi-file unified diff (git diff output or model-written) by file into
+/// (target path, that file's diff fragment).
+/// Fragments keep their original text (including their own file headers and hunks); target paths
+/// are resolved with the same semantics as parse_unified_diff_header_target (`diff --git` takes
+/// precedence; without a `diff --git` header, split by adjacent `--- `/`+++ ` pairs that are
+/// followed by a hunk header, so add/remove lines in the hunk body that look like file headers
+/// are not treated as file boundaries).
+/// Returns Err when any fragment cannot be resolved to a unique target path — when the structure
+/// is unreliable, report the error explicitly rather than silently writing to the wrong file.
 fn split_unified_diff_by_file(patch: &str) -> Result<Vec<(String, String)>, String> {
     let lines: Vec<&str> = patch.lines().collect();
     let has_git_headers = lines.iter().any(|line| line.starts_with("diff --git "));
@@ -439,9 +462,11 @@ fn split_unified_diff_by_file(patch: &str) -> Result<Vec<(String, String)>, Stri
     Ok(sections)
 }
 
-/// 为 driver 的 scoped-instruction preflight 与 stale-patch 账本提供统一目标提取语义。
-/// 即使 envelope 最终因结构错误而执行失败，也尽量暴露已声明的目标，确保首次潜在写入
-/// 前仍会加载对应目录的项目规则。
+/// Provides a unified target-extraction semantic for the driver's scoped-instruction preflight
+/// and the stale-patch ledger.
+/// Even if the envelope ultimately fails to execute due to structural errors, declared targets
+/// are still surfaced as much as possible, so the project rules for the corresponding directory
+/// are loaded before the first potential write.
 pub(crate) fn apply_patch_target_paths_from_patch(raw_patch: &str) -> Vec<PathBuf> {
     let patch = strip_code_fence(raw_patch);
     let mut targets = Vec::new();
@@ -596,9 +621,11 @@ fn parse_patch_envelope(patch: &str) -> Result<Option<PatchEnvelope>, String> {
 fn normalize_patch_envelope_body(envelope: &PatchEnvelope) -> Result<String, String> {
     Ok(match envelope.op {
         PatchEnvelopeOp::ReplaceInLine => {
-            // ReplaceInLine 不走 unified-diff 路径，由 apply_inline_replace 直接处理。
-            // 走到这里说明 execute_apply_patch 的分流逻辑有 bug——提前返回明确错误，
-            // 避免被当成 unified-diff 误处理（那会把 anchor:/old:/new: 当 context 行）。
+            // ReplaceInLine does not go through the unified-diff path; it is handled directly by
+            // apply_inline_replace. Reaching here means the dispatch logic in
+            // execute_apply_patch has a bug — return an explicit error early rather than letting
+            // this be processed as a unified diff (which would treat anchor:/old:/new: as context
+            // lines).
             return Err(
                 "internal error: ReplaceInLine envelope should be handled by \
                  apply_inline_replace, not normalize_patch_text"
@@ -606,13 +633,15 @@ fn normalize_patch_envelope_body(envelope: &PatchEnvelope) -> Result<String, Str
             );
         }
         PatchEnvelopeOp::Update => {
-            // *** Begin Patch 的 Update 格式允许省略 hunk header（Cursor/Aider 风格），
-            // 模型常只写 +/−/space 前缀行而不带 hunk header。如果 body 中没有任何
-            // hunk header，合成一个，让 parse_unified_hunks 能识别。old_start=0 表示
-            // 无标称位置，locate_hunk 会跳过标称匹配直接全文件搜索。
+            // The Update format of *** Begin Patch allows omitting the hunk header (Cursor/Aider
+            // style); models often write only +/-/space-prefixed lines without a hunk header. If
+            // the body contains no hunk header at all, synthesize one so parse_unified_hunks can
+            // recognize it. old_start=0 means no nominal position; locate_hunk will skip nominal
+            // matching and search the whole file directly.
             let has_hunk_header = envelope.body_lines.iter().any(|l| l.starts_with("@@"));
-            // 即便已有 hunk header，模型也常把 context 行写成裸文本；在 envelope
-            // 内将这类裸行补成 context 行，避免无意义的 invalid hunk line 失败。
+            // Even when a hunk header exists, models often write context lines as bare text; pad
+            // such bare lines into context lines within the envelope to avoid pointless invalid
+            // hunk line failures.
             let normalized_body: Vec<String> = envelope
                 .body_lines
                 .iter()
@@ -641,7 +670,8 @@ fn normalize_patch_envelope_body(envelope: &PatchEnvelope) -> Result<String, Str
             }
         }
         PatchEnvelopeOp::Add => {
-            // 空行代表新增文件中的空行，补上 + 前缀以便 parse_unified_hunks 识别为 Add 行。
+            // Blank lines represent blank lines in the new file; prefix them with `+` so
+            // parse_unified_hunks recognizes them as Add lines.
             let normalized_body: Vec<String> = envelope
                 .body_lines
                 .iter()
@@ -693,18 +723,24 @@ fn normalize_patch_envelope(path: &Path, envelope: &PatchEnvelope) -> Result<Str
     }
 }
 
-/// 行内子串替换：用 `anchor:` 定位行，在该行内将 `old:` 精确替换为 `new:`。
+/// Inline substring replacement: use `anchor:` to locate the line, then exactly replace
+/// `old:` with `new:` within that line.
 ///
-/// 专为"长单行字符串里换几个词"这种最常见的编辑场景设计，避免整行重写。
+/// Designed for the most common editing scenario — "change a few words inside one long
+/// single-line string" — avoiding a full-line rewrite.
 ///
-/// 安全设计（杜绝"执行成功但替换错位置"）：
-/// - `anchor` 用归一化子串匹配（容忍 confusable）定位行，但**只用于定位**；
-/// - `old` 用**精确**子串匹配（不归一化）确定替换的 byte range，杜绝位置偏移；
-/// - `anchor` 必须唯一匹配到一行，否则报错（避免改错地方）；
-/// - `old` 必须在该行中唯一出现，否则报错（避免改错位置）；
-/// - 若 `old == new`（替换前后相同），报错提示无操作，避免误以为成功。
+/// Safety design (to rule out "executed successfully but replaced the wrong position"):
+/// - `anchor` locates the line via normalized substring matching (confusable-tolerant), but is
+///   **only used for locating**;
+/// - `old` uses **exact** substring matching (no normalization) to determine the byte range to
+///   replace, ruling out positional drift;
+/// - `anchor` must uniquely match one line, otherwise error (to avoid changing the wrong place);
+/// - `old` must appear exactly once in that line, otherwise error (to avoid changing the wrong
+///   position);
+/// - if `old == new` (identical before/after), report an error as a no-op so it isn't mistaken
+///   for success.
 fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<String, String> {
-    // --- 解析 anchor / old / new 三个字段 ---
+    // --- Parse the three fields: anchor / old / new ---
     let mut anchor: Option<String> = None;
     let mut old: Option<String> = None;
     let mut new: Option<String> = None;
@@ -716,7 +752,7 @@ fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<Stri
         } else if let Some(rest) = line.strip_prefix("new: ") {
             new = Some(rest.to_string());
         }
-        // 忽略无关行（空行、注释等），保持宽容
+        // Ignore unrelated lines (blank lines, comments, etc.) and stay tolerant
     }
     let anchor = anchor.ok_or_else(|| {
         "Replace in line: missing `anchor:` field. \
@@ -744,7 +780,7 @@ fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<Stri
         ));
     }
 
-    // --- 用归一化子串匹配定位行（容忍 confusable），但只用于定位 ---
+    // --- Locate the line via normalized substring matching (confusable-tolerant), but only for locating ---
     let norm_anchor = normalize_confusables(&anchor);
     let matched_lines: Vec<usize> = original
         .lines()
@@ -778,13 +814,15 @@ fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<Stri
     let original_lines: Vec<&str> = original.lines().collect();
     let target_line = original_lines[line_idx];
 
-    // --- old 先用精确子串匹配确定替换位置（不归一化），杜绝位置偏移 ---
+    // --- First use exact substring matching (no normalization) to determine the replacement position, ruling out positional drift ---
     let occurrences: Vec<usize> = target_line.match_indices(&old).map(|(i, _)| i).collect();
     let (pos, match_len) = match occurrences.len() {
         1 => (occurrences[0], old.len()),
         0 => {
-            // 精确匹配失败时的宽容兜底：confusable 归一化 + 首尾空白容忍。
-            // 仅用于定位；替换边界按匹配到的原字节区间，写入内容由 new 构造。
+            // Tolerant fallback when exact matching fails: confusable normalization + leading and
+            // trailing whitespace tolerance.
+            // Only used for locating; the replacement boundary follows the matched original byte
+            // range, and the written content is constructed from `new`.
             match find_tolerant_old_match(target_line, &old) {
                 Ok((start, end)) => (start, end - start),
                 Err(TolerantMatchError::Ambiguous(n)) => {
@@ -823,9 +861,9 @@ fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<Stri
         }
     };
 
-    // 精确替换：byte range [pos, pos+old.len())。
-    // pos 是 str::find 返回的 byte index，old 是有效 UTF-8，
-    // 所以 pos 和 pos+old.len() 都在 char boundary 上，切片安全。
+    // Exact replacement: byte range [pos, pos+old.len()).
+    // pos is the byte index returned by str::find; old is valid UTF-8, so pos and
+    // pos+old.len() both lie on char boundaries and slicing is safe.
     let replaced_line = format!(
         "{}{}{}",
         &target_line[..pos],
@@ -833,7 +871,7 @@ fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<Stri
         &target_line[pos + match_len..]
     );
 
-    // 重建文件，保留原始行尾换行行为
+    // Rebuild the file, preserving the original trailing-newline behavior
     let trailing_newline = original.ends_with('\n');
     let mut result = String::with_capacity(original.len() + new.len());
     for (i, line) in original_lines.iter().enumerate() {
@@ -851,33 +889,40 @@ fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<Stri
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchMode {
-    /// 精确匹配（允许行尾空白差异），默认使用。
+    /// Exact matching (allows trailing-whitespace differences), used by default.
     Strict,
-    /// 忽略前导缩进差异，仅在严格匹配全文件都定位不到时作为兜底。
-    /// 对齐 `git apply --ignore-whitespace`：模型对 markdown/嵌套列表/代码块
-    /// 的缩进常常复刻不准，导致严格匹配整块失配报 context mismatch。
+    /// Ignores leading-indentation differences; only used as a fallback when strict matching
+    /// fails to locate anything in the whole file.
+    /// Aligns with `git apply --ignore-whitespace`: models often fail to reproduce the
+    /// indentation of markdown/nested lists/code blocks exactly, causing strict matching to
+    /// fail on the whole block with context mismatch.
     IgnoreIndent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextPolicy {
-    /// context 行必须匹配，remove 行也必须匹配。
+    /// Context lines must match, and remove lines must also match.
     Require,
-    /// context 行只作为定位参考；应用时保留文件中的实际 context，remove 行仍必须匹配。
+    /// Context lines are only a locating reference; when applying, keep the file's actual
+    /// context, while remove lines must still match.
     Fuzz,
 }
 
-/// 剥离 read_file / grep 等工具输出的行号前缀（单参数兜底版）。
-/// 模型有时会不小心把行号前缀复制进 patch 的 context/remove 行中。
+/// Strips the line-number prefix that read_file / grep and other tool outputs add
+/// (single-argument fallback version).
+/// Models sometimes accidentally copy the line-number prefix into a patch's context/remove lines.
 ///
-/// 该版本用于**没有"真实行"可锚定**的场景（如 IgnoreIndent 双侧各自归一）。
-/// 有真实行可比对时，优先用锚定式 [`strip_number_prefix_anchored`]，它分隔符
-/// 无关且几乎零误伤。此处为避免误剥真正以数字开头的代码行（如 `80:80`、`42px`、
-/// `3.14`），采取**保守**策略，只认两类确定性极高的行号栏形状：
-/// - `digits + \t`：read_file 的真实格式（`{:>6}\t{}`）。TAB 后直接是行内容
-///   （含其自身缩进），只吞这一个 TAB。
-/// - `digits + 单个非字母数字分隔符 + 空格`：grep 类（`42| `、`42: `）。要求分隔符
-///   后**必须跟空格**，因此 `80:80`（`:` 后是数字）、`3.14`（`.` 后是数字）不会被误剥。
+/// This version is for scenarios with **no "real line" to anchor on** (e.g. IgnoreIndent
+/// normalizes both sides independently). When a real line is available for comparison, prefer
+/// the anchored [`strip_number_prefix_anchored`], which is separator-agnostic and has almost
+/// zero false positives. Here, to avoid wrongly stripping code lines that genuinely start with
+/// digits (e.g. `80:80`, `42px`, `3.14`), we take a **conservative** approach and only recognize
+/// two highly deterministic line-number-column shapes:
+/// - `digits + \t`: read_file's real format (`{:>6}\t{}`). The line content (including its own
+///   indentation) follows directly after the TAB; only this single TAB is consumed.
+/// - `digits + single non-alphanumeric separator + space`: grep-like (`42| `, `42: `). The
+///   separator must be **followed by a space**, so `80:80` (`:` followed by a digit) and `3.14`
+///   (`.` followed by a digit) are not wrongly stripped.
 fn strip_line_number_prefix(s: &str) -> &str {
     let trimmed = s.trim_start();
     let digits_end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
@@ -890,12 +935,14 @@ fn strip_line_number_prefix(s: &str) -> &str {
         Some(c) => c,
         None => return s,
     };
-    // TAB：read_file 真实分隔符，其后直接是内容（含缩进），只吞这一个 TAB。
+    // TAB: read_file's real separator; the content (including indentation) follows directly
+    // after it; only this single TAB is consumed.
     if sep == '\t' {
         return &after_digits['\t'.len_utf8()..];
     }
-    // 其它分隔符：必须是"非字母数字、非空格"的单字符，且其后紧跟一个空格
-    // （`42| ` / `42: `）。要求尾随空格可避免把 `80:80`、`3.14` 误判成行号栏。
+    // Other separators: must be a single non-alphanumeric, non-space character followed
+    // immediately by a space (`42| ` / `42: `). Requiring the trailing space avoids mistaking
+    // `80:80` or `3.14` for a line-number column.
     if sep.is_alphanumeric() || sep == ' ' {
         return s;
     }
@@ -906,15 +953,19 @@ fn strip_line_number_prefix(s: &str) -> &str {
     }
 }
 
-/// 锚定式行号前缀剥离：以 `actual`（原文件真实行，永不含行号栏）为 Ground Truth，
-/// 判断 `expected`（patch 行，可能被模型误抄了行号栏）去掉"数字栏"后是否**精确
-/// 等于** `actual`。是则返回去栏后的内容，否则返回 `expected` 原样。
+/// Anchored line-number-prefix stripping: using `actual` (the file's real line, which never
+/// contains a line-number column) as ground truth, decides whether `expected` (a patch line,
+/// possibly with a model-miscopied line-number column) is **exactly equal** to `actual` after
+/// removing the "digit column". If so, returns the de-columned content; otherwise returns
+/// `expected` unchanged.
 ///
-/// 相比枚举分隔符，这里分隔符无关（`\t` `|` `:` 空格 `.` `)` 全兼容），且因为
-/// 要求"剩余部分精确等于真实行"，几乎不可能误伤真正以数字开头的代码行——即便
-/// 恰好撞上，也会被 lines_match 的多处匹配（ambiguity）检测拦截。
+/// Compared with enumerating separators, this is separator-agnostic (`\t` `|` `:` space `.`
+/// `)` are all compatible), and because it requires "the remainder to exactly equal the real
+/// line", it can almost never wrongly hit code lines that genuinely start with digits — even if
+/// it happens to, lines_match's multi-match (ambiguity) detection intercepts it.
 fn strip_number_prefix_anchored<'a>(expected: &'a str, actual: &str) -> &'a str {
-    // expected 必须以「可选空白 + 数字」开头，否则不可能是"行号栏 + actual"。
+    // expected must start with "optional whitespace + digits", otherwise it cannot be
+    // "line-number column + actual".
     let lead_ws_end = expected
         .find(|c: char| !c.is_whitespace())
         .unwrap_or(expected.len());
@@ -923,20 +974,22 @@ fn strip_number_prefix_anchored<'a>(expected: &'a str, actual: &str) -> &'a str 
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(after_ws.len());
     if digits_end == 0 {
-        return expected; // 数字部分为空：不是行号栏。
+        return expected; // the digit part is empty: not a line-number column.
     }
     let after_digits = &after_ws[digits_end..];
-    // 去掉 1 个分隔符（按 char 边界，避免多字节 UTF-8 切分 panic）后的剩余部分。
+    // The remainder after removing 1 separator (on char boundaries, to avoid multi-byte UTF-8
+    // slice panics).
     let after_one_sep = after_digits
         .char_indices()
         .nth(1)
         .map(|(byte_idx, _)| &after_digits[byte_idx..])
         .unwrap_or("");
-    // 逐一尝试：去掉 0 或 1 个分隔符（可再带 1 个空格）后是否等于真实行。
-    // 用"剩余部分精确等于真实行"作为唯一判据，因此无需知道分隔符具体是什么。
+    // Try each candidate: does removing 0 or 1 separators (optionally with 1 space) equal the
+    // real line? "The remainder exactly equals the real line" is the only criterion, so we don't
+    // need to know what the separator actually is.
     let candidates = [
-        after_digits,  // 数字后直接是内容（罕见）
-        after_one_sep, // 吞 1 个分隔符
+        after_digits,  // digits directly followed by content (rare)
+        after_one_sep, // consume 1 separator
     ];
     for cand in candidates {
         if cand == actual || cand.trim_end() == actual.trim_end() {
@@ -951,50 +1004,54 @@ fn strip_number_prefix_anchored<'a>(expected: &'a str, actual: &str) -> &'a str 
     expected
 }
 
-/// 单个字符的 confusable 归一化（严格的 1:1 映射，不做任何宽度扩展）。
-/// 与 [`normalize_confusables`] 共用，确保"整串归一化"和"逐字符等价判定"行为一致。
+/// Single-character confusable normalization (strict 1:1 mapping, no width expansion).
+/// Shared with [`normalize_confusables`] to keep "whole-string normalization" and
+/// "per-character equivalence checks" consistent.
 fn normalize_confusable_char(c: char) -> char {
     match c {
-        // --- dash 系 ---
+        // --- dash family ---
         '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
         | '\u{2212}' => '-',
         // --- smart double quotes ---
         '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{2033}' => '"',
         // --- smart single quotes ---
         '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2032}' => '\'',
-        // --- 不间断空格系 ---
+        // --- non-breaking space family ---
         '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{2060}' => ' ',
         other => other,
     }
 }
 
-/// 将常见的 Unicode "confusable" 字符归一化为 ASCII 等价形式。
+/// Normalizes common Unicode "confusable" characters to ASCII-equivalent forms.
 ///
-/// 仅用于 patch 匹配的 **定位判定**（lines_match），绝不参与输出内容构造。
-/// 处理的字符都是纯排版差异，不影响语义：
-/// - dash 系（— – ― 等）-> '-'
-/// - smart quotes（" " ' ' ‛ ‟）-> '"' / "'"
-/// - 不间断空格（NBSP U+00A0、NNBSP U+202F 等）-> 普通空格
+/// Only used for **locating decisions** in patch matching (lines_match); never participates in
+/// constructing output content.
+/// All handled characters are purely typographic differences that don't affect semantics:
+/// - dash family (— – ― etc.) -> '-'
+/// - smart quotes (" " ' ' ‛ ‟) -> '"' / "'"
+/// - non-breaking spaces (NBSP U+00A0, NNBSP U+202F, etc.) -> regular space
 fn normalize_confusables(s: &str) -> String {
     s.chars().map(normalize_confusable_char).collect()
 }
 
-/// 在 `line` 中定位 `old` 的**宽容匹配**（仅用于 `*** Replace in line:` 的
-/// `old` 兜底定位）：
-/// - 逐字符 confusable 归一化等价（1:1，见 [`normalize_confusable_char`]），
-///   因此 em-dash/smart quotes/NBSP 与 ASCII 等价形式互相可匹配；
-/// - 忽略 `old` 首尾空白（模型常因缩进复刻把前导空格带进 `old`）。
+/// Locates `old` in `line` via **tolerant matching** (only for the `old` fallback locating in
+/// `*** Replace in line:`):
+/// - per-character confusable normalization equivalence (1:1, see [`normalize_confusable_char`]),
+///   so em-dash/smart quotes/NBSP match their ASCII-equivalent forms;
+/// - ignores leading/trailing whitespace in `old` (models often copy leading spaces into `old`
+///   while reproducing indentation).
 ///
-/// 返回匹配在原行中的 (byte_start, byte_end)。要求唯一：多处匹配返回
-/// [`TolerantMatchError::Ambiguous`]。匹配到后仍按原字节区间切片替换，
-/// 写入内容由 `new` 构造，不会把归一化后的字符写进文件。
+/// Returns the (byte_start, byte_end) of the match in the original line. Must be unique:
+/// multiple matches return [`TolerantMatchError::Ambiguous`]. The replacement still slices on the
+/// original byte range; the written content is constructed from `new`, so normalized characters
+/// are never written into the file.
 fn find_tolerant_old_match(line: &str, old: &str) -> Result<(usize, usize), TolerantMatchError> {
     let needle: Vec<char> = old.trim().chars().collect();
     let hay: Vec<char> = line.chars().collect();
     if needle.is_empty() || needle.len() > hay.len() {
         return Err(TolerantMatchError::NoMatch);
     }
-    // 预计算每个 char 的 byte offset，O(n) 一次，避免逐位置 nth()。
+    // Precompute each char's byte offset once in O(n) to avoid per-position nth().
     let byte_offsets: Vec<usize> = line.char_indices().map(|(b, _)| b).collect();
     let mut found: Vec<(usize, usize)> = Vec::new();
     'outer: for i in 0..=(hay.len() - needle.len()) {
@@ -1029,22 +1086,24 @@ fn lines_match_exact(actual: &str, expected: &str, mode: MatchMode) -> bool {
     }
     match mode {
         MatchMode::Strict => {
-            // 模型经常从 read_file 输出中复制行号前缀（如 `    42\t<code>`）。
-            // 优先用锚定式：以 actual（真实文件行）为准，判断 expected 去掉数字栏后
-            // 是否精确等于 actual —— 分隔符无关且几乎零误伤。
+            // Models often copy the line-number prefix from read_file output (e.g.
+            // `    42\t<code>`). Prefer the anchored approach: using actual (the real file line)
+            // as the reference, check whether expected equals actual exactly after removing the
+            // digit column — separator-agnostic and with almost zero false positives.
             let e = strip_number_prefix_anchored(expected, actual);
             if e == actual || e.trim_end() == actual.trim_end() {
                 return true;
             }
-            // 兜底：无 actual 锚点信息时的通用数字栏剥离（双侧），
-            // 兼容 actual 侧也带栏之类的极端情况。
+            // Fallback: generic digit-column stripping on both sides when no actual anchor info
+            // is available, also covering edge cases where the actual side carries a column too.
             let expected_stripped = strip_line_number_prefix(expected);
             let actual_stripped = strip_line_number_prefix(actual);
             expected_stripped == actual_stripped
                 || expected_stripped.trim_end() == actual_stripped.trim_end()
         }
         MatchMode::IgnoreIndent => {
-            // 先试锚定式（以 actual.trim 为准），再回退到双侧通用剥离 + trim。
+            // Try the anchored approach first (based on actual.trim), then fall back to generic
+            // two-sided stripping + trim.
             let e = strip_number_prefix_anchored(expected.trim_start(), actual.trim());
             if e.trim() == actual.trim() {
                 return true;
@@ -1054,13 +1113,16 @@ fn lines_match_exact(actual: &str, expected: &str, mode: MatchMode) -> bool {
     }
 }
 
-/// lines_match 的公共入口：先做精确匹配，失败后对 confusable 字符归一化再比较。
+/// Common entry point for lines_match: exact matching first, then compare after normalizing
+/// confusable characters.
 ///
-/// 归一化只影响"能否定位到"的判定。输出内容由 try_apply_hunk_at 构造：
-/// - Context 行输出 actual（原文件内容）
-/// - Remove 行匹配后丢弃
-/// - Add 行直接用 patch 内容
-/// 因此归一化匹配成功时，写入文件的仍是原文件的 Unicode 字符，不会"替换错内容"。
+/// Normalization only affects whether a line "can be located". Output content is constructed by
+/// try_apply_hunk_at:
+/// - Context lines output actual (the original file content)
+/// - Remove lines are dropped after matching
+/// - Add lines use the patch content directly
+/// So when normalized matching succeeds, the file still receives the original file's Unicode
+/// characters — content is never "replaced with the wrong thing".
 fn lines_match(actual: &str, expected: &str, mode: MatchMode) -> bool {
     if lines_match_exact(actual, expected, mode) {
         return true;
@@ -1091,7 +1153,7 @@ fn lines_match(actual: &str, expected: &str, mode: MatchMode) -> bool {
     }
 }
 
-/// 提取 hunk 的 context+remove 行（即"期望在原文件中匹配到"的行）。
+/// Extracts the hunk's context+remove lines (i.e. the lines expected to match in the original file).
 fn hunk_expected_lines(hunk: &UnifiedHunk) -> Vec<&str> {
     hunk.lines
         .iter()
@@ -1102,8 +1164,9 @@ fn hunk_expected_lines(hunk: &UnifiedHunk) -> Vec<&str> {
         .collect()
 }
 
-/// 在全文件范围内统计 hunk 的 context+remove 块能匹配到的位置（0-based 行号）。
-/// 用于检测"多处匹配"歧义，避免静默改错地方。
+/// Counts, across the whole file, the positions (0-based line numbers) where the hunk's
+/// context+remove block can match.
+/// Used to detect "multiple matches" ambiguity, avoiding silently editing the wrong place.
 fn all_hunk_match_positions(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
@@ -1149,8 +1212,8 @@ fn describe_ambiguous_hunk(
         shown.join(", "),
         if positions.len() > 8 { ", ..." } else { "" }
     );
-    // 回显每个候选位置的当前首行，帮助模型选出正确锚点、加更独特的上下文，
-    // 无需再单独 read_file。
+    // Echo the current first line at each candidate position, so the model can pick the right
+    // anchor and add more unique context without a separate read_file.
     msg.push_str("Candidate locations (current first line at each):\n");
     for &pos in positions.iter().take(8) {
         if let Some(line) = orig_lines.get(pos) {
@@ -1308,9 +1371,10 @@ fn fuzzy_context_candidates(
     candidates
 }
 
-/// context 行是定位辅助，不应在 remove 行已经精确锚定时导致硬失败。
-/// 但为了避免把常见 remove 行（如 `}`）改错位置，只有候选唯一，或剩余 context
-/// 能唯一打分时才允许 fuzz 应用。
+/// Context lines are a locating aid and should not cause a hard failure once the
+/// remove lines are precisely anchored. But to avoid mislocating common remove
+/// lines (such as `}`), fuzz application is allowed only when the candidate is
+/// unique or the remaining context can be scored uniquely.
 fn locate_hunk_with_fuzzy_context(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
@@ -1340,10 +1404,12 @@ fn locate_hunk_with_fuzzy_context(
     }
 
     let nominal = hunk.old_start.saturating_sub(1);
-    // 用 old_start 作为消歧信号：只要 nominal 候选的 context 分数接近最优
-    // （差值 ≤ 1），就信任模型标注的行号。best_score == 0 时（上下文行完全
-    // 无法区分候选位置）也接受——此时 old_start 是唯一可用的定位信号，
-    // 拒绝只会导致模型无限重试相同的 generic context。
+    // Use old_start as a disambiguation signal: as long as the nominal
+    // candidate's context score is close to the best (difference ≤ 1), trust the
+    // line number the model annotated. Accept it also when best_score == 0 (the
+    // context lines cannot distinguish candidate positions at all) — then
+    // old_start is the only usable locating signal, and rejecting would just make
+    // the model retry the same generic context endlessly.
     if hunk.old_start > 0 && nominal < orig_lines.len() {
         if let Some(nominal_candidate) = candidates.iter().find(|c| c.pos == nominal) {
             if best_score == 0 || nominal_candidate.context_matches + 1 >= best_score {
@@ -1373,24 +1439,28 @@ fn locate_hunk_with_fuzzy_context(
     ))
 }
 
-/// 大块替换（hunk 含大量 context/remove 行）时，全有或全无的精确匹配极易因个别行
-/// 复刻不准而整体失败。此处先做一次 best-effort 部分匹配扫描：在全文件范围内找到
-/// 匹配行数最多的起点，并精确报告哪些行不一致（expected vs actual），让模型只需
-/// 修正出错的几行而非重新猜测整块。
+/// For large replacements (a hunk with many context/remove lines), all-or-nothing
+/// exact matching easily fails entirely when a few lines are not reproduced
+/// exactly. Here we first run a best-effort partial-match scan: find the start
+/// with the most matching lines across the whole file, and report precisely which
+/// lines differ (expected vs actual), so the model only needs to fix the few
+/// wrong lines instead of re-guessing the whole block.
 struct BestPartialMatch {
-    /// 最佳匹配起点（0-based）
+    /// Best matching start (0-based)
     pos: usize,
-    /// 匹配的行数
+    /// Number of matching lines
     matches: usize,
-    /// 检查的总行数
+    /// Total number of lines checked
     total: usize,
-    /// 不一致的行：(1-based 文件行号, 期望内容, 实际内容)
+    /// Mismatched lines: (1-based file line, expected content, actual content)
     mismatches: Vec<(usize, String, String)>,
 }
 
-/// 在全文件范围内找到 hunk 期望行块匹配度最高的起点。
-/// 仅在精确匹配失败后的错误路径调用，用 IgnoreIndent 模式以容忍缩进差异、
-/// 聚焦内容差异。返回 None 表示文件中没有任何行能匹配期望块——块完全不存在。
+/// Finds the start position where the hunk's expected block matches best across
+/// the whole file. Called only on the error path after exact matching failed,
+/// using IgnoreIndent mode to tolerate indentation differences and focus on
+/// content differences. Returns None when no line in the file can match the
+/// expected block — the block does not exist at all.
 fn find_best_partial_match(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
@@ -1401,13 +1471,16 @@ fn find_best_partial_match(
         return None;
     }
 
-    // 用首行做快速过滤：只在首行能匹配的候选位置做完整对齐检查，避免大文件上的
-    // O(N*M) 全扫描。大块替换中最常见的失败是首行正确、后续个别行有误。
+    // Use the first line for a quick filter: only run the full alignment check at
+    // candidate positions where the first line matches, avoiding an O(N*M) full
+    // scan on large files. In large replacements the most common failure is a
+    // correct first line with a few wrong lines after it.
     let mut candidates: Vec<usize> = (0..orig_lines.len())
         .filter(|&i| lines_match(&orig_lines[i], expected[0], mode))
         .collect();
 
-    // 首行匹配不到时，用末行做锚点：末行匹配位置 i 对应起点 i - (len-1)。
+    // When the first line does not match, use the last line as an anchor: a last
+    // line matching at position i corresponds to start i - (len-1).
     if candidates.is_empty() && expected.len() > 1 {
         let last = expected.len() - 1;
         candidates = (last..orig_lines.len())
@@ -1416,8 +1489,10 @@ fn find_best_partial_match(
             .collect();
     }
 
-    // 首尾都匹配不到时，用每一条期望行做锚点，取匹配行最多的候选。
-    // 这是最后的兜底，覆盖期望块中间行正确但首尾行有误的情况。
+    // When neither the first nor the last line matches, anchor on every expected
+    // line and take the candidate with the most matching lines. This is the final
+    // fallback, covering cases where the middle lines of the expected block are
+    // correct but the first/last lines are wrong.
     if candidates.is_empty() {
         for (ei, exp) in expected.iter().enumerate() {
             for (fi, line) in orig_lines.iter().enumerate() {
@@ -1433,7 +1508,7 @@ fn find_best_partial_match(
         candidates.dedup();
     }
 
-    // 限制候选数量，避免极端情况下的性能问题。
+    // Limit the number of candidates to avoid performance issues in extreme cases.
     candidates.truncate(500);
 
     let mut best: Option<BestPartialMatch> = None;
@@ -1465,7 +1540,8 @@ fn find_best_partial_match(
                 mismatches,
             });
         }
-        // 完美匹配不应出现在错误路径，但保留提前退出以保安全。
+        // A perfect match should not occur on the error path, but keep the early
+        // exit for safety.
         if matches == expected.len() {
             break;
         }
@@ -1477,8 +1553,9 @@ fn format_char_with_code_point(ch: char) -> String {
     format!("{ch:?} (U+{:04X})", ch as u32)
 }
 
-/// 描述两行文本首个不同字符的位置与 Unicode code point，便于快速发现
-/// 智能引号/全半角等"看起来像一样"的字符差异。
+/// Describes the position and Unicode code point of the first differing character
+/// between two lines of text, making it easy to spot "looks-alike" differences
+/// such as smart quotes or full/half-width characters.
 fn describe_first_char_mismatch(expected: &str, actual: &str) -> Option<String> {
     let mut column = 1usize;
     let mut expected_chars = expected.chars();
@@ -1542,12 +1619,15 @@ fn describe_aligned_block_first_mismatch(
 pub(crate) const PATCH_TEXT_BLOCK_START: &str =
     "Current file text at this location (copy verbatim, no line-number prefix):\n<<<PATCH_TEXT\n";
 
-/// 渲染一段「可直接粘贴」的当前文件文本块（0-based `start`，含 `count` 行）。
+/// Renders a directly pasteable block of the current file text (0-based `start`,
+/// `count` lines).
 ///
-/// 与错误信息里其它诊断（带 `<行号>:` 前缀、便于人眼定位）不同，这个块**不带任何
-/// 行号前缀**，专门给模型照抄进新 patch 的 context/removed 行——从根源上消除「把
-/// read_file 的 `<number>\t` 行号栏一起抄进 patch」这一高频错误。用 `<<<PATCH_TEXT`
-/// / `PATCH_TEXT>>>` 明确圈定可复制边界。
+/// Unlike the other diagnostics in the error message (which carry a `<line>:` prefix
+/// for human eyes), this block carries **no line-number prefix** and is meant to be
+/// copied verbatim by the model into the new patch's context/removed lines — this
+/// eliminates at the root the frequent error of copying read_file's `<number>\t`
+/// line-number column into the patch. The `<<<PATCH_TEXT` / `PATCH_TEXT>>>` markers
+/// clearly delimit the copyable region.
 fn render_pasteable_current_block(orig_lines: &[String], start: usize, count: usize) -> String {
     let end = start.saturating_add(count).min(orig_lines.len());
     if start >= end {
@@ -1562,19 +1642,23 @@ fn render_pasteable_current_block(orig_lines: &[String], start: usize, count: us
     out
 }
 
-/// 构造带诊断的 "hunks out of order" 错误。
+/// Constructs a "hunks out of order" error with diagnostics.
 ///
-/// 之前该错误只返回裸字符串 `"hunks out of order"`——没有行号、没有是哪个 hunk、
-/// 没有当前文本、没有修复建议，模型只能盲猜（真实会话里因此连败 4 轮）。
+/// Previously this error returned only the bare string `"hunks out of order"` — no
+/// line numbers, no indication of which hunk, no current text, no fix suggestion, so
+/// the model could only guess blindly (in real sessions this caused 4 consecutive
+/// failures).
 ///
-/// unified diff 要求各 hunk 按文件行号**升序**排列；`apply_unified_patch` 用一个
-/// 单调递增的 `cursor` 逐个定位 hunk。当某个 hunk 唯一匹配到的位置落在 `cursor`
-/// （上一个 hunk 结束行）之前，就说明模型把 hunk 写成了乱序（或存在重叠）。这里
-/// 说清楚原因、给出该 hunk 匹配到的位置 vs 允许的最早位置、附可粘贴当前文本，并
-/// 明确建议按行号重排或改用独立的 `*** Replace in line:` 段落。
+/// Unified diffs require hunks to be ordered by **ascending** file line number;
+/// `apply_unified_patch` locates each hunk with a monotonically increasing `cursor`.
+/// When the unique match position of a hunk falls before `cursor` (the end line of
+/// the previous hunk), the model wrote the hunks out of order (or overlapping).
+/// This explains the cause, gives the matched position of this hunk vs the earliest
+/// allowed position, appends pasteable current text, and clearly suggests reordering
+/// by line number or switching to separate `*** Replace in line:` sections.
 ///
-/// `matched_pos` 为该 hunk 实际匹配到的 0-based 行（若已知）；`cursor` 为当前允许
-/// 的最早 0-based 起点。
+/// `matched_pos` is the 0-based line this hunk actually matched (if known); `cursor`
+/// is the earliest currently allowed 0-based start.
 fn describe_hunks_out_of_order(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
@@ -1610,7 +1694,8 @@ fn describe_hunks_out_of_order(
             cursor + 1
         )),
     }
-    // 附该 hunk 期望块处的可粘贴当前文本，帮助模型据此重排/重建。
+    // Append pasteable current text at this hunk's expected block to help the model
+    // reorder/rebuild accordingly.
     let anchor = matched_pos.unwrap_or_else(|| hunk.old_start.saturating_sub(1));
     let expected_len = hunk_expected_lines(hunk).len().max(1);
     let block = render_pasteable_current_block(orig_lines, anchor, expected_len);
@@ -1620,8 +1705,10 @@ fn describe_hunks_out_of_order(
     msg
 }
 
-/// 构造带上下文的 "context mismatch" 错误：列出 patch 期望匹配的行，以及原文件
-/// 在标称位置附近的实际行，帮助模型快速自我修正，而不是只看到一句 "context mismatch"。
+/// Constructs a "context mismatch" error with context: lists the lines the patch
+/// expected to match plus the actual lines in the original file near the nominal
+/// position, so the model can quickly self-correct instead of only seeing a bare
+/// "context mismatch".
 fn describe_context_mismatch(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
@@ -1650,8 +1737,10 @@ fn describe_context_mismatch(
         ));
     }
 
-    // 先尝试 best-effort 部分匹配，精确定位不一致的行。大块替换中最常见的失败是
-    // 整块只有个别行复刻不准，部分匹配能告诉模型"第 X 行期望 A 但实际是 B"。
+    // First try a best-effort partial match to pinpoint the mismatched lines. In
+    // large replacements the most common failure is that only a few lines in the
+    // block are not reproduced exactly; a partial match can tell the model "line X
+    // expected A but is B".
     if let Some(best) = find_best_partial_match(orig_lines, hunk, MatchMode::IgnoreIndent) {
         msg.push_str(&format!(
             "Best partial match at line {} ({}/{} lines matched).\n",
@@ -1665,7 +1754,8 @@ fn describe_context_mismatch(
                  the mismatch may be due to hunk ordering or a missing trailing line.\n",
             );
         } else {
-            // 展示前 10 个不匹配行：完整偏移模式比精简字数对模型修 patch 更重要
+            // Show the first 10 mismatched lines: the full offset pattern matters
+            // more than a condensed word count for the model to fix the patch.
             let show = best.mismatches.len().min(10);
             msg.push_str(&format!(
                 "Mismatched lines (showing {} of {}):\n",
@@ -1688,15 +1778,17 @@ fn describe_context_mismatch(
                 ));
             }
         }
-        // 可直接粘贴的当前文本块：覆盖 best 匹配区间（含少量前后余量），
-        // 让模型无需重读整文件即可就地重建 patch。
+        // A directly pasteable block of current text: covers the best-match region
+        // (with a little extra margin before/after) so the model can rebuild the
+        // patch in place without re-reading the whole file.
         let block =
             render_pasteable_current_block(orig_lines, best.pos, best.total.max(expected.len()));
         if !block.is_empty() {
             msg.push_str(&block);
         }
     } else {
-        // 文件中找不到任何部分匹配——块完全不存在。回显期望行和标称位置附近实际内容。
+        // No partial match found in the file — the block does not exist at all.
+        // Echo the expected lines and the actual content near the nominal position.
         msg.push_str("Patch expected these lines (context/removed):\n");
         for (i, line) in expected.iter().take(10).enumerate() {
             msg.push_str(&format!("  expected[{}]: {}\n", i, line));
@@ -1717,7 +1809,7 @@ fn describe_context_mismatch(
             for (offset, line) in orig_lines[win_start..win_end].iter().enumerate() {
                 msg.push_str(&format!("  {:>6}: {}\n", win_start + offset + 1, line));
             }
-            // 同样附一份无行号前缀、可直接粘贴的块。
+            // Also append a pasteable block with no line-number prefix.
             let block = render_pasteable_current_block(orig_lines, win_start, win_end - win_start);
             if !block.is_empty() {
                 msg.push_str(&block);
@@ -1774,9 +1866,10 @@ fn try_apply_hunk_at(
     Some((out, idx))
 }
 
-/// 在给定匹配模式下定位一个 hunk 的应用起点（0-based）。
-/// 返回 `Ok(Some(pos))` 表示唯一定位成功；`Ok(None)` 表示全文件都匹配不到
-/// （调用方可用更宽松的模式重试）；`Err` 表示定位到但存在歧义或顺序错误。
+/// Locates the application start (0-based) of a hunk under the given match mode.
+/// Returns `Ok(Some(pos))` for a unique successful location; `Ok(None)` when no
+/// position in the whole file matches (the caller may retry with a more lenient
+/// mode); `Err` when a position was found but is ambiguous or out of order.
 fn locate_hunk(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
@@ -1817,9 +1910,10 @@ fn locate_hunk(
         return Ok(Some(nominal));
     }
 
-    // 标称位置匹配不上时，先检查全文件范围内有多少处能匹配：
-    // 多处匹配说明上下文锚点非唯一，应直接报出候选位置，避免继续回退到
-    // fuzzy context 后生成令人困惑的 context mismatch。
+    // When the nominal position does not match, first check how many places across
+    // the whole file can match: multiple matches mean the context anchors are not
+    // unique, so report the candidate positions directly instead of falling back
+    // to fuzzy context and producing a confusing context mismatch.
     let positions = all_hunk_match_positions(orig_lines, hunk, mode);
     let forward: Vec<usize> = positions.iter().copied().filter(|&p| p >= cursor).collect();
     if forward.len() > 1 {
@@ -1833,14 +1927,16 @@ fn locate_hunk(
             hunk_total,
         ));
     }
-    // forward 已经过滤了 p >= cursor，所以这里不会有 "hunks out of order"。
-    // 之前回退到 find_hunk_offset（±50 窗口）会在唯一匹配超出窗口时误报
-    // context mismatch；直接使用 forward 的唯一结果即可。
+    // forward is already filtered to p >= cursor, so "hunks out of order" cannot
+    // happen here. Previously falling back to find_hunk_offset (a ±50 window) would
+    // falsely report context mismatch when the unique match fell outside the
+    // window; just use forward's unique result directly.
     if let Some(&offset) = forward.first() {
         Ok(Some(offset))
     } else if let Some(&earliest) = positions.first() {
-        // 所有匹配都在 cursor 之前——hunk 顺序错误。positions 已按升序排列，
-        // 取最靠前的匹配位置作为诊断锚点。
+        // All matches are before cursor — the hunk is out of order. positions is
+        // already sorted ascending, so take the earliest match as the diagnostic
+        // anchor.
         Err(describe_hunks_out_of_order(
             orig_lines,
             hunk,
@@ -1883,9 +1979,12 @@ fn apply_unified_patch_with_hints(
     let mut cursor = 0usize;
 
     for (hunk_idx, hunk) in active_hunks.iter().enumerate() {
-        // 先做严格匹配（仅容忍行尾空白）。严格匹配全文件都定位不到时，再用忽略
-        // 前导缩进的宽松模式兜底一次——对齐 `git apply --ignore-whitespace`，
-        // 解决模型对 markdown/嵌套列表/代码块缩进复刻不准导致的 context mismatch。
+        // First try strict matching (only tolerating trailing whitespace). When
+        // strict matching cannot locate the hunk anywhere in the file, fall back
+        // once to a lenient mode that ignores leading indentation — aligned with
+        // `git apply --ignore-whitespace`, resolving context mismatches caused by
+        // the model not reproducing markdown/nested-list/code-block indentation
+        // exactly.
         let (apply_at, mode, context_policy) = match locate_hunk(
             &orig_lines,
             hunk,
@@ -1954,9 +2053,11 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
     apply_unified_patch_with_hints(original, patch).map(|(content, _)| content)
 }
 
-/// 纯插入 hunk（只有 `+` 行、无 context/remove 行）在非空文件上不经过任何内容
-/// 验证，仅按 `@@` 声明的行号定位。命中时返回提示，提醒模型若文件在读取后
-/// 发生过变更，需用 read_file 复核插入位置。
+/// A pure-insert hunk (only `+` lines, no context/remove lines) undergoes no
+/// content verification on a non-empty file; it is located only by the line number
+/// declared in `@@`. When one is hit, return a hint reminding the model that if the
+/// file changed after being read, it should re-verify the insert position with
+/// read_file.
 fn pure_insert_hint(original: &str, hunks: &[UnifiedHunk]) -> Option<String> {
     if original.is_empty() {
         return None;
@@ -1976,10 +2077,11 @@ fn pure_insert_hint(original: &str, hunks: &[UnifiedHunk]) -> Option<String> {
     })
 }
 
-/// 轻量截断启发：内联 patch 被上下文管理器截断时，末尾常呈残缺结构（未闭合的
-/// envelope、以裸 hunk header 或半个 `***` 标记结尾）。命中时在错误文本里追加
-/// 改用 `patch_file` 的替代路径，避免模型在误导性的解析错误上重复重试同一份
-/// 残缺 patch。
+/// A lightweight truncation heuristic: when an inline patch is cut off by the
+/// context manager, its tail often looks truncated (an unclosed envelope, or it
+/// ends with a bare hunk header or a partial `***` marker). On a hit, append the
+/// alternative `patch_file` path to the error text so the model does not keep
+/// retrying the same truncated patch on a misleading parse error.
 fn truncated_patch_hint(patch: &str) -> Option<&'static str> {
     let trimmed = patch.trim_end();
     if trimmed.is_empty() {
@@ -1987,7 +2089,7 @@ fn truncated_patch_hint(patch: &str) -> Option<&'static str> {
     }
     let lines: Vec<&str> = trimmed.lines().collect();
     let last = lines.last().unwrap().trim_end();
-    // 1) 以 envelope 标记开头但全篇未闭合
+    // 1) Starts with an envelope marker but is never closed
     let starts_envelope = lines
         .iter()
         .any(|line| line.trim_start().starts_with("*** Begin Patch"));
@@ -1999,7 +2101,8 @@ fn truncated_patch_hint(patch: &str) -> Option<&'static str> {
     {
         return Some("the patch starts with `*** Begin Patch` but has no closing `*** End Patch`");
     }
-    // 2) 以残缺 `***` 分节/结尾标记收尾（如 `*** End Patc`、`*** Update File: /pa`）
+    // 2) Ends with a partial `***` section/closing marker (e.g. `*** End Patc`,
+    //    `*** Update File: /pa`)
     let last_trimmed = last.trim();
     if last.starts_with("*** ")
         && last_trimmed != "*** End Patch"
@@ -2007,14 +2110,16 @@ fn truncated_patch_hint(patch: &str) -> Option<&'static str> {
     {
         return Some("the patch ends with a partial `***` section marker");
     }
-    // 3) 以 hunk header 收尾（其后没有内容行）：hunk 至少需要一个 ` `/`-`/`+` 体行
+    // 3) Ends with a hunk header (no content lines after it): a hunk needs at least
+    //    one body line that is ` ` / `-` / `+`.
     if last.trim_start().starts_with("@@") {
         return Some("the patch ends with a `@@` hunk header and no body lines after it");
     }
     None
 }
 
-/// 解析失败时若截断启发命中，把可执行的替代路径追加到错误文本末尾。
+/// When a parse failure hits the truncation heuristic, append the actionable
+/// alternative path to the end of the error text.
 fn append_truncated_patch_hint(patch: &str, err: String) -> String {
     match truncated_patch_hint(patch) {
         Some(hint) => format!(
@@ -2032,9 +2137,10 @@ fn emit_stream_line(on_chunk: &mut ToolStreamWriter<'_>, line: &str) {
     on_chunk(rendered.as_bytes());
 }
 
-/// 剥离模型常给 patch 外层包裹的代码围栏（```...``` 或 ~~~...~~~）。
-/// 仅当整体 patch 被一对围栏包裹（首行开围栏、末行裸闭围栏）时才剥离；
-/// 围栏出现在 patch 内部内容中时不处理，避免误伤真正的 patch 内容。
+/// Strips code fences (```...``` or ~~~...~~~) the model often wraps around a
+/// patch. Strips only when the whole patch is wrapped in one pair (opening fence on
+/// the first line, bare closing fence on the last); fences inside the patch body
+/// are left untouched to avoid damaging real patch content.
 fn strip_code_fence(patch: &str) -> String {
     let lines: Vec<&str> = patch.lines().collect();
     if lines.len() < 3 {
@@ -2045,7 +2151,9 @@ fn strip_code_fence(patch: &str) -> String {
     if !is_open_fence {
         return patch.to_string();
     }
-    // 从末尾向前找第一个非空行作为闭围栏候选——模型常在闭围栏后多输出空行。
+    // Walk backwards from the end to find the first non-empty line as the closing
+    // fence candidate — the model often emits extra blank lines after the closing
+    // fence.
     let last_nonempty = lines
         .iter()
         .rposition(|l| !l.trim().is_empty())
@@ -2055,7 +2163,8 @@ fn strip_code_fence(patch: &str) -> String {
     if !is_close_fence || last_nonempty < 2 {
         return patch.to_string();
     }
-    // 剥离首尾围栏行，保留中间内容并去掉多余首尾空白。
+    // Strip the first/last fence lines, keep the middle content, and trim excess
+    // leading/trailing whitespace.
     lines[1..last_nonempty].join("\n").trim().to_string()
 }
 
@@ -2066,7 +2175,7 @@ fn diff_stats_for_write(write: &PreparedPatchWrite) -> (usize, usize, usize) {
             let after_lines = next.lines().count();
             match &write.before {
                 Some(before) => {
-                    // 逐行对比统计新增/删除
+                    // Count additions/removals by comparing line by line
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
                     let mut before_set: Vec<u64> = before
@@ -2148,8 +2257,10 @@ fn format_legacy_patch_dry_run(writes: &[PreparedPatchWrite]) -> String {
     message
 }
 
-/// 仅兼容旧会话/历史回放。`dry_run` 不再暴露给模型，但不能直接忽略旧参数，
-/// 否则旧的 `dry_run: true` 调用会从“只校验”静默变成真实写入。
+/// Kept only for compatibility with old sessions/history replay. `dry_run` is no
+/// longer exposed to the model, but the old parameter cannot be silently ignored:
+/// otherwise an old `dry_run: true` call would silently change from "validate only"
+/// into a real write.
 fn legacy_dry_run_arg(args: &Value) -> Result<bool, String> {
     match args.get("dry_run") {
         None | Some(Value::Null) => Ok(false),
@@ -2268,8 +2379,9 @@ fn prepare_patch_write(
     };
     let (action, hints) =
         if matches!(envelope.op, PatchEnvelopeOp::Update | PatchEnvelopeOp::Add) {
-        // 首次处理某个文件时沿用磁盘存在性检查，保持单 section 行为不变；
-        // 重复同文件 section 由 prepare_patch_action_from_content 按内存状态处理。
+        // On the first encounter of a file, keep the disk-existence check so the
+        // single-section behavior is unchanged; repeated sections for the same file
+        // are handled by prepare_patch_action_from_content against in-memory state.
         let normalized_patch = normalize_patch_envelope(path, envelope)?;
         let original = before.as_deref().unwrap_or_default();
         apply_unified_patch_with_hints(original, &normalized_patch)
@@ -2285,10 +2397,12 @@ fn prepare_patch_write(
     })
 }
 
-/// 按"已切分好的单文件 unified diff 片段"准备写入（多文件 unified diff 路径用）。
-/// 与 prepare_patch_write 的区别：section 自带 `--- `/`+++ ` 文件头与 `@@` hunks，
-/// 不再走 envelope 归一化，直接交给 apply_unified_patch（parse_unified_hunks 会跳过
-/// 非 `@@` 行），因此可以原样复用 unified-diff 的容错匹配语义。
+/// Prepares a write from an already-split single-file unified diff section (used
+/// for the multi-file unified diff path). Unlike prepare_patch_write, the section
+/// carries its own `--- `/`+++ ` file headers and `@@` hunks, so no envelope
+/// normalization is applied — it is handed straight to apply_unified_patch
+/// (parse_unified_hunks skips non-`@@` lines), reusing the tolerant match
+/// semantics of unified diffs as-is.
 fn prepare_patch_write_from_section(
     path: &Path,
     store: &FileStore,
@@ -2310,7 +2424,8 @@ fn prepare_patch_write_from_section(
     })
 }
 
-/// 拒绝最终内容与原文件完全相同的写入，避免工具报告成功却没有产生实际改动。
+/// Rejects writes whose final content is identical to the original file, so the
+/// tool never reports success without actually changing anything.
 fn ensure_patch_writes_change(writes: &[PreparedPatchWrite]) -> Result<(), String> {
     for write in writes {
         let PreparedPatchAction::Write(next) = &write.action else {
@@ -2371,7 +2486,8 @@ fn restore_prepared_patch_write(write: &PreparedPatchWrite) -> Result<(), String
             .map_err(|err| format!("failed to restore {}: {err}", write.path.display())),
         None => match fs::remove_file(&write.path) {
             Ok(()) => {
-                // 回滚删除（文件是本批次新建的）：记录被删内容，使审计轨迹完整。
+                // Roll back the deletion (the file was newly created in this
+                // batch): record the deleted content so the audit trail is complete.
                 let deleted = match &write.action {
                     PreparedPatchAction::Write(c) => Some(c.as_str()),
                     PreparedPatchAction::Delete => None,
@@ -2424,8 +2540,10 @@ fn commit_patch_writes(writes: &[PreparedPatchWrite]) -> Result<(), String> {
 
 fn optional_patch_source_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
     match args.get(key) {
-        // 部分 provider / tool bridge 会把 schema 中的可选字段物化为 null 或空串。
-        // 对互斥来源参数而言它们都表示“未提供”，不能在另一个来源有效时误报错误。
+        // Some providers / tool bridges materialize optional schema fields as null
+        // or empty strings. For mutually exclusive source arguments, both mean "not
+        // provided" and must not be reported as an error when the other source is
+        // valid.
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
@@ -2457,9 +2575,10 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         (None, Some(pf)) => {
             let store = FileStore::new(PathBuf::from(&pf));
             let resolved = store.path();
-            // patch_file 的合同：必须是会话临时文件（write_file(temp=true) 写入并登记
-            // 在 temp registry）或 effective_cwd 下的文件；两者之外明确拒绝，避免模型
-            // 指向任意系统文件造成困惑。
+            // patch_file contract: it must be a session temp file (written with
+            // write_file(temp=true) and registered in the temp registry) or a file
+            // under effective_cwd; anything else is rejected outright so the model
+            // cannot point at arbitrary system files and get confused.
             let in_cwd = crate::ai::driver::runtime_ctx::effective_cwd()
                 .map(|cwd| resolved.starts_with(&cwd))
                 .unwrap_or(false);
@@ -2494,9 +2613,11 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         }
     };
     let patch = strip_code_fence(&raw_patch);
-    // 截断启发：内联 patch 若以未闭合 envelope / 残缺 `***` 标记 / 裸 hunk header
-    // 收尾，很可能是被上下文管理器截断。无论后续是成功还是报错，都先给出提示，
-    // 避免模型把残缺文本当成自己的语法错误反复重试。
+    // Truncation heuristic: when an inline patch ends with an unclosed envelope, a
+    // partial `***` marker, or a bare hunk header, it was likely cut off by the
+    // context manager. Emit a hint up front regardless of whether the patch then
+    // succeeds or errors, so the model does not keep retrying truncated text as if
+    // it were its own syntax error.
     if let Some(hint) = truncated_patch_hint(&patch) {
         emit(&format!(
             "warning: {hint}; the patch may have been truncated by the context manager \
@@ -2505,8 +2626,9 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
         ));
     }
     if from_file {
-        // patch_file 的目的就是承载大补丁（内联 patch 会被上下文管理器截断），因此不受
-        // 8K 内联限制；只设一个宽松的安全上限，防止模型误读超大文件。
+        // patch_file is meant to carry large patches (inline patches get truncated
+        // by the context manager), so it is exempt from the 8K inline limit; only a
+        // loose safety cap is set to stop the model from misreading oversized files.
         const MAX_PATCH_FILE_CHARS: usize = 64_000;
         if patch.chars().count() > MAX_PATCH_FILE_CHARS {
             return Err(format!(
@@ -2517,8 +2639,10 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
             ));
         }
     } else {
-        // 内联 patch 过大时大概率在上下文管理器处被截断（表现为 patch 缺失/残缺，或
-        // 误导性的 context mismatch）。直接报错并给出拆分路径，胜过把残缺文本喂给解析器。
+        // An oversized inline patch is very likely to be truncated by the context
+        // manager (appearing as a missing/partial patch or a misleading context
+        // mismatch). Erroring out directly with a splitting path beats feeding
+        // truncated text to the parser.
         const MAX_INLINE_PATCH_CHARS: usize = 8_000;
         if patch.chars().count() > MAX_INLINE_PATCH_CHARS {
             return Err(format!(
@@ -2536,9 +2660,9 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
     if let Some(envelopes) = parse_patch_envelopes(&patch)
         .map_err(|err| append_truncated_patch_hint(&patch, err))?
     {
-        // 信封（无论单文件/多文件）内各 section 已声明各自目标路径，file_path 是
-        // 多余的。模型常在多文件信封时冗余传 file_path，与其硬报错浪费一轮，不如
-        // 静默忽略并用信封路径（信封路径才是权威来源）。
+        // Each section inside an envelope (single-file or multi-file) already declares its own target path, so `file_path` is
+        // redundant. Models often redundantly pass `file_path` for multi-file envelopes; instead of hard-erroring and wasting a round,
+        // silently ignore it and use the envelope path (the envelope path is the authoritative source).
         if initial_file_path.is_some() {
             emit("note: ignoring redundant file_path arg; using paths from Begin Patch envelope");
         }
@@ -2626,10 +2750,10 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
     }
 
     let header_target = parse_unified_diff_header_target(&patch);
-    // 多文件 unified diff（git diff 输出或模型手写）：自动按文件拆分后逐个 prepare，
-    // 全部成功再统一 commit——与 Begin Patch 信封的批量语义一致（原子、同路径叠加）。
-    // 注意：同文件多 section（两个 `diff --git a/x b/x`）经 header 解析去重后 paths.len()==1，
-    // 因此以 split 出的 section 数（>1）或解析出的不同路径数（>1）为准，二者都走拆分路径。
+    // Multi-file unified diff (git diff output or hand-written by the model): split by file and prepare each one,
+    // then commit only after all succeed — matching the batch semantics of the Begin Patch envelope (atomic, same-path stacking).
+    // Note: multiple sections for the same file (two `diff --git a/x b/x`) dedupe to paths.len()==1 after header parsing,
+    // so use the split section count (>1) or the count of distinct parsed paths (>1) as the criterion — both take the split path.
     let split_sections = split_unified_diff_by_file(&patch);
     let multi_file_sections = match &split_sections {
         Ok(sections) if sections.len() > 1 || header_target.paths.len() > 1 => Some(sections),
@@ -2669,7 +2793,7 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
                 .validate_write_access()
                 .map_err(|err| err.to_string())?;
             if let Some(&write_idx) = write_indexes.get(&path) {
-                // 同一文件出现多个 section 时按序叠加（语义同信封分支）。
+                // Multiple sections for the same file apply in order (same semantics as the envelope branch).
                 emit("applying after previous section for same file");
                 let (action, hints) = {
                     let current = match &writes[write_idx].action {
@@ -2727,8 +2851,8 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
     let inferred_file_path = header_target.paths.first().cloned();
     let file_path = match initial_file_path {
         Some(path) => path.to_string(),
-        // file_path 缺失时，回退解析 git 风格 diff 头（`--- a/`/`+++ b/`/`diff --git`）
-        // 里自带的路径：模型写出的合法 unified diff 不该被判成 "missing file_path"。
+        // When file_path is missing, fall back to parsing the git-style diff headers (`--- a/`/`+++ b/`/`diff --git`)
+        // for the paths they carry: a valid unified diff written by the model must not be rejected as "missing file_path".
         None => inferred_file_path.clone().ok_or(
             "missing file_path: provide `file_path` (or `path`) arg, wrap the patch in a \
              `*** Begin Patch` / `*** Update File: <path>` envelope, or include a git-style \
@@ -2830,13 +2954,13 @@ mod tests {
         assert!(schema["properties"].get("dry_run").is_none());
     }
 
-    /// 离线回放：用真实会话（history.json）里模型实际发出的 apply_patch 输入，
-    /// 对照重建出的"当时文件真相"，用**当前代码**跑一遍，打印每个 patch 的真实
-    /// 成/败。这不是常规断言测试——它验证的是"真实调用成功率"，而非我写的断言。
+    /// Offline replay: uses the actual apply_patch inputs the model issued in a real session (history.json),
+    /// reconstructs the "file truth at the time" from them, and runs them through the **current** code, printing each patch's real
+    /// success/failure. This is not a conventional assertion test — it verifies the "real call success rate", not the assertions I wrote.
     ///
-    /// 默认忽略；需要时用：
+    /// Ignored by default; enable when needed with:
     ///   AI_PATCH_REPLAY_DIR=/tmp/patch_review cargo test --bin a replay_apply_patch -- --ignored --nocapture
-    /// 目录下需有 replay_manifest.json + rebuild/proc.rs + rebuild/session_pid.rs。
+    /// The directory needs replay_manifest.json + rebuild/proc.rs + rebuild/session_pid.rs.
     #[test]
     #[ignore]
     fn replay_apply_patch_from_session() {
@@ -2850,7 +2974,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(dir.join("replay_manifest.json")).unwrap())
                 .unwrap();
 
-        // 会话里的绝对路径前缀，替换为临时工作区。
+        // Absolute path prefix in the session, replaced with the temporary workspace.
         const OLD_PREFIX: &str = "/Users/bytedance/rust_tools/src/bin/ai/driver";
         let records = manifest.as_array().unwrap();
         let mut ok = 0usize;
@@ -2861,7 +2985,7 @@ mod tests {
             let patch = rec["patch"].as_str().unwrap();
             let dry_run = rec["dry_run"].as_bool().unwrap_or(false);
 
-            // 每个 patch 用全新的重建文件（互不污染）。
+            // Each patch uses a brand-new rebuilt file (they must not pollute each other).
             let work = make_temp_path(&format!("replay_{msg}"));
             let commands = work.join("commands");
             fs::create_dir_all(&commands).unwrap();
@@ -2894,8 +3018,8 @@ mod tests {
 
     #[test]
     fn parse_unified_hunks_treats_empty_hunk_line_as_context() {
-        // 模型常把空 context 行写成完全没有前导空格的空行，应当作空 context 行处理，
-        // 而不是报错。这与 `git apply` 对空 context 行的宽容一致。
+        // Models often write empty context lines as fully blank lines with no leading space; these should be treated as empty context lines,
+        // not an error. This matches `git apply`'s tolerance for empty context lines.
         let patch = "@@ -1,3 +1,3 @@\n foo\n\n bar\n";
         let hunks =
             parse_unified_hunks(patch).expect("empty hunk line should be treated as context");
@@ -2905,7 +3029,7 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_tolerates_empty_context_line() {
-        // 模型常把空 context 行写成空字符串（无前导空格），apply_patch 应正常匹配。
+        // Models often write empty context lines as empty strings (no leading space); apply_patch should match them normally.
         let original = "foo\n\nbar\n";
         let patch = "@@ -1,3 +1,3 @@\n foo\n\n-bar\n+baz\n";
         let result =
@@ -2915,7 +3039,7 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_strips_trailing_cr_from_crlf_patch() {
-        // CRLF patch：Add 行尾的 \r 不应写入文件内容。
+        // CRLF patch: the trailing \r on Add lines must not be written into the file content.
         let original = "foo\nbar\n";
         let patch = "@@ -2,1 +2,1 @@\r\n-bar\r\n+baz\r\n";
         let result = apply_unified_patch(original, patch).expect("CRLF patch should be tolerated");
@@ -2924,20 +3048,20 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_tolerates_empty_context_line_in_crlf_patch() {
-        // CRLF patch 中的空 context 行（只剩 \r 的行）也应被当作空 context 行。
+        // Empty context lines in a CRLF patch (lines with only \r) should also be treated as empty context lines.
         let original = "foo\r\n\r\nbar\r\n";
         let patch = "@@ -1,3 +1,3 @@\r\n foo\r\n\r\r\n-bar\r\n+baz\r\n";
         let result = apply_unified_patch(original, patch)
             .expect("empty CRLF context line should be tolerated");
-        // 原文件是 CRLF，但 patch 的 Add 行已剥离 \r，输出统一为 LF。
+        // The original file is CRLF, but the patch's Add lines have already stripped \r; output is uniformly LF.
         assert_eq!(result, "foo\n\nbaz\n");
     }
 
     #[test]
     fn parse_unified_hunks_strips_trailing_blank_context_between_hunks() {
-        // 两个 hunk 之间用空行分隔（可读性写法）。之前空行会被吞进 hunk1 变成末尾
-        // 的空 context 行，凭空要求原文件对应位置有空行 → context mismatch。
-        // 修复后应剥离该尾随空行，hunk1 只保留 remove+add 两行。
+        // Hunks are separated by blank lines (a readability convention). Previously the blank line was swallowed into hunk1 as a trailing
+        // empty context line, spuriously requiring the original file to have a blank line at that position → context mismatch.
+        // After the fix, that trailing blank line should be stripped, leaving hunk1 with only the remove+add lines.
         let patch = "@@ -1,1 +1,1 @@\n-a\n+b\n\n@@ -5,1 +5,1 @@\n-c\n+d\n";
         let hunks = parse_unified_hunks(patch).expect("blank separator should be tolerated");
         assert_eq!(hunks.len(), 2);
@@ -2950,8 +3074,8 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_multi_hunk_separated_by_blank_line() {
-        // 复现真实高频场景：多 hunk 之间空行分隔。修复前 hunk1 末尾多一条空 context
-        // 行，导致整个 patch 报 context mismatch。
+        // Reproduces a real high-frequency scenario: hunks separated by blank lines. Before the fix, hunk1 ended with an extra empty context
+        // line, making the whole patch report context mismatch.
         let original = "a\nkeep1\nkeep2\nkeep3\nc\n";
         let patch = "@@ -1,1 +1,1 @@\n-a\n+b\n\n@@ -5,1 +5,1 @@\n-c\n+d\n";
         let result = apply_unified_patch(original, patch)
@@ -2961,8 +3085,8 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_tolerates_trailing_blank_line_in_patch() {
-        // patch 末尾有多余空行（模型常见输出）。修复前末尾空行被并入最后一个 hunk
-        // 变成空 context 行 → 匹配失败。
+        // The patch ends with extra blank lines (common model output). Before the fix, the trailing blank lines were merged into the last hunk
+        // as empty context lines → match failure.
         let original = "line1\nline2\nline3\n";
         let patch = "@@ -2,1 +2,1 @@\n-line2\n+changed\n\n";
         let result = apply_unified_patch(original, patch)
@@ -2972,9 +3096,9 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_tolerates_envelope_end_marker() {
-        // 模型常在 unified-diff hunk 末尾误带 `*** End Patch` 等 envelope 尾标记
-        // （格式混用）。这些标记不属于 unified-diff 内容，应静默结束当前 hunk，
-        // 而不是报 invalid hunk line。
+        // Models often mistakenly append envelope tail markers like `*** End Patch` at the end of a unified-diff hunk
+        // (format mixing). These markers do not belong to unified-diff content; the current hunk should end silently,
+        // not report invalid hunk line.
         let original = "line1\nline2\nline3\n";
         let patch = "@@ -2,1 +2,1 @@\n-line2\n+changed\n*** End Patch\n";
         let result = apply_unified_patch(original, patch)
@@ -2984,9 +3108,9 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_rejects_envelope_section_marker_with_hint() {
-        // unified-diff hunk 中混入 `*** Begin Patch` / `*** Update File:` 等开头或
-        // 分节标记，说明 patch 结构混乱。应报错并明确提示"格式混用"，引导模型
-        // 二选一重建，而非笼统的 invalid hunk line。
+        // When a unified-diff hunk mixes in `*** Begin Patch` / `*** Update File:` opener or
+        // section markers, the patch structure is confused. It should error with an explicit "format mixing" message guiding the model
+        // to rebuild with one of the two formats, instead of a generic invalid hunk line.
         let original = "line1\nline2\nline3\n";
         let patch = "@@ -2,1 +2,1 @@\n-line2\n+changed\n*** Begin Patch\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
@@ -2996,11 +3120,11 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_rejects_malformed_envelope_trailer_not_silently_applied() {
-        // 安全属性：当 patch 含 `*** Begin Patch` / `*** Update File:` 等 envelope
-        // 标记（即残缺 envelope 误入 unified-diff 路径）时，尾部 `*** End Patch`
-        // 绝不能被静默容忍并把 hunk 应用到 file_path 指定、却非 envelope 声明的
-        // 文件上。必须报"格式混用"错误，由模型重建。即便这里 original 恰好含相同
-        // 上下文（最危险的巧合情形），也必须报错而非写入。
+        // Safety property: when a patch contains `*** Begin Patch` / `*** Update File:` envelope
+        // markers (i.e. a truncated envelope leaked into the unified-diff path), a trailing `*** End Patch`
+        // must never be silently tolerated and the hunk applied to the file_path target that the envelope did not declare.
+        // It must report a "format mixing" error for the model to rebuild. Even if `original` here happens to contain the same
+        // context (the most dangerous coincidence), it must error rather than write.
         let original = "line1\nline2\nline3\n";
         let patch = "*** Begin Patch\n*** Update File: other.rs\n@@ -2,1 +2,1 @@\n-line2\n+changed\n*** End Patch\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
@@ -3019,7 +3143,7 @@ mod tests {
     #[test]
     fn apply_unified_patch_context_mismatch_includes_actual_content() {
         let original = "alpha\nbeta\ngamma\n";
-        // 期望删除一行不存在的内容，应触发带上下文的 context mismatch。
+        // Deleting content that does not exist should trigger a context mismatch with context.
         let patch = "@@ -2,1 +2,1 @@\n-not_present\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("context mismatch"), "err was: {err}");
@@ -3030,20 +3154,20 @@ mod tests {
                 .contains("Rebuild the patch from the current file text"),
             "first error line should include the recovery action: {err}"
         );
-        // 错误里应回显期望行与实际文件内容，便于模型自我修正。
+        // The error should echo the expected line and the actual file content so the model can self-correct.
         assert!(err.contains("not_present"), "err was: {err}");
         assert!(err.contains("beta"), "err was: {err}");
-        // 应包含无行号前缀、可直接粘贴的当前文本块。
+        // Should include a directly pasteable current text block with no line-number prefix.
         assert!(err.contains("<<<PATCH_TEXT"), "err was: {err}");
         assert!(err.contains("PATCH_TEXT>>>"), "err was: {err}");
     }
 
     #[test]
     fn apply_unified_patch_context_mismatch_reports_unicode_code_points() {
-        // 用真正"非 confusable"的 Unicode 差异触发 mismatch，验证错误里回显 code point。
-        // 注意：smart quotes（U+201C/U+201D）与 ASCII 引号已由 normalize_confusables 归一化容忍
-        // （见 apply_unified_patch_tolerates_confusable_quotes），不能再当作 mismatch 样例。
-        // 这里用带重音字母 é (U+00E9) vs e (U+0065)--不在 confusable 归一化范围内，是真差异。
+        // Uses a genuinely "non-confusable" Unicode difference to trigger the mismatch, verifying the error echoes the code point.
+        // Note: smart quotes (U+201C/U+201D) and ASCII quotes are already tolerated by normalize_confusables normalization
+        // (see apply_unified_patch_tolerates_confusable_quotes), so they can no longer serve as mismatch samples.
+        // Here we use accented é (U+00E9) vs e (U+0065) -- not in the confusable normalization range; a real difference.
         let original = "let label = \"café\";\n";
         let patch = "@@ -1,1 +1,1 @@\n-let label = \"cafe\";\n+let label = \"changed\";\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
@@ -3054,29 +3178,29 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_tolerates_confusable_quotes() {
-        // P0: 模型常把 ASCII 引号/连字符自动替换为排版用 smart quote / en-dash。
-        // 这类纯排版差异不应导致 context mismatch--normalize_confusables 归一化后应能匹配。
-        // 关键安全属性：context 行输出原文件内容（actual），而非 patch 里的 smart quote，
-        // 所以文件里的 ASCII 字符不会被"替换"成 smart quote。
+        // P0: models often auto-replace ASCII quotes/hyphens with typographic smart quotes / en-dash.
+        // Such purely typographic differences must not cause a context mismatch -- after normalize_confusables normalization they should match.
+        // Key safety property: the context line outputs the original file content (actual), not the smart quote from the patch,
+        // so the ASCII characters in the file are never "replaced" with smart quotes.
         let original = "let quote = \"hi\";\nlet dash = a - b;\n";
-        // context 行用 smart quotes（“ ”），remove 行用 en-dash（– U+2013），
-        // 文件里对应是 ASCII 引号 / ASCII hyphen--归一化后均应匹配。
+        // context lines use smart quotes (“ ”), remove lines use en-dash (– U+2013),
+        // the file has ASCII quotes / ASCII hyphen -- after normalization all should match.
         let patch = "@@ -1,2 +1,2 @@\n let quote = “hi”;\n-let dash = a – b;\n+let dash = a - b;\n";
         let result = apply_unified_patch(original, patch)
             .expect("confusable smart quotes / en-dash should be tolerated");
-        // context 行保留原文件 ASCII 引号；remove 的 en-dash 匹配文件 ASCII hyphen 后删除；
-        // add 行写入 patch 内容（ASCII hyphen）。
+        // context lines keep the original file's ASCII quotes; the remove en-dash matches the file's ASCII hyphen and is deleted;
+        // add lines write the patch content (ASCII hyphen).
         assert_eq!(result, "let quote = \"hi\";\nlet dash = a - b;\n");
     }
 
     #[test]
     fn apply_unified_patch_detects_ambiguous_match() {
-        // 同样的行在文件里出现多次，且标称位置匹配不上，应报歧义错误。
+        // The same line appears multiple times in the file, and the nominal position does not match; an ambiguity error should be reported.
         let original = "dup\nmid\ndup\ntail\n";
         let patch = "@@ -9,1 +9,1 @@\n-dup\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("ambiguous patch"), "err was: {err}");
-        // 歧义错误应回显各候选位置的当前行文本，便于模型选唯一锚点，无需重读。
+        // The ambiguity error should echo the current line text of each candidate position so the model can pick a unique anchor without re-reading.
         assert!(
             err.contains("Candidate locations"),
             "ambiguous error should echo candidate current lines: {err}"
@@ -3085,20 +3209,20 @@ mod tests {
         assert!(err.contains("line 3"), "err was: {err}");
     }
 
-    /// 模型错写 `@@ -0,0 +1,3 @@`（插入到文件开头）时应归一化为 old_start=1，
-    /// 而不是当作"无标称行号"（old_start=0）导致 context mismatch 报 "declared line 0"。
+    /// When the model wrongly writes `@@ -0,0 +1,3 @@` (insert at file start), normalize it to old_start=1,
+    /// instead of treating it as "no nominal line number" (old_start=0) and reporting a context mismatch with "declared line 0".
     #[test]
     fn parse_unified_hunks_normalizes_zero_declared_line_to_one() {
         let patch = "@@ -0,0 +1,3 @@\n+aaa\n+bbb\n+ccc\n";
         let hunks = parse_unified_hunks(patch).expect("@@ -0 should parse");
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].old_start, 1);
-        // 且能直接应用到空文件顶部。
+        // And can be applied directly at the top of an empty file.
         let result = apply_unified_patch("", patch).expect("insert at top should apply");
         assert_eq!(result, "aaa\nbbb\nccc");
     }
 
-    /// `@@ -0` 插入到已有文件顶部时也应正常。
+    /// `@@ -0` insertion at the top of an existing file should also work.
     #[test]
     fn apply_unified_patch_inserts_at_top_with_zero_declared_line() {
         let original = "first\nsecond\n";
@@ -3108,8 +3232,8 @@ mod tests {
         assert_eq!(result, "head\ntop\nfirst\nsecond\n");
     }
 
-    /// 纯插入 hunk（只有 `+` 行）在非空文件上仅按行号定位、无内容验证，
-    /// 成功时应返回提示，提醒模型文件变更后需 read_file 复核。
+    /// A pure-insertion hunk (only `+` lines) on a non-empty file is located only by line number with no content verification;
+    /// on success it should return a hint reminding the model to re-read the file after the change.
     #[test]
     fn apply_unified_patch_pure_insert_reports_line_number_hint() {
         let original = "first\nsecond\n";
@@ -3123,7 +3247,7 @@ mod tests {
         );
     }
 
-    /// 有 context/remove 行的 hunk 经过内容验证，不产生纯插入提示。
+    /// Hunks with context/remove lines go through content verification, so no pure-insertion hint is produced.
     #[test]
     fn apply_unified_patch_no_hint_for_context_anchored_hunks() {
         let original = "first\nsecond\n";
@@ -3137,7 +3261,7 @@ mod tests {
         );
     }
 
-    /// 空文件上的纯插入是新建文件的常规流程，不产生提示。
+    /// Pure insertion on an empty file is the normal flow for creating a new file; no hint is produced.
     #[test]
     fn apply_unified_patch_pure_insert_on_empty_file_has_no_hint() {
         let patch = "@@ -0,0 +1,2 @@\n+a\n+b\n";
@@ -3150,7 +3274,7 @@ mod tests {
         );
     }
 
-    /// 纯插入提示应随成功消息返回（format_patch_success 追加 note）。
+    /// The pure-insertion hint should be returned with the success message (format_patch_success appends a note).
     #[test]
     fn apply_patch_success_message_includes_pure_insert_hint() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
@@ -3177,8 +3301,8 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
-    /// 截断启发：识别未闭合 envelope、残缺 `***` 标记、裸 hunk header 结尾；
-    /// 合法收尾不误报。
+    /// Truncation heuristic: recognize unclosed envelopes, broken `***` markers, and bare hunk-header endings;
+    /// legal endings must not be misreported.
     #[test]
     fn truncated_patch_hint_heuristics() {
         assert!(
@@ -3196,7 +3320,7 @@ mod tests {
             truncated_patch_hint("@@ -1,1 +1,1 @@\n-a\n+b\n*** End Patc").is_some(),
             "partial *** marker should be flagged"
         );
-        // 合法收尾不误报
+        // Legal endings must not be misreported.
         assert!(truncated_patch_hint("@@ -1,1 +1,1 @@\n-a\n+b\n").is_none());
         assert!(
             truncated_patch_hint(
@@ -3206,8 +3330,8 @@ mod tests {
         );
     }
 
-    /// 未闭合的 envelope（截断）解析失败时，错误应附带截断提示与 patch_file
-    /// 替代路径，避免模型把残缺文本当成自己的语法错误反复重试。
+    /// When parsing an unclosed (truncated) envelope fails, the error should include a truncation hint and a patch_file
+    /// alternative path, so the model does not treat the truncated text as its own syntax error and retry repeatedly.
     #[test]
     fn apply_patch_unclosed_envelope_error_hints_truncation_and_patch_file() {
         let patch = "*** Begin Patch\n*** Update File: missing.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n";
@@ -3217,7 +3341,7 @@ mod tests {
         assert!(err.contains("cut off"), "err was: {err}");
     }
 
-    /// patch 缺失时给出截断提示和 patch_file 替代路径。
+    /// When the patch is missing, give a truncation hint and the patch_file alternative path.
     #[test]
     fn apply_patch_missing_patch_error_hints_truncation_and_patch_file() {
         let args = serde_json::json!({});
@@ -3227,7 +3351,7 @@ mod tests {
         assert!(err.contains("truncated"), "err was: {err}");
     }
 
-    /// 超大内联 patch 直接报错并引导拆分，而不是带病解析。
+    /// An oversized inline patch should error out immediately and guide splitting, rather than parse with the defect.
     #[test]
     fn apply_patch_rejects_oversized_inline_patch() {
         let huge = format!("@@ -1,1 +1,1 @@\n-a\n+{}", "x".repeat(9_000));
@@ -3237,8 +3361,8 @@ mod tests {
         assert!(err.contains("patch_file"), "err was: {err}");
     }
 
-    /// patch_file 承载大补丁（>8K 内联上限）时应成功：内联限制只针对内联 patch，
-    /// 否则审计指出的"推荐降级路径实际不可用"自相矛盾无法消除。
+    /// A patch_file carrying a large patch (>8K inline cap) should succeed: the inline limit applies only to inline patches;
+    /// otherwise the audit-flagged "recommended fallback path is actually unusable" contradiction cannot be resolved.
     #[test]
     fn apply_patch_large_patch_file_above_inline_limit_applies() {
         let temp = make_temp_path("patch_file_large");
@@ -3263,7 +3387,7 @@ mod tests {
         );
     }
 
-    /// tool bridge 物化出的空 patch_file 是“未提供”，不能阻断有效的内联补丁。
+    /// An empty patch_file materialized by the tool bridge counts as "not provided" and must not block a valid inline patch.
     #[test]
     fn apply_patch_inline_accepts_empty_patch_file_placeholder() {
         let temp = make_temp_path("empty_patch_file_placeholder");
@@ -3282,7 +3406,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
     }
 
-    /// 两个来源都为空时仍应明确报缺少补丁，而不是尝试执行空内容。
+    /// When both sources are empty, missing-patch must still be explicitly reported rather than attempting to execute empty content.
     #[test]
     fn apply_patch_empty_source_placeholders_report_missing_patch() {
         let args = serde_json::json!({ "patch": "", "patch_file": null });
@@ -3290,7 +3414,7 @@ mod tests {
         assert!(err.contains("missing or empty"), "err was: {err}");
     }
 
-    /// patch_file 超过宽松安全上限（64K）时明确拒绝并引导拆分。
+    /// A patch_file exceeding the loose safety cap (64K) is explicitly rejected with guidance to split.
     #[test]
     fn apply_patch_rejects_oversized_patch_file() {
         let temp = make_temp_path("patch_file_huge");
@@ -3306,7 +3430,7 @@ mod tests {
         assert!(err.contains("patch_file too large"), "err was: {err}");
     }
 
-    /// patch_file 从 effective_cwd（sync_scope）下的文件读取补丁并应用。
+    /// patch_file reads the patch from a file under effective_cwd (sync_scope) and applies it.
     #[test]
     fn apply_patch_reads_patch_from_patch_file_under_cwd() {
         let temp = make_temp_path("patch_file_cwd");
@@ -3328,7 +3452,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "bar\n");
     }
 
-    /// patch_file 指向 cwd 之外且未登记在 temp registry 的路径必须被明确拒绝。
+    /// A patch_file pointing outside cwd and not registered in the temp registry must be explicitly rejected.
     #[test]
     fn apply_patch_rejects_patch_file_outside_cwd_and_registry() {
         let outside =
@@ -3342,18 +3466,18 @@ mod tests {
         );
     }
 
-    /// context mismatch 且文件里完全找不到部分匹配时（no-partial-match 分支），
-    /// 也应附带无行号前缀、可直接粘贴的当前文本块。
+    /// On a context mismatch where the file contains no partial match at all (the no-partial-match branch),
+    /// it should also attach a directly pasteable current text block with no line-number prefix.
     #[test]
     fn apply_unified_patch_context_mismatch_emits_pasteable_block_without_partial_match() {
         let original = "alpha\nbeta\ngamma\n";
-        // 期望块与文件内容毫无重叠，触发 no-partial-match 分支。
+        // The expected block and the file content have zero overlap, triggering the no-partial-match branch.
         let patch = "@@ -1,2 +1,2 @@\n-zzz1\n-zzz2\n+repl\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("context mismatch"), "err was: {err}");
         assert!(err.contains("<<<PATCH_TEXT"), "err was: {err}");
         assert!(err.contains("PATCH_TEXT>>>"), "err was: {err}");
-        // 可粘贴块内是原文件真实行，且不带 `<行号>:` 前缀。
+        // The pasteable block contains real original file lines, without a `<line>: ` prefix.
         let block = err
             .split("<<<PATCH_TEXT\n")
             .nth(1)
@@ -3366,17 +3490,17 @@ mod tests {
         );
     }
 
-    /// "hunks out of order" 不再是裸字符串：应说明原因、给出可粘贴当前文本、并
-    /// 提示按行号重排或改用 Replace in line。真实会话里模型曾因裸报错连败 4 轮。
+    /// "hunks out of order" is no longer a bare string: it should state the reason, give pasteable current text, and
+    /// suggest reordering by line number or switching to Replace in line. In a real session the model lost 4 rounds in a row on the bare error.
     #[test]
     fn apply_unified_patch_out_of_order_error_is_actionable() {
-        // 文件：first 在前、last 在后。patch 把 hunk 顺序写反：先改 last（第 4 行），
-        // 再改 first（第 1 行）——第二个 hunk 匹配位置落在游标之前，触发 out of order。
+        // File: `first` before `last`. The patch writes the hunks in reverse order: first modifies `last` (line 4),
+        // then `first` (line 1) -- the second hunk's match position falls before the cursor, triggering out of order.
         let original = "first\naaa\nbbb\nlast\n";
         let patch = concat!("@@\n-last\n+LAST\n", "@@\n-first\n+FIRST\n",);
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("hunks out of order"), "err was: {err}");
-        // 应包含可操作的重排/Replace in line 建议与可粘贴文本块。
+        // Should include actionable reorder / Replace in line suggestions and a pasteable text block.
         assert!(
             err.contains("ascending file line number"),
             "err should explain ordering rule: {err}"
@@ -3399,7 +3523,7 @@ mod tests {
     #[test]
     fn apply_unified_patch_disambiguates_ambiguous_match_by_nearby_declared_line() {
         let original = "dup\nhead\nfiller1\nfiller2\nfiller3\ndup\ntail\n";
-        // `dup` 出现两次，但 hunk 头标称第 5 行，明显靠近第二个候选（第 6 行）。
+        // `dup` appears twice, but the hunk header claims line 5, clearly closer to the second candidate (line 6).
         let patch = "@@ -5,1 +5,1 @@\n-dup\n+changed\n";
         let result = apply_unified_patch(original, patch)
             .expect("nearby declared line should disambiguate repeated context");
@@ -3412,7 +3536,7 @@ mod tests {
     #[test]
     fn apply_unified_patch_rejects_declared_line_when_not_clear_nearest() {
         let original = "dup\nleft\nmid\ndup\nright\n";
-        // 标称第 3 行夹在两个 `dup` 中间，候选距离相同，不能猜。
+        // The nominal line 3 sits between two `dup`s with equal candidate distance; it must not guess.
         let patch = "@@ -3,1 +3,1 @@\n-dup\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("ambiguous patch"), "err was: {err}");
@@ -3420,10 +3544,10 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_finds_unique_match_beyond_search_radius() {
-        // 文件有 150 行，唯一匹配在第 130 行（0-based 129）。
-        // hunk 头标称第 1 行，nominal=0，find_hunk_offset 的 ±50 窗口搜索 [0,50)，
-        // 找不到 129 处的匹配。但 all_hunk_match_positions 能在全文件找到唯一匹配。
-        // 此前代码忽略 forward.len()==1 的结果，回退到 find_hunk_offset 导致误报
+        // The file has 150 lines; the only match is at line 130 (0-based 129).
+        // The hunk header claims line 1, nominal=0, and find_hunk_offset's ±50 window searches [0,50),
+        // which cannot find the match at 129. But all_hunk_match_positions can find the unique match across the whole file.
+        // Previously the code ignored the forward.len()==1 result and fell back to find_hunk_offset, causing a false
         // "context mismatch"。
         let mut lines: Vec<String> = (0..130).map(|i| format!("filler{i}")).collect();
         lines.push("unique_target".to_string());
@@ -3432,7 +3556,7 @@ mod tests {
         let original = lines.join("\n") + "\n";
 
         let patch = "@@ -1,2 +1,2 @@\n-unique_target\n+changed\n+after_target\n";
-        // 故意用错误的标称行号(-1) 模拟 stale line numbers
+        // Deliberately uses a wrong nominal line number (-1) to simulate stale line numbers
         let result = apply_unified_patch(&original, patch).unwrap_or_else(|err| {
             panic!("apply_patch should find unique match beyond ±50 radius, but got: {err}")
         });
@@ -3452,25 +3576,25 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_tolerates_leading_indent_mismatch() {
-        // 真实高频失败场景：markdown/嵌套列表里，模型复刻的 context 行缩进与原文件
-        // 不一致（这里 patch 少了 2 个前导空格）。修复前 lines_match 只做 trim_end，
-        // 前导空白零容忍 → 全文件定位不到 → "context mismatch: patch hunk could not
-        // be located"。修复后严格匹配失败会用忽略缩进的兜底模式唯一定位并应用。
+        // Real high-frequency failure scenario: in markdown/nested lists, the model's recreated context line indentation differs from the original file
+        // (here the patch is missing 2 leading spaces). Before the fix, lines_match only did trim_end,
+        // with zero tolerance for leading whitespace → the whole file failed to locate → "context mismatch: patch hunk could not
+        // be located". After the fix, when strict matching fails, the indent-ignoring fallback uniquely locates and applies.
         let original = "# Title\n\n  - item one\n  - item two\n";
-        // 前导空格=context 前缀；context 内容 "- item one"、remove 内容 "- item two"
-        // 都比原文件少了 2 个缩进空格。
+        // Leading spaces = context prefix; context content "- item one", remove content "- item two"
+        // are both missing 2 indentation spaces compared to the original file.
         let patch = "@@ -3,2 +3,2 @@\n - item one\n-- item two\n+- item two changed\n";
         let result = apply_unified_patch(original, patch).unwrap_or_else(|err| {
             panic!("indent-insensitive fallback should locate the hunk, got: {err}")
         });
-        // 保留原文件缩进的 context 行，只替换 remove/add 目标行。
+        // Context lines keep the original file's indentation; only the remove/add target lines are replaced.
         assert_eq!(result, "# Title\n\n  - item one\n- item two changed\n");
     }
 
     #[test]
     fn apply_unified_patch_indent_fallback_still_detects_ambiguity() {
-        // 兜底的忽略缩进模式不能牺牲安全性：若忽略缩进后有多处匹配，仍应报歧义，
-        // 而不是静默改错地方。
+        // The indent-ignoring fallback must not sacrifice safety: if ignoring indentation yields multiple matches, it must still report ambiguity,
+        // not silently change the wrong place.
         let original = "  dup\nmid\n    dup\ntail\n";
         let patch = "@@ -9,1 +9,1 @@\n-dup\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
@@ -3479,8 +3603,8 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_strict_match_preferred_over_indent_fallback() {
-        // 当严格匹配能唯一定位时，必须使用严格匹配的结果，保持原文件精确内容，
-        // 不因存在缩进变体而误走兜底。
+        // When strict matching uniquely locates, the strict-match result must be used, preserving the original file's exact content,
+        // and must not fall back just because an indentation variant exists.
         let original = "    exact\nother\n";
         let patch = "@@ -1,1 +1,1 @@\n-    exact\n+    replaced\n";
         let result = apply_unified_patch(original, patch).unwrap();
@@ -3489,8 +3613,8 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_fuzzes_stale_context_when_remove_lines_are_unique() {
-        // 真实循环根因：模型把 context 行写成了过时/目标态内容，但 remove 行仍然
-        // 精确锚定目标。context 不应在这种情况下把 patch 硬拒绝。
+        // Real loop root cause: the model wrote the context line as stale/target-state content, but the remove line still
+        // anchors precisely on the target. Context must not hard-reject the patch in this case.
         let original = "alpha current\nold target\nomega current\n";
         let patch = "\
 @@ -1,3 +1,3 @@
@@ -3507,8 +3631,8 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_fuzzy_context_uses_remaining_context_to_disambiguate() {
-        // remove 行出现两次时，fuzz 仍可使用其他 context 行打分；只有唯一最高分
-        // 才能应用，避免退化成“改第一个相同 remove 行”。
+        // When a remove line appears twice, fuzz can still score using other context lines; only a unique top score
+        // may be applied, avoiding degradation into "modify the first identical remove line".
         let original = "alpha current\nold target\ntail one\nbeta current\nold target\ntail two\n";
         let patch = "\
 @@ -1,3 +1,3 @@
@@ -3535,8 +3659,8 @@ mod tests {
 -old target
 +new target
 ";
-        // old_start=1 (1-based) → nominal=0，remove "old target" 在 line 1 匹配。
-        // 即使 context 全部 miss，old_start 仍能消歧——应成功应用。
+        // old_start=1 (1-based) → nominal=0; remove "old target" matches at line 1.
+        // Even if all context misses, old_start can still disambiguate — it should apply successfully.
         let result = apply_unified_patch(original, patch).expect("should apply via nominal");
         assert_eq!(
             result, "alpha current\nnew target\nbeta current\nold target\n",
@@ -3546,27 +3670,27 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_fuzzy_context_rejects_when_nominal_not_in_candidates() {
-        // old_start 指向的位置不在候选列表中时，应仍然拒绝。
+        // When the position old_start points to is not in the candidate list, it should still be rejected.
         // original: line 0="old target", line 1="xxx", line 2="old target", line 3="yyy"
         // patch: @@ -2,1 +2,1 @@ — old_start=2 → nominal=1
-        // hunk 只有 remove 行（无 context），remove "xxx" 出现在 line 1。
-        // 但换一种：多个 "old target" 作为 remove，old_start 指向没有匹配的位置。
+        // The hunk has only a remove line (no context); remove "xxx" appears at line 1.
+        // But another variant: multiple "old target" as remove, and old_start points to a position with no match.
         // original: line 0="old target", line 1="aaa", line 2="old target", line 3="bbb"
         // patch: @@ -3,1 +3,1 @@ — old_start=3 → nominal=2
-        // remove "old target" 匹配 line 0 (pos=0) 和 line 2 (pos=2)
-        // nominal=2 在候选列表中 → 会被接受（正确行为）。
-        // 改为: old_start 指向一个不在文件中的行号。
+        // remove "old target" matches line 0 (pos=0) and line 2 (pos=2);
+        // nominal=2 is in the candidate list → it is accepted (correct behavior).
+        // Changed to: old_start points to a line number that does not exist in the file.
         let original = "old target\naaa\nold target\nbbb\n";
         let patch = "@@ -5,1 +5,1 @@\n-old target\n+changed\n";
-        // old_start=5 → nominal=4, 但文件只有4行 (index 0-3)。
-        // candidates: pos=0 和 pos=2 (old target 匹配)。nominal=4 不在 candidates 中。
+        // old_start=5 → nominal=4, but the file has only 4 lines (index 0-3).
+        // candidates: pos=0 and pos=2 (old target matches). nominal=4 is not in candidates.
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("ambiguous patch"), "err was: {err}");
     }
 
     #[test]
     fn apply_unified_patch_indent_fallback_reports_context_mismatch_when_absent() {
-        // 即便忽略缩进，内容本身不存在时仍应报 context mismatch（回显实际内容）。
+        // Even ignoring indentation, if the content itself does not exist, it should still report a context mismatch (echoing the actual content).
         let original = "alpha\nbeta\ngamma\n";
         let patch = "@@ -2,1 +2,1 @@\n-  not_present\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
@@ -3598,8 +3722,8 @@ mod tests {
 
     #[test]
     fn execute_apply_patch_update_envelope_without_hunk_header() {
-        // *** Begin Patch 的 Update 格式省略 @@ header（Cursor/Aider 风格），
-        // 只写 +/−/space 前缀行。模型经常这样写，不应报 "no hunks found"。
+        // The *** Begin Patch Update format omits the @@ header (Cursor/Aider style),
+        // writing only +/−/space-prefixed lines. Models write this often; it must not report "no hunks found".
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let path = make_temp_path("update_nohdr").with_extension("txt");
         let base = path.parent().unwrap().to_path_buf();
@@ -3626,9 +3750,9 @@ mod tests {
     }
     #[test]
     fn apply_unified_patch_multi_hunk_with_stale_line_numbers() {
-        // 两个 hunk，标称行号都是 1（过时），但各自的目标在文件中唯一且按顺序排列。
-        // 验证 cursor 推进 + forward 过滤在多 hunk 场景下正常工作，不会把第二个
-        // hunk 误匹配到第一个 hunk 的目标位置。
+        // Two hunks, both nominal line numbers 1 (stale), but each target is unique in the file and ordered.
+        // Verifies that cursor advancement + forward filtering work correctly across multiple hunks, without mis-matching the second
+        // hunk onto the first hunk's target position.
         let mut lines: Vec<String> = (0..60).map(|i| format!("filler{i}")).collect();
         lines.push("target_a".to_string());
         lines.push("after_a".to_string());
@@ -3662,7 +3786,7 @@ mod tests {
             !result.contains("target_b"),
             "should not contain target_b: {result}"
         );
-        // 中间填充行应保持不变
+        // The filler lines in between should remain unchanged
         assert!(
             result.contains("filler0"),
             "filler0 should remain: {result}"
@@ -3775,7 +3899,7 @@ mod tests {
             execute_apply_patch(&args).expect_err("mismatched target must be rejected")
         });
 
-        // file_path 被静默忽略，信封声明 b.txt 为权威目标；b.txt 不存在 → 报缺失文件。
+        // file_path is silently ignored; the envelope declares b.txt as the authoritative target; b.txt does not exist → report missing file.
         assert!(
             err.contains("b.txt"),
             "err should mention the envelope target path: {err}"
@@ -3847,7 +3971,7 @@ mod tests {
             strip_code_fence(fenced),
             "@@ -1,1 +1,1 @@\n-line2\n+changed"
         );
-        // ~~~ 围栏同样剥离。
+        // ~~~ fences are stripped as well.
         let fenced_tilde = "~~~\n@@ -1,1 +1,1 @@\n-x\n+y\n~~~";
         assert_eq!(strip_code_fence(fenced_tilde), "@@ -1,1 +1,1 @@\n-x\n+y");
     }
@@ -3856,10 +3980,10 @@ mod tests {
     fn strip_code_fence_leaves_unfenced_patch_untouched() {
         let raw = "@@ -1,1 +1,1 @@\n-x\n+y";
         assert_eq!(strip_code_fence(raw), raw);
-        // 闭围栏缺失时不剥离，避免误伤内容以 ``` 开头的真实 patch。
+        // When the closing fence is missing, do not strip, to avoid damaging a real patch whose content starts with ```.
         let no_close = "```diff\n@@ -1,1 +1,1 @@\n-x\n+y";
         assert_eq!(strip_code_fence(no_close), no_close);
-        // 行数太少不处理。
+        // Do not process when there are too few lines.
         assert_eq!(strip_code_fence("```\n```"), "```\n```");
     }
 
@@ -3889,7 +4013,7 @@ mod tests {
 
     #[test]
     fn file_path_from_unified_diff_header_reads_git_style_paths() {
-        // `+++ b/` 侧优先，剥离 `b/` 前缀。
+        // The `+++ b/` side takes priority; strip the `b/` prefix.
         assert_eq!(
             file_path_from_unified_diff_header(
                 "--- a/src/old.rs\n+++ b/src/new.rs\n@@ -1 +1 @@\n-x\n+y\n"
@@ -3897,7 +4021,7 @@ mod tests {
             .as_deref(),
             Some("src/new.rs")
         );
-        // 删除场景：`+++ /dev/null` 跳过，回退到 `--- a/` 侧。
+        // Deletion case: `+++ /dev/null` is skipped, falling back to the `--- a/` side.
         assert_eq!(
             file_path_from_unified_diff_header(
                 "--- a/src/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
@@ -3905,7 +4029,7 @@ mod tests {
             .as_deref(),
             Some("src/gone.rs")
         );
-        // `diff --git a/… b/…` 取 b 侧；行尾 TAB+时间戳被剥离。
+        // `diff --git a/… b/…` takes the b side; trailing TAB+timestamp is stripped.
         assert_eq!(
             file_path_from_unified_diff_header(
                 "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\t2026-07-30\n+++ b/foo.rs\t2026-07-30\n@@ -1 +1 @@\n-a\n+b\n"
@@ -3913,23 +4037,23 @@ mod tests {
             .as_deref(),
             Some("foo.rs")
         );
-        // 绝对路径无 a/ b/ 前缀时原样保留。
+        // Absolute paths without an a/ b/ prefix are preserved as-is.
         assert_eq!(
             file_path_from_unified_diff_header("+++ /abs/path.rs\n@@ -1 +1 @@\n-a\n+b\n")
                 .as_deref(),
             Some("/abs/path.rs")
         );
-        // 没有 diff 头则返回 None（裸 `@@` hunk 仍需显式 file_path）。
+        // Without a diff header, return None (a bare `@@` hunk still requires an explicit file_path).
         assert_eq!(
             file_path_from_unified_diff_header("@@ -1 +1 @@\n-a\n+b\n"),
             None
         );
-        // `---`/`+++` header 解析必须在首个 hunk 前停止，不能把正文 context 误当成路径。
+        // `---`/`+++` header parsing must stop before the first hunk, so body context lines are not mistaken for paths.
         assert_eq!(
             file_path_from_unified_diff_header("@@ -1 +1 @@\n +++ b/not-a-header.rs\n"),
             None
         );
-        // Git 会把带空格的路径写成 JSON/C 风格引号；应先解码再剥离 b/。
+        // Git writes paths with spaces in JSON/C-style quotes; decode first, then strip b/.
         assert_eq!(
             file_path_from_unified_diff_header(
                 "--- \"a/src/old name.rs\"\n+++ \"b/src/new name.rs\"\n@@ -1 +1 @@\n-a\n+b\n"
@@ -3937,16 +4061,16 @@ mod tests {
             .as_deref(),
             Some("src/new name.rs")
         );
-        // 单文件调用不能静默接受不带 `diff --git` 的标准多文件 unified diff；
-        // 每个文件头都必须由自己的 hunk 跟随，冲突时不推断任一目标。
+        // A single-file call must not silently accept a standard multi-file unified diff without `diff --git`;
+        // each file header must be followed by its own hunk; on conflict, do not infer any target.
         assert_eq!(
             file_path_from_unified_diff_header(
                 "--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\n--- a/two.rs\n+++ b/two.rs\n@@ -1 +1 @@\n-c\n+d\n"
             ),
             None
         );
-        // 标准多文件 Git diff 的第二个 `diff --git` 位于首个 hunk 后；仍必须识别冲突，
-        // 不能把整个 patch 静默应用到第一个文件。
+        // In a standard multi-file Git diff, the second `diff --git` comes after the first hunk; the conflict must still be recognized,
+        // not silently applying the whole patch to the first file.
         assert_eq!(
             file_path_from_unified_diff_header(
                 "diff --git a/one.rs b/one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/two.rs b/two.rs\n--- a/two.rs\n+++ b/two.rs\n@@ -1 +1 @@\n-c\n+d\n"
@@ -3960,7 +4084,7 @@ mod tests {
             .paths,
             vec!["one.rs", "two.rs"]
         );
-        // 带空格路径必须按 git 的引号/转义规则读取，不能按空白切成半截 token。
+        // Paths with spaces must be read per git's quoting/escaping rules, not split into half tokens by whitespace.
         assert_eq!(
             file_path_from_unified_diff_header(
                 "diff --git \"a/foo bar.rs\" \"b/foo bar.rs\"\n--- \"a/foo bar.rs\"\n+++ \"b/foo bar.rs\"\n@@ -1 +1 @@\n-a\n+b\n"
@@ -3968,7 +4092,7 @@ mod tests {
             .as_deref(),
             Some("foo bar.rs")
         );
-        // 即使没有 `+++`/`---` 兜底，引号路径也应从 `diff --git` 正确解析。
+        // Even without `+++`/`---` fallback, quoted paths should parse correctly from `diff --git`.
         assert_eq!(
             file_path_from_unified_diff_header(
                 "diff --git \"a/foo bar.rs\" \"b/foo bar.rs\"\n@@ -1 +1 @@\n-a\n+b\n"
@@ -3976,7 +4100,7 @@ mod tests {
             .as_deref(),
             Some("foo bar.rs")
         );
-        // `diff --git` 与 `+++` 指向同一文件（无引号）时不算多文件冲突，正常解析。
+        // When `diff --git` and `+++` point to the same file (no quotes), it is not a multi-file conflict; parse normally.
         assert_eq!(
             file_path_from_unified_diff_header(
                 "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n@@ -1 +1 @@\n-a\n+b\n"
@@ -3988,9 +4112,9 @@ mod tests {
 
     #[test]
     fn execute_apply_patch_reads_path_from_git_diff_header_without_file_path_arg() {
-        // 复现历史 loop 的第一张多米诺骨牌：模型写出教科书级 git unified diff
-        // （自带 `--- a/` `+++ b/` 头），但未传 file_path。此前工具报 missing
-        // file_path，逼模型反复换格式试错。修复后应直接从 diff 头读出路径并成功。
+        // Reproduces the first domino of a historical loop: the model writes a textbook git unified diff
+        // (with its own `--- a/` `+++ b/` headers), but does not pass file_path. Previously the tool reported missing
+        // file_path, forcing the model to keep changing formats in trial and error. After the fix, it should read the path from the diff header and succeed.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let path = make_temp_path("git_diff_header").with_extension("txt");
         let base = path.parent().unwrap().to_path_buf();
@@ -3999,7 +4123,7 @@ mod tests {
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
 
         crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
-            // patch 头用相对文件名（相对 cwd 解析），且不传 file_path/path 参数。
+            // The patch header uses a relative file name (resolved relative to cwd), and neither file_path/path is passed.
             let patch = format!(
                 "--- a/{file_name}\n+++ b/{file_name}\n@@ -1,3 +1,3 @@\n line1\n-line2\n+changed\n line3\n"
             );
@@ -4017,8 +4141,8 @@ mod tests {
 
     #[test]
     fn execute_apply_patch_missing_path_error_mentions_diff_header_option() {
-        // 既无 file_path、又无 diff 头、又非信封时，报错文案应提示三条出路之一
-        // 是 git 风格 diff 头，帮模型接地到正确的下一步。
+        // When there is neither file_path, nor a diff header, nor an envelope, the error message should offer three ways out, one
+        // being a git-style diff header, grounding the model to the correct next step.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let err = execute_apply_patch(&serde_json::json!({
             "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
@@ -4033,7 +4157,7 @@ mod tests {
 
     #[test]
     fn execute_apply_patch_applies_multi_file_diff_automatically() {
-        // 多文件 unified diff（git diff 输出风格）：不再报错，自动按文件拆分后原子应用。
+        // Multi-file unified diff (git diff output style): no longer an error; auto-split by file and apply atomically.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let base = make_temp_path("multi_file_diff_auto");
         let a = base.join("one.txt");
@@ -4045,7 +4169,7 @@ mod tests {
         let patch = "diff --git a/one.txt b/one.txt\n--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old_a\n+new_a\ndiff --git a/two.txt b/two.txt\n--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-old_b\n+new_b\n";
         crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
             let result = execute_apply_patch(&serde_json::json!({
-                // 多文件 diff 自带路径，冗余 file_path 应被忽略
+                // The multi-file diff carries its own paths; a redundant file_path should be ignored
                 "file_path": "one.txt",
                 "patch": patch,
             }))
@@ -4063,7 +4187,7 @@ mod tests {
 
     #[test]
     fn execute_apply_patch_applies_multi_file_diff_without_git_headers() {
-        // 无 `diff --git` 头、仅 `---`/`+++` 对的多文件 diff：按相邻文件头对切分。
+        // A multi-file diff without `diff --git` headers, only `---`/`+++` pairs: split by adjacent file-header pairs.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let base = make_temp_path("multi_file_diff_no_git");
         let a = base.join("a.txt");
@@ -4089,7 +4213,7 @@ mod tests {
 
     #[test]
     fn execute_apply_patch_multi_file_diff_same_file_sections_stack() {
-        // 同一文件出现多个 section（同路径叠加语义，与信封分支一致）。
+        // Multiple sections for the same file (same-path stacking semantics, consistent with the envelope branch).
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let base = make_temp_path("multi_file_diff_stack");
         let a = base.join("a.txt");
@@ -4112,7 +4236,7 @@ mod tests {
 
     #[test]
     fn execute_apply_patch_multi_file_diff_is_atomic_on_failure() {
-        // 任一文件 prepare 失败则整体不提交，之前已 prepare 的文件也不落盘。
+        // If any file's prepare fails, nothing is committed; previously prepared files are not written either.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let base = make_temp_path("multi_file_diff_atomic");
         let a = base.join("a.txt");
@@ -4201,7 +4325,7 @@ mod tests {
 
     #[test]
     fn parse_unified_hunks_error_message_names_expected_prefixes() {
-        // context 行漏前导空格时，错误信息应明确指出期望的前缀。
+        // When a context line is missing its leading space, the error message should explicitly state the expected prefix.
         let err = parse_unified_hunks("@@ -1,3 +1,3 @@\nline1\n-line2\n+changed\n line3")
             .expect_err("missing leading space on context line must error");
         assert!(
@@ -4210,19 +4334,19 @@ mod tests {
         );
     }
 
-    // ── Fix 1: strip_code_fence 应容忍闭围栏后的尾随空行 ──
+    // ── Fix 1: strip_code_fence should tolerate trailing blank lines after the closing fence ──
 
     #[test]
     fn strip_code_fence_tolerates_trailing_blank_lines() {
-        // 模型常在闭围栏后多输出一个或多个空行，之前 strip_code_fence 把最后一行
-        // 空行当作 last，判断不是闭围栏就放弃剥离，导致整个 patch 被代码围栏包裹
-        // 送入解析器报错。
+        // Models often emit one or more extra blank lines after the closing fence; previously strip_code_fence treated the last
+        // blank line as `last`, decided it was not a closing fence, and gave up stripping, so the whole patch stayed wrapped in the code fence
+        // and went into the parser with an error.
         let fenced = "```diff\n@@ -1,1 +1,1 @@\n-line2\n+changed\n```\n";
         assert_eq!(
             strip_code_fence(fenced),
             "@@ -1,1 +1,1 @@\n-line2\n+changed"
         );
-        // 多个尾随空行也应容忍
+        // Multiple trailing blank lines should also be tolerated
         let fenced_multi = "```\n*** Begin Patch\n*** End Patch\n```\n\n\n";
         assert_eq!(
             strip_code_fence(fenced_multi),
@@ -4230,25 +4354,25 @@ mod tests {
         );
     }
 
-    // ── Fix 2: 缺少 hunk header 时给出明确错误 ──
+    // ── Fix 2: give a clear error when the hunk header is missing ──
 
     #[test]
     fn parse_unified_hunks_missing_header_gives_clear_error() {
-        // patch 内容行存在但没有 hunk header，应给出比 "no hunks found" 更明确的错误。
+        // When patch content lines exist but there is no hunk header, give an error clearer than "no hunks found".
         let err = parse_unified_hunks(" line1\n-line2\n+changed\n line3")
             .expect_err("patch without hunk header must error");
         assert!(err.contains("no hunk header found"), "err was: {err}");
         assert!(err.contains("content lines"), "err was: {err}");
     }
 
-    // ── Fix 3: envelope Update 合成 header 使用 old_start=0 ──
+    // ── Fix 3: envelope Update synthesized headers use old_start=0 ──
 
     #[test]
     fn execute_apply_patch_update_envelope_without_header_does_not_match_at_line_1() {
-        // 当文件开头恰好与 hunk context 行匹配时，old_start=1 的标称匹配可能误命中
-        // 文件开头而非模型真正想改的位置。old_start=0 虽然给出同样的 nominal=0，
-        // 但语义更清晰：无标称位置，依赖全文件搜索唯一定位。
-        // 这里验证一个不在文件开头的唯一匹配能正确定位。
+        // When the file start happens to match the hunk's context lines, the nominal match with old_start=1 may wrongly hit
+        // the file start instead of where the model actually wants to change. old_start=0 gives the same nominal=0,
+        // but with clearer semantics: no nominal position, relying on a whole-file search for a unique location.
+        // Here we verify that a unique match not at the file start is located correctly.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let path = make_temp_path("update_nohdr_mid").with_extension("txt");
         let base = path.parent().unwrap().to_path_buf();
@@ -4274,12 +4398,12 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
-    // ── Fix 4: envelope Update 无 hunk header 时补全裸行前缀 ──
+    // ── Fix 4: fill in bare line prefixes when the envelope Update has no hunk header ──
 
     #[test]
     fn execute_apply_patch_update_envelope_tolerates_bare_lines() {
-        // 模型在 envelope Update 格式（无 hunk header）中写了不带 +/-/ 前缀的裸行，
-        // 应自动补空格前缀当作 context 行，而不是报 "invalid hunk line"。
+        // In the envelope Update format (no hunk header), the model wrote bare lines without a +/-/ prefix;
+        // they should get an automatic space prefix and be treated as context lines, instead of reporting "invalid hunk line".
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let path = make_temp_path("update_bare").with_extension("txt");
         let base = path.parent().unwrap().to_path_buf();
@@ -4305,25 +4429,25 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
-    // ── Fix 5: context 行容忍行号前缀 ──
+    // ── Fix 5: context lines tolerate line-number prefixes ──
 
     #[test]
     fn apply_unified_patch_tolerates_line_number_prefix_in_context() {
-        // 模型从 grep 类输出复制了带行号前缀的 context 行（如 `   42| `），
-        // IgnoreIndent 兜底模式应剥离行号前缀后匹配成功。
-        // read_file 的真实 TAB 格式另有 apply_unified_patch_tolerates_read_file_tab_prefix 覆盖。
+        // The model copied context lines with line-number prefixes from grep-like output (e.g. `   42| `);
+        // the IgnoreIndent fallback mode should strip the line-number prefix and match successfully.
+        // read_file's real TAB format is covered separately by apply_unified_patch_tolerates_read_file_tab_prefix.
         let original = "line1\nline2\nline3\n";
-        // context 行 " line1" 被模型误写为带行号前缀的 " 1| line1"
+        // context line " line1" was wrongly written by the model as " 1| line1" with a line-number prefix
         let patch = "@@ -1,3 +1,3 @@\n 1| line1\n-line2\n+changed\n line3\n";
         let result = apply_unified_patch(original, patch)
             .expect("line number prefix in context should be tolerated by indent fallback");
-        // context 行应保留原文件内容（不含行号前缀）
+        // context lines should keep the original file content (without the line-number prefix)
         assert_eq!(result, "line1\nchanged\nline3\n");
     }
 
     #[test]
     fn apply_unified_patch_tolerates_line_number_prefix_in_remove() {
-        // remove 行也带了行号前缀，应同样被容忍。
+        // The remove line also carries a line-number prefix and should be tolerated the same way.
         let original = "line1\ntarget\nline3\n";
         let patch = "@@ -1,3 +1,3 @@\n line1\n-2| target\n+changed\n line3\n";
         let result = apply_unified_patch(original, patch)
@@ -4333,11 +4457,11 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_tolerates_read_file_tab_prefix() {
-        // 复现 history 中的真实失败场景：模型把 read_file 的输出逐行照抄进 patch 的
-        // context / remove 行。read_file 真实渲染格式是 `{:>6}\t{}`（右对齐行号 + TAB），
-        // 修复前 strip_line_number_prefix 不认 TAB，导致 context mismatch 反复失败。
+        // Reproduces a real failure scenario from history: the model copied read_file output line by line into the patch's
+        // context / remove lines. read_file's real render format is `{:>6}\t{}` (right-aligned line number + TAB);
+        // before the fix, strip_line_number_prefix did not recognize TAB, causing repeated context mismatches.
         let original = "fn foo() {\n    let x = 1;\n    x\n}\n";
-        // 用与 read_file 完全相同的渲染方式构造模型看到的行，避免手数空格出错。
+        // Construct the line the model sees using exactly the same rendering as read_file, to avoid miscounting spaces by hand.
         let rf = |n: usize, s: &str| format!("{:>6}\t{}", n, s);
         let patch = format!(
             "@@ -1,4 +1,4 @@\n {}\n-{}\n+    let x = 2;\n {}\n {}\n",
@@ -4348,15 +4472,15 @@ mod tests {
         );
         let result = apply_unified_patch(original, &patch)
             .expect("read_file TAB line-number prefix must be tolerated in context/remove lines");
-        // context 行保留原文件内容（含缩进），仅目标行被替换。
+        // context lines keep the original file content (including indentation); only target lines are replaced.
         assert_eq!(result, "fn foo() {\n    let x = 2;\n    x\n}\n");
     }
 
     #[test]
     fn apply_unified_patch_line_number_prefix_still_detects_ambiguity() {
-        // 行号前缀容忍不应牺牲安全性：忽略行号后若仍有多处匹配，应报歧义。
+        // Line-number-prefix tolerance must not sacrifice safety: if there are still multiple matches after stripping the number, report ambiguity.
         let original = "dup\ndup\ndup\n";
-        // 标称位置故意写错，迫使走全文件搜索；剥离行号后 context+remove = ["dup","dup"] 匹配多处
+        // The nominal position is deliberately wrong, forcing a whole-file search; after stripping the number, context+remove = ["dup","dup"] matches multiple places
         let patch = "@@ -9,2 +9,2 @@\n 1| dup\n-dup\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("ambiguous patch"), "err was: {err}");
@@ -4364,39 +4488,39 @@ mod tests {
 
     #[test]
     fn strip_line_number_prefix_does_not_strip_code_lines() {
-        // 单参数兜底版：只认 `digits+\t` 与 `digits+分隔符+空格`，保守以防误剥。
+        // Conservative single-argument fallback: only recognizes `digits+\t` and `digits+separator+space`, to avoid mis-stripping.
         use super::strip_line_number_prefix;
-        // read_file 真实格式：右对齐行号 + TAB（此前遗漏的根因场景）
+        // read_file's real format: right-aligned line number + TAB (the root-cause scenario previously missed)
         assert_eq!(
             strip_line_number_prefix("     3\tuse std::fs;"),
             "use std::fs;"
         );
-        // TAB 后保留代码原有缩进（只剥离一个 TAB，不动内容缩进）
+        // After TAB, keep the code's original indentation (strip only one TAB, do not touch content indentation)
         assert_eq!(
             strip_line_number_prefix("    42\t    let x = 1;"),
             "    let x = 1;"
         );
-        // grep 类格式（分隔符 + 空格）应被剥离
+        // grep-like formats (separator + space) should be stripped
         assert_eq!(strip_line_number_prefix("   42| hello"), "hello");
         assert_eq!(strip_line_number_prefix("42: hello"), "hello");
-        // `80:80`（冒号后无空格）不是行号前缀，不应被剥离
+        // `80:80` (colon without a following space) is not a line-number prefix and must not be stripped
         assert_eq!(strip_line_number_prefix("80:80"), "80:80");
-        // `3.14`（点后无空格）不应被剥离
+        // `3.14` (dot without a following space) must not be stripped
         assert_eq!(strip_line_number_prefix("3.14"), "3.14");
-        // 纯数字行不应被剥离（没有分隔符）
+        // Pure digit lines must not be stripped (no separator)
         assert_eq!(strip_line_number_prefix("42"), "42");
-        // 数字紧跟字母不应被剥离（`42px`）
+        // Digits immediately followed by letters must not be stripped (`42px`)
         assert_eq!(strip_line_number_prefix("42px"), "42px");
-        // 不以数字开头的行不应被剥离
+        // Lines not starting with a digit must not be stripped
         assert_eq!(strip_line_number_prefix("hello"), "hello");
     }
 
     #[test]
     fn strip_number_prefix_anchored_is_separator_agnostic() {
-        // 锚定式：以真实行为准，分隔符无关地剥离行号栏，几乎零误伤。
+        // Anchor-based: keyed to the real line, stripping the line-number column regardless of separator, with almost zero false positives.
         use super::strip_number_prefix_anchored;
         let actual = "    let x = 1;";
-        // read_file TAB / grep `| ` / `: ` / 空格 / `.` / `)` 全部兼容
+        // read_file TAB / grep `| ` / `: ` / space / `.` / `)` all compatible
         assert_eq!(
             strip_number_prefix_anchored("  42\t    let x = 1;", actual),
             actual
@@ -4417,31 +4541,31 @@ mod tests {
             strip_number_prefix_anchored("42)     let x = 1;", actual),
             actual
         );
-        // 去栏后不等于真实行 → 原样返回（不误剥）
+        // After removing the column, not equal to the real line → return as-is (no false strip)
         assert_eq!(
             strip_number_prefix_anchored("42\tsomething else", actual),
             "42\tsomething else"
         );
-        // 不以数字开头 → 原样返回
+        // Not starting with a digit → return as-is
         assert_eq!(strip_number_prefix_anchored(actual, actual), actual);
     }
 
-    // ── 大块替换：best-effort 部分匹配精确定位不一致行 ──
+    // ── Large-block replacement: best-effort partial matching precisely locates the inconsistent line ──
 
     #[test]
     fn apply_unified_patch_large_block_mismatch_pinpoints_wrong_line() {
-        // 大块替换中只有一行内容复刻不准，错误信息应精确定位哪一行不一致
-        // （expected vs actual），而不是只给一句 "context mismatch"。
+        // In a large-block replacement where only one line's content is reproduced inaccurately, the error message should precisely locate which line is inconsistent
+        // (expected vs actual), not just say "context mismatch".
         let original = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
-        // remove 块 6 行，其中 line4 被模型误写为 lineX
+        // The remove block has 6 lines; line4 was mistyped by the model as lineX
         let patch =
             "@@ -2,6 +2,3 @@\n-line2\n-line3\n-lineX\n-line5\n-line6\n-line7\n+new2\n+new3\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("context mismatch"), "err was: {err}");
-        // 应报告最佳匹配位置和匹配数
+        // Should report the best match position and match count
         assert!(err.contains("Best partial match"), "err was: {err}");
         assert!(err.contains("5/6 lines matched"), "err was: {err}");
-        // 应精确指出不一致的行：期望 lineX 但实际是 line4
+        // Should precisely point out the inconsistent line: expected lineX but actual is line4
         assert!(
             err.contains("lineX"),
             "err should mention wrong expected line: {err}"
@@ -4454,33 +4578,33 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_absent_block_falls_back_to_nominal_window() {
-        // 期望的块在文件中完全不存在（没有任何行能部分匹配），应回显期望行和
-        // 标称位置附近实际内容，而不是走 partial match 分支。
+        // The expected block does not exist in the file at all (no line partially matches); it should echo the expected lines and
+        // the actual content near the nominal position, instead of taking the partial-match branch.
         let original = "alpha\nbeta\ngamma\n";
         let patch = "@@ -2,1 +2,1 @@\n-not_present\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("context mismatch"), "err was: {err}");
-        // 块完全不存在时不会有 "Best partial match"
+        // When the block does not exist at all, there is no "Best partial match"
         assert!(!err.contains("Best partial match"), "err was: {err}");
-        // 应回显期望行
+        // Should echo the expected lines
         assert!(err.contains("not_present"), "err was: {err}");
-        // 应显示标称位置附近的实际内容
+        // Should show the actual content near the nominal position
         assert!(err.contains("beta"), "err was: {err}");
     }
 
     #[test]
     fn apply_unified_patch_partial_match_uses_middle_line_anchor() {
-        // 期望块的首行复刻有误，但中间行正确。应通过中间行锚点找到最佳匹配位置，
-        // 并报告首行的不一致。
+        // The first line of the expected block is mistyped, but the middle lines are correct. The middle-line anchors should find the best match position,
+        // and report the first line's inconsistency.
         let original = "aaa\nbbb\nccc\nddd\neee\n";
-        // 首行 "wrong" 不在文件中，但 "ccc"、"ddd" 在
+        // The first line "wrong" is not in the file, but "ccc", "ddd" are
         let patch = "@@ -1,3 +1,1 @@\n-wrong\n-ccc\n ddd\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("context mismatch"), "err was: {err}");
-        // 应通过 "ccc" 或 "ddd" 找到部分匹配
+        // Should find a partial match via "ccc" or "ddd"
         assert!(err.contains("Best partial match"), "err was: {err}");
         assert!(err.contains("2/3 lines matched"), "err was: {err}");
-        // 应指出首行不匹配：期望 "wrong" 但实际是 "bbb"
+        // Should point out the first line mismatch: expected "wrong" but actual is "bbb"
         assert!(
             err.contains("wrong"),
             "err should mention wrong expected line: {err}"
@@ -4491,12 +4615,12 @@ mod tests {
         );
     }
 
-    // ── 规范 *** Begin Patch 信封：裸 @@ / @@ heading @@ 无行号 header ──
+    // ── Canonical *** Begin Patch envelope: bare @@ / @@ heading @@ headers without line numbers ──
 
     #[test]
     fn parse_unified_hunks_accepts_bare_at_header() {
-        // 规范信封格式用裸 `@@` 分隔 hunk，不带 `-N,M +N,M` 行号。
-        // 修复前会报 "invalid hunk header"。
+        // The canonical envelope format uses bare `@@` to separate hunks, without `-N,M +N,M` line numbers.
+        // Before the fix it reported "invalid hunk header".
         let patch = "@@\n foo\n-bar\n+baz\n";
         let hunks = parse_unified_hunks(patch).expect("bare @@ header should be accepted");
         assert_eq!(hunks.len(), 1);
@@ -4505,7 +4629,7 @@ mod tests {
 
     #[test]
     fn parse_unified_hunks_accepts_at_header_with_heading() {
-        // `@@ <上下文标题> @@` 也应被接受，标称行号视为 0（依赖全文件搜索定位）。
+        // `@@ <context title> @@` should also be accepted; the nominal line number is treated as 0 (whole-file search locates it).
         let patch = "@@ fn foo() @@\n foo\n-bar\n+baz\n";
         let hunks = parse_unified_hunks(patch).expect("@@ heading @@ header should be accepted");
         assert_eq!(hunks.len(), 1);
@@ -4514,7 +4638,7 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_applies_bare_at_header_hunk() {
-        // 端到端：裸 @@ header 的 hunk 应能通过全文件搜索唯一定位并应用。
+        // End-to-end: a hunk with a bare @@ header should be uniquely located and applied via whole-file search.
         let original = "alpha\nbeta\ngamma\n";
         let patch = "@@\n alpha\n-beta\n+changed\n";
         let result = apply_unified_patch(original, patch).expect("bare @@ hunk should apply");
@@ -4523,9 +4647,9 @@ mod tests {
 
     #[test]
     fn apply_unified_patch_bare_at_header_requires_unique_match() {
-        // 裸 @@ header 没有标称行号，不能把 old_start=0 当成第 1 行的强锚点。
-        // 如果上下文在文件中出现多次，应要求模型补充更多上下文，避免静默改错首个位置。
-        // exact 定位阶段已经足够确认歧义；不应继续猜测或静默选第一个位置。
+        // A bare @@ header has no nominal line number; old_start=0 must not be treated as a strong anchor at line 1.
+        // If the context appears multiple times in the file, the model must be asked to add more context, avoiding silently changing the first position.
+        // The exact-location stage already confirms ambiguity sufficiently; it must not keep guessing or silently pick the first position.
         let original = "alpha\nbeta\ngamma\nalpha\nbeta\ngamma\n";
         let patch = "@@\n alpha\n-beta\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
@@ -4535,7 +4659,7 @@ mod tests {
 
     #[test]
     fn execute_apply_patch_envelope_with_bare_at_header() {
-        // 复现用户报告：规范 *** Begin Patch 信封 + 裸 @@ header。
+        // Reproduces the user report: canonical *** Begin Patch envelope + bare @@ header.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let path = make_temp_path("envelope_bare_at").with_extension("txt");
         let base = path.parent().unwrap().to_path_buf();
@@ -4561,7 +4685,7 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
-    // ======================== ReplaceInLine (P2) 测试 ========================
+    // ======================== ReplaceInLine (P2) tests ========================
 
     fn make_envelope(op: PatchEnvelopeOp, target: &str, body: &[&str]) -> super::PatchEnvelope {
         super::PatchEnvelope {
@@ -4573,7 +4697,7 @@ mod tests {
 
     #[test]
     fn inline_replace_basic() {
-        // 基本：anchor 定位行，old->new 精确替换
+        // Basic: anchor locates the line, old->new exact replacement
         let original = "fn foo() {\n    let x = 42;\n    println!(\"{}\", x);\n}\n";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
@@ -4589,7 +4713,7 @@ mod tests {
 
     #[test]
     fn inline_replace_preserves_no_trailing_newline() {
-        // 文件不以 \n 结尾时，替换后也不加 \n
+        // When the file does not end with \n, no \n is added after the replacement
         let original = "hello world";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
@@ -4614,8 +4738,8 @@ mod tests {
 
     #[test]
     fn inline_replace_anchor_tolerates_confusable() {
-        // anchor 里用了 em-dash (—, U+2014)，文件里是 ASCII hyphen (-)。
-        // anchor 归一化匹配应容忍，但 old 仍需精确匹配。
+        // The anchor uses em-dash (—, U+2014), while the file has ASCII hyphen (-).
+        // Anchor normalized matching should tolerate it, but old must still match exactly.
         let original = "the quick—brown fox\njumps over\n";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
@@ -4629,8 +4753,8 @@ mod tests {
 
     #[test]
     fn inline_replace_old_tolerates_confusable() {
-        // old 里有 em-dash，文件里是 ASCII hyphen：精确匹配失败后，
-        // 宽容兜底（confusable 1:1 归一化）应能定位并替换。
+        // old has em-dash, the file has ASCII hyphen: after exact match fails,
+        // the tolerant fallback (confusable 1:1 normalization) should locate and replace.
         let original = "the quick-brown fox\n";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
@@ -4639,13 +4763,13 @@ mod tests {
         );
         let result =
             apply_inline_replace(original, &envelope).expect("confusable old should match");
-        // 输出由 new 构造，保留文件原有内容；只替换匹配到的区间
+        // The output is built from new, preserving the file's original content; only the matched range is replaced
         assert_eq!(result, "the slow-brown fox\n");
     }
 
     #[test]
     fn inline_replace_old_tolerates_whitespace() {
-        // old 带前导/尾随空白（模型缩进复刻不准）-> 宽容匹配忽略首尾空白
+        // old with leading/trailing whitespace (model indentation not reproduced exactly) -> tolerant match ignores leading/trailing whitespace
         let original = "let x = 42;\n";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
@@ -4659,8 +4783,8 @@ mod tests {
 
     #[test]
     fn inline_replace_old_not_found_mentions_line_prefix_hint() {
-        // old 从 read_file 复制时把行号前缀也带进来了 -> 不应静默匹配，报错并给出提示。
-        // 宽容匹配不做前缀剥离（会污染文件内容），这里验证错误信息有指引。
+        // old copied from read_file also brought the line-number prefix -> must not match silently; error with a hint.
+        // Tolerant matching does not strip prefixes (that would pollute file content); here we verify the error message has guidance.
         let original = "let x = 42;\n";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
@@ -4677,8 +4801,8 @@ mod tests {
 
     #[test]
     fn inline_replace_old_confusable_ambiguous() {
-        // 精确匹配为零（em-dash/en-dash 都不是 hyphen），归一化后 old 在行内出现
-        // 多次 -> 报错（而不是猜一个）
+        // Exact match is zero (em-dash/en-dash are not hyphen); after normalization old appears in the line
+        // multiple times -> error (instead of guessing one)
         let original = "a—b a–b\n";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
@@ -4695,7 +4819,7 @@ mod tests {
 
     #[test]
     fn inline_replace_anchor_not_unique() {
-        // anchor 匹配多行 -> 报错
+        // Anchor matches multiple lines -> error
         let original = "duplicate line\nduplicate line\nunique here\n";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
@@ -4725,7 +4849,7 @@ mod tests {
 
     #[test]
     fn inline_replace_old_not_unique_in_line() {
-        // old 在行内出现多次 -> 报错
+        // old appears multiple times within the line -> error
         let original = "foo bar foo baz\n";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
@@ -4766,7 +4890,7 @@ mod tests {
 
     #[test]
     fn inline_replace_unicode_content() {
-        // 替换包含多字节 UTF-8 的内容，验证 byte index 切片安全
+        // Replacing multi-byte UTF-8 content, verifying byte-index slicing safety
         let original = "let greeting = \"你好世界\";\n";
         let envelope = make_envelope(
             PatchEnvelopeOp::ReplaceInLine,
@@ -4780,7 +4904,7 @@ mod tests {
 
     #[test]
     fn inline_replace_parse_envelope() {
-        // 验证 parse_patch_envelope 能识别 *** Replace in line: header
+        // Verifies parse_patch_envelope recognizes the *** Replace in line: header
         let patch = "*** Begin Patch\n\
             *** Replace in line: src/main.rs\n\
             anchor: fn main()\n\
@@ -4797,7 +4921,7 @@ mod tests {
 
     #[test]
     fn inline_replace_via_execute_apply_patch() {
-        // 端到端：通过 execute_apply_patch 调用，验证完整路径（含 sandbox）
+        // End-to-end: calls through execute_apply_patch, verifying the full path (including sandbox)
         let _guard = ENV_LOCK.lock();
         let path = make_temp_path("inline_e2e");
         let base = path.parent().unwrap().to_path_buf();
@@ -4849,7 +4973,7 @@ mod tests {
 
         crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
             let args = serde_json::json!({
-                // 部分模型会把未使用的可选字符串参数序列化为空串，应按未提供处理。
+                // Some models serialize unused optional string parameters as empty strings; treat them as not provided.
                 "file_path": "",
                 "patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-old_a\n+new_a\n*** Add File: b.txt\n+hello\n+world\n*** End Patch\n"
             });
@@ -4864,8 +4988,8 @@ mod tests {
 
     #[test]
     fn execute_apply_patch_multi_file_ignores_redundant_file_path() {
-        // 多文件信封 + 冗余 file_path：模型常在多文件信封时仍传 file_path
-        // （指向其中一个文件）。应静默忽略 file_path，用信封内各 section 自身路径。
+        // Multi-file envelope + redundant file_path: models often still pass file_path in a multi-file envelope
+        // (pointing at one of the files). file_path should be silently ignored, using each section's own path in the envelope.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let base = make_temp_path("multi_file_redundant_path");
         let a = base.join("a.txt");
@@ -4875,7 +4999,7 @@ mod tests {
 
         crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
             let args = serde_json::json!({
-                // 冗余 file_path 应被静默忽略
+                // Redundant file_path should be silently ignored
                 "file_path": a.to_string_lossy(),
                 "patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-old_a\n+new_a\n*** Add File: b.txt\n+hello\n+world\n*** End Patch\n"
             });
