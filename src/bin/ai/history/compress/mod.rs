@@ -449,7 +449,22 @@ impl OverflowSink {
         }
         let digest = content_sha256_hex(payload.as_bytes());
         if self.seen_payloads.contains(&digest) {
-            return true;
+            // Trust an index hit only if the archive it describes is still
+            // readable. `exists()` alone is insufficient: an in-place truncate
+            // leaves the file present but empty, so require a non-zero length.
+            let archive_readable = std::fs::metadata(&self.path)
+                .map(|meta| meta.len() > 0)
+                .unwrap_or(false);
+            if archive_readable {
+                return true;
+            }
+            // The archive body vanished or was emptied while the index survived
+            // (external cleanup, move, or truncate of overflow-history.md).
+            // Trusting a stale entry here would report success while skipping
+            // payloads readers can no longer find, so reset the in-memory set
+            // and drop the sidecar; both repopulate from fresh appends below.
+            self.seen_payloads.clear();
+            let _ = std::fs::remove_file(self.fingerprint_index_path());
         }
         use std::io::Write;
         // Append mode: a later compress pass must never wipe what earlier
@@ -3836,6 +3851,8 @@ mod dedup_adjacent_tests;
 mod fold_early_tool_groups_tests;
 #[cfg(test)]
 mod overflow_stub_merge_tests;
+#[cfg(test)]
+mod overflow_sink_dedup_tests;
 #[cfg(test)]
 mod shrink_successful_write_arguments_tests;
 #[cfg(test)]

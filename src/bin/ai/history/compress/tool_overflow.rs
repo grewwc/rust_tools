@@ -946,7 +946,9 @@ mod tests {
         // 1) 用 Path C 生成一个归档 asset
         let mut messages = vec![
             assistant_call("spill", "read_file"),
-            tool_result("spill", &"x".repeat(1_000)),
+            // 填充量留足余量：指纹给 stub 引入固定 ~16 字节开销，若原文与 stub 体量
+            // 极度接近会翻转防膨胀守卫（stub>=原文），使本测试聚焦复用语义而非字节巧合。
+            tool_result("spill", &"x".repeat(4_000)),
             assistant_call("recent", "read_file"),
             tool_result("recent", "recent result"),
         ];
@@ -1528,6 +1530,82 @@ mod tests {
     }
 
     #[test]
+    fn preserved_stub_carries_fingerprint_line() {
+        let full = "Compiling rust_tools v0.1.0 (/repo)\n\
+                    warning: unused variable `root_idx`\n\
+                    error[E0308]: mismatched types in sched_ctx\n";
+        let stub = build_preserved_tool_overflow_stub(Path::new("/tmp/fp.txt"), "execute_command", full, &[]);
+        assert!(is_preserved_tool_overflow_stub(&stub));
+
+        // Deterministic in content: same bytes -> byte-identical stub text.
+        let stub_again = build_preserved_tool_overflow_stub(Path::new("/tmp/fp.txt"), "execute_command", full, &[]);
+        assert_eq!(stub, stub_again);
+
+        let fp_line = stub
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix("- fingerprint: "))
+            .expect("fingerprint line present on fresh stub");
+        // sha= segment: exactly 12 hex chars.
+        let sha = fp_line.split("sha=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(sha.len(), 12);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        // Keyword casing is preserved verbatim so tokens stay greppable in the archive.
+        assert!(fp_line.contains("keys="), "keys= segment present: {fp_line}");
+        assert!(fp_line.contains("rust_tools") || fp_line.contains("root_idx"), "keywords: {fp_line}");
+    }
+
+    #[test]
+    fn collapse_and_minimize_carry_fingerprint_through() {
+        let full = "alpha beta gamma\nE0308 mismatched_types hit\n".repeat(30);
+        let stub = build_preserved_tool_overflow_stub(Path::new("/tmp/carry.txt"), "execute_command", full.as_str(), &[]);
+
+        let anchor = collapse_overflow_stub_to_anchor(&stub).expect("collapse");
+        assert!(!anchor.contains("Preview ("));
+        assert!(anchor.contains("- fingerprint: "), "anchor carries fingerprint: {anchor}");
+
+        let pointer = minimize_overflow_stub_to_pointer(&stub).expect("minimize");
+        assert!(pointer.contains("- file_path: /tmp/carry.txt"));
+        assert!(pointer.contains("- fingerprint: "), "pointer keeps retrieval signal");
+        assert!(is_preserved_tool_overflow_stub(&pointer));
+
+        // Legacy stubs (pre-fingerprint) minimize cleanly without fabricated fields.
+        let legacy = format!(
+            "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\nOutput preserved for tool `x`.\n- file_path: /tmp/legacy.txt"
+        );
+        let minimized = minimize_overflow_stub_to_pointer(&legacy).unwrap();
+        assert!(!minimized.contains("fingerprint"));
+    }
+
+    #[test]
+    fn fingerprint_skips_degenerate_gist() {
+        // A single repeated character carries no recall signal; the gist segment is
+        // omitted entirely so aged stubs of degenerate outputs stay minimal.
+        let fp = stub_fingerprint_line(&"x".repeat(1_000)).expect("non-empty content has fingerprint");
+        assert!(fp.contains("sha="), "{fp}");
+        assert!(!fp.contains("gist="), "no gist for degenerate body: {fp}");
+
+        // Real signal still gets a gist.
+        let fp2 = stub_fingerprint_line("warning: sched_ctx drifted from kernel root\n");
+        assert!(fp2.unwrap().contains("gist=\""), "informative line kept");
+    }
+
+    #[test]
+    fn fingerprint_keywords_dedup_case_insensitively_and_stay_deterministic() {
+        // Mixed-case repeats of the same token must collapse to one keyword,
+        // keeping the first-seen casing; the set-based dedup must not perturb
+        // ordering vs. the previous linear scan.
+        let content = "sched_ctx SCHED_CTX Sched_Ctx root_idx ROOT_IDX payloadxyz\n";
+        let keys = extract_fingerprint_keywords(content);
+        let sched = keys.iter().filter(|k| k.eq_ignore_ascii_case("sched_ctx")).count();
+        assert_eq!(sched, 1, "case-insensitive dedup collapses repeats: {keys:?}");
+        assert!(keys.contains(&"sched_ctx".to_string()), "first casing kept: {keys:?}");
+        assert!(keys.len() <= FINGERPRINT_KEY_COUNT);
+
+        // Fully deterministic across calls (no RNG / hash-order leakage into output).
+        assert_eq!(keys, extract_fingerprint_keywords(content));
+    }
+
+    #[test]
     fn age_out_overflow_stub_previews_is_idempotent() {
         let stub = overflow_stub_with_preview("/tmp/session/read-xyz.txt", "read_file");
         // 两条 user 轮，让 stub 落在保护尾窗之外（retained_turn_start 之前）。
@@ -1735,6 +1813,10 @@ fn build_preserved_tool_overflow_stub(
          - file_path: {}",
         path.display(),
     );
+    if let Some(fingerprint) = stub_fingerprint_line(full_content) {
+        out.push('\n');
+        out.push_str(&fingerprint);
+    }
     for line in recall_lines {
         out.push('\n');
         out.push_str(line);
@@ -1765,6 +1847,116 @@ fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'s
         }
         _ => "Archived output; `file_path` holds the full text. Read it only if the preview is insufficient.",
     }
+}
+
+/// Max characters kept in the fingerprint gist; long build-log headers carry mostly
+/// boilerplate past this point.
+const FINGERPRINT_GIST_MAX_CHARS: usize = 72;
+
+/// A gist qualifies only above this many distinct characters: degenerate bodies
+/// (one repeated char filling an oversized command echo) carry no recall signal,
+/// and padding them into every aged stub wastes bytes under tight stub budgets.
+const FINGERPRINT_GIST_MIN_DISTINCT_CHARS: usize = 4;
+
+/// How many discriminative keywords the fingerprint carries into aged stub stages.
+const FINGERPRINT_KEY_COUNT: usize = 5;
+
+/// Build the single-line `- fingerprint:` payload from archived content.
+///
+/// Purely deterministic in the content (no timestamps, no RNG): reprojections
+/// rebuild stubs every turn, and byte-identical stubs keep prompt caches warm.
+/// Layout: `sha=<12 hex> gist="<one informative line>" keys=<k1,k2,...>`; empty
+/// segments are omitted rather than rendered blank.
+fn stub_fingerprint_line(full_content: &str) -> Option<String> {
+    if full_content.trim().is_empty() {
+        return None;
+    }
+    let digest = content_sha256_hex(full_content.as_bytes());
+    let mut parts = vec![format!("sha={}", &digest[..12])];
+    if let Some(gist) = extract_fingerprint_gist(full_content) {
+        parts.push(format!("gist=\"{gist}\""));
+    }
+    let keys = extract_fingerprint_keywords(full_content);
+    if !keys.is_empty() {
+        parts.push(format!("keys={}", keys.join(",")));
+    }
+    Some(format!("- fingerprint: {}", parts.join(" ")))
+}
+
+/// Pick the first head-region line with real alphanumeric signal as the gist,
+/// whitespace-collapsed and clamped on char boundaries. Returns `None` when the
+/// head region holds only decoration (separators, bare JSON braces, ...).
+fn extract_fingerprint_gist(content: &str) -> Option<String> {
+    content.lines().take(30).find_map(|line| {
+        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let distinct = collapsed.chars().collect::<FxHashSet<char>>().len();
+        (distinct >= FINGERPRINT_GIST_MIN_DISTINCT_CHARS).then_some(collapsed)
+    }).map(|gist| {
+        let head: String = gist.chars().take(FINGERPRINT_GIST_MAX_CHARS).collect();
+        if head.len() < gist.len() {
+            format!("{head}\u{2026}")
+        } else {
+            head
+        }
+    })
+}
+
+/// Hand-tuned heuristic salience for fingerprint keywords, matching what models
+/// tend to recall from tool outputs: error codes, type/path identifiers, flags.
+fn fingerprint_token_score(token: &str) -> i32 {
+    let base = token.len().min(24) as i32;
+    let digit_bonus = i32::from(token.chars().any(|c| c.is_ascii_digit())) * 4;
+    let has_camel_boundary = token
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase());
+    let structure_bonus = i32::from(token.contains('_') || has_camel_boundary) * 3;
+    // Full paths rarely survive model recollection; their trailing segment usually
+    // does, so whole path-shaped tokens compete with a handicap.
+    let slash_handicap = i32::from(token.contains('/')) * (-base / 2 - 2);
+    base + digit_bonus + structure_bonus + slash_handicap
+}
+
+/// Extract up to `FINGERPRINT_KEY_COUNT` discriminative keywords from content.
+///
+/// Casing is preserved verbatim: `search_overflow` matches literally and defaults
+/// to case-sensitive, so a keyword only helps retrieval if it still occurs exactly
+/// in the archived text.
+fn extract_fingerprint_keywords(content: &str) -> Vec<String> {
+    const MIN_TOKEN_LEN: usize = 5;
+    const MAX_TOKEN_LEN: usize = 32;
+    // Generic prose/log vocabulary that crowds out identifiers when left unfiltered.
+    const STOP_WORDS: [&str; 14] = [
+        "error", "result", "output", "content", "value", "string", "unknown",
+        "there", "which", "would", "about", "failed", "success", "warning",
+    ];
+    let mut candidates: Vec<(String, i32)> = Vec::new();
+    // Case-insensitive dedup via a membership set (not a linear scan of
+    // `candidates`): this runs on the full raw overflow body (up to the 64K
+    // hard cap) and is rebuilt every turn during reprojection, so an
+    // O(tokens × distinct) scan is a hot-path cost. Insertion order into
+    // `candidates` is unchanged, and the stable sort below keeps appearance
+    // order as the score tiebreak, so output stays byte-identical.
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    for raw in content.split(|c: char| {
+        !(c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '.' | '-'))
+    }) {
+        let len_ok = (MIN_TOKEN_LEN..=MAX_TOKEN_LEN).contains(&raw.len());
+        let wordy = raw.chars().any(|c| c.is_ascii_alphabetic());
+        let diversified = !raw.chars().all(|c| c == raw.chars().next().unwrap_or('-'));
+        let lowered = raw.to_ascii_lowercase();
+        if !len_ok || !wordy || !diversified || STOP_WORDS.contains(&lowered.as_str()) {
+            continue;
+        }
+        // Keep the first-seen casing; a second occurrence in any casing is skipped.
+        if !seen.insert(lowered) {
+            continue;
+        }
+        candidates.push((raw.to_string(), fingerprint_token_score(raw)));
+    }
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.truncate(FINGERPRINT_KEY_COUNT);
+    candidates.into_iter().map(|(token, _)| token).collect()
 }
 
 pub(super) fn build_tool_overflow_recall_lines(tool_name: &str, arguments: &str) -> Vec<String> {
@@ -1924,6 +2116,15 @@ fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
         out.push('\n');
         out.push_str(line);
     }
+    if let Some(fp) = text
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("- fingerprint: "))
+    {
+        out.push('\n');
+        out.push_str("- fingerprint: ");
+        out.push_str(fp.trim());
+        out.push('\n');
+    }
     out.push('\n');
     out.push_str(tool_hint);
     Some(out)
@@ -1950,11 +2151,21 @@ fn minimize_overflow_stub_to_pointer(text: &str) -> Option<String> {
         .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
         .map(str::trim)
         .filter(|path| !path.is_empty())?;
-    Some(format!(
+    let mut out = format!(
         "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
          Output preserved for tool `{tool_name}`.\n\
          - file_path: {file_path}"
-    ))
+    );
+    // Carry the content fingerprint into the final pointer form so even the most
+    // compressed stub keeps retrieval signal; legacy stubs simply omit it.
+    if let Some(fp) = text
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("- fingerprint: "))
+    {
+        out.push_str("\n- fingerprint: ");
+        out.push_str(fp.trim());
+    }
+    Some(out)
 }
 
 pub(super) fn minimize_overflow_stubs_for_hard_budget(messages: &mut [Message]) {
