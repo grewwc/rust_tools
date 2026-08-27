@@ -49,7 +49,6 @@ mod agent_routing;
 mod background_dispatch;
 pub mod commands;
 pub mod decision_log;
-pub mod embedding;
 pub mod hooks;
 pub mod hook_registry;
 pub mod input;

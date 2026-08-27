@@ -498,6 +498,59 @@ pub(crate) fn is_registered_tool_name(name: &str) -> bool {
     REGISTERED_TOOL_NAMES.contains(name)
 }
 
+/// Returns the skill/agent manifest-declared tool names that match no
+/// registered builtin tool. `mcp_*` entries are excluded deliberately: MCP
+/// availability is resolved against live servers at turn time (`select_mcp_tools`
+/// / `enable_tools`), not against this static registry, so an `mcp_*` prefix can
+/// be valid even though this process has never seen the underlying server.
+pub(crate) fn unknown_manifest_tool_names(tool_names: &[String]) -> Vec<String> {
+    tool_names
+        .iter()
+        .filter(|name| !name.starts_with("mcp_") && !is_registered_tool_name(name))
+        .cloned()
+        .collect()
+}
+
+/// Comma-joined form of [`unknown_manifest_tool_names`] for load-time warnings,
+/// or `None` when every declared name resolves.
+pub(crate) fn manifest_unknown_tool_names_warning(tool_names: &[String]) -> Option<String> {
+    let unknown = unknown_manifest_tool_names(tool_names);
+    (!unknown.is_empty()).then(|| unknown.join(", "))
+}
+
+#[cfg(test)]
+mod manifest_tool_name_tests {
+    use super::*;
+
+    #[test]
+    fn known_and_mcp_prefixed_names_pass_typo_is_flagged() {
+        assert_eq!(
+            unknown_manifest_tool_names(&[
+                "read_file".to_string(),
+                "read_fil".to_string(),
+                "".to_string()
+            ]),
+            vec!["read_fil".to_string(), "".to_string()]
+        );
+        assert_eq!(
+            unknown_manifest_tool_names(&["mcp_browser_navigate".to_string()]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn warning_is_none_when_all_resolved() {
+        assert_eq!(
+            manifest_unknown_tool_names_warning(&["apply_patch".to_string()]),
+            None
+        );
+        assert_eq!(
+            manifest_unknown_tool_names_warning(&["nope".to_string(), "also_nope".to_string()]),
+            Some("nope, also_nope".to_string())
+        );
+    }
+}
+
 /// 把已废弃/合并的历史工具名规整到当前规范名，用于旧会话回放兼容。
 /// `read_file_lines` 已并入 `read_file`（两者都接受 offset/limit）。
 fn canonical_tool_name(name: &str) -> &str {

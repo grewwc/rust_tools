@@ -2345,8 +2345,10 @@ fn execute_task_integrate(args: &Value) -> Result<String, String> {
             .get("task_id")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or("Each task integration requires a non-empty task_id")?;
+            .filter(|value| !value.is_empty());
+        let Some(task_id) = task_id else {
+            return Err(missing_task_id_error(history_file, session_id));
+        };
         let disposition = task
             .get("disposition")
             .and_then(Value::as_str)
@@ -2385,6 +2387,42 @@ fn execute_task_integrate(args: &Value) -> Result<String, String> {
         integrated.len(),
         integrated.join(", ")
     ))
+}
+
+/// Error text for a missing or empty `task_id`. Appends the ids of delivered but
+/// still-unintegrated subagent results so the model can copy one verbatim instead of
+/// re-guessing (the `[task_id=...]` markers in earlier results may be off-screen).
+fn missing_task_id_error(history_file: &std::path::Path, session_id: &str) -> String {
+    let mut message = "Each task integration requires a non-empty task_id".to_string();
+    // Use the full audit plus the same delivered-but-unintegrated filter as
+    // `read_unintegrated_task_evidence` (which is not re-exported at history level).
+    match crate::ai::history::read_task_spawn_audit(history_file, session_id) {
+        Ok(records) => {
+            let ids: Vec<&str> = records
+                .iter()
+                .filter(|record| {
+                    record.delivered_at_unix_ms > 0 && record.integrated_at_unix_ms.is_none()
+                })
+                .map(|record| record.task_id.as_str())
+                .collect();
+            if ids.is_empty() {
+                message.push_str(
+                    "\nNo delivered-but-unintegrated subagent results found; run `task_audit` to list task ids, then retry with the exact task_id.",
+                );
+                return message;
+            }
+            message.push_str(&format!(
+                "\nDelivered task results not yet integrated (copy one of these task_ids verbatim): {}",
+                ids.join(", ")
+            ));
+        }
+        Err(_) => {
+            message.push_str(
+                "\nRun `task_audit` to list delivered task ids, then retry with the exact task_id.",
+            );
+        }
+    }
+    message
 }
 
 inventory::submit!(ToolRegistration {

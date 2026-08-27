@@ -24,7 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 ///   以及其他非 guidance 类别
 ///
 /// ## 搜索机制
-/// - BM25 关键词搜索 + 向量语义搜索 (通过 RAG store)
+/// - BM25 关键词搜索 + 文本相似度 (词汇级)
 /// - 支持归档文件搜索 (可配置)
 /// - 自动去重和 GC
 use std::collections::VecDeque;
@@ -35,7 +35,7 @@ use std::sync::{LazyLock, Mutex};
 
 use super::memory_index::MemoryIndex;
 use super::with_memory_file_lock;
-use crate::ai::knowledge::indexing::{embedder, similarity};
+use crate::ai::knowledge::indexing::similarity;
 use crate::ai::tools::service::memory::{execute_memory_dedup, execute_memory_gc};
 use crate::commonw::configw;
 use serde::{Deserialize, Serialize};
@@ -730,7 +730,7 @@ impl MemoryStore {
         let query_lc = query.to_lowercase();
 
         // Fast-path: 先用 SQLite FTS5 拿候选 id 集合（O(log N) MATCH），
-        // 再回到 JSONL 把候选条目精确加载，跑现有 BM25 + embedding 计分。
+        // 再回到 JSONL 把候选条目精确加载，跑现有 BM25 + 文本相似度计分。
         // 这样把 search 从 "全文件扫描 + 全文件 tokenize" 降为 "命中行 + tokenize"，
         // 输出格式 / 分数权重 / 排序逻辑全部不变。
         // FTS 不可用 / 候选过少时回到原扫描路径，行为完全等价。
@@ -805,7 +805,7 @@ impl MemoryStore {
         let b = 0.75f64;
         let mut scored: Vec<(f64, usize)> = Vec::with_capacity(docs.len());
         let mut bm25_vals: Vec<f64> = Vec::with_capacity(docs.len());
-        for (idx, (entry, _full, toks)) in docs.iter().enumerate() {
+        for (idx, (_entry, _full, toks)) in docs.iter().enumerate() {
             let mut tf: FxHashMap<&str, usize> = FxHashMap::default();
             for t in toks {
                 *tf.entry(t.as_str()).or_insert(0) += 1;
@@ -830,50 +830,33 @@ impl MemoryStore {
                 bm25 += idf * (tfv * (k1 + 1.0)) / denom;
             }
             bm25_vals.push(bm25);
-            let sim = compute_similarity(entry, &query_lc) as f64;
-            let pre = 0.5 * sim + 0.5 * 0.0;
-            scored.push((pre, idx));
+            // Ranking is BM25-only here: the character-similarity re-scoring
+            // (compute_similarity) was removed because it re-weighted the same
+            // token space BM25 already scores. The priority boost applies below.
+            scored.push((bm25, idx));
         }
         let max_bm25 = bm25_vals.iter().cloned().fold(0.0f64, f64::max);
         for i in 0..scored.len() {
-            let bm = if max_bm25 > 0.0 {
-                bm25_vals[i] / max_bm25
+            scored[i].0 = if max_bm25 > 0.0 {
+                scored[i].0 / max_bm25
             } else {
                 0.0
             };
-            let s = 0.55 * scored[i].0 + 0.45 * bm;
-            scored[i].0 = s;
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         let cap = limit.saturating_mul(10).min(200).max(limit);
         let mut top_idx: Vec<(f64, usize)> =
             scored.iter().take(cap).map(|(s, i)| (*s, *i)).collect();
-        // 查询与候选合并为一次批量远程请求，省一次 HTTP round-trip。
-        // 语义与拆分调用等价：任一步失败都回退纯 BM25 排序。
-        let mut embed_inputs: Vec<String> = Vec::with_capacity(top_idx.len() + 1);
-        embed_inputs.push(query_lc.clone());
-        embed_inputs.extend(top_idx.iter().map(|&(_, i)| docs[i].1.clone()));
-        let batch_all = embedder::embed_texts(&embed_inputs);
-        if let Some(qv) = batch_all.as_ref().and_then(|v| v.first()).cloned() {
-            let batch: Vec<Vec<f32>> = batch_all
-                .as_ref()
-                .map(|v| v.get(1..).map(|s| s.to_vec()).unwrap_or_default())
-                .unwrap_or_default();
-            let mut rescored: Vec<(f64, usize)> = Vec::with_capacity(top_idx.len());
-            for (idx, &(_s, i)) in top_idx.iter().enumerate() {
-                let emb = batch
-                    .get(idx)
-                    .map(|v| similarity::cosine_similarity(&qv, v))
-                    .unwrap_or(0.0);
-                let base = _s;
-                let final_s = 0.85 * base + 0.15 * emb as f64;
-                rescored.push((final_s, i));
-            }
-            rescored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-            top_idx = rescored.into_iter().take(limit).collect();
-        } else {
-            top_idx.truncate(limit);
+        // Priority boost: scale the blended score by entry priority so that
+        // explicitly high-value knowledge (High 100-200, Permanent 255) ranks
+        // above same-relevance low-priority entries. Default 100 → ×1.0;
+        // permanent 255 → ~×1.8; low 0 → ~×0.5.
+        for i in 0..top_idx.len() {
+            let pri = docs[top_idx[i].1].0.priority.unwrap_or(100) as f64;
+            top_idx[i].0 *= 1.0 + (pri - 100.0) / 200.0;
         }
+        top_idx.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        top_idx.truncate(limit);
         let mut out = Vec::with_capacity(top_idx.len());
         for (s, i) in top_idx {
             out.push((docs[i].0.clone(), s));
@@ -1406,45 +1389,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-fn compute_similarity(entry: &AgentMemoryEntry, query_lc: &str) -> f64 {
-    let base_contains = if entry.note.to_lowercase().contains(query_lc)
-        || entry.category.to_lowercase().contains(query_lc)
-        || entry
-            .tags
-            .iter()
-            .any(|t| t.to_lowercase().contains(query_lc))
-        || entry
-            .source
-            .as_ref()
-            .is_some_and(|s| s.to_lowercase().contains(query_lc))
-    {
-        0.35
-    } else {
-        0.0
-    };
-    let mut full = String::new();
-    full.push_str(&entry.category);
-    full.push(' ');
-    full.push_str(&entry.note);
-    if let Some(s) = &entry.source {
-        full.push(' ');
-        full.push_str(s);
-    }
-    if !entry.tags.is_empty() {
-        full.push(' ');
-        full.push_str(&entry.tags.join(" "));
-    }
-    let nq = similarity::norm_text(query_lc);
-    let ne = similarity::norm_text(&full);
-    let d = similarity::dice_coefficient(&similarity::bigrams(&nq), &similarity::bigrams(&ne));
-    let tq = similarity::expand_tokens(&similarity::tokenize(query_lc));
-    let te = similarity::expand_tokens(&similarity::tokenize(&full.to_lowercase()));
-    let j = similarity::jaccard(&tq, &te);
-    let co = similarity::char_overlap(&nq, &ne);
-    let s = 0.5 * d + 0.3 * j + 0.15 * co + base_contains;
-    if s < 0.0 { 0.0 } else { s.min(1.0) }
 }
 
 fn resolve_memory_file() -> PathBuf {

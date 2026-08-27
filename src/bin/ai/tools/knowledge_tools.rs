@@ -17,8 +17,8 @@
 /// 知识库面向用户，记忆面向 Agent 自身。
 ///
 /// 包含工具：
-/// - `knowledge_save` — 保存用户知识（自动同步到 RAG 向量索引）
-/// - `knowledge_forget` — 删除指定知识（同步删除 RAG 向量）
+/// - `knowledge_save` — 保存用户知识
+/// - `knowledge_forget` — 删除指定知识
 /// - `knowledge_search` — 按关键词搜索知识
 /// - `knowledge_list` — 列出最近的知识条目（默认 20 条，最多 100）
 /// - `knowledge_consolidate` — AI 驱动的记忆整理（读全部 → 分析 → 执行整理）
@@ -72,17 +72,7 @@ use crate::ai::tools::service::memory::{
 use crate::ai::tools::storage::memory_store::{
     AgentMemoryEntry, KnowledgeAppendOutcome, MemoryStore,
 };
-use crate::ai::tools::storage::rag_store::{
-    RagEntry, ensure_rag_store, get_rag_store, legacy_rag_id_for_memory_entry,
-    legacy_rebuild_rag_id_for_memory_entry,
-};
 use chrono::Local;
-
-fn rag_timestamp_for_entry(entry: &AgentMemoryEntry) -> u64 {
-    chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
-        .map(|dt| dt.timestamp_millis().max(0) as u64)
-        .unwrap_or_else(|_| entry.timestamp.parse().unwrap_or(0))
-}
 
 // ─── knowledge_save ──────────────────────────────────────────────────────────
 
@@ -118,12 +108,6 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
         return Ok(result);
     }
 
-    // Sync to RAG vector index. Failure here is non-fatal (the entry is already
-    // persisted to the JSONL store above), but it must not be silent: if the
-    // vector upsert fails the entry won't be reachable via semantic search, so
-    // surface a warning to the model rather than pretending it succeeded.
-    let rag_warning = sync_entry_to_rag(&entry);
-
     let mut result = format!(
         "Saved to knowledge [{}]:\n  {}\n",
         entry.category, entry.note
@@ -153,53 +137,7 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
             .push_str("  Saved as searchable knowledge; it will not be injected automatically.\n");
     }
 
-    if let Some(warning) = rag_warning {
-        result.push_str(&format!(
-            "  ⚠️ Warning: vector index sync failed ({warning}); this entry may not be retrievable via semantic knowledge_search until re-synced.\n"
-        ));
-    }
-
     Ok(result)
-}
-
-/// 把知识条目同步进 RAG 向量索引。成功返回 `None`；任一步骤失败返回
-/// `Some(reason)`，由调用方决定如何提示模型。条目此前已落 JSONL 主存储，
-/// 因此这里的失败是非致命的，但不能静默——否则模型会误以为该条目可被语义检索。
-fn sync_entry_to_rag(entry: &AgentMemoryEntry) -> Option<String> {
-    let Some(id) = entry.id.clone() else {
-        // 没有 id 的条目无法进 RAG（也无法后续定位），但这属于上游生成问题，
-        // 不在此处报错，交由主存储语义处理。
-        return None;
-    };
-    if let Err(e) = ensure_rag_store() {
-        return Some(format!("rag store unavailable: {e}"));
-    }
-    let guard = match get_rag_store() {
-        Ok(guard) => guard,
-        Err(e) => return Some(format!("rag store lock poisoned: {e}")),
-    };
-    let Some(rag) = guard.as_ref() else {
-        return Some("rag store not initialized".to_string());
-    };
-    let embedding_text = format!("{}: {}", entry.category, entry.note);
-    let embedding = match rag.embed_texts(&[embedding_text.clone()]) {
-        Ok(embeddings) => match embeddings.into_iter().next() {
-            Some(embedding) => embedding,
-            None => return Some("embedding provider returned no vector".to_string()),
-        },
-        Err(e) => return Some(format!("embedding failed: {e}")),
-    };
-    if let Err(e) = rag.upsert(RagEntry {
-        id,
-        content: embedding_text,
-        category: entry.category.clone(),
-        tags: entry.tags.clone(),
-        embedding,
-        timestamp: rag_timestamp_for_entry(entry),
-    }) {
-        return Some(format!("vector upsert failed: {e}"));
-    }
-    None
 }
 
 inventory::submit!(ToolRegistration {
@@ -239,30 +177,8 @@ fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
         deleted.note.clone()
     };
 
-    // Sync delete from RAG vector index
-    if let Ok(_) = ensure_rag_store() {
-        if let Ok(guard) = get_rag_store() {
-            if let Some(rag) = guard.as_ref() {
-                let rag_id = deleted
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| legacy_rag_id_for_memory_entry(&deleted));
-                let _ = rag.delete(&rag_id);
-                let legacy_ids = [
-                    legacy_rag_id_for_memory_entry(&deleted),
-                    legacy_rebuild_rag_id_for_memory_entry(&deleted),
-                ];
-                for legacy_id in legacy_ids {
-                    if legacy_id != rag_id {
-                        let _ = rag.delete(&legacy_id);
-                    }
-                }
-            }
-        }
-    }
-
     Ok(format!(
-        "Forgotten knowledge entry:\n  id: {}\n  category: {}\n  content: {}\n  (Also removed from RAG vector index)",
+        "Forgotten knowledge entry:\n  id: {}\n  category: {}\n  content: {}",
         id, deleted.category, preview
     ))
 }
@@ -314,12 +230,13 @@ fn execute_knowledge_search(args: &Value) -> Result<String, String> {
     );
     for (idx, entry) in entries.iter().enumerate() {
         let entry_id = entry.id.as_deref().unwrap_or("N/A");
+        let note = truncate_for_output(&entry.note, 600);
         result.push_str(&format!(
             "{}. [id:{}] [{}] {}\n",
             idx + 1,
             entry_id,
             entry.category,
-            entry.note
+            note
         ));
         if !entry.tags.is_empty() {
             result.push_str(&format!("   Tags: {}\n", entry.tags.join(", ")));
@@ -332,6 +249,18 @@ fn execute_knowledge_search(args: &Value) -> Result<String, String> {
     }
 
     Ok(result)
+}
+
+/// Cap a note's displayed length so a single long knowledge entry cannot
+/// dominate the tool result. Keeps the head and an explicit truncation marker;
+/// the full note remains retrievable via `knowledge_list`.
+fn truncate_for_output(note: &str, max_chars: usize) -> String {
+    if note.chars().count() <= max_chars {
+        return note.to_string();
+    }
+    let mut out: String = note.chars().take(max_chars).collect();
+    out.push_str("\n… [truncated]");
+    out
 }
 
 fn knowledge_search_entry_visible(entry: &AgentMemoryEntry, category: Option<&str>) -> bool {
@@ -638,35 +567,6 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
             }
             if !new_entries.is_empty() {
                 report.push_str(&format!("   Saved: {} new entries\n", result.appended));
-            }
-            // Sync RAG vector index: delete vectors for removed ids, upsert embeddings for new entries.
-            // apply_batch_update only rewrites JSONL + rebuilds SQLite/FTS5, so the vector store
-            // must be synced separately to avoid orphaned/missing embeddings.
-            if let Ok(_) = ensure_rag_store() {
-                if let Ok(guard) = get_rag_store() {
-                    if let Some(rag) = guard.as_ref() {
-                        for id in &delete_ids {
-                            let _ = rag.delete(id);
-                        }
-                        for entry in &new_entries {
-                            if let Some(id) = entry.id.clone() {
-                                let embedding_text = format!("{}: {}", entry.category, entry.note);
-                                if let Ok(embeddings) = rag.embed_texts(&[embedding_text.clone()]) {
-                                    if let Some(embedding) = embeddings.into_iter().next() {
-                                        let _ = rag.upsert(RagEntry {
-                                            id,
-                                            content: embedding_text,
-                                            category: entry.category.clone(),
-                                            tags: entry.tags.clone(),
-                                            embedding,
-                                            timestamp: rag_timestamp_for_entry(entry),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
             (result.deleted, result.appended)
         }

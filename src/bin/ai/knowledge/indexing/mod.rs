@@ -1,4 +1,3 @@
-/// Indexing module — BM25, embeddings, and similarity functions.
-pub mod bm25_index;
+/// Indexing module — lexical similarity functions and the embedding provider.
 pub mod embedder;
 pub mod similarity;

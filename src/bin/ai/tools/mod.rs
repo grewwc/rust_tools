@@ -5,10 +5,10 @@ mod knowledge_tools;
 pub mod os_tools;
 mod overflow_search;
 mod patch_tools;
+mod rag_tools;
 mod permissions;
 mod plan_state;
 mod plan_tools;
-mod rag_tools;
 pub(crate) mod registry;
 pub(crate) mod service;
 pub(crate) mod skill_tools;
@@ -28,6 +28,7 @@ pub(crate) use registry::common::execute_tool_call;
 pub(crate) use registry::common::execute_tool_call_with_args_streaming;
 pub(crate) use registry::common::{
     deferred_eager_load_tool_summaries, get_tool_definitions_by_names,
+    manifest_unknown_tool_names_warning,
     tool_allows_same_turn_replay, tool_defers_eager_load, tool_definitions_for_groups,
     tool_history_policy, tool_summaries_for_groups,
 };

@@ -1,46 +1,34 @@
-/// Centralized configuration for the knowledge system.
-/// All thresholds, weights, TTLs, and magic numbers live here.
+//! Knowledge search configuration.
 
-#[derive(Debug, Clone)]
-pub struct SimilarityWeights {
-    pub bm25_blend: f64,
-    pub pre_score_blend: f64,
-    pub embedding_blend: f64,
-    pub dice_weight: f64,
-    pub jaccard_weight: f64,
-    pub char_overlap_weight: f64,
-    pub base_contains_bonus: f64,
-    pub bm25_k1: f64,
-    pub bm25_b: f64,
-}
+use crate::ai::config_schema::AiConfig;
+use crate::commonw::configw;
 
-impl Default for SimilarityWeights {
-    fn default() -> Self {
-        Self {
-            bm25_blend: 0.45,
-            pre_score_blend: 0.55,
-            embedding_blend: 0.15,
-            dice_weight: 0.5,
-            jaccard_weight: 0.3,
-            char_overlap_weight: 0.15,
-            base_contains_bonus: 0.35,
-            bm25_k1: 1.2,
-            bm25_b: 0.75,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+/// Tuning parameters for knowledge retrieval.
+#[derive(Debug, Clone, Copy)]
 pub struct KnowledgeConfig {
-    pub similarity: SimilarityWeights,
+    /// Weight of vector (semantic) similarity in hybrid search, in [0.0, 1.0].
+    /// 1.0 = semantic only, 0.0 = BM25 only. Default 0.4.
     pub hybrid_vector_weight: f32,
 }
 
 impl Default for KnowledgeConfig {
     fn default() -> Self {
         Self {
-            similarity: SimilarityWeights::default(),
             hybrid_vector_weight: 0.4,
         }
     }
+}
+
+/// Load the knowledge config from the runtime config
+/// (`ai.knowledge.hybrid_vector_weight`).
+pub fn knowledge_config() -> KnowledgeConfig {
+    let mut cfg = KnowledgeConfig::default();
+    if let Some(v) = configw::get_all_config()
+        .get_opt(AiConfig::KNOWLEDGE_HYBRID_VECTOR_WEIGHT)
+    {
+        if let Ok(w) = v.parse::<f32>() {
+            cfg.hybrid_vector_weight = w.clamp(0.0, 1.0);
+        }
+    }
+    cfg
 }

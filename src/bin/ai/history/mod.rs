@@ -435,7 +435,12 @@ fn context_projection_fingerprint(
     history_summary_max_chars: usize,
     overflow_dir: Option<&Path>,
 ) -> String {
-    const PROJECTION_VERSION: u8 = 1;
+    // Snapshots persist the materialized projection, so any strategy change that
+    // alters generated projections requires a version bump: mismatched fingerprints
+    // force a rebuild from canonical messages instead of silently keeping stale
+    // context. v2: group folding gained a minimum protected-tail byte floor, and
+    // byte-identical dedup stubs embed a capped content excerpt.
+    const PROJECTION_VERSION: u8 = 2;
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();

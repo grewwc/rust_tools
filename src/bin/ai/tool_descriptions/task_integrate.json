@@ -1,6 +1,6 @@
 {
   "name": "task_integrate",
-  "description": "Acknowledge durable subagent results after incorporating or explicitly rejecting them. Every delivered task_id must be integrated before a normal final answer.",
+  "description": "Acknowledge durable subagent results after incorporating or explicitly rejecting them. Every delivered task_id must be integrated before a normal final answer. Example: {\"tasks\": [{\"task_id\": \"0123456789abcdef0123456789abcdef\", \"disposition\": \"accepted\", \"summary\": \"Result incorporated; it confirmed the root cause and narrowed the fix.\"}]}",
   "parameters": {
     "type": "object",
     "properties": {
@@ -12,7 +12,7 @@
           "properties": {
             "task_id": {
               "type": "string",
-              "description": "The task_id returned by task_spawn / task_spawn_batch (or task_retry) of the delivered result being integrated."
+              "description": "The task_id of the delivered result being integrated. Copy it verbatim from the `[task_id=...]` header of a `task` / `task_wait` result (task_status appends the same headers for completed results), or from the `task_id=` / `new_task_id=` field of a `task_spawn` / `task_audit` / `task_retry` result. Required; must be non-empty."
             },
             "disposition": {
               "type": "string",

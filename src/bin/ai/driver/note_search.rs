@@ -396,22 +396,9 @@ fn build_note_search_chat_history(
 fn select_note_search_candidates<'a>(
     candidates: &'a [crate::ai::tools::service::memory::ScoredMemo],
 ) -> Vec<&'a crate::ai::tools::service::memory::ScoredMemo> {
-    if candidates
-        .first()
-        .is_some_and(|candidate| candidate.semantic)
-    {
-        let top = candidates[0].score.max(1e-6);
-        let threshold = top * 0.6;
-        candidates
-            .iter()
-            .enumerate()
-            .filter(|(index, candidate)| *index == 0 || candidate.score >= threshold)
-            .take(8)
-            .map(|(_, candidate)| candidate)
-            .collect()
-    } else {
-        candidates.iter().collect()
-    }
+    // Lexical-only scoring: no comparable semantic threshold anymore, so keep
+    // every candidate for the LLM (matches the historical no-embedding path).
+    candidates.iter().collect()
 }
 
 async fn answer_memo_search(
@@ -424,11 +411,6 @@ async fn answer_memo_search(
         eprintln!("[note-search] 用法: a -ns <查询内容>");
         return Err("note-search requires a query".into());
     }
-
-    // 安装远程 embedding provider（若已配置）。必须在任何 embedder::is_ready()
-    // 调用之前执行——GLOBAL_PROVIDER 是 OnceLock，首次读取即定型。
-    // 未配置 / 配置不全时此调用无副作用，检索退回 BM25/lexical。
-    crate::ai::knowledge::indexing::embedder::warm_up();
 
     // 检索 + 模型总结都可能耗时，给一个 "Searching..." 动画提示（输出前自动清除）。
     let _spinner = SearchSpinner::start("Searching memo");
@@ -454,11 +436,8 @@ async fn answer_memo_search(
         return Ok(format!("没有在知识库中找到与「{}」相关的内容。", question));
     }
 
-    // 按语义分数收紧喂给 LLM 的条数，进一步防止大知识库撑爆上下文。
-    // 仅在本次确实用了语义打分（embedding 可用）时收紧——此时分数可比较、
-    // 排序可信；否则保持全部 20 条交给 LLM（与历史行为一致，不丢候选）。
-    // 收紧策略：保留 top1 锚点；其余条目要求语义分数 >= top1 的 60% 才纳入，
-    // 至多 8 条。这样只砍掉明显不相关的长尾，不影响真正相关的笔记。
+    // 语义收紧已随 embedding 链路移除：词汇级分数不具备可比较的阈值，
+    // 保持全部候选交给 LLM（与历史无语义路径一致，不丢候选）。
     let selected = select_note_search_candidates(&candidates);
 
     // 把检索到的条目作为上下文，让模型基于这些内容回答用户的问题。

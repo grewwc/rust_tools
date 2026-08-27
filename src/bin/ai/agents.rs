@@ -871,6 +871,17 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
         Some(other) => return Err(format!("invalid model_tier: {}", other)),
     };
 
+    // Same rationale as the skill-side check in skills.rs: `get_tool_definitions_by_names`
+    // silently skips `tools:` entries absent from the registry, so warn here rather
+    // than letting `.agent` authors chase permanently-missing tools.
+    if let Some(unknown) = super::tools::manifest_unknown_tool_names_warning(&tools) {
+        eprintln!(
+            "[agents] agent \"{}\": `tools` lists unknown tool(s): {} \
+             (must be a registered builtin name or an mcp_* server tool)",
+            name, unknown
+        );
+    }
+
     Ok(AgentManifest {
         name,
         description,

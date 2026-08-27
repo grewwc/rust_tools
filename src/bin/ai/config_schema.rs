@@ -76,18 +76,31 @@ impl AiConfig {
     pub const MEMORY_ARCHIVES_KEEP_LAST: &str = "ai.memory.archives.keep_last";
     pub const MEMORY_ARCHIVES_MAX_BYTES: &str = "ai.memory.archives.max_bytes";
 
+    // ── Embedding (semantic knowledge search) ──────────────
+    /// Master switch for the embedding-based semantic index
+    /// (`knowledge_semantic_search` / `knowledge_rebuild_index`).
+    pub const EMBEDDING_ENABLE: &str = "ai.embedding.enable";
+    /// OpenAI-compatible `/embeddings` endpoint URL.
+    pub const EMBEDDING_ENDPOINT: &str = "ai.embedding.endpoint";
+    /// API key for the embedding endpoint; falls back to the Volcano/Alibaba
+    /// model keys when unset.
+    pub const EMBEDDING_API_KEY: &str = "ai.embedding.api_key";
+    /// Embedding model name (changes invalidate the index, which is then
+    /// rebuilt automatically on next use).
+    pub const EMBEDDING_MODEL: &str = "ai.embedding.model";
+    /// Request timeout in milliseconds for embedding calls.
+    pub const EMBEDDING_TIMEOUT_MS: &str = "ai.embedding.timeout_ms";
+
+    // ── Knowledge (hybrid semantic search) ─────────────────
+    /// Weight of vector (semantic) similarity in hybrid search, in [0.0, 1.0]
+    /// (1.0 = semantic only, 0.0 = BM25 only). Default 0.4.
+    pub const KNOWLEDGE_HYBRID_VECTOR_WEIGHT: &str = "ai.knowledge.hybrid_vector_weight";
+
     // ── Response critic ───────────────────────────────────────
     // Only performs an inline self-check on the current reply; does not read
     // or retrieve from the knowledge base.
     pub const CRITIC_REVISE_ENABLE: &str = "ai.critic_revise.enable";
     pub const CRITIC_REVISE_INTEGRATED_ENABLE: &str = "ai.critic_revise.integrated.enable";
-
-    // ── Embedding (remote provider) ────────────────────────
-    pub const EMBEDDING_ENABLE: &str = "ai.embedding.enable";
-    pub const EMBEDDING_ENDPOINT: &str = "ai.embedding.endpoint";
-    pub const EMBEDDING_API_KEY: &str = "ai.embedding.api_key";
-    pub const EMBEDDING_MODEL: &str = "ai.embedding.model";
-    pub const EMBEDDING_TIMEOUT_MS: &str = "ai.embedding.timeout_ms";
 
     // ── Sandbox ────────────────────────────────────────────
     /// Comma-separated extra program names to block in `execute_command`

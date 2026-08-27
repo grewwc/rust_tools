@@ -1,6 +1,6 @@
 {
   "name": "knowledge_search",
-  "description": "Search saved knowledge by keywords. For paraphrases or related concepts, enable `knowledge_semantic_search` via `enable_tools` first.",
+  "description": "Search saved knowledge by keywords (BM25 + lexical similarity).",
   "parameters": {
     "type": "object",
     "properties": {

@@ -31,6 +31,20 @@ use rust_tools::cw::SkipMap;
 use crate::ai::config_schema::AiConfig;
 use crate::commonw::{configw, utils::expanduser};
 
+/// Lowercase hex encoding. `sha2` 0.11's digest output (`hybrid-array::Array`) no
+/// longer implements `LowerHex`, so format the digest bytes manually.
+fn sha256_hex(payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+    }
+    out
+}
+
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
     (
         "audit_own_changes.skill",
@@ -125,9 +139,7 @@ impl SkillManifest {
             "resource_path": self.resource_path,
             "parent": self.parent,
         });
-        let mut hasher = Sha256::new();
-        hasher.update(payload.to_string().as_bytes());
-        format!("{:x}", hasher.finalize())
+        sha256_hex(payload.to_string().as_bytes())
     }
     /// 是否为子 skill
     pub(super) fn is_subskill(&self) -> bool {
@@ -339,6 +351,18 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
     let Some(name) = name else {
         return Err("missing name".to_string());
     };
+
+    // Unknown `tools:` entries are silently dropped later when the per-turn tool
+    // set is built (`get_tool_definitions_by_names` skips names missing from the
+    // registry), which would hide a typo in a `.skill` manifest forever. Warn at
+    // load time instead.
+    if let Some(unknown) = super::tools::manifest_unknown_tool_names_warning(&tools) {
+        eprintln!(
+            "[skills] skill \"{}\": `tools` lists unknown tool(s): {} \
+             (must be a registered builtin name or an mcp_* server tool)",
+            name, unknown
+        );
+    }
 
     Ok(SkillManifest {
         name,
@@ -768,9 +792,7 @@ fn extracted_zip_package_root(zip_path: &Path, skills_dir: &Path) -> Result<Path
 
 fn file_sha256_hex(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| format!("failed to read skill zip: {e}"))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(sha256_hex(&bytes))
 }
 
 fn extract_zip_to_dir(zip_path: &Path, target_dir: &Path) -> Result<(), String> {

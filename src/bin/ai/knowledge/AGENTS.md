@@ -2,7 +2,15 @@
 
 ## Scope
 
-Applies to `src/bin/ai/knowledge/**` (`indexing/`, `retrieval/`, `storage/`, `sync/`).
+Applies to `src/bin/ai/knowledge/**`. Shared types and the semantic-index
+building blocks: `types.rs` (`Category`), `entry.rs` (path-leak guard),
+`config.rs` (hybrid-search weight), `indexing/similarity.rs` (lexical scoring +
+`cosine_similarity`), `indexing/embedder.rs` (remote OpenAI-compatible
+embedding provider, default `doubao-embedding-vision`), and
+`storage/vector_store.rs` (SQLite-backed vector index). The orchestration layer
+lives in `tools/storage/rag_store.rs` (rebuild + hybrid merge) and the
+`knowledge_semantic_search` / `knowledge_rebuild_index` tools in
+`tools/rag_tools.rs`.
 
 ## Key invariants
 
@@ -16,11 +24,15 @@ Applies to `src/bin/ai/knowledge/**` (`indexing/`, `retrieval/`, `storage/`, `sy
    preserved in the merged entry). Content is discarded only for entries removed via
    `delete_ids` without being listed in any `save_entries[].source_ids` — consolidation
    never silently compresses or drops original content.
-3. **Graceful retrieval fallback.** Embedding is optional; explicit knowledge
-   search must degrade to lexical/BM25 retrieval when unavailable or failing.
-4. **Separated responsibilities.** Keep retrieval, indexing, storage, and sync
-   separated unless a change genuinely crosses those boundaries.
-5. **No automatic recall.** Knowledge is read only through explicit
+3. **Semantic search is explicit and derived.** The vector index is a pure
+   derived artifact of the canonical memory store, rebuilt lazily on first use
+   (or when the configured embedding model changed — see the model fingerprint
+   in `rag_store.rs`) and explicitly via `knowledge_rebuild_index`. It is never
+   auto-injected into turns; recall happens only through explicit
+   `knowledge_*` tool calls (invariant 4). Lexical ranking stays in
+   `MemoryStore::search` (BM25 + priority weight); hybrid search merges that
+   with the vector index using `hybrid_vector_weight`.
+4. **No automatic recall.** Knowledge is read only through explicit
    `knowledge_*` / `memory_*` tool calls - never scan or inject the store
    automatically while preparing a turn. Notebook is an independent tool-backed
    context source, not coupled to knowledge retrieval.

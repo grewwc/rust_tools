@@ -883,7 +883,7 @@ pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<(
     let result = (|| {
         let source_conn = Connection::open(source).map_err(|e| io::Error::other(e.to_string()))?;
         source_conn
-            .backup(rusqlite::DatabaseName::Main, &temporary, None)
+            .backup(rusqlite::MAIN_DB, &temporary, None)
             .map_err(|e| io::Error::other(e.to_string()))?;
         drop(source_conn);
 

@@ -1,3 +1,2 @@
-/// Storage module — JSONL and vector stores.
-pub mod jsonl_store;
+//! Knowledge storage — the vector index for semantic search.
 pub mod vector_store;

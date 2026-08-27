@@ -1207,26 +1207,75 @@ fn fold_noncompressible_tool_groups_to_fit(
     overflow_dir: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
-    let mut made_progress = false;
+    if messages_total_chars(messages) <= max_chars {
+        return false;
+    }
+    // Select ONE window from the descending-protection ladder instead of
+    // committing every intermediate rung:
+    //   1. the most protective window whose result both fits and keeps the
+    //      verbatim tail at or above MIN_PROTECTED_TAIL_CHARS,
+    //   2. otherwise the most protective window that merely fits - overflow
+    //      matters more than the floor once the floor cannot hold,
+    //   3. otherwise the deepest reducing window, so bounded progress and the
+    //      historical deep-fold endpoint are preserved even when nothing fits.
+    // Plans are pure functions of the messages, so candidates are recorded as
+    // window sizes and re-planned exactly once before committing.
+    let mut floor_safe_fitting_keep: Option<usize> = None;
+    let mut fitting_keep: Option<usize> = None;
+    let mut deepest_reducing_keep: Option<usize> = None;
     for &keep_recent in progressive_fold_windows().iter() {
-        if messages_total_chars(messages) <= max_chars {
-            break;
-        }
         let plan =
             plan_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids);
         if plan.folded_groups() == 0 {
             continue;
         }
-        // 折叠必须带来净下降才采纳，否则丢弃本次结果继续收紧 keep_recent，
-        // 严防「组数变了但字符没降」导致的循环空转。规划阶段没有文件副作用，
-        // 只有确认采纳后才 commit 归档。
-        if messages_total_chars(plan.messages()) < messages_total_chars(messages) && plan.commit() {
+        // A plan must net a strict decrease; drop it otherwise and keep tightening
+        // keep_recent to guard against livelock where the group count changes but
+        // the char count does not.
+        if messages_total_chars(plan.messages()) >= messages_total_chars(messages) {
+            continue;
+        }
+        deepest_reducing_keep = Some(keep_recent);
+        if messages_total_chars(plan.messages()) <= max_chars {
+            if fitting_keep.is_none() {
+                fitting_keep = Some(keep_recent);
+            }
+            if protected_tail_message_chars(plan.messages(), keep_recent)
+                >= MIN_PROTECTED_TAIL_CHARS
+            {
+                floor_safe_fitting_keep = Some(keep_recent);
+                break;
+            }
+        }
+    }
+    let chosen = floor_safe_fitting_keep
+        .or(fitting_keep)
+        .or(deepest_reducing_keep);
+    let mut made_progress = false;
+    if let Some(keep_recent) = chosen {
+        let plan =
+            plan_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids);
+        if plan.folded_groups() > 0
+            && messages_total_chars(plan.messages()) < messages_total_chars(messages)
+            && plan.commit()
+        {
             let (folded, _) = plan.into_result();
             *messages = folded;
             made_progress = true;
         }
     }
     made_progress
+}
+
+/// Billable chars across the tool-result messages of the most-recent
+/// `keep_recent` complete tool groups - i.e. the verbatim structured evidence
+/// kept outside folding under that window size (assistant anchors excluded,
+/// matching what recent_tool_group_message_indices returns).
+fn protected_tail_message_chars(messages: &[Message], keep_recent: usize) -> usize {
+    recent_tool_group_message_indices(messages, keep_recent)
+        .into_iter()
+        .map(|idx| message_billable_chars(&messages[idx]))
+        .sum()
 }
 
 /// 批量移除可裁的普通消息，并在一次 flush 中归档。旧实现每删一条就重新进入外层
@@ -3028,22 +3077,38 @@ fn is_summary_message(message: &Message) -> bool {
     is_summary_note_text(&value_to_string(&message.content))
 }
 
-/// 最近完整工具组的保护窗口。一个 assistant(tool_calls) 批次是不可拆分的证据
-/// 单元：绝不能按单条 tool 消息截断，否则并行读取会只留下半批结果。
+/// Protection window over recent complete tool groups. An assistant(tool_calls)
+/// batch is an indivisible evidence unit: it must never be truncated message by
+/// message, or parallel reads would leave half a batch behind.
 const KEEP_RECENT_TOOL_GROUPS: usize = 4;
 
-/// 渐进式工具组折叠的**最小**保护窗口。窗口收紧到该值即停，绝不降到 0。
+/// **Minimum** protection window for progressive group folding: narrowing stops
+/// here and never reaches 0.
 ///
-/// 窗口降到 0 会把最近一次工具交互也折叠成 `compressed_tool_round` stub：
-/// 模型因此完全失去最近的结构化工具上下文（`assistant.tool_calls` + `role=tool`
-/// 结果），既伤害多步任务连续性，也让依赖结构化消息的运行时守卫失去最新证据。
-/// 保留最近 1 组逐字；剩余超额由下游 per-message 截断 / first_trim 兜底。
+/// A window of 0 folds the most recent tool interaction itself into a
+/// `compressed_tool_round` stub, leaving the model without any recent structured
+/// tool context (`assistant.tool_calls` + `role=tool` results): multi-step task
+/// continuity suffers and runtime guards lose their freshest evidence. Keep the
+/// most recent group verbatim; remaining excess is handled downstream by
+/// per-message truncation / first_trim fallbacks.
 const MIN_KEEP_RECENT_TOOL_GROUPS: usize = 1;
 
-/// 渐进式折叠的保护窗口序列：从 [`KEEP_RECENT_TOOL_GROUPS`] 递进收紧到
-/// [`MIN_KEEP_RECENT_TOOL_GROUPS`]，逐步放宽折叠范围但绝不到 0。两条渐进折叠
-/// 路径（[`fold_noncompressible_tool_groups_to_fit`] 与 `mid_turn_llm_summarize`
-/// 的 Path B+C）共用同一序列，保证「最小保护窗口」这一策略只有一处真源。
+/// Floor on the protected verbatim tail once group folding converges, measured in
+/// billable chars across the messages retained for the current window. Group-count
+/// protection alone proved insufficient on read-heavy sessions: many large results
+/// still squeezed the window down until nearly everything except the last turn was
+/// a pointer stub, after which the model re-read files whose full text it had just
+/// received. This floor keeps roughly 6K tokens of fresh tool evidence resident
+/// whenever budget allows. It intentionally yields (folding proceeds past it) only
+/// at MIN_KEEP_RECENT_TOOL_GROUPS so overflow handling always terminates.
+const MIN_PROTECTED_TAIL_CHARS: usize = 30_000;
+
+/// Window sequence for progressive folding: tightens stepwise from
+/// [`KEEP_RECENT_TOOL_GROUPS`] down to [`MIN_KEEP_RECENT_TOOL_GROUPS`], widening
+/// what may be folded but never reaching 0. Both progressive paths
+/// ([`fold_noncompressible_tool_groups_to_fit`] and mid-turn summarization's
+/// Path B+C) share one sequence so the minimum-protection policy has a single
+/// source of truth.
 fn progressive_fold_windows() -> Vec<usize> {
     let mut windows = Vec::new();
     let mut keep = KEEP_RECENT_TOOL_GROUPS;
@@ -3308,6 +3373,13 @@ fn dedup_repeated_tool_results(
                 continue;
             }
         };
+        // Never re-process a stub produced by an earlier projection build:
+        // rendering from stub text nests stale previews/excerpts inside fresh
+        // stubs, and neither copy holds real result data. Keep this marker in
+        // sync with the "[deduped:" prefixes emitted by render_dedup_tool_stub.
+        if value_to_string(&messages[idx].content).starts_with(DEDUP_STUB_MARKER_PREFIX) {
+            continue;
+        }
         let signature_key = (occurrence.tool_name.clone(), occurrence.args_norm.clone());
         let signature_canonical = seen.get(&signature_key).cloned();
         if signature_canonical.is_none() {
@@ -3439,6 +3511,29 @@ fn is_content_overflow_archived_stub(content: &Value) -> bool {
     })
 }
 
+/// Marker prefix identifying an already-folded tool-result stub produced by
+/// [`render_dedup_tool_stub`]. Must stay equal to the literal "[deduped:"
+/// embedded in that function's output; the dedup pass skips content starting
+/// with it so persisted stubs are never re-rendered into nested stubs.
+const DEDUP_STUB_MARKER_PREFIX: &str = "[deduped:";
+
+/// Hard cap for the raw content prefix embedded in byte-identical dedup stubs.
+/// Each stub carries its own bounded excerpt so it stays useful even after the
+/// canonical occurrence gets folded away in a later pass (historical failure
+/// mode: the stub pointed at a canonical that no longer existed verbatim in the
+/// projection, so the model re-read identical data forever). Arbitrarily large
+/// source results stay safe: the excerpt is truncated from the in-memory string,
+/// so cost per duplicate occurrence is capped no matter how much a tool printed.
+const DEDUP_STUB_EXCERPT_MAX_CHARS: usize = 1_600;
+
+/// Char-boundary-safe prefix of at most `max_chars` characters.
+fn char_prefix_capped(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &text[..byte_idx],
+        None => text,
+    }
+}
+
 fn render_dedup_tool_stub(
     kind: DedupToolStubKind,
     original: &DedupToolOccurrence,
@@ -3481,6 +3576,25 @@ fn render_dedup_tool_stub(
         "- preview: {}",
         render_dedup_preview(removed_content)
     ));
+    if matches!(kind, DedupToolStubKind::ByteIdentical) {
+        // By construction removed_content equals the canonical body here, so a raw
+        // prefix truthfully represents the newest copy. Keep it multi-line and
+        // un-normalized: models reuse these stubs for verbatim patching, which the
+        // lossy single-line preview above cannot serve.
+        let body = removed_content.trim_start();
+        let excerpt = char_prefix_capped(body, DEDUP_STUB_EXCERPT_MAX_CHARS);
+        let total_chars = body.chars().count();
+        let shown_chars = excerpt.chars().count();
+        out.push_str(&format!(
+            "\n- canonical_first_chars: {shown_chars} of {total_chars}\n<<<DEDUP_EXCERPT\n{excerpt}"
+        ));
+        if shown_chars < total_chars {
+            out.push_str(
+                "\n(excerpt truncated; see the canonical occurrence or original_target for the rest)",
+            );
+        }
+        out.push_str("\nDEDUP_EXCERPT>>>");
+    }
     out
 }
 

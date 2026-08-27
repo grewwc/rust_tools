@@ -17,7 +17,7 @@ the nearest child `AGENTS.md`.
 - `provider/`: provider adapters and wire-format differences
 - `tools/`: registry, service implementations, storage, display/history policy
 - `mcp/`: MCP lifecycle, clients, routing snapshots, transport
-- `knowledge/`: indexing, retrieval, storage, sync
+- `knowledge/`: shared types, lexical similarity, embedding provider, vector index
 - `stream/`: streaming protocol, chunk extraction, state machine, `stream/render/` terminal rendering
 - `cli.rs` / `theme.rs` / `background.rs`: CLI entry, theming, background tasks
 - `persona.rs` / `files.rs` / `types.rs` / `errors.rs` / `request_protocol.rs`: persona, file helpers (`extract_key_lines`), shared types, `AiError`, request dialect

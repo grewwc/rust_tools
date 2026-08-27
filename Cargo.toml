@@ -19,38 +19,39 @@ default = []
 agent-hang-debug = []
 
 [dependencies]
-arboard = "3.3"
+arboard = "3.6.1"
 image = {version = "0.25.8", features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico", "qoi"]}
 clap = { version = "4", features = ["derive"] }
-rustc-hash = "2"
-colored = "3.0.0"
-regex = "1.12.2"
-base64 = "0.22.1"
-libc = "0.2"
-sha2 = "0.10.8"
+rustc-hash = "2.1.3"
+colored = "3.1.1"
+regex = "1.13.1"
+base64 = "0.23.1"
+libc = "0.2.189"
+sha2 = "0.11.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 jsonschema = { version = "0.49.2", default-features = false }
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
-chrono = "0.4"
-ctrlc = "3.4"
+chrono = "0.4.45"
+ctrlc = "3.5.2"
 crossterm = "0.29"
-futures-util = "0.3"
-futures-executor = "0.3"
-inventory = "0.3"
-mongodb = "3.4"
+futures-util = "0.3.34"
+futures-executor = "0.3.34"
+inventory = "0.3.24"
+mongodb = "3.8.1"
 notify = "8.2"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "multipart", "rustls", "stream"] }
-rust_decimal = "1"
-rustyline = "15.0"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
-tui-textarea = { package = "tui-textarea-2", version = "0.12.1", default-features = false, features = ["crossterm"] }
-unicode-width = "0.2"
-lopdf = "0.40"
-rand = "0.10.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "multipart", "rustls", "stream"] }
+rust_decimal = "1.42.1"
+rustyline = "18.0.1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync"] }
+tui-textarea = { package = "tui-textarea-2", version = "0.13.2", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2.2"
+lopdf = "0.44.0"
+time = { version = "0.3.48", default-features = false }
+rand = "0.10.2"
 dirs = "6"
 rust_tools_macros = { path = "crates/rust_tools_macros" }
 aios_kernel = { path = "crates/aios_kernel" }

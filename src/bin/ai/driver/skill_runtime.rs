@@ -795,6 +795,67 @@ fn build_hidden_execution_primitive_catalog(
     Some(out)
 }
 
+/// Lazily-loaded subagent orchestration family: task-group tools (group
+/// `["builtin", "task"]`) are not part of the default `core` turn schema, and
+/// unlike executor primitives they are not covered by `groups_defer_eager_load`
+/// (which only defers `executor`/`openclaw` groups), so without this catalog the
+/// model has no prompt-level awareness that subagent tools exist and can be
+/// enabled on demand — broad multi-branch tasks silently degrade to serial
+/// parent work. Mirrors `build_hidden_execution_primitive_catalog`.
+/// Top-level agents only: the task family is hidden from subagents
+/// (`SUBAGENT_DEPTH > 0`), so the nudge must never reach them.
+fn build_hidden_task_tool_catalog(available_tools: &Box<SkipSet<String>>) -> Option<String> {
+    if crate::ai::driver::runtime_ctx::current_subagent_depth() != 0 {
+        return None;
+    }
+    const TASK_FAMILY: &[&str] = &[
+        "task",
+        "task_spawn",
+        "task_spawn_batch",
+        "task_wait",
+        "task_status",
+        "task_retry",
+        "task_cancel",
+        "task_evidence_read",
+        "task_audit",
+        "task_integrate",
+        "manage_team",
+        "run_agent_graph",
+    ];
+    let hidden: Vec<&str> = TASK_FAMILY
+        .iter()
+        .copied()
+        .filter(|name| !available_tools.contains_str(name))
+        .collect();
+    if hidden.is_empty() {
+        return None;
+    }
+
+    const MAX_DISPLAY: usize = 8;
+    let displayed = hidden
+        .iter()
+        .take(MAX_DISPLAY)
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = hidden.len().saturating_sub(MAX_DISPLAY);
+
+    let mut out = format!(
+        "Subagent orchestration tools are available but not loaded in this turn.\n\
+         When the task splits into multiple independent branches that would benefit from \
+         subagent parallelism (broad discovery, cross-module mapping, independent verification, \
+         or concurrent research), call `enable_tools(operation=enable, tools=[...])` with the \
+         exact names you need.\n\
+         Example available tools: {}",
+        displayed
+    );
+    if remaining > 0 {
+        out.push_str(&format!(", and {remaining} more"));
+    }
+    out.push('.');
+    Some(out)
+}
+
 /// XML 属性值转义：`&` `<` `>` `"` `'`。
 /// 用于 `<instructions path="...">` 的 path 属性，避免路径中的引号/尖括号破坏 XML 结构。
 fn escape_xml_attr(s: &str) -> String {
@@ -1330,14 +1391,10 @@ fn build_system_prompt(
     }
 
     if has_tool(available_tools, "knowledge_search")
-        || has_tool(available_tools, "knowledge_semantic_search")
         || has_tool(available_tools, "knowledge_list")
     {
         let mut lines = Vec::new();
-        let search_tools = available_tool_names_in_order(
-            available_tools,
-            &["knowledge_search", "knowledge_semantic_search"],
-        );
+        let search_tools = available_tool_names_in_order(available_tools, &["knowledge_search"]);
         if !search_tools.is_empty() {
             lines.push(format!(
                 "Only when the user explicitly asks about remembered or saved knowledge, search with {}.",
@@ -1356,20 +1413,6 @@ fn build_system_prompt(
             lines.push("Use `knowledge_list` when asked what is remembered.".to_string());
         }
         push_tool_guidance_section(&mut b, ContextKind::Policy, "knowledge_retrieval", lines);
-    }
-
-    // ── 知识缓存维护：仅在缓存疑似过期或需要排查时使用，不是常规步骤 ──
-    if has_tool(available_tools, "knowledge_cache_manage") {
-        push_tool_guidance_section(
-            &mut b,
-            ContextKind::Policy,
-            "knowledge_cache_maintenance",
-            vec![
-                "Use `knowledge_cache_manage(action=stats)` only to inspect the knowledge cache; do not call it as a routine step.".to_string(),
-                "Use `action=refresh` with a `topic` only when cached knowledge answers look stale or outdated — it forces a re-fetch of that topic.".to_string(),
-                "Use `action=clear_volatile` only when the project structure has changed and time-limited cached knowledge may be stale; stable entries are never touched.".to_string(),
-            ],
-        );
     }
 
     if has_tool(available_tools, "write_file") {
@@ -1453,6 +1496,14 @@ fn build_skill_turn_guard(
     if has_tool(&available_tools, "enable_tools")
         && declares_executor_group(skills, active_agent.as_ref())
         && let Some(catalog) = build_hidden_execution_primitive_catalog(&available_tools)
+    {
+        builder.push(ContextKind::Capability, catalog);
+    }
+    // Task-family tools are lazy for every top-level turn (not just executor
+    // agents); advertise them so the model loads subagent tools exactly when the
+    // task warrants parallelism. Gated internally on top-level depth.
+    if has_tool(&available_tools, "enable_tools")
+        && let Some(catalog) = build_hidden_task_tool_catalog(&available_tools)
     {
         builder.push(ContextKind::Capability, catalog);
     }
@@ -1702,12 +1753,12 @@ mod tests {
     use super::{
         ContextKind, PromptContext, SystemPromptBuilder, available_tool_names,
         build_hidden_execution_primitive_catalog, build_hidden_mcp_tool_catalog,
-        build_project_instruction_prompt, build_scoped_project_instruction_prompt,
-        build_system_prompt, builtin_tools_for_skill, declares_executor_group,
-        ensure_required_baseline_tools, escape_xml_attr, filter_mcp_tools_by_allowed_servers,
-        has_tool, manifest_tool_definitions, merge_with_runtime_enabled_tools,
-        push_project_context, resolve_max_iterations, select_mcp_tools, tool_uses_mcp_server,
-        session_context_prompt,
+        build_hidden_task_tool_catalog, build_project_instruction_prompt,
+        build_scoped_project_instruction_prompt, build_system_prompt, builtin_tools_for_skill,
+        declares_executor_group, ensure_required_baseline_tools, escape_xml_attr,
+        filter_mcp_tools_by_allowed_servers, has_tool, manifest_tool_definitions,
+        merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
+        select_mcp_tools, tool_uses_mcp_server, session_context_prompt,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
@@ -2047,6 +2098,61 @@ mod tests {
     }
 
     #[test]
+    fn hidden_task_tool_catalog_advertises_lazy_subagent_family() {
+        // A default core turn carries no task group: the catalog must list the
+        // unloaded subagent tool names and give the enable_tools path so the
+        // model knows subagent tools can be loaded on demand.
+        let mut available = SkipSet::new(16);
+        available.insert("read_file".to_string());
+        available.insert("enable_tools".to_string());
+
+        let catalog = build_hidden_task_tool_catalog(&Box::new(available))
+            .expect("unloaded task family should produce a catalog");
+        assert!(catalog.contains("enable_tools(operation=enable"));
+        assert!(catalog.contains("task_spawn"));
+        assert!(catalog.contains("task_spawn_batch"));
+        // 展示区按族内顺序取前 MAX_DISPLAY(8) 个，其余折叠为 "and N more"。
+        assert!(catalog.contains("more."));
+    }
+
+    #[test]
+    fn hidden_task_tool_catalog_suppressed_when_family_loaded() {
+        // Once the task family is loaded (explicit enable or a skill/agent
+        // declaration), the catalog must not repeat the nudge.
+        let mut available = SkipSet::new(16);
+        for name in [
+            "task",
+            "task_spawn",
+            "task_spawn_batch",
+            "task_wait",
+            "task_status",
+            "task_retry",
+            "task_cancel",
+            "task_evidence_read",
+            "task_audit",
+            "task_integrate",
+            "manage_team",
+            "run_agent_graph",
+        ] {
+            available.insert(name.to_string());
+        }
+        assert!(build_hidden_task_tool_catalog(&Box::new(available)).is_none());
+    }
+
+    #[tokio::test]
+    async fn hidden_task_tool_catalog_suppressed_inside_subagent() {
+        // Subagents can never enable the task family (it is hidden when
+        // SUBAGENT_DEPTH > 0), so the nudge would be misleading there; the
+        // catalog must stay silent at depth > 0.
+        SUBAGENT_DEPTH.scope(1, async {
+            let mut available = SkipSet::new(16);
+            available.insert("read_file".to_string());
+            available.insert("enable_tools".to_string());
+            assert!(build_hidden_task_tool_catalog(&Box::new(available)).is_none());
+        });
+    }
+
+    #[test]
     fn declares_executor_group_only_true_for_executor_agents() {
         let build_agent = executor_group_agent("build");
         assert!(declares_executor_group(&[], Some(&build_agent)));
@@ -2143,7 +2249,6 @@ mod tests {
         assert!(!prompt.contains("execute_command"));
         assert!(!prompt.contains("apply_patch"));
         assert!(!prompt.contains("<compressed_context_recovery>"));
-        assert!(!prompt.contains("<knowledge_cache_maintenance>"));
     }
 
     #[test]
@@ -2185,21 +2290,6 @@ mod tests {
         assert!(prompt.contains("absence claims must cover the archived scope"));
         assert!(prompt.contains("verbatim excerpts"));
         assert!(prompt.contains("scope=all"));
-    }
-
-    #[test]
-    fn system_prompt_guides_knowledge_cache_manage_when_loaded() {
-        let mut available = SkipSet::new(16);
-        available.insert("knowledge_cache_manage".to_string());
-
-        let prompt =
-            build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-                .render_system_prompt();
-
-        assert!(prompt.contains("<knowledge_cache_maintenance>"));
-        assert!(prompt.contains("action=stats"));
-        assert!(prompt.contains("action=refresh"));
-        assert!(prompt.contains("action=clear_volatile"));
     }
 
     #[test]
@@ -3564,7 +3654,7 @@ mod tests {
     #[test]
     fn runtime_enabled_builtin_is_restored_when_current_context_missed_writeback() {
         let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
-        set_explicit_enabled_tool_names(vec!["knowledge_rebuild_index".to_string()]);
+        set_explicit_enabled_tool_names(vec!["knowledge_consolidate".to_string()]);
 
         let merged = merge_with_runtime_enabled_tools(vec![tool("read_file")], vec![], &[]);
         let names = merged
@@ -3573,7 +3663,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"knowledge_rebuild_index".to_string()));
+        assert!(names.contains(&"knowledge_consolidate".to_string()));
         set_explicit_enabled_tool_names(Vec::new());
     }
 

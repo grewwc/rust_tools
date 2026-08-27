@@ -184,10 +184,6 @@ pub(super) fn install_runtime_manifests(
         agent_manifests.as_slice(),
     );
 
-    if !skill_manifests.is_empty() {
-        crate::ai::knowledge::indexing::embedder::warm_up();
-    }
-
     if let Some(default_agent) = agents::find_agent_by_name(agent_manifests, &app.current_agent)
         && default_agent.is_primary()
         && !default_agent.disabled

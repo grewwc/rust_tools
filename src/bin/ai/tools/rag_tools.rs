@@ -1,215 +1,81 @@
-/// RAG 语义检索工具 — 为 agent 提供向量语义搜索能力
-///
-/// 包含两个工具：
-/// - `knowledge_semantic_search` — 语义相似度搜索（向量检索）
-/// - `knowledge_rebuild_index` — 重建向量索引（从 memory_store 同步）
+//! Semantic knowledge search tools backed by the embedding vector index.
+//!
+//! `knowledge_semantic_search` runs hybrid (BM25 + semantic) or pure semantic
+//! search over durable knowledge. `knowledge_rebuild_index` forces an index
+//! rebuild, which is required after changing the embedding model.
+
 use serde_json::Value;
 
-use crate::ai::knowledge::config::KnowledgeConfig;
-use crate::ai::knowledge::storage::jsonl_store::JsonlStore;
-use crate::ai::knowledge::sync::knowledge_sync;
-use crate::ai::tools::common::ToolRegistration;
-use crate::ai::tools::common::ToolSpec;
-use crate::ai::tools::storage::memory_store::MemoryStore;
-use crate::ai::tools::storage::rag_store::{ensure_rag_store, get_rag_store};
+use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::storage::rag_store::{hybrid_search, rebuild_index, semantic_search};
 
-// ─── knowledge_semantic_search ───────────────────────────────────────────────
-
-fn execute_semantic_search(args: &Value) -> Result<String, String> {
-    // 确保 embedding provider 已初始化（与 note_search 一致：在入口处调用 warm_up）。
-    // GLOBAL_PROVIDER 是 OnceLock，重复调用无副作用；未配置 key 时 is_ready() 仍为 false，
-    // 下面会自动降级为 BM25/lexical 检索。
-    crate::ai::knowledge::indexing::embedder::warm_up();
-
-    ensure_rag_store()?;
-    let guard = get_rag_store()?;
-    let store = guard.as_ref().ok_or("RAG store not initialized")?;
-
-    let query = args["query"]
-        .as_str()
-        .ok_or("Missing 'query'. Provide a semantic search query.")?;
-    let category = args["category"].as_str();
-    let limit = args["limit"].as_u64().map(|v| v as usize).unwrap_or(5);
-    let use_hybrid = args["hybrid"].as_bool().unwrap_or(true);
-
-    // 嵌入模型已经不再静态链接（fastembed/ONNX runtime 25MB 移除），
-    // 当本地 embedder::is_ready() == false 时直接降级为 BM25/lexical 检索，
-    // 不再返回错误，并在结果前缀里标记 [retrieval:bm25-fallback]。
-    let semantic_available = crate::ai::knowledge::indexing::embedder::is_ready();
-    if !semantic_available {
-        let mem_store = MemoryStore::from_env_or_config();
-        let jsonl_store = JsonlStore::new(mem_store.path().to_path_buf());
-        let config = KnowledgeConfig::default();
-        let bm25_results = crate::ai::knowledge::retrieval::keyword_search::keyword_search(
-            &jsonl_store,
-            query,
-            limit,
-            &config,
-        )?;
-        if bm25_results.is_empty() {
-            return Ok(format!("No results found for: '{}'", query));
-        }
-        let mut output = format!(
-            "[retrieval:bm25-fallback] semantic embedding unavailable, using BM25 + lexical similarity\n\nResults for '{}':\n\n",
-            query
-        );
-        for (idx, (entry, score)) in bm25_results.iter().enumerate() {
-            output.push_str(&format!(
-                "{}. [score: {:.3}] [{}] {}\n",
-                idx + 1,
-                score,
-                entry.category,
-                entry.note
-            ));
-            if !entry.tags.is_empty() {
-                output.push_str(&format!("   Tags: {}\n", entry.tags.join(", ")));
-            }
-        }
-        return Ok(output);
+fn execute_knowledge_semantic_search(args: &Value) -> Result<String, String> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if query.is_empty() {
+        return Err("`query` is required for knowledge_semantic_search.".to_string());
     }
+    let category = args
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .clamp(1, 20) as usize;
+    let hybrid = args
+        .get("hybrid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
-    if use_hybrid {
-        // Hybrid search: combine BM25 with vector
-        let mem_store = MemoryStore::from_env_or_config();
-        let jsonl_store = JsonlStore::new(mem_store.path().to_path_buf());
-        let config = KnowledgeConfig::default();
-
-        let bm25_results = crate::ai::knowledge::retrieval::keyword_search::keyword_search(
-            &jsonl_store,
-            query,
-            limit * 3,
-            &config,
-        )?;
-
-        let bm25_for_hybrid: Vec<(String, f32)> = bm25_results
-            .iter()
-            .filter_map(|(entry, score)| entry.id.as_ref().map(|id| (id.clone(), *score as f32)))
-            .collect();
-
-        let results = store.hybrid_search(
-            query,
-            bm25_for_hybrid,
-            limit,
-            category,
-            config.hybrid_vector_weight,
-        )?;
-
-        if results.is_empty() {
-            return Ok(format!("No results found for: '{}'", query));
-        }
-
-        let mut output = format!("Semantic search results for '{}':\n\n", query);
-        for (idx, (_id, entry, score)) in results.iter().enumerate() {
-            output.push_str(&format!(
-                "{}. [score: {:.3}] [{}] {}\n",
-                idx + 1,
-                score,
-                entry.category,
-                entry.content
-            ));
-            if !entry.tags.is_empty() {
-                output.push_str(&format!("   Tags: {}\n", entry.tags.join(", ")));
-            }
-            output.push_str(&format!("   Vector ID: {}\n\n", entry.id));
-        }
-        Ok(output)
+    let hits = if hybrid {
+        hybrid_search(&query, category.as_deref(), limit)?
     } else {
-        // Pure semantic search
-        let results = store.semantic_search(query, limit, category)?;
+        semantic_search(&query, category.as_deref(), limit)?
+    };
 
-        if results.is_empty() {
-            return Ok(format!("No results found for: '{}'", query));
-        }
-
-        let mut output = format!("Semantic search results for '{}':\n\n", query);
-        for (idx, (entry, score)) in results.iter().enumerate() {
-            output.push_str(&format!(
-                "{}. [score: {:.3}] [{}] {}\n",
-                idx + 1,
-                score,
-                entry.category,
-                entry.content
-            ));
-            if !entry.tags.is_empty() {
-                output.push_str(&format!("   Tags: {}\n", entry.tags.join(", ")));
-            }
-            output.push_str(&format!("   Vector ID: {}\n\n", entry.id));
-        }
-        Ok(output)
+    if hits.is_empty() {
+        return Ok("No relevant knowledge found.".to_string());
     }
+    let mut out = Vec::with_capacity(hits.len());
+    for h in hits {
+        let tags = if h.tags.is_empty() {
+            "-".to_string()
+        } else {
+            h.tags.join(", ")
+        };
+        out.push(format!(
+            "- [{:.3}] {}: {}\n  ID: {} | Tags: {}",
+            h.score, h.category, h.content, h.id, tags
+        ));
+    }
+    Ok(out.join("\n"))
 }
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_semantic_search",
         description: "",
-
-        execute: execute_semantic_search,
+        execute: execute_knowledge_semantic_search,
         groups: &["builtin"],
     }
 });
 
-// ─── knowledge_rebuild_index ─────────────────────────────────────────────────
-
-fn execute_rebuild_index(_args: &Value) -> Result<String, String> {
-    // 确保 embedding provider 已初始化（与 note_search / semantic_search 一致）。
-    // 向量索引重建本质上依赖 embedding，无法降级；未配置 key 时给出明确提示。
-    crate::ai::knowledge::indexing::embedder::warm_up();
-    if !crate::ai::knowledge::indexing::embedder::is_ready() {
-        return Err(
-            "Embedding provider not available — vector index rebuild requires embeddings. \
-             Configure embedding.api_key (or model.aliyun_api_key) to enable."
-                .to_string(),
-        );
-    }
-
-    ensure_rag_store()?;
-    let guard = get_rag_store()?;
-    let store = guard.as_ref().ok_or("RAG store not initialized")?;
-
-    let mem_store = MemoryStore::from_env_or_config();
-    let jsonl_store = JsonlStore::new(mem_store.path().to_path_buf());
-    let count = knowledge_sync::rebuild_vector_index(&jsonl_store, store)?;
-
-    Ok(format!("Rebuilt RAG index: {} entries vectorized.", count))
+fn execute_knowledge_rebuild_index(args: &Value) -> Result<String, String> {
+    let _ = args;
+    rebuild_index()
 }
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_rebuild_index",
         description: "",
-
-        execute: execute_rebuild_index,
+        execute: execute_knowledge_rebuild_index,
         groups: &["builtin"],
     }
 });
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_semantic_search_params() {
-        let params =
-            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_semantic_search");
-        assert!(
-            params["required"]
-                .as_array()
-                .unwrap()
-                .contains(&Value::String("query".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_rebuild_index_params() {
-        let params =
-            crate::ai::tools::registry::tool_metadata::tool_parameters("knowledge_rebuild_index");
-        // No required parameters
-        assert!(
-            params["required"]
-                .as_array()
-                .map(|a| a.is_empty())
-                .unwrap_or(true)
-        );
-    }
-}

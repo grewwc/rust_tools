@@ -531,12 +531,10 @@ pub(crate) fn execute_memory_search(args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
-/// 带分数的 memo 检索结果。`semantic` 表示本次是否用到了语义（embedding）打分——
-/// 上层据此决定能否按语义分数做上下文收紧。
+/// 带分数的 memo 检索结果。
 pub(crate) struct ScoredMemo {
     pub entry: AgentMemoryEntry,
     pub score: f64,
-    pub semantic: bool,
 }
 
 /// 根据查询文本检索 memo 候选条目，返回结构化条目（按相关度排序）。
@@ -554,7 +552,7 @@ pub(crate) fn search_memo_candidates(
     )
 }
 
-/// 与 `search_memo_candidates` 同源，但保留分数与"是否用了语义"标记。
+/// 与 `search_memo_candidates` 同源，但保留分数。
 pub(crate) fn search_memo_candidates_scored(
     query: &str,
     limit: usize,
@@ -587,7 +585,7 @@ pub(crate) fn search_memo_candidates_scored(
     let visible: Vec<AgentMemoryEntry> =
         results.into_iter().filter(|e| viewer.can_see(e)).collect();
 
-    // 字面打分（子串命中），任何情况下都计算——作为基础信号 / embedding 不可用时的唯一信号。
+    // 字面打分（子串命中），是唯一的相关度信号。
     let lexical = |e: &AgentMemoryEntry| -> f64 {
         let mut score = 0.0_f64;
         if e.note.to_lowercase().contains(&qlc) {
@@ -598,9 +596,9 @@ pub(crate) fn search_memo_candidates_scored(
             score += 1.2;
         }
 
-        // 未配置 embedding 时不能只依赖整个 query 的连续子串：用户往往会在
-        // 检索词中加入项目名或描述性词，而旧笔记只覆盖其中一部分。按 token 覆盖率
-        // 加分，仍让完整短语命中保持最高优先级。
+        // 不能只依赖整个 query 的连续子串：用户往往会在检索词中加入项目名或
+        // 描述性词，而旧笔记只覆盖其中一部分。按 token 覆盖率加分，
+        // 仍让完整短语命中保持最高优先级。
         if !query_tokens.is_empty() {
             let mut searchable = e.note.to_lowercase();
             if !e.tags.is_empty() {
@@ -623,42 +621,12 @@ pub(crate) fn search_memo_candidates_scored(
         score
     };
 
-    // 语义重排：仅当远程 embedding 可用时启用。任意一步拿不到向量都整体回退到
-    // 纯字面打分（即历史行为），绝不因为 embedding 故障而改变/中断检索结果。
-    let semantic: Option<Vec<f64>> = if crate::ai::knowledge::indexing::embedder::is_ready() {
-        let qv = crate::ai::knowledge::indexing::embedder::embed_text(&qlc);
-        match qv {
-            Some(qv) => {
-                let texts: Vec<String> = visible.iter().map(|e| e.note.clone()).collect();
-                crate::ai::knowledge::indexing::embedder::embed_texts(&texts).map(|batch| {
-                    batch
-                        .iter()
-                        .map(|v| {
-                            crate::ai::knowledge::indexing::similarity::cosine_similarity(&qv, v)
-                                as f64
-                        })
-                        .collect()
-                })
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
-
-    let used_semantic = semantic.is_some();
     let mut scored: Vec<ScoredMemo> = Vec::with_capacity(visible.len());
-    for (i, e) in visible.into_iter().enumerate() {
-        let lex = lexical(&e);
-        // 有 embedding 时语义为主、字面为辅；无 embedding 时退回纯字面。
-        let score = match &semantic {
-            Some(sims) => sims.get(i).copied().unwrap_or(0.0) * 10.0 + lex,
-            None => lex,
-        };
+    for e in visible {
+        let score = lexical(&e);
         scored.push(ScoredMemo {
             entry: e,
             score,
-            semantic: used_semantic,
         });
     }
     scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
@@ -1036,78 +1004,25 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
         deduped.reverse();
         let exact_dedup_removed = total_before.saturating_sub(deduped.len());
 
-        // Step 2: 同 category 内 cosine ≥ 0.85 的语义重复合并保留较新一条。
-        // 复用 ai::knowledge::indexing::embedder + similarity::cosine_similarity，
-        // embedding 不可用时（fastembed 模型未就绪）静默退化为只做严格去重。
-        let cosine_threshold = 0.85f32;
-        let texts: Vec<String> = deduped
-            .iter()
-            .map(|e| format!("[{}] {}", e.category, e.note))
-            .collect();
-        let mut cosine_removed = 0usize;
-        let final_entries =
-            if let Some(vectors) = crate::ai::knowledge::indexing::embedder::embed_texts(&texts) {
-                // 时间排序：保留较新的优先策略 = 先按 timestamp 降序遍历，
-                // 若与已保留集合中同 category 的某条 cosine ≥ 阈值，则丢弃当前。
-                use crate::ai::knowledge::indexing::similarity::cosine_similarity;
-                let mut indexed: Vec<usize> = (0..deduped.len()).collect();
-                indexed.sort_by(|&a, &b| deduped[b].timestamp.cmp(&deduped[a].timestamp));
-
-                // kept: Vec<(原 idx, 同 cat 标记)>；用 idx 引用 deduped/vectors 避免 clone embedding
-                let mut kept_idx: Vec<usize> = Vec::with_capacity(deduped.len());
-                for &i in &indexed {
-                    let cat_i = deduped[i].category.as_str();
-                    let v_i = &vectors[i];
-                    let mut merged = false;
-                    for &j in &kept_idx {
-                        if deduped[j].category != cat_i {
-                            continue;
-                        }
-                        let sim = cosine_similarity(v_i, &vectors[j]);
-                        if sim >= cosine_threshold {
-                            merged = true;
-                            break;
-                        }
-                    }
-                    if merged {
-                        cosine_removed += 1;
-                    } else {
-                        kept_idx.push(i);
-                    }
-                }
-                // 还原原始顺序（按原 idx 升序）
-                kept_idx.sort();
-                let mut out: Vec<AgentMemoryEntry> = Vec::with_capacity(kept_idx.len());
-                // 用 swap_remove 思路不行（会乱序），直接 clone：
-                for i in kept_idx {
-                    out.push(deduped[i].clone());
-                }
-                out
-            } else {
-                deduped
-            };
+        // Step 2: semantic (cosine) dedup was removed together with the embedding
+        // chain; only strict exact dedup remains.
+        let final_entries = deduped;
 
         write_memory_entries(&path, &final_entries)?;
 
         crate::ai::tools::storage::memory_store::trace_memory_event(
             "memory.dedup",
-            "dedup pass completed (exact + cosine)",
+            "dedup pass completed (exact)",
             &[
                 ("total_before", total_before.to_string()),
                 ("exact_removed", exact_dedup_removed.to_string()),
-                ("cosine_removed", cosine_removed.to_string()),
                 ("kept", final_entries.len().to_string()),
-                ("threshold", cosine_threshold.to_string()),
             ],
         );
 
         Ok(format!(
-            "Dedup done: {} -> {} (exact: {}, cosine≥{}: {})",
-            total_before,
-            final_entries.len(),
-            exact_dedup_removed,
-            cosine_threshold,
-            cosine_removed
+            "Dedup done: {} -> {} (exact: {})",
+            total_before, final_entries.len(), exact_dedup_removed,
         ))
     })
 }

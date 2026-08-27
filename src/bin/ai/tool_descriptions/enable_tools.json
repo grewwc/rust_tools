@@ -1,6 +1,6 @@
 {
   "name": "enable_tools",
-  "description": "List or activate additional tools that are not loaded by default. Use 'list' to see available tools, enabling specific tools by name makes them available in subsequent calls. Use this when you need specialized capabilities like memory, knowledge base, web browsing, or MCP server tools.",
+  "description": "List or activate additional tools that are not loaded by default. Use 'list' to see available tools, enabling specific tools by name makes them available in subsequent calls. Use this when you need specialized capabilities like memory, knowledge base, web browsing, or MCP server tools - and when a task would benefit from subagent parallelism: the subagent orchestration family (task, task_spawn, task_spawn_batch, task_integrate, task_wait, task_status, manage_team, ...) is also lazily loaded and must be enabled before it can be used.",
   "parameters": {
     "type": "object",
     "properties": {

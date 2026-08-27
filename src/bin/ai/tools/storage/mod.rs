@@ -8,9 +8,6 @@ use std::sync::{LazyLock, Mutex};
 
 pub(crate) mod command_runner;
 pub(crate) mod file_store;
-pub(crate) mod knowledge_cache;
-pub(crate) mod knowledge_fingerprint;
-pub(crate) mod knowledge_types;
 pub(crate) mod memory_index;
 pub(crate) mod memory_store;
 pub(crate) mod mutation_log;

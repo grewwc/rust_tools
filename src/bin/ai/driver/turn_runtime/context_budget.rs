@@ -841,7 +841,8 @@ mod tests {
             }
         });
 
-        // 2. app: endpoint points at the mock; history_max_chars near the production default
+        // 2. app: endpoint points at the mock; history_max_chars is pinned here so
+        // this test stays deterministic regardless of future production-default changes
         let history_file = std::env::temp_dir().join(format!(
             "llm_summary_repro_{}.jsonl",
             uuid::Uuid::new_v4()
