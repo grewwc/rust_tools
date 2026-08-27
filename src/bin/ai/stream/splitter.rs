@@ -922,6 +922,11 @@ enum WrappedSplitSegment {
 #[derive(Default)]
 pub(super) struct StreamSplitter {
     pending: String,
+    /// Scratch reused by `longest_marker_prefix_suffix` for its char-offset
+    /// collection. Cleared at every use; keeps repeated `take_segments` calls from
+    /// allocating a fresh `Vec` each time. Purely an allocation-reuse cache: the
+    /// scan result (and therefore the emitted segments) is unaffected.
+    char_offset_scratch: Vec<usize>,
 }
 
 impl StreamSplitter {
@@ -961,7 +966,11 @@ impl StreamSplitter {
             let keep_len = if flush_all {
                 0
             } else {
-                longest_marker_prefix_suffix(&self.pending, markers)
+                longest_marker_prefix_suffix(
+                    &self.pending,
+                    markers,
+                    &mut self.char_offset_scratch,
+                )
             };
             let emit_len = self.pending.len().saturating_sub(keep_len);
             if emit_len == 0 {
@@ -991,15 +1000,20 @@ fn earliest_marker_match(s: &str, markers: &[&str]) -> Option<(usize, usize, usi
         .min_by_key(|(marker_pos, _, _)| *marker_pos)
 }
 
-fn longest_marker_prefix_suffix(s: &str, markers: &[&str]) -> usize {
+fn longest_marker_prefix_suffix(
+    s: &str,
+    markers: &[&str],
+    char_offsets_scratch: &mut Vec<usize>,
+) -> usize {
     if s.is_empty() || markers.is_empty() {
         return 0;
     }
 
+    char_offsets_scratch.clear();
     let mut best = 0usize;
-    let mut starts = s.char_indices().map(|(idx, _)| idx).collect::<Vec<_>>();
-    starts.push(s.len());
-    for start in starts {
+    char_offsets_scratch.extend(s.char_indices().map(|(idx, _)| idx));
+    char_offsets_scratch.push(s.len());
+    for start in char_offsets_scratch.iter().copied() {
         let suffix = &s[start..];
         if markers
             .iter()

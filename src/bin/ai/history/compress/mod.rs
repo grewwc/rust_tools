@@ -20,9 +20,10 @@ use text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 #[cfg(test)]
 use tool_groups::{FOLDED_TOOL_GROUP_ARCHIVE_DIR, fold_early_tool_groups};
 use tool_groups::{
-    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, first_trim_candidate,
-    is_protected_leading_system_like_message, plan_early_tool_groups,
+    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, count_tool_group_anchors,
+    first_trim_candidate, is_protected_leading_system_like_message, plan_early_tool_groups,
     recent_tool_group_message_indices, recent_tool_result_groups,
+    ToolGroupFoldPlan,
 };
 #[cfg(test)]
 use tool_overflow::normalize_internal_notes_for_summary_model;
@@ -1222,7 +1223,10 @@ fn fold_noncompressible_tool_groups_to_fit(
     overflow_dir: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
-    if messages_total_chars(messages) <= max_chars {
+    // The total is a pure function of the (not yet mutated) messages; compute
+    // it once and reuse it for the entry guard and every comparison below.
+    let base_total = messages_total_chars(messages);
+    if base_total <= max_chars {
         return false;
     }
     // Select ONE window from the descending-protection ladder instead of
@@ -1238,7 +1242,21 @@ fn fold_noncompressible_tool_groups_to_fit(
     let mut floor_safe_fitting_keep: Option<usize> = None;
     let mut fitting_keep: Option<usize> = None;
     let mut deepest_reducing_keep: Option<usize> = None;
+    // Anchor count is likewise invariant while this loop only reads messages;
+    // planning (which deep-clones the entire history) is skipped outright for
+    // windows whose plan would be `ToolGroupFoldPlan::unchanged`.
+    let anchor_count = count_tool_group_anchors(messages);
+    // Plan reuse: a plan is a pure function of the unchanged messages, so the
+    // last reducing candidate can be committed directly when its window is the
+    // chosen one instead of being discarded and re-planned afterwards. This
+    // caps the ladder at one live plan (one whole-history clone) instead of a
+    // clone per rung plus a final re-plan; every selection decision below is
+    // evaluated exactly as before.
+    let mut last_reducing_plan: Option<(usize, ToolGroupFoldPlan)> = None;
     for &keep_recent in progressive_fold_windows().iter() {
+        if anchor_count <= keep_recent {
+            continue;
+        }
         let plan =
             plan_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids);
         if plan.folded_groups() == 0 {
@@ -1247,20 +1265,24 @@ fn fold_noncompressible_tool_groups_to_fit(
         // A plan must net a strict decrease; drop it otherwise and keep tightening
         // keep_recent to guard against livelock where the group count changes but
         // the char count does not.
-        if messages_total_chars(plan.messages()) >= messages_total_chars(messages) {
+        let plan_total = messages_total_chars(plan.messages());
+        if plan_total >= base_total {
             continue;
         }
         deepest_reducing_keep = Some(keep_recent);
-        if messages_total_chars(plan.messages()) <= max_chars {
+        let plan_fits = plan_total <= max_chars;
+        let floor_safe = plan_fits
+            && protected_tail_message_chars(plan.messages(), keep_recent)
+                >= MIN_PROTECTED_TAIL_CHARS;
+        if plan_fits {
             if fitting_keep.is_none() {
                 fitting_keep = Some(keep_recent);
             }
-            if protected_tail_message_chars(plan.messages(), keep_recent)
-                >= MIN_PROTECTED_TAIL_CHARS
-            {
-                floor_safe_fitting_keep = Some(keep_recent);
-                break;
-            }
+        }
+        last_reducing_plan = Some((keep_recent, plan));
+        if floor_safe {
+            floor_safe_fitting_keep = Some(keep_recent);
+            break;
         }
     }
     let chosen = floor_safe_fitting_keep
@@ -1268,10 +1290,21 @@ fn fold_noncompressible_tool_groups_to_fit(
         .or(deepest_reducing_keep);
     let mut made_progress = false;
     if let Some(keep_recent) = chosen {
+        // Reuse the remembered plan when it was built for the chosen window;
+        // the only case it is not (a first fitting window superseded by later
+        // reducing windows) falls back to the single re-plan, which produces a
+        // byte-identical plan because the messages have not changed since the
+        // selection loop ran.
         let plan =
-            plan_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids);
+            match last_reducing_plan.take() {
+                Some((window, plan)) if window == keep_recent => plan,
+                _ => {
+                    plan_early_tool_groups(messages, keep_recent, overflow_dir,
+                        protected_tool_call_ids)
+                }
+            };
         if plan.folded_groups() > 0
-            && messages_total_chars(plan.messages()) < messages_total_chars(messages)
+            && messages_total_chars(plan.messages()) < base_total
             && plan.commit()
         {
             let (folded, _) = plan.into_result();
@@ -1511,6 +1544,231 @@ fn shrink_messages_to_fit(
     messages
 }
 
+/// Index of the nearest alive entry at or below `from` in the real-user
+/// aliveness table, or -1 when none remains. Mirrors the "previous remaining
+/// user" step of `retained_turn_start` under prefix-only deletions.
+fn prev_alive_user(alive: &[bool], from: isize) -> isize {
+    let mut cursor = from;
+    while cursor >= 0 && !alive[cursor as usize] {
+        cursor -= 1;
+    }
+    cursor
+}
+
+/// Single-pass replacement for the sequential per-drop rounds in
+/// [`shrink_messages_to_fit_with_summary`]. The old path called
+/// `first_trim_candidate` plus `Vec::remove` once per dropped message — an
+/// O(n) rescan (including the 48K-threshold base and the byte-capped
+/// tail-window recompute inside `keep_recent_user_turns_when_trimming`) and an
+/// O(n) memmove per drop, i.e. O(n²) on long histories. This helper collects
+/// every candidate those rounds would have dropped in one scan and splices
+/// them out once. Selection is provably identical to the sequential loop:
+///
+/// - candidate predicate and protected leading run match `first_trim_candidate`
+///   verbatim; the leading run can only grow (its members are never
+///   candidates), and the scan re-extends it after each removal exactly like
+///   the sequential recompute would;
+/// - deletions always sit strictly before the tail-window boundary, so
+///   comparing original indices against an originally-derived boundary is
+///   equivalent to the sequential recompute on the shrinking sequence;
+/// - `keep_recent_user_turns` has at most two values during the stretch
+///   (totals only decrease, so the 48K base flips at most 2 -> 3); the
+///   byte-cap component depends only on the protected tail sums, which are
+///   invariant under prefix deletions, hence both variants are precomputed
+///   from `keep_recent_user_turns_when_trimming`'s own formula;
+/// - `fold_noncompressible_tool_groups_to_fit` cannot flip from false to true
+///   mid-stretch: removing non-tool-group singletons leaves every fold plan's
+///   folded-group set and net char delta unchanged, so one fold check per
+///   outer round (kept at the call site) reproduces the interleaving;
+/// - `dropped` / `dropped_internal_notes` keep the sequential (ascending)
+///   removal order, `total` is decremented with the same
+///   `saturating_sub(billable)` arithmetic per removal, and the rollback
+///   snapshot is taken immediately before the first accepted removal.
+fn drop_trim_candidates_batch(
+    messages: &mut Vec<Message>,
+    max_chars: usize,
+    total: &mut usize,
+    messages_before_first_drop: &mut Option<Vec<Message>>,
+    dropped: &mut Vec<Message>,
+    dropped_internal_notes: &mut Vec<Message>,
+) -> usize {
+    let len = messages.len();
+    if len == 0 || *total <= max_chars {
+        return 0;
+    }
+    // Per-message billable chars cached once: the sequential loop re-charged
+    // every message via a full `messages_total_chars` rescan each round.
+    let chars: Vec<usize> = messages.iter().map(message_billable_chars).collect();
+    // `keep_recent_user_turns_when_trimming` recomputed per round is equivalent
+    // to this two-entry table: the byte-cap loop reads only the protected tail
+    // sums (invariant under our deletions), and the 48K base depends only on
+    // `total`, which moves downwards across the threshold at most once.
+    let tail_chars = |keep: usize| -> usize {
+        let start = retained_turn_start(messages, keep);
+        chars[start..].iter().sum()
+    };
+    let capped_keep = |base: usize| -> usize {
+        let mut keep = base;
+        while keep > 1 && tail_chars(keep) > max_chars {
+            keep -= 1;
+        }
+        keep
+    };
+    let keep2 = capped_keep(2);
+    let keep3 = capped_keep(3);
+    // Real-user positions mirror `retained_turn_start`'s input list.
+    let user_positions: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, message)| {
+            (message.role == "user" && !is_runtime_synthetic_user_message(message))
+                .then_some(idx)
+        })
+        .collect();
+    let user_count = user_positions.len();
+    let mut alive = vec![true; user_count];
+    let mut alive_users = user_count;
+    let mut keep_now = if *total <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
+        keep3
+    } else {
+        keep2
+    };
+    // Ordinal (into user_positions) of the tail-window boundary user, or -1
+    // once `retained_turn_start` would return 0 (protect everything). The
+    // selected ordinal is alive_users - keep, walking down as users are
+    // deleted or the window grows, exactly like recomputing
+    // `retained_turn_start` per round.
+    let mut boundary_ptr: isize = if user_count <= keep_now {
+        -1
+    } else {
+        (user_count - keep_now) as isize
+    };
+
+    let mut tombstones = vec![false; len];
+    let mut removed = 0usize;
+    let mut user_ordinal = 0usize;
+    let mut idx = 0usize;
+    while idx < len && is_protected_leading_system_like_message(&messages[idx]) {
+        idx += 1;
+    }
+    let mut head_run_end = idx;
+    while idx < len {
+        if idx < head_run_end {
+            idx = head_run_end;
+            continue;
+        }
+        let boundary = if boundary_ptr >= 0 {
+            user_positions[boundary_ptr as usize]
+        } else {
+            0
+        };
+        if idx >= boundary || *total <= max_chars {
+            break;
+        }
+        let message = &messages[idx];
+        // Predicate chain copied from `first_trim_candidate`.
+        if is_context_checkpoint_marker(message) {
+            idx += 1;
+            continue;
+        }
+        if is_preserved_user_or_image_stub(&value_to_string(&message.content)) {
+            idx += 1;
+            continue;
+        }
+        if message.role == "tool" {
+            idx += 1;
+            continue;
+        }
+        if message.role == "assistant"
+            && message
+                .tool_calls
+                .as_ref()
+                .map(|calls| !calls.is_empty())
+                .unwrap_or(false)
+        {
+            idx += 1;
+            continue;
+        }
+
+        // Accepted candidate: snapshot before the first removal (the caller's
+        // sequential loop snapshotted at exactly this point), then tombstone.
+        if messages_before_first_drop.is_none() {
+            *messages_before_first_drop = Some(messages.clone());
+        }
+        tombstones[idx] = true;
+        removed += 1;
+        *total = total.saturating_sub(chars[idx]);
+        // Deleting a real user below the window shifts the selected boundary
+        // user one alive slot downwards, matching the sequential recompute.
+        while user_ordinal < user_count && user_positions[user_ordinal] < idx {
+            user_ordinal += 1;
+        }
+        if user_ordinal < user_count && user_positions[user_ordinal] == idx {
+            alive[user_ordinal] = false;
+            alive_users -= 1;
+            user_ordinal += 1;
+            if boundary_ptr >= 0 {
+                boundary_ptr = prev_alive_user(&alive, boundary_ptr - 1);
+            }
+        }
+        // Crossing the 48K threshold widens the protection window (base 2 ->
+        // 3); totals never increase inside a stretch, so this fires at most
+        // once per stretch.
+        let new_keep = if *total <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
+            keep3
+        } else {
+            keep2
+        };
+        while keep_now < new_keep {
+            keep_now += 1;
+            if boundary_ptr >= 0 {
+                if alive_users <= keep_now {
+                    boundary_ptr = -1;
+                } else {
+                    boundary_ptr = prev_alive_user(&alive, boundary_ptr - 1);
+                }
+            }
+        }
+        if idx == head_run_end {
+            // Removing the first message after the protected leading run lets
+            // that run grow over the following messages, exactly like the
+            // sequential head-run recompute on the shrunk sequence.
+            head_run_end = idx + 1;
+            while head_run_end < len
+                && is_protected_leading_system_like_message(&messages[head_run_end])
+            {
+                head_run_end += 1;
+            }
+            idx = head_run_end;
+        } else {
+            idx += 1;
+        }
+        if *total <= max_chars {
+            break;
+        }
+    }
+    if removed == 0 {
+        return 0;
+    }
+    // One physical splice instead of one O(n) `Vec::remove` per drop. Each
+    // list keeps ascending removal order, matching the sequential pushes.
+    let old = std::mem::take(messages);
+    let mut kept = Vec::with_capacity(old.len() - removed);
+    for (index, message) in old.into_iter().enumerate() {
+        if tombstones[index] {
+            if is_internal_note_role(&message.role) {
+                dropped_internal_notes.push(message);
+            } else {
+                dropped.push(message);
+            }
+        } else {
+            kept.push(message);
+        }
+    }
+    *messages = kept;
+    removed
+}
+
 /// Same as [`shrink_messages_to_fit`] but, before dropping early messages
 /// outright, captures them into (or merges them with) a leading
 /// `internal_note` summary so that long conversations still retain a
@@ -1601,17 +1859,20 @@ fn shrink_messages_to_fit_with_summary(
             total = messages_total_chars(&messages);
             continue;
         }
-        if let Some(idx) = first_trim_candidate(&messages, max_chars) {
-            if messages_before_first_drop.is_none() {
-                messages_before_first_drop = Some(messages.clone());
-            }
-            let removed_msg = messages.remove(idx);
-            total = total.saturating_sub(message_billable_chars(&removed_msg));
-            if is_internal_note_role(&removed_msg.role) {
-                dropped_internal_notes.push(removed_msg);
-            } else {
-                dropped.push(removed_msg);
-            }
+        // Batch the consecutive drop rounds: selection inside
+        // `drop_trim_candidates_batch` reproduces the previous per-round
+        // `first_trim_candidate` + `Vec::remove` sequence exactly, while
+        // turning O(n) rescans and O(n) memmoves per drop into one scan and
+        // one splice (see the helper's doc comment for the equivalence proof).
+        if drop_trim_candidates_batch(
+            &mut messages,
+            max_chars,
+            &mut total,
+            &mut messages_before_first_drop,
+            &mut dropped,
+            &mut dropped_internal_notes,
+        ) > 0
+        {
             continue;
         }
         if let Some(dir) = overflow_dir
@@ -3847,6 +4108,8 @@ fn render_deduped_read_file_output_lines(lines: &[(usize, String)], removed: usi
 mod coalesce_summary_notes_tests;
 #[cfg(test)]
 mod dedup_adjacent_tests;
+#[cfg(test)]
+mod drop_trim_differential_tests;
 #[cfg(test)]
 mod fold_early_tool_groups_tests;
 #[cfg(test)]

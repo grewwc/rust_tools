@@ -36,6 +36,9 @@ fn render_line_excerpt_from_char(
     let mut shown_lines = 0usize;
     let mut truncated_mid_line = false;
     let mut next_char_offset = None;
+    // Running char count of `text`; replaces re-scanning the whole rendered
+    // buffer with chars().count() on every line (was O(rendered) per line).
+    let mut text_chars = 0usize;
 
     for (idx, line) in lines[start..end].iter().enumerate() {
         let line_char_offset = if idx == 0 { first_line_char_offset } else { 0 };
@@ -45,16 +48,18 @@ fn render_line_excerpt_from_char(
         } else {
             line
         };
+        let rendered_chars = rendered.chars().count();
         if let Some(limit) = max_chars {
             if !text.is_empty() {
-                if text.chars().count().saturating_add(1) >= limit {
+                if text_chars.saturating_add(1) >= limit {
                     break;
                 }
                 text.push('\n');
+                text_chars += 1;
             }
 
-            let remaining = limit.saturating_sub(text.chars().count());
-            if rendered.chars().count() > remaining {
+            let remaining = limit.saturating_sub(text_chars);
+            if rendered_chars > remaining {
                 if remaining == 0 {
                     break;
                 }
@@ -72,9 +77,11 @@ fn render_line_excerpt_from_char(
             }
         } else if !text.is_empty() {
             text.push('\n');
+            text_chars += 1;
         }
 
         text.push_str(&rendered);
+        text_chars += rendered_chars;
         shown_lines += 1;
     }
 

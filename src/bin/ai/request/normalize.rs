@@ -414,8 +414,10 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         }
     }
 
+    /// Consuming variant: repairs the call in place so no per-call clone is
+    /// needed by callers that already own the `ToolCall`.
     fn sanitize_tool_call_for_request(
-        tool_call: &crate::ai::types::ToolCall,
+        mut tool_call: crate::ai::types::ToolCall,
     ) -> crate::ai::types::ToolCall {
         let raw_args = tool_call.function.arguments.trim();
         // args 必须是合法 JSON 对象字符串才能过 provider 校验。但绝不能因为
@@ -432,13 +434,12 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             serde_json::json!({ "_malformed_arguments": raw_args }).to_string()
         };
 
-        let mut sanitized = tool_call.clone();
-        sanitized.function.arguments = normalized_arguments;
+        tool_call.function.arguments = normalized_arguments;
         // 确保 tool_type 不为空（部分 provider 在 stream 中不返回 type）
-        if sanitized.tool_type.is_empty() {
-            sanitized.tool_type = "function".to_string();
+        if tool_call.tool_type.is_empty() {
+            tool_call.tool_type = "function".to_string();
         }
-        sanitized
+        tool_call
     }
 
     fn has_valid_function_name(tool_call: &crate::ai::types::ToolCall) -> bool {
@@ -453,40 +454,37 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     }
 
     fn sanitize_tool_message_sequence(messages: Vec<Message>) -> Vec<Message> {
+        /// Precomputed evidence for one unmatched tool message: the effective
+        /// tool_call_id label plus its content preview (`None` when the content
+        /// is blank and contributes no line — the blank check runs inside the
+        /// note builder so the first-8-evidence window stays identical to the
+        /// previous behavior over full `Message` clones). Capturing evidence at
+        /// scan time lets unmatched tool messages be dropped instead of
+        /// deep-copied.
+        struct UnmatchedToolEvidence {
+            id_label: String,
+            preview: Option<String>,
+        }
+
         fn build_unpaired_tool_evidence_note(
             reason: &str,
-            tool_messages: &[Message],
+            evidence: &[UnmatchedToolEvidence],
         ) -> Option<Message> {
-            if tool_messages.is_empty() {
+            if evidence.is_empty() {
                 return None;
             }
             let mut lines = vec![
                 "Context note: preserved unmatched tool outputs from prior rounds.".to_string(),
                 format!("reason: {reason}"),
             ];
-            for message in tool_messages.iter().take(8) {
-                let tool_call_id = message
-                    .tool_call_id
-                    .as_deref()
-                    .filter(|id| !id.trim().is_empty())
-                    .unwrap_or("unknown");
-                let text = message
-                    .content
-                    .as_str()
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_default();
-                if text.is_empty() {
-                    continue;
+            for item in evidence.iter().take(8) {
+                if let Some(preview) = &item.preview {
+                    lines.push(format!(
+                        "- tool_call_id={id_label}: {preview}",
+                        id_label = item.id_label,
+                        preview = preview
+                    ));
                 }
-                let preview = if text.chars().count() > 240 {
-                    let mut p = text.chars().take(239).collect::<String>();
-                    p.push('…');
-                    p
-                } else {
-                    text.to_string()
-                };
-                lines.push(format!("- tool_call_id={tool_call_id}: {preview}"));
             }
             if lines.len() <= 2 {
                 return None;
@@ -507,31 +505,31 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         }
 
         let mut out = Vec::with_capacity(messages.len());
-        let mut idx = 0usize;
-
-        while idx < messages.len() {
-            let message = &messages[idx];
+        // Consuming scan: every message is moved (never re-cloned) into `out`;
+        // the peekable cursor replaces the old index window over `messages[..]`.
+        let mut consumed = messages.into_iter().peekable();
+        while let Some(mut message) = consumed.next() {
             if message.role == "tool" {
-                idx += 1;
                 continue;
             }
 
-            let Some(tool_calls) = message
+            let has_effective_tool_calls = message
                 .tool_calls
                 .as_ref()
-                .filter(|calls| !calls.is_empty())
-            else {
-                out.push(message.clone());
-                idx += 1;
+                .is_some_and(|calls| !calls.is_empty());
+            if !has_effective_tool_calls {
+                // Pass through unchanged, including a `Some(empty)` tool_calls
+                // value: the old loop only specialized on non-empty lists.
+                out.push(message);
                 continue;
             };
 
-            let sanitized_tool_calls = tool_calls
-                .iter()
+            let raw_tool_calls = message.tool_calls.take().unwrap_or_default();
+            let sanitized_tool_calls = raw_tool_calls
+                .into_iter()
                 .filter(|tool_call| has_valid_function_name(tool_call))
                 .map(sanitize_tool_call_for_request)
                 .collect::<Vec<_>>();
-            let mut scan = idx + 1;
 
             let expected_ids = sanitized_tool_calls
                 .iter()
@@ -539,10 +537,10 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
                 .collect::<Vec<_>>();
             let mut matched_ids = Vec::new();
             let mut matched_tool_messages = Vec::new();
-            let mut unmatched_tool_messages = Vec::new();
+            let mut unmatched_tool_evidence = Vec::new();
 
-            while scan < messages.len() && messages[scan].role == "tool" {
-                let tool_message = &messages[scan];
+            while matches!(consumed.peek(), Some(next) if next.role == "tool") {
+                let tool_message = consumed.next().expect("tool message was peeked");
                 if let Some(tool_call_id) = tool_message.tool_call_id.as_deref()
                     && expected_ids
                         .iter()
@@ -550,72 +548,117 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
                     && !matched_ids.iter().any(|seen| seen == tool_call_id)
                 {
                     matched_ids.push(tool_call_id.to_string());
-                    matched_tool_messages.push(tool_message.clone());
+                    matched_tool_messages.push(tool_message);
                 } else {
-                    unmatched_tool_messages.push(tool_message.clone());
+                    let tool_call_id = tool_message
+                        .tool_call_id
+                        .as_deref()
+                        .filter(|id| !id.trim().is_empty())
+                        .unwrap_or("unknown");
+                    let text = tool_message
+                        .content
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_default();
+                    let preview = (!text.is_empty()).then(|| {
+                        if text.chars().count() > 240 {
+                            let mut p = text.chars().take(239).collect::<String>();
+                            p.push('…');
+                            p
+                        } else {
+                            text.to_string()
+                        }
+                    });
+                    unmatched_tool_evidence.push(UnmatchedToolEvidence {
+                        id_label: tool_call_id.to_string(),
+                        preview,
+                    });
                 }
-                scan += 1;
             }
 
             if matched_ids.is_empty() {
-                let mut assistant_only = message.clone();
-                assistant_only.tool_calls = None;
-                if !content_is_effectively_empty(&assistant_only.content) {
-                    out.push(assistant_only);
+                message.tool_calls = None;
+                if !content_is_effectively_empty(&message.content) {
+                    out.push(message);
                 }
                 if let Some(note) = build_unpaired_tool_evidence_note(
                     "tool_call ids could not be matched with sanitized assistant tool_calls",
-                    &unmatched_tool_messages,
+                    &unmatched_tool_evidence,
                 ) {
                     out.push(note);
                 }
-                idx = scan.max(idx + 1);
                 continue;
             }
 
-            let mut assistant_with_matched_calls = message.clone();
-            assistant_with_matched_calls.tool_calls = Some(
+            message.tool_calls = Some(
                 sanitized_tool_calls
-                    .iter()
+                    .into_iter()
                     .filter(|tool_call| matched_ids.iter().any(|id| id == &tool_call.id))
-                    .cloned()
                     .collect(),
             );
-            out.push(assistant_with_matched_calls);
+            out.push(message);
             out.extend(matched_tool_messages);
             if let Some(note) = build_unpaired_tool_evidence_note(
                 "some tool outputs were unmatched and preserved as context note",
-                &unmatched_tool_messages,
+                &unmatched_tool_evidence,
             ) {
                 out.push(note);
             }
-            idx = scan;
         }
 
         out
     }
 
-    // canonical history 需要保留 runtime 来源旁路以重建真实 user 边界；provider
-    // payload 不得看到内部 metadata，所以在所有 request projection 逻辑之前清除。
+    /// Placeholder parked into a slot after its value has been moved out for
+    /// projection. Both projection loops only look strictly forward
+    /// (`messages[idx + 1..]`), so an already-processed slot — placeholder
+    /// included — is never read again.
+    fn moved_out_message_placeholder() -> Message {
+        Message {
+            role: String::new(),
+            content: Value::Null,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    // The canonical history must keep the runtime origin sidecar to rebuild
+    // real user boundaries; provider payloads must never see internal
+    // metadata, so it is cleared before any request-projection logic runs.
+    // This working copy is the single deep copy of the history taken here;
+    // the projection loops below move messages out of it instead of cloning
+    // each element a second time.
     let mut request_messages = messages.to_vec();
     request_messages
         .iter_mut()
         .for_each(clear_runtime_message_metadata);
-    let messages = request_messages.as_slice();
 
-    let first_system_idx = messages.iter().position(|m| m.role == ROLE_SYSTEM);
+    let first_system_idx = request_messages
+        .iter()
+        .position(|m| m.role == ROLE_SYSTEM);
     let Some(first_system_idx) = first_system_idx else {
-        let mut projected = Vec::with_capacity(messages.len() + 1);
-        for (idx, message) in messages.iter().enumerate() {
-            if !is_internal_note_role(&message.role) {
-                projected.push(message.clone());
+        let mut projected = Vec::with_capacity(request_messages.len() + 1);
+        for idx in 0..request_messages.len() {
+            if !is_internal_note_role(&request_messages[idx].role) {
+                projected.push(std::mem::replace(
+                    &mut request_messages[idx],
+                    moved_out_message_placeholder(),
+                ));
                 continue;
             }
-            let mut note = message.clone();
+            let mut note = std::mem::replace(
+                &mut request_messages[idx],
+                moved_out_message_placeholder(),
+            );
+            // Marker detection must see the original role/content, before the
+            // content is rewritten below (mirrors the old clone-then-check
+            // order on the untouched source message).
+            let checkpoint = is_context_checkpoint_marker(&note);
             note.content = normalize_system_like_content_for_request(&note.content);
             let text = note.content.as_str().unwrap_or_default();
             let kind = detect_note_kind(text);
-            let checkpoint = is_context_checkpoint_marker(message);
             let model_derived = checkpoint || is_model_derived_note(kind);
             note.role = if model_derived {
                 "assistant".to_string()
@@ -634,7 +677,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             }
             projected.push(note);
             if model_derived
-                && messages[idx + 1..]
+                && request_messages[idx + 1..]
                     .iter()
                     .find(|next| !is_context_checkpoint_marker(next))
                     .is_some_and(|next| next.role == "assistant")
@@ -648,12 +691,12 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     // 只把 runtime-owned system-like note 合入首条 system。模型自产的
     // self_note / 自动摘要单独投影为 assistant 来源，避免派生判断被提权。
     // 首个对话消息之后的 note 保持原位，避免新增尾部 note 破坏缓存前缀。
-    let first_body_idx = messages
+    let first_body_idx = request_messages
         .iter()
         .position(|m| !is_system_like_role(&m.role))
-        .unwrap_or(messages.len());
+        .unwrap_or(request_messages.len());
 
-    let checkpoint_markers = messages
+    let checkpoint_markers = request_messages
         .iter()
         .filter(|message| is_context_checkpoint_marker(message))
         .filter_map(|message| message.content.as_str().map(|text| text.trim().to_string()))
@@ -661,7 +704,11 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
 
     let mut merged_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
     let mut model_derived_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
-    for (idx, message) in messages.iter().enumerate().take(first_body_idx) {
+    for (idx, message) in request_messages
+        .iter()
+        .enumerate()
+        .take(first_body_idx)
+    {
         let normalized_content = normalize_system_like_content_for_request(&message.content);
         let text = normalized_content
             .as_str()
@@ -691,13 +738,20 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     merged_notes.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     model_derived_notes.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
-    let mut merged_first = messages[first_system_idx].clone();
+    // Move the first system message out of the working copy instead of
+    // cloning it: this slot is skipped by the final projection loop, so the
+    // placeholder left behind is never read.
+    let mut merged_first = std::mem::replace(
+        &mut request_messages[first_system_idx],
+        moved_out_message_placeholder(),
+    );
+    // Checkpoint detection must see the ORIGINAL message (role not yet
+    // rewritten to system): checking the rewritten copy would miss the legal
+    // marker and skip its blanking step.
+    let first_is_checkpoint_marker = is_context_checkpoint_marker(&merged_first);
     merged_first.role = ROLE_SYSTEM.to_string();
     merged_first.content = normalize_system_like_content_for_request(&merged_first.content);
-    // 用**原始**消息（role 尚未被改写为 system）判定 checkpoint marker：merged_first
-    // 的 role 已被上一行改成 ROLE_SYSTEM，若拿它判定会因 role 校验失败而漏掉合法
-    // marker 的清空处理。
-    if is_context_checkpoint_marker(&messages[first_system_idx]) {
+    if first_is_checkpoint_marker {
         merged_first.content = Value::String(String::new());
     }
     if let Some(base) = merged_first.content.as_str() {
@@ -725,7 +779,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         .take(REQUEST_CONTEXT_CHECKPOINT_LIMIT)
         .collect::<Vec<_>>();
 
-    let mut out = Vec::with_capacity(messages.len() + 1);
+    let mut out = Vec::with_capacity(request_messages.len() + 1);
     out.push(merged_first);
     let mut derived_sections = Vec::new();
     let mut current_kind: Option<InternalNoteKind> = None;
@@ -765,29 +819,38 @@ evidence before relying on them.\n",
             reasoning_content: None,
         });
     }
-    for (idx, message) in messages.iter().enumerate() {
+    for idx in 0..request_messages.len() {
         if idx == first_system_idx {
             continue;
         }
-        if is_context_checkpoint_marker(message) {
-            // 所有 checkpoint 都集中投影到请求前缀并限量，不能让历史尾部的 marker
-            // 随会话增长；持久化 history 保留完整记录，后续请求只带最近若干条。
+        if is_context_checkpoint_marker(&request_messages[idx]) {
+            // All checkpoints are centrally projected into the request prefix
+            // with a cap, so tail markers must not grow with the session; the
+            // persisted history keeps the full record and later requests only
+            // carry the most recent few.
             continue;
         }
         if idx < first_body_idx {
-            // runtime note 已折叠进 merged_first；model-derived note / checkpoint
-            // 已作为独立 assistant 上下文投影。
+            // Runtime notes were already folded into merged_first;
+            // model-derived notes / checkpoints were already projected as the
+            // standalone assistant context block.
             continue;
         }
+        let mut message = std::mem::replace(
+            &mut request_messages[idx],
+            moved_out_message_placeholder(),
+        );
         if is_system_like_role(&message.role) {
-            let mut promoted = message.clone();
-            promoted.content = normalize_system_like_content_for_request(&promoted.content);
-            let text = promoted.content.as_str().unwrap_or_default();
+            message.content = normalize_system_like_content_for_request(&message.content);
+            let text = message.content.as_str().unwrap_or_default();
             let kind = detect_note_kind(text);
+            // The original role decides derivation, so evaluate it before the
+            // role is rewritten below.
             let model_derived = is_internal_note_role(&message.role) && is_model_derived_note(kind);
-            // 模型自产的 self_note / 历史摘要只能作为 assistant 来源的导航信息，
-            // 不能与运行时拥有的 policy/control note 一起提权为 system。
-            promoted.role = if model_derived {
+            // Model-authored self_notes / history summaries may only surface
+            // as assistant-sourced navigation info; they must not be promoted
+            // to system together with runtime-owned policy/control notes.
+            message.role = if model_derived {
                 "assistant".to_string()
             } else {
                 ROLE_SYSTEM.to_string()
@@ -795,21 +858,21 @@ evidence before relying on them.\n",
             // Cap mid-stream notes to a reasonable budget to avoid bloating
             // the request with stale long notes (working memory / self_note /
             // cached-tool notes accumulated over many tool rounds).
-            if let Value::String(text) = &promoted.content {
+            if let Value::String(text) = &message.content {
                 if text.chars().count() > MERGED_SINGLE_NOTE_MAX_CHARS {
-                    promoted.content =
+                    message.content =
                         Value::String(truncate_note_text(text, MERGED_SINGLE_NOTE_MAX_CHARS));
                 }
             }
-            if model_derived && let Some(text) = promoted.content.as_str() {
-                promoted.content = model_derived_content(kind, text);
+            if model_derived && let Some(text) = message.content.as_str() {
+                message.content = model_derived_content(kind, text);
             }
             if model_derived {
                 out.push(derived_context_handoff_message());
             }
-            out.push(promoted);
+            out.push(message);
             if model_derived
-                && messages[idx + 1..]
+                && request_messages[idx + 1..]
                     .iter()
                     .find(|next| !is_context_checkpoint_marker(next))
                     .is_some_and(|next| next.role == "assistant")
@@ -818,7 +881,7 @@ evidence before relying on them.\n",
             }
             continue;
         }
-        out.push(message.clone());
+        out.push(message);
     }
     sanitize_tool_message_sequence(out)
 }

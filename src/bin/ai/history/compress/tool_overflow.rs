@@ -439,9 +439,17 @@ pub(super) fn spill_protected_precision_to_fit(
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|(_, _, _, chars)| std::cmp::Reverse(*chars));
 
+    // Running total maintained incrementally instead of re-scanning the whole
+    // sequence per candidate: the only mutation inside this loop is the content
+    // swap on a single message (`messages[idx].content`), so the authoritative
+    // `messages_total_chars` sum changes by exactly that message's billable
+    // delta. This mirrors the running-total pattern used by
+    // `shrink_messages_to_fit_with_summary` in `compress/mod.rs`. Candidate
+    // selection order and spilled stub contents are untouched.
+    let mut total = super::messages_total_chars(messages);
     let mut spilled = 0usize;
     for (idx, tool_name, existing_asset_path, _) in candidates {
-        if super::messages_total_chars(messages) <= hard_target_chars {
+        if total <= hard_target_chars {
             break;
         }
         let text = value_to_string(&messages[idx].content);
@@ -482,7 +490,15 @@ pub(super) fn spill_protected_precision_to_fit(
             }
             continue;
         };
+        let before_billable = super::message_billable_chars(&messages[idx]);
         messages[idx].content = Value::String(replacement);
+        let after_billable = super::message_billable_chars(&messages[idx]);
+        total = total
+            .saturating_sub(before_billable)
+            .saturating_add(after_billable);
+        // Debug-only oracle: the incremental total must always equal a full
+        // rescan; compiles away in release builds.
+        debug_assert_eq!(total, super::messages_total_chars(messages));
         spilled += 1;
     }
     spilled

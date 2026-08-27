@@ -209,11 +209,16 @@ where
         let mut order = Vec::with_capacity(nodes.len());
         while let Some(curr) = q.pop_front() {
             order.push(curr.clone());
-            for next in self.adj(&curr) {
-                if let Some(x) = indegree.get_mut(&next) {
-                    *x = x.saturating_sub(1);
-                    if *x == 0 {
-                        q.push_back(next);
+            // Iterate the stored neighbor set directly instead of the
+            // temporary Vec clone adj() builds per call; the underlying set
+            // is iterated either way, so element order is identical.
+            if let Some(neighbors) = self.adj.get(&curr) {
+                for next in neighbors.iter() {
+                    if let Some(x) = indegree.get_mut(next) {
+                        *x = x.saturating_sub(1);
+                        if *x == 0 {
+                            q.push_back(next.clone());
+                        }
                     }
                 }
             }
@@ -289,10 +294,14 @@ where
         q.push_back(from.clone());
 
         while let Some(curr) = q.pop_front() {
-            for next in self.adj(&curr) {
-                if visited.insert(next.clone()) {
-                    prev.insert(next.clone(), curr.clone());
-                    q.push_back(next);
+            // Neighbor-set iteration without adj()'s per-node Vec clone;
+            // traversal order over the same set is unchanged.
+            if let Some(neighbors) = self.adj.get(&curr) {
+                for next in neighbors.iter() {
+                    if visited.insert(next.clone()) {
+                        prev.insert(next.clone(), curr.clone());
+                        q.push_back(next.clone());
+                    }
                 }
             }
         }
@@ -338,17 +347,21 @@ where
             stack_pos.insert(node.clone(), stack.len());
             stack.push(node.clone());
 
-            for next in g.adj(node) {
-                let st = state.get(&next).copied().unwrap_or(0);
-                if st == 0 {
-                    if let Some(cycle) = dfs(g, &next, state, stack, stack_pos) {
+            // Neighbor-set iteration skips the Vec clone adj() allocates per
+            // visit; DFS visit order over the same set is unchanged.
+            if let Some(neighbors) = g.adj.get(node) {
+                for next in neighbors.iter() {
+                    let st = state.get(next).copied().unwrap_or(0);
+                    if st == 0 {
+                        if let Some(cycle) = dfs(g, next, state, stack, stack_pos) {
+                            return Some(cycle);
+                        }
+                    } else if st == 1 {
+                        let start = *stack_pos.get(next).unwrap_or(&0);
+                        let mut cycle = stack[start..].to_vec();
+                        cycle.push(next.clone());
                         return Some(cycle);
                     }
-                } else if st == 1 {
-                    let start = *stack_pos.get(&next).unwrap_or(&0);
-                    let mut cycle = stack[start..].to_vec();
-                    cycle.push(next.clone());
-                    return Some(cycle);
                 }
             }
 
@@ -380,9 +393,14 @@ where
         order: &mut Vec<T>,
     ) {
         visited.insert(node.clone());
-        for next in g.adj(node) {
-            if !visited.contains(&next) {
-                Self::dfs_finish_order(g, &next, visited, order);
+        // Direct neighbor-set iteration (no per-call Vec clone from adj());
+        // finish-order relies only on set content and iteration order, both
+        // unchanged here.
+        if let Some(neighbors) = g.adj.get(node) {
+            for next in neighbors.iter() {
+                if !visited.contains(next) {
+                    Self::dfs_finish_order(g, next, visited, order);
+                }
             }
         }
         order.push(node.clone());
@@ -396,9 +414,13 @@ where
     ) {
         visited.insert(node.clone());
         component.push(node.clone());
-        for next in g.adj(node) {
-            if !visited.contains(&next) {
-                Self::dfs_collect_component(g, &next, visited, component);
+        // Direct neighbor-set iteration (see dfs_finish_order note): skips
+        // adj()'s temporary Vec while keeping the same visit order.
+        if let Some(neighbors) = g.adj.get(node) {
+            for next in neighbors.iter() {
+                if !visited.contains(next) {
+                    Self::dfs_collect_component(g, next, visited, component);
+                }
             }
         }
     }
@@ -542,12 +564,16 @@ where
         q.push_back(u.clone());
 
         while let Some(curr) = q.pop_front() {
-            for next in self.adj(&curr) {
-                if next == *v {
-                    return true;
-                }
-                if visited.insert(next.clone()) {
-                    q.push_back(next);
+            // Neighbor-set iteration without adj()'s per-node Vec clone;
+            // BFS order over the same set is unchanged.
+            if let Some(neighbors) = self.adj.get(&curr) {
+                for next in neighbors.iter() {
+                    if next == v {
+                        return true;
+                    }
+                    if visited.insert(next.clone()) {
+                        q.push_back(next.clone());
+                    }
                 }
             }
         }
@@ -571,9 +597,13 @@ where
 
             while let Some(curr) = q.pop_front() {
                 component.push(curr.clone());
-                for next in self.adj(&curr) {
-                    if visited.insert(next.clone()) {
-                        q.push_back(next);
+                // Direct neighbor-set iteration (no adj() Vec clone); BFS
+                // discovery order within a component stays the same.
+                if let Some(neighbors) = self.adj.get(&curr) {
+                    for next in neighbors.iter() {
+                        if visited.insert(next.clone()) {
+                            q.push_back(next.clone());
+                        }
                     }
                 }
             }
@@ -613,10 +643,14 @@ where
         q.push_back(from.clone());
 
         while let Some(curr) = q.pop_front() {
-            for next in self.adj(&curr) {
-                if visited.insert(next.clone()) {
-                    prev.insert(next.clone(), curr.clone());
-                    q.push_back(next);
+            // Neighbor-set iteration instead of adj()'s temporary Vec;
+            // predecessor selection order is preserved.
+            if let Some(neighbors) = self.adj.get(&curr) {
+                for next in neighbors.iter() {
+                    if visited.insert(next.clone()) {
+                        prev.insert(next.clone(), curr.clone());
+                        q.push_back(next.clone());
+                    }
                 }
             }
         }
@@ -823,14 +857,19 @@ where
 
             visited.insert(curr.clone());
 
-            for next in self.graph.adj(&curr) {
-                let Some(weight) = self.weight(&curr, &next) else {
-                    continue;
-                };
-                let candidate = curr_dist + weight;
-                if candidate < dist.get(&next).copied().unwrap_or(INF) {
-                    dist.insert(next.clone(), candidate);
-                    prev.insert(next.clone(), curr.clone());
+            // Edge relaxation iterates the neighbor set itself rather than
+            // the Vec clone DirectedGraph::adj builds per call; relaxation
+            // order over the same set is unchanged.
+            if let Some(neighbors) = self.graph.adj.get(&curr) {
+                for next in neighbors.iter() {
+                    let Some(weight) = self.weight(&curr, next) else {
+                        continue;
+                    };
+                    let candidate = curr_dist + weight;
+                    if candidate < dist.get(next).copied().unwrap_or(INF) {
+                        dist.insert(next.clone(), candidate);
+                        prev.insert(next.clone(), curr.clone());
+                    }
                 }
             }
         }
@@ -852,14 +891,18 @@ where
             if !base.is_finite() {
                 continue;
             }
-            for next in self.graph.adj(&node) {
-                let Some(weight) = self.weight(&node, &next) else {
-                    continue;
-                };
-                let candidate = base + weight;
-                if candidate < dist.get(&next).copied().unwrap_or(INF) {
-                    dist.insert(next.clone(), candidate);
-                    prev.insert(next.clone(), node.clone());
+            // Neighbor-set iteration without adj()'s per-node Vec clone;
+            // relaxation order is unchanged.
+            if let Some(neighbors) = self.graph.adj.get(&node) {
+                for next in neighbors.iter() {
+                    let Some(weight) = self.weight(&node, next) else {
+                        continue;
+                    };
+                    let candidate = base + weight;
+                    if candidate < dist.get(next).copied().unwrap_or(INF) {
+                        dist.insert(next.clone(), candidate);
+                        prev.insert(next.clone(), node.clone());
+                    }
                 }
             }
         }
@@ -1125,14 +1168,18 @@ where
 
             visited.insert(curr.clone());
 
-            for next in self.graph.adj(&curr) {
-                let Some(weight) = self.weight(&curr, &next) else {
-                    continue;
-                };
-                let candidate = curr_dist + weight;
-                if candidate < dist.get(&next).copied().unwrap_or(INF) {
-                    dist.insert(next.clone(), candidate);
-                    prev.insert(next.clone(), curr.clone());
+            // Edge relaxation over the neighbor set directly (see the
+            // weighted directed variant): no per-call Vec clone, same order.
+            if let Some(neighbors) = self.graph.adj.get(&curr) {
+                for next in neighbors.iter() {
+                    let Some(weight) = self.weight(&curr, next) else {
+                        continue;
+                    };
+                    let candidate = curr_dist + weight;
+                    if candidate < dist.get(next).copied().unwrap_or(INF) {
+                        dist.insert(next.clone(), candidate);
+                        prev.insert(next.clone(), curr.clone());
+                    }
                 }
             }
         }

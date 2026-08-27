@@ -446,7 +446,7 @@ impl MemoryStore {
     ) -> Result<bool, String> {
         let target_norm = normalize_learning_note(&target.note);
         let target_source = target.source.as_deref().unwrap_or("");
-        let recent = self.recent(recent_limit)?;
+        let recent = self.recent_tail_window(recent_limit)?;
         Ok(recent.into_iter().any(|entry| {
             if entry.category != target.category {
                 return false;
@@ -456,6 +456,153 @@ impl MemoryStore {
             }
             normalize_learning_note(&entry.note) == target_norm
         }))
+    }
+
+    /// Same entry window as `recent(limit)` for the append duplicate check,
+    /// obtained by scanning the file backwards from the end and parsing at
+    /// most `limit` entries instead of reading and parsing the whole file.
+    ///
+    /// Equivalence to `recent(limit)`:
+    /// - Line model: `\n`-separated byte slices, with the final unterminated
+    ///   segment counting as a line, matching `BufRead::lines`. Splitting on
+    ///   the `\n` byte is UTF-8 safe because continuation bytes are never
+    ///   0x0A, so every slice contains whole characters.
+    /// - Window identity: both implementations keep the last `limit`
+    ///   successfully-parsed entries. The predicate in
+    ///   `has_recent_duplicate` depends only on individual entries, so the
+    ///   newest-first ordering of `recent` is not needed here.
+    /// - Skipped lines: whitespace-only lines and lines that fail JSON
+    ///   parsing are ignored in both implementations and do not count
+    ///   toward `limit`.
+    /// - Errors: `recent` fails the whole scan when any line in the file is
+    ///   not valid UTF-8, and `append` maps that error to "no duplicate".
+    ///   This scanner fails identically for invalid lines inside the scanned
+    ///   tail, and once `limit` entries are collected it validates the
+    ///   remaining prefix as raw UTF-8 (`ensure_range_is_utf8`, a cheap
+    ///   byte-level check without JSON parsing), so corruption in the
+    ///   unscanned prefix produces the same error.
+    fn recent_tail_window(&self, limit: usize) -> Result<Vec<AgentMemoryEntry>, String> {
+        if limit == 0 || !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut file = fs::File::open(&self.path)
+            .map_err(|e| format!("Failed to read memory file: {e}"))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| format!("Failed to read memory file: {e}"))?
+            .len();
+
+        const CHUNK: usize = 32 * 1024;
+        let mut chunk: Vec<u8> = Vec::new();
+        // Exclusive end of the not-yet-scanned region; bytes >= end have
+        // already been scanned as complete lines.
+        let mut end = file_len;
+        // Byte offset where scanning stopped; the prefix below it is only
+        // validated by `ensure_range_is_utf8` after the loop.
+        let mut scan_stop = 0u64;
+        let mut window = CHUNK as u64;
+        let mut collected: Vec<AgentMemoryEntry> = Vec::new();
+
+        while end > 0 && collected.len() < limit {
+            let start = end.saturating_sub(window);
+            let len = (end - start) as usize;
+            chunk.resize(len, 0);
+            file.seek(SeekFrom::Start(start))
+                .map_err(|e| format!("Failed to read memory file: {e}"))?;
+            file.read_exact(&mut chunk[..len])
+                .map_err(|e| format!("Failed to read memory file: {e}"))?;
+
+            match chunk.iter().rposition(|b| *b == b'\n') {
+                Some(i) => {
+                    // The line is the segment between the last '\n' in the
+                    // chunk and `end`; everything at or after that '\n' is
+                    // scanned once the line is consumed.
+                    Self::parse_tail_window_line(&chunk[i + 1..len], &mut collected, limit)?;
+                    end = start + i as u64;
+                    window = CHUNK as u64;
+                }
+                None if start == 0 => {
+                    // No '\n' left before the region start: the rest of the
+                    // file is a single line.
+                    Self::parse_tail_window_line(&chunk[..len], &mut collected, limit)?;
+                    end = 0;
+                }
+                None => {
+                    // No '\n' inside the window but the file continues
+                    // further back: the line spans the whole window, so grow
+                    // it and retry. Terminates once start reaches 0.
+                    window = window.saturating_mul(2).min(end);
+                }
+            }
+            scan_stop = end;
+        }
+
+        Self::ensure_range_is_utf8(&mut file, scan_stop)?;
+        Ok(collected)
+    }
+
+    /// Decode one raw `\n`-delimited line exactly like `recent` does via
+    /// `BufRead::lines` + `trim`: invalid UTF-8 fails the whole scan, blank
+    /// lines and lines that fail JSON parsing are skipped and do not count
+    /// toward the window limit.
+    fn parse_tail_window_line(
+        raw: &[u8],
+        collected: &mut Vec<AgentMemoryEntry>,
+        limit: usize,
+    ) -> Result<(), String> {
+        let line = std::str::from_utf8(raw)
+            .map_err(|_| "Failed to read memory file: stream did not contain valid UTF-8")?;
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(());
+        }
+        if collected.len() < limit {
+            if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
+                collected.push(entry);
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate that the bytes `[0, upto)` are valid UTF-8 without parsing
+    /// them, so the backward scan in `recent_tail_window` keeps `recent`'s
+    /// behavior of failing the whole read when any part of the file is not
+    /// valid UTF-8.
+    fn ensure_range_is_utf8(file: &mut fs::File, upto: u64) -> Result<(), String> {
+        if upto == 0 {
+            return Ok(());
+        }
+        const BLOCK: usize = 64 * 1024;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("Failed to read memory file: {e}"))?;
+        let mut block = vec![0u8; BLOCK];
+        // Trailing bytes of a multi-byte character split by the block
+        // boundary; prepended to the next block before decoding.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut done = 0u64;
+        while done < upto {
+            let want = ((upto - done) as usize).min(BLOCK);
+            file.read_exact(&mut block[..want])
+                .map_err(|e| format!("Failed to read memory file: {e}"))?;
+            carry.extend_from_slice(&block[..want]);
+            match std::str::from_utf8(&carry) {
+                Ok(_) => carry.clear(),
+                Err(e) => {
+                    if e.error_len().is_none() && done as usize + want < upto as usize {
+                        // Incomplete only because the character may continue
+                        // in the next block; keep it and retry.
+                        carry.drain(..e.valid_up_to());
+                    } else {
+                        return Err(
+                            "Failed to read memory file: stream did not contain valid UTF-8"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            done += want as u64;
+        }
+        Ok(())
     }
 
     /// 批量应用“删除 + 新增”变更。先准备全部目标内容，再在同一主文件锁内提交；
@@ -1083,6 +1230,53 @@ mod tests {
         let out = store.search("登陆失败", 3).unwrap();
         assert!(!out.is_empty());
         assert!(out.iter().any(|(x, _)| x.note.contains("登录失败")));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_dedup_scans_tail_window_across_bad_lines() {
+        let path = std::env::temp_dir().join(format!(
+            "rt_mem_tail_window_{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = MemoryStore::for_tests_with_path(path.clone());
+        let mk = |note: &str| AgentMemoryEntry {
+            id: None,
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            category: "self_note".to_string(),
+            note: note.to_string(),
+            tags: Vec::new(),
+            source: Some("session:test".to_string()),
+            priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+        // Write the JSONL directly with trailing corrupt/blank lines to cover
+        // the backward scan's tolerance for bad tail lines.
+        let mut buf = String::new();
+        for i in 0..5 {
+            buf.push_str(&serde_json::to_string(&mk(&format!("note-{i}"))).unwrap());
+            buf.push('\n');
+        }
+        buf.push_str("not-json\n\n");
+        std::fs::write(&path, buf).unwrap();
+
+        // Duplicate of the newest good entry: must hit the tail-window dedup.
+        store.append(&mk("note-4")).unwrap();
+        // Duplicate of an older-but-still-in-window entry: deduped too.
+        store.append(&mk("note-0")).unwrap();
+        // A genuinely new note must be appended.
+        store.append(&mk("brand-new")).unwrap();
+
+        let recent = store.recent(20).unwrap();
+        assert_eq!(recent.iter().filter(|e| e.note == "note-4").count(), 1);
+        assert_eq!(recent.iter().filter(|e| e.note == "note-0").count(), 1);
+        assert!(recent.iter().any(|e| e.note == "brand-new"));
+
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1896,12 +2090,12 @@ impl Default for MemoryImportance {
 }
 
 impl MemoryStore {
-    /// 修剪低价值记忆
+    /// Prune low-value memories.
     ///
-    /// 删除满足以下条件的记忆：
-    /// - 重要性分数 < min_score
-    /// - 优先级 < 200（非高优先级）
-    /// - 90 天未使用
+    /// Removes memories that satisfy all of:
+    /// - importance score < min_score
+    /// - priority < 200 (not high priority)
+    /// - older than max_age_days
     pub fn prune_low_value_memories(
         &self,
         min_score: f64,
@@ -1933,48 +2127,50 @@ impl MemoryStore {
 
         let removed_count = to_remove.len();
 
-        // 执行删除
-        for id in to_remove {
-            if let Some(id) = id {
-                self.remove_by_id(&id)?;
-            }
+        // Batch removal: one load, one filter pass against the id set, one
+        // rewrite. Sequentially filtering per id (the old behavior) yields
+        // the same surviving set as this single pass, and a rewrite with no
+        // matching id still replaces the file with its parseable entries, so
+        // missing ids are handled the same way as before.
+        let ids_to_remove: Vec<String> = to_remove.into_iter().flatten().collect();
+        if !ids_to_remove.is_empty() {
+            let id_set: FxHashSet<String> = ids_to_remove.iter().cloned().collect();
+            super::with_memory_file_lock(&self.path, || {
+                // Same enumeration as all(): the old per-id removal reloaded
+                // through all(), so entries scanned from archives were folded
+                // back into the main file on rewrite. Keep that behavior.
+                let entries = self.load_entries_search_order()?;
+                let surviving: Vec<AgentMemoryEntry> = entries
+                    .into_iter()
+                    .filter(|e| e.id.as_deref().map_or(true, |id| !id_set.contains(id)))
+                    .collect();
+                let mut output = String::new();
+                for entry in &surviving {
+                    let serialized = serde_json::to_string(entry)
+                        .map_err(|e| format!("Failed to serialize memory entry: {e}"))?;
+                    output.push_str(&serialized);
+                    output.push('\n');
+                }
+                // Atomic tmp + rename write: a failed rewrite leaves the
+                // original file intact instead of the half-written state the
+                // old truncate-then-write loop could produce.
+                atomic_write_file(&self.path, output.as_bytes())
+                    .map_err(|e| format!("Failed to write memory file: {e}"))?;
+
+                // Same index handling as before: delete each removed id and
+                // refresh the signature; failures only affect drift detection
+                // on the next index open.
+                if let Some(idx) = memory_index_for(&self.path) {
+                    for id in &ids_to_remove {
+                        let _ = idx.delete_id(id);
+                    }
+                    let _ = idx.refresh_signature();
+                }
+                Ok(())
+            })?;
         }
 
         Ok(removed_count)
-    }
-
-    /// 根据 ID 删除记忆
-    fn remove_by_id(&self, id: &str) -> Result<(), String> {
-        let entries = self.all()?;
-        let new_entries: Vec<AgentMemoryEntry> = entries
-            .into_iter()
-            .filter(|e| e.id.as_deref() != Some(id))
-            .collect();
-
-        // 重写文件
-        super::with_memory_file_lock(&self.path, || {
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&self.path)
-                .map_err(|e| format!("Failed to open memory file: {e}"))?;
-
-            for entry in new_entries {
-                let serialized = serde_json::to_string(&entry)
-                    .map_err(|e| format!("Failed to serialize memory entry: {e}"))?;
-                writeln!(file, "{}", serialized)
-                    .map_err(|e| format!("Failed to write memory entry: {e}"))?;
-            }
-
-            // 同步删除 SQLite 索引；失败只 trace，下次 search 启动时漂移检测会重建。
-            if let Some(idx) = memory_index_for(&self.path) {
-                let _ = idx.delete_id(id);
-                let _ = idx.refresh_signature();
-            }
-
-            Ok(())
-        })
     }
 
     /// 重写整个 JSONL 文件（原子写：tmp → rename）。
@@ -1990,10 +2186,60 @@ impl MemoryStore {
             .map_err(|e| format!("Failed to write memory file: {}", e))
     }
 
-    /// 获取所有记忆
+    /// Get all memories.
     pub fn all(&self) -> Result<Vec<AgentMemoryEntry>, String> {
-        self.search("", usize::MAX)
-            .map(|results| results.into_iter().map(|(e, _score)| e).collect())
+        // Direct collection path, equivalent to the old
+        // `search("", usize::MAX)`: an empty query tokenizes to no query
+        // tokens, so BM25 scores exactly 0.0 for every document; score
+        // normalization keeps 0.0 (max is 0) and the priority boost keeps
+        // +0.0 (its factor is >= 0.5), so both stable sorts preserve document
+        // order and `search` degenerates to "all parseable entries in scan
+        // order". The FTS fast path can never trigger there because it
+        // requires `candidates.len() >= usize::MAX`; skipping it only omits
+        // one best-effort index probe. `record_hits` below mirrors the LFU
+        // accounting `search` performs on the entries it returns.
+        let entries = self.load_entries_search_order()?;
+        if let Some(idx) = memory_index_for(&self.path) {
+            let ids: Vec<String> = entries.iter().filter_map(|e| e.id.clone()).collect();
+            if !ids.is_empty() {
+                if let Err(e) = idx.record_hits(&ids) {
+                    trace_memory_event(
+                        "memory.index.hits_failed",
+                        "MemoryIndex record_hits failed",
+                        &[("path", self.path.display().to_string()), ("error", e)],
+                    );
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Collect every parseable entry in the exact order `search` scans:
+    /// `memory_files_to_scan(false)` order, each file front to back,
+    /// skipping blank and unparseable lines. Used by `all` and by batch
+    /// rewrites that must observe exactly what `all` used to observe.
+    fn load_entries_search_order(&self) -> Result<Vec<AgentMemoryEntry>, String> {
+        let mut entries = Vec::new();
+        for p in self.memory_files_to_scan(false)? {
+            if !p.exists() {
+                continue;
+            }
+            let file =
+                fs::File::open(&p).map_err(|e| format!("Failed to read memory file: {e}"))?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line.map_err(|e| format!("Failed to read memory file: {e}"))?;
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) else {
+                    continue;
+                };
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
     }
 
     /// 获取全部记忆（含全部轮转归档，不含 legacy 迁移备份）。
@@ -2185,6 +2431,56 @@ mod retention_tests {
     /// P0-1 回归：原实现的双删 bug 会在配额满后误删紧邻 priority=255 的条目，
     /// 这里制造一份"低优先级 + 永久"混合，断言 enforce 后所有 priority=255
     /// 都还在，且配额被压回 max_entries 之内。
+    #[test]
+    fn prune_low_value_removes_matching_ids_in_one_pass() {
+        let path = unique_path("prune_batch");
+        let mut all = Vec::new();
+        // Old low-priority entries: must be pruned.
+        for i in 0..3 {
+            all.push(entry_with_id(
+                &format!("old-{i}"),
+                "tool_stat",
+                &format!("old-{i}"),
+                "2025-01-01T00:00:00Z",
+                50,
+            ));
+        }
+        // Old but permanent: must survive regardless of age.
+        all.push(entry_with_id(
+            "perm",
+            "safety_rules",
+            "keep",
+            "2025-01-01T00:00:00Z",
+            255,
+        ));
+        // Low priority but too recent: must survive.
+        all.push(entry_with_id(
+            "fresh",
+            "tool_stat",
+            "fresh",
+            "2099-01-01T00:00:00Z",
+            50,
+        ));
+        write_lines(&path, &all);
+
+        let store = MemoryStore::for_tests_with_path(path.clone());
+        // tool_stat with no general tags scores 0.1 < 0.2; safety_rules and
+        // priority >= 200 are exempt, so exactly the three old-* entries go.
+        let removed = store.prune_low_value_memories(0.2, 365).unwrap();
+        assert_eq!(removed, 3);
+
+        let kept = read_entries(&path);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|e| e.id.as_deref() == Some("perm")));
+        assert!(kept.iter().any(|e| e.id.as_deref() == Some("fresh")));
+        assert!(
+            kept.iter()
+                .all(|e| !e.id.as_deref().unwrap_or("").starts_with("old-"))
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn enforce_max_entries_keeps_all_permanent_entries() {
         let path = unique_path("enforce_perm");

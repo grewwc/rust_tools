@@ -2,6 +2,7 @@ use super::inline_recovery::{
     collect_valid_tool_calls, ensure_tool_calls_section_open, normalize_inline_tool_call_markup,
     recover_inline_tool_calls,
 };
+use std::cell::RefCell;
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
@@ -1383,18 +1384,23 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
     }
 
     let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
-    let (body, body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
-        &body_lines,
-        marker_lines,
-        fold.rewrite_right_margin_cols,
-        fold.max_visible_lines,
-    );
-    if !body.is_empty() {
-        out.write_all(body.as_bytes())?;
-    }
+    THINKING_FOLD_BODY_BUF.with(|buf| -> io::Result<()> {
+        let mut buf = buf.borrow_mut();
+        let (body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
+            &body_lines,
+            marker_lines,
+            fold.rewrite_right_margin_cols,
+            fold.max_visible_lines,
+            &mut buf,
+        );
+        if !buf.is_empty() {
+            out.write_all(buf.as_bytes())?;
+        }
+        fold.window_rows = body_rows;
+        fold.rendered_body_lines = rendered_body_lines;
+        Ok(())
+    })?;
     out.flush()?;
-    fold.window_rows = body_rows;
-    fold.rendered_body_lines = rendered_body_lines;
     Ok(())
 }
 
@@ -1515,22 +1521,30 @@ fn finalize_fold_to(
         fold.max_visible_lines = 0;
     }
     let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
-    let (body, body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
-        &body_lines,
-        marker_lines,
-        fold.rewrite_right_margin_cols,
-        fold.max_visible_lines,
-    );
-    fold.max_visible_lines = saved_max_visible_lines;
-    if !body.is_empty() {
-        out.write_all(body.as_bytes())?;
-    }
-    fold.window_rows = body_rows;
-    fold.rendered_body_lines = rendered_body_lines;
+    let max_visible_rows = fold.max_visible_lines;
+    let mut final_body_rows = 0usize;
+    THINKING_FOLD_BODY_BUF.with(|buf| -> io::Result<()> {
+        let mut buf = buf.borrow_mut();
+        let (body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
+            &body_lines,
+            marker_lines,
+            fold.rewrite_right_margin_cols,
+            max_visible_rows,
+            &mut buf,
+        );
+        fold.max_visible_lines = saved_max_visible_lines;
+        if !buf.is_empty() {
+            out.write_all(buf.as_bytes())?;
+        }
+        fold.window_rows = body_rows;
+        fold.rendered_body_lines = rendered_body_lines;
+        final_body_rows = body_rows;
+        Ok(())
+    })?;
 
     if !collapse_body {
         // Subagent preview keeps its footer; thinking's scale info was already written into the in-place-replaced header.
-        if body_rows > 0 {
+        if final_body_rows > 0 {
             out.write_all(b"\r\n")?;
         }
         write!(
@@ -1603,23 +1617,42 @@ fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<St
 /// end with a newline and the cursor always stays on the last line, so xterm.js does not interpret a trailing LF as extra scrolling.
 fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
     let (lines, marker_lines) = thinking_fold_window_lines(fold);
-    let (window, rows, _) = render_thinking_fold_window_lines(
-        &lines,
-        marker_lines,
-        fold.rewrite_right_margin_cols,
-        fold.max_visible_lines,
-    );
-    (window, rows)
+    THINKING_FOLD_BODY_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        let (rows, _) = render_thinking_fold_window_lines(
+            &lines,
+            marker_lines,
+            fold.rewrite_right_margin_cols,
+            fold.max_visible_lines,
+            &mut buf,
+        );
+        (buf.clone(), rows)
+    })
 }
 
+// Scratch buffer reused across thinking-fold body renders so each redraw does not
+// rebuild a zero-capacity String. Purely an allocation-reuse optimization: the
+// renderer clears the buffer before every rebuild, so the bytes handed to the
+// terminal are identical to building a fresh String each time.
+thread_local! {
+    static THINKING_FOLD_BODY_BUF: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Render the **body** of the fold window (fold summary + recent visible lines), without the header.
+/// The header is anchored and printed separately by `write_fold_header`. Writes the body into
+/// `out` (cleared first) and returns the number of physical body lines plus the plain-text rows
+/// kept for later width recomputation; the body does not end with a newline and the cursor always
+/// stays on the last line, so xterm.js does not interpret a trailing LF as extra scrolling.
 fn render_thinking_fold_window_lines(
     lines: &[String],
     marker_lines: usize,
     rewrite_right_margin_cols: usize,
     max_visible_rows: usize,
-) -> (String, usize, Vec<String>) {
+    out: &mut String,
+) -> (usize, Vec<String>) {
+    out.clear();
     if lines.is_empty() {
-        return (String::new(), 0, Vec::new());
+        return (0, Vec::new());
     }
 
     let reserve_cols = THINKING_FOLD_BODY_INDENT_WIDTH + rewrite_right_margin_cols;
@@ -1658,7 +1691,6 @@ fn render_thinking_fold_window_lines(
             .map(|line| (line, false)),
     );
 
-    let mut out = String::new();
     let mut rendered_lines = Vec::with_capacity(rows_to_render.len());
     // Folded body has fixed indentation. The body keeps at most max_visible_rows wrapped physical lines; if more
     // content must be hidden, the single-line fold hint does not count against the body budget. Each wrapped segment
@@ -1685,7 +1717,7 @@ fn render_thinking_fold_window_lines(
         rendered_lines.push(rendered_line);
     }
 
-    (out, rows, rendered_lines)
+    (rows, rendered_lines)
 }
 
 fn maybe_write_stream_content(

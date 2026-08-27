@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -512,6 +513,64 @@ fn div2(a: &str, b: &str, num_digit_to_keep: i32) -> String {
     let decimal_pos: isize = a.len() as isize - (d.saturating_sub(d1) as isize);
     let total_digits = a.len() + keep;
     let mut res = String::new();
+
+    // Fast path: when both operands are pure digit strings (the normal
+    // case after normalization above), run long division on in-place
+    // MSB-first digit buffers instead of rebuilding String values through
+    // do_div/mul2/minus2 for every dividend digit. The fast path is gated
+    // so inputs containing unexpected non-digit bytes keep flowing through
+    // the original loop below, preserving its byte-for-byte behavior.
+    if a.bytes().all(|c| c.is_ascii_digit()) && b.bytes().all(|c| c.is_ascii_digit()) {
+        // Buffers are most-significant-first digit values, canonical:
+        // no leading zeros, a lone `[0]` stands for zero. At loop entry
+        // the remainder satisfies `remainder < 10*b`, so the quotient
+        // digit stays within 0..=9.
+        let a_digits: Vec<u8> = a.bytes().map(|c| c - b'0').collect();
+        let b_digits: Vec<u8> = b.bytes().map(|c| c - b'0').collect();
+        let mut remainder: Vec<u8> = vec![0];
+
+        for i in 0..total_digits {
+            // Append the next dividend digit ('0' past the end), then
+            // restore the canonical form the old pipeline enforced every
+            // iteration (remove_leading_zero keeps at least one digit and
+            // turned empty results into "0"; pushing exactly one digit
+            // means the buffer is never empty here).
+            remainder.push(if i < a_digits.len() { a_digits[i] } else { 0 });
+            while remainder.len() > 1 && remainder[0] == 0 {
+                remainder.remove(0);
+            }
+
+            // Quotient digit: largest d in 0..=9 with b*d <= remainder.
+            // That is the unique digit the binary search inside do_div
+            // settles on, including its b == "1" shortcut: the invariant
+            // remainder < b before appending guarantees the appended
+            // buffer holds a single digit, whose value equals the shortcut
+            // digit.
+            let mut digit = 0u8;
+            for cand in (1..=9u8).rev() {
+                if cmp_digit_slice(&mul_digit_slice(&b_digits, cand), &remainder)
+                    != Ordering::Greater
+                {
+                    digit = cand;
+                    break;
+                }
+            }
+            res.push((b'0' + digit) as char);
+
+            // Next remainder == remainder - b*digit, always >= 0 by the
+            // digit choice. Rendered in the same canonical no-leading-zero
+            // form minus2 produced for these integer-only operands.
+            let product = mul_digit_slice(&b_digits, digit);
+            sub_digit_slice_in_place(&mut remainder, &product);
+
+            if i as isize == decimal_pos - 1 && i + 1 < a_digits.len() {
+                res.push('.');
+            }
+        }
+
+        return finish_div2(res, decimal_pos, num_digit_to_keep, is_minus);
+    }
+
     let mut remainder = "0".to_string();
 
     for i in 0..total_digits {
@@ -534,6 +593,18 @@ fn div2(a: &str, b: &str, num_digit_to_keep: i32) -> String {
         }
     }
 
+    finish_div2(res, decimal_pos, num_digit_to_keep, is_minus)
+}
+
+/// Shared tail of `div2`: dot insertion, leading-zero cleanup, sign
+/// handling, rounding, and suffix-zero trimming operate on the digit
+/// string assembled by either division loop.
+fn finish_div2(
+    mut res: String,
+    decimal_pos: isize,
+    num_digit_to_keep: i32,
+    is_minus: bool,
+) -> String {
     if !res.contains('.') {
         if decimal_pos <= 0 {
             res = format!("0.{}{}", "0".repeat((-decimal_pos) as usize), res);
@@ -557,6 +628,71 @@ fn div2(a: &str, b: &str, num_digit_to_keep: i32) -> String {
     }
     res = round(&res, num_digit_to_keep);
     remove_suffix_zero(&res)
+}
+
+/// Numeric comparison of canonical most-significant-first digit vectors:
+/// longer means greater, then lexicographic order breaks length ties.
+fn cmp_digit_slice(a: &[u8], b: &[u8]) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// Multiply canonical most-significant-first digit values by a single
+/// digit `d`. Inputs here are canonical and the divisor already passed the
+/// `b == "0"` guard, so the top limb of the product is nonzero whenever
+/// `d > 0`.
+fn mul_digit_slice(b: &[u8], d: u8) -> Vec<u8> {
+    if d == 0 {
+        return vec![0];
+    }
+    let mut out = Vec::with_capacity(b.len() + 1);
+    let mut carry = 0u16;
+    for &limb in b.iter().rev() {
+        let total = u16::from(limb) * u16::from(d) + carry;
+        out.push((total % 10) as u8);
+        carry = total / 10;
+    }
+    while carry > 0 {
+        out.push((carry % 10) as u8);
+        carry /= 10;
+    }
+    out.reverse();
+    out
+}
+
+/// Subtract canonical most-significant-first digit values `product` from
+/// `lhs` in place; `lhs >= product` holds because the quotient digit was
+/// chosen as the largest d with `b*d <= lhs`. Renormalizes `lhs` to the
+/// canonical no-leading-zero form (keeping `[0]` for zero).
+fn sub_digit_slice_in_place(lhs: &mut Vec<u8>, product: &[u8]) {
+    let lhs_len = lhs.len();
+    let prod_len = product.len();
+    let mut borrow = 0i8;
+    for k in 0..prod_len {
+        let li = lhs_len - 1 - k;
+        let v = lhs[li] as i8 - product[prod_len - 1 - k] as i8 - borrow;
+        if v < 0 {
+            lhs[li] = (v + 10) as u8;
+            borrow = 1;
+        } else {
+            lhs[li] = v as u8;
+            borrow = 0;
+        }
+    }
+    let mut k = prod_len;
+    while borrow > 0 && k < lhs_len {
+        let li = lhs_len - 1 - k;
+        let v = lhs[li] as i8 - borrow;
+        if v < 0 {
+            lhs[li] = (v + 10) as u8;
+            borrow = 1;
+        } else {
+            lhs[li] = v as u8;
+            borrow = 0;
+        }
+        k += 1;
+    }
+    let first_nonzero = lhs.iter().position(|&d| d != 0).unwrap_or(lhs_len - 1);
+    lhs.drain(..first_nonzero);
 }
 
 #[cfg(test)]

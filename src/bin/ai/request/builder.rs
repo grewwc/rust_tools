@@ -70,6 +70,58 @@ fn estimate_prompt_tokens(messages: &[Message]) -> usize {
     chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
 }
 
+/// Character count of the compact JSON text `serde_json::to_string` produces
+/// for `value`, computed without materializing that text. Every branch mirrors
+/// serde_json's compact formatter exactly:
+/// - strings: 2 quotes + per-char contributions (`\"`, `\\`, `\b`, `\t`, `\n`,
+///   `\f`, `\r` are two chars each, other control chars become `\u00xx`
+///   (6 chars), everything else is emitted verbatim = 1 char per scalar);
+/// - containers: delimiters plus single-char commas/colons;
+/// - numbers: delegated to `serde_json::to_string` itself (tiny transient
+///   allocation per numeric leaf only), so integer/float formatting — the one
+///   formatter whose output is non-trivial to replicate — is identical by
+///   construction regardless of serde_json feature flags.
+/// The token-estimation caller only consumes this count, so replacing the old
+/// full-schema `to_string` keeps the estimated number provably identical
+/// (guarded by the parity tests at the bottom of this file) while avoiding a
+/// potentially multi-megabyte string allocation per request.
+fn compact_json_char_len(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(_) => serde_json::to_string(value)
+            .map(|encoded| encoded.chars().count())
+            .unwrap_or(0),
+        Value::String(text) => json_string_char_len(text),
+        Value::Array(items) => {
+            2 + items
+                .iter()
+                .map(compact_json_char_len)
+                .sum::<usize>()
+                + items.len().saturating_sub(1)
+        }
+        Value::Object(map) => {
+            2 + map
+                .iter()
+                .map(|(key, item)| json_string_char_len(key) + 1 + compact_json_char_len(item))
+                .sum::<usize>()
+                + map.len().saturating_sub(1)
+        }
+    }
+}
+
+fn json_string_char_len(text: &str) -> usize {
+    2 + text
+        .chars()
+        .map(|ch| match ch {
+            '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+            ch if (ch as u32) < 0x20 => 6,
+            _ => 1,
+        })
+        .sum::<usize>()
+}
+
 /// 估算工具 schema 的 prompt token 数。工具定义（name/description/JSON Schema）
 /// 会随每次请求发送并计入 prompt 占用；启用大量工具/MCP 时体积可观。以序列化后
 /// 的字符数按同一保守换算折算。`None` / 空工具集贡献 0。
@@ -77,10 +129,7 @@ fn estimate_tools_tokens(tools: Option<&Value>) -> usize {
     let Some(tools) = tools else {
         return 0;
     };
-    let chars = serde_json::to_string(tools)
-        .map(|s| s.chars().count())
-        .unwrap_or(0);
-    chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
+    compact_json_char_len(tools).div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
 }
 
 /// 估算本次请求的输入 token：messages + tools schema。
@@ -205,5 +254,137 @@ pub(super) fn build_request_body<'a>(
         reasoning_items,
         reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
         estimated_prompt_tokens: est_prompt,
+    }
+}
+
+#[cfg(test)]
+mod compact_json_char_len_tests {
+    use super::{compact_json_char_len, json_string_char_len};
+    use serde_json::{Map, Value, json};
+
+    /// Ground truth: the walker must agree with `serde_json::to_string(..)`
+    /// char count for every value. This is the parity guard that lets
+    /// `estimate_tools_tokens` skip materializing the encoded schema string.
+    fn assert_parity(value: &Value) {
+        let expected = serde_json::to_string(value)
+            .expect("test value must serialize")
+            .chars()
+            .count();
+        assert_eq!(
+            compact_json_char_len(value),
+            expected,
+            "char-len parity failed for {value}"
+        );
+    }
+
+    #[test]
+    fn scalars_and_escaping_match_compact_formatter() {
+        assert_parity(&Value::Null);
+        assert_parity(&Value::Bool(true));
+        assert_parity(&Value::Bool(false));
+
+        // Every ASCII control char plus quote/backslash escaping; serde_json
+        // escapes controls < 0x20 and emits everything else verbatim.
+        for byte in 0u32..0x20 {
+            let ch = char::from_u32(byte).expect("ASCII control char");
+            assert_eq!(json_string_char_len(&ch.to_string()), 2 + { match ch {
+                '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+                _ => 6,
+            } });
+            assert_parity(&json!({ "k": ch.to_string() }));
+        }
+        for text in ["\"", "\\", "a\"b\\c", "\u{7f}", "中文", "🙂", "line\nbreak"] {
+            assert_parity(&json!({ text: text }));
+        }
+    }
+
+    #[test]
+    fn numbers_match_serde_json_formatting_including_floats() {
+        for value in [
+            json!(0),
+            json!(-1),
+            json!(i64::MIN),
+            json!(i64::MAX),
+            json!(u64::MAX),
+            json!(0.0),
+            json!(-0.0),
+            json!(0.3),
+            json!(1.5),
+            json!(1e100),
+            json!(5e-324),
+            json!(f64::MIN),
+            json!(f64::MAX),
+            json!(f64::INFINITY),
+            json!(f64::NEG_INFINITY),
+            json!(f64::NAN),
+            Value::Number(serde_json::Number::from_f64(9007199254740993.0).unwrap()),
+        ] {
+            assert_parity(&value);
+        }
+    }
+
+    #[test]
+    fn containers_and_empty_shapes_match() {
+        for value in [
+            json!([]),
+            json!([[]]),
+            json!({}),
+            json!([{}, {}]),
+            json!({"a": []}),
+            json!({"a": {"b": [1, [2, {"c": null}]]}}),
+            json!([true, false, null, -2.5, "s", {"k": [1]}]),
+        ] {
+            assert_parity(&value);
+        }
+    }
+
+    #[test]
+    fn randomized_values_stay_in_parity_with_serde_json() {
+        // Deterministic xorshift PRNG so failures are reproducible.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        fn build(rng: &mut impl FnMut() -> u64, depth: u32) -> Value {
+            let pick = (rng()) % 100;
+            if depth == 0 || pick < 30 {
+                return match (rng()) % 6 {
+                    0 => Value::Null,
+                    1 => Value::Bool(rng() % 2 == 0),
+                    2 => Value::from((rng() as i64).wrapping_mul(1_000_003)),
+                    3 => Value::from(f64::from_bits(rng())),
+                    4 => Value::from(rng()),
+                    _ => {
+                        // Sample control chars / quotes / non-ASCII into strings.
+                        let unit = (rng() % 0x2FFF) as u32;
+                        let ch = match char::from_u32(unit) {
+                            Some(ch) if ch != '\u{0}' => ch,
+                            _ => 'x',
+                        };
+                        Value::String(ch.to_string())
+                    }
+                };
+            }
+            if pick < 65 {
+                let len = (rng() % 4) as usize;
+                return Value::Array((0..len).map(|_| build(rng, depth - 1)).collect());
+            }
+            let len = (rng() % 4) as usize;
+            let mut map = Map::new();
+            for i in 0..len {
+                let key_char = char::from_u32(0x20 + (rng() % 0x40) as u32).unwrap_or('k');
+                map.insert(format!("k{key_char}{i}"), build(rng, depth - 1));
+            }
+            Value::Object(map)
+        }
+
+        for _ in 0..2_000 {
+            let value = build(&mut next, 5);
+            assert_parity(&value);
+        }
     }
 }

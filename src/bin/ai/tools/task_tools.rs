@@ -3380,18 +3380,19 @@ fn char_ngram_set_from_text(input: &str) -> FxHashSet<String> {
     set
 }
 
-/// Subagent auto-selection: score by Jaccard overlap of the normalized-text
-/// character n-gram sets.
-fn auto_subagent_score(
-    agent: &AgentManifest,
-    task_text: &str,
+/// Subagent auto-selection scoring: Jaccard overlap of two prebuilt normalized-
+/// text character n-gram sets (the task-text query set vs. one candidate's
+/// document set). Callers cache these sets once per selection round and reuse
+/// them across comparisons; scoring is pure integer counting plus a single
+/// division, so reusing the same set values yields bit-identical scores.
+fn char_ngram_jaccard(
+    query: &FxHashSet<String>,
+    doc: &FxHashSet<String>,
 ) -> f64 {
-    let query = char_ngram_set_from_text(task_text);
-    let doc = char_ngram_set_from_text(&subagent_document_text(agent));
     if query.is_empty() || doc.is_empty() {
         return 0.0;
     }
-    let intersection = query.intersection(&doc).count();
+    let intersection = query.intersection(doc).count();
     let union = query.len() + doc.len() - intersection;
     if union == 0 {
         return 0.0;
@@ -3453,15 +3454,28 @@ fn select_subagent<'a>(
 
     let task_text = format!("{description}\n{prompt}");
 
+    // Build the query n-gram set once plus one document set per candidate,
+    // then reuse the cached sets in every pairwise comparison instead of
+    // rebuilding them inside each scorer call. Each score is the same formula
+    // over the same set values as before, so results stay bit-identical.
+    let query_ngrams = char_ngram_set_from_text(&task_text);
+    let doc_ngrams: Vec<FxHashSet<String>> = subagents
+        .iter()
+        .map(|agent| char_ngram_set_from_text(&subagent_document_text(agent)))
+        .collect();
+
     subagents
         .into_iter()
-        .max_by(|a, b| {
-            auto_subagent_score(a, &task_text)
-                .total_cmp(&auto_subagent_score(b, &task_text))
-                .then_with(|| b.name.cmp(&a.name))
+        .enumerate()
+        .max_by(|(index_a, agent_a), (index_b, agent_b)| {
+            char_ngram_jaccard(&query_ngrams, &doc_ngrams[*index_a])
+                .total_cmp(&char_ngram_jaccard(&query_ngrams, &doc_ngrams[*index_b]))
+                .then_with(|| agent_b.name.cmp(&agent_a.name))
         })
-        .map(|agent| {
-            let score = auto_subagent_score(agent, &task_text);
+        .map(|(index, agent)| {
+            // Same Jaccard value over the same cached sets as any comparison,
+            // so the reported score matches what pre-refactor code reported.
+            let score = char_ngram_jaccard(&query_ngrams, &doc_ngrams[index]);
             SelectedSubagent {
                 agent,
                 auto_selected: true,

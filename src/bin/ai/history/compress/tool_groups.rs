@@ -985,6 +985,23 @@ pub(super) fn plan_early_tool_groups(
     }
 }
 
+/// Number of `assistant(tool_calls)` group anchors, matching the collection in
+/// [`plan_early_tool_groups`]. Lets ladder callers skip planning (and the
+/// whole-history clone it performs) for windows that cannot fold anything.
+pub(super) fn count_tool_group_anchors(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|m| {
+            let has_calls = m
+                .tool_calls
+                .as_ref()
+                .map(|calls| !calls.is_empty())
+                .unwrap_or(false);
+            m.role == "assistant" && has_calls
+        })
+        .count()
+}
+
 /// 非 speculative 调用的便利入口：规划成功后立即提交；归档失败则保留原消息，
 /// 绝不生成指向不存在证据的折叠 stub。
 pub(super) fn fold_early_tool_groups(

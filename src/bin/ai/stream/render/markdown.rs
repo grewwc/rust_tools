@@ -35,10 +35,70 @@ impl MathBlockDelimiter {
     }
 
     fn closes(self, line: &str) -> bool {
-        matches!(
-            (self, line),
-            (Self::Dollars, "$$") | (Self::Brackets, "\\]")
-        )
+        matches!((self, line), (Self::Dollars, "$$") | (Self::Brackets, "\\]"))
+    }
+}
+
+/// Incrementally classified tail of `line_buf.trim_start()`, advanced per arriving
+/// char so the math-candidate decision stays O(1) instead of re-scanning the whole
+/// buffered line each time. States cover every value `trim_start` can yield while
+/// its length is ≤ 2; once that is impossible (`Decided`), appending more chars can
+/// never bring the trimmed line back into the candidate set because the trimmed
+/// tail only ever grows, so the classification is stable for any input sequence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MathCandidateTail {
+    /// Every char seen so far is whitespace, i.e. `trim_start(line_buf)` is "".
+    Blank,
+    /// Trimmed tail is exactly `$`.
+    Dollar,
+    /// Trimmed tail is exactly `\`.
+    Backslash,
+    /// Trimmed tail is exactly `$$`.
+    DollarDollar,
+    /// Trimmed tail is exactly `\[`.
+    BracketOpen,
+    /// Trimmed tail is exactly `\]`.
+    BracketClose,
+    /// The trimmed tail can no longer be one of the candidate tokens.
+    Decided,
+}
+
+impl MathCandidateTail {
+    fn advance(self, ch: char) -> Self {
+        // Leading whitespace is invisible to `trim_start`, so whitespace keeps the
+        // blank state. Whitespace *after* non-whitespace content extends past the
+        // short tokens (only the leading run is trimmed), which rules them out.
+        if ch.is_whitespace() {
+            return if self == Self::Blank {
+                Self::Blank
+            } else {
+                Self::Decided
+            };
+        }
+        match self {
+            Self::Blank => match ch {
+                '$' => Self::Dollar,
+                '\\' => Self::Backslash,
+                _ => Self::Decided,
+            },
+            Self::Dollar => {
+                if ch == '$' {
+                    Self::DollarDollar
+                } else {
+                    Self::Decided
+                }
+            }
+            Self::Backslash => match ch {
+                '[' => Self::BracketOpen,
+                ']' => Self::BracketClose,
+                _ => Self::Decided,
+            },
+            _ => Self::Decided,
+        }
+    }
+
+    fn is_math_candidate(self) -> bool {
+        self != Self::Decided
     }
 }
 
@@ -83,6 +143,19 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     html_table_indent: String,
     // 数学块缓冲区：积累 $$/\[/\] 之间的内容，块结束后一次性渲染
     math_block_buf: Vec<String>,
+    /// Number of chars currently buffered in `line_buf`. Maintained incrementally
+    /// at every mutation point (the push/take helpers below are the only ones) so
+    /// per-char handling stays O(1) instead of re-scanning the whole growing line.
+    line_char_count: usize,
+    /// Incremental classification of `line_buf.trim_start()`; see [`MathCandidateTail`].
+    math_candidate_tail: MathCandidateTail,
+    /// Whether `line_preview_height` no longer matches the already-echoed portion
+    /// of `line_buf`. Echo paths mark this stale instead of recomputing the
+    /// ANSI-aware height after every char; the height is recomputed lazily right
+    /// before it is consumed or read. That yields the same value as eager
+    /// recomputation because `line_buf` cannot change between the last echo of a
+    /// line and its consumption.
+    line_preview_height_stale: bool,
 }
 
 impl MarkdownStreamRenderer {
@@ -117,6 +190,9 @@ impl MarkdownStreamRenderer {
             html_table_preview_height: 0,
             html_table_indent: String::new(),
             math_block_buf: Vec::new(),
+            line_char_count: 0,
+            math_candidate_tail: MathCandidateTail::Blank,
+            line_preview_height_stale: false,
         }
     }
 
@@ -150,7 +226,7 @@ impl MarkdownStreamRenderer {
                 continue;
             }
 
-            self.line_buf.push(ch);
+            self.push_line_char(ch);
             self.handle_char(out, ch)?;
             self.bol = false;
         }
@@ -162,10 +238,10 @@ impl MarkdownStreamRenderer {
         self.dimmed = dimmed;
         for segment in text.split_inclusive('\n') {
             if let Some(line) = segment.strip_suffix('\n') {
-                self.line_buf.push_str(line);
+                self.push_line_str(line);
                 self.handle_newline(out)?;
             } else {
-                self.line_buf.push_str(segment);
+                self.push_line_str(segment);
             }
         }
         out.flush()?;
@@ -202,11 +278,13 @@ impl MarkdownStreamRenderer {
                 }
                 self.bol = true;
             }
-            let line = std::mem::take(&mut self.line_buf);
+            self.refresh_stale_line_preview_height();
+            let line = self.take_line_buf();
             let rendered = self.consume_line(&line, self.line_preview_emitted);
             self.math_line_candidate_buffered = false;
             self.line_preview_emitted = false;
             self.line_preview_height = 0;
+            self.line_preview_height_stale = false;
             self.code_preview_segment_width = 0;
             if !rendered.is_empty() {
                 out.write_all(rendered.as_bytes())?;
@@ -255,11 +333,13 @@ impl MarkdownStreamRenderer {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    pub(in crate::ai::stream::render) fn line_preview_height(&self) -> usize {
+    pub(in crate::ai::stream::render) fn line_preview_height(&mut self) -> usize {
+        self.refresh_stale_line_preview_height();
         self.line_preview_height
     }
 
     pub(in crate::ai::stream::render) fn set_line_preview_height(&mut self, height: usize) {
+        self.line_preview_height_stale = false;
         self.line_preview_height = height;
     }
 
@@ -269,6 +349,39 @@ impl MarkdownStreamRenderer {
 
     pub(in crate::ai::stream) fn has_unfinished_line(&self) -> bool {
         !self.line_buf.is_empty()
+    }
+
+    /// The only append path into `line_buf`, keeping [`Self::line_char_count`] and
+    /// the incremental math-candidate classification in sync with the buffer.
+    fn push_line_char(&mut self, ch: char) {
+        self.line_buf.push(ch);
+        self.line_char_count += 1;
+        self.math_candidate_tail = self.math_candidate_tail.advance(ch);
+    }
+
+    fn push_line_str(&mut self, s: &str) {
+        for ch in s.chars() {
+            self.push_line_char(ch);
+        }
+    }
+
+    /// The only reset path for `line_buf`; clears the derived incremental state so
+    /// the counters describe exactly the chars still in the buffer.
+    fn take_line_buf(&mut self) -> String {
+        self.line_char_count = 0;
+        self.math_candidate_tail = MathCandidateTail::Blank;
+        std::mem::take(&mut self.line_buf)
+    }
+
+    /// Recomputes the preview height if an echo path marked it stale; see the
+    /// `line_preview_height_stale` field for why this is equivalent to the former
+    /// per-char eager recomputation.
+    fn refresh_stale_line_preview_height(&mut self) {
+        if !self.line_preview_height_stale {
+            return;
+        }
+        self.line_preview_height = self.current_line_preview_height();
+        self.line_preview_height_stale = false;
     }
 
     pub(in crate::ai::stream::render) fn code_line_number(&self) -> usize {
@@ -295,7 +408,8 @@ impl MarkdownStreamRenderer {
             self.bol = true;
         }
 
-        let line = std::mem::take(&mut self.line_buf);
+        self.refresh_stale_line_preview_height();
+        let line = self.take_line_buf();
         self.math_line_candidate_buffered = false;
 
         // 纯空行且不在代码块/数学块/表格上下文：先缓存，不立即落地。等真实内容跟进
@@ -310,6 +424,7 @@ impl MarkdownStreamRenderer {
         {
             self.deferred_blank_lines += 1;
             self.line_preview_height = 0;
+            self.line_preview_height_stale = false;
             self.code_preview_segment_width = 0;
             return Ok(());
         }
@@ -317,7 +432,8 @@ impl MarkdownStreamRenderer {
         let rendered = self.consume_line(&line, self.line_preview_emitted);
 
         self.line_preview_emitted = false;
-        self.line_preview_height = 0;
+            self.line_preview_height = 0;
+            self.line_preview_height_stale = false;
         self.code_preview_segment_width = 0;
 
         if !rendered.is_empty() {
@@ -344,7 +460,7 @@ impl MarkdownStreamRenderer {
 
     fn handle_char(&mut self, out: &mut dyn Write, ch: char) -> io::Result<()> {
         // 真实内容行的第一个字符到达：把此前缓存的纯空行照数补回，再输出该行。
-        if self.deferred_blank_lines > 0 && self.line_buf.chars().count() == 1 {
+        if self.deferred_blank_lines > 0 && self.line_char_count == 1 {
             self.flush_deferred_blank_lines(out)?;
         }
         // 表格上下文（含潜在表头行）一律静默缓冲，不逐字 echo，也不做 cursor-up
@@ -359,9 +475,8 @@ impl MarkdownStreamRenderer {
         // 屏幕，换行后再追加 Unicode 成品，造成重复内容。行首空白也先短暂缓冲；
         // 一旦确认不是数学分隔符，就一次性补发此前缓存的前缀。
         if !self.in_code_block {
-            let trimmed = self.line_buf.trim_start();
             let is_math_candidate = self.math_block_delimiter.is_some()
-                || matches!(trimmed, "" | "$" | "$$" | "\\" | "\\[" | "\\]");
+                || self.math_candidate_tail.is_math_candidate();
             if is_math_candidate {
                 self.math_line_candidate_buffered = true;
                 return Ok(());
@@ -373,7 +488,7 @@ impl MarkdownStreamRenderer {
                 }
                 out.write_all(self.line_buf.as_bytes())?;
                 self.line_preview_emitted = true;
-                self.line_preview_height = self.current_line_preview_height();
+                self.line_preview_height_stale = true;
                 return Ok(());
             }
         }
@@ -384,15 +499,15 @@ impl MarkdownStreamRenderer {
         if self.in_code_block {
             self.handle_code_block_realtime_output(out, ch)?;
             self.line_preview_emitted = true;
-            self.line_preview_height = self.current_line_preview_height();
+            self.line_preview_height_stale = true;
             return Ok(());
         }
-        if self.line_buf.chars().count() == 1 && self.dimmed {
+        if self.line_char_count == 1 && self.dimmed {
             out.write_all(b"\x1b[2m")?;
         }
         self.emit_char(out, ch)?;
         self.line_preview_emitted = true;
-        self.line_preview_height = self.current_line_preview_height();
+        self.line_preview_height_stale = true;
         Ok(())
     }
 
@@ -510,11 +625,13 @@ impl MarkdownStreamRenderer {
                 }
                 self.bol = true;
             }
-            let line = std::mem::take(&mut self.line_buf);
+            self.refresh_stale_line_preview_height();
+            let line = self.take_line_buf();
             let rendered = self.consume_line(&line, self.line_preview_emitted);
             self.math_line_candidate_buffered = false;
             self.line_preview_emitted = false;
             self.line_preview_height = 0;
+            self.line_preview_height_stale = false;
             self.code_preview_segment_width = 0;
             if !rendered.is_empty() {
                 out.write_all(rendered.as_bytes())?;
