@@ -619,7 +619,7 @@ fn exact_replay_reasoning_survives_recent_reasoning_window() {
             &format!("glm-reasoning-{i}"),
         );
         messages.push(sanitize_message_for_persisted_history_for_model(
-            "glm-5.2-opencode",
+            "glm-5.3-flash",
             &original,
         ));
     }
@@ -636,7 +636,7 @@ fn exact_replay_reasoning_survives_recent_reasoning_window() {
 
 #[test]
 fn path_c_preserves_exact_replay_reasoning_verbatim() {
-    let model = "glm-5.2-opencode";
+    let model = "glm-5.3-flash";
     let raw_reasoning = "reasoning-state-".repeat(64);
     let assistant = sanitize_message_for_persisted_history_for_model(
         model,

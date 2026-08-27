@@ -320,16 +320,16 @@ fn deepseek_v4_flash_routes_declare_full_context_budget() {
 
 #[test]
 fn platform_changes_model_handle_but_legacy_adapter_handle_still_resolves() {
-    let volcano = "glm-5.2-volcano";
+    let volcano = "deepseek-v4-flash-volcano";
     let def = super::model_names::find_by_identifier(volcano)
-        .expect("model registry should contain volcano glm-5.2");
+        .expect("model registry should contain volcano deepseek-v4-flash");
     assert_eq!(super::model_names::model_handle(def), volcano);
-    assert_eq!(determine_model("glm-5.2-compatible"), volcano);
+    assert_eq!(determine_model("deepseek-v4-flash-compatible"), volcano);
     assert_eq!(model_platform_label(volcano), "volcano");
-    // Volcengine Coding Plan's official OpenCode config declares 1,024K context / 64K output.
+    // Volcengine Coding Plan's official config declares 1,024K context / 393,216 output.
     // It must be configured explicitly here and must not fall back to flagship's conservative 256K default window.
     assert_eq!(context_window_tokens(volcano), 1_024_000);
-    assert_eq!(max_output_tokens(volcano), Some(65_536));
+    assert_eq!(max_output_tokens(volcano), Some(393_216));
 }
 
 #[test]

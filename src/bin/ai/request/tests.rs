@@ -1015,8 +1015,8 @@ fn dashscope_deepseek_uses_model_specific_reasoning_contract() {
 }
 
 #[test]
-fn dashscope_glm_uses_top_level_effort_and_exact_reasoning_replay() {
-    const MODEL: &str = "glm-5.2-alibaba";
+fn dashscope_deepseek_uses_top_level_effort_and_exact_reasoning_replay() {
+    const MODEL: &str = "deepseek-v4-flash-0731-alibaba";
     let messages = vec![Message {
         role: "user".to_string(),
         content: Value::String("hi".to_string()),
@@ -1800,7 +1800,7 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
     };
 
     let projected = crate::ai::history::compress::sanitize_message_for_persisted_history_for_model(
-        "glm-5.2-opencode",
+        "glm-5.3",
         &assistant,
     );
     assert_ne!(
@@ -1808,18 +1808,18 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
         "请求上下文投影应携带来源模型标记"
     );
     let mut glm_messages = vec![projected.clone()];
-    normalize_reasoning_content_replay_for_model("glm-5.2-opencode", &mut glm_messages);
+    normalize_reasoning_content_replay_for_model("glm-5.3", &mut glm_messages);
     assert_eq!(
         glm_messages[0].reasoning_content.as_deref(),
         Some("必须原样回放的 GLM 推理")
     );
 
     let mut volcano_glm_messages = vec![projected.clone()];
-    normalize_reasoning_content_replay_for_model("glm-5.2-volcano", &mut volcano_glm_messages);
+    normalize_reasoning_content_replay_for_model("gpt-5.5", &mut volcano_glm_messages);
     assert_eq!(volcano_glm_messages[0].reasoning_content, None);
 
     let mut untagged_glm_messages = vec![assistant.clone()];
-    normalize_reasoning_content_replay_for_model("glm-5.2-opencode", &mut untagged_glm_messages);
+    normalize_reasoning_content_replay_for_model("glm-5.3", &mut untagged_glm_messages);
     assert_eq!(untagged_glm_messages[0].reasoning_content, None);
 
     let mut deepseek_messages = vec![assistant];

@@ -676,22 +676,31 @@ mod tests {
         );
 
         // 从提示里解析续读 offset，验证它指向"实际显示的最后一行的下一行"，
-        // 且续读能拿到紧接着的内容（不跳行）。
-        let marker = "Continue with offset=";
-        let idx = output.find(marker).expect("continue offset present");
+        // 且续读能拿到紧接着的内容（不跳行）。宽行文件命中字符上限时是在"行中"
+        // 截断，续读通过 offset + char_offset 从同一行的断点继续，绝不跳到后面的行。
+        let marker = "Continue that same line with offset=";
+        let idx = output.find(marker).expect("mid-line continue present");
         let rest = &output[idx + marker.len()..];
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        let continue_offset: usize = digits.parse().expect("offset is a number");
-        assert!(
-            continue_offset > 1,
-            "offset should advance: {continue_offset}"
-        );
+        // 提示格式：{offset}, char_offset={char_offset}, limit=1.
+        let offset_digits = rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
+        let continue_offset: usize = offset_digits.parse().expect("offset is a number");
+        let char_marker = "char_offset=";
+        let char_idx =
+            rest.find(char_marker).expect("char_offset present") + char_marker.len();
+        let next_char_offset: usize = rest[char_idx..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .expect("char_offset is a number");
+        assert!(continue_offset > 1, "offset should advance: {continue_offset}");
+        assert!(next_char_offset > 0, "char_offset should advance: {next_char_offset}");
 
-        // 用续读 offset 再读一次，第一行行号必须正好等于 continue_offset，
-        // 证明没有静默跳过任何行。
+        // 从断点续读同一行，渲染行号必须等于 continue_offset，证明没有静默跳过行。
         let next_args = serde_json::json!({
             "file_path": path.to_string_lossy(),
             "offset": continue_offset,
+            "char_offset": next_char_offset,
             "limit": 1
         });
         let next = execute_read_file(&next_args).unwrap();
@@ -703,7 +712,7 @@ mod tests {
             .expect("first rendered line number");
         assert_eq!(
             first_line_no, continue_offset,
-            "continue offset must not skip lines"
+            "continue must resume the same line, not skip ahead"
         );
 
         let _ = fs::remove_file(&path);

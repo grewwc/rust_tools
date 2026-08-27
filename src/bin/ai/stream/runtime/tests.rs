@@ -1858,10 +1858,13 @@ fn completed_thinking_fold_replaces_anchored_header_in_place() {
 
     finalize_fold_to(&mut out, &mut fold, true).unwrap();
 
+    // 断言逐行清除序列（而非 CSI 0J）：0J 会从首个 body 行清到物理屏尾，跨越
+    // DECSTBM 滚动区把底部 side-note 编辑器一并擦掉，所以这里只能逐行 \x1b[2K
+    // 清除窗口再原位重写锚定的 header。
     assert_eq!(
         String::from_utf8(out).unwrap(),
         format!(
-            "\r\x1b[1A\x1b[0J\r\x1b[1A\r\x1b[2K  {ACCENT_MUTED}✓ thinking · 3 lines\x1b[0m\r\n{ACCENT_MUTED}    … 3 earlier lines\x1b[0m"
+            "\r\x1b[1A\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1A\r\r\x1b[1A\r\x1b[2K  {ACCENT_MUTED}✓ thinking · 3 lines\x1b[0m\r\n{ACCENT_MUTED}    … 3 earlier lines\x1b[0m"
         )
     );
     assert!(!fold.active);

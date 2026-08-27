@@ -1811,7 +1811,7 @@ mod tests {
 
         append_tool_result_messages_for_model(
             &mut app,
-            "glm-5.2-opencode",
+            "glm-5.3",
             "",
             "fallback reasoning state",
             &[],

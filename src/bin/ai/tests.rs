@@ -613,7 +613,7 @@ fn declared_model_keeps_raw_reasoning_and_builds_tagged_context_projection() {
     crate::ai::history::append_history_messages_for_model(
         &path,
         std::slice::from_ref(&assistant),
-        "glm-5.2-opencode",
+        "glm-5.3",
     )
     .unwrap();
 
