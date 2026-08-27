@@ -14,8 +14,11 @@ lives in `tools/storage/rag_store.rs` (rebuild + hybrid merge) and the
 
 ## Key invariants
 
-1. **Public vs internal tools.** User-facing persistence uses `knowledge_*`
-   tools; `memory_*` tools are agent-internal.
+1. **Public vs internal tools.** All registry tools are `knowledge_*`
+   (`knowledge_save`/`forget`/`search`/`list`/`consolidate`); there are no separate
+   `memory_*` tools — agent-internal memory uses the same `knowledge_*` tools
+   scoped by `MemoryOwnerScope` (e.g. the `agent_memory_save` path in
+   `tools/service/memory.rs`).
 2. **Consolidation contract.** `knowledge_consolidate` is a two-phase flow:
    `read_all` then `execute`. Merges are lossless: `execute` `save_entries[].source_ids`
    must list every source entry being consolidated, and the tool appends each source's
@@ -28,11 +31,10 @@ lives in `tools/storage/rag_store.rs` (rebuild + hybrid merge) and the
    derived artifact of the canonical memory store, rebuilt lazily on first use
    (or when the configured embedding model changed — see the model fingerprint
    in `rag_store.rs`) and explicitly via `knowledge_rebuild_index`. It is never
-   auto-injected into turns; recall happens only through explicit
-   `knowledge_*` tool calls (invariant 4). Lexical ranking stays in
+   auto-injected into turns (invariant 4). Lexical ranking stays in
    `MemoryStore::search` (BM25 + priority weight); hybrid search merges that
    with the vector index using `hybrid_vector_weight`.
 4. **No automatic recall.** Knowledge is read only through explicit
-   `knowledge_*` / `memory_*` tool calls - never scan or inject the store
+   `knowledge_*` tool calls - never scan or inject the store
    automatically while preparing a turn. Notebook is an independent tool-backed
    context source, not coupled to knowledge retrieval.

@@ -20,6 +20,11 @@
 //! - Screenshots use `screencapture -l <window-id>` (requires screen-recording permission);
 //!   `full_page` automatically degrades to a window screenshot and falls back to
 //!   rect/fullscreen so the model never fails just from passing the argument.
+//!   A non-prompting TCC preflight (`CGPreflightScreenCaptureAccess`) runs first:
+//!   without Screen Recording permission, `-l` always fails while the region/
+//!   fullscreen fallbacks still "succeed" with a wallpaper-only image (no app
+//!   windows), so failing fast with re-authorization guidance beats producing
+//!   silently useless screenshots.
 //! - If the user manually closes the session tab, later operations return an explicit
 //!   "tab lost" error that `navigate` can rebuild from (`screenshot` excepted: when no
 //!   window exists it automatically rebuilds via `about:blank`).
@@ -31,6 +36,27 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use crate::tools::{op_timeout_ms, resolve_screenshot_path};
+
+/// Non-blocking probe of macOS Screen Recording permission (TCC). Returns false
+/// when the permission is absent or revoked (macOS 15+ re-verifies it monthly),
+/// and never shows the authorization prompt -- unlike CGRequestScreenCaptureAccess.
+#[cfg(target_os = "macos")]
+fn screen_capture_allowed() -> bool {
+    // Direct framework binding avoids pulling in an FFI bindings crate for one call.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+/// Non-macOS builds compile this module too (cdp is their default driver and the
+/// AppleScript driver is never selected there); report "allowed" so callers are
+/// not blocked in theory-reachable-but-unused paths.
+#[cfg(not(target_os = "macos"))]
+fn screen_capture_allowed() -> bool {
+    true
+}
 
 /// One screencapture invocation: Ok(()) on success, Err(stderr trimmed) on failure.
 async fn screencapture_capture(args: &[&str]) -> Result<(), String> {
@@ -686,6 +712,20 @@ end tell"#,
     /// a window screenshot (returns a warning instead of Err to avoid a model retry loop).
     /// Takes `&mut self` so it can auto-`open_tab("about:blank")` when no window exists.
     pub async fn screenshot(&mut self, path: &str, full_page: bool) -> Result<(String, String), String> {
+        // Gate every capture attempt behind the Screen Recording preflight. Without
+        // it `screencapture -l` fails outright ("could not create image from
+        // window") and the later rect/fullscreen fallbacks exit 0 yet emit a
+        // wallpaper-only image the model mistakes for real page content.
+        if !screen_capture_allowed() {
+            return Err(
+                "屏幕录制权限未授予或已被系统收回，无法捕获 Chrome 窗口内容。请到 系统设置 > \
+                 隐私与安全性 > 屏幕录制 勾选运行本工具的宿主应用（Terminal/iTerm/VS Code/Cursor 等），\
+                 然后完全退出并重新打开该应用使授权生效（macOS 15+ 每月会重新确认该授权，\
+                 被撤销时截图会突然全部失败或只截到桌面壁纸）。生效后重试；\
+                 若想避开系统授权依赖，可改用受控实例驱动：MCP_BROWSER_DRIVER=cdp"
+                    .to_string(),
+            );
+        }
         let full_page_warn = if full_page {
             " [warn: AppleScript 模式不支持 full_page，已按窗口截图]"
         } else {

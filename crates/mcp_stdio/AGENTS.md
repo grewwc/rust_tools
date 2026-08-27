@@ -12,7 +12,7 @@ Not a binary; light deps only (`tokio` io-std/io-util/time + `serde_json`).
 
 ```text
 src/lib.rs   # JsonRpcErr, text_content, cap_text (CAP_CHARS = 24_000),
-             # with_timeout (default 90s), write_result / write_err,
+             # with_timeout (per-op ms cap), write_result / write_err,
              # McpServer trait, run() loop
 ```
 
@@ -40,8 +40,9 @@ No focused unit tests - the gate is the consuming binaries' build + smoke test.
 4. **Only `content[0].text` reaches the model** - servers must return payloads
    via `text_content(...)`; `cap_text` caps extracted text/HTML at 24K chars
    (the host offloads results above ~32K to disk).
-5. **Per-op timeout < host timeout.** `with_timeout` defaults to 90s so it
-   fires before the host's `request_timeout_ms` (120s recommended); a server
+5. **Per-op timeout < host timeout.** Servers wrap every op in
+   `with_timeout(op_timeout_ms())`, defaulting that cap to 90s so it fires
+   before the host's `request_timeout_ms` (120s recommended); a server
    that needs longer must still stay under the host cap.
 6. **New "drive an OS-native app" MCP servers** reuse this crate (per root
    AGENTS.md): implement `McpServer` + the app driver, nothing else.

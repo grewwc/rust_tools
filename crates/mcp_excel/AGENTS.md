@@ -17,7 +17,7 @@ Transport (`cap_text(24K)`/`with_timeout`/`JsonRpcErr`/dispatch loop) lives in `
 ## Build / Test
 
 ```bash
-cargo build -p mcp_excel   # ~10s; tokio+serde_json only
+cargo build -p mcp_excel   # ~10s; third-party deps tokio+serde_json (+ local mcp_stdio)
 ```
 
 `cargo check --bin a` unaffected (not a dep). No unit tests — needs real Excel. Gate: build + smoke-test cold-Excel round-trip `open_workbook -> read_range -> write_cell -> read_cell -> export_csv -> close_workbook`.

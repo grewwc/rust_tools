@@ -3,8 +3,9 @@
 ## Scope
 
 Applies to `src/bin/ai/driver/**` and nearby driver glue: prompt assembly
-(`skill_runtime.rs`), turn orchestration (`turn_runtime/` + `orchestrator.rs` and
-siblings `loop_detection`/`checkpoint`/`progress`/`notes`), and driver infrastructure:
+(`skill_runtime.rs`), turn orchestration (all inside `turn_runtime/`:
+`orchestrator.rs`, `loop_detection`, `checkpoint`, `progress`, `notes`, …), and
+driver infrastructure:
 
 - `scheduler.rs` / `background_dispatch.rs`: background scheduling
 - `session.rs` / `process_context.rs` / `runtime_ctx.rs`: session, history paths, `effective_cwd`
@@ -12,6 +13,9 @@ siblings `loop_detection`/`checkpoint`/`progress`/`notes`), and driver infrastru
 - `mcp_init.rs` / `mcp_lifecycle.rs`: MCP bootstrap
 - `model.rs` / `input.rs` / `signal.rs` / `hooks.rs`: model resolution, input, SIGINT, hooks
 - `observer.rs` / `decision_log.rs` / `note_search.rs` / `skill_watcher.rs`: observation, logging, search, watching
+- `commands/` / `system_prompts/`: command impls (e.g. `/audit`) and `include_str!`
+  prompt templates; supporting modules `thinking/`, `reflection/`, `embedding/`,
+  `hook_registry.rs`, `session_pid.rs`, `side_note.rs`
 
 ## Key invariants
 

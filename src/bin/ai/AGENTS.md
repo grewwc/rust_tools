@@ -15,6 +15,8 @@ the nearest child `AGENTS.md`.
 - `history/`: canonical persistence, context projection/compression, task evidence
 - `request/`: LLM request execution, retry, routing, normalization; `request/wire_parse.rs` holds stream primitives shared with `stream/` (avoids provider↔stream cycle)
 - `provider/`: provider adapters and wire-format differences
+- `pipeline/` / `ports/` / `middleware/`: turn pipeline (stage/run), port traits
+  (llm/mcp/history/prompt/stream/tool), request & tool middleware
 - `tools/`: registry, service implementations, storage, display/history policy
 - `mcp/`: MCP lifecycle, clients, routing snapshots, transport
 - `knowledge/`: shared types, lexical similarity, embedding provider, vector index
@@ -25,13 +27,14 @@ the nearest child `AGENTS.md`.
 
 ## Session storage & sessionid debugging
 
-Sessions are the unit of conversation persistence; a session id is a UUID (36 chars).
+Sessions are the unit of conversation persistence; ids are UUID-shaped (36 chars) by construction.
 
 - **Sessions root**: `<parent>/<file-stem>.sessions` next to the history file (default
   `~/.history_file.sessions`); derive it via `SessionStore::new(&history_file).sessions_root()`.
-- **Per session** (id validated by `SessionStore::validate_session_id`):
+- **Per session** (`SessionStore::validate_session_id` enforces 1–128 ASCII
+  letters/digits/`-`/`_`, not strict UUID shape):
   - `<id>.sqlite` — canonical history. Tables: `messages`, `meta`, `context_messages`,
-    `context_snapshot`, `tool_execution_outcomes`, `skill_activation_events`.
+    `context_snapshot`, `tool_execution_outcomes`, `skill_activation_events`, `image_digests`.
   - `<id>.assets/` — session assets: `folded-tool-groups/`, `tool-overflow-compressed/`,
     `context-checkpoints/`, images, etc.
   - `.<id>.sqlite.state.lock` (state lock) and `<id>.<pid>.pid` (live-process marker).

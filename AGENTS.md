@@ -1,7 +1,9 @@
 # AGENTS.md - rust_tools Project Guide
 
 Root-level overview and repo-wide invariants only; subsystem details live in
-scoped `AGENTS.md` files. Only `AGENTS.md` / `Agent.md` / `CLAUDE.md` are auto-discovered.
+scoped `AGENTS.md` files. Auto-discovered instruction files are the `AGENTS.md` /
+`Agent.md` / `CLAUDE.md` families plus lowercase variants (`agent.md`, `Claude.md`,
+`claude.md`) — see `PROJECT_INSTRUCTION_FILENAMES` in `src/bin/ai/agents.rs`.
 
 Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`, an
 LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill routing,
@@ -16,7 +18,7 @@ library cross-platform.
 src/lib.rs                  # utility library
 src/bin/a.rs                # AI agent entry point
 src/bin/ai/                 # AI runtime core
-src/bin/ff/                 # file-finder module embedded by `a` (via include!)
+src/bin/ff/                 # file-finder module embedded by `a` via include! in ai/mod.rs
 src/bin/*.rs                # one-off CLI tools (c, j, secret, pdf, ...) - not part of `a`
 crates/aios_kernel/         # scheduler / IPC / process state machine
 crates/rust_tools_macros/   # proc macros
@@ -29,7 +31,8 @@ models/                     # per-model JSON registry (read at runtime)
 
 > `mcp_browser` / `mcp_excel` are standalone binaries (not deps of `a`), so
 > `cargo check --bin a` stays fast. Both reuse `mcp_stdio`; new OS-app MCP
-> servers should follow the same pattern.
+> servers should follow the same pattern. Standalone exceptions: `src/bin/mcp_feishu.rs`
+> and `src/bin/mcp_ocr.rs` are hand-rolled JSON-RPC servers that don't reuse `mcp_stdio`.
 
 ## Build / Test
 
@@ -75,6 +78,7 @@ Prefer an existing focused test before running one.
 ## High-Value Pitfalls
 
 1. `.agent` / builtin `.skill` files are compiled in via `include_str!` (editing recompiles); user `.skill` files load at runtime.
-2. `src/bin/ff/` is embedded into `a` via `include!`; changes affect the agent binary.
+2. `src/bin/ff/` is embedded into `a` via `include!` in `src/bin/ai/mod.rs` (`a.rs`
+   itself is just `mod ai;`); changes affect the agent binary.
 3. `runtime_ctx::effective_cwd()` is the working-directory authority for tools and sub-agents.
 4. `objc2*` deps are macOS-only.
