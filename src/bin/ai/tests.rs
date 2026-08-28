@@ -3262,12 +3262,15 @@ fn math_frac_renders_with_nested_braces() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
     // 块级数学行改为缓冲：`$$`/`\[` 到 `$$`/`\]` 之间的行先累积，闭合分隔符到达时
     // 一次性渲染，避免实时预览先吐原始 TeX、换行后再补 Unicode 成品造成重复输出。
-    assert_eq!(renderer.consume_line("$$", false), "\n");
+    assert_eq!(renderer.consume_line("$$", false), "");
     assert_eq!(
         renderer.consume_line(r"x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}", false),
-        "\n"
+        ""
     );
-    assert_eq!(renderer.consume_line(r"y = \frac{1}{\frac{2}{3}}", false), "\n");
+    assert_eq!(
+        renderer.consume_line(r"y = \frac{1}{\frac{2}{3}}", false),
+        ""
+    );
 
     let out = renderer.consume_line("$$", false);
     assert!(out.contains("x ="));
@@ -3281,13 +3284,13 @@ fn math_frac_renders_with_nested_braces() {
 fn math_renderer_preserves_longer_commands_and_literal_braces() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
     // 块级数学行缓冲后在闭合分隔符处一次性渲染（见上）。
-    assert_eq!(renderer.consume_line("$$", false), "\n");
+    assert_eq!(renderer.consume_line("$$", false), "");
     assert_eq!(
         renderer.consume_line(
             r"\leftarrow \rightarrow \leftrightarrow \subseteq \supseteq \sqrt[3]{x} \sqrt[5]{y} \left\{a\right\}",
             false,
         ),
-        "\n"
+        ""
     );
 
     let out = renderer.consume_line("$$", false);
@@ -3308,10 +3311,10 @@ fn math_renderer_preserves_longer_commands_and_literal_braces() {
 fn math_renderer_maps_mathbb_and_preserves_unknown_commands() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
     // 块级数学行缓冲后在闭合分隔符处一次性渲染（见上）。
-    assert_eq!(renderer.consume_line("$$", false), "\n");
+    assert_eq!(renderer.consume_line("$$", false), "");
     assert_eq!(
         renderer.consume_line(r"\mathbb{R} \customcmd \alpha", false),
-        "\n"
+        ""
     );
 
     let out = renderer.consume_line("$$", false);

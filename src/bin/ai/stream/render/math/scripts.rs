@@ -19,8 +19,31 @@ pub(super) fn apply_super_subscripts(s: &str) -> String {
             '=' => Some('⁼'),
             '(' => Some('⁽'),
             ')' => Some('⁾'),
+            'a' => Some('ᵃ'),
+            'b' => Some('ᵇ'),
+            'c' => Some('ᶜ'),
+            'd' => Some('ᵈ'),
+            'e' => Some('ᵉ'),
+            'f' => Some('ᶠ'),
+            'g' => Some('ᵍ'),
+            'h' => Some('ʰ'),
             'n' => Some('ⁿ'),
             'i' => Some('ⁱ'),
+            'j' => Some('ʲ'),
+            'k' => Some('ᵏ'),
+            'l' => Some('ˡ'),
+            'm' => Some('ᵐ'),
+            'o' => Some('ᵒ'),
+            'p' => Some('ᵖ'),
+            'r' => Some('ʳ'),
+            's' => Some('ˢ'),
+            't' => Some('ᵗ'),
+            'u' => Some('ᵘ'),
+            'v' => Some('ᵛ'),
+            'w' => Some('ʷ'),
+            'x' => Some('ˣ'),
+            'y' => Some('ʸ'),
+            'z' => Some('ᶻ'),
             _ => None,
         }
     }
@@ -63,13 +86,22 @@ pub(super) fn apply_super_subscripts(s: &str) -> String {
         }
     }
 
-    fn convert_group(group: &str, sup: bool) -> Option<String> {
+    fn convert_group(group: &str, sup: bool) -> String {
         let mut out = String::new();
+        let mut fully_mapped = true;
         for ch in group.chars() {
-            let mapped = if sup { map_sup(ch) } else { map_sub(ch) }?;
-            out.push(mapped);
+            if let Some(mapped) = if sup { map_sup(ch) } else { map_sub(ch) } {
+                out.push(mapped);
+            } else {
+                fully_mapped = false;
+                out.push(ch);
+            }
         }
-        Some(out)
+        if fully_mapped {
+            return out;
+        }
+        let (open, close) = if sup { ('⁽', '⁾') } else { ('₍', '₎') };
+        format!("{open}{out}{close}")
     }
 
     let bytes = s.as_bytes();
@@ -87,14 +119,7 @@ pub(super) fn apply_super_subscripts(s: &str) -> String {
             if bytes[i] == b'{'
                 && let Some((group, next)) = read_group_braced(s, i)
             {
-                if let Some(converted) = convert_group(group.trim(), sup) {
-                    out.push_str(&converted);
-                } else {
-                    out.push(if sup { '^' } else { '_' });
-                    out.push('(');
-                    out.push_str(group.trim());
-                    out.push(')');
-                }
+                out.push_str(&convert_group(group.trim(), sup));
                 i = next;
                 continue;
             }
@@ -106,8 +131,10 @@ pub(super) fn apply_super_subscripts(s: &str) -> String {
             } {
                 out.push(mapped);
             } else {
-                out.push(if sup { '^' } else { '_' });
+                let (open, close) = if sup { ('⁽', '⁾') } else { ('₍', '₎') };
+                out.push(open);
                 out.push(next_ch);
+                out.push(close);
             }
             i += next_ch.len_utf8();
             continue;

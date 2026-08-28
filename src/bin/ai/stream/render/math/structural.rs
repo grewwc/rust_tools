@@ -1,7 +1,7 @@
-/// 结构性 TeX 命令：\frac、\sqrt、sizing、括号包裹等。
+/// Structural TeX commands such as `\frac`, `\sqrt`, and `\binom`.
 use super::symbols::is_control_word_boundary;
 
-/// 跳过 `\left` / `\right` 等 sizing 命令前缀。
+/// Removes sizing-command prefixes such as `\left` and `\right`.
 pub(super) fn strip_sizing_commands(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -21,7 +21,7 @@ pub(super) fn strip_sizing_commands(s: &str) -> String {
     out
 }
 
-/// 读取从 `start` 位置开始的 `{...}` 分组内容（不含外层花括号）。
+/// Reads a `{...}` group starting at `start`, excluding its outer braces.
 pub(super) fn read_group_braced(s: &str, start: usize) -> Option<(String, usize)> {
     let bytes = s.as_bytes();
     if start >= bytes.len() || bytes[start] != b'{' {
@@ -57,7 +57,7 @@ pub(super) fn read_group_braced(s: &str, start: usize) -> Option<(String, usize)
     None
 }
 
-/// 读取从 `start` 位置开始的 `[...]` 分组内容（不含外层方括号）。
+/// Reads a `[...]` group starting at `start`, excluding its outer brackets.
 pub(super) fn read_group_bracketed(s: &str, start: usize) -> Option<(String, usize)> {
     let bytes = s.as_bytes();
     if start >= bytes.len() || bytes[start] != b'[' {
@@ -93,7 +93,7 @@ pub(super) fn read_group_bracketed(s: &str, start: usize) -> Option<(String, usi
     None
 }
 
-/// 判断分组内容是否需要包裹括号（含运算符、负数、多字符等）。
+/// Returns whether grouped content needs parentheses, such as for an expression or negative value.
 pub(super) fn needs_parens(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() {
@@ -119,7 +119,7 @@ pub(super) fn needs_parens(s: &str) -> bool {
     false
 }
 
-/// 按需将内容包裹括号。
+/// Wraps content in parentheses when needed.
 pub(super) fn wrap_parens(s: &str) -> String {
     let s = s.trim();
     if needs_parens(s) {
@@ -129,7 +129,7 @@ pub(super) fn wrap_parens(s: &str) -> String {
     }
 }
 
-/// 递归处理 \frac、\sqrt 等结构性命令。
+/// Recursively transforms structural commands such as `\frac`, `\sqrt`, and `\binom`.
 pub(super) fn replace_structural_tex(mut s: String) -> String {
     let mut changed = true;
     while changed {
@@ -190,6 +190,29 @@ pub(super) fn replace_structural_tex(mut s: String) -> String {
                     i = j2;
                     changed = true;
                     continue;
+                }
+            }
+            const BINOM_COMMANDS: [&str; 3] = ["\\dbinom", "\\tbinom", "\\binom"];
+            if let Some(command) = BINOM_COMMANDS.iter().find(|command| {
+                s[i..].starts_with(*command) && is_control_word_boundary(&s, i + command.len())
+            }) {
+                let mut j = i + command.len();
+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if let Some((top, j2)) = read_group_braced(&s, j) {
+                    let mut k = j2;
+                    while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                        k += 1;
+                    }
+                    if let Some((bottom, k2)) = read_group_braced(&s, k) {
+                        let top = replace_structural_tex(top);
+                        let bottom = replace_structural_tex(bottom);
+                        out.push_str(&format!("C({}, {})", top.trim(), bottom.trim()));
+                        i = k2;
+                        changed = true;
+                        continue;
+                    }
                 }
             }
             let ch = s[i..].chars().next().unwrap();

@@ -23,6 +23,11 @@ use crate::ai::theme::{
 enum MathBlockDelimiter {
     Dollars,
     Brackets,
+    /// A fenced code block tagged `latex` / `tex` / `math`. The fence open/close
+    /// lines act as the delimiters; the content is buffered and rendered through
+    /// the math pipeline on close, so formulas appear like `$$...$$` blocks
+    /// instead of a code box.
+    Fenced,
 }
 
 impl MathBlockDelimiter {
@@ -35,7 +40,14 @@ impl MathBlockDelimiter {
     }
 
     fn closes(self, line: &str) -> bool {
-        matches!((self, line), (Self::Dollars, "$$") | (Self::Brackets, "\\]"))
+        match (self, line) {
+            (Self::Dollars, "$$") | (Self::Brackets, "\\]") => true,
+            (Self::Fenced, line) => {
+                let trimmed = line.trim();
+                trimmed.starts_with("```") || trimmed.starts_with("~~~")
+            }
+            _ => false,
+        }
     }
 }
 
@@ -1057,7 +1069,12 @@ impl MarkdownStreamRenderer {
             return format!("{indent}{ACCENT_MUTED}{label}\x1b[0m\n");
         }
 
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        // A math block may already be open (e.g. a fenced latex block); its closing
+        // fence line must reach the math-close path below, not re-enter the code
+        // fence state machine here.
+        if (trimmed.starts_with("```") || trimmed.starts_with("~~~"))
+            && self.math_block_delimiter.is_none()
+        {
             if self.in_code_block {
                 self.in_code_block = false;
                 self.code_block_lang = None;
@@ -1065,9 +1082,18 @@ impl MarkdownStreamRenderer {
                 let border = "─".repeat(22);
                 return format!("{block_indent}{MONOKAI_BG}{MONOKAI_DIM}╰{border}\x1b[0m\n");
             } else {
+                let lang = parse_code_block_language(trimmed);
+                // `latex` / `tex` / `math` fences carry formulas: buffer the lines and
+                // render them through the math pipeline on close, exactly like `$$...$$`.
+                if matches!(lang.as_deref(), Some("latex" | "tex" | "math")) {
+                    self.math_block_delimiter = Some(MathBlockDelimiter::Fenced);
+                    self.math_block_indent = indent.to_string();
+                    self.math_block_buf.clear();
+                    return String::new();
+                }
                 self.in_code_block = true;
                 self.code_block_indent = indent.to_string();
-                self.code_block_lang = parse_code_block_language(trimmed);
+                self.code_block_lang = lang;
                 self.code_line_number = 0;
                 let lang = self.code_block_lang.as_deref().unwrap_or("code");
                 return format!("{indent}{MONOKAI_BG}{MONOKAI_DIM}╭─ {lang}\x1b[0m\n");
@@ -1129,18 +1155,18 @@ impl MarkdownStreamRenderer {
                 if !rendered.is_empty() {
                     return format!("{base}{ACCENT_SECONDARY}{rendered}\x1b[0m\n");
                 }
-                return "\n".to_string();
+                return String::new();
             }
 
             self.math_block_buf.push(rest.trim_end().to_string());
-            return "\n".to_string();
+            return String::new();
         }
 
         if let Some(delimiter) = MathBlockDelimiter::opening(trimmed) {
             self.math_block_delimiter = Some(delimiter);
             self.math_block_indent = indent.to_string();
             self.math_block_buf.clear();
-            return "\n".to_string();
+            return String::new();
         }
 
         if let Some((level, title)) = parse_heading(trimmed) {
@@ -2647,5 +2673,148 @@ make_llm_call_publisher | 一致 | 同一条 on_call complete callback
         let visible = crate::ai::stream::extract::strip_ansi_codes(&output);
         assert!(visible.contains("x²"), "got: {visible}");
         assert!(!visible.contains("x^2"), "got: {visible}");
+    }
+
+    #[test]
+    fn latex_fenced_block_renders_as_math_without_code_box() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let mut output = renderer
+            .write_block_for_test(
+                "```latex\nx = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}\n```\n",
+                false,
+            )
+            .unwrap();
+        output.push_str(&renderer.flush_pending_for_test().unwrap());
+
+        let visible = crate::ai::stream::extract::strip_ansi_codes(&output);
+        // Fenced latex blocks render as math, not as a code box.
+        assert!(!visible.contains("```"), "got: {visible}");
+        assert!(!visible.contains("latex"), "got: {visible}");
+        assert!(!visible.contains('╭'), "got: {visible}");
+        assert!(!visible.contains("\\frac"), "got: {visible}");
+        assert!(visible.contains("(-b ± √(b² - 4ac))/2a"), "got: {visible}");
+    }
+
+    #[test]
+    fn latex_fence_renders_binomial_and_chain_rule_without_raw_tex() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let mut output = renderer
+            .write_block_for_test(
+                "```latex\n\\frac{dy}{dx} = \\frac{dy}{du} \\cdot \\frac{du}{dx}\n```\n\n```latex\n(a + b)^n = \\sum_{k=0}^{n} \\binom{n}{k} a^{n-k} b^k\n```\n",
+                false,
+            )
+            .unwrap();
+        output.push_str(&renderer.flush_pending_for_test().unwrap());
+
+        let visible = crate::ai::stream::extract::strip_ansi_codes(&output);
+        assert!(visible.contains("dy/dx = dy/du · du/dx"), "got: {visible}");
+        assert!(
+            visible.contains("(a + b)ⁿ = ∑ₖ₌₀ⁿ C(n, k) aⁿ⁻ᵏ bᵏ"),
+            "got: {visible}"
+        );
+        assert!(!visible.contains("\\binom"), "got: {visible}");
+    }
+
+    #[test]
+    fn streamed_latex_fence_rewrites_to_compact_math_without_placeholder_rows() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let mut stream = String::new();
+        for chunk in [
+            "1. 勾股定理\n",
+            "```latex\n",
+            "a^2 + b^2 = c^2\n",
+            "```\n",
+            "2. 定积分\n",
+        ] {
+            stream.push_str(&renderer.write_chunk_for_test(chunk, false).unwrap());
+        }
+
+        let mut grid = VtGrid::new(80);
+        grid.feed(&stream);
+        let screen = grid.screen();
+        let title_row = screen
+            .iter()
+            .position(|line| line.contains("勾股定理"))
+            .unwrap();
+        let formula_row = screen
+            .iter()
+            .position(|line| line.contains("a² + b² = c²"))
+            .unwrap();
+        let next_title_row = screen
+            .iter()
+            .position(|line| line.contains("定积分"))
+            .unwrap();
+
+        assert_eq!(formula_row, title_row + 1, "screen: {}", screen.join("\n"));
+        assert_eq!(
+            next_title_row,
+            formula_row + 1,
+            "screen: {}",
+            screen.join("\n")
+        );
+        let visible = screen.join("\n");
+        assert!(!visible.contains("```"), "screen: {visible}");
+    }
+
+    #[test]
+    fn tex_and_math_fence_aliases_render_as_math() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let mut output = renderer
+            .write_block_for_test(
+                "```tex\ne^{i\\pi} + 1 = 0\n```\n~~~math\nf(x) = \\frac{1}{2}\n~~~\n",
+                false,
+            )
+            .unwrap();
+        output.push_str(&renderer.flush_pending_for_test().unwrap());
+
+        let visible = crate::ai::stream::extract::strip_ansi_codes(&output);
+        assert!(!visible.contains("```"), "got: {visible}");
+        assert!(!visible.contains("~~~"), "got: {visible}");
+        assert!(!visible.contains('╭'), "got: {visible}");
+        assert!(!visible.contains("\\frac"), "got: {visible}");
+        assert!(visible.contains('π'), "got: {visible}");
+        assert!(visible.contains("1/2"), "got: {visible}");
+    }
+
+    #[test]
+    fn latex_fenced_aligned_environment_renders_as_block() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let mut output = renderer
+            .write_block_for_test(
+                "```latex\n\\begin{aligned}\nx &= 1 \\\\ y &= 2\n\\end{aligned}\n```\n",
+                false,
+            )
+            .unwrap();
+        output.push_str(&renderer.flush_pending_for_test().unwrap());
+
+        let visible = crate::ai::stream::extract::strip_ansi_codes(&output);
+        assert!(!visible.contains("```"), "got: {visible}");
+        assert!(!visible.contains("\\begin"), "got: {visible}");
+        assert!(visible.contains('x'), "got: {visible}");
+        assert!(visible.contains('y'), "got: {visible}");
+    }
+
+    #[test]
+    fn unterminated_latex_fence_flushes_rendered_math_at_end() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let mut output = renderer
+            .write_block_for_test("```latex\nx^2\n", false)
+            .unwrap();
+        output.push_str(&renderer.flush_pending_for_test().unwrap());
+
+        let visible = crate::ai::stream::extract::strip_ansi_codes(&output);
+        assert!(visible.contains("x²"), "got: {visible}");
+        assert!(!visible.contains("x^2"), "got: {visible}");
+    }
+
+    #[test]
+    fn non_math_fence_still_renders_code_box() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let out = renderer
+            .write_block_for_test("```rust\nfn main() {}\n```\n", false)
+            .unwrap();
+        let visible = crate::ai::stream::extract::strip_ansi_codes(&out);
+        assert!(visible.contains('╭'), "got: {visible}");
+        assert!(visible.contains("rust"), "got: {visible}");
     }
 }

@@ -11,13 +11,15 @@ use crate::ai::{
     tools::{storage::file_store::FileStore, task_tools},
     types::{App, ToolCall},
 };
+use regex::Regex;
 use rust_tools::commonw::FastSet;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
-    io::Write,
-    path::PathBuf,
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
     pin::Pin,
+    sync::LazyLock,
 };
 
 use super::super::persistence::persist_pending_turn_messages_for_model;
@@ -465,6 +467,33 @@ const COMPLETION_EVIDENCE_REQUIRED_MARKER: &str = "self_note:completion_evidence
 const COMPLETION_EVIDENCE_UNVERIFIED_NOTE: &str = "runtime:completion_evidence_unverified\nA final response was recorded after a project mutation without observed post-mutation verification.";
 const COMPLETION_EVIDENCE_WARNING: &str = "[Runtime warning] Completion/impact claim is unverified: no successful post-mutation check, test, diff, or status command was observed.";
 
+const FINAL_CITATION_RETRY_MARKER: &str = "[final-citation-retry]";
+const FINAL_CITATION_UNVERIFIED_NOTE: &str = "runtime:final_citation_unverified\nA final response contained one or more file/line citations that could not be validated locally.";
+const FINAL_CITATION_WARNING: &str = "[Runtime warning] One or more file/line citations in this answer could not be validated locally; treat the cited details as unverified.";
+const MAX_FINAL_RESPONSE_CITATIONS: usize = 64;
+const MAX_FINAL_CITATION_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_FINAL_CITATION_LINE_SCAN: u64 = 1_000_000;
+
+/// This recognizes only conventional, file-looking `path:line` references. A final-response
+/// gate must prefer false negatives over false positives: prose such as `phase: 2` must never
+/// force the model to repeat an otherwise valid answer.
+static PATH_LINE_CITATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        (?P<path>
+            (?:/|\./|\.\./|~/)?
+            [A-Za-z0-9_.@%+=,-]+
+            (?:/[A-Za-z0-9_.@%+=,-]+)*
+        )
+        :
+        (?P<start>[1-9][0-9]*)
+        (?:-(?P<end>[1-9][0-9]*))?
+        (?::[0-9]+)?
+        ",
+    )
+    .expect("path:line citation regular expression must compile")
+});
+
 const INJECTED_CONTEXT_ECHO_RETRY_MARKER: &str = "[injected-context-echo-retry]";
 const INJECTED_CONTEXT_ECHO_RETRY_NOTE: &str = "Your previous response reproduced a runtime-injected context note verbatim instead of answering. \
 Runtime notes are context for you only; they are never the user-facing answer. \
@@ -490,6 +519,13 @@ const INJECTED_CONTEXT_ECHO_PREFIXES: &[&str] = &[
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionEvidenceGateAction {
+    Allow,
+    Reopen,
+    Warn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalCitationGateAction {
     Allow,
     Reopen,
     Warn,
@@ -1397,6 +1433,281 @@ fn completion_evidence_gate_action(
         reasoning_content: None,
     });
     CompletionEvidenceGateAction::Reopen
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalCitation {
+    text: String,
+    path: String,
+    start_line: u64,
+    end_line: u64,
+}
+
+/// Byte ranges of fenced code blocks (``` or ~~~) in `text`, used by the citation
+/// scanner to skip example/diff code: paths mentioned inside a fence are
+/// illustrative, not evidence-bearing citations, and flagging them would attach a
+/// false warning to an otherwise correct answer. A fence opens on a line whose
+/// non-whitespace content starts with 3+ backticks or tildes, and closes on a
+/// line whose non-whitespace content consists only of the same marker repeated
+/// at least as many times; an unclosed fence covers the rest of the text, which
+/// errs toward skipping.
+/// Inline code spans are intentionally NOT skipped — real citations are usually
+/// written as `src/lib.rs:42` in prose, so skipping them would lose true positives.
+fn fenced_code_block_byte_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    // (marker char, minimum closing marker count, range start byte)
+    let mut open_fence: Option<(char, usize, usize)> = None;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if let Some((marker, open_count, start)) = open_fence {
+            let marker_count = trimmed.chars().filter(|c| *c == marker).count();
+            let closes_fence =
+                marker_count >= open_count && trimmed.chars().all(|c| c == marker);
+            if closes_fence {
+                ranges.push((start, offset + line.len()));
+                open_fence = None;
+            }
+        } else {
+            for (marker, prefix) in [('`', "```"), ('~', "~~~")] {
+                if trimmed.starts_with(prefix) {
+                    let open_count = trimmed.chars().take_while(|c| *c == marker).count();
+                    open_fence = Some((marker, open_count, offset));
+                    break;
+                }
+            }
+        }
+        offset += line.len();
+    }
+    if let Some((_, _, start)) = open_fence {
+        ranges.push((start, text.len()));
+    }
+    ranges
+}
+
+fn final_response_citations(final_text: &str) -> Vec<FinalCitation> {
+    let mut citations = Vec::new();
+    let fenced_ranges = fenced_code_block_byte_ranges(final_text);
+    for captures in PATH_LINE_CITATION_RE.captures_iter(final_text) {
+        let (Some(full), Some(path), Some(start)) = (
+            captures.get(0),
+            captures.name("path"),
+            captures.name("start"),
+        ) else {
+            continue;
+        };
+        if fenced_ranges
+            .iter()
+            .any(|(start_byte, end_byte)| full.start() >= *start_byte && full.start() < *end_byte)
+        {
+            continue;
+        }
+        if citations.len() == MAX_FINAL_RESPONSE_CITATIONS {
+            break;
+        }
+        if !citation_has_token_boundaries(final_text, full.start(), full.end())
+            || !looks_like_final_citation_path(path.as_str())
+        {
+            continue;
+        }
+        let Ok(start_line) = start.as_str().parse::<u64>() else {
+            continue;
+        };
+        let end_line = match captures.name("end") {
+            Some(end) => match end.as_str().parse::<u64>() {
+                Ok(line) => line,
+                Err(_) => continue,
+            },
+            None => start_line,
+        };
+        let citation = FinalCitation {
+            text: full.as_str().to_string(),
+            path: path.as_str().to_string(),
+            start_line,
+            end_line,
+        };
+        if !citations.iter().any(|existing| existing == &citation) {
+            citations.push(citation);
+        }
+    }
+    citations
+}
+
+fn citation_has_token_boundaries(text: &str, start: usize, end: usize) -> bool {
+    let preceding = text[..start].chars().next_back();
+    let following = text[end..].chars().next();
+    !preceding.is_some_and(is_citation_path_character)
+        && !following.is_some_and(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '/' | ':' | '-' | '@' | '%' | '+' | '=')
+        })
+}
+
+fn is_citation_path_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '_' | '.' | '-' | '/' | '@' | '%' | '+' | '=' | ',' | ':')
+}
+
+/// Extensions that appear in prose mainly as version/phase qualifiers rather than
+/// real file extensions (e.g. `phase.alpha:2`, `build.release:3`). Treating them
+/// as citation paths would probe phantom files like `phase.alpha` and attach a
+/// false warning; real source/config extensions practically never collide with
+/// these. This only narrows detection — the gate still prefers false negatives
+/// over false positives, so tokens with other unknown extensions stay candidates.
+const PROSE_QUALIFIER_EXTENSIONS: &[&str] = &[
+    "alpha", "beta", "rc", "dev", "debug", "release", "final", "snapshot",
+    "nightly", "canary", "preview", "draft", "wip", "test", "prod", "stage",
+    "staging",
+];
+
+fn looks_like_final_citation_path(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    if matches!(file_name, "Makefile" | "Dockerfile" | "LICENSE" | "README" | "AGENTS") {
+        return true;
+    }
+    let Some((_, extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    extension
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic())
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        && !PROSE_QUALIFIER_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+}
+
+fn resolve_final_citation_path(
+    path: &str,
+    effective_cwd: Option<&Path>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(home_relative_path) = path.strip_prefix("~/") {
+        return home.map(|home| PathBuf::from(home).join(home_relative_path));
+    }
+    let path = Path::new(path);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        effective_cwd.map(|cwd| cwd.join(path))
+    }
+}
+
+/// `Some(false)` is reserved for a locally provable bad citation. I/O failures and oversized
+/// files stay unknown so this gate never claims a citation is invalid without direct evidence.
+fn citation_file_contains_line(path: &Path, line: u64) -> Option<bool> {
+    if line > MAX_FINAL_CITATION_LINE_SCAN {
+        // Cheap falsification before giving up: a file of S bytes has at most S
+        // lines (every line needs at least one byte), so a line number beyond
+        // size + 1 is provably past EOF even above the scan cap. Anything else
+        // stays unknown here; only the bounded scan below can verify smaller
+        // line numbers.
+        return match std::fs::metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Ok(metadata) if line > metadata.len().saturating_add(1) => Some(false),
+            _ => None,
+        };
+    }
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    if !metadata.is_file() {
+        return Some(false);
+    }
+    if metadata.len() > MAX_FINAL_CITATION_FILE_BYTES {
+        return None;
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return None,
+    };
+    let mut reader = BufReader::new(file);
+    let mut buffer = String::new();
+    for _ in 0..line {
+        buffer.clear();
+        match reader.read_line(&mut buffer) {
+            Ok(0) => return Some(false),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(true)
+}
+
+fn unvalidated_final_response_citations(
+    final_text: &str,
+    effective_cwd: Option<&Path>,
+) -> Vec<String> {
+    let home = std::env::var_os("HOME");
+    final_response_citations(final_text)
+        .into_iter()
+        .filter_map(|citation| {
+            if citation.end_line < citation.start_line {
+                return Some(citation.text);
+            }
+            // Resolution failure (no cwd / no HOME) means "cannot validate", not
+            // "valid": skip without flagging, exactly like the other unknown
+            // verdicts. Only provably bad citations may trigger the retry/warning
+            // path.
+            let path =
+                resolve_final_citation_path(&citation.path, effective_cwd, home.as_deref())?;
+            match citation_file_contains_line(&path, citation.end_line) {
+                Some(true) | None => None,
+                Some(false) => Some(citation.text),
+            }
+        })
+        .collect()
+}
+
+fn final_response_citation_gate_action(
+    messages: &mut Vec<Message>,
+    final_text: &str,
+    effective_cwd: Option<&Path>,
+    force_final_response: bool,
+    iteration: usize,
+    max_iterations: usize,
+) -> FinalCitationGateAction {
+    let unvalidated = unvalidated_final_response_citations(final_text, effective_cwd);
+    if unvalidated.is_empty() {
+        return FinalCitationGateAction::Allow;
+    }
+    let already_retried = messages.iter().any(|message| {
+        message.role == ROLE_INTERNAL_NOTE
+            && message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(FINAL_CITATION_RETRY_MARKER))
+    });
+    if already_retried || force_final_response || iteration >= max_iterations {
+        return FinalCitationGateAction::Warn;
+    }
+
+    let listed = unvalidated
+        .iter()
+        .take(8)
+        .map(|citation| format!("`{citation}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let omitted = unvalidated.len().saturating_sub(8);
+    let suffix = (omitted > 0).then(|| format!(" and {omitted} more"));
+    let note = format!(
+        "{FINAL_CITATION_RETRY_MARKER}\n\
+         The draft final response contains file/line citations that could not be validated locally: {listed}{}.\n\
+         This is not a final answer. Recheck the cited paths and line numbers using existing evidence or focused reads, then give a corrected answer.\n\
+         Do not retain, invent, or replace a citation unless the path and line are supported by observed evidence.",
+        suffix.as_deref().unwrap_or_default(),
+    );
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    FinalCitationGateAction::Reopen
 }
 
 /// Decide whether the final response merely regurgitates a context note the runtime
@@ -3247,6 +3558,24 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 }
                 CompletionEvidenceGateAction::Warn => true,
             };
+            let effective_cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
+            let warn_unvalidated_final_citation = match final_response_citation_gate_action(
+                messages,
+                &stream_result.assistant_text,
+                effective_cwd.as_deref(),
+                *force_final_response,
+                iteration,
+                max_iterations,
+            ) {
+                FinalCitationGateAction::Allow => false,
+                FinalCitationGateAction::Reopen => {
+                    *terminal_dedupe_candidate = terminal_dedupe_candidate_from_assistant_text(
+                        &stream_result.assistant_text,
+                    );
+                    return Ok(TurnLoopStep::Continue);
+                }
+                FinalCitationGateAction::Warn => true,
+            };
             let warn_dangling_final = match dangling_final_recovery_action(
                 question,
                 messages,
@@ -3293,6 +3622,17 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     COMPLETION_EVIDENCE_WARNING,
                 );
                 record_hidden_self_note(app, turn_messages, COMPLETION_EVIDENCE_UNVERIFIED_NOTE);
+            }
+            if warn_unvalidated_final_citation {
+                append_runtime_warning_once(
+                    &mut stream_result.assistant_text,
+                    FINAL_CITATION_WARNING,
+                );
+                append_user_visible_final_notice(
+                    terminal_dedupe_candidate,
+                    FINAL_CITATION_WARNING,
+                );
+                record_hidden_self_note(app, turn_messages, FINAL_CITATION_UNVERIFIED_NOTE);
             }
             // At the hard cap we no longer reopen, but unreaped subtasks must still enter
             // both the canonical final and the terminal redraw.
@@ -5206,6 +5546,260 @@ mod tests {
                     .as_str()
                     .is_some_and(|text| text.contains(COMPLETION_EVIDENCE_UNVERIFIED_NOTE))
         }));
+    }
+
+    #[test]
+    fn final_response_citation_parser_ignores_urls_and_non_file_colon_forms() {
+        let citations = final_response_citations(
+            "Evidence: src/lib.rs:2-3, Cargo.toml:1:4, phase:2, https://example.com/file.rs:5, and 127.0.0.1:8080.",
+        );
+        assert_eq!(
+            citations
+                .iter()
+                .map(|citation| citation.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/lib.rs:2-3", "Cargo.toml:1:4"]
+        );
+    }
+
+    #[test]
+    fn final_response_citation_parser_skips_fenced_code_blocks() {
+        let citations = final_response_citations(
+            "See src/lib.rs:2.\n\n\
+             ```rust\n\
+             # src/nonexistent_example.rs:12\n\
+             // Cargo.toml:8 in a diff example\n\
+             ```\n\n\
+             Also Cargo.toml:1:4.\n",
+        );
+        assert_eq!(
+            citations
+                .iter()
+                .map(|citation| citation.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/lib.rs:2", "Cargo.toml:1:4"]
+        );
+
+        // An unclosed fence skips everything after it (conservative direction).
+        assert!(final_response_citations("```text\nsrc/missing.rs:9\nmore\n").is_empty());
+    }
+
+    #[test]
+    fn final_response_citation_parser_ignores_prose_qualifier_extensions() {
+        let citations = final_response_citations(
+            "Rollout phase.alpha:2, build.release:3, retry.beta:4 vs src/main.rs:4.",
+        );
+        assert_eq!(
+            citations
+                .iter()
+                .map(|citation| citation.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/main.rs:4"]
+        );
+    }
+
+    #[test]
+    fn citation_line_check_falsifies_lines_beyond_scan_cap_cheaply() {
+        let root = std::env::temp_dir().join(format!(
+            "final-citation-line-check-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "first\nsecond\n").unwrap();
+        let path = root.join("src/lib.rs");
+
+        // A 2-line file: the line number is provably past EOF (a file of S bytes
+        // has at most S lines) even though it exceeds the line-scan cap.
+        assert_eq!(
+            citation_file_contains_line(&path, MAX_FINAL_CITATION_LINE_SCAN + 1),
+            Some(false)
+        );
+        // Missing files stay provably invalid regardless of the line number.
+        assert_eq!(
+            citation_file_contains_line(
+                &root.join("src/missing.rs"),
+                MAX_FINAL_CITATION_LINE_SCAN + 1
+            ),
+            Some(false)
+        );
+        // A file large enough that the line could exist stays unknown (no scan).
+        let big = root.join("src/big.txt");
+        fs::write(&big, "\n".repeat(1_200_000)).unwrap();
+        assert_eq!(
+            citation_file_contains_line(&big, MAX_FINAL_CITATION_LINE_SCAN + 1),
+            None
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn final_citation_resolution_failure_is_unknown_not_invalid() {
+        // No cwd: relative citations cannot be resolved and must be skipped as
+        // unknown, never flagged as provably bad.
+        assert!(unvalidated_final_response_citations("See src/lib.rs:2.", None).is_empty());
+        // Same for ~/ citations without HOME.
+        assert_eq!(resolve_final_citation_path("~/notes.rs", None, None), None);
+        assert_eq!(
+            resolve_final_citation_path("~/notes.rs", None, Some(std::ffi::OsStr::new("/home/u"))),
+            Some(std::path::PathBuf::from("/home/u/notes.rs"))
+        );
+    }
+
+    #[test]
+    fn final_response_citation_gate_reopens_once_then_warns_for_an_invalid_line() {
+        let root = std::env::temp_dir().join(format!(
+            "final-citation-gate-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "first\nsecond\n").unwrap();
+
+        SUBAGENT_CWD.sync_scope(root.clone(), || {
+            let final_text = "Implemented the change in src/lib.rs:9.";
+            let effective_cwd = crate::ai::driver::runtime_ctx::effective_cwd().unwrap();
+            assert_eq!(
+                unvalidated_final_response_citations(final_text, Some(&effective_cwd)),
+                vec!["src/lib.rs:9"]
+            );
+
+            let mut messages = Vec::new();
+            assert_eq!(
+                final_response_citation_gate_action(
+                    &mut messages,
+                    final_text,
+                    Some(&effective_cwd),
+                    false,
+                    1,
+                    16,
+                ),
+                FinalCitationGateAction::Reopen
+            );
+            assert!(messages.iter().any(|message| {
+                message.role == ROLE_INTERNAL_NOTE
+                    && message.content.as_str().is_some_and(|text| {
+                        text.starts_with(FINAL_CITATION_RETRY_MARKER)
+                            && text.contains("`src/lib.rs:9`")
+                    })
+            }));
+            assert_eq!(
+                final_response_citation_gate_action(
+                    &mut messages,
+                    final_text,
+                    Some(&effective_cwd),
+                    false,
+                    2,
+                    16,
+                ),
+                FinalCitationGateAction::Warn
+            );
+            assert!(unvalidated_final_response_citations(
+                "Implemented the change in src/lib.rs:2.",
+                Some(&effective_cwd)
+            )
+            .is_empty());
+        });
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn final_response_citation_gate_warns_only_after_one_recovery_final() {
+        let root = std::env::temp_dir().join(format!(
+            "final-citation-finalize-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "first\nsecond\n").unwrap();
+
+        SUBAGENT_CWD.sync_scope(root.clone(), || {
+            let mut app = test_app_with_tools(&["read_file"]);
+            let shared_mcp =
+                std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+            let mut messages = Vec::new();
+            let mut turn_messages = Vec::new();
+            let mut persisted_turn_messages = 0usize;
+            let mut final_assistant_text = String::new();
+            let mut final_assistant_recorded = false;
+            let mut force_final_response = false;
+            let mut terminal_dedupe_candidate = None;
+            let mut turn_had_tool_error = false;
+            let final_response = || {
+                IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                    outcome: crate::ai::types::StreamOutcome::Completed,
+                    assistant_text: "Implemented the change in src/lib.rs:9.".to_string(),
+                    skip_response_drain: true,
+                    ..Default::default()
+                })
+            };
+
+            let first_step = handle_iteration_execution(
+                &mut app,
+                "fix the bug",
+                &mcp_snapshot(&shared_mcp),
+                &shared_mcp,
+                final_response(),
+                &mut messages,
+                &mut turn_messages,
+                false,
+                &mut persisted_turn_messages,
+                &mut final_assistant_text,
+                &mut final_assistant_recorded,
+                &mut force_final_response,
+                &mut terminal_dedupe_candidate,
+                true,
+                2,
+                16,
+                0,
+                &mut turn_had_tool_error,
+            )
+            .unwrap();
+
+            assert!(matches!(first_step, TurnLoopStep::Continue));
+            assert!(!final_assistant_recorded);
+            assert_eq!(
+                terminal_dedupe_candidate.as_deref(),
+                Some("Implemented the change in src/lib.rs:9.")
+            );
+
+            let second_step = handle_iteration_execution(
+                &mut app,
+                "fix the bug",
+                &mcp_snapshot(&shared_mcp),
+                &shared_mcp,
+                final_response(),
+                &mut messages,
+                &mut turn_messages,
+                false,
+                &mut persisted_turn_messages,
+                &mut final_assistant_text,
+                &mut final_assistant_recorded,
+                &mut force_final_response,
+                &mut terminal_dedupe_candidate,
+                true,
+                3,
+                16,
+                0,
+                &mut turn_had_tool_error,
+            )
+            .unwrap();
+
+            assert!(matches!(second_step, TurnLoopStep::Break));
+            assert!(final_assistant_recorded);
+            assert!(final_assistant_text.contains(FINAL_CITATION_WARNING));
+            assert_eq!(
+                terminal_dedupe_candidate.as_deref(),
+                Some(FINAL_CITATION_WARNING)
+            );
+            assert!(turn_messages.iter().any(|message| {
+                message.role == ROLE_INTERNAL_NOTE
+                    && message.content.as_str().is_some_and(|text| {
+                        text.contains(FINAL_CITATION_UNVERIFIED_NOTE)
+                    })
+            }));
+
+        let _ = fs::remove_dir_all(root);
+        });
     }
 
     #[test]

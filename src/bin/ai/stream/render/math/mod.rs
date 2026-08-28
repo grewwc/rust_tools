@@ -12,7 +12,45 @@ use environments::{
 };
 use scripts::apply_super_subscripts;
 use structural::{replace_structural_tex, strip_sizing_commands};
-use symbols::{LITERAL_LBRACE_PLACEHOLDER, LITERAL_RBRACE_PLACEHOLDER, replace_symbolic_tex_once};
+use symbols::{
+    LITERAL_LBRACE_PLACEHOLDER, LITERAL_RBRACE_PLACEHOLDER, is_control_word_boundary,
+    replace_symbolic_tex_once,
+};
+
+/// Replaces named TeX spacing commands with one terminal space.
+///
+/// TeX normally ignores source whitespace around these commands, so consume it
+/// here as well to avoid displaying an accidental run of spaces in the terminal.
+fn replace_named_spacing_commands(s: &str) -> String {
+    const SPACING_COMMANDS: [&str; 4] = ["\\qquad", "\\quad", "\\enspace", "\\enskip"];
+
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        let command = SPACING_COMMANDS.iter().copied().find(|command| {
+            s[i..].starts_with(command) && is_control_word_boundary(s, i + command.len())
+        });
+        if let Some(command) = command {
+            while out.ends_with(' ') {
+                out.pop();
+            }
+            out.push(' ');
+            i += command.len();
+            while let Some(ch) = s.get(i..).and_then(|rest| rest.chars().next()) {
+                if !ch.is_whitespace() {
+                    break;
+                }
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
 
 /// Converts a single line of TeX math content into a Unicode string.
 ///
@@ -24,7 +62,8 @@ use symbols::{LITERAL_LBRACE_PLACEHOLDER, LITERAL_RBRACE_PLACEHOLDER, replace_sy
 /// 5. Clean up braces, keeping escaped literals
 /// 6. Handle the `\text{}` and `\boxed{}` environment commands
 pub(in crate::ai::stream) fn render_math_tex_to_unicode(s: &str) -> String {
-    let mut t = strip_sizing_commands(s);
+    let mut t = replace_named_spacing_commands(s);
+    t = strip_sizing_commands(&t);
 
     // Structural transforms must run before symbol substitution, since \frac{...}{...} relies on brace grouping
     t = replace_structural_tex(t);
@@ -132,6 +171,14 @@ mod tests {
     }
 
     #[test]
+    fn render_binom_as_combination_notation() {
+        for command in [r"\binom", r"\dbinom", r"\tbinom"] {
+            let result = render_math_tex_to_unicode(&format!("{command}{{n}}{{k}}"));
+            assert_eq!(result, "C(n, k)", "command: {command}");
+        }
+    }
+
+    #[test]
     fn render_subscript() {
         let result = render_math_tex_to_unicode(r#"NCF_7"#);
         assert!(result.contains("NCF"), "got: {result}");
@@ -165,5 +212,23 @@ mod tests {
         assert!(result.contains("-8600"), "got: {result}");
         assert!(result.contains("-360"), "got: {result}");
         assert!(result.contains("2345"), "got: {result}");
+    }
+
+    #[test]
+    fn renders_common_spacing_and_partial_scripts_without_raw_tex() {
+        let result = render_math_tex_to_unicode(
+            r"\sum_{n=0}^{\infty} ar^n = \frac{a}{1-r}, \quad |r| < 1",
+        );
+
+        assert_eq!(result, "∑ₙ₌₀⁽∞⁾ arⁿ = a/(1-r), |r| < 1");
+        assert!(!result.contains("\\quad"), "got: {result}");
+        assert!(!result.contains("^("), "got: {result}");
+    }
+
+    #[test]
+    fn renders_integral_bounds_with_compact_scripts() {
+        let result = render_math_tex_to_unicode(r"\int_{a}^{b} f(x)\,dx");
+
+        assert_eq!(result, "∫ₐᵇ f(x) dx");
     }
 }
