@@ -9,11 +9,11 @@ pub(super) enum InternalToolCallStreamEvent {
     Begin(String),
     Args(String),
     End,
-    /// 模型在可见正文里吐出的系统内部工具协议标记（如 `<function_results>`）。
-    /// 系统自身从不生成这类结果标记——它是模型退化、自编自演「工具调用→工具结果」
-    /// 循环的确定性指纹。streamer 已把整块剥离不外显；此事件通知上层：本轮已退化，
-    /// 应停流并降档重试（复用 degenerate_repetition 路径），而非把幻觉正文落盘毒化
-    /// 下一轮请求。相比文本统计阈值，这是零误伤信号：合法重复代码/措辞永不含此标记。
+    /// System-internal tool-protocol markers the model emits in visible body
+    /// text (e.g. `<function_results>`). The system itself never emits such
+    /// results — the deterministic fingerprint of a degenerate self-play loop. The
+    /// streamer strips the whole block from display; this event tells upper layers
+    /// the turn is degraded, so stop streaming and downgrade-retry (reuse the degenerate_repetition path) instead of persisting hallucinated text that would poison the next request. Unlike text-statistics thresholds this is a zero-false-positive signal: legitimate repeated code or wording never contains this marker.
     HallucinatedProtocolMarker,
 }
 
@@ -205,16 +205,16 @@ const TC_CLOSE_MARKER: &str = "</tool_call>";
 enum HermesXmlPhase {
     #[default]
     Idle,
-    /// 已吞掉 `<function=`，正在等待函数名后的 `>`。
+    /// Consumed `<function=`, waiting for the `>` after the function name.
     AwaitingName,
-    /// 已捕获函数名，正在缓冲 body 直到 `</function>`（期间不外显任何字符）。
+    /// Function name captured; buffering the body until `</function>` (nothing is echoed meanwhile).
     InBody { name: String },
 }
 
-/// 流式抑制 Hermes / Qwen 风格的 XML tool call（`<function=NAME>...</function>`，
-/// 可被 `<tool_call>` 包裹），在生成期间就把这段标记从可见输出里剥掉，并即时
-/// 转换成与 `<|tool_call_begin|>` 相同的 Begin/Args/End 事件交由统一管线渲染。
-/// 这样模型每轮调用工具时，终端不会先闪现一段 `<function=...>` 原始标记。
+/// Suppress Hermes / Qwen-style XML tool calls (`<function=NAME>...</function>`,
+/// possibly wrapped in `<tool_call>`) mid-stream: strip the markup from the visible output
+/// and convert it on the fly into the same Begin/Args/End events as `<|tool_call_begin|>` for the unified pipeline to render.
+/// This way the terminal never flashes the raw `<function=...>` markup when the model calls a tool.
 #[derive(Default)]
 pub(super) struct HermesXmlToolCallStreamer {
     pending: String,
@@ -237,8 +237,8 @@ impl HermesXmlToolCallStreamer {
                     let candidates = [FN_OPEN_MARKER, TC_OPEN_MARKER, TC_CLOSE_MARKER];
                     match earliest_substring_match(&self.pending, &candidates) {
                         Some((pos, idx, len)) => {
-                            // marker 之前的内容是正常可见文本；但紧邻 marker 的尾随
-                            // 空白只是包裹/调用前的噪声，去掉以免出现多余空行。
+                            // Content before the marker is normal visible text; but trailing whitespace
+                            // right before the marker is wrapper/call noise — trim it to avoid extra blank lines.
                             let before =
                                 self.pending[..pos].trim_end_matches([' ', '\t', '\r', '\n']);
                             cleaned.push_str(before);
@@ -247,15 +247,15 @@ impl HermesXmlToolCallStreamer {
                             if candidates[idx] == FN_OPEN_MARKER {
                                 self.phase = HermesXmlPhase::AwaitingName;
                             }
-                            // `<tool_call>` / `</tool_call>` 仅作包裹标记，直接抑制后继续。
+                            // `<tool_call>` / `</tool_call>` are wrapper markers only; suppress and continue.
                             continue;
                         }
                         None => {
-                            // 仅保留可能是 marker 前缀的尾巴，其余安全外显。
+                            // Keep only the tail that could still be a marker prefix; emit the rest safely.
                             let mut keep = longest_marker_suffix_prefix(&self.pending, &candidates);
-                            // 若正握着一个潜在 marker 前缀，则把紧邻其前的空白也一起
-                            // 暂存，避免 `<tool_call>\n<func` 这类拆包时把中间的 `\n`
-                            // 先闪出来。空白只是被推迟一帧，顺序不变。
+                            // When holding a potential marker prefix, also hold the whitespace right
+                            // before it, so a split like `<tool_call>\n<func` never flashes the middle `\n`
+                            // first. The whitespace is only deferred by one frame; ordering is unchanged.
                             if keep > 0 {
                                 let head = &self.pending[..self.pending.len() - keep];
                                 let trimmed = head.trim_end_matches([' ', '\t', '\r', '\n']);
@@ -277,7 +277,7 @@ impl HermesXmlToolCallStreamer {
                         self.phase = HermesXmlPhase::InBody { name };
                         continue;
                     }
-                    // 函数名尚未完整到达，等待后续 chunk（不外显半截名字）。
+                    // Function name not fully arrived yet: wait for later chunks (never echo a partial name).
                     break;
                 }
                 HermesXmlPhase::InBody { name } => {
@@ -296,7 +296,7 @@ impl HermesXmlToolCallStreamer {
                         self.phase = HermesXmlPhase::Idle;
                         continue;
                     }
-                    // body 未闭合，整体继续缓冲（不外显），等待 `</function>`。
+                    // Body still unclosed: keep buffering everything (no echo) and wait for `</function>`.
                     break;
                 }
             }
@@ -306,7 +306,7 @@ impl HermesXmlToolCallStreamer {
     }
 }
 
-/// Anthropic / Claude 风格的 XML tool call：
+/// Anthropic / Claude-style XML tool calls:
 /// ```text
 /// <function_calls>
 ///   <invoke name="read_file">
@@ -314,11 +314,11 @@ impl HermesXmlToolCallStreamer {
 ///   </invoke>
 /// </function_calls>
 /// ```
-/// 与 Hermes 形态（`<function=NAME>` / `<parameter=key>`）不同，这里用的是
-/// `name="..."` 属性，且外层包裹标签可能是 `function_calls` 或 `tool_calls`，
-/// 标签还可能带命名空间前缀（如 `antml:invoke`）。某些模型（deepseek-v4-flash）
-/// 会用这种格式输出工具调用，若不识别就会被当成普通文本原样打印，且 turn 被判
-/// 定为 Completed 直接结束 —— 表现为"突然停止且工具从未执行"。
+/// Unlike the Hermes form (`<function=NAME>` / `<parameter=key>`), this one uses
+/// a `name="..."` attribute, the outer wrapper tag is `function_calls` or `tool_calls`,
+/// and tags may carry a namespace prefix (e.g. `antml:invoke`). Some models
+/// (deepseek-v4-flash) emit tool calls in this format; unrecognized, they would be printed as plain text and the turn would be
+/// judged Completed and end right away — showing up as "it suddenly stopped and the tool never ran".
 #[derive(Default)]
 enum AnthropicXmlPhase {
     #[default]
@@ -334,9 +334,9 @@ enum AnthropicXmlPhase {
         force_string: bool,
         value: String,
     },
-    /// 正在吞除一个模型幻觉的「工具结果」块，直到遇到匹配的闭标签或流结束。
-    /// 块内所有内容（嵌套标签、幻觉结果文本、散文）一律不外显。上层会在收到
-    /// HallucinatedProtocolMarker 后立即停流降档重试，因此块通常只吞到停流为止。
+    /// Swallowing a model-hallucinated "tool result" block until the matching closing tag or end of stream.
+    /// Nothing inside the block (nested tags, hallucinated result text, prose) is echoed. Upper layers stop
+    /// and downgrade-retry as soon as HallucinatedProtocolMarker arrives, so the block is usually swallowed only until that stop.
     InResultBlock,
 }
 
@@ -347,30 +347,30 @@ pub(super) struct AnthropicXmlToolCallStreamer {
 }
 
 enum AnthropicTagClass {
-    /// `function_calls` / `tool_calls`（开或闭），仅作包裹，直接抑制。
+    /// `function_calls` / `tool_calls` (open or close): wrapper only, suppress directly.
     Wrapper,
     InvokeOpen(String),
     InvokeClose,
     ParamOpen {
         key: String,
-        /// `string="true"` 属性：参数值应始终作为字符串，即使值形如 JSON 标量。
+        /// `string="true"` attribute: the parameter value must always stay a string, even when it looks like a JSON scalar.
         force_string: bool,
     },
     ParamClose,
-    /// 系统内部「工具结果」协议标记（`function_results` / `tool_result` 等）。
-    /// 系统自身从不生成这类标记；出现即模型幻觉。开标签启动整块吞除，直到匹配的闭标签
-    /// （或流结束），块内所有幻觉「结果」文本一律不外显。
+    /// System-internal "tool result" protocol markers (`function_results` / `tool_result` etc.).
+    /// The system never emits these; seeing one means model hallucination. An open tag starts swallowing the whole block until the matching
+    /// closing tag (or end of stream); none of the hallucinated "result" text inside is echoed.
     ResultBlockOpen,
-    /// 上述结果块的闭标签，用于结束整块吞除。
+    /// Closing tag of the result block above; ends the whole-block swallow.
     ResultBlockClose,
-    /// 非工具标签（普通散文里的 `<...>`），原样外显。
+    /// Non-tool tags (`<...>` in ordinary prose): passed through as-is.
     Other,
 }
 
-/// 模型幻觉的「工具结果」协议标记本地名集合（不含尖括号与命名空间前缀）。
-/// 系统真实的工具结果绝不会以这种内联 XML 形式进入 assistant 可见正文——模型一旦
-/// 吐出，即是自编自演「调用→结果」退化循环的确定性指纹。开标签触发整块吞除，同时
-/// 上报 HallucinatedProtocolMarker 供上层降档重试。名单覆盖单/复数与常见幻觉变体。
+/// Local names of model-hallucinated "tool result" protocol markers (no angle brackets or namespace prefix).
+/// Real system tool results never reach the assistant's visible body in this inline XML form — the moment the model
+/// emits one, it is the deterministic fingerprint of a fabricated "call → result" loop. An open tag triggers the whole-block swallow and
+/// also reports HallucinatedProtocolMarker for upper layers to downgrade-retry. The list covers singular/plural and common hallucinated variants.
 const HALLUCINATED_RESULT_TAG_NAMES: &[&str] = &[
     "function_results",
     "function_result",
@@ -407,16 +407,16 @@ impl AnthropicXmlToolCallStreamer {
 
                     let gt_rel = self.pending[lt..].find('>');
                     let Some(gt_rel) = gt_rel else {
-                        // 标签未闭合：判断这截 `<...` 是否还可能成为工具/普通标签。
+                        // Tag not closed yet: decide whether this `<...` fragment could still become a tool/ordinary tag.
                         if could_be_tag_name_prefix(&self.pending[lt..]) {
-                            // 像在写标签名，先把 `<` 前的可见文本放出，剩余 hold。
+                            // Looks like a tag name being written: emit the visible text before `<`, hold the rest.
                             if lt > 0 {
                                 cleaned.push_str(&before);
                                 self.pending.drain(..lt);
                             }
                             break;
                         }
-                        // 不是标签（如散文里的 `<` ），把 `<` 当普通字符外显。
+                        // Not a tag (e.g. `<` in prose): emit `<` as an ordinary character.
                         cleaned.push_str(&before);
                         cleaned.push('<');
                         self.pending.drain(..lt + '<'.len_utf8());
@@ -424,13 +424,13 @@ impl AnthropicXmlToolCallStreamer {
                     };
 
                     let tag_start = lt;
-                    let tag_end = lt + gt_rel; // 指向 '>'
+                    let tag_end = lt + gt_rel; // points at '>'
                     let tag = self.pending[tag_start..=tag_end].to_string();
                     let class = classify_anthropic_tag(&tag);
                     let is_tool_tag = !matches!(class, AnthropicTagClass::Other);
 
                     if is_tool_tag {
-                        // 工具标签前的尾随空白只是排版噪声，去掉避免多余空行。
+                        // Trailing whitespace before a tool tag is layout noise; trim it to avoid extra blank lines.
                         let trimmed = before.trim_end_matches([' ', '\t', '\r', '\n']);
                         cleaned.push_str(trimmed);
                     } else {
@@ -447,23 +447,23 @@ impl AnthropicXmlToolCallStreamer {
                             };
                         }
                         AnthropicTagClass::ResultBlockOpen => {
-                            // 模型幻觉的「工具结果」块：进入整块吞除，并上报退化指纹。
+                            // Model-hallucinated "tool result" block: start the whole-block swallow and report the degeneration fingerprint.
                             self.phase = AnthropicXmlPhase::InResultBlock;
                             events.push(InternalToolCallStreamEvent::HallucinatedProtocolMarker);
                         }
                         AnthropicTagClass::ResultBlockClose => {
-                            // Idle 下遇到孤立闭标签（复读打乱了配对）：标签已被抑制，
-                            // 同样上报指纹——普通正文永不含 `</function_results>`。
+                            // Orphan closing tag in Idle (repetition broke the pairing): the tag is already suppressed,
+                            // report the fingerprint anyway — ordinary body text never contains `</function_results>`.
                             events.push(InternalToolCallStreamEvent::HallucinatedProtocolMarker);
                         }
-                        // Wrapper / 空名 invoke / 杂散闭合标签 / Other：已处理，继续。
+                        // Wrapper / empty-name invoke / stray closing tag / Other: already handled, continue.
                         _ => {}
                     }
                     continue;
                 }
                 1 => {
                     let Some(lt) = self.pending.find('<') else {
-                        // invoke 内标签之间的空白/换行直接抑制。
+                        // Whitespace/newlines between tags inside invoke are suppressed directly.
                         self.pending.clear();
                         break;
                     };
@@ -498,13 +498,13 @@ impl AnthropicXmlToolCallStreamer {
                             }
                             self.phase = AnthropicXmlPhase::Idle;
                         }
-                        // 其它标签（含未知）在 invoke 内一律抑制。
+                        // All other tags (including unknown) inside invoke are suppressed.
                         _ => {}
                     }
                     continue;
                 }
                 2 => {
-                    // InParamValue：累积原始值，直到遇到 `</parameter>` 闭合标签。
+                    // InParamValue: accumulate the raw value until the `</parameter>` closing tag.
                     let Some(lt) = self.pending.find('<') else {
                         if let AnthropicXmlPhase::InParamValue { value, .. } = &mut self.phase {
                             value.push_str(&self.pending);
@@ -513,7 +513,7 @@ impl AnthropicXmlToolCallStreamer {
                         break;
                     };
                     let Some(gt_rel) = self.pending.find('>') else {
-                        // 有 `<` 但标签未闭合：`<` 前是值内容，从 `<` 起 hold。
+                        // `<` seen but the tag is not closed: text before `<` is value content; hold from `<` onward.
                         if lt > 0 {
                             if let AnthropicXmlPhase::InParamValue { value, .. } = &mut self.phase {
                                 value.push_str(&self.pending[..lt]);
@@ -540,7 +540,7 @@ impl AnthropicXmlToolCallStreamer {
                         }
                         self.pending.drain(..=gt_rel);
                     } else {
-                        // `<...>` 属于值内容（如代码片段），并入值后继续。
+                        // `<...>` belongs to the value (e.g. a code snippet); fold it into the value and continue.
                         if let AnthropicXmlPhase::InParamValue { value, .. } = &mut self.phase {
                             value.push_str(&self.pending[..=gt_rel]);
                         }
@@ -549,20 +549,20 @@ impl AnthropicXmlToolCallStreamer {
                     continue;
                 }
                 _ => {
-                    // InResultBlock：吞除幻觉「工具结果」块内的所有内容，直到匹配的闭标签
-                    // （`</function_results>` 等）；块内嵌套标签、结果文本、散文一律不外显。
+                    // InResultBlock: swallow everything inside the hallucinated "tool result" block until the matching closing
+                    // tag (`</function_results>` etc.); nested tags, result text, and prose inside are never echoed.
                     let Some(lt) = self.pending.find('<') else {
-                        // 没有标签起始：全是块内文本，丢弃。
+                        // No tag start: it is all in-block text; discard.
                         self.pending.clear();
                         break;
                     };
-                    // `<` 前的内容仍是块内文本，丢弃。
+                    // Content before `<` is still in-block text; discard.
                     if lt > 0 {
                         self.pending.drain(..lt);
                     }
                     let Some(gt_rel) = self.pending.find('>') else {
-                        // 标签未闭合：可能是块内文本里的 `<`，也可能是半截闭标签。
-                        // 若还可能是标签名前缀就 hold 等待下一 chunk；否则丢弃这个 `<`。
+                        // Tag not closed: could be a `<` inside block text or a partial closing tag.
+                        // If it could still be a tag-name prefix, hold and wait for the next chunk; otherwise discard this `<`.
                         if could_be_tag_name_prefix(&self.pending) {
                             break;
                         }
@@ -575,10 +575,10 @@ impl AnthropicXmlToolCallStreamer {
                         classify_anthropic_tag(&tag),
                         AnthropicTagClass::ResultBlockClose
                     ) {
-                        // 块结束，回到 Idle。闭标签本身也被吞除，不外显。
+                        // Block ended, back to Idle. The closing tag itself is swallowed too, never echoed.
                         self.phase = AnthropicXmlPhase::Idle;
                     }
-                    // 其它标签（含嵌套 open/未知）在结果块内一律抑制。
+                    // All other tags (including nested opens/unknown) inside the result block are suppressed.
                     continue;
                 }
             }
@@ -597,8 +597,8 @@ enum BareXmlPhase {
     },
 }
 
-/// 裸工具名 XML：`<execute_command>pwd</execute_command>`。
-/// 仅在标签名本身就是已注册工具名时生效；否则原样透传，避免误伤普通 HTML/XML。
+/// Bare tool-name XML: `<execute_command>pwd</execute_command>`.
+/// Only takes effect when the tag name itself is a registered tool name; otherwise pass through untouched to avoid false positives on ordinary HTML/XML.
 #[derive(Default)]
 pub(super) struct BareXmlToolCallStreamer {
     pending: String,
@@ -714,14 +714,14 @@ fn insert_anthropic_param(
         params.insert(key, serde_json::Value::String(raw.to_string()));
         return;
     }
-    // 尝试把值解析成 JSON 标量/结构（数字、bool、对象、数组）；否则当字符串。
+    // Try to parse the value as a JSON scalar/structure (number, bool, object, array); otherwise treat it as a string.
     let value = serde_json::from_str::<serde_json::Value>(raw)
         .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
     params.insert(key, value);
 }
 
-/// 判断未闭合的 `<...` 片段是否还可能是一个标签名前缀（用于跨 chunk 缓冲决策）。
-/// 真正的标签名是连续的 name 字符；一旦出现空白或其它字符就不是标签起始（散文）。
+/// Decide whether an unclosed `<...` fragment could still be a tag-name prefix (used for cross-chunk buffering decisions).
+/// A real tag name is a run of name characters; any whitespace or other character means this is not a tag start (prose).
 fn could_be_tag_name_prefix(after_lt: &str) -> bool {
     let body = after_lt.strip_prefix('<').unwrap_or(after_lt);
     let body = body.strip_prefix('/').unwrap_or(body);
@@ -735,7 +735,7 @@ fn could_be_tag_name_prefix(after_lt: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-')
 }
 
-/// 把单个 `<...>` 标签分类。标签名允许命名空间前缀（取最后一个 `:` 之后的本地名）。
+/// Classify a single `<...>` tag. Tag names may carry a namespace prefix (the local name after the last `:` is used).
 fn classify_anthropic_tag(tag: &str) -> AnthropicTagClass {
     let inner = tag.trim_start_matches('<').trim_end_matches('>').trim();
     let is_close = inner.starts_with('/');
@@ -776,7 +776,7 @@ fn classify_anthropic_tag(tag: &str) -> AnthropicTagClass {
     }
 }
 
-/// 从标签属性串里解析 `name="..."` 或 `name='...'` 的值。
+/// Parse the `name="..."` or `name='...'` value out of a tag's attribute string.
 fn parse_anthropic_name_attr(attrs: &str) -> String {
     parse_xml_attr_value(attrs, "name")
         .unwrap_or_default()
@@ -787,7 +787,7 @@ fn parse_anthropic_bool_attr(attrs: &str, name: &str) -> bool {
     parse_xml_attr_value(attrs, name).is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-/// 按 XML 属性边界扫描属性值，避免把目标名称误匹配到其他属性名或已引用的属性值中。
+/// Scan attribute values along XML attribute boundaries so the target name is never mismatched into other attribute names or already-quoted values.
 pub(super) fn parse_xml_attr_value<'a>(input: &'a str, target: &str) -> Option<&'a str> {
     let bytes = input.as_bytes();
     let mut cursor = 0;
@@ -1217,14 +1217,14 @@ mod tests {
                 "list_agents".to_string()
             ))
         );
-        // 无参数 → 空对象。
+        // No parameters → empty object.
         assert!(events.contains(&InternalToolCallStreamEvent::Args("{}".to_string())));
     }
 
     #[test]
     fn hermes_streamer_holds_markup_split_across_chunks() {
         let mut s = HermesXmlToolCallStreamer::new();
-        // marker 被切成两半到达，中途不得外显任何半截标记。
+        // The marker arrives split in half; no partial marker may ever be echoed midway.
         let (c1, e1) = s.push("<tool_call>\n<func");
         assert_eq!(c1, "");
         assert!(e1.is_empty());
@@ -1291,12 +1291,12 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    // ── 幻觉「工具结果」协议标记（漏洞A/B 修复）──────────────────────────
+            // ── Hallucinated "tool result" protocol markers (bug A/B fix) ──────────────────────────
 
     #[test]
     fn anthropic_streamer_swallows_hallucinated_result_block_and_signals() {
-        // 模型自编自演的「工具结果」：整块（标签+内含幻觉结果文本）不外显，
-        // 且上报 HallucinatedProtocolMarker 供上层降档重试。
+        // Model-fabricated "tool results": the whole block (tag + hallucinated result text) is never echoed,
+        // and HallucinatedProtocolMarker is reported so upper layers can downgrade-retry.
         let mut s = super::AnthropicXmlToolCallStreamer::new();
         let (cleaned, events) = s.push(
             "正在读取文件<function_results>File: a.rs\n3 matches found</function_results>完成",
@@ -1310,7 +1310,7 @@ mod tests {
 
     #[test]
     fn anthropic_streamer_swallows_result_block_split_across_chunks() {
-        // 跨-chunk：开标签、结果文本、闭标签分散在多个 chunk 里，仍整块吞除。
+        // Cross-chunk: open tag, result text, and closing tag spread across multiple chunks are still swallowed as one block.
         let mut s = super::AnthropicXmlToolCallStreamer::new();
         let mut all_cleaned = String::new();
         let mut all_events = Vec::new();
@@ -1333,7 +1333,7 @@ mod tests {
 
     #[test]
     fn anthropic_streamer_signals_on_orphan_result_close_tag() {
-        // 复读打乱配对时会出现孤立闭标签；它同样是零误伤指纹，需抑制并上报。
+        // Repetition breaking the pairing produces orphan closing tags; they are the same zero-false-positive fingerprint — suppress and report.
         let mut s = super::AnthropicXmlToolCallStreamer::new();
         let (cleaned, events) = s.push("尾部残留</function_results>之后");
         assert_eq!(cleaned, "尾部残留之后");
@@ -1342,7 +1342,7 @@ mod tests {
 
     #[test]
     fn anthropic_streamer_handles_namespaced_result_tag() {
-        // 带命名空间前缀（如 `antml:`）的幻觉标记同样命中本地名。
+        // Hallucinated markers with a namespace prefix (e.g. `antml:`) also match by local name.
         let mut s = super::AnthropicXmlToolCallStreamer::new();
         let (cleaned, events) = s.push("x<tool_result>garbage</tool_result>y");
         assert_eq!(cleaned, "xy");
@@ -1351,7 +1351,7 @@ mod tests {
 
     #[test]
     fn anthropic_streamer_keeps_legit_html_and_normal_invoke_untouched() {
-        // 零误伤回归：普通 HTML 原样保留、不产生幻觉信号。
+        // Zero-false-positive regression: ordinary HTML is kept as-is and produces no hallucination signal.
         let mut s = super::AnthropicXmlToolCallStreamer::new();
         let (cleaned, events) = s.push("see <div>result</div> and <span>ok</span>");
         assert_eq!(cleaned, "see <div>result</div> and <span>ok</span>");
@@ -1359,7 +1359,7 @@ mod tests {
             !events.contains(&InternalToolCallStreamEvent::HallucinatedProtocolMarker),
             "普通 HTML 不得触发幻觉信号"
         );
-        // 合法 invoke 工具调用仍正常解析，不受结果块逻辑影响。
+        // Legitimate invoke tool calls still parse normally, unaffected by the result-block logic.
         let mut s2 = super::AnthropicXmlToolCallStreamer::new();
         let (cleaned2, events2) = s2.push(
             r#"go<invoke name="read_file"><parameter name="path">/x</parameter></invoke>done"#,
@@ -1374,7 +1374,7 @@ mod tests {
 
     #[test]
     fn anthropic_streamer_respects_string_true_attr() {
-        // DSML `string="true"`：值看起来像 JSON 标量时仍保持为字符串。
+        // DSML `string="true"`: values that look like JSON scalars still stay strings.
         let mut s = super::AnthropicXmlToolCallStreamer::new();
         let (cleaned, events) = s.push(
             r#"<tool_calls><invoke name="enable_tools"><parameter name="operation" string="true">enable</parameter><parameter name="tools" string="false">["read_file"]</parameter><parameter name="flag" string="true">true</parameter></invoke></tool_calls>"#,

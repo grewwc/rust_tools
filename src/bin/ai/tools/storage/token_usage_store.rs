@@ -1,22 +1,23 @@
-//! LLM token 用量统计存储（独立 SQLite 表），含费用与按天趋势。
+//! LLM token usage stats storage (separate SQLite table), with cost and per-day trends.
 //!
-//! 审计的"采集"由 OS 层负责：内核 `LlmOps::llm_account` 在每次 LLM 调用结束时
-//! 把用量追加进有界账本（见 `aios_kernel::primitives::LlmUsageRing`）。本模块是
-//! 审计的"落库"侧：从内核账本 drain 出 [`LlmUsageRecord`] 并写入一张单独的表
-//! `token_usage`，记录：
-//!   - `created_at`     ：落库时间（Unix epoch 秒，即调用结束时刻）
-//!   - `model`          ：模型名
-//!   - `input_tokens`   ：输入 token（prompt_tokens）
-//!   - `output_tokens`  ：输出 token（completion_tokens）
-//!   - `total_tokens`   ：总 token（prompt + completion）
+//! The "collection" side of auditing is handled by the OS layer: the kernel's `LlmOps::llm_account`
+//! appends usage to a bounded ledger at the end of every LLM call (see
+//! `aios_kernel::primitives::LlmUsageRing`). This module is the "persistence" side of auditing:
+//! it drains [`LlmUsageRecord`] entries from the kernel ledger into a separate `token_usage`
+//! table, recording:
+//!   - `created_at`     : persistence time (Unix epoch seconds, i.e. when the call ended)
+//!   - `model`          : model name
+//!   - `input_tokens`   : input tokens (prompt_tokens)
+//!   - `output_tokens`  : output tokens (completion_tokens)
+//!   - `total_tokens`   : total tokens (prompt + completion)
 //!
-//! 数据库默认放在 `~/.config/rust_tools/token_usage.db`，与 `agent_memory.db`
-//! 同目录。连接放在全局 `LazyLock<Mutex<Connection>>` 单例里，避免与 `app.os` 的
-//! kernel 锁竞争。写入是 best-effort：失败仅打印 warning，不阻断主流程。
+//! The database defaults to `~/.config/rust_tools/token_usage.db`, in the same directory as
+//! `agent_memory.db`. The connection lives in a global `LazyLock<Mutex<Connection>>` singleton to avoid
+//! contending with the `app.os` kernel lock. Writes are best-effort: failures only log a warning and never block the main flow.
 //!
-//! 沿用仓库约定：没有 migrations 框架，统一 `CREATE TABLE IF NOT EXISTS`。
-//! 支持按保留天数清理过旧数据（`cleanup_old`），写入路径会按一定频率自动触发。新
-//! 列通过 `ALTER TABLE ADD COLUMN` 渐进式迁移，忽略"列已存在"的错误。
+//! Follows the repo convention: no migrations framework; tables are created with `CREATE TABLE IF NOT EXISTS`.
+//! Supports purging data older than the retention window (`cleanup_old`), auto-triggered periodically from the write path. New
+//! columns are migrated incrementally via `ALTER TABLE ADD COLUMN`, ignoring "duplicate column" errors.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,21 +31,21 @@ use aios_kernel::primitives::LlmUsageRecord;
 use crate::ai::config_schema::AiConfig;
 use crate::commonw::configw;
 
-/// 默认保留天数：超过该天数的记录会在自动清理时删除。
+/// Default retention days: records older than this are deleted during automatic cleanup.
 const DEFAULT_RETAIN_DAYS: u64 = 90;
-/// 每写入多少条触发一次自动清理（避免每次写都扫全表）。
+/// Number of writes that trigger one automatic cleanup pass (avoids a full-table scan on every write).
 const CLEANUP_EVERY_N_INSERTS: u64 = 100;
-/// cost_micros → 分的换算系数（1 分 = 10,000 μ$）。
+/// Conversion factor from cost_micros to cents (1 cent = 10,000 μ$).
 const MICROS_PER_CENT: u64 = 10_000;
 
-/// 自插入计数器，用于按频率触发自动清理。
+/// Self-insertion counter used to trigger automatic cleanup at a fixed frequency.
 static INSERT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// 已 drain 落库的内核账本游标（kernel `LlmUsageRecord::seq`）。
-/// 调用方据此向内核 `llm_usage_drain_since(cursor)` 拿增量记录，落库成功后推进。
+/// Kernel ledger cursor up to which records have been drained and persisted (kernel `LlmUsageRecord::seq`).
+/// Callers use it to fetch incremental records via the kernel's `llm_usage_drain_since(cursor)`, advancing it after a successful persist.
 static DRAIN_CURSOR: AtomicU64 = AtomicU64::new(0);
 
-/// 全局连接单例。`None` 表示初始化失败（路径不可写等），后续写入直接跳过。
+/// Global connection singleton. `None` means initialization failed (e.g. path not writable); subsequent writes are skipped.
 static STORE: LazyLock<Option<Mutex<Connection>>> = LazyLock::new(|| match open_store() {
     Ok(conn) => Some(Mutex::new(conn)),
     Err(e) => {
@@ -53,7 +54,7 @@ static STORE: LazyLock<Option<Mutex<Connection>>> = LazyLock::new(|| match open_
     }
 });
 
-/// 解析数据库文件路径：优先配置项 `ai.token_usage.db`，否则用默认路径。
+/// Resolve the database file path: prefer the `ai.token_usage.db` config key, else the default path.
 fn db_path() -> PathBuf {
     let cfg = configw::get_all_config();
     let raw = cfg
@@ -63,7 +64,7 @@ fn db_path() -> PathBuf {
     PathBuf::from(crate::commonw::utils::expanduser(raw.trim()).as_ref())
 }
 
-/// 打开并初始化数据库连接。
+/// Open and initialize the database connection.
 fn open_store() -> Result<Connection, String> {
     let path = db_path();
     if let Some(parent) = path.parent() {
@@ -75,7 +76,7 @@ fn open_store() -> Result<Connection, String> {
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
     let _ = conn.pragma_update(None, "synchronous", "NORMAL");
     conn.execute_batch(
-        // 新库完整建表；存量库已有该表则跳过。
+        // Create the full schema for new databases; skip when an existing DB already has the table.
         r#"
         CREATE TABLE IF NOT EXISTS token_usage (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,7 +93,7 @@ fn open_store() -> Result<Connection, String> {
     )
     .map_err(|e| format!("init token_usage schema: {e}"))?;
 
-    // 渐进式迁移：为存量库添加新增列（忽略"列已存在"错误）。
+    // Incremental migration: add the new columns to existing databases (ignoring "duplicate column" errors).
     let migrations = [
         "ALTER TABLE token_usage ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE token_usage ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0",
@@ -100,7 +101,7 @@ fn open_store() -> Result<Connection, String> {
     for sql in &migrations {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
-            // SQLite 3.35+ 返回 1 "duplicate column name"；旧版返回其他措辞。
+            // SQLite 3.35+ returns 1 "duplicate column name"; older versions return different wording.
             if !msg.to_lowercase().contains("duplicate column") {
                 eprintln!("[TokenUsage] migration warning: {e}");
             }
@@ -110,7 +111,7 @@ fn open_store() -> Result<Connection, String> {
     Ok(conn)
 }
 
-/// 是否启用 token 统计（默认开启，设为 false 关闭）。
+/// Whether token accounting is enabled (on by default; set to false to turn it off).
 fn enabled() -> bool {
     let cfg = configw::get_all_config();
     !cfg.get_opt(AiConfig::TOKEN_USAGE_ENABLE)
@@ -126,19 +127,19 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 当前 drain 游标：调用方据此向内核拿增量账本记录。
+/// Current drain cursor: callers use it to fetch incremental ledger records from the kernel.
 pub(crate) fn drain_cursor() -> u64 {
     DRAIN_CURSOR.load(Ordering::Relaxed)
 }
 
-/// 把从内核 drain 出的账本记录批量落库。best-effort：失败仅 warning，不返回错误。
+/// Batch-persist ledger records drained from the kernel. Best-effort: failures only log a warning and no error is returned.
 ///
-/// `new_head` 是内核账本当前 head seq（`llm_usage_head_seq()`）；落库成功后游标
-/// 推进到该值，下次只 drain 新增记录。`records` 应为 `drain_since(drain_cursor())`
-/// 的结果（升序、seq 严格大于旧游标）。
+/// `new_head` is the current head seq of the kernel ledger (`llm_usage_head_seq()`); after a successful
+/// persist the cursor advances to that value so the next drain only fetches new records. `records` should be
+/// the result of `drain_since(drain_cursor())` (ascending, with seq strictly greater than the old cursor).
 pub(crate) fn persist_drained(records: &[LlmUsageRecord], new_head: u64) {
     if !enabled() {
-        // 关闭统计时也推进游标，避免重新开启后回放历史账本。
+        // Advance the cursor even when accounting is disabled, so re-enabling it does not replay the historical ledger.
         DRAIN_CURSOR.store(new_head, Ordering::Relaxed);
         return;
     }
@@ -185,7 +186,7 @@ pub(crate) fn persist_drained(records: &[LlmUsageRecord], new_head: u64) {
                 r.cost_micros as i64,
             ]) {
                 eprintln!("[TokenUsage] insert failed: {e}");
-                // 整批回滚并保留 drain 游标，避免跳过失败记录造成永久漏计。
+                // Roll back the whole batch and keep the drain cursor, so failed records never cause a permanent accounting gap.
                 return;
             } else {
                 inserted += 1;
@@ -196,10 +197,10 @@ pub(crate) fn persist_drained(records: &[LlmUsageRecord], new_head: u64) {
         eprintln!("[TokenUsage] commit failed: {e}");
         return;
     }
-    // 落库成功，推进游标。
+    // Persist succeeded; advance the cursor.
     DRAIN_CURSOR.store(new_head, Ordering::Relaxed);
 
-    // 按频率触发自动清理，避免每次写入都扫全表。
+    // Trigger automatic cleanup at a fixed frequency to avoid a full-table scan on every write.
     let n = INSERT_COUNTER.fetch_add(inserted, Ordering::Relaxed) + inserted;
     if inserted > 0 && n % CLEANUP_EVERY_N_INSERTS < inserted {
         let retain_days = configw::get_all_config()
@@ -211,7 +212,7 @@ pub(crate) fn persist_drained(records: &[LlmUsageRecord], new_head: u64) {
     }
 }
 
-/// 删除早于 `retain_days` 天的记录（持有连接锁时调用）。
+/// Delete records older than `retain_days` days (call while holding the connection lock).
 fn cleanup_old_locked(conn: &mut Connection, retain_days: u64) {
     let cutoff = now_secs().saturating_sub(retain_days * 86400);
     if let Err(e) = conn.execute(
@@ -222,46 +223,46 @@ fn cleanup_old_locked(conn: &mut Connection, retain_days: u64) {
     }
 }
 
-/// 一段时间窗口内的 token 用量合计。
+/// Aggregated token usage over a time window.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UsageTotals {
     pub calls: u64,
     pub input: u64,
     pub output: u64,
-    /// `output` 中属于 reasoning/thinking 的子集。
+    /// The subset of `output` spent on reasoning/thinking.
     pub reasoning: u64,
     pub total: u64,
     pub cost_micros: u64,
 }
 
-/// 按模型聚合的一行用量。
+/// One usage row aggregated per model.
 #[derive(Debug, Clone)]
 pub(crate) struct UsageByModel {
     pub model: String,
     pub calls: u64,
     pub input: u64,
     pub output: u64,
-    /// `output` 中属于 reasoning/thinking 的子集。
+    /// The subset of `output` spent on reasoning/thinking.
     pub reasoning: u64,
     pub total: u64,
     pub cost_micros: u64,
 }
 
-/// 按天聚合的一行用量。
+/// One usage row aggregated per day.
 #[derive(Debug, Clone)]
 pub(crate) struct DailyUsage {
     pub day: String,
     pub calls: u64,
     pub input: u64,
     pub output: u64,
-    /// `output` 中属于 reasoning/thinking 的子集。
+    /// The subset of `output` spent on reasoning/thinking.
     pub reasoning: u64,
     pub total: u64,
     pub cost_micros: u64,
 }
 
-/// 查询某时间窗口内的总用量。`window_secs=None` 表示全部历史；
-/// 否则统计最近 `window_secs` 秒。`None` 返回值表示存储不可用。
+/// Query total usage over a time window. `window_secs=None` means all history;
+/// otherwise only the last `window_secs` seconds are counted. A `None` return means storage is unavailable.
 pub(crate) fn query_totals(window_secs: Option<u64>) -> Option<UsageTotals> {
     let store = STORE.as_ref()?;
     let conn = match store.lock() {
@@ -289,7 +290,7 @@ pub(crate) fn query_totals(window_secs: Option<u64>) -> Option<UsageTotals> {
     .ok()
 }
 
-/// 查询某时间窗口内按模型聚合的用量，按总 token 降序。
+/// Query per-model aggregated usage over a time window, ordered by total tokens descending.
 pub(crate) fn query_by_model(window_secs: Option<u64>) -> Option<Vec<UsageByModel>> {
     let store = STORE.as_ref()?;
     let conn = match store.lock() {
@@ -322,29 +323,29 @@ pub(crate) fn query_by_model(window_secs: Option<u64>) -> Option<Vec<UsageByMode
     Some(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// 查询最近 N 个自然日的按天聚合用量（每天一行），从最新一天开始降序。
+/// Query per-day aggregated usage for the last N calendar days (one row per day), newest first.
 pub(crate) fn query_daily_breakdown(days: u64) -> Option<Vec<DailyUsage>> {
     query_daily_impl(days, None)
 }
 
-/// 查询最近有数据的 N 天（每天一行），从最新一天开始降序。
-/// 与 [`query_daily_breakdown`] 的区别：后者按自然日窗口截断；本函数不限时间窗口，
-/// 只取有数据的前 `limit` 天，适合"默认概览只看最近有数几天"的场景。
+/// Query the most recent N days that have data (one row per day), newest first.
+/// Difference from [`query_daily_breakdown`]: that function truncates to a calendar-day window; this one has no time window,
+/// and just takes the first `limit` days that have data, fitting the "default overview shows the most recent days with data" case.
 pub(crate) fn query_recent_days(limit: usize) -> Option<Vec<DailyUsage>> {
     query_daily_impl(0, Some(limit as i64))
 }
 
-/// 按天聚合用量的内部实现。
+/// Internal implementation of per-day usage aggregation.
 ///
-/// - `days > 0`：只统计最近 `days` 个自然日（`cutoff = now - days*86400`）。
-/// - `limit > 0`：只保留有数据的前 `limit` 天（`ORDER BY day DESC LIMIT limit`）。
+/// - `days > 0`: only count the last `days` calendar days (`cutoff = now - days*86400`).
+/// - `limit > 0`: keep only the first `limit` days that have data (`ORDER BY day DESC LIMIT limit`).
 fn query_daily_impl(days: u64, limit: Option<i64>) -> Option<Vec<DailyUsage>> {
     let store = STORE.as_ref()?;
     let conn = match store.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    // days=0 表示不限时间窗口（cutoff=0）；否则只取最近 days 个自然日。
+    // days=0 means no time window (cutoff=0); otherwise only the last `days` calendar days are counted.
     let cutoff = if days == 0 {
         0i64
     } else {
@@ -354,8 +355,8 @@ fn query_daily_impl(days: u64, limit: Option<i64>) -> Option<Vec<DailyUsage>> {
         Some(n) if n > 0 => format!("LIMIT {n}"),
         _ => String::new(),
     };
-    // 用 'localtime' 把 UTC epoch 秒转成本地日期再分组，否则 UTC+8 凌晨的调用
-    // 会被归到前一天，导致"今天的用量"显示为昨天。
+    // Use 'localtime' to convert UTC epoch seconds to the local date before grouping; otherwise calls made in the
+    // small hours of UTC+8 get attributed to the previous day, making "today's usage" show up as yesterday.
     let sql = format!(
         "\
         SELECT DATE(created_at, 'unixepoch', 'localtime') AS day, \
@@ -397,28 +398,28 @@ fn query_daily_impl(days: u64, limit: Option<i64>) -> Option<Vec<DailyUsage>> {
     Some(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// 数据库文件路径（供 `/usage` 展示）。
+/// Database file path (displayed by `/usage`).
 pub(crate) fn store_path() -> PathBuf {
     db_path()
 }
 
-/// 是否启用（供 `/usage` 展示）。
+/// Whether enabled (displayed by `/usage`).
 pub(crate) fn is_enabled() -> bool {
     enabled()
 }
 
-/// 把 cost_micros（微元）格式化为可读字符串。1 美元 = 1,000,000 μ$。
+/// Format cost_micros (micro-dollars) as a human-readable string. 1 USD = 1,000,000 μ$.
 pub(crate) fn format_cost(micros: u64) -> String {
     if micros >= 100_000_000 {
-        // ≥ $100：显示美元整数
+        // ≥ $100: show whole dollars
         format!("${}", micros / 1_000_000)
     } else if micros >= 1_000_000 {
-        // $1 – $99.99：显示美元加两位小数
+        // $1 – $99.99: show dollars with two decimal places
         let dol = micros / 1_000_000;
         let cent = (micros % 1_000_000) / 10_000;
         format!("${}.{:02}", dol, cent)
     } else if micros >= 10_000 {
-        // 1¢ – 99.99¢：显示分
+        // 1¢ – 99.99¢: show cents
         let c = micros / 10_000;
         let f = (micros % 10_000) / 100;
         if f == 0 {

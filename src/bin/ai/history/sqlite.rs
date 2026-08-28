@@ -29,6 +29,7 @@ use super::{
 const STALE_PATCH_TARGETS_META_KEY: &str = "stale_patch_targets_v1";
 const LLM_PRUNE_MARKS_META_KEY: &str = "llm_prune_marks_v1";
 const LAST_ACTIVITY_META_KEY: &str = "last_activity_unix_ms";
+const SESSION_MARKED_META_KEY: &str = "session_marked";
 
 static SESSION_STATE_LOCKS: LazyLock<Mutex<FxHashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
@@ -333,6 +334,8 @@ pub(in crate::ai) struct SessionListMetadata {
     pub(in crate::ai) session_title: Option<String>,
     pub(in crate::ai) last_activity_unix_ms: Option<i64>,
     pub(in crate::ai) history_revision: i64,
+    /// Whether the user marked this session as important via `/mark`.
+    pub(in crate::ai) marked: bool,
 }
 
 fn open_history_db(path: &Path) -> Result<Connection, io::Error> {
@@ -2557,6 +2560,47 @@ pub(in crate::ai) fn read_session_list_metadata_sqlite(
         last_activity_unix_ms: read_i64_meta_from_conn(&conn, LAST_ACTIVITY_META_KEY)
             .or_else(|| read_latest_message_activity_unix_ms(&conn)),
         history_revision: read_i64_meta_from_conn(&conn, "history_revision").unwrap_or(0),
+        marked: read_session_marked_from_conn(&conn),
+    })
+}
+
+/// Read the session "important" mark stored under meta key `session_marked`.
+/// Missing or unparsable values are treated as unmarked (no session is important
+/// by default).
+fn read_session_marked_from_conn(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key='session_marked' LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .unwrap_or(None)
+    .is_some_and(|value| value == "1")
+}
+
+/// Read the session "important" mark (`/mark`).
+pub(in crate::ai) fn read_session_marked_sqlite(path: &Path) -> io::Result<bool> {
+    let conn = open_history_db_read_only(path)?;
+    Ok(read_session_marked_from_conn(&conn))
+}
+
+/// Persist the session "important" mark (`/mark` / `/unmark`). Uses a key/value
+/// in the meta table so the flag survives clear-history and is copied by fork /
+/// import (both copy the whole SQLite file).
+pub(in crate::ai) fn write_session_marked_sqlite(path: &Path, marked: bool) -> io::Result<()> {
+    with_session_state_lock(path, || {
+        let mut conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())",
+            rusqlite::params![SESSION_MARKED_META_KEY, if marked { "1" } else { "0" }],
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+        touch_session_activity(&tx)?;
+        tx.commit().map_err(|e| io::Error::other(e.to_string()))
     })
 }
 

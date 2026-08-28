@@ -252,20 +252,20 @@ fn maybe_downgrade_long_term_save(
     )
 }
 
-/// 判断一条记忆是否豁免 30d 时间窗 GC / 配额淘汰。
+/// Determines whether a memory entry is exempt from the 30-day time-window GC / quota eviction.
 ///
-/// 历史实现只看 `priority == 255`：
-///   - 用户偏好 / coding_guideline / project_memory 等长期资产 priority 是 210/180，
-///     30 天没刷新就有概率被 GC 掉，与"长期记忆应该保留"的直觉不符。
+/// The historical implementation only checked `priority == 255`:
+///   - Long-lived assets such as user preferences / coding_guideline / project_memory have priority 210/180,
+///     so they could be GC'd after 30 days without refresh, contradicting the intuition that "long-term memory should be kept".
 ///
-/// 新策略：priority==255 仍然豁免（safety_rules 等显式声明的永久记忆），
-/// 同时把以下 category 视为长期资产，无论 priority 多少都豁免：
-///   - 多数 guideline 类（safety/preference/user_preference/coding_guideline/
-///     best_practice/common_sense）
-///   - `project_memory`：项目级事实，writeback 路径会主动 upsert，不应被时间淘汰
+/// New policy: priority==255 stays exempt (explicitly declared permanent memories such as safety_rules),
+/// and the following categories are also treated as long-lived assets, exempt regardless of priority:
+///   - Most guideline-like categories (safety/preference/user_preference/coding_guideline/
+///     best_practice/common_sense)
+///   - `project_memory`: project-level facts that the writeback path actively upserts; they must not be evicted by time
 ///
-/// 注意 self_note 是会话期反思，不属于长期资产白名单，
-/// 也不在此处豁免 GC（自然落入正常时间淘汰）。
+/// Note: self_note is a within-session reflection and is not part of the long-lived asset whitelist;
+/// it is not exempted from GC here either (it naturally falls under normal time-based eviction).
 pub(crate) fn is_permanent_memory(entry: &AgentMemoryEntry) -> bool {
     if entry.priority.unwrap_or(100) == 255 {
         return true;
@@ -531,14 +531,14 @@ pub(crate) fn execute_memory_search(args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
-/// 带分数的 memo 检索结果。
+/// A scored memo search result.
 pub(crate) struct ScoredMemo {
     pub entry: AgentMemoryEntry,
     pub score: f64,
 }
 
-/// 根据查询文本检索 memo 候选条目，返回结构化条目（按相关度排序）。
-/// 用于 `-nd` 删除流程：让上层用模型挑选最匹配的条目再确认删除。
+/// Searches memo candidate entries by query text and returns structured entries (sorted by relevance).
+/// Used by the `-nd` delete flow: lets the upper layer pick the best-matching entry with the model before confirming deletion.
 pub(crate) fn search_memo_candidates(
     query: &str,
     limit: usize,
@@ -552,7 +552,7 @@ pub(crate) fn search_memo_candidates(
     )
 }
 
-/// 与 `search_memo_candidates` 同源，但保留分数。
+/// Same source as `search_memo_candidates`, but keeps the scores.
 pub(crate) fn search_memo_candidates_scored(
     query: &str,
     limit: usize,
@@ -564,10 +564,10 @@ pub(crate) fn search_memo_candidates_scored(
     }
     let limit = limit.clamp(1, 50);
     let store = MemoryStore::from_env_or_config();
-    // `a -n` 保存的用户笔记固定为 memo；-ns / -nd / -ne 都只处理这类条目。
-    // include_archives=false 时只读当前 memory 文件：删除/编辑只能改写当前文件，
-    // 即便全局开启了 ai.memory.search_archives.enable 也不纳入归档候选，
-    // 否则用户选中归档条目后删除/更新会得到 "matching memo entry not found"。
+    // Notes saved via `a -n` are always memo entries; -ns / -nd / -ne only handle this kind.
+    // With include_archives=false, only the current memory file is read: delete/edit can only rewrite the current file,
+    // and archive entries are excluded from candidates even when ai.memory.search_archives.enable is on globally,
+    // otherwise deleting/updating a selected archive entry would fail with "matching memo entry not found".
     let results: Vec<AgentMemoryEntry> = if include_archives {
         store.entries_by_category("memo", 100_000, true)?
     } else {
@@ -585,7 +585,7 @@ pub(crate) fn search_memo_candidates_scored(
     let visible: Vec<AgentMemoryEntry> =
         results.into_iter().filter(|e| viewer.can_see(e)).collect();
 
-    // 字面打分（子串命中），是唯一的相关度信号。
+    // Literal scoring (substring hits) is the only relevance signal.
     let lexical = |e: &AgentMemoryEntry| -> f64 {
         let mut score = 0.0_f64;
         if e.note.to_lowercase().contains(&qlc) {
@@ -596,9 +596,9 @@ pub(crate) fn search_memo_candidates_scored(
             score += 1.2;
         }
 
-        // 不能只依赖整个 query 的连续子串：用户往往会在检索词中加入项目名或
-        // 描述性词，而旧笔记只覆盖其中一部分。按 token 覆盖率加分，
-        // 仍让完整短语命中保持最高优先级。
+        // Cannot rely only on contiguous substrings of the whole query: users often add project names or
+        // descriptive words to search terms, while old notes cover only part of them. Add score by token coverage,
+        // while full phrase hits keep the highest priority.
         if !query_tokens.is_empty() {
             let mut searchable = e.note.to_lowercase();
             if !e.tags.is_empty() {
@@ -726,11 +726,11 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
         let now = Utc::now();
         let cutoff_secs = max_days * 86400;
 
-        // 摘要回写（writeback）：原始实现把"过期的 deletable"直接丢掉，丢失了
-        // 与项目相关但不是永久白名单的事实（例如 30 天前的 task_event）。
-        // 现在把过期项按 (category, source) 分组，每组合成 1 条 summary
-        // 写回 permanent 区——以"sum:"前缀标记，priority 沿用该组最高，
-        // 后续不会被时间窗 GC（summary 自身永远是新创建，时间 = now）。
+        // Summary writeback: the original implementation dropped "expired deletable" entries outright, losing
+        // project-relevant facts that are not on the permanent whitelist (e.g. task_event entries older than 30 days).
+        // Now expired entries are grouped by (category, source), and each group is synthesized into 1 summary
+        // written back to the permanent area — marked with a "sum:" prefix, priority taken from the group's highest,
+        // so it will not be GC'd by the time window later (a summary is always newly created, timestamp = now).
         let mut evicted: Vec<AgentMemoryEntry> = Vec::new();
         deletable.retain(|e| {
             let keep = parse_rfc3339_ts(&e.timestamp)
@@ -779,7 +779,7 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
             deletable = new_deletable;
         }
 
-        // Combine permanent + summaries (新生成) + deletable
+        // Combine permanent + summaries (newly generated) + deletable
         let permanent_count = permanent.len();
         let mut final_entries = permanent;
         final_entries.extend(summaries);
@@ -817,17 +817,17 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
     })
 }
 
-/// 把过期 evicted 条目按 (category, source) 分组，每组聚合成一条 summary。
+/// Groups expired evicted entries by (category, source) and aggregates each group into one summary.
 ///
-/// summary 设计：
-///   - category 沿用原 category（这样跟原条目处于同一个召回桶里）
-///   - tags 取首个被合并条目的 tags + 加 "summary"
-///   - source 沿用原 source
-///   - priority = 该组最高 priority（保留原本的重要性信号）
-///   - note = "[summary of N entries from <ts1> to <ts2>] " + 截断的代表性内容
-///   - timestamp = 当前时间（让它进入"最新区域"，不会立即又被时间窗 GC）
+/// Summary design:
+///   - category keeps the original category (so it lands in the same recall bucket as the original entries)
+///   - tags take the first merged entry's tags plus "summary"
+///   - source keeps the original source
+///   - priority = the group's highest priority (preserving the original importance signal)
+///   - note = "[summary of N entries from <ts1> to <ts2>] " + truncated representative content
+///   - timestamp = current time (puts it in the "newest region" so it is not immediately GC'd by the time window again)
 ///
-/// 不调外部模型——以本地拼接为主，避免 GC 路径阻塞。
+/// No external model calls — local concatenation only, to keep the GC path from blocking.
 fn build_gc_summaries(evicted: &[AgentMemoryEntry], max_days: i64) -> Vec<AgentMemoryEntry> {
     use std::collections::BTreeMap;
 
@@ -847,7 +847,7 @@ fn build_gc_summaries(evicted: &[AgentMemoryEntry], max_days: i64) -> Vec<AgentM
             continue;
         }
         let count = items.len();
-        // 时间范围
+        // Time range
         let mut ts_min = items[0].timestamp.as_str();
         let mut ts_max = items[0].timestamp.as_str();
         let mut max_prio: u8 = 0;
@@ -868,7 +868,7 @@ fn build_gc_summaries(evicted: &[AgentMemoryEntry], max_days: i64) -> Vec<AgentM
             }
         }
 
-        // 摘要正文：取每条 note 的前 80 字符，最多拼 5 条，用 "; " 连接
+        // Summary body: take the first 80 chars of each note, up to 5 entries, joined with "; "
         const PER_ITEM_CHARS: usize = 80;
         const MAX_SAMPLES: usize = 5;
         let mut samples: Vec<String> = Vec::new();
@@ -916,15 +916,15 @@ fn parse_rfc3339_ts(s: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// 把 sub-agent 的私有 memory 文件按白名单 merge 回主 memory 文件。
+/// Merges a sub-agent's private memory file back into the main memory file according to the whitelist.
 ///
-/// - `private_path`：sub-agent 的 jsonl（make_subagent_memory_path 生成）
-/// - `main_path`：主 agent 的 memory jsonl（resolve 时不能再走 task_local override，
-///   所以由调用方传入实际目标路径）
+/// - `private_path`: the sub-agent's jsonl (generated by make_subagent_memory_path)
+/// - `main_path`: the main agent's memory jsonl (resolution must not go through the task_local override again,
+///   so the caller passes in the actual target path)
 ///
-/// 仅 `is_permanent_memory` 命中的条目（safety/preference/coding_guideline/
-/// project_memory/...）会被 append；普通对话级 task_event 留在私有文件，不污染主记忆。
-/// 写入复用 MemoryStore::append（自带 lock + index upsert）。
+/// Only entries matching `is_permanent_memory` (safety/preference/coding_guideline/
+/// project_memory/...) are appended; ordinary conversational task_event entries stay in the private file and do not pollute main memory.
+/// Writes reuse MemoryStore::append (which brings its own lock + index upsert).
 pub(crate) fn merge_subagent_whitelist(
     private_path: &std::path::Path,
     main_path: &std::path::Path,
@@ -943,8 +943,8 @@ pub(crate) fn merge_subagent_whitelist(
         if !is_permanent_memory(&entry) {
             continue;
         }
-        // 把 owner pid/pgid 重置：sub-agent 可能已经退出，
-        // 主 store 重新打 owner tag 没意义，留 None 即可。
+        // Reset the owner pid/pgid: the sub-agent may have already exited,
+        // and re-tagging the owner in the main store is meaningless; leaving None is fine.
         let mut e = entry;
         e.owner_pid = None;
         e.owner_pgid = None;
@@ -982,8 +982,8 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
         }
         let total_before = entries.len();
 
-        // Step 1: 严格去重——note + category + tags + source 完全一致的，
-        // 只保留时间最新（reverse 遍历后写回）。
+        // Step 1: strict dedup — entries whose note + category + tags + source are all identical:
+        // keep only the newest by timestamp (write back after reverse traversal).
         let mut seen: SkipSet<(String, String, Vec<String>, Option<String>)> = SkipSet::default();
         let mut deduped: Vec<AgentMemoryEntry> = Vec::with_capacity(entries.len());
         for e in entries.into_iter().rev() {
@@ -1178,9 +1178,9 @@ pub(crate) fn execute_memory_delete(args: &Value) -> Result<String, String> {
     })
 }
 
-/// 修改一条已存在的 memo：定位 target（优先 id，否则时间戳+原文精确匹配），
-/// 把内容替换为 `new_note`，保留原 id，timestamp 更新为当前时间（体现最近被编辑）。
-/// 只改第一条匹配项，避免误改重复内容。
+/// Edits an existing memo: locates the target (by id first, otherwise exact match on timestamp + original text),
+/// replaces the content with `new_note`, keeps the original id, and updates the timestamp to now (reflecting the recent edit).
+/// Only the first match is modified, to avoid touching duplicated content by mistake.
 pub(crate) fn update_memo_entry(
     target: &AgentMemoryEntry,
     new_note: &str,
@@ -1224,8 +1224,8 @@ pub(crate) fn update_memo_entry(
     })
 }
 
-/// 删除一条 memo 条目：优先按 id 匹配；若条目没有 id（历史数据），
-/// 则按 (timestamp, note) 精确匹配删除。返回删除结果描述。
+/// Deletes one memo entry: matches by id first; if the entry has no id (legacy data),
+/// falls back to exact (timestamp, note) matching. Returns a description of the deletion result.
 pub(crate) fn delete_memo_entry(target: &AgentMemoryEntry) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
     let path = store.path().to_path_buf();
@@ -1243,7 +1243,7 @@ pub(crate) fn delete_memo_entry(target: &AgentMemoryEntry) -> Result<String, Str
         if let Some(id) = target_id.as_deref() {
             entries.retain(|e| e.id.as_deref() != Some(id));
         } else {
-            // 无 id：按时间戳 + 内容精确匹配，只删第一条匹配项，避免误删重复内容。
+            // No id: exact match on timestamp + content; delete only the first match to avoid removing duplicates by mistake.
             let mut removed = false;
             entries.retain(|e| {
                 if !removed
@@ -1267,7 +1267,7 @@ pub(crate) fn delete_memo_entry(target: &AgentMemoryEntry) -> Result<String, Str
     })
 }
 
-/// 用户主动保存记忆到全局 memory store
+/// User explicitly saves a memory into the global memory store
 pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
     let prepared = prepare_memory_save_entry(
         args,
@@ -1318,9 +1318,9 @@ mod tests {
     use std::sync::MutexGuard;
 
     fn env_lock_guard() -> MutexGuard<'static, ()> {
-        // 这里的锁只用于串行化环境变量 / GLOBAL_OS 相关测试。
-        // 即使前一个 case 因断言失败而 poison，也不该让后续 case
-        // 失真成 PoisonError，从而掩盖真正的首发问题。
+        // This lock only serializes env-var / GLOBAL_OS related tests.
+        // Even if a previous case poisons it via an assertion failure, later cases must not
+        // be distorted into a PoisonError, which would mask the real first failure.
         ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
@@ -1462,7 +1462,7 @@ mod tests {
 
         let list_after = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
         let after: serde_json::Value = serde_json::from_str(&list_after).unwrap();
-        // id 保持不变；内容被替换；条目数不变。
+        // id unchanged; content replaced; entry count unchanged.
         assert_eq!(after.as_array().unwrap().len(), 1);
         assert_eq!(after[0]["id"].as_str().unwrap(), id);
         assert_eq!(
@@ -1554,8 +1554,8 @@ mod tests {
         }
     }
 
-    /// 回归：-nd/-ne 的候选函数在 include_archives=false 时只读当前 memory 文件，
-    /// 不纳入归档条目（删除/更新只能改写当前文件，否则会落到 "matching memo entry not found"）。
+    /// Regression: the -nd/-ne candidate functions read only the current memory file when include_archives=false,
+    /// excluding archive entries (delete/update can only rewrite the current file; otherwise they fail with "matching memo entry not found").
     #[test]
     fn memo_delete_candidates_exclude_archives_and_delete_fails_on_archived() {
         let _guard = env_lock_guard();
@@ -1603,8 +1603,8 @@ mod tests {
             })
             .unwrap();
 
-        // include_archives=false：候选不应包含归档条目，
-        // 只剩当前文件里的 "current-del-memo"。
+        // include_archives=false: candidates must not include archive entries,
+        // leaving only "current-del-memo" from the current file.
         let candidates = search_memo_candidates("二次分析问题排查", 10, false).unwrap();
         assert!(
             candidates
@@ -1617,8 +1617,8 @@ mod tests {
                 .any(|c| c.id.as_deref() == Some("current-del-memo"))
         );
 
-        // 即便外部传入归档条目，delete_memo_entry 也只能在当前文件找不到它而失败，
-        // 而不是静默误删或落到成功路径。
+        // Even when an archive entry is passed in externally, delete_memo_entry must fail because it cannot find it in the current file,
+        // rather than silently deleting the wrong thing or falling through to a success path.
         let err = delete_memo_entry(&archived_memo).unwrap_err();
         assert_eq!(err, "matching memo entry not found");
 

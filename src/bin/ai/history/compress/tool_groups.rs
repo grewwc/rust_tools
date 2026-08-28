@@ -1,7 +1,7 @@
-//! 工具组折叠（tool group folding）。
+//! Tool group folding.
 //!
-//! 把消息序列中较早的 `assistant(tool_calls) + 配套 tool` 组整组折叠成
-//! 单条 `internal_note` stub，逐字保留最近的工具组。
+//! Fold earlier `assistant(tool_calls) + accompanying tool` groups in the message
+//! sequence into a single `internal_note` stub, keeping the most recent groups verbatim.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
@@ -79,18 +79,21 @@ pub(super) fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> 
         .map(|tc| tc.id.clone())
         .collect();
     let mut group = vec![assistant_idx];
-    // 仅收集紧跟 assistant 之后、连续出现的 tool 消息，遇到任何非 tool（含
-    // 下一个 assistant/user/system/internal_note）即停。这样可以防止把
-    // 不同 turn 中残留的同 id stub（来自 dedup_repeated_tool_results 替换）
-    // 一并卷入同一 group，导致跨 turn 整组被折叠/删除。
+    // Only collect tool messages that appear consecutively right after the
+    // assistant, stopping at any non-tool message (including the next
+    // assistant/user/system/internal_note). This keeps stale same-id stubs left
+    // over from other turns (produced by dedup_repeated_tool_results replacement)
+    // from being pulled into the same group, which would fold/delete whole groups
+    // across turns.
     let mut i = assistant_idx + 1;
     while i < messages.len() && messages[i].role == "tool" {
         if let Some(ref id) = messages[i].tool_call_id {
             if tool_call_ids.contains(id) {
                 group.push(i);
             } else {
-                // 同位置出现了不属于本 assistant 的 tool 消息（理论上不应该
-                // 发生，但若发生，停止扫描以避免破坏 OpenAI 配对协议）。
+                // A tool message not belonging to this assistant appeared in the
+                // same position (should not happen, but if it does, stop scanning
+                // to avoid breaking the OpenAI pairing protocol).
                 break;
             }
         } else {
@@ -105,14 +108,17 @@ pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Optio
     let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages, budget);
     let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
 
-    // 跳过头部受保护的 system-like 消息：真正的 system prompt、历史摘要、
-    // 归档指针和 checkpoint。不能把所有 internal_note 都整体保护起来：
-    // compressed_tool_round 也是 internal_note，若位于持久化历史头部，会变成
-    // 不可裁剪噪音并持续挤占上下文。
-    // 旧实现只跳过以"对话摘要/历史摘要"前缀开头的条目，会把普通 system prompt
-    // 当成可裁削目标，触发"上下文压缩后回复戛然而止"。
-    // 同时把最近 N 轮 user 起始的整段尾部窗口都设为保护区，避免把多阶段任务
-    // 的上一个子目标与当前子目标切开。
+    // Skip head-protected system-like messages: the real system prompt, history
+    // summaries, archive pointers, and checkpoints. Do not blanket-protect all
+    // internal_note messages: compressed_tool_round is also an internal_note, and
+    // if one sits at the head of the persisted history it becomes untrimmable
+    // noise that keeps eating context.
+    // The old implementation only skipped entries prefixed with "conversation
+    // summary / history summary", treating an ordinary system prompt as trimmable
+    // and triggering "replies cut off abruptly after context compression".
+    // Also treat the entire tail window starting from the most recent N user
+    // turns as protected, so a multi-stage task's previous subgoal is not split
+    // from the current one.
     let mut index = 0usize;
     while index < messages.len() && is_protected_leading_system_like_message(&messages[index]) {
         index += 1;
@@ -121,33 +127,40 @@ pub(super) fn first_trim_candidate(messages: &[Message], budget: usize) -> Optio
     while index < protected_tail_start {
         let message = &messages[index];
 
-        // checkpoint 的正文已落盘，短标记是回读正文的唯一入口。它不应因位于
-        // 早期对话中而被兜底裁剪掉。
+        // The checkpoint body is already on disk; the short marker is the only
+        // way back to it. It must not be trimmed by the fallback merely for
+        // appearing early in the conversation.
         if is_context_checkpoint_marker(message) {
             index += 1;
             continue;
         }
 
-        // 已外溢到会话文件的 user/image 占位 stub 不删：它只是一个指向归档
-        // 文件的指针（原文零压缩保存在磁盘上），删掉会让模型彻底失去线索。
-        // 普通 user / 含图片消息是否可删由调用方路径决定，这里只负责上报候选：
-        // - with_summary：丢弃 + 归档 + 摘要（返回 user 即授权删除，早期目标由
-        //   摘要承接，否则 30+ 轮纯文本对话永远无法收敛进预算）；
-        // - plain shrink / 批量裁剪：user 只能 OffloadOnly——先外溢搬盘，失败则
-        //   plain shrink 必须 break（否则同一 user 会无限重复返回），batch 跳过
-        //   该 user 继续扫描后续候选，绝不能 remove 原文。
+        // user/image placeholder stubs spilled to session files are not deleted:
+        // they are just pointers to archive files (original text stored on disk
+        // with zero compression); deleting them would leave the model with no
+        // leads. Whether ordinary user / image-bearing messages may be deleted is
+        // decided by the caller path; this function only reports candidates:
+        // - with_summary: drop + archive + summarize (returning the user
+        //   authorizes deletion; the summary carries the early goal, otherwise
+        //   30+ turns of plain-text dialogue would never converge into budget);
+        // - plain shrink / batch trim: user can only be OffloadOnly — spill to
+        //   disk first; on failure plain shrink must break (otherwise the same
+        //   user would be returned forever), and batch skips that user and keeps
+        //   scanning later candidates; never remove the original text.
         if is_preserved_user_or_image_stub(&value_to_string(&message.content)) {
             index += 1;
             continue;
         }
 
-        // tool 不单删：否则可能破坏 assistant(tool_calls) ↔ tool 的配对关系。
+        // tool messages are never deleted alone: that could break the
+        // assistant(tool_calls) ↔ tool pairing.
         if message.role == "tool" {
             index += 1;
             continue;
         }
 
-        // 带 tool_calls 的 assistant 不单删：保持协议配对一致性。
+        // Assistants carrying tool_calls are never deleted alone: preserves
+        // protocol pairing consistency.
         if message.role == "assistant"
             && message
                 .tool_calls
@@ -180,8 +193,9 @@ pub(super) fn is_protected_leading_system_like_message(message: &Message) -> boo
         || is_context_checkpoint_marker(message)
 }
 
-/// 规划把一个 `(assistant tool_calls + 配套 tool 结果)` 整组折叠成单条
-/// `internal_note`。这里只生成确定性路径和待写内容，不执行任何文件 I/O。
+/// Plan folding one `(assistant tool_calls + accompanying tool results)` group
+/// into a single `internal_note`. This only produces the deterministic path and
+/// content to write; no file I/O is performed.
 fn plan_tool_call_group_fold(
     messages: &[Message],
     group: &[usize],
@@ -227,9 +241,11 @@ fn plan_tool_call_group_fold(
         lines.push("- archive_scope: folded_tool_group_raw_messages".to_string());
     }
 
-    // checkpoint 只使用对用户可见的 assistant 正文。隐藏 reasoning_content 可能是
-    // 未验证的中间推断，不能在压缩时提升为持久化事实；正文为空时从结构化工具调用
-    // 重建「已完成的工具活动」，避免模型误以为这些调用尚未执行。
+    // Checkpoints use only the user-visible assistant body. Hidden
+    // reasoning_content may be unverified intermediate inference and must not be
+    // promoted to persisted fact during compression; when the body is empty,
+    // rebuild "completed tool activity" from the structured tool calls so the
+    // model does not assume those calls were never executed.
     let assistant_content = match &assistant.content {
         Value::Null => String::new(),
         content => value_to_string(content),
@@ -379,9 +395,11 @@ fn tool_call_target_recall(tool_call: &ToolCall) -> String {
     }
 }
 
-/// `execute_command` 的结果本身无法说明它回答的是哪个问题。工具组折叠会移除
-/// 原始 tool_call，因此必须把命令和 cwd 留在召回文本中；否则多个「成功但无输出」
-/// 的 git log 会退化成无法区分的记录，模型会把它当作尚未执行而重新开始排查。
+/// An `execute_command` result by itself cannot say which question it answered.
+/// Tool group folding removes the original tool_call, so the command and cwd must
+/// stay in the recall text; otherwise multiple indistinguishable "successful but
+/// empty" git logs would degrade into records the model treats as never run and
+/// starts investigating again.
 fn tool_call_invocation_recall(tool_call: &ToolCall) -> String {
     if tool_call.function.name != "execute_command" {
         return String::new();
@@ -414,8 +432,10 @@ fn tool_call_invocation_recall(tool_call: &ToolCall) -> String {
     }
 }
 
-/// 为工具组折叠生成结果召回文本。高精度结果在移除原始消息前必须先归档；若归档
-/// 失败则返回 `None`，调用方保留整组原文，不能将唯一证据降级为首句。
+/// Generate the result recall text for tool group folding. High-precision results
+/// must be archived before the original messages are removed; if archiving fails,
+/// return `None` so the caller keeps the whole group verbatim rather than
+/// demoting the only evidence to a single sentence.
 fn tool_result_recall_text(
     tool_call: &ToolCall,
     result_text: &str,
@@ -504,10 +524,13 @@ fn tool_result_recall_text(
     ))
 }
 
-/// 工具组折叠是第二级压缩：不能把一级 stub 中的 `original_*` 调用锚点再次丢掉。
+/// Tool group folding is the second compression level: the `original_*` call
+/// anchors in first-level stubs must not be dropped a second time.
 ///
-/// 优先从仍在场的 ToolCall 参数重建；旧格式或参数解析失败时，再保留已有 stub 中的
-/// 锚点。这样历史只剩内部归档路径时，模型仍知道原始文件、命令或检索是什么。
+/// Rebuild them from ToolCall arguments that are still present; fall back to the
+/// anchors already in the stub when the format is old or argument parsing fails.
+/// That way, even when history retains only internal archive paths, the model
+/// still knows what the original file, command, or search was.
 fn append_original_recall_lines(
     mut recall: String,
     tool_call: &ToolCall,
@@ -555,15 +578,18 @@ fn preserved_file_path_line(preserved: &str) -> Option<String> {
     preserved_file_path_value(preserved).map(|path| format!("- file_path: {path}"))
 }
 
-/// 折叠 read_file 结果时，不要把内部 overflow 归档路径伪装成普通 `file_path`
-/// 主线索；真正的继续调查目标应是 `original_file_path` / `original_range`。
+/// When folding read_file results, do not disguise the internal overflow archive
+/// path as the ordinary `file_path` lead; the real follow-up investigation target
+/// should be `original_file_path` / `original_range`.
 fn preserved_archive_file_path_line(preserved: &str) -> Option<String> {
     preserved_file_path_value(preserved).map(|path| format!("- archive_file_path: {path}"))
 }
 
-/// 一级 overflow stub 已经带有 head/tail 预览；二级 tool-group 折叠时继续保留几条
-/// preview，避免历史里只剩 `original_file_path`/`archive_file_path` 两个路径账单，
-/// 导致模型在压缩后失去“文件里看到了什么”的状态。
+/// First-level overflow stubs already carry head/tail previews; keep a few
+/// previews during second-level tool-group folding too, so the history does not
+/// degrade into just the two path entries `original_file_path`/`archive_file_path`,
+/// leaving the model without the state of "what was seen in the file" after
+/// compression.
 fn preserved_preview_recall(preserved: &str, max_lines: usize) -> Option<String> {
     let mut in_preview = false;
     let mut lines = Vec::new();
@@ -622,8 +648,10 @@ fn precision_grounding_tool_recall(
     }
 }
 
-/// 命令输出被折叠时至少保留退出状态、关键诊断与尾部结论。完整日志仍由调用方
-/// 归档到 `file_path`，这里的职责只是让模型能在不重跑命令的情况下判断下一步。
+/// When command output is folded, keep at least the exit status, key diagnostics,
+/// and tail conclusions. The full log is still archived by the caller to
+/// `file_path`; the job here is only to let the model decide the next step without
+/// re-running the command.
 fn command_result_recall(result_text: &str) -> String {
     const MAX_SIGNALS: usize = 5;
     const MAX_CHARS: usize = 720;
@@ -669,16 +697,21 @@ fn push_command_signal(signals: &mut Vec<String>, line: &str) {
     }
 }
 
-/// 单轮内折叠：LLM 摘要兜底时，尾窗（当前 user 轮）内部保留逐字的最近工具组数。
-/// 更早的同轮工具组折叠成单行 stub，解决"臃肿全堆在一个 user 轮内、无跨轮边界
-/// 可摘要"时压缩器空转的问题。
+/// Within a single turn: when the LLM-summary fallback runs, keep the verbatim
+/// count of recent tool groups inside the tail window (the current user turn);
+/// fold earlier same-turn tool groups into one-line stubs. This fixes compressor
+/// idling when all the bulk piles up inside one user turn with no cross-turn
+/// boundary to summarize.
 pub(super) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS: usize = 4;
 
-/// 返回最近 `keep_recent_groups` 个完整工具组中所有 tool 结果的消息下标。
+/// Return the message indices of all tool results in the most recent
+/// `keep_recent_groups` complete tool groups.
 ///
-/// 一个 assistant(tool_calls) 可能并行发起任意数量的调用。保护窗口必须按这个
-/// 原子组计算，不能按 tool 消息条数切开；否则一个批次会出现部分结果仍在上下文、
-/// 部分结果已被 offload/dedup 的状态，迫使模型重新读取缺失文件。
+/// One assistant(tool_calls) may issue any number of parallel calls. The
+/// protection window must be computed per atomic group, not cut by tool message
+/// count; otherwise a batch could end up with some results still in context and
+/// others already offloaded/deduped, forcing the model to re-read the missing
+/// files.
 pub(super) fn recent_tool_group_message_indices(
     messages: &[Message],
     keep_recent_groups: usize,
@@ -689,7 +722,8 @@ pub(super) fn recent_tool_group_message_indices(
         .collect()
 }
 
-/// 返回最近 `keep_recent_groups` 个完整工具组的 tool 结果下标，并保留组边界。
+/// Return the tool result indices of the most recent `keep_recent_groups` complete
+/// tool groups, preserving group boundaries.
 pub(super) fn recent_tool_result_groups(
     messages: &[Message],
     keep_recent_groups: usize,
@@ -733,9 +767,11 @@ pub(super) fn recent_tool_result_groups(
     groups.into_iter().rev().take(keep_recent_groups).collect()
 }
 
-/// 为折叠 stub 生成"召回锚点"单行：优先提取已外溢 tool 结果里的 `file_path:`
-/// 指针（模型据此可重新 read_file），否则退回结果首个非空行。
-/// 保证折叠早期 precision 工具组时仍留下可召回的线索，避免失忆式重复检索。
+/// Generate the single-line "recall anchor" for a folded stub: prefer extracting
+/// the `file_path:` pointer from spilled tool results (the model can re-run
+/// read_file from it), otherwise fall back to the first non-empty result line.
+/// Guarantees that folding early precision tool groups still leaves a recallable
+/// lead, avoiding amnesia-style repeated searches.
 fn tool_result_recall_one_liner(result_text: &str) -> String {
     if let Some(original_line) = result_text
         .lines()
@@ -766,10 +802,10 @@ fn tool_result_recall_one_liner(result_text: &str) -> String {
     truncate_to_chars(&normalize_whitespace(first_meaningful), 160)
 }
 
-/// 从工具调用的 JSON `arguments` 里取 `file_path`（或兼容的 `path`）。
-/// `apply_patch` 还可能把目标写在 `patch` 正文 `*** Update File: <path>` /
-/// `*** Add File: <path>` / `*** Delete File: <path>` /
-/// `*** Replace in line: <path>` 信封里，做兜底解析。
+/// Extract `file_path` (or the compatible `path`) from a tool call's JSON
+/// `arguments`. `apply_patch` may also write the target inside the `patch` body's
+/// `*** Update File: <path>` / `*** Add File: <path>` / `*** Delete File: <path>` /
+/// `*** Replace in line: <path>` envelopes; parse those as a fallback.
 fn extract_file_path_args(arguments: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<Value>(arguments) else {
         return Vec::new();
@@ -797,17 +833,20 @@ fn extract_file_path_args(arguments: &str) -> Vec<String> {
     Vec::new()
 }
 
-/// 扫描整条消息流，找出"最近一次 `apply_patch` 失败、且之后同路径没有成功"
-/// 的目标文件路径集合。
+/// Scan the whole message stream for the set of target file paths whose most
+/// recent `apply_patch` failed with no later success on the same path.
 ///
-/// 折叠器遇到 `read_file` 这些路径的工具组时跳过折叠，让模型在重试 patch 时
-/// 仍能看到原始文件内容以构造精确 context。判定：按消息顺序记录每个路径最近
-/// 一次 `apply_patch` 的结果；结果 content 以 `Successfully patched` 开头视为成功，
-/// 否则视为失败。只保留最终状态为"失败"的路径——一旦后续同路径 patch 成功即
-/// 自动解除。当失败的 `apply_patch` 调用本身被压缩移出历史后，该路径也随之
-/// 消失，保护范围天然有界（通常 1–3 个文件）。
+/// When the folder hits a tool group that reads these paths via `read_file`, it
+/// skips folding so the model can still see the original file content to construct
+/// exact patch context. Rule: record, in message order, the most recent
+/// `apply_patch` result per path; a result content starting with `Successfully
+/// patched` counts as success, anything else as failure. Only paths whose final
+/// state is "failed" are kept — a later successful patch on the same path lifts
+/// the protection automatically. Once the failed `apply_patch` call itself is
+/// compressed out of history, the path disappears with it, so the protection scope
+/// is naturally bounded (usually 1–3 files).
 fn collect_pending_patch_paths(messages: &[Message]) -> FxHashSet<String> {
-    // tool_call_id → tool 结果文本
+    // tool_call_id → tool result text
     let mut result_by_id: FxHashMap<String, String> = FxHashMap::default();
     for m in messages {
         if m.role == "tool" {
@@ -816,7 +855,7 @@ fn collect_pending_patch_paths(messages: &[Message]) -> FxHashSet<String> {
             }
         }
     }
-    // path → 最近一次 apply_patch 是否成功
+    // path → whether the most recent apply_patch succeeded
     let mut last_state: FxHashMap<String, bool> = FxHashMap::default();
     for m in messages {
         if m.role != "assistant" {
@@ -847,9 +886,10 @@ fn collect_pending_patch_paths(messages: &[Message]) -> FxHashSet<String> {
         .collect()
 }
 
-/// 本工具组是否含 `read_file` 调用，且其 `file_path` 正是某个尚未成功的
-/// `apply_patch` 目标。若是，折叠器应跳过折叠以保留模型重试 patch 所需的
-/// 原始文件内容。
+/// Whether this tool group contains a `read_file` call whose `file_path` is
+/// exactly a not-yet-successful `apply_patch` target. If so, the folder should
+/// skip folding to preserve the original file content the model needs to retry
+/// the patch.
 fn group_reads_pending_patch_target(
     messages: &[Message],
     group: &[usize],
@@ -869,23 +909,27 @@ fn group_reads_pending_patch_target(
     })
 }
 
-/// 把消息序列中较早的 `assistant(tool_calls) + 配套 tool` 组整组折叠成单条
-/// `internal_note` stub，逐字保留最近 `keep_recent_groups` 个工具组以及所有
-/// 非工具组消息（user / system / internal_note / 纯文本 assistant）。
+/// Fold earlier `assistant(tool_calls) + accompanying tool` groups in the message
+/// sequence into a single `internal_note` stub, keeping the most recent
+/// `keep_recent_groups` groups verbatim plus all non-tool-group messages
+/// (user / system / internal_note / plain-text assistant).
 ///
-/// 关键不变量：折叠时把 assistant 及其全部 tool 响应**整组一起**替换成一条
-/// stub，因此不会出现"留下 assistant.tool_calls 却丢掉配套 tool 响应"的配对
-/// 断裂（OpenAI 协议要求二者成对）。含 `is_non_compressible_tool` 的组也会被
-/// 折叠，但 stub 内保留其 `file_path:` 召回锚点。
+/// Key invariant: folding replaces the assistant and all of its tool responses
+/// **as one whole group** with a single stub, so the pairing breakage of "keeping
+/// assistant.tool_calls while dropping the accompanying tool responses" can never
+/// happen (the OpenAI protocol requires the two to be paired). Groups containing
+/// `is_non_compressible_tool` tools are folded too, but their `file_path:` recall
+/// anchor is kept inside the stub.
 ///
-/// 返回纯内存 [`ToolGroupFoldPlan`]；调用方确认采用候选后必须显式 `commit`。
+/// Returns the purely in-memory [`ToolGroupFoldPlan`]; the caller must explicitly
+/// `commit` after deciding to adopt the candidate.
 pub(super) fn plan_early_tool_groups(
     messages: &[Message],
     keep_recent_groups: usize,
     overflow_dir: Option<&Path>,
     protected_tool_call_ids: &FxHashSet<String>,
 ) -> ToolGroupFoldPlan {
-    // 定位所有 assistant(tool_calls) 起始位置，作为工具组锚点。
+    // Locate the start of every assistant(tool_calls) message as a tool group anchor.
     let group_anchors: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -901,21 +945,24 @@ pub(super) fn plan_early_tool_groups(
     if group_anchors.len() <= keep_recent_groups {
         return ToolGroupFoldPlan::unchanged(messages);
     }
-    // 最近 keep_recent_groups 个工具组逐字保留；更早的折叠。
-    // keep_recent_groups=0 时折叠全部工具组（fold_before_anchor 取消息末尾），
-    // 避免 group_anchors[len - 0] 越界 panic。
+    // Keep the most recent keep_recent_groups tool groups verbatim; fold earlier
+    // ones. When keep_recent_groups=0, fold all tool groups (fold_before_anchor
+    // takes the end of the messages) to avoid an out-of-bounds panic on
+    // group_anchors[len - 0].
     let fold_before_anchor = if keep_recent_groups == 0 {
         messages.len()
     } else {
         group_anchors[group_anchors.len() - keep_recent_groups]
     };
 
-    // 方向二：pending-patch 定向保留。扫描历史中"最近一次 apply_patch 失败、
-    // 且之后同路径没有成功"的目标文件路径；折叠器遇到读这些路径的 read_file
-    // 组时跳过折叠，让模型在重试 patch 时仍能看到原始文件内容以构造精确
-    // context，避免"内容被 offload → patch context mismatch → 重读 → 被判
-    // 无进展 → 硬停"的死结。保护范围天然有界：patch 成功或失败的 apply_patch
-    // 调用本身被压缩移出历史后，该路径自动解除。
+    // Direction two: pending-patch targeted retention. Scan the history for target
+    // file paths whose most recent apply_patch failed with no later success on the
+    // same path; when the folder hits a read_file group reading those paths, it
+    // skips folding so the model can still see the original file content to
+    // construct exact patch context, avoiding the deadlock of "content offloaded →
+    // patch context mismatch → re-read → judged no progress → hard stop". The
+    // protection scope is naturally bounded: once the succeeded or failed
+    // apply_patch call itself is compressed out of history, the path is released.
     let pending_patch_paths = collect_pending_patch_paths(messages);
 
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
@@ -929,7 +976,8 @@ pub(super) fn plan_early_tool_groups(
             .as_ref()
             .map(|calls| !calls.is_empty())
             .unwrap_or(false);
-        // 只有位于折叠区（早于最近保留窗口）的 assistant(tool_calls) 组才折叠。
+        // Only assistant(tool_calls) groups inside the fold region (earlier than
+        // the recent retention window) are folded.
         if idx < fold_before_anchor && message.role == "assistant" && has_calls {
             let tool_call_ids: FxHashSet<&str> = message
                 .tool_calls
@@ -946,7 +994,8 @@ pub(super) fn plan_early_tool_groups(
                 idx += 1;
                 continue;
             }
-            // 收集紧随其后、属于本 assistant 的连续 tool 响应，构成完整组。
+            // Collect the consecutive tool responses right after it that belong to
+            // this assistant, forming the complete group.
             let mut group = vec![idx];
             let mut cursor = idx + 1;
             while cursor < messages.len() && messages[cursor].role == "tool" {
@@ -956,8 +1005,10 @@ pub(super) fn plan_early_tool_groups(
                 }
                 cursor += 1;
             }
-            // pending-patch 目标路径的 read_file 组跳过折叠，逐字保留。必须在构造
-            // stub 之前判断，避免给不会被采纳的受保护组生成无意义归档计划。
+            // read_file groups targeting pending-patch paths skip folding and are
+            // kept verbatim. This must be checked before building the stub so no
+            // pointless archive plan is generated for a group that would never be
+            // adopted anyway.
             if group_reads_pending_patch_target(messages, &group, &pending_patch_paths) {
                 for &gi in &group {
                     out.push(messages[gi].clone());
@@ -1002,8 +1053,9 @@ pub(super) fn count_tool_group_anchors(messages: &[Message]) -> usize {
         .count()
 }
 
-/// 非 speculative 调用的便利入口：规划成功后立即提交；归档失败则保留原消息，
-/// 绝不生成指向不存在证据的折叠 stub。
+/// Convenience entry point for non-speculative calls: commit immediately after a
+/// successful plan; if archiving fails, keep the original messages and never
+/// produce a folded stub pointing at nonexistent evidence.
 pub(super) fn fold_early_tool_groups(
     messages: &[Message],
     keep_recent_groups: usize,

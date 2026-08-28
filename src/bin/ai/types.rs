@@ -56,8 +56,9 @@ impl Clone for App {
             pending_files: self.pending_files.clone(),
             forced_skills: self.forced_skills.clone(),
             forced_skill_source: self.forced_skill_source,
-            // 该状态只属于 foreground 的下一条用户消息；`App` clone 还会用于
-            // DriverContext、subagent 与后台任务，不能让它们继承这次续接。
+            // This state belongs only to the next user message in the foreground;
+            // `App` clones are also used for DriverContext, subagents, and
+            // background tasks, which must not inherit this continuation.
             pending_skill_continuation: None,
             forced_question: self.forced_question.clone(),
             attached_image_files: self.attached_image_files.clone(),
@@ -71,11 +72,14 @@ impl Clone for App {
             os: self.os.clone(),
             agent_reload_counter: self.agent_reload_counter,
             observers: Vec::new(),
-            // 与 `observers` 一致：进程级工具中间件策略不随 clone 传播（子代理/后台各自独立）。
+            // Same policy as `observers`: process-level tool middleware strategy
+            // does not propagate through clone (subagents/background are independent).
             tool_middlewares: Vec::new(),
-            // 与 `tool_middlewares` 一致：进程级 LLM 请求中间件策略不随 clone 传播。
+            // Same policy as `tool_middlewares`: process-level LLM request
+            // middleware strategy does not propagate through clone.
             llm_middlewares: Vec::new(),
-            // 与 `observers`/`tool_middlewares` 一致：进程级 hook 注册表不随 clone 传播。
+            // Same policy as `observers`/`tool_middlewares`: the process-level hook
+            // registry does not propagate through clone.
             hooks: HookRegistry::new(),
             last_known_prompt_tokens: self.last_known_prompt_tokens,
             last_known_cached_prompt_tokens: self.last_known_cached_prompt_tokens,
@@ -107,16 +111,20 @@ pub(super) struct App {
     pub(super) current_agent: String,
     pub(super) current_agent_manifest: Option<AgentManifest>,
     pub(super) pending_files: Option<String>,
-    /// 用户通过 `@skills:<name>` 或 `/skills <name>...` 在输入框中显式选择、仅对
-    /// **本轮**生效的强制 skill 列表（保持选择顺序，多 skill 平权）。
-    /// turn 准备阶段读取后强制注入这些 skill，并在该 turn 结束后清空，下一轮不再强制。
+    /// Forced skill list explicitly selected by the user via `@skills:<name>` or
+    /// `/skills <name>...` in the input box, effective for **this turn only**
+    /// (selection order preserved; multiple skills treated equally).
+    /// Turn preparation reads it, force-injects these skills, and clears it at the
+    /// end of the turn; the next turn is not forced.
     pub(super) forced_skills: Vec<String>,
-    /// `forced_skills` 的来源。只有显式用户选择会携带该值，用于本轮持久化审计。
+    /// Source of `forced_skills`. Only explicit user selection carries this value,
+    /// for per-turn persistence auditing.
     pub(super) forced_skill_source: Option<ForcedSkillSource>,
-    /// 当前 skill 通过 `request_user_input` 明确请求用户输入后保存的一次性续接。
-    /// 下一条普通用户消息消费它；显式 skill 选择或会话切换会覆盖/清除它。
+    /// One-shot continuation saved after the current skill explicitly requested
+    /// user input via `request_user_input`. Consumed by the next ordinary user
+    /// message; an explicit skill selection or session switch overwrites/clears it.
     pub(super) pending_skill_continuation: Option<PendingSkillContinuation>,
-    /// 当 /skills <name>... <rest> 时，<rest> 作为本轮问题使用。
+    /// When /skills <name>... <rest>, <rest> is used as this turn's question.
     pub(super) forced_question: Option<String>,
     pub(super) attached_image_files: Vec<String>,
     pub(super) shutdown: Arc<AtomicBool>,
@@ -129,63 +137,80 @@ pub(super) struct App {
     pub(super) os: SharedKernel,
     pub(super) agent_reload_counter: Option<usize>,
     pub(super) observers: Vec<Box<dyn crate::ai::driver::observer::TurnObserver>>,
-    /// 工具执行中间件链（Step 5：按轮构建 `build_tool_executor_chain`，空链 = 零行为变化）。
-    /// 用 `Arc` 共享：`dyn` 中间件不可 Clone，Arc 引用计数可在每轮建链时安全复制。
+    /// Tool execution middleware chain (Step 5: built per turn via
+    /// `build_tool_executor_chain`; empty chain = zero behavior change).
+    /// Shared via `Arc`: `dyn` middleware is not Clone, and the Arc refcount can be
+    /// safely copied when building the chain each turn.
     pub(super) tool_middlewares: Vec<Arc<dyn ToolMiddleware>>,
-    /// 进程级 LLM 请求中间件链（与 `tool_middlewares` 一致：`request_model_response`
-    /// 每次请求经 `build_llm_client_chain` 建链；空链 = 零行为变化）。
-    /// 用 `Arc` 共享：与 `tool_middlewares` 同理，可在每次请求建链时安全复制。
+    /// Process-level LLM request middleware chain (same policy as
+    /// `tool_middlewares`: `request_model_response` builds the chain via
+    /// `build_llm_client_chain` per request; empty chain = zero behavior change).
+    /// Shared via `Arc`: like `tool_middlewares`, safely copyable per request
+    /// chain build.
     pub(super) llm_middlewares: Vec<Arc<dyn RequestMiddleware>>,
-    /// 进程级 hook 注册表（Step 3：driver turn 生命周期钩子）。
-    /// 空注册表 = 零行为变化；turn 起点/终点在 `run_turn` 触发。
+    /// Process-level hook registry (Step 3: driver turn lifecycle hooks).
+    /// Empty registry = zero behavior change; turn start/end fire in `run_turn`.
     pub(super) hooks: HookRegistry,
-    /// 上一次请求服务端返回的实际 prompt_tokens（来自 usage 统计）。
-    /// 用于在下一次请求的 max_tokens clamp 中替代字符估算，提高精度。
+    /// Actual prompt_tokens returned by the server on the last request (from usage
+    /// stats). Used to replace character estimation in the next request's
+    /// max_tokens clamp for better precision.
     pub(super) last_known_prompt_tokens: Option<u64>,
-    /// 上一次请求服务端返回的 prompt cache 命中 token 数。
-    /// 用于在下一次请求的 TPM 预算预估中扣除可复用前缀，避免 100% cache hit
-    /// 仍按整段 prompt 记账而误触发等待。
+    /// Prompt cache hit token count returned by the server on the last request.
+    /// Used to subtract the reusable prefix from the next request's TPM budget
+    /// estimate, so a 100% cache hit is not billed as the full prompt and falsely
+    /// triggers waiting.
     pub(super) last_known_cached_prompt_tokens: Option<u64>,
-    /// Goal 模式状态。`None` = 未启用；`Some("")` = 等待用户输入目标；
-    /// `Some(goal)` = 目标已设定，agent 自动持续推进直到完成。
+    /// Goal mode state. `None` = not enabled; `Some("")` = waiting for the user's
+    /// goal; `Some(goal)` = goal set, the agent keeps driving automatically until
+    /// completion.
     pub(super) goal_mode: Option<String>,
-    /// 上一轮 turn 是否调用了工具。goal 模式下用于判定目标是否完成：
-    /// 若一轮结束时未调用任何工具，视为 agent 已交付最终结果。
+    /// Whether the previous turn called tools. In goal mode this decides whether
+    /// the goal is complete: if a turn ends with no tool calls, the agent is
+    /// considered to have delivered its final result.
     pub(super) last_turn_had_tool_calls: bool,
-    /// 上一轮 turn 是否被 Ctrl+C 打断。打断与「自然无工具完成」都会把
-    /// `last_turn_had_tool_calls` 置 false，但语义相反：前者不代表目标达成。
-    /// goal 模式据此区分——被打断时保留 goal_mode 并回落到等待用户输入，
-    /// 不打印「Goal achieved」误导信息。
+    /// Whether the previous turn was interrupted by Ctrl+C. Both interruption and
+    /// "natural no-tool completion" set `last_turn_had_tool_calls` to false, but
+    /// with opposite semantics: the former does not mean the goal was achieved.
+    /// Goal mode distinguishes them — when interrupted, keep goal_mode and fall
+    /// back to waiting for user input, without printing the misleading
+    /// "Goal achieved" message.
     pub(super) last_turn_interrupted: bool,
 
-    /// LLM 引导的上下文裁剪计数表（tool_call_id → 连续被标记次数）
+    /// LLM-guided context pruning counters (tool_call_id → consecutive mark count)
     pub(super) prune_marks: FxHashMap<String, u8>,
 
-    /// 当前 turn 内存态侧信道：Responses 协议捕获的完整 `reasoning` output items
-    /// （含 encrypted_content），以带 tool_calls 的 assistant 消息「首个
-    /// tool_call id」为 key。回放时在对应 function_call 前原样 splice，让模型保留
-    /// 上一跳推理上下文。
+    /// Current-turn in-memory side channel: full `reasoning` output items captured
+    /// via the Responses protocol (including encrypted_content), keyed by the
+    /// "first tool_call id" of the assistant message carrying tool_calls. On
+    /// replay they are spliced verbatim before the corresponding function_call so
+    /// the model keeps the previous hop's reasoning context.
     ///
-    /// 刻意不放进 `Message` 结构：reasoning items 只在同 turn 工具链回放时有用、
-    /// 跨 turn 会被 sqlite 剥离；放进共享 `Message` 会污染 295 处字面量且需
-    /// `#[serde(skip)]` 才能挡住落盘。用 turn 级旁路 map（同 `prune_marks` 模式）
-    /// 天然按轮对齐、纯内存态、物理上不可能落盘。
+    /// Deliberately not placed in the `Message` struct: reasoning items are only
+    /// useful for same-turn tool-chain replay and are stripped across turns by
+    /// sqlite; putting them in the shared `Message` would pollute 295 literals and
+    /// require `#[serde(skip)]` to keep them off disk. A turn-level bypass map
+    /// (same pattern as `prune_marks`) is naturally turn-aligned, purely
+    /// in-memory, and physically impossible to persist.
     pub(super) turn_reasoning_items: FxHashMap<String, Vec<Value>>,
 
-    /// `apply_patch` 的 stale-target 运行时账本：值为「上一次 patch 因
-    /// `context mismatch` / `ambiguous patch` 失败、且之后同路径尚未成功
-    /// `read_file` / `write_file` / `apply_patch`」的目标文件路径集合。
+    /// Runtime ledger of stale `apply_patch` targets: the set of target file paths
+    /// whose last patch failed with `context mismatch` / `ambiguous patch` and for
+    /// which no successful `read_file` / `write_file` / `apply_patch` has happened
+    /// on the same path since.
     ///
-    /// 语义：patch 失败说明模型持有的文件事实已过期，在对同一路径重新取真相
-    /// （成功 read/write/patch）之前再次 patch 只会重复失败，guard
-    /// [`patch_retry_requires_fresh_read`] 据此拒绝。
+    /// Semantics: a failed patch means the model's view of the file is stale;
+    /// re-patching before re-fetching ground truth (successful read/write/patch)
+    /// will just fail again, which is why guard [`patch_retry_requires_fresh_read`]
+    /// rejects it.
     ///
-    /// 为什么用专用账本而非扫描 `messages`：历史压缩会把失败的 apply_patch 组
-    /// 折叠成 `internal_note` stub（丢失 `role=tool` 结果与
-    /// `assistant.tool_calls`），使基于消息扫描的 guard 丢失 stale 状态、
-    /// 无法拦截重试。账本由工具执行结果直接维护，并同步到当前 session 的 SQLite
-    /// meta；切换/恢复 session 时重新加载，因此既不受消息压缩影响，也不会跨 session
-    /// 污染。旧数据库首次加载时才从仍可见的结构化消息回放并迁移。
+    /// Why a dedicated ledger instead of scanning `messages`: history compression
+    /// folds failed apply_patch groups into `internal_note` stubs (dropping the
+    /// `role=tool` results and `assistant.tool_calls`), so a message-scan-based
+    /// guard loses the stale state and cannot intercept retries. The ledger is
+    /// maintained directly from tool execution results and synced to the current
+    /// session's SQLite meta; it is reloaded on session switch/restore, so it is
+    /// unaffected by message compression and cannot leak across sessions. Legacy
+    /// databases replay it from still-visible structured messages on first load.
     pub(super) stale_patch_targets: FxHashSet<PathBuf>,
 }
 
@@ -240,15 +265,18 @@ pub(super) struct SkillBiasMemory {
     pub(super) question: String,
 }
 
-/// 一个已明确请求用户输入的 skill。它只允许续接下一条普通用户消息，不能作为
-/// 模糊的跨轮 skill 偏好使用。
+/// A skill that has explicitly requested user input. It only allows continuing
+/// with the next ordinary user message and must not be treated as a vague
+/// cross-turn skill preference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PendingSkillContinuation {
-    /// 当前活动 skill 列表（多 skill 叠加时保留全部，平权无主次）。
+    /// Currently active skill list (when multiple skills stack, keep all of them,
+    /// treated equally with no precedence).
     pub(super) skill_names: Vec<String>,
 }
 
-/// 用户显式指定强制 skill 的入口。保留来源可区分命令解析问题与注入问题。
+/// Entry point where the user explicitly specifies forced skills. Keeping the
+/// source distinguishes command-parsing issues from injection issues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ForcedSkillSource {
     SkillsCommandInline,
@@ -390,9 +418,11 @@ pub(super) enum StreamOutcome {
     #[default]
     Completed,
     EmptyResponse,
-    /// 本轮响应被截断：服务端回 `finish_reason=length`（撞输出上限），或有工具调用
-    /// 因 arguments JSON 不完整被丢弃、导致本轮无有效工具调用。两者都不应被当成
-    /// 正常完成静默结束，而应自动重试并提示模型收缩单次输出（分块写文件等）。
+    /// This turn's response was truncated: the server returned
+    /// `finish_reason=length` (output cap hit), or a tool call was dropped for
+    /// incomplete arguments JSON, leaving the turn with no valid tool call. Neither
+    /// should silently count as normal completion; retry automatically and prompt
+    /// the model to shrink each output (e.g. chunked file writes).
     Truncated,
     Cancelled,
     ToolCall,
@@ -404,42 +434,50 @@ pub(super) struct StreamResult {
     pub(super) tool_calls: Vec<ToolCall>,
     pub(super) assistant_text: String,
     pub(super) hidden_meta: String,
-    /// 模型在 thinking 模式下输出的 reasoning_content 原文，
-    /// 用于多轮请求时按服务端要求回传给后端。
+    /// Raw reasoning_content emitted by the model in thinking mode,
+    /// passed back to the backend on multi-turn requests as the server requires.
     pub(super) reasoning_text: String,
-    /// 本轮从 Responses 流捕获的完整 `reasoning` output items（含 encrypted_content）。
-    /// 仅用于同 turn 工具链回放，透传给内存态 assistant 消息，不进持久化历史。
+    /// Full `reasoning` output items (including encrypted_content) captured from
+    /// the Responses stream this turn. Only for same-turn tool-chain replay, passed
+    /// through to the in-memory assistant message; never persisted to history.
     pub(super) reasoning_items: Vec<serde_json::Value>,
     pub(super) skip_response_drain: bool,
-    /// 服务端返回 finish_reason=length（撞输出上限）。即使 outcome 是 Completed
-    /// （有可见文本），该标志仍保留，供上层决定是否注入"输出可能不完整"提示。
+    /// Server returned finish_reason=length (output cap hit). Even when the outcome
+    /// is Completed (with visible text), the flag is kept so upper layers can
+    /// decide whether to inject an "output may be incomplete" hint.
     pub(super) truncated_by_length: bool,
-    /// 截断由流读取错误（网络抖动 / 服务端异常断流）导致，而非模型撞输出上限。
-    /// 此时 outcome 为 Truncated，但降 reasoning_effort、注入收缩提示均无意义——
-    /// 模型并没有输出太多，是服务端断了。上层应做简单重试而非收缩重写。
+    /// Truncation was caused by a stream read error (network jitter / server
+    /// disconnect), not by the model hitting the output cap. The outcome is
+    /// Truncated, but lowering reasoning_effort or injecting shrink hints is
+    /// pointless — the model did not output too much; the server dropped the
+    /// stream. Upper layers should do a plain retry rather than shrink-and-rewrite.
     pub(super) stream_error: bool,
-    /// 服务端返回的 finish_reason 原始值（如 `stop` / `length` / `tool_calls`）。
-    /// 用于截断诊断，区分"撞输出上限"与其他原因。
+    /// Raw finish_reason returned by the server (e.g. `stop` / `length` /
+    /// `tool_calls`). Used for truncation diagnostics, distinguishing "output cap
+    /// hit" from other causes.
     pub(super) finish_reason_value: Option<String>,
-    /// 服务端 usage 统计：prompt tokens（已 normalize）。
+    /// Server usage stats: prompt tokens (normalized).
     pub(super) usage_prompt_tokens: u64,
-    /// 服务端 usage 统计：本次 prompt 中命中的 cached_tokens。
+    /// Server usage stats: cached_tokens hit within this prompt.
     pub(super) usage_cached_prompt_tokens: u64,
-    /// 服务端 usage 统计：completion tokens（已 normalize，含 reasoning）。
+    /// Server usage stats: completion tokens (normalized, includes reasoning).
     pub(super) usage_completion_tokens: u64,
-    /// 服务端 usage 统计：reasoning tokens（来自 completion_tokens_details）。
-    /// 部分 provider（GLM thinking 模式）会把 reasoning token 单独上报，
-    /// 这是排查"reasoning 耗尽预算导致零输出截断"的关键指标。
+    /// Server usage stats: reasoning tokens (from completion_tokens_details).
+    /// Some providers (GLM thinking mode) report reasoning tokens separately;
+    /// this is the key metric for diagnosing "reasoning exhausting the budget
+    /// causing zero-output truncation".
     pub(super) usage_reasoning_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct QuestionContext {
-    /// 用户输入的纯 prompt（不包含 @file 注入的内容）。
-    /// 用于路由 / 意图识别 / 技能匹配等需要看"用户意图"的场景。
+    /// The user's pure prompt input (excluding @file-injected content).
+    /// Used for routing / intent detection / skill matching scenarios that need to
+    /// see "user intent".
     pub(super) question: String,
-    /// 通过 @file、二进制（pdf）、pending_files 等渠道注入的附加文本。
-    /// 仅在最终发给 LLM 的 user_message 里拼接，不参与路由/特征提取。
+    /// Additional text injected via @file, binaries (pdf), pending_files, etc.
+    /// Only concatenated into the final user_message sent to the LLM; not used for
+    /// routing/feature extraction.
     pub(super) attachments_text: String,
     pub(super) history_count: usize,
 }

@@ -1,6 +1,7 @@
-//! 命令执行实现
+//! Command execution.
 //!
-//! 提供系统命令的执行功能，包括超时控制和工作目录设置。
+//! Executes system commands, with timeout control and working-directory
+//! configuration.
 
 use crate::{commonw::utils::expanduser, strw::split::split_space_keep_symbol};
 
@@ -18,47 +19,47 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::{io::FromRawFd, process::CommandExt};
 
-/// 命令执行选项
+/// Command execution options.
 ///
-/// 用于配置命令执行的行为。
+/// Configures how a command is executed.
 ///
-/// # 字段
+/// # Fields
 ///
-/// * `cwd` - 可选的工作目录路径
+/// * `cwd` - Optional working-directory path
 ///
-/// # 示例
+/// # Examples
 ///
 /// ```rust
 /// use rust_tools::cmd::RunCmdOptions;
 ///
-/// // 在当前目录执行
+/// // Run in the current directory
 /// let opts = RunCmdOptions::default();
 ///
-/// // 在指定目录执行
+/// // Run in a specific directory
 /// let opts = RunCmdOptions {
 ///     cwd: Some("/tmp"),
 /// };
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunCmdOptions<'a> {
-    /// 命令执行的工作目录
+    /// Working directory for command execution.
     ///
-    /// 如果为 `None`，则在当前进程的工作目录执行
+    /// If `None`, the command runs in the current process's working directory.
     pub cwd: Option<&'a str>,
 }
 
-/// 标准化命令字符串
+/// Normalize a command string.
 ///
-/// 去除首尾空白并检查是否为空。
+/// Trims leading/trailing whitespace and rejects empty commands.
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `command` - 原始命令字符串
+/// * `command` - Raw command string
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Ok(&str)` - 标准化后的命令
-/// - `Err(io::Error)` - 命令为空
+/// - `Ok(&str)` - The normalized command
+/// - `Err(io::Error)` - The command is empty
 fn normalize_command(command: &str) -> io::Result<&str> {
     let command = command.trim();
     if command.is_empty() {
@@ -73,14 +74,16 @@ fn is_shell_boundary(byte: Option<u8>) -> bool {
     })
 }
 
-/// 判断命令是否需要使用 Shell 执行。
+/// Determines whether a command must be executed through a shell.
 ///
-/// 这里只识别“引号外确实需要 shell 解释”的语法，避免把双引号内的字面量
-/// `<` / `>` / `|` 之类误判为必须走 `sh -c`。
+/// Only syntax that genuinely needs shell interpretation outside quotes is
+/// recognized, so literals inside double quotes such as `<` / `>` / `|` are not
+/// misclassified as requiring `sh -c`.
 ///
-/// 注意：本函数仍保守地把单引号、反斜杠、`$`（变量展开）等视为需要 shell，
-/// 因为当前 `build_no_shell_command` 只实现了双引号分组，不负责完整复刻
-/// shell 的转义/引用/变量展开语义。
+/// Note: this function still conservatively treats single quotes, backslashes,
+/// and `$` (variable expansion) as requiring a shell, because the current
+/// `build_no_shell_command` only implements double-quote grouping and does not
+/// fully replicate shell escaping/quoting/variable-expansion semantics.
 fn should_use_shell(command: &str) -> bool {
     let bytes = command.as_bytes();
     let mut i = 0usize;
@@ -111,12 +114,13 @@ fn should_use_shell(command: &str) -> bool {
             b'$' => return true,
             b'|' | b'>' | b'<' | b';' | b'&' | b'*' | b'?' => return true,
             b'#' if is_shell_boundary(i.checked_sub(1).map(|idx| bytes[idx])) => return true,
-            // `(` 只有在 token 起始边界上才视为 shell 分组/子 shell 语法；
-            // 普通参数里的 `foo(bar)` 不应该把命令强行送进 shell。
+            // `(` is only treated as shell grouping/subshell syntax at a token
+            // start boundary; `foo(bar)` in an ordinary argument must not force
+            // the command into a shell.
             b'(' if is_shell_boundary(i.checked_sub(1).map(|idx| bytes[idx])) => {
                 return true;
             }
-            // `)` 只有在 token 结束边界上才视为 shell 分组闭合。
+            // `)` is only treated as closing shell grouping at a token end boundary.
             b')' if is_shell_boundary(bytes.get(i + 1).copied()) => {
                 return true;
             }
@@ -128,23 +132,24 @@ fn should_use_shell(command: &str) -> bool {
     false
 }
 
-/// 返回命令是否会走 shell 执行路径。
+/// Returns whether the command takes the shell execution path.
 ///
-/// 供上层安全校验复用，确保验证语义与实际执行语义保持一致。
+/// Reused by upper-layer safety validation so that validation semantics stay
+/// consistent with actual execution semantics.
 pub fn command_requires_shell(command: &str) -> bool {
     should_use_shell(command)
 }
 
-/// 构建使用 Shell 的命令对象
+/// Builds a shell-based `Command`.
 ///
-/// 根据操作系统选择合适的 Shell：
+/// Picks a suitable shell for the current OS:
 /// - Windows: `cmd /C`
 /// - Unix-like: `sh -c`
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `command` - 要执行的命令
-/// * `opts` - 执行选项
+/// * `command` - The command to execute
+/// * `opts` - Execution options
 fn build_shell_command(command: &str, opts: RunCmdOptions<'_>) -> Command {
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
@@ -161,19 +166,20 @@ fn build_shell_command(command: &str, opts: RunCmdOptions<'_>) -> Command {
     cmd
 }
 
-/// 构建命令对象
+/// Builds a `Command`.
 ///
-/// 自动判断是否需要使用 Shell，并构建相应的 `Command` 对象。
+/// Automatically decides whether a shell is required and builds the
+/// corresponding `Command`.
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `command` - 要执行的命令
-/// * `opts` - 执行选项
+/// * `command` - The command to execute
+/// * `opts` - Execution options
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Ok(Command)` - 成功构建命令对象
-/// - `Err(io::Error)` - 构建失败
+/// - `Ok(Command)` - The command was built successfully
+/// - `Err(io::Error)` - Building failed
 fn build_command(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Command> {
     let command = normalize_command(command)?;
     if should_use_shell(command) {
@@ -183,29 +189,30 @@ fn build_command(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Command> 
     }
 }
 
-/// 构建不使用 Shell 的命令对象
+/// Builds a `Command` without a shell.
 ///
-/// 直接解析命令和参数，避免 Shell 注入风险。
+/// Parses the command and arguments directly to avoid shell-injection risk.
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `command` - 要执行的命令（包含参数）
-/// * `opts` - 执行选项
+/// * `command` - The command to execute (including arguments)
+/// * `opts` - Execution options
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Ok(Command)` - 成功构建命令对象
-/// - `Err(io::Error)` - 构建失败
+/// - `Ok(Command)` - The command was built successfully
+/// - `Err(io::Error)` - Building failed
 fn build_no_shell_command(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Command> {
     let command = normalize_command(command)?;
 
-    // 分割命令和参数
+    // Split the command into program and arguments.
     let mut iter = split_space_keep_symbol(command, r#"""#);
     let Some(program) = iter.next() else {
         return Err(io::Error::other("empty command"));
     };
 
-    // 程序名同样支持前导 `~` 展开（与 shell 语义一致）；引号包裹的按字面量处理。
+    // The program name also supports leading `~` expansion (matching shell
+    // semantics); quoted names are treated literally.
     let mut cmd = if program.starts_with('"') {
         Command::new(program)
     } else {
@@ -217,19 +224,22 @@ fn build_no_shell_command(command: &str, opts: RunCmdOptions<'_>) -> io::Result<
     if let Some(dir) = opts.cwd {
         cmd.current_dir(dir);
     }
-    // 处理参数，展开未加引号的前导 `~`（shell 语义）。
-    // 非 shell 路径下，双引号只承担“分组”职责，不应作为字面量传给子进程。
-    // 引号内的前导 `~` 是字面量，不做展开（如 `echo "~"` 应输出 `~`）。
-    // 这里不尝试复刻完整 shell 语义；更复杂的单引号/反斜杠转义仍由
-    // `should_use_shell` 保守地导向 shell 路径。
+    // Handle arguments, expanding an unquoted leading `~` (shell semantics).
+    // On the non-shell path, double quotes only serve to group tokens and must
+    // not be passed to the child process as literals. A leading `~` inside
+    // quotes is a literal and is not expanded (e.g. `echo "~"` should print
+    // `~`). This does not attempt to replicate full shell semantics; more
+    // complex single-quote/backslash escaping is still conservatively routed to
+    // the shell path by `should_use_shell`.
     iter.for_each(|arg| {
         let normalized_arg = if arg.contains('"') {
             arg.replace('"', "")
         } else {
             arg.to_string()
         };
-        // shell 规则：只有「word 首字符为未加引号的 `~`」才展开；
-        // 引号开头（`"~"`）或 `~` 后紧跟引号（`~"x"`、`~"/foo"`）都是字面量。
+        // Shell rule: only a word whose first character is an unquoted `~` is
+        // expanded; a leading quote (`"~"`) or a quote right after `~`
+        // (`~"x"`, `~"/foo"`) is a literal.
         let new_arg = if arg.starts_with('"') || arg.starts_with(r#"~""#) {
             Cow::Borrowed(normalized_arg.as_str())
         } else {
@@ -259,8 +269,9 @@ fn configure_child_process_group(cmd: &mut Command) {
 #[cfg(not(unix))]
 fn configure_child_process_group(_cmd: &mut Command) {}
 
-/// 让子进程将 slave PTY 作为控制终端。仅把 stdout 接到 PTY 不足以满足一些
-/// CLI 的 TTY 检测；它们还会检查 stdin/stderr 或是否拥有 controlling terminal。
+/// Makes the child process adopt the slave PTY as its controlling terminal.
+/// Wiring only stdout to the PTY is not enough for the TTY detection of some
+/// CLIs; they also check stdin/stderr or whether a controlling terminal exists.
 #[cfg(unix)]
 fn configure_child_process_group_with_controlling_terminal(cmd: &mut Command) {
     unsafe {
@@ -276,7 +287,8 @@ fn configure_child_process_group_with_controlling_terminal(cmd: &mut Command) {
     }
 }
 
-/// 打开一对 PTY。master 仅由父进程读取，slave 会成为子进程的 stdin/stdout/stderr。
+/// Opens a PTY pair. The master is read only by the parent; the slave becomes
+/// the child's stdin/stdout/stderr.
 #[cfg(unix)]
 fn open_pseudo_terminal() -> io::Result<(File, File)> {
     let mut master = -1;
@@ -294,7 +306,8 @@ fn open_pseudo_terminal() -> io::Result<(File, File)> {
         return Err(io::Error::last_os_error());
     }
 
-    // openpty 成功时两个 fd 的所有权都已转移给 File，离开作用域自动关闭。
+    // On openpty success, ownership of both fds has moved into the `File`s;
+    // they are closed automatically when they go out of scope.
     Ok(unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) })
 }
 
@@ -312,12 +325,15 @@ fn terminate_child(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// 前台命令退出后，检测其进程组内是否仍有存活成员（典型：命令用 `&` 派生的
-/// 常驻服务，如 `python app.py &`）。`kill(-pgid, 0)` 不发送信号，仅用于探测：
-/// 返回 0 表示进程组仍存在成员，`ESRCH` 表示已无成员。
+/// After the foreground command exits, detects whether its process group still
+/// has live members (typically long-running services spawned with `&`, such as
+/// `python app.py &`). `kill(-pgid, 0)` sends no signal; it only probes:
+/// a return of 0 means the group still has members, `ESRCH` means none remain.
 ///
-/// 因为子进程通过 `setsid` 成为组长，`child.id()` 即该进程组的 pgid；即使前台
-/// 组长已被 reap，只要还有后台成员存活，pgid 就不会被回收，此探测是安全的。
+/// Because the child becomes the group leader via `setsid`, `child.id()` is the
+/// pgid of that process group; even after the foreground leader has been
+/// reaped, the pgid is not reclaimed as long as background members are alive,
+/// so this probe is safe.
 #[cfg(unix)]
 fn background_group_alive(pgid: u32) -> bool {
     unsafe { libc::kill(-(pgid as libc::pid_t), 0) == 0 }
@@ -328,21 +344,21 @@ fn background_group_alive(_pgid: u32) -> bool {
     false
 }
 
-/// 执行命令并返回输出
+/// Executes a command and returns its output.
 ///
-/// 执行命令并捕获标准输出和标准错误。
+/// Runs the command and captures stdout and stderr.
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `command` - 要执行的命令
-/// * `opts` - 执行选项
+/// * `command` - The command to execute
+/// * `opts` - Execution options
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Ok(Output)` - 命令执行成功，返回输出
-/// - `Err(io::Error)` - 命令执行失败
+/// - `Ok(Output)` - The command ran successfully; returns the output
+/// - `Err(io::Error)` - The command failed
 ///
-/// # 示例
+/// # Examples
 ///
 /// ```rust,no_run
 /// use rust_tools::cmd::run_cmd_output;
@@ -357,23 +373,24 @@ pub fn run_cmd_output(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Outp
     crate::fork_guard::output(&mut build_command(command, opts)?)
 }
 
-/// 执行命令并带超时控制
+/// Executes a command with timeout control.
 ///
-/// 执行命令，如果在指定时间内未完成则终止。
+/// Runs the command and terminates it if it does not finish within the given
+/// time.
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `command` - 要执行的命令
-/// * `opts` - 执行选项
-/// * `timeout` - 超时时间
+/// * `command` - The command to execute
+/// * `opts` - Execution options
+/// * `timeout` - Timeout duration
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Ok(Output)` - 命令在超时前完成
-/// - `Err(io::Error)` - 命令执行失败或超时
-///   - `ErrorKind::TimedOut` - 命令超时
+/// - `Ok(Output)` - The command completed before the timeout
+/// - `Err(io::Error)` - The command failed or timed out
+///   - `ErrorKind::TimedOut` - The command timed out
 ///
-/// # 示例
+/// # Examples
 ///
 /// ```rust,no_run
 /// use rust_tools::cmd::run_cmd_output_with_timeout;
@@ -390,10 +407,10 @@ pub fn run_cmd_output(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Outp
 /// }
 /// ```
 ///
-/// # 注意事项
+/// # Notes
 ///
-/// - 超时后会尝试终止子进程
-/// - 标准输入被设置为 null
+/// - The child process is terminated on timeout
+/// - stdin is set to null
 pub fn run_cmd_output_with_timeout(
     command: &str,
     opts: RunCmdOptions<'_>,
@@ -424,13 +441,17 @@ enum StreamKind {
     Stderr,
 }
 
-/// 读取线程：把读到的数据按流类型打标签后经 channel 送回主线程累积。
+/// Reader thread: tags each chunk with its stream kind and sends it over a
+/// channel back to the main thread for accumulation.
 ///
-/// 关键：不再在线程内累积并通过 `join` 回收。因为命令若在后台派生常驻进程
-/// （如 `python app.py &` 启动的 Flask），该子进程会继承同一个 stdout/stderr
-/// 管道写端 fd，导致 `read()` 永远等不到 EOF、线程永不退出。主线程一旦 `join`
-/// 这样的线程就会死锁。改为纯 channel 汇报后，主线程可在前台命令结束时直接
-/// 返回、把读取线程作为 daemon 泄漏（其阻塞在无害的管道读上，进程退出即回收）。
+/// Key point: the thread no longer accumulates data itself and is not rejoined
+/// via `join`. If a command spawns a long-lived process in the background
+/// (e.g. Flask started by `python app.py &`), that child inherits the same
+/// stdout/stderr pipe write-end fd, so `read()` never sees EOF and the thread
+/// never exits. Joining such a thread would deadlock the main thread. With
+/// pure channel reporting, the main thread can return as soon as the
+/// foreground command exits, leaking the reader thread as a daemon (it blocks
+/// on a harmless pipe read and is reclaimed when the process exits).
 fn spawn_pipe_reader<R>(mut reader: R, kind: StreamKind, tx: Sender<(StreamKind, Vec<u8>)>)
 where
     R: Read + Send + 'static,
@@ -455,17 +476,24 @@ where
     });
 }
 
-/// 前台命令退出后，给读取线程一个短暂的宽限期把「已经缓冲在管道里」的尾部
-/// 输出排空，然后返回。若命令派生了继承管道的后台进程，channel 永远不会
-/// `Disconnected`，因此必须用固定宽限期兜底，绝不能无限等待。
+/// After the foreground command exits, gives the reader thread a short grace
+/// period to drain the tail output already buffered in the pipe, then returns.
+/// If the command spawned a background process that inherited the pipe, the
+/// channel never becomes `Disconnected`, so a fixed grace period is mandatory
+/// and waiting must be bounded.
 const DRAIN_GRACE: Duration = Duration::from_millis(100);
 
-/// PTY 交互命令的"停滞"判定：命令在 PTY 上存活却长时间没有输出时，几乎可以断定它在
-/// 等待人类输入（扫码、密码、菜单选择），而 agent 无法提供输入；输出被管道（如
-/// `| tail`）缓冲时更是从头到尾都看不到。此时提前终止并返回部分输出 + 明确诊断，
-/// 避免静默挂起直到 60-300s 的超时兜底。
-/// - `PTY_STALL_AFTER_OUTPUT`：命令已产生过输出后，连续静默超过该时长即判定停滞。
-/// - `PTY_STALL_SILENT_START`：命令从启动起就毫无输出、且持续运行超过该时长即判定停滞。
+/// Stall detection for PTY interactive commands: when a command is alive on the
+/// PTY but produces no output for a long time, it is almost certainly waiting
+/// for human input (QR scan, password, menu choice) that the agent cannot
+/// provide; when output is buffered through a pipe (e.g. `| tail`) it is
+/// invisible from start to finish. In that case terminate early and return the
+/// partial output plus an explicit diagnosis instead of hanging silently until
+/// the 60-300s timeout backstop.
+/// - `PTY_STALL_AFTER_OUTPUT`: once the command has produced output, continued
+///   silence beyond this duration is judged a stall.
+/// - `PTY_STALL_SILENT_START`: a command with no output at all since startup
+///   that keeps running beyond this duration is judged a stall.
 const PTY_STALL_AFTER_OUTPUT: Duration = Duration::from_secs(10);
 const PTY_STALL_SILENT_START: Duration = Duration::from_secs(20);
 
@@ -482,7 +510,7 @@ fn drain_channel<F>(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            // 仍尽量取走已就绪的数据，但不再等待。
+            // Still take any data that is ready, but do not wait for more.
             while let Ok((kind, chunk)) = rx.try_recv() {
                 accumulate_chunk(kind, &chunk, stdout_buf, stderr_buf, on_chunk);
             }
@@ -512,10 +540,13 @@ fn accumulate_chunk<F>(
     on_chunk(chunk);
 }
 
-/// 命令执行结果：携带 stdout/stderr，并用标志位区分「被超时/取消杀掉」的情形。
+/// Command execution result: carries stdout/stderr and uses flags to
+/// distinguish the "killed by timeout/cancel" cases.
 ///
-/// 超时或取消时仍保留已捕获的部分输出（`status` 可能为 `None`），让上层能把
-/// 「被杀前已经产生的输出」交给调用方，而不是只给一句无信息的 timeout/cancelled。
+/// On timeout or cancellation the partially captured output is still preserved
+/// (`status` may be `None`) so the upper layer can hand the caller whatever was
+/// produced before the kill, rather than an uninformative
+/// timeout/cancelled-only error.
 #[derive(Debug)]
 pub struct CommandRunResult {
     pub status: Option<ExitStatus>,
@@ -523,7 +554,8 @@ pub struct CommandRunResult {
     pub stderr: Vec<u8>,
     pub timed_out: bool,
     pub cancelled: bool,
-    /// PTY 命令被判"停滞"（存活但长时间无输出，疑似等待交互输入）并被提前终止。
+    /// The PTY command was judged "stalled" (alive but silent for a long time,
+    /// likely waiting for interactive input) and terminated early.
     pub stalled: bool,
 }
 
@@ -541,8 +573,9 @@ const NON_INTERACTIVE_ENV_POLICY: CommandEnvPolicy = CommandEnvPolicy {
     suppress_pagers: true,
     suppress_interaction: true,
 };
-// PTY 输出仍由父进程捕获，因此关闭 pager；但保留提示、编辑器、终端和颜色环境，
-// 让显式交互命令继续按真实终端模式运行。
+// PTY output is still captured by the parent, so pagers are disabled; but
+// prompt, editor, terminal, and color environment are kept so explicitly
+// interactive commands keep running in real-terminal mode.
 const PSEUDO_TERMINAL_ENV_POLICY: CommandEnvPolicy = CommandEnvPolicy {
     suppress_pagers: true,
     suppress_interaction: false,
@@ -570,10 +603,13 @@ fn apply_command_env_policy(cmd: &mut Command, policy: CommandEnvPolicy) {
     }
 }
 
-/// 把带超时/取消标记的结果转回旧的 `io::Result<Output>` 语义：
-/// 超时 -> `Err(TimedOut)`、取消 -> `Err(Interrupted)`、正常 -> `Ok(Output)`。
-/// 旧路径（hooks、非流式 `run_cmd_output_with_timeout`）不需要部分输出，只看成功/失败，
-/// 因此维持原签名，由本函数丢弃被杀情形下的部分输出。
+/// Converts a result carrying timeout/cancel markers back to the legacy
+/// `io::Result<Output>` semantics:
+/// timeout -> `Err(TimedOut)`, cancel -> `Err(Interrupted)`, normal ->
+/// `Ok(Output)`. Legacy paths (hooks, non-streaming
+/// `run_cmd_output_with_timeout`) do not need partial output and only care
+/// about success/failure, so the signature is unchanged and this function
+/// discards the partial output of killed cases.
 fn result_to_output(r: CommandRunResult) -> io::Result<Output> {
     if r.timed_out {
         Err(io::Error::new(io::ErrorKind::TimedOut, "timeout"))
@@ -615,14 +651,17 @@ where
     result_to_output(r)
 }
 
-/// 与 [`run_cmd_output_streaming_with_timeout`] 相同，但额外接收
-/// `on_background_group` 回调：当前台命令正常退出后，如果其进程组内仍有存活
-/// 成员（命令用 `&` 派生了常驻服务，如 `python app.py &`），会以该进程组的
-/// pgid 调用一次回调。上层可据此把 pgid 登记到会话级注册表，在会话结束时统一
-/// 清理，避免遗留孤儿进程。
+/// Same as [`run_cmd_output_streaming_with_timeout`], but additionally accepts
+/// an `on_background_group` callback: after the foreground command exits
+/// normally, if its process group still has live members (the command spawned a
+/// long-running service with `&`, e.g. `python app.py &`), the callback is
+/// invoked once with that group's pgid. The upper layer can use it to register
+/// the pgid in a session-level registry and clean up uniformly when the session
+/// ends, avoiding orphan processes.
 ///
-/// 注意：pgid 仅在当前进程存活期间有意义，不应持久化到磁盘——重启后同一数值
-/// 可能被无关进程复用，届时 `killpg` 会误杀。
+/// Note: a pgid is only meaningful while the current process is alive and must
+/// not be persisted to disk — after a restart the same value may be reused by
+/// an unrelated process, and `killpg` would then kill the wrong target.
 pub fn run_cmd_output_streaming_with_timeout_tracked<F, C, G>(
     command: &str,
     opts: RunCmdOptions<'_>,
@@ -675,10 +714,13 @@ where
     )
 }
 
-/// 与 [`run_cmd_output_streaming_with_timeout_tracked`] 相同，但让子进程运行在 PTY
-/// 中。仅限需要终端能力（例如扫码登录、全屏交互 CLI）的显式调用；该路径只关闭
-/// 可能阻塞捕获输出的 pager，不关闭提示、编辑器、终端能力或颜色。常规命令仍应
-/// 使用管道，以保留 stdout/stderr 分离和普通日志的非交互语义。
+/// Same as [`run_cmd_output_streaming_with_timeout_tracked`], but runs the
+/// child in a PTY. Intended only for explicit calls that need terminal
+/// capabilities (e.g. QR-code login, full-screen interactive CLIs); this path
+/// disables only pagers that could block captured output, not prompts, editors,
+/// terminal capabilities, or color. Regular commands should still use pipes to
+/// keep stdout/stderr separation and the non-interactive semantics of ordinary
+/// logs.
 pub fn run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal<F, C, G>(
     command: &str,
     opts: RunCmdOptions<'_>,
@@ -714,8 +756,9 @@ fn run_cmd_output_streaming_with_timeout_tracked_inner<F, C, G>(
     mut on_background_group: G,
     pseudo_terminal: bool,
     env_policy: CommandEnvPolicy,
-    // PTY 停滞判定阈值 `(after_output, silent_start)`；`None` 时使用默认值。测试可注入
-    // 极小值快速验证停滞路径，生产路径始终为 `None`。
+    // Stall-detection thresholds `(after_output, silent_start)` for PTY;
+    // `None` uses the defaults. Tests may inject tiny values to exercise the
+    // stall path quickly; production always passes `None`.
     pty_stall: Option<(Duration, Duration)>,
 ) -> io::Result<CommandRunResult>
 where
@@ -737,8 +780,9 @@ where
 
             let child = crate::fork_guard::spawn(&mut cmd)?;
             let (tx, rx) = mpsc::channel::<(StreamKind, Vec<u8>)>();
-            // PTY 将 stdout/stderr 合并到同一个 master；用 stdout 槽保存，保持上层
-            // "合并输出" 的既有结果语义。
+            // The PTY merges stdout/stderr into the same master; store it in
+            // the stdout slot to keep the existing "merged output" result
+            // semantics for the upper layer.
             spawn_pipe_reader(master, StreamKind::Stdout, tx);
             (child, rx)
         }
@@ -775,7 +819,8 @@ where
     let mut stderr_buf = Vec::new();
 
     let deadline = Instant::now() + timeout;
-    // PTY 停滞判定用：命令启动时间、最近一次收到输出的时间。
+    // For PTY stall detection: command start time and the time of the most
+    // recent output received.
     let started_at = Instant::now();
     let mut last_output_at = started_at;
     let status = loop {
@@ -794,7 +839,8 @@ where
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if should_cancel() {
-                    // 取消：杀掉整个进程组（含后台派生进程），管道随之关闭，读取线程退出。
+                    // Cancel: kill the whole process group (including spawned
+                    // background processes); the pipes close and reader threads exit.
                     terminate_child(&mut child);
                     let killed_status = child.wait().ok();
                     drain_channel(
@@ -804,8 +850,10 @@ where
                         &mut on_chunk,
                         DRAIN_GRACE,
                     );
-                    // 取消时仍返回已捕获的部分输出（status 可能因 wait 失败而为 None），
-                    // 让上层能把「被取消前已经产生的输出」交给模型，而不是只给一句 cancelled。
+                    // On cancel, still return the partially captured output
+                    // (status may be None if wait failed) so the upper layer
+                    // can hand the model whatever was produced before the
+                    // cancellation, not just a bare cancelled marker.
                     return Ok(CommandRunResult {
                         status: killed_status,
                         stdout: stdout_buf,
@@ -815,11 +863,15 @@ where
                         stalled: false,
                     });
                 }
-                // PTY 交互命令停滞判定：命令存活却长时间没有输出，几乎可以断定它在等待
-                // 人类输入（扫码、密码、菜单选择），agent 无法提供输入；输出被管道（如
-                // `| tail`）缓冲时更是一点都看不到。提前终止并返回已捕获的部分输出 +
-                // stalled 标记，让上层给出"等待交互输入"的明确诊断，而不是静默挂到
-                // 60-300s 的超时兜底。
+                // PTY interactive-command stall detection: the command is alive
+                // but silent for a long time, almost certainly waiting for
+                // human input (QR scan, password, menu choice) that the agent
+                // cannot provide; output buffered through a pipe (e.g.
+                // `| tail`) is invisible entirely. Terminate early and return
+                // the captured partial output plus the stalled flag so the
+                // upper layer can report an explicit "waiting for interactive
+                // input" diagnosis instead of hanging silently into the
+                // 60-300s timeout backstop.
                 if pseudo_terminal {
                     let now = Instant::now();
                     let (after_output, silent_start) = pty_stall.unwrap_or((
@@ -853,7 +905,8 @@ where
                     }
                 }
                 if Instant::now() >= deadline {
-                    // 超时：同样杀掉整个进程组，避免后台进程继续持有管道。
+                    // Timeout: likewise kill the whole process group so
+                    // background processes stop holding the pipes.
                     terminate_child(&mut child);
                     let killed_status = child.wait().ok();
                     drain_channel(
@@ -863,8 +916,10 @@ where
                         &mut on_chunk,
                         DRAIN_GRACE,
                     );
-                    // 超时仍返回已捕获的部分输出（典型：长构建/测试被杀前已打印的进度与
-                    // 错误），让模型能据此判断下一步，而不是只看到一个无信息的 "timeout"。
+                    // On timeout, still return the captured partial output
+                    // (typically progress and errors a long build/test printed
+                    // before being killed) so the model can decide the next
+                    // step instead of seeing only an uninformative "timeout".
                     return Ok(CommandRunResult {
                         status: killed_status,
                         stdout: stdout_buf,
@@ -893,8 +948,10 @@ where
         }
     };
 
-    // 前台命令已退出。若它派生了继承管道的后台进程（如 `flask &`），channel
-    // 不会 Disconnected，这里用固定宽限期排空尾部输出后返回，绝不 join 读取线程。
+    // The foreground command has exited. If it spawned a background process
+    // that inherited the pipes (e.g. `flask &`), the channel never becomes
+    // Disconnected; drain the tail output within the fixed grace period and
+    // return, never joining the reader threads.
     drain_channel(
         &rx,
         &mut stdout_buf,
@@ -903,7 +960,8 @@ where
         DRAIN_GRACE,
     );
 
-    // 前台组长已退出，但若进程组内仍有后台成员存活，上报 pgid 以便会话级清理。
+    // The foreground leader has exited; report the pgid if background members
+    // of the group are still alive, for session-level cleanup.
     if background_group_alive(pgid) {
         on_background_group(pgid);
     }
@@ -918,20 +976,20 @@ where
     })
 }
 
-/// 执行命令并返回输出文本
+/// Executes a command and returns the output text.
 ///
-/// 执行命令并将标准输出和标准错误合并为字符串返回。
+/// Runs the command and returns stdout and stderr merged into a single string.
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `command` - 要执行的命令
+/// * `command` - The command to execute
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Ok(String)` - 命令输出（stdout + stderr）
-/// - `Err(io::Error)` - 命令执行失败
+/// - `Ok(String)` - The command output (stdout + stderr)
+/// - `Err(io::Error)` - The command failed
 ///
-/// # 示例
+/// # Examples
 ///
 /// ```rust,no_run
 /// use rust_tools::cmd::run_cmd;
@@ -940,10 +998,10 @@ where
 /// println!("输出：{}", output);
 /// ```
 ///
-/// # 注意事项
+/// # Notes
 ///
-/// - 空命令会返回空字符串
-/// - stdout 和 stderr 会被合并
+/// - An empty command returns an empty string
+/// - stdout and stderr are merged
 pub fn run_cmd(command: &str) -> io::Result<String> {
     if command.trim().is_empty() {
         return Ok("".to_owned());
@@ -1012,7 +1070,8 @@ mod tests {
 
     #[test]
     fn test_should_use_shell_routes_variable_expansion_to_shell() {
-        // 普通 `$VAR` 是 shell 变量展开，必须走 shell 路径，否则会作为字面量传给子进程。
+        // A plain `$VAR` is shell variable expansion and must take the shell
+        // path, otherwise it would be passed to the child as a literal.
         assert!(should_use_shell("echo $HOME"));
         assert!(should_use_shell(r#"echo "$HOME""#));
         assert!(should_use_shell("ls $DIR"));
@@ -1032,7 +1091,7 @@ mod tests {
 
     #[test]
     fn test_run_cmd_output_keeps_quoted_tilde_literal() {
-        // shell 语义：引号内的 `~` 是字面量，不应展开。
+        // Shell semantics: a `~` inside quotes is a literal and is not expanded.
         #[cfg(unix)]
         {
             let output = run_cmd_output(r#"echo "~""#, RunCmdOptions::default()).unwrap();
@@ -1043,8 +1102,9 @@ mod tests {
 
     #[test]
     fn test_run_cmd_output_keeps_tilde_followed_by_quote_literal() {
-        // shell 语义：`~` 后紧跟引号同样不展开（`~"/foo"` → 字面量 `~/foo`，
-        // `~"x"` → 字面量 `~x`），与 `sh` 实测行为一致。
+        // Shell semantics: a quote right after `~` likewise blocks expansion
+        // (`~"/foo"` → literal `~/foo`, `~"x"` → literal `~x`), matching
+        // observed `sh` behavior.
         #[cfg(unix)]
         {
             let output = run_cmd_output(r#"echo ~"/foo""#, RunCmdOptions::default()).unwrap();
@@ -1070,7 +1130,8 @@ mod tests {
 
     #[test]
     fn test_build_no_shell_command_expands_program_tilde() {
-        // 程序位置的前导 `~` 也应展开，与参数位置、shell 语义保持一致。
+        // A leading `~` in the program position is expanded too, consistent
+        // with the argument position and shell semantics.
         #[cfg(unix)]
         {
             let home = std::env::var("HOME").unwrap();
@@ -1138,8 +1199,10 @@ mod tests {
 
     #[test]
     fn test_pty_stall_terminates_interactive_command_and_preserves_partial_output() {
-        // 交互命令（如扫码登录）打印输出后等待人类输入：应快速判"停滞"并终止，
-        // 保留已捕获的部分输出（二维码），而不是静默挂到超时兜底。
+        // Interactive commands (e.g. QR-code login) print output and then wait
+        // for human input: they should be judged "stalled" and terminated
+        // quickly, preserving the captured partial output (the QR code) instead
+        // of hanging silently until the timeout backstop.
         #[cfg(unix)]
         {
             let started = Instant::now();
@@ -1173,8 +1236,10 @@ mod tests {
 
     #[test]
     fn test_pty_stall_terminates_silent_command() {
-        // 从启动起就毫无输出的 PTY 命令（例如输出被 `| tail` 管道缓冲吞掉）：
-        // silent-start 阈值到期后同样判停滞，避免无信息地挂满整个超时。
+        // A PTY command with no output at all since startup (e.g. output
+        // swallowed by `| tail` pipe buffering): once the silent-start threshold
+        // expires it is likewise judged stalled, avoiding an uninformative hang
+        // for the full timeout.
         #[cfg(unix)]
         {
             let started = Instant::now();
@@ -1204,8 +1269,10 @@ mod tests {
 
     #[test]
     fn test_stall_guard_only_applies_to_pty_runs() {
-        // 非 PTY 路径不受停滞判定影响：仍由常规超时兜底（打印输出后静默的普通命令
-        // 如编译/下载可以合法地长时间无输出）。
+        // The non-PTY path is unaffected by stall detection: the regular
+        // timeout remains the backstop (ordinary commands like compiles or
+        // downloads may legitimately stay silent for a long time after
+        // printing output).
         #[cfg(unix)]
         {
             let result = run_cmd_output_streaming_with_timeout(
@@ -1269,8 +1336,10 @@ mod tests {
 
     #[test]
     fn test_returns_promptly_when_command_backgrounds_a_long_lived_process() {
-        // 回归：前台命令结束、但后台派生进程继承了 stdout/stderr 管道。
-        // 旧实现会 join 永不退出的读取线程而死锁；新实现应在宽限期后返回。
+        // Regression: the foreground command finishes, but a background spawned
+        // process inherited the stdout/stderr pipes. The old implementation
+        // joined a reader thread that never exits and deadlocked; the new one
+        // should return after the grace period.
         #[cfg(unix)]
         {
             let started = Instant::now();
@@ -1298,8 +1367,10 @@ mod tests {
 
     #[test]
     fn test_reports_pgid_when_background_group_survives() {
-        // 派生一个后台常驻进程后前台立即返回：应上报存活进程组的 pgid，
-        // 供上层登记会话级清理。上报后测试自行杀掉该组，避免泄漏。
+        // After spawning a long-lived background process the foreground returns
+        // immediately: the surviving group's pgid should be reported for the
+        // upper layer to register session-level cleanup. The test kills the
+        // group itself afterwards to avoid leaks.
         #[cfg(unix)]
         {
             let mut reported: Vec<u32> = Vec::new();
@@ -1317,9 +1388,9 @@ mod tests {
             assert_eq!(reported.len(), 1, "expected exactly one surviving group");
             let pgid = reported[0];
             assert!(pgid > 0);
-            // 该进程组应确实存活。
+            // The process group should indeed be alive.
             assert_eq!(unsafe { libc::kill(-(pgid as libc::pid_t), 0) }, 0);
-            // 清理：杀掉整个组。
+            // Cleanup: kill the whole group.
             unsafe {
                 let _ = libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
             }
@@ -1328,7 +1399,8 @@ mod tests {
 
     #[test]
     fn test_does_not_report_pgid_for_clean_foreground_command() {
-        // 纯前台命令退出后进程组内无成员，不应上报 pgid。
+        // After a pure foreground command exits, the group has no members; no
+        // pgid should be reported.
         #[cfg(unix)]
         {
             let mut reported: Vec<u32> = Vec::new();

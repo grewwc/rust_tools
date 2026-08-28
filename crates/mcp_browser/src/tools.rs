@@ -1,7 +1,7 @@
-//! 工具 schema 声明 + `tools/call` 分发与各工具逻辑。
+//! Tool schema declarations + `tools/call` dispatch and per-tool logic.
 //!
-//! 全部 13 个工具都通过 `content[0].text` 回传文本（宿主只读这一处）。
-//! 每个 CDP 操作都包在 `with_timeout` 里，超时返回不含 transport 触发词的干净错误。
+//! All 13 tools return text via `content[0].text` (the host reads only this slot).
+//! Every CDP operation is wrapped in `with_timeout`; a timeout returns a clean error free of transport trigger words.
 
 use std::path::PathBuf;
 
@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use crate::browser::{BrowserSession, ensure_session};
 use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
 
-/// 每操作超时（毫秒）。默认 90s，短于宿主 request_timeout_ms（建议 120s），
-/// 使超时由 server 侧兜底、返回干净错误，而非被宿主 kill 掉整个会话。
+/// Per-operation timeout (milliseconds). Defaults to 90s, shorter than the host request_timeout_ms (recommended 120s),
+/// so timeouts are handled server-side with a clean error instead of the host killing the whole session.
 pub(crate) fn op_timeout_ms() -> u64 {
     std::env::var("MCP_BROWSER_OP_TIMEOUT_MS")
         .ok()
@@ -21,7 +21,7 @@ pub(crate) fn op_timeout_ms() -> u64 {
         .unwrap_or(90_000)
 }
 
-/// initialize 结果。
+/// Result of initialize.
 pub fn initialize_result() -> Value {
     json!({
         "protocolVersion": "2024-11-05",
@@ -30,7 +30,7 @@ pub fn initialize_result() -> Value {
     })
 }
 
-/// tools/list 结果：13 个浏览器自动化工具的 schema。
+/// Result of tools/list: schemas for the 13 browser automation tools.
 pub fn tools_list_result() -> Value {
     json!({
         "tools": [
@@ -173,7 +173,7 @@ pub fn tools_list_result() -> Value {
     })
 }
 
-/// tools/call 分发。
+/// tools/call dispatch.
 pub async fn handle_tools_call(
     session: &mut Option<BrowserSession>,
     params: Option<Value>,
@@ -211,7 +211,7 @@ pub async fn handle_tools_call(
     }
 }
 
-// ---- 参数助手 ----
+// ---- Parameter helpers ----
 
 fn require_str(args: &Value, key: &str) -> Result<String, JsonRpcErr> {
     args.get(key)
@@ -228,15 +228,15 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// 扫描页面是否出现需要用户手动完成的操作。
+/// Scans the page for actions that require manual completion by the user.
 ///
-/// 覆盖 7 类：captcha、slider（滑块）、sms_otp、twofa、login_required、
-/// payment_verify、identity_verify。命中则返回分类标签，未命中返回 None。
-/// 检测失败（JS 执行异常等）静默返回 None，不影响正常流程。
+/// Covers 7 categories: captcha, slider, sms_otp, twofa, login_required,
+/// payment_verify, identity_verify. Returns the category tag on a hit, None otherwise.
+/// Detection failures (e.g. JS exceptions) silently return None and do not affect the normal flow.
 ///
-/// 检测偏保守：DOM 结构信号（iframe/class/id、专用输入框）优先且最可信；
-/// 纯正文关键词匹配容易误报（如一篇讲 2FA/OTP 原理的文章），因此把纯文本类
-/// 归到结构信号之后，且尽量要求「关键词 + 结构特征」同时命中。
+/// Detection is conservative: DOM structure signals (iframe/class/id, dedicated input fields) come first and are most trusted;
+/// plain body keyword matching easily false-positives (e.g. an article explaining 2FA/OTP), so text-only signals are ranked after
+/// structure signals, and keyword + structure features are required to match together wherever possible.
 async fn detect_user_action_required(page: &chromiumoxide::page::Page) -> Option<String> {
     let result = page
         .evaluate_expression(r#"(function(){
@@ -289,17 +289,17 @@ async fn detect_user_action_required(page: &chromiumoxide::page::Page) -> Option
     if v.is_empty() { None } else { Some(v) }
 }
 
-/// 生成追加到工具输出末尾的「需人工介入」提示标签（单一事实来源，避免多处重复）。
+/// Builds the "user action required" tag appended to tool output (single source of truth, avoids duplication).
 fn user_action_tag(cat: &str) -> String {
     format!(
         "\n[USER_ACTION_REQUIRED: {cat}] 页面需要用户手动完成操作。可调用 wait_for_human 阻塞等待用户在可见浏览器窗口完成，或直接停止自动化并请用户完成后告知继续。"
     )
 }
 
-/// 检测人机校验并把结果记入会话（`pending_human` 标记）：
-/// 命中 → 写入分类并返回待追加的标签；未命中 → 清空标记并返回空串。
-/// 供 navigate / get_text / get_html / click / type_text / press_key 复用，
-/// 保证会话标记与页面实际状态一致。
+/// Detects human verification and records the result in the session (`pending_human` flag):
+/// on a hit, stores the category and returns the tag to append; on a miss, clears the flag and returns an empty string.
+/// Reused by navigate / get_text / get_html / click / type_text / press_key,
+/// keeping the session flag consistent with the actual page state.
 async fn detect_and_mark(s: &mut BrowserSession) -> String {
     if let Some(cat) = detect_user_action_required(&s.page).await {
         s.pending_human = Some(cat.clone());
@@ -310,7 +310,7 @@ async fn detect_and_mark(s: &mut BrowserSession) -> String {
     }
 }
 
-/// 会话仍有人工操作待完成时，给改动类工具输出前加的提醒前缀。
+/// Prefix prepended to mutating tool output while a human action is still pending in the session.
 fn pending_warning(s: &BrowserSession) -> String {
     match &s.pending_human {
         Some(cat) => format!(
@@ -320,11 +320,11 @@ fn pending_warning(s: &BrowserSession) -> String {
     }
 }
 
-// ---- 各工具实现 ----
+// ---- Tool implementations ----
 
-/// 轮询等待元素出现：每 200ms 一次 `querySelector`，到 `timeout_ms` 仍未出现则报错。
-/// 与 AppleScript 驱动的 `wait_for_selector`（applescript.rs）行为对齐，
-/// 使 `wait_selector` 在两个驱动下语义一致（真等待，而非单次查找）。
+/// Polls for an element to appear: one `querySelector` every 200ms; errors if it has not appeared by `timeout_ms`.
+/// Aligned with the AppleScript driver's `wait_for_selector` (applescript.rs),
+/// so `wait_selector` behaves the same under both drivers (real waiting, not a single lookup).
 async fn wait_for_selector(page: &Page, selector: &str, timeout_ms: u64) -> Result<(), String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
@@ -368,7 +368,7 @@ async fn tool_navigate(
         }
         let title = s.page.get_title().await.ok().flatten().unwrap_or_default();
         let final_url = s.page.url().await.ok().flatten().unwrap_or(url.clone());
-        // 新页面 = 新状态：清掉旧的人工待办标记，随后按新页面重新检测。
+        // New page = new state: clear the stale human-action flag, then re-detect on the new page.
         s.pending_human = None;
         let mut summary = format!("Navigated to {final_url}\nTitle: {title}");
         summary.push_str(&detect_and_mark(s).await);
@@ -389,7 +389,7 @@ async fn tool_click(
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
 
-    // 会话仍有人工操作待完成时，先提示模型停下来（见 pending_warning）。
+    // While a human action is still pending, prompt the model to stop first (see pending_warning).
     let pending = pending_warning(s);
     let tag = with_timeout(ms, async {
         let el = s
@@ -401,7 +401,7 @@ async fn tool_click(
             .await
             .map_err(|e| format!("scroll_into_view failed: {e}"))?;
         el.click().await.map_err(|e| format!("click failed: {e}"))?;
-        // 点击常触发验证码/登录墙：动作后立即检测并标记，让模型第一时间知道。
+        // Clicks often trigger captchas/login walls: detect and flag immediately after the action so the model knows right away.
         Ok(detect_and_mark(s).await)
     })
     .await?;
@@ -429,7 +429,7 @@ async fn tool_type_text(
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
 
-    // 会话仍有人工操作待完成时，先提示模型停下来（见 pending_warning）。
+    // While a human action is still pending, prompt the model to stop first (see pending_warning).
     let pending = pending_warning(s);
     let tag = with_timeout(ms, async {
         let el = s
@@ -449,7 +449,7 @@ async fn tool_type_text(
                 .await
                 .map_err(|e| format!("submit (Enter) failed: {e}"))?;
         }
-        // 提交常触发验证码/登录墙：动作后立即检测并标记，让模型第一时间知道。
+        // Submits often trigger captchas/login walls: detect and flag immediately after the action so the model knows right away.
         Ok(detect_and_mark(s).await)
     })
     .await?;
@@ -471,10 +471,10 @@ async fn tool_press_key(
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;
 
-    // 会话仍有人工操作待完成时，先提示模型停下来（见 pending_warning）。
+    // While a human action is still pending, prompt the model to stop first (see pending_warning).
     let pending = pending_warning(s);
     let tag = with_timeout(ms, async {
-        // 键盘动作走元素句柄：给定 selector 则用它，否则退到 body。
+        // Keyboard actions go through element handles: use the given selector if present, otherwise fall back to body.
         let target = selector.clone().unwrap_or_else(|| "body".to_string());
         let el = s
             .page
@@ -485,7 +485,7 @@ async fn tool_press_key(
         el.press_key(&key)
             .await
             .map_err(|e| format!("press_key '{key}' failed: {e}"))?;
-        // Enter 提交常触发验证码/登录墙：动作后立即检测并标记，让模型第一时间知道。
+        // Enter submissions often trigger captchas/login walls: detect and flag immediately after the action so the model knows right away.
         Ok(detect_and_mark(s).await)
     })
     .await?;
@@ -538,7 +538,7 @@ async fn tool_wait_for(
         .get("timeout_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(15_000);
-    // 轮询上限取 min(操作 cap, 用户 timeout)，保证 server cap 优先。
+    // Poll cap = min(operation cap, user timeout), so the server cap takes precedence.
     let cap = op_timeout_ms().min(timeout_ms);
     let s = ensure_session(session)
         .await
@@ -609,7 +609,7 @@ async fn tool_get_text(
             .await
             .map_err(|e| format!("inner_text failed: {e}"))?
             .unwrap_or_default();
-        // 检测在正文之外单独返回，避免标签被 cap_text 截断吞掉（正文可能 ≥ 24K）。
+        // The detection is returned separately from the body so the tag is not swallowed by cap_text truncation (the body may be ≥ 24K).
         let tag = detect_and_mark(s).await;
         Ok((inner, tag))
     })
@@ -651,7 +651,7 @@ async fn tool_get_html(
                 .await
                 .map_err(|e| format!("content failed: {e}")),
         }?;
-        // 检测在正文之外单独返回，避免标签被 cap_text 截断吞掉（HTML 极易 ≥ 24K）。
+        // The detection is returned separately from the body so the tag is not swallowed by cap_text truncation (HTML easily exceeds 24K).
         let tag = detect_and_mark(s).await;
         Ok((content, tag))
     })
@@ -663,25 +663,25 @@ async fn tool_get_html(
     Ok(text_content(out))
 }
 
-/// 阻塞等待用户在可见窗口手动完成验证类操作（captcha / 滑块 / 短信码 / 2FA / 登录 …）。
+/// Blocks waiting for the user to manually complete a verification step in the visible window (captcha / slider / SMS code / 2FA / login ...).
 ///
-/// # 为什么是「可续期分段阻塞」而非「一直等到底」
-/// 宿主对每个 MCP server 只有一个 `request_timeout_ms`（默认 120s），一旦某次
-/// tools/call 超过它，宿主会**kill 并 restart 子进程、销毁整个浏览器会话**
-/// （见 AGENTS.md 铁律 #2）。人工完成验证码常需数分钟，若本工具一直阻塞到底，
-/// 必然超时→窗口被杀→人做到一半前功尽弃。
+/// # Why renewable bounded segments instead of waiting indefinitely
+/// The host enforces a single `request_timeout_ms` per MCP server (default 120s). Once any
+/// tools/call exceeds it, the host **kills and restarts the subprocess, destroying the whole browser session**
+/// (see AGENTS.md invariant #2). Human completion of a captcha often takes minutes; if this tool blocked to the end,
+/// it would inevitably time out → window killed → the user's half-finished work lost.
 ///
-/// 因此本工具**单次调用只阻塞一个有界预算**（固定最长 60s，且被硬夹紧到显著小于
-/// server op 上限），期间每 2s 轮询一次 `detect_user_action_required`：
-/// - 连续 2 次检测不到阻塞信号 → 返回 `status=resolved`（人工已完成，可继续自动化）；
-///   连续判定可避免页面重渲染/检测瞬时抖动造成的误报「已解决」。
-/// - 每次检测自带 5s 超时：单次检测卡死按「仍在阻塞」处理，绝不误判 resolved。
-/// - 预算耗尽仍未完成 → **正常返回**（非 error）`status=still_waiting`，提示模型
-///   **结束本轮、把操作交给用户**，用户回复后再调本工具验证。绝不返回 -32001
-///   超时错误，避免模型误判为失败；无头模式（用户看不到窗口）立即返回 unavailable。
+/// Therefore this tool **blocks for at most one bounded budget per call** (fixed 60s max, hard-clamped to be well below
+/// the server op cap), polling `detect_user_action_required` every 2s meanwhile:
+/// - 2 consecutive polls with no blocking signal → return `status=resolved` (human finished; automation may continue);
+///   consecutive confirmation avoids false "resolved" reports from re-renders or transient detection jitter.
+/// - Each poll has its own 5s timeout: a hung poll is treated as "still blocked", never misreported as resolved.
+/// - Budget exhausted and still unfinished → return **normally** (not an error) `status=still_waiting`, telling the model
+///   **to end the turn and hand the action to the user**, then call this tool again after the user replies. It never returns a -32001
+///   timeout error, so the model never misreads it as failure; headless mode (no visible window) returns unavailable immediately.
 ///
-/// 这样既是**真阻塞**（窗口内人一完成就马上被感知并返回），又永远不会触发宿主的
-/// kill+restart，人可以跨多次调用从容完成任意长的手工操作。
+/// This is both **a real block** (completion inside the window is detected and returned immediately) and never triggers the host's
+/// kill+restart, letting the user complete arbitrarily long manual work across multiple calls.
 async fn tool_wait_for_human(
     session: &mut Option<BrowserSession>,
     args: &Value,
@@ -689,14 +689,14 @@ async fn tool_wait_for_human(
     let expect = opt_str(args, "expect");
     let relay = opt_str(args, "message");
 
-    // 单次调用的阻塞预算：固定最长 60s（人完成校验立刻返回，否则最多等 1 分钟）。
-    // 仍硬夹紧到 [2s, op_timeout - 15s]，给最后一次轮询 + 返回留足余量，
-    // 确保绝不逼近宿主 request_timeout。
+    // Blocking budget per call: fixed 60s max (return as soon as the human finishes; otherwise wait at most 1 minute).
+    // Still hard-clamped to [2s, op_timeout - 15s], leaving enough headroom for the final poll + return,
+    // ensuring it never approaches the host request_timeout.
     let op_cap = op_timeout_ms();
     let ceiling = op_cap.saturating_sub(15_000).max(5_000);
     let budget_ms = 60_000u64.min(ceiling);
 
-    // 无头模式下用户根本看不到窗口、无法手动操作——立即返回，不空等（也避免启动浏览器）。
+    // In headless mode the user cannot see or operate the window at all — return immediately instead of idling (also avoids launching a browser).
     let headless = std::env::var("MCP_BROWSER_HEADLESS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -714,18 +714,18 @@ async fn tool_wait_for_human(
     let poll_timeout = std::time::Duration::from_secs(5);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
 
-    // 段内轮询循环。注意：本循环自身即受 budget_ms 约束，不再套 with_timeout。
+    // Polling loop within a segment. Note: this loop is itself bounded by budget_ms; no with_timeout wrapper.
     let mut last_seen: Option<String> = None;
     let mut clean_polls = 0u32;
     loop {
         match tokio::time::timeout(poll_timeout, detect_user_action_required(&s.page)).await {
             Ok(Some(cat)) => {
-                // 仍存在阻塞信号：记录分类，继续等。
+                // Blocking signal still present: record the category and keep waiting.
                 last_seen = Some(cat);
                 clean_polls = 0;
             }
             Ok(None) => {
-                // 阻塞信号消失：连续 2 次干净轮询才确认人工已完成（防重渲染抖动）。
+                // Blocking signal gone: confirm completion only after 2 consecutive clean polls (guards against re-render jitter).
                 clean_polls += 1;
                 if clean_polls >= 2 {
                     let url = s.page.url().await.ok().flatten().unwrap_or_default();
@@ -740,7 +740,7 @@ async fn tool_wait_for_human(
                 }
             }
             Err(_) => {
-                // 单次检测超时（CDP 卡死）：按「仍在阻塞」继续等，不累计 clean_polls。
+                // A single poll timed out (CDP hung): treat as "still blocked" and keep waiting without accumulating clean_polls.
             }
         }
 
@@ -750,7 +750,7 @@ async fn tool_wait_for_human(
         tokio::time::sleep(poll_interval).await;
     }
 
-    // 预算耗尽仍未完成：正常返回 still_waiting（非 error），引导模型把控制权交还用户。
+    // Budget exhausted and still unfinished: return still_waiting normally (not an error), guiding the model to hand control back to the user.
     let cat = last_seen
         .or(expect)
         .unwrap_or_else(|| "unknown".to_string());
@@ -797,8 +797,8 @@ async fn tool_screenshot(
     )))
 }
 
-/// 解析截图落盘路径：显式 path > MCP_BROWSER_SCREENSHOT_DIR > 系统临时目录/mcp_browser。
-/// 目录不存在则创建；返回绝对路径。
+/// Resolves the screenshot save path: explicit path > MCP_BROWSER_SCREENSHOT_DIR > system temp dir/mcp_browser.
+/// Creates the directory if missing; returns an absolute path.
 pub(crate) fn resolve_screenshot_path(explicit: Option<String>) -> Result<PathBuf, JsonRpcErr> {
     let path = if let Some(p) = explicit {
         PathBuf::from(p)

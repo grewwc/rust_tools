@@ -1,10 +1,11 @@
-//! 工具溢出处理与持久化摘要构建。
+//! Tool overflow handling and persisted summary construction.
 //!
-//! - `prepare_tool_messages_structured`：结构化裁剪 tool 消息
-//! - `build_persisted_summary_text` / `build_persisted_summary_text_with_app`：构建持久化摘要
-//! - `write_preserved_tool_overflow_file` 等：将溢出内容写入归档文件
-//! - `structured_tool_output_summary`：工具结果结构化摘要
-//! - `is_non_compressible_tool` / `is_preserved_user_or_image_stub`：工具分类判断
+//! - `prepare_tool_messages_structured`: structurally trims tool messages
+//! - `build_persisted_summary_text` / `build_persisted_summary_text_with_app`: builds the
+//!   persisted summary
+//! - `write_preserved_tool_overflow_file` and friends: write overflow content to archive files
+//! - `structured_tool_output_summary`: structured summary of tool results
+//! - `is_non_compressible_tool` / `is_preserved_user_or_image_stub`: tool classification helpers
 
 use std::path::{Path, PathBuf};
 
@@ -91,8 +92,10 @@ pub(super) fn normalize_internal_notes_for_summary_model(messages: &mut Vec<Mess
                 continue;
             }
 
-            // 普通 internal_note 多为过程性提示、cache/loop 状态或 self_note 的
-            // inline 副本。它们不应被当成长期历史事实交给摘要模型反复吸收。
+            // Ordinary internal_notes are mostly procedural notices, cache/loop
+            // state, or inline copies of self_notes. They must not be treated as
+            // long-term historical facts for the summary model to absorb
+            // repeatedly.
             continue;
         }
         out.push(message);
@@ -119,9 +122,11 @@ pub(super) fn prepare_tool_messages_structured(
         if text.trim().is_empty() {
             continue;
         }
-        // 已外溢的 precision 工具结果是稳定指针，不能再把 stub 当成原始结果
-        // 外溢一次。否则每轮压缩都会写出 `stub -> stub` 新文件，既泄漏磁盘，
-        // 也让模型必须沿多层指针才能回到原始证据。
+        // Already-spilled precision tool results are stable pointers; a stub
+        // must not be spilled again as if it were the original result.
+        // Otherwise every compaction round would write a new `stub -> stub`
+        // file, leaking disk space and forcing the model to follow layers of
+        // pointers to reach the original evidence.
         if is_preserved_tool_overflow_stub(&text) {
             continue;
         }
@@ -134,10 +139,14 @@ pub(super) fn prepare_tool_messages_structured(
         if let Some(name) = tool_name
             && is_non_compressible_tool(name)
         {
-            // 最近完整工具组不外溢：刚读到的文件/检索结果必须在下一轮请求里
-            // 完整可见，否则模型看到的是「已卸载，请重读」stub，会立刻再发一次
-            // 同样的 read_file——在会话超软阈值、每轮都跑压缩时表现为无限重读。
-            // 只有保护尾窗之外的旧 precision 结果才零压缩外溢到磁盘。
+            // The most recent complete tool group is never spilled: files and
+            // retrieval results read just now must remain fully visible in the
+            // next request, otherwise the model sees an "evicted, please
+            // re-read" stub and immediately re-issues the same read_file —
+            // manifesting as endless re-reading when the session exceeds the
+            // soft threshold and compaction runs every round. Only older
+            // precision results outside the protected tail window are
+            // zero-compression spilled to disk.
             let is_explicitly_protected = message
                 .tool_call_id
                 .as_ref()
@@ -146,8 +155,10 @@ pub(super) fn prepare_tool_messages_structured(
                 && !protected_indices.contains(&idx)
                 && text.chars().count() > max_chars_per_msg
             {
-                // 回读本 session 已归档 asset 时复用既有文件，避免「外溢→回读→
-                // 再外溢」每次铸造新文件（与 Path C 复用逻辑一致）。
+                // When reading back an asset already archived for this session,
+                // reuse the existing file so "spill → read-back → spill again"
+                // does not mint a new file every time (consistent with Path C's
+                // reuse logic).
                 let existing_asset_path = overflow_dir.and_then(|dir| {
                     message
                         .tool_call_id
@@ -176,12 +187,17 @@ pub(super) fn prepare_tool_messages_structured(
                         .unwrap_or_default();
                     let stub =
                         build_preserved_tool_overflow_stub(&path, name, &text, &recall_lines);
-                    // 防膨胀：外溢必须真正腾出空间。小结果（如几百字节的 grep 输出）
-                    // 换成带完整预览的 stub 往往比原文更大，只会虚增占用、还逼模型
-                    // 去回读归档——正是「读结果一直被归档成 stub」的成因。膨胀时保留
-                    // 原文；仅删除本次新建的文件（复用的 asset 归其它消息的外溢所有，
-                    // 删除会让那条消息的 stub 悬空）。与 enforce_protected_precision_
-                    // group_budget / spill_protected_precision_to_fit 的守卫一致。
+                    // Anti-bloat: spilling must actually free space. Small
+                    // results (e.g. a few hundred bytes of grep output) often
+                    // become larger as a stub with a full preview, which only
+                    // inflates usage and forces the model to read the archive
+                    // back — the exact cause of "read results kept being
+                    // archived as stubs". On bloat, keep the original text and
+                    // delete only the file created this time (a reused asset
+                    // belongs to another message's spill; deleting it would
+                    // leave that message's stub dangling). Consistent with the
+                    // guards in enforce_protected_precision_
+                    // group_budget / spill_protected_precision_to_fit.
                     if stub.chars().count() >= text.chars().count() {
                         if !reused_existing {
                             let _ = std::fs::remove_file(&path);
@@ -195,7 +211,8 @@ pub(super) fn prepare_tool_messages_structured(
         }
 
         if protected_indices.contains(&idx) {
-            // 最近完整工具组的普通工具结果仍保留全文，避免误伤近端上下文。
+            // Ordinary tool results of the most recent complete tool group keep
+            // their full text, avoiding damage to near-end context.
             continue;
         }
 
@@ -206,11 +223,14 @@ pub(super) fn prepare_tool_messages_structured(
     }
 }
 
-/// 对请求上下文中的工具结果施加不可绕过的物理上限。
+/// Applies a non-bypassable physical cap to tool results in the request
+/// context.
 ///
-/// canonical history 始终保留原文；这里仅修改请求侧副本。普通近端结果继续保持
-/// raw，只有超过绝对上限时才外溢，避免 SQLite snapshot 水位之后的 canonical
-/// tail 绕过 current-turn 投影，再次把超大输出送进模型。
+/// The canonical history always keeps the original text; only the request-side
+/// copy is modified here. Ordinary near-end results stay raw and are spilled
+/// only past the absolute cap, preventing the canonical tail after the SQLite
+/// snapshot watermark from bypassing the current-turn projection and pushing
+/// oversized output into the model again.
 pub(super) fn cap_oversized_tool_results_for_context(
     messages: &mut [Message],
     hard_cap_chars: usize,
@@ -239,10 +259,13 @@ pub(super) fn cap_oversized_tool_results_for_context(
             .and_then(|id| id_to_tool_args.get(id))
             .map(|args| build_tool_overflow_recall_lines(tool_name, args))
             .unwrap_or_default();
-        // 回读本 session 已归档 asset（read_file / execute_command cat 指向
-        // tool-overflow-compressed/ 直接子文件）时复用既有文件，而不是再铸造一个
-        // 随机名新文件——否则「外溢→回读→再外溢」会在每次回读时生成新 archive，
-        // 模型永远沿新指针重读，形成无界链。与 Path C 的复用逻辑保持一致。
+        // When reading back an asset already archived for this session
+        // (read_file / execute_command cat pointing at a direct child of
+        // tool-overflow-compressed/), reuse the existing file instead of
+        // minting another randomly named one — otherwise "spill → read-back →
+        // spill again" would generate a new archive on every read-back, with
+        // the model forever re-reading along new pointers: an unbounded chain.
+        // Consistent with Path C's reuse logic.
         let existing_asset_path = overflow_dir.and_then(|dir| {
             tool_call_id
                 .and_then(|id| id_to_tool_args.get(id))
@@ -278,9 +301,12 @@ pub(super) fn cap_oversized_tool_results_for_context(
     capped
 }
 
-/// 最新并行批次可能单独超过上下文窗口。此时仍按完整组判定，但对注册为高精度
-/// grounding 的结果设置 inline 上限：超过预算的结果零压缩外溢并保留可召回 stub。
-/// `task` / `task_wait` 等聚合结果没有注册该标志，不会挤占 read_file 等证据的预算。
+/// The newest parallel batch may alone exceed the context window. Group-level
+/// judgment still applies, but results registered as high-precision grounding
+/// get an inline cap: results over budget are zero-compression spilled while
+/// keeping a recallable stub. Aggregate results such as `task` / `task_wait`
+/// do not register that flag and never crowd out the budget of evidence like
+/// read_file.
 pub(super) fn enforce_protected_precision_group_budget(
     messages: &mut [Message],
     keep_recent_groups: usize,
@@ -310,8 +336,10 @@ pub(super) fn enforce_protected_precision_group_budget(
             })
             .collect();
 
-        // 已外溢成 stub / 空文本的结果不再计入可用预算：它们已被固定协议文本占用，
-        // 记入会让 total_chars 虚高，导致同组其它结果被多外溢。
+        // Results already spilled into stubs / empty text no longer count
+        // toward the available budget: they are occupied by fixed protocol
+        // text, and counting them would inflate total_chars and cause extra
+        // spills of other results in the same group.
         let mut total_chars = precision_results
             .iter()
             .map(|(idx, _)| value_to_string(&messages[*idx].content))
@@ -322,7 +350,8 @@ pub(super) fn enforce_protected_precision_group_budget(
             std::cmp::Reverse(value_to_string(&messages[*idx].content).chars().count())
         });
 
-        // 优先外溢最大的结果，以最少的 stub 腾出足够空间；其余同组证据仍完整可见。
+        // Spill the largest results first, freeing enough space with the fewest
+        // stubs; the rest of the group's evidence stays fully visible.
         for (idx, tool_name) in precision_results {
             if total_chars <= inline_budget {
                 break;
@@ -331,8 +360,10 @@ pub(super) fn enforce_protected_precision_group_budget(
             if text.trim().is_empty() || is_preserved_tool_overflow_stub(&text) {
                 continue;
             }
-            // protected（当前 turn）结果默认保持原样以留在上下文内；仅在 Path C 兜底时
-            // 允许零压缩外溢到 asset，避免后续被有损截断后原文不可恢复。
+            // protected (current-turn) results stay as-is by default to remain
+            // in context; only Path C's fallback allows a zero-compression
+            // spill to an asset, so the original is recoverable instead of
+            // being lost to later lossy truncation.
             if !allow_overflow_protected
                 && messages[idx]
                     .tool_call_id
@@ -342,10 +373,13 @@ pub(super) fn enforce_protected_precision_group_budget(
                 continue;
             }
             let text_len = text.chars().count();
-            // 回读本 session 已归档的 asset（read_file 指向 tool-overflow-compressed/
-            // 直接子文件）时复用既有文件，而不是再铸造一个随机名新文件——否则
-            // 「外溢→回读→再外溢」会在每次回读时生成新 archive，形成无界链，
-            // 模型永远拿不到稳定的内容。与 Path C 的复用逻辑保持一致。
+            // When reading back an asset already archived for this session
+            // (read_file pointing at a direct child of
+            // tool-overflow-compressed/), reuse the existing file instead of
+            // minting another randomly named one — otherwise "spill → read-back
+            // → spill again" would generate a new archive on every read-back,
+            // forming an unbounded chain where the model never gets stable
+            // content. Consistent with Path C's reuse logic.
             let tool_call_id = messages[idx].tool_call_id.as_deref();
             let existing_asset_path = tool_call_id
                 .and_then(|id| id_to_tool_args.get(id))
@@ -372,11 +406,15 @@ pub(super) fn enforce_protected_precision_group_budget(
                 .map(|args| build_tool_overflow_recall_lines(&tool_name, args))
                 .unwrap_or_default();
             let stub = build_preserved_tool_overflow_stub(&path, &tool_name, &text, &recall_lines);
-            // 外溢必须严格腾出空间：小结果换成更大的 stub 是膨胀而非压缩，
-            // 会虚增预算占用且让模型看不到真实结果（死循环放大因素）。
-            // 膨胀时删除刚写的文件、保留原文，与 Path C 的防膨胀守卫一致。
-            // 只删除本次新建的文件：复用的 asset 归其它消息的外溢所有，
-            // 删除会让那条消息的 stub 悬空（历史会话出现过归档文件被删的故障）。
+            // Spilling must strictly free space: swapping a small result for a
+            // larger stub is bloat, not compression — it inflates budget usage
+            // and hides the real result from the model (an amplifying factor in
+            // loops). On bloat, delete the just-written file and keep the
+            // original text, consistent with Path C's anti-bloat guard.
+            // Delete only files created this time: a reused asset belongs to
+            // another message's spill, and deleting it would leave that
+            // message's stub dangling (past sessions saw archive files deleted
+            // by mistake).
             let stub_chars = stub.chars().count();
             if stub_chars >= text_len {
                 if wrote_new {
@@ -385,7 +423,9 @@ pub(super) fn enforce_protected_precision_group_budget(
                 continue;
             }
             messages[idx].content = Value::String(stub);
-            // 记账必须计入 stub 自身占用：只减原文会低估剩余占用，让预算判定失真。
+            // Accounting must include the stub's own size: subtracting only the
+            // original underestimates remaining usage and skews budget
+            // decisions.
             total_chars = total_chars
                 .saturating_sub(text_len)
                 .saturating_add(stub_chars);
@@ -393,10 +433,13 @@ pub(super) fn enforce_protected_precision_group_budget(
     }
 }
 
-/// Path C 的全局兜底：跨工具组收集所有受保护且禁止有损压缩的结果，并优先外溢
-/// 最大的原文，直到整个请求回到 hard target 或没有可外溢候选。候选放宽到
-/// `!allows_lossy_compress()`（而非仅高精度 inline 预算工具），使 `task_wait` 等
-/// 聚合但禁压缩的大结果也走无损外溢+file 指针，避免落到后续有损截断被静默丢真相。
+/// Path C's global fallback: collect all protected results that forbid lossy
+/// compression across tool groups and spill the largest originals first, until
+/// the whole request returns to the hard target or no spillable candidates
+/// remain. Candidates are widened to `!allows_lossy_compress()` (not just
+/// high-precision inline-budget tools) so aggregate but non-compressible large
+/// results like `task_wait` also take the lossless spill + file-pointer path
+/// instead of being silently dropped by later lossy truncation.
 pub(super) fn spill_protected_precision_to_fit(
     messages: &mut [Message],
     hard_target_chars: usize,
@@ -419,8 +462,10 @@ pub(super) fn spill_protected_precision_to_fit(
             }
             let tool_name = id_to_tool_name.get(id)?;
             let text = value_to_string(&message.content);
-            // 当前轮若直接回读本 session 的 archive，Path C 不能再复制一份原文。
-            // 复用原 asset 的指针既保住 hard target，又避免「外溢→回读→再外溢」循环。
+            // If the current turn reads this session's archive directly, Path C
+            // must not copy the original again. Reusing the original asset's
+            // pointer both preserves the hard target and avoids the "spill →
+            // read-back → spill again" cycle.
             let existing_asset_path = id_to_tool_args.get(id).and_then(|args| {
                 preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir, cwd)
             });
@@ -530,26 +575,34 @@ pub(super) fn build_tool_call_arguments_index(messages: &[Message]) -> FxHashMap
     out
 }
 
-/// 返回 `read_file` 直接读取的本 session 工具溢出归档路径。
+/// Returns the tool-overflow archive path of this session read directly by
+/// `read_file`.
 ///
-/// 对一般工具结果必须落盘，以保住 hard target；但 archive 本身已经是
-/// runtime 写入的稳定资产，再复制一次只会让模型在回读大文件时持续产生新 archive。
-/// 仅复用 `tool-overflow-compressed` 的直接子文件：session asset 根中的 `tmp`、
-/// checkpoint 等文件可在同一 session 后续被写入；若直接保留其指针，历史结果会
-/// 随源文件变化。两端 canonicalize 后再判断目录，避免 `..` 或 symlink 越过边界。
+/// Ordinary tool results must be persisted to disk to preserve the hard
+/// target; but an archive is already a stable asset written by the runtime, and
+/// copying it again would only make the model keep producing new archives when
+/// reading large files back. Only direct children of
+/// `tool-overflow-compressed` are reused: files like `tmp` and checkpoints
+/// under the session asset root can still be written later in the same
+/// session, so keeping a pointer to them would let historical results change
+/// with their source. Both ends are canonicalized before the directory check
+/// to keep `..` or symlinks from crossing the boundary.
 fn preserved_tool_overflow_read_file_path(arguments: &str, overflow_dir: &Path) -> Option<PathBuf> {
     let args = serde_json::from_str::<Value>(arguments).ok()?;
     let raw_path = value_string_from_keys(&args, &["file_path", "path", "filePath"])?;
     archived_asset_path_from_raw(&raw_path, overflow_dir)
 }
 
-/// 统一识别「读取本 session 归档 asset」的直接文件路径，供两条主路径与 Path C 复用
-/// 既有 archive，避免「外溢→回读→再外溢」每次回读都铸造新 uuid 文件、让模型沿
-/// 新指针无限重读。
+/// Uniformly recognizes direct file paths that "read this session's archived
+/// asset", so both main paths and Path C can reuse the existing archive
+/// instead of minting a new uuid file on every read-back and making the model
+/// re-read endlessly along new pointers.
 ///
-/// - `read_file`：`file_path` / `path` / `filePath` 字段；
-/// - `execute_command`：`command` 字符串内嵌的归档路径（`cat`/`head`/`grep` 等）。
-/// 其余工具不返回路径（复用语义不适用，行为与旧 `read_file` 守卫一致）。
+/// - `read_file`: the `file_path` / `path` / `filePath` fields;
+/// - `execute_command`: archive paths embedded in the `command` string
+///   (`cat`/`head`/`grep` etc.).
+/// Other tools return no paths (reuse semantics do not apply; behavior matches
+/// the old `read_file` guard).
 fn preserved_tool_overflow_path_in_arguments(
     tool_name: &str,
     arguments: &str,
@@ -567,14 +620,16 @@ fn preserved_tool_overflow_path_in_arguments(
     }
 }
 
-/// 校验 raw 路径为 `tool-overflow-compressed` 的直接子文件；两端 canonicalize。
+/// Validates that a raw path is a direct child of `tool-overflow-compressed`;
+/// both ends are canonicalized.
 fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) -> Option<PathBuf> {
     let preserved_dir = overflow_dir
         .join(PRESERVED_TOOL_OVERFLOW_DIR)
         .canonicalize()
         .ok()?;
-    // 必须与 read_file 共用相同的 relative-path 解析规则；直接 canonicalize 会错误地
-    // 以进程 cwd 为基准，忽略 subagent 的 effective_cwd。
+    // Must share the same relative-path resolution rules as read_file;
+    // canonicalizing directly would wrongly anchor at the process cwd and
+    // ignore the subagent's effective_cwd.
     let source_path = FileStore::new(PathBuf::from(raw_path))
         .path()
         .canonicalize()
@@ -585,9 +640,11 @@ fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) -> Option<P
     Some(source_path)
 }
 
-/// 从 execute_command 的 `command` 字符串中识别「读取本 session 归档 asset」的路径。
-/// 匹配 archive 直接子文件的绝对路径、相对 effective_cwd 的路径或裸文件名
-/// （文件名含 uuid，基本唯一）。archive 数量有限，每轮压缩扫描成本可接受。
+/// Recognizes paths that "read this session's archived asset" inside the
+/// `command` string of execute_command. Matches absolute paths of archive
+/// direct children, paths relative to effective_cwd, or bare file names (the
+/// name contains a uuid and is essentially unique). The archive count is
+/// small, so the per-compaction scan cost is acceptable.
 fn archived_asset_path_in_command(
     command: &str,
     overflow_dir: &Path,
@@ -605,8 +662,9 @@ fn archived_asset_path_in_command(
         let Ok(canonical) = path.canonicalize() else {
             continue;
         };
-        // 与 read_file 路径（archived_asset_path_from_raw）一致：拒绝指向
-        // `tool-overflow-compressed` 目录外的 symlink 目标。
+        // Consistent with the read_file path (archived_asset_path_from_raw):
+        // reject symlink targets pointing outside the
+        // `tool-overflow-compressed` directory.
         if !canonical.is_file() || canonical.parent() != Some(preserved_dir.as_path()) {
             continue;
         }
@@ -800,8 +858,10 @@ mod tests {
 
     #[test]
     fn preserved_stub_preview_includes_line_numbered_key_lines() {
-        // read_file 输出带 `{:>6}\t` 行号前缀：key_lines 应解析前缀、用真实行号
-        // 做 L 标签（而不是被前缀挡住匹配而全部落空），让长文件外溢后仍能按行号定位。
+        // read_file output carries a `{:>6}\t` line-number prefix: key_lines
+        // should parse the prefix and use real line numbers for L tags (rather
+        // than failing every match because of the prefix), so long files remain
+        // locatable by line number after being spilled.
         let content = "\
      1\tuse std::fmt;\n\
      2\t\n\
@@ -942,9 +1002,11 @@ mod tests {
             false,
         );
 
-        // 小结果（100 字符）换成带长路径的 stub 反而膨胀：必须保留原文内联。
+        // A small result (100 chars) bloats when swapped for a stub with a long
+        // path: the original text must stay inline.
         assert_eq!(value_to_string(&messages[1].content), "s".repeat(100));
-        // 大结果被外溢成 stub，且 stub 严格短于原文。
+        // The large result is spilled into a stub, and the stub is strictly
+        // shorter than the original.
         let stub = value_to_string(&messages[2].content);
         assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
         assert!(stub.chars().count() < 10_000, "{stub}");
@@ -953,17 +1015,23 @@ mod tests {
 
     #[test]
     fn enforce_group_budget_reuses_reread_archive_asset_instead_of_rearchiving() {
-        // 回读已归档 asset 的 read_file 结果（跨 turn 后不再是 protected）再次进入
-        // group 外溢时，必须复用既有归档文件（stub 指向同一文件），而不是铸造
-        // 随机名新文件——否则「外溢→回读→再外溢」每次回读都会生成新 archive，
-        // 形成无界链，模型永远拿不到稳定的内容。
+        // When a read_file result that read back an archived asset (no longer
+        // protected after crossing turns) enters group spilling again, the
+        // existing archive file must be reused (the stub points at the same
+        // file) instead of minting a randomly named new one — otherwise "spill
+        // → read-back → spill again" generates a new archive on every
+        // read-back, forming an unbounded chain where the model never gets
+        // stable content.
         let overflow_dir =
             std::env::temp_dir().join(format!("ai-precision-group-reuse-{}", uuid::Uuid::new_v4()));
-        // 1) 用 Path C 生成一个归档 asset
+        // 1) Generate an archive asset via Path C
         let mut messages = vec![
             assistant_call("spill", "read_file"),
-            // 填充量留足余量：指纹给 stub 引入固定 ~16 字节开销，若原文与 stub 体量
-            // 极度接近会翻转防膨胀守卫（stub>=原文），使本测试聚焦复用语义而非字节巧合。
+            // Leave ample headroom in the payload: the fingerprint adds a fixed
+            // ~16-byte overhead to the stub, and if the original and stub sizes
+            // were extremely close the anti-bloat guard (stub>=original) could
+            // flip, making this test about reuse semantics rather than byte
+            // coincidence.
             tool_result("spill", &"x".repeat(4_000)),
             assistant_call("recent", "read_file"),
             tool_result("recent", "recent result"),
@@ -987,7 +1055,8 @@ mod tests {
             .path();
         let raw = std::fs::read_to_string(&archive_path).unwrap();
 
-        // 2) 模型回读该归档：结果(1000 字符) 超过 group inline 预算 → 触发 enforce 外溢
+        // 2) The model reads the archive back: the result (1000 chars) exceeds
+        // the group inline budget → triggers the enforce spill
         let read_args = serde_json::json!({ "file_path": archive_path.to_string_lossy() });
         let mut messages = vec![
             assistant_call_args("re-read", "read_file", &read_args.to_string()),
@@ -1003,7 +1072,8 @@ mod tests {
             false,
         );
 
-        // 3) 复用既有 asset：目录仍只有 1 个文件，且 stub 指向同一个 archive_path
+        // 3) The existing asset is reused: the directory still has exactly 1
+        // file, and the stub points at the same archive_path
         assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
         let stub_text = value_to_string(&messages[1].content);
         assert!(is_preserved_tool_overflow_stub(&stub_text), "{stub_text}");
@@ -1018,7 +1088,7 @@ mod tests {
     fn cap_oversized_reuses_reread_archive_asset_instead_of_rearchiving() {
         let overflow_dir =
             std::env::temp_dir().join(format!("ai-cap-reread-reuse-{}", uuid::Uuid::new_v4()));
-        // 1) 先由 cap 自身写一个归档 asset
+        // 1) First let the cap itself write an archive asset
         let mut messages = vec![
             assistant_call("first", "read_file"),
             tool_result("first", &"y".repeat(70_000)),
@@ -1039,7 +1109,8 @@ mod tests {
             .path();
         let raw = std::fs::read_to_string(&archive_path).unwrap();
 
-        // 2) 模型回读归档（正文 70k > 64k hard cap）→ 复用既有文件，不写新文件
+        // 2) The model reads the archive back (body 70k > the 64k hard cap) →
+        // the existing file is reused, no new file written
         let read_args = serde_json::json!({ "file_path": archive_path.to_string_lossy() });
         let mut messages = vec![
             assistant_call_args("re-read", "read_file", &read_args.to_string()),
@@ -1066,7 +1137,8 @@ mod tests {
     fn prepare_structured_reuses_reread_archive_asset_instead_of_rearchiving() {
         let overflow_dir =
             std::env::temp_dir().join(format!("ai-prepare-reread-reuse-{}", uuid::Uuid::new_v4()));
-        // 1) 先由 prepare 写一个归档 asset（旧 read_file 结果，超出 480 阈值、非尾窗）
+        // 1) First let prepare write an archive asset (an old read_file result,
+        // over the 480 threshold and outside the tail window)
         let mut messages = vec![
             assistant_call("first", "read_file"),
             tool_result("first", &"z".repeat(2_000)),
@@ -1088,7 +1160,9 @@ mod tests {
             .path();
         let raw = std::fs::read_to_string(&archive_path).unwrap();
 
-        // 2) 模型回读归档，结果再进 prepare（非保护、非尾窗）→ 复用既有文件
+        // 2) The model reads the archive back and the result enters prepare
+        // again (unprotected, outside the tail window) → the existing file is
+        // reused
         let read_args = serde_json::json!({ "file_path": archive_path.to_string_lossy() });
         let mut messages = vec![
             assistant_call_args("re-read", "read_file", &read_args.to_string()),
@@ -1114,16 +1188,22 @@ mod tests {
 
     #[test]
     fn prepare_structured_spill_is_deterministic_across_reprojections() {
-        // P1 回归：同一条 canonical tool 结果在两次独立的投影里被外溢时，必须映射到
-        // 同一个确定性归档文件，而不是每轮铸造一个随机名新副本（旧行为在单会话里
-        // 造成 368 个文件仅 211 份唯一内容的无界膨胀）。两次投影用**不同**的
-        // overflow_dir 无法体现幂等，因此复用同一个 dir 模拟同一 session 的逐轮压缩。
+        // P1 regression: when the same canonical tool result is spilled in two
+        // independent projections, it must map to the same deterministic
+        // archive file rather than minting a randomly named new copy every
+        // round (the old behavior caused unbounded bloat within one session:
+        // 368 files for only 211 unique contents). Using **different**
+        // overflow_dirs for the two projections would hide idempotence, so the
+        // same dir is reused to simulate round-by-round compaction of one
+        // session.
         let overflow_dir = std::env::temp_dir().join(format!(
             "ai-prepare-deterministic-spill-{}",
             uuid::Uuid::new_v4()
         ));
         let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
-        // 单行长结果：预览经行截断后 stub 显著小于原文 → 确实外溢（不触发防膨胀守卫）。
+        // A single very long line: after line truncation the preview makes the
+        // stub significantly smaller than the original → it does spill (the
+        // anti-bloat guard does not trigger).
         let big = "b".repeat(4_000);
         let build = || {
             vec![
@@ -1147,8 +1227,10 @@ mod tests {
         assert!(is_preserved_tool_overflow_stub(&first_stub), "{first_stub}");
         assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
 
-        // 第二次投影：同一条 canonical 结果（同 tool_call_id + 同正文）再次被压缩。
-        // 确定性命名 → 命中既有文件、不新增副本，stub 文本逐轮稳定。
+        // Second projection: the same canonical result (same tool_call_id +
+        // same body) is compacted again. Deterministic naming → the existing
+        // file is hit, no new copy is added, and the stub text stays stable
+        // across rounds.
         let mut second = build();
         prepare_tool_messages_structured(
             &mut second,
@@ -1174,14 +1256,18 @@ mod tests {
 
     #[test]
     fn prepare_structured_keeps_small_multiline_result_inline() {
-        // P2 回归：一个几百字节的多行 grep 结果（> max_chars_per_msg 但很小），
-        // 换成带完整 head/tail 预览的 stub 反而更大。防膨胀守卫必须保留原文内联，
-        // 不写归档文件——否则模型看到「已卸载，请重读」而反复回读（会话 9f4d0fae 的
-        // 「读结果一直被归档成 stub」正是此路径：673 字符 grep 被换成更大的 stub）。
+        // P2 regression: a few-hundred-byte multi-line grep result (over
+        // max_chars_per_msg but still small) becomes larger when swapped for a
+        // stub with a full head/tail preview. The anti-bloat guard must keep
+        // the original inline and write no archive file — otherwise the model
+        // sees "evicted, please re-read" and reads back repeatedly (session
+        // 9f4d0fae's "read results kept being archived as stubs" was exactly
+        // this path: a 673-char grep swapped for a larger stub).
         let overflow_dir =
             std::env::temp_dir().join(format!("ai-prepare-small-inline-{}", uuid::Uuid::new_v4()));
-        // 20 行、每行 ~30 字符 ≈ 600 字符：超过 max_chars_per_msg=480，但整段会被
-        // 预览逐字包含，stub 必然不小于原文。
+        // 20 lines × ~30 chars ≈ 600 chars: over max_chars_per_msg=480, but the
+        // preview contains the whole body verbatim, so the stub cannot be
+        // smaller than the original.
         let grep_like = (0..20)
             .map(|i| format!("src/bin/ai/mod.rs:{i}: use crate::ai::x;"))
             .collect::<Vec<_>>()
@@ -1209,7 +1295,8 @@ mod tests {
             !is_preserved_tool_overflow_stub(&content),
             "不应被换成 stub"
         );
-        // 没有归档文件被写出（膨胀时删除新建文件；此处应压根没写成功的净收益）。
+        // No archive file is written (on bloat the new file is deleted; here it
+        // should never have been written at all).
         let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
         let archived = std::fs::read_dir(&archive_dir)
             .map(|d| d.count())
@@ -1223,7 +1310,7 @@ mod tests {
     fn cap_reuses_execute_command_cat_archive_instead_of_rearchiving() {
         let overflow_dir =
             std::env::temp_dir().join(format!("ai-cap-cat-reuse-{}", uuid::Uuid::new_v4()));
-        // 1) 先由 cap 写一个 execute_command 归档 asset
+        // 1) First let the cap write an execute_command archive asset
         let mut messages = vec![
             assistant_call("run", "execute_command"),
             tool_result("run", &"log line\n".repeat(30_000)),
@@ -1244,7 +1331,8 @@ mod tests {
             .path();
         let raw = std::fs::read_to_string(&archive_path).unwrap();
 
-        // 2) 模型用 `cat <archive>` 回读归档正文（> hard cap）→ 复用既有文件
+        // 2) The model reads the archive body back with `cat <archive>` (over
+        // the hard cap) → the existing file is reused
         let run_args = serde_json::json!({
             "command": format!("cat {}", archive_path.to_string_lossy()),
             "pty": false,
@@ -1293,8 +1381,10 @@ mod tests {
             &protected,
         );
 
-        // 覆盖 Path C 的后半段：spill 后仍超预算时会进入 emergency cap。所有
-        // preserved stub 必须先缩成不可截断的最小指针，不能再被通用 head/tail 截断。
+        // Covers the second half of Path C: when still over budget after the
+        // spill, the emergency cap kicks in. Every preserved stub must first
+        // shrink into a non-truncatable minimal pointer and must not be run
+        // through generic head/tail truncation again.
         assert!(super::super::messages_total_chars(&messages) > 4_000);
         super::super::emergency_cap_messages_to_fit(
             &mut messages,
@@ -1442,8 +1532,10 @@ mod tests {
 
     #[test]
     fn path_c_spills_aggregated_task_wait_result_losslessly() {
-        // task_wait 禁止有损压缩但不占 inline 预算；Path C 全局兜底必须把它无损外溢
-        // 并留下 file 指针，而不是排除在候选之外、任由后续有损截断丢失聚合真相。
+        // task_wait forbids lossy compression but occupies no inline budget;
+        // Path C's global fallback must spill it losslessly with a file pointer
+        // left behind, rather than excluding it from candidates and letting
+        // later lossy truncation lose the aggregate truth.
         let overflow_dir = std::env::temp_dir().join(format!(
             "ai-global-precision-taskwait-{}",
             uuid::Uuid::new_v4()
@@ -1515,7 +1607,8 @@ mod tests {
         }
     }
 
-    /// 构造一条「首次外溢」形态的 stub（含多行 Preview 正文），用于折叠测试。
+    /// Builds a stub in its "first spill" shape (with a multi-line Preview
+    /// body), for fold testing.
     fn overflow_stub_with_preview(file_path: &str, tool_name: &str) -> String {
         let full = (0..40)
             .map(|i| format!("line {i}: some content"))
@@ -1527,21 +1620,24 @@ mod tests {
     #[test]
     fn collapse_overflow_stub_to_anchor_drops_preview_keeps_file_path() {
         let stub = overflow_stub_with_preview("/tmp/session/read-abc.txt", "read_file");
-        // 前置条件：首次 stub 确实带 Preview 正文。
+        // Precondition: the first-spill stub really does carry a Preview body.
         assert!(stub.contains("Preview ("));
 
         let anchor = collapse_overflow_stub_to_anchor(&stub).expect("should collapse");
-        // 预览正文被丢弃。
+        // The preview body is discarded.
         assert!(!anchor.contains("Preview ("));
-        // file_path 保留。
+        // The file_path is kept.
         assert!(anchor.contains("- file_path: /tmp/session/read-abc.txt"));
-        // 工具名保留（新格式用 "Output preserved for tool"）。
+        // The tool name is kept (the new format uses "Output preserved for
+        // tool").
         assert!(anchor.contains("Output preserved for tool `read_file`"));
-        // read_file 类型的归档有"通常无需重新读取"提示（而非旧的诱导式 "use read_file"）。
+        // read_file-type archives carry the "usually no need to re-read" notice
+        // (instead of the old leading "use read_file").
         assert!(anchor.contains("Archived snapshot of an earlier read"));
-        // 仍是合法 stub（前缀不变），后续压缩链继续按 stub 豁免识别。
+        // Still a valid stub (prefix unchanged); the downstream compaction
+        // chain keeps recognizing it via the stub exemption.
         assert!(is_preserved_tool_overflow_stub(&anchor));
-        // 体量骤降。
+        // The size drops sharply.
         assert!(anchor.len() < stub.len());
     }
 
@@ -1624,7 +1720,8 @@ mod tests {
     #[test]
     fn age_out_overflow_stub_previews_is_idempotent() {
         let stub = overflow_stub_with_preview("/tmp/session/read-xyz.txt", "read_file");
-        // 两条 user 轮，让 stub 落在保护尾窗之外（retained_turn_start 之前）。
+        // Two user turns place the stub outside the protected tail window
+        // (before retained_turn_start).
         let mut messages = vec![
             user_msg("q1"),
             assistant_call("s", "read_file"),
@@ -1638,14 +1735,16 @@ mod tests {
         let after_first = value_to_string(&messages[2].content);
         assert!(!after_first.contains("Preview ("));
 
-        // 再跑一次：已是锚点形态，内容不得再变（防 stub->stub 抖动）。
+        // Run again: it is already in anchor shape and the content must not
+        // change (prevents stub->stub churn).
         age_out_overflow_stub_previews(&mut messages, 1);
         assert_eq!(value_to_string(&messages[2].content), after_first);
     }
 
     #[test]
     fn age_out_overflow_stub_previews_respects_protected_tail() {
-        // 早期 stub（尾窗外）与近端 stub（尾窗内）各一条。
+        // One early stub (outside the tail window) and one recent stub (inside
+        // the tail window).
         let early = overflow_stub_with_preview("/tmp/session/early.txt", "read_file");
         let recent = overflow_stub_with_preview("/tmp/session/recent.txt", "read_file");
         let mut messages = vec![
@@ -1659,7 +1758,8 @@ mod tests {
         messages[2].content = Value::String(early);
         messages[5].content = Value::String(recent.clone());
 
-        // 保护最近 1 个 user 轮（q2 起）：早期 stub 折叠，尾窗内 recent 保留完整预览。
+        // Protect the most recent user turn (from q2 on): the early stub folds,
+        // while the recent one inside the tail window keeps its full preview.
         age_out_overflow_stub_previews(&mut messages, 1);
         assert!(!value_to_string(&messages[2].content).contains("Preview ("));
         assert_eq!(value_to_string(&messages[5].content), recent);
@@ -1667,25 +1767,33 @@ mod tests {
     }
 }
 
-/// 「读取/检索」类工具的输出零压缩（不行裁剪、不去重折叠、不整组删除），
-/// 超阈值时只做"零压缩外溢到会话文件 + 留指针 stub"。这类输出复现代价高，
-/// 一旦被压掉模型就会反复重跑同一次检索（典型失忆/原地打转症状）。
+/// Output of "read/retrieval" tools is zero-compressed (no trimming, no dedup
+/// folding, no whole-group deletion); over the threshold it only gets
+/// "zero-compression spilled to the session file + a pointer stub". Such
+/// output is expensive to reproduce, and once compressed away the model
+/// re-runs the same retrieval again and again (the classic amnesia /
+/// spinning-in-place symptom).
 ///
-/// 现在改为查询工具自身声明的历史保留策略
-/// （`ToolHistoryPolicyRegistration`，见各工具注册文件），而非在此硬编码
-/// 工具名列表。默认未注册的工具允许有损压缩；只有显式声明
-/// `lossy_compress: Never` 的工具（`read_file` / 检索类 / `execute_command`）
-/// 返回 true。`plan` 不再禁止有损压缩：最新一版由最近工具组保护窗口完整保留，
-/// 旧版可摘要压缩以释放上下文。注意：这与「是否允许 LLM 裁剪」是正交维度——见 `llm_prune.rs`。
+/// This now consults the history-retention policy declared by the tool itself
+/// (`ToolHistoryPolicyRegistration`, see each tool's registration file) instead
+/// of hard-coding a tool-name list here. Unregistered tools allow lossy
+/// compression by default; only tools that explicitly declare
+/// `lossy_compress: Never` (`read_file` / retrieval tools / `execute_command`)
+/// return true. `plan` no longer forbids lossy compression: the latest version
+/// is fully preserved by the recent-tool-group protection window, while older
+/// versions may be summary-compressed to free context. Note this is orthogonal
+/// to "whether LLM trimming is allowed" — see `llm_prune.rs`.
 pub(super) fn is_non_compressible_tool(tool_name: &str) -> bool {
     !crate::ai::tools::registry::common::tool_history_policy(tool_name).allows_lossy_compress()
 }
 
-/// 为尚未外溢的高精度工具结果规划确定性 asset 和带 `file_path` 的稳定 stub。
+/// Plans a deterministic asset and a stable stub carrying `file_path` for
+/// high-precision tool results not yet spilled.
 ///
-/// 本函数只生成 [`PlannedArchiveWrite`]，不触碰文件系统。调用方确认采用整个 fold
-/// 方案后再统一 commit，避免被拒绝的 speculative fold 留下磁盘副作用。已有 stub
-/// 直接复用，不产生新写入。
+/// This function only produces [`PlannedArchiveWrite`] and never touches the
+/// filesystem. The caller commits the whole fold plan together after deciding
+/// to adopt it, so a rejected speculative fold leaves no disk side effects.
+/// Existing stubs are reused directly and produce no new writes.
 pub(super) fn plan_noncompressible_tool_result_for_fold(
     overflow_dir: Option<&Path>,
     tool_call_id: &str,
@@ -1771,7 +1879,8 @@ fn write_preserved_tool_overflow_file_stable(
     Some(path)
 }
 
-/// 把工具名 / id 归一成仅含字母数字与 `-`/`_` 的安全文件名片段。
+/// Normalizes a tool name / id into a safe file-name fragment containing only
+/// alphanumerics and `-`/`_`.
 fn sanitize_overflow_name_component(raw: &str) -> String {
     raw.chars()
         .map(|ch| {
@@ -1784,13 +1893,19 @@ fn sanitize_overflow_name_component(raw: &str) -> String {
         .collect::<String>()
 }
 
-/// 非 speculative 的即时外溢路径。文件名由 `(tool_call_id, content)` 确定性派生
-/// （而非随机 uuid + 时间戳）：同一条 canonical tool 结果在后续 turn 重建投影时会被
-/// 反复外溢，随机命名会让「每轮压缩铸造一份新副本」无界膨胀（实测单会话 368 个归档
-/// 文件仅 211 份唯一内容），且模型沿 stub 回读时指针每轮漂移、永远拿不到稳定内容。
-/// 确定性命名后同一结果幂等映射到同一文件：已存在则复用、不重复写盘，stub 文本逐轮
-/// 稳定（与 fold 的 `folded-`、prune 的 `pruned-` 归档命名策略一致）。
-/// fold 不得调用本函数；fold 的写入统一由 `PlannedArchiveWrite` 在候选被采纳后提交。
+/// The immediate (non-speculative) spill path. The file name is derived
+/// deterministically from `(tool_call_id, content)` (rather than a random uuid
+/// + timestamp): the same canonical tool result gets re-spilled every time a
+/// later turn rebuilds the projection, and random naming would make "each
+/// compaction round mints a new copy" bloat without bound (measured: one
+/// session produced 368 archive files for only 211 unique contents), with the
+/// model's read-back pointer drifting every round so it never gets stable
+/// content. With deterministic naming the same result maps idempotently to the
+/// same file: if it exists it is reused without rewriting, and the stub text
+/// stays stable across rounds (consistent with the `folded-` fold and
+/// `pruned-` prune archive naming schemes). fold must not call this function;
+/// fold's writes are committed together via `PlannedArchiveWrite` once a
+/// candidate is adopted.
 fn write_preserved_tool_overflow_file(
     overflow_dir: &Path,
     tool_call_id: Option<&str>,
@@ -1803,7 +1918,8 @@ fn write_preserved_tool_overflow_file(
     let identity = format!("{}\0{content}", tool_call_id.unwrap_or(""));
     let digest = content_sha256_hex(identity.as_bytes());
     let path = dir.join(format!("spilled-{safe_tool}-{}.txt", &digest[..24]));
-    // 幂等：内容不随轮次变化，已存在则不重复写盘（也保住 prompt cache 稳定）。
+    // Idempotent: the content does not change across rounds; if it exists it is
+    // not rewritten (also keeping the prompt cache stable).
     if !path.exists() {
         std::fs::write(&path, content).ok()?;
     }
@@ -1816,11 +1932,14 @@ fn build_preserved_tool_overflow_stub(
     full_content: &str,
     recall_lines: &[String],
 ) -> String {
-    // 仍把全文外溢到磁盘以控制上下文体积，但在 stub 内保留 head+tail 预览，
-    // 让后续 turn 拥有"召回锚点"——模型据此判断是否真的需要重新 read_file，
-    // 避免早期读到的代码被搬走后出现"失忆/反复重读"。
-    // 提示文案保持中性：明确告知"仅在需要完整内容时才读取"，防止 LLM 看到
-    // file_path 就无条件重读导致外溢→重读→再外溢的无限循环。
+    // The full text is still spilled to disk to control context size, but the
+    // stub keeps a head+tail preview so later turns own a "recall anchor" — the
+    // model can judge whether it really needs to read_file again, avoiding the
+    // "amnesia / endless re-reading" that follows when early-read code is moved
+    // away. The notice wording stays neutral: it clearly says "read only if the
+    // full content is needed", preventing the LLM from unconditionally
+    // re-reading on sight of a file_path and looping spill → re-read → spill
+    // again forever.
     let preview = build_overflow_content_preview(full_content);
     let tool_hint = preserved_tool_overflow_hint(tool_name, recall_lines);
     let mut out = format!(
@@ -2065,26 +2184,33 @@ pub(super) fn is_preserved_tool_overflow_stub(text: &str) -> bool {
     false
 }
 
-/// 把一条已外溢的 tool overflow stub 的 head+tail 预览体收敛为「单行召回锚点」
-/// （仅保留 `file_path:` 指针 + 回读提示，丢弃 `Preview (...)` 及其后所有行）。
+/// Collapses the head+tail preview body of an already-spilled tool overflow
+/// stub into a "single-line recall anchor" (keeping only the `file_path:`
+/// pointer + the read-back notice, dropping `Preview (...)` and everything
+/// after it).
 ///
-/// 老 stub 的预览在长会话里单调累积（真实案例：800 条 × ~1KB ≈ 849KB），而
-/// `file_path` 才是模型精确回读的唯一必要信息——预览只是「首次召回锚点」，一旦
-/// 该 stub 已远离当前工作焦点，预览正文的边际价值趋近于 0。收敛后每条从 ~1KB
-/// 降到 ~200 字符，召回能力零损失（仍可 read_file 回读原文）。
+/// Old stubs' previews accumulate monotonically in long sessions (real case:
+/// 800 stubs × ~1KB ≈ 849KB), while `file_path` is the only information the
+/// model needs for an exact read-back — the preview is just a "first recall
+/// anchor", and once the stub has drifted away from the current work focus the
+/// preview body's marginal value approaches 0. After collapsing, each entry
+/// shrinks from ~1KB to ~200 chars with zero loss of recall ability (the
+/// original can still be read back with read_file).
 ///
-/// 解析失败（无法定位 file_path 或工具名）返回 `None`，保持原文不动，绝不破坏。
-/// 对「已经是锚点形态」（不含 `Preview (` 段）的 stub 亦返回 `None`，保证幂等、
-/// 不产生 stub→stub 抖动。
+/// Returns `None` on parse failure (file_path or tool name not found), leaving
+/// the original untouched — it is never corrupted. Stubs already in anchor
+/// shape (no `Preview (` section) also return `None`, guaranteeing idempotence
+/// and no stub→stub churn.
 fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
     if !is_preserved_tool_overflow_stub(text) {
         return None;
     }
-    // 已是锚点形态（无预览段）：幂等，返回 None 表示无需改写。
+    // Already in anchor shape (no preview section): idempotent; returning None
+    // means no rewrite is needed.
     if !text.contains("Preview (") {
         return None;
     }
-    // 支持新旧两种格式解析 tool_name
+    // Parse tool_name in both the old and new formats.
     let tool_name = text
         .split_once("non-compressible tool `")
         .and_then(|(_, rest)| rest.split_once('`'))
@@ -2146,9 +2272,11 @@ fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// Path C 的最终硬预算阶段只允许去掉 overflow stub 的预览与召回附注，不能把
-/// 唯一的 asset 指针交给通用 head+tail 截断。返回的最小 stub 仍保留协议 marker、
-/// 工具名和 `file_path`，因此后续可以精确回读原始证据。
+/// Path C's final hard-budget stage may only strip an overflow stub's preview
+/// and recall notice; the sole asset pointer must never be handed to generic
+/// head+tail truncation. The returned minimal stub still keeps the protocol
+/// marker, tool name, and `file_path`, so the original evidence can still be
+/// read back precisely.
 fn minimize_overflow_stub_to_pointer(text: &str) -> Option<String> {
     if !is_preserved_tool_overflow_stub(text) {
         return None;
@@ -2205,13 +2333,16 @@ pub(super) fn is_preserved_tool_overflow_content(content: &Value) -> bool {
         .is_some_and(is_preserved_tool_overflow_stub)
 }
 
-/// 将「保护尾窗之外」的 overflow stub 预览体老化折叠为单行锚点。仅作用于已外溢
-/// 的 tool stub（`is_preserved_tool_overflow_stub`），不碰原始 tool 结果；尾窗内
-/// stub 保留完整 head+tail 预览（当前工作焦点仍需要它的召回上下文）。
+/// Age-folds the preview body of overflow stubs "outside the protected tail
+/// window" into single-line anchors. Applies only to already-spilled tool
+/// stubs (`is_preserved_tool_overflow_stub`) and never touches original tool
+/// results; stubs inside the tail window keep their full head+tail preview
+/// (the current work focus still needs its recall context).
 ///
-/// 与预算驱动的组折叠互补：即便某条 stub 所在的组因近端保护未被
-/// `fold_early_tool_groups` 折叠，其预览正文也会随对话推进老化收敛，防止历史里
-/// 上百条早期 read_file 预览单调累积。
+/// Complements budget-driven group folding: even when a stub's group escapes
+/// `fold_early_tool_groups` because of near-end protection, its preview body
+/// still age-collapses as the conversation advances, preventing hundreds of
+/// early read_file previews from accumulating monotonically in the history.
 pub(super) fn age_out_overflow_stub_previews(
     messages: &mut [Message],
     keep_recent_user_turns: usize,
@@ -2230,8 +2361,9 @@ pub(super) fn age_out_overflow_stub_previews(
     }
 }
 
-/// 为外溢内容生成 head+tail 预览。短内容直接全量保留；长内容保留前后各若干行，
-/// 中间用占位行折叠，并标注省略的行数。
+/// Generates a head+tail preview for spilled content. Short content is kept in
+/// full; long content keeps a few leading/trailing lines with the middle folded
+/// into a placeholder line that states the omitted line count.
 fn build_overflow_content_preview(content: &str) -> String {
     const HEAD_LINES: usize = 8;
     const TAIL_LINES: usize = 4;
@@ -2250,9 +2382,12 @@ fn build_overflow_content_preview(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     let mut out = String::from("Preview (for recall; not exhaustive):\n");
-    // 源码/文本类大结果：附带头带行号的结构索引（fn/struct/impl/use/错误等关键行），
-    // 与捕获期 overflow stub 的 key_lines 对齐。压缩外溢后模型仍能按行号定位目标
-    // 区域，只重读需要的 range，避免大文件（数千行）中段只能盲目重读。
+    // Large source/text results: attach a structural index with line-numbered
+    // heads (key lines like fn/struct/impl/use/errors), aligned with the
+    // capture-time overflow stub's key_lines. After the compression spill the
+    // model can still locate the target region by line number and re-read only
+    // the needed range, instead of blindly re-reading the middle of a
+    // multi-thousand-line file.
     let key_lines = extract_key_lines(content, MAX_KEY_LINES);
     if !key_lines.is_empty() {
         out.push_str(&format!("- key_lines ({}):\n", key_lines.len()));
@@ -2300,7 +2435,8 @@ fn parse_merged_preserved_message_stub(text: &str) -> Option<(usize, Vec<String>
 
     let mut dirs = Vec::new();
     for line in text.lines() {
-        // 兼容首版合并 stub 使用的「归档文件」字段；该字段实际存放目录。
+        // Compatibility with the first-version merged stub's "归档文件"
+        // (archive file) field; that field actually stores a directory.
         let Some(dir) = line
             .strip_prefix(MERGED_PRESERVED_ARCHIVE_DIR_PREFIX)
             .or_else(|| line.strip_prefix("归档文件: "))
@@ -2330,23 +2466,30 @@ fn build_merged_preserved_message_stub(count: usize, dirs: &[String]) -> String 
     merged
 }
 
-/// 将保护尾窗之外的 user/image 外溢 stub 合并为一条带归档目录的指针。
+/// Merges user/image spill stubs outside the protected tail window into a
+/// single pointer carrying the archive directory.
 ///
-/// user/image stub 是 role=user 的占位消息：`first_trim_candidate` / truncate /
-/// emergency cap / tool-only 老化折叠都不会再触碰它们，长会话（尤其图片消息按
-/// 名义成本计费后）会让 stub 单调累积且没有任何收敛路径。把旧 stub 折叠成
-/// 单条合并指针后，占位开销从 O(N) 收敛到 O(1)；原文仍在磁盘零压缩保存，
-/// 目录 + 时间戳命名可通过 tree + read_file 回读。只合并保护尾窗之外的 stub，最近几轮保持
-/// 逐条指针以便精确召回。
+/// user/image stubs are role=user placeholder messages: `first_trim_candidate`
+/// / truncate / emergency cap / tool-only age folding never touch them again,
+/// so long sessions (especially once images are billed at nominal cost) let
+/// the stubs accumulate monotonically with no convergence path. Folding old
+/// stubs into a single merged pointer shrinks placeholder overhead from O(N)
+/// to O(1); the originals stay zero-compressed on disk, and the
+/// directory + timestamp naming allows read-back via tree + read_file. Only
+/// stubs outside the protected tail window are merged; the most recent turns
+/// keep per-stub pointers for precise recall.
 pub(super) fn merge_old_user_overflow_stubs(
     messages: &mut Vec<Message>,
     keep_recent_user_turns: usize,
 ) {
     const MERGE_MIN_STUB_COUNT: usize = 4;
 
-    // 后续 mid-turn 摘要仍会按最近 2/3 个真实 user 边界切分。即使当前预算已把
-    // keep_recent_user_turns 降到 1，也不能把这些结构边界一并折叠进 internal_note，
-    // 否则 retained_turn_start 会误判为“历史不足”，整段旧历史将无法进入摘要。
+    // Later mid-turn summaries still split at the most recent 2/3 real user
+    // boundaries. Even if the current budget has already dropped
+    // keep_recent_user_turns to 1, these structural boundaries must not be
+    // folded into an internal_note as well, otherwise retained_turn_start would
+    // misjudge "not enough history" and the whole old segment could not enter
+    // the summary.
     let structural_tail_turns =
         keep_recent_user_turns.max(KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX);
     let protected_tail_start = retained_turn_start(messages, structural_tail_turns);
@@ -2386,12 +2529,16 @@ pub(super) fn merge_old_user_overflow_stubs(
             }
         }
     }
-    // 尚无合并指针时至少积累 4 条才折叠；已有合并指针后，新老 stub 都并回同一条，
-    // 避免每新增 4 条就永久多出一个合并指针，重新退化为 O(N)。
-    // 旧版快照可能已含 role=user 的合并指针（修复前生成）。即使本轮无需重新折叠
-    // （只有一条合并指针且无新增单条 stub），也必须把已有合并指针的角色迁移为
-    // internal_note，否则 retained_turn_start 会继续把它当成真实 user 边界，
-    // 污染后续摘要切点。
+    // With no merged pointer yet, fold only after at least 4 accumulate; once a
+    // merged pointer exists, old and new stubs are merged back into that same
+    // one, avoiding a permanent extra merged pointer for every 4 new stubs and
+    // the re-degradation to O(N).
+    // Snapshots from the old version may already contain a role=user merged
+    // pointer (generated before the fix). Even when this round needs no
+    // re-folding (a single merged pointer and no new per-stub stubs), the
+    // existing merged pointer's role must be migrated to internal_note,
+    // otherwise retained_turn_start keeps treating it as a real user boundary
+    // and pollutes later summary split points.
     for &idx in &stub_indices {
         let is_merged = match &messages[idx].content {
             Value::String(text) => parse_merged_preserved_message_stub(text).is_some(),
@@ -2410,10 +2557,11 @@ pub(super) fn merge_old_user_overflow_stubs(
 
     let merged = build_merged_preserved_message_stub(archived_message_count, &dirs);
 
-    // 从后往前删除，避免下标失效；合并指针写到第一条 stub 的 Message 上。
-    // 它描述的是运行时归档元数据，不是新的用户请求；若继续保留 `user` 角色，
-    // 删除其余 stub 后会伪造轮次边界，使后续 tail/摘要切分把多轮旧消息误判
-    // 成一个近期用户轮次。
+    // Delete back-to-front to keep indices valid; the merged pointer is written
+    // onto the first stub's Message. It describes runtime archive metadata, not
+    // a new user request; if it kept the `user` role, deleting the other stubs
+    // would forge a turn boundary and make later tail/summary splitting
+    // misjudge multiple rounds of old messages as one recent user turn.
     for &idx in stub_indices.iter().skip(1).rev() {
         messages.remove(idx);
     }
@@ -2449,7 +2597,8 @@ fn parse_preserved_message_stub(text: &str) -> Option<(String, String)> {
     (!file_path.is_empty()).then(|| (kind.to_string(), file_path.to_string()))
 }
 
-/// 将内部归档协议转换成模型可理解的上下文说明，同时兼容已经落盘的旧 JSON stub。
+/// Converts the internal archive protocol into a context note the model can
+/// understand, while staying compatible with old JSON stubs already on disk.
 pub(in crate::ai) fn normalize_preserved_message_stubs_for_model(messages: &mut [Message]) {
     for message in messages {
         let Value::String(text) = &message.content else {
@@ -2457,8 +2606,10 @@ pub(in crate::ai) fn normalize_preserved_message_stubs_for_model(messages: &mut 
         };
         if let Some((count, dirs)) = parse_merged_preserved_message_stub(text) {
             message.content = Value::String(build_merged_preserved_message_stub(count, &dirs));
-            // 合并指针是运行时归档元数据，不是用户请求；旧版快照可能仍以
-            // role=user 落盘，在此兜底迁移，避免污染 user/assistant 配对。
+            // A merged pointer is runtime archive metadata, not a user request;
+            // old-version snapshots may still have it on disk as role=user, so
+            // this is the fallback migration to keep user/assistant pairing
+            // unpolluted.
             message.role = ROLE_INTERNAL_NOTE.to_string();
             continue;
         }
@@ -2497,9 +2648,11 @@ fn first_preserved_content_spill_candidate(messages: &[Message], budget: usize) 
             continue;
         }
 
-        // value_to_string 会把图片 base64 折叠成 "[图片]"，无法反映真实体量。
-        // 对图片消息改用原始 content 的序列化长度判断是否需要外溢，与「把大图
-        // 搬到会话临时文件」的意图一致；普通文本消息仍按 value_to_string 计费。
+        // value_to_string folds an image's base64 into "[图片]" and cannot
+        // reflect the real size. For image messages, the serialized length of
+        // the raw content decides whether to spill, matching the intent of
+        // "moving large images into session temp files"; ordinary text messages
+        // are still billed by value_to_string.
         let char_count = if message_contains_image(&message.content) {
             message.content.to_string().chars().count()
         } else {
@@ -2587,14 +2740,19 @@ pub(super) fn try_spill_preserved_message_to_stub(
     true
 }
 
-/// 主动把体量过大的旧 user / 图片消息（保护尾窗之前的）搬到会话临时文件，
-/// 原地替换为紧凑 stub。原文零压缩保存在磁盘上，但不再占用每轮请求的 payload。
+/// Proactively moves oversized old user / image messages (before the protected
+/// tail window) into session temp files, replacing them in place with compact
+/// stubs. The originals stay zero-compressed on disk but no longer occupy each
+/// request's payload.
 ///
-/// 这与预算驱动的循环内 spill 互补：自从图片在预算里只按 [`IMAGE_BUDGET_CHARS`]
-/// 名义计费后，单张大图本身不再触发 `messages_total_chars > max_chars`，于是
-/// 循环内的 spill 永远不会被调用。这里改为「无论是否超预算，只要旧消息原始
-/// 体量超过阈值就外溢」，既保证大图/大段用户原文被零压缩归档，又避免它们污染
-/// 后续每一轮请求。最新一轮（保护尾窗内）的 user/图片永不外溢。
+/// This complements the budget-driven in-loop spill: ever since images are
+/// billed nominally at [`IMAGE_BUDGET_CHARS`] in the budget, a single large
+/// image no longer triggers `messages_total_chars > max_chars` by itself, so
+/// the in-loop spill would never be called. This pass instead spills "whenever
+/// an old message's raw size exceeds the threshold, regardless of budget",
+/// both ensuring large images / long user texts get zero-compression archived
+/// and keeping them from polluting every later request. The newest turn's
+/// user/image messages (inside the protected tail window) are never spilled.
 pub(super) fn spill_oversized_preserved_messages(
     messages: &mut [Message],
     overflow_dir: &Path,

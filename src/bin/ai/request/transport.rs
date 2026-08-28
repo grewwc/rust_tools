@@ -1,7 +1,7 @@
-//! HTTP 传输层：请求发送、重试、超时、鉴权。
+//! HTTP transport layer: request sending, retries, timeouts, authentication.
 //!
-//! 从 `request/mod.rs` 提取，职责仅限"把请求发出去并拿到响应"，
-//! 与消息归一化、tool schema 构造、thinking dialect 等请求构建逻辑分离。
+//! Extracted from `request/mod.rs`; its sole responsibility is "send the request and get the response",
+//! kept separate from request-construction logic such as message normalization, tool schema building, and thinking dialect.
 
 use std::time::{Duration, Instant};
 
@@ -40,9 +40,9 @@ use super::thinking::resolve_thinking;
 use super::token_budget;
 use super::types::{RequestBody, StreamChunk, StreamUsage};
 
-/// 并发请求（前台 turn + 各子代理）各自独立重试，`attempt N/M` 计数互相
-/// 交错、无法区分归属。用 aios 调度 pid 作为作用域标签把每条重试日志绑定到
-/// 具体进程；无 pid（无 TASK_PID 作用域）时返回空串，日志退化为原样。
+/// Concurrent requests (foreground turn + subagents) retry independently, and their `attempt N/M` counters
+/// interleave with no way to tell them apart. An aios scheduler pid is used as a scope tag binding each retry log to
+/// its process; without a pid (no TASK_PID scope) it returns an empty string and the log degrades to plain text.
 fn retry_scope_tag() -> String {
     match aios_kernel::kernel::current_task_pid() {
         Some(pid) => format!("[pid {pid}] "),
@@ -93,10 +93,10 @@ fn maybe_emit_responses_reasoning_replay_diagnostic(
     {
         return;
     }
-    // 加密 reasoning item 只在当前 turn 的工具链中通过内存侧信道回放；历史 turn
-    // 已经无法忠实回放，且由 history checkpoint/工具证据承担语义保真。诊断只统计
-    // 最新 user 之后的当前 turn，避免每次请求都对旧历史发噪音。
-    // 合成 user 消息（证据交接、图片 followup）不构成轮次边界。
+    // Encrypted reasoning items are replayed through an in-memory side channel only within the current turn's tool chain; earlier turns
+    // can no longer be replayed faithfully, and history checkpoints / tool evidence carry the semantic fidelity. Diagnostics only count
+    // the current turn after the latest user message, so every request does not emit noise about old history.
+    // Synthetic user messages (evidence handoff, image followup) do not form a turn boundary.
     let current_turn_start =
         crate::ai::history::last_real_user_index(messages).unwrap_or(0);
     let stats = super::protocol::responses_reasoning_replay_stats(
@@ -114,11 +114,11 @@ fn maybe_emit_responses_reasoning_replay_diagnostic(
     // ));
 }
 
-/// 带 TPM 预检的 hedged send。
+/// Hedged send with TPM preflight.
 ///
-/// 预算必须按 actual physical send 计，而不是按 logical request 计：hedged backup
-/// 未触发时只占一次；长尾触发 backup 时，每个追加请求都会在发送前重新占一次。
-/// 这样既避免 429，又不会因为按 `hedged_max_sends` 一次性预占而把正常吞吐压低 3 倍。
+/// The budget must be counted per actual physical send, not per logical request: when no hedged backup
+/// fires, only one slot is taken; when the tail triggers a backup, every additional request re-reserves before sending.
+/// This avoids 429s while preventing the one-shot `hedged_max_sends` reservation from throttling normal throughput by 3x.
 async fn send_with_budgeted_hedged_backup(
     app: &App,
     model: &str,
@@ -136,8 +136,8 @@ async fn send_with_budgeted_hedged_backup(
     let hedge = Duration::from_secs(backup_after_secs);
     let mut in_flight = FuturesUnordered::new();
 
-    // 记录最近一次可重试 HTTP 响应 / 网络失败：单个失败不应短路其它在途请求，
-    // 只有不可重试响应到达，或所有请求均结束时才返回。
+    // Track the most recent retryable HTTP response / network failure: a single failure must not short-circuit other in-flight requests;
+    // return only when a non-retryable response arrives or all requests have finished.
     let mut last_retryable_response: Option<Response> = None;
     let mut last_err: Option<RequestError> = None;
     for round in 1..=max_sends {
@@ -183,8 +183,8 @@ async fn send_with_budgeted_hedged_backup(
         }
     }
 
-    // 所有 hedged 请求已发起；继续等待在途请求。可重试 HTTP 状态（429/5xx 等）
-    // 和网络错误都只作为候选失败保留，避免它们抢赢仍可能成功的请求。
+    // All hedged requests are dispatched; keep waiting on in-flight ones. Retryable HTTP statuses (429/5xx etc.)
+    // and network errors are kept only as candidate failures, so they cannot outrun requests that may still succeed.
     while !in_flight.is_empty() {
         let result = tokio::select! {
             result = in_flight.next() => {
@@ -224,8 +224,8 @@ async fn send_with_budgeted_hedged_backup(
 /// Try a single API key for `do_request_messages`, with retry logic for
 /// header timeout, network errors, and retryable server statuses (5xx / 400+upstream).
 ///
-/// 429（配额/限流）**不**在此内部退避重试：直接携带（已钳制的）`retry_after`
-/// 返回，交由上层 `do_request_messages` 先轮换其它 key，再决定是否退避重试。
+/// 429 (quota/rate limit) is **not** retried with backoff inside this function: it returns directly with the (clamped) `retry_after`,
+/// letting the upper `do_request_messages` rotate other keys first before deciding whether to back off and retry.
 /// Returns `Ok` on success or `Err` after exhausting per-key retries.
 async fn request_messages_with_key(
     app: &mut App,
@@ -236,8 +236,8 @@ async fn request_messages_with_key(
     endpoint: &str,
 ) -> Result<Response, RequestError> {
     let http_body = super::protocol::build_http_body_for_request(model, endpoint, request_body);
-    // 复用 build_request_body 内已算好的字符估算（同一 RequestBody），
-    // 避免对同一历史再次全量遍历 + 工具 schema 再次序列化。
+    // Reuse the character estimate already computed inside build_request_body (same RequestBody),
+    // avoiding another full traversal of the same history plus re-serializing tool schemas.
     let estimated_prompt_tokens = token_budget::calibrate_prompt_tokens_for_budget(
         request_body.estimated_prompt_tokens,
         app.last_known_prompt_tokens,
@@ -316,8 +316,8 @@ async fn request_messages_with_key(
                 .await?;
                 let mut err = RequestError::status(status, body);
 
-                // 429（配额/限流）不在单 key 内退避：携带钳制后的 retry_after 立即返回，
-                // 让上层先轮换其它 key，key 用尽后再由上层决定退避重试。
+                // 429 (quota/rate limit) is not backed off within a single key: return immediately with the clamped retry_after,
+                // let the upper layer rotate other keys first, and only then decide on backoff retry once keys are exhausted.
                 if status_code == 429 {
                     err.retry_after = retry_after_delay;
                     return Err(err);
@@ -382,10 +382,10 @@ pub(crate) async fn do_request_messages(
     do_request_messages_with_tool_mode(app, model, messages, stream, true).await
 }
 
-/// 发起不暴露任何工具的请求。
+/// Send a request that exposes no tools.
 ///
-/// 用于工具循环或迭代上限后的收口轮次。这里必须在 wire request 层移除
-/// `tools`，而不能只依赖 prompt 要求模型停止调用工具。
+/// Used for the wrap-up round after the tool loop or iteration cap. The `tools` field must be removed at the wire request layer here,
+/// rather than relying only on the prompt to ask the model to stop calling tools.
 pub(crate) async fn do_request_messages_without_tools(
     app: &mut App,
     model: &str,
@@ -441,23 +441,23 @@ async fn do_request_messages_with_tool_mode(
             model
         ));
     }
-    // 加密推理侧信道重建：必须在 `normalize_reasoning_content_replay_for_model` 之前，
-    // 因为后者会把 encrypted-replay 模型的 `reasoning_content`（我们落库的编码 blob）剥离。
-    // 内存侧信道（当轮最新）优先，落库 blob 只补历史空缺；随后照常剥离 wire 投影里的字段。
+    // Encrypted reasoning side-channel rebuild: must run before `normalize_reasoning_content_replay_for_model`,
+    // because the latter strips the `reasoning_content` (our persisted encoded blob) for encrypted-replay models.
+    // The in-memory side channel (freshest for the current turn) wins; the persisted blob only fills historical gaps. The field is then stripped from the wire projection as usual.
     let turn_reasoning_items = reconstruct_encrypted_reasoning_items_for_model(
         model,
         &normalized_messages,
         &app.turn_reasoning_items,
     );
-    // 最终 wire 投影按模型能力决定 reasoning_content 的回放语义：GLM 保留
-    // tool-call assistant 的原文，DeepSeek 仅补空字段形状，其余模型一律剥离。
-    // 这与本轮 enable_thinking gate 不同，必须在每次请求前统一收口。
+    // The final wire projection decides reasoning_content replay semantics by model capability: GLM keeps the
+    // tool-call assistant's original text, DeepSeek only fills the empty field shape, and all other models strip it.
+    // Unlike this turn's enable_thinking gate, this must be unified before every request.
     normalize_reasoning_content_replay_for_model(model, &mut normalized_messages);
     let reasoning_effort = resolve_reasoning_effort(app, model).map(|e| e.as_str());
-    // 部分网关（如 bytedance modelhub）在 /v1/chat/completions 上拒绝
-    // `tools` + `reasoning_effort` 同时出现（返回 400）。当模型声明了
-    // `reasoning_effort_conflicts_with_tools` 且本轮请求携带 tools 时，
-    // 自动省略 reasoning_effort 以避免 400；无 tools 时保留以维持 thinking。
+    // Some gateways (e.g. bytedance modelhub) reject /v1/chat/completions requests that carry
+    // `tools` + `reasoning_effort` together (returning 400). When the model declares
+    // `reasoning_effort_conflicts_with_tools` and this turn's request carries tools,
+    // reasoning_effort is omitted automatically to avoid the 400; requests without tools keep it to preserve thinking.
     let reasoning_effort = if reasoning_effort.is_some()
         && tools_value.is_some()
         && models::reasoning_effort_conflicts_with_tools(model)
@@ -489,9 +489,9 @@ async fn do_request_messages_with_tool_mode(
     let retry_policy = request_retry_policy_for_current_context();
 
     // --- Key rotation + 429 backoff ---
-    // 每一轮先轮换尝试所有 key；只有当全部 key 都因 429（配额/限流）失败时，
-    // 才整轮退避重试（最多 max_attempts_429 轮）。其它可轮换错误（401/403）
-    // 轮换 key 后仍失败则直接返回，重试无意义。
+    // Each round first tries all keys in rotation; only when every key failed with 429 (quota/rate limit)
+    // does the whole round retry with backoff (up to max_attempts_429 rounds). Other rotatable errors (401/403)
+    // return directly if they still fail after key rotation; retrying is pointless.
     let primary_key = api_key_for_request_model(app, model);
     let adapter = adapter_for(models::model_adapter(model), &endpoint);
     let keys_to_try = adapter.collect_api_keys(&primary_key);
@@ -534,7 +534,7 @@ async fn do_request_messages_with_tool_mode(
             }
         }
 
-        // 所有 key 均失败。仅当全部为 429 限流且仍有重试额度时才整轮退避重试。
+        // All keys failed. Retry the whole round with backoff only if every failure was 429 rate limiting and retries remain.
         if !all_rate_limited || attempt >= retry_policy.max_attempts_429 {
             break;
         }
@@ -567,8 +567,8 @@ pub(crate) fn print_info(app: &App, model: &str) {
         "false"
     };
     let effort_label = if app.cli.thinking_disabled_override {
-        // 截断兜底已强制关闭 thinking（对 always-thinking 模型降 effort 无效时的
-        // 最终手段），显式标注，避免与"auto/模型默认"混淆。
+        // The truncation fallback already forced thinking off (the last resort when lowering effort is ineffective for
+        // always-thinking models); label it explicitly to avoid confusion with "auto / model default".
         "off"
     } else {
         match resolve_reasoning_effort(app, model) {
@@ -577,7 +577,7 @@ pub(crate) fn print_info(app: &App, model: &str) {
         }
     };
 
-    // 打印当前 session 摘要
+    // Print the current session summary
     let store = SessionStore::new(&app.config.history_file);
     let summary = store
         .read_session_title(&app.session_id)
@@ -599,17 +599,17 @@ pub(crate) fn print_info(app: &App, model: &str) {
         .map(|s| format!("{ACCENT_MUTED} · {ACCENT_WARN}{}{RESET}", s))
         .unwrap_or_default();
 
-    // 使用 println! 避免手动 flush 的权限问题；模型与 session 合并为一行。
+    // Use println! to avoid manual-flush permission issues; model and session are merged into one line.
     println!(
         "{ACCENT_MUTED}[{ACCENT_SUCCESS}{}{ACCENT_MUTED} (search: {ACCENT_WARN}{search}{ACCENT_MUTED}, effort: {ACCENT_PRIMARY}{effort_label}{ACCENT_MUTED}){session_part}{ACCENT_MUTED}]{RESET}",
         models::model_display_label(model),
     );
 }
 
-/// 使用 LLM 进行 JSON 格式的请求（用于意图识别、知识库问答等场景）。
+/// Make an LLM request expecting a JSON response (used for intent recognition, knowledge-base Q&A, etc.).
 ///
-/// `skip_reasoning_effort`：为 `true` 时强制不注入 `reasoning_effort` 字段，
-/// 即使模型默认配置了该参数也会被忽略。适用于知识库问答等轻量场景。
+/// `skip_reasoning_effort`: when `true`, force-omit the `reasoning_effort` field;
+/// the field is ignored even when the model configures it by default. Suited to lightweight workloads such as knowledge-base Q&A.
 pub async fn do_request_json(
     app: &App,
     model: &str,
@@ -624,8 +624,8 @@ pub async fn do_request_json(
     let resolved_reasoning_effort = (!skip_reasoning_effort)
         .then(|| resolve_reasoning_effort(app, model).map(|effort| effort.as_str()))
         .flatten();
-    // 辅助请求固定关闭 thinking，但仍按模型/endpoint 的协议方言生成最终
-    // HTTP body（chat-completions: messages；responses: input）。
+    // Auxiliary requests disable thinking unconditionally, but the final wire fields still follow the model/endpoint protocol dialect for the
+    // HTTP body (chat-completions: messages; responses: input).
     let request_body = super::protocol::build_http_body_for_json_messages(
         model,
         &endpoint,
@@ -635,8 +635,8 @@ pub async fn do_request_json(
         stream,
     );
 
-    // 辅助请求也必须复用主请求的 provider key 轮换。`a -n` 等路径走这里；
-    // 若只取首个结果，会在通用 `api_key` 失效时跳过 `opencode.api_key_*`。
+    // Auxiliary requests must also reuse the main request's provider key rotation. Paths like `a -n` come through here;
+    // taking only the first result would skip `opencode.api_key_*` when the generic `api_key` fails.
     let primary_key = api_key_for_request_model(app, model);
     let adapter = adapter_for(models::model_adapter(model), &endpoint);
     let keys_to_try = adapter.collect_api_keys(&primary_key);
@@ -662,7 +662,7 @@ pub async fn do_request_json(
         )
         .await
         .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
-        // 非流式辅助请求：每次尝试 60 秒超时
+        // Non-streaming auxiliary request: 60s timeout per attempt
         let send_future = async {
             let resp = apply_request_auth(app.client.post(&endpoint), &endpoint, api_key)
                 .header("Content-Type", "application/json")
@@ -728,7 +728,7 @@ pub async fn do_request_json(
                 }
                 let status = response.status();
                 let status_code = status.as_u16();
-                // 在消费 body 前读取 Retry-After 头
+                // Read the Retry-After header before consuming the body
                 let retry_after_delay = if status_code == 429 {
                     parse_retry_after(response.headers())
                 } else {
@@ -789,15 +789,15 @@ pub async fn do_request_json(
     }
 }
 
-/// 流式聚合请求：发起 `stream: true` 请求，逐 chunk 累积 `delta.content`，
-/// 最终返回拼接好的完整文本。
+/// Streaming aggregation request: issues a `stream: true` request, accumulates `delta.content` chunk by chunk,
+/// and finally returns the concatenated full text.
 ///
-/// 相比非流式的 [`do_request_json`]，流式链路的响应头会立即返回、数据按
-/// chunk 增量到达，因此**不会**被"等服务端整段 body 生成完"撑爆超时。
-/// 这里用「单 chunk 空闲超时」兜底：只要持续有数据到达就一直读，连续
-/// `STREAM_RESPONSE_HEADER_TIMEOUT_SECS` 秒没有任何 chunk 才判定卡死。
+/// Compared with non-streaming [`do_request_json`], the streaming path returns response headers immediately and data arrives
+/// incrementally per chunk, so it **cannot** be blown up by waiting for the server to finish the whole body.
+/// The guard here is a per-chunk idle timeout: keep reading as long as data keeps arriving; only `STREAM_RESPONSE_HEADER_TIMEOUT_SECS`
+/// consecutive seconds without any chunk count as a hang.
 ///
-/// 适用于知识整理这类「只需要最终完整 JSON、不需要实时终端渲染」的辅助任务。
+/// Suited to auxiliary tasks like knowledge curation that only need the final complete JSON, without live terminal rendering.
 pub(super) fn apply_aux_stream_payload(
     payload: &str,
     event_type: Option<&str>,
@@ -820,8 +820,8 @@ pub(super) fn apply_aux_stream_payload(
         }
     }
     if let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) {
-        // 捕获 usage：OpenAI 兼容流式把最终 usage 放在 choices 为空的尾包，
-        // 必须在取 choice 之前先 take 出来，否则会漏计。
+        // Capture usage: OpenAI-compatible streaming puts the final usage in a trailing chunk with empty choices,
+        // so it must be taken before the choice is read, or it would be missed.
         if let Some(usage) = chunk.usage {
             *pending_usage = Some((chunk.model.clone(), usage.normalized()));
         }
@@ -941,10 +941,10 @@ pub async fn do_request_text_streaming(
                 .header("Content-Type", "application/json")
                 .body(request_body.clone())
         };
-        // 等待响应头：握手 + 服务端开始返回。流式下这一步很快。
-        // 使用 hedged backup：如果 primary 在短时间内没响应，自动发 backup 请求。
-        // 与非流式路径一致，header 等待超时取自 retry_policy.header_timeout_secs
-        // （auto 子 agent 走 30s 而非硬编码 90s），chunk 空闲超时仍用固定常量。
+        // Wait for response headers: handshake + server starting to respond. This step is fast when streaming.
+        // Use a hedged backup: if the primary produces no response within a short window, dispatch a backup request automatically.
+        // Consistent with the non-streaming path, the header wait timeout comes from retry_policy.header_timeout_secs
+        // (auto subagents use 30s instead of the hardcoded 90s); the chunk idle timeout still uses the fixed constant.
         let mut response = match tokio::time::timeout(
             Duration::from_secs(retry_policy.header_timeout_secs),
             send_with_budgeted_hedged_backup(
@@ -1035,13 +1035,13 @@ pub async fn do_request_text_streaming(
             }
         };
 
-        // 逐 chunk 读取并聚合 delta.content。
+        // Read and aggregate delta.content chunk by chunk.
         let mut content = String::new();
         let mut buffer: Vec<u8> = Vec::new();
         let mut sse_event_data = String::new();
         let mut sse_event_type: Option<String> = None;
         let mut idle_timed_out = false;
-        // final chunk 携带的 usage（OpenAI 兼容流式：通常在 choices 为空的尾包返回）。
+        // Usage carried by the final chunk (OpenAI-compatible streaming: usually returned in a trailing chunk with empty choices).
         let mut pending_usage: Option<(String, StreamUsage)> = None;
         let t0 = std::time::Instant::now();
         loop {
@@ -1058,8 +1058,8 @@ pub async fn do_request_text_streaming(
                 }
             } {
                 AuxChunkWait::Ready(Ok(Some(bytes))) => bytes,
-                AuxChunkWait::Ready(Ok(None)) => break, // 流正常结束
-                AuxChunkWait::Ready(Err(_)) => break,   // 读取错误：用已聚合内容
+                AuxChunkWait::Ready(Ok(None)) => break, // stream ended normally
+                AuxChunkWait::Ready(Err(_)) => break,   // read error: keep what was aggregated so far
                 AuxChunkWait::TimedOut => {
                     idle_timed_out = true;
                     break;
@@ -1071,7 +1071,7 @@ pub async fn do_request_text_streaming(
                 }
             };
             buffer.extend_from_slice(&chunk);
-            // 按 SSE 事件边界聚合 `data:` 行，兼容标准的多行 payload。
+            // Aggregate `data:` lines by SSE event boundaries, compatible with standard multi-line payloads.
             while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = buffer.drain(..=pos).collect();
                 let line = String::from_utf8_lossy(&line);
@@ -1124,7 +1124,7 @@ pub async fn do_request_text_streaming(
             &mut pending_usage,
         );
 
-        // AIOS: 把本次流式辅助请求的 usage 落账到内核 `/dev/llm`，与主链路一致。
+        // AIOS: charge this streaming auxiliary request's usage to the kernel `/dev/llm`, same as the main path.
         if let Some((echoed_model, usage)) = pending_usage {
             let model_for_pricing = if echoed_model.is_empty() {
                 model

@@ -1,32 +1,32 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-/// Agent 记忆存储 — 底层持久化存储系统
+/// Agent memory store — the underlying persistent storage system
 ///
-/// ## 架构说明
-/// `MemoryStore` 是所有知识/记忆的底层存储，被两个上层系统共用：
+/// ## Architecture
+/// `MemoryStore` is the low-level storage for all knowledge/memory, shared by two upper layers:
 ///
-/// 1. **Knowledge (知识库)** - 面向用户的知识管理
-///    - 通过 `knowledge_tools.rs` 暴露给用户
-///    - 存储项目知识、决策记录、用户偏好等事实性知识
-///    - 类别: `user_memory`, `project_info`, `architecture`, `decision_log`
+/// 1. **Knowledge** - user-facing knowledge management
+///    - Exposed to users via `knowledge_tools.rs`
+///    - Stores factual knowledge such as project facts, decision records, and user preferences
+///    - Categories: `user_memory`, `project_info`, `architecture`, `decision_log`
 ///
-/// 2. **Memory (记忆)** - 显式保存的长期规则和会话期内部记录
-///    - 通过 `memory.rs` 服务层管理
-///    - 存储安全规则、编码规范、自我反思等行为指导
-///    - 类别: `safety_rules`, `coding_guideline`, `self_note`, `common_sense`
+/// 2. **Memory** - explicitly saved long-term rules and session-scoped internal records
+///    - Managed by the `memory.rs` service layer
+///    - Stores behavioral guidance such as safety rules, coding guidelines, and self-reflections
+///    - Categories: `safety_rules`, `coding_guideline`, `self_note`, `common_sense`
 ///
-/// ## 类别区分
-/// - **Guidance 类别**:
+/// ## Category distinction
+/// - **Guidance categories**:
 ///   `safety_rules`, `user_preference`, `preference`, `coding_guideline`,
 ///   `best_practice`, `common_sense`, `self_note`
 ///
-/// - **Knowledge 类别**:
+/// - **Knowledge categories**:
 ///   `user_memory`, `project_info`, `architecture`, `decision_log`
-///   以及其他非 guidance 类别
+///   and other non-guidance categories
 ///
-/// ## 搜索机制
-/// - BM25 关键词搜索 + 文本相似度 (词汇级)
-/// - 支持归档文件搜索 (可配置)
-/// - 自动去重和 GC
+/// ## Search mechanism
+/// - BM25 keyword search + text similarity (lexical level)
+/// - Archive file search support (configurable)
+/// - Automatic dedup and GC
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -44,9 +44,9 @@ use std::ffi::OsStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-/// 全局 (source_path, MemoryIndex) 注册表，懒加载、按 path 复用。
-/// 第一次访问某条 source 路径时打开 / 重建 SQLite 索引；后续都拿到同一个
-/// `Arc<MemoryIndex>`，跨调用共享 LFU 计数与 FTS 索引。
+/// Global (source_path, MemoryIndex) registry: lazily loaded and reused per path.
+/// The first access to a source path opens / rebuilds the SQLite index; all later calls receive the
+/// same `Arc<MemoryIndex>`, sharing LFU counts and the FTS index across calls.
 fn memory_index_for(source_path: &Path) -> Option<Arc<MemoryIndex>> {
     use std::sync::Mutex;
     static REG: OnceLock<Mutex<Vec<(PathBuf, Arc<MemoryIndex>)>>> = OnceLock::new();
@@ -63,7 +63,7 @@ fn memory_index_for(source_path: &Path) -> Option<Arc<MemoryIndex>> {
             Some(arc)
         }
         Err(e) => {
-            // 索引不可用时降级到 BM25 路径，不阻断主存储。
+            // Fall back to the BM25 path when the index is unavailable, without blocking the main store.
             trace_memory_event(
                 "memory.index.open_failed",
                 "MemoryIndex unavailable; falling back to BM25",
@@ -90,7 +90,7 @@ pub(crate) fn rebuild_index_for_path(path: &Path) {
     }
 }
 
-/// 由 source jsonl 路径派生出对应的 sqlite 路径：
+/// Derive the corresponding sqlite path from a source jsonl path:
 /// `agent_memory.jsonl` -> `agent_memory.db`
 /// `agent_memory.subagent-xxx.jsonl` -> `agent_memory.subagent-xxx.db`
 fn derive_db_path(source: &Path) -> Option<PathBuf> {
@@ -99,9 +99,9 @@ fn derive_db_path(source: &Path) -> Option<PathBuf> {
     Some(parent.join(format!("{stem}.db")))
 }
 
-/// 把 memory 子系统的关键运维事件镜像到 AIOS kernel trace ring，
-/// 让 rotate / enforce / GC 等"会动数据"的动作在 AIOS 侧可观测。
-/// 任何获取不到内核或锁失败的情况都静默返回——不能影响主流程。
+/// Mirror key operational events of the memory subsystem into the AIOS kernel trace ring,
+/// making data-mutating actions (rotate / enforce / GC) observable on the AIOS side.
+/// Silently return when the kernel is unavailable or locking fails — this must never affect the main flow.
 pub(crate) fn trace_memory_event(location: &'static str, msg: &str, fields: &[(&str, String)]) {
     use aios_kernel::{FastMap, primitives::TraceLevel};
 
@@ -130,8 +130,8 @@ pub(crate) fn trace_memory_event(location: &'static str, msg: &str, fields: &[(&
     }
 }
 
-/// 原子地把内容写入 `path`：先写到同目录下的 tmp 文件，fsync 后 rename。
-/// 进程在中途崩溃也只会留下被 rename 替换前的旧主文件，不会写出半截 JSONL。
+/// Atomically write content to `path`: write to a tmp file in the same directory, fsync, then rename.
+/// If the process crashes midway, only the pre-rename old file remains; no half-written JSONL is ever produced.
 fn atomic_write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -155,7 +155,7 @@ fn atomic_write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         let _ = f.sync_all();
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
-        // rename 失败时尽力清理 tmp，避免遗留半成品
+        // Best-effort cleanup of the tmp file if rename fails, to avoid leaving a partial artifact
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -223,12 +223,12 @@ pub(crate) enum KnowledgeAppendOutcome {
     Duplicate { existing_id: Option<String> },
 }
 
-/// knowledge_save 幂等去重的进程内缓存：按文件指纹 (len, mtime) 失效。
-/// 文件被其它进程写入/轮转/GC 重写后指纹变化 -> 缓存清空回退全文件扫描，
-/// 因此正确性与无缓存时完全一致，只是重复保存从 O(全文件) 变成 O(1)。
+/// In-process cache for knowledge_save idempotent dedup: invalidated by file fingerprint (len, mtime).
+/// When the file is rewritten by another process / rotation / GC, the fingerprint changes -> the cache clears and falls back to a full-file scan,
+/// so correctness is identical to the no-cache case; repeated saves just drop from O(full file) to O(1).
 struct KnowledgeDedupCache {
     fingerprint: (u64, SystemTime),
-    /// (category, note, source, tags) 规范化后的等价 key -> 已存在条目 id。
+    /// Normalized equivalence key of (category, note, source, tags) -> existing entry id.
     seen: FxHashMap<(String, String, String, Vec<String>), Option<String>>,
 }
 
@@ -244,9 +244,9 @@ impl KnowledgeDedupCache {
 static KNOWLEDGE_DEDUP_CACHE: LazyLock<Mutex<FxHashMap<PathBuf, KnowledgeDedupCache>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
-/// 私有 memory 文件结束生命周期时移除对应去重缓存，避免已删除的 sub-agent
-/// 路径在长生命周期父进程中持续累积。删除缓存不影响持久化数据；后续若路径被
-/// 复用，会按当前文件指纹重新构建。
+/// Remove the dedup cache entry when a private memory file ends its lifecycle, so deleted sub-agent
+/// paths do not keep accumulating in a long-lived parent process. Removing the cache does not touch persisted data; if the path is
+/// reused later, the cache is rebuilt from the current file fingerprint.
 pub(crate) fn remove_knowledge_dedup_cache_entry(path: &Path) {
     if let Ok(mut cache) = KNOWLEDGE_DEDUP_CACHE.lock() {
         cache.remove(path);
@@ -291,9 +291,9 @@ impl MemoryStore {
         })
     }
 
-    /// 对用户可见的长期知识执行原子幂等写入。`knowledge_save` 的重试和重复
-    /// tool call 不应制造多条 JSONL 记录或重复 RAG upsert；自动反思等其它
-    /// MemoryStore 调用仍保留各自原有语义。
+    /// Perform an atomic idempotent write of user-visible long-term knowledge. `knowledge_save` retries and duplicate
+    /// tool calls must not create duplicate JSONL records or repeated RAG upserts; other
+    /// MemoryStore callers keep their original semantics.
     pub(crate) fn append_idempotent_knowledge(
         &self,
         entry: &AgentMemoryEntry,
@@ -301,8 +301,8 @@ impl MemoryStore {
         let entry = cap_memory_entry(entry);
         self.ensure_memory_file_for_lock()?;
         let key = equivalent_knowledge_key(&entry);
-        // 指纹校验和缓存命中判定在文件锁内执行，确保与扫描/追加/整理看到
-        // 一致的文件状态，避免外部写入已改库但缓存返回错误 Duplicate 的竞态。
+        // Fingerprint validation and cache-hit checks run under the file lock, ensuring the same view of the
+        // file state as scanning/appending/consolidation, avoiding the race where an external write changed the file but the cache wrongly returned Duplicate.
         super::with_memory_file_lock(&self.path, || {
             let fingerprint = memory_file_fingerprint(&self.path);
             let cache_hit = {
@@ -321,7 +321,7 @@ impl MemoryStore {
             if let Some(existing_id) = cache_hit {
                 return Ok(KnowledgeAppendOutcome::Duplicate { existing_id });
             }
-            // 缓存 miss：在文件锁内扫描文件
+            // Cache miss: scan the file under the file lock
             if let Some(existing) = self.find_equivalent_knowledge(&entry)? {
                 let mut cache = KNOWLEDGE_DEDUP_CACHE.lock().unwrap();
                 cache
@@ -393,8 +393,8 @@ impl MemoryStore {
             .and_then(|_| file.write_all(b"\n"))
             .map_err(|e| format!("Failed to write memory file: {e}"))?;
 
-        // JSONL 是 source of truth；下面的 SQLite 索引同步是 best-effort，
-        // 失败只 trace 不冒泡。这样即使 rusqlite 出问题也不会阻断主存储。
+        // JSONL is the source of truth; the SQLite index sync below is best-effort,
+        // failures are traced but not propagated, so rusqlite problems never block the main store.
         if let Some(idx) = memory_index_for(&self.path) {
             if let Err(e) = idx.upsert_entry(entry) {
                 trace_memory_event(
@@ -605,9 +605,9 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// 批量应用“删除 + 新增”变更。先准备全部目标内容，再在同一主文件锁内提交；
-    /// 中途失败时恢复已提交文件，避免当前文件与轮转归档只更新一部分。
-    /// JSONL 仍是 source of truth；SQLite 索引在成功写回后做 best-effort 全量重建。
+    /// Apply "delete + add" changes in batch. Prepare all target content first, then commit under the same main-file lock;
+    /// on mid-way failure the already-committed files are restored, so the current file and rotated archives are never partially updated.
+    /// JSONL remains the source of truth; the SQLite index is fully rebuilt best-effort after a successful write-back.
     pub(crate) fn apply_batch_update(
         &self,
         delete_ids: &[&str],
@@ -731,10 +731,10 @@ impl MemoryStore {
         let mut files: Vec<PathBuf> = Vec::new();
         let archives = self.collect_archive_files(include_archives)?;
         if include_archives {
-            // 显式请求扫描归档（如 -ns memo 检索）：不截断，
-            // 确保被 rotation 移入旧归档的历史 memo 仍可检索。
-            // keep_last_archives 截断仅用于 search_archives.enable
-            // 全局配置开启时的全量搜索性能优化。
+            // Explicit archive scan request (e.g. -ns memo retrieval): no truncation,
+            // ensuring historical memos moved into old archives by rotation stay retrievable.
+            // keep_last_archives truncation applies only to the global
+            // full-search performance optimization when search_archives.enable is on.
             files.extend(archives.into_iter().map(|(path, _)| path));
         } else if search_archives {
             let take_from = archives.len().saturating_sub(keep_last_archives);
@@ -744,7 +744,7 @@ impl MemoryStore {
         Ok(files)
     }
 
-    /// 收集归档文件（轮转归档 + 可选 legacy 迁移备份），按修改时间升序返回。
+    /// Collect archive files (rotated archives + optional legacy migration backups), returned in ascending mtime order.
     fn collect_archive_files(
         &self,
         include_legacy_backups: bool,
@@ -771,10 +771,10 @@ impl MemoryStore {
             let entry = entry.map_err(|e| format!("{}", e))?;
             let file_name = entry.file_name().to_str().unwrap_or("").to_string();
             let is_rotation_archive = file_name.starts_with(&archive_prefix);
-            // 旧版迁移曾将原始 JSONL 留为
-            // `agent_memory.legacy-migrate-<timestamp>.jsonl.bak`。它不符合
-            // 当前 rotation 的 `<base>.{timestamp}` 命名；仅在 -ns 等显式
-            // 要求查归档时纳入，避免普通当前文件检索读取过期迁移快照。
+            // Legacy migration used to leave the original JSONL as
+            // `agent_memory.legacy-migrate-<timestamp>.jsonl.bak`. It does not match
+            // the current rotation naming `<base>.{timestamp}`; include it only when an explicit
+            // archive query (-ns etc.) asks for it, so ordinary current-file searches never read a stale migration snapshot.
             let is_legacy_migration_backup = include_legacy_backups
                 && file_name.starts_with(&legacy_migration_prefix)
                 && file_name.ends_with(".jsonl.bak");
@@ -792,9 +792,9 @@ impl MemoryStore {
         Ok(archives)
     }
 
-    /// --consolidate-knowledge 专用扫描：包含全部轮转归档，不含 legacy 迁移备份。
-    /// 整理需要看到被 rotation 移入归档的历史条目；迁移备份只是只读历史快照，
-    /// 不应进入整理视野（也不会被改写）。
+    /// Scan dedicated to --consolidate-knowledge: includes all rotated archives, excludes legacy migration backups.
+    /// Consolidation must see historical entries moved into archives by rotation; migration backups are read-only historical snapshots,
+    /// not part of the consolidation view (and never rewritten).
     fn memory_files_to_scan_consolidate(&self) -> Result<Vec<PathBuf>, String> {
         let mut files: Vec<PathBuf> = self
             .collect_archive_files(false)?
@@ -876,11 +876,11 @@ impl MemoryStore {
     ) -> Result<Vec<(AgentMemoryEntry, f64)>, String> {
         let query_lc = query.to_lowercase();
 
-        // Fast-path: 先用 SQLite FTS5 拿候选 id 集合（O(log N) MATCH），
-        // 再回到 JSONL 把候选条目精确加载，跑现有 BM25 + 文本相似度计分。
-        // 这样把 search 从 "全文件扫描 + 全文件 tokenize" 降为 "命中行 + tokenize"，
-        // 输出格式 / 分数权重 / 排序逻辑全部不变。
-        // FTS 不可用 / 候选过少时回到原扫描路径，行为完全等价。
+        // Fast path: first use SQLite FTS5 to get the candidate id set (O(log N) MATCH),
+        // then go back to the JSONL to load the candidate entries exactly and run the existing BM25 + text-similarity scoring.
+        // This reduces search from "full-file scan + full-file tokenize" to "hit lines + tokenize",
+        // with output format / score weights / ordering logic unchanged.
+        // When FTS is unavailable or candidates are too few, fall back to the original scan path with fully equivalent behavior.
         let fts_candidate_cap = limit.saturating_mul(20).max(60).min(400);
         let fts_ids: Option<std::collections::HashSet<String>> = memory_index_for(&self.path)
             .and_then(|idx| match idx.search_ids(&query_lc, fts_candidate_cap) {
@@ -906,7 +906,7 @@ impl MemoryStore {
                     continue;
                 };
                 if let Some(ids) = &fts_ids {
-                    // fast-path：只保留 FTS 命中的条目
+                    // Fast path: keep only FTS-hit entries
                     if let Some(id) = entry.id.as_deref() {
                         if !ids.contains(id) {
                             continue;
@@ -1008,8 +1008,8 @@ impl MemoryStore {
         for (s, i) in top_idx {
             out.push((docs[i].0.clone(), s));
         }
-        // 给被命中的条目计 LFU；失败只 trace。注意只对 top-N（已截到 limit）计数，
-        // 而不是 cap=200 的中间集合，避免 score 很低的边缘条目刷出 hits。
+        // Count LFU for hit entries; failures are traced only. Count only the top-N (already truncated to limit),
+        // not the cap=200 intermediate set, so low-scoring fringe entries do not inflate their hits.
         if let Some(idx) = memory_index_for(&self.path) {
             let ids: Vec<String> = out.iter().filter_map(|(e, _)| e.id.clone()).collect();
             if !ids.is_empty() {
@@ -1129,8 +1129,8 @@ impl MemoryStore {
     }
 }
 
-/// 直接基于一个明确路径构建 store，绕过 task_local override / env / config。
-/// 用于父任务在 sub-agent finalize 后把白名单条目写回主 memory 文件。
+/// Build a store directly from an explicit path, bypassing task_local override / env / config.
+/// Used by the parent task to write whitelist entries back into the main memory file after sub-agent finalize.
 pub(crate) fn store_for_path(path: PathBuf) -> MemoryStore {
     MemoryStore { path }
 }
@@ -1534,7 +1534,7 @@ mod tests {
                 .filter_map(|entry| entry.id)
                 .collect()
         };
-        // 当前文件：cur_a 保留、cur_b 删除；归档：arch_c 删除、arch_d 保留。
+        // Current file: keep cur_a, delete cur_b; archives: delete arch_c, keep arch_d.
         write_lines(
             &current,
             &[
@@ -1569,7 +1569,7 @@ mod tests {
         );
         assert_eq!(read_ids(&archive), vec!["arch_d".to_string()]);
 
-        // all_with_archives 应同时看到主文件与轮转归档中的条目。
+        // all_with_archives must see entries from both the main file and the rotated archives.
         let all_ids: Vec<String> = store
             .all_with_archives()
             .unwrap()
@@ -1614,15 +1614,15 @@ impl MemoryStore {
                 return Ok(false);
             }
 
-            // 修复点 P0-2：原实现直接 `rename` + `File::create`，category 白名单内的
-            // 永久条目（safety_rules / reflection self_note / coding_guideline /
-            // user_preference / project_memory ...）也会被一起冻进归档，之后默认
-            // 不参与召回——等于把"长期记忆"的核心规则丢掉。
+            // Fix P0-2: the original implementation used `rename` + `File::create` directly, freezing even entries in the
+            // category whitelist (permanent entries: safety_rules / reflection self_note / coding_guideline /
+            // user_preference / project_memory ...) into the archive, after which they default
+            // out of recall — effectively discarding the core rules of "long-term memory".
             //
-            // 现在先把所有条目读出来，把白名单条目留在新主文件，其余写入归档：
-            //   - 新主文件 = 原内容 ∩ {is_permanent_memory}
-            //   - 归档文件 = 原内容（保持不变，与旧实现一致）
-            // 这样无论召回器是否启用 search_archives，长期资产都不会丢。
+            // Now all entries are read out first: whitelist entries stay in the new main file, the rest go to the archive:
+            //   - new main file = original content ∩ {is_permanent_memory}
+            //   - archive file = original content (unchanged, same as the old implementation)
+            // That way long-term assets are never lost, regardless of whether the recall layer enables search_archives.
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read memory file before rotate: {}", e))?;
 
@@ -1654,7 +1654,7 @@ impl MemoryStore {
             std::fs::rename(&path, &new_name)
                 .map_err(|e| format!("Failed to rotate file: {}", e))?;
 
-            // 重建主文件：写回所有 priority=255 的条目（保留原 timestamp 顺序）
+            // Rebuild the main file: write back all priority=255 entries (original timestamp order preserved)
             let mut head = String::new();
             for entry in &permanent {
                 if let Ok(s) = serde_json::to_string(*entry) {
@@ -1681,8 +1681,8 @@ impl MemoryStore {
                     ("file_size", meta.len().to_string()),
                 ],
             );
-            // rotate 把绝大多数条目搬到归档，索引内容已经严重失效。
-            // 这里直接触发一次 rebuild —— 现在主文件只剩永久条目，rebuild 很轻。
+            // Rotation moves the vast majority of entries to the archive, leaving the index content badly stale.
+            // Trigger a rebuild directly here — the main file now holds only permanent entries, so the rebuild is cheap.
             if let Some(idx) = memory_index_for(&path) {
                 let _ = idx.rebuild_from_source();
             }
@@ -1748,9 +1748,9 @@ impl MemoryStore {
                 return Ok(());
             }
 
-            // 排序键：永久条目（白名单：safety/preference/coding_guideline/
-            // project_memory/...）永远靠后，其余按 priority 升序、ts 升序。
-            // 这样删除的时候从头开始砍最低优先级、最旧的条目。
+            // Sort key: permanent entries (whitelist: safety/preference/coding_guideline/
+            // project_memory/...) always last; the rest by ascending priority then ascending ts.
+            // Deletion then cuts the lowest-priority, oldest entries from the front.
             entries.sort_by(|a, b| {
                 let perm_a = crate::ai::tools::service::memory::is_permanent_memory(a);
                 let perm_b = crate::ai::tools::service::memory::is_permanent_memory(b);
@@ -1765,19 +1765,19 @@ impl MemoryStore {
                 pa.cmp(&pb).then_with(|| a.timestamp.cmp(&b.timestamp))
             });
 
-            // 修复点 P0-1：原实现用 `while … { remove(i); if … { remove(i); } }`
-            // 在同一个下标位置删了两次——第二次删的其实是已经"前移"上来的下一条，
-            // 而且没有跳过永久条目检查，可能误伤白名单条目。这里改成单删 +
-            // i 保持不动（remove(i) 后下一条自动落到 i），同时白名单条目跳过。
+            // Fix P0-1: the original implementation used `while … { remove(i); if … { remove(i); } }`
+            // deleting twice at the same index — the second remove actually deleted the next entry that had already "shifted up",
+            // and it never checked the permanent-entry skip, so whitelist entries could be hit by mistake. Changed to a single remove +
+            // leaving i unchanged (after remove(i) the next entry lands at i), with permanent whitelist entries skipped.
             //
-            // target 字段保留只是为了"达到配额尽快收手"，不再用来触发第二次删除。
+            // The target field now only serves "stop as soon as the quota is met"; it no longer triggers a second deletion.
             let target = max_entries.saturating_sub(min_keep);
             let mut removed = 0usize;
             let mut skipped_permanent = 0usize;
             let mut i = 0usize;
             while i < entries.len() && entries.len() > max_entries {
                 if crate::ai::tools::service::memory::is_permanent_memory(&entries[i]) {
-                    // 永久条目永远跳过，不能 remove。
+                    // Permanent entries are always skipped and must not be removed.
                     skipped_permanent += 1;
                     i += 1;
                     continue;
@@ -1797,13 +1797,13 @@ impl MemoryStore {
                 }
             }
 
-            // 修复点 P1-1：原实现 `fs::write(&path, output)` 是 truncate-then-write，
-            // 中途崩溃会留下不完整的主文件。改成 tmp+rename，文件系统层面原子。
+            // Fix P1-1: the original `fs::write(&path, output)` was truncate-then-write,
+            // leaving an incomplete main file on a mid-way crash. Switched to tmp+rename for filesystem-level atomicity.
             atomic_write_file(&self.path, output.as_bytes()).map_err(|e| {
                 format!("Failed to write memory file after quota enforcement: {}", e)
             })?;
 
-            // 文件已被整体重写，触发索引重建以保持一致；rebuild 内部包事务，失败只 trace。
+            // The file was fully rewritten: trigger an index rebuild to stay consistent; the rebuild wraps a transaction internally and failures are only traced.
             if let Some(idx) = memory_index_for(&self.path) {
                 let _ = idx.rebuild_from_source();
             }
@@ -1825,8 +1825,8 @@ impl MemoryStore {
         })
     }
 
-    /// 批量删除多条记忆（原子操作：一次性读 → 过滤 → 写回）。
-    /// 返回实际删除的条数。
+    /// Batch-delete memory entries (atomic: read once → filter → write back).
+    /// Returns the number of entries actually deleted.
     pub(crate) fn delete_by_ids(&self, ids: &[&str]) -> Result<usize, String> {
         if ids.is_empty() {
             return Ok(0);
@@ -1835,7 +1835,7 @@ impl MemoryStore {
             .map(|report| report.deleted)
     }
 
-    /// 根据 id 删除条目（返回被删除的条目）
+    /// Delete an entry by id (returns the deleted entry)
     pub(crate) fn delete_by_id(&self, id: &str) -> Result<Option<AgentMemoryEntry>, String> {
         super::with_memory_file_lock(&self.path, || {
             let content = std::fs::read_to_string(&self.path)
@@ -1871,7 +1871,7 @@ impl MemoryStore {
                 }
             }
 
-            // 与 enforce_max_entries 保持一致：tmp + rename 原子写，避免崩溃后留下不完整主文件。
+            // Consistent with enforce_max_entries: tmp + rename atomic write, avoiding an incomplete main file after a crash.
             atomic_write_file(&self.path, output.as_bytes())
                 .map_err(|e| format!("Failed to write memory file: {}", e))?;
 
@@ -1879,8 +1879,8 @@ impl MemoryStore {
         })
     }
 
-    /// 批量追加多条记忆；内部复用 `apply_batch_update([], entries)`，
-    /// 通过一次原子重写避免“先追加一半”这类中间态。
+    /// Batch-append memory entries; internally reuses `apply_batch_update([], entries)`,
+    /// using a single atomic rewrite to avoid intermediate states like "half appended".
     pub(crate) fn append_batch(&self, entries: &[AgentMemoryEntry]) -> Result<usize, String> {
         if entries.is_empty() {
             return Ok(0);
@@ -1996,16 +1996,16 @@ impl MemoryStore {
     }
 }
 
-/// 记忆重要性评分 - 用于主动学习和自动遗忘
+/// Memory importance scoring — used for active learning and automatic forgetting
 #[derive(Debug, Clone)]
 pub struct MemoryImportance {
-    /// 被引用次数
+    /// Reference count
     pub frequency: u32,
-    /// 时间衰减因子 (0.0 - 1.0, 越近越高)
+    /// Time-decay factor (0.0 - 1.0, higher when more recent)
     pub recency: f64,
-    /// 适用范围广度 (0.0 - 1.0)
+    /// Breadth of applicability (0.0 - 1.0)
     pub generality: f64,
-    /// 用户是否确认过
+    /// Whether the user has confirmed it
     pub user_validated: bool,
 }
 
@@ -2019,34 +2019,34 @@ impl MemoryImportance {
         }
     }
 
-    /// 计算综合重要性分数 (0.0 - 1.0)
+    /// Compute the composite importance score (0.0 - 1.0)
     pub fn score(&self) -> f64 {
         let freq_score = (self.frequency as f64).min(10.0) / 10.0; // 0-1
         let recency_score = self.recency.clamp(0.0, 1.0);
         let generality_score = self.generality.clamp(0.0, 1.0);
         let validation_bonus = if self.user_validated { 0.2 } else { 0.0 };
 
-        // 权重：频率 30%, 时效性 30%, 通用性 20%, 用户确认 20%
+        // Weights: frequency 30%, recency 30%, generality 20%, user confirmation 20%
         (freq_score * 0.3 + recency_score * 0.3 + generality_score * 0.2 + validation_bonus)
             .min(1.0)
     }
 
-    /// 增加引用次数
+    /// Increment the reference count
     pub fn increment_frequency(&mut self) {
         self.frequency += 1;
     }
 
-    /// 更新时间衰减
+    /// Update the time decay
     pub fn update_recency(&mut self, created_at: &str) {
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(created_at) {
             let now = chrono::Utc::now();
             let age_days = (now - dt.with_timezone(&chrono::Utc)).num_seconds() as f64 / 86400.0;
-            // 指数衰减：半衰期 30 天
+            // Exponential decay: 30-day half-life
             self.recency = (-age_days * std::f64::consts::LN_2 / 30.0).exp();
         }
     }
 
-    /// 评估通用性（基于类别和标签）
+    /// Evaluate generality (based on category and tags)
     pub fn evaluate_generality(&mut self, category: &str, tags: &[String]) {
         let general_categories = [
             "common_sense",
@@ -2072,12 +2072,12 @@ impl MemoryImportance {
         self.generality = (category_score * 0.7 + tag_score * 0.3).clamp(0.0, 1.0);
     }
 
-    /// 标记为用户确认
+    /// Mark as user-confirmed
     pub fn mark_user_validated(&mut self) {
         self.user_validated = true;
     }
 
-    /// 判断是否应该被遗忘（低价值记忆）
+    /// Decide whether this should be forgotten (low-value memory)
     pub fn should_prune(&self, min_score: f64) -> bool {
         self.score() < min_score
     }
@@ -2106,17 +2106,17 @@ impl MemoryStore {
         let now = chrono::Utc::now();
 
         for entry in entries {
-            // 永久记忆和高优先级记忆不删除
+            // Permanent and high-priority memories are not deleted
             if entry.priority.unwrap_or(100) >= 200 {
                 continue;
             }
 
-            // 计算重要性
+            // Compute importance
             let mut importance = MemoryImportance::new();
             importance.update_recency(&entry.timestamp);
             importance.evaluate_generality(&entry.category, &entry.tags);
 
-            // 检查年龄
+            // Check age
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) {
                 let age_days = (now - dt.with_timezone(&chrono::Utc)).num_days();
                 if age_days > max_age_days && importance.should_prune(min_score) {
@@ -2173,7 +2173,7 @@ impl MemoryStore {
         Ok(removed_count)
     }
 
-    /// 重写整个 JSONL 文件（原子写：tmp → rename）。
+    /// Rewrite the whole JSONL file (atomic write: tmp → rename).
     fn write_all_entries(path: &Path, entries: &[AgentMemoryEntry]) -> Result<(), String> {
         let mut output = String::new();
         for entry in entries {
@@ -2242,9 +2242,9 @@ impl MemoryStore {
         Ok(entries)
     }
 
-    /// 获取全部记忆（含全部轮转归档，不含 legacy 迁移备份）。
-    /// 供 --consolidate-knowledge 使用：整理需要看到被 rotation 移入
-    /// 归档的历史条目，否则它们永远不会进入整理视野。
+    /// Get all memories (including all rotated archives, excluding legacy migration backups).
+    /// Used by --consolidate-knowledge: consolidation must see historical entries moved
+    /// into archives by rotation, otherwise they never enter the consolidation view.
     pub(crate) fn all_with_archives(&self) -> Result<Vec<AgentMemoryEntry>, String> {
         let mut entries = Vec::new();
         for p in self.memory_files_to_scan_consolidate()? {
@@ -2268,9 +2268,9 @@ impl MemoryStore {
         Ok(entries)
     }
 
-    /// 记录记忆被使用（增加引用次数）。
-    /// 真正落地点是 SQLite 索引的 `hits` 列；JSONL 没法原地 update。
-    /// 索引不可用时静默返回 Ok，与历史行为兼容。
+    /// Record that a memory was used (increment the reference count).
+    /// The actual write target is the `hits` column of the SQLite index; JSONL cannot be updated in place.
+    /// Silently return Ok when the index is unavailable, for backward-compatible behavior.
     pub fn record_usage(&self, entry_id: &str) -> Result<(), String> {
         if entry_id.is_empty() {
             return Ok(());
@@ -2295,21 +2295,21 @@ mod importance_tests {
         assert_eq!(importance.generality, 0.5);
         assert!(!importance.user_validated);
 
-        // 初始分数
+        // Initial score
         let initial_score = importance.score();
         assert!(initial_score > 0.0 && initial_score < 1.0);
 
-        // 增加引用
+        // Add a reference
         for _ in 0..10 {
             importance.increment_frequency();
         }
         assert_eq!(importance.frequency, 10);
 
-        // 用户确认
+        // User confirmation
         importance.mark_user_validated();
         assert!(importance.user_validated);
 
-        // 分数应该提高
+        // Score should increase
         let new_score = importance.score();
         assert!(new_score > initial_score);
     }
@@ -2318,18 +2318,18 @@ mod importance_tests {
     fn test_memory_importance_recency_decay() {
         let mut importance = MemoryImportance::new();
 
-        // 30 天前的记忆
+        // Memory from 30 days ago
         let old_timestamp = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
         importance.update_recency(&old_timestamp);
 
-        // 时效性应该衰减到约 0.5（半衰期）
+        // Recency should have decayed to about 0.5 (half-life)
         assert!(importance.recency > 0.4 && importance.recency < 0.6);
 
-        // 90 天前的记忆
+        // Memory from 90 days ago
         let very_old_timestamp = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
         importance.update_recency(&very_old_timestamp);
 
-        // 时效性应该很低
+        // Recency should be very low
         assert!(importance.recency < 0.2);
     }
 
@@ -2337,15 +2337,15 @@ mod importance_tests {
     fn test_memory_importance_generality() {
         let mut importance = MemoryImportance::new();
 
-        // 通用类别
+        // General category
         importance.evaluate_generality("common_sense", &vec![]);
         assert!(importance.generality >= 0.7);
 
-        // 特定类别
+        // Specific category
         importance.evaluate_generality("user_specific", &vec![]);
         assert!(importance.generality <= 0.5);
 
-        // 带有通用标签
+        // With general tags
         importance.evaluate_generality(
             "user_specific",
             &vec!["general".to_string(), "core".to_string()],
@@ -2357,12 +2357,12 @@ mod importance_tests {
     fn test_should_prune() {
         let mut importance = MemoryImportance::new();
 
-        // 高价值记忆不应该被修剪
+        // High-value memories must not be pruned
         importance.frequency = 10;
         importance.user_validated = true;
         assert!(!importance.should_prune(0.3));
 
-        // 低价值记忆应该被修剪
+        // Low-value memories should be pruned
         let mut low_importance = MemoryImportance::new();
         low_importance.frequency = 0;
         low_importance.recency = 0.1;
@@ -2428,9 +2428,9 @@ mod retention_tests {
             .collect()
     }
 
-    /// P0-1 回归：原实现的双删 bug 会在配额满后误删紧邻 priority=255 的条目，
-    /// 这里制造一份"低优先级 + 永久"混合，断言 enforce 后所有 priority=255
-    /// 都还在，且配额被压回 max_entries 之内。
+    /// P0-1 regression: the original double-delete bug wrongly removed the entry right after a priority=255 one once the quota was full;
+    /// build a "low-priority + permanent" mix here and assert that after enforce all priority=255
+    /// entries survive and the quota is pressed back under max_entries.
     #[test]
     fn prune_low_value_removes_matching_ids_in_one_pass() {
         let path = unique_path("prune_batch");
@@ -2485,7 +2485,7 @@ mod retention_tests {
     fn enforce_max_entries_keeps_all_permanent_entries() {
         let path = unique_path("enforce_perm");
         let mut all = Vec::new();
-        // 100 条普通低优先级，按时间从旧到新
+        // 100 ordinary low-priority entries, ordered old to new
         for i in 0..100 {
             all.push(entry(
                 "tool_stat",
@@ -2494,7 +2494,7 @@ mod retention_tests {
                 50,
             ));
         }
-        // 5 条永久条目（safety_rules）
+        // 5 permanent entries (safety_rules)
         for i in 0..5 {
             all.push(entry(
                 "safety_rules",
@@ -2520,13 +2520,13 @@ mod retention_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// P0-2 回归：rotate 后新主文件只能含 priority=255 的条目，
-    /// 归档文件包含全部原条目。
+    /// P0-2 regression: after rotate the new main file may contain only priority=255 entries,
+    /// while the archive file contains all original entries.
     #[test]
     fn rotate_preserves_permanent_entries_in_main_file() {
         let path = unique_path("rotate_perm");
         let mut all = Vec::new();
-        // 用足够大的 note 把文件膨胀到几 KB
+        // Inflate the file to a few KB with a large enough note
         let big = "x".repeat(2048);
         for i in 0..20 {
             all.push(entry(
@@ -2551,16 +2551,16 @@ mod retention_tests {
         write_lines(&path, &all);
 
         let store = MemoryStore::for_tests_with_path(path.clone());
-        // 阈值故意比当前 size 小，强制 rotate
+        // Threshold deliberately smaller than the current size to force a rotate
         let rotated = store.rotate_if_exceeds(1024).unwrap();
         assert!(rotated, "expected rotate to happen");
 
-        // 主文件只剩永久
+        // Main file keeps only permanent entries
         let head = read_entries(&path);
         assert_eq!(head.len(), 2);
         assert!(head.iter().all(|e| e.priority == Some(255)));
 
-        // 归档文件存在，且包含所有原条目
+        // Archive file exists and contains all original entries
         let parent = path.parent().unwrap();
         let archives: Vec<_> = std::fs::read_dir(parent)
             .unwrap()
@@ -2582,9 +2582,9 @@ mod retention_tests {
         }
     }
 
-    /// P0 回归：-ns memo 检索（include_archives=true）必须扫描全部归档，
-    /// 不受 keep_last_archives 截断；也必须兼容旧迁移留下的 `.jsonl.bak`。
-    /// 否则被 rotation 或迁移移出的历史 memo 会永久不可检索。
+    /// P0 regression: -ns memo retrieval (include_archives=true) must scan all archives,
+    /// not truncated by keep_last_archives; it must also handle `.jsonl.bak` files left by legacy migration.
+    /// Otherwise historical memos moved out by rotation or migration become permanently unretrievable.
     #[test]
     fn entries_by_category_include_archives_scans_all_archives() {
         let path = unique_path("memo_arch_scan");
@@ -2601,14 +2601,14 @@ mod retention_tests {
             .unwrap()
             .to_string();
 
-        // 主文件：1 条 memo
+        // Main file: 1 memo
         write_lines(
             &path,
             &[entry("memo", "main memo", "2026-07-16T00:00:00Z", 100)],
         );
 
-        // 创建 5 个归档文件（超出默认 keep_last_archives=3 窗口）。
-        // 最旧归档中放 "二次分析"，模拟被 rotation 移走的用户记录。
+        // Create 5 archive files (beyond the default keep_last_archives=3 window).
+        // Put "二次分析" in the oldest archive, simulating a user record moved out by rotation.
         let archive_notes = [
             "oldest: 二次分析问题排查",
             "archive2 memo",
@@ -2620,7 +2620,7 @@ mod retention_tests {
         for (i, note) in archive_notes.iter().enumerate() {
             let ap = parent.join(format!("{base}.2026070{}170000", i + 1));
             write_lines(&ap, &[entry("memo", note, "2026-07-01T00:00:00Z", 100)]);
-            // 设置递增 mtime，确保排序确定（最旧 -> 最新）
+            // Set increasing mtimes so ordering is deterministic (oldest -> newest)
             let times = std::fs::FileTimes::new();
             let _ = times.set_modified(
                 UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + i as u64),
@@ -2629,7 +2629,7 @@ mod retention_tests {
             archive_paths.push(ap);
         }
 
-        // 旧版本曾把迁移前的数据留在此命名格式；它不是普通 rotation 归档。
+        // Older versions left pre-migration data in this naming format; it is not an ordinary rotation archive.
         let legacy_path = parent.join(format!(
             "{legacy_base}.legacy-migrate-20260701180745.jsonl.bak"
         ));
@@ -2646,7 +2646,7 @@ mod retention_tests {
         let store = MemoryStore::for_tests_with_path(path.clone());
         let memos = store.entries_by_category("memo", 100_000, true).unwrap();
 
-        // 主文件 1 + 普通归档 5 + 旧迁移备份 1 = 7 条。
+        // Main file 1 + normal archives 5 + legacy migration backup 1 = 7 entries.
         assert_eq!(
             memos.len(),
             7,
@@ -2657,7 +2657,7 @@ mod retention_tests {
             "最旧归档和旧迁移备份中的 memo 都必须可检索"
         );
 
-        // 清理
+        // Cleanup
         let _ = std::fs::remove_file(&path);
         for p in archive_paths {
             let _ = std::fs::remove_file(p);

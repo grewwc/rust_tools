@@ -14,7 +14,7 @@ use unicode_width::UnicodeWidthStr;
 use super::completion_panel::CompletionPanel;
 use crate::ai::prompt::MAX_INPUT_CHARS;
 
-/// 补全面板一次最多显示的候选行数（超出部分随选中项滚动）。
+/// Maximum number of candidate lines the completion panel shows at once (overflow scrolls with the selection).
 const COMPLETION_WINDOW: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,14 +35,14 @@ fn popup_layout_config(
     _has_status_msg: bool,
     has_model_label: bool,
 ) -> PopupLayoutConfig {
-    // top_margin 始终保持 0。不要在 inline viewport 里放稳定的装饰性横线：
-    // 终端 resize / reflow / 重新锚定时，这类整行装饰很容易被推入 scrollback，
-    // 恢复宽度后就会像“多出几条横线”一样不断堆叠。这里彻底去掉 divider，
-    // 只保留必要的 model/help 信息，避免残影。
+    // top_margin always stays 0. Do not put stable decorative horizontal rules inside the inline viewport:
+    // on terminal resize / reflow / re-anchoring, such full-line decorations easily get pushed into scrollback,
+    // and after the width is restored they keep stacking like "a few extra horizontal lines". The divider is
+    // removed entirely here, keeping only the necessary model/help info to avoid ghost artifacts.
     let top_margin: u16 = 0;
     let top_rule_lines: u16 = 0;
-    // 补全面板激活时，把底部帮助压缩为 1 行并隐藏 model/session 信息，
-    // 优先把高度让给候选列表；小终端里这能显著减少"只能看到 1 个候选"的情况。
+    // While the completion panel is active, compress the bottom help to 1 line and hide model/session info,
+    // giving the height to the candidate list first; on small terminals this significantly reduces the "only 1 candidate visible" case.
     let help_lines: u16 = 1;
     let model_header_lines = if has_completion_panel || !has_model_label {
         0
@@ -87,18 +87,18 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         !model_label.is_empty(),
     );
 
-    // 计算 popup 尺寸：始终填满当前 inline viewport。空输入场景的留白通过更小的
-    // viewport 高度和去掉顶部间距解决，而不是在 viewport 内再造未使用区域。
+    // Compute the popup size: always fill the current inline viewport. Whitespace for the empty-input case is
+    // achieved via a smaller viewport height and removing the top gap, not by carving unused regions inside the viewport.
     let popup_height = area.height;
     let popup_width = area.width.saturating_sub(2).clamp(40, 180).min(area.width);
 
-    // 计算 popup 位置（顶部对齐，紧贴上次输出）
+    // Compute the popup position (top-aligned, right below the previous output)
     let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
     let popup_y = area.y;
     let popup = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
-    // 计算内区域：左右各 1 列水平边距，不额外增加顶部/底部 padding，
-    // 避免在 inline viewport 里制造多余空白行。
+    // Compute the inner area: 1 column of horizontal margin on each side, no extra top/bottom padding,
+    // to avoid creating extra blank lines inside the inline viewport.
     let h_margin: u16 = 1;
     let top_margin = layout.top_margin;
     let inner = Rect::new(
@@ -108,24 +108,25 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         popup.height - top_margin,
     );
 
-    // 计算各区域高度
+    // Compute each region's height
     let top_rule_lines = layout.top_rule_lines;
     let help_lines = layout.help_lines;
-    // 模型/主题信息行：放在底部（help 行上方）而非 viewport 顶行。inline viewport 每次
-    // 重新锚定（resize、上方有新输出、退出清屏）时，**顶行**会被推入终端永久 scrollback
-    // 且退出时的 `Clear(FromCursorDown)` 无法擦除光标上方历史行——把这行画在顶部会像
-    // 装饰性横线一样反复堆叠（表现为 `model: ... | ...` 在恢复/重绘时多次出现）。底部区域
-    // 在光标下方，随每帧重绘、退出时被 FromCursorDown 清除，不会污染 scrollback。
+    // Model/topic info line: place it at the bottom (above the help line), not on the viewport's top row. On every
+    // inline-viewport re-anchor (resize, new output above, exit screen clear), the **top row** gets pushed into the
+    // terminal's permanent scrollback, and the exit-time `Clear(FromCursorDown)` cannot erase history lines above the
+    // cursor — drawing this line at the top makes it stack repeatedly like a decorative rule (`model: ... | ...`
+    // appearing multiple times after restore/redraw). The bottom region sits below the cursor, is redrawn every frame,
+    // and cleared by FromCursorDown at exit, so it never pollutes scrollback.
     let model_header_lines = layout.model_header_lines;
-    // 面板激活时优先占满高度：先扣掉 help 行与 textarea 最小行，余下的尽量给面板
-    // （面板期望高度 = min(候选数, COMPLETION_WINDOW) + 上下边框 2，但不超过可用空间）。
-    // textarea 退让到最小 1 行（此时用户在选列表，不需要大编辑区）。
-    // 无面板时按当前内容与 viewport 高度自适应。
+    // While the panel is active, prioritize filling the height: subtract the help line and the textarea's minimum
+    // rows first, then give the rest to the panel (panel desired height = min(candidate count, COMPLETION_WINDOW) +
+    // 2 for top/bottom borders, capped by available space). The textarea yields to its minimum 1 row (the user is
+    // picking from a list and does not need a large editor). Without a panel, adapt to content and viewport height.
     let min_textarea_lines = layout.min_textarea_lines;
     let (textarea_lines, panel_lines) = match completion_panel {
         Some(panel) => {
             let desired_panel = (panel.items.len().min(COMPLETION_WINDOW) as u16).saturating_add(2);
-            // 面板可用上限 = 总高度 - help - textarea 最小行。
+            // Panel usable cap = total height - help - textarea minimum rows.
             let panel_cap = inner
                 .height
                 .saturating_sub(top_rule_lines)
@@ -164,15 +165,15 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         ])
         .split(inner);
 
-    // textarea 的渲染区域
+    // textarea render area
     let textarea_area = chunks[1];
 
-    // 清除 popup 区域，确保 resize 后旧边框/文本不残留
+    // Clear the popup area so old borders/text do not linger after a resize
     f.render_widget(Clear, popup);
 
-    // 底部模型/主题信息行：让用户在输入时看到当前模型与 session 主题。
-    // **必须画在底部专属 chunk（chunks[3]，help 行上方）而非 viewport 顶行**：顶行会在
-    // 每次 viewport 重新锚定时被推进 scrollback 反复堆叠（见上方 model_header_lines 注释）。
+    // Bottom model/topic info line: lets the user see the current model and session topic while typing.
+    // **Must be drawn in the dedicated bottom chunk (chunks[3], above the help line), not the viewport top row**:
+    // the top row gets pushed into scrollback and stacks on every viewport re-anchor (see the model_header_lines comment above).
     if model_header_lines > 0 {
         let header_area = chunks[3];
         let mut spans = vec![
@@ -196,7 +197,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        // 在 model 同行展示 session 主题
+        // Show the session topic on the same line as the model
         let topic_text = match session_topic {
             Some(t) if !t.is_empty() => t,
             _ => "new session",
@@ -217,36 +218,36 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     let char_count = current_content.chars().count();
 
-    // 设置对齐方式
+    // Set alignment
     textarea.set_alignment(Alignment::Left);
-    // 用户输入使用低饱和暖灰；它不会与蓝/青状态信息或黄色告警争夺注意力，
-    // 在深色终端中也比高饱和颜色更适合长时间阅读。
+    // User input uses a low-saturation warm gray; it does not compete for attention with blue/cyan status info
+    // or yellow warnings, and reads better over long sessions than high-saturation colors on dark terminals.
     let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
     textarea.set_style(Style::default().fg(Color::Rgb(red, green, blue)));
-    // tui-textarea 默认用 REVERSED 空格把 cursor 画进 buffer；在 ratatui inline
-    // viewport 下，resize 重锚会把这块"画出来的 cursor"推进 scrollback，表现为
-    // 每次侧栏展开/收回都多一个白色 cursor 残影。这里禁用 buffer cursor，改用
-    // ratatui 的真实终端 cursor（见下方 set_cursor_position），它不会成为可持久化内容。
+    // tui-textarea draws the cursor into the buffer as a REVERSED space by default; under a ratatui inline
+    // viewport, resize re-anchoring pushes that "drawn cursor" into scrollback, so every sidebar expand/collapse
+    // leaves one more white cursor ghost. Disable the buffer cursor here and use ratatui's real terminal cursor
+    // (see set_cursor_position below), which never becomes persistable content.
     textarea.set_cursor_style(Style::default());
 
     f.render_widget(&*textarea, textarea_area);
-    // 直接使用 tui-textarea 渲染后计算好的真实终端光标位置。
-    // 之前这里自己重算了一套屏幕坐标，用了 `UnicodeWidthChar::width_cjk`，而
-    // tui-textarea 内部（screen_map.rs）使用非 CJK 版本的 `c.width()`，两者对
-    // CJK/ambiguous-width 字符返回的宽度不同，在中文输入下会导致真实终端光标
-    // 跟编辑器 buffer 光标位置偏离 1 列以上（越靠前的 CJK 字符越明显）。
-    // 直接复用库内部在 render_plan 阶段算好的位置，保证两者永远一致。
+    // Use the real terminal cursor position computed by tui-textarea's own rendering.
+    // Previously this recomputed screen coordinates itself using `UnicodeWidthChar::width_cjk`, while
+    // tui-textarea internally (screen_map.rs) uses the non-CJK `c.width()`. The two disagree on the width of
+    // CJK/ambiguous-width characters, which under CJK input puts the real terminal cursor 1+ columns off from
+    // the editor's buffer cursor (more visible for earlier CJK characters).
+    // Reuse the position the library computed during its render plan so the two always agree.
     let cursor_offset_row = textarea.rendered_cursor_position().map(|pos: Position| {
         f.set_cursor_position((pos.x, pos.y));
         pos.y.saturating_sub(area.y)
     });
 
-    // 渲染 completion panel
+    // Render the completion panel
     if let Some(panel) = completion_panel {
-        // 滚动窗口必须用面板**实际可见行数**（chunk 高度减去上下边框），
-        // 而不是固定 COMPLETION_WINDOW：在矮终端下 layout 会把面板挤压成
-        // 比 COMPLETION_WINDOW 更少的行，若仍按固定值算 `start`，选中项一旦
-        // 越过可见区就会落到屏幕外，表现为"卡在前几项、无法滚动"。
+        // The scroll window must use the panel's **actually visible row count** (chunk height minus the top/bottom
+        // borders), not a fixed COMPLETION_WINDOW: on short terminals the layout squeezes the panel to fewer rows
+        // than COMPLETION_WINDOW, and if `start` is still computed from the fixed value, once the selection passes
+        // the visible area it lands off-screen — the panel appears "stuck on the first items, unable to scroll".
         let visible_rows = (chunks[2].height as usize).saturating_sub(2).max(1);
         let window_size = visible_rows.min(panel.items.len()).max(1);
         let start = panel
@@ -283,10 +284,10 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         f.render_widget(Paragraph::new(items).block(panel_block), chunks[2]);
     }
 
-    // 获取光标位置
+    // Get cursor position
     let (cursor_row, cursor_col) = textarea.cursor();
 
-    // 状态栏信息：字符数 + 光标位置
+    // Status bar info: character count + cursor position
     let status_info = if char_count > MAX_INPUT_CHARS {
         format!(
             " Chars: {} (exceeded) | Ln {}, Col {} ",
@@ -310,7 +311,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         )
     };
 
-    // 渲染帮助行
+    // Render the help line
     let help_lines = if completion_panel.is_some() {
         vec![Line::from(vec![
             Span::styled("移动：", Style::default().fg(Color::DarkGray)),
@@ -522,8 +523,8 @@ fn count_trailing_blank_lines(lines: &[String]) -> usize {
         .count()
 }
 
-/// 截断文本以适应显示宽度
-/// 使用 unicode-width 包计算宽度，对于未识别的字符保守估计为宽度 1
+/// Truncate text to fit a display width.
+/// Width is computed with the unicode-width crate; unrecognized characters are conservatively estimated at width 1.
 fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
@@ -544,7 +545,7 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
     let mut width: usize = 0;
 
     for ch in text.chars() {
-        // 对于 unicode-width 返回 0 的字符，保守估计为宽度 1
+        // For characters where unicode-width returns 0, conservatively estimate width 1
         let ch_w = UnicodeWidthChar::width_cjk(ch).unwrap_or(1);
 
         if width + ch_w > target {
@@ -590,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_truncate_cjk() {
-        // 测试中文截断
+        // Test CJK truncation
         let result = truncate_with_ellipsis("已补全为 /agent", 10);
         assert!(result.ends_with("..."));
         assert!(display_width(&result) <= 10);
@@ -610,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_truncate_unicode() {
-        // 测试各种 Unicode 字符
+        // Test assorted Unicode characters
         let result = truncate_with_ellipsis("日本語テスト", 8);
         assert!(result.ends_with("..."));
         assert!(display_width(&result) <= 8);
@@ -631,7 +632,7 @@ mod tests {
     #[test]
     fn empty_prompt_keeps_consistent_top_margin() {
         let layout = popup_layout_config(8, "", 1, 0, false, false, true);
-        // 紧凑空输入：不再放任何装饰性 divider，避免 resize 后横线残影。
+        // Compact empty input: no decorative divider anymore, avoiding horizontal-line ghosts after resize.
         assert_eq!(layout.top_margin, 0);
         assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 1);
@@ -642,7 +643,7 @@ mod tests {
     #[test]
     fn non_empty_prompt_keeps_full_editor_layout() {
         let layout = popup_layout_config(8, "hello", 1, 0, false, false, true);
-        // 普通编辑态也不再画 divider，避免 resize/re-anchor 后装饰线堆入 scrollback。
+        // Normal editing mode no longer draws a divider either, avoiding decorative rules piling into scrollback after resize/re-anchor.
         assert_eq!(layout.top_margin, 0);
         assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 1);
@@ -700,7 +701,7 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // 顶部分隔线已移走，空输入时光标应直接落在 textarea 首行。
+        // The top divider is gone; with empty input the cursor should land directly on the textarea's first line.
         let expected = Position::new(popup_x + 1, viewport_area.y);
         terminal.backend_mut().assert_cursor_position(expected);
     }
@@ -752,9 +753,9 @@ mod tests {
 
     #[test]
     fn cjk_cursor_position_matches_popup_inner_left_plus_width() {
-        // 中文输入时，光标应落在 textarea 首行 popup 内左边 + 文字显示宽度处。
-        // 之前手算用 width_cjk，与 tui-textarea 内部的 width 不一致，
-        // 导致光标向右偏移（CJK 字符每字符偏移 1 列）。
+        // Under CJK input, the cursor should land at the popup's inner left edge on the textarea's first line plus the text's display width.
+        // The previous hand-computation used width_cjk, which disagrees with tui-textarea's internal width,
+        // shifting the cursor to the right (1 column per CJK character).
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::with_options(
             backend,
@@ -763,10 +764,10 @@ mod tests {
             },
         )
         .unwrap();
-        // "你好世界" 4 个 CJK 字符，每个宽度 2，合计显示宽度 8
+        // 4 CJK characters, width 2 each, total display width 8
         let content = "你好世界";
         let mut textarea = TextArea::from(vec![content.to_string()]);
-        // 把光标移到文字末尾（"你好世界" → col 4）
+        // Move the cursor to the end of the text ("你好世界" → col 4)
         textarea.move_cursor(CursorMove::End);
         let mut viewport_area = Rect::ZERO;
 
@@ -791,7 +792,7 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // 光标在 "你好世界" 末尾 → popup 内左边(1) + "你好世界" 显示宽度(8)
+        // Cursor at the end of "你好世界" → popup inner left(1) + display width of "你好世界"(8)
         let expected_x = popup_x + 1 + 8;
         let expected = Position::new(expected_x, viewport_area.y);
         terminal.backend_mut().assert_cursor_position(expected);

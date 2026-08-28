@@ -10,13 +10,15 @@ const MAX_OUTPUT_CHARS: usize = 32_000;
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
 const MAX_MATCHES: usize = 200;
 const MAX_WALK_FILES: usize = 10_000;
-/// 每个文件最多保留多少条 snippet（按相关性排序后取前 N）。
+/// How many snippets to keep per file at most (top N after relevance sorting).
 const MAX_SNIPPETS_PER_FILE: usize = 3;
 
-/// 系统级目录黑名单：搜索根落在这些前缀内一律拒绝，避免误把整个磁盘扫了。
-/// 仅列出明确的"系统/平台"目录；故意不收 `/var`、`/private`、`/tmp`，因为
-/// macOS 的临时目录就在 `/var/folders/...`（canonicalize 后为
-/// `/private/var/folders/...`），收进去会误伤合法的临时工作目录。
+/// System-level directory blocklist: search roots inside these prefixes are
+/// always rejected, to avoid accidentally scanning the whole disk. Only explicit
+/// "system/platform" directories are listed; `/var`, `/private`, and `/tmp` are
+/// deliberately excluded, because macOS temp dirs live under `/var/folders/...`
+/// (after canonicalize: `/private/var/folders/...`) and including them would
+/// reject legitimate temporary working directories.
 const FORBIDDEN_ROOT_PREFIXES: &[&str] = &[
     "/System",
     "/Library",
@@ -32,12 +34,14 @@ const FORBIDDEN_ROOT_PREFIXES: &[&str] = &[
     "/Network",
 ];
 
-/// 校验搜索根目录是否合法，拒绝文件系统根 `/` 与系统级目录。
+/// Validate the search root, rejecting the filesystem root `/` and system-level
+/// directories.
 ///
-/// 设计目标：阻止 LLM 误传 `path="/"` 或 `path="/System"` 这类会导致全盘扫描、
-/// CPU 100% 的调用。`root` 必须已经是绝对路径（调用方先 join 过 cwd）。
+/// Design goal: stop LLM mistakes like `path="/"` or `path="/System"` that would
+/// trigger a full-disk scan at 100% CPU. `root` must already be absolute (the
+/// caller joins cwd first).
 pub(crate) fn validate_search_root(root: &Path, cwd: &Path) -> Result<(), String> {
-    // 1. 拒绝文件系统根（`/` 或 Windows 盘根）。
+    // 1. Reject the filesystem root (`/` or a Windows drive root).
     let component_count = root.components().count();
     if component_count <= 1 {
         return Err(format!(
@@ -47,7 +51,8 @@ pub(crate) fn validate_search_root(root: &Path, cwd: &Path) -> Result<(), String
         ));
     }
 
-    // 2. 拒绝系统级前缀。比较时优先用 canonicalize，失败则按字面比较。
+    // 2. Reject system-level prefixes. Prefer canonicalize for the comparison;
+    // fall back to a literal comparison on failure.
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let canonical_str = canonical.to_string_lossy();
     for prefix in FORBIDDEN_ROOT_PREFIXES {
@@ -64,74 +69,85 @@ pub(crate) fn validate_search_root(root: &Path, cwd: &Path) -> Result<(), String
 }
 
 // ============================================================================
-// 共享内容搜索引擎
+// Shared content search engine
 //
-// `run_content_search` 是文本搜索工具的内容搜索核心：
-// BFS 递归收集文件 → 逐行匹配 → 相关性重排 → 按文件聚合（每文件 top-N
-// snippet + context + `>` 标记匹配行）。普通大小写敏感字面查询直接走
-// `str::find`，仅正则和大小写不敏感查询构造 Regex。
+// `run_content_search` is the content-search core of the text search tools:
+// BFS-collect files → match line by line → rerank by relevance → aggregate per
+// file (top-N snippets + context + `>` markers on matched lines per file).
+// Plain case-sensitive literal queries go straight through `str::find`; only
+// regex and case-insensitive queries build a Regex.
 //
-// 设计要点：
-// - 文件收集走 BFS（保留 `*.rs` 递归语义；`terminalw::glob_paths` 非递归，
-//   不能直接替代）。
-// - `extensions=None` 表示不按扩展名过滤（text_search 的默认行为）；
-//   `Some(&[...])` 表示只搜白名单扩展名（保留给未来按语言过滤用）。
-// - 相关性评分：whole-word 命中 > 子串命中；大小写一致优先；命中出现在
-//   文件名/路径中的文件整体加权；行内匹配靠前的优先。
+// Design notes:
+// - File collection uses BFS (keeping the `*.rs` recursive semantics;
+//   `terminalw::glob_paths` is non-recursive and cannot replace it directly).
+// - `extensions=None` means no extension filtering (text_search's default
+//   behavior); `Some(&[...])` means only whitelisted extensions are searched
+//   (reserved for future per-language filtering).
+// - Relevance scoring: whole-word hits > substring hits; exact case match is
+//   preferred; files whose name/path matches get a whole-file bonus; earlier
+//   in-line matches are preferred.
 // ============================================================================
 
-/// 内容搜索的可配置项。由两个调用方各自构造。
+/// Configurable knobs for content search. Constructed separately by each caller.
 pub(crate) struct ContentSearchOptions<'a> {
-    /// 原始查询串（用于相关性打分时识别字面大小写、whole-word）。
+    /// The raw query string (used to detect literal case and whole-word hits
+    /// during relevance scoring).
     pub(crate) query: &'a str,
-    /// 是否把 query 当正则。false 时按字面子串（已转义）匹配。
+    /// Whether to treat the query as a regex. When false, matches as a literal
+    /// (escaped) substring.
     pub(crate) is_regex: bool,
-    /// 是否大小写敏感。
+    /// Whether matching is case-sensitive.
     pub(crate) case_sensitive: bool,
-    /// 每个匹配行上下各保留多少 context 行。
+    /// How many context lines to keep on each side of a matched line.
     pub(crate) context_lines: usize,
-    /// 最多返回多少条匹配行（跨所有文件）。
+    /// Maximum number of matched lines returned (across all files).
     pub(crate) max_results: usize,
-    /// 可选的文件名 glob 过滤（支持逗号分隔、`*.{ts,tsx}` brace 展开）。
+    /// Optional file-name glob filter (supports comma-separated patterns and
+    /// `*.{ts,tsx}` brace expansion).
     pub(crate) file_pattern: Option<&'a str>,
-    /// 可选的扩展名白名单。None=不按扩展名过滤；Some=只收这些扩展名。
+    /// Optional extension whitelist. None = no extension filtering; Some = only
+    /// these extensions.
     pub(crate) extensions: Option<&'a [&'a str]>,
-    /// 展示路径时用于裁掉前缀（一般是 cwd），让输出用相对路径。
+    /// Prefix stripped for display paths (usually cwd) so output uses relative paths.
     pub(crate) display_root: Option<&'a Path>,
-    /// 单文件大小上限（字节），超过即跳过该文件。普通搜索用 2 MiB；
-    /// 会话归档搜索会调大，因为 overflow 文件可能远超普通源文件。
+    /// Per-file size cap in bytes; larger files are skipped. Plain search uses
+    /// 2 MiB; session archive searches raise it because overflow files can be far
+    /// larger than ordinary source files.
     pub(crate) max_file_size: u64,
 }
 
-/// 一行匹配，连同它在文件内的相关性分数。
+/// One matched line, together with its in-file relevance score.
 struct ScoredLine {
     line_index: usize,
     score: i64,
 }
 
-/// 单个文件的聚合结果（已按相关性排序、限流的 snippet 行）。
+/// Aggregated result for one file (snippet lines already sorted by relevance and
+/// capped).
 struct FileHits {
-    /// 用于展示的（可能相对化的）路径字符串。
+    /// Path string used for display (possibly relativized).
     display_path: String,
-    /// 文件的整体相关性分数（用于文件间排序）。
+    /// Whole-file relevance score (used for ordering between files).
     file_score: i64,
-    /// 命中的行（line_index, score），已按相关性降序。
+    /// Matched lines (line_index, score), sorted by relevance descending.
     scored: Vec<ScoredLine>,
-    /// 文件内**全部**命中行号（升序），用于在渲染时正确标记 `>`。
-    /// 注意 `scored` 仅保留 top-N snippet，但落到 context 窗口内的
-    /// 其余命中行也应以 `>` 标注，否则会被误显示为普通 context 行。
+    /// **All** matched line indices in the file (ascending), so rendering can
+    /// mark `>` correctly. Note `scored` keeps only the top-N snippets, but other
+    /// hits that fall inside a context window must also be marked `>`; otherwise
+    /// they would be wrongly shown as ordinary context lines.
     all_match_indices: Vec<usize>,
-    /// 原始文件内容。只为有命中的文件保留，渲染 context 时按行起点借用切片，
-    /// 避免为扫描过的每一行单独分配 String。
+    /// Raw file content. Kept only for files with hits; context rendering borrows
+    /// slices by line start instead of allocating a String for every scanned line.
     content: String,
-    /// 与 `str::lines()` 语义一致的行起始字节偏移。
+    /// Line-start byte offsets with the same semantics as `str::lines()`.
     line_starts: Vec<usize>,
 }
 
 enum SearchMatcher {
-    /// 默认路径：大小写敏感的字面子串搜索，不构造也不执行正则。
+    /// Default path: case-sensitive literal substring search; no regex is built or run.
     Literal,
-    /// 正则查询以及大小写不敏感的字面查询仍由 regex crate 处理，以保持语义。
+    /// Regex queries and case-insensitive literal queries still go through the
+    /// regex crate to preserve semantics.
     Regex(Regex),
 }
 
@@ -154,8 +170,10 @@ impl SearchMatcher {
     }
 }
 
-/// 运行共享内容搜索，返回已格式化好的结果字符串（含 truncate）。
-/// 无命中时返回 `Ok("No matches found.")`，让调用方按各自语义包装。
+/// Run the shared content search and return the fully formatted result string
+/// (including truncation).
+/// With no hits it returns `Ok("No matches found.")` so callers can wrap it in
+/// their own semantics.
 pub(crate) fn run_content_search(
     root: &Path,
     options: &ContentSearchOptions<'_>,
@@ -212,12 +230,15 @@ pub(crate) fn run_content_search(
             continue;
         }
 
-        // 在 truncate 前收集全部命中行号（升序），供渲染时标注 `>`。
+        // Collect all matched line indices (ascending) before truncation, for `>`
+        // marking at render time.
         let all_match_indices: Vec<usize> = scored.iter().map(|s| s.line_index).collect();
 
-        // 文件分数取其命中行的最高分 + 路径命中加权，作为文件间排序键。
+        // File score = its best hit score + path-hit bonus; used as the inter-file
+        // sort key.
         let file_score = scored.iter().map(|s| s.score).max().unwrap_or(0) + name_path_bonus;
-        // 文件内按相关性降序，再按行号升序（稳定、就近）。
+        // Within the file: relevance descending, then line index ascending
+        // (stable, nearest first).
         scored.sort_by(|a, b| {
             b.score
                 .cmp(&a.score)
@@ -239,7 +260,8 @@ pub(crate) fn run_content_search(
         return Ok("No matches found.".to_string());
     }
 
-    // 文件间按相关性降序，分数相同按路径字典序稳定排列。
+    // Between files: relevance descending; equal scores ordered stably by path
+    // lexicographically.
     file_hits.sort_by(|a, b| {
         b.file_score
             .cmp(&a.file_score)
@@ -270,7 +292,7 @@ fn build_regex(query: &str, is_regex: bool, case_sensitive: bool) -> Result<Rege
     }
 }
 
-/// 展示用路径：能相对化就相对化，否则用完整路径。
+/// Display path: relativize when possible, otherwise the full path.
 fn display_path_for(file_path: &Path, display_root: Option<&Path>) -> String {
     if let Some(root) = display_root {
         if let Ok(rel) = file_path.strip_prefix(root) {
@@ -280,7 +302,8 @@ fn display_path_for(file_path: &Path, display_root: Option<&Path>) -> String {
     file_path.to_string_lossy().to_string()
 }
 
-/// 当查询命中文件名/路径时给文件整体加权（文件名命中 +3，目录路径命中 +1）。
+/// Whole-file bonus when the query matches the file name/path (+3 for a file-name
+/// hit, +1 for a directory-path hit).
 fn path_match_bonus(display_path: &str, options: &ContentSearchOptions<'_>) -> i64 {
     if options.is_regex {
         return 0;
@@ -301,18 +324,18 @@ fn path_match_bonus(display_path: &str, options: &ContentSearchOptions<'_>) -> i
     if file_name.contains(&needle) { 3 } else { 1 }
 }
 
-/// 对单个匹配行打分：whole-word 命中 +4；字面大小写完全一致 +2；
-/// 匹配越靠近行首越优先（最多 +2）。
+/// Score a single matched line: whole-word hit +4; exact literal-case match +2;
+/// matches closer to the line start rank higher (up to +2).
 fn score_line(
     line: &str,
     options: &ContentSearchOptions<'_>,
     match_start: usize,
     match_end: usize,
 ) -> i64 {
-    let mut score = 1; // 基础命中分
+    let mut score = 1; // base hit score
     let matched = &line[match_start..match_end];
 
-    // 全词命中加权。
+    // Whole-word hit bonus.
     let left_ok =
         match_start == 0 || !is_identifier_byte(line.as_bytes()[match_start.saturating_sub(1)]);
     let right_ok = match_end >= line.len() || !is_identifier_byte(line.as_bytes()[match_end]);
@@ -320,12 +343,13 @@ fn score_line(
         score += 4;
     }
 
-    // 字面（非正则）时，匹配片段与 query 大小写完全一致再加权。
+    // For literal (non-regex) queries, an exact-case match against the query
+    // adds another bonus.
     if !options.is_regex && matched == options.query {
         score += 2;
     }
 
-    // 就近：匹配越靠前越好。
+    // Proximity: the earlier the match, the better.
     let lead = line[..match_start]
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -343,7 +367,8 @@ fn is_identifier_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// 收集与 `str::lines()` 一致的行起点。尾部换行不会产生额外空行。
+/// Collect line starts with the same semantics as `str::lines()`. A trailing
+/// newline does not produce an extra empty line.
 fn collect_line_starts(content: &str) -> Vec<usize> {
     if content.is_empty() {
         return Vec::new();
@@ -360,7 +385,8 @@ fn collect_line_starts(content: &str) -> Vec<usize> {
     starts
 }
 
-/// 根据行起点返回不含换行符的行切片，并与 `str::lines()` 一样去掉 CRLF 中的 CR。
+/// Return the line slice without newlines for a given line start, stripping the
+/// CR of CRLF just like `str::lines()`.
 fn line_at<'a>(content: &'a str, starts: &[usize], index: usize) -> Option<&'a str> {
     let start = *starts.get(index)?;
     let mut end = starts
@@ -396,7 +422,8 @@ fn format_content_results(
         out.push_str(&hit.display_path);
         out.push('\n');
 
-        // snippet 行按行号升序渲染（相关性已用于截断与文件排序）。
+        // Render snippet lines in ascending line order (relevance was already used
+        // for capping and file ordering).
         let mut match_indices: Vec<usize> = hit.scored.iter().map(|s| s.line_index).collect();
         match_indices.sort_unstable();
 
@@ -407,8 +434,8 @@ fn format_content_results(
             }
             for idx in range.start..range.end {
                 let line_num = idx + 1;
-                // 用全部命中行号标注 `>`，避免被截断的命中行落入 context 窗口时
-                // 被误显示为普通 context 行。
+                // Mark `>` using all matched line indices, so a truncated hit falling
+                // inside a context window is not mistaken for an ordinary context line.
                 let is_match = hit.all_match_indices.binary_search(&idx).is_ok();
                 let prefix = if is_match { ">" } else { " " };
                 let line_content = line_at(&hit.content, &hit.line_starts, idx).unwrap_or("");
@@ -452,19 +479,20 @@ fn merge_context_ranges(
 }
 
 // ----------------------------------------------------------------------------
-// 文件收集 + glob 匹配
+// File collection + glob matching
 // ----------------------------------------------------------------------------
 
 fn build_glob_matcher(pattern: &str) -> GlobMatcher {
     let mut patterns = Vec::new();
-    // 先按"顶层逗号"（不在 `{}` 内的逗号）拆成多个 glob，再各自做 brace 展开，
-    // 否则 `*.{ts,tsx}` 会被 brace 内的逗号错误拆开。
+    // First split on "top-level commas" (commas not inside `{}`) into multiple
+    // globs, then brace-expand each one; otherwise `*.{ts,tsx}` would be wrongly
+    // split on the comma inside the braces.
     for part in split_top_level_commas(pattern) {
         let trimmed = part.trim();
         if trimmed.is_empty() {
             continue;
         }
-        // brace 展开：`*.{ts,tsx}` → `*.ts`, `*.tsx`
+        // Brace expansion: `*.{ts,tsx}` → `*.ts`, `*.tsx`
         for expanded in expand_braces(trimmed) {
             patterns.push(expanded);
         }
@@ -472,7 +500,7 @@ fn build_glob_matcher(pattern: &str) -> GlobMatcher {
     GlobMatcher { patterns }
 }
 
-/// 按不在 `{}` 内的逗号拆分，使 `a,*.{ts,tsx}` → [`a`, `*.{ts,tsx}`]。
+/// Split on commas not inside `{}`, so `a,*.{ts,tsx}` → [`a`, `*.{ts,tsx}`].
 fn split_top_level_commas(pattern: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -497,7 +525,8 @@ fn split_top_level_commas(pattern: &str) -> Vec<String> {
     parts
 }
 
-/// 展开单层 `{a,b,c}` brace（仅支持一处 brace，足够覆盖 `*.{ts,tsx}` 这类）。
+/// Expand a single one-level `{a,b,c}` brace (only one brace site supported,
+/// enough for patterns like `*.{ts,tsx}`).
 fn expand_braces(pattern: &str) -> Vec<String> {
     let (Some(open), Some(close)) = (pattern.find('{'), pattern.find('}')) else {
         return vec![pattern.to_string()];
@@ -535,8 +564,9 @@ impl GlobMatcher {
     }
 }
 
-/// 路径 glob 额外支持 `**/` 匹配零层目录，例如 `src/**/mod.rs` 也应匹配
-/// `src/mod.rs`。普通 `*` 的既有语义保持不变，仍由 `glob_match_simple` 处理。
+/// Path globs additionally support `**/` matching zero directory levels, so
+/// `src/**/mod.rs` should also match `src/mod.rs`. The existing semantics of a
+/// plain `*` are unchanged and still handled by `glob_match_simple`.
 fn glob_match_path(pattern: &str, path: &str) -> bool {
     if glob_match_simple(pattern, path) {
         return true;
@@ -556,9 +586,11 @@ fn glob_match_path(pattern: &str, path: &str) -> bool {
 
 fn glob_match_simple(pattern: &str, name: &str) -> bool {
     let pat = pattern.trim_start_matches("**/");
-    // 经典两指针 + 回溯的 glob 匹配，正确支持 `*`（匹配任意长度，含空）与
-    // `?`（匹配恰好一个字符）。不含通配符时退化为精确匹配，避免旧实现里
-    // `name.ends_with(pat)` 把 `Cargo.toml` 误匹配到 `my_cargo.toml`。
+    // Classic two-pointer glob matching with backtracking, correctly supporting
+    // `*` (matches any length, including empty) and `?` (matches exactly one
+    // character). Patterns without wildcards degrade to exact matching, avoiding
+    // the old implementation's bug where `name.ends_with(pat)` made `Cargo.toml`
+    // match `my_cargo.toml`.
     let p: Vec<char> = pat.chars().collect();
     let n: Vec<char> = name.chars().collect();
     let mut pi = 0usize;
@@ -587,9 +619,10 @@ fn glob_match_simple(pattern: &str, name: &str) -> bool {
     pi == p.len()
 }
 
-/// BFS 递归收集候选文件，跳过隐藏目录与依赖/构建目录。
-/// - `glob_matcher`：文件名或相对路径 glob 过滤（None=不过滤）。
-/// - `extensions`：扩展名白名单（None=不按扩展名过滤）。
+/// Recursively collect candidate files via BFS, skipping hidden directories and
+/// dependency/build directories.
+/// - `glob_matcher`: file-name or relative-path glob filter (None = no filter).
+/// - `extensions`: extension whitelist (None = no extension filtering).
 fn collect_content_files(
     root: &Path,
     glob_matcher: Option<&GlobMatcher>,
@@ -623,7 +656,8 @@ fn collect_content_files(
             };
 
             if file_type.is_symlink() {
-                // 不递归目录符号链接；否则可能重复扫描，甚至在目录环上失控。
+                // Do not recurse into directory symlinks; otherwise scanning may
+                // repeat, or even run away on a directory loop.
                 let meta = match fs::metadata(&path) {
                     Ok(meta) => meta,
                     Err(_) => continue,
@@ -683,8 +717,9 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
     out
 }
 
-// execute_text_grep 保留为测试专用入口：text_grep 工具已退役，但共享引擎
-// run_content_search 的回归测试仍通过这条 arg-parsing 路径驱动。
+// execute_text_grep is kept as a test-only entry point: the text_grep tool is
+// retired, but regression tests for the shared engine run_content_search still
+// drive it through this arg-parsing path.
 #[cfg(test)]
 fn execute_text_grep(args: &Value) -> Result<String, String> {
     let pattern = args["pattern"]
@@ -724,7 +759,8 @@ fn execute_text_grep(args: &Value) -> Result<String, String> {
         context_lines,
         max_results,
         file_pattern,
-        // text_grep 不按扩展名过滤——只受可选的 file_pattern 约束。
+        // text_grep does not filter by extension — only the optional file_pattern
+        // constrains it.
         extensions: None,
         display_root: Some(&cwd),
         max_file_size: MAX_FILE_SIZE,
@@ -952,9 +988,9 @@ mod tests {
     #[test]
     fn test_content_search_ranks_whole_word_first() {
         let dir = make_temp_dir("rank_word");
-        // substring 命中
+        // substring hit
         fs::write(dir.join("a_sub.rs"), "let foobar = 1;\n").unwrap();
-        // whole-word 命中——应排在前面
+        // whole-word hit — should rank first
         fs::write(dir.join("z_word.rs"), "let foo = 2;\n").unwrap();
 
         let args = serde_json::json!({
@@ -1044,12 +1080,14 @@ mod tests {
         assert!(msg.contains("Refusing to search"), "{}", msg);
     }
 
-    // Bug 1 回归：单文件命中超过 MAX_SNIPPETS_PER_FILE(3) 时，落入 context 窗口
-    // 的被截断命中行也必须以 `>` 标注，而非被误显示为普通 context 行。
+    // Bug 1 regression: when one file has more hits than MAX_SNIPPETS_PER_FILE(3),
+    // truncated hits falling inside the context window must still be marked `>`
+    // instead of being shown as ordinary context lines.
     #[test]
     fn test_text_grep_truncated_match_marked_in_context() {
         let dir = make_temp_dir("trunc");
-        // 5 条连续命中，context_lines 默认 2，top-3 的窗口会覆盖全部 5 行。
+        // 5 consecutive hits; with the default context_lines of 2, the top-3
+        // window covers all 5 lines.
         fs::write(
             dir.join("f.txt"),
             "match a\nmatch b\nmatch c\nmatch d\nmatch e\n",
@@ -1060,36 +1098,37 @@ mod tests {
             "path": dir.to_string_lossy().to_string(),
         });
         let out = execute_text_grep(&args).unwrap();
-        // header 计数应为 5
+        // header count should be 5
         assert!(out.contains("5 match(es)"), "{}", out);
-        // 全部 5 行命中都应以 `>` 标注
+        // all 5 matched lines should be marked `>`
         let marked = out.lines().filter(|l| l.starts_with('>')).count();
         assert_eq!(marked, 5, "all 5 matches should be marked `>`:\n{}", out);
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // Bug 2 回归：无通配符的字面 file_pattern 必须精确匹配，不得走 ends_with。
+    // Bug 2 regression: a literal file_pattern without wildcards must match
+    // exactly, never via ends_with.
     #[test]
     fn test_glob_literal_pattern_exact_only() {
-        // `Cargo.toml` 不应匹配 `my_cargo.toml`
+        // `Cargo.toml` must not match `my_cargo.toml`
         assert!(glob_match_simple("Cargo.toml", "Cargo.toml"));
         assert!(!glob_match_simple("Cargo.toml", "my_cargo.toml"));
-        // `main.rs` 不应匹配 `domain.rs`
+        // `main.rs` must not match `domain.rs`
         assert!(glob_match_simple("main.rs", "main.rs"));
         assert!(!glob_match_simple("main.rs", "domain.rs"));
-        // `*.rs` 仍应按后缀匹配
+        // `*.rs` should still match by suffix
         assert!(glob_match_simple("*.rs", "foo.rs"));
         assert!(!glob_match_simple("*.rs", "foo.txt"));
     }
 
-    // Bug 3 回归：`?` 通配符匹配恰好一个字符。
+    // Bug 3 regression: the `?` wildcard matches exactly one character.
     #[test]
     fn test_glob_question_mark_single_char() {
         assert!(glob_match_simple("foo?bar", "fooXbar"));
         assert!(glob_match_simple("foo?bar", "foo_bar"));
-        assert!(!glob_match_simple("foo?bar", "foobar")); // ? 至少匹配一个字符
-        assert!(!glob_match_simple("foo?bar", "fooXYbar")); // ? 恰好一个字符
-        // 与 `*` 组合
+        assert!(!glob_match_simple("foo?bar", "foobar")); // ? matches at least one character
+        assert!(!glob_match_simple("foo?bar", "fooXYbar")); // ? matches exactly one character
+        // Combined with `*`
         assert!(glob_match_simple("?at.rs", "cat.rs"));
         assert!(!glob_match_simple("?at.rs", "at.rs"));
         assert!(glob_match_simple("?.rs", "a.rs"));

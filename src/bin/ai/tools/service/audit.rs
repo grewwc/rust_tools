@@ -1,16 +1,18 @@
-/// 审计模块：负责命令安全校验（注入面检查 + 分段黑名单）。
+/// Audit module: command safety validation (injection-surface checks + segment
+/// blacklists).
 ///
-/// 职责分离：
-/// - 本模块只做「校验」，不做「执行」。
-/// - `execute_command` 调用 `validate_execute_command()` 入口即可。
-/// - 便于独立测试、独立演进安全策略，不与执行逻辑耦合。
+/// Separation of concerns:
+/// - This module only "validates"; it never "executes".
+/// - `execute_command` just calls the `validate_execute_command()` entry point.
+/// - Easy to test and evolve the safety policy independently, decoupled from
+///   execution logic.
 use crate::ai::config_schema::AiConfig;
 
 // ---------------------------------------------------------------------------
-// 配置辅助
+// Config helpers
 // ---------------------------------------------------------------------------
 
-/// 从配置读取用户自定义的被禁程序列表。
+/// Read the user-configured list of denied programs.
 fn config_blocked_commands() -> Vec<String> {
     let raw = crate::commonw::configw::get_all_config().get(AiConfig::SANDBOX_BLOCKED_COMMANDS, "");
     raw.split(',')
@@ -20,7 +22,7 @@ fn config_blocked_commands() -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Shell 分段（按 `&&` / `||` / `;` / `|` / `\n` 拆分链式命令）
+// Shell segmentation (split chained commands on `&&` / `||` / `;` / `|` / `\n`)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,9 +43,11 @@ fn ampersand_is_redirection_operator(bytes: &[u8], index: usize) -> bool {
         || (index + 1 < bytes.len() && bytes[index + 1] == b'>')
 }
 
-/// 以 unquoted 的 `&&` / `||` / `;` / `|` / `\n` 为分隔符，把整条命令拆成
-/// 独立段。单/双引号内的分隔符不会触发拆分；单引号 heredoc body 内的换行也会
-/// 被跳过（heredoc body 内容是字面量，不应被拆分逻辑消费）。
+/// Split the whole command into independent segments using unquoted
+/// `&&` / `||` / `;` / `|` / `\n` as separators. Separators inside single/double
+/// quotes do not trigger a split; newlines inside a single-quoted heredoc body
+/// are skipped too (heredoc body content is literal and must not be consumed by
+/// the splitting logic).
 pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment> {
     let bytes = command.as_bytes();
     let mut segments = Vec::new();
@@ -80,7 +84,8 @@ pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment
         }
         if in_double {
             current.push(b as char);
-            // 转义字符在双引号内仅对少数字符有效；这里粗粒度跳过下一个字节即可
+            // Escape chars inside double quotes are only valid for a few
+            // characters; coarsely skipping the next byte here is enough
             if b == b'\\' && i + 1 < bytes.len() {
                 current.push(bytes[i + 1] as char);
                 i += 2;
@@ -104,7 +109,7 @@ pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment
                 i += 1;
             }
             b'\\' if i + 1 < bytes.len() => {
-                // 引号外的反斜杠转义：保留两个字节
+                // Backslash escape outside quotes: keep both bytes
                 current.push(b as char);
                 current.push(bytes[i + 1] as char);
                 i += 2;
@@ -119,7 +124,7 @@ pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment
                     i += 1;
                 }
             }
-            // 双字符操作符 `&&` / `||`
+            // Two-char operators `&&` / `||`
             b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
                 push_current(&mut segments, &mut current, current_join);
                 current_join = ShellJoin::And;
@@ -134,7 +139,7 @@ pub(crate) fn split_unquoted_command_segments(command: &str) -> Vec<ShellSegment
                 current.push('&');
                 i += 1;
             }
-            // 单字符分隔符
+            // Single-char separators
             b';' | b'|' | b'&' => {
                 push_current(&mut segments, &mut current, current_join);
                 current_join = ShellJoin::Other;
@@ -175,7 +180,7 @@ pub(crate) fn split_unquoted_segments(command: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Heredoc 解析辅助
+// Heredoc parsing helpers
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -390,7 +395,7 @@ fn validate_and_skip_heredoc_bodies(
 }
 
 // ---------------------------------------------------------------------------
-// Shell 词法分析（用于单段校验）
+// Shell lexical analysis (used for per-segment validation)
 // ---------------------------------------------------------------------------
 
 pub(crate) fn tokenize_shell_words(command: &str) -> Vec<String> {
@@ -465,7 +470,8 @@ pub(crate) fn tokenize_shell_words(command: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// 命令索引解析（跳过选项，定位到真正要执行的程序）
+// Command index resolution (skip options and locate the program that will
+// actually run)
 // ---------------------------------------------------------------------------
 
 fn is_env_assignment_word(token: &str) -> bool {
@@ -785,7 +791,8 @@ fn is_python_program(program: &str) -> bool {
     matches!(program, "python" | "python3")
 }
 
-/// 出现 `-c` / `--command`（shell）、`-c` / `-e`（解释器）这类"二次解释"选项。
+/// Presence of "second-interpretation" options: `-c` / `--command` (shells),
+/// `-c` / `-e` (interpreters).
 fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
     let is_shell = is_shell_program(program);
     let is_interpreter = is_interpreter_program(program);
@@ -801,9 +808,11 @@ fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
         if !tok.starts_with('-') || tok == "-" {
             return false;
         }
-        // 成组短选项也可能带 `-c` / `-e`（如 `bash -lc`、`perl -le`、`node -pe`）。
-        // 只匹配长度 >2 的单横线 token：`--norc` 等长选项、以及已被精确匹配的
-        // `-c` / `-e`（注意 token 已小写化，`-C` noclobber 会与 `-c` 混同，属既有误拦）不误伤。
+        // Clustered short options can also carry `-c` / `-e` (e.g. `bash -lc`,
+        // `perl -le`, `node -pe`). Match only single-dash tokens longer than 2
+        // chars: long options like `--norc`, and `-c` / `-e` already exactly
+        // matched, are not hit (note tokens are lowercased, so `-C` noclobber gets
+        // conflated with `-c` — a pre-existing false positive).
         let grouped = !tok.starts_with("--") && tok.len() > 2;
         if is_shell && (tok == "-c" || tok == "--command" || (grouped && tok.contains('c'))) {
             return true;
@@ -818,27 +827,32 @@ fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
     false
 }
 
-/// 提取 `python -c <code>` 的代码字符串（tokenizer 已去除 shell 引号）。
-/// - `Ok(None)`：没有 `-c` 选项（如 `python3 script.py` / `python3 -m mod`），不涉及代码串。
-/// - `Ok(Some(code))`：提取到字面代码串。
-/// - `Err`：出现 `-c` 但代码串无法静态获取（缺失 / 为空 / 来自 shell 变量展开），fail-closed。
+/// Extract the code string of `python -c <code>` (the tokenizer already removed
+/// shell quotes).
+/// - `Ok(None)`: no `-c` option (e.g. `python3 script.py` / `python3 -m mod`), no
+///   code string involved.
+/// - `Ok(Some(code))`: a literal code string was extracted.
+/// - `Err`: `-c` is present but the code string cannot be statically obtained
+///   (missing / empty / from shell variable expansion), fail-closed.
 fn python_c_argument(tokens: &[String]) -> Result<Option<String>, String> {
     let mut i = 1usize;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
         if tok == "--" || !tok.starts_with('-') || tok == "-" {
-            // 选项区结束，`-c` 未出现 → 普通脚本 / 模块执行。
+            // Option region ended without `-c` -> ordinary script / module
+            // execution.
             return Ok(None);
         }
-        // `-W` / `-X` / `-m` 消费一个值参数（附着形式 `-Wfoo` 或独立 `-W foo`），
-        // 值本身不是 `-c`，跳过它们继续找。
+        // `-W` / `-X` / `-m` consume one value argument (attached `-Wfoo` or
+        // separate `-W foo`); the value itself is not `-c`, so skip and keep
+        // looking.
         if matches!(tok, "-W" | "-X" | "-m")
             || tok.starts_with("-W")
             || tok.starts_with("-X")
             || tok.starts_with("-m")
         {
             if matches!(tok, "-W" | "-X" | "-m") {
-                i += 1; // 跳过值参数 token
+                i += 1; // skip the value argument token
             }
             i += 1;
             continue;
@@ -850,14 +864,15 @@ fn python_c_argument(tokens: &[String]) -> Result<Option<String>, String> {
             };
         }
         if let Some(code) = tok.strip_prefix("-c") {
-            // 附着形式 `-cCODE`。
+            // Attached form `-cCODE`.
             return if code.is_empty() {
                 Err("`-c` requires a non-empty code argument".to_string())
             } else {
                 Ok(Some(code.to_string()))
             };
         }
-        // 成组的短选项可能包含 `-c`（如 `-uc` 等价于 `-u -c`，`-Oc` 等价于 `-O -c`）。
+        // Clustered short options may contain `-c` (e.g. `-uc` equals `-u -c`,
+        // `-Oc` equals `-O -c`).
         if tok.contains('c') {
             return match tokens.get(i + 1) {
                 Some(code) => Ok(Some(code.clone())),
@@ -869,16 +884,20 @@ fn python_c_argument(tokens: &[String]) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// 校验 `python -c` 传入的代码字符串（静态、best-effort）：去空白 + 小写压平后扫描
-/// 危险原语，命中即拒绝（fail-closed）。注释 / 字符串里的字样也会被命中，属可接受的
-/// 误拦（安全优先）。
+/// Validate the code string passed to `python -c` (static, best-effort): strip
+/// whitespace, lowercase-flatten, then scan for dangerous primitives; a hit is
+/// rejected (fail-closed). Occurrences inside comments/strings are matched too —
+/// an accepted false positive (safety first).
 ///
-/// 说明：这是与整个命令审计同级的静态防线，不是沙箱——刻意混淆的代码理论上总能找到
-/// 盲点；但相比"一刀切拦截"，它把 python `-c` 从"不可审计"变为"可审计"，并覆盖
-/// 直接调用与常见混淆入口（getattr / __import__ / exec / eval / 双下划线逃逸链等）。
+/// Note: this is a static defense at the same level as the whole command audit,
+/// not a sandbox — deliberately obfuscated code can in theory always find blind
+/// spots. But compared with blanket blocking, it turns python `-c` from
+/// "unauditable" into "auditable", covering direct calls and common obfuscation
+/// entry points (getattr / __import__ / exec / eval / dunder escape chains, etc.).
 fn validate_python_code(code: &str) -> Result<(), String> {
-    // 代码串里出现 `$` / 反引号，说明内容可能来自 shell 变量展开（如
-    // `python3 -c $CODE`），审计看不到展开后的内容 → fail-closed。
+    // `$` or backticks in the code string suggest the content may come from shell
+    // variable expansion (e.g. `python3 -c $CODE`); the audit cannot see the
+    // expanded content -> fail-closed.
     if code.contains('$') || code.contains('`') {
         return Err(
             "python -c code must be a literal quoted string without shell expansion (`$`)"
@@ -895,7 +914,7 @@ fn validate_python_code(code: &str) -> Result<(), String> {
     }
 
     const DANGEROUS_PYTHON_PATTERNS: &[&str] = &[
-        // —— 执行外部命令 / 进程控制 ——
+        // —— External command execution / process control ——
         "os.system",
         "os.popen",
         "os.spawn",
@@ -906,9 +925,10 @@ fn validate_python_code(code: &str) -> Result<(), String> {
         "subprocess.",
         "importsubprocess",
         "fromsubprocess",
-        // 危险模块的任意导入形式（含 `import X as` / `from X import *`）一律拦截：
-        // 否则 `from os import system; system("...")` / `import os as o; o.system(...)`
-        // / `import os; x = os; x.system(...)` 都能绕开上面的 `os.system` 直匹配。
+        // Block every import form of dangerous modules (including `import X as` /
+        // `from X import *`): otherwise `from os import system; system("...")` /
+        // `import os as o; o.system(...)` / `import os; x = os; x.system(...)` all
+        // bypass the direct `os.system` match above.
         "importos",
         "fromos",
         "importposix",
@@ -937,12 +957,13 @@ fn validate_python_code(code: &str) -> Result<(), String> {
         "fromcommands",
         "importimportlib",
         "fromimportlib",
-        // 经 `sys.modules` 取出已加载的 os 再调用（如 `import json` 内部会加载 os）。
+        // Fetch the already-loaded os via `sys.modules` and call through it (e.g.
+        // `import json` loads os internally).
         "sys.modules",
         "commands.getoutput",
         "signal.kill",
         "pty.",
-        // —— 文件破坏 / 权限 / 所有权 / 链接 / 重命名 ——
+        // —— File destruction / permissions / ownership / links / renaming ——
         "os.remove",
         "os.unlink",
         "os.rmdir",
@@ -962,7 +983,8 @@ fn validate_python_code(code: &str) -> Result<(), String> {
         "shutil.rmtree",
         "shutil.move",
         "shutil.chown",
-        // Path(...) 方法调用形式（`.unlink()` 等）；`).replace(` 同时覆盖 os.replace。
+        // Path(...) method-call forms (`.unlink()` etc.); `).replace(` also covers
+        // os.replace.
         ").unlink(",
         ").rmdir(",
         ").rename(",
@@ -973,7 +995,8 @@ fn validate_python_code(code: &str) -> Result<(), String> {
         ").write_text(",
         ").write_bytes(",
         ").truncate(",
-        // —— 动态执行 / 动态导入（混淆与逃逸入口）——
+        // —— Dynamic execution / dynamic import (obfuscation and escape entry
+        // points) ——
         "eval(",
         "exec(",
         "execfile(",
@@ -988,7 +1011,8 @@ fn validate_python_code(code: &str) -> Result<(), String> {
         "ctypes.",
         "marshal.",
         "pickle.loads",
-        // —— 网络 / 监听（对应 shell 侧 nc / telnet / socat 黑名单）——
+        // —— Network / listening (mirrors the shell-side nc / telnet / socat
+        // blacklist) ——
         "socket.",
         "http.server",
         "baseserver",
@@ -1053,16 +1077,18 @@ fn find_has_blocked_exec_semantics(tokens: &[String]) -> Option<&str> {
 }
 
 // ---------------------------------------------------------------------------
-// Git 子命令拦截
+// Git subcommand blocking
 // ---------------------------------------------------------------------------
 
-/// 解析 `git` 子命令：跳过出现在子命令之前的 git 全局选项，返回子命令 token
-/// 在 `command_tokens`（首元素为 `git` 本身）中的索引。
+/// Parse the `git` subcommand: skip git global options appearing before the
+/// subcommand and return the index of the subcommand token in `command_tokens`
+/// (whose first element is `git` itself).
 ///
-/// 部分 git 全局选项会消费紧随其后的一个参数：`-C <path>`、`-c <name>=<value>`、
+/// Some git global options consume the argument right after them: `-C <path>`,
+/// `-c <name>=<value>`,
 /// `--git-dir <path>`、`--work-tree <path>`、`--namespace <name>`、`--exec-path <path>`。
-/// `=` 附着形式（如 `--git-dir=/repo`、`-C/repo`）不额外消费 token。
-/// `--` 之后的第一个 token 视为子命令。
+/// `=`-attached forms (e.g. `--git-dir=/repo`, `-C/repo`) consume no extra token.
+/// The first token after `--` is treated as the subcommand.
 fn git_subcommand_index(command_tokens: &[String]) -> Option<usize> {
     const VALUE_CONSUMING_LONG: &[&str] =
         &["--git-dir", "--work-tree", "--namespace", "--exec-path"];
@@ -1072,17 +1098,19 @@ fn git_subcommand_index(command_tokens: &[String]) -> Option<usize> {
         if tok == "--" {
             return command_tokens.get(i + 1).map(|_| i + 1);
         }
-        // 非 option token 即为子命令。
+        // The first non-option token is the subcommand.
         if !tok.starts_with('-') || tok == "-" {
             return Some(i);
         }
-        // `=` 附着形式自带值，无需额外消费下一 token。
+        // `=`-attached forms carry their own value; no need to consume the next
+        // token.
         if tok.contains('=') {
             i += 1;
             continue;
         }
         let lower = tok.to_ascii_lowercase();
-        // `-C` / `-c` 都消费下一参数（lower 后二者均为 `-c`）。
+        // Both `-C` and `-c` consume the next argument (after lowercasing both
+        // are `-c`).
         if lower == "-c" || VALUE_CONSUMING_LONG.contains(&lower.as_str()) {
             i += 2;
             continue;
@@ -1144,25 +1172,30 @@ pub(crate) fn command_subcommand_index(command_tokens: &[String]) -> Option<usiz
     }
 }
 
-/// 被安全策略硬拦的 `git` 子命令及其拒绝原因。
+/// `git` subcommands hard-blocked by the safety policy and their rejection
+/// reasons.
 ///
-/// `git` 本身不在 `denied_programs` 里（status/log/diff 等子命令无害且必要），
-/// 只对下列子命令硬拦。全局选项变体（如 `git -C /repo push`）同样命中。
+/// `git` itself is not in `denied_programs` (subcommands like status/log/diff are
+/// harmless and necessary); only the subcommands below are hard-blocked. Global
+/// option variants (e.g. `git -C /repo push`) hit too.
 const BLOCKED_GIT_SUBCOMMANDS: &[(&str, &str)] = &[
-    // 避免把本地提交推送到远端仓库。
+    // Prevent pushing local commits to a remote repository.
     ("push", "git push is blocked by sandbox policy"),
-    // `git stash`（含 pop/drop/clear 等子动作）会暂存甚至丢弃工作区改动，
-    // 容易丢失未提交的工作，禁止 agent 自主调用。
+    // `git stash` (including pop/drop/clear subactions) stashes or even discards
+    // working-tree changes and can easily lose uncommitted work; the agent may
+    // not invoke it on its own.
     ("stash", "git stash is blocked by sandbox policy"),
-    // `git rm` 从工作树物理删除文件，不可恢复；`git rm --cached` 仅移除 index，
-    // 但直接拦截比逐参数分析更安全。需要删除文件时请用 `trash` 等安全工具。
+    // `git rm` physically deletes files from the working tree, unrecoverable;
+    // `git rm --cached` only removes the index entry, but blocking outright is
+    // safer than per-argument analysis. Use safe tools like `trash` to delete
+    // files.
     (
         "rm",
         "git rm is blocked by sandbox policy; use trash or similar safe-delete tool",
     ),
 ];
 
-/// 若 `git` 子命令命中拦截名单，返回对应的拒绝原因。
+/// If a `git` subcommand hits the block list, return its rejection reason.
 fn blocked_git_subcommand(command_tokens: &[String]) -> Option<&'static str> {
     let idx = git_subcommand_index(command_tokens)?;
     let sub = command_tokens[idx].to_ascii_lowercase();
@@ -1172,24 +1205,30 @@ fn blocked_git_subcommand(command_tokens: &[String]) -> Option<&'static str> {
         .map(|(_, reason)| *reason)
 }
 
-/// `git` 子命令中「会不可逆地丢弃或删除未提交工作」的判定。
+/// Decide which `git` subcommands would irreversibly discard or delete
+/// uncommitted work.
 ///
-/// 与 `BLOCKED_GIT_SUBCOMMANDS`（push/stash 这类全局禁止）不同，下面这些子命令在
-/// 部分参数组合下是无害的（如 `git switch` 分支切换、`git restore --staged` 取消暂存），
-/// 因此只在「确实会销毁未提交改动（工作树/暂存区改动、未跟踪文件）」时才拦截，避免误伤
-/// 正常流程。命中返回拒绝原因。
+/// Unlike `BLOCKED_GIT_SUBCOMMANDS` (globally banned ones like push/stash), the
+/// subcommands below are harmless under some argument combinations (e.g. `git
+/// switch` branch switching, `git restore --staged` unstaging), so block only
+/// when they would truly destroy uncommitted changes (working-tree/staged
+/// changes, untracked files), avoiding collateral damage to normal workflows.
+/// Returns the rejection reason on a hit.
 ///
-/// 覆盖用户要求的「禁止 `git checkout --` 以及任何会把当前未提交文件删掉且无法回滚的命令」。
+/// Covers the user requirement "ban `git checkout --` and any command that
+/// deletes currently uncommitted files irreversibly".
 fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
     let idx = git_subcommand_index(command_tokens)?;
-    // 子命令名大小写不敏感，统一小写后匹配。
+    // Subcommand names are case-insensitive; match after lowercasing.
     let sub = command_tokens[idx].to_ascii_lowercase();
     let rest = &command_tokens[idx + 1..];
     match sub.as_str() {
-        // `git checkout <branch>`（无 `--`、无 `--force`/`-B`）由 git 自身保护未提交改动，
-        // 冲突时直接报错，放行；其余会丢弃工作树改动的形态一律拦截。
-        // 注意：短选项区分大小写，`-B`(force-create/重置分支) 与 `-b`(创建分支) 不同，
-        // 必须区分；`-f`/`--force` 强切分支同样会丢改动。
+        // `git checkout <branch>` (no `--`, no `--force`/`-B`) lets git itself
+        // protect uncommitted changes and error out on conflict — allow; other
+        // forms that discard working-tree changes are blocked. Note: short options
+        // are case-sensitive; `-B` (force-create/reset branch) differs from `-b`
+        // (create branch) and must be distinguished; `-f`/`--force`
+        // force-switching also discards changes.
         "checkout" => {
             if rest.iter().any(|t| t == "--") {
                 return Some("git checkout -- <path> discards uncommitted working-tree changes");
@@ -1204,11 +1243,12 @@ fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
                     "git checkout --force/-B discards uncommitted changes when switching branches",
                 );
             }
-            // 无 `--`、无 force 的情况下，用启发式判断是否为文件路径：
-            // 1. `.`/`..`/`./`/`../` 明显是路径形态，直接拦截。
-            // 2. 参数末尾含有文件扩展名（如 `src/main.rs`、`package.json`），
-            //    大概率是文件路径而非分支名；分支名/标签的 `.` 后缀通常是数字
-            //   （如 `v1.2.3`），不会全是字母，不会误拦。
+            // With no `--` and no force, use heuristics to detect file paths:
+            // 1. `.`/`..`/`./`/`../` are obviously path shapes — block directly.
+            // 2. An argument ending in a file extension (e.g. `src/main.rs`,
+            //    `package.json`) is most likely a file path, not a branch name;
+            //    the `.` suffix of branch/tag names is usually numeric (e.g.
+            //    `v1.2.3`), not all letters, so no false block.
             let looks_like_path = rest.iter().any(|t| {
                 if t.starts_with('-') {
                     return false;
@@ -1218,7 +1258,7 @@ fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
                     || t.starts_with("./")
                     || t.starts_with("../")
                     || t.rfind('.').map_or(false, |pos| {
-                        // 跳过 `.` 开头的隐藏文件（.gitignore 等），已在上面覆盖。
+                        // Skip dotfiles (.gitignore etc.); already covered above.
                         pos > 0 && {
                             let ext = &t[pos + 1..];
                             !ext.is_empty()
@@ -1232,9 +1272,11 @@ fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
             }
             None
         }
-        // `git switch -f`/`--force`/`--discard-changes` 强制切分支会丢弃未提交改动；
-        // `-C`/`--force-create` 在分支已存在时强制重置并切分支，同样丢弃。创建新分支
-        //（`-c`/`--create`，不带 force）是安全操作，放行。短选项区分大小写：`-C` ≠ `-c`。
+        // `git switch -f`/`--force`/`--discard-changes` force-switches and discards
+        // uncommitted changes; `-C`/`--force-create` force-resets and switches
+        // when the branch exists, also discarding. Creating a new branch (`-c`/
+        // `--create`, without force) is safe — allow. Short options are
+        // case-sensitive: `-C` ≠ `-c`.
         "switch" => {
             if rest.iter().any(|t| {
                 t == "-f"
@@ -1249,8 +1291,9 @@ fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
             }
             None
         }
-        // `git restore` 默认恢复工作树，会丢弃未提交的工作树改动；仅「只 `--staged`」是
-        // 安全的取消暂存（工作树不动、可回滚）。
+        // `git restore` defaults to restoring the working tree, discarding
+        // uncommitted working-tree changes; only "--staged alone" is a safe
+        // unstage (working tree untouched, reversible).
         "restore" => {
             if rest.iter().any(|t| t == "--worktree") {
                 return Some("git restore --worktree discards uncommitted working-tree changes");
@@ -1263,13 +1306,13 @@ fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
                 return Some("git restore --source=... discards uncommitted working-tree changes");
             }
             if has_staged {
-                // 仅取消暂存、工作树不动，可回滚，放行。
+                // Unstage only, working tree untouched, reversible — allow.
                 return None;
             }
             Some("git restore discards uncommitted working-tree changes")
         }
-        // `git reset --hard`/`--merge`/`--keep` 会丢弃工作树/暂存区改动；
-        // `--soft` 与默认（mixed）保留工作树，放行。
+        // `git reset --hard`/`--merge`/`--keep` discard working-tree/staged
+        // changes; `--soft` and the default (mixed) keep the working tree — allow.
         "reset" => {
             if rest
                 .iter()
@@ -1279,12 +1322,14 @@ fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
             }
             None
         }
-        // `git clean -f` 删除未跟踪文件，不可回滚；`-n`(dry-run) 等不实际删除，放行。
+        // `git clean -f` deletes untracked files, unrecoverable; `-n` (dry-run)
+        // and the like do not actually delete — allow.
         "clean" => {
             if rest.iter().any(|t| {
                 t == "-f"
                     || t == "--force"
-                    // 合并短选项（如 `-fd` 即 `-f -d`）里包含 `-f`，同样会真正删除文件。
+                    // A clustered short option (e.g. `-fd` = `-f -d`) containing
+                    // `-f` also truly deletes files.
                     || (t.starts_with('-') && !t.starts_with("--") && t.contains('f'))
             }) {
                 return Some("git clean -f deletes untracked files irreversibly");
@@ -1296,15 +1341,16 @@ fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
-// Shell 注入面检查
+// Shell injection-surface checks
 // ---------------------------------------------------------------------------
 
-/// 判断 `(` 是否紧跟在被转义的 `$` 之后（`\$(`）。`\$` 把 `$` 转义为字面量后，
-/// `$(...)` 不再构成命令替换；残留的 `(` 在 bash 里只会触发语法错误（不会执行子
-/// shell），因此不视为注入面。判断方式：`(` 前一字符是 `$`，且紧贴 `$` 之前的
-/// 连续反斜杠数为奇数（奇数 ⇒ `$` 被转义）。
+/// Whether `(` immediately follows an escaped `$` (`\$(`). Once `\$` escapes the
+/// `$` as a literal, `$(...)` no longer forms command substitution; the leftover
+/// `(` only triggers a syntax error in bash (no subshell executes), so it is not
+/// treated as an injection surface. Detection: the char before `(` is `$`, and
+/// the run of backslashes directly before that `$` is odd (odd ⇒ `$` is escaped).
 fn paren_follows_escaped_dollar(bytes: &[u8], i: usize) -> bool {
-    // bytes[i] == b'('；需要前一字符是 `$`。
+    // bytes[i] == b'('; the previous char must be `$`.
     if i < 2 || bytes[i - 1] != b'$' {
         return false;
     }
@@ -1325,8 +1371,9 @@ fn paren_follows_escaped_dollar(bytes: &[u8], i: usize) -> bool {
     backslashes % 2 == 1
 }
 
-/// 查找 shell 结构中与 `open_idx` 处左括号配对的右括号。
-/// 引号内和反斜杠转义后的括号按字面量处理。
+/// Find the closing bracket pairing the left bracket at `open_idx` in the shell
+/// structure. Brackets inside quotes or after backslash escapes are treated as
+/// literals.
 fn find_matching_shell_paren(command: &str, open_idx: usize) -> Option<usize> {
     let bytes = command.as_bytes();
     if bytes.get(open_idx) != Some(&b'(') {
@@ -1396,9 +1443,11 @@ struct ShellWordSpan {
     end: usize,
 }
 
-/// 解析仅供受限文件读取替换使用的外层 shell 单词。这里刻意不复用
-/// `tokenize_shell_words`：后者会抹掉引号来源，无法证明 `$()` 确实位于一个完整的
-/// 双引号单词里。只接受无控制运算符、无转义、无额外活动展开的简单命令行。
+/// Parse the outer shell word used only for restricted file-read substitution.
+/// Deliberately does not reuse `tokenize_shell_words`: that would erase quote
+/// provenance, making it impossible to prove the `$()` really sits inside one
+/// complete double-quoted word. Only simple command lines without control
+/// operators, escapes, or extra active expansions are accepted.
 fn restricted_outer_shell_words(command: &str) -> Option<(Vec<ShellWordSpan>, Vec<usize>)> {
     if command.bytes().any(|b| matches!(b, b'\n' | b'\r')) {
         return None;
@@ -1431,7 +1480,8 @@ fn restricted_outer_shell_words(command: &str) -> Option<(Vec<ShellWordSpan>, Ve
             if in_double {
                 match b {
                     b'"' => in_double = false,
-                    // 受限语法不接受反斜杠或反引号，避免它们改变引号和展开语义。
+                    // The restricted grammar rejects backslashes and backticks,
+                    // so they cannot alter quoting or expansion semantics.
                     b'\\' | b'`' => return None,
                     b'$' => {
                         if bytes.get(i + 1) != Some(&b'(') {
@@ -1450,7 +1500,8 @@ fn restricted_outer_shell_words(command: &str) -> Option<(Vec<ShellWordSpan>, Ve
             match b {
                 b'\'' => in_single = true,
                 b'"' => in_double = true,
-                // 外层不允许会改变命令结构、触发展开或 glob 的字符。
+                // The outer word must not contain chars that change command
+                // structure or trigger expansion or globbing.
                 b'\\' | b'`' | b'$' | b'(' | b')' | b'{' | b'}' | b';' | b'&' | b'|' | b'<'
                 | b'>' | b'*' | b'?' | b'[' => return None,
                 _ => {}
@@ -1465,8 +1516,9 @@ fn restricted_outer_shell_words(command: &str) -> Option<(Vec<ShellWordSpan>, Ve
     Some((words, active_dollars))
 }
 
-/// 仅允许 ASCII 绝对路径，且不允许空、`.`、`..` 组件；这让 `cat` 的参数不含任何
-/// shell 展开、选项或额外命令片段。
+/// Allow only ASCII absolute paths and forbid empty, `.`, and `..` components;
+/// this keeps `cat`'s argument free of any shell expansion, options, or extra
+/// command fragments.
 fn is_literal_absolute_path(path: &str) -> bool {
     if !path.starts_with('/')
         || !path
@@ -1482,7 +1534,8 @@ fn is_literal_absolute_path(path: &str) -> bool {
             .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
-/// 无害 shell 替换的种类：优先尝试字面量文件读取（不执行 shell），否则执行无害命令并捕获输出。
+/// Kinds of harmless shell substitutions: prefer literal file reads (no shell
+/// runs), otherwise run a harmless command and capture its output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SafeShellSubstitutionKind {
     FileRead { path: String },
@@ -1496,14 +1549,19 @@ pub(crate) struct SafeShellSubstitution {
     pub(crate) kind: SafeShellSubstitutionKind,
 }
 
-/// 识别简单外层命令中的无害 `"$(...)"` 替换并分类。
+/// Recognize and classify harmless `"$(...)"` substitutions in a simple outer
+/// command.
 ///
-/// - 外层必须使用受限语法：无控制运算符、无转义、无额外活动展开，
-///   且每个 `$()` 都是完整双引号单词 `"$(inner)"`。
-/// - `inner` 若为 `cat /绝对路径字面量` 则走文件读取路径（不经过 shell 执行）。
-/// - 否则若 `inner` 本身能通过 `validate_execute_command`（即按现有黑名单被判定为无害），
-///   则视为可执行的无害命令替换。
-/// - 只要有一个 `$()` 不满足上述两类，就整体视为不安全，返回空以便上层注入校验拦截。
+/// - The outer command must use the restricted grammar: no control operators, no
+///   escapes, no extra active expansions, and every `$()` must be a complete
+///   double-quoted word `"$(inner)"`.
+/// - If `inner` is `cat /absolute/path/literal`, take the file-read path (no
+///   shell execution).
+/// - Otherwise, if `inner` itself passes `validate_execute_command` (i.e. is
+///   judged harmless by the existing blacklist), treat it as an executable
+///   harmless command substitution.
+/// - If any `$()` fails both categories above, the whole thing is unsafe; return
+///   empty so the upper injection validation can block it.
 pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstitution> {
     let Some((words, active_dollars)) = restricted_outer_shell_words(command) else {
         return Vec::new();
@@ -1558,15 +1616,19 @@ pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstituti
     substitutions
 }
 
-/// 检查命令字符串中是否存在不安全的 shell 注入面。
+/// Check whether the command string contains an unsafe shell injection surface.
 ///
-/// 本函数是 **shell-specific** 的安全检查，只应对经 shell 解释执行的命令
-///（即 `execute_command` 工具）调用。对于非 shell 的工具（如 `write_file`、
-/// `apply_patch` 等纯字符串操作），不应应用本检查——它们是直接写入文件系统
-/// 或做文本替换，不会把参数喂给 shell 解释，`<<` / `$()` 只是普通文本。
+/// This function is a **shell-specific** safety check and should only be called
+/// for commands executed through a shell (i.e. the `execute_command` tool). For
+/// non-shell tools (pure string operations like `write_file`, `apply_patch`),
+/// do not apply this check — they write the filesystem or do text replacement
+/// directly and never feed arguments to a shell, so `<<` / `$()` are just plain
+/// text.
 ///
-/// 命令替换（`$(...)` / `` `...` ``）可能在运行时生成 program 名，继续禁止。
-/// 进程替换 `<(...)` / `>(...)` 则递归校验内部命令后放行，避免误伤 diff/sort 等常见用法。
+/// Command substitution (`$(...)` / `` `...` ``) can generate the program name at
+/// runtime and stays banned. Process substitution `<(...)` / `>(...)` is allowed
+/// after recursively validating the inner command, avoiding false blocks on
+/// common usages like diff/sort.
 fn validate_no_injection_surface(command: &str) -> Result<(), String> {
     let bytes = command.as_bytes();
     let mut i = 0;
@@ -1583,7 +1645,8 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
             i += 1;
             continue;
         }
-        // 单引号内的所有内容都是字面量，shell 不会解析 $() / `。
+        // Everything inside single quotes is a literal; the shell does not parse
+        // $() or backticks.
         if in_single {
             if b == b'\'' {
                 in_single = false;
@@ -1591,7 +1654,8 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
             i += 1;
             continue;
         }
-        // 双引号内 `<(` / `>(` 只是普通文本，但 `$()` / `` `...` `` 仍可能生效，因此后面继续做拦截。
+        // Inside double quotes `<(` / `>(` are plain text, but `$()` / `` `...` ``
+        // can still take effect, so blocking continues below.
         if in_double {
             match b {
                 b'\\' => {
@@ -1641,12 +1705,15 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
                 continue;
             }
         }
-        // 命令替换 `$(`
+        // Command substitution `$(`
         if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
-            // 算术展开 `$(( ... ))` 不执行任何命令，是无害的（典型：`echo $((RANDOM % 20))`），
-            // 不应被命令替换规则误杀。压入算术深度后继续向内扫描——这样真正内嵌的
-            // 命令替换（如 `$(( $(whoami) ))` 里的 `$(`）仍会在后续迭代被命中拦下，
-            // 而结尾的 `))` 与内部分组括号由下方的 arith_depth 分支正确放行。
+            // Arithmetic expansion `$(( ... ))` executes no commands and is
+            // harmless (typical: `echo $((RANDOM % 20))`); it must not be falsely
+            // killed by the command-substitution rule. Push the arithmetic depth
+            // and keep scanning inward — genuinely nested command substitutions
+            // (like the `$(` inside `$(( $(whoami) ))`) still get caught in later
+            // iterations, while the trailing `))` and inner grouping parens are
+            // correctly allowed by the arith_depth branch below.
             if i + 2 < bytes.len() && bytes[i + 2] == b'(' {
                 arith_depth += 1;
                 i += 3;
@@ -1657,8 +1724,10 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
                     .to_string(),
             );
         }
-        // 进程替换 `<(...)` / `>(...)` 只在引号外有 shell 语义。递归校验其中的完整
-        // 命令，而不是无差别禁止；这样安全命令可用，`<(rm ...)` 等仍会被原有规则拦截。
+        // Process substitution `<(...)` / `>(...)` has shell semantics only
+        // outside quotes. Recursively validate the full inner command instead of
+        // banning indiscriminately; safe commands stay usable while `<(rm ...)`
+        // etc. are still caught by the existing rules.
         if !in_double && (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             let close = find_matching_shell_paren(command, i + 1).ok_or_else(|| {
                 "unterminated process substitution `<(...)` / `>(...)`".to_string()
@@ -1669,12 +1738,16 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
             i = close + 1;
             continue;
         }
-        // 未引用的 `(` / `)` / `{` / `}` 开启子 shell 或命令分组（如 `(rm -rf /tmp)`、
-        // `{ rm -rf /tmp; }`），会绕过分段黑名单验证。
-        // `$(` / `$((` / `<(` / `>(` 已在上方单独处理，此处拦截裸 `(` / `)` / `{` / `}`。
-        // 但算术展开 `$(( ... ))` 内部的 `(` / `)` 只是分组括号、`))` 用于闭合算术展开，
-        // 都不构成子 shell；`\$(` 中 `$` 已被转义为字面量，残留 `(` 只是 bash 语法错误，
-        // 同样不执行子 shell——这两种情况都要放行。
+        // Unquoted `(` / `)` / `{` / `}` open a subshell or command grouping
+        // (e.g. `(rm -rf /tmp)`, `{ rm -rf /tmp; }`), bypassing segment-blacklist
+        // validation.
+        // `$(` / `$((` / `<(` / `>(` are handled separately above; block bare
+        // `(` / `)` / `{` / `}` here.
+        // But the `(` / `)` inside arithmetic expansion `$(( ... ))` are just
+        // grouping parens and `))` closes the expansion — neither forms a
+        // subshell; in `\$(` the `$` is escaped as a literal and the leftover `(`
+        // is only a bash syntax error, which likewise executes no subshell — allow
+        // both cases.
         if !in_double && matches!(b, b'(' | b')' | b'{' | b'}') {
             if arith_depth > 0 && matches!(b, b'(' | b')') {
                 if b == b')' && i + 1 < bytes.len() && bytes[i + 1] == b')' {
@@ -1715,7 +1788,7 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 分段级校验入口
+// Segment-level validation entry
 // ---------------------------------------------------------------------------
 
 fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -1734,9 +1807,10 @@ fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
     normalized
 }
 
-/// 展开参数开头的 `~` / `$HOME`。home 本身及其子路径属于正常开发访问；仅拒绝
-/// 通过 `..` 从 home 目录向外逃逸。`~other` 不在 shell 的当前用户 home 语义内，
-/// 留给 shell 自身处理。
+/// Expand a leading `~` / `$HOME` in the argument. The home directory itself and
+/// its subpaths are normal development access; only escaping outward from home
+/// via `..` is rejected. `~other` is outside the shell's current-user home
+/// semantics and is left to the shell itself.
 fn expand_tilde_and_home(arg: &str) -> Result<String, String> {
     let home = if arg == "~" || arg.starts_with("~/") {
         std::env::var("HOME")
@@ -1763,7 +1837,7 @@ fn expand_tilde_and_home(arg: &str) -> Result<String, String> {
     }
 }
 
-/// 对单段命令做 program/参数级黑名单校验。
+/// Validate a single command segment against the program/argument blacklist.
 fn validate_single_segment(command: &str) -> Result<(), String> {
     let command = command.trim();
     if command.is_empty() {
@@ -1786,16 +1860,19 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
     let command_tokens = &lower_tokens[command_idx..];
     let raw_command_tokens = &tokens[command_idx..];
     let program = command_tokens[0].as_str();
-    // 对程序路径取 basename，防止 `/bin/rm`、`./rm` 等绝对/相对路径绕过黑名单。
+    // Take the basename of the program path so `/bin/rm`, `./rm` and other
+    // absolute/relative paths cannot bypass the blacklist.
     let program_basename = std::path::Path::new(program)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(program);
-    // 后续所有比较统一使用 basename，确保 `/bin/rm` 与 `rm` 被同等对待。
+    // All later comparisons use the basename uniformly, so `/bin/rm` and `rm`
+    // are treated alike.
     let program = program_basename;
     let extra_blocked = config_blocked_commands();
-    // ---- tilde / $HOME 逃逸检测 ----
-    // home 与其子路径可正常访问；仅拒绝 `~/..` / `$HOME/..` 向外逃逸。
+    // ---- tilde / $HOME escape detection ----
+    // home and its subpaths are normally accessible; only `~/..` / `$HOME/..`
+    // escapes outward are rejected.
     {
         for token in raw_command_tokens.iter().skip(1) {
             if token.starts_with('-') {
@@ -1910,12 +1987,13 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         "ssh",
         "scp",
         "rsync",
-        // 绕过手段：`eval` / `source` / `.` 会把后续字符串当 shell 代码再次
-        // 解释，等于把验证完全 bypass 掉。
+        // Bypass vector: `eval` / `source` / `.` re-interpret the following string
+        // as shell code, completely bypassing validation.
         "eval",
         "source",
         ".",
-        // 反向 shell / 网络监听工具，正当 dev 流程几乎不会用，留着风险大于收益。
+        // Reverse-shell / network-listening tools: legitimate dev workflows almost
+        // never need them; the risk outweighs the benefit.
         "nc",
         "ncat",
         "netcat",
@@ -1926,43 +2004,50 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         return Err(format!("program '{program}' is blocked"));
     }
 
-    // 用户可通过 `ai.sandbox.blocked_commands` 追加自定义黑名单程序。
+    // Users can add custom blacklist programs via `ai.sandbox.blocked_commands`.
     if extra_blocked.iter().any(|p| p == program) {
         return Err(format!(
             "program '{program}' is blocked by sandbox policy (ai.sandbox.blocked_commands)"
         ));
     }
 
-    // 安全策略：拦截有破坏性/越权风险的 `git` 子命令（见 `BLOCKED_GIT_SUBCOMMANDS`）。
-    // `git` 本身不在 denied_programs 里（status/log/diff 等子命令无害且必要），
-    // 只对名单内的子命令硬拦。全局选项变体（`git -C /repo push`）同样命中。
+    // Safety policy: block destructive/privilege-escalating `git` subcommands
+    // (see `BLOCKED_GIT_SUBCOMMANDS`).
+    // `git` itself is not in denied_programs (subcommands like status/log/diff are
+    // harmless and necessary); only the listed subcommands are hard-blocked.
+    // Global option variants (`git -C /repo push`) hit too.
     if program == "git" {
         if let Some(reason) = blocked_git_subcommand(command_tokens) {
             return Err(reason.to_string());
         }
-        // 用原始大小写 token 调用，以区分 `-B`/`-b`、`-C`/`-c` 这类大小写敏感的短选项。
+        // Call with the original-case tokens to distinguish case-sensitive short
+        // options like `-B`/`-b` and `-C`/`-c`.
         if let Some(reason) = blocked_git_destructive(raw_command_tokens) {
             return Err(reason.to_string());
         }
     }
 
-    // `bash -c "..."` / `sh -c` / `zsh -c` 这种"二次解释"把字符串当 shell 代码执行，
-    // 等于绕过分段黑名单，一律拦截。直接执行脚本（`bash script.sh`）仍然允许。
+    // "Second interpretation" like `bash -c "..."` / `sh -c` / `zsh -c` executes
+    // the string as shell code, bypassing the segment blacklist — block outright.
+    // Running scripts directly (`bash script.sh`) is still allowed.
     if is_shell_program(program) && shell_c_option_present(program, command_tokens) {
         return Err(format!(
             "shell `{program} -c ...` re-interprets a string as shell code; \
              run the literal command directly instead"
         ));
     }
-    // `python -c '...'` 的代码串同样会被当成程序执行，但代码串本身可以静态校验
-    // （validate_python_code）：干净放行、命中危险原语拦截——比一刀切拦截更可用，
-    // 且不弱于原保证。提取不到代码串（缺失 / shell 变量展开）时 fail-closed。
-    // 其他解释器（perl / ruby / node / php / awk / lua）没有对应扫描器，保持原样拦截。
+    // The code string of `python -c '...'` is likewise executed as a program, but
+    // it can be validated statically (validate_python_code): clean strings pass,
+    // hits on dangerous primitives are blocked — more usable than blanket
+    // blocking and no weaker than the original guarantee. fail-closed when the
+    // code string cannot be extracted (missing / shell variable expansion).
+    // Other interpreters (perl / ruby / node / php / awk / lua) have no matching
+    // scanner and stay blocked as before.
     if is_python_program(program) {
         match python_c_argument(command_tokens) {
             Ok(Some(code)) => validate_python_code(&code)?,
-            // 无 `-c`：`python3 script.py` / `python3 -m mod`，与 `bash run.sh` 同级，
-            // 不审计脚本文件内容。
+            // No `-c`: `python3 script.py` / `python3 -m mod`, same tier as
+            // `bash run.sh`; script file contents are not audited.
             Ok(None) => {}
             Err(reason) => {
                 return Err(format!(
@@ -1978,8 +2063,9 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         ));
     }
 
-    // `find` 的 `-delete` / `-exec*` / `-ok*` 只有在作为真正 primary 时才有危险语义。
-    // 若它们只是 `-name '-delete'` 之类 pattern 参数，不应误拦。
+    // `find`'s `-delete` / `-exec*` / `-ok*` are dangerous only when they act as a
+    // real primary. When they are merely pattern arguments like `-name
+    // '-delete'`, they must not be falsely blocked.
     if program == "find" {
         if let Some(flag) = find_has_blocked_exec_semantics(command_tokens) {
             return Err(format!(
@@ -1988,8 +2074,10 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         }
     }
 
-    // 常见包装器会把后续 token 当作真正要执行的程序；只检查"将被执行的那个程序名"，
-    // 避免把普通内容参数（如 `printf '%s' rm` 里的 `rm`）误判为危险命令。
+    // Common wrappers treat later tokens as the program that will actually run;
+    // check only "the program name that will be executed", avoiding misjudging
+    // ordinary content arguments (like the `rm` inside `printf '%s' rm`) as
+    // dangerous commands.
     const DANGEROUS_PROGRAM_NAMES: &[&str] = &[
         "rm",
         "mv",
@@ -2023,8 +2111,9 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
                 "indirect execution of '{nested}' via '{program}' is blocked"
             ));
         }
-        // 间接执行被拦的 `git` 子命令（如 `env git push`、`xargs git stash`）同样需要拦截，
-        // 否则可借包装器绕过直接的检查。
+        // Indirectly executing a blocked `git` subcommand (e.g. `env git push`,
+        // `xargs git stash`) must be blocked too, otherwise wrappers bypass the
+        // direct check.
         if nested == "git" {
             if let Some(reason) = blocked_git_subcommand(&command_tokens[idx..]) {
                 return Err(reason.to_string());
@@ -2033,8 +2122,9 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
                 return Err(reason.to_string());
             }
         }
-        // 间接执行的解释器 `-c` / `-e` 同样要校验，否则 `env bash -c '...'` /
-        // `env perl -e '...'` / `xargs python3 -c '...'` 可借包装器绕开直接路径的拦截。
+        // Interpreter `-c` / `-e` behind wrappers needs the same validation,
+        // otherwise `env bash -c '...'` / `env perl -e '...'` /
+        // `xargs python3 -c '...'` bypass the direct-path block via the wrapper.
         if is_python_program(nested) {
             match python_c_argument(&command_tokens[idx..]) {
                 Ok(Some(code)) => validate_python_code(&code)?,
@@ -2054,8 +2144,9 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         }
     }
 
-    // 叠层包装（`nohup env python3 -c '...'`、`env env bash -c '...'`）会逐层绕过
-    // 上面的单层间接检查：用 effective_command_tokens 深解到最内层命令再校验一次。
+    // Layered wrappers (`nohup env python3 -c '...'`, `env env bash -c '...'`)
+    // peel past the single-level indirect checks above: deep-unwrap to the
+    // innermost command with effective_command_tokens and validate once more.
     let effective = effective_command_tokens(command);
     if let Some(eff_program) = effective.first() {
         if is_python_program(eff_program) {
@@ -2082,24 +2173,27 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
 }
 
 // =========================================================================
-// 公开入口
+// Public entry point
 // =========================================================================
 
-/// 校验一条完整命令（含链式 `&&` / `||`）的安全性。
+/// Validate the safety of one complete command (including chained `&&` / `||`).
 ///
-/// 这是审计模块的唯一公开入口，`execute_command` 调用此函数即可。
+/// This is the audit module's single public entry point; `execute_command` just
+/// calls it.
 pub(crate) fn validate_execute_command(command: &str) -> Result<(), String> {
     let command = command.trim();
     if command.is_empty() {
         return Err("empty command".to_string());
     }
 
-    // 第一道防线：阻断 shell 注入面（命令替换 / 进程替换）。
-    // 这些放过去，分段黑名单就是摆设。
+    // First line of defense: block shell injection surfaces (command substitution
+    // / process substitution). Letting these through renders the segment
+    // blacklist pointless.
     validate_no_injection_surface(command)?;
 
-    // 第二道防线：把链式命令拆段，对每一段都跑一次 program/参数黑名单。
-    // 这样 `echo ok && rm -rf /` 会在第二段被 `rm` 黑名单命中。
+    // Second line of defense: split the chained command into segments and run the
+    // program/argument blacklist on each one. That way `echo ok && rm -rf /` is
+    // caught by the `rm` blacklist in the second segment.
     let segments = split_unquoted_segments(command);
     if segments.is_empty() {
         return Err("empty command".to_string());
@@ -2279,7 +2373,8 @@ mod tests {
 
     #[test]
     fn injection_treats_single_quoted_as_literal() {
-        // 整段在单引号内的 `$()` 是字面量，bash 不会展开。
+        // A `$()` entirely inside single quotes is a literal; bash does not
+        // expand it.
         assert!(validate_no_injection_surface("echo 'price: $(100)'").is_ok());
         assert!(validate_no_injection_surface("echo '`whoami`'").is_ok());
     }
@@ -2368,7 +2463,8 @@ mod tests {
 
     #[test]
     fn detects_literal_file_read_substitution_for_any_simple_outer_command() {
-        // safe_shell_substitutions 的 FileRead 分支（已取代删除的 safe_file_read_substitutions）
+        // The FileRead branch of safe_shell_substitutions (replaced the removed
+        // safe_file_read_substitutions)
         let substitutions = safe_shell_substitutions(
             r#"curl --data "$(cat /tmp/request.json)" https://example.test/api"#,
         );
@@ -2398,10 +2494,11 @@ mod tests {
             safe_shell_substitutions(r#"echo "$(cat /tmp/a)" "$(cat /tmp/b)""#).len(),
             2
         );
-        // 外层带管道/连接符 → 整个命令不识别为安全替换
+        // Outer pipes/connectors -> the whole command is not recognized as a safe
+        // substitution
         assert!(safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" | jq ."#).is_empty());
         assert!(safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" && id"#).is_empty());
-        // 非完整单词的 $() 仍是注入面
+        // A $() that is not a complete word is still an injection surface
         assert!(validate(r#"echo "$(cat /tmp/dsl.json)""#).is_err());
         assert!(validate(r#"bytedcli --dsl "prefix$(cat /tmp/dsl.json)""#).is_err());
         assert!(validate(r#"bytedcli --dsl "$(cat /tmp/dsl.json)suffix""#).is_err());
@@ -2409,7 +2506,8 @@ mod tests {
 
     #[test]
     fn file_read_substitution_requires_one_literal_absolute_path() {
-        // 非绝对、非字面路径不得物化为 FileRead（可回退为经 validate 的无害 Command）
+        // Non-absolute, non-literal paths must not materialize as FileRead (may
+        // fall back to a validate-passed harmless Command)
         for command in [
             r#"echo "$(cat /tmp/a /tmp/b)""#,
             r#"echo "$(cat $HOME/a)""#,
@@ -2426,7 +2524,7 @@ mod tests {
                 "unsafe cat path must not be materialized as FileRead: {command}"
             );
         }
-        // 嵌套 $() 整体拒绝
+        // Nested $() rejected as a whole
         assert!(safe_shell_substitutions(r#"echo "$(cat /tmp/a$(id))""#).is_empty());
     }
 
@@ -2447,7 +2545,8 @@ mod tests {
 
     #[test]
     fn allows_subcommand_patterns_that_resemble_blocked_programs() {
-        // `git rm` 现在被 BLOCKED_GIT_SUBCOMMANDS 拦截（不可恢复删除）。
+        // `git rm` is now blocked by BLOCKED_GIT_SUBCOMMANDS (unrecoverable
+        // deletion).
         assert!(validate("git rm file.txt").is_err());
         assert!(validate("git mv old.txt new.txt").is_ok());
         assert!(validate("docker rm my_container").is_ok());
@@ -2537,7 +2636,7 @@ mod tests {
         assert!(validate(r#"find . -name "-delete" -print"#).is_ok());
         assert!(validate(r#"find . -name "-exec" -print"#).is_ok());
         assert!(validate(r#"find . -printf "-delete\n""#).is_ok());
-        // `git rm` 现在被 BLOCKED_GIT_SUBCOMMANDS 拦截。
+        // `git rm` is now blocked by BLOCKED_GIT_SUBCOMMANDS.
         assert!(validate("git rm file.txt").is_err());
         assert!(validate("docker rm container").is_ok());
         assert!(validate("npm rm pkg").is_ok());
@@ -2583,7 +2682,7 @@ mod tests {
         assert!(validate("echo 'literal $(x)'").is_ok());
     }
 
-    // ---- tilde / $HOME 逃逸检测 ----
+    // ---- tilde / $HOME escape detection ----
 
     #[test]
     fn home_paths_are_allowed() {
@@ -2594,7 +2693,8 @@ mod tests {
 
     #[test]
     fn tilde_escape_to_parent_dir_blocked() {
-        // cwd=/Users/bytedance/rust_tools → ~/.. 遍历到 /Users/bytedance → /Users → /
+        // cwd=/Users/bytedance/rust_tools -> ~/.. walks up to /Users/bytedance ->
+        // /Users -> /
         assert!(validate("cp foo.txt ~/../..").is_err());
         assert!(validate("cp foo.txt ~/..").is_err());
     }
@@ -2609,7 +2709,7 @@ mod tests {
         assert!(validate("cp foo.txt $HOME/../../..").is_err());
     }
 
-    // ---- python -c 代码串审计 ----
+    // ---- python -c code-string audit ----
 
     #[test]
     fn python_dash_c_clean_code_allowed() {
@@ -2638,32 +2738,35 @@ mod tests {
         assert!(validate("python3 -c 'import socket; socket.socket()'").is_err());
         assert!(validate("python3 -c 'ctypes.CDLL(None).system(\"id\")'").is_err());
         assert!(validate("python3 -c 'Path(\"x\").unlink()'").is_err());
-        // 危险模块的任意导入形式（from-import / 别名 / 变量复制 / sys.modules）。
+        // Every import form of dangerous modules (from-import / aliasing /
+        // variable copy / sys.modules).
         assert!(validate("python3 -c 'from os import system; system(\"rm -rf /\")'").is_err());
         assert!(validate("python3 -c 'import os as o; o.system(\"id\")'").is_err());
         assert!(validate("python3 -c 'import os; x = os; x.system(\"id\")'").is_err());
         assert!(validate("python3 -c 'import sys; sys.modules[\"os\"].system(\"id\")'").is_err());
         assert!(validate("python3 -c 'import posix; posix.system(\"id\")'").is_err());
         assert!(validate("python3 -c 'import signal; signal.kill(1, 9)'").is_err());
-        // 常见混淆：去掉空白 / 改大小写后仍能命中。
+        // Common obfuscations: still hit after stripping whitespace / changing
+        // case.
         assert!(validate("python3 -c 'os . system(\"id\")'").is_err());
         assert!(validate("python3 -c 'OS.SYSTEM(\"id\")'").is_err());
-        // 成组短选项 `-uc` 等价于 `-u -c`。
+        // Clustered short option `-uc` equals `-u -c`.
         assert!(validate("python3 -uc 'os.system(\"id\")'").is_err());
-        // `__subclasses__` 沙箱逃逸链。
+        // The `__subclasses__` sandbox escape chain.
         assert!(validate("python3 -c '().__class__.__bases__[0].__subclasses__()'").is_err());
     }
 
     #[test]
     fn python_dash_c_unverifiable_code_blocked() {
-        // 代码来自 shell 变量展开，无法静态验证 → fail-closed。
+        // Code comes from shell variable expansion, statically unverifiable ->
+        // fail-closed.
         assert!(validate("python3 -c $CODE").is_err());
         assert!(validate("CODE=x python3 -c $CODE").is_err());
         assert!(validate("python3 -c \"$CODE\"").is_err());
-        // 缺失 / 空代码。
+        // Missing / empty code.
         assert!(validate("python3 -c").is_err());
         assert!(validate("python3 -c ''").is_err());
-        // 成组短选项里带 `-c` 但缺代码。
+        // Clustered short options carrying `-c` without code.
         assert!(validate("python3 -uc").is_err());
     }
 
@@ -2676,14 +2779,15 @@ mod tests {
 
     #[test]
     fn grouped_short_options_caught() {
-        // 成组短选项同样会带出 `-c` / `-e`：`bash -lc` / `perl -le` / `node -pe` /
-        // `ruby -ne` 与 `-c` / `-e` 等价，不能放行。
+        // Clustered short options can smuggle `-c` / `-e` too: `bash -lc` /
+        // `perl -le` / `node -pe` / `ruby -ne` are equivalent to `-c` / `-e` and
+        // must not pass.
         assert!(validate("bash -lc 'rm -rf /'").is_err());
         assert!(validate("perl -le 'system(\"rm -rf /\")'").is_err());
         assert!(validate("node -pe 'require(\"child_process\").execSync(\"id\")'").is_err());
         assert!(validate("ruby -ne 'puts 1'").is_err());
-        // 不带 `-c` / `-e` 的合法短选项不受影响（`-e` 对 shell 是 errexit，不是代码；
-        // `--norc` 是长选项）。
+        // Legitimate short options without `-c` / `-e` are unaffected (`-e` on a
+        // shell is errexit, not code; `--norc` is a long option).
         assert!(validate("bash -e script.sh").is_ok());
         assert!(validate("bash --norc script.sh").is_ok());
         assert!(validate("perl -w script.pl").is_ok());
@@ -2691,16 +2795,17 @@ mod tests {
 
     #[test]
     fn indirect_interpreter_dash_c_audited() {
-        // 干净的间接 python -c 仍然放行。
+        // Clean indirect python -c still passes.
         assert!(validate("env python3 -c 'print(1)'").is_ok());
         assert!(validate("nohup env python3 -c 'print(1)'").is_ok());
         assert!(validate("env env python3 -c 'print(1)'").is_ok());
-        // 包装器不再能借 `-c` 绕过校验。
+        // Wrappers can no longer bypass validation via `-c`.
         let err = validate("env python3 -c 'os.system(\"id\")'").unwrap_err();
         assert!(err.contains("blocked primitive"), "got: {err}");
         assert!(validate("xargs python3 -c 'os.system(\"id\")'").is_err());
         assert!(validate("nohup python3 -c 'os.system(\"id\")'").is_err());
-        // 叠层包装（`nohup env python3 -c ...`）同样被深解拦截。
+        // Layered wrappers (`nohup env python3 -c ...`) are likewise caught by
+        // deep unwrapping.
         assert!(validate("nohup env python3 -c 'os.system(\"id\")'").is_err());
         assert!(validate("env bash -c 'echo ok && rm -rf /'").is_err());
         assert!(validate("timeout 10 bash -c 'rm -rf /'").is_err());

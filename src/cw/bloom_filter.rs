@@ -1,83 +1,91 @@
-//! 布隆过滤器（Bloom Filter）实现
+//! Bloom filter implementation.
 //!
-//! 布隆过滤器是一种空间效率很高的概率型数据结构，用于测试一个元素是否在一个集合中。
-//! 它可能会产生假阳性（false positive），但不会产生假阴性（false negative）。
+//! A bloom filter is a highly space-efficient probabilistic data structure for
+//! testing whether an element is in a set. It may produce false positives, but
+//! never produces false negatives.
 
 use std::hash::{Hash, Hasher};
 
 use rustc_hash::FxHasher;
 
-/// 布隆过滤器（Bloom Filter）
+/// A bloom filter.
 ///
-/// 布隆过滤器是一种空间效率很高的概率型数据结构，用于测试一个元素是否在一个集合中。
+/// A bloom filter is a highly space-efficient probabilistic data structure for
+/// testing whether an element is in a set.
 ///
-/// ## 特性
+/// ## Features
 ///
-/// - **可能产生假阳性**：如果 `contains` 返回 `true`，元素可能存在集合中（但不一定）
-/// - **不会产生假阴性**：如果 `contains` 返回 `false`，元素一定不在集合中
-/// - **空间效率高**：比传统的 HashSet 等结构占用更少的内存
+/// - **May produce false positives**: if `contains` returns `true`, the element
+///   may be in the set (not guaranteed)
+/// - **Never produces false negatives**: if `contains` returns `false`, the
+///   element is definitely not in the set
+/// - **Space-efficient**: uses less memory than structures like a plain HashSet
 ///
-/// ## 工作原理
+/// ## How it works
 ///
-/// 布隆过滤器使用一个位数组和多个哈希函数。当插入一个元素时，使用多个哈希函数
-/// 计算出多个位置，并将这些位置的位设置为 1。当查询一个元素时，同样计算这些位置，
-/// 如果所有位置都是 1，则认为元素可能存在。
+/// A bloom filter uses a bit array and several hash functions. When inserting
+/// an element, the hash functions compute multiple positions and set those
+/// bits to 1. When querying an element, the same positions are computed; if
+/// all of them are 1, the element may be present.
 ///
-/// ## 创建方式
+/// ## Construction
 ///
-/// 有两种创建布隆过滤器的方式：
+/// There are two ways to create a bloom filter:
 ///
-/// 1. [`BloomFilter::new`] - 直接指定位数和哈希函数数量
-/// 2. [`BloomFilter::with_rate`] - 指定期望元素数量和假阳性率，自动计算最优参数
+/// 1. [`BloomFilter::new`] - specify the bit count and hash function count directly
+/// 2. [`BloomFilter::with_rate`] - specify the expected item count and
+///   false-positive rate; optimal parameters are computed automatically
 ///
-/// # 示例
+/// # Examples
 ///
 /// ```rust
 /// use rust_tools::cw::BloomFilter;
 ///
-/// // 方式 1：直接指定参数
-/// let mut bf = BloomFilter::new(1000, 3); // 1000 位，3 个哈希函数
+/// // Approach 1: specify parameters directly
+/// let mut bf = BloomFilter::new(1000, 3); // 1000 bits, 3 hash functions
 /// bf.insert(&"hello".to_string());
 /// bf.insert(&"world".to_string());
 /// assert!(bf.contains(&"hello".to_string()));
 /// assert!(bf.contains(&"world".to_string()));
 ///
-/// // 方式 2：根据期望元素数量和假阳性率自动计算
-/// let mut bf2 = BloomFilter::with_rate(10000, 0.01); // 期望 10000 个元素，1% 假阳性率
+/// // Approach 2: compute automatically from the expected item count and
+/// // false-positive rate
+/// let mut bf2 = BloomFilter::with_rate(10000, 0.01); // 10000 expected items, 1% false-positive rate
 /// bf2.insert(&"rust".to_string());
 /// assert!(bf2.contains(&"rust".to_string()));
 /// ```
 ///
-/// # 性能特征
+/// # Performance characteristics
 ///
-/// - 时间复杂度：
-///   - `insert`: O(k)，k 为哈希函数数量
+/// - Time complexity:
+///   - `insert`: O(k), where k is the number of hash functions
 ///   - `contains`: O(k)
-/// - 空间复杂度：O(m)，m 为位数
+/// - Space complexity: O(m), where m is the number of bits
 ///
-/// # 注意事项
+/// # Caveats
 ///
-/// - 布隆过滤器不支持删除操作（除非使用计数布隆过滤器）
-/// - 假阳性率随着插入元素数量的增加而增加
-/// - 选择合适的参数很重要：位数越多、哈希函数数量越合适，假阳性率越低
+/// - Bloom filters do not support deletion (unless using a counting bloom filter)
+/// - The false-positive rate grows as more elements are inserted
+/// - Choosing good parameters matters: more bits and a well-suited hash
+///   function count lower the false-positive rate
 pub struct BloomFilter {
-    /// 位数组，每 u64 存储 64 位
+    /// Bit array; each u64 stores 64 bits
     bits: Vec<u64>,
-    /// 总位数
+    /// Total number of bits
     bit_count: usize,
-    /// 哈希函数数量
+    /// Number of hash functions
     hash_count: u32,
 }
 
 impl BloomFilter {
-    /// 创建一个新的布隆过滤器
+    /// Creates a new bloom filter
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// * `bit_count` - 位数组的大小（位数）
-    /// * `hash_count` - 使用的哈希函数数量
+    /// * `bit_count` - size of the bit array (number of bits)
+    /// * `hash_count` - number of hash functions to use
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::BloomFilter;
@@ -97,31 +105,32 @@ impl BloomFilter {
         }
     }
 
-    /// 根据期望的元素数量和假阳性率创建布隆过滤器
+    /// Creates a bloom filter from the expected item count and false-positive rate
     ///
-    /// 此方法会自动计算最优的位数和哈希函数数量。
+    /// This method automatically computes the optimal bit count and hash
+    /// function count.
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// * `expected_items` - 期望插入的元素数量
-    /// * `false_positive_rate` - 期望的假阳性率（0.0 到 1.0 之间）
+    /// * `expected_items` - expected number of inserted elements
+    /// * `false_positive_rate` - desired false-positive rate (between 0.0 and 1.0)
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::BloomFilter;
     ///
-    /// // 期望存储 10000 个元素，假阳性率 1%
+    /// // 10000 expected items, 1% false-positive rate
     /// let bf = BloomFilter::with_rate(10000, 0.01);
     /// println!("位数：{}, 哈希函数数量：{}", bf.bit_count(), bf.hash_count());
     /// ```
     ///
-    /// # 计算公式
+    /// # Formulas
     ///
-    /// - 最优位数 m = -(n * ln(p)) / (ln(2)^2)
-    /// - 最优哈希函数数量 k = (m/n) * ln(2)
+    /// - Optimal bit count m = -(n * ln(p)) / (ln(2)^2)
+    /// - Optimal hash function count k = (m/n) * ln(2)
     ///
-    /// 其中 n 为元素数量，p 为假阳性率
+    /// where n is the element count and p the false-positive rate
     pub fn with_rate(expected_items: usize, false_positive_rate: f64) -> Self {
         let n = expected_items.max(1) as f64;
         let p = false_positive_rate.clamp(1e-12, 0.999_999_999_999);
@@ -131,11 +140,11 @@ impl BloomFilter {
         Self::new(m, k)
     }
 
-    /// 清空布隆过滤器
+    /// Clears the bloom filter
     ///
-    /// 将所有位重置为 0。
+    /// Resets all bits to 0.
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::BloomFilter;
@@ -150,9 +159,9 @@ impl BloomFilter {
         self.bits.fill(0);
     }
 
-    /// 返回布隆过滤器的位数
+    /// Returns the number of bits in the bloom filter
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::BloomFilter;
@@ -164,9 +173,9 @@ impl BloomFilter {
         self.bit_count
     }
 
-    /// 返回哈希函数的数量
+    /// Returns the number of hash functions
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::BloomFilter;
@@ -178,13 +187,13 @@ impl BloomFilter {
         self.hash_count
     }
 
-    /// 向布隆过滤器中插入一个元素
+    /// Inserts an element into the bloom filter
     ///
-    /// # 类型参数
+    /// # Type parameters
     ///
-    /// * `T` - 可哈希的类型
+    /// * `T` - a hashable type
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::BloomFilter;
@@ -201,18 +210,18 @@ impl BloomFilter {
         }
     }
 
-    /// 检查元素是否可能存在于布隆过滤器中
+    /// Checks whether the element may be present in the bloom filter
     ///
-    /// # 返回值
+    /// # Returns
     ///
-    /// - `true` - 元素**可能**存在于集合中（可能是假阳性）
-    /// - `false` - 元素**一定**不存在于集合中
+    /// - `true` - the element **may** be in the set (possibly a false positive)
+    /// - `false` - the element is **definitely** not in the set
     ///
-    /// # 类型参数
+    /// # Type parameters
     ///
-    /// * `T` - 可哈希的类型
+    /// * `T` - a hashable type
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::BloomFilter;
@@ -220,8 +229,8 @@ impl BloomFilter {
     /// let mut bf = BloomFilter::new(1000, 3);
     /// bf.insert(&"hello".to_string());
     ///
-    /// assert!(bf.contains(&"hello".to_string())); // 一定为 true
-    /// assert!(!bf.contains(&"world".to_string())); // 可能为 false 或 true（假阳性）
+    /// assert!(bf.contains(&"hello".to_string())); // guaranteed true
+    /// assert!(!bf.contains(&"world".to_string())); // may be false or true (false positive)
     /// ```
     pub fn contains<T: Hash>(&self, item: &T) -> bool {
         let (h1, h2) = self.hash_pair(item);
@@ -234,32 +243,32 @@ impl BloomFilter {
         true
     }
 
-    /// 计算第 i 个哈希函数对应的位索引
+    /// Computes the bit index for the i-th hash function
     ///
-    /// 使用双重哈希技术：h(i) = h1 + i * h2
+    /// Uses double hashing: h(i) = h1 + i * h2
     fn index(&self, h1: u64, h2: u64, i: u32) -> usize {
         let mixed = h1.wrapping_add((i as u64).wrapping_mul(h2));
         (mixed % (self.bit_count as u64)) as usize
     }
 
-    /// 设置指定位为 1
+    /// Sets the given bit to 1
     fn set_bit(&mut self, idx: usize) {
         let word = idx / 64;
         let bit = idx % 64;
         self.bits[word] |= 1u64 << bit;
     }
 
-    /// 获取指定位的值
+    /// Gets the value of the given bit
     fn get_bit(&self, idx: usize) -> bool {
         let word = idx / 64;
         let bit = idx % 64;
         (self.bits[word] & (1u64 << bit)) != 0
     }
 
-    /// 计算两个哈希值用于双重哈希技术
+    /// Computes two hash values for double hashing
     ///
-    /// 使用两个不同的哈希种子生成两个独立的哈希值，
-    /// 然后通过线性组合生成多个哈希值。
+    /// Generates two independent hash values with two different hash seeds,
+    /// then derives multiple hash values by linear combination.
     fn hash_pair<T: Hash>(&self, item: &T) -> (u64, u64) {
         let mut a = FxHasher::default();
         item.hash(&mut a);
@@ -278,9 +287,9 @@ impl BloomFilter {
 }
 
 impl Default for BloomFilter {
-    /// 创建默认布隆过滤器
+    /// Creates the default bloom filter
     ///
-    /// 默认配置：期望 1024 个元素，假阳性率 1%
+    /// Default configuration: 1024 expected items, 1% false-positive rate
     fn default() -> Self {
         Self::with_rate(1024, 0.01)
     }

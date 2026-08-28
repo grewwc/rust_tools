@@ -115,19 +115,19 @@ fn segment_verification_effect(tokens: &[String]) -> (bool, bool) {
     (scope_review, behavior_check)
 }
 
-/// 单段命令的写文件意图分类。
+/// Write-file intent classification for single-segment commands.
 ///
-/// 只读/非只读两态语义被并入这个三态分类：非只读里混着两种语义——
-/// - `WriteIntended`：已知程序显式写本地文件（`sed -i`、`bytedcli --output-dir`、
-///   `git commit`、`cargo build` 等），或者 known mutator；
-/// - `Unknown`：未知程序（`python3`/`node`/`perl -e` 等解释器、脚本），既没有
-///   只读知识也没有写知识——它可能写也可能不写。
+/// The read-only/non-read-only two-state semantics are folded into this three-state enum; non-read-only mixes two meanings:
+/// - `WriteIntended`: a program known to explicitly write local files (`sed -i`, `bytedcli --output-dir`,
+///   `git commit`, `cargo build`, etc.), or a known mutator;
+/// - `Unknown`: an unrecognized program (interpreters/scripts like `python3`/`node`/`perl -e`) with
+///   neither read-only nor write knowledge — it may or may not write.
 ///
-/// 未知程序即使从项目 cwd 运行也没有任何写入证据，不能据此判定"项目已被变更"；
-/// 否则只读的 python/node 校验会被误判为项目变更，污染 checkpoint 阶段提示
-/// 等下游。completion 证据门禁只认可可证明的工具级变更（apply_patch /
-/// write_file），不依赖本分类；但本分类仍服务于 checkpoint 阶段提示等下游。
-/// 解释器无法穷尽（不能用白名单枚举），所以必须靠写入证据而不是程序名归类。
+/// An unknown program running from the project cwd has no write evidence, so it must not be judged as "the project was changed";
+/// otherwise read-only python/node checks would be misjudged as project changes, polluting downstream consumers such as
+/// checkpoint-phase prompts. The completion evidence gate only credits provable tool-level changes (apply_patch /
+/// write_file) and does not depend on this classification; this classification still serves checkpoint-phase prompts and other downstream consumers.
+/// Interpreters cannot be exhaustively enumerated (no whitelist possible), so classification must rely on write evidence rather than the program name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentWriteKind {
     ReadOnly,
@@ -155,10 +155,10 @@ fn segment_write_kind(tokens: &[String]) -> SegmentWriteKind {
             }
         }
         "git" => {
-            // 子命令可能不在索引 1：`git -C <repo> tag -l` / `git --git-dir=... tag` 等
-            // 全局选项会前置。`tag`/`worktree` 分支需要的是"子命令后的第一个参数"
-            // （`subcommand_index + 1`），硬编码 `tokens.get(2)` 会把全局选项的值
-            // （如 `-C` 的路径）误当成 tag/worktree 的实参，把只读查询判成写 refs。
+            // The subcommand may not be at index 1: `git -C <repo> tag -l` / `git --git-dir=... tag` etc.
+            // put global options first. The `tag`/`worktree` branches need "the first argument after the subcommand"
+            // (`subcommand_index + 1`); hardcoding `tokens.get(2)` would treat a global option's value
+            // (such as the `-C` path) as the tag/worktree argument, judging a read-only query as writing refs.
             let subcommand_index =
                 crate::ai::tools::service::audit::command_subcommand_index(tokens).unwrap_or(1);
             let tag_worktree_arg = tokens.get(subcommand_index + 1).map(|s| s.as_str());
@@ -180,11 +180,11 @@ fn segment_write_kind(tokens: &[String]) -> SegmentWriteKind {
             ) {
                 SegmentWriteKind::ReadOnly
             } else if subcommand == "tag" {
-                // `git tag`（无参数）与 `git tag -l/--list/-n/...` 是只读查询；
-                // 其余形式（`git tag <name>`、`-a/-d/-m/-s/-f` 等）会写 refs，视为写。
-                // `-l/-n/--list/--sort/--format` 支持附着值形式（`-n1`、`-ln`、
-                // `--sort=...`、`--format=...`），同样只读，按前缀匹配；git tag 的
-                // 写 flag（`-a/-d/-f/-m/-s/-u/-F/-e`）与这些前缀无冲突。
+                // `git tag` (no args) and `git tag -l/--list/-n/...` are read-only queries;
+                // the other forms (`git tag <name>`, `-a/-d/-m/-s/-f`, etc.) write refs and count as writes.
+                // `-l/-n/--list/--sort/--format` accept attached-value forms (`-n1`, `-ln`,
+                // `--sort=...`, `--format=...`), also read-only, matched by prefix; these prefixes do not
+                // collide with git tag's write flags (`-a/-d/-f/-m/-s/-u/-F/-e`).
                 let read_only_tag_arg = |arg: &str| {
                     arg == "-l"
                         || arg == "--list"
@@ -209,7 +209,7 @@ fn segment_write_kind(tokens: &[String]) -> SegmentWriteKind {
                     Some(_) => SegmentWriteKind::WriteIntended,
                 }
             } else if subcommand == "worktree" {
-                // `git worktree list` 只读；`add/remove/prune/move/repair/lock/unlock` 写。
+                // `git worktree list` is read-only; `add/remove/prune/move/repair/lock/unlock` write.
                 match tag_worktree_arg {
                     None | Some("list") => SegmentWriteKind::ReadOnly,
                     Some(_) => SegmentWriteKind::WriteIntended,
@@ -247,10 +247,10 @@ fn segment_write_kind(tokens: &[String]) -> SegmentWriteKind {
             }
         }
         "pytest" => SegmentWriteKind::ReadOnly,
-        // `bytedcli` 是 ByteDance 内部平台 CLI（codebase/db/faas/log 等子命令
-        // 都是远端 API 查询/操作），默认不写本地项目文件，故按只读归类；
-        // 但 `--output`/`--output-dir`/`--manifest` 会显式写本地文件
-        // （如 `codebase mr artifacts download --output-dir ...`），必须视为变更。
+        // `bytedcli` is the ByteDance internal platform CLI (codebase/db/faas/log subcommands
+        // are all remote API queries/operations); it does not write local project files by default, so it is classified read-only;
+        // but `--output`/`--output-dir`/`--manifest` explicitly write local files
+        // (e.g. `codebase mr artifacts download --output-dir ...`) and must count as a change.
         "bytedcli" => {
             if tokens.iter().any(|token| {
                 token == "--output"
@@ -374,8 +374,8 @@ fn mutation_target_tokens(tokens: &[String]) -> (Vec<String>, bool) {
         _ => Vec::new(),
     };
     targets.retain(|target| !target.chars().all(|ch| ch.is_ascii_digit()));
-    // `perl` 是解释器，只有 `-p/-i`（就地编辑）形态才"按设计写文件"；
-    // 裸 `perl -e '...'` 与 python3/node 一样没有任何写入证据。
+    // `perl` is an interpreter; only the `-p/-i` (in-place edit) forms "write files by design";
+    // a bare `perl -e '...'` has no write evidence, just like python3/node.
     let known_mutator = matches!(
         program,
         "touch"
@@ -471,10 +471,10 @@ fn analyze_execute_command(command: &str, initial_cwd: &Path) -> ExecuteCommandA
         let read_only = matches!(write_kind, SegmentWriteKind::ReadOnly);
         let (mut command_targets, known_mutator) = mutation_target_tokens(&tokens);
         raw_targets.append(&mut command_targets);
-        // 只有"已知会写本地文件"的程序（WriteIntended 或 known mutator）才能仅凭
-        // cwd 在项目内判定为项目变更；未知程序（python3/node/...）没有任何写入
-        // 证据，兜底置位会把只读校验误判为变更，触发 completion 证据门禁
-        // （`successful_post_mutation_verification` 被重置）导致模型重复输出结论。
+        // Only programs "known to write local files" (WriteIntended or a known mutator) may be judged
+        // as a project change from the project cwd alone; unknown programs (python3/node/...) have no write
+        // evidence, and the cwd fallback would misjudge read-only checks as changes, tripping the completion evidence gate
+        // (`successful_post_mutation_verification` gets reset) and making the model repeat its conclusion.
         let known_writer =
             matches!(write_kind, SegmentWriteKind::WriteIntended) || known_mutator;
         let mutation = has_redirection || !read_only;
@@ -623,9 +623,9 @@ pub(super) fn project_instruction_target_paths_from_tool_calls(
 }
 
 fn project_instruction_target_paths(messages: &[Message]) -> Vec<PathBuf> {
-    // 以最后一个**真实** user 消息为本轮起点：运行时合成的 user 消息
-    // （证据交接、图片 followup）不构成轮次边界，否则 scoped 指令目标
-    // 会被错误地界定在合成消息之后，导致目标目录的 AGENTS.md 从系统提示中消失。
+    // Start the turn at the last **real** user message: runtime-synthetic user messages
+    // (evidence handoff, image followup) do not form turn boundaries, otherwise the scoped-instruction
+    // target would wrongly start after the synthetic message and the target directory's AGENTS.md would drop out of the system prompt.
     let current_turn_start = last_real_user_index(messages).unwrap_or(0);
     let mut targets = Vec::new();
     let mut seen = FastSet::default();
@@ -656,11 +656,11 @@ pub(super) fn refresh_skill_turn_for_iteration(
 
     let prev_skills = skill_turn.matched_skill_names().to_vec();
 
-    // 模型通过 activate_skill / deactivate_skill 工具显式请求变更时优先采纳：
-    // 按名字强制激活，跳过自动路由打分。名字校验在工具侧已做（必须真实存在），
-    // 这里用 skill_manifests 再兜一次，未命中则回退到自动路由。
-    // 多 skill：pending action 可以是 Add（追加）或 Remove（移除），同一 turn 内
-    // 的多次调用按顺序全部应用（队列语义，不做后写覆盖），作用于当前活动集。
+    // Explicit change requests from the model via the activate_skill / deactivate_skill tools take priority:
+    // force-activate by name and skip automatic routing scores. The tool side already validates the name (it must really exist);
+    // here skill_manifests is checked once more, falling back to automatic routing on a miss.
+    // Multiple skills: a pending action can be Add (append) or Remove (drop); multiple calls within the
+    // same turn are all applied in order (queue semantics, no last-write-wins) against the current active set.
     use crate::ai::tools::skill_tools::PendingSkillAction;
     let actions = crate::ai::tools::skill_tools::take_pending_skill_action();
     let mut current_names = prev_skills.clone();
@@ -676,11 +676,11 @@ pub(super) fn refresh_skill_turn_for_iteration(
             }
         }
     }
-    // 无任何变更时复用现有 guard（跳过全量重建）：无 pending action、skill 集未动，
-    // 且 preflight 必需的 + 本轮已触碰文件的 scoped 项目指令都已就绪。重建的开销不止
-    // 是重渲染：会重拉 MCP 工具集、重读 SQLite 激活历史，并整体置换 ctx.tools，导致
-    // 上游 prompt cache 在长 turn 里连续失效。若 observed 目标新增了带指令的文件，
-    // 其指令尚未出现在现有 prompt 中，则仍走重建路径补充。
+    // When nothing changed, reuse the existing guard (skip the full rebuild): no pending action, skill set
+    // untouched, and the scoped project instructions required by preflight plus those for files touched this turn are all in place. A rebuild costs more
+    // than re-rendering: it re-pulls the MCP toolset, re-reads the SQLite activation history, and swaps out ctx.tools wholesale, so
+    // the upstream prompt cache invalidates repeatedly across a long turn. If an observed target added a file carrying instructions
+    // that are not yet in the current prompt, the rebuild path still runs to pick them up.
     if actions.is_empty() && current_names == prev_skills {
         let project_targets = project_instruction_target_paths(messages);
         if !skill_runtime::scoped_project_instructions_missing(
@@ -738,10 +738,10 @@ pub(super) fn refresh_skill_turn_for_iteration(
 
     *skill_turn = new_skill_turn;
     if let Some(system_message) = messages.first_mut() {
-        // 仅当新旧 system prompt 文本不同才覆写。
-        // 同一段字符串的覆写不仅没用，还会让上游 prompt cache（例如 anthropic
-        // 的 cache_control 命中、或者 driver 内部的字符串 hash 复用）连续失效，
-        // 在长 turn 多 iteration 场景里是无声的 token 浪费。
+        // Overwrite only when the new system prompt text differs from the old.
+        // Overwriting with the same string is not just useless: it repeatedly invalidates the upstream
+        // prompt cache (e.g. anthropic cache_control hits, or the driver's internal string hash reuse),
+        // silently wasting tokens in long multi-iteration turns.
         let next_prompt = skill_turn.system_prompt();
         let same = matches!(&system_message.content, Value::String(s) if s == next_prompt);
         if !same {
@@ -798,12 +798,12 @@ fn finish_interrupted_turn(
 ) -> TurnOutcome {
     app.streaming
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    // 仅消费“本轮由 cancel_stream 触发”的中断，避免误清其它来源
-    // （例如 shutdown/request-level interrupt）的全局中断位。
+    // Consume only interrupts triggered by cancel_stream for this turn, avoiding accidental clearing of
+    // global interrupt bits from other sources (e.g. shutdown / request-level interrupt).
     let _ = crate::ai::types::take_stream_cancelled(app);
     app.ignore_next_prompt_interrupt = true;
-    // 标记本轮被打断：run_loop 的 goal 续推逻辑据此区分「打断」与「自然完成」，
-    // 打断时保留 goal_mode 并回落到等待用户输入，不误报「Goal achieved」。
+    // Mark this turn as interrupted: run_loop's goal-continuation logic uses this to tell "interrupted"
+    // apart from "finished naturally"; on interruption goal_mode is kept and we fall back to waiting for user input instead of falsely reporting "Goal achieved".
     app.last_turn_interrupted = true;
     persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
     println!("\nInterrupted.");
@@ -854,11 +854,11 @@ fn request_interrupt_futex_ready() -> bool {
     crate::ai::driver::signal::request_interrupt_ready()
 }
 
-/// 请求等待期间被打断的原因。
+/// Why a request wait was interrupted.
 enum RequestInterruptKind {
-    /// 用户主动取消（Ctrl+C / shutdown / cancel_stream）。
+    /// User-initiated cancel (Ctrl+C / shutdown / cancel_stream).
     User,
-    /// 父代理预超时收口信号：放弃当前请求，立即进入强制收口迭代。
+    /// Parent agent pre-timeout wrap-up signal: abandon the current request and enter a forced wrap-up iteration immediately.
     WrapUp,
 }
 
@@ -873,11 +873,11 @@ async fn wait_for_request_interrupt(
         {
             return RequestInterruptKind::User;
         }
-        // 预超时收口信号（task-local，不影响全局中断状态，也不会误伤并行后台 turn）。
+        // Pre-timeout wrap-up signal (task-local; does not touch global interrupt state and does not disturb parallel background turns).
         if crate::ai::driver::runtime_ctx::has_subagent_wrap_up_pending() {
             return RequestInterruptKind::WrapUp;
         }
-        // 注册等待 future 后再次检查，避免 signal_request_interrupt 与注册之间的 race。
+        // Re-check after registering the wait future to avoid a race between signal_request_interrupt and registration.
         let notified = notify.notified();
         if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref())
             || request_interrupt_futex_ready()
@@ -887,7 +887,7 @@ async fn wait_for_request_interrupt(
         if crate::ai::driver::runtime_ctx::has_subagent_wrap_up_pending() {
             return RequestInterruptKind::WrapUp;
         }
-        // 50ms 兜底兼容外部 futex 唤醒（不经 Notify 通道）。
+        // 50ms fallback to accommodate external futex wakeups (not going through the Notify channel).
         tokio::select! {
             _ = notified => {}
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
@@ -988,7 +988,7 @@ fn reactive_shrink_context_after_overflow(
     after
 }
 
-/// 在每个模型请求边界更新临时上下文投影，不触碰 canonical `turn_messages`。
+/// Update the temporary context projection at every model request boundary without touching canonical `turn_messages`.
 fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Message>) {
     let overflow_dir = {
         use crate::ai::history::SessionStore;
@@ -1049,15 +1049,15 @@ fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Messa
         "elapsed_ms": __agent_hang_elapsed_ms,
     }
 )]
-/// 构建真实请求使用的 LLM client 链：默认空链 = 直接走 `DefaultLlmClient`（零行为变更）；
-/// 注册了 `RequestMiddleware` 时按注册顺序包裹（重试/短路/审计等在生产请求中生效）。
+/// Build the LLM client chain used for real requests: an empty chain by default = go straight to `DefaultLlmClient` (zero behavior change);
+/// with `RequestMiddleware` registered, wrap in registration order (retries/short-circuits/auditing take effect on production requests).
 fn build_llm_request_client(app: &App) -> Box<dyn LlmClient> {
     build_llm_client_chain(app.llm_middlewares.clone(), Box::new(DefaultLlmClient))
 }
 
-/// 经 client 链发送一次 LLM 请求，并把错误收敛回 `RequestError`：
-/// 默认链原样透传（downcast 成功，fallback/超限分类行为不变）；
-/// 自定义中间件产生的非 `RequestError` 错误视为本地策略失败，不触发模型 fallback。
+/// Send one LLM request through the client chain and normalize errors back to `RequestError`:
+/// the default chain passes through unchanged (downcast succeeds; fallback/over-limit classification behavior is unchanged);
+/// non-`RequestError` errors produced by custom middleware count as local policy failures and do not trigger model fallback.
 async fn send_llm_request(
     client: &dyn LlmClient,
     app: &mut App,
@@ -1091,8 +1091,8 @@ async fn request_model_response(
     _iteration: usize,
     mut compression_report: CompressionReport,
 ) -> Result<(reqwest::Response, String), request::RequestError> {
-    // 请求构建前钩子（on_before_request → BuildRequest.before），先于任何 app 状态变更触发。
-    // 传入正在构建的真实请求消息，让钩子可检查/改写。
+    // Pre-request-build hooks (on_before_request → BuildRequest.before), fired before any app state mutation.
+    // The request messages being built are passed in so hooks can inspect/rewrite them.
     app.fire_before_request_hooks(messages);
     if crate::ai::driver::runtime_ctx::take_subagent_checkpoint_due_reminder() {
         messages.push(Message {
@@ -1121,8 +1121,8 @@ async fn request_model_response(
         });
     }
 
-    // 每次请求前都处理，而不是只在 turn 初始化时处理。这样同一 turn 内后续工具轮
-    // 也能消费刚累计到阈值的 prune 标记，并在上下文压缩前先做无损卸载。
+    // Process before every request, not just at turn initialization, so later tool rounds within the same
+    // turn can also consume prune markers that just crossed the threshold and offload losslessly before context compression.
     apply_model_guided_pruning_before_request(app, messages);
 
     let budget_report = context_budget::apply_pre_request_context_budget(app, next_model, messages);
@@ -1138,21 +1138,21 @@ async fn request_model_response(
         );
     }
 
-    // === Pre-request LLM 摘要兜底 ===
-    // 无损+弱损压缩后仍远超阈值时，调用 LLM 把早期对话压成摘要。
-    // 这是发送请求前的最后一道防线，避免超大上下文导致模型 4xx 或质量退化
-    // （用户报告的 "295K 压到 294K 就停了" 问题）。
-    // 阈值取 history_max_chars * 2（默认 180K），比 orchestrator 的 hard
-    // threshold（*3.5 = 315K）更积极——后者只在工具调用间隙触发，此处覆盖
-    // 每次请求前的最后检查。
-    // 增长量守卫：mid-turn 和 pre-request 共享同一个 LLM summary 尝试游标。
-    // 同一批上下文刚尝试过且无有效增量时，不再重复请求 summary。
+    // === Pre-request LLM summary fallback ===
+    // When the context still far exceeds the threshold after lossless + lossy compression, call the LLM to squeeze the early conversation into a summary.
+    // This is the last line of defense before sending the request, preventing oversized context from causing model 4xx or quality degradation
+    // (the user-reported "295K compressed to 294K and then stalled" problem).
+    // The threshold is history_max_chars * 2 (default 180K), more aggressive than the orchestrator's
+    // hard threshold (*3.5 = 315K) — that one only fires between tool calls, while this covers the
+    // final check before every request.
+    // Growth guard: mid-turn and pre-request share the same LLM summary attempt cursor.
+    // If the same context batch was just attempted with no effective growth, do not request a summary again.
     let llm_threshold = pre_request_llm_summary_threshold(next_model, app.config.history_max_chars);
     let session_id = app.session_id.clone();
     if should_try_llm_summary(&session_id, budget_report.after_chars, llm_threshold) {
-        // 取消安全：传入 messages 的 **clone** 而非 `mem::take`。若本次摘要 await
-        // 期间被 Ctrl+C 中断，请求 future 被 drop，`messages` 仍保有原始完整内容，
-        // 不会退化成空 Vec 导致后续请求发出空上下文 / 丢失消息状态。
+        // Cancel safety: pass a **clone** of messages instead of `mem::take`. If this summary await
+        // is interrupted by Ctrl+C, the request future is dropped while `messages` keeps its original
+        // full content, so it cannot degrade into an empty Vec and send an empty context / lose message state on later requests.
         let (after_msgs, llm_before, llm_after, was_effective, llm_summary_inserted) =
             crate::ai::history::mid_turn_llm_summarize(
                 app,
@@ -1173,7 +1173,7 @@ async fn request_model_response(
         );
         record_llm_summary_attempt_chars(&session_id, llm_after);
     }
-    // 摘要管线原则上保留 system 消息；这里仍做一次幂等兜底，确保请求边界协议存在。
+    // The summary pipeline keeps system messages in principle; this idempotent safeguard still runs to guarantee the request-boundary protocol exists.
     llm_prune::ensure_prune_protocol_prompt(messages);
     compression_report.emit();
 
@@ -1188,11 +1188,11 @@ async fn request_model_response(
         );
     }
 
-    // Reactive 上下文超限重试：主动压缩已尽力把上下文压到软阈值附近，但字符估算
-    // 不是 provider tokenizer 的权威裁判。若请求仍被判上下文超限，就地收缩后重试，
-    // 而不是本地主动 413 误杀合法请求，也不是把超限包硬塞给 provider 后直接放弃。
-    // 超限错误不触发模型 fallback（`should_try_model_fallback` 已排除 400/413），
-    // 二者互斥。
+    // Reactive context-over-limit retry: proactive compression has done its best to squeeze the context near the soft threshold, but character
+    // estimation is not the authoritative judge — the provider tokenizer is. If the request is still judged over the context limit, shrink in place and retry,
+    // instead of locally raising 413 and killing a legitimate request or shoving the oversized payload at the provider and giving up.
+    // Over-limit errors do not trigger model fallback (`should_try_model_fallback` already excludes 400/413);
+    // the two are mutually exclusive.
     const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 4;
     let mut overflow_retries = 0usize;
     let llm_client = build_llm_request_client(app);
@@ -1424,7 +1424,7 @@ pub(super) async fn execute_turn_iteration(
                         should_quit,
                     ));
                 }
-                // 预超时收口：放弃当前请求，由 orchestrator 立即进入强制收口迭代。
+                // Pre-timeout wrap-up: abandon the current request; the orchestrator enters a forced wrap-up iteration immediately.
                 RequestInterruptKind::WrapUp => {
                     return Ok(IterationExecution::WrapUpFinal);
                 }
@@ -1448,8 +1448,8 @@ pub(super) async fn execute_turn_iteration(
             )));
         }
     };
-    // 自动 fallback 后仍需把真正完成本次响应的模型传到消息投影与 canonical
-    // 持久化层，不能继续使用路由前的 next_model / app.current_model。
+    // After automatic fallback, the model that actually completed this response must still be passed to
+    // the message projection and canonical persistence layers; the pre-routing next_model / app.current_model cannot be reused.
     *response_model = Some(actual_model.clone());
 
     if app
@@ -1465,8 +1465,8 @@ pub(super) async fn execute_turn_iteration(
         ));
     }
 
-    // 流式响应中途可能因后端瞬态错误（如 "Cancelled by backend"）中断，
-    // 对这类可重试错误重试整条请求+流，避免直接放弃整轮对话。
+    // A streaming response can break mid-stream on transient backend errors (e.g. "Cancelled by backend");
+    // retry the whole request+stream for such retryable errors instead of abandoning the entire turn.
     const MAX_STREAM_RETRIES: usize = 16;
     let mut stream_attempt = 0usize;
     loop {
@@ -1484,7 +1484,7 @@ pub(super) async fn execute_turn_iteration(
         .await
         {
             Ok(stream_result) => {
-                // 流解析成功路径的收尾钩子（on_after_stream → ParseStream.after）。
+                // Wrap-up hook on the successful stream-parse path (on_after_stream → ParseStream.after).
                 app.fire_after_stream_hooks();
                 return finalize_stream_interaction(
                     app,
@@ -1560,7 +1560,7 @@ pub(super) async fn execute_turn_iteration(
                     continue;
                 }
 
-                // 不可重试或已用完重试次数——回退到旧行为，继续对话
+                // Not retryable or retries exhausted — fall back to the old behavior and keep the conversation going
                 if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                     eprintln!("\n[Error] 流式响应处理失败：{}", err_msg);
                     eprintln!("[Info] 尝试继续对话...");
@@ -1616,9 +1616,9 @@ mod tests {
     use std::sync::{Arc, atomic::Ordering};
 
     // ------------------------------------------------------------------
-    // RequestMiddleware 链已接入真实请求路径（P2 修复回归保护）：
-    // `app.llm_middlewares` 注册的中间件必须在生产请求建链
-    // （build_llm_request_client）与发送（send_llm_request）时生效。
+    // The RequestMiddleware chain is wired into the real request path (regression guard for the P2 fix):
+    // middleware registered in `app.llm_middlewares` must take effect when production requests build the chain
+    // (build_llm_request_client) and send (send_llm_request).
     // ------------------------------------------------------------------
 
     struct CountingRequestMiddleware {
@@ -1688,8 +1688,8 @@ mod tests {
             calls: Arc::clone(&calls),
         }));
 
-        // 建链必须来自 app.llm_middlewares；空 endpoint 下内层 DefaultLlmClient
-        // 请求必然失败，但中间件 send 一定被调用（证明生产路径确实走了链）。
+        // The chain must come from app.llm_middlewares; with an empty endpoint the inner DefaultLlmClient
+        // request is guaranteed to fail, but the middleware send is definitely invoked (proving the production path really goes through the chain).
         let client = build_llm_request_client(&app);
         let mut messages = Vec::new();
         let _ = send_llm_request(&*client, &mut app, "gpt-4o", &mut messages, true).await;
@@ -1976,8 +1976,8 @@ mod tests {
 
     #[test]
     fn bytedcli_remote_queries_are_not_project_mutations() {
-        // bytedcli 只做远端 API 查询/操作，不应触发 completion 证据门禁的
-        // 项目变更判定，也不应推导出项目指令目标。
+        // bytedcli only performs remote API queries/operations, so it must not trip the completion evidence
+        // gate's project-change judgment, nor derive project-instruction targets.
         for command in [
             "bytedcli codebase mr get -R \"byteapi/bytedcli\"",
             "bytedcli --json codebase commit list -R \"byteapi/bytedcli\" --revision master",
@@ -1994,8 +1994,8 @@ mod tests {
             );
         }
 
-        // `mr artifacts download` 显式写本地文件（--output-dir），
-        // 即使不经 shell 重定向也必须被识别为项目变更。
+        // `mr artifacts download` explicitly writes local files (--output-dir),
+        // and must be recognized as a project change even without a shell redirection.
         let args = serde_json::json!({
             "command": "bytedcli codebase mr artifacts download -R \"byteapi/bytedcli\" 42 --output-dir ./artifacts",
             "pty": false
@@ -2010,13 +2010,13 @@ mod tests {
 
     #[test]
     fn git_readonly_listing_queries_are_not_project_mutations() {
-        // 回归：git 只读查询子命令（tag -l / worktree list / ls-remote / remote -v /
-        // fetch）之前被当作 WriteIntended（白名单外的 git 子命令一律视为写），从项目
-        // cwd 触发 cwd 兜底误判为 project_mutation。这会在同一轮里重置
-        // successful_post_mutation_verification：例如 `git status --short &&
-        // git worktree list && git tag -l` 中，git status 的校验证据被后面误判的
-        // worktree list / tag -l 重置，导致 completion 证据门禁误报"未观察到变更后
-        // 校验"（会话 a48935d1 消息 169/170 即因此被 Warn，结论被迫带上错误的未校验警告）。
+        // Regression: git read-only query subcommands (tag -l / worktree list / ls-remote / remote -v /
+        // fetch) used to be treated as WriteIntended (git subcommands outside the whitelist were all treated as writes),
+        // tripping the cwd fallback into a project_mutation misjudgment from the project cwd. Within the same turn this resets
+        // successful_post_mutation_verification: e.g. in `git status --short &&
+        // git worktree list && git tag -l`, the verification evidence from git status is reset by the
+        // misjudged worktree list / tag -l afterwards, making the completion evidence gate falsely report "no post-change
+        // verification observed" (session a48935d1 messages 169/170 got Warned for exactly this, forcing the conclusion to carry a bogus unverified warning).
         for command in [
             "git tag -l \"V2.78*\"",
             "git tag | grep -c foo",
@@ -2025,11 +2025,11 @@ mod tests {
             "git remote -v",
             "git fetch --tags",
             "git status --short && git worktree list && git tag -l",
-            // 全局选项前置时子命令不在索引 1，`tag`/`worktree` 必须取
-            // 子命令后的第一个参数而非硬编码的第三 token（`-C` 的值不是实参）。
+            // With global options first, the subcommand is not at index 1; `tag`/`worktree` must take
+            // the first argument after the subcommand instead of a hardcoded third token (the `-C` value is not an argument).
             "git -C . tag -l \"V2.78*\"",
             "git -C . worktree list",
-            // 只读查询 flag 的附着值形式（`-n1`/`-ln`/`--sort=`/`--format=`）。
+            // Attached-value forms of the read-only query flags (`-n1`/`-ln`/`--sort=`/`--format=`).
             "git tag -n1",
             "git tag -ln \"v*\"",
             "git tag --sort=-creatordate",
@@ -2044,7 +2044,7 @@ mod tests {
             );
         }
 
-        // git 真正写 refs / 工作区的形态仍应判定为项目变更。
+        // git forms that really write refs / the worktree must still be judged a project change.
         for command in [
             "git worktree add /tmp/wt HEAD",
             "git worktree remove /tmp/wt",
@@ -2063,13 +2063,13 @@ mod tests {
 
     #[test]
     fn unknown_interpreter_readonly_checks_are_not_project_mutations() {
-        // 回归：python3/node/perl -e 等"未知程序"从项目 cwd 跑只读校验时，
-        // 之前会被 cwd 兜底误判为 project_mutation，触发 completion 证据门禁
-        // （重置 successful_post_mutation_verification），导致模型被迫重复输出
-        // 结论（会话 9cec82e3 最后三轮 277/310/329 均因此触发）。
-        // 修复：只有"已知会写本地文件"的程序（WriteIntended 或 known mutator）
-        // 才允许仅凭 cwd 判定项目变更；未知程序必须靠写入证据（重定向/可解析的
-        // 项目内目标）才能判定，不能靠枚举解释器名（无法穷尽）。
+        // Regression: "unknown programs" such as python3/node/perl -e running read-only checks from the
+        // project cwd used to be misjudged as project_mutation by the cwd fallback, tripping the completion evidence gate
+        // (resetting successful_post_mutation_verification) and forcing the model to repeat its
+        // conclusion (session 9cec82e3's last three turns 277/310/329 all tripped on this).
+        // Fix: only programs "known to write local files" (WriteIntended or a known mutator)
+        // may be judged a project change from the cwd alone; unknown programs require write evidence
+        // (redirection / a resolvable in-project target) and cannot be classified by enumerating interpreter names (impossible to be exhaustive).
         for command in [
             "python3 -c \"import json; print('ok')\"",
             "node -e \"console.log('ok')\"",
@@ -2084,7 +2084,7 @@ mod tests {
             );
         }
 
-        // 未知解释器 + shell 重定向写入项目文件：按写入证据仍判定为项目变更。
+        // Unknown interpreter + shell redirection writing a project file: still judged a project change based on write evidence.
         let args = serde_json::json!({
             "command": "python3 -c \"print('x')\" > generated.json",
             "pty": false
@@ -2095,7 +2095,7 @@ mod tests {
             "未知解释器通过重定向写入项目文件仍应视为项目变更"
         );
 
-        // perl 仅 -p/-i（就地编辑）形态是已知写者；目标文件解析后应视为项目变更。
+        // For perl only the -p/-i (in-place edit) forms are known writers; once the target file resolves, treat as a project change.
         for command in [
             "perl -pi -e 's/foo/bar/' src/main.rs",
             "perl -i -pe 's/foo/bar/' src/main.rs",
@@ -2108,7 +2108,7 @@ mod tests {
             );
         }
 
-        // 已知写者（npm install）的 cwd 兜底保持不变。
+        // The cwd fallback for known writers (npm install) stays unchanged.
         let args = serde_json::json!({"command": "npm install", "pty": false});
         let effects = super::execute_command_segment_effects_for_args(&args);
         assert!(
@@ -2126,19 +2126,19 @@ mod tests {
 
         assert!(should_try_llm_summary(sid, after_chars, threshold));
 
-        // 调用方在每次尝试后（无论成功与否）都写入游标。模拟失败/no-op 后
-        // 写入实际尝试后大小，确保下一次同样大小的请求被 growth 守卫挡掉，
-        // 避免结构上无法压缩时每轮空转重试。
+        // The caller writes the cursor after every attempt (success or not). After simulating a failure/no-op,
+        // write the post-attempt size so the next same-sized request is blocked by the growth guard,
+        // preventing idle retries every turn when the context structurally cannot shrink.
         record_llm_summary_attempt_chars(sid, after_chars);
         assert!(!should_try_llm_summary(sid, after_chars, threshold));
-        // 增长 ≥ MIN_GROWTH(20K) 后才再次触发
+        // Re-trigger only after growth ≥ MIN_GROWTH(20K)
         assert!(should_try_llm_summary(sid, after_chars + 20_000, threshold));
 
         record_llm_summary_attempt_chars(sid, 230_000);
         assert!(!should_try_llm_summary(sid, after_chars, threshold));
         assert!(should_try_llm_summary(sid, 251_000, threshold));
 
-        // 不同 session 之间互不串扰：另一个 session 游标仍为 0，应独立触发。
+        // No cross-session interference: another session's cursor stays 0 and should trigger independently.
         let other = "test-session-cursor-isolation";
         assert!(should_try_llm_summary(other, after_chars, threshold));
 

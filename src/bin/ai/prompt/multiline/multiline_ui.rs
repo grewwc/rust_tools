@@ -23,47 +23,58 @@ use super::{
 };
 use crate::ai::prompt::{PromptEditor, interrupted_error};
 
-/// viewport 最大高度（textarea + chrome），随终端尺寸动态缩放，上限 11 行。
+/// Maximum viewport height (textarea + chrome); scales with the terminal size,
+/// capped at 11 lines.
 const MAX_VIEWPORT_HEIGHT: u16 = 11;
-/// textarea 最大行数上限（大终端下的舒适值）。
+/// Upper bound on textarea lines (a comfortable value on large terminals).
 const MAX_TEXTAREA_LINES: u16 = 7;
-/// 普通编辑态的 chrome 固定行数：model(1) + help(1)。
-/// 不再绘制装饰性 divider，避免 terminal resize 后横线残影堆积。
+/// Fixed chrome line count for the normal editing state: model(1) + help(1).
+/// No decorative divider is drawn anymore, so stray horizontal lines do not
+/// pile up after terminal resizes.
 const VIEWPORT_CHROME_LINES: u16 = 2;
-/// textarea 最小行数，用于 clamp 计算。
+/// Minimum textarea line count, used for clamping.
 const MIN_TEXTAREA_LINES: u16 = 2;
-/// 空输入时为 textarea 预留 3 行，再加上固定 chrome。
+/// With empty input, reserve 3 lines for the textarea plus the fixed chrome.
 const EMPTY_VIEWPORT_HEIGHT: u16 = 3 + VIEWPORT_CHROME_LINES;
 
-/// 补全面板一次最多显示的候选行数，与 `render::COMPLETION_WINDOW` 对齐。
+/// Max candidate lines shown at once in the completion panel; aligned with
+/// `render::COMPLETION_WINDOW`.
 const PANEL_COMPLETION_WINDOW: u16 = 12;
-/// 补全面板激活时的保底 chrome：textarea 最小行(1) + 压缩后的帮助行(1) = 2。
-/// 补全态会隐藏 model/session 信息，优先把高度让给候选列表。
+/// Fallback chrome while the completion panel is active: minimum textarea
+/// lines(1) + compressed help line(1) = 2.
+/// The completion state hides model/session info, giving height priority to the
+/// candidate list.
 const PANEL_CHROME_LINES: u16 = 2;
-/// 补全态允许比普通编辑态更高的 inline viewport，这样大终端里可以一次看到更多候选。
+/// The completion state allows a taller inline viewport than normal editing, so
+/// large terminals can show more candidates at once.
 const MAX_COMPLETION_VIEWPORT_HEIGHT: u16 = PANEL_CHROME_LINES + PANEL_COMPLETION_WINDOW + 2;
 
 fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
     let available_rows = terminal_rows.saturating_sub(2).max(1);
-    // 空输入默认保留 3 行 textarea，避免输入区过窄。
+    // With empty input, keep 3 textarea lines by default so the input area is
+    // not too narrow.
     if prefill.is_none_or(str::is_empty) {
         return EMPTY_VIEWPORT_HEIGHT
             .min(available_rows)
             .min(MAX_VIEWPORT_HEIGHT);
     }
-    // textarea 基础行数：取 terminal 可用行数的 1/4，至少 MIN、最多 MAX
+    // Base textarea lines: 1/4 of the terminal's available lines, at least MIN,
+    // at most MAX
     let base_textarea = (available_rows / 4).clamp(MIN_TEXTAREA_LINES, MAX_TEXTAREA_LINES);
-    // 有预填内容时，textarea 行数不小于 base 且能容纳内容，最多 MAX_TEXTAREA_LINES
+    // With prefilled content, textarea lines are at least base and fit the
+    // content, capped at MAX_TEXTAREA_LINES
     let content_rows = prefill.map(|text| text.lines().count().max(1)).unwrap_or(1) as u16;
     let textarea = content_rows.clamp(base_textarea, MAX_TEXTAREA_LINES);
     let viewport = textarea.saturating_add(VIEWPORT_CHROME_LINES);
     viewport.min(available_rows).min(MAX_VIEWPORT_HEIGHT)
 }
 
-/// 补全面板激活时所需的 viewport 高度：在保持输入框（textarea）行数不变的前提下，
-/// 额外为面板腾出空间。面板期望行数 = min(候选数, PANEL_COMPLETION_WINDOW) + 上下边框(2)，
-/// 再加上 PANEL_CHROME_LINES（textarea 最小行 + 压缩后的帮助行）。
-/// 未超过 base_height（无面板时的高度）时直接用 base_height，避免面板很小反而缩了 viewport。
+/// Viewport height needed while the completion panel is active: extra space for
+/// the panel while keeping the textarea's line count unchanged. Desired panel
+/// lines = min(candidates, PANEL_COMPLETION_WINDOW) + top/bottom borders(2),
+/// plus PANEL_CHROME_LINES (minimum textarea lines + compressed help line).
+/// When this does not exceed base_height (height without a panel), use
+/// base_height directly so a tiny panel never shrinks the viewport.
 fn viewport_height_with_completion(
     terminal_rows: u16,
     base_height: u16,
@@ -75,7 +86,7 @@ fn viewport_height_with_completion(
         return base;
     };
     let visible = (items.min(PANEL_COMPLETION_WINDOW as usize) as u16).max(1);
-    let panel_lines = visible.saturating_add(2); // 上下边框
+    let panel_lines = visible.saturating_add(2); // top/bottom borders
     let desired = panel_lines.saturating_add(PANEL_CHROME_LINES);
     desired
         .max(base)
@@ -96,13 +107,16 @@ fn build_inline_terminal(height: u16) -> io::Result<MultilineTerminal> {
     .map_err(|err| io::Error::other(err.to_string()))
 }
 
-/// 删除 inline viewport 曾经预留的真实终端行。
+/// Deletes the real terminal lines previously reserved by the inline viewport.
 ///
-/// Ratatui 会通过换行预留 `Viewport::Inline` 的高度；常规 clear 只能擦除单元格，
-/// 不能收回这些行。标准 ANSI `CSI Ps M` 会删除光标处起的行，让提交后的预览紧接
-/// 上一轮输出。部分终端对删行后的残余单元格或光标位置处理不一致，因此最后再回到
-/// 顶行并清除其后的区域，保证下一次普通输出从该顶行开始。返回值表示是否拥有足够的
-/// 最后一帧状态来执行行删除。
+/// Ratatui reserves `Viewport::Inline` height by emitting newlines; a regular
+/// clear only erases cells and cannot reclaim those lines. The standard ANSI
+/// `CSI Ps M` deletes lines starting at the cursor, letting the post-submit
+/// preview follow the previous round's output directly. Some terminals handle
+/// leftover cells or cursor position after line deletion inconsistently, so we
+/// finally return to the top line and clear the area after it, ensuring the
+/// next regular output starts at that top line. The return value says whether
+/// enough last-frame state exists to perform the line deletion.
 fn delete_inline_viewport_rows<W: Write>(
     output: &mut W,
     viewport_top_row: Option<u16>,
@@ -126,13 +140,18 @@ fn delete_inline_viewport_rows<W: Write>(
     Ok(true)
 }
 
-/// 清除 inline viewport 后，将光标重新锚定到旧 viewport 顶部。
+/// After clearing the inline viewport, re-anchors the cursor to the old
+/// viewport's top.
 ///
-/// `Terminal::clear()` 会恢复调用前的 cursor；而新的 `Viewport::Inline` 会以创建时
-/// backend cursor 所在行作为顶边。若直接重建，输入框内的 cursor 行会被当作新顶边，
-/// 导致原 viewport 顶部的内容留在 scrollback。高度变更发生在两帧之间时，以上一帧
-/// 记录的 viewport 顶行为准；部分终端在输入后读取到的 live cursor 会暂时漂到左上角。
-/// 尚未完成首帧绘制时才根据 cursor 相对 viewport 的偏移回退计算顶行。
+/// `Terminal::clear()` restores the cursor from before the call, while a new
+/// `Viewport::Inline` takes the row of the backend cursor at creation time as
+/// its top edge. Rebuilding directly would treat the cursor row inside the
+/// input box as the new top edge, leaving the original viewport's top content
+/// stuck in scrollback. When the height changed between two frames, trust the
+/// viewport top row recorded in the previous frame; on some terminals the live
+/// cursor read after input drifts to the top-left corner temporarily.
+/// Only when the first frame has not been drawn yet, fall back to computing the
+/// top row from the cursor's offset relative to the viewport.
 fn clear_and_reanchor_inline_viewport<B: Backend>(
     terminal: &mut Terminal<B>,
     last_viewport_top_row: Option<u16>,
@@ -154,11 +173,14 @@ fn clear_and_reanchor_inline_viewport<B: Backend>(
         .set_cursor_position(Position::new(0, viewport_top_row))
 }
 
-/// 补全面板开/关时，inline viewport 需要的高度会变化，而 ratatui 的 inline viewport
-/// 高度在创建时固定、无法原地修改。清屏后先把 cursor 放回旧 viewport 顶部，再用新高度
-/// 重建 Terminal；这样 ratatui 会以同一顶部锚点向下 `append_lines` 展开，放大/收回都
-/// 不会把旧帧残留在 scrollback。输入框（textarea）的行数不受影响——多出/收回的高度
-/// 只作用于补全面板区域。
+/// When the completion panel opens/closes, the inline viewport's required height
+/// changes, and ratatui's inline viewport height is fixed at creation and cannot
+/// be modified in place. After clearing, put the cursor back at the old
+/// viewport's top, then rebuild the Terminal with the new height; ratatui then
+/// expands downward via `append_lines` from the same top anchor, so neither
+/// growing nor shrinking leaves the old frame in scrollback. The textarea's
+/// line count is unaffected — the added/reclaimed height only affects the panel
+/// area.
 fn resize_inline_viewport(
     terminal: &mut MultilineTerminal,
     new_height: u16,
@@ -171,9 +193,11 @@ fn resize_inline_viewport(
     Ok(())
 }
 
-/// 横向 resize 后终端会先对现有内容做 reflow，此时 ratatui 保存的 viewport 顶行
-/// 还是 resize 前的坐标。根据真实 cursor 和上一帧的相对行偏移重新找到顶行，先擦除
-/// 旧 viewport，避免它在下一次 `autoresize` 重锚时被推进 scrollback。
+/// After a horizontal resize the terminal first reflows existing content, so
+/// ratatui's saved viewport top row still holds pre-resize coordinates.
+/// Re-locate the top row from the real cursor and the previous frame's relative
+/// row offset, and erase the old viewport first so it is not pushed into
+/// scrollback on the next `autoresize` re-anchor.
 fn clear_reflowed_inline_viewport<B: Backend>(
     terminal: &mut Terminal<B>,
     cursor_offset_row: u16,
@@ -195,11 +219,13 @@ fn clear_reflowed_inline_viewport<B: Backend>(
     terminal.backend_mut().flush()
 }
 
-/// 强制当前帧的所有单元格写回终端。
+/// Forces every cell of the current frame to be written back to the terminal.
 ///
-/// 某些 inline viewport 场景下，终端画面可能残留一个已删除字符，但 ratatui 的上一帧
-/// buffer 已经认为该位置是空白，常规 diff 因而不会再次输出空格。仅在输入内容缩短后的
-/// 下一帧使用 `AlwaysUpdate`，既能擦掉这种残影，也避免每帧全量重绘。
+/// In some inline viewport scenarios the terminal may still show a deleted
+/// character, while ratatui's previous-frame buffer already considers that
+/// position blank, so a regular diff would not emit a space there again. Use
+/// `AlwaysUpdate` only on the frame after the input got shorter: it wipes such
+/// ghosts and avoids a full redraw every frame.
 fn force_frame_repaint(frame: &mut ratatui::Frame<'_>) {
     let area = frame.area();
     let buffer = frame.buffer_mut();
@@ -223,10 +249,12 @@ fn submitted_input_preview_lines(content: &str) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut lines = content.lines();
     let marker = crate::ai::theme::ACCENT_SUCCESS;
-    // 提交后预览用柔和中紫，与编辑态暖灰区分，在白底/深底上都清晰可辨。
+    // The post-submit preview uses a soft mid-purple, distinct from the editing
+    // state's warm gray, readable on both light and dark backgrounds.
     let body = crate::ai::theme::ACCENT_SUBMITTED;
     if let Some(first) = lines.next() {
-        // 加粗绿色 `>` 标记 + 低饱和暖灰正文，与 textarea 编辑态颜色一致。
+        // Bold green `>` marker + low-saturation warm-gray body, matching the
+        // textarea editing-state colors.
         rendered.push(format!("\x1b[1m{marker}❯\x1b[0m {body}{first}\x1b[0m"));
         for line in lines {
             rendered.push(format!("  {body}{line}\x1b[0m"));
@@ -245,9 +273,11 @@ impl PromptEditor {
     pub(in crate::ai::prompt) fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
         enable_raw_mode()?;
 
-        // SSH 下禁用 bracketed paste：终端截获 Ctrl+V 后，如果剪贴板内容是图片（二进制），
-        // 无法通过 bracketed paste 传输，导致 paste event 为空或不触发。
-        // 禁用后 Ctrl+V 直接产生 Event::Key(Ctrl+V)，由 handler 通过 OSC52 通路读取剪贴板。
+        // Disable bracketed paste under SSH: after the terminal intercepts
+        // Ctrl+V, clipboard content that is an image (binary) cannot travel
+        // through bracketed paste, leaving the paste event empty or never fired.
+        // With it disabled, Ctrl+V produces Event::Key(Ctrl+V) directly, and the
+        // handler reads the clipboard through the OSC52 path.
         let is_ssh = std::env::var("SSH_CONNECTION").is_ok()
             || std::env::var("SSH_CLIENT").is_ok()
             || std::env::var("SSH_TTY").is_ok();
@@ -257,12 +287,17 @@ impl PromptEditor {
             let _ = execute!(io::stdout(), EnableBracketedPaste);
         }
 
-        // Inline viewport 初始化会通过 append_lines() 真实撑开终端区域。空输入默认保留
-        // 3 行 textarea；编辑已有内容时再按预填行数放大，给 textarea 保留足够空间。
-        // fallback 必须与空输入预留高度一致：某些终端（如 VS Code 集成终端）在
-        // 特定时序下 ioctl(TIOCGWINSZ) 会短暂失败，此时若回落到一个更大的值，textarea
-        // 顶部会多撑出额外空行，表现为正文与 model/help 之间的大段空白。用
-        // EMPTY_VIEWPORT_HEIGHT 兜底可保证拿不到尺寸时仍保留所需的输入空间。
+        // Inline viewport initialization really expands the terminal area via
+        // append_lines(). Empty input keeps 3 textarea lines by default; when
+        // editing existing content it grows by the prefilled line count, leaving
+        // the textarea enough space.
+        // The fallback must match the empty-input reserved height: on some
+        // terminals (e.g. the VS Code integrated terminal) ioctl(TIOCGWINSZ) can
+        // fail briefly at specific timings; falling back to a larger value then
+        // would push extra blank lines above the textarea, showing up as a large
+        // blank gap between the body and model/help. Falling back to
+        // EMPTY_VIEWPORT_HEIGHT guarantees the needed input space even when the
+        // size is unknown.
         let mut base_viewport_height = terminal_size()
             .map(|(_, h)| multiline_viewport_height(h, self.pending_prefill.as_deref()))
             .unwrap_or(EMPTY_VIEWPORT_HEIGHT);
@@ -275,18 +310,23 @@ impl PromptEditor {
             }
         };
 
-        // 退出时按“最后一次实际渲染到哪里”来清理 viewport；不能依赖创建 Terminal
-        // 那一刻的 cursor 位置，因为补全面板/textarea 扩容会重建 inline viewport。
+        // On exit, clean up the viewport based on "where the last actual render
+        // ended"; do not rely on the cursor position at Terminal creation, because
+        // completion-panel/textarea growth rebuilds the inline viewport.
         let mut last_viewport_top_row: Option<u16> = None;
-        // `Viewport::Inline` 会预留真实终端行；退出时必须删除最后实际渲染的高度，
-        // 而不是基于 base 高度推算（补全面板和短终端都会改变实际高度）。
+        // `Viewport::Inline` reserves real terminal lines; on exit you must delete
+        // the height actually rendered last, not a value derived from the base
+        // height (the completion panel and short terminals both change the actual
+        // height).
         let mut last_viewport_height: Option<u16> = None;
-        // resize reflow 后 viewport 的绝对坐标会变化，但 cursor 在 viewport 内的相对行
-        // 不变；记录该偏移用于在下一次 autoresize 前清掉旧帧。
+        // After a resize reflow the viewport's absolute coordinates change, but the
+        // cursor's relative row inside the viewport does not; record that offset
+        // to clear the old frame before the next autoresize.
         let mut last_cursor_offset_row: Option<u16> = None;
 
         let result: io::Result<Option<String>> = (|| {
-            // 预填内容（编辑已有 memo 场景）：按行载入 textarea，读取后清空。
+            // Prefilled content (editing an existing memo): load into the textarea
+            // line by line, then clear the source.
             let mut textarea: TextArea = match self.pending_prefill.take() {
                 Some(text) => TextArea::from(text.lines().map(|l| l.to_string())),
                 None => TextArea::default(),
@@ -296,18 +336,25 @@ impl PromptEditor {
             let mut pending_tab_completion: Option<PendingTabCompletion> = None;
             let mut completion_panel: Option<CompletionPanel> = None;
             let mut recent_text_input: Option<RecentTextInput> = None;
-            // 记录当前 viewport 已适配的补全候选数：None 表示无面板（base 高度）。
-            // 面板出现/消失/候选数变化时，据此重建 viewport 让面板获得足够高度，
-            // 而输入框行数保持不变。
+            // Record how many completion candidates the current viewport already
+            // accommodates: None means no panel (base height).
+            // When the panel appears/disappears or the candidate count changes,
+            // rebuild the viewport accordingly so the panel gets enough height
+            // while the textarea's line count stays unchanged.
             let mut fitted_completion_items: Option<usize> = None;
-            // 输入缩短时强制写回一帧，清除 ratatui buffer 与真实终端失同步留下的字符。
+            // When the input gets shorter, force one frame write-back to wipe
+            // characters left by desync between the ratatui buffer and the real
+            // terminal.
             let mut force_repaint_next_frame = false;
 
             loop {
-                // 后台只发布标题更新；终端仍由前台输入循环在本次安全绘制点重绘。
+                // The background only publishes title updates; the terminal is
+                // still redrawn by the foreground input loop at this safe draw
+                // point.
                 self.apply_pending_session_title_updates();
 
-                // 面板状态变化时，重建 inline viewport 以匹配面板所需高度。
+                // When the panel state changes, rebuild the inline viewport to
+                // match the height the panel needs.
                 let current_items = completion_panel.as_ref().map(|p| p.items.len());
                 if current_items != fitted_completion_items {
                     let terminal_rows = terminal_size().map(|(_, h)| h).unwrap_or(0);
@@ -325,7 +372,8 @@ impl PromptEditor {
                     fitted_completion_items = current_items;
                 }
 
-                // 内容超出 textarea 容量时自动扩展 viewport（只扩不缩，避免频繁闪烁）。
+                // Auto-grow the viewport when content exceeds the textarea capacity
+                // (grow only, never shrink, to avoid frequent flicker).
                 let content_lines = textarea.lines().len() as u16;
                 let textarea_capacity = base_viewport_height.saturating_sub(VIEWPORT_CHROME_LINES);
                 if content_lines > textarea_capacity && base_viewport_height < MAX_VIEWPORT_HEIGHT {
@@ -376,8 +424,10 @@ impl PromptEditor {
                 }
                 let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
                 if matches!(event, Event::Resize(_, _)) {
-                    // VS Code 已经完成横向 reflow；先按真实 cursor 重算并清理旧 viewport，
-                    // 再让下一轮 `Terminal::draw` 调用 `autoresize` 完成重锚和重绘。
+                    // VS Code has finished its horizontal reflow; first recompute
+                    // from the real cursor and clean up the old viewport, then let
+                    // the next `Terminal::draw` call `autoresize` to re-anchor and
+                    // redraw.
                     if let Some(cursor_offset_row) = last_cursor_offset_row {
                         clear_reflowed_inline_viewport(&mut terminal, cursor_offset_row)
                             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -405,8 +455,10 @@ impl PromptEditor {
             }
         })();
 
-        // 退出 TUI：Ratatui 清屏只会擦除字符，必须另外删掉 Inline viewport 实际追加的
-        // 行，否则下一条提交预览或模型输出会出现在这些空白行之后。
+        // Exiting the TUI: Ratatui's clear only erases characters; the lines
+        // actually appended by the inline viewport must be deleted separately,
+        // otherwise the next submit preview or model output appears after those
+        // blank lines.
         let _ = terminal.hide_cursor();
         let can_delete_rows = last_viewport_top_row
             .is_some_and(|_| last_viewport_height.is_some_and(|height| height > 0));
@@ -487,7 +539,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|_| {}).unwrap();
 
-        // 模拟真实终端仍显示字符、而 ratatui 上一帧 buffer 已认为该位置为空白。
+        // Simulate the real terminal still showing a character while ratatui's
+        // previous-frame buffer already considers that position blank.
         let slash = Cell::new("/");
         terminal
             .backend_mut()
@@ -540,14 +593,15 @@ mod tests {
 
     #[test]
     fn multiline_viewport_height_scales_with_terminal() {
-        // 空输入：viewport = 3 行输入区 + chrome(2) = 5
+        // Empty input: viewport = 3 input lines + chrome(2) = 5
         assert_eq!(multiline_viewport_height(30, None), 5);
         assert_eq!(multiline_viewport_height(30, Some("")), 5);
-        // 有预填但内容短于 base：保持 base 大小
+        // Prefilled but shorter than base: keep the base size
         assert_eq!(multiline_viewport_height(30, Some("one line")), 9);
-        // 小终端：terminal=12, available=10，空输入仍保留 3 行输入区
+        // Small terminal: terminal=12, available=10; empty input still keeps 3
+        // input lines
         assert_eq!(multiline_viewport_height(12, None), 5);
-        // 大终端下空输入仍保留 3 行输入区
+        // On large terminals empty input still keeps 3 input lines
         assert_eq!(multiline_viewport_height(40, None), 5);
     }
 
@@ -562,26 +616,29 @@ mod tests {
         assert_eq!(multiline_viewport_height(40, Some(&prefill)), 9);
         assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
         assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
-        assert_eq!(multiline_viewport_height(4, None), 2); // available=2，仍受可用行数约束
+        assert_eq!(multiline_viewport_height(4, None), 2); // available=2; still bounded by available lines
     }
 
     #[test]
     fn completion_viewport_grows_with_candidates_without_shrinking_base() {
-        // 无面板：保持空输入的 base 高度（5）。
+        // No panel: keep the empty-input base height (5).
         assert_eq!(viewport_height_with_completion(30, 5, None), 5);
-        // 1 个候选：面板需要 1+2(边框)=3 + 2(chrome)=5，与 base 相同。
+        // 1 candidate: panel needs 1+2(borders)=3 + 2(chrome)=5, same as base.
         assert_eq!(viewport_height_with_completion(30, 5, Some(1)), 5);
-        // 3 个候选：3+2+2=7 > base，viewport 撑高到 7，多出的 3 行给面板。
+        // 3 candidates: 3+2+2=7 > base; the viewport grows to 7, the extra 3
+        // lines go to the panel.
         assert_eq!(viewport_height_with_completion(30, 5, Some(3)), 7);
-        // 大量候选：补全态上限单独放宽到 16，可容纳 12 行候选 + 边框 + 压缩 chrome。
+        // Many candidates: the completion-state cap is separately raised to 16,
+        // fitting 12 candidate lines + borders + compressed chrome.
         assert_eq!(viewport_height_with_completion(30, 5, Some(50)), 16);
     }
 
     #[test]
     fn completion_viewport_capped_by_available_terminal_rows() {
-        // 终端只有 12 行时 available=10，即便面板想要更高也不能超过 10。
+        // With a 12-line terminal available=10; even if the panel wants more it
+        // cannot exceed 10.
         assert_eq!(viewport_height_with_completion(12, 4, Some(50)), 10);
-        // base 本身也受 available 约束。
+        // The base itself is also bounded by available.
         assert_eq!(viewport_height_with_completion(6, 8, None), 4);
     }
 

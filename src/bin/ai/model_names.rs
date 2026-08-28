@@ -21,96 +21,96 @@ pub struct ModelDef {
     #[serde(default)]
     pub aliases: Vec<String>,
     pub name: String,
-    /// 请求 wire-profile 适配器。决定请求体/流式解析/鉴权候选链等行为。
-    /// 新配置推荐使用 `adapter`；保留 `provider` 作为向后兼容别名。
+    /// Request wire-profile adapter. Determines request body / streaming parse / auth candidate chain behavior.
+    /// New configs should use `adapter`; `provider` is kept as a backward-compatible alias.
     #[serde(default, alias = "provider")]
     pub adapter: ApiProvider,
-    /// 平台标识，仅用于展示名、selector 后缀、日志与配置语义。
-    /// 缺省时回退到 `adapter` 的 slug（如 `compatible` / `openai`）。
+    /// Platform identifier, used only for display names, selector suffixes, logs, and config semantics.
+    /// Defaults to the `adapter` slug when unset (e.g. `compatible` / `openai`).
     #[serde(default)]
     pub platform: Option<String>,
     #[serde(default, alias = "base_url")]
     pub endpoint: Option<String>,
     #[serde(default)]
     pub api_key_config_key: Option<String>,
-    /// 可选：直接指定 API key 字面量（优先级高于 api_key_config_key）。
-    /// 用于不想走 configw 查找的场景（如临时测试、自定义 endpoint）。
+    /// Optional: specify the API key literal directly (takes precedence over api_key_config_key).
+    /// For cases that should not go through configw lookup (e.g. temporary tests, custom endpoints).
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
     pub quality_tier: ModelQualityTier,
     pub is_vl: bool,
-    /// provider 原生联网搜索能力。仅当请求协议有明确 wire 映射时开启：
-    /// DashScope Chat Completions 使用 `enable_search`，OpenAI Responses 使用
-    /// 内置 `web_search` tool；客户端工具不属于此字段。
+    /// Provider-native web search. Enable only when the request protocol has a clear wire mapping:
+    /// DashScope Chat Completions uses `enable_search`, OpenAI Responses uses the built-in
+    /// `web_search` tool; client-side tools are not part of this field.
     pub search_enabled: bool,
     pub tools_default_enabled: bool,
-    /// 是否支持在 message content block 上注入
-    /// `cache_control: {"type":"ephemeral"}` 以启用显式 prompt cache。
+    /// Whether `cache_control: {"type":"ephemeral"}` can be injected onto message content blocks
+    /// to enable explicit prompt caching.
     #[serde(default, alias = "supports_explicit_prompt_cache")]
     pub explicit_prompt_cache: bool,
     #[serde(default)]
     pub enable_thinking: bool,
-    /// 可选：模型上下文窗口（token 数）。
-    /// 用于 driver 的动态压缩预算估算；缺省时按 quality_tier 回退。
+    /// Optional: model context window (in tokens).
+    /// Used for the driver's dynamic compression budget estimation; falls back by quality_tier when unset.
     #[serde(default, alias = "context_window", alias = "max_context_tokens")]
     pub context_window_tokens: Option<usize>,
-    /// 可选：单次响应的最大输出 token 数，作为请求的 `max_tokens` 下发。
-    /// 许多 OpenAI 兼容 provider 在客户端不指定时会用一个偏保守的补全上限，
-    /// 导致大文件 `write_file` / 长文档生成被中途截断。显式声明一个接近模型
-    /// 真实上限的值可缓解截断；缺省（None）时不下发 `max_tokens`，沿用历史行为。
+    /// Optional: maximum output tokens per response, sent as the request's `max_tokens`.
+    /// Many OpenAI-compatible providers apply a conservative completion cap when the client does not specify one,
+    /// truncating large `write_file` payloads / long documents mid-generation. Declaring a value close to the
+    /// model's real limit mitigates truncation; when unset (None), `max_tokens` is not sent, preserving historical behavior.
     #[serde(default, alias = "max_tokens", alias = "max_completion_tokens")]
     pub max_output_tokens: Option<u32>,
-    /// 可选：请求层的 prompt-token-per-minute 预检预算。仅当模型注册表
-    /// 显式配置此字段时，请求层才会在发送前等待；未配置（或为 0）则完全跳过
-    /// TPM 预检，避免用错误的默认值误伤不同 provider / key。
+    /// Optional: request-layer prompt-token-per-minute preflight budget. Only when the model registry
+    /// explicitly sets this field does the request layer wait before sending; when unset (or 0) the TPM preflight is
+    /// skipped entirely, so a wrong default never penalizes different providers / keys.
     #[serde(default)]
     pub request_tpm_limit: Option<u64>,
-    /// 可选：请求所使用的 HTTP 协议方言。绝大多数模型默认走
-    /// `chat_completions`；只有少数模型（如 modelhub 的 GPT-5.x）显式走
-    /// `responses`。缺省时会按 endpoint 形状做兼容推断，供历史配置平滑升级。
+    /// Optional: HTTP protocol dialect for requests. Most models default to
+    /// `chat_completions`; only a few models (e.g. modelhub GPT-5.x) explicitly use
+    /// `responses`. When unset, a compatible inference is made from the endpoint shape for smooth upgrades of historical configs.
     #[serde(default)]
     pub request_protocol: Option<RequestProtocolDialect>,
-    /// 可选：仅对 `responses` 协议生效。开启后，请求会带
-    /// `include: ["reasoning.encrypted_content"]` 索取加密推理项，并在同一
-    /// turn 的工具调用回合把服务端返回的 `reasoning` output item 原样回放到
-    /// input，使模型在多步工具链中保留上一跳推理上下文。缺省关闭：未声明的
-    /// 模型行为不变，网关不透传 `encrypted_content` 时回放自动退化为不回传。
+    /// Optional: only effective for the `responses` protocol. When enabled, requests carry
+    /// `include: ["reasoning.encrypted_content"]` to request encrypted reasoning items, and replay the server-returned `reasoning` output
+    /// item verbatim into the input on subsequent tool-call rounds within the same turn,
+    /// letting the model retain the previous hop's reasoning context across a multi-step tool chain. Off by default: undeclared
+    /// models behave unchanged, and when a gateway does not pass through `encrypted_content` the replay degrades to no replay automatically.
     #[serde(default)]
     pub reasoning_encrypted_replay: bool,
-    /// 可选：Chat Completions 模型是否要求后续工具调用请求原样回放
-    /// assistant 的 `reasoning_content`。这与仅要求字段存在（可为空字符串）
-    /// 的协议不同；缺省关闭，避免无关模型累积或泄露隐藏推理文本。
+    /// Optional: whether a Chat Completions model requires subsequent tool-call requests to replay the assistant's
+    /// `reasoning_content` verbatim. This differs from protocols that only require the field to exist (it may be an empty string);
+    /// off by default so unrelated models neither accumulate nor leak hidden reasoning text.
     #[serde(default)]
     pub reasoning_content_replay: bool,
-    /// 可选：该模型的推理链是否内联在 `content` 通道里，而非独立的
-    /// `reasoning_content` 字段。少数 reasoner 网关（实测 volcano ark `/coding`
-    /// 端点的 deepseek-v4 / glm 系列）采用「预填 `<think>`」对话模板：思考文本
-    /// 直接写进 `content`，整段仅以一个悬空的 `</think>` 收尾，从不产生
-    /// `reasoning_content`。开启后，流式层会在 content 通道用 `</think>` 把泄漏的
-    /// 推理链拆回 reasoning，避免思考链与正式答案一起落进可见正文（表现为“最终
-    /// 答案输出两遍”）。缺省关闭：未声明的模型行为完全不变。
+    /// Optional: whether the model's reasoning chain is inlined in the `content` channel instead of a separate
+    /// `reasoning_content` field. A few reasoner gateways (observed on volcano ark `/coding`
+    /// endpoints with deepseek-v4 / glm models) use a "pre-filled `<think>`" chat template: the reasoning text
+    /// is written directly into `content` and the whole block ends with a lone dangling `</think>`, never producing
+    /// `reasoning_content`. When enabled, the streaming layer uses `</think>` in the content channel to split the leaked
+    /// reasoning chain back into reasoning, keeping the chain of thought out of the visible body (otherwise the "final
+    /// answer is printed twice"). Off by default: undeclared model behavior is completely unchanged.
     #[serde(default)]
     pub reasoning_in_content: bool,
-    /// 子 agent 模型选择优先级（越大越优先）。同 tier 内按此值降序排列。
-    /// 缺省为 0，用户可在 ~/.config/rust_tools/models/（或旧版单文件
-    /// ~/.config/rust_tools/models.json）中覆盖以调整偏好，无需重新编译。
+    /// Subagent model selection priority (higher wins). Within a tier, models are sorted by this value descending.
+    /// Defaults to 0; users can override it in ~/.config/rust_tools/models/ (or the legacy single-file
+    /// ~/.config/rust_tools/models.json) to adjust preference without recompiling.
     #[serde(default)]
     pub subagent_priority: i32,
 
-    /// 可选：覆盖 adapter 的推理强度 wire 形状。相同网关下的不同模型族可能使用
-    /// 不同字段（例如 DashScope DeepSeek / GLM 使用顶层 `reasoning_effort`；
-    /// 未声明的 Alibaba 模型不发送未经确认的推理强度字段）。
+    /// Optional: override the adapter's reasoning-effort wire shape. Different model families behind the same gateway may use
+    /// different fields (e.g. DashScope DeepSeek / GLM use the top-level `reasoning_effort`;
+    /// undeclared Alibaba models do not send unconfirmed reasoning-effort fields).
     #[serde(default)]
     pub reasoning_effort_wire: Option<ReasoningEffortWire>,
 
-    /// 可选：默认推理强度档位。具体 wire 形状优先使用上面的模型级覆盖，否则由
-    /// provider adapter 决定。CLI / `/model effort` 命令的覆盖优先级高于这里。
+    /// Optional: default reasoning effort tier. The concrete wire shape prefers the model-level override above, and otherwise comes
+    /// from the provider adapter. CLI / `/model effort` command overrides take precedence over this.
     ///
-    /// 在模型注册表（models/ 目录）中可填以下值（大小写不敏感）：
-    /// - `"auto"` / `"none"` / `"off"` 或字段省略：等同 `None`，请求中不带
-    ///   `reasoning_effort` 字段（与历史行为兼容）；
-    /// - `"minimal"` / `"low"` / `"medium"` / `"high"` / `"xhigh"` / `"max"`：对应档位。
+    /// Values accepted in the model registry (models/ directory), case-insensitive:
+    /// - `"auto"` / `"none"` / `"off"` or the field omitted: equivalent to `None`, no `reasoning_effort` in the request
+    ///   (compatible with historical behavior);
+    /// - `"minimal"` / `"low"` / `"medium"` / `"high"` / `"xhigh"` / `"max"`: the corresponding tiers.
     #[serde(
         default,
         alias = "reasoning_effort",
@@ -119,18 +119,18 @@ pub struct ModelDef {
     )]
     pub reasoning_effort: Option<ReasoningEffort>,
 
-    /// 该模型的 `reasoning_effort` 与请求体中的 `tools` 参数不兼容。
-    /// 部分网关（如 bytedance modelhub）在 `/v1/chat/completions` 上拒绝
-    /// 二者同时出现，返回 400 "Function tools with reasoning_effort are not
-    /// supported"。设为 true 时，请求层在检测到 tools 非空时自动省略
-    /// `reasoning_effort` 字段以避免 400；无 tools 的请求仍正常携带该字段，
-    /// 保留 thinking 能力。
+    /// The model's `reasoning_effort` conflicts with the `tools` parameter in the request body.
+    /// Some gateways (e.g. bytedance modelhub) reject requests carrying both on `/v1/chat/completions`, returning
+    /// 400 "Function tools with reasoning_effort are not
+    /// supported". When true, the request layer automatically omits `reasoning_effort` whenever tools is non-empty;
+    /// requests without tools still carry the field as usual,
+    /// preserving thinking capability.
     #[serde(default)]
     pub reasoning_effort_conflicts_with_tools: bool,
 }
 
-/// 从字符串反序列化推理强度档位；接受 `auto` / `none` / `off` 等字面量作为
-/// "未设置"语义，等同字段省略。
+/// Deserialize a reasoning effort tier from a string; accepts literals such as `auto` / `none` / `off` as
+/// "unset" semantics, equivalent to omitting the field.
 fn deserialize_default_reasoning_effort<'de, D>(
     deserializer: D,
 ) -> Result<Option<ReasoningEffort>, D::Error>
@@ -209,8 +209,8 @@ pub fn platform_label(model: &ModelDef) -> String {
 }
 
 pub fn model_handle(model: &ModelDef) -> String {
-    // 如果 name 是加密格式（enc: 前缀），则使用 key 作为显示名，
-    // 避免补全面板里显示乱码的 enc:xxx-<platform>。
+    // If name is in encrypted form (enc: prefix), use the key as the display name
+    // to avoid showing garbled enc:xxx-<platform> in the completion panel.
     let is_encrypted = model.name.starts_with("enc:");
     let name = if is_encrypted {
         String::new()
@@ -240,8 +240,8 @@ pub fn legacy_adapter_handle(model: &ModelDef) -> Option<String> {
     }
 }
 
-/// 用户模型注册表目录（新格式，推荐）：`~/.config/rust_tools/models/`，
-/// 约定与内置 `models/` 目录一致（每个模型一个 JSON 文件）。
+/// User model registry directory (new format, recommended): `~/.config/rust_tools/models/`,
+/// following the same convention as the built-in `models/` directory (one JSON file per model).
 fn user_config_dir() -> PathBuf {
     let home = expanduser("~/.config/rust_tools/models");
     match home {
@@ -250,8 +250,8 @@ fn user_config_dir() -> PathBuf {
     }
 }
 
-/// 兼容旧格式：单文件 `~/.config/rust_tools/models.json` 用户覆盖。
-/// 新目录格式存在时优先，旧文件仅作回退。
+/// Legacy format compatibility: single-file `~/.config/rust_tools/models.json` user overrides.
+/// The new directory format takes precedence when present; the legacy file is only a fallback.
 fn legacy_user_config_path() -> PathBuf {
     let home = expanduser("~/.config/rust_tools/models.json");
     match home {
@@ -264,8 +264,8 @@ fn builtin_config_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models")
 }
 
-/// 解析单个模型文件：支持单个对象 `{...}` 或对象数组 `[{...}]` 两种形式。
-/// 读取/解析失败返回 `None`（已打印错误信息）。
+/// Parse a single model file: supports both a single object `{...}` and an object array `[{...}]`.
+/// Returns `None` on read/parse failure (error already printed).
 fn load_models_from_file(path: &Path) -> Option<Vec<ModelDef>> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
@@ -274,7 +274,7 @@ fn load_models_from_file(path: &Path) -> Option<Vec<ModelDef>> {
             return None;
         }
     };
-    // 先按数组解析（兼容合并文件），失败再按单个对象解析。
+    // Parse as an array first (for merged files), then as a single object on failure.
     if let Ok(models) = serde_json::from_str::<Vec<ModelDef>>(&content) {
         return Some(models);
     }
@@ -287,9 +287,9 @@ fn load_models_from_file(path: &Path) -> Option<Vec<ModelDef>> {
     }
 }
 
-/// 读取目录下所有 `*.json` 模型文件（按文件名排序，保证加载顺序确定）。
-/// `strict` 为 true 时任一文件读取/解析失败返回 `None`（内置注册表用，
-/// 直接退出以免静默降级）；为 false 时跳过坏文件继续加载（用户注册表用）。
+/// Read all `*.json` model files in the directory (sorted by filename for a deterministic load order).
+/// With `strict` true, any file read/parse failure returns `None` (used by the built-in registry to
+/// exit immediately instead of silently degrading); with false, bad files are skipped and loading continues (user registry).
 fn load_models_from_dir(dir: &Path, strict: bool) -> Option<Vec<ModelDef>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -321,7 +321,7 @@ fn load_models_from_dir(dir: &Path, strict: bool) -> Option<Vec<ModelDef>> {
 }
 
 fn load_user_models() -> Vec<ModelDef> {
-    // 新格式目录优先；不存在时兼容旧版单文件覆盖。
+    // New-format directory takes precedence; fall back to the legacy single-file override when absent.
     let dir = user_config_dir();
     if dir.is_dir() {
         return load_models_from_dir(&dir, false).unwrap_or_default();

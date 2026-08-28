@@ -38,7 +38,8 @@ use tool_overflow::{
     try_spill_preserved_message_to_stub,
 };
 
-/// 请求上下文中单条 raw tool result 的物理上限。canonical history 不受影响。
+/// Physical cap for a single raw tool result in the request context. Canonical
+/// history is unaffected.
 pub(in crate::ai) const TOOL_RESULT_RAW_HARD_CAP_CHARS: usize = 64_000;
 
 pub(in crate::ai) fn cap_raw_tool_results_for_context(
@@ -54,14 +55,19 @@ pub(in crate::ai) fn cap_raw_tool_results_for_context(
     )
 }
 
-/// 所有"自动压缩摘要" note 的前缀。写入端（生成摘要 note）与识别端
-/// （防重复 guard、sqlite 接续点、请求侧分组）**必须共用这一份清单**，否则
-/// 会出现"写入的前缀识别端不认"的断裂——历史上 `长期记忆摘要（压缩保留）`
-/// 就因未登记而绕过防重复 guard，导致每轮重复插入摘要 note、上下文预算被
-/// 持续推高、压缩管线每个 turn 空转。新增摘要前缀时只改这里。
+/// Prefixes of all "auto-compaction summary" notes. The writer side (which
+/// generates summary notes) and the recognizer side (duplicate guard, sqlite
+/// resume points, request-side grouping) **must share this one list**; otherwise
+/// the two sides split apart — "prefixes written are not recognized". Historically
+/// `长期记忆摘要（压缩保留）` was never registered and thus bypassed the
+/// duplicate guard, causing a summary note to be re-inserted every turn, the
+/// context budget to creep up continuously, and the compaction pipeline to spin
+/// on every turn. When adding a new summary prefix, change only this list.
 ///
-/// 注意：条目应为"去除前导空白后"的裸前缀；判定统一走 [`is_summary_note_text`]，
-/// 它会先 `trim_start` 再逐一 `starts_with`，因此全角/半角冒号只需各列一次。
+/// Note: entries must be bare prefixes "after leading whitespace is stripped";
+/// detection uniformly goes through [`is_summary_note_text`], which `trim_start`s
+/// first and then checks `starts_with` one by one, so full-width/half-width
+/// colons only need to be listed once each.
 pub(in crate::ai) const SUMMARY_NOTE_PREFIXES: &[&str] = &[
     "对话摘要（自动压缩",
     "历史摘要（自动压缩",
@@ -69,19 +75,24 @@ pub(in crate::ai) const SUMMARY_NOTE_PREFIXES: &[&str] = &[
     "[mid-turn-summary]",
 ];
 
-/// 工具组折叠时生成的确定性证据 note 标记。
+/// Marker of the deterministic evidence note generated when folding a tool group.
 ///
-/// 这不是 LLM 生成的摘要，而是压缩器从 tool_call 参数和 tool 结果中机械提取的
-/// evidence/checkpoint。它必须在二次摘要前保留，否则长工具链会退化成只有
-/// file_path / original_file_path 的工具账单，模型压缩后容易重新取证。
+/// This is not an LLM-generated summary; it is evidence/checkpoint extracted
+/// mechanically by the compressor from tool_call arguments and tool results. It
+/// must survive secondary summarization; otherwise long tool chains degrade into
+/// a tool bill of bare file_path / original_file_path entries, and the model
+/// tends to re-gather evidence after compaction.
 pub(super) const COMPRESSED_TOOL_EVIDENCE_MARKER: &str = "[compressed-tool-evidence]";
 
-/// 归档指针 note（overflow 原文回指）的前缀。与摘要 note 成对出现，
-/// P1 折叠逻辑据此识别并去重堆积的归档指针。
+/// Prefix of archive-pointer notes (back-references to overflow originals). They
+/// appear paired with summary notes; the P1 folding logic relies on this to
+/// recognize and dedupe piled-up archive pointers.
 pub(in crate::ai) const ARCHIVE_NOTE_PREFIX: &str = "长期记忆归档";
 
-/// 判断一段文本是否是"自动压缩摘要" note 正文（前缀匹配，容忍前导空白）。
-/// 这是摘要识别的**唯一真源**，供 guard / sqlite / 请求规范化统一调用。
+/// Whether a piece of text is the body of an "auto-compaction summary" note
+/// (prefix match, tolerant of leading whitespace). This is the **single source of
+/// truth** for summary detection, shared by the guard / sqlite / request
+/// normalization paths.
 pub(in crate::ai) fn is_summary_note_text(text: &str) -> bool {
     let trimmed = text.trim_start();
     SUMMARY_NOTE_PREFIXES
@@ -89,31 +100,41 @@ pub(in crate::ai) fn is_summary_note_text(text: &str) -> bool {
         .any(|prefix| trimmed.starts_with(prefix))
 }
 
-/// 判断一段文本是否是 overflow 归档指针 note。
+/// Whether a piece of text is an overflow archive-pointer note.
 pub(in crate::ai) fn is_archive_note_text(text: &str) -> bool {
     text.trim_start().starts_with(ARCHIVE_NOTE_PREFIX)
 }
 
 const PERSISTED_HISTORY_KEEP_RECENT_TURNS: usize = 160;
-/// 压缩兜底（first_trim_candidate）时保护最近 user 起始尾窗的动态上下限。
-/// 小上下文优先保留 3 轮提升多阶段任务连续性；超大上下文回退到 2 轮控预算。
+/// Dynamic bounds of the recent user-turn tail window protected during compaction
+/// fallback (first_trim_candidate). Small contexts prefer keeping 3 turns to
+/// improve multi-stage task continuity; very large contexts fall back to 2 turns
+/// to control the budget.
 const KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MIN: usize = 2;
 const KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX: usize = 3;
-/// 当上下文字符数不超过该阈值时，优先保留 3 轮 user。
+/// When the context char count is at or below this threshold, prefer keeping 3
+/// recent user turns.
 const KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS: usize = 48_000;
 
-/// 计算裁剪/外溢/折叠时应完整豁免的「最近 user 起始尾窗」轮数。
+/// Number of "recent user-turn" tail-window turns to fully exempt from
+/// trimming/spilling/folding.
 ///
-/// 基础判定（按总量二选一）不变：≤48K → 3 轮，否则 2 轮——正常会话零行为变化。
+/// The base rule (pick one by total size) is unchanged: <=48K -> 3 turns,
+/// otherwise 2 — zero behavior change for normal sessions.
 ///
-/// **字节上限逃逸阀**（`budget > 0` 时生效）：保护尾窗是「完整豁免区」，它自身
-/// 不应超过整个历史预算。tool-heavy agentic 会话（少 user 轮 × 每轮上百次工具
-/// 调用）会让尾窗撑到 MB 级且**结构上禁止收敛**——尾窗内即便有几百条工具组也
-/// 一律豁免。此时逐步收缩保护轮数，让「倒数第 2 轮及更早」的工具组暴露给
-/// fold/spill 路径恢复收敛。**保底不变式：永不低于 1 轮**——最新一轮 user 及其
-/// 工具组始终逐字保留（由 `KEEP_RECENT_TOOL_GROUPS` 组级保护继续兜底）。
+/// **Byte-cap escape valve** (active when `budget > 0`): the protected tail window
+/// is a "full exemption zone" and must not itself exceed the entire history
+/// budget. Tool-heavy agentic sessions (few user turns x hundreds of tool calls
+/// per turn) can balloon the tail window to MB scale and **structurally prevent
+/// convergence** — even hundreds of tool groups inside the window are all
+/// exempted. In that case shrink the protected turn count step by step, exposing
+/// tool groups "from the second-to-last turn and earlier" to the fold/spill paths
+/// to restore convergence. **Floor invariant: never below 1 turn** — the newest
+/// user turn and its tool groups are always kept verbatim (the group-level
+/// protection of `KEEP_RECENT_TOOL_GROUPS` remains the backstop).
 ///
-/// `budget == 0` 表示调用方显式不设上限（保持旧行为），供无预算语境复用。
+/// `budget == 0` means the caller explicitly sets no cap (old behavior kept), for
+/// reuse in contexts without a budget.
 fn keep_recent_user_turns_when_trimming(messages: &[Message], budget: usize) -> usize {
     let mut keep = if messages_total_chars(messages) <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
         KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX
@@ -133,8 +154,10 @@ fn keep_recent_user_turns_when_trimming(messages: &[Message], budget: usize) -> 
     keep
 }
 
-/// 批量裁剪不能在执行中重算保护边界，因此低预算目标必须从一开始就采用
-/// 48K 以下的三轮保护策略；否则第三近用户轮次可能在总量跨过 48K 前已被删除。
+/// Batch trimming cannot recompute protection boundaries mid-execution, so a
+/// low-budget target must adopt the sub-48K three-turn protection policy from the
+/// start; otherwise the third-most-recent user turn may already have been deleted
+/// before the total crosses 48K.
 fn keep_recent_user_turns_for_batch(messages: &[Message], budget: usize) -> usize {
     let total_chars = messages_total_chars(messages);
     let mut keep = if budget > 0 && budget <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
@@ -156,18 +179,21 @@ fn keep_recent_user_turns_for_batch(messages: &[Message], budget: usize) -> usiz
     keep
 }
 
-/// 暴露给同 crate 的常量访问器，避免在 mod.rs 中复制阈值数字。
+/// Constant accessors exposed to the rest of the crate, avoiding duplicated
+/// threshold numbers in mod.rs.
 pub(in crate::ai) fn persisted_history_keep_recent_turns() -> usize {
     PERSISTED_HISTORY_KEEP_RECENT_TURNS
 }
 
-/// messages 数组中保留的 self_note 最大条数。
-/// self_note 已经被持久化到 MemoryStore（`memory_store::AgentMemoryEntry`），
-/// messages 里那条仅是同 turn 内被 LLM 看到的"冗余 inline 副本"。
-/// 长 session 累计上千 turn 时这些 inline 副本会单调膨胀，需要滑窗剪裁。
+/// Maximum number of self_note entries kept in the messages array. self_notes are
+/// already persisted to MemoryStore (`memory_store::AgentMemoryEntry`); the copy
+/// in messages is only the "redundant inline copy" the LLM saw within the same
+/// turn. Over a long session with thousands of turns these inline copies bloat
+/// monotonically and need sliding-window pruning.
 const MAX_SELF_NOTES_IN_MESSAGES: usize = 8;
-/// 旧工具组的机械证据在模型上下文中逐字保留的总字符上限。
-/// 更早的证据会零压缩追加到 overflow-history.md，只在 messages 中保留统一回指。
+/// Total char cap for keeping mechanical evidence of older tool groups verbatim
+/// in the model context. Older evidence is appended to overflow-history.md with
+/// zero compression, and only a unified back-reference is kept in messages.
 const MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS: usize = 12_000;
 const CONTEXT_CHECKPOINT_MARKER_PREFIX: &str = "[context_checkpoint";
 pub(in crate::ai) const QUERY_MEMORY_INDEX_PREFIX: &str = "[query-memory-index-v1]";
@@ -176,8 +202,9 @@ pub(in crate::ai) fn compressed_tool_evidence_inline_chars_limit() -> usize {
     MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS
 }
 
-/// 仅保留最近 `keep_recent` 条 internal_note 中的 `self_note:` 条目。
-/// 其他 internal_note（如 cache 提示、loop-breaker、历史摘要）不在剪裁范围。
+/// Keep only the `self_note:` entries among the most recent `keep_recent`
+/// internal_notes. Other internal_notes (cache hints, loop-breakers, history
+/// summaries) are outside the pruning scope.
 fn trim_self_notes_to_recent(messages: Vec<Message>, keep_recent: usize) -> Vec<Message> {
     let total_self_notes = messages.iter().filter(|m| is_self_note_message(m)).count();
     if total_self_notes <= keep_recent {
@@ -250,8 +277,10 @@ impl PlannedArchiveWrite {
         Self { path, content }
     }
 
-    /// 把规划阶段的归档原子落盘。路径包含内容指纹，因此已存在文件可直接复用；
-    /// 并发 writer 即使同时写临时文件，最终也只会留下同一份确定性目标文件。
+    /// Atomically persist the planning-phase archive to disk. The path contains a
+    /// content fingerprint, so an already-existing file can be reused directly;
+    /// even if concurrent writers write temp files at the same time, only one
+    /// deterministic target file ends up remaining.
     pub(super) fn commit(&self) -> bool {
         if self.path.is_file() {
             return true;
@@ -611,9 +640,12 @@ pub(in crate::ai) fn compressed_tool_evidence_exceeds_inline_budget(messages: &[
         > MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS
 }
 
-/// 工具组折叠 note 是旧证据的短期召回窗口，而不是永久逐条内联的账本。
-/// 保留能装入固定字符预算的最近连续窗口；更早 note 先零压缩归档，写入成功后
-/// 才从 messages 删除。这样长工具链不会用上百条约 1 KiB 的 note 挤占上下文。
+/// Folded tool-group notes are a short-term recall window for older evidence, not
+/// a ledger that stays fully inlined forever. Keep the most recent contiguous
+/// window that fits a fixed char budget; older notes are archived with zero
+/// compression first and removed from messages only after the write succeeds.
+/// This keeps long tool chains from crowding the context with hundreds of ~1 KiB
+/// notes.
 fn trim_compressed_tool_evidence_to_inline_budget(
     mut messages: Vec<Message>,
     overflow_dir: Option<&Path>,
@@ -692,24 +724,30 @@ pub(in crate::ai) fn compress_messages_for_context(
     overflow_dir: Option<PathBuf>,
     cwd: Option<&Path>,
 ) -> Vec<Message> {
-    // 历史库中可能仍有旧版 JSON stub。它是压缩器的内部协议，不能原样交给模型，
-    // 否则模型会把它当普通用户文本甚至直接复述到最终回复中。
+    // The history store may still hold legacy JSON stubs. They are an internal
+    // protocol of the compressor and must not be handed to the model as-is,
+    // otherwise the model treats them as ordinary user text or even repeats them
+    // verbatim in its final reply.
     normalize_preserved_message_stubs_for_model(&mut messages);
     if max_chars == 0 || messages.is_empty() {
         return messages;
     }
 
-    // compressed_tool_round note 本身也是压缩产物；若不设独立上限，它们会在
-    // 全局 history 预算触发前逐条累积，形成另一种线性上下文膨胀。
+    // compressed_tool_round notes are themselves compaction products; without an
+    // independent cap they accumulate one by one before the global history budget
+    // triggers, forming another kind of linear context bloat.
     messages = trim_compressed_tool_evidence_to_inline_budget(messages, overflow_dir.as_deref());
 
-    // 在做大块压缩前先剪 self_note 滑动上限，避免上千轮 turn 累积的
-    // self_note（已写入 MemoryStore，messages 里那条仅是冗余备份）
-    // 单调膨胀。MemoryStore 仍保留全部记录。
+    // Prune the self_note sliding cap before large-block compaction, so the
+    // self_notes accumulated over thousands of turns (already written to
+    // MemoryStore; the copy in messages is just a redundant backup) do not bloat
+    // monotonically. MemoryStore still keeps every record.
     let messages = trim_self_notes_to_recent(messages, MAX_SELF_NOTES_IN_MESSAGES);
 
-    // 收敛历史上因防重复 guard 断裂而堆积的重复摘要/归档 note。放在请求期入口，
-    // 让已经堆积了几十对 note 的旧 session 下一次请求就立刻恢复正常，无需等落盘。
+    // Converge duplicate summary/archive notes piled up by past duplicate-guard
+    // breakage. Doing this at the request-time entry lets an old session that
+    // already piled up dozens of note pairs recover on its very next request
+    // instead of waiting for a flush.
     let messages = coalesce_accumulated_summary_notes(messages);
 
     let keep_last = keep_last.min(messages.len());
@@ -761,9 +799,12 @@ pub(in crate::ai) fn compress_messages_for_context(
         older
             .iter()
             .filter(|message| {
-                // 摘要预算为 0（生产路径第二轮压缩等场景）时不会重建摘要；旧的摘要/
-                // 归档 note 本身就是"早期对话的压缩表示"，必须与 checkpoint marker
-                // 一样保留，否则 prepare_turn 已生成的摘要会在第二轮压缩中被静默丢弃。
+                // When the summary budget is 0 (e.g. second-round compaction in the
+                // production path) no summary is rebuilt; the old summary/archive
+                // notes are themselves "the compressed representation of the early
+                // conversation" and must be kept like the checkpoint marker,
+                // otherwise the summary prepare_turn already produced would be
+                // silently dropped in the second compaction round.
                 is_context_checkpoint_marker(message)
                     || (summary_max_chars == 0 && is_summary_or_archive_note(message))
             })
@@ -780,19 +821,24 @@ pub(in crate::ai) fn compress_messages_for_context(
     )
 }
 
-/// 持久化历史里"带 tool_calls 的 assistant narration"被截断到的字符数。
+/// Char cap applied to "assistant narration carrying tool_calls" in the persisted
+/// history.
 ///
-/// 折叠器 [`tool_groups::fold_tool_call_group_to_stub`] 把发起本轮工具调用前
-/// 的可见 narration 当作 `assistant_checkpoint` 的来源。除模型协议明确要求回放的
-/// continuation state 外，完整 reasoning_content 不落盘，也绝不能提升为 assistant
-/// 正文；tool-call-only 消息由折叠器根据结构化 tool_calls 重建安全的操作摘要。
-/// 720 字与折叠后的 checkpoint 上限同量级。
+/// The folder [`tool_groups::fold_tool_call_group_to_stub`] uses the visible
+/// narration before this turn's tool calls as the source of
+/// `assistant_checkpoint`. Except for continuation state the model protocol
+/// explicitly requires replaying, full reasoning_content is never persisted and
+/// must never be promoted into assistant body text; tool-call-only messages get
+/// a safe operation summary rebuilt by the folder from structured tool_calls.
+/// 720 chars is the same order of magnitude as the post-fold checkpoint cap.
 const PERSISTED_TOOL_CALL_ASSISTANT_NARRATION_MAX_CHARS: usize = 720;
 pub(in crate::ai) const PERSISTED_REASONING_REPLAY_PREFIX: &str =
     "\u{1e}aios:reasoning-content-replay:v1\u{1f}";
 
-/// exact-replay continuation state 只存在于可重建的上下文投影中。payload 带来源模型，
-/// 因此切换模型时不会把另一个 provider 的隐藏状态误当成当前模型的续传状态。
+/// exact-replay continuation state exists only in the rebuildable context
+/// projection. The payload carries the originating model, so switching models
+/// never mistakes another provider's hidden state for the current model's resume
+/// state.
 pub(in crate::ai) fn encode_reasoning_replay_state(model: &str, reasoning: &str) -> String {
     format!(
         "{PERSISTED_REASONING_REPLAY_PREFIX}{}",
@@ -810,25 +856,32 @@ pub(in crate::ai) fn decode_reasoning_replay_for_model(
         .then(|| payload.get("reasoning")?.as_str().map(str::to_owned))?
 }
 
-/// Responses 协议加密推理回放前缀。与 exact-replay（`PERSISTED_REASONING_REPLAY_PREFIX`）
-/// 分开，因为二者 payload 形状不同：exact 存明文 reasoning 字符串，加密存 provider
-/// 下发的 reasoning output-item（JSON 数组，含 `encrypted_content`）。分开前缀避免
-/// 请求端把两类 payload 混用、也让压缩/sanitize 层能用同一"带标记则保留"规则统一处理。
+/// Replay prefix for encrypted reasoning under the Responses protocol. Kept
+/// separate from exact-replay (`PERSISTED_REASONING_REPLAY_PREFIX`) because the
+/// payload shapes differ: exact stores a plaintext reasoning string; encrypted
+/// stores the reasoning output-item delivered by the provider (a JSON array with
+/// `encrypted_content`). Separate prefixes prevent the request side from mixing
+/// the two payload kinds and let the compaction/sanitize layers handle both with
+/// the same "keep if marked" rule.
 pub(in crate::ai) const PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX: &str =
     "\u{1e}aios:reasoning-encrypted-replay:v1\u{1f}";
 
-/// 加密推理跨轮回放的运行时总开关。默认开启；设 `AIOS_DISABLE_ENCRYPTED_REPLAY=1`
-/// 时短路落库与请求端重建，用于对照实验复现"修复前"行为（跨轮/resume 丢失加密推理）。
-/// 仅作实验脚手架，不改变默认产品行为。
+/// Runtime master switch for cross-turn encrypted reasoning replay. On by
+/// default; setting `AIOS_DISABLE_ENCRYPTED_REPLAY=1` short-circuits persistence
+/// and request-side rebuild, for A/B experiments reproducing the "pre-fix"
+/// behavior (encrypted reasoning lost across turns/resume). Experimental
+/// scaffolding only; default product behavior is unchanged.
 pub(in crate::ai) fn encrypted_reasoning_replay_runtime_enabled() -> bool {
     std::env::var("AIOS_DISABLE_ENCRYPTED_REPLAY")
         .map(|v| v.trim().is_empty() || v == "0")
         .unwrap_or(true)
 }
 
-/// 把本轮捕获的加密 reasoning items 连同来源模型编码进单个字符串，供落库到
-/// `reasoning_content`。带 model 标记：切换/回退到其他模型时，请求端解码会因
-/// 模型不匹配而丢弃，避免把 A 模型的加密状态误喂给 B 模型（provider 会 400）。
+/// Encode the encrypted reasoning items captured this turn, together with the
+/// originating model, into a single string for persisting into
+/// `reasoning_content`. Carries a model marker: when switching/falling back to
+/// another model, request-side decoding drops it on model mismatch, avoiding
+/// feeding model A's encrypted state to model B (the provider would 400).
 pub(in crate::ai) fn encode_encrypted_reasoning_replay_state(
     model: &str,
     items: &[Value],
@@ -839,8 +892,9 @@ pub(in crate::ai) fn encode_encrypted_reasoning_replay_state(
     )
 }
 
-/// 从落库的 `reasoning_content` 解码出加密 reasoning items。仅当标记内的来源模型
-/// 与当前请求模型一致时才返回；否则返回 `None`（跨模型不回放）。
+/// Decode encrypted reasoning items from the persisted `reasoning_content`.
+/// Returns them only when the originating model inside the marker matches the
+/// current request model; otherwise returns `None` (no cross-model replay).
 pub(in crate::ai) fn decode_encrypted_reasoning_replay_for_model(
     model: &str,
     encoded: &str,
@@ -851,22 +905,27 @@ pub(in crate::ai) fn decode_encrypted_reasoning_replay_for_model(
         return None;
     }
     let mut items: Vec<Value> = payload.get("items")?.as_array()?.to_vec();
-    // 网关会对同一 reasoning 资源在 `.added`（部分载荷）与 `.done`（完整载荷）
-    // 重复下发，修复前的累积器按全字段相等去重未能收敛，历史里可能因此落库
-    // 同 id 的两项。按 id 去重、保留后到（`.done` 为协议最终权威状态）的一项，
-    // 否则回放时同一资源 id 出现两次，modelhub 返回 400 (-4003 Duplicate item found)。
+    // The gateway re-delivers the same reasoning resource twice — `.added`
+    // (partial payload) and `.done` (full payload). The pre-fix accumulator
+    // deduped by all-fields equality and failed to converge, so history may hold
+    // two entries with the same id. Dedupe by id, keeping the later one (`.done`
+    // is the protocol's final authoritative state); otherwise replay emits the
+    // same resource id twice and modelhub returns 400 (-4003 Duplicate item found).
     dedup_reasoning_items_by_id(&mut items);
     Some(items)
 }
 
-/// 按 `id` 收敛 reasoning items：同一资源保留后到的一项。
+/// Converge reasoning items by `id`: keep the later entry for the same resource.
 ///
-/// 网关会对同一 reasoning 资源在 `.added`（部分载荷）与 `.done`（完整载荷）
-/// 重复下发，二者 id 相同、内容不同，按全字段相等去重判不等，会留下重复 id；
-/// 回放时同一资源 id 出现两次，modelhub 返回 400 (-4003 Duplicate item found)。
-/// 这里按 id 收敛、保留后到的一项：流内 `.done` 恒晚于 `.added`，是协议最终
-/// 权威状态（携带完整载荷），后到者胜天然选中它。无 `id` 的项互不合并（保留
-/// 全部，避免误删）。
+/// The gateway re-delivers the same reasoning resource twice — `.added` (partial
+/// payload) and `.done` (full payload); same id, different content, so
+/// all-fields-equality dedup judges them unequal and leaves duplicate ids behind.
+/// Replay then emits the same resource id twice and modelhub returns 400 (-4003
+/// Duplicate item found). Converge by id here and keep the later entry: within a
+/// stream `.done` always follows `.added` and is the protocol's final
+/// authoritative state (carrying the full payload), so last-writer-wins naturally
+/// picks it. Items without an `id` are never merged (keep all of them to avoid
+/// wrong deletions).
 pub(in crate::ai) fn dedup_reasoning_items_by_id(items: &mut Vec<Value>) {
     let mut deduped: Vec<Value> = Vec::with_capacity(items.len());
     for item in items.drain(..) {
@@ -891,13 +950,17 @@ fn sanitize_message_for_persisted_history_inner(
         return sanitized;
     }
 
-    // 持久化历史只保留跨 turn 真正需要的 assistant 事实：
-    // - `reasoning_content` 是隐藏推理，持久化层一律丢弃，绝不复制到可见正文；
-    //   provider 需要字段形状时由 request 层统一补空字符串。
-    // - 带 tool_calls 的 assistant narration 不能清空：否则
-    //   [`tool_groups::fold_tool_call_group_to_stub`] 的 checkpoint 看不到任何文字，只能塌成
+    // The persisted history keeps only the assistant facts truly needed across
+    // turns:
+    // - `reasoning_content` is hidden reasoning; the persistence layer always
+    //   drops it and never copies it into visible body text. When the provider
+    //   needs the field shape, the request layer fills in an empty string.
+    // - Assistant narration carrying tool_calls must not be emptied: otherwise
+    //   the checkpoint of [`tool_groups::fold_tool_call_group_to_stub`] sees no
+    //   text at all and collapses into
     //   "assistant_checkpoint: <empty; no persisted decision before these tool calls>"，
-    //   压缩后模型失忆，从同一轮重启取证。
+    //   leaving the model amnesic after compaction, re-gathering evidence from
+    //   the same turn.
     //
     if sanitized
         .tool_calls
@@ -924,7 +987,8 @@ fn sanitize_message_for_persisted_history_inner(
             if reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX)
                 || reasoning.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX)
             {
-                // 已经是带内部标记的连续性状态（exact 明文 / responses 加密），保持幂等。
+                // Already a continuation state carrying the internal marker (exact
+                // plaintext / responses encrypted); stay idempotent.
             } else if let Some(model) = replay_source_model {
                 *reasoning = encode_reasoning_replay_state(model, reasoning);
             } else {
@@ -941,8 +1005,10 @@ pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -
     sanitize_message_for_persisted_history_inner(message, None)
 }
 
-/// 按模型协议生成持久化投影。只有显式声明需要原样回放的模型，才会为
-/// tool-call assistant 保留隐藏推理；最终回答等其他消息仍一律删除。
+/// Build the persisted projection according to the model protocol. Only models
+/// that explicitly declare they need verbatim replay keep hidden reasoning for
+/// tool-call assistant messages; final answers and other messages are still
+/// always dropped.
 pub(in crate::ai) fn sanitize_message_for_persisted_history_for_model(
     model: &str,
     message: &Message,
@@ -956,8 +1022,10 @@ fn sanitize_persisted_history_messages(messages: Vec<Message>) -> Vec<Message> {
     let messages = coalesce_accumulated_summary_notes(messages);
     messages
         .into_iter()
-        // 只有带内部标记的 reasoning 才是运行时按模型能力显式保留的连续性状态；
-        // 旧历史、导入文件和其他模型的裸 reasoning 仍按原策略删除。
+        // Only reasoning carrying the internal marker is continuation state that
+        // the runtime explicitly kept according to model capability; legacy
+        // history, imported files, and bare reasoning from other models are still
+        // dropped per the original policy.
         .map(|message| {
             let preserve = message.reasoning_content.as_deref().is_some_and(|reasoning| {
                 reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX)
@@ -971,21 +1039,29 @@ fn sanitize_persisted_history_messages(messages: Vec<Message>) -> Vec<Message> {
         .collect()
 }
 
-/// 收敛历史上因防重复 guard 断裂而堆积的多条摘要 / 归档 note。
+/// Converge the multiple summary/archive notes piled up by past duplicate-guard
+/// breakage.
 ///
-/// 背景：`长期记忆摘要（压缩保留）` 前缀曾未登记进 `is_summary_message`，导致
-/// 每轮压缩都在开头重复插入一对「摘要 + 归档」note，长 session 可堆积几十对，
-/// 既污染上下文预算又推高 `total_chars` 让压缩管线每 turn 空转。
+/// Background: the `长期记忆摘要（压缩保留）` prefix was once not registered in
+/// `is_summary_message`, so every compaction round re-inserted a "summary +
+/// archive" note pair at the top; a long session could pile up dozens of pairs,
+/// polluting the context budget and inflating `total_chars` until the compaction
+/// pipeline spun on every turn.
 ///
-/// 折叠策略（无损）：
-/// - **摘要 note**：把每条正文（去 header 后）按原顺序去重拼接成**一条**，放回
-///   第一条摘要原来的位置。不同轮次挤出窗口时各自记录的"初始目标"因此全部保留。
-/// - **归档指针 note**：内容完全相同的只保留一条，内容不同的全部保留，紧跟
-///   合并后的摘要，避免导入/迁移会话时丢失指向其他归档文件的回指。
-/// - 其余消息一律原样保留、顺序不变（绝不触碰非摘要/归档消息）。
+/// Folding policy (lossless):
+/// - **Summary notes**: dedupe and concatenate each note body (header stripped)
+///   in original order into **one** note, put back where the first summary sat.
+///   The "initial goal" each evicted round recorded is therefore fully kept.
+/// - **Archive-pointer notes**: keep only one when contents are identical, keep
+///   all when they differ, placed right after the merged summary — avoids losing
+///   back-references to other archive files when importing/migrating sessions.
+/// - All other messages are kept verbatim and in order (non-summary/archive
+///   messages are never touched).
 ///
-/// 仅当摘要超过一条或存在内容完全相同的归档指针时才折叠，避免对正常历史做
-/// 无谓改写（返回值与入参逐条相等时，上层 `compacted == messages` 判定会跳过落盘）。
+/// Fold only when there is more than one summary or identical archive pointers
+/// exist, avoiding pointless rewriting of healthy history (when the return value
+/// equals the input entry by entry, the caller's `compacted == messages` check
+/// skips persisting).
 fn coalesce_accumulated_summary_notes(messages: Vec<Message>) -> Vec<Message> {
     let summary_count = messages.iter().filter(|m| is_summary_message(m)).count();
     let mut seen_archive_texts = rustc_hash::FxHashSet::default();
@@ -998,7 +1074,8 @@ fn coalesce_accumulated_summary_notes(messages: Vec<Message>) -> Vec<Message> {
         return messages;
     }
 
-    // 合并所有摘要正文，并对内容完全相同的归档指针去重；两者都保持原顺序。
+    // Merge all summary bodies and dedupe archive pointers with identical
+    // content; both keep their original order.
     let mut merged_bodies: Vec<String> = Vec::new();
     let mut first_summary_role: Option<String> = None;
     let mut archive_notes: Vec<Message> = Vec::new();
@@ -1037,8 +1114,9 @@ fn coalesce_accumulated_summary_notes(messages: Vec<Message>) -> Vec<Message> {
         })
     };
 
-    // 重建序列：在"第一条摘要/归档 note"的位置放入合并摘要 + 去重后的归档指针，
-    // 丢弃其余摘要/归档 note，其他消息原样保留。
+    // Rebuild the sequence: put the merged summary plus deduped archive pointers
+    // at the position of "the first summary/archive note", drop the other
+    // summary/archive notes, and keep every other message as-is.
     let mut out = Vec::with_capacity(messages.len());
     let mut inserted = false;
     for m in messages {
@@ -1050,7 +1128,7 @@ fn coalesce_accumulated_summary_notes(messages: Vec<Message>) -> Vec<Message> {
                 out.extend(archive_notes.iter().cloned());
                 inserted = true;
             }
-            // 其余摘要及已收集的归档 note 丢弃。
+            // Remaining summaries and already-collected archive notes are dropped.
         } else {
             out.push(m);
         }
@@ -1066,8 +1144,9 @@ fn is_archive_note_message(m: &Message) -> bool {
     is_system_like_role(&m.role) && is_archive_note_text(&value_to_string(&m.content))
 }
 
-/// 在 leading summary 后注入归档回指；相同回指已存在时保持幂等，避免每轮压缩
-/// 都在上下文头部追加一条完全相同的 `internal_note`。
+/// Inject an archive back-reference after the leading summary; idempotent when an
+/// identical back-reference already exists, so each compaction round does not
+/// append another identical `internal_note` at the top of the context.
 fn insert_archive_note_if_missing(messages: &mut Vec<Message>, archive_note: String) {
     let already_present = messages.iter().any(|message| {
         is_archive_note_message(message) && value_to_string(&message.content) == archive_note
@@ -1094,7 +1173,8 @@ pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Me
     let user_turns = messages
         .iter()
         .filter(|message| {
-            // 合成的 user 消息（图片 followup 等）不构成真实轮次，避免提前截断历史。
+            // Synthetic user messages (image followups etc.) do not form a real
+            // turn boundary, avoiding premature history truncation.
             message.role == "user" && !is_runtime_synthetic_user_message(message)
         })
         .count();
@@ -1144,10 +1224,12 @@ pub(in crate::ai) async fn compact_persisted_history_with_app(
     compact_persisted_history_with_app_inner(app, messages, MAX_HISTORY_TURNS).await
 }
 
-/// 任务边界（一轮 turn 结束且没有再调工具，意味着 agent 给出了最终答案）触发的
-/// 主动压缩。阈值从 `MAX_HISTORY_TURNS`(200) 下调到 `PERSISTED_HISTORY_KEEP_RECENT_TURNS`(160)，
-/// 让"任务做完"这种自然分界点提前触发摘要，避免一直堆到硬上限才被动切。
-/// 仍然不会摘出还没到 160 的对话，所以短对话不受影响。
+/// Proactive compaction triggered by a task boundary (a turn ended with no
+/// further tool calls, meaning the agent gave its final answer). The threshold is
+/// lowered from `MAX_HISTORY_TURNS` (200) to `PERSISTED_HISTORY_KEEP_RECENT_TURNS`
+/// (160), so the natural "task done" boundary triggers summarization earlier
+/// instead of passively switching only when the hard cap is hit. Conversations
+/// below 160 turns are still never summarized, so short sessions are unaffected.
 pub(in crate::ai) async fn compact_persisted_history_at_boundary_with_app(
     app: &App,
     messages: Vec<Message>,
@@ -1209,22 +1291,30 @@ async fn compact_persisted_history_with_app_inner(
     out
 }
 
-/// 当 `first_tool_call_group` 折不动（剩余可折叠组都含 `read_file`
-/// 等 non-compressible 工具、被它按策略拒绝）但仍超预算时的下一档手段：用
-/// [`fold_early_tool_groups`] 递进折叠「保护尾窗之外」的这些组为单行
-/// `compressed_tool_round` note（内含 file_path 召回锚点，模型可 read_file 回读）。
+/// The next escalation when `first_tool_call_group` refuses to fold (all
+/// remaining foldable groups contain non-compressible tools like `read_file`,
+/// which it rejects by policy) but the budget is still exceeded: use
+/// [`fold_early_tool_groups`] to progressively fold those groups "outside the
+/// protected tail window" into single-line `compressed_tool_round` notes (each
+/// carrying a file_path recall anchor the model can read back with read_file).
 ///
-/// 这与 `mid_turn_llm_summarize` 的 Path B+C 复用**同一个**久经测试的折叠函数，
-/// 只是把它前移到常规/落盘压缩路径——修复「tool-heavy 会话（少 user 轮 × 上百次
-/// read_file）在 `compress_messages_for_context` / `shrink_*` 里永远
-/// 压不掉工具组、整段历史无法收敛进预算」的总根因。
+/// This reuses **the same** battle-tested folding function as Path B+C of
+/// `mid_turn_llm_summarize`, just moved earlier into the regular/persisted
+/// compaction path — fixing the root cause of "tool-heavy sessions (few user
+/// turns x hundreds of read_file calls) never folding tool groups inside
+/// `compress_messages_for_context` / `shrink_*`, leaving the whole history unable
+/// to converge into the budget".
 ///
-/// 返回是否发生了「有效折叠」（净字符数下降）。`keep_recent` 从
-/// [`KEEP_RECENT_TOOL_GROUPS`] 递进收紧到 [`MIN_KEEP_RECENT_TOOL_GROUPS`]（=1），
-/// 保证最近的工具组尽量逐字保留、只有仍超预算才逐步放宽折叠范围；每一步都要求
-/// 净下降，避免无进展空转。**不再收紧到 0**：窗口降到 0 会把最近一次工具交互也
-/// 折叠成 stub，模型因此完全失去最近的结构化工具上下文；剩余超额交由 while 循环
-/// 后续的 `first_trim_candidate` / `truncate_mutable_messages_to_fit` 兜底。
+/// Returns whether an "effective fold" happened (net char decrease). `keep_recent`
+/// tightens progressively from [`KEEP_RECENT_TOOL_GROUPS`] down to
+/// [`MIN_KEEP_RECENT_TOOL_GROUPS`] (=1), keeping the most recent tool groups
+/// verbatim as much as possible and widening the folding scope step by step only
+/// while still over budget; every step must produce a net decrease to avoid
+/// spinning without progress. **Never tightens to 0**: a window of 0 would fold
+/// the most recent tool interaction into a stub too, leaving the model with no
+/// structured tool context at all; the remaining excess is handled by the later
+/// `first_trim_candidate` / `truncate_mutable_messages_to_fit` backstops in the
+/// while loop.
 fn fold_noncompressible_tool_groups_to_fit(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -1334,19 +1424,24 @@ fn protected_tail_message_chars(messages: &[Message], keep_recent: usize) -> usi
         .sum()
 }
 
-/// 批量移除可裁的普通消息，并在一次 flush 中归档。旧实现每删一条就重新进入外层
-/// 循环并 `sync_data`，tool-heavy 历史会把数百条 assistant 消息放大成数百次同步
-/// 写。这里先在候选副本上完成整批裁剪；归档失败时不采纳候选，原消息保持不变。
+/// Batch-remove trimmable ordinary messages and archive them in a single flush.
+/// The old implementation re-entered the outer loop and ran `sync_data` after
+/// every single removal, so a tool-heavy history amplified hundreds of assistant
+/// messages into hundreds of synchronous writes. Here the whole batch is trimmed
+/// on a candidate copy first; if archiving fails the candidate is not adopted and
+/// the original messages stay unchanged.
 fn trim_removable_messages_batch(
     messages: &mut Vec<Message>,
     max_chars: usize,
     overflow_dir: Option<&Path>,
 ) -> bool {
-    // 单趟扫描 + 重建，替代旧实现「每轮 first_trim_candidate + Vec::remove」：
-    // 旧循环每轮都会全量重扫（keep_recent_user_turns_when_trimming /
-    // retained_turn_start / 头部保护 run 各 O(n)），删除又是 O(n) memmove，
-    // 整体 O(n²)，数千条 tool-heavy 历史会明显卡顿。这里把保护尾窗与字符总量
-    // 在移除前一次性算好，之后只做 O(n) 扫描 + O(n) 重建。
+    // Single-pass scan + rebuild, replacing the old "first_trim_candidate +
+    // Vec::remove per round": the old loop re-scanned everything every round
+    // (keep_recent_user_turns_when_trimming / retained_turn_start / the leading
+    // protected run, each O(n)), and removal was an O(n) memmove — O(n²) overall,
+    // visibly stalling histories with thousands of tool-heavy entries. The
+    // protected tail window and total char count are computed once up front;
+    // afterwards only an O(n) scan + O(n) rebuild run.
     let keep_recent_user_turns = keep_recent_user_turns_for_batch(messages, max_chars);
     let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
     let mut total = messages_total_chars(messages);
@@ -1360,8 +1455,9 @@ fn trim_removable_messages_batch(
     let mut index = 0usize;
     let mut in_protected_leading_run = true;
     for message in candidate {
-        // 头部受保护的 system-like run（系统提示词、历史摘要、归档指针、checkpoint）
-        // 整段跳过，与 first_trim_candidate 语义一致。
+        // Skip the whole leading protected system-like run (system prompt, history
+        // summaries, archive pointers, checkpoints), matching first_trim_candidate
+        // semantics.
         let head_protected =
             in_protected_leading_run && is_protected_leading_system_like_message(&message);
         if head_protected {
@@ -1371,12 +1467,16 @@ fn trim_removable_messages_batch(
         }
         in_protected_leading_run = false;
 
-        // 与 first_trim_candidate 的可删判定一致：checkpoint / 外溢 stub / tool /
-        // assistant(tool_calls) 均不可单删。user 在此路径不可删（OffloadOnly，只能
-        // 外溢）——跳过而不是 break：避免首个 user 之后的大量可裁候选失去批量移除
-        // 机会（旧行为 break 后只能靠 truncate 兜底，与 with_summary 的「丢弃 +
-        // 归档」语义不一致）。字符总量精确维护：每删一条减去 message_billable_chars，
-        // 一旦 total <= max_chars 即停止移除，与旧循环的停止条件一致。
+        // Same deletability rule as first_trim_candidate: checkpoints, spill
+        // stubs, tool messages, and assistant(tool_calls) cannot be removed
+        // singly. user messages are not removable on this path (OffloadOnly, spill
+        // only) — skip rather than break, so the many trimmable candidates after
+        // the first user message keep their chance of batch removal (the old
+        // behavior broke out and left everything to the truncate backstop,
+        // inconsistent with the with_summary "drop + archive" semantics). The
+        // total char count is maintained exactly: subtract message_billable_chars
+        // per removal and stop as soon as total <= max_chars, matching the old
+        // loop's stop condition.
         let removable = index < protected_tail_start
             && !is_context_checkpoint_marker(&message)
             && !is_preserved_user_or_image_stub(&value_to_string(&message.content))
@@ -1399,8 +1499,10 @@ fn trim_removable_messages_batch(
     if removed.is_empty() {
         return false;
     }
-    // 普通消息仍追加到统一历史归档；internal_note 单独按内容指纹写入确定性文件。
-    // 后者既避免静默丢失恢复指令/持久状态，也避免重复压缩时 append 同一正文。
+    // Ordinary messages still go to the unified history archive; internal_notes
+    // are written to a deterministic file keyed by content fingerprint. The
+    // latter both avoids silently losing recovery instructions/persisted state
+    // and avoids appending the same body again on repeated compaction.
     let archive_candidates: Vec<Message> = removed
         .iter()
         .filter(|m| !is_internal_note_role(&m.role))
@@ -1441,10 +1543,12 @@ fn shrink_messages_to_fit(
 
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
-    // dedup 必须在 offload 之前：offload 会把超阈值的旧 read_file 全文搬到磁盘并
-    // 替换成带**唯一临时路径**的 stub，一旦如此，逐字节相同的重复副本就因路径不同
-    // 而无法再折叠。先做内容级 dedup，把冗余全文折叠成回指 stub，再对真正需要保留
-    // 的少数版本做 offload。
+    // dedup must run before offload: offload moves over-threshold old read_file
+    // bodies to disk and replaces them with a stub carrying a **unique temp
+    // path**; once that happens, byte-identical duplicates can no longer be folded
+    // because their paths differ. Do content-level dedup first, folding redundant
+    // bodies into back-reference stubs, then offload the few versions truly worth
+    // keeping.
     dedup_repeated_tool_results(&mut messages, protected_tool_call_ids);
     prepare_tool_messages_structured(
         &mut messages,
@@ -1454,31 +1558,44 @@ fn shrink_messages_to_fit(
         cwd,
         protected_tool_call_ids,
     );
-    // 先无条件外溢体量过大的旧 user/图片消息（保护尾窗除外），与
-    // `shrink_messages_to_fit_with_summary` 保持一致。图片在预算里只按名义成本
-    // 计费、大 user 原文零压缩搬盘为 stub 后，下面的裁剪循环因
-    // `is_preserved_user_or_image_stub` 自动跳过它们——避免旧 user 被通用裁剪
-    // 直接 `remove` 掉（那违反分类给 RecentUser 的 OffloadOnly 语义、静默丢原文）。
+    // Unconditionally spill oversized old user/image messages first (except the
+    // protected tail window), consistent with
+    // `shrink_messages_to_fit_with_summary`. Images are billed at nominal cost in
+    // the budget, and once a large user body is moved to disk with zero
+    // compression as a stub, the trimming loop below skips them automatically via
+    // `is_preserved_user_or_image_stub` — preventing old user messages from being
+    // outright `remove`d by generic trimming (which would violate the OffloadOnly
+    // semantics assigned to RecentUser and silently lose the original text).
     if let Some(dir) = overflow_dir {
         spill_oversized_preserved_messages(&mut messages, dir, max_chars);
     }
 
-    // 保护尾窗之外的 overflow stub 预览体老化折叠为单行锚点（file_path 召回不丢），
-    // 收敛「上百条早期 read_file 预览单调累积」的历史膨胀。放在预算判断之前，
-    // 让即便未超预算的会话也能持续收敛已外溢 stub。尾窗轮数受 max_chars 字节上限
-    // 约束：tool-heavy 会话尾窗过大时自动缩窗，把更早的 stub 暴露给老化折叠。
+    // Age-fold overflow stub preview bodies outside the protected tail window into
+    // single-line anchors (file_path recall is not lost), converging the
+    // historical bloat of "hundreds of early read_file previews accumulating
+    // monotonically". This runs before the budget check so sessions not yet over
+    // budget also keep converging already-spilled stubs. The tail-window turn
+    // count is bounded by the max_chars byte cap: when a tool-heavy session's tail
+    // window grows too large it shrinks automatically, exposing older stubs to age
+    // folding.
     let keep_recent_turns = keep_recent_user_turns_when_trimming(&messages, max_chars);
     age_out_overflow_stub_previews(&mut messages, keep_recent_turns);
-    // user/image 外溢 stub 没有 tool 锚点可老化：其预览本身就是单行指针，且
-    // first_trim_candidate / truncate / emergency cap 都不会再触碰它们，长会话
-    // 会让 stub 单调累积（尤其图片消息 512 阈值 < 名义成本时）。把保护尾窗之外
-    // 的旧 stub 合并成一条带归档目录的指针，占位开销从 O(N) 收敛到 O(1)。
+    // user/image spill stubs have no tool anchor to age-fold: their preview is
+    // already a single-line pointer, and first_trim_candidate / truncate /
+    // emergency cap never touch them again, so long sessions accumulate stubs
+    // monotonically (especially image messages when the 512 threshold is below
+    // their nominal cost). Merge old stubs outside the protected tail window into
+    // one pointer carrying the archive directory, converging placeholder overhead
+    // from O(N) to O(1).
     merge_old_user_overflow_stubs(&mut messages, keep_recent_turns);
 
-    // 主动精简「已成功写入」的 write_file/apply_patch 巨型 arguments：文件落盘、
-    // 结果确认成功后全文不再有语义价值，无需等预算压力即可先替换为归档 stub。
-    // 保护窗口内（含当前轮刚写完、模型可能立即引用正文构造后续编辑的组）与失败
-    // 结果一律保留，保证 agent 效果不劣化。
+    // Proactively slim down the giant arguments of write_file/apply_patch calls
+    // that were "successfully written": once the file is on disk and the result
+    // confirms success, the full body no longer has semantic value, so it can be
+    // replaced with an archive stub without waiting for budget pressure. Anything
+    // inside the protection window (including groups just written this turn,
+    // whose bodies the model may immediately reference to build follow-up edits)
+    // and failed results are always kept, so agent effectiveness does not degrade.
     shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids);
 
     if messages_total_chars(&messages) <= max_chars {
@@ -1486,16 +1603,20 @@ fn shrink_messages_to_fit(
     }
 
     while messages_total_chars(&messages) > max_chars {
-        // 一次性批量折叠超出预算的所有非保护工具组（compressible + non-compressible
-        // 都通过 [`fold_early_tool_groups`] 处理）。
-        // 旧实现在 `first_tool_call_group` + 单组 fold 循环里一次只折一组，且只在
-        // 折无可折后才落到 `fold_noncompressible_tool_groups_to_fit` 的批 fold。Bug A
-        // 让单组 fold 的字符节省极小（assistant.content 已被 sanitize 置
-        // `""`/`null`，fold 出的 stub 几乎与原 group 同大）→ 外层 while 要迭代几十
-        // 轮才收敛，每轮再注入一条 `<empty>` empty-checkpoint note 污染上下文（详
-        // e75fc2e5 session dump 的 22 个连续 `compressed_tool_round` <empty> stub）。
-        // 改成每轮优先用一个 `fold_early_tool_groups` 批把所有可折叠组一次性收掉，
-        // 让收缩在数外层迭代内完成。
+        // Fold all unprotected tool groups over budget in one batch (both
+        // compressible and non-compressible go through [`fold_early_tool_groups`]).
+        // The old implementation folded only one group per iteration in the
+        // `first_tool_call_group` + single-group fold loop, and only fell through
+        // to the batch fold of `fold_noncompressible_tool_groups_to_fit` after
+        // nothing foldable remained. Bug A kept the per-group savings tiny
+        // (assistant.content had already been sanitized to `""`/`null`, so the
+        // folded stub was nearly as large as the original group) -> the outer while
+        // needed dozens of iterations to converge, each round also injecting an
+        // `<empty>` empty-checkpoint note that polluted the context (see the 22
+        // consecutive `compressed_tool_round` <empty> stubs in the e75fc2e5
+        // session dump). Now each round first uses one `fold_early_tool_groups`
+        // batch to collect every foldable group at once, finishing the shrink
+        // within a few outer iterations.
         if fold_noncompressible_tool_groups_to_fit(
             &mut messages,
             max_chars,
@@ -1505,23 +1626,30 @@ fn shrink_messages_to_fit(
             continue;
         }
         if let Some(idx) = first_trim_candidate(&messages, max_chars) {
-            // 旧 user（含图片的多模态 user）绝不静默删除：这是分类给 RecentUser 的
-            // OffloadOnly 语义。先尝试把原文零压缩搬到归档文件、替换成回指 stub；
-            // 搬盘成功则继续裁剪循环。
+            // Old user messages (including multimodal ones with images) are never
+            // silently deleted: that is the OffloadOnly semantics assigned to
+            // RecentUser. First try moving the original text to the archive file
+            // with zero compression and replacing it with a back-reference stub;
+            // if the move succeeds, continue the trimming loop.
             if messages[idx].role == "user" {
                 if let Some(dir) = overflow_dir
                     && try_spill_preserved_message_to_stub(&mut messages, dir, max_chars)
                 {
                     continue;
                 }
-                // 无法外溢（无 overflow_dir 或体量过小、上面的 proactive spill 已处理
-                // 掉所有超阈值 user）：直接跳出裁剪循环，绝不 `remove` 掉 user 原文。
-                // 残余的轻微超阈值交由上层硬阈值 `mid_turn_llm_summarize` 兜底，
-                // 避免同一小 user 被反复选中造成死循环。
+                // Cannot spill (no overflow_dir, or the body is too small, or the
+                // proactive spill above already handled every over-threshold
+                // user): break out of the trimming loop directly and never
+                // `remove` the user original text. The residual slight overage is
+                // left to the upper hard-threshold `mid_turn_llm_summarize`
+                // backstop, avoiding a livelock where the same small user message
+                // keeps getting picked.
                 break;
             }
-            // 其余可裁候选（assistant 纯叙述、compressed_tool_round 等）集中归档，
-            // 避免逐条 append + sync_data。批量归档失败时原消息保持不变。
+            // Archive the remaining trimmable candidates (plain assistant
+            // narration, compressed_tool_round, etc.) in one place, avoiding
+            // per-entry append + sync_data. If batch archiving fails, the original
+            // messages stay unchanged.
             if trim_removable_messages_batch(&mut messages, max_chars, overflow_dir) {
                 continue;
             }
@@ -1530,12 +1658,16 @@ fn shrink_messages_to_fit(
         break;
     }
 
-    // 裁剪 compressed_tool_evidence 时，正文会零压缩追加到统一历史归档；必须把
-    // 统一回指重新放回请求，否则磁盘上虽有证据，模型却不知道归档路径。归档 note
-    // 是 internal_note（受 is_system_like_role 保护、不会被下方截断裁掉），因此必须
-    // 在 `truncate_unprotected_messages_to_fit` **之前**注入，才能让最后一次截断把它
-    // 占用的预算从其他可裁消息中腾出，避免返回轻微超 max_chars 的 payload。这与
-    // `shrink_messages_to_fit_with_summary` 先插 summary note 再 truncate 的顺序一致。
+    // When compressed_tool_evidence is trimmed, its body is appended with zero
+    // compression to the unified history archive; the unified back-reference must
+    // be put back into the request, otherwise the evidence exists on disk but the
+    // model never learns the archive path. The archive note is an internal_note
+    // (protected by is_system_like_role, so the truncation below will not cut it),
+    // therefore it must be injected **before** `truncate_unprotected_messages_to_fit`,
+    // so the final truncation frees the budget it occupies from other trimmable
+    // messages, avoiding a payload that is slightly over max_chars. This matches
+    // the order in `shrink_messages_to_fit_with_summary`: insert the summary note
+    // first, then truncate.
     insert_overflow_archive_note_if_exists(&mut messages, overflow_dir);
 
     if messages_total_chars(&messages) > max_chars {
@@ -1798,8 +1930,9 @@ fn shrink_messages_to_fit_with_summary(
 
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
-    // dedup 先于 offload：理由同 shrink_messages_to_fit——避免逐字节相同的重复
-    // read_file 全文各自被 offload 成唯一临时路径 stub 而失去折叠机会。
+    // dedup before offload: same rationale as shrink_messages_to_fit — avoid
+    // byte-identical duplicate read_file bodies each being offloaded into a
+    // unique-temp-path stub and losing the chance to fold.
     dedup_repeated_tool_results(&mut messages, protected_tool_call_ids);
     prepare_tool_messages_structured(
         &mut messages,
@@ -1819,45 +1952,55 @@ fn shrink_messages_to_fit_with_summary(
         false,
     );
 
-    // 先无条件外溢体量过大的旧 user/图片消息（最新一轮保护尾窗除外）。
-    // 图片在预算里只按名义成本计费，单张大图不再触发超预算循环，因此必须
-    // 在预算判断之前就把它们零压缩搬到文件，避免每轮请求都携带完整 base64。
+    // Unconditionally spill oversized old user/image messages first (except the
+    // newest turn's protected tail window). Images are billed at nominal cost in
+    // the budget, so a single large image no longer triggers the over-budget loop;
+    // they must therefore be moved to files with zero compression before the
+    // budget check, avoiding a full base64 payload on every request.
     if let Some(dir) = overflow_dir {
         spill_oversized_preserved_messages(&mut messages, dir, max_chars);
     }
 
-    // 保护尾窗之外的 overflow stub 预览体老化折叠为单行锚点（与 shrink_messages_to_fit
-    // 对称）。收敛早期 read_file 预览的单调累积，file_path 召回锚点保留不丢。
-    // 尾窗轮数同样受 max_chars 字节上限约束（见 keep_recent_user_turns_when_trimming）。
+    // Age-fold overflow stub preview bodies outside the protected tail window into
+    // single-line anchors (symmetric with shrink_messages_to_fit). Converges the
+    // monotonic accumulation of early read_file previews; the file_path recall
+    // anchor is kept. The tail-window turn count is likewise bounded by the
+    // max_chars byte cap (see keep_recent_user_turns_when_trimming).
     let keep_recent_turns = keep_recent_user_turns_when_trimming(&messages, max_chars);
     age_out_overflow_stub_previews(&mut messages, keep_recent_turns);
-    // 与 plain shrink 对称：合并保护尾窗之外的 user/image 外溢 stub，防止占位
-    // 消息随会话时长单调累积。
+    // Symmetric with plain shrink: merge user/image spill stubs outside the
+    // protected tail window, preventing placeholder messages from accumulating
+    // monotonically as the session grows.
     merge_old_user_overflow_stubs(&mut messages, keep_recent_turns);
 
-    // 与 shrink_messages_to_fit 对称：成功写入的 write_file/apply_patch 巨型
-    // arguments 主动替换为归档 stub（保护窗口与失败结果保留）。
+    // Symmetric with shrink_messages_to_fit: proactively replace giant arguments
+    // of successfully-written write_file/apply_patch calls with archive stubs
+    // (the protection window and failed results are kept).
     shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids);
 
     if messages_total_chars(&messages) <= max_chars {
         return messages;
     }
     let had_leading_summary = messages.first().map(is_summary_message).unwrap_or(false);
-    // 归档失败时必须恢复首次删除前的完整顺序；直接把 dropped 插到头部会把它们
-    // 放到原本保留的 system prompt 之前，破坏 provider 要求的消息顺序。
+    // On archive failure the full pre-removal order must be restored; inserting
+    // dropped messages at the head outright would place them before the retained
+    // system prompt, breaking the message order the provider requires.
     let mut messages_before_first_drop: Option<Vec<Message>> = None;
     let mut dropped: Vec<Message> = Vec::new();
     let mut dropped_internal_notes: Vec<Message> = Vec::new();
 
-    // 运行期字符总量：单条删除精确减掉 message_billable_chars，折叠/外溢是整体性
-    // 批量变更，各自分支里统一重算，语义与每轮 `messages_total_chars(&messages)`
-    // 完全等价，但避免多轮循环时对整条消息序列反复 O(n) 全量重扫。
+    // Runtime char total: single removals subtract message_billable_chars exactly;
+    // folds/spills are holistic batch changes recomputed uniformly in their own
+    // branches — semantically identical to calling
+    // `messages_total_chars(&messages)` every round, but avoids repeatedly
+    // O(n)-rescanning the whole message sequence across loop iterations.
     let mut total = messages_total_chars(&messages);
     while total > max_chars {
-        // 一次性批量折叠超出预算的所有非保护工具组（compressible + non-compressible
-        // 都通过 [`fold_early_tool_groups`] 处理）——理由同
-        // [`shrink_messages_to_fit`]，避免单组 fold 循环迭代几十轮注入
-        // `<empty>` empty-checkpoint note（详 e75fc2e5 session dump）。
+        // Fold all unprotected tool groups over budget in one batch (both
+        // compressible and non-compressible go through [`fold_early_tool_groups`])
+        // — same rationale as [`shrink_messages_to_fit`], avoiding a single-group
+        // fold loop that iterates dozens of rounds injecting `<empty>`
+        // empty-checkpoint notes (see the e75fc2e5 session dump).
         if fold_noncompressible_tool_groups_to_fit(
             &mut messages,
             max_chars,
@@ -1970,11 +2113,14 @@ fn shrink_messages_to_fit_with_summary(
                 }
                 insert_archive_note_if_missing(&mut messages, archive_note);
             } else {
-                // flush 失败：绝不删历史。恢复首次删除前的完整消息快照，随后立即
-                // 返回——跳过摘要/归档 note 注入
-                //（防止产生没有对应归档文件的悬空指针 note）、truncate 与 reasoning
-                // 清理。返回值可能仍超预算，但那是可恢复的（下轮重试压缩 / 请求层
-                // clamp），而数据丢失不可逆——遵守“写入失败严禁删除历史”的既有教训。
+                // flush failed: never delete history. Restore the full pre-removal
+                // message snapshot and return immediately — skipping summary/archive
+                // note injection (preventing dangling pointer notes without a
+                // matching archive file), truncate, and reasoning cleanup. The
+                // return value may still be over budget, but that is recoverable
+                // (retry compaction next round / request-layer clamp), while data
+                // loss is irreversible — honoring the existing lesson of "never
+                // delete history when a write fails".
                 return messages_before_first_drop.unwrap_or(messages);
             }
         } else if dropped_has_user_turn
@@ -2028,9 +2174,12 @@ fn take_leading_summary(messages: &mut Vec<Message>) -> Option<Message> {
     }
 }
 
-/// 最后一层硬预算逃逸阀：保持 system/user 与工具调用配对结构不变，只缩短可重建的
-/// assistant/tool 正文、reasoning 及超大 tool arguments。先保护当前高精度结果；若
-/// 仍无法达标，再允许截断这些结果。若不可裁的 system/user 自身已经超限，返回 false。
+/// The last-resort hard-budget escape valve: keep the system/user and tool-call
+/// pairing structure intact and only shorten rebuildable assistant/tool bodies,
+/// reasoning, and oversized tool arguments. Current high-precision results are
+/// protected first; if the target is still not met, truncating those results is
+/// allowed. If the untrimmable system/user content itself is already over the
+/// limit, return false.
 fn truncate_mutable_messages_to_fit(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -2057,8 +2206,10 @@ fn truncate_mutable_messages_to_fit_with_policy(
         return true;
     }
 
-    // overflow asset 是受保护证据的唯一真源。预算不足时先丢弃可选预览，只保留
-    // 可解析的 file_path 指针；后续通用 head+tail 截断绝不能再碰该最小协议。
+    // The overflow asset is the single source of truth for protected evidence. When
+    // the budget is short, drop the optional preview first and keep only the
+    // parseable file_path pointer; the later generic head+tail truncation must
+    // never touch that minimal protocol.
     minimize_overflow_stubs_for_hard_budget(messages);
     if messages_total_chars(messages) <= max_chars {
         return true;
@@ -2137,7 +2288,8 @@ fn truncate_mutable_messages_to_fit_with_policy(
                 continue;
             }
             insert_overflow_archive_note_if_exists(messages, overflow_dir);
-            // 首次插入 archive note 可能改变消息下标；成功缩短后重新评估候选。
+            // Inserting the archive note the first time may shift message indices;
+            // re-evaluate candidates after a successful shrink.
             blocked_fields.clear();
         }
     }
@@ -2145,8 +2297,10 @@ fn truncate_mutable_messages_to_fit_with_policy(
     messages_total_chars(messages) <= max_chars
 }
 
-/// 软压缩只裁未受保护字段；当前轮高精度 tool 结果必须留给真正的 hard-target
-/// 兜底处理，不能因为 soft threshold 较小就损失刚读到的精确上下文。
+/// Soft compaction trims only unprotected fields; the current turn's
+/// high-precision tool results must be left to the real hard-target backstop and
+/// must not lose freshly-read precise context just because the soft threshold is
+/// small.
 fn truncate_unprotected_messages_to_fit(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -2162,9 +2316,10 @@ fn truncate_unprotected_messages_to_fit(
     )
 }
 
-/// Path C 先给每个可裁字段设置单项上限，防止一个最新结果独占整个窗口；再按总预算
-/// 继续收紧。两步都不删除消息或工具调用，也不改写 exact-replay 协议状态，因此
-/// assistant↔tool 配对及 reasoning continuation state 保持完整。
+/// Path C first caps each trimmable field individually so one newest result cannot
+/// monopolize the whole window, then keeps tightening against the total budget.
+/// Neither step deletes messages or tool calls, nor rewrites exact-replay protocol
+/// state, so assistant↔tool pairing and reasoning continuation state stay intact.
 fn emergency_cap_messages_to_fit(
     messages: &mut Vec<Message>,
     max_chars: usize,
@@ -2635,15 +2790,20 @@ fn truncate_mutable_field(
     }
 }
 
-/// 主动精简「已成功写入」的 write_file / apply_patch 巨型 arguments。
+/// Proactively slim down the giant arguments of write_file / apply_patch calls
+/// that were "successfully written".
 ///
-/// 文件已落盘（结果消息确认成功）之后，完整 content/patch 正文对后续轮次没有
-/// 语义价值——模型引用的是文件路径而非正文——保留只会持续占用上下文。与预算
-/// 压力无关：只要该组已滑出最近保护窗口（模型不再可能引用刚写入的正文来构造
-/// 后续编辑），立即将其替换为 `_context_overflow_truncated` 指针 stub 并零压缩
-/// 归档原文；失败结果、窗口内结果、当前轮保护 id 一律不动，保证 agent 效果
-/// 不劣化（模型需要时仍可按 stub 的 archive_file_path 回读原文，或按 preview
-/// 识别文件内容轮廓）。
+/// Once the file is on disk (the result message confirms success), the full
+/// content/patch body has no semantic value for later turns — the model references
+/// the file path, not the body — so keeping it only occupies context. This is
+/// independent of budget pressure: as soon as the group has slid out of the recent
+/// protection window (the model can no longer plausibly reference the just-written
+/// body to construct follow-up edits), replace it with a
+/// `_context_overflow_truncated` pointer stub and archive the original with zero
+/// compression. Failed results, in-window results, and current-turn protected ids
+/// are never touched, so agent effectiveness does not degrade (when needed, the
+/// model can still read the original back via the stub's archive_file_path, or
+/// recognize the file's content outline from the preview).
 fn shrink_successful_write_arguments(
     messages: &mut Vec<Message>,
     overflow_dir: Option<&Path>,
@@ -2652,15 +2812,17 @@ fn shrink_successful_write_arguments(
     if messages.is_empty() {
         return;
     }
-    // 保护窗口：最近 KEEP_RECENT_TOOL_GROUPS 个已有结果的工具组（含当前轮刚写完、
-    // 模型可能立即引用正文构造后续编辑的组），其调用一律保留完整 arguments。
+    // Protection window: the most recent KEEP_RECENT_TOOL_GROUPS tool groups that
+    // already have results (including groups just written this turn, whose bodies
+    // the model may immediately reference for follow-up edits) — their calls
+    // always keep full arguments.
     let protected_recent_call_ids: rustc_hash::FxHashSet<String> =
         recent_tool_result_groups(messages, KEEP_RECENT_TOOL_GROUPS)
             .into_iter()
             .flatten()
             .filter_map(|idx| messages[idx].tool_call_id.clone())
             .collect();
-    // tool_call_id → 结果文本（判定成功/失败）。
+    // tool_call_id -> result text (used to judge success/failure).
     let result_by_call_id: rustc_hash::FxHashMap<String, String> = messages
         .iter()
         .filter(|message| message.role == "tool")
@@ -2680,7 +2842,8 @@ fn shrink_successful_write_arguments(
         let Some(tool_calls) = message.tool_calls.as_mut() else {
             continue;
         };
-        // 先收集候选，避免与 truncate_mutable_field 的独占借用冲突。
+        // Collect candidates first, to avoid an exclusive-borrow conflict with
+        // truncate_mutable_field.
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         for (call_index, call) in tool_calls.iter().enumerate() {
             let name = call.function.name.as_str();
@@ -2694,7 +2857,7 @@ fn shrink_successful_write_arguments(
             }
             let arguments = &call.function.arguments;
             if arguments.contains("\"_context_overflow_truncated\"") {
-                continue; // 已替换，幂等（避免重复归档/重复写文件）
+                continue; // already replaced; idempotent (avoids duplicate archiving/duplicate file writes)
             }
             let original_chars = arguments.chars().count();
             if original_chars <= 160 {
@@ -2725,8 +2888,9 @@ fn shrink_successful_write_arguments(
     }
 }
 
-/// 判定 write_file / apply_patch 的结果是否成功。失败结果必须保留完整 arguments
-/// 供模型依据原文修复；成功结果才是可安全精简的对象。
+/// Whether a write_file / apply_patch result succeeded. Failed results must keep
+/// full arguments so the model can fix from the original text; only successful
+/// results are safe to slim down.
 fn is_successful_write_result(tool_name: &str, result_text: &str) -> bool {
     let trimmed = result_text.trim_start();
     if trimmed.starts_with("Error:") || trimmed.starts_with("Exit code:") {
@@ -2792,9 +2956,11 @@ fn messages_total_chars(messages: &[Message]) -> usize {
 
 fn current_turn_precision_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String> {
     let mut out = rustc_hash::FxHashSet::default();
-    // 合成 user 消息不构成轮次边界：否则本轮早前轮次的 precision 工具结果
-    // 会失去保护，被 Path C 有损截断。若完全没有真实 user，则整段历史都是
-    // 当前合成轮，和 retained_turn_start 的保守边界保持一致。
+    // Synthetic user messages do not form a turn boundary: otherwise precision
+    // tool results from earlier turns of this round would lose protection and be
+    // lossy truncated by Path C. If there is no real user at all, the whole
+    // history counts as the current synthetic turn, consistent with
+    // retained_turn_start's conservative boundary.
     let current_turn_start = last_real_user_index(messages).unwrap_or(0);
     for message in messages.iter().skip(current_turn_start) {
         let Some(tool_calls) = &message.tool_calls else {
@@ -2812,11 +2978,14 @@ fn current_turn_precision_tool_call_ids(messages: &[Message]) -> rustc_hash::FxH
     out
 }
 
-/// 收集当前 turn 内所有禁止有损压缩的工具调用。它比 precision inline 集合更宽：
-/// `task_wait` 等聚合结果不参与 precision 配额，但其正文同样不能被 Path C 截断。
+/// Collect every tool call in the current turn that forbids lossy compaction. It
+/// is wider than the precision inline set: aggregated results like `task_wait`
+/// are not part of the precision quota, but their bodies likewise must not be
+/// truncated by Path C.
 fn current_turn_lossless_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String> {
     let mut out = rustc_hash::FxHashSet::default();
-    // 没有真实 user 时，不能把合成轮中的不可有损结果暴露给 Path C。
+    // When there is no real user, lossless-mandatory results of the synthetic
+    // turn must not be exposed to Path C.
     let current_turn_start = last_real_user_index(messages).unwrap_or(0);
     for message in messages.iter().skip(current_turn_start) {
         let Some(tool_calls) = &message.tool_calls else {
@@ -2894,12 +3063,17 @@ fn upsert_context_compaction_state(messages: &mut Vec<Message>) {
     );
 }
 
-/// Mid-turn 渐进式压缩：在 iteration loop 中复用跨 turn 压缩管线的前几档。
-/// 只做"无损/弱损"操作，不动 system / 不删除最近 keep_recent 条工具消息：
-///   1. dedup_repeated_tool_results — 同 (tool, args) 旧结果折叠为 stub
-///   2. prepare_tool_messages_structured — 远端 tool 结果按行裁剪到 480 字
-///   3. fold_tool_call_group_to_stub  — 仍超额：远端整组 (assistant + tool) 折叠
-/// 返回：(messages_after, before_chars, after_chars)
+/// Mid-turn progressive compaction: reuse the first tiers of the cross-turn
+/// compaction pipeline inside the iteration loop. Only "lossless/weakly-lossy"
+/// operations; system messages untouched and the most recent keep_recent tool
+/// messages never deleted:
+///   1. dedup_repeated_tool_results — older results with the same (tool, args)
+///      folded into stubs
+///   2. prepare_tool_messages_structured — remote tool results trimmed by line to
+///      480 chars
+///   3. fold_tool_call_group_to_stub  — still over budget: fold the whole remote
+///      (assistant + tool) group
+/// Returns: (messages_after, before_chars, after_chars)
 pub(in crate::ai) fn mid_turn_compress(
     messages: Vec<Message>,
     soft_threshold: usize,
@@ -2913,28 +3087,33 @@ pub(in crate::ai) fn mid_turn_compress(
         return (messages, before, after_evidence_trim);
     }
     let mut out = messages;
-    // 把压缩状态显式交给模型，避免它把可恢复的 evidence stub 误判为上下文已满。
-    // 在任何裁剪之前插入，后续预算计算会把这条固定开销一并纳入。
+    // Hand the compaction state to the model explicitly, so it does not misread
+    // recoverable evidence stubs as a full context. Inserted before any trimming;
+    // the later budget calculation folds this fixed overhead in.
     upsert_context_compaction_state(&mut out);
-    // 0. 清理过期 reasoning_content：单 turn 内 LLM 多次返回的 reasoning chain
-    //    对后续决策无益，但部分厂商要求历史 reasoning 与 tool_calls 配对。
-    //    只保留最后一条 assistant 的 reasoning_content，其余置 None。
+    // 0. Clean up stale reasoning_content: multiple reasoning chains returned by
+    //    the LLM within one turn add nothing to later decisions, but some vendors
+    //    require historical reasoning to pair with tool_calls. Keep only the last
+    //    assistant's reasoning_content; set the rest to None.
     keep_only_recent_reasoning_content(&mut out);
     if messages_total_chars(&out) <= soft_threshold {
         let after = messages_total_chars(&out);
         return (out, before, after);
     }
-    // 1. 同 signature 工具结果去重
+    // 1. Dedupe tool results with the same signature
     let protected_tool_call_ids = current_turn_precision_tool_call_ids(&out);
     dedup_repeated_tool_results(&mut out, &protected_tool_call_ids);
     if messages_total_chars(&out) <= soft_threshold {
         let after = messages_total_chars(&out);
         return (out, before, after);
     }
-    // 2. 远端结构化裁剪：tool 结果中段按行折叠到 480 字/条，最近 6 条保留全文。
-    //    传入 overflow_dir 后，read_file/grep 等「不可压缩」工具的大输出会被
-    //    零压缩外溢到会话文件并留 head+tail 预览 stub（与跨 turn 压缩一致），
-    //    既释放上下文体积又不丢信息——模型可按 stub 里的 file_path 重新 read_file。
+    // 2. Structured remote trimming: the middle of each tool result is folded by
+    //    line down to 480 chars per entry; the most recent 6 keep full text.
+    //    When overflow_dir is passed, large outputs of "non-compressible" tools
+    //    like read_file/grep spill to the session file with zero compression and
+    //    leave a head+tail preview stub (consistent with cross-turn compaction),
+    //    freeing context without losing information — the model can re-read via
+    //    the stub's file_path.
     prepare_tool_messages_structured(
         &mut out,
         480,
@@ -2947,7 +3126,8 @@ pub(in crate::ai) fn mid_turn_compress(
         let after = messages_total_chars(&out);
         return (out, before, after);
     }
-    // 3. 仍超额：用 shrink_messages_to_fit 走"折叠 tool group + 整体兜底"
+    // 3. Still over budget: use shrink_messages_to_fit for "fold tool groups +
+    //    overall backstop"
     out = shrink_messages_to_fit(
         out,
         soft_threshold,
@@ -2959,32 +3139,46 @@ pub(in crate::ai) fn mid_turn_compress(
     (out, before, after)
 }
 
-/// LLM 摘要"有效压缩"的最小净下降量（字符）。低于此值视为低效，
-/// `was_effective` 返回 false；硬预算兜底仍可能返回一个略小的上下文结果。
-/// 取 `summary_max_chars` 同量级：若净下降还不如注入的摘要文本大，
-/// 说明压缩器空转（典型症状："295K 压到 294K 就停了"）。
+/// Minimum net decrease (chars) for an LLM summary to count as "effective
+/// compaction". Below this it is considered ineffective and `was_effective`
+/// returns false; the hard-budget backstop may still return a slightly smaller
+/// context result. Same order of magnitude as `summary_max_chars`: if the net
+/// decrease is smaller than the injected summary text itself, the compressor is
+/// spinning (typical symptom: "295K shrank to 294K and stopped").
 const MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS: usize = 4_000;
 
-/// Path C 兜底：对尾窗内单个超大非 system 消息做 head+tail 截断时的单条上限。
-/// 仅在渐进式折叠后仍超 `hard_target` 时触发——宁可截断也不能让模型 4xx。
+/// Path C backstop: per-message cap for head+tail truncating a single oversized
+/// non-system message inside the tail window. Triggers only when progressive
+/// folding still leaves the context over `hard_target` — prefer truncation over
+/// letting the model 4xx.
 const PATH_C_PER_MSG_CAP: usize = 8_000;
 
-/// Mid-turn LLM 摘要兜底：无损/弱损管线之后仍超阈值时调用。三条互补路径：
-///   - Path A（跨轮摘要）：最近 `keep_recent_turns` 个 user 轮之前若还有对话，
-///     调 LLM 摘要器把那段压成单条 `internal_note` 注入到尾窗前；同时对尾窗
-///     内部较早的工具组做折叠，避免"臃肿全在最近一轮"时压不动。
-///   - Path B+C（渐进式折叠）：从 `keep_recent=4` 开始（等价于原 Path B），
-///     逐步缩小保护窗口到 2→1，直到有效压缩或降至 `hard_target` 以下。
-///     解决"臃肿全在保护尾窗内、早期历史已压无可压"时压缩器空转的问题。
-///   - Path C 兜底（per-message 截断）：渐进式折叠后仍超 `hard_target` 时，
-///     对尾窗内单个超大非 system 消息做 head+tail 截断。这是绝对最后手段。
-/// 头部所有 system / internal_note（agent 指令、工具列表、全局指引）始终原样保留。
-/// 返回 `(messages_after, before, after, was_effective, llm_summary_inserted)`；
-/// `was_effective` 仅在净下降 ≥ [`MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS`] 时为 true。
-/// false 不代表返回的 messages 未变化；硬预算兜底可能产生低于有效阈值的部分下降。
-/// `llm_summary_inserted` 表示 Path A 是否真的执行并注入了 `[mid-turn-summary]`：
-/// 为 false 且 `after < before` 说明下降全部来自机械路径（折叠/截断/外溢），
-/// 供上层报告区分"LLM 摘要已执行"与"纯机械压缩"，避免误报。
+/// Mid-turn LLM summary backstop: called when the lossless/weakly-lossy pipeline
+/// still leaves the context over threshold. Three complementary paths:
+///   - Path A (cross-turn summary): if conversation remains before the most recent
+///     `keep_recent_turns` user turns, call the LLM summarizer to compress that
+///     span into a single `internal_note` injected before the tail window; also
+///     fold older tool groups inside the tail window, so "bloat concentrated in
+///     the newest turn" can still shrink.
+///   - Path B+C (progressive folding): start from `keep_recent=4` (equivalent to
+///     the original Path B) and shrink the protection window step by step to 2→1,
+///     until compaction is effective or the context drops below `hard_target`.
+///     Fixes compressor spin when "all the bloat sits inside the protected tail
+///     window and early history has nothing left to fold".
+///   - Path C backstop (per-message truncation): when progressive folding still
+///     exceeds `hard_target`, head+tail truncate a single oversized non-system
+///     message in the tail window. This is the absolute last resort.
+/// All leading system / internal_note messages (agent instructions, tool lists,
+/// global guidance) are always kept verbatim. Returns
+/// `(messages_after, before, after, was_effective, llm_summary_inserted)`;
+/// `was_effective` is true only when the net decrease is >=
+/// [`MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS`]. false does not mean the returned
+/// messages are unchanged; the hard-budget backstop may produce a partial decrease
+/// below the effective threshold. `llm_summary_inserted` says whether Path A
+/// actually ran and injected `[mid-turn-summary]`: false with `after < before`
+/// means the decrease came entirely from mechanical paths (fold/truncate/spill),
+/// letting the upper report distinguish "LLM summary executed" from "purely
+/// mechanical compaction" and avoid false reporting.
 pub(in crate::ai) async fn mid_turn_llm_summarize(
     app: &App,
     messages: Vec<Message>,
@@ -2998,20 +3192,26 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         .session_assets_dir(&app.session_id);
     let protected_tool_call_ids = current_turn_precision_tool_call_ids(&messages);
     let lossless_tool_call_ids = current_turn_lossless_tool_call_ids(&messages);
-    // best 追踪迄今为止体积最小的结果；None 表示仍使用原始 messages。
+    // best tracks the smallest result so far; None means the original messages are
+    // still in use.
     let mut best: Option<Vec<Message>> = None;
     let mut best_after = before;
-    // Path A 是否真的执行并注入了 [mid-turn-summary]（见返回注释）。
+    // Whether Path A actually ran and injected [mid-turn-summary] (see the return
+    // doc).
     let mut llm_summary_inserted = false;
 
-    // === Path A：跨轮 LLM 摘要 ===
-    // 先按"保留最近 keep_recent_turns 个 user 轮"算切点。经过前置投影压缩后，
-    // 较早的 user 消息可能已被替换成 internal_note 摘要（role != "user"），导致
-    // 投影里可见的 user 边界不足 keep_recent_turns，retained_turn_start 返回 0。
-    // 但这并不代表没有可压缩的旧内容--第一个 user 消息之前仍可能残留被协议配对
-    // 保护的 assistant(tool_calls)/tool 记录（无法逐条删除）。此时把切点回退到
-    // 第一个 user 消息位置：尾部用户轮仍受保护，前缀的 system-like 摘要/归档标记
-    // 由 preserved_system_end 保留，二者之间的旧对话区段可被 LLM 摘要回收。
+    // === Path A: cross-turn LLM summary ===
+    // First compute the cut point as "keep the most recent keep_recent_turns user
+    // turns". After upstream projection compaction, older user messages may already
+    // have been replaced by internal_note summaries (role != "user"), leaving fewer
+    // visible user boundaries in the projection than keep_recent_turns, so
+    // retained_turn_start returns 0. That does not mean there is no compactable old
+    // content — before the first user message there may still be
+    // assistant(tool_calls)/tool records protected by protocol pairing (impossible
+    // to delete one by one). In that case fall the cut point back to the first user
+    // message position: the trailing user turns stay protected, the leading
+    // system-like summary/archive markers are kept by preserved_system_end, and the
+    // old conversation span between them can be reclaimed by the LLM summary.
     let mut split_at = retained_turn_start(&messages, keep_recent_turns);
     if split_at == 0 {
         if let Some(first_user) = messages.iter().position(|m| m.role == "user") {
@@ -3021,16 +3221,21 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         }
     }
     if split_at > 0 && split_at < messages.len() {
-        // 保留头部前缀连续的 system-like 消息（agent 指令等），只摘要其后的对话
-        // 区段。早期版本直接丢弃 messages[0] 的 system prompt，会让模型立刻失去
-        // agent 行为指令，表现为"压缩后回复戛然而止 / 极短 / 跑偏"。
+        // Keep the leading contiguous run of system-like messages (agent
+        // instructions etc.) and summarize only the conversation span after them.
+        // An early version dropped the messages[0] system prompt outright, which
+        // made the model instantly lose its agent behavior instructions — observed
+        // as "replies cut off abruptly / extremely short / off track after
+        // compaction".
         let preserved_system_end = messages[..split_at]
             .iter()
             .position(|m| !is_system_like_role(&m.role))
             .unwrap_or(split_at);
         let earlier = &messages[preserved_system_end..split_at];
-        // 从待摘要区段中抽出 context checkpoint 标记：它是定位已保存检查点正文的
-        // 唯一索引，绝不能被摘要吞掉。常规落盘压缩路径已做同样处理，这里补齐。
+        // Extract context checkpoint markers from the to-be-summarized span: they
+        // are the only index locating saved checkpoint bodies and must never be
+        // swallowed by the summary. The regular persisted-compaction path already
+        // does the same; this closes the gap here.
         let checkpoint_markers: Vec<Message> = earlier
             .iter()
             .filter(|m| is_context_checkpoint_marker(m))
@@ -3059,10 +3264,12 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 );
                 let mut out =
                     Vec::with_capacity(preserved_system_end + 2 + (messages.len() - split_at));
-                // 1. 头部 system / internal_note（agent 指令等）原样保留
+                // 1. Leading system / internal_notes (agent instructions etc.)
+                //    kept verbatim
                 out.extend_from_slice(&messages[..preserved_system_end]);
-                // 2. 摘要作为 internal_note 注入（normalize_messages_for_request 会把
-                //    它归类成 Summary heading 并合并进 system 消息）
+                // 2. The summary is injected as an internal_note
+                //    (normalize_messages_for_request classifies it as a Summary
+                //    heading and merges it into the system message)
                 out.push(Message {
                     role: ROLE_INTERNAL_NOTE.to_string(),
                     content: Value::String(format!(
@@ -3076,17 +3283,24 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                     &mut out,
                     build_overflow_placeholder(&archive_file_path.to_string_lossy()),
                 );
-                // 2b. 回填被抽出的 context checkpoint 标记，保留其可回读索引
+                // 2b. Put the extracted context checkpoint markers back, keeping
+                //     their re-readable index
                 out.extend(checkpoint_markers.iter().cloned());
-                // 3. 尾窗折叠先纯规划；整个 Path A 确认优于当前 best 后再统一写盘。
+                // 3. Tail-window folding is planned only at first; disk writes
+                //    happen uniformly after the whole Path A candidate is confirmed
+                //    better than the current best.
                 out.extend_from_slice(tail_plan.messages());
                 let after = messages_total_chars(&out);
-                // 先提交尾窗折叠，确认候选被采纳后再归档 earlier：archive 是追加式写
-                // overflow-history.md（非幂等），若提前归档而 commit 失败，`earlier`
-                // 已落盘但上下文未采纳 `out`，下轮压缩会重复归档同一批消息 → 孤儿累积。
-                // 短路 `&&` 保证 commit 失败时根本不会触碰归档；commit 成功后若归档
-                // 失败，`best` 不更新、上下文仍保留 earlier，无数据丢失（仅剩幂等
-                // 哈希命名的折叠文件）。
+                // Commit the tail-window fold first and archive `earlier` only
+                // after the candidate is confirmed adopted: archive appends to
+                // overflow-history.md (non-idempotent), so archiving early and then
+                // failing the commit would leave `earlier` on disk while the
+                // context never adopted `out`, and the next compaction round would
+                // archive the same messages again -> orphan accumulation. The
+                // short-circuit `&&` guarantees the archive is never touched when
+                // commit fails; if commit succeeds but archiving fails, `best` is
+                // not updated and the context still keeps `earlier` — no data loss
+                // (only an idempotently hash-named fold file remains).
                 if after < best_after
                     && tail_plan.commit()
                     && archive_messages_to_overflow(earlier, Some(overflow_dir.as_path())).is_some()
@@ -3095,7 +3309,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                     best_after = after;
                     llm_summary_inserted = true;
                 }
-                // 有效压缩且达标 → 直接返回
+                // Effective compaction meeting the target -> return directly
                 if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS
                     && best_after <= hard_target
                 {
@@ -3105,14 +3319,18 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         }
     }
 
-    // === Path B+C：渐进式工具组折叠 ===
-    // 从 keep_recent=4（等价于原 Path B）开始，逐步缩小保护窗口到 2→1（绝不到 0），
-    // 直到有效压缩或降至 hard_target 以下。解决"臃肿全在保护尾窗内"时空转。
-    // 在 best（Path A 结果或原始 messages）上链式折叠：已折叠的组变成 stub
-    //（internal_note），不会被 fold_early_tool_groups 再次匹配，因此每次迭代
-    // 只会折叠上一轮保留的组，逐步释放保护尾窗。窗口不降到 0（见
-    // [`MIN_KEEP_RECENT_TOOL_GROUPS`]）：保留最近 1 组逐字，剩余超额由下方 Path C
-    // per-message 截断兜底，避免把最近一次工具交互也 stub 化。
+    // === Path B+C: progressive tool-group folding ===
+    // Start from keep_recent=4 (equivalent to the original Path B) and shrink the
+    // protection window step by step to 2→1 (never to 0), until compaction is
+    // effective or the context drops below hard_target. Fixes the spin when "all
+    // the bloat sits inside the protected tail window". Folding chains on best
+    // (the Path A result or the original messages): already-folded groups became
+    // stubs (internal_notes) and will not match fold_early_tool_groups again, so
+    // each iteration folds only the groups the previous round kept, progressively
+    // releasing the protected tail window. The window never drops to 0 (see
+    // [`MIN_KEEP_RECENT_TOOL_GROUPS`]): the most recent 1 group stays verbatim,
+    // and remaining excess is handled by the Path C per-message truncation
+    // backstop below, avoiding stub-izing the most recent tool interaction too.
     for &keep_recent in progressive_fold_windows().iter() {
         if best_after <= hard_target {
             break;
@@ -3135,8 +3353,10 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         }
     }
 
-    // 只有真正达到 hard_target 才能提前返回。旧逻辑只要净下降超过 4K 就返回，
-    // 会跳过下面的硬兜底，让「旧组已省很多、最新一组仍单独超窗」继续发出超限请求。
+    // Only truly reaching hard_target allows an early return. The old logic
+    // returned as soon as the net decrease exceeded 4K, skipping the hard backstop
+    // below and letting "older groups already saved a lot, but the newest group
+    // alone still overflows the window" keep sending over-limit requests.
     if best_after <= hard_target {
         let was_effective = before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS;
         return (
@@ -3148,15 +3368,20 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         );
     }
 
-    // === Path C 兜底：预算感知的结构保留截断 ===
-    // 保留 system/user 与最近工具组的 assistant↔tool 配对；仅压缩可再取回的结果正文、
-    // reasoning 和超大 tool arguments。与旧的「每条最多 8K」不同，这里继续按总预算
-    // 收紧，因此并行工具结果很多时也能收敛。若不可裁的 system/user 本身已超预算，
-    // 返回可达到的最小结果，而不是破坏用户任务原文。
+    // === Path C backstop: budget-aware structure-preserving truncation ===
+    // Keep the assistant↔tool pairing of system/user messages and the most recent
+    // tool groups; compress only re-retrievable result bodies, reasoning, and
+    // oversized tool arguments. Unlike the old "8K per message", this keeps
+    // tightening against the total budget, so it converges even with many parallel
+    // tool results. If the untrimmable system/user content itself is over budget,
+    // return the smallest achievable result instead of corrupting the user's task
+    // text.
     let mut result = best.unwrap_or(messages);
-    // Path C 兜底前先对当前 turn 的所有禁止有损压缩结果做零压缩外溢：
-    // 原文落盘为可回读 asset 并替换为 stub，避免紧接着的 `emergency_cap_messages_to_fit`
-    // 把这些 grounding 证据有损截断到 8K / ~160 字符后原文不可恢复。
+    // Before the Path C backstop, spill every current-turn result that forbids
+    // lossy compaction with zero compression: persist the original as a
+    // re-readable asset and replace it with a stub, so the immediately following
+    // `emergency_cap_messages_to_fit` cannot lossy-truncate that grounding
+    // evidence to 8K / ~160 chars, making the original unrecoverable.
     spill_protected_precision_to_fit(
         &mut result,
         hard_target,
@@ -3182,25 +3407,30 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     )
 }
 
-/// 单张图片在「字符预算」里的名义计费。
+/// Nominal billing cost of a single image in the "char budget".
 ///
-/// 视觉模型把一张图 tokenize 成几百~一两千 token，与其 base64 文本长度
-/// （动辄数十万字符）完全脱钩。历史上 `value_len_chars` 直接按 base64 文本
-/// 长度计费，导致**一张大图就把整个上下文预算吃光**：`messages_total_chars`
-/// 暴涨到远超 max_chars / soft_threshold，压缩管线于是每轮都把 agent 自己的
-/// 工具结果（工作记忆）挤出窗口 —— 单 turn 内表现为「失忆 + 反复重复之前的
-/// 探索/计划」。这里给图片一个固定名义成本，让预算回归文本主导。
-/// 注意：这只改预算**计量**，不改消息内容本身（图片仍零压缩原样发送）。
+/// A vision model tokenizes one image into a few hundred to one-or-two thousand
+/// tokens, fully decoupled from its base64 text length (easily hundreds of
+/// thousands of chars). Historically `value_len_chars` billed directly by base64
+/// text length, so **one large image ate the entire context budget**:
+/// `messages_total_chars` ballooned far past max_chars / soft_threshold, and the
+/// compaction pipeline evicted the agent's own tool results (its working memory)
+/// every round — within one turn this showed up as "amnesia + repeatedly
+/// restating earlier exploration/plans". Give images a fixed nominal cost so the
+/// budget returns to being text-dominated.
+/// Note: this only changes budget **accounting**, not the message content itself
+/// (images are still sent verbatim with zero compression).
 const IMAGE_BUDGET_CHARS: usize = 1_024;
 
-/// 判断裸字符串是否是内联图片 data URL（极少数 provider 会把图片放进纯字符串）。
+/// Whether a bare string is an inline image data URL (a few providers put images
+/// into plain strings).
 fn is_inline_image_data_url(s: &str) -> bool {
     let t = s.trim_start();
     t.starts_with("data:image/") && t.contains(";base64,")
 }
 
-/// 计算多模态 content 数组中单个 part 的预算字符数：图片按名义成本计费，
-/// 文本按其实际字符数计费。
+/// Budget char count of a single part in a multimodal content array: images are
+/// billed at nominal cost, text at its actual char count.
 fn content_part_budget_chars(item: &Value) -> usize {
     let is_image = item.get("type").and_then(|t| t.as_str()) == Some("image_url")
         || item.get("image_url").is_some();
@@ -3213,12 +3443,14 @@ fn content_part_budget_chars(item: &Value) -> usize {
     item.to_string().chars().count()
 }
 
-/// 返回 Value 内容的「预算字符数」（Unicode scalar 数）。
-/// 历史上这里返回的是 byte length，导致中文/emoji 场景下字符预算被高估 ~3 倍：
-/// 例如 36K 字符的软阈值在中文 turn 下会被 12K 字符就误触发，反复跑压缩管线。
-/// 现在统一按 `chars().count()` 计量，与外层 `cap_chars`、`max_chars`
-/// 阈值的命名保持一致。图片 part 按 [`IMAGE_BUDGET_CHARS`] 名义计费，避免
-/// base64 文本长度污染预算（见该常量文档）。
+/// "Budget char count" of a Value's content (Unicode scalar count).
+/// Historically this returned byte length, overestimating the char budget ~3x for
+/// Chinese/emoji content: a 36K-char soft threshold could be falsely triggered by
+/// a 12K-char Chinese turn, re-running the compaction pipeline over and over. Now
+/// measured uniformly by `chars().count()`, consistent with the naming of the
+/// outer `cap_chars` / `max_chars` thresholds. Image parts are billed nominally
+/// via [`IMAGE_BUDGET_CHARS`], keeping base64 text length from polluting the
+/// budget (see that constant's doc).
 fn value_len_chars(v: &Value) -> usize {
     if let Some(s) = v.as_str() {
         if is_inline_image_data_url(s) {
@@ -3232,17 +3464,20 @@ fn value_len_chars(v: &Value) -> usize {
     v.to_string().chars().count()
 }
 
-/// 单条消息进入模型请求时的「计费字符数」——唯一权威口径。
+/// "Billed char count" of a single message entering a model request — the single
+/// authoritative measure.
 ///
-/// 历史上多处预算只统计 `content`，把 `tool_calls[].function.arguments`
-/// （典型 `apply_patch` 会把整份大补丁放进 arguments、content 为空）与
-/// `reasoning_content`（thinking 模式的长思维链）完全漏算，导致大消息
-/// 绕过压缩门控、TPM preflight 与 max_tokens clamp 一起低估输入。
+/// Historically many budget checks counted only `content`, entirely missing
+/// `tool_calls[].function.arguments` (typically `apply_patch` puts a whole large
+/// patch into arguments with empty content) and `reasoning_content` (long
+/// thinking chains), letting large messages bypass compaction gating and making
+/// TPM preflight and the max_tokens clamp underestimate input together.
 ///
-/// 这里把三者合并计量，与 SQL 端 `total_message_chars_sqlite`
-/// （`length(content)+length(tool_calls)+length(reasoning_content)`）对齐，
-/// 使「内存态预算」与「持久化预算」共用同一口径。图片仍按
-/// [`IMAGE_BUDGET_CHARS`] 名义计费（见 `value_len_chars`）。
+/// This combines all three into one measure, aligned with the SQL side
+/// `total_message_chars_sqlite`
+/// (`length(content)+length(tool_calls)+length(reasoning_content)`), so the
+/// "in-memory budget" and "persisted budget" share one measure. Images are still
+/// billed nominally via [`IMAGE_BUDGET_CHARS`] (see `value_len_chars`).
 pub(in crate::ai) fn message_billable_chars(m: &Message) -> usize {
     let content_chars = value_len_chars(&m.content);
     let tool_call_chars = m
@@ -3266,8 +3501,9 @@ pub(in crate::ai) fn value_to_string(v: &Value) -> String {
     if let Some(s) = v.as_str() {
         return s.to_string();
     }
-    // 多模态消息（JSON 数组）：只提取文本部分，丢弃图片 base64 数据，
-    // 避免生成摘要/标题时把巨大的 base64 内容喂给模型或显示给用户。
+    // Multimodal messages (JSON arrays): extract only the text parts and discard
+    // image base64 data, avoiding feeding huge base64 content to the model or
+    // showing it to the user when generating summaries/titles.
     if let Some(arr) = v.as_array() {
         let mut text_parts = Vec::new();
         let mut has_image = false;
@@ -3406,9 +3642,11 @@ fn progressive_fold_windows() -> Vec<usize> {
     windows
 }
 
-/// 带 tool_calls 的 assistant 消息中，保留完整 reasoning_content 的最近轮数。
-/// 更早的 tool-call reasoning 置 None（DeepSeek 由 echo 兜底补空字符串占位），
-/// 防止历史 reasoning 文本在长 session 里单调累积，拖慢响应并挤占上下文预算。
+/// For assistant messages carrying tool_calls, how many recent turns keep full
+/// reasoning_content. Older tool-call reasoning is set to None (DeepSeek fills an
+/// empty-string placeholder via echo as a backstop), preventing historical
+/// reasoning text from accumulating monotonically over long sessions, slowing
+/// responses and squeezing the context budget.
 const KEEP_RECENT_TOOL_CALL_REASONING: usize = 3;
 
 fn tool_message_indices(messages: &[Message]) -> Vec<usize> {
@@ -3419,11 +3657,13 @@ fn tool_message_indices(messages: &[Message]) -> Vec<usize> {
         .collect()
 }
 
-/// 判断 message content 是否包含真正的图片附件（OpenAI Vision schema）。
-/// 图片必须以 multimodal `Value::Array` 形式存在，且数组中含
+/// Whether message content contains a real image attachment (OpenAI Vision
+/// schema). The image must exist as a multimodal `Value::Array`, and the array
+/// must contain
 /// `{"type":"image_url", "image_url":{...}}`。
-/// 旧实现用 `text.contains("data:image/")` 误判：agent 在普通文本里讨论
-/// `data:image/png` 字串就会被整条替换，丢信息。
+/// The old implementation misjudged via `text.contains("data:image/")`: the agent
+/// merely discussing the `data:image/png` string in plain text got the whole
+/// message replaced, losing information.
 fn message_contains_image(content: &Value) -> bool {
     let Some(arr) = content.as_array() else {
         return false;
@@ -3436,7 +3676,8 @@ fn message_contains_image(content: &Value) -> bool {
 
 fn redact_images_except_last(messages: &mut [Message], keep_last: usize) {
     let _ = (messages, keep_last);
-    // 用户要求图片内容零压缩：历史压缩阶段不再把旧图片替换成 [[image omitted]]。
+    // Images are required to stay zero-compression: the history compaction stage
+    // no longer replaces old images with [[image omitted]].
 }
 
 fn dedup_adjacent(messages: &mut Vec<Message>) {
@@ -3448,12 +3689,15 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
     let mut prev_content = String::new();
     let mut prev_signature = String::new();
     let mut prev_tool_call_id: Option<String> = None;
-    // 上一条 tool 消息的 tool_call_id：只有同 tool_call_id 才视为同一次调用的重复结果。
+    // tool_call_id of the previous tool message: only the same tool_call_id counts
+    // as a duplicate result of the same call.
     for m in messages.drain(..) {
         let text = value_to_string(&m.content);
-        // 完全相等去重仅对 tool 启用：用户/助手/system 原文不做去重。
-        // 必须同 tool_call_id：并行工具调用返回相同文本属于不同调用，不能丢弃，
-        // 否则会破坏 assistant tool_call <-> tool result 的配对。
+        // Exact-equality dedup applies only to tool messages: user/assistant/system
+        // originals are never deduped. Must share the same tool_call_id: parallel
+        // tool calls returning identical text are different calls and must not be
+        // dropped, otherwise the assistant tool_call <-> tool result pairing
+        // breaks.
         if m.role == "tool"
             && m.role == prev_role
             && text == prev_content
@@ -3462,8 +3706,10 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
         {
             continue;
         }
-        // 模糊去重：仅对 tool 角色启用，避免误伤 assistant/user 中观感相近但实质不同的回复。
-        // 同 role 且整段 text 的 tool_line_signature 相同（去掉空白噪音 + 关键 token 一致）才丢弃。
+        // Fuzzy dedup: enabled only for the tool role, avoiding false hits on
+        // assistant/user replies that look similar but differ in substance. Drop
+        // only when the role matches and the whole text's tool_line_signature is
+        // identical (whitespace noise stripped + key tokens equal).
         let signature = if m.role == "tool" {
             tool_line_signature(&text)
         } else {
@@ -3487,21 +3733,28 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
     *messages = out;
 }
 
-/// 裁剪历史中的 reasoning_content，只保留确有必要回传给厂商的那些。
+/// Trim reasoning_content in the history, keeping only what truly needs to be
+/// sent back to the vendor.
 ///
-/// 较老的 reasoning chain 对后续 turn 决策几乎没有帮助，去掉可节省上下文预算。
-/// 部分模型对 tool-call reasoning 有回传约束，因此这里的策略是：
-/// - 模型显式声明 exact replay 的 continuation state 带内部标记，只要所属
-///   assistant/tool 协议组仍在上下文中就始终保留；整组被摘要替代后无需再回放；
-/// - 其他带 `tool_calls` 的 assistant 消息只保留最近
-///   `KEEP_RECENT_TOOL_CALL_REASONING` 轮的完整 reasoning_content，更早的置 None；
-///   DeepSeek 所需的缺失字段由 request 层用空字符串占位补齐，避免历史 reasoning
-///   文本在长 session 里单调累积、拖慢并"变蠢"；
-/// - 不带 tool_calls 的纯回答 assistant 消息：只保留最近一条的 reasoning_content，
-///   其余置 None（OpenAI 等仅要求与最近一次 tool_call 同回合的 reasoning 配对，
-///   旧的纯回答 reasoning 可安全丢弃）。
+/// Older reasoning chains barely help later turn decisions; dropping them saves
+/// context budget. Some models constrain tool-call reasoning replay, so the policy
+/// here is:
+/// - continuation state the model explicitly declared as exact replay carries the
+///   internal marker and is always kept as long as its assistant/tool protocol
+///   group is still in context; once the whole group is replaced by a summary, no
+///   replay is needed;
+/// - other assistant messages with `tool_calls` keep full reasoning_content only
+///   for the most recent `KEEP_RECENT_TOOL_CALL_REASONING` turns, older ones set
+///   to None; missing fields DeepSeek requires are backfilled with empty strings
+///   by the request layer, avoiding historical reasoning text accumulating
+///   monotonically over long sessions, slowing responses and "getting dumber";
+/// - plain-answer assistant messages without tool_calls: keep only the most
+///   recent one's reasoning_content, the rest set to None (OpenAI et al. only
+///   require reasoning paired with the most recent tool_call in the same turn;
+///   old plain-answer reasoning can be dropped safely).
 fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
-    // 最近一条「不带 tool_calls」的 assistant reasoning 索引——这一条予以保留。
+    // Index of the most recent assistant reasoning "without tool_calls" — this one
+    // is kept.
     let keep_plain_idx = messages
         .iter()
         .enumerate()
@@ -3511,7 +3764,8 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
         })
         .map(|(idx, _)| idx);
 
-    // 未标记的 tool-call assistant reasoning 跨轮滑窗：只保留最近 N 条完整文本。
+    // Cross-turn sliding window for unmarked tool-call assistant reasoning: keep
+    // only the most recent N full texts.
     let tool_call_reasoning_count = messages
         .iter()
         .filter(|m| {
@@ -3530,14 +3784,16 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
         if m.role != "assistant" || m.reasoning_content.is_none() {
             continue;
         }
-        // exact replay 是所属 tool-call 消息的协议状态；消息仍在时不能单独裁掉。
+        // exact replay is the protocol state of its tool-call message; it cannot
+        // be trimmed alone while the message is still present.
         if m.reasoning_content
             .as_deref()
             .is_some_and(|reasoning| reasoning.starts_with(PERSISTED_REASONING_REPLAY_PREFIX))
         {
             continue;
         }
-        // 带 tool_calls 的回合：仅保留最近 N 条完整 reasoning，其余置 None。
+        // Turns with tool_calls: keep only the most recent N full reasonings, the
+        // rest set to None.
         if m.tool_calls.is_some() {
             let rank = seen_tool_call_reasoning;
             seen_tool_call_reasoning += 1;
@@ -3546,7 +3802,7 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
             }
             continue;
         }
-        // 纯回答回合：只保留最近一条。
+        // Plain-answer turns: keep only the most recent one.
         if Some(idx) == keep_plain_idx {
             continue;
         }
@@ -3554,10 +3810,12 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
     }
 }
 
-/// 跨轮 tool 结果去重：同一 (tool_name, normalized_args) 在历史中出现多次时，
-/// 把较早的 tool 结果替换为单行 stub（保留 tool_call_id 以维持 OpenAI tool-calls 协议正确性）。
-/// 仅压缩内容，不删除消息，避免 assistant tool_calls 与 tool 响应的配对断裂。
-/// 最近 KEEP_RECENT_TOOL_GROUPS 个完整工具组一律保留全文。
+/// Cross-turn tool result dedup: when the same (tool_name, normalized_args)
+/// appears multiple times in the history, earlier tool results are replaced with
+/// a single-line stub (tool_call_id kept to preserve OpenAI tool-calls protocol
+/// correctness). Only content is compressed, no messages deleted, avoiding a
+/// broken pairing between assistant tool_calls and tool responses. The most
+/// recent KEEP_RECENT_TOOL_GROUPS complete tool groups are always kept in full.
 fn dedup_repeated_tool_results(
     messages: &mut [Message],
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
@@ -3565,8 +3823,8 @@ fn dedup_repeated_tool_results(
     use rustc_hash::{FxHashMap, FxHasher};
     use std::hash::{Hash, Hasher};
 
-    // 收集 (tool_name, args_signature) → 出现次数与索引
-    // 通过 assistant.tool_calls 关联 tool_call_id → (name, args)
+    // Collect (tool_name, args_signature) -> occurrence counts and indices
+    // Map tool_call_id -> (name, args) via assistant.tool_calls
     let mut id_occurrences: FxHashMap<String, usize> = FxHashMap::default();
     for message in messages.iter() {
         for tool_call in message.tool_calls.iter().flatten() {
@@ -3597,9 +3855,12 @@ fn dedup_repeated_tool_results(
     let tool_indices = tool_message_indices(messages);
     let protected_indices = recent_tool_group_message_indices(messages, KEEP_RECENT_TOOL_GROUPS);
 
-    // `read_file` 的 offset/limit 不同不会命中调用签名去重，但它们可能包含同一
-    // 段文件。仅在两个结果都已离开近端保护窗口、同文件重叠行逐字一致时，才从较早
-    // 结果删除重叠行；任一行不同（文件曾被编辑、输出格式变化等）即保持原样。
+    // `read_file` calls with different offset/limit do not hit call-signature
+    // dedup, but they may contain the same file span. Only when both results have
+    // left the near-end protection window and the overlapping lines of the same
+    // file are verbatim identical, delete the overlapping lines from the earlier
+    // result; if any line differs (file was edited, output format changed, etc.),
+    // keep both as-is.
     dedup_overlapping_read_file_results(
         messages,
         &id_to_signature,
@@ -3607,41 +3868,54 @@ fn dedup_repeated_tool_results(
         protected_tool_call_ids,
     );
 
-    // (name, args) → 该签名下"最新保留全文"的 tool 调用，用于在折叠时回指。
+    // (name, args) -> the "newest full-text-kept" tool call under that signature,
+    // used as the fold back-reference.
     let mut seen: FxHashMap<(String, String), DedupToolOccurrence> = FxHashMap::default();
-    // (tool_name, content_hash) → 最新出现该内容版本的 tool 调用。
-    // 内容级去重是断开"重复整篇重读"失忆环的关键：对 read_file 等
-    // non-compressible 工具，同一 (文件) 被反复读取时往往返回**逐字节
-    // 相同**的全文（实测占全部 tool 字节的 ~52%）。这些冗余副本可无损折叠，
-    // 而内容确实变化的版本（如被编辑过的文件）因 hash 不同得以完整保留。
+    // (tool_name, content_hash) -> the tool call where that content version most
+    // recently appeared.
+    // Content-level dedup is the key to breaking the "re-reading the same whole
+    // file" amnesia loop: for non-compressible tools like read_file, repeated
+    // reads of the same (file) often return **byte-identical** full text (measured
+    // at ~52% of all tool bytes). Such redundant copies can be folded losslessly,
+    // while versions whose content truly changed (e.g. an edited file) survive
+    // intact because their hash differs.
     //
-    // **关键**：key 不携带 `args_norm`——历史上把 args 也纳入键，导致显式的
-    // "同一查询的大小写/路径变体"（`readFileLines` vs `read_file_lines`、
-    // 大小写敏感差异等）即便返回**逐字节相同**的"无命中"体也 collapse 不掉，
-    // 在尾部反复堆积 6+ 份 15KB 的同内容（详 e75fc2e5 session dump）。
-    // 改用 `(tool_name, content_hash)`：只要返回体本身一致就折叠——args 不同
-    // 由调用签名去重的 `seen` 计数器单独管，不影响内容级折叠。
+    // **Key point**: the key does not carry `args_norm` — historically args were
+    // part of the key, so explicit "case/path variants of the same query"
+    // (`readFileLines` vs `read_file_lines`, case-sensitivity differences, etc.)
+    // would not collapse even when returning **byte-identical** "no hit" bodies,
+    // piling up 6+ copies of 15KB identical content at the tail (see the e75fc2e5
+    // session dump). Switched to `(tool_name, content_hash)`: fold whenever the
+    // returned body itself matches — different args are handled separately by the
+    // call-signature dedup's `seen` counter and do not affect content-level
+    // folding.
     let mut seen_content: FxHashMap<(String, u64), DedupToolOccurrence> = FxHashMap::default();
-    // 从新到旧扫描，确保最新一次调用保留全文，较早的重复结果才被折叠。
-    // 这对失败后重试尤其关键：成功重试不能被旧失败占据 canonical 位置后压成 stub。
+    // Scan from newest to oldest so the newest call keeps full text and only older
+    // duplicates get folded. Especially critical for retry-after-failure: a
+    // successful retry must not be squashed into a stub after an old failure took
+    // the canonical slot.
     for &idx in tool_indices.iter().rev() {
         if messages[idx]
             .tool_call_id
             .as_ref()
             .is_some_and(|id| ambiguous_ids.contains(id))
         {
-            // 旧历史里复用的 ID 无法可靠关联到具体 assistant occurrence；保留原文。
+            // IDs reused in old history cannot be reliably linked to a specific
+            // assistant occurrence; keep the original text.
             continue;
         }
         let occurrence = dedup_tool_occurrence(messages, idx, &id_to_signature, &id_to_args_raw);
         let occurrence = match occurrence {
             Some(occurrence) => occurrence,
             None => {
-                // 孤儿 tool：找不到对应的 assistant.tool_calls（可能因为 assistant 消息
-                // 已被早期裁剪/丢弃，或写入历史时配对就已经断裂）。这些消息在
-                // normalize_messages_for_request 阶段会被丢掉，但在压缩阶段仍占用
-                // 字符预算。最近完整工具组的结果保留全文以防误伤；
-                // 较旧的孤儿一律折叠为短 stub，避免阻塞后续压缩判断。
+                // Orphan tool: no matching assistant.tool_calls found (the
+                // assistant message may have been trimmed/dropped early, or the
+                // pairing was already broken when written to history). These
+                // messages get dropped at normalize_messages_for_request time but
+                // still consume char budget during compaction. Results of the most
+                // recent complete tool groups keep full text to avoid collateral
+                // damage; older orphans are always folded into short stubs so they
+                // do not block later compaction decisions.
                 if !protected_indices.contains(&idx) {
                     let tool_call_id = messages[idx].tool_call_id.clone().unwrap_or_default();
                     let stub = if tool_call_id.is_empty() {
@@ -3669,33 +3943,48 @@ fn dedup_repeated_tool_results(
         if signature_canonical.is_none() {
             seen.insert(signature_key, occurrence.clone());
         }
-        // **不再豁免最近保护窗内的重复**。历史上这里 `if protected_indices.contains(&idx) continue;`
-        // 让最近 N 个工具组完全跳过去重，于是 agent 不断重发同一查询、最新副本一直
-        // 落到"最近窗"里 → 永不被折叠，尾部堆积 15KB × 29 份的逐字节相同结果。
-        // 现在让 dedup 一视同仁跑遍所有 tool 消息：逆序首见（即最新一次）登记为
-        // canonical 全文，其余较早副本一律折叠为回指 stub。模型仍能看到最新全文，
-        // 同时避免旧失败覆盖后续成功重试的有效结果。
-        // orphan 的保护逻辑（上面的 `!protected_indices.contains`）已经单独处理，
-        // 不受这里影响。
-        // 内容级去重同样作用于 current-turn precision 保护的调用（本轮内的
-        // read_file 重读）：同一轮内对同一文件逐字节相同的重读是纯冗余，折叠较早
-        // 副本、保留逆序首见（最新）全文即可。这不违反"precision 结果保持 raw"
-        // 不变式——最新副本仍是 raw 全文，旧副本只是回指它；同时直接切断
-        // "同轮内全文重读堆积 → 近端 offload → 失忆再重读"的环。
+        // **No longer exempt duplicates inside the recent protection window**.
+        // Historically `if protected_indices.contains(&idx) continue;` here let the
+        // most recent N tool groups skip dedup entirely, so the agent kept
+        // re-sending the same query, the newest copy always landed in the "recent
+        // window" and was never folded -> 15KB x 29 byte-identical results piled up
+        // at the tail. Now dedup runs uniformly over all tool messages: the first
+        // seen in reverse order (i.e. the newest) is registered as the canonical
+        // full text, and all earlier copies are folded into back-reference stubs.
+        // The model still sees the newest full text, while an old failure can no
+        // longer override a later successful retry's valid result.
+        // Orphan protection (the `!protected_indices.contains` above) is handled
+        // separately and is unaffected here.
+        // Content-level dedup also applies to current-turn precision-protected
+        // calls (re-reads within this turn): byte-identical re-reads of the same
+        // file within one turn are pure redundancy — fold the earlier copies and
+        // keep the reverse-order-first (newest) full text. This does not violate
+        // the "precision results stay raw" invariant — the newest copy is still the
+        // raw full text and older copies merely back-reference it; it also directly
+        // cuts the "same-turn full re-read pile-up -> near-end offload -> amnesia
+        // and re-read" loop.
         if tool_uses_content_identity_dedup(&occurrence.tool_name) {
-            // read_file/检索类工具**内容不同的版本**必须零压缩保留（Invariant：
-            // precision 结果不做 lossy 裁剪）。但**逐字节相同**的重复副本是纯冗余，
-            // 折叠它们不丢失任何信息，且能直接消除"旧全文堆积 + 近端 offload 触发
-            // 重读"的失忆环。用内容 hash 区分二者：hash 首见 → 保留全文并登记；
-            // hash 重现 → 折叠为回指最新全文的 stub（保留 tool_call_id 以维持协议）。
+            // For read_file/retrieval-style tools, **versions with different
+            // content** must be kept with zero compression (invariant: precision
+            // results get no lossy trimming). But **byte-identical** duplicates are
+            // pure redundancy; folding them loses nothing and directly removes the
+            // amnesia loop of "old full texts pile up + near-end offload triggers
+            // re-reads". Distinguish the two by content hash: first sighting of a
+            // hash -> keep full text and register it; hash reappears -> fold into a
+            // stub back-referencing the newest full text (tool_call_id kept to
+            // preserve the protocol).
             let text = value_to_string(&messages[idx].content);
-            // 若内容本身已是 overflow/truncation 归档 stub，它并非"完整结果"：
-            // canonical（逆序首见）与本副本 byte-identical，因此 canonical 同样是
-            // 截断 stub。此时折叠成"reuse the canonical full result"是谎报——真实
-            // 案例：task_wait 结果先被 overflow 截断成 [context-overflow-truncated]，
-            // dedup 再谎称可复用 canonical 全文，模型反复追 canonical 却永远拿不到
-            // 原文（下一跳仍是 stub 的回指链）。跳过折叠：每条 stub 自带 file_path
-            // 召回指针，保留它们即可让模型直接回读归档原文。
+            // If the content is already an overflow/truncation archive stub, it is
+            // not a "complete result": the canonical (reverse-order-first) copy is
+            // byte-identical to this one, so the canonical is also a truncation
+            // stub. Folding into "reuse the canonical full result" here would be a
+            // false claim — real case: a task_wait result was first
+            // overflow-truncated into [context-overflow-truncated], then dedup
+            // claimed the canonical full text was reusable; the model chased the
+            // canonical repeatedly but never got the original (the next hop was
+            // still a stub back-reference). Skip folding: each stub carries its own
+            // file_path recall pointer, and keeping them lets the model read the
+            // archived original directly.
             if is_content_overflow_archived_stub(&messages[idx].content) {
                 continue;
             }
@@ -3718,13 +4007,16 @@ fn dedup_repeated_tool_results(
             }
             continue;
         }
-        // 签名级去重仍跳过 current-turn precision 保护的调用：args 变体本身携带
-        // 信息（offset/limit/use_line_numbers 不同就不该折叠），避免误伤本轮正在
-        // 使用的读取。上面的内容级去重已经处理了"真正逐字节相同"的情况。
+        // Signature-level dedup still skips current-turn precision-protected
+        // calls: args variants carry information themselves (different
+        // offset/limit/use_line_numbers must not be folded), avoiding collateral
+        // damage to reads in use this turn. The content-level dedup above already
+        // handled the "truly byte-identical" cases.
         if protected_tool_call_ids.contains(&occurrence.tool_call_id) {
             continue;
         }
-        // 逆序首见即最新调用；把更早的同签名结果折叠为 stub。
+        // Reverse-order first sighting is the newest call; fold older
+        // same-signature results into stubs.
         if let Some(canonical) = signature_canonical {
             let text = value_to_string(&messages[idx].content);
             let stub = render_dedup_tool_stub(
@@ -3780,11 +4072,13 @@ fn tool_uses_content_identity_dedup(tool_name: &str) -> bool {
     is_non_compressible_tool(tool_name) || tool_name == "tree"
 }
 
-/// 内容是否为「已外溢/截断的归档 stub」——即本身就不是完整结果，只是一个指向
-/// 磁盘原文的召回指针（`[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]` 或
-/// `[context-overflow-truncated]`）。byte-identical dedup 遇到这类内容时必须
-/// 跳过折叠：canonical 与副本逐字节相同 ⇒ canonical 同样是截断 stub，谎称
-/// "reuse the canonical full result" 会把模型导向拿不到原文的回指链。
+/// Whether the content is an "already-spilled/truncated archive stub" — i.e. not
+/// a complete result at all, just a recall pointer to the on-disk original
+/// (`[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]` or `[context-overflow-truncated]`).
+/// byte-identical dedup must skip folding for such content: canonical and copy
+/// are byte-identical ⇒ the canonical is likewise a truncation stub, and claiming
+/// "reuse the canonical full result" would lead the model into a back-reference
+/// chain that never yields the original.
 fn is_content_overflow_archived_stub(content: &Value) -> bool {
     if is_preserved_tool_overflow_content(content) {
         return true;
@@ -4013,7 +4307,8 @@ fn dedup_overlapping_read_file_results(
             continue;
         };
 
-        // 近端完整工具组必须逐字保留，避免下一轮模型看到被处理过的刚读取内容。
+        // Near-end complete tool groups must be kept verbatim, so the model does
+        // not see processed just-read content in the next round.
         if protected_indices.contains(&idx) || protected_tool_call_ids.contains(tool_call_id) {
             prior_results.push(NumberedReadFileResult {
                 message_idx: idx,
@@ -4074,7 +4369,8 @@ fn parse_numbered_read_file_output_lines(text: &str) -> Option<Vec<(usize, Strin
     (!lines.is_empty()).then_some(lines)
 }
 
-/// 返回双方所有共有行号，前提是每一个共有行的内容均完全相同。
+/// Returns all line numbers shared by both sides, provided every shared line's
+/// content is exactly identical.
 fn matching_line_numbers(
     earlier: &[(usize, String)],
     later: &[(usize, String)],

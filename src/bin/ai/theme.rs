@@ -15,6 +15,8 @@ pub(in crate::ai) const ACCENT_SUCCESS: &str = "\x1b[38;2;134;194;166m";
 pub(in crate::ai) const ACCENT_EMPHASIZED_OUTPUT: &str = "\x1b[38;2;152;195;121m";
 pub(in crate::ai) const ACCENT_WARN: &str = "\x1b[38;2;245;158;11m";
 pub(in crate::ai) const ACCENT_DANGER: &str = "\x1b[38;2;251;113;133m";
+/// 浅红：用于 `/ss` 中标记为重要（`/mark`）的 session 行，醒目但不刺眼。
+pub(in crate::ai) const ACCENT_MARKED: &str = "\x1b[38;2;255;150;150m";
 pub(in crate::ai) const ACCENT_RULE: &str = "\x1b[38;2;71;85;105m";
 /// 已提交用户输入预览：柔和中紫（较亮、降饱和），在白底/深底上都清晰可辨，
 /// 又不会因过饱和而与深色背景形成刺眼对比；与编辑态的低饱和暖灰区分。

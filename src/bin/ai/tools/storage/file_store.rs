@@ -6,8 +6,8 @@ use crate::ai::tools::storage::temp_registry;
 use aios_kernel::primitives::VfsError;
 
 pub(crate) struct FileStore {
-    /// 调用方传入的原始路径（未经 resolve），用于错误提示中展示，避免模型
-    /// 看到解析后的绝对路径时无法对应自己的输入。
+    /// Original path as passed by the caller (unresolved), shown in error messages so the model
+    /// can map a resolved absolute path back to its own input.
     original: PathBuf,
     path: PathBuf,
 }
@@ -26,10 +26,10 @@ impl FileStore {
     }
 
     pub(crate) fn validate_read_access(&self) -> Result<(), AiError> {
-        // 外溢归档是请求侧压缩后的唯一完整快照，必须可读；否则对模型而言等价于
-        // 丢弃。read_file 归档中的历史行号由 service::file 在渲染前剥离，避免
-        // 回读时产生嵌套行号。这里仍需把快照限制在当前会话，避免绝对路径把
-        // 相邻会话的历史内容带入当前上下文。
+        // The overflow archive is the only complete post-compression snapshot on the request side and must stay readable; otherwise, to the model, it is
+        // equivalent to dropping it. Historical line numbers in read_file archives are stripped by service::file before rendering to avoid
+        // nested line numbers on re-read. The snapshot must still be scoped to the current session so absolute paths cannot pull
+        // neighboring sessions' history into the current context.
         if let Some(reason) = blocked_overflow_read_reason(&self.path) {
             return Err(AiError::file(self.path.display().to_string(), reason));
         }
@@ -41,18 +41,18 @@ impl FileStore {
         if path_within_allowed_roots(&self.path) {
             return Ok(());
         }
-        // 同 session 的临时文件：write_file(temp=true) 已把解析后的绝对路径注册进
-        // temp registry。即使该路径不在 effective_cwd / allowed_roots / 当前 temp_dir
-        // 之下（例如子代理在隔离临时目录里创建的文件），write_file / apply_patch 也应
-        // 允许继续操作，而不是被沙箱拦截。这是对「同 session 临时文件」的最权威判定。
+        // Same-session temp files: write_file(temp=true) has registered the resolved absolute path in the
+        // temp registry. Even if the path is outside effective_cwd / allowed_roots / the current temp_dir
+        // (e.g. a file created by a subagent in an isolated temp dir), write_file / apply_patch must still
+        // be allowed to proceed rather than being blocked by the sandbox. This is the most authoritative check for a "same-session temp file".
         if temp_registry::is_registered(&self.path.display().to_string()) {
             return Ok(());
         }
         let resolved = self.path.display();
-        // 明确告知模型「能写哪里」，而不仅是「这里不能写」。此前消息只提示
-        // temp=true（scratch 语义），当模型的真实目标是把正式产物写到某个指定
-        // 目录时无从下手，于是对同一越界路径反复重试。这里给出可写根目录 +
-        // 两条具体可选路径（写进根目录内 / 用 temp=true），让模型一次纠偏。
+        // Tell the model explicitly "where it can write", not just "it cannot write here". The previous message only mentioned
+        // temp=true (scratch semantics); when the model's real goal is to write a final artifact to some specified
+        // directory it had no way to proceed and kept retrying the same out-of-bounds path. Provide the writable root +
+        // two concrete options (write inside the root / use temp=true) so the model can correct course in one step.
         let roots = writable_roots_for_hint();
         let root_hint = match roots.first() {
             Some(root) => format!(
@@ -87,7 +87,7 @@ impl FileStore {
     }
 
     pub(crate) fn read_to_string(&self) -> Result<String, AiError> {
-        // 优先路由到 AIOS VfsOps（带 trace + rusage_charge）；当内核未绑定时退回裸 std::fs。
+        // Route through AIOS VfsOps first (with trace + rusage_charge); fall back to bare std::fs when the kernel is not bound.
         if let Some(result) = try_vfs_read(&self.path) {
             return result.map_err(|e| vfs_to_ai_err(&self.path, e));
         }
@@ -100,12 +100,12 @@ impl FileStore {
     }
 
     pub(crate) fn write_all(&self, content: &str) -> Result<(), AiError> {
-        // 改动前快照（best-effort）：供 mutation log 的 before 字段使用。
-        // 新文件 / 二进制 / 读取失败均为 None，不影响写盘。
+        // Pre-change snapshot (best-effort): used for the before field of the mutation log.
+        // New files / binaries / read failures all yield None and never affect the write itself.
         let before = self.read_to_string().ok();
         let result = self.write_all_inner(content);
         if result.is_ok() {
-            // 记录到会话级 mutation log（best-effort，绝不影响写盘结果）。
+            // Record into the session-level mutation log (best-effort; never affects the write result).
             crate::ai::tools::storage::mutation_log::record(
                 &self.path,
                 "write",
@@ -141,7 +141,7 @@ fn vfs_to_ai_err(path: &Path, err: VfsError) -> AiError {
     AiError::file(path.display().to_string(), err.to_string())
 }
 
-/// 尝试走内核 VfsOps；返回 None 表示内核未就绪（e.g. 单元测试启动阶段），让调用方 fallback 到裸 std::fs。
+/// Try the kernel VfsOps path; returning None means the kernel is not ready yet (e.g. during unit test startup) and the caller should fall back to bare std::fs.
 fn try_vfs_read(path: &Path) -> Option<Result<String, VfsError>> {
     use crate::ai::tools::os_tools::GLOBAL_OS;
 
@@ -180,7 +180,7 @@ fn is_sensitive_fs_path(path: &Path) -> bool {
     {
         return true;
     }
-    // 用户在 `ai.sandbox.extra_sensitive_paths` 中追加的敏感子串。
+    // Sensitive substrings appended by the user via `ai.sandbox.extra_sensitive_paths`.
     for needle in config_extra_sensitive_substrings() {
         if rendered.contains(&needle) {
             return true;
@@ -206,11 +206,11 @@ fn is_sensitive_fs_path(path: &Path) -> bool {
     )
 }
 
-/// 若 `path` 落在会话压缩器生成的某个内部产物目录下，返回匹配到的目录名。
+/// If `path` lies under one of the internal artifact directories generated by the session compressor, return the matched directory name.
 ///
-/// 这些目录里的文件是上下文压缩机制的中间产物：外溢的工具结果、折叠的归档等。
-/// 只有锚定在 `*.assets/` 或 `.history_file.sessions/<id>/` 之下的同名目录才算数，
-/// 避免误伤用户项目里恰好同名的普通目录。
+/// Files in these directories are intermediate products of the context compression mechanism: offloaded tool results, folded archives, etc.
+/// Only same-named directories anchored under `*.assets/` or `.history_file.sessions/<id>/` count,
+/// to avoid collateral damage to ordinary same-named directories in user projects.
 fn session_overflow_dir_component(path: &Path) -> Option<&'static str> {
     let components = path
         .components()
@@ -231,20 +231,20 @@ fn session_overflow_dir_component(path: &Path) -> Option<&'static str> {
     })
 }
 
-/// 是否为会话压缩器保存的 `read_file` 结果快照。
+/// Whether this is a `read_file` result snapshot saved by the session compressor.
 ///
-/// 这类文件需要正常回读，但 service 层必须保留归档中的原始展示形式，避免
-/// `read_file` 再额外添加 asset 相对行号。不能只依赖 `original_file_path`：原始
-/// 文件可能已经变更、删除，或无法复现当时的截断结果。
+/// Such files must be readable normally, but the service layer must preserve the original display form from the archive so that
+/// `read_file` does not add asset-relative line numbers again. Relying on `original_file_path` alone is unsafe: the original
+/// file may have changed, been deleted, or can no longer reproduce the original truncation result.
 pub(crate) fn is_read_file_overflow_artifact(path: &Path) -> bool {
     session_overflow_dir_component(path) == Some("tool-overflow-compressed")
         && overflow_artifact_tool_name(path).as_deref() == Some("read_file")
 }
 
-/// 从外溢产物文件名 `{timestamp}-{tool}-{uuid}.txt` 中提取工具名。
+/// Extract the tool name from an overflow artifact filename `{timestamp}-{tool}-{uuid}.txt`.
 ///
-/// 写入侧固定用 `%Y%m%dT%H%M%SZ`（无 `-`）时间戳与 uuid simple 格式（无 `-`），
-/// 故首个 `-` 与末个 `-` 之间即工具名。解析失败返回 None（保守放行，不误封）。
+/// The writer side always uses the `%Y%m%dT%H%M%SZ` timestamp (no `-`) and uuid simple format (no `-`),
+/// so the tool name is between the first and last `-`. Return None on parse failure (conservatively allow, never mis-block).
 fn overflow_artifact_tool_name(path: &Path) -> Option<String> {
     let stem = path.file_stem().and_then(|value| value.to_str())?;
     let first = stem.find('-')?;
@@ -256,8 +256,8 @@ fn overflow_artifact_tool_name(path: &Path) -> Option<String> {
     (!tool.is_empty()).then(|| tool.to_string())
 }
 
-/// 当前 turn 对应的会话 asset 根目录。无活动 driver context 时保守返回 None，
-/// 不能把测试/one-shot 环境误当成拥有任意历史会话的读取权限。
+/// Session asset root for the current turn. Conservatively return None when there is no active driver context,
+/// never mistaking test/one-shot environments as having read access to arbitrary historical sessions.
 pub(crate) fn current_session_assets_dir() -> Option<PathBuf> {
     let ctx = crate::ai::driver::runtime_ctx::try_current()?;
     let turn_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
@@ -308,7 +308,7 @@ fn is_session_overflow_asset_path(path: &Path) -> bool {
     session_overflow_dir_component(path).is_some()
 }
 
-/// 词法归一化路径：解析 `.`/`..` 而不触盘（路径可能尚不存在，如写入新文件）。
+/// Lexically normalize the path: resolve `.`/`..` without touching the disk (the path may not exist yet, e.g. when writing a new file).
 fn normalize_lexical(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -326,8 +326,8 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 }
 
 fn resolve_effective_path(path: PathBuf) -> PathBuf {
-    // 先展开开头的 `~`：模型常按 shell 习惯给出 `~/.config/...`，但 `~` 只有
-    // shell 才会展开，Rust 里它不是绝对路径，会被错误拼到 effective_cwd 之后。
+    // Expand a leading `~` first: models often follow shell habit and pass `~/.config/...`, but `~` is only
+    // expanded by shells; in Rust it is not absolute and would be wrongly joined after effective_cwd.
     let path = match path.to_str() {
         Some(s) => PathBuf::from(crate::commonw::utils::expanduser(s).as_ref()),
         None => path,
@@ -340,7 +340,7 @@ fn resolve_effective_path(path: PathBuf) -> PathBuf {
     normalize_lexical(&base.join(path))
 }
 
-/// 读取 `ai.sandbox.extra_sensitive_paths`（逗号分隔，去空白）。
+/// Read `ai.sandbox.extra_sensitive_paths` (comma-separated, whitespace trimmed).
 fn config_extra_sensitive_substrings() -> Vec<String> {
     let raw = crate::commonw::configw::get_all_config().get(
         crate::ai::config_schema::AiConfig::SANDBOX_EXTRA_SENSITIVE_PATHS,
@@ -352,10 +352,10 @@ fn config_extra_sensitive_substrings() -> Vec<String> {
         .collect()
 }
 
-/// 计算当前生效的可写根目录集合：`ai.sandbox.allowed_roots` 非空时用其配置，
-/// 为空（默认）时退回 `effective_cwd()`；session 临时目录与用户技能目录
-/// （`ai.skills.dir`，默认 `~/.config/rust_tools/skills`）始终追加为可写根。
-/// 返回值同时用于写权限校验与「写被拒」错误提示中的可写路径建议，避免两处漂移。
+/// Compute the effective writable root set: use `ai.sandbox.allowed_roots` when non-empty;
+/// fall back to `effective_cwd()` when empty (default). The session temp dir and user skills dir
+/// (`ai.skills.dir`, default `~/.config/rust_tools/skills`) are always appended as writable roots.
+/// The result feeds both the write-permission check and the writable-path suggestions in "write denied" errors, keeping them from drifting apart.
 fn configured_write_roots(base: &Path) -> Vec<PathBuf> {
     let raw = crate::commonw::configw::get_all_config().get(
         crate::ai::config_schema::AiConfig::SANDBOX_ALLOWED_ROOTS,
@@ -370,17 +370,17 @@ fn configured_write_roots(base: &Path) -> Vec<PathBuf> {
     if roots.is_empty() {
         roots.push(normalize_lexical(base));
     }
-    // session 临时目录始终可写：模型可能从之前工具输出中发现 temp 路径后
-    // 用绝对路径写入（不带 temp=true），不应被沙箱拦截。
+    // The session temp dir is always writable: the model may discover a temp path in earlier tool output and then
+    // write to it by absolute path (without temp=true); that must not be blocked by the sandbox.
     if let Ok(temp) = crate::ai::driver::runtime_ctx::temp_dir() {
         let temp = normalize_lexical(&temp);
         if !roots.iter().any(|r| temp.starts_with(r)) {
             roots.push(temp);
         }
     }
-    // 用户技能目录（ai.skills.dir，默认 ~/.config/rust_tools/skills）始终可写：
-    // 模型需要创建 / 编辑用户 .skill 文件，该目录在 effective_cwd / allowed_roots
-    // 之外，不能因此被 apply_patch / write_file 沙箱拦截（save_skill 已直接写该目录）。
+    // The user skills dir (ai.skills.dir, default ~/.config/rust_tools/skills) is always writable:
+    // the model needs to create / edit user .skill files, and this dir sits outside effective_cwd / allowed_roots,
+    // so it must not be blocked by the apply_patch / write_file sandbox (save_skill already writes there directly).
     let skills = crate::ai::skills::skills_dir();
     let skills = if skills.is_absolute() {
         normalize_lexical(&skills)
@@ -393,25 +393,25 @@ fn configured_write_roots(base: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// 供「写被拒」错误提示使用的可写根目录：优先展示 effective_cwd 类的项目根，
-/// 排在最前，便于模型据此纠偏（session 临时目录不适合承载正式产物，不作首选）。
+/// Writable roots for the "write denied" error message: prefer effective_cwd-style project roots,
+/// listed first so the model can correct course (the session temp dir is unsuitable for final artifacts and is not suggested first).
 fn writable_roots_for_hint() -> Vec<PathBuf> {
     let base =
         crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
     configured_write_roots(&base)
 }
 
-/// 当 `ai.sandbox.allowed_roots` 非空时，文件路径必须位于其中某个根之下。
-/// 为空（默认）时，退回到 `effective_cwd()` 作为单一沙箱根目录。
+/// When `ai.sandbox.allowed_roots` is non-empty, file paths must lie under one of its roots.
+/// When empty (default), fall back to `effective_cwd()` as the single sandbox root.
 pub(crate) fn path_within_allowed_roots(path: &Path) -> bool {
-    // 相对路径基于 effective_cwd 解析为绝对路径后再归一化。
+    // Relative paths are resolved against effective_cwd into absolute paths before normalization.
     let base =
         crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
     let roots = configured_write_roots(&base);
     path_within_roots(path, &base, &roots)
 }
 
-/// 纯函数：归一化 `path`（相对则基于 `base`）后判断是否落在任一 `roots` 之下。
+/// Pure function: normalize `path` (relative paths resolve against `base`) and check whether it lies under any of `roots`.
 pub(crate) fn path_within_roots(path: &Path, base: &Path, roots: &[PathBuf]) -> bool {
     if roots.is_empty() {
         return true;
@@ -459,13 +459,13 @@ mod tests {
             Path::new("/home/user/proj"),
             &roots
         ));
-        // 越界绝对路径
+        // Out-of-bounds absolute path
         assert!(!path_within_roots(
             Path::new("/etc/passwd"),
             Path::new("/home/user/proj"),
             &roots
         ));
-        // 通过 `..` 逃逸应被归一化后拦截
+        // Escaping via `..` should be blocked after normalization
         assert!(!path_within_roots(
             Path::new("/home/user/proj/../secret"),
             Path::new("/home/user/proj"),
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn overflow_artifact_tool_name_parses_write_side_filename() {
-        // 写入侧格式：{%Y%m%dT%H%M%SZ}-{tool}-{uuid_simple}.txt
+        // Writer-side format: {%Y%m%dT%H%M%SZ}-{tool}-{uuid_simple}.txt
         assert_eq!(
             overflow_artifact_tool_name(Path::new(
                 "/a.assets/tool-overflow-compressed/20260722T101112Z-read_file-abc123.txt"
@@ -526,7 +526,7 @@ mod tests {
             )),
             Some("execute_command".to_string())
         );
-        // 非预期命名保守返回 None（宁可放行也不误封普通文件）。
+        // Conservatively return None on unexpected naming (better to allow than to mis-block an ordinary file).
         assert_eq!(
             overflow_artifact_tool_name(Path::new("/a.assets/plain.txt")),
             None
@@ -556,7 +556,7 @@ mod tests {
             "/proj/tool-overflow-compressed/20260722T101112Z-read_file-abc123.txt"
         )));
 
-        // 无活动 driver context 时，FileStore 端到端必须拒绝历史快照。
+        // Without an active driver context, the FileStore end-to-end path must reject historical snapshots.
         assert!(
             FileStore::new(current_artifact.to_path_buf())
                 .validate_read_access()
@@ -572,7 +572,7 @@ mod tests {
         );
         assert!(blocked_overflow_read_reason_for_assets(escaped, Some(current_assets)).is_some());
 
-        // 其它工具归档保持既有可读行为，不劣化其精确证据召回能力。
+        // Other tools' archives keep their existing readable behavior; their precise evidence recall must not degrade.
         let command_artifact = Path::new(
             "/sessions/other.assets/tool-overflow-compressed/20260722T101112Z-execute_command-def456.txt",
         );
@@ -647,15 +647,15 @@ mod tests {
         let _ = std::fs::remove_file(temp_root.join("empty.configw"));
         let _ = std::fs::remove_dir_all(&temp_root);
 
-        // 保留稳定的分类前缀（供 orchestrator 的 write_blocked_outside_root_path 解析）。
+        // Keep the stable category prefix (parsed by the orchestrator's write_blocked_outside_root_path).
         assert!(msg.contains("Write blocked: path '"), "msg: {msg}");
-        // 必须明确告知可写根目录，而不仅是「这里不能写」。
+        // Must state the writable roots explicitly, not just "cannot write here".
         assert!(msg.contains("Writable root:"), "msg: {msg}");
         assert!(
             msg.contains(&temp_root.display().to_string()),
             "hint must name the effective_cwd root: {msg}"
         );
-        // 必须劝阻对同一绝对路径的重试。
+        // Must discourage retrying the same absolute path.
         assert!(
             msg.contains("Do NOT retry the same absolute path"),
             "msg: {msg}"
@@ -716,9 +716,9 @@ mod tests {
 
     #[test]
     fn session_temp_dir_is_always_writable() {
-        // session 临时目录（由 runtime_ctx::temp_dir() 返回）即使不在
-        // effective_cwd 之下也应被允许写入：模型可能从先前工具输出中
-        // 发现 temp 路径后用绝对路径写入（不带 temp=true）。
+        // The session temp dir (returned by runtime_ctx::temp_dir()) must remain writable even when it is not
+        // under effective_cwd: the model may discover the temp path in earlier tool output
+        // and write there by absolute path (without temp=true).
         let temp = crate::ai::driver::runtime_ctx::temp_dir().unwrap();
         let target = temp.join(format!("sandbox-test-{}.txt", uuid::Uuid::new_v4()));
         assert!(
@@ -730,9 +730,9 @@ mod tests {
 
     #[test]
     fn skills_dir_is_always_writable() {
-        // 用户技能目录（ai.skills.dir，默认 ~/.config/rust_tools/skills）即使不在
-        // effective_cwd / allowed_roots 之下也应可写：模型需要用 apply_patch /
-        // write_file 创建、编辑用户 .skill 文件，不能因此被沙箱拦截。
+        // The user skills dir (ai.skills.dir, default ~/.config/rust_tools/skills) must stay writable even when
+        // outside effective_cwd / allowed_roots: the model needs apply_patch / write_file to create and edit
+        // user .skill files, so the sandbox must not block it.
         let skills = crate::ai::skills::skills_dir();
         let target = skills.join(format!("sandbox-test-{}.skill", uuid::Uuid::new_v4()));
         assert!(
@@ -744,13 +744,13 @@ mod tests {
 
     #[test]
     fn temp_registry_registered_path_outside_roots_is_writable() {
-        // 同 session 的临时文件（如子代理在隔离临时目录里创建、已注册进 temp
-        // registry 的路径）即使不在 effective_cwd / allowed_roots 之下，也应被
-        // write_file / apply_patch 允许继续操作，而不是被沙箱拦截。
+        // Same-session temp files (e.g. created by a subagent in an isolated temp dir and already registered in the
+        // temp registry) must remain writable via write_file / apply_patch even when outside
+        // effective_cwd / allowed_roots, instead of being blocked by the sandbox.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let temp_root =
             std::env::temp_dir().join(format!("file-store-registry-{}", uuid::Uuid::new_v4()));
-        // 一个在 effective_cwd 之外、也被 allowed_roots 排除的路径。
+        // A path outside effective_cwd and also excluded by allowed_roots.
         let outside = temp_root
             .parent()
             .unwrap_or_else(|| Path::new("/"))
@@ -760,7 +760,7 @@ mod tests {
         unsafe { std::env::set_var("CONFIGW_PATH", temp_root.join("empty.configw")) };
         crate::commonw::configw::refresh();
 
-        // 未注册时，越界路径必须被拦截。
+        // When unregistered, the out-of-bounds path must be blocked.
         let blocked = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
             .sync_scope(temp_root.clone(), || {
                 FileStore::new(outside.clone()).validate_write_access()
@@ -768,7 +768,7 @@ mod tests {
             .expect_err("unregistered outside path must be blocked");
         assert!(blocked.to_string().contains("Write blocked"));
 
-        // 注册后（模拟 write_file(temp=true) 已注册该解析绝对路径），应放行。
+        // Once registered (simulating write_file(temp=true) having registered the resolved absolute path), it should be allowed.
         let abs = outside.display().to_string();
         temp_registry::register(&abs).unwrap();
         let allowed = crate::ai::driver::runtime_ctx::SUBAGENT_CWD

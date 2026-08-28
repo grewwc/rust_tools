@@ -1,4 +1,5 @@
 use aios_kernel::primitives::{DaemonKind, DaemonState};
+use std::io::IsTerminal;
 use uuid::Uuid;
 
 use crate::ai::{
@@ -10,7 +11,8 @@ use crate::ai::{
     types::App,
 };
 
-/// 公开给帮助与补全的规范二级命令；旧别名仅为兼容保留，不再主动展示。
+/// Canonical subcommands exposed to help and completion; legacy aliases are kept
+/// only for compatibility and no longer advertised.
 pub(in crate::ai) const CANONICAL_SESSION_SUBCOMMANDS: &[&str] = &[
     "help",
     "list",
@@ -32,6 +34,16 @@ pub(in crate::ai) const CANONICAL_SESSION_SUBCOMMANDS: &[&str] = &[
     "fork",
     "branch",
 ];
+
+/// Highlight style for sessions marked important via `/mark`. ANSI colors are
+/// only emitted when stdout is a terminal; piped output stays plain.
+fn marked_session_style() -> (&'static str, &'static str) {
+    if std::io::stdout().is_terminal() {
+        (crate::ai::theme::ACCENT_MARKED, crate::ai::theme::RESET)
+    } else {
+        ("", "")
+    }
+}
 
 pub(in crate::ai) fn cancel_current_process_reflection_daemons(app: &App) -> usize {
     let Ok(mut os) = app.os.lock() else {
@@ -83,8 +95,10 @@ fn load_stale_patch_targets(
         return Ok(targets);
     }
 
-    // 兼容升级前没有专用 meta 的 session：只在首次加载时从尚存的结构化消息
-    // 回放一次，随后写回 meta。以后即使历史被压缩，账本也不再依赖消息形态。
+    // Compatibility with sessions created before the dedicated meta existed:
+    // replay once from surviving structured messages on first load only, then
+    // write back to meta. Afterwards the ledger never depends on message shape
+    // again, even if history is compressed.
     let messages = store.read_all_messages(session_id)?;
     let targets = crate::ai::driver::turn_runtime::stale_patch_targets_from_messages(&messages);
     if history_file.exists() {
@@ -93,8 +107,9 @@ fn load_stale_patch_targets(
     Ok(targets)
 }
 
-/// 恢复当前 App 对应 session 的持久化运行时状态。启动恢复、persona 切换与
-/// `/sessions use` 必须统一走这里，避免 stale-patch 状态跨 session 污染或丢失。
+/// Restores the persisted runtime state of the current App's session. Startup
+/// restore, persona switching, and `/sessions use` must all go through here, so
+/// stale-patch state neither pollutes across sessions nor gets lost.
 pub(in crate::ai) fn restore_session_local_runtime_state(app: &mut App) -> std::io::Result<()> {
     let store = SessionStore::new(app.config.history_file.as_path());
     app.stale_patch_targets =
@@ -102,8 +117,10 @@ pub(in crate::ai) fn restore_session_local_runtime_state(app: &mut App) -> std::
     restore_prune_marks_for_history(app)
 }
 
-/// 按当前 `session_history_file` 恢复模型裁剪计数。子代理拥有独立 history，
-/// 不能沿用 `App::clone` 带来的父会话内存态；resume 也必须从子 history 恢复。
+/// Restores model prune counters from the current `session_history_file`.
+/// Sub-agents own an independent history and must not reuse the parent session's
+/// in-memory state from `App::clone`; resume must also restore from the child
+/// history.
 pub(in crate::ai) fn restore_prune_marks_for_history(app: &mut App) -> std::io::Result<()> {
     app.prune_marks.clear();
     let mut prune_marks =
@@ -117,8 +134,10 @@ pub(in crate::ai) fn restore_prune_marks_for_history(app: &mut App) -> std::io::
             }
         };
     if !prune_marks.is_empty() {
-        // Meta 可能来自 rewind/branch 前的更长历史。恢复前只保留目标 session 当前
-        // 投影里仍存在且允许裁剪的 id，避免旧计数误绑定到已删除或受保护结果。
+        // Meta may come from a longer pre-rewind/branch history. Before restoring,
+        // keep only ids that still exist in the target session's current projection
+        // and are prunable, so old counters do not bind wrongly to deleted or
+        // protected results.
         let messages =
             match crate::ai::history::build_message_arr(usize::MAX, &app.session_history_file) {
                 Ok(messages) => messages,
@@ -167,7 +186,8 @@ fn switch_app_to_session(
             path.display()
         );
     }
-    // 先登记活跃标记，再加载目标状态，避免 prune 在切换窗口内删除目标 session。
+    // Register the live marker first, then load the target state, so prune cannot
+    // delete the target session during the switch window.
     let stale_patch_targets = load_stale_patch_targets(store, &session_id, &history_file)?;
     clear_session_local_runtime_state(app);
     app.session_id = session_id.to_string();
@@ -178,8 +198,9 @@ fn switch_app_to_session(
     Ok(())
 }
 
-/// 历史 rewind 会原地替换当前 session 的消息，必须同步重建并持久化账本，不能沿用
-/// rewind 之前的 meta，也不能简单清空后让下一次 patch 绕过 fresh-read 门控。
+/// A history rewind replaces the current session's messages in place, so the
+/// ledger must be rebuilt and persisted in step: keep neither the pre-rewind meta
+/// nor a simple clear that would let the next patch bypass the fresh-read gate.
 pub(in crate::ai) fn reset_stale_patch_targets_from_messages(
     app: &mut App,
     messages: &[crate::ai::history::Message],
@@ -231,7 +252,8 @@ fn print_current_terminal_suspended_sessions(entries: &[SuspendedSessionEntry]) 
     }
 }
 
-/// `/clear`：仅清屏（清除终端显示），不触及任何对话历史或会话状态。
+/// `/clear`: clears the screen (terminal display) only; no conversation history
+/// or session state is touched.
 pub fn try_handle_clear_command(input: &str) -> bool {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -252,14 +274,16 @@ pub fn try_handle_clear_command(input: &str) -> bool {
         return false;
     }
 
-    // 清屏：ANSI escape - 清除整屏 + 光标回到左上角
+    // Clear screen: ANSI escape - clear the whole screen + move the cursor to
+    // the top-left
     use std::io::Write;
     print!("\x1b[2J\x1b[H");
     let _ = std::io::stdout().flush();
     true
 }
 
-/// 解析 export/archive 使用的规范目标选择器，并确保普通 ID 指向现有会话。
+/// Parses the canonical target selector used by export/archive and ensures a
+/// plain ID refers to an existing session.
 fn resolve_existing_session_selector(
     store: &SessionStore,
     current_session_id: &str,
@@ -288,13 +312,16 @@ fn resolve_existing_session_selector(
     Ok(session_id)
 }
 
-/// `/sessions prune <days>` 允许的最大天数（~10k 年）。远小于 `chrono` 的
-/// `Duration::days` 与 `DateTime` 运算溢出阈值，用来把非法的超大输入挡在 panic 之前。
-/// 有效区间为 `1..=MAX_PRUNE_DAYS`：`0` 会退化成"删除所有非当前 session"，被显式拒绝。
+/// Maximum allowed days for `/sessions prune <days>` (~10k years). Far below
+/// `chrono`'s `Duration::days` and `DateTime` overflow thresholds, so illegal
+/// oversized input is stopped before a panic. The valid range is
+/// `1..=MAX_PRUNE_DAYS`: `0` would degrade into "delete all non-current
+/// sessions" and is rejected explicitly.
 pub(crate) const MAX_PRUNE_DAYS: i64 = 3_650_000;
 
-/// 选出 N 天未活动的 session：`modified_local` 早于 `cutoff` 的视为过期。
-/// 当前 session 永不删除；缺少时间戳的 session 无法判定新旧，保守跳过。
+/// Selects sessions inactive for N days: those whose `modified_local` is earlier
+/// than `cutoff` count as expired. The current session is never deleted; sessions
+/// without a timestamp cannot be age-ordered and are conservatively skipped.
 pub(crate) fn select_stale_sessions<'a>(
     sessions: &'a [SessionInfo],
     current_session_id: &str,
@@ -330,12 +357,16 @@ pub fn try_handle_session_command(
     let top_level_suspend = matches!(cmd, "suspend" | "bg" | "detach" | "susp");
     let top_level_close = cmd == "close";
     let top_level_fork = cmd == "fork";
+    let top_level_mark = cmd == "mark";
+    let top_level_unmark = cmd == "unmark";
     if cmd != "sessions"
         && cmd != "session"
         && cmd != "ss"
         && !top_level_suspend
         && !top_level_close
         && !top_level_fork
+        && !top_level_mark
+        && !top_level_unmark
     {
         return Ok(false);
     }
@@ -345,6 +376,10 @@ pub fn try_handle_session_command(
         "close"
     } else if top_level_fork {
         "fork"
+    } else if top_level_mark {
+        "mark"
+    } else if top_level_unmark {
+        "unmark"
     } else {
         parts.next().unwrap_or("list")
     };
@@ -367,6 +402,8 @@ pub fn try_handle_session_command(
             println!(
                 "  /fork                     fork current session into a new branch (keeps original) and switch"
             );
+            println!("  /mark                     mark current session as important (shown in red in `/ss`)");
+            println!("  /unmark                   remove the important mark from the current session");
             println!(
                 "  /sessions bound           list suspended sessions bound to current terminal"
             );
@@ -401,19 +438,21 @@ pub fn try_handle_session_command(
             println!();
         }
         "list" | "ls" | "" | "verbose" => {
-            // 默认不递归统计每个 session 的大小（assets 递归是 `/ss` 的唯一重活）；
-            // 只有显式 `verbose`（`/ss verbose` 或 `/ss list verbose`）才并行统计。
+            // By default do not recursively stat each session's size (the assets
+            // recursion is the only heavy work of `/ss`); only explicit `verbose`
+            // (`/ss verbose` or `/ss list verbose`) stats them in parallel.
             let verbose =
                 action == "verbose" || parts.next().map(|t| t == "verbose").unwrap_or(false);
             let mut sessions = store.list_sessions()?;
             if verbose {
-                // 大小按需并行统计：list_sessions 只读元数据，assets 递归统计放到这里多核并行。
+                // Sizes are stat-ed in parallel on demand: list_sessions reads only
+                // metadata, and the recursive assets stat runs here across cores.
                 store.attach_session_sizes(&mut sessions)?;
             }
             if sessions.is_empty() {
                 println!("No sessions.");
             } else {
-                // 计算最大 ID 长度用于对齐
+                // Compute the max ID length for alignment
                 let max_id_len = sessions.iter().map(|s| s.id.len()).max().unwrap_or(36);
                 for s in &sessions {
                     let mark = if s.id == app.session_id { "*" } else { " " };
@@ -431,8 +470,13 @@ pub fn try_handle_session_command(
                     } else {
                         "-".to_string()
                     };
+                    let (style_open, style_close) = if s.marked {
+                        marked_session_style()
+                    } else {
+                        ("", "")
+                    };
                     println!(
-                        "{} {:<width$}  {}  {:>8}  {}",
+                        "{style_open}{} {:<width$}  {}  {:>8}  {}{style_close}",
                         mark,
                         s.id,
                         time,
@@ -449,8 +493,9 @@ pub fn try_handle_session_command(
         "current" | "cur" => {
             println!("session: {}", app.session_id);
             println!("history: {}", app.session_history_file.display());
-            // 显示 session 摘要
-            // 只读当前 session 的预览，避免扫描并统计全部 session。
+            // Show the session summary
+            // Read only the current session's preview, avoiding a scan and stat
+            // of all sessions.
             if let Ok(Some((summary, modified_local))) = store.read_session_preview(&app.session_id)
             {
                 if let Some(summary) = &summary {
@@ -458,15 +503,30 @@ pub fn try_handle_session_command(
                 }
                 let size = store.session_total_size(&app.session_id).unwrap_or(0);
                 println!("size: {}", format_size(size));
+                let marked = store.read_session_marked(&app.session_id).unwrap_or(false);
+                println!("marked: {}", if marked { "yes" } else { "no" });
                 if let Some(t) = modified_local {
                     println!("modified: {}", t.format("%Y-%m-%d %H:%M:%S"));
                 }
             }
         }
+        "mark" => {
+            match store.write_session_marked(&app.session_id, true) {
+                Ok(()) => println!("Marked session as important: {}", app.session_id),
+                Err(err) => eprintln!("[mark] failed to mark session: {err}"),
+            }
+        }
+        "unmark" => {
+            match store.write_session_marked(&app.session_id, false) {
+                Ok(()) => println!("Removed important mark from session: {}", app.session_id),
+                Err(err) => eprintln!("[unmark] failed to unmark session: {err}"),
+            }
+        }
         "new" | "create" => {
             let new_id = Uuid::new_v4().to_string();
-            // 切换前清掉旧 session 的 history cache 与 explicit-enabled tools，
-            // 防止下个 turn 携带跨 session 脏状态。
+            // Clear the old session's history cache and explicit-enabled tools
+            // before switching, so the next turn carries no cross-session dirty
+            // state.
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
             switch_app_to_session(app, &store, &new_id, false)?;
             println!("Switched to new session: {}", new_id);
@@ -487,8 +547,9 @@ pub fn try_handle_session_command(
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
             switch_app_to_session(app, &store, id, true)?;
             println!("Switched session: {}", id);
-            // 显示 session 摘要
-            // 只读目标 session 预览，避免扫描全部 session。
+            // Show the session summary
+            // Read only the target session's preview, avoiding a scan of all
+            // sessions.
             if let Ok(Some((summary, _))) = store.read_session_preview(id) {
                 if let Some(summary) = &summary {
                     println!("summary: {}", summary);
@@ -496,11 +557,13 @@ pub fn try_handle_session_command(
             }
         }
         "suspend" | "bg" | "detach" => {
-            // 与 Ctrl+C 挂起路径（`should_suspend_session_on_sigint`）保持一致：
-            // `--session` 显式指定的 id 总是挂起；否则若 session 还没有任何用户消息，
-            // 主循环退出时的 `cleanup_one_shot` 会把这个空 session 删除，若此处仍写入
-            // 挂起条目，就会留下指向已删除 session 的悬空绑定，下次启动 `a` 会尝试恢复
-            // 一个不存在的会话。
+            // Stay consistent with the Ctrl+C suspend path
+            // (`should_suspend_session_on_sigint`): an id explicitly given via
+            // `--session` is always suspended; otherwise, if the session has no
+            // user messages yet, the main loop's `cleanup_one_shot` deletes that
+            // empty session on exit, and writing a suspension entry here would
+            // leave a dangling binding to a deleted session — the next `a` launch
+            // would try to restore a nonexistent session.
             let should_suspend = if app.cli.session.is_some() {
                 true
             } else {
@@ -518,7 +581,7 @@ pub fn try_handle_session_command(
                 &app.session_id,
                 app.config.history_file.as_path(),
                 &app.active_persona.id,
-                // 保存当前模型，恢复时使用
+                // Save the current model for restoration
                 &app.current_model,
             ) {
                 Ok(entry) => {
@@ -533,8 +596,10 @@ pub fn try_handle_session_command(
             }
         }
         "close" => {
-            // /close：删除当前 session 后退出交互式对话（与 /suspend 的"保留并回到 shell"
-            // 相反，这里直接销毁 session）。复用 store（已在上方构造）。
+            // /close: delete the current session and exit the interactive
+            // conversation (the opposite of /suspend's "keep and return to shell"
+            // — here the session is destroyed outright). Reuse the store (already
+            // constructed above).
             let current_id = app.session_id.clone();
             let deleted_path = app.session_history_file.clone();
             match store.delete_session(&current_id) {
@@ -575,8 +640,9 @@ pub fn try_handle_session_command(
             let mut deleted_current = false;
             for id in &ids {
                 let deleted_path = store.session_history_file(id);
-                // 必须先终止该 session 尚在执行的 subagent；否则删除 SQLite 后，
-                // 活跃 Future 仍可能再次写入并重建派生历史。
+                // Must first terminate subagents still running for this session;
+                // otherwise, after the SQLite file is deleted, live Futures may
+                // write again and rebuild derived history.
                 crate::ai::tools::task_tools::discard_tasks_for_session(id);
                 let deleted = store.delete_session(id)?;
                 if deleted {
@@ -746,7 +812,7 @@ pub fn try_handle_session_command(
                 return Ok(true);
             };
             let archive_path = std::path::Path::new(file);
-            // 可选 as=<id> 指定导入后的 session id
+            // Optional as=<id> specifies the session id after import
             let mut dst: Option<String> = None;
             for arg in parts.by_ref() {
                 if let Some(v) = arg.strip_prefix("as=") {
@@ -781,8 +847,9 @@ pub fn try_handle_session_command(
             }
 
             store.clear_session_history(&app.session_id)?;
-            // 清掉关联的 history cache 与 explicit-enabled tools，避免下个 turn
-            // 命中陈旧缓存或携带已经无意义的工具列表。
+            // Clear the associated history cache and explicit-enabled tools, so
+            // the next turn hits no stale cache and carries no meaningless tool
+            // list.
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
             clear_session_local_runtime_state(app);
             println!(
@@ -805,7 +872,8 @@ pub fn try_handle_session_command(
             println!("Deleted {deleted} session(s). Switched to new session: {new_id}");
         }
         "prune" | "delete-old" | "delete_old" | "purge" | "gc" | "stale" => {
-            // /sessions prune <days>：删除 N 天未活动的 session（当前 session 永不删除）。
+            // /sessions prune <days>: delete sessions inactive for N days (the
+            // current session is never deleted).
             let Some(days_str) = parts.next() else {
                 println!("missing days. try: /sessions prune <days>");
                 return Ok(true);
@@ -814,9 +882,11 @@ pub fn try_handle_session_command(
                 println!("invalid days: '{}'", days_str);
                 return Ok(true);
             };
-            // 下界为 1：`prune 0` 的 cutoff 落在 now，等于删除所有非当前 session，
-            // 与"清理 N 天未活动"的语义相悖，属于误伤级 footgun，直接拒绝。上界防止
-            // `Duration::days` / `DateTime` 运算溢出 panic；~10k 年足够任何清理场景。
+            // Lower bound is 1: `prune 0` puts the cutoff at now, i.e. delete all
+            // non-current sessions — contrary to the "clean up N days inactive"
+            // semantics and a collateral-damage footgun, so it is rejected
+            // outright. The upper bound prevents `Duration::days` / `DateTime`
+            // overflow panics; ~10k years suffices for any cleanup.
             if !(1..=MAX_PRUNE_DAYS).contains(&days) {
                 println!(
                     "days must be between 1 and {MAX_PRUNE_DAYS}. try: /sessions prune <days>"
@@ -874,7 +944,8 @@ pub fn try_handle_session_command(
                             .into_iter()
                             .any(|(id, _, alive)| alive && id == session_id);
                     if !active {
-                        // 最终校验后再终止该 session 的子代理，避免删除后 Future 写回。
+                        // Terminate the session's sub-agents after the final
+                        // validation, so Futures do not write back after deletion.
                         crate::ai::tools::task_tools::discard_tasks_for_session(&session_id);
                     }
                     Ok(active)
@@ -913,7 +984,8 @@ pub fn try_handle_session_command(
             );
         }
         "fork" => {
-            // 解析 src=<id> / as=<id>，未指定 src 时默认基于当前 session。
+            // Parse src=<id> / as=<id>; when src is not given, default to the
+            // current session.
             let mut src: Option<String> = None;
             let mut dst: Option<String> = None;
             for arg in parts.by_ref() {
@@ -927,7 +999,8 @@ pub fn try_handle_session_command(
             let dst_id = dst.unwrap_or_else(|| Uuid::new_v4().to_string());
             match store.fork_session(&src_id, &dst_id) {
                 Ok(()) => {
-                    // 为 fork 出的新 session 写入带深度的 fork 标记标题（支持 fork 的 fork）。
+                    // Write a depth-tagged fork marker title for the forked session
+                    // (supports fork of fork).
                     if let Err(err) = apply_fork_title(&store, &src_id, &dst_id) {
                         eprintln!("[fork] 无法写入 fork 标记标题: {err}");
                     }
@@ -946,7 +1019,7 @@ pub fn try_handle_session_command(
             }
         }
         "branch" => {
-            // 用法: /sessions branch <keep_turns> [src=<id>] [as=<id>]
+            // Usage: /sessions branch <keep_turns> [src=<id>] [as=<id>]
             let Some(keep_str) = parts.next() else {
                 println!(
                     "missing keep count. try: /sessions branch <keep_turns> [src=<id>] [as=<id>]"
@@ -991,8 +1064,10 @@ pub fn try_handle_session_command(
     Ok(true)
 }
 
-/// 解析标题开头的 fork 标记，返回 (已 fork 深度, 去除标记后的内层标题)。
-/// 无标记或格式不符时返回 (0, 原标题)。`[fork]` 视为深度 1，`[fork N]` 视为深度 N。
+/// Parses the fork marker at the start of a title, returning (fork depth, inner
+/// title with the marker removed).
+/// Returns (0, original title) when there is no marker or the format mismatches.
+/// `[fork]` means depth 1, `[fork N]` means depth N.
 fn parse_fork_marker(title: &str) -> (usize, &str) {
     let trimmed = title.trim_start();
     let Some(rest) = trimmed.strip_prefix('[') else {
@@ -1018,8 +1093,10 @@ fn parse_fork_marker(title: &str) -> (usize, &str) {
     (depth, after)
 }
 
-/// 构造带 fork 深度标记的标题。深度 1 显示为 `[fork]`，N≥2 显示为 `[fork N]`。
-/// 总长度限制在 40 字符内，避免被判定为低质量标题而在后续被模型重新生成覆盖。
+/// Builds a title with a fork depth marker. Depth 1 renders as `[fork]`, N≥2 as
+/// `[fork N]`.
+/// Total length is capped at 40 chars, so it is not judged a low-quality title
+/// and later overwritten by model regeneration.
 fn format_fork_title(depth: usize, inner: &str) -> String {
     let marker = if depth <= 1 {
         "[fork]".to_string()
@@ -1048,8 +1125,9 @@ fn format_fork_title(depth: usize, inner: &str) -> String {
     }
 }
 
-/// 读取源 session 的有效标题作为 fork 标记的基底：优先持久化标题，
-/// 否则从首条用户消息生成回退标题。
+/// Reads the source session's effective title as the base for the fork marker:
+/// prefer the persisted title, otherwise generate a fallback title from the
+/// first user message.
 fn session_title_base(store: &SessionStore, session_id: &str) -> String {
     if let Ok(Some(title)) = store.read_session_title(session_id) {
         let title = title.trim();
@@ -1066,7 +1144,8 @@ fn session_title_base(store: &SessionStore, session_id: &str) -> String {
     String::new()
 }
 
-/// 把 dst session 的标题改成带 fork 标记的版本，深度基于源 session 标题递增。
+/// Rewrites the dst session's title to the fork-marked version, with depth
+/// incremented from the source session's title.
 fn apply_fork_title(store: &SessionStore, src_id: &str, dst_id: &str) -> std::io::Result<()> {
     let base = session_title_base(store, src_id);
     let (depth, inner) = parse_fork_marker(&base);
@@ -1095,7 +1174,7 @@ fn truncate_session_prompt(s: &str, max_len: usize) -> String {
     out
 }
 
-/// 格式化文件大小为人类可读格式（KB/MB/GB）。
+/// Formats a file size into a human-readable form (KB/MB/GB).
 fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -1364,7 +1443,8 @@ mod tests {
         let persisted = [
             ("call_0".to_string(), 1_u8),
             ("missing".to_string(), 2_u8),
-            // 最近四组受保护，恢复时不得继续携带旧计数。
+        // The most recent four groups are protected; restored state must not
+        // carry the old counters.
             ("call_4".to_string(), 2_u8),
         ]
         .into_iter()
@@ -1501,8 +1581,9 @@ mod tests {
         }
 
         let mut app = test_app(&root);
-        // 写入一条用户消息，使 session 非空（否则新的空 session 保护会拒绝挂起，
-        // 因为主循环退出时会删除空 session，留下悬空绑定）。
+        // Write one user message to make the session non-empty (otherwise the new
+        // empty-session protection rejects the suspension, because the main loop
+        // deletes empty sessions on exit, leaving a dangling binding).
         let store = SessionStore::new(app.config.history_file.as_path());
         let path = store.session_history_file(&app.session_id);
         append_history_messages(
@@ -1547,10 +1628,11 @@ mod tests {
         }
 
         let mut app = test_app(&root);
-        // 不写入任何用户消息，session 为空。
+        // No user message written; the session is empty.
         try_handle_session_command(&mut app, "/bg").unwrap();
 
-        // 仍请求退出，但不能留下挂起绑定（否则主循环删除空 session 后成为悬空绑定）。
+        // Still request exit, but must not leave a suspension binding (it would
+        // dangle after the main loop deletes the empty session).
         assert!(app.shutdown.load(Ordering::Relaxed));
         let entries = SuspendedSessionStore::new()
             .peek_entries_for_terminal_key("terminal:term-empty")
@@ -1625,7 +1707,7 @@ mod tests {
         let app = test_app(&root);
         let store = SessionStore::new(app.config.history_file.as_path());
 
-        // 写入测试消息
+        // Write test messages
         let src_path = store.session_history_file(&app.session_id);
         let original_messages = [
             Message {
@@ -1645,19 +1727,19 @@ mod tests {
         ];
         append_history_messages(&src_path, &original_messages).unwrap();
 
-        // 导出到 zip
+        // Export to zip
         let archive_path = root.join("export.zip");
         store
             .export_session_archive(&app.session_id, &archive_path)
             .expect("export should succeed");
         assert!(archive_path.exists(), "archive file should exist");
 
-        // 导入为新 session
+        // Import as a new session
         let dst_id = "imported-session".to_string();
         let result = store.import_session_archive(&archive_path, &dst_id);
         assert!(result.is_ok(), "import should succeed: {:?}", result.err());
 
-        // 验证导入后的消息与原始消息一致
+        // Verify the imported messages match the originals
         let imported_messages = store.read_all_messages(&dst_id).unwrap();
         assert_eq!(imported_messages.len(), original_messages.len());
         assert_eq!(imported_messages[0].role, "user");
@@ -1723,6 +1805,7 @@ mod tests {
             size_bytes: 0,
             first_user_prompt: None,
             summary: None,
+            marked: false,
         }
     }
 
@@ -1740,7 +1823,8 @@ mod tests {
         assert_eq!(stale_ids, vec!["old"]);
     }
 
-    /// 把目标 session 文件的 mtime 回拨到 N 天前，用于模拟“N 天未读”。
+    /// Rolls the target session file's mtime back N days, to simulate "unread
+    /// for N days".
     fn set_session_activity_days_ago(path: &std::path::Path, days: i64) {
         let activity_unix_ms = (Local::now() - Duration::days(days)).timestamp_millis();
         rusqlite::Connection::open(path)
@@ -1771,7 +1855,7 @@ mod tests {
         let app = test_app(&root);
         let store = SessionStore::new(app.config.history_file.as_path());
 
-        // 三个 session：两个旧（>30 天）、一个新（刚刚写入）。
+        // Three sessions: two old (>30 days), one new (just written).
         for id in ["sess-old-a", "sess-old-b", "sess-fresh"] {
             let path = store.session_history_file(id);
             append_history_messages(
@@ -1799,7 +1883,8 @@ mod tests {
             vec!["sess-old-a".to_string(), "sess-old-b".to_string()]
         );
 
-        // 走与 handler 相同的最终重检 + 加锁删除路径，仅省略交互确认与 PID 扫描。
+        // Take the same final recheck + locked-delete path as the handler,
+        // omitting only the interactive confirmation and PID scan.
         for s in &stale {
             assert_eq!(
                 store
@@ -1816,6 +1901,42 @@ mod tests {
             .collect();
         remaining.sort();
         assert_eq!(remaining, vec!["sess-fresh".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mark_and_unmark_persist_and_show_in_session_list() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let id = app.session_id.clone();
+
+        // A session is not marked by default.
+        assert!(!store.read_session_marked(&id).unwrap());
+
+        assert!(try_handle_session_command(&mut app, "/mark").unwrap());
+        assert!(store.read_session_marked(&id).unwrap());
+        let listed = store.list_sessions().unwrap();
+        assert_eq!(
+            listed.iter().find(|s| s.id == id).map(|s| s.marked),
+            Some(true)
+        );
+
+        assert!(try_handle_session_command(&mut app, "/unmark").unwrap());
+        assert!(!store.read_session_marked(&id).unwrap());
+        assert_eq!(
+            store
+                .list_sessions()
+                .unwrap()
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.marked),
+            Some(false)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1875,7 +1996,8 @@ mod tests {
         let mut app = test_app(&root);
         let store = SessionStore::new(app.config.history_file.as_path());
 
-        // 落盘两个旧 session，用于验证越界输入被拒后不会误删任何数据。
+        // Persist two old sessions, to verify out-of-range input rejection
+        // deletes nothing.
         for id in ["sess-stale-a", "sess-stale-b"] {
             let path = store.session_history_file(id);
             append_history_messages(
@@ -1893,9 +2015,11 @@ mod tests {
         set_session_activity_days_ago(&store.session_history_file("sess-stale-a"), 40);
         set_session_activity_days_ago(&store.session_history_file("sess-stale-b"), 35);
 
-        // `0`（退化成删除所有非当前 session）、负数、恰好越过上界、以及会让 chrono
-        // 日期运算溢出 panic 的超大值，都应被优雅拒绝。
-        // `1e8` 天回拨会越过 `DateTime` 下界——若无上界守卫，这一行本身就会 panic。
+        // `0` (degenerates into deleting all non-current sessions), negatives,
+        // exactly past the upper bound, and huge values that would overflow
+        // chrono date arithmetic into a panic must all be rejected gracefully.
+        // Rolling back `1e8` days crosses `DateTime`'s lower bound — without the
+        // upper-bound guard, this line itself would panic.
         let over_bound = (MAX_PRUNE_DAYS + 1).to_string();
         let max_i64 = i64::MAX.to_string();
         for bad in [
@@ -1913,7 +2037,8 @@ mod tests {
             );
         }
 
-        // 两个旧 session 仍然存在：越界输入在进入删除逻辑之前就返回了。
+        // Both old sessions still exist: out-of-range input returned before
+        // reaching the deletion logic.
         let mut remaining: Vec<String> = store
             .list_sessions()
             .unwrap()
@@ -1958,7 +2083,8 @@ mod tests {
             ],
         )
         .unwrap();
-        // 给源 session 写一个模型标题，作为 fork 标记的基底。
+        // Write a model title to the source session as the base for the fork
+        // marker.
         store
             .write_session_title_with_origin(
                 &app.session_id,
@@ -1967,7 +2093,8 @@ mod tests {
             )
             .unwrap();
 
-        // 第一次 fork：标题加上 [fork] 标记，并切到新 session。
+        // First fork: the title gains the [fork] marker and we switch to the new
+        // session.
         try_handle_session_command(&mut app, "/fork").unwrap();
         let first_fork_id = app.session_id.clone();
         assert_ne!(first_fork_id, "sess-old");
@@ -1976,21 +2103,22 @@ mod tests {
             "[fork] 实现fork功能"
         );
 
-        // 原 session 保留未删除，标题不变。
+        // The original session is kept, not deleted, with its title unchanged.
         assert!(store.session_history_file("sess-old").exists());
         assert_eq!(
             store.read_session_title("sess-old").unwrap().unwrap(),
             "实现fork功能"
         );
 
-        // 在 fork 出来的 session 上再 fork：标记深度递增为 [fork 2]。
+        // Fork again on the forked session: the marker depth increments to
+        // [fork 2].
         try_handle_session_command(&mut app, "/fork").unwrap();
         assert_ne!(app.session_id, first_fork_id);
         assert_eq!(
             store.read_session_title(&app.session_id).unwrap().unwrap(),
             "[fork 2] 实现fork功能"
         );
-        // 两个 fork 分支都保留未删除。
+        // Both fork branches are kept, not deleted.
         assert!(store.session_history_file(&first_fork_id).exists());
         assert!(store.session_history_file("sess-old").exists());
 

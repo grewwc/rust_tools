@@ -1,14 +1,14 @@
-//! 内联工具调用恢复与验证。
+//! Inline tool-call recovery and validation.
 //!
-//! 处理模型输出中非标准格式的工具调用：
-//! - `InlineToolCallParser` / `INLINE_PARSERS`：注册的解析器列表
-//! - `normalize_inline_tool_call_markup`：归一化命名空间前缀 XML 标签
-//! - `recover_inline_tool_calls`：从纯文本中恢复工具调用
+//! Handles tool calls that appear in non-standard formats in model output:
+//! - `InlineToolCallParser` / `INLINE_PARSERS`: list of registered parsers
+//! - `normalize_inline_tool_call_markup`: normalizes namespace-prefixed XML tags
+//! - `recover_inline_tool_calls`: recovers tool calls from plain text
 //! - `recover_json_tool_calls` / `recover_hermes_xml_tool_calls` / `recover_anthropic_xml_tool_calls`
-//!   / `recover_bare_xml_tool_calls`：各格式解析器
-//! - `strip_inline_tool_call_wrappers`：移除工具调用包装标签
-//! - `normalize_tool_call_arguments` / `find_json_object_end`：参数验证
-//! - `collect_valid_tool_calls` / `ensure_tool_calls_section_open`：工具调用收集与渲染
+//!   / `recover_bare_xml_tool_calls`: per-format parsers
+//! - `strip_inline_tool_call_wrappers`: removes tool-call wrapper tags
+//! - `normalize_tool_call_arguments` / `find_json_object_end`: argument validation
+//! - `collect_valid_tool_calls` / `ensure_tool_calls_section_open`: tool-call collection and rendering
 
 use std::sync::LazyLock;
 
@@ -29,11 +29,11 @@ const INLINE_PARSERS: &[InlineToolCallParser] = &[
     recover_json_tool_calls,
 ];
 
-/// 把模型输出里的命名空间前缀 XML 标签归一化为标准 XML 标签，例如
+/// Normalizes namespace-prefixed XML tags in model output into standard XML tags, e.g.
 /// `<|DSML|invoke name="x">` / `<｜｜DSML｜｜invoke name="x">` → `<invoke name="x">`，
 /// `</|DSML|invoke>` / `</｜｜DSML｜｜invoke>` → `</invoke>`。
-/// 也兼容部分模型会输出的带空格分隔形态：`<｜｜DSML ｜ invoke ...>`。
-/// 这样 Hermes / Anthropic 解析器无需为每个 `<|PREFIX|>` 协议单独适配。
+/// Also handles the space-separated form some models emit: `<｜｜DSML ｜ invoke ...>`.
+/// This way the Hermes / Anthropic parsers need no per-`<|PREFIX|>` protocol adaptation.
 pub(super) fn normalize_inline_tool_call_markup(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains("<|")
         && !text.contains("</|")
@@ -81,13 +81,15 @@ pub(super) fn normalize_inline_tool_call_markup(text: &str) -> std::borrow::Cow<
     )
 }
 
-/// 流式场景下的有状态命名空间标签归一化器。
+/// Stateful namespace-tag normalizer for streaming scenarios.
 ///
-/// `normalize_inline_tool_call_markup` 是无状态的整段归一化，无法处理被切到两个
-/// delta chunk 边界的 marker（例如 chunk A 收到 `<｜｜DS`，chunk B 收到
-/// `ML｜｜tool_calls>`）。这种情况下原始 marker 会泄漏成正文，且后续解析失效。
+/// `normalize_inline_tool_call_markup` is a stateless whole-text normalizer; it cannot
+/// handle a marker split across two delta chunk boundaries (e.g. chunk A receives
+/// `<｜｜DS`, chunk B receives `ML｜｜tool_calls>`). In that case the raw marker leaks
+/// into the body text and subsequent parsing fails.
 ///
-/// 该结构缓存可能是「半个 marker」的尾部前缀，等下一个 chunk 补齐后再一起归一化。
+/// This struct caches a trailing prefix that may be "half a marker" and normalizes it
+/// together once the next chunk completes it.
 #[derive(Default)]
 pub(super) struct InlineMarkupNormalizer {
     pending: String,
@@ -98,15 +100,16 @@ impl InlineMarkupNormalizer {
         Self::default()
     }
 
-    /// 喂入一个 chunk，返回可安全下发的归一化文本。若尾部可能是被截断的
-    /// marker 前缀，则暂存到 `pending`，等待下一次 `push` 补齐。
+    /// Feeds in one chunk and returns normalized text that is safe to emit. If the tail
+    /// may be a truncated marker prefix, it is stashed in `pending` until the next
+    /// `push` completes it.
     pub(super) fn push(&mut self, chunk: &str) -> String {
         if chunk.is_empty() {
             return String::new();
         }
         self.pending.push_str(chunk);
-        // 找到最后一个 `<`：它之后的内容可能是尚未闭合的（命名空间）标签，
-        // 一旦这段可能是被切断的 marker，就整体保留到下一个 chunk。
+        // Find the last `<`: everything after it may be an unclosed (namespace) tag.
+        // If that segment could be a split marker, keep all of it for the next chunk.
         let hold_from = self
             .pending
             .rfind('<')
@@ -122,7 +125,8 @@ impl InlineMarkupNormalizer {
         normalize_inline_tool_call_markup(&emit).into_owned()
     }
 
-    /// 流结束时冲刷剩余缓存（可能是一个完整但结尾没有 `>` 的 marker，或普通文本）。
+    /// Flushes the remaining cache at end of stream (either a complete marker missing
+    /// its trailing `>`, or plain text).
     pub(super) fn flush(&mut self) -> String {
         if self.pending.is_empty() {
             return String::new();
@@ -131,15 +135,17 @@ impl InlineMarkupNormalizer {
         normalize_inline_tool_call_markup(&rest).into_owned()
     }
 
-    /// 判断从某个 `<` 开始的片段是否可能是「尚未接收完整」的命名空间 marker，
-    /// 即 `<|...` / `<｜｜...` / `</|...` / `</｜｜...` 且还没出现闭合 `>`。
-    /// 若片段里已经出现 `>`，说明标签已完整，无需保留。
+    /// Determines whether a fragment starting at some `<` may be a namespace marker
+    /// that has not been fully received yet — i.e. `<|...` / `<｜｜...` / `</|...` /
+    /// `</｜｜...` with no closing `>` yet.
+    /// If the fragment already contains `>`, the tag is complete and need not be kept.
     fn maybe_partial_marker(frag: &str) -> bool {
         if frag.contains('>') {
             return false;
         }
-        // 逐字符判断前缀是否仍可能长成命名空间 marker 的开头。
-        // 允许的开头：`<`、`</`，随后跟半角 `|` 或全角 `｜`。
+        // Walk the prefix character by character to check whether it could still grow
+        // into the start of a namespace marker.
+        // Allowed starts: `<`, `</`, followed by an ASCII `|` or a full-width `｜`.
         const HALF: char = '|';
         const FULL: char = '｜';
         let mut chars = frag.chars();
@@ -148,19 +154,22 @@ impl InlineMarkupNormalizer {
         if let Some(after) = rest.strip_prefix('/') {
             rest = after;
         }
-        // 空（刚好停在 `<` 或 `</`）也算可能是 marker 前缀。
+        // Empty (stopped right at `<` or `</`) also counts as a possible marker prefix.
         if rest.is_empty() {
             return true;
         }
-        // 允许 marker 前缀里出现半角/全角竖线；只要没闭合 `>`，就当作可能的半截 marker。
+        // Allow ASCII/full-width vertical bars inside the marker prefix; as long as no
+        // closing `>` has appeared, treat it as a possibly partial marker.
         rest.starts_with(HALF) || rest.starts_with(FULL)
     }
 }
 
-/// 尝试把整段 assistant 文本反向识别为一个/多个 tool_call。
-/// 通过 parser 注册表 + 前置 XML 命名空间归一化，统一处理不同模型产出的
-/// inline tool call 形态（Hermes XML、Anthropic XML、JSON、`<|PREFIX|>` 包装）。
-/// 任一 parser 成功即返回；全部失败则视为普通文本回答。
+/// Attempts to parse a whole assistant text back into one or more tool_calls.
+/// Via the parser registry plus upfront XML namespace normalization, it uniformly
+/// handles the inline tool call forms produced by different models (Hermes XML,
+/// Anthropic XML, JSON, `<|PREFIX|>` wrappers).
+/// Returns as soon as any parser succeeds; if all fail, the text is treated as a
+/// plain answer.
 pub(super) fn recover_inline_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let normalized = normalize_inline_tool_call_markup(text);
     for parser in INLINE_PARSERS {
@@ -171,7 +180,7 @@ pub(super) fn recover_inline_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     None
 }
 
-/// 从 assistant 文本里识别 JSON 形态的工具调用（单个对象或数组）。
+/// Recognizes JSON-form tool calls in assistant text (single object or array).
 fn recover_json_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let stripped = strip_inline_tool_call_wrappers(text);
     let trimmed = stripped.trim();
@@ -188,8 +197,8 @@ fn recover_json_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let mut out = Vec::with_capacity(raw_calls.len());
     for (idx, raw) in raw_calls.into_iter().enumerate() {
         let obj = raw.as_object()?;
-        // 兼容 OpenAI 风格 {"function": {"name", "arguments"}, "id"} 与
-        // 简化风格 {"name", "arguments"}。
+        // Handles both the OpenAI style {"function": {"name", "arguments"}, "id"} and
+        // the simplified style {"name", "arguments"}.
         let (name, arguments_value, id) = if let Some(func) = obj.get("function") {
             let func_obj = func.as_object()?;
             let name = func_obj.get("name")?.as_str()?.to_string();
@@ -223,7 +232,8 @@ fn recover_json_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
                 if trimmed.is_empty() {
                     "{}".to_string()
                 } else {
-                    // 校验内层字符串确实是 JSON，避免把任意字符串当 args 透传。
+                    // Validate that the inner string is really JSON, so arbitrary strings
+                    // are not passed through as args.
                     serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
                     trimmed.to_string()
                 }
@@ -239,25 +249,26 @@ fn recover_json_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// 解析 Hermes / Qwen 风格的 XML tool call。支持：
-///   - 多个 `<function=NAME> ... </function>` 块（并行工具调用）
-///   - body 为 JSON：`<function=read_file>{"path":"/x"}</function>`
-///   - body 为 parameter 标签：`<function=read_file><parameter=path>/x</parameter></function>`
-///   - 外层可有可无 `<tool_call>...</tool_call>` 包裹
-/// 任意一个 `<function=...>` 块解析成功即返回；全部失败返回 None。
+/// Parses Hermes / Qwen style XML tool calls. Supports:
+///   - multiple `<function=NAME> ... </function>` blocks (parallel tool calls)
+///   - JSON body: `<function=read_file>{"path":"/x"}</function>`
+///   - parameter-tag body: `<function=read_file><parameter=path>/x</parameter></function>`
+///   - an optional outer `<tool_call>...</tool_call>` wrapper
+/// Returns as soon as any `<function=...>` block parses; returns None if all fail.
 fn recover_hermes_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let mut out: Vec<ToolCall> = Vec::new();
     let mut rest = text;
     let mut idx = 0usize;
     while let Some(open_rel) = rest.find("<function=") {
         let after_open = &rest[open_rel + "<function=".len()..];
-        // 函数名到第一个 '>' 为止。
+        // Function name runs up to the first '>'.
         let Some(name_end) = after_open.find('>') else {
             break;
         };
         let name = after_open[..name_end].trim().to_string();
         let body_start = name_end + 1;
-        // body 到配套 </function> 为止；缺失闭合标签时取剩余全部。
+        // Body runs up to the matching </function>; if the closing tag is missing,
+        // take the rest.
         let body_region = &after_open[body_start..];
         let (body, consumed_to) = match body_region.find("</function>") {
             Some(close_rel) => (
@@ -276,7 +287,8 @@ fn recover_hermes_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
                 idx += 1;
             }
         }
-        // 前进到本块结束之后，继续扫描后续并行块。
+        // Advance past the end of this block and keep scanning for subsequent
+        // parallel blocks.
         let advance = open_rel + "<function=".len() + consumed_to;
         if advance >= rest.len() {
             break;
@@ -286,19 +298,19 @@ fn recover_hermes_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// 解析 Anthropic / Claude 风格的 XML tool call。支持：
-///   - 多个 `<invoke name="NAME"> ... </invoke>` 块（并行工具调用）
-///   - 参数为 `<parameter name="key">value</parameter>` 标签集合
-///   - 外层可有可无 `<function_calls>` / `<tool_calls>` 包裹
-///   - 标签可带命名空间前缀（如 `antml:invoke`）
-/// 任意一个 `<invoke ...>` 块解析成功即返回；全部失败返回 None。
+/// Parses Anthropic / Claude style XML tool calls. Supports:
+///   - multiple `<invoke name="NAME"> ... </invoke>` blocks (parallel tool calls)
+///   - parameters as a set of `<parameter name="key">value</parameter>` tags
+///   - an optional outer `<function_calls>` / `<tool_calls>` wrapper
+///   - tags may carry a namespace prefix (e.g. `antml:invoke`)
+/// Returns as soon as any `<invoke ...>` block parses; returns None if all fail.
 fn recover_anthropic_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let mut out: Vec<ToolCall> = Vec::new();
     let mut rest = text;
     let mut idx = 0usize;
     while let Some(open_rel) = rest.find("<invoke") {
         let after_tag = &rest[open_rel..];
-        // 定位本 invoke 开标签的 '>'。
+        // Locate the '>' of this invoke's opening tag.
         let Some(open_gt) = after_tag.find('>') else {
             break;
         };
@@ -330,10 +342,12 @@ fn recover_anthropic_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// 解析裸工具名 XML：`<execute_command>pwd</execute_command>`。
-/// 仅对白名单里的已注册工具名生效，避免把普通 HTML/XML 标签误当工具调用。
-/// 与 Hermes / Anthropic 不同，这里标签名本身就是工具名，body 既可能是 JSON
-/// arguments，也可能是像 `execute_command` 这样只有一个必填字符串参数的原始文本。
+/// Parses bare tool-name XML: `<execute_command>pwd</execute_command>`.
+/// Only takes effect for registered tool names on the allowlist, so ordinary
+/// HTML/XML tags are not mistaken for tool calls.
+/// Unlike Hermes / Anthropic, the tag name itself is the tool name; the body may be
+/// JSON arguments, or raw text for tools like `execute_command` that have exactly
+/// one required string parameter.
 fn recover_bare_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let stripped = strip_inline_tool_call_wrappers(text);
     let mut rest = stripped.trim();
@@ -369,8 +383,8 @@ fn recover_bare_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// 把 `<invoke>` body 里的 `<parameter name="key">value</parameter>` 解析为 JSON
-/// arguments 字符串；无参数返回 `{}`。
+/// Parses the `<parameter name="key">value</parameter>` tags in an `<invoke>` body
+/// into a JSON arguments string; returns `{}` when there are no parameters.
 fn parse_anthropic_invoke_body(body: &str) -> String {
     let mut map = serde_json::Map::new();
     let mut rest = body;
@@ -413,22 +427,24 @@ fn parse_anthropic_invoke_body(body: &str) -> String {
     }
 }
 
-/// 从 `<invoke name="x">` / `<parameter name="y">` 开标签里抽取 `name` 属性值，
-/// 支持双引号或单引号。
+/// Extracts the `name` attribute value from an `<invoke name="x">` /
+/// `<parameter name="y">` opening tag; supports double or single quotes.
 fn parse_anthropic_xml_name_attr(open_tag: &str) -> String {
     super::splitter::parse_xml_attr_value(open_tag, "name")
         .unwrap_or_default()
         .to_string()
 }
 
-/// 从开标签属性串里解析 `string="true"` 等 bool 属性（DSML 协议）。
-/// 值不区分大小写；缺省或非 "true" 值返回 false。
+/// Parses bool attributes such as `string="true"` from an opening tag's attribute
+/// string (DSML protocol).
+/// Values are case-insensitive; a missing or non-"true" value returns false.
 fn parse_anthropic_xml_bool_attr(open_tag: &str, name: &str) -> bool {
     super::splitter::parse_xml_attr_value(open_tag, name)
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-/// 解析裸 XML 开标签，要求标签名本身是已注册工具名，且不带属性。
+/// Parses a bare XML opening tag; the tag name must itself be a registered tool
+/// name, and the tag must carry no attributes.
 pub(super) fn parse_bare_xml_open_tag(tag: &str) -> Option<String> {
     let inner = tag.trim();
     if !inner.starts_with('<') || !inner.ends_with('>') {
@@ -444,9 +460,10 @@ pub(super) fn parse_bare_xml_open_tag(tag: &str) -> Option<String> {
     crate::ai::tools::registry::common::is_registered_tool_name(inner).then(|| inner.to_string())
 }
 
-/// 解析裸 XML 工具体。优先接受 JSON object / Hermes parameter 标签；
-/// 若 body 只是原始文本，则仅对“恰好一个必填 string 参数”的工具做安全降级，
-/// 例如 `<execute_command>pwd</execute_command>` → `{"command":"pwd"}`。
+/// Parses a bare XML tool body. Prefers JSON objects / Hermes parameter tags;
+/// if the body is only raw text, it safely degrades only for tools with exactly
+/// one required string parameter, e.g.
+/// `<execute_command>pwd</execute_command>` → `{"command":"pwd"}`.
 pub(super) fn parse_bare_xml_tool_body(tool_name: &str, body: &str) -> Option<String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -465,9 +482,10 @@ fn single_required_string_argument_key(tool_name: &str) -> Option<String> {
     let schema = schema.as_object()?;
     let required = schema.get("required")?.as_array()?;
     let props = schema.get("properties")?.as_object()?;
-    // 找到所有 required 中类型为 string 的参数。
-    // 当且仅当恰好有一个 required string 参数时，裸文本 body 映射到它；
-    // 其它 required 非 string 参数（如 execute_command 的 pty: bool）由运行时默认值填充。
+    // Find all required parameters whose type is string.
+    // If and only if there is exactly one required string parameter, the raw text
+    // body maps to it; other required non-string parameters (e.g. execute_command's
+    // pty: bool) are filled from runtime defaults.
     let mut string_keys = Vec::new();
     for item in required {
         let key = item.as_str()?;
@@ -484,15 +502,17 @@ fn single_required_string_argument_key(tool_name: &str) -> Option<String> {
     }
 }
 
-/// 把单个 `<function=...>` 的 body 解析为 JSON arguments 字符串。
-/// body 既可能直接是 JSON 对象，也可能是若干 `<parameter=key>value</parameter>`。
+/// Parses the body of a single `<function=...>` into a JSON arguments string.
+/// The body may be a JSON object directly, or a set of
+/// `<parameter=key>value</parameter>` tags.
 pub(super) fn parse_hermes_function_body(body: &str) -> Option<String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
-        // 无参数工具调用（如 `<function=list_dir></function>`）合法，返回空对象。
+        // A parameterless tool call (e.g. `<function=list_dir></function>`) is legal;
+        // return an empty object.
         return Some("{}".to_string());
     }
-    // 形态 1：body 本身就是 JSON 对象。
+    // Form 1: the body is itself a JSON object.
     if trimmed.starts_with('{') {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
             if value.is_object() {
@@ -500,7 +520,7 @@ pub(super) fn parse_hermes_function_body(body: &str) -> Option<String> {
             }
         }
     }
-    // 形态 2：<parameter=key>value</parameter> 标签集合。
+    // Form 2: a set of <parameter=key>value</parameter> tags.
     if trimmed.contains("<parameter=") {
         let mut map = serde_json::Map::new();
         let mut rest = trimmed;
@@ -515,7 +535,8 @@ pub(super) fn parse_hermes_function_body(body: &str) -> Option<String> {
                 break;
             };
             let raw_value = value_region[..close_rel].trim();
-            // 尝试把值解析成 JSON 标量/结构（数字、bool、对象、数组）；否则当字符串。
+            // Try to parse the value as a JSON scalar/structure (number, bool, object,
+            // array); otherwise treat it as a string.
             let value = serde_json::from_str::<serde_json::Value>(raw_value)
                 .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
             if !key.is_empty() {
@@ -530,16 +551,17 @@ pub(super) fn parse_hermes_function_body(body: &str) -> Option<String> {
     None
 }
 
-/// 剥掉模型常见的包裹形态：```json ... ```、``` ... ```、
+/// Strips common wrapper forms emitted by models: ```json ... ```, ``` ... ```,
 /// `<tool_call> ... </tool_call>`、`<|tool_call_begin|> ... <|tool_call_end|>`。
-/// 仅当输入整体被这些包裹时才剥离一层；否则原样返回。
+/// Strips one layer only when the whole input is wrapped like this; otherwise
+/// returns it unchanged.
 fn strip_inline_tool_call_wrappers(text: &str) -> String {
     let mut s = text.trim().to_string();
     // markdown fenced code block
     if let Some(rest) = s.strip_prefix("```") {
         if let Some(end) = rest.rfind("```") {
             let inner = &rest[..end];
-            // 去掉首行可能的语言标签（json / JSON）
+            // Remove a possible language tag on the first line (json / JSON)
             let inner_trimmed = inner.trim_start();
             let inner_no_lang = inner_trimmed
                 .strip_prefix("json")
@@ -568,19 +590,20 @@ pub(super) fn normalize_tool_call_arguments(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return Some("{}".to_string());
     }
-    // 标准路径：整体就是合法 JSON。
+    // Standard path: the whole input is valid JSON.
     if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
         return Some(trimmed.to_string());
     }
-    // 部分 provider（qwen3.7 等）在 delta.tool_calls.arguments 中混入 XML
-    // parameter 标签（如 `{"k":"v"}</parameter><parameter-langs>...</parameter></function>`）。
-    // 尝试用 Hermes body 解析器提取参数。
+    // Some providers (qwen3.7 etc.) mix XML parameter tags into
+    // delta.tool_calls.arguments (e.g.
+    // `{"k":"v"}</parameter><parameter-langs>...</parameter></function>`).
+    // Try extracting the arguments with the Hermes body parser.
     if trimmed.contains("<parameter=") || trimmed.contains("</parameter>") {
         if let Some(args) = parse_hermes_function_body(trimmed) {
             return Some(args);
         }
     }
-    // 尝试截取 JSON 对象前缀：从 '{' 开始找到最后一个配对的 '}'。
+    // Try to slice a JSON object prefix: starting at '{', find the last matching '}'.
     if trimmed.starts_with('{') {
         if let Some(end) = find_json_object_end(trimmed) {
             let candidate = &trimmed[..=end];
@@ -592,7 +615,8 @@ pub(super) fn normalize_tool_call_arguments(raw: &str) -> Option<String> {
     None
 }
 
-/// 从字符串开头的 `{` 开始，追踪大括号嵌套深度，跳过字符串字面量，返回配对 `}` 的索引。
+/// Starting from the `{` at the beginning of the string, tracks brace nesting depth
+/// while skipping string literals, and returns the index of the matching `}`.
 fn find_json_object_end(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut depth = 0i32;
@@ -626,9 +650,11 @@ fn find_json_object_end(s: &str) -> Option<usize> {
     None
 }
 
-/// 收集本轮有效工具调用。返回 `(工具调用列表, 是否发生过丢弃)`：当某个工具调用
-/// 的 arguments JSON 不完整（典型：大文件 `write_file` 撞输出上限被截断）而无法
-/// 修复时会被丢弃并返回 `dropped=true`，供上层区分"截断"与"正常无工具调用"。
+/// Collects the valid tool calls for this turn. Returns
+/// `(tool call list, whether anything was dropped)`: a tool call whose arguments
+/// JSON is incomplete (typically a large `write_file` truncated by the output
+/// limit) and cannot be repaired is dropped with `dropped=true`, letting callers
+/// distinguish "truncated" from "no tool calls this turn".
 pub(super) fn collect_valid_tool_calls(
     builders: &mut rust_tools::cw::SkipMap<usize, ToolCallBuilder>,
 ) -> (Vec<ToolCall>, bool) {
@@ -638,12 +664,15 @@ pub(super) fn collect_valid_tool_calls(
         .filter_map(|(_, mut builder)| {
             let Some(arguments) = normalize_tool_call_arguments(&builder.arguments) else {
                 dropped = true;
-                // 打印被截断的 arguments 片段，便于排查"为什么被截断"。
-                // arguments 可能很大（大文件 write_file），只显示头尾各 300 字符。
+                // Print the truncated arguments fragment to ease debugging "why was it
+                // truncated".
+                // arguments can be large (large-file write_file); show only the first
+                // and last 300 chars.
                 let raw = &builder.arguments;
                 let char_count = raw.chars().count();
                 let snippet = if char_count > 600 {
-                    // 按字符边界截取，避免在多字节 UTF-8 字符（如中文）中间切片导致 panic。
+                    // Slice at char boundaries to avoid panicking by cutting a
+                    // multi-byte UTF-8 character (e.g. Chinese) in the middle.
                     let head: String = raw.chars().take(300).collect();
                     let tail: String = raw
                         .chars()
@@ -691,7 +720,7 @@ pub(super) fn ensure_tool_calls_section_open(
     let _ = clear_waiting_hint(state);
 
     if state.content.thinking_open {
-        // 如果折叠模式活跃，先执行折叠结束渲染
+        // If fold mode is active, render the fold ending first
         if state.render.thinking_fold.active {
             let _ = finalize_thinking_fold(state);
         } else {

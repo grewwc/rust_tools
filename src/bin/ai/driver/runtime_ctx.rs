@@ -52,9 +52,9 @@ use crate::ai::{
 };
 use tokio::sync::Mutex;
 
-/// 子代理发布给父代理的结果。`parent_payload` 可包含工具证据，供父代理复用；
-/// `final_assistant_text` 保留模型原始最终正文，供 `response_schema` 校验。
-/// 两者必须分开，避免证据包装破坏结构化 JSON 输出。
+/// Result published by a subagent to its parent. `parent_payload` may contain tool evidence for the parent to reuse;
+/// `final_assistant_text` keeps the model's original final body for `response_schema` validation.
+/// The two must stay separate so evidence wrapping cannot break structured JSON output.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SubagentResult {
     pub(crate) parent_payload: String,
@@ -92,8 +92,8 @@ pub(crate) struct SubagentProgressEvent {
     pub(crate) summary: String,
 }
 
-/// 所有父代理可观测路径共用的结构化快照。展示、唤醒、持久化和硬超时恢复
-/// 都从这里投影，避免各自拼装一份语义不一致的状态。
+/// Structured snapshot shared by all parent-observable paths. Display, wakeup, persistence, and hard-timeout recovery
+/// all project from here, preventing each path from assembling a semantically inconsistent state of its own.
 #[derive(Debug, Clone)]
 pub(crate) struct SubagentProgressSnapshot {
     pub(crate) phase: String,
@@ -125,7 +125,7 @@ impl SubagentProgressSnapshot {
     }
 }
 
-/// 子代理的实时进度。事件时间线保持有界，长期诊断证据由 task 层低频持久化。
+/// A subagent's live progress. The event timeline stays bounded; long-term diagnostic evidence is persisted at low frequency by the task layer.
 #[derive(Debug, Clone)]
 pub(crate) struct SubagentProgress {
     phase: String,
@@ -190,12 +190,12 @@ impl SubagentProgress {
     }
 }
 
-/// 与 `SubagentResultSlot` 不同，这里使用同步锁：子代理写入时不跨 `.await`，
-/// 父代理的前台等待/刷新循环也只做一次短快照。
+/// Unlike `SubagentResultSlot`, this uses a synchronous lock: subagent writes never span an `.await`,
+/// and the parent's foreground wait/refresh loop only takes a short snapshot.
 pub(crate) type SubagentPhaseSlot = Arc<std::sync::Mutex<SubagentProgress>>;
 
-/// 一次性收口信号：父等待循环在预留的收口时间到达时置位，子代理在下一轮
-/// 请求模型前消费它并切换到无工具的最终回答模式。
+/// One-shot wrap-up signal: the parent wait loop sets it when the reserved wrap-up time arrives, and the subagent consumes it before its next
+/// model request, switching to the tool-free final answer mode.
 pub(crate) type SubagentWrapUpSignal = Arc<AtomicBool>;
 
 /// Snapshot of the live runtime that a sub-agent dispatch needs.
@@ -230,8 +230,8 @@ impl DriverContext {
 
 tokio::task_local! {
     pub(crate) static DRIVER_CTX: Arc<DriverContext>;
-    /// 当前人格绑定的 memory 文件。前台 turn / one-shot note 流程会把它
-    /// scope 进来，让不同 persona 的长期记忆完全隔离。
+    /// Memory file bound to the current persona. The foreground turn / one-shot note flows scope it
+    /// in, keeping long-term memory fully isolated across personas.
     pub(crate) static PERSONA_MEMORY_PATH: PathBuf;
     /// When set, every `MemoryStore::from_env_or_config()` inside this
     /// task scope reads/writes from this path instead of the shared
@@ -252,52 +252,52 @@ tokio::task_local! {
     /// current execution phase here so the spawning `task` tool's heartbeat
     /// line can surface it. Absence means "no parent is showing a heartbeat".
     pub(crate) static SUBAGENT_PHASE: SubagentPhaseSlot;
-    /// 后台异步任务的稳定 task id。进度发布器据此把统一快照低频持久化并唤醒
-    /// 对应父进程；同步 `task` 没有该作用域，仍可通过共享 slot 展示心跳。
+    /// Stable task id for background async tasks. The progress publisher uses it to persist the unified snapshot at low frequency and wake the
+    /// corresponding parent process; a synchronous `task` has no such scope but can still show heartbeats via the shared slot.
     pub(crate) static SUBAGENT_TASK_ID: String;
-    /// 父同步等待即将到达硬超时时置位；子代理只消费一次，用于请求其立即收口。
+    /// Set when the parent's synchronous wait is about to hit its hard timeout; the subagent consumes it once to request immediate wrap-up.
     pub(crate) static SUBAGENT_WRAP_UP_SIGNAL: SubagentWrapUpSignal;
-    /// 后台 subagent 不拥有 terminal。其完整响应仍照常解析、持久化并通过 result
-    /// slot 返回父 agent，但流式正文、thinking、工具状态等不得直接写 stdout/stderr，
-    /// 否则多个并发任务会互相覆盖光标并打乱前台输出。
+    /// Background subagents do not own the terminal. Their full responses are still parsed, persisted, and returned to the parent through the
+    /// result slot as usual, but streaming body, thinking, tool status, etc. must never write directly to stdout/stderr,
+    /// or concurrent tasks would overwrite each other's cursor and garble foreground output.
     pub(crate) static SUPPRESS_TERMINAL_OUTPUT: bool;
-    /// 子代理嵌套深度。顶层 agent 未设置（等价于 0）；每 spawn 一层
-    /// 子代理时递增。用于防止 `mode: all` 的 heavy agent 递归扇出
-    /// 导致资源耗尽——`task_spawn` / `task` 在超过 `MAX_SUBAGENT_SPAWN_DEPTH`
-    /// 时拒绝继续委派。
+    /// Subagent nesting depth. Unset for the top-level agent (equivalent to 0); incremented each time
+    /// a subagent is spawned. Guards against recursive fan-out of `mode: all` heavy agents
+    /// exhausting resources — `task_spawn` / `task` refuse to delegate further once `MAX_SUBAGENT_SPAWN_DEPTH`
+    /// is exceeded.
     pub(crate) static SUBAGENT_DEPTH: usize;
-    /// 当前 turn 的 (session_id, turn_id) 元组。由 driver run_loop 在每
-    /// 轮调度前 enter，被 DecisionLog / 反馈写入路径读取，把工具调用结
-    /// 果对回到正确的 (session, turn)。未设置时下游获取到 ("", 0)。
+    /// The current turn's (session_id, turn_id) tuple. The driver run_loop enters it before each
+    /// turn's scheduling; DecisionLog / feedback write paths read it to attribute tool call
+    /// results back to the right (session, turn). Downstream sees ("", 0) when unset.
     pub(crate) static TURN_IDENTITY: (String, usize);
     pub(crate) static AUTO_MODEL_FALLBACK: AutoModelFallbackSpec;
-    /// 当设置时，标识当前 turn 是 foreground 进程被唤醒后的恢复执行
-    /// （而非用户主动输入）。`prepare_turn` 据此将持久化的 question 消息
-    /// 标记为 `internal_note` 而非 `user`，避免唤醒 prompt 被计入
-    /// `/history user`、history 压缩的 user-turn 计数、以及被模型误读为
-    /// 用户重复提问。
+    /// When set, marks the current turn as resumed execution after a foreground process wakeup
+    /// (rather than direct user input). `prepare_turn` uses this to mark the persisted question message
+    /// as `internal_note` instead of `user`, so the wakeup prompt is not counted in
+    /// `/history user`, history compression's user-turn counts, or misread by the model as
+    /// the user asking again.
     pub(crate) static IS_RESUME_TURN: bool;
 }
 
-/// 读取当前 turn 的 session_id；未在 turn 内调用时返回空串。
+/// Read the current turn's session_id; returns an empty string outside a turn.
 pub(crate) fn current_session_id_or_empty() -> String {
     TURN_IDENTITY
         .try_with(|(s, _)| s.clone())
         .unwrap_or_default()
 }
 
-/// 读取当前 turn 的 turn_id；未在 turn 内调用时返回 0。
+/// Read the current turn's turn_id; returns 0 outside a turn.
 pub(crate) fn current_turn_id_or_zero() -> usize {
     TURN_IDENTITY.try_with(|(_, t)| *t).unwrap_or(0)
 }
 
-/// 返回当前 turn 是否是 foreground 进程唤醒后的恢复执行。
+/// Whether the current turn is resumed execution after a foreground process wakeup.
 pub(crate) fn is_resume_turn() -> bool {
     IS_RESUME_TURN.try_with(|v| *v).unwrap_or(false)
 }
 
-/// 把父侧 payload 与原始最终正文一起发布到 active result slot。顶层前台
-/// turn 没有安装 slot 时静默跳过。
+/// Publish the parent-side payload together with the original final body into the active result slot. A top-level
+/// foreground turn without an installed slot silently skips this.
 pub(crate) async fn publish_subagent_result(parent_payload: &str, final_assistant_text: &str) {
     if parent_payload.trim().is_empty() {
         return;
@@ -317,7 +317,7 @@ pub(crate) fn has_subagent_result_slot() -> bool {
     SUBAGENT_RESULT_SLOT.try_with(|_| ()).is_ok()
 }
 
-/// 当前任务是否拥有 terminal 输出权。默认允许；后台 subagent 作用域显式关闭。
+/// Whether the current task owns terminal output. Allowed by default; background subagent scopes turn it off explicitly.
 pub(crate) fn terminal_output_enabled() -> bool {
     !SUPPRESS_TERMINAL_OUTPUT
         .try_with(|value| *value)
@@ -345,8 +345,8 @@ pub(crate) fn publish_subagent_phase(phase: &str) {
     }
 }
 
-/// 记录最近一次已成功落盘的工作计划。阶段变化只更新 `phase`，不会丢失这条
-/// 可供父代理展示的任务级进展。
+/// The most recent work plan successfully persisted. Phase changes only update `phase`, never losing this
+/// task-level progress available for parent display.
 pub(crate) fn publish_subagent_checkpoint_summary(summary: &str) {
     let Ok(slot) = SUBAGENT_PHASE.try_with(|slot| slot.clone()) else {
         return;
@@ -397,8 +397,8 @@ pub(crate) fn subagent_progress_state_snapshot(
         .map(|progress| progress.snapshot(Instant::now()))
 }
 
-/// 长任务的 checkpoint 由运行时状态决定，而不是依赖模型记住固定轮次。
-/// 每个到期窗口最多注入一次提醒；成功发布 checkpoint 后重新计时。
+/// Checkpoints for long tasks are driven by runtime state, not by the model remembering fixed turn counts.
+/// At most one reminder is injected per due window; the timer restarts after a checkpoint is published successfully.
 pub(crate) fn take_subagent_checkpoint_due_reminder() -> bool {
     let Ok(slot) = SUBAGENT_PHASE.try_with(|slot| slot.clone()) else {
         return false;
@@ -422,8 +422,8 @@ pub(crate) fn take_subagent_checkpoint_due_reminder() -> bool {
 }
 
 fn compact_progress_text(value: &str, max_chars: usize) -> String {
-    // 进度最终会进入父进程 TTY；先在共享槽写入边界移除 ESC、BEL、回车等
-    // 终端控制字符，避免任一前台渲染路径误把模型提供的工具参数当作控制序列。
+    // Progress eventually reaches the parent's TTY; at the shared-slot write boundary, strip ESC, BEL, carriage returns, and other
+    // terminal control characters so no foreground render path mistakes model-provided tool args for control sequences.
     let sanitized: String = value
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -449,16 +449,16 @@ pub(crate) fn format_progress_duration(duration: Duration) -> String {
     }
 }
 
-/// 消费一次父代理发来的收口请求。未安装该 task-local 时说明当前 turn 没有
-/// 预超时收口策略，保持普通执行路径。
+/// Consume one wrap-up request from the parent. If this task-local is not installed, the current turn has no
+/// pre-timeout wrap-up policy and keeps the normal execution path.
 pub(crate) fn take_subagent_wrap_up_request() -> bool {
     SUBAGENT_WRAP_UP_SIGNAL
         .try_with(|signal| signal.swap(false, Ordering::AcqRel))
         .unwrap_or(false)
 }
 
-/// 非消费式检查：父代理是否已发出预超时收口请求。用于在当前模型请求等待期间
-/// 中断请求并立即进入强制收口迭代（见 `iteration.rs` 的请求中断分支）。
+/// Non-consuming check: whether the parent has already sent a pre-timeout wrap-up request. Used to interrupt the in-flight
+/// model request and immediately enter the forced wrap-up iteration (see the request-interrupt branch in `iteration.rs`).
 pub(crate) fn has_subagent_wrap_up_pending() -> bool {
     SUBAGENT_WRAP_UP_SIGNAL
         .try_with(|signal| signal.load(Ordering::Acquire))
@@ -466,27 +466,27 @@ pub(crate) fn has_subagent_wrap_up_pending() -> bool {
 }
 
 // =============================================================================
-// 并行只读批次线程的 DRIVER_CTX 回退
+// DRIVER_CTX fallback for parallel read-only batch threads
 // =============================================================================
-// `run_parallel_readonly_batch` 用 `std::thread::scope` 在原始 OS 线程上执行
-// 只读工具。tokio task-local `DRIVER_CTX` 只对安装它的 tokio 任务可见，在这些
-// 线程上 `try_with` 必然失败，导致依赖会话上下文的工具（如 search_overflow 的
-// `current_session_assets_dir`）在批量并行时硬失败。批次线程在运行前把父任务
-// 的上下文安装到下面的回退槽，`try_current()` 在 task-local 缺失时改读它；
-// 线程退出（guard drop）时恢复原值，不会泄漏到其它线程。
+// `run_parallel_readonly_batch` runs read-only tools on raw OS threads via `std::thread::scope`.
+// The tokio task-local `DRIVER_CTX` is visible only to the tokio task that installed it; on those
+// threads `try_with` always fails, hard-failing tools that depend on session context (such as search_overflow's
+// `current_session_assets_dir`) during batched parallelism. Before running, a batch thread installs the parent task's
+// context into the fallback slot below, and `try_current()` reads it when the task-local is missing;
+// on thread exit (guard drop) the original value is restored and nothing leaks to other threads.
 thread_local! {
     static THREAD_CTX_FALLBACK: RefCell<Option<Arc<DriverContext>>> =
         const { RefCell::new(None) };
 }
 
-/// RAII 守卫：在 `std::thread::scope` 批次线程内临时安装/恢复 `DRIVER_CTX`
-/// 回退，让只读工具在这些线程上仍能解析会话上下文。
+/// RAII guard: temporarily installs/restores the `DRIVER_CTX` fallback inside a `std::thread::scope` batch thread,
+/// letting read-only tools still resolve session context on those threads.
 pub(crate) struct DriverCtxThreadFallback {
     previous: Option<Arc<DriverContext>>,
 }
 
 impl DriverCtxThreadFallback {
-    /// 安装回退上下文；返回的守卫在 drop 时恢复该线程之前的值。
+    /// Install the fallback context; the returned guard restores the thread's previous value on drop.
     pub(crate) fn install(ctx: Option<Arc<DriverContext>>) -> Self {
         let previous =
             THREAD_CTX_FALLBACK.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), ctx));
@@ -552,27 +552,27 @@ pub(crate) fn effective_cwd() -> std::io::Result<PathBuf> {
 // =============================================================================
 // Per-session temp directory + persistent temp-file registry
 // =============================================================================
-// agent 在执行任务时常需要写临时/中间文件（脚本、片段输出、转储等）。
-// `temp_dir()` 提供一个统一的、按 session 隔离的临时目录，按需创建。
+// Agents often need to write temp/intermediate files while working (scripts, snippet output, dumps, etc.).
+// `temp_dir()` provides a unified, per-session isolated temp directory, created on demand.
 //
-// 优先使用 session assets 目录（与 tool-overflow 同源），路径为
-// `~/.history_file.sessions/<session>.assets/tmp/`——落在项目外、按 session
-// 隔离，不污染工作区。当 DRIVER_CTX 不可用（测试 / 一次性调用）时，回退到
-// `<std::env::temp_dir()/.agent_tmp/<session>/`（系统临时目录，不污染项目）。
+// Prefer the session assets dir (same source as tool-overflow) at
+// `~/.history_file.sessions/<session>.assets/tmp/` — outside the project and isolated per session,
+// so the workspace stays clean. When DRIVER_CTX is unavailable (tests / one-shot calls), fall back to
+// `<std::env::temp_dir()/.agent_tmp/<session>/` (system temp dir; does not pollute the project).
 //
-// 通过 `write_file(temp=true)` 写入此目录的文件会被记录在持久化注册表
-// （`storage::temp_registry`）中，供审计跟踪。临时文件在会话结束时由运行时统一清理。
-// 注册表以 JSON 文件持久化，会话终止后重启仍可读取。
+// Files written into this dir via `write_file(temp=true)` are recorded in a persistent registry
+// (`storage::temp_registry`) for audit tracking. Temp files are cleaned up by the runtime when the session ends.
+// The registry is persisted as a JSON file and remains readable after restarts following a session termination.
 // =============================================================================
 
-/// 返回当前 session 的临时目录路径，按需创建目录。供 `write_file(temp=true)`
-/// 等需要写入临时文件的场景使用。
+/// Return the current session's temp dir path, creating the directory on demand. Used by `write_file(temp=true)`
+/// and other flows that need to write temp files.
 ///
-/// 优先返回 `<sessions_root>/<session>.assets/tmp/`（与 tool-overflow 同源，
-/// 落在项目外），`DRIVER_CTX` 不可用时回退到 `<std::env::temp_dir()/.agent_tmp/<session>/`。
+/// Prefers `<sessions_root>/<session>.assets/tmp/` (same source as tool-overflow,
+/// outside the project); falls back to `<std::env::temp_dir()/.agent_tmp/<session>/` when `DRIVER_CTX` is unavailable.
 pub(crate) fn temp_dir() -> std::io::Result<PathBuf> {
-    // 优先使用 session assets 目录（与 tool-overflow 同源），让临时文件
-    // 落在项目外、按 session 隔离的 ~/.history_file.sessions/<id>.assets/tmp/。
+    // Prefer the session assets dir (same source as tool-overflow) so temp files live in
+    // the per-session isolated ~/.history_file.sessions/<id>.assets/tmp/ outside the project.
     if let Some(ctx) = try_current() {
         let history_file = ctx.app_proto.config.history_file.clone();
         let session_id = ctx.app_proto.session_id.clone();
@@ -583,8 +583,8 @@ pub(crate) fn temp_dir() -> std::io::Result<PathBuf> {
         return Ok(dir);
     }
 
-    // fallback：无 DRIVER_CTX（测试 / 一次性调用）时使用系统临时目录，
-    // 不落到 effective_cwd 下，避免污染项目工作区。
+    // Fallback: without DRIVER_CTX (tests / one-shot calls), use the system temp dir,
+    // never under effective_cwd, keeping the project workspace clean.
     let base = std::env::temp_dir();
     let session = current_session_id_or_empty();
     let session_part = if session.is_empty() {
@@ -779,11 +779,11 @@ mod tests {
 
     #[test]
     fn try_current_falls_back_to_thread_installed_ctx_on_raw_threads() {
-        // 回归：并行只读批次在 `std::thread::scope` 的原始 OS 线程上运行，tokio
-        // task-local `DRIVER_CTX` 在这些线程上不存在（search_overflow 批量并行曾
-        // 因此硬失败）。批次线程安装 `DriverCtxThreadFallback` 回退后，
-        // `try_current()` 必须仍能解析出上下文；线程退出时回退自动恢复，且各
-        // 线程之间互不泄漏。
+        // Regression: parallel read-only batches run on raw OS threads via `std::thread::scope`, where the tokio
+        // task-local `DRIVER_CTX` does not exist (batched parallel search_overflow once
+        // hard-failed because of this). After a batch thread installs the `DriverCtxThreadFallback`,
+        // `try_current()` must still resolve the context; the fallback is restored automatically on thread exit,
+        // and nothing leaks between threads.
         let ctx = DriverContext::new(
             crate::ai::driver::tests::test_app("build"),
             Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new())),
@@ -807,7 +807,7 @@ mod tests {
                 }
             });
             scope.spawn(move || {
-                // 并发线程互不影响：回退是线程局部的。
+        // Concurrent threads do not affect each other: the fallback is thread-local.
                 assert!(try_current().is_none());
             });
         });

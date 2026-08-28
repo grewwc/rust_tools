@@ -57,12 +57,13 @@ fn parse_retry_after_caps_oversized_server_value() {
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 
     let mut headers = HeaderMap::new();
-    // 服务端返回极大的 Retry-After（模拟到下个配额窗口的秒数），必须被钳制。
+    // The server returns an enormous Retry-After (simulating seconds until the
+    // next quota window); it must be clamped.
     headers.insert(RETRY_AFTER, HeaderValue::from_static("243749"));
     let delay = parse_retry_after(&headers).expect("should parse numeric retry-after");
     assert_eq!(delay, Duration::from_millis(REQUEST_RETRY_429_MAX_MS));
 
-    // 小于上限的值原样返回。
+    // Values below the cap are returned unchanged.
     let mut small = HeaderMap::new();
     small.insert(RETRY_AFTER, HeaderValue::from_static("3"));
     assert_eq!(parse_retry_after(&small), Some(Duration::from_secs(3)));
@@ -133,17 +134,21 @@ fn tpm_budget_reservation_charges_physical_sends_without_extra_multiplier() {
 
 #[test]
 fn tpm_budget_calibrates_overestimated_char_count_with_server_prompt_usage() {
-    // 字符估算常会高估英文代码/schema token；服务端上一轮 usage 可把预算拉回真实区间。
+    // Character estimation often overestimates tokens for English code/schema;
+    // the server's previous-round usage can pull the budget back into the
+    // realistic range.
     assert_eq!(
         token_budget::calibrate_prompt_tokens_for_budget(46_342, Some(25_875), None),
         25_875
     );
-    // 但 known 太低时仍保留字符估算的一半作为地板，避免本轮新增大工具结果后低估。
+    // But when known is too low, keep half the character estimate as a floor,
+    // avoiding underestimation after this round adds large tool results.
     assert_eq!(
         token_budget::calibrate_prompt_tokens_for_budget(46_342, Some(10_000), None),
         23_171
     );
-    // known 太高通常来自压缩前旧值，不应让限速继续按旧高值误等待。
+    // An overly high known usually comes from a stale pre-compression value;
+    // rate limiting must not keep waiting on that old high value.
     assert_eq!(
         token_budget::calibrate_prompt_tokens_for_budget(46_342, Some(120_000), None),
         46_342
@@ -152,12 +157,14 @@ fn tpm_budget_calibrates_overestimated_char_count_with_server_prompt_usage() {
 
 #[test]
 fn tpm_budget_discount_cached_prompt_tokens_from_previous_request() {
-    // 上一轮 77,370 prompt token 里有 77,184 命中 cache，本轮预算应主要计新增尾巴。
+    // Of the previous round's 77,370 prompt tokens, 77,184 hit the cache; this
+    // round's budget should mostly count the newly added tail.
     assert_eq!(
         token_budget::calibrate_prompt_tokens_for_budget(81_370, Some(77_370), Some(77_184)),
         4_186
     );
-    // 若当前估算比上一轮更短，至少保留上一轮未缓存部分，避免估成 0。
+    // If the current estimate is shorter than the previous round, keep at least
+    // the previous round's uncached part instead of estimating 0.
     assert_eq!(
         token_budget::calibrate_prompt_tokens_for_budget(40_000, Some(77_370), Some(77_184)),
         186
@@ -196,7 +203,8 @@ fn auto_subagent_retry_policy_fails_fast_for_fallback() {
         auto_subagent.header_timeout_secs,
         AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS
     );
-    // 自动选型失败会切换模型，不能再同时复制同一子 agent 请求。
+    // Auto-selection failure switches models; the same sub-agent request must
+    // not be duplicated across both.
     assert_eq!(auto_subagent.hedged_max_sends(), 1);
     assert_eq!(regular.hedged_max_sends(), 3);
 }
@@ -302,13 +310,14 @@ fn prompt_cache_breakpoint_wraps_first_system_message() {
     ];
     apply_prompt_cache_breakpoint(&mut messages);
 
-    // 第一条 system 消息被改写为内容块数组并带 cache_control。
+    // The first system message is rewritten into a content-block array with
+    // cache_control.
     let blocks = messages[0].content.as_array().expect("array content");
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0]["type"], "text");
     assert_eq!(blocks[0]["text"], "you are helpful");
     assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
-    // user 消息保持原样。
+    // The user message stays as is.
     assert_eq!(messages[1].content, Value::String("hi".to_string()));
 }
 
@@ -419,9 +428,10 @@ fn test_parse_thinking_gate_output_bool() {
 
 #[test]
 fn thinking_disabled_override_forces_thinking_off() {
-    // 截断兜底置位 thinking_disabled_override 后，即使模型支持 thinking，
-    // resolve_thinking 也必须短路返回 false —— 这是压制 always-thinking 模型
-    // （GLM 走 enable_thinking）思考链的最终手段。
+    // Once truncation fallback sets thinking_disabled_override, resolve_thinking
+    // must short-circuit to false even when the model supports thinking — the
+    // last resort for suppressing the reasoning chains of always-thinking models
+    // (GLM via enable_thinking).
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -519,8 +529,9 @@ fn strip_system_reminders_passthrough_when_absent() {
 
 #[test]
 fn reminder_polluted_greeting_decides_locally() {
-    // 模拟被 system-reminder 撑长的 "hi"：剥离后应命中本地短路（Casual+短），
-    // 而不是落到耗时的模型 gate。
+    // Simulate a "hi" inflated by system-reminders: after stripping, it should
+    // hit the local short-circuit (Casual + short) instead of falling to the
+    // slow model gate.
     let polluted = format!(
         "<system-reminder>{}</system-reminder>\n\nhi",
         "x".repeat(2000)
@@ -673,8 +684,9 @@ async fn response_body_read_observes_request_interrupt_source() {
     }
 }
 
-/// 找一个真实存在的 OpenAi-adapter 模型名做测试输入，避免硬编码
-/// 具体模型字符串导致模型注册表（models/）变更后测试失效。
+/// Finds a real OpenAi-adapter model name as test input, avoiding hardcoded
+/// model strings that would break tests when the model registry (models/)
+/// changes.
 fn first_openai_model_name() -> Option<String> {
     crate::ai::model_names::all()
         .iter()
@@ -696,10 +708,12 @@ fn first_alibaba_vl_model_name() -> Option<String> {
         .map(|m| m.name.clone())
 }
 
-/// 返回该 adapter 下第一个模型的 **唯一 key**（而非 `name`）。生产链路
-/// 用 key 定位模型（日志里模型标识形如 `glm-5.2-opencode`），而 `name`
-/// （如 `glm-5.2`）可能被多个 adapter/platform 的条目共享，按 name 查找会命中歧义
-/// 条目、解析出错误的 adapter 方言。测试必须与生产一致用 key。
+/// Returns the **unique key** of the adapter's first model (not the `name`).
+/// The production path locates models by key (log identifiers look like
+/// `glm-5.2-opencode`), while a `name` (e.g. `glm-5.2`) may be shared by entries
+/// of multiple adapters/platforms; looking up by name would hit an ambiguous
+/// entry and resolve the wrong adapter dialect. Tests must use the key,
+/// consistent with production.
 fn first_model_key_for_adapter(adapter: crate::ai::provider::ApiProvider) -> Option<String> {
     crate::ai::model_names::all()
         .iter()
@@ -707,9 +721,11 @@ fn first_model_key_for_adapter(adapter: crate::ai::provider::ApiProvider) -> Opt
         .map(|m| m.key.clone())
 }
 
-/// 逐字节 wire guard：锁死各 adapter 的 `build_request_body` 序列化结果，
-/// 作为 adapter 重构「不破坏对外 wire 行为」的可执行回归网。
-/// 字段顺序由 [`RequestBody`] 声明顺序决定，serde 输出稳定可断言整串。
+/// Byte-for-byte wire guard: pins each adapter's `build_request_body`
+/// serialization as an executable regression net for "adapter refactors must not
+/// break the external wire behavior". Field order is determined by
+/// [`RequestBody`]'s declaration order, and serde output is stable, so the whole
+/// string can be asserted.
 #[test]
 fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
     use crate::ai::provider::ApiProvider;
@@ -722,9 +738,9 @@ fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
         reasoning_content: None,
     }];
 
-    // Alibaba 声明 top_level wire 的模型：enable_thinking/enable_search +
-    // 顶层 reasoning_effort。用唯一 key 定位模型（生产链路一致），避免共享
-    // name 命中歧义条目。
+    // Alibaba models declaring top_level wire: enable_thinking/enable_search +
+    // top-level reasoning_effort. Locate the model by its unique key (consistent
+    // with the production path) to avoid ambiguous entries sharing a name.
     let alibaba_model = crate::ai::model_names::all()
         .iter()
         .find(|model| {
@@ -747,11 +763,13 @@ fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
         None,
         None,
     );
-    // wire 里的 model 字段是解析后的 request_model_name（provider 实际模型名），
-    // 与用于定位的 key 可能不同。
+    // The wire's model field is the resolved request_model_name (the provider's
+    // actual model name), which may differ from the key used for lookup.
     let alibaba_wire_model = super::super::models::request_model_name(&alibaba_model);
-    // max_tokens 现按剩余上下文窗口钳制；仅当模型声明 max_output_tokens 时下发。
-    // 期望值由同一钳制函数推导，保持 wire 断言随模型配置变化仍成立。
+    // max_tokens is now clamped by the remaining context window; it is sent only
+    // when the model declares max_output_tokens.
+    // The expected value is derived from the same clamping function, keeping the
+    // wire assertion valid as model configuration changes.
     let alibaba_max_tokens_field = expected_max_tokens_field(&alibaba_model, &messages);
     assert_eq!(
         serde_json::to_string(&alibaba).unwrap(),
@@ -760,9 +778,10 @@ fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
         )
     );
 
-    // OpenCode 非 DeepSeek：与 OpenAI 兼容族字段一致
-    // （顶层 reasoning_effort、省略扩展字段）。DeepSeek 专属的 `thinking`
-    // 字段由单独的 `deepseek_request_body_uses_thinking_object` 测试覆盖。
+    // OpenCode non-DeepSeek: fields match the OpenAI-compatible family
+    // (top-level reasoning_effort, extension fields omitted). The
+    // DeepSeek-specific `thinking` field is covered by the separate
+    // `deepseek_request_body_uses_thinking_object` test.
     let non_deepseek_opencode = crate::ai::model_names::all()
         .iter()
         .find(|m| {
@@ -794,8 +813,9 @@ fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
     }
 }
 
-/// 复用生产钳制逻辑，构造 wire 断言里 `max_tokens` 字段的期望片段：
-/// 模型声明 max_output_tokens 时为 `,"max_tokens":N`，否则为空串。
+/// Reuses the production clamping logic to build the expected `max_tokens`
+/// fragment for the wire assertion: `,"max_tokens":N` when the model declares
+/// max_output_tokens, otherwise an empty string.
 fn expected_max_tokens_field(model: &str, messages: &[Message]) -> String {
     match super::super::models::max_output_tokens(model) {
         Some(model_max) => {
@@ -806,17 +826,20 @@ fn expected_max_tokens_field(model: &str, messages: &[Message]) -> String {
     }
 }
 
-/// 回归：历史压缩后 `known_prompt_tokens`（上一轮服务端回填的高值）不能
-/// 盖过本轮实际消息量。否则 clamp 会以为 prompt 仍占满窗口，remaining 触底
-/// 到 MIN_OUTPUT_TOKENS_FLOOR，always-thinking 模型的输出预算被 reasoning
-/// 吃光 → 零可见文本截断重试死循环。
+/// Regression: after history compression, `known_prompt_tokens` (the high value
+/// the server backfilled last round) must not outweigh this round's actual
+/// message volume. Otherwise clamp assumes the prompt still fills the window,
+/// remaining bottoms out at MIN_OUTPUT_TOKENS_FLOOR, the always-thinking model's
+/// output budget is eaten by reasoning → an infinite retry loop of
+/// zero-visible-text truncation.
 #[test]
 fn clamp_ignores_stale_high_known_prompt_after_compression() {
     let model = "glm-5.2-opencode";
     let Some(model_max) = super::super::models::max_output_tokens(model) else {
         return;
     };
-    // 本轮消息很短（压缩后），字符估算 ~个位数 token。
+    // This round's messages are short (post-compression); the character estimate
+    // is ~single-digit tokens.
     let messages = vec![Message {
         role: "user".to_string(),
         content: Value::String("short message after compression".to_string()),
@@ -825,14 +848,15 @@ fn clamp_ignores_stale_high_known_prompt_after_compression() {
         reasoning_content: None,
     }];
 
-    // 陈旧的高 known（压缩前 ~满窗）不应触底。
+    // The stale high known (~full window pre-compression) must not bottom out.
     let stale_high = clamp_max_tokens_for_prompt(model, &messages, None, model_max, Some(259_000));
     assert!(
         stale_high > MIN_OUTPUT_TOKENS_FLOOR,
         "stale-high known_prompt_tokens should not clamp output to the floor, got {stale_high}"
     );
 
-    // 合理的 known（与本轮估算同量级）仍被采纳：结果与不传 known 接近。
+    // A reasonable known (same order of magnitude as this round's estimate) is
+    // still adopted: the result stays close to passing no known at all.
     let fresh = clamp_max_tokens_for_prompt(model, &messages, None, model_max, Some(20));
     let no_known = clamp_max_tokens_for_prompt(model, &messages, None, model_max, None);
     assert_eq!(fresh, no_known);
@@ -848,8 +872,9 @@ fn deepseek_v4_flash_short_prompt_keeps_declared_output_budget() {
         reasoning_content: None,
     }];
 
-    // 若回退到 strong tier 的 200K 窗口，此处会被压到约 198K；1M 窗口下应保留
-    // DeepSeek V4 Flash 声明的完整补全预算。
+    // If this fell back to the strong tier's 200K window, it would be squeezed to
+    // ~198K; with the 1M window, DeepSeek V4 Flash's declared full completion
+    // budget must be kept.
     for model in [
         "deepseek-v4-flash-opencode",
         "deepseek-v4-flash-0731-alibaba",
@@ -926,8 +951,9 @@ fn opencode_deepseek_sends_thinking_object_alongside_reasoning_effort() {
             None,
         );
         let json = serde_json::to_value(&body).unwrap();
-        // DeepSeek 方言始终下发 thinking 对象；顶层 reasoning_effort 按 adapter
-        // 规则照常下发（网关实测两者可共存，无 wire 冲突）。
+        // The DeepSeek dialect always sends the thinking object; the top-level
+        // reasoning_effort is still sent per adapter rules (gateway-verified to
+        // coexist without wire conflict).
         assert_eq!(
             json.pointer("/thinking/type").and_then(|v| v.as_str()),
             Some("enabled"),
@@ -1081,8 +1107,9 @@ fn opencode_deepseek_aux_disabled_thinking_object_ignores_effort() {
         Some("high"),
     );
 
-    // DeepSeek 方言始终下发 thinking:{"type":"disabled"}；顶层 reasoning_effort
-    // 按 adapter 规则照常下发（网关实测 thinking:disabled 优先于 effort 生效）。
+    // The DeepSeek dialect always sends thinking:{"type":"disabled"}; the
+    // top-level reasoning_effort is still sent per adapter rules
+    // (gateway-verified that thinking:disabled takes precedence over effort).
     assert_eq!(
         thinking
             .get("thinking")
@@ -1331,8 +1358,9 @@ fn aux_stream_payload_reads_responses_text_and_usage_events() {
 
 #[test]
 fn responses_request_body_omits_assistant_reasoning_from_message_content() {
-    // Responses message content 只接受 output_text/refusal；reasoning_content 不得
-    // 被回放成 summary_text（会 400），只保留可见回答文本。
+    // Responses message content accepts only output_text/refusal;
+    // reasoning_content must not be replayed as summary_text (would 400) — keep
+    // only the visible answer text.
     let messages = vec![Message {
         role: "assistant".to_string(),
         content: Value::String("final answer".to_string()),
@@ -1372,8 +1400,9 @@ fn responses_request_body_omits_assistant_reasoning_from_message_content() {
 
 #[test]
 fn responses_request_body_emits_bare_function_call_for_tool_turn() {
-    // assistant 只带 tool_calls（无可见文本）时，直接产出扁平 function_call，
-    // 不再补 assistant message item，也不注入 reasoning summary_text。
+    // When the assistant carries only tool_calls (no visible text), emit flat
+    // function_call items directly — no assistant message item, no reasoning
+    // summary_text injected.
     let messages = vec![Message {
         role: "assistant".to_string(),
         content: Value::String(String::new()),
@@ -1423,7 +1452,8 @@ fn responses_request_body_emits_bare_function_call_for_tool_turn() {
 
 #[test]
 fn responses_request_body_drops_empty_text_content_items() {
-    // 空串文本会被 Responses API 拒绝（400 invalid_value），必须过滤掉。
+    // Empty-string text is rejected by the Responses API (400 invalid_value) and
+    // must be filtered out.
     let messages = vec![Message {
         role: "user".to_string(),
         content: Value::String(String::new()),
@@ -1460,8 +1490,9 @@ fn responses_request_body_drops_empty_text_content_items() {
 
 #[test]
 fn responses_request_body_includes_encrypted_reasoning_flag_for_capable_model() {
-    // 声明了 reasoning_encrypted_replay 的模型：请求必须带
-    // include: ["reasoning.encrypted_content"]，否则服务端不下发 encrypted_content。
+    // Models declaring reasoning_encrypted_replay: the request must carry
+    // include: ["reasoning.encrypted_content"], otherwise the server sends no
+    // encrypted_content.
     let messages = vec![Message {
         role: "user".to_string(),
         content: Value::String("hi".to_string()),
@@ -1520,8 +1551,9 @@ fn responses_request_body_omits_include_without_encrypted_replay() {
 
 #[test]
 fn responses_request_body_replays_reasoning_items_before_function_call() {
-    // 侧信道命中：以首个 tool_call id 为 key 的 reasoning items 必须原样 splice
-    // 到对应 function_call 之前，供模型保留上一跳推理上下文。
+    // Side-channel hit: reasoning items keyed by the first tool_call id must be
+    // spliced verbatim before the corresponding function_call, so the model keeps
+    // the previous hop's reasoning context.
     let messages = vec![Message {
         role: "assistant".to_string(),
         content: Value::String(String::new()),
@@ -1580,7 +1612,8 @@ fn responses_request_body_replays_reasoning_items_before_function_call() {
 
 #[test]
 fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items() {
-    // 侧信道未命中（拿不到 encrypted_content）：退化为扁平 function_call，零 regression。
+    // Side-channel miss (no encrypted_content available): degrade to flat
+    // function_call, zero regression.
     let messages = vec![Message {
         role: "assistant".to_string(),
         content: Value::String(String::new()),
@@ -1635,7 +1668,7 @@ fn deepseek_request_body_uses_thinking_object() {
         reasoning_content: None,
     }];
 
-    // 关闭：thinking={"type":"disabled"}
+    // Off: thinking={"type":"disabled"}
     let disabled = build_request_body(
         "deepseek-v4-flash-free",
         &messages,
@@ -1654,10 +1687,11 @@ fn deepseek_request_body_uses_thinking_object() {
         disabled.get("thinking"),
         Some(&json!({ "type": "disabled" }))
     );
-    // DeepSeek 不应再发送 enable_thinking（避免与 thinking 对象冲突/无效）。
+    // DeepSeek must no longer send enable_thinking (it conflicts with / is
+    // ignored next to the thinking object).
     assert!(disabled.get("enable_thinking").is_none());
 
-    // 开启：thinking={"type":"enabled"}
+    // On: thinking={"type":"enabled"}
     let enabled = build_request_body(
         "deepseek-v4-flash-free",
         &messages,
@@ -1745,9 +1779,10 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
         reasoning_content: None,
     }];
 
-    // 回归：OpenCode DeepSeek 始终下发 `thinking` 对象（disabled 时优先于顶层
-    // reasoning_effort 生效）；历史 tool-call assistant 仍必须补齐空
-    // reasoning_content，否则压缩后续写会稳定 400。
+    // Regression: OpenCode DeepSeek always sends the `thinking` object (when
+    // disabled it takes precedence over the top-level reasoning_effort); a
+    // historical tool-call assistant must still get an empty reasoning_content
+    // filled in, otherwise post-compression continuation requests fail with 400.
     normalize_reasoning_content_replay_for_model("deepseek-v4-flash-free-opencode", &mut messages);
     assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
 
@@ -1846,9 +1881,10 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
     assert_eq!(gpt_messages[0].reasoning_content, None);
 }
 
-/// 核心回归：DashScope compatible-mode 端点的 Alibaba-provider 模型必须按
-/// thinking gate 决策发送 `enable_thinking`，否则「关闭」会被静默丢弃、模型仍
-/// reasoning。模型注册表会变动，因此从其中选择一个实际的 Alibaba 模型。
+/// Core regression: Alibaba-provider models on the DashScope compatible-mode
+/// endpoint must send `enable_thinking` per the thinking gate decision,
+/// otherwise "off" is silently dropped and the model keeps reasoning. The model
+/// registry changes over time, so pick an actual Alibaba model from it.
 #[test]
 fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
     let messages = vec![Message {
@@ -1862,7 +1898,7 @@ fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
     let model = first_model_key_for_adapter(crate::ai::provider::ApiProvider::Alibaba)
         .expect("model registry must contain at least one Alibaba-adapter model");
 
-    // gate 关闭 → enable_thinking:false
+    // gate off → enable_thinking:false
     let disabled = build_request_body(
         &model, &messages, false, false, None, None, None, None, None, None, None,
     );
@@ -1872,10 +1908,10 @@ fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
         Some(false),
         "{model} should emit enable_thinking:false when gate disables thinking"
     );
-    // 走 enable_thinking 而非 deepseek 的 thinking 对象
+    // Uses enable_thinking rather than the deepseek thinking object
     assert!(disabled.get("thinking").is_none(), "{model}");
 
-    // gate 开启 → enable_thinking:true
+    // gate on → enable_thinking:true
     let enabled = build_request_body(
         &model, &messages, false, true, None, None, None, None, None, None, None,
     );
@@ -1887,13 +1923,15 @@ fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
     );
 }
 
-/// 辅助（非主链路）请求对 DashScope 端点模型必须显式关闭 thinking，
-/// 否则默认开启的长推理链会撑爆辅助任务超时。
+/// Auxiliary (non-mainline) requests must explicitly disable thinking for
+/// DashScope endpoint models, otherwise the default-on long reasoning chains
+/// blow the aux task timeout.
 #[test]
 fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
-    // 仅 DashScope（alibaba adapter）模型走 enable_thinking 字段；
-    // deepseek-v4-pro 已迁往 OpenCode 网关（走 thinking 对象，见下方断言），
-    // kimi-k2.7-code 已不在模型注册表（models/）中。
+    // Only DashScope (alibaba adapter) models use the enable_thinking field;
+    // deepseek-v4-pro has moved to the OpenCode gateway (uses the thinking
+    // object, see the assertion below), and kimi-k2.7-code is no longer in the
+    // model registry (models/).
     for model in ["qwen3.7-plus", "qwen3.7-max", "deepseek-v4-flash-0731"] {
         let mut body = json!({ "model": model, "messages": [], "stream": false });
         apply_aux_thinking_fields(model, &mut body);
@@ -1904,7 +1942,8 @@ fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
         );
     }
 
-    // OpenCode 的 deepseek 不靠 enable_thinking，aux 关闭走 thinking 对象。
+    // OpenCode's deepseek does not rely on enable_thinking; aux turns thinking
+    // off via the thinking object.
     let mut deepseek =
         json!({ "model": "deepseek-v4-flash-free", "messages": [], "stream": false });
     apply_aux_thinking_fields("deepseek-v4-flash-free", &mut deepseek);
@@ -1914,7 +1953,8 @@ fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
     );
     assert!(deepseek.get("enable_thinking").is_none());
 
-    // OpenCode 非 deepseek 无可靠关闭开关，aux 不注入任何思考字段。
+    // OpenCode non-deepseek has no reliable off switch; aux injects no thinking
+    // fields at all.
     let mut mimo = json!({ "model": "mimo-v2.5-free", "messages": [], "stream": false });
     apply_aux_thinking_fields("mimo-v2.5-free", &mut mimo);
     assert!(mimo.get("thinking").is_none());
@@ -1952,7 +1992,8 @@ fn openai_request_body_omits_nonstandard_flags() {
     );
     let value = serde_json::to_value(&body).unwrap();
 
-    // OpenAI-provider 不发送 DashScope 扩展字段，推理强度走顶层 reasoning_effort。
+    // OpenAI-provider sends no DashScope extension fields; reasoning strength
+    // goes through the top-level reasoning_effort.
     assert!(value.get("enable_thinking").is_none());
     assert!(value.get("enable_search").is_none());
     assert_eq!(
@@ -2526,15 +2567,17 @@ fn normalize_messages_preserves_tool_result_when_tool_call_args_are_malformed() 
 
     let normalized = normalize_messages_for_request(&messages);
 
-    // 坏 JSON args 不再导致 tool_call 被丢弃降级：assistant 的 tool_call 与真实
-    // tool 结果都必须保留，args 被修复成合法 JSON 对象（保住原始文本）以过
-    // provider 校验。这样模型仍能看到真实执行结果，不会误判需要重跑同一工具。
+    // Bad JSON args no longer cause the tool_call to be dropped/degraded: the
+    // assistant's tool_call and the real tool result must both be kept, with
+    // args repaired into a valid JSON object (preserving the original text) to
+    // pass provider validation. This way the model still sees the real execution
+    // result and does not mistakenly re-run the same tool.
     assert_eq!(normalized.len(), 5);
     assert_eq!(normalized[2].role, "assistant");
     let calls = normalized[2].tool_calls.as_ref().expect("tool_calls kept");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].id, "call_1");
-    // args 必须是合法 JSON，且原始坏文本被完整保留。
+    // args must be valid JSON, and the original bad text is fully preserved.
     let parsed: Value = serde_json::from_str(&calls[0].function.arguments)
         .expect("repaired args must be valid JSON");
     assert_eq!(
@@ -2753,10 +2796,12 @@ fn normalize_messages_dedupes_context_checkpoints_by_path_before_limit() {
 
 #[test]
 fn openai_image_content_uses_object_image_url_shape() {
-    // 仅当模型注册表（models/）中存在一个 OpenAi-provider 且 is_vl=true 的模型时
-    // 才能验证"以 {image_url:{url:...}} 对象形状下发图像"的协议契约。
-    // 真实环境下没有这种模型时（例如模型注册表只有 Compatible VL），
-    // 这条契约无从验证，跳过即可。
+    // The contract "images are sent in the {image_url:{url:...}} object shape"
+    // can only be verified when the model registry (models/) contains an
+    // OpenAi-provider model with is_vl=true.
+    // When no such model exists in the real environment (e.g. the registry only
+    // has a Compatible VL), this contract cannot be verified and the test is
+    // simply skipped.
     let Some(model) = first_openai_vl_model_name() else {
         eprintln!(
             "[test] skipping openai_image_content_uses_object_image_url_shape: \

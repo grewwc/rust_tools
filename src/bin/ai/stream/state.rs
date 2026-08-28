@@ -19,8 +19,8 @@ use super::{
     think_demux::ContentThinkDemuxer,
 };
 
-/// 流文本协议标记（嵌入 history / assistant_text，终端展示时会再映射为
-/// header/footer 标签，见 `ThinkingFoldState` 与 markdown 渲染器）。
+/// Stream text protocol markers (embedded into history / assistant_text, and re-mapped to
+/// header/footer labels at terminal display time; see `ThinkingFoldState` and the markdown renderer).
 pub(super) const THINKING_TAG_TEXT: &str = "╭─ thinking";
 pub(super) const END_THINKING_TAG_TEXT: &str = "╰─ done thinking";
 
@@ -65,8 +65,8 @@ pub(super) struct StreamProcessingState {
     pub(super) framing: StreamFramingState,
     pub(super) render: StreamRenderState,
     pub(super) content: StreamContentState,
-    /// 可插拔流过滤器链（Step 6：在 `process_stream_payload` 的可见内容提交点
-    /// 应用；空链 = 直通，零行为变化）。
+    /// Pluggable stream filter chain (Step 6: applied at the visible-content commit point of
+    /// `process_stream_payload`; empty chain = pass-through, zero behavior change).
     pub(super) filters: FilterChain,
     /// Last-seen `(echoed_model, usage)` from any chunk during this stream.
     /// Handed to the kernel's `/dev/llm` when the stream finalizes.
@@ -120,8 +120,8 @@ pub(super) struct StreamRenderState {
     pub(super) terminal_splitter: StreamSplitter,
     pub(super) thinking_fold: ThinkingFoldState,
     pub(super) subagent_fold: ThinkingFoldState,
-    /// 终端展示专用：剥离 `<<<IMAGE_DIGEST>>> ... <<<END_IMAGE_DIGEST>>>` 区间
-    /// （模型可见文本 / 历史不受影响），并处理哨兵被跨 chunk 拆散的情况。
+    /// Terminal display only: strips `<<<IMAGE_DIGEST>>> ... <<<END_IMAGE_DIGEST>>>` ranges
+    /// (model-visible text / history are unaffected), and handles sentinels split across chunks.
     pub(super) digest_filter: DigestTerminalFilter,
 }
 
@@ -143,14 +143,14 @@ impl StreamRenderState {
     }
 }
 
-/// 终端展示用的图片摘要区域过滤器：把 digest 区间从**终端输出**里剥离，
-/// 跨 chunk 正确处理哨兵被拆散的情况；模型可见文本不走这里。
+/// Image-digest range filter for terminal display: strips digest ranges from **terminal output**,
+/// correctly handling sentinels split across chunks; model-visible text does not go through here.
 pub(super) struct DigestTerminalFilter {
-    /// 是否已越过 BEGIN 哨兵（正在 digest 区间内）。
+    /// Whether the BEGIN sentinel has been passed (currently inside the digest range).
     in_digest: bool,
-    /// 尾部暂存：等待确认是否构成哨兵前缀（最多保留最长哨兵长度 - 1）。
+    /// Pending tail: held while confirming whether it forms a sentinel prefix (at most longest sentinel length - 1).
     pending: String,
-    /// 已确认进入 digest 区间后暂存的文本（仅在流结束时仍未闭合才回退输出）。
+    /// Text staged after the digest range is confirmed entered (only flushed back out if the stream ends while still unclosed).
     suppressed: String,
 }
 
@@ -163,7 +163,7 @@ impl DigestTerminalFilter {
         }
     }
 
-    /// 输入一段流式内容，返回其中**可以写终端**的部分。
+    /// Feeds in a chunk of streamed content and returns the part that **can be written to the terminal**.
     pub(super) fn push(&mut self, content: &str) -> String {
         let mut out = String::with_capacity(content.len());
         self.pending.push_str(content);
@@ -171,19 +171,19 @@ impl DigestTerminalFilter {
             let target = if self.in_digest { DIGEST_END } else { DIGEST_BEGIN };
             let Some(idx) = self.pending.find(target) else { break };
             if self.in_digest {
-                // 丢弃 digest 区间内容（含 END 哨兵），回到普通状态
+                // Drop the digest range content (including the END sentinel) and return to normal state
                 self.in_digest = false;
                 self.suppressed.clear();
                 self.pending.drain(..idx + target.len());
             } else {
-                // 输出 BEGIN 之前的文本，进入 digest 区间
+                // Emit the text before BEGIN and enter the digest range
                 out.push_str(&self.pending[..idx]);
                 self.in_digest = true;
                 self.pending.drain(..idx + target.len());
             }
         }
         if self.in_digest {
-            // digest 区间内只保留确实可能组成 END 的后缀，其余移入 suppressed。
+            // Inside the digest range, keep only the suffix that could genuinely form END; move the rest into suppressed.
             let hold_len = marker_prefix_suffix_len(&self.pending, DIGEST_END);
             let commit_len = self.pending.len() - hold_len;
             if commit_len > 0 {
@@ -191,8 +191,8 @@ impl DigestTerminalFilter {
                 self.suppressed.push_str(&committed);
             }
         } else {
-            // 普通状态只保留确实可能组成 BEGIN 的后缀。普通正文必须立即放行，
-            // 不能固定扣留尾巴后在 flush 时绕过去重/样式管线。
+            // Normal state keeps only the suffix that could genuinely form BEGIN. Ordinary body text must pass through immediately,
+            // not be held back as a fixed tail only to bypass the dedup/style pipeline at flush time.
             let hold_len = marker_prefix_suffix_len(&self.pending, DIGEST_BEGIN);
             let emit_len = self.pending.len() - hold_len;
             out.push_str(&self.pending[..emit_len]);
@@ -201,8 +201,8 @@ impl DigestTerminalFilter {
         out
     }
 
-    /// 流结束时冲刷：若 digest 区间从未闭合，把暂存内容回退输出
-    /// （宁可展示完整叙述，也不静默丢内容）；哨兵前缀尾巴也一并输出。
+    /// Flush at stream end: if the digest range was never closed, flush the staged content back out
+    /// (prefer showing the full narration over silently dropping content); the sentinel-prefix tail is emitted too.
     pub(super) fn flush(&mut self) -> String {
         let mut out = String::new();
         if self.in_digest {
@@ -214,7 +214,7 @@ impl DigestTerminalFilter {
     }
 }
 
-/// 返回 `text` 末尾与 `marker` 前缀重合的最长字节数。
+/// Returns the longest number of bytes at the end of `text` that overlap the prefix of `marker`.
 fn marker_prefix_suffix_len(text: &str, marker: &str) -> usize {
     let max_len = text.len().min(marker.len().saturating_sub(1));
     for len in (1..=max_len).rev() {
@@ -226,44 +226,44 @@ fn marker_prefix_suffix_len(text: &str, marker: &str) -> usize {
     0
 }
 
-/// Thinking 折叠状态：维护一个滚动窗口，只在终端展示最近 N 条正文物理行，
-/// 旧内容被折叠起来，同时保持流式实时输出。
+/// Thinking fold state: maintains a rolling window so only the most recent N body physical lines are shown in the terminal,
+/// older content is folded away, while streaming output stays real-time.
 pub(super) struct ThinkingFoldState {
-    /// 最大可见正文物理行数（不含单行折叠提示）
+    /// Maximum visible body physical lines (excluding the one-line fold hint)
     pub(super) max_visible_lines: usize,
-    /// 已完成的 thinking 逻辑行（ring buffer，只保留最近 max_visible_lines 个候选行）
+    /// Completed thinking logical lines (ring buffer holding only the most recent max_visible_lines candidate lines)
     pub(super) recent_lines: VecDeque<String>,
-    /// 当前正在流式输出的不完整行
+    /// The incomplete line currently being streamed
     pub(super) current_line: String,
-    /// 总完成行数（含已被折叠的）
+    /// Total completed line count (including folded lines)
     pub(super) total_lines: usize,
-    /// 当前折叠窗口（仅正文，不含 header）占用的 terminal 物理行数。光标停在正文
-    /// 最后一行，而不是窗口下方的空白行；重画时只需向上移动 `window_rows - 1`。
+    /// Number of terminal physical rows occupied by the current fold window (body only, excluding the header). The cursor sits on the last
+    /// body line, not on the blank line below the window; redrawing only needs to move up `window_rows - 1`.
     pub(super) window_rows: usize,
-    /// 上次真正写到 terminal 的正文纯文本物理行（含缩进/包裹，不含 ANSI / header），用于在
-    /// terminal resize 后按**当前**列宽重算旧窗口会占多少物理行，避免 cursor-up 擦不干净。
+    /// Body plain-text physical lines actually written to the terminal last time (including indentation/wrapping, excluding ANSI / header), used to
+    /// recompute how many physical rows the old window occupies at the **current** column width after a terminal resize, so cursor-up leaves no residue.
     pub(super) rendered_body_lines: Vec<String>,
-    /// 重画正文时额外保留的右侧列数。xterm.js 在最后一列使用 delayed-wrap，若正文恰好
-    /// 写满整行，下一次换行可能多占一个未计入 cursor-up 的物理行并把旧帧推入 scrollback。
+    /// Extra right-side columns reserved when redrawing the body. xterm.js uses delayed-wrap on the last column; if the body
+    /// exactly fills a line, the next line break may occupy an extra physical row not counted by cursor-up and push the old frame into scrollback.
     pub(super) rewrite_right_margin_cols: usize,
-    /// 是否处于活跃的 thinking 折叠模式
+    /// Whether active thinking fold mode is in effect
     pub(super) active: bool,
-    /// header（`○ thinking`）是否已落地。流式重画绝不随正文一起擦除/重画；收尾时才会
-    /// 在原位将它改为 `✓ thinking`。这样即便正文擦除失步也无法再生出第二个 header，
-    /// 从根上杜绝「孤儿 header 叠加」的渲染 bug。
+    /// Whether the header (`○ thinking`) has been laid down. Streaming redraws never erase/repaint it along with the body; only at teardown is it
+    /// changed in place to `✓ thinking`. This way, even if body erasure drifts out of sync, a second header can never appear,
+    /// eliminating the "orphan header stacking" rendering bug at its root.
     pub(super) header_drawn: bool,
-    /// 折叠块 header 文案（如 `○ thinking` / `subagent explore`）。
+    /// Fold-block header text (e.g. `○ thinking` / `subagent explore`).
     pub(super) header_label: String,
-    /// 折叠块 footer 文案（如 `✓ thinking` / `done subagent explore`）。
+    /// Fold-block footer text (e.g. `✓ thinking` / `done subagent explore`).
     pub(super) footer_label: String,
-    /// 是否在折叠窗口里跳过空白行。thinking 适合紧凑展示；subagent 正文保持原样。
+    /// Whether to skip blank lines inside the fold window. Thinking suits compact display; subagent body text stays as-is.
     pub(super) skip_blank_lines: bool,
 }
 
 impl ThinkingFoldState {
     pub(super) fn new() -> Self {
-        // thinking 过程用 `○ thinking` 标识进行中，结束后用 `✓ thinking` 收口
-        // （对勾代替 "done"），避免「thinking / done thinking」成对文字的冗余。
+        // The thinking phase is marked in progress with `○ thinking` and closed out with `✓ thinking`
+        // (a checkmark instead of "done"), avoiding the redundant "thinking / done thinking" pair of words.
         Self::new_with_labels("○ thinking", "✓ thinking", true)
     }
 
@@ -317,20 +317,20 @@ pub(super) struct StreamContentState {
     pub(super) thinking_open: bool,
     pub(super) empty_choice_chunks: usize,
     pub(super) finish_reason_seen: bool,
-    /// 未收到 finish_reason 前，响应流连续无有效进展并触发 idle timeout。
-    /// 这属于传输中断，不能把未确认完整的工具调用交给执行层。
+    /// Before finish_reason was received, the response stream made no valid progress for a sustained period and hit the idle timeout.
+    /// This is a transport interruption; unconfirmed-incomplete tool calls must not be handed to the execution layer.
     pub(super) stream_idle_timed_out: bool,
-    /// 最近一个非空 `finish_reason` 的具体值（如 `stop` / `length` / `tool_calls`）。
-    /// `length` 表示服务端因输出上限截断，是比"工具 JSON 解析失败"更早、更准的
-    /// 截断信号，用于把本轮 outcome 升级为可重试的 `Truncated`。
+    /// The exact value of the most recent non-empty `finish_reason` (e.g. `stop` / `length` / `tool_calls`).
+    /// `length` means the server truncated due to the output limit — an earlier, more accurate truncation
+    /// signal than "tool JSON parse failure", used to upgrade this turn's outcome to retryable `Truncated`.
     pub(super) finish_reason_value: Option<String>,
-    /// 本轮是否发生过「因 arguments JSON 不完整而丢弃工具调用」。大文件 `write_file`
-    /// 撞上输出上限被截断时最典型：JSON 半截 → 被丢弃 → 本轮无有效工具调用。
-    /// 若仅凭"无工具调用 + 有文本"会被误判为正常完成而静默结束。
+    /// Whether this turn had tool calls dropped due to incomplete arguments JSON. Typical case: a large `write_file`
+    /// hits the output limit and gets truncated: half a JSON → dropped → the turn has no valid tool calls.
+    /// Judging only by "no tool calls + some text" would misread it as normal completion and end silently.
     pub(super) dropped_malformed_tool_call: bool,
-    /// 工具调用参数累积超过 `MAX_TOOL_ARG_BYTES` 上限被强制停流。与
-    /// `stream_idle_timed_out` 同理：流是被运行时掐断的，模型可能仍在生成，
-    /// 不能把截止瞬间恰好合法的 JSON 当成完整工具调用交给执行层。
+    /// Accumulated tool-call arguments exceeded the `MAX_TOOL_ARG_BYTES` cap and the stream was force-stopped. Same reasoning as
+    /// `stream_idle_timed_out`: the stream was cut off by the runtime and the model may still be generating,
+    /// so JSON that merely happens to be valid at the cut-off moment must not be handed to the execution layer as a complete tool call.
     pub(super) tool_args_cap_exceeded: bool,
     pub(super) saw_reasoning_output: bool,
     pub(super) tool_calls_map: SkipMap<usize, ToolCallBuilder>,
@@ -361,11 +361,11 @@ pub(super) struct StreamContentState {
     pub(super) hermes_tool_call_streamer: HermesXmlToolCallStreamer,
     pub(super) anthropic_tool_call_streamer: AnthropicXmlToolCallStreamer,
     pub(super) bare_xml_tool_call_streamer: BareXmlToolCallStreamer,
-    /// 有状态命名空间 marker 归一化器：跨 chunk 复原被截断的 `<｜｜DSML｜｜…>`。
+    /// Stateful namespace marker normalizer: reassembles a truncated `<｜｜DSML｜｜…>` across chunks.
     pub(super) inline_markup_normalizer: InlineMarkupNormalizer,
-    /// 把内联在 content 通道里的推理链（预填 `<think>` 模板）用悬空 `</think>`
-    /// 拆回 reasoning。默认直通（未 arm 的模型零影响）；仅对声明
-    /// `reasoning_in_content` 的模型在 `stream_response` 里 arm。
+    /// Splits reasoning chains inlined in the content channel (pre-filled `<think>` template) back out into reasoning using a dangling `</think>`.
+    /// Pass-through by default (zero impact on models that are not armed); armed only in `stream_response` for models declaring
+    /// `reasoning_in_content`.
     pub(super) content_think_demuxer: ContentThinkDemuxer,
 }
 
@@ -425,8 +425,8 @@ impl ToolCallBuilder {
     pub(super) fn build(self) -> ToolCall {
         ToolCall {
             id: self.id,
-            // 部分 provider 在 stream delta 中不返回 type 字段，默认为 "function"
-            // 以符合 OpenAI 协议要求，避免发送 "type":"" 导致 400 错误。
+            // Some providers do not return the type field in stream deltas; default to "function"
+            // to satisfy the OpenAI protocol and avoid a 400 error from sending "type":"".
             tool_type: if self.tool_type.is_empty() {
                 "function".to_string()
             } else {
@@ -456,17 +456,17 @@ mod tests {
     fn digest_filter_strips_region_across_chunk_boundaries() {
         let mut f = DigestTerminalFilter::new();
         let mut out = String::new();
-        // 普通叙述立即透出。
+        // Ordinary narration passes through immediately.
         out.push_str(&f.push("我先看一下界面。"));
-        // BEGIN 哨兵被拆散到两个 chunk
+        // BEGIN sentinel split across two chunks
         out.push_str(&f.push(&DIGEST_BEGIN[..10]));
         out.push_str(&f.push(&DIGEST_BEGIN[10..]));
-        // digest 区间内容被吞掉
+        // digest range content is swallowed
         out.push_str(&f.push("界面上有一个搜索框，右下角是按钮"));
-        // END 哨兵被拆散
+        // END sentinel split apart
         out.push_str(&f.push(&DIGEST_END[..8]));
         out.push_str(&f.push(&DIGEST_END[8..]));
-        // 后续叙述恢复透出
+        // subsequent narration passes through again
         out.push_str(&f.push("接下来我操作一下。"));
         out.push_str(&f.flush());
         assert_eq!(out, "我先看一下界面。接下来我操作一下。");
@@ -480,7 +480,7 @@ mod tests {
         out.push_str(&f.push(DIGEST_BEGIN));
         let body = "被截断的摘要正文很长，必须保持原始顺序，不能把尾部移到开头。";
         out.push_str(&f.push(body));
-        // 流结束仍未闭合：回退输出暂存内容，避免静默丢叙述
+        // Stream ended while still unclosed: flush the staged content back out to avoid silently losing narration
         out.push_str(&f.flush());
         assert_eq!(out, format!("叙述开始{body}"));
         assert_eq!(f.flush(), "");
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn digest_filter_keeps_partial_sentinel_tail_until_flush() {
         let mut f = DigestTerminalFilter::new();
-        // 流在普通文本中结束：尾部可能是哨兵前缀的部分在 flush 时透出
+        // Stream ends inside ordinary text: a tail that may be part of a sentinel prefix is emitted at flush
         assert_eq!(f.push("结尾写着 <<<IMAGE_"), "结尾写着 ");
         assert_eq!(f.flush(), "<<<IMAGE_");
     }

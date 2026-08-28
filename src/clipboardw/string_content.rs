@@ -1,7 +1,7 @@
-//! 文本剪贴板内容处理
+//! Text clipboard content handling.
 //!
-//! 提供文本剪贴板的读取、写入和文件操作功能。
-//! 支持本地剪贴板和 SSH 会话中的 OSC52 协议。
+//! Provides reading, writing, and file operations for the text clipboard.
+//! Supports the local clipboard and the OSC52 protocol over SSH sessions.
 
 use std::{
     fmt::Display,
@@ -12,7 +12,7 @@ use std::{
 
 use crate::commonw::filename::add_suffix;
 
-/// 非文本文件错误
+/// Error for non-text files.
 #[derive(Debug)]
 struct NonTextErr(String);
 
@@ -30,41 +30,42 @@ impl Display for NonTextErr {
 
 impl std::error::Error for NonTextErr {}
 
-/// 检查当前是否为 SSH 会话
+/// Check whether the current session is an SSH session.
 ///
-/// 通过检查以下环境变量判断：
+/// Detected by checking the following environment variables:
 /// - `SSH_CONNECTION`
 /// - `SSH_CLIENT`
 /// - `SSH_TTY`
 ///
-/// # 返回值
+/// # Returns
 ///
-/// 如果在 SSH 会话中返回 `true`，否则返回 `false`
+/// Returns `true` when inside an SSH session, otherwise `false`.
 fn is_ssh_session() -> bool {
     std::env::var("SSH_CONNECTION").is_ok()
         || std::env::var("SSH_CLIENT").is_ok()
         || std::env::var("SSH_TTY").is_ok()
 }
 
-/// 通过 OSC52 转义序列设置剪贴板内容
+/// Set clipboard content via the OSC52 escape sequence.
 ///
-/// OSC52 是一种终端转义序列，允许应用程序设置终端的剪贴板内容。
-/// 在 SSH 会话中特别有用，因为可以在远程服务器上操作本地剪贴板。
+/// OSC52 is a terminal escape sequence that lets an application set the
+/// terminal's clipboard content. It is especially useful in SSH sessions,
+/// where the local clipboard can be manipulated from the remote server.
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `content` - 要复制到剪贴板的文本内容
+/// * `content` - The text content to copy to the clipboard
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Ok(())` - 成功设置剪贴板
-/// - `Err(...)` - 设置失败
+/// - `Ok(())` - Clipboard set successfully
+/// - `Err(...)` - Failed to set the clipboard
 ///
-/// # 工作原理
+/// # How it works
 ///
-/// 1. 将内容 Base64 编码
-/// 2. 发送 OSC52 转义序列：`\x1b]52;c;<base64>\x07`
-/// 3. 终端解码并设置剪贴板
+/// 1. Base64-encode the content
+/// 2. Send the OSC52 escape sequence: `\x1b]52;c;<base64>\x07`
+/// 3. The terminal decodes it and sets the clipboard
 fn set_clipboard_via_osc52(content: &str) -> Result<(), Box<dyn std::error::Error>> {
     use base64::Engine as _;
     use base64::engine::general_purpose;
@@ -79,47 +80,48 @@ fn set_clipboard_via_osc52(content: &str) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// 检查标准输入是否为 TTY
+/// Check whether standard input is a TTY.
 fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
-/// 检查标准输出是否为 TTY
+/// Check whether standard output is a TTY.
 fn stdout_is_tty() -> bool {
     unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
 }
 
-/// 通过 OSC52 终端查询读取原始字节
+/// Read raw bytes via an OSC52 terminal query.
 ///
-/// 发送 OSC52 查询序列并等待终端响应，返回剪贴板的原始字节数据。
-/// 不要求内容是有效的 UTF-8。
+/// Sends the OSC52 query sequence, waits for the terminal response, and
+/// returns the raw clipboard bytes. The content is not required to be
+/// valid UTF-8.
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Some(Vec<u8>)` - 成功读取剪贴板字节
-/// - `None` - 读取失败（非 TTY、超时等）
+/// - `Some(Vec<u8>)` - Clipboard bytes read successfully
+/// - `None` - Read failed (not a TTY, timeout, etc.)
 ///
-/// # 注意事项
+/// # Notes
 ///
-/// - 需要终端支持 OSC52 查询
-/// - 会临时修改终端设置为非规范模式
-/// - 读取超时自适应：首字节 3s、空闲 1s、绝对上限 120s
+/// - The terminal must support OSC52 queries
+/// - Temporarily switches the terminal to non-canonical mode
+/// - Adaptive read timeouts: first byte 3s, idle 1s, absolute cap 120s
 fn read_osc52_bytes() -> Option<Vec<u8>> {
     if !stdin_is_tty() || !stdout_is_tty() {
         return None;
     }
 
-    // 使用原始文件描述符直接读写，绕过 Rust stdio 缓冲层，
-    // 避免与 crossterm 的 stdin/stdout 管理冲突。
+    // Use raw file descriptors for I/O, bypassing the Rust stdio buffering
+    // layer to avoid conflicts with crossterm's stdin/stdout management.
 
-    // 保存原始终端设置
+    // Save the original terminal settings.
     let fd = libc::STDIN_FILENO;
     let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut original_termios) } != 0 {
         return None;
     }
 
-    // 设置为非规范模式（立即返回）
+    // Switch to non-canonical mode (return immediately).
     let mut new_termios = original_termios;
     new_termios.c_lflag &= !(libc::ICANON | libc::ECHO);
     new_termios.c_cc[libc::VMIN] = 0;
@@ -129,7 +131,7 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
         return None;
     }
 
-    // 使用 libc::write 发送 OSC52 查询（绕过 stdout 缓冲）
+    // Send the OSC52 query via libc::write (bypasses the stdout buffer).
     let query = b"\x1b]52;c;?\x07";
     let write_result = unsafe {
         libc::write(
@@ -143,15 +145,19 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
         return None;
     }
 
-    // 使用 libc::read 读取响应（绕过 stdin 缓冲）
+    // Read the response via libc::read (bypasses the stdin buffer).
     //
-    // `oo -B` 桥接的图片 base64 会让 OSC52 响应达到数 MB（响应内容 = base64(base64(图片))），
-    // 固定 1.5s 短超时会在传输中途放弃并恢复 ECHO，导致响应尾部被远端 pty 回显到终端
-    // （表现为终端刷出一大段 base64）。因此改为：
-    //   - 首字节超时：终端不支持 OSC52 查询时不会响应，避免无限等待
-    //   - 收到结束标记 `\x07` / `\x1b\\` 立即结束
-    //   - 空闲超时：已收到数据但长时间无新数据，视为传输结束
-    //   - 绝对上限兜底
+    // Image base64 bridged by `oo -B` can push the OSC52 response into the
+    // multi-MB range (response content = base64(base64(image))), and a fixed
+    // 1.5s short timeout would give up mid-transfer and restore ECHO, so the
+    // response tail gets echoed back by the remote pty onto the terminal
+    // (the terminal visibly floods with base64). Therefore:
+    //   - First-byte timeout: terminals that do not support OSC52 queries
+    //     never respond, avoiding an infinite wait
+    //   - Stop immediately once the end marker `\x07` / `\x1b\\` arrives
+    //   - Idle timeout: data was received but nothing new for a long time,
+    //     treat the transfer as finished
+    //   - Absolute cap as a final backstop
     let result = (|| {
         let mut response = Vec::new();
         let mut buf = [0u8; 65536];
@@ -168,16 +174,18 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
             if elapsed >= absolute_timeout {
                 break;
             }
-            // 一直没收到任何数据（终端不支持 OSC52 查询）
+            // No data at all (terminal does not support OSC52 queries).
             if response.is_empty() && elapsed >= first_byte_timeout {
                 break;
             }
-            // 已收到数据，但长时间没有新数据 → 认为传输结束
+            // Data was received but nothing new for a long time → treat the
+            // transfer as finished.
             if !response.is_empty() && last_data.elapsed() >= idle_timeout {
                 break;
             }
 
-            // poll 超时不超过剩余的首字节/空闲预算，避免忙等
+            // Keep the poll timeout within the remaining first-byte/idle
+            // budget to avoid busy-waiting.
             let mut poll_timeout = 200i32;
             if response.is_empty() {
                 let remain = first_byte_timeout.saturating_sub(elapsed);
@@ -207,14 +215,14 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
                 let n = n as usize;
                 response.extend_from_slice(&buf[..n]);
                 last_data = std::time::Instant::now();
-                // 收到响应结束标记后立即停止
+                // Stop as soon as the response end marker arrives.
                 if response.contains(&b'\x07') || response.windows(2).any(|w| w == b"\x1b\\") {
                     break;
                 }
             }
         }
 
-        // 解析响应，提取 Base64 数据
+        // Parse the response and extract the Base64 data.
         let response_str = String::from_utf8_lossy(&response);
         if let Some(start_idx) = response_str.find("]52;c;") {
             let data_start = start_idx + 6;
@@ -232,28 +240,29 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
         None
     })();
 
-    // 恢复终端设置前先清空尚未读取的输入（超时放弃时可能残留响应尾部），
-    // 避免 ECHO 恢复后残留内容被回显到终端。
+    // Flush any unread input before restoring the terminal settings (when
+    // giving up on a timeout, a response tail may still be buffered) so that
+    // leftover content is not echoed to the terminal once ECHO is restored.
     unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
-    // 恢复原始终端设置
+    // Restore the original terminal settings.
     unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original_termios) };
 
     result
 }
 
-/// 通过 OSC52 读取剪贴板文本
+/// Read clipboard text via OSC52.
 fn get_clipboard_via_osc52() -> Option<String> {
     read_osc52_bytes().and_then(|bytes| String::from_utf8(bytes).ok())
 }
 
-/// 通过 OSC52 读取剪贴板原始字节（仅 SSH 会话）
+/// Read raw clipboard bytes via OSC52 (SSH sessions only).
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Some(Vec<u8>)` - 在 SSH 会话中成功读取剪贴板字节
-/// - `None` - 非 SSH 会话或读取失败
+/// - `Some(Vec<u8>)` - Clipboard bytes read successfully in an SSH session
+/// - `None` - Not an SSH session, or the read failed
 ///
-/// # 示例
+/// # Example
 ///
 /// ```rust,no_run
 /// use rust_tools::clipboardw::get_clipboard_raw_bytes_via_osc52;
@@ -270,21 +279,21 @@ pub fn get_clipboard_raw_bytes_via_osc52() -> Option<Vec<u8>> {
     }
 }
 
-/// 保存剪贴板内容到文件
+/// Save clipboard content to a file.
 ///
-/// 读取当前剪贴板文本内容并保存到指定文件。
-/// 如果文件名没有扩展名，会自动添加 `.txt` 后缀。
+/// Reads the current clipboard text content and saves it to the given file.
+/// If the file name has no extension, `.txt` is appended automatically.
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `fname` - 目标文件名
+/// * `fname` - Target file name
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Ok(())` - 成功保存
-/// - `Err(io::Error)` - 保存失败（剪贴板为空或 IO 错误）
+/// - `Ok(())` - Saved successfully
+/// - `Err(io::Error)` - Save failed (empty clipboard or IO error)
 ///
-/// # 示例
+/// # Example
 ///
 /// ```rust,no_run
 /// use rust_tools::clipboardw::save_to_file;
@@ -303,20 +312,20 @@ pub fn save_to_file(fname: &str) -> io::Result<()> {
     }
 }
 
-/// 从文件复制内容到剪贴板
+/// Copy file content into the clipboard.
 ///
-/// 读取文件内容并设置到剪贴板。
+/// Reads the file content and sets it as the clipboard content.
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `fname` - 源文件名
+/// * `fname` - Source file name
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Ok(())` - 成功复制
-/// - `Err(...)` - 复制失败（文件为空或不是文本文件）
+/// - `Ok(())` - Copied successfully
+/// - `Err(...)` - Copy failed (file empty or not a text file)
 ///
-/// # 示例
+/// # Example
 ///
 /// ```rust,no_run
 /// use rust_tools::clipboardw::copy_from_file;
@@ -338,17 +347,18 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 获取剪贴板文本内容
+/// Get the clipboard text content.
 ///
-/// 自动检测环境并使用合适的方式读取剪贴板：
-/// - 本地会话：使用 `arboard` crate
-/// - SSH 会话：使用 OSC52 协议
+/// Auto-detects the environment and reads the clipboard with the appropriate
+/// method:
+/// - Local session: uses the `arboard` crate
+/// - SSH session: uses the OSC52 protocol
 ///
-/// # 返回值
+/// # Returns
 ///
-/// 返回剪贴板文本内容，如果读取失败则返回空字符串。
+/// Returns the clipboard text content, or an empty string if reading fails.
 ///
-/// # 示例
+/// # Example
 ///
 /// ```rust,no_run
 /// use rust_tools::clipboardw::get_clipboard_content;
@@ -369,22 +379,23 @@ pub fn get_clipboard_content() -> String {
     }
 }
 
-/// 设置剪贴板文本内容
+/// Set the clipboard text content.
 ///
-/// 自动检测环境并使用合适的方式设置剪贴板：
-/// - 本地会话：使用 `arboard` crate
-/// - SSH 会话：使用 OSC52 协议
+/// Auto-detects the environment and sets the clipboard with the appropriate
+/// method:
+/// - Local session: uses the `arboard` crate
+/// - SSH session: uses the OSC52 protocol
 ///
-/// # 参数
+/// # Arguments
 ///
-/// * `content` - 要设置的文本内容
+/// * `content` - The text content to set
 ///
-/// # 返回值
+/// # Returns
 ///
-/// - `Ok(())` - 成功设置
-/// - `Err(...)` - 设置失败
+/// - `Ok(())` - Set successfully
+/// - `Err(...)` - Failed to set the clipboard
 ///
-/// # 示例
+/// # Example
 ///
 /// ```rust,no_run
 /// use rust_tools::clipboardw::set_clipboard_content;
@@ -413,8 +424,8 @@ mod tests {
 
     #[test]
     fn test_ssh_session_detection() {
-        // 这个测试取决于环境变量
-        // 只是验证函数不会 panic
+        // This test depends on the environment variables; it only verifies
+        // that the function does not panic.
         let _ = is_ssh_session();
     }
 }

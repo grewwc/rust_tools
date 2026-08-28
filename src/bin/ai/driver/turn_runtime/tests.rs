@@ -37,17 +37,17 @@ fn force_final_reason_is_request_only_and_deduplicated() {
 #[test]
 fn detect_tool_loop_triggers_after_window_of_identical_signatures() {
     let sig = vec!["read_file::{\"path\":\"a.rs\"}".to_string()];
-    // 不足窗口
+    // Below the window size
     let history = vec![sig.clone(); TOOL_LOOP_SOFT_WINDOW - 1];
     assert!(!detect_tool_loop(&history, TOOL_LOOP_SOFT_WINDOW));
-    // 满 soft 窗口触发，但尚不满 hard 窗口
+    // Fills the soft window but not yet the hard window
     let history = vec![sig.clone(); TOOL_LOOP_SOFT_WINDOW];
     assert!(detect_tool_loop(&history, TOOL_LOOP_SOFT_WINDOW));
     assert!(!detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
-    // 满 hard 窗口且完全相同
+    // Fills the hard window and is fully identical
     let history = vec![sig.clone(); TOOL_LOOP_HARD_WINDOW];
     assert!(detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
-    // 满窗口但有一轮不同
+    // Fills the window but with one differing round
     let mut history = vec![sig.clone(); TOOL_LOOP_HARD_WINDOW];
     history[1] = vec!["read_file::{\"path\":\"b.rs\"}".to_string()];
     assert!(!detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
@@ -121,25 +121,29 @@ fn detect_execute_command_coarse_loop_requires_execute_command_only_signatures()
 
 #[test]
 fn detect_tool_loop_matches_cycle_prefix_when_window_not_divisible_by_period() {
-    // 回归：soft 窗口 4 无法被周期 3 整除，旧实现 `window % period != 0` 直接
-    // continue，导致 A-B-C-A-B-C 在第 6 轮被无预警 hard-stop（hard 先查、soft
-    // 后查，soft 永不可能先触发，升级不变量被破坏）。修复后退化为「若干完整
-    // 周期 + 一个周期前缀」也判为循环，使 3 周期在第 4 轮（A-B-C-A）先拿到 Soft。
+    // Regression: soft window 4 is not divisible by period 3; the old
+    // implementation hit `window % period != 0` and `continue`d directly, so
+    // A-B-C-A-B-C got an unannounced hard stop at round 6 (hard is checked
+    // first and soft second, so soft could never fire first and the escalation
+    // invariant was broken). The fix treats "several full cycles plus a
+    // partial-cycle prefix" as a loop too, so the 3-cycle case gets Soft first
+    // at round 4 (A-B-C-A).
     let a = vec!["tree::{\"path\":\"src\"}".to_string()];
     let b = vec!["read_file::{\"path\":\"src/bin/a.rs\"}".to_string()];
     let c = vec!["tree::{\"path\":\"src/bin\"}".to_string()];
 
-    // 不足窗口不误报。
+    // Below the window: no false positive.
     assert!(!detect_tool_loop(
         &[a.clone(), b.clone(), c.clone()],
         TOOL_LOOP_SOFT_WINDOW
     ));
-    // 3 周期 + 1 前缀正好填满 soft 窗口 4：应触发 Soft。
+    // 3 cycles + 1 prefix exactly fills soft window 4: should trigger Soft.
     assert!(detect_tool_loop(
         &[a.clone(), b.clone(), c.clone(), a.clone()],
         TOOL_LOOP_SOFT_WINDOW
     ));
-    // 完整 hard 窗口（6 轮整周期）仍触发，且整除路径不受影响。
+    // A full hard window (6 rounds of whole cycles) still triggers, and the
+    // divisible path is unaffected.
     assert!(detect_tool_loop(
         &[
             a.clone(),
@@ -151,7 +155,7 @@ fn detect_tool_loop_matches_cycle_prefix_when_window_not_divisible_by_period() {
         ],
         TOOL_LOOP_HARD_WINDOW
     ));
-    // 前缀不匹配（第 4 轮与周期无关）不得误报。
+    // A non-matching prefix (round 4 unrelated to the cycle) must not misfire.
     assert!(!detect_tool_loop(
         &[a.clone(), b.clone(), c.clone(), b.clone()],
         TOOL_LOOP_SOFT_WINDOW
@@ -160,22 +164,26 @@ fn detect_tool_loop_matches_cycle_prefix_when_window_not_divisible_by_period() {
 
 #[test]
 fn execute_command_is_read_only_skips_nav_segments_and_requires_all_substantive_read_only() {
-    // 前导 cd/export 无副作用，应跳过：`cd X && git status` 是只读。
+    // Leading cd/export segments have no side effects and should be skipped:
+    // `cd X && git status` is read-only.
     assert!(execute_command_is_read_only(
         "cd /tmp && git status --short"
     ));
     assert!(execute_command_is_read_only(
         "cd /tmp && export FOO=1 && ls -la"
     ));
-    // 任一实质段可能变更 → 非只读（堵住旧实现「只看首段」的盲区）。
+    // Any substantive segment that may change → not read-only (closes the old
+    // implementation's blind spot of looking only at the first segment).
     assert!(!execute_command_is_read_only("ls /tmp && rm -rf build"));
     assert!(!execute_command_is_read_only(
         "cd /tmp && git checkout master"
     ));
-    // 纯只读命令仍成立。
+    // Purely read-only commands still hold.
     assert!(execute_command_is_read_only("git log --oneline -5"));
     assert!(execute_command_is_read_only("ls -la /tmp"));
-    // cargo 验证子命令不改源码 → 只读；重复运行同一验证命令不应再计为 Mutation。
+    // cargo verification subcommands do not modify source → read-only;
+    // rerunning the same verification command must no longer count as a
+    // Mutation.
     assert!(execute_command_is_read_only("cargo check --bin a"));
     assert!(execute_command_is_read_only(
         "cd /Users/bytedance/rust_tools && cargo test --bin a focused_test"
@@ -183,7 +191,7 @@ fn execute_command_is_read_only_skips_nav_segments_and_requires_all_substantive_
     assert!(execute_command_is_read_only("cargo build --release"));
     assert!(execute_command_is_read_only("cargo clippy"));
     assert!(execute_command_is_read_only("cargo fmt --check"));
-    // 会改写源码 / 执行任意程序 → 非只读。
+    // Rewrites source / executes arbitrary programs → not read-only.
     assert!(!execute_command_is_read_only("cargo add serde"));
     assert!(!execute_command_is_read_only("cargo fmt"));
     assert!(!execute_command_is_read_only("cargo clippy --fix"));
@@ -193,17 +201,20 @@ fn execute_command_is_read_only_skips_nav_segments_and_requires_all_substantive_
 #[test]
 fn low_information_probe_only_matches_pure_echo_commands() {
     use super::checkpoint::command_is_low_information_probe;
-    // 纯 echo 探针（含 cd/export 前导）→ 无信息量，不应刷新 no-progress 预算。
+    // A pure echo probe (with cd/export leads) carries no information → must
+    // not refresh the no-progress budget.
     assert!(command_is_low_information_probe("echo \"integrate\""));
     assert!(command_is_low_information_probe("echo x"));
     assert!(command_is_low_information_probe("cd /tmp && echo done"));
     assert!(command_is_low_information_probe("echo a && echo b"));
-    // 含任何真实只读段 → 不是纯探针，仍照常记账（不误伤正当探查）。
+    // Contains any real read-only segment → not a pure probe; still accounted
+    // for normally (legitimate exploration is not penalized).
     assert!(!command_is_low_information_probe("cat version.txt"));
     assert!(!command_is_low_information_probe("echo hi && cargo check --bin a"));
     assert!(!command_is_low_information_probe("echo start && grep foo src.rs"));
     assert!(!command_is_low_information_probe("ls -la"));
-    // 空命令 / 仅前导段 → 无实质 echo 段，不算探针。
+    // Empty command / leading segments only → no substantive echo segment, not
+    // a probe.
     assert!(!command_is_low_information_probe(""));
     assert!(!command_is_low_information_probe("cd /tmp"));
 }
@@ -237,7 +248,9 @@ fn distinct_echo_probes_do_not_each_count_as_new_evidence() {
         ]
     };
 
-    // 互不相同的 echo 探针：修复前每个都产生新指纹刷新预算，修复后一律不计入证据。
+    // Mutually distinct echo probes: before the fix each produced a fresh
+    // fingerprint that refreshed the budget; after the fix none counts as
+    // evidence.
     assert!(
         extract_round_evidence_fingerprints(&echo_round("c1", "echo \\\"integrate\\\"", "integrate"))
             .is_empty(),
@@ -246,7 +259,8 @@ fn distinct_echo_probes_do_not_each_count_as_new_evidence() {
     assert!(
         extract_round_evidence_fingerprints(&echo_round("c2", "echo \\\"x\\\"", "x")).is_empty()
     );
-    // 对照：真实只读探查（cat 文件内容）仍应产生证据指纹，未被误伤。
+    // Control: real read-only exploration (cat of file contents) still
+    // produces an evidence fingerprint, unaffected.
     assert!(
         !extract_round_evidence_fingerprints(&echo_round("c3", "cat version.txt", "1.2.3"))
             .is_empty(),
@@ -256,7 +270,8 @@ fn distinct_echo_probes_do_not_each_count_as_new_evidence() {
 
 #[test]
 fn cargo_verify_evidence_normalizes_volatile_output() {
-    // 同一验证结果（仅时长/编译进度不同）→ 归一化后相同 → 指纹相同。
+    // The same verification result (differing only in duration/compile
+    // progress) → identical after normalization → same fingerprint.
     let a = normalize_verify_output(
         "   Compiling rust_tools v0.1.0 (/Users/bytedance/rust_tools)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s\n     Running unittests src/lib.rs (target/debug/deps/rust_tools-0123abc)\nrunning 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
     );
@@ -265,12 +280,14 @@ fn cargo_verify_evidence_normalizes_volatile_output() {
     );
     assert_eq!(a, b);
     assert!(a.contains("2 passed"));
-    // 不同验证结果（失败）→ 归一化后仍不同。
+    // A different verification result (failure) → still different after
+    // normalization.
     let c = normalize_verify_output(
         "running 2 tests\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
     );
     assert_ne!(a, c);
-    // 判定函数：cargo 验证子命令（可带 cd 前导段）→ true；非 cargo / 非验证 → false。
+    // Classifier: cargo verification subcommand (possibly with cd leads) →
+    // true; non-cargo / non-verification → false.
     assert!(command_is_cargo_verify("cargo test --bin a focused_test"));
     assert!(command_is_cargo_verify("cd /tmp && cargo check --bin a"));
     assert!(!command_is_cargo_verify("git status"));
@@ -296,8 +313,10 @@ fn turn_supervisor_emits_soft_then_hard_loop_signal() {
         reasoning_content: None,
     };
 
-    // 收集每一轮的信号：前 SOFT_WINDOW-1 轮不触发，第 SOFT_WINDOW 轮触发 Soft。
-    // Soft 会清空旧样本，因此必须在提示后再次重复 HARD_WINDOW 轮才触发 Hard。
+    // Collect the signal for each round: no trigger for the first
+    // SOFT_WINDOW-1 rounds; Soft fires on round SOFT_WINDOW. Soft clears the
+    // old samples, so HARD_WINDOW more repeats after the notice are required
+    // before Hard fires.
     let mut signals = Vec::new();
     for i in 0..(TOOL_LOOP_SOFT_WINDOW + TOOL_LOOP_HARD_WINDOW) {
         messages.push(assistant_with_same_read(&format!("tc-{i}")));
@@ -325,7 +344,7 @@ fn task_progress_after_loop_soft_restarts_tool_loop_ladder() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
 
-    // 同一只读调用重复到 soft 阈值。
+    // Repeat the same read-only call until the soft threshold.
     for i in 0..TOOL_LOOP_SOFT_WINDOW {
         messages.push(pb_read_msg("src/main.rs", &format!("read-{i}")));
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
@@ -335,7 +354,8 @@ fn task_progress_after_loop_soft_restarts_tool_loop_ladder() {
     }
     assert!(supervisor.loop_breaker_injected);
 
-    // soft 后的实际变更表示任务在推进，必须清除旧循环状态。
+    // A real mutation after soft means the task is progressing; the old loop
+    // state must be cleared.
     messages.push(pb_apply_patch_msg("patch-1"));
     assert!(matches!(
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS,),
@@ -344,7 +364,8 @@ fn task_progress_after_loop_soft_restarts_tool_loop_ladder() {
     assert!(!supervisor.loop_breaker_injected);
     assert!(supervisor.tool_signature_history.is_empty());
 
-    // 新的一轮重复必须重新先得到 soft，而不是沿用旧状态直接 hard-stop。
+    // A new round of repetition must earn soft again first, not inherit the
+    // old state and jump straight to hard-stop.
     for i in 0..TOOL_LOOP_SOFT_WINDOW {
         pb_successful_read_round(&mut messages, "src/other.rs", 5, &format!("retry-{i}"), "body");
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
@@ -361,7 +382,7 @@ fn soft_rearms_coarse_and_target_gates_so_post_soft_page_cycling_is_still_caught
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
 
-    // 阶段一：同一只读调用重复到 soft 触发。
+    // Phase 1: repeat the same read-only call until soft fires.
     for i in 0..TOOL_LOOP_SOFT_WINDOW {
         messages.push(pb_read_msg("src/main.rs", &format!("read-{i}")));
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
@@ -370,19 +391,24 @@ fn soft_rearms_coarse_and_target_gates_so_post_soft_page_cycling_is_still_caught
         }
     }
     assert!(supervisor.loop_breaker_injected);
-    // soft 处理器清空了 coarse/target 历史并重武装了它们的门。
+    // The soft handler cleared the coarse/target history and re-armed their
+    // gates.
     assert!(supervisor.tool_signature_history_coarse.is_empty());
     assert!(supervisor.tool_target_history.is_empty());
     assert!(!supervisor.coarse_loop_note_injected);
     assert!(!supervisor.target_repeat_note_injected);
 
-    // 阶段二：soft 后模型换一批 `ls` 变体继续翻同一日志目录。exact 签名各不相同，
-    // 不会重触发精确 soft/hard；但 coarse 签名都是 `ls:/data01/logs`，应在填满
-    // COARSE_WINDOW 后触发 Coarse（旧实现中该门被 loop_breaker_injected 永久挡死，
-    // 会一直漏到迭代上限）。
-    // 注意：第一个 `ls` 轮因 `/data01/logs` 是全新目标，会走 assess_progress 的
-    // 新目标 + 已注入过 loop 分支，触发 reset_tool_loop_escalation（清空 coarse
-    // 历史并重武装门）。因此需要在其后再积累 COARSE_WINDOW 轮同 coarse 样本。
+    // Phase 2: after soft, the model switches to a batch of `ls` variants over
+    // the same log directory. exact signatures all differ, so exact soft/hard
+    // never re-fires; but every coarse signature is `ls:/data01/logs`, so
+    // Coarse should fire once COARSE_WINDOW fills (the old implementation kept
+    // that gate permanently blocked by loop_breaker_injected and leaked to the
+    // iteration cap).
+    // Note: the first `ls` round sees `/data01/logs` as a brand-new target and
+    // takes assess_progress's new-target + already-injected-loop branch,
+    // triggering reset_tool_loop_escalation (clears the coarse history and
+    // re-arms the gate). COARSE_WINDOW more rounds of the same coarse sample
+    // must be accumulated afterwards.
     let ls_variants = [
         "ls -lt /data01/logs | head -20",
         "ls -la /data01/logs | head -30",
@@ -394,7 +420,8 @@ fn soft_rearms_coarse_and_target_gates_so_post_soft_page_cycling_is_still_caught
     for (i, cmd) in ls_variants.iter().enumerate() {
         messages.push(pb_execute_command_msg(cmd, &format!("ls-{i}")));
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
-        // 第 5 轮（ls-5，索引 5）是 reset 后填满 COARSE_WINDOW 的首轮。
+        // Round 5 (ls-5, index 5) is the first round that fills COARSE_WINDOW
+        // after the reset.
         if i == TOOL_LOOP_COARSE_WINDOW {
             assert!(
                 matches!(signal, ToolLoopSignal::Coarse),
@@ -424,38 +451,39 @@ fn mark_truncation_skip_resets_full_loop_detection_ladder() {
         reasoning_content: None,
     };
 
-    // 第一轮：积累到 soft 触发。
+    // Round 1: accumulate until soft fires.
     for i in 0..TOOL_LOOP_SOFT_WINDOW {
         messages.push(assistant_with_read(&format!("tc-{i}")));
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     }
-    // 验证 soft 已触发，flag 已设置。
+    // Verify soft fired and the flag is set.
     assert!(supervisor.loop_breaker_injected);
     assert!(!supervisor.hard_loop_stop_injected);
 
-    // 截断触发标记：历史清空，skip +1，所有 flag 重置。
+    // Truncation-triggered marker: history cleared, skip +1, all flags reset.
     supervisor.mark_truncation_skip();
     assert!(supervisor.tool_signature_history.is_empty());
     assert!(supervisor.tool_signature_history_coarse.is_empty());
     assert_eq!(supervisor.skip_tool_signature_rounds, 1);
-    // 关键验证：所有一次性标志都被重置。
+    // Key check: every one-shot flag is reset.
     assert!(!supervisor.hard_loop_stop_injected);
     assert!(!supervisor.loop_breaker_injected);
     assert!(!supervisor.coarse_loop_note_injected);
 
-    // 截断迭代：跳过签名记录。
+    // Truncated iteration: signature recording is skipped.
     messages.push(assistant_with_read("tc-skip"));
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(matches!(signal, ToolLoopSignal::None));
     assert!(supervisor.tool_signature_history.is_empty());
     assert_eq!(supervisor.skip_tool_signature_rounds, 0);
 
-    // 第二轮：恢复后重新积累，验证 soft 能再次触发。
+    // Round 2: accumulate again after recovery; verify soft can fire a second
+    // time.
     for i in 0..TOOL_LOOP_SOFT_WINDOW {
         messages.push(assistant_with_read(&format!("tc2-{i}")));
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         if i == TOOL_LOOP_SOFT_WINDOW - 1 {
-            // 第 4 次应触发 soft。
+            // The 4th occurrence should trigger soft.
             assert!(matches!(signal, ToolLoopSignal::Soft));
             assert!(supervisor.loop_breaker_injected);
         } else {
@@ -463,12 +491,13 @@ fn mark_truncation_skip_resets_full_loop_detection_ladder() {
         }
     }
 
-    // soft 后需重新积累完整 hard window，验证完整升级阶梯恢复。
+    // After soft a full hard window must be re-accumulated, verifying the full
+    // escalation ladder is restored.
     for i in 0..TOOL_LOOP_HARD_WINDOW {
         messages.push(assistant_with_read(&format!("tc3-{i}")));
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         if i == TOOL_LOOP_HARD_WINDOW - 1 {
-            // 收到 soft 后又重复 6 次，才应触发 hard。
+            // Only after 6 more repeats following soft should hard fire.
             assert!(matches!(signal, ToolLoopSignal::Hard));
             assert!(supervisor.hard_loop_stop_injected);
         }
@@ -496,33 +525,41 @@ fn turn_supervisor_compress_gate_respects_cooldown_and_delta() {
     ));
 }
 
-/// 长循环感知：短 turn 保持基准软阈值不变；一旦迭代轮次达阈值，有效软阈值
-/// 被下调到 SOFT_FLOOR，让内容级去重尽早介入，遏制 O(n²) 累积重发。
-/// 这是 aefa66f2 那类「历史中等(~120K) + 56 轮迭代」撞 TPM 的直接修复：
-/// 基准阈值 135K 永不触发，下调到 36K 后长循环中段即开始压缩。
+/// Long-loop awareness: short turns keep the baseline soft threshold; once the
+/// iteration count reaches the threshold, the effective soft threshold drops
+/// to SOFT_FLOOR so content-level dedup kicks in early and curbs O(n²)
+/// resending of accumulated content.
+/// This is the direct fix for incidents like aefa66f2 (medium history ~120K +
+/// 56 iterating rounds) hitting TPM: the 135K baseline never fired, while the
+/// lowered 36K threshold starts compression mid-way through long loops.
 #[test]
 fn long_loop_lowers_effective_mid_turn_soft_threshold() {
     const FLOOR: usize = super::super::MID_TURN_COMPRESS_SOFT_FLOOR;
-    // flagship 大窗口模型的基准软阈值远高于 FLOOR（模拟 135K）。
+    // The flagship large-window model's baseline soft threshold is far above
+    // FLOOR (simulating 135K).
     let base = 135_000usize;
     assert!(base > FLOOR, "precondition: base threshold above floor");
 
     let mut s = TurnSupervisor::default();
 
-    // 短 turn（未达长循环阈值）：有效阈值 == 基准，不误伤正常单轮大任务。
+    // Short turn (below the long-loop threshold): effective threshold ==
+    // baseline; normal single-round large tasks are unaffected.
     s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD - 1;
     assert_eq!(s.effective_mid_turn_soft_threshold(base), base);
-    // 此时 ~120K 历史（< 135K 基准）不触发压缩——正是旧行为的空窗。
+    // Here ~120K of history (< 135K baseline) does not trigger compression —
+    // exactly the old behavior's blind spot.
     assert!(
         !s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base))
     );
 
-    // 长循环（达阈值）：有效阈值降到 FLOOR，同样 ~120K 历史立即触发压缩。
+    // Long loop (threshold reached): the effective threshold drops to FLOOR
+    // and the same ~120K history triggers compression immediately.
     s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD;
     assert_eq!(s.effective_mid_turn_soft_threshold(base), FLOOR);
     assert!(s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base)));
 
-    // 若基准本就低于 FLOOR（history_max_chars 很小的场景），min() 保证不抬高阈值。
+    // If the baseline is already below FLOOR (a tiny history_max_chars), min()
+    // guarantees the threshold is never raised.
     let tiny_base = FLOOR / 2;
     assert_eq!(s.effective_mid_turn_soft_threshold(tiny_base), tiny_base);
 }
@@ -573,10 +610,13 @@ fn coarse_execute_command_signature_collapses_log_listing_window_variants() {
 
 #[test]
 fn coarse_execute_command_signature_collapses_middle_paging_offsets() {
-    // 翻页循环逃逸根因：tail -c +N / sed -n 'N,Mp' 的偏移字面量此前被保留在
-    // coarse 签名里，同一文件换窗口翻页时每轮签名互不相同，coarse / target-repeat
-    // 都抓不到。偏移/行号区间属于「窗口」而非目标资源，应被剥掉（与 read_file 的
-    // offset/limit 剥离同理），使翻页变体折叠为同一签名。
+    // Root cause of pagination-loop escapes: offset literals in
+    // `tail -c +N` / `sed -n 'N,Mp'` used to be kept in the coarse signature,
+    // so paging the same file through different windows produced a distinct
+    // signature every round and neither coarse nor target-repeat could catch
+    // it. Offsets/line ranges describe the "window", not the target resource,
+    // and should be stripped (like read_file's offset/limit stripping) so
+    // paging variants collapse into one signature.
     let a = coarse_execute_command_signature("tail -c +2401 src/all_desc.txt | head -c 2400");
     let b = coarse_execute_command_signature("tail -c +4801 src/all_desc.txt | head -c 2400");
     let c = coarse_execute_command_signature("tail -c +1 src/all_desc.txt | head -c 1400");
@@ -587,23 +627,26 @@ fn coarse_execute_command_signature_collapses_middle_paging_offsets() {
     let e = coarse_execute_command_signature("sed -n '1,40p' src/all_desc.txt");
     assert_eq!(d, "sed:src/all_desc.txt");
     assert_eq!(d, e);
-    // 不同目标文件仍保持区分，避免误合并。
+    // Different target files remain distinguished to avoid false merges.
     assert_ne!(a, coarse_execute_command_signature("tail -c +2401 other.txt"));
 }
 
 #[test]
 fn coarse_catches_middle_paging_loop_never_from_top() {
-    // 纯「翻页」循环：同一文件反复从中间偏移读（tail -c +N，每轮偏移不同、
-    // 永不为 +1，from-top 重扫检测抓不到）。整轮原始命令各不相同，exact 落空；
-    // 修复前 coarse 签名保留偏移字面量，整轮 coarse 集合也永不相等，循环一直
-    // 逃逸到迭代上限。修复后偏移被剥掉，全部折叠为 `tail:<file>`：第 5 轮触发
-    // Coarse 软提示，第 8 轮触发 CoarseHard 硬停。
+    // Pure "paging" loop: the same file is read repeatedly from mid-file
+    // offsets (tail -c +N with a different offset each round, never +1, so the
+    // from-top rescan detector cannot catch it). Whole-round raw commands all
+    // differ, so exact matching fails; before the fix the coarse signature
+    // kept the offset literal and the whole-round coarse sets never matched
+    // either, letting the loop escape to the iteration cap. After the fix
+    // offsets are stripped and everything folds to `tail:<file>`: Coarse soft
+    // notice on round 5, CoarseHard hard stop on round 8.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let file = "src/all_desc.txt";
     let mut signals = Vec::new();
     for i in 0..TOOL_LOOP_COARSE_HARD_WINDOW {
-        let offset = 2401 + i * 2400; // 中间偏移，永不为 1（from-top）。
+        let offset = 2401 + i * 2400; // Mid-file offset, never 1 (from-top).
         pb_execute_command_round(
             &mut messages,
             &format!("tail -c +{offset} {file} | head -c 2400"),
@@ -682,8 +725,9 @@ fn turn_supervisor_emits_coarse_signal_for_same_file_paging() {
         reasoning_content: None,
     };
 
-    // 每轮 offset 递增：字节精确签名各不相同 → soft/hard 不触发；
-    // 剥离 offset/limit 后 coarse 签名一致 → 满 COARSE_WINDOW 后触发 Coarse。
+    // Offsets increase every round: byte-exact signatures all differ → no
+    // soft/hard; with offset/limit stripped the coarse signatures match →
+    // Coarse fires once COARSE_WINDOW fills.
     let mut signals = Vec::new();
     for i in 0..TOOL_LOOP_COARSE_WINDOW {
         messages.push(assistant_paging_read(&format!("tc-{i}"), i * 80));
@@ -699,7 +743,8 @@ fn turn_supervisor_emits_coarse_signal_for_same_file_paging() {
     assert!(matches!(signals.last().unwrap(), ToolLoopSignal::Coarse));
     assert!(supervisor.coarse_loop_note_injected);
 
-    // coarse 只提示一次：继续同样翻页不再返回 Coarse。
+    // Coarse notices only once: continuing the same paging returns no further
+    // Coarse.
     messages.push(assistant_paging_read(
         "tc-extra",
         TOOL_LOOP_COARSE_WINDOW * 80,
@@ -1182,10 +1227,11 @@ fn agent_team_read_only_breadth_note_redirects_to_delegation() {
     assert!(!ordinary_note.contains("`agent-team` is active"));
 }
 
-// ===== Progress Budget（行为信号进展预算）测试 =====
-// 这些用例都刻意让每轮工具签名各不相同（不同 path），从而绕过 exact/coarse
-// 「签名重复」检测，专门验证第三层 assess_progress 的「信息增益」判定：成功的
-// 新目标读取算进展，失败读取（无目标）不算进展。
+// ===== Progress Budget (behavioral-signal progress budget) tests =====
+// These cases deliberately make every round's tool signature differ (different
+// paths) to bypass exact/coarse "signature repetition" detection and verify
+// the third layer, assess_progress's "information gain" rule: a successful
+// read of a new target counts as progress; a failed read (no target) does not.
 
 fn pb_read_msg(path: &str, id: &str) -> crate::ai::history::Message {
     crate::ai::history::Message {
@@ -1348,16 +1394,20 @@ fn pb_task_round(
     messages.push(pb_tool_result(id, result));
 }
 
-/// 失败的只读调用轮：assistant 发起 read_file，紧跟一条 tool 结果表示读取失败。
-/// 失败调用不进入 `extract_round_targets`（无目标 → 无信息增益 → 无进展），
-/// 且因每轮 path 不同而绕过 exact/coarse 签名循环检测，是进展预算升级阶梯
-/// 在「统一为行为信号」后唯一的无进展驱动方式（成功的新目标读取都算进展）。
+/// A failed read-only call round: the assistant issues read_file followed by a
+/// tool result indicating the read failed. Failed calls do not enter
+/// `extract_round_targets` (no targets → no information gain → no progress),
+/// and because each round uses a different path they bypass exact/coarse
+/// signature loop detection, making this the only no-progress driver of the
+/// progress-budget escalation ladder after "unify on behavioral signals"
+/// (successful new-target reads always count as progress).
 fn pb_failed_read_round(messages: &mut Vec<crate::ai::history::Message>, path: &str, id: &str) {
     pb_failed_read_round_reasoning(messages, path, id, None);
 }
 
-/// `pb_failed_read_round` 的带 reasoning 变体：失败读取轮附带一段 reasoning，
-/// 用于验证 grace 宽限（软提示后 reasoning 指纹变化 → 换取一次宽限）。
+/// Variant of `pb_failed_read_round` with reasoning: the failed read round
+/// carries a reasoning snippet, used to verify grace extension (a changed
+/// reasoning fingerprint after the soft notice buys one grace round).
 fn pb_failed_read_round_reasoning(
     messages: &mut Vec<crate::ai::history::Message>,
     path: &str,
@@ -1411,9 +1461,12 @@ fn progress_budget_no_gain_reading_triggers_soft_after_free_rounds() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let mut signals = Vec::new();
-    // iteration 1..=25：免费区（<=20）全静默；21 起累加无进展，
-    // 25 轮时 consecutive=5 达到 soft_threshold(25)=5，触发软提示。
-    // 用失败读取制造「无信息增益」轮：成功的新目标读取都算进展，无法累计无进展。
+    // iterations 1..=25: the free zone (<=20) stays fully silent; from 21 on,
+    // no-progress accumulates, and at round 25 consecutive=5 reaches
+    // soft_threshold(25)=5, firing the soft notice.
+    // Failed reads manufacture "no information gain" rounds: successful
+    // new-target reads always count as progress and cannot accumulate
+    // no-progress.
     for i in 1..=25 {
         supervisor.next_iteration();
         pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("tc-{i}"));
@@ -1447,9 +1500,12 @@ fn progress_budget_same_target_paging_is_progress_but_coarse_brake_still_fires()
         );
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         if i == TOOL_LOOP_COARSE_WINDOW - 1 {
-            // 同文件翻页填满 coarse 窗口：exact 签名因 offset 不同而各异（soft/hard
-            // 不触发），但剥离 offset 后的 coarse 签名一致，仍应触发一次性 Coarse 刹车。
-            // 这是「进展哈希须忽略 offset/limit 以防预算逃逸」不变量的关键保证。
+            // Paging the same file fills the coarse window: exact signatures
+            // differ because offsets differ (no soft/hard), but the coarse
+            // signatures match once offsets are stripped, so the one-shot
+            // Coarse brake should still fire. This is the key guarantee of the
+            // "progress hashing must ignore offset/limit to prevent budget
+            // escapes" invariant.
             assert!(
                 matches!(signal, ToolLoopSignal::Coarse),
                 "round {i}: same-file paging must still trip the coarse brake: {signal:?}"
@@ -1460,18 +1516,21 @@ fn progress_budget_same_target_paging_is_progress_but_coarse_brake_still_fires()
                 "round {i}: {signal:?}"
             );
         }
-        // 新证据始终算进展：Progress Budget 绝不因高效翻页误升级 soft/ledger/hard。
+        // New evidence always counts as progress: Progress Budget never
+        // escalates to soft/ledger/hard because of efficient paging.
         assert_eq!(supervisor.progress.consecutive_no_progress, 0);
     }
 
-    // Coarse 只提示一次，且新证据不会清空签名历史（否则窗口永远填不满、刹车失效）。
+    // Coarse notices once, and new evidence must not clear the signature
+    // history (otherwise the window never fills and the brake fails).
     assert!(
         supervisor.coarse_loop_note_injected,
         "coarse paging brake must have fired exactly once"
     );
     assert_eq!(supervisor.progress.seen_targets.len(), 1);
-    // 12 轮翻页里，coarse 命中的那一轮（i=COARSE_WINDOW-1）在进入 assess_progress
-    // 前就早退，其证据不入账；其余 11 轮各记一条独立指纹。
+    // Across the 12 paging rounds, the coarse-hit round (i=COARSE_WINDOW-1)
+    // early-returns before entering assess_progress and its evidence is not
+    // recorded; the other 11 rounds each record one distinct fingerprint.
     assert_eq!(supervisor.progress.seen_evidence_fingerprints.len(), 11);
 }
 
@@ -1499,10 +1558,13 @@ fn progress_budget_readonly_novel_targets_warn_once_after_breadth_threshold() {
     assert_eq!(supervisor.progress.consecutive_no_progress, 0);
 }
 
-/// 纯只读发散（零 mutation，持续换新目标读取）必须在累计目标数达到
-/// `READ_ONLY_BREADTH_HARD_STOP_TARGETS` 时被强制收口——即便每轮都读到新目标
-/// / 新字节而使常规无进展计数被反复复位。这条判据与内容新颖度解耦，是本次
-/// 「诊断 agent 只读发散两小时不收口」事故的最终刹车。
+/// Pure read-only divergence (zero mutations, constantly switching to new
+/// target reads) must be forcibly wrapped up once the accumulated target count
+/// reaches `READ_ONLY_BREADTH_HARD_STOP_TARGETS` — even though every round
+/// reads a new target / new bytes, repeatedly resetting the regular
+/// no-progress counter. This criterion is decoupled from content novelty and
+/// is the final brake for the "diagnostic agent diverging read-only for two
+/// hours without wrapping up" incident.
 #[test]
 fn progress_budget_pure_readonly_divergence_hard_stops_after_breadth_ceiling() {
     let mut supervisor = TurnSupervisor::default();
@@ -1510,8 +1572,9 @@ fn progress_budget_pure_readonly_divergence_hard_stops_after_breadth_ceiling() {
     let mut saw_hard_stop_at = None;
     for i in 1..=(READ_ONLY_BREADTH_HARD_STOP_TARGETS + 4) {
         supervisor.next_iteration();
-        // 每轮都读一个全新文件并拿到成功结果：既是新目标又是新证据，
-        // 常规 no-progress 计数始终为 0，只有解耦的广度硬停能兜住。
+        // Every round reads a brand-new file and gets a successful result: both
+        // a new target and new evidence, so the regular no-progress counter
+        // stays 0 and only the decoupled breadth hard stop can catch it.
         pb_successful_read_round(
             &mut messages,
             &format!("src/probe_{i}.rs"),
@@ -1536,13 +1599,15 @@ fn progress_budget_pure_readonly_divergence_hard_stops_after_breadth_ceiling() {
     );
 }
 
-/// 一旦本 turn 发生过任何 mutation，广度硬停永久让路：正常「读大量文件 + 改」
-/// 的实现型任务不受该刹车约束，避免劣化 agent 效果。
+/// Once any mutation happened in this turn, the breadth hard stop stands down
+/// permanently: normal "read many files + edit" implementation tasks are not
+/// subject to this brake, avoiding degraded agent effectiveness.
 #[test]
 fn progress_budget_breadth_hard_stop_never_fires_after_mutation() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
-    // 第 1 轮就做一次成功项目 mutation，置位 observed_project_mutation_this_turn。
+    // Perform one successful project mutation in round 1 to set
+    // observed_project_mutation_this_turn.
     supervisor.next_iteration();
     messages.push(pb_apply_patch_msg("patch-1"));
     messages.push(pb_tool_result(
@@ -1552,7 +1617,8 @@ fn progress_budget_breadth_hard_stop_never_fires_after_mutation() {
     let _ = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(supervisor.progress.observed_project_mutation_this_turn);
 
-    // 随后大量只读探索远超硬停阈值，也绝不能触发 ReadOnlyBreadthHard。
+    // Subsequent read-only exploration far exceeds the hard-stop threshold yet
+    // must never trigger ReadOnlyBreadthHard.
     for i in 1..=(READ_ONLY_BREADTH_HARD_STOP_TARGETS + 8) {
         supervisor.next_iteration();
         pb_successful_read_round(
@@ -1576,8 +1642,9 @@ fn progress_budget_does_not_inject_readonly_breadth_after_mutation() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
 
-    // 先积累到 breadth 阈值前一格，模拟已经读过很多证据但还没触发
-    // ReadOnlyBreadth 的状态。
+    // First accumulate to one step below the breadth threshold, simulating a
+    // state where much evidence has been read but ReadOnlyBreadth has not yet
+    // fired.
     for i in 1..READ_ONLY_BREADTH_CHECK_TARGETS {
         supervisor.next_iteration();
         messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("tc-{i}")));
@@ -1663,9 +1730,11 @@ fn blocked_outside_workspace_command_normalizes_to_stable_target() {
 
 #[test]
 fn browser_navigation_and_read_count_as_progress_targets() {
-    // 浏览器工具不在 MUTATION_TOOL_NAMES、参数也不带 path/query；若不提取
-    // url/selector，navigate 新页面与读取新 selector 会被误判为无进展，正常的
-    // 多步浏览 turn 会在进展预算阶梯下被 LowProgressHard 误停。
+    // Browser tools are not in MUTATION_TOOL_NAMES and their args carry no
+    // path/query; without extracting url/selector, navigating to a new page or
+    // reading a new selector would be misjudged as no progress, and a normal
+    // multi-step browsing turn would be wrongly stopped by LowProgressHard
+    // under the progress-budget ladder.
     let mut messages = Vec::new();
     pb_task_round(
         &mut messages,
@@ -1724,9 +1793,11 @@ fn target_repeat_catches_repeated_blocked_outside_workspace_commands() {
     assert!(supervisor.target_repeat_note_injected);
 }
 
-/// 混合工具轮里同一目标反复取证：每轮都读同一个文件 A，但穿插一个每轮都不同的
-/// tree，使整轮 exact/coarse 签名各不相等而逃过 detect_tool_loop；此时
-/// 目标交集检测应抓到「A 每轮都在」并发出一次 TargetRepeat。
+/// Repeated evidence gathering on the same target across mixed tool rounds:
+/// every round reads the same file A, interleaved with a tree that differs
+/// every round, so whole-round exact/coarse signatures never match and
+/// detect_tool_loop is bypassed; the target-intersection check should catch
+/// "A present every round" and emit one TargetRepeat.
 #[test]
 fn turn_supervisor_emits_target_repeat_for_mixed_tool_rounds_on_same_file() {
     fn mixed_round(i: usize) -> crate::ai::history::Message {
@@ -1734,7 +1805,7 @@ fn turn_supervisor_emits_target_repeat_for_mixed_tool_rounds_on_same_file() {
             role: "assistant".to_string(),
             content: serde_json::Value::String(String::new()),
             tool_calls: Some(vec![
-                // 每轮恒定：反复读同一个文件 A。
+                // Constant every round: re-read the same file A.
                 crate::ai::types::ToolCall {
                     id: format!("read-A-{i}"),
                     tool_type: "function".to_string(),
@@ -1743,7 +1814,9 @@ fn turn_supervisor_emits_target_repeat_for_mixed_tool_rounds_on_same_file() {
                         arguments: "{\"path\":\"src/bin/ai/mod.rs\",\"offset\":100}".to_string(),
                     },
                 },
-                // 每轮不同的陪衬目录读取：让整轮签名各不相等，逃过整轮判等。
+                // A different filler directory read each round: keeps
+                // whole-round signatures unequal, escaping whole-round equality
+                // checks.
                 crate::ai::types::ToolCall {
                     id: format!("search-{i}"),
                     tool_type: "function".to_string(),
@@ -1767,14 +1840,16 @@ fn turn_supervisor_emits_target_repeat_for_mixed_tool_rounds_on_same_file() {
             .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
 
-    // 整轮签名每轮都不同：exact / coarse 整轮判等一律不命中。
+    // Whole-round signatures differ every round: exact / coarse whole-round
+    // equality never hits.
     assert!(
         signals[..TOOL_LOOP_COARSE_WINDOW - 1]
             .iter()
             .all(|s| matches!(s, ToolLoopSignal::None)),
         "whole-round signatures differ every round; nothing should fire early: {signals:?}"
     );
-    // 填满 coarse 窗口时，目标交集（文件 A）命中，发出一次 TargetRepeat。
+    // When the coarse window fills, the target intersection (file A) hits and
+    // emits one TargetRepeat.
     assert!(
         matches!(
             signals[TOOL_LOOP_COARSE_WINDOW - 1],
@@ -1785,8 +1860,8 @@ fn turn_supervisor_emits_target_repeat_for_mixed_tool_rounds_on_same_file() {
     assert!(supervisor.target_repeat_note_injected);
 }
 
-/// 反例守卫：每轮读的文件都不同（无公共目标），目标交集为空，
-/// 不得误报 TargetRepeat。
+/// Counter-case guard: every round reads a different file (no common target),
+/// the target intersection is empty, and TargetRepeat must not be reported.
 #[test]
 fn target_repeat_ignores_distinct_targets_each_round() {
     let mut supervisor = TurnSupervisor::default();
@@ -1830,16 +1905,18 @@ fn target_repeat_does_not_fire_on_write_file_progress() {
 
 #[test]
 fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
-    // 复现 f319d490 会话的真实逃逸模式：同一文件从文件头反复读取（每轮页宽
-    // 变化：2400B → 1400B → read_file 行分页），中间混入每轮不同的新归档
-    // 路径——整轮签名永不相等，exact/coarse/target-repeat 三道整轮检测全部
-    // 落空；重扫计数按目标累计、与整轮签名解耦：第 3 次从头读注入软提示，
-    // 第 4 次从头读硬停止。
+    // Reproduces the real escape pattern of session f319d490: the same file is
+    // read from the top repeatedly (page width changes every round: 2400B →
+    // 1400B → read_file line paging), interleaved with new archive paths that
+    // differ every round — whole-round signatures never match and all three
+    // whole-round detectors (exact/coarse/target-repeat) miss; the rescan
+    // counter accumulates per target, decoupled from whole-round signatures:
+    // the 3rd from-top read injects the soft notice, the 4th hard-stops.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let file = "src/all_desc.txt";
 
-    // 第 1 次从头读（tail -c +1）+ 后续分页。
+    // 1st from-top read (tail -c +1) plus subsequent paging.
     pb_execute_command_round(&mut messages, &format!("tail -c +1 {file} | head -c 2400"), "t0");
     assert_eq!(
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
@@ -1857,13 +1934,15 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
             ToolLoopSignal::None
         );
     }
-    // 混入每轮不同的新归档路径读取（此前三道检测的逃逸关键）。
+    // Interleave new archive-path reads that differ every round (the key to
+    // escaping the previous three detectors).
     pb_read_round(&mut messages, &format!("{file}.archive-1"), "a1");
     assert_eq!(
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
         ToolLoopSignal::None
     );
-    // 第 2 次从头读：换成 1400 字节页宽 → 软提示（soft 阈值=2）。
+    // 2nd from-top read: page width switched to 1400 bytes → soft notice (soft
+    // threshold=2).
     pb_execute_command_round(&mut messages, &format!("tail -c +1 {file} | head -c 1400"), "t1");
     assert!(
         matches!(
@@ -1873,9 +1952,11 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
         "round t1 应软提示：第 2 次从头读"
     );
     pb_execute_command_round(&mut messages, &format!("tail -c +1401 {file} | head -c 1400"), "t1p1");
-    // 修复后：tail/sed 的偏移/行号字面量被剥掉，窗口 [tail,tail,archive,
-    // tail,tail] 折叠成 3 周期 [tail,tail,archive]，coarse 在填满窗口时
-    // 提前命中（比 from-top 重扫更早抓住这个翻页+混轮循环）。
+    // After the fix: tail/sed offset/line-range literals are stripped, the
+    // window [tail,tail,archive,tail,tail] folds into the 3-cycle
+    // [tail,tail,archive], and coarse hits early when the window fills
+    // (catching this paging + interleaved-rounds loop before the from-top
+    // rescan does).
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(
         matches!(signal, ToolLoopSignal::Coarse),
@@ -1886,7 +1967,8 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
         ToolLoopSignal::None
     );
-    // 第 3 次从头读（read_file offset 缺省）→ 无新信号（软提示已在本 episode 注入）。
+    // 3rd from-top read (read_file offset omitted) → no new signal (the soft
+    // notice was already injected in this episode).
     pb_read_round(&mut messages, file, "r3");
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert_eq!(
@@ -1894,7 +1976,7 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
         ToolLoopSignal::None,
         "3rd from-top read: soft already injected this episode (fires once), got {signal:?}"
     );
-    // 第 4 次从头读（offset=0）→ 硬停止。
+    // 4th from-top read (offset=0) → hard stop.
     pb_successful_read_round(&mut messages, file, 0, "r4", "content page");
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(
@@ -1905,8 +1987,9 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
 
 #[test]
 fn target_rescan_resets_on_write_file_edit() {
-    // 编辑后从头重读是合法验证：write_file 修改目标清零重扫计数，
-    // 读→改→读 循环不应触发任何重扫信号。
+    // Re-reading from the top after editing is legitimate verification:
+    // write_file modifying the target resets the rescan counter to zero, and a
+    // read→edit→read cycle must not trigger any rescan signal.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let target = "src/config.toml";
@@ -1928,7 +2011,8 @@ fn target_rescan_resets_on_write_file_edit() {
 
 #[test]
 fn target_rescan_ignores_monotonic_pagination() {
-    // 单调向前翻页（offset 递增、从不回头）不是重扫：只计 1 次从头读。
+    // Monotonically forward paging (offsets increase, never revisits) is not a
+    // rescan: only 1 from-top read counted.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let file = "src/big-file.rs";
@@ -1948,27 +2032,32 @@ fn target_rescan_ignores_monotonic_pagination() {
 
 #[test]
 fn target_rescan_window_decays_stale_counts() {
-    // 上下文压缩后跨多轮的合法重读不应累积：距上次从头读取超过窗口轮数
-    // （TARGET_RESCAN_WINDOW_ROUNDS=8）时，计数过期并从 1 重新累计。
+    // Legitimate re-reads spanning many rounds after context compression must
+    // not accumulate: when more than TARGET_RESCAN_WINDOW_ROUNDS=8 rounds have
+    // passed since the last from-top read, the counter expires and restarts
+    // from 1.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let target = "src/spaced-file.rs";
-    // 第 1 次从头读，iteration=1 → 计数 1。
+    // 1st from-top read at iteration=1 → count 1.
     supervisor.iteration = 1;
     pb_execute_command_round(&mut messages, &format!("tail -c +1 {target} | head -c 2400"), "r1");
     assert_eq!(
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
         ToolLoopSignal::None
     );
-    // 跨 10 轮后再从头读（gap=10 > 8）→ 计数过期，重新从 1 计，不触发。
+    // Another from-top read after 10 rounds (gap=10 > 8) → the counter
+    // expired, restarts from 1, nothing fires.
     supervisor.iteration = 11;
     pb_execute_command_round(&mut messages, &format!("cat {target}"), "r11");
     assert_eq!(
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
         ToolLoopSignal::None
     );
-    // 窗口内连续重读：每轮命令互异（tail/cat/sed/nl/head），避免误触精确/粗粒度
-    // 循环检测。第 2 次（累计 2）软提示，第 3 次无新信号（软提示已注入），第 4 次硬停止。
+    // Consecutive re-reads inside the window: commands differ every round
+    // (tail/cat/sed/nl/head) to avoid tripping exact/coarse loop detection.
+    // The 2nd (cumulative 2) soft notice, the 3rd no new signal (soft already
+    // injected), the 4th hard stop.
     supervisor.iteration = 12;
     pb_execute_command_round(&mut messages, &format!("sed -n 1,40p {target}"), "r12");
     assert!(
@@ -1998,13 +2087,17 @@ fn target_rescan_window_decays_stale_counts() {
 
 #[test]
 fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
-    // 回归：衰减开启新的重读 episode，每一段循环都必须拿到自己的 soft 预警。
-    // 旧实现衰减时只重置计数、不清 rescan_note_injected，第二段累计到 soft 时
-    // insert 返回 false → 跳过软提示直接硬停（soft→hard 升级不变量被破坏）。
+    // Regression: decay opens a new re-read episode, and every loop segment
+    // must get its own soft warning. The old implementation only reset the
+    // counter on decay without clearing rescan_note_injected, so when the
+    // second segment accumulated to soft, insert returned false → the soft
+    // notice was skipped and it went straight to a hard stop (the soft→hard
+    // escalation invariant was broken).
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let target = "src/episode-file.rs";
-    // Episode 1：第 1 次不触发，第 2 次软提示并记录 rescan_note_injected，第 3 次无新信号。
+    // Episode 1: 1st no trigger, 2nd soft notice with rescan_note_injected
+    // recorded, 3rd no new signal.
     for (iter, cmd) in [
         (1, format!("tail -c +1 {target} | head -c 2400")),
         (2, format!("cat {target}")),
@@ -2024,8 +2117,9 @@ fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
             assert_eq!(signal, ToolLoopSignal::None, "episode1 round r{iter}");
         }
     }
-    // 跨 9 轮（gap=9 > TARGET_RESCAN_WINDOW_ROUNDS=8）→ 计数衰减并从 1 重新计，
-    // 同时软提示标记必须随 episode 一并清除（本次修复点）。
+    // After 9 rounds (gap=9 > TARGET_RESCAN_WINDOW_ROUNDS=8) → the counter
+    // decays and restarts from 1, and the soft-notice flag must be cleared
+    // together with the episode (the point of this fix).
     supervisor.iteration = 12;
     pb_execute_command_round(&mut messages, &format!("nl -ba {target}"), "r12");
     assert_eq!(
@@ -2033,8 +2127,10 @@ fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
         ToolLoopSignal::None,
         "decay round r12"
     );
-    // Episode 2：第 2 次再次软提示——本段自己的预警，
-    // 不能因为上一段已提示过就跳过 soft 直接硬停；第 3 次无新信号。
+    // Episode 2: the 2nd occurrence soft-notices again — this segment's own
+    // warning; soft must not be skipped in favor of a hard stop just because
+    // the previous segment already warned; the 3rd occurrence gives no new
+    // signal.
     supervisor.iteration = 13;
     pb_execute_command_round(&mut messages, &format!("head -n 200 {target}"), "r13");
     assert!(
@@ -2055,12 +2151,15 @@ fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
 
 #[test]
 fn target_rescan_resets_on_other_file_mutation() {
-    // 多文件工作流：编辑任意目标（不限于被重读的目标）都整表清空 rescan 计数，
-    // 后续对另一文件的验证性从头重读从 1 重新累计，不应被误判为翻页循环。
+    // Multi-file workflow: editing any target (not only the re-read one)
+    // clears the whole rescan table, so a later verification from-top re-read
+    // of another file restarts from 1 and must not be misjudged as a paging
+    // loop.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
     let target = "src/read-a.rs";
-    // 两种不同签名（offset 0 / 1）的从头读，各累计一次。
+    // From-top reads with two distinct signatures (offset 0 / 1), each
+    // accumulating once.
     for (offset, id) in [(0usize, "r1"), (1usize, "r2")] {
         supervisor.iteration = id.trim_start_matches('r').parse().unwrap();
         pb_successful_read_round(&mut messages, target, offset, id, "line:0");
@@ -2074,7 +2173,7 @@ fn target_rescan_resets_on_other_file_mutation() {
             );
         }
     }
-    // 第 3 轮：编辑其他文件 B → 整表清空 A 的计数。
+    // Round 3: edit the other file B → the table clears A's counts.
     supervisor.iteration = 4;
     let id = "w4";
     messages.push(pb_write_file_msg("src/edit-b.rs", id));
@@ -2084,8 +2183,9 @@ fn target_rescan_resets_on_other_file_mutation() {
         ToolLoopSignal::None,
         "edit-other-file round must not signal"
     );
-    // 编辑后从头重读 A 重新从 1 计：cat / offset=0 / offset=1 三种互异签名。
-    // 第 2 次软提示，第 3 次无新信号（软提示已注入）。
+    // After the edit, from-top re-reads of A restart from 1: cat / offset=0 /
+    // offset=1 are three distinct signatures. The 2nd soft notice, the 3rd no
+    // new signal (soft already injected).
     supervisor.iteration = 5;
     pb_execute_command_round(&mut messages, &format!("cat {target}"), "c5");
     assert_eq!(
@@ -2146,7 +2246,7 @@ fn target_rescan_helper_detects_from_top_reads() {
     );
     assert_eq!(first_path_token("head -c 2400 /tmp/a.txt").as_deref(), Some("/tmp/a.txt"));
     assert_eq!(normalize_rescan_path("./src/a.rs"), normalize_rescan_path("src/a.rs"));
-    // read_file offset 缺省/0/1 → from-top；offset=100 → 不是。
+    // read_file offset omitted/0/1 → from-top; offset=100 → not.
     let mut messages = Vec::new();
     messages.push(pb_read_msg("/tmp/a.txt", "no-offset"));
     assert_eq!(
@@ -2188,9 +2288,12 @@ fn repeated_identical_write_file_still_hits_exact_tool_loop() {
     );
 }
 
-/// 回归：反复写同一个「沙箱越界被拒」的路径（content 每轮不同、file_path 相同），
-/// 曾因失败被误计为 mutation-progress、且不进入 target 历史而逃过所有 loop guard。
-/// 修复后：blocked 写不再算进展，且归一成稳定目标，target-repeat guard 在少数轮内命中。
+/// Regression: repeatedly writing the same "sandbox boundary rejected" path
+/// (different content each round, same file_path) used to be miscounted as
+/// mutation-progress and, never entering the target history, escaped every
+/// loop guard. After the fix: blocked writes no longer count as progress, are
+/// normalized into a stable target, and the target-repeat guard hits within a
+/// few rounds.
 #[test]
 fn repeated_blocked_write_to_same_path_triggers_target_repeat() {
     let mut supervisor = TurnSupervisor::default();
@@ -2202,7 +2305,8 @@ fn repeated_blocked_write_to_same_path_triggers_target_repeat() {
 
     for i in 0..TOOL_LOOP_COARSE_WINDOW {
         let id = format!("blocked-write-{i}");
-        // content 每轮不同：exact/coarse 整轮签名各不相等，逃过 detect_tool_loop。
+        // content differs every round: whole-round exact/coarse signatures
+        // never match, escaping detect_tool_loop.
         messages.push(pb_write_file_msg_with_content(
             "/out/picks.json",
             &id,
@@ -2229,8 +2333,10 @@ fn repeated_blocked_write_to_same_path_triggers_target_repeat() {
     assert!(supervisor.target_repeat_note_injected);
 }
 
-/// 回归：blocked write 不得清零无进展预算。此前 `_ => true` 把失败写也计为
-/// mutation，每次重试都重置 consecutive_no_progress，使 progress-budget 永不升级。
+/// Regression: a blocked write must not zero the no-progress budget.
+/// Previously `_ => true` counted failed writes as mutations too, resetting
+/// consecutive_no_progress on every retry so the progress budget never
+/// escalated.
 #[test]
 fn blocked_write_does_not_count_as_mutation_progress() {
     let blocked = "Error: write_file failed: File error (/out/x.json): Write blocked: \
@@ -2247,7 +2353,7 @@ fn blocked_write_does_not_count_as_mutation_progress() {
         "a blocked write must not be counted as mutation progress"
     );
 
-    // 对照：成功写入仍算 mutation。
+    // Control: a successful write still counts as a mutation.
     let mut ok = Vec::new();
     ok.push(pb_write_file_msg_with_content(
         "in-root.json",
@@ -2277,12 +2383,12 @@ fn write_blocked_outside_root_path_parses_and_classifies() {
         classify_tool_result_progress(text),
         ToolResultProgressStatus::BlockedOutsideWorkspace("/out/p.json".to_string())
     );
-    // 普通失败（非 write-blocked）仍归类为 Failure。
+    // An ordinary failure (not write-blocked) is still classified as Failure.
     assert_eq!(
         classify_tool_result_progress("Error: read_file failed: File not found"),
         ToolResultProgressStatus::Failure
     );
-    // 无 marker 文本不误匹配。
+    // Text without the marker does not match.
     assert!(write_blocked_outside_root_path("Successfully wrote to /x").is_none());
 }
 
@@ -2300,7 +2406,7 @@ fn target_repeat_loop_note_mentions_reuse_over_reprobe() {
 fn progress_budget_mutation_action_resets_no_progress() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
-    // 固定在计费区（iteration=30 → soft_threshold=5）。
+    // Pin inside the metered zone (iteration=30 → soft_threshold=5).
     supervisor.iteration = 30;
     for i in 0..4 {
         pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
@@ -2308,7 +2414,7 @@ fn progress_budget_mutation_action_resets_no_progress() {
         assert!(matches!(signal, ToolLoopSignal::None));
     }
     assert_eq!(supervisor.progress.consecutive_no_progress, 4);
-    // 一次真正的变更动作：无进展计数清零。
+    // One real mutation action: the no-progress counter resets to zero.
     messages.push(pb_apply_patch_msg("patch-1"));
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(matches!(signal, ToolLoopSignal::None));
@@ -2319,8 +2425,10 @@ fn progress_budget_mutation_action_resets_no_progress() {
 fn progress_budget_uses_pre_compress_current_round_for_apply_patch_progress() {
     let mut supervisor = TurnSupervisor::default();
     let mut compressed_messages = Vec::new();
-    // 固定在计费区，并预置 4 轮无进展；下一轮若仍按压缩后视图判定，
-    // 会触发 LowProgressSoft。真实当前轮是 apply_patch，必须按原始工具轮清零。
+    // Pin inside the metered zone with 4 no-progress rounds pre-seeded; if the
+    // next round were still judged on the compressed view, LowProgressSoft
+    // would fire. The real current round is apply_patch and must reset the
+    // counter based on the original tool round.
     supervisor.iteration = 30;
     supervisor.progress.consecutive_no_progress = 4;
 
@@ -2525,16 +2633,20 @@ fn task_wait_status_coarse_signatures_ignore_polling_noise() {
 
 #[test]
 fn progress_budget_real_progress_resets_ladder_but_preserves_episode_cooldown() {
-    // 软提示注入后，若模型给出真正推进任务的动作，应重置整个升级阶梯
-    // （soft_injected / ledger_injected / hard_injected / grace），使下一轮无进展
-    // 重新从 soft 开始，而非因 soft_injected 残留直接跳级到 ledger/hard。
-    // 否则长任务中模型只要早期发散过一次，每次收敛提醒都会更快滑向硬停。
+    // After a soft notice is injected, if the model takes an action that truly
+    // advances the task, the whole escalation ladder (soft_injected /
+    // ledger_injected / hard_injected / grace) must reset so the next
+    // no-progress round starts over from soft instead of skipping to
+    // ledger/hard because of residual soft_injected. Otherwise, in long tasks
+    // a single early divergence makes every subsequent refocusing reminder
+    // slide to a hard stop faster.
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
-    // 固定在计费区（iteration=30 -> over=10 -> soft_threshold=5）。
+    // Pin inside the metered zone (iteration=30 -> over=10 -> soft_threshold=5).
     supervisor.iteration = 30;
 
-    // 阶段一：连续 5 轮无信息增益（失败读取）累计到 soft_threshold=5，触发软提示。
+    // Phase 1: 5 consecutive no-information-gain rounds (failed reads)
+    // accumulate to soft_threshold=5, firing the soft notice.
     let mut last = ToolLoopSignal::None;
     for i in 0..5 {
         pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
@@ -2543,7 +2655,8 @@ fn progress_budget_real_progress_resets_ladder_but_preserves_episode_cooldown() 
     assert!(matches!(last, ToolLoopSignal::LowProgressSoft));
     assert!(supervisor.progress.soft_injected);
 
-    // 阶段二：一次真正的变更动作（apply_patch）-> 实质进展，重置整个升级阶梯。
+    // Phase 2: one real mutation action (apply_patch) -> substantive progress,
+    // resetting the whole escalation ladder.
     messages.push(pb_apply_patch_msg("patch-1"));
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
     assert!(matches!(signal, ToolLoopSignal::None));
@@ -2552,8 +2665,11 @@ fn progress_budget_real_progress_resets_ladder_but_preserves_episode_cooldown() 
     assert!(!supervisor.progress.hard_injected);
     assert_eq!(supervisor.progress.consecutive_no_progress, 0);
 
-    // 阶段三：再次连续 5 轮无信息增益时，升级阶梯已经重置，但 episode cooldown
-    // 会抑制同一 soft 的高频重复，避免复杂任务被「推进一点、再提示一次」持续打断。
+    // Phase 3: with another 5 consecutive no-information-gain rounds, the
+    // escalation ladder has been reset, but the episode cooldown suppresses
+    // high-frequency repetition of the same soft notice so complex tasks are
+    // not constantly interrupted by "make a bit of progress, get noticed
+    // again".
     for i in 0..5 {
         pb_failed_read_round(&mut messages, &format!("src/g{i}.rs"), &format!("r2-{i}"));
         last = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
@@ -2565,7 +2681,8 @@ fn progress_budget_real_progress_resets_ladder_but_preserves_episode_cooldown() 
     assert!(!supervisor.progress.soft_injected);
     assert!(!supervisor.progress.ledger_injected);
 
-    // cooldown 到期后，若仍无进展，新的 episode 重新从 soft 开始，不会跳级。
+    // After the cooldown expires, if there is still no progress, a new episode
+    // restarts from soft without skipping levels.
     supervisor.iteration = supervisor.progress.next_episode_iteration;
     pb_failed_read_round(&mut messages, "src/g-final.rs", "r2-final");
     last = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
@@ -2578,8 +2695,9 @@ fn progress_budget_real_progress_resets_ladder_but_preserves_episode_cooldown() 
 fn progress_budget_escalates_soft_then_ledger_then_hard() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
-    // 长任务后段仍使用稳定 soft_threshold=5；soft 后先给固定响应窗口，再进入
-    // ledger，最后到 soft_threshold + margin 才 hard stop。
+    // The late phase of long tasks still uses the stable soft_threshold=5;
+    // after soft there is a fixed response window, then the ledger stage, and
+    // only at soft_threshold + margin does the hard stop happen.
     supervisor.iteration = 50;
     let mut signals = Vec::new();
     for i in 0..(5 + PROGRESS_NO_PROGRESS_HARD_MARGIN) {
@@ -2616,7 +2734,8 @@ fn progress_budget_escalates_soft_then_ledger_then_hard() {
 fn progress_budget_grace_window_pauses_escalation_on_new_reasoning() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
-    // iteration=30 后连续 5 轮触发 soft；soft 自身先给所有模型固定响应窗口。
+    // 5 consecutive rounds after iteration=30 trigger soft; soft itself first
+    // grants every model a fixed response window.
     supervisor.iteration = 30;
     let mut last = ToolLoopSignal::None;
     for i in 0..5 {
@@ -2628,7 +2747,8 @@ fn progress_budget_grace_window_pauses_escalation_on_new_reasoning() {
     assert!(supervisor.progress.soft_injected);
     let base_grace_until = supervisor.progress.grace_until_iteration;
 
-    // 响应窗口内即使模型不暴露 reasoning，也不会在 soft 下一轮立刻收到 ledger。
+    // Within the response window, even a model that exposes no reasoning does
+    // not immediately receive the ledger on the round after soft.
     supervisor.next_iteration();
     pb_failed_read_round_reasoning(&mut messages, "src/g.rs", "r-grace", None);
     let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
@@ -2640,7 +2760,8 @@ fn progress_budget_grace_window_pauses_escalation_on_new_reasoning() {
     assert_eq!(supervisor.progress.grace_until_iteration, base_grace_until);
     assert!(!supervisor.progress.grace_consumed);
 
-    // 在基础窗口内推进到最后一轮，reasoning 保持不变。
+    // Advance to the final round inside the base window with reasoning
+    // unchanged.
     while supervisor.iteration + 1 < base_grace_until {
         supervisor.next_iteration();
         let id = format!("r-base-{}", supervisor.iteration);
@@ -2656,7 +2777,8 @@ fn progress_budget_grace_window_pauses_escalation_on_new_reasoning() {
         ));
     }
 
-    // 基础窗口到期时给出实质不同的理由，可额外延长一次。
+    // Giving a substantively different rationale when the base window expires
+    // buys one extra extension.
     supervisor.next_iteration();
     pb_failed_read_round_reasoning(
         &mut messages,
@@ -2669,7 +2791,8 @@ fn progress_budget_grace_window_pauses_escalation_on_new_reasoning() {
     assert!(supervisor.progress.grace_consumed);
     assert!(supervisor.progress.grace_until_iteration > base_grace_until);
 
-    // grace 到期后即使 reasoning 再变化，也不能继续滚动续期。
+    // After grace expires, further reasoning changes must not keep rolling the
+    // extension forward.
     let grace_until = supervisor.progress.grace_until_iteration;
     supervisor.iteration = grace_until;
     pb_failed_read_round_reasoning(

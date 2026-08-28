@@ -1,27 +1,27 @@
 use crate::ai::stream::render::code::{MONOKAI_BG, MONOKAI_FG};
 
-/// 终端默认把 East-Asian **Ambiguous** 宽度字符（箭头 `→`、数学符号 `× ± ≤ ≥ ≠`、
-/// box-drawing、braille 等）按单列渲染，只有真正的 Wide/全角字符（CJK 等）才占 2 列。
-/// `width_cjk` 会把所有 ambiguous 字符算成 2 列，导致表格边框、cursor-up 高度整体漂移
-/// （尤其是含 `→` 的单元格右边框被逐行拉偏）。因此这里统一用 `width`（ambiguous=1）。
+/// Terminals by default render East-Asian **Ambiguous** width characters (arrows `→`, math symbols `× ± ≤ ≥ ≠`,
+/// box-drawing, braille, etc.) as single-column; only true Wide/fullwidth characters (CJK, etc.) take 2 columns.
+/// `width_cjk` counts every ambiguous character as 2 columns, shifting table borders and cursor-up heights overall
+/// (especially dragging right borders of cells containing `→` off by a line). So this module consistently uses `width` (ambiguous=1).
 pub(super) fn terminal_cell_width(ch: char) -> usize {
-    // Emoji variation selector（U+FE0F）本身宽度 0，但它把前一个 base 符号从
-    // 文本呈现（1 列）强制成 emoji 呈现（2 列）。真实终端据此渲染，例如 `⚠️`
-    // （U+26A0 + U+FE0F）占 2 列。若按 unicode-width 的 0 计算，表格/预览会比
-    // 终端实际显示窄 1 列，导致行被硬折行、cursor-up 擦除行数算少、旧表头残留
-    // 堆叠。这里把 VS16 计为 1 列，等价于给 base 补上被撑开的那一列。
+    // The emoji variation selector (U+FE0F) has width 0 itself, but it forces the preceding base symbol from
+    // text presentation (1 column) into emoji presentation (2 columns). Real terminals render it that way; e.g. `⚠️`
+    // (U+26A0 + U+FE0F) takes 2 columns. Counting it as unicode-width's 0 would make tables/previews one column
+    // narrower than the terminal actually shows, causing hard line wraps, under-counted cursor-up erase lines, and stale
+    // header residue stacking up. Here VS16 is counted as 1 column, giving the base the extra column it expands into.
     if ch == '\u{fe0f}' {
         return 1;
     }
     if is_single_width_terminal_symbol(ch) {
         return 1;
     }
-    // 现代 macOS 终端把 Miscellaneous Symbols（U+2600-U+26FF）、
-    // Miscellaneous Technical（U+2300-U+23FF）、Dingbats（U+2700-U+27BF）
-    // 以及部分 Geometric Shapes 里的评分/涨跌标记（△▽▲▼）等块中的
-    // ambiguous-width 符号当作 emoji 渲染为 2 列。unicode-width
-    // 对这些字符返回 1（ambiguous），但终端实际占 2 列。若不修正，含 ⚠ ☎ ✂
-    // 或 `4.0→4.0 △` 这类涨跌标记的单元格右边框会被逐行拉偏。
+    // Modern macOS terminals render Miscellaneous Symbols (U+2600-U+26FF),
+    // Miscellaneous Technical (U+2300-U+23FF), Dingbats (U+2700-U+27BF),
+    // and the ambiguous-width symbols in some blocks such as Geometric Shapes rating/up-down markers (△▽▲▼)
+    // as emoji at 2 columns. unicode-width
+    // returns 1 (ambiguous) for these characters, but the terminal actually uses 2. Without a fix, cells containing ⚠ ☎ ✂
+    // or `4.0→4.0 △`-style markers get their right border dragged off line by line.
     if is_ambiguous_emoji_block_char(ch) {
         return 2;
     }
@@ -33,7 +33,7 @@ pub(super) fn terminal_display_width(s: &str) -> usize {
     let mut prev_was_emoji_block = false;
     for ch in s.chars() {
         if ch == '\u{fe0f}' && prev_was_emoji_block {
-            // 前一个字符已经是 emoji 块字符（按 2 列计算），VS16 不额外占宽
+            // The previous char is already an emoji-block character (counted as 2 columns); VS16 adds no extra width
             prev_was_emoji_block = false;
             continue;
         }
@@ -71,39 +71,39 @@ fn is_single_width_terminal_symbol(ch: char) -> bool {
     )
 }
 
-/// 判断字符是否属于"终端按 emoji 渲染为 2 列"的 Unicode 块。
+/// Whether the character belongs to a Unicode block the terminal renders as emoji at 2 columns.
 ///
-/// 这些块里的字符在 Unicode 里是 East Asian Ambiguous 宽度（unicode-width 返回 1），
-/// 但现代 macOS 终端用 Apple Color Emoji 字体渲染它们，实际占 2 列。
-/// 本身就是 Wide 的 emoji（✅ ❌ 等）已由 unicode-width 正确返回 2，无需处理。
+/// Characters in these blocks are East Asian Ambiguous width in Unicode (unicode-width returns 1),
+/// but modern macOS terminals render them with the Apple Color Emoji font, actually using 2 columns.
+/// Inherently Wide emoji (✅ ❌, etc.) already return 2 from unicode-width and need no handling.
 fn is_ambiguous_emoji_block_char(ch: char) -> bool {
     let c = ch as u32;
     matches!(
         c,
-        // Miscellaneous Technical: ⌚ ⌛ ⏰ 等
+        // Miscellaneous Technical: ⌚ ⌛ ⏰ etc.
         0x2300..=0x23FF
-            // Miscellaneous Symbols: ☀ ☁ ⚠ ☎ ⚡ 等
+            // Miscellaneous Symbols: ☀ ☁ ⚠ ☎ ⚡ etc.
             | 0x2600..=0x26FF
-            // Dingbats: ✂ ✆ ✈ ✉ ✌ ✍ ✎ ✏ ✓ ✔ ✨ 等
+            // Dingbats: ✂ ✆ ✈ ✉ ✌ ✍ ✎ ✏ ✓ ✔ ✨ etc.
             | 0x2700..=0x27BF
-            // Geometric Shapes 中常见的涨跌/评分三角标记：△ ▲ ▽ ▼
+            // Common rating/up-down triangle markers in Geometric Shapes: △ ▲ ▽ ▼
             | 0x25B2 | 0x25B3 | 0x25BC | 0x25BD
     )
 }
 
-/// 把紧贴文件名/链接的中文标点（`：` `，` `。`）转成英文版（`:` `,` `.`）。
+/// Convert CJK punctuation (`：` `，` `。`) adjacent to file names / links into their ASCII forms (`:` `,` `.`).
 ///
-/// Agent 常把中文标点和文件名/行号或链接连在一起输出，如 `src/foo.rs：42`、
-/// `调用时机： app.py:334`、`https://x.com，详见`。全角标点会让终端无法识别
-/// file:line / URL 边界，导致无法点击跳转。标点前是路径/链接常见字符时直接转换；
-/// 标点前是普通中文时，仅在其后（允许空格及行内代码标记）确实跟着可点击目标时转换，
-/// 避免误伤 `时间：12点` 这类纯中文语境。
+/// Agents often emit CJK punctuation glued to file names / line numbers or links, e.g. `src/foo.rs：42`,
+/// `调用时机： app.py:334`, `https://x.com，详见`. Fullwidth punctuation keeps the terminal from recognizing
+/// file:line / URL boundaries, breaking click-to-jump. Convert directly when the char before the punctuation is common in paths/links;
+/// when it follows ordinary Chinese text, convert only if a clickable target actually follows (allowing spaces and inline code markers),
+/// avoiding collateral damage to purely Chinese contexts like `时间：12点`.
 fn normalize_cjk_punct_around_path(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev: Option<char> = None;
     let mut i = 0;
     while i < s.len() {
-        // code / math span 是 Markdown 字面量，不能为了终端跳转而改写其内容。
+        // code / math spans are Markdown literals; their content must not be rewritten for terminal jump links.
         if let Some((span, next)) = take_atomic_markdown_span(s, i)
             && (span.starts_with('`') || span.starts_with('$'))
         {
@@ -122,7 +122,7 @@ fn normalize_cjk_punct_around_path(s: &str) -> String {
             _ => ch,
         };
         out.push(replaced);
-        // 用原始字符判断前文，避免连续全角标点连锁转换（如 `：：` 只转第一个）。
+        // Inspect the preceding char in its original form so consecutive fullwidth punctuation does not chain-convert (`：：` converts only the first).
         prev = Some(ch);
         i += ch.len_utf8();
     }
@@ -137,11 +137,11 @@ fn is_path_neighbor(ch: char) -> bool {
     )
 }
 
-/// 判断全角标点右侧是否紧跟终端通常可点击的路径 / URL。
+/// Whether the right side of a fullwidth punctuation mark is immediately followed by a path / URL the terminal can usually click.
 ///
-/// Markdown 行内代码里的 `app.py:334` 仍是终端链接目标，因此识别其内容；数学 span
-/// 则保持字面量，不参与判断。这里只接受带路径分隔符、文件扩展名或 URL scheme 的目标，
-/// 不能把 `时间：12点` 之类普通中文后的数字误判为文件。
+/// `app.py:334` inside Markdown inline code is still a terminal link target, so its content is recognized; math spans
+/// stay literal and do not participate. Only targets with a path separator, file extension, or URL scheme are accepted,
+/// so a number after ordinary Chinese like `时间：12点` is never mistaken for a file.
 fn starts_clickable_terminal_target(s: &str, mut start: usize) -> bool {
     while let Some(ch) = s.get(start..).and_then(|rest| rest.chars().next()) {
         if !matches!(ch, ' ' | '\t') {
@@ -207,7 +207,7 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
     let mut bold = false;
     let mut italic = false;
     let mut code = false;
-    // math 状态在新实现里只在配对成功的局部分支内短暂为 true，循环外恒为 false。
+    // In the new implementation the math state is briefly true only inside the local paired-success branch; it is always false outside the loop.
     let mut math = false;
 
     fn apply_style(out: &mut String, base: &str, bold: bool, italic: bool, code: bool, math: bool) {
@@ -256,9 +256,9 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
     }
 
     while i < bytes.len() {
-        // 反引号 `code`：必须找到配对的闭合反引号才开启样式，否则按字面字符输出。
-        // 旧实现是无脑切换 `code = !code`，模型若输出"use `cargo run to test"
-        // （单个未闭合反引号），剩余整行都会被着上代码块背景色。
+        // Backtick `code`: open the style only when the paired closing backtick is found, otherwise emit literal characters.
+        // The old implementation blindly toggled `code = !code`; if the model emitted "use `cargo run to test"
+        // (a single unclosed backtick), the whole rest of the line got the code-block background.
         if bytes[i] == b'`' && !math {
             if let Some(close) = find_unescaped_delim(s, i + 1, "`") {
                 let content = &s[i + 1..close - 1];
@@ -275,14 +275,14 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
             continue;
         }
 
-        // **bold**：同样要求配对。模型常输出未闭合的 "**Note:" 或 "5 ** 3"，
-        // 旧实现会让其后整段都加粗。
+        // **bold**: also requires pairing. Models often emit unclosed "**Note:" or "5 ** 3",
+        // which the old implementation bolded for the entire following span.
         if !code && !math && bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
             if let Some(close) = find_unescaped_delim(s, i + 2, "**") {
                 let content = &s[i + 2..close - 2];
                 bold = true;
                 apply_style(&mut out, base, bold, italic, code, math);
-                // bold 内部仍可能含 italic / code，递归处理保证嵌套样式正确。
+                // bold interiors may still contain italic / code; recursion keeps nested styles correct.
                 out.push_str(&render_inline_md(content, base));
                 bold = false;
                 apply_style(&mut out, base, bold, italic, code, math);
@@ -294,7 +294,7 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
             continue;
         }
 
-        // *italic*：同上。"5 * 3 = 15" 不应被当成 italic 触发。
+        // *italic*: same as above. "5 * 3 = 15" must not trigger italic.
         if !code && !math && bytes[i] == b'*' {
             if let Some(close) = find_unescaped_delim(s, i + 1, "*") {
                 let content = &s[i + 1..close - 1];
@@ -344,7 +344,7 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
             continue;
         }
 
-        // \(math\) 行内公式：要求配对，与 $...$ 同等处理。
+        // \(math\) inline math: requires pairing, handled the same as $...$.
         if !code && !math && bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             if let Some(close) = find_unescaped_delim(s, i + 2, "\\)") {
                 let content = &s[i + 2..close - 2];
@@ -358,14 +358,14 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
                 i = close;
                 continue;
             }
-            // 未配对：按字面输出
+            // Unpaired: emit literally
             out.push('\\');
             i += 1;
             continue;
         }
 
-        // $math$ / $$display$$：要求配对，避免把单独的"$5"、"$PATH"等 $ 字符
-        // 误识为公式起点，把行尾全部当成 LaTeX 渲染。
+        // $math$ / $$display$$: requires pairing, so lone $ characters like "$5" or "$PATH" are not
+        // mistaken for math starts that render the rest of the line as LaTeX.
         if !code && bytes[i] == b'$' && !math {
             let is_double = i + 1 < bytes.len() && bytes[i + 1] == b'$';
             let delim = if is_double { "$$" } else { "$" };
@@ -381,7 +381,7 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
                 i = close;
                 continue;
             }
-            // 未配对：按字面输出
+            // Unpaired: emit literally
             out.push('$');
             i += 1;
             continue;
@@ -471,7 +471,7 @@ fn strip_inline_md_markers(s: &str) -> String {
                 continue;
             }
         }
-        // \(math\) 行内公式
+        // \(math\) inline math
         if !code && !math && bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             if let Some(end) = find_unescaped_delim(s, i + 2, "\\)") {
                 out.push_str(&crate::ai::stream::render_math_tex_to_unicode(
@@ -480,7 +480,7 @@ fn strip_inline_md_markers(s: &str) -> String {
                 i = end;
                 continue;
             }
-            // 未配对：输出原字符
+            // Unpaired: emit the original characters
         }
         let ch = s[i..].chars().next().unwrap();
         if math && !code {
@@ -643,8 +643,8 @@ fn wrap_overlong_atomic_markdown_span(s: &str, width: usize) -> Vec<String> {
     let Some((prefix, inner, suffix)) = split_atomic_markdown_span(s) else {
         return wrap_plain_visible_text(s, width);
     };
-    // `\(...\)` 内可能包含 `\alpha` 这类不可拆分的 TeX 控制词。先整体渲染成
-    // Unicode，再按终端宽度换行，避免通用字符切分把命令拆成 `\alp` / `ha`。
+    // `\(...\)` may contain inseparable TeX control words like `\alpha`. Render the whole run to
+    // Unicode first, then wrap by terminal width, so generic character splitting cannot cut a command into `\alp` / `ha`.
     let rendered_inner;
     let inner = if prefix == "\\(" {
         rendered_inner = crate::ai::stream::render_math_tex_to_unicode(inner);
@@ -745,7 +745,7 @@ fn take_atomic_markdown_span(s: &str, start: usize) -> Option<(String, usize)> {
         return Some((s[start..end].to_string(), end));
     }
 
-    // \(math\) 行内公式
+    // \(math\) inline math
     if rest.starts_with("\\(") {
         let end = find_unescaped_delim(s, start + 2, "\\)")?;
         return Some((s[start..end].to_string(), end));
@@ -857,8 +857,8 @@ mod tests {
 
     #[test]
     fn terminal_width_counts_ambiguous_symbols_as_single_width() {
-        // 箭头/数学符号是 East-Asian Ambiguous 宽度：终端按 1 列渲染。
-        // 若按 width_cjk 算成 2 列，含 `→` 的表格单元格右边框会被逐行拉偏。
+        // Arrows / math symbols are East-Asian Ambiguous width: terminals render them at 1 column.
+        // Counting them as 2 columns via width_cjk would drag right borders of cells containing `→` off line by line.
         for ch in ['→', '←', '↔', '×', '±', '≤', '≥', '≠', '∈', '⊂'] {
             assert_eq!(
                 terminal_cell_width(ch),
@@ -866,7 +866,7 @@ mod tests {
                 "ambiguous-width symbol {ch:?} must render as a single terminal column"
             );
         }
-        // 真正的全角/CJK 字符仍占 2 列，不受影响。
+        // True fullwidth / CJK characters still take 2 columns and are unaffected.
         for ch in ['中', '文', '你', '好'] {
             assert_eq!(
                 terminal_cell_width(ch),
@@ -874,9 +874,9 @@ mod tests {
                 "CJK char {ch:?} stays double-width"
             );
         }
-        // 含箭头的结果单元格：3 个可见字符（→ 空格 x）应为 3 列，而非 4。
+        // A result cell containing an arrow: 3 visible chars (→ space x) should be 3 columns, not 4.
         assert_eq!(terminal_display_width("→ x"), 3);
-        // emoji 块的 ambiguous 字符（⚠ ☎ ✂）现代终端按 2 列渲染。
+        // Ambiguous emoji-block characters (⚠ ☎ ✂) render at 2 columns in modern terminals.
         for ch in ['⚠', '☎', '✂', '☀', '✈'] {
             assert_eq!(
                 terminal_cell_width(ch),
@@ -884,27 +884,27 @@ mod tests {
                 "emoji-block symbol {ch:?} must render as double width"
             );
         }
-        // emoji 块字符 + 数字 = 3 列（emoji 2 + 数字 1）。
+        // Emoji-block char + digit = 3 columns (emoji 2 + digit 1).
         assert_eq!(terminal_display_width("⚠1"), 3);
     }
 
     #[test]
     fn terminal_width_counts_emoji_presentation_as_double_width() {
-        // 带 emoji variation selector（U+FE0F）的符号，真实终端按 emoji 呈现占 2 列。
-        // `⚠️` = U+26A0 + U+FE0F：base 是 ambiguous(1) + VS16(补 1) = 2 列。
+        // A symbol with an emoji variation selector (U+FE0F) takes 2 columns via emoji presentation in real terminals.
+        // `⚠️` = U+26A0 + U+FE0F: base is ambiguous(1) + VS16(adds 1) = 2 columns.
         assert_eq!(terminal_display_width("⚠️"), 2);
-        // 现代 macOS 终端把 Miscellaneous Symbols 块的字符当作 emoji 渲染为 2 列，
-        // 即使没有 VS16。⚠（U+26A0）属于此块。
+        // Modern macOS terminals render Miscellaneous Symbols block characters as emoji at 2 columns,
+        // even without VS16. ⚠ (U+26A0) belongs to this block.
         assert_eq!(terminal_display_width("⚠"), 2);
-        // 本身即 emoji-presentation 的字符（unicode-width 判为 2）不受影响。
+        // Characters with inherent emoji presentation (unicode-width says 2) are unaffected.
         assert_eq!(terminal_display_width("✅"), 2);
         assert_eq!(terminal_display_width("❌"), 2);
-        // macOS 终端里的涨跌/评分三角标记也会占 2 列。
+        // Up-down / rating triangle markers also take 2 columns in macOS terminals.
         assert_eq!(terminal_display_width("△"), 2);
         assert_eq!(terminal_display_width("▲"), 2);
         assert_eq!(terminal_display_width("▽"), 2);
         assert_eq!(terminal_display_width("▼"), 2);
-        // VS16 单独出现时贡献 1 列（等价于给紧邻 base 补足被撑开的那一列）。
+        // A lone VS16 contributes 1 column (equivalent to giving the adjacent base the column it expands into).
         assert_eq!(terminal_cell_width('\u{fe0f}'), 1);
     }
 
@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn unclosed_backtick_is_not_styled() {
-        // 未配对反引号：应原样输出为字面字符，绝不开启 code 背景色。
+        // Unclosed backtick: must be emitted as a literal character, never opening the code background.
         let rendered = render_inline_md("use `cargo to test", "");
         assert!(!rendered.contains(MONOKAI_BG));
         assert!(!rendered.contains(MONOKAI_FG));
@@ -953,7 +953,7 @@ mod tests {
 
     #[test]
     fn unclosed_asterisk_does_not_italicize_rest_of_line() {
-        // "5 * 3 = 15"：单 * 不应触发 italic，整段不应包含 \x1b[3m。
+        // "5 * 3 = 15": a single * must not trigger italic; the output must not contain \x1b[3m.
         let rendered = render_inline_md("5 * 3 = 15", "");
         assert!(!rendered.contains("\x1b[3m"));
         assert!(rendered.contains("5 * 3 = 15"));
@@ -968,7 +968,7 @@ mod tests {
 
     #[test]
     fn standalone_dollar_sign_is_literal() {
-        // "$5 USD" 不应被当成 math 起点，整段不应触发 math 颜色 \x1b[95m。
+        // "$5 USD" must not be taken as a math start; the output must not trigger the math color \x1b[95m.
         let rendered = render_inline_md("price: $5 USD", "");
         assert!(!rendered.contains("\x1b[95m"));
         assert!(rendered.contains("$5 USD"));
@@ -999,7 +999,7 @@ mod tests {
 
     #[test]
     fn paren_math_renders_inline() {
-        // \(x_1\) 应识别为行内数学并渲染下标
+        // \(x_1\) should be recognized as inline math with the subscript rendered
         let rendered = render_inline_md(r"其中 \(x_1\) 是变量", "");
         assert!(rendered.contains("x₁"), "got: {rendered}");
         assert!(
@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn paren_math_in_markdown_table_cell() {
-        // 表格单元格内 \(...\) 也能被 strip_inline_md_markers 处理
+        // \(...\) inside a table cell is also handled by strip_inline_md_markers
         let stripped = strip_inline_md_markers(r"公式 \(NCF_0=-8600\)");
         assert!(stripped.contains("NCF₀=-8600"), "got: {stripped}");
         assert!(!stripped.contains("\\("), "got: {stripped}");
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn unpaired_paren_math_is_literal() {
-        // 未配对的 \( 应作为字面文本输出
+        // An unpaired \( must be emitted as literal text
         let rendered = render_inline_md(r"半公式 \(x_1", "");
         assert!(rendered.contains(r"\(x_1"), "got: {rendered}");
     }

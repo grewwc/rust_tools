@@ -9,29 +9,29 @@ use crate::ai::config_schema::AiConfig;
 use crate::ai::skills::SkillManifest;
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 
-/// 模型通过 `activate_skill` / `deactivate_skill` 工具请求的 skill 变更动作（待
-/// driver 在下一个 iteration 读取并应用）。
+/// Skill change actions requested by the model via the `activate_skill` / `deactivate_skill` tools (to be
+/// read and applied by the driver on the next iteration).
 ///
-/// 工具是纯函数 `fn(&Value) -> Result<String, String>`，拿不到 `App`，因此沿用
-/// `enable_tools.rs` 的"工具写全局状态 → driver 读取"桥接模式。这里只需要一个
-/// 极小的待激活槽位，故用单个 `RwLock<FastMap>` 而非完整状态结构。支持多 skill
-/// 同时激活：`Add` 追加到活动集，`Remove` 从活动集移除。同一 turn 内多次调用会
-/// 按调用顺序累积为队列，driver 一次性全部应用（不做"后写覆盖"）。
+/// Tools are pure functions `fn(&Value) -> Result<String, String>` with no access to `App`, so this follows
+/// the `enable_tools.rs` bridging pattern of "tool writes global state → driver reads it". Only a tiny
+/// pending-activation slot is needed, hence a single `RwLock<FastMap>` instead of a full state struct. Multiple skills
+/// can be activated at once: `Add` appends to the active set and `Remove` removes from it. Multiple calls within one turn
+/// accumulate into a queue in call order, and the driver applies all of them at once (no "last write wins").
 
-/// 模型请求的 skill 变更动作。driver 在下一个 iteration 读取并应用到当前活动集。
+/// A skill change action requested by the model. The driver reads it on the next iteration and applies it to the current active set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingSkillAction {
-    /// 追加一个 skill 到当前活动集（已存在则忽略）
+    /// Append a skill to the current active set (ignored if already present)
     Add(String),
-    /// 从当前活动集移除一个 skill
+    /// Remove a skill from the current active set
     Remove(String),
 }
 
 pub(crate) static PENDING_SKILL_ACTIVATION: LazyLock<RwLock<FastMap<(String, usize), Vec<PendingSkillAction>>>> =
     LazyLock::new(|| RwLock::new(FastMap::default()));
 
-/// `request_user_input` 在本轮内记录的明确交互边界。按 `(session_id, turn_id)` 隔离，
-/// 避免并行 subagent 或其他 session 的请求污染当前 foreground turn。
+/// Explicit interaction boundary recorded by `request_user_input` for the current turn. Isolated by `(session_id, turn_id)`
+/// so requests from parallel subagents or other sessions cannot pollute the current foreground turn.
 static PENDING_USER_INPUT_REQUESTS: LazyLock<RwLock<FastSet<(String, usize)>>> =
     LazyLock::new(|| RwLock::new(FastSet::default()));
 
@@ -47,7 +47,7 @@ fn set_pending_skill_action(action: PendingSkillAction) {
     }
 }
 
-/// driver 侧调用：取出并清空本 turn 的全部待处理 skill 变更动作。
+/// Driver-side call: take and clear all pending skill change actions for this turn.
 pub(crate) fn take_pending_skill_action() -> Vec<PendingSkillAction> {
     PENDING_SKILL_ACTIVATION
         .write()
@@ -62,7 +62,7 @@ pub(crate) fn clear_pending_user_input_request() {
     }
 }
 
-/// driver 侧调用：查询并清空本轮的显式用户输入请求。
+/// Driver-side call: query and clear this turn's explicit user input request.
 pub(crate) fn take_pending_user_input_request() -> bool {
     PENDING_USER_INPUT_REQUESTS
         .write()
@@ -76,8 +76,8 @@ pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
         return Err("activate_skill requires a non-empty 'name'.".to_string());
     }
 
-    // 校验"别乱用"：请求的 skill 名必须真实存在。未命中则拒绝，并回列可用
-    // skill 名，引导模型纠正而不是凭空激活。
+    // Guard against misuse: the requested skill name must actually exist. On a miss, refuse and list the available
+    // skill names so the model corrects itself instead of activating something out of thin air.
     let skills = crate::ai::skills::load_all_skills();
     let matched = skills.iter().find(|s| s.name == name);
     let Some(skill) = matched else {
@@ -115,8 +115,8 @@ pub(crate) fn execute_deactivate_skill(args: &Value) -> Result<String, String> {
     ))
 }
 
-/// 标记当前 skill 正在等待用户输入。工具结果仅供模型接续生成面向用户的问题；
-/// 真正的跨轮状态由 driver 在本 turn 结束时保存，避免工具层直接修改会话状态。
+/// Mark the current skill as waiting for user input. The tool result only lets the model continue generating a user-facing question;
+/// the real cross-turn state is saved by the driver at the end of the turn, keeping session state out of the tool layer.
 pub(crate) fn execute_request_user_input(args: &Value) -> Result<String, String> {
     let question = args["question"].as_str().unwrap_or("").trim();
     if question.is_empty() {
@@ -139,9 +139,9 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_activate_skill,
-        // skill 发现/激活是低频能力：默认不随每轮 core 展开常驻，模型按需经
-        // `enable_tools` 启用，压缩每轮 tools schema token。仍保留 builtin 组，
-        // 保证可被动态启用。
+        // Skill discovery/activation is a low-frequency capability: it does not ship in the per-turn core set by default; the model enables it on demand via
+        // `enable_tools`, trimming per-turn tools schema tokens. The builtin group is kept
+        // so it can still be enabled dynamically.
     }
 });
 
@@ -151,7 +151,7 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_deactivate_skill,
-        // 与 activate_skill 同属低频控制工具：默认不常驻，按需经 enable_tools 启用。
+        // A low-frequency control tool like activate_skill: not resident by default, enabled on demand via enable_tools.
     }
 });
 
@@ -161,7 +161,7 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_request_user_input,
-        // 这是 driver 直接按名称注入的控制工具，不能通过 manifest 的 tool_groups 暴露。
+        // This is a control tool injected directly by name from the driver; it must not be exposed via manifest tool_groups.
     }
 });
 
@@ -186,7 +186,7 @@ fn render_skill_catalog(skills: &[SkillManifest], query: &str, limit: usize) -> 
                 || skill.description.to_lowercase().contains(&query)
         })
         .collect::<Vec<_>>();
-    // catalog 是发现入口而非排序候选，固定按名字列出以免把 priority 误解为推荐分数。
+    // The catalog is a discovery entry point, not a ranked candidate list; always list by name so priority is not mistaken for a recommendation score.
     matches.sort_by(|a, b| a.name.cmp(&b.name));
 
     if matches.is_empty() {
@@ -202,7 +202,7 @@ fn render_skill_catalog(skills: &[SkillManifest], query: &str, limit: usize) -> 
     let total = matches.len();
     let shown = total.min(limit);
     let mut out = format!("Installed skills ({shown} shown of {total}):\n");
-    // 统计父 skill -> 子 skill 数量，用于给父 skill 加标注
+    // Count parent skill -> child skill edges, used to annotate parent skills
     let mut parent_has_children: FastSet<String> = FastSet::default();
     for s in skills.iter() {
         if let Some(p) = s.parent.as_deref() {
@@ -238,7 +238,7 @@ fn render_skill_catalog(skills: &[SkillManifest], query: &str, limit: usize) -> 
         "This catalog is metadata only and does not activate a skill. Call `activate_skill(name=...)` only when one listed skill clearly and materially helps the current task.",
     );
     if parent_has_children.is_empty() {
-        // 无子 skill 时不额外提示
+        // No extra hint when there are no child skills
     } else {
         out.push_str(" Sub-skills can be activated independently via `activate_skill`; parent skills list their sub-skills in `load_skill`.");
     }
@@ -260,18 +260,18 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-/// 采集 `resource_path` 下的文件列表（相对路径），用于 `load_skill` / 资源工具的展示。
-/// `subdir` 需为安全的相对路径（仅允许单级 category 或空），内部会校验不穿越且 canonical 后仍在 base 内。
+/// Collect the file listing (relative paths) under `resource_path` for `load_skill` / resource tool display.
+/// `subdir` must be a safe relative path (only a single-level category or empty); internally validated against traversal and canonicalized to stay inside base.
 fn collect_resource_files(resource_path: &str, subdir: Option<&str>) -> Vec<String> {
     use std::path::Path;
     let base = Path::new(resource_path);
-    // 先校验 base 存在且可 canonicalize（防 symlink 攻击前置检查）
+    // First verify base exists and is canonicalizable (front-running check against symlink attacks)
     let Ok(canonical_base) = std::fs::canonicalize(base) else {
-        // base 不存在或不可解析时返回空（调用方已处理 resource_path 不存在的情况）
+        // Return empty when base is missing or unresolvable (the caller already handles a missing resource_path)
         if !base.is_dir() {
             return Vec::new();
         }
-        // 退化：base 存在但 canonicalize 失败（如权限），仍尝试直接列
+        // Degraded case: base exists but canonicalize fails (e.g. permissions); still try listing directly
         let mut files = Vec::new();
         collect_files_recursive(base, base, &mut files, 120);
         rust_tools::sortw::stable_sort_by(&mut files, |a, b| a.cmp(b));
@@ -280,29 +280,29 @@ fn collect_resource_files(resource_path: &str, subdir: Option<&str>) -> Vec<Stri
     let target_base = match subdir {
         Some(s) if !s.trim().is_empty() => {
             let cleaned = s.trim().trim_matches('/').replace('\\', "/");
-            // 严格校验：不允许 `..`、绝对路径、含 `/` 的多级穿越
+            // Strict validation: no `..`, absolute paths, or multi-level traversal containing `/`
             if cleaned.is_empty() || cleaned.contains("..") || Path::new(&cleaned).is_absolute() {
                 return Vec::new();
             }
-            // category 仅允许单段且为常见资源目录
+            // category must be a single segment from the common resource dirs
             if cleaned.contains('/') {
                 return Vec::new();
             }
-            // 白名单校验（与文档一致）
+            // Whitelist validation (consistent with the docs)
             const ALLOWED_CATEGORIES: &[&str] = &["references", "examples", "scripts"];
             if !ALLOWED_CATEGORIES.contains(&cleaned.as_str()) {
                 return Vec::new();
             }
             let joined = base.join(&cleaned);
-            // canonical 校验：若目标存在则必须仍在 base 内；不存在则视为合法空目录
+            // Canonical check: if the target exists it must still be inside base; if missing, treat as a legitimately empty dir
             match std::fs::canonicalize(&joined) {
                 Ok(canonical_joined) if !canonical_joined.starts_with(&canonical_base) => {
                     return Vec::new();
                 }
                 Ok(canonical_joined) => canonical_joined,
                 Err(_) => {
-                    // 目标不存在时检查 joined 的 parent 是否仍在 base 内（防 `references/../etc` 类构造）
-                    // 已通过 `..` 检查，此处认为不存在即空
+                    // When the target is missing, check that the joined parent is still inside base (blocks `references/../etc`-style constructs)
+                    // already covered by the `..` check; treat missing as empty here
                     return Vec::new();
                 }
             }
@@ -340,7 +340,7 @@ fn collect_files_recursive(root: &std::path::Path, cur: &std::path::Path, out: &
     }
 }
 
-/// 渲染 load_skill 的返回：头部元信息 + skill 正文（+ 可选 bundled 资源目录）。
+/// Render the load_skill return: header metadata + skill body (+ optional bundled resource listing).
 fn render_loaded_skill_with_all(skill: &SkillManifest, all: &[SkillManifest]) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Skill: {}\n", skill.name));
@@ -369,7 +369,7 @@ fn render_loaded_skill_with_all(skill: &SkillManifest, all: &[SkillManifest]) ->
             out.push('\n');
         }
     }
-    // 只有当 skill 真带 bundled 资源时才暴露其目录，并列出 references/examples/scripts 等文件。
+    // Only expose the resource dir when the skill actually bundles resources, listing files like references/examples/scripts.
     if let Some(resource_path) = skill.resource_path.as_deref()
         && !resource_path.trim().is_empty()
     {
@@ -389,7 +389,7 @@ fn render_loaded_skill_with_all(skill: &SkillManifest, all: &[SkillManifest]) ->
             }
             out.push_str("Use `read_skill_resource(name, path)` or `read_file` with the absolute resource directory to read any file.\n");
         }
-        // 列出子 skill（由调用方传入的 all，避免全量 IO 重复）
+        // List child skills (passed in by the caller as all, avoiding duplicated full IO)
     }
     let children: Vec<&SkillManifest> = all.iter().filter(|s| s.parent.as_deref() == Some(skill.name.as_str())).collect();
     if !children.is_empty() {
@@ -446,7 +446,7 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// ===== 新增：读取 skill 资源的工具 =====
+// ===== New: tools for reading skill resources =====
 
 fn resolve_skill_for_resource(name: &str) -> Result<SkillManifest, String> {
     let name = name.trim();
@@ -483,7 +483,7 @@ pub(crate) fn execute_list_skill_resources(args: &Value) -> Result<String, Strin
         .and_then(|v| usize::try_from(v).ok())
         .unwrap_or(80)
         .clamp(1, 200);
-    // 严格校验 category：仅允许空或白名单，且不含路径穿越字符
+    // Strictly validate category: only empty or whitelisted values, with no path traversal characters
     if !category.is_empty() {
         const ALLOWED: &[&str] = &["references", "examples", "scripts"];
         if category.contains("..") || category.contains('/') || category.contains('\\') {
@@ -518,7 +518,7 @@ pub(crate) fn execute_list_skill_resources(args: &Value) -> Result<String, Strin
         total
     );
     for rel in files.iter().take(shown) {
-        // 尝试推断大小
+        // Try to infer the size
         let abs = std::path::Path::new(resource_path).join(rel);
         let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!("- {rel} ({size} bytes)\n"));
@@ -543,7 +543,7 @@ pub(crate) fn execute_read_skill_resource(args: &Value) -> Result<String, String
         .ok_or_else(|| format!("Skill '{name}' has no bundled resource directory"))?;
     let rel = validate_resource_relative_path(path)?;
     let abs = std::path::Path::new(resource_path).join(&rel);
-    // 规范化后确保仍在 resource_path 内（防路径穿越）
+    // After normalization, ensure the path is still inside resource_path (anti path traversal)
     let canonical_base = std::fs::canonicalize(resource_path)
         .unwrap_or_else(|_| std::path::PathBuf::from(resource_path));
     let canonical_target = std::fs::canonicalize(&abs)
@@ -617,7 +617,7 @@ fn yaml_quote(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// 共享的 skill 名净化核心：小写、保留 alnum/`-`/`_`/` .`，其余转 `-`，合并 `--`，trim `-`/` .`。
+/// Shared skill name sanitization core: lowercase, keep alnum/`-`/`_`/` .`, convert the rest to `-`, collapse `--`, trim `-`/` .`.
 fn sanitize_skill_basename(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 8);
     for ch in name.chars() {
@@ -640,7 +640,7 @@ fn sanitize_skill_basename(name: &str) -> String {
 
 fn safe_skill_file_name(name: &str) -> String {
     let base = sanitize_skill_basename(name);
-    // 使用 strip_suffix 精确判断，避免 trim_end_matches 誤刪字符集
+    // Use strip_suffix for an exact check; trim_end_matches would wrongly strip whole character sets
     if base.to_ascii_lowercase().ends_with(".skill") {
         base
     } else {
@@ -650,7 +650,7 @@ fn safe_skill_file_name(name: &str) -> String {
 
 fn safe_skill_dir_name(name: &str) -> String {
     let mut base = sanitize_skill_basename(name);
-    // 去除 .skill 後綴（若有），保持文件與目錄 basename 一致：a.b.skill ↔ a.b
+    // Strip the .skill suffix (if any) so the file and dir basenames match: a.b.skill ↔ a.b
     if base.to_ascii_lowercase().ends_with(".skill") {
         if let Some(stripped) = base.get(..base.len() - ".skill".len()) {
             base = stripped.trim_end_matches('-').trim_end_matches('.').to_string();
@@ -718,11 +718,11 @@ fn build_skill_file_content(args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
-// ===== save_skill：支持 package 布局（references/examples/scripts + subskills）=====
+// ===== save_skill: package layout support (references/examples/scripts + subskills) =====
 
 fn parse_resources_arg(args: &Value) -> Result<Vec<(String, String)>, String> {
     let mut out: Vec<(String, String)> = Vec::new();
-    // 通用字段 `resources: [{path, content}]`
+    // Generic field `resources: [{path, content}]`
     if let Some(arr) = args.get("resources").and_then(|v| v.as_array()) {
         for item in arr {
             if let Some(obj) = item.as_object() {
@@ -745,7 +745,7 @@ fn parse_resources_arg(args: &Value) -> Result<Vec<(String, String)>, String> {
             }
         }
     }
-    // 分类快捷字段：references / examples / scripts，各为同形数组，若 path 不含目录则自动补前缀
+    // Category shortcut fields: references / examples / scripts, same-shaped arrays each; a path without a directory gets the prefix auto-added
     for (key, prefix) in [("references", "references"), ("examples", "examples"), ("scripts", "scripts")] {
         if let Some(arr) = args.get(key).and_then(|v| v.as_array()) {
             for item in arr {
@@ -799,24 +799,24 @@ fn write_resource_files_with_overwrite(
     resources: &[(String, String)],
     overwrite: bool,
 ) -> Result<(), String> {
-    // 确保 base_dir 存在并可 canonicalize（前置校验）
+    // Ensure base_dir exists and is canonicalizable (upfront validation)
     fs::create_dir_all(base_dir)
         .map_err(|e| format!("Failed to create dir {}: {e}", base_dir.display()))?;
     let canonical_base = fs::canonicalize(base_dir)
         .unwrap_or_else(|_| base_dir.to_path_buf());
     for (rel, content) in resources {
         let rel_clean = rel.trim().trim_matches('/').replace('\\', "/");
-        // 复用已有校验（含 ..、绝对路径）
+        // Reuse the existing validation (covers .. and absolute paths)
         let validated = validate_resource_relative_path(&rel_clean)
             .map_err(|e| format!("Invalid resource path '{rel}': {e}"))?;
         let target = base_dir.join(&validated);
-        // 创建父目录前先做路径穿越预检：target 的 parent canonical 必须在 base 内
+        // Pre-check for path traversal before creating parent dirs: the canonical parent of target must be inside base
         if let Some(parent) = target.parent() {
-            // parent 可能尚不存在，校验其“预期”路径的前缀字符级穿越
-            // 使用组件级检查：若 validated 含 `..` 已在上一步拦截，此处再做 canonical 校验
+            // The parent may not exist yet; validate the "expected" path prefix at character level for traversal
+            // Component-level check: `..` in validated was already blocked above; do the canonical check here
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create dir {}: {e}", parent.display()))?;
-            // 对已创建的 parent 做 canonical 校验
+            // Canonical check on the already-created parent
             if let Ok(canonical_parent) = fs::canonicalize(parent) {
                 if !canonical_parent.starts_with(&canonical_base) {
                     return Err(format!("Resource path escapes package directory: {validated}"));
@@ -830,7 +830,7 @@ fn write_resource_files_with_overwrite(
             ));
         }
         fs::write(&target, content).map_err(|e| format!("Failed to write resource {validated}: {e}"))?;
-        // 写入后二次校验（处理 symlink 竞态）
+        // Post-write re-validation (handles symlink races)
         if let (Ok(cb), Ok(ct)) = (fs::canonicalize(&canonical_base), fs::canonicalize(&target)) {
             if !ct.starts_with(&cb) {
                 let _ = fs::remove_file(&target);
@@ -846,7 +846,7 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     if name.is_empty() {
         return Err("name is empty".to_string());
     }
-    // 提前解析可选的复杂包能力
+    // Resolve the optional complex-package capabilities up front
     let resources = parse_resources_arg(args)?;
     let subskills = parse_subskills_arg(args)?;
     let has_package_features = !resources.is_empty() || !subskills.is_empty();
@@ -856,7 +856,7 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     let overwrite = args["overwrite"].as_bool().unwrap_or(true);
 
     if !has_package_features {
-        // 兼容旧行为：单文件 `*.skill`
+    // Legacy behavior compatibility: single-file `*.skill`
         let content = build_skill_file_content(args)?;
         let file_name = args["file_name"]
             .as_str()
@@ -875,8 +875,8 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
         return Ok(format!("Skill saved: {}\nSkill name: {}", path.display(), name));
     }
 
-    // ===== 包布局：`skills_dir/<package_dir>/SKILL.md` + resources + subskills =====
-    // 事前校验：子 skill 去重与环检测
+    // ===== Package layout: `skills_dir/<package_dir>/SKILL.md` + resources + subskills =====
+    // Upfront validation: child skill dedup and cycle detection
     {
         use rustc_hash::FxHashSet;
         let mut seen_names: FxHashSet<String> = FxHashSet::default();
@@ -983,7 +983,7 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
             return Err(e);
         }
     };
-    // 原子发布：若目标已存在，先备份再替换，避免 remove+rename 窗口内崩溃导致数据丢失
+    // Atomic publish: if the target exists, back it up before replacing, so a crash inside the remove+rename window cannot lose data
     if package_dir.exists() {
         let backup = dir.join(format!(".bak-{}-{}", package_dir_name, std::process::id()));
         if backup.exists() {
@@ -996,7 +996,7 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
                 let _ = fs::remove_dir_all(&backup);
             }
             Err(e) => {
-                // 回滚：尽力恢复原目录
+                // Rollback: restore the original directory best-effort
                 let _ = fs::rename(&backup, &package_dir);
                 let _ = fs::remove_dir_all(&tmp_dir);
                 return Err(format!("Failed to publish skill package {}: {e}", package_dir.display()));
@@ -1032,7 +1032,7 @@ mod tests {
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};
 
-    // activate_skill 系列测试共享同一个全局待激活槽位，串行化避免并发污染。
+    // activate_skill tests share one global pending-activation slot; serialize to avoid concurrent pollution.
     static ACTIVATION_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
@@ -1049,14 +1049,14 @@ mod tests {
         let err = execute_activate_skill(&serde_json::json!({"name": "definitely-not-a-skill"}))
             .unwrap_err();
         assert!(err.contains("No skill named"));
-        // 未命中不应写入待激活槽位，避免乱激活。
+        // A miss must not write into the pending-activation slot, avoiding stray activations.
         assert!(take_pending_skill_action().is_empty());
     }
 
     #[test]
     fn activate_skill_queues_existing_skill() {
         let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
-        // 取一个真实存在的 builtin skill 名字。
+        // Take a builtin skill name that actually exists.
         let skills = crate::ai::skills::load_all_skills();
         let Some(name) = skills.first().map(|s| s.name.clone()) else {
             return;
@@ -1065,15 +1065,15 @@ mod tests {
         assert!(out.contains(&name));
         let actions = take_pending_skill_action();
         assert_eq!(actions, vec![PendingSkillAction::Add(name.clone())]);
-        // take 应清空槽位。
+        // take should clear the slot.
         assert!(take_pending_skill_action().is_empty());
     }
 
     #[test]
     fn multiple_actions_in_one_turn_accumulate_in_order() {
         let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
-        // 同一 turn 内连续多次变更动作应按顺序累积，而不是后写覆盖（回归：多
-        // skill 叠加时代价槽位曾是单个 action，第二次调用会静默丢失第一次）。
+        // Multiple change actions within one turn must accumulate in order, not last-write-wins (regression: with multiple
+        // skills stacked, the slot used to hold a single action and the second call silently dropped the first).
         execute_deactivate_skill(&serde_json::json!({"name": "alpha"})).unwrap();
         execute_deactivate_skill(&serde_json::json!({"name": "beta"})).unwrap();
         let actions = take_pending_skill_action();
@@ -1201,7 +1201,7 @@ mod tests {
         assert!(out.contains("description: demo description"));
         assert!(out.contains("## prompt"));
         assert!(out.contains("line one\nline two"));
-        // 有 bundled 资源时才暴露目录
+        // Expose the dir only when bundled resources exist
         assert!(out.contains("Bundled resource directory: /tmp/demo/resources"));
     }
 

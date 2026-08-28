@@ -1,18 +1,19 @@
-//! # JSON 处理工具 (JSON Tools)
+//! # JSON Tools
 //!
-//! 本模块提供 JSON 数据的处理工具，包括解析、格式化、排序和差异比较等功能。
+//! This module provides JSON data processing utilities, including parsing,
+//! formatting, sorting, and diffing.
 //!
-//! ## 功能概览
+//! ## Feature Overview
 //!
-//! - [`diff_json`] - 比较两个 JSON 值的差异
-//! - [`sanitize_json_input`] - 清理和规范化 JSON 输入
-//! - [`Json`] - JSON 值包装器类型
-//! - [`DiffEntry`] - JSON 差异条目类型
-//! - [`ParseOptions`] - JSON 解析选项
+//! - [`diff_json`] - Compares the differences between two JSON values
+//! - [`sanitize_json_input`] - Cleans and normalizes JSON input
+//! - [`Json`] - JSON value wrapper type
+//! - [`DiffEntry`] - JSON diff entry type
+//! - [`ParseOptions`] - JSON parsing options
 //!
-//! ## 使用示例
+//! ## Usage Examples
 //!
-//! ### JSON 差异比较
+//! ### JSON Diffing
 //!
 //! ```rust
 //! use rust_tools::jsonw::diff_json;
@@ -27,28 +28,28 @@
 //! }
 //! ```
 //!
-//! ### 清理 JSON 输入
+//! ### Sanitizing JSON Input
 //!
 //! ```rust
 //! use rust_tools::jsonw::sanitize_json_input;
 //!
-//! // 清理带有注释的 JSON
+//! // Sanitize JSON that contains comments
 //! let input = r#"{
-//!     // 这是一个注释
+//!     // this is a comment
 //!     "name": "Alice"
 //! }"#;
 //!
 //! use rust_tools::jsonw::ParseOptions;
 //! let options = ParseOptions::default();
 //! let cleaned = sanitize_json_input(input, options);
-//! // cleaned 现在是可以被标准 JSON 解析器接受的格式
+//! // cleaned is now in a form accepted by standard JSON parsers
 //! ```
 //!
-//! ## 类型
+//! ## Types
 //!
-//! - [`DiffEntry`] - 表示 JSON 差异的条目
-//! - [`Json`] - JSON 值包装器
-//! - [`ParseOptions`] - 控制 JSON 解析行为的选项
+//! - [`DiffEntry`] - Represents a JSON diff entry
+//! - [`Json`] - JSON value wrapper
+//! - [`ParseOptions`] - Options controlling JSON parsing behavior
 
 pub mod diff;
 pub mod json;
@@ -56,7 +57,7 @@ pub mod sanitize;
 pub mod sort;
 pub mod types;
 
-// 重新导出常用类型和函数
+// Re-export commonly used types and functions
 pub use diff::diff_json;
 pub use sanitize::sanitize_json_input;
 pub use types::{DiffEntry, Json, ParseOptions};

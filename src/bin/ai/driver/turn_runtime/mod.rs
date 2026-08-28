@@ -32,8 +32,8 @@ pub(in crate::ai) mod tool_result;
 mod types;
 
 pub(super) use orchestrator::run_turn;
-// 早期步骤将 checkpoint/progress 声明为 orchestrator 私有子模块，但 execution.rs 以
-// `turn_runtime::checkpoint|progress` 引用；此处 re-export 恢复 turn_runtime 层可见性。
+// Earlier steps declared checkpoint/progress as orchestrator-private submodules, but execution.rs references them as
+// `turn_runtime::checkpoint|progress`; these re-exports restore turn_runtime-level visibility.
 pub(crate) use orchestrator::{checkpoint, progress};
 #[cfg(test)]
 use persistence::persist_pending_turn_messages;
@@ -43,7 +43,7 @@ pub(in crate::ai::driver) use tool_result::stale_patch_targets_from_messages;
 use tool_result::{prepare_recent_tool_result, prepare_tool_result};
 pub(super) use types::TurnOutcome;
 
-/// 将相邻压缩阶段合并为一条 status line，避免每个阶段各占一行。
+/// Merges adjacent compression phases into a single status line so each phase does not occupy its own line.
 #[derive(Default)]
 pub(super) struct CompressionReport {
     entries: Vec<String>,
@@ -55,13 +55,13 @@ impl CompressionReport {
             .push(format!("{}: {before} → {after} chars", label.into()));
     }
 
-    /// `effective` 只表示净节省是否达到摘要有效阈值；false 时硬预算兜底仍可能
-    /// 已经缩小并替换请求上下文，不能误报为 skipped。
-    /// `llm_summary_inserted` 表示这次压缩是否真的执行并注入了 `[mid-turn-summary]`。
-    /// 为 false 且 `after < before` 时，下降全部来自机械路径（折叠/截断/外溢），
-    /// 报告为 "skipped (no LLM summary), mechanical-only"，避免把纯机械压缩
-    /// 误报成"调用了 LLM 摘要"（用户曾看到 `pre-request LLM ... chars` 但实际
-    /// 未触发 LLM 的可观测性问题）。
+    /// `effective` only means the net savings reached the summary-effective threshold; when false, the hard-budget fallback may
+    /// still have shrunk and replaced the request context, so it must not be misreported as skipped.
+    /// `llm_summary_inserted` says whether this compression actually ran and injected `[mid-turn-summary]`.
+    /// When false and `after < before`, the reduction came entirely from mechanical paths (folding/truncation/offload),
+    /// reported as "skipped (no LLM summary), mechanical-only", so purely mechanical compression is not
+    /// misreported as "an LLM summary ran" (users previously saw `pre-request LLM ... chars` when in fact
+    /// no LLM was triggered — an observability bug).
     pub(super) fn record_llm_summary_attempt(
         &mut self,
         label: impl Into<String>,
@@ -120,21 +120,21 @@ pub(super) async fn maybe_generate_session_title_for_input(app: &super::App, use
 
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
 const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
-/// 首次 overflow stub 中的 head 预览字符数。
-/// 与 mid-turn 压缩 stub 的 head 8 行预览保持一致的信息密度。
+/// Number of head preview characters in the first overflow stub.
+/// Matches the information density of the head-8-line preview in mid-turn compression stubs.
 const TOOL_OVERFLOW_HEAD_CHARS: usize = 800;
-/// 中等大输出阈值：超过此值但未到 overflow 阈值的工具结果，仅对非精确概览类
-/// 工具走"头 + 关键命中 + 尾"的按行裁剪，避免完整 32KB 全部进上下文。
-/// grep/read_file(_lines) 等精确证据工具不走该有损路径。
+/// Medium-large output threshold: tool results above this but below the overflow threshold are trimmed line-wise
+/// ("head + key hits + tail") only for non-precise overview tools, avoiding the full 32KB entering context.
+/// Precise evidence tools such as grep/read_file(_lines) never take this lossy path.
 const MAX_TOOL_RESULT_LINE_TRIM_CHARS: usize = 8_000;
 
-/// 单条工具结果 inline（不 offload 到文件）的字符上限，按模型 context window 动态计算。
+/// Per-result inline (not offloaded to file) character cap, computed dynamically from the model context window.
 ///
-/// - 基准 32K（`MAX_TOOL_RESULT_INLINE_CHARS`），适合 128K token 窗口的模型。
-/// - 大窗口模型按比例放宽：`context_window * chars_per_token / 8`，即窗口的 ~12.5%
-///   预留给单条工具结果。256K token 模型 → 64K 字符，200K → 50K，128K → 32K。
-/// - 上限 64K：避免单条工具结果占用过多上下文，即使模型窗口很大。
-/// - 下限 32K：不小于基准值，确保小窗口模型也不会频繁 offload。
+/// - Baseline 32K (`MAX_TOOL_RESULT_INLINE_CHARS`), suited to 128K token window models.
+/// - Large-window models scale up proportionally: `context_window * chars_per_token / 8`, i.e. ~12.5% of the window
+///   reserved for a single tool result. 256K token model → 64K chars, 200K → 50K, 128K → 32K.
+/// - Cap 64K: keeps a single tool result from consuming too much context even on very large windows.
+/// - Floor 32K: never below the baseline so small-window models do not offload too often.
 pub(in crate::ai::driver::turn_runtime) fn max_tool_result_inline_chars(model: &str) -> usize {
     const CHARS_PER_TOKEN: usize = 2;
     let window = crate::ai::models::context_window_tokens(model);
@@ -144,24 +144,24 @@ pub(in crate::ai::driver::turn_runtime) fn max_tool_result_inline_chars(model: &
         .clamp(MAX_TOOL_RESULT_INLINE_CHARS, 64_000)
 }
 
-/// Mid-turn 渐进式压缩：messages 总字符数超过该阈值时，在 iteration loop 内
-/// 复用跨 turn 压缩管线，避免单 turn 长链工具调用把上下文撑爆。
+/// Mid-turn progressive compression: when total message characters exceed this threshold, the cross-turn
+/// compression pipeline runs inside the iteration loop, preventing a single turn of long tool chains from blowing up the context.
 ///
-/// 阈值默认按 `app.config.history_max_chars` 动态计算（详见
-/// [`mid_turn_compress_soft_threshold`] / [`mid_turn_compress_hard_threshold`]）。
-/// 这两个常量仅作为 floor 兜底（防止用户把 history_max_chars 设得过小，
-/// 导致 mid-turn 压缩在单条 tool 结果就被触发，反而不停 no-op）。
+/// The threshold defaults to a dynamic value from `app.config.history_max_chars` (see
+/// [`mid_turn_compress_soft_threshold`] / [`mid_turn_compress_hard_threshold`]).
+/// These two constants only act as floor guards (so a user-set too-small history_max_chars cannot cause
+/// mid-turn compression to trigger on a single tool result and no-op repeatedly).
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_SOFT_FLOOR: usize = 36_000;
-/// Mid-turn LLM 摘要硬阈值 floor：经过无损/弱损压缩后仍超过该值，触发 LLM summary
-/// 兜底（会调用一次模型，并在完成后输出一条合并的压缩状态行）。
+/// Mid-turn LLM summary hard-threshold floor: if content still exceeds this after lossless/weak-loss compression, an LLM summary
+/// fallback runs (one model call, followed by a single merged compression status line).
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_FLOOR: usize = 80_000;
 
-/// 软阈值：min 36K，否则取 history_max_chars * 1.5。
-/// history_max_chars 默认 90K，对应软阈值 135K。
+/// Soft threshold: min 36K, otherwise history_max_chars * 1.5.
+/// history_max_chars defaults to 90K, giving a 135K soft threshold.
 ///
-/// 但字符阈值与模型的 token 窗口是两套单位：一个高占用 prompt 可能远未触及
-/// 180K 字符阈值，却已逼近模型 token 窗口。[`token_window_char_ceiling`] 给出
-/// 该模型「安全字符预算」，二者取 min，确保接近 token 窗口时压缩必然更早触发。
+/// But character thresholds and the model token window are different units: a heavily loaded prompt may be far below
+/// the 180K character threshold yet already close to the model token window. [`token_window_char_ceiling`] gives
+/// the model's "safe character budget"; taking the min of both ensures compression triggers earlier as the window nears.
 pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_soft_threshold(
     model: &str,
     history_max_chars: usize,
@@ -173,12 +173,12 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_soft_threshold(
         .min(token_window_char_ceiling(model))
 }
 
-/// 硬阈值：min 80K，否则取 history_max_chars * 3.5。
-/// history_max_chars 默认 90K，对应硬阈值 315K（远超模型 context window，
-/// 实际硬阈值会被模型 4xx 之前的 normalize_messages_for_request 拦截）。
-/// 但相对软阈值留出明显 gap，避免软阈值边界连续触发 LLM summary。
-/// 按 LLM 摘要字符阈值收口——LLM 摘要只在上下文接近模型实际 context window
-/// 时触发（见 [`llm_summary_char_threshold`]），而非 60% 窗口处过早触发。
+/// Hard threshold: min 80K, otherwise history_max_chars * 3.5.
+/// history_max_chars defaults to 90K, giving a 315K hard threshold (far beyond the model context window;
+/// in practice the hard threshold is intercepted by normalize_messages_for_request before the model returns 4xx).
+/// It leaves a clear gap above the soft threshold so LLM summary does not trigger repeatedly at the soft boundary.
+/// Gated by the LLM summary character threshold — LLM summary only runs when the context approaches the model's actual context window
+/// (see [`llm_summary_char_threshold`]), not prematurely at 60% of the window.
 pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
     model: &str,
     history_max_chars: usize,
@@ -189,16 +189,16 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
         .max(MID_TURN_COMPRESS_HARD_FLOOR)
         .min(llm_summary_char_threshold(model))
 }
-/// LLM 摘要兜底时保留尾部窗口的 user 起始轮数。早期超过此窗口的对话被压成
-/// 一条 internal_note 摘要插入到尾部窗口前。
+/// Number of user-started turns kept in the tail window for the LLM summary fallback. Earlier conversation beyond this window is compressed
+/// into a single internal_note summary inserted before the tail window.
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS: usize = 2;
-/// LLM 摘要文本的最大字符数。
+/// Maximum character count of the LLM summary text.
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_MAX_CHARS: usize = 4_000;
-/// Pre-request LLM 摘要阈值：在每次发送 LLM 请求前，如果无损+弱损压缩后
-/// 仍超过此阈值，触发 LLM 摘要兜底（把早期对话压成单条 internal_note）。
-/// 按 LLM 摘要字符阈值收口——LLM 摘要只在上下文接近模型实际 context window
-/// 时触发，避免在远低于窗口上限时就频繁调用 LLM 摘要（旧设计用 0.6 窗口
-/// 收口导致小窗口模型在 76K 字符处就不停触发 LLM 摘要却压不动）。
+/// Pre-request LLM summary threshold: before each LLM request is sent, if lossless + weak-loss compression still leaves
+/// content above this threshold, the LLM summary fallback runs (compressing earlier conversation into a single internal_note).
+/// Gated by the LLM summary character threshold — LLM summary only runs when the context approaches the model's actual context window,
+/// avoiding frequent LLM summary calls far below the window cap (the old design gated at 0.6 of the window,
+/// which made small-window models trigger LLM summary repeatedly at 76K chars without any effect).
 pub(in crate::ai::driver::turn_runtime) fn pre_request_llm_summary_threshold(
     model: &str,
     history_max_chars: usize,
@@ -209,14 +209,14 @@ pub(in crate::ai::driver::turn_runtime) fn pre_request_llm_summary_threshold(
         .min(llm_summary_char_threshold(model))
 }
 
-/// LLM 摘要字符阈值：`context_window_tokens * CHARS_PER_TOKEN`。
+/// LLM summary character threshold: `context_window_tokens * CHARS_PER_TOKEN`.
 ///
-/// 与 [`token_window_char_ceiling`]（0.6 窗口，用于无损压缩提前裁剪）不同，
-/// 此阈值代表「history 已撑满模型实际 context window」——此时 LLM 摘要
-///（昂贵，需额外调用一次模型）才真正必要。默认 100K token 模型 → 200K 字符。
+/// Unlike [`token_window_char_ceiling`] (0.6 window, used to trim early during lossless compression),
+/// this threshold means "history has filled the model's actual context window" — only then is an LLM summary
+/// (expensive, one extra model call) truly necessary. A 100K token model defaults to 200K characters.
 ///
-/// `CHARS_PER_TOKEN = 2` 本身已偏保守（中文约 1-2 字符/token，英文约 3-4），
-/// 不再额外乘 fraction，避免小窗口模型阈值过低导致 LLM 摘要空转。
+/// `CHARS_PER_TOKEN = 2` is already conservative (Chinese ≈ 1-2 chars/token, English ≈ 3-4),
+/// so no extra fraction is multiplied, avoiding a too-low threshold that makes LLM summary spin uselessly on small-window models.
 pub(in crate::ai::driver::turn_runtime) fn llm_summary_char_threshold(model: &str) -> usize {
     const CHARS_PER_TOKEN: usize = 2;
     crate::ai::models::context_window_tokens(model)
@@ -224,10 +224,10 @@ pub(in crate::ai::driver::turn_runtime) fn llm_summary_char_threshold(model: &st
         .max(MID_TURN_COMPRESS_HARD_FLOOR)
 }
 
-/// 模型 token 窗口换算出的「安全字符预算」：`window * chars_per_token * fraction`。
-/// - `chars_per_token = 2`：与 [`request`] 侧 max_tokens 钳制保持同一保守换算。
-/// - `fraction = 0.6`：只用窗口的 ~60% 给历史 prompt，剩余留给系统 prompt、
-///   本轮 user、工具 schema 以及模型输出，避免压缩阈值本身贴着窗口上沿。
+/// "Safe character budget" derived from the model token window: `window * chars_per_token * fraction`.
+/// - `chars_per_token = 2`: same conservative conversion as the max_tokens clamp on the [`request`] side.
+/// - `fraction = 0.6`: only ~60% of the window goes to the history prompt, leaving the rest for the system prompt,
+///   this turn's user message, tool schemas, and model output, so the compression threshold never hugs the top of the window.
 pub(in crate::ai::driver::turn_runtime) fn token_window_char_ceiling(model: &str) -> usize {
     const CHARS_PER_TOKEN: usize = 2;
     let window = crate::ai::models::context_window_tokens(model);
@@ -237,16 +237,16 @@ pub(in crate::ai::driver::turn_runtime) fn token_window_char_ceiling(model: &str
         .saturating_div(5)
         .max(MID_TURN_COMPRESS_SOFT_FLOOR)
 }
-/// Pre-request LLM 摘要重触发最小增量：自上次 LLM 摘要后 messages 增量
-/// 小于此值则跳过，避免摘要失败时每轮重复调用 LLM。
+/// Pre-request LLM summary re-trigger minimum growth: if messages have grown by less than this since the last LLM summary,
+/// skip it, avoiding a repeated LLM call every turn when summarization fails.
 pub(in crate::ai::driver::turn_runtime) const PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH: usize = 20_000;
 
-/// 记录每个独立执行上下文上次 LLM 摘要尝试后的 messages 总字符数。
+/// Records the total message character count after the last LLM summary attempt per independent execution context.
 ///
-/// mid-turn 与 pre-request 共享该游标：若同一批上下文刚刚尝试过 LLM summary
-/// 且没有增长出新的压缩空间，就不要在另一个触发点马上重复请求。成功与 no-op
-/// 都写入尝试后大小；真正增长超过 [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`] 后再重试。
-/// key 同时包含 session 与当前调度进程 pid，避免父 agent 和并发 subagent 相互抑制。
+/// mid-turn and pre-request share this cursor: if the same context batch just attempted an LLM summary
+/// and no new compression headroom appeared, do not repeat the request at the other trigger point. Both success and no-op
+/// attempts record the post-attempt size; retry only after real growth exceeds [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`].
+/// The key includes both the session and the current scheduler process pid so the parent agent and concurrent subagents do not suppress each other.
 static LAST_LLM_SUMMARY_ATTEMPT_CHARS: std::sync::LazyLock<
     std::sync::Mutex<rust_tools::commonw::FastMap<String, usize>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(rust_tools::commonw::FastMap::default()));
@@ -294,11 +294,11 @@ pub(in crate::ai::driver::turn_runtime) fn should_try_llm_summary(
     last_attempt_chars == 0 || growth >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH
 }
 
-/// Mid-turn 压缩冷却：触发一次后至少间隔 N 轮才再次重判，避免在阈值附近徘徊
-/// 时每轮都跑一次（实际无变化）。
+/// Mid-turn compression cooldown: after one trigger, wait at least N turns before re-evaluating, avoiding repeated runs
+/// while hovering near the threshold (with no actual change).
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_COOLDOWN_ITERATIONS: usize = 2;
-/// Mid-turn 压缩增量门槛：自上次压缩后 messages 增量小于此值则跳过（避免
-/// 大 tool result 留在 messages 末尾时反复触发 no-op 压缩）。
+/// Mid-turn compression growth gate: skip when messages have grown by less than this since the last compression (avoids
+/// repeated no-op compressions while a large tool result sits at the end of messages).
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_DELTA_THRESHOLD: usize = 4_000;
 
 pub(in crate::ai) use debug::report_agent_hang_debug;
@@ -354,9 +354,9 @@ mod tests {
 
     #[test]
     fn llm_summary_mechanical_only_reduction_is_not_reported_as_llm() {
-        // 用户观测到的问题：单轮 + 巨量工具输出的 session 里 LLM 摘要实际被跳过
-        // （无可摘要的旧对话），但净下降达到有效阈值后被报告成 `... LLM ... chars`，
-        // 看起来像调用了 LLM。这里验证机械路径下降被标记为 skipped (no LLM summary)。
+        // User-observed problem: in single-turn sessions with huge tool output, the LLM summary was actually skipped
+        // (no old conversation to summarize), yet once the net reduction reached the effective threshold it was reported as `... LLM ... chars`,
+        // looking like an LLM call. This verifies that mechanical-only reduction is marked as skipped (no LLM summary).
         let mut report = CompressionReport::default();
         report.record_llm_summary_attempt(
             "pre-request LLM (limit 180000)",
@@ -385,8 +385,8 @@ mod tests {
         record_llm_summary_attempt_chars(sid, 0);
         assert!(should_try_llm_summary(sid, attempted_chars, mid_turn_hard));
 
-        // mid-turn 已经对这批上下文尝试过 LLM summary 且无效后，
-        // pre-request 不应因为阈值更低就马上重复请求同一次 summary。
+        // After mid-turn already attempted an LLM summary on this context batch without effect,
+        // pre-request must not immediately repeat the same summary just because its threshold is lower.
         record_llm_summary_attempt_chars(sid, attempted_chars);
         assert!(!should_try_llm_summary(
             sid,
@@ -549,8 +549,8 @@ mod tests {
         let expected_dir = store
             .session_assets_dir(&app.session_id)
             .join("tool-overflow");
-        // macOS 上 /tmp 是 /private/tmp 的符号链接；overflow 文件路径经过
-        // canonicalize，比较前需对 expected_dir 做同样处理，否则 starts_with 失败。
+        // On macOS /tmp is a symlink to /private/tmp; overflow file paths go through canonicalize,
+        // so expected_dir must be canonicalized the same way before comparison, or starts_with fails.
         let expected_dir = expected_dir.canonicalize().unwrap_or(expected_dir);
         let nested_dir = SessionStore::new(app.session_history_file.as_path())
             .session_assets_dir(&app.session_id)

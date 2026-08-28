@@ -19,13 +19,14 @@ const SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS: usize = 4_000;
 const MODEL_CONTEXT_ECHO_PREFIX: &str = "[Model-authored note from an earlier turn;";
 static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
-/// 与标题任务同构的 in-flight 去重：避免同一 session 同时跑多次持久化压缩
-///（前台收尾派发的后台压缩与下一轮 prepare 的防御性压缩可能重叠）。
+/// In-flight dedup mirroring the title task: prevents the same session from running persisted
+/// compression multiple times concurrently (the background compression dispatched at foreground
+/// finalize may overlap with the next round's defensive compression in prepare).
 static SESSION_COMPACTION_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
     LazyLock::new(|| Mutex::new(FastSet::default()));
 
-/// 标题任务必须从基础 history 文件推导 sessions 根目录；不能传入当前 session
-/// 数据库的父目录，否则会错误地拼接出嵌套的 `.sessions` 路径。
+/// The title task must derive the sessions root from the base history file; do not pass the
+/// parent directory of the current session database, or a nested `.sessions` path is built by mistake.
 fn session_title_store(history_file: &std::path::Path) -> crate::ai::history::SessionStore {
     crate::ai::history::SessionStore::new(history_file)
 }
@@ -48,16 +49,18 @@ fn ensure_final_assistant_recorded(
     });
 }
 
-/// 模型偶尔会把 request projection 中的 internal_note 原样回显。仅供模型消费的
-/// runtime note 必须留在 canonical history，但不能作为用户可见回答打印到 terminal。
-/// 已流式输出的回答只补画 runtime 显式标记为用户可见的追加提示。
+/// The model occasionally echoes internal_note entries from the request projection verbatim. Runtime
+/// notes intended only for the model must stay in canonical history but must not be printed to the
+/// terminal as user-visible answers. For already-streamed answers, only append hints that the runtime
+/// explicitly marked as user-visible are painted.
 fn terminal_final_text_to_render(
     final_assistant_text: &str,
     final_assistant_recorded: bool,
     user_visible_suffix: Option<&str>,
 ) -> Option<String> {
-    // 已写入 canonical history 的最终模型响应此前已经由 stream runtime 实时输出；
-    // finalize 只补画未经过流式响应的本地 fallback，避免整段正文在终端重复一次。
+    // The final model response already written to canonical history was streamed live by the stream
+    // runtime; finalize only paints local fallbacks that never went through streaming, so the body
+    // is not duplicated in the terminal.
     if final_assistant_recorded {
         return user_visible_suffix
             .map(str::trim)
@@ -189,8 +192,8 @@ fn should_compact_session_history_in_background(
     should_quit: bool,
     is_subagent: bool,
 ) -> bool {
-    // 子代理 history 由调用方的生命周期 guard 管理；压缩若脱离当前 future，
-    // guard 可能先删除临时 SQLite，后台任务随后访问已不存在的文件。
+    // Subagent history is managed by the caller's lifecycle guard; if compression escapes the current
+    // future, the guard may delete the temp SQLite first and the background task then touches a missing file.
     !is_subagent && !one_shot_mode && !should_quit
 }
 
@@ -208,8 +211,8 @@ fn mark_session_title_generation_finished(session_id: &str) {
     in_flight.remove(session_id);
 }
 
-/// 返回 true 表示成功抢到压缩 in-flight 槽位；false 表示该 session 已有
-/// 压缩任务在跑，调用方应直接跳过，避免重复压缩同一批历史。
+/// Returns true when the compression in-flight slot was acquired; false means a compression task is
+/// already running for this session and the caller should skip to avoid recompressing the same history.
 pub(in crate::ai::driver::turn_runtime) fn mark_session_compaction_started(
     session_id: &str,
 ) -> bool {
@@ -226,21 +229,25 @@ pub(in crate::ai::driver::turn_runtime) fn mark_session_compaction_finished(sess
     in_flight.remove(session_id);
 }
 
-/// 交互式收尾把持久化压缩派发到后台：压缩结果只是 context snapshot 的写回缓存，
-/// 下一轮 `build_context_history` 始终从 canonical 层重新压缩，故延迟落盘不影响
-/// 正确性。前台 turn 因此不必在答案交付后再干等一次 CPU 压缩 + SQLite 写事务。
+/// Interactive finalization dispatches persisted compression to the background: the compression
+/// result is only a write-back cache for the context snapshot, and the next `build_context_history`
+/// always recompresses from the canonical layer, so deferred persistence does not affect correctness.
+/// The foreground turn therefore does not have to wait for a CPU compression + SQLite write transaction
+/// after the answer is delivered.
 ///
-/// `at_boundary` 对应本轮是否再调用过工具（无工具调用 = "答案已交付"，用更激进
-/// 阈值）。返回后 in-flight 槽位由 spawned task 负责清理。
+/// `at_boundary` records whether tools were called again this round (no tool calls = "answer
+/// delivered", using the more aggressive threshold). After return, the spawned task owns clearing the
+/// in-flight slot.
 fn spawn_background_compaction(app: &App, at_boundary: bool) {
     if !mark_session_compaction_started(&app.session_id) {
-        // 已有压缩在跑（例如上一轮的后台任务尚未完成）；本轮跳过即可，
-        // 待其完成后下一轮 prepare 会基于最新 canonical 再判定。
+        // A compression is already running (e.g. the previous round's background task has not finished);
+        // skipping this round is fine — once it completes, the next prepare re-evaluates against the
+        // latest canonical history.
         return;
     }
     let task_app = app.clone();
     let session_id = task_app.session_id.clone();
-    // 后台任务不拥有前台终端：压缩的告警/日志不得抢占前台输出光标。
+    // Background tasks do not own the foreground terminal: compression warnings/logs must not steal the foreground output cursor.
     tokio::spawn(
         crate::ai::driver::runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, async move {
             let compact_result = if at_boundary {
@@ -264,9 +271,9 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
     );
 }
 
-/// 收尾阶段的持久化压缩派发。前台交互式 turn 走后台（不阻塞前台回到 prompt）；
-/// one-shot、即将退出的进程及子代理走前台 `.await`，确保 snapshot 在所属 history
-/// 的生命周期结束前落盘。
+/// Persisted-compression dispatch at finalize. Foreground interactive turns go through the background
+/// (so the prompt returns without blocking); one-shot runs, soon-to-exit processes, and subagents take
+/// the foreground `.await` path, ensuring the snapshot is persisted before the owning history's lifetime ends.
 async fn dispatch_finalize_compaction(app: &App, at_boundary: bool, run_in_background: bool) {
     if run_in_background {
         spawn_background_compaction(app, at_boundary);
@@ -292,8 +299,8 @@ async fn dispatch_finalize_compaction(app: &App, at_boundary: bool, run_in_backg
     }
 }
 
-/// 标题任务可以在当前 user message 尚未落盘时启动；把这条已提交输入补进快照，
-/// 让辅助模型无需等待主请求或首轮 assistant response。
+/// The title task may start before the current user message is persisted; patch this committed input
+/// into the snapshot so the helper model does not have to wait for the main request or the first assistant response.
 fn session_title_messages(
     mut persisted_messages: Vec<Message>,
     pending_user_input: Option<&str>,
@@ -318,15 +325,15 @@ fn session_title_messages(
 fn has_session_title_source(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         message.role == "user"
-            // 子代理证据交接等运行时合成的 user 消息不是真实轮次（AGENTS.md
-            // 不变式 12），不能作为标题来源；否则 agent-team 这类多子代理会话
-            // 会把交接内容当成用户意图，导致标题生成被污染。
+            // Runtime-synthesized user messages such as subagent evidence handoffs are not real turns
+            // (AGENTS.md invariant 12) and must not seed the title; otherwise multi-subagent sessions
+            // like agent-team would treat the handoff content as user intent and pollute title generation.
             && !is_runtime_synthetic_user_message(message)
             && !value_to_string(&message.content).trim().is_empty()
     })
 }
 
-/// fallback 与旧版无来源标题的匹配依据必须保持和落盘时一致。
+/// The matching basis between the fallback and legacy provenance-less titles must stay identical to what was persisted.
 fn fallback_session_title(messages: &[Message]) -> String {
     messages
         .iter()
@@ -350,8 +357,8 @@ fn should_generate_model_session_title(
 
     match existing.origin {
         SessionTitleOrigin::Fallback => true,
-        // 没有来源标记的旧标题只有在与旧 fallback 完全一致时才升级，避免误覆盖
-        // 已经由模型生成的历史好标题。
+        // Legacy titles without provenance are upgraded only when they exactly match the old fallback,
+        // avoiding accidental overwrite of good historical titles the model already generated.
         SessionTitleOrigin::Legacy => {
             !fallback_title.is_empty()
                 && normalize_generated_session_title(&existing.text) == fallback_title
@@ -367,7 +374,7 @@ fn should_write_fallback_session_title(
     match existing {
         None => true,
         Some(existing) if is_low_quality_session_title(&existing.text) => true,
-        // 迁移旧 fallback 时补上来源标记；之后可以可靠地继续尝试模型升级。
+        // Stamp provenance when migrating a legacy fallback; model-based upgrades can then be retried reliably.
         Some(existing) => {
             existing.origin == SessionTitleOrigin::Legacy
                 && normalize_generated_session_title(&existing.text) == fallback_title
@@ -393,9 +400,9 @@ pub(super) async fn finalize_turn(
     if let Some(subagent_output_for_parent) =
         subagent_result_payload_for_parent(final_assistant_text, turn_messages)
     {
-        // 尽早发布给父 agent：即便本轮没有最终 assistant 正文，只要留下了可复用的
-        // subagent 证据（如 read_file 结果），父 agent 也必须感知。
-        // 这样同步 `task` 与异步 `task_wait` 都能拿到同一份父侧 payload。
+        // Publish to the parent agent early: even without final assistant prose this round, any reusable
+        // subagent evidence (e.g. read_file results) must be visible to the parent.
+        // This keeps the synchronous `task` and the asynchronous `task_wait` on the same parent-side payload.
         crate::ai::driver::runtime_ctx::publish_subagent_result(
             &subagent_output_for_parent,
             final_assistant_text,
@@ -418,7 +425,7 @@ pub(super) async fn finalize_turn(
                 )
         {
             print_assistant_banner_with_app_and_skill(Some(app), active_skill_name);
-            // digest 是给模型看的附加图片理解内容，最终回显同样剥离
+            // The digest is extra image understanding for the model; it is stripped from the final echo as well.
             let visible_text = crate::ai::request::strip_digest_blocks(&visible_text);
             crate::ai::stream::render_markdown_block(&visible_text)?;
         }
@@ -429,19 +436,21 @@ pub(super) async fn finalize_turn(
             turn_messages,
             persisted_turn_messages,
         );
-        // 任务边界判定：当前 turn 没有再调工具，意味着 agent 已经把答案交付，
-        // 这是一个自然的"任务完成"切点；用更激进的阈值（160 turns）触发摘要，
-        // 避免对话一直堆到硬上限（200 turns）才被动压缩。
+        // Task boundary detection: no tool calls in this turn means the agent has delivered its answer —
+        // a natural "task complete" cut point. Trigger the summary with the more aggressive threshold
+        // (160 turns) instead of waiting until the conversation piles up to the hard cap (200 turns).
         let had_tool_calls = turn_messages
             .iter()
             .any(|m| m.role == "tool" || m.tool_calls.as_ref().map_or(false, |c| !c.is_empty()));
-        // goal 模式下，run_loop 通过此标志判定目标是否完成：
-        // 一轮结束时没有调用任何工具 = agent 已交付最终结果。
+        // In goal mode, run_loop uses this flag to decide whether the goal is complete:
+        // no tool calls at the end of a round = the agent delivered its final result.
         app.last_turn_had_tool_calls = had_tool_calls;
-        // 持久化压缩：前台交互式 turn 派发到后台，避免答案交付后再等待 CPU 压缩
-        // 与 SQLite 写事务（快照只是写回缓存，下一轮从 canonical 重算）。
-        // one-shot、即将退出及子代理 turn 走当前 future，避免所属 history 先结束生命周期。
-        // `at_boundary` = 本轮没有再调工具（答案已交付），用更激进的阈值。
+        // Persisted compression: foreground interactive turns dispatch to the background to avoid waiting
+        // on CPU compression + a SQLite write transaction after the answer is delivered (the snapshot is only
+        // a write-back cache; the next round recomputes from canonical).
+        // One-shot runs, soon-to-exit processes, and subagent turns take the current future so the owning
+        // history does not end its lifetime first.
+        // `at_boundary` = no tool calls this round (answer delivered), using the more aggressive threshold.
         dispatch_finalize_compaction(
             app,
             !had_tool_calls,
@@ -452,8 +461,8 @@ pub(super) async fn finalize_turn(
             ),
         )
         .await;
-        // 尝试为当前对话生成 LLM 概括性标题（如果尚未生成且已有足够上下文）。
-        // 交互式前台 turn 不应在这里等待一个后台质量任务。
+        // Try to generate an LLM summary title for the current conversation (when none exists and there is enough context).
+        // Interactive foreground turns must not wait here on a background quality task.
         maybe_generate_session_title(
             app,
             should_generate_session_title_in_background(one_shot_mode, should_quit),
@@ -517,11 +526,11 @@ pub(super) async fn finalize_turn(
     })
 }
 
-/// 在 turn 结束后尝试用 LLM 生成 session 概括性标题。
-/// 条件：至少有 1 个 user turn，且没有已生成标题或现有标题质量过低。
+/// After a turn ends, attempt to generate a summary session title with the LLM.
+/// Conditions: at least 1 user turn, and no generated title yet or the existing title is low quality.
 pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: bool) {
     let store = session_title_store(&app.config.history_file);
-    // 已有模型标题的恢复 session 不需要为标题检查解码整段 canonical history。
+    // A restored session that already has a model title need not decode the whole canonical history just to check for a title.
     if store.has_generated_title(&app.session_id) {
         return;
     }
@@ -529,8 +538,8 @@ pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: b
         .read_all_messages(&app.session_id)
         .is_ok_and(|messages| has_session_title_source(&messages))
     {
-        // 新 session 启动时没有历史，不要占住 in-flight 标记；否则用户立即提交
-        // 首条输入时，真正需要的标题任务可能被这个空任务挡掉。
+        // A brand-new session has no history; do not hold the in-flight marker, or when the user submits
+        // the first input right away, the actually needed title task may be blocked by this empty one.
         return;
     }
     if !mark_session_title_generation_started(&app.session_id) {
@@ -551,7 +560,7 @@ pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: b
     mark_session_title_generation_finished(&app.session_id);
 }
 
-/// 用户提交输入后立即派发标题生成，不等待该 turn 的历史落盘或模型响应。
+/// Dispatch title generation immediately after the user submits input, without waiting for this turn's history to persist or for the model response.
 pub(super) async fn maybe_generate_session_title_for_input(app: &App, user_input: &str) {
     if user_input.trim().is_empty() || !mark_session_title_generation_started(&app.session_id) {
         return;
@@ -567,15 +576,16 @@ pub(super) async fn maybe_generate_session_title_for_input(app: &App, user_input
 }
 
 async fn generate_session_title_if_missing(app: &App, pending_user_input: Option<&str>) {
-    // SessionStore 接收基础 history 文件，并据此推导 `<stem>.sessions/`。
-    // 传入当前 session sqlite 的父目录会额外拼出一层 `.sessions`，导致标题任务
-    // 读取不到当前会话的消息。
+    // SessionStore takes the base history file and derives `<stem>.sessions/` from it.
+    // Passing the parent directory of the current session sqlite would append an extra `.sessions`
+    // layer, leaving the title task unable to read the current session's messages.
     let store = session_title_store(&app.config.history_file);
 
     let persisted_messages = match store.read_all_messages(&app.session_id) {
         Ok(messages) => messages,
-        // 首条输入触发时 session sqlite 可能还没由主 turn 创建；pending input 本身
-        // 已足够生成标题，因此把“尚无历史文件”视为空历史，而不是错过整个首轮。
+        // When triggered by the first input, the session sqlite may not have been created by the main turn yet;
+        // the pending input alone is enough to generate a title, so treat "no history file yet" as empty
+        // history instead of missing the entire first round.
         Err(_) if pending_user_input.is_some() => Vec::new(),
         Err(_) => return,
     };
@@ -597,8 +607,9 @@ async fn generate_session_title_if_missing(app: &App, pending_user_input: Option
         .await
         .map(|title| normalize_generated_session_title(&title));
 
-    // 模型返回了标题但被质量过滤拒掉——这是「有请求、无结果」的静默路径，必须落
-    // 决策日志，否则无法区分传输失败与低质量回退（两者都表现为长期 fallback 标题）。
+    // The model returned a title but the quality filter rejected it — a silent "request made, no result"
+    // path that must be recorded in the decision log; otherwise a transport failure and a low-quality
+    // fallback are indistinguishable (both surface as a long-lived fallback title).
     if let Some(title) = model_title.as_deref()
         && (title.is_empty() || is_low_quality_session_title(title))
     {
@@ -613,7 +624,7 @@ async fn generate_session_title_if_missing(app: &App, pending_user_input: Option
     let generated_title =
         model_title.filter(|title| !title.is_empty() && !is_low_quality_session_title(title));
 
-    // 网络请求期间，另一个进程可能已写入标题；重新读取后只在仍可升级时覆盖。
+    // While the network request ran, another process may have written a title; re-read and overwrite only when an upgrade is still possible.
     let current = store
         .read_session_title_with_origin(&app.session_id)
         .ok()
@@ -630,7 +641,7 @@ async fn generate_session_title_if_missing(app: &App, pending_user_input: Option
         return;
     }
 
-    // 失败时只补写 fallback，绝不覆盖已有的合格标题；下一次完成回合仍会重试模型。
+    // On failure, write only the fallback and never overwrite an existing qualified title; the model is retried on the next completing round.
     if !fallback_title.is_empty()
         && should_write_fallback_session_title(current.as_ref(), &fallback_title)
     {
@@ -872,7 +883,7 @@ mod tests {
         let synthetic = runtime_synthetic_user_message(Value::String(
             "[Subagent evidence] 子代理交接内容...".to_string(),
         ));
-        // 只有运行时合成 user 消息时，不能视为有真实标题来源
+        // Runtime-synthesized user messages only: must not count as a real title provenance
         assert!(!has_session_title_source(&[synthetic.clone()]));
 
         let real = Message {

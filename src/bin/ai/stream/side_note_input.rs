@@ -1,17 +1,22 @@
-// side_note_input.rs — 流式输出期间的同终端 side-note 输入监听（Ctrl+G）
+// side_note_input.rs — same-terminal side-note input listener during streaming output (Ctrl+G)
 //
-// 主 agent 在模型流式输出时 stdin 处于空闲（交互式输入框未打开）。本模块在 cbreak
-// 模式（关闭 ICANON/ECHO，保留 ISIG/OPOST）下轮询监听 Ctrl+G（0x07）：命中后弹单行
-// 输入，Esc / F2 / Alt+Enter 提交为 `from="user"` 的 side-note 写入 foreground 队列，
-// 下一轮迭代由 `driver::side_note::poll_and_inject` 注入 LLM 上下文。输入中再次按
-// Ctrl+G 放弃当前草稿；回车不发送（与主输入"回车=换行、Esc/F2 提交"的键位语义对齐）。
+// While the main agent is streaming model output, stdin is idle (the interactive input
+// box is not open). This module polls for Ctrl+G (0x07) in cbreak mode (ICANON/ECHO
+// off, ISIG/OPOST kept): on hit it opens a one-line input; Esc / F2 / Alt+Enter submit
+// the draft as a side-note with `from="user"` into the foreground queue, and the next
+// iteration injects it into the LLM context via `driver::side_note::poll_and_inject`.
+// Pressing Ctrl+G again while typing discards the current draft; Enter does not send
+// (aligned with the main input's "Enter=newline, Esc/F2 submit" key semantics).
 //
-// 设计要点：
-// - 保留 ISIG：Ctrl+C 仍走现有 SIGINT 中断路径，不破坏流式中断语义。
-// - 保留 OPOST：主 agent 的渲染输出 `\n` → `\r\n` 转换不受影响。
-// - 关闭 ECHO 自行回显：backspace 能按字符宽度擦除，且 Ctrl+G 本身无回显不干扰渲染。
-// - poll 短轮询 + stop 标志：stream_response 结束（任意 return 路径）时由守卫请求
-//   退出并等待终端恢复，避免遗留 cbreak 状态影响后续输入框。
+// Design notes:
+// - ISIG kept: Ctrl+C still goes through the existing SIGINT interrupt path without
+//   breaking the streaming interrupt semantics.
+// - OPOST kept: the main agent's rendered output `\n` → `\r\n` conversion is unaffected.
+// - ECHO off with self-managed echo: backspace can erase by character width, and
+//   Ctrl+G itself produces no echo to interfere with rendering.
+// - Short poll + stop flag: when stream_response ends (any return path) the guard
+//   requests exit and waits for the terminal to be restored, avoiding leftover cbreak
+//   state affecting the later input box.
 use std::{
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -30,15 +35,18 @@ use crate::ai::{
 };
 use crate::commonw::prompt::{acquire_background_stdin, foreground_stdin_requested};
 
-/// Ctrl+G（BEL）
+/// Ctrl+G (BEL)
 const CTRL_G: u8 = 0x07;
-/// poll 轮询间隔（毫秒）：同时约束 stop 标志的响应延迟。
+/// Poll interval in milliseconds; also bounds how quickly the stop flag is observed.
 const POLL_MS: i32 = 50;
-/// Drop 时等待监听线程确认已释放 stdin / cbreak 的上限。
+/// Upper bound for how long Drop waits for the listener thread to confirm stdin /
+/// cbreak release.
 const SHUTDOWN_WAIT_MS: u64 = 250;
-/// 启动时等待 listener 完成终端接管的上限；超时则不让尚未开始的 task 修改终端。
+/// Upper bound for waiting at startup for the listener to take over the terminal;
+/// on timeout the not-yet-started task is not allowed to modify the terminal.
 const STARTUP_WAIT_MS: u64 = 250;
-/// 底部 composer 固定占用的物理行数。模型输出在其上方的滚动区域连续滚动。
+/// Number of physical rows permanently reserved for the bottom composer. Model
+/// output scrolls continuously in the scroll region above it.
 const FOOTER_ROWS: u16 = 1;
 const COMPOSER_PREFIX: &str = "  [side-note] Esc/F2 send · Ctrl+G cancel > ";
 const COMPOSER_CURSOR: char = '▌';
@@ -47,8 +55,9 @@ fn should_yield_stdin(stop: &AtomicBool) -> bool {
     stop.load(Ordering::Relaxed) || foreground_stdin_requested()
 }
 
-/// 以 DECSTBM 保留的终端底部 footer。所有输出仍在主屏，避免 alternate screen
-/// 隐藏 transcript；composer 每次重绘会保存/恢复输出光标，因此不影响模型持续输出。
+/// Bottom footer reserved via DECSTBM. All output stays on the main screen, avoiding
+/// alternate-screen hiding of the transcript; each composer redraw saves/restores the
+/// output cursor, so continuous model output is not affected.
 struct FooterReservation {
     cols: u16,
     rows: u16,
@@ -86,9 +95,11 @@ impl FooterReservation {
                 "side-note stopped",
             ));
         }
-        // 无条件把当前可见屏幕完整滚动两行，显式造出“输出区最后一行 + footer”两
-        // 个空行。不能假定物理末行在 cursor 之后没有旧内容；只有先滚进 scrollback
-        // 才能保证 leave() 只清理本 footer 自己创建的空白行。
+        // Unconditionally scroll the whole visible screen by two rows to explicitly
+        // create two blank lines: "last output row + footer". We cannot assume the
+        // physical last row has no stale content after the cursor; only by first
+        // scrolling it into scrollback can leave() be guaranteed to clean up only
+        // the blank lines this footer itself created.
         write!(
             out,
             "\x1b[{};1H\n\n\x1b[1;{}r\x1b[{};1H",
@@ -114,7 +125,9 @@ impl FooterReservation {
         self.rows = rows;
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        // 清旧 footer 后再重设滚动区域；保存/恢复保证模型输出光标不被 resize 重绘挪走。
+        // Clear the old footer before re-establishing the scroll region; the
+        // save/restore keeps the model-output cursor from being moved by the resize
+        // redraw.
         write!(
             out,
             "\x1b7\x1b[{};1H\x1b[2K\x1b[r\x1b[1;{}r\x1b8",
@@ -129,9 +142,10 @@ impl FooterReservation {
         let (prefix, visible, caret) = composer_line_parts(input, self.cols as usize);
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        // stdout 的锁与 stream renderer 共用：整段控制序列不会被模型正文插入。
-        // 不把真实 cursor 留在 footer，避免下一个模型/token 输出从输入行开始；尾部用
-        // 可见的 block caret 表示编辑位置。
+        // The stdout lock is shared with the stream renderer: the whole control
+        // sequence cannot be interleaved into model text. Do not leave the real
+        // cursor in the footer, so the next model/token output does not start from
+        // the input row; the tail uses a visible block caret to mark the edit point.
         write!(
             out,
             "\x1b7\x1b[?25l\x1b[{};1H\x1b[2K{ACCENT_MUTED}{prefix}{RESET}{visible}{ACCENT_MUTED}{caret}{RESET}\x1b8\x1b[?25h",
@@ -176,14 +190,16 @@ fn terminal_size() -> io::Result<(u16, u16)> {
     }
 }
 
-/// 是否启用同终端 side-note 输入监听：仅前台主 agent + 交互式 stdin + 终端输出开启。
+/// Whether same-terminal side-note input listening is enabled: foreground main agent
+/// + interactive stdin + terminal output only.
 pub(crate) fn side_note_input_enabled() -> bool {
     let term_out = runtime_ctx::terminal_output_enabled();
     let stdin_tty = io::stdin().is_terminal();
     let depth = runtime_ctx::current_subagent_depth();
     let enabled = term_out && stdin_tty && depth == 0;
-    // 临时诊断（RUST_TOOLS_SIDE_NOTE_DEBUG=1 时打印各启用条件的真实值），
-    // 定位"Ctrl+G 不生效"时监听器为何未启动；定位后移除。
+    // Temporary diagnostics (prints the real value of each enable condition when
+    // RUST_TOOLS_SIDE_NOTE_DEBUG=1), for locating why the listener fails to start
+    // when "Ctrl+G does nothing"; remove after diagnosis.
     if std::env::var_os("RUST_TOOLS_SIDE_NOTE_DEBUG").is_some() {
         eprintln!(
             "[side-note-debug] enabled={enabled} term_out={term_out} stdin_tty={stdin_tty} depth={depth}"
@@ -192,7 +208,8 @@ pub(crate) fn side_note_input_enabled() -> bool {
     enabled
 }
 
-/// RAII 守卫：持有后台监听任务，drop 时请求退出并等待终端恢复。
+/// RAII guard: holds the background listener task, requests exit on drop and waits
+/// for the terminal to be restored.
 pub(crate) struct SideNoteInputGuard {
     stop: Arc<AtomicBool>,
     terminal_released: mpsc::Receiver<()>,
@@ -213,14 +230,16 @@ impl SideNoteInputGuard {
                     if task_stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    // 工具确认等前台 prompt 与本监听器可能处于同一个 turn。租约保证任何
-                    // 时刻只有一个 stdin reader / termios owner；前台结束后监听器重新接管。
+                    // Foreground prompts such as tool confirmation may share a turn with
+                    // this listener. The lease guarantees a single stdin reader / termios
+                    // owner at any moment; after the foreground ends the listener retakes it.
                     let Some(stdin_owner) = acquire_background_stdin() else {
                         thread::sleep(Duration::from_millis(POLL_MS as u64));
                         continue;
                     };
-                    // 若 guard 已在线程获得执行权前被 drop，绝不能事后切换 cbreak
-                    // 或设置滚动区域；否则下一轮 prompt 会继承孤立的终端状态。
+                    // If the guard was dropped before this thread got scheduled, we must
+                    // not switch cbreak or set the scroll region afterwards; otherwise
+                    // the next prompt turn would inherit orphaned terminal state.
                     if should_yield_stdin(&task_stop) {
                         drop(stdin_owner);
                         continue;
@@ -234,8 +253,9 @@ impl SideNoteInputGuard {
                         drop(stdin_owner);
                         continue;
                     }
-                    // 监听器只接管 stdin；未按 Ctrl+G 时绝不设置滚动区域或移动 stdout，
-                    // 避免普通 turn 的状态/正文被无条件推到终端底部。
+                    // The listener only takes over stdin; before Ctrl+G is pressed it
+                    // never sets the scroll region or moves stdout, so a normal turn's
+                    // state/body is not unconditionally pushed to the terminal bottom.
                     if let Some(ready_tx) = ready_tx.take() {
                         let _ = ready_tx.send(true);
                     }
@@ -249,8 +269,9 @@ impl SideNoteInputGuard {
                 if let Some(ready_tx) = ready_tx {
                     let _ = ready_tx.send(false);
                 }
-                // 只能在输入循环返回且 CbreakTerm 已析构后确认；收到此消息即保证该
-                // 线程不会再 poll/read stdin，也不再持有 cbreak 终端状态。
+                // Can only be confirmed after the input loop returns and CbreakTerm has
+                // been dropped; receiving this message guarantees this thread will no
+                // longer poll/read stdin nor hold cbreak terminal state.
                 let _ = terminal_released_tx.send(());
             })
             .ok();
@@ -276,21 +297,24 @@ impl Drop for SideNoteInputGuard {
             .terminal_released
             .recv_timeout(Duration::from_millis(SHUTDOWN_WAIT_MS));
         if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
-            // 仅回收已完成线程；超时后绝不 join 尚未结束的 worker，保证 Drop 有硬上限。
+            // Only reap finished threads; never join a still-running worker after the
+            // timeout, keeping Drop's wait hard-bounded.
             let _ = self.task.take().expect("checked above").join();
         }
     }
 }
 
-/// cbreak 终端模式：关闭 ICANON（单键即时送达）与 ECHO（自行回显，便于按字符宽度
-/// 擦除），保留 ISIG（Ctrl+C 仍触发 SIGINT）与 OPOST（输出换行转换不受影响）。
+/// cbreak terminal mode: ICANON off (single keys delivered immediately) and ECHO off
+/// (self-managed echo so erasing by character width works), ISIG kept (Ctrl+C still
+/// raises SIGINT) and OPOST kept (output newline conversion unaffected).
 struct CbreakTerm {
     saved: libc::termios,
 }
 
 impl CbreakTerm {
     fn enter() -> io::Result<Self> {
-        // SAFETY: 只读写 stdin 的 termios，无跨线程共享的可变访问。
+        // SAFETY: only reads/writes stdin's termios; no mutable access shared across
+        // threads.
         unsafe {
             let mut t = std::mem::zeroed::<libc::termios>();
             if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
@@ -310,20 +334,21 @@ impl CbreakTerm {
 
 impl Drop for CbreakTerm {
     fn drop(&mut self) {
-        // SAFETY: 恢复进入前的原始终端状态。
+        // SAFETY: restores the original terminal state captured on entry.
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved);
         }
     }
 }
 
-/// 字符在终端中占用的列数（East Asian Wide / Fullwidth 计 2 列，其余 1 列）。
-/// 用于输入回显与 backspace 擦除的精确列对齐。
+/// Number of terminal columns occupied by a character (East Asian Wide / Fullwidth
+/// count as 2 columns, everything else 1). Used for exact column alignment of input
+/// echo and backspace erasure.
 fn char_width(c: char) -> usize {
     let cp = c as u32;
     if (0x1100..=0x115F).contains(&cp)
         || (0x2E80..=0xA4CF).contains(&cp)
-        || (0x3400..=0x4DBF).contains(&cp) // CJK 扩展 A
+        || (0x3400..=0x4DBF).contains(&cp) // CJK Extension A
         || (0xAC00..=0xD7A3).contains(&cp)
         || (0xF900..=0xFAFF).contains(&cp)
         || (0xFE30..=0xFE4F).contains(&cp)
@@ -331,7 +356,7 @@ fn char_width(c: char) -> usize {
         || (0xFFE0..=0xFFE6).contains(&cp)
         || (0x1F300..=0x1F9FF).contains(&cp)
         || (0x20000..=0x2FFFD).contains(&cp)
-    // CJK 扩展 B+
+    // CJK Extension B+
     {
         2
     } else {
@@ -354,7 +379,8 @@ fn composer_layout(cols: usize) -> (&'static str, Option<char>) {
     }
 }
 
-/// 把长输入裁成单行尾部视图，永远给 composer 的可见 caret 留一列，避免底部行换行。
+/// Trim long input to a single-line tail view, always leaving one column for the
+/// composer's visible caret so the bottom line never wraps.
 fn input_viewport_with_layout(
     input: &[char],
     cols: usize,
@@ -421,8 +447,10 @@ fn refresh_footer(footer: &mut FooterReservation, input: Option<&[char]>) -> io:
     Ok(())
 }
 
-/// 在不持有终端职责的独立线程写入 side-note；监听线程只按 poll 周期等待结果，stop
-/// 到达后立即放弃等待并进入终端清理，不能被文件系统 I/O 拖住。
+/// Write the side-note from a separate thread that owns no terminal duties; the
+/// listener thread only waits for the result at poll cadence, gives up waiting as
+/// soon as stop arrives and enters terminal cleanup, and must not get stuck on
+/// filesystem I/O.
 fn persist_side_note_interruptibly(
     history_file: &Path,
     content: &str,
@@ -456,8 +484,10 @@ fn persist_side_note_interruptibly(
     }
 }
 
-/// 发送当前草稿（Esc/F2/Alt+Enter 提交键共用）：内容为空时仅退出输入模式；
-/// 非空时写入 foreground 队列。写入失败保留草稿并继续 composer，不静默丢失指令。
+/// Submit the current draft (shared by the Esc/F2/Alt+Enter submit keys): with empty
+/// content just exit input mode; otherwise write to the foreground queue. On write
+/// failure the draft is kept and the composer stays, never silently losing the
+/// instruction.
 fn submit_draft(
     history_file: &Path,
     stop: &AtomicBool,
@@ -474,8 +504,9 @@ fn submit_draft(
         *in_input = false;
         return clear_input(footer);
     }
-    // 不在 transcript 中插入确认行：模型可能正流式生成一个 Markdown 段落，
-    // 额外换行会改变其语义布局。footer 清除即为发送反馈。
+    // Do not insert a confirmation line into the transcript: the model may be mid-way
+    // through streaming a Markdown paragraph and an extra newline would change its
+    // semantic layout. Clearing the footer is the send feedback.
     match persist_side_note_interruptibly(history_file, &content, stop) {
         Some(true) => {
             input.clear();
@@ -483,8 +514,8 @@ fn submit_draft(
             clear_input(footer)
         }
         Some(false) => {
-            // 保留草稿并继续显示 composer，避免静默丢失用户指令；可再次按
-            // Esc/F2 重试，或 Ctrl+G 放弃。
+            // Keep the draft and keep showing the composer so the user's instruction
+            // is not silently lost; press Esc/F2 again to retry, or Ctrl+G to give up.
             redraw_input(footer, input)
         }
         None => Err(io::Error::new(
@@ -494,8 +525,9 @@ fn submit_draft(
     }
 }
 
-/// 带超时的单字节读取（仅用于 Esc 后判定是否为提交型功能键序列）。
-/// 返回 None 表示超时、收到 stop，或 stdin 关闭/出错。
+/// Single-byte read with timeout (only used to decide whether a post-Esc key is a
+/// submit-type function-key sequence).
+/// None means timeout, stop received, or stdin closed/errored.
 fn read_byte_timeout(timeout_ms: i32, stop: &AtomicBool) -> Option<u8> {
     let deadline = std::time::Instant::now()
         + Duration::from_millis(u64::try_from(timeout_ms.max(0)).unwrap_or_default());
@@ -510,55 +542,60 @@ fn read_byte_timeout(timeout_ms: i32, stop: &AtomicBool) -> Option<u8> {
         };
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let wait_ms = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
-        // SAFETY: pollfd 为栈上独占可变引用。
+        // SAFETY: the pollfd is a stack-local, exclusively mutable reference.
         let ret = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
         if ret < 0 {
-            // EINTR（SIGINT/SIGWINCH 等）重试，但仍受 deadline / stop 约束，不能让
-            // 正在退出的监听线程无限停在转义序列解析中。
+            // EINTR (SIGINT/SIGWINCH etc.) retries, still bounded by the deadline /
+            // stop, so a listener thread that is exiting cannot hang forever inside
+            // escape sequence parsing.
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             return None;
         }
         if ret == 0 {
-            return None; // 超时：无跟随字节，即裸 Esc
+            return None; // timeout: no follow-up byte, i.e. a bare Esc
         }
         if pfd.revents & libc::POLLIN == 0 {
             return None;
         }
-        // poll 返回与 guard 请求退出之间可能已有下一轮输入到达；不要吞掉它。
+        // Input for the next round may have arrived between poll returning and the
+        // guard requesting exit; do not swallow it.
         if should_yield_stdin(stop) {
             return None;
         }
         let mut byte = [0u8; 1];
-        // SAFETY: 单字节栈缓冲，poll 已确认可读，阻塞 read 立即返回。
+        // SAFETY: one-byte stack buffer; poll confirmed readability so the blocking
+        // read returns immediately.
         let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
         if n == 1 {
             return Some(byte[0]);
         }
         if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue; // read 被信号打断，重试
+            continue; // read interrupted by a signal, retry
         }
-        return None; // EOF 或错误
+        return None; // EOF or error
     }
 }
 
-/// 判定 ESC（0x1b）后的按键是否为提交键：裸 Esc、F2（`ESC O Q` / `ESC [ 1 2 ~`）、
-/// Alt+Enter（`ESC \r` / `ESC \n`）。终端在单个写突发内发出完整功能键序列，跟随
-/// 字节几乎立即可达；无论是否提交，本函数都会消费掉 ESC 之后的全部跟随字节，
-/// 避免方向键等其他序列的字节混入草稿。
+/// Decide whether the keys following ESC (0x1b) form a submit key: bare Esc, F2
+/// (`ESC O Q` / `ESC [ 1 2 ~`), Alt+Enter (`ESC \r` / `ESC \n`). Terminals emit the
+/// full function-key sequence in a single write burst, so follow-up bytes are almost
+/// immediately available; whether or not it submits, this function consumes every
+/// follow-up byte after ESC so bytes from other sequences such as arrow keys cannot
+/// leak into the draft.
 fn is_submit_escape(stop: &AtomicBool) -> bool {
     const ESCAPE_FOLLOWUP_MS: i32 = 30;
     const MAX_CSI_BYTES: usize = 16;
     match read_byte_timeout(ESCAPE_FOLLOWUP_MS, stop) {
-        None => !should_yield_stdin(stop), // 裸 Esc；停止/前台抢占时绝不提交草稿
+        None => !should_yield_stdin(stop), // bare Esc; never submit the draft while stopping / foreground-preempted
         Some(0x0d) | Some(0x0a) => true,   // Alt+Enter
         Some(0x4f) => {
-            // SS3 形式：`ESC O Q` → F2；其余（F1/F3/F4 等）吞掉并忽略。
+            // SS3 form: `ESC O Q` → F2; the rest (F1/F3/F4 etc.) are swallowed and ignored.
             read_byte_timeout(ESCAPE_FOLLOWUP_MS, stop) == Some(0x51)
         }
         Some(0x5b) => {
-            // CSI 形式：读至 `~` 终止符；`ESC [ 1 2 ~` → F2，其余忽略。
+            // CSI form: read until the `~` terminator; `ESC [ 1 2 ~` → F2, anything else ignored.
             let mut seq = Vec::new();
             loop {
                 match read_byte_timeout(ESCAPE_FOLLOWUP_MS, stop) {
@@ -573,9 +610,10 @@ fn is_submit_escape(stop: &AtomicBool) -> bool {
     }
 }
 
-/// 返回 true 表示因前台 prompt 抢占而退出，调用方应在 prompt 结束后重新接管 stdin。
+/// Returns true when the exit was caused by a foreground prompt taking over; the
+/// caller should retake stdin after the prompt finishes.
 fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: CbreakTerm) -> bool {
-    // 输入模式：UTF-8 字节累积缓冲 + 已解析字符 + 已回显列数
+    // Input mode: UTF-8 byte accumulation buffer + parsed characters + echoed column count
     let mut pending: Vec<u8> = Vec::new();
     let mut input: Vec<char> = Vec::new();
     let mut in_input = false;
@@ -591,14 +629,15 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // SAFETY: pollfd 为栈上独占可变引用。
+            // SAFETY: the pollfd is a stack-local, exclusively mutable reference.
             let ret = unsafe { libc::poll(&mut pfd, 1, POLL_MS) };
             if should_yield_stdin(stop) {
                 break;
             }
             if ret < 0 {
-                // EINTR：终端尺寸变化（SIGWINCH）等信号会中断 poll，属正常现象，
-                // 重新计算 footer 位置；其余错误（fd 失效等）才退出监听。
+                // EINTR: signals such as terminal resize (SIGWINCH) interrupt poll — a
+                // normal occurrence; recompute the footer position. Only other errors
+                // (invalid fd etc.) exit the listener.
                 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                     if let Some(active_footer) = footer.as_mut() {
                         if refresh_footer(active_footer, in_input.then_some(input.as_slice()))
@@ -612,10 +651,12 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
                 break;
             }
             if ret == 0 {
-                // renderer 中仍有少量历史的整屏擦除序列（CSI 0J）。DECSTBM 会阻止
-                // 其滚动进 footer，却不限制擦除范围；输入激活时以 poll 周期重绘，使
-                // 草稿即使被异步重画短暂清掉也会在 50ms 内恢复，而无需把所有 renderer
-                // 的成熟重写状态机改成另一套光标协议。
+                // The renderer still contains a few legacy full-screen erase sequences
+                // (CSI 0J). DECSTBM keeps them from scrolling into the footer but does
+                // not bound their erase range; while input is active we redraw at poll
+                // cadence so a draft briefly cleared by an async redraw recovers within
+                // 50ms, without forcing every renderer's mature rewrite state machine
+                // onto a different cursor protocol.
                 if in_input {
                     let Some(active_footer) = footer.as_mut() else {
                         break;
@@ -628,16 +669,18 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
             }
             if pfd.revents & libc::POLLIN == 0 {
                 if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                    break; // stdin 关闭/出错，退出监听
+                    break; // stdin closed/errored, exit the listener
                 }
                 continue;
             }
-            // 退出与 stdin 就绪同时发生时，把字节留给随后打开的 prompt。
+            // When exit and stdin readiness happen together, leave the byte for the
+            // prompt that opens next.
             if should_yield_stdin(stop) {
                 break;
             }
             let mut byte = [0u8; 1];
-            // SAFETY: 单字节栈缓冲，poll 已确认可读，阻塞 read 立即返回。
+            // SAFETY: one-byte stack buffer; poll confirmed readability so the blocking
+            // read returns immediately.
             let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
             if n == 0 {
                 break; // EOF
@@ -655,7 +698,8 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
         };
 
         if !in_input {
-            // 监听状态：仅 Ctrl+G 进入输入模式；Ctrl+C 由 SIGINT 路径处理（读到即退出）
+            // Listening state: only Ctrl+G enters input mode; Ctrl+C is handled by the
+            // SIGINT path (exit as soon as it is read)
             if b == CTRL_G {
                 input.clear();
                 pending.clear();
@@ -669,26 +713,30 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
                         in_input = true;
                     }
                     Err(_) => {
-                        // 当前尺寸无法安全建立 footer 时忽略本次 Ctrl+G；监听继续，
-                        // 用户调整终端尺寸后可以重试。
+                        // Ignore this Ctrl+G when the current size cannot safely
+                        // establish a footer; listening continues and the user can
+                        // retry after resizing the terminal.
                     }
                 }
             } else if b == 0x03 {
-                break; // 流式期间 Ctrl+C：主循环中断处理，监听任务退出
+                break; // Ctrl+C during streaming: main loop handles the interrupt, listener task exits
             }
             continue;
         }
 
-        // 输入模式：控制字节直接处理，其余按 UTF-8 累积解码
+        // Input mode: control bytes handled directly, everything else decoded as
+        // accumulated UTF-8
         match b {
             0x0d | 0x0a => {
-                // 回车不再发送：与主输入"回车=换行、Esc/F2 提交"的键位语义对齐。
-                // 单行 composer 下回车直接忽略，避免误触提交。
+                // Enter no longer sends: aligned with the main input's "Enter=newline,
+                // Esc/F2 submit" key semantics. In the single-line composer Enter is
+                // ignored outright to avoid accidental submits.
             }
             0x7f | 0x08 => {
-                // backspace：重绘单行 viewport，长输入不会在 footer 自动换行。
+                // backspace: redraw the single-line viewport; long input never
+                // auto-wraps in the footer.
                 if input.pop().is_some() {
-                    pending.clear(); // 避免半字符残留与后续字节拼出非法序列
+                    pending.clear(); // avoid a leftover half character forming an illegal sequence with later bytes
                     let Some(active_footer) = footer.as_mut() else {
                         break;
                     };
@@ -698,9 +746,10 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
                 }
             }
             0x1b => {
-                // Esc / F2 / Alt+Enter：提交草稿。is_submit_escape 会消费掉 F2 等
-                // 功能键的完整转义序列，避免其跟随字节混入草稿；方向键等其他序列
-                // 被吞掉而不提交。
+                // Esc / F2 / Alt+Enter: submit the draft. is_submit_escape consumes
+                // the full escape sequence of F2 and other function keys so their
+                // follow-up bytes cannot leak into the draft; other sequences such as
+                // arrow keys are swallowed without submitting.
                 if is_submit_escape(stop) {
                     let Some(active_footer) = footer.as_mut() else {
                         break;
@@ -725,7 +774,7 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
                 }
             }
             0x07 => {
-                // 再次 Ctrl+G：放弃当前草稿并退出输入模式（取消）。
+                // Ctrl+G again: discard the current draft and exit input mode (cancel).
                 input.clear();
                 pending.clear();
                 in_input = false;
@@ -738,7 +787,7 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
                 }
             }
             0x03 => {
-                // 输入中 Ctrl+C：SIGINT 已触发主中断，放弃本条输入
+                // Ctrl+C while typing: SIGINT has already raised the main interrupt, discard this draft
                 input.clear();
                 pending.clear();
                 if let Some(active_footer) = footer.as_mut() {
@@ -765,17 +814,18 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
                         pending.clear();
                     }
                     Err(e) if e.error_len().is_none() => {
-                        // 不完整的多字节序列，继续累积
+                        // Incomplete multi-byte sequence, keep accumulating
                     }
                     Err(_) => {
-                        pending.clear(); // 非法字节，丢弃
+                        pending.clear(); // illegal byte, discard
                     }
                 }
             }
         }
     }
-    // 循环退出（stop / EOF / 错误 / Ctrl+C）：由监听线程独占完成终端清理，避免 guard
-    // 在阻塞 poll 尚未返回时抢先重置滚动区域。
+    // Loop exit (stop / EOF / error / Ctrl+C): the listener thread alone performs
+    // the terminal cleanup, avoiding the guard resetting the scroll region first
+    // while a blocking poll has not yet returned.
     if let Some(mut active_footer) = footer {
         if in_input {
             let _ = clear_input(&mut active_footer);
@@ -800,8 +850,9 @@ mod tests {
 
     #[test]
     fn enabled_check_does_not_panic() {
-        // 非交互 stdin（管道/CI）下绝不应启用，避免监听任务污染重定向输入。
-        // 无论本机 stdin 是否为 tty，该查询都不应 panic。
+        // Must never be enabled with non-interactive stdin (pipe/CI), so the listener
+        // cannot pollute redirected input. The query must not panic regardless of
+        // whether the local stdin is a tty.
         let _ = side_note_input_enabled();
     }
 
@@ -816,7 +867,8 @@ mod tests {
                 thread::yield_now();
             }
             let _ = terminal_released_tx.send(());
-            // 模拟终端职责已结束、但后续非终端工作永久阻塞的 worker。
+            // Simulates a worker whose terminal duty has ended but whose later
+            // non-terminal work blocks forever.
             let _ = worker_release_rx.recv();
         });
         let guard = SideNoteInputGuard {
@@ -882,7 +934,8 @@ mod tests {
     #[test]
     fn input_viewport_keeps_the_tail_on_one_line() {
         let input: Vec<char> = "abcdefghijklmnopqrstuvwxyz".chars().collect();
-        // cols 取能容纳完整 COMPOSER_PREFIX 的宽度，验证完整提示前缀下的单行约束。
+        // cols is wide enough for the full COMPOSER_PREFIX, verifying the single-line
+        // constraint under the full prompt prefix.
         let visible = input_viewport(&input, 60);
         assert!(visible.starts_with('…'));
         assert!(visible.ends_with("vwxyz"));
@@ -896,7 +949,8 @@ mod tests {
     #[test]
     fn input_viewport_keeps_wide_characters_intact() {
         let input: Vec<char> = "前缀-修复这些问题-🚀".chars().collect();
-        // 同上：用能容纳完整前缀的宽度验证宽字符（CJK/emoji）不被截断。
+        // Same as above: verify wide characters (CJK/emoji) are not truncated using
+        // a width that fits the full prefix.
         let visible = input_viewport(&input, 64);
         assert!(visible.contains('🚀'));
         let total_width = display_width(COMPOSER_PREFIX.chars())

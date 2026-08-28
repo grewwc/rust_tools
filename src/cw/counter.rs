@@ -1,28 +1,30 @@
-//! 计数器（Counter）实现
+//! Counter implementation.
 //!
-//! 用于统计元素出现频率的数据结构，类似于 Python 的 `collections.Counter`。
+//! A data structure for counting element frequencies, similar to Python's
+//! `collections.Counter`.
 
 use std::hash::Hash;
 
 use crate::commonw::types::FastMap;
 
-/// 计数器（Counter）
+/// Counter.
 ///
-/// 用于统计元素出现频率的数据结构。内部使用 `FastMap`（基于 FxHasher 的 HashMap）实现，
-/// 提供高性能的计数操作。
+/// A data structure for counting element frequencies. Implemented on top of
+/// `FastMap` (a HashMap based on FxHasher), it provides high-performance
+/// counting operations.
 ///
-/// # 类型参数
+/// # Type Parameters
 ///
-/// * `K` - 计数的元素类型，必须实现 `Eq` 和 `Hash`
+/// * `K` - The element type being counted; must implement `Eq` and `Hash`
 ///
-/// # 示例
+/// # Examples
 ///
 /// ```rust
 /// use rust_tools::cw::Counter;
 ///
 /// let mut counter: Counter<char> = Counter::new();
 ///
-/// // 统计字符频率
+/// // Count character frequencies
 /// for c in "hello world".chars() {
 ///     counter.inc(c);
 /// }
@@ -30,35 +32,35 @@ use crate::commonw::types::FastMap;
 /// assert_eq!(counter.get(&'l'), 3);
 /// assert_eq!(counter.get(&'o'), 2);
 /// assert_eq!(counter.get(&'h'), 1);
-/// assert_eq!(counter.get(&'x'), 0); // 不存在的元素返回 0
+/// assert_eq!(counter.get(&'x'), 0); // missing elements return 0
 ///
-/// // 获取最常见的元素
+/// // Get the most common elements
 /// let top3 = counter.most_common(3);
 /// assert_eq!(top3[0], ('l', 3));
 /// assert_eq!(top3[1], ('o', 2));
 /// ```
 ///
-/// # 性能特征
+/// # Performance
 ///
-/// - 时间复杂度：
-///   - `inc`/`add`/`dec`: O(1) 平均
-///   - `get`/`contains`: O(1) 平均
-///   - `most_common`: O(n log n)，n 为不同元素的数量
-/// - 空间复杂度：O(n)，n 为不同元素的数量
+/// - Time complexity:
+///   - `inc`/`add`/`dec`: O(1) average
+///   - `get`/`contains`: O(1) average
+///   - `most_common`: O(n log n), where n is the number of distinct elements
+/// - Space complexity: O(n), where n is the number of distinct elements
 ///
-/// # 注意事项
+/// # Notes
 ///
-/// - 计数不会低于 0
-/// - 当计数减到 0 时，元素会自动从计数器中移除
-/// - 使用饱和加法/减法，避免溢出
+/// - Counts never go below 0
+/// - When a count reaches 0, the element is automatically removed from the counter
+/// - Uses saturating addition/subtraction to avoid overflow
 #[derive(Clone, Debug, Default)]
 pub struct Counter<K>
 where
     K: Eq + Hash,
 {
-    /// 存储元素及其计数的映射
+    /// Map storing elements and their counts
     data: FastMap<K, usize>,
-    /// 所有元素的总计数
+    /// Total count across all elements
     total: usize,
 }
 
@@ -66,9 +68,9 @@ impl<K> Counter<K>
 where
     K: Eq + Hash,
 {
-    /// 创建一个新的空计数器
+    /// Creates a new empty counter
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -84,11 +86,11 @@ where
         }
     }
 
-    /// 清空计数器
+    /// Clears the counter
     ///
-    /// 移除所有元素并重置总计数。
+    /// Removes all elements and resets the total count.
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -105,9 +107,9 @@ where
         self.total = 0;
     }
 
-    /// 返回不同元素的数量
+    /// Returns the number of distinct elements
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -116,15 +118,15 @@ where
     /// counter.inc("a");
     /// counter.inc("b");
     /// counter.inc("a");
-    /// assert_eq!(counter.len(), 2); // "a" 和 "b" 两个不同元素
+    /// assert_eq!(counter.len(), 2); // two distinct elements, "a" and "b"
     /// ```
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
-    /// 检查计数器是否为空
+    /// Checks whether the counter is empty
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -138,9 +140,9 @@ where
         self.data.is_empty()
     }
 
-    /// 返回所有元素的总计数
+    /// Returns the total count across all elements
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -154,15 +156,15 @@ where
         self.total
     }
 
-    /// 获取元素的计数值
+    /// Gets the count of an element
     ///
-    /// 如果元素不存在，返回 0。
+    /// Returns 0 if the element does not exist.
     ///
-    /// # 参数
+    /// # Arguments
     ///
-    /// * `key` - 要查询的元素
+    /// * `key` - The element to look up
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -170,24 +172,24 @@ where
     /// let mut counter = Counter::new();
     /// counter.inc("a");
     /// assert_eq!(counter.get(&"a"), 1);
-    /// assert_eq!(counter.get(&"b"), 0); // 不存在的元素返回 0
+    /// assert_eq!(counter.get(&"b"), 0); // missing elements return 0
     /// ```
     pub fn get(&self, key: &K) -> usize {
         self.data.get(key).copied().unwrap_or(0)
     }
 
-    /// 增加元素的计数值
+    /// Adds to an element's count
     ///
-    /// # 参数
+    /// # Arguments
     ///
-    /// * `key` - 要增加计数的元素
-    /// * `n` - 增加的数量
+    /// * `key` - The element to increment
+    /// * `n` - The amount to add
     ///
-    /// # 返回值
+    /// # Returns
     ///
-    /// 返回增加后的新计数值
+    /// Returns the new count after the addition
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -198,10 +200,10 @@ where
     /// assert_eq!(counter.get(&"a"), 8);
     /// ```
     ///
-    /// # 注意事项
+    /// # Notes
     ///
-    /// - 如果 `n` 为 0，不执行任何操作，返回当前计数值
-    /// - 使用饱和加法，避免溢出
+    /// - If `n` is 0, does nothing and returns the current count
+    /// - Uses saturating addition to avoid overflow
     pub fn add(&mut self, key: K, n: usize) -> usize {
         if n == 0 {
             return self.get(&key);
@@ -212,17 +214,17 @@ where
         *x
     }
 
-    /// 将元素的计数值加 1
+    /// Increments an element's count by 1
     ///
-    /// # 参数
+    /// # Arguments
     ///
-    /// * `key` - 要增加计数的元素
+    /// * `key` - The element to increment
     ///
-    /// # 返回值
+    /// # Returns
     ///
-    /// 返回增加后的新计数值
+    /// Returns the new count after the increment
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -235,17 +237,17 @@ where
         self.add(key, 1)
     }
 
-    /// 将元素的计数值减 1
+    /// Decrements an element's count by 1
     ///
-    /// # 参数
+    /// # Arguments
     ///
-    /// * `key` - 要减少计数的元素
+    /// * `key` - The element to decrement
     ///
-    /// # 返回值
+    /// # Returns
     ///
-    /// 返回减少后的新计数值
+    /// Returns the new count after the decrement
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -255,14 +257,14 @@ where
     /// assert_eq!(counter.dec(&"a"), 2);
     /// assert_eq!(counter.dec(&"a"), 1);
     /// assert_eq!(counter.dec(&"a"), 0);
-    /// // 计数为 0 时，元素会被自动移除
+    /// // When the count reaches 0, the element is removed automatically
     /// assert!(!counter.contains(&"a"));
     /// ```
     ///
-    /// # 注意事项
+    /// # Notes
     ///
-    /// - 如果元素不存在或计数已为 0，返回 0
-    /// - 当计数减到 0 时，元素会自动从计数器中移除
+    /// - Returns 0 if the element does not exist or its count is already 0
+    /// - When a count reaches 0, the element is automatically removed from the counter
     pub fn dec(&mut self, key: &K) -> usize {
         let Some(curr) = self.data.get_mut(key) else {
             return 0;
@@ -279,18 +281,18 @@ where
         left
     }
 
-    /// 移除元素并返回其计数值
+    /// Removes an element and returns its count
     ///
-    /// # 参数
+    /// # Arguments
     ///
-    /// * `key` - 要移除的元素
+    /// * `key` - The element to remove
     ///
-    /// # 返回值
+    /// # Returns
     ///
-    /// - `Some(count)` - 如果元素存在，返回其计数值
-    /// - `None` - 如果元素不存在
+    /// - `Some(count)` - the element's count, if the element exists
+    /// - `None` - if the element does not exist
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -306,13 +308,13 @@ where
         Some(v)
     }
 
-    /// 检查元素是否在计数器中
+    /// Checks whether an element is in the counter
     ///
-    /// # 参数
+    /// # Arguments
     ///
-    /// * `key` - 要检查的元素
+    /// * `key` - The element to check
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -326,11 +328,11 @@ where
         self.data.contains_key(key)
     }
 
-    /// 返回计数器的迭代器
+    /// Returns an iterator over the counter
     ///
-    /// 迭代顺序不确定。
+    /// The iteration order is unspecified.
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -354,19 +356,20 @@ impl<K> Counter<K>
 where
     K: Eq + Hash + Clone,
 {
-    /// 返回最常见的 n 个元素及其计数值
+    /// Returns the n most common elements with their counts
     ///
-    /// 按计数值降序排列。如果元素数量少于 n，返回所有元素。
+    /// Sorted by count in descending order. If there are fewer than n elements,
+    /// all elements are returned.
     ///
-    /// # 参数
+    /// # Arguments
     ///
-    /// * `n` - 要返回的元素数量
+    /// * `n` - The number of elements to return
     ///
-    /// # 返回值
+    /// # Returns
     ///
-    /// 包含 (元素，计数值) 对的向量，按计数值降序排列
+    /// A vector of (element, count) pairs, sorted by count in descending order
     ///
-    /// # 示例
+    /// # Examples
     ///
     /// ```rust
     /// use rust_tools::cw::Counter;
@@ -379,14 +382,14 @@ where
     ///
     /// let top3 = counter.most_common(3);
     /// assert_eq!(top3[0], ("a", 5));
-    /// // "c" 和 "d" 计数值相同，顺序不确定
+    /// // "c" and "d" have equal counts; the order is unspecified
     /// assert!(top3[1].1 == 3 && top3[2].1 == 3);
     /// ```
     ///
-    /// # 性能特征
+    /// # Performance
     ///
-    /// - 时间复杂度：O(n log n)，n 为不同元素的数量
-    /// - 空间复杂度：O(n)
+    /// - Time complexity: O(n log n), where n is the number of distinct elements
+    /// - Space complexity: O(n)
     pub fn most_common(&self, n: usize) -> Vec<(K, usize)> {
         if n == 0 {
             return Vec::new();

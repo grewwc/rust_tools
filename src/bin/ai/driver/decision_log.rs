@@ -1,6 +1,6 @@
-/// 决策日志模块 - 记录 AI Agent 的关键决策过程
+/// Decision log module - records the AI agent's key decision-making process
 ///
-/// 用于元认知（Meta-Cognition）：追溯"为什么做了某个选择"，便于调试和优化
+/// Used for meta-cognition: traces back "why a certain choice was made", aiding debugging and optimization
 use chrono::Local;
 use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
@@ -11,64 +11,64 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// 磁盘决策日志的字节上限；超过即触发一次保留尾部的压缩。约 8MB。
+/// Byte cap for the on-disk decision log; exceeding it triggers one tail-retaining compaction. About 8MB.
 const DECISION_LOG_MAX_PERSIST_BYTES: u64 = 8 * 1024 * 1024;
-/// 压缩后保留的最近行数（与内存 max_capacity 同量级，足够回放当前会话）。
+/// Number of recent lines retained after compaction (same order as the in-memory max_capacity, enough to replay the current session).
 const DECISION_LOG_RETAIN_LINES: usize = 2000;
 
-/// 决策类型
+/// Decision type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DecisionType {
-    /// 技能选择
+    /// Skill selection
     SkillSelection,
-    /// 工具调用
+    /// Tool call
     ToolInvocation,
-    /// 模型路由（选择哪个模型）
+    /// Model routing (which model to choose)
     ModelRouting,
-    /// Memory 检索
+    /// Memory retrieval
     MemoryRetrieval,
-    /// Memory 保存门禁
+    /// Memory save gate
     MemorySave,
-    /// 反思触发
+    /// Reflection trigger
     ReflectionTrigger,
-    /// 调度器分发与评估
+    /// Scheduler dispatch and evaluation
     SchedulerDispatch,
-    /// 会话标题等辅助 LLM 任务
+    /// Auxiliary LLM tasks such as session title generation
     SessionTitle,
-    /// 截断重试时的 reasoning effort 降档决策
+    /// Reasoning effort downgrade decision on truncation retry
     TruncationDowngrade,
-    /// 运行时强制无工具收尾（no-tool handoff）的根因记录
+    /// Root-cause record for a runtime-forced no-tool handoff
     RuntimeStop,
 }
 
-/// 决策记录
+/// Decision record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionLog {
-    /// 时间戳 (Unix timestamp in milliseconds)
+    /// Timestamp (Unix timestamp in milliseconds)
     pub timestamp: i64,
-    /// 会话 ID
+    /// Session ID
     pub session_id: String,
-    /// 轮次 ID
+    /// Turn ID
     pub turn_id: usize,
-    /// 决策类型
+    /// Decision type
     pub decision_type: DecisionType,
-    /// 上下文（用户输入/当前状态）
+    /// Context (user input / current state)
     pub context: String,
-    /// 考虑的备选方案
+    /// Alternatives considered
     pub alternatives_considered: Vec<String>,
-    /// 最终选择的方案
+    /// Final choice
     pub chosen_option: String,
-    /// 选择理由
+    /// Rationale for the choice
     pub reasoning: String,
-    /// 置信度 (0.0 - 1.0)
+    /// Confidence (0.0 - 1.0)
     pub confidence: Option<f64>,
-    /// 事后结果（执行后填充）
+    /// Post-hoc outcome (filled in after execution)
     pub outcome: Option<Outcome>,
-    /// 执行耗时（毫秒）
+    /// Execution duration (milliseconds)
     pub execution_time_ms: Option<u64>,
 }
 
-/// 决策结果
+/// Decision outcome
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Outcome {
     pub success: bool,
@@ -76,7 +76,7 @@ pub struct Outcome {
     pub user_feedback: Option<UserFeedback>,
 }
 
-/// 用户反馈
+/// User feedback
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum UserFeedback {
     Positive,
@@ -84,7 +84,7 @@ pub enum UserFeedback {
     Neutral,
 }
 
-/// 决策日志存储器
+/// Decision log store
 pub struct DecisionLogStore {
     logs: Arc<Mutex<Vec<DecisionLog>>>,
     max_capacity: usize,
@@ -130,9 +130,9 @@ impl DecisionLogStore {
         let _ = writeln!(file, "{}", line);
         drop(file);
 
-        // 决策日志是 append-only JSONL：内存缓冲受 max_capacity 限制，但磁盘文件
-        // 若不轮转会无限增长，且 `replay_recent_from_disk` 每次都全量逐行读取。
-        // 这里用一次 O(1) 的 metadata 探测，仅当超过上限时才做一次保留尾部的压缩。
+        // The decision log is append-only JSONL: the in-memory buffer is bounded by max_capacity, but the on-disk file
+        // grows without bound if never rotated, and `replay_recent_from_disk` reads the whole file line by line every time.
+        // Use one O(1) metadata probe and compact with tail retention only when the cap is exceeded.
         if let Ok(meta) = fs::metadata(&path)
             && meta.len() > DECISION_LOG_MAX_PERSIST_BYTES
         {
@@ -140,9 +140,9 @@ impl DecisionLogStore {
         }
     }
 
-    /// 把磁盘日志文件压缩到最近 `DECISION_LOG_RETAIN_LINES` 行，使用临时文件
-    /// + 原子 rename，避免读到半截内容。best-effort：任意一步失败即放弃，不影响
-    /// 主流程。并发写入时遵循 last-writer-wins，最多丢失少量尚未压缩的尾行。
+    /// Compacts the on-disk log file down to the most recent `DECISION_LOG_RETAIN_LINES` lines, using a temp file
+    /// + atomic rename so readers never see a partial file. Best-effort: any failed step aborts the compaction without
+    /// affecting the main flow. Concurrent writes follow last-writer-wins; at most a few not-yet-compacted tail lines are lost.
     fn compact_persist_file(&self, path: &Path) {
         let Ok(file) = std::fs::File::open(path) else {
             return;
@@ -178,14 +178,14 @@ impl DecisionLogStore {
         let _ = fs::rename(&tmp_path, path);
     }
 
-    /// 记录一个决策
+    /// Record a decision
     pub fn log(&self, mut log: DecisionLog) {
         let mut logs = self.logs.lock().unwrap();
 
-        // 设置时间戳
+        // Set the timestamp
         log.timestamp = Local::now().timestamp_millis();
 
-        // 如果超出容量，删除最旧的 10%
+        // If over capacity, drop the oldest 10%
         if logs.len() >= self.max_capacity {
             let remove_count = self.max_capacity / 10;
             logs.drain(0..remove_count);
@@ -197,7 +197,7 @@ impl DecisionLogStore {
         self.persist_log_if_enabled(&persist_copy);
     }
 
-    /// 获取最近的 N 条日志
+    /// Get the most recent N log entries
     pub fn recent(&self, n: usize) -> Vec<DecisionLog> {
         let logs = self.logs.lock().unwrap();
         let start = logs.len().saturating_sub(n);
@@ -239,7 +239,7 @@ impl DecisionLogStore {
         out[start..].to_vec()
     }
 
-    /// 按类型筛选日志
+    /// Filter log entries by type
     pub fn by_type(&self, decision_type: &DecisionType) -> Vec<DecisionLog> {
         let logs = self.logs.lock().unwrap();
         logs.iter()
@@ -248,7 +248,7 @@ impl DecisionLogStore {
             .collect()
     }
 
-    /// 获取失败的决策日志
+    /// Get failed decision log entries
     pub fn failures(&self) -> Vec<DecisionLog> {
         let logs = self.logs.lock().unwrap();
         logs.iter()
@@ -257,7 +257,7 @@ impl DecisionLogStore {
             .collect()
     }
 
-    /// 获取低置信度的决策日志
+    /// Get low-confidence decision log entries
     pub fn low_confidence(&self, threshold: f64) -> Vec<DecisionLog> {
         let logs = self.logs.lock().unwrap();
         logs.iter()
@@ -266,7 +266,7 @@ impl DecisionLogStore {
             .collect()
     }
 
-    /// 更新某个决策的结果
+    /// Update the outcome of a decision
     pub fn update_outcome(&self, session_id: &str, turn_id: usize, outcome: Outcome) {
         let mut logs = self.logs.lock().unwrap();
         if let Some(log) = logs
@@ -277,7 +277,7 @@ impl DecisionLogStore {
         }
     }
 
-    /// 记录用户反馈
+    /// Record user feedback
     pub fn add_feedback(&self, session_id: &str, turn_id: usize, feedback: UserFeedback) {
         let mut logs = self.logs.lock().unwrap();
         if let Some(log) = logs
@@ -296,7 +296,7 @@ impl DecisionLogStore {
         }
     }
 
-    /// 导出为 JSON 字符串
+    /// Export as a JSON string
     pub fn export_json(&self, n: Option<usize>) -> String {
         let logs = self.logs.lock().unwrap();
         let logs_to_export = if let Some(n) = n {
@@ -310,7 +310,7 @@ impl DecisionLogStore {
             .unwrap_or_else(|e| format!("Error serializing logs: {}", e))
     }
 
-    /// 统计信息
+    /// Statistics
     pub fn stats(&self) -> DecisionStats {
         let logs = self.logs.lock().unwrap();
 
@@ -364,14 +364,14 @@ impl DecisionLogStore {
         }
     }
 
-    /// 清空日志
+    /// Clear the log
     pub fn clear(&self) {
         let mut logs = self.logs.lock().unwrap();
         logs.clear();
     }
 }
 
-/// 决策统计信息
+/// Decision statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionStats {
     pub total: usize,
@@ -383,7 +383,7 @@ pub struct DecisionStats {
     pub avg_execution_time_ms: f64,
 }
 
-/// 辅助函数：创建技能选择日志
+/// Helper: create a skill-selection log entry
 pub fn log_skill_selection(
     store: &DecisionLogStore,
     session_id: &str,
@@ -410,7 +410,7 @@ pub fn log_skill_selection(
     });
 }
 
-/// 辅助函数：创建工具调用日志
+/// Helper: create a tool-call log entry
 pub fn log_tool_invocation(
     store: &DecisionLogStore,
     session_id: &str,
@@ -436,8 +436,8 @@ pub fn log_tool_invocation(
     });
 }
 
-/// 辅助函数：记录截断重试时的 reasoning effort 降档决策。
-/// 用于事后审计"哪个会话、哪一轮、因何种截断被降档/未降档"。
+/// Helper: record the reasoning effort downgrade decision made on truncation retry.
+/// Used for post-hoc auditing of "which session, which turn, and which truncation caused a downgrade (or not)".
 pub fn log_truncation_downgrade(
     store: &DecisionLogStore,
     session_id: &str,
@@ -471,9 +471,9 @@ pub fn log_truncation_downgrade(
     });
 }
 
-/// 记录运行时强制无工具收尾（no-tool handoff）的根因，供事后审计。
-/// 只写入决策日志（会话旁路、不进入模型上下文），避免 internal note 被提升为
-/// system 后永久重放；stop 原因同时会注入本次请求投影供模型收尾。
+/// Record the root cause of a runtime-forced no-tool handoff for post-hoc auditing.
+/// Writes only to the decision log (session side channel, never enters model context), so an internal note cannot be promoted to
+/// a system message and replayed forever; the stop reason is also injected into the current request projection so the model can wrap up.
 pub fn log_runtime_stop(
     store: &DecisionLogStore,
     session_id: &str,
@@ -499,7 +499,7 @@ pub fn log_runtime_stop(
     });
 }
 
-/// 辅助函数：创建 Memory 检索日志
+/// Helper: create a memory-retrieval log entry
 pub fn log_memory_retrieval(
     store: &DecisionLogStore,
     session_id: &str,
@@ -569,7 +569,7 @@ pub fn log_memory_save_assessment(
     });
 }
 
-/// 辅助函数：记录调度器分发决策（含 defer/selected 与评分摘要）
+/// Helper: record a scheduler dispatch decision (including defer/selected and a scoring summary)
 pub fn log_scheduler_dispatch(
     store: &DecisionLogStore,
     session_id: &str,
@@ -603,9 +603,9 @@ pub fn log_scheduler_dispatch(
     });
 }
 
-/// 辅助函数：记录会话标题生成失败（传输/HTTP/解析/低质量被拒等静默路径）。
-/// 标题生成失败历史上只留注释掉的 eprintln，用户无法区分「请求超时」与
-/// 「模型返回了但被质量过滤拒掉」，导致 session 长期停留在 fallback 标题而不可观测。
+/// Helper: record a session-title generation failure (silent paths such as transport/HTTP/parse errors or low-quality rejection).
+/// Title generation failures used to leave only a commented-out eprintln, so users could not tell a "request timeout" from
+/// "the model replied but was rejected by quality filtering", leaving the session stuck on a fallback title, unobservable.
 pub fn log_session_title_failure(
     store: &DecisionLogStore,
     session_id: &str,
@@ -678,7 +678,7 @@ mod tests {
     fn test_log_store_capacity() {
         let store = DecisionLogStore::new(10);
 
-        // 添加 15 条日志
+        // Add 15 log entries
         for i in 0..15 {
             store.log(DecisionLog {
                 timestamp: 0,
@@ -695,10 +695,10 @@ mod tests {
             });
         }
 
-        // 应该只保留最近的 10 条（实际上会保留 9-10 条，因为会删除 10%）
+        // Only the most recent 10 entries should be kept (in practice 9-10 are kept because 10% get dropped)
         let recent = store.recent(100);
         assert!(recent.len() <= 10);
-        assert_eq!(recent[0].turn_id, 5); // 最旧的是第 5 条
+        assert_eq!(recent[0].turn_id, 5); // the oldest one is entry 5
     }
 
     #[test]
@@ -737,7 +737,7 @@ mod tests {
     fn test_stats() {
         let store = DecisionLogStore::new(100);
 
-        // 添加成功和失败的日志
+        // Add success and failure log entries
         for i in 0..5 {
             store.log(DecisionLog {
                 timestamp: 0,
@@ -849,7 +849,7 @@ mod tests {
         let store = DecisionLogStore::new(100);
         let path = temp_log_path("decision_log_compact");
 
-        // 直接写入超过保留上限的行数，再手动触发压缩。
+        // Write more lines than the retention cap directly, then trigger compaction manually.
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -883,10 +883,10 @@ mod tests {
         let reader = BufReader::new(std::fs::File::open(&path).unwrap());
         let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
         assert_eq!(lines.len(), DECISION_LOG_RETAIN_LINES);
-        // 应保留最新的尾部：最后一行 turn_id == total - 1。
+        // The latest tail must be retained: the last line has turn_id == total - 1.
         let last: DecisionLog = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!(last.turn_id, total - 1);
-        // 最旧保留行应为 total - RETAIN_LINES。
+        // The oldest retained line should be total - RETAIN_LINES.
         let first: DecisionLog = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(first.turn_id, total - DECISION_LOG_RETAIN_LINES);
 
@@ -933,17 +933,17 @@ mod tests {
     }
 }
 
-// 全局单例访问
+// Global singleton access
 use std::sync::OnceLock;
 
 static DECISION_LOG_STORE: OnceLock<DecisionLogStore> = OnceLock::new();
 
-/// 获取全局决策日志存储
+/// Get the global decision log store
 pub fn get_decision_log_store() -> &'static DecisionLogStore {
     DECISION_LOG_STORE.get_or_init(|| DecisionLogStore::new(1000))
 }
 
-/// 初始化决策日志存储（可选，用于自定义容量）
+/// Initialize the decision log store (optional, for a custom capacity)
 pub fn init_decision_log_store(capacity: usize) -> &'static DecisionLogStore {
     DECISION_LOG_STORE.get_or_init(|| DecisionLogStore::new(capacity))
 }

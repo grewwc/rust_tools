@@ -46,8 +46,8 @@ use crate::primitives::{
 
 const DEFAULT_COMPLETED_EVENT_RETENTION: usize = 8192;
 const DEFAULT_TRACE_CAPACITY: usize = 4096;
-/// LLM 用量审计账本默认容量。account 落账后由 agent 侧定期 drain 落库，
-/// 这里只需足够缓冲两次 drain 之间的记录即可。
+/// Default capacity of the LLM usage audit ledger. The agent side drains and persists records
+/// periodically after account entries, so this only needs to buffer the records between two drains.
 const DEFAULT_LLM_USAGE_CAPACITY: usize = 4096;
 const SHM_PERM_CACHE_SLOTS: usize = 32;
 
@@ -81,12 +81,12 @@ fn shm_checksum(value: &str, owner_pid: u64) -> u64 {
 
 pub struct LocalOS {
     pub processes: FastMap<u64, Process>,
-    /// 就绪队列，保存 `(pid, priority)`。优先级随条目内联存储，避免每次入队比较
-    /// 都回表查 `Process.priority`。出队 / 调度过滤通过 `ready_set` 进行 O(1)
-    /// 标记，因此终止 / 信号停止等路径不再需要线性 retain。
+    /// Ready queue holding `(pid, priority)`. Priority is stored inline with each entry so enqueue
+    /// comparisons never look up `Process.priority` in the table. Dequeue / scheduling filtering uses
+    /// `ready_set` for O(1) marking, so terminate / signal-stop paths no longer need a linear retain.
     pub(super) ready_queue: VecDeque<(u64, u8)>,
-    /// `ready_queue` 的成员索引。一个 pid 是否真正“可被调度”以这个集合为准；
-    /// 队列里的条目可能是过期 tombstone，由 [`pop_ready`] 丢弃。
+    /// Membership index of `ready_queue`. Whether a pid is actually "schedulable" is decided by this set;
+    /// queue entries can be stale tombstones, discarded by [`pop_ready`].
     pub(super) ready_set: FastSet<u64>,
     pub(super) wait_queue: FastMap<u64, Vec<u64>>,
     /// Reverse index: parent_pid -> set of child pids. Maintained on spawn /
@@ -111,9 +111,9 @@ pub struct LocalOS {
     pub(super) event_waiters: FastMap<EventId, FastSet<u64>>,
     /// Refcount of the kernel sources that reference each `event_id`：channel
     /// create / futex create / epoll registration of `EpollSource::Event`。
-    /// 拿来给 [`Self::completed_event_is_live`] 走 O(1) 的判定，避免再去
-    /// 扫 `channels` / `futexes` / `epolls` 三张表。重复 key 的复用与递减
-    /// 必须严格成对，少一次会让 prune 提前误判事件已死。
+    /// Used by [`Self::completed_event_is_live`] for an O(1) check instead of scanning the
+    /// `channels` / `futexes` / `epolls` tables. Reuse and decrement of a duplicate key
+    /// must be strictly paired; missing one makes prune wrongly declare the event dead early.
     pub(super) event_source_refs: FastMap<EventId, u32>,
     /// Bumped whenever the process topology changes (spawn / terminate /
     /// set_process_group). Used as the version stamp for `shm_perm_cache`
@@ -132,7 +132,7 @@ pub struct LocalOS {
     pub(super) trace: TraceRing,
     /// LLM device: model name -> price table. See `LlmOps`.
     pub(super) llm_prices: FastMap<String, crate::primitives::LlmModelPrice>,
-    /// LLM 用量审计账本（有界 ring）。每次 `llm_account` 追加一条，供外部 drain 落库。
+    /// LLM usage audit ledger (bounded ring). Each `llm_account` appends one entry for external drain-and-persist.
     pub(super) llm_usage: crate::primitives::LlmUsageRing,
     /// Daemon registry: handle -> entry. See `DaemonOps`.
     pub(super) daemons: FastMap<u64, DaemonEntry>,
@@ -145,13 +145,13 @@ pub struct LocalOS {
     /// epoll registry: epoll id -> registrations.
     pub(super) epolls: FastMap<u64, EpollEntry>,
     pub(super) next_epoll_id: u64,
-    /// 到期唤醒堆：(until_tick, pid)。与进程 state 中的 until_tick/timeout_tick
-    /// 一一对应；进程被提前唤醒/终止后条目变为 stale，pop 时验证后丢弃。
-    /// 避免 advance_ticks / next_wakeup_tick 每次全表扫描 sleeping 进程。
+    /// Expiry wakeup heap: (until_tick, pid). One-to-one with until_tick/timeout_tick in process state;
+    /// after a process is woken/terminated early its entry goes stale and is validated then dropped on pop.
+    /// Saves advance_ticks / next_wakeup_tick from a full scan of sleeping processes every time.
     wakeup_heap: BinaryHeap<Reverse<(u64, u64)>>,
 }
 
-/// 内核内部使用的 daemon 登记条目（含活引用 token）。对外只暴露 Snapshot。
+/// Internal daemon registration entry (with a live-reference token). Only Snapshot is exposed externally.
 pub(super) struct DaemonEntry {
     pub(super) label: String,
     pub(super) kind: crate::primitives::DaemonKind,
@@ -363,32 +363,32 @@ impl LocalOS {
             .unwrap_or(u8::MAX)
     }
 
-    /// 解析"当前调用进程"的 pid。
+    /// Resolve the pid of the "currently calling process".
     ///
-    /// 后台子 agent 各自跑在独立的 `tokio::spawn` 任务里，却共享同一个
-    /// `Arc<Mutex<Kernel>>`。`self.current_pid` 是单个标量，任一并发任务在完成 /
-    /// 让出时会把它改成 `None` 或别的 pid，于是另一任务正在执行的阻塞 syscall
-    /// （如 `wait_on_events`）读到的 `self.current_pid` 可能已被并发清空，导致
-    /// 误报 "No process currently running."。
+    /// Background sub-agents each run in their own `tokio::spawn` task yet share one
+    /// `Arc<Mutex<Kernel>>`. `self.current_pid` is a single scalar: any concurrent task finishing /
+    /// yielding rewrites it to `None` or another pid, so a blocking syscall executed by another task
+    /// (e.g. `wait_on_events`) may read a concurrently-cleared `self.current_pid`,
+    /// falsely reporting "No process currently running.".
     ///
-    /// `TASK_PID` task-local 才是每个任务自身权威的调用者身份（`current_process_id`
-    /// 也据此解析）。这里统一优先读 task-local，缺失时再回退到 `self.current_pid`，
-    /// 保证身份类 syscall 在并发子 agent 场景下读到的始终是真正的调用者。
+    /// The `TASK_PID` task-local is each task's authoritative caller identity (`current_process_id`
+    /// resolves through it too). Read the task-local first here and fall back to `self.current_pid` only
+    /// when missing, so identity syscalls always see the true caller under concurrent sub-agents.
     fn effective_current_pid(&self) -> Option<u64> {
         crate::kernel::current_task_pid().or(self.current_pid)
     }
 
     fn enqueue_ready(&mut self, pid: u64) {
-        // 不存在的 pid 或已在队列中都直接返回。`ready_set.insert` 返回值同时
-        // 承担了去重检查，省一次额外查表。
+        // Return directly for a nonexistent pid or one already queued. The `ready_set.insert` return
+        // value doubles as the dedup check, saving an extra table lookup.
         if !self.processes.contains_key(&pid) || !self.ready_set.insert(pid) {
             return;
         }
 
         let priority = self.process_priority(pid);
-        // 优先级插入点查找现在只读 tuple 里的缓存优先级，不再进 processes
-        // 表。这让批量唯醒 / spawn 从 O(n^2) 到 O(n*k)（k = 队列该优先级之后
-        // 的长度）。序列 tombstone 在比较时也不会造成额外代价。
+        // The priority insertion-point search now reads the cached priority from the tuple instead of
+        // querying the processes table. This takes batch wakeup / spawn from O(n^2) to O(n*k) (k =
+        // queue length after that priority). Sequence tombstones add no extra cost during comparison.
         let insert_at = self
             .ready_queue
             .iter()
@@ -400,16 +400,16 @@ impl LocalOS {
     }
 
     fn terminate_pid(&mut self, pid: u64, result: String) {
-        // O(1) tombstone：仅移除集合成员身份，`pop_ready` 负责清理。
+        // O(1) tombstone: only removes set membership; `pop_ready` does the cleanup.
         self.ready_set.remove(&pid);
         if let Some(proc) = self.processes.get_mut(&pid) {
             proc.state = ProcessState::Terminated;
             proc.result = Some(result.clone());
         }
-        // 进程进入 Terminated 会影响 SHM 权限（owner 已不可达），才能及时
-        // 失效缓存中“owner 还在”的 accessible=true 结果。严格讲另一条防线
-        // 在 `shm_read` 里独立检查了 owner 状态，但在此处 bump 可以减少拍额
-        // 外 syscall 返回错误不一致的概率。
+        // A process entering Terminated affects SHM permissions (the owner is unreachable), which is what
+        // invalidates the cached "owner still alive" accessible=true results in time. Strictly speaking, a second
+        // defense line in `shm_read` independently checks owner state, but bumping here reduces the chance of
+        // inconsistent syscall error returns.
         self.bump_topology_version();
 
         if let Some(waiting_pids) = self.wait_queue.remove(&pid) {
@@ -546,10 +546,10 @@ impl LocalOS {
         if pid == entry.owner_pid {
             return true;
         }
-        // 这里走 live 的 owner pgid 查询（而不是 entry.owner_pgid 这一份创建
-        // 时的快照），因为 owner 进程可能在创建之后才被 `set_process_group`
-        // 加进新的 group，缓存里的 None 会让本来合法的写被拒。perm cache
-        // 由 topology_version 负责失效，这里只关心一次决策的正确性。
+        // Consult the live owner pgid lookup here (not the creation-time snapshot in entry.owner_pgid),
+        // because the owner process may only be added to its new group by `set_process_group` after
+        // creation, and a cached None would reject an otherwise legitimate write. The perm cache is
+        // invalidated via topology_version; this spot only cares about the correctness of one decision.
         if self.is_same_process_group(pid, entry.owner_pid) {
             return true;
         }
@@ -563,15 +563,15 @@ impl LocalOS {
         self.event_waiters.entry(event).or_default().insert(pid);
     }
 
-    /// 向 `event_source_refs` 登记一个新的内核 source 引用。channel / futex /
-    /// epoll(EpollSource::Event) 任意一个新增都应调用一次，destroy 时
-    /// [`dec_event_source_ref`] 配对调用。
+    /// Register a new kernel source reference in `event_source_refs`. Call once for every new
+    /// channel / futex / epoll(EpollSource::Event), with [`dec_event_source_ref`]
+    /// as the paired call on destroy.
     fn inc_event_source_ref(&mut self, event: EventId) {
         let entry = self.event_source_refs.entry(event).or_insert(0);
         *entry = entry.saturating_add(1);
     }
 
-    /// 释放一次 source 引用，归零时清掉条目避免无界增长。
+    /// Release one source reference; clear the entry when it reaches zero to avoid unbounded growth.
     fn dec_event_source_ref(&mut self, event: EventId) {
         if let Some(slot) = self.event_source_refs.get_mut(&event) {
             *slot = slot.saturating_sub(1);
@@ -778,7 +778,7 @@ impl LocalOS {
     fn completed_event_is_live(&self, event_id: EventId) -> bool {
         // Process side uses the reverse waiter index (O(1)) instead of a full
         // process-table scan. Source side (channels / futexes / epoll
-        // registrations) is consulted via `event_source_refs`，同样 O(1)。
+        // registrations) is consulted via `event_source_refs`, also O(1).
         if self
             .event_waiters
             .get(&event_id)
@@ -1027,8 +1027,8 @@ impl Syscall for LocalOS {
             return Err(format!("Process {} does not exist.", target_pid));
         }
 
-        // 一次走完所有亲缘关系判定，让两层权限检查复用同一组判定结果，
-        // 避免 happy path 上把 process tree 走两遍。
+        // Walk all kinship determinations once so both permission-check layers reuse the same verdicts,
+        // avoiding two passes over the process tree on the happy path.
         let same_pid = sender_pid == target_pid;
         let same_pgid = !same_pid && self.is_same_process_group(sender_pid, target_pid);
         let sender_is_ancestor =
@@ -1260,8 +1260,8 @@ impl Syscall for LocalOS {
             return Err(format!("Shared memory key '{}' already exists.", key));
         }
         let owner_pgid = self.processes.get(&current).and_then(|p| p.process_group);
-        // owner_pgid 仅越过 trace 下发作为创建时快照；SHM 权限走实时
-        // 查表以应对 set_process_group 后的变更。
+        // owner_pgid only flows through trace as a creation-time snapshot; SHM permissions consult
+        // the table live to handle changes made by set_process_group afterwards.
         let _ = owner_pgid;
         let checksum = shm_checksum(&value, current);
         self.shared_memory.insert(
@@ -1506,7 +1506,7 @@ impl KernelInternal for LocalOS {
     }
 
     fn pop_ready(&mut self) -> Option<Process> {
-        // 跳过被惰性删除的 tombstone：ready_set 中不再存在的 pid 丢弃。
+        // Skip lazily deleted tombstones: drop pids no longer present in ready_set.
         while let Some((pid, _priority)) = self.ready_queue.pop_front() {
             if !self.ready_set.remove(&pid) {
                 continue;
@@ -1594,7 +1594,7 @@ impl KernelInternal for LocalOS {
             return;
         }
         self.tick = self.tick.saturating_add(ticks);
-        // 从唤醒堆弹出所有到期条目；stale（进程已被提前唤醒/终止/改状态）直接丢弃。
+        // Pop all due entries from the wakeup heap; stale ones (process already woken/terminated/re-stated early) are dropped outright.
         while let Some(Reverse((until_tick, pid))) = self.wakeup_heap.peek() {
             let (until_tick, pid) = (*until_tick, *pid);
             if until_tick > self.tick {
@@ -1635,7 +1635,7 @@ impl KernelInternal for LocalOS {
                 }
                 self.enqueue_ready(pid);
             }
-            // 其余情况为 stale 条目，已 pop 丢弃。
+            // All other cases are stale entries, already popped and dropped.
         }
     }
 
@@ -1644,8 +1644,8 @@ impl KernelInternal for LocalOS {
     }
 
     fn next_wakeup_tick(&self) -> Option<u64> {
-        // 堆顶即最早到期；stale 顶部只会在 advance_ticks 时被清理，
-        // 这里返回其 tick 只会让调用者提前醒来，不会错过更早的唤醒。
+        // The heap top is the earliest deadline; stale tops are only cleaned up during advance_ticks,
+        // so returning that tick merely wakes the caller early and never misses an earlier wakeup.
         self.wakeup_heap.peek().map(|Reverse((t, _))| *t)
     }
 
@@ -1979,7 +1979,7 @@ impl FutexOps for LocalOS {
         let event_id = self.alloc_internal_event_id();
         let owner = self.effective_current_pid();
         self.futexes.insert(id, FutexState::new(initial, event_id));
-        // 与 futex 生命周期绑定的 event_id 入资源计数。
+        // Charge the event_id bound to the futex lifecycle into the resource count.
         self.inc_event_source_ref(event_id);
         // Label and owner used to live on FutexState; emitting a trace event
         // at create time keeps them visible for diagnostics without bloating
@@ -2456,7 +2456,7 @@ impl LlmOps for LocalOS {
         };
         let verdict = <Self as RlimitOps>::rusage_charge(self, pid, delta);
 
-        // 4) 追加一条审计记录到有界账本（供外部 drain 落库）。
+        // 4) Append one audit record to the bounded ledger (for external drain-and-persist).
         {
             let seq = self.llm_usage.alloc_seq();
             let total_tokens = report
@@ -2496,7 +2496,7 @@ impl LlmOps for LocalOS {
     }
 }
 
-/// 敏感路径黑名单（与 agent 侧 FileStore 行为等价，是"根权限不可穿透"的安全边界）。
+/// Sensitive-path blocklist (equivalent to the agent-side FileStore behavior; the "root permission cannot be pierced" security boundary).
 fn is_sensitive_fs_path(path: &std::path::Path) -> bool {
     let rendered = path.to_string_lossy();
     let rendered = rendered.as_ref();
@@ -2534,7 +2534,7 @@ fn is_sensitive_fs_path(path: &std::path::Path) -> bool {
 }
 
 impl LocalOS {
-    /// 统一的 VFS trace 事件工具，给 vfs_* 方法共用。
+    /// Unified VFS trace event helper shared by the vfs_* methods.
     fn vfs_emit_trace(
         &mut self,
         op: &'static str,
@@ -2585,7 +2585,7 @@ impl VfsOps for LocalOS {
             .map_err(|e| VfsError::Io(format!("Failed to read file: {}", e)))?;
         let bytes = content.len() as u64;
 
-        // charge fs_bytes（pid 缺失或不受约束时 skip；rlimit 超出则返回 QuotaExceeded）
+        // charge fs_bytes (skip when the pid is missing or unconstrained; return QuotaExceeded when the rlimit is exceeded)
         let verdict = if let Some(pid) = pid {
             let delta = ResourceUsageDelta {
                 fs_bytes: bytes,
@@ -2689,7 +2689,7 @@ impl VfsOps for LocalOS {
 }
 
 impl LocalOS {
-    /// DaemonOps 的共用 trace emitter。
+    /// Shared trace emitter for DaemonOps.
     fn daemon_emit_trace(
         &mut self,
         op: &'static str,
@@ -2849,8 +2849,8 @@ impl LocalOS {
                 (!self.completed_events.contains(&event_id)).then_some(event_id)
             }
             EpollSource::Channel(channel) => {
-                // 单次 channels 查表得到 entry，然后直接判定 mask，避免再走
-                // `epoll_actual_events_for_source` 二次查表。
+                // One channels lookup gets the entry, then the mask is judged directly, avoiding a second
+                // lookup via `epoll_actual_events_for_source`.
                 let entry = self.channels.get(&channel.0)?;
                 let has_data = !entry.queue.is_empty();
                 if has_data || entry.closed {
@@ -2921,8 +2921,8 @@ impl LocalOS {
 
     fn epoll_collect_wait_ids(&self, registrations: &[EpollRegistration]) -> Vec<EventId> {
         let mut wait_ids = Vec::new();
-        // 用临时集合做去重，避免每次插入都对 wait_ids 做线性扫描。
-        // 在 registration 数大的 epoll 上，O(n^2) 退化为 O(n)。
+        // Dedup with a temporary set instead of linearly scanning wait_ids on every insert.
+        // On epolls with many registrations this takes O(n^2) down to O(n).
         let mut seen: FastSet<EventId> = FastSet::default();
         for registration in registrations {
             let actual = self.epoll_collect_ready_for_registration(registration);
@@ -2958,8 +2958,8 @@ impl LocalOS {
         };
         self.notify_events_completed(&[event_id]);
         if rotate {
-            // 轮转时老 event_id 不再被任何 source 索引，换上新的 event_id
-            // 同步调整 event_source_refs 以保持严格配对。
+            // After rotation the old event_id is no longer indexed by any source; swap in the new event_id
+            // and adjust event_source_refs in lockstep to keep the strict pairing.
             self.dec_event_source_ref(event_id);
             let next_event_id = self.alloc_internal_event_id();
             if let Some(state) = self.futexes.get_mut(&addr.0) {
@@ -3027,7 +3027,7 @@ impl DaemonOps for LocalOS {
             let Some(entry) = self.daemons.get_mut(&handle.0) else {
                 return;
             };
-            // 若之前已经 cancel，退出 state 保持 Cancelled（cancel 是更显著的语义）。
+            // If already cancelled, keep the exit state Cancelled (cancel is the more salient semantics).
             let state = match (entry.state, &err) {
                 (DaemonState::Cancelled, _) => DaemonState::Cancelled,
                 (_, None) => DaemonState::Exited,
@@ -3148,7 +3148,7 @@ impl IpcOps for LocalOS {
                 closed: false,
             },
         );
-        // 与 channel 生命周期绑定的 event_id 在表中记一次引用。
+        // Record one reference in the table for the event_id bound to the channel lifecycle.
         self.inc_event_source_ref(event_id);
         let channel = ChannelId(id);
         self.channel_emit_trace("channel_create", channel, owner_pid, &label, 0);
@@ -3233,8 +3233,8 @@ impl IpcOps for LocalOS {
         };
         if should_notify {
             self.notify_events_completed(&[event_id]);
-            // 旧 event 不再是 channel 的 source，转换后由新 event 负责后续 waiter
-            // 的 live 判定。
+            // The old event is no longer the channel's source; after the conversion the new event owns
+            // the liveness checks for subsequent waiters.
             self.dec_event_source_ref(event_id);
             let next_event_id = self.alloc_internal_event_id();
             if let Some(entry) = self.channels.get_mut(&channel.0) {
@@ -3491,8 +3491,8 @@ impl IpcOps for LocalOS {
         };
         if should_notify {
             self.notify_events_completed(&[event_id]);
-            // 旧 event 不再是 channel 的 source，转换后由新 event 负责后续 waiter
-            // 的 live 判定。
+            // The old event is no longer the channel's source; after the conversion the new event owns
+            // the liveness checks for subsequent waiters.
             self.dec_event_source_ref(event_id);
             let next_event_id = self.alloc_internal_event_id();
             if let Some(entry) = self.channels.get_mut(&channel.0) {
@@ -3648,7 +3648,7 @@ impl EpollOps for LocalOS {
         let Some(entry) = self.epolls.remove(&epoll.0) else {
             return false;
         };
-        // 释放该 epoll 中所有 EpollSource::Event 的引用计数。
+        // Release the reference counts of all EpollSource::Event entries in this epoll.
         for registration in entry.registrations.values() {
             if let EpollSource::Event(event_id) = registration.snapshot.source {
                 self.dec_event_source_ref(event_id);
@@ -3744,10 +3744,10 @@ mod tests {
         ));
     }
 
-    // 回归测试：并发后台子 agent 各跑在独立 tokio 任务里、共享同一个 kernel。
-    // 当某个任务把共享标量 `self.current_pid` 清空 / 改写后，另一个任务正在执行的
-    // 阻塞 syscall（如 task_wait → wait_on_events）必须仍能从 task-local 解析出真正
-    // 的调用者，而不是误报 "No process currently running."（主 / 子 agent 调度卡死的根因）。
+    // Regression test: concurrent background sub-agents each run in their own tokio task while sharing
+    // one kernel. When one task clears/rewrites the shared scalar `self.current_pid`, a blocking syscall
+    // running in another task (e.g. task_wait → wait_on_events) must still resolve the true caller from
+    // the task-local instead of misreporting "No process currently running." (root cause of stuck main/sub-agent scheduling).
     #[test]
     fn blocking_syscall_resolves_caller_from_task_local_when_current_pid_cleared() {
         use std::cell::Cell;
@@ -3769,14 +3769,14 @@ mod tests {
             None,
         );
 
-        // 模拟并发任务在收尾时把共享 current_pid 清空。
+        // Simulate a concurrent task clearing the shared current_pid during its wrap-up.
         os.set_current_pid(None);
         assert!(os.current_pid.is_none());
 
-        // 但 task-local 仍指向 root（即"本任务"权威身份）。
+        // But the task-local still points at root (the authoritative identity of "this task").
         TEST_TASK_PID.with(|c| c.set(Some(root)));
 
-        // wait_on_events 必须按 task-local 解析出 root 并正常挂起，而不是报错。
+        // wait_on_events must resolve root via the task-local and suspend normally instead of erroring.
         let timeout_tick = os
             .wait_on_events(vec![EventId::new(7)], WaitPolicy::Any, Some(5))
             .expect("wait_on_events must resolve caller from task-local");
@@ -3789,7 +3789,7 @@ mod tests {
             })
         ));
 
-        // 复位 task-local，避免污染同线程后续测试。
+        // Reset the task-local to avoid polluting later tests on the same thread.
         TEST_TASK_PID.with(|c| c.set(None));
     }
 
@@ -4045,8 +4045,8 @@ mod tests {
         );
     }
 
-    /// 终止进程 + 重新登入应当让 SHM 权限缓存里的旧答复失效，否则
-    /// 会出现“owner 已死但 cache 仍允许写”的尴尬窗口。
+    /// Terminating a process + re-login must invalidate the old answers in the SHM permission cache,
+    /// otherwise there is an awkward window where "the owner is dead but the cache still allows writes".
     #[test]
     fn shm_perm_cache_invalidates_on_topology_change() {
         let mut os = LocalOS::new();
@@ -4077,14 +4077,14 @@ mod tests {
         os.set_current_pid(Some(owner));
         os.shm_create("k".to_string(), "v".to_string()).unwrap();
 
-        // stranger 当前是 sibling，可读但不可写。
+        // stranger is currently a sibling: readable but not writable.
         os.set_current_pid(Some(stranger));
         let entry = os.shared_memory.get("k").unwrap();
         assert!(!os.is_shm_accessible_by(stranger, entry));
         assert!(os.is_shm_readable_by(stranger, entry));
 
-        // 把 stranger 拉进 owner 的 process group：拓扑变更应让缓存里
-        // “stranger 不可写”的旧答案失效，重新计算后变为可写。
+        // Pull stranger into the owner's process group: the topology change must invalidate the cached
+        // "stranger is not writable" answer, which flips to writable after recomputation.
         let pgid = os.next_pgid;
         os.next_pgid += 1;
         os.set_process_group(owner, pgid).unwrap();
@@ -4095,18 +4095,18 @@ mod tests {
             "set_process_group must invalidate stale shm perm cache",
         );
 
-        // 反向：owner terminate 后，cache 也要让 accessible 重新计算。
+        // Reverse direction: after owner terminate, the cache must also let accessible be recomputed.
         os.terminate_pid(owner, "done".to_string());
         os.remove_process_entry(owner);
         let entry = os.shared_memory.get("k").unwrap();
-        // owner pid 不再存在；non-owner 走 ancestor / sibling 链路，
-        // accessible 取决于 stranger 与 owner 的 pgid，但 owner 已被擦除，
-        // 这里只断言查询不会 panic 并返回 bool。
+        // The owner pid no longer exists; the non-owner path goes through the ancestor / sibling chain.
+        // accessible depends on stranger's and owner's pgids, but the owner has been erased,
+        // so only assert that the query does not panic and returns a bool.
         let _ = os.is_shm_accessible_by(stranger, entry);
     }
 
-    /// `event_source_refs` 与 channel/futex/epoll(EpollSource::Event) 的
-    /// 生命周期严格一一对应，destroy 后引用必须归零。
+    /// `event_source_refs` corresponds strictly one-to-one with the lifecycle of
+    /// channel/futex/epoll(EpollSource::Event); references must return to zero after destroy.
     #[test]
     fn event_source_refs_track_channel_and_futex_lifetimes() {
         use crate::primitives::{FutexOps, IpcOps};
@@ -4122,18 +4122,18 @@ mod tests {
         let fx_event = os.futex_event_id(addr).unwrap();
         assert_eq!(os.event_source_refs.get(&fx_event).copied(), Some(1));
 
-        // futex_destroy 后引用归零、条目必须被清掉以免无界增长。
+        // After futex_destroy the references hit zero and the entry must be cleared to avoid unbounded growth.
         assert!(os.futex_destroy(addr));
         assert!(os.event_source_refs.get(&fx_event).is_none());
 
-        // channel destroy 同上。
+        // channel destroy behaves the same as above.
         os.channel_close(None, ch).unwrap();
         os.channel_destroy(None, ch).unwrap();
         assert!(os.event_source_refs.get(&ch_event).is_none());
     }
 
-    /// epoll 注册 EpollSource::Event 时也应让事件保持 live；del / destroy
-    /// 后归零，确保 prune_completed_events 不会过早回收。
+    /// Registering EpollSource::Event with epoll should also keep the event live; after del / destroy
+    /// the count returns to zero, ensuring prune_completed_events does not reclaim too early.
     #[test]
     fn event_source_refs_track_epoll_event_registration() {
         use crate::primitives::{EpollEventMask, EpollOps, EpollSource};
@@ -4141,18 +4141,18 @@ mod tests {
         let _root = os.begin_foreground("fg".to_string(), "g".to_string(), 10, 8, None);
         let ep = os.epoll_create("ep".to_string());
 
-        // 用一个内部 event_id；直接构造一个 EpollSource::Event。
+        // Use an internal event_id; construct an EpollSource::Event directly.
         let watched = os.alloc_internal_event_id();
         os.epoll_ctl_add(ep, EpollSource::Event(watched), EpollEventMask::IN, 1)
             .unwrap();
         assert_eq!(os.event_source_refs.get(&watched).copied(), Some(1));
         assert!(os.completed_event_is_live(watched));
 
-        // del 一次：归零并删除条目。
+        // del once: the count hits zero and the entry is removed.
         os.epoll_ctl_del(ep, EpollSource::Event(watched)).unwrap();
         assert!(os.event_source_refs.get(&watched).is_none());
 
-        // 重新注册再走 destroy 路径，destroy 必须把所有 event 引用清掉。
+        // Re-register then take the destroy path; destroy must clear all event references.
         os.epoll_ctl_add(ep, EpollSource::Event(watched), EpollEventMask::IN, 2)
             .unwrap();
         assert_eq!(os.event_source_refs.get(&watched).copied(), Some(1));
@@ -4160,8 +4160,8 @@ mod tests {
         assert!(os.event_source_refs.get(&watched).is_none());
     }
 
-    /// 终止大量进程时，ready_queue 不再被线性 retain；tombstone 由
-    /// pop_ready 在出队时清掉。
+    /// When terminating many processes, ready_queue is no longer linearly retained; tombstones are
+    /// cleaned up by pop_ready at dequeue time.
     #[test]
     fn ready_queue_uses_lazy_tombstones_on_termination() {
         let mut os = LocalOS::new();
@@ -4181,29 +4181,29 @@ mod tests {
                 .unwrap();
             spawned.push(pid);
         }
-        // begin_foreground 后 root 已是当前运行进程，不在 ready_set
-        // 里；spawn 出的子进程全部入 ready。
+        // After begin_foreground, root is the currently running process and not in ready_set;
+        // all spawned children enter ready.
         assert_eq!(os.ready_count(), spawned.len());
-        // 批量终止：ready_set 立即收缩，但 ready_queue 留有 tombstone。
+        // Batch terminate: ready_set shrinks immediately, but ready_queue keeps tombstones.
         for &pid in &spawned {
             os.terminate_pid(pid, "x".to_string());
         }
         assert_eq!(os.ready_count(), 0);
         assert!(os.ready_queue.len() >= spawned.len());
-        // pop_ready 必须丢弃全部 tombstone 并返回 None。
+        // pop_ready must drop all tombstones and return None.
         assert!(os.pop_ready().is_none());
-        // 队列也最终被排空。
+        // The queue is eventually drained too.
         assert!(os.ready_queue.is_empty());
     }
 
-    /// 优先级插入不再为每个比较都查 processes 表；新增高优先级进程
-    /// 时应该插到队首。
+    /// Priority insertion no longer queries the processes table per comparison; a newly added
+    /// higher-priority process should land at the queue head.
     #[test]
     fn ready_queue_priority_insertion_uses_cached_priority() {
         let mut os = LocalOS::new();
         // root priority = 10
         let root = os.begin_foreground("fg".to_string(), "g".to_string(), 10, 8, None);
-        // 后入低优先级（数值更大 -> 更低）
+        // Enqueue lower priority afterwards (larger value -> lower priority)
         let low = os
             .spawn(
                 Some(root),
@@ -4215,7 +4215,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        // 再入高优先级（数值最小 -> 最高）
+        // Then enqueue higher priority (smallest value -> highest priority)
         let high = os
             .spawn(
                 Some(root),
@@ -4227,13 +4227,13 @@ mod tests {
                 None,
             )
             .unwrap();
-        // 队列中 high 必须排在 low 之前；不必以 root 为参考（begin_foreground
-        // 帮 root 设为 Running，不在 ready_set中）。
+        // high must be ahead of low in the queue; no need to reference root (begin_foreground
+        // sets root to Running, so it is not in ready_set).
         let pids: Vec<u64> = os.ready_queue.iter().map(|(pid, _)| *pid).collect();
         let pos_high = pids.iter().position(|p| *p == high).expect("high in queue");
         let pos_low = pids.iter().position(|p| *p == low).expect("low in queue");
         assert!(pos_high < pos_low, "high priority must come before low");
-        // 优先级缓存不再需要 processes 查表：pop_ready 顶部必是 high。
+        // The priority cache no longer needs a processes lookup: pop_ready's top must be high.
         let next = os.pop_ready().unwrap();
         assert_eq!(next.pid, high);
     }
@@ -4821,7 +4821,7 @@ mod tests {
 
     #[test]
     fn daemon_restarts_up_to_max_restarts_then_stops() {
-        // 回归：重启后的进程必须保留原始 max_restarts，否则只会重启一次。
+        // Regression: a restarted process must keep its original max_restarts, otherwise it only restarts once.
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
         let daemon_pid = os
@@ -4846,7 +4846,7 @@ mod tests {
             assert_eq!(proc.max_restarts, 3);
         }
 
-        // 第 4 次终止后已达上限，不再重启。
+        // After the 4th termination the limit is reached; no more restarts.
         os.terminate_pid(current, "crashed".to_string());
         assert!(os.check_daemon_restart().is_empty());
     }
@@ -5857,7 +5857,7 @@ mod tests {
                 completion_per_1k_micros: 2_000,
             },
         );
-        // 初始账本为空。
+        // The initial ledger is empty.
         assert_eq!(os.llm_usage_head_seq(), 0);
         assert!(os.llm_usage_drain_since(0).is_empty());
 
@@ -5884,7 +5884,7 @@ mod tests {
             },
         );
 
-        // 全量 drain：两条，升序，字段正确。
+        // Full drain: two records, ascending, fields correct.
         let all = os.llm_usage_drain_since(0);
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].seq, 1);
@@ -5901,12 +5901,12 @@ mod tests {
         assert_eq!(all[1].seq, 2);
         assert_eq!(all[1].total_tokens, 280);
 
-        // 游标 drain：只拿 seq>1 的记录。
+        // Cursor drain: fetch only records with seq>1.
         assert_eq!(os.llm_usage_head_seq(), 2);
         let tail = os.llm_usage_drain_since(1);
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].seq, 2);
-        // drain 不消费，重复 drain 结果一致。
+        // Draining does not consume; repeated drains return the same result.
         assert_eq!(os.llm_usage_drain_since(0).len(), 2);
     }
 
@@ -5929,7 +5929,7 @@ mod tests {
                 },
             );
         }
-        // seq 仍单调到 5，但只保留最后两条。
+        // seq still monotonically reaches 5, but only the last two records are kept.
         assert_eq!(os.llm_usage_head_seq(), 5);
         let recs = os.llm_usage_drain_since(0);
         assert_eq!(recs.len(), 2);
@@ -5969,7 +5969,7 @@ mod tests {
         assert_eq!(got, "hello world");
 
         let usage = os.rusage_get(pid).unwrap();
-        // 写入 11 字节 + 读出 11 字节 = 22
+        // Write 11 bytes + read back 11 bytes = 22
         assert_eq!(usage.fs_bytes, 22);
 
         let _ = std::fs::remove_file(&p);
@@ -6009,7 +6009,7 @@ mod tests {
         os.rlimit_set(pid, limits).unwrap();
 
         let p = tmp_path("quota");
-        // 写 10 字节——超过 5 字节上限
+        // Write 10 bytes — over the 5-byte cap
         match os.vfs_write_all(Some(pid), &p, "0123456789").unwrap_err() {
             VfsError::QuotaExceeded {
                 dimension: RlimitDim::FsBytes,

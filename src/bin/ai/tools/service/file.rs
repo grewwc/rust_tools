@@ -93,24 +93,24 @@ fn render_line_excerpt_from_char(
     }
 }
 
-/// 检测内容是否带有 read_file 输出格式的最外层行号前缀，若是则只剥除这一层。
+/// Detects whether content carries the outermost line-number prefix of read_file output, and if so strips only that layer.
 ///
-/// read_file 输出格式为 `{:>6}\t{content}`（6位右对齐行号 + tab + 内容）。
-/// 当这种输出被写入归档文件后再次被 read_file 读取时，会出现多层嵌套
-/// （如 `     1\t     1\t原始内容`）。每次回读只需去掉当前工具产生的最外层，
-/// 不能继续猜测内层：原始文件内容本身也可能合法地以同一格式开头。
+/// read_file output format is `{:>6}\t{content}` (6-char right-aligned line number + tab + content).
+/// When such output is written to an archive file and read back via read_file, the prefixes nest,
+/// e.g. `     1\t     1\t原始内容`. Each re-read strips only the outermost layer produced by the current tool;
+/// it must not keep guessing about inner layers: the original file content itself may legitimately start with the same format.
 fn strip_rendered_line_number_layer(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
         return content.to_string();
     }
-    // 快速判断：第一行必须以空格+数字+tab开头，否则不可能是 read_file 格式。
-    // 使用 split_once 避免对非匹配内容做全量解析。
+    // Quick check: the first line must start with spaces+digits+tab, otherwise it cannot be read_file format.
+    // Uses split_once to avoid fully parsing non-matching content.
     if read_file_number_prefix_rest(lines[0]).is_none() {
         return content.to_string();
     }
-    // 每行至多剥除一次，恰好移除保存快照时由 read_file 渲染的展示层。
-    // 不循环剥离，避免将原始文件中合法的 `     7\tvalue` 当作展示层丢掉。
+    // Strip at most once per line, removing exactly the display layer rendered by read_file when the snapshot was saved.
+    // Do not loop-strip, to avoid dropping legitimate `     7\tvalue` lines from the original file as display layers.
     let stripped: Vec<String> = lines
         .iter()
         .map(|line| {
@@ -124,8 +124,8 @@ fn strip_rendered_line_number_layer(content: &str) -> String {
 
 fn read_file_number_prefix_rest(line: &str) -> Option<&str> {
     let (num_part, rest) = line.split_once('\t')?;
-    // `render_line_excerpt` 使用 `{:>6}\t` 渲染行号；普通 TSV/日志里常见的
-    // `1\tfoo`/`12\tfoo` 不应被误判并剥离。
+    // `render_line_excerpt` renders line numbers with `{:>6}\t`; the `1\tfoo`/`12\tfoo` shapes
+    // common in plain TSV/logs must not be misdetected and stripped.
     if num_part.chars().count() < 6 {
         return None;
     }
@@ -139,11 +139,11 @@ fn read_file_number_prefix_rest(line: &str) -> Option<&str> {
     Some(rest)
 }
 
-/// 仅对会话归档的 `overflow-history.md` 剥离一层展示行号。
+/// Strips one display line-number layer, only for the session archive `overflow-history.md`.
 ///
-/// `read_file` 外溢快照保存的是先前工具调用的完整渲染结果。重读时应直接保留
-/// 该结果里的原始行号，而不是剥离后按 asset 的相对行号重新编号；否则既不再是
-/// 精确快照，也会把 `use_line_numbers=false` 的真实 `123\t...` 内容误当展示层。
+/// `read_file` overflow snapshots store the full rendered result of the earlier tool call. On re-read, keep the
+/// original line numbers from that result instead of stripping and renumbering by asset-relative lines; otherwise it is
+/// no longer an exact snapshot, and genuine `use_line_numbers=false` content like `123\t...` gets misread as a display layer.
 fn should_strip_rendered_line_number_layer(path: &std::path::Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some("overflow-history.md")
         && path
@@ -153,8 +153,8 @@ fn should_strip_rendered_line_number_layer(path: &std::path::Path) -> bool {
             .is_some_and(|name| name.ends_with(".assets"))
 }
 
-/// 历史 `read_file` 快照已经包含调用当时选择的展示形式。为避免外层再添一层
-/// asset 相对行号，回读快照时保持其原始渲染；普通文件仍遵从调用方的开关。
+/// Historical `read_file` snapshots already embed the display form chosen at call time. To avoid adding another
+/// asset-relative line-number layer, keep their original rendering when re-reading; plain files still honor the caller's switch.
 fn should_render_read_file_line_numbers(path: &std::path::Path, requested: bool) -> bool {
     requested && !is_read_file_overflow_artifact(path)
 }
@@ -188,10 +188,10 @@ fn resolve_file_path_arg(args: &Value) -> Result<&str, String> {
         .ok_or_else(|| "Missing file_path".to_string())
 }
 
-/// temp=true 时规范化 file_path：拒绝绝对路径与越界的父目录引用，只保留文件名。
+/// Normalizes file_path when temp=true: rejects absolute paths and out-of-bounds parent references, keeping only the file name.
 ///
-/// 这样避免 `PathBuf::join` 遇到绝对路径时整体替换 base，把文件误写到项目源码
-/// 目录却仍被注册进 temp registry。模型只需传相对文件名（如 `script.py`）。
+/// This avoids `PathBuf::join` replacing the whole base when given an absolute path, writing the file into the
+/// project source tree while still registering it in the temp registry. The model only passes a relative file name (e.g. `script.py`).
 fn temp_file_name(file_path: &str) -> Result<std::path::PathBuf, String> {
     let p = std::path::Path::new(file_path);
     if p.is_absolute() {
@@ -199,7 +199,7 @@ fn temp_file_name(file_path: &str) -> Result<std::path::PathBuf, String> {
             "temp=true requires a relative filename, got absolute path: {file_path}"
         ));
     }
-    // 只取文件名，丢弃任何目录部分，确保落点始终在 per-session temp dir 内。
+    // Keep only the file name, discarding any directory parts, so the target always lands inside the per-session temp dir.
     let name = p
         .file_name()
         .ok_or_else(|| format!("temp=true requires a file name, got: {file_path}"))?;
@@ -232,9 +232,9 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     };
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
-    // offset 越界或文件为空时不能静默返回空串：模型会把「空结果」误判为
-    // 「文件为空」，进而得出错误结论（历史会话曾把归档文件读成空后反复重试）。
-    // 这里显式区分两种异常情况，正常分页路径保持原有行为。
+    // An out-of-bounds offset or an empty file must not silently return an empty string: the model misreads "empty result"
+    // as "file is empty" and draws wrong conclusions (a past session re-read an archive file as empty and retried repeatedly).
+    // Here the two abnormal cases are distinguished explicitly; the normal paging path keeps its original behavior.
     if total == 0 {
         return Ok(
             "... [note: file is empty (0 lines); read_file returned no lines. \
@@ -258,8 +258,8 @@ to read the last line.]"
         ));
     }
 
-    // 默认带行号（grounding 轴）；use_line_numbers=false 时返回原始内容，
-    // 便于把结果直接作为 apply_patch 的精确源文本或其他工具的输入。
+    // Numbered lines by default (grounding axis); with use_line_numbers=false, return raw content,
+    // so the result can feed directly into apply_patch as exact source text or into other tools.
     let use_line_numbers = should_render_read_file_line_numbers(
         store.path(),
         args["use_line_numbers"].as_bool().unwrap_or(true),
@@ -272,8 +272,8 @@ to read the last line.]"
         use_line_numbers,
         char_offset,
     );
-    // 用实际渲染行数计算续读锚点：字符上限可能在请求的 `end` 之前就截断，
-    // 若沿用 `end` 会让续读 offset 跳过未显示的行（静默丢数据）。
+    // Compute the continuation anchor from the actually rendered line count: the char cap may truncate before the requested `end`,
+    // and reusing `end` would make the continuation offset skip unshown lines (silent data loss).
     let shown_end = start + excerpt.shown_lines;
     let size_capped = shown_end < end || excerpt.truncated_mid_line;
     let rendered = append_truncation_notice(
@@ -288,21 +288,21 @@ to read the last line.]"
     Ok(rendered)
 }
 
-/// 单次 read_file 结果的字符硬上限。
+/// Hard character cap for a single read_file result.
 ///
-/// 行分页（offset/limit）只约束"行数"，无法约束"字符量"：minified JS/JSON、
-/// 单行几十万字符的病理文件即使只读 1 行也能产出 MB 级结果，raw 进入 messages
-/// 会瞬间撑爆上下文。此上限把单条读取结果钳到与 inline 预算同量级（64K），
-/// 超出部分通过统一的 offset 续读契约让模型分页取回，而不是静默丢弃。
+/// Line paging (offset/limit) only bounds "line count", not "character volume": minified JS/JSON and
+/// pathological single-line files with hundreds of thousands of chars can produce MB-scale results from a 1-line read; raw content
+/// entering messages would blow up the context instantly. This cap clamps a single read result to the inline-budget scale (64K);
+/// the excess is fetched via the unified offset continuation contract instead of being silently dropped.
 const MAX_READ_FILE_RESULT_CHARS: usize = 64_000;
 
-/// 当本次读取没有覆盖到文件末尾时，追加一条明确提示，告知模型文件仍有
-/// 剩余行未显示以及如何继续读取。避免模型把"截断结果"误判为"完整文件"。
+/// When this read did not reach end-of-file, append an explicit note telling the model that more lines remain
+/// and how to continue reading. Prevents the model from misreading a "truncated result" as the "complete file".
 ///
-/// `shown_end` 必须是**实际渲染到的行号**（`start + shown_lines`），不能用请求的
-/// `limit` 推算——否则字符上限提前截断时，续读 `offset` 会指向错误位置，导致中间
-/// 若干行被静默跳过。`size_capped` 表示本次截断是由字符上限触发（而非行数用尽），
-/// `truncated_mid_line` 表示最后一行因体积在行中被截断（其余部分已丢弃）。
+/// `shown_end` must be the **actually rendered line number** (`start + shown_lines`), not derived from the requested
+/// `limit` — otherwise, when the char cap truncates early, the continuation `offset` points to the wrong place and middle
+/// lines get silently skipped. `size_capped` means this truncation was triggered by the char cap (not exhausted lines);
+/// `truncated_mid_line` means the last line was cut mid-line due to size (the rest is discarded).
 fn append_truncation_notice(
     mut rendered: String,
     start: usize,
@@ -365,14 +365,14 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
     };
 
     let store = FileStore::new(resolved_path);
-    // temp 文件落在 runtime 控制的临时目录（session assets 或系统 temp），不属于
-    // 用户项目空间，跳过沙箱写权限检查（与 tool-overflow 行为一致）。
+    // Temp files live in runtime-controlled temp dirs (session assets or system temp), outside the
+    // user's project space, so skip the sandbox write check (consistent with tool-overflow behavior).
     if !is_temp {
         store.validate_write_access().map_err(|e| e.to_string())?;
     }
     store.write_all(content).map_err(|e| e.to_string())?;
 
-    // temp 文件写入成功后注册到持久化注册表，供审计跟踪。
+    // After a temp file write succeeds, register it in the persistent registry for audit tracking.
     if is_temp {
         let abs_path = store.path().display().to_string();
         super::super::storage::temp_registry::register(&abs_path)?;
@@ -400,7 +400,7 @@ pub(crate) fn execute_write_file_streaming(
     let target = store.path().display().to_string();
 
     emit_stream_line(on_chunk, &format!("target: {target}"));
-    // temp 文件落在 runtime 控制的临时目录，不属于用户项目空间，跳过沙箱写权限检查。
+    // Temp files live in runtime-controlled temp dirs, outside the user's project space; skip the sandbox write check.
     if !is_temp {
         emit_stream_line(on_chunk, "validating write access");
         store.validate_write_access().map_err(|e| e.to_string())?;
@@ -409,7 +409,7 @@ pub(crate) fn execute_write_file_streaming(
     emit_stream_line(on_chunk, &format!("writing {} byte(s)", content.len()));
     store.write_all(content).map_err(|e| e.to_string())?;
 
-    // temp 文件写入成功后注册到持久化注册表，供审计跟踪。
+    // After a temp file write succeeds, register it in the persistent registry for audit tracking.
     if is_temp {
         let abs_path = store.path().display().to_string();
         super::super::storage::temp_registry::register(&abs_path)?;
@@ -517,8 +517,8 @@ mod tests {
             let read_result = execute_read_file(&read_args);
             assert!(read_result.is_ok(), "read failed: {:?}", read_result);
             let output = read_result.unwrap();
-            // 修复前 offset 越界会静默返回 ""，模型误判为「文件为空」；
-            // 现在必须返回带总行数的明确诊断。
+            // Before the fix, an out-of-bounds offset silently returned ""; the model misread that as "file is empty";
+            // it must now return an explicit diagnostic that includes the total line count.
             assert!(output.contains("beyond the end of file"), "{output}");
             assert!(output.contains("total: 3"), "{output}");
         });
@@ -628,7 +628,7 @@ mod tests {
         let output = execute_read_file(&read_args).unwrap();
         assert!(output.contains("line10"), "output: {output}");
         assert!(!output.contains("line11"), "output: {output}");
-        // 截断时必须提示还有剩余行以及如何继续读取。
+        // On truncation, must note that more lines remain and how to continue reading.
         assert!(output.contains("truncated"), "output: {output}");
         assert!(output.contains("40 more line"), "output: {output}");
         assert!(output.contains("offset=11"), "output: {output}");
@@ -654,9 +654,9 @@ mod tests {
 
     #[test]
     fn test_read_file_size_cap_uses_actual_shown_lines_for_continue_offset() {
-        // 病理文件：每行很宽，行数远少于请求的 limit，但字符量超过硬上限。
-        // 关键回归点：截断提示的续读 offset 必须基于"实际渲染的行数"，
-        // 而不是请求的 limit——否则中间若干行会被静默跳过。
+        // Pathological file: very wide lines, far fewer lines than the requested limit, but char volume exceeds the hard cap.
+        // Key regression point: the continuation offset in the truncation note must be based on the "actually rendered line count",
+        // not the requested limit — otherwise middle lines get silently skipped.
         let path = make_temp_path("bigchars");
         let wide_line = "x".repeat(2_000);
         let content = (0..100)
@@ -672,23 +672,23 @@ mod tests {
         });
         let output = execute_read_file(&read_args).unwrap();
 
-        // 必须提示"因体积截断"，且明确标注字符上限。
+        // Must note "truncated due to size" and call out the character cap explicitly.
         assert!(output.contains("output capped at"), "output: {output}");
         assert!(output.contains("truncated"), "output: {output}");
-        // 输出不得超过硬上限太多（渲染行前缀 + 提示，留合理余量）。
+        // Output must not exceed the hard cap by much (rendered line prefixes + note; a reasonable margin is allowed).
         assert!(
             output.chars().count() <= MAX_READ_FILE_RESULT_CHARS + 2_000,
             "output len {} exceeds cap",
             output.chars().count()
         );
 
-        // 从提示里解析续读 offset，验证它指向"实际显示的最后一行的下一行"，
-        // 且续读能拿到紧接着的内容（不跳行）。宽行文件命中字符上限时是在"行中"
-        // 截断，续读通过 offset + char_offset 从同一行的断点继续，绝不跳到后面的行。
+        // Parse the continuation offset from the note and verify it points to "the line after the last actually displayed line",
+        // and that continuing fetches the immediately following content (no skipped lines). Wide-line files that hit the char cap
+        // are truncated "mid-line"; continuation resumes from the same line's breakpoint via offset + char_offset, never skipping ahead.
         let marker = "Continue that same line with offset=";
         let idx = output.find(marker).expect("mid-line continue present");
         let rest = &output[idx + marker.len()..];
-        // 提示格式：{offset}, char_offset={char_offset}, limit=1.
+        // Note format: {offset}, char_offset={char_offset}, limit=1.
         let offset_digits = rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
         let continue_offset: usize = offset_digits.parse().expect("offset is a number");
         let char_marker = "char_offset=";
@@ -703,7 +703,7 @@ mod tests {
         assert!(continue_offset > 1, "offset should advance: {continue_offset}");
         assert!(next_char_offset > 0, "char_offset should advance: {next_char_offset}");
 
-        // 从断点续读同一行，渲染行号必须等于 continue_offset，证明没有静默跳过行。
+        // Re-reading the same line from the breakpoint must render line number == continue_offset, proving no silent line skipping.
         let next_args = serde_json::json!({
             "file_path": path.to_string_lossy(),
             "offset": continue_offset,
@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_read_file_reads_last_line_without_trailing_newline() {
-        // 文件末尾无换行符时，旧实现按 '\n' 计数会漏掉最后一行。
+        // Without a trailing newline, the old implementation counted by '\n' and missed the last line.
         let path = make_temp_path("lastline");
         fs::write(&path, "first\nsecond\nthird").unwrap();
 
@@ -744,8 +744,8 @@ mod tests {
 
     #[test]
     fn test_read_file_raw_mode_returns_content_without_line_numbers() {
-        // 原始内容本身包含形如 `  7\tvalue` 的行：raw 模式必须原样返回，
-        // 不带行号前缀、也不受 strip 逻辑影响（strip 只作用于归档路径）。
+        // The original content itself contains lines like `  7\tvalue`: raw mode must return them verbatim,
+        // with no line-number prefix and unaffected by strip logic (strip only applies to archive paths).
         let path = make_temp_path("raw");
         let content = "alpha\nbeta\n  7\tvalue\nlast";
         fs::write(&path, content).unwrap();
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn test_read_file_defaults_to_line_numbers() {
-        // 缺省（未传 use_line_numbers）时行为必须与历史一致：带行号前缀。
+        // Default (use_line_numbers not passed) must match historical behavior: line-number prefix.
         let path = make_temp_path("default_ln");
         fs::write(&path, "alpha\nbeta").unwrap();
 
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn test_strip_rendered_line_number_layer_preserves_source_prefix() {
-        // 外层 `1` 是保存 read_file 输出时产生的展示行号；内层 `7` 是源文件内容。
+        // The outer `1` is the display line number added when read_file output was saved; the inner `7` is source content.
         let snapshot = "     1\t     7\tvalue";
         assert_eq!(strip_rendered_line_number_layer(snapshot), "     7\tvalue");
     }
@@ -864,8 +864,8 @@ mod tests {
             "output should not contain nested line numbers: {output}"
         );
 
-        // read_file 快照需要当前 driver 会话授权；无上下文的 service 单测验证其
-        // 重渲染规则，正反授权边界由 storage::file_store 的回归测试覆盖。
+        // read_file snapshots require authorization from the current driver session; context-free service unit tests
+        // verify the re-rendering rules, and the allow/deny authorization boundary is covered by storage::file_store regression tests.
         let snapshot = "   120\talpha\n   121\tbeta\n";
         fs::write(&read_file_snapshot, snapshot).unwrap();
         assert!(!should_strip_rendered_line_number_layer(
@@ -972,7 +972,7 @@ mod tests {
     #[test]
     fn test_temp_file_name_strips_directory_components() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        // 模型可能传 "subdir/script.py"；应只保留文件名，落在 temp dir 根下。
+        // The model may pass "subdir/script.py"; only the file name should be kept, landing at the temp dir root.
         let args = serde_json::json!({
             "file_path": "subdir/script.py",
             "content": "print('hi')\n",

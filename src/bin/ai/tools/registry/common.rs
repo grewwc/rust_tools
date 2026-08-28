@@ -32,8 +32,9 @@ pub(crate) type ToolStreamWriter<'a> = dyn FnMut(&[u8]) + 'a;
 pub(crate) type ToolStreamExecutor =
     for<'a> fn(&Value, &mut ToolStreamWriter<'a>) -> Result<String, String>;
 
-/// 可选的流式执行注册：只给确实需要实时 terminal 反馈的 builtin tool 使用。
-/// 未注册的工具仍沿用原有同步 `execute` 路径，不需要改动现有 ToolSpec。
+/// Optional streaming-execution registration: only for builtin tools that
+/// genuinely need real-time terminal feedback. Unregistered tools keep the
+/// original synchronous `execute` path; no change to the existing ToolSpec.
 pub(crate) struct ToolStreamingRegistration {
     pub(crate) name: &'static str,
     pub(crate) execute_streaming: ToolStreamExecutor,
@@ -41,30 +42,34 @@ pub(crate) struct ToolStreamingRegistration {
 
 inventory::collect!(ToolStreamingRegistration);
 
-/// 终端回显配置：控制工具调用时是否把入参 / 输出结果打印到终端。
-/// 默认全部为 `false`，仅对用户可见性价值较高的工具（如 `plan`）显式开启。
-/// 通过独立的 `ToolDisplayRegistration` 提交，不改动现有 `ToolSpec`，
-/// 保持向后兼容。
+/// Terminal echo configuration: controls whether a tool call's arguments /
+/// output are printed to the terminal. Defaults to all `false`; only tools
+/// with high user-visibility value (e.g. `plan`) opt in explicitly. Submitted
+/// via a separate `ToolDisplayRegistration` without touching the existing
+/// `ToolSpec`, keeping backward compatibility.
 
-/// 终端回显的内容变换：把完整工具结果压缩为紧凑回显文本。
-/// 签名 `fn(完整结果, 调用参数) -> 回显文本`；`None` 表示原样回显完整结果。
+/// Terminal echo content transform: compresses the full tool result into
+/// compact echo text. Signature `fn(full result, call args) -> echo text`;
+/// `None` echoes the full result as-is.
 pub(crate) type ToolDisplayTransform = fn(&str, &Value) -> String;
 
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct ToolDisplayConfig {
-    /// 是否在终端打印工具调用入参。
+    /// Whether to print tool call arguments to the terminal.
     pub(crate) print_args: bool,
-    /// 是否在终端打印工具输出结果。
+    /// Whether to print tool output to the terminal.
     pub(crate) print_result: bool,
-    /// 结果正文是否使用常规亮度回显；默认沿用低优先级的 `DIM`。
-    /// 仅用于少数需要略微突出、但不应增加高饱和颜色或粗体的工具结果。
+    /// Whether the result body is echoed at regular brightness; defaults to
+    /// the low-priority `DIM`. Only for the few tool results that need slight
+    /// emphasis without high-saturation color or bold.
     pub(crate) emphasize_result: bool,
-    /// 可选的终端回显变换：模型仍收到完整 `content`，终端只回显变换后的紧凑文本。
+    /// Optional terminal echo transform: the model still receives the full `content`; the terminal only echoes the transformed compact text.
     pub(crate) display: Option<ToolDisplayTransform>,
 }
 
-/// 可选的终端回显注册：只给需要回显入参/结果的 builtin tool 使用。
-/// 未注册的工具沿用默认配置（均不回显），不需要改动现有 `ToolSpec`。
+/// Optional terminal-echo registration: only for builtin tools that need to
+/// echo arguments/results. Unregistered tools keep the default configuration
+/// (nothing echoed); no change to the existing `ToolSpec`.
 pub(crate) struct ToolDisplayRegistration {
     pub(crate) name: &'static str,
     pub(crate) config: ToolDisplayConfig,
@@ -72,8 +77,10 @@ pub(crate) struct ToolDisplayRegistration {
 
 inventory::collect!(ToolDisplayRegistration);
 
-/// 可选的同参结果复用注册。只有结果在当前 user turn 内可视为稳定快照、且重复执行
-/// 没有消费副作用的工具才可登记；未登记工具默认必须真实执行。
+/// Optional same-args result reuse registration. Only tools whose results can
+/// be treated as a stable snapshot within the current user turn and whose
+/// repeated execution has no consuming side effects may register; unregistered
+/// tools must actually execute by default.
 pub(crate) struct ToolReplayRegistration {
     pub(crate) name: &'static str,
 }
@@ -91,7 +98,7 @@ static TOOL_REPLAY_INDEX: LazyLock<SkipMap<String, ()>> = LazyLock::new(|| {
     index
 });
 
-/// 同名同参的成功结果是否允许在当前 user turn 内直接复用。
+/// Whether a successful result with the same name and args may be reused directly within the current user turn.
 pub(crate) fn tool_allows_same_turn_replay(name: &str) -> bool {
     TOOL_REPLAY_INDEX.contains_key(&name.to_string())
 }
@@ -107,7 +114,7 @@ static TOOL_DISPLAY_INDEX: LazyLock<SkipMap<String, ToolDisplayConfig>> = LazyLo
     index
 });
 
-/// 查询某个工具的终端回显配置；未注册的工具返回全 `false` 默认值。
+/// Query a tool's terminal echo configuration; unregistered tools return the all-`false` default.
 pub(crate) fn tool_display_config(name: &str) -> ToolDisplayConfig {
     TOOL_DISPLAY_INDEX
         .get_ref(&name.to_string())
@@ -115,51 +122,61 @@ pub(crate) fn tool_display_config(name: &str) -> ToolDisplayConfig {
         .unwrap_or_default()
 }
 
-/// 有损压缩策略：控制该工具结果是否允许被行裁剪 / 折叠 / 摘要等有损压缩。
-/// `Never` 表示 precision 结果，压缩路径只能零压缩外溢到磁盘并留指针 stub。
+/// Lossy-compression policy: controls whether this tool's results may undergo
+/// lossy compression such as line trimming / folding / summarization. `Never`
+/// marks precision results; the compression path may only zero-compress them
+/// out to disk, leaving a pointer stub.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) enum ToolLossyCompressPolicy {
-    /// 默认：允许有损压缩（普通概览型工具结果）。
+    /// Default: lossy compression allowed (ordinary overview-type tool results).
     #[default]
     Allow,
-    /// 禁止有损压缩：内容复现代价高（如 `read_file` / 检索类 / `execute_command`），
-    /// 一旦被裁剪模型会反复重跑同一次操作，表现为失忆/原地打转。
+    /// Lossy compression forbidden: content is expensive to reproduce (e.g.
+    /// `read_file` / retrieval / `execute_command`); once trimmed, the model
+    /// re-runs the same operation repeatedly, appearing amnesiac / stuck in place.
     Never,
 }
 
-/// LLM 引导裁剪策略：控制该工具结果是否允许被模型标记后裁剪成占位符。
-/// 与有损压缩正交——「不可有损压缩」不等于「不可裁剪」：`read_file` 的旧
-/// 版本一旦被模型连续判定过时，就应允许裁剪以释放上下文。`plan` 允许有损
-/// 压缩但禁止 LLM 裁剪：最新一版由最近工具组保护窗口完整保留，旧版可摘要
-/// 压缩以释放上下文，但模型不应单方"判废"既有规划。
+/// LLM-guided pruning policy: controls whether this tool's results may be
+/// marked by the model and pruned into placeholders. Orthogonal to lossy
+/// compression — "cannot be lossily compressed" does not mean "cannot be
+/// pruned": old versions of `read_file` should become prunable once the model
+/// has repeatedly judged them outdated, to free context. `plan` allows lossy
+/// compression but forbids LLM pruning: the latest version is fully preserved
+/// by the recent-tool-group protection window, while old versions may be
+/// summarized to free context, but the model should not unilaterally
+/// invalidate existing plans.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) enum ToolPrunePolicy {
-    /// 默认：允许被 LLM 引导裁剪（仍受最近窗口保护与连续标记阈值约束）。
+    /// Default: may be pruned under LLM guidance (still subject to recent-window protection and the consecutive-mark threshold).
     #[default]
     Allow,
-    /// 永不裁剪（如 `plan`）。
+    /// Never pruned (e.g. `plan`).
     Never,
 }
 
-/// 工具的历史保留策略：把「有损压缩」与「LLM 裁剪」两个正交维度合并声明。
-/// 通过独立的 `ToolHistoryPolicyRegistration` 提交，不改动 `ToolSpec`，
-/// 未注册的工具取默认值（两维度均 `Allow`）。
+/// Tool history retention policy: declares both orthogonal dimensions, "lossy
+/// compression" and "LLM pruning", together. Submitted via a separate
+/// `ToolHistoryPolicyRegistration` without touching `ToolSpec`; unregistered
+/// tools take the defaults (both dimensions `Allow`).
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct ToolHistoryPolicy {
     pub(crate) lossy_compress: ToolLossyCompressPolicy,
     pub(crate) prune: ToolPrunePolicy,
-    /// 最近工具组过大时，该工具是否占用高精度结果的 inline 预算。
-    /// 聚合型工具（如 task_wait）即使同样禁止有损压缩，也不占用此预算。
+    /// When the recent tool group is oversized, whether this tool occupies the
+    /// inline budget for high-precision results. Aggregation tools (e.g.
+    /// task_wait) do not occupy this budget even though they likewise forbid
+    /// lossy compression.
     pub(crate) counts_toward_precision_inline_budget: bool,
 }
 
 impl ToolHistoryPolicy {
-    /// 是否允许对该工具结果做有损压缩（行裁剪/折叠/摘要）。
+    /// Whether lossy compression (line trimming / folding / summarization) may be applied to this tool's results.
     pub(crate) fn allows_lossy_compress(&self) -> bool {
         matches!(self.lossy_compress, ToolLossyCompressPolicy::Allow)
     }
 
-    /// 是否允许该工具结果被 LLM 引导裁剪。
+    /// Whether this tool's results may be pruned under LLM guidance.
     pub(crate) fn allows_prune(&self) -> bool {
         matches!(self.prune, ToolPrunePolicy::Allow)
     }
@@ -169,9 +186,11 @@ impl ToolHistoryPolicy {
     }
 }
 
-/// 可选的历史保留策略注册：只给需要偏离默认（`Allow`/`Allow`）的工具使用。
-/// 未注册的工具沿用默认策略，不需要改动现有 `ToolSpec`，与
-/// `ToolDisplayRegistration` / `ToolStreamingRegistration` 的兼容模式一致。
+/// Optional history-retention-policy registration: only for tools that
+/// deviate from the default (`Allow`/`Allow`). Unregistered tools keep the
+/// default policy, no change to the existing `ToolSpec` needed, consistent
+/// with the compatibility mode of `ToolDisplayRegistration` /
+/// `ToolStreamingRegistration`.
 pub(crate) struct ToolHistoryPolicyRegistration {
     pub(crate) name: &'static str,
     pub(crate) policy: ToolHistoryPolicy,
@@ -191,7 +210,7 @@ static TOOL_HISTORY_POLICY_INDEX: LazyLock<SkipMap<String, ToolHistoryPolicy>> =
         index
     });
 
-/// 查询某个工具的历史保留策略；未注册的工具返回默认值（两维度均 `Allow`）。
+/// Query a tool's history retention policy; unregistered tools return the default (`Allow` for both dimensions).
 pub(crate) fn tool_history_policy(name: &str) -> ToolHistoryPolicy {
     TOOL_HISTORY_POLICY_INDEX
         .get_ref(&name.to_string())
@@ -242,8 +261,9 @@ pub(crate) fn request_tool_cancel() {
     });
 }
 
-/// SIGINT handler 路径不能阻塞在 kernel mutex 上。stream/request cancel flag 是
-/// 主取消信号；这里仅作为正在轮询 SigCancel 的工具的 best-effort 侧信道。
+/// The SIGINT handler path must not block on the kernel mutex. The
+/// stream/request cancel flag is the primary cancellation signal; this is only
+/// a best-effort side channel for tools currently polling SigCancel.
 pub(crate) fn try_request_tool_cancel() -> bool {
     try_with_current_process_kernel(|os, pid| {
         let addr = ensure_process_tool_cancel_futex(os, pid)?;
@@ -538,8 +558,9 @@ mod manifest_tool_name_tests {
     }
 }
 
-/// 把已废弃/合并的历史工具名规整到当前规范名，用于旧会话回放兼容。
-/// `read_file_lines` 已并入 `read_file`（两者都接受 offset/limit）。
+/// Normalize deprecated/merged historical tool names to their current
+/// canonical names, for old-session replay compatibility. `read_file_lines`
+/// has been merged into `read_file` (both accept offset/limit).
 fn canonical_tool_name(name: &str) -> &str {
     match name {
         "read_file_lines" => "read_file",
@@ -583,8 +604,10 @@ fn execute_tool_call_with_args_impl(
     args: &Value,
     on_chunk: Option<&mut ToolStreamWriter<'_>>,
 ) -> Result<ToolResult, String> {
-    // 旧会话回放兼容：read_file_lines 已并入 read_file（同样支持 offset/limit）。
-    // 老历史里残留的调用名映射到规范名，避免回放时命中 "Unknown tool"。
+    // Old-session replay compatibility: read_file_lines was merged into
+    // read_file (also supports offset/limit). Legacy call names left over in
+    // old history map to the canonical name to avoid hitting "Unknown tool"
+    // during replay.
     let name = canonical_tool_name(name);
     let Some(spec) = TOOL_INDEX.get_ref(&name.to_string()).copied() else {
         record_tool_stat(name, false);
@@ -620,7 +643,7 @@ fn execute_tool_call_with_args_impl(
     }
 }
 
-/// Tier A1：把工具调用结果写进 DecisionLog（只写，下游消费另起 PR）。
+/// Tier A1: write tool call results into the DecisionLog (write-only; downstream consumption is a separate PR).
 fn record_tool_decision(name: &str, success: bool, message: &str) {
     record_tool_decision_with_time(name, success, message, 0);
 }
@@ -642,7 +665,7 @@ fn record_tool_decision_with_time(name: &str, success: bool, message: &str, elap
         outcome: Some(crate::ai::driver::decision_log::Outcome {
             success,
             message: {
-                // 截断长错误，避免 DecisionLog 内存膨胀
+                // Truncate long errors to avoid DecisionLog memory bloat
                 if message.len() > 240 {
                     let mut end = 240;
                     while !message.is_char_boundary(end) && end > 0 {
@@ -717,9 +740,11 @@ mod history_policy_tests {
 
     #[test]
     fn plan_allows_lossy_compress_but_blocks_prune() {
-        // plan 最新一版由最近工具组保护窗口 (`KEEP_RECENT_TOOL_GROUPS`) 完整保留；
-        // 旧版 plan 触发上下文压力时允许有损压缩摘要。LLM 单方裁剪 prunes 始终禁止，
-        // 防止模型"判废"既有规划而原地打转。
+        // The latest plan version is fully preserved by the recent-tool-group
+        // protection window (`KEEP_RECENT_TOOL_GROUPS`); older plan versions
+        // may be lossily summarized under context pressure. LLM-driven pruning
+        // of plan results is always forbidden, to prevent the model from
+        // unilaterally invalidating existing plans and spinning in place.
         let policy = tool_history_policy("plan");
         assert!(policy.allows_lossy_compress());
         assert!(!policy.allows_prune());
@@ -728,8 +753,8 @@ mod history_policy_tests {
 
     #[test]
     fn legacy_read_file_lines_name_canonicalizes_to_read_file() {
-        // 旧会话历史里残留的 read_file_lines 调用名必须映射到 read_file，
-        // 回放时不能命中 "Unknown tool"。
+        // The read_file_lines call name left over in old-session history must
+        // map to read_file; replay must not hit "Unknown tool".
         assert_eq!(canonical_tool_name("read_file_lines"), "read_file");
         assert_eq!(canonical_tool_name("lsp"), "lsp");
         assert_eq!(canonical_tool_name("read_file"), "read_file");
@@ -753,10 +778,14 @@ mod history_policy_tests {
 
     #[test]
     fn apply_patch_blocks_lossy_compression_and_counts_toward_precision() {
-        // apply_patch 结果是当前轮「我刚改了什么」的唯一精确证据；失败诊断还会回显
-        // 整份文件文本供重建补丁。漏注册会让它退回默认 (Allow/Allow, precision=false)，
-        // 于是当前轮补丁结果既不进保护集合又可被有损截断，模型看不到补丁是否落地而
-        // 原地重试。这条断言把该契约钉死，防止再次回退到默认策略。
+        // apply_patch results are the only precise evidence of "what I just
+        // changed" in the current turn; failure diagnostics also echo the full
+        // file text for rebuilding the patch. Missing registration would fall
+        // back to the default (Allow/Allow, precision=false), so the current
+        // turn's patch result would neither enter the protection set nor be
+        // safe from lossy trimming — the model could not see whether the patch
+        // landed and would retry in place. This assertion pins that contract,
+        // preventing another regression to defaults.
         let policy = tool_history_policy("apply_patch");
         assert!(!policy.allows_lossy_compress());
         assert!(policy.allows_prune());
@@ -772,10 +801,13 @@ mod history_policy_tests {
 
     #[test]
     fn subagent_spawn_tools_block_lossy_and_prune() {
-        // task_spawn / task_spawn_batch 的参数（子代理 prompt / response schema）与
-        // 返回值（task_id 列表）是后续 wait/status/integrate 的必需输入。漏注册会让
-        // 它们退回默认策略 (Allow/Allow)，折叠后证据退化成结果首字符（原始参数不参与
-        // recall），主 agent 会失去对已 spawn 子任务的 grounding。这条断言把契约钉死。
+        // task_spawn / task_spawn_batch arguments (subagent prompt / response
+        // schema) and return values (task_id list) are required inputs for
+        // later wait/status/integrate. Missing registration would fall back to
+        // the default policy (Allow/Allow); after folding, evidence degrades
+        // to the first characters of the result (the original args do not
+        // participate in recall), and the main agent loses grounding on
+        // already-spawned subtasks. This assertion pins the contract.
         for name in ["task_spawn", "task_spawn_batch"] {
             let policy = tool_history_policy(name);
             assert!(!policy.allows_lossy_compress(), "{name} must block lossy compress");

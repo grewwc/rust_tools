@@ -18,13 +18,13 @@ use super::{DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS};
 
 type ToolDef = ToolDefinition;
 
-/// 运行时上下文，传入 build_system_prompt 实现条件渲染。
-/// 当前有 goal_mode 与 is_background；未来可扩展 task_type / persona 等。
+/// Runtime context passed into build_system_prompt to enable conditional rendering.
+/// Currently has goal_mode and is_background; extensible later with task_type / persona etc.
 #[derive(Clone, Default)]
 pub(super) struct PromptContext {
-    /// 非 None 表示处于 goal 模式，值为目标描述文本。
+    /// Some(_) means goal mode is active; the value is the goal description text.
     pub goal_mode: Option<String>,
-    /// 后台模式（-bg）：终端已脱离，不应注入"向用户提问"引导。
+    /// Background mode (-bg): the terminal is detached, so do not inject "ask the user" guidance.
     pub is_background: bool,
 }
 
@@ -69,12 +69,12 @@ impl SystemPromptBuilder {
     }
 
     fn render_system_prompt(&self) -> String {
-        // 按语义类别分组渲染：同一 kind（identity/behavior/capability/policy）的所有段落
-        // 合并进同一对 tag，组内保持插入顺序。这样 persona 等"在 build_system_prompt
-        // 之后追加"的 identity 段不会被甩到 prompt 末尾，而是与通用 identity 聚拢；
-        // behavior/policy 也不再因 push 时机裂成多簇，减少 tag 噪音、让优先级层次
-        // 对模型更清晰。Fact 段不在 system prompt 渲染（走 context reminder 注入当前
-        // user 消息），故不在白名单内、自然被排除。
+        // Render grouped by semantic category: all sections of the same kind
+        // (identity/behavior/capability/policy) merge into one tag pair, keeping insertion order within the group, so identity sections
+        // appended "after build_system_prompt" (e.g. persona) are not pushed to the end of the prompt but cluster with the generic identity;
+        // behavior/policy no longer split into multiple clusters by push timing, reducing tag noise and making the priority
+        // hierarchy clearer to the model. Fact sections are not rendered in the system prompt (they go through the context reminder injected into the current
+        // user message), so they are not in the whitelist and are naturally excluded.
         const RENDER_ORDER: [(ContextKind, &str); 4] = [
             (ContextKind::Identity, "identity"),
             (ContextKind::Behavior, "behavior"),
@@ -185,7 +185,7 @@ pub(super) struct SkillTurnGuard {
     builder: SystemPromptBuilder,
     cached_system_prompt: Option<String>,
     cached_context_reminder: Option<Option<String>>,
-    /// 当前活动 skill 列表（有序，多 skill 平权，无主次之分）。
+    /// Currently active skill list (ordered; multiple skills are peers with no ranking).
     matched_skill_names: Vec<String>,
 }
 
@@ -200,17 +200,17 @@ impl SkillTurnGuard {
     pub(super) fn context_reminder(&mut self) -> Option<String> {
         if self.cached_context_reminder.is_none() {
             let mut parts: Vec<String> = Vec::new();
-            // 活动 skill 的"末尾指针"：长上下文（多轮对话 + 工具循环）下 system
-            // prompt 位于上下文最前，skill 指令容易被长中间段稀释；在最后一个 user
-            // 消息开头注入一条简短指针，把"turn 开始时生效的 skill 名单（快照）"
-            // 重新锚定到请求附近（近因位置），保证模型在长上下文里仍按 skill 契约
-            // 执行。指针刻意用 "at turn start" 而非 "for this turn"：user 消息只在
-            // turn 开头构建一次，而 mid-turn 可通过 activate_skill/deactivate_skill
-            // 变更生效集，快照式表述保证指针永不为假；当前生效集一律以 system
-            // prompt 的 `<skill_instructions>`（每 iteration 重建、权威、可命中缓存）
-            // 为准。本指针只进请求投影（turn_messages 不含 reminder），且当前 user
-            // 消息本就是 cache miss，故不破坏上游 prompt cache。仅当有活动 skill
-            // 时注入。
+            // "End-of-context pointer" for active skills: in long contexts (multi-turn dialogue + tool loops) the system
+            // prompt sits at the very front, where skill instructions get diluted by the long middle; injecting a short pointer at the
+            // start of the last user message re-anchors "the skill list in effect at turn start (snapshot)"
+            // near the request (recency position), so the model still follows the skill contract
+            // in long contexts. The pointer deliberately says "at turn start" rather than "for this turn": the user message is
+            // built only once at turn start, while mid-turn activate_skill/deactivate_skill
+            // can change the effective set, so the snapshot wording keeps the pointer never false; the currently effective set is always governed by the
+            // system prompt's `<skill_instructions>` (rebuilt each iteration, authoritative, cache-friendly)
+            // This pointer only enters the request projection (turn_messages does not contain the reminder), and the current user
+            // message is already a cache miss anyway, so the upstream prompt cache is not broken. Injected only when
+            // there are active skills.
             if !self.matched_skill_names.is_empty() {
                 let mut pointer = String::new();
                 if self.matched_skill_names.len() == 1 {
@@ -285,12 +285,12 @@ impl SkillTurnGuard {
         !scoped_project_instructions_missing(self.system_prompt(), required_targets)
     }
 
-    /// 返回当前所有活动 skill 名称（有序，多 skill 平权）。
+    /// Returns the names of all currently active skills (ordered; peers with no ranking).
     pub(super) fn matched_skill_names(&self) -> &[String] {
         &self.matched_skill_names
     }
 
-    /// 返回活动列表的第一条 skill 名称，仅用于显示/日志（多 skill 平权，无主次之分）。
+    /// Returns the first skill name in the active list, for display/logging only (peers, no ranking).
     pub(super) fn primary_skill_name(&self) -> Option<&str> {
         self.matched_skill_names.first().map(|s| s.as_str())
     }
@@ -328,13 +328,13 @@ fn activate_skill_context(
         let prev_max_iterations = std::mem::replace(&mut ctx.max_iterations, max_iterations);
         restore = Some((prev_tools, prev_max_iterations));
     }
-    // max_iterations 是「每轮」迭代上限（TurnSupervisor.iteration 每轮从 0 重置），
-    // 而 kernel 的 max_tool_calls 是「进程生命周期累计」的（tool_calls_used 永不重置）。
-    // 把 per-turn 的 max_iterations 映射到累计的 max_tool_calls 会导致长会话中累计
-    // 工具调用数先触顶（build=2048 / executor=128），即使没有任何单轮超限也会被
-    // 强制收尾，表现为 "已达到本轮工具上限"。per-turn 迭代上限已由 execution.rs
-    // 的 `iteration >= max_iterations` 检查正确执行，进程级 turn 上限已由 max_turns
-    // （来自 quota_turns）执行，因此这里不再覆盖 max_tool_calls，保持 unlimited。
+    // max_iterations is the per-turn iteration cap (TurnSupervisor.iteration resets to 0 each turn),
+    // while the kernel's max_tool_calls is cumulative over the process lifetime (tool_calls_used is never reset).
+    // Mapping the per-turn max_iterations onto the cumulative max_tool_calls would make long sessions hit the
+    // cumulative tool-call ceiling first (build=2048 / executor=128), force-wrapping the turn
+    // even without any single-turn overrun, showing up as "tool limit reached for this turn". The per-turn iteration cap is already enforced by
+    // execution.rs's `iteration >= max_iterations` check, and the process-level turn cap is enforced by max_turns
+    // (from quota_turns), so we no longer override max_tool_calls here and keep it unlimited.
     restore
 }
 
@@ -370,8 +370,8 @@ fn merge_with_runtime_enabled_tools(
         .filter(|name| !runtime_extra_names.contains(*name))
         .cloned()
         .collect::<Vec<_>>();
-    // enable_tools 的执行结果与下一次 skill 刷新之间不应依赖 ctx.tools 恰好已写回。
-    // 内置工具可直接从注册表恢复；MCP 工具仍由 current_tools 保留。
+    // The result of enable_tools and the next skill refresh must not depend on ctx.tools having been written back in time.
+    // Builtin tools can be restored directly from the registry; MCP tools are still kept by current_tools.
     runtime_extra.extend(super::super::tools::get_tool_definitions_by_names(
         &missing_builtin_names,
     ));
@@ -395,9 +395,9 @@ fn dedupe_tools_by_name(tools: Vec<ToolDef>) -> Vec<ToolDef> {
 }
 
 fn required_baseline_tool_names() -> Vec<String> {
-    // 只补回每轮必须常驻的执行 baseline。低频 skill 发现工具仍保留在进程级
-    // allowlist 中，但由 `enable_tools` 按需加入 schema，避免 manifest 路径绕过
-    // lazy-loading 策略。
+    // Only re-add the execution baseline that must be resident every turn. Low-frequency skill-discovery tools stay in the process-level
+    // allowlist but join the schema on demand via `enable_tools`, preventing the manifest path from bypassing
+    // the lazy-loading policy.
     crate::ai::tools::eager_baseline_tool_names()
         .iter()
         .map(|name| (*name).to_string())
@@ -520,11 +520,11 @@ fn builtin_tools_for_skill(
     skills: &[&SkillManifest],
     active_agent: Option<&AgentManifest>,
 ) -> Vec<ToolDef> {
-    // 任一活动 skill 禁用 builtin 即整体禁用（most-restrictive）
+    // If any active skill disables builtin, disable builtin entirely (most-restrictive)
     if skills.iter().any(|s| s.disable_builtin_tools) {
         return filter_subagent_hidden_tools(Vec::new());
     }
-    // 合并所有活动 skill 的 tool_groups 和 tools（去重，保序）
+    // Merge tool_groups and tools across all active skills (dedup, order-preserving)
     let mut merged_groups: Vec<String> = Vec::new();
     let mut merged_tools: Vec<String> = Vec::new();
     for skill in skills {
@@ -695,7 +695,7 @@ fn select_mcp_tools(
     skills: &[&SkillManifest],
     active_agent: Option<&AgentManifest>,
 ) -> Vec<ToolDef> {
-    // 任一活动 skill 禁用 mcp 即整体禁用
+    // If any active skill disables mcp, disable mcp entirely
     if skills.iter().any(|skill| skill.disable_mcp_tools) {
         return Vec::new();
     }
@@ -706,14 +706,14 @@ fn select_mcp_tools(
 
     let allowed_servers = resolved_mcp_servers(skills, active_agent);
     if allowed_servers.is_empty() {
-        // 默认懒加载：不把全部 MCP 工具的 schema 预挂载到每轮请求里（每个 schema
-        // 几百~上千 token，全量 MCP 工具是每轮 tools 数组里最大且最可削减的一块，
-        // 直接撞 TPM 上限）。模型仍能感知这些工具——`build_hidden_mcp_tool_catalog`
-        // 会在 system prompt 里列出未加载的 MCP 工具名，模型按需通过
-        // `enable_tools(operation=list/enable)` 加载；已启用的工具经
-        // `explicit_enabled_tool_names` + `merge_with_runtime_enabled_tools` 跨轮保留。
-        // 只有当 skill / agent 显式声明了 `mcp_servers` 白名单时才走下面的
-        // eager 分支，把命中的 server 工具直接挂上。
+        // Lazy by default: do not pre-mount every MCP tool's schema into each request (each schema
+        // costs hundreds to thousands of tokens; all MCP tools are the largest and most trimmable chunk of the per-turn tools array,
+        // easily hitting the TPM cap). The model can still sense these tools — `build_hidden_mcp_tool_catalog`
+        // lists unloaded MCP tool names in the system prompt, and the model loads them on demand via
+        // `enable_tools(operation=list/enable)`; already-enabled tools persist across turns
+        // via `explicit_enabled_tool_names` + `merge_with_runtime_enabled_tools`.
+        // Only when a skill / agent explicitly declares an `mcp_servers` whitelist do we take the
+        // eager branch below and mount the matching server tools directly.
         return Vec::new();
     }
 
@@ -873,8 +873,8 @@ fn build_hidden_task_tool_catalog(available_tools: &Box<SkipSet<String>>) -> Opt
     Some(out)
 }
 
-/// XML 属性值转义：`&` `<` `>` `"` `'`。
-/// 用于 `<instructions path="...">` 的 path 属性，避免路径中的引号/尖括号破坏 XML 结构。
+/// XML attribute-value escaping: `&` `<` `>` `"` `'`.
+/// Used for the path attribute of `<instructions path="...">` so quotes/angle brackets in paths cannot break the XML structure.
 fn escape_xml_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -965,8 +965,8 @@ fn push_project_instruction_context(builder: &mut SystemPromptBuilder) {
 
 fn push_project_type_context(builder: &mut SystemPromptBuilder) {
     if let Some(kind) = crate::ai::agents::detect_project_kind_from_cwd() {
-        // 把识别出的项目类型 + 默认构建/测试约定作为 Fact 段注入，
-        // 让 LLM 不必猜测 `cargo` / `npm` / `go` 该用哪个。
+        // Inject the detected project type and default build/test conventions as a Fact section,
+        // so the LLM does not have to guess whether `cargo` / `npm` / `go` applies.
         builder.push_labeled(
             ContextKind::Fact,
             "Project Type",
@@ -980,9 +980,9 @@ fn push_project_context(builder: &mut SystemPromptBuilder) {
     push_project_type_context(builder);
 }
 
-/// 会话（session）上下文：告诉模型当前 session 及其数据布局，使它在任何项目
-/// （包括与 rust_tools 无关的目录）里都能定位、排查 sessionid 相关问题，并对
-/// 指定 session 的内容做只读交互。模型只读：不写入、不修改、不删除 session 数据。
+/// Session context: tells the model the current session and its data layout, so that in any project
+/// (even directories unrelated to rust_tools) it can locate and debug sessionid problems and
+/// interact read-only with a given session's content. The model is read-only: no writing, modifying, or deleting session data.
 fn session_context_prompt(session_id: &str, session_history_file: &Path, history_file: &Path) -> String {
     let sessions_root = crate::ai::history::SessionStore::new(history_file)
         .sessions_root()
@@ -998,8 +998,8 @@ fn session_context_prompt(session_id: &str, session_history_file: &Path, history
 
 const MAX_SKILL_ACTIVATION_HISTORY_ENTRIES: usize = 6;
 
-/// 把成功的显式 skill 选择投影为有界的 runtime fact。原始旁路记录不进入
-/// canonical messages；这里仅让后续模型能区分“曾经选中过”与“当前仍激活”。
+/// Project a successful explicit skill selection into a bounded runtime fact. The raw side-channel record does not enter
+/// canonical messages; this only lets later models distinguish "was once selected" from "still currently active".
 fn build_skill_activation_history_reminder(events: &[SkillActivationEvent]) -> Option<String> {
     let mut recent: Vec<(&str, &str)> = Vec::with_capacity(MAX_SKILL_ACTIVATION_HISTORY_ENTRIES);
     for event in events.iter().rev() {
@@ -1047,13 +1047,13 @@ fn build_system_prompt(
 ) -> SystemPromptBuilder {
     let mut b = SystemPromptBuilder::new();
 
-    // Identity 段：合并通用 identity + agent / skill enforcement，避免 4 段
-    // 重复 "you must follow ..." 充斥 prompt cache。
+    // Identity section: merge the generic identity with agent / skill enforcement, avoiding 4 copies of
+    // repeated "you must follow ..." flooding the prompt cache.
     let agent_extra = active_agent
         .map(|agent| agent.build_system_prompt())
         .filter(|s| !s.trim().is_empty());
 
-    // 多 skill 叠加：按激活顺序拼接所有 skill 的 prompt
+    // Multi-skill stacking: concatenate all skills' prompts in activation order
     let skill_prompts: Vec<String> = skills
         .iter()
         .map(|skill| skill.build_system_prompt())
@@ -1067,14 +1067,14 @@ fn build_system_prompt(
 
     let identity = if let Some(skill_text) = &skill_extra {
         let mut s = if skills.len() == 1 {
-            // 单 skill：保持原有简洁格式
+            // Single skill: keep the original compact format
             let skill_name = skills[0].name.as_str();
             format!(
                 "Active skill: {skill_name}\n\
                  Its instructions are the primary behavior contract for this turn."
             )
         } else {
-            // 多 skill：列出全部，说明叠加规则
+            // Multiple skills: list all and state the stacking rules
             let mut header = String::from(
                 "Active skills (activation order; equal peers):\n\
                  Their instructions compose additively and form the primary behavior contract \
@@ -1135,7 +1135,7 @@ fn build_system_prompt(
         runtime_environment_prompt(),
     );
 
-    // 多 skill：逐个输出 resource_path（仅当有值）
+    // Multiple skills: output each resource_path (only when non-empty)
     for skill in skills {
         if let Some(resource_path) = skill.resource_path.as_deref() {
             let trimmed = resource_path.trim();
@@ -1228,8 +1228,8 @@ fn build_system_prompt(
         );
     }
 
-    // ── 行为规则：根据 goal 模式条件渲染 ──
-    // 两种模式共用上面的 success-criteria 收敛规则；这里只表达作用域与续执行差异。
+    // ── Behavior rules: conditionally rendered based on goal mode ──
+    // Both modes share the success-criteria convergence rules above; only scope and continuation differences are expressed here.
     if ctx.goal_mode.is_some() {
         b.push(
             ContextKind::Behavior,
@@ -1500,8 +1500,8 @@ fn build_skill_turn_guard(
     super::super::tools::enable_tools::set_hidden_group_declared(hidden_group_declared);
 
     let mut builtin_tools = builtin_tools_for_skill(skills, active_agent.as_ref());
-    // 外部下载的 skill 无法预先声明本运行时的续接协议；仅在 skill 已激活时
-    // 注入这个 driver-owned 工具，普通 turn 不增加 schema 噪声或行为分支。
+    // Externally downloaded skills cannot pre-declare this runtime's continuation protocol; inject this driver-owned tool
+    // only while a skill is active, so ordinary turns gain no schema noise or behavior branches.
     if !skills.is_empty() {
         builtin_tools.extend(crate::ai::tools::get_tool_definitions_by_names(&[
             "request_user_input".to_string(),
@@ -1586,8 +1586,8 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     _question: &str,
     preferred_skill_names: &[String],
 ) -> SkillTurnGuard {
-    // iteration > 1 时仅按名字保持上一轮的 skill，不再做文本相似度重路由。
-    // 模型如需切换可通过 activate_skill 显式请求。
+    // For iteration > 1, keep the previous turn's skills by name only; no more text-similarity re-routing.
+    // If the model needs to switch, it can request explicitly via activate_skill.
     let skills: Vec<&SkillManifest> = preferred_skill_names
         .iter()
         .filter_map(|name| skill_manifests.iter().find(|s| &s.name == name))
@@ -1595,12 +1595,12 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     build_skill_turn_guard(app, mcp_client, &skills)
 }
 
-/// 模型通过 `activate_skill` 工具显式请求激活某个 skill 时走这里：直接按名字
-/// 命中并强制激活其 prompt + 工具集，跳过自动路由的打分/阈值/门控。
+/// Path taken when the model explicitly requests a skill via the `activate_skill` tool: match by name
+/// directly and force-activate its prompt + tool set, skipping auto-routing's scoring/threshold/gating.
 ///
-/// "别乱用"由工具侧（名字必须真实存在、描述明确要求"clearly matches"才调用）和
-/// 这里的名字校验共同兜底；命中后活动集在当前 turn 内由每轮重建保持
-/// （`refresh_skill_turn_for_iteration` 只按 pending action 调整，不重新打分）。
+/// "Don't abuse it" is enforced by the tool side (the name must really exist, and the description requires "clearly matches" before calling) plus
+/// the name validation here. After a hit, the active set is kept within the turn by the per-iteration rebuild
+/// (`refresh_skill_turn_for_iteration` only adjusts by pending action and does not re-score).
 pub(super) fn force_activate_named_skill(
     app: &mut App,
     mcp_client: &McpClient,
@@ -1608,7 +1608,7 @@ pub(super) fn force_activate_named_skill(
     _question: &str,
     requested_names: &[String],
 ) -> Option<SkillTurnGuard> {
-    // 按名字逐个解析为 manifest（跳过未命中的）
+    // Resolve each name into a manifest one by one (skipping misses)
     let skills: Vec<&SkillManifest> = requested_names
         .iter()
         .filter_map(|name| skill_manifests.iter().find(|s| &s.name == name))
@@ -1659,18 +1659,18 @@ pub(super) fn prepare_skill_for_turn(
         .trim()
         .eq_ignore_ascii_case("true");
 
-    // 用户通过 `@skills:<name>` 或 `/skills <name>...` 在输入框中显式选择的强制
-    // skill 列表最高优先。
-    // 这是 per-turn 语义：消费后立即清空，下一轮不再强制注入。
-    // 它也是用户显式离开等待中 skill 的信号，不能让旧续接抢回本轮。
+    // Skills explicitly forced by the user via `@skills:<name>` or `/skills <name>...` in the input box have the
+    // highest priority.
+    // This is per-turn semantics: cleared immediately after consumption; not force-injected next turn.
+    // It is also the user's signal of explicitly leaving a waiting skill; an old continuation must not grab the turn back.
     let forced_skills = std::mem::take(&mut app.forced_skills);
     let forced_source = app.forced_skill_source.take();
     if !forced_skills.is_empty() {
         app.pending_skill_continuation = None;
     }
     if !forced_skills.is_empty() {
-        // 逐个解析：保持输入顺序、按 manifest 规范化名字并去重；未命中的单独记录，
-        // 其中某个名字失效不应拖垮整个集合（force_activate_named_skill 也会逐个跳过）。
+        // Resolve one by one: keep input order, normalize names per manifest and dedup; misses are recorded separately,
+        // since one bad name must not sink the whole set (force_activate_named_skill skips unknowns one by one too).
         let mut valid: Vec<String> = Vec::with_capacity(forced_skills.len());
         let mut not_found: Vec<String> = Vec::new();
         for forced in &forced_skills {
@@ -1722,14 +1722,14 @@ pub(super) fn prepare_skill_for_turn(
         }
     }
 
-    // 只消费一次由 `request_user_input` 建立的显式续接。这里按名字重新解析
-    // manifest，既避免把已删除/改名的外部 skill 当作有效状态，也不会退回到
-    // 旧版基于文本相似度的 cross-turn sticky 路由。
+    // Consume the explicit continuation created by `request_user_input` exactly once. Re-resolving manifests by name here both
+    // avoids treating deleted/renamed external skills as valid state and does not fall back to
+    // the old text-similarity-based cross-turn sticky routing.
     if let Some(continuation) = app.pending_skill_continuation.take() {
         let requested_names = continuation.skill_names;
-        // 只恢复仍能解析的 skill：集合中某个 skill 已删除/改名不应拖垮整个集合
-        // 的续接。force_activate_named_skill 内部同样会逐个跳过未知名字，这里
-        // 先行过滤以便区分"部分恢复"与"全部失效"。
+        // Restore only skills that still resolve: one deleted/renamed skill in the set must not sink the whole
+        // continuation. force_activate_named_skill skips unknown names one by one internally too; filtering here first
+        // lets us distinguish "partially restored" from "all invalid".
         let valid_names: Vec<String> = requested_names
             .iter()
             .filter(|name| skill_manifests.iter().any(|s| &s.name == *name))
@@ -1765,9 +1765,9 @@ pub(super) fn prepare_skill_for_turn(
         }
     }
 
-    // 不做任何自动 skill 激活：交给 LLM 在需要时通过 activate_skill 显式选择，
-    // 或直接使用现有工具完成任务。cross-turn sticky 也已移除——浅层 Jaccard
-    // 匹配无法区分"追问同一 skill"与"恰好共享 token 的不同话题"。
+    // No automatic skill activation: leave it to the LLM to explicitly choose via activate_skill when needed,
+    // or complete the task with existing tools. Cross-turn sticky is also gone — shallow Jaccard
+    // matching cannot tell "follow-up on the same skill" from "a different topic that happens to share tokens".
     let skills: &[&SkillManifest] = &[];
 
     if debug {
@@ -1857,8 +1857,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "enable_tools"));
         assert!(names.iter().any(|name| name == "read_file"));
-        // skill 发现/激活、task 编排、knowledge 记忆都是低频能力：默认不随每轮
-        // core 展开常驻，改由 `enable_tools` 按需启用（仍保留 builtin 组、可被动态发现）。
+        // Skill discovery/activation, task orchestration, and knowledge memory are low-frequency capabilities: by default they do not
+        // expand into the resident core set; `enable_tools` enables them on demand (the builtin group stays, discoverable dynamically).
         assert!(!names.iter().any(|name| name == "activate_skill"));
         assert!(!names.iter().any(|name| name == "list_skills"));
         assert!(!names.iter().any(|name| name == "load_skill"));
@@ -2049,9 +2049,9 @@ mod tests {
 
     #[test]
     fn executor_group_defers_process_primitives_but_keeps_core_editing() {
-        // build/executor 用 tool_groups: [core, executor]。执行原语（进程/IPC/shm/env）
-        // 默认懒加载，不进入常驻工具集；但 core∩executor 的 apply_patch/write_file 保留，
-        // 编辑能力零损失。
+        // build/executor use tool_groups: [core, executor]. Execution primitives (process/IPC/shm/env)
+        // are lazy by default and stay out of the resident tool set; apply_patch/write_file (core∩executor) are kept,
+        // so editing capability is preserved with zero loss.
         let build_agent = executor_group_agent("build");
         let tools = builtin_tools_for_skill(&[], Some(&build_agent));
         let names = tools
@@ -2059,14 +2059,14 @@ mod tests {
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
 
-        // 常驻：core 编辑/检索能力
+        // Resident: core editing/retrieval capabilities
         assert!(names.iter().any(|n| n == "apply_patch"));
         assert!(names.iter().any(|n| n == "write_file"));
         assert!(names.iter().any(|n| n == "read_file"));
-        // 常驻：baseline 自助能力（enable_tools 是渐进发现入口）
+        // Resident: baseline self-service capabilities (enable_tools is the progressive-discovery entry point)
         assert!(names.iter().any(|n| n == "enable_tools"));
 
-        // 懒加载：重执行原语、task 编排（task_spawn 等）不常驻
+        // Lazy: heavy execution primitives and task orchestration (task_spawn etc.) are not resident
         assert!(!names.iter().any(|n| n == "task_spawn"));
         for deferred in [
             "spawn_process",
@@ -2098,7 +2098,7 @@ mod tests {
 
     #[test]
     fn explicit_tools_list_is_not_filtered_by_lazy_load() {
-        // 显式 `tools:` 点名的工具即常驻：即便点名一个执行原语也不剔除。
+        // Tools explicitly named via `tools:` become resident: even a named execution primitive is not culled.
         let mut agent = agent("custom", Vec::new());
         agent.tool_groups = Vec::new();
         agent.tools = vec!["read_file".to_string(), "spawn_process".to_string()];
@@ -2220,12 +2220,12 @@ mod tests {
 
     #[test]
     fn lazy_load_measurably_shrinks_build_agent_tool_payload() {
-        // 用生产序列化路径量化「懒加载剔除执行原语」对每轮请求 tools token 的实际
-        // 削减：请求体里 tools 就是 Vec<ToolDefinition> 的紧凑 JSON，request/builder.rs
-        // 的 estimate_tools_tokens 按 serde_json::to_string 的字符数 / 2（保守换算，
-        // CHARS_PER_TOKEN_CONSERVATIVE）计入每轮 prompt。这里对比：
-        //   baseline = executor 组按 tool_groups 全量展开（懒加载前的行为）
-        //   optimized = 现行 builtin_tools_for_skill（懒加载后，剔除 deferred 原语）
+        // Quantify, via the production serialization path, the actual per-request tools-token savings of
+        // lazy-loading culling of execution primitives: tools in the request body is compact JSON of Vec<ToolDefinition>, and
+        // request/builder.rs's estimate_tools_tokens counts serde_json::to_string characters / 2 (conservative conversion,
+        // CHARS_PER_TOKEN_CONSERVATIVE) into each turn's prompt. Compare:
+        //   baseline = the executor group fully expanded via tool_groups (pre-lazy-loading behavior)
+        //   optimized = current builtin_tools_for_skill (after lazy loading, deferred primitives culled)
         const CHARS_PER_TOKEN_CONSERVATIVE: usize = 2;
         let build_agent = executor_group_agent("build");
 
@@ -2234,7 +2234,7 @@ mod tests {
         let groups = [ToolGroup::Core, ToolGroup::Executor];
         let baseline_tools =
             ensure_required_baseline_tools(crate::ai::tools::tool_definitions_for_groups(&groups));
-        // optimized：现行生产路径（manifest_tool_definitions 会剔除 deferred 原语）。
+        // optimized: current production path (manifest_tool_definitions culls deferred primitives).
         let optimized_tools = builtin_tools_for_skill(&[], Some(&build_agent));
 
         let ser = |tools: &[ToolDefinition]| -> usize {
@@ -2262,9 +2262,9 @@ mod tests {
             pct,
         );
 
-        // 优化必须真实削减 payload：剔除的原语数 == deferred 目录大小；且节省 token
-        // 量级显著（保守下界 800 tok/轮，实测约 1.1~1.2k）。若哪天有人把这些原语加回
-        // core 或删掉过滤，这个断言会立刻红。
+        // The optimization must genuinely shrink the payload: culled primitive count == deferred catalog size, and the token
+        // savings must be significant (conservative lower bound 800 tok/turn, measured ~1.1–1.2k). If anyone ever adds these
+        // primitives back to core or removes the filter, this assertion goes red immediately.
         let deferred_count = crate::ai::tools::deferred_eager_load_tool_summaries().len();
         assert_eq!(
             baseline_tools.len() - optimized_tools.len(),
@@ -2305,8 +2305,8 @@ mod tests {
 
     #[test]
     fn system_prompt_forbids_breaking_other_modules_to_satisfy_a_requirement() {
-        // 无条件渲染的系统约束：实现需求不得以破坏其他模块功能为代价，冲突要上报而非静默破坏。
-        // goal 模式最容易"为达成目标而牺牲既有功能"，因此默认路径与 goal 路径都要校验约束在场。
+        // Unconditionally rendered system constraint: implementing a requirement must not come at the cost of breaking other modules; conflicts must be reported, not silently broken.
+        // Goal mode is the most likely to "sacrifice existing functionality to reach the goal", so both the default and goal paths must verify the constraint is present.
         let cases = [
             PromptContext::default(),
             PromptContext {
@@ -2328,8 +2328,8 @@ mod tests {
 
     #[test]
     fn system_prompt_bridges_compressed_context_recovery_via_search_overflow() {
-        // search_overflow 是 core 常驻工具，但必须显式桥接压缩管线：
-        // 上下文被压缩后，absence 主张要先检索会话归档，不能直接断言"没找到"。
+        // search_overflow is a core resident tool but must be explicitly bridged to the compression pipeline:
+        // after context compression, absence claims must first search the session archive instead of directly asserting "not found".
         let mut available = SkipSet::new(16);
         available.insert("search_overflow".to_string());
 
@@ -2420,10 +2420,10 @@ mod tests {
         let prompt =
             build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
-        // 风格段必须存在，且要求"先答后说、不啰嗦"
+        // The style section must exist and require "answer first, no rambling"
         assert!(prompt.contains("<response_style>"));
         assert!(prompt.contains("Lead with the answer or action"));
-        // 必须保留"简洁不能换错"的安全垫，避免过度精简导致错误判断
+        // Must keep the "conciseness must not trade away correctness" safety pad to prevent over-compression from causing wrong judgments
         assert!(prompt.contains("Be concise without sacrificing correctness"));
         assert!(prompt.contains("Skip preambles, restatements, meta-commentary"));
         assert!(prompt.contains("status only at real milestones or plan changes"));
@@ -2435,7 +2435,7 @@ mod tests {
         let prompt =
             build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
-        // 危险操作红线：无条件渲染，且包含禁止/绕过/确认三要素
+        // Dangerous-operation red lines: unconditionally rendered, containing all three elements — forbidden / bypass / confirmation
         assert!(prompt.contains("<safety_redlines>"));
         assert!(prompt.contains("Never perform dangerous operations"));
         assert!(prompt.contains("Never bypass or work around safety mechanisms"));
@@ -2463,8 +2463,8 @@ mod tests {
             build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
                 .render_system_prompt();
 
-        // 委派是实质步骤的默认选择（串行或并行皆可），但必须有清晰边界；父进程保留
-        // 琐碎步骤、紧密耦合编辑与最终评审，且绝不并发运行有依赖的步骤。
+        // Delegation is the default choice for substantive steps (serial or parallel), but with clear boundaries; the parent keeps
+        // trivial steps, tightly coupled edits, and final review, and never runs dependent steps concurrently.
         assert!(prompt.contains("fan out MULTIPLE focused, independent subtasks concurrently"));
         assert!(prompt.contains("mark `delegate: true` on every substantive step"));
         assert!(prompt.contains("delegated steps without it run one at a time via the synchronous `task`"));
@@ -2667,7 +2667,7 @@ mod tests {
         assert!(prompt.contains("Treat the plan as a living roadmap"));
         assert!(prompt.contains("before the first tool call, so the plan is the roadmap"));
 
-        // plan 不可用（如技能白名单剔除）时：桥接行不出现，task_convergence 本体仍在。
+        // When plan is unavailable (e.g. culled by a skill whitelist): the bridging line is absent, but the task_convergence body remains.
         let empty =
             build_system_prompt(None, &[], &Box::new(SkipSet::new(16)), &PromptContext::default())
                 .render_system_prompt();
@@ -2827,8 +2827,8 @@ mod tests {
 
     #[test]
     fn system_prompt_guides_tree_for_layout_when_available() {
-        // 无 tree 时不注入导航段；有 tree 时提示先用 tree 掌握结构再 read_file，
-        // 避免模型盲目 ls / 递归 read。
+        // When no tree, do not inject the navigation section; with a tree, prompt to grasp the structure with tree first, then read_file,
+        // avoiding blind ls / recursive reads by the model.
         let without = build_system_prompt(
             None,
             &[],
@@ -3056,15 +3056,15 @@ mod tests {
 
     #[test]
     fn render_groups_same_kind_sections_into_single_tag_block() {
-        // identity/behavior/policy 各应只出现一对 tag，且按 identity→behavior→policy
-        // 排布。这保证 persona 这类"事后追加"的 identity 段不会被甩到 prompt 末尾，
-        // 而是与通用 identity 聚拢成一块。
+        // identity/behavior/policy should each appear as exactly one tag pair, ordered identity→behavior→policy,
+        // This guarantees that "appended afterwards" identity sections like persona are not pushed to the end of the prompt
+        // but cluster with the generic identity into one block.
         let mut builder = SystemPromptBuilder::new();
         builder.push(ContextKind::Identity, "Generic identity.");
         builder.push(ContextKind::Behavior, "Behavior one.");
         builder.push(ContextKind::Policy, "Policy one.");
         builder.push(ContextKind::Behavior, "Behavior two.");
-        // 模拟 persona 在 build_system_prompt 之后追加：
+        // Simulate persona being appended after build_system_prompt:
         builder.push(ContextKind::Identity, "Persona identity.");
 
         let prompt = builder.render_system_prompt();
@@ -3078,14 +3078,14 @@ mod tests {
         let policy_pos = prompt.find("<policy>").unwrap();
         assert!(identity_pos < behavior_pos && behavior_pos < policy_pos);
 
-        // 两段 identity 必须落在同一个 identity 块内、且保持插入顺序。
+        // The two identity sections must land inside the same identity block, in insertion order.
         let generic_pos = prompt.find("Generic identity.").unwrap();
         let persona_pos = prompt.find("Persona identity.").unwrap();
         let identity_close = prompt.find("</identity>").unwrap();
         assert!(generic_pos < persona_pos);
         assert!(persona_pos < identity_close);
 
-        // 同 kind 段落之间用空行分隔，组内保持插入顺序。
+        // Sections of the same kind are separated by blank lines; insertion order is kept within the group.
         let behavior_one = prompt.find("Behavior one.").unwrap();
         let behavior_two = prompt.find("Behavior two.").unwrap();
         assert!(behavior_one < behavior_two);
@@ -3267,12 +3267,12 @@ mod tests {
             escape_xml_attr("a&b<c>d\"e'f"),
             "a&amp;b&lt;c&gt;d&quot;e&apos;f"
         );
-        // 普通路径原样保留
+        // Ordinary path preserved as-is
         assert_eq!(
             escape_xml_attr("/src/bin/ai/AGENTS.md"),
             "/src/bin/ai/AGENTS.md"
         );
-        // 空串安全
+        // Empty string is safe
         assert_eq!(escape_xml_attr(""), "");
     }
 
@@ -3608,8 +3608,8 @@ mod tests {
 
     #[test]
     fn agent_without_mcp_servers_field_lazy_loads_mcp_tools() {
-        // 无 mcp_servers 白名单时默认懒加载：不预挂载任何 MCP 工具 schema，
-        // 模型经 hidden MCP catalog + enable_tools 按需加载。
+        // With no mcp_servers whitelist, lazy-load by default: pre-mount no MCP tool schemas;
+        // the model loads them on demand via the hidden MCP catalog + enable_tools.
         let all_tools = vec![
             tool("mcp_feishu_docs_search"),
             tool("mcp_ocr_extract"),
@@ -3652,8 +3652,8 @@ mod tests {
 
     #[test]
     fn no_active_agent_or_skill_lazy_loads_mcp_tools() {
-        // 既无 skill 也无 agent 白名单时同样默认懒加载：返回空，交由
-        // hidden MCP catalog + enable_tools 按需加载。
+        // With neither a skill nor an agent whitelist, lazy-load by default too: return empty and leave loading to
+        // the hidden MCP catalog + enable_tools on demand.
         let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_other_lookup")];
 
         let tools = select_mcp_tools(all_tools, &[], None);
@@ -3732,8 +3732,8 @@ mod tests {
     fn subagent_runtime_enabled_task_tools_stay_hidden() {
         let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
         SUBAGENT_DEPTH.sync_scope(1, || {
-            // 显式启用列表按 owner（含是否处于子代理上下文）隔离，必须在
-            // sync_scope 内写入，读取才使用同一 owner。
+            // The explicit-enabled list is isolated per owner (including subagent context); it must be written
+            // within sync_scope so reads use the same owner.
             set_explicit_enabled_tool_names(vec![
                 "task_wait".to_string(),
                 "task_cancel".to_string(),
@@ -3792,18 +3792,18 @@ mod tests {
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"enable_tools".to_string()));
-        // 基础只读 / 检索能力应作为 baseline 常驻补回，避免窄白名单 skill 把
-        // read_file 等最基本的阅读工具剔除，导致主 Agent 连用户点名的文件都读不了。
+        // Basic read-only / retrieval capabilities should be re-added as the resident baseline, so a narrow-whitelist skill cannot
+        // cull the most basic reading tools like read_file and leave the main Agent unable to read user-named files.
         assert!(names.contains(&"read_file".to_string()));
-        // task 编排 / knowledge 记忆系列已移出 baseline：窄白名单 skill 下不再被
-        // 自动补回，但主 Agent 仍可通过常驻的 enable_tools 渐进式发现并启用它们，
-        // 不会真正失去委派子 Agent 的能力。
+        // Task orchestration / knowledge memory series have been moved out of the baseline: under narrow-whitelist skills they are no longer
+        // auto-re-added, but the main Agent can still progressively discover and enable them via the resident enable_tools,
+        // so delegation of subagents is never truly lost.
         assert!(!names.contains(&"task".to_string()));
         assert!(!names.contains(&"task_spawn".to_string()));
         assert!(!names.contains(&"task_wait".to_string()));
         assert!(!names.contains(&"task_status".to_string()));
         assert!(!names.contains(&"knowledge_save".to_string()));
-        // 其它非 baseline 的内置工具仍不应被无端带入白名单。
+        // Other non-baseline builtin tools still must not be dragged into the whitelist without cause.
         assert!(!names.contains(&"plan".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
         assert!(!names.contains(&"apply_patch".to_string()));
@@ -3818,7 +3818,7 @@ mod tests {
         let tools = super::builtin_tools_for_skill(&[&skill_a, &skill_b], None);
         let names: Vec<String> = tools.iter().map(|t| t.function.name.clone()).collect();
         assert!(names.contains(&"enable_tools".to_string()));
-        // skill group 提供 list_skills / activate_skill；builtin group 提供 enable_tools
+        // The skill group provides list_skills / activate_skill; the builtin group provides enable_tools
         assert!(names.contains(&"list_skills".to_string()));
         assert!(names.contains(&"activate_skill".to_string()));
     }
@@ -3849,7 +3849,7 @@ mod tests {
 
     #[test]
     fn multi_skill_any_disable_mcp_tools_disables_all() {
-        // select_mcp_tools 检查 disable_mcp_tools：任一 skill 禁用即返回空
+        // select_mcp_tools checks disable_mcp_tools: any skill disabling it returns empty
         let mcp_tool = tool("mcp_server_a_lookup");
         let mut skill_a = skill("alpha", "alpha skill");
         skill_a.mcp_servers.push("server_a".to_string());

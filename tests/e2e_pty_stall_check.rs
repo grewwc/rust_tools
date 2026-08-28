@@ -1,5 +1,7 @@
-// 临时端到端验证：真实复现用户报告的 bytedcli 扫码登录挂起场景。
-// 通过真实生产路径（默认停滞阈值 10s/20s）验证停滞判定与进程组清理。
+// Temporary end-to-end verification: faithfully reproduce the user-reported
+// bytedcli QR-code login hang scenario.
+// Verify stall detection and process-group cleanup through the real production
+// path (default stall thresholds 10s/20s).
 use std::time::{Duration, Instant};
 
 #[test]
@@ -32,7 +34,8 @@ fn real_bytedcli_login_hang_is_stall_killed() {
 #[test]
 #[ignore = "requires bytedcli installed; run explicitly: cargo test --test e2e_pty_stall_check -- --ignored"]
 fn real_bytedcli_login_without_pipe_captures_qr_then_stalls() {
-    // 不带管道时，二维码应被部分输出捕获（停滞判定基于"输出后静默"）。
+    // Without a pipe, part of the QR-code output should still get captured
+    // (stall detection is based on "silence following output").
     let result = rust_tools::cmd::run::run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal(
         "bytedcli auth login --session",
         rust_tools::cmd::run::RunCmdOptions::default(),

@@ -19,16 +19,16 @@ use crate::{commonw::utils::expanduser, cw::Trie};
 pub(super) type LineEditor = Editor<CommandCompleter, DefaultHistory>;
 
 static CURRENT_MODEL_HINT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new(String::new()));
-/// 由 driver 在加载 manifest 后写入。补全位于热路径，不能在每次 Tab 时重新扫描磁盘。
-/// `None` 表示尚未初始化，保留给单元测试和非交互调用的兼容回退。
+/// Written by the driver after loading manifests. Completion sits on the hot path and must not rescan the disk on every Tab.
+/// `None` means not yet initialized, kept as the compatibility fallback for unit tests and non-interactive calls.
 static SKILL_NAME_CANDIDATES: LazyLock<RwLock<Option<Vec<CompletionCandidate>>>> =
     LazyLock::new(|| RwLock::new(None));
-/// 与 SKILL_NAME_CANDIDATES 相同的语义：`None` 表示尚未被 driver 填充，
-/// agent 名补全在此时同步回退到磁盘扫描（否则新会话首条输入前的 Tab 无候选）。
+/// Same semantics as SKILL_NAME_CANDIDATES: `None` means the driver has not populated it yet,
+/// and agent-name completion then falls back synchronously to a disk scan (otherwise Tab before the first input of a new session has no candidates).
 static AGENT_NAME_CANDIDATES: LazyLock<RwLock<Option<Vec<CompletionCandidate>>>> =
     LazyLock::new(|| RwLock::new(None));
 
-/// Trie 存储所有 "/" 和 ":" 开头的顶层命令，替换原先的线性 starts_with 过滤。
+/// Trie holding all top-level commands starting with "/" and ":", replacing the previous linear starts_with filtering.
 static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
     let mut trie = Trie::new();
     for &cmd in &[
@@ -76,17 +76,21 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":proc",
         "/skills",
         ":skills",
+        "/mark",
+        ":mark",
+        "/unmark",
+        ":unmark",
     ] {
         trie.insert(cmd);
     }
     trie
 });
 
-/// Trie 存储所有 "--" 和 "-" 开头的 CLI 选项（含简写），支持选项补全。
+/// Trie holding all CLI options starting with "--" and "-" (short forms included) to support option completion.
 static FLAGS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
     let mut trie = Trie::new();
     for flag in &[
-        // bool 选项
+        // bool options
         "--clear",
         "--new-session",
         "--new",
@@ -105,7 +109,7 @@ static FLAGS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         "--note-search",
         "-ns",
         "--generate-completions",
-        // string/int 选项
+        // string/int options
         "--model",
         "-m",
         "--agent",
@@ -153,14 +157,14 @@ impl CommandCompleter {
             .filter(|model| !model.is_empty())
     }
 
-    /// 用运行时 manifest 快照更新技能补全缓存。
+    /// Update the skill completion cache from the runtime manifest snapshot.
     pub(in crate::ai) fn set_skill_manifests(manifests: &[crate::ai::skills::SkillManifest]) {
         if let Ok(mut guard) = SKILL_NAME_CANDIDATES.write() {
             *guard = Some(Self::skill_candidates_from_manifests(manifests));
         }
     }
 
-    /// 用运行时 manifest 快照更新可切换 agent 的补全缓存。
+    /// Update the switchable-agent completion cache from the runtime manifest snapshot.
     pub(in crate::ai) fn set_agent_manifests(manifests: &[crate::ai::agents::AgentManifest]) {
         if let Ok(mut guard) = AGENT_NAME_CANDIDATES.write() {
             *guard = Some(Self::agent_candidates_from_manifests(manifests));
@@ -213,6 +217,10 @@ impl CommandCompleter {
             ":proc",
             "/skills",
             ":skills",
+            "/mark",
+            ":mark",
+            "/unmark",
+            ":unmark",
         ]
     }
 
@@ -235,8 +243,8 @@ impl CommandCompleter {
     }
 
     fn model_replacement(model: &crate::ai::model_names::ModelDef) -> String {
-        // replacement 使用 model.key，这样 find_by_identifier 能通过 key 正确解析。
-        // 如果 key 为空，fallback 到 handle（兼容旧模型）。
+        // replacement uses model.key so find_by_identifier can resolve it correctly by key.
+        // When key is empty, fall back to handle (compatible with older models).
         let key = model.key.trim();
         if key.is_empty() {
             Self::model_handle(model)
@@ -339,22 +347,22 @@ impl CommandCompleter {
         candidates
     }
 
-    /// 模型名补全匹配等级：
-    /// - 0：replacement 前缀匹配（原行为，大小写不敏感）
-    /// - 1：“名称 + 平台”两段式匹配，如 `deep-v` → `deepseek-v4-flash-volcano`
-    /// - 2：逐段前缀匹配，如 `deep-v` → 所有 `deepseek-v4-*`
-    /// 不匹配返回 None。
+    /// Model-name completion match ranks:
+    /// - 0: prefix match on replacement (original behavior, case-insensitive)
+    /// - 1: two-segment "name + platform" match, e.g. `deep-v` → `deepseek-v4-flash-volcano`
+    /// - 2: per-segment prefix match, e.g. `deep-v` → all `deepseek-v4-*`
+    /// Returns None when nothing matches.
     fn model_token_match_rank(
         token: &str,
         model: &crate::ai::model_names::ModelDef,
     ) -> Option<u8> {
         let token = token.trim().to_ascii_lowercase();
-        // 空 token（如 `/model ` 后直接按 Tab）时，空前缀匹配所有模型（原行为）。
+        // With an empty token (e.g. Tab right after `/model `), an empty prefix matches all models (original behavior).
         let replacement = Self::model_replacement(model).to_ascii_lowercase();
         if replacement.starts_with(&token) {
             return Some(0);
         }
-        // 两段式：最后一个分段当作平台前缀，如 `deep-v` → `deep` + 平台 `v`。
+        // Two-segment: treat the last segment as the platform prefix, e.g. `deep-v` → `deep` + platform `v`.
         if let Some((head, tail)) = token.rsplit_once(['-', '.', '_', '/', ':', ' ']) {
             if !head.is_empty() && !tail.is_empty() {
                 let key = model.key.to_ascii_lowercase();
@@ -366,14 +374,14 @@ impl CommandCompleter {
                 }
             }
         }
-        // 逐段前缀匹配：query 每段在候选各段中按顺序前缀命中（允许跳段）。
+        // Per-segment prefix matching: each query segment prefix-hits candidate segments in order (skipping segments allowed).
         if Self::segments_prefix_match(&token, &Self::model_searchable_text(model).to_ascii_lowercase()) {
             return Some(2);
         }
         None
     }
 
-    /// 用于逐段匹配的搜索文本：key + name + platform + aliases。
+    /// Search text used for per-segment matching: key + name + platform + aliases.
     fn model_searchable_text(model: &crate::ai::model_names::ModelDef) -> String {
         let mut text = format!("{} {}", model.key, model.name);
         let platform = crate::ai::model_names::platform_slug(model);
@@ -388,8 +396,8 @@ impl CommandCompleter {
         text
     }
 
-    /// 把 query 与 candidate 按 `- . _ / : 空白` 分段，要求 query 的每一段
-    /// 都能按顺序前缀命中 candidate 的某一段（允许跳段）。
+    /// Split query and candidate on `- . _ / : whitespace`, requiring every query segment
+    /// to prefix-hit some candidate segment in order (skipping segments allowed).
     fn segments_prefix_match(query: &str, candidate: &str) -> bool {
         let q_segments: Vec<&str> = query
             .split(['-', '.', '_', '/', ':', ' '])
@@ -414,12 +422,12 @@ impl CommandCompleter {
         false
     }
 
-    /// 通用名称补全匹配等级（agent / skill 等）：
-    /// - 0：replacement 前缀匹配（原行为，大小写不敏感）
-    /// - 1：逐段前缀匹配（replacement），如 `fast` → `audit-fast`、`own` → `audit_own_changes`
-    /// 只匹配名称本身：描述仅用于展示、不参与匹配（避免 `audit_o` 误命中描述中
-    /// 含 "audits of" 等词的无关 skill）。
-    /// 不匹配返回 None。
+    /// Generic name completion match ranks (agent / skill etc.):
+    /// - 0: prefix match on replacement (original behavior, case-insensitive)
+    /// - 1: per-segment prefix match on replacement, e.g. `fast` → `audit-fast`, `own` → `audit_own_changes`
+    /// Only the name itself participates: descriptions are display-only and never matched (preventing `audit_o`
+    /// from falsely hitting unrelated skills whose descriptions contain words like "audits of").
+    /// Returns None when nothing matches.
     fn name_token_match_rank(token: &str, replacement: &str) -> Option<u8> {
         let token = token.trim().to_ascii_lowercase();
         if replacement.to_ascii_lowercase().starts_with(&token) {
@@ -447,19 +455,19 @@ impl CommandCompleter {
             .collect()
     }
 
-    /// 所有已加载 agent 的名称候选（带 display）。
+    /// Name candidates of all loaded agents (with display).
     fn agent_name_candidates(token: &str) -> Vec<CompletionCandidate> {
         let candidates = if let Ok(guard) = AGENT_NAME_CANDIDATES.read()
             && let Some(candidates) = guard.as_ref()
         {
             candidates.clone()
         } else {
-            // 缓存尚未填充（首条输入提交前 / 非交互调用 / 单元测试）时，
-            // 同步回退到磁盘扫描，与技能补全 SKILL_NAME_CANDIDATES=None 的回退一致。
+            // When the cache is not yet populated (before the first input is submitted / non-interactive calls / unit tests),
+            // fall back synchronously to a disk scan, mirroring the skill completion fallback when SKILL_NAME_CANDIDATES=None.
             Self::agent_candidates_from_manifests(&crate::ai::agents::load_all_agents())
         };
-        // 智能匹配：前缀（rank 0）> 逐段前缀（rank 1，如 `fast` → `audit-fast`），
-        // 与 model 补全一致。只匹配名称，描述仅用于展示。
+        // Smart matching: prefix (rank 0) > per-segment prefix (rank 1, e.g. `fast` → `audit-fast`),
+        // consistent with model completion. Only names match; descriptions are display-only.
         let mut matched: Vec<(u8, CompletionCandidate)> = candidates
             .into_iter()
             .filter_map(|candidate| {
@@ -474,14 +482,14 @@ impl CommandCompleter {
             .collect()
     }
 
-    /// `/model` 的二级子命令字面量。注意：这些子命令与"模型名"互斥地占据
-    /// 第二个 token；为了让 Tab 既能补出子命令也能补出模型名，
-    /// `complete_for_line` 会把它们合并到候选列表中（前缀过滤）。
+    /// Second-level subcommand literals of `/model`. Note: these subcommands and "model names" occupy
+    /// the second token mutually exclusively; so Tab can complete both subcommands and model names,
+    /// `complete_for_line` merges them into one candidate list (prefix-filtered).
     fn model_subcommands() -> &'static [&'static str] {
         &["current", "list", "help", "effort"]
     }
 
-    /// `/model effort` 的第三个 token 候选：推理强度档位 + auto/off。
+    /// Third-token candidates for `/model effort`: reasoning-effort levels + auto/off.
     fn model_effort_levels() -> &'static [&'static str] {
         &[
             "minimal", "low", "medium", "high", "xhigh", "max", "auto", "off",
@@ -496,26 +504,26 @@ impl CommandCompleter {
         &["list", "current", "create", "new", "use", "delete", "help"]
     }
 
-    /// `/usage` 的子命令。
+    /// Subcommands of `/usage`.
     fn usage_subcommands() -> &'static [&'static str] {
         &[
             "today", "7d", "30d", "all", "models", "daily", "trend", "days", "help",
         ]
     }
 
-    /// `/checkpoint` / `/cp` 的子命令。
+    /// Subcommands of `/checkpoint` / `/cp`.
     fn checkpoint_subcommands() -> &'static [&'static str] {
         &["save", "list", "rollback", "delete", "help"]
     }
 
-    /// `/changes` / `/diff` 的子命令（-- 长选项为主，与命令文档一致；
-    /// 裸词形式 `stat`/`json`/`patch`/`open`/`help` 同样被解析器接受）。
+    /// Subcommands of `/changes` / `/diff` (-- long options are primary, matching the command docs;
+    /// the bare-word forms `stat`/`json`/`patch`/`open`/`help` are accepted by the parser too).
     fn changes_subcommands() -> &'static [&'static str] {
         &["--help", "--stat", "--json", "--patch", "--open"]
     }
 
-    /// `/changes --open [editor]` 的编辑器候选（与 `changes::EditorKind::from_str`
-    /// 接受的别名一致，取规范名）。
+    /// Editor candidates for `/changes --open [editor]` (same aliases `changes::EditorKind::from_str`
+    /// accepts, using the canonical names).
     fn changes_open_editors() -> &'static [&'static str] {
         &["auto", "code", "vscode", "cursor", "idea", "git", "open"]
     }
@@ -541,7 +549,7 @@ impl CommandCompleter {
         ]
     }
 
-    /// `/skills` / `/skill` 的子命令字面量。
+    /// Subcommand literals of `/skills` / `/skill`.
     fn skills_subcommands() -> &'static [&'static str] {
         &["list", "current", "use", "help"]
     }
@@ -565,7 +573,7 @@ impl CommandCompleter {
             .collect()
     }
 
-    /// 所有已加载 skill 的名称候选（带 display）。
+    /// Name candidates of all loaded skills (with display).
     fn skill_name_candidates() -> Vec<CompletionCandidate> {
         if let Ok(guard) = SKILL_NAME_CANDIDATES.read()
             && let Some(candidates) = guard.as_ref()
@@ -573,20 +581,20 @@ impl CommandCompleter {
             return candidates.clone();
         }
 
-        // 非交互调用与尚未设置运行时快照的单元测试保持原有行为。
+        // Non-interactive calls and unit tests without a runtime snapshot keep the original behavior.
         Self::skill_candidates_from_manifests(&crate::ai::skills::load_all_skills())
     }
 
     pub(super) fn complete_for_line(line: &str, pos: usize) -> (usize, Vec<CompletionCandidate>) {
-        // `pos` 是字节偏移的光标位置，可能落在多字节 UTF-8 字符内部（如中文），
-        // 直接 `&line[..pos]` 切片会 panic。向下对齐到最近的字符边界。
+        // `pos` is a byte-offset cursor position that may land inside a multi-byte UTF-8 character (e.g. Chinese),
+        // where a direct `&line[..pos]` slice panics. Align down to the nearest character boundary.
         let mut pos = pos.min(line.len());
         while pos > 0 && !line.is_char_boundary(pos) {
             pos -= 1;
         }
         let before = &line[..pos];
-        // `@skills` / `@skill[:prefix]` 触发技能补全，必须先于普通 `@file` 补全，
-        // 否则 `complete_file_reference` 会把 `@skills` 当成文件路径片段处理。
+        // `@skills` / `@skill[:prefix]` trigger skill completion and must be handled before plain `@file` completion,
+        // otherwise `complete_file_reference` would treat `@skills` as a file-path fragment.
         if let Some((token_start, candidates)) = complete_skill_reference(before) {
             return (token_start, candidates);
         }
@@ -607,8 +615,8 @@ impl CommandCompleter {
         }
 
         let candidates = if token_start == 0 {
-            // 用 Trie 做前缀匹配："/" / ":" 走命令 Trie，"--" / "-" 走选项 Trie；
-            // 排序结果以保证确定性（HashMap 迭代无序）。
+            // Prefix-match with Tries: "/" / ":" go through the command Trie, "--" / "-" through the option Trie;
+            // sort the results for determinism (HashMap iteration order is unordered).
             if token.starts_with('/') || token.starts_with(':') {
                 let mut words = COMMANDS_TRIE.words_with_prefix(token);
                 words.sort();
@@ -626,14 +634,14 @@ impl CommandCompleter {
                 return (token_start, Vec::new());
             };
             if Self::is_model_command(first) {
-                // 第二个 token 之后还有更深层补全（目前只有 `/model effort <level>`）。
-                // 这里检查"`/model` 后面已经有几个非空 token"。
+                // Deeper completions exist beyond the second token (currently only `/model effort <level>`).
+                // Here we check "how many non-empty tokens already follow `/model`".
                 let second = words.next();
                 match second {
                     None => {
-                        // 第二个 token：模型名（带 current 置顶）+ `/model` 子命令字面量。
-                        // 模型名用智能匹配（前缀 > 名称+平台两段式 > 逐段前缀），
-                        // 使 `deep-v` 也能补全到 `deepseek-v4-flash-volcano`。
+                        // Second token: model names (with current pinned on top) + `/model` subcommand literals.
+                        // Model names use smart matching (prefix > name+platform two-segment > per-segment prefix),
+                        // so `deep-v` also completes to `deepseek-v4-flash-volcano`.
                         let mut matched: Vec<(u8, CompletionCandidate)> =
                             Self::model_name_candidates()
                                 .into_iter()
@@ -662,7 +670,7 @@ impl CommandCompleter {
                         merged
                     }
                     Some("effort") => {
-                        // `/model effort <TAB>` -> 列出档位字面量。
+                        // `/model effort <TAB>` -> list the level literals.
                         Self::plain_candidates(
                             Self::model_effort_levels()
                                 .iter()
@@ -690,8 +698,8 @@ impl CommandCompleter {
             } else if matches!(first, "/changes" | ":changes" | "/diff" | ":diff") {
                 match words.next() {
                     None => {
-                        // `/changes --open=<prefix>` 粘连形式：补全编辑器名并回填整个前缀；
-                        // 否则按子命令字面量前缀过滤。
+                        // `/changes --open=<prefix>` glued form: complete the editor name and backfill the whole prefix;
+                        // otherwise prefix-filter on the subcommand literals.
                         if let Some(prefix) = token.strip_prefix("--open=") {
                             let mut candidates = Self::plain_candidates(
                                 Self::changes_open_editors()
@@ -726,15 +734,15 @@ impl CommandCompleter {
             } else {
                 let sources: &[&str] = match first {
                     "/skills" | ":skills" | "/skill" | ":skill" => {
-                        // 已输入的参数 token（光标前去掉命令本身）——多 skill 补全时
-                        // 排除已选名字，支持 `/skills a <TAB>` 继续选下一个。
+                        // Argument tokens already typed (before the cursor, excluding the command itself) — for multi-skill
+                        // completion exclude already-picked names so `/skills a <TAB>` can pick the next one.
                         let consumed: Vec<&str> = before[..token_start]
                             .split_whitespace()
                             .skip(1)
                             .collect();
                         let mut matched: Vec<(u8, CompletionCandidate)> = Vec::new();
                         if consumed.is_empty() {
-                            // 第一个参数位置：子命令字面量也参与提示（`/skills us<TAB>` → use）
+                            // First argument position: subcommand literals join the hints too (`/skills us<TAB>` → use)
                             for sub in Self::skills_subcommands() {
                                 if sub.starts_with(token) {
                                     matched.push((
@@ -760,7 +768,7 @@ impl CommandCompleter {
                                 matched.push((rank, c));
                             }
                         }
-                        // 稳定排序：同 rank 保持子命令在前、skill 按 manifest 顺序。
+                        // Stable sort: at equal rank keep subcommands first and skills in manifest order.
                         matched.sort_by_key(|(rank, _)| *rank);
                         let candidates: Vec<CompletionCandidate> = matched
                             .into_iter()
@@ -804,15 +812,15 @@ impl CommandCompleter {
     }
 }
 
-/// 技能补全。触发与过滤规则（`<filter>` 大小写不敏感）：
-/// - `@ski` / `@skil` / `@skill` / `@skills`（"skills" 的前缀，≥3 字符）：列出全部 skill；
-/// - `@skill<filter>` / `@skills<filter>`：输完关键字后直接续打字母即按名称过滤，
-///   例如 `@skillhum` → 匹配以 `hum` 开头的 skill；
-/// - `@skill:<filter>` / `@skills:<filter>`：带冒号的等价写法（补全选中后插入的规范形式）。
+/// Skill completion. Trigger and filtering rules (`<filter>` case-insensitive):
+/// - `@ski` / `@skil` / `@skill` / `@skills` (a prefix of "skills", ≥3 chars): list all skills;
+/// - `@skill<filter>` / `@skills<filter>`: after the keyword, keep typing letters to filter by name,
+///   e.g. `@skillhum` → matches skills starting with `hum`;
+/// - `@skill:<filter>` / `@skills:<filter>`: the colon-equivalent form (the canonical form inserted when a completion is picked).
 ///
-/// 匹配用 [`CommandCompleter::name_token_match_rank`] 的智能匹配（前缀 > 逐段前缀），
-/// 如 `@skills:own` → `audit_own_changes`。选中后行内变成 `@skills:<name>`，
-/// 本轮对话将强制注入该 skill。返回 `(token_start, candidates)`，token_start 是 `@` 的字节偏移。
+/// Matching uses [`CommandCompleter::name_token_match_rank`] smart matching (prefix > per-segment prefix),
+/// e.g. `@skills:own` → `audit_own_changes`. Once picked the line becomes `@skills:<name>`,
+/// and the skill is force-injected for this turn. Returns `(token_start, candidates)` where token_start is the byte offset of `@`.
 fn complete_skill_reference(before: &str) -> Option<(usize, Vec<CompletionCandidate>)> {
     let (token_start, token) = find_skill_reference_token(before)?;
     let rest = token.strip_prefix('@')?;
@@ -820,8 +828,8 @@ fn complete_skill_reference(before: &str) -> Option<(usize, Vec<CompletionCandid
 
     let skills = CommandCompleter::skill_name_candidates();
 
-    // 每个 filter 独立做智能匹配，多种切分取并集（任一命中即保留）。
-    // 空 filter（仍在输入 `@skill`/`@skills`）空前缀匹配全部，等价于"列出全部"。
+    // Smart-match each filter independently and union the multiple splits (any hit is kept).
+    // An empty filter (still typing `@skill`/`@skills`) matches everything with an empty prefix, equivalent to "list all".
     let mut candidates = Vec::new();
     for skill in &skills {
         if !filters.iter().any(|filter| {
@@ -837,14 +845,14 @@ fn complete_skill_reference(before: &str) -> Option<(usize, Vec<CompletionCandid
     Some((token_start, candidates))
 }
 
-/// 解析 `@` 之后的内容，判断是否为技能引用并返回所有可能的过滤前缀（小写）。
-/// 返回 `None` 表示不是技能引用 token；返回的 Vec 中含空串表示"列出全部"。
+/// Parse what follows `@`, decide whether it is a skill reference, and return all possible filter prefixes (lowercased).
+/// `None` means it is not a skill reference token; an empty string inside the returned Vec means "list all".
 ///
-/// `@skillsec` 这类无冒号写法对关键字 `skill`/`skills` 存在切分歧义，故同时返回
-/// 两种解释（如 `["ec", "sec"]`）取并集，避免漏掉用户想要的候选。
+/// Colon-less forms like `@skillsec` are ambiguous to split against the `skill`/`skills` keyword, so both
+/// interpretations (e.g. `["ec", "sec"]`) are returned for a union, avoiding missing candidates the user wants.
 pub(in crate::ai::prompt) fn skill_token_filters(rest: &str) -> Option<Vec<String>> {
     const MIN_TRIGGER_LEN: usize = 3;
-    // 冒号写法：`<keyword>:<filter>`，keyword 须为 "skills" 的非空前缀（≥3 字符）。
+    // Colon form: `<keyword>:<filter>`, where keyword must be a non-empty prefix of "skills" (≥3 chars).
     if let Some((keyword, filter)) = rest.split_once(':') {
         let keyword_lower = keyword.to_ascii_lowercase();
         if keyword_lower.len() >= MIN_TRIGGER_LEN && "skills".starts_with(&keyword_lower) {
@@ -854,12 +862,12 @@ pub(in crate::ai::prompt) fn skill_token_filters(rest: &str) -> Option<Vec<Strin
     }
 
     let rest_lower = rest.to_ascii_lowercase();
-    // 仍在输入关键字途中（`ski`/`skil`/`skill`/`skills`）⇒ 列出全部。
+    // Still typing the keyword (`ski`/`skil`/`skill`/`skills`) ⇒ list all.
     if rest_lower.len() >= MIN_TRIGGER_LEN && "skills".starts_with(&rest_lower) {
         return Some(vec![String::new()]);
     }
 
-    // 关键字已输完，其后字母即过滤前缀。两种切分都收集，取并集。
+    // Keyword fully typed; the letters after it are the filter prefix. Collect both splits and take their union.
     let mut filters = Vec::new();
     if let Some(filter) = rest_lower.strip_prefix("skills") {
         filters.push(filter.to_string());
@@ -874,8 +882,8 @@ pub(in crate::ai::prompt) fn skill_token_filters(rest: &str) -> Option<Vec<Strin
     }
 }
 
-/// 定位行尾的技能引用 token。要求 `@` 前是空白或行首、token 内无空白（与 `@file`
-/// 边界规则一致），且 `@` 之后内容能被 [`skill_token_filters`] 识别为技能引用。
+/// Locate the skill-reference token at end of line. Requires whitespace or line start before `@`, no
+/// whitespace inside the token (same boundary rules as `@file`), and content after `@` recognized by [`skill_token_filters`] as a skill reference.
 fn find_skill_reference_token(before: &str) -> Option<(usize, &str)> {
     let mut last_at = None;
     for (idx, ch) in before.char_indices() {
@@ -1187,7 +1195,7 @@ mod tests {
         let manifests = crate::ai::agents::load_all_agents();
         CommandCompleter::set_agent_manifests(&manifests);
 
-        // `/agents <name>` 与运行时别名一致：第二 token 也应按 agent 名补全。
+        // `/agents <name>` aligns with the runtime alias: the second token should also complete by agent name.
         let (_, direct) = CommandCompleter::complete_for_line("/agents au", 10);
         assert!(
             direct
@@ -1211,9 +1219,9 @@ mod tests {
             .iter()
             .any(|a| a.name == "audit-fast")
         {
-            return; // 无该 agent 时跳过
+            return; // skip when the agent is absent
         }
-        // 分段匹配：`fast` 不是 `audit-fast` 的前缀，但能命中其第二段。
+        // Segment matching: `fast` is not a prefix of `audit-fast` but hits its second segment.
         let (_, direct) = CommandCompleter::complete_for_line("/agent fast", 11);
         assert!(
             direct
@@ -1236,9 +1244,9 @@ mod tests {
     fn command_completion_skill_name_matches_segments() {
         let skills = crate::ai::skills::load_all_skills();
         if !skills.iter().any(|s| s.name == "audit_own_changes") {
-            return; // 无该 skill 时跳过
+            return; // skip when the skill is absent
         }
-        // 分段匹配：`own` 不是 `audit_own_changes` 的前缀，但能命中其第二段。
+        // Segment matching: `own` is not a prefix of `audit_own_changes` but hits its second segment.
         let (_, candidates) = CommandCompleter::complete_for_line("/skills own", 11);
         assert!(
             candidates
@@ -1251,9 +1259,9 @@ mod tests {
 
     #[test]
     fn agent_candidates_fall_back_to_disk_scan_before_cache_is_filled() {
-        // 全新启动、driver 尚未调用 set_agent_manifests（缓存为 None）时，
-        // agent 名补全必须能同步扫描出候选，否则新会话首条输入前的
-        // `/agent <prefix><Tab>` / `/agents <prefix><Tab>` 会无响应。
+        // On a fresh start where the driver has not called set_agent_manifests yet (cache is None),
+        // agent-name completion must synchronously scan out candidates, otherwise
+        // `/agent <prefix><Tab>` / `/agents <prefix><Tab>` before the first input of a new session hangs.
         let manifests = crate::ai::agents::load_all_agents();
         let candidates = CommandCompleter::agent_candidates_from_manifests(&manifests);
         assert!(
@@ -1271,7 +1279,7 @@ mod tests {
             .complete("/clo", 4, &Context::new(&history))
             .unwrap();
         assert!(pairs.iter().any(|pair| pair.replacement == "/close"));
-        // ":" 前缀同样可用
+        // the ":" prefix works the same way
         let (_, pairs) = completer
             .complete(":clo", 4, &Context::new(&history))
             .unwrap();
@@ -1297,6 +1305,24 @@ mod tests {
             .complete("/pers", 5, &Context::new(&history))
             .unwrap();
         assert!(pairs.iter().any(|pair| pair.replacement == "/personas"));
+    }
+
+    #[test]
+    fn command_completion_suggests_mark_and_unmark() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (_, pairs) = completer
+            .complete("/ma", 3, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "/mark"));
+        let (_, pairs) = completer
+            .complete("/un", 3, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "/unmark"));
+        let (_, pairs) = completer
+            .complete(":ma", 3, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == ":mark"));
     }
 
     #[test]
@@ -1412,7 +1438,7 @@ mod tests {
 
     #[test]
     fn trie_command_completion_expands_usage_prefix() {
-        // /usa → /usage（Trie 前缀匹配）
+        // /usa → /usage (Trie prefix match)
         let (_, candidates) = CommandCompleter::complete_for_line("/usa", 4);
         assert!(
             candidates.iter().any(|c| c.replacement == "/usage"),
@@ -1426,7 +1452,7 @@ mod tests {
 
     #[test]
     fn trie_command_completion_expands_changes_prefix() {
-        // /cha → /changes（Trie 前缀匹配）
+        // /cha → /changes (Trie prefix match)
         let (_, candidates) = CommandCompleter::complete_for_line("/cha", 4);
         assert!(
             candidates.iter().any(|c| c.replacement == "/changes"),
@@ -1436,7 +1462,7 @@ mod tests {
                 .map(|c| &c.replacement)
                 .collect::<Vec<_>>()
         );
-        // /diff 别名精确匹配
+        // /diff alias exact match
         let (_, candidates) = CommandCompleter::complete_for_line("/diff", 5);
         assert!(
             candidates.iter().any(|c| c.replacement == "/diff"),
@@ -1446,7 +1472,7 @@ mod tests {
                 .map(|c| &c.replacement)
                 .collect::<Vec<_>>()
         );
-        // :changes 冒号形式同样补全
+        // :changes completes in the colon form too
         let (_, candidates) = CommandCompleter::complete_for_line(":ch", 3);
         assert!(candidates.iter().any(|c| c.replacement == ":changes"));
     }
@@ -1470,7 +1496,7 @@ mod tests {
         assert!(candidates.iter().any(|c| c.replacement == "code"));
         assert!(candidates.iter().any(|c| c.replacement == "cursor"));
         assert!(!candidates.iter().any(|c| c.replacement == "idea"));
-        // `/changes --open=co` 粘连形式回填整个前缀
+        // `/changes --open=co` glued form backfills the whole prefix
         let (_, candidates) = CommandCompleter::complete_for_line(
             "/changes --open=co",
             "/changes --open=co".len(),
@@ -1483,7 +1509,7 @@ mod tests {
                 .map(|c| &c.replacement)
                 .collect::<Vec<_>>()
         );
-        // `/diff --j` 别名同样走子命令补全
+        // `/diff --j` alias goes through subcommand completion too
         let (_, candidates) =
             CommandCompleter::complete_for_line("/diff --j", "/diff --j".len());
         assert!(
@@ -1498,7 +1524,7 @@ mod tests {
 
     #[test]
     fn trie_flag_completion_expands_model_prefix() {
-        // --mod → --model（选项 Trie 前缀匹配）
+        // --mod → --model (option Trie prefix match)
         let (_, candidates) = CommandCompleter::complete_for_line("--mod", 5);
         assert!(
             candidates.iter().any(|c| c.replacement == "--model"),
@@ -1512,18 +1538,18 @@ mod tests {
 
     #[test]
     fn trie_flag_completion_expands_h_flag() {
-        // -h → -h（短选项精确匹配）
+        // -h → -h (short option exact match)
         let (_, candidates) = CommandCompleter::complete_for_line("-h", 2);
         assert!(candidates.iter().any(|c| c.replacement == "-h"));
-        // --h → --help 也匹配
+        // --h → --help matches too
         let (_, candidates) = CommandCompleter::complete_for_line("--h", 3);
         assert!(candidates.iter().any(|c| c.replacement == "--help"));
     }
 
     #[test]
     fn completion_pos_inside_multibyte_char_does_not_panic() {
-        // 光标字节偏移落在多字节 UTF-8 字符内部（如中文'能'）时，
-        // 直接切片会 panic。向下对齐到字符边界后应安全返回。
+        // When the cursor byte offset lands inside a multi-byte UTF-8 character (e.g. a CJK char),
+        // a direct slice panics. After aligning down to a character boundary it should return safely.
         let line = "帮我给a.rs 这个 agent 增加一个dump 功能";
         for pos in 0..=line.len() {
             let _ = CommandCompleter::complete_for_line(line, pos);
@@ -1532,9 +1558,9 @@ mod tests {
 
     #[test]
     fn skill_reference_completion_lists_skills() {
-        // 该测试比较两次独立的 load_all_skills() 快照（complete_for_line 内部一次、
-        // expected 一次），而其他用例会在 ENV_LOCK 下改写全局 HOME。不持锁则 HOME
-        // 可能在两次快照之间翻转导致候选集不一致，故与之串行。
+        // This test compares two independent load_all_skills() snapshots (one inside complete_for_line,
+        // one for expected), while other cases rewrite the global HOME under ENV_LOCK. Without holding
+        // the lock, HOME could flip between the two snapshots and desync the candidate sets, so serialize with them.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1555,18 +1581,18 @@ mod tests {
 
     #[test]
     fn skill_reference_completion_triggers_on_short_prefix() {
-        // 同上：比较候选数量与 load_all_skills().len() 两次快照，需与改写 HOME 的用例串行。
+        // Same as above: comparing candidate count against two snapshots of load_all_skills().len() requires serializing with the HOME-rewriting cases.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // 输入 `@ski`（"skills" 的前缀）即应触发，列出全部 skill。
+        // Typing `@ski` (a prefix of "skills") should already trigger and list all skills.
         let (start, candidates) = CommandCompleter::complete_for_line("@ski", 4);
         assert_eq!(start, 0);
         let total = crate::ai::skills::load_all_skills().len();
         assert_eq!(candidates.len(), total);
-        // `@sk`（<3 字符）不触发，避免劫持普通文件路径补全。
+        // `@sk` (<3 chars) does not trigger, avoiding hijacking plain file-path completion.
         assert!(complete_skill_reference("@sk").is_none());
-        // `@skq` 不是 "skills" 的前缀，不触发。
+        // `@skq` is not a prefix of "skills" and does not trigger.
         assert!(complete_skill_reference("@skq").is_none());
     }
 
@@ -1576,7 +1602,7 @@ mod tests {
         let Some(first) = skills.first() else {
             return;
         };
-        // 取首字母作为过滤词，所有候选名都应通过智能匹配（前缀或分段）。
+        // Use the first letter as the filter; every candidate name should pass smart matching (prefix or segment).
         let ch = first.name.chars().next().unwrap();
         let line = format!("@skills:{ch}");
         let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
@@ -1596,7 +1622,7 @@ mod tests {
 
     #[test]
     fn skill_reference_completion_ignores_midword_at() {
-        // `foo@skills` 中的 `@` 前不是边界字符，不应触发技能补全。
+        // In `foo@skills` the `@` is not preceded by a boundary character, so skill completion must not trigger.
         let result = complete_skill_reference("foo@skills");
         assert!(result.is_none());
     }
@@ -1607,7 +1633,7 @@ mod tests {
         let Some(target) = skills.first() else {
             return;
         };
-        // 取某个真实 skill 名的前 3 个字符作为过滤前缀，用无冒号写法 `@skill<prefix>`。
+        // Take the first 3 characters of a real skill name as the filter prefix, using the colon-less form `@skill<prefix>`.
         let name_lower = target.name.to_ascii_lowercase();
         let take = name_lower.chars().take(3).collect::<String>();
         if take.chars().count() < 3 {
@@ -1615,7 +1641,7 @@ mod tests {
         }
         let line = format!("@skill{take}");
         let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
-        // 目标 skill 必须在候选里，且所有候选名都通过智能匹配（取并集的两种切分均符合）。
+        // The target skill must be among the candidates, and all candidate names must pass smart matching (both unioned splits comply).
         assert!(
             candidates
                 .iter()
@@ -1636,9 +1662,9 @@ mod tests {
     fn skill_reference_completion_matches_segments() {
         let skills = crate::ai::skills::load_all_skills();
         if !skills.iter().any(|s| s.name == "audit_own_changes") {
-            return; // 无该 skill 时跳过
+            return; // skip when the skill is absent
         }
-        // 分段匹配：`own` 不是 `audit_own_changes` 的前缀，但能命中其第二段。
+        // Segment matching: `own` is not a prefix of `audit_own_changes` but hits its second segment.
         let (_, candidates) = CommandCompleter::complete_for_line("@skills:own", 11);
         assert!(
             candidates
@@ -1651,8 +1677,8 @@ mod tests {
 
     #[test]
     fn skill_completion_matches_name_not_description() {
-        // 回归：`/skills audit_o` 只能命中名称匹配的 skill（audit_own_changes），
-        // 不得因为某 skill 描述含 "audits of" 等词而误匹配（如 TRAE-security-review）。
+        // Regression: `/skills audit_o` must only hit the name-matched skill (audit_own_changes),
+        // never a false match because some skill's description contains words like "audits of" (e.g. TRAE-security-review).
         let line = "/skills audit_o";
         let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
         assert!(
@@ -1663,7 +1689,7 @@ mod tests {
             candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
         );
         for c in &candidates {
-            // 每个候选都必须能仅凭名称匹配到 `audit_o`（描述不得参与匹配）。
+            // Every candidate must match `audit_o` by name alone (descriptions must not participate in matching).
             assert!(
                 CommandCompleter::name_token_match_rank("audit_o", &c.replacement).is_some(),
                 "candidate {} matched via description only",
@@ -1674,21 +1700,21 @@ mod tests {
 
     #[test]
     fn skill_token_filters_parses_variants() {
-        // 关键字途中：列出全部（空过滤词）。
+        // Mid-keyword: list all (empty filter).
         assert_eq!(skill_token_filters("ski"), Some(vec![String::new()]));
         assert_eq!(skill_token_filters("skill"), Some(vec![String::new()]));
         assert_eq!(skill_token_filters("skills"), Some(vec![String::new()]));
-        // 无冒号过滤：`skillhum` → 关键字 `skill` + 前缀 `hum`。
+        // Colon-less filter: `skillhum` → keyword `skill` + prefix `hum`.
         assert_eq!(
             skill_token_filters("skillhum"),
             Some(vec!["hum".to_string()])
         );
-        // 冒号过滤。
+        // Colon filter.
         assert_eq!(
             skill_token_filters("skills:deb"),
             Some(vec!["deb".to_string()])
         );
-        // 太短或非前缀：不识别。
+        // Too short or not a prefix: not recognized.
         assert_eq!(skill_token_filters("sk"), None);
         assert_eq!(skill_token_filters("skq"), None);
     }
@@ -1723,7 +1749,7 @@ mod tests {
     #[test]
     fn model_completion_deep_v_completes_volcano_deepseek() {
         if crate::ai::model_names::find_by_identifier("deepseek-v4-flash-volcano").is_none() {
-            return; // 模型注册表（models/）无该模型时跳过
+            return; // skip when the model registry (models/) lacks this model
         }
         let (_, candidates) = CommandCompleter::complete_for_line("/model deep-v", 13);
         let repls: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
@@ -1732,7 +1758,7 @@ mod tests {
             "expected volcano deepseek for `/model deep-v`: {:?}",
             repls
         );
-        // volcano 的 deepseek 应排在其它 deepseek-v4 模型前面（两段式匹配优先）。
+        // The volcano deepseek should rank ahead of other deepseek-v4 models (two-segment matching wins).
         let volcano_idx = repls
             .iter()
             .position(|r| r == "deepseek-v4-flash-volcano")
@@ -1751,7 +1777,7 @@ mod tests {
     #[test]
     fn model_completion_glm_v_completes_glm_volcano() {
         if crate::ai::model_names::find_by_identifier("glm-5.2-volcano").is_none() {
-            return; // 模型注册表（models/）无该模型时跳过
+            return; // skip when the model registry (models/) lacks this model
         }
         let (_, candidates) = CommandCompleter::complete_for_line("/model glm-v", 12);
         let repls: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();

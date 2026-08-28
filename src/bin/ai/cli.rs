@@ -4,7 +4,7 @@ use crate::ai::provider::ReasoningEffort;
 use crate::commonw::utils::expanduser;
 use crate::terminalw::parser::Parser as TermParser;
 
-/// 解析后的 CLI 参数结构体
+/// Parsed CLI argument struct.
 #[derive(Debug, Clone)]
 pub(super) struct ParsedCli {
     pub(super) model: Option<String>,
@@ -22,58 +22,75 @@ pub(super) struct ParsedCli {
     pub(super) no_skills: bool,
     pub(super) mcp_config: String,
     pub(super) help: bool,
-    /// 是否在消费完 CLI prompt 后继续停留在交互式 REPL。
-    /// 通过 `--interactive` / `-i` 开启；与 `-ns` 联用时，后续每轮都会继续走 notebook 检索问答。
+    /// Whether to stay in the interactive REPL after consuming the CLI prompt.
+    /// Enabled via `--interactive` / `-i`; when combined with `-ns`, every later
+    /// turn continues with notebook retrieval Q&A.
     pub(super) interactive: bool,
-    /// 用户对推理强度档位的会话级覆盖。语义说明：
-    /// - `None`：未设置，遵循模型注册表（[models/](../../../../models)）的模型默认值；
-    /// - `Some(Some(level))`：强制使用该档位（minimal/low/medium/high）；
-    /// - `Some(None)`：用户显式关闭，请求里不带 `reasoning_effort` 字段。
+    /// Session-level override of the reasoning effort tier. Semantics:
+    /// - `None`: not set; follow the model default from the model registry
+    ///   ([models/](../../../../models));
+    /// - `Some(Some(level))`: force this tier (minimal/low/medium/high);
+    /// - `Some(None)`: user explicitly disabled it; requests omit the
+    ///   `reasoning_effort` field.
     ///
-    /// `/model effort <x>` 与 `--reasoning-effort` 都写入此字段。
+    /// Both `/model effort <x>` and `--reasoning-effort` write to this field.
     pub(super) reasoning_effort_override: Option<Option<ReasoningEffort>>,
-    /// 截断重试的兜底开关：为 `true` 时本轮请求强制关闭 thinking，忽略模型默认与
-    /// 自动判定。对 always-thinking 模型（如 GLM 走 `enable_thinking`），单纯降
-    /// `reasoning_effort` 无法抑制思考链占满输出预算；连续多次截断后置位此字段，
-    /// 把整个思考预算让给可见内容。仅在 turn 内临时生效，turn 末统一恢复。
+    /// Fallback switch for truncation retries: when `true`, the current request
+    /// force-disables thinking, ignoring the model default and automatic detection.
+    /// For always-thinking models (e.g. GLM via `enable_thinking`), merely lowering
+    /// `reasoning_effort` cannot stop the chain of thought from filling the output
+    /// budget; after several consecutive truncations this flag is set to give the
+    /// whole thinking budget to visible content. Takes effect only within the turn
+    /// and is uniformly restored at turn end.
     pub(super) thinking_disabled_override: bool,
-    /// 截断重试时的 `max_tokens` 自适应覆盖。当检测到「零输出截断」
-    /// （`completion=0` + `finish_reason=length`）时，说明服务端拒绝了当前
-    /// `max_tokens` 值（典型：relay/兼容层对超大 max_tokens 返回空响应）。
-    /// 此时将 max_tokens 减半写入此字段，下一轮请求使用更小的值重试，
-    /// 直到服务端接受。仅在 turn 内临时生效，turn 末统一恢复。
-    /// - `None`：未设置，使用 `clamp_max_tokens_for_prompt` 的正常计算值；
-    /// - `Some(n)`：用 `n` 作为 max_tokens 上限（仍受 clamp 的剩余窗口约束）。
+    /// Adaptive `max_tokens` override for truncation retries. On detecting a
+    /// "zero-output truncation" (`completion=0` + `finish_reason=length`), the
+    /// server rejected the current `max_tokens` value (typically: relay/compat
+    /// layers return empty responses for very large max_tokens).
+    /// This field then records max_tokens halved, and the next request retries
+    /// with the smaller value until the server accepts it. Takes effect only
+    /// within the turn and is uniformly restored at turn end.
+    /// - `None`: not set; use the normal value computed by
+    ///   `clamp_max_tokens_for_prompt`;
+    /// - `Some(n)`: use `n` as the max_tokens cap (still bounded by the clamp's
+    ///   remaining window).
     pub(super) max_tokens_override: Option<u32>,
-    /// 是否只搜索 memo 类别的记录。
-    /// 通过 `--note-search` / `-ns` 开启，用于快速查找用户手动记录的内容（如截图、笔记等）。
-    /// 默认 false，即走正常的知识召回流程。
+    /// Whether to search only memo-category records.
+    /// Enabled via `--note-search` / `-ns`, for quickly finding content the user
+    /// recorded manually (screenshots, notes, etc.).
+    /// Defaults to false, i.e. the normal knowledge recall flow.
     pub(super) note_search: bool,
-    /// 快速保存 memo 到知识库。
-    /// 通过 `--note` 或 `-n` 指定内容，保存后直接退出。
+    /// Quickly save a memo to the knowledge base.
+    /// Content given via `--note` or `-n`; exits right after saving.
     pub(super) note: Option<String>,
-    /// 是否传入了 `--note` / `-n`（即便没有文本，例如只想保存剪贴板图片）。
+    /// Whether `--note` / `-n` was passed (even without text, e.g. to save only a
+    /// clipboard image).
     pub(super) note_flag: bool,
-    /// 通过 `--note-delete` / `-nd <id>` 指定要删除的 memo 条目 ID。
+    /// Memo entry ID to delete, via `--note-delete` / `-nd <id>`.
     pub(super) note_delete: Option<String>,
-    /// 通过 `--note-edit` / `-ne <描述>` 指定要修改的 memo：AI 匹配后在编辑器中改写。
+    /// Memo to edit, via `--note-edit` / `-ne <description>`: AI matches it, then
+    /// it is rewritten in an editor.
     pub(super) note_edit: Option<String>,
-    /// AI 驱动的知识库整理：读取全部条目 → 模型分析 → 执行整理。
+    /// AI-driven knowledge base consolidation: read all entries → model analysis
+    /// → perform consolidation.
     pub(super) consolidate_knowledge: bool,
     /// --generate-completions
     pub(super) generate_completions: bool,
-    /// 是否以后台模式运行（`--background` / `-bg`）。
-    /// 后台模式下会 detach 终端、把完整输出写入当前目录下 `<sessionid>.log`，
-    /// 并提示 agent 在任务完成前不要停止。
-    /// 可搭配位置参数（任务描述）使用；若未提供位置参数，则会在 daemonize 之前
-    /// 交互式读取多行输入作为任务描述。
+    /// Whether to run in background mode (`--background` / `-bg`).
+    /// In background mode the terminal is detached, full output is written to
+    /// `<sessionid>.log` in the current directory, and the agent is instructed
+    /// not to stop until the task completes.
+    /// Can be combined with a positional argument (task description); if none is
+    /// given, multi-line input is read interactively before daemonize as the
+    /// task description.
     pub(super) background: bool,
-    /// --stop <session-id>：向后台任务的进程发送 SIGTERM 停止它。
-    /// 后台模式会在当前目录下写入 <sessionid>.pid 文件，--stop 读取它并 kill。
+    /// --stop <session-id>: send SIGTERM to the background task's process to stop
+    /// it. Background mode writes a <sessionid>.pid file in the current directory;
+    /// --stop reads it and kills the process.
     pub(super) stop_session: Option<String>,
 }
 
-/// `a` 内部 "/" / ":" 命令列表，用于 shell 补全。
+/// List of `a` internal "/" / ":" commands, used for shell completion.
 const INTERNAL_COMMANDS: &[&str] = &[
     "/help",
     ":help",
@@ -107,6 +124,10 @@ const INTERNAL_COMMANDS: &[&str] = &[
     ":sessions",
     "/ss",
     ":ss",
+    "/mark",
+    ":mark",
+    "/unmark",
+    ":unmark",
     "/proc",
     ":proc",
 ];
@@ -338,7 +359,7 @@ impl Default for ParsedCli {
     }
 }
 
-/// 使用 terminalw::Parser 解析 CLI 参数
+/// Parse CLI arguments with terminalw::Parser.
 pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     let raw: Vec<String> = args.collect();
     if raw.is_empty() {
@@ -348,17 +369,17 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     let mut parser = build_cli_parser();
     let argv = normalize_cli_argv(&raw);
 
-    // 使用 terminalw 解析参数
+    // Parse arguments with terminalw.
     parser.parse_argv(&argv, &[]);
 
-    // 构建 ParsedCli 结构体
+    // Build the ParsedCli struct.
     let mut cli = ParsedCli::default();
 
-    // 处理 help（需要特殊处理，因为它是别名）
+    // Handle help (needs special handling because it is an alias).
     cli.help = parser.contains_flag_strict("help") || parser.contains_flag_strict("h");
     cli.interactive = parser.contains_flag_strict("interactive");
 
-    // 处理 model
+    // Handle model.
     if parser.contains_flag_strict("model") {
         let val = parser.flag_value_or_default("model");
         if !val.trim().is_empty() {
@@ -366,7 +387,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         }
     }
 
-    // 处理 agent
+    // Handle agent.
     if parser.contains_flag_strict("agent") {
         let val = parser.flag_value_or_default("agent");
         if !val.trim().is_empty() {
@@ -374,56 +395,56 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         }
     }
 
-    // 处理 clear（与 --session 联用，清空对应 session 的 history）
+    // Handle clear (combined with --session, clears the given session's history).
     cli.clear = parser.contains_flag_strict("clear");
     cli.new_session = parser.contains_flag_strict("new-session");
     cli.resume = parser.contains_flag_strict("resume");
 
-    // 处理 session
+    // Handle session.
     if parser.contains_flag_strict("session") {
         let val = parser.flag_value_or_default("session");
         cli.session = Some(val);
     }
 
-    // 处理 files
+    // Handle files.
     if parser.contains_flag_strict("files") {
         cli.files = parser.flag_value_or_default("files");
     }
 
-    // 处理 consolidate-knowledge
+    // Handle consolidate-knowledge.
     cli.consolidate_knowledge = parser.contains_flag_strict("consolidate-knowledge");
 
-    // 处理 generate-completions
+    // Handle generate-completions.
     cli.generate_completions = parser.contains_flag_strict("generate-completions");
 
-    // 处理 background / -bg
+    // Handle background / -bg.
     cli.background = parser.contains_flag_strict("background");
 
-    // 处理 --stop <session-id>
+    // Handle --stop <session-id>.
     if parser.contains_flag_strict("stop") {
         let val = parser.flag_value_or_default("stop");
         cli.stop_session = Some(val.trim().to_string());
     }
 
-    // 处理 list-tools
+    // Handle list-tools.
     cli.list_tools = parser.contains_flag_strict("list-tools");
 
-    // 处理 list-mcp-tools
+    // Handle list-mcp-tools.
     cli.list_mcp_tools = parser.contains_flag_strict("list-mcp-tools");
 
-    // 处理 list-skills
+    // Handle list-skills.
     cli.list_skills = parser.contains_flag_strict("list-skills");
 
-    // 处理 list-agents
+    // Handle list-agents.
     cli.list_agents = parser.contains_flag_strict("list-agents");
 
-    // 处理 no-skills
+    // Handle no-skills.
     cli.no_skills = parser.contains_flag_strict("no-skills");
 
-    // 处理 note-search
+    // Handle note-search.
     cli.note_search = parser.contains_flag_strict("note-search");
 
-    // 处理 note
+    // Handle note.
     if parser.contains_flag_strict("note") {
         cli.note_flag = true;
         let val = parser.flag_value_or_default("note");
@@ -432,24 +453,24 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         }
     }
 
-    // 处理 note-delete
+    // Handle note-delete.
     if parser.contains_flag_strict("note-delete") {
         let val = parser.flag_value_or_default("note-delete");
         cli.note_delete = Some(val.trim().to_string());
     }
 
-    // 处理 note-edit
+    // Handle note-edit.
     if parser.contains_flag_strict("note-edit") {
         let val = parser.flag_value_or_default("note-edit");
         cli.note_edit = Some(val.trim().to_string());
     }
 
-    // 处理 mcp-config
+    // Handle mcp-config.
     if parser.contains_flag_strict("mcp-config") {
         cli.mcp_config = parser.flag_value_or_default("mcp-config");
     }
 
-    // 处理 reasoning-effort
+    // Handle reasoning-effort.
     if parser.contains_flag_strict("reasoning-effort") {
         let raw = parser.flag_value_or_default("reasoning-effort");
         let trimmed = raw.trim();
@@ -470,13 +491,13 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         }
     }
 
-    // 处理位置参数（prompt args）
+    // Handle positional arguments (prompt args).
     cli.args = parser.positional_args(false);
 
     cli
 }
 
-/// 打印帮助信息
+/// Print help information.
 pub(super) fn print_help() {
     let parser = build_cli_parser();
     println!("AI CLI - Interactive AI Assistant\n");
@@ -509,9 +530,9 @@ pub(super) fn print_help() {
     println!("REPL COMMANDS:");
     println!("  In interactive mode, type /help to see all available commands.\n");
 }
-/// 生成 shell 补全脚本并打印到 stdout。
-/// `shell` 取值 "bash" | "zsh" | "fish"，不区分大小写。
-/// 通过 --generate-completions 触发。
+/// Generate the shell completion script and print it to stdout.
+/// `shell` is "bash" | "zsh" | "fish", case-insensitive.
+/// Triggered via --generate-completions.
 pub fn generate_completion_script(shell: &str) {
     let parser = build_cli_parser();
     let info = parser.collect_completion_info();
@@ -542,8 +563,8 @@ fn model_selector_words() -> String {
         .join(" ")
 }
 
-/// 模型选择器 + 平台 slug 的 `'selector|platform'` 列表，供 bash/zsh 生成
-/// “名称 + 平台”两段式智能补全。
+/// List of `'selector|platform'` entries for model selectors + platform slugs,
+/// used by bash/zsh to build "name + platform" two-stage smart completion.
 fn model_meta_words() -> String {
     crate::ai::model_names::all()
         .into_iter()
@@ -556,11 +577,13 @@ fn model_meta_words() -> String {
         .join(" ")
 }
 
-/// skill 名称列表，供 bash/zsh 生成补全。只喂名字、不含描述：
-/// `_a_name_rank` 的 rank-1 两段式分支会把 `|` 后的次字段当作匹配对象，
-/// 若把 description 放进去会造成“描述误命中”（交互式补全明确只按名称匹配，
-/// 见 prompt/completion.rs 的 name_token_match_rank）。条目不带 `|` 时次字段
-/// 为空，rank-1 自然不会命中；rank-0 前缀与 rank-2 逐段匹配仍按名称生效。
+/// Skill name list for bash/zsh completion. Only names are fed, no descriptions:
+/// the rank-1 two-stage branch of `_a_name_rank` treats the secondary field after
+/// `|` as a match target, so putting a description in would cause "description
+/// false hits" (interactive completion matches by name only; see
+/// name_token_match_rank in prompt/completion.rs). Entries without `|` have an
+/// empty secondary field, so rank-1 naturally never matches; rank-0 prefix and
+/// rank-2 segment-wise matching still work by name.
 fn skill_meta_words() -> String {
     crate::ai::skills::load_all_skills()
         .into_iter()
@@ -569,8 +592,9 @@ fn skill_meta_words() -> String {
         .join(" ")
 }
 
-/// 主 agent 名称列表，供 bash/zsh 生成补全。同 skill_meta_words，只喂名字、
-/// 不含描述，避免 rank-1 两段式把 description 当次字段造成“描述误命中”。
+/// Primary agent name list for bash/zsh completion. Like skill_meta_words, only
+/// names are fed, no descriptions, to avoid rank-1 two-stage matching treating a
+/// description as the secondary field ("description false hits").
 fn agent_meta_words() -> String {
     crate::ai::agents::get_primary_agents(&crate::ai::agents::load_all_agents())
         .into_iter()
@@ -579,7 +603,7 @@ fn agent_meta_words() -> String {
         .join(" ")
 }
 
-/// skill 名称（空格分隔），供 fish 前缀补全使用。
+/// Skill names (space-separated), used for fish prefix completion.
 fn skill_names() -> String {
     crate::ai::skills::load_all_skills()
         .into_iter()
@@ -588,7 +612,7 @@ fn skill_names() -> String {
         .join(" ")
 }
 
-/// 主 agent 名称（空格分隔），供 fish 前缀补全使用。
+/// Primary agent names (space-separated), used for fish prefix completion.
 fn agent_names() -> String {
     crate::ai::agents::get_primary_agents(&crate::ai::agents::load_all_agents())
         .into_iter()
@@ -626,14 +650,15 @@ fn generate_bash(
             opts.push(' ');
         }
     }
-    // 追加 "/" / ":" 内部命令
+    // Append "/" / ":" internal commands.
     let mut all = opts;
     for cmd in INTERNAL_COMMANDS {
         all.push_str(cmd);
         all.push(' ');
     }
-    // 子命令映射（与 zsh 分支保持一致）。当第一个参数是内部命令时，
-    // 第二个参数补全对应的子命令而不是顶层 flags/命令列表。
+    // Subcommand mapping (kept in sync with the zsh branch). When the first
+    // argument is an internal command, the second argument completes its
+    // subcommands instead of the top-level flags/command list.
     println!("  local usage_sub='today 7d 30d all daily trend days models help'");
     println!("  local checkpoint_sub='save list rollback delete help'");
     println!(
@@ -654,7 +679,7 @@ fn generate_bash(
     println!("  local -a _a_agent_meta=({})", agent_meta_words());
     println!("  local effort_levels='minimal low medium high xhigh max auto off'");
     println!();
-    // `--model`/`-m` 的值：智能匹配模型名。
+    // Values of `--model`/`-m`: smart-match model names.
     println!("  if [[ \"$prev\" == \"--model\" || \"$prev\" == \"-m\" ]]; then");
     println!("    COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_model_meta[@]}}\"))");
     println!("    return 0");
@@ -667,7 +692,7 @@ fn generate_bash(
     println!("    COMPREPLY=(\"${{_vals[@]/#/$_mdl_ip}}\")");
     println!("    return 0");
     println!("  fi");
-    // COMP_WORDS[0] 是命令名 a，内部命令位于 COMP_WORDS[1]。
+    // COMP_WORDS[0] is the command name a; internal commands live in COMP_WORDS[1].
     println!("  if [ \"$COMP_CWORD\" -ge 2 ]; then");
     println!("    case \"${{COMP_WORDS[1]}}\" in");
     println!("      /usage|:usage)");
@@ -807,13 +832,13 @@ fn generate_zsh(
             );
         }
     }
-    // 内部命令作为第一层 position args
+    // Internal commands as first-level position args.
     println!(
         "  local -a _a_internal_cmds=({})",
         INTERNAL_COMMANDS.join(" ")
     );
     println!();
-    // 子命令映射
+    // Subcommand mapping.
     println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days models help)");
     println!("  local -a _a_checkpoint_subcmds=(save list rollback delete help)");
     println!(
@@ -893,13 +918,14 @@ fn generate_zsh(
   }
 "#
     );
-    // `--model`/`-m` 的值：智能匹配模型名。
+    // Values of `--model`/`-m`: smart-match model names.
     println!("  if [[ \"$words[CURRENT-1]\" == --model* || \"$words[CURRENT-1]\" == -m* ]]; then");
     println!("    _a_name_candidates _a_model_meta");
     println!("    return");
     println!("  fi");
-    // `--model=VALUE` / `-m=VALUE`（等号形式）：把 `--model=` 设为 IPREFIX，
-    // 只对等号后的部分做匹配，候选插入时保留前缀。
+    // `--model=VALUE` / `-m=VALUE` (equals form): set `--model=` as IPREFIX so
+    // only the part after the equals sign is matched, keeping the prefix on
+    // candidate insertion.
     println!("  if [[ \"$words[CURRENT]\" == --model=* || \"$words[CURRENT]\" == -m=* ]]; then");
     println!("    local _mdl_ip='--model='");
     println!("    [[ \"$words[CURRENT]\" == -m=* ]] && _mdl_ip='-m='");
@@ -909,14 +935,18 @@ fn generate_zsh(
     println!("    return");
     println!("  fi");
     println!();
-    // 若正在补全内部命令的子命令，先按子命令处理并 return，
-    // 避免回落到 flags / 顶层命令补全。
+    // If a subcommand of an internal command is being completed, handle it as a
+    // subcommand first and return, instead of falling back to flags / top-level
+    // command completion.
     //
-    // zsh 在 `a /personas <TAB>` 这种“一级命令后刚输入一个空格”的场景里，
-    // CURRENT 有时仍是 2，因此不能只依赖 `CURRENT >= 3`。这里同时兼容：
-    // - CURRENT >= 3：已经进入第三个词；
-    // - CURRENT == 2 且 LBUFFER 以空白结尾：刚输入完一级命令并跟了空格。
-    // 注意：zsh 补全里 $words[1] 是命令名 a 本身，内部命令位于 $words[2]。
+    // In zsh, in scenarios like `a /personas <TAB>` ("a single space typed right
+    // after a first-level command"), CURRENT can still be 2, so we cannot rely on
+    // `CURRENT >= 3` alone. Accept both:
+    // - CURRENT >= 3: already inside the third word;
+    // - CURRENT == 2 with LBUFFER ending in whitespace: a first-level command was
+    //   just typed and followed by a space.
+    // Note: in zsh completion $words[1] is the command name a itself; internal
+    // commands live in $words[2].
     println!("  local _a_subcmd_owner=''");
     println!("  if (( CURRENT >= 3 )); then");
     println!("    _a_subcmd_owner=\"$words[2]\"");
@@ -980,9 +1010,10 @@ fn generate_zsh(
     println!("        ;;");
     println!("  esac");
     println!();
-    // _arguments: flags + 第一个 position arg 是内部命令。
-    // 用 ($_a_internal_cmds) 展开数组成员作为候选；早期写成 (_a_internal_cmds)
-    // 会把字面量字符串 "_a_internal_cmds" 当成唯一候选，导致 /usa<tab> 无反应。
+    // _arguments: flags + the first position arg is an internal command.
+    // Expand the array members as candidates via ($_a_internal_cmds); an early
+    // version wrote (_a_internal_cmds) instead, which made the literal string
+    // "_a_internal_cmds" the only candidate, leaving /usa<tab> unresponsive.
     println!("  _arguments $_a_args ':first command:(($_a_internal_cmds))'");
     println!("}}");
     println!();
@@ -1012,7 +1043,7 @@ fn generate_fish(
             }
         }
     }
-    // 追加 "/" / ":" 内部命令
+    // Append "/" / ":" internal commands.
     for cmd in INTERNAL_COMMANDS {
         println!("complete -c a -a '{cmd}' -d 'internal command'");
     }
@@ -1020,8 +1051,9 @@ fn generate_fish(
         "complete -c a -n '__fish_seen_subcommand_from /model :model' -a '{}' -d 'model selector'",
         model_selector_words().replace('\'', "\\'")
     );
-    // `--model`/`-m` 的值：模型选择器。fish 的 `-a` 自带前缀过滤，
-    // 无法像 bash/zsh 那样做分段匹配，但 `a --model dee<TAB>` 这类前缀场景可用。
+    // Values of `--model`/`-m`: model selector. fish's `-a` already prefix-filters,
+    // so segmented matching like bash/zsh is not possible, but prefix scenarios
+    // such as `a --model dee<TAB>` work.
     println!(
         "complete -c a -l model -r -a '{}' -d 'model selector'",
         model_selector_words().replace('\'', "\\'")
@@ -1036,8 +1068,9 @@ fn generate_fish(
     println!(
         "complete -c a -n '__fish_seen_subcommand_from effort' -a 'minimal low medium high xhigh max auto off' -d 'reasoning effort'"
     );
-    // skill/agent 名补全：fish 的 `-a` 只能前缀匹配，无法像 bash/zsh 那样做
-    // 两段式智能匹配（平台限制），这里仅补全名字本身。
+    // skill/agent name completion: fish's `-a` can only match by prefix and cannot
+    // do the two-stage smart matching of bash/zsh (platform limitation), so only
+    // the names themselves are completed here.
     println!(
         "complete -c a -n '__fish_seen_subcommand_from /skills :skills /skill :skill' -a '{}' -d 'skill name'",
         skill_names().replace('\'', "\\'")

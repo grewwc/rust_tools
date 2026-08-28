@@ -19,8 +19,9 @@ use super::{
     sqlite::{
         SessionListMetadata, backup_sqlite, read_all_messages_sqlite,
         read_first_user_prompt_sqlite, read_session_list_metadata_sqlite,
-        read_session_title_origin_sqlite, read_session_title_sqlite,
-        remap_context_checkpoint_paths_sqlite, with_session_state_lock, write_session_title_sqlite,
+        read_session_marked_sqlite, read_session_title_origin_sqlite, read_session_title_sqlite,
+        remap_context_checkpoint_paths_sqlite, with_session_state_lock, write_session_marked_sqlite,
+        write_session_title_sqlite,
     },
     types::Message,
 };
@@ -85,6 +86,8 @@ pub(in crate::ai) struct SessionInfo {
     pub(in crate::ai) size_bytes: u64,
     pub(in crate::ai) first_user_prompt: Option<String>,
     pub(in crate::ai) summary: Option<String>,
+    /// Whether the user marked this session as important via `/mark`.
+    pub(in crate::ai) marked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,15 +225,16 @@ impl SessionStore {
                 }
             });
         for (idx, (id, _path, file_modified)) in jobs.into_iter().enumerate() {
-            let (first_user_prompt, generated_title, last_activity_unix_ms, history_revision) =
+            let (first_user_prompt, generated_title, last_activity_unix_ms, history_revision, marked) =
                 match metadata_results[idx].take() {
                     Some(metadata) => (
                         metadata.first_user_prompt,
                         metadata.session_title,
                         metadata.last_activity_unix_ms,
                         metadata.history_revision,
+                        metadata.marked,
                     ),
-                    None => (None, None, None, 0),
+                    None => (None, None, None, 0, false),
                 };
             // 新库使用事务内维护的逻辑活动时间；旧库由元数据读取层回退到最后一条
             // canonical message 的 created_at。只有无法读取逻辑时间时才使用主库 mtime。
@@ -265,6 +269,7 @@ impl SessionStore {
                     size_bytes: 0,
                     first_user_prompt,
                     summary,
+                    marked,
                 },
             );
         }
@@ -971,6 +976,27 @@ impl SessionStore {
             title,
             origin.persisted_value(),
         )
+    }
+
+    /// Whether the user marked the session as important via `/mark`.
+    /// A missing or unreadable session is treated as unmarked.
+    pub(in crate::ai) fn read_session_marked(&self, session_id: &str) -> io::Result<bool> {
+        Self::validate_session_id(session_id)?;
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        read_session_marked_sqlite(&path)
+    }
+
+    /// Persist the session "important" mark (`/mark` / `/unmark`).
+    pub(in crate::ai) fn write_session_marked(
+        &self,
+        session_id: &str,
+        marked: bool,
+    ) -> io::Result<()> {
+        Self::validate_session_id(session_id)?;
+        write_session_marked_sqlite(&self.session_history_file(session_id), marked)
     }
 
     /// 检查是否已有 LLM 生成的标题。

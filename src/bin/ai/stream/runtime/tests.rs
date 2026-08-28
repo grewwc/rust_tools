@@ -116,9 +116,9 @@ fn idle_timeout_discards_unconfirmed_tool_call_and_marks_stream_error() {
 
 #[test]
 fn tool_arg_cap_discards_unconfirmed_tool_call_and_marks_truncated() {
-    // 工具参数累积超过上限被掐断时，即使截止瞬间的 JSON 恰好合法，也不能把
-    // 半截工具调用交给执行层（与 idle timeout 同一原则）。必须丢弃并走
-    // degenerate_repetition 的可重试 Truncated 路径，而不是执行部分参数。
+    // When accumulated tool arguments exceed the cap and get cut off, the half-finished tool call
+    // must not reach the execution layer even if the JSON happens to be valid at the cutoff instant
+    // (same principle as idle timeout): drop it and take degenerate_repetition's retryable Truncated path instead of executing partial args.
     let mut app = test_app();
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
@@ -132,13 +132,13 @@ fn tool_arg_cap_discards_unconfirmed_tool_call_and_marks_truncated() {
             id: "call-cap".to_string(),
             tool_type: "function".to_string(),
             function_name: "apply_patch".to_string(),
-            // 截止瞬间恰好是合法 JSON，也不应被执行。
+            // Even when the JSON is valid at the cutoff instant, it must not be executed.
             arguments: r#"{"patch":"partial but currently valid"}"#.to_string(),
             printed_arguments_len: 0,
         },
     );
-    // assistant_text 里出现疑似内联工具调用的 JSON（会被 recover_inline_tool_calls
-    // 识别），参数超限场景下同样不可信，不能被恢复执行，否则绕过上面的丢弃逻辑。
+    // JSON in assistant_text that looks like an inline tool call (recognized by recover_inline_tool_calls)
+    // is equally untrusted in this over-limit scenario and must not be recovered for execution, otherwise it would bypass the drop logic above.
     state.content.assistant_text =
         r#"{"function":{"name":"apply_patch","arguments":"{}"},"id":"call-recover"}"#.to_string();
 
@@ -168,12 +168,12 @@ fn degenerate_reasoning_repetition_detects_suffix_after_normal_progress() {
 
 #[test]
 fn degenerate_repetition_catches_visible_content_runaway() {
-    // 复现事故：模型在**可见输出**里逐字复读同一短语直到撑满预算，
-    // 产出巨型垃圾消息落盘并触发下一轮 provider 400。退化守卫必须对
-    // 可见 assistant 文本同样生效（此前仅覆盖 reasoning_content）。
+    // Reproduces an incident: the model repeated the same phrase verbatim in its **visible output**
+    // until the budget was full, producing a giant junk message on disk and triggering a provider 400
+    // on the next turn. The degenerate guard must also apply to visible assistant text (previously it only covered reasoning_content).
     let phrase = "我再重新读一遍修复区域，以确保我掌握的是当前状态。";
     assert!(has_degenerate_repetition(&phrase.repeat(3)));
-    // 单字复读（如事故里的 8 万个「再」）也应命中。
+    // Single-character repetition (e.g. the 80,000 repetitions of one character in the incident) must also match.
     assert!(has_degenerate_repetition(&"再".repeat(64)));
 }
 
@@ -440,7 +440,7 @@ fn normalize_tool_call_arguments_rejects_incomplete_json_and_canonicalizes_empty
 fn collect_valid_tool_calls_reports_drop_on_incomplete_arguments() {
     let mut builders: rust_tools::cw::SkipMap<usize, ToolCallBuilder> =
         rust_tools::cw::SkipMap::default();
-    // 模拟大文件 write_file 撞输出上限：arguments JSON 半截、无法修复。
+    // Simulate a large write_file hitting the output cap: arguments JSON cut in half and unrepairable.
     builders.insert(
         0,
         ToolCallBuilder {
@@ -473,7 +473,7 @@ fn collect_valid_tool_calls_no_drop_on_valid_arguments() {
 
 #[test]
 fn recover_inline_tool_calls_handles_bare_object() {
-    // 模拟 qwen3.7-max 把 tool call 当成 content 输出的情况。
+    // Simulate qwen3.7-max emitting a tool call as content.
     let raw = r#"{"name":"read_file","arguments":{"path":"/tmp/x"}}"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
@@ -506,7 +506,7 @@ fn recover_inline_tool_calls_handles_tool_call_xml_wrapper() {
 
 #[test]
 fn recover_inline_tool_calls_handles_hermes_xml_json_body() {
-    // 截图中模型实际输出的 Hermes/Qwen XML 形态（body 为 JSON）。
+    // The Hermes/Qwen XML shape the model actually emitted in the screenshot (body is JSON).
     let raw = "<tool_call>\n<function=read_file>\n{\"path\":\"/tmp/x\"}\n</function>\n</tool_call>";
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
@@ -522,7 +522,7 @@ fn recover_inline_tool_calls_handles_hermes_xml_parameter_tags() {
     assert_eq!(calls[0].function.name, "read_file");
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
     assert_eq!(args["path"], "/tmp/x");
-    // 数字参数被识别为 JSON 数字而非字符串。
+    // Numeric arguments must be recognized as JSON numbers, not strings.
     assert_eq!(args["limit"], 200);
 }
 
@@ -565,20 +565,20 @@ fn recover_inline_tool_calls_handles_openai_function_wrapper() {
 
 #[test]
 fn recover_inline_tool_calls_rejects_plain_text() {
-    // 普通文本回答绝不能被误判为 tool call。
+    // Plain text answers must never be misidentified as a tool call.
     assert!(recover_inline_tool_calls("Hello world").is_none());
     assert!(recover_inline_tool_calls("").is_none());
-    // 仅有 name 没有 arguments，且 name 不在合法对象中——这里应该也是不解析的，
-    // 但为保留兼容性我们允许 name 单独存在时仍然识别。下面是真正的负样本：
+    // name without arguments, and name not in the known object set — strictly this should not parse,
+    // but for compatibility we still recognize a bare name on its own. Below are the true negative samples:
     assert!(recover_inline_tool_calls("{\"foo\":\"bar\"}").is_none());
     assert!(recover_inline_tool_calls("12345").is_none());
-    // 字符串形式的 args 必须本身也是合法 JSON，否则拒绝。
+    // String-form args must themselves be valid JSON, otherwise reject.
     assert!(recover_inline_tool_calls(r#"{"name":"x","arguments":"not-json"}"#).is_none());
 }
 
 #[test]
 fn recover_inline_tool_calls_handles_anthropic_xml_parameter_tags() {
-    // deepseek-v4-flash 实际输出的 Anthropic 风格：<invoke name=...>/<parameter name=...>。
+    // The Anthropic style deepseek-v4-flash actually emits: <invoke name=...>/<parameter name=...>.
     let raw = r#"<function_calls><invoke name="read_file"><parameter name="path">/tmp/x</parameter><parameter name="limit">200</parameter></invoke></function_calls>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
@@ -590,8 +590,8 @@ fn recover_inline_tool_calls_handles_anthropic_xml_parameter_tags() {
 
 #[test]
 fn recover_inline_tool_calls_respects_anthropic_string_attr() {
-    // string="true" 必须把看起来像 JSON 标量的值（true/123/null）保持为字符串，
-    // 而不是自动解析成 bool/number。string="false" 则照常 JSON 解析。
+    // string="true" must keep values that look like JSON scalars (true/123/null) as strings,
+    // instead of auto-parsing them into bool/number. string="false" parses as JSON as usual.
     let raw = r#"<function_calls><invoke name="enable_tools"><parameter name="operation" string="true">enable</parameter><parameter name="dry_run" string="true">true</parameter><parameter name="count" string="true">123</parameter><parameter name="tools" string="false">["a","b"]</parameter></invoke></function_calls>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
@@ -621,7 +621,7 @@ fn recover_inline_tool_calls_matches_anthropic_string_attr_by_exact_name() {
 
 #[test]
 fn recover_inline_tool_calls_handles_anthropic_xml_namespaced_tags() {
-    // 带命名空间前缀（antml:）且无外层包裹。
+    // With a namespace prefix (antml:) and no outer wrapper.
     let raw = r#"<invoke name="list_agents"></invoke>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
@@ -631,20 +631,20 @@ fn recover_inline_tool_calls_handles_anthropic_xml_namespaced_tags() {
 
 #[test]
 fn recover_inline_tool_calls_respects_anthropic_xml_string_attr() {
-    // DSML `string="true"`：即便值看起来像 JSON 标量，也必须保持为字符串。
-    // 覆盖用户报告的 deepseek 启用 MCP 工具的输出形态。
+    // DSML `string="true"`: the value must stay a string even when it looks like a JSON scalar.
+    // Covers the output shape the user reported from deepseek with MCP tools enabled.
     let raw = r#"<tool_calls><invoke name="enable_tools"><parameter name="operation" string="true">enable</parameter><parameter name="tools" string="false">["mcp_excel_open_workbook"]</parameter></invoke></tool_calls>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].function.name, "enable_tools");
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
-    // string="true" -> "enable" 必须是字符串，不得被当成标识符。
+    // string="true" -> "enable" must remain a string, never treated as an identifier.
     assert_eq!(args["operation"], "enable");
     assert!(
         args["operation"].is_string(),
         "string=\"true\" 必须保持字符串"
     );
-    // string="false" -> 数组 JSON 正常解析。
+    // string="false" -> the array JSON parses normally.
     assert_eq!(args["tools"][0], "mcp_excel_open_workbook");
 }
 
@@ -661,7 +661,7 @@ fn recover_inline_tool_calls_handles_anthropic_xml_parallel_calls() {
 
 #[test]
 fn recover_inline_tool_calls_handles_anthropic_xml_string_true_attr() {
-    // DSML `string="true"`：值看起来像 JSON 标量时仍保持为字符串。
+    // DSML `string="true"`: the value stays a string even when it looks like a JSON scalar.
     let raw = r#"<tool_calls><invoke name="enable_tools"><parameter name="operation" string="true">enable</parameter><parameter name="tools" string="false">["read_file","write_file"]</parameter><parameter name="verbose" string="true">true</parameter><parameter name="count" string="true">123</parameter></invoke></tool_calls>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
     assert_eq!(calls.len(), 1);
@@ -702,9 +702,9 @@ fn anthropic_xml_streamer_suppresses_markup_and_emits_events() {
     let (cleaned, events) = streamer.push(
             r#"Let me check.<invoke name="read_file"><parameter name="path">/tmp/x</parameter></invoke>"#,
         );
-    // invoke 标记不外显，仅保留前置散文。
+    // The invoke markers stay hidden; only the leading prose is kept.
     assert_eq!(cleaned, "Let me check.");
-    // 产出 Begin/Args/End 事件，与内部 tool_call 管线一致。
+    // Emits Begin/Args/End events, consistent with the internal tool_call pipeline.
     assert_eq!(events.len(), 3);
     match (&events[0], &events[1], &events[2]) {
         (
@@ -788,15 +788,15 @@ fn response_completed_event_does_not_block_late_snapshot_text() {
 
 #[test]
 fn replayed_content_part_added_does_not_duplicate_visible_text() {
-    // 用户可见"结论输出两遍"：兼容网关把 content_part.added（output_text）的
-    // 全量文本在 output_text.delta 增量之后再次下发。Append 模式原样渲染会
-    // 重复正文；ReplayedChunk 应对 content 计算未见后缀后只渲染新增部分。
+    // User-visible "conclusion printed twice": a compatibility gateway re-delivers the full text of
+    // content_part.added (output_text) after the output_text.delta increments. Rendering as-is in
+    // Append mode duplicates the body; ReplayedChunk must compute the unseen suffix for content and render only the new part.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
     let mut current_history = String::new();
 
-    // 1) delta 增量先渲染部分正文
+    // 1) delta increments render part of the body first
     process_stream_payload(
         &mut app,
         &mut current_history,
@@ -809,7 +809,7 @@ fn replayed_content_part_added_does_not_duplicate_visible_text() {
     .unwrap();
     assert_eq!(state.content.assistant_text, "修复完成");
 
-    // 2) content_part.added 重发该 part 的完整文本（协议多路径下发）
+    // 2) content_part.added re-sends the part's full text (multi-path delivery by the protocol)
     process_stream_payload(
         &mut app,
         &mut current_history,
@@ -820,11 +820,11 @@ fn replayed_content_part_added_does_not_duplicate_visible_text() {
         r#"{"part":{"type":"output_text","text":"修复完成，验证通过。"}}"#,
     )
     .unwrap();
-    // 已见前缀被吞掉，只追加未见后缀
+    // The seen prefix is swallowed; only the unseen suffix is appended
     assert_eq!(state.content.assistant_text, "修复完成，验证通过。");
     assert_eq!(current_history, "修复完成，验证通过。");
 
-    // 3) 再次重发完全相同文本：完全重叠，不再追加
+    // 3) Re-sending the exact same text: full overlap, nothing more is appended
     process_stream_payload(
         &mut app,
         &mut current_history,
@@ -1077,8 +1077,8 @@ fn output_text_stream_preserves_inter_paragraph_newlines_without_snapshot_duplic
     let mut app = test_app();
     let mut current_history = String::new();
 
-    // responses 协议分段输出：正文 -> 纯换行 -> 下一段。纯换行是正文格式的一部分，
-    // 必须原样进入 assistant_text；最终 .done 快照只用于去重，不能再次追加整段内容。
+    // The responses protocol emits in segments: body -> bare newline -> next segment. A bare newline is part of the body format,
+    // must go into assistant_text verbatim; the final .done snapshot is only for dedup and must not append the whole content again.
     process_stream_payload(
         &mut app,
         &mut current_history,
@@ -1249,10 +1249,10 @@ fn inline_tool_call_fallback_does_not_persist_protocol_as_hidden_meta() {
 
 #[test]
 fn process_stream_payload_halts_and_downshifts_on_hallucinated_result_marker() {
-    // 复现本次事故：模型在可见正文里自编自演「工具调用→工具结果」，吐出系统从不
-    // 生成的 `<function_results>` 协议标记。要求：(1) 幻觉结果块整块剥离，不落盘；
-    // (2) 停流（should_stop=true）；(3) 置 degenerate_repetition finish_reason 走
-    // 降档重试路径，避免幻觉正文毒化下一轮请求。
+    // Reproduces this incident: the model fabricated a "tool call -> tool result" sequence in its
+    // visible body, emitting `<function_results>` protocol markers the system never generates. Requirements:
+    // (1) the hallucinated result block is stripped whole and never persisted; (2) the stream stops
+    // (should_stop=true); (3) degenerate_repetition finish_reason is set to take the downgrade-retry path, keeping hallucinated body text from poisoning the next request.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
@@ -1335,8 +1335,8 @@ fn thinking_fold_keeps_reasoning_buffer_intact() {
 
 #[test]
 fn reasoning_summary_done_snapshot_does_not_duplicate_thinking() {
-    // Responses 协议先流式发 `.delta` 增量，再用 `.done` 事件重发整段推理摘要
-    // （SnapshotChunk）。若不对 snapshot 做未见后缀去重，thinking 会被打印两遍。
+    // The Responses protocol first streams `.delta` increments, then re-sends the whole reasoning
+    // summary via a `.done` event (SnapshotChunk). Without unseen-suffix dedup on the snapshot, thinking prints twice.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
@@ -1363,7 +1363,7 @@ fn reasoning_summary_done_snapshot_does_not_duplicate_thinking() {
         "I'm considering inspecting the task_tools."
     );
 
-    // `.done` 事件携带完整摘要（全量）——去重后不应再追加任何内容。
+    // The `.done` event carries the complete summary (full) — after dedup nothing more may be appended.
     process_stream_payload(
         &mut app,
         &mut current_history,
@@ -1383,16 +1383,16 @@ fn reasoning_summary_done_snapshot_does_not_duplicate_thinking() {
 
 #[test]
 fn content_part_summary_text_events_never_replay_streamed_reasoning() {
-    // gpt-5.5/5.6 的 Responses API 对同一段推理摘要会通过 content_part.added /
-    // content_part.done 的 summary_text 重发已流式输出过的内容。这些事件是
-    // 快照重发而非模型增量，必须按未见后缀去重，否则 reasoning_text 会被
-    // 重复累积，污染退化检测并可能诱发 thinking 重复渲染。
+    // gpt-5.5/5.6's Responses API re-sends already-streamed reasoning summaries via the summary_text
+    // of content_part.added / content_part.done. These events are snapshot re-sends rather than model
+    // increments and must be deduped by unseen suffix, otherwise reasoning_text accumulates twice,
+    // polluting degenerate detection and possibly triggering duplicate thinking rendering.
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
     let mut current_history = String::new();
 
-    // 第一段摘要：先 delta 流式，再用 content_part.added/done 重发同一段
+    // First summary: stream via delta first, then re-send the same segment via content_part.added/done
     process_stream_payload(
         &mut app,
         &mut current_history,
@@ -1420,7 +1420,7 @@ fn content_part_summary_text_events_never_replay_streamed_reasoning() {
         "content_part 的 summary_text 重发不应重复累积 reasoning_text"
     );
 
-    // 第二段摘要：同样验证 delta + content_part 重发不污染
+    // Second summary: likewise verify that the delta + content_part re-send does not pollute
     process_stream_payload(
         &mut app,
         &mut current_history,
@@ -1456,7 +1456,7 @@ fn thinking_fold_drops_interior_blank_lines() {
     state.render.thinking_fold.max_visible_lines = 8;
     state.render.thinking_fold.active = true;
 
-    // 模型常用空行分段：段间空行不应占用折叠窗口的可见行。
+    // Models often separate paragraphs with blank lines: blank lines between segments must not consume visible rows of the fold window.
     write_thinking_content_folded("para 1\n\npara 2\n", &mut state, &markers).unwrap();
 
     let fold = &state.render.thinking_fold;
@@ -1469,8 +1469,8 @@ fn thinking_fold_drops_interior_blank_lines() {
 
 #[test]
 fn thinking_fold_window_counts_current_line_inside_visible_budget() {
-    // 锁定并置宽 COLUMNS：本用例断言正文/标记原样存在，须避免与 COLUMNS=12
-    // 的折行用例并发时读到被泄漏的窄列宽而触发 clamp 截断。
+    // Lock and widen COLUMNS: this case asserts the body/markers exist verbatim, so it must avoid
+    // reading a leaked narrow column width while the COLUMNS=12 wrapping case runs concurrently and triggering clamp truncation.
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1507,9 +1507,9 @@ fn thinking_fold_window_counts_current_line_inside_visible_budget() {
 
 #[test]
 fn thinking_fold_zero_window_is_pure_summary() {
-    // 0 行窗口 = 纯摘要：已完成的正文行与未完成行都不进入可见窗口。
-    // `finalize_fold` 在思考收尾时临时使用该语义，避免 thinking 尾部复述的
-    // 结论/问句与最终回答在终端重复显示（流式过程仍按 max_visible_lines 展示）。
+    // 0-row window = summary only: neither completed body lines nor the in-flight line enter the visible window.
+    // `finalize_fold` temporarily uses this semantics when thinking wraps up, so trailing recap
+    // conclusions/questions do not duplicate the final answer on screen (streaming still shows max_visible_lines).
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1563,8 +1563,8 @@ fn thinking_fold_window_wraps_long_lines_to_terminal_width() {
         .lines()
         .map(crate::ai::stream::extract::strip_ansi_codes)
         .collect::<Vec<_>>();
-    // COLUMNS=12，reserve = 缩进 4 → 有效宽度 8 列。长行按 8 列自然折行，
-    // 每个包裹段本身就是一个物理行，且恰好落在 4 条正文物理行的可见预算内。
+    // COLUMNS=12, reserve = indent 4 -> effective width 8 columns. Long lines wrap naturally at 8 columns,
+    // each wrapped segment being one physical line, and all fit within the 4-physical-line visible budget.
     assert_eq!(
         plain_lines,
         vec!["    12345678", "    90123456", "    7890", "    abcdef",]
@@ -1609,8 +1609,8 @@ fn thinking_fold_window_caps_wrapped_content_to_physical_row_budget() {
         .map(crate::ai::stream::extract::strip_ansi_codes)
         .collect::<Vec<_>>();
 
-    // 逻辑行未超限也可能因包裹超过物理行预算；此时保留最新两行，并以单行提示
-    // 占据额外的一行，保证 cursor-up 擦除的范围恒定有界。
+    // Even when logical lines are within budget, wrapping can exceed the physical-line budget; keep the
+    // latest two lines plus a one-line notice so the cursor-up erase range stays constantly bounded.
     assert_eq!(plain_lines, vec!["    … more", "    7890", "    abcdef"]);
     assert_eq!(rows, 3);
     assert!(rows <= fold.max_visible_lines + 1);
@@ -1635,8 +1635,8 @@ fn one_column_fold_content_keeps_row_accounting_safe() {
         std::env::set_var("COLUMNS", "5");
     }
 
-    // 缩进占 4 列时，正文和折叠提示只剩一列。截断提示必须仍是一列，宽字符则以
-    // 单列占位符表示，不能让终端自行折行而使擦除行数少算。
+    // With a 4-column indent, body and fold notice have one column left. The truncation notice must still
+    // be one column, wide chars render as a single-column placeholder, and the terminal must not wrap on its own or the erase count under-counts.
     assert_eq!(
         crate::ai::stream::clamp_line_to_terminal_row_with_reserve("marker", 4),
         "…"
@@ -1691,8 +1691,8 @@ fn fold_window_keeps_last_terminal_columns_unused_without_terminal_detection() {
         .map(crate::ai::stream::extract::strip_ansi_codes)
         .collect::<Vec<_>>();
 
-    // COLUMNS=12，reserve = 缩进 4 + 通用右边距 2 = 6 → 有效宽度 6 列。
-    // 不依赖 TERM_PROGRAM 识别，长行也始终避开 delayed-wrap 列。
+    // COLUMNS=12, reserve = indent 4 + generic right margin 2 = 6 -> effective width 6 columns.
+    // Independent of TERM_PROGRAM detection, long lines always avoid the delayed-wrap column.
     assert_eq!(
         plain_lines,
         vec![
@@ -1792,7 +1792,7 @@ fn thinking_fold_window_without_hidden_lines_has_no_fold_marker() {
 
     let (window, rows) = render_thinking_fold_window(fold);
 
-    // 无隐藏行、无 active header：窗口物理行数 == 可见逻辑行数（3）。
+    // No hidden lines, no active header: window physical rows == visible logical lines (3).
     assert!(!window.contains("earlier lines"));
     assert!(window.contains("line-1"));
     assert!(window.contains("line-2"));
@@ -1806,9 +1806,9 @@ fn thinking_fold_window_without_hidden_lines_has_no_fold_marker() {
 
 #[test]
 fn thinking_fold_window_body_excludes_anchored_header() {
-    // header 已从正文渲染中剥离并单独锚定：`render_thinking_fold_window` 只产出正文
-    // （折叠摘要 + 可见行），绝不含 header。这是「孤儿 header 叠加」修复的核心不变量——
-    // 正文可被 cursor-up 反复擦除重画，header 只落地一次、永不被擦除。
+    // The header is stripped from body rendering and anchored separately: `render_thinking_fold_window`
+    // only produces body content (fold summary + visible lines), never the header. This is the core
+    // invariant of the "orphan header stacking" fix — body may be erased and redrawn repeatedly via cursor-up, while the header lands once and is never erased.
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1826,7 +1826,7 @@ fn thinking_fold_window_body_excludes_anchored_header() {
 
     let (window, rows) = render_thinking_fold_window(fold);
 
-    // 折叠标记(1) + 可见行(1) + current(1) = 3 物理行，header 不在此列。
+    // Fold marker(1) + visible line(1) + current(1) = 3 physical rows, header not included.
     assert!(!window.contains("thinking"));
     assert!(window.contains("earlier lines"));
     assert!(window.contains("line-1"));
@@ -1858,9 +1858,9 @@ fn completed_thinking_fold_replaces_anchored_header_in_place() {
 
     finalize_fold_to(&mut out, &mut fold, true).unwrap();
 
-    // 断言逐行清除序列（而非 CSI 0J）：0J 会从首个 body 行清到物理屏尾，跨越
-    // DECSTBM 滚动区把底部 side-note 编辑器一并擦掉，所以这里只能逐行 \x1b[2K
-    // 清除窗口再原位重写锚定的 header。
+    // Assert per-line clear sequences (not CSI 0J): 0J clears from the first body row to the physical
+    // screen bottom, crossing the DECSTBM scroll region and wiping the bottom side-note editor, so the
+    // window must be cleared row by row with \x1b[2K and the anchored header rewritten in place.
     assert_eq!(
         String::from_utf8(out).unwrap(),
         format!(
@@ -1907,9 +1907,9 @@ fn thinking_fold_erase_rows_follow_current_terminal_reflow_of_previous_body() {
 
 #[test]
 fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
-    // 「孤儿 header 叠加」回归：header 只在首次重画时落地（header_drawn=true），
-    // 之后无论重画多少次都不再重打；window_rows 只记录正文物理行数（不含 header），
-    // 因此 cursor-up 擦除永远只作用于可视的正文区，不会因窗口滚入 scrollback 而失步。
+    // "Orphan header stacking" regression: the header lands only on the first redraw (header_drawn=true)
+    // and is never printed again no matter how many redraws follow; window_rows counts only body physical
+    // rows (excluding the header), so cursor-up erasure always targets the visible body area and never drifts when the window scrolls into scrollback.
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1924,14 +1924,14 @@ fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
 
     write_thinking_content_folded("line-1\n", &mut state, &markers).unwrap();
     assert!(state.render.thinking_fold.header_drawn);
-    // 1 可见行，无折叠 → 正文 1 行。
+    // 1 visible line, no fold -> body 1 row.
     assert_eq!(state.render.thinking_fold.window_rows, 1);
     assert_eq!(state.render.thinking_fold.rendered_body_lines.len(), 1);
 
     write_thinking_content_folded("line-2\nline-3\nline-4\n", &mut state, &markers).unwrap();
-    // header 仍只落地一次，绝不重打。
+    // The header still lands only once and is never reprinted.
     assert!(state.render.thinking_fold.header_drawn);
-    // 4 行完成、可见 2 行 → 折叠标记(1) + 可见(2) = 正文 3 行，header 不计入。
+    // 4 completed, 2 visible -> fold marker(1) + visible(2) = body 3 rows, header not counted.
     assert_eq!(state.render.thinking_fold.window_rows, 3);
     assert_eq!(state.render.thinking_fold.rendered_body_lines.len(), 3);
 
@@ -1942,8 +1942,8 @@ fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
 
 #[test]
 fn cancelled_stream_result_finalizes_active_thinking_fold() {
-    // 取消时若折叠窗口仍活跃，必须收口（finalize→reset），避免半截 thinking
-    // 残留、下一轮重试在其下叠新 header（重复 header + 大段空白的跨轮根因）。
+    // On cancel with an active fold window, it must be finalized (finalize→reset), preventing a partial
+    // thinking remnant with a new header stacked under it on the next retry (cross-turn root cause of duplicated headers + large blank areas).
     let mut state = StreamProcessingState::new();
     {
         let fold = &mut state.render.thinking_fold;
@@ -1958,7 +1958,7 @@ fn cancelled_stream_result_finalizes_active_thinking_fold() {
 
     assert!(matches!(result.outcome, StreamOutcome::Cancelled));
     assert!(result.skip_response_drain);
-    // finalize 后折叠状态被 reset：不再 active，窗口行数归零，无孤儿窗口残留。
+    // After finalize the fold state is reset: no longer active, window rows zeroed, no orphan window left behind.
     assert!(!state.render.thinking_fold.active);
     assert_eq!(state.render.thinking_fold.window_rows, 0);
     assert!(state.render.thinking_fold.recent_lines.is_empty());
@@ -2039,10 +2039,10 @@ fn snapshot_done_chunk_does_not_duplicate_already_streamed_prefix() {
 
 #[test]
 fn reasoning_item_added_done_same_id_keeps_full_payload() {
-    // 网关会对同一 reasoning 资源重复下发 .added（部分载荷）与 .done（完整载荷）：
-    // id 相同、encrypted_content 长度不同（.added 携带 >=256 的真实部分载荷时同样
-    // 被捕获）。累积器必须按 id 收敛、保留最长载荷，否则回放时同一资源 id 出现
-    // 两次触发 modelhub 400 (-4003 Duplicate item found)。
+    // The gateway re-delivers .added (partial payload) and .done (complete payload) for the same
+    // reasoning resource: same id, different encrypted_content lengths (a real partial payload of
+    // >=256 delivered via .added is captured too). The accumulator must converge by id and keep the
+    // longest payload, otherwise the same resource id appearing twice triggers modelhub 400 (-4003 Duplicate item found).
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     let mut app = test_app();
@@ -2221,7 +2221,7 @@ async fn stream_response_marks_length_finish_reason_as_truncated() {
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
                 )
                 .unwrap();
-        // 有可见文本但服务端因输出上限截断：finish_reason=length。
+        // Visible text present but the server truncated at the output cap: finish_reason=length.
         write_http_chunk(
             &mut stream,
             "data: {\"choices\":[{\"delta\":{\"content\":\"partial output\"}}]}\n\n",
@@ -2254,11 +2254,11 @@ async fn stream_response_marks_length_finish_reason_as_truncated() {
     .expect("stream_response should return after finish_reason grace window")
     .unwrap();
 
-    // 关键断言：有文本但 finish_reason=length 时按 Completed 处理。推理模型
-    // 的 reasoning token 经常占满输出预算导致 finish_reason=length，但可见的
-    // assistant_text 实际已完整。继续重试只会无意义地反复截断。只有 tool call
-    // arguments JSON 被截断（dropped_malformed_tool_call）或完全没有可见输出
-    // 时，才应升级为 Truncated 触发重试。
+    // Key assertion: text present but finish_reason=length is treated as Completed. Reasoning models
+    // often exhaust the output budget on reasoning tokens, yielding finish_reason=length while the
+    // visible assistant_text is actually complete; retrying would only truncate again for nothing. Only
+    // truncated tool call arguments JSON (dropped_malformed_tool_call) or no visible output at all
+    // should escalate to Truncated and trigger a retry.
     assert_eq!(result.outcome, StreamOutcome::Completed);
     assert_eq!(result.assistant_text, "partial output");
 
@@ -2287,15 +2287,15 @@ async fn stream_response_marks_reasoning_only_early_stop_as_truncated() {
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
                 )
                 .unwrap();
-        // 只吐了 reasoning，从未产出可见 content，也从未发送 finish_reason，
-        // 随后直接关闭连接（提前 EOF）——模拟 GLM 等 enable_thinking 模型憋着
-        // 思考链被掐断的早停场景。
+        // Only reasoning was emitted, no visible content was ever produced, no finish_reason was ever
+        // sent, and then the connection closes outright (early EOF) — simulating the early-stop of GLM-style
+        // enable_thinking models cut off mid chain-of-thought.
         write_http_chunk(
             &mut stream,
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Hmm\"}}]}\n\n",
         )
         .unwrap();
-        // 关闭 chunked body（0-size chunk）后 drop stream，制造 EOF。
+        // Close the chunked body (0-size chunk) then drop the stream to produce an EOF.
         let _ = stream.write_all(b"0\r\n\r\n");
         let _ = stream.flush();
     });
@@ -2319,8 +2319,8 @@ async fn stream_response_marks_reasoning_only_early_stop_as_truncated() {
     .expect("stream_response should return promptly on reasoning-only early stop")
     .unwrap();
 
-    // 关键断言：只有 reasoning、无可见文本、无 finish_reason 的早停必须升级为
-    // Truncated，交给上层降档 / 关 thinking 后重试，而不是静默 Completed。
+    // Key assertion: an early stop with only reasoning, no visible text and no finish_reason must
+    // escalate to Truncated so the upper layer retries with a downgraded model / thinking off, not silently Completed.
     assert_eq!(result.outcome, StreamOutcome::Truncated);
     assert!(result.assistant_text.trim().is_empty());
     assert_eq!(result.reasoning_text, "Hmm");
@@ -2407,8 +2407,8 @@ async fn stream_response_keeps_reading_delayed_chunks_after_finish_reason() {
 
 #[test]
 fn recover_inline_tool_calls_normalizes_namespaced_xml_prefix() {
-    // 某些前端/模型会把 Anthropic 风格的 invoke 包在 <|DSML|> 协议里输出。
-    // 归一化后应被 Anthropic XML 解析器识别，无需为每种 <|PREFIX|> 单独写 parser。
+    // Some frontends/models wrap Anthropic-style invokes in the <|DSML|> protocol.
+    // After normalization the Anthropic XML parser should recognize them; no per-<|PREFIX|> parser needed.
     let raw = r#"<|DSML|tool_calls><|DSML|invoke name="apply_patch"><|DSML|parameter name="file_path">/tmp/x</|DSML|parameter><|DSML|parameter name="patch">---</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover DSML-wrapped tool calls");
     assert_eq!(calls.len(), 1);
@@ -2420,7 +2420,7 @@ fn recover_inline_tool_calls_normalizes_namespaced_xml_prefix() {
 
 #[test]
 fn recover_inline_tool_calls_normalizes_fullwidth_dsml_prefix() {
-    // debug.md 里的 DeepSeek 实际会输出全角竖线版本：<｜｜DSML｜｜...>。
+    // Per debug.md, DeepSeek actually emits the fullwidth-vertical-bar variant: <｜｜DSML｜｜...>.
     let raw = r#"<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="apply_patch"><｜｜DSML｜｜parameter name="file_path">/tmp/x</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name="patch">---</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"#;
     let calls = recover_inline_tool_calls(raw).expect("should recover fullwidth-DSML tool calls");
     assert_eq!(calls.len(), 1);
@@ -2430,10 +2430,10 @@ fn recover_inline_tool_calls_normalizes_fullwidth_dsml_prefix() {
     assert_eq!(args["patch"], "---");
 }
 
-/// 复现 session bc1f2e88 故障：预填 `<think>` 模板的 reasoner 把推理链写进 content
-/// 通道、仅以悬空 `</think>` 收尾。arm 拆分器后，`</think>` 之前的泄漏推理必须进入
-/// reasoning_text（渲染进 thinking 折叠），只有 `</think>` 之后的正式答案才进
-/// assistant_text，杜绝“最终答案输出两遍”。
+/// Reproduces the session bc1f2e88 failure: a reasoner with a prefilled `<think>` template writes
+/// the chain of thought into the content channel, ending only with a dangling `</think>`. With the
+/// splitter armed, leaked reasoning before `</think>` must go into reasoning_text (rendered in the
+/// thinking fold); only the real answer after `</think>` enters assistant_text, so the final answer is never output twice.
 #[test]
 fn armed_demuxer_splits_leaked_reasoning_from_visible_content() {
     let markers = StreamMarkers::new();
@@ -2442,7 +2442,7 @@ fn armed_demuxer_splits_leaked_reasoning_from_visible_content() {
     let mut app = test_app();
     let mut current_history = String::new();
 
-    // 推理链跨多个 content chunk 到达，其中 `</think>` 被切在 chunk 边界上。
+    // The chain of thought arrives across multiple content chunks, with `</think>` split at a chunk boundary.
     for payload in [
         r#"{"choices":[{"delta":{"content":"Let me consolidate. "}}]}"#,
         r#"{"choices":[{"delta":{"content":"I have enough evidence.</thi"}}]}"#,
@@ -2460,11 +2460,11 @@ fn armed_demuxer_splits_leaked_reasoning_from_visible_content() {
         .unwrap();
     }
 
-    // `</think>` 之后的正式答案是唯一的可见正文；推理链不得泄漏进 assistant_text。
+    // The real answer after `</think>` is the only visible body; the chain of thought must not leak into assistant_text.
     assert_eq!(state.content.assistant_text, "## 结论\n不是 bug。");
     assert!(!state.content.assistant_text.contains("Let me consolidate"));
     assert!(!state.content.assistant_text.contains("</think>"));
-    // 泄漏的推理被拆回 reasoning 通道。
+    // The leaked reasoning is split back into the reasoning channel.
     assert!(
         state
             .content
@@ -2633,11 +2633,11 @@ fn output_text_snapshot_can_finish_a_partially_streamed_demux_capture() {
     assert_eq!(state.content.reasoning_text, "reasoning");
 }
 
-/// 反向断言：未 arm 的普通模型（走独立 reasoning_content 字段）行为完全不变——
-/// content 里即便出现字面量 `</think>` 也原样落进可见正文，绝不被吞。
+/// Reverse assertion: for a normal model without the splitter armed (using the separate reasoning_content
+/// field), behavior is unchanged — a literal `</think>` in content lands verbatim in the visible body and is never swallowed.
 #[test]
 fn stream_filters_rewrite_visible_content_before_commit() {
-    // 过滤器：把 "secret" 改写为 "[REDACTED]"。
+    // Filter: rewrite "secret" into "[REDACTED]".
     struct RedactFilter;
     impl crate::ai::ports::stream::StreamFilter for RedactFilter {
         fn filter(&self, chunk: &str) -> Option<String> {
@@ -2649,8 +2649,8 @@ fn stream_filters_rewrite_visible_content_before_commit() {
     }
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
-    // Step 6：注入过滤器链，验证 `process_stream_payload` 的可见内容提交点
-    // 应用了过滤器（改写进入 assistant_text / history，原文不出现）。
+    // Step 6: inject the filter chain and verify that `process_stream_payload`'s visible-content commit
+    // point applies the filters (the rewrite lands in assistant_text / history, the original text does not appear).
     state.filters = crate::ai::ports::stream::FilterChain::new().push(RedactFilter);
     let mut app = test_app();
     let mut current_history = String::new();

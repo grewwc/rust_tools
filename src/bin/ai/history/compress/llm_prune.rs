@@ -133,22 +133,32 @@ pub(crate) fn parse_prune_from_hidden_meta(hidden_meta: &str) -> (Vec<String>, S
     (prune_ids, remaining)
 }
 
-/// 更新裁剪计数（「容忍静默 + 单调累计」语义）。
+/// Updates the pruning counters ("tolerate silent rounds + monotonic
+/// accumulation" semantics).
 ///
-/// - `current_marks`: 当前会话的裁剪计数表（tool_call_id → 累计计数）
-/// - `prune_ids`: 本轮模型标记的 tool_call_id 列表
-/// - `active_prunable_tool_ids`: 本轮 messages 中实际存在、且允许裁剪的 tool_call_id 集合
+/// - `current_marks`: this session's prune counter table (tool_call_id →
+///   accumulated count)
+/// - `prune_ids`: the tool_call_ids the model marked this round
+/// - `active_prunable_tool_ids`: the tool_call_ids actually present in this
+///   round's messages and eligible for pruning
 ///
-/// 逻辑：
-/// 1. **静默轮不动计数**：本轮模型未产出任何有效 prune 指令时（`prune_ids` 里没有
-///    命中 active 的 id），整表保持不变（仅清理已离开上下文/被保护的陈旧条目）。
-///    这样"连续调工具、中间轮没写 self_note"不会误清此前攒下的计数。
-/// 2. 本轮被标记的 id 计数 +1（单调累计）。**未被标记的既有条目保持不变、不衰减**：
-///    模型每轮通常标记的是"这一轮刚用完、新变陈旧的结果"（每轮标不同 id），若对
-///    未标记项做衰减，会在计数到达阈值前把它清零，使机制在最典型用法下几乎永不
-///    触发——这正是早前 decay 版本的隐性失效。累计只增不减，直到该 id 真正离开
-///    上下文或被保护策略排除时才清除。
-/// 3. 清理已不在当前上下文、或已被保护策略排除的条目。
+/// Logic:
+/// 1. **Silent rounds never touch counters**: when the model produces no valid
+///    prune instruction this round (no id in `prune_ids` hits an active id),
+///    the whole table stays unchanged (only stale entries that left the context
+///    / are protected get cleaned up), so "back-to-back tool calls with an
+///    intermediate round that wrote no self_note" does not wrongly clear
+///    previously accumulated counts.
+/// 2. Ids marked this round get +1 (monotonic accumulation). **Existing
+///    unmarked entries stay unchanged, no decay**: each round the model usually
+///    marks "results it just finished using that have now gone stale" (a
+///    different id each round); applying decay to unmarked items would zero
+///    them before reaching the threshold, making the mechanism almost never
+///    fire under the most typical usage — exactly the hidden failure of the
+///    earlier decay version. Accumulation only grows, until the id actually
+///    leaves the context or is excluded by the protection policy.
+/// 3. Clean up entries no longer in the current context or excluded by the
+///    protection policy.
 pub(crate) fn update_prune_marks(
     current_marks: &mut FxHashMap<String, u8>,
     prune_ids: &[String],
@@ -160,22 +170,27 @@ pub(crate) fn update_prune_marks(
         .cloned()
         .collect::<FxHashSet<_>>();
 
-    // 增加被标记的 tool 的计数（单调累计；静默轮 marked_ids 为空即无操作）。
+    // Increment the counters of marked tools (monotonic accumulation; a silent
+    // round has empty marked_ids and is a no-op).
     for id in marked_ids {
         let count = current_marks.entry(id).or_insert(0);
         *count = count.saturating_add(1);
     }
 
-    // 清理计数为 0、已不在当前上下文、或已被保护策略排除的条目。
+    // Clean up entries with a zero count, no longer in the current context, or
+    // excluded by the protection policy.
     current_marks.retain(|id, v| *v > 0 && active_prunable_tool_ids.contains(id));
 }
 
-/// 收集当前上下文中允许被 LLM 引导裁剪的 tool_call_id。
+/// Collects the tool_call_ids in the current context that may be pruned under
+/// LLM guidance.
 ///
-/// 保护策略：
-/// - 最近完整工具组的结果保留全文。
-/// - 工具注册策略声明 `prune: Never` 的结果（如 `plan`）永不裁剪。
-///   注意 `read_file` / 检索类虽「不可有损压缩」但**允许**裁剪。
+/// Protection policy:
+/// - Results of the most recent complete tool group keep their full text.
+/// - Results of tools whose registration policy declares `prune: Never` (e.g.
+///   `plan`) are never pruned.
+///   Note `read_file` / retrieval-like tools, though "not lossy-compressible",
+///   **are** allowed to be pruned.
 pub(crate) fn active_prunable_tool_ids(messages: &[Message]) -> FxHashSet<String> {
     let protected_ids = protected_tool_call_ids(messages);
     messages
@@ -233,31 +248,39 @@ fn protected_tool_call_ids(messages: &[Message]) -> FxHashSet<String> {
     protected
 }
 
-/// 单次 `apply_pruning` 的裁剪统计，供调用方打印终端简讯。
+/// Pruning statistics of a single `apply_pruning` call, for the caller to
+/// print a terminal notice.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PruneReport {
-    /// 本次被卸载到磁盘、inline 替换为召回 stub 的 tool 结果条数。
+    /// Number of tool results offloaded to disk this time and inline-replaced
+    /// with a recall stub.
     pub(crate) pruned_count: usize,
-    /// 净释放的字符数（原内容长度减去 stub 长度之和）。
+    /// Net characters freed (sum of original content lengths minus stub lengths).
     pub(crate) freed_chars: usize,
-    /// 涉及的工具名（去重、按首次出现顺序）。
+    /// Tool names involved (deduplicated, in first-appearance order).
     pub(crate) tools: Vec<String>,
 }
 
-/// 对 messages 数组应用裁剪（无损可召回卸载）。
+/// Applies pruning to the messages array (lossless, recallable offload).
 ///
-/// 将计数 >= PRUNE_THRESHOLD 的 tool 消息全文卸载到会话 asset 磁盘，inline 替换为
-/// 带 `file_path` + 召回锚点 + head/tail 预览的 stub；不删除消息、不改变数组长度，
-/// 模型可随时 `read_file` 取回完整原文。
+/// Tool messages whose count >= PRUNE_THRESHOLD have their full text offloaded
+/// to the session asset directory and are inline-replaced with a stub carrying
+/// `file_path` + a recall anchor + head/tail previews; no message is deleted
+/// and the array length never changes — the model can `read_file` the full
+/// original at any time.
 ///
-/// **安全底线**：`overflow_dir=None`（无归档目录，如临时/one-shot session）时**绝不
-/// 裁剪**——宁可不压缩也不做不可逆丢弃。归档写盘失败的单条也保留原文跳过。
+/// **Safety floor**: with `overflow_dir=None` (no archive directory, e.g. a
+/// temporary/one-shot session), **never prune** — prefer not compressing over
+/// irreversible dropping. A single entry whose archive write fails also keeps
+/// its original text and is skipped.
 ///
-/// 受 `protected_tool_call_ids` 保护的消息（最近完整工具组、以及注册策略声明
-/// `prune: Never` 的工具，如 `plan`）永不被裁剪，避免误裁剪当前轮所需结果或任务
-/// 路线图锚点。
+/// Messages protected by `protected_tool_call_ids` (the most recent complete
+/// tool group, and tools whose registration policy declares `prune: Never`,
+/// e.g. `plan`) are never pruned, avoiding wrongfully pruning results needed
+/// this round or task-roadmap anchors.
 ///
-/// 返回本次裁剪的统计报告（供调用方打印终端简讯）。
+/// Returns the statistics report of this pruning run (for the caller to print
+/// a terminal notice).
 pub(crate) fn apply_pruning(
     messages: &mut [Message],
     prune_marks: &FxHashMap<String, u8>,
@@ -267,7 +290,8 @@ pub(crate) fn apply_pruning(
     if prune_marks.is_empty() {
         return report;
     }
-    // 安全底线：没有归档目录就无法无损召回，直接不裁剪。
+    // Safety floor: without an archive directory there is no lossless recall,
+    // so do not prune at all.
     if overflow_dir.is_none() {
         return report;
     }
@@ -299,7 +323,8 @@ pub(crate) fn apply_pruning(
         let Some(content) = msg.content.as_str() else {
             continue;
         };
-        // 请求投影会跨多个模型轮次复用；已卸载的 stub 不应重复计入裁剪报告。
+        // The request projection is reused across multiple model rounds; an
+        // already-offloaded stub must not be counted again in the pruning report.
         if is_preserved_tool_overflow_stub(content) {
             continue;
         }
@@ -313,8 +338,10 @@ pub(crate) fn apply_pruning(
             .map(|args| build_tool_overflow_recall_lines(tool_name, args))
             .unwrap_or_default();
 
-        // 无损卸载：全文落盘 + 生成召回 stub。归档失败（含 overflow_dir=None，
-        // 上方已提前返回）则保留原文、跳过本条，绝不做不可逆丢弃。
+        // Lossless offload: full text to disk + generate a recall stub. If
+        // archiving fails (including overflow_dir=None, which returned early
+        // above), keep the original text and skip the entry — never drop
+        // irreversibly.
         let Some(stub) = preserve_pruned_tool_result_stable(
             overflow_dir,
             &tool_call_id,
@@ -324,8 +351,10 @@ pub(crate) fn apply_pruning(
         ) else {
             continue;
         };
-        // 裁剪的目标是回收上下文；短结果若换成更长的路径 stub 只会反向膨胀。
-        // 归档是内容寻址且幂等，即使已写出也不会在后续请求重复制造副本。
+        // The goal of pruning is to reclaim context; swapping a short result for
+        // a longer path stub would only bloat it.
+        // The archive is content-addressed and idempotent, so no duplicate copies
+        // are created in later requests even if already written.
         if stub.chars().count() >= freed {
             continue;
         }
@@ -341,15 +370,18 @@ pub(crate) fn apply_pruning(
     report
 }
 
-/// 仅在当前请求里确实存在可裁剪的旧工具结果时注入协议。
+/// Injects the protocol only when the current request actually contains
+/// prunable old tool results.
 ///
-/// 这比固定消息数阈值更贴近能力边界：短对话里的超大旧结果可以及时回收；
-/// 没有工具候选的长纯对话则不浪费 prompt token。
+/// This tracks the capability boundary better than a fixed message-count
+/// threshold: oversized old results in a short conversation get reclaimed
+/// promptly, while long tool-less conversations waste no prompt tokens.
 pub(crate) fn should_inject_prune_prompt(messages: &[Message]) -> bool {
     !active_prunable_tool_ids(messages).is_empty()
 }
 
-/// 在模型请求投影中按需注入裁剪协议，且保证重复调用不产生重复提示。
+/// Injects the pruning protocol into the model request projection on demand,
+/// guaranteeing repeated calls never duplicate the prompt.
 pub(crate) fn ensure_prune_protocol_prompt(messages: &mut Vec<Message>) -> bool {
     if messages.iter().any(|message| {
         message.role == "system"
@@ -376,9 +408,12 @@ pub(crate) fn ensure_prune_protocol_prompt(messages: &mut Vec<Message>) -> bool 
     true
 }
 
-/// 在每次模型请求前更新临时投影：先无损卸载达到阈值的旧工具结果，再按需注入协议。
+/// Updates the transient projection before every model request: first
+/// losslessly offload old tool results that reached the threshold, then inject
+/// the protocol on demand.
 ///
-/// 调用方必须传入与 canonical `turn_messages` 分离的请求投影。
+/// The caller must pass a request projection kept separate from the canonical
+/// `turn_messages`.
 pub(crate) fn prepare_request_projection(
     messages: &mut Vec<Message>,
     prune_marks: &FxHashMap<String, u8>,
@@ -462,7 +497,7 @@ mod tests {
         let assistant_msg = make_assistant_message("hi");
         assert!(!is_prunable_message(&assistant_msg));
 
-        // tool 消息但没有 tool_call_id
+        // tool message but without a tool_call_id
         let tool_no_id = Message {
             role: "tool".to_string(),
             content: Value::String("result".to_string()),
@@ -517,7 +552,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
 
-        // 第一轮标记 call_1, call_2
+        // Round 1 marks call_1, call_2
         update_prune_marks(
             &mut marks,
             &["call_1".to_string(), "call_2".to_string()],
@@ -527,7 +562,7 @@ mod tests {
         assert_eq!(marks.get("call_2"), Some(&1));
         assert!(!marks.contains_key("call_3"));
 
-        // 第二轮标记 call_1, call_2
+        // Round 2 marks call_1, call_2
         update_prune_marks(
             &mut marks,
             &["call_1".to_string(), "call_2".to_string()],
@@ -536,31 +571,34 @@ mod tests {
         assert_eq!(marks.get("call_1"), Some(&2));
         assert_eq!(marks.get("call_2"), Some(&2));
 
-        // 第三轮只标记 call_1：单调累计——call_2 未被标记但**保持不变**（不衰减），
-        // call_1 继续 +1。
+        // Round 3 marks only call_1: monotonic accumulation — call_2 was not
+        // marked but **stays unchanged** (no decay), while call_1 gets +1 again.
         update_prune_marks(&mut marks, &["call_1".to_string()], &active);
         assert_eq!(marks.get("call_1"), Some(&3));
         assert_eq!(marks.get("call_2"), Some(&2));
     }
 
-    /// 真实分布验证：模型每轮标记"这一轮刚用完、新变陈旧"的**不同** id，从不重复
-    /// 标记同一个旧 id。单调累计下，各 id 的计数只增不减，多轮后能真正到达阈值
-    /// 并触发裁剪；若沿用旧的衰减语义，这里会在到阈值前被清零、永不触发。
+    /// Realistic distribution check: each round the model marks **different**
+    /// ids ("just used this round, newly stale") and never re-marks the same old
+    /// id. Under monotonic accumulation each id's count only grows, so after
+    /// several rounds the threshold is truly reached and pruning fires; under
+    /// the old decay semantics the counts would be zeroed before reaching the
+    /// threshold and never fire.
     #[test]
     fn test_update_prune_marks_distinct_ids_accumulate_monotonically() {
         let mut marks = FxHashMap::default();
         let active: FxHashSet<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
 
-        // 每轮标不同 id（真实模型行为）。
+        // Mark a different id each round (realistic model behavior).
         update_prune_marks(&mut marks, &["A".to_string()], &active);
         update_prune_marks(&mut marks, &["B".to_string()], &active);
         update_prune_marks(&mut marks, &["C".to_string()], &active);
-        // 三个 id 各累计 1，均未被衰减清零。
+        // Each of the three ids accumulated 1, none decayed to zero.
         assert_eq!(marks.get("A"), Some(&1));
         assert_eq!(marks.get("B"), Some(&1));
         assert_eq!(marks.get("C"), Some(&1));
 
-        // 再各标一轮 → 到达阈值 2，可被裁剪。
+        // Mark each one more round → threshold 2 reached, prunable.
         update_prune_marks(&mut marks, &["A".to_string()], &active);
         update_prune_marks(&mut marks, &["B".to_string()], &active);
         assert_eq!(marks.get("A"), Some(&2));
@@ -568,8 +606,10 @@ mod tests {
         assert!(marks.values().any(|v| *v >= PRUNE_THRESHOLD));
     }
 
-    /// 静默轮（本轮无任何有效 prune 标记）不得清零既有计数——这是新语义相对旧
-    /// 「连续」语义的核心修复：连续调工具的中间轮不再误清此前攒下的计数。
+    /// A silent round (no valid prune marks this round) must not zero existing
+    /// counters — this is the core fix of the new semantics over the old
+    /// "consecutive" one: intermediate rounds of back-to-back tool calls no
+    /// longer wrongly clear previously accumulated counts.
     #[test]
     fn test_update_prune_marks_silent_round_preserves_counts() {
         let mut marks = FxHashMap::default();
@@ -577,16 +617,17 @@ mod tests {
         let active: FxHashSet<String> =
             ["call_1", "call_2"].iter().map(|s| s.to_string()).collect();
 
-        // 静默轮：模型没写任何 prune 指令。
+        // Silent round: the model wrote no prune instructions.
         update_prune_marks(&mut marks, &[], &active);
-        assert_eq!(marks.get("call_1"), Some(&1)); // 计数保持，不清零
+        assert_eq!(marks.get("call_1"), Some(&1)); // count kept, not zeroed
 
-        // 之后再标记一次即可达到阈值 2。
+        // One more mark afterwards reaches threshold 2.
         update_prune_marks(&mut marks, &["call_1".to_string()], &active);
         assert_eq!(marks.get("call_1"), Some(&2));
     }
 
-    /// 静默轮仍需清理已离开上下文 / 被保护的陈旧条目，避免计数表无界增长。
+    /// Silent rounds must still clean up stale entries that left the context /
+    /// are protected, so the counter table does not grow unboundedly.
     #[test]
     fn test_update_prune_marks_silent_round_drops_stale_ids() {
         let mut marks = FxHashMap::default();
@@ -597,7 +638,7 @@ mod tests {
 
         update_prune_marks(&mut marks, &[], &active);
 
-        // call_1 仍 active → 保留；stale 已离开上下文 → 清理。
+        // call_1 still active → kept; stale already left the context → cleaned up.
         assert_eq!(marks.get("call_1"), Some(&2));
         assert!(!marks.contains_key("stale"));
     }
@@ -621,7 +662,7 @@ mod tests {
         assert!(!marks.contains_key("missing"));
     }
 
-    /// 供 apply_pruning 测试使用的临时归档目录。
+    /// Temporary archive directory for the apply_pruning tests.
     fn make_overflow_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ai-llm-prune-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -657,33 +698,36 @@ mod tests {
         let pruned = apply_pruning(&mut messages, &marks, Some(overflow_dir.as_path()));
 
         assert_eq!(pruned.pruned_count, 1);
-        // call_old 内容被卸载为可召回 stub，且含全文归档 file_path。
+        // call_old's content was offloaded into a recallable stub that contains
+        // the full-text archive file_path.
         let stub = messages[1].content.as_str().unwrap();
         assert!(stub.contains("file_path:"));
-        // 全文确实落盘可召回（stub 本身可能含 head/tail 预览，故不断言"不含原文"）。
+        // The full text really is on disk and recallable (the stub itself may
+        // contain head/tail previews, so we do not assert "original text absent").
         let path_line = stub
             .lines()
             .find_map(|line| line.trim().strip_prefix("- file_path: "))
             .expect("stub must carry an archived file_path");
         let archived = std::fs::read_to_string(path_line.trim()).unwrap();
         assert!(archived.contains("very long outdated result that should be pruned"));
-        // call_keep 内容不变（计数 < threshold）
+        // call_keep's content unchanged (count < threshold)
         assert_eq!(
             messages[3].content.as_str().unwrap(),
             "still relevant result"
         );
-        // 最近 tool 窗口内容不变
+        // Recent tool window content unchanged
         assert_eq!(
             messages[5].content.as_str().unwrap(),
             "current turn result 1"
         );
-        // user 消息不变
+        // user message unchanged
         assert_eq!(messages[12].content.as_str().unwrap(), "what about this?");
 
         std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
-    /// 安全底线：无归档目录（overflow_dir=None）时绝不裁剪，保留全文原样。
+    /// Safety floor: with no archive directory (overflow_dir=None), never prune
+    /// — keep the full text as is.
     #[test]
     fn test_apply_pruning_skips_without_overflow_dir() {
         let mut marks = FxHashMap::default();
@@ -713,7 +757,8 @@ mod tests {
         );
     }
 
-    /// 幂等性：同一条被裁剪的消息重复裁剪，stub 文本逐轮稳定（保 prompt cache）。
+    /// Idempotence: re-pruning the same pruned message keeps the stub text
+    /// stable across rounds (protecting the prompt cache).
     #[test]
     fn test_apply_pruning_is_idempotent_across_turns() {
         let overflow_dir = make_overflow_dir();
@@ -766,7 +811,8 @@ mod tests {
 
         let pruned = apply_pruning(&mut messages, &marks, Some(overflow_dir.as_path()));
 
-        // call_last 所在的最近完整工具组受保护，不被裁剪。
+        // The most recent complete tool group containing call_last is protected
+        // and not pruned.
         assert_eq!(pruned.pruned_count, 0);
         assert_eq!(messages[3].content.as_str().unwrap(), "most recent result");
 
@@ -791,7 +837,8 @@ mod tests {
     fn test_apply_pruning_never_touches_user_or_assistant() {
         let overflow_dir = make_overflow_dir();
         let mut marks = FxHashMap::default();
-        // 即使 user/assistant 有对应的 "tool_call_id"，也不会被裁剪
+        // Even when user/assistant messages carry a matching "tool_call_id",
+        // they are not pruned
         marks.insert("call_1".to_string(), PRUNE_THRESHOLD);
         marks.insert("call_2".to_string(), PRUNE_THRESHOLD);
 
@@ -851,9 +898,10 @@ mod tests {
         assert!(!ids.contains("call_recent_1"));
     }
 
-    /// 解耦不变量：`read_file` 声明 `lossy_compress: Never` 但 `prune: Allow`，
-    /// 因此虽然「不可有损压缩」，其过时旧结果仍可被 LLM 裁剪。而 `plan`
-    /// 声明 `prune: Never`，永不进入裁剪候选。
+    /// Decoupling invariant: `read_file` declares `lossy_compress: Never` but
+    /// `prune: Allow`, so although it is "not lossy-compressible", its stale old
+    /// results may still be pruned under LLM guidance. `plan` declares
+    /// `prune: Never` and never becomes a pruning candidate.
     #[test]
     fn test_active_prunable_allows_read_file_but_protects_plan() {
         let messages = vec![
@@ -877,9 +925,10 @@ mod tests {
 
         let ids = active_prunable_tool_ids(&messages);
 
-        // read_file 现在允许裁剪（旧行为下会被排除）。
+        // read_file is now prunable (it would have been excluded under the old
+        // behavior).
         assert!(ids.contains("call_read"));
-        // plan 仍受注册策略保护，永不裁剪。
+        // plan remains protected by its registration policy and is never pruned.
         assert!(!ids.contains("call_plan"));
     }
 
@@ -1063,7 +1112,8 @@ mod tests {
 
     #[test]
     fn test_prune_threshold_is_reasonable() {
-        // 确保阈值不是 0（每轮都触发），也不超过 10（太保守）
+        // Ensure the threshold is neither 0 (would fire every round) nor above
+        // 10 (too conservative)
         assert!(PRUNE_THRESHOLD >= 1);
         assert!(PRUNE_THRESHOLD <= 10);
     }
@@ -1104,7 +1154,7 @@ mod tests {
         let len_after = messages.len();
 
         assert_eq!(len_before, len_after);
-        assert_eq!(pruned.pruned_count, 3); // 最近 4 组工具受保护
+        assert_eq!(pruned.pruned_count, 3); // the most recent 4 tool groups are protected
 
         std::fs::remove_dir_all(&overflow_dir).ok();
     }

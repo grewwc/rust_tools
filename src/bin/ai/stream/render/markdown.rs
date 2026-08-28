@@ -278,7 +278,7 @@ impl MarkdownStreamRenderer {
     fn flush_pending_for_test(&mut self) -> io::Result<String> {
         let mut out = Vec::new();
 
-        // 收尾时残留的缓存空行属于尾随空行，直接丢弃（不落地）。
+        // Blank lines still cached at flush time are trailing blanks; discard (do not emit).
         self.deferred_blank_lines = 0;
 
         if !self.line_buf.is_empty() {
@@ -319,17 +319,17 @@ impl MarkdownStreamRenderer {
         }
 
         let state = std::mem::replace(&mut self.table_state, TableState::None);
-        // 收尾前先清掉可能残留的表格占位提示（上移量恒为 1，不依赖折行预测）。
+        // Before finishing, clear any leftover table placeholder (always 1 line up; no wrap prediction).
         let mut rendered = self.clear_table_placeholder();
         rendered.push_str(&match state {
             TableState::None => String::new(),
-            // 表头行后流已结束、始终没等到分隔行——它只是含 `|` 的普通文本行。
-            // 全程未 echo，直接当普通行渲染即可。
+            // The stream ended after the header row and no separator ever arrived — just an
+            // ordinary text line containing `|`; nothing was echoed, so render it as a plain line.
             TableState::PendingHeader {
                 indent,
                 header_line,
             } => self.render_buffered_plain(&indent, &header_line),
-            // 表格在流结束时收尾：一次性画出成品盒框表，无 cursor-up。
+            // Table finishing at end of stream: draw the final boxed table in one shot, no cursor-up.
             TableState::InTable {
                 indent,
                 header,
@@ -625,7 +625,7 @@ impl MarkdownStreamRenderer {
     pub(in crate::ai::stream) fn flush_pending(&mut self) -> io::Result<()> {
         let mut out = io::stdout();
 
-        // 收尾时残留的缓存空行属于尾随空行，直接丢弃（不落地）。
+        // Blank lines still cached at flush time are trailing blanks; discard (do not emit).
         self.deferred_blank_lines = 0;
 
         if !self.line_buf.is_empty() {
@@ -689,17 +689,17 @@ impl MarkdownStreamRenderer {
         }
 
         let state = std::mem::replace(&mut self.table_state, TableState::None);
-        // 收尾前先清掉可能残留的表格占位提示（上移量恒为 1，不依赖折行预测）。
+        // Before finishing, clear any leftover table placeholder (always 1 line up; no wrap prediction).
         let mut rendered = self.clear_table_placeholder();
         rendered.push_str(&match state {
             TableState::None => String::new(),
-            // 表头行后流已结束、始终没等到分隔行——它只是含 `|` 的普通文本行。
-            // 全程未 echo，直接当普通行渲染即可。
+            // The stream ended after the header row and no separator ever arrived — just an
+            // ordinary text line containing `|`; nothing was echoed, so render it as a plain line.
             TableState::PendingHeader {
                 indent,
                 header_line,
             } => self.render_buffered_plain(&indent, &header_line),
-            // 表格在流结束时收尾：一次性画出成品盒框表，无 cursor-up。
+            // Table finishing at end of stream: draw the final boxed table in one shot, no cursor-up.
             TableState::InTable {
                 indent,
                 header,

@@ -31,9 +31,9 @@ pub(super) enum TableAlign {
 }
 
 pub(super) fn table_preview_height(line: &str) -> usize {
-    // 数的是"原样写入终端的预览行"占多少物理行，终端按 **真实** 列宽（raw_cols）
-    // 自动折行，因此不能用保留右边距的 terminal_width，否则会高估行数、导致 cursor-up
-    // 越界清屏。
+    // This counts how many physical rows the "preview lines written verbatim to the terminal"
+    // occupy. The terminal wraps them at the **real** column width (raw_cols), so the margin-aware
+    // terminal_width must not be used — it overestimates the row count and makes cursor-up erase past the top.
     let visible = strip_ansi_codes(line);
     let cols = raw_cols().max(1);
     let mut lines = 1usize;
@@ -242,13 +242,13 @@ fn split_table_segments(s: &str) -> Vec<String> {
     let mut chars = s.chars().peekable();
     let mut in_code = false;
     let mut in_math = false;
-    let mut math_delim = ""; // "$" or "$$"，记录进入数学段时的分隔符
+    let mut math_delim = ""; // "$" or "$$": the delimiter active when the math segment was entered
     let mut in_strike = false;
     let mut escaped = false;
 
-    /// 向前查找未转义的目标字符。用于判断分隔符是否有配对，
-    /// 避免未闭合的 `、$ 把 in_code/in_math 卡死在 true，
-    /// 导致后续 | 无法被识别为列分隔符。
+    /// Scans forward for an unescaped target character. Used to check whether a delimiter has a
+    /// matching pair, so an unclosed ` or $ cannot leave in_code/in_math stuck at true and make
+    /// later | pipes unrecognized as column separators.
     fn has_matching_delim(chars: &std::iter::Peekable<std::str::Chars>, target: char) -> bool {
         let mut la = chars.clone();
         let mut esc = false;
@@ -268,17 +268,17 @@ fn split_table_segments(s: &str) -> Vec<String> {
         false
     }
 
-    /// 向前查找未转义的双字符分隔符（用于 ~~ 和 $$）。
+    /// Scans forward for an unescaped two-character delimiter (used for ~~ and $$).
     fn has_matching_delim_pair(
         chars: &std::iter::Peekable<std::str::Chars>,
         first: char,
         second: char,
     ) -> bool {
         let mut la = chars.clone();
-        // 跳过当前 peek 位置的字符——它是开分隔符的一部分（如 $$ 的第二个 $），
-        // 不能把它和后面的字符凑成"闭合对"。例如 $$$ 中，开分隔符占前两个 $，
-        // 如果不跳过，lookahead 会把第 2、3 个 $ 误判为闭合 $$，
-        // 导致错误地进入数学模式而永远无法退出。
+        // Skip the character at the current peek position — it is part of the opening delimiter
+        // (e.g. the second $ of $$) and must not be paired with the following characters into a
+        // "closing pair". In $$$, the opening delimiter takes the first two $; if not skipped, the
+        // lookahead would misread the 2nd and 3rd $ as a closing $$ and enter math mode forever.
         la.next();
         let mut esc = false;
         while let Some(c) = la.next() {
@@ -310,17 +310,17 @@ fn split_table_segments(s: &str) -> Vec<String> {
             continue;
         }
 
-        // ~~strikethrough~~：跟踪状态，避免 ~~ 内的 | 被误识别为列分隔符
+        // ~~strikethrough~~: track the state so a | inside ~~ is not misread as a column separator
         if ch == '~' && !in_code && !in_math && chars.peek().copied() == Some('~') {
             if in_strike {
-                // 已在删除线内：这是闭合 ~~
+                // Already inside a strikethrough: this is the closing ~~
                 chars.next();
                 in_strike = false;
                 current.push('~');
                 current.push('~');
                 continue;
             }
-            // 不在删除线内：检查是否有配对的 ~~
+            // Not inside a strikethrough: check for a matching ~~ pair
             if has_matching_delim_pair(&chars, '~', '~') {
                 chars.next();
                 in_strike = true;
@@ -332,13 +332,13 @@ fn split_table_segments(s: &str) -> Vec<String> {
 
         if ch == '`' {
             if in_code {
-                // 已在代码段内：这是闭合反引号
+                // Already inside a code span: this is the closing backtick
                 in_code = false;
                 current.push(ch);
                 continue;
             }
             if !in_math && has_matching_delim(&chars, '`') {
-                // 不在代码段内且能找到配对反引号：进入代码段
+                // Not inside a code span and a matching backtick exists: enter the code span
                 in_code = true;
                 current.push(ch);
                 continue;
@@ -347,10 +347,10 @@ fn split_table_segments(s: &str) -> Vec<String> {
 
         if ch == '$' && !in_code {
             if in_math {
-                // 已在数学段内：按进入时的分隔符类型决定是否闭合
+                // Already inside a math segment: decide closure by the delimiter type entered with
                 match math_delim {
                     "$$" if chars.peek().copied() == Some('$') => {
-                        // $$ 段遇到 $$ 对：闭合
+                        // A $$ segment meeting a $$ pair: close
                         chars.next();
                         in_math = false;
                         math_delim = "";
@@ -359,19 +359,19 @@ fn split_table_segments(s: &str) -> Vec<String> {
                         continue;
                     }
                     "$" => {
-                        // $ 段遇到单个 $：闭合（即使后面跟着 $）
+                        // A $ segment meeting a single $: close (even if a $ follows)
                         in_math = false;
                         math_delim = "";
                         current.push(ch);
                         continue;
                     }
                     _ => {
-                        // $$ 段内的单个 $（peek 不是 $），或未知状态：
-                        // 按字面量处理，不闭合，fall through 到 current.push(ch)
+                        // A single $ inside a $$ segment (peek is not $), or an unknown state:
+                        // treat it literally, do not close, and fall through to current.push(ch)
                     }
                 }
             }
-            // 不在数学段内：检查配对
+            // Not inside a math segment: check for a pair
             if chars.peek().copied() == Some('$') {
                 if has_matching_delim_pair(&chars, '$', '$') {
                     chars.next();
@@ -415,11 +415,11 @@ fn pad_cell(s: &str, width: usize, align: TableAlign) -> String {
     }
 }
 
-/// 先渲染 inline markdown，再按渲染后的实际显示宽度补空格。
+/// Render inline markdown first, then pad spaces based on the rendered display width.
 ///
-/// 不能用 `pad_cell` + `render_inline_md(padded)` 的顺序：`pad_cell` 基于
-/// `visible_width`（会剥离未闭合的 `、**、* 标记），但 `render_inline_md` 遇到
-/// 未闭合标记会原样输出为字面字符，导致实际宽度 > 预期，表格边框错位。
+/// The `pad_cell` + `render_inline_md(padded)` order must not be used: `pad_cell` relies on
+/// `visible_width` (which strips unclosed `, **, and * markers), but `render_inline_md` emits
+/// unclosed markers verbatim as literal characters, making the real width exceed the estimate and misaligning table borders.
 fn render_and_pad_cell(cell_line: &str, width: usize, align: TableAlign, base: &str) -> String {
     let rendered = render_inline_md(cell_line, base);
     // Strip redundant VS16 from the rendered text. When VS16 follows an
@@ -672,8 +672,9 @@ pub(super) fn render_table_row(
 }
 
 fn terminal_width() -> usize {
-    // 与 markdown.rs::preview_terminal_width 保持一致：保留 4 列右安全边距，
-    // 避免表格 │ 边框紧贴终端右缘触发自动换行，破坏 box-drawing。
+    // Matches markdown.rs::preview_terminal_width: keep a 4-column right safety margin so the
+    // table │ borders never sit flush against the terminal's right edge, which would trigger
+    // automatic wrapping and break the box-drawing layout.
     const RIGHT_MARGIN: usize = 4;
     const MIN_WIDTH: usize = 20;
 
@@ -682,9 +683,10 @@ fn terminal_width() -> usize {
 }
 
 fn raw_cols() -> usize {
-    // 与 markdown.rs::raw_terminal_cols 保持一致：实时 ioctl 优先，COLUMNS 仅作非 tty
-    // 回退。常驻进程在面板里被拖窄后 COLUMNS 是过时快照，用它算表格宽度会超出真实
-    // 面板、被终端硬折行，导致 │ 边框错位。
+    // Matches markdown.rs::raw_terminal_cols: prefer a live ioctl query and use COLUMNS only as
+    // a non-tty fallback. After a resident process is narrowed inside a panel, COLUMNS is a stale
+    // snapshot; computing table width from it overflows the real panel, gets hard-wrapped by the
+    // terminal, and misaligns the │ borders.
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -723,15 +725,18 @@ mod tests {
 
     #[test]
     fn parse_table_row_handles_unpaired_backticks() {
-        // 三个反引号（奇数）不应把 in_code 卡死在 true，否则尾随 | 无法被识别为列分隔符。
-        // 修复前：split_table_segments 每遇到一个 ` 就翻转 in_code，
-        //   ``` 后 in_code=true，后续 | 被当字面量，整行只解析出 1 个 cell。
-        // 修复后：只有找到配对反引号才进入 in_code，未配对的 ` 按字面量处理。
+        // An odd number of three backticks must not leave in_code stuck at true, otherwise the
+        // trailing | can no longer be recognized as a column separator.
+        // Before the fix: split_table_segments toggled in_code on every backtick; after ``` the
+        //   in_code flag was true and later | characters were treated as literals, so the whole
+        //   row parsed as a single cell.
+        // After the fix: in_code is entered only when a paired backtick exists; unpaired ` is
+        //   treated as a literal.
         assert_eq!(
             parse_table_row("| context 行漏前导空格 | ❌ invalid hunk line: ``` |"),
             vec!["context 行漏前导空格", "❌ invalid hunk line: ```"]
         );
-        // 单个未闭合反引号也应按字面量处理
+        // A single unclosed backtick should also be treated as a literal
         assert_eq!(
             parse_table_row("| foo `bar | baz |"),
             vec!["foo `bar", "baz"]
@@ -740,70 +745,70 @@ mod tests {
 
     #[test]
     fn parse_table_row_handles_unpaired_dollar() {
-        // 未配对的 $ 不应把 in_math 卡死在 true
+        // An unpaired $ must not leave in_math stuck at true
         assert_eq!(
             parse_table_row("| foo $bar | baz |"),
             vec!["foo $bar", "baz"]
         );
-        // 三个 $（奇数）也应正确处理
+        // Three $ characters (odd count) should also be handled correctly
         assert_eq!(parse_table_row("| a $$$ b | c |"), vec!["a $$$ b", "c"]);
     }
 
     #[test]
     fn parse_table_row_dollar_inside_code_is_literal() {
-        // $ 在反引号代码段内不触发数学模式
+        // $ inside a backtick code span must not trigger math mode
         assert_eq!(parse_table_row("| `a$b` | c |"), vec!["`a$b`", "c"]);
     }
 
     #[test]
     fn parse_table_row_single_dollar_math_closes_at_single_dollar() {
-        // 用单 $ 进入的数学段，遇到 $$ 时应在第一个 $ 处闭合，
-        // 第二个 $ 按字面量处理（可能开启新的数学段）。
-        // 关键：$a$$b$ 中，$a$ 是一个数学段，$b$ 是另一个。
+        // For a math span entered with a single $, a $$ sequence must close the span at the
+        // first $; the second $ is treated as a literal (it may open a new math span).
+        // Key case: in $a$$b$, $a$ is one math span and $b$ is another.
         let cells = parse_table_row("| $a$$b$ | c |");
-        // 两个 cell：第一个含 "$a$$b$"（两个相邻数学段），第二个是 "c"
+        // Two cells: the first contains "$a$$b$" (two adjacent math spans), the second is "c"
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[1], "c");
-        // 第一个 cell 的内容应包含所有 $ 符号
+        // The first cell's content must contain all $ characters
         assert!(cells[0].contains("$$b$"));
     }
 
     #[test]
     fn parse_table_row_double_dollar_math_requires_double_dollar_to_close() {
-        // 用 $$ 进入的数学段，单个 $ 不应触发闭合
+        // For a math span entered with $$, a single $ must not trigger closure
         let cells = parse_table_row("| $$a$b$$ | c |");
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[1], "c");
-        // $$a$b$$ 中，$ 是 $$ 段内的字面量，整段是一个数学 span
+        // In $$a$b$$, the $ is a literal inside the $$ span; the whole run is one math span
         assert_eq!(cells[0], "$$a$b$$");
     }
 
     #[test]
     fn parse_table_row_handles_unpaired_strikethrough() {
-        // 未配对的 ~~ 应按字面量处理，不应把 in_strike 卡死
+        // Unpaired ~~ must be treated as literals and must not leave in_strike stuck
         assert_eq!(parse_table_row("| ~~a | b |"), vec!["~~a", "b"]);
-        // 三个 ~~ 序列（奇数）也应正确处理
+        // Three ~~ sequences (odd count) should also be handled correctly
         assert_eq!(parse_table_row("| ~~a~~b~~ | c |"), vec!["~~a~~b~~", "c"]);
     }
 
     #[test]
     fn parse_table_row_escaped_delimiters() {
-        // 转义的反引号不应触发代码段
+        // An escaped backtick must not open a code span
         assert_eq!(parse_table_row(r#"| \`a\` | b |"#), vec![r#"\`a\`"#, "b"]);
-        // 转义的 $ 不应触发数学段
+        // An escaped $ must not open a math span
         assert_eq!(parse_table_row(r#"| \$a\$ | b |"#), vec![r#"\$a\$"#, "b"]);
     }
 
     #[test]
     fn parse_table_row_pipe_inside_math_is_literal() {
-        // $ 段内的 | 应被当作字面量
+        // A | inside a $ math span must be treated as a literal
         assert_eq!(parse_table_row("| $a|b$ | c |"), vec!["$a|b$", "c"]);
     }
 
     #[test]
     fn parse_table_row_adjacent_code_spans() {
-        // 相邻的反引号代码段：`a`b`c` 应被解析为 `a` + `c` 两个代码段
-        // 中间的 b 是普通文本，| 不应被误吞
+        // Adjacent backtick code spans: `a`b`c` should be parsed as two code spans `a` + `c`,
+        // with the middle b as plain text; the | must not be swallowed
         let cells = parse_table_row("| `a`b`c` | d |");
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[1], "d");
@@ -816,7 +821,7 @@ mod tests {
             parse_table_row(r#"| ~~a|b~~ | normal |"#),
             vec!["~~a|b~~", "normal"]
         );
-        // 多个 ~~ 段 + 普通文本混合
+        // Multiple ~~ spans mixed with plain text
         assert_eq!(
             parse_table_row(r#"| ~~x|y~~ | z | ~~w|v~~ |"#),
             vec!["~~x|y~~", "z", "~~w|v~~"]
@@ -907,10 +912,11 @@ mod tests {
         let w2 = visible_width("💧湿度");
         let w3 = visible_width("🍃空气质量");
 
-        // 宽度模型对 U+FE0F 一律 +1，把需要 VS16 才呈现成 emoji 的 base 撑到 2 列，
-        // 与真实终端一致。🌧️ = U+1F327(unicode-width=1) + U+FE0F(+1) = 2 列，
-        // "天气" 4 列，合计 6。旧代码把 VS16 当 0 列，🌧️ 只算 1 列，比终端窄 1 列，
-        // 正是表格被硬折行、表头残留堆叠的根因。
+        // The width model always adds +1 for U+FE0F, widening a base character that needs VS16 to
+        // render as emoji to 2 columns, matching real terminals. 🌧️ = U+1F327(unicode-width=1) +
+        // U+FE0F(+1) = 2 columns; "天气" is 4 columns, totaling 6. The old code counted VS16 as 0
+        // columns, so 🌧️ measured 1 column — one narrower than the terminal. That was the root
+        // cause of tables being hard-wrapped with header residue piling up.
         assert_eq!(w1, 6);
         assert_eq!(w2, 6); // 💧(2) + 湿(2) + 度(2)
         assert_eq!(w3, 10); // 🍃(2) + 空气质量(8)
@@ -940,7 +946,8 @@ mod tests {
             );
         }
 
-        // 顶部边框应连成 box-drawing 线段（┌─...─┬─...─┐），确保观感为实线而非虚线。
+        // The top border must form a continuous box-drawing line (┌─...─┬─...─┐), appearing as a
+        // solid line rather than a dashed one.
         let top = render_table_top("", &widths);
         assert!(
             top.contains('┌') && top.contains('┬') && top.contains('┐'),
@@ -951,9 +958,9 @@ mod tests {
 
     #[test]
     fn render_and_pad_cell_compensates_for_unclosed_marker_literal_output() {
-        // 未闭合的 `、**、* 标记会被 render_inline_md 当字面字符输出（而非剥离），
-        // 导致渲染后的实际显示宽度 > visible_width 预估值。
-        // render_and_pad_cell 必须基于渲染后的实际宽度补空格。
+        // Unclosed `, **, and * markers are emitted by render_inline_md as literal characters
+        // (rather than stripped), so the rendered real display width exceeds the visible_width
+        // estimate. render_and_pad_cell must pad based on the actual width after rendering.
         use crate::ai::stream::extract::strip_ansi_codes;
 
         fn rendered_display_width(s: &str) -> usize {
@@ -961,7 +968,8 @@ mod tests {
             terminal_display_width(visible.as_str())
         }
 
-        // 目标宽度 10；未闭合反引号：visible_width 剥离 `，但 render_inline_md 原样输出
+        // Target width 10; unclosed backtick: visible_width strips the ` but render_inline_md
+        // outputs it verbatim
         let padded = render_and_pad_cell("`foo", 10, TableAlign::Left, "");
         let actual_w = rendered_display_width(&padded);
         assert_eq!(
@@ -969,7 +977,7 @@ mod tests {
             "unclosed backtick: padded width should be 10, got {actual_w}, padded={padded:?}"
         );
 
-        // 未闭合 **：visible_width 剥离 **，但 render_inline_md 原样输出（+2 列）
+        // Unclosed **: visible_width strips it but render_inline_md outputs it verbatim (+2 cols)
         let padded = render_and_pad_cell("**foo", 10, TableAlign::Left, "");
         let actual_w = rendered_display_width(&padded);
         assert_eq!(
@@ -977,7 +985,7 @@ mod tests {
             "unclosed **: padded width should be 10, got {actual_w}, padded={padded:?}"
         );
 
-        // 未闭合 *：visible_width 剥离 *，但 render_inline_md 原样输出（+1 列）
+        // Unclosed *: visible_width strips it but render_inline_md outputs it verbatim (+1 col)
         let padded = render_and_pad_cell("*foo", 10, TableAlign::Left, "");
         let actual_w = rendered_display_width(&padded);
         assert_eq!(
@@ -985,7 +993,7 @@ mod tests {
             "unclosed *: padded width should be 10, got {actual_w}, padded={padded:?}"
         );
 
-        // 闭合标记应该正常工作
+        // Closed markers should work normally
         let padded = render_and_pad_cell("`foo`", 10, TableAlign::Left, "");
         let actual_w = rendered_display_width(&padded);
         assert_eq!(

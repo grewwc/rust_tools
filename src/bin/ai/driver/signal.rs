@@ -11,39 +11,53 @@ static REQUEST_INTERRUPT_FUTEX: LazyLock<Mutex<Option<(usize, FutexAddr)>>> =
     LazyLock::new(|| Mutex::new(None));
 static REQUEST_INTERRUPT_FLAG: AtomicBool = AtomicBool::new(false);
 static REQUEST_INTERRUPT_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
-// 仅记录由 Ctrl+C 触发的会话退出；`/sessions close` 等主动退出不能被误判为挂起。
+// Records only session exits triggered by Ctrl+C; proactive exits such as
+// `/sessions close` must not be misdetected as a suspension.
 static SIGINT_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// 当前正在前台同步执行（阻塞父 turn）的子 agent 注册表。
+/// Registry of sub-agents currently executing in the foreground synchronously
+/// (blocking the parent turn).
 ///
-/// 同步 `task` 工具在 `execute_sync_task` 里阻塞父 turn 等待子 agent 完成，
-/// 期间父 agent 自身既不流式也不在迭代循环里——它“卡”在工具调用里。此时按
-/// Ctrl+C，若只看全局 shutdown/streaming 标志会直接把整个主 agent 关掉
-/// （子 agent 还卡在静默的 prepare 阶段、streaming=false，于是走 Shutdown 分支）。
+/// The sync `task` tool blocks the parent turn inside `execute_sync_task` while
+/// waiting for the sub-agent to finish; during that window the parent agent
+/// itself neither streams nor sits in its iteration loop — it is "stuck" inside
+/// a tool call. Pressing Ctrl+C then, judging only by the global
+/// shutdown/streaming flags, would shut the whole main agent down (the
+/// sub-agent is still stuck in the silent prepare phase with streaming=false,
+/// so the Shutdown branch wins).
 ///
-/// 注册表让 SIGINT 先定向取消"最近一个前台子 agent"：第一次 Ctrl+C 只翻该子
-/// agent 自己的 cancel 标志（绝不碰全局 shutdown），父 turn 拿到子 agent 的取消
-/// 错误后继续存活；若子 agent 卡死（已请求取消仍留在栈里）、再次按 Ctrl+C 则直接
-/// 锁无关强制退出——软取消已证明无效，且前台 turn 活动标志会把 sigint_action
-/// 永久锁在 CancelStream 上（见 probe_foreground_subagent）。
+/// This registry lets SIGINT first target-cancel the "most recent foreground
+/// sub-agent": the first Ctrl+C only flips that sub-agent's own cancel flag
+/// (never touching the global shutdown), and the parent turn survives after
+/// receiving the sub-agent's cancellation error; if the sub-agent is stuck
+/// (cancel requested but still on the stack), a second Ctrl+C goes straight to
+/// the lock-free forced exit — soft cancellation has proven ineffective, and
+/// the foreground turn activity flag would keep sigint_action permanently
+/// latched on CancelStream (see probe_foreground_subagent).
 ///
-/// 用栈支持嵌套子 agent：定向取消总是作用于栈顶（最深、最新派发）的那个。
+/// A stack supports nested sub-agents: targeted cancellation always applies to
+/// the top of the stack (deepest, most recently dispatched).
 struct ForegroundSubagent {
     id: u64,
-    /// 子 agent 私有的 cancel 标志，翻位后由进程级中断通知唤醒其等待路径。
+    /// The sub-agent's private cancel flag; once flipped, the process-level
+    /// interrupt notification wakes its wait path.
     cancel: Arc<AtomicBool>,
-    /// 是否已请求过取消（用于把"二次 Ctrl+C"识别为卡死升级）。
+    /// Whether cancellation has already been requested (used to recognize a
+    /// "second Ctrl+C" as a stuck-state escalation).
     cancel_requested: bool,
 }
 
-/// 一次 SIGINT 对前台子 agent 的探测结果。
+/// The result of probing how one SIGINT should act on the foreground sub-agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForegroundSubagentProbe {
-    /// 没有可定向的子 agent（栈空），本次中断未被消费，走正常 sigint_action。
+    /// No targetable sub-agent (stack empty); this interrupt was not consumed
+    /// and normal sigint_action applies.
     None,
-    /// 已定向取消栈顶子 agent（翻了其 cancel 标志并发通知），本次中断被消费。
+    /// Targeted cancellation of the top-of-stack sub-agent happened (its cancel
+    /// flag was flipped and it was notified); this interrupt was consumed.
     Cancelled,
-    /// 栈顶子 agent 此前已被请求取消却仍未退出 → 卡死，软取消已无效，应强制退出。
+    /// The top-of-stack sub-agent was previously asked to cancel but still has
+    /// not exited → stuck; soft cancellation is exhausted and a forced exit is due.
     Stuck,
 }
 
@@ -51,20 +65,26 @@ static FOREGROUND_SUBAGENTS: LazyLock<Mutex<Vec<ForegroundSubagent>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static FOREGROUND_SUBAGENT_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// 前台 turn 是否正在执行。由前台 `run_turn` 通过 `ForegroundTurnGuard` 抬起，
-/// 覆盖 prepare / 思考 / 模型流 / 工具执行 / mid-turn 压缩 / 阶段切换的整个生命周期。
+/// Whether a foreground turn is currently executing. Raised by the foreground
+/// `run_turn` via `ForegroundTurnGuard`, covering the whole lifecycle of
+/// prepare / thinking / model streaming / tool execution / mid-turn compression
+/// / phase switching.
 ///
-/// `app.streaming` 只在「模型流」和「工具执行」两个子阶段抬起，阶段之间以及
-/// prepare / 压缩 / 思考期间为 false。仅凭 streaming 判定会让这些空窗里的
-/// Ctrl+C 落入 `Shutdown` 分支、直接退出整个交互式会话。该标志补齐「当前有前台
-/// turn 在跑」这一事实，使空窗里的 Ctrl+C 也走「取消本轮」而非「退出会话」。
+/// `app.streaming` is raised only in the "model streaming" and "tool execution"
+/// sub-phases, and is false between phases and during prepare / compression /
+/// thinking. Relying on streaming alone would make Ctrl+C in those gaps fall
+/// into the `Shutdown` branch and exit the whole interactive session. This flag
+/// supplies the missing fact "a foreground turn is running", so Ctrl+C in the
+/// gaps cancels the turn instead of quitting the session.
 ///
-/// 子 agent（sync / background）各自持有私有标志，且其 `run_turn` 不抬此标志，
-/// 因此该标志只反映「前台主 turn」的活动状态。
+/// Sub-agents (sync / background) hold their own private flags, and their
+/// `run_turn` does not raise this flag, so it reflects only the activity of the
+/// "foreground main turn".
 static FOREGROUND_TURN_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// RAII 守卫：前台 `run_turn` 进入时抬起 `FOREGROUND_TURN_ACTIVE`，
-/// drop（正常返回 / 提前 return / panic）时落下，保证标志不泄漏陈旧状态。
+/// RAII guard: raises `FOREGROUND_TURN_ACTIVE` when the foreground `run_turn`
+/// enters, and lowers it on drop (normal return / early return / panic) so the
+/// flag never leaks stale state.
 pub(in crate::ai) struct ForegroundTurnGuard;
 
 impl ForegroundTurnGuard {
@@ -84,8 +104,9 @@ fn foreground_turn_active() -> bool {
     FOREGROUND_TURN_ACTIVE.load(Ordering::Relaxed)
 }
 
-/// RAII 守卫：`execute_sync_task` 派发前台子 agent 时注册其 cancel 标志，
-/// drop（含 panic / 提前 return）时自动注销，保证注册表不泄漏陈旧条目。
+/// RAII guard: registers a foreground sub-agent's cancel flag when
+/// `execute_sync_task` dispatches it, and deregisters it automatically on drop
+/// (including panic / early return) so the registry never leaks stale entries.
 pub(in crate::ai) struct ForegroundSubagentGuard {
     id: u64,
 }
@@ -112,12 +133,15 @@ impl Drop for ForegroundSubagentGuard {
     }
 }
 
-/// 探测一次 SIGINT 应如何作用于栈顶前台子 agent，并可能定向取消它。
+/// Probes how one SIGINT should act on the top-of-stack foreground sub-agent,
+/// possibly canceling it in a targeted way.
 ///
-/// 见 [`ForegroundSubagentProbe`] 的三个变体的语义。其中 `Stuck` 是此前
-/// `try_cancel_foreground_subagent() -> bool` 用 `false` 糊在一起的两种情况之一
-/// （栈空 / 卡死），调用方必须区分：栈空走正常 sigint_action，卡死则直接强制退出，
-/// 否则会被 `foreground_turn_active()==true` 永久锁在 CancelStream 上。
+/// See the semantics of the three [`ForegroundSubagentProbe`] variants. `Stuck`
+/// is one of the two cases that `try_cancel_foreground_subagent() -> bool` used
+/// to lump together as `false` (empty stack / stuck); callers must distinguish
+/// them: an empty stack takes normal sigint_action, a stuck sub-agent goes
+/// straight to forced exit, otherwise `foreground_turn_active()==true` keeps it
+/// latched on CancelStream forever.
 fn probe_foreground_subagent() -> ForegroundSubagentProbe {
     let cancel_flag = {
         let Ok(mut stack) = FOREGROUND_SUBAGENTS.lock() else {
@@ -127,30 +151,36 @@ fn probe_foreground_subagent() -> ForegroundSubagentProbe {
             return ForegroundSubagentProbe::None;
         };
         if top.cancel_requested {
-            // 已请求过取消但子 agent 还在栈里 → 卡死。软取消已证明无效（若有效，
-            // 该 guard 早已随 execute_sync_task 返回而 drop），必须升级到强制退出。
+            // Cancellation was requested but the sub-agent is still on the stack →
+            // stuck. Soft cancellation has proven ineffective (if it worked, this
+            // guard would already have dropped when execute_sync_task returned), so
+            // escalation to a forced exit is required.
             return ForegroundSubagentProbe::Stuck;
         }
         top.cancel_requested = true;
         top.cancel.clone()
     };
     cancel_flag.store(true, Ordering::Relaxed);
-    // 定向取消只翻目标子 agent 的私有 cancel flag 并唤醒其等待者；不设置进程级
-    // REQUEST_INTERRUPT_FLAG/futex，避免并发后台 turn 读到全局 flag 被误判为
-    // "本 turn 被取消"。目标子 agent 的等待路径通过 wait_for_interrupt_sources
-    // 的 cancel_flag 形参在被唤醒后重新检查其私有 cancel_stream。
+    // Targeted cancellation only flips the target sub-agent's private cancel flag
+    // and wakes its waiters; it does not set the process-level
+    // REQUEST_INTERRUPT_FLAG/futex, so concurrent background turns will not read
+    // the global flag and mistake it for "this turn was canceled". The target
+    // sub-agent's wait path re-checks its private cancel_stream after being woken,
+    // via wait_for_interrupt_sources' cancel_flag parameter.
     notify_request_interrupt_waiters();
     let _ = crate::ai::tools::registry::common::try_request_tool_cancel();
     ForegroundSubagentProbe::Cancelled
 }
 
-/// 锁无关的强制退出兜底：用于用户已明确多次 Ctrl+C（Exit 分支）或前台子 agent
-/// 卡死（Stuck 升级）的路径。绝不在此路径调用任何会锁 kernel 的函数
-/// （request_tool_cancel / request_shutdown 都会拿锁）——若某个后台任务正持有
-/// kernel 锁，这里会阻塞，导致 process::exit 永远执行不到，表现为"Ctrl+C 关不掉"。
-/// 先关闭 stdin 以便阻塞在 read 上的输入线程返回。
+/// Lock-free forced-exit fallback: used on paths where the user has clearly
+/// pressed Ctrl+C multiple times (Exit branch) or a foreground sub-agent is
+/// stuck (Stuck escalation). Never call anything that locks the kernel on this
+/// path (request_tool_cancel / request_shutdown both take locks) — if some
+/// background task holds the kernel lock, this would block and process::exit
+/// would never run, manifesting as "Ctrl+C can't close the app".
+/// Close stdin first so the input thread blocked on read returns.
 #[inline]
-#[cfg_attr(not(test), allow(unused_variables))] // shutdown 仅测试分支使用，非 test 构建避免 unused 告警
+#[cfg_attr(not(test), allow(unused_variables))] // shutdown is used by the test branch only; avoid an unused warning in non-test builds
 fn force_exit_after_sigint(shutdown: &AtomicBool) {
     #[cfg(unix)]
     unsafe {
@@ -180,19 +210,26 @@ pub(in crate::ai) fn handle_sigint(
     streaming: &AtomicBool,
     cancel_stream: &AtomicBool,
 ) {
-    // 若已请求过 shutdown，用户的二次 Ctrl+C 是明确的退出诉求：必须优先、无条件
-    // 退出，绝不能被“定向取消子 agent”拦截（否则关不掉）。其余情况下先尝试把这次
-    // 中断定向给前台子 agent（见 probe_foreground_subagent 的语义）。
+    // If shutdown was already requested, the user's second Ctrl+C is an explicit
+    // exit request: it must take priority and exit unconditionally, and must
+    // never be intercepted by "targeted sub-agent cancellation" (otherwise the
+    // app cannot be closed). Otherwise, first try directing this interrupt at
+    // the foreground sub-agent (see the probe_foreground_subagent semantics).
     if !shutdown.load(Ordering::Relaxed) {
         match probe_foreground_subagent() {
             ForegroundSubagentProbe::Cancelled => return,
             ForegroundSubagentProbe::Stuck => {
-                // 栈顶子 agent 已请求取消却仍未退出（卡死）。此时前台 turn 的活动
-                // 标志恒为 true，若照常调用 sigint_action 会永远停在 CancelStream
-                // （只设软标志，主线程早已 park，无人轮询）——这正是"Ctrl+C 关不掉"
-                // 的根因。软取消已证明无效，且运行时可能已楔死（worker 卡锁导致
-                // Notify/定时器无人轮询），shutdown 分支依赖运行时观察同样救不了，
-                // 只能走锁无关的强制退出兜底（见 force_exit_after_sigint）。
+                // The top-of-stack sub-agent was asked to cancel but still has not
+                // exited (stuck). The foreground turn's activity flag is true the
+                // whole time, so calling sigint_action as usual would stay on
+                // CancelStream forever (it only sets a soft flag while the main
+                // thread has long been parked with nobody polling) — exactly the
+                // root cause of "Ctrl+C can't close the app". Soft cancellation has
+                // proven ineffective, and the runtime may already be wedged (a
+                // worker stuck on a lock leaves Notify/timers unpolled), so the
+                // shutdown branch's reliance on runtime observation cannot help
+                // either; the only way out is the lock-free forced-exit fallback
+                // (see force_exit_after_sigint).
                 force_exit_after_sigint(shutdown);
                 return;
             }
@@ -201,8 +238,10 @@ pub(in crate::ai) fn handle_sigint(
     }
     match sigint_action(shutdown, streaming, cancel_stream, foreground_turn_active()) {
         SigintAction::CancelStream => {
-            // 先唤醒 request/stream 等待者，再通知工具层 cancel。后者会拿 kernel
-            // 锁；若锁竞争发生在断网/卡住路径上，不能阻塞真正的 Ctrl+C 取消信号。
+            // Wake request/stream waiters first, then notify the tool layer to
+            // cancel. The latter takes the kernel lock; if that lock contention
+            // happens on a disconnected/stuck path, it must not block the real
+            // Ctrl+C cancel signal.
             cancel_stream.store(true, Ordering::Relaxed);
             signal_request_interrupt();
             let _ = crate::ai::tools::registry::common::try_request_tool_cancel();
@@ -227,13 +266,15 @@ pub(in crate::ai) fn request_shutdown(shutdown: &AtomicBool) {
     signal_request_interrupt();
 }
 
-/// 标记本次 shutdown 来自 Ctrl+C，供 driver 在安全的事件循环上下文中持久化会话。
+/// Marks that this shutdown came from Ctrl+C, so the driver persists the session
+/// in a safe event-loop context.
 pub(in crate::ai) fn request_sigint_shutdown(shutdown: &AtomicBool) {
     SIGINT_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
     request_shutdown(shutdown);
 }
 
-/// 读取并清除 Ctrl+C 退出标记，避免后续非信号退出重复挂起会话。
+/// Reads and clears the Ctrl+C exit marker so later non-signal exits do not
+/// suspend the session again.
 pub(in crate::ai) fn take_sigint_shutdown_request() -> bool {
     SIGINT_SHUTDOWN_REQUESTED.swap(false, Ordering::AcqRel)
 }
@@ -277,14 +318,18 @@ pub(in crate::ai) fn signal_request_interrupt() {
     let _ = os.futex_store(addr, 1);
 }
 
-/// 只唤醒等待 `REQUEST_INTERRUPT_NOTIFY` 的协程，**不**设置进程级中断 flag/futex。
+/// Wakes only the tasks waiting on `REQUEST_INTERRUPT_NOTIFY`, and does **not**
+/// set the process-level interrupt flag/futex.
 ///
-/// 用于定向取消单个前台子 agent：取消条件由目标子 agent 私有的 `cancel_stream`
-/// 承载（其等待路径以 `Some(&cancel_stream)` 调用 `wait_for_interrupt_sources`，
-/// 被唤醒后重新检查该 flag 即可返回）。若改用 `signal_request_interrupt` 会写入
-/// 进程级 flag/futex，并发后台 turn 的 `should_abort_retry_wait` /
-/// `stream_interrupt_requested` 会读到该全局 flag 被误判为"本 turn 被取消"，
-/// 且任一请求进入时调用的 `clear_request_interrupt` 还可能让目标子 agent 错过取消。
+/// Used to cancel a single foreground sub-agent in a targeted way: the
+/// cancellation condition lives in the target sub-agent's private `cancel_stream`
+/// (its wait path calls `wait_for_interrupt_sources` with `Some(&cancel_stream)`
+/// and, once woken, re-checks that flag to return). Using
+/// `signal_request_interrupt` instead would write the process-level flag/futex;
+/// concurrent background turns' `should_abort_retry_wait` /
+/// `stream_interrupt_requested` would read that global flag and mistake it for
+/// "this turn was canceled", and `clear_request_interrupt`, called when any
+/// request enters, could also make the target sub-agent miss the cancellation.
 pub(in crate::ai) fn notify_request_interrupt_waiters() {
     REQUEST_INTERRUPT_NOTIFY.notify_waiters();
 }
@@ -377,8 +422,9 @@ pub(in crate::ai) async fn wait_for_interrupt_sources(
         if interrupt_sources_ready(local_interrupt_futex) {
             return;
         }
-        // 定向取消（前台子 agent）只翻其私有 cancel_stream，不设全局 flag；
-        // 这里在被 Notify 唤醒后重新检查该 flag，使其等待能及时返回。
+        // Targeted cancellation (foreground sub-agent) flips only its private
+        // cancel_stream and sets no global flag; after being woken by the Notify,
+        // re-check that flag here so the wait returns promptly.
         if let Some(flag) = cancel_flag
             && flag.load(Ordering::Relaxed)
         {
@@ -392,7 +438,8 @@ pub(in crate::ai) async fn wait_for_interrupt_sources(
             }
             return;
         }
-        // 主信号通过 Notify 唤醒；本地 futex 仍需短轮询兜底（无对应通知通道）。
+        // The main signal wakes via Notify; the local futex still needs a short
+        // polling fallback (no matching notification channel).
         let notified = REQUEST_INTERRUPT_NOTIFY.notified();
         tokio::select! {
             _ = notified => {}
@@ -410,10 +457,12 @@ pub(in crate::ai) fn sigint_action(
     if shutdown.load(Ordering::Relaxed) {
         SigintAction::Exit
     } else if streaming.load(Ordering::Relaxed) || foreground_turn_active {
-        // streaming：模型流 / 工具执行子阶段。
-        // foreground_turn_active：补齐 prepare / 思考 / 阶段切换 / mid-turn 压缩
-        // 等 streaming=false 的空窗——只要前台 turn 在跑，Ctrl+C 一律取消本轮，
-        // 绝不退出会话；退出语义留给「空闲态」（无 turn 在跑）的 Ctrl+C。
+        // streaming: model streaming / tool execution sub-phases.
+        // foreground_turn_active: covers the streaming=false gaps such as prepare
+        // / thinking / phase switching / mid-turn compression — as long as a
+        // foreground turn is running, Ctrl+C always cancels the turn and never
+        // exits the session; exit semantics are left to Ctrl+C in the idle state
+        // (no turn running).
         SigintAction::CancelStream
     } else {
         SigintAction::Shutdown
@@ -484,8 +533,9 @@ mod tests {
 
     #[test]
     fn sigint_cancels_during_non_streaming_turn_gap() {
-        // prepare / 思考 / 阶段切换 / mid-turn 压缩等空窗：streaming=false 但前台
-        // turn 仍在跑。此时 Ctrl+C 必须取消本轮、绝不退出会话。
+        // Gaps such as prepare / thinking / phase switching / mid-turn compression:
+        // streaming=false but a foreground turn is still running. Ctrl+C here must
+        // cancel the turn and never exit the session.
         let shutdown = AtomicBool::new(false);
         let streaming = AtomicBool::new(false);
         let cancel_stream = AtomicBool::new(false);
@@ -535,14 +585,16 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let _registration = ForegroundSubagentGuard::register(cancel.clone());
 
-        // 第一次 SIGINT：定向取消子 agent，翻它自己的 cancel 标志、不碰全局 shutdown。
+        // First SIGINT: targeted cancellation of the sub-agent — flip its own
+        // cancel flag, leave global shutdown untouched.
         assert_eq!(
             probe_foreground_subagent(),
             ForegroundSubagentProbe::Cancelled
         );
         assert!(cancel.load(Ordering::Relaxed));
 
-        // 第二次 SIGINT：子 agent 仍在栈里（卡死）→ 不再消费，判定为卡死。
+        // Second SIGINT: the sub-agent is still on the stack (stuck) → not
+        // consumed; classified as stuck.
         assert_eq!(probe_foreground_subagent(), ForegroundSubagentProbe::Stuck);
 
         super::clear_request_interrupt();
@@ -550,10 +602,12 @@ mod tests {
 
     #[test]
     fn stuck_foreground_subagent_escapes_cancel_stream() {
-        // 回归测试：前台子 agent 卡死（已请求取消仍留在栈里）时，即使前台 turn 活动
-        // 标志为 true（父 turn 阻塞在 execute_sync_task 未返回），二次 Ctrl+C 也必须
-        // 直接退出，而不是落入 sigint_action 的 CancelStream（只设软标志，主线程
-        // park 无人轮询，表现为"Ctrl+C 关不掉"）。
+        // Regression test: when a foreground sub-agent is stuck (cancel requested
+        // but still on the stack), the second Ctrl+C must exit directly even though
+        // the foreground turn activity flag is true (the parent turn is blocked in
+        // execute_sync_task without returning), instead of falling into
+        // sigint_action's CancelStream (which only sets a soft flag while the
+        // parked main thread polls nothing — "Ctrl+C can't close the app").
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -562,22 +616,24 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let _registration = ForegroundSubagentGuard::register(cancel.clone());
 
-        // 第一次 SIGINT：定向取消子 agent，被消费。
+        // First SIGINT: targeted cancellation of the sub-agent, consumed.
         assert_eq!(
             probe_foreground_subagent(),
             ForegroundSubagentProbe::Cancelled
         );
         assert!(cancel.load(Ordering::Relaxed));
 
-        // 模拟父 turn 仍阻塞在 execute_sync_task：抬起前台 turn 活动标志——
-        // 这正是此前把 sigint_action 永久锁在 CancelStream 上的条件。
+        // Simulate the parent turn still blocked in execute_sync_task: raise the
+        // foreground turn activity flag — exactly the condition that used to latch
+        // sigint_action on CancelStream forever.
         let _turn = ForegroundTurnGuard::enter();
         let shutdown = AtomicBool::new(false);
         let streaming = AtomicBool::new(false);
         let cancel_stream = AtomicBool::new(false);
 
-        // 第二次 SIGINT：卡死 + 前台 turn 活动 → 必须直接强制退出，
-        // 不能被 CancelStream 吞掉（test 模式下 force_exit_after_sigint 置 shutdown）。
+        // Second SIGINT: stuck + foreground turn active → must force-exit directly,
+        // and must not be swallowed by CancelStream (in test mode
+        // force_exit_after_sigint sets shutdown).
         handle_sigint(&shutdown, &streaming, &cancel_stream);
         assert!(shutdown.load(Ordering::Relaxed));
         assert!(!cancel_stream.load(Ordering::Relaxed));
@@ -590,7 +646,8 @@ mod tests {
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // 栈空时不应消费这次中断，调用方据此走正常 shutdown/exit。
+        // With an empty stack this interrupt must not be consumed; callers proceed
+        // to normal shutdown/exit.
         assert_eq!(
             probe_foreground_subagent(),
             ForegroundSubagentProbe::None
@@ -608,7 +665,8 @@ mod tests {
         {
             let _registration = ForegroundSubagentGuard::register(cancel.clone());
         }
-        // guard 已 drop：栈里不再有该条目，定向取消无对象可消费。
+        // The guard has dropped: the entry is no longer on the stack, so targeted
+        // cancellation has nothing to consume.
         assert_eq!(
             probe_foreground_subagent(),
             ForegroundSubagentProbe::None

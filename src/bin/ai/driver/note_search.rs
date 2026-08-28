@@ -1,7 +1,7 @@
 // =============================================================================
 // Note/Memo Search + Knowledge Consolidation CLI Subsystem
 // =============================================================================
-// 从 driver/mod.rs 抽离的笔记/备忘录搜索 + 知识整理 CLI 子功能。
+// Note/memo search + knowledge consolidation CLI subfeature extracted from driver/mod.rs.
 // =============================================================================
 
 use std::path::PathBuf;
@@ -46,13 +46,15 @@ pub(super) fn note_search_interactive_mode(cli: &ParsedCli) -> bool {
     if cli.interactive {
         return true;
     }
-    // `a -ns` 不带实质查询内容（空白符不算）时自动进入交互模式，等同 `a -ns -i`；
-    // 带查询内容时才保持 one-shot 单轮检索。
+    // `a -ns` with no substantive query content (whitespace does not count)
+    // automatically enters interactive mode, equivalent to `a -ns -i`; only a query
+    // with content stays a one-shot single-round retrieval.
     !cli.args.iter().any(|arg| !arg.trim().is_empty())
 }
 
-/// 如果剪贴板有图片，使用视觉模型理解内容；
-/// 否则使用 `-n` 后面提供的文本；若也没有文本，则进入多行输入框让用户输入。
+/// If the clipboard holds an image, a vision model interprets the content;
+/// otherwise use the text following `-n`; if there is no text either, open the
+/// multi-line input box for the user to type it.
 pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     use arboard::Clipboard;
     use image::buffer::ConvertBuffer;
@@ -60,9 +62,10 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
     use std::fs;
 
     let store = MemoryStore::from_env_or_config();
-    // -n 是字符串 flag，只会捕获其后的第一个 token（如 `a -n aeolus 线上日志路径：...`
-    // 只会把 "aeolus" 当作 note 值），其余 token 落到位置参数里。这里把位置参数拼接回来，
-    // 避免内容被截断、导致后续检索不到完整笔记。
+    // -n is a string flag and only captures the first token after it (e.g. in
+    // `a -n aeolus prod log path: ...` only "aeolus" becomes the note value), and the
+    // remaining tokens fall into positional args. The positional args are joined back
+    // here so the content is not truncated and later retrieval can find the full note.
     let provided_text = {
         let mut parts: Vec<String> = Vec::new();
         if let Some(text) = app.cli.note.clone() {
@@ -83,16 +86,17 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
         }
     };
 
-    // 图片持久化目录：与 memory 文件同目录下的 note_images/。
-    // 之前的实现把截图写进 /tmp 然后立即删除、并存 image_path: None，
-    // 导致图片彻底丢失、memo 永远无法再引用原图。改成持久化保存。
+    // Image persistence dir: note_images/ next to the memory file. The previous
+    // implementation wrote screenshots to /tmp, deleted them immediately, and stored
+    // image_path: None, losing the image for good so the memo could never reference
+    // the original again. Switched to persistent storage.
     let images_dir = store
         .path()
         .parent()
         .map(|parent| parent.join("note_images"))
         .unwrap_or_else(|| PathBuf::from("note_images"));
 
-    // 尝试从剪贴板获取图片并持久化保存
+    // Try to fetch an image from the clipboard and persist it
     let clipboard_image_path: Option<String> = match Clipboard::new() {
         Ok(mut clipboard) => {
             if let Ok(image) = clipboard.get_image() {
@@ -135,12 +139,12 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
     };
 
     let note_content = if let Some(image_path) = &clipboard_image_path {
-        // 有图片，调用视觉模型理解内容
+        // Image present: ask the vision model to interpret the content
         println!("[note] Detected image in clipboard, analyzing...");
 
         let model = crate::ai::models::determine_vl_model(&app.current_model);
 
-        // 构建包含图片的消息
+        // Build the message that includes the image
         let content = crate::ai::request::build_content(
             &model,
             "请详细描述这张图片的内容，包括关键信息、文字、数据等。用中文回答。",
@@ -152,7 +156,7 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
             "content": content,
         })];
 
-        // 调用模型
+        // Call the model
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
             Ok(response) => crate::ai::request::extract_response_text(&response)
                 .unwrap_or_else(|| "无法获取模型响应".to_string()),
@@ -163,12 +167,14 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
             }
         }
     } else {
-        // 没有图片：取得原始文本（来自 -n 后面的文本，或多行输入框），
-        // 统一先交给模型理解、整理后再保存，避免直接堆原文。
+        // No image: get the raw text (from the text after -n or the multi-line input
+        // box), and always have the model interpret and organize it before saving
+        // instead of dumping the raw text directly.
         let raw = if let Some(text) = provided_text.filter(|t| !t.trim().is_empty()) {
             text
         } else {
-            // 既没有图片也没有文本：进入多行输入框，让用户手动输入要保存的内容。
+            // Neither image nor text: open the multi-line input box so the user can
+            // enter the content to save.
             println!("[note] 剪贴板没有图片，请输入要保存的内容（多行；提交后保存，留空取消）：");
             let input = match app.prompt_editor.as_mut() {
                 Some(editor) => editor.read_multi_line().ok().flatten(),
@@ -183,7 +189,8 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
             }
         };
 
-        // 调用模型理解并整理用户输入，使其更适合作为知识库 memo。
+        // Ask the model to interpret and organize the user input so it works better
+        // as a knowledge-base memo.
         println!("[note] 正在整理内容...");
         let model = crate::ai::models::initial_model(&app.cli);
         let messages = vec![
@@ -203,14 +210,16 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
                 .filter(|s| !s.is_empty())
                 .unwrap_or(raw),
             Err(err) => {
-                // 整理失败时退回保存原始输入，避免丢失用户内容。
+                // On organization failure fall back to saving the raw input so user
+                // content is not lost.
                 eprintln!("[note] 整理失败，保存原始输入: {}", err);
                 raw
             }
         }
     };
 
-    // 保存到知识库（图片已持久化，路径写入 image_path 以便后续引用）
+    // Save to the knowledge base (the image is already persisted; its path is
+    // written to image_path for later reference)
     let now = chrono::Local::now().to_rfc3339();
     let entry = AgentMemoryEntry {
         id: Some(format!("mem_{}", uuid::Uuid::new_v4().simple())),
@@ -248,11 +257,12 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// 一个轻量的终端 "Searching..." 动画提示。
+/// A lightweight terminal "Searching..." spinner.
 ///
-/// 在 stderr 上用回车 `\r` 原地刷新一帧帧 spinner，`stop()` / drop 时清除当前行，
-/// 不会污染随后的正式输出（正式结果走 stdout）。仅在 stderr 为 TTY 时启用，
-/// 管道 / 重定向场景自动静默，避免写入垃圾字符。
+/// Refreshes the spinner in place on stderr using carriage returns `\r`; on
+/// `stop()` / drop it clears the current line so the following formal output
+/// (formal results go to stdout) is not polluted. Enabled only when stderr is a
+/// TTY; silently disabled for pipes/redirects to avoid writing garbage characters.
 struct SearchSpinner {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -261,7 +271,8 @@ struct SearchSpinner {
 impl SearchSpinner {
     fn start(label: &str) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        // 非 TTY（被管道/重定向）时不画动画，返回一个空 spinner。
+        // With a non-TTY (piped/redirected) stderr, draw no animation and return an
+        // inert spinner.
         if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
             return Self { stop, handle: None };
         }
@@ -278,7 +289,7 @@ impl SearchSpinner {
                 i += 1;
                 std::thread::sleep(Duration::from_millis(80));
             }
-            // 清除当前行（足够覆盖 "<frame> <label>..."）。
+            // Clear the current line (wide enough to cover "<frame> <label>...").
             let mut err = std::io::stderr();
             let _ = write!(err, "\r{}\r", " ".repeat(label.len() + 8));
             let _ = err.flush();
@@ -290,7 +301,7 @@ impl SearchSpinner {
     }
 
     fn stop(self) {
-        // 显式消费，触发 Drop。
+        // Consume explicitly to trigger Drop.
         drop(self);
     }
 }
@@ -412,7 +423,8 @@ async fn answer_memo_search(
         return Err("note-search requires a query".into());
     }
 
-    // 检索 + 模型总结都可能耗时，给一个 "Searching..." 动画提示（输出前自动清除）。
+    // Retrieval plus model summarization can both take a while; show a
+    // "Searching..." spinner (cleared automatically before output).
     let _spinner = SearchSpinner::start("Searching memo");
     let retrieval_query = if note_search_interactive_mode(&app.cli) {
         build_note_search_retrieval_query(&question, &read_recent_history(app))
@@ -420,7 +432,8 @@ async fn answer_memo_search(
         question.clone()
     };
 
-    // `a -n` 保存的用户笔记固定为 memo；notebook 检索不混入其他内部知识类别。
+    // Notes saved by `a -n` are always memos; notebook retrieval never mixes in
+    // other internal knowledge categories.
     let candidates = match crate::ai::tools::service::memory::search_memo_candidates_scored(
         &retrieval_query,
         20,
@@ -436,11 +449,13 @@ async fn answer_memo_search(
         return Ok(format!("没有在知识库中找到与「{}」相关的内容。", question));
     }
 
-    // 语义收紧已随 embedding 链路移除：词汇级分数不具备可比较的阈值，
-    // 保持全部候选交给 LLM（与历史无语义路径一致，不丢候选）。
+    // The semantic tightening was removed along with the embedding pipeline:
+    // lexical scores have no comparable threshold, so every candidate is kept for
+    // the LLM (consistent with the historical no-embedding path; no candidate lost).
     let selected = select_note_search_candidates(&candidates);
 
-    // 把检索到的条目作为上下文，让模型基于这些内容回答用户的问题。
+    // Feed the retrieved entries as context so the model answers the user's
+    // question from them.
     let mut context = String::new();
     for (idx, candidate) in selected.iter().enumerate() {
         context.push_str(&format!("[{}] {}\n", idx + 1, candidate.entry.note));
@@ -468,7 +483,8 @@ async fn answer_memo_search(
                 .trim()
                 .to_string();
             if answer.is_empty() {
-                // 模型无输出时退回展示已选中的原始条目（复用上面的检索结果，不重复检索）。
+                // When the model produced no output, fall back to listing the selected
+                // raw entries (reusing the retrieval above; no second search).
                 Ok(selected
                     .iter()
                     .enumerate()
@@ -530,8 +546,9 @@ pub(super) async fn handle_note_search_interactive_turn(
     Ok(())
 }
 
-/// 处理 --note-search / -ns：从知识库中检索 memo 类条目，再用模型根据检索到的
-/// 内容总结、回答用户的问题（而不是直接堆砌原始条目）。
+/// Handle --note-search / -ns: retrieve memo entries from the knowledge base,
+/// then have the model summarize them and answer the user's question (rather
+/// than dumping the raw entries directly).
 pub(super) async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     let query = app.cli.args.join(" ");
     let answer = answer_memo_search(app, &query, 0).await?;
@@ -555,7 +572,8 @@ impl ConsolidationScope {
 
     fn matches(self, entry: &AgentMemoryEntry) -> bool {
         match self {
-            // 带图片的 memo 保留原条目，避免合并后丢失图片附件的关联。
+            // Memos with images keep their original entries, so merging cannot
+            // lose the attachment association.
             Self::Memo => entry.category == "memo" && entry.image_path.is_none(),
             Self::OtherKnowledge => entry.category != "memo",
         }
@@ -564,7 +582,7 @@ impl ConsolidationScope {
     fn merged_category(self) -> &'static str {
         match self {
             Self::Memo => "memo",
-            // 保持原有 consolidate 的非 memo 合并落点。
+            // Keep the original consolidate merge target for non-memo entries.
             Self::OtherKnowledge => "user_memory",
         }
     }
@@ -593,7 +611,8 @@ fn consolidation_candidates(
     let mut candidates: Vec<&AgentMemoryEntry> = all_entries
         .iter()
         .filter(|entry| entry.priority.unwrap_or(100) < 200)
-        // 无 ID 的历史条目无法被 apply_batch_update 精确替换，不让模型对其做计划。
+        // Legacy entries without an ID cannot be precisely replaced by
+        // apply_batch_update; the model gets no plan over them.
         .filter(|entry| entry.id.as_deref().is_some_and(|id| !id.trim().is_empty()))
         .filter(|entry| scope.matches(entry))
         .collect();
@@ -602,12 +621,16 @@ fn consolidation_candidates(
     candidates
 }
 
-// 处理 consolidate 计划里的 merge 项：只为有效 merge（ids 非空且 merged_content 非空）
-// 生成新条目，并把对应源 IDs 自动并入删除集合，避免"旧条目 + 合并条目"并存。
+// Process merge items in a consolidate plan: generate new entries only for valid
+// merges (non-empty ids and non-empty merged_content), and fold the source IDs
+// into the delete set automatically, avoiding "old entry + merged entry"
+// coexistence.
 //
-// originals 提供 id -> 完整条目的查找表，用于**无损合并**：模型只看到截断预览，
-// 凭记忆重写的 merged_content 会丢细节；用户 memo 是不可再生的笔记数据，新条目
-// 必须 = 模型摘要 + 全部源条目原文，整理绝不压缩/丢失内容。
+// originals provides an id -> full-entry lookup for **lossless merging**: the
+// model only sees truncated previews, and a merged_content rewritten from memory
+// loses detail; user memos are non-recoverable note data, so a new entry must
+// equal model summary + the full text of every source entry. Consolidation never
+// compresses or drops content.
 fn build_consolidation_merge_entries(
     category: &str,
     source: Option<&str>,
@@ -632,12 +655,14 @@ fn build_consolidation_merge_entries(
             .filter(|id| eligible_ids.contains(id) && !merge_delete_ids.contains(*id))
             .collect();
         let content = item["merged_content"].as_str().unwrap_or("").trim();
-        // 单条改写不属于 merge；至少两条可操作条目才能替换为一个合并条目。
+        // A single rewritten entry is not a merge; at least two actionable entries
+        // are required to be replaced by one merged entry.
         if ids.len() < 2 || content.is_empty() {
             continue;
         }
 
-        // 无损合并：模型摘要在前，全部源条目原文在后，保证细节不丢。
+        // Lossless merge: model summary first, then the full text of every source
+        // entry, so no detail is lost.
         let mut note = content.to_string();
         let original_texts: Vec<&str> = ids
             .iter()
@@ -682,9 +707,10 @@ async fn consolidate_scope(
         let id = entry.id.as_deref().unwrap_or("unknown");
         let prio = entry.priority.unwrap_or(100);
         let ts_short: String = entry.timestamp.chars().take(10).collect();
-        // 预览用于模型做合并/删除决策。500 字已能覆盖绝大多数 memo；
-        // 超长条目明确标注截断。落库时合并项仍保留完整原文（见
-        // build_consolidation_merge_entries），预览截断不会造成内容丢失。
+        // The preview is what the model uses for merge/delete decisions. 500 chars
+        // covers the vast majority of memos; overlong entries are explicitly marked
+        // as truncated. Merges still store the full original text (see
+        // build_consolidation_merge_entries), so preview truncation loses nothing.
         let note_len = entry.note.chars().count();
         let preview: String = if note_len > 500 {
             entry.note.chars().take(500).collect::<String>()
@@ -703,7 +729,8 @@ async fn consolidate_scope(
         }));
     }
 
-    // id -> 完整条目：合并时把源 memo 全文拼进新条目，保证整理不丢内容。
+    // id -> full entry: merges concatenate the source memo's full text into the
+    // new entry so consolidation loses no content.
     let originals: FxHashMap<&str, &AgentMemoryEntry> = candidates
         .iter()
         .filter_map(|entry| entry.id.as_deref().map(|id| (id, *entry)))
@@ -790,7 +817,8 @@ async fn consolidate_scope(
         &originals,
     );
 
-    // 模型输出只能影响当前批次的候选 ID，保证 memo 与其它类别不会互相删除或合并。
+    // Model output can only affect the current batch's candidate IDs, so memos
+    // and other categories can never delete or merge each other.
     let mut delete_id_set: FxHashSet<String> = requested_delete_ids
         .into_iter()
         .filter(|id| eligible_ids.contains(id))
@@ -827,18 +855,22 @@ async fn consolidate_scope(
     Ok(())
 }
 
-/// 处理 --consolidate-knowledge：读取全部知识条目 → 模型分析 → 执行整理。
+/// Handle --consolidate-knowledge: read all knowledge entries → model analysis →
+/// run the consolidation.
 ///
-/// **优化策略**（避免超时 / 控制 token）：
-/// 1. 只分析优先级 < 200 的条目（≥200 受保护）
-/// 2. memo 与其它类别分别按时间倒序取**最近 15 条**，绝不混合整理
-/// 3. 每条预览截断到 **500 字**；但合并落库时把源 memo 全文拼进新条目（无损）
-/// 4. 用 JSON 数组格式（比文本格式更省 token）
-/// 5. 英文 system prompt（模型响应更快）
+/// **Optimization strategy** (avoid timeouts / control tokens):
+/// 1. Only entries with priority < 200 are analyzed (>= 200 is protected)
+/// 2. memos and other categories each take the **most recent 15** by timestamp
+///    descending, never mixed in one pass
+/// 3. Each preview is truncated to **500 chars**; merged entries still get the
+///    full source memo text on write (lossless)
+/// 4. JSON format is used (cheaper in tokens than free text)
+/// 5. English system prompt (models respond faster)
 ///
-/// 读取范围：主文件 + 全部轮转归档（all_with_archives）。被 rotation 移入
-/// 归档的历史 memo / 知识同样进入整理视野；对应删除会在 apply_batch_update
-/// 中落到归档文件本身。
+/// Read scope: main file plus all rotated archives (all_with_archives).
+/// Historical memos/knowledge moved into archives by rotation also enter
+/// consolidation; the corresponding deletes land in the archive file itself via
+/// apply_batch_update.
 pub(super) async fn handle_consolidate_knowledge(
     app: &App,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -853,7 +885,8 @@ pub(super) async fn handle_consolidate_knowledge(
     }
 
     let mut scopes_with_candidates = 0usize;
-    // memo 优先执行；即使后续非 memo 整理的模型请求失败，用户笔记也已独立处理。
+    // Memos run first; even if the later non-memo model request fails, the user's
+    // notes were already processed independently.
     for scope in [ConsolidationScope::Memo, ConsolidationScope::OtherKnowledge] {
         let candidates = consolidation_candidates(&all_entries, scope);
         if candidates.is_empty() {
@@ -873,15 +906,17 @@ pub(super) async fn handle_consolidate_knowledge(
     Ok(())
 }
 
-/// 处理 --note-delete / -nd <一段话>：用模型在知识库中匹配最相关的 memo 条目，
-/// 找到对应 id，删除前请用户确认。
+/// Handle --note-delete / -nd <text>: have the model match the most relevant memo
+/// entries in the knowledge base, resolve their ids, and ask the user to confirm
+/// before deleting.
 pub(super) async fn handle_note_delete(
     app: &mut App,
     query: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
-    // 拼接查询：flag 的值 + 其余位置参数；都为空时进入多行输入框。
+    // Join the query: flag value + remaining positional args; if both are empty,
+    // open the multi-line input box.
     let mut query = query.trim().to_string();
     if !app.cli.args.is_empty() {
         let extra = app.cli.args.join(" ");
@@ -908,7 +943,7 @@ pub(super) async fn handle_note_delete(
         query
     };
 
-    // 检索候选条目。
+    // Retrieve candidate entries.
     let candidates =
         match crate::ai::tools::service::memory::search_memo_candidates(&query, 10, false) {
             Ok(c) => c,
@@ -925,7 +960,8 @@ pub(super) async fn handle_note_delete(
         return Ok(());
     }
 
-    // 让模型从候选中挑选最匹配的一条（返回其序号，或 NONE）。
+    // Have the model pick the best-matching entries from the candidates (returns
+    // their indices, or NONE).
     let mut listing = String::new();
     for (idx, e) in candidates.iter().enumerate() {
         let note_preview: String = e.note.chars().take(300).collect();
@@ -958,7 +994,8 @@ pub(super) async fn handle_note_delete(
             }
         };
 
-    // 解析模型返回的若干编号（支持逗号 / 空格 / 顿号等分隔），去重并保持升序。
+    // Parse the indices returned by the model (supports comma / space /
+    // enumeration-comma separators), dedupe, and keep ascending order.
     let mut chosen_indices: Vec<usize> = Vec::new();
     {
         let mut num = String::new();
@@ -994,10 +1031,10 @@ pub(super) async fn handle_note_delete(
     let targets: Vec<&crate::ai::tools::storage::memory_store::AgentMemoryEntry> =
         chosen_indices.iter().map(|&i| &candidates[i]).collect();
 
-    // 删除前确认 + 精选。列出条目后，用户可以：
-    //   - 直接回车 / y / all / a：删除全部列出条目
-    //   - 输入编号（如 1,3）：只删除指定编号
-    //   - n / 回车以外的取消词：取消
+    // Confirmation + selection before deleting. After listing, the user can:
+    //   - press Enter directly / y / all / a: delete all listed entries
+    //   - enter indices (e.g. 1,3): delete only those entries
+    //   - n / any other cancel word: cancel
     println!("\n[note-delete] 匹配到以下 {} 条条目：", targets.len());
     for (n, target) in targets.iter().enumerate() {
         println!("  [{}]", n + 1);
@@ -1017,7 +1054,7 @@ pub(super) async fn handle_note_delete(
     std::io::stdin().read_line(&mut answer).ok();
     let answer = answer.trim().to_lowercase();
 
-    // 解析用户选择，得到最终要删除的 targets 子集。
+    // Parse the user's choice into the final subset of targets to delete.
     let selected: Vec<&crate::ai::tools::storage::memory_store::AgentMemoryEntry> = if answer
         .is_empty()
         || answer == "y"
@@ -1030,7 +1067,7 @@ pub(super) async fn handle_note_delete(
         println!("[note-delete] 已取消，未删除任何内容。");
         return Ok(());
     } else {
-        // 解析编号列表（针对上面列出的 1..=targets.len()）。
+        // Parse the index list (against the 1..=targets.len() listing above).
         let mut picks: Vec<usize> = Vec::new();
         let mut num = String::new();
         let flush = |num: &mut String, out: &mut Vec<usize>| {
@@ -1084,22 +1121,25 @@ pub(super) async fn handle_note_delete(
     Ok(())
 }
 
-/// 处理 --note-edit / -ne <一段话>：用模型在知识库中匹配相关 memo 条目，
-/// 匹配到多条时让用户选定一条，在编辑器中预填原文改写后保存（保留 id、更新时间戳）。
+/// Handle --note-edit / -ne <text>: have the model match related memo entries in
+/// the knowledge base; with several matches the user picks exactly one, the
+/// original text is prefilled in the editor, and the rewrite is saved (id kept,
+/// timestamp updated).
 pub(super) async fn handle_note_edit(
     app: &mut App,
     query: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
-    // 状态行着色：与黑底白字的 note 正文区分开。
-    const NE: &str = "\x1b[1;36m[note-edit]\x1b[0m"; // 青色加粗标签
-    const FIELD: &str = "\x1b[2m"; // 字段名（id/时间/内容）暗灰
-    const HINT: &str = "\x1b[1;32m"; // 操作提示绿色加粗
-    const IDX: &str = "\x1b[1;33m"; // 候选编号黄色加粗
+    // Status-line coloring: keeps the note body (white on black) visually distinct.
+    const NE: &str = "\x1b[1;36m[note-edit]\x1b[0m"; // bold cyan label
+    const FIELD: &str = "\x1b[2m"; // field names (id/time/content) in dim gray
+    const HINT: &str = "\x1b[1;32m"; // action hints in bold green
+    const IDX: &str = "\x1b[1;33m"; // candidate indices in bold yellow
     const RST: &str = "\x1b[0m";
 
-    // 拼接查询：flag 的值 + 其余位置参数；都为空时进入多行输入框。
+    // Join the query: flag value + remaining positional args; if both are empty,
+    // open the multi-line input box.
     let mut query = query.trim().to_string();
     if !app.cli.args.is_empty() {
         let extra = app.cli.args.join(" ");
@@ -1126,10 +1166,11 @@ pub(super) async fn handle_note_edit(
         query
     };
 
-    // 检索 + 模型匹配都可能耗时，给一个状态条动画（输出前自动清除），与 -ns 一致。
+    // Retrieval plus model matching can both take a while; show a spinner (cleared
+    // automatically before output), same as -ns.
     let spinner = SearchSpinner::start("匹配知识库条目");
 
-    // 检索候选条目。
+    // Retrieve candidate entries.
     let candidates =
         match crate::ai::tools::service::memory::search_memo_candidates(&query, 10, false) {
             Ok(c) => c,
@@ -1145,7 +1186,8 @@ pub(super) async fn handle_note_edit(
         return Ok(());
     }
 
-    // 让模型从候选中挑选匹配的条目（可能多条），返回编号。
+    // Have the model pick the matching entries from the candidates (possibly
+    // several), returning their indices.
     let mut listing = String::new();
     for (idx, e) in candidates.iter().enumerate() {
         let note_preview: String = e.note.chars().take(300).collect();
@@ -1183,7 +1225,7 @@ pub(super) async fn handle_note_edit(
         eprintln!("{NE} 模型匹配失败: {}", err);
     }
 
-    // 解析模型返回的编号集合。
+    // Parse the set of indices returned by the model.
     let parse_indices = |s: &str, max: usize| -> Vec<usize> {
         let mut out: Vec<usize> = Vec::new();
         let mut num = String::new();
@@ -1216,7 +1258,8 @@ pub(super) async fn handle_note_edit(
         return Ok(());
     }
 
-    // 匹配到多条：列出后让用户选定恰好一条来编辑（编辑是针对单条内容的）。
+    // Several matches: list them and let the user pick exactly one to edit
+    // (editing operates on a single entry).
     let target_idx = if matched.len() == 1 {
         matched[0]
     } else {
@@ -1254,7 +1297,7 @@ pub(super) async fn handle_note_edit(
 
     let target = candidates[target_idx].clone();
 
-    // 在编辑器中预填原文，让用户改写。
+    // Prefill the original text in the editor for the user to rewrite.
     println!("\n{NE} 将打开编辑器修改以下条目（原文已预填；留空或不改动即取消）：");
     if let Some(id) = target.id.as_deref().filter(|s| !s.is_empty()) {
         println!("    {FIELD}id:{RST} {}", id);
@@ -1280,8 +1323,9 @@ pub(super) async fn handle_note_edit(
         return Ok(());
     }
 
-    // 在保存前用 LLM 整理用户改写后的内容：只做格式/表达上的润色，
-    // 严格禁止改变语义。整理失败则回退到用户编辑的原文，不阻塞保存。
+    // Before saving, use the LLM to tidy the user's rewritten content: polish
+    // formatting/wording only, strictly forbidden from changing semantics. On
+    // tidy failure fall back to the user's edited text; saving is never blocked.
     let final_note = {
         let spinner = SearchSpinner::start("整理修改内容");
         let mut tidy_err: Option<String> = None;
@@ -1349,31 +1393,33 @@ mod tests {
 
     #[test]
     fn note_search_mode_detection() {
-        // `a -ns xxx`：带查询内容 → one-shot 单轮检索。
+        // `a -ns xxx`: with query content → one-shot single-round retrieval.
         let one_shot = crate::ai::cli::parse_cli_args(
             vec!["a".to_string(), "-ns".to_string(), "trait object".to_string()].into_iter(),
         );
         assert!(one_shot.note_search);
         assert!(!note_search_interactive_mode(&one_shot));
 
-        // `a -ns`：无实质内容 → 自动进入交互模式（等同 `a -ns -i`）。
+        // `a -ns`: no substantive content → automatically interactive (equivalent
+        // to `a -ns -i`).
         let auto = crate::ai::cli::parse_cli_args(vec!["a".to_string(), "-ns".to_string()].into_iter());
         assert!(auto.note_search);
         assert!(note_search_interactive_mode(&auto));
 
-        // 空白/空字符串不算内容。
+        // Blank/empty strings do not count as content.
         let blank = crate::ai::cli::parse_cli_args(
             vec!["a".to_string(), "-ns".to_string(), "   ".to_string()].into_iter(),
         );
         assert!(note_search_interactive_mode(&blank));
 
-        // `a -ns -i`：显式交互模式，保持原语义。
+        // `a -ns -i`: explicit interactive mode, original semantics kept.
         let explicit = crate::ai::cli::parse_cli_args(
             vec!["a".to_string(), "-ns".to_string(), "-i".to_string()].into_iter(),
         );
         assert!(note_search_interactive_mode(&explicit));
 
-        // 未开启 -ns：即使无内容也不是 notebook 检索交互模式。
+        // Without -ns: even with no content this is not notebook-search
+        // interactive mode.
         let no_ns = crate::ai::cli::parse_cli_args(vec!["a".to_string()].into_iter());
         assert!(!note_search_interactive_mode(&no_ns));
     }
@@ -1428,7 +1474,8 @@ mod tests {
         let merge_plan_refs: Vec<&serde_json::Value> = merge_plan.iter().collect();
 
         let eligible_ids = FxHashSet::from_iter(["id_a", "id_b", "ignored"].into_iter());
-        // 源条目原文：合并后必须无损保留，不能只留模型摘要。
+        // Source entry text: must be preserved losslessly after merging, not just
+        // the model summary.
         let entry_a = AgentMemoryEntry {
             id: Some("id_a".to_string()),
             timestamp: "2026-07-24T00:00:00Z".to_string(),
@@ -1477,7 +1524,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|id| id.starts_with("mem_"))
         );
-        // 无损合并：摘要 + 全部源原文。
+        // Lossless merge: summary + the full text of every source entry.
         assert_eq!(
             new_entries[0].note,
             "合并后的内容\n\n--- 原文保留（合并来源）---\n完整原文A：详细的排障步骤与具体命令\n\n完整原文B：关键标识符与复现步骤"
@@ -1539,7 +1586,8 @@ mod tests {
         assert_eq!(new_entries.len(), 1);
         assert_eq!(new_entries[0].category, "memo");
         assert_eq!(new_entries[0].source.as_deref(), Some("cli_note"));
-        // 无损合并：源 memo 全文必须保留在新条目里。
+        // Lossless merge: the source memos' full text must be preserved in the new
+        // entry.
         assert!(new_entries[0].note.contains("合并后的 memo"));
         assert!(new_entries[0].note.contains("memo_a 内容"));
         assert!(new_entries[0].note.contains("memo_b 内容"));

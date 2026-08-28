@@ -360,8 +360,8 @@ fn all_failed_ocr_does_not_keep_text_model() {
 
 #[test]
 fn determine_vl_model_supports_selector_and_fuzzy_name() {
-    // 空输入走 default_vl_model（quality_tier 优先）；数字索引走"按 is_vl 过滤后的第 N 个"。
-    // 两条路径并不等价，这里分别按各自的不变量来断言，避免硬编码具体模型名。
+    // Empty input goes through default_vl_model (quality_tier first); a numeric index goes through "the Nth entry after filtering by is_vl".
+    // The two paths are not equivalent; assert each against its own invariant to avoid hardcoding specific model names.
     let empty = models::determine_vl_model("");
     let zero = models::determine_vl_model("0");
     let first_vl = any_vl_model_handle();
@@ -369,7 +369,7 @@ fn determine_vl_model_supports_selector_and_fuzzy_name() {
         zero, first_vl,
         "selector \"0\" should pick first VL in model registry"
     );
-    // empty 仅要求是 VL 模型即可（best-by-tier 可能与 first_vl 不同）。
+    // empty only requires a VL model (best-by-tier may differ from first_vl).
     assert!(
         super::model_names::find_by_identifier(&empty)
             .map(|m| m.is_vl)
@@ -379,20 +379,20 @@ fn determine_vl_model_supports_selector_and_fuzzy_name() {
     if let Some(vl1) = vl_model_handle_at(1) {
         assert_eq!(models::determine_vl_model("1"), vl1);
     } else {
-        // 越界时回退到 default_vl_model
+        // Fall back to default_vl_model when out of range
         assert_eq!(models::determine_vl_model("1"), empty);
     }
 
-    // 直接以已知 VL 模型名作输入时，应返回原名（exact match）。
+    // Feeding a known VL model name directly should return the same name (exact match).
     let canonical = models::determine_vl_model(&first_vl);
     assert_eq!(canonical, first_vl);
 }
 
 #[test]
 fn tools_default_flag_is_respected_per_model_entry() {
-    // 以前这里硬编码 qwen3.5-flash / qwen3-max 的 tools_enabled 行为；这两个模型
-    // 已经从模型注册表中移除。改成扫描真实条目，校验 models::tools_enabled
-    // 与 ModelDef.tools_default_enabled 的对齐关系，仍能守住"配置即真相"的不变量。
+    // This used to hardcode the tools_enabled behavior of qwen3.5-flash / qwen3-max; both models
+    // have been removed from the model registry. Scan the real entries instead and verify that
+    // models::tools_enabled stays aligned with ModelDef.tools_default_enabled, keeping the "config is truth" invariant.
     for def in super::model_names::all() {
         assert_eq!(
             models::tools_enabled(&def.name),
@@ -815,12 +815,12 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
 
 #[test]
 fn overflow_flush_failure_restores_dropped_messages_without_data_loss() {
-    // 缺陷1 回归：归档 flush 失败时必须把待删消息放回、绝不静默丢历史。
+    // Defect-1 regression: when archive flush fails, the messages pending deletion must be put back — never silently drop history.
     let path =
         std::env::temp_dir().join(format!("ai-overflow-fail-{}.sqlite", uuid::Uuid::new_v4()));
-    // 关键：把 overflow_dir 指向一个**已存在的普通文件**。这样 OverflowSink::flush
-    // 里的 create_dir_all(parent=文件) 失败、随后 OpenOptions.open(文件/overflow-history.md)
-    // 因路径中间是文件而 ENOTDIR 失败 → flush() 必然返回 false，稳定触发失败回滚路径。
+    // Key: point overflow_dir at an **existing regular file**. Then OverflowSink::flush's
+    // create_dir_all(parent=file) fails, and OpenOptions.open(file/overflow-history.md)
+    // fails with ENOTDIR because a path component is a file → flush() necessarily returns false, deterministically triggering the failure-rollback path.
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-overflow-failfile-{}", uuid::Uuid::new_v4()));
     std::fs::write(&overflow_dir, b"not a directory").unwrap();
@@ -838,7 +838,7 @@ fn overflow_flush_failure_restores_dropped_messages_without_data_loss() {
     let compressed =
         compress_messages_for_context(messages, 2000, 256, 400, Some(overflow_dir.clone()), None);
 
-    // flush 失败 → 绝不删历史：全部 user 原文必须仍在返回值中（旧代码会静默丢弃）。
+    // flush failure → never delete history: all original user messages must still be in the return value (the old code silently dropped them).
     let kept_user_count = compressed.iter().filter(|m| m.role == "user").count();
     assert_eq!(
         kept_user_count, original_user_count,
@@ -854,7 +854,7 @@ fn overflow_flush_failure_restores_dropped_messages_without_data_loss() {
         joined.contains("Q00"),
         "最早的用户问题 Q00 必须被放回，不能丢失"
     );
-    // 失败路径绝不注入摘要/归档 note（避免产生没有对应归档文件的悬空指针）。
+    // The failure path must never inject summary/archive notes (avoiding dangling pointers to non-existent archive files).
     assert!(
         !joined.contains("长期记忆摘要"),
         "flush 失败路径不得注入摘要 note"
@@ -928,7 +928,7 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
         std::path::Path::new(file_path).exists(),
         "overflow file path from stub should exist: {file_path}"
     );
-    // stub 内应保留一段内容预览作为召回锚点，避免后续 turn "失忆"。
+    // The stub must keep a content preview as a recall anchor so later turns do not "forget".
     assert!(
         stub.contains("Preview (for recall"),
         "stub should contain a content preview: {stub}"
@@ -937,9 +937,9 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
 
 #[test]
 fn overflow_stub_recall_anchor_survives_compaction() {
-    // 复现「tool-heavy 会话（少 user 轮 × 上百次 read_file）」：早期大量
-    // read_file 组 + 一个近端 user 轮。断言压缩后 (1) 总 billable 显著下降并收敛进
-    // 预算，(2) 每个 read_file 的 file_path 召回锚点在输出里仍可找到（零失忆）。
+    // Reproduce a "tool-heavy session (few user turns × hundreds of read_file calls)": many early
+    // read_file groups + one near-end user turn. After compression assert (1) total billable drops sharply and converges
+    // into budget, and (2) every read_file's file_path recall anchor is still findable in the output (zero amnesia).
     use super::history::messages_total_chars_pub;
 
     let overflow_dir =
@@ -952,7 +952,7 @@ fn overflow_stub_recall_anchor_survives_compaction() {
         reasoning_content: None,
     }];
 
-    // 60 个早期 read_file 组，每组结果 4000 字符 —— 单条超阈值必被外溢成带预览 stub。
+    // 60 early read_file groups, each result 4000 chars — any single one over the threshold must be spilled into a preview stub.
     for i in 0..60usize {
         let id = format!("call_{i}");
         messages.push(Message {
@@ -977,7 +977,7 @@ fn overflow_stub_recall_anchor_survives_compaction() {
             reasoning_content: None,
         });
     }
-    // 近端 user 轮（保护尾窗）。
+    // Near-end user turn (protected tail window).
     messages.push(Message {
         role: "user".to_string(),
         content: Value::String("最新的问题".to_string()),
@@ -992,7 +992,7 @@ fn overflow_stub_recall_anchor_survives_compaction() {
         compress_messages_for_context(messages, budget, 256, 400, Some(overflow_dir.clone()), None);
     let after = messages_total_chars_pub(&compressed);
 
-    // 总量显著下降并收敛进预算（tool-heavy 会话不再结构性卡死）。
+    // The total drops sharply and converges into budget (tool-heavy sessions no longer stall structurally).
     assert!(
         after < before,
         "compaction must reduce total billable ({after} !< {before})"
@@ -1002,14 +1002,14 @@ fn overflow_stub_recall_anchor_survives_compaction() {
         "tool-heavy history must converge under budget ({after} > {budget})"
     );
 
-    // 收集压缩后所有输出文本，验证每个早期 read_file 的 file_path 仍可召回：
-    // 要么以 stub/锚点保留 src/file_N.rs 路径，要么以外溢临时文件路径存在于某条 note。
+    // Collect all output text after compression and verify every early read_file's file_path is still recallable:
+    // either the src/file_N.rs path survives in a stub/anchor, or the spill temp-file path appears in some note.
     let joined: String = compressed
         .iter()
         .filter_map(|m| m.content.as_str().map(str::to_string))
         .collect::<Vec<_>>()
         .join("\n");
-    // 至少应有外溢临时文件被写盘（read_file 结果零压缩外溢）。
+    // At least one spill temp file must be written to disk (read_file results spill with zero compression).
     let overflow_files: Vec<_> = std::fs::read_dir(overflow_dir.join("tool-overflow-compressed"))
         .map(|rd| rd.filter_map(Result::ok).collect())
         .unwrap_or_default();
@@ -1017,7 +1017,7 @@ fn overflow_stub_recall_anchor_survives_compaction() {
         !overflow_files.is_empty(),
         "read_file outputs should be spilled to session temp files"
     );
-    // 折叠后仍保留召回线索：compressed_tool_round note 或 stub 锚点二者至少其一。
+    // A recall lead survives folding: at least one of a compressed_tool_round note or a stub anchor.
     assert!(
         joined.contains("compressed_tool_round")
             || joined.contains("Output preserved for tool")
@@ -1068,7 +1068,7 @@ fn compression_keeps_recent_non_compressible_tool_output_verbatim() {
     let compressed =
         compress_messages_for_context(messages, 32_000, 256, 400, Some(overflow_dir.clone()), None);
 
-    // 最近这条 read_file 结果既不应被外溢成 stub，也不应被裁剪：逐字可见。
+    // The most recent read_file result must be neither spilled into a stub nor pruned: visible verbatim.
     assert!(
         compressed.iter().all(|m| {
             m.content
@@ -1146,10 +1146,10 @@ fn tool_call_pair(id: &str, tool_name: &str, arguments: &str, content: &str) -> 
 
 #[test]
 fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_versions() {
-    // 回归测试：断开"重复整篇重读"失忆环。
-    // 同一文件被反复 read_file 且**内容逐字节相同**时，只应保留一份全文，
-    // 其余冗余副本折叠为回指 stub（无损）。而内容确实变化的版本（文件被编辑）
-    // 必须每个都完整保留——绝不能因签名相同而误折叠成 stub 丢失真实差异。
+    // Regression test: break the "repeated full re-read" amnesia loop.
+    // When the same file is read repeatedly with **byte-identical content**, only one full copy should be kept,
+    // with the redundant duplicates folded into back-reference stubs (lossless). Versions whose content truly changes (the file was edited)
+    // must each be kept in full — identical signatures must never wrongly fold them into stubs and lose the real differences.
     let identical = format!("// agent_adapter.py\n{}", "A".repeat(6_000));
     let changed_v1 = format!("// controller.py v1\n{}", "B".repeat(6_000));
     let changed_v2 = format!("// controller.py v2 EDITED\n{}", "C".repeat(6_000));
@@ -1162,7 +1162,7 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
         reasoning_content: None,
     }];
 
-    // 6 次读取同一文件、内容完全相同（模拟失忆环里的重复整篇重读）。
+    // 6 reads of the same file with identical content (simulating repeated full re-reads in an amnesia loop).
     for i in 0..6 {
         let (a, t) = read_file_call_pair(
             &format!("call_same_{i}"),
@@ -1172,7 +1172,7 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
         messages.push(a);
         messages.push(t);
     }
-    // 同一文件被编辑，产生两个内容不同的版本，各读一次。
+    // The same file gets edited, producing two distinct versions, each read once.
     let (a1, t1) = read_file_call_pair("call_ctrl_1", "/repo/controller.py", &changed_v1);
     messages.push(a1);
     messages.push(t1);
@@ -1180,8 +1180,8 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
     messages.push(a2);
     messages.push(t2);
 
-    // 末尾追加足够多的"近端"tool 消息，把上面所有读取推出 KEEP_RECENT 保护窗，
-    // 确保 dedup 真正作用到它们身上。每条内容/路径都唯一，避免自身被 dedup 折叠。
+    // Append enough "near-end" tool messages to push all reads above out of the KEEP_RECENT protected window,
+    // making sure dedup actually applies to them. Every message's content/path is unique so they are not folded by dedup themselves.
     for i in 0..8 {
         let (a, t) = read_file_call_pair(
             &format!("call_pad_{i}"),
@@ -1192,8 +1192,8 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
         messages.push(t);
     }
 
-    // overflow_dir=None：隔离 dedup 行为，避免保留下来的那一份全文再被 offload
-    // 到磁盘 stub（offload 阈值 480 字符是另一条正交路径，已有专门测试覆盖）。
+    // overflow_dir=None: isolate the dedup behavior so the single retained full copy is not further offloaded
+    // to a disk stub (the 480-char offload threshold is an orthogonal path covered by dedicated tests).
     let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None, None);
 
     let full_identical = compressed
@@ -1238,7 +1238,7 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
         assert!(stub.contains("- preview: // agent_adapter.py"), "{stub}");
     }
 
-    // 两个内容不同的版本都必须完整保留，绝不因签名相同而被折叠。
+    // Both distinct versions must be kept in full, never folded just because signatures match.
     assert!(
         compressed
             .iter()
@@ -1255,13 +1255,13 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
 
 #[test]
 fn dedup_skips_byte_identical_overflow_archived_stubs() {
-    // 回归测试（真实案例 session c0ad15e6，msg 471/472）：
-    // 当一条 tool 结果内容**本身已是 overflow 归档 stub**（`[context-overflow-truncated]`
-    // 或 `[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]`）时，它并非"完整结果"，只是指向磁盘
-    // 原文的召回指针。byte-identical dedup 逆序首见登记 canonical，副本与 canonical
-    // 逐字节相同 ⇒ canonical 同样是截断 stub。若仍折叠成 "reuse the canonical full
-    // result" 就是谎报，把模型导向"下一跳仍是 stub"的回指链、永远拿不到原文。
-    // 正确行为：跳过折叠，各条 stub 各自保留其 file_path 召回指针。
+    // Regression test (real case session c0ad15e6, msg 471/472):
+    // when a tool result's content **is itself already an overflow archive stub** (`[context-overflow-truncated]`
+    // or `[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]`), it is not a "full result", just a recall pointer to the
+    // original text on disk. Byte-identical dedup registers the first seen in reverse order as canonical; when a copy is
+    // byte-identical to canonical ⇒ canonical is likewise a truncated stub. Folding it into "reuse the canonical full
+    // result" would be a false claim, steering the model into a back-reference chain where the next hop is still a stub and the original text is never reached.
+    // Correct behavior: skip folding; each stub keeps its own file_path recall pointer.
     let archived_stub = format!(
         "[context-overflow-truncated] full original archived at: \
          /sess.assets/tool-overflow-compressed/20260803T041154Z-read_file-abc.txt\n\
@@ -1277,7 +1277,7 @@ fn dedup_skips_byte_identical_overflow_archived_stubs() {
         reasoning_content: None,
     }];
 
-    // 5 次读取同一文件，结果内容都已是**同一条截断 stub**（模拟溢出后被反复重放）。
+    // 5 reads of the same file whose results are all already **the same truncated stub** (simulating repeated replays after overflow).
     for i in 0..5 {
         let (a, t) = read_file_call_pair(
             &format!("call_stub_{i}"),
@@ -1288,8 +1288,8 @@ fn dedup_skips_byte_identical_overflow_archived_stubs() {
         messages.push(t);
     }
 
-    // 末尾追加唯一内容的近端 tool 消息，把上面的读取推出 KEEP_RECENT 保护窗，
-    // 确保 dedup 真正作用到它们身上。
+    // Append near-end tool messages with unique content to push the reads above out of the KEEP_RECENT protected window,
+    // making sure dedup actually applies to them.
     for i in 0..8 {
         let (a, t) = read_file_call_pair(
             &format!("call_pad_{i}"),
@@ -1302,8 +1302,8 @@ fn dedup_skips_byte_identical_overflow_archived_stubs() {
 
     let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None, None);
 
-    // 关键断言：绝不能产生任何 "reuse the canonical full result" 的 byte-identical
-    // dedup stub——那会把已截断的 stub 谎报成可复用全文。
+    // Key assertion: no byte-identical dedup stub of the form "reuse the canonical full result" may ever
+    // be produced — that would falsely present an already-truncated stub as reusable full text.
     let lying_dedup_stubs = compressed
         .iter()
         .filter_map(|m| m.content.as_str())
@@ -1314,7 +1314,7 @@ fn dedup_skips_byte_identical_overflow_archived_stubs() {
         "overflow-archived stubs must not be dedup-collapsed into a 'reuse canonical full result' claim"
     );
 
-    // 5 条截断 stub 必须原样保留（各自带 file_path 召回指针），一条都不少。
+    // All 5 truncated stubs must be preserved verbatim (each with its file_path recall pointer), not one missing.
     let preserved_archive_stubs = compressed
         .iter()
         .filter_map(|m| m.content.as_str())
@@ -1587,8 +1587,8 @@ fn mid_turn_compress_preserves_latest_user_message() {
     );
 }
 
-/// 回归：旧工具组已节省超过 4K 时，不能在仍高于 hard_target 的情况下提前返回。
-/// 最新完整工具组（尤其并行结果和大 arguments）必须保留配对结构并按总预算收敛。
+/// Regression: when the older tool groups already saved more than 4K, we must not return early while still above hard_target.
+/// The latest full tool group (especially parallel results and large arguments) must keep its paired structure and converge within the total budget.
 #[tokio::test]
 async fn mid_turn_llm_summary_reaches_hard_target_after_effective_early_folding() {
     let root =
@@ -1750,12 +1750,12 @@ async fn mid_turn_llm_summary_path_a_preserves_raw_archive_pointer() {
 
 #[tokio::test]
 async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
-    // 回归测试：经过持久化压缩后，较早的 user 消息被替换成 internal_note 摘要，
-    // 投影里可见的 role=="user" 边界不足 keep_recent_turns（=2）。retained_turn_start
-    // 返回 0 导致 Path A 被整体跳过，残留的 assistant(tool_calls)/tool 记录（受协议
-    // 配对保护、无法逐条删除）无法被 LLM 语义摘要回收，上下文只增不减。
-    // 修复后：split_at 回退到第一个 user 消息位置，system-like 摘要/归档标记仍由
-    // preserved_system_end 保留，二者之间的旧对话区段可被 Path A 正常摘要。
+    // Regression test: after persistent compression, earlier user messages are replaced by internal_note summaries,
+    // and the visible role=="user" boundary in the projection is fewer than keep_recent_turns (=2). retained_turn_start
+    // returning 0 makes Path A get skipped wholesale, so leftover assistant(tool_calls)/tool records (protected by protocol
+    // pairing, impossible to delete one by one) can never be reclaimed by the LLM semantic summary and the context only grows.
+    // After the fix: split_at falls back to the first user message position, system-like summary/archive markers are still
+    // preserved by preserved_system_end, and the old conversation segment between them can be summarized by Path A normally.
     let app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
     let big_tool_output = "x".repeat(12_000);
     let messages = vec![
@@ -1766,7 +1766,7 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
             tool_call_id: None,
             reasoning_content: None,
         },
-        // 前置压缩产生的摘要 + 归档标记（internal_note，system-like，受保护）
+        // Summary + archive markers produced by the earlier compression (internal_note, system-like, protected)
         Message {
             role: "internal_note".into(),
             content: Value::String("长期记忆摘要（压缩保留）：之前的对话已完成。".into()),
@@ -1781,7 +1781,7 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
             tool_call_id: None,
             reasoning_content: None,
         },
-        // 残留的旧 assistant(tool_calls)+tool（受协议配对保护，无法逐条删除）
+        // Leftover old assistant(tool_calls)+tool (protected by protocol pairing, cannot be deleted one by one)
         Message {
             role: "assistant".into(),
             content: Value::String(String::new()),
@@ -1803,7 +1803,7 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
             tool_call_id: Some("call_old_1".into()),
             reasoning_content: None,
         },
-        // 最近 2 个 user 轮（受保护尾部）
+        // The most recent 2 user turns (protected tail)
         Message {
             role: "user".into(),
             content: Value::String("请继续修改这个文件".into()),
@@ -1843,7 +1843,7 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
         after,
         before
     );
-    // Path A 应对旧前缀生成 [mid-turn-summary] 摘要；修复前 split_at==0 导致 Path A 被跳过
+    // Path A should generate a [mid-turn-summary] for the old prefix; before the fix split_at==0 made Path A get skipped
     let has_mid_turn_summary = compressed.iter().any(|message| {
         message
             .content
@@ -1855,7 +1855,7 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
         "Path A 应对旧前缀生成 [mid-turn-summary] 摘要，实际 roles: {:?}",
         compressed.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
     );
-    // 旧的大块 tool 输出应被摘要回收，不再以原文出现在结果里
+    // The old large tool output should be reclaimed by the summary and no longer appear verbatim in the result
     let still_has_raw_tool_output = compressed.iter().any(|message| {
         message
             .content
@@ -1870,10 +1870,10 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
 
 #[test]
 fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present() {
-    // 回归测试：mid-turn 压缩传入 overflow_dir 后，read_file 等「不可压缩」
-    // 工具的大输出应被零压缩外溢到会话文件 + 留预览 stub，从而真正降低字符数。
-    // 历史 bug：mid-turn 走 None overflow_dir，这类输出既不能裁剪也不能外溢，
-    // 只能原样堆在上下文里，导致每轮只压掉零星几 K（用户报告"压不动"）。
+    // Regression test: once mid-turn compression receives an overflow_dir, large outputs of "incompressible"
+    // tools like read_file must spill with zero compression into the session file + leave a preview stub, actually reducing the character count.
+    // Historical bug: mid-turn passed None overflow_dir, so such outputs could be neither pruned nor spilled;
+    // they just piled up in the context verbatim, shaving only a few K per turn (the user-reported "compression does nothing").
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-midturn-overflow-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![Message {
@@ -1883,10 +1883,10 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         tool_call_id: None,
         reasoning_content: None,
     }];
-    // 10 组 read_file 调用，每条结果超过 8000 字符且内容各异，避免先命中
-    // byte-identical dedup。前 6 组放在真实 user 消息之前，模拟「上一轮未被
-    // 压缩的 read_file 输出」——不在当前 turn 保护窗内、也不在最近 keep_recent
-    // 组内，应被零压缩外溢。
+    // 10 read_file groups, each result over 8000 chars and all distinct, so byte-identical
+    // dedup never hits first. The first 6 groups sit before the real user message, simulating "last turn's
+    // uncompressed read_file outputs" — outside the current-turn protected window and outside the recent
+    // keep_recent groups, they should spill with zero compression.
     for i in 0..6usize {
         let id = format!("call_{i}");
         messages.push(Message {
@@ -1916,8 +1916,8 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         });
     }
 
-    // 真实 user 轮次边界：此后的 read_file 结果属于当前 turn，受 precision
-    // 保护并作为最近工具组保留全文，验证「当前轮不误伤」。
+    // Real user turn boundary: read_file results after it belong to the current turn, protected by
+    // precision and kept in full as the most recent tool group, verifying "the current turn is not collateral damage".
     messages.push(Message {
         role: "user".to_string(),
         content: Value::String("continue".to_string()),
@@ -1967,19 +1967,19 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
         "mid-turn compression with overflow_dir must shrink payload \
          (before={reported_before}, after={reported_after})"
     );
-    // 契约：不可压缩的 read_file 结果被压缩后，必须留下可回读的 file_path 召回锚点，
-    // 且其指向的会话归档文件真实存在、全文零压缩保存。召回锚点有两种合法形态，取决于
-    // 命中的压缩路径（二者都携带指向归档文件的 `file_path:`，断言召回契约而非某条路径
-    // 的字面文案）：
+    // Contract: after an incompressible read_file result is compressed, a readable file_path recall anchor must remain,
+    // and the session archive file it points to must really exist with the full text saved zero-compression. The recall anchor has two legal
+    // shapes depending on the compression path hit (both carry a `file_path:` pointing at the archive; assert the recall contract, not the
+    // literal wording of one path):
     //   - spill stub：`Output preserved for tool `read_file` ... - file_path: ...`
     //   - fold note ：`compressed_tool_round: ... - read_file => - archive_file_path: ...`
-    //     （二级折叠有意把内部 overflow 路径重命名为 `archive_file_path`，避免伪装成
-    //     普通 `file_path` 主线索；同条 note 里的 `- original_file_path:` 指向源码
-    //     文件而非归档，不能当作归档指针。）
+    //     (secondary folding deliberately renames the internal overflow path to `archive_file_path` so it cannot pose as
+    //     the plain `file_path` primary lead; the `- original_file_path:` in the same note points at the source
+    //     file, not the archive, and must not be treated as the archive pointer.)
     //
-    // 注意：不能用 `split("file_path: ").nth(1)` 这种子串切分——fold note 里
-    // `- original_file_path:` 排在 `- archive_file_path:` 前面，子串切分会误把
-    // 源码文件路径当成归档路径（历史 bug：读到 src/lib.rs 仅 1305 字节）。
+    // Note: do not use substring splitting like `split("file_path: ").nth(1)` — in the fold note
+    // `- original_file_path:` comes before `- archive_file_path:`, so substring splitting would mistake the
+    // source file path for the archive path (historical bug: read src/lib.rs at only 1305 bytes).
     let file_path = compressed
         .iter()
         .find_map(|m| {
@@ -1993,8 +1993,8 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
                         .map(str::trim)
                 })
                 .collect();
-            // 优先选择携带完整零压缩内容的 per-tool 归档；若所有候选都不足阈值
-            // （spill 直接命中的 stub 场景下 file_path 就指向完整文件），回退首个候选。
+            // Prefer the per-tool archive carrying complete zero-compression content; if every candidate is under the threshold
+            // (in the stub hit directly by the spill scenario, file_path already points at the full file), fall back to the first candidate.
             let full = candidates
                 .iter()
                 .copied()
@@ -2019,10 +2019,10 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
 
 #[test]
 fn large_image_does_not_evict_tool_history_from_budget() {
-    // 回归测试：一张大 base64 图片不应把 agent 的工具结果（工作记忆）
-    // 挤出上下文。历史 bug：value_len_chars 按 base64 文本长度计费，
-    // 一张 ~900K 字符的图片让 messages_total_chars 暴涨，压缩管线每轮
-    // 都把工具结果删掉 -> agent 失忆 -> 反复重复同样的探索。
+    // Regression test: one large base64 image must not squeeze the agent's tool results (working memory)
+    // out of the context. Historical bug: value_len_chars billed by base64 text length,
+    // so a ~900K-char image ballooned messages_total_chars and the compression pipeline
+    // deleted tool results every turn -> agent amnesia -> repeating the same exploration over and over.
     let huge_base64 = "A".repeat(900_000);
     let image_content = serde_json::json!([
         {
@@ -2062,8 +2062,8 @@ fn large_image_does_not_evict_tool_history_from_budget() {
         },
     ];
 
-    // soft_threshold 36K：若图片仍按 base64 长度计费（900K），会判为超额并
-    // 触发压缩，把 tool 结果删掉。修复后图片仅计 ~1K，总预算远低于阈值。
+    // soft_threshold 36K: if the image were still billed by base64 length (900K), it would be judged over budget and
+    // trigger compression, deleting tool results. After the fix the image counts only ~1K, keeping the total well under the threshold.
     let (compressed, before, after) = mid_turn_compress(messages, 36_000, None, None);
     assert!(
         before <= 36_000,
@@ -2416,8 +2416,8 @@ fn session_delete_cleans_up_overflow_history_file() {
     let _ = std::fs::remove_dir_all(store.session_assets_dir("__cleanup__"));
 }
 
-/// `temp_dir()` 现在与 tool-overflow 同源，落在 `session_assets_dir/tmp/` 下。
-/// 验证 `delete_session` 会连同 `tmp/temp_registry.json` 一起递归清理。
+/// `temp_dir()` now shares its root with tool-overflow, landing under `session_assets_dir/tmp/`.
+/// Verifies that `delete_session` recursively cleans up `tmp/temp_registry.json` along with it.
 #[test]
 fn session_delete_cleans_up_temp_registry() {
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
@@ -2430,7 +2430,7 @@ fn session_delete_cleans_up_temp_registry() {
     let assets = store.session_assets_dir(&session_id);
     let tmp_dir = assets.join("tmp");
     std::fs::create_dir_all(&tmp_dir).unwrap();
-    // 模拟 write_file(temp=true) 写入的临时文件 + 注册表
+    // Simulate temp files written by write_file(temp=true) plus the registry
     std::fs::write(tmp_dir.join("scratch.rs"), "fn main() {}").unwrap();
     std::fs::write(tmp_dir.join("temp_registry.json"), r#"["scratch.rs"]"#).unwrap();
     std::fs::write(&db, b"test").unwrap();
@@ -2540,8 +2540,8 @@ fn history_retains_turns_under_cap() {
     }
 }
 
-/// sqlite 首次打开/WAL 初始化在并行测试负载下可能瞬时报 SQLITE_IOERR（映射为 WouldBlock），
-/// 属于瞬时错误：短退避重试几次（与生产 async 路径的 WouldBlock 重试语义一致）。
+/// sqlite first open / WAL initialization can transiently report SQLITE_IOERR (mapped to WouldBlock) under parallel test load;
+/// it is a transient error: retry a few times with short backoff (same WouldBlock retry semantics as the production async path).
 fn append_history_messages_retry_transient(
     path: &std::path::Path,
     messages: &[Message],
@@ -2880,7 +2880,7 @@ fn context_history_caps_oversized_canonical_tail_without_mutating_canonical_data
     )
     .unwrap();
 
-    // 即使关闭常规 history 压缩，绝对安全上限仍应投影超大 canonical tail。
+    // Even with regular history compression off, the absolute safety cap must still project an oversized canonical tail.
     let context = build_context_history(8, &path, 0, 8, 2_000, Some(overflow_dir.clone()), None).unwrap();
     let projected = context
         .iter()
@@ -3220,24 +3220,24 @@ fn multiline_history_navigation_restores_draft() {
 fn table_preview_lines_are_not_double_printed_after_live_emit() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
 
-    // 流式表格渲染：表头行进入静默缓冲（等待分隔行确认是否成表），缓冲期间
-    // 输出"生成表格中"占位预览，不直接 echo 原始文本——否则最终成表时会与
-    // 渲染后的表头重复打印。
+    // Streaming table rendering: the header row enters silent buffering (waiting for a separator row to confirm a table); while
+    // buffering, a "generating table" placeholder preview is emitted instead of echoing the raw text — otherwise the
+    // final table would print the rendered header twice.
     let header_out = renderer.consume_line("| name | value |", false);
     assert!(header_out.contains("\x1b["));
     assert!(!header_out.contains("| name | value |"));
 
-    // 分隔行确认成表后，表内容继续静默缓冲（不再 echo 原始行）。
+    // Once the separator row confirms a table, table content keeps buffering silently (no more echoing raw rows).
     let sep_out = renderer.consume_line("| --- | --- |", true);
     assert_eq!(sep_out, "");
     let row_out = renderer.consume_line("| foo | bar |", true);
     assert_eq!(row_out, "");
 
-    // 表格结束（非表格行 "done"）时，先清除占位预览，再一次性渲染完整表格。
+    // When the table ends (non-table row "done"), clear the placeholder preview first, then render the complete table in one shot.
     let end_out = renderer.consume_line("done", false);
-    // 清除占位预览的 ANSI 序列
+    // ANSI sequence that clears the placeholder preview
     assert!(end_out.contains("\x1b[1A"));
-    // 渲染后的表格包含表头与数据，但原始 markdown 文本不单独出现
+    // The rendered table contains header and data, but the raw markdown text does not appear separately
     assert!(end_out.contains("name"));
     assert!(end_out.contains("value"));
     assert!(end_out.contains("foo"));
@@ -3245,7 +3245,7 @@ fn table_preview_lines_are_not_double_printed_after_live_emit() {
     assert!(!end_out.contains("| name | value |"));
     assert!(!end_out.contains("| --- | --- |"));
     assert!(!end_out.contains("| foo | bar |"));
-    // 表格后的普通文本正常输出
+    // Plain text after the table outputs normally
     assert!(end_out.contains("done"));
 }
 
@@ -3260,8 +3260,8 @@ fn table_live_preview_detection_requires_table_like_content() {
 #[test]
 fn math_frac_renders_with_nested_braces() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
-    // 块级数学行改为缓冲：`$$`/`\[` 到 `$$`/`\]` 之间的行先累积，闭合分隔符到达时
-    // 一次性渲染，避免实时预览先吐原始 TeX、换行后再补 Unicode 成品造成重复输出。
+    // Block math lines now buffer: lines between `$$`/`\[` and `$$`/`\]` accumulate first and render
+    // in one shot when the closing delimiter arrives, preventing the live preview from emitting raw TeX and then appending the Unicode result after a newline (duplicate output).
     assert_eq!(renderer.consume_line("$$", false), "");
     assert_eq!(
         renderer.consume_line(r"x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}", false),
@@ -3283,7 +3283,7 @@ fn math_frac_renders_with_nested_braces() {
 #[test]
 fn math_renderer_preserves_longer_commands_and_literal_braces() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
-    // 块级数学行缓冲后在闭合分隔符处一次性渲染（见上）。
+    // Buffered block math lines render in one shot at the closing delimiter (see above).
     assert_eq!(renderer.consume_line("$$", false), "");
     assert_eq!(
         renderer.consume_line(
@@ -3310,7 +3310,7 @@ fn math_renderer_preserves_longer_commands_and_literal_braces() {
 #[test]
 fn math_renderer_maps_mathbb_and_preserves_unknown_commands() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
-    // 块级数学行缓冲后在闭合分隔符处一次性渲染（见上）。
+    // Buffered block math lines render in one shot at the closing delimiter (see above).
     assert_eq!(renderer.consume_line("$$", false), "");
     assert_eq!(
         renderer.consume_line(r"\mathbb{R} \customcmd \alpha", false),
@@ -3332,67 +3332,67 @@ fn execute_command_blocks_dangerous_programs() {
 
 #[test]
 fn execute_command_blocks_git_destructive_to_uncommitted() {
-    // checkout：会丢弃工作树改动
+    // checkout: discards worktree changes
     assert!(tools::validate_execute_command("git checkout -- src/main.rs").is_err());
     assert!(tools::validate_execute_command("git checkout -- .").is_err());
     assert!(tools::validate_execute_command("git checkout .").is_err());
     assert!(tools::validate_execute_command("git checkout -f main").is_err());
     assert!(tools::validate_execute_command("git checkout --force main").is_err());
     assert!(tools::validate_execute_command("git -C /repo checkout -- x").is_err());
-    // checkout：纯分支切换，git 会保护未提交改动，放行
+    // checkout: pure branch switch; git protects uncommitted changes, allow
     assert!(tools::validate_execute_command("git checkout main").is_ok());
     assert!(tools::validate_execute_command("git checkout -b feature/x").is_ok());
-    // checkout：-B 会强制重置并切分支，丢弃未提交改动
+    // checkout: -B force-resets and switches branches, discarding uncommitted changes
     assert!(tools::validate_execute_command("git checkout -B main").is_err());
     assert!(tools::validate_execute_command("git checkout --force-create main").is_err());
-    // checkout：无 -- 但路径启发式判定为文件（含扩展名）
+    // checkout: no -- but the path heuristic judges it a file (has an extension)
     assert!(tools::validate_execute_command("git checkout src/main.rs").is_err());
     assert!(tools::validate_execute_command("git checkout README.md").is_err());
     assert!(tools::validate_execute_command("git checkout main.rs").is_err());
     assert!(tools::validate_execute_command("git checkout archive.tar.gz").is_err());
-    // checkout：不含扩展名的参数不误拦（分支/tag 形态）
+    // checkout: arguments without an extension are not falsely blocked (branch/tag shapes)
     assert!(tools::validate_execute_command("git checkout main").is_ok());
     assert!(tools::validate_execute_command("git checkout v1.2.3").is_ok());
     assert!(tools::validate_execute_command("git checkout feature/x").is_ok());
 
-    // restore：默认恢复工作树会丢弃未提交改动
+    // restore: restoring the worktree by default discards uncommitted changes
     assert!(tools::validate_execute_command("git restore src/main.rs").is_err());
     assert!(tools::validate_execute_command("git restore --worktree src/main.rs").is_err());
     assert!(tools::validate_execute_command("git restore --source=HEAD~1 src/main.rs").is_err());
-    // restore：仅取消暂存，工作树不动，放行
+    // restore: only unstages, the worktree is untouched, allow
     assert!(tools::validate_execute_command("git restore --staged src/main.rs").is_ok());
     assert!(
         tools::validate_execute_command("git restore --staged --source=HEAD src/main.rs").is_ok()
     );
 
-    // reset：--hard/--merge/--keep 丢弃未提交改动
+    // reset: --hard/--merge/--keep discard uncommitted changes
     assert!(tools::validate_execute_command("git reset --hard").is_err());
     assert!(tools::validate_execute_command("git reset --hard HEAD~1").is_err());
     assert!(tools::validate_execute_command("git reset --merge").is_err());
     assert!(tools::validate_execute_command("git reset --keep").is_err());
-    // reset：--soft / 默认(mixed) 保留工作树，放行
+    // reset: --soft / default (mixed) keep the worktree, allow
     assert!(tools::validate_execute_command("git reset --soft HEAD~1").is_ok());
     assert!(tools::validate_execute_command("git reset").is_ok());
     assert!(tools::validate_execute_command("git reset HEAD~1").is_ok());
 
-    // clean：-f 删除未跟踪文件，不可回滚
+    // clean: -f deletes untracked files, not recoverable
     assert!(tools::validate_execute_command("git clean -f").is_err());
     assert!(tools::validate_execute_command("git clean -fd").is_err());
     assert!(tools::validate_execute_command("git clean --force").is_err());
-    // clean：dry-run 等不实际删除，放行
+    // clean: dry-run and friends do not actually delete, allow
     assert!(tools::validate_execute_command("git clean -n").is_ok());
 
-    // switch：force 切分支会丢弃未提交改动
+    // switch: force branch switch discards uncommitted changes
     assert!(tools::validate_execute_command("git switch -f main").is_err());
     assert!(tools::validate_execute_command("git switch --force main").is_err());
     assert!(tools::validate_execute_command("git switch --discard-changes main").is_err());
     assert!(tools::validate_execute_command("git switch -C fix").is_err());
     assert!(tools::validate_execute_command("git switch --force-create fix").is_err());
-    // switch：纯创建/切换分支，git 保护未提交改动，放行
+    // switch: pure branch create/switch; git protects uncommitted changes, allow
     assert!(tools::validate_execute_command("git switch main").is_ok());
     assert!(tools::validate_execute_command("git switch -c feature/x").is_ok());
 
-    // 经间接包装器（env/xargs）也需拦截
+    // Must also be blocked through indirect wrappers (env/xargs)
     assert!(tools::validate_execute_command("env git checkout -- x").is_err());
     assert!(tools::validate_execute_command("xargs git reset --hard").is_err());
 }
