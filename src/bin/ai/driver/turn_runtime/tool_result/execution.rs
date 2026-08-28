@@ -3725,7 +3725,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             };
             // Pre-tool-round hook (on_before_tools → ExecuteTools.before).
             app.fire_before_tools_hooks();
-            *terminal_dedupe_candidate = handle_tool_call_round(
+            let tool_round_candidate = handle_tool_call_round(
                 app,
                 source_model,
                 mcp_client,
@@ -3740,6 +3740,14 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 &suppressed_read_only_results,
                 turn_had_tool_error,
             )?;
+            // A candidate armed by a final gate reopen (the draft conclusion was already
+            // streamed live) must survive this verification tool round: the model is
+            // expected to re-answer verbatim after verification, and only the draft
+            // (not the tool round's short narration) can suppress that redraw in the
+            // next round's terminal dedupe. Only fill the slot when it is empty.
+            if terminal_dedupe_candidate.is_none() {
+                *terminal_dedupe_candidate = tool_round_candidate;
+            }
             append_auto_image_followup_message(
                 app,
                 question,
@@ -5799,6 +5807,152 @@ mod tests {
             }));
 
         let _ = fs::remove_dir_all(root);
+        });
+    }
+
+    #[test]
+    fn citation_reopen_candidate_survives_verification_tool_round() {
+        // Regression: when the citation gate reopens a draft conclusion, the draft is
+        // armed as the terminal-dedupe candidate. A verification tool round in between
+        // must NOT clobber it with the tool round's own short narration, otherwise the
+        // verbatim final answer would be redrawn (terminal double output).
+        let root = std::env::temp_dir().join(format!(
+            "citation-reopen-dedupe-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "first\nsecond\n").unwrap();
+
+        SUBAGENT_CWD.sync_scope(root.clone(), || {
+            let mut app = test_app_with_tools(&[TEST_REPLAY_TOOL]);
+            let shared_mcp =
+                std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+            let mut messages = Vec::new();
+            let mut turn_messages = Vec::new();
+            let mut persisted_turn_messages = 0usize;
+            let mut final_assistant_text = String::new();
+            let mut final_assistant_recorded = false;
+            let mut force_final_response = false;
+            let mut terminal_dedupe_candidate = None;
+            let mut turn_had_tool_error = false;
+            let draft = "Implemented the change in src/lib.rs:9.";
+            let final_response = || {
+                IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                    outcome: crate::ai::types::StreamOutcome::Completed,
+                    assistant_text: draft.to_string(),
+                    skip_response_drain: true,
+                    ..Default::default()
+                })
+            };
+
+            // Step 1: the citation gate cannot validate src/lib.rs:9 (the file only has
+            // two lines) and reopens; the draft is armed as the dedupe candidate.
+            let first_step = handle_iteration_execution(
+                &mut app,
+                "fix the bug",
+                &mcp_snapshot(&shared_mcp),
+                &shared_mcp,
+                final_response(),
+                &mut messages,
+                &mut turn_messages,
+                false,
+                &mut persisted_turn_messages,
+                &mut final_assistant_text,
+                &mut final_assistant_recorded,
+                &mut force_final_response,
+                &mut terminal_dedupe_candidate,
+                true,
+                2,
+                16,
+                0,
+                &mut turn_had_tool_error,
+            )
+            .unwrap();
+            assert!(matches!(first_step, TurnLoopStep::Continue));
+            assert_eq!(
+                terminal_dedupe_candidate.as_deref(),
+                Some(draft),
+                "reopen must arm the draft conclusion"
+            );
+
+            // Step 2: the model verifies with a tool round. The tool round's own
+            // narration must not replace the armed draft candidate.
+            let second_step = handle_iteration_execution(
+                &mut app,
+                "fix the bug",
+                &mcp_snapshot(&shared_mcp),
+                &shared_mcp,
+                IterationExecution::ToolCall(ToolCallExecution {
+                    stream_result: crate::ai::types::StreamResult {
+                        outcome: crate::ai::types::StreamOutcome::ToolCall,
+                        assistant_text: "核对计数器定义区块的行号，确保最终引用精确。".to_string(),
+                        tool_calls: vec![test_tool_call(
+                            "call_verify",
+                            TEST_REPLAY_TOOL,
+                            serde_json::json!({ "file_path": "src/lib.rs" }),
+                        )],
+                        skip_response_drain: true,
+                        ..Default::default()
+                    },
+                    allowed_tool_names: rust_tools::commonw::FastSet::from_iter([
+                        TEST_REPLAY_TOOL.to_string()
+                    ]),
+                }),
+                &mut messages,
+                &mut turn_messages,
+                false,
+                &mut persisted_turn_messages,
+                &mut final_assistant_text,
+                &mut final_assistant_recorded,
+                &mut force_final_response,
+                &mut terminal_dedupe_candidate,
+                true,
+                3,
+                16,
+                0,
+                &mut turn_had_tool_error,
+            )
+            .unwrap();
+            assert!(matches!(second_step, TurnLoopStep::Continue));
+            assert_eq!(
+                terminal_dedupe_candidate.as_deref(),
+                Some(draft),
+                "a verification tool round must not clobber the reopen-armed draft candidate"
+            );
+
+            // Step 3: the model re-answers verbatim; because the draft candidate
+            // survived, the stream dedupe can suppress the redraw (candidate now only
+            // carries the user-visible warning for the final terminal redraw).
+            let third_step = handle_iteration_execution(
+                &mut app,
+                "fix the bug",
+                &mcp_snapshot(&shared_mcp),
+                &shared_mcp,
+                final_response(),
+                &mut messages,
+                &mut turn_messages,
+                false,
+                &mut persisted_turn_messages,
+                &mut final_assistant_text,
+                &mut final_assistant_recorded,
+                &mut force_final_response,
+                &mut terminal_dedupe_candidate,
+                true,
+                4,
+                16,
+                0,
+                &mut turn_had_tool_error,
+            )
+            .unwrap();
+            assert!(matches!(third_step, TurnLoopStep::Break));
+            assert!(final_assistant_recorded);
+            assert!(final_assistant_text.starts_with(draft));
+            assert_eq!(
+                terminal_dedupe_candidate.as_deref(),
+                Some(FINAL_CITATION_WARNING)
+            );
+
+            let _ = fs::remove_dir_all(root);
         });
     }
 

@@ -2464,7 +2464,7 @@ fn task_wait_status_idle_results_do_not_count_as_mutation_progress() {
         (
             "task_wait",
             serde_json::json!({ "task_ids": ["task-1"], "timeout_secs": 1 }),
-            "[task_wait] All 1 referenced task(s) already completed and their results were delivered by an earlier task_wait call. No tasks remain to wait on; continue reasoning with the results you already collected.",
+            "[task_wait] All 1 referenced task(s) already completed and their results were delivered by an earlier task result tool call. No tasks remain to wait on; the wait is OVER (unlike PARKED/BUDGET-ELAPSED, do NOT re-call task_wait for these ids — call `task_integrate` or continue reasoning with the results you already collected).",
         ),
         (
             "task_wait",

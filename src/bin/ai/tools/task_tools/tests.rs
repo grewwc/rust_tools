@@ -1,17 +1,19 @@
 use super::{
     AsyncTaskEntry, InheritOptions, OsTaskGoal, OutstandingTaskSnapshot, PreparedSubagentTask,
     SUBAGENT_PARENT_SUMMARY_REMINDER, SUBAGENT_WALL_CLOCK_TIMEOUT, SelectedSubagent,
-    StoredTaskResult, TASK_REGISTRY, TASK_RETRY_REGISTRY, WaitManySource,
+    StoredTaskResult, TASK_REGISTRY, TASK_RETRY_REGISTRY, TASK_WAIT_NOOP_COUNTS, WaitManySource,
     append_current_process_cancel_source, build_outstanding_task_anchor,
-    build_selection_explanation, capped_subagent_manifest, discard_tasks_for_session,
+    build_selection_explanation, bump_task_wait_noop_count, capped_subagent_manifest,
+    discard_tasks_for_session,
     encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels, execute_task_cancel,
     execute_task_integrate, execute_task_retry, execute_task_spawn, execute_task_spawn_batch,
     execute_task_status, execute_task_wait, expire_task_wait_states_for_test,
     format_task_result_with_id, insert_task_entry_for_test, is_encoded_task_goal,
     is_retryable_task_status, parse_task_wait_options, prepare_subagent_task,
     reap_timed_out_subagents, record_subagent_progress_update, register_retry_spec,
-    remove_task_entry, render_outstanding_task_anchor, select_subagent,
-    task_wait_state_count_for_test, validate_subagent_response,
+    remove_task_entry, render_outstanding_task_anchor, reset_task_wait_noop_counts_for_test,
+    select_subagent,
+    task_wait_key, task_wait_state_count_for_test, validate_subagent_response,
     wait_sources_for_channel_and_futex, wake_expired_task_waits, with_task_entry_by_pid,
     wrap_subagent_prompt,
 };
@@ -1066,6 +1068,101 @@ fn task_wait_distinguishes_delivered_and_unknown_registry_misses() {
 }
 
 #[test]
+fn task_wait_escalates_repeated_noop_wait_on_delivered_task_to_error() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = std::env::temp_dir().join(format!(
+        "task-wait-noop-escalation-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    app.config.history_file = root.join("history.sqlite");
+    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    {
+        let mut os = app.os.lock().unwrap();
+        os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+    }
+    let delivered_task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    crate::ai::history::record_delivered_task_evidence(
+        app.config.history_file.as_path(),
+        &app.session_id,
+        crate::ai::history::DeliveredTaskEvidence {
+            task_id: &delivered_task_id,
+            description: "already delivered",
+            agent_name: "explore",
+            model: "qwen3.7-max",
+            status: "completed",
+            payload: "delivered result",
+        },
+    )
+    .unwrap();
+    // DriverContext is not Clone, so rebuild it per call (all fields are cheap Arc clones).
+    let make_context = || {
+        DriverContext::new(
+            app.clone(),
+            Arc::new(std::sync::Mutex::new(McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        )
+    };
+    let run = |task_id: &str| {
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+            (app.session_id.clone(), 0usize),
+            || {
+                DRIVER_CTX.sync_scope(make_context(), || {
+                    execute_task_wait(&serde_json::json!({ "task_ids": [task_id] }))
+                })
+            },
+        )
+    };
+
+    // First two no-op polls on the delivered id stay soft (below the escalation threshold)...
+    let first = run(&delivered_task_id).unwrap();
+    assert!(first.contains("results were delivered"));
+    let second = run(&delivered_task_id).unwrap();
+    assert!(second.contains("results were delivered"));
+    // ...the third consecutive no-op poll for the same key escalates to an error...
+    let third = run(&delivered_task_id).expect_err("no-op wait must escalate to an error");
+    assert!(third.contains("Repeated task_wait"));
+    assert!(third.contains("task_integrate"));
+    // ...and stays an error on further repeats instead of going soft again.
+    let fourth = run(&delivered_task_id).expect_err("further repeats must stay errors");
+    assert!(fourth.contains("Repeated task_wait"));
+
+    // Per-key isolation: a different delivered id has its own counter and stays soft.
+    let other_task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    crate::ai::history::record_delivered_task_evidence(
+        app.config.history_file.as_path(),
+        &app.session_id,
+        crate::ai::history::DeliveredTaskEvidence {
+            task_id: &other_task_id,
+            description: "other delivered",
+            agent_name: "explore",
+            model: "qwen3.7-max",
+            status: "completed",
+            payload: "other result",
+        },
+    )
+    .unwrap();
+    let other = run(&other_task_id).unwrap();
+    assert!(other.contains("results were delivered"));
+
+    // Reset the global counter so later tests start clean.
+    reset_task_wait_noop_counts_for_test();
+
+    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        *guard = None;
+    }
+    let sessions_root = crate::ai::history::SessionStore::new(&app.config.history_file)
+        .sessions_root()
+        .to_path_buf();
+    let _ = std::fs::remove_dir_all(sessions_root);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() {
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()
@@ -1743,6 +1840,20 @@ fn discard_session_removes_retry_specs_after_active_tasks_are_gone() {
             .unwrap()
             .get_ref(&task_id)
             .is_none()
+    );
+}
+
+#[test]
+fn discard_session_clears_task_wait_noop_counts() {
+    let session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    let key = task_wait_key(&session_id, 1, &WaitPolicy::All, &["task-1".to_string()]);
+    assert_eq!(bump_task_wait_noop_count(&key), 1);
+
+    discard_tasks_for_session(&session_id);
+
+    assert!(
+        TASK_WAIT_NOOP_COUNTS.lock().unwrap().get(&key).is_none(),
+        "session deletion must drop the dead no-op wait counter"
     );
 }
 

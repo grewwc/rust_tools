@@ -528,6 +528,30 @@ struct TaskWaitState {
 static TASK_WAIT_STATES: LazyLock<Mutex<FxHashMap<TaskWaitKey, TaskWaitState>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
+/// Consecutive `task_wait` calls that found every referenced task already delivered (the
+/// "all completed" no-op path). Once results are delivered, waiting is over: PARKED /
+/// BUDGET-ELAPSED legitimately ask the model to re-call `task_wait` to keep waiting, and a stuck
+/// model can wrongly extend that instruction to this terminal case (observed: an 11-round wait
+/// loop on an already-delivered task). After `TASK_WAIT_NOOP_ERROR_THRESHOLD` consecutive no-op
+/// calls for the same key, the tool escalates the soft hint into an error so the loop is broken
+/// by a distinct signal. Any real wait (pending tasks still running) resets the count for that
+/// key.
+const TASK_WAIT_NOOP_ERROR_THRESHOLD: u32 = 3;
+
+static TASK_WAIT_NOOP_COUNTS: LazyLock<Mutex<FxHashMap<TaskWaitKey, u32>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+fn bump_task_wait_noop_count(key: &TaskWaitKey) -> u32 {
+    let mut counts = TASK_WAIT_NOOP_COUNTS.lock().unwrap();
+    let count = counts.entry(key.clone()).or_insert(0);
+    *count += 1;
+    *count
+}
+
+fn reset_task_wait_noop_count(key: &TaskWaitKey) {
+    TASK_WAIT_NOOP_COUNTS.lock().unwrap().remove(key);
+}
+
 const OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX: &str = "[pending-subagent-tasks]";
 
 /// Task id list produced by the most recent successful `task_spawn` / `task_spawn_batch`, used to
@@ -766,6 +790,11 @@ pub(crate) fn expire_task_wait_states_for_test() {
 #[cfg(test)]
 pub(crate) fn task_wait_state_count_for_test() -> usize {
     TASK_WAIT_STATES.lock().unwrap().len()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_task_wait_noop_counts_for_test() {
+    TASK_WAIT_NOOP_COUNTS.lock().unwrap().clear();
 }
 
 pub(crate) fn wake_expired_task_waits() {
@@ -1799,10 +1828,38 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // delivered by the ledger are dropped here.
     let task_ids = task_ids_filtered;
     if task_ids.is_empty() {
+        // Repeatedly waiting on already-delivered ids is a no-op: the results were already surfaced
+        // by an earlier task result tool call. PARKED / BUDGET-ELAPSED instruct re-calling
+        // task_wait to keep waiting, and a stuck model may wrongly extend that instruction to this
+        // terminal case. Count consecutive no-op calls for this key and escalate to an error after
+        // TASK_WAIT_NOOP_ERROR_THRESHOLD so the loop is broken with a distinct signal instead of an
+        // ever-softer hint.
+        let wait_key = task_wait_key(
+            &current_session_id,
+            current_owner_pid,
+            &wait_policy,
+            &requested_task_ids,
+        );
+        let noop_count = bump_task_wait_noop_count(&wait_key);
+        if noop_count >= TASK_WAIT_NOOP_ERROR_THRESHOLD {
+            return Err(format!(
+                "Repeated task_wait on task_id(s) whose results were already delivered \
+                 ({} consecutive no-op calls). The wait is OVER — this is NOT a PARKED or \
+                 BUDGET-ELAPSED state, so do NOT call task_wait again for these ids; each repeat \
+                 produces no new information. Call `task_integrate` with the task_id(s) below to \
+                 persist the delivered results into the evidence ledger, or `task_status` for a \
+                 non-blocking snapshot.\n\
+                 task_ids: {}",
+                noop_count,
+                already_delivered.join(", ")
+            ));
+        }
         return Ok(format!(
             "[task_wait] All {} referenced task(s) already completed and \
              their results were delivered by an earlier task result tool call. No tasks remain to \
-             wait on; continue reasoning with the results you already collected.",
+             wait on; the wait is OVER (unlike PARKED/BUDGET-ELAPSED, do NOT re-call task_wait for \
+             these ids — call `task_integrate` or continue reasoning with the results you already \
+             collected).",
             already_delivered.len()
         ));
     }
@@ -1815,6 +1872,9 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         &wait_policy,
         &requested_task_ids,
     );
+    // A real wait (still-pending tasks) proves the model is not stuck polling delivered ids, so
+    // reset the no-op escalation counter for this key.
+    reset_task_wait_noop_count(&wait_key);
     let wait_state = load_or_create_task_wait_state(&wait_key, timeout_secs);
     let wait_budget_elapsed = wait_state.expired;
 
@@ -2528,6 +2588,13 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
         }
     }
     TASK_WAIT_STATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .retain(|key, _| key.session_id != session_id);
+    // Same session-scoped cleanup for the task_wait no-op escalation counter: keys keyed by a
+    // deleted session's id can never be bumped or reset again, so drop them to avoid accumulating
+    // dead entries in the long-lived process.
+    TASK_WAIT_NOOP_COUNTS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .retain(|key, _| key.session_id != session_id);
