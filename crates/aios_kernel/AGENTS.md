@@ -45,3 +45,10 @@ cargo test -p aios_kernel test_name
 6. **`LocalOS` state is guarded by the caller** via
    `SharedKernel = Arc<Mutex<Box<dyn Kernel + Send>>>` - kernel methods must
    not block or await.
+7. **Process-table lifecycle.** `remove_process_entry_raw` reattaches surviving
+   children to the oldest live foreground process (deterministic root via
+   `min_by_key(pid)`, pids increase monotonically) instead of orphaning them, so
+   child-scoped ops (`kill_process` / `signal_process` / `reap_process` /
+   `wait_on`) always have a manageable owner. A target pid absent from the
+   process table reports `"Process {pid} does not exist."` rather than a
+   misleading "outside its scope" error.
