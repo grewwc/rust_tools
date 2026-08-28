@@ -54,7 +54,7 @@ impl ContextBudgetRollbackReason {
     pub(super) fn note(self) -> &'static str {
         match self {
             ContextBudgetRollbackReason::NoAdditionalSavings => {
-                "lossy compression rolled back because it did not improve beyond lossless prepass"
+                "lossy compression rolled back because it did not improve beyond deterministic prepasses"
             }
             ContextBudgetRollbackReason::ProtectedContextChanged => {
                 "compression rolled back because protected system/current-user context changed"
@@ -77,6 +77,10 @@ pub(super) struct ContextBudgetReport {
     pub(super) lossy_candidate_chars: usize,
     pub(super) lossless_removed_messages: usize,
     pub(super) lossless_saved_chars: usize,
+    pub(super) memory_projection_removed_messages: usize,
+    pub(super) memory_projection_selected_messages: usize,
+    pub(super) memory_projection_saved_chars: usize,
+    pub(super) memory_projection_index_chars: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,7 +118,10 @@ pub(super) fn apply_pre_request_context_budget(
         ..ContextBudgetReport::default()
     };
 
-    if scan.total_chars <= target_chars && !scan.has_lossless_candidate {
+    if scan.total_chars <= target_chars
+        && !scan.has_lossless_candidate
+        && !super::context_memory::has_dense_recoverable_memory(messages)
+    {
         return report;
     }
 
@@ -130,7 +137,21 @@ pub(super) fn apply_pre_request_context_budget(
         }
     }
 
-    if after_lossless_chars <= target_chars {
+    let memory_projection =
+        super::context_memory::apply_query_aware_memory_projection(messages, target_chars);
+    report.memory_projection_removed_messages = memory_projection.removed_messages;
+    report.memory_projection_selected_messages = memory_projection.selected_messages;
+    report.memory_projection_saved_chars = memory_projection.saved_chars;
+    report.memory_projection_index_chars = memory_projection.index_chars;
+    let after_prepass_chars = if memory_projection.removed_messages > 0 {
+        report.changed = true;
+        report.after_chars = memory_projection.after_chars;
+        memory_projection.after_chars
+    } else {
+        after_lossless_chars
+    };
+
+    if after_prepass_chars <= target_chars {
         if report.changed {
             fill_segment_summary(&mut report, messages);
         }
@@ -162,12 +183,12 @@ pub(super) fn apply_pre_request_context_budget(
     // a full context" (see CONTEXT_COMPACTION_STATE).
     reposition_context_compaction_state_before_last_user(messages);
     report.after_chars = after_chars;
-    report.changed = report.changed || after_chars < after_lossless_chars;
+    report.changed = report.changed || after_chars < after_prepass_chars;
 
     let protected_preserved = protected_messages_preserved(messages, &protected);
     let rollback_reason = if !protected_preserved {
         Some(ContextBudgetRollbackReason::ProtectedContextChanged)
-    } else if after_chars > after_lossless_chars {
+    } else if after_chars > after_prepass_chars {
         Some(ContextBudgetRollbackReason::NoAdditionalSavings)
     } else {
         None
@@ -175,8 +196,9 @@ pub(super) fn apply_pre_request_context_budget(
 
     if let Some(reason) = rollback_reason {
         *messages = original;
-        report.after_chars = after_lossless_chars;
-        report.changed = report.lossless_removed_messages > 0;
+        report.after_chars = after_prepass_chars;
+        report.changed = report.lossless_removed_messages > 0
+            || report.memory_projection_removed_messages > 0;
         report.rolled_back = after_chars < scan.total_chars;
         if report.rolled_back {
             report.rollback_reason = Some(reason);
@@ -325,6 +347,10 @@ fn summarize_segments(
             .sum(),
         lossless_removed_messages: 0,
         lossless_saved_chars: 0,
+        memory_projection_removed_messages: 0,
+        memory_projection_selected_messages: 0,
+        memory_projection_saved_chars: 0,
+        memory_projection_index_chars: 0,
     }
 }
 
@@ -688,6 +714,38 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn context_budget_preserves_hierarchical_memory_index_through_later_compression() {
+        let history_file = std::env::temp_dir().join(format!(
+            "context-budget-memory-index-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(history_file);
+        let current_user = msg("user", "continue checkpoint topic-3");
+        let mut messages = vec![msg("system", "system prompt must stay exact")];
+        for index in 0..16 {
+            messages.push(msg(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                format!(
+                    "[context_checkpoint path=/tmp/test.assets/context-checkpoints/{index}.md] \
+                     topic-{index} {}",
+                    "x".repeat(1_200)
+                ),
+            ));
+        }
+        messages.push(msg("assistant", "old narration ".repeat(4_000)));
+        messages.push(current_user.clone());
+
+        let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+
+        assert!(report.memory_projection_removed_messages > 0);
+        assert_eq!(messages.last(), Some(&current_user));
+        assert!(messages.iter().any(|message| {
+            crate::ai::history::value_to_string(&message.content)
+                .starts_with(crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX)
+        }));
     }
 
     #[test]

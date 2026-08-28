@@ -21,6 +21,7 @@
 // =============================================================================
 
 mod context_budget;
+mod context_memory;
 mod debug;
 mod finalize;
 mod iteration;

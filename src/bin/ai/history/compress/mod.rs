@@ -90,7 +90,7 @@ pub(in crate::ai) fn is_summary_note_text(text: &str) -> bool {
 }
 
 /// 判断一段文本是否是 overflow 归档指针 note。
-fn is_archive_note_text(text: &str) -> bool {
+pub(in crate::ai) fn is_archive_note_text(text: &str) -> bool {
     text.trim_start().starts_with(ARCHIVE_NOTE_PREFIX)
 }
 
@@ -170,6 +170,7 @@ const MAX_SELF_NOTES_IN_MESSAGES: usize = 8;
 /// 更早的证据会零压缩追加到 overflow-history.md，只在 messages 中保留统一回指。
 const MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS: usize = 12_000;
 const CONTEXT_CHECKPOINT_MARKER_PREFIX: &str = "[context_checkpoint";
+pub(in crate::ai) const QUERY_MEMORY_INDEX_PREFIX: &str = "[query-memory-index-v1]";
 
 pub(in crate::ai) fn compressed_tool_evidence_inline_chars_limit() -> usize {
     MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS
@@ -205,16 +206,23 @@ fn is_self_note_message(m: &Message) -> bool {
     s.trim_start().starts_with("self_note:")
 }
 
-/// checkpoint 正文已写入会话 asset；这里的短标记是模型在压缩后重新找到正文的
-/// 唯一索引，因此既不能被摘要吞掉，也不能被普通裁剪删掉。
-pub(super) fn is_context_checkpoint_marker(m: &Message) -> bool {
-    m.role == ROLE_INTERNAL_NOTE
-        && value_to_string(&m.content)
-            .trim_start()
-            .starts_with(CONTEXT_CHECKPOINT_MARKER_PREFIX)
+/// The checkpoint body is already written to the session asset; this short
+/// marker is the model's only index for relocating that body after
+/// compression, so history compression must never swallow or drop it. The
+/// request projection may replace many old markers with a hierarchical index
+/// holding every exact path; that index is protected by the same rule, and the
+/// original markers always stay in canonical history.
+pub(in crate::ai) fn is_context_checkpoint_marker(m: &Message) -> bool {
+    if m.role != ROLE_INTERNAL_NOTE {
+        return false;
+    }
+    let content = value_to_string(&m.content);
+    let content = content.trim_start();
+    content.starts_with(CONTEXT_CHECKPOINT_MARKER_PREFIX)
+        || content.starts_with(QUERY_MEMORY_INDEX_PREFIX)
 }
 
-pub(super) fn is_compressed_tool_evidence_note(m: &Message) -> bool {
+pub(in crate::ai) fn is_compressed_tool_evidence_note(m: &Message) -> bool {
     m.role == ROLE_INTERNAL_NOTE
         && value_to_string(&m.content)
             .trim_start()

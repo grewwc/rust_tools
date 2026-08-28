@@ -14,6 +14,7 @@ use crate::ai::history::{
     Message, ROLE_SYSTEM, clear_runtime_message_metadata, is_internal_note_role,
     is_summary_note_text, is_system_like_role,
 };
+use crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX;
 use crate::ai::models;
 use crate::ai::types::App;
 
@@ -232,22 +233,38 @@ pub(super) fn strip_unavailable_tool_hints_from_messages(
 
 const MERGED_NOTES_MAX_CHARS: usize = 4_000;
 const MERGED_SINGLE_NOTE_MAX_CHARS: usize = 1_200;
-/// 持久化 checkpoint 全部保存在 history 中；请求只投影最近有限条，避免 marker
-/// 本身随着长期会话无限增长。
+/// Persisted checkpoints all stay in canonical history; the request only projects the most
+/// recent few, so the markers themselves cannot grow without bound over long sessions.
 const REQUEST_CONTEXT_CHECKPOINT_LIMIT: usize = 8;
 
-/// checkpoint marker 是压缩后重新定位归档正文的短索引，写入端**始终**是
-/// `role=internal_note`（见 `history::compress::is_context_checkpoint_marker`）。
-/// 请求归一化会把 marker 收集后拼进一条独立 `system` 消息注入模型，因此这里
-/// **必须同时校验 role**：若仅按 content 前缀识别，任何 user/tool/assistant
-/// 正文只要以 `[context_checkpoint ` 开头就会被提权成 system 指令并注入——
-/// 一条跨信任边界的 prompt 注入通道。合法 marker（internal_note）行为不变。
+/// The checkpoint marker is the short index the model uses to relocate the
+/// archived body text after compression; the writer is always
+/// `role=internal_note` (see `history::compress::is_context_checkpoint_marker`).
+/// This is a prompt-injection channel crossing the trust boundary, so the role
+/// check here is mandatory: request normalization collects these markers and
+/// injects them into a standalone `system` message, and matching only on the
+/// content prefix would escalate any user/tool/assistant body text starting
+/// with `[context_checkpoint ` into a system instruction. Only legitimate
+/// `internal_note` markers are recognized; their behavior is unchanged.
 fn is_context_checkpoint_marker(message: &Message) -> bool {
     is_internal_note_role(&message.role)
         && message
             .content
             .as_str()
             .is_some_and(|text| text.trim_start().starts_with("[context_checkpoint "))
+}
+
+/// Runtime-generated hierarchical memory index note emitted by
+/// `context_memory::apply_query_aware_memory_projection`. It replaces many
+/// archived checkpoint markers with one compact path index whose `index=` JSON
+/// must stay byte-exact for the model to reach every omitted target, so
+/// normalize must never truncate it or re-frame it like a model-authored note.
+fn is_query_memory_index_note(message: &Message) -> bool {
+    is_internal_note_role(&message.role)
+        && message
+            .content
+            .as_str()
+            .is_some_and(|text| text.trim_start().starts_with(QUERY_MEMORY_INDEX_PREFIX))
 }
 
 fn context_checkpoint_marker_key(marker: &str) -> String {
@@ -688,9 +705,11 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         return sanitize_tool_message_sequence(projected);
     };
 
-    // 只把 runtime-owned system-like note 合入首条 system。模型自产的
-    // self_note / 自动摘要单独投影为 assistant 来源，避免派生判断被提权。
-    // 首个对话消息之后的 note 保持原位，避免新增尾部 note 破坏缓存前缀。
+    // Only runtime-owned system-like notes merge into the first system message.
+    // Model-authored self_notes / auto summaries are projected separately as
+    // assistant-sourced so derived-context provenance is never escalated; notes
+    // after the first conversation message stay in place so adding a tail note
+    // cannot break the cached prefix.
     let first_body_idx = request_messages
         .iter()
         .position(|m| !is_system_like_role(&m.role))
@@ -699,6 +718,15 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     let checkpoint_markers = request_messages
         .iter()
         .filter(|message| is_context_checkpoint_marker(message))
+        .filter_map(|message| message.content.as_str().map(|text| text.trim().to_string()))
+        .collect::<Vec<_>>();
+    // Memory index notes are projected verbatim (never truncated or folded into
+    // the merged system blob): their JSON holds the exact paths of every
+    // omitted evidence target, so any cut would silently break reachability at
+    // the provider boundary.
+    let memory_index_notes = request_messages
+        .iter()
+        .filter(|message| is_query_memory_index_note(message))
         .filter_map(|message| message.content.as_str().map(|text| text.trim().to_string()))
         .collect::<Vec<_>>();
 
@@ -716,6 +744,9 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
         if is_context_checkpoint_marker(message) {
+            continue;
+        }
+        if is_query_memory_index_note(message) {
             continue;
         }
         if idx == first_system_idx {
@@ -809,6 +840,19 @@ evidence before relying on them.\n",
         }
         derived_sections.push(checkpoint_context);
     }
+    if !memory_index_notes.is_empty() {
+        let mut memory_index_context = String::from(
+            "## Hierarchical Memory Index\n\
+             Runtime-generated index of archived evidence paths omitted from this request \
+             projection. Paths are exact; canonical history and archived evidence are unchanged. \
+             Verify by reading the cited source before relying on it.\n",
+        );
+        for note in memory_index_notes {
+            memory_index_context.push_str(&note);
+            memory_index_context.push('\n');
+        }
+        derived_sections.push(memory_index_context);
+    }
     if !derived_sections.is_empty() {
         out.push(derived_context_handoff_message());
         out.push(Message {
@@ -823,11 +867,15 @@ evidence before relying on them.\n",
         if idx == first_system_idx {
             continue;
         }
-        if is_context_checkpoint_marker(&request_messages[idx]) {
-            // All checkpoints are centrally projected into the request prefix
-            // with a cap, so tail markers must not grow with the session; the
-            // persisted history keeps the full record and later requests only
-            // carry the most recent few.
+        if is_context_checkpoint_marker(&request_messages[idx])
+            || is_query_memory_index_note(&request_messages[idx])
+        {
+            // Checkpoint markers are centrally projected into the request
+            // prefix with a cap; the runtime memory index note is projected
+            // verbatim (its JSON must stay byte-exact). Neither may be
+            // truncated mid-stream or grow with the session; persisted history
+            // keeps the full record and later requests only carry what the
+            // projection emits.
             continue;
         }
         if idx < first_body_idx {
@@ -984,6 +1032,129 @@ mod synthetic_user_projection_tests {
                 .unwrap()
                 .contains("runtime-origin:synthetic-user")
         );
+    }
+}
+
+#[cfg(test)]
+mod query_memory_index_projection_tests {
+    use super::*;
+    use crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX;
+
+    fn note(role: &str, content: impl Into<String>) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Value::String(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn index_message() -> Message {
+        let mut roots = serde_json::Map::new();
+        for i in 0..60 {
+            roots.insert(
+                format!("/tmp/session.assets/context-checkpoints/root{i:02}"),
+                serde_json::Value::Array(
+                    (0..3)
+                        .map(|j| serde_json::Value::String(format!("evidence-{i}-{j}.md")))
+                        .collect(),
+                ),
+            );
+        }
+        let payload = serde_json::json!({
+            "omitted_entries": 180,
+            "omitted_chars": 240_000,
+            "roots": roots,
+            "standalone_files": ["/tmp/session.assets/context-checkpoints/tail-standalone.md"],
+            "directories": ["/tmp/session.assets/context-checkpoints/"],
+        });
+        let encoded = serde_json::to_string(&payload).unwrap();
+        note(
+            crate::ai::history::ROLE_INTERNAL_NOTE,
+            format!(
+                "{QUERY_MEMORY_INDEX_PREFIX}\n\
+                 Older recoverable memory metadata was omitted only from this request projection. \
+                 Canonical history and archived evidence are unchanged. Search with search_overflow \
+                 (scope=all), then read the exact source before relying on it.\nindex={encoded}"
+            ),
+        )
+    }
+
+    fn joined_text(normalized: &[Message]) -> String {
+        normalized
+            .iter()
+            .filter_map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n---MESSAGE---\n")
+    }
+
+    fn assert_index_intact(normalized: &[Message]) {
+        let text = joined_text(normalized);
+        assert!(
+            text.contains("[query-memory-index-v1]"),
+            "index note must stay in the request"
+        );
+        assert!(
+            text.contains("tail-standalone.md") && text.contains("\"directories\""),
+            "JSON tail (standalone_files/directories) must not be truncated away"
+        );
+        assert!(
+            text.contains("root59"),
+            "later BTreeMap roots (sorted behind) must not be truncated away"
+        );
+        assert!(
+            !text.contains("[truncated:"),
+            "index note must not go through truncate_note_text"
+        );
+    }
+
+    #[test]
+    fn query_memory_index_before_first_body_survives_byte_for_byte() {
+        let normalized = normalize_messages_for_request(&[
+            note("system", "system prompt"),
+            index_message(),
+            note(crate::ai::history::ROLE_INTERNAL_NOTE, "another old note"),
+            note("user", "current request"),
+        ]);
+        assert_index_intact(&normalized);
+        let index_owner = normalized
+            .iter()
+            .find(|m| {
+                m.content
+                    .as_str()
+                    .is_some_and(|t| t.contains("[query-memory-index-v1]"))
+            })
+            .expect("index owner");
+        assert_eq!(index_owner.role, "assistant");
+        assert!(index_owner
+            .content
+            .as_str()
+            .unwrap()
+            .contains("## Hierarchical Memory Index"));
+        let first_system = normalized
+            .iter()
+            .find(|m| m.role == ROLE_SYSTEM)
+            .expect("first system");
+        assert!(
+            !first_system
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .contains("[query-memory-index-v1]"),
+            "index must not be folded into the merged system blob (4k cap would truncate it)"
+        );
+    }
+
+    #[test]
+    fn query_memory_index_after_first_body_also_survives() {
+        let normalized = normalize_messages_for_request(&[
+            note("system", "system prompt"),
+            note("user", "old turn user"),
+            index_message(),
+            note("user", "current request"),
+        ]);
+        assert_index_intact(&normalized);
     }
 }
 
