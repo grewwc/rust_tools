@@ -367,7 +367,7 @@ pub(in crate::ai) async fn run_with_cli(
     }
 
     if cli.list_tools {
-        let tool_summaries = super::tools::tool_summaries_for_groups(&["core"]);
+        let tool_summaries = super::tools::tool_summaries_for_groups(&[super::tools::ToolGroup::Core]);
         print::print_builtin_tool_summaries(&tool_summaries);
         return Ok(());
     }
@@ -610,7 +610,7 @@ pub(in crate::ai) async fn run_with_cli(
     }
 
     if let Some(ctx) = app.agent_context.as_mut() {
-        ctx.tools = super::tools::tool_definitions_for_groups(&["core"]);
+        ctx.tools = super::tools::tool_definitions_for_groups(&[super::tools::ToolGroup::Core]);
     }
 
     // Hold manifests behind an Arc: every foreground turn / background subagent

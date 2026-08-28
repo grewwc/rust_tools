@@ -101,7 +101,6 @@ inventory::submit!(ToolRegistration {
         name: "plan_update",
         description: "",
         execute: execute_plan_update,
-        groups: &["builtin", "core"],
     }
 });
 inventory::submit!(ToolDisplayRegistration {

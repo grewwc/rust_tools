@@ -16,5 +16,10 @@
     "required": [
       "pid"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

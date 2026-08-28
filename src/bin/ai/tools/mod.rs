@@ -28,10 +28,11 @@ pub(crate) use registry::common::execute_tool_call;
 pub(crate) use registry::common::execute_tool_call_with_args_streaming;
 pub(crate) use registry::common::{
     deferred_eager_load_tool_summaries, get_tool_definitions_by_names,
-    manifest_unknown_tool_names_warning,
+    group_gates_hidden_tools, manifest_unknown_tool_names_warning,
     tool_allows_same_turn_replay, tool_defers_eager_load, tool_definitions_for_groups,
     tool_history_policy, tool_summaries_for_groups,
 };
+pub(crate) use registry::tool_groups::ToolGroup;
 const BASELINE_TOOL_NAMES: &[&str] = &[
     "list_skills",
     "load_skill",

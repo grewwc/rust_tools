@@ -20,5 +20,9 @@
       }
     },
     "required": []
-  }
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
 }

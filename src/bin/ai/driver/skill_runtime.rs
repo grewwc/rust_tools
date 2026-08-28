@@ -7,6 +7,7 @@ use crate::ai::{
     history::{self, SkillActivationEvent},
     mcp::McpClient,
     skills::SkillManifest,
+    tools::ToolGroup,
     types::{App, ForcedSkillSource, ToolDefinition},
 };
 use crate::commonw::configw;
@@ -142,7 +143,7 @@ impl SystemPromptBuilder {
     }
 }
 
-const DEFAULT_TURN_TOOL_GROUPS: &[&str] = &["core"];
+const DEFAULT_TURN_TOOL_GROUPS: &[ToolGroup] = &[ToolGroup::Core];
 
 fn runtime_environment_prompt() -> String {
     let os = std::env::consts::OS;
@@ -435,12 +436,22 @@ fn filter_subagent_hidden_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
 
 fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option<Vec<ToolDef>> {
     if !tool_groups.is_empty() {
-        let groups: Vec<&str> = tool_groups.iter().map(|s| s.as_str()).collect();
-        // 按 tool_groups 展开时剔除「按需加载的重执行原语」（executor/openclaw 组
-        // 内、非 core 的进程/IPC/shm/env 原语）：它们 schema 大、使用频率低，默认不
-        // 随每轮请求常驻，改由模型经 `enable_tools` 按需启用，压缩每轮 tools token。
-        // 显式 `tools:` 点名的工具走下面分支、不做剔除（点名即常驻）。core∩executor
-        // 的 apply_patch / write_file 因同属 core 不被剔除，编辑能力零损失。
+        // Manifest group names resolve against the closed ToolGroup vocabulary;
+        // unknown names are skipped (matching how unknown names have always
+        // behaved as no-ops here, e.g. typos).
+        let groups: Vec<ToolGroup> = tool_groups
+            .iter()
+            .filter_map(|name| ToolGroup::from_name(name))
+            .collect();
+        // When expanding via tool_groups, drop the deferred heavy execution
+        // primitives (tools carrying the `hidden` metadata flag: process / IPC
+        // / shm / env primitives). Their schemas are large and usage rare, so
+        // they do not ride along in every turn's request; the model enables
+        // them on demand via `enable_tools`, shrinking per-turn tools tokens.
+        // Tools named explicitly via `tools:` take the branch below and are
+        // never dropped (naming a tool pins it as resident). Core tools like
+        // apply_patch / write_file are never marked hidden, so editing
+        // capability is unaffected.
         let expanded = super::super::tools::tool_definitions_for_groups(&groups)
             .into_iter()
             .filter(|tool| !super::super::tools::tool_defers_eager_load(&tool.function.name))
@@ -457,36 +468,42 @@ fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option
 
 fn is_executor_agent(agent: &AgentManifest) -> bool {
     agent.mode == crate::ai::agents::AgentMode::Primary
-        && agent.tool_groups.iter().any(|group| {
-            group.eq_ignore_ascii_case("executor") || group.eq_ignore_ascii_case("openclaw")
-        })
+        && manifest_declares_hidden_group(&agent.tool_groups)
 }
 
 fn is_executor_skill(skills: &[&SkillManifest]) -> bool {
-    // 任一活动 skill 声明 executor / openclaw 即生效
-    skills.iter().any(|skill| {
-        skill.tool_groups.iter().any(|group| {
-            group.eq_ignore_ascii_case("executor") || group.eq_ignore_ascii_case("openclaw")
-        })
-    })
+    // Any active skill declaring a hidden-gating group counts.
+    skills
+        .iter()
+        .any(|skill| manifest_declares_hidden_group(&skill.tool_groups))
 }
 
-/// 该 skill / agent 是否声明了 executor / openclaw tool group（与 `is_executor_*`
-/// 不同：这里 mode-agnostic，`build` 这种 `mode: all` 但带 executor 组的 agent 也算）。
-/// 用于判定「本轮工具集里那些重执行原语被 manifest_tool_definitions 剔除过」，
-/// 从而只对这类 agent 追加「按需加载」提示，避免 plan/explore 等只读 agent 收到
-/// 不相关的进程/IPC 提示。
-fn declares_executor_group(
+/// Whether a skill / agent manifest declares a group that gates hidden tools
+/// (see `crate::ai::tools::group_gates_hidden_tools`). Unlike the
+/// `is_executor_*` helpers this is mode-agnostic: a `mode: all` agent carrying
+/// the executor group (e.g. `build`) counts too. Drives the "available on
+/// demand via enable_tools" hint for turns whose resident tool set had the
+/// heavy execution primitives deferred out by `manifest_tool_definitions`, so
+/// read-only agents (plan / explore) never get irrelevant process/IPC hints.
+fn declares_hidden_group(
     skills: &[&SkillManifest],
     active_agent: Option<&AgentManifest>,
 ) -> bool {
-    let has_executor = |groups: &[String]| {
-        groups
-            .iter()
-            .any(|g| g.eq_ignore_ascii_case("executor") || g.eq_ignore_ascii_case("openclaw"))
-    };
-    skills.iter().any(|s| has_executor(&s.tool_groups))
-        || active_agent.is_some_and(|a| has_executor(&a.tool_groups))
+    skills
+        .iter()
+        .any(|s| manifest_declares_hidden_group(&s.tool_groups))
+        || active_agent.is_some_and(|a| manifest_declares_hidden_group(&a.tool_groups))
+}
+
+/// Case-insensitive hidden-gating-group check: a manifest declares the
+/// capability iff any of its group names resolves to a group that gates hidden
+/// tools (today that is the executor group). Names resolve against the closed
+/// `ToolGroup` vocabulary (manifests historically spelled group names loosely).
+fn manifest_declares_hidden_group(groups: &[String]) -> bool {
+    groups
+        .iter()
+        .filter_map(|g| ToolGroup::from_name(g))
+        .any(crate::ai::tools::group_gates_hidden_tools)
 }
 
 fn resolve_max_iterations(active_agent: Option<&AgentManifest>, executor_active: bool) -> usize {
@@ -741,9 +758,9 @@ fn build_hidden_mcp_tool_catalog(
 
     let mut out = format!(
         "Configured MCP tools are available but not loaded in this turn.\n\
-         If the task needs an external system or MCP-backed capability, call `enable_tools(operation=list)` first, then \
-         `enable_tools(operation=enable, tools=[...])` with the exact names you need.\n\
-         Example available MCP tools: {}",
+         If the task needs an external system or MCP-backed capability, discover and enable matching \
+         `mcp_*` tools via `enable_tools` first.\n\
+         Available: {}",
         displayed
     );
     if remaining > 0 {
@@ -756,10 +773,11 @@ fn build_hidden_mcp_tool_catalog(
 fn build_hidden_execution_primitive_catalog(
     available_tools: &Box<SkipSet<String>>,
 ) -> Option<String> {
-    // 「按需加载的重执行原语」（进程 / IPC / 共享内存 / 环境原语）默认不随每轮请求
-    // 常驻。这里在 system prompt 里列出「已注册但本轮未加载」的这类工具名，保证模型
-    // 对它们可感知：需要时经 `enable_tools(operation=enable, tools=[...])` 按需启用。
-    // 与 MCP hidden catalog 同构（同样的 MAX_DISPLAY 截断 / 全部已加载则不提示）。
+    // Deferred heavy-execution primitives (process / IPC / shared-memory / env)
+    // are not loaded into every turn by default. List the registered-but-not-
+    // loaded names here so the model stays aware they exist and can enable them
+    // on demand via `enable_tools`. Mirrors `build_hidden_mcp_tool_catalog`
+    // (same MAX_DISPLAY truncation; silent when everything is already loaded).
     let mut hidden: Vec<String> = super::super::tools::deferred_eager_load_tool_summaries()
         .into_iter()
         .map(|(name, _desc)| name)
@@ -783,9 +801,8 @@ fn build_hidden_execution_primitive_catalog(
     let mut out = format!(
         "Process / IPC / shared-memory primitives are available but not loaded this turn.\n\
          For multi-process orchestration, background daemons, cross-process IPC, shared memory, \
-         or per-process env/working-dir control, call `enable_tools(operation=enable, tools=[...])` \
-         with the exact names you need.\n\
-         Example available tools: {}",
+         or per-process env/working-dir control, enable the needed tools via `enable_tools`.\n\
+         Available: {}",
         displayed
     );
     if remaining > 0 {
@@ -797,10 +814,11 @@ fn build_hidden_execution_primitive_catalog(
 
 /// Lazily-loaded subagent orchestration family: task-group tools (group
 /// `["builtin", "task"]`) are not part of the default `core` turn schema, and
-/// unlike executor primitives they are not covered by `groups_defer_eager_load`
-/// (which only defers `executor`/`openclaw` groups), so without this catalog the
-/// model has no prompt-level awareness that subagent tools exist and can be
-/// enabled on demand — broad multi-branch tasks silently degrade to serial
+/// unlike executor primitives they are not covered by `tool_defers_eager_load`
+/// (which only defers tools carrying the `hidden` metadata flag), so without
+/// this catalog the model has no prompt-level awareness that subagent tools
+/// exist and can be enabled on demand — broad multi-branch tasks silently
+/// degrade to serial
 /// parent work. Mirrors `build_hidden_execution_primitive_catalog`.
 /// Top-level agents only: the task family is hidden from subagents
 /// (`SUBAGENT_DEPTH > 0`), so the nudge must never reach them.
@@ -844,9 +862,8 @@ fn build_hidden_task_tool_catalog(available_tools: &Box<SkipSet<String>>) -> Opt
         "Subagent orchestration tools are available but not loaded in this turn.\n\
          When the task splits into multiple independent branches that would benefit from \
          subagent parallelism (broad discovery, cross-module mapping, independent verification, \
-         or concurrent research), call `enable_tools(operation=enable, tools=[...])` with the \
-         exact names you need.\n\
-         Example available tools: {}",
+         or concurrent research), enable the needed tools via `enable_tools`.\n\
+         Available: {}",
         displayed
     );
     if remaining > 0 {
@@ -1234,15 +1251,16 @@ fn build_system_prompt(
             && has_tool(available_tools, "list_skills")
             && has_tool(available_tools, "activate_skill"))
     {
-        // 未加载能力的详细目录与示例容易在每轮造成无关噪声；统一通过
-        // enable_tools 按需发现，只有已经加载的工具才在下方注入具体规则。
+        // Detailed catalogs and examples of unloaded capabilities add noise to
+        // every turn; discovery goes through enable_tools on demand, and only
+        // already-loaded tools get concrete rules injected below.
         let mut discovery_lines = Vec::new();
         if skills.is_empty() && has_tool(available_tools, "enable_tools") {
             discovery_lines.push(
                 "No skill is active for this turn. Additional capabilities are available via `enable_tools`; call `enable_tools(operation=list)` to see them, enabling only the specific tools you need.".to_string(),
             );
             discovery_lines.push(
-                "If a task needs an external system or MCP-backed capability, call `enable_tools(operation=list)` to see available tools, then discover and enable matching `mcp_*` tools first.".to_string(),
+                "If the task needs an external system or MCP-backed capability, discover and enable matching `mcp_*` tools first.".to_string(),
             );
         } else if has_tool(available_tools, "enable_tools") {
             discovery_lines.push(
@@ -1302,8 +1320,14 @@ fn build_system_prompt(
         let mut lines = Vec::new();
         if has_tool(available_tools, "plan") {
             lines.push("Simple tasks: act directly. Complex ones: call `plan` first — before the first tool call, so the plan is the roadmap for the whole task.".to_string());
-            lines.push("Track step progress with `plan_update`: mark a step `running` before starting it and `done` when finished; use `failed`/`skipped` when a step cannot be completed as planned. Each `plan_update` echoes the full plan with per-step status.".to_string());
-            lines.push("Treat the plan as a living roadmap: when new findings, changed requirements, or a dead end reshape the task, revise it with a fresh `plan` call instead of drifting; the latest plan is preserved in full as the task anchor while older versions may be summarized.".to_string());
+            if has_tool(available_tools, "plan_update") {
+                // plan_update's own tool description carries the per-step status
+                // semantics; only the track-as-you-go cadence is restated here.
+                lines.push("Track step progress with `plan_update` as you work (per-step status semantics live in its tool description).".to_string());
+            } else {
+                lines.push("Track step progress with `plan_update`: mark a step `running` before starting it and `done` when finished; use `failed`/`skipped` when a step cannot be completed as planned. Each `plan_update` echoes the full plan with per-step status.".to_string());
+            }
+            lines.push("Treat the plan as a living roadmap: when findings, changed requirements, or a dead end reshape the task, call `plan` again instead of drifting; the latest plan is preserved in full as the task anchor while older versions may be summarized.".to_string());
             if has_tool(available_tools, "task_spawn") {
                 lines.push("When planning, mark `delegate: true` on every substantive step, serial or parallel: subagents start with a clean, focused context and the parent reviews results. Keep in the parent only trivial single-tool steps, tightly coupled overlapping edits, and final review/synthesis. `parallelizable: true` means no dependency on earlier steps (concurrent task_spawn); delegated steps without it run one at a time via the synchronous `task`, with the parent handing the needed context in the prompt.".to_string());
             }
@@ -1421,14 +1445,11 @@ fn build_system_prompt(
             "To run a script, dump intermediate data, or write a test fixture, create it with `write_file(temp=true)` first, then run it with `execute_command`. Prefer this over inline `python -c '...'` whenever the code is more than a few lines or you need to inspect/edit the file.".to_string(),
         );
         lines.push(
-            "`write_file(temp=true)` writes to the per-session temp directory. When `temp=true`, pass a relative filename only (e.g. `script.py`); an absolute path is rejected to avoid accidentally writing into the project tree.".to_string(),
-        );
-        lines.push(
             "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` will accumulate. `execute_command` cannot run `rm` either — that is a command-policy blacklist, not a filesystem sandbox: allowed commands run directly against the real workspace.".to_string(),
         );
         if has_tool(available_tools, "apply_patch") {
             lines.push(
-                "When modifying an existing project file, do NOT use `write_file` with `temp=true` — use `apply_patch` for localized edits, or `write_file` without `temp` only when a full rewrite is genuinely necessary.".to_string(),
+                "Do NOT use `write_file(temp=true)` on existing project files; reserve `write_file` without `temp` for genuine full rewrites (localized edits go through `apply_patch`).".to_string(),
             );
             lines.push(
                 "When one file needs several localized edits, read the relevant span once and make ONE `apply_patch` call with multiple `@@` hunks in a single `*** Update File:` section — only when every hunk has a unique anchor (distinct surrounding context). For several files, use one Begin Patch envelope with one section per target. Do not split related edits into serial read/patch cycles unless a previous patch failed or a later edit truly depends on the earlier edit's result. For structurally similar blocks (e.g. repeated closures with identical bodies), apply one at a time, each hunk with a distinctive anchor line (function name or comment). Keep each patch under ~4KB: split large edits into multiple apply_patch calls, or write the patch to a temp file and pass `patch_file`.".to_string(),
@@ -1470,6 +1491,13 @@ fn build_skill_turn_guard(
     let active_agent = app.current_agent_manifest.clone();
     let executor_active = is_executor_skill(skills)
         || active_agent.as_ref().is_some_and(is_executor_agent);
+    // Record whether the current turn declares a hidden-gating group into
+    // enable_tools' turn-level state, so the heavy execution primitives stay
+    // out of the enable catalog for agents that do not declare one (same
+    // source of truth as the hidden-catalog hint below, so the two can never
+    // disagree).
+    let hidden_group_declared = declares_hidden_group(skills, active_agent.as_ref());
+    super::super::tools::enable_tools::set_hidden_group_declared(hidden_group_declared);
 
     let mut builtin_tools = builtin_tools_for_skill(skills, active_agent.as_ref());
     // 外部下载的 skill 无法预先声明本运行时的续接协议；仅在 skill 已激活时
@@ -1491,10 +1519,12 @@ fn build_skill_turn_guard(
     {
         builder.push(ContextKind::Capability, catalog);
     }
-    // executor/openclaw agent 的重执行原语被 manifest_tool_definitions 剔除出常驻集，
-    // 这里补一条「可 enable」提示保证模型可感知（其它只读 agent 不声明该组、不注入）。
+    // For executor agents the heavy execution primitives are deferred out of
+    // the resident set by manifest_tool_definitions; add an on-demand enable
+    // hint here so the model can still sense them (read-only agents never
+    // declare the group, so nothing is injected).
     if has_tool(&available_tools, "enable_tools")
-        && declares_executor_group(skills, active_agent.as_ref())
+        && hidden_group_declared
         && let Some(catalog) = build_hidden_execution_primitive_catalog(&available_tools)
     {
         builder.push(ContextKind::Capability, catalog);
@@ -1755,10 +1785,10 @@ mod tests {
         build_hidden_execution_primitive_catalog, build_hidden_mcp_tool_catalog,
         build_hidden_task_tool_catalog, build_project_instruction_prompt,
         build_scoped_project_instruction_prompt, build_system_prompt, builtin_tools_for_skill,
-        declares_executor_group, ensure_required_baseline_tools, escape_xml_attr,
+        declares_hidden_group, ensure_required_baseline_tools, escape_xml_attr,
         filter_mcp_tools_by_allowed_servers, has_tool, manifest_tool_definitions,
         merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
-        select_mcp_tools, tool_uses_mcp_server, session_context_prompt,
+        select_mcp_tools, session_context_prompt, tool_uses_mcp_server, ToolGroup,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
@@ -1862,9 +1892,11 @@ mod tests {
         // default turn stays slim, but agent-team / audit_own_changes hard-require the
         // task family in their flows (delegation / spawning the audit subagent). Their
         // manifests declare the narrow `task` group so expansion loads exactly that
-        // family. The broad `builtin` tag means "nearly the whole registry" (it drags in
-        // run_agent_graph/save_skill/manage_team ~15KB of unrelated schemas), so those
-        // heavy non-flow tools must stay lazy under [core, task].
+        // family. Heavy non-flow orchestration tools (`manage_team`, `run_agent_graph`)
+        // live in the narrow `agent_team` group instead of `builtin`: `[core, task]`
+        // stays slim (the broad `builtin` tag means "nearly the whole registry",
+        // ~15KB of unrelated schemas), while the agent-team skill opts into them by
+        // declaring `agent_team` in its manifest.
         let names_for = |groups: Vec<String>| {
             manifest_tool_definitions(&groups, &[])
                 .expect("non-empty manifest groups should resolve tool definitions")
@@ -1893,6 +1925,21 @@ mod tests {
         assert!(
             !plain_groups.iter().any(|name| name == "task_spawn"),
             "default [core, executor] manifest must keep task* lazy"
+        );
+
+        let agent_team_groups = names_for(vec![
+            "core".to_string(),
+            "task".to_string(),
+            "agent_team".to_string(),
+        ]);
+        assert!(
+            agent_team_groups.iter().any(|name| name == "manage_team"),
+            "[core, task, agent_team] (agent-team skill) must expose manage_team"
+        );
+        assert!(agent_team_groups.iter().any(|name| name == "run_agent_graph"));
+        assert!(
+            agent_team_groups.iter().any(|name| name == "send_side_note"),
+            "send_side_note rides in via the task group for orchestration skills"
         );
     }
 
@@ -2071,25 +2118,28 @@ mod tests {
 
     #[test]
     fn hidden_execution_primitive_catalog_advertises_deferred_tools() {
-        // 懒加载后模型仍需可感知：本轮未加载这些原语时，catalog 必须列出它们
-        // 并给出 enable_tools 的启用路径。
+        // After lazy loading the model must still stay aware: when these
+        // primitives are not loaded this turn, the catalog must list them and
+        // give the enable_tools path.
         let mut available = SkipSet::new(16);
         available.insert("read_file".to_string());
         available.insert("enable_tools".to_string());
 
         let catalog = build_hidden_execution_primitive_catalog(&Box::new(available))
             .expect("deferred primitives should produce a catalog");
-        assert!(catalog.contains("enable_tools(operation=enable"));
-        // catalog 按名称排序后只展示前 MAX_DISPLAY(8) 个，其余折叠为 "and N more"。
-        // `kill_process` 字典序最靠前，必在展示区内；断言它而非 `spawn_process`
-        // （后者排在末尾、落在截断之外）。
+        assert!(catalog.contains("enable the needed tools via `enable_tools`"));
+        // The catalog shows the first MAX_DISPLAY(8) entries in sorted order and
+        // folds the rest into "and N more". `kill_process` sorts first and must
+        // be inside the display window; assert on it rather than `spawn_process`
+        // (the latter sorts last and falls outside the truncation).
         assert!(catalog.contains("kill_process"));
         assert!(catalog.contains("more."));
     }
 
     #[test]
     fn hidden_execution_primitive_catalog_suppressed_when_all_loaded() {
-        // 若所有执行原语都已加载（例如显式点名全量），则不再重复提示。
+        // When every executor primitive is already loaded (e.g. an explicit
+        // full whitelist), the catalog is suppressed: nothing to advertise.
         let mut available = SkipSet::new(16);
         for (name, _desc) in crate::ai::tools::deferred_eager_load_tool_summaries() {
             available.insert(name);
@@ -2108,10 +2158,11 @@ mod tests {
 
         let catalog = build_hidden_task_tool_catalog(&Box::new(available))
             .expect("unloaded task family should produce a catalog");
-        assert!(catalog.contains("enable_tools(operation=enable"));
+        assert!(catalog.contains("enable the needed tools via `enable_tools`"));
         assert!(catalog.contains("task_spawn"));
         assert!(catalog.contains("task_spawn_batch"));
-        // 展示区按族内顺序取前 MAX_DISPLAY(8) 个，其余折叠为 "and N more"。
+        // The display window takes the first MAX_DISPLAY(8) entries in family
+        // order and folds the rest into "and N more".
         assert!(catalog.contains("more."));
     }
 
@@ -2153,18 +2204,18 @@ mod tests {
     }
 
     #[test]
-    fn declares_executor_group_only_true_for_executor_agents() {
+    fn declares_hidden_group_only_true_for_executor_agents() {
         let build_agent = executor_group_agent("build");
-        assert!(declares_executor_group(&[], Some(&build_agent)));
+        assert!(declares_hidden_group(&[], Some(&build_agent)));
 
-        // plan/explore 用显式 tools 列表、无 executor 组
+        // plan/explore use an explicit tools list without any executor group.
         let mut plan_agent = agent("plan", Vec::new());
         plan_agent.mode = AgentMode::All;
         plan_agent.tool_groups = Vec::new();
         plan_agent.tools = vec!["read_file".to_string()];
-        assert!(!declares_executor_group(&[], Some(&plan_agent)));
+        assert!(!declares_hidden_group(&[], Some(&plan_agent)));
 
-        assert!(!declares_executor_group(&[], None));
+        assert!(!declares_hidden_group(&[], None));
     }
 
     #[test]
@@ -2178,8 +2229,9 @@ mod tests {
         const CHARS_PER_TOKEN_CONSERVATIVE: usize = 2;
         let build_agent = executor_group_agent("build");
 
-        // baseline：直接展开 [core, executor]，不做 deferred 过滤（还原优化前口径）。
-        let groups = ["core", "executor"];
+        // baseline: expand [core, executor] fully with no deferred filtering
+        // (the pre-lazy-load behavior).
+        let groups = [ToolGroup::Core, ToolGroup::Executor];
         let baseline_tools =
             ensure_required_baseline_tools(crate::ai::tools::tool_definitions_for_groups(&groups));
         // optimized：现行生产路径（manifest_tool_definitions 会剔除 deferred 原语）。
@@ -2808,7 +2860,8 @@ mod tests {
         .unwrap();
 
         assert!(catalog.contains("Configured MCP tools are available but not loaded"));
-        assert!(catalog.contains("enable_tools(operation=list)"));
+        assert!(catalog.contains("discover and enable matching `mcp_*` tools"));
+        assert!(catalog.contains("`enable_tools`"));
         assert!(catalog.contains("`mcp_feishu_docs_get_text_by_url`"));
         assert!(catalog.contains("`mcp_pdf-extract_pdf_extract_text`"));
         assert!(!catalog.contains("`mcp_feishu_doc_create_from_markdown`"));
@@ -2825,16 +2878,21 @@ mod tests {
 
     #[test]
     fn narrow_skill_whitelist_still_lets_model_discover_explicitly_requested_mcp_tools() {
-        // 场景复现：用户显式要求"用 mcp 工具写飞书"，但当前 skill 用窄 tools:
-        // 白名单把工具集替换成只有一个专用工具，且默认 agent 带 disable_mcp_tools
-        // （mcp_* 不预挂载）。修复前：窄白名单会把 enable_tools 一并挤掉，hidden MCP
-        // catalog 的注入门（has_tool("enable_tools")）随之关闭，模型三条发现 MCP 的
-        // 路径全断，物理上无法响应"用 mcp 工具"。修复后：enable_tools 作为 baseline
-        // 常驻补回，catalog 注入门重新成立，模型能发现并启用 mcp_feishu_*。
+        // Scenario: the user explicitly asks to "write a Feishu doc with MCP
+        // tools", but the active skill's narrow tools: whitelist replaces the
+        // tool set with a single dedicated tool, and the default agent carries
+        // disable_mcp_tools (no mcp_* pre-mounted). Before the fix: the narrow
+        // whitelist squeezed out enable_tools too, the hidden MCP catalog gate
+        // (has_tool("enable_tools")) closed with it, and all three MCP discovery
+        // paths were severed, making the request physically impossible to serve.
+        // After the fix: enable_tools is restored as an always-on baseline, the
+        // catalog gate holds again, and the model can discover and enable
+        // mcp_feishu_*.
         let mut narrow_skill = skill("feishu-upload", "Upload markdown into Feishu docs");
         narrow_skill.tools = vec!["write_file".to_string()];
 
-        // 1) 窄白名单替换工具集后，baseline 兜底仍补回发现/加载与基础只读入口。
+        // 1) After the narrow whitelist replaces the tool set, the baseline
+        // fallback still restores discovery/loading and basic read-only entries.
         let builtin_tools = builtin_tools_for_skill(&[&narrow_skill], None);
         let builtin_names = builtin_tools
             .iter()
@@ -2842,18 +2900,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             builtin_names.contains(&"write_file".to_string()),
-            "skill 白名单里显式声明的工具应保留"
+            "explicitly declared tools in the skill whitelist must be preserved"
         );
         assert!(
             builtin_names.contains(&"enable_tools".to_string()),
-            "enable_tools 必须作为 baseline 常驻补回，否则模型无法发现/启用 MCP 工具"
+            "enable_tools must be restored as an always-on baseline, otherwise the model cannot discover/enable MCP tools"
         );
         assert!(
             builtin_names.contains(&"read_file".to_string()),
-            "read_file 应作为基础只读能力常驻，读取用户点名的 test.md"
+            "read_file must stay as a baseline read-only capability to read the user-named test.md"
         );
 
-        // 2) 默认 agent disable_mcp_tools => 本轮 mcp_* 一个都没预挂载。
+        // 2) The default agent's disable_mcp_tools => no mcp_* is pre-mounted
+        // this turn.
         let all_mcp_tools = vec![
             tool("mcp_feishu_doc_create_from_markdown"),
             tool("mcp_feishu_docs_get_text_by_url"),
@@ -2861,18 +2920,20 @@ mod tests {
         ];
         let loaded_mcp_tools: Vec<ToolDefinition> = Vec::new();
 
-        // 3) available_tools 含 enable_tools => catalog 注入门成立（生产代码里的
-        //    has_tool("enable_tools") 判断）。
+        // 3) available_tools contains enable_tools => the catalog injection gate
+        // holds (the production code's has_tool("enable_tools") check).
         let available_tools = available_tool_names(&builtin_tools, &loaded_mcp_tools);
         assert!(
             has_tool(&available_tools, "enable_tools"),
-            "catalog 注入门依赖 available_tools 里存在 enable_tools"
+            "the catalog injection gate depends on enable_tools being present in available_tools"
         );
 
-        // 4) hidden MCP catalog 会把用户想用的 mcp_feishu_* 暴露给模型作为发现入口。
+        // 4) The hidden MCP catalog exposes the user-requested mcp_feishu_* to
+        // the model as the discovery entry point.
         let catalog = build_hidden_mcp_tool_catalog(&all_mcp_tools, &loaded_mcp_tools)
-            .expect("存在未加载的 mcp_* 时必须给出发现提示");
-        assert!(catalog.contains("enable_tools(operation=list)"));
+            .expect("a discovery hint is required when unloaded mcp_* tools exist");
+        assert!(catalog.contains("discover and enable matching `mcp_*` tools"));
+        assert!(catalog.contains("`enable_tools`"));
         assert!(catalog.contains("`mcp_feishu_doc_create_from_markdown`"));
         assert!(catalog.contains("`mcp_feishu_docs_get_text_by_url`"));
     }

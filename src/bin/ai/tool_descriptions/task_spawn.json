@@ -33,5 +33,9 @@
       "description",
       "prompt"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "task"
+  ]
 }

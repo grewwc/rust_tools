@@ -12,5 +12,9 @@
     "required": [
       "task_id"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "task"
+  ]
 }

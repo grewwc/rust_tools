@@ -32,7 +32,7 @@
         "items": {
           "type": "string"
         },
-        "description": "Tool groups that the skill is allowed to use (e.g. builtin, executor; legacy openclaw is still accepted)."
+        "description": "Tool groups that the skill is allowed to use (e.g. builtin, executor)."
       },
       "mcp_servers": {
         "type": "array",
@@ -76,7 +76,10 @@
               "description": "File content to write."
             }
           },
-          "required": ["path", "content"]
+          "required": [
+            "path",
+            "content"
+          ]
         }
       },
       "references": {
@@ -85,10 +88,17 @@
         "items": {
           "type": "object",
           "properties": {
-            "path": { "type": "string" },
-            "content": { "type": "string" }
+            "path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
           },
-          "required": ["path", "content"]
+          "required": [
+            "path",
+            "content"
+          ]
         }
       },
       "examples": {
@@ -97,10 +107,17 @@
         "items": {
           "type": "object",
           "properties": {
-            "path": { "type": "string" },
-            "content": { "type": "string" }
+            "path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
           },
-          "required": ["path", "content"]
+          "required": [
+            "path",
+            "content"
+          ]
         }
       },
       "scripts": {
@@ -109,10 +126,17 @@
         "items": {
           "type": "object",
           "properties": {
-            "path": { "type": "string" },
-            "content": { "type": "string" }
+            "path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
           },
-          "required": ["path", "content"]
+          "required": [
+            "path",
+            "content"
+          ]
         }
       },
       "subskills": {
@@ -121,27 +145,64 @@
         "items": {
           "type": "object",
           "properties": {
-            "name": { "type": "string", "description": "Sub-skill name (globally unique; suggested '<parent>/<sub>' or '<parent>-<sub>')." },
-            "description": { "type": "string" },
-            "prompt": { "type": "string", "description": "Sub-skill prompt body (required)." },
-            "system_prompt": { "type": "string" },
-            "tools": { "type": "array", "items": { "type": "string" } },
-            "tool_groups": { "type": "array", "items": { "type": "string" } },
-            "mcp_servers": { "type": "array", "items": { "type": "string" } },
-            "priority": { "type": "integer" },
+            "name": {
+              "type": "string",
+              "description": "Sub-skill name (globally unique; suggested '<parent>/<sub>' or '<parent>-<sub>')."
+            },
+            "description": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string",
+              "description": "Sub-skill prompt body (required)."
+            },
+            "system_prompt": {
+              "type": "string"
+            },
+            "tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "tool_groups": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "mcp_servers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "priority": {
+              "type": "integer"
+            },
             "resources": {
               "type": "array",
               "items": {
                 "type": "object",
                 "properties": {
-                  "path": { "type": "string" },
-                  "content": { "type": "string" }
+                  "path": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  }
                 },
-                "required": ["path", "content"]
+                "required": [
+                  "path",
+                  "content"
+                ]
               }
             }
           },
-          "required": ["name", "prompt"]
+          "required": [
+            "name",
+            "prompt"
+          ]
         }
       }
     },
@@ -149,5 +210,9 @@
       "name",
       "prompt"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "skills"
+  ]
 }

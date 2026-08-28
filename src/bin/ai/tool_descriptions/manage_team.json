@@ -207,5 +207,9 @@
         "description": "For advance, dispatch newly ready tasks after collecting terminal work. Default true."
       }
     }
-  }
+  },
+  "groups": [
+    "builtin",
+    "agent_team"
+  ]
 }

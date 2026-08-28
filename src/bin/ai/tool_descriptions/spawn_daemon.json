@@ -29,5 +29,10 @@
       "name",
       "goal"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

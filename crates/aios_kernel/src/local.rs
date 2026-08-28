@@ -260,10 +260,57 @@ impl LocalOS {
             .map(|set| set.into_iter().collect())
             .unwrap_or_default();
         let mut terminated_children = Vec::new();
+        // Re-attach surviving children to the root (foreground) process instead of
+        // orphaning them. `ensure_child_scope` walks parent chains, so a `None`
+        // parent makes a live process unmanageable by every process (including the
+        // foreground model) even though it keeps running and is listed by
+        // `list_processes`. The root outlives its subtree in a session, so
+        // re-parenting keeps the whole tree inside the foreground's management
+        // scope. Fall back to orphaning only when no other foreground process
+        // exists (e.g. the root itself is being removed). Only a live foreground
+        // qualifies as target: `terminate_pid` keeps terminated processes as
+        // tombstones in the table, and re-parenting to one would silently
+        // reproduce the unmanageable-orphan bug (the parent chain still ends in
+        // `None` for a zombie).
+        // The foreground with the lowest pid is the session root:
+        // `begin_foreground` creates it first and pid allocation is monotonic.
+        // `min_by_key` makes the choice independent of the `processes` HashMap
+        // iteration order, so the re-attachment target is deterministic even if
+        // several foregrounds exist.
+        let root_pid = self
+            .processes
+            .values()
+            .filter(|proc| {
+                proc.is_foreground && proc.pid != pid && proc.state != ProcessState::Terminated
+            })
+            .min_by_key(|proc| proc.pid)
+            .map(|proc| proc.pid);
+        // Snapshot the live orphans first: `register_child` needs `&mut self`, so it
+        // cannot be called while a `child` borrow from the process table is alive.
+        let live_orphans: Vec<u64> = orphaned_children
+            .iter()
+            .copied()
+            .filter(|child_pid| {
+                self.processes
+                    .get(child_pid)
+                    .is_some_and(|proc| proc.state != ProcessState::Terminated)
+            })
+            .collect();
+        for child_pid in &live_orphans {
+            if let Some(root) = root_pid {
+                self.register_child(root, *child_pid);
+            }
+        }
         for child_pid in orphaned_children {
             if let Some(child) = self.processes.get_mut(&child_pid) {
                 if child.state == ProcessState::Terminated {
                     terminated_children.push(child_pid);
+                } else if let Some(root) = root_pid {
+                    child.parent_pid = Some(root);
+                    child.mailbox.push_back(format!(
+                        "Parent process {} exited; this process was re-attached to the root process {}.",
+                        pid, root
+                    ));
                 } else {
                     child.parent_pid = None;
                     child.mailbox.push_back(format!(
@@ -398,6 +445,13 @@ impl LocalOS {
     }
 
     fn ensure_child_scope(&self, current: u64, target: u64) -> Result<(), String> {
+        // Report a missing target as "does not exist" instead of the generic scope
+        // error: without this check a nonexistent pid falls through the parent-chain
+        // walk below and is misreported as "outside its scope", which conflates "not
+        // allowed" with "no such process" for all callers (kill/reap/signal/wait).
+        if !self.processes.contains_key(&target) {
+            return Err(format!("Process {} does not exist.", target));
+        }
         if current == target {
             return Ok(());
         }
@@ -4929,6 +4983,117 @@ mod tests {
         let result = os.kill_process(child_b, "sibling kill".to_string());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("outside its scope"));
+    }
+
+    #[test]
+    fn orphaned_grandchild_reattached_to_root_and_killable() {
+        // Regression for the `kill_process` "outside its scope" failure: when a
+        // subagent (child) exits and its kernel entry is dropped, its live
+        // descendants used to be orphaned (`parent_pid = None`), which made them
+        // unmanageable by the foreground model even though they kept running and
+        // were listed by `list_processes`. They must be re-attached to the root
+        // process so the whole tree stays inside the foreground's scope.
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        let child = os
+            .spawn(
+                Some(root),
+                "subagent".to_string(),
+                "goal sub".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let grandchild = os
+            .spawn(
+                Some(child),
+                "grandchild".to_string(),
+                "goal gc".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Simulate subagent completion: terminate + drop its kernel entry, the same
+        // path `terminate_and_cleanup` in the `a` binary takes after a turn ends.
+        os.terminate_pid(child, "done".to_string());
+        assert!(os.drop_terminated(child), "drop_terminated should succeed");
+
+        // The grandchild must now be a descendant of the root again, so the
+        // foreground model (full capabilities) can kill it.
+        os.set_current_pid(Some(root));
+        let result = os.kill_process(grandchild, "cleanup".to_string());
+        assert!(
+            result.is_ok(),
+            "root should be able to kill the re-attached grandchild, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn kill_process_nonexistent_reports_missing_process() {
+        // A nonexistent pid must be reported as "does not exist", not as
+        // "outside its scope": the two errors mean different things to the caller.
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        os.set_current_pid(Some(root));
+        let result = os.kill_process(9999, "no such process".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn orphan_reattaches_to_oldest_live_foreground() {
+        // Determinism guard for the re-attachment target: with several live
+        // foregrounds, the choice must be the lowest foreground pid (the session
+        // root, created first by monotonic pid allocation), independent of the
+        // process-table (HashMap) iteration order.
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg1".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        let second =
+            os.begin_foreground("fg2".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        assert!(second > root, "foreground pids must be monotonic");
+
+        // A background process under `root` holds the surviving grandchild.
+        let child = os
+            .spawn(
+                Some(root),
+                "subagent".to_string(),
+                "goal sub".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let grandchild = os
+            .spawn(
+                Some(child),
+                "grandchild".to_string(),
+                "goal gc".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Simulate the subagent finishing: terminate + drop its kernel entry.
+        os.terminate_pid(child, "done".to_string());
+        assert!(os.drop_terminated(child), "drop_terminated should succeed");
+
+        // Both foregrounds are live candidates; the grandchild must re-attach to
+        // the oldest one (`root`), not `second`.
+        let proc = os.get_process(grandchild).expect("grandchild still alive");
+        assert_eq!(proc.parent_pid, Some(root));
+
+        // The session root (full capabilities) can manage it again.
+        os.set_current_pid(Some(root));
+        assert!(os.kill_process(grandchild, "cleanup".to_string()).is_ok());
     }
 
     #[test]

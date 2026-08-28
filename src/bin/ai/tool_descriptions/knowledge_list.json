@@ -9,5 +9,9 @@
         "description": "Max entries to show (default: 20, max: 100)."
       }
     }
-  }
+  },
+  "groups": [
+    "builtin",
+    "knowledge"
+  ]
 }

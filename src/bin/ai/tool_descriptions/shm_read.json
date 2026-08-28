@@ -12,5 +12,10 @@
     "required": [
       "key"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

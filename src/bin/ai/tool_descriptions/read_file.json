@@ -28,5 +28,10 @@
     "required": [
       "file_path"
     ]
-  }
+  },
+  "groups": [
+    "executor",
+    "builtin",
+    "core"
+  ]
 }

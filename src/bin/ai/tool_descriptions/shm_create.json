@@ -17,5 +17,10 @@
       "key",
       "value"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

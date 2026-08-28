@@ -1,6 +1,6 @@
 {
   "name": "knowledge_consolidate",
-  "description": "Two-phase knowledge consolidation. First call with action=\"read_all\" to get all entries; then call with action=\"execute\", delete_ids=[...], and/or save_entries=[...] to apply a consolidation plan. The agent analyzes which entries are useful, obsolete, or mergeable. Lossless guarantee: read_all shows truncated previews, so when consolidating existing entries into a merged one, ALWAYS pass save_entries[].source_ids listing the source entry IDs — the tool appends the FULL original content of each source to the saved note (after a '--- 原文保留（合并来源）---' marker) and automatically deletes those sources. Only entries explicitly listed in delete_ids (or auto-added from source_ids) are removed; consolidation never compresses or drops original content.",
+  "description": "Two-phase consolidation: call with action=\"read_all\" to fetch all entries, then action=\"execute\" with delete_ids and/or save_entries to apply the plan. Lossless: read_all previews are truncated, so when merging entries ALWAYS list the sources in save_entries[].source_ids — the tool appends each source's full original text to the merged entry and deletes those sources automatically. Only ids in delete_ids (or auto-added from source_ids) are ever removed.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -65,5 +65,9 @@
     "required": [
       "action"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "knowledge"
+  ]
 }

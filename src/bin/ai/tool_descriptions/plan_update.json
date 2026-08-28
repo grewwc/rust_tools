@@ -1,6 +1,6 @@
 {
   "name": "plan_update",
-  "description": "Update the status of one step in the active plan created by `plan`: mark a step `running` before starting it and `done` when finished; use `failed`/`skipped` when a step cannot be completed as planned. Each call echoes the full updated plan text with per-step status suffixes and an overall progress summary. The plan state is persisted per session; re-calling `plan` with the same steps keeps existing step statuses.",
+  "description": "Update the status of one step in the active plan created by `plan` (running before starting, done when finished, failed/skipped when not completable). Echoes the full updated plan; statuses persist per session.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,7 +10,13 @@
       },
       "status": {
         "type": "string",
-        "enum": ["pending", "running", "done", "failed", "skipped"],
+        "enum": [
+          "pending",
+          "running",
+          "done",
+          "failed",
+          "skipped"
+        ],
         "description": "New status for the step."
       },
       "note": {
@@ -18,6 +24,13 @@
         "description": "Optional short note (e.g. failure reason or skip rationale); echoed in the step status, e.g. `(failed, note: ...)`."
       }
     },
-    "required": ["step", "status"]
-  }
+    "required": [
+      "step",
+      "status"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
 }

@@ -12,5 +12,9 @@
     "required": [
       "name"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "skills"
+  ]
 }

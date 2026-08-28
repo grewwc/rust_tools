@@ -142,7 +142,6 @@ inventory::submit!(ToolRegistration {
         // skill 发现/激活是低频能力：默认不随每轮 core 展开常驻，模型按需经
         // `enable_tools` 启用，压缩每轮 tools schema token。仍保留 builtin 组，
         // 保证可被动态启用。
-        groups: &["builtin"],
     }
 });
 
@@ -153,7 +152,6 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_deactivate_skill,
         // 与 activate_skill 同属低频控制工具：默认不常驻，按需经 enable_tools 启用。
-        groups: &["builtin"],
     }
 });
 
@@ -164,7 +162,6 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_request_user_input,
         // 这是 driver 直接按名称注入的控制工具，不能通过 manifest 的 tool_groups 暴露。
-        groups: &[],
     }
 });
 
@@ -260,7 +257,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_list_skills,
-        groups: &["builtin"],
     }
 });
 
@@ -447,7 +443,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_load_skill,
-        groups: &["builtin"],
     }
 });
 
@@ -576,7 +571,6 @@ inventory::submit!(ToolRegistration {
         name: "list_skill_resources",
         description: "",
         execute: execute_list_skill_resources,
-        groups: &["builtin"],
     }
 });
 
@@ -585,7 +579,6 @@ inventory::submit!(ToolRegistration {
         name: "read_skill_resource",
         description: "",
         execute: execute_read_skill_resource,
-        groups: &["builtin"],
     }
 });
 
@@ -595,7 +588,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_save_skill,
-        groups: &["builtin"],
     }
 });
 
@@ -1142,8 +1134,8 @@ mod tests {
             activate_spec.name,
             activate_spec.description,
         );
-        assert!(activate_skill.contains("use `list_skills`"));
-        assert!(activate_skill.contains("technical keywords"));
+        assert!(activate_skill.contains("Use `list_skills`"));
+        assert!(activate_skill.contains("loose keyword overlap"));
     }
 
     #[test]

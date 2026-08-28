@@ -13,5 +13,9 @@
         "description": "Maximum number of matching skills to return (default 50, maximum 100)."
       }
     }
-  }
+  },
+  "groups": [
+    "builtin",
+    "skills"
+  ]
 }

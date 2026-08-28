@@ -5,6 +5,7 @@ use rust_tools::cw::SkipSet;
 use serde_json::Value;
 
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::registry::tool_groups::ToolGroup;
 use crate::ai::types::ToolDefinition;
 
 type TurnIdentity = (String, usize);
@@ -16,6 +17,13 @@ struct TurnEnableState {
     pending_mcp_enable: Vec<String>,
     active_tool_names: Vec<String>,
     available_mcp_tools: Vec<ToolDefinition>,
+    /// Whether the current turn's active agent/skills declare the
+    /// executor tool group. Set by the driver when the skill turn
+    /// guard is built; gates visibility of heavy execution primitives in the
+    /// `enable_tools` catalog (hidden for agents that never declare the group).
+    // Set when the current agent/skills declare a group that gates hidden
+    // tools (see `registry::common::group_gates_hidden_tools`).
+    hidden_group_declared: bool,
 }
 
 #[derive(Default)]
@@ -73,10 +81,58 @@ fn subagent_may_enable_tool(name: &str) -> bool {
         || !super::is_subagent_orchestration_tool_name(name)
 }
 
-/// 按需启用只暴露通用 builtin 工具。skill 专属的 driver control tool 只能在
-/// active skill turn 由 driver 注入，不能通过普通 turn 的 `enable_tools` 获得。
+/// On-demand enablement only exposes generic `builtin` tools. Skill-specific
+/// driver control tools are injected by the driver during an active-skill turn
+/// and cannot be obtained through `enable_tools` in a normal turn.
 fn registration_may_be_dynamically_enabled(reg: &ToolRegistration) -> bool {
-    reg.spec.groups.contains(&"builtin")
+    crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name)
+        .contains(&ToolGroup::Builtin)
+}
+
+/// Record whether the current turn's active agent/skills declare a group that
+/// gates hidden tools (see `registry::common::group_gates_hidden_tools`). The
+/// driver computes this from the same manifest source that decides the hidden
+/// execution-primitive system-prompt catalog, so the `enable_tools` catalog
+/// and that hint can never disagree.
+pub(crate) fn set_hidden_group_declared(declared: bool) {
+    let turn = current_turn_identity();
+    if let Ok(mut s) = STATE.write() {
+        s.turns.entry(turn).or_default().hidden_group_declared = declared;
+    }
+}
+
+fn hidden_group_declared() -> bool {
+    let turn = current_turn_identity();
+    STATE
+        .read()
+        .ok()
+        .and_then(|s| {
+            s.turns
+                .get(&turn)
+                .map(|state| state.hidden_group_declared)
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a deferred heavy execution primitive may be enabled in the current
+/// agent context. Hidden tools (spawn_process / spawn_daemon / shm_* / ...)
+/// are only meaningful to agents that manage kernel processes, so for everyone
+/// else they stay out of the catalog and are rejected by name; agents that
+/// declare a hidden-gating group (see `group_gates_hidden_tools`) may enable
+/// them. Core tools like apply_patch / read_file are never hidden, so they are
+/// unaffected.
+fn agent_may_enable_tool(name: &str) -> bool {
+    !super::tool_defers_eager_load(name) || hidden_group_declared()
+}
+
+/// Whether a group name may be used as an `enable` shortcut (and appear in the
+/// group-shortcut catalog line) for the current agent. Groups that gate hidden
+/// tools (`group_gates_hidden_tools`) are privileged: for agents that never
+/// declare one, the whole group is hidden — including any always-available
+/// core members — so the catalog never advertises a system-level family the
+/// agent cannot meaningfully load.
+fn group_visible_to_agent(group: ToolGroup) -> bool {
+    !super::group_gates_hidden_tools(group) || hidden_group_declared()
 }
 
 fn current_turn_identity() -> TurnIdentity {
@@ -212,7 +268,7 @@ pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
             .unwrap_or_default(),
         Err(_) => return Vec::new(),
     };
-    names.retain(|name| subagent_may_enable_tool(name));
+    names.retain(|name| subagent_may_enable_tool(name) && agent_may_enable_tool(name));
     if names.is_empty() {
         return Vec::new();
     }
@@ -264,6 +320,7 @@ fn available_tools_not_active() -> Vec<(String, String)> {
     for reg in inventory::iter::<ToolRegistration> {
         if registration_may_be_dynamically_enabled(reg)
             && subagent_may_enable_tool(reg.spec.name)
+            && agent_may_enable_tool(reg.spec.name)
             && !active.iter().any(|a| a == reg.spec.name)
         {
             result.push((
@@ -306,6 +363,32 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 };
                 lines.push(format!("  - {}: {}", name, short));
             }
+            // One-line group catalog: the model can load a whole tool family
+            // by passing the group name to 'enable' instead of listing every
+            // member. Counts cover enable-able members only, matching what
+            // the expansion actually loads.
+            let mut group_counts: std::collections::BTreeMap<&str, usize> = Default::default();
+            for reg in inventory::iter::<ToolRegistration> {
+                if registration_may_be_dynamically_enabled(reg) {
+                    for tag in
+                        crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name)
+                    {
+                        if !tag.is_enable_ability_flag() && group_visible_to_agent(*tag) {
+                            *group_counts.entry(tag.as_str()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            if !group_counts.is_empty() {
+                let parts: Vec<String> = group_counts
+                    .iter()
+                    .map(|(group, count)| format!("{group}({count})"))
+                    .collect();
+                lines.push(format!(
+                    "Group shortcuts (a group name may be passed to 'enable'): {}",
+                    parts.join(", ")
+                ));
+            }
             Ok(lines.join("\n"))
         }
         "enable" => {
@@ -318,9 +401,57 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             if tool_names.is_empty() {
                 return Err("'tools' array is empty".to_string());
             }
+            // Group shortcuts: an entry that matches no registered tool but
+            // names a group expands to every enable-able tool carrying that
+            // tag. `builtin` is the enable-ability flag rather than a loadable
+            // unit and never expands, so a single entry can never dump the
+            // whole catalog; per-name enables stay the fine-grained path.
+            let mut expanded_from_groups: Vec<(String, usize)> = Vec::new();
+            let mut resolved_names: Vec<String> = Vec::new();
+            for entry in tool_names {
+                let mut is_tool = false;
+                for reg in inventory::iter::<ToolRegistration> {
+                    if reg.spec.name == entry {
+                        is_tool = true;
+                        break;
+                    }
+                }
+                if is_tool {
+                    resolved_names.push(entry);
+                    continue;
+                }
+                let mut members: Vec<String> = Vec::new();
+                if let Some(group) = ToolGroup::from_name(&entry)
+                    && !group.is_enable_ability_flag()
+                    && group_visible_to_agent(group)
+                {
+                    for reg in inventory::iter::<ToolRegistration> {
+                        let tags = crate::ai::tools::registry::tool_metadata::tool_groups(
+                            reg.spec.name,
+                        );
+                        if tags.contains(&ToolGroup::Builtin) && tags.contains(&group) {
+                            members.push(reg.spec.name.to_string());
+                        }
+                    }
+                }
+                if !members.is_empty() {
+                    expanded_from_groups.push((entry.clone(), members.len()));
+                    resolved_names.extend(members);
+                } else {
+                    // Not a tool and not a known group: keep as-is so the
+                    // existing unknown/MCP handling below reports it.
+                    resolved_names.push(entry);
+                }
+            }
+            let tool_names = resolved_names;
             let blocked_in_subagent: Vec<String> = tool_names
                 .iter()
                 .filter(|name| !subagent_may_enable_tool(name))
+                .cloned()
+                .collect();
+            let blocked_for_agent: Vec<String> = tool_names
+                .iter()
+                .filter(|name| !agent_may_enable_tool(name))
                 .cloned()
                 .collect();
             // 一次写锁内完成读 active/known_mcp + 写 pending_enable/pending_mcp_enable
@@ -353,6 +484,7 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 .iter()
                 .filter(|n| {
                     !blocked_in_subagent.iter().any(|blocked| blocked == *n)
+                        && !blocked_for_agent.iter().any(|blocked| blocked == *n)
                         && !known_builtin.iter().any(|k| k == n)
                         && !known_mcp.iter().any(|k| k == n.as_str())
                 })
@@ -362,12 +494,14 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 .iter()
                 .filter(|n| !unknown.iter().any(|u| u == *n))
                 .filter(|n| !blocked_in_subagent.iter().any(|blocked| blocked == *n))
+                .filter(|n| !blocked_for_agent.iter().any(|blocked| blocked == *n))
                 .cloned()
                 .collect();
             let to_enable: Vec<String> = tool_names
                 .into_iter()
                 .filter(|n| !active.iter().any(|a| a == n.as_str()))
                 .filter(|n| !blocked_in_subagent.iter().any(|blocked| blocked == n))
+                .filter(|n| !blocked_for_agent.iter().any(|blocked| blocked == n))
                 .filter(|n| {
                     known_builtin.iter().any(|k| k == n)
                         || known_mcp.iter().any(|k| k == n.as_str())
@@ -397,6 +531,13 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                     to_enable.join(", ")
                 ));
             }
+            if !expanded_from_groups.is_empty() {
+                let parts: Vec<String> = expanded_from_groups
+                    .iter()
+                    .map(|(group, count)| format!("{group} ({count} tools)"))
+                    .collect();
+                msg.push(format!("Expanded group shortcut(s): {}", parts.join(", ")));
+            }
             if !already.is_empty() {
                 msg.push(format!("Already active: {}", already.join(", ")));
             }
@@ -407,6 +548,12 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 msg.push(format!(
                     "Unavailable in subagent context (ignored): {}",
                     blocked_in_subagent.join(", ")
+                ));
+            }
+            if !blocked_for_agent.is_empty() {
+                msg.push(format!(
+                    "Unavailable for the current agent (ignored): {}",
+                    blocked_for_agent.join(", ")
                 ));
             }
             Ok(msg.join("\n"))
@@ -424,7 +571,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_enable_tools,
-        groups: &["builtin", "core"],
     }
 });
 
@@ -492,6 +638,41 @@ mod tests {
     }
 
     #[test]
+    fn group_name_enable_expands_to_group_members() {
+        // Group shortcut: an 'enable' entry naming a group expands to every
+        // enable-able member of that group. `builtin` is the enable-ability
+        // flag rather than a loadable unit, so it must stay unknown and can
+        // never load the whole catalog in one entry.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+
+        let enabled =
+            execute_enable_tools(&json!({"operation": "enable", "tools": ["knowledge"]})).unwrap();
+        assert!(
+            enabled.contains("Expanded group shortcut(s): knowledge (7 tools)"),
+            "{enabled}"
+        );
+        assert!(enabled.contains("Enabled 7 tool(s)"), "{enabled}");
+        for name in ["knowledge_search", "knowledge_save", "knowledge_semantic_search"] {
+            assert!(
+                enabled.contains(name),
+                "{name} should be enabled via the knowledge group"
+            );
+        }
+
+        let builtin =
+            execute_enable_tools(&json!({"operation": "enable", "tools": ["builtin"]})).unwrap();
+        assert!(builtin.contains("Unknown tools (ignored): builtin"), "{builtin}");
+
+        let listed = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+        assert!(listed.contains("Group shortcuts"), "{listed}");
+        assert!(listed.contains("skills(") && listed.contains("task("), "{listed}");
+    }
+
+    #[test]
     fn task_and_knowledge_tools_remain_dynamically_enabled() {
         // task 编排系列与 knowledge 记忆系列已从 core 组降级为 builtin-only：
         // 默认不随每轮常驻（省 token），但必须仍在 enable_tools 目录中可见、
@@ -529,6 +710,79 @@ mod tests {
         )
         .unwrap();
         assert!(enabled.contains("Enabled 2 tool(s): task_spawn, knowledge_search"));
+    }
+
+    #[test]
+    fn executor_primitives_hidden_for_default_agent() {
+        // Heavy execution primitives (executor group, non-core) only matter to
+        // agents that declare the group: a default agent's enable catalog must
+        // hide them entirely — no by-name enable and no group shortcut — or
+        // the model just sees unusable system-level schema noise.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+
+        let output = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+        for hidden in [
+            "spawn_daemon",
+            "spawn_process",
+            "shm_read",
+            "send_ipc_message",
+            "set_env",
+        ] {
+            assert!(
+                !output.contains(&format!("  - {hidden}:")),
+                "{hidden} must not be listed for a default agent"
+            );
+        }
+        // 组快捷键一行也不能宣传 executor 组（enable 它只会得到 Unknown）。
+        assert!(!output.contains("executor("), "{output}");
+        // 非原语工具不受影响：task 家族仍在目录中。
+        assert!(output.contains("  - task_spawn:"), "{output}");
+
+        let enabled =
+            execute_enable_tools(&json!({"operation": "enable", "tools": ["spawn_daemon"]}))
+                .unwrap();
+        assert!(
+            enabled.contains("Unavailable for the current agent (ignored): spawn_daemon"),
+            "{enabled}"
+        );
+        assert!(drain_pending_enable().is_empty());
+        assert!(explicit_enabled_tool_names().is_empty());
+
+        let group = execute_enable_tools(&json!({"operation": "enable", "tools": ["executor"]}))
+            .unwrap();
+        assert!(group.contains("Unknown tools (ignored): executor"), "{group}");
+    }
+
+    #[test]
+    fn executor_primitives_visible_when_group_declared() {
+        // An agent declaring the executor group must still discover and enable
+        // heavy execution primitives: visible in the catalog, enableable by
+        // name, and the group shortcut expands.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+        set_hidden_group_declared(true);
+
+        let output = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+        assert!(output.contains("  - spawn_daemon:"), "{output}");
+        assert!(output.contains("executor("), "{output}");
+
+        let enabled =
+            execute_enable_tools(&json!({"operation": "enable", "tools": ["spawn_daemon"]}))
+                .unwrap();
+        assert!(enabled.contains("Enabled 1 tool(s): spawn_daemon"), "{enabled}");
+        let drained = drain_pending_enable();
+        assert!(drained.iter().any(|d| d.function.name == "spawn_daemon"));
+
+        let group = execute_enable_tools(&json!({"operation": "enable", "tools": ["executor"]}))
+            .unwrap();
+        assert!(group.contains("Expanded group shortcut(s): executor"), "{group}");
     }
 
     #[test]

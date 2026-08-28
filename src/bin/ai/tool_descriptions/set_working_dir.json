@@ -12,5 +12,10 @@
     "required": [
       "dir"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

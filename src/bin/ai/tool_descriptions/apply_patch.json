@@ -17,5 +17,10 @@
         "description": "Absolute path to a patch file, instead of `patch`. It must be session-temp or inside the current working directory. Mutually exclusive with `patch`; limit 64000 characters."
       }
     }
-  }
+  },
+  "groups": [
+    "executor",
+    "builtin",
+    "core"
+  ]
 }

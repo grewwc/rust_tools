@@ -24,5 +24,10 @@
       "pid",
       "signal"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

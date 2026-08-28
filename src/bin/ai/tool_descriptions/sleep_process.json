@@ -9,5 +9,10 @@
         "description": "Scheduler ticks to sleep. Minimum and default 1."
       }
     }
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

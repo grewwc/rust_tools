@@ -25,5 +25,9 @@
         "description": "Optional glob filter for files (e.g. \"*.rs\"). Directories are always shown for structure."
       }
     }
-  }
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
 }

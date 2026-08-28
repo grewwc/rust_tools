@@ -62,7 +62,6 @@ inventory::submit!(ToolRegistration {
         name: "knowledge_semantic_search",
         description: "",
         execute: execute_knowledge_semantic_search,
-        groups: &["builtin"],
     }
 });
 
@@ -76,6 +75,5 @@ inventory::submit!(ToolRegistration {
         name: "knowledge_rebuild_index",
         description: "",
         execute: execute_knowledge_rebuild_index,
-        groups: &["builtin"],
     }
 });

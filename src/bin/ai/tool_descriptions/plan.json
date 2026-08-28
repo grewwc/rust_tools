@@ -50,5 +50,9 @@
     "required": [
       "steps"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
 }

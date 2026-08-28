@@ -12,7 +12,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_read_file,
-        groups: &["executor", "builtin", "core"],
     }
 });
 
@@ -45,7 +44,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_write_file,
-        groups: &["builtin", "core"],
     }
 });
 

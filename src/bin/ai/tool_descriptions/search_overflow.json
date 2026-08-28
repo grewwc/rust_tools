@@ -41,5 +41,9 @@
     "required": [
       "query"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
 }

@@ -17,5 +17,10 @@
       "pid",
       "message"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

@@ -264,5 +264,9 @@
         }
       }
     }
-  }
+  },
+  "groups": [
+    "builtin",
+    "agent_team"
+  ]
 }

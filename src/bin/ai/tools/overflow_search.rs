@@ -599,7 +599,6 @@ inventory::submit!(ToolRegistration {
         name: "search_overflow",
         description: "",
         execute: execute_search_overflow,
-        groups: &["builtin", "core"],
     }
 });
 

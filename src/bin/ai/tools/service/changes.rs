@@ -20,7 +20,6 @@ inventory::submit!(ToolRegistration {
         name: "show_changes",
         description: "",
         execute: execute_show_changes,
-        groups: &["builtin", "core"],
     }
 });
 
@@ -29,7 +28,8 @@ inventory::submit!(ToolRegistration {
         name: "open_diff",
         description: "",
         execute: execute_open_diff,
-        groups: &["builtin", "core"],
+        // User-triggered only (opens a diff in an external editor); lazy via
+        // `enable_tools` instead of a resident `core` schema every turn.
     }
 });
 

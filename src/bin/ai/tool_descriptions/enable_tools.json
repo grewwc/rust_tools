@@ -1,6 +1,6 @@
 {
   "name": "enable_tools",
-  "description": "List or activate additional tools that are not loaded by default. Use 'list' to see available tools, enabling specific tools by name makes them available in subsequent calls. Use this when you need specialized capabilities like memory, knowledge base, web browsing, or MCP server tools - and when a task would benefit from subagent parallelism: the subagent orchestration family (task, task_spawn, task_spawn_batch, task_integrate, task_wait, task_status, manage_team, ...) is also lazily loaded and must be enabled before it can be used.",
+  "description": "List or activate tools not loaded by default. 'list' shows unloaded tools plus group shortcuts; 'enable' takes tool names or a group name, expanding to that group's members ('builtin' is only an enable-ability flag and never expands). Enabled tools become available in subsequent calls — knowledge, skills, process/IPC primitives, MCP servers, and the lazy subagent orchestration family.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,18 +10,22 @@
           "list",
           "enable"
         ],
-        "description": "list: show unloaded available tools; enable: activate tools by name for subsequent calls."
+        "description": "list: show unloaded available tools plus group shortcuts; enable: activate tools or a whole group for subsequent calls."
       },
       "tools": {
         "type": "array",
         "items": {
           "type": "string"
         },
-        "description": "Tool names to enable (required for 'enable' operation)."
+        "description": "Tool names to enable, or group names (expanded to their members). Required for 'enable'."
       }
     },
     "required": [
       "operation"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
 }

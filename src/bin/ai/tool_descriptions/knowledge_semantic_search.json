@@ -24,5 +24,9 @@
     "required": [
       "query"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "knowledge"
+  ]
 }

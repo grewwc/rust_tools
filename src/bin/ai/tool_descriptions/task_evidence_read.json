@@ -9,6 +9,12 @@
         "description": "The asynchronous task_id returned by task_spawn or task_spawn_batch."
       }
     },
-    "required": ["task_id"]
-  }
+    "required": [
+      "task_id"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "task"
+  ]
 }

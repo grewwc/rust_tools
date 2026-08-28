@@ -41,7 +41,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_plan,
-        groups: &["builtin", "core"],
     }
 });
 

@@ -12,5 +12,9 @@
     "required": [
       "id"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "knowledge"
+  ]
 }

@@ -23,7 +23,8 @@ the nearest child `AGENTS.md`.
 - `stream/`: streaming protocol, chunk extraction, state machine, `stream/render/` terminal rendering
 - `cli.rs` / `theme.rs` / `background.rs`: CLI entry, theming, background tasks
 - `persona.rs` / `files.rs` / `types.rs` / `errors.rs` / `request_protocol.rs`: persona, file helpers (`extract_key_lines`), shared types, `AiError`, request dialect
-- `tool_descriptions/`: per-tool JSON schemas auto-discovered by `build.rs`
+- `tool_descriptions/`: per-tool JSON metadata (description, parameters schema,
+  group membership) auto-discovered by `build.rs`
 
 ## Session storage & sessionid debugging
 

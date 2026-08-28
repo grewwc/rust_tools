@@ -17,5 +17,10 @@
         "description": "When true, only show channels that are still live or not yet reclaimable. Default is true."
       }
     }
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

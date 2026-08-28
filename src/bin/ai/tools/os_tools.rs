@@ -118,7 +118,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_spawn_process,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -144,7 +143,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_sleep_process,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -175,7 +173,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_wait_process,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -205,7 +202,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_kill_process,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -236,7 +232,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_send_ipc,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -261,7 +256,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_reap_process,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -289,7 +283,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_read_mailbox,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -315,7 +308,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_set_env,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -380,7 +372,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_ps_processes,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -462,7 +453,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_ps_ipc,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -507,7 +497,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_signal_process,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -532,7 +521,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_set_process_group,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -567,7 +555,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_signal_process_group,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -592,7 +579,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_shm_create,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -646,7 +632,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_shm_read,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -669,7 +654,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_shm_write,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -691,7 +675,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_shm_delete,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -715,7 +698,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_set_working_dir,
-        groups: &["builtin", "executor"],
     }
 });
 
@@ -755,7 +737,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_spawn_daemon,
-        groups: &["builtin", "executor"],
     }
 });
 

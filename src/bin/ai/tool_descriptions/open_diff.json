@@ -1,6 +1,6 @@
 {
   "name": "open_diff",
-  "description": "Open the current session's diffs in an external editor. In a git repository the diff is derived from `git diff` plus the session mutation log; outside git the patch file alone is opened. Returns the patch file path and the editor command used. editor may be 'auto', 'code' (VS Code), 'cursor', 'idea', 'git' (git difftool), 'open' (macOS). Set background to true to detach.",
+  "description": "Open the current session's diffs in an external editor: `git diff` plus the session mutation log in a git repo, the patch file alone otherwise. Returns the patch file path and the editor command used.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -18,5 +18,8 @@
       }
     },
     "required": []
-  }
+  },
+  "groups": [
+    "builtin"
+  ]
 }

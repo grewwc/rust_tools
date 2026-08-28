@@ -18,7 +18,6 @@ pub(crate) struct ToolSpec {
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
     pub(crate) execute: fn(&Value) -> Result<String, String>,
-    pub(crate) groups: &'static [&'static str],
 }
 
 /// Registry entry submitted via `inventory!` to register a tool
@@ -363,31 +362,15 @@ static REGISTERED_TOOL_NAMES: LazyLock<FastSet<&'static str>> = LazyLock::new(||
     names
 });
 
-fn expanded_tool_groups<'a>(groups: &'a [&'a str]) -> Vec<&'a str> {
-    let mut expanded_groups: Vec<&str> = groups.to_vec();
-    if groups.contains(&"executor") && !expanded_groups.contains(&"openclaw") {
-        expanded_groups.push("openclaw");
-    }
-    if groups.contains(&"openclaw") && !expanded_groups.contains(&"executor") {
-        expanded_groups.push("executor");
-    }
-    expanded_groups
-}
-
 /// Returns tool definitions for all registered tools that belong
 /// to at least one of the specified groups.
-pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition> {
+pub(crate) fn tool_definitions_for_groups(groups: &[super::tool_groups::ToolGroup]) -> Vec<ToolDefinition> {
     let mut tools: Box<SkipMap<String, ToolDefinition>> =
         SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
-    let expanded_groups = expanded_tool_groups(groups);
 
     for reg in inventory::iter::<ToolRegistration> {
-        if !reg
-            .spec
-            .groups
-            .iter()
-            .any(|g| expanded_groups.iter().any(|x| x == g))
-        {
+        let tags = super::tool_metadata::tool_groups(reg.spec.name);
+        if !tags.iter().any(|g| groups.contains(g)) {
             continue;
         }
         let tool_def = ToolDefinition {
@@ -406,18 +389,13 @@ pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition
     tools.into_iter().map(|(_, v)| v).collect()
 }
 
-pub(crate) fn tool_summaries_for_groups(groups: &[&str]) -> Vec<(String, String)> {
+pub(crate) fn tool_summaries_for_groups(groups: &[super::tool_groups::ToolGroup]) -> Vec<(String, String)> {
     let mut tools: Box<SkipMap<String, String>> =
         SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
-    let expanded_groups = expanded_tool_groups(groups);
 
     for reg in inventory::iter::<ToolRegistration> {
-        if !reg
-            .spec
-            .groups
-            .iter()
-            .any(|g| expanded_groups.iter().any(|x| x == g))
-        {
+        let tags = super::tool_metadata::tool_groups(reg.spec.name);
+        if !tags.iter().any(|g| groups.contains(g)) {
             continue;
         }
         tools.insert(
@@ -451,36 +429,29 @@ pub(crate) fn get_tool_definitions_by_names(names: &[String]) -> Vec<ToolDefinit
 }
 
 pub(crate) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {
-    tool_definitions_for_groups(&["builtin"])
+    tool_definitions_for_groups(&[super::tool_groups::ToolGroup::Builtin])
 }
 
-/// 判断一组 group 归属是否代表「按需加载的重执行原语」：隶属 executor/openclaw
-/// 组但不属于 core 组。这类工具（进程 / IPC / 共享内存 / 环境原语）schema 体积大、
-/// 使用频率低，默认不随每轮请求常驻，改由模型经 `enable_tools` 按需启用，压缩每轮
-/// 发送的 tools schema token。core∩executor 的工具（如 apply_patch / write_file /
-/// read_file）因同属 core 仍然常驻，不受影响。
-fn groups_defer_eager_load(groups: &[&str]) -> bool {
-    let in_executor = groups.contains(&"executor") || groups.contains(&"openclaw");
-    in_executor && !groups.contains(&"core")
-}
-
-/// 某个已注册工具是否为「按需加载的重执行原语」。turn 级工具集在按 tool_groups
-/// 展开时用它剔除这些工具；显式 `tools:` 点名的工具不走这里（点名即常驻）。
+/// Whether a registered tool is a "deferred eager-load heavy execution
+/// primitive", i.e. it carries the `hidden` metadata flag. These tools
+/// (process / IPC / shared-memory / environment primitives) have large schemas
+/// and low usage, so they are not resident in each turn's request; the model
+/// enables them on demand via `enable_tools`, shrinking per-turn tools-schema
+/// tokens. The same flag also excludes them from the default catalog
+/// (`tool_metadata::tool_is_hidden`), so `hidden` is the single source of
+/// truth for both eager-load deferral and default-agent visibility.
 pub(crate) fn tool_defers_eager_load(name: &str) -> bool {
-    TOOL_INDEX
-        .get_ref(&name.to_string())
-        .copied()
-        .map(|spec| groups_defer_eager_load(spec.groups))
-        .unwrap_or(false)
+    super::tool_metadata::tool_is_hidden(name)
 }
 
-/// 全部「按需加载的重执行原语」（名称 + 描述），按名称排序。用于在 system prompt
-/// 里生成「未加载但可 enable」的能力目录，保证模型对这些工具可感知、可按需启用。
+/// All deferred eager-load primitives (name + description), sorted by name.
+/// Feeds the "loaded on demand" capability catalog in the system prompt so the
+/// model stays aware of these tools and can enable them when needed.
 pub(crate) fn deferred_eager_load_tool_summaries() -> Vec<(String, String)> {
     let mut tools: Box<SkipMap<String, String>> =
         SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
     for reg in inventory::iter::<ToolRegistration> {
-        if groups_defer_eager_load(reg.spec.groups) {
+        if super::tool_metadata::tool_is_hidden(reg.spec.name) {
             tools.insert(
                 reg.spec.name.to_string(),
                 super::tool_metadata::tool_description(reg.spec.name, reg.spec.description),
@@ -488,6 +459,22 @@ pub(crate) fn deferred_eager_load_tool_summaries() -> Vec<(String, String)> {
         }
     }
     tools.into_iter().collect()
+}
+
+/// Whether a turn-group gates hidden tools: at least one registered tool that
+/// belongs to `group` carries the `hidden` metadata flag. Agents that declare
+/// such a group (e.g. the executor group in a skill/agent manifest) may see
+/// and enable the group's hidden primitives; everyone else stays blocked. This
+/// is the single source of truth for "privileged group" — tagging a new tool
+/// hidden automatically makes its group privileged, with no hardcoded
+/// group-name list.
+pub(crate) fn group_gates_hidden_tools(group: super::tool_groups::ToolGroup) -> bool {
+    inventory::iter::<ToolRegistration>
+        .into_iter()
+        .any(|reg| {
+            super::tool_metadata::tool_is_hidden(reg.spec.name)
+                && super::tool_metadata::tool_groups(reg.spec.name).contains(&group)
+        })
 }
 
 pub(crate) fn get_tool_spec(name: &str) -> Option<&'static ToolSpec> {

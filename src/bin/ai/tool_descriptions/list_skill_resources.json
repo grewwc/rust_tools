@@ -17,6 +17,12 @@
         "description": "Maximum number of files to list (default: 100, max: 500)."
       }
     },
-    "required": ["name"]
-  }
+    "required": [
+      "name"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "skills"
+  ]
 }

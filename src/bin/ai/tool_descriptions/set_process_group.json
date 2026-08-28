@@ -17,5 +17,10 @@
       "pid",
       "pgid"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

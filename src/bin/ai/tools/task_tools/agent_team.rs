@@ -40,7 +40,6 @@ inventory::submit!(ToolRegistration {
         name: "manage_team",
         description: "",
         execute: execute_manage_team,
-        groups: &["builtin"],
     }
 });
 

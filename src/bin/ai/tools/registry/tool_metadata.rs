@@ -1,18 +1,25 @@
 //! 内置工具元数据加载。
 //!
-//! 每个工具对应一个独立 JSON 文件：`src/bin/ai/tool_descriptions/<tool>.json`，
-//! 内容形如：
+//! One JSON file per tool: `src/bin/ai/tool_descriptions/<tool>.json`,
+//! shaped like:
 //!
 //! ```json
 //! {
 //!   "name": "read_file",
 //!   "description": "...",
-//!   "parameters": { "type": "object", "properties": { ... } }
+//!   "parameters": { "type": "object", "properties": { ... } },
+//!   "groups": ["builtin", "core"]
 //! }
 //! ```
 //!
-//! 其中 `parameters` 是发给模型的 JSON Schema。`execute` 是 Rust 函数，
-//! 必须留在代码里；描述与参数 schema 都属于声明性元数据，统一外置。
+//! `parameters` is the JSON Schema sent to the model. `groups` lists the
+//! tool's turn-groups as [`ToolGroup`] variant names (see
+//! `registry::tool_groups`): it is the single source of truth for which turn
+//! groups load the tool, whether `enable_tools` may activate it (membership
+//! of `builtin`), and whether it is a deferred eager-load primitive.
+//! `execute` is a Rust function and must stay in code; description,
+//! parameters schema, and group membership are declarative metadata and live
+//! here.
 //!
 //! build.rs 编译期扫描该目录，把所有文件以 `include_str!` 嵌入并生成
 //! `BUILTIN_TOOL_DESCRIPTION_FILES` 常量；运行时首次访问时解析并缓存。
@@ -24,10 +31,19 @@
 //! 3. `~/.config/rust_tools/tool_descriptions/`
 //! 4. 可执行文件同目录的 `tool_descriptions/`
 //!
-//! 注册处 `ToolSpec.description` 保持空占位，描述与参数 schema 全部来自元数据。
-//! 某工具若缺少可用元数据（漏建文件 / 拼错文件名 / 内部 `name` 与注册名不一致 /
-//! 描述为空），会静默退化为空描述 + 空 schema；`every_registered_tool_has_
-//! builtin_metadata` 测试在编译期登记表与内置元数据之间钉死全覆盖契约。
+//! The registration site keeps empty placeholders (`description: ""`, no group
+//! literals); everything comes from metadata. A built-in tool with unusable
+//! metadata (missing file / misspelled filename / inner `name` mismatching the
+//! registered name / empty description / missing `groups`) silently degrades to
+//! an empty description + empty schema + no group membership; the
+//! `every_registered_tool_has_builtin_metadata` test pins the full-coverage
+//! contract between the compile-time registry and built-in metadata.
+//!
+//! A user override file may omit optional fields to change only part of a
+//! tool's metadata: an absent `groups` / `hidden` inherits from the entry being
+//! replaced (so "just tweak the description" cannot silently detach the tool
+//! from every turn group), while an explicit `groups: []` still means
+//! "deliberately no group membership".
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +55,8 @@ use serde_json::Value;
 use crate::ai::config_schema::AiConfig;
 use crate::commonw::{configw, utils::expanduser};
 
+use super::tool_groups::ToolGroup;
+
 // build.rs 生成的清单。
 include!(concat!(env!("OUT_DIR"), "/tool_description_files.rs"));
 
@@ -49,6 +67,14 @@ struct ToolMetadataFile {
     description: String,
     #[serde(default = "empty_parameters")]
     parameters: Value,
+    // Distinguish "field absent" (None) from "declared empty" (Some(vec![])).
+    // The coverage test requires the field to be present for every built-in
+    // tool; empty is reserved for driver-injected-only tools.
+    groups: Option<Vec<String>>,
+    // Distinguish "field absent" (None) from "declared false" (Some(false)):
+    // a user override that omits the field inherits the entry being replaced,
+    // while an explicit `false` un-hides a built-in hidden primitive.
+    hidden: Option<bool>,
 }
 
 fn empty_parameters() -> Value {
@@ -59,17 +85,26 @@ fn empty_parameters() -> Value {
 pub(crate) struct ToolMetadata {
     pub(crate) description: String,
     pub(crate) parameters: Value,
+    // Interned once at parse time so group lookups can return `&'static`
+    // slices without re-parsing; the metadata cache itself is a `OnceLock`,
+    // so each file's groups are leaked exactly once.
+    pub(crate) groups: &'static [ToolGroup],
+    // Tools marked hidden stay out of the default model's `enable_tools`
+    // catalog: their schemas are only meaningful to agents that manage kernel
+    // processes / IPC (e.g. the executor primitives), so they are gated behind
+    // an explicit group declaration (see `registry::common::group_gates_hidden_tools`).
+    // The flag is orthogonal to group membership: a core tool (apply_patch /
+    // read_file) that also carries the executor tag is NOT hidden, because it
+    // must stay resident for every agent.
+    pub(crate) hidden: bool,
 }
 
-fn parse_metadata_entry(content: &str, source: &str) -> Option<(String, ToolMetadata)> {
+/// Parse a metadata file into its declared fields (no inheritance). Returns
+/// the inner `name` so the caller can resolve the entry being replaced for
+/// optional-field inheritance.
+fn parse_metadata_file(content: &str, source: &str) -> Option<(String, ToolMetadataFile)> {
     match serde_json::from_str::<ToolMetadataFile>(content) {
-        Ok(file) => Some((
-            file.name,
-            ToolMetadata {
-                description: file.description,
-                parameters: file.parameters,
-            },
-        )),
+        Ok(file) => Some((file.name.clone(), file)),
         Err(err) => {
             eprintln!("[tools] failed to parse tool metadata from {source}: {err}");
             None
@@ -77,8 +112,53 @@ fn parse_metadata_entry(content: &str, source: &str) -> Option<(String, ToolMeta
     }
 }
 
-/// 用户自定义工具元数据目录，按优先级从低到高排列（`load_metadata` 依次应用，
-/// 后应用者覆盖前者，因此数组末尾优先级最高）。见模块文档。
+/// Build the effective [`ToolMetadata`] from a parsed file, inheriting optional
+/// fields (`groups`, `hidden`) from the entry being replaced when the file
+/// omits them. Built-in files pass `base = None`, so the full-coverage contract
+/// is unchanged for them; a user override may then tweak only `description`
+/// without accidentally detaching the tool from every turn group.
+fn finalize_metadata(
+    file: ToolMetadataFile,
+    base: Option<&ToolMetadata>,
+    source: &str,
+) -> Option<ToolMetadata> {
+    let groups = match file.groups {
+        Some(names) => match parse_groups(names) {
+            Ok(groups) => groups,
+            Err(err) => {
+                eprintln!("[tools] failed to parse tool metadata from {source}: {err}");
+                return None;
+            }
+        },
+        None => base.map_or(&[][..], |b| b.groups),
+    };
+    Some(ToolMetadata {
+        description: file.description,
+        parameters: file.parameters,
+        groups,
+        hidden: file.hidden.unwrap_or_else(|| base.map_or(false, |b| b.hidden)),
+    })
+}
+
+/// Resolve the JSON `groups` array against the closed [`ToolGroup`] vocabulary.
+/// Unknown names are a hard parse error (the whole file is rejected), so a
+/// typo cannot silently detach a tool from every turn that would otherwise
+/// load it. Duplicates are dropped.
+fn parse_groups(names: Vec<String>) -> Result<&'static [ToolGroup], String> {
+    let mut groups: Vec<ToolGroup> = Vec::with_capacity(names.len());
+    for name in names {
+        let group = ToolGroup::from_name(&name)
+            .ok_or_else(|| format!("unknown tool group {name:?} (see registry::tool_groups)"))?;
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    Ok(Box::leak(groups.into_boxed_slice()) as &'static [ToolGroup])
+}
+
+/// User-defined tool metadata directories, ordered lowest to highest priority
+/// (`load_metadata` applies them in order, so the last entry wins). See the
+/// module documentation.
 fn user_tool_description_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
@@ -134,8 +214,13 @@ fn load_user_dir(dir: &Path, into: &mut HashMap<String, ToolMetadata>) {
         let source = path.display().to_string();
         match std::fs::read_to_string(&path) {
             Ok(content) => {
-                if let Some((name, metadata)) = parse_metadata_entry(&content, &source) {
-                    into.insert(name, metadata);
+                if let Some((name, file)) = parse_metadata_file(&content, &source) {
+                    // Resolve the entry being replaced first: an override may
+                    // omit optional fields (groups / hidden) and inherit them.
+                    let base = into.get(&name);
+                    if let Some(metadata) = finalize_metadata(file, base, &source) {
+                        into.insert(name, metadata);
+                    }
                 }
             }
             Err(err) => {
@@ -150,10 +235,11 @@ fn load_user_dir(dir: &Path, into: &mut HashMap<String, ToolMetadata>) {
 fn load_builtin_metadata() -> HashMap<String, ToolMetadata> {
     let mut metadata = HashMap::new();
     for (name, content) in BUILTIN_TOOL_DESCRIPTION_FILES {
-        if let Some((parsed_name, entry)) =
-            parse_metadata_entry(content, &format!("builtin:{name}"))
-        {
-            metadata.insert(parsed_name, entry);
+        let source = format!("builtin:{name}");
+        if let Some((parsed_name, file)) = parse_metadata_file(content, &source) {
+            if let Some(entry) = finalize_metadata(file, None, &source) {
+                metadata.insert(parsed_name, entry);
+            }
         }
     }
     metadata
@@ -171,13 +257,14 @@ fn load_metadata() -> &'static HashMap<String, ToolMetadata> {
     })
 }
 
-/// 返回内置工具的有效描述。
+/// Returns the effective description of a built-in tool.
 ///
-/// - 元数据（内置 JSON 或用户覆盖）中存在 `name` 且描述非空时，使用配置值。
-/// - 缺失或为空时返回 `fallback`。注册处 `ToolSpec.description` 现为占位空串，
-///   正常路径不会用到 `fallback`；全覆盖契约由
-///   `every_registered_tool_has_builtin_metadata` 测试钉死，空描述不再视为
-///   可接受的兜底。
+/// - Uses the configured value when metadata (built-in JSON or a user override)
+///   contains `name` with a non-empty description.
+/// - Returns `fallback` when missing or empty. The registration site keeps an
+///   empty placeholder, so the normal path never uses `fallback`; the
+///   full-coverage contract is pinned by
+///   `every_registered_tool_has_builtin_metadata`.
 pub(crate) fn tool_description(name: &str, fallback: &str) -> String {
     let metadata = load_metadata();
     metadata
@@ -196,6 +283,29 @@ pub(crate) fn tool_parameters(name: &str) -> Value {
         .get(name)
         .map(|m| m.parameters.clone())
         .unwrap_or_else(empty_parameters)
+}
+
+/// Group membership of a registered tool, sourced from the `groups` field of
+/// its metadata JSON (`tool_descriptions/<tool>.json`). This is the single
+/// source of truth for group membership — the Rust `ToolSpec` carries no
+/// group data, and the name vocabulary is the closed [`ToolGroup`] enum. An
+/// empty slice means the tool belongs to no group (e.g. driver-injected
+/// control tools). Missing metadata also yields `&[]`; the coverage test pins
+/// that every built-in tool declares the field.
+pub(crate) fn tool_groups(name: &str) -> &'static [ToolGroup] {
+    load_metadata()
+        .get(name)
+        .map(|m| m.groups)
+        .unwrap_or(&[])
+}
+
+/// Whether a tool is hidden from the default model's `enable_tools` catalog.
+/// Hidden tools carry the `hidden` flag in their metadata JSON
+/// (`tool_descriptions/<tool>.json`); they only become visible to agents that
+/// declare a group gating hidden tools (see `registry::common::group_gates_hidden_tools`).
+/// Missing metadata yields `false`, so this never hides a driver-injected tool.
+pub(crate) fn tool_is_hidden(name: &str) -> bool {
+    load_metadata().get(name).map(|m| m.hidden).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -231,18 +341,109 @@ mod tests {
     }
 
     #[test]
+    fn user_override_inherits_optional_fields_when_omitted() {
+        // A user override file that only tweaks `description` must keep the
+        // replaced entry's `groups` / `hidden`; otherwise the tool would
+        // silently detach from every turn group (empty membership).
+        let base_json = r#"{
+            "name": "read_file",
+            "description": "base description",
+            "parameters": {"type": "object", "properties": {}},
+            "groups": ["builtin", "core"],
+            "hidden": true
+        }"#;
+        let base = finalize_metadata(
+            serde_json::from_str(base_json).unwrap(),
+            None,
+            "test:base",
+        )
+        .unwrap();
+
+        // Override omits `groups` and `hidden` -> inherit both from the base.
+        let override_json = r#"{
+            "name": "read_file",
+            "description": "overridden description"
+        }"#;
+        let merged = finalize_metadata(
+            serde_json::from_str(override_json).unwrap(),
+            Some(&base),
+            "test:override",
+        )
+        .unwrap();
+        assert_eq!(merged.description, "overridden description");
+        assert_eq!(merged.groups, &[ToolGroup::Builtin, ToolGroup::Core][..]);
+        assert!(merged.hidden);
+
+        // Explicit `groups: []` still means "no membership", and explicit
+        // `hidden: false` un-hides, regardless of the base.
+        let detach_json = r#"{
+            "name": "read_file",
+            "description": "explicitly detached",
+            "groups": [],
+            "hidden": false
+        }"#;
+        let detached = finalize_metadata(
+            serde_json::from_str(detach_json).unwrap(),
+            Some(&base),
+            "test:detach",
+        )
+        .unwrap();
+        assert!(detached.groups.is_empty());
+        assert!(!detached.hidden);
+    }
+
+    #[test]
+    fn user_override_dir_inherits_groups_via_base_lookup() {
+        // End-to-end for `load_user_dir`: a real override file that omits
+        // `groups` must inherit from the entry it replaces (looked up by its
+        // inner name), not silently detach from every turn group.
+        let dir = std::env::temp_dir().join(format!(
+            "tool_metadata_override_test_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("read_file.json"),
+            r#"{
+                "name": "read_file",
+                "description": "overridden description only"
+            }"#,
+        )
+        .unwrap();
+
+        let mut metadata = load_builtin_metadata();
+        load_user_dir(&dir, &mut metadata);
+
+        let entry = metadata.get("read_file").expect("read_file present");
+        assert_eq!(entry.description, "overridden description only");
+        // Inherited from the built-in entry, so the tool stays resident.
+        assert!(entry.groups.contains(&ToolGroup::Core));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn every_registered_tool_has_builtin_metadata() {
-        // 钉死「注册登记表 ↔ 内置 JSON 文件」的双向全覆盖与一致性契约：
-        // 1. 每个已注册工具都必须有对应 JSON，且描述非空、schema 结构合法；
-        // 2. 每个内置 JSON 都必须对应一个已注册工具（无孤儿文件，防止删工具后
-        //    遗留的陈旧元数据继续被嵌入）；
-        // 3. JSON 内部的 `name` 字段必须与文件名 stem 一致，否则 build.rs 用
-        //    stem 登记、运行时用内部 name 查表会发生静默错位。
+        // Pins the bidirectional full-coverage contract between the registry
+        // and the built-in JSON files:
+        // 1. Every registered tool must have a JSON file with a non-empty
+        //    description, a valid object schema, and a present `groups` field
+        //    (possibly `[]`) whose entries all name a `ToolGroup` variant.
+        // 2. Every built-in JSON must correspond to a registered tool (no
+        //    orphan files, so stale metadata cannot keep getting embedded
+        //    after a tool is removed).
+        // 3. The inner `name` field must equal the filename stem, otherwise
+        //    build.rs registers by stem while runtime lookup uses the inner
+        //    name and lookups silently miss.
         //
-        // 注意：这里用 load_builtin_metadata()（不掺用户目录覆盖），并把内置
-        // 清单按「文件名 stem」和「内部 name」分别建表，以暴露二者不一致。
+        // Uses load_builtin_metadata() (no user-directory overrides) and builds
+        // the built-in manifest keyed separately by stem and inner name to
+        // expose mismatches.
         let metadata = load_builtin_metadata();
-        let mut missing = Vec::new(); // 注册了但无 JSON（或内部 name 不匹配）
+        // Registered tools with no JSON file (or an inner-name mismatch).
+        let mut missing = Vec::new();
         let mut empty_desc = Vec::new();
         let mut bad_schema = Vec::new();
         for reg in inventory::iter::<ToolRegistration> {
@@ -271,6 +472,8 @@ mod tests {
             .map(|r| r.spec.name)
             .collect();
         let mut orphan = Vec::new();
+        let mut missing_groups = Vec::new();
+        let mut unknown_groups = Vec::new();
         for (stem, content) in BUILTIN_TOOL_DESCRIPTION_FILES {
             let parsed: ToolMetadataFile =
                 serde_json::from_str(content).expect("builtin metadata must parse");
@@ -282,6 +485,14 @@ mod tests {
                     "{}.json (name {:?}) has no registered tool",
                     stem, parsed.name
                 ));
+            }
+            if parsed.groups.is_none() {
+                missing_groups.push(format!("{}.json has no `groups` field", stem));
+            }
+            for group in parsed.groups.unwrap_or_default() {
+                if ToolGroup::from_name(&group).is_none() {
+                    unknown_groups.push(format!("{}.json has unknown group {group:?}", stem));
+                }
             }
         }
 
@@ -300,6 +511,15 @@ mod tests {
         assert!(
             orphan.is_empty(),
             "builtin metadata files with no matching registered tool, or filename/inner-name mismatch: {orphan:?}"
+        );
+        assert!(
+            missing_groups.is_empty(),
+            "builtin metadata files missing the `groups` field: {missing_groups:?}"
+        );
+        assert!(
+            unknown_groups.is_empty(),
+            "builtin metadata files naming unknown groups (extend ToolGroup in \
+             registry/tool_groups.rs): {unknown_groups:?}"
         );
     }
 }

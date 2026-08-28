@@ -4,5 +4,10 @@
   "parameters": {
     "type": "object",
     "properties": {}
-  }
+  },
+  "groups": [
+    "builtin",
+    "executor"
+  ],
+  "hidden": true
 }

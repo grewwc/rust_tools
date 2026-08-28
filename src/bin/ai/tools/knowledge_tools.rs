@@ -146,7 +146,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_knowledge_save,
-        groups: &["builtin"],
     }
 });
 
@@ -189,7 +188,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_knowledge_forget,
-        groups: &["builtin"],
     }
 });
 
@@ -277,7 +275,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_knowledge_search,
-        groups: &["builtin"],
     }
 });
 
@@ -373,7 +370,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_knowledge_list,
-        groups: &["builtin"],
     }
 });
 
@@ -589,7 +585,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_knowledge_consolidate,
-        groups: &["builtin"],
     }
 });
 

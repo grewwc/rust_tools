@@ -6,6 +6,5 @@ inventory::submit!(ToolRegistration {
         name: "send_side_note",
         description: "",
         execute: execute_send_side_note,
-        groups: &["builtin", "core"],
     }
 });

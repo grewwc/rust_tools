@@ -7,6 +7,7 @@ priority: 20
 tool_groups:
   - "core"
   - "task"
+  - "agent_team"
 ---
 
 # Agent Team Mode
@@ -42,7 +43,7 @@ A worker branch must be sized to its own bounded turn budget: the default subage
 5. Use `run_agent_graph` only when an explicit DAG, reducer, conditional path, or structured multi-perspective pooling is materially better than ordinary task delegation.
 6. Do not delegate from a subagent. Subagents are leaf workers; the parent owns orchestration.
 
-注意：本 skill 常驻的工具集为 `[core, task]`（task 系列委派/编排必需）；`manage_team` / `run_agent_graph` 不在其中，需要时先用 `enable_tools`（operation="enable"）启用。
+Note: this skill's resident tool set is `[core, task, agent_team]` — task-family delegation/orchestration tools plus the `agent_team` group (`manage_team`, `run_agent_graph`); `send_side_note` is included via the `task` group. Other lazy builtin tools stay unloaded; enable on demand with `enable_tools`.
 
 ## Subagent contract
 

@@ -21,7 +21,6 @@ inventory::submit!(ToolRegistration {
         description: "",
 
         execute: execute_apply_patch,
-        groups: &["executor", "builtin", "core"],
     }
 });
 

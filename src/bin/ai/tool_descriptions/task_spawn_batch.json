@@ -47,5 +47,9 @@
     "required": [
       "tasks"
     ]
-  }
+  },
+  "groups": [
+    "builtin",
+    "task"
+  ]
 }

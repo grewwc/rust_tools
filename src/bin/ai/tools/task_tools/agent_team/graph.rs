@@ -35,7 +35,6 @@ inventory::submit!(ToolRegistration {
         name: "run_agent_graph",
         description: "",
         execute: execute_run_agent_graph,
-        groups: &["builtin"],
     }
 });
 
