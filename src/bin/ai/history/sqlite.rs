@@ -503,6 +503,13 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             succeeded INTEGER NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
+        CREATE TABLE IF NOT EXISTS interrupted_stream_diagnostics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            assistant_text TEXT NOT NULL,
+            reasoning_text TEXT NOT NULL,
+            source_model TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
         CREATE TABLE IF NOT EXISTS skill_activation_events (
             id INTEGER PRIMARY KEY,
             requested_skill TEXT NOT NULL,
@@ -1089,6 +1096,37 @@ pub(in crate::ai) fn append_tool_execution_outcomes_sqlite(
                     .map_err(|error| io::Error::other(error.to_string()))?;
             }
         }
+        bump_history_revision(&tx)?;
+        tx.commit()
+            .map_err(|error| io::Error::other(error.to_string()))
+    })
+}
+
+/// Stores received partial model output after an interrupted stream in an audit-only
+/// side table. It is deliberately separate from `messages` and `context_messages`,
+/// so the output can never be included in a later model request.
+pub(in crate::ai) fn append_interrupted_stream_diagnostic_sqlite(
+    path: &Path,
+    source_model: &str,
+    assistant_text: &str,
+    reasoning_text: &str,
+) -> io::Result<()> {
+    if (assistant_text.is_empty() && reasoning_text.is_empty()) || !blob::is_sqlite_path(path) {
+        return Ok(());
+    }
+    with_session_state_lock(path, || {
+        let mut conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        let tx = conn
+            .transaction()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO interrupted_stream_diagnostics
+                (assistant_text, reasoning_text, source_model)
+             VALUES (?1, ?2, ?3)",
+            params![assistant_text, reasoning_text, source_model],
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
         bump_history_revision(&tx)?;
         tx.commit()
             .map_err(|error| io::Error::other(error.to_string()))
@@ -2340,6 +2378,8 @@ fn clear_session_history_sqlite_unlocked(path: &Path) -> io::Result<()> {
     invalidate_context_snapshot(&tx)?;
     tx.execute("DELETE FROM tool_execution_outcomes", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute("DELETE FROM interrupted_stream_diagnostics", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
     tx.execute("DELETE FROM skill_activation_events", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
     // Keep the history_revision row: it is the cache-invalidation counter and must stay **monotonically increasing** across clears.
@@ -2381,6 +2421,8 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
             .map_err(|e| io::Error::other(e.to_string()))?;
         invalidate_context_snapshot(&tx)?;
         tx.execute("DELETE FROM tool_execution_outcomes", [])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        tx.execute("DELETE FROM interrupted_stream_diagnostics", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
         tx.execute("DELETE FROM skill_activation_events", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -3173,6 +3215,59 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrupted_stream_diagnostics_are_isolated_from_model_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "interrupted_stream_diagnostic_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+
+        append_interrupted_stream_diagnostic_sqlite(
+            &path,
+            "test-model",
+            "partial body",
+            "partial reasoning",
+        )
+        .unwrap();
+
+        assert!(read_all_messages_sqlite(&path).unwrap().is_empty());
+        let conn = Connection::open(&path).unwrap();
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT assistant_text, reasoning_text, source_model
+                 FROM interrupted_stream_diagnostics",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "partial body".to_string(),
+                "partial reasoning".to_string(),
+                "test-model".to_string(),
+            )
+        );
+
+        clear_session_history_sqlite(&path).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM interrupted_stream_diagnostics",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

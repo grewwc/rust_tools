@@ -111,6 +111,9 @@ pub(super) struct SseEvent {
 
 pub(super) struct StreamRenderState {
     pub(super) markdown: MarkdownStreamRenderer,
+    /// Withhold non-thinking assistant prose until the stream outcome and the
+    /// driver's final-response gates are known.
+    pub(super) defer_assistant_body: bool,
     pub(super) waiting_hint_active: bool,
     pub(super) waiting_hint_buffering: bool,
     pub(super) waiting_hint_tool_call: bool,
@@ -129,6 +132,7 @@ impl StreamRenderState {
     fn new() -> Self {
         Self {
             markdown: MarkdownStreamRenderer::new(),
+            defer_assistant_body: false,
             waiting_hint_active: false,
             waiting_hint_buffering: false,
             waiting_hint_tool_call: false,

@@ -61,7 +61,7 @@ fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
     assert!(matches!(first_step, TurnLoopStep::Continue));
     assert!(final_assistant_text.is_empty());
     assert!(!final_assistant_recorded);
-    assert_eq!(terminal_dedupe_candidate.as_deref(), Some("已修复。"));
+    assert_eq!(terminal_dedupe_candidate, None);
     assert_eq!(
         messages
             .iter()
@@ -103,8 +103,8 @@ fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
     assert!(final_assistant_text.contains(COMPLETION_EVIDENCE_WARNING));
     assert_eq!(
         terminal_dedupe_candidate.as_deref(),
-        Some(COMPLETION_EVIDENCE_WARNING),
-        "streamed finals must expose only the user-visible runtime suffix for terminal redraw"
+        Some(final_assistant_text.as_str()),
+        "only the accepted final, including its runtime warning, is committed to the terminal"
     );
     assert!(messages.iter().any(|message| {
         message.role == "assistant"
@@ -244,7 +244,7 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
 }
 
 #[test]
-fn completion_evidence_gate_precedes_dangling_final_recovery() {
+fn dangling_action_gate_takes_over_when_mutation_final_has_no_completion_claim() {
     let mutation = test_tool_call(
         "call_patch",
         "apply_patch",
@@ -296,22 +296,34 @@ fn completion_evidence_gate_precedes_dangling_final_recovery() {
     .unwrap();
 
     assert!(matches!(step, TurnLoopStep::Continue));
+    // The completion gate only reopens finals that CLAIM completion
+    // (FinalClaimKind::NoClaim passes the evidence check unverified). A final
+    // that announces an action but ends the turn instead falls through to the
+    // dangling-final gate, which forces one no-tool synthesis retry and
+    // records the no-tool wrap-up root cause.
     assert!(
-        !force_final_response,
-        "verification must keep tools enabled"
+        force_final_response,
+        "a dangling-action final must force the no-tool synthesis retry"
     );
-    assert!(messages.iter().any(|message| {
-        message
-            .content
-            .as_str()
-            .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER))
-    }));
-    assert!(!messages.iter().any(|message| {
-        message
-            .content
-            .as_str()
-            .is_some_and(|text| text.starts_with(DANGLING_FINAL_RECOVERY_MARKER))
-    }));
+    assert!(
+        messages.iter().any(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("[runtime-tool-stop]"))
+        }),
+        "the dangling-action retry must record its force-final reason"
+    );
+    assert!(
+        !messages.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER))
+        }),
+        "no completion claim means the completion gate must stay silent"
+    );
 }
 
 #[test]
@@ -644,4 +656,30 @@ fn completion_evidence_gate_allows_command_level_mutation_without_tool_evidence(
         ),
         CompletionEvidenceGateAction::Allow
     );
+}
+
+#[test]
+fn completion_evidence_records_direct_nonzero_check_after_mutation() {
+    let turn_messages = vec![
+        assistant_tool_call_message(test_tool_call(
+            "call_patch",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** End Patch"}),
+        )),
+        tool_result_message("call_patch", "Successfully patched src/lib.rs"),
+        assistant_tool_call_message(test_tool_call(
+            "call_check",
+            "execute_command",
+            serde_json::json!({"command": "cargo check --bin a"}),
+        )),
+        tool_result_message(
+            "call_check",
+            "Exit code: 101\n\nerror: could not compile `rust_tools`",
+        ),
+    ];
+
+    let evidence = completion_evidence_state(&turn_messages);
+    assert!(evidence.successful_mutation);
+    assert!(evidence.successful_post_mutation_failed_check);
+    assert!(!evidence.successful_post_mutation_verification);
 }

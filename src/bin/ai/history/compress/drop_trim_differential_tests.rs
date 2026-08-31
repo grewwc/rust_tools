@@ -456,3 +456,30 @@ fn batch_drop_matches_sequential_special_messages() {
     m.insert(4, msg("tool", "tool result"));
     run_case("special-messages", m, 2_000);
 }
+
+/// Persisted reference parts render as short markers: image-only messages still
+/// summarize to "[图片]", text-file/PDF references render as their file name
+/// (never the raw path or content), and real user text is preserved.
+#[test]
+fn value_to_string_renders_reference_boundary_markers() {
+    let content = serde_json::json!([
+        { "type": "reference", "kind": "image", "name": "shot.png", "path": "/assets/shot.png" },
+        { "type": "reference", "kind": "file", "name": "service.rs", "path": "/tmp/service.rs" },
+        { "type": "reference", "kind": "audio", "name": "clip.m4a", "path": "/tmp/clip.m4a" },
+        { "type": "text", "text": "帮我 review 这个文件" }
+    ]);
+    let rendered = value_to_string(&content);
+    assert!(rendered.contains("帮我 review 这个文件"));
+    assert!(rendered.contains("[Attached file: service.rs]"));
+    // Unknown/future reference kinds render a marker instead of leaking raw JSON.
+    assert!(rendered.contains("[audio: clip.m4a]"));
+    assert!(!rendered.contains("/tmp/service.rs"));
+    assert!(!rendered.contains("/tmp/clip.m4a"));
+    assert!(!rendered.contains("shot.png"));
+
+    // A message that is only images still collapses to the "[图片]" marker.
+    let image_only = serde_json::json!([
+        { "type": "reference", "kind": "image", "name": "shot.png", "path": "/assets/shot.png" }
+    ]);
+    assert_eq!(value_to_string(&image_only), "[图片]".to_string());
+}

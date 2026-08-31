@@ -12,7 +12,7 @@ use crate::ai::types::{App, QuestionContext};
 use crate::clipboardw::string_content;
 
 use crate::ai::{files, prompt::trim_trailing_newline};
-use crate::pdfw::{PdfParseOptions, parse_pdf};
+use crate::pdfw::{PdfParseError, PdfParseOptions, parse_pdf};
 
 const HISTORY_PREVIEW_DEFAULT_COUNT: usize = 6;
 const HISTORY_PREVIEW_FULL_COUNT: usize = 20;
@@ -924,6 +924,35 @@ fn resolve_inline_image_path(raw: &str, assets_dir: &Path) -> String {
     raw.to_string()
 }
 
+/// Copies images into the active session before the turn is persisted. The
+/// immutable copies, rather than a caller's mutable paths, are used for the
+/// current request and every later history replay.
+/// `pub(crate)` because the synchronous `task` tool attaches caller-provided
+/// images to a sub-agent's first turn; the sub-agent path skips
+/// `finalize_question`, so it must capture the files itself before the turn
+/// is persisted.
+pub(crate) fn snapshot_image_attachments(
+    images: Vec<String>,
+    assets_dir: &Path,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let snapshots_dir = assets_dir.join("attachments");
+    fs::create_dir_all(&snapshots_dir)?;
+    images
+        .into_iter()
+        .map(|source| {
+            let name = Path::new(&source)
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| std::ffi::OsStr::new("image"));
+            let destination_dir = snapshots_dir.join(uuid::Uuid::new_v4().to_string());
+            fs::create_dir_all(&destination_dir)?;
+            let destination = destination_dir.join(name);
+            fs::copy(&source, &destination)?;
+            Ok(destination.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
 fn apply_text_files_prefix(
     attachments: &mut String,
     text_files: &[String],
@@ -972,19 +1001,23 @@ fn build_pdf_text_prefix(pdfs: &[String]) -> String {
         prefix.push_str(display_name);
         prefix.push('\n');
 
-        let parsed = parse_pdf(path, PdfParseOptions::default()).ok();
-        let Some(parsed) = parsed else {
-            continue;
-        };
-        let Some(text) = parsed.text else {
-            continue;
-        };
-        let text = text.trim();
-        if text.is_empty() {
-            continue;
+        match parse_pdf(path, PdfParseOptions::default()) {
+            Ok(parsed) => {
+                let text = parsed.text.as_deref().map(str::trim).unwrap_or_default();
+                if text.is_empty() {
+                    prefix.push_str("[Attached PDF contains no extractable text]\n");
+                } else {
+                    prefix.push_str(text);
+                    prefix.push('\n');
+                }
+            }
+            Err(PdfParseError::OpenFailed(_)) => {
+                prefix.push_str("[Attached PDF could not be read]\n");
+            }
+            Err(PdfParseError::ParseFailed(_) | PdfParseError::ExtractTextFailed(_)) => {
+                prefix.push_str("[Attached PDF text extraction failed]\n");
+            }
         }
-        prefix.push_str(text);
-        prefix.push('\n');
         prefix.push('\n');
     }
     prefix
@@ -1032,6 +1065,11 @@ fn finalize_question(
     let mut inline_images = extract_inline_image_paths(&mut question);
     let mut attachments_text = String::new();
     apply_text_files_prefix(&mut attachments_text, &inline_files.text_files)?;
+    // Text-extractable references (text files + PDFs) are folded into
+    // `attachments_text` instead of being inlined into the question itself,
+    // so the persisted user message keeps a provenance boundary (reference
+    // parts with name/path) rather than content that could be mistaken for
+    // the user's own words.
     if !inline_files.image_files.is_empty() {
         inline_images.extend(inline_files.image_files);
     }
@@ -1052,10 +1090,11 @@ fn finalize_question(
         let store = SessionStore::new(app.config.history_file.as_path());
         store.session_assets_dir(&app.session_id)
     };
-    app.attached_image_files = inline_images
+    let resolved_images = inline_images
         .into_iter()
         .map(|raw| resolve_inline_image_path(&raw, assets_dir.as_path()))
         .collect();
+    app.attached_image_files = snapshot_image_attachments(resolved_images, assets_dir.as_path())?;
 
     Ok(QuestionContext {
         question,
@@ -1235,10 +1274,24 @@ mod tests {
         let ctx = finalize_question(&mut app, question, 6).unwrap();
 
         assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
-        assert_eq!(
-            app.attached_image_files,
-            vec![path.to_string_lossy().to_string()]
-        );
+        assert_eq!(app.attached_image_files.len(), 1);
+        let snapshot = PathBuf::from(&app.attached_image_files[0]);
+        assert!(snapshot.is_file());
+        assert_ne!(snapshot, path);
+        assert_eq!(snapshot.file_name(), path.file_name());
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"fake");
+
+        std::fs::write(&path, b"changed").unwrap();
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"fake");
+
+        let _ = std::fs::remove_file(&path);
+        if let Some(snapshot_dir) = snapshot.parent() {
+            let attachments_dir = snapshot_dir.parent().map(|path| path.to_path_buf());
+            let _ = std::fs::remove_dir_all(snapshot_dir);
+            if let Some(attachments_dir) = attachments_dir {
+                let _ = std::fs::remove_dir(attachments_dir);
+            }
+        }
     }
 
     #[test]
@@ -1298,10 +1351,24 @@ mod tests {
         let ctx = finalize_question(&mut app, "describe this".to_string(), 6).unwrap();
 
         assert_eq!(ctx.question, "describe this");
-        assert_eq!(
-            app.attached_image_files,
-            vec![path.to_string_lossy().to_string()]
-        );
+        // The pending image is snapshotted into the session assets (immutable
+        // copy), mirroring the @reference flow, instead of holding the caller's
+        // original temp path.
+        assert_eq!(app.attached_image_files.len(), 1);
+        let snapshot = PathBuf::from(&app.attached_image_files[0]);
+        assert!(snapshot.is_file());
+        assert_ne!(snapshot, path);
+        assert_eq!(snapshot.file_name(), path.file_name());
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"fake");
+
+        let _ = std::fs::remove_file(&path);
+        if let Some(snapshot_dir) = snapshot.parent() {
+            let attachments_dir = snapshot_dir.parent().map(|path| path.to_path_buf());
+            let _ = std::fs::remove_dir_all(snapshot_dir);
+            if let Some(attachments_dir) = attachments_dir {
+                let _ = std::fs::remove_dir(attachments_dir);
+            }
+        }
     }
 
     #[test]

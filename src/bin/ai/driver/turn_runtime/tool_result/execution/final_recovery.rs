@@ -13,6 +13,75 @@ Produce the actual answer to the user's request now, using tools first if verifi
 pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_STOP: &str =
     "[Model echoed a runtime internal note instead of giving a real answer; please retry or switch models]";
 
+/// Turn-local state for final-response recovery. Prompt markers remain useful context for
+/// the model, but runtime control flow must not infer retry budgets from persisted text:
+/// old markers can survive into later turns and independent gates can otherwise each spend
+/// their own retry, producing a cascade of near-duplicate conclusions.
+#[derive(Debug, Default)]
+pub(in crate::ai::driver::turn_runtime) struct FinalGateState {
+    retry_consumed: bool,
+    no_tool_retry_consumed: bool,
+}
+
+impl FinalGateState {
+    pub(super) fn from_current_turn_markers(messages: &[Message]) -> Self {
+        let retry_consumed = [
+            INJECTED_CONTEXT_ECHO_RETRY_MARKER,
+            UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER,
+            DANGLING_FINAL_RECOVERY_MARKER,
+            COMPLETION_EVIDENCE_REQUIRED_MARKER,
+            FINAL_CITATION_RETRY_MARKER,
+        ]
+        .iter()
+        .any(|marker| current_turn_has_internal_marker(messages, marker));
+        Self {
+            retry_consumed,
+            no_tool_retry_consumed: current_turn_has_internal_marker(
+                messages,
+                NO_TOOL_SYNTHESIS_RETRY_MARKER,
+            ),
+        }
+    }
+
+    pub(super) fn can_reopen(
+        &self,
+        force_final_response: bool,
+        iteration: usize,
+        max_iterations: usize,
+    ) -> bool {
+        !self.retry_consumed && !force_final_response && iteration < max_iterations
+    }
+
+    pub(super) fn consume_retry(&mut self) {
+        self.retry_consumed = true;
+    }
+
+    pub(super) fn no_tool_retry_consumed(&self) -> bool {
+        self.no_tool_retry_consumed
+    }
+
+    pub(super) fn consume_no_tool_retry(&mut self) {
+        self.no_tool_retry_consumed = true;
+    }
+}
+
+/// Marker lookup is scoped to the current real-user turn. This is a compatibility path for
+/// direct gate tests and rebuilt request projections; production retry budgets are owned by
+/// [`FinalGateState`] and do not depend on marker text.
+pub(in crate::ai::driver::turn_runtime) fn current_turn_has_internal_marker(
+    messages: &[Message],
+    marker: &str,
+) -> bool {
+    let turn_start = crate::ai::history::last_real_user_index(messages).unwrap_or(0);
+    messages.iter().skip(turn_start).any(|message| {
+        message.role == ROLE_INTERNAL_NOTE
+            && message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(marker))
+    })
+}
+
 /// Prefixes of context notes that the runtime injects into the request projection.
 /// These are all runtime-authored text; a legitimate user-visible answer never starts
 /// with them — if the model spits them back verbatim as its answer, that is an echo.
@@ -29,7 +98,7 @@ pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_PREFIXES: &[
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::ai::driver::turn_runtime) enum FinalClaimKind {
-    None,
+    NoClaim,
     Completion,
     NoImpact,
 }
@@ -77,8 +146,10 @@ pub(in crate::ai::driver::turn_runtime) const TASK_EVIDENCE_REOPEN_MAX: usize = 
 /// Count the completion-gate reopen markers already injected into the current `messages`.
 /// The marker is an internal_note that reopens do not clear, so it accumulates across iterations.
 pub(in crate::ai::driver::turn_runtime) fn task_evidence_reopen_count(messages: &[Message]) -> usize {
+    let turn_start = crate::ai::history::last_real_user_index(messages).unwrap_or(0);
     messages
         .iter()
+        .skip(turn_start)
         .filter(|message| {
             message.role == ROLE_INTERNAL_NOTE
                 && message
@@ -350,13 +421,8 @@ pub(in crate::ai::driver::turn_runtime) fn unsupported_runtime_limit_action(
         return UnsupportedRuntimeLimitAction::Allow;
     }
 
-    let already_retried = messages.iter().any(|message| {
-        message.role == ROLE_INTERNAL_NOTE
-            && message
-                .content
-                .as_str()
-                .is_some_and(|text| text.starts_with(UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER))
-    });
+    let already_retried =
+        current_turn_has_internal_marker(messages, UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER);
     if already_retried || force_final_response || iteration >= max_iterations {
         return UnsupportedRuntimeLimitAction::Warn;
     }
@@ -579,13 +645,8 @@ pub(in crate::ai::driver::turn_runtime) fn dangling_final_recovery_action(
         return DanglingFinalRecoveryAction::Allow;
     }
 
-    let already_retried = messages.iter().any(|message| {
-        message.role == ROLE_INTERNAL_NOTE
-            && message
-                .content
-                .as_str()
-                .is_some_and(|text| text.starts_with(DANGLING_FINAL_RECOVERY_MARKER))
-    });
+    let already_retried =
+        current_turn_has_internal_marker(messages, DANGLING_FINAL_RECOVERY_MARKER);
     if already_retried {
         return DanglingFinalRecoveryAction::Warn;
     }
@@ -612,7 +673,16 @@ pub(in crate::ai::driver::turn_runtime) fn final_text_claim_kind(text: &str) -> 
     {
         return FinalClaimKind::NoImpact;
     }
-    if ["已完成", "已修复", "全部修复", "修复完成"]
+    if [
+        "已完成",
+        "已修复",
+        "全部修复",
+        "修复完成",
+        "已更新",
+        "已经更新",
+        "已修改",
+        "已经修改",
+    ]
         .iter()
         .any(|claim| text.contains(claim))
     {
@@ -632,13 +702,30 @@ pub(in crate::ai::driver::turn_runtime) fn final_text_claim_kind(text: &str) -> 
     {
         return FinalClaimKind::NoImpact;
     }
-    if ["completed", "fixed", "resolved", "implemented", "done"]
+    if [
+        "completed",
+        "fixed",
+        "resolved",
+        "implemented",
+        "done",
+        "updated",
+        "changed",
+    ]
         .iter()
         .any(|word| contains_non_negated_completion_word(&text, word))
+        || [
+            "changes are ready",
+            "change is ready",
+            "implementation is ready",
+            "fix is ready",
+            "patch is ready",
+        ]
+        .iter()
+        .any(|claim| text.contains(claim))
     {
         return FinalClaimKind::Completion;
     }
-    FinalClaimKind::None
+    FinalClaimKind::NoClaim
 }
 
 /// Decide whether the final response merely regurgitates a context note the runtime
@@ -676,13 +763,8 @@ pub(in crate::ai::driver::turn_runtime) fn injected_context_echo_recovery_action
     if !looks_like_injected_context_echo(final_text) {
         return DanglingFinalRecoveryAction::Allow;
     }
-    let already_retried = messages.iter().any(|message| {
-        message.role == ROLE_INTERNAL_NOTE
-            && message
-                .content
-                .as_str()
-                .is_some_and(|text| text.starts_with(INJECTED_CONTEXT_ECHO_RETRY_MARKER))
-    });
+    let already_retried =
+        current_turn_has_internal_marker(messages, INJECTED_CONTEXT_ECHO_RETRY_MARKER);
     if already_retried {
         return DanglingFinalRecoveryAction::Warn;
     }

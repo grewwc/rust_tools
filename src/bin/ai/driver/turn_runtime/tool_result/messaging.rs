@@ -461,7 +461,7 @@ pub(super) fn parse_prune_meta_and_update_marks(
                 let count = app.prune_marks.get(id).copied().unwrap_or(0);
                 format!(
                     "{id} ({count}/{})",
-                    crate::ai::history::compress::llm_prune::PRUNE_THRESHOLD
+                    crate::ai::history::compress::llm_prune::needed_marks_for(messages, id)
                 )
             })
             .collect::<Vec<_>>()
@@ -472,6 +472,38 @@ pub(super) fn parse_prune_meta_and_update_marks(
         crate::ai::driver::print::print_tool_note_line(
             "context-prune",
             &format!("model marked {shown}{suffix}"),
+        );
+    }
+
+    // Unexplained rejections make the model repeat useless marks; surface the
+    // reason so the model-facing user sees why a mark did not count.
+    let mut rejected: Vec<&String> = Vec::new();
+    for id in &prune_ids {
+        if !active_tool_ids.contains(id) && !rejected.contains(&id) {
+            rejected.push(id);
+        }
+    }
+    if !rejected.is_empty() && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        let shown = rejected
+            .iter()
+            .take(4)
+            .map(|id| {
+                let reason =
+                    crate::ai::history::compress::llm_prune::explain_rejected_prune_mark(
+                        messages,
+                        id,
+                    )
+                    .unwrap_or("not currently eligible");
+                format!("{id} ({reason})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = (rejected.len() > 4)
+            .then(|| format!(", +{} more", rejected.len() - 4))
+            .unwrap_or_default();
+        crate::ai::driver::print::print_tool_note_line(
+            "context-prune",
+            &format!("ignored mark(s): {shown}{suffix}"),
         );
     }
     remaining_meta

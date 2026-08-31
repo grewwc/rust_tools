@@ -30,7 +30,7 @@ use super::{
     prepare::prepare_turn,
     record_llm_summary_attempt_chars, should_try_llm_summary,
     tool_result::{
-        completion_evidence_state, completion_tool_result_succeeded,
+        FinalGateState, completion_evidence_state, completion_tool_result_succeeded,
         handle_iteration_execution_for_model, tool_call_is_successful_mutation_candidate,
     },
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
@@ -1073,6 +1073,7 @@ async fn run_turn_body(
     let mut final_assistant_recorded = false;
     let mut final_response_model = None::<String>;
     let mut terminal_dedupe_candidate = None;
+    let mut final_gate_state = FinalGateState::default();
     // Collect the names of explicit-enabled tools actually called this turn; used to age
     // out unused entries at the end of the turn.
     let mut tools_used_this_turn: rust_tools::cw::SkipSet<String> =
@@ -1570,6 +1571,7 @@ async fn run_turn_body(
                 &mut final_assistant_recorded,
                 &mut force_final_response,
                 &mut terminal_dedupe_candidate,
+                &mut final_gate_state,
                 skill_turn.matched_skill_names().is_empty(),
                 iteration,
                 effective_max_iterations,

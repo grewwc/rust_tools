@@ -3434,7 +3434,9 @@ fn is_inline_image_data_url(s: &str) -> bool {
 fn content_part_budget_chars(item: &Value) -> usize {
     let is_image = item.get("type").and_then(|t| t.as_str()) == Some("image_url")
         || item.get("image_url").is_some();
-    if is_image {
+    let is_image_reference = item.get("type").and_then(|t| t.as_str()) == Some("reference")
+        && item.get("kind").and_then(|kind| kind.as_str()) == Some("image");
+    if is_image || is_image_reference {
         return IMAGE_BUDGET_CHARS;
     }
     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
@@ -3519,7 +3521,33 @@ pub(in crate::ai) fn value_to_string(v: &Value) -> String {
                             }
                         }
                     }
+                    // The persisted reference form (build_reference_content)
+                    // counts as an image too, so image-only messages still
+                    // summarize to "[图片]" instead of leaking the file path.
                     "image_url" => has_image = true,
+                    "reference"
+                        if obj.get("kind").and_then(|k| k.as_str()) == Some("image") =>
+                    {
+                        has_image = true;
+                    }
+                    // Persisted text-file/PDF references render as a marker
+                    // (name only, never the raw path/content) so /history and
+                    // summaries show the attachment boundary instead of leaking
+                    // file contents.
+                    "reference"
+                        if obj.get("kind").and_then(|k| k.as_str()) == Some("file") =>
+                    {
+                        let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("file");
+                        text_parts.push(format!("[Attached file: {name}]"));
+                    }
+                    // Any other/future reference kind renders as a marker so
+                    // summaries never leak raw JSON and new kinds are not
+                    // silently dropped from /history or summary text.
+                    "reference" => {
+                        let kind = obj.get("kind").and_then(|k| k.as_str()).unwrap_or("reference");
+                        let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("attachment");
+                        text_parts.push(format!("[{kind}: {name}]"));
+                    }
                     _ => {}
                 }
             }

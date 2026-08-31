@@ -65,7 +65,9 @@ pub(crate) use types::{
 pub(in crate::ai) use wire_parse::{ParsedStreamPayload, try_parse_stream_chunk_loose};
 // External re-exports (build_content is called from several places in the driver)
 #[allow(unused_imports)]
-pub(crate) use builder::{build_content, clamp_max_tokens_for_prompt};
+pub(crate) use builder::{
+    build_content, build_reference_content, clamp_max_tokens_for_prompt, materialize_references,
+};
 
 // Transport layer: HTTP request sending, retry, timeout, auth
 pub use transport::{do_request_json, do_request_text_streaming};

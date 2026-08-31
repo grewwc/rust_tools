@@ -123,9 +123,16 @@ pub(crate) fn is_digest_only_response(text: &str) -> bool {
         && strip_digest_blocks(text).trim().is_empty()
 }
 
-/// Whether a content part is an image (image_url).
+/// Whether a content part is an image: an inline `image_url` part (request
+/// form) or a persisted `reference` part with `kind == "image"` (the long-term
+/// history form from `build_reference_content`). Treating both as images keeps
+/// digest swapping and image detection consistent across the two
+/// representations.
 fn is_image_part(part: &Value) -> bool {
-    part.get("type").and_then(Value::as_str) == Some("image_url") || part.get("image_url").is_some()
+    part.get("type").and_then(Value::as_str) == Some("image_url")
+        || part.get("image_url").is_some()
+        || (part.get("type").and_then(Value::as_str) == Some("reference")
+            && part.get("kind").and_then(Value::as_str) == Some("image"))
 }
 
 /// Whether a message's content (multimodal array) still contains an image part.

@@ -315,11 +315,12 @@ pub(super) async fn prepare_turn(
     next_model: &str,
     precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
 ) -> Result<TurnPreparation, Box<dyn std::error::Error>> {
-    let overflow_dir = {
+    let attachment_assets_dir = {
         use crate::ai::history::SessionStore;
         let store = SessionStore::new(app.config.history_file.as_path());
-        Some(store.session_assets_dir(&app.session_id))
+        store.session_assets_dir(&app.session_id)
     };
+    let overflow_dir = Some(attachment_assets_dir.clone());
     crate::ai::driver::runtime_ctx::publish_subagent_phase("preparing context");
     // The finalize phase may not have run due to interruption, request errors, or
     // an older-version process; its dispatched background compression may also
@@ -351,6 +352,7 @@ pub(super) async fn prepare_turn(
     let history_keep_last = app.config.history_keep_last;
     let history_summary_max_chars = app.config.history_summary_max_chars;
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
+    let reference_assets_dir = attachment_assets_dir.clone();
     let history = tokio::task::spawn_blocking(move || {
         let mut history = build_context_history(
             history_count,
@@ -370,6 +372,15 @@ pub(super) async fn prepare_turn(
             &mut history,
         )
         .map_err(|e| e.to_string())?;
+        // Materialize immutable reference snapshots after digest substitution so
+        // digest-bearing turns stay text-only while other image references turn
+        // into inline images for the request projection.
+        for m in &mut history {
+            crate::ai::request::materialize_references(
+                &mut m.content,
+                Some(reference_assets_dir.as_path()),
+            );
+        }
         Ok::<_, String>(history)
     })
     .await
@@ -404,11 +415,14 @@ pub(super) async fn prepare_turn(
     } else {
         None
     };
-    let final_question = assemble_effective_question(
-        question,
-        attachments_text,
-        usable_ocr.map(|ocr| (ocr.tool_name.as_str(), ocr.content.as_str())),
-    );
+    let ocr_pair = usable_ocr.as_ref().map(|ocr| (ocr.tool_name.as_str(), ocr.content.as_str()));
+    let final_question = assemble_effective_question(question, attachments_text, ocr_pair);
+    // The persisted text part is the user's own words plus OCR-derived content
+    // (already labeled by `[Attached Image Content via ...]`). Text file / PDF
+    // attachments are intentionally NOT inlined here: they are persisted as
+    // `reference` parts below so a later reader of history can tell the user's
+    // own words apart from attachment content.
+    let persisted_question_text = assemble_effective_question(question, "", ocr_pair);
     let has_attached_artifact = !attachments_text.trim().is_empty() || has_images;
     let cfg = crate::commonw::configw::get_all_config();
     if parse_bool_flag(cfg.get_opt(AiConfig::CRITIC_REVISE_ENABLE), true)
@@ -570,23 +584,43 @@ pub(super) async fn prepare_turn(
     // The `turn_messages` list (what gets persisted to long-term history)
     // intentionally keeps the original user question without the reminder.
     let context_reminder = skill_turn.context_reminder();
-    let (user_content, persisted_question_text) = {
-        // OCR digests are extra image-understanding content: they only enter the
-        // model-visible final_question and are not echoed to the terminal.
-        let content =
-            request::build_content(next_model, &final_question, &app.attached_image_files)?;
-        (content, final_question)
-    };
+    // Two content forms of the same user turn:
+    // - `user_content`: the MATERIALIZED request form (inline base64 image_url
+    //   parts) that this turn's model request actually sees.
+    // - `persisted_user_content`: the PERSISTED form (`reference` parts with
+    //   immutable session-asset keys, no source paths or base64) written to
+    //   long-term history. Keeping the reference boundary at write time means
+    //   any later reader of history
+    //   (another session debugging this one, /history rendering, compression
+    //   summaries) can tell the user's own words apart from attached images
+    //   instead of mistaking inline image data for real user content.
+    let user_content =
+        request::build_content(next_model, &final_question, &app.attached_image_files)?;
+    let persisted_user_content = request::build_reference_content(
+        next_model,
+        &persisted_question_text,
+        &app.attached_image_files,
+        attachments_text,
+        attachment_assets_dir.as_path(),
+    )?;
+    // Persisted track: canonical turn_messages keep the reference boundary.
     let user_message = Message {
+        role: "user".to_string(),
+        content: persisted_user_content,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    // Request track: the materialized form plus the context reminder.
+    let mut request_user_message = Message {
         role: "user".to_string(),
         content: user_content,
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
     };
-    let request_user_message = if let Some(reminder) = context_reminder.as_deref() {
-        let mut decorated = user_message.clone();
-        decorated.content = match decorated.content {
+    if let Some(reminder) = context_reminder.as_deref() {
+        request_user_message.content = match request_user_message.content {
             Value::String(text) => Value::String(format!("{}\n\n{}", reminder, text)),
             Value::Array(mut parts) => {
                 parts.insert(
@@ -600,11 +634,7 @@ pub(super) async fn prepare_turn(
             }
             other => other,
         };
-        decorated
-    } else {
-        user_message.clone()
-    };
-    let mut request_user_message = request_user_message;
+    }
     // VL image digest protocol: if the request projection's user message
     // contains inline images, inject a fixed "image handling protocol"
     // instruction asking the model to produce a reusable image digest this very

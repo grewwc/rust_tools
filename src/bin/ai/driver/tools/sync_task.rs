@@ -203,7 +203,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     // - `reasoning_effort`: lowers the reasoning level for simple sub-tasks such as pure
     //   transcription (e.g. minimal for image parsing).
     if let Some(images) = args.get("image_files").and_then(|v| v.as_array()) {
-        task_app.attached_image_files = images
+        let resolved = images
             .iter()
             .filter_map(|v| v.as_str())
             // build_content reads with fs::read on the raw path without resolving cwd; resolve
@@ -221,7 +221,20 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
                         .into_owned()
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // Persisted history stores image attachments as opaque session-asset keys
+        // (`build_reference_content` rejects paths outside the session assets
+        // directory). The sub-agent path skips `finalize_question`, which snapshots
+        // @-references for the foreground, so capture the caller-provided files here.
+        let assets_dir = {
+            let store = history::SessionStore::new(task_app.config.history_file.as_path());
+            store.session_assets_dir(&task_app.session_id)
+        };
+        task_app.attached_image_files = crate::ai::driver::input::snapshot_image_attachments(
+            resolved,
+            assets_dir.as_path(),
+        )
+        .map_err(|error| format!("failed to snapshot task images: {error}"))?;
     }
     if let Some(level) = args
         .get("reasoning_effort")

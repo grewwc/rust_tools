@@ -81,6 +81,44 @@ fn terminal_dedupe_releases_content_after_visible_divergence() {
 }
 
 #[test]
+fn completed_assistant_body_is_withheld_for_final_gates() {
+    let mut app = test_app();
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.render.defer_assistant_body = true;
+    state.render.terminal_dedupe = Some(TerminalDedupeState {
+        candidate: "older visible narration".to_string(),
+        buffered_terminal_output: String::new(),
+    });
+    let mut current_history = String::new();
+
+    commit_visible_content(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        "provisional conclusion".to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(state.content.assistant_text, "provisional conclusion");
+    assert_eq!(current_history, "provisional conclusion");
+    assert_eq!(
+        state
+            .render
+            .terminal_dedupe
+            .as_ref()
+            .unwrap()
+            .buffered_terminal_output,
+        "",
+        "a provisional final must not enter the live terminal pipeline"
+    );
+
+    let result = finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
+    assert_eq!(result.outcome, StreamOutcome::Completed);
+}
+
+#[test]
 fn waiting_hint_tool_name_is_single_line_and_terminal_safe() {
     assert_eq!(
         sanitize_waiting_hint_tool_name("apply_\x1b[31mpatch\n next\tstep"),
@@ -1953,15 +1991,33 @@ fn cancelled_stream_result_finalizes_active_thinking_fold() {
         fold.recent_lines.push_back("partial".to_string());
         fold.window_rows = 2;
     }
+    state.content.assistant_text = "partial body".to_string();
+    state.content.reasoning_text = "partial reasoning".to_string();
 
     let result = cancelled_stream_result(&mut state);
 
     assert!(matches!(result.outcome, StreamOutcome::Cancelled));
     assert!(result.skip_response_drain);
+    assert_eq!(result.assistant_text, "partial body");
+    assert_eq!(result.reasoning_text, "partial reasoning");
     // After finalize the fold state is reset: no longer active, window rows zeroed, no orphan window left behind.
     assert!(!state.render.thinking_fold.active);
     assert_eq!(state.render.thinking_fold.window_rows, 0);
     assert!(state.render.thinking_fold.recent_lines.is_empty());
+}
+
+#[test]
+fn cancelled_stream_result_flushes_unclassified_content_reasoner_tail() {
+    let mut state = StreamProcessingState::new();
+    state.content.content_think_demuxer.arm();
+    let (reasoning, content) = state.content.content_think_demuxer.push("unfinished reply");
+    assert!(reasoning.is_empty());
+    assert!(content.is_empty());
+
+    let result = cancelled_stream_result(&mut state);
+
+    assert_eq!(result.assistant_text, "unfinished reply");
+    assert!(result.reasoning_text.is_empty());
 }
 
 #[test]

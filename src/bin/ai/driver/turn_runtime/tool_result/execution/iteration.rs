@@ -24,6 +24,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     turn_had_tool_error: &mut bool,
 ) -> Result<TurnLoopStep, Box<dyn std::error::Error>> {
     let source_model = app.current_model.clone();
+    let mut final_gate_state = FinalGateState::from_current_turn_markers(messages);
     handle_iteration_execution_for_model(
         app,
         &source_model,
@@ -39,6 +40,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
         final_assistant_recorded,
         force_final_response,
         terminal_dedupe_candidate,
+        &mut final_gate_state,
         _no_active_skill,
         iteration,
         max_iterations,
@@ -63,6 +65,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
     final_assistant_recorded: &mut bool,
     force_final_response: &mut bool,
     terminal_dedupe_candidate: &mut Option<String>,
+    final_gate_state: &mut FinalGateState,
     _no_active_skill: bool,
     iteration: usize,
     max_iterations: usize,
@@ -151,8 +154,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             if reasoning_only_completion {
                 // Count the retries via the number of retry markers, so multiple
                 // automatic retries are supported.
+                let turn_start = crate::ai::history::last_real_user_index(messages).unwrap_or(0);
                 let retry_count = messages
                     .iter()
+                    .skip(turn_start)
                     .filter(|message| {
                         message.role == ROLE_INTERNAL_NOTE
                             && message
@@ -161,13 +166,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                                 .is_some_and(|text| text.starts_with(REASONING_ONLY_RETRY_MARKER))
                     })
                     .count();
-                let already_forced_synthesis = messages.iter().any(|message| {
-                    message.role == ROLE_INTERNAL_NOTE
-                        && message
-                            .content
-                            .as_str()
-                            .is_some_and(|text| text.starts_with(REASONING_ONLY_SYNTHESIS_MARKER))
-                });
+                let already_forced_synthesis = current_turn_has_internal_marker(
+                    messages,
+                    REASONING_ONLY_SYNTHESIS_MARKER,
+                );
                 // The iteration hard cap remains the final fallback: at max_iterations the
                 // round stops with a user-visible error.
                 if iteration >= max_iterations {
@@ -191,6 +193,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     // user-visible error.
                     let post_synthesis_retries = messages
                         .iter()
+                        .skip(turn_start)
                         .filter(|message| {
                             message.role == ROLE_INTERNAL_NOTE
                                 && message.content.as_str().is_some_and(|text| {
@@ -248,9 +251,19 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             // text has no answer value and leaks internal prompts to the terminal and into
             // the persisted final. On a hit, give one no-tool synthesis retry; if it still
             // regurgitates, stop the round with a user-visible error instead of accepting it.
-            match injected_context_echo_recovery_action(messages, &stream_result.assistant_text) {
+            let final_gate_reopen_allowed =
+                final_gate_state.can_reopen(*force_final_response, iteration, max_iterations);
+            let echo_action = if !final_gate_reopen_allowed
+                && looks_like_injected_context_echo(&stream_result.assistant_text)
+            {
+                DanglingFinalRecoveryAction::Warn
+            } else {
+                injected_context_echo_recovery_action(messages, &stream_result.assistant_text)
+            };
+            match echo_action {
                 DanglingFinalRecoveryAction::Allow => {}
                 DanglingFinalRecoveryAction::RetryWithoutTools => {
+                    final_gate_state.consume_retry();
                     record_force_final_reason(messages, "injected_context_echo", iteration, None);
                     *force_final_response = true;
                     return Ok(TurnLoopStep::Continue);
@@ -266,12 +279,13 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 turn_messages,
                 &stream_result.assistant_text,
                 *turn_had_tool_error,
-                *force_final_response,
+                !final_gate_reopen_allowed,
                 iteration,
                 max_iterations,
             ) {
                 UnsupportedRuntimeLimitAction::Allow => false,
                 UnsupportedRuntimeLimitAction::ReopenWithTools => {
+                    final_gate_state.consume_retry();
                     *force_final_response = false;
                     return Ok(TurnLoopStep::Continue);
                 }
@@ -281,19 +295,16 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 messages,
                 turn_messages,
                 &stream_result.assistant_text,
-                *force_final_response,
+                !final_gate_reopen_allowed,
                 iteration,
                 max_iterations,
             ) {
                 CompletionEvidenceGateAction::Allow => false,
                 CompletionEvidenceGateAction::Reopen => {
-                    // The current candidate conclusion was already streamed live by the
-                    // stream runtime; when the evidence gate asks for a reopen, hand it to
-                    // the next round's terminal dedupe so a verbatim answer after
-                    // verification does not redraw the conclusion.
-                    *terminal_dedupe_candidate = terminal_dedupe_candidate_from_assistant_text(
-                        &stream_result.assistant_text,
-                    );
+                    final_gate_state.consume_retry();
+                    // Completed drafts are transactionally deferred and were never
+                    // user-visible, so they must not become a dedupe candidate.
+                    *terminal_dedupe_candidate = None;
                     return Ok(TurnLoopStep::Continue);
                 }
                 CompletionEvidenceGateAction::Warn => true,
@@ -303,37 +314,53 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 messages,
                 &stream_result.assistant_text,
                 effective_cwd.as_deref(),
-                *force_final_response,
+                !final_gate_reopen_allowed,
                 iteration,
                 max_iterations,
             ) {
                 FinalCitationGateAction::Allow => false,
                 FinalCitationGateAction::Reopen => {
-                    *terminal_dedupe_candidate = terminal_dedupe_candidate_from_assistant_text(
-                        &stream_result.assistant_text,
-                    );
+                    final_gate_state.consume_retry();
+                    *terminal_dedupe_candidate = None;
                     return Ok(TurnLoopStep::Continue);
                 }
                 FinalCitationGateAction::Warn => true,
             };
-            let warn_dangling_final = match dangling_final_recovery_action(
-                question,
-                messages,
-                turn_messages,
-                &stream_result.assistant_text,
-            ) {
+            let dangling_action = if !final_gate_reopen_allowed
+                && looks_like_dangling_action_final(
+                    question,
+                    turn_messages,
+                    &stream_result.assistant_text,
+                )
+            {
+                DanglingFinalRecoveryAction::Warn
+            } else {
+                dangling_final_recovery_action(
+                    question,
+                    messages,
+                    turn_messages,
+                    &stream_result.assistant_text,
+                )
+            };
+            let warn_dangling_final = match dangling_action {
                 DanglingFinalRecoveryAction::Allow => false,
                 DanglingFinalRecoveryAction::RetryWithoutTools => {
+                    final_gate_state.consume_retry();
                     record_force_final_reason(messages, "dangling_action_final", iteration, None);
                     *force_final_response = true;
                     return Ok(TurnLoopStep::Continue);
                 }
                 DanglingFinalRecoveryAction::Warn => true,
             };
-            // The current response has passed the final gate; the body previously kept for
-            // the next round's streamed dedupe is no longer relevant. From here on, the
-            // slot only holds runtime hints that still need to be drawn for the user after
-            // the streamed body.
+            let previously_rendered_body_matches = terminal_dedupe_candidate
+                .as_deref()
+                .is_some_and(|candidate| {
+                    crate::ai::request::strip_digest_blocks(&stream_result.assistant_text).trim()
+                        == candidate.trim()
+                });
+            // The current response has passed the final gate. The slot is filled with the
+            // complete accepted answer below so finalize renders it exactly once; if an
+            // identical tool-round narration was already visible, only new warnings remain.
             *terminal_dedupe_candidate = None;
             if warn_unsupported_runtime_limit {
                 append_runtime_warning_once(
@@ -383,6 +410,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     append_runtime_warning_once(&mut stream_result.assistant_text, &notice);
                     append_user_visible_final_notice(terminal_dedupe_candidate, &notice);
                 }
+            }
+            if !previously_rendered_body_matches {
+                *terminal_dedupe_candidate = Some(stream_result.assistant_text.clone());
             }
             let was_truncated_by_length = stream_result.truncated_by_length;
             record_final_stream_response(
@@ -506,14 +536,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             }
 
             if *force_final_response {
-                let already_retried = messages.iter().any(|message| {
-                    message.role == ROLE_INTERNAL_NOTE
-                        && message
-                            .content
-                            .as_str()
-                            .is_some_and(|text| text.starts_with(NO_TOOL_SYNTHESIS_RETRY_MARKER))
-                });
-                if !already_retried {
+                if iteration < max_iterations && !final_gate_state.no_tool_retry_consumed() {
+                    final_gate_state.consume_no_tool_retry();
                     let retry_note = Message {
                         role: ROLE_INTERNAL_NOTE.to_string(),
                         content: serde_json::Value::String(format!(
@@ -523,8 +547,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                         tool_call_id: None,
                         reasoning_content: None,
                     };
-                    messages.push(retry_note.clone());
-                    turn_messages.push(retry_note);
+                    messages.push(retry_note);
                     return Ok(TurnLoopStep::Continue);
                 }
 

@@ -5,7 +5,10 @@
 //! - 请求体组装（model/messages/tools/thinking/stream/max_tokens 等）
 //! - prompt token 估算与 max_tokens 钳制（防止 prompt+输出撞爆窗口）
 
-use std::fs;
+use std::{
+    fs,
+    path::{Component, Path, PathBuf},
+};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -48,6 +51,192 @@ pub(crate) fn build_content(
         "text": question,
     }));
     Ok(Value::Array(parts))
+}
+
+/// Builds the PERSISTED form of a user message's content, keeping the write-time
+/// provenance boundary between the user's own words and referenced/attached
+/// artifacts: each image becomes a `reference` part (kind=image, name + path)
+/// instead of inline base64, and each text-extractable attachment (text file /
+/// PDF) becomes a `reference` part (kind=file, name + path) instead of inline
+/// content. Long-term history keeps this form so any later reader (another
+/// session debugging this one, /history rendering, compression summaries) can
+/// tell real user content apart from references instead of mistaking inline
+/// attachment data for the user's own words. `materialize_references` restores
+/// the inline form for requests.
+pub(crate) fn build_reference_content(
+    model: &str,
+    question: &str,
+    image_files: &[String],
+    attachments_text: &str,
+    attachment_assets_dir: &Path,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let supports_images = models::supports_image_input(model);
+    if attachments_text.trim().is_empty() && (!supports_images || image_files.is_empty()) {
+        return Ok(Value::String(question.to_string()));
+    }
+
+    let mut parts = Vec::new();
+    // Non-VL models never receive image parts (their image context arrives via
+    // OCR text in the question), so their persisted form skips image references
+    // but still keeps text-file references.
+    if supports_images {
+        for file in image_files {
+            let name = std::path::Path::new(file)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.clone());
+            let asset = attachment_asset_key(file, attachment_assets_dir)?;
+            parts.push(json!({
+                "type": "reference",
+                "kind": "image",
+                "name": name,
+                "asset": asset,
+            }));
+        }
+    }
+    if !attachments_text.trim().is_empty() {
+        parts.push(json!({
+            "type": "reference",
+            "kind": "file",
+            "name": "attached files",
+            "text": attachments_text,
+        }));
+    }
+    parts.push(json!({
+        "type": "text",
+        "text": question,
+    }));
+    Ok(Value::Array(parts))
+}
+
+/// Converts a captured image's absolute path into an opaque key relative to the
+/// current session assets directory. Persisting this key, rather than a source
+/// path, keeps references stable across working directories and session forks.
+fn attachment_asset_key(
+    path: &str,
+    attachment_assets_dir: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let root = attachment_assets_dir.canonicalize()?;
+    let path = Path::new(path).canonicalize()?;
+    let relative = path.strip_prefix(&root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "image attachment must be captured inside the session assets directory",
+        )
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "image attachment asset key is invalid",
+        )
+        .into());
+    }
+    Ok(relative.to_string_lossy().into_owned())
+}
+
+/// Materializes persisted reference parts for a request. Image references read
+/// an immutable session asset, and file references replay their write-time text
+/// snapshot. Legacy path references deliberately become a marker instead of
+/// rereading a mutable source file. Returns whether any part changed.
+pub(crate) fn materialize_references(
+    content: &mut Value,
+    attachment_assets_dir: Option<&Path>,
+) -> bool {
+    let Value::Array(parts) = content else {
+        return false;
+    };
+    let mut changed = false;
+    let mut out: Vec<Value> = Vec::with_capacity(parts.len());
+    for part in parts.drain(..) {
+        let is_ref = part.get("type").and_then(Value::as_str) == Some("reference");
+        if !is_ref {
+            out.push(part);
+            continue;
+        }
+        changed = true;
+        let kind = part.get("kind").and_then(Value::as_str).unwrap_or("");
+        let name = part
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("attachment")
+            .to_string();
+        match kind {
+            "image" => {
+                let asset = part.get("asset").and_then(Value::as_str);
+                match resolve_attachment_asset(attachment_assets_dir, asset).and_then(fs::read) {
+                    Ok(bytes) => {
+                        let mime = files::image_mime_type(&name);
+                        let image = base64::engine::general_purpose::STANDARD.encode(bytes);
+                        out.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{mime};base64,{image}")
+                            },
+                        }));
+                    }
+                    Err(_) => {
+                        out.push(json!({
+                            "type": "text",
+                            "text": format!("[引用图片快照不可用: {name}]"),
+                        }));
+                    }
+                }
+            }
+            "file" => {
+                let text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("[引用文件快照不可用: attached files]");
+                out.push(json!({ "type": "text", "text": text }));
+            }
+            // Forward-compat guard: only image/file exist today (see
+            // build_reference_content), but a reference of any future kind must
+            // never be forwarded verbatim — OpenAI-style content parts reject an
+            // unknown `type`, which would fail the whole request.
+            _ => out.push(json!({
+                "type": "text",
+                "text": format!("[引用内容类型未知: {kind} ({name})]"),
+            })),
+        }
+    }
+    *content = Value::Array(out);
+    changed
+}
+
+/// Resolves an opaque session-relative asset key without allowing references to
+/// escape the active session's assets directory.
+fn resolve_attachment_asset(root: Option<&Path>, asset: Option<&str>) -> std::io::Result<PathBuf> {
+    let root = root.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "attachment assets are unavailable")
+    })?;
+    let asset = asset.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "attachment asset key is missing")
+    })?;
+    let relative = Path::new(asset);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "attachment asset key is invalid",
+        ));
+    }
+    let root = root.canonicalize()?;
+    let asset = root.join(relative).canonicalize()?;
+    if asset.strip_prefix(&root).is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "attachment asset escapes the session assets directory",
+        ));
+    }
+    Ok(asset)
 }
 
 /// 中英文 + 代码混合语料下的保守「字符 -> token」换算：每 token 约 2 个字符。

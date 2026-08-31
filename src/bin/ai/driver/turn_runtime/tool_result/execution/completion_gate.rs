@@ -62,7 +62,7 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
                 calls_by_id.insert(tool_call.id.clone(), tool_call.clone());
             }
         }
-        if message.role != "tool" || !completion_tool_result_succeeded(&message.content) {
+        if message.role != "tool" {
             continue;
         }
         let Some(tool_call) = message
@@ -73,6 +73,7 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
             continue;
         };
 
+        let tool_succeeded = completion_tool_result_succeeded(&message.content);
         if tool_call.function.name == "execute_command" {
             let effects = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
                 .ok()
@@ -86,10 +87,13 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
             // When `cargo check | tail -5` fails, the tail segment itself is not a check; if
             // judged per segment it would be misrecorded as “post-mutation activity”, so the
             // whole command must be considered together.
+            let output_reports_behavior_failure =
+                behavior_check_output_reports_failure(&message.content);
             let mut command_has_failed_known_check = false;
             for effect in &effects {
                 command_has_failed_known_check |=
-                    effect.behavior_check && !output_confirms_behavior_check;
+                    effect.behavior_check
+                        && (!tool_succeeded || output_reports_behavior_failure);
             }
             let had_mutation_before_command = state.successful_mutation;
             for effect in &effects {
@@ -103,7 +107,8 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
                 if effect.project_mutation {
                     state.successful_mutation = true;
                 }
-                if had_mutation
+                if tool_succeeded
+                    && had_mutation
                     && (effect.success_guaranteed
                         || (effect.behavior_check && output_confirms_behavior_check))
                     && (effect.scope_review || effect.behavior_check)
@@ -126,10 +131,12 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
             if had_mutation_before_command {
                 if command_has_failed_known_check {
                     state.successful_post_mutation_failed_check = true;
-                } else {
+                } else if tool_succeeded {
                     state.successful_post_mutation_activity = true;
                 }
             }
+        } else if !tool_succeeded {
+            continue;
         } else if tool_call_is_successful_mutation_candidate(tool_call) {
             // Tool-level mutations (apply_patch / write_file) are the gate's only trusted
             // change evidence; each success invalidates earlier verification.
@@ -154,18 +161,24 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
 
 pub(in crate::ai::driver::turn_runtime) fn behavior_check_output_confirms_success(content: &serde_json::Value) -> bool {
     let text = content.as_str().unwrap_or_default().to_ascii_lowercase();
-    if text.contains("test result: failed")
-        || text.contains("\nfailures:")
-        || text.contains("error:")
-        || text.contains("error[")
-        || text.contains("could not compile")
-    {
+    if behavior_check_output_reports_failure(content) {
         return false;
     }
 
     text.contains("test result: ok")
         || (text.contains("finished") && text.contains("target(s)"))
         || text.contains("all tests passed")
+}
+
+pub(in crate::ai::driver::turn_runtime) fn behavior_check_output_reports_failure(
+    content: &serde_json::Value,
+) -> bool {
+    let text = content.as_str().unwrap_or_default().to_ascii_lowercase();
+    text.contains("test result: failed")
+        || text.contains("\nfailures:")
+        || text.contains("error:")
+        || text.contains("error[")
+        || text.contains("could not compile")
 }
 
 pub(in crate::ai::driver::turn_runtime) fn completion_tool_result_succeeded(
@@ -238,9 +251,8 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_gate_action(
     let evidence = completion_evidence_state(turn_messages);
     let claim = final_text_claim_kind(final_text);
     let evidence_is_sufficient = match claim {
-        FinalClaimKind::None | FinalClaimKind::Completion => {
-            evidence.successful_post_mutation_verification
-        }
+        FinalClaimKind::NoClaim => true,
+        FinalClaimKind::Completion => evidence.successful_post_mutation_verification,
         FinalClaimKind::NoImpact => {
             evidence.successful_post_mutation_scope_review
                 && evidence.successful_post_mutation_behavior_check
@@ -277,13 +289,8 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_gate_action(
         return CompletionEvidenceGateAction::Allow;
     }
 
-    let already_fired = messages.iter().any(|message| {
-        message.role == ROLE_INTERNAL_NOTE
-            && message
-                .content
-                .as_str()
-                .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER))
-    });
+    let already_fired =
+        current_turn_has_internal_marker(messages, COMPLETION_EVIDENCE_REQUIRED_MARKER);
     if already_fired || force_final_response || iteration >= max_iterations {
         return CompletionEvidenceGateAction::Warn;
     }

@@ -679,7 +679,17 @@ fn forced_final_hallucinated_tool_call_is_rejected_without_consuming_quota() {
         .join("\n");
     assert!(joined.contains("disabled in no-tool handoff mode"));
     assert!(!joined.contains("exceeded kernel rlimit"));
-    assert!(joined.contains(NO_TOOL_SYNTHESIS_RETRY_MARKER));
+    // The no-tool synthesis retry marker is model-visible context injected into the
+    // request projection (`messages`), but is deliberately kept out of canonical
+    // `turn_messages`: the retry budget is owned in-memory by `FinalGateState`, so
+    // persisting the marker would only risk a stale note surviving into a later turn.
+    let request_joined = messages
+        .iter()
+        .map(|msg| msg.content.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(request_joined.contains(NO_TOOL_SYNTHESIS_RETRY_MARKER));
+    assert!(!joined.contains(NO_TOOL_SYNTHESIS_RETRY_MARKER));
 
     let step = handle_iteration_execution(
         &mut app,

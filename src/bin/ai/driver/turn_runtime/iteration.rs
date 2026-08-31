@@ -775,6 +775,27 @@ fn interrupted_iteration_execution(
     ))
 }
 
+fn persist_interrupted_stream_diagnostic(
+    app: &App,
+    source_model: &str,
+    stream_result: &StreamResult,
+) {
+    if stream_result.assistant_text.is_empty() && stream_result.reasoning_text.is_empty() {
+        return;
+    }
+
+    // Keep cancellation output outside canonical messages: it is useful for session
+    // diagnosis but must never be replayed into a later model request.
+    if let Err(error) = crate::ai::history::append_interrupted_stream_diagnostic_sqlite(
+        &app.session_history_file,
+        source_model,
+        &stream_result.assistant_text,
+        &stream_result.reasoning_text,
+    ) {
+        eprintln!("[Warning] Failed to save interrupted stream diagnostics: {error}");
+    }
+}
+
 fn shutdown_iteration_execution(
     app: &App,
     one_shot_mode: bool,
@@ -995,23 +1016,23 @@ fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Messa
         let store = SessionStore::new(app.config.history_file.as_path());
         store.session_assets_dir(&app.session_id)
     };
-    let candidate_count = llm_prune::active_prunable_tool_ids(messages).len();
-    let had_protocol = messages
-        .iter()
-        .any(|message| message.content.as_str() == Some(llm_prune::PRUNE_PROTOCOL_PROMPT));
+    // The prompt embeds a dynamic candidate list, so recognize the protocol
+    // message structurally instead of by full-text equality.
+    let had_protocol = messages.iter().any(llm_prune::is_prune_protocol_message);
     let report = llm_prune::prepare_request_projection(
         messages,
         &app.prune_marks,
         Some(overflow_dir.as_path()),
     );
     let protocol_injected = !had_protocol
-        && messages
-            .iter()
-            .any(|message| message.content.as_str() == Some(llm_prune::PRUNE_PROTOCOL_PROMPT));
+        && messages.iter().any(llm_prune::is_prune_protocol_message);
     if protocol_injected && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        // Counted after the projection update so results offloaded by this
+        // very call are not advertised as still-listed candidates.
+        let candidate_count = llm_prune::active_prunable_tool_ids(messages).len();
         crate::ai::driver::print::print_tool_note_line(
             "context-prune",
-            &format!("model pruning enabled for {candidate_count} old tool result(s)"),
+            &format!("protocol armed: {candidate_count} prunable candidate(s)"),
         );
     }
     if report.pruned_count == 0 {
@@ -1174,7 +1195,7 @@ async fn request_model_response(
         record_llm_summary_attempt_chars(&session_id, llm_after);
     }
     // The summary pipeline keeps system messages in principle; this idempotent safeguard still runs to guarantee the request-boundary protocol exists.
-    llm_prune::ensure_prune_protocol_prompt(messages);
+    llm_prune::ensure_prune_protocol_prompt(messages, &app.prune_marks);
     compression_report.emit();
 
     let auto_model_fallback_spec = crate::ai::driver::runtime_ctx::auto_model_fallback_spec();
@@ -1314,6 +1335,7 @@ async fn stream_model_response(
 
 async fn finalize_stream_interaction(
     app: &mut App,
+    source_model: &str,
     response: &mut reqwest::Response,
     stream_result: StreamResult,
     turn_messages: &[Message],
@@ -1325,6 +1347,7 @@ async fn finalize_stream_interaction(
     input::clear_stdin_buffer();
 
     if stream_result.outcome == StreamOutcome::Cancelled {
+        persist_interrupted_stream_diagnostic(app, source_model, &stream_result);
         return Ok(interrupted_iteration_execution(
             app,
             one_shot_mode,
@@ -1488,6 +1511,7 @@ pub(super) async fn execute_turn_iteration(
                 app.fire_after_stream_hooks();
                 return finalize_stream_interaction(
                     app,
+                    &actual_model,
                     &mut response,
                     stream_result,
                     turn_messages,
@@ -1583,6 +1607,7 @@ pub(super) async fn execute_turn_iteration(
                 };
                 return finalize_stream_interaction(
                     app,
+                    &actual_model,
                     &mut response,
                     stream_result,
                     turn_messages,

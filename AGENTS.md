@@ -68,12 +68,11 @@ Prefer an existing focused test before running one.
 3. **Collections**: `rustc-hash` FxHashMap/FxHashSet via re-exports.
 4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
 5. **AI tools**: schema in `tools/registry/`, logic in `tools/service/`.
-6. **Focused changes**: edit only what the task requires (+ minimal direct support). No opportunistic refactors/cleanup; report out-of-scope fixes first.
-7. **Tests**: keep close to changed module; serial tests use `test_support::ENV_LOCK`.
-8. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
-9. **AGENTS.md maintenance**: after code changes, revise/delete stale rules nearby — don't just append. Contradictory stale rules are worse than missing ones.
-10. **Git safety**: never `stash`/`stash drop` others' uncommitted changes. Use temp branch/worktree or stash only your own.
-11. **Architecture-first**: many fallbacks = wrong data flow — refactor the happy path instead.
+6. **Tests**: keep close to changed module; serial tests use `test_support::ENV_LOCK`.
+7. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
+8. **AGENTS.md maintenance**: after code changes, revise/delete stale rules nearby — don't just append. Contradictory stale rules are worse than missing ones.
+9. **Git safety**: never `stash`/`stash drop` others' uncommitted changes. Use temp branch/worktree or stash only your own.
+10. **Architecture-first**: many fallbacks = wrong data flow — refactor the happy path instead.
 
 ## High-Value Pitfalls
 

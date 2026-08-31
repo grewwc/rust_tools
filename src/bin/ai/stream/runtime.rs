@@ -116,6 +116,10 @@ pub(super) async fn stream_response(
     }
     configure_thinking_fold(&mut state);
     configure_subagent_preview_fold(app, &mut state, &mut markers);
+    // A completed answer is provisional until the driver's completion/citation
+    // gates accept it. Keep assistant prose transactional while preserving live
+    // thinking and tool activity.
+    state.render.defer_assistant_body = runtime_ctx::terminal_output_enabled();
     let adapter = provider::adapter_for(
         models::model_adapter(&app.current_model),
         &models::endpoint_for_model(&app.current_model, &app.config.endpoint),
@@ -353,11 +357,33 @@ fn immediate_cancel_result(app: &App, state: &mut StreamProcessingState) -> Opti
     stream_interrupt_requested(app).then(|| cancelled_stream_result(state))
 }
 
+fn flush_inline_markup_normalizer_on_cancel(state: &mut StreamProcessingState) {
+    let normalized = state.content.inline_markup_normalizer.flush();
+    if normalized.is_empty() {
+        return;
+    }
+    // Finish the protocol parsers so a partial tool call stays stripped, but discard
+    // emitted tool events because an interrupted stream must never execute them.
+    let (cleaned, _) = state.content.hermes_tool_call_streamer.push(&normalized);
+    let (cleaned, _) = state.content.anthropic_tool_call_streamer.push(&cleaned);
+    let (cleaned, _) = state.content.bare_xml_tool_call_streamer.push(&cleaned);
+    let content = normalize_stream_text(cleaned);
+    state.content.assistant_text.push_str(&content);
+}
+
 /// Thinking-fold cleanup on cancel/interrupt: if the fold window is still active we
 /// must erase the current window and settle with a `✓`; otherwise a half-drawn
 /// thinking window stays on screen, and the fresh state of the next retry draws a
 /// new header below it — stacking into a "duplicate header + large blank area".
 fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
+    flush_inline_markup_normalizer_on_cancel(state);
+    // A content-channel reasoner can keep all received text inside the demuxer until
+    // it observes its response delimiter. Ctrl+C must not discard that received
+    // prefix merely because the delimiter never arrived.
+    let (residual_reasoning, residual_content) = state.content.content_think_demuxer.flush();
+    state.content.reasoning_text.push_str(&residual_reasoning);
+    state.content.assistant_text.push_str(&residual_content);
+
     if runtime_ctx::terminal_output_enabled() {
         let _ = clear_waiting_hint(state);
         if state.render.thinking_fold.active {
@@ -372,9 +398,9 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
     StreamResult {
         outcome: StreamOutcome::Cancelled,
         tool_calls: Vec::new(),
-        assistant_text: String::new(),
+        assistant_text: std::mem::take(&mut state.content.assistant_text),
         hidden_meta: String::new(),
-        reasoning_text: String::new(),
+        reasoning_text: std::mem::take(&mut state.content.reasoning_text),
         reasoning_items: Vec::new(),
         skip_response_drain: true,
         truncated_by_length: false,
@@ -493,6 +519,11 @@ fn finalize_stream_response(
     mut state: StreamProcessingState,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
     let render_terminal = runtime_ctx::terminal_output_enabled();
+    let deferred_dedupe_candidate = state
+        .render
+        .terminal_dedupe
+        .as_ref()
+        .map(|dedupe| dedupe.candidate.clone());
     if render_terminal {
         clear_waiting_hint(&mut state)?;
     }
@@ -644,6 +675,16 @@ fn finalize_stream_response(
             StreamOutcome::Completed
         }
     };
+
+    if render_terminal && state.render.defer_assistant_body && outcome != StreamOutcome::Completed {
+        let visible_text = crate::ai::request::strip_digest_blocks(&state.content.assistant_text);
+        let duplicate = deferred_dedupe_candidate
+            .as_deref()
+            .is_some_and(|candidate| candidate.trim() == visible_text.trim());
+        if !duplicate && !visible_text.trim().is_empty() {
+            super::render_markdown_block(&visible_text)?;
+        }
+    }
 
     Ok(StreamResult {
         outcome,
@@ -818,11 +859,21 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     } else {
         StreamOutcome::Completed
     };
+    let assistant_text = std::mem::take(&mut state.content.assistant_text);
+    if runtime_ctx::terminal_output_enabled()
+        && state.render.defer_assistant_body
+        && outcome != StreamOutcome::Completed
+    {
+        let visible_text = crate::ai::request::strip_digest_blocks(&assistant_text);
+        if !visible_text.trim().is_empty() {
+            let _ = super::render_markdown_block(&visible_text);
+        }
+    }
 
     Some(StreamResult {
         outcome,
         tool_calls,
-        assistant_text: std::mem::take(&mut state.content.assistant_text),
+        assistant_text,
         hidden_meta: String::new(),
         reasoning_text: std::mem::take(&mut state.content.reasoning_text),
         reasoning_items: std::mem::take(&mut state.content.reasoning_items),
@@ -1100,7 +1151,7 @@ fn commit_visible_content(
         return Ok(());
     }
 
-    if render_terminal {
+    if render_terminal && (state.content.thinking_open || !state.render.defer_assistant_body) {
         // digest is extra image-understanding content meant for the model; strip it for terminal display (history/assistant_text keep the original)
         let terminal_content = state.render.digest_filter.push(&content);
         if markers.subagent_preview_enabled() {

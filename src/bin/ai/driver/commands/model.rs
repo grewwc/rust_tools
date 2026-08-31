@@ -12,6 +12,7 @@ fn print_model_help() {
     println!("  /model effort <minimal|low|medium|high|xhigh|max>");
     println!("                                      override reasoning effort");
     println!("  /model effort off|none|auto         clear override (use model default)");
+    println!("  /effort <level|off|auto>            standalone shortcut for /model effort");
     println!();
 }
 
@@ -98,6 +99,60 @@ fn print_model_list(app: &App) {
     println!();
 }
 
+/// Handle the reasoning-effort override, shared by `/model effort <level>` and the
+/// standalone `/effort <level>` command. `arg` is everything after the subcommand:
+///
+/// - empty → show the current effective effort and override state
+/// - `auto|clear|default|reset` → clear the override (use the model default)
+/// - `off|none|no|false|disable|disabled` → force the effort field off entirely
+/// - a tier name → set the override to that tier
+///
+/// Returns `true` because a recognized effort command always consumes the input line.
+fn handle_effort_arg(app: &mut App, arg: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        println!(
+            "Reasoning effort: {} (override: {})",
+            format_effort(effective_effort(app, &app.current_model)),
+            match app.cli.reasoning_effort_override {
+                None => "none".to_string(),
+                Some(None) => "off".to_string(),
+                Some(Some(e)) => e.as_str().to_string(),
+            }
+        );
+        return Ok(true);
+    }
+    match arg.to_ascii_lowercase().as_str() {
+        "auto" | "clear" | "default" | "reset" => {
+            app.cli.reasoning_effort_override = None;
+            println!(
+                "Cleared reasoning_effort override; now using model default ({}).",
+                format_effort(models::default_reasoning_effort(&app.current_model))
+            );
+            return Ok(true);
+        }
+        "off" | "none" | "no" | "false" | "disable" | "disabled" => {
+            app.cli.reasoning_effort_override = Some(None);
+            println!("Reasoning effort disabled (no field will be sent).");
+            return Ok(true);
+        }
+        _ => {}
+    }
+    match ReasoningEffort::parse(arg) {
+        Some(level) => {
+            app.cli.reasoning_effort_override = Some(Some(level));
+            println!("Reasoning effort overridden: {}", level.as_str());
+        }
+        None => {
+            println!(
+                "Unknown reasoning effort '{}'. Allowed: minimal, low, medium, high, xhigh, max, off, auto.",
+                arg
+            );
+        }
+    }
+    Ok(true)
+}
+
 pub fn try_handle_model_command(
     app: &mut App,
     input: &str,
@@ -118,6 +173,11 @@ pub fn try_handle_model_command(
     let Some(cmd) = parts.next() else {
         return Ok(false);
     };
+    // `/effort <level>` (or `:effort <level>`) is a standalone shortcut for
+    // `/model effort <level>`; everything after the word is the effort argument.
+    if cmd == "effort" {
+        return handle_effort_arg(app, &normalized[cmd.len()..]);
+    }
     if cmd != "model" && cmd != "models" {
         return Ok(false);
     }
@@ -179,48 +239,7 @@ pub fn try_handle_model_command(
 
     // /model effort [<value>]
     if let Some(rest) = remainder.strip_prefix("effort") {
-        let arg = rest.trim();
-        if arg.is_empty() {
-            println!(
-                "Reasoning effort: {} (override: {})",
-                format_effort(effective_effort(app, &app.current_model)),
-                match app.cli.reasoning_effort_override {
-                    None => "none".to_string(),
-                    Some(None) => "off".to_string(),
-                    Some(Some(e)) => e.as_str().to_string(),
-                }
-            );
-            return Ok(true);
-        }
-        match arg.to_ascii_lowercase().as_str() {
-            "auto" | "clear" | "default" | "reset" => {
-                app.cli.reasoning_effort_override = None;
-                println!(
-                    "Cleared reasoning_effort override; now using model default ({}).",
-                    format_effort(models::default_reasoning_effort(&app.current_model))
-                );
-                return Ok(true);
-            }
-            "off" | "none" | "no" | "false" | "disable" | "disabled" => {
-                app.cli.reasoning_effort_override = Some(None);
-                println!("Reasoning effort disabled (no field will be sent).");
-                return Ok(true);
-            }
-            _ => {}
-        }
-        match ReasoningEffort::parse(arg) {
-            Some(level) => {
-                app.cli.reasoning_effort_override = Some(Some(level));
-                println!("Reasoning effort overridden: {}", level.as_str());
-            }
-            None => {
-                println!(
-                    "Unknown reasoning effort '{}'. Allowed: minimal, low, medium, high, xhigh, max, off, auto.",
-                    arg
-                );
-            }
-        }
-        return Ok(true);
+        return handle_effort_arg(app, rest);
     }
 
     let raw = remainder;
@@ -510,5 +529,72 @@ mod tests {
         assert!(handled);
         assert_eq!(app.current_model, target);
         assert_eq!(app.forced_question.as_deref(), Some(question));
+    }
+
+    #[test]
+    fn effort_command_sets_override() {
+        let mut app = test_app();
+
+        let handled = try_handle_model_command(&mut app, "/effort high").unwrap();
+
+        assert!(handled);
+        assert_eq!(
+            app.cli.reasoning_effort_override,
+            Some(Some(ReasoningEffort::High))
+        );
+    }
+
+    #[test]
+    fn effort_command_off_disables() {
+        let mut app = test_app();
+
+        let handled = try_handle_model_command(&mut app, "/effort off").unwrap();
+
+        assert!(handled);
+        assert_eq!(app.cli.reasoning_effort_override, Some(None));
+    }
+
+    #[test]
+    fn effort_command_auto_clears_override() {
+        let mut app = test_app();
+        try_handle_model_command(&mut app, "/effort high").unwrap();
+
+        let handled = try_handle_model_command(&mut app, "/effort auto").unwrap();
+
+        assert!(handled);
+        assert_eq!(app.cli.reasoning_effort_override, None);
+    }
+
+    #[test]
+    fn effort_command_without_arg_keeps_override() {
+        let mut app = test_app();
+
+        let handled = try_handle_model_command(&mut app, "/effort").unwrap();
+
+        assert!(handled);
+        assert_eq!(app.cli.reasoning_effort_override, None);
+    }
+
+    #[test]
+    fn effort_command_unknown_value_keeps_override() {
+        let mut app = test_app();
+
+        let handled = try_handle_model_command(&mut app, "/effort banana").unwrap();
+
+        assert!(handled);
+        assert_eq!(app.cli.reasoning_effort_override, None);
+    }
+
+    #[test]
+    fn model_effort_still_works_via_model_command() {
+        let mut app = test_app();
+
+        let handled = try_handle_model_command(&mut app, "/model effort high").unwrap();
+
+        assert!(handled);
+        assert_eq!(
+            app.cli.reasoning_effort_override,
+            Some(Some(ReasoningEffort::High))
+        );
     }
 }

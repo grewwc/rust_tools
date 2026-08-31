@@ -7,6 +7,8 @@
 //! On every model call, a short prompt is appended to the system prompt asking the model to
 //! use `<meta:self_note>prune:tool_call_id1,tool_call_id2</meta:self_note>` in its response to
 //! mark tool messages that are no longer needed (usually stale ordinary tool results).
+//! The prompt ends with a dynamic per-request section listing the exact eligible ids (see
+//! [`build_prune_protocol_prompt`]), so the model does not have to recall ids from history.
 //!
 //! - Roles such as user / system / assistant / internal_note are never pruned even if
 //!   they are marked (see `is_protected_role`).
@@ -17,6 +19,7 @@
 //! - After being marked **PRUNE_THRESHOLD** times cumulatively, the message content is offloaded to the session asset disk and
 //!   the inline text is replaced with a **recallable stub** (keeping `file_path` + a recall anchor + head/tail preview,
 //!   preserving the message structure without deletion, to avoid breaking the tool_call ↔ tool_response pairing).
+//!   Exception: results at or above [`PRUNE_SINGLE_MARK_OFFLOAD_CHARS`] offload after a single mark (see [`needed_marks`]).
 //! - Counting semantics are "silence-tolerant + monotonically accumulating" rather than "consecutive": if the model produces no prune
 //!   directives this round, the counts stay untouched (intermediate tool-only rounds do not wrongly reset them); marked ids only increase
 //!   (+1), and unmarked existing entries stay **unchanged, without decay**, until the id actually leaves the context or is
@@ -61,11 +64,53 @@ fn is_prune_protected_tool(tool_name: &str) -> bool {
 /// Uses "silence-tolerant + monotonically accumulating" semantics (see [`update_prune_marks`]), so the threshold here
 /// is a **cumulative** rather than **consecutive** count. Since pruning is lossless and recallable (full text archived + stub),
 /// a low threshold works: 2 marks offload the message, balancing aggressive reclamation with hysteresis against a single stray token.
+///
+/// Exception: results at or above [`PRUNE_SINGLE_MARK_OFFLOAD_CHARS`] offload after a single
+/// mark (see [`needed_marks`]).
 pub(crate) const PRUNE_THRESHOLD: u8 = 2;
 
 /// Only old tool results reaching this size are worth exposing the pruning protocol to the model.
 /// The actual replacement still compares against the generated stub, ensuring the text only ever shrinks on every path.
 const PRUNE_MIN_CONTENT_CHARS: usize = 4_096;
+
+/// Tool results at or above this size are offloaded after a **single** model
+/// mark instead of [`PRUNE_THRESHOLD`].
+///
+/// Rationale: a result this large is re-sent in full on every round it stays
+/// visible, so waiting for a second mark usually costs more tokens than the
+/// rare wrong mark loses — and pruning is lossless (full text archived, a
+/// recallable stub stays in place), so a wrong mark is recoverable.
+const PRUNE_SINGLE_MARK_OFFLOAD_CHARS: usize = 16_384;
+
+/// Marks required before a result of this size is offloaded: one for very
+/// large results (see [`PRUNE_SINGLE_MARK_OFFLOAD_CHARS`]), [`PRUNE_THRESHOLD`]
+/// otherwise. Shared by `apply_pruning` (the actual gate) and
+/// [`build_prune_protocol_prompt`] (the per-candidate annotation the model sees).
+fn needed_marks(content_chars: usize) -> u8 {
+    if content_chars >= PRUNE_SINGLE_MARK_OFFLOAD_CHARS {
+        1
+    } else {
+        PRUNE_THRESHOLD
+    }
+}
+
+/// Per-id variant of [`needed_marks`] for display: marks still required before
+/// this id offloads. For ids not found in `messages` (not an active candidate)
+/// this falls back to [`PRUNE_THRESHOLD`].
+pub(crate) fn needed_marks_for(messages: &[Message], tool_call_id: &str) -> u8 {
+    messages
+        .iter()
+        .find(|message| {
+            message.role == "tool" && message.tool_call_id.as_deref() == Some(tool_call_id)
+        })
+        .and_then(|message| message.content.as_str())
+        .map(|content| needed_marks(content.chars().count()))
+        .unwrap_or(PRUNE_THRESHOLD)
+}
+
+/// Maximum candidates rendered into the per-request protocol section; the
+/// largest results are listed first because they free the most context.
+const PRUNE_PROMPT_MAX_CANDIDATES: usize = 8;
 
 /// The pruning-protocol instructions injected into the system prompt.
 /// Kept short to avoid consuming too many tokens.
@@ -248,6 +293,58 @@ fn protected_tool_call_ids(messages: &[Message]) -> FxHashSet<String> {
     protected
 }
 
+/// Explains why a marked id was not accepted this round, so the driver can
+/// surface actionable terminal feedback instead of silently dropping the mark
+/// (unexplained rejections make the model repeat useless marks). Returns
+/// `None` when the id is actually prunable.
+///
+/// Deliberately per-id (rebuilds the small indexes on each call): rejections
+/// are rare (usually 0-2 per round), so clarity beats batching here. The
+/// checks mirror [`active_prunable_tool_ids`] but are ordered for message
+/// quality (why exactly, not merely that it is ineligible).
+pub(crate) fn explain_rejected_prune_mark(
+    messages: &[Message],
+    tool_call_id: &str,
+) -> Option<&'static str> {
+    let Some(message) = messages.iter().find(|message| {
+        message.role == "tool" && message.tool_call_id.as_deref() == Some(tool_call_id)
+    }) else {
+        return Some("no such tool result in the current context");
+    };
+    if message
+        .content
+        .as_str()
+        .is_some_and(is_preserved_tool_overflow_stub)
+    {
+        return Some("already offloaded to the session archive");
+    }
+    let id_to_tool_name = build_tool_call_name_index(messages);
+    if id_to_tool_name
+        .get(tool_call_id)
+        .is_some_and(|name| is_prune_protected_tool(name))
+    {
+        return Some("tool declares prune:Never");
+    }
+    if protected_tool_call_ids(messages).contains(&tool_call_id.to_string()) {
+        return Some("inside the recent-results protection window");
+    }
+    if message
+        .content
+        .as_str()
+        .is_none_or(|content| content.chars().count() < PRUNE_MIN_CONTENT_CHARS)
+    {
+        return Some("below the minimum size for pruning");
+    }
+    // All specific checks passed; re-consult the authoritative eligibility
+    // set so the "None means prunable" contract cannot drift from
+    // [`active_prunable_tool_ids`] (it may gain conditions later).
+    if active_prunable_tool_ids(messages).contains(tool_call_id) {
+        None
+    } else {
+        Some("not currently eligible")
+    }
+}
+
 /// Pruning statistics of a single `apply_pruning` call, for the caller to
 /// print a terminal notice.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -263,8 +360,10 @@ pub(crate) struct PruneReport {
 
 /// Applies pruning to the messages array (lossless, recallable offload).
 ///
-/// Tool messages whose count >= PRUNE_THRESHOLD have their full text offloaded
-/// to the session asset directory and are inline-replaced with a stub carrying
+/// Tool messages whose accumulated marks reach the per-result threshold
+/// (`PRUNE_THRESHOLD`, or a single mark for results at or above
+/// `PRUNE_SINGLE_MARK_OFFLOAD_CHARS`) have their full text offloaded to the
+/// session asset directory and are inline-replaced with a stub carrying
 /// `file_path` + a recall anchor + head/tail previews; no message is deleted
 /// and the array length never changes — the model can `read_file` the full
 /// original at any time.
@@ -316,13 +415,16 @@ pub(crate) fn apply_pruning(
         let Some(&count) = prune_marks.get(&tool_call_id) else {
             continue;
         };
-        if count < PRUNE_THRESHOLD {
-            continue;
-        }
 
         let Some(content) = msg.content.as_str() else {
             continue;
         };
+        // Very large results offload after a single mark: re-sending them in
+        // full every extra round costs more than the rare wrong mark loses,
+        // and the offload is lossless and recallable either way.
+        if count < needed_marks(content.chars().count()) {
+            continue;
+        }
         // The request projection is reused across multiple model rounds; an
         // already-offloaded stub must not be counted again in the pruning report.
         if is_preserved_tool_overflow_stub(content) {
@@ -382,12 +484,90 @@ pub(crate) fn should_inject_prune_prompt(messages: &[Message]) -> bool {
 
 /// Injects the pruning protocol into the model request projection on demand,
 /// guaranteeing repeated calls never duplicate the prompt.
-pub(crate) fn ensure_prune_protocol_prompt(messages: &mut Vec<Message>) -> bool {
-    if messages.iter().any(|message| {
-        message.role == "system"
-            && matches!(&message.content, Value::String(text) if text == PRUNE_PROTOCOL_PROMPT)
-    }) || !should_inject_prune_prompt(messages)
+/// Recognizes the protocol message regardless of which candidate list was
+/// rendered into it: the prompt is static instructions plus a dynamic
+/// per-request section, so full-text equality no longer identifies it.
+pub(crate) fn is_prune_protocol_message(message: &Message) -> bool {
+    message.role == "system"
+        && matches!(&message.content, Value::String(text) if text.starts_with(PRUNE_PROTOCOL_PROMPT))
+}
+
+/// Builds the full protocol prompt for this request: the static instructions
+/// plus a dynamic section listing the currently prunable candidates (largest
+/// first, capped at [`PRUNE_PROMPT_MAX_CANDIDATES`]). `prune_marks` annotates
+/// each candidate with its accumulated counter (`marks/threshold`) so the
+/// model can see how close a result is to being offloaded.
+///
+/// Listing exact ids is the main fix for the earlier static-prompt version,
+/// where the model had to recall `tool_call_id`s from history and rarely
+/// emitted valid marks.
+fn build_prune_protocol_prompt(messages: &[Message], prune_marks: &FxHashMap<String, u8>) -> String {
+    let active_ids = active_prunable_tool_ids(messages);
+    if active_ids.is_empty() {
+        return PRUNE_PROTOCOL_PROMPT.to_string();
+    }
+    let id_to_tool_name = build_tool_call_name_index(messages);
+    let mut candidates: Vec<(String, &str, usize)> = messages
+        .iter()
+        .filter_map(|message| {
+            let id = message.tool_call_id.as_ref()?;
+            if !active_ids.contains(id) {
+                return None;
+            }
+            let chars = message.content.as_str()?.chars().count();
+            let tool = id_to_tool_name.get(id).map(String::as_str).unwrap_or("tool");
+            Some((id.clone(), tool, chars))
+        })
+        .collect();
+    // Largest first (most context freed); tie-break by id for determinism.
+    candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    let mut section =
+        String::from("\n### Prunable candidates in this request (id · tool · size · marks/threshold)\n");
+    for (id, tool, chars) in candidates.iter().take(PRUNE_PROMPT_MAX_CANDIDATES) {
+        let count = prune_marks.get(id).copied().unwrap_or(0);
+        section.push_str(&format!(
+            "- {id} · {tool} · {chars} chars · marks {count}/{}\n",
+            needed_marks(*chars)
+        ));
+    }
+    let hidden = candidates.len().saturating_sub(PRUNE_PROMPT_MAX_CANDIDATES);
+    if hidden > 0 {
+        section.push_str(&format!("(+{hidden} more eligible candidates not listed)\n"));
+    }
+
+    let mut prompt = PRUNE_PROTOCOL_PROMPT.to_string();
+    prompt.push_str(&section);
+    prompt
+}
+
+/// Injects the pruning protocol into the model request projection on demand,
+/// guaranteeing repeated calls never duplicate the prompt message. When the
+/// protocol is already present and candidates still exist, the dynamic
+/// candidate list is refreshed in place instead; when no prunable candidates
+/// remain, the stale protocol message (with its outdated candidate list) is
+/// removed so the model never sees ids that no longer exist.
+pub(crate) fn ensure_prune_protocol_prompt(
+    messages: &mut Vec<Message>,
+    prune_marks: &FxHashMap<String, u8>,
+) -> bool {
+    if let Some(existing_idx) = messages
+        .iter()
+        .position(|message| is_prune_protocol_message(message))
     {
+        if should_inject_prune_prompt(messages) {
+            let prompt = build_prune_protocol_prompt(messages, prune_marks);
+            messages[existing_idx].content = Value::String(prompt);
+        } else {
+            // No prunable candidates remain in this projection: the candidate
+            // list inside the protocol message would now name ids that are no
+            // longer present, which misleads the model into re-marking them.
+            // Remove the stale message instead of leaving it in place.
+            messages.remove(existing_idx);
+        }
+        return false;
+    }
+    if !should_inject_prune_prompt(messages) {
         return false;
     }
 
@@ -395,11 +575,12 @@ pub(crate) fn ensure_prune_protocol_prompt(messages: &mut Vec<Message>) -> bool 
         .iter()
         .position(|message| message.role != "system")
         .unwrap_or(messages.len());
+    let prompt = build_prune_protocol_prompt(messages, prune_marks);
     messages.insert(
         insert_at,
         Message {
             role: "system".to_string(),
-            content: Value::String(PRUNE_PROTOCOL_PROMPT.to_string()),
+            content: Value::String(prompt),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -420,7 +601,7 @@ pub(crate) fn prepare_request_projection(
     overflow_dir: Option<&Path>,
 ) -> PruneReport {
     let report = apply_pruning(messages.as_mut_slice(), prune_marks, overflow_dir);
-    ensure_prune_protocol_prompt(messages);
+    ensure_prune_protocol_prompt(messages, prune_marks);
     report
 }
 
@@ -999,15 +1180,15 @@ mod tests {
             messages.push(make_tool_message(&id, &"recent result ".repeat(500)));
         }
 
-        assert!(!ensure_prune_protocol_prompt(&mut messages));
+        assert!(!ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
         messages.push(make_assistant_tool_call("call_4", "execute_command"));
         messages.push(make_tool_message("call_4", &"newest result ".repeat(500)));
-        assert!(ensure_prune_protocol_prompt(&mut messages));
-        assert!(!ensure_prune_protocol_prompt(&mut messages));
+        assert!(ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
+        assert!(!ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
         assert_eq!(
             messages
                 .iter()
-                .filter(|message| message.content.as_str() == Some(PRUNE_PROTOCOL_PROMPT))
+                .filter(|message| is_prune_protocol_message(message))
                 .count(),
             1
         );
@@ -1052,7 +1233,7 @@ mod tests {
         assert_eq!(
             request_messages
                 .iter()
-                .filter(|message| message.content.as_str() == Some(PRUNE_PROTOCOL_PROMPT))
+                .filter(|message| is_prune_protocol_message(message))
                 .count(),
             0,
             "after the only old candidate is pruned, the protocol prompt is no longer needed"
@@ -1157,5 +1338,224 @@ mod tests {
         assert_eq!(pruned.pruned_count, 3); // the most recent 4 tool groups are protected
 
         std::fs::remove_dir_all(&overflow_dir).ok();
+    }
+
+    #[test]
+    fn test_protocol_prompt_lists_candidates_with_marks() {
+        let mut messages = vec![make_user_message("request")];
+        messages.extend([
+            make_assistant_tool_call("call_big", "read_file"),
+            make_tool_message("call_big", &"x".repeat(20_000)),
+            make_assistant_tool_call("call_small_old", "execute_command"),
+            make_tool_message("call_small_old", &"y".repeat(5_000)),
+        ]);
+        for index in 0..4 {
+            let id = format!("call_recent_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, "recent result"));
+        }
+        let marks = [("call_small_old".to_string(), 1u8)].into_iter().collect();
+
+        assert!(ensure_prune_protocol_prompt(&mut messages, &marks));
+        let prompt = messages
+            .iter()
+            .find(|message| is_prune_protocol_message(message))
+            .and_then(|message| message.content.as_str())
+            .expect("protocol prompt injected");
+        assert!(prompt.starts_with(PRUNE_PROTOCOL_PROMPT));
+        let big_pos = prompt.find("call_big").expect("large candidate listed");
+        let small_pos = prompt
+            .find("call_small_old")
+            .expect("small candidate listed");
+        assert!(big_pos < small_pos, "largest candidates are listed first");
+        assert!(
+            prompt.contains("marks 0/1"),
+            "very large result shows the single-mark threshold"
+        );
+        assert!(
+            prompt.contains("marks 1/2"),
+            "small result shows the accumulated counter against the normal threshold"
+        );
+        assert!(
+            !prompt.contains("call_recent_0"),
+            "protected recent results are not listed as candidates"
+        );
+    }
+
+    #[test]
+    fn test_ensure_refreshes_candidate_list_in_place() {
+        let mut messages = vec![make_user_message("request")];
+        messages.extend([
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", &"x".repeat(5_000)),
+        ]);
+        for index in 0..4 {
+            let id = format!("call_recent_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, "recent result"));
+        }
+        assert!(ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
+
+        let prompt_before = messages
+            .iter()
+            .find(|message| is_prune_protocol_message(message))
+            .and_then(|message| message.content.as_str())
+            .expect("protocol prompt injected")
+            .to_string();
+        assert!(prompt_before.contains("marks 0/2"));
+
+        // A later round of the same turn: the model has marked call_old once,
+        // so the existing protocol message must be refreshed in place (updated
+        // counter), never duplicated.
+        let marks = [("call_old".to_string(), 1u8)].into_iter().collect();
+        assert!(!ensure_prune_protocol_prompt(&mut messages, &marks));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| is_prune_protocol_message(message))
+                .count(),
+            1,
+            "refresh must never duplicate the protocol message"
+        );
+        let prompt = messages
+            .iter()
+            .find(|message| is_prune_protocol_message(message))
+            .and_then(|message| message.content.as_str())
+            .expect("protocol prompt still present");
+        assert!(prompt.contains("marks 1/2"));
+        assert_ne!(prompt_before, prompt);
+    }
+
+    #[test]
+    fn test_protocol_message_removed_when_no_candidates_remain() {
+        let mut messages = vec![make_user_message("request")];
+        messages.extend([
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", &"x".repeat(5_000)),
+        ]);
+        for index in 0..4 {
+            let id = format!("call_recent_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, "recent result"));
+        }
+        assert!(ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| is_prune_protocol_message(message))
+                .count(),
+            1
+        );
+
+        // A later round of the same turn: the old result is gone (offloaded or
+        // rewritten), so no prunable candidate remains. The stale protocol
+        // message must be removed, not left behind with an outdated list.
+        messages.retain(|message| message.tool_call_id.as_deref() != Some("call_old"));
+        assert!(!ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| is_prune_protocol_message(message))
+                .count(),
+            0,
+            "protocol message with an empty candidate list is removed"
+        );
+    }
+
+    #[test]
+    fn test_single_mark_offloads_very_large_result() {
+        let overflow_dir = make_overflow_dir();
+        let mut messages = vec![make_user_message("request")];
+        messages.extend([
+            make_assistant_tool_call("call_huge", "execute_command"),
+            make_tool_message("call_huge", &"z".repeat(PRUNE_SINGLE_MARK_OFFLOAD_CHARS)),
+            make_assistant_tool_call("call_small", "execute_command"),
+            make_tool_message("call_small", &"w".repeat(5_000)),
+        ]);
+        for index in 0..4 {
+            let id = format!("call_recent_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, "recent result"));
+        }
+        let marks = [
+            ("call_huge".to_string(), 1u8),
+            ("call_small".to_string(), 1u8),
+        ]
+        .into_iter()
+        .collect();
+
+        let report = apply_pruning(&mut messages, &marks, Some(overflow_dir.as_path()));
+        assert_eq!(
+            report.pruned_count, 1,
+            "only the very large result offloads after a single mark"
+        );
+        let huge_content = messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_huge"))
+            .and_then(|message| message.content.as_str())
+            .expect("huge result stays in place");
+        assert!(huge_content.contains("file_path:"), "offloaded to a recall stub");
+        let small_content = messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_small"))
+            .and_then(|message| message.content.as_str())
+            .expect("small result stays in place");
+        assert_eq!(
+            small_content,
+            "w".repeat(5_000),
+            "small result still waits for the normal threshold"
+        );
+        std::fs::remove_dir_all(&overflow_dir).ok();
+    }
+
+    #[test]
+    fn test_needed_marks_for_matches_size_rule() {
+        let messages = vec![
+            make_assistant_tool_call("call_big", "execute_command"),
+            make_tool_message("call_big", &"x".repeat(PRUNE_SINGLE_MARK_OFFLOAD_CHARS)),
+            make_assistant_tool_call("call_small", "execute_command"),
+            make_tool_message("call_small", &"y".repeat(5_000)),
+        ];
+        assert_eq!(needed_marks_for(&messages, "call_big"), 1);
+        assert_eq!(needed_marks_for(&messages, "call_small"), PRUNE_THRESHOLD);
+        assert_eq!(
+            needed_marks_for(&messages, "call_missing"),
+            PRUNE_THRESHOLD,
+            "unknown ids fall back to the default threshold"
+        );
+    }
+
+    #[test]
+    fn test_explain_rejected_prune_mark() {
+        let mut messages = vec![make_user_message("request")];
+        messages.extend([
+            make_assistant_tool_call("call_small", "execute_command"),
+            make_tool_message("call_small", &"x".repeat(100)),
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", &"y".repeat(5_000)),
+        ]);
+        for index in 0..4 {
+            let id = format!("call_recent_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, "recent result"));
+        }
+
+        assert_eq!(
+            explain_rejected_prune_mark(&messages, "call_unknown"),
+            Some("no such tool result in the current context")
+        );
+        assert_eq!(
+            explain_rejected_prune_mark(&messages, "call_recent_0"),
+            Some("inside the recent-results protection window")
+        );
+        assert_eq!(
+            explain_rejected_prune_mark(&messages, "call_small"),
+            Some("below the minimum size for pruning")
+        );
+        assert_eq!(
+            explain_rejected_prune_mark(&messages, "call_old"),
+            None,
+            "eligible ids get no rejection reason"
+        );
     }
 }

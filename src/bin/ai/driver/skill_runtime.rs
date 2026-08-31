@@ -2625,10 +2625,11 @@ mod tests {
         // prefixed by leaked source indentation.
         assert!(prompt
             .contains("\n- Investigate the user's explicit request plus only the direct dependencies"));
-        assert!(prompt.contains("\n- Do not implement unsolicited refactors or optimizations."));
+        assert!(prompt
+            .contains("\n- Do not implement refactors or optimizations unrelated to the task;"));
         assert!(prompt.contains("\n- For broad requests, define investigation boundaries"));
         // Guard against the exact defect: no bullet prefixed by leading spaces.
-        assert!(!prompt.contains("\n             - Do not implement unsolicited refactors"));
+        assert!(!prompt.contains("\n             - Do not implement refactors"));
         assert!(!prompt.contains("\n             - For broad requests, define"));
     }
 

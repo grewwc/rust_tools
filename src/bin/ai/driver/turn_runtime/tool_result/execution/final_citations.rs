@@ -197,6 +197,73 @@ pub(in crate::ai::driver::turn_runtime) fn resolve_final_citation_path(
     }
 }
 
+fn push_citation_base_dir(base_dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    if !base_dirs.contains(&path) {
+        base_dirs.push(path);
+    }
+}
+
+/// Build conservative resolution roots from the current turn's observed tool paths. Models
+/// often cite a basename after reading an absolute file path or running a command from a
+/// subdirectory; validating only against the process cwd incorrectly rejects those citations.
+/// No recursive search is performed: every extra root must come from explicit tool arguments.
+pub(in crate::ai::driver::turn_runtime) fn final_citation_base_dirs(
+    messages: &[Message],
+    effective_cwd: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut base_dirs = Vec::new();
+    if let Some(cwd) = effective_cwd {
+        push_citation_base_dir(&mut base_dirs, cwd.to_path_buf());
+    }
+    let turn_start = crate::ai::history::last_real_user_index(messages).unwrap_or(0);
+    for message in messages.iter().skip(turn_start) {
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for tool_call in tool_calls {
+            let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+            else {
+                continue;
+            };
+            let tool_cwd = args
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .filter(|cwd| !cwd.trim().is_empty())
+                .map(PathBuf::from)
+                .map(|cwd| {
+                    if cwd.is_absolute() {
+                        cwd
+                    } else {
+                        effective_cwd.map_or(cwd.clone(), |base| base.join(cwd))
+                    }
+                });
+            if let Some(cwd) = &tool_cwd {
+                push_citation_base_dir(&mut base_dirs, cwd.clone());
+            }
+            for raw_path in ["file_path", "path"]
+                .into_iter()
+                .filter_map(|key| args.get(key).and_then(serde_json::Value::as_str))
+            {
+                let path = Path::new(raw_path);
+                let resolved = if path.is_absolute() {
+                    path.to_path_buf()
+                } else if let Some(cwd) = &tool_cwd {
+                    cwd.join(path)
+                } else if let Some(cwd) = effective_cwd {
+                    cwd.join(path)
+                } else {
+                    continue;
+                };
+                if let Some(parent) = resolved.parent() {
+                    push_citation_base_dir(&mut base_dirs, parent.to_path_buf());
+                }
+                push_citation_base_dir(&mut base_dirs, resolved);
+            }
+        }
+    }
+    base_dirs
+}
+
 /// `Some(false)` is reserved for a locally provable bad citation. I/O failures and oversized
 /// files stay unknown so this gate never claims a citation is invalid without direct evidence.
 pub(in crate::ai::driver::turn_runtime) fn citation_file_contains_line(path: &Path, line: u64) -> Option<bool> {
@@ -244,6 +311,17 @@ pub(in crate::ai::driver::turn_runtime) fn unvalidated_final_response_citations(
     final_text: &str,
     effective_cwd: Option<&Path>,
 ) -> Vec<String> {
+    let base_dirs = effective_cwd
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    unvalidated_final_response_citations_with_bases(final_text, &base_dirs)
+}
+
+pub(in crate::ai::driver::turn_runtime) fn unvalidated_final_response_citations_with_bases(
+    final_text: &str,
+    base_dirs: &[PathBuf],
+) -> Vec<String> {
     let home = std::env::var_os("HOME");
     final_response_citations(final_text)
         .into_iter()
@@ -255,11 +333,25 @@ pub(in crate::ai::driver::turn_runtime) fn unvalidated_final_response_citations(
             // "valid": skip without flagging, exactly like the other unknown
             // verdicts. Only provably bad citations may trigger the retry/warning
             // path.
-            let path =
-                resolve_final_citation_path(&citation.path, effective_cwd, home.as_deref())?;
-            match citation_file_contains_line(&path, citation.end_line) {
-                Some(true) | None => None,
-                Some(false) => Some(citation.text),
+            if citation.path.starts_with("~/") || Path::new(&citation.path).is_absolute() {
+                let path = resolve_final_citation_path(&citation.path, None, home.as_deref())?;
+                return match citation_file_contains_line(&path, citation.end_line) {
+                    Some(true) | None => None,
+                    Some(false) => Some(citation.text),
+                };
+            }
+            let verdicts = base_dirs
+                .iter()
+                .map(|base| {
+                    citation_file_contains_line(&base.join(&citation.path), citation.end_line)
+                })
+                .collect::<Vec<_>>();
+            if verdicts.iter().any(|verdict| matches!(verdict, Some(true)))
+                || verdicts.iter().all(Option::is_none)
+            {
+                None
+            } else {
+                Some(citation.text)
             }
         })
         .collect()
@@ -273,17 +365,13 @@ pub(in crate::ai::driver::turn_runtime) fn final_response_citation_gate_action(
     iteration: usize,
     max_iterations: usize,
 ) -> FinalCitationGateAction {
-    let unvalidated = unvalidated_final_response_citations(final_text, effective_cwd);
+    let base_dirs = final_citation_base_dirs(messages, effective_cwd);
+    let unvalidated = unvalidated_final_response_citations_with_bases(final_text, &base_dirs);
     if unvalidated.is_empty() {
         return FinalCitationGateAction::Allow;
     }
-    let already_retried = messages.iter().any(|message| {
-        message.role == ROLE_INTERNAL_NOTE
-            && message
-                .content
-                .as_str()
-                .is_some_and(|text| text.starts_with(FINAL_CITATION_RETRY_MARKER))
-    });
+    let already_retried =
+        current_turn_has_internal_marker(messages, FINAL_CITATION_RETRY_MARKER);
     if already_retried || force_final_response || iteration >= max_iterations {
         return FinalCitationGateAction::Warn;
     }
