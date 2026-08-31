@@ -4,7 +4,6 @@ use rust_tools::{commonw::FastSet, cw::SkipMap};
 use serde_json::Value;
 
 use crate::ai::tools::os_tools::GLOBAL_OS;
-use crate::ai::tools::permissions::ToolPermissions;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
 use aios_kernel::{
@@ -705,33 +704,6 @@ fn record_tool_stat(name: &str, ok: bool) {
     let store = MemoryStore::from_env_or_config();
     let _ = store.append(&entry);
     store.maintain_after_append();
-}
-
-/// Executes a tool call with permission checking.
-/// - If denied: returns an error immediately.
-/// - If ask: prompts the user for confirmation before executing.
-/// - If allowed: proceeds to execute directly.
-pub(crate) fn execute_tool_call_with_permissions(
-    tool_call: &ToolCall,
-    permissions: &ToolPermissions,
-) -> Result<ToolResult, String> {
-    let tool_name = &tool_call.function.name;
-
-    if permissions.is_denied(tool_name) {
-        return Err(format!("Tool '{}' is denied by permissions", tool_name));
-    }
-
-    if permissions.needs_ask(tool_name) {
-        let confirmed = crate::commonw::prompt::prompt_yes_or_no_interruptible(&format!(
-            "Confirm tool execution: {} (y/n): ",
-            tool_name
-        ));
-        if !confirmed.unwrap_or(false) {
-            return Err(format!("Tool '{}' execution cancelled by user", tool_name));
-        }
-    }
-
-    execute_tool_call(tool_call)
 }
 
 #[cfg(test)]

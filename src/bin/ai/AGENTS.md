@@ -20,7 +20,7 @@ the nearest child `AGENTS.md`.
 - `tools/`: registry, service implementations, storage, display/history policy
 - `mcp/`: MCP lifecycle, clients, routing snapshots, transport
 - `knowledge/`: shared types, lexical similarity, embedding provider, vector index
-- `stream/`: streaming protocol, chunk extraction, state machine, `stream/render/` terminal rendering
+- `stream/`: streaming protocol, chunk extraction, state machine, `stream/render/` terminal rendering. Golden wire→parse regression tests live in `stream/runtime/tests.rs` (`mod golden_wire`): a `ScriptedSse` loopback server feeds fixture SSE events through the real `stream_response` state machine and asserts the parsed `StreamResult` (offline, CI-safe). Add new provider wire shapes as fixtures there.
 - `cli.rs` / `theme.rs` / `background.rs`: CLI entry, theming, background tasks
 - `persona.rs` / `files.rs` / `types.rs` / `errors.rs` / `request_protocol.rs`: persona, file helpers (`extract_key_lines`), shared types, `AiError`, request dialect
 - `tool_descriptions/`: per-tool JSON metadata (description, parameters schema,

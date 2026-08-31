@@ -475,6 +475,35 @@ pub(in crate::ai) async fn run_with_cli(
     let os_arc = new_local_kernel();
     crate::ai::tools::os_tools::init_os_tools_globals(os_arc.clone());
 
+    // Build the tool-permission middleware from config. Empty rules => no
+    // middleware installed (zero-config path stays all-allow). This install site
+    // is reached by every `run_with_cli` entry, including a re-exec'd background
+    // daemon (`-bg`), so the background process DOES enforce the policy. Only
+    // in-process subagents skip it: `App::clone` resets the middleware vectors,
+    // so agent-spawned helpers inherit no gate. Note a background daemon's stdin
+    // is `/dev/null`, so any `ask` rule fails closed to deny there.
+    let tool_middlewares = {
+        let cfg = configw::get_all_config();
+        let rules = cfg
+            .get_opt(crate::ai::config_schema::AiConfig::TOOLS_PERMISSIONS)
+            .unwrap_or_default();
+        let default = cfg
+            .get_opt(crate::ai::config_schema::AiConfig::TOOLS_PERMISSIONS_DEFAULT)
+            .unwrap_or_default();
+        match crate::ai::tools::permissions::ToolPermissions::from_config(&rules, &default) {
+            Some((perms, warnings)) => {
+                for warning in warnings {
+                    eprintln!("[tool-permissions] {warning}");
+                }
+                let mw: std::sync::Arc<dyn crate::ai::middleware::ToolMiddleware> = std::sync::Arc::new(
+                    crate::ai::tools::permissions::PermissionMiddleware::new(perms),
+                );
+                vec![mw]
+            }
+            None => Vec::new(),
+        }
+    };
+
     let mut app = App {
         pending_files: if cli.files.trim().is_empty() {
             None
@@ -522,7 +551,7 @@ pub(in crate::ai) async fn run_with_cli(
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
         stale_patch_targets: Default::default(),
-        tool_middlewares: Vec::new(),
+        tool_middlewares,
         llm_middlewares: Vec::new(),
         hooks: Default::default(),
     };

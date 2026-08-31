@@ -2745,3 +2745,188 @@ fn unarmed_demuxer_leaves_content_untouched() {
     assert_eq!(state.content.assistant_text, "see </think> literal");
     assert!(state.content.reasoning_text.is_empty());
 }
+
+// =============================================================================
+// Golden wire→parse harness
+// =============================================================================
+// Regression guard for the SSE wire-shape → StreamResult contract. Unlike the
+// process_stream_payload unit tests above (which feed one payload at a time), and
+// unlike the ad-hoc loopback tests earlier in this file, this harness scripts a
+// full multi-event SSE response over a real loopback socket and drives the real
+// `stream_response` state machine end to end. It is the deterministic, offline
+// core of the "golden transcript" idea: fixtures describe the exact bytes a
+// provider would stream; assertions pin the parsed outcome. No network, no live
+// model — so it is safe to run in CI and catches regressions in chunk framing,
+// tool-call assembly, finish_reason handling, and reasoning demux.
+//
+// Reusability: `ScriptedSse::spawn(events)` takes a list of raw SSE `data:`
+// payloads (JSON strings, or the literal "[DONE]") and serves them over a real
+// loopback socket; `drive(events)` runs the parser and returns the StreamResult.
+// New golden cases only add fixtures; the harness is fixed.
+mod golden_wire {
+    use super::*;
+
+    /// One scripted SSE server for a single response. Splits each event across
+    /// its own HTTP chunk so the framing/boundary logic is exercised the same way
+    /// a real streaming provider drives it.
+    struct ScriptedSse {
+        addr: std::net::SocketAddr,
+        done_tx: mpsc::Sender<()>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    impl ScriptedSse {
+        /// Spawn a loopback server that emits `events` as `data: <event>\n\n`
+        /// SSE frames, then blocks until the response is dropped. Each entry is a
+        /// raw payload: a JSON chunk body, or "[DONE]" for the terminator.
+        fn spawn(events: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (done_tx, done_rx) = mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request_buf = [0u8; 1024];
+                let _ = stream.read(&mut request_buf);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .unwrap();
+                for event in &events {
+                    write_http_chunk(&mut stream, &format!("data: {event}\n\n")).unwrap();
+                }
+                // Keep the socket open until the test drops the response, matching
+                // the finish_reason-grace behavior of real providers.
+                let _ = done_rx.recv_timeout(Duration::from_secs(2));
+            });
+            Self {
+                addr,
+                done_tx,
+                handle,
+            }
+        }
+
+        async fn response(&self) -> reqwest::Response {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            client
+                .post(format!("http://{}/chat", self.addr))
+                .send()
+                .await
+                .unwrap()
+        }
+
+        fn shutdown(self, response: reqwest::Response) {
+            drop(response);
+            let _ = self.done_tx.send(());
+            self.handle.join().unwrap();
+        }
+    }
+
+    /// Drive `stream_response` against a scripted event list and return the parsed
+    /// result. Centralizes the env-lock, os-globals, and interrupt hygiene the
+    /// existing loopback tests each repeat.
+    async fn drive(events: Vec<String>) -> crate::ai::types::StreamResult {
+        let _signal_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let server = ScriptedSse::spawn(events);
+        let mut response = server.response().await;
+        let mut app = test_app();
+        init_os_tools_globals(app.os.clone());
+        crate::ai::driver::signal::clear_request_interrupt();
+        let mut current_history = String::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            stream_response(&mut app, &mut response, &mut current_history, None),
+        )
+        .await
+        .expect("stream_response should finish within the grace window")
+        .unwrap();
+
+        server.shutdown(response);
+        crate::ai::driver::signal::clear_request_interrupt();
+        if let Ok(mut guard) = GLOBAL_OS.lock() {
+            *guard = None;
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn golden_multi_chunk_text_assembles_in_order() {
+        let result = drive(vec![
+            r#"{"choices":[{"delta":{"content":"Hel"}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{"content":"lo, "}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{"content":"world"}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#.to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await;
+
+        assert_eq!(result.outcome, StreamOutcome::Completed);
+        assert_eq!(result.assistant_text, "Hello, world");
+        assert!(result.tool_calls.is_empty());
+        assert!(!result.truncated_by_length);
+    }
+
+    #[tokio::test]
+    async fn golden_streamed_tool_call_is_reassembled() {
+        // OpenAI-style streaming tool call: name arrives first, arguments arrive
+        // as fragments across subsequent deltas, then finish_reason=tool_calls.
+        let result = drive(vec![
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"file_path\":"}}]}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Cargo.toml\"}"}}]}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await;
+
+        assert_eq!(result.outcome, StreamOutcome::ToolCall);
+        assert_eq!(result.tool_calls.len(), 1);
+        let call = &result.tool_calls[0];
+        assert_eq!(call.id, "call_1");
+        assert_eq!(call.function.name, "read_file");
+        // Fragmented arguments must concatenate into valid JSON.
+        let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
+            .expect("reassembled tool-call arguments must be valid JSON");
+        assert_eq!(args["file_path"], "Cargo.toml");
+    }
+
+    #[tokio::test]
+    async fn golden_finish_reason_length_marks_truncation() {
+        let result = drive(vec![
+            r#"{"choices":[{"delta":{"content":"partial answer"}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#.to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await;
+
+        // Even with visible text, a length finish_reason must flag truncation so
+        // upper layers can inject a shrink hint / retry.
+        assert_eq!(result.assistant_text, "partial answer");
+        assert!(result.truncated_by_length, "length finish_reason => truncated_by_length");
+    }
+
+    #[tokio::test]
+    async fn golden_reasoning_is_split_from_visible_content() {
+        // reasoning_content on the delta must land in reasoning_text, not the
+        // visible assistant answer.
+        let result = drive(vec![
+            r#"{"choices":[{"delta":{"reasoning_content":"thinking step"}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{"content":"final answer"}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#.to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await;
+
+        assert_eq!(result.outcome, StreamOutcome::Completed);
+        assert_eq!(result.assistant_text, "final answer");
+        assert!(
+            result.reasoning_text.contains("thinking step"),
+            "reasoning must be captured separately, got: {:?}",
+            result.reasoning_text
+        );
+        assert!(!result.assistant_text.contains("thinking step"));
+    }
+}

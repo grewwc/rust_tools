@@ -6,7 +6,7 @@ pub mod os_tools;
 mod overflow_search;
 mod patch_tools;
 mod rag_tools;
-mod permissions;
+pub(crate) mod permissions;
 mod plan_state;
 mod plan_tools;
 pub(crate) mod registry;

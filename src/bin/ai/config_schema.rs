@@ -119,6 +119,37 @@ impl AiConfig {
     /// for file read/write), merged with the built-in sensitive list.
     pub const SANDBOX_EXTRA_SENSITIVE_PATHS: &str = "ai.sandbox.extra_sensitive_paths";
 
+    // ── Tool permissions ───────────────────────────────────
+    /// Per-tool execution policy applied to the foreground turn via a
+    /// `ToolMiddleware`. Comma-separated `pattern:policy` rules where `policy`
+    /// is `allow` / `ask` / `deny` and `pattern` is an exact tool name or a
+    /// `prefix*` glob (e.g. `execute_command:ask, apply_patch:ask, write_file:ask`).
+    /// Match precedence: exact tool-name rules win over `prefix*` patterns;
+    /// among patterns the FIRST one registered wins (registration order = the
+    /// order rules appear in this string), so list the more specific `prefix*`
+    /// before a broader one. Empty = no policy (all tools allow), preserving
+    /// current behavior.
+    ///
+    /// `ask` requires an interactive stdin. Without a TTY it fails closed (the
+    /// call is denied with an explanatory result, not silently). This affects
+    /// both a piped/non-TTY foreground AND background daemon mode (`-bg`), whose
+    /// stdin is `/dev/null` — so an `ask` rule effectively becomes `deny` in the
+    /// background. Use explicit `allow`/`deny` for tools you expect to run
+    /// unattended.
+    ///
+    /// Scope: a background daemon (`-bg`) is a freshly re-exec'd process that
+    /// re-runs `driver::run_with_cli`, so it DOES install this policy from config
+    /// (it is a full user-initiated agent run). Only in-process subagents do not
+    /// inherit it — `App::clone` resets the middleware vectors, so agent-spawned
+    /// helpers run with no permission gate.
+    pub const TOOLS_PERMISSIONS: &str = "ai.tools.permissions";
+    /// Default policy for tools not matched by any rule in
+    /// `ai.tools.permissions`. One of `allow` / `ask` / `deny`. Defaults to
+    /// `allow` (unchanged behavior). Only consulted when `ai.tools.permissions`
+    /// is non-empty; with no rules configured the middleware is not installed
+    /// at all, so this key has no effect on the zero-config path.
+    pub const TOOLS_PERMISSIONS_DEFAULT: &str = "ai.tools.permissions.default";
+
     // ── Hooks (lifecycle) ──────────────────────────────────
     /// Shell command executed before each turn starts. Receives env
     /// `AI_HOOK_EVENT=on_turn_start`. Empty = disabled.
