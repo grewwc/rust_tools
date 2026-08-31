@@ -1286,6 +1286,25 @@ async fn run_turn_body(
             let sr = &tce.stream_result;
             pending_digest_source = Some(format!("{}\n{}", sr.assistant_text, sr.reasoning_text));
         }
+        // Digest-only guard: the injected digest instruction can make the first round
+        // return ONLY the image digest — no answer, no tool calls. The terminal strips
+        // the digest, so ending the turn here looks like the model was interrupted and
+        // answered nothing. Instead, cache the digest as the pending source and continue
+        // the loop: the top of iteration 2 swaps the image for the digest and asks the
+        // model again to answer the user's actual question. The guard only fires while
+        // the image digest is unresolved (before iteration 2, since the swap block above
+        // always resolves it by then) and never on a forced final (interrupt / iteration
+        // limit / health hard-stop), so it can convert at most one round per turn.
+        if !image_digest_resolved
+            && !force_final_response
+            && let IterationExecution::FinalResponse(sr) = &execution
+        {
+            let raw = format!("{}\n{}", sr.assistant_text, sr.reasoning_text);
+            if crate::ai::request::is_digest_only_response(&raw) {
+                pending_digest_source = Some(raw);
+                continue 'turn;
+            }
+        }
         {
             let mc = mcp_client.lock().unwrap().routing_snapshot();
                 // Calibrate the max_tokens clamp of later requests with the actual prompt_tokens

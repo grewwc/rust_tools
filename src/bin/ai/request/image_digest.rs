@@ -66,8 +66,10 @@ pub(crate) fn digest_instruction() -> String {
 （界面结构、可见文字、代码、数值、颜色、布局与位置关系等）写清楚——后续你将只能\
 依赖这段摘要，看不到原图：\n\
 {DIGEST_BEGIN}\n（在这里写图片摘要）\n{DIGEST_END}\n\
-你仍可以在本轮正常调用工具；摘要与工具调用可以同时输出。原图路径由系统记录，\
-确有需要时可用文件工具重新读取原图。"
+摘要只是中间步骤，绝不能作为本轮回复的结尾：输出完摘要后，你必须继续回答用户本轮\
+提出的实际问题（例如提取图片中的链接、总结界面内容等），并在必要时照常调用工具；\
+最终以对用户问题的完整答复结束本轮。你可以在输出摘要的同时并行作答或调用工具。\
+原图路径由系统记录，确有需要时可用文件工具重新读取原图。"
     )
 }
 
@@ -104,6 +106,21 @@ pub(crate) fn strip_digest_blocks(text: &str) -> String {
         rest = &after_begin[end + DIGEST_END.len()..];
     }
     out
+}
+
+/// Whether a raw model response is "digest-only": it contains a parseable digest
+/// and nothing visible outside the digest blocks. The terminal strips the digest,
+/// so ending the turn on such a response looks like the model was interrupted and
+/// answered nothing. The orchestrator treats it as intermediate and continues the
+/// loop, so the digest replaces the image and the model gets to answer the user's
+/// actual question. Callers must pass the full raw response (assistant text plus
+/// reasoning text): both are parsed for the digest, and the reasoning text alone
+/// may carry the sentinels when the visible text is empty.
+pub(crate) fn is_digest_only_response(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && parse_digest(text).is_some()
+        && strip_digest_blocks(text).trim().is_empty()
 }
 
 /// Whether a content part is an image (image_url).
@@ -393,6 +410,31 @@ mod tests {
             )),
             "mid"
         );
+    }
+
+    #[test]
+    fn digest_only_detection() {
+        // A response that is entirely the digest block counts as digest-only.
+        assert!(is_digest_only_response(&format!(
+            "{DIGEST_BEGIN}\n摘要内容\n{DIGEST_END}"
+        )));
+        // Trailing whitespace outside an otherwise complete digest still counts
+        // as digest-only.
+        assert!(is_digest_only_response(&format!(
+            "{DIGEST_BEGIN}摘要{DIGEST_END}\n\n"
+        )));
+        // Narration outside the digest means the user sees real content -> not
+        // digest-only.
+        assert!(!is_digest_only_response(&format!(
+            "我来看看。{DIGEST_BEGIN}摘要{DIGEST_END}答案是 X"
+        )));
+        // No sentinels at all -> not digest-only.
+        assert!(!is_digest_only_response("普通回复"));
+        // BEGIN without END keeps the body visible -> not digest-only.
+        assert!(!is_digest_only_response(&format!("{DIGEST_BEGIN} 未闭合")));
+        // Empty / blank input is not a digest-only response.
+        assert!(!is_digest_only_response(""));
+        assert!(!is_digest_only_response("   "));
     }
 
     #[test]
