@@ -203,10 +203,65 @@ fn push_citation_base_dir(base_dirs: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+/// Extract the directory from a simple leading `cd <path> && ...` shell prefix.
+/// This deliberately accepts only an unquoted, shell-metacharacter-free operand:
+/// unsupported shell syntax remains unknown rather than adding an invented
+/// citation root. A relative operand is resolved from the command's explicit cwd
+/// when present, otherwise from the turn's effective cwd.
+fn inline_execute_command_cd_dir(command: &str, base: Option<&Path>) -> Option<PathBuf> {
+    let command = command.trim_start_matches(|character| matches!(character, ' ' | '\t' | '\n'));
+    let after_cd = command.strip_prefix("cd")?;
+    if !matches!(after_cd.as_bytes().first(), Some(b' ' | b'\t')) {
+        return None;
+    }
+    let after_cd = after_cd.trim_start_matches(|character| matches!(character, ' ' | '\t'));
+    let (operand, trailing_command) = after_cd.split_once("&&")?;
+    if trailing_command.trim().is_empty() {
+        return None;
+    }
+    let operand = operand.trim_matches(|character| matches!(character, ' ' | '\t'));
+    if operand.is_empty()
+        || operand.chars().any(|character| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '\'' | '"'
+                        | '\\'
+                        | '$'
+                        | '`'
+                        | '~'
+                        | '#'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '['
+                        | ']'
+                        | '*'
+                        | '?'
+                        | ';'
+                        | '|'
+                        | '&'
+                        | '<'
+                        | '>'
+                )
+        })
+    {
+        return None;
+    }
+    let path = Path::new(operand);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        base.map(|base| base.join(path))
+    }
+}
+
 /// Build conservative resolution roots from the current turn's observed tool paths. Models
 /// often cite a basename after reading an absolute file path or running a command from a
 /// subdirectory; validating only against the process cwd incorrectly rejects those citations.
-/// No recursive search is performed: every extra root must come from explicit tool arguments.
+/// No recursive search is performed: every extra root must come from an explicit tool path,
+/// cwd, or a conservatively parsed leading `cd <path> && ...` command prefix.
 pub(in crate::ai::driver::turn_runtime) fn final_citation_base_dirs(
     messages: &[Message],
     effective_cwd: Option<&Path>,
@@ -239,6 +294,20 @@ pub(in crate::ai::driver::turn_runtime) fn final_citation_base_dirs(
                 });
             if let Some(cwd) = &tool_cwd {
                 push_citation_base_dir(&mut base_dirs, cwd.clone());
+            }
+            if tool_call.function.name == "execute_command" {
+                let command_cwd = args
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|command| {
+                        inline_execute_command_cd_dir(
+                            command,
+                            tool_cwd.as_deref().or(effective_cwd),
+                        )
+                    });
+                if let Some(command_cwd) = command_cwd {
+                    push_citation_base_dir(&mut base_dirs, command_cwd);
+                }
             }
             for raw_path in ["file_path", "path"]
                 .into_iter()

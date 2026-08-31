@@ -40,10 +40,10 @@
 //! contract between the compile-time registry and built-in metadata.
 //!
 //! A user override file may omit optional fields to change only part of a
-//! tool's metadata: an absent `groups` / `hidden` inherits from the entry being
-//! replaced (so "just tweak the description" cannot silently detach the tool
-//! from every turn group), while an explicit `groups: []` still means
-//! "deliberately no group membership".
+//! tool's metadata: an absent `parameters` / `groups` / `hidden` inherits from
+//! the entry being replaced (so "just tweak the description" cannot silently
+//! detach the tool from every turn group or wipe its input schema), while an
+//! explicit `groups: []` still means "deliberately no group membership".
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -65,8 +65,13 @@ include!(concat!(env!("OUT_DIR"), "/tool_description_files.rs"));
 struct ToolMetadataFile {
     name: String,
     description: String,
-    #[serde(default = "empty_parameters")]
-    parameters: Value,
+    // Distinguish "field absent" (None) from a declared schema: a user override
+    // that omits the field inherits the entry being replaced instead of
+    // resetting the tool's input schema to the empty default. Built-in files
+    // pass `base = None`, so an absent schema still degrades to the empty
+    // object (the coverage test requires a valid object schema for every
+    // built-in tool).
+    parameters: Option<Value>,
     // Distinguish "field absent" (None) from "declared empty" (Some(vec![])).
     // The coverage test requires the field to be present for every built-in
     // tool; empty is reserved for driver-injected-only tools.
@@ -132,9 +137,15 @@ fn finalize_metadata(
         },
         None => base.map_or(&[][..], |b| b.groups),
     };
+    // Absent `parameters` inherits the replaced entry's schema (built-in files
+    // have `base = None`, so they fall back to the empty object default).
+    let parameters = match file.parameters {
+        Some(parameters) => parameters,
+        None => base.map_or_else(empty_parameters, |b| b.parameters.clone()),
+    };
     Some(ToolMetadata {
         description: file.description,
-        parameters: file.parameters,
+        parameters,
         groups,
         hidden: file.hidden.unwrap_or_else(|| base.map_or(false, |b| b.hidden)),
     })
@@ -343,12 +354,13 @@ mod tests {
     #[test]
     fn user_override_inherits_optional_fields_when_omitted() {
         // A user override file that only tweaks `description` must keep the
-        // replaced entry's `groups` / `hidden`; otherwise the tool would
-        // silently detach from every turn group (empty membership).
+        // replaced entry's `parameters` / `groups` / `hidden`; otherwise the
+        // tool would silently detach from every turn group (empty membership)
+        // or lose its input schema (empty object).
         let base_json = r#"{
             "name": "read_file",
             "description": "base description",
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
             "groups": ["builtin", "core"],
             "hidden": true
         }"#;
@@ -359,7 +371,8 @@ mod tests {
         )
         .unwrap();
 
-        // Override omits `groups` and `hidden` -> inherit both from the base.
+        // Override omits `parameters`, `groups` and `hidden` -> inherit all
+        // three from the base.
         let override_json = r#"{
             "name": "read_file",
             "description": "overridden description"
@@ -371,14 +384,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(merged.description, "overridden description");
+        assert_eq!(merged.parameters, base.parameters);
+        assert!(merged.parameters["properties"].get("path").is_some());
         assert_eq!(merged.groups, &[ToolGroup::Builtin, ToolGroup::Core][..]);
         assert!(merged.hidden);
 
-        // Explicit `groups: []` still means "no membership", and explicit
+        // An explicit `parameters` schema wins over the base; explicit
+        // `groups: []` still means "no membership", and explicit
         // `hidden: false` un-hides, regardless of the base.
         let detach_json = r#"{
             "name": "read_file",
             "description": "explicitly detached",
+            "parameters": {"type": "object", "properties": {}},
             "groups": [],
             "hidden": false
         }"#;
@@ -388,6 +405,7 @@ mod tests {
             "test:detach",
         )
         .unwrap();
+        assert!(detached.parameters["properties"].get("path").is_none());
         assert!(detached.groups.is_empty());
         assert!(!detached.hidden);
     }
@@ -395,8 +413,9 @@ mod tests {
     #[test]
     fn user_override_dir_inherits_groups_via_base_lookup() {
         // End-to-end for `load_user_dir`: a real override file that omits
-        // `groups` must inherit from the entry it replaces (looked up by its
-        // inner name), not silently detach from every turn group.
+        // `parameters` / `groups` must inherit from the entry it replaces
+        // (looked up by its inner name), not silently detach from every turn
+        // group or wipe the tool's input schema.
         let dir = std::env::temp_dir().join(format!(
             "tool_metadata_override_test_{}_{}",
             std::process::id(),
@@ -414,12 +433,20 @@ mod tests {
         .unwrap();
 
         let mut metadata = load_builtin_metadata();
+        let builtin_parameters = metadata
+            .get("read_file")
+            .expect("built-in read_file present")
+            .parameters
+            .clone();
         load_user_dir(&dir, &mut metadata);
 
         let entry = metadata.get("read_file").expect("read_file present");
         assert_eq!(entry.description, "overridden description only");
-        // Inherited from the built-in entry, so the tool stays resident.
+        // Inherited from the built-in entry, so the tool stays resident and
+        // keeps its real input schema instead of the empty-object default.
         assert!(entry.groups.contains(&ToolGroup::Core));
+        assert_eq!(entry.parameters, builtin_parameters);
+        assert_ne!(entry.parameters, empty_parameters());
 
         std::fs::remove_dir_all(&dir).ok();
     }

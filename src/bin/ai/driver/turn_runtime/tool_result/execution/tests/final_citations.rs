@@ -127,6 +127,78 @@ fn final_citation_resolves_basename_from_observed_tool_path() {
 }
 
 #[test]
+fn final_citation_gate_accepts_relative_paths_from_inline_cd_command() {
+    let root = std::env::temp_dir().join(format!(
+        "final-citation-inline-cd-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let repository = root.join("dataagent_be");
+    let session_state_store = repository.join("aida/core/session_state_store.py");
+    let upload_file_service = repository
+        .join("aeolus_llm/tests/service/deep_research/agent/test_agent_upload_file_service.py");
+    fs::create_dir_all(session_state_store.parent().unwrap()).unwrap();
+    fs::create_dir_all(upload_file_service.parent().unwrap()).unwrap();
+    fs::write(&session_state_store, "line\n".repeat(46)).unwrap();
+    fs::write(&upload_file_service, "line\n".repeat(1_759)).unwrap();
+
+    let command = format!("cd {} && rg -n session_state_store", repository.display());
+    let mut messages = vec![
+        assistant_tool_call_message(test_tool_call(
+            "call_command",
+            "execute_command",
+            serde_json::json!({ "command": command }),
+        )),
+        assistant_tool_call_message(test_tool_call(
+            "call_first_read",
+            "read_file",
+            serde_json::json!({ "file_path": session_state_store }),
+        )),
+        assistant_tool_call_message(test_tool_call(
+            "call_second_read",
+            "read_file",
+            serde_json::json!({ "file_path": upload_file_service }),
+        )),
+    ];
+    let final_text = "See aida/core/session_state_store.py:46 and \
+                      aeolus_llm/tests/service/deep_research/agent/test_agent_upload_file_service.py:1759.";
+    let base_dirs = final_citation_base_dirs(&messages, Some(&root));
+
+    assert!(base_dirs.contains(&repository));
+    assert!(unvalidated_final_response_citations_with_bases(final_text, &base_dirs).is_empty());
+    assert_eq!(
+        final_response_citation_gate_action(&mut messages, final_text, Some(&root), false, 16, 16,),
+        FinalCitationGateAction::Allow
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn inline_execute_command_cd_dir_rejects_newlines_and_shell_comments() {
+    for command in [
+        "cd\n/tmp/repository && rg -n citation",
+        "cd \n/tmp/repository && rg -n citation",
+    ] {
+        let messages = vec![assistant_tool_call_message(test_tool_call(
+            "call_command",
+            "execute_command",
+            serde_json::json!({ "command": command }),
+        ))];
+        assert!(
+            !final_citation_base_dirs(&messages, None).contains(&std::path::PathBuf::from("/tmp/repository"))
+        );
+    }
+
+    let root = std::path::PathBuf::from("/tmp/final-citation-inline-cd-comment");
+    let messages = vec![assistant_tool_call_message(test_tool_call(
+        "call_comment",
+        "execute_command",
+        serde_json::json!({ "command": "cd #&& ignored" }),
+    ))];
+    assert!(!final_citation_base_dirs(&messages, Some(&root)).contains(&root.join("#")));
+}
+
+#[test]
 fn final_response_citation_gate_reopens_once_then_warns_for_an_invalid_line() {
     let root = std::env::temp_dir().join(format!(
         "final-citation-gate-{}",
