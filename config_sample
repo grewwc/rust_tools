@@ -1,0 +1,51 @@
+# aliyun_ak = "<your-aliyun-secret>"
+aliyun_secret = "<your-aliyun-secret>"
+api_key = "<your-api-key>"
+
+# ai.intent_model='deepseek-v4-flash-free'
+opencode.api_key_grewwc = "<your-opencode-key>"  # grewwc
+opencode.api_key = "<your-opencode-key>"
+# opencode.api_key_mamawwc_v1 = "<your-opencode-key>" # mamawwc
+
+volcano.api_key = <your-volcano-key>
+
+ida-dev.api_key = "<your-ida-dev-key>"
+
+
+# ai.model.default = mimo-v2.5-free-opencode 
+# ai.model.default="qwen3.7-plus"
+# ai.model.default="qwen3.6-plus"
+# ai.model.default="nemotron-3-super-free"
+# ai.model.default = "deepseek-v4-pro"
+# ai.model.default = "qwen3.7-max"
+# ai.model.default="glm-5.2-alibaba"
+# ai.model.default="glm-5.2-opencode"
+# ai.model.default="deepseek-v4-flash-opencode"
+ ai.model.default="deepseek-v4-flash-volcano"
+#  ai.model.default = mimo-v2.5-free-opencode 
+# ai.model.default = glm-5.2-volcano
+# ai.model.default="deepseek-v4-flash-alibaba"
+#  ai.model.default="deepseek-v4-flash-opencode-free"
+# ai.model.default="minimax-m2.5"
+# ai.model.default="claude-haiku-4.5"
+# ai.model.default="gpt-5.4-pro"
+# ai.model.default="qwen3.6-plus"
+# ai.model.default="qwen3-max"
+
+
+special.tags = "固化"
+re.remote.host = 10.37.110.250
+
+ai.embedding.api_key = <your-volcano-key>
+feishu.app_id = cli_a93c49d60678dcbb
+feishu.app_secret = "<your-feishu-app-secret>"
+
+
+ai.subagent.model_inherit=1
+ai.embedding.enable = true
+ai.embedding.endpoint = https://ark.cn-beijing.volces.com/api/coding/v3/embeddings
+ai.embedding.model = doubao-embedding-vision
+
+
+ai.output.postprocess_command = python3 /path/to/rust_tools/scripts/postprocess_term
+inal.py
