@@ -353,8 +353,9 @@ fn config_extra_sensitive_substrings() -> Vec<String> {
 }
 
 /// Compute the effective writable root set: use `ai.sandbox.allowed_roots` when non-empty;
-/// fall back to `effective_cwd()` when empty (default). The session temp dir and user skills dir
-/// (`ai.skills.dir`, default `~/.config/rust_tools/skills`) are always appended as writable roots.
+/// fall back to `effective_cwd()` when empty (default). The session temp dir, user skills dir
+/// (`ai.skills.dir`, default `~/.config/rust_tools/skills`), and the rust_tools user config dir
+/// (default `~/.config/rust_tools`) are always appended as writable roots.
 /// The result feeds both the write-permission check and the writable-path suggestions in "write denied" errors, keeping them from drifting apart.
 fn configured_write_roots(base: &Path) -> Vec<PathBuf> {
     let raw = crate::commonw::configw::get_all_config().get(
@@ -389,6 +390,17 @@ fn configured_write_roots(base: &Path) -> Vec<PathBuf> {
     };
     if !roots.iter().any(|r| skills.starts_with(r)) {
         roots.push(skills);
+    }
+    // The rust_tools user config dir (default ~/.config/rust_tools) is always writable:
+    // the model needs write_file / apply_patch to create and maintain user-supplied
+    // per-project instruction files (~/.config/rust_tools/<project>/agents.md) and other
+    // user config, so the sandbox must not block it.
+    if let Some(config_dir) = crate::commonw::utils::get_config_dir().map(|d| d.join("rust_tools"))
+    {
+        let config_dir = normalize_lexical(&config_dir);
+        if !roots.iter().any(|r| config_dir.starts_with(r)) {
+            roots.push(config_dir);
+        }
     }
     roots
 }
@@ -738,6 +750,22 @@ mod tests {
         assert!(
             path_within_allowed_roots(&target),
             "skills dir path must be within allowed write roots: {}",
+            target.display()
+        );
+    }
+
+    #[test]
+    fn rust_tools_config_dir_is_always_writable() {
+        // The rust_tools user config dir (default ~/.config/rust_tools) must stay writable even when
+        // outside effective_cwd / allowed_roots: the model needs write_file / apply_patch to create
+        // and maintain per-project instruction files (~/.config/rust_tools/<project>/agents.md).
+        let config_dir = crate::commonw::utils::get_config_dir()
+            .expect("HOME must be set in the test env")
+            .join("rust_tools");
+        let target = config_dir.join(format!("sandbox-test-{}.txt", uuid::Uuid::new_v4()));
+        assert!(
+            path_within_allowed_roots(&target),
+            "rust_tools config dir path must be within allowed write roots: {}",
             target.display()
         );
     }

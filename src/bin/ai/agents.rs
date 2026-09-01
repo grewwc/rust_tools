@@ -33,6 +33,8 @@ const BUILTIN_AGENTS: &[(&str, &str)] = &[
 ];
 const PROJECT_INSTRUCTION_FILENAMES: &[&str] = &[
     "AGENTS.md",
+    "Agents.md",
+    "agents.md",
     "Agent.md",
     "agent.md",
     "CLAUDE.md",
@@ -657,10 +659,35 @@ fn project_instruction_search_scope(cwd: &Path) -> Vec<PathBuf> {
                 .rposition(|dir| has_project_instruction_doc(dir))
         });
 
-    match boundary {
+    let mut scope = match boundary {
         Some(idx) => ancestors[..=idx].iter().rev().cloned().collect(),
         None => vec![cwd.to_path_buf()],
+    };
+
+    // User-supplied per-project instructions: `~/.config/rust_tools/<project-name>/`
+    // (AGENTS.md / agents.md / ...), where `<project-name>` is the leaf name of the project
+    // root. Insert right after the project root so these are treated as project-level docs
+    // (loaded before deeper repo-local files and not starved by the total instruction budget).
+    let project_root = scope.first().map(PathBuf::as_path).unwrap_or(cwd);
+    if let Some(cfg_dir) = project_config_instruction_dir(project_root)
+        && !scope.iter().any(|dir| dir == &cfg_dir)
+    {
+        scope.insert(1, cfg_dir);
     }
+
+    scope
+}
+
+/// User config instruction dir for a project: `~/.config/rust_tools/<project-name>/`.
+/// Returns None when the leaf name of `project_root` is unusable or the config dir cannot
+/// be derived (no HOME).
+fn project_config_instruction_dir(project_root: &Path) -> Option<PathBuf> {
+    let project_name = project_root.file_name()?.to_str()?;
+    if project_name.is_empty() {
+        return None;
+    }
+    let config_root = crate::commonw::utils::get_config_dir()?.join("rust_tools");
+    Some(config_root.join(project_name))
 }
 
 fn has_project_root_marker(dir: &Path) -> bool {

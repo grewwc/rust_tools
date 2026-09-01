@@ -3,8 +3,9 @@ use super::{
     load_scoped_project_instruction_docs_for_target_priority_from,
     load_scoped_project_instruction_docs_for_targets_from, parse_agent_front_matter,
 };
+use crate::ai::test_support::ENV_LOCK;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -19,6 +20,20 @@ fn temp_dir(name: &str) -> PathBuf {
         nanos
     ));
     path
+}
+
+/// Run `f` with HOME redirected to `fake_home` (so `get_config_dir()` resolves under the
+/// temp tree instead of the real user config), then restore the original value. Tests that
+/// touch the user-config instruction dir must hold `ENV_LOCK` (HOME is process-global).
+fn with_fake_home<T>(fake_home: &Path, f: impl FnOnce() -> T) -> T {
+    let old_home = std::env::var_os("HOME");
+    unsafe { std::env::set_var("HOME", fake_home) };
+    let result = f();
+    match old_home {
+        Some(value) => unsafe { std::env::set_var("HOME", value) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+    result
 }
 
 #[test]
@@ -171,6 +186,154 @@ fn project_instruction_docs_fall_back_to_doc_ancestors_without_repo_markers() {
     assert_eq!(docs.len(), 1);
     assert!(docs[0].path.ends_with("claude.md"));
     assert!(docs[0].content.contains("Prefer make targets."));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_instruction_docs_include_user_config_dir_for_project() {
+    // `~/.config/rust_tools/<project-name>/agents.md` must be loaded exactly like the
+    // repo-root instruction docs, keyed by the leaf name of the project root.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let root = temp_dir("project_cfg_docs");
+    let nested = root.join("packages/app/src");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(root.join("AGENTS.md"), "# Root rules\n").unwrap();
+
+    // Fake HOME so get_config_dir() resolves under <root>/home/.config.
+    let fake_home = root.join("home");
+    let project_name = root.file_name().unwrap().to_string_lossy().into_owned();
+    let config_dir = fake_home
+        .join(".config")
+        .join("rust_tools")
+        .join(&project_name);
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("agents.md"), "# User project rules\n").unwrap();
+
+    let docs = with_fake_home(&fake_home, || load_project_instruction_docs_from(&nested));
+
+    let user_doc = docs
+        .iter()
+        .find(|doc| doc.path.ends_with("agents.md") && doc.content.contains("User project rules"));
+    assert!(
+        user_doc.is_some(),
+        "user config agents.md must be loaded for the project, got docs: {:?}",
+        docs.iter().map(|d| &d.path).collect::<Vec<_>>()
+    );
+    assert!(
+        user_doc.is_some_and(|doc| doc.path.contains("rust_tools")),
+        "config doc path must live under the config dir: {:?}",
+        user_doc.map(|d| &d.path)
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_instruction_docs_cache_invalidates_on_user_config_change() {
+    // The cache fingerprint covers every file in the search scope, including the user
+    // config instruction dir (~/.config/rust_tools/<project>/agents.md); rewriting that
+    // file must invalidate the cache exactly like a repo-root AGENTS.md change.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let root = temp_dir("project_cfg_cache");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("AGENTS.md"), "# Root rules\n").unwrap();
+
+    let fake_home = root.join("home");
+    let project_name = root.file_name().unwrap().to_string_lossy().into_owned();
+    let config_dir = fake_home
+        .join(".config")
+        .join("rust_tools")
+        .join(&project_name);
+    fs::create_dir_all(&config_dir).unwrap();
+    let cfg_md = config_dir.join("agents.md");
+    fs::write(&cfg_md, "cfg-v1: use pnpm.\n").unwrap();
+
+    let first = with_fake_home(&fake_home, || load_project_instruction_docs_from(&root));
+    assert!(
+        first.iter().any(|doc| doc.content.contains("cfg-v1")),
+        "first load must include the user config doc, got: {:?}",
+        first.iter().map(|d| &d.path).collect::<Vec<_>>()
+    );
+
+    // Rewrite only the config file: the mtime advances and the length changes, so the
+    // fingerprint mismatch must force a reload even though the repo-root files are unchanged.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(&cfg_md, "cfg-v2: use cargo and longer content for len change.\n").unwrap();
+
+    let after = with_fake_home(&fake_home, || load_project_instruction_docs_from(&root));
+    assert!(
+        after.iter().any(|doc| doc.content.contains("cfg-v2")),
+        "cache must invalidate when the user config instruction file changes, got: {:?}",
+        after.iter().map(|d| &d.path).collect::<Vec<_>>()
+    );
+    assert!(
+        !after.iter().any(|doc| doc.content.contains("cfg-v1")),
+        "stale user config content must not survive a cache miss"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_instruction_docs_do_not_load_other_projects_config_dir() {
+    // The config dir is keyed by the leaf name of the *current* project root; instructions
+    // stored under a different project's config dir must never leak into this project.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let root = temp_dir("project_cfg_negative");
+    let fake_home = root.join("home");
+    let cfg_other = fake_home
+        .join(".config")
+        .join("rust_tools")
+        .join("other_project");
+    fs::create_dir_all(&cfg_other).unwrap();
+    fs::write(cfg_other.join("agents.md"), "# Other project rules\n").unwrap();
+
+    let project = root.join("current_project");
+    fs::create_dir_all(project.join(".git")).unwrap();
+    fs::write(project.join("AGENTS.md"), "# Current project rules\n").unwrap();
+
+    let docs = with_fake_home(&fake_home, || load_project_instruction_docs_from(&project));
+    assert_eq!(
+        docs.len(),
+        1,
+        "other project's config docs must not load, got: {:?}",
+        docs.iter().map(|d| &d.path).collect::<Vec<_>>()
+    );
+    assert!(docs[0].content.contains("Current project rules"));
+    assert!(
+        !docs.iter().any(|doc| doc.content.contains("Other project rules")),
+        "config instructions for a different project must not be loaded"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_instruction_docs_without_home_skip_user_config_dir() {
+    // With HOME unset, get_config_dir() yields nothing, so the user config dir must be
+    // skipped entirely: only the repo-root docs load, without a panic or a bogus path.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let root = temp_dir("project_docs_no_home");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("AGENTS.md"), "# Root rules\n").unwrap();
+
+    let old_home = std::env::var_os("HOME");
+    unsafe { std::env::remove_var("HOME") };
+    let docs = load_project_instruction_docs_from(&root);
+    match old_home {
+        Some(value) => unsafe { std::env::set_var("HOME", value) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+
+    assert_eq!(
+        docs.len(),
+        1,
+        "only the repo-root AGENTS.md must load without HOME, got: {:?}",
+        docs.iter().map(|d| &d.path).collect::<Vec<_>>()
+    );
+    assert!(docs[0].content.contains("Root rules"));
 
     let _ = fs::remove_dir_all(root);
 }
