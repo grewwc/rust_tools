@@ -28,7 +28,7 @@ the nearest child `AGENTS.md`.
 
 ## Session storage & sessionid debugging
 
-Sessions are the unit of conversation persistence; ids are UUID-shaped (36 chars) by construction.
+Sessions are the unit of conversation persistence; IDs are not restricted to UUIDs.
 
 - **Sessions root**: `<parent>/<file-stem>.sessions` next to the history file (default
   `~/.history_file.sessions`); derive it via `SessionStore::new(&history_file).sessions_root()`.
@@ -64,7 +64,8 @@ Sessions are the unit of conversation persistence; ids are UUID-shaped (36 chars
     `driver/turn_runtime/finalize.rs`. It is strictly best-effort (any failure
     shows the original text) and never mutates canonical history. Repo ships
     `scripts/postprocess_terminal.py` (Chinese punctuation inside code /
-    file-location contexts -> ASCII) as a ready-made filter.
+    file-location contexts -> ASCII, plus fullwidth parens in prose) as a
+    ready-made filter.
 
 ## Scoped guides
 

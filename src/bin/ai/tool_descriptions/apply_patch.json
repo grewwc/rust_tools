@@ -10,7 +10,7 @@
       },
       "patch": {
         "type": "string",
-        "description": "The inline edit. Use one format: (A) `*** Begin Patch` with `*** Replace in line: <absolute/path>` plus `anchor:`, `old:`, and `new:`; (B) a `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:` (`+`-prefixed content), or bodyless `*** Delete File:` sections and `@@` hunks; or (C) a unified diff identified by `file_path`, `---`/`+++`, or `diff --git` headers. Multi-file unified diffs are split automatically; unified diffs cannot delete files. Copy source exactly without `read_file` line prefixes; context and removed lines must match, including indentation. Do not use Markdown fences, mix formats, or send a no-op. Limit: 8000 characters (`patch_file`: 64000). Split larger edits; batch hunks only with unique context, and patch repeated structures separately."
+        "description": "The inline edit. Use one format:\n(A) `*** Begin Patch` with `*** Replace in line: <absolute/path>` plus `anchor:`, `old:`, and `new:`.\n(B) A `*** Begin Patch` envelope with `*** Update File:`, `*** Add File:` (`+`-prefixed content), or bodyless `*** Delete File:` sections and `@@` hunks.\n(C) A unified diff identified by `file_path`, `---`/`+++`, or `diff --git` headers.\n\nRules:\n- Multi-file unified diffs are split automatically; unified diffs cannot delete files.\n- Copy source exactly without `read_file` line prefixes; context and removed lines must match, including indentation.\n- Do not use Markdown fences, mix formats, or send a no-op.\n- Limit: 8000 characters (`patch_file`: 64000).\n- Split larger edits; batch hunks only with unique context, and patch repeated structures separately."
       },
       "patch_file": {
         "type": "string",

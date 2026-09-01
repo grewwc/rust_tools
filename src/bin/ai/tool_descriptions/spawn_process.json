@@ -14,7 +14,7 @@
       },
       "priority": {
         "type": "integer",
-        "description": "Process priority 0-255 (0=highest, 255=lowest). Default 10."
+        "description": "Process scheduling priority 0-255 (0=highest, 255=lowest). Default 10. Lower = more urgent; opposite direction of knowledge_save priority."
       },
       "quota_turns": {
         "type": "integer",

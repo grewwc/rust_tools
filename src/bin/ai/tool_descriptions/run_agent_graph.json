@@ -15,7 +15,7 @@
           "status",
           "cancel"
         ],
-        "description": "Operation to perform. start requires mode, question, and the matching graph definition; advance, status, and cancel require graph_id. Call advance until the graph is terminal."
+        "description": "Operation. start requires mode, question, and `static_graph` or `dynamic_graph` matching mode; advance, status, and cancel require graph_id. Call advance until the graph is terminal."
       },
       "graph_id": {
         "type": "string",
@@ -137,7 +137,7 @@
                 },
                 "condition": {
                   "type": "object",
-                  "description": "Optional gate evaluated after the predecessor finishes. Defaults to always.",
+                  "description": "Optional gate. Omit for always; on_success runs only after a completed predecessor, on_failure only after a failed predecessor, output_contains requires text, and json_pointer_equals requires pointer and value.",
                   "required": [
                     "kind"
                   ],
@@ -151,18 +151,18 @@
                         "output_contains",
                         "json_pointer_equals"
                       ],
-                      "description": "Gate type. output_contains uses text; json_pointer_equals uses pointer and value."
+                      "description": "Gate type."
                     },
                     "text": {
                       "type": "string",
-                      "description": "Substring required in the predecessor output for output_contains."
+                      "description": "Required when kind is output_contains: substring in the predecessor output."
                     },
                     "pointer": {
                       "type": "string",
-                      "description": "JSON Pointer into the predecessor output for json_pointer_equals."
+                      "description": "Required when kind is json_pointer_equals: JSON Pointer into the predecessor output."
                     },
                     "value": {
-                      "description": "Expected JSON value for json_pointer_equals."
+                      "description": "Required when kind is json_pointer_equals: expected JSON value."
                     }
                   }
                 }

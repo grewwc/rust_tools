@@ -1,6 +1,6 @@
 {
   "name": "knowledge_semantic_search",
-  "description": "Search saved knowledge by meaning; falls back to keyword search without embeddings.",
+  "description": "Search saved knowledge by semantic similarity. Requires an embedding provider; if embeddings are unavailable, this tool returns an error. Use `knowledge_search` for keyword search.",
   "parameters": {
     "type": "object",
     "properties": {

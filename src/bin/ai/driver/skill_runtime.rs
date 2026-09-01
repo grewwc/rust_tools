@@ -1163,6 +1163,13 @@ fn build_system_prompt(
         ContextKind::Behavior,
         include_str!("system_prompts/correctness_guardrails.md"),
     );
+    // Intellectual honesty: evidence-earned agreement and respectful pushback
+    // against wrong or inappropriate user premises. Unconditional — it applies
+    // in every mode and is never relaxed by a skill or goal.
+    b.push(
+        ContextKind::Behavior,
+        include_str!("system_prompts/intellectual_honesty.md"),
+    );
 
     // ── System constraints: implementing a requirement must not break other modules ──
     // Unconditionally rendered regression red line: no change may sacrifice
@@ -1452,7 +1459,7 @@ fn build_system_prompt(
                 "Do NOT use `write_file(temp=true)` on existing project files; reserve `write_file` without `temp` for genuine full rewrites (localized edits go through `apply_patch`).".to_string(),
             );
             lines.push(
-                "When one file needs several localized edits, read the relevant span once and make ONE `apply_patch` call with multiple `@@` hunks in a single `*** Update File:` section — only when every hunk has a unique anchor (distinct surrounding context). For several files, use one Begin Patch envelope with one section per target. Do not split related edits into serial read/patch cycles unless a previous patch failed or a later edit truly depends on the earlier edit's result. For structurally similar blocks (e.g. repeated closures with identical bodies), apply one at a time, each hunk with a distinctive anchor line (function name or comment). Keep each patch under ~4KB: split large edits into multiple apply_patch calls, or write the patch to a temp file and pass `patch_file`.".to_string(),
+                "When one file needs several localized edits, read the relevant span once and make ONE `apply_patch` call with multiple `@@` hunks in a single `*** Update File:` section — only when every hunk has a unique anchor (distinct surrounding context). For several files, use one Begin Patch envelope with one section per target. Do not split related edits into serial read/patch cycles unless a previous patch failed or a later edit truly depends on the earlier edit's result. For structurally similar blocks (e.g. repeated closures with identical bodies), apply one at a time, each hunk with a distinctive anchor line (function name or comment). Keep each patch well under the size limit: split large edits into multiple apply_patch calls, or write the patch to a temp file and pass `patch_file`.".to_string(),
             );
         } else {
             lines.push(
@@ -2611,6 +2618,38 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_resists_sycophancy() {
+        // The intellectual-honesty block must render for every session: the
+        // model must earn agreement by evidence, not grant it because the user
+        // holds the view. Assert it is present on the default interactive path,
+        // in goal mode, and on a skill turn (no mode may drop it).
+        let available = SkipSet::new(16);
+        let default_prompt =
+            build_system_prompt(None, &[], &Box::new(available.clone()), &PromptContext::default())
+                .render_system_prompt();
+        assert!(default_prompt.contains("<intellectual_honesty>"));
+        assert!(default_prompt.contains(
+            "Agreement must be earned by the facts, not granted because the user holds the view"
+        ));
+        assert!(default_prompt.contains("say so directly and respectfully"));
+
+        let goal_ctx = PromptContext {
+            goal_mode: Some("ship the feature".to_string()),
+            is_background: false,
+        };
+        let goal_prompt =
+            build_system_prompt(None, &[], &Box::new(available.clone()), &goal_ctx)
+                .render_system_prompt();
+        assert!(goal_prompt.contains("<intellectual_honesty>"));
+
+        let skill = skill("demo", "a demo skill");
+        let skill_prompt =
+            build_system_prompt(None, &[&skill], &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+        assert!(skill_prompt.contains("<intellectual_honesty>"));
+    }
+
+    #[test]
     fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
         // Regression: the non-goal Scope Discipline block once dropped the
         // `\n\` line-continuation on two bullets, baking ~13 spaces of source
@@ -2626,7 +2665,7 @@ mod tests {
         assert!(prompt
             .contains("\n- Investigate the user's explicit request plus only the direct dependencies"));
         assert!(prompt
-            .contains("\n- Do not implement refactors or optimizations unrelated to the task;"));
+            .contains("\n- Do not implement refactors or optimizations unrelated to the task."));
         assert!(prompt.contains("\n- For broad requests, define investigation boundaries"));
         // Guard against the exact defect: no bullet prefixed by leading spaces.
         assert!(!prompt.contains("\n             - Do not implement refactors"));

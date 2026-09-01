@@ -20,7 +20,7 @@
           "status",
           "cancel"
         ],
-        "description": "Operation to perform. create requires name and goal; add_task requires team_id and task; claim requires team_id and member_id; complete requires team_id, task_id, member_id, and status; send_message requires team_id, from, to, and body; all other non-create actions require team_id."
+        "description": "Operation. create requires name, goal, and members; add_task requires team_id and task; claim requires team_id and member_id; complete requires team_id, task_id, member_id, and status; send_message requires team_id, from, to, and body; all other non-create actions require team_id."
       },
       "team_id": {
         "type": "string",
@@ -39,8 +39,9 @@
       },
       "members": {
         "type": "array",
+        "minItems": 1,
         "maxItems": 32,
-        "description": "Optional member definitions for create (maximum 32).",
+        "description": "Member definitions for create (1 to 32 required when action is create).",
         "items": {
           "type": "object",
           "required": [

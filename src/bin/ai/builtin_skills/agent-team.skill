@@ -37,13 +37,10 @@ A worker branch must be sized to its own bounded turn budget: the default subage
 ## Orchestration strategy
 
 1. Start with the smallest useful decomposition. Preserve shared discovery, product decisions, conflicting edits, and final synthesis in the parent.
-2. For one focused delegated branch whose result is needed before proceeding, use `task`.
-3. For two or more independent branches, dispatch them together with `task_spawn_batch` (at most 8 tasks per call); then continue productive parent work while they run. Do not serialize spawn-and-wait cycles.
-4. Use `manage_team` only for durable, dependency-aware multi-phase work where named roles, task ownership, messaging, or resumable orchestration add real value.
-5. Use `run_agent_graph` only when an explicit DAG, reducer, conditional path, or structured multi-perspective pooling is materially better than ordinary task delegation.
-6. Do not delegate from a subagent. Subagents are leaf workers; the parent owns orchestration.
-
-Note: this skill's resident tool set is `[core, task, agent_team]` — task-family delegation/orchestration tools plus the `agent_team` group (`manage_team`, `run_agent_graph`); `send_side_note` is included via the `task` group. Other lazy builtin tools stay unloaded; enable on demand with `enable_tools`.
+2. Use ordinary task delegation for bounded workers. Use `task_spawn_batch` only when independent branches can make progress concurrently. Follow the runtime task-tool guidance for spawning, waiting, cancellation, inheritance, and result integration.
+3. Use `manage_team` only for durable, dependency-aware multi-phase work where named roles, task ownership, messaging, or resumable orchestration add real value.
+4. Use `run_agent_graph` only when an explicit DAG, reducer, conditional path, or structured multi-perspective pooling is materially better than ordinary task delegation.
+5. Do not delegate from a subagent. Subagents are leaf workers; the parent owns orchestration.
 
 ## Subagent contract
 
@@ -55,16 +52,11 @@ Every delegated prompt must be self-contained and include:
 - required invariants and edge cases;
 - the expected result format: concise conclusion, key evidence paths/lines or commands, changes made if any, remaining uncertainty, and recommended verification.
 
-Use focused inheritance: prefer `inherit="none"` for isolated research and `inherit="cwd"` for repository work. Use `inherit="all"` only when the branch genuinely depends on conversation history, memory, and active skills. Avoid copying broad context into every worker.
-
 ## Parent responsibilities
 
 - Keep overlapping writes and consequential decisions centralized. Parallel writers must have disjoint files or explicitly non-overlapping ownership.
 - Treat subagent output as evidence to review, not authority. Double-check decision-bearing claims and inspect edits before accepting them.
-- Integrate every delivered task result with `task_integrate`; explicitly reject or supersede results that are not used.
-- Use `task_status` before finishing to ensure no task is silently abandoned. Use `task_cancel` for obsolete or stuck work, and collect its terminal result.
-- When no useful parent work remains, collect results with `task_wait`: keep per-call budgets short (default 30s, hard max 60s). A budget-elapsed timeout does not cancel workers — re-call with the same task_ids to collect ready results; prefer `wait_policy="any"` to resume on the first useful result.
-- Use `task_evidence_read` after timeouts or ambiguous progress when the durable checkpoint can resolve the next action; use `task_retry` only after diagnosing a terminal failed, timed-out, or cancelled attempt.
+- Follow the runtime task-tool guidance for integration, status, waiting, cancellation, evidence recovery, and retries.
 - Synthesize one coherent final answer. Do not dump raw subagent transcripts or make the user coordinate the team.
 
 ## Anti-patterns
@@ -74,7 +66,5 @@ Do not:
 - split trivial work into ceremonial subtasks;
 - delegate several versions of the same tightly coupled edit;
 - use subagents only because the conversation is long or a tool call failed;
-- spawn a lone async task and immediately wait when synchronous `task` is available;
-- wait while useful parent work remains;
 - ask workers for exhaustive logs or large source excerpts when a compact evidence-backed result is enough;
 - accept a consensus of weakly grounded answers as verification.

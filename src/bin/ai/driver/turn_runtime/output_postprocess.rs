@@ -6,7 +6,8 @@
 //! `render_markdown_block`. This lets users fix cosmetic issues in the
 //! terminal echo without touching canonical history (e.g.
 //! `scripts/postprocess_terminal.py`, which converts Chinese punctuation
-//! inside code / file-location contexts to ASCII).
+//! inside code / file-location contexts (and fullwidth parentheses in
+//! prose) to ASCII).
 //!
 //! The filter is strictly best-effort: any failure (empty command, missing
 //! python, non-zero exit, non-UTF8 output) falls back to the original text so

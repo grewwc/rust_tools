@@ -1,8 +1,9 @@
 //! Semantic knowledge search tools backed by the embedding vector index.
 //!
-//! `knowledge_semantic_search` runs hybrid (BM25 + semantic) or pure semantic
-//! search over durable knowledge. `knowledge_rebuild_index` forces an index
-//! rebuild, which is required after changing the embedding model.
+//! `knowledge_semantic_search` searches durable knowledge with semantic ranking,
+//! optionally combined with BM25; both modes require an embedding provider.
+//! `knowledge_rebuild_index` forces an index rebuild after the embedding model
+//! changes.
 
 use serde_json::Value;
 

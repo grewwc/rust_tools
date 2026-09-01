@@ -1,6 +1,6 @@
 {
   "name": "write_file",
-  "description": "Write content to a file, replacing its entire contents (no append, no merge); returns the absolute path. temp=true writes a relative filename under the per-session temp dir; otherwise use an absolute or working-directory-relative path. Prefer apply_patch to modify existing files.",
+  "description": "Write content to a file, replacing its entire contents (no append, no merge); returns the absolute path. temp=true writes a relative filename under the per-session temp dir; otherwise use an absolute or working-directory-relative path.",
   "parameters": {
     "type": "object",
     "properties": {

@@ -47,5 +47,4 @@ ai.embedding.endpoint = https://ark.cn-beijing.volces.com/api/coding/v3/embeddin
 ai.embedding.model = doubao-embedding-vision
 
 
-ai.output.postprocess_command = python3 /path/to/rust_tools/scripts/postprocess_term
-inal.py
+ai.output.postprocess_command = python3 /path/to/rust_tools/scripts/postprocess_terminal.py

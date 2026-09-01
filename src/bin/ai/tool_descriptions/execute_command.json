@@ -18,7 +18,7 @@
       },
       "pty": {
         "type": "boolean",
-        "description": "Required. Use true for interactive CLIs (prompts, QR codes, full-screen UI), false otherwise. Keyboard input is not forwarded. Blocking interactive commands are stopped after about 10-20 seconds of silence and return partial output; prefer non-blocking or headless flags."
+        "description": "Use true for interactive CLIs (prompts, QR codes, full-screen UI), false otherwise. Keyboard input is not forwarded. Blocking interactive commands are stopped after about 10-20 seconds of silence and return partial output; prefer non-blocking or headless flags."
       }
     },
     "required": [

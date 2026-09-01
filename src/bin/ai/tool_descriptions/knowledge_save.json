@@ -25,7 +25,7 @@
       },
       "priority": {
         "type": "integer",
-        "description": "Priority 0-255. 255=permanent, 100-200=high, 50-99=normal, 0-49=low. Default follows category: `user_memory`=150, guideline categories=210, `safety_rules`=255."
+        "description": "Priority 0-255 (255=permanent, 100-200=high, 50-99=normal, 0-49=low). Default follows category: `user_memory`=150, guideline categories=210, `safety_rules`=255. Higher = more durable; opposite direction of spawn_process/spawn_daemon priority."
       }
     },
     "required": [

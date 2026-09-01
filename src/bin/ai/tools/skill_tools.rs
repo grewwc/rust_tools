@@ -474,6 +474,24 @@ fn validate_resource_relative_path(path: &str) -> Result<String, String> {
     Ok(p)
 }
 
+const MAX_SKILL_RESOURCE_READ_BYTES: usize = 64 * 1024;
+
+fn skill_resource_read_limit(args: &Value) -> usize {
+    args.get("limit")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(MAX_SKILL_RESOURCE_READ_BYTES)
+        .clamp(1, MAX_SKILL_RESOURCE_READ_BYTES)
+}
+
+fn utf8_prefix_at_most(content: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(content.len());
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[..end]
+}
+
 pub(crate) fn execute_list_skill_resources(args: &Value) -> Result<String, String> {
     let name = args["name"].as_str().unwrap_or("").trim();
     let category = args["category"].as_str().unwrap_or("").trim();
@@ -553,13 +571,14 @@ pub(crate) fn execute_read_skill_resource(args: &Value) -> Result<String, String
     }
     let content = std::fs::read_to_string(&canonical_target)
         .map_err(|e| format!("Failed to read resource '{rel}': {e}"))?;
-    const MAX_READ: usize = 64 * 1024;
-    if content.len() > MAX_READ {
-        let truncated = &content[..MAX_READ];
+    let limit = skill_resource_read_limit(args);
+    if content.len() > limit {
+        let truncated = utf8_prefix_at_most(&content, limit);
         Ok(format!(
-            "{truncated}\n\n... truncated: {} bytes total, showing first {} bytes. Use read_file with offset/limit for paging.",
+            "{truncated}\n\n... truncated: {} bytes total, showing first {} UTF-8 bytes (limit {}). Use read_file with offset/limit for paging.",
             content.len(),
-            MAX_READ
+            truncated.len(),
+            limit
         ))
     } else {
         Ok(content)
@@ -1021,13 +1040,13 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::PendingSkillAction;
     use super::{
         build_skill_file_content, clear_pending_user_input_request, execute_activate_skill,
         execute_deactivate_skill, execute_load_skill, execute_request_user_input,
-        render_loaded_skill, render_skill_catalog, take_pending_skill_action,
-        take_pending_user_input_request,
+        render_loaded_skill, render_skill_catalog, skill_resource_read_limit,
+        take_pending_skill_action, take_pending_user_input_request, utf8_prefix_at_most,
     };
-    use super::PendingSkillAction;
     use crate::ai::driver::runtime_ctx::TURN_IDENTITY;
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};
@@ -1136,6 +1155,27 @@ mod tests {
         );
         assert!(activate_skill.contains("Use `list_skills`"));
         assert!(activate_skill.contains("loose keyword overlap"));
+        assert!(activate_skill.contains("equal peers"));
+    }
+
+    #[test]
+    fn skill_resource_limit_defaults_and_clamps_to_the_documented_range() {
+        assert_eq!(skill_resource_read_limit(&serde_json::json!({})), 64 * 1024);
+        assert_eq!(
+            skill_resource_read_limit(&serde_json::json!({"limit": 0})),
+            1
+        );
+        assert_eq!(
+            skill_resource_read_limit(&serde_json::json!({"limit": 100_000})),
+            64 * 1024
+        );
+    }
+
+    #[test]
+    fn skill_resource_truncation_respects_utf8_boundaries() {
+        let content = "aé文";
+        assert_eq!(utf8_prefix_at_most(content, 3), "aé");
+        assert_eq!(utf8_prefix_at_most(content, 2), "a");
     }
 
     #[test]

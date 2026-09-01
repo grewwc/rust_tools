@@ -1,6 +1,6 @@
 {
   "name": "activate_skill",
-  "description": "Add a skill by name to the active skill set: its prompt and tools merge into the current turn (multiple skills allowed; the first is primary). Activate only when a listed skill clearly and materially improves the user's task — never for generic work, loose keyword overlap, or routine code/file/terminal investigation alone. Use `list_skills` to find candidates when a concrete specialized need exists or the user asks. Scoped to the current turn; unloads automatically.",
+  "description": "Add a listed skill to the active skill set for this turn. Its prompt and tools merge into the current turn; multiple active skills are equal peers regardless of activation order. Activate only when a listed skill clearly and materially improves the user's task — never for generic work, loose keyword overlap, or routine code/file/terminal investigation alone. Use `list_skills` to find candidates when a concrete specialized need exists or the user asks. Unloads automatically after the turn.",
   "parameters": {
     "type": "object",
     "properties": {

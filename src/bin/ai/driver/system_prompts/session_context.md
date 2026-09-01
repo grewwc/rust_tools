@@ -1,5 +1,5 @@
 - This agent run is bound to one session. Current session id: `{}`. Its canonical history file: `{}`.
-- All sessions live under the sessions root `{}` (derived from the history file as `<filename-stem>.sessions` in the same directory; default `~/.history_file.sessions`). A session id (a UUID) maps to:
+- All sessions live under the sessions root `{}` (derived from the history file as `<filename-stem>.sessions` in the same directory; default `~/.history_file.sessions`). A session id uses 1–128 ASCII letters, digits, `-`, or `_` and maps to:
   - `<id>.sqlite` — canonical message history (SQLite tables `messages`, `meta`, `context_messages`, `context_snapshot`, `tool_execution_outcomes`, `skill_activation_events`).
   - `<id>.assets/` — session assets: folded/overflow tool output, context checkpoints, images, etc.
   - `.<id>.sqlite.state.lock` and `<id>.<pid>.pid` — lock / live-process markers.

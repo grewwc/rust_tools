@@ -10,11 +10,18 @@
       },
       "category": {
         "type": "string",
-        "description": "Optional filter: 'references', 'examples', or 'scripts'. When omitted, all bundled resources are listed."
+        "enum": [
+          "references",
+          "examples",
+          "scripts"
+        ],
+        "description": "Optional resource category. Omit to list all resources."
       },
       "limit": {
         "type": "integer",
-        "description": "Maximum number of files to list (default: 100, max: 500)."
+        "minimum": 1,
+        "maximum": 200,
+        "description": "Maximum files to list (default: 80)."
       }
     },
     "required": [

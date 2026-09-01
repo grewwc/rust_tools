@@ -1,49 +1,48 @@
 ---
 name: audit_own_changes
 version: 1.0.0
-description: 在 main agent 完成某个用户需求的改动后使用。根据自己本次的改动生成审计指令，用 task 工具（agent: audit）启动完整审计 subagent（仅轻量复查才用 agent: audit-fast），或请用户执行 /audit（完整审计；仅轻量复查用 /audit -f），只审计 main agent 自己做的改动、不审计其他人的改动；随后 main agent 接管并 double check 审计结果，据此做下一步改动。
+description: "Use after the main agent has completed and verified changes for a user request. Build a self-contained audit prompt covering only those changes; start a full `audit` subagent with `task` (`audit-fast` only for a low-risk lightweight review), or tell an attending user to run `/audit`. Then verify findings and make any needed follow-up changes."
 author: rust_tools
 priority: 0
 tool_groups:
   - "core"
   - "task"
 ---
-# 自查审计：只审计 main agent 自己的改动
+# Self-audit: only changes made by the main agent
 
-## 触发时机
+## When to use
 
-当你（main agent）完成某个用户需求的代码/文件改动，改动已落盘、自测通过、准备向用户汇报完成之前，激活本 skill 做一轮自查审计。审计只针对你本次为这个需求做的改动。
+Activate after you have made and persisted code or file changes for a user request, completed relevant verification, and before reporting completion. Audit only the changes you made for that request.
 
-## 步骤
+## Procedure
 
-### 1. 生成审计指令 xxxx（自包含、边界明确）
+### 1. Build a self-contained audit prompt
 
-基于你自己本次为这个需求做的改动，生成一段完整的审计指令 xxxx，必须包含以下内容：
+Create an `audit_prompt` from the changes you made for this request. It must include:
 
-- **审计边界（最重要）**：在 xxxx 开头明确声明"只审计 main agent（我）本次为这个需求做的改动"，并列出本次改动的文件清单。明确要求审计 subagent **不要审计、不要报告** 工作区中其他人或其他并行任务的改动、历史遗留问题——除非它们与本次改动直接相关并影响本次改动的正确性。
-- **改动说明**：逐文件说明改了什么、为什么改，让 subagent 能把工作区 diff 对应到你的改动意图，从而区分"你的改动"与"别人的改动"。
-- **重点验证项**：列出你希望 subagent 逐一验证的关键不变式、边界条件、回归风险点（例如：类型/编译是否通过、行为变更点、错误处理、并发/副作用、配置文件变更的影响面）。
+- **Scope (most important):** Start by stating that the audit covers only the main agent's changes for this request. List the changed files. Tell the auditor not to audit or report other workspace changes, concurrent work, or pre-existing issues unless they directly affect the correctness of these changes.
+- **Change summary:** For each changed file, state what changed and why. This lets the auditor distinguish your intent from unrelated diffs.
+- **Verification focus:** List the invariants, edge cases, and regression risks to check, such as compilation, behavior changes, error handling, concurrency or side effects, and configuration impact.
 
-注意：审计 subagent 完全看不到你的对话历史（/audit 路径会自动附加本会话改动上下文，task 路径只有 xxxx），所以 xxxx 必须自包含、可独立执行。
+A task subagent cannot see your conversation history. The `/audit` path adds this session's change context, but the `task` path receives only `audit_prompt`; therefore, `audit_prompt` must stand alone.
 
-### 2. 触发审计 subagent
+### 2. Start the audit
 
-先澄清：`/audit [-f] <指令>` 是**用户键入的交互命令**（运行时在模型循环前拦截执行），**模型无法自己调用它**；它也不是 shell 命令——**不要**用 execute_command 执行 `/audit ...`，shell 里没有该命令，会直接失败。
+`/audit [-f] <audit_prompt>` is an interactive command typed by the user before the model loop. The model cannot invoke it, and it is not a shell command; never run it through `execute_command`.
 
-- **标准路径（模型自主启动）**：用 `task` 工具启动审计 subagent，把 xxxx 作为 prompt 传入；默认用 `agent: "audit"`（完整审计），**仅当本次改动小、风险低（轻量复查）时才用 `agent: "audit-fast"`**——按任务复杂性自行判断，不要默认降级到 audit-fast；用户明确要求 audit/审计时一律用 `audit`。此路径不会自动注入本会话改动上下文，因此 xxxx 必须完全自包含（见第 1 步），必要时在 xxxx 中要求子代理用 git diff / read_file 自行核对。
-- **可选（用户在场）**：把 xxxx 交给用户执行 `/audit xxxx`（默认完整审计）；仅当本次改动小、风险低（轻量复查）时建议用户加 `-f`（fast 模式：当前会话模型 + high 思考 + 更少步数 + 更短超时）。运行时会自动附带本会话 main agent 已做的文件改动上下文，审计 subagent 基于 xxxx 圈定的边界做审计。
+- **Autonomous path:** Call `task` with `audit_prompt`. Use `agent: "audit"` for a full audit. Use `agent: "audit-fast"` only for a small, low-risk lightweight review; never downgrade a user-requested audit. This path does not inject the current session's change context, so require the subagent to inspect `git diff` or relevant files when needed.
+- **User-assisted path:** If the user is present, offer `audit_prompt` for `/audit <audit_prompt>`. Suggest `/audit -f <audit_prompt>` only for a small, low-risk lightweight review. The runtime adds the current session's main-agent change context.
 
-### 3. subagent 审计完成后：接管 + double check
+### 3. Verify findings and take ownership
 
-审计 subagent 返回结果后，你必须继续接管，不能把结果直接转交给用户：
+After the audit subagent returns, continue the work rather than forwarding its result directly to the user:
 
-- **逐条 double check** 审计发现的每个问题：对照真实代码/证据核实（read_file、execute_command、git diff 等），区分"真实问题"与"误报"。
-- **对确认为真实的问题**：给出修复方案并实施下一步改动。
-- **对误报**：说明理由，不盲目采纳。
-- **修复后重新验证**：确认问题已修复、无回归、改动仍只覆盖自己的范围，才向用户汇报完成。
+- Verify every reported issue against the code and direct evidence (`read_file`, `execute_command`, `git diff`, or equivalent).
+- Fix confirmed issues and explain why any false positive is not actionable.
+- Re-run appropriate verification after a fix, confirm the work remains within your change scope, then report completion.
 
-## 约束
+## Constraints
 
-- 只处理与本次改动相关的问题；不要把别人的改动或历史遗留问题算进本次审计范围，也不要在汇报中把它们当作本次改动的产物。
-- 不要因为审计 subagent 报了问题就直接照单全收，也不要因为它没报问题就草率收尾——double check 是本流程的必需环节。
-- 不要把审计指令 xxxx 写成模糊的"帮我看看我的改动"，必须给出明确的文件清单和验证点，否则审计 subagent 无法区分你的改动与别人的改动。
+- Address only issues related to this request's changes. Do not attribute others' changes or pre-existing issues to your work.
+- Treat subagent output as evidence, not authority: a clean audit is not sufficient proof, and a reported issue is not automatically correct.
+- Never use a vague audit prompt such as "review my changes". Include the changed-file list and concrete verification goals so the auditor can distinguish your changes from unrelated work.

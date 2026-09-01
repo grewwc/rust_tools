@@ -192,7 +192,8 @@ impl AiConfig {
     /// on stdin; it must write the transformed text to stdout. Display-only:
     /// canonical history is never modified. Empty = disabled. The repo ships
     /// `scripts/postprocess_terminal.py` (converts Chinese punctuation inside
-    /// code / file-location contexts to ASCII) as a ready-made filter.
+    /// code / file-location contexts to ASCII, plus fullwidth parentheses in
+    /// prose) as a ready-made filter.
     pub const OUTPUT_POSTPROCESS_COMMAND: &str = "ai.output.postprocess_command";
 
     // ── Token usage stats ──────────────────────────────────
