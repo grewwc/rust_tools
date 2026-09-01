@@ -50,6 +50,9 @@ use super::super::runtime_ctx::DriverContext;
 /// refactors, audits) enough budget to return useful partial evidence without
 /// wedging the parent turn for an interactive session.
 const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Reserve enough of the existing hard-timeout budget for one interrupted request to stop and one
+/// no-tool synthesis request to return a useful result to the parent.
+const SYNC_TASK_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(3 * 60);
 const TIMEOUT_RECOVERY_MAX_CHARS: usize = 24_000;
 const TIMEOUT_RECOVERY_TAIL_MESSAGES: usize = 40;
 
@@ -147,29 +150,20 @@ fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubag
     Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped))
 }
 
-/// Runs a synchronous sub-agent requested by the model through the `task` tool. Ordinary tool
-/// calls may use the full hard-timeout budget (currently 10 minutes); only explicit driver
-/// commands may ask the sub-agent to wrap up before the hard timeout.
+/// Runs a synchronous sub-agent requested by the model through the `task` tool. The sub-agent gets
+/// a pre-timeout wrap-up request within the existing 10-minute hard limit, so it can stop expanding
+/// the investigation and return useful partial conclusions instead of being killed mid-step.
 pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
-    execute_sync_task_with_hard_timeout(tool_call_id, args, SYNC_TASK_HARD_TIMEOUT)
+    execute_sync_task_with_pre_timeout_wrap_up(
+        tool_call_id,
+        args,
+        SYNC_TASK_HARD_TIMEOUT,
+        Some(SYNC_TASK_WRAP_UP_LEAD_TIME),
+    )
 }
 
-/// Runs a synchronous sub-agent initiated by the driver itself, using the caller-chosen hard
-/// timeout.
-///
-/// This entry point stays crate-private so model tool arguments cannot inflate the foreground
-/// wait time into an unbounded value.
-pub(super) fn execute_sync_task_with_hard_timeout(
-    tool_call_id: &str,
-    args: &Value,
-    hard_timeout: Duration,
-) -> Result<ToolResult, String> {
-    execute_sync_task_with_pre_timeout_wrap_up(tool_call_id, args, hard_timeout, None)
-}
-
-/// Same as a normal synchronous `task`, but allows explicit commands to reserve some time before
-/// the hard timeout so the sub-agent can stop expanding its investigation and wrap up based on
-/// the evidence at hand. This parameter is not exposed to model tool calls.
+/// Internal synchronous-task entry point with caller-selected timeout and wrap-up policy. These
+/// controls are not exposed to model tool arguments, so the foreground wait remains bounded.
 pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     tool_call_id: &str,
     args: &Value,
@@ -1012,8 +1006,14 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_sync_task_hard_timeout_remains_ten_minutes() {
+    fn ordinary_sync_task_reserves_wrap_up_inside_ten_minute_hard_timeout() {
         assert_eq!(SYNC_TASK_HARD_TIMEOUT, Duration::from_secs(10 * 60));
+        assert_eq!(SYNC_TASK_WRAP_UP_LEAD_TIME, Duration::from_secs(3 * 60));
+        assert!(SYNC_TASK_WRAP_UP_LEAD_TIME < SYNC_TASK_HARD_TIMEOUT);
+        assert_eq!(
+            SYNC_TASK_HARD_TIMEOUT - SYNC_TASK_WRAP_UP_LEAD_TIME,
+            Duration::from_secs(7 * 60)
+        );
     }
 
     #[test]

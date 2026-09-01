@@ -20,7 +20,7 @@ driver infrastructure:
 ## Key invariants
 
 1. **Single turn coordinator.** Driver owns prompt assembly, model requests, tool loops, history mutation, and final response. No UI/tool shortcuts mutating state behind it.
-2. **Prompt assembly is explicit.** Don't duplicate instructions across system prompts/catalogs/skill prompts/reminders. Trust-boundary block is injected once by `build_system_prompt` in `skill_runtime.rs`.
+2. **Prompt assembly is explicit.** Don't duplicate instructions across system prompts/catalogs/skill prompts/reminders. Trust-boundary block is injected once by `build_system_prompt` in `skill_runtime.rs`. Tool metadata may provide detailed `first_use_guidance`; the tool-result path emits it once after that tool's first call in the current user turn while keeping the resident schema compact.
 3. **History is evidence.** Compression/pruning must preserve tool outputs, subagent results, and truncation via explicit stubs/file pointers — never silently summarize away truth. Sample progress from the pre-compression current tool-round snapshot, not compressed `messages`.
 4. **Retry & streaming are contracts.** Retry only on classified transport/provider/context-window failures. Event ordering and final-response semantics are stable; terminal previews are not persisted truth.
 5. **Skill runtime isolation.** Manifests determine visible tools, MCP allowlists, prompt overlays, and inheritance. Keep default `core` visibility and explicit pinning aligned with `tools/registry/`. Multi-skill: ordered active set, union tools/MCP, most-restrictive `disable_*` wins.

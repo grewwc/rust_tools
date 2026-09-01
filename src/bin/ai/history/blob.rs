@@ -168,8 +168,16 @@ pub(in crate::ai) fn delete_assets_dir(path: &Path) -> io::Result<()> {
 }
 
 pub(in crate::ai) fn is_sqlite_path(path: &Path) -> bool {
+    // Hard-timeout recovery preserves a child history by appending this suffix to the original
+    // filename. Classify the preserved artifact by its original extension; otherwise a SQLite
+    // database such as `child.sqlite.timeout-preserved` is read as UTF-8 text and recovery loses
+    // all of the subagent's recorded progress.
+    let path_text = path.to_string_lossy();
+    let logical_path = path_text
+        .strip_suffix(".timeout-preserved")
+        .unwrap_or(&path_text);
     matches!(
-        path.extension().and_then(|s| s.to_str()),
+        Path::new(logical_path).extension().and_then(|s| s.to_str()),
         Some("sqlite") | Some("db")
     )
 }
@@ -305,6 +313,33 @@ mod tests {
             "[Process {pid} Woke Up] Original goal: test goal\nNew mailbox messages:\n[TASK_WAIT_TIMEOUT]\nWall-clock task_wait budget elapsed after 30s. Re-call `task_wait` with the same task_ids to collect any ready results and receive the budget-elapsed status. task_ids=[{}]\nProgress: {checkpoint}\n\nWake-up handling rules:\n- rule\n\nResume execution based on the goal and these messages.",
             ids.join(", ")
         )
+    }
+
+    #[test]
+    fn preserved_sqlite_history_remains_readable_as_sqlite() {
+        let dir = std::env::temp_dir().join(format!(
+            "preserved_sqlite_history_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("child.sqlite");
+        append_history_messages(&original, &[msg("assistant", "verified partial finding")])
+            .unwrap();
+
+        let preserved = crate::ai::history::preserve_subagent_history(&original).unwrap();
+        assert!(is_sqlite_path(&preserved));
+        let messages = build_message_arr(10, &preserved).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].content.as_str(),
+            Some("verified partial finding")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

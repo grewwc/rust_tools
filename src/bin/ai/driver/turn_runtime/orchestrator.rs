@@ -30,8 +30,9 @@ use super::{
     prepare::prepare_turn,
     record_llm_summary_attempt_chars, should_try_llm_summary,
     tool_result::{
-        FinalGateState, completion_evidence_state, completion_tool_result_succeeded,
-        handle_iteration_execution_for_model, tool_call_is_successful_mutation_candidate,
+        FinalGateState, audit_evidence_gate_action, completion_evidence_state,
+        completion_tool_result_succeeded, handle_iteration_execution_for_model,
+        is_evidence_gated_audit_agent, tool_call_is_successful_mutation_candidate,
     },
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
 };
@@ -1525,6 +1526,22 @@ async fn run_turn_body(
                         consecutive_truncations
                     );
                     final_assistant_text = partial_text.to_string();
+                    // A truncation finalizes outside the normal FinalResponse gate path. Audit
+                    // reports must still be parsed or withheld here so a partial protocol payload
+                    // cannot bypass the evidence gate and reach the user as a verified finding.
+                    if is_evidence_gated_audit_agent(app.current_agent.as_str()) {
+                        let effective_cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
+                        let _ = audit_evidence_gate_action(
+                            app.current_agent.as_str(),
+                            &mut messages,
+                            &turn_messages,
+                            &mut final_assistant_text,
+                            effective_cwd.as_deref(),
+                            true,
+                            iteration,
+                            effective_max_iterations,
+                        );
+                    }
                     break 'turn Ok(None);
                 }
 

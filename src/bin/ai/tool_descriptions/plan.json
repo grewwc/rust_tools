@@ -1,6 +1,7 @@
 {
   "name": "plan",
-  "description": "Create or replace a plan for a complex task. Each step states the action, reason, and primary tool. Keep statuses current with `plan_update`; call `plan` again if the task shape changes. Skip planning for simple one-step work.",
+  "description": "Create or replace a plan for a complex task. Use `plan_update` for status changes and call `plan` again only when the task shape changes. Skip simple one-step work.",
+  "first_use_guidance": "Guidance for later plan operations in this turn:\n- Keep step statuses current with `plan_update`; replace the plan only when the task shape changes.\n- Set `delegate` true for substantive bounded work. Keep trivial work, tightly coupled edits, and final review in the parent.\n- Delegated steps run serially with `task` unless independent steps use `parallelizable` with concurrent `task_spawn`.\n- Mark `parallelizable` only when the step has no dependency on the previous step.\n- Use the primary tool name in `tool`, or `none` when no tool is needed.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -16,23 +17,23 @@
             },
             "action": {
               "type": "string",
-              "description": "What to do in this step (e.g., 'read src/main.rs', 'run cargo build', 'apply patch to fix X')."
+              "description": "What to do in this step (e.g. 'read src/main.rs' or 'apply the fix')."
             },
             "reason": {
               "type": "string",
-              "description": "Why this step is needed and what we expect to learn or achieve."
+              "description": "Why this step is needed and what it should achieve."
             },
             "tool": {
               "type": "string",
-              "description": "Primary tool for this step (e.g. 'read_file', 'execute_command', 'apply_patch', 'knowledge_search'). Use 'none' if no tool is needed."
+              "description": "Primary tool for this step (e.g. 'read_file' or 'apply_patch'); use 'none' if no tool is needed."
             },
             "parallelizable": {
               "type": "boolean",
-              "description": "Whether this step can run in parallel with the previous step because no dependency exists. Default false; only meaningful for delegated work."
+              "description": "Whether this delegated step can run with the previous step because no dependency exists. Default false."
             },
             "delegate": {
               "type": "boolean",
-              "description": "Whether to delegate this step. Set true for substantive bounded work; keep only trivial work, tightly coupled edits, and final review in the parent. Delegated steps run serially with `task` unless `parallelizable` enables concurrent `task_spawn`."
+              "description": "Whether a subagent should do this step. Use true for substantive bounded work; keep trivial or tightly coupled work and final review in the parent."
             }
           },
           "required": [

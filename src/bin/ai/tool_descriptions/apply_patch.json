@@ -1,20 +1,21 @@
 {
   "name": "apply_patch",
   "description": "Apply localized edits from inline text or a patch file. Supports line replacement, patch envelopes, and unified diffs.",
+  "first_use_guidance": "Guidance for later patches in this turn:\n- Copy source text exactly without `read_file` line prefixes; context lines must match.\n- For `*** Replace in line:`, provide `anchor:`, `old:`, and `new:` inside a `*** Begin Patch` envelope.\n- Patch envelopes support `*** Update File:`, `*** Add File:` with `+`-prefixed content, and `*** Delete File:` plus `@@` hunks.\n- Multi-file unified diffs split automatically, but unified diffs cannot delete files.\n- `file_path` is only needed for a single-file unified diff whose headers do not identify the target.\n- `patch` and `patch_file` are mutually exclusive; the limits are 8000 and 64000 characters respectively.",
   "parameters": {
     "type": "object",
     "properties": {
       "file_path": {
         "type": "string",
-        "description": "Absolute target path for a single-file unified diff when its headers do not identify the file. Ignored for `*** Begin Patch` envelopes; `path` is an alias."
+        "description": "Absolute target for a single-file unified diff when its headers omit the file; `path` is an alias."
       },
       "patch": {
         "type": "string",
-        "description": "The inline edit; use exactly one format:\n(A) `*** Begin Patch` with `*** Replace in line: <absolute/path>` plus `anchor:`, `old:`, `new:`.\n(B) A `*** Begin Patch` envelope with `*** Update File:` / `*** Add File:` (`+`-prefixed) / `*** Delete File:` sections and `@@` hunks.\n(C) A unified diff (`---`/`+++`/`diff --git` headers).\n\nConstraints:\n- No Markdown fences; no no-op edits.\n- Copy source exactly (no `read_file` line prefixes); context lines must match.\n- Multi-file unified diffs split automatically; unified diffs cannot delete files.\n- Limit: 8000 characters (`patch_file`: 64000)."
+        "description": "Inline edit in exactly one form: `*** Replace in line:` inside a `*** Begin Patch` envelope; an envelope with `*** Update/Add/Delete File:` sections and `@@` hunks; or a unified diff. No Markdown fences or no-op edits. Limit: 8000 characters."
       },
       "patch_file": {
         "type": "string",
-        "description": "Absolute path to a patch file, instead of `patch`. It must be session-temp or inside the current working directory. Mutually exclusive with `patch`; limit 64000 characters."
+        "description": "Patch-file path instead of `patch`; must be session-temp or under the working directory. Mutually exclusive with `patch`; limit 64000 characters."
       }
     }
   },

@@ -32,6 +32,7 @@ pub(crate) use registry::common::{
     tool_allows_same_turn_replay, tool_defers_eager_load, tool_definitions_for_groups,
     tool_history_policy, tool_summaries_for_groups,
 };
+pub(crate) use registry::tool_metadata::tool_first_use_guidance;
 pub(crate) use registry::tool_groups::ToolGroup;
 const BASELINE_TOOL_NAMES: &[&str] = &[
     "list_skills",

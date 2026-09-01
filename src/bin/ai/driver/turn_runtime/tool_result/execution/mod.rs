@@ -2,7 +2,7 @@
 //!
 //! Feature clusters (each a child module): result preparation
 //! (`prepare`), pre-execution gating (`rejection`), final-response
-//! quality gates (`completion_gate`, `final_citations`,
+//! quality gates (`audit_evidence`, `completion_gate`, `final_citations`,
 //! `final_recovery`), patch retries (`patch_retry`), terminal
 //! presentation (`output_format`, `observer`), round orchestration
 //! (`round`), post-round followups (`followup`), and the iteration
@@ -57,6 +57,7 @@ pub(super) use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
 mod prepare;
 mod rejection;
+mod audit_evidence;
 mod completion_gate;
 mod final_citations;
 mod final_recovery;
@@ -82,8 +83,9 @@ pub(in crate::ai::driver::turn_runtime) use prepare::prepare_recent_tool_result;
 // cluster), so the glob segments are unused outside test builds.
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(in crate::ai::driver::turn_runtime) use {
-    completion_gate::*, final_citations::*, final_recovery::*, followup::*, iteration::*,
-    observer::*, output_format::*, patch_retry::*, prepare::*, rejection::*, round::*,
+    audit_evidence::*, completion_gate::*, final_citations::*, final_recovery::*, followup::*,
+    iteration::*, observer::*, output_format::*, patch_retry::*, prepare::*, rejection::*,
+    round::*,
 };
 #[cfg(test)]
 mod tests;

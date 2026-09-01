@@ -71,3 +71,21 @@ pub use string_content::{
     copy_from_file, get_clipboard_content, get_clipboard_raw_bytes_via_osc52, save_to_file,
     set_clipboard_content,
 };
+
+/// Base64-decode a terminal/clipboard payload leniently.
+///
+/// Terminals are not guaranteed to emit canonical base64 in OSC52 responses:
+/// some wrap the payload with line breaks, and some omit the `=` padding.
+/// `base64::general_purpose::STANDARD` rejects both (it requires canonical
+/// padding), so strip whitespace and decode with a padding-indifferent engine.
+pub(crate) fn decode_base64_lenient(input: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose;
+    let cleaned: String = input
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    general_purpose::STANDARD_PAD_INDIFFERENT
+        .decode(&cleaned)
+        .ok()
+}

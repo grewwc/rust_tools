@@ -310,6 +310,24 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 CompletionEvidenceGateAction::Warn => true,
             };
             let effective_cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
+            let warn_unverified_audit_evidence = match audit_evidence_gate_action(
+                app.current_agent.as_str(),
+                messages,
+                turn_messages,
+                &mut stream_result.assistant_text,
+                effective_cwd.as_deref(),
+                !final_gate_reopen_allowed,
+                iteration,
+                max_iterations,
+            ) {
+                AuditEvidenceGateAction::Allow => false,
+                AuditEvidenceGateAction::Reopen => {
+                    final_gate_state.consume_retry();
+                    *terminal_dedupe_candidate = None;
+                    return Ok(TurnLoopStep::Continue);
+                }
+                AuditEvidenceGateAction::Warn => true,
+            };
             let warn_unvalidated_final_citation = match final_response_citation_gate_action(
                 messages,
                 &stream_result.assistant_text,
@@ -389,6 +407,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     COMPLETION_EVIDENCE_WARNING,
                 );
                 record_hidden_self_note(app, turn_messages, COMPLETION_EVIDENCE_UNVERIFIED_NOTE);
+            }
+            if warn_unverified_audit_evidence {
+                record_hidden_self_note(app, turn_messages, AUDIT_EVIDENCE_UNVERIFIED_NOTE);
             }
             if warn_unvalidated_final_citation {
                 append_runtime_warning_once(

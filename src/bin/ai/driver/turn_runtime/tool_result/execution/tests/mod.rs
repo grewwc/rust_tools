@@ -2,6 +2,7 @@
 //! cluster (`prepare` has no tests of its own).
 
 mod common;
+mod audit_evidence;
 mod completion_gate;
 mod final_citations;
 mod final_recovery;

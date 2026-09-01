@@ -28,6 +28,51 @@ fn tool_call_round_no_longer_requests_terminal_dedupe() {
 }
 
 #[test]
+fn first_use_guidance_is_emitted_once_per_tool_per_turn() {
+    let calls = vec![
+        test_tool_call("plan_1", "plan", serde_json::json!({})),
+        test_tool_call("plan_2", "plan", serde_json::json!({})),
+        test_tool_call("command_1", "execute_command", serde_json::json!({})),
+    ];
+    let exec_result = ExecuteToolCallsResult {
+        executed_tool_calls: calls.clone(),
+        tool_results: calls
+            .iter()
+            .map(|call| ToolResult {
+                tool_call_id: call.id.clone(),
+                content: "ok".to_string(),
+            })
+            .collect(),
+        cached_hits: vec![false; calls.len()],
+        execution_outcomes: vec![None; calls.len()],
+        had_error: false,
+    };
+
+    let first_round = build_first_use_tool_guidance_messages_with(&exec_result, &[], |name| {
+        (name == "plan").then(|| "detailed plan guidance".to_string())
+    });
+    assert_eq!(first_round.len(), 1);
+    assert_eq!(first_round[0].role, ROLE_INTERNAL_NOTE);
+    assert_eq!(
+        first_round[0].content.as_str(),
+        Some("[tool_first_use_guidance name=plan]\ndetailed plan guidance")
+    );
+
+    let prior_turn_messages = vec![Message {
+        role: "assistant".to_string(),
+        content: serde_json::Value::String(String::new()),
+        tool_calls: Some(vec![calls[0].clone()]),
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let later_round =
+        build_first_use_tool_guidance_messages_with(&exec_result, &prior_turn_messages, |name| {
+            (name == "plan").then(|| "detailed plan guidance".to_string())
+        });
+    assert!(later_round.is_empty());
+}
+
+#[test]
 fn reused_tool_call_id_is_rewritten_for_the_whole_occurrence() {
     let existing_call = test_tool_call(
         "reused",

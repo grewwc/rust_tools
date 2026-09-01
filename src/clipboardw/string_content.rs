@@ -226,15 +226,13 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
         let response_str = String::from_utf8_lossy(&response);
         if let Some(start_idx) = response_str.find("]52;c;") {
             let data_start = start_idx + 6;
-            use base64::Engine as _;
-            use base64::engine::general_purpose;
             if let Some(end_idx) = response_str[data_start..].find('\x07') {
                 let base64_data = &response_str[data_start..data_start + end_idx];
-                return general_purpose::STANDARD.decode(base64_data).ok();
+                return crate::clipboardw::decode_base64_lenient(base64_data);
             }
             if let Some(end_idx) = response_str[data_start..].find("\x1b\\") {
                 let base64_data = &response_str[data_start..data_start + end_idx];
-                return general_purpose::STANDARD.decode(base64_data).ok();
+                return crate::clipboardw::decode_base64_lenient(base64_data);
             }
         }
         None

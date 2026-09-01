@@ -96,20 +96,22 @@ fn classify(raw: &[u8]) -> SaveKind {
                 .filter(|c| !matches!(c, '\n' | '\r'))
                 .collect();
             if !cleaned.is_empty() {
-                use base64::Engine as _;
-                use base64::engine::general_purpose;
-                if let Ok(decoded) = general_purpose::STANDARD.decode(&cleaned) {
-                    // base64-wrapped image (oo -B / oo -c bridge)
-                    if let Ok(format) = image::guess_format(&decoded) {
-                        if image::load_from_memory(&decoded).is_ok() {
-                            return SaveKind::Image {
-                                data: decoded,
-                                ext: ext_of(format),
-                            };
+                if let Some(decoded) = crate::clipboardw::decode_base64_lenient(&cleaned) {
+                    // An empty decode result (e.g. whitespace-only clipboard) is
+                    // plain text, not a base64 payload.
+                    if !decoded.is_empty() {
+                        // base64-wrapped image (oo -B / oo -c bridge)
+                        if let Ok(format) = image::guess_format(&decoded) {
+                            if image::load_from_memory(&decoded).is_ok() {
+                                return SaveKind::Image {
+                                    data: decoded,
+                                    ext: ext_of(format),
+                                };
+                            }
                         }
+                        // Other base64-wrapped binary
+                        return SaveKind::Binary(decoded);
                     }
-                    // Other base64-wrapped binary
-                    return SaveKind::Binary(decoded);
                 }
             }
             return SaveKind::Text(text.to_string());
@@ -187,6 +189,44 @@ mod tests {
             }
             other => panic!("expected Image, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_base64_wrapped_png_unpadded() {
+        // Terminals may emit OSC52 responses without '=' padding; after one decode
+        // the clipboard text can itself be unpadded base64. classify must still
+        // recover the image.
+        let png = tiny_png();
+        let b64 = general_purpose::STANDARD.encode(&png);
+        let b64 = b64.trim_end_matches('=');
+        match classify(b64.as_bytes()) {
+            SaveKind::Image { data, ext } => {
+                assert_eq!(ext, "png");
+                assert_eq!(data, png);
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_base64_lenient_accepts_unpadded_and_wrapped() {
+        use crate::clipboardw::decode_base64_lenient;
+
+        let data = b"hello world";
+        let b64 = general_purpose::STANDARD.encode(data);
+
+        // Missing '=' padding must still decode.
+        let unpadded = b64.trim_end_matches('=');
+        assert_eq!(decode_base64_lenient(unpadded), Some(data.to_vec()));
+
+        // Line-wrapped payloads (some terminals wrap at 76 chars) must still decode.
+        let wrapped: String = b64
+            .as_bytes()
+            .chunks(4)
+            .map(|c| String::from_utf8_lossy(c))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(decode_base64_lenient(&wrapped), Some(data.to_vec()));
     }
 
     #[test]

@@ -49,6 +49,54 @@ pub(in crate::ai::driver::turn_runtime) fn execute_tool_calls_for_round(
     )
 }
 
+pub(super) fn build_first_use_tool_guidance_messages_with(
+    exec_result: &ExecuteToolCallsResult,
+    prior_turn_messages: &[Message],
+    guidance_for: impl Fn(&str) -> Option<String>,
+) -> Vec<Message> {
+    let previously_called = |tool_name: &str| {
+        prior_turn_messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .flat_map(|message| message.tool_calls.iter().flatten())
+            .any(|tool_call| tool_call.function.name == tool_name)
+    };
+    let mut guided_this_round = FastSet::default();
+    let mut messages = Vec::new();
+    for (tool_call, _) in exec_result
+        .executed_tool_calls
+        .iter()
+        .zip(exec_result.tool_results.iter())
+    {
+        let tool_name = tool_call.function.name.as_str();
+        if previously_called(tool_name) || !guided_this_round.insert(tool_name.to_string()) {
+            continue;
+        }
+        let Some(guidance) = guidance_for(tool_name) else {
+            continue;
+        };
+        messages.push(Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: serde_json::Value::String(format!(
+                "[tool_first_use_guidance name={tool_name}]\n{guidance}"
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
+    messages
+}
+
+fn build_first_use_tool_guidance_messages(
+    exec_result: &ExecuteToolCallsResult,
+    prior_turn_messages: &[Message],
+) -> Vec<Message> {
+    build_first_use_tool_guidance_messages_with(exec_result, prior_turn_messages, |tool_name| {
+        crate::ai::tools::tool_first_use_guidance(tool_name).map(str::to_owned)
+    })
+}
+
 pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
     app: &mut App,
     source_model: &str,
@@ -133,6 +181,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
         &exec_result.executed_tool_calls,
         &exec_result.tool_results,
     );
+    // Capture turn-local first-use guidance before appending this round's
+    // assistant tool calls to canonical history; after that append, those calls
+    // would be indistinguishable from calls made in earlier rounds.
+    let first_use_guidance_messages =
+        build_first_use_tool_guidance_messages(&exec_result, turn_messages);
     // Write the ledger before messages hit disk: if the process crashes between the two
     // writes, leaving a conservative fresh-read requirement is safe; losing the mismatch
     // state instead would let a stale patch through after session recovery.
@@ -158,6 +211,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
         messages,
         turn_messages,
     );
+    for message in first_use_guidance_messages {
+        append_message_pair(messages, turn_messages, message);
+    }
     record_hidden_self_note(app, turn_messages, &remaining_meta);
     record_tool_inspection_artifacts(messages, turn_messages);
 
