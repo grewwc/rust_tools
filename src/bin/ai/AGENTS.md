@@ -58,6 +58,13 @@ Sessions are the unit of conversation persistence; ids are UUID-shaped (36 chars
 8. **Synthetic user messages.** Runtime-injected `role=="user"` (subagent handoff, image followup, etc.) must use `history::runtime_synthetic_user_message` and be detected via `history::is_runtime_synthetic_user_message`/`last_real_user_index` — never bare `rposition(role=="user")`. Clear the origin sidecar in `request/normalize` before provider serialization.
 9. **Compression purity.** Speculative fold candidates stay pure until selected; persist evidence only for accepted candidates with deterministic asset paths; retain raw messages if archive commit fails.
 10. **Model-visible wording is English.** Base prompt / gate notes / injected notes use one English system; keep Chinese only in keyword-match lists and terminal text.
+11. **Output post-processing is display-only.** `ai.output.postprocess_command`
+    (config_schema.rs) optionally pipes the final assistant body through a shell
+    filter (stdin -> stdout) right before `render_markdown_block` in
+    `driver/turn_runtime/finalize.rs`. It is strictly best-effort (any failure
+    shows the original text) and never mutates canonical history. Repo ships
+    `scripts/postprocess_terminal.py` (Chinese punctuation inside code /
+    file-location contexts -> ASCII) as a ready-made filter.
 
 ## Scoped guides
 

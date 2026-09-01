@@ -26,6 +26,7 @@ mod debug;
 mod finalize;
 mod iteration;
 mod orchestrator;
+mod output_postprocess;
 mod persistence;
 mod prepare;
 pub(in crate::ai) mod tool_result;

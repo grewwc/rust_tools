@@ -427,6 +427,11 @@ pub(super) async fn finalize_turn(
             print_assistant_banner_with_app_and_skill(Some(app), active_skill_name);
             // The digest is extra image understanding for the model; it is stripped from the final echo as well.
             let visible_text = crate::ai::request::strip_digest_blocks(&visible_text);
+            // Display-only post-processing (e.g. `scripts/postprocess_terminal.py`
+            // via `ai.output.postprocess_command`). Best-effort: on any failure
+            // the original text is shown unchanged; canonical history is untouched.
+            let visible_text =
+                super::output_postprocess::postprocess_terminal_text(visible_text);
             crate::ai::stream::render_markdown_block(&visible_text)?;
         }
         persist_pending_turn_messages_for_model(

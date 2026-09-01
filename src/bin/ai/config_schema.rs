@@ -187,6 +187,13 @@ impl AiConfig {
     /// show the latest N lines. Only affects terminal display, not the model
     /// context.
     pub const OUTPUT_THINKING_MAX_VISIBLE_LINES: &str = "ai.output.thinking.max_visible_lines";
+    /// Shell command that post-processes the final assistant body before it
+    /// is printed to the terminal. The completed text is piped to the command
+    /// on stdin; it must write the transformed text to stdout. Display-only:
+    /// canonical history is never modified. Empty = disabled. The repo ships
+    /// `scripts/postprocess_terminal.py` (converts Chinese punctuation inside
+    /// code / file-location contexts to ASCII) as a ready-made filter.
+    pub const OUTPUT_POSTPROCESS_COMMAND: &str = "ai.output.postprocess_command";
 
     // ── Token usage stats ──────────────────────────────────
     /// When true, persist the per-session DecisionLog sidecar JSONL file.
