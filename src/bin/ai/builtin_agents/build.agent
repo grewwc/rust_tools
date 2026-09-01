@@ -36,10 +36,8 @@ Checkpoint files are written by the runtime automatically: the system extracts
 tool) to save a checkpoint file yourself — the asset directory lives outside
 the sandbox and a manual write will be blocked.
 
-## Escalation Rules
+## Access limitations
 
-- Ask the user only when blocked by a product decision, missing input, or risky irreversible action.
-- When several approaches are valid, choose the clearly safer, more local one.
 - If current access makes the task impossible, state what is missing and what you tried.
 
 ## Prompt & Skill Engineering

@@ -54,6 +54,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         "/export",
         ":export",
         ":model",
+        "/effort",
+        ":effort",
         "/audit",
         ":audit",
         "/changes",
@@ -195,6 +197,8 @@ impl CommandCompleter {
             "/export",
             ":export",
             ":model",
+            "/effort",
+            ":effort",
             "/audit",
             ":audit",
             "/changes",
@@ -785,6 +789,8 @@ impl CommandCompleter {
                     "/usage" | ":usage" => Self::usage_subcommands(),
                     "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => Self::checkpoint_subcommands(),
                     "/model" | ":model" => Self::model_subcommands(),
+                    // `/effort <TAB>` -> reasoning-effort levels (same set as `/model effort <level>`).
+                    "/effort" | ":effort" => Self::model_effort_levels(),
                     _ => &[],
                 };
                 Self::plain_candidates(
@@ -1859,6 +1865,43 @@ mod tests {
         assert!(labels.iter().any(|x| x == "medium"));
         assert!(!labels.iter().any(|x| x == "high"));
         assert!(!labels.iter().any(|x| x == "low"));
+    }
+
+    #[test]
+    fn command_completion_expands_effort_shortcut() {
+        let (_, candidates) = CommandCompleter::complete_for_line("/effor", 6);
+        let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        assert!(
+            labels.iter().any(|x| x == "/effort"),
+            "expected `/effort` for `/effor`: {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn effort_shortcut_completion_lists_levels() {
+        let (start, candidates) = CommandCompleter::complete_for_line("/effort ", 8);
+        assert_eq!(start, 8);
+        let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        for level in [
+            "minimal", "low", "medium", "high", "xhigh", "max", "auto", "off",
+        ] {
+            assert!(
+                labels.iter().any(|x| x == level),
+                "expected level `{}` for `/effort `: {:?}",
+                level,
+                labels
+            );
+        }
+    }
+
+    #[test]
+    fn effort_shortcut_completion_filters_by_prefix() {
+        let (_, candidates) = CommandCompleter::complete_for_line("/effort h", 9);
+        let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        assert!(labels.iter().any(|x| x == "high"));
+        assert!(!labels.iter().any(|x| x == "low"));
+        assert!(!labels.iter().any(|x| x == "auto"));
     }
 
     #[test]

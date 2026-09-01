@@ -9,9 +9,11 @@ Display-only post-processor for the agent's terminal body text. Converts
 Chinese (fullwidth/ideographic) punctuation **inside code or file-location
 contexts** to ASCII, plus fullwidth parentheses `（` `）`, and fullwidth
 colon `：` (as `: `) / period `。` (as `. `) -- each only when it directly
-abuts an ASCII letter, so pure-Chinese prose keeps `：` and `。` -- in plain
-prose (deliberate exceptions so mixed technical prose reads consistently);
-all other Chinese punctuation in plain prose stays untouched.
+abuts an ASCII letter, except that a period immediately before an inline-code
+span starting with an ASCII letter receives the same prose replacement. This
+keeps the rendered code span separated from the sentence while pure-Chinese
+prose retains `：` and `。`; all other Chinese punctuation in plain prose stays
+untouched.
 
 - Contexts translated: fenced code blocks, inline code spans (`` `...` ``),
   and file-path/file-reference spans in prose (path indicators, drive

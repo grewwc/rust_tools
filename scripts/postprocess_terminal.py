@@ -3,8 +3,9 @@
 terminal: Chinese (fullwidth / ideographic) punctuation that appears inside
 code or file-location contexts is converted to its ASCII equivalent, as are
 fullwidth parentheses in plain prose and fullwidth colons / full stops that
-directly abut an ASCII letter.  Other Chinese punctuation in plain prose is
-left untouched.
+directly abut an ASCII letter.  A full stop immediately before an inline-code
+span that starts with an ASCII letter is treated the same way.  Other Chinese
+punctuation in plain prose is left untouched.
 
 Contexts that are translated (Chinese -> ASCII punctuation):
 
@@ -34,8 +35,11 @@ Contexts that are translated (Chinese -> ASCII punctuation):
      period plus one space) only when it directly abuts an ASCII letter --
      either the sentence ends on ASCII (`使用 rustc。下一步` becomes
      `使用 rustc. 下一步`) or ASCII follows (`完成。Next step` becomes
-     `完成. Next step`).  Pure-Chinese sentences keep their fullwidth `。`
-     (`已处理完成。` stays unchanged), so CJK-only prose is never mangled.
+     `完成. Next step`).  A period immediately before an inline-code span
+     that starts with ASCII is also converted, with the space outside the
+     code delimiter (`提示规则。`src/main.rs`` becomes
+     `提示规则. `src/main.rs``).  Pure-Chinese sentences keep their fullwidth
+     `。` (`已处理完成。` stays unchanged), so CJK-only prose is never mangled.
      As with the colon, periods inside fenced blocks, inline code spans, and
      path spans still map to a bare `.` -- a space there would corrupt
      tokens such as `main。rs` (a typo for `main.rs`).
@@ -98,11 +102,15 @@ _ASCII_WORD = r"[A-Za-z0-9_]"
 
 # Fullwidth colon `：` and period `。` in plain prose: converted to `: ` /
 # `. ` only when they directly abut an ASCII letter on either side -- a
-# label or sentence that ends on ASCII, or ASCII that follows.  Pure-Chinese
-# prose keeps both fullwidth.  Fenced blocks, inline code, and path spans are
-# handled upstream and use a bare `:` / `.`.
+# label or sentence that ends on ASCII, or ASCII that follows.  A period
+# immediately before an ASCII-leading inline-code span is visually adjacent
+# after Markdown rendering, so it also receives the prose replacement.  The
+# inserted space stays outside the code delimiter.  Pure-Chinese prose keeps
+# both fullwidth.  Fenced blocks, inline code, and path spans are handled
+# upstream and use a bare `:` / `.`.
 _PROSE_ASCII_ADJACENT_RE = re.compile(
     r"(?<=[A-Za-z])[\u3002\uff1a]|[\u3002\uff1a](?=[A-Za-z])"
+    r"|\u3002(?=`[A-Za-z][^`\n]*`)"
 )
 
 
@@ -317,6 +325,12 @@ def _selftest():
         # (either side); pure-Chinese periods keep the fullwidth form.
         ("使用 rustc。下一步继续", "使用 rustc. 下一步继续"),
         ("完成。Next step 继续", "完成. Next step 继续"),
+        # Markdown delimiters do not render, so a period before an
+        # ASCII-leading inline-code span needs its prose space outside code.
+        ("提示规则。`src/main.rs:10`", "提示规则. `src/main.rs:10`"),
+        # A CJK-leading inline-code span is not ASCII-adjacent and stays
+        # untouched.
+        ("提示规则。`路径`", "提示规则。`路径`"),
         ("已完成。下一步继续", "已完成。下一步继续"),
         ("已完成。", "已完成。"),
         # Digits are not letters: a period after a number stays fullwidth.

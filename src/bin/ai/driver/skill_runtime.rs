@@ -1279,7 +1279,19 @@ fn build_system_prompt(
             && has_tool(available_tools, "activate_skill")
         {
             discovery_lines.push(
-                "Skills are optional. Call `list_skills` when the user asks about them; otherwise assess the task first and proactively call `list_skills` only when you identify a concrete, genuinely specialized need for domain context, an established workflow, bundled resources, or dedicated tools and do not know which skill is available. Do not browse skills as a routine opening step; a routine source-code, repository, file, or terminal investigation—or technical keywords alone—is not evidence that a skill is needed.".to_string(),
+                "Skills are optional. Call `list_skills` when the user asks about them; otherwise assess the task first."
+                    .to_string(),
+            );
+            discovery_lines.push(
+                "After assessing the task, proactively call `list_skills` only for a concrete, genuinely specialized need for domain context, an established workflow, bundled resources, or dedicated tools. Call it only when you do not know which skill is available."
+                    .to_string(),
+            );
+            discovery_lines.push(
+                "Do not browse skills as a routine opening step.".to_string(),
+            );
+            discovery_lines.push(
+                "A routine source-code, repository, file, or terminal investigation—or technical keywords alone—is not evidence that a skill is needed."
+                    .to_string(),
             );
             discovery_lines.push(
                 "Call `activate_skill(name=...)` only when one listed skill clearly and materially improves the task. Do not activate for generic work, loose keyword overlap, or just in case.".to_string(),
@@ -1459,7 +1471,20 @@ fn build_system_prompt(
                 "Do NOT use `write_file(temp=true)` on existing project files; reserve `write_file` without `temp` for genuine full rewrites (localized edits go through `apply_patch`).".to_string(),
             );
             lines.push(
-                "When one file needs several localized edits, read the relevant span once and make ONE `apply_patch` call with multiple `@@` hunks in a single `*** Update File:` section — only when every hunk has a unique anchor (distinct surrounding context). For several files, use one Begin Patch envelope with one section per target. Do not split related edits into serial read/patch cycles unless a previous patch failed or a later edit truly depends on the earlier edit's result. For structurally similar blocks (e.g. repeated closures with identical bodies), apply one at a time, each hunk with a distinctive anchor line (function name or comment). Keep each patch well under the size limit: split large edits into multiple apply_patch calls, or write the patch to a temp file and pass `patch_file`.".to_string(),
+                "When one file needs several localized edits, read the relevant span once. Make ONE `apply_patch` call with multiple `@@` hunks in a single `*** Update File:` section only when every hunk has a unique anchor (distinct surrounding context)."
+                    .to_string(),
+            );
+            lines.push(
+                "For several files, use one Begin Patch envelope with one section per target. Do not split related edits into serial read/patch cycles unless a previous patch failed or a later edit truly depends on the earlier edit's result."
+                    .to_string(),
+            );
+            lines.push(
+                "For structurally similar blocks (for example, repeated closures with identical bodies), apply one at a time with a distinctive anchor line such as a function name or comment."
+                    .to_string(),
+            );
+            lines.push(
+                "Keep each patch well under the size limit. Split large edits into multiple `apply_patch` calls, or write the patch to a temp file and pass `patch_file`."
+                    .to_string(),
             );
         } else {
             lines.push(
@@ -2329,7 +2354,7 @@ mod tests {
             assert!(prompt.contains(
                 "Never break another module's functionality to satisfy a requirement"
             ));
-            assert!(prompt.contains("surface the conflict"));
+            assert!(prompt.contains("apply the `intellectual_honesty` conflict rule"));
         }
     }
 
@@ -2592,13 +2617,17 @@ mod tests {
         assert!(prompt.contains("reset, checkout, restore, stash drop"));
         assert!(prompt.contains("temporary branch/worktree or stash push then pop"));
         // Anti-hallucination bullet: every concrete specific must trace to
-        // session-observed evidence, with explicit abstention allowed. The old
-        // in-bullet meta-sentence guarding against re-verifying settled facts
-        // was trimmed as redundant; the efficiency guard now lives in
-        // task_convergence's stopping rule and must keep rendering.
+        // session-observed evidence; when evidence is insufficient, one
+        // targeted lookup first, otherwise report verified / unknown / next
+        // step. The negative provenance tail and the abstention-preference
+        // bullet were trimmed as restatements of no_hallucination's gate
+        // ("state unknowns as unknown"), which owns that duty and must keep
+        // rendering (asserted in
+        // system_prompt_renders_safety_redlines_and_no_hallucination).
+        // The efficiency guard lives in task_convergence's stopping rule and
+        // must keep rendering.
         assert!(prompt.contains("must trace to evidence observed in this session"));
-        assert!(prompt.contains("not to memory or plausibility"));
-        assert!(prompt.contains("beats a confident guess"));
+        assert!(prompt.contains("targeted lookup; otherwise state what is verified"));
         assert!(prompt.contains("Do not pursue perfect certainty or unrelated detail"));
     }
 

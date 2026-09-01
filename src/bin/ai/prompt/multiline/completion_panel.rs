@@ -61,9 +61,15 @@ fn build_multiline_completion_context(textarea: &TextArea<'_>) -> Option<Pending
 
 fn should_open_popup_on_first_tab(ctx: &PendingTabCompletion) -> bool {
     let trimmed = ctx.line[..ctx.col].trim();
-    matches!(trimmed, "/model" | ":model")
+    // `/model` (including its `effort` subcommand) and `/effort` both pick one value
+    // from a fixed candidate list, so the first Tab opens the panel directly instead
+    // of the silent-first-then-popup flow used for ambiguous completions.
+    (matches!(trimmed, "/model" | ":model")
         || trimmed.starts_with("/model ")
         || trimmed.starts_with(":model ")
+        || matches!(trimmed, "/effort" | ":effort")
+        || trimmed.starts_with("/effort ")
+        || trimmed.starts_with(":effort "))
         || is_skill_reference_trigger(trimmed)
 }
 
@@ -251,6 +257,22 @@ mod tests {
         assert_eq!(panel.selected_index, 0);
         assert_eq!(panel.items[0].replacement, format!("/model {current}"));
         assert!(panel.items[0].display.contains("current"));
+    }
+
+    #[test]
+    fn effort_shortcut_opens_popup_on_first_tab() {
+        let mut textarea = TextArea::new(vec!["/effort ".to_string()]);
+        textarea.move_cursor(CursorMove::End);
+        let mut pending = None;
+        let mut panel = None;
+
+        let status = apply_multiline_completion(&mut textarea, &mut pending, &mut panel).unwrap();
+
+        assert!(status.contains("发现"));
+        let panel = panel.expect("panel should open on first tab");
+        assert_eq!(panel.items.len(), 8);
+        assert!(panel.items.iter().any(|item| item.replacement == "high"));
+        assert!(panel.items.iter().any(|item| item.replacement == "auto"));
     }
 
     #[test]
