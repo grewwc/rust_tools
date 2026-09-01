@@ -11,6 +11,7 @@
 //   - temperature: Override default temperature
 //   - tools/tool_groups/mcp_servers/disable_mcp_tools: Available tools
 //   - model_tier: light/standard/heavy preference
+//   - validated_claims: Require the validated-claims protocol for multi-artifact investigations
 //
 // Builtin agents:
 //   - build: Default unified development agent (planning, code-writing, execution, prompt engineering, exploration)
@@ -204,6 +205,8 @@ pub(super) struct AgentManifest {
     #[serde(default)]
     pub(super) disable_mcp_tools: bool,
     #[serde(default)]
+    pub(super) validated_claims: bool,
+    #[serde(default)]
     pub(super) model_tier: Option<AgentModelTier>,
     #[serde(default)]
     pub(super) disabled: bool,
@@ -235,6 +238,10 @@ impl AgentManifest {
 
     pub(super) fn is_subagent(&self) -> bool {
         matches!(self.mode, AgentMode::Subagent | AgentMode::All)
+    }
+
+    pub(super) fn requires_validated_claims(&self) -> bool {
+        self.validated_claims
     }
 }
 
@@ -788,6 +795,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
     let mut tool_groups: Vec<String> = Vec::new();
     let mut mcp_servers: Vec<String> = Vec::new();
     let mut disable_mcp_tools = false;
+    let mut validated_claims = false;
 
     let mut body = String::new();
     let mut in_front_matter = true;
@@ -860,6 +868,9 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
                 "disable_mcp_tools" => {
                     disable_mcp_tools = unquoted.eq_ignore_ascii_case("true");
                 }
+                "validated_claims" => {
+                    validated_claims = unquoted.eq_ignore_ascii_case("true");
+                }
                 "tools" => tools = parse_list_value(unquoted),
                 "tool_groups" => tool_groups = parse_list_value(unquoted),
                 "mcp_servers" => mcp_servers = parse_list_value(unquoted),
@@ -922,6 +933,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
         tool_groups,
         mcp_servers,
         disable_mcp_tools,
+        validated_claims,
         model_tier: agent_model_tier,
         disabled,
         hidden,

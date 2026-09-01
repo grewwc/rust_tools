@@ -67,6 +67,13 @@ Sessions are the unit of conversation persistence; IDs are not restricted to UUI
     `scripts/postprocess_terminal.py` (Chinese punctuation inside code /
     file-location contexts -> ASCII, plus fullwidth parens in prose) as a
     ready-made filter.
+12. **Validated cross-artifact claims.** Agents opt in with `validated_claims: true`.
+    On non-mutating turns with at least two successful tool results,
+    the final response must use `validated_claims/v1`; this conservative trigger prevents
+    unclassified tools from bypassing the gate. The runtime accepts receipts only from
+    stable replay-safe read-only calls, verifies complete exact field facts, derives
+    request/session/trace identity from a closed key registry, and renders the answer.
+    Shared labels or values never imply artifact identity.
 
 ## Scoped guides
 

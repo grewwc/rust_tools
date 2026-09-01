@@ -3,7 +3,7 @@
 //! Feature clusters (each a child module): result preparation
 //! (`prepare`), pre-execution gating (`rejection`), final-response
 //! quality gates (`audit_evidence`, `completion_gate`, `final_citations`,
-//! `final_recovery`), patch retries (`patch_retry`), terminal
+//! `final_recovery`, `validated_claims`), patch retries (`patch_retry`), terminal
 //! presentation (`output_format`, `observer`), round orchestration
 //! (`round`), post-round followups (`followup`), and the iteration
 //! entry points (`iteration`).
@@ -61,6 +61,7 @@ mod audit_evidence;
 mod completion_gate;
 mod final_citations;
 mod final_recovery;
+mod validated_claims;
 mod patch_retry;
 mod output_format;
 mod observer;
@@ -85,7 +86,7 @@ pub(in crate::ai::driver::turn_runtime) use prepare::prepare_recent_tool_result;
 pub(in crate::ai::driver::turn_runtime) use {
     audit_evidence::*, completion_gate::*, final_citations::*, final_recovery::*, followup::*,
     iteration::*, observer::*, output_format::*, patch_retry::*, prepare::*, rejection::*,
-    round::*,
+    round::*, validated_claims::*,
 };
 #[cfg(test)]
 mod tests;

@@ -1,0 +1,11 @@
+<validated_claims_protocol>
+- On a non-mutating turn with two or more successful tool results, the runtime requires a validated-claims final response. This conservative trigger prevents an unclassified inspection tool or repeated dynamic read from bypassing the gate.
+- Return exactly one `<validated_claims>{...}</validated_claims>` JSON payload with no surrounding text.
+- Use protocol `validated_claims/v1` and this shape:
+  `{"protocol":"validated_claims/v1","artifacts":[{"id":"a","tool_call_id":"call_..."}],"facts":[{"id":"f","artifact":"a","field":"sessionId","value":"123","evidence":"\"sessionId\": \"123\""}],"comparisons":[{"left_fact":"f1","right_fact":"f2"}],"relations":[{"left_artifact":"a","right_artifact":"b","scope":"request|session|trace"}],"open_questions":[],"coverage_gaps":[]}`.
+- Artifact receipts are accepted only for stable, replay-safe read-only tool results. `evidence` must be an exact single-line fragment from that tool result and must directly bind the stated field to the complete stated value. Artifact and fact ids are internal labels, not conclusions.
+- The runtime, not the model, derives comparisons and request/session/trace identity. Registered identity fields are request-id, session-id, trace-id, and correlation-id spellings. Shared configuration, filenames, timestamps, feature flags, app ids, sources, scenes, or user grouping do not prove identity.
+- Include a relation for every cross-artifact request/session/trace identity that matters to the answer. When no registered identity key joins two artifacts, the verified result is `unknown`, never `same`.
+- If none of the tool results is admissible as evidence, return empty artifact/fact/comparison/relation arrays and explain the limitation in `coverage_gaps`; do not fall back to prose conclusions.
+- Do not place conclusions, titles, impacts, or explanations in verified fields. Put unsupported interpretation only in `open_questions` or `coverage_gaps`; the runtime labels it unverified.
+</validated_claims_protocol>

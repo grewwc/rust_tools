@@ -1163,6 +1163,12 @@ fn build_system_prompt(
         ContextKind::Behavior,
         include_str!("system_prompts/correctness_guardrails.md"),
     );
+    if active_agent.is_some_and(AgentManifest::requires_validated_claims) {
+        b.push(
+            ContextKind::Behavior,
+            include_str!("system_prompts/validated_claims.md"),
+        );
+    }
     // Intellectual honesty: evidence-earned agreement and respectful pushback
     // against wrong or inappropriate user premises. Unconditional — it applies
     // in every mode and is never relaxed by a skill or goal.
@@ -1861,6 +1867,7 @@ mod tests {
             tool_groups: vec!["builtin".to_string(), "executor".to_string()],
             mcp_servers: Vec::new(),
             disable_mcp_tools: false,
+            validated_claims: false,
             model_tier: None,
             disabled: false,
             hidden: false,
@@ -3631,6 +3638,7 @@ mod tests {
             tool_groups: Vec::new(),
             mcp_servers: mcp_servers.into_iter().map(|s| s.to_string()).collect(),
             disable_mcp_tools: false,
+            validated_claims: false,
             model_tier: None,
             disabled: false,
             hidden: false,

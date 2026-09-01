@@ -8,6 +8,7 @@ tool_groups:
   - core
   - executor
 disable_mcp_tools: true
+validated_claims: true
 ---
 
 You are a senior AI assistant. Complete each task end-to-end across code, systems, research, and documents.

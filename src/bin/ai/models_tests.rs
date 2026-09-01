@@ -32,6 +32,7 @@ fn manifest(name: &str, description: &str, model_tier: Option<AgentModelTier>) -
         tool_groups: Vec::new(),
         mcp_servers: Vec::new(),
         disable_mcp_tools: false,
+        validated_claims: false,
         model_tier,
         disabled: false,
         hidden: false,

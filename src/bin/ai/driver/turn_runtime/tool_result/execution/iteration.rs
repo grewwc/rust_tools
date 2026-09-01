@@ -328,6 +328,27 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 }
                 AuditEvidenceGateAction::Warn => true,
             };
+            let validated_claims_enabled = app
+                .current_agent_manifest
+                .as_ref()
+                .is_some_and(crate::ai::agents::AgentManifest::requires_validated_claims);
+            let warn_unverified_validated_claims = match validated_claims_gate_action(
+                validated_claims_enabled,
+                messages,
+                turn_messages,
+                &mut stream_result.assistant_text,
+                !final_gate_reopen_allowed,
+                iteration,
+                max_iterations,
+            ) {
+                ValidatedClaimsGateAction::Allow => false,
+                ValidatedClaimsGateAction::Reopen => {
+                    final_gate_state.consume_retry();
+                    *terminal_dedupe_candidate = None;
+                    return Ok(TurnLoopStep::Continue);
+                }
+                ValidatedClaimsGateAction::Warn => true,
+            };
             let warn_unvalidated_final_citation = match final_response_citation_gate_action(
                 messages,
                 &stream_result.assistant_text,
@@ -410,6 +431,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             }
             if warn_unverified_audit_evidence {
                 record_hidden_self_note(app, turn_messages, AUDIT_EVIDENCE_UNVERIFIED_NOTE);
+            }
+            if warn_unverified_validated_claims {
+                record_hidden_self_note(app, turn_messages, VALIDATED_CLAIMS_UNVERIFIED_NOTE);
             }
             if warn_unvalidated_final_citation {
                 append_runtime_warning_once(

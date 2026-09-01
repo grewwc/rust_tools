@@ -33,6 +33,7 @@ use super::{
         FinalGateState, audit_evidence_gate_action, completion_evidence_state,
         completion_tool_result_succeeded, handle_iteration_execution_for_model,
         is_evidence_gated_audit_agent, tool_call_is_successful_mutation_candidate,
+        validated_claims_gate_action,
     },
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
 };
@@ -1542,6 +1543,19 @@ async fn run_turn_body(
                             effective_max_iterations,
                         );
                     }
+                    let validated_claims_enabled = app
+                        .current_agent_manifest
+                        .as_ref()
+                        .is_some_and(crate::ai::agents::AgentManifest::requires_validated_claims);
+                    let _ = validated_claims_gate_action(
+                        validated_claims_enabled,
+                        &mut messages,
+                        &turn_messages,
+                        &mut final_assistant_text,
+                        true,
+                        iteration,
+                        effective_max_iterations,
+                    );
                     break 'turn Ok(None);
                 }
 
