@@ -125,7 +125,73 @@ fn audit_requires_the_structured_report_protocol_and_reopens_once() {
         AuditEvidenceGateAction::Warn
     );
     assert!(second_draft.contains("No verified findings could be published"));
-    assert!(!second_draft.contains("same unsupported review claim"));
+    // At the cap the raw draft is preserved (unverified), not silently discarded.
+    assert!(second_draft.contains("Unverified audit draft"));
+    assert!(second_draft.contains("same unsupported review claim"));
+}
+
+#[test]
+fn audit_accepts_the_report_block_embedded_in_surrounding_prose() {
+    let root = temporary_root("embedded-prose");
+    write_fixture(&root);
+    let mut messages = Vec::new();
+    let turn_messages = successful_reads("src/lib.rs");
+    let mut final_text = format!(
+        "Here is my review.\n\n{}\n\nSummary of what I found above.",
+        complete_report("src/lib.rs")
+    );
+
+    assert_eq!(
+        audit_evidence_gate_action(
+            "audit",
+            &mut messages,
+            &turn_messages,
+            &mut final_text,
+            Some(&root),
+            false,
+            1,
+            16,
+        ),
+        AuditEvidenceGateAction::Allow
+    );
+    assert!(final_text.contains("### P1 — A verified defect"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn audit_tolerates_unknown_extra_fields_in_the_report() {
+    let root = temporary_root("extra-fields");
+    write_fixture(&root);
+    let mut messages = Vec::new();
+    let turn_messages = successful_reads("src/lib.rs");
+    let mut report = complete_report("src/lib.rs");
+    // Insert an unknown top-level field and an unknown per-finding field;
+    // strict deserialization would reject the whole report, lenient parsing keeps it.
+    let mut text = report.clone();
+    text = text.replacen(
+        r#""findings": [{"#,
+        r#""notes": "summary of the review process", "findings": [{"notes": "extra", "#,
+        1,
+    );
+    report = text;
+
+    assert_eq!(
+        audit_evidence_gate_action(
+            "audit",
+            &mut messages,
+            &turn_messages,
+            &mut report,
+            Some(&root),
+            false,
+            1,
+            16,
+        ),
+        AuditEvidenceGateAction::Allow
+    );
+    assert!(report.contains("### P1 — A verified defect"));
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

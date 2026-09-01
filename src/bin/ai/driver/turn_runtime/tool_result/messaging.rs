@@ -15,6 +15,7 @@ use crate::ai::{
 
 use super::super::types::PreparedToolResult;
 use super::execution::prepare_recent_tool_result;
+use super::execution::annotate_tool_result_evidence_status;
 
 const TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES: usize = 64_000;
 
@@ -591,31 +592,37 @@ fn prepare_tool_result_for_current_turn(
     tool_call: &ToolCall,
     content: &str,
 ) -> PreparedToolResult {
-    if !exceeds_chars(content, TOOL_RESULT_RAW_HARD_CAP_CHARS) {
-        return prepare_recent_tool_result(app, &tool_call.function.name, content);
-    }
-
-    let content_for_terminal =
-        build_large_current_turn_terminal_preview(&tool_call.function.name, content);
-    let path = write_current_turn_tool_overflow_file(app, &tool_call.function.name, content).ok();
-    let mut content_for_model =
-        build_current_turn_tool_overflow_stub(path.as_ref(), &tool_call.function.name, content);
-    let anchors = current_tool_result_recall_anchors(tool_call);
-    if !anchors.is_empty() {
-        content_for_model.push_str("- original_call:\n");
-        for anchor in anchors {
-            content_for_model.push_str("  ");
-            content_for_model.push_str(&anchor);
-            content_for_model.push('\n');
+    let mut prepared = if !exceeds_chars(content, TOOL_RESULT_RAW_HARD_CAP_CHARS) {
+        prepare_recent_tool_result(app, &tool_call.function.name, content)
+    } else {
+        let content_for_terminal =
+            build_large_current_turn_terminal_preview(&tool_call.function.name, content);
+        let path =
+            write_current_turn_tool_overflow_file(app, &tool_call.function.name, content).ok();
+        let mut content_for_model = build_current_turn_tool_overflow_stub(
+            path.as_ref(),
+            &tool_call.function.name,
+            content,
+        );
+        let anchors = current_tool_result_recall_anchors(tool_call);
+        if !anchors.is_empty() {
+            content_for_model.push_str("- original_call:\n");
+            for anchor in anchors {
+                content_for_model.push_str("  ");
+                content_for_model.push_str(&anchor);
+                content_for_model.push('\n');
+            }
         }
-    }
-    content_for_model.push_str(
-        "- context_policy: result exceeded the current-turn raw hard cap; use the previews and original_call anchors first. Read the overflow archive only when exact omitted text is required.\n",
-    );
-    PreparedToolResult {
-        content_for_model,
-        content_for_terminal,
-    }
+        content_for_model.push_str(
+            "- context_policy: result exceeded the current-turn raw hard cap; use the previews and original_call anchors first. Read the overflow archive only when exact omitted text is required.\n",
+        );
+        PreparedToolResult {
+            content_for_model,
+            content_for_terminal,
+        }
+    };
+    annotate_tool_result_evidence_status(app, tool_call, content, &mut prepared);
+    prepared
 }
 
 fn exceeds_chars(content: &str, max_chars: usize) -> bool {

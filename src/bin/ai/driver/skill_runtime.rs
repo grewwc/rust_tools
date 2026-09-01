@@ -1226,6 +1226,14 @@ fn build_system_prompt(
         include_str!("system_prompts/trust_boundary.md"),
     );
 
+    // ── Tool-result evidence status: `[reference: ...]` markers on historical ──
+    //    data are runtime-injected (see tool_result/execution/evidence_status.rs);
+    //    the model must read them as reference snapshots, not live state.
+    b.push(
+        ContextKind::Behavior,
+        include_str!("system_prompts/tool_result_evidence.md"),
+    );
+
     // ── Compressed-context recovery: absence claims must first search the session ──
     //    archive — never assert "not found" without checking.
     if has_tool(available_tools, "search_overflow") {
@@ -2377,6 +2385,24 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_explains_tool_result_evidence_markers() {
+        // The `[reference: ...]` markers are runtime-injected on historical tool
+        // results; the model must read them as snapshots, not live state. The
+        // guidance is unconditional (every tool result can carry a marker).
+        let mut available = SkipSet::new(16);
+        available.insert("read_file".to_string());
+        available.insert("execute_command".to_string());
+
+        let prompt =
+            build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
+        assert!(prompt.contains("<tool_result_evidence>"));
+        assert!(prompt.contains("[reference: session-history]"));
+        assert!(prompt.contains("[reference: stale-file]"));
+        assert!(prompt.contains("[reference: git-history]"));
+    }
+
+    #[test]
     fn system_prompt_includes_runtime_environment_and_effective_cwd() {
         let available = SkipSet::new(16);
         let effective_cwd = std::env::temp_dir().join("rust_tools_prompt_cwd");
@@ -2472,15 +2498,17 @@ mod tests {
         assert!(prompt.contains("Never perform dangerous operations"));
         assert!(prompt.contains("Never bypass or work around safety mechanisms"));
         assert!(prompt.contains("state the exact command and its consequences and wait for approval"));
-        // Anti-hallucination red line: unconditionally rendered; fact tracing /
-        // evidence calibration is covered by correctness_guardrails, so this only
-        // verifies the purely prohibitive phrasing and the duty to label
-        // inference / unknown.
+        // Anti-hallucination policy: unconditionally rendered. Detailed fact
+        // tracing lives in correctness_guardrails; this test protects the
+        // complementary evidence/inference boundary, metadata limit, and
+        // conclusion-calibration rules.
         assert!(prompt.contains("<no_hallucination>"));
-        assert!(prompt.contains("Never present unverified content"));
-        assert!(prompt.contains(
-            "label inferences with their basis and state unknowns as unknown"
-        ));
+        assert!(prompt.contains("Distinguish evidence from inference"));
+        assert!(prompt.contains("label every inference and state its evidentiary basis"));
+        assert!(prompt.contains("beyond a field's documented semantics"));
+        assert!(prompt.contains("does not establish provenance, lineage, capability, intent, or comparative rank"));
+        assert!(prompt.contains("Calibrate conclusions to the evidence"));
+        assert!(prompt.contains("do not introduce unstated premises, causal links, or facts"));
     }
 
     #[test]
@@ -2620,9 +2648,10 @@ mod tests {
         // session-observed evidence; when evidence is insufficient, one
         // targeted lookup first, otherwise report verified / unknown / next
         // step. The negative provenance tail and the abstention-preference
-        // bullet were trimmed as restatements of no_hallucination's gate
-        // ("state unknowns as unknown"), which owns that duty and must keep
-        // rendering (asserted in
+        // bullet were trimmed as restatements of no_hallucination's
+        // evidence-to-conclusion gate, which requires unresolved questions
+        // to remain distinct from supported findings. That prompt owns the
+        // duty and must keep rendering (asserted in
         // system_prompt_renders_safety_redlines_and_no_hallucination).
         // The efficiency guard lives in task_convergence's stopping rule and
         // must keep rendering.

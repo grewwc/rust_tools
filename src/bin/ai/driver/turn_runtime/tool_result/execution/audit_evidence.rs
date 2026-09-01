@@ -6,8 +6,9 @@ use serde::Deserialize;
 
 pub(in crate::ai::driver::turn_runtime) const AUDIT_EVIDENCE_RETRY_MARKER: &str =
     "[audit-evidence-retry]";
-pub(in crate::ai::driver::turn_runtime) const AUDIT_EVIDENCE_UNVERIFIED_NOTE: &str = "runtime:audit_evidence_withheld\nOne or more audit findings were withheld because their structured evidence could not be verified from current-turn reads.";
+pub(in crate::ai::driver::turn_runtime) const AUDIT_EVIDENCE_UNVERIFIED_NOTE: &str = "runtime:audit_evidence_withheld\nThe audit response was not published as verified findings: either the report did not follow the structured evidence protocol, or its findings lacked a complete current-turn evidence chain.";
 pub(in crate::ai::driver::turn_runtime) const AUDIT_EVIDENCE_WARNING: &str = "[Runtime warning] Audit findings without a complete, current-turn evidence chain were withheld rather than published as verified.";
+pub(in crate::ai::driver::turn_runtime) const AUDIT_EVIDENCE_PARSE_WARNING: &str = "[Runtime warning] The audit draft did not follow the structured evidence protocol; nothing in the draft above is a verified finding.";
 
 const AUDIT_REPORT_OPEN: &str = "<audit_report>";
 const AUDIT_REPORT_CLOSE: &str = "</audit_report>";
@@ -26,7 +27,6 @@ pub(in crate::ai::driver::turn_runtime) enum AuditEvidenceGateAction {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AuditReport {
     #[serde(default)]
     findings: Vec<AuditFinding>,
@@ -37,7 +37,6 @@ struct AuditReport {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AuditFinding {
     severity: String,
     title: String,
@@ -50,7 +49,6 @@ struct AuditFinding {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AuditEvidence {
     path: String,
     start_line: u64,
@@ -146,11 +144,16 @@ fn audit_evidence_retry_or_withhold(
 ) -> AuditEvidenceGateAction {
     let already_retried = current_turn_has_internal_marker(messages, AUDIT_EVIDENCE_RETRY_MARKER);
     if already_retried || force_final_response || iteration >= max_iterations {
-        *final_text = withheld_report.unwrap_or_else(|| {
-            format!(
-                "## Verified findings\n\nNo verified findings could be published because the audit response did not provide a valid structured evidence report.\n\n{AUDIT_EVIDENCE_WARNING}"
-            )
-        });
+        // At the finalization cap the subagent's work must not be silently discarded:
+        // when the report did not even parse, keep the raw draft visible but clearly
+        // labeled as unverified, so the parent agent can still see what was examined.
+        *final_text = match withheld_report {
+            Some(rendered) => rendered,
+            None => {
+                let draft = final_text.clone();
+                render_unparseable_draft(&draft, reason)
+            }
+        };
         return AuditEvidenceGateAction::Warn;
     }
 
@@ -171,16 +174,12 @@ fn audit_evidence_retry_or_withhold(
 }
 
 fn parse_audit_report(text: &str) -> Result<AuditReport, &'static str> {
-    if text.len() > MAX_AUDIT_REPORT_BYTES {
+    let Some(body) = extract_audit_report_body(text) else {
+        return Err("the audit report protocol is missing");
+    };
+    if body.len() > MAX_AUDIT_REPORT_BYTES {
         return Err("the audit report exceeds the protocol size limit");
     }
-    let trimmed = text.trim();
-    let Some(body) = trimmed
-        .strip_prefix(AUDIT_REPORT_OPEN)
-        .and_then(|text| text.strip_suffix(AUDIT_REPORT_CLOSE))
-    else {
-        return Err("the audit report protocol is missing or has text outside the report tag");
-    };
     let report: AuditReport = serde_json::from_str(body.trim())
         .map_err(|_| "the audit report is not valid protocol JSON")?;
     if report.findings.len() > MAX_AUDIT_FINDINGS
@@ -195,6 +194,50 @@ fn parse_audit_report(text: &str) -> Result<AuditReport, &'static str> {
         return Err("the audit report exceeds a protocol size limit");
     }
     Ok(report)
+}
+
+/// Extract the first `<audit_report>...</audit_report>` block from arbitrary
+/// text, tolerating prose before and after it. Models routinely wrap the
+/// protocol payload in a preamble or a closing remark; only the payload block
+/// is parsed, so such prose no longer discards the whole report.
+fn extract_audit_report_body(text: &str) -> Option<&str> {
+    let open = text.find(AUDIT_REPORT_OPEN)?;
+    let after_open = &text[open + AUDIT_REPORT_OPEN.len()..];
+    let close = after_open.find(AUDIT_REPORT_CLOSE)?;
+    Some(&after_open[..close])
+}
+
+/// Render the fallback for a report that could not be parsed at all: keep the
+/// raw draft (bounded) under an explicit "unverified" heading instead of
+/// replacing it with a terse boilerplate string, so the subagent's work is
+/// never fully discarded.
+fn render_unparseable_draft(draft: &str, reason: &str) -> String {
+    let mut out = String::from(
+        "## Verified findings\n\nNo verified findings could be published because the audit response did not provide a valid structured evidence report.\n\n",
+    );
+    out.push_str(&format!(
+        "The audit draft could not be parsed because {reason}. It is preserved below, unverified, for the parent agent's reference.\n\n"
+    ));
+    out.push_str("## Unverified audit draft\n\n");
+    let bounded = bound_draft(draft);
+    out.push_str(bounded);
+    if bounded.len() < draft.len() {
+        out.push_str("\n…[draft truncated at the protocol size limit]");
+    }
+    out.push_str(&format!("\n\n{AUDIT_EVIDENCE_PARSE_WARNING}\n"));
+    out
+}
+
+/// Cap a preserved draft at the protocol size limit, cutting at a char boundary.
+fn bound_draft(draft: &str) -> &str {
+    if draft.len() <= MAX_AUDIT_REPORT_BYTES {
+        return draft;
+    }
+    let mut end = MAX_AUDIT_REPORT_BYTES;
+    while !draft.is_char_boundary(end) {
+        end -= 1;
+    }
+    &draft[..end]
 }
 
 fn finding_has_complete_evidence(
