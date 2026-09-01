@@ -2,8 +2,8 @@
 """Post-process the agent's final answer text before it is printed to the
 terminal: Chinese (fullwidth / ideographic) punctuation that appears inside
 code or file-location contexts is converted to its ASCII equivalent, as are
-fullwidth parentheses in plain prose.  Other Chinese punctuation in plain
-prose is left untouched.
+fullwidth parentheses, colons, and full stops in plain prose.  Other Chinese
+punctuation in plain prose is left untouched.
 
 Contexts that are translated (Chinese -> ASCII punctuation):
 
@@ -16,8 +16,7 @@ Contexts that are translated (Chinese -> ASCII punctuation):
      Chinese punctuation inside such a span is converted -- but a span stops
      at punctuation followed by a CJK ideograph, marking the transition back
      into prose (e.g. `src/main，rs` becomes `src/main,rs` while
-     `src/main，请查看` and `文件：/tmp/x，处理完成。` keep their prose
-     punctuation).
+     `src/main，请查看` keeps its prose comma).
   4. Fullwidth parentheses `（` `）` in plain prose: converted to `(` `)`
      (e.g. `动态指引（code 段）` becomes `动态指引(code 段)`).  This is a
      deliberate exception to the "prose is untouched" rule: technical prose
@@ -27,8 +26,13 @@ Contexts that are translated (Chinese -> ASCII punctuation):
      plus one space), e.g. `有三处：main.rs` becomes `有三处: main.rs`.
      Colons inside fenced blocks, inline code spans, and path spans still
      map to a bare `:` -- a space there would corrupt tokens such as
-     `main.rs:10` or `C:\\Users`.  All other prose punctuation (`，` `。` ...)
+     `main.rs:10` or `C:\\Users`.  All other prose punctuation (`，` `、` ...)
      still stays fullwidth.
+  6. Fullwidth period `。` in plain prose: converted to `. ` (halfwidth
+     period plus one space), e.g. `已处理完成。` becomes `已处理完成. `.
+     As with the colon, periods inside fenced blocks, inline code spans, and
+     path spans still map to a bare `.` -- a space there would corrupt
+     tokens such as `main。rs` (a typo for `main.rs`).
 
 ANSI escape sequences are preserved verbatim and act as token boundaries, so
 the script can also be used as a pipe filter directly on rendered terminal
@@ -193,16 +197,18 @@ def _process_path_run(run):
 
 
 def _translate_prose_punct(text):
-    """Convert remaining fullwidth parentheses to ASCII and the fullwidth
-    colon to `: ` in prose.  Parens and colons inside fenced blocks, inline
-    code spans, and path spans are already translated by the upstream passes
-    with a bare `:` (a space would corrupt tokens such as `main.rs:10` or
-    `C:\\Users`); whatever `（`/`）`/`：` is left is prose-level and gets
-    converted here (see module docstring, exceptions 4-5)."""
+    """Convert remaining fullwidth parentheses to ASCII, the fullwidth colon
+    to `: `, and the fullwidth period to `. ` in prose.  These inside fenced
+    blocks, inline code spans, and path spans are already translated by the
+    upstream passes with a bare `.`/`:` (a space would corrupt tokens such as
+    `main.rs:10`, `C:\\Users`, or `main。rs`); whatever `（`/`）`/`：`/`。`
+    is left is prose-level and gets converted here (see module docstring,
+    exceptions 4-6)."""
     return (
         text.replace("\uff08", "(")
         .replace("\uff09", ")")
         .replace("\uff1a", ": ")
+        .replace("\u3002", ". ")
     )
 
 
@@ -265,7 +271,7 @@ def _selftest():
         # Inline code: everything translated.
         ("调用 `println！（\"你好\"）` 即可", "调用 `println!(\"你好\")` 即可"),
         # Fenced code block: everything translated.
-        ("```python\nprint（1）\n```\n结束。", "```python\nprint(1)\n```\n结束。"),
+        ("```python\nprint（1）\n```\n结束。", "```python\nprint(1)\n```\n结束. "),
         # Path separators: translate CJK punct inside the run.
         ("在 src/main，rs 中", "在 src/main,rs 中"),
         ("打开 C：\\Users\\文档\\a。rs", "打开 C:\\Users\\文档\\a.rs"),
@@ -275,12 +281,19 @@ def _selftest():
         ("错误在 main。rs：10", "错误在 main.rs:10"),
         # Prose transition: comma after a path stays Chinese.
         ("查看 src/main.rs，请确认", "查看 src/main.rs，请确认"),
-        # Prose colon -> ': ' (halfwidth colon plus one space); other prose
-        # punctuation untouched.
-        ("他说：你好，世界。请确认！", "他说: 你好，世界。请确认！"),
-        ("文件：/tmp/x，处理完成。", "文件: /tmp/x，处理完成。"),
+        # Prose colon -> ': ' (halfwidth colon plus one space); prose comma
+        # stays untouched.
+        ("他说：你好，世界。请确认！", "他说: 你好，世界. 请确认！"),
+        ("文件：/tmp/x，处理完成。", "文件: /tmp/x，处理完成. "),
         # Colon at end of line still gets the trailing space.
         ("步骤如下：", "步骤如下: "),
+        # Prose period -> '. ' (halfwidth period plus one space), like the
+        # colon; trailing space is kept even at end of line.
+        ("已完成。下一步继续", "已完成. 下一步继续"),
+        ("已完成。", "已完成. "),
+        # Prose comma stays fullwidth while the sentence-ending period is
+        # converted.
+        ("查看 src/main.rs，请确认。", "查看 src/main.rs，请确认. "),
         # Prose colon directly before an inline code span.
         ("全仓 8000 有三处：`patch_tools.rs:2648` 拦截（源头，功能性）",
          "全仓 8000 有三处: `patch_tools.rs:2648` 拦截(源头，功能性)"),
@@ -295,8 +308,9 @@ def _selftest():
         ("动态指引（`temporary_files` 段，注入 system prompt）",
          "动态指引(`temporary_files` 段，注入 system prompt)"),
         ("查看 src/main.rs（请确认）", "查看 src/main.rs(请确认)"),
-        # Parens and colon converted; other prose punctuation still untouched.
-        ("函数（输入）报错：请重试。", "函数(输入)报错: 请重试。"),
+        # Parens, colon, and period converted; other prose punctuation
+        # still untouched.
+        ("函数（输入）报错：请重试。", "函数(输入)报错: 请重试. "),
     ]
     failures = 0
     for i, (inp, expected) in enumerate(cases, 1):

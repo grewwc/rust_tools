@@ -8,14 +8,14 @@ its own header.
 Display-only post-processor for the agent's terminal body text. Converts
 Chinese (fullwidth/ideographic) punctuation **inside code or file-location
 contexts** to ASCII, plus fullwidth parentheses `（` `）` and fullwidth
-colon `：` (as `: `) in plain prose (deliberate exceptions so mixed
-technical prose reads consistently); all other Chinese punctuation in
-plain prose stays untouched.
+colon `：` (as `: `) and fullwidth period `。` (as `. `) in plain prose
+(deliberate exceptions so mixed technical prose reads consistently); all
+other Chinese punctuation in plain prose stays untouched.
 
 - Contexts translated: fenced code blocks, inline code spans (`` `...` ``),
   and file-path/file-reference spans in prose (path indicators, drive
   prefixes, `name.ext[:line[:col]]`, dotted words followed by a separator),
-  and fullwidth parentheses / colon in plain prose.
+  and fullwidth parentheses / colon / period in plain prose.
 - ANSI escape sequences are preserved verbatim, so it also works as a pipe
   filter directly on rendered terminal output.
 - Filter contract: reads stdin, writes transformed text to stdout.
