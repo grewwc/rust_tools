@@ -319,6 +319,43 @@ fn deepseek_v4_flash_routes_declare_full_context_budget() {
 }
 
 #[test]
+fn gpt_5_x_routes_declare_window_consistent_with_output_cap() {
+    // gpt-5.5 / gpt-5.6 share a 256K context window (confirmed by the provider). A 256K
+    // output cap cannot coexist with a 256K window: prompt + 2048 safety margin would
+    // always exceed it, so the builder would clamp max_tokens below the declared cap on
+    // every request. The gpt-5.6 output cap is therefore 128K (matching gpt-5.5 and the
+    // glm-5.3 half-window pattern), and the window is declared explicitly so a future
+    // tier-default change cannot silently re-clamp max_tokens.
+    for key in ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra"] {
+        assert_eq!(context_window_tokens(key), 256_000, "{key}");
+        assert_eq!(max_output_tokens(key), Some(128_000), "{key}");
+    }
+}
+
+#[test]
+fn all_models_declare_output_cap_below_context_window() {
+    // Registry-wide guard for the output-cap / window pairing convention. The request
+    // builder clamps max_tokens to `window - est_prompt - 2048`, so a max_output_tokens
+    // that reaches or exceeds the effective context window (declared or tier fallback)
+    // is silently unreachable and long generations truncate early. Covers every model,
+    // including ones added later (deepseek-v4-flash and the gpt-5.x / doubao-seed-2.1
+    // families are the known cases that previously relied on an explicit declaration).
+    for def in super::model_names::all() {
+        let Some(out) = def.max_output_tokens else {
+            continue;
+        };
+        let window = context_window_tokens(&def.key);
+        assert!(
+            (out as usize) < window,
+            "{}: max_output_tokens {} must stay below context window {} (declared or tier fallback)",
+            def.key,
+            out,
+            window
+        );
+    }
+}
+
+#[test]
 fn platform_changes_model_handle_but_legacy_adapter_handle_still_resolves() {
     let volcano = "deepseek-v4-flash-volcano";
     let def = super::model_names::find_by_identifier(volcano)

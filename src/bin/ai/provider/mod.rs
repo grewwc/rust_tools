@@ -50,9 +50,14 @@ pub(super) enum ModelQualityTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ReasoningEffort {
-    /// Explicit lowest tier: sends `reasoning_effort: "none"`. Note this differs from "omit the field"
-    /// (`override = Some(None)`, where the server default takes over): `None` is the true
-    /// reasoning floor. The newer gpt-5.6 uses it in place of the removed `minimal`.
+    /// Explicit lowest tier: sends `reasoning_effort: "none"` (`reasoning: {"effort":"none"}` on
+    /// the Responses wire). Differs from "omit the field" (`override = Some(None)`, where the
+    /// server default takes over and keeps thinking on): `None` is the true reasoning floor,
+    /// used by gpt-5.x in place of the removed `minimal`. It is emitted only by the truncation
+    /// ladder's last-resort force-off fallback (`thinking_disabled_override`, see
+    /// `request::reasoning::apply_thinking_force_off_effort`); the graduated ladder itself
+    /// deliberately never sends it (orchestrator.rs) because an explicit none during convergence
+    /// retries would castrate reasoning instead of shrinking it.
     None,
     Minimal,
     Low,

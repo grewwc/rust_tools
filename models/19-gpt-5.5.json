@@ -14,6 +14,7 @@
   "reasoning_effort_conflicts_with_tools": false,
   "reasoning_encrypted_replay": true,
   "subagent_priority": 50,
+  "context_window_tokens": 256000,
   "max_output_tokens": 128000,
   "request_tpm_limit": 600000
 }

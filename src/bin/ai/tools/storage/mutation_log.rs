@@ -39,6 +39,18 @@ static APPEND_LOCK: Mutex<()> = Mutex::new(());
 /// 可用 read_file 读原文件。审计只需知道「改了哪些文件、大致改了什么」，无需逐字节留存。
 const MAX_CONTENT_BYTES: usize = 16 * 1024;
 
+/// Recognizable prefix of the truncation marker. `is_capped` and the rendering
+/// side use it to tell whether a before/after snapshot is complete.
+const TRUNCATED_MARKER: &str = "[truncated ";
+
+/// Per-entry cap for the authoritative diff. The diff is computed from full
+/// content and normally contains only the changed lines, far smaller than the
+/// file itself; in the extreme case (full rewrite) it is capped here. Capping
+/// happens at a line boundary, so the rendered output is still a truthful
+/// partial diff — unlike truncated snapshots, it never misjudges the truncation
+/// edge as a deletion.
+const MAX_DIFF_BYTES: usize = 64 * 1024;
+
 /// 一条文件变更记录。
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct MutationEntry {
@@ -54,6 +66,12 @@ pub(crate) struct MutationEntry {
     pub before: Option<String>,
     /// 改动后内容（删除为 None）。
     pub after: Option<String>,
+    /// Line-level diff of this write computed on the full before/after
+    /// (`- ` old lines / `+ ` new lines). Once a snapshot is truncated a reliable
+    /// diff cannot be rebuilt (the truncation edge reads as a deletion), so this
+    /// diff is the authoritative source for audit and display; old logs that lack
+    /// the field deserialize to None and rendering falls back to snapshot diffs.
+    pub diff: Option<String>,
 }
 
 /// 当前 session 的 mutation log 文件路径。
@@ -82,12 +100,13 @@ pub(crate) fn record(path: &std::path::Path, op: &str, before: Option<&str>, aft
         op: op.to_string(),
         before: before.map(cap_content),
         after: after.map(cap_content),
+        diff: entry_diff(before, after),
     };
     append_entry(&assets_dir.join("mutation_log.jsonl"), &entry);
 }
 
 /// 把内容裁到 `MAX_CONTENT_BYTES` 以内（按字符边界安全截断），超出时附标注。
-fn cap_content(content: &str) -> String {
+pub(crate) fn cap_content(content: &str) -> String {
     if content.len() <= MAX_CONTENT_BYTES {
         return content.to_string();
     }
@@ -96,10 +115,99 @@ fn cap_content(content: &str) -> String {
         end -= 1;
     }
     format!(
-        "{}\n…[truncated {} more bytes; read the file for full content]",
+        "{}\n…{TRUNCATED_MARKER}{} more bytes; read the file for full content]",
         &content[..end],
         content.len() - end
     )
+}
+
+/// Whether `cap_content` truncated the content. Rendering uses this to decide
+/// whether a snapshot can be diffed directly.
+pub(crate) fn is_capped(s: &str) -> bool {
+    s.contains(TRUNCATED_MARKER)
+}
+
+/// Computes the line-level diff of this write from the full before/after. At
+/// record time the content is not yet truncated, so the diff is always reliable;
+/// rendering prefers it over snapshot diffs to avoid false deletions at the
+/// truncation edge. Returns None when there is nothing to show (new empty file
+/// or unchanged content).
+pub(crate) fn entry_diff(before: Option<&str>, after: Option<&str>) -> Option<String> {
+    let out = match (before, after) {
+        (None, None) => return None,
+        (None, Some(a)) => {
+            let lines: Vec<&str> = a.lines().collect();
+            if lines.is_empty() {
+                return None;
+            }
+            let mut out = String::new();
+            for l in &lines {
+                out.push_str(&format!("+ {l}\n"));
+            }
+            out
+        }
+        (Some(b), None) => {
+            let lines: Vec<&str> = b.lines().collect();
+            if lines.is_empty() {
+                return None;
+            }
+            let mut out = String::new();
+            for l in &lines {
+                out.push_str(&format!("- {l}\n"));
+            }
+            out
+        }
+        (Some(b), Some(a)) => {
+            let bv: Vec<&str> = b.lines().collect();
+            let av: Vec<&str> = a.lines().collect();
+            let mut prefix = 0;
+            while prefix < bv.len() && prefix < av.len() && bv[prefix] == av[prefix] {
+                prefix += 1;
+            }
+            let mut suffix = 0;
+            while suffix < bv.len() - prefix
+                && suffix < av.len() - prefix
+                && bv[bv.len() - 1 - suffix] == av[av.len() - 1 - suffix]
+            {
+                suffix += 1;
+            }
+            let mut out = String::new();
+            for l in &bv[prefix..bv.len() - suffix] {
+                out.push_str(&format!("- {l}\n"));
+            }
+            for l in &av[prefix..av.len() - suffix] {
+                out.push_str(&format!("+ {l}\n"));
+            }
+            if out.is_empty() {
+                return None; // before 与 after 完全相同
+            }
+            out
+        }
+    };
+    Some(cap_diff(out))
+}
+
+/// Caps the diff text at `MAX_DIFF_BYTES`, cutting at a line boundary when
+/// possible (never leaves a partial line). The capped diff is the leading
+/// truthful portion, so rendering stays a correct partial view — unlike the
+/// false deletions caused by diffing truncated snapshots.
+fn cap_diff(mut out: String) -> String {
+    if out.len() <= MAX_DIFF_BYTES {
+        return out;
+    }
+    let mut end = MAX_DIFF_BYTES;
+    while end > 0 && !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    // 尽量在最近换行处截断，保证末尾是完整行。
+    while end > 0 && out.as_bytes()[end - 1] != b'\n' {
+        end -= 1;
+    }
+    out.truncate(end);
+    out.push_str(&format!(
+        "…[diff truncated at {MAX_DIFF_BYTES} bytes; see the file for the rest]\n"
+    ));
+    out
 }
 
 /// 是否应跳过该路径的记录。session 运行时目录（sessions root 之下的 assets、
@@ -210,6 +318,53 @@ mod tests {
         let capped = cap_content(&big);
         assert!(capped.len() < big.len());
         assert!(capped.contains("truncated"));
+        // The truncation marker must be recognized by is_capped (rendering uses
+        // it to decide whether a snapshot can be diffed directly).
+        assert!(is_capped(&capped));
+        assert!(!is_capped(small));
+    }
+
+    #[test]
+    fn entry_diff_modify_emits_only_changed_lines() {
+        let before = "a\nb\nc\nd\ne\n";
+        let after = "a\nb\nX\nd\ne\n";
+        assert_eq!(entry_diff(Some(before), Some(after)).as_deref(), Some("- c\n+ X\n"));
+    }
+
+    #[test]
+    fn entry_diff_created_and_deleted_emit_single_sided_lines() {
+        assert_eq!(entry_diff(None, Some("x\ny\n")).as_deref(), Some("+ x\n+ y\n"));
+        assert_eq!(entry_diff(Some("x\ny\n"), None).as_deref(), Some("- x\n- y\n"));
+    }
+
+    #[test]
+    fn entry_diff_none_for_unchanged_or_empty() {
+        assert!(entry_diff(Some("same"), Some("same")).is_none());
+        assert!(entry_diff(None, None).is_none());
+        assert!(entry_diff(None, Some("")).is_none());
+        assert!(entry_diff(Some(""), None).is_none());
+    }
+
+    #[test]
+    fn entry_diff_caps_huge_change_at_line_boundary() {
+        // Full-file rewrite: when the diff exceeds MAX_DIFF_BYTES it must be cut
+        // at a line boundary with a marker, and must never panic.
+        let before = format!("{}\n", "b".repeat(MAX_DIFF_BYTES + 100));
+        let after = format!("{}\n", "a".repeat(MAX_DIFF_BYTES + 100));
+        let d = entry_diff(Some(&before), Some(&after)).unwrap();
+        assert!(d.contains("truncated"));
+        assert!(d.ends_with('\n'));
+    }
+
+    #[test]
+    fn entry_diff_caps_huge_change_with_multibyte_chars() {
+        // Multi-byte characters straddling the 64KiB cap must not panic and the
+        // cut must stay on a line boundary.
+        let before = format!("{}\n", "€€€".repeat(MAX_DIFF_BYTES));
+        let after = format!("{}\n", "¥¥¥".repeat(MAX_DIFF_BYTES));
+        let d = entry_diff(Some(&before), Some(&after)).unwrap();
+        assert!(d.contains("truncated"));
+        assert!(d.ends_with('\n'));
     }
 
     #[test]
@@ -231,6 +386,7 @@ mod tests {
                 op: "write".into(),
                 before: Some("old".into()),
                 after: Some("new".into()),
+                diff: Some("- old\n+ new\n".into()),
             },
         );
         append_entry(
@@ -242,6 +398,7 @@ mod tests {
                 op: "delete".into(),
                 before: Some("gone".into()),
                 after: None,
+                diff: Some("- gone\n".into()),
             },
         );
         let entries = read_entries(&log_path);
@@ -249,8 +406,10 @@ mod tests {
         assert_eq!(entries[0].path, "/proj/a.rs");
         assert_eq!(entries[0].before.as_deref(), Some("old"));
         assert_eq!(entries[0].after.as_deref(), Some("new"));
+        assert_eq!(entries[0].diff.as_deref(), Some("- old\n+ new\n"));
         assert_eq!(entries[1].op, "delete");
         assert_eq!(entries[1].after, None);
+        assert_eq!(entries[1].diff.as_deref(), Some("- gone\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -281,6 +440,7 @@ mod tests {
                 op: "write".into(),
                 before: None,
                 after: Some("x".into()),
+                diff: None,
             },
         );
         // 追加一行非法 JSON，read_entries 应跳过它而保留合法条目。
@@ -290,6 +450,39 @@ mod tests {
         }
         let entries = read_entries(&log_path);
         assert_eq!(entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_entries_defaults_missing_diff_field_to_none() {
+        // Old-format logs have no diff field: deserialization must yield None
+        // (backward compatible) rather than failing to parse.
+        let dir = std::env::temp_dir().join(format!(
+            ".agent_mutation_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Bare OpenOptions does not create parent dirs (append_entry does), so
+        // create it explicitly here.
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("mutation_log.jsonl");
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = writeln!(
+                f,
+                r#"{{"seq":1,"ts":"t","path":"/proj/a.rs","op":"write","before":"old","after":"new"}}"#
+            );
+        }
+        let entries = read_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].before.as_deref(), Some("old"));
+        assert_eq!(entries[0].diff, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

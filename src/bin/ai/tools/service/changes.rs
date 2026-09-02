@@ -303,6 +303,12 @@ fn try_open_single_file_diff(
     if g.before_first.is_none() && g.after_last.is_none() {
         return None;
     }
+    // Truncated snapshots are not the full file, so code --diff would show a
+    // wrong comparison; fall back to the patch path (the patch is built from the
+    // authoritative diff recorded at write time).
+    if !crate::ai::tools::storage::changes::snapshots_full(&g.before_first, &g.after_last) {
+        return None;
+    }
     // 落盘到会话临时目录（与 file_store 沙箱保持一致，避免直接写系统 /tmp 越界）
     let base_tmp = crate::ai::driver::runtime_ctx::temp_dir().unwrap_or_else(|_| std::env::temp_dir());
     let tmp_dir = base_tmp.join(format!("rust_tools_diff_{}", std::process::id()));

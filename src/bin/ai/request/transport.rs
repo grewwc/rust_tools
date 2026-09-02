@@ -32,7 +32,8 @@ use super::normalize::{
     request_tool_names_for_model, strip_unavailable_tool_hints_from_messages,
 };
 use super::reasoning::{
-    apply_prompt_cache_breakpoint, normalize_reasoning_content_replay_for_model,
+    apply_prompt_cache_breakpoint, apply_thinking_force_off_effort,
+    normalize_reasoning_content_replay_for_model,
     prompt_cache_enabled_for_model, reconstruct_encrypted_reasoning_items_for_model,
     resolve_reasoning_effort,
 };
@@ -467,6 +468,20 @@ async fn do_request_messages_with_tool_mode(
         reasoning_effort
     };
     let endpoint = endpoint_for_request_model(app, model);
+    // Truncation-ladder force-off fallback (orchestrator.rs): after repeated truncation the
+    // ladder sets thinking_disabled_override to force thinking off. For effort-only dialects
+    // (OpenAI family / Responses) resolve_thinking=false emits nothing on the wire
+    // (NoThinkingDialect sends no thinking field) and the ladder's Low effort keeps thinking on,
+    // making the fallback a no-op; map it to `reasoning_effort: "none"`, the only value that
+    // actually disables thinking there. Switch-based dialects keep their effort (their off-switch
+    // is already driven by enable_thinking=false).
+    let reasoning_effort = apply_thinking_force_off_effort(
+        app.cli.thinking_disabled_override,
+        models::model_adapter(model),
+        model,
+        &endpoint,
+        reasoning_effort,
+    );
     maybe_emit_responses_reasoning_replay_diagnostic(
         model,
         &endpoint,

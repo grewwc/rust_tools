@@ -635,6 +635,40 @@ fn exact_replay_reasoning_survives_recent_reasoning_window() {
 }
 
 #[test]
+fn encrypted_replay_reasoning_survives_recent_reasoning_window() {
+    let model = "muse-spark-1.2-contributor";
+    let mut messages = Vec::new();
+    for i in 0..5 {
+        let mut assistant = assistant_call(&format!("spark-call-{i}"), "read_file");
+        assistant.reasoning_content = Some(encode_encrypted_reasoning_replay_state(
+            model,
+            &[serde_json::json!({
+                "type": "reasoning",
+                "encrypted_content": format!("ENC-{i}-{}", "x".repeat(64)),
+                "summary": []
+            })],
+        ));
+        messages.push(assistant);
+        messages.push(tool_result(&format!("spark-call-{i}"), "ok"));
+    }
+
+    keep_only_recent_reasoning_content(&mut messages);
+
+    // 5 条 tool-call reasoning 超过保留窗口：不带标记的普通 reasoning 会被裁掉，
+    // 加密回放状态必须全部逐字节保留（与 exact-replay 同等待遇）。
+    assert!(
+        messages
+            .iter()
+            .filter(|m| m.tool_calls.is_some())
+            .all(|m| m
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|r| r.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX))),
+        "encrypted replay 状态不能被通用三轮窗口裁掉"
+    );
+}
+
+#[test]
 fn path_c_preserves_exact_replay_reasoning_verbatim() {
     let model = "glm-5.3-flash";
     let raw_reasoning = "reasoning-state-".repeat(64);
@@ -698,6 +732,68 @@ fn path_c_preserves_exact_replay_reasoning_verbatim() {
         )
         .as_deref(),
         Some(raw_reasoning.as_str())
+    );
+}
+
+#[test]
+fn path_c_preserves_encrypted_replay_reasoning_verbatim() {
+    let model = "muse-spark-1.2-contributor";
+    let raw_items = vec![serde_json::json!({
+        "type": "reasoning",
+        "encrypted_content": format!("ENC-{}", "y".repeat(128)),
+        "summary": []
+    })];
+    let mut assistant = assistant_call("spark-call", "read_file");
+    assistant.reasoning_content = Some(encode_encrypted_reasoning_replay_state(model, &raw_items));
+    let encoded = assistant
+        .reasoning_content
+        .clone()
+        .expect("encrypted replay reasoning should be encoded");
+    assert!(encoded.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX));
+
+    // Path C 的单字段上限不能把 marker+payload 当普通 reasoning 截断。
+    let mut per_field_capped = vec![assistant.clone(), tool_result("spark-call", "ok")];
+    assert!(emergency_cap_messages_to_fit(
+        &mut per_field_capped,
+        usize::MAX,
+        160,
+        None,
+        &FxHashSet::default(),
+    ));
+    assert_eq!(
+        per_field_capped[0].reasoning_content.as_deref(),
+        Some(encoded.as_str())
+    );
+
+    let mut directly_capped = assistant.clone();
+    assert!(!truncate_mutable_field(
+        &mut directly_capped,
+        MutableMessageField::Reasoning,
+        encoded.chars().count(),
+        None,
+        FieldArchivePolicy::BestEffort,
+    ));
+    assert_eq!(
+        directly_capped.reasoning_content.as_deref(),
+        Some(encoded.as_str())
+    );
+
+    // 若加密回放本身已超过总预算，宁可报告未达标，也不能制造不可解码的伪状态。
+    let mut aggregate_capped = vec![assistant, tool_result("spark-call", "ok")];
+    assert!(!emergency_cap_messages_to_fit(
+        &mut aggregate_capped,
+        160,
+        usize::MAX,
+        None,
+        &FxHashSet::default(),
+    ));
+    assert_eq!(
+        aggregate_capped[0].reasoning_content.as_deref(),
+        Some(encoded.as_str())
+    );
+    assert_eq!(
+        decode_encrypted_reasoning_replay_for_model(model, encoded.as_str()),
+        Some(raw_items)
     );
 }
 

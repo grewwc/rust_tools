@@ -1177,6 +1177,45 @@ fn responses_request_body_uses_function_tools_and_nested_reasoning() {
 }
 
 #[test]
+fn responses_force_off_override_emits_none_effort_on_wire() {
+    // The truncation ladder's last-resort force-off fallback (thinking_disabled_override) must
+    // actually disable thinking on the Responses wire. gpt-5.x uses NoThinkingDialect (no
+    // thinking field), so the only lever is reasoning.effort="none"; without the override the
+    // ladder's "low" effort would keep thinking on — the pre-fix no-op.
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let effort = super::reasoning::apply_thinking_force_off_effort(
+        true,
+        crate::ai::provider::ApiProvider::Compatible,
+        "gpt-5.5",
+        "https://dataagent-dev-llm.bytedance.net/v1",
+        Some("low"),
+    );
+    assert_eq!(effort, Some("none"));
+    let request = build_request_body(
+        "gpt-5.5",
+        &messages,
+        false,
+        false,
+        None,
+        None,
+        None,
+        effort,
+        None,
+        None,
+        None,
+    );
+    let body = super::build_responses_request_body(&request);
+    assert_eq!(body["reasoning"]["effort"], "none");
+    assert_eq!(body["reasoning"]["summary"], "auto");
+}
+
+#[test]
 fn responses_search_uses_builtin_web_search_tool() {
     let messages = vec![Message {
         role: "user".to_string(),
@@ -1659,6 +1698,106 @@ fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items
 }
 
 #[test]
+fn responses_request_body_replays_tool_round_narration_before_function_call() {
+    // P2 regression: assistant narration (the text the model produced before dispatching a
+    // tool) was dropped on the Responses wire, while chat-completions keeps it. It must be
+    // replayed as a message item ahead of the function_call items.
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::String("Let me read the file first.".to_string()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let request = RequestBody {
+        model: "gpt-5.5".to_string(),
+        messages: &messages,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: Some("high"),
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: None,
+        reasoning_encrypted_replay: false,
+        estimated_prompt_tokens: 0,
+    };
+
+    let body = super::build_responses_request_body(&request);
+    let input = body["input"].as_array().expect("input array");
+    assert_eq!(input.len(), 2, "narration message + function_call");
+    assert_eq!(input[0]["role"], "assistant");
+    assert_eq!(input[0]["content"][0]["type"], "output_text");
+    assert_eq!(input[0]["content"][0]["text"], "Let me read the file first.");
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_1");
+}
+
+#[test]
+fn responses_request_body_orders_reasoning_narration_function_call() {
+    // A full tool round replays in the provider-streamed order: reasoning items, then the
+    // narration message item, then function_call.
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::String("I need the current directory contents.".to_string()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "list_files".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let mut items = rustc_hash::FxHashMap::default();
+    items.insert(
+        "call_1".to_string(),
+        vec![json!({
+            "type": "reasoning",
+            "id": "rs_abc",
+            "encrypted_content": "ENC",
+            "summary": [],
+        })],
+    );
+    let request = RequestBody {
+        model: "gpt-5.5".to_string(),
+        messages: &messages,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: Some("high"),
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: Some(&items),
+        reasoning_encrypted_replay: true,
+        estimated_prompt_tokens: 0,
+    };
+
+    let body = super::build_responses_request_body(&request);
+    let input = body["input"].as_array().expect("input array");
+    assert_eq!(input.len(), 3, "reasoning + narration message + function_call");
+    assert_eq!(input[0]["type"], "reasoning");
+    assert_eq!(input[1]["role"], "assistant");
+    assert_eq!(input[1]["content"][0]["text"], "I need the current directory contents.");
+    assert_eq!(input[2]["type"], "function_call");
+}
+
+#[test]
 fn deepseek_request_body_uses_thinking_object() {
     let messages = vec![Message {
         role: "user".to_string(),
@@ -1879,6 +2018,63 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
     let mut gpt_messages = vec![projected];
     normalize_reasoning_content_replay_for_model("gpt-5.5", &mut gpt_messages);
     assert_eq!(gpt_messages[0].reasoning_content, None);
+}
+
+/// 加密推理回放 blob（`PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX`）是受保护的
+/// 内部状态：切到要求回传 `reasoning_content` 的 shape-only 模型（DeepSeek 方言）
+/// 时，必须清成空字符串而不是把 blob 原样发给 provider——与 GLM exact 标记切到
+/// DeepSeek 的既有语义（上方测试 2007-2016 行）一致。加密 blob 的模型自身则走
+/// else 分支整体剥离（side-channel 已在 normalize 之前重建，见 transport.rs）。
+#[test]
+fn encrypted_replay_blob_cleared_when_switching_to_shape_only_model() {
+    let items = vec![serde_json::json!({
+        "type": "reasoning",
+        "encrypted_content": "ENC-cross-model-switch",
+        "summary": []
+    })];
+    let blob =
+        crate::ai::history::compress::encode_encrypted_reasoning_replay_state(
+            "muse-spark-1.2-contributor",
+            &items,
+        );
+    assert!(blob.starts_with(
+        crate::ai::history::compress::PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX
+    ));
+
+    let assistant = Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: Some(blob.clone()),
+    };
+
+    let mut switched_to_deepseek = vec![assistant.clone()];
+    normalize_reasoning_content_replay_for_model(
+        "deepseek-v4-flash-free",
+        &mut switched_to_deepseek,
+    );
+    assert_eq!(
+        switched_to_deepseek[0].reasoning_content.as_deref(),
+        Some(""),
+        "加密回放 blob 不能原样发给 DeepSeek provider"
+    );
+
+    // blob 的来源模型（加密回放模型）走 else 分支整体剥离：side-channel 在
+    // normalize 之前已从历史重建（transport.rs），wire 上不应残留 blob。
+    let mut origin_model_messages = vec![assistant];
+    normalize_reasoning_content_replay_for_model(
+        "muse-spark-1.2-contributor",
+        &mut origin_model_messages,
+    );
+    assert_eq!(origin_model_messages[0].reasoning_content, None);
 }
 
 /// Core regression: Alibaba-provider models on the DashScope compatible-mode

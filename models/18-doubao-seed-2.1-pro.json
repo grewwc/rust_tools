@@ -11,6 +11,7 @@
   "enable_thinking": true,
   "default_reasoning_effort": "high",
   "subagent_priority": 50,
-  "max_output_tokens": 400000,
+  "context_window_tokens": 256000,
+  "max_output_tokens": 128000,
   "request_tpm_limit": 500000
 }

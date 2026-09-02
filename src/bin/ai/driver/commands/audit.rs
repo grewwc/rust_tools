@@ -228,17 +228,28 @@ fn capture_git_diff_fallback() -> String {
 fn format_mutation_log(
     entries: &[crate::ai::tools::storage::mutation_log::MutationEntry],
 ) -> String {
-    // (path, first_before, last_after, last_op, write_count, delete_count)
-    let mut summary: Vec<(String, Option<String>, Option<String>, String, usize, usize)> =
+    // (path, first_before, last_after, last_op, write_count, delete_count, diffs)
+    let mut summary: Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        usize,
+        usize,
+        Vec<String>,
+    )> =
         Vec::new();
     for e in entries {
-        if let Some(s) = summary.iter_mut().find(|(p, _, _, _, _, _)| p == &e.path) {
+        if let Some(s) = summary.iter_mut().find(|(p, _, _, _, _, _, _)| p == &e.path) {
             s.2 = e.after.clone();
             s.3 = e.op.clone();
             if e.op == "write" {
                 s.4 += 1;
             } else {
                 s.5 += 1;
+            }
+            if let Some(d) = &e.diff {
+                s.6.push(d.clone());
             }
         } else {
             summary.push((
@@ -248,6 +259,7 @@ fn format_mutation_log(
                 e.op.clone(),
                 if e.op == "write" { 1 } else { 0 },
                 if e.op == "delete" { 1 } else { 0 },
+                e.diff.iter().cloned().collect(),
             ));
         }
     }
@@ -260,7 +272,7 @@ fn format_mutation_log(
     );
     const CAP: usize = 14_000;
     let mut truncated = false;
-    for (i, (path, first_before, last_after, last_op, wc, dc)) in summary.iter().enumerate() {
+    for (i, (path, first_before, last_after, last_op, wc, dc, diffs)) in summary.iter().enumerate() {
         if out.len() >= CAP {
             truncated = true;
             break;
@@ -290,7 +302,20 @@ fn format_mutation_log(
             counts.push_str(&format!("{dc} delete"));
         }
         out.push_str(&format!("{}. {}  [{net}]  ({counts})\n", i + 1, rel));
-        if let Some(diff) = diff_snippet(first_before.as_deref(), last_after.as_deref(), 30) {
+        if !crate::ai::tools::storage::changes::snapshots_full(first_before, last_after)
+            && !diffs.is_empty()
+        {
+            // Truncated snapshots: use the authoritative diff recorded at write
+            // time so the truncation edge is never rendered as a deletion.
+            if let Some(block) =
+                crate::ai::tools::storage::changes::diff_block_from_lines(&diffs.join(""), 30)
+            {
+                out.push_str(&block);
+                out.push_str("\n\n");
+            }
+        } else if let Some(diff) =
+            diff_snippet(first_before.as_deref(), last_after.as_deref(), 30)
+        {
             out.push_str(&diff);
             out.push_str("\n\n");
         }
@@ -597,6 +622,7 @@ model_reason=inherited parent agent current model\n\
             op: "write".into(),
             before: Some("fn a() {}\n".into()),
             after: Some("fn a() { return 1; }\n".into()),
+            diff: Some("- fn a() {}\n+ fn a() { return 1; }\n".into()),
         }];
         let out = format_mutation_log(&entries);
         assert!(out.contains("src/a.rs"));

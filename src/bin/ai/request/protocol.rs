@@ -338,16 +338,28 @@ fn responses_input(
             .as_ref()
             .filter(|calls| !calls.is_empty())
         {
-            // A Responses API tool round is a flat sequence of output items. If this turn's
-            // side channel captured that round's reasoning items (keyed by the first tool_call id),
-            // splice them back verbatim so the model keeps the previous hop's reasoning context
-            // (encrypted), then continue with the function_call items. narration text is still not
-            // re-sent separately.
+            // A Responses API tool round is a flat sequence of output items. Replay it in the
+            // order the provider streamed it: reasoning items (if this turn's side channel
+            // captured them, keyed by the first tool_call id — spliced verbatim so the model keeps
+            // the previous hop's reasoning context), then the narration message item the model
+            // produced before dispatching the tool, then the function_call items. The narration is
+            // preserved on the chat-completions wire (driver/turn_runtime/tool_result/messaging.rs
+            // persists it, truncated to 800 chars), so dropping it here would make Responses lose
+            // the model's intermediate conclusions across tool hops.
             if let Some(items) = reasoning_items
                 .zip(tool_calls.first())
                 .and_then(|(map, first)| map.get(&first.id))
             {
                 input.extend(items.iter().cloned());
+            }
+            let narration_items = responses_message_content(message);
+            if !narration_items.is_empty() {
+                // The Responses API rejects empty output_text, so only emit the message item when
+                // the model actually produced narration.
+                input.push(json!({
+                    "role": "assistant",
+                    "content": narration_items,
+                }));
             }
             for tool_call in tool_calls {
                 input.push(json!({

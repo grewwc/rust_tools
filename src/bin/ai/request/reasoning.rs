@@ -13,7 +13,8 @@ use super::super::{
     history::{Message, is_system_like_role},
     models,
     provider::{
-        ApiProvider, ReasoningEffort, adapter_for, compatible_wire_shapes, thinking_dialect_for,
+        ApiProvider, ReasoningEffort, adapter_for, compatible_wire_shapes,
+        reasoning_effort_reduces_thinking_for, thinking_dialect_for,
     },
     types::App,
 };
@@ -100,16 +101,16 @@ pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages
             continue;
         }
         if shape_only_replay {
-            let carries_exact_replay_marker =
-                message
-                    .reasoning_content
-                    .as_deref()
-                    .is_some_and(|reasoning| {
-                        reasoning.starts_with(
-                            crate::ai::history::compress::PERSISTED_REASONING_REPLAY_PREFIX,
-                        )
-                    });
-            if carries_exact_replay_marker {
+            // 内部持久化状态（exact 或 encrypted 回放标记）绝不能原样发给 provider：
+            // 这类 blob 编码自其他/本模型的 exact 或加密推理状态，跨模型回放既泄漏
+            // 内部状态，也可能被网关当作无效推理文本拒绝。与 GLM exact 标记切到
+            // DeepSeek 的既有语义一致（见 request/tests.rs 的跨模型断言），这里把
+            // 两类标记统一清成空字符串，只保留字段形状。
+            let carries_replay_marker = message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(crate::ai::history::compress::is_persisted_reasoning_replay);
+            if carries_replay_marker {
                 message.reasoning_content = Some(String::new());
             } else {
                 message.reasoning_content.get_or_insert_default();
@@ -243,6 +244,33 @@ pub(crate) fn resolve_reasoning_effort(app: &App, model: &str) -> Option<Reasoni
     models::default_reasoning_effort(model)
 }
 
+/// Apply the truncation ladder's last-resort force-off fallback to the reasoning-effort value.
+///
+/// When `thinking_disabled_override` is active (set by the orchestrator after repeated
+/// truncation when lowering effort alone cannot converge), thinking must actually be turned off
+/// on the wire. For dialects that control thinking solely through `reasoning_effort` (OpenAI
+/// family / Responses — `NoThinkingDialect` sends no thinking field), the only wire value that
+/// disables thinking is `"none"`, so the effort is mapped to `ReasoningEffort::None`. Dialects
+/// with a real off-switch (DashScope `enable_thinking: false`, DeepSeek
+/// `thinking: {"type":"disabled"}`) are already handled through `enable_thinking=false`;
+/// `reasoning_effort_reduces_thinking_for` is false for them, so their effort passes through
+/// unchanged. The graduated effort ladder itself deliberately never sends `"none"`
+/// (orchestrator.rs) — this maps only the force-off fallback, not ladder retries.
+pub(crate) fn apply_thinking_force_off_effort<'a>(
+    thinking_disabled_override: bool,
+    provider: ApiProvider,
+    model: &str,
+    endpoint: &str,
+    effort: Option<&'a str>,
+) -> Option<&'a str> {
+    if thinking_disabled_override && reasoning_effort_reduces_thinking_for(provider, model, endpoint)
+    {
+        Some(ReasoningEffort::None.as_str())
+    } else {
+        effort
+    }
+}
+
 /// 返回输入框中展示的当前请求推理强度。未下发字段时明确标注为服务端默认值，
 /// 避免把「无模型默认档位」误显示为某个具体 effort。
 pub(crate) fn reasoning_effort_display_label(app: &App, model: &str) -> &'static str {
@@ -361,5 +389,73 @@ mod encrypted_replay_reconstruct_tests {
             Some(v) => unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", v) },
             None => unsafe { std::env::remove_var("AIOS_DISABLE_ENCRYPTED_REPLAY") },
         }
+    }
+}
+
+#[cfg(test)]
+mod force_off_effort_tests {
+    use super::apply_thinking_force_off_effort;
+    use crate::ai::provider::ApiProvider;
+
+    const MODELHUB_ENDPOINT: &str = "https://dataagent-dev-llm.bytedance.net/v1";
+
+    #[test]
+    fn responses_model_force_off_maps_to_none() {
+        // gpt-5.x (compatible provider, non-DashScope modelhub endpoint) routes to
+        // NoThinkingDialect: the only thinking lever is reasoning_effort, so the force-off
+        // fallback must emit "none" instead of the ladder's "low".
+        assert_eq!(
+            apply_thinking_force_off_effort(
+                true,
+                ApiProvider::Compatible,
+                "gpt-5.6-sol",
+                MODELHUB_ENDPOINT,
+                Some("low"),
+            ),
+            Some("none"),
+        );
+    }
+
+    #[test]
+    fn force_off_inactive_passes_effort_through() {
+        // Normal requests (auto-detected no-thinking, user config, etc.) must keep the
+        // configured/default effort — only the explicit override maps to "none".
+        assert_eq!(
+            apply_thinking_force_off_effort(
+                false,
+                ApiProvider::Compatible,
+                "gpt-5.6-sol",
+                MODELHUB_ENDPOINT,
+                Some("xhigh"),
+            ),
+            Some("xhigh"),
+        );
+    }
+
+    #[test]
+    fn force_off_keeps_effort_for_switch_based_dialects() {
+        // DashScope `enable_thinking:false` is the real off-switch there, so the effort is left
+        // untouched (sending "none" would be an unverified field on that gateway).
+        assert_eq!(
+            apply_thinking_force_off_effort(
+                true,
+                ApiProvider::Alibaba,
+                "qwen3.7-max-alibaba",
+                crate::ai::provider::ALIBABA_DEFAULT_ENDPOINT,
+                Some("low"),
+            ),
+            Some("low"),
+        );
+        // DeepSeek `thinking:{"type":"disabled"}` is the real off-switch there as well.
+        assert_eq!(
+            apply_thinking_force_off_effort(
+                true,
+                ApiProvider::OpenCode,
+                "deepseek-v4-flash-opencode",
+                "https://api.deepseek.com/v1",
+                Some("low"),
+            ),
+            Some("low"),
+        );
     }
 }

@@ -12,5 +12,6 @@
   "enable_thinking": true,
   "default_reasoning_effort": "high",
   "subagent_priority": 50,
+  "context_window_tokens": 262144,
   "max_output_tokens": 256000
 }
