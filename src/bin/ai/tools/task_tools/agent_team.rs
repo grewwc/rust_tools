@@ -419,7 +419,12 @@ fn member_from_input(input: TeamMemberInput) -> Result<TeamMember, String> {
         // early check deliberately keeps persisted manifests simple and deterministic.
         let allowed = ["history", "memory", "cwd", "skills"];
         let mut seen = FxHashSet::default();
-        for part in input.inherit.split(',').map(str::trim) {
+        // Separator parity with InheritOptions::from_value (',' '+' '/'): descriptions show
+        // defaults in prose style like "cwd+skills", and a comma-only pre-check here would
+        // reject values the final authority accepts. Intentionally stricter than the authority
+        // on duplicates: from_value treats a repeated token as idempotent, this pre-check
+        // fails it, keeping persisted team manifests canonical.
+        for part in input.inherit.split(&[',', '+', '/'][..]).map(str::trim) {
             if !allowed.contains(&part) || !seen.insert(part) {
                 return Err(format!("member {id} has invalid inherit value"));
             }
@@ -1638,6 +1643,30 @@ mod tests {
         let mut short = base;
         short.role = " ".to_string();
         assert!(member_from_input(short).is_err());
+    }
+
+    #[test]
+    fn member_inherit_accepts_plus_and_slash_separators() {
+        // Must stay in sync with InheritOptions::from_value: 'cwd+skills' (prose style from
+        // tool descriptions) parses like 'cwd,skills' here too.
+        let base = TeamMemberInput {
+            id: "worker".to_string(),
+            role: "worker".to_string(),
+            agent: None,
+            model: None,
+            inherit: "none".to_string(),
+            capabilities: Vec::new(),
+        };
+        let mut ok = base.clone();
+        ok.inherit = "cwd+skills".to_string();
+        assert!(member_from_input(ok).is_ok());
+        let mut ok2 = base.clone();
+        ok2.inherit = "history/cwd".to_string();
+        assert!(member_from_input(ok2).is_ok());
+        // Duplicates are still caught across the lenient separators.
+        let mut dup = base;
+        dup.inherit = "cwd+cwd".to_string();
+        assert!(member_from_input(dup).is_err());
     }
 
     #[test]

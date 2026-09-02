@@ -1,10 +1,10 @@
-//! plan 步骤状态机（model / store / render 三层）。
+//! Plan step state machine split into model, store, and render layers.
 //!
-//! - `model`：状态模型（`StepStatus` / `PlanState` 纯数据，无 I/O、无渲染）
-//! - `store`：持久化（显式 `&App`，原子写，路径复用 `driver::assets_dir_for_history`）
-//! - `render`：渲染 + 委派编排提示文案
+//! - `model`: pure `StepStatus` / `PlanState` data without I/O or rendering
+//! - `store`: persistence with explicit `&App`, atomic writes, and shared asset paths
+//! - `render`: user-facing output and delegation guidance
 //!
-//! 本文件承担 `plan_update` 工具入口与模块重导出（`plan` 工具本体在 `plan_tools`）。
+//! This module also hosts the `plan_update` entry point and public re-exports.
 
 mod model;
 mod render;
@@ -40,10 +40,9 @@ fn execute_plan_update(args: &Value) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let app = crate::ai::driver::runtime_ctx::try_current()
-        .map(|ctx| ctx.app_proto.clone())
+    let ctx = crate::ai::driver::runtime_ctx::try_current()
         .ok_or("plan_update requires an active driver session; no session context is available.")?;
-    let (state, transition) = update_plan_step(&app, step, status, note)?;
+    let (state, transition) = update_plan_step(&ctx.app_proto, step, status, note)?;
     let mut result = String::new();
     if let Some(warning) = &transition.warning {
         result.push_str(warning);
@@ -53,14 +52,14 @@ fn execute_plan_update(args: &Value) -> Result<String, String> {
     Ok(result)
 }
 
-/// plan_update 的终端紧凑回显：模型仍收到完整渲染（保持计划锚点完整），终端只回显
-/// 本次变更的步骤行、进度行与可能的终态覆盖警告，避免每次更新都重打整份计划。
+/// Compact terminal echo for plan_update. The model still receives the complete
+/// plan, while the terminal shows only the changed step, progress, and warnings.
 fn compact_plan_update_echo(content: &str, args: &Value) -> String {
     let step = args.get("step").and_then(|v| v.as_u64());
     let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
     let mut out = String::new();
 
-    // 终态覆盖警告：完整渲染若以 "Warning:" 开头，说明本次更新覆盖了既有终态，保留提示。
+    // Preserve a leading warning when the update overrides a terminal status.
     if let Some(first) = content.lines().next()
         && first.starts_with("Warning:")
     {
@@ -73,8 +72,8 @@ fn compact_plan_update_echo(content: &str, args: &Value) -> String {
         if !status.is_empty() {
             out.push_str(&format!(" → {status}"));
         }
-        // 变更后该步的渲染行（含 tool/action/note 后缀），确认具体内容。
-        // parallelizable 步骤的行首有 "  || " 前缀：trim_start 只消空白，需再剥离 "||"。
+        // Include the updated rendered step with its tool, action, and note suffix.
+        // Parallel steps start with `||`, which must be stripped after whitespace.
         let prefix = format!("Step {n}.");
         if let Some(line) = content.lines().find(|l| {
             let t = l.trim_start();
@@ -88,7 +87,7 @@ fn compact_plan_update_echo(content: &str, args: &Value) -> String {
         out.push_str("Plan updated.");
     }
 
-    // 进度行。
+    // Include the aggregate progress line.
     if let Some(progress) = content.lines().find(|l| l.starts_with("Progress: ")) {
         out.push('\n');
         out.push_str(progress);
@@ -145,7 +144,7 @@ Progress: 2/3 steps done, 1 pending.";
             out.contains("Progress: 2/3 steps done, 1 pending."),
             "got: {out}"
         );
-        // 未变更的步骤不回显。
+        // Unchanged steps are omitted from the compact echo.
         assert!(!out.contains("Step 1."), "got: {out}");
         assert!(!out.contains("Step 3."), "got: {out}");
     }
@@ -163,8 +162,7 @@ Progress: 0/2 steps done, 1 running, 1 pending.";
         assert!(out.contains("Step 1 → running"), "got: {out}");
     }
 
-    /// 走真实 `render()` 锁定行格式与紧凑回显提取逻辑的耦合：render 改格式时本测试
-    /// 会失败，提醒同步更新 `compact_plan_update_echo` 的匹配（不要只改手写 fixture）。
+    /// Exercise the real renderer so format changes also require updating compact extraction.
     #[test]
     fn compact_echo_stays_in_sync_with_render_format() {
         let raw = serde_json::json!([
@@ -181,7 +179,7 @@ Progress: 0/2 steps done, 1 running, 1 pending.";
         let out = compact_plan_update_echo(&rendered, &args);
 
         assert!(out.contains("Step 3 → done"), "got: {out}");
-        // parallelizable 前缀 "  || " 应被 trim 掉、不破坏步骤行提取。
+        // The parallel `||` prefix must not prevent extraction of the step line.
         assert!(
             out.contains("Step 3. [execute_command] Check (done)"),
             "got: {out}"

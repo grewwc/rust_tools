@@ -38,9 +38,12 @@ pub fn foreground_stdin_requested() -> bool {
     FOREGROUND_STDIN_REQUESTS.load(Ordering::SeqCst) != 0
 }
 
-/// 前台交互必须在打印提示前调用；抢占标志会让流式 side-note 监听器停止 poll/read，
-/// 恢复 termios 并释放独占租约后，本函数才返回。
-fn acquire_foreground_stdin() -> StdinOwnerGuard {
+/// Foreground interactions must call this before printing the prompt or reading
+/// stdin. Publishing the preemption flag makes the streaming side-note listener
+/// stop poll/read, restore termios, and release its stdin lease; this function
+/// returns only after that handshake completes.
+#[doc(hidden)]
+pub fn acquire_foreground_stdin() -> StdinOwnerGuard {
     FOREGROUND_STDIN_REQUESTS.fetch_add(1, Ordering::SeqCst);
     StdinOwnerGuard {
         owner: Some(lock_stdin_owner()),

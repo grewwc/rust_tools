@@ -704,8 +704,8 @@ async fn run_foreground_resume(
     crate::ai::types::clear_stream_cancel(app);
     crate::ai::tools::registry::common::clear_tool_cancel();
 
-    let driver_ctx = runtime_ctx::DriverContext::new(
-        app.clone(),
+    let driver_ctx = runtime_ctx::DriverContext::from_app_snapshot(
+        app,
         mcp_client.clone(),
         skill_manifests.clone(),
         agent_manifests.clone(),
@@ -1148,8 +1148,8 @@ async fn run_loop(
             // When a non-VL model receives attached images, the main agent no longer
             // calls the OCR tool directly; instead a subagent pinned to a VL model
             // parses the images, then control returns to the main agent.
-            let image_parse_ctx = runtime_ctx::DriverContext::new(
-                app.clone(),
+            let image_parse_ctx = runtime_ctx::DriverContext::from_app_snapshot(
+                app,
                 mcp_client.clone(),
                 skill_manifests.clone(),
                 agent_manifests.clone(),
@@ -1204,8 +1204,8 @@ async fn run_loop(
             os.current_process_id()
         };
 
-        let driver_ctx = runtime_ctx::DriverContext::new(
-            app.clone(),
+        let driver_ctx = runtime_ctx::DriverContext::from_app_snapshot(
+            app,
             mcp_client.clone(),
             skill_manifests.clone(),
             agent_manifests.clone(),

@@ -245,7 +245,7 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
         // latest canonical history.
         return;
     }
-    let task_app = app.clone();
+    let task_app = app.snapshot_for_detached_helper();
     let session_id = task_app.session_id.clone();
     // Background tasks do not own the foreground terminal: compression warnings/logs must not steal the foreground output cursor.
     tokio::spawn(
@@ -552,7 +552,7 @@ pub(super) async fn maybe_generate_session_title(app: &App, run_in_background: b
     }
 
     if run_in_background {
-        let task_app = app.clone();
+        let task_app = app.snapshot_for_detached_helper();
         let session_id = task_app.session_id.clone();
         tokio::spawn(async move {
             generate_session_title_if_missing(&task_app, None).await;
@@ -571,7 +571,7 @@ pub(super) async fn maybe_generate_session_title_for_input(app: &App, user_input
         return;
     }
 
-    let task_app = app.clone();
+    let task_app = app.snapshot_for_detached_helper();
     let session_id = task_app.session_id.clone();
     let user_input = user_input.to_string();
     tokio::spawn(async move {

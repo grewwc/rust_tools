@@ -22,7 +22,7 @@
       },
       "inherit": {
         "type": "string",
-        "description": "Pass a plain string: 'all', 'none', or a comma-separated subset of history/memory/cwd/skills. Default: cwd+skills (history/memory private) — keep it for workspace-touching steps, serial steps hand off via files; 'none' for pure analysis; 'all' only when the subtask needs the full conversation."
+        "description": "Omit for the default: 'cwd,skills' (history/memory private), which is right for workspace-touching steps; serial steps hand off via files. Pass a plain string otherwise: 'all', 'none', or a comma-separated subset of 'history', 'memory', 'cwd', 'skills' (e.g. \"cwd,skills\"); 'none' for pure analysis; 'all' only when the subtask needs the full conversation."
       },
       "response_schema": {
         "type": "object",

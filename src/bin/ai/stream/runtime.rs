@@ -93,6 +93,10 @@ impl StreamPayloadOutcome {
     }
 }
 
+fn initial_stream_processing_state(app: &App) -> StreamProcessingState {
+    StreamProcessingState::with_filters(app.hooks.stream_filters().clone())
+}
+
 pub(super) async fn stream_response(
     app: &mut App,
     response: &mut reqwest::Response,
@@ -100,7 +104,7 @@ pub(super) async fn stream_response(
     terminal_dedupe_candidate: Option<&str>,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
     let mut markers = StreamMarkers::new();
-    let mut state = StreamProcessingState::new();
+    let mut state = initial_stream_processing_state(app);
     state.render.terminal_dedupe = terminal_dedupe_candidate
         .map(str::trim)
         .filter(|candidate| !candidate.is_empty())
@@ -338,6 +342,31 @@ fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::
     Ok(())
 }
 
+/// Show a compact "generating…" hint while the assistant body is being withheld
+/// (defer_assistant_body) and thinking is closed. The final answer is streamed but
+/// not rendered until the completion/citation gates accept it, so without this the
+/// terminal stays blank for the whole generation. Upgrades the initial "waiting…"
+/// line in place (cursor up + clear + rewrite) and stays put until
+/// `clear_waiting_hint` fires — at the next renderable chunk or at stream end.
+fn show_deferred_body_buffering_hint(state: &mut StreamProcessingState) -> io::Result<()> {
+    if !io::stdout().is_terminal()
+        || state.render.waiting_hint_buffering
+        || state.render.waiting_hint_tool_call
+    {
+        return Ok(());
+    }
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if state.render.waiting_hint_active {
+        write!(out, "\x1b[1A\r\x1b[2K")?;
+    }
+    writeln!(out, "  {ACCENT_MUTED}⠋ generating…{RESET}")?;
+    out.flush()?;
+    state.render.waiting_hint_active = true;
+    state.render.waiting_hint_buffering = true;
+    Ok(())
+}
+
 pub(super) fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     if !state.render.waiting_hint_active {
         return Ok(());
@@ -565,6 +594,9 @@ fn finalize_stream_response(
         let suppress_duplicate = final_assistant_matches_terminal_dedupe(&state);
         disable_terminal_dedupe(&mut state, suppress_duplicate)?;
         state.render.markdown.flush_pending()?;
+        // Residual content committed below may have re-shown the deferred-body hint;
+        // the stream is over, so clear it before the driver renders the final answer.
+        clear_waiting_hint(&mut state)?;
     }
 
     if take_stream_cancelled(app) {
@@ -1131,7 +1163,16 @@ fn commit_visible_content(
     let render_terminal = runtime_ctx::terminal_output_enabled();
     if render_terminal {
         normalize_end_thinking_boundary(&mut content, markers, &state.render.markdown);
-        clear_waiting_hint(state)?;
+        if state.content.thinking_open || !state.render.defer_assistant_body {
+            // Renderable content (thinking, or body with the deferral off): the
+            // waiting/buffering hint is no longer needed.
+            clear_waiting_hint(state)?;
+        } else {
+            // Deferred-body buffering: the final answer is withheld from the
+            // terminal until the gates accept it. Keep a hint on its own line so
+            // the terminal is never silently blank while the model generates.
+            show_deferred_body_buffering_hint(state)?;
+        }
     }
 
     // When thinking fold mode is active and an end_thinking_tag arrives, do the final fold render

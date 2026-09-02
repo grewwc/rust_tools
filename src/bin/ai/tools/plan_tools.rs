@@ -17,14 +17,14 @@ fn execute_plan(args: &Value) -> Result<String, String> {
         return Err("Plan must contain at least one step.".to_string());
     }
 
-    // 渲染走统一路径：按当前参数构建状态模型并经 `PlanState::render` 输出（与
-    // `plan_update` 共用同一渲染路径，不再在 execute_plan 里维护一套重复格式化）。
-    // 随后尝试把本次规划登记为会话级状态（plan_update 据此更新）；登记失败不阻塞
-    // plan 输出本身，但追加提示行，避免损坏/不可写的状态文件被静默吞没。
+    // Render through the shared state model and `PlanState::render`, which is also
+    // used by `plan_update`, rather than maintaining duplicate formatting here.
+    // Then register the plan as session state for later updates. Registration
+    // failures do not suppress the plan output, but must remain visible as a warning.
     let rendered = crate::ai::tools::plan_state::PlanState::build(summary, steps, None)?.render();
-    if let Some(app) = crate::ai::driver::runtime_ctx::try_current().map(|ctx| ctx.app_proto.clone()) {
-        match crate::ai::tools::plan_state::record_plan(&app, summary, steps) {
-            // 登记成功：按持久化状态渲染（重规划时保留已完成步骤的后缀与进度行）。
+    if let Some(ctx) = crate::ai::driver::runtime_ctx::try_current() {
+        match crate::ai::tools::plan_state::record_plan(&ctx.app_proto, summary, steps) {
+            // Render persisted state so replanning preserves completed-step suffixes and progress.
             Ok(state) => Ok(state.render()),
             Err(e) => Ok(format!(
                 "{rendered}\nWarning: could not register this plan as session state (plan_update will fail until this is fixed): {e}\n"
@@ -44,7 +44,7 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// plan 工具的输出对用户有较高可见性价值，开启结果回显。
+// Plan output has high user-facing value, so show the result.
 inventory::submit!(ToolDisplayRegistration {
     name: "plan",
     config: ToolDisplayConfig {
@@ -55,10 +55,10 @@ inventory::submit!(ToolDisplayRegistration {
     },
 });
 
-// plan 是任务路线图锚点：最新一版必须完整保留（不受有损压缩，也不被 LLM 裁剪），
-// 这由最近工具组保护窗口 (`KEEP_RECENT_TOOL_GROUPS`) 自动实现。旧版 plan 一旦被
-// 新版替换，可被有损压缩摘要以释放上下文；但仍禁止 LLM 单方裁剪为占位符，避免
-// 模型自己否定既有规划。
+// The latest plan is the task-roadmap anchor and must remain complete. The recent
+// tool-group retention window (`KEEP_RECENT_TOOL_GROUPS`) protects it from lossy
+// compression. Superseded plans may be summarized, but model-directed pruning is
+// still forbidden so the model cannot invalidate the roadmap on its own.
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "plan",
     policy: ToolHistoryPolicy {
@@ -140,7 +140,7 @@ mod tests {
             ]
         });
         let result = execute_plan(&args).unwrap();
-        // 显式 parallelizable=true + delegate=true：两个并行委派步 → 并发 task_spawn 分支。
+        // Explicit parallelizable delegated steps should use concurrent task_spawn branches.
         assert!(result.contains("||"));
         assert!(result.contains("[delegate]"));
         assert!(result.contains("2 step(s) marked for delegation."));
@@ -170,7 +170,7 @@ mod tests {
         assert!(result.contains("[delegate]"));
         assert!(result.contains("1 step(s) marked for delegation."));
         assert!(!result.contains("can run in parallel."));
-        // 串行委派步 → 逐个同步 `task`；绝不并发。
+        // Serial delegated steps use synchronous `task` calls one at a time.
         assert!(result.contains("synchronous `task`"));
         assert!(result.contains("one at a time"));
         assert!(!result.contains("task_spawn"));
@@ -242,8 +242,8 @@ mod tests {
 
     #[test]
     fn test_plan_mixed_parallel_and_serial_delegates() {
-        // 一个并行委派步 + 一个串行委派步：并行步用 task_spawn 并发跑，串行步逐个同步
-        // `task`，两条建议都出现。
+        // Mixed plans should recommend task_spawn for the parallel step and
+        // synchronous `task` for the serial step.
         let args = serde_json::json!({
             "summary": "One independent fix plus one dependent step",
             "steps": [
@@ -266,7 +266,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        // Drop guard：即使断言 panic 也保证临时目录被清理，避免测试失败泄漏垃圾目录。
+        // The drop guard cleans the temporary directory even when an assertion panics.
         struct TempDirGuard(std::path::PathBuf);
         impl Drop for TempDirGuard {
             fn drop(&mut self) {
@@ -274,10 +274,9 @@ mod tests {
             }
         }
 
-        // 回归：plan_update 把步骤标记为 done 后，重新调用 `plan`（修订计划、续会话
-        // 压缩后重锚定都会触发）的回显必须带持久化的状态后缀与进度行。此前 execute_plan
-        // 只按原始参数渲染，重规划后已完成步骤的状态从回显中消失，agent 会误以为进度
-        // 丢失而从头开始。
+        // Regression: after plan_update marks a step done, invoking `plan` again must
+        // preserve the persisted status suffix and progress line. Rendering only the
+        // raw arguments made completed steps appear pending after replanning.
         let base = std::env::temp_dir().join(format!(
             "plan-tools-replan-test-{}-{}",
             std::process::id(),
@@ -290,10 +289,9 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let _guard = TempDirGuard(base.clone());
         let mut app = crate::ai::middleware::test_util::test_app();
-        // plan 状态路径由 `session_history_file` 推导（见 plan_state::store::plan_state_path），
-        // 不是 `config.history_file`。必须把它指到临时目录内，否则测试会把 plan-state.json
-        // 写到共享的 `default.assets/`（session_history_file 为空时的回退路径），造成跨测试
-        // 运行的状态泄漏与"首轮通过、次轮必挂"的抖动。
+        // The plan state path is derived from `session_history_file`, not
+        // `config.history_file`. Keep it under the temporary directory to prevent
+        // state leaking through the shared `default.assets/` fallback between runs.
         app.session_history_file = base.join("session.sqlite");
         app.session_id = "plan-tools-replan-test".to_string();
 
@@ -313,12 +311,12 @@ mod tests {
         );
 
         let result = DRIVER_CTX.sync_scope(ctx, || {
-            // 首次规划：全新计划，全部 pending，无状态后缀。
+            // A new plan starts with every step pending and no status suffix.
             let first = execute_plan(&args).unwrap();
             assert!(!first.contains("(done)"));
             assert!(!first.contains("Progress: 1/2 steps done."));
 
-            // 完成第 1 步并落盘（即 plan_update 走过的 load→mutate→save 路径）。
+            // Persist step 1 through the same load-mutate-save path as plan_update.
             crate::ai::tools::plan_state::update_plan_step(
                 &app,
                 1,
@@ -327,8 +325,8 @@ mod tests {
             )
             .unwrap();
 
-            // 重新调用 plan（同参数重新规划）：回显必须保留已完成步骤的 (done) 后缀，
-            // 并显示进度行；未完成的第 2 步保持无状态后缀。
+            // Replanning with the same arguments must preserve the completed suffix
+            // and progress line while leaving the pending step suffix-free.
             let replan = execute_plan(&args).unwrap();
             assert!(
                 replan.contains("Step 1. [read_file] Read file A (done)"),

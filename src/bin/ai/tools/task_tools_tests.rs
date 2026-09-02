@@ -18,6 +18,28 @@ use super::{
     wrap_subagent_prompt,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
+
+#[test]
+fn inherit_options_accepts_plus_and_slash_separators() {
+    // Regression: descriptions used to render the default as prose ("cwd+skills"), and a
+    // model copying that verbatim hit a hard parse error under comma-only splitting.
+    let canonical = InheritOptions::from_value(&serde_json::json!("cwd,skills")).unwrap();
+    assert_eq!(canonical, InheritOptions::default());
+    assert_eq!(
+        InheritOptions::from_value(&serde_json::json!("cwd+skills")).unwrap(),
+        canonical
+    );
+    assert_eq!(
+        InheritOptions::from_value(&serde_json::json!("cwd/skills")).unwrap(),
+        canonical
+    );
+    assert_eq!(
+        InheritOptions::from_value(&serde_json::json!("history + memory/cwd")).unwrap(),
+        InheritOptions::from_value(&serde_json::json!("history,memory,cwd")).unwrap()
+    );
+    // Unknown tokens are still rejected after splitting on the lenient separators.
+    assert!(InheritOptions::from_value(&serde_json::json!("cwd+telepathy")).is_err());
+}
 use crate::ai::cli::ParsedCli;
 use crate::ai::driver::runtime_ctx::{
     DRIVER_CTX, DriverContext, SubagentProgressEvent, SubagentProgressEventKind,

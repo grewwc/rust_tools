@@ -2,6 +2,7 @@ use super::super::inline_recovery::normalize_tool_call_arguments;
 use super::*;
 use crate::ai::{
     cli::ParsedCli,
+    ports::stream::StreamFilter,
     tools::os_tools::{GLOBAL_OS, init_os_tools_globals},
     types::{App, AppConfig},
 };
@@ -17,6 +18,43 @@ const REPORTED_FULLWIDTH_DSML_TOOL_CALL: &str = r#"<｜｜DSML｜｜tool_calls>
 <｜｜DSML｜｜parameter name="offset" string="false">110</｜｜DSML｜｜parameter>
 </｜｜DSML｜｜invoke>
 </｜｜DSML｜｜tool_calls>"#;
+
+struct PrefixStreamFilter;
+
+impl StreamFilter for PrefixStreamFilter {
+    fn filter(&self, chunk: &str) -> Option<String> {
+        Some(format!("filtered:{chunk}"))
+    }
+
+    fn name(&self) -> &str { "prefix" }
+}
+
+#[test]
+fn app_registered_stream_filters_reach_runtime_state() {
+    let mut app = crate::ai::middleware::test_util::test_app();
+    app.hooks.register_stream_filter(PrefixStreamFilter);
+
+    let state = initial_stream_processing_state(&app);
+
+    assert_eq!(
+        state.filters.apply("chunk".to_string()),
+        Some("filtered:chunk".to_string())
+    );
+}
+
+#[test]
+fn forked_app_inherits_stream_filters_for_initial_state() {
+    // Regression: forked turns (subagents / background) run their own
+    // stream_response on an App fork; the fork must inherit the parent's
+    // registered stream filter chain instead of silently using an empty one.
+    let mut app = crate::ai::middleware::test_util::test_app();
+    app.hooks.register_stream_filter(PrefixStreamFilter);
+
+    let fork = app.fork_for_subagent();
+    let state = initial_stream_processing_state(&fork);
+
+    assert_eq!(state.filters.names(), vec!["prefix"]);
+}
 
 #[test]
 fn prompt_cache_metrics_none_without_hit() {

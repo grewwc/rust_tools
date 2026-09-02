@@ -39,10 +39,14 @@ pub(super) struct AppConfig {
     pub(super) intent_model: Option<String>,
 }
 
-/// Main application state holding CLI arguments, configuration,
-/// HTTP client, session data, and streaming control flags.
-impl Clone for App {
-    fn clone(&self) -> Self {
+impl App {
+    /// Create the common isolated baseline used by driver snapshots and child work.
+    ///
+    /// Process-local extensions and one-shot foreground state are intentionally reset,
+    /// while shared runtime handles keep their existing `Arc` identity. One exception:
+    /// the stream filter chain is inherited (Arc-shared) so that forked turns apply the
+    /// same content-transformation policy as the foreground turn.
+    fn fork_baseline(&self) -> Self {
         Self {
             cli: self.cli.clone(),
             config: self.config.clone(),
@@ -78,9 +82,17 @@ impl Clone for App {
             // Same policy as `tool_middlewares`: process-level LLM request
             // middleware strategy does not propagate through clone.
             llm_middlewares: Vec::new(),
-            // Same policy as `observers`/`tool_middlewares`: the process-level hook
-            // registry does not propagate through clone.
-            hooks: HookRegistry::new(),
+            // Same policy as `observers`/`tool_middlewares`: stage/global hook
+            // callbacks do not propagate through clone (subagents/background are
+            // independent). The stream filter chain is the exception: it is a
+            // content-transformation policy whose output lands in parent history and
+            // subagent payloads, so forked turns must apply the parent's chain too
+            // (see HookRegistry::inherit_stream_filters).
+            hooks: {
+                let mut hooks = HookRegistry::new();
+                hooks.inherit_stream_filters(&self.hooks);
+                hooks
+            },
             last_known_prompt_tokens: self.last_known_prompt_tokens,
             last_known_cached_prompt_tokens: self.last_known_cached_prompt_tokens,
             goal_mode: self.goal_mode.clone(),
@@ -91,12 +103,24 @@ impl Clone for App {
             stale_patch_targets: self.stale_patch_targets.clone(),
         }
     }
+
+    pub(super) fn snapshot_for_driver_context(&self) -> Self {
+        self.fork_baseline()
+    }
+
+    pub(super) fn fork_for_subagent(&self) -> Self {
+        self.fork_baseline()
+    }
+
+    pub(super) fn snapshot_for_detached_helper(&self) -> Self {
+        self.fork_baseline()
+    }
 }
 
-impl App {
-    #[allow(dead_code)]
-    pub(super) fn clone_without_observers_intentionally(&self) -> Self {
-        self.clone()
+#[cfg(test)]
+impl Clone for App {
+    fn clone(&self) -> Self {
+        self.fork_baseline()
     }
 }
 
@@ -487,4 +511,107 @@ pub(super) struct FileParseResult {
     pub(super) text_files: Vec<String>,
     pub(super) image_files: Vec<String>,
     pub(super) binary_files: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, sync::Arc};
+
+    use super::PendingSkillContinuation;
+    use crate::ai::{
+        driver::observer::TurnObserver,
+        middleware::{RequestMiddleware, ToolMiddleware, test_util::test_app},
+        ports::{llm::LlmClient, stream::PassthroughFilter, tool::ToolExecutor},
+        prompt::PromptEditor,
+    };
+
+    struct MarkerObserver;
+
+    impl TurnObserver for MarkerObserver {}
+
+    struct PassthroughToolMiddleware;
+
+    impl ToolMiddleware for PassthroughToolMiddleware {
+        fn name(&self) -> &'static str {
+            "passthrough-tool"
+        }
+
+        fn wrap(&self, inner: Box<dyn ToolExecutor>) -> Box<dyn ToolExecutor> {
+            inner
+        }
+    }
+
+    struct PassthroughRequestMiddleware;
+
+    impl RequestMiddleware for PassthroughRequestMiddleware {
+        fn name(&self) -> &'static str {
+            "passthrough-request"
+        }
+
+        fn wrap(&self, inner: Box<dyn LlmClient>) -> Box<dyn LlmClient> {
+            inner
+        }
+    }
+
+    #[test]
+    fn app_forks_reset_process_local_state_and_preserve_shared_handles() {
+        let mut app = test_app();
+        app.pending_skill_continuation = Some(PendingSkillContinuation {
+            skill_names: vec!["continuation".to_string()],
+        });
+        app.prompt_editor = Some(PromptEditor::new(
+            "clone-characterization",
+            Path::new("clone-characterization.sqlite"),
+        ));
+        app.observers = vec![Box::new(MarkerObserver)];
+        app.tool_middlewares = vec![Arc::new(PassthroughToolMiddleware)];
+        app.llm_middlewares = vec![Arc::new(PassthroughRequestMiddleware)];
+        app.hooks
+            .register_global_before("clone-characterization", |_| Ok(()));
+        app.hooks.register_stream_filter(PassthroughFilter);
+        app.forced_skills = vec!["source-skill".to_string()];
+        app.prune_marks.insert("source-call".to_string(), 1);
+
+        let mut cloned = app.fork_for_subagent();
+
+        let driver_snapshot = app.snapshot_for_driver_context();
+        let detached_snapshot = app.snapshot_for_detached_helper();
+        assert!(driver_snapshot.pending_skill_continuation.is_none());
+        assert!(driver_snapshot.tool_middlewares.is_empty());
+        assert!(detached_snapshot.pending_skill_continuation.is_none());
+        assert!(detached_snapshot.tool_middlewares.is_empty());
+
+        assert!(cloned.pending_skill_continuation.is_none());
+        assert!(cloned.prompt_editor.is_none());
+        assert!(cloned.observers.is_empty());
+        assert!(cloned.tool_middlewares.is_empty());
+        assert!(cloned.llm_middlewares.is_empty());
+        // Stream filters are content-transformation policy: forked turns must apply
+        // the parent's registered filters (their output lands in parent history and
+        // subagent payloads), while stage/global hook callbacks stay process-local.
+        assert_eq!(cloned.hooks.stream_filters().len(), 1);
+        assert_eq!(driver_snapshot.hooks.stream_filters().len(), 1);
+        assert_eq!(detached_snapshot.hooks.stream_filters().len(), 1);
+        // len() counts only the inherited filter: the registered global hook did not
+        // propagate into any fork.
+        assert_eq!(cloned.hooks.len(), 1);
+
+        assert!(Arc::ptr_eq(&app.shutdown, &cloned.shutdown));
+        assert!(Arc::ptr_eq(&app.streaming, &cloned.streaming));
+        assert!(Arc::ptr_eq(&app.cancel_stream, &cloned.cancel_stream));
+        assert!(Arc::ptr_eq(&app.os, &cloned.os));
+
+        cloned.forced_skills.push("clone-only-skill".to_string());
+        cloned.prune_marks.insert("clone-only-call".to_string(), 2);
+        assert_eq!(app.forced_skills, ["source-skill"]);
+        assert_eq!(app.prune_marks.len(), 1);
+        assert_eq!(app.prune_marks.get("source-call"), Some(&1));
+
+        assert!(app.pending_skill_continuation.is_some());
+        assert!(app.prompt_editor.is_some());
+        assert_eq!(app.observers.len(), 1);
+        assert_eq!(app.tool_middlewares.len(), 1);
+        assert_eq!(app.llm_middlewares.len(), 1);
+        assert_eq!(app.hooks.len(), 2);
+    }
 }

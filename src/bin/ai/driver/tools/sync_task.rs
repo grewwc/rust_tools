@@ -188,7 +188,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         "task tool requires an active driver turn (DRIVER_CTX is not set)".to_string()
     })?;
 
-    let mut task_app = ctx.app_proto.clone();
+    let mut task_app = ctx.app_proto.fork_for_subagent();
     // Driver-internal dispatch options (the task tool schema seen by model calls has neither
     // field, so they never match):
     // - `image_files`: attaches images directly to the sub-agent's first user message so a VL
@@ -330,8 +330,8 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let model = prepared.model.clone();
     let auto_model_fallback = prepared.auto_model_fallback;
 
-    let spawn_driver_ctx = DriverContext::new(
-        subagent_app.clone(),
+    let spawn_driver_ctx = DriverContext::from_app_snapshot(
+        &subagent_app,
         task_mcp_for_spawn.clone(),
         task_skill_manifests_for_spawn.clone(),
         task_agent_manifests_for_spawn.clone(),
@@ -925,7 +925,7 @@ mod tests {
             Ok(())
         });
 
-        suppress_subagent_terminal_output(fut).await;
+        let _ = suppress_subagent_terminal_output(fut).await;
 
         assert!(
             !rx.await

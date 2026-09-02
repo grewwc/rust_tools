@@ -30,7 +30,7 @@
             },
             "inherit": {
               "type": "string",
-              "description": "Optional inheritance control: 'all' (history, memory, cwd, skills), 'none' (fresh context), or a comma-separated subset of history, memory, cwd, skills. Default: cwd+skills only (history and memory kept private). Keep the default (or 'cwd') for delegated steps that touch the workspace - serial steps hand off via files. Use 'none' only for pure analysis that never touches the workspace; 'all' only when the subtask depends on the full conversation."
+              "description": "Optional inheritance control; omit for the default 'cwd,skills' (history and memory kept private). Otherwise a plain string: 'all', 'none', or a comma-separated subset of 'history', 'memory', 'cwd', 'skills' (e.g. \"cwd,skills\"). Keep the default (or 'cwd') for delegated steps that touch the workspace - serial steps hand off via files. Use 'none' only for pure analysis that never touches the workspace; 'all' only when the subtask depends on the full conversation."
             },
             "response_schema": {
               "type": "object",

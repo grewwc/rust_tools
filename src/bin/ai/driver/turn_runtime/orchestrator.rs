@@ -203,6 +203,47 @@ pub(super) use notes::record_force_final_reason;
 mod tests;
 
 #[derive(Default)]
+struct TurnOutputState {
+    assistant_text: String,
+    assistant_recorded: bool,
+    response_model: Option<String>,
+    terminal_dedupe_candidate: Option<String>,
+    validation_status: Option<crate::ai::request::TransientStatusLine>,
+    gate: FinalGateState,
+    had_tool_error: bool,
+}
+
+struct TurnRetryState {
+    consecutive_empty_responses: usize,
+    consecutive_truncations: usize,
+    consecutive_stream_errors: usize,
+    saved_effort_override: Option<Option<crate::ai::provider::ReasoningEffort>>,
+    saved_thinking_disabled: bool,
+    saved_max_tokens_override: Option<u32>,
+    max_tokens_downgraded: bool,
+}
+
+impl TurnRetryState {
+    fn capture(app: &App) -> Self {
+        Self {
+            consecutive_empty_responses: 0,
+            consecutive_truncations: 0,
+            consecutive_stream_errors: 0,
+            saved_effort_override: app.cli.reasoning_effort_override,
+            saved_thinking_disabled: app.cli.thinking_disabled_override,
+            saved_max_tokens_override: app.cli.max_tokens_override,
+            max_tokens_downgraded: false,
+        }
+    }
+
+    fn restore_overrides(&self, app: &mut App) {
+        app.cli.reasoning_effort_override = self.saved_effort_override;
+        app.cli.thinking_disabled_override = self.saved_thinking_disabled;
+        app.cli.max_tokens_override = self.saved_max_tokens_override;
+    }
+}
+
+#[derive(Default)]
 struct TurnSupervisor {
     iteration: usize,
     skip_tool_signature_rounds: usize,
@@ -1070,43 +1111,30 @@ async fn run_turn_body(
     let mut supervisor = TurnSupervisor::default();
     let mut force_final_response = false;
     let mut pre_timeout_wrap_up_requested = false;
-    let mut final_assistant_text = String::new();
-    let mut final_assistant_recorded = false;
-    let mut final_response_model = None::<String>;
-    let mut terminal_dedupe_candidate = None;
-    let mut final_validation_status = None;
-    let mut final_gate_state = FinalGateState::default();
+    let mut output = TurnOutputState::default();
     // Collect the names of explicit-enabled tools actually called this turn; used to age
     // out unused entries at the end of the turn.
     let mut tools_used_this_turn: rust_tools::cw::SkipSet<String> =
         rust_tools::cw::SkipSet::default();
-    let mut consecutive_empty_responses: usize = 0;
-    let mut consecutive_truncations: usize = 0;
     // Count stream-read-interruption truncations (stream_error) separately. They are
     // unrelated to overlong model output (network jitter / server-side stream drop), so
     // they neither participate in reasoning downgrades nor accumulate
     // consecutive_truncations; still, sustained stream drops need a bounded fallback, or
     // a background task with a usize::MAX iteration budget would retry forever.
-    let mut consecutive_stream_errors: usize = 0;
-    let mut turn_had_tool_error = false;
     // Save the reasoning-effort override in effect when this turn starts (either the
     // user's explicit `/model effort` choice, or None = model default). Truncation
     // retries temporarily lower it to Low to give the output-token budget to actual
     // content; restore it uniformly at turn end (including all break exits) so the
     // user's session-level setting is never polluted.
-    let saved_effort_override = app.cli.reasoning_effort_override;
     // Likewise save the thinking fallback switch: truncation retries may set it to force
     // the thinking chain of always-thinking models off; restore it at turn end so later
     // turns are unaffected.
-    let saved_thinking_disabled = app.cli.thinking_disabled_override;
     // Similarly save the adaptive max_tokens override: on a zero-output truncation we
     // automatically lower max_tokens and retry. The downgrade is temporary — restore the
     // original value as soon as there is normal output (normal completion or normal
     // truncation), because the original value is itself reasonable (the first request
     // succeeded). Also restored as a safety net at turn end.
-    let saved_max_tokens_override = app.cli.max_tokens_override;
-    // Whether we are currently in the zero-output downgraded state.
-    let mut mt_downgraded = false;
+    let mut retry = TurnRetryState::capture(app);
     // VL image-digest (429 TPM mitigation) state: pending_digest_source holds the
     // untruncated raw text (including reasoning) of the previous round's tool-call
     // response, used as the source to piggyback the digest parse; once
@@ -1255,7 +1283,7 @@ async fn run_turn_body(
             &mut persisted_turn_messages,
             should_quit,
             force_final_response,
-            terminal_dedupe_candidate.as_deref(),
+            output.terminal_dedupe_candidate.as_deref(),
             active_skill_name.as_deref(),
             iteration,
             compression_report,
@@ -1330,24 +1358,24 @@ async fn run_turn_body(
                 // Empty-response retry count: give up after more than 5 consecutive empty
                 // responses to avoid wasting iteration budget
             if matches!(execution, IterationExecution::EmptyResponse) {
-                consecutive_empty_responses += 1;
-                if consecutive_empty_responses > 5 {
+                retry.consecutive_empty_responses += 1;
+                if retry.consecutive_empty_responses > 5 {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ✗ {} consecutive empty responses; giving up retry",
-                        consecutive_empty_responses
+                        retry.consecutive_empty_responses
                     );
-                    final_assistant_text = "[Model returned empty responses repeatedly; please retry or switch models]".to_string();
+                    output.assistant_text = "[Model returned empty responses repeatedly; please retry or switch models]".to_string();
                     break 'turn Ok(None);
                 }
             } else {
-                consecutive_empty_responses = 0;
+                retry.consecutive_empty_responses = 0;
             }
                 // Truncation retry count: give up when repeated truncations (output cap / truncated
                 // tool JSON) still cannot converge, to avoid endless retries burning budget. The
                 // threshold is 3: it gives the model two chances to shrink and rewrite.
             if let IterationExecution::Truncated(stream_result) = &execution {
-                consecutive_truncations += 1;
+                retry.consecutive_truncations += 1;
                 // Reset tool-loop detection: repeated calls during truncation retries are expected
                 // behavior and must not be misjudged as a tool dead-loop that triggers a hard-stop
                 // convergence.
@@ -1360,26 +1388,27 @@ async fn run_turn_body(
                 // consecutive_truncations (it is not the model's fault), but a separate counter,
                 // consecutive_stream_errors, provides a cap so persistent server stream drops do
                 // not retry forever.
-                    consecutive_truncations = 0;
-                    consecutive_stream_errors += 1;
-                    if consecutive_stream_errors > MAX_STREAM_ERROR_RETRIES {
+                    retry.consecutive_truncations = 0;
+                    retry.consecutive_stream_errors += 1;
+                    if retry.consecutive_stream_errors > MAX_STREAM_ERROR_RETRIES {
                         let _ = writeln!(
                             std::io::stderr(),
                             "  ✗ {} consecutive response-stream read interruptions; giving up retry",
-                            consecutive_stream_errors
+                            retry.consecutive_stream_errors
                         );
-                        final_assistant_text =
+                        output.assistant_text =
                             "[Response stream interrupted repeatedly; the server may be unstable. Please retry later or switch models]"
                                 .to_string();
                         break 'turn Ok(None);
                     }
                     let _ = writeln!(
                         std::io::stderr(),
-                        "  ⚠ Response-stream read interrupted (consecutive #{consecutive_stream_errors}); auto-retrying, stopping after {MAX_STREAM_ERROR_RETRIES} consecutive failures…"
+                        "  ⚠ Response-stream read interrupted (consecutive #{}); auto-retrying, stopping after {MAX_STREAM_ERROR_RETRIES} consecutive failures…",
+                        retry.consecutive_stream_errors
                     );
                 } else {
                 // Real truncation: the model hit the output cap or produced half-cut tool JSON.
-                    consecutive_stream_errors = 0;
+                    retry.consecutive_stream_errors = 0;
 
                 // Zero-output truncation detection: completion=0 + finish_reason=length means the
                 // server rejected the max_tokens value (typically a relay/compatibility layer
@@ -1406,13 +1435,13 @@ async fn run_turn_body(
                             halved
                         );
                         app.cli.max_tokens_override = Some(halved);
-                        mt_downgraded = true;
-                    } else if mt_downgraded {
+                        retry.max_tokens_downgraded = true;
+                    } else if retry.max_tokens_downgraded {
                 // Normal truncation (there was output but it was cut off): the server accepted the
                 // current max_tokens, so restore the original value to give later iterations a
                 // larger output budget.
-                        app.cli.max_tokens_override = saved_max_tokens_override;
-                        mt_downgraded = false;
+                        app.cli.max_tokens_override = retry.saved_max_tokens_override;
+                        retry.max_tokens_downgraded = false;
                     }
 
             // Whether lowering reasoning_effort actually shortens the thought chain for this model.
@@ -1458,7 +1487,7 @@ async fn run_turn_body(
             // its own default tier (gpt-5.x defaults to medium), raising the budget — neither is
             // suitable as a truncation-convergence mechanism.
                             app.cli.reasoning_effort_override =
-                                Some(match consecutive_truncations {
+                                Some(match retry.consecutive_truncations {
                                     1 => Some(crate::ai::provider::ReasoningEffort::High),
                                     2 => Some(crate::ai::provider::ReasoningEffort::Medium),
                                     _ => Some(crate::ai::provider::ReasoningEffort::Low),
@@ -1473,7 +1502,7 @@ async fn run_turn_body(
                                 &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
                                 crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
                                 &next_model,
-                                consecutive_truncations,
+                                retry.consecutive_truncations,
                                 stream_result.usage_reasoning_tokens,
                                 stream_result.usage_completion_tokens,
                                 true,
@@ -1488,7 +1517,7 @@ async fn run_turn_body(
                                 &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
                                 crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
                                 &next_model,
-                                consecutive_truncations,
+                                retry.consecutive_truncations,
                                 stream_result.usage_reasoning_tokens,
                                 stream_result.usage_completion_tokens,
                                 false,
@@ -1498,7 +1527,7 @@ async fn run_turn_body(
             // If the effort ladder still truncates at tier 3, lowering effort alone is no longer
             // enough to converge; force thinking off on top of it as a fallback, handing the entire
             // output budget to visible content.
-                        if consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES {
+                        if retry.consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES {
                             app.cli.thinking_disabled_override = true;
                         }
                     } else {
@@ -1518,15 +1547,15 @@ async fn run_turn_body(
             // retry, accept the partial text as the final answer. stream_error scenarios do not
             // count toward consecutive_truncations, so they never reach this branch.
                 if has_visible_text
-                    && consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
+                    && retry.consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
                     && !stream_result.stream_error
                 {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ▲ {} consecutive truncated outputs; keeping the partial text produced so far",
-                        consecutive_truncations
+                        retry.consecutive_truncations
                     );
-                    final_assistant_text = partial_text.to_string();
+                    output.assistant_text = partial_text.to_string();
                     // A truncation finalizes outside the normal FinalResponse gate path. Audit
                     // reports must still be parsed or withheld here so a partial protocol payload
                     // cannot bypass the evidence gate and reach the user as a verified finding.
@@ -1536,7 +1565,7 @@ async fn run_turn_body(
                             app.current_agent.as_str(),
                             &mut messages,
                             &turn_messages,
-                            &mut final_assistant_text,
+                            &mut output.assistant_text,
                             effective_cwd.as_deref(),
                             true,
                             iteration,
@@ -1548,17 +1577,17 @@ async fn run_turn_body(
 
             // stream_error already reset consecutive_truncations to 0 above, so this branch is
             // unreachable for it.
-                if consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
+                if retry.consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
                     && !stream_result.stream_error
                 {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ✗ {} consecutive truncated responses; giving up retry",
-                        consecutive_truncations
+                        retry.consecutive_truncations
                     );
             // Keep whatever partial text the model already produced (if any) — it is more valuable
             // than discarding it outright.
-                    final_assistant_text = if has_visible_text {
+                    output.assistant_text = if has_visible_text {
                         partial_text.to_string()
                     } else {
                         "[Model output truncated repeatedly; please shrink per-operation scope (e.g., write files in chunks) or switch models]"
@@ -1567,11 +1596,11 @@ async fn run_turn_body(
                     break 'turn Ok(None);
                 }
             } else {
-                consecutive_truncations = 0;
+                retry.consecutive_truncations = 0;
             // Not a truncation: restore the max_tokens downgraded due to zero output.
-                if mt_downgraded {
-                    app.cli.max_tokens_override = saved_max_tokens_override;
-                    mt_downgraded = false;
+                if retry.max_tokens_downgraded {
+                    app.cli.max_tokens_override = retry.saved_max_tokens_override;
+                    retry.max_tokens_downgraded = false;
                 }
             }
             let step = match handle_iteration_execution_for_model(
@@ -1585,23 +1614,23 @@ async fn run_turn_body(
                 &mut turn_messages,
                 one_shot_mode,
                 &mut persisted_turn_messages,
-                &mut final_assistant_text,
-                &mut final_assistant_recorded,
+                &mut output.assistant_text,
+                &mut output.assistant_recorded,
                 &mut force_final_response,
-                &mut terminal_dedupe_candidate,
-                &mut final_validation_status,
-                &mut final_gate_state,
+                &mut output.terminal_dedupe_candidate,
+                &mut output.validation_status,
+                &mut output.gate,
                 skill_turn.matched_skill_names().is_empty(),
                 iteration,
                 effective_max_iterations,
-                consecutive_truncations,
-                &mut turn_had_tool_error,
+                retry.consecutive_truncations,
+                &mut output.had_tool_error,
             ) {
                 Ok(s) => s,
                 Err(err) => break 'turn Err(err),
             };
             if matches!(step, TurnLoopStep::Continue) {
-                drop(final_validation_status.take());
+                drop(output.validation_status.take());
             }
             match step {
                 TurnLoopStep::ScopedPreflightContinue(targets) => {
@@ -1658,7 +1687,7 @@ async fn run_turn_body(
                 }
                 TurnLoopStep::Break => {
                     if was_final_response {
-                        final_response_model.clone_from(&response_model);
+                        output.response_model.clone_from(&response_model);
                     }
                     break 'turn Ok(None);
                 }
@@ -1952,11 +1981,9 @@ async fn run_turn_body(
             // have lowered it to Low temporarily; restore it uniformly here (covering every break
             // 'turn exit) so the downgrade does not leak into later turns and pollute the user's
             // session-level setting.
-    app.cli.reasoning_effort_override = saved_effort_override;
-    app.cli.thinking_disabled_override = saved_thinking_disabled;
-    app.cli.max_tokens_override = saved_max_tokens_override;
+    retry.restore_overrides(app);
     // Final-gate status is transient and must not overlap terminal output from finalization.
-    drop(final_validation_status.take());
+    drop(output.validation_status.take());
 
             // Age out explicit-enabled tools that were not used this turn. After N consecutive
             // turns of idle use they are demoted, preventing "enabled once, welded forever".
@@ -1994,7 +2021,7 @@ async fn run_turn_body(
             // does not run, so instead parse the digest from the final reply text.
             let mut digest_to_persist = turn_digest.take();
             if digest_to_persist.is_none() {
-                if let Some(digest) = crate::ai::request::parse_digest(&final_assistant_text) {
+                if let Some(digest) = crate::ai::request::parse_digest(&output.assistant_text) {
                     if let Some(fp) =
                         crate::ai::request::last_image_user_message_fingerprint(&turn_messages)
                     {
@@ -2013,17 +2040,17 @@ async fn run_turn_body(
             finalize_turn(
                 app,
                 &next_model,
-                final_response_model.as_deref().unwrap_or(&next_model),
+                output.response_model.as_deref().unwrap_or(&next_model),
                 &question,
-                &final_assistant_text,
-                final_assistant_recorded,
-                terminal_dedupe_candidate.as_deref(),
+                &output.assistant_text,
+                output.assistant_recorded,
+                output.terminal_dedupe_candidate.as_deref(),
                 final_skill_name.as_deref(),
                 &mut turn_messages,
                 one_shot_mode,
                 &mut persisted_turn_messages,
                 should_quit,
-                turn_had_tool_error,
+                output.had_tool_error,
             )
             .await
         }

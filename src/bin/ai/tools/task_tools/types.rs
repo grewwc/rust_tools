@@ -84,7 +84,11 @@ impl InheritOptions {
     ///   - missing / null -> default (cwd+skills, history/memory private)
     ///   - "all"          -> full inheritance (incl. memory)
     ///   - "none"         -> no inheritance (fresh sub-agent)
-    ///   - comma-separated list of: history, memory, cwd, skills
+    ///   - list of: history, memory, cwd, skills. The separators ',', '+' and '/'
+    ///     are all accepted, so a value copied out of prose style ("cwd+skills",
+    ///     "history/cwd") parses the same as the canonical "cwd,skills". Models
+    ///     tend to transcribe the description's own wording verbatim, and strict
+    ///     comma-only parsing made that copy a hard tool-call failure.
     pub(crate) fn from_value(value: &Value) -> Result<Self, String> {
         let Some(raw) = value.as_str() else {
             if value.is_null() {
@@ -118,7 +122,7 @@ impl InheritOptions {
             cwd: false,
             skills: false,
         };
-        for part in trimmed.split(',') {
+        for part in trimmed.split(&[',', '+', '/'][..]) {
             match part.trim().to_ascii_lowercase().as_str() {
                 "history" => opts.history = true,
                 "memory" => opts.memory = true,

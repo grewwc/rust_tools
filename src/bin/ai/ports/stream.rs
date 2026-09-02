@@ -4,6 +4,7 @@
 // Decouples the parsing implementation of `stream` from callers, making it easy to swap protocols, add observability, or mock.
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use reqwest::Response;
 use crate::ai::{history::Message, types::App};
 
@@ -25,13 +26,15 @@ impl StreamFilter for PassthroughFilter {
 }
 
 /// Filter chain: applied in registration order; any filter returning None drops the chunk.
+#[derive(Clone)]
 pub(crate) struct FilterChain {
-    filters: Vec<Box<dyn StreamFilter>>,
+    filters: Vec<Arc<dyn StreamFilter>>,
 }
 impl FilterChain {
     pub(crate) fn new() -> Self { Self { filters: Vec::new() } }
-    pub(crate) fn push<F: StreamFilter + 'static>(mut self, f: F) -> Self { self.filters.push(Box::new(f)); self }
-    pub(crate) fn push_boxed(mut self, f: Box<dyn StreamFilter>) -> Self { self.filters.push(f); self }
+    pub(crate) fn push<F: StreamFilter + 'static>(mut self, f: F) -> Self { self.filters.push(Arc::new(f)); self }
+    pub(crate) fn push_boxed(mut self, f: Box<dyn StreamFilter>) -> Self { self.filters.push(Arc::from(f)); self }
+    pub(crate) fn register<F: StreamFilter + 'static>(&mut self, filter: F) { self.filters.push(Arc::new(filter)); }
     pub(crate) fn is_empty(&self) -> bool { self.filters.is_empty() }
     pub(crate) fn len(&self) -> usize { self.filters.len() }
     pub(crate) fn apply(&self, mut chunk: String) -> Option<String> {

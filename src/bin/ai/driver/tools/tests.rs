@@ -459,3 +459,55 @@ fn tool_call(name: &str) -> ToolCall {
         },
     }
 }
+
+fn tool_call_with_args(name: &str, arguments: &str) -> ToolCall {
+    ToolCall {
+        id: format!("call-{name}"),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    }
+}
+
+#[test]
+fn overflow_stub_argument_guard_catches_transcribed_stubs() {
+    // Stringified stub as a model transcribed it after seeing the compressor's
+    // pointer in context (observed for apply_patch and write_file in production
+    // sessions): must be rejected centrally, not reach the tool's own parser.
+    let mcp = McpClient::new();
+    let string_stub = tool_call_with_args(
+        "apply_patch",
+        r#"{"_context_overflow_truncated": "true", "original_chars": "1622", "archive_file_path": "/tmp/archive.md", "preview": "{\"patch\": \"*** Begin P"}"#,
+    );
+    let err = super::prepare_tool_call(&mcp, &string_stub, None)
+        .expect_err("stringified stub arguments must be rejected");
+    assert!(err.content.contains("context-overflow pointer stub"));
+    assert!(err.content.contains("/tmp/archive.md"));
+    // Runtime-native shape (JSON bool marker + numeric original_chars) is caught too.
+    let runtime_stub = tool_call_with_args(
+        "write_file",
+        r#"{"_context_overflow_truncated": true, "original_chars": 900, "archive_file_path": "/tmp/a.md", "preview": "xyz"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &runtime_stub, None).is_err());
+    // Marker-less pointer shape (all three archive-pointer keys) is also rejected.
+    let keys_only = tool_call_with_args(
+        "apply_patch",
+        r#"{"original_chars": 10, "archive_file_path": "/tmp/b.md", "preview": "aa"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &keys_only, None).is_err());
+    // Real arguments (including a legit `patch_file` recovery call) pass through.
+    let real = tool_call_with_args("apply_patch", r#"{"patch": "*** Begin Patch\n*** End Patch\n"}"#);
+    assert!(super::prepare_tool_call(&mcp, &real, None).is_ok());
+    let recovery =
+        tool_call_with_args("apply_patch", r#"{"patch_file": "/tmp/x.patch", "f": true}"#);
+    assert!(super::prepare_tool_call(&mcp, &recovery, None).is_ok());
+    // A marker key that is not true-ish (e.g. a nested value named like the
+    // marker with boolean false) must not trip the guard.
+    let benign = tool_call_with_args(
+        "apply_patch",
+        r#"{"_context_overflow_truncated": false, "patch": "x"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &benign, None).is_ok());
+}

@@ -338,10 +338,7 @@ fn prompt_cache_breakpoint_noop_without_system_message() {
 fn dashscope_builtin_models_do_not_enable_anthropic_prompt_cache() {
     for model in [
         "deepseek-v4-flash-0731-alibaba",
-        "qwen3.7-plus-alibaba",
-        "qwen3.7-max-alibaba",
-        "qwen3.6-flash-alibaba",
-        "glm-5.2-alibaba",
+        "qwen3.8-flash-alibaba",
     ] {
         assert!(!models::explicit_prompt_cache_enabled(model), "{model}");
     }
@@ -1091,10 +1088,12 @@ fn dashscope_qwen_metadata_matches_documented_thinking_controls() {
         Some(crate::ai::provider::ReasoningEffort::High)
     );
     assert_eq!(
-        models::default_reasoning_effort("qwen3.6-flash-alibaba"),
-        Some(crate::ai::provider::ReasoningEffort::High)
+        // Registry entry renamed: models/07-qwen3.6-flash-alibaba.json is now
+        // models/qwen-flash-alibaba.json (name "qwen3.8-flash", effort "max").
+        models::default_reasoning_effort("qwen3.8-flash-alibaba"),
+        Some(crate::ai::provider::ReasoningEffort::Max)
     );
-    assert!(models::enable_thinking("qwen3.6-flash-alibaba"));
+    assert!(models::enable_thinking("qwen3.8-flash-alibaba"));
 }
 
 #[test]

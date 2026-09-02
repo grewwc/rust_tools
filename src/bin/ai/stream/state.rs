@@ -75,11 +75,15 @@ pub(super) struct StreamProcessingState {
 
 impl StreamProcessingState {
     pub(super) fn new() -> Self {
+        Self::with_filters(FilterChain::new())
+    }
+
+    pub(super) fn with_filters(filters: FilterChain) -> Self {
         Self {
             framing: StreamFramingState::new(),
             render: StreamRenderState::new(),
             content: StreamContentState::new(),
-            filters: FilterChain::new(),
+            filters,
             pending_llm_usage: None,
         }
     }

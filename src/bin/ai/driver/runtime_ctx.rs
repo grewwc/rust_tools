@@ -213,6 +213,21 @@ pub(crate) struct DriverContext {
 }
 
 impl DriverContext {
+    pub(crate) fn from_app_snapshot(
+        app: &App,
+        mcp_client: SharedMcpClient,
+        skill_manifests: Arc<Vec<SkillManifest>>,
+        agent_manifests: Arc<Vec<AgentManifest>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            app_proto: app.snapshot_for_driver_context(),
+            mcp_client,
+            skill_manifests,
+            agent_manifests,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         app_proto: App,
         mcp_client: SharedMcpClient,

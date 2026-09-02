@@ -613,7 +613,7 @@ pub(super) fn dispatch_background_batch(
         initialize_history,
     ) in task_specs
     {
-        let mut task_app = app.clone();
+        let mut task_app = app.fork_for_subagent();
         // Background tasks need their own streaming/cancel_stream flags:
         // `App::clone` by default shares the same Arc set with the parent App, so
         // concurrent background run_turns would overwrite each other's streaming
@@ -686,8 +686,8 @@ pub(super) fn dispatch_background_batch(
         };
         task_app.session_history_file = effective_history;
         let _ = crate::ai::driver::commands::session::restore_prune_marks_for_history(&mut task_app);
-        let task_driver_ctx = runtime_ctx::DriverContext::new(
-            task_app.clone(),
+        let task_driver_ctx = runtime_ctx::DriverContext::from_app_snapshot(
+            &task_app,
             task_mcp.clone(),
             task_skills.clone(),
             agent_manifests.clone(),

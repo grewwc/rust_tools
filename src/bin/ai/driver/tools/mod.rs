@@ -181,9 +181,66 @@ fn prepare_tool_call(
             ),
         });
     }
+    let args = parse_tool_args(tool_call)?;
+    if let Some(stub_error) = overflow_stub_argument_error(tool_call, &args) {
+        return Err(stub_error);
+    }
     Ok(PreparedToolCall {
         route: route_tool_call(mcp_client, &tool_call.function.name),
-        args: parse_tool_args(tool_call)?,
+        args,
+    })
+}
+
+/// Detect tool arguments that are actually a context-overflow pointer stub
+/// (`{"_context_overflow_truncated": ..., "archive_file_path": ..., "preview": ...}`)
+/// rather than real parameters. The projection compressor archives oversized
+/// *completed* calls in this shape, and a model that has such a stub in its
+/// visible context sometimes re-emits the stub keys verbatim as a fresh call
+/// (observed with apply_patch `patch` and write_file `content`). Each tool then
+/// reports a misleading "parameter missing" error that invites an identical
+/// retry (apply_patch retried the same stub shape three times in a row,
+/// write_file twice), instead of converging.
+/// Rejecting at the central dispatch point gives one unambiguous repair
+/// instruction regardless of which tool is targeted.
+fn overflow_stub_argument_error(tool_call: &ToolCall, args: &Value) -> Option<ToolResult> {
+    let Some(map) = args.as_object() else {
+        return None;
+    };
+    let marker_is_stub = map
+        .get("_context_overflow_truncated")
+        .is_some_and(|value| match value {
+            // Runtime emits a JSON bool; a transcribing model often sends the
+            // stringified forms instead. Accept all shapes.
+            Value::Bool(true) => true,
+            Value::String(text) => {
+                matches!(text.trim().to_ascii_lowercase().as_str(), "true" | "1")
+            }
+            Value::Number(number) => number.as_u64() == Some(1),
+            _ => false,
+        });
+    // Fallback shape: no marker but the full archive-pointer key set.
+    let pointer_shape = ["original_chars", "archive_file_path", "preview"]
+        .iter()
+        .all(|key| map.contains_key(*key));
+    if !(marker_is_stub || pointer_shape) {
+        return None;
+    }
+    let archive_path = map
+        .get("archive_file_path")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    Some(ToolResult {
+        tool_call_id: tool_call.id.clone(),
+        content: format!(
+            "Error: the arguments for '{}' are a context-overflow pointer stub \
+             (keys _context_overflow_truncated/original_chars/archive_file_path/preview), \
+             not real parameters. The archived original text is at: {archive_path}. \
+             Do NOT resend these stub keys. Regenerate the real arguments for this call \
+             (re-derive the payload from the current file state, or if the payload exceeds \
+             a tool's inline limit, write it to a temp file with write_file(temp=true) and \
+             pass its path via the tool's file parameter, e.g. apply_patch `patch_file`).",
+            tool_call.function.name
+        ),
     })
 }
 

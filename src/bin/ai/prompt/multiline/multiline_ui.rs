@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io;
 use std::time::Duration;
 
 use crossterm::{
@@ -11,7 +11,7 @@ use ratatui::{
     Terminal,
     backend::{Backend, ClearType as BackendClearType, CrosstermBackend},
     buffer::CellDiffOption,
-    layout::Position,
+    layout::{Position, Rect, Size},
 };
 use tui_textarea::TextArea;
 
@@ -21,6 +21,7 @@ use super::{
     events::{EventLoopAction, RecentTextInput, handle_multiline_event},
     render::render_multiline_popup,
 };
+use crate::commonw::prompt::acquire_foreground_stdin;
 use crate::ai::prompt::{PromptEditor, interrupted_error};
 
 /// Maximum viewport height (textarea + chrome); scales with the terminal size,
@@ -45,7 +46,7 @@ const PANEL_COMPLETION_WINDOW: u16 = 12;
 /// The completion state hides model/session info, giving height priority to the
 /// candidate list.
 const PANEL_CHROME_LINES: u16 = 2;
-/// The completion state allows a taller inline viewport than normal editing, so
+/// The completion state allows a taller prompt viewport than normal editing, so
 /// large terminals can show more candidates at once.
 const MAX_COMPLETION_VIEWPORT_HEIGHT: u16 = PANEL_CHROME_LINES + PANEL_COMPLETION_WINDOW + 2;
 
@@ -96,132 +97,159 @@ fn viewport_height_with_completion(
 
 type MultilineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-fn build_inline_terminal(height: u16) -> io::Result<MultilineTerminal> {
-    let backend = CrosstermBackend::new(io::stdout());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewportRebuildMode {
+    ReserveMissingRows,
+    ReflowOnly,
+}
+
+fn fixed_viewport_area(
+    terminal_size: Size,
+    cursor_position: Position,
+    requested_height: u16,
+    cursor_offset_row: u16,
+    mode: ViewportRebuildMode,
+) -> (Rect, u16) {
+    let height = requested_height.max(1).min(terminal_size.height.max(1));
+    let live_top = cursor_position
+        .y
+        .saturating_sub(cursor_offset_row)
+        .min(terminal_size.height.saturating_sub(1));
+    let missing_rows = live_top
+        .saturating_add(height)
+        .saturating_sub(terminal_size.height);
+    let lines_to_scroll = match mode {
+        ViewportRebuildMode::ReserveMissingRows => missing_rows,
+        ViewportRebuildMode::ReflowOnly => 0,
+    };
+    let viewport_top = live_top
+        .saturating_sub(lines_to_scroll)
+        .min(terminal_size.height.saturating_sub(height));
+    (
+        Rect::new(0, viewport_top, terminal_size.width, height),
+        lines_to_scroll,
+    )
+}
+
+fn prepare_fixed_viewport<B: Backend>(
+    backend: &mut B,
+    terminal_size: Size,
+    requested_height: u16,
+    cursor_offset_row: u16,
+    mode: ViewportRebuildMode,
+    clear_existing_viewport: bool,
+) -> Result<Rect, B::Error> {
+    let cursor_position = backend.get_cursor_position()?;
+    let (area, lines_to_scroll) = fixed_viewport_area(
+        terminal_size,
+        cursor_position,
+        requested_height,
+        cursor_offset_row,
+        mode,
+    );
+    if lines_to_scroll > 0 {
+        backend.set_cursor_position(Position::new(0, terminal_size.height.saturating_sub(1)))?;
+        backend.append_lines(lines_to_scroll)?;
+    }
+    if clear_existing_viewport {
+        backend.set_cursor_position(Position::new(0, area.y))?;
+        backend.clear_region(BackendClearType::AfterCursor)?;
+    }
+    backend.flush()?;
+    Ok(area)
+}
+
+fn terminal_with_fixed_viewport<B: Backend>(
+    backend: B,
+    area: Rect,
+) -> Result<Terminal<B>, B::Error> {
     Terminal::with_options(
         backend,
         ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Inline(height.max(1)),
+            viewport: ratatui::Viewport::Fixed(area),
         },
     )
-    .map_err(|err| io::Error::other(err.to_string()))
 }
 
-/// Deletes the real terminal lines previously reserved by the inline viewport.
+/// Builds a fixed viewport immediately below the preceding output.
 ///
-/// Ratatui reserves `Viewport::Inline` height by emitting newlines; a regular
-/// clear only erases cells and cannot reclaim those lines. The standard ANSI
-/// `CSI Ps M` deletes lines starting at the cursor, letting the post-submit
-/// preview follow the previous round's output directly. Some terminals handle
-/// leftover cells or cursor position after line deletion inconsistently, so we
-/// finally return to the top line and clear the area after it, ensuring the
-/// next regular output starts at that top line. The return value says whether
-/// enough last-frame state exists to perform the line deletion.
-fn delete_inline_viewport_rows<W: Write>(
-    output: &mut W,
-    viewport_top_row: Option<u16>,
-    viewport_height: Option<u16>,
-) -> io::Result<bool> {
-    let (Some(top_row), Some(height)) = (viewport_top_row, viewport_height) else {
-        return Ok(false);
-    };
-    if height == 0 {
-        return Ok(false);
-    }
-
-    execute!(output, cursor::MoveTo(0, top_row))?;
-    output.write_all(format!("\x1b[{height}M").as_bytes())?;
-    execute!(
-        output,
-        cursor::MoveTo(0, top_row),
-        Clear(ClearType::FromCursorDown),
+/// Ratatui's inline viewport calls `append_lines` on every real terminal resize,
+/// even when the screen already has enough rows for the input area. IDE terminal
+/// size notifications can oscillate, turning those reservations into a growing
+/// blank gap. A fixed viewport avoids that automatic behavior; this bootstrap
+/// scrolls only the rows that are actually missing at the bottom of the screen.
+fn build_fixed_terminal(height: u16) -> io::Result<MultilineTerminal> {
+    let mut backend = CrosstermBackend::new(io::stdout());
+    let terminal_size = backend.size()?;
+    let area = prepare_fixed_viewport(
+        &mut backend,
+        terminal_size,
+        height,
+        0,
+        ViewportRebuildMode::ReserveMissingRows,
+        false,
     )?;
-    output.flush()?;
-    Ok(true)
+    terminal_with_fixed_viewport(backend, area).map_err(|err| io::Error::other(err.to_string()))
 }
 
-/// After clearing the inline viewport, re-anchors the cursor to the old
-/// viewport's top.
-///
-/// `Terminal::clear()` restores the cursor from before the call, while a new
-/// `Viewport::Inline` takes the row of the backend cursor at creation time as
-/// its top edge. Rebuilding directly would treat the cursor row inside the
-/// input box as the new top edge, leaving the original viewport's top content
-/// stuck in scrollback. When the height changed between two frames, trust the
-/// viewport top row recorded in the previous frame; on some terminals the live
-/// cursor read after input drifts to the top-left corner temporarily.
-/// Only when the first frame has not been drawn yet, fall back to computing the
-/// top row from the cursor's offset relative to the viewport.
-fn clear_and_reanchor_inline_viewport<B: Backend>(
-    terminal: &mut Terminal<B>,
-    last_viewport_top_row: Option<u16>,
-    last_cursor_offset_row: Option<u16>,
-) -> Result<(), B::Error> {
-    let viewport_top_row = match last_viewport_top_row {
-        Some(top_row) => top_row,
-        None => {
-            let cursor_position = terminal.backend_mut().get_cursor_position()?;
-            last_cursor_offset_row
-                .map(|offset| cursor_position.y.saturating_sub(offset))
-                .unwrap_or(cursor_position.y)
-        }
-    };
-
-    terminal.clear()?;
-    terminal
-        .backend_mut()
-        .set_cursor_position(Position::new(0, viewport_top_row))
-}
-
-/// When the completion panel opens/closes, the inline viewport's required height
-/// changes, and ratatui's inline viewport height is fixed at creation and cannot
-/// be modified in place. After clearing, put the cursor back at the old
-/// viewport's top, then rebuild the Terminal with the new height; ratatui then
-/// expands downward via `append_lines` from the same top anchor, so neither
-/// growing nor shrinking leaves the old frame in scrollback. The textarea's
-/// line count is unaffected — the added/reclaimed height only affects the panel
-/// area.
-fn resize_inline_viewport(
+/// Re-anchors a fixed viewport after terminal reflow or a requested height
+/// change without reserving another full block of terminal lines.
+fn rebuild_fixed_viewport(
     terminal: &mut MultilineTerminal,
+    terminal_size: Size,
     new_height: u16,
-    last_viewport_top_row: Option<u16>,
-    last_cursor_offset_row: Option<u16>,
-) -> io::Result<()> {
-    let _ = terminal.hide_cursor();
-    clear_and_reanchor_inline_viewport(terminal, last_viewport_top_row, last_cursor_offset_row)?;
-    *terminal = build_inline_terminal(new_height)?;
-    Ok(())
+    cursor_offset_row: u16,
+    mode: ViewportRebuildMode,
+) -> io::Result<Rect> {
+    let area = prepare_fixed_viewport(
+        terminal.backend_mut(),
+        terminal_size,
+        new_height,
+        cursor_offset_row,
+        mode,
+        true,
+    )?;
+    *terminal = terminal_with_fixed_viewport(CrosstermBackend::new(io::stdout()), area)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    Ok(area)
 }
 
-/// After a horizontal resize the terminal first reflows existing content, so
-/// ratatui's saved viewport top row still holds pre-resize coordinates.
-/// Re-locate the top row from the real cursor and the previous frame's relative
-/// row offset, and erase the old viewport first so it is not pushed into
-/// scrollback on the next `autoresize` re-anchor.
-fn clear_reflowed_inline_viewport<B: Backend>(
+/// Chooses the rebuild strategy for a resize based on how the last frame
+/// positioned the real terminal cursor. Offset 0 means the cursor is parked on
+/// the viewport's top row (empty-input frames park it there), so the
+/// post-reflow position report names the exact viewport top and rows genuinely
+/// missing at the bottom can be reserved (only real content scrolls into
+/// scrollback). Any other or unknown offset cannot survive reflow — the
+/// panel's own painted rows are re-wrapped too — so appending rows is
+/// forbidden there.
+fn resize_rebuild_mode(cursor_offset_row: Option<u16>) -> ViewportRebuildMode {
+    if cursor_offset_row == Some(0) {
+        ViewportRebuildMode::ReserveMissingRows
+    } else {
+        ViewportRebuildMode::ReflowOnly
+    }
+}
+
+fn clear_fixed_viewport<B: Backend>(
     terminal: &mut Terminal<B>,
-    cursor_offset_row: u16,
-) -> Result<(), B::Error> {
-    let cursor_position = terminal.backend_mut().get_cursor_position()?;
-    let viewport_top = cursor_position.y.saturating_sub(cursor_offset_row);
+    viewport_top_row: Option<u16>,
+) -> Result<bool, B::Error> {
+    let Some(top_row) = viewport_top_row else {
+        return Ok(false);
+    };
     terminal
         .backend_mut()
-        .set_cursor_position(Position::new(0, viewport_top))?;
-    terminal
-        .backend_mut()
-        .clear_region(BackendClearType::CurrentLine)?;
+        .set_cursor_position(Position::new(0, top_row))?;
     terminal
         .backend_mut()
         .clear_region(BackendClearType::AfterCursor)?;
-    terminal
-        .backend_mut()
-        .set_cursor_position(cursor_position)?;
-    terminal.backend_mut().flush()
+    terminal.backend_mut().flush()?;
+    Ok(true)
 }
 
 /// Forces every cell of the current frame to be written back to the terminal.
 ///
-/// In some inline viewport scenarios the terminal may still show a deleted
+/// After terminal reflow the terminal may still show a deleted
 /// character, while ratatui's previous-frame buffer already considers that
 /// position blank, so a regular diff would not emit a space there again. Use
 /// `AlwaysUpdate` only on the frame after the input got shorter: it wipes such
@@ -243,6 +271,11 @@ fn textarea_logical_char_count(textarea: &TextArea<'_>) -> usize {
         .map(|line| line.chars().count())
         .sum::<usize>()
         .saturating_add(textarea.lines().len().saturating_sub(1))
+}
+
+fn take_redraw_request(redraw_requested: &mut bool, external_change: bool) -> bool {
+    *redraw_requested |= external_change;
+    std::mem::take(redraw_requested)
 }
 
 fn submitted_input_preview_lines(content: &str) -> Vec<String> {
@@ -271,6 +304,16 @@ fn print_submitted_input_preview(content: &str) {
 
 impl PromptEditor {
     pub(in crate::ai::prompt) fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
+        // The streaming side-note listener (Ctrl+G composer) owns stdin in
+        // cbreak mode for the whole turn. Preempt it BEFORE touching stdin or
+        // termios: the foreground flag makes it stop poll/read, restore termios
+        // and release its stdin lease, and only then does this function return.
+        // Without the handshake, the cursor-position query (\x1b[6n) below races
+        // the listener for stdin, its DSR response gets consumed, the query
+        // blocks until timeout, and the whole input box falls back to a
+        // prompt-less line read — the terminal appears frozen after the final
+        // answer with no input prompt.
+        let _stdin_owner = acquire_foreground_stdin();
         enable_raw_mode()?;
 
         // Disable bracketed paste under SSH: after the terminal intercepts
@@ -287,10 +330,9 @@ impl PromptEditor {
             let _ = execute!(io::stdout(), EnableBracketedPaste);
         }
 
-        // Inline viewport initialization really expands the terminal area via
-        // append_lines(). Empty input keeps 3 textarea lines by default; when
-        // editing existing content it grows by the prefilled line count, leaving
-        // the textarea enough space.
+        // Empty input keeps 3 textarea lines by default; when editing existing
+        // content the viewport grows by the prefilled line count, leaving the
+        // textarea enough space.
         // The fallback must match the empty-input reserved height: on some
         // terminals (e.g. the VS Code integrated terminal) ioctl(TIOCGWINSZ) can
         // fail briefly at specific timings; falling back to a larger value then
@@ -299,10 +341,11 @@ impl PromptEditor {
         // EMPTY_VIEWPORT_HEIGHT guarantees the needed input space even when the
         // size is unknown.
         let mut base_viewport_height = terminal_size()
+            .ok()
             .map(|(_, h)| multiline_viewport_height(h, self.pending_prefill.as_deref()))
             .unwrap_or(EMPTY_VIEWPORT_HEIGHT);
 
-        let mut terminal = match build_inline_terminal(base_viewport_height) {
+        let mut terminal = match build_fixed_terminal(base_viewport_height) {
             Ok(terminal) => terminal,
             Err(err) => {
                 let _ = disable_raw_mode();
@@ -310,18 +353,12 @@ impl PromptEditor {
             }
         };
 
-        // On exit, clean up the viewport based on "where the last actual render
-        // ended"; do not rely on the cursor position at Terminal creation, because
-        // completion-panel/textarea growth rebuilds the inline viewport.
-        let mut last_viewport_top_row: Option<u16> = None;
-        // `Viewport::Inline` reserves real terminal lines; on exit you must delete
-        // the height actually rendered last, not a value derived from the base
-        // height (the completion panel and short terminals both change the actual
-        // height).
-        let mut last_viewport_height: Option<u16> = None;
+        let initial_viewport_area = terminal.get_frame().area();
+        // On exit, clean up the viewport based on its latest reflowed top row.
+        let mut last_viewport_top_row = Some(initial_viewport_area.y);
         // After a resize reflow the viewport's absolute coordinates change, but the
         // cursor's relative row inside the viewport does not; record that offset
-        // to clear the old frame before the next autoresize.
+        // to re-anchor the fixed area after reflow.
         let mut last_cursor_offset_row: Option<u16> = None;
 
         let result: io::Result<Option<String>> = (|| {
@@ -339,83 +376,95 @@ impl PromptEditor {
             // Record how many completion candidates the current viewport already
             // accommodates: None means no panel (base height).
             // When the panel appears/disappears or the candidate count changes,
-            // rebuild the viewport accordingly so the panel gets enough height
+            // resize the viewport accordingly so the panel gets enough height
             // while the textarea's line count stays unchanged.
             let mut fitted_completion_items: Option<usize> = None;
             // When the input gets shorter, force one frame write-back to wipe
             // characters left by desync between the ratatui buffer and the real
             // terminal.
             let mut force_repaint_next_frame = false;
+            // Consume this flag after each frame so poll timeouts do not redraw
+            // an unchanged input screen. Resize and title events explicitly
+            // request the next frame.
+            let mut redraw_requested = true;
 
             loop {
                 // The background only publishes title updates; the terminal is
                 // still redrawn by the foreground input loop at this safe draw
                 // point.
-                self.apply_pending_session_title_updates();
+                let title_changed = self.apply_pending_session_title_updates();
 
-                // When the panel state changes, rebuild the inline viewport to
-                // match the height the panel needs.
-                let current_items = completion_panel.as_ref().map(|p| p.items.len());
-                if current_items != fitted_completion_items {
-                    let terminal_rows = terminal_size().map(|(_, h)| h).unwrap_or(0);
-                    let new_height = viewport_height_with_completion(
-                        terminal_rows,
-                        base_viewport_height,
-                        current_items,
-                    );
-                    resize_inline_viewport(
-                        &mut terminal,
-                        new_height,
-                        last_viewport_top_row,
-                        last_cursor_offset_row,
-                    )?;
-                    fitted_completion_items = current_items;
-                }
-
-                // Auto-grow the viewport when content exceeds the textarea capacity
-                // (grow only, never shrink, to avoid frequent flicker).
-                let content_lines = textarea.lines().len() as u16;
-                let textarea_capacity = base_viewport_height.saturating_sub(VIEWPORT_CHROME_LINES);
-                if content_lines > textarea_capacity && base_viewport_height < MAX_VIEWPORT_HEIGHT {
-                    let terminal_rows = terminal_size().map(|(_, h)| h).unwrap_or(0);
-                    let available = terminal_rows.saturating_sub(2).max(1);
-                    let new_height = content_lines
-                        .saturating_add(VIEWPORT_CHROME_LINES)
-                        .min(MAX_VIEWPORT_HEIGHT)
-                        .min(available);
-                    if new_height > base_viewport_height {
-                        resize_inline_viewport(
-                            &mut terminal,
-                            new_height,
-                            last_viewport_top_row,
-                            last_cursor_offset_row,
-                        )?;
-                        base_viewport_height = new_height;
-                    }
-                }
-
-                let force_repaint = force_repaint_next_frame;
-                terminal
-                    .draw(|f| {
-                        let area = f.area();
-                        last_viewport_top_row = Some(area.y);
-                        last_viewport_height = Some(area.height);
-                        last_cursor_offset_row = render_multiline_popup(
-                            f,
-                            &mut textarea,
-                            status_msg.as_deref(),
-                            completion_panel.as_ref(),
-                            &self.current_model_label,
-                            &self.current_reasoning_effort_label,
-                            self.session_topic.as_deref(),
+                if take_redraw_request(&mut redraw_requested, title_changed) {
+                    // When the panel state changes, resize the fixed viewport to
+                    // match the height the panel needs.
+                    let current_items = completion_panel.as_ref().map(|p| p.items.len());
+                    if current_items != fitted_completion_items {
+                        let terminal_size = terminal.backend().size()?;
+                        let new_height = viewport_height_with_completion(
+                            terminal_size.height,
+                            base_viewport_height,
+                            current_items,
                         );
-                        if force_repaint {
-                            force_frame_repaint(f);
+                        rebuild_fixed_viewport(
+                            &mut terminal,
+                            terminal_size,
+                            new_height,
+                            last_cursor_offset_row.unwrap_or(0),
+                            ViewportRebuildMode::ReserveMissingRows,
+                        )?;
+                        fitted_completion_items = current_items;
+                        force_repaint_next_frame = false;
+                    }
+
+                    // Auto-grow the viewport when content exceeds the textarea capacity
+                    // (grow only, never shrink, to avoid frequent flicker).
+                    let content_lines = textarea.lines().len() as u16;
+                    let textarea_capacity =
+                        base_viewport_height.saturating_sub(VIEWPORT_CHROME_LINES);
+                    if content_lines > textarea_capacity
+                        && base_viewport_height < MAX_VIEWPORT_HEIGHT
+                    {
+                        let terminal_size = terminal.backend().size()?;
+                        let available = terminal_size.height.saturating_sub(2).max(1);
+                        let new_height = content_lines
+                            .saturating_add(VIEWPORT_CHROME_LINES)
+                            .min(MAX_VIEWPORT_HEIGHT)
+                            .min(available);
+                        if new_height > base_viewport_height {
+                            rebuild_fixed_viewport(
+                                &mut terminal,
+                                terminal_size,
+                                new_height,
+                                last_cursor_offset_row.unwrap_or(0),
+                                ViewportRebuildMode::ReserveMissingRows,
+                            )?;
+                            base_viewport_height = new_height;
+                            force_repaint_next_frame = false;
                         }
-                    })
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-                self.notify_first_render();
-                force_repaint_next_frame = false;
+                    }
+
+                    let force_repaint = force_repaint_next_frame;
+                    terminal
+                        .draw(|f| {
+                            let area = f.area();
+                            last_viewport_top_row = Some(area.y);
+                            last_cursor_offset_row = render_multiline_popup(
+                                f,
+                                &mut textarea,
+                                status_msg.as_deref(),
+                                completion_panel.as_ref(),
+                                &self.current_model_label,
+                                &self.current_reasoning_effort_label,
+                                self.session_topic.as_deref(),
+                            );
+                            if force_repaint {
+                                force_frame_repaint(f);
+                            }
+                        })
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    self.notify_first_render();
+                    force_repaint_next_frame = false;
+                }
 
                 if !event::poll(Duration::from_millis(250))
                     .map_err(|e| io::Error::other(e.to_string()))?
@@ -423,15 +472,39 @@ impl PromptEditor {
                     continue;
                 }
                 let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
-                if matches!(event, Event::Resize(_, _)) {
-                    // VS Code has finished its horizontal reflow; first recompute
-                    // from the real cursor and clean up the old viewport, then let
-                    // the next `Terminal::draw` call `autoresize` to re-anchor and
-                    // redraw.
-                    if let Some(cursor_offset_row) = last_cursor_offset_row {
-                        clear_reflowed_inline_viewport(&mut terminal, cursor_offset_row)
-                            .map_err(|e| io::Error::other(e.to_string()))?;
-                    }
+                if let Event::Resize(_, _) = event {
+                    // The terminal may reflow or clear cells before delivering a
+                    // Resize event. Treat the event as a trigger and query the live
+                    // PTY size because cursor-position queries can leave older
+                    // resize events queued. Re-anchor and redraw immediately.
+                    //
+                    // A parked idle frame (empty input) leaves the real cursor on
+                    // the viewport's top-left cell, so the position report after
+                    // reflow IS the viewport's exact top row (offset 0); rows
+                    // genuinely missing at the bottom can then be reserved safely
+                    // because only real content scrolls into scrollback. With a
+                    // non-zero recorded offset the top-to-cursor distance cannot
+                    // survive reflow, so rows must never be appended there: line
+                    // feeds during width reflow permanently grow scrollback.
+                    let terminal_size = terminal.backend().size()?;
+                    let requested_height = viewport_height_with_completion(
+                        terminal_size.height,
+                        base_viewport_height,
+                        fitted_completion_items,
+                    );
+                    rebuild_fixed_viewport(
+                        &mut terminal,
+                        terminal_size,
+                        requested_height,
+                        last_cursor_offset_row.unwrap_or(0),
+                        resize_rebuild_mode(last_cursor_offset_row),
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                    // Rebuilding starts with empty ratatui buffers and the viewport
+                    // was explicitly cleared, so a forced all-cell repaint would
+                    // only increase autowrap risk while the user is still resizing.
+                    force_repaint_next_frame = false;
+                    redraw_requested = true;
                     continue;
                 }
 
@@ -449,36 +522,20 @@ impl PromptEditor {
                     EventLoopAction::Continue => {
                         force_repaint_next_frame =
                             textarea_logical_char_count(&textarea) < previous_input_len;
+                        redraw_requested = true;
                     }
                     EventLoopAction::Submit(result) => break Ok(result),
                 }
             }
         })();
 
-        // Exiting the TUI: Ratatui's clear only erases characters; the lines
-        // actually appended by the inline viewport must be deleted separately,
-        // otherwise the next submit preview or model output appears after those
-        // blank lines.
+        // Exiting the TUI: clear from the fixed viewport's reflowed top and leave
+        // the cursor there, so the submit preview follows the previous output.
         let _ = terminal.hide_cursor();
-        let can_delete_rows = last_viewport_top_row
-            .is_some_and(|_| last_viewport_height.is_some_and(|height| height > 0));
-        if !can_delete_rows {
-            let _ = terminal.clear();
-        }
+        let cleared_viewport =
+            clear_fixed_viewport(&mut terminal, last_viewport_top_row).unwrap_or(false);
         drop(terminal);
-        if can_delete_rows {
-            let _ = delete_inline_viewport_rows(
-                &mut io::stdout(),
-                last_viewport_top_row,
-                last_viewport_height,
-            );
-        } else if let Some(top_row) = last_viewport_top_row {
-            let _ = execute!(
-                io::stdout(),
-                cursor::MoveTo(0, top_row),
-                Clear(ClearType::FromCursorDown),
-            );
-        } else {
+        if !cleared_viewport {
             let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
         }
         let _ = execute!(io::stdout(), cursor::Show);
@@ -511,26 +568,59 @@ mod tests {
     };
 
     use super::{
-        clear_and_reanchor_inline_viewport, clear_reflowed_inline_viewport,
-        delete_inline_viewport_rows, force_frame_repaint, multiline_viewport_height,
-        submitted_input_preview_lines, viewport_height_with_completion,
+        ViewportRebuildMode, clear_fixed_viewport, fixed_viewport_area, force_frame_repaint,
+        multiline_viewport_height, prepare_fixed_viewport, resize_rebuild_mode,
+        submitted_input_preview_lines, take_redraw_request, terminal_with_fixed_viewport,
+        viewport_height_with_completion,
     };
 
     #[test]
-    fn inline_viewport_row_deletion_moves_to_top_and_deletes_rendered_height() {
-        let mut output = Vec::new();
+    fn idle_poll_timeouts_do_not_request_more_frames() {
+        let mut redraw_requested = true;
 
-        assert!(delete_inline_viewport_rows(&mut output, Some(4), Some(3)).unwrap());
-        assert_eq!(output, b"\x1b[5;1H\x1b[3M\x1b[5;1H\x1b[J");
+        assert!(take_redraw_request(&mut redraw_requested, false));
+        assert!(!take_redraw_request(&mut redraw_requested, false));
+        assert!(!take_redraw_request(&mut redraw_requested, false));
+
+        assert!(take_redraw_request(&mut redraw_requested, true));
+        assert!(!take_redraw_request(&mut redraw_requested, false));
     }
 
     #[test]
-    fn inline_viewport_row_deletion_requires_a_nonempty_rendered_viewport() {
-        for (top_row, height) in [(None, Some(3)), (Some(4), None), (Some(4), Some(0))] {
-            let mut output = Vec::new();
-            assert!(!delete_inline_viewport_rows(&mut output, top_row, height).unwrap());
-            assert!(output.is_empty());
-        }
+    fn fixed_viewport_scrolls_only_rows_missing_below_cursor() {
+        let size = ratatui::layout::Size {
+            width: 80,
+            height: 24,
+        };
+        let (area, lines_to_scroll) = fixed_viewport_area(
+            size,
+            Position::new(0, 10),
+            5,
+            0,
+            ViewportRebuildMode::ReserveMissingRows,
+        );
+        assert_eq!(area, ratatui::layout::Rect::new(0, 10, 80, 5));
+        assert_eq!(lines_to_scroll, 0);
+
+        let (area, lines_to_scroll) = fixed_viewport_area(
+            size,
+            Position::new(0, 22),
+            5,
+            0,
+            ViewportRebuildMode::ReserveMissingRows,
+        );
+        assert_eq!(area, ratatui::layout::Rect::new(0, 19, 80, 5));
+        assert_eq!(lines_to_scroll, 3);
+
+        let (area, lines_to_scroll) = fixed_viewport_area(
+            size,
+            Position::new(0, 22),
+            5,
+            0,
+            ViewportRebuildMode::ReflowOnly,
+        );
+        assert_eq!(area, ratatui::layout::Rect::new(0, 19, 80, 5));
+        assert_eq!(lines_to_scroll, 0);
     }
 
     #[test]
@@ -552,43 +642,75 @@ mod tests {
     }
 
     #[test]
-    fn clear_reflowed_viewport_uses_cursor_relative_top_and_restores_cursor() {
-        let backend = TestBackend::new(8, 5);
-        let mut terminal = Terminal::new(backend).unwrap();
+    fn fixed_viewport_rebuilds_without_growing_scrollback() {
+        let mut backend = TestBackend::new(10, 6);
+        backend.set_cursor_position(Position::new(0, 5)).unwrap();
+        let initial_area = prepare_fixed_viewport(
+            &mut backend,
+            ratatui::layout::Size {
+                width: 10,
+                height: 6,
+            },
+            3,
+            0,
+            ViewportRebuildMode::ReserveMissingRows,
+            false,
+        )
+        .unwrap();
+        assert_eq!(initial_area, ratatui::layout::Rect::new(0, 3, 10, 3));
+        let reserved_scrollback_height = backend.scrollback().area.height;
+        assert_eq!(reserved_scrollback_height, 2);
+
+        let mut final_area = initial_area;
+        for (width, cursor_row) in [(9, 5), (10, 4), (9, 5), (10, 5)] {
+            backend.resize(width, 6);
+            backend
+                .set_cursor_position(Position::new(0, cursor_row))
+                .unwrap();
+            final_area = prepare_fixed_viewport(
+                &mut backend,
+                ratatui::layout::Size { width, height: 6 },
+                3,
+                0,
+                ViewportRebuildMode::ReflowOnly,
+                true,
+            )
+            .unwrap();
+            assert!(final_area.bottom() <= 6);
+            assert_eq!(backend.scrollback().area.height, reserved_scrollback_height);
+        }
+
+        let mut terminal = terminal_with_fixed_viewport(backend, final_area).unwrap();
         terminal
             .draw(|frame| {
-                frame.render_widget(Paragraph::new("row0\nrow1\nrow2\nrow3\nrow4"), frame.area());
+                frame.render_widget(Paragraph::new("INPUT\nSTATUS"), frame.area());
+                frame.set_cursor_position(Position::new(0, frame.area().y));
             })
             .unwrap();
-        let cursor = Position::new(3, 4);
-        terminal.backend_mut().set_cursor_position(cursor).unwrap();
-
-        clear_reflowed_inline_viewport(&mut terminal, 2).unwrap();
-
-        assert_eq!(
-            terminal.backend_mut().get_cursor_position().unwrap(),
-            cursor
-        );
-        assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "r");
-        assert_eq!(terminal.backend().buffer()[(0, 2)].symbol(), " ");
-        assert_eq!(terminal.backend().buffer()[(0, 4)].symbol(), " ");
+        assert_eq!(terminal.backend().buffer()[(0, 3)].symbol(), "I");
+        assert_eq!(terminal.backend().buffer()[(0, 4)].symbol(), "S");
+        assert!(clear_fixed_viewport(&mut terminal, Some(3)).unwrap());
+        assert_eq!(terminal.backend().buffer()[(0, 3)].symbol(), " ");
     }
 
     #[test]
-    fn clearing_and_reanchoring_inline_viewport_uses_previous_viewport_top() {
-        let backend = TestBackend::new(8, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .backend_mut()
-            .set_cursor_position(Position::new(3, 4))
-            .unwrap();
-
-        clear_and_reanchor_inline_viewport(&mut terminal, Some(1), Some(2)).unwrap();
-
+    fn resize_rebuild_appends_rows_only_for_parked_anchor() {
+        // Parked idle frames leave the real cursor on the viewport's top row,
+        // so the post-reflow position report is the exact top row (offset 0)
+        // and rows genuinely missing below may be reserved.
         assert_eq!(
-            terminal.backend_mut().get_cursor_position().unwrap(),
-            Position::new(0, 1)
+            resize_rebuild_mode(Some(0)),
+            ViewportRebuildMode::ReserveMissingRows
         );
+        // Editing frames keep the caret inside the viewport; the recorded
+        // top-to-cursor distance does not survive reflow, so appending rows is
+        // forbidden (it would permanently grow scrollback).
+        assert_eq!(
+            resize_rebuild_mode(Some(2)),
+            ViewportRebuildMode::ReflowOnly
+        );
+        // Unknown anchor: never append.
+        assert_eq!(resize_rebuild_mode(None), ViewportRebuildMode::ReflowOnly);
     }
 
     #[test]

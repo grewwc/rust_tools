@@ -1431,7 +1431,7 @@ fn build_system_prompt(
 
         if has_tool(available_tools, "task_spawn") {
             lines.push("By default a subagent reuses your (parent) model; only override the `model` field when the subtask is clearly lighter or heavier than your own.".to_string());
-            lines.push("Give each subagent a focused context: the default `inherit` (cwd + skills, no history/memory) is right for delegated steps that touch the workspace; use `inherit=\"none\"` only for pure analysis that never touches the workspace; use `inherit=\"all\"` only when the subtask genuinely needs the full conversation.".to_string());
+            lines.push("Give each subagent a focused context: omitting `inherit` applies the default \"cwd,skills\" (no history/memory), which is right for delegated steps that touch the workspace; use `inherit=\"none\"` only for pure analysis that never touches the workspace; use `inherit=\"all\"` only when the subtask genuinely needs the full conversation.".to_string());
         }
         push_tool_guidance_section(
             &mut b,

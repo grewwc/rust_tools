@@ -1,6 +1,5 @@
 use ratatui::{
     layout::Alignment,
-    layout::Position,
     layout::Rect,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -35,7 +34,7 @@ fn popup_layout_config(
     _has_status_msg: bool,
     has_model_label: bool,
 ) -> PopupLayoutConfig {
-    // top_margin always stays 0. Do not put stable decorative horizontal rules inside the inline viewport:
+    // top_margin always stays 0. Do not put stable decorative horizontal rules inside the prompt viewport:
     // on terminal resize / reflow / re-anchoring, such full-line decorations easily get pushed into scrollback,
     // and after the width is restored they keep stacking like "a few extra horizontal lines". The divider is
     // removed entirely here, keeping only the necessary model/help info to avoid ghost artifacts.
@@ -87,7 +86,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         !model_label.is_empty(),
     );
 
-    // Compute the popup size: always fill the current inline viewport. Whitespace for the empty-input case is
+    // Compute the popup size: always fill the current prompt viewport. Whitespace for the empty-input case is
     // achieved via a smaller viewport height and removing the top gap, not by carving unused regions inside the viewport.
     let popup_height = area.height;
     let popup_width = area.width.saturating_sub(2).clamp(40, 180).min(area.width);
@@ -98,7 +97,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     let popup = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
     // Compute the inner area: 1 column of horizontal margin on each side, no extra top/bottom padding,
-    // to avoid creating extra blank lines inside the inline viewport.
+    // to avoid creating extra blank lines inside the prompt viewport.
     let h_margin: u16 = 1;
     let top_margin = layout.top_margin;
     let inner = Rect::new(
@@ -111,12 +110,9 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // Compute each region's height
     let top_rule_lines = layout.top_rule_lines;
     let help_lines = layout.help_lines;
-    // Model/topic info line: place it at the bottom (above the help line), not on the viewport's top row. On every
-    // inline-viewport re-anchor (resize, new output above, exit screen clear), the **top row** gets pushed into the
-    // terminal's permanent scrollback, and the exit-time `Clear(FromCursorDown)` cannot erase history lines above the
-    // cursor — drawing this line at the top makes it stack repeatedly like a decorative rule (`model: ... | ...`
-    // appearing multiple times after restore/redraw). The bottom region sits below the cursor, is redrawn every frame,
-    // and cleared by FromCursorDown at exit, so it never pollutes scrollback.
+    // Model/topic info line: keep it at the bottom (above the help line), where it
+    // remains visually stable while the textarea grows and the viewport is
+    // re-anchored after terminal reflow.
     let model_header_lines = layout.model_header_lines;
     // While the panel is active, prioritize filling the height: subtract the help line and the textarea's minimum
     // rows first, then give the rest to the panel (panel desired height = min(candidate count, COMPLETION_WINDOW) +
@@ -172,8 +168,8 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     f.render_widget(Clear, popup);
 
     // Bottom model/topic info line: lets the user see the current model and session topic while typing.
-    // **Must be drawn in the dedicated bottom chunk (chunks[3], above the help line), not the viewport top row**:
-    // the top row gets pushed into scrollback and stacks on every viewport re-anchor (see the model_header_lines comment above).
+    // Draw it in the dedicated bottom chunk (chunks[3], above the help line) so
+    // textarea growth does not move it through the editing region.
     if model_header_lines > 0 {
         let header_area = chunks[3];
         let mut spans = vec![
@@ -224,10 +220,10 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // or yellow warnings, and reads better over long sessions than high-saturation colors on dark terminals.
     let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
     textarea.set_style(Style::default().fg(Color::Rgb(red, green, blue)));
-    // tui-textarea draws the cursor into the buffer as a REVERSED space by default; under a ratatui inline
-    // viewport, resize re-anchoring pushes that "drawn cursor" into scrollback, so every sidebar expand/collapse
-    // leaves one more white cursor ghost. Disable the buffer cursor here and use ratatui's real terminal cursor
-    // (see set_cursor_position below), which never becomes persistable content.
+    // tui-textarea draws the cursor into the buffer as a REVERSED space by default;
+    // terminal reflow can preserve that drawn cell as a white cursor ghost. Disable
+    // the buffer cursor here and use ratatui's real terminal cursor (see
+    // set_cursor_position below), which is not persistable content.
     textarea.set_cursor_style(Style::default());
 
     f.render_widget(&*textarea, textarea_area);
@@ -237,10 +233,35 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // CJK/ambiguous-width characters, which under CJK input puts the real terminal cursor 1+ columns off from
     // the editor's buffer cursor (more visible for earlier CJK characters).
     // Reuse the position the library computed during its render plan so the two always agree.
-    let cursor_offset_row = textarea.rendered_cursor_position().map(|pos: Position| {
-        f.set_cursor_position((pos.x, pos.y));
-        pos.y.saturating_sub(area.y)
-    });
+    //
+    // Empty-input frames park the real terminal cursor on the viewport's
+    // top-left cell and paint the editing caret as a styled cell instead.
+    // Reflowing terminals (VS Code's xterm.js, Terminal.app, tmux) keep the
+    // cursor attached to its cell while re-wrapping rows, so after a resize a
+    // cursor-position query reports the viewport's exact top row (offset 0).
+    // Re-anchoring from that report can never drift, so a resize rebuild
+    // clears exactly the stale panel rows below the anchor and leaves no
+    // blank band above the next prompt. A remembered non-zero offset cannot
+    // survive reflow — the panel's own painted rows are re-wrapped too —
+    // which is what previously produced those bands during width resizes.
+    let cursor_offset_row = match textarea.rendered_cursor_position() {
+        // The styled cell mirrors tui-textarea's default reversed-space caret
+        // (disabled above to avoid reflow ghosts inside content), so the idle
+        // input line looks unchanged; the parked terminal cursor itself is
+        // only visible at the left edge of the top rule row.
+        Some(pos) if current_content.is_empty() => {
+            if let Some(cell) = f.buffer_mut().cell_mut((pos.x, pos.y)) {
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+            f.set_cursor_position((area.x, area.y));
+            Some(0)
+        }
+        Some(pos) => {
+            f.set_cursor_position((pos.x, pos.y));
+            Some(pos.y.saturating_sub(area.y))
+        }
+        None => None,
+    };
 
     // Render the completion panel
     if let Some(panel) = completion_panel {
@@ -662,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_prompt_cursor_renders_below_top_margin() {
+    fn empty_prompt_parks_cursor_on_viewport_top_left() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::with_options(
             backend,
@@ -695,14 +716,12 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("reasoning: max"));
 
-        let popup_width = viewport_area
-            .width
-            .saturating_sub(2)
-            .clamp(40, 180)
-            .min(viewport_area.width);
-        let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // The top divider is gone; with empty input the cursor should land directly on the textarea's first line.
-        let expected = Position::new(popup_x + 1, viewport_area.y);
+        // Empty-input frames park the real terminal cursor on the viewport's
+        // top-left cell so the position report after a reflow names the exact
+        // viewport top (offset 0). The editing caret itself is drawn as a
+        // styled cell at the textarea's first position, which stays on the
+        // same row as the parked cursor for empty input.
+        let expected = Position::new(viewport_area.x, viewport_area.y);
         terminal.backend_mut().assert_cursor_position(expected);
     }
 

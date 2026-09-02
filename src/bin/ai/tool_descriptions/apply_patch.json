@@ -1,7 +1,7 @@
 {
   "name": "apply_patch",
   "description": "Apply localized edits from inline text or a patch file. Supports line replacement, patch envelopes, and unified diffs.",
-  "first_use_guidance": "Guidance for later patches in this turn:\n- Copy source text exactly without `read_file` line prefixes; context lines must match.\n- For `*** Replace in line:`, provide `anchor:`, `old:`, and `new:` inside a `*** Begin Patch` envelope.\n- Patch envelopes support `*** Update File:`, `*** Add File:` with `+`-prefixed content, and `*** Delete File:` plus `@@` hunks.\n- Multi-file unified diffs split automatically, but unified diffs cannot delete files.\n- `file_path` is only needed for a single-file unified diff whose headers do not identify the target.\n- `patch` and `patch_file` are mutually exclusive; the limits are 8000 and 64000 characters respectively.",
+  "first_use_guidance": "Guidance for later patches in this turn:\n- Copy source text exactly without `read_file` line prefixes; context lines must match.\n- Each hunk's context must match exactly one location in the target file. In files with structurally similar blocks, add a distinctive anchor line (function name, comment) to the context, or patch such hunks one at a time; a multi-location match is auto-resolved only when the declared @@ line clearly identifies one candidate, otherwise the hunk is rejected and the error lists candidate lines.\n- For edits above the inline limit, write the patch to a temp file with `write_file(temp=true)` and pass it as `patch_file` (or use `write_file` for a full-file rewrite); do not retry the same oversized inline patch.\n- For `*** Replace in line:`, provide `anchor:`, `old:`, and `new:` inside a `*** Begin Patch` envelope.\n- Patch envelopes support `*** Update File:`, `*** Add File:` with `+`-prefixed content, and `*** Delete File:` plus `@@` hunks.\n- Multi-file unified diffs split automatically, but unified diffs cannot delete files.\n- `file_path` is only needed for a single-file unified diff whose headers do not identify the target.\n- `patch` and `patch_file` are mutually exclusive; the limits are 8000 and 64000 characters respectively.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,7 +11,7 @@
       },
       "patch": {
         "type": "string",
-        "description": "Inline edit in exactly one form: `*** Replace in line:` inside a `*** Begin Patch` envelope; an envelope with `*** Update/Add/Delete File:` sections and `@@` hunks; or a unified diff. No Markdown fences or no-op edits. Limit: 8000 characters."
+        "description": "Inline edit in exactly one form: `*** Replace in line:` inside a `*** Begin Patch` envelope; an envelope with `*** Update/Add/Delete File:` sections and `@@` hunks; or a unified diff. No Markdown fences or no-op edits. Limit: 8000 characters - for larger edits use `patch_file` or split. Give each hunk context that matches exactly one location (add distinctive anchor lines in repetitive code); ambiguous context is rejected unless the declared @@ line resolves it to one candidate."
       },
       "patch_file": {
         "type": "string",

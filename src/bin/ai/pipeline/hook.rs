@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use super::context::{PipelineContext, StageKind};
+use crate::ai::ports::stream::{FilterChain, StreamFilter};
 
 /// Hook callback signature: synchronous and fallible; for async, use
 /// block_on / the middleware chain.
@@ -28,10 +29,32 @@ pub struct HookRegistry {
     /// on_turn_start / on_turn_end.
     global_before: Vec<HookEntry>,
     global_after: Vec<HookEntry>,
+    stream_filters: FilterChain,
 }
 
 impl HookRegistry {
     pub fn new() -> Self { Self::default() }
+
+    pub(crate) fn register_stream_filter<F: StreamFilter + 'static>(&mut self, filter: F) {
+        self.stream_filters.register(filter);
+    }
+
+    pub(crate) fn stream_filters(&self) -> &FilterChain { &self.stream_filters }
+
+    /// Copies the parent's stream filter chain into this registry.
+    ///
+    /// Unlike stage/global hook callbacks (which stay process-local by design:
+    /// subagents/background tasks are independent execution contexts), the
+    /// stream filter chain is a content-transformation policy. Subagent and
+    /// background turns run their own `stream_response` on an `App` fork, and
+    /// their streamed content is persisted to history and passed back to the
+    /// parent via subagent payloads; silently bypassing the parent's registered
+    /// filters there would let unwanted content through. `FilterChain` entries
+    /// are `Arc<dyn StreamFilter>`, so this is an Arc-shared borrow of the same
+    /// filter objects, not a fresh copy.
+    pub(crate) fn inherit_stream_filters(&mut self, parent: &HookRegistry) {
+        self.stream_filters = parent.stream_filters.clone();
+    }
 
     pub fn register_before<F>(&mut self, kind: StageKind, name: &'static str, f: F)
     where
@@ -104,7 +127,11 @@ impl HookRegistry {
 
     /// Quick construction of an empty registry compatible with legacy shell hooks.
     pub fn is_empty(&self) -> bool {
-        self.before.is_empty() && self.after.is_empty() && self.global_before.is_empty() && self.global_after.is_empty()
+        self.before.is_empty()
+            && self.after.is_empty()
+            && self.global_before.is_empty()
+            && self.global_after.is_empty()
+            && self.stream_filters.is_empty()
     }
 
     pub fn len_before(&self, kind: StageKind) -> usize {
@@ -128,6 +155,7 @@ impl HookRegistry {
             + self.after.values().map(|v| v.len()).sum::<usize>()
             + self.global_before.len()
             + self.global_after.len()
+            + self.stream_filters.len()
     }
 }
 
