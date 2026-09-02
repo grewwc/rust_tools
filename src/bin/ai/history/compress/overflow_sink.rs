@@ -29,7 +29,42 @@ impl PlannedArchiveWrite {
     /// deterministic target file ends up remaining.
     pub(super) fn commit(&self) -> bool {
         if self.path.is_file() {
-            return true;
+            // Content-addressed idempotence: reuse if the existing file is intact.
+            // Legacy bare `fs::write` could leave a truncated file that still
+            // satisfies `exists()` / `is_file()` but is shorter than the expected
+            // content (crash mid-write). That stale partial file must not be
+            // treated as valid, otherwise the stub permanently points at half
+            // content and is never rebuilt (size / content-address check is
+            // skipped). Size check is cheap and catches truncation (partial
+            // write => smaller); same-size corruption is out of scope for this
+            // fast-path and would require a full read/hash.
+            match std::fs::metadata(&self.path) {
+                Ok(meta) if meta.len() == self.content.as_bytes().len() as u64 => {
+                    return true;
+                }
+                Ok(_) => {
+                    // Size mismatch => likely truncated legacy file. Remove so the
+                    // atomic temp+rename below can rebuild. If remove fails
+                    // (e.g. permission), fall through to attempt atomic overwrite
+                    // via `rename` which on Unix replaces the target atomically.
+                    let _ = std::fs::remove_file(&self.path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // TOCTOU: file was deleted between is_file() and metadata().
+                    // Fall through to recreate it atomically below.
+                }
+                Err(_) => {
+                    // Can't stat existing file (permission, etc.); assume it is
+                    // usable rather than risking data loss by overwriting.
+                    // Conservative fallback matches previous `return true` behavior.
+                    return true;
+                }
+            }
+            // If we reach here, the existing file was size-mismatched. Either it
+            // was removed (now !is_file()) or remove failed and it still exists
+            // but is stale. In both cases we must not return early; fall through
+            // to the atomic write path which will `rename` over the stale file.
+            // No early return.
         }
         let Some(parent) = self.path.parent() else {
             return false;

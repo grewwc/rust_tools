@@ -1,18 +1,17 @@
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use super::{
-    connection::open_history_db,
-    lock::with_session_state_lock,
-    migrations::init_history_schema,
+    connection::open_history_db, lock::with_session_state_lock, migrations::init_history_schema,
     revision::touch_session_activity,
 };
+
+const CHECKPOINT_LIVE_ROLLBACK_META_KEY: &str = "checkpoint_live_rollback_transaction_v1";
 
 /// Reads the live DB's three monotonic counters before a rollback:
 /// `history_generation`, `history_revision`, `turn_seq`. A rollback uses
@@ -36,6 +35,44 @@ impl LiveRollbackMetadata {
             turn_seq: 0,
         }
     }
+}
+
+/// Returns whether a rollback transaction has already atomically published its
+/// replacement SQLite database. The marker is written into the replacement DB
+/// before it is renamed over the live path, so a later recovery can avoid
+/// replaying that replacement over messages written after the rollback.
+pub(in crate::ai) fn live_rollback_transaction_is_published(
+    path: &Path,
+    transaction_id: &str,
+) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let meta_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .is_some();
+    if !meta_exists {
+        return Ok(false);
+    }
+    let marker = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1 LIMIT 1",
+            params![CHECKPOINT_LIVE_ROLLBACK_META_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(marker.as_deref() == Some(transaction_id))
 }
 
 pub(in crate::ai) fn read_live_rollback_metadata(path: &Path) -> io::Result<LiveRollbackMetadata> {
@@ -93,11 +130,12 @@ pub(in crate::ai) fn read_live_rollback_metadata(path: &Path) -> io::Result<Live
 /// - `history_revision` is strictly greater than the live value -> cross-connection file caches observe the change and reload.
 /// Everything commits in a single Immediate transaction, avoiding an inconsistent window of
 /// “rolled back but counters not raised” after the overwrite.
-pub(in crate::ai) fn rebase_metadata_after_rollback(
+fn rebase_metadata_after_rollback(
     path: &Path,
     live_generation: i64,
     live_revision: i64,
     live_turn_seq: i64,
+    transaction_id: Option<&str>,
 ) -> io::Result<()> {
     let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;
@@ -133,6 +171,14 @@ pub(in crate::ai) fn rebase_metadata_after_rollback(
         params![bump_rev.to_string()],
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
+    if let Some(transaction_id) = transaction_id {
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![CHECKPOINT_LIVE_ROLLBACK_META_KEY, transaction_id],
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    }
     touch_session_activity(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
@@ -143,6 +189,18 @@ pub(in crate::ai) fn rebase_metadata_after_rollback(
 pub(in crate::ai) fn restore_sqlite_after_rollback(
     checkpoint: &Path,
     live_path: &Path,
+) -> io::Result<()> {
+    restore_sqlite_after_rollback_with_transaction(checkpoint, live_path, None)
+}
+
+/// Like [`restore_sqlite_after_rollback`], but atomically stamps the published
+/// replacement DB with a rollback transaction identifier. The stamp is part of
+/// the same replacement DB that is renamed into place, making crash recovery
+/// idempotent even when later asset restoration or cleanup fails.
+pub(in crate::ai) fn restore_sqlite_after_rollback_with_transaction(
+    checkpoint: &Path,
+    live_path: &Path,
+    transaction_id: Option<&str>,
 ) -> io::Result<()> {
     with_session_state_lock(live_path, || {
         let live = read_live_rollback_metadata(live_path)?;
@@ -157,10 +215,13 @@ pub(in crate::ai) fn restore_sqlite_after_rollback(
                 live.generation,
                 live.revision,
                 live.turn_seq,
+                transaction_id,
             )?;
-            // The second backup materializes the working WAL into the final temporary main DB, then
-            // publishes it with a single rename, so the rebase transaction is not dropped by moving only the main file.
-            backup_sqlite(&working, live_path)
+            // The second backup materializes the working WAL into the final
+            // temporary main DB. Publishing it has no fallible cleanup after
+            // the rename, so the embedded transaction marker is sufficient to
+            // distinguish an already-published rollback during recovery.
+            publish_rebased_sqlite(&working, live_path)
         })();
         let _ = fs::remove_file(&working);
         let _ = remove_sqlite_sidecars(&working);
@@ -203,6 +264,66 @@ pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<(
         let _ = remove_sqlite_sidecars(&temporary);
     }
     result
+}
+
+/// Publish a rebased rollback database without any fallible work after the
+/// target rename. Existing target sidecars are checkpointed and removed before
+/// publication, so a later failure leaves the old main DB intact and retryable.
+fn publish_rebased_sqlite(source: &Path, target: &Path) -> io::Result<()> {
+    if !source.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("SQLite source does not exist: {}", source.display()),
+        ));
+    }
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("history.sqlite");
+    let temporary = parent.join(format!(
+        ".{file_name}.rollback-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+
+    let result = (|| {
+        let source_conn = Connection::open(source).map_err(|e| io::Error::other(e.to_string()))?;
+        source_conn
+            .backup(rusqlite::MAIN_DB, &temporary, None)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        drop(source_conn);
+
+        quiesce_and_remove_sqlite_sidecars(target)?;
+        fs::rename(&temporary, target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+        let _ = remove_sqlite_sidecars(&temporary);
+    }
+    result
+}
+
+fn quiesce_and_remove_sqlite_sidecars(path: &Path) -> io::Result<()> {
+    if path.exists() {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let busy = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        drop(conn);
+        if busy != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("SQLite WAL checkpoint is busy: {}", path.display()),
+            ));
+        }
+    }
+    remove_sqlite_sidecars(path)
 }
 
 /// Copy the parent session's history DB to a standalone per-process file for a sub-agent.

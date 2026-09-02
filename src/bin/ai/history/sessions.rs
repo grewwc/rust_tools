@@ -20,8 +20,8 @@ use super::{
         SessionListMetadata, backup_sqlite, read_all_messages_sqlite,
         read_first_user_prompt_sqlite, read_session_list_metadata_sqlite,
         read_session_marked_sqlite, read_session_title_origin_sqlite, read_session_title_sqlite,
-        remap_context_checkpoint_paths_sqlite, with_session_state_lock, write_session_marked_sqlite,
-        write_session_title_sqlite,
+        remap_context_checkpoint_paths_sqlite, with_session_state_lock,
+        write_session_marked_sqlite, write_session_title_sqlite,
     },
     types::Message,
 };
@@ -761,6 +761,14 @@ impl SessionStore {
             // 删除成功后主动清理缓存条目；清理失败不影响删除结果，残留条目由
             // attach_session_sizes 的 retain 自愈兜底。
             let _ = self.remove_session_size_cache_entry(session_id);
+            // Reclaim the in-process state-lock map entry: subagent paths reclaim it in
+            // `delete_subagent_history`, but a deleted main session would otherwise leave its
+            // entry (keyed by the never-reused session path) in the global map for the rest of
+            // the process lifetime — unbounded growth across create/delete cycles. The on-disk
+            // `.sqlite.state.lock` file is deliberately kept: unlinking it after releasing the
+            // flock would let a concurrent waiter that already opened the old inode lock a
+            // different inode than the next writer at the same path.
+            super::sqlite::remove_session_state_lock_entry(&path);
         }
         Ok(deleted)
     }
@@ -778,7 +786,7 @@ impl SessionStore {
         let path = self.session_history_file(&candidate.id);
         let assets = self.session_assets_dir(&candidate.id);
         let checkpoints = self.checkpoints_dir(&candidate.id);
-        with_sessions_lifecycle_lock(&self.root, || {
+        let result = with_sessions_lifecycle_lock(&self.root, || {
             super::checkpoint::with_checkpoint_lock(&checkpoints, || {
                 with_session_state_lock(&path, || {
                     let current = self
@@ -817,7 +825,13 @@ impl SessionStore {
                     Ok(PruneSessionDeleteResult::Deleted)
                 })
             })
-        })
+        })?;
+        if matches!(result, PruneSessionDeleteResult::Deleted) {
+            // Same in-process lock-map entry reclaim as `delete_session`; must run after the
+            // `with_session_state_lock` scope above so its Arc clone is dropped (strong_count 1).
+            super::sqlite::remove_session_state_lock_entry(&path);
+        }
+        Ok(result)
     }
 
     fn delete_session_artifacts_unlocked(

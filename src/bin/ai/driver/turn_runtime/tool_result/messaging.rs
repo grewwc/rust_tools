@@ -4,6 +4,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use crate::ai::{
+    driver::side_note::assets_dir_for_history,
     driver::tools::ExecuteToolCallsResult,
     history::{
         Message, ROLE_INTERNAL_NOTE, SessionStore, compress::TOOL_RESULT_RAW_HARD_CAP_CHARS,
@@ -229,10 +230,15 @@ fn save_working_context_checkpoint(
     summary: &str,
     body: &str,
 ) -> std::io::Result<PathBuf> {
-    // 与 save_context_checkpoint 同理：统一基于 config.history_file，避免嵌套目录偏移。
-    let assets_dir = SessionStore::new(app.config.history_file.as_path())
-        .session_assets_dir(&app.session_id)
-        .join("context-checkpoints");
+    // Unlike durable context checkpoints (unique per write), this file has a fixed
+    // name and is overwritten atomically. Deriving its assets root from
+    // config.history_file + session_id would let a subagent (which forks only
+    // session_history_file and inherits config.history_file + session_id) clobber
+    // the parent session's working-checkpoint.md, and background processes would
+    // race on the same file. Derive from session_history_file instead (same rule
+    // as plan_state / side_note): the parent stays at <sessions_root>/<id>.assets,
+    // while every subagent / background process gets its own assets root.
+    let assets_dir = assets_dir_for_history(&app.session_history_file).join("context-checkpoints");
     fs::create_dir_all(&assets_dir)?;
     let path = assets_dir.join(WORKING_CHECKPOINT_FILE_NAME);
     let temporary_path = assets_dir.join(format!(
@@ -1768,6 +1774,85 @@ mod tests {
         assert!(second_body.contains("Patch checkpoint flow"));
         assert!(second_body.contains("Step 1 via `apply_patch`"));
         assert!(!second_body.contains("Inspect checkpoint flow"));
+
+        let _ = std::fs::remove_dir_all(session_root);
+    }
+
+    #[test]
+    fn subagent_plan_working_checkpoint_is_isolated_from_parent() {
+        let session_root = std::env::temp_dir().join(format!(
+            "ai-plan-working-checkpoint-isolation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let history_file = session_root.join("history.sqlite");
+        let parent_app = test_app(history_file);
+
+        // A synchronous subagent inherits config.history_file + session_id from the
+        // parent and only swaps session_history_file for its own forked history.
+        let parent_history = parent_app.session_history_file.clone();
+        let stem = parent_history
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("parent history stem");
+        let ext = parent_history
+            .extension()
+            .and_then(|s| s.to_str())
+            .expect("parent history extension");
+        let child_history = parent_history.with_file_name(format!("{stem}.subagent-task-1.{ext}"));
+        let mut sub_app = parent_app.clone();
+        sub_app.session_history_file = child_history;
+
+        let parent_call = tool_call(
+            "call_plan_parent",
+            "plan",
+            serde_json::json!({
+                "summary": "Parent task",
+                "steps": [{"step": 1, "action": "Parent step", "tool": "read_file"}]
+            }),
+        );
+        let parent_marker = working_checkpoint_message_for_plan(
+            &parent_app,
+            &parent_call,
+            "Plan: Parent task\n\nStep 1. [read_file] Parent step",
+        )
+        .expect("parent plan should create working checkpoint marker");
+        let parent_path = checkpoint_path_from_marker(parent_marker.content.as_str().unwrap());
+
+        let sub_call = tool_call(
+            "call_plan_sub",
+            "plan",
+            serde_json::json!({
+                "summary": "Sub task",
+                "steps": [{"step": 1, "action": "Sub step", "tool": "read_file"}]
+            }),
+        );
+        let sub_marker = working_checkpoint_message_for_plan(
+            &sub_app,
+            &sub_call,
+            "Plan: Sub task\n\nStep 1. [read_file] Sub step",
+        )
+        .expect("subagent plan should create its own working checkpoint marker");
+        let sub_path = checkpoint_path_from_marker(sub_marker.content.as_str().unwrap());
+
+        // The subagent must not reuse the parent's fixed working-checkpoint file.
+        assert_ne!(parent_path, sub_path);
+        // The subagent marker must point into the subagent's own assets root.
+        let sub_assets = crate::ai::driver::side_note::assets_dir_for_history(
+            &sub_app.session_history_file,
+        )
+        .join("context-checkpoints");
+        assert!(
+            sub_path.starts_with(&sub_assets),
+            "subagent working checkpoint should live in its own assets root: {}",
+            sub_path.display()
+        );
+
+        // The parent's working checkpoint body stays intact after the subagent plan.
+        let parent_body = std::fs::read_to_string(&parent_path).unwrap();
+        assert!(parent_body.contains("Parent task"));
+        assert!(!parent_body.contains("Sub task"));
+        let sub_body = std::fs::read_to_string(&sub_path).unwrap();
+        assert!(sub_body.contains("Sub task"));
 
         let _ = std::fs::remove_dir_all(session_root);
     }

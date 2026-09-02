@@ -97,7 +97,7 @@ pub(in crate::ai) fn replace_history_messages(path: &Path, messages: &[Message])
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serialize_history_messages(messages))
+    atomic_write_history(path, serialize_history_messages(messages).as_bytes())
 }
 
 pub(in crate::ai) fn truncate_history_messages(path: &Path, keep: usize) -> io::Result<()> {
@@ -281,7 +281,7 @@ pub(in crate::ai) fn coalesce_repeated_wait_wake_notes(
         rebuilt.push(NEWLINE);
     }
     if removed > 0 {
-        fs::write(path, rebuilt.as_bytes()).map_err(|err| {
+        atomic_write_history(path, rebuilt.as_bytes()).map_err(|err| {
             eprintln!(
                 "[history] coalesce_repeated_wait_wake_notes: rewrite {} failed: {err}",
                 path.display()
@@ -291,6 +291,52 @@ pub(in crate::ai) fn coalesce_repeated_wait_wake_notes(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Atomically replace the whole history file: write to a unique temp file in the same directory,
+/// fsync it, then rename over the target. A crash at any point leaves either the previous complete
+/// history or no file — never a truncated canonical history (which `fs::write`'s in-place truncate
+/// could produce). Every text-backend full rewrite (replace/truncate/compaction/wake-note
+/// coalescing) funnels through here; the SQLite backend needs no equivalent because its
+/// replace/truncate run inside a transaction and are protected by the state lock.
+pub(in crate::ai) fn atomic_write_history(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("history");
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // pid + timestamp keeps temp names unique across concurrent writers in the same session, so
+    // concurrent rewrites never clobber each other's temp file; the last rename wins with a complete file.
+    let tmp = parent.join(format!(".{}.tmp.{}.{}", file_name, pid, nanos));
+    let result = (|| {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        file.flush()?;
+        // fsync before rename so the rename never publishes unflushed data.
+        file.sync_all()?;
+        // rename replaces the inode, which would silently reset the file's permission bits
+        // (the append path creates history with 0o664). Carry the previous mode over when the
+        // target already exists; a first-ever write keeps the temp file's default mode.
+        if let Ok(meta) = fs::metadata(path) {
+            let _ = fs::set_permissions(&tmp, meta.permissions());
+        }
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        // Best-effort cleanup of the temp file on failure so no partial artifact is left behind.
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -465,6 +511,66 @@ mod tests {
         let missing = dir.join("missing.txt");
         let wait_note = msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a"], "c"));
         assert!(!coalesce_repeated_wait_wake_notes(&missing, &wait_note).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_backend_rewrites_are_atomic_with_no_temp_leftovers() {
+        let dir = std::env::temp_dir().join(format!(
+            "blob_atomic_rewrite_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.txt");
+        std::fs::write(&path, serialize_history_messages_for_storage(&[msg("user", "first")]))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        // Both text-backend rewrite entry points must replace the file completely and leave no
+        // intermediate `.tmp.` artifact behind (the atomic-write contract for canonical history).
+        replace_history_messages(
+            &path,
+            &[msg("user", "second"), msg("assistant", "reply")],
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640,
+                "atomic rewrite must preserve the history file's permission bits"
+            );
+        }
+        let messages = parse_history_blob(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content.as_str(), Some("second"));
+
+        truncate_history_messages(&path, 1).unwrap();
+        let messages = parse_history_blob(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.as_str(), Some("second"));
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.contains(".tmp.").then_some(name)
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic rewrites must not leave temp files: {leftovers:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -133,13 +133,49 @@ fn publish_text_subagent_history(
 /// 同步子代理的 history 仅在任务执行期间存在。任务已停止后清除主文件、SQLite
 /// sidecar、跨进程 state lock 文件与进程内 state-lock map 条目；文本后端复用同一
 /// 清理入口也不会产生额外副作用。
+///
+/// 同时按同一 stem 规则清理子代理的 assets 目录（`<stem>.assets`，与
+/// `driver::side_note::assets_dir_for_history` 相同推导）：plan_state /
+/// side_note / working-checkpoint 都写在子代理自己的 assets 下，任务结束后即成为
+/// 孤儿残留。保留路径（[`preserve_subagent_history`]）不走这里，因此被保留的
+/// history 里引用的子代理 assets 文件不会被误删。
 pub(in crate::ai) fn delete_subagent_history(path: &Path) -> io::Result<()> {
     let history_result = blob::delete_history_artifacts(path);
     let lock_result = sqlite::delete_session_state_lock(path);
     // 回收进程内 per-path 锁条目，避免子代理路径（按 pid/task_id 唯一）累积后
     // 令 SESSION_STATE_LOCKS map 无界增长。放在磁盘清理之后、不影响其错误传播。
     sqlite::remove_session_state_lock_entry(path);
-    history_result.and(lock_result)
+    let assets_result = delete_subagent_assets_dir(path);
+    history_result.and(lock_result).and(assets_result)
+}
+
+/// 删除从子代理 history 文件推导出的 assets 目录：`<parent>/<stem>.assets`
+/// （stem 去掉 `.sqlite` 等扩展名），与 `driver::side_note::assets_dir_for_history`
+/// 保持同一规则。仅在文件名带 `.subagent-` / `.proc-` 派生标记时执行，防止误传
+/// 主会话路径时把主会话的 assets 目录一并清掉；目录不存在视为成功（幂等）。
+fn delete_subagent_assets_dir(path: &Path) -> io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !(file_name.contains(".subagent-") || file_name.contains(".proc-")) {
+        return Ok(());
+    }
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(());
+    };
+    if stem.is_empty() {
+        return Ok(());
+    }
+    let assets_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{stem}.assets"));
+    match std::fs::remove_dir_all(&assets_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// 超时保留场景下子代理历史文件的新路径（`<原路径>.timeout-preserved`）。
@@ -155,13 +191,44 @@ pub(in crate::ai) fn preserve_subagent_history(path: &Path) -> Option<PathBuf> {
         return None;
     }
     let preserved = preserved_subagent_history_path(path);
-    if std::fs::rename(path, &preserved).is_err() {
-        // rename 失败（跨设备/权限）时退化为复制；复制仍失败则放弃保留。
-        if std::fs::copy(path, &preserved).is_err() {
-            return None;
+    if blob::is_sqlite_path(path) {
+        // WAL-mode SQLite: the sub-agent's cached read connection
+        // (history/sqlite/connection.rs `CACHED_HISTORY_CONN`) stays open past the abort, so the
+        // last-connection-close checkpoint never runs and recent committed messages still live in
+        // the -wal file. Renaming only the main file would drop them and corrupt the preserved
+        // snapshot (SQLITE_IOERR_SHMOPEN on re-open). Use the SQLite Online Backup API, which
+        // copies main DB + WAL from one consistent snapshot, then remove the original DB.
+        if sqlite::backup_sqlite(path, &preserved).is_err() {
+            // Backup unavailable (locked/corrupt): fall back to the plain rename so the
+            // pre-timeout artifact is still retained best-effort.
+            if std::fs::rename(path, &preserved).is_err()
+                && std::fs::copy(path, &preserved).is_err()
+            {
+                return None;
+            }
         }
+    } else if std::fs::rename(path, &preserved).is_err()
+        && std::fs::copy(path, &preserved).is_err()
+    {
+        // Text backend: rename (with copy fallback for cross-device/permission failures).
+        return None;
     }
-    // 主文件已改名/复制保留，这里只清理原路径的 SQLite sidecar。
+    // `preserved` now supersedes the original path. The backup path keeps the original main file
+    // in place, so remove it (plus any SQLite sidecars) to restore the "original path is gone"
+    // contract the caller and the recovery reader rely on.
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        // The rename/copy fallback branches already moved the original away, so NotFound is
+        // expected there; any other failure leaves a stale, uncheckpointed DB at the original
+        // path that the sidecar cleanup below no longer protects. Surface it instead of silently
+        // discarding it; the preserved snapshot itself is already complete at this point.
+        eprintln!(
+            "[Warning] preserved subagent history at {} but failed to remove the original {}: {error}",
+            preserved.display(),
+            path.display()
+        );
+    }
     let base = path.to_string_lossy().to_string();
     for suffix in ["-wal", "-shm", "-journal"] {
         let _ = std::fs::remove_file(Path::new(&format!("{base}{suffix}")));
@@ -648,9 +715,9 @@ async fn compact_session_history_with_app_inner(
             return Ok(());
         }
     } else if compacted != messages {
-        std::fs::write(
+        blob::atomic_write_history(
             history_file,
-            blob::serialize_history_messages_for_storage(&compacted),
+            blob::serialize_history_messages_for_storage(&compacted).as_bytes(),
         )?;
     } else {
         return Ok(());
@@ -740,6 +807,130 @@ mod tests {
 
         delete_subagent_history(&history).unwrap();
         assert!(!sqlite::history_revision_cache_contains(&history));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_subagent_history_removes_derived_assets_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "delete_subagent_history_assets_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Sync-task naming: `<parent>.subagent-<task_id>.sqlite`; its derived assets
+        // dir holds plan_state / side_note / working-checkpoint.
+        let history = dir.join("session.subagent-task_x.sqlite");
+        std::fs::File::create(&history).unwrap();
+        let assets = dir.join("session.subagent-task_x.assets");
+        std::fs::create_dir_all(assets.join("side_notes")).unwrap();
+        std::fs::write(assets.join("plan-state.json"), "{}").unwrap();
+        std::fs::write(assets.join("side_notes").join("foreground.jsonl"), "{}").unwrap();
+
+        delete_subagent_history(&history).unwrap();
+        assert!(!history.exists(), "history must be removed");
+        assert!(!assets.exists(), "derived subagent assets dir must be removed");
+
+        // Idempotent: a second call (assets already gone) must not error.
+        delete_subagent_history(&history).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_subagent_history_removes_proc_assets_and_spares_main_session_assets() {
+        let dir = std::env::temp_dir().join(format!(
+            "delete_subagent_history_proc_assets_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Background-process naming: `<parent>.proc-<pid>.sqlite`.
+        let proc_history = dir.join("session.proc-4242.sqlite");
+        std::fs::File::create(&proc_history).unwrap();
+        let proc_assets = dir.join("session.proc-4242.assets");
+        std::fs::create_dir_all(&proc_assets).unwrap();
+        std::fs::write(proc_assets.join("plan-state.json"), "{}").unwrap();
+        delete_subagent_history(&proc_history).unwrap();
+        assert!(!proc_assets.exists(), "proc-derived assets dir must be removed");
+
+        // Defensive guard: a main-session history path (no `.subagent-` / `.proc-`
+        // marker) must never delete the main session's assets dir.
+        let main_history = dir.join("session.sqlite");
+        std::fs::File::create(&main_history).unwrap();
+        let main_assets = dir.join("session.assets");
+        std::fs::create_dir_all(&main_assets).unwrap();
+        std::fs::write(main_assets.join("plan-state.json"), "{}").unwrap();
+        delete_subagent_history(&main_history).unwrap();
+        assert!(
+            main_assets.exists(),
+            "main-session assets must survive delete_subagent_history"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preserve_subagent_history_keeps_wal_committed_messages() {
+        let dir = std::env::temp_dir().join(format!(
+            "preserve_subagent_history_wal_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let history = dir.join("subagent-1-2.sqlite");
+
+        // First write: creates the schema and the first committed message.
+        append_history_messages(
+            &history,
+            &[Message {
+                role: "assistant".into(),
+                content: serde_json::Value::String("first message".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+
+        // Simulate the running sub-agent's cached read connection: the worker-thread TLS keeps
+        // this connection open past the child's abort, which prevents the last-connection-close
+        // WAL checkpoint (history/sqlite/connection.rs `CACHED_HISTORY_CONN`).
+        read_context_history_sqlite(&history, "test-fingerprint").unwrap();
+
+        // A later write is committed to the -wal file and is not yet checkpointed into the main
+        // DB (wal_autocheckpoint defaults to 1000 pages).
+        append_history_messages(
+            &history,
+            &[Message {
+                role: "assistant".into(),
+                content: serde_json::Value::String("second message".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        let wal_path = PathBuf::from(format!("{}-wal", history.display()));
+        assert!(wal_path.exists(), "WAL must hold the second committed message");
+
+        let preserved = preserve_subagent_history(&history).unwrap();
+        let messages = build_message_arr(10, &preserved).unwrap();
+        let contents: Vec<String> = messages
+            .iter()
+            .filter_map(|m| m.content.as_str().map(str::to_string))
+            .collect();
+        assert!(
+            contents.iter().any(|c| c == "first message"),
+            "preserved snapshot must keep the first message, got {contents:?}"
+        );
+        assert!(
+            contents.iter().any(|c| c == "second message"),
+            "preserved snapshot must keep the WAL-committed second message, got {contents:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

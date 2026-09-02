@@ -19,11 +19,18 @@ Contexts that are translated (Chinese -> ASCII punctuation):
      at punctuation followed by a CJK ideograph, marking the transition back
      into prose (e.g. `src/main，rs` becomes `src/main,rs` while
      `src/main，请查看` keeps its prose comma).
-  4. Fullwidth parentheses `（` `）` in plain prose: converted to `(` `)`
-     (e.g. `动态指引（code 段）` becomes `动态指引(code 段)`).  This is a
-     deliberate exception to the "prose is untouched" rule: technical prose
-     mixes halfwidth parens around code/file references, and a lone
-     fullwidth pair reads as a rendering glitch.
+  4. Fullwidth parentheses `（` `）` in plain prose: converted to halfwidth
+     with a separating space when they abut prose, so rendered Markdown does
+     not jam CJK text against the paren (e.g. `动态指引（code 段）` becomes
+     `动态指引 (code 段)`; `函数（输入）报错` becomes `函数 (输入) 报错`).
+     The space is inserted only when the neighbour is a non-space character:
+     an already-present space is reused (`）（` -> `) (`), and a paren at the
+     line end stays bare (no trailing whitespace).  This is a deliberate
+     exception to the "prose is untouched" rule: technical prose mixes
+     halfwidth parens around code/file references, and a lone fullwidth pair
+     reads as a rendering glitch.  Parentheses inside fenced blocks, inline
+     code spans, and path spans still map to bare `(` `)` -- a space there
+     would corrupt tokens.
   5. Fullwidth colon `：` in plain prose: converted to `: ` (halfwidth colon
      plus one space) only when it directly abuts an ASCII letter -- e.g.
      `使用 rustc：完成` becomes `使用 rustc: 完成`.  Pure-Chinese labels keep
@@ -232,6 +239,13 @@ def _translate_prose_punct(text):
     would corrupt tokens such as `main.rs:10`, `C:\\Users`, or `main。rs`);
     whatever `（`/`）`/`：`/`。` is left is prose-level and gets converted
     here (see module docstring, exceptions 4-6)."""
+    # Fullwidth parens to halfwidth with a separating space, but only when the
+    # neighbour is a non-space character: an already-present space is reused so
+    # `）（` becomes `) (` (never `)  (`), and a paren at the line end / before
+    # whitespace stays bare (no trailing space). Order matters: `）` is spaced
+    # first, so the following `（` sees that inserted space and adds none.
+    text = re.sub(r"\uff09(?=\S)", ") ", text)
+    text = re.sub(r"(?<=\S)\uff08", " (", text)
     text = text.replace("\uff08", "(").replace("\uff09", ")")
     out = []
     # Apply the adjacency rule per visible segment: ANSI codes are token
@@ -340,7 +354,7 @@ def _selftest():
         ("查看 src/main.rs，请确认。", "查看 src/main.rs，请确认。"),
         # Prose colon directly before an inline code span.
         ("全仓 8000 有三处：`patch_tools.rs:2648` 拦截（源头，功能性）",
-         "全仓 8000 有三处：`patch_tools.rs:2648` 拦截(源头，功能性)"),
+         "全仓 8000 有三处：`patch_tools.rs:2648` 拦截 (源头，功能性)"),
         # Colons inside inline code stay bare: a space would corrupt tokens.
         ("`配置：main.rs：10` 已修复", "`配置:main.rs:10` 已修复"),
         # ANSI codes preserved.
@@ -348,13 +362,20 @@ def _selftest():
         # Quoted file location in prose.
         ('请打开 "src/foo，bar.rs"', '请打开 "src/foo,bar.rs"'),
         # Prose fullwidth parens -> halfwidth (exception 4); inner code span
-        # and prose comma stay as-is.
+        # and prose comma stay as-is; a separating space keeps prose and
+        # paren apart, and the line-ending paren stays bare (no trailing
+        # whitespace).
         ("动态指引（`temporary_files` 段，注入 system prompt）",
-         "动态指引(`temporary_files` 段，注入 system prompt)"),
-        ("查看 src/main.rs（请确认）", "查看 src/main.rs(请确认)"),
-        # Parens converted; colon/period stay fullwidth in pure-Chinese
-        # prose; other prose punctuation still untouched.
-        ("函数（输入）报错：请重试。", "函数(输入)报错：请重试。"),
+         "动态指引 (`temporary_files` 段，注入 system prompt)"),
+        ("查看 src/main.rs（请确认）", "查看 src/main.rs (请确认)"),
+        # Parens converted with separating spaces; adjacent pairs reuse one
+        # space (`）（` -> `) (`) instead of a double space; colon/period
+        # stay fullwidth in pure-Chinese prose.
+        ("函数（输入）报错：请重试。", "函数 (输入) 报错：请重试。"),
+        ("嵌套（甲）（乙）结束", "嵌套 (甲) (乙) 结束"),
+        # A fullwidth paren next to an existing space reuses it instead of
+        # adding another, and the line-ending paren stays bare.
+        ("说明 （注）", "说明 (注)"),
         # ANSI codes are token boundaries: a reset's trailing `m` is not a
         # letter, so a pure-Chinese period after it stays fullwidth.
         ("\x1b[32m成功\x1b[0m。", "\x1b[32m成功\x1b[0m。"),

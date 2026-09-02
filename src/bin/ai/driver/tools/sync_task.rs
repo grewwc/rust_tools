@@ -144,7 +144,7 @@ impl Drop for SyncSubagentHistoryGuard {
 /// progress until the task completes / is cancelled / times out.
 const SUBAGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
-type BoxedSubagentFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type BoxedSubagentFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
 fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubagentFuture {
     Box::pin(runtime_ctx::SUPPRESS_TERMINAL_OUTPUT.scope(true, wrapped))
@@ -379,7 +379,8 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         }
         .map(|_outcome| ())
         .map_err(|e| format!("{}", e));
-        let _ = tx.send(result);
+        let _ = tx.send(result.clone());
+        result
     };
 
     let mut wrapped: BoxedSubagentFuture = Box::pin(inner_fut);
@@ -416,7 +417,15 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let memory_merge_error_for_task = memory_merge_error.clone();
     let guarded = async move {
         let mut history_cleanup = history_cleanup;
-        wrapped.await;
+        let outcome = wrapped.await;
+        // A subagent whose turn failed never reached `finalize_turn`, so the result slot stays
+        // empty and the parent would otherwise see only the error. Preserve its history (rename
+        // on Drop instead of delete) so the parent can extract the pre-failure evidence. Without
+        // this, a failure late in a long investigation (e.g. the forced wrap-up request rejected
+        // by the provider) deleted the whole history and wasted all collected work.
+        if outcome.is_err() {
+            history_cleanup.preserve_on_drop.store(true, Ordering::Release);
+        }
         if let Some((private_memory, main_memory)) = memory_merge {
             match crate::ai::tools::service::memory::merge_subagent_whitelist(
                 &private_memory,
@@ -475,20 +484,30 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let duration = started.elapsed();
     let elapsed_secs = duration.as_secs_f64();
 
-    // Hard timeout: the guard has already renamed the sub-agent history aside; here we extract
-    // the pre-timeout work product and publish it to the result slot, so 10 minutes of work is
-    // not lost (previously the timeout path only returned an empty result).
-    if let Err(timeout_error) = &join_result {
-        let timeout_phase = phase_slot
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
-        publish_timeout_evidence(
+    // After a hard timeout or a subagent failure that never reached `finalize_turn`, the guard
+    // has already renamed the sub-agent history aside (Drop runs when the spawned task finishes);
+    // extract the pre-failure work product and publish it to the result slot, so long
+    // investigations are not lost. Previously the timeout path returned an empty result and the
+    // FAILED path deleted the history outright, so a failure after many minutes of work showed
+    // nothing to the parent.
+    let failure_phase = phase_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    match &join_result {
+        Err(timeout_error) => publish_recovery_evidence(
             &child_history,
             &result_slot,
             timeout_error,
-            &format!("{timeout_phase:?}"),
-        );
+            &format!("{failure_phase:?}"),
+        ),
+        Ok(Err(failure_error)) => publish_recovery_evidence(
+            &child_history,
+            &result_slot,
+            failure_error,
+            &format!("{failure_phase:?}"),
+        ),
+        Ok(Ok(())) => {}
     }
 
     let captured_result = result_slot
@@ -659,14 +678,15 @@ async fn wait_for_sync_task_completion_with_wrap_up(
     }
 }
 
-/// After a hard timeout, extracts the work product the sub-agent already wrote to its history
-/// and publishes it to the result slot. The parent then sees a pre-timeout evidence excerpt and
-/// the preserved file path in the failure result instead of an empty one (the previous timeout
-/// path discarded all 10 minutes of work).
-fn publish_timeout_evidence(
+/// After a hard timeout or a subagent failure that never reached `finalize_turn`, extracts the
+/// work product the sub-agent already wrote to its (preserved) history and publishes it to the
+/// result slot. The parent then sees a pre-failure evidence excerpt plus the preserved file path
+/// in the failure result instead of an empty one (previously the timeout path discarded all the
+/// work, and the failed path deleted the history entirely).
+fn publish_recovery_evidence(
     child_history: &Path,
     result_slot: &runtime_ctx::SubagentResultSlot,
-    timeout_error: &str,
+    failure_error: &str,
     phase: &str,
 ) {
     let preserved = history::preserved_subagent_history_path(child_history);
@@ -692,7 +712,7 @@ fn publish_timeout_evidence(
         )
     };
     let payload = format_timeout_recovery_payload(
-        timeout_error,
+        failure_error,
         phase,
         &preserved,
         excerpt.trim(),
@@ -706,16 +726,20 @@ fn publish_timeout_evidence(
 }
 
 fn format_timeout_recovery_payload(
-    timeout_error: &str,
+    failure_error: &str,
     phase: &str,
     preserved: &Path,
     excerpt: &str,
     extraction_error: Option<&str>,
 ) -> String {
-    let status = if timeout_error.contains("exceeded hard timeout") {
+    // Classify the recovery status from the error text so the parent (and the terminal renderer)
+    // can tell a hard timeout, a cancel/interrupt, and a plain subagent failure apart.
+    let status = if failure_error.contains("exceeded hard timeout") {
         "timed_out"
-    } else {
+    } else if failure_error.contains("aborted") || failure_error.contains("cancel") {
         "interrupted"
+    } else {
+        "failed"
     };
     let evidence = if excerpt.is_empty() {
         "未恢复到非空消息；请结合下方诊断和保留路径继续排查。"
@@ -726,7 +750,7 @@ fn format_timeout_recovery_payload(
         .map(|error| format!("\nhistory_extraction_error: {error}"))
         .unwrap_or_default();
     format!(
-        "SUBAGENT_TIMEOUT_RECOVERY_V1\nstatus: {status}\nerror: {timeout_error}\nlast_phase: {phase}\npreserved_child_history: {}{extraction}\n\n## 中断前已完成的工作（恢复节选）\n\n{evidence}\n\n以上是阶段性证据而非完整审计结论；后续应从这些证据继续，而不是从零重跑。",
+        "SUBAGENT_TIMEOUT_RECOVERY_V1\nstatus: {status}\nerror: {failure_error}\nlast_phase: {phase}\npreserved_child_history: {}{extraction}\n\n## 中断前已完成的工作（恢复节选）\n\n{evidence}\n\n以上是阶段性证据而非完整审计结论；后续应从这些证据继续，而不是从零重跑。",
         preserved.display(),
     )
 }
@@ -898,6 +922,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let fut: BoxedSubagentFuture = Box::pin(async move {
             let _ = tx.send(runtime_ctx::terminal_output_enabled());
+            Ok(())
         });
 
         suppress_subagent_terminal_output(fut).await;
@@ -1125,6 +1150,11 @@ mod tests {
         let cwd_path = root.join("subagent-cwd-child");
         std::fs::create_dir_all(cwd_path.join("nested")).unwrap();
         std::fs::write(cwd_path.join("scratch.txt"), b"scratch").unwrap();
+        // Subagent-scoped assets (plan_state / side_note / working-checkpoint) live in
+        // `<stem>.assets` next to the child history; guard Drop must reclaim them too.
+        let assets_dir = root.join("session.subagent-child.assets");
+        std::fs::create_dir_all(assets_dir.join("side_notes")).unwrap();
+        std::fs::write(assets_dir.join("plan-state.json"), b"{}").unwrap();
 
         drop(
             SyncSubagentHistoryGuard::new(child_path.clone(), Arc::new(AtomicBool::new(false)))
@@ -1139,6 +1169,7 @@ mod tests {
         assert!(!memory_db_path.exists());
         assert!(!std::path::Path::new(&format!("{}-wal", memory_db_path.display())).exists());
         assert!(!cwd_path.exists());
+        assert!(!assets_dir.exists(), "guard Drop must remove subagent assets dir");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1223,6 +1254,61 @@ mod tests {
         assert!(payload.contains("history_extraction_error"));
         assert!(payload.contains("preserved child history was not found"));
         assert!(payload.contains("未恢复到非空消息"));
+    }
+
+    #[test]
+    fn recovery_payload_classifies_run_turn_failure_as_failed() {
+        let payload = format_timeout_recovery_payload(
+            "model request failed: provider returned 500",
+            "CallingTool",
+            Path::new("/tmp/audit-failed.sqlite"),
+            "AUDIT_CHECKPOINT: checked src/a.rs",
+            None,
+        );
+
+        assert!(payload.contains("status: failed"));
+        assert!(payload.contains("provider returned 500"));
+    }
+
+    #[test]
+    fn recovery_payload_classifies_cancel_as_interrupted() {
+        let payload = format_timeout_recovery_payload(
+            "subagent task aborted: stream cancel requested",
+            "CallingTool",
+            Path::new("/tmp/audit-cancel.sqlite"),
+            "",
+            None,
+        );
+
+        assert!(payload.contains("status: interrupted"));
+    }
+
+    #[test]
+    fn publish_recovery_evidence_fills_empty_result_slot_on_missing_history() {
+        let slot: runtime_ctx::SubagentResultSlot = Arc::new(tokio::sync::Mutex::new(
+            runtime_ctx::SubagentResult::default(),
+        ));
+        let missing = std::env::temp_dir().join(format!(
+            "ai-recovery-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        publish_recovery_evidence(
+            &missing,
+            &slot,
+            "model request failed: provider returned 500",
+            "CallingTool",
+        );
+
+        let captured = slot
+            .try_lock()
+            .expect("slot should be free after publishing")
+            .clone();
+        assert!(captured.parent_payload.contains("SUBAGENT_TIMEOUT_RECOVERY_V1"));
+        assert!(captured.parent_payload.contains("status: failed"));
+        assert!(captured
+            .parent_payload
+            .contains("preserved child history was not found"));
     }
 
     #[test]

@@ -24,7 +24,10 @@ use crate::ai::history::SessionStore;
 
 use super::{
     sessions::copy_dir_recursively,
-    sqlite::{backup_sqlite, restore_sqlite_after_rollback},
+    sqlite::{
+        backup_sqlite, live_rollback_transaction_is_published, restore_sqlite_after_rollback,
+        restore_sqlite_after_rollback_with_transaction,
+    },
 };
 const MAX_CHECKPOINTS_PER_SESSION: usize = 20;
 const MAX_CHECKPOINT_STORAGE_BYTES: u64 = 512 * 1024 * 1024;
@@ -376,20 +379,29 @@ impl CheckpointStore {
         let new_state = transaction.join("new");
         let sqlite = new_state.join(GENERATION_SQLITE_FILE);
         let assets = new_state.join(GENERATION_ASSETS_DIR);
-        if !transaction.join(LIVE_ROLLBACK_MANIFEST).is_file()
-            || !sqlite.is_file()
-            || !assets.is_dir()
-        {
+        let transaction_id = live_rollback_transaction_id(transaction)?;
+        if !live_rollback_is_ready(transaction) {
             return Err(io::Error::other(format!(
                 "incomplete checkpoint rollback transaction: {}",
                 transaction.display()
             )));
         }
+        if live_rollback_transaction_is_published(&self.session_file, &transaction_id)? {
+            // Assets are restored before the marker-bearing SQLite DB is
+            // published, so a matching marker means only cleanup remains.
+            // Replaying either state would clobber post-rollback writes.
+            fs::remove_dir_all(transaction)?;
+            return Ok(());
+        }
         if let Some(parent) = self.session_file.parent() {
             fs::create_dir_all(parent)?;
         }
-        restore_sqlite_after_rollback(&sqlite, &self.session_file)?;
         restore_checkpoint_assets(&assets, &self.session_assets)?;
+        restore_sqlite_after_rollback_with_transaction(
+            &sqlite,
+            &self.session_file,
+            Some(&transaction_id),
+        )?;
         fs::remove_dir_all(transaction)?;
         Ok(())
     }
@@ -409,9 +421,13 @@ impl CheckpointStore {
             if !entry.file_type()?.is_dir() || !name.starts_with(LIVE_ROLLBACK_PREFIX) {
                 continue;
             }
-            if path.join(LIVE_ROLLBACK_MANIFEST).is_file() {
+            if live_rollback_is_ready(&path) {
                 self.complete_live_rollback(&path)?;
             } else {
+                // Staging writes the manifest last and cannot begin a SQLite
+                // replacement until the staged source is complete. A malformed
+                // directory therefore has no rollback to resume and must not
+                // block every later checkpoint operation.
                 fs::remove_dir_all(path)?;
             }
         }
@@ -762,6 +778,43 @@ fn generation_is_ready(path: &Path) -> bool {
     path.join(GENERATION_MANIFEST_FILE).is_file()
         && path.join(GENERATION_SQLITE_FILE).is_file()
         && path.join(GENERATION_ASSETS_DIR).is_dir()
+}
+
+fn live_rollback_is_ready(path: &Path) -> bool {
+    path.join(LIVE_ROLLBACK_MANIFEST).is_file()
+        && path.join("new").join(GENERATION_SQLITE_FILE).is_file()
+        && path.join("new").join(GENERATION_ASSETS_DIR).is_dir()
+}
+
+fn live_rollback_transaction_id(transaction: &Path) -> io::Result<String> {
+    let Some(name) = transaction.file_name().and_then(|name| name.to_str()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "rollback transaction has no valid name: {}",
+                transaction.display()
+            ),
+        ));
+    };
+    let Some(transaction_id) = name.strip_prefix(LIVE_ROLLBACK_PREFIX) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid rollback transaction name: {}",
+                transaction.display()
+            ),
+        ));
+    };
+    if transaction_id.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "rollback transaction has an empty identifier: {}",
+                transaction.display()
+            ),
+        ));
+    }
+    Ok(transaction_id.to_string())
 }
 
 fn staged_generation_base<'a>(name: &'a str, marker: &str) -> Option<&'a str> {
@@ -1149,6 +1202,179 @@ mod tests {
         assert_eq!(restored[0].content, Value::String("before".to_string()));
         assert_eq!(fs::read_to_string(live_asset).unwrap(), "before asset");
         assert!(!transaction.exists());
+        if let Some(root) = history_file.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn startup_recovery_does_not_replay_published_live_rollback() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-rollback-idempotent-recovery");
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("before".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        let live_asset = store
+            .session_assets
+            .join("context-checkpoints")
+            .join("working-checkpoint.md");
+        fs::create_dir_all(live_asset.parent().unwrap()).unwrap();
+        fs::write(&live_asset, "before working checkpoint").unwrap();
+        store.save("stable").unwrap();
+
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "assistant".to_string(),
+                content: Value::String("after".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        fs::write(&live_asset, "after working checkpoint").unwrap();
+
+        let transaction = store
+            .stage_live_rollback(
+                &store.checkpoint_path("stable"),
+                &store.checkpoint_assets_path("stable"),
+            )
+            .unwrap();
+        let transaction_id = live_rollback_transaction_id(&transaction).unwrap();
+        restore_checkpoint_assets(
+            &transaction.join("new").join(GENERATION_ASSETS_DIR),
+            &store.session_assets,
+        )
+        .unwrap();
+        restore_sqlite_after_rollback_with_transaction(
+            &transaction.join("new").join(GENERATION_SQLITE_FILE),
+            &store.session_file,
+            Some(&transaction_id),
+        )
+        .unwrap();
+        assert!(
+            live_rollback_transaction_is_published(&store.session_file, &transaction_id).unwrap()
+        );
+
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "assistant".to_string(),
+                content: Value::String("after published rollback".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        fs::write(&live_asset, "after published rollback working checkpoint").unwrap();
+
+        store.recover().unwrap();
+
+        let restored = build_message_arr(10, &store.session_file).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].content, Value::String("before".to_string()));
+        assert_eq!(
+            restored[1].content,
+            Value::String("after published rollback".to_string())
+        );
+        assert_eq!(
+            fs::read_to_string(live_asset).unwrap(),
+            "after published rollback working checkpoint"
+        );
+        assert!(!transaction.exists());
+        if let Some(root) = history_file.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn rollback_publish_removes_sidecars_without_a_live_main_db() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-rollback-sidecar-publish");
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("checkpoint history".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        store.save("stable").unwrap();
+        let transaction = store
+            .stage_live_rollback(
+                &store.checkpoint_path("stable"),
+                &store.checkpoint_assets_path("stable"),
+            )
+            .unwrap();
+        let transaction_id = live_rollback_transaction_id(&transaction).unwrap();
+
+        fs::remove_file(&store.session_file).unwrap();
+        let sidecars = ["-wal", "-shm", "-journal"]
+            .map(|suffix| PathBuf::from(format!("{}{}", store.session_file.display(), suffix)));
+        for sidecar in &sidecars {
+            fs::write(sidecar, b"stale sidecar").unwrap();
+        }
+
+        restore_sqlite_after_rollback_with_transaction(
+            &transaction.join("new").join(GENERATION_SQLITE_FILE),
+            &store.session_file,
+            Some(&transaction_id),
+        )
+        .unwrap();
+
+        assert!(store.session_file.is_file());
+        assert!(sidecars.iter().all(|sidecar| !sidecar.exists()));
+        assert_eq!(
+            build_message_arr(10, &store.session_file).unwrap()[0].content,
+            Value::String("checkpoint history".to_string())
+        );
+        if let Some(root) = history_file.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn startup_recovery_reclaims_incomplete_live_rollback_transaction() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-rollback-stage-cleanup");
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("live history".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        let transaction = store
+            .dir
+            .join(format!("{LIVE_ROLLBACK_PREFIX}{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&transaction).unwrap();
+        fs::write(transaction.join(LIVE_ROLLBACK_MANIFEST), b"commit\n").unwrap();
+
+        store.recover().unwrap();
+
+        assert!(!transaction.exists());
+        assert_eq!(
+            build_message_arr(10, &store.session_file).unwrap()[0].content,
+            Value::String("live history".to_string())
+        );
+        assert!(store.save("stable").unwrap().exists());
         if let Some(root) = history_file.parent() {
             let _ = fs::remove_dir_all(root);
         }

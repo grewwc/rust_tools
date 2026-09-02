@@ -795,10 +795,18 @@ pub(super) fn write_preserved_tool_overflow_file_stable(
     // Idempotent for identical content: the same (id, content) maps to the same
     // path, so an existing file is never rewritten and the stub text (and the
     // prompt cache prefix) stays stable across turns.
-    if !path.exists() {
-        std::fs::write(&path, content).ok()?;
+    // Use atomic temp+fsync+rename via `PlannedArchiveWrite::commit` instead of
+    // bare `fs::write`. A bare write truncates the target in-place; a crash
+    // mid-write leaves a truncated file that forever satisfies `exists()` and is
+    // never rebuilt while the stub claims "full result at file_path". The atomic
+    // path only publishes the target after a fully synced temp file. Truncated
+    // legacy detection is handled inside `PlannedArchiveWrite::commit` (size
+    // mismatch => remove + rebuild/overwrite).
+    if PlannedArchiveWrite::new(path.clone(), content.to_string()).commit() {
+        Some(path)
+    } else {
+        None
     }
-    Some(path)
 }
 
 /// Normalizes a tool name / id into a safe file-name fragment containing only
@@ -842,10 +850,15 @@ fn write_preserved_tool_overflow_file(
     let path = dir.join(format!("spilled-{safe_tool}-{}.txt", &digest[..24]));
     // Idempotent: the content does not change across rounds; if it exists it is
     // not rewritten (also keeping the prompt cache stable).
-    if !path.exists() {
-        std::fs::write(&path, content).ok()?;
+    // Atomicity rationale is documented on `write_preserved_tool_overflow_file_stable`:
+    // bare `fs::write` can leave a truncated content-addressed file that forever
+    // satisfies `exists()` and is never rebuilt. Deduplication + truncated
+    // recovery is handled inside `PlannedArchiveWrite::commit`.
+    if PlannedArchiveWrite::new(path.clone(), content.to_string()).commit() {
+        Some(path)
+    } else {
+        None
     }
-    Some(path)
 }
 
 pub(super) fn build_preserved_tool_overflow_stub(
@@ -1629,8 +1642,16 @@ fn write_preserved_message_overflow_file(
     }
 
     let serialized = serde_json::to_string_pretty(&Value::Object(payload)).ok()?;
-    std::fs::write(&path, serialized).ok()?;
-    Some(path)
+    // Use atomic temp+fsync+rename via `PlannedArchiveWrite::commit` instead of
+    // bare `fs::write`. The file name is unique (timestamp + uuid), but a crash
+    // mid-write still leaves a truncated asset that the stub permanently points
+    // at. The atomic path only publishes the target after a fully synced temp
+    // file, matching the content-addressed tool overflow fix.
+    if PlannedArchiveWrite::new(path.clone(), serialized).commit() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 fn build_preserved_message_overflow_stub(path: &Path, kind: &str) -> String {

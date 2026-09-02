@@ -1074,6 +1074,7 @@ async fn run_turn_body(
     let mut final_assistant_recorded = false;
     let mut final_response_model = None::<String>;
     let mut terminal_dedupe_candidate = None;
+    let mut final_validation_status = None;
     let mut final_gate_state = FinalGateState::default();
     // Collect the names of explicit-enabled tools actually called this turn; used to age
     // out unused entries at the end of the turn.
@@ -1588,6 +1589,7 @@ async fn run_turn_body(
                 &mut final_assistant_recorded,
                 &mut force_final_response,
                 &mut terminal_dedupe_candidate,
+                &mut final_validation_status,
                 &mut final_gate_state,
                 skill_turn.matched_skill_names().is_empty(),
                 iteration,
@@ -1598,6 +1600,9 @@ async fn run_turn_body(
                 Ok(s) => s,
                 Err(err) => break 'turn Err(err),
             };
+            if matches!(step, TurnLoopStep::Continue) {
+                drop(final_validation_status.take());
+            }
             match step {
                 TurnLoopStep::ScopedPreflightContinue(targets) => {
                     if supervisor.grant_scoped_preflight_grace() {
@@ -1950,6 +1955,8 @@ async fn run_turn_body(
     app.cli.reasoning_effort_override = saved_effort_override;
     app.cli.thinking_disabled_override = saved_thinking_disabled;
     app.cli.max_tokens_override = saved_max_tokens_override;
+    // Final-gate status is transient and must not overlap terminal output from finalization.
+    drop(final_validation_status.take());
 
             // Age out explicit-enabled tools that were not used this turn. After N consecutive
             // turns of idle use they are demoted, preventing "enabled once, welded forever".

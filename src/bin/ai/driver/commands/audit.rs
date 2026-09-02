@@ -94,6 +94,9 @@ pub(crate) fn terminal_audit_result(payload: &str) -> String {
         }
     }
 
+    // 超时/失败路径：中断前已收集的恢复证据块（sync_task 写入 result slot 的
+    // SUBAGENT_TIMEOUT_RECOVERY_V1）只随完整 payload 交给主 agent（lead agent）作为证据，
+    // 终端不展示节选内容——用户只需要知道审计未完成，原因由紧凑的 `Error:` 行给出。
     if let Some(error) = payload
         .lines()
         .find_map(|line| line.trim().strip_prefix("Error: "))
@@ -514,6 +517,35 @@ No verified findings.\n{}",
         let payload = "[task_id=task-1]\n[Task: /audit inspect via audit @ model] FAILED after 1.0s\nError: model unavailable\n[subagent evidence omitted]";
 
         assert_eq!(terminal_audit_result(payload), "[audit] model unavailable");
+    }
+
+    #[test]
+    fn terminal_audit_result_keeps_compact_error_on_timeout_with_recovery_evidence() {
+        // 超时 payload 同时含 `Error:` 行与恢复节选。恢复节选只随完整 payload 交给主 agent
+        // （lead agent）作为证据，终端保持紧凑——只显示错误原因，不展示节选内容。
+        let payload = format!(
+            "[task_id=task-1]\n\
+[Task: /audit inspect diff via audit @ model] TIMED_OUT after 900.0s\n\
+Error: subagent task exceeded hard timeout of 900s\n\
+SUBAGENT_TIMEOUT_RECOVERY_V1\n\
+status: timed_out\n\
+error: subagent task exceeded hard timeout of 900s\n\
+last_phase: CallingTool\n\
+preserved_child_history: /tmp/audit-timeout.sqlite\n\
+\n\
+## 中断前已完成的工作（恢复节选）\n\
+\n\
+AUDIT_CHECKPOINT: checked src/a.rs; finding at src/a.rs:42\n\
+\n\
+以上是阶段性证据而非完整审计结论。\n{}",
+            crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER
+        );
+
+        let rendered = terminal_audit_result(&payload);
+        assert_eq!(rendered, "[audit] subagent task exceeded hard timeout of 900s");
+        // 恢复节选内容与保留路径都不在终端出现（证据归 lead agent）。
+        assert!(!rendered.contains("src/a.rs:42"));
+        assert!(!rendered.contains("preserved_child_history"));
     }
 
     #[test]

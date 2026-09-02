@@ -40,8 +40,9 @@ pub(in crate::ai) use revision::history_revision_cache_contains;
 pub(in crate::ai) use context::write_context_snapshot_sqlite;
 pub(in crate::ai) use revision::{read_history_revision, remove_history_revision_cache_entry};
 pub(in crate::ai) use rollback::{
-    backup_sqlite, fork_history_for_subagent, reset_history_for_subagent,
-    restore_sqlite_after_rollback,
+    backup_sqlite, fork_history_for_subagent, live_rollback_transaction_is_published,
+    reset_history_for_subagent, restore_sqlite_after_rollback,
+    restore_sqlite_after_rollback_with_transaction,
 };
 pub(in crate::ai) use store::{
     ContextHistory, SessionListMetadata, append_history_sqlite,

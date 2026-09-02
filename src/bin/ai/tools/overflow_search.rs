@@ -35,7 +35,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use regex::{Regex, RegexBuilder};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use crate::ai::tools::common::{
@@ -109,7 +109,7 @@ fn execute_search_overflow(args: &Value) -> Result<String, String> {
         max_results: args["max_results"]
             .as_u64()
             .unwrap_or(50)
-            .min(MAX_MATCHES as u64) as usize,
+            .clamp(1, MAX_MATCHES as u64) as usize,
         file_pattern: args["file_pattern"].as_str(),
         scope: args["scope"]
             .as_str()
@@ -143,7 +143,7 @@ fn build_patterns(params: &OverflowSearchParams<'_>) -> Result<Vec<TermPattern>,
     let mut patterns: Vec<TermPattern> = Vec::new();
     let mut seen: FxHashMap<&str, ()> = FxHashMap::default();
     for (idx, term) in params.query.split_whitespace().enumerate() {
-        if term.chars().count() < 1 || seen.insert(term, ()).is_some() {
+        if seen.insert(term, ()).is_some() {
             continue;
         }
         let regex = compile_pattern(term, false, params.case_sensitive)?;
@@ -205,6 +205,10 @@ struct RawHit {
     line_index: usize,
     /// Indices into `patterns` that matched this line (deduped, unordered).
     matched: Vec<usize>,
+    /// IDF-independent line score, computed while the line text is in hand
+    /// during the scan pass: whole-word (+2.0), lead-proximity, and exact
+    /// phrase bonuses. Corpus-wide IDF weights are added in pass B.
+    local_score: f64,
 }
 
 struct FileScan {
@@ -213,9 +217,10 @@ struct FileScan {
     /// Absolute path, ready for `read_file` round-trips.
     display_path: String,
     hits: Vec<RawHit>,
-    /// Full lowercase contents are not retained; only needed lines are copied
-    /// out at render time by re-reading kept line indices from this buffer.
-    lines: Vec<String>,
+    /// Line count of the archive file at scan time. The file text itself is
+    /// dropped after scanning and re-read only for the few files that survive
+    /// selection, so resident memory scales with match count, not file size.
+    total_lines: usize,
 }
 
 /// One scanned archive file with its aggregated relevance scores.
@@ -236,7 +241,17 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
     }
     let mut out: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    // `path.is_dir()` follows symlinks, so a symlink cycle (a directory
+    // symlinked back into one of its ancestors) would otherwise push forever.
+    // Canonical paths break the cycle: each physical directory is visited once.
+    let mut visited: FxHashSet<PathBuf> = FxHashSet::default();
     while let Some(dir) = stack.pop() {
+        let Ok(canon) = fs::canonicalize(&dir) else {
+            continue;
+        };
+        if !visited.insert(canon) {
+            continue;
+        }
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
@@ -300,25 +315,33 @@ fn run_overflow_search(
     let mut df: Vec<usize> = vec![0; patterns.len()];
     let mut files_seen: usize = 0;
 
+    // Compiled once: the glob is fixed for the whole search. A pattern that
+    // trims to empty is treated as "no filter" — an empty glob would only match
+    // a bare relative path "" (the History scope's file root) and silently
+    // exclude every file under a directory root.
+    let glob = params
+        .file_pattern
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(glob_to_regex);
+
     for (root_idx, root) in &roots {
-        let glob = params
-            .file_pattern
-            .map(|p| glob_to_regex(p.trim()))
-            .map(Some)
-            .unwrap_or(None);
-        let glob = glob.as_ref(); // Option<&Regex>
         for file in collect_files(root) {
-            if !path_matches_glob(&file, root, glob) {
+            if !path_matches_glob(&file, root, glob.as_ref()) {
                 continue;
             }
-            files_seen += 1;
             let Ok(content) = fs::read_to_string(&file) else {
+                // Unreadable or non-UTF-8 files cannot contain matches; skip
+                // without counting them toward the corpus size used by IDF.
                 continue;
             };
+            files_seen += 1;
 
             let mut hits: Vec<RawHit> = Vec::new();
             let mut file_term_hits: Vec<bool> = vec![false; patterns.len()];
+            let mut total_lines = 0usize;
             for (line_index, line) in content.lines().enumerate() {
+                total_lines = line_index + 1;
                 let mut matched: Vec<usize> = Vec::new();
                 for (pid, pattern) in patterns.iter().enumerate() {
                     if pattern.regex.is_match(line) {
@@ -327,9 +350,34 @@ fn run_overflow_search(
                     }
                 }
                 if !matched.is_empty() {
+                    // Line-local scoring happens here while the text is
+                    // available; corpus-wide IDF weights are added in pass B.
+                    let mut local_score = 0.0;
+                    for &pid in &matched {
+                        // Whole-word hits carry more information than substring hits.
+                        let re = &patterns[pid].regex;
+                        if let Some(m) = re.find(line) {
+                            let bytes = line.as_bytes();
+                            let left_ok =
+                                m.start() == 0 || !is_identifier_byte(bytes[m.start() - 1]);
+                            let right_ok =
+                                m.end() >= line.len() || !is_identifier_byte(bytes[m.end()]);
+                            if left_ok && right_ok {
+                                local_score += 2.0;
+                            }
+                            // Lead-proximity bonus, mirroring the shared engine style.
+                            let lead_chars = line[..m.start()].chars().count();
+                            local_score += 2.0 * (1.0 - (lead_chars.min(40) as f64) / 40.0);
+                        }
+                    }
+                    if line_has_exact_phrase_bonus(&patterns, &matched) {
+                        // Exact whole-query phrase/regex hit.
+                        local_score += PHRASE_WEIGHT;
+                    }
                     hits.push(RawHit {
                         line_index,
                         matched,
+                        local_score,
                     });
                 }
             }
@@ -345,7 +393,7 @@ fn run_overflow_search(
                 root_idx: *root_idx,
                 display_path: file.to_string_lossy().to_string(),
                 hits,
-                lines: content.lines().map(str::to_string).collect(),
+                total_lines,
             });
         }
     }
@@ -371,30 +419,10 @@ fn run_overflow_search(
         let mut distinct_terms: FxHashMap<usize, ()> = FxHashMap::default();
         let mut scored: Vec<(usize, f64)> = Vec::with_capacity(scan.hits.len());
         for hit in &scan.hits {
-            let mut line_score = 0.0;
+            let mut line_score = hit.local_score;
             for &pid in &hit.matched {
                 distinct_terms.insert(pid, ());
                 line_score += idf[pid];
-                // Whole-word hits carry more information than substring hits.
-                let re = &patterns[pid].regex;
-                if let Some(m) = re.find(&scan.lines[hit.line_index]) {
-                    let bytes = scan.lines[hit.line_index].as_bytes();
-                    let left_ok =
-                        m.start() == 0 || !is_identifier_byte(bytes[m.start() - 1]);
-                    let right_ok =
-                        m.end() >= scan.lines[hit.line_index].len()
-                            || !is_identifier_byte(bytes[m.end()]);
-                    if left_ok && right_ok {
-                        line_score += 2.0;
-                    }
-                    // Lead-proximity bonus, mirroring the shared engine style.
-                    let lead_chars = scan.lines[hit.line_index][..m.start()].chars().count();
-                    line_score += 2.0 * (1.0 - (lead_chars.min(40) as f64) / 40.0);
-                }
-            }
-            if patterns[hit.matched[0]].term_id.is_none() {
-                // Exact whole-query phrase/regex hit.
-                line_score += PHRASE_WEIGHT;
             }
             scored.push((hit.line_index, line_score));
         }
@@ -436,6 +464,15 @@ fn is_identifier_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Whether a hit line earns the flat whole-query bonus: any matched pattern
+/// with `term_id: None` (the whole-query phrase in term-fanout mode, or the
+/// single pattern in regex mode). Every matched pid must be inspected — the
+/// phrase is appended *last* in pattern order, so the first match is always a
+/// plain term, and checking only `matched[0]` would silently disable the bonus.
+fn line_has_exact_phrase_bonus(patterns: &[TermPattern], matched: &[usize]) -> bool {
+    matched.iter().any(|&pid| patterns[pid].term_id.is_none())
+}
+
 // ─── Fair-share selection & rendering ────────────────────────────────────────
 
 /// Selects files/lines across roots with relevance-first ordering plus
@@ -444,10 +481,11 @@ fn is_identifier_byte(b: u8) -> bool {
 /// Selection happens at line granularity: candidates enter a global pool, and
 /// while the answer budget lasts, the pool is drained in relevance order, but a
 /// root whose consumed share reaches `ceil(max_results/roots) * FAIR_SHARE_MULTIPLE`
-/// sits out while other roots still have candidates left. Equal-score ties
-/// rotate across files, so symmetric floods (e.g. the same marker
-/// repeated in several archives) distribute visibly instead of collapsing into
-/// a single dominant file.
+/// sits out while other roots still have candidates left — and resumes once
+/// they are spent, so the leftover budget is not wasted on an under-filled
+/// answer. Equal-score ties rotate across files, so symmetric floods (e.g. the
+/// same marker repeated in several archives) distribute visibly instead of
+/// collapsing into a single dominant file.
 fn render_selection(
     mut files: Vec<ScoredFile>,
     params: &OverflowSearchParams<'_>,
@@ -473,25 +511,41 @@ fn render_selection(
         v.dedup();
         v
     };
-    let fair_share = (params.max_results / roots_with_hits.len().max(1)).max(1);
+    // A degenerate request of zero results is clamped to one so real matches
+    // are never misreported as "No matches found".
+    let max_results = params.max_results.max(1);
+    let fair_share = (max_results / roots_with_hits.len().max(1)).max(1);
     let soft_cap_per_root = fair_share * FAIR_SHARE_MULTIPLE;
 
     let mut chosen: Vec<Candidate> = Vec::new();
 
     // Every pass visits all ranked files once; each visit either pops one
-    // candidate or counts that file as settled. Files of capped roots also
-    // count as settled, guaranteeing termination even when every remaining
-    // file belongs to a capped root. Equal-score ties rotate across files
-    // because each pass re-visits files in stable global relevance order.
-    while chosen.len() < params.max_results {
+    // candidate or counts that file as settled. A capped root sits out only
+    // while another root still holds an un-drained candidate (active_roots),
+    // so the cap is a fairness valve rather than a hard quota: once every
+    // other root is spent, the dominant root resumes draining and the full
+    // budget is used. Equal-score ties rotate across files because each pass
+    // re-visits files in stable global relevance order.
+    while chosen.len() < max_results {
+        // Roots that still hold at least one un-drained candidate this pass.
+        let active_roots: std::collections::BTreeSet<usize> = files
+            .iter()
+            .enumerate()
+            .filter(|(pos, f)| per_file_cursor[*pos] < f.scored.len())
+            .map(|(_, f)| f.root_idx)
+            .collect();
+
         let mut settled = 0usize;
         for file_pos in 0..files.len() {
-            if chosen.len() >= params.max_results {
+            if chosen.len() >= max_results {
                 break;
             }
             let file = &files[file_pos];
-            if root_consumed.get(&file.root_idx).copied().unwrap_or(0) >= soft_cap_per_root
+            let root_capped =
+                root_consumed.get(&file.root_idx).copied().unwrap_or(0) >= soft_cap_per_root;
+            if !active_roots.contains(&file.root_idx)
                 || per_file_cursor[file_pos] >= file.scored.len()
+                || (root_capped && active_roots.len() > 1)
             {
                 // Capped roots sit out while other roots still demand room.
                 settled += 1;
@@ -541,11 +595,50 @@ fn render_selection(
         let hidden_here = file.total_matches.saturating_sub(lis.len());
         total_hidden += hidden_here;
 
+        // The scan pass retained only indices and scores, never the archive
+        // text. Re-read the file to render the selected excerpts so at most
+        // one archive file is resident at a time — and only files that
+        // survived selection are re-read at all.
+        let Ok(content) = fs::read_to_string(&file.scan.display_path) else {
+            // Vanished or unreadable between scan and render (should not
+            // happen within one search): fall back to a pointer, never
+            // fabricate excerpts.
+            out.push_str(&format!(
+                "### {} match(es) in {}\n",
+                lis.len(),
+                &file.scan.display_path
+            ));
+            out.push_str(
+                "... [file unreadable during excerpt rendering; use read_file for surrounding context] ...\n\n",
+            );
+            continue;
+        };
+        let content_lines: Vec<&str> = content.lines().collect();
+        let n_lines = content_lines.len();
+        if n_lines == 0 {
+            // Empty between scan and render (concurrent truncation): nothing
+            // to excerpt, and indexing below would panic. Emit the header so
+            // the footer's shown counts stay consistent with visible output.
+            out.push_str(&format!(
+                "### {} match(es) in {}\n",
+                lis.len(),
+                &file.scan.display_path
+            ));
+            out.push_str(
+                "... [file empty during excerpt rendering; use read_file for surrounding context] ...\n\n",
+            );
+            continue;
+        }
+
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for li in &lis {
             let start = li.saturating_sub(params.context_lines);
-            let end =
-                (*li + params.context_lines).min(file.scan.lines.len().saturating_sub(1));
+            // Clamp against both the scan-time line count and the re-read
+            // length so a concurrently truncated file can never cause an
+            // out-of-bounds index.
+            let end = (*li + params.context_lines)
+                .min(file.scan.total_lines.saturating_sub(1))
+                .min(n_lines.saturating_sub(1));
             if let Some(last) = ranges.last_mut() {
                 if start <= last.1.saturating_add(1) {
                     last.1 = last.1.max(end);
@@ -564,7 +657,7 @@ fn render_selection(
         for (start, end) in ranges {
             for li in start..=end {
                 let marker = if match_set.remove(&li) { ">" } else { " " };
-                out.push_str(&format!("{:>7}{} {}\n", li + 1, marker, &file.scan.lines[li]));
+                out.push_str(&format!("{:>7}{} {}\n", li + 1, marker, content_lines[li]));
             }
         }
         if hidden_here > 0 {
@@ -820,6 +913,145 @@ mod tests {
         let sections = out.matches("match(es) in").count();
         assert_eq!(sections, 4, "all four hit roots visible: {out}");
         assert!(out.contains("unique-marker"), "minority root visible: {out}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn capped_root_absorbs_leftover_budget_when_others_exhausted() {
+        // Regression: with max_results=10 over three hit roots where two
+        // minority roots have one line each, fair_share = 10/3 = 3 and the
+        // soft cap is 6. The dominant root must absorb the remaining budget
+        // once the minority roots are spent; the old code never lifted the
+        // cap and returned only 8 of 10 lines.
+        let dir = make_temp_dir();
+        fs::write(dir.join("overflow-history.md"), "alpha\n").unwrap();
+        let tool_dir = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tool_dir).unwrap();
+        fs::write(tool_dir.join("noisy.txt"), &"alpha\n".repeat(200)).unwrap();
+        let folded_dir = dir.join("folded-tool-groups");
+        fs::create_dir_all(&folded_dir).unwrap();
+        fs::write(folded_dir.join("a.md"), "alpha\n").unwrap();
+
+        let mut p = params("alpha");
+        p.context_lines = 0;
+        p.max_results = 10;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(
+            out.contains("[archive search] showed 10 matching line(s)"),
+            "full budget must be used once minority roots are spent:\n{out}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn phrase_pattern_line_earns_exact_bonus() {
+        // Regression: a line matching the whole query "alpha beta" matches the
+        // phrase pattern AND both term patterns. Patterns are pid-ordered with
+        // the phrase last, so inspecting only `matched[0]` (always a plain
+        // term) made the exact-phrase bonus dead code; every matched pid must
+        // be scanned.
+        let mut p = params("alpha beta");
+        p.case_sensitive = false;
+        let patterns = build_patterns(&p).unwrap();
+        let mut whole: Vec<usize> = Vec::new();
+        for (pid, pat) in patterns.iter().enumerate() {
+            if pat.regex.is_match("alpha beta") {
+                whole.push(pid);
+            }
+        }
+        assert!(
+            line_has_exact_phrase_bonus(&patterns, &whole),
+            "whole-query line must earn the phrase bonus"
+        );
+        let mut single: Vec<usize> = Vec::new();
+        for (pid, pat) in patterns.iter().enumerate() {
+            if pat.regex.is_match("alpha") {
+                single.push(pid);
+            }
+        }
+        assert!(
+            !line_has_exact_phrase_bonus(&patterns, &single),
+            "a lone term line must not earn the phrase bonus"
+        );
+    }
+
+    #[test]
+    fn word_boundary_bonus_survives_scan_time_scoring() {
+        // Regression for moving line-local scoring (whole-word + lead-proximity
+        // bonuses) from pass B into the scan pass, which let the archive text
+        // be dropped after scanning. Without the +2 whole-word bonus the
+        // substring line would win here (its lead bonus exceeds the long
+        // whole-word line's), so the test discriminates the refactored path.
+        let dir = make_temp_dir();
+        let tool_dir = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tool_dir).unwrap();
+        // Line 1: whole-word "alpha" with a large lead (40 chars) -> lead bonus
+        // 0, whole-word bonus +2. Line 2: substring "xxalpha" -> lead bonus
+        // ~1.9, no whole-word bonus.
+        fs::write(
+            tool_dir.join("words.txt"),
+            format!("{}alpha\nxxalpha\n", "a ".repeat(20)),
+        )
+        .unwrap();
+
+        let mut p = params("alpha");
+        p.scope = SearchScope::ToolOutputs;
+        p.context_lines = 0;
+        p.max_results = 1;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(
+            out.contains("1> a "),
+            "whole-word line must win the single slot:\n{out}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zero_max_results_clamps_to_at_least_one() {
+        let dir = make_temp_dir();
+        seed_archive(&dir);
+        let mut p = params("foo");
+        p.max_results = 0;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(
+            !out.contains("No matches found"),
+            "degenerate max_results=0 must not hide real matches:\n{out}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_file_pattern_is_ignored() {
+        let dir = make_temp_dir();
+        seed_archive(&dir);
+        let mut p = params("foo");
+        p.file_pattern = Some("");
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(
+            out.contains("20260804T140000Z-execute_command-deadbeef.txt"),
+            "an empty file_pattern must not filter out directory-root files:\n{out}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cycle_terminates() {
+        use std::os::unix::fs::symlink;
+        let dir = make_temp_dir();
+        let tool_dir = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tool_dir).unwrap();
+        fs::write(tool_dir.join("needle.txt"), "alpha needle\n").unwrap();
+        // A directory symlinked back into itself; without cycle protection the
+        // DFS would push forever and the search would hang.
+        symlink(&tool_dir, tool_dir.join("loop")).unwrap();
+        let mut p = params("needle");
+        p.scope = SearchScope::ToolOutputs;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(
+            out.contains("needle.txt"),
+            "search must terminate and still find hits:\n{out}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -3,6 +3,19 @@
 
 use super::*;
 
+const FINAL_RESPONSE_VALIDATION_STATUS: &str = "⌛ Validating final response…";
+
+fn show_final_response_validation_status(
+    status_line: &mut Option<crate::ai::request::TransientStatusLine>,
+) {
+    if status_line.is_none() {
+        *status_line = crate::ai::request::TransientStatusLine::new();
+    }
+    if let Some(status_line) = status_line.as_mut() {
+        status_line.update(FINAL_RESPONSE_VALIDATION_STATUS);
+    }
+}
+
 pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     app: &mut App,
     question: &str,
@@ -25,6 +38,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
 ) -> Result<TurnLoopStep, Box<dyn std::error::Error>> {
     let source_model = app.current_model.clone();
     let mut final_gate_state = FinalGateState::from_current_turn_markers(messages);
+    let mut final_validation_status = None;
     handle_iteration_execution_for_model(
         app,
         &source_model,
@@ -40,6 +54,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
         final_assistant_recorded,
         force_final_response,
         terminal_dedupe_candidate,
+        &mut final_validation_status,
         &mut final_gate_state,
         _no_active_skill,
         iteration,
@@ -65,6 +80,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
     final_assistant_recorded: &mut bool,
     force_final_response: &mut bool,
     terminal_dedupe_candidate: &mut Option<String>,
+    final_validation_status: &mut Option<crate::ai::request::TransientStatusLine>,
     final_gate_state: &mut FinalGateState,
     _no_active_skill: bool,
     iteration: usize,
@@ -245,6 +261,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 });
                 return Ok(TurnLoopStep::Continue);
             }
+            show_final_response_validation_status(final_validation_status);
             // Injected-note regurgitation gate: takes priority over the other final gates.
             // When the model spits a runtime context note back verbatim as its answer
             // (especially common with weak models after the earlier kinds of reopen), the

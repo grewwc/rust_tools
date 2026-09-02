@@ -385,6 +385,11 @@ mod tests {
         let cwd = root.join("subagent-cwd-task_x");
         std::fs::create_dir_all(cwd.join("nested")).unwrap();
         std::fs::write(cwd.join("scratch.txt"), b"tmp").unwrap();
+        // Subagent-scoped assets (plan_state / side_note / working-checkpoint) live in
+        // `<stem>.assets` next to the child history; guard Drop must reclaim them too.
+        let assets = root.join("session.subagent-task_x.assets");
+        std::fs::create_dir_all(assets.join("side_notes")).unwrap();
+        std::fs::write(assets.join("plan-state.json"), b"{}").unwrap();
 
         drop(
             BackgroundSubagentHistoryGuard::new(history.clone())
@@ -399,19 +404,25 @@ mod tests {
             "memory .db WAL sidecar must be cleaned"
         );
         assert!(!cwd.exists(), "cwd scratch dir must be recursively cleaned");
+        assert!(!assets.exists(), "subagent assets dir must be cleaned");
 
-        // preserve() must also keep memory/cwd (normal-end / resume scenarios).
+        // preserve() must also keep memory/cwd/assets (normal-end / resume scenarios:
+        // the resumed process still reads its plan-state / side-notes / checkpoint).
         let history2 = root.join("session.subagent-task_y.sqlite");
         let memory2 = root.join("agent_memory.subagent-task_y.jsonl");
         let cwd2 = root.join("subagent-cwd-task_y");
+        let assets2 = root.join("session.subagent-task_y.assets");
         std::fs::write(&history2, b"db").unwrap();
         std::fs::write(&memory2, b"[]").unwrap();
         std::fs::create_dir_all(&cwd2).unwrap();
+        std::fs::create_dir_all(&assets2).unwrap();
+        std::fs::write(assets2.join("plan-state.json"), b"{}").unwrap();
         let mut guard = BackgroundSubagentHistoryGuard::new(history2.clone())
             .with_scoped_artifacts(Some(memory2.clone()), Some(cwd2.clone()));
         guard.preserve();
         drop(guard);
         assert!(history2.exists() && memory2.exists() && cwd2.exists());
+        assert!(assets2.exists(), "preserve() must keep subagent assets dir");
 
         let _ = std::fs::remove_dir_all(root);
     }
