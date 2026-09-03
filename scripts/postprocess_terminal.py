@@ -70,16 +70,16 @@ import sys
 # code / file-location contexts described above.
 CJK_TO_ASCII = {
     "\u3002": ".",   # 。 ideographic full stop
-    "\uff0c": ",",   # ， fullwidth comma
-    "\u3001": ",",   # 、 ideographic comma
-    "\uff1a": ":",   # ： fullwidth colon (code/path contexts; prose uses ': ')
-    "\uff1b": ";",   # ； fullwidth semicolon
-    "\uff01": "!",   # ！ fullwidth exclamation
-    "\uff1f": "?",   # ？ fullwidth question
-    "\uff08": "(",   # （ fullwidth left paren
-    "\uff09": ")",   # ） fullwidth right paren
-    "\u3010": "[",   # 【 left corner bracket
-    "\u3011": "]",   # 】 right corner bracket
+    "\uff0c": ", ",   # ， fullwidth comma
+    "\u3001": ", ",   # 、 ideographic comma
+    "\uff1a": ": ",   # ： fullwidth colon (code/path contexts; prose uses ': ')
+    "\uff1b": "; ",   # ； fullwidth semicolon
+    "\uff01": "! ",   # ！ fullwidth exclamation
+    "\uff1f": "? ",   # ？ fullwidth question
+    "\uff08": " (",   # （ fullwidth left paren
+    "\uff09": ") ",   # ） fullwidth right paren
+    "\u3010": " [",   # 【 left corner bracket
+    "\u3011": "] ",   # 】 right corner bracket
     "\uff5e": "~",   # ～ fullwidth tilde
     "\u201c": '"',   # “ left double quote
     "\u201d": '"',   # ” right double quote
@@ -246,7 +246,7 @@ def _translate_prose_punct(text):
     # first, so the following `（` sees that inserted space and adds none.
     text = re.sub(r"\uff09(?=\S)", ") ", text)
     text = re.sub(r"(?<=\S)\uff08", " (", text)
-    text = text.replace("\uff08", "(").replace("\uff09", ")")
+    text = text.replace("\uff08", " (").replace("\uff09", ") ")
     out = []
     # Apply the adjacency rule per visible segment: ANSI codes are token
     # boundaries, so a char never "sees" an escape byte (e.g. the trailing

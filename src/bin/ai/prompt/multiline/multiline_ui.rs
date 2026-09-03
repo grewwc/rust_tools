@@ -21,8 +21,8 @@ use super::{
     events::{EventLoopAction, RecentTextInput, handle_multiline_event},
     render::render_multiline_popup,
 };
-use crate::commonw::prompt::acquire_foreground_stdin;
 use crate::ai::prompt::{PromptEditor, interrupted_error};
+use crate::commonw::prompt::acquire_foreground_stdin;
 
 /// Maximum viewport height (textarea + chrome); scales with the terminal size,
 /// capped at 11 lines.
@@ -139,6 +139,10 @@ fn prepare_fixed_viewport<B: Backend>(
     mode: ViewportRebuildMode,
     clear_existing_viewport: bool,
 ) -> Result<Rect, B::Error> {
+    // One synchronous DSR query is the authoritative cursor position for this
+    // rebuild. Issuing an extra query cannot identify a stale reply (both use
+    // the same untagged terminal response) and can instead leave another reply
+    // in the input stream when a resize interrupts the round-trip.
     let cursor_position = backend.get_cursor_position()?;
     let (area, lines_to_scroll) = fixed_viewport_area(
         terminal_size,
@@ -192,6 +196,24 @@ fn build_fixed_terminal(height: u16) -> io::Result<MultilineTerminal> {
     terminal_with_fixed_viewport(backend, area).map_err(|err| io::Error::other(err.to_string()))
 }
 
+/// Blanks rows orphaned above a fixed viewport that moved down. The rebuild
+/// clears from the new top downwards, so without this the previous frame's
+/// rows would stay on screen as ghost copies of the input box.
+fn clear_orphaned_viewport_rows<B: Backend>(
+    backend: &mut B,
+    previous_top_row: u16,
+    new_top_row: u16,
+) -> Result<(), B::Error> {
+    if new_top_row > previous_top_row {
+        for row in previous_top_row..new_top_row {
+            backend.set_cursor_position(Position::new(0, row))?;
+            backend.clear_region(BackendClearType::CurrentLine)?;
+        }
+        backend.flush()?;
+    }
+    Ok(())
+}
+
 /// Re-anchors a fixed viewport after terminal reflow or a requested height
 /// change without reserving another full block of terminal lines.
 fn rebuild_fixed_viewport(
@@ -200,6 +222,7 @@ fn rebuild_fixed_viewport(
     new_height: u16,
     cursor_offset_row: u16,
     mode: ViewportRebuildMode,
+    previous_top_row: Option<u16>,
 ) -> io::Result<Rect> {
     let area = prepare_fixed_viewport(
         terminal.backend_mut(),
@@ -211,23 +234,26 @@ fn rebuild_fixed_viewport(
     )?;
     *terminal = terminal_with_fixed_viewport(CrosstermBackend::new(io::stdout()), area)
         .map_err(|err| io::Error::other(err.to_string()))?;
+    // The rebuild above clears from the new top downwards. When the viewport
+    // moves down (terminal reflow pushing it, or a height change), rows of the
+    // previous frame above the new top would otherwise stay on screen as ghost
+    // copies of the input box, so clear that gap explicitly. Width reflow can
+    // in theory move wrapped history output into the gap; blanking it is the
+    // lesser harm because the viewport is bottom-anchored in practice and a
+    // duplicated input box is far more confusing than a blanked history tail.
+    if let Some(previous_top) = previous_top_row {
+        clear_orphaned_viewport_rows(terminal.backend_mut(), previous_top, area.y)?;
+    }
     Ok(area)
 }
 
-/// Chooses the rebuild strategy for a resize based on how the last frame
-/// positioned the real terminal cursor. Offset 0 means the cursor is parked on
-/// the viewport's top row (empty-input frames park it there), so the
-/// post-reflow position report names the exact viewport top and rows genuinely
-/// missing at the bottom can be reserved (only real content scrolls into
-/// scrollback). Any other or unknown offset cannot survive reflow — the
-/// panel's own painted rows are re-wrapped too — so appending rows is
-/// forbidden there.
-fn resize_rebuild_mode(cursor_offset_row: Option<u16>) -> ViewportRebuildMode {
-    if cursor_offset_row == Some(0) {
-        ViewportRebuildMode::ReserveMissingRows
-    } else {
-        ViewportRebuildMode::ReflowOnly
-    }
+/// A terminal resize may move the reported cursor while reflowing both prior
+/// output and the existing input viewport. Never reserve rows in response to a
+/// resize: doing so turns that transient movement into permanent blank lines in
+/// scrollback. Initial setup and real input/completion growth still use
+/// `ReserveMissingRows`, so the editor keeps its normal usable height.
+fn resize_rebuild_mode(_cursor_offset_row: Option<u16>) -> ViewportRebuildMode {
+    ViewportRebuildMode::ReflowOnly
 }
 
 fn clear_fixed_viewport<B: Backend>(
@@ -262,6 +288,35 @@ fn force_frame_repaint(frame: &mut ratatui::Frame<'_>) {
             buffer[(x, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
         }
     }
+}
+
+/// Moves the hidden hardware cursor to the last row of the rendered viewport.
+///
+/// Ratatui hides the hardware cursor when a frame does not set one. Moving it
+/// directly through the backend afterward keeps it hidden, but places the
+/// terminal's reflow anchor after every prompt row. On a width resize, the
+/// reported cursor therefore follows reflowed history instead of leaving the
+/// input viewport at its old absolute screen row.
+fn park_hidden_cursor_at_reflow_anchor<B: Backend>(
+    terminal: &mut Terminal<B>,
+    viewport_area: Rect,
+    anchor_offset: Option<Position>,
+) -> Result<(), B::Error> {
+    let Some(anchor_offset) = anchor_offset else {
+        return Ok(());
+    };
+    let max_x = viewport_area
+        .x
+        .saturating_add(viewport_area.width.saturating_sub(1));
+    let max_y = viewport_area
+        .y
+        .saturating_add(viewport_area.height.saturating_sub(1));
+    let anchor = Position::new(
+        viewport_area.x.saturating_add(anchor_offset.x).min(max_x),
+        viewport_area.y.saturating_add(anchor_offset.y).min(max_y),
+    );
+    terminal.backend_mut().set_cursor_position(anchor)?;
+    terminal.backend_mut().flush()
 }
 
 fn textarea_logical_char_count(textarea: &TextArea<'_>) -> usize {
@@ -356,10 +411,9 @@ impl PromptEditor {
         let initial_viewport_area = terminal.get_frame().area();
         // On exit, clean up the viewport based on its latest reflowed top row.
         let mut last_viewport_top_row = Some(initial_viewport_area.y);
-        // After a resize reflow the viewport's absolute coordinates change, but the
-        // cursor's relative row inside the viewport does not; record that offset
-        // to re-anchor the fixed area after reflow.
-        let mut last_cursor_offset_row: Option<u16> = None;
+        // The hidden hardware cursor is parked at the viewport tail. Its relative
+        // offset lets a resize re-anchor the fixed area after terminal reflow.
+        let mut last_reflow_anchor: Option<Position> = None;
 
         let result: io::Result<Option<String>> = (|| {
             // Prefilled content (editing an existing memo): load into the textarea
@@ -409,8 +463,9 @@ impl PromptEditor {
                             &mut terminal,
                             terminal_size,
                             new_height,
-                            last_cursor_offset_row.unwrap_or(0),
+                            last_reflow_anchor.map(|position| position.y).unwrap_or(0),
                             ViewportRebuildMode::ReserveMissingRows,
+                            last_viewport_top_row,
                         )?;
                         fitted_completion_items = current_items;
                         force_repaint_next_frame = false;
@@ -435,8 +490,9 @@ impl PromptEditor {
                                 &mut terminal,
                                 terminal_size,
                                 new_height,
-                                last_cursor_offset_row.unwrap_or(0),
+                                last_reflow_anchor.map(|position| position.y).unwrap_or(0),
                                 ViewportRebuildMode::ReserveMissingRows,
+                                last_viewport_top_row,
                             )?;
                             base_viewport_height = new_height;
                             force_repaint_next_frame = false;
@@ -444,11 +500,13 @@ impl PromptEditor {
                     }
 
                     let force_repaint = force_repaint_next_frame;
+                    let mut drawn_viewport_area = Rect::ZERO;
                     terminal
                         .draw(|f| {
                             let area = f.area();
+                            drawn_viewport_area = area;
                             last_viewport_top_row = Some(area.y);
-                            last_cursor_offset_row = render_multiline_popup(
+                            last_reflow_anchor = render_multiline_popup(
                                 f,
                                 &mut textarea,
                                 status_msg.as_deref(),
@@ -462,6 +520,11 @@ impl PromptEditor {
                             }
                         })
                         .map_err(|e| io::Error::other(e.to_string()))?;
+                    park_hidden_cursor_at_reflow_anchor(
+                        &mut terminal,
+                        drawn_viewport_area,
+                        last_reflow_anchor,
+                    )?;
                     self.notify_first_render();
                     force_repaint_next_frame = false;
                 }
@@ -478,14 +541,10 @@ impl PromptEditor {
                     // PTY size because cursor-position queries can leave older
                     // resize events queued. Re-anchor and redraw immediately.
                     //
-                    // A parked idle frame (empty input) leaves the real cursor on
-                    // the viewport's top-left cell, so the position report after
-                    // reflow IS the viewport's exact top row (offset 0); rows
-                    // genuinely missing at the bottom can then be reserved safely
-                    // because only real content scrolls into scrollback. With a
-                    // non-zero recorded offset the top-to-cursor distance cannot
-                    // survive reflow, so rows must never be appended there: line
-                    // feeds during width reflow permanently grow scrollback.
+                    // The remembered cursor offset still helps locate the
+                    // reflowed viewport, but resize must never call
+                    // `append_lines`: repeated width changes can otherwise
+                    // make transient cursor movement permanent in scrollback.
                     let terminal_size = terminal.backend().size()?;
                     let requested_height = viewport_height_with_completion(
                         terminal_size.height,
@@ -496,8 +555,9 @@ impl PromptEditor {
                         &mut terminal,
                         terminal_size,
                         requested_height,
-                        last_cursor_offset_row.unwrap_or(0),
-                        resize_rebuild_mode(last_cursor_offset_row),
+                        last_reflow_anchor.map(|position| position.y).unwrap_or(0),
+                        resize_rebuild_mode(last_reflow_anchor.map(|position| position.y)),
+                        last_viewport_top_row,
                     )
                     .map_err(|e| io::Error::other(e.to_string()))?;
                     // Rebuilding starts with empty ratatui buffers and the viewport
@@ -563,13 +623,14 @@ mod tests {
         Terminal,
         backend::{Backend, TestBackend},
         buffer::Cell,
-        layout::Position,
+        layout::{Position, Rect},
         widgets::Paragraph,
     };
 
     use super::{
-        ViewportRebuildMode, clear_fixed_viewport, fixed_viewport_area, force_frame_repaint,
-        multiline_viewport_height, prepare_fixed_viewport, resize_rebuild_mode,
+        ViewportRebuildMode, clear_fixed_viewport, clear_orphaned_viewport_rows,
+        fixed_viewport_area, force_frame_repaint, multiline_viewport_height,
+        park_hidden_cursor_at_reflow_anchor, prepare_fixed_viewport, resize_rebuild_mode,
         submitted_input_preview_lines, take_redraw_request, terminal_with_fixed_viewport,
         viewport_height_with_completion,
     };
@@ -584,6 +645,27 @@ mod tests {
 
         assert!(take_redraw_request(&mut redraw_requested, true));
         assert!(!take_redraw_request(&mut redraw_requested, false));
+    }
+
+    #[test]
+    fn reflow_anchor_is_parked_at_viewport_tail_while_cursor_stays_hidden() {
+        let backend = TestBackend::new(10, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // A frame without `set_cursor_position` hides the hardware cursor.
+        terminal.draw(|_| {}).unwrap();
+        assert!(!terminal.backend().cursor_visible());
+
+        park_hidden_cursor_at_reflow_anchor(
+            &mut terminal,
+            Rect::new(0, 2, 10, 3),
+            Some(Position::new(0, 2)),
+        )
+        .unwrap();
+
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(0, 4));
+        assert!(!terminal.backend().cursor_visible());
     }
 
     #[test]
@@ -672,7 +754,7 @@ mod tests {
                 ratatui::layout::Size { width, height: 6 },
                 3,
                 0,
-                ViewportRebuildMode::ReflowOnly,
+                resize_rebuild_mode(Some(0)),
                 true,
             )
             .unwrap();
@@ -694,22 +776,42 @@ mod tests {
     }
 
     #[test]
-    fn resize_rebuild_appends_rows_only_for_parked_anchor() {
-        // Parked idle frames leave the real cursor on the viewport's top row,
-        // so the post-reflow position report is the exact top row (offset 0)
-        // and rows genuinely missing below may be reserved.
+    fn rebuild_clears_orphaned_rows_above_moved_down_viewport() {
+        // A resize that moves the viewport down must blank rows of the
+        // previous frame above the new top; otherwise they stay on screen as
+        // ghost copies of the input box.
+        let mut backend = TestBackend::new(10, 8);
+        for row in 2..5 {
+            let ghost = Cell::new("X");
+            backend.draw(std::iter::once((0, row, &ghost))).unwrap();
+        }
+        let keeper = Cell::new("K");
+        backend.draw(std::iter::once((0, 6, &keeper))).unwrap();
+
+        clear_orphaned_viewport_rows(&mut backend, 2, 5).unwrap();
+
+        for row in 2..5 {
+            assert_eq!(backend.buffer()[(0, row)].symbol(), " ");
+        }
+        assert_eq!(backend.buffer()[(0, 6)].symbol(), "K");
+        // No downward move means nothing is cleared.
+        clear_orphaned_viewport_rows(&mut backend, 5, 5).unwrap();
+        clear_orphaned_viewport_rows(&mut backend, 6, 5).unwrap();
+        assert_eq!(backend.buffer()[(0, 6)].symbol(), "K");
+    }
+
+    #[test]
+    fn resize_rebuild_never_appends_rows() {
+        // A known cursor offset is only an anchor for locating the viewport; it
+        // must not authorize line reservation during terminal reflow.
         assert_eq!(
             resize_rebuild_mode(Some(0)),
-            ViewportRebuildMode::ReserveMissingRows
+            ViewportRebuildMode::ReflowOnly
         );
-        // Editing frames keep the caret inside the viewport; the recorded
-        // top-to-cursor distance does not survive reflow, so appending rows is
-        // forbidden (it would permanently grow scrollback).
         assert_eq!(
             resize_rebuild_mode(Some(2)),
             ViewportRebuildMode::ReflowOnly
         );
-        // Unknown anchor: never append.
         assert_eq!(resize_rebuild_mode(None), ViewportRebuildMode::ReflowOnly);
     }
 

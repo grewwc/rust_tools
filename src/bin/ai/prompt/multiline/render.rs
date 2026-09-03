@@ -1,12 +1,12 @@
 use ratatui::{
     layout::Alignment,
-    layout::Rect,
     layout::{Constraint, Direction, Layout},
+    layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
-use tui_textarea::TextArea;
+use tui_textarea::{CursorRenderMode, TextArea};
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
@@ -15,6 +15,53 @@ use crate::ai::prompt::MAX_INPUT_CHARS;
 
 /// Maximum number of candidate lines the completion panel shows at once (overflow scrolls with the selection).
 const COMPLETION_WINDOW: usize = 12;
+
+/// Styles only cells occupied by input text.
+///
+/// Applying a foreground color through `TextArea::set_style` styles the whole
+/// widget rectangle, including otherwise empty cells. Those invisible styled
+/// cells become real terminal output and can be reflowed into extra rows when
+/// an IDE terminal is repeatedly narrowed and widened.
+fn style_input_text(textarea: &mut TextArea<'_>, lines: &[String]) {
+    let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
+    let input_style = Style::default().fg(Color::Rgb(red, green, blue));
+    let cursor_row = textarea.cursor().0;
+
+    textarea.set_style(Style::default());
+    textarea.set_cursor_line_style(Style::default());
+    let selection_style = input_style.patch(textarea.selection_style());
+    textarea.set_selection_style(selection_style);
+    textarea.clear_custom_highlight();
+
+    for (row, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let style = if row == cursor_row {
+            input_style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            input_style
+        };
+        // tui-textarea highlight offsets are UTF-8 byte offsets.
+        textarea.custom_highlight(((row, 0), (row, line.len())), style, 1);
+    }
+}
+
+/// Paints the visible editing caret without making it the terminal's physical cursor.
+///
+/// The physical cursor is deliberately kept at the end of the prompt viewport so
+/// terminal reflow moves the complete prompt together with the output above it.
+/// This cell is repainted with every input frame and preserves the character under
+/// the caret while making the logical edit position visible. ANSI terminals that
+/// honor slow-blink styling retain a blinking caret without idle redraws.
+fn render_virtual_cursor(f: &mut ratatui::Frame<'_>, cursor_position: Position) {
+    if let Some(cell) = f.buffer_mut().cell_mut(cursor_position) {
+        cell.set_style(
+            cell.style()
+                .add_modifier(Modifier::REVERSED | Modifier::SLOW_BLINK),
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PopupLayoutConfig {
@@ -71,7 +118,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     model_label: &str,
     reasoning_effort_label: &str,
     session_topic: Option<&str>,
-) -> Option<u16> {
+) -> Option<Position> {
     let area = f.area();
     let current_lines = textarea.lines().to_vec();
     let current_content = current_lines.join("\n");
@@ -216,52 +263,20 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     // Set alignment
     textarea.set_alignment(Alignment::Left);
-    // User input uses a low-saturation warm gray; it does not compete for attention with blue/cyan status info
-    // or yellow warnings, and reads better over long sessions than high-saturation colors on dark terminals.
-    let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
-    textarea.set_style(Style::default().fg(Color::Rgb(red, green, blue)));
-    // tui-textarea draws the cursor into the buffer as a REVERSED space by default;
-    // terminal reflow can preserve that drawn cell as a white cursor ghost. Disable
-    // the buffer cursor here and use ratatui's real terminal cursor (see
-    // set_cursor_position below), which is not persistable content.
-    textarea.set_cursor_style(Style::default());
+    // Keep the existing input color and current-line underline, but apply them
+    // only to actual characters so blank cells cannot participate in reflow.
+    style_input_text(textarea, &current_lines);
+    // tui-textarea draws its own cursor into the buffer as a reversed space by
+    // default. Keep it hidden because this renderer paints the visible caret after
+    // all widgets have drawn, while the real terminal cursor is parked elsewhere
+    // as the reflow anchor.
+    textarea.set_cursor_render_mode(CursorRenderMode::Hidden);
 
     f.render_widget(&*textarea, textarea_area);
-    // Use the real terminal cursor position computed by tui-textarea's own rendering.
-    // Previously this recomputed screen coordinates itself using `UnicodeWidthChar::width_cjk`, while
-    // tui-textarea internally (screen_map.rs) uses the non-CJK `c.width()`. The two disagree on the width of
-    // CJK/ambiguous-width characters, which under CJK input puts the real terminal cursor 1+ columns off from
-    // the editor's buffer cursor (more visible for earlier CJK characters).
-    // Reuse the position the library computed during its render plan so the two always agree.
-    //
-    // Empty-input frames park the real terminal cursor on the viewport's
-    // top-left cell and paint the editing caret as a styled cell instead.
-    // Reflowing terminals (VS Code's xterm.js, Terminal.app, tmux) keep the
-    // cursor attached to its cell while re-wrapping rows, so after a resize a
-    // cursor-position query reports the viewport's exact top row (offset 0).
-    // Re-anchoring from that report can never drift, so a resize rebuild
-    // clears exactly the stale panel rows below the anchor and leaves no
-    // blank band above the next prompt. A remembered non-zero offset cannot
-    // survive reflow — the panel's own painted rows are re-wrapped too —
-    // which is what previously produced those bands during width resizes.
-    let cursor_offset_row = match textarea.rendered_cursor_position() {
-        // The styled cell mirrors tui-textarea's default reversed-space caret
-        // (disabled above to avoid reflow ghosts inside content), so the idle
-        // input line looks unchanged; the parked terminal cursor itself is
-        // only visible at the left edge of the top rule row.
-        Some(pos) if current_content.is_empty() => {
-            if let Some(cell) = f.buffer_mut().cell_mut((pos.x, pos.y)) {
-                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
-            }
-            f.set_cursor_position((area.x, area.y));
-            Some(0)
-        }
-        Some(pos) => {
-            f.set_cursor_position((pos.x, pos.y));
-            Some(pos.y.saturating_sub(area.y))
-        }
-        None => None,
-    };
+    // Reuse tui-textarea's own rendering plan for the visual caret position.
+    // This avoids a duplicate CJK-width calculation that can disagree with the
+    // widget's internal screen map.
+    let visual_cursor_position = textarea.rendered_cursor_position();
 
     // Render the completion panel
     if let Some(panel) = completion_panel {
@@ -479,7 +494,15 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         }
     }
 
-    cursor_offset_row
+    if let Some(cursor_position) = visual_cursor_position {
+        render_virtual_cursor(f, cursor_position);
+    }
+
+    // Do not request a frame cursor: Ratatui then keeps the hardware cursor
+    // hidden. The input loop moves that hidden cursor to this tail row after the
+    // draw, making the whole prompt viewport part of the terminal's reflow
+    // anchor rather than pinning it to the logical editing caret.
+    Some(Position::new(0, area.height.saturating_sub(1)))
 }
 
 fn completion_item_line(display: &str, selected: bool) -> Line<'_> {
@@ -590,6 +613,7 @@ mod tests {
         Terminal, TerminalOptions, Viewport,
         backend::TestBackend,
         layout::{Position, Rect},
+        style::{Color, Modifier},
     };
     use tui_textarea::{CursorMove, TextArea};
     use unicode_width::UnicodeWidthStr;
@@ -683,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_prompt_parks_cursor_on_viewport_top_left() {
+    fn empty_prompt_renders_virtual_caret_and_returns_tail_reflow_anchor() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::with_options(
             backend,
@@ -694,11 +718,12 @@ mod tests {
         .unwrap();
         let mut textarea = TextArea::default();
         let mut viewport_area = Rect::ZERO;
+        let mut cursor_position = None;
 
         terminal
             .draw(|f| {
                 viewport_area = f.area();
-                render_multiline_popup(
+                cursor_position = render_multiline_popup(
                     f,
                     &mut textarea,
                     None,
@@ -716,13 +741,24 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("reasoning: max"));
 
-        // Empty-input frames park the real terminal cursor on the viewport's
-        // top-left cell so the position report after a reflow names the exact
-        // viewport top (offset 0). The editing caret itself is drawn as a
-        // styled cell at the textarea's first position, which stays on the
-        // same row as the parked cursor for empty input.
-        let expected = Position::new(viewport_area.x, viewport_area.y);
-        terminal.backend_mut().assert_cursor_position(expected);
+        // The visual caret remains at the textarea's first row, but the resize
+        // anchor is the viewport tail so terminal reflow carries the whole
+        // prompt along with the history above it.
+        let popup_width = viewport_area
+            .width
+            .saturating_sub(2)
+            .clamp(40, 180)
+            .min(viewport_area.width);
+        let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
+        let visual_caret = Position::new(popup_x + 1, viewport_area.y);
+        assert_eq!(
+            cursor_position,
+            Some(Position::new(0, viewport_area.height.saturating_sub(1)))
+        );
+        let caret_modifiers =
+            terminal.backend().buffer()[(visual_caret.x, visual_caret.y)].modifier;
+        assert!(caret_modifiers.contains(Modifier::REVERSED));
+        assert!(caret_modifiers.contains(Modifier::SLOW_BLINK));
     }
 
     #[test]
@@ -771,6 +807,76 @@ mod tests {
     }
 
     #[test]
+    fn input_style_does_not_fill_blank_textarea_cells() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::from(vec!["hello".to_string()]);
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "glm-5.2-super-relay",
+                    "max",
+                    None,
+                );
+            })
+            .unwrap();
+
+        let popup_width = viewport_area
+            .width
+            .saturating_sub(2)
+            .clamp(40, 180)
+            .min(viewport_area.width);
+        let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
+        let input_x = popup_x + 1;
+        let input_y = viewport_area.y;
+        let text_cell = &terminal.backend().buffer()[(input_x, input_y)];
+        let blank_cell = &terminal.backend().buffer()[(input_x + 20, input_y)];
+        let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
+
+        assert_eq!(text_cell.symbol(), "h");
+        assert_eq!(text_cell.fg, Color::Rgb(red, green, blue));
+        assert!(text_cell.modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(blank_cell.fg, Color::Reset);
+        assert!(!blank_cell.modifier.contains(Modifier::UNDERLINED));
+
+        textarea.start_selection();
+        textarea.move_cursor(CursorMove::End);
+        terminal
+            .draw(|f| {
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "glm-5.2-super-relay",
+                    "max",
+                    None,
+                );
+            })
+            .unwrap();
+
+        let selected_cell = &terminal.backend().buffer()[(input_x, input_y)];
+        let blank_cell = &terminal.backend().buffer()[(input_x + 20, input_y)];
+        assert_eq!(selected_cell.fg, Color::Rgb(red, green, blue));
+        assert_eq!(selected_cell.bg, Color::LightBlue);
+        assert_eq!(blank_cell.fg, Color::Reset);
+        assert_eq!(blank_cell.bg, Color::Reset);
+    }
+
+    #[test]
     fn cjk_cursor_position_matches_popup_inner_left_plus_width() {
         // Under CJK input, the cursor should land at the popup's inner left edge on the textarea's first line plus the text's display width.
         // The previous hand-computation used width_cjk, which disagrees with tui-textarea's internal width,
@@ -811,9 +917,14 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // Cursor at the end of "你好世界" → popup inner left(1) + display width of "你好世界"(8)
+        // The virtual caret at the end of "你好世界" uses tui-textarea's
+        // calculated position, avoiding an independent CJK-width calculation.
         let expected_x = popup_x + 1 + 8;
         let expected = Position::new(expected_x, viewport_area.y);
-        terminal.backend_mut().assert_cursor_position(expected);
+        assert!(
+            terminal.backend().buffer()[(expected.x, expected.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 }
