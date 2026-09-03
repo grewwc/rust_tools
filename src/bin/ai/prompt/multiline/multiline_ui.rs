@@ -216,6 +216,13 @@ fn clear_orphaned_viewport_rows<B: Backend>(
 
 /// Re-anchors a fixed viewport after terminal reflow or a requested height
 /// change without reserving another full block of terminal lines.
+///
+/// `clear_gap_above` blanks the rows between the previous and the new viewport
+/// top when the viewport moved down. Width reflows can leave ghost rows of the
+/// previous frame in that gap, so they pass `true`. A height-only change moves
+/// the viewport coherently with the terminal buffer (the terminal scrolls
+/// history back into view above it), so the gap holds model output that must
+/// stay untouched and height-only resizes pass `false`.
 fn rebuild_fixed_viewport(
     terminal: &mut MultilineTerminal,
     terminal_size: Size,
@@ -223,6 +230,7 @@ fn rebuild_fixed_viewport(
     cursor_offset_row: u16,
     mode: ViewportRebuildMode,
     previous_top_row: Option<u16>,
+    clear_gap_above: bool,
 ) -> io::Result<Rect> {
     let area = prepare_fixed_viewport(
         terminal.backend_mut(),
@@ -241,8 +249,10 @@ fn rebuild_fixed_viewport(
     // in theory move wrapped history output into the gap; blanking it is the
     // lesser harm because the viewport is bottom-anchored in practice and a
     // duplicated input box is far more confusing than a blanked history tail.
-    if let Some(previous_top) = previous_top_row {
-        clear_orphaned_viewport_rows(terminal.backend_mut(), previous_top, area.y)?;
+    if clear_gap_above {
+        if let Some(previous_top) = previous_top_row {
+            clear_orphaned_viewport_rows(terminal.backend_mut(), previous_top, area.y)?;
+        }
     }
     Ok(area)
 }
@@ -411,6 +421,11 @@ impl PromptEditor {
         let initial_viewport_area = terminal.get_frame().area();
         // On exit, clean up the viewport based on its latest reflowed top row.
         let mut last_viewport_top_row = Some(initial_viewport_area.y);
+        // Fixed viewports are intentionally not autoresized by Ratatui. Track
+        // the last physical terminal size so a resize can tell width reflows
+        // (which may leave ghost rows above the viewport) apart from
+        // height-only changes (where rows above hold scrolled-back output).
+        let mut last_terminal_size = terminal.backend().size()?;
         // The hidden hardware cursor is parked at the viewport tail. Its relative
         // offset lets a resize re-anchor the fixed area after terminal reflow.
         let mut last_reflow_anchor: Option<Position> = None;
@@ -459,14 +474,16 @@ impl PromptEditor {
                             base_viewport_height,
                             current_items,
                         );
-                        rebuild_fixed_viewport(
+                        let rebuilt_area = rebuild_fixed_viewport(
                             &mut terminal,
                             terminal_size,
                             new_height,
                             last_reflow_anchor.map(|position| position.y).unwrap_or(0),
                             ViewportRebuildMode::ReserveMissingRows,
                             last_viewport_top_row,
+                            true,
                         )?;
+                        last_viewport_top_row = Some(rebuilt_area.y);
                         fitted_completion_items = current_items;
                         force_repaint_next_frame = false;
                     }
@@ -486,14 +503,16 @@ impl PromptEditor {
                             .min(MAX_VIEWPORT_HEIGHT)
                             .min(available);
                         if new_height > base_viewport_height {
-                            rebuild_fixed_viewport(
+                            let rebuilt_area = rebuild_fixed_viewport(
                                 &mut terminal,
                                 terminal_size,
                                 new_height,
                                 last_reflow_anchor.map(|position| position.y).unwrap_or(0),
                                 ViewportRebuildMode::ReserveMissingRows,
                                 last_viewport_top_row,
+                                true,
                             )?;
+                            last_viewport_top_row = Some(rebuilt_area.y);
                             base_viewport_height = new_height;
                             force_repaint_next_frame = false;
                         }
@@ -536,30 +555,39 @@ impl PromptEditor {
                 }
                 let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
                 if let Event::Resize(_, _) = event {
-                    // The terminal may reflow or clear cells before delivering a
-                    // Resize event. Treat the event as a trigger and query the live
-                    // PTY size because cursor-position queries can leave older
-                    // resize events queued. Re-anchor and redraw immediately.
-                    //
-                    // The remembered cursor offset still helps locate the
-                    // reflowed viewport, but resize must never call
-                    // `append_lines`: repeated width changes can otherwise
-                    // make transient cursor movement permanent in scrollback.
+                    // Every resize re-anchors the viewport around the parked
+                    // cursor with one live DSR query. ReflowOnly keeps resizes
+                    // from appending rows: reserving rows here previously pushed
+                    // already-printed model output into scrollback and turned
+                    // reflow jitter into a growing blank gap. Height-only
+                    // changes never rewrap rows, so the parked anchor is exact
+                    // for them too.
                     let terminal_size = terminal.backend().size()?;
                     let requested_height = viewport_height_with_completion(
                         terminal_size.height,
                         base_viewport_height,
                         fitted_completion_items,
                     );
-                    rebuild_fixed_viewport(
+                    // Width reflow can leave rows of the previous frame between
+                    // the old and the new viewport top, so that gap is blanked.
+                    // A height-only change moves the viewport coherently with
+                    // the terminal buffer: rows above the new top are model
+                    // output the terminal scrolled back into view, and blanking
+                    // them would erase it.
+                    let clear_gap_above = terminal_size.width != last_terminal_size.width;
+                    let rebuilt_area = rebuild_fixed_viewport(
                         &mut terminal,
                         terminal_size,
                         requested_height,
                         last_reflow_anchor.map(|position| position.y).unwrap_or(0),
                         resize_rebuild_mode(last_reflow_anchor.map(|position| position.y)),
                         last_viewport_top_row,
-                    )
-                    .map_err(|e| io::Error::other(e.to_string()))?;
+                        clear_gap_above,
+                    )?;
+                    // Store the rebuilt top immediately rather than waiting for
+                    // the next draw: resize notifications can arrive in a burst.
+                    last_viewport_top_row = Some(rebuilt_area.y);
+                    last_terminal_size = terminal_size;
                     // Rebuilding starts with empty ratatui buffers and the viewport
                     // was explicitly cleared, so a forced all-cell repaint would
                     // only increase autowrap risk while the user is still resizing.
@@ -703,6 +731,58 @@ mod tests {
         );
         assert_eq!(area, ratatui::layout::Rect::new(0, 19, 80, 5));
         assert_eq!(lines_to_scroll, 0);
+    }
+
+    #[test]
+    fn height_only_resize_reanchors_from_live_cursor_without_losing_output() {
+        // Screen fully filled: the box occupies the bottom rows, simulated
+        // model output sits above it. Shrinking the height re-anchors the box
+        // around the parked cursor without appending rows, so the output above
+        // stays on screen instead of being pushed into scrollback.
+        let mut backend = TestBackend::new(10, 17);
+        backend.set_cursor_position(Position::new(0, 12)).unwrap();
+        let initial_area = prepare_fixed_viewport(
+            &mut backend,
+            ratatui::layout::Size {
+                width: 10,
+                height: 17,
+            },
+            5,
+            0,
+            ViewportRebuildMode::ReserveMissingRows,
+            false,
+        )
+        .unwrap();
+        assert_eq!(initial_area, Rect::new(0, 12, 10, 5));
+
+        // Height shrink 17 -> 10: the terminal keeps the parked cursor visible
+        // at the bottom, which puts the box top at row 5.
+        backend.resize(10, 10);
+        backend.set_cursor_position(Position::new(0, 9)).unwrap();
+        for row in 0..5 {
+            let output = Cell::new("K");
+            backend.draw(std::iter::once((0, row, &output))).unwrap();
+        }
+        let scrollback_before = backend.scrollback().area.height;
+
+        let rebuilt_area = prepare_fixed_viewport(
+            &mut backend,
+            ratatui::layout::Size {
+                width: 10,
+                height: 10,
+            },
+            5,
+            0,
+            resize_rebuild_mode(Some(0)),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(rebuilt_area, Rect::new(0, 5, 10, 5));
+        assert_eq!(backend.scrollback().area.height, scrollback_before);
+        for row in 0..5 {
+            assert_eq!(backend.buffer()[(0, row)].symbol(), "K");
+        }
     }
 
     #[test]
