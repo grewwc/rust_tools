@@ -1,9 +1,12 @@
 //! search_overflow — ranked retrieval over the session overflow archive
 //!
-//! Content moved out of context is archived verbatim into session assets:
+//! Content moved out of context is archived into session assets (verbatim
+//! unless noted):
 //! - `overflow-history.md`: original folded messages (user/assistant/tool results)
 //! - `tool-overflow-compressed/`: full snapshots of individual tool results
-//! - `folded-tool-groups/`: original messages of wholly folded tool-call groups
+//! - `folded-tool-groups/`: request-projection copies of wholly folded tool-call
+//!   groups (high-precision tool results appear as spill stubs or as full-text
+//!   copies kept verbatim at fold time; lossy results may be reduced to a summary)
 //! - `internal-note-overflow/`: internal context notes trimmed by budget
 //! - `user-overflow-preserved/`, `image-overflow-preserved/`: kept user turns/images
 //!

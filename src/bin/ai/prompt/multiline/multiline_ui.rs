@@ -41,11 +41,12 @@ const EMPTY_VIEWPORT_HEIGHT: u16 = 3 + VIEWPORT_CHROME_LINES;
 /// Max candidate lines shown at once in the completion panel; aligned with
 /// `render::COMPLETION_WINDOW`.
 const PANEL_COMPLETION_WINDOW: u16 = 12;
-/// Fallback chrome while the completion panel is active: minimum textarea
-/// lines(1) + compressed help line(1) = 2.
+/// Fallback chrome while the completion panel is active: the minimum textarea
+/// lines(1) plus the compressed help line(1) = 2. The input area's left-edge
+/// marker bar occupies a column, not a row, so it adds nothing here.
 /// The completion state hides model/session info, giving height priority to the
 /// candidate list.
-const PANEL_CHROME_LINES: u16 = 2;
+const PANEL_CHROME_LINES: u16 = 1 + 1;
 /// The completion state allows a taller prompt viewport than normal editing, so
 /// large terminals can show more candidates at once.
 const MAX_COMPLETION_VIEWPORT_HEIGHT: u16 = PANEL_CHROME_LINES + PANEL_COMPLETION_WINDOW + 2;
@@ -459,8 +460,10 @@ impl PromptEditor {
                     // Auto-grow the viewport when content exceeds the textarea capacity
                     // (grow only, never shrink, to avoid frequent flicker).
                     let content_lines = textarea.lines().len() as u16;
-                    let textarea_capacity =
-                        base_viewport_height.saturating_sub(VIEWPORT_CHROME_LINES);
+                    // Content rows that fit = viewport height minus the
+                    // model/help chrome rows (the left-edge marker bar occupies
+                    // a column, not a row).
+                    let textarea_capacity = base_viewport_height.saturating_sub(VIEWPORT_CHROME_LINES);
                     if content_lines > textarea_capacity
                         && base_viewport_height < MAX_VIEWPORT_HEIGHT
                     {
@@ -868,15 +871,17 @@ mod tests {
 
     #[test]
     fn multiline_viewport_height_scales_with_terminal() {
-        // Empty input: viewport = 3 input lines + chrome(2) = 5
+        // Empty input: viewport = 3 input lines + chrome(2) = 5. The left-edge
+        // marker bar occupies a column, not a row, so it adds no height.
         assert_eq!(multiline_viewport_height(30, None), 5);
         assert_eq!(multiline_viewport_height(30, Some("")), 5);
-        // Prefilled but shorter than base: keep the base size
+        // Prefilled but shorter than base: keep the base size. base textarea is
+        // 7 content lines; 7 + chrome(2) = 9.
         assert_eq!(multiline_viewport_height(30, Some("one line")), 9);
-        // Small terminal: terminal=12, available=10; empty input still keeps 3
-        // input lines
+        // Small terminal: terminal=12, available=10; empty input still keeps its
+        // 5-line box (3 content + chrome).
         assert_eq!(multiline_viewport_height(12, None), 5);
-        // On large terminals empty input still keeps 3 input lines
+        // On large terminals empty input still keeps the same compact box.
         assert_eq!(multiline_viewport_height(40, None), 5);
     }
 
@@ -887,7 +892,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // terminal=40: available=38, base_textarea=7, content=20→clamp(7,7)=7, viewport=9
+        // terminal=40: available=38, base_textarea=7, content=20→clamp(7,7)=7,
+        // viewport = 7 + chrome(2) = 9.
         assert_eq!(multiline_viewport_height(40, Some(&prefill)), 9);
         assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
         assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
@@ -896,15 +902,16 @@ mod tests {
 
     #[test]
     fn completion_viewport_grows_with_candidates_without_shrinking_base() {
-        // No panel: keep the empty-input base height (5).
+        // No panel: return the passed-in base height unchanged (here 5).
         assert_eq!(viewport_height_with_completion(30, 5, None), 5);
-        // 1 candidate: panel needs 1+2(borders)=3 + 2(chrome)=5, same as base.
+        // Panel chrome = 1 content line + help(1) = 2 (the left marker bar adds
+        // no row). 1 candidate: panel 1+2(borders)=3 + chrome(2)=5, equal to base.
         assert_eq!(viewport_height_with_completion(30, 5, Some(1)), 5);
-        // 3 candidates: 3+2+2=7 > base; the viewport grows to 7, the extra 3
-        // lines go to the panel.
+        // 3 candidates: panel 3+2=5 + chrome(2)=7; the viewport grows and the
+        // extra lines go to the panel.
         assert_eq!(viewport_height_with_completion(30, 5, Some(3)), 7);
-        // Many candidates: the completion-state cap is separately raised to 16,
-        // fitting 12 candidate lines + borders + compressed chrome.
+        // Many candidates: the completion-state cap is 16 = chrome(2) + 12
+        // candidate lines + panel borders(2).
         assert_eq!(viewport_height_with_completion(30, 5, Some(50)), 16);
     }
 

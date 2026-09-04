@@ -99,6 +99,9 @@ fn popup_layout_config(
 struct PopupGeometry {
     popup: Rect,
     chunks: [Rect; 5],
+    /// Content area inside the input box border (chunks[1] inset by one cell on
+    /// every side); the textarea widget renders here.
+    textarea_inner: Rect,
 }
 
 fn popup_geometry(
@@ -162,6 +165,9 @@ fn popup_geometry(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(layout.top_rule_lines),
+            // chunks[1] is the input box. The left-edge bar occupies one column
+            // but no extra rows, so its height is exactly the textarea's line
+            // count.
             Constraint::Length(textarea_lines),
             Constraint::Length(panel_lines),
             Constraint::Length(layout.model_header_lines),
@@ -169,9 +175,18 @@ fn popup_geometry(
         ])
         .split(inner);
 
+    // Inset chunks[1] by the single left gutter column to get the area the
+    // textarea draws into; the left bar itself is rendered separately in
+    // `render_multiline_popup`. A LEFT border shifts content right by one column
+    // and adds no rows.
+    let textarea_inner = Block::default()
+        .borders(Borders::LEFT)
+        .inner(chunks[1]);
+
     PopupGeometry {
         popup,
         chunks: [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]],
+        textarea_inner,
     }
 }
 
@@ -256,17 +271,43 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // Keep the existing input color and current-line underline, but apply them
     // only to actual characters so blank cells cannot participate in reflow.
     style_input_text(textarea, &current_lines);
-    // Draw the editing caret into the buffer. The real terminal cursor is kept
-    // hidden and parked on the viewport's final row by the input loop so that
-    // terminal width reflow cannot split the long help line below the caret
-    // into persistent scrollback rows.
-    textarea.set_cursor_render_mode(CursorRenderMode::Cell);
+    // Draw the editing caret into the buffer as a thin vertical bar instead of
+    // a reversed block. The real terminal cursor is kept hidden and parked on
+    // the viewport's final row by the input loop so that terminal width reflow
+    // cannot split the long help line below the caret into persistent
+    // scrollback rows. A drawn caret is required here: the hardware cursor is
+    // the width-reflow anchor and cannot also sit at the editing position.
+    textarea.set_cursor_render_mode(CursorRenderMode::Hidden);
 
-    f.render_widget(&*textarea, textarea_area);
+    // Input box: a left-edge vertical bar marking the editing area, in the same
+    // color as the completion panel frame. Only the LEFT border is drawn: a full
+    // frame's top/bottom rules fill the popup width and wrap into permanent
+    // scrollback rows when the terminal is narrowed (the same reflow hazard the
+    // parked-cursor anchor exists to avoid). A single left-column glyph can never
+    // reach the right margin, so it survives width changes without leaving
+    // ghost boxes.
+    let input_bar = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(
+            Style::default()
+                .fg(Color::Rgb(74, 92, 112))
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_widget(&input_bar, textarea_area);
+    f.render_widget(&*textarea, geometry.textarea_inner);
     // Reuse tui-textarea's own rendering plan for the visual caret position.
     // This avoids a duplicate CJK-width calculation that can disagree with the
     // widget's internal screen map.
     let visual_cursor_position = textarea.rendered_cursor_position();
+    if let Some(position) = visual_cursor_position {
+        // LEFT ONE EIGHTH BLOCK (U+258F): a 1/8-width vertical bar at the
+        // cell's left edge, matching a hardware bar cursor. Replacing the cell
+        // hides any character underneath only while the caret sits on it.
+        let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
+        let caret_cell = &mut f.buffer_mut()[(position.x, position.y)];
+        caret_cell.set_symbol("▏");
+        caret_cell.set_style(Style::default().fg(Color::Rgb(red, green, blue)));
+    }
 
     // Render the completion panel
     if let Some(panel) = completion_panel {
@@ -516,7 +557,7 @@ pub(in crate::ai::prompt::multiline) fn measure_multiline_cursor_offset(
     style_input_text(&mut measured, &current_lines);
     measured.set_cursor_render_mode(CursorRenderMode::Hidden);
     let mut buffer = Buffer::empty(area);
-    Widget::render(&measured, geometry.chunks[1], &mut buffer);
+    Widget::render(&measured, geometry.textarea_inner, &mut buffer);
     measured.rendered_cursor_position()
 }
 
@@ -762,7 +803,9 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        let visual_caret = Position::new(popup_x + 1, viewport_area.y);
+        // The caret sits one column right of the left-edge marker bar. The bar
+        // occupies a column but no row, so the caret stays on the box's top row.
+        let visual_caret = Position::new(popup_x + 2, viewport_area.y);
         assert_eq!(
             cursor_position,
             Some(Position::new(
@@ -771,11 +814,10 @@ mod tests {
             ))
         );
         assert!(!terminal.backend().cursor_visible());
-        // The visible caret is a reversed buffer cell; the input loop parks the
-        // hidden hardware cursor at the viewport tail after the draw.
+        // The visible caret is a drawn vertical-bar cell; the input loop parks
+        // the hidden hardware cursor at the viewport tail after the draw.
         let caret_cell = &terminal.backend().buffer()[(visual_caret.x, visual_caret.y)];
-        assert_eq!(caret_cell.symbol(), " ");
-        assert!(caret_cell.modifier.contains(Modifier::REVERSED));
+        assert_eq!(caret_cell.symbol(), "▏");
     }
 
     #[test]
@@ -857,7 +899,9 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        let input_x = popup_x + 1;
+        // Textarea content renders one column right of the left-edge marker bar;
+        // the bar adds no row, so content starts on the box's top row.
+        let input_x = popup_x + 2;
         let input_y = viewport_area.y;
         // The first character is the reversed buffer cursor, so inspect the
         // next text cell when checking that input styling does not fill blanks.
@@ -939,7 +983,9 @@ mod tests {
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
         // The buffer caret at the end of the CJK text uses tui-textarea's
         // calculated position, avoiding an independent CJK-width calculation.
-        let expected_x = popup_x + 1 + 8;
+        // Content starts one column right of the left-edge marker bar; the bar
+        // occupies no row, so the first text line sits on the box's top row.
+        let expected_x = popup_x + 2 + 8;
         let expected = Position::new(expected_x, viewport_area.y);
         assert_eq!(
             cursor_offset,
@@ -949,9 +995,8 @@ mod tests {
             ))
         );
         assert!(!terminal.backend().cursor_visible());
-        // The blank cell at the measured caret is rendered in reverse video.
+        // The cell at the measured caret holds the drawn vertical-bar glyph.
         let caret_cell = &terminal.backend().buffer()[(expected.x, expected.y)];
-        assert_eq!(caret_cell.symbol(), " ");
-        assert!(caret_cell.modifier.contains(Modifier::REVERSED));
+        assert_eq!(caret_cell.symbol(), "▏");
     }
 }

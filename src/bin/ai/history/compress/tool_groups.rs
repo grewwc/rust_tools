@@ -12,8 +12,8 @@ use crate::ai::types::ToolCall;
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, ROLE_SYSTEM, retained_turn_start};
 use super::text_utils::truncate_to_chars;
 use super::tool_overflow::{
-    build_tool_overflow_recall_lines, is_non_compressible_tool, is_preserved_user_or_image_stub,
-    plan_noncompressible_tool_result_for_fold,
+    build_tool_overflow_recall_lines, is_non_compressible_tool, is_preserved_tool_overflow_stub,
+    is_preserved_user_or_image_stub, plan_noncompressible_tool_result_for_fold,
 };
 use super::{
     COMPRESSED_TOOL_EVIDENCE_MARKER, PlannedArchiveWrite, content_sha256_hex,
@@ -23,6 +23,39 @@ use super::{
 };
 
 pub(super) const FOLDED_TOOL_GROUP_ARCHIVE_DIR: &str = "folded-tool-groups";
+
+/// Header of the folded-group archive file. The archived JSON is a verbatim
+/// copy of the messages folded out of the *request projection*, not of the
+/// canonical history: high-precision tool results (tools that forbid lossy
+/// compression, e.g. read_file / execute_command / apply_patch / task results)
+/// appear either as spill stubs (when a prior stage already spilled them,
+/// carrying `original_file_path` / `archive_file_path`) or as their full text
+/// (when still verbatim at fold time - protected by the recent-window until
+/// this fold, or below the spill threshold); lossy-compressible results (e.g.
+/// plan, tree) may have been reduced to a summary before folding. Stating this
+/// in the header keeps a model reading the archive from expecting the original
+/// full tool output inside it, and tells it how to retrieve current output
+/// instead.
+const FOLDED_GROUP_ARCHIVE_HEADER: &str = "\
+# Folded tool group (request-projection copy)
+
+This JSON is a verbatim copy of the messages folded out of the request \
+projection, not the canonical history. High-precision tool results (tools that
+forbid lossy compression, e.g. read_file / execute_command / apply_patch / task
+results) appear here either as spill stubs carrying `original_file_path` /
+`archive_file_path` (when a prior stage already spilled them to
+`tool-overflow-compressed/`) or as their full text (when they were still
+verbatim at fold time - protected by the recent-window until this fold, or
+below the spill threshold). Lossy-compressible tool results (e.g. plan, tree)
+may have been reduced to a structured summary before folding; when they were,
+only the summary is archived here. Results that survived summarization
+(recent-window protection or small output) are kept verbatim in this file. Read
+this file for the exact archived content; re-run the tool against the same
+target only when the content here lacks the detail you need.
+
+raw_message_json:
+```json
+";
 
 pub(super) struct ToolGroupFoldPlan {
     messages: Vec<Message>,
@@ -218,9 +251,7 @@ fn plan_tool_call_group_fold(
             .filter_map(|idx| messages.get(*idx).cloned())
             .collect::<Vec<_>>();
         let raw_messages = serde_json::to_string_pretty(&group_messages).ok()?;
-        let content = format!(
-            "# Folded tool group (verbatim)\n\nraw_message_json:\n```json\n{raw_messages}\n```\n"
-        );
+        let content = format!("{FOLDED_GROUP_ARCHIVE_HEADER}{raw_messages}\n```\n");
         let digest = content_sha256_hex(content.as_bytes());
         let path = dir
             .join(FOLDED_TOOL_GROUP_ARCHIVE_DIR)
@@ -237,9 +268,9 @@ fn plan_tool_call_group_fold(
         tool_calls.len()
     ));
     lines.push(COMPRESSED_TOOL_EVIDENCE_MARKER.to_string());
-    if let Some(path) = archive_file_path {
+    if let Some(path) = archive_file_path.as_deref() {
         lines.push(format!("- archive_file_path: {path}"));
-        lines.push("- archive_scope: folded_tool_group_raw_messages".to_string());
+        lines.push("- archive_scope: folded_tool_group_projection_messages".to_string());
     }
 
     // Checkpoints use only the user-visible assistant body. Hidden
@@ -290,11 +321,30 @@ fn plan_tool_call_group_fold(
             tool_calls.len() - 8
         ));
     }
-    if tool_calls
+    // The `reuse evidence` guidance is only truthful when the group keeps a
+    // recoverable pointer (a non-compressible tool spill, or an already-spilled
+    // stub). Lossy-only groups may archive either a summary (results summarized
+    // before folding) or the full text (results that survived summarization -
+    // recent-window protection or small output), so their guidance points at
+    // `archive_file_path` first and falls back to re-running the tool only when
+    // the archived text lacks the detail needed. When no archive was written at
+    // all (`overflow_dir = None`), neither pointer exists and the evidence lines
+    // above are the only record, so the guidance must say so instead of
+    // referencing a nonexistent archive.
+    let has_recoverable_result = tool_calls
         .iter()
         .any(|tool_call| is_non_compressible_tool(&tool_call.function.name))
-    {
+        || group.iter().skip(1).any(|idx| {
+            messages.get(*idx).is_some_and(|message| {
+                is_preserved_tool_overflow_stub(&value_to_string(&message.content))
+            })
+        });
+    if has_recoverable_result {
         lines.push("compression_decision: reuse the evidence above before repeating the same read/search/list/command action; only re-run or re-read if exact omitted text is required or the underlying target changed.".to_string());
+    } else if archive_file_path.is_some() {
+        lines.push("compression_decision: the archived tool results are the request-projection content at fold time - full text when the result survived lossy summarization (recent-window protection or small output), otherwise only a lossy summary. Read `archive_file_path` for the exact archived content; re-run the affected tool against the same target only when the archived text lacks the detail you need.".to_string());
+    } else {
+        lines.push("compression_decision: no archive was written for this fold (overflow archiving is disabled); the evidence lines above are the only remaining record of these tool results. Re-run the affected tool against the same target to get current output.".to_string());
     }
 
     Some((

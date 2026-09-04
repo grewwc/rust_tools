@@ -1316,13 +1316,13 @@ fn folded_tool_group_points_to_raw_group_archive() {
         .find(|message| {
             message.role == ROLE_INTERNAL_NOTE
                 && value_to_string(&message.content)
-                    .contains("- archive_scope: folded_tool_group_raw_messages")
+                    .contains("- archive_scope: folded_tool_group_projection_messages")
         })
         .map(|message| value_to_string(&message.content))
         .expect("folded group should expose an archive pointer");
 
     assert!(
-        stub.contains("- archive_scope: folded_tool_group_raw_messages"),
+        stub.contains("- archive_scope: folded_tool_group_projection_messages"),
         "{stub}"
     );
     let archive_path = archive_file_path_from_text(&stub);
@@ -1336,6 +1336,312 @@ fn folded_tool_group_points_to_raw_group_archive() {
     );
     assert!(archived.contains("unique raw grep result"), "{archived}");
     assert!(archived.contains("raw_message_json"), "{archived}");
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn folded_lossy_group_advises_archive_read_and_archive_header_is_honest() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-lossy-fold-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("system", "s"), msg("user", "查看项目结构")];
+    messages.push(assistant_call("tree-lossy", "tree"));
+    messages.push(tool_result(
+        "tree-lossy",
+        "src\n  bin/a.rs\n  lib.rs\n  ... [truncated: 398 lines omitted]",
+    ));
+    for i in 0..4 {
+        let id = format!("later-lossy-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "later"));
+    }
+
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        4,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
+    assert_eq!(folded_groups, 1);
+    let stub = folded
+        .iter()
+        .find(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && value_to_string(&message.content).contains(COMPRESSED_TOOL_EVIDENCE_MARKER)
+        })
+        .map(|message| value_to_string(&message.content))
+        .expect("folded lossy group should become evidence note");
+
+    assert!(
+        stub.contains("survived lossy summarization"),
+        "lossy-only groups must explain what the archive holds: {stub}"
+    );
+    assert!(
+        stub.contains("Read `archive_file_path` for the exact archived content"),
+        "lossy-only groups must point the model at the archive, not at a re-run: {stub}"
+    );
+    assert!(
+        !stub.contains("reuse the evidence above"),
+        "lossy-only groups must not claim a recoverable pointer: {stub}"
+    );
+
+    let archive_path = archive_file_path_from_text(&stub);
+    let archived = std::fs::read_to_string(&archive_path)
+        .expect("folded group archive should be readable");
+    assert!(
+        archived.starts_with("# Folded tool group (request-projection copy)"),
+        "{archived}"
+    );
+    assert!(archived.contains("raw_message_json"), "{archived}");
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+/// When folding runs without an overflow dir (`overflow_dir = None`, e.g. the
+/// injected `DefaultCompressor` or test paths), no archive is written and no
+/// `archive_file_path` line can exist; the lossy guidance must not reference a
+/// nonexistent archive and must state that the evidence lines are the only
+/// record.
+#[test]
+fn lossy_fold_without_archive_does_not_reference_nonexistent_archive() {
+    let mut messages = vec![msg("system", "s"), msg("user", "查看项目结构")];
+    messages.push(assistant_call("tree-noarchive", "tree"));
+    messages.push(tool_result(
+        "tree-noarchive",
+        "src\n  bin/a.rs\n  lib.rs\n  ... [truncated: 398 lines omitted]",
+    ));
+    for i in 0..4 {
+        let id = format!("later-noarchive-{i}");
+        messages.push(assistant_call(&id, "text_grep"));
+        messages.push(tool_result(&id, "later"));
+    }
+
+    let (folded, folded_groups) =
+        fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
+    assert_eq!(folded_groups, 1);
+    let stub = folded
+        .iter()
+        .find(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && value_to_string(&message.content).contains(COMPRESSED_TOOL_EVIDENCE_MARKER)
+        })
+        .map(|message| value_to_string(&message.content))
+        .expect("folded lossy group should become evidence note");
+
+    assert!(
+        !stub.contains("archive_file_path"),
+        "no-archive fold must not reference an archive pointer: {stub}"
+    );
+    assert!(
+        !stub.contains("survived lossy summarization"),
+        "no-archive fold must not claim archive content: {stub}"
+    );
+    assert!(
+        stub.contains("no archive was written for this fold"),
+        "no-archive fold must say the evidence lines are the only record: {stub}"
+    );
+    assert!(
+        stub.contains("Re-run the affected tool"),
+        "no-archive fold must direct the model to re-run for current output: {stub}"
+    );
+}
+
+/// A lossy tool result large enough (many lines, above the per-message summary
+/// budget) that `prepare_tool_messages_structured` replaces it with a summary.
+fn big_lossy_text(prefix: &str) -> String {
+    (0..16)
+        .map(|i| format!("{prefix} line {i:04} padding padding padding"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Regression: the fold ladder tightens the protection window (4 -> 2 -> 1)
+/// without re-running `prepare_tool_messages_structured` between rungs, so
+/// groups folded at keep=2 (e.g. the 3rd/4th most recent) may still carry
+/// their FULL lossy result in the request projection at fold time. The archive
+/// then holds the full text, and the stub must point the model at
+/// `archive_file_path` instead of blanket-telling it to re-run the tool.
+#[test]
+fn tightened_ladder_rung_archives_full_text_and_advises_archive_read() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-lossy-ladder-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("system", "s"), msg("user", "查看项目结构")];
+    // Six lossy groups: A is oldest (outside recent-4 at prepare -> summarized),
+    // B is also outside recent-4 (summarized), C and D are inside recent-4 at
+    // prepare time (kept full) but outside keep=2 at fold time (folded with
+    // their full text), and E/F stay inside the protected window (not folded).
+    messages.push(assistant_call("tree-A", "tree"));
+    messages.push(tool_result("tree-A", &big_lossy_text("TREE-A")));
+    for id in ["grep-B", "grep-C", "grep-D", "grep-E", "grep-F"] {
+        messages.push(assistant_call(id, "text_grep"));
+        let text = if matches!(id, "grep-E" | "grep-F") {
+            "later".to_string()
+        } else {
+            big_lossy_text(id)
+        };
+        messages.push(tool_result(id, &text));
+    }
+    // Replicate shrink_messages_to_fit's order: prepare once with the
+    // protection window (4), then fold with a tighter window (2) without any
+    // re-summarization in between.
+    prepare_tool_messages_structured(
+        &mut messages,
+        480,
+        4,
+        Some(overflow_dir.as_path()),
+        None,
+        &FxHashSet::default(),
+    );
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        2,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
+    assert_eq!(folded_groups, 4);
+    let archive_dir = overflow_dir.join("folded-tool-groups");
+
+    let stubs: Vec<String> = folded
+        .iter()
+        .filter(|message| {
+            message.role == ROLE_INTERNAL_NOTE
+                && value_to_string(&message.content).contains(COMPRESSED_TOOL_EVIDENCE_MARKER)
+        })
+        .map(|message| value_to_string(&message.content))
+        .collect();
+    assert_eq!(stubs.len(), 4, "one evidence note per folded group");
+    for stub in &stubs {
+        assert!(
+            stub.contains("Read `archive_file_path` for the exact archived content"),
+            "every lossy stub must direct the model to the archive first: {stub}"
+        );
+    }
+
+    // Prove the mixed archive content: summarized groups (A, B) archived only
+    // the summary, while groups protected at prepare time (C, D) archived their
+    // full text - so "read the archive" is the only truthful instruction.
+    let archive_dir = overflow_dir.join("folded-tool-groups");
+    let mut saw_full_c = false;
+    for entry in std::fs::read_dir(&archive_dir).expect("archive dir should exist") {
+        let archived = std::fs::read_to_string(entry.expect("entry").path())
+            .expect("archive should be readable");
+        if archived.contains("grep-C line 0012") {
+            saw_full_c = true;
+        }
+        assert!(
+            !archived.contains("TREE-A line 0012"),
+            "summarized lossy results must not archive the full text: {archived}"
+        );
+        assert!(
+            !archived.contains("grep-B line 0012"),
+            "summarized lossy results must not archive the full text: {archived}"
+        );
+    }
+    assert!(
+        saw_full_c,
+        "a keep=2-folded group that was protected at prepare time must archive its full text"
+    );
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+/// Regression: the ladder can also tighten the window onto HIGH-PRECISION
+/// groups (lossy_compress: Never, e.g. read_file). Prepare spills only
+/// precision results outside its recent-4 window; results protected at prepare
+/// time are still full text when the fold archives them (the archive JSON is
+/// serialized before the fold's own spill planning, and the fold never writes
+/// the stub back into the archived copy). The archive header must therefore
+/// describe BOTH forms - spill stubs and verbatim full text - instead of
+/// claiming every precision result appears as a stub.
+#[test]
+fn protected_precision_group_archives_full_text_so_header_must_not_claim_stub_only() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-precision-ladder-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![msg("system", "s"), msg("user", "读取代码")];
+    // Precision results must be large enough that the spill stub (head-8 +
+    // tail-4 preview) is genuinely smaller than the text, otherwise the
+    // anti-bloat guard keeps the full text and prepare never spills.
+    let big_text = |prefix: &str| {
+        (0..60)
+            .map(|i| format!("{prefix} line {i:04} padding padding padding"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    messages.push(assistant_call("read-A", "read_file"));
+    messages.push(tool_result("read-A", &big_text("read-A")));
+    for id in ["read-B", "read-C", "read-D", "read-E", "read-F"] {
+        messages.push(assistant_call(id, "read_file"));
+        let text = if matches!(id, "read-E" | "read-F") {
+            "later".to_string()
+        } else {
+            big_text(id)
+        };
+        messages.push(tool_result(id, &text));
+    }
+    // Replicate shrink_messages_to_fit's order: prepare once with the
+    // protection window (4), then fold with a tighter window (2) without any
+    // re-spill/re-summarization in between.
+    prepare_tool_messages_structured(
+        &mut messages,
+        480,
+        4,
+        Some(overflow_dir.as_path()),
+        None,
+        &FxHashSet::default(),
+    );
+    let (folded, folded_groups) = fold_early_tool_groups(
+        &messages,
+        2,
+        Some(overflow_dir.as_path()),
+        &FxHashSet::default(),
+    );
+    assert_eq!(folded_groups, 4);
+    let archive_dir = overflow_dir.join("folded-tool-groups");
+
+    let mut saw_full_c = false;
+    for entry in std::fs::read_dir(&archive_dir).expect("archive dir should exist") {
+        let archived =
+            std::fs::read_to_string(entry.expect("entry").path()).expect("archive should be readable");
+        assert!(
+            archived.starts_with("# Folded tool group (request-projection copy)"),
+            "{archived}"
+        );
+        assert!(
+            archived.contains("appear here either as spill stubs")
+                && archived.contains("or as their full text"),
+            "archive header must describe both spill-stub and verbatim full-text forms: {archived}"
+        );
+        assert!(
+            !archived.contains("were spilled zero-compression to `tool-overflow-compressed/` and appear\nhere as stubs"),
+            "archive header must not claim every precision result is a stub: {archived}"
+        );
+        // Groups protected at prepare time (C, D) were still full text when the
+        // archive JSON was serialized: the archived copy must be the full
+        // result, not a spill stub.
+        if archived.contains("read-C line 0055") {
+            saw_full_c = true;
+            assert!(
+                !archived.contains("[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]"),
+                "protected precision results must archive the full text, not a stub: {archived}"
+            );
+        }
+        // Groups spilled by prepare (A, B) were stubs before folding: their
+        // archived copy is the stub carrying the spill pointer, never the full
+        // text re-archived. `line 0055` lies inside the preview-omitted middle
+        // (head 8 + tail 4 of 60), so its presence proves full text.
+        assert!(
+            !archived.contains("read-A line 0055"),
+            "prepare-spilled precision results must archive the stub, not the full text: {archived}"
+        );
+        assert!(
+            !archived.contains("read-B line 0055"),
+            "prepare-spilled precision results must archive the stub, not the full text: {archived}"
+        );
+    }
+    assert!(
+        saw_full_c,
+        "a keep=2-folded precision group protected at prepare time must archive its full text"
+    );
 
     let _ = std::fs::remove_dir_all(overflow_dir);
 }

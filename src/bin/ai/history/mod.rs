@@ -505,8 +505,12 @@ fn context_projection_fingerprint(
     // alters generated projections requires a version bump: mismatched fingerprints
     // force a rebuild from canonical messages instead of silently keeping stale
     // context. v2: group folding gained a minimum protected-tail byte floor, and
-    // byte-identical dedup stubs embed a capped content excerpt.
-    const PROJECTION_VERSION: u8 = 2;
+    // byte-identical dedup stubs embed a capped content excerpt. v3: folded tool
+    // groups now carry archive-first guidance (lossy groups point at
+    // `archive_file_path`; no-archive folds state the evidence lines are the only
+    // record) and the archive header/scope labels describe request-projection
+    // copies.
+    const PROJECTION_VERSION: u8 = 3;
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();
