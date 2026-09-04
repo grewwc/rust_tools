@@ -53,13 +53,11 @@ pub(crate) fn record_subagent_progress_update(
         let Some(entry) = registry.get_mut(&task_id.to_string()) else {
             return;
         };
-        let persist = kind
-            == crate::ai::driver::runtime_ctx::SubagentProgressEventKind::Checkpoint
+        let persist = kind == crate::ai::driver::runtime_ctx::SubagentProgressEventKind::Checkpoint
             || entry.last_progress_persisted_at.is_none_or(|last| {
                 now.saturating_duration_since(last) >= SUBAGENT_PROGRESS_PERSIST_INTERVAL
             });
-        let notify = kind
-            == crate::ai::driver::runtime_ctx::SubagentProgressEventKind::Checkpoint
+        let notify = kind == crate::ai::driver::runtime_ctx::SubagentProgressEventKind::Checkpoint
             || entry.last_progress_notification_at.is_none_or(|last| {
                 now.saturating_duration_since(last) >= SUBAGENT_PROGRESS_NOTIFY_INTERVAL
             });

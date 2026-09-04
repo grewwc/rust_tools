@@ -201,16 +201,17 @@ fn print_daily_breakdown(days: u64) {
         Some(rows) => {
             println!("  [daily last {}d]", days);
             println!(
-                "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}",
-                "date", "calls", "in", "out", "total"
+                "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}  {:>7}",
+                "date", "calls", "in", "out", "think", "total"
             );
             for r in &rows {
                 println!(
-                    "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}",
+                    "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}  {:>7}",
                     r.day,
                     format_number(r.calls),
                     format_number(r.input),
                     format_number(r.output),
+                    format_number(r.reasoning),
                     format_number(r.total)
                 );
             }
@@ -221,7 +222,7 @@ fn print_daily_breakdown(days: u64) {
     }
 }
 
-/// 打印最近有数据的 N 天（不限时间窗口，跳过无数据的空天）。
+/// Print the N most recent days that have data (no time window; empty days are skipped).
 fn print_recent_days(limit: usize) {
     match store::query_recent_days(limit) {
         Some(rows) if rows.is_empty() => {
@@ -230,16 +231,17 @@ fn print_recent_days(limit: usize) {
         Some(rows) => {
             println!("  [daily recent {}d]", limit);
             println!(
-                "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}",
-                "date", "calls", "in", "out", "total"
+                "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}  {:>7}",
+                "date", "calls", "in", "out", "think", "total"
             );
             for r in &rows {
                 println!(
-                    "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}",
+                    "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}  {:>7}",
                     r.day,
                     format_number(r.calls),
                     format_number(r.input),
                     format_number(r.output),
+                    format_number(r.reasoning),
                     format_number(r.total)
                 );
             }

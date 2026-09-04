@@ -18,9 +18,7 @@ mod wire_parse;
 
 #[cfg(test)]
 use aux::{SESSION_TITLE_BODY_TIMEOUT_SECS, SESSION_TITLE_REQUEST_TIMEOUT_SECS};
-pub(crate) use aux::{
-    charge_llm_usage_to_kernel, generate_session_title_via_model,
-};
+pub(crate) use aux::{charge_llm_usage_to_kernel, generate_session_title_via_model};
 #[allow(unused_imports)]
 pub(crate) use error::{
     AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS, AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
@@ -36,9 +34,9 @@ pub(crate) use error::{
     should_try_model_fallback, sleep_with_cancel,
 };
 pub(crate) use image_digest::{
-    content_has_image, describe_image_for_digest, digest_instruction, is_digest_only_response,
-    parse_digest, strip_digest_blocks, swap_images_with_digest, DIGEST_BEGIN, DIGEST_END,
-    last_image_user_message_fingerprint, replace_old_images_with_persisted_digests,
+    DIGEST_BEGIN, DIGEST_END, content_has_image, describe_image_for_digest, digest_instruction,
+    is_digest_only_response, last_image_user_message_fingerprint, parse_digest,
+    replace_old_images_with_persisted_digests, strip_digest_blocks, swap_images_with_digest,
 };
 pub(in crate::ai) use logging::TransientStatusLine;
 pub(in crate::ai) use logging::emit_request_diagnostic;

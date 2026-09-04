@@ -1,10 +1,11 @@
 use ratatui::{
+    buffer::Buffer,
     layout::Alignment,
     layout::{Constraint, Direction, Layout},
-    layout::{Position, Rect},
+    layout::{Position, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 use tui_textarea::{CursorRenderMode, TextArea};
 use unicode_width::UnicodeWidthChar;
@@ -44,22 +45,6 @@ fn style_input_text(textarea: &mut TextArea<'_>, lines: &[String]) {
         };
         // tui-textarea highlight offsets are UTF-8 byte offsets.
         textarea.custom_highlight(((row, 0), (row, line.len())), style, 1);
-    }
-}
-
-/// Paints the visible editing caret without making it the terminal's physical cursor.
-///
-/// The physical cursor is deliberately kept at the end of the prompt viewport so
-/// terminal reflow moves the complete prompt together with the output above it.
-/// This cell is repainted with every input frame and preserves the character under
-/// the caret while making the logical edit position visible. ANSI terminals that
-/// honor slow-blink styling retain a blinking caret without idle redraws.
-fn render_virtual_cursor(f: &mut ratatui::Frame<'_>, cursor_position: Position) {
-    if let Some(cell) = f.buffer_mut().cell_mut(cursor_position) {
-        cell.set_style(
-            cell.style()
-                .add_modifier(Modifier::REVERSED | Modifier::SLOW_BLINK),
-        );
     }
 }
 
@@ -110,6 +95,86 @@ fn popup_layout_config(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PopupGeometry {
+    popup: Rect,
+    chunks: [Rect; 5],
+}
+
+fn popup_geometry(
+    area: Rect,
+    current_content: &str,
+    content_lines: usize,
+    trailing_blank_lines: usize,
+    completion_items: Option<usize>,
+    has_status_msg: bool,
+    has_model_label: bool,
+) -> PopupGeometry {
+    let layout = popup_layout_config(
+        area.height,
+        current_content,
+        content_lines,
+        trailing_blank_lines,
+        completion_items.is_some(),
+        has_status_msg,
+        has_model_label,
+    );
+    let popup_width = area.width.saturating_sub(2).clamp(40, 180).min(area.width);
+    let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
+    let popup = Rect::new(popup_x, area.y, popup_width, area.height);
+    let horizontal_margin = 1;
+    let inner = Rect::new(
+        popup.x + horizontal_margin,
+        popup.y + layout.top_margin,
+        popup.width - horizontal_margin * 2,
+        popup.height - layout.top_margin,
+    );
+    let (textarea_lines, panel_lines) = match completion_items {
+        Some(items) => {
+            let desired_panel = (items.min(COMPLETION_WINDOW) as u16).saturating_add(2);
+            let panel_cap = inner
+                .height
+                .saturating_sub(layout.top_rule_lines)
+                .saturating_sub(layout.help_lines)
+                .saturating_sub(layout.model_header_lines)
+                .saturating_sub(layout.min_textarea_lines);
+            let panel = desired_panel.min(panel_cap).max(1.min(panel_cap));
+            let textarea = inner
+                .height
+                .saturating_sub(layout.top_rule_lines)
+                .saturating_sub(panel)
+                .saturating_sub(layout.model_header_lines)
+                .saturating_sub(layout.help_lines)
+                .max(layout.min_textarea_lines);
+            (textarea, panel)
+        }
+        None => {
+            let textarea = inner
+                .height
+                .saturating_sub(layout.top_rule_lines)
+                .saturating_sub(layout.model_header_lines)
+                .saturating_sub(layout.help_lines)
+                .max(layout.min_textarea_lines);
+            (textarea, 0)
+        }
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(layout.top_rule_lines),
+            Constraint::Length(textarea_lines),
+            Constraint::Length(panel_lines),
+            Constraint::Length(layout.model_header_lines),
+            Constraint::Length(layout.help_lines),
+        ])
+        .split(inner);
+
+    PopupGeometry {
+        popup,
+        chunks: [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]],
+    }
+}
+
 pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     f: &mut ratatui::Frame<'_>,
     textarea: &mut TextArea<'_>,
@@ -123,92 +188,17 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     let current_lines = textarea.lines().to_vec();
     let current_content = current_lines.join("\n");
     let trailing_blank_lines = count_trailing_blank_lines(&current_lines);
-    let layout = popup_layout_config(
-        area.height,
+    let geometry = popup_geometry(
+        area,
         &current_content,
         current_lines.len(),
         trailing_blank_lines,
-        completion_panel.is_some(),
+        completion_panel.map(|panel| panel.items.len()),
         status_msg.is_some(),
         !model_label.is_empty(),
     );
-
-    // Compute the popup size: always fill the current prompt viewport. Whitespace for the empty-input case is
-    // achieved via a smaller viewport height and removing the top gap, not by carving unused regions inside the viewport.
-    let popup_height = area.height;
-    let popup_width = area.width.saturating_sub(2).clamp(40, 180).min(area.width);
-
-    // Compute the popup position (top-aligned, right below the previous output)
-    let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
-    let popup_y = area.y;
-    let popup = Rect::new(popup_x, popup_y, popup_width, popup_height);
-
-    // Compute the inner area: 1 column of horizontal margin on each side, no extra top/bottom padding,
-    // to avoid creating extra blank lines inside the prompt viewport.
-    let h_margin: u16 = 1;
-    let top_margin = layout.top_margin;
-    let inner = Rect::new(
-        popup.x + h_margin,
-        popup.y + top_margin,
-        popup.width - h_margin * 2,
-        popup.height - top_margin,
-    );
-
-    // Compute each region's height
-    let top_rule_lines = layout.top_rule_lines;
-    let help_lines = layout.help_lines;
-    // Model/topic info line: keep it at the bottom (above the help line), where it
-    // remains visually stable while the textarea grows and the viewport is
-    // re-anchored after terminal reflow.
-    let model_header_lines = layout.model_header_lines;
-    // While the panel is active, prioritize filling the height: subtract the help line and the textarea's minimum
-    // rows first, then give the rest to the panel (panel desired height = min(candidate count, COMPLETION_WINDOW) +
-    // 2 for top/bottom borders, capped by available space). The textarea yields to its minimum 1 row (the user is
-    // picking from a list and does not need a large editor). Without a panel, adapt to content and viewport height.
-    let min_textarea_lines = layout.min_textarea_lines;
-    let (textarea_lines, panel_lines) = match completion_panel {
-        Some(panel) => {
-            let desired_panel = (panel.items.len().min(COMPLETION_WINDOW) as u16).saturating_add(2);
-            // Panel usable cap = total height - help - textarea minimum rows.
-            let panel_cap = inner
-                .height
-                .saturating_sub(top_rule_lines)
-                .saturating_sub(help_lines)
-                .saturating_sub(model_header_lines)
-                .saturating_sub(min_textarea_lines);
-            let panel = desired_panel.min(panel_cap).max(1.min(panel_cap));
-            let textarea = inner
-                .height
-                .saturating_sub(top_rule_lines)
-                .saturating_sub(panel)
-                .saturating_sub(model_header_lines)
-                .saturating_sub(help_lines)
-                .max(min_textarea_lines);
-            (textarea, panel)
-        }
-        None => {
-            let textarea = inner
-                .height
-                .saturating_sub(top_rule_lines)
-                .saturating_sub(model_header_lines)
-                .saturating_sub(help_lines)
-                .max(min_textarea_lines);
-            (textarea, 0)
-        }
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(top_rule_lines),
-            Constraint::Length(textarea_lines),
-            Constraint::Length(panel_lines),
-            Constraint::Length(model_header_lines),
-            Constraint::Length(help_lines),
-        ])
-        .split(inner);
-
-    // textarea render area
+    let popup = geometry.popup;
+    let chunks = geometry.chunks;
     let textarea_area = chunks[1];
 
     // Clear the popup area so old borders/text do not linger after a resize
@@ -217,7 +207,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // Bottom model/topic info line: lets the user see the current model and session topic while typing.
     // Draw it in the dedicated bottom chunk (chunks[3], above the help line) so
     // textarea growth does not move it through the editing region.
-    if model_header_lines > 0 {
+    if chunks[3].height > 0 {
         let header_area = chunks[3];
         let mut spans = vec![
             Span::styled(" model: ", Style::default().fg(Color::Rgb(148, 163, 184))),
@@ -266,11 +256,11 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // Keep the existing input color and current-line underline, but apply them
     // only to actual characters so blank cells cannot participate in reflow.
     style_input_text(textarea, &current_lines);
-    // tui-textarea draws its own cursor into the buffer as a reversed space by
-    // default. Keep it hidden because this renderer paints the visible caret after
-    // all widgets have drawn, while the real terminal cursor is parked elsewhere
-    // as the reflow anchor.
-    textarea.set_cursor_render_mode(CursorRenderMode::Hidden);
+    // Draw the editing caret into the buffer. The real terminal cursor is kept
+    // hidden and parked on the viewport's final row by the input loop so that
+    // terminal width reflow cannot split the long help line below the caret
+    // into persistent scrollback rows.
+    textarea.set_cursor_render_mode(CursorRenderMode::Cell);
 
     f.render_widget(&*textarea, textarea_area);
     // Reuse tui-textarea's own rendering plan for the visual caret position.
@@ -494,15 +484,40 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         }
     }
 
-    if let Some(cursor_position) = visual_cursor_position {
-        render_virtual_cursor(f, cursor_position);
-    }
+    visual_cursor_position.map(|position| {
+        Position::new(
+            position.x.saturating_sub(area.x),
+            position.y.saturating_sub(area.y),
+        )
+    })
+}
 
-    // Do not request a frame cursor: Ratatui then keeps the hardware cursor
-    // hidden. The input loop moves that hidden cursor to this tail row after the
-    // draw, making the whole prompt viewport part of the terminal's reflow
-    // anchor rather than pinning it to the logical editing caret.
-    Some(Position::new(0, area.height.saturating_sub(1)))
+pub(in crate::ai::prompt::multiline) fn measure_multiline_cursor_offset(
+    textarea: &TextArea<'_>,
+    viewport_size: Size,
+    status_msg: Option<&str>,
+    completion_panel: Option<&CompletionPanel>,
+    model_label: &str,
+) -> Option<Position> {
+    let area = Rect::new(0, 0, viewport_size.width, viewport_size.height);
+    let current_lines = textarea.lines().to_vec();
+    let current_content = current_lines.join("\n");
+    let geometry = popup_geometry(
+        area,
+        &current_content,
+        current_lines.len(),
+        count_trailing_blank_lines(&current_lines),
+        completion_panel.map(|panel| panel.items.len()),
+        status_msg.is_some(),
+        !model_label.is_empty(),
+    );
+    let mut measured = textarea.clone();
+    measured.set_alignment(Alignment::Left);
+    style_input_text(&mut measured, &current_lines);
+    measured.set_cursor_render_mode(CursorRenderMode::Hidden);
+    let mut buffer = Buffer::empty(area);
+    Widget::render(&measured, geometry.chunks[1], &mut buffer);
+    measured.rendered_cursor_position()
 }
 
 fn completion_item_line(display: &str, selected: bool) -> Line<'_> {
@@ -707,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_prompt_renders_virtual_caret_and_returns_tail_reflow_anchor() {
+    fn empty_prompt_draws_buffer_cursor_and_hides_hardware_cursor() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::with_options(
             backend,
@@ -741,9 +756,6 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("reasoning: max"));
 
-        // The visual caret remains at the textarea's first row, but the resize
-        // anchor is the viewport tail so terminal reflow carries the whole
-        // prompt along with the history above it.
         let popup_width = viewport_area
             .width
             .saturating_sub(2)
@@ -753,12 +765,17 @@ mod tests {
         let visual_caret = Position::new(popup_x + 1, viewport_area.y);
         assert_eq!(
             cursor_position,
-            Some(Position::new(0, viewport_area.height.saturating_sub(1)))
+            Some(Position::new(
+                visual_caret.x.saturating_sub(viewport_area.x),
+                visual_caret.y.saturating_sub(viewport_area.y),
+            ))
         );
-        let caret_modifiers =
-            terminal.backend().buffer()[(visual_caret.x, visual_caret.y)].modifier;
-        assert!(caret_modifiers.contains(Modifier::REVERSED));
-        assert!(caret_modifiers.contains(Modifier::SLOW_BLINK));
+        assert!(!terminal.backend().cursor_visible());
+        // The visible caret is a reversed buffer cell; the input loop parks the
+        // hidden hardware cursor at the viewport tail after the draw.
+        let caret_cell = &terminal.backend().buffer()[(visual_caret.x, visual_caret.y)];
+        assert_eq!(caret_cell.symbol(), " ");
+        assert!(caret_cell.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -842,11 +859,13 @@ mod tests {
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
         let input_x = popup_x + 1;
         let input_y = viewport_area.y;
-        let text_cell = &terminal.backend().buffer()[(input_x, input_y)];
+        // The first character is the reversed buffer cursor, so inspect the
+        // next text cell when checking that input styling does not fill blanks.
+        let text_cell = &terminal.backend().buffer()[(input_x + 1, input_y)];
         let blank_cell = &terminal.backend().buffer()[(input_x + 20, input_y)];
         let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
 
-        assert_eq!(text_cell.symbol(), "h");
+        assert_eq!(text_cell.symbol(), "e");
         assert_eq!(text_cell.fg, Color::Rgb(red, green, blue));
         assert!(text_cell.modifier.contains(Modifier::UNDERLINED));
         assert_eq!(blank_cell.fg, Color::Reset);
@@ -892,14 +911,15 @@ mod tests {
         // 4 CJK characters, width 2 each, total display width 8
         let content = "你好世界";
         let mut textarea = TextArea::from(vec![content.to_string()]);
-        // Move the cursor to the end of the text ("你好世界" → col 4)
+        // Move the cursor to the end of the four-character CJK text.
         textarea.move_cursor(CursorMove::End);
         let mut viewport_area = Rect::ZERO;
+        let mut cursor_offset = None;
 
         terminal
             .draw(|f| {
                 viewport_area = f.area();
-                render_multiline_popup(
+                cursor_offset = render_multiline_popup(
                     f,
                     &mut textarea,
                     None,
@@ -917,14 +937,21 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // The virtual caret at the end of "你好世界" uses tui-textarea's
+        // The buffer caret at the end of the CJK text uses tui-textarea's
         // calculated position, avoiding an independent CJK-width calculation.
         let expected_x = popup_x + 1 + 8;
         let expected = Position::new(expected_x, viewport_area.y);
-        assert!(
-            terminal.backend().buffer()[(expected.x, expected.y)]
-                .modifier
-                .contains(Modifier::REVERSED)
+        assert_eq!(
+            cursor_offset,
+            Some(Position::new(
+                expected.x.saturating_sub(viewport_area.x),
+                expected.y.saturating_sub(viewport_area.y),
+            ))
         );
+        assert!(!terminal.backend().cursor_visible());
+        // The blank cell at the measured caret is rendered in reverse video.
+        let caret_cell = &terminal.backend().buffer()[(expected.x, expected.y)];
+        assert_eq!(caret_cell.symbol(), " ");
+        assert!(caret_cell.modifier.contains(Modifier::REVERSED));
     }
 }

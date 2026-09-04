@@ -1596,7 +1596,9 @@ pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstituti
                 substitutions.push(SafeShellSubstitution {
                     start: word.start,
                     end: word.end,
-                    kind: SafeShellSubstitutionKind::FileRead { path: path.to_string() },
+                    kind: SafeShellSubstitutionKind::FileRead {
+                        path: path.to_string(),
+                    },
                 });
                 continue;
             }
@@ -2053,7 +2055,7 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
                 return Err(format!(
                     "python `{program} -c` code cannot be verified ({reason}); \
                      pass a literal quoted code string or write a script file instead"
-                ))
+                ));
             }
         }
     } else if is_interpreter_program(program) && shell_c_option_present(program, command_tokens) {
@@ -2132,7 +2134,7 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
                 Err(reason) => {
                     return Err(format!(
                         "python `{nested} -c` code cannot be verified via '{program}' ({reason})"
-                    ))
+                    ));
                 }
             }
         } else if (is_shell_program(nested) || is_interpreter_program(nested))
@@ -2157,7 +2159,7 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
                     return Err(format!(
                         "python `{eff_program} -c` code cannot be verified inside '{command}' \
                          ({reason})"
-                    ))
+                    ));
                 }
             }
         } else if (is_shell_program(eff_program) || is_interpreter_program(eff_program))
@@ -2214,9 +2216,9 @@ pub(crate) fn validate_execute_command(command: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_subcommand_index, effective_command_tokens, safe_shell_substitutions,
-        split_unquoted_command_segments, split_unquoted_segments, tokenize_shell_words,
-        validate_no_injection_surface, SafeShellSubstitutionKind, ShellJoin,
+        SafeShellSubstitutionKind, ShellJoin, command_subcommand_index, effective_command_tokens,
+        safe_shell_substitutions, split_unquoted_command_segments, split_unquoted_segments,
+        tokenize_shell_words, validate_no_injection_surface,
     };
 
     // ---- split_unquoted_segments ----
@@ -2489,7 +2491,10 @@ mod tests {
                 path: "/tmp/dsl.json".to_string()
             }]
         );
-        assert_eq!(safe_shell_substitutions(r#"bytedcli --dsl "$(cat /tmp/dsl.json)""#).len(), 1);
+        assert_eq!(
+            safe_shell_substitutions(r#"bytedcli --dsl "$(cat /tmp/dsl.json)""#).len(),
+            1
+        );
         assert_eq!(
             safe_shell_substitutions(r#"echo "$(cat /tmp/a)" "$(cat /tmp/b)""#).len(),
             2

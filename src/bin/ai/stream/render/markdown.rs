@@ -444,8 +444,8 @@ impl MarkdownStreamRenderer {
         let rendered = self.consume_line(&line, self.line_preview_emitted);
 
         self.line_preview_emitted = false;
-            self.line_preview_height = 0;
-            self.line_preview_height_stale = false;
+        self.line_preview_height = 0;
+        self.line_preview_height_stale = false;
         self.code_preview_segment_width = 0;
 
         if !rendered.is_empty() {
@@ -487,8 +487,8 @@ impl MarkdownStreamRenderer {
         // 屏幕，换行后再追加 Unicode 成品，造成重复内容。行首空白也先短暂缓冲；
         // 一旦确认不是数学分隔符，就一次性补发此前缓存的前缀。
         if !self.in_code_block {
-            let is_math_candidate = self.math_block_delimiter.is_some()
-                || self.math_candidate_tail.is_math_candidate();
+            let is_math_candidate =
+                self.math_block_delimiter.is_some() || self.math_candidate_tail.is_math_candidate();
             if is_math_candidate {
                 self.math_line_candidate_buffered = true;
                 return Ok(());
@@ -1395,6 +1395,36 @@ fn raw_terminal_cols() -> usize {
     }
 
     80
+}
+
+/// 终端可见视口的物理行数（**实时**行高）。
+///
+/// 与 [`raw_terminal_cols`] 同源：`a` 是常驻进程，`LINES` 环境变量只是启动那一刻
+/// 的快照，面板被拖矮后往往比真实高度大。折叠预览窗靠相对光标（`\x1b[nA`）就地
+/// 重绘，而 `CUU` 在视口顶部会被终端钳制、够不到已滚入 scrollback 的旧行；因此
+/// 必须用实时行高把窗口高度钳制在视口内，真实 tty 一律以 ioctl 为准，`LINES`
+/// 仅作非 tty（测试 / 管道）回退。
+pub(in crate::ai) fn raw_terminal_rows() -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdout().as_raw_fd();
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+        if rc == 0 && ws.ws_row > 0 {
+            return ws.ws_row as usize;
+        }
+    }
+
+    if let Some(rows) = std::env::var("LINES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        && rows > 0
+    {
+        return rows;
+    }
+
+    24
 }
 
 fn code_block_gutter_width(

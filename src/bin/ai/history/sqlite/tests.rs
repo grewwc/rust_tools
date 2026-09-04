@@ -1,7 +1,7 @@
 use super::*;
+use rusqlite::Connection;
 use serde_json::Value;
 use std::io;
-use rusqlite::Connection;
 
 #[test]
 fn sqlite_error_classifies_transient_failures_as_retryable() {
@@ -13,8 +13,7 @@ fn sqlite_error_classifies_transient_failures_as_retryable() {
         rusqlite::ffi::SQLITE_IOERR,
         rusqlite::ffi::SQLITE_IOERR_FSTAT,
     ] {
-        let error =
-            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(result_code), None);
+        let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(result_code), None);
         assert_eq!(
             sqlite_error_kind(&error),
             io::ErrorKind::WouldBlock,
@@ -280,8 +279,7 @@ fn stale_patch_targets_survive_history_replacement_and_clear_with_session() {
     let path = dir.join("history.sqlite");
     append_history_sqlite(&path, vec![msg("user", "before compression")]).unwrap();
 
-    let targets =
-        FxHashSet::from_iter([PathBuf::from("/tmp/a.rs"), PathBuf::from("/tmp/b.rs")]);
+    let targets = FxHashSet::from_iter([PathBuf::from("/tmp/a.rs"), PathBuf::from("/tmp/b.rs")]);
     write_stale_patch_targets_sqlite(&path, &targets).unwrap();
     assert_eq!(
         read_stale_patch_targets_sqlite(&path).unwrap(),
@@ -583,8 +581,7 @@ fn truncating_by_user_turn_prunes_removed_tool_outcomes() {
         ],
     )
     .unwrap();
-    append_tool_execution_outcomes_sqlite(&path, &[outcome("call-1"), outcome("call-2")])
-        .unwrap();
+    append_tool_execution_outcomes_sqlite(&path, &[outcome("call-1"), outcome("call-2")]).unwrap();
 
     truncate_messages_to_user_turns_sqlite(&path, 1).unwrap();
 
@@ -868,15 +865,26 @@ fn wait_wake_notes_coalesce_keeps_latest_in_sqlite_history() {
         &path,
         vec![
             msg("user", "goal"),
-            msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a", "task_b"], "checkpoint-1")),
-            msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a", "task_b"], "checkpoint-2")),
-            msg(ROLE_INTERNAL_NOTE, &wake_note_text(7, &["task_x"], "checkpoint-3")),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                &wake_note_text(6, &["task_a", "task_b"], "checkpoint-1"),
+            ),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                &wake_note_text(6, &["task_a", "task_b"], "checkpoint-2"),
+            ),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                &wake_note_text(7, &["task_x"], "checkpoint-3"),
+            ),
         ],
     )
     .unwrap();
 
-    let latest =
-        msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a", "task_b"], "checkpoint-4"));
+    let latest = msg(
+        ROLE_INTERNAL_NOTE,
+        &wake_note_text(6, &["task_a", "task_b"], "checkpoint-4"),
+    );
     assert!(coalesce_repeated_wait_wake_notes_sqlite(&path, &latest).unwrap());
     // The caller then appends the latest one at the tail.
     append_history_sqlite(&path, vec![latest]).unwrap();
@@ -920,8 +928,10 @@ fn wait_wake_coalesce_sqlite_window_is_last_total_messages() {
     );
     append_history_sqlite(&path, history).unwrap();
 
-    let latest =
-        msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a"], "checkpoint-new"));
+    let latest = msg(
+        ROLE_INTERNAL_NOTE,
+        &wake_note_text(6, &["task_a"], "checkpoint-new"),
+    );
     assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &latest).unwrap());
 
     let notes: Vec<_> = read_all_messages_sqlite(&path)
@@ -931,7 +941,13 @@ fn wait_wake_coalesce_sqlite_window_is_last_total_messages() {
         .collect();
     // The old waiting note outside the window is retained and not wrongly deleted.
     assert_eq!(notes.len(), 1);
-    assert!(notes[0].content.as_str().unwrap().contains("checkpoint-old"));
+    assert!(
+        notes[0]
+            .content
+            .as_str()
+            .unwrap()
+            .contains("checkpoint-old")
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -952,13 +968,19 @@ fn wait_wake_coalesce_sqlite_is_noop_when_nothing_matches() {
         &path,
         vec![
             msg("user", "goal"),
-            msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a"], "checkpoint-1")),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                &wake_note_text(6, &["task_a"], "checkpoint-1"),
+            ),
         ],
     )
     .unwrap();
 
     // Same pid but a different task set: the identity differs, so no dedup.
-    let other = msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_z"], "checkpoint-x"));
+    let other = msg(
+        ROLE_INTERNAL_NOTE,
+        &wake_note_text(6, &["task_z"], "checkpoint-x"),
+    );
     assert!(!coalesce_repeated_wait_wake_notes_sqlite(&path, &other).unwrap());
 
     // Non-internal_note message: the fast path does no IO.

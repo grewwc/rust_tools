@@ -133,15 +133,17 @@ impl SubagentStatusLine {
     pub(super) fn refresh(&mut self, app: &App) {
         let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
         let current_pid = std::process::id() as i32;
-        let mut session_ids = crate::ai::driver::session_pid::scan_all_session_pids(
-            store.sessions_root(),
-        )
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, pid, alive)| *alive && *pid == current_pid)
-        .map(|(session_id, _, _)| session_id)
-        .collect::<Vec<_>>();
-        if !session_ids.iter().any(|session_id| session_id == &app.session_id) {
+        let mut session_ids =
+            crate::ai::driver::session_pid::scan_all_session_pids(store.sessions_root())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, pid, alive)| *alive && *pid == current_pid)
+                .map(|(session_id, _, _)| session_id)
+                .collect::<Vec<_>>();
+        if !session_ids
+            .iter()
+            .any(|session_id| session_id == &app.session_id)
+        {
             session_ids.push(app.session_id.clone());
         }
         session_ids.sort();
@@ -685,7 +687,8 @@ pub(super) fn dispatch_background_batch(
             }
         };
         task_app.session_history_file = effective_history;
-        let _ = crate::ai::driver::commands::session::restore_prune_marks_for_history(&mut task_app);
+        let _ =
+            crate::ai::driver::commands::session::restore_prune_marks_for_history(&mut task_app);
         let task_driver_ctx = runtime_ctx::DriverContext::from_app_snapshot(
             &task_app,
             task_mcp.clone(),

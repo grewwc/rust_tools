@@ -1,7 +1,7 @@
 //! Tests for the `round` cluster.
 
-use super::common::*;
 use super::super::*;
+use super::common::*;
 
 #[test]
 fn tool_call_round_no_longer_requests_terminal_dedupe() {
@@ -276,8 +276,7 @@ fn registered_tool_middleware_intercepts_real_dispatch_round() {
                     >,
                 > {
                     Box::pin(async move {
-                        self.calls
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         self.inner.execute(app, tool_calls).await
                     })
                 }
@@ -291,8 +290,9 @@ fn registered_tool_middleware_intercepts_real_dispatch_round() {
 
     let mut app = test_app_with_tools(&["execute_command"]);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    app.tool_middlewares
-        .push(Arc::new(CountingMiddleware { calls: calls.clone() }));
+    app.tool_middlewares.push(Arc::new(CountingMiddleware {
+        calls: calls.clone(),
+    }));
 
     let mcp = crate::ai::mcp::McpClient::new();
     let shared_mcp = Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
@@ -469,7 +469,11 @@ fn tool_round_releases_live_mcp_lock_before_dispatch() {
         &mut turn_had_tool_error,
     );
 
-    assert!(result.is_ok(), "tool round should complete: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "tool round should complete: {:?}",
+        result.err()
+    );
     assert!(
         lock_was_available.load(std::sync::atomic::Ordering::SeqCst),
         "tool dispatch must not retain the live MCP mutex; a synchronous task subagent needs it while preparing context"

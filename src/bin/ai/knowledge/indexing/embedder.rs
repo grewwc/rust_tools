@@ -142,7 +142,10 @@ pub fn is_ready() -> bool {
 
 /// Model name of the installed provider (used to fingerprint the vector index).
 pub fn current_model() -> Option<&'static str> {
-    PROVIDER.get().and_then(|p| p.as_ref()).map(|p| p.model.as_str())
+    PROVIDER
+        .get()
+        .and_then(|p| p.as_ref())
+        .map(|p| p.model.as_str())
 }
 
 /// Embed a single text for semantic search.

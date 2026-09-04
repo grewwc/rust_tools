@@ -1,7 +1,7 @@
 //! Tests for the `final_citations` cluster.
 
-use super::common::*;
 use super::super::*;
+use super::common::*;
 
 #[test]
 fn final_response_citation_parser_ignores_urls_and_non_file_colon_forms() {
@@ -117,11 +117,10 @@ fn final_citation_resolves_basename_from_observed_tool_path() {
     ))];
 
     let base_dirs = final_citation_base_dirs(&messages, Some(&root));
-    assert!(unvalidated_final_response_citations_with_bases(
-        "See output_rendering.py:2.",
-        &base_dirs,
-    )
-    .is_empty());
+    assert!(
+        unvalidated_final_response_citations_with_bases("See output_rendering.py:2.", &base_dirs,)
+            .is_empty()
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -185,7 +184,8 @@ fn inline_execute_command_cd_dir_rejects_newlines_and_shell_comments() {
             serde_json::json!({ "command": command }),
         ))];
         assert!(
-            !final_citation_base_dirs(&messages, None).contains(&std::path::PathBuf::from("/tmp/repository"))
+            !final_citation_base_dirs(&messages, None)
+                .contains(&std::path::PathBuf::from("/tmp/repository"))
         );
     }
 
@@ -230,8 +230,7 @@ fn final_response_citation_gate_reopens_once_then_warns_for_an_invalid_line() {
         assert!(messages.iter().any(|message| {
             message.role == ROLE_INTERNAL_NOTE
                 && message.content.as_str().is_some_and(|text| {
-                    text.starts_with(FINAL_CITATION_RETRY_MARKER)
-                        && text.contains("`src/lib.rs:9`")
+                    text.starts_with(FINAL_CITATION_RETRY_MARKER) && text.contains("`src/lib.rs:9`")
                 })
         }));
         assert_eq!(
@@ -245,11 +244,13 @@ fn final_response_citation_gate_reopens_once_then_warns_for_an_invalid_line() {
             ),
             FinalCitationGateAction::Warn
         );
-        assert!(unvalidated_final_response_citations(
-            "Implemented the change in src/lib.rs:2.",
-            Some(&effective_cwd)
-        )
-        .is_empty());
+        assert!(
+            unvalidated_final_response_citations(
+                "Implemented the change in src/lib.rs:2.",
+                Some(&effective_cwd)
+            )
+            .is_empty()
+        );
     });
 
     let _ = fs::remove_dir_all(root);
@@ -342,12 +343,13 @@ fn final_response_citation_gate_warns_only_after_one_recovery_final() {
         );
         assert!(turn_messages.iter().any(|message| {
             message.role == ROLE_INTERNAL_NOTE
-                && message.content.as_str().is_some_and(|text| {
-                    text.contains(FINAL_CITATION_UNVERIFIED_NOTE)
-                })
+                && message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.contains(FINAL_CITATION_UNVERIFIED_NOTE))
         }));
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
     });
 }
 

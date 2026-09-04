@@ -554,7 +554,10 @@ fn render_selection(
             let line_index = file.scored[per_file_cursor[file_pos]].0;
             per_file_cursor[file_pos] += 1;
             *root_consumed.entry(file.root_idx).or_insert(0) += 1;
-            chosen.push(Candidate { file_pos, line_index });
+            chosen.push(Candidate {
+                file_pos,
+                line_index,
+            });
         }
         if settled == files.len() {
             break;
@@ -912,7 +915,10 @@ mod tests {
         // must stay visible under the same tiny budget.
         let sections = out.matches("match(es) in").count();
         assert_eq!(sections, 4, "all four hit roots visible: {out}");
-        assert!(out.contains("unique-marker"), "minority root visible: {out}");
+        assert!(
+            out.contains("unique-marker"),
+            "minority root visible: {out}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1060,7 +1066,11 @@ mod tests {
         let dir = make_temp_dir();
         let tool_dir = dir.join("tool-overflow-compressed");
         fs::create_dir_all(&tool_dir).unwrap();
-        fs::write(tool_dir.join("huge-log.txt"), &"spam spam spam\n".repeat(500)).unwrap();
+        fs::write(
+            tool_dir.join("huge-log.txt"),
+            &"spam spam spam\n".repeat(500),
+        )
+        .unwrap();
         fs::write(tool_dir.join("small-note.txt"), "spam context survivor\n").unwrap();
 
         let mut p = params("spam");
@@ -1068,7 +1078,10 @@ mod tests {
         p.context_lines = 0;
         p.max_results = 50;
         let out = run_overflow_search(&dir, &p).unwrap();
-        assert!(out.contains("small-note.txt"), "smaller file survives: {out}");
+        assert!(
+            out.contains("small-note.txt"),
+            "smaller file survives: {out}"
+        );
         assert!(
             out.contains("not shown"),
             "per-file cap hides surplus lines: {out}"
@@ -1133,14 +1146,21 @@ mod tests {
         // line must be long enough that that many blow past MAX_OUTPUT_CHARS.
         // '好' is 3 bytes and straddles the byte cap regardless of gutter width.
         let line = format!("needle {}\n", "好".repeat(1_000));
-        fs::write(tool_dir.join("wide.txt"), line.repeat(MAX_SNIPPETS_PER_FILE + 4)).unwrap();
+        fs::write(
+            tool_dir.join("wide.txt"),
+            line.repeat(MAX_SNIPPETS_PER_FILE + 4),
+        )
+        .unwrap();
 
         let mut p = params("needle");
         p.scope = SearchScope::ToolOutputs;
         p.context_lines = 0;
         p.max_results = MAX_MATCHES;
         let out = run_overflow_search(&dir, &p).unwrap();
-        assert!(out.len() > MAX_OUTPUT_CHARS, "test must exercise truncation");
+        assert!(
+            out.len() > MAX_OUTPUT_CHARS,
+            "test must exercise truncation"
+        );
         assert!(
             out.contains("output truncated at character limit"),
             "truncation notice must survive"

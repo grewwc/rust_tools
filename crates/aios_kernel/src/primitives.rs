@@ -520,16 +520,16 @@ pub trait LlmOps {
     /// Query a model's price (unknown models return zero).
     fn llm_price(&self, model: &str) -> LlmModelPrice;
 
-/// Charge one LLM call's usage report to pid's account:
-///   1) convert it to cost_micros (via llm_price(model))
-///   2) advance tokens_in/tokens_out/cost_micros through rusage_charge
-///   3) write a name="llm.account" event into the trace ring
-///   4) append a [`LlmUsageRecord`] to the bounded LLM usage ledger (for external drain / persistence)
+    /// Charge one LLM call's usage report to pid's account:
+    ///   1) convert it to cost_micros (via llm_price(model))
+    ///   2) advance tokens_in/tokens_out/cost_micros through rusage_charge
+    ///   3) write a name="llm.account" event into the trace ring
+    ///   4) append a [`LlmUsageRecord`] to the bounded LLM usage ledger (for external drain / persistence)
     fn llm_account(&mut self, pid: u64, report: LlmUsageReport) -> LlmAccountOutcome;
 
-/// All LLM usage records from `since_seq` onward (ascending). Used for external drain /
-/// persistence.
-/// Returned records have seq strictly greater than `since_seq`.
+    /// All LLM usage records from `since_seq` onward (ascending). Used for external drain /
+    /// persistence.
+    /// Returned records have seq strictly greater than `since_seq`.
     fn llm_usage_drain_since(&self, since_seq: u64) -> Vec<LlmUsageRecord>;
 
     /// Current head seq of the ledger (for initializing / aligning the drain cursor).

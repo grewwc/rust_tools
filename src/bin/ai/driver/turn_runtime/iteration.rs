@@ -7,14 +7,11 @@ use std::time::Duration;
 
 use crate::ai::{
     driver::{drain_response, input, skill_runtime},
-    history::{
-        Message, ROLE_INTERNAL_NOTE, compress::llm_prune, last_real_user_index,
-    },
+    history::{Message, ROLE_INTERNAL_NOTE, compress::llm_prune, last_real_user_index},
     mcp::McpClient,
     middleware::request::build_llm_client_chain,
     ports::{DefaultLlmClient, LlmClient, LlmRequest},
-    request,
-    stream,
+    request, stream,
     tools::task_tools,
     types::{App, StreamOutcome, StreamResult},
 };
@@ -219,7 +216,10 @@ fn segment_write_kind(tokens: &[String]) -> SegmentWriteKind {
             }
         }
         "cargo" => {
-            if matches!(subcommand, "check" | "test" | "clippy" | "build" | "metadata") {
+            if matches!(
+                subcommand,
+                "check" | "test" | "clippy" | "build" | "metadata"
+            ) {
                 SegmentWriteKind::ReadOnly
             } else {
                 SegmentWriteKind::WriteIntended
@@ -475,8 +475,7 @@ fn analyze_execute_command(command: &str, initial_cwd: &Path) -> ExecuteCommandA
         // as a project change from the project cwd alone; unknown programs (python3/node/...) have no write
         // evidence, and the cwd fallback would misjudge read-only checks as changes, tripping the completion evidence gate
         // (`successful_post_mutation_verification` gets reset) and making the model repeat its conclusion.
-        let known_writer =
-            matches!(write_kind, SegmentWriteKind::WriteIntended) || known_mutator;
+        let known_writer = matches!(write_kind, SegmentWriteKind::WriteIntended) || known_mutator;
         let mutation = has_redirection || !read_only;
         if !mutation {
             analysis.effects.push(ExecuteCommandSegmentEffect {
@@ -721,8 +720,8 @@ pub(super) fn refresh_skill_turn_for_iteration(
         )
     };
     let project_targets = project_instruction_target_paths(messages);
-    let scoped_project_instructions_ready = new_skill_turn
-        .push_scoped_project_instructions(required_project_targets, &project_targets);
+    let scoped_project_instructions_ready =
+        new_skill_turn.push_scoped_project_instructions(required_project_targets, &project_targets);
     if inherited_restore.is_some() {
         new_skill_turn.set_restore_agent_context(inherited_restore);
     }
@@ -859,7 +858,9 @@ fn handle_request_error(
         eprintln!("[Error] {}", err_text);
     }
     if err_text.contains("function.arguments") && err_text.contains("must be in JSON format") {
-        eprintln!("[Info] Model returned invalid tool arguments; skipped this round and continued to the next round.");
+        eprintln!(
+            "[Info] Model returned invalid tool arguments; skipped this round and continued to the next round."
+        );
     } else {
         eprintln!("[Info] Request failed this round; session kept alive, you can keep asking.");
     }
@@ -982,13 +983,14 @@ fn reactive_shrink_context_after_overflow(
         store.session_assets_dir(&app.session_id)
     };
     let drained = std::mem::take(messages);
-    let (compressed, before, after) =
-        crate::ai::history::mid_turn_compress(
-            drained,
-            target_chars,
-            Some(overflow_dir.as_path()),
-            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
-        );
+    let (compressed, before, after) = crate::ai::history::mid_turn_compress(
+        drained,
+        target_chars,
+        Some(overflow_dir.as_path()),
+        crate::ai::driver::runtime_ctx::effective_cwd()
+            .ok()
+            .as_deref(),
+    );
     *messages = compressed;
     // A dead end here usually means the oversized body is the current user
     // message itself: compression policies never truncate user messages. As a
@@ -1024,8 +1026,8 @@ fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Messa
         &app.prune_marks,
         Some(overflow_dir.as_path()),
     );
-    let protocol_injected = !had_protocol
-        && messages.iter().any(llm_prune::is_prune_protocol_message);
+    let protocol_injected =
+        !had_protocol && messages.iter().any(llm_prune::is_prune_protocol_message);
     if protocol_injected && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         // Counted after the projection update so results offloaded by this
         // very call are not advertised as still-listed candidates.
@@ -1181,7 +1183,9 @@ async fn request_model_response(
                 MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
                 MID_TURN_LLM_SUMMARY_MAX_CHARS,
                 app.config.history_max_chars,
-                crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+                crate::ai::driver::runtime_ctx::effective_cwd()
+                    .ok()
+                    .as_deref(),
             )
             .await;
         *messages = after_msgs;
@@ -1557,11 +1561,11 @@ pub(super) async fn execute_turn_iteration(
                     }
 
                     request::clear_stale_request_interrupt_before_request(app);
-        let llm_client = build_llm_request_client(app);
+                    let llm_client = build_llm_request_client(app);
                     let retry_request = if force_final_response {
-            send_llm_request(&*llm_client, app, &actual_model, messages, false).await
+                        send_llm_request(&*llm_client, app, &actual_model, messages, false).await
                     } else {
-            send_llm_request(&*llm_client, app, &actual_model, messages, true).await
+                        send_llm_request(&*llm_client, app, &actual_model, messages, true).await
                     };
                     match retry_request {
                         Ok(new_response) => {
@@ -1664,8 +1668,17 @@ mod tests {
                     &'a self,
                     app: &'a mut App,
                     req: LlmRequest,
-                ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>
-                {
+                ) -> Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    LlmResponse,
+                                    Box<dyn std::error::Error + Send + Sync>,
+                                >,
+                            > + Send
+                            + 'a,
+                    >,
+                > {
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     self.inner.send(app, req)
                 }
@@ -1692,12 +1705,22 @@ mod tests {
                     &'a self,
                     _app: &'a mut App,
                     _req: LlmRequest,
-                ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>
-                {
+                ) -> Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    LlmResponse,
+                                    Box<dyn std::error::Error + Send + Sync>,
+                                >,
+                            > + Send
+                            + 'a,
+                    >,
+                > {
                     Box::pin(async {
                         Err(Box::new(request::RequestError::cancelled(
                             "short-circuited by test middleware".to_string(),
-                        )) as Box<dyn std::error::Error + Send + Sync>)
+                        ))
+                            as Box<dyn std::error::Error + Send + Sync>)
                     })
                 }
             }
@@ -1709,9 +1732,10 @@ mod tests {
     async fn llm_middlewares_chain_used_by_real_request_path() {
         let mut app = crate::ai::middleware::test_util::test_app();
         let calls = Arc::new(AtomicUsize::new(0));
-        app.llm_middlewares.push(Arc::new(CountingRequestMiddleware {
-            calls: Arc::clone(&calls),
-        }));
+        app.llm_middlewares
+            .push(Arc::new(CountingRequestMiddleware {
+                calls: Arc::clone(&calls),
+            }));
 
         // The chain must come from app.llm_middlewares; with an empty endpoint the inner DefaultLlmClient
         // request is guaranteed to fail, but the middleware send is definitely invoked (proving the production path really goes through the chain).
@@ -1724,14 +1748,18 @@ mod tests {
     #[tokio::test]
     async fn llm_middleware_short_circuit_error_surfaces_as_request_error() {
         let mut app = crate::ai::middleware::test_util::test_app();
-        app.llm_middlewares.push(Arc::new(ShortCircuitRequestMiddleware));
+        app.llm_middlewares
+            .push(Arc::new(ShortCircuitRequestMiddleware));
 
         let client = build_llm_request_client(&app);
         let mut messages = Vec::new();
         let err = send_llm_request(&*client, &mut app, "gpt-4o", &mut messages, true)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("short-circuited by test middleware"));
+        assert!(
+            err.to_string()
+                .contains("short-circuited by test middleware")
+        );
     }
 
     #[test]

@@ -3,12 +3,11 @@ use super::{
     DispatchOutcomeTag, ProcessDispatchMeta, SCHED_COOLDOWN_EPOCHS_DEFAULT,
     SCHEDULER_DISPATCH_META, SCHEDULER_TICK_DURATION, SchedulerClock, background_execute_limit,
     background_pop_limit, build_background_process_question, decode_background_process_task_goal,
-    has_pending_foreground_process, one_shot_cli_mode,
-    reset_scheduler_test_state, resolve_background_subagent_override,
-    resolve_startup_session_choice, resolve_startup_session_choice_with_selector,
-    should_preload_mcp, should_publish_subagent_task_result,
-    should_resume_suspended_terminal_session, should_suspend_session_on_sigint,
-    update_dispatch_meta,
+    has_pending_foreground_process, one_shot_cli_mode, reset_scheduler_test_state,
+    resolve_background_subagent_override, resolve_startup_session_choice,
+    resolve_startup_session_choice_with_selector, should_preload_mcp,
+    should_publish_subagent_task_result, should_resume_suspended_terminal_session,
+    should_suspend_session_on_sigint, update_dispatch_meta,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 use crate::ai::cli::ParsedCli;
@@ -796,7 +795,6 @@ fn startup_choice_rejects_resume_and_new_session_together() {
     assert!(err.to_string().contains("--resume"));
     assert!(err.to_string().contains("--new-session"));
 }
-
 
 #[test]
 fn read_recent_history_sqlite_preserves_previous_ordering() {

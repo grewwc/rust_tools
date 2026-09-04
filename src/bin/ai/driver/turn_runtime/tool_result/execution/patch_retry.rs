@@ -3,7 +3,9 @@
 
 use super::*;
 
-pub(in crate::ai::driver::turn_runtime) fn extract_apply_patch_target_paths_from_patch(patch: &str) -> Vec<PathBuf> {
+pub(in crate::ai::driver::turn_runtime) fn extract_apply_patch_target_paths_from_patch(
+    patch: &str,
+) -> Vec<PathBuf> {
     crate::ai::tools::apply_patch_target_paths_from_patch(patch)
         .into_iter()
         .map(|path| FileStore::new(path).path().to_path_buf())
@@ -135,7 +137,9 @@ pub(in crate::ai::driver::turn_runtime) fn patch_failure_diagnostic(result: &str
         .map_or(result, |(before, _)| before)
 }
 
-pub(in crate::ai::driver::turn_runtime) fn direct_patch_failure_is_ambiguous(diagnostic: &str) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn direct_patch_failure_is_ambiguous(
+    diagnostic: &str,
+) -> bool {
     diagnostic
         .trim_start()
         .strip_prefix("Error: apply_patch failed: ")
@@ -168,7 +172,9 @@ pub(in crate::ai::driver::turn_runtime) fn patch_failure_stale_targets(
     }
 }
 
-pub(in crate::ai::driver::turn_runtime) fn patch_target_paths(tool_call: &ToolCall) -> Vec<PathBuf> {
+pub(in crate::ai::driver::turn_runtime) fn patch_target_paths(
+    tool_call: &ToolCall,
+) -> Vec<PathBuf> {
     let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments) else {
         return Vec::new();
     };
@@ -185,7 +191,9 @@ pub(in crate::ai::driver::turn_runtime) fn patch_target_paths(tool_call: &ToolCa
         .unwrap_or_default()
 }
 
-pub(in crate::ai::driver::turn_runtime) fn file_tool_target_path(tool_call: &ToolCall) -> Option<PathBuf> {
+pub(in crate::ai::driver::turn_runtime) fn file_tool_target_path(
+    tool_call: &ToolCall,
+) -> Option<PathBuf> {
     let args = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments).ok()?;
     let target = args
         .get("file_path")

@@ -1,7 +1,7 @@
 //! Tests for the `final_recovery` cluster.
 
-use super::common::*;
 use super::super::*;
+use super::common::*;
 
 #[test]
 fn task_evidence_reopen_marker_counts_and_survives_reopen_retain() {
@@ -40,7 +40,10 @@ fn task_evidence_reopen_quota_is_bounded() {
         );
         push_task_evidence_reopen_marker(&mut messages, attempt);
     }
-    assert_eq!(task_evidence_reopen_count(&messages), TASK_EVIDENCE_REOPEN_MAX);
+    assert_eq!(
+        task_evidence_reopen_count(&messages),
+        TASK_EVIDENCE_REOPEN_MAX
+    );
     assert!(
         task_evidence_reopen_count(&messages) >= TASK_EVIDENCE_REOPEN_MAX,
         "after the cap, reopen budget is exhausted and the turn finalizes"
@@ -303,9 +306,10 @@ fn reasoning_only_final_response_stops_after_bounded_post_synthesis_retries() {
             .iter()
             .filter(|message| {
                 message.role == ROLE_INTERNAL_NOTE
-                    && message.content.as_str().is_some_and(|text| {
-                        text.starts_with(REASONING_ONLY_SYNTHESIS_RETRY_MARKER)
-                    })
+                    && message
+                        .content
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(REASONING_ONLY_SYNTHESIS_RETRY_MARKER))
             })
             .count()
     }
@@ -595,8 +599,7 @@ fn forced_final_hallucinated_tool_call_is_rejected_without_consuming_quota() {
     let mut app = test_app_with_tools(&["read_file"]);
     let pid = {
         let mut os = app.os.lock().unwrap();
-        let pid =
-            os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        let pid = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
         let mut lim = ResourceLimit::unlimited();
         lim.max_tool_calls = 64;
         os.rlimit_set(pid, lim).unwrap();
@@ -607,8 +610,7 @@ fn forced_final_hallucinated_tool_call_is_rejected_without_consuming_quota() {
     let path = std::env::temp_dir().join(format!("forced-final-{}.txt", pid));
     std::fs::write(&path, "hello").unwrap();
 
-    let shared_mcp =
-        std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
     let mut messages = Vec::new();
     let mut turn_messages = Vec::new();
     let mut persisted_turn_messages = 0usize;
@@ -781,9 +783,10 @@ fn unsupported_read_only_phase_limit_claim_reopens_once_with_tools() {
         messages
             .iter()
             .filter(|message| {
-                message.content.as_str().is_some_and(|text| {
-                    text.starts_with(UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER)
-                })
+                message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER))
             })
             .count(),
         1
@@ -980,9 +983,7 @@ fn prose_sentence_counter_ignores_code_symbol_dots() {
     // `driver/mod.rs`, `.ok().flatten()`, and line ranges like `1057-1080`, the `.`
     // is never followed by whitespace or end-of-text.
     assert_eq!(
-        prose_sentence_terminator_count(
-            "检查 driver/mod.rs:1057-1080 的 .ok().flatten() 吞错逻辑"
-        ),
+        prose_sentence_terminator_count("检查 driver/mod.rs:1057-1080 的 .ok().flatten() 吞错逻辑"),
         0
     );
     // Genuine sentence endings (. followed by whitespace, or the CJK
@@ -1027,11 +1028,7 @@ fn dangling_final_detects_mid_introduction_colon_stop() {
     }];
     let final_text = "11 个文件与 review.md 声称一致。现在逐项检查 review.md 列出的问题。先看 P1-a（图片解析失败静默丢失）——检查 `driver/mod.rs:1057-1080` 的 `.ok().flatten()` 吞错逻辑：";
     assert!(
-        looks_like_dangling_action_final(
-            "分析这个 agent 的会话历史",
-            &turn_messages,
-            final_text,
-        ),
+        looks_like_dangling_action_final("分析这个 agent 的会话历史", &turn_messages, final_text,),
         "以冒号收尾、代码符号密集的悬空预告必须被识别为 dangling final"
     );
 }

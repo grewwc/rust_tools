@@ -260,7 +260,11 @@ fn project_instruction_docs_cache_invalidates_on_user_config_change() {
     // Rewrite only the config file: the mtime advances and the length changes, so the
     // fingerprint mismatch must force a reload even though the repo-root files are unchanged.
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    fs::write(&cfg_md, "cfg-v2: use cargo and longer content for len change.\n").unwrap();
+    fs::write(
+        &cfg_md,
+        "cfg-v2: use cargo and longer content for len change.\n",
+    )
+    .unwrap();
 
     let after = with_fake_home(&fake_home, || load_project_instruction_docs_from(&root));
     assert!(
@@ -303,7 +307,9 @@ fn project_instruction_docs_do_not_load_other_projects_config_dir() {
     );
     assert!(docs[0].content.contains("Current project rules"));
     assert!(
-        !docs.iter().any(|doc| doc.content.contains("Other project rules")),
+        !docs
+            .iter()
+            .any(|doc| doc.content.contains("Other project rules")),
         "config instructions for a different project must not be loaded"
     );
 

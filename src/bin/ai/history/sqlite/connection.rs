@@ -1,7 +1,6 @@
 use std::{
     cell::RefCell,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };

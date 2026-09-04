@@ -120,17 +120,20 @@ fn execute_inner_shell_command(inner: &str, cwd: Option<&str>) -> Result<String,
         ));
     }
     if stdout.contains('\0') {
-        return Err(format!(
-            "substitution '{inner}' output contains NUL bytes"
-        ));
+        return Err(format!("substitution '{inner}' output contains NUL bytes"));
     }
     // bash 的 $(...) 会剥离所有末尾换行，这里复刻该语义
-    Ok(stdout.trim_end_matches(|c| c == '\n' || c == '\r').to_string())
+    Ok(stdout
+        .trim_end_matches(|c| c == '\n' || c == '\r')
+        .to_string())
 }
 
 /// 对审计层已证明安全的无害 `"$(...)"` 做数据物化，支持 `cat` 字面量与通用无害命令。
 /// 随后仍对替换后的命令做完整审计，因此替换结果若成为被禁程序名或危险参数仍会被拦截。
-fn materialize_safe_shell_substitutions(command: &str, cwd: Option<&str>) -> Result<String, String> {
+fn materialize_safe_shell_substitutions(
+    command: &str,
+    cwd: Option<&str>,
+) -> Result<String, String> {
     let substitutions = super::audit::safe_shell_substitutions(command);
     if substitutions.is_empty() {
         // 回退到旧的 cat 物化以兼容仅含 cat 的历史路径（实际上 safe_shell 已覆盖 cat，此分支仅为无替换时的快速返回）
@@ -391,8 +394,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        confirm_git_commit_if_needed, execute_command, format_command_result,
-        is_git_commit_command, resolve_command_timeout, truncate_chars, MAX_COMMAND_OUTPUT_CHARS,
+        MAX_COMMAND_OUTPUT_CHARS, confirm_git_commit_if_needed, execute_command,
+        format_command_result, is_git_commit_command, resolve_command_timeout, truncate_chars,
     };
     use crate::cmd::run::CommandRunResult;
     use serde_json::json;

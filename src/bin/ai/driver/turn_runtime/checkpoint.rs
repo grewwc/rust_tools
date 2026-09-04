@@ -11,7 +11,10 @@ pub(super) fn initial_tool_round_checkpoint(max_iterations: usize) -> usize {
     (max_iterations / 2).max(1).min(TOOL_ROUND_CHECKPOINT)
 }
 
-pub(super) fn tool_round_checkpoint_threshold(max_iterations: usize, level: usize) -> Option<usize> {
+pub(super) fn tool_round_checkpoint_threshold(
+    max_iterations: usize,
+    level: usize,
+) -> Option<usize> {
     let multiplier = *TOOL_ROUND_CHECKPOINT_MULTIPLIERS.get(level)?;
     let threshold = initial_tool_round_checkpoint(max_iterations).checked_mul(multiplier)?;
     if level > 0 && threshold >= max_iterations {
@@ -91,7 +94,9 @@ impl ToolRoundCheckpointLevel {
 
     pub(super) fn guidance(self) -> &'static str {
         match self {
-            Self::Review => "This is a one-time phase checkpoint that is not an error or a tool failure.",
+            Self::Review => {
+                "This is a one-time phase checkpoint that is not an error or a tool failure."
+            }
             Self::Restrict => {
                 "This is the second-level checkpoint: first list the remaining necessary work, then only complete critical fixes and minimal verification; do not expand the task scope."
             }
@@ -217,9 +222,7 @@ pub(super) fn shell_segment_is_read_only(segment: &str) -> bool {
 
 /// 解析 `cargo` 子命令与 `--fix`/`--check` 标志，跳过 `--config`/`--manifest-path`
 /// 等取值选项。返回 `(子命令, 是否 --fix, 是否 --check)`。
-fn parse_cargo_tokens<'a>(
-    tokens: impl Iterator<Item = &'a str>,
-) -> (Option<&'a str>, bool, bool) {
+fn parse_cargo_tokens<'a>(tokens: impl Iterator<Item = &'a str>) -> (Option<&'a str>, bool, bool) {
     let mut subcommand = None;
     let mut skip_next = false;
     let mut fix_flag = false;

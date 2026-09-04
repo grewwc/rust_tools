@@ -100,7 +100,10 @@ pub(in crate::ai) const KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX: usize = 3;
 ///
 /// `budget == 0` means the caller explicitly sets no cap (old behavior kept), for
 /// reuse in contexts without a budget.
-pub(in crate::ai) fn keep_recent_user_turns_when_trimming(messages: &[Message], budget: usize) -> usize {
+pub(in crate::ai) fn keep_recent_user_turns_when_trimming(
+    messages: &[Message],
+    budget: usize,
+) -> usize {
     let mut keep = if messages_total_chars(messages) <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
         KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX
     } else {
@@ -123,7 +126,10 @@ pub(in crate::ai) fn keep_recent_user_turns_when_trimming(messages: &[Message], 
 /// low-budget target must adopt the sub-48K three-turn protection policy from the
 /// start; otherwise the third-most-recent user turn may already have been deleted
 /// before the total crosses 48K.
-pub(in crate::ai) fn keep_recent_user_turns_for_batch(messages: &[Message], budget: usize) -> usize {
+pub(in crate::ai) fn keep_recent_user_turns_for_batch(
+    messages: &[Message],
+    budget: usize,
+) -> usize {
     let total_chars = messages_total_chars(messages);
     let mut keep = if budget > 0 && budget <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
         3
@@ -173,7 +179,10 @@ pub(in crate::ai) fn compressed_tool_evidence_inline_chars_limit() -> usize {
 /// Keep only the `self_note:` entries among the most recent `keep_recent`
 /// internal_notes. Other internal_notes (cache hints, loop-breakers, history
 /// summaries) are outside the pruning scope.
-pub(in crate::ai) fn trim_self_notes_to_recent(messages: Vec<Message>, keep_recent: usize) -> Vec<Message> {
+pub(in crate::ai) fn trim_self_notes_to_recent(
+    messages: Vec<Message>,
+    keep_recent: usize,
+) -> Vec<Message> {
     let total_self_notes = messages.iter().filter(|m| is_self_note_message(m)).count();
     if total_self_notes <= keep_recent {
         return messages;
@@ -543,9 +552,10 @@ pub(in crate::ai) fn sanitize_persisted_history_messages(messages: Vec<Message>)
         // history, imported files, and bare reasoning from other models are still
         // dropped per the original policy.
         .map(|message| {
-            let preserve = message.reasoning_content.as_deref().is_some_and(|reasoning| {
-                is_persisted_reasoning_replay(reasoning)
-            });
+            let preserve = message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|reasoning| is_persisted_reasoning_replay(reasoning));
             sanitize_message_for_persisted_history_inner(
                 &message,
                 preserve.then_some("already-tagged"),

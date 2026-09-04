@@ -33,9 +33,8 @@ use super::normalize::{
 };
 use super::reasoning::{
     apply_prompt_cache_breakpoint, apply_thinking_force_off_effort,
-    normalize_reasoning_content_replay_for_model,
-    prompt_cache_enabled_for_model, reconstruct_encrypted_reasoning_items_for_model,
-    resolve_reasoning_effort,
+    normalize_reasoning_content_replay_for_model, prompt_cache_enabled_for_model,
+    reconstruct_encrypted_reasoning_items_for_model, resolve_reasoning_effort,
 };
 use super::thinking::resolve_thinking;
 use super::token_budget;
@@ -98,8 +97,7 @@ fn maybe_emit_responses_reasoning_replay_diagnostic(
     // can no longer be replayed faithfully, and history checkpoints / tool evidence carry the semantic fidelity. Diagnostics only count
     // the current turn after the latest user message, so every request does not emit noise about old history.
     // Synthetic user messages (evidence handoff, image followup) do not form a turn boundary.
-    let current_turn_start =
-        crate::ai::history::last_real_user_index(messages).unwrap_or(0);
+    let current_turn_start = crate::ai::history::last_real_user_index(messages).unwrap_or(0);
     let stats = super::protocol::responses_reasoning_replay_stats(
         &messages[current_turn_start..],
         Some(reasoning_items),
@@ -949,7 +947,8 @@ pub async fn do_request_text_streaming(
     loop {
         let api_key = &keys_to_try[key_idx];
         let retry_policy = request_retry_policy_for_current_context();
-        let estimated_prompt_tokens = token_budget::estimate_serialized_request_tokens(&request_body);
+        let estimated_prompt_tokens =
+            token_budget::estimate_serialized_request_tokens(&request_body);
         let client = app.client.clone();
         let build_request = || {
             apply_request_auth(client.post(&endpoint), &endpoint, api_key)
@@ -1074,7 +1073,7 @@ pub async fn do_request_text_streaming(
             } {
                 AuxChunkWait::Ready(Ok(Some(bytes))) => bytes,
                 AuxChunkWait::Ready(Ok(None)) => break, // stream ended normally
-                AuxChunkWait::Ready(Err(_)) => break,   // read error: keep what was aggregated so far
+                AuxChunkWait::Ready(Err(_)) => break, // read error: keep what was aggregated so far
                 AuxChunkWait::TimedOut => {
                     idle_timed_out = true;
                     break;

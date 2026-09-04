@@ -105,14 +105,12 @@ pub(in crate::ai) fn fold_noncompressible_tool_groups_to_fit(
         // reducing windows) falls back to the single re-plan, which produces a
         // byte-identical plan because the messages have not changed since the
         // selection loop ran.
-        let plan =
-            match last_reducing_plan.take() {
-                Some((window, plan)) if window == keep_recent => plan,
-                _ => {
-                    plan_early_tool_groups(messages, keep_recent, overflow_dir,
-                        protected_tool_call_ids)
-                }
-            };
+        let plan = match last_reducing_plan.take() {
+            Some((window, plan)) if window == keep_recent => plan,
+            _ => {
+                plan_early_tool_groups(messages, keep_recent, overflow_dir, protected_tool_call_ids)
+            }
+        };
         if plan.folded_groups() > 0
             && messages_total_chars(plan.messages()) < base_total
             && plan.commit()
@@ -129,7 +127,10 @@ pub(in crate::ai) fn fold_noncompressible_tool_groups_to_fit(
 /// `keep_recent` complete tool groups - i.e. the verbatim structured evidence
 /// kept outside folding under that window size (assistant anchors excluded,
 /// matching what recent_tool_group_message_indices returns).
-pub(in crate::ai) fn protected_tail_message_chars(messages: &[Message], keep_recent: usize) -> usize {
+pub(in crate::ai) fn protected_tail_message_chars(
+    messages: &[Message],
+    keep_recent: usize,
+) -> usize {
     recent_tool_group_message_indices(messages, keep_recent)
         .into_iter()
         .map(|idx| message_billable_chars(&messages[idx]))
@@ -473,8 +474,7 @@ pub(in crate::ai) fn drop_trim_candidates_batch(
         .iter()
         .enumerate()
         .filter_map(|(idx, message)| {
-            (message.role == "user" && !is_runtime_synthetic_user_message(message))
-                .then_some(idx)
+            (message.role == "user" && !is_runtime_synthetic_user_message(message)).then_some(idx)
         })
         .collect();
     let user_count = user_positions.len();
@@ -767,7 +767,9 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary(
                     && !had_leading_summary
                     && summary_max_chars > 0
                 {
-                    let header_chars = "对话摘要（自动压缩，以下为早期对话要点）：\n".chars().count();
+                    let header_chars = "对话摘要（自动压缩，以下为早期对话要点）：\n"
+                        .chars()
+                        .count();
                     let used = messages_total_chars(&messages);
                     // max_chars/used are char counts, so measure the header in
                     // chars too; a byte .len() would over-subtract (CJK is 3

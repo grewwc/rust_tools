@@ -34,9 +34,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
 // suppression message only points at the original result in context, never fabricates
 // new data. Paths are normalized in read_only_tool_signature, so `./x` and `x` count
 // as the same read.
-inventory::submit!(ToolReplayRegistration {
-    name: "read_file",
-});
+inventory::submit!(ToolReplayRegistration { name: "read_file" });
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {

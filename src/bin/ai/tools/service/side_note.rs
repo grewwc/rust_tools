@@ -33,7 +33,9 @@ pub(crate) fn execute_send_side_note(args: &Value) -> Result<String, String> {
 
     let history_file = runtime_ctx::try_current()
         .map(|ctx| ctx.app_proto.session_history_file.clone())
-        .ok_or_else(|| "cannot resolve current session history file (DRIVER_CTX missing)".to_string())?;
+        .ok_or_else(|| {
+            "cannot resolve current session history file (DRIVER_CTX missing)".to_string()
+        })?;
 
     side_note::push_side_note(&history_file, &note, "lead", target.as_deref())
         .map_err(|e| e.to_string())?;
@@ -45,10 +47,7 @@ pub(crate) fn execute_send_side_note(args: &Value) -> Result<String, String> {
     ))
 }
 
-pub fn handle_send_side_note(
-    tool_call_id: &str,
-    args: &Value,
-) -> Result<ToolResult, String> {
+pub fn handle_send_side_note(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
     let content = execute_send_side_note(args)?;
     Ok(ToolResult {
         tool_call_id: tool_call_id.to_string(),

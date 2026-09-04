@@ -472,9 +472,9 @@ pub(in crate::ai) fn sigint_action(
 #[cfg(test)]
 mod tests {
     use super::{
-        ForegroundSubagentGuard, ForegroundTurnGuard, SigintAction, foreground_turn_active,
-        request_shutdown, request_sigint_shutdown, sigint_action, take_sigint_shutdown_request,
-        handle_sigint, probe_foreground_subagent, ForegroundSubagentProbe,
+        ForegroundSubagentGuard, ForegroundSubagentProbe, ForegroundTurnGuard, SigintAction,
+        foreground_turn_active, handle_sigint, probe_foreground_subagent, request_shutdown,
+        request_sigint_shutdown, sigint_action, take_sigint_shutdown_request,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -648,10 +648,7 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
         // With an empty stack this interrupt must not be consumed; callers proceed
         // to normal shutdown/exit.
-        assert_eq!(
-            probe_foreground_subagent(),
-            ForegroundSubagentProbe::None
-        );
+        assert_eq!(probe_foreground_subagent(), ForegroundSubagentProbe::None);
     }
 
     #[test]
@@ -667,10 +664,7 @@ mod tests {
         }
         // The guard has dropped: the entry is no longer on the stack, so targeted
         // cancellation has nothing to consume.
-        assert_eq!(
-            probe_foreground_subagent(),
-            ForegroundSubagentProbe::None
-        );
+        assert_eq!(probe_foreground_subagent(), ForegroundSubagentProbe::None);
 
         super::clear_request_interrupt();
     }

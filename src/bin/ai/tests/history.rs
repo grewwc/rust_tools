@@ -4,8 +4,8 @@ use serde_json::Value;
 
 use super::super::{
     history::{
-        COLON, MAX_HISTORY_TURNS, Message, NEWLINE, append_history,
-        append_history_messages, build_context_history, build_message_arr,
+        COLON, MAX_HISTORY_TURNS, Message, NEWLINE, append_history, append_history_messages,
+        build_context_history, build_message_arr,
     },
     types::{FunctionCall, ToolCall},
 };
@@ -585,7 +585,8 @@ fn context_history_caps_oversized_canonical_tail_without_mutating_canonical_data
     .unwrap();
 
     // Even with regular history compression off, the absolute safety cap must still project an oversized canonical tail.
-    let context = build_context_history(8, &path, 0, 8, 2_000, Some(overflow_dir.clone()), None).unwrap();
+    let context =
+        build_context_history(8, &path, 0, 8, 2_000, Some(overflow_dir.clone()), None).unwrap();
     let projected = context
         .iter()
         .find(|message| message.role == "tool")

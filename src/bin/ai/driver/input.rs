@@ -1186,7 +1186,8 @@ mod tests {
     #[test]
     fn extract_forced_skill_references_accumulates_multiple_and_dedupes() {
         // 多次引用累加、保持顺序、去重。
-        let mut q = "@skills:code-review @skills:docs-review @skills:Code-Review 帮我看看".to_string();
+        let mut q =
+            "@skills:code-review @skills:docs-review @skills:Code-Review 帮我看看".to_string();
         let names = extract_forced_skill_references(&mut q);
         assert_eq!(names, vec!["code-review", "docs-review"]);
         assert_eq!(q, "帮我看看");

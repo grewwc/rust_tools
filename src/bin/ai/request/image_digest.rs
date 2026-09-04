@@ -306,7 +306,8 @@ pub(crate) async fn describe_image_for_digest(
     );
     let endpoint = endpoint_for_request_model(app, model);
     let api_key = api_key_for_request_model(app, model);
-    let http_body = super::protocol::build_http_body_for_request(model, &endpoint, &mut request_body);
+    let http_body =
+        super::protocol::build_http_body_for_request(model, &endpoint, &mut request_body);
 
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
@@ -598,8 +599,7 @@ mod tests {
         .expect("upsert digest");
         // Replacement on load: old images with a persisted digest are swapped for
         // the digest text.
-        let replaced =
-            replace_old_images_with_persisted_digests(&db, &mut msgs).expect("replace");
+        let replaced = replace_old_images_with_persisted_digests(&db, &mut msgs).expect("replace");
         assert_eq!(replaced, 1);
         assert!(!content_has_image(&msgs[1].content));
         let joined = msgs[1].content.to_string();

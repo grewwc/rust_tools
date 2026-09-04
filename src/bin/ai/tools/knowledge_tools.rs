@@ -1044,7 +1044,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("rt_knowledge_consolidate_lossless_{ts}.jsonl"));
+        let path =
+            std::env::temp_dir().join(format!("rt_knowledge_consolidate_lossless_{ts}.jsonl"));
         unsafe {
             std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
         }
@@ -1053,7 +1054,8 @@ mod tests {
             "文档链接 https://example.com/docs/{} 完整路径\n第一行细节\n第二行细节\n第三行细节",
             "abc123xyz"
         );
-        let long_note_2 = "另一条完整原文，模型在 read_all 里只能看到前 500 字预览\n第二行原文\n第三行原文";
+        let long_note_2 =
+            "另一条完整原文，模型在 read_all 里只能看到前 500 字预览\n第二行原文\n第三行原文";
 
         let seed = [
             AgentMemoryEntry {

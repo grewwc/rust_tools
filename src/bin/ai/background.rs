@@ -346,7 +346,11 @@ fn spawn_daemon_child(cli: &ParsedCli, session_id: &str, log_path: &Path) -> std
 }
 
 #[cfg(not(unix))]
-fn spawn_daemon_child(_cli: &ParsedCli, _session_id: &str, _log_path: &Path) -> std::io::Result<()> {
+fn spawn_daemon_child(
+    _cli: &ParsedCli,
+    _session_id: &str,
+    _log_path: &Path,
+) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "background mode (-bg) is unix-only (posix_spawn daemonize)",
@@ -378,7 +382,10 @@ mod tests {
         assert_eq!(args[0].to_string_lossy(), "--daemon-child");
         assert_eq!(args[1].to_string_lossy(), session_id);
         // Must contain the interactively entered task (as a trailing positional arg)
-        let args_str: Vec<String> = args.iter().map(|s| s.to_string_lossy().to_string()).collect();
+        let args_str: Vec<String> = args
+            .iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
         assert!(
             args_str.contains(&interactive_task),
             "daemon args should contain the interactively entered task, actual args={args_str:?}"
@@ -408,7 +415,10 @@ mod tests {
         let mut cli = cli;
         cli.session = Some(session_id.clone());
         let args = build_daemon_args(&cli, &session_id);
-        let args_str: Vec<String> = args.iter().map(|s| s.to_string_lossy().to_string()).collect();
+        let args_str: Vec<String> = args
+            .iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
         assert!(args_str.contains(&"--model".to_string()));
         assert!(args_str.contains(&"gpt-test".to_string()));
         assert!(args_str.contains(&"--files".to_string()));
@@ -436,7 +446,12 @@ mod tests {
         let daemon_args = build_daemon_args(&cli, &session_id);
         // Drop the leading --daemon-child <session> pair; the remainder simulates the child's argv after ai::entry strips them
         let child_argv: Vec<String> = std::iter::once("a".to_string())
-            .chain(daemon_args.iter().skip(2).map(|s| s.to_string_lossy().to_string()))
+            .chain(
+                daemon_args
+                    .iter()
+                    .skip(2)
+                    .map(|s| s.to_string_lossy().to_string()),
+            )
             .collect();
         let reparsed = parse_cli_args(child_argv.into_iter());
         assert_eq!(reparsed.args, vec!["do something important".to_string()]);

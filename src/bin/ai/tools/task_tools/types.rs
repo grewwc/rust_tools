@@ -46,7 +46,8 @@ pub(super) const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 60;
 /// result, so the main agent does not spin in a "timeout -> wait again -> timeout" loop or leave
 /// background processes holding resources forever. One hour far exceeds normal completion times
 /// and only acts as a safety net for genuinely stuck subagents.
-pub(super) const SUBAGENT_WALL_CLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+pub(super) const SUBAGENT_WALL_CLOCK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
 pub(super) const SUBAGENT_PROGRESS_NOTIFY_INTERVAL: Duration = Duration::from_secs(15);
 pub(super) const SUBAGENT_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(10);
 

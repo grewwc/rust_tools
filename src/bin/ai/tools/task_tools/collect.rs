@@ -61,7 +61,10 @@ pub(super) fn read_persisted_task_evidence_status(
     .map_err(|error| format!("failed to read task evidence for {task_id}: {error}"))
 }
 
-pub(super) fn collect_missing_task_result(task_id: &str, entry: &AsyncTaskEntry) -> Result<String, String> {
+pub(super) fn collect_missing_task_result(
+    task_id: &str,
+    entry: &AsyncTaskEntry,
+) -> Result<String, String> {
     let result = StoredTaskResult {
         status: "failed".to_string(),
         output: String::new(),
@@ -325,10 +328,7 @@ pub(super) fn char_ngram_set_from_text(input: &str) -> FxHashSet<String> {
 /// document set). Callers cache these sets once per selection round and reuse
 /// them across comparisons; scoring is pure integer counting plus a single
 /// division, so reusing the same set values yields bit-identical scores.
-pub(super) fn char_ngram_jaccard(
-    query: &FxHashSet<String>,
-    doc: &FxHashSet<String>,
-) -> f64 {
+pub(super) fn char_ngram_jaccard(query: &FxHashSet<String>, doc: &FxHashSet<String>) -> f64 {
     if query.is_empty() || doc.is_empty() {
         return 0.0;
     }

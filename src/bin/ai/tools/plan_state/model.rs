@@ -64,9 +64,7 @@ impl StepStatus {
     fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Skipped)
     }
-
 }
-
 
 /// 单个步骤的持久化状态。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,7 +104,6 @@ pub(crate) struct PlanState {
     pub(crate) updated_at_ms: u64,
 }
 
-
 impl PlanState {
     /// 由 `plan` 工具原始参数与可选的上一个状态构建；按全字段一致匹配保留既有步骤
     /// 状态，任一字段有变（动作/工具/理由/执行属性）都视为新步骤（回退 pending）。
@@ -120,18 +117,14 @@ impl PlanState {
             Some(prev) => steps
                 .into_iter()
                 .map(|mut spec| {
-                    if let Some(carried) = prev
-                        .steps
-                        .iter()
-                        .find(|s| {
-                            s.step == spec.step
-                                && s.action == spec.action
-                                && s.tool == spec.tool
-                                && s.reason == spec.reason
-                                && s.delegate == spec.delegate
-                                && s.parallelizable == spec.parallelizable
-                        })
-                    {
+                    if let Some(carried) = prev.steps.iter().find(|s| {
+                        s.step == spec.step
+                            && s.action == spec.action
+                            && s.tool == spec.tool
+                            && s.reason == spec.reason
+                            && s.delegate == spec.delegate
+                            && s.parallelizable == spec.parallelizable
+                    }) {
                         spec.status = carried.status;
                         spec.note = carried.note.clone();
                     }
@@ -176,35 +169,43 @@ impl PlanState {
     }
 
     pub(crate) fn done_count(&self) -> usize {
-        self.steps.iter().filter(|s| s.status == StepStatus::Done).count()
+        self.steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Done)
+            .count()
     }
 
     pub(crate) fn running_count(&self) -> usize {
-        self.steps.iter().filter(|s| s.status == StepStatus::Running).count()
+        self.steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Running)
+            .count()
     }
 
     pub(crate) fn failed_count(&self) -> usize {
-        self.steps.iter().filter(|s| s.status == StepStatus::Failed).count()
+        self.steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Failed)
+            .count()
     }
 
     pub(crate) fn skipped_count(&self) -> usize {
-        self.steps.iter().filter(|s| s.status == StepStatus::Skipped).count()
+        self.steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Skipped)
+            .count()
     }
 
     /// 是否存在非 pending 步骤（决定是否渲染进度行）。
     pub(crate) fn has_progress(&self) -> bool {
-        self.steps
-            .iter()
-            .any(|s| s.status != StepStatus::Pending)
+        self.steps.iter().any(|s| s.status != StepStatus::Pending)
     }
 }
 
 fn parse_step_specs(raw_steps: &[Value]) -> Result<Vec<PlanStepState>, String> {
     let mut out = Vec::with_capacity(raw_steps.len());
     for step in raw_steps {
-        let step_obj = step
-            .as_object()
-            .ok_or("Each step must be a JSON object.")?;
+        let step_obj = step.as_object().ok_or("Each step must be a JSON object.")?;
         let step_num = step_obj
             .get("step")
             .and_then(|v| v.as_u64())
@@ -213,11 +214,23 @@ fn parse_step_specs(raw_steps: &[Value]) -> Result<Vec<PlanStepState>, String> {
             .get("action")
             .and_then(|v| v.as_str())
             .ok_or("Each step must have an 'action' string field.")?;
-        let reason = step_obj.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        let reason = step_obj
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         // 与 plan_tools 的 execute_plan 保持一致：tool 缺省时渲染为 "unspecified"。
-        let tool = step_obj.get("tool").and_then(|v| v.as_str()).unwrap_or("unspecified");
-        let delegate = step_obj.get("delegate").and_then(|v| v.as_bool()).unwrap_or(false);
-        let parallelizable = step_obj.get("parallelizable").and_then(|v| v.as_bool()).unwrap_or(false);
+        let tool = step_obj
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unspecified");
+        let delegate = step_obj
+            .get("delegate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let parallelizable = step_obj
+            .get("parallelizable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         out.push(PlanStepState {
             step: step_num,
             action: action.to_string(),
@@ -304,7 +317,11 @@ mod tests {
         ];
         for spec in variants {
             let rebuilt = PlanState::build("T", spec.as_array().unwrap(), Some(&first)).unwrap();
-            assert_eq!(rebuilt.steps[0].status, StepStatus::Pending, "字段变化应回退 pending");
+            assert_eq!(
+                rebuilt.steps[0].status,
+                StepStatus::Pending,
+                "字段变化应回退 pending"
+            );
         }
     }
 
@@ -338,11 +355,12 @@ mod tests {
     fn test_apply_update_errors() {
         let raw = serde_json::json!([{ "step": 1, "action": "A", "tool": "read_file" }]);
         let mut state = PlanState::build("T", raw.as_array().unwrap(), None).unwrap();
-        assert!(state
-            .apply_update(9, StepStatus::Done, None)
-            .unwrap_err()
-            .contains("not found"));
+        assert!(
+            state
+                .apply_update(9, StepStatus::Done, None)
+                .unwrap_err()
+                .contains("not found")
+        );
         assert!(state.apply_update(1, StepStatus::Done, None).is_ok());
     }
-
 }

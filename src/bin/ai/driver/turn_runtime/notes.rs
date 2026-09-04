@@ -157,9 +157,9 @@ pub(super) fn inject_target_repeat_loop_note(messages: &mut Vec<crate::ai::histo
     });
 }
 
-    /// Soft notice for repeated "re-read from the top" rescans of the same target: the same file
-    /// keeps being read from the beginning (page width changes each round, or each round mixes in a
-    /// different new archive path), accumulating many full re-reads.
+/// Soft notice for repeated "re-read from the top" rescans of the same target: the same file
+/// keeps being read from the beginning (page width changes each round, or each round mixes in a
+/// different new archive path), accumulating many full re-reads.
 pub(super) fn inject_target_rescan_note(
     messages: &mut Vec<crate::ai::history::Message>,
     target: &str,
@@ -168,7 +168,7 @@ pub(super) fn inject_target_rescan_note(
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-            "[target-rescan] File `{target}` has been re-read from the beginning {reads} times within the recent window.\n\
+        "[target-rescan] File `{target}` has been re-read from the beginning {reads} times within the recent window.\n\
             If you have already covered the full content, converge now and answer based on the evidence you have; if you still need more of that file, delegate the remaining exploration to a subagent with the exact file and range to inspect.\n\
             Re-reading the same range injects byte-identical content: it is suppressed/deduped and does NOT count as new progress. What you already read is still in this turn's context (or archived - see its preserved stub's `file_path`); do not re-read it from the top. Continue from the exact offset you last reached, or use `search_overflow` to locate the archived content.\n\
             If you really must re-read it yourself, write down exactly which new piece of information you expect to gain and why."
@@ -182,8 +182,8 @@ pub(super) fn inject_target_rescan_note(
     });
 }
 
-    /// Hard stop for "re-read from the top" rescans of the same target: full re-reads of the same
-    /// file exceed the hard threshold, judged a paging + mixed-round loop, forcing no-tool wrap-up.
+/// Hard stop for "re-read from the top" rescans of the same target: full re-reads of the same
+/// file exceed the hard threshold, judged a paging + mixed-round loop, forcing no-tool wrap-up.
 pub(super) fn inject_target_rescan_hard_stop_note(
     messages: &mut Vec<crate::ai::history::Message>,
     target: &str,
@@ -192,7 +192,7 @@ pub(super) fn inject_target_rescan_hard_stop_note(
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-            "[low-yield-hard-stop] File `{target}` has been re-read from the beginning {reads} times within recent rounds; this is judged a pagination loop.\n\
+        "[low-yield-hard-stop] File `{target}` has been re-read from the beginning {reads} times within recent rounds; this is judged a pagination loop.\n\
             The content you already read is still available in this turn's context or archived (see preserved stubs' `file_path`); base your conclusion on it instead of re-reading.\n\
         From now on you are in no-tool wrap-up mode: do not issue any more tool calls;\n\
         give a phase summary and current conclusion based on existing information; if the task is not yet complete, clearly state the current gap, remaining work, and suggested next steps."
@@ -387,7 +387,9 @@ pub(super) fn inject_iteration_limit_reflect_note(
 
 /// When the synchronous wait is close to its hard timeout, ask the subagent to stop expanding new
 /// branches and prioritize delivering verifiable conclusions.
-pub(super) fn inject_subagent_pre_timeout_wrap_up_note(messages: &mut Vec<crate::ai::history::Message>) {
+pub(super) fn inject_subagent_pre_timeout_wrap_up_note(
+    messages: &mut Vec<crate::ai::history::Message>,
+) {
     use crate::ai::history::Message;
     use serde_json::Value;
 

@@ -1,7 +1,7 @@
 //! Tests for the `patch_retry` cluster.
 
-use super::common::*;
 use super::super::*;
+use super::common::*;
 
 #[test]
 fn context_mismatch_does_not_require_fresh_read() {
@@ -183,9 +183,7 @@ fn patch_retry_target_path_may_contain_patch_text_marker() {
     let ledger = ledger_from_messages(&messages);
     assert_eq!(
         ledger,
-        rustc_hash::FxHashSet::from_iter([FileStore::new(PathBuf::from(b))
-            .path()
-            .to_path_buf()])
+        rustc_hash::FxHashSet::from_iter([FileStore::new(PathBuf::from(b)).path().to_path_buf()])
     );
 }
 

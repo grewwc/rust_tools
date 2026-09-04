@@ -33,8 +33,7 @@ use crate::ai::types::App;
 pub(in crate::ai) use blob::{
     append_history, append_history_messages, append_history_messages_for_model, build_message_arr,
     coalesce_repeated_wait_wake_notes, delete_history_artifacts, parse_history_blob,
-    replace_history_messages,
-    truncate_history_messages,
+    replace_history_messages, truncate_history_messages,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use checkpoint::{CheckpointInfo, CheckpointStore};
@@ -207,8 +206,7 @@ pub(in crate::ai) fn preserve_subagent_history(path: &Path) -> Option<PathBuf> {
                 return None;
             }
         }
-    } else if std::fs::rename(path, &preserved).is_err()
-        && std::fs::copy(path, &preserved).is_err()
+    } else if std::fs::rename(path, &preserved).is_err() && std::fs::copy(path, &preserved).is_err()
     {
         // Text backend: rename (with copy fallback for cross-device/permission failures).
         return None;
@@ -258,17 +256,17 @@ pub(in crate::ai) fn delete_subagent_memory(memory_path: &Path) -> io::Result<()
 
 #[cfg(test)]
 pub(in crate::ai) use sqlite::read_context_history_sqlite;
-pub(in crate::ai) use sqlite::{read_image_digest_sqlite, upsert_image_digest_sqlite};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::{
     append_interrupted_stream_diagnostic_sqlite, append_skill_activation_event_sqlite,
-    append_tool_execution_outcomes_sqlite,
-    read_llm_prune_marks_sqlite, read_recent_messages_sqlite, read_skill_activation_events_sqlite,
+    append_tool_execution_outcomes_sqlite, read_llm_prune_marks_sqlite,
+    read_recent_messages_sqlite, read_skill_activation_events_sqlite,
     read_stale_patch_targets_sqlite, read_tool_execution_outcomes_sqlite,
     read_tool_message_ids_sqlite, write_llm_prune_marks_sqlite, write_stale_patch_targets_sqlite,
 };
+pub(in crate::ai) use sqlite::{read_image_digest_sqlite, upsert_image_digest_sqlite};
 #[allow(unused_imports)]
 pub(in crate::ai) use suspended::{
     SuspendedSessionEntry, SuspendedSessionStore, format_suspended_timestamp_label,
@@ -831,7 +829,10 @@ mod tests {
 
         delete_subagent_history(&history).unwrap();
         assert!(!history.exists(), "history must be removed");
-        assert!(!assets.exists(), "derived subagent assets dir must be removed");
+        assert!(
+            !assets.exists(),
+            "derived subagent assets dir must be removed"
+        );
 
         // Idempotent: a second call (assets already gone) must not error.
         delete_subagent_history(&history).unwrap();
@@ -855,7 +856,10 @@ mod tests {
         std::fs::create_dir_all(&proc_assets).unwrap();
         std::fs::write(proc_assets.join("plan-state.json"), "{}").unwrap();
         delete_subagent_history(&proc_history).unwrap();
-        assert!(!proc_assets.exists(), "proc-derived assets dir must be removed");
+        assert!(
+            !proc_assets.exists(),
+            "proc-derived assets dir must be removed"
+        );
 
         // Defensive guard: a main-session history path (no `.subagent-` / `.proc-`
         // marker) must never delete the main session's assets dir.
@@ -915,7 +919,10 @@ mod tests {
         )
         .unwrap();
         let wal_path = PathBuf::from(format!("{}-wal", history.display()));
-        assert!(wal_path.exists(), "WAL must hold the second committed message");
+        assert!(
+            wal_path.exists(),
+            "WAL must hold the second committed message"
+        );
 
         let preserved = preserve_subagent_history(&history).unwrap();
         let messages = build_message_arr(10, &preserved).unwrap();

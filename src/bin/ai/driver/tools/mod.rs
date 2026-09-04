@@ -594,7 +594,11 @@ fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
         echo_tool_args(name, &tool_call.function.arguments);
     }
     if run_result.ok {
-        echo_tool_output(name, &run_result.tool_result.content, &tool_call.function.arguments);
+        echo_tool_output(
+            name,
+            &run_result.tool_result.content,
+            &tool_call.function.arguments,
+        );
     }
 }
 
@@ -1089,9 +1093,9 @@ fn run_parallel_readonly_batch(
                 let ctx = batch_ctx.clone();
                 scope.spawn(move || {
                     let _ctx_fallback = ctx.as_ref().map(|driver_ctx| {
-                        crate::ai::driver::runtime_ctx::DriverCtxThreadFallback::install(
-                            Some(std::sync::Arc::clone(driver_ctx)),
-                        )
+                        crate::ai::driver::runtime_ctx::DriverCtxThreadFallback::install(Some(
+                            std::sync::Arc::clone(driver_ctx),
+                        ))
                     });
                     let mut no_observer: Option<&mut dyn ToolExecutionObserver> = None;
                     run_one(

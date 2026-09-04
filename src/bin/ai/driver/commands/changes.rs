@@ -41,11 +41,7 @@ pub(crate) fn parse_changes_command(input: &str) -> Option<ChangesCommand> {
         return None;
     };
     // head 后必须为空白或结束，避免 `/changesxxx`
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|c| !c.is_whitespace())
-    {
+    if rest.chars().next().is_some_and(|c| !c.is_whitespace()) {
         return None;
     }
     let args = rest.trim();
@@ -84,7 +80,11 @@ pub(crate) fn parse_changes_command(input: &str) -> Option<ChangesCommand> {
                     if let Some(pos) = args.find("--open=") {
                         let tail = &args[pos + "--open=".len()..];
                         let tok = tail.split_whitespace().next().unwrap_or("");
-                        if tok.is_empty() { None } else { changes::EditorKind::from_str(tok) }
+                        if tok.is_empty() {
+                            None
+                        } else {
+                            changes::EditorKind::from_str(tok)
+                        }
                     } else {
                         None
                     }
@@ -101,13 +101,19 @@ pub(crate) fn parse_changes_command(input: &str) -> Option<ChangesCommand> {
             if !editor_raw.is_empty() && editor.is_none() {
                 // 尝试提取等号后的原始值用于提示
                 let raw = if let Some(eq) = args.find("--open=") {
-                    &args[eq + "--open=".len()..].split_whitespace().next().unwrap_or("")
+                    &args[eq + "--open=".len()..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
                 } else if editor_raw.starts_with("--") {
                     editor_raw
                 } else {
                     editor_raw
                 };
-                if !raw.is_empty() && changes::EditorKind::from_str(raw).is_none() && !raw.starts_with('-') {
+                if !raw.is_empty()
+                    && changes::EditorKind::from_str(raw).is_none()
+                    && !raw.starts_with('-')
+                {
                     // 仍按 Help 返回，上层会打印支持列表
                     return Some(ChangesCommand::Help);
                 }
@@ -116,7 +122,11 @@ pub(crate) fn parse_changes_command(input: &str) -> Option<ChangesCommand> {
         }
         _ if first.starts_with("--open=") => {
             let val = first.trim_start_matches("--open=");
-            let editor = if val.is_empty() { None } else { changes::EditorKind::from_str(val) };
+            let editor = if val.is_empty() {
+                None
+            } else {
+                changes::EditorKind::from_str(val)
+            };
             if val.is_empty() || editor.is_some() {
                 Some(ChangesCommand::Open { editor })
             } else {
@@ -143,15 +153,13 @@ pub fn try_handle_changes_command(input: &str) -> Result<bool, Box<dyn std::erro
             let summary = changes::combined_summary();
             println!("{summary}");
         }
-        ChangesCommand::Stat => {
-            match changes::git_stat() {
-                Some(stat) => println!("{stat}"),
-                None => {
-                    eprintln!("提示：不在 git 仓库内或无差异，无法展示 --stat；以下为会话级摘要：\n");
-                    println!("{}", changes::combined_summary());
-                }
+        ChangesCommand::Stat => match changes::git_stat() {
+            Some(stat) => println!("{stat}"),
+            None => {
+                eprintln!("提示：不在 git 仓库内或无差异，无法展示 --stat；以下为会话级摘要：\n");
+                println!("{}", changes::combined_summary());
             }
-        }
+        },
         ChangesCommand::Json => {
             let json = changes_json();
             println!("{json}");
@@ -204,10 +212,13 @@ fn changes_json() -> String {
     // 回退：git status
     let cwd = match crate::ai::driver::runtime_ctx::effective_cwd() {
         Ok(p) => p,
-        Err(e) => return serde_json::json!({"error": format!("无法确定工作目录: {e}")}).to_string(),
+        Err(e) => {
+            return serde_json::json!({"error": format!("无法确定工作目录: {e}")}).to_string();
+        }
     };
     if !changes::is_inside_git_work_tree(&cwd) {
-        return serde_json::json!({"changes": [], "note": "不在 git 仓库且无 mutation log"}).to_string();
+        return serde_json::json!({"changes": [], "note": "不在 git 仓库且无 mutation log"})
+            .to_string();
     }
     let status = crate::fork_guard::output(
         std::process::Command::new("git")
@@ -223,7 +234,8 @@ fn changes_json() -> String {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::json!({"status": l[..2].to_string(), "path": l[3..].to_string()}))
         .collect();
-    serde_json::to_string_pretty(&serde_json::json!({"git_status": files})).unwrap_or_else(|_| "[]".into())
+    serde_json::to_string_pretty(&serde_json::json!({"git_status": files}))
+        .unwrap_or_else(|_| "[]".into())
 }
 
 fn print_changes_help() {
@@ -268,22 +280,46 @@ mod tests {
 
     #[test]
     fn parse_summary_and_alias() {
-        assert_eq!(parse_changes_command("/changes"), Some(ChangesCommand::Summary));
-        assert_eq!(parse_changes_command(":changes"), Some(ChangesCommand::Summary));
-        assert_eq!(parse_changes_command("/diff"), Some(ChangesCommand::Summary));
-        assert_eq!(parse_changes_command("/diff  "), Some(ChangesCommand::Summary));
+        assert_eq!(
+            parse_changes_command("/changes"),
+            Some(ChangesCommand::Summary)
+        );
+        assert_eq!(
+            parse_changes_command(":changes"),
+            Some(ChangesCommand::Summary)
+        );
+        assert_eq!(
+            parse_changes_command("/diff"),
+            Some(ChangesCommand::Summary)
+        );
+        assert_eq!(
+            parse_changes_command("/diff  "),
+            Some(ChangesCommand::Summary)
+        );
     }
 
     #[test]
     fn parse_help() {
-        assert_eq!(parse_changes_command("/changes --help"), Some(ChangesCommand::Help));
-        assert_eq!(parse_changes_command("/diff -h"), Some(ChangesCommand::Help));
+        assert_eq!(
+            parse_changes_command("/changes --help"),
+            Some(ChangesCommand::Help)
+        );
+        assert_eq!(
+            parse_changes_command("/diff -h"),
+            Some(ChangesCommand::Help)
+        );
     }
 
     #[test]
     fn parse_stat_json() {
-        assert_eq!(parse_changes_command("/changes --stat"), Some(ChangesCommand::Stat));
-        assert_eq!(parse_changes_command("/changes --json"), Some(ChangesCommand::Json));
+        assert_eq!(
+            parse_changes_command("/changes --stat"),
+            Some(ChangesCommand::Stat)
+        );
+        assert_eq!(
+            parse_changes_command("/changes --json"),
+            Some(ChangesCommand::Json)
+        );
     }
 
     #[test]
@@ -294,7 +330,9 @@ mod tests {
         );
         assert_eq!(
             parse_changes_command("/changes --patch /tmp/a.patch"),
-            Some(ChangesCommand::Patch { dest: Some(PathBuf::from("/tmp/a.patch")) })
+            Some(ChangesCommand::Patch {
+                dest: Some(PathBuf::from("/tmp/a.patch"))
+            })
         );
     }
 
@@ -306,15 +344,21 @@ mod tests {
         );
         assert_eq!(
             parse_changes_command("/changes --open=code"),
-            Some(ChangesCommand::Open { editor: Some(changes::EditorKind::Vscode) })
+            Some(ChangesCommand::Open {
+                editor: Some(changes::EditorKind::Vscode)
+            })
         );
         assert_eq!(
             parse_changes_command("/changes --open code"),
-            Some(ChangesCommand::Open { editor: Some(changes::EditorKind::Vscode) })
+            Some(ChangesCommand::Open {
+                editor: Some(changes::EditorKind::Vscode)
+            })
         );
         assert_eq!(
             parse_changes_command("/changes --open=git"),
-            Some(ChangesCommand::Open { editor: Some(changes::EditorKind::Git) })
+            Some(ChangesCommand::Open {
+                editor: Some(changes::EditorKind::Git)
+            })
         );
     }
 

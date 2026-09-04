@@ -15,8 +15,8 @@ use crate::ai::{
 };
 
 use super::super::types::PreparedToolResult;
-use super::execution::prepare_recent_tool_result;
 use super::execution::annotate_tool_result_evidence_status;
+use super::execution::prepare_recent_tool_result;
 
 const TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES: usize = 64_000;
 
@@ -495,12 +495,10 @@ pub(super) fn parse_prune_meta_and_update_marks(
             .iter()
             .take(4)
             .map(|id| {
-                let reason =
-                    crate::ai::history::compress::llm_prune::explain_rejected_prune_mark(
-                        messages,
-                        id,
-                    )
-                    .unwrap_or("not currently eligible");
+                let reason = crate::ai::history::compress::llm_prune::explain_rejected_prune_mark(
+                    messages, id,
+                )
+                .unwrap_or("not currently eligible");
                 format!("{id} ({reason})")
             })
             .collect::<Vec<_>>()
@@ -605,11 +603,8 @@ fn prepare_tool_result_for_current_turn(
             build_large_current_turn_terminal_preview(&tool_call.function.name, content);
         let path =
             write_current_turn_tool_overflow_file(app, &tool_call.function.name, content).ok();
-        let mut content_for_model = build_current_turn_tool_overflow_stub(
-            path.as_ref(),
-            &tool_call.function.name,
-            content,
-        );
+        let mut content_for_model =
+            build_current_turn_tool_overflow_stub(path.as_ref(), &tool_call.function.name, content);
         let anchors = current_tool_result_recall_anchors(tool_call);
         if !anchors.is_empty() {
             content_for_model.push_str("- original_call:\n");
@@ -1625,10 +1620,8 @@ mod tests {
 
     #[test]
     fn prune_hidden_meta_updates_and_persists_session_marks() {
-        let history_root = std::env::temp_dir().join(format!(
-            "ai-prune-meta-persist-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let history_root =
+            std::env::temp_dir().join(format!("ai-prune-meta-persist-{}", uuid::Uuid::new_v4()));
         let mut app = test_app(history_root.join("history.sqlite"));
         let _ = std::fs::remove_file(&app.session_history_file);
         let mut messages = Vec::new();
@@ -1837,10 +1830,9 @@ mod tests {
         // The subagent must not reuse the parent's fixed working-checkpoint file.
         assert_ne!(parent_path, sub_path);
         // The subagent marker must point into the subagent's own assets root.
-        let sub_assets = crate::ai::driver::side_note::assets_dir_for_history(
-            &sub_app.session_history_file,
-        )
-        .join("context-checkpoints");
+        let sub_assets =
+            crate::ai::driver::side_note::assets_dir_for_history(&sub_app.session_history_file)
+                .join("context-checkpoints");
         assert!(
             sub_path.starts_with(&sub_assets),
             "subagent working checkpoint should live in its own assets root: {}",

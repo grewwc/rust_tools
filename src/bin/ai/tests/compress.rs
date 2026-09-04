@@ -4,8 +4,8 @@ use serde_json::Value;
 
 use super::super::{
     history::{
-        COLON, NEWLINE, Message, append_history, build_message_arr,
-        compress_messages_for_context, messages_total_chars_pub,
+        COLON, Message, NEWLINE, append_history, build_message_arr, compress_messages_for_context,
+        messages_total_chars_pub,
     },
     types::{FunctionCall, ToolCall},
 };
@@ -286,7 +286,8 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
         });
     }
 
-    let compressed = compress_messages_for_context(messages, 20_000, 2, 400, Some(overflow_dir), None);
+    let compressed =
+        compress_messages_for_context(messages, 20_000, 2, 400, Some(overflow_dir), None);
 
     let stub = compressed
         .iter()

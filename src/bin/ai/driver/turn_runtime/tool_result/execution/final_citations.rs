@@ -4,7 +4,8 @@
 
 use super::*;
 
-pub(in crate::ai::driver::turn_runtime) const FINAL_CITATION_RETRY_MARKER: &str = "[final-citation-retry]";
+pub(in crate::ai::driver::turn_runtime) const FINAL_CITATION_RETRY_MARKER: &str =
+    "[final-citation-retry]";
 pub(in crate::ai::driver::turn_runtime) const FINAL_CITATION_UNVERIFIED_NOTE: &str = "runtime:final_citation_unverified\nA final response contained one or more file/line citations that could not be validated locally.";
 pub(in crate::ai::driver::turn_runtime) const FINAL_CITATION_WARNING: &str = "[Runtime warning] One or more file/line citations in this answer could not be validated locally; treat the cited details as unverified.";
 pub(in crate::ai::driver::turn_runtime) const MAX_FINAL_RESPONSE_CITATIONS: usize = 64;
@@ -14,9 +15,10 @@ pub(in crate::ai::driver::turn_runtime) const MAX_FINAL_CITATION_LINE_SCAN: u64 
 /// This recognizes only conventional, file-looking `path:line` references. A final-response
 /// gate must prefer false negatives over false positives: prose such as `phase: 2` must never
 /// force the model to repeat an otherwise valid answer.
-pub(in crate::ai::driver::turn_runtime) static PATH_LINE_CITATION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?x)
+pub(in crate::ai::driver::turn_runtime) static PATH_LINE_CITATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| {
+        Regex::new(
+            r"(?x)
         (?P<path>
             (?:/|\./|\.\./|~/)?
             [A-Za-z0-9_.@%+=,-]+
@@ -27,9 +29,9 @@ pub(in crate::ai::driver::turn_runtime) static PATH_LINE_CITATION_RE: LazyLock<R
         (?:-(?P<end>[1-9][0-9]*))?
         (?::[0-9]+)?
         ",
-    )
-    .expect("path:line citation regular expression must compile")
-});
+        )
+        .expect("path:line citation regular expression must compile")
+    });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::ai::driver::turn_runtime) enum FinalCitationGateAction {
@@ -56,7 +58,9 @@ pub(in crate::ai::driver::turn_runtime) struct FinalCitation {
 /// errs toward skipping.
 /// Inline code spans are intentionally NOT skipped — real citations are usually
 /// written as `src/lib.rs:42` in prose, so skipping them would lose true positives.
-pub(in crate::ai::driver::turn_runtime) fn fenced_code_block_byte_ranges(text: &str) -> Vec<(usize, usize)> {
+pub(in crate::ai::driver::turn_runtime) fn fenced_code_block_byte_ranges(
+    text: &str,
+) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     // (marker char, minimum closing marker count, range start byte)
     let mut open_fence: Option<(char, usize, usize)> = None;
@@ -65,8 +69,7 @@ pub(in crate::ai::driver::turn_runtime) fn fenced_code_block_byte_ranges(text: &
         let trimmed = line.trim();
         if let Some((marker, open_count, start)) = open_fence {
             let marker_count = trimmed.chars().filter(|c| *c == marker).count();
-            let closes_fence =
-                marker_count >= open_count && trimmed.chars().all(|c| c == marker);
+            let closes_fence = marker_count >= open_count && trimmed.chars().all(|c| c == marker);
             if closes_fence {
                 ranges.push((start, offset + line.len()));
                 open_fence = None;
@@ -88,7 +91,9 @@ pub(in crate::ai::driver::turn_runtime) fn fenced_code_block_byte_ranges(text: &
     ranges
 }
 
-pub(in crate::ai::driver::turn_runtime) fn final_response_citations(final_text: &str) -> Vec<FinalCitation> {
+pub(in crate::ai::driver::turn_runtime) fn final_response_citations(
+    final_text: &str,
+) -> Vec<FinalCitation> {
     let mut citations = Vec::new();
     let fenced_ranges = fenced_code_block_byte_ranges(final_text);
     for captures in PATH_LINE_CITATION_RE.captures_iter(final_text) {
@@ -136,7 +141,11 @@ pub(in crate::ai::driver::turn_runtime) fn final_response_citations(final_text: 
     citations
 }
 
-pub(in crate::ai::driver::turn_runtime) fn citation_has_token_boundaries(text: &str, start: usize, end: usize) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn citation_has_token_boundaries(
+    text: &str,
+    start: usize,
+    end: usize,
+) -> bool {
     let preceding = text[..start].chars().next_back();
     let following = text[end..].chars().next();
     !preceding.is_some_and(is_citation_path_character)
@@ -148,7 +157,10 @@ pub(in crate::ai::driver::turn_runtime) fn citation_has_token_boundaries(text: &
 
 pub(in crate::ai::driver::turn_runtime) fn is_citation_path_character(character: char) -> bool {
     character.is_ascii_alphanumeric()
-        || matches!(character, '_' | '.' | '-' | '/' | '@' | '%' | '+' | '=' | ',' | ':')
+        || matches!(
+            character,
+            '_' | '.' | '-' | '/' | '@' | '%' | '+' | '=' | ',' | ':'
+        )
 }
 
 /// Extensions that appear in prose mainly as version/phase qualifiers rather than
@@ -158,14 +170,16 @@ pub(in crate::ai::driver::turn_runtime) fn is_citation_path_character(character:
 /// these. This only narrows detection — the gate still prefers false negatives
 /// over false positives, so tokens with other unknown extensions stay candidates.
 pub(in crate::ai::driver::turn_runtime) const PROSE_QUALIFIER_EXTENSIONS: &[&str] = &[
-    "alpha", "beta", "rc", "dev", "debug", "release", "final", "snapshot",
-    "nightly", "canary", "preview", "draft", "wip", "test", "prod", "stage",
-    "staging",
+    "alpha", "beta", "rc", "dev", "debug", "release", "final", "snapshot", "nightly", "canary",
+    "preview", "draft", "wip", "test", "prod", "stage", "staging",
 ];
 
 pub(in crate::ai::driver::turn_runtime) fn looks_like_final_citation_path(path: &str) -> bool {
     let file_name = path.rsplit('/').next().unwrap_or(path);
-    if matches!(file_name, "Makefile" | "Dockerfile" | "LICENSE" | "README" | "AGENTS") {
+    if matches!(
+        file_name,
+        "Makefile" | "Dockerfile" | "LICENSE" | "README" | "AGENTS"
+    ) {
         return true;
     }
     let Some((_, extension)) = file_name.rsplit_once('.') else {
@@ -335,7 +349,10 @@ pub(in crate::ai::driver::turn_runtime) fn final_citation_base_dirs(
 
 /// `Some(false)` is reserved for a locally provable bad citation. I/O failures and oversized
 /// files stay unknown so this gate never claims a citation is invalid without direct evidence.
-pub(in crate::ai::driver::turn_runtime) fn citation_file_contains_line(path: &Path, line: u64) -> Option<bool> {
+pub(in crate::ai::driver::turn_runtime) fn citation_file_contains_line(
+    path: &Path,
+    line: u64,
+) -> Option<bool> {
     if line > MAX_FINAL_CITATION_LINE_SCAN {
         // Cheap falsification before giving up: a file of S bytes has at most S
         // lines (every line needs at least one byte), so a line number beyond
@@ -439,8 +456,7 @@ pub(in crate::ai::driver::turn_runtime) fn final_response_citation_gate_action(
     if unvalidated.is_empty() {
         return FinalCitationGateAction::Allow;
     }
-    let already_retried =
-        current_turn_has_internal_marker(messages, FINAL_CITATION_RETRY_MARKER);
+    let already_retried = current_turn_has_internal_marker(messages, FINAL_CITATION_RETRY_MARKER);
     if already_retried || force_final_response || iteration >= max_iterations {
         return FinalCitationGateAction::Warn;
     }

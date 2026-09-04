@@ -219,11 +219,7 @@ fn format_tool_output_line_with_dim(line: &str, dim: bool) -> String {
     if sanitized.is_empty() {
         format!("  {}│{}", ACCENT_RULE, RESET)
     } else {
-        let body_style = if dim {
-            DIM
-        } else {
-            ACCENT_EMPHASIZED_OUTPUT
-        };
+        let body_style = if dim { DIM } else { ACCENT_EMPHASIZED_OUTPUT };
         format!(
             "  {}│{} {}{}{}",
             ACCENT_RULE, RESET, body_style, sanitized, RESET
@@ -599,11 +595,10 @@ pub fn print_mcp_tools(report: &McpInitReport, mcp_client: &McpClient) {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_assistant_banner, format_empty_state, format_ocr_summary_block,
-        format_section_header, format_section_item, format_section_note,
+        format_assistant_banner, format_emphasized_tool_output_block, format_empty_state,
+        format_ocr_summary_block, format_section_header, format_section_item, format_section_note,
         format_skill_activation_note, format_tool_command_line, format_tool_header,
-        format_emphasized_tool_output_block, format_tool_output_block, format_tool_output_line,
-        format_tool_output_prefix,
+        format_tool_output_block, format_tool_output_line, format_tool_output_prefix,
         format_tool_status_completed, format_tool_status_with_file_target, sanitize_for_terminal,
     };
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
@@ -734,12 +729,16 @@ mod tests {
         );
         assert!(normal.iter().all(|line| line.contains(DIM)));
         assert!(emphasized.iter().all(|line| !line.contains(DIM)));
-        assert!(normal
-            .iter()
-            .all(|line| !line.contains(ACCENT_EMPHASIZED_OUTPUT)));
-        assert!(emphasized
-            .iter()
-            .all(|line| line.contains(ACCENT_EMPHASIZED_OUTPUT)));
+        assert!(
+            normal
+                .iter()
+                .all(|line| !line.contains(ACCENT_EMPHASIZED_OUTPUT))
+        );
+        assert!(
+            emphasized
+                .iter()
+                .all(|line| line.contains(ACCENT_EMPHASIZED_OUTPUT))
+        );
     }
 
     #[test]

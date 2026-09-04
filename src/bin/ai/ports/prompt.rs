@@ -26,6 +26,8 @@ pub(crate) struct DefaultPromptBuilder;
 
 impl PromptBuilder for DefaultPromptBuilder {
     fn build(&self, _app: &App, req: PromptBuildRequest) -> PromptBuildOutput {
-        PromptBuildOutput { messages: req.messages }
+        PromptBuildOutput {
+            messages: req.messages,
+        }
     }
 }

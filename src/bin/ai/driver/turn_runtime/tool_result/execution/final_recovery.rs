@@ -4,14 +4,14 @@
 
 use super::*;
 
-pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_RETRY_MARKER: &str = "[injected-context-echo-retry]";
+pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_RETRY_MARKER: &str =
+    "[injected-context-echo-retry]";
 pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_RETRY_NOTE: &str = "Your previous response reproduced a runtime-injected context note verbatim instead of answering. \
 Runtime notes are context for you only; they are never the user-facing answer. \
 Do not quote, restate, or continue any runtime note — including lines that begin with \
 \"[Model-authored note from an earlier turn\", \"[Compressed history summary\", \"[Runtime context handoff\", or \"self_note:\". \
 Produce the actual answer to the user's request now, using tools first if verification is still required; if you cannot verify, state that limitation in your own words.";
-pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_STOP: &str =
-    "[Model echoed a runtime internal note instead of giving a real answer; please retry or switch models]";
+pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_STOP: &str = "[Model echoed a runtime internal note instead of giving a real answer; please retry or switch models]";
 
 /// Turn-local state for final-response recovery. Prompt markers remain useful context for
 /// the model, but runtime control flow must not infer retry budgets from persisted text:
@@ -103,21 +103,27 @@ pub(in crate::ai::driver::turn_runtime) enum FinalClaimKind {
     NoImpact,
 }
 
-pub(in crate::ai::driver::turn_runtime) const DANGLING_FINAL_RECOVERY_MARKER: &str = "[dangling-final-recovery]";
+pub(in crate::ai::driver::turn_runtime) const DANGLING_FINAL_RECOVERY_MARKER: &str =
+    "[dangling-final-recovery]";
 pub(in crate::ai::driver::turn_runtime) const DANGLING_FINAL_WARNING: &str = "[Runtime warning] The model still described a future inspection step after a one-time no-tool wrap-up retry, so this turn ended without a complete conclusion.";
-pub(in crate::ai::driver::turn_runtime) const UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER: &str = "[unsupported-runtime-limit-retry]";
+pub(in crate::ai::driver::turn_runtime) const UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER: &str =
+    "[unsupported-runtime-limit-retry]";
 pub(in crate::ai::driver::turn_runtime) const UNSUPPORTED_RUNTIME_LIMIT_WARNING: &str = "[Runtime warning] The model claimed that a read-only phase limit prevented changes, but no matching runtime/tool evidence was observed; the requested work may be incomplete.";
-pub(in crate::ai::driver::turn_runtime) const NO_TOOL_SYNTHESIS_RETRY_MARKER: &str = "[no-tool-synthesis-retry]";
+pub(in crate::ai::driver::turn_runtime) const NO_TOOL_SYNTHESIS_RETRY_MARKER: &str =
+    "[no-tool-synthesis-retry]";
 pub(in crate::ai::driver::turn_runtime) const NO_TOOL_SYNTHESIS_RETRY_NOTE: &str = "The previous no-tool synthesis response incorrectly returned a tool call. Do not call any tool. Produce the final answer now from the evidence already present in the conversation, and explicitly mark anything unverified as incomplete.";
 pub(in crate::ai::driver::turn_runtime) const NO_TOOL_SYNTHESIS_WARNING: &str = "The model returned tool calls twice during the no-tool wrap-up stage; the runtime has stopped retrying. Judge the task state only from the evidence already obtained, and treat anything unverified as incomplete.";
-pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_RETRY_MARKER: &str = "[reasoning-only-retry]";
+pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_RETRY_MARKER: &str =
+    "[reasoning-only-retry]";
 pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_RETRY_NOTE: &str = "The previous response contained hidden reasoning but no visible assistant answer. Retry the step normally with the same capabilities, including tools and internal reasoning when needed, and ensure the response eventually includes visible assistant content.";
-pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_SYNTHESIS_MARKER: &str = "[reasoning-only-synthesis]";
+pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_SYNTHESIS_MARKER: &str =
+    "[reasoning-only-synthesis]";
 pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_SYNTHESIS_NOTE: &str = "Multiple consecutive responses contained hidden reasoning but no visible assistant answer. Produce the concrete user-facing final answer now. Do not call tools and do not return hidden reasoning alone.";
 /// Maximum automatic retries when the response contains only hidden reasoning
 /// (only after reaching this limit does the final no-reasoning synthesis kick in).
 pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_MAX_RETRIES: usize = 3;
-pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_SYNTHESIS_RETRY_MARKER: &str = "[reasoning-only-synthesis-retry]";
+pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_SYNTHESIS_RETRY_MARKER: &str =
+    "[reasoning-only-synthesis-retry]";
 pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_SYNTHESIS_RETRY_NOTE: &str = "The response still contained hidden reasoning with no visible assistant answer, even after the synthesis instruction. Produce the concrete user-facing final answer now; do not call tools and do not return hidden reasoning alone.";
 /// Maximum further automatic retries when the response still contains only hidden
 /// reasoning even after the forced no-reasoning synthesis; beyond that the round stops
@@ -137,7 +143,8 @@ pub(in crate::ai::driver::turn_runtime) const REASONING_ONLY_POST_SYNTHESIS_MAX_
 /// Here a persistent count marker records the reopen count within one turn; beyond the cap
 /// we stop reopening and fall back to the same degraded path as `iteration >= max_iterations`
 /// (attaching a warning and letting the ledger finalize).
-pub(in crate::ai::driver::turn_runtime) const TASK_EVIDENCE_REOPEN_MARKER: &str = "[task-evidence-reopen-count]";
+pub(in crate::ai::driver::turn_runtime) const TASK_EVIDENCE_REOPEN_MARKER: &str =
+    "[task-evidence-reopen-count]";
 /// Maximum number of reopens within one turn for “unintegrated evidence / unclosed subagent”.
 /// Set to 3: enough chances for the model to call `task_integrate` once it has the ledger,
 /// yet well before the iteration hard cap, avoiding infinite spinning on dead ends.
@@ -145,7 +152,9 @@ pub(in crate::ai::driver::turn_runtime) const TASK_EVIDENCE_REOPEN_MAX: usize = 
 
 /// Count the completion-gate reopen markers already injected into the current `messages`.
 /// The marker is an internal_note that reopens do not clear, so it accumulates across iterations.
-pub(in crate::ai::driver::turn_runtime) fn task_evidence_reopen_count(messages: &[Message]) -> usize {
+pub(in crate::ai::driver::turn_runtime) fn task_evidence_reopen_count(
+    messages: &[Message],
+) -> usize {
     let turn_start = crate::ai::history::last_real_user_index(messages).unwrap_or(0);
     messages
         .iter()
@@ -164,7 +173,10 @@ pub(in crate::ai::driver::turn_runtime) fn task_evidence_reopen_count(messages: 
 /// the count across iterations). Consistent with the other markers in this file: marker
 /// prefix + one human-readable sentence, so the projection to the model never shows a
 /// bare semantics-free label (internal_note is mapped to system/assistant, see request/normalize).
-pub(in crate::ai::driver::turn_runtime) fn push_task_evidence_reopen_marker(messages: &mut Vec<Message>, attempt: usize) {
+pub(in crate::ai::driver::turn_runtime) fn push_task_evidence_reopen_marker(
+    messages: &mut Vec<Message>,
+    attempt: usize,
+) {
     messages.push(Message {
         role: ROLE_INTERNAL_NOTE.to_string(),
         content: serde_json::Value::String(format!(
@@ -178,7 +190,10 @@ pub(in crate::ai::driver::turn_runtime) fn push_task_evidence_reopen_marker(mess
     });
 }
 
-pub(in crate::ai::driver::turn_runtime) fn append_runtime_warning_once(text: &mut String, warning: &str) {
+pub(in crate::ai::driver::turn_runtime) fn append_runtime_warning_once(
+    text: &mut String,
+    warning: &str,
+) {
     if text.contains(warning) {
         return;
     }
@@ -188,7 +203,10 @@ pub(in crate::ai::driver::turn_runtime) fn append_runtime_warning_once(text: &mu
     text.push_str(warning);
 }
 
-pub(in crate::ai::driver::turn_runtime) fn append_user_visible_final_notice(target: &mut Option<String>, notice: &str) {
+pub(in crate::ai::driver::turn_runtime) fn append_user_visible_final_notice(
+    target: &mut Option<String>,
+    notice: &str,
+) {
     let text = target.get_or_insert_with(String::new);
     append_runtime_warning_once(text, notice);
 }
@@ -223,7 +241,11 @@ pub(in crate::ai::driver::turn_runtime) enum UnsupportedRuntimeLimitAction {
     Warn,
 }
 
-pub(in crate::ai::driver::turn_runtime) fn text_range_is_quoted(text: &str, start: usize, end: usize) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn text_range_is_quoted(
+    text: &str,
+    start: usize,
+    end: usize,
+) -> bool {
     for (open, close) in [
         ("\"", "\""),
         ("'", "'"),
@@ -251,7 +273,10 @@ pub(in crate::ai::driver::turn_runtime) fn text_range_is_quoted(text: &str, star
     false
 }
 
-pub(in crate::ai::driver::turn_runtime) fn plan_request_phrase_is_negated(text: &str, start: usize) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn plan_request_phrase_is_negated(
+    text: &str,
+    start: usize,
+) -> bool {
     let clause = text[..start]
         .rsplit(|ch: char| matches!(ch, '.' | ';' | '!' | '?' | '。' | '；' | '！' | '？' | '\n'))
         .next()
@@ -284,7 +309,10 @@ pub(in crate::ai::driver::turn_runtime) fn plan_request_phrase_is_negated(text: 
         .any(|marker| chinese_tail.contains(marker))
 }
 
-pub(in crate::ai::driver::turn_runtime) fn contains_active_plan_request_phrase(question: &str, phrase: &str) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn contains_active_plan_request_phrase(
+    question: &str,
+    phrase: &str,
+) -> bool {
     question.match_indices(phrase).any(|(start, _)| {
         let end = start + phrase.len();
         let bytes = question.as_bytes();
@@ -683,8 +711,8 @@ pub(in crate::ai::driver::turn_runtime) fn final_text_claim_kind(text: &str) -> 
         "已修改",
         "已经修改",
     ]
-        .iter()
-        .any(|claim| text.contains(claim))
+    .iter()
+    .any(|claim| text.contains(claim))
     {
         return FinalClaimKind::Completion;
     }
@@ -711,8 +739,8 @@ pub(in crate::ai::driver::turn_runtime) fn final_text_claim_kind(text: &str) -> 
         "updated",
         "changed",
     ]
-        .iter()
-        .any(|word| contains_non_negated_completion_word(&text, word))
+    .iter()
+    .any(|word| contains_non_negated_completion_word(&text, word))
         || [
             "changes are ready",
             "change is ready",
@@ -738,7 +766,9 @@ pub(in crate::ai::driver::turn_runtime) fn final_text_claim_kind(text: &str) -> 
 /// Stay conservative: only handle the case where the whole body is an injected note. If
 /// the model quotes/discusses these prefixes in the body (prefix not at the start, or
 /// followed by its own text) it is not an echo and is left to the other gates.
-pub(in crate::ai::driver::turn_runtime) fn looks_like_injected_context_echo(final_text: &str) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn looks_like_injected_context_echo(
+    final_text: &str,
+) -> bool {
     // The runtime may append `\n\n[Runtime warning] ...` after the real answer; classify
     // only the model's body text.
     let visible = final_text

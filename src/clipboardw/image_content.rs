@@ -237,10 +237,9 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Case 2: raw_bytes are a UTF-8 base64 string (from oo -c bridge).
-        let b64_str = std::str::from_utf8(&raw_bytes)
-            .map_err(|_| {
-                io::Error::other("clipboard data is not a valid image or base64 string")
-            })?;
+        let b64_str = std::str::from_utf8(&raw_bytes).map_err(|_| {
+            io::Error::other("clipboard data is not a valid image or base64 string")
+        })?;
         let data = crate::clipboardw::decode_base64_lenient(b64_str)
             .ok_or_else(|| io::Error::other("failed to decode clipboard base64"))?;
         let img = image::load_from_memory(&data).map_err(|e| {

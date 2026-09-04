@@ -5,10 +5,10 @@ mod knowledge_tools;
 pub mod os_tools;
 mod overflow_search;
 mod patch_tools;
-mod rag_tools;
 pub(crate) mod permissions;
 mod plan_state;
 mod plan_tools;
+mod rag_tools;
 pub(crate) mod registry;
 pub(crate) mod service;
 pub(crate) mod skill_tools;
@@ -27,13 +27,12 @@ pub(crate) use registry::common::ToolReplayRegistration;
 pub(crate) use registry::common::execute_tool_call;
 pub(crate) use registry::common::execute_tool_call_with_args_streaming;
 pub(crate) use registry::common::{
-    deferred_eager_load_tool_summaries, get_tool_definitions_by_names,
-    group_gates_hidden_tools, manifest_unknown_tool_names_warning,
-    tool_allows_same_turn_replay, tool_defers_eager_load, tool_definitions_for_groups,
-    tool_history_policy, tool_summaries_for_groups,
+    deferred_eager_load_tool_summaries, get_tool_definitions_by_names, group_gates_hidden_tools,
+    manifest_unknown_tool_names_warning, tool_allows_same_turn_replay, tool_defers_eager_load,
+    tool_definitions_for_groups, tool_history_policy, tool_summaries_for_groups,
 };
-pub(crate) use registry::tool_metadata::tool_first_use_guidance;
 pub(crate) use registry::tool_groups::ToolGroup;
+pub(crate) use registry::tool_metadata::tool_first_use_guidance;
 const BASELINE_TOOL_NAMES: &[&str] = &[
     "list_skills",
     "load_skill",
@@ -51,10 +50,7 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
 
 // Process-level allowlist needs to retain the full self-service capability above, but the manifest's resident schema only restores
 // the real execution baseline; skill discovery, task orchestration, and knowledge tools are loaded on demand via `enable_tools`.
-const EAGER_BASELINE_TOOL_NAMES: &[&str] = &[
-    "enable_tools",
-    "read_file",
-];
+const EAGER_BASELINE_TOOL_NAMES: &[&str] = &["enable_tools", "read_file"];
 
 pub(crate) fn baseline_tool_names() -> &'static [&'static str] {
     BASELINE_TOOL_NAMES

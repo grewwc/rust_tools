@@ -263,7 +263,8 @@ pub(crate) fn apply_thinking_force_off_effort<'a>(
     endpoint: &str,
     effort: Option<&'a str>,
 ) -> Option<&'a str> {
-    if thinking_disabled_override && reasoning_effort_reduces_thinking_for(provider, model, endpoint)
+    if thinking_disabled_override
+        && reasoning_effort_reduces_thinking_for(provider, model, endpoint)
     {
         Some(ReasoningEffort::None.as_str())
     } else {
@@ -316,8 +317,11 @@ mod encrypted_replay_reconstruct_tests {
             "call-1",
             Some(encode_encrypted_reasoning_replay_state(model, &items)),
         )];
-        let rebuilt =
-            reconstruct_encrypted_reasoning_items_for_model(model, &messages, &FxHashMap::default());
+        let rebuilt = reconstruct_encrypted_reasoning_items_for_model(
+            model,
+            &messages,
+            &FxHashMap::default(),
+        );
         assert_eq!(rebuilt.get("call-1"), Some(&items));
     }
 
@@ -351,8 +355,11 @@ mod encrypted_replay_reconstruct_tests {
                 &items,
             )),
         )];
-        let rebuilt =
-            reconstruct_encrypted_reasoning_items_for_model(model, &messages, &FxHashMap::default());
+        let rebuilt = reconstruct_encrypted_reasoning_items_for_model(
+            model,
+            &messages,
+            &FxHashMap::default(),
+        );
         assert!(rebuilt.is_empty());
     }
 
@@ -375,8 +382,12 @@ mod encrypted_replay_reconstruct_tests {
         )];
         // 关闭时即便模型 capable、历史有编码 blob，也不重建。
         assert!(
-            reconstruct_encrypted_reasoning_items_for_model(model, &messages, &FxHashMap::default())
-                .is_empty()
+            reconstruct_encrypted_reasoning_items_for_model(
+                model,
+                &messages,
+                &FxHashMap::default()
+            )
+            .is_empty()
         );
 
         unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", "0") };

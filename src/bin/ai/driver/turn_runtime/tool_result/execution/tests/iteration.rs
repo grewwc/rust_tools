@@ -1,7 +1,7 @@
 //! Tests for the `iteration` cluster.
 
-use super::common::*;
 use super::super::*;
+use super::common::*;
 
 #[test]
 fn tool_call_round_persists_hidden_context_checkpoint() {

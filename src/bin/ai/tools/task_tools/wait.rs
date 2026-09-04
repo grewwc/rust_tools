@@ -81,7 +81,10 @@ pub(crate) fn reset_last_spawn_batch_for_test() {
     *LAST_SPAWN_BATCH.lock().unwrap() = None;
 }
 
-pub(super) fn load_or_create_task_wait_state(key: &TaskWaitKey, timeout_secs: u64) -> TaskWaitState {
+pub(super) fn load_or_create_task_wait_state(
+    key: &TaskWaitKey,
+    timeout_secs: u64,
+) -> TaskWaitState {
     let now = Instant::now();
     let mut states = TASK_WAIT_STATES.lock().unwrap();
     let mut inserted = false;

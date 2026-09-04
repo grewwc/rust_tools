@@ -874,10 +874,8 @@ where
                 // 60-300s timeout backstop.
                 if pseudo_terminal {
                     let now = Instant::now();
-                    let (after_output, silent_start) = pty_stall.unwrap_or((
-                        PTY_STALL_AFTER_OUTPUT,
-                        PTY_STALL_SILENT_START,
-                    ));
+                    let (after_output, silent_start) =
+                        pty_stall.unwrap_or((PTY_STALL_AFTER_OUTPUT, PTY_STALL_SILENT_START));
                     let produced_output = !stdout_buf.is_empty() || !stderr_buf.is_empty();
                     let stalled = if produced_output {
                         now.duration_since(last_output_at) >= after_output
@@ -1109,7 +1107,10 @@ mod tests {
         {
             let output = run_cmd_output(r#"echo ~"/foo""#, RunCmdOptions::default()).unwrap();
             assert!(output.status.success());
-            assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), r#"~/foo"#);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim_end(),
+                r#"~/foo"#
+            );
 
             let output = run_cmd_output(r#"echo ~"x""#, RunCmdOptions::default()).unwrap();
             assert!(output.status.success());
@@ -1135,9 +1136,8 @@ mod tests {
         #[cfg(unix)]
         {
             let home = std::env::var("HOME").unwrap();
-            let cmd =
-                super::build_no_shell_command("~/bin/prog --flag", RunCmdOptions::default())
-                    .unwrap();
+            let cmd = super::build_no_shell_command("~/bin/prog --flag", RunCmdOptions::default())
+                .unwrap();
             let program = cmd.get_program().to_string_lossy().into_owned();
             assert!(program.starts_with(&home), "program={program}");
             assert!(program.ends_with("/bin/prog"), "program={program}");

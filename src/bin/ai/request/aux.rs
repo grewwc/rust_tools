@@ -980,9 +980,10 @@ pub(crate) fn charge_llm_usage_to_kernel(
     charge_llm_usage_via_kernel(&app.os, requested_model, usage, latency_ms)
 }
 
-/// 与 [`charge_llm_usage_to_kernel`] 等价，但直接接受一个 `SharedKernel`。
-/// 供没有 `App` 句柄的调用方（如后台 reflection 的 `background_call`）使用--
-/// `GLOBAL_OS` 与 `App.os` 共享同一把 `Arc<Mutex<Kernel>>`，落账语义一致。
+/// Equivalent to [`charge_llm_usage_to_kernel`], but takes a `SharedKernel`
+/// directly. Intended for callers without an `App` handle (e.g. background
+/// reflection's `background_call`): `GLOBAL_OS` and `App.os` share the same
+/// `Arc<Mutex<Kernel>>`, so the accounting semantics are identical.
 pub(crate) fn charge_llm_usage_via_kernel(
     os: &aios_kernel::kernel::SharedKernel,
     requested_model: &str,
@@ -1011,8 +1012,16 @@ pub(crate) fn charge_llm_usage_via_kernel(
         cached_prompt_tokens: cached,
         latency_ms,
     };
-    // 在内核里落账（计费 + rusage + trace + 追加审计账本），同时拿出本次需要
-    // drain 落库的增量记录。SQLite I/O 放到 guard 释放之后，避免持内核锁做磁盘写。
+    // Serialize the whole "drain -> persist -> advance cursor" sequence: the cursor is
+    // read and the ledger drained under the kernel lock, but it only advances after a
+    // successful commit in `persist_drained`. Without this guard, concurrent LLM calls
+    // (e.g. in-process subagents) could both read the same cursor and double-insert the
+    // same records. A concurrent caller blocks here until we commit, then reads the
+    // already-advanced cursor and only fetches new records.
+    let _drain_guard = crate::ai::tools::storage::token_usage_store::drain_lock();
+    // Settle the call in the kernel (billing + rusage + trace + appending to the audit
+    // ledger) and fetch the incremental records to drain for this call. SQLite I/O
+    // happens after the guard is released, so we never hold the kernel lock for disk writes.
     let (outcome, drained, head) = {
         let mut guard = match os.lock() {
             Ok(g) => g,
@@ -1025,7 +1034,8 @@ pub(crate) fn charge_llm_usage_via_kernel(
         let head = guard.llm_usage_head_seq();
         (outcome, drained, head)
     };
-    // best-effort 落库到独立的 token 用量统计表，失败不影响主流程。
+    // Best-effort persistence into the dedicated token-usage stats table;
+    // failures never block the main flow.
     crate::ai::tools::storage::token_usage_store::persist_drained(&drained, head);
     Some(outcome)
 }

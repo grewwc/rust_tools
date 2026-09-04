@@ -224,11 +224,9 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
             let store = history::SessionStore::new(task_app.config.history_file.as_path());
             store.session_assets_dir(&task_app.session_id)
         };
-        task_app.attached_image_files = crate::ai::driver::input::snapshot_image_attachments(
-            resolved,
-            assets_dir.as_path(),
-        )
-        .map_err(|error| format!("failed to snapshot task images: {error}"))?;
+        task_app.attached_image_files =
+            crate::ai::driver::input::snapshot_image_attachments(resolved, assets_dir.as_path())
+                .map_err(|error| format!("failed to snapshot task images: {error}"))?;
     }
     if let Some(level) = args
         .get("reasoning_effort")
@@ -424,7 +422,9 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         // this, a failure late in a long investigation (e.g. the forced wrap-up request rejected
         // by the provider) deleted the whole history and wasted all collected work.
         if outcome.is_err() {
-            history_cleanup.preserve_on_drop.store(true, Ordering::Release);
+            history_cleanup
+                .preserve_on_drop
+                .store(true, Ordering::Release);
         }
         if let Some((private_memory, main_memory)) = memory_merge {
             match crate::ai::tools::service::memory::merge_subagent_whitelist(
@@ -1169,7 +1169,10 @@ mod tests {
         assert!(!memory_db_path.exists());
         assert!(!std::path::Path::new(&format!("{}-wal", memory_db_path.display())).exists());
         assert!(!cwd_path.exists());
-        assert!(!assets_dir.exists(), "guard Drop must remove subagent assets dir");
+        assert!(
+            !assets_dir.exists(),
+            "guard Drop must remove subagent assets dir"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1288,10 +1291,8 @@ mod tests {
         let slot: runtime_ctx::SubagentResultSlot = Arc::new(tokio::sync::Mutex::new(
             runtime_ctx::SubagentResult::default(),
         ));
-        let missing = std::env::temp_dir().join(format!(
-            "ai-recovery-missing-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let missing =
+            std::env::temp_dir().join(format!("ai-recovery-missing-{}", uuid::Uuid::new_v4()));
 
         publish_recovery_evidence(
             &missing,
@@ -1304,11 +1305,17 @@ mod tests {
             .try_lock()
             .expect("slot should be free after publishing")
             .clone();
-        assert!(captured.parent_payload.contains("SUBAGENT_TIMEOUT_RECOVERY_V1"));
+        assert!(
+            captured
+                .parent_payload
+                .contains("SUBAGENT_TIMEOUT_RECOVERY_V1")
+        );
         assert!(captured.parent_payload.contains("status: failed"));
-        assert!(captured
-            .parent_payload
-            .contains("preserved child history was not found"));
+        assert!(
+            captured
+                .parent_payload
+                .contains("preserved child history was not found")
+        );
     }
 
     #[test]

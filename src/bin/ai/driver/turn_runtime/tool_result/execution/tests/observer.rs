@@ -1,7 +1,7 @@
 //! Tests for the `observer` cluster.
 
-use super::common::*;
 use super::super::*;
+use super::common::*;
 
 #[test]
 fn command_input_marks_pseudo_terminal_mode() {

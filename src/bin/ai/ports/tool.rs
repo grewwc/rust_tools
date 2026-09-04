@@ -1,9 +1,12 @@
 // =============================================================================
 // ToolExecutor - tool execution port (dependency inversion)
 // =============================================================================
+use crate::ai::{
+    history::{Message, ToolExecutionOutcome},
+    types::{App, ToolCall, ToolResult},
+};
 use std::future::Future;
 use std::pin::Pin;
-use crate::ai::{history::{Message, ToolExecutionOutcome}, types::{App, ToolCall, ToolResult}};
 
 #[derive(Debug, Default)]
 pub(crate) struct ToolExecOutput {
@@ -22,6 +25,11 @@ pub(crate) trait ToolExecutor: Send + Sync {
         &'a self,
         app: &'a mut App,
         tool_calls: Vec<ToolCall>,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolExecOutput, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ToolExecOutput, Box<dyn std::error::Error + Send + Sync>>>
+                + Send
+                + 'a,
+        >,
+    >;
 }
-

@@ -218,8 +218,9 @@ fn plan_tool_call_group_fold(
             .filter_map(|idx| messages.get(*idx).cloned())
             .collect::<Vec<_>>();
         let raw_messages = serde_json::to_string_pretty(&group_messages).ok()?;
-        let content =
-            format!("# Folded tool group (verbatim)\n\nraw_message_json:\n```json\n{raw_messages}\n```\n");
+        let content = format!(
+            "# Folded tool group (verbatim)\n\nraw_message_json:\n```json\n{raw_messages}\n```\n"
+        );
         let digest = content_sha256_hex(content.as_bytes());
         let path = dir
             .join(FOLDED_TOOL_GROUP_ARCHIVE_DIR)

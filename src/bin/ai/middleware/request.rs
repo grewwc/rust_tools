@@ -35,7 +35,10 @@ pub(crate) fn build_llm_client_chain(
     middlewares: Vec<Arc<dyn RequestMiddleware>>,
     inner: Box<dyn LlmClient>,
 ) -> Box<dyn LlmClient> {
-    middlewares.into_iter().rev().fold(inner, |client, mw| mw.wrap(client))
+    middlewares
+        .into_iter()
+        .rev()
+        .fold(inner, |client, mw| mw.wrap(client))
 }
 
 #[cfg(test)]
@@ -86,7 +89,9 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
     impl RequestMiddleware for CountingMiddleware {
-        fn name(&self) -> &'static str { "counting" }
+        fn name(&self) -> &'static str {
+            "counting"
+        }
         fn wrap(&self, inner: Box<dyn LlmClient>) -> Box<dyn LlmClient> {
             let calls = Arc::clone(&self.calls);
             struct CountingClient {
@@ -111,7 +116,9 @@ mod tests {
         max_attempts: usize,
     }
     impl RequestMiddleware for RetryMiddleware {
-        fn name(&self) -> &'static str { "retry" }
+        fn name(&self) -> &'static str {
+            "retry"
+        }
         fn wrap(&self, inner: Box<dyn LlmClient>) -> Box<dyn LlmClient> {
             let max_attempts = self.max_attempts;
             struct RetryClient {
@@ -133,14 +140,19 @@ mod tests {
                     })
                 }
             }
-            Box::new(RetryClient { inner, max_attempts })
+            Box::new(RetryClient {
+                inner,
+                max_attempts,
+            })
         }
     }
 
     /// 短路中间件：直接返回，不调用 inner。
     struct ShortCircuitMiddleware;
     impl RequestMiddleware for ShortCircuitMiddleware {
-        fn name(&self) -> &'static str { "short-circuit" }
+        fn name(&self) -> &'static str {
+            "short-circuit"
+        }
         fn wrap(&self, _inner: Box<dyn LlmClient>) -> Box<dyn LlmClient> {
             struct ShortCircuitClient;
             impl LlmClient for ShortCircuitClient {
@@ -160,9 +172,17 @@ mod tests {
         let client_calls = Arc::new(AtomicUsize::new(0));
 
         // Logging(Retry(Default)) 式洋葱链：外层计数 -> 内层计数 -> 真实 client
-        let client: Box<dyn LlmClient> = CountingMiddleware { calls: Arc::clone(&outer_calls) }
-            .wrap(CountingMiddleware { calls: Arc::clone(&middleware_calls) }
-                .wrap(Box::new(CountingClient { calls: Arc::clone(&client_calls) })));
+        let client: Box<dyn LlmClient> = CountingMiddleware {
+            calls: Arc::clone(&outer_calls),
+        }
+        .wrap(
+            CountingMiddleware {
+                calls: Arc::clone(&middleware_calls),
+            }
+            .wrap(Box::new(CountingClient {
+                calls: Arc::clone(&client_calls),
+            })),
+        );
 
         let mut app = test_app();
         for _ in 0..3 {
@@ -180,25 +200,36 @@ mod tests {
     async fn retry_middleware_calls_inner_multiple_times() {
         let inner_calls = Arc::new(AtomicUsize::new(0));
         let client: Box<dyn LlmClient> =
-            RetryMiddleware { max_attempts: 3 }.wrap(Box::new(CountingClient { calls: Arc::clone(&inner_calls) }));
+            RetryMiddleware { max_attempts: 3 }.wrap(Box::new(CountingClient {
+                calls: Arc::clone(&inner_calls),
+            }));
 
         let mut app = test_app();
         let res = client.send(&mut app, mock_req()).await;
         assert!(res.is_err(), "固定失败，重试耗尽后冒泡错误");
-        assert_eq!(inner_calls.load(Ordering::SeqCst), 3, "重试中间件应多次调用 inner");
+        assert_eq!(
+            inner_calls.load(Ordering::SeqCst),
+            3,
+            "重试中间件应多次调用 inner"
+        );
     }
 
     /// 短路中间件（mock/熔断）不调用 inner。
     #[tokio::test]
     async fn short_circuit_middleware_skips_inner() {
         let inner_calls = Arc::new(AtomicUsize::new(0));
-        let client: Box<dyn LlmClient> =
-            ShortCircuitMiddleware.wrap(Box::new(CountingClient { calls: Arc::clone(&inner_calls) }));
+        let client: Box<dyn LlmClient> = ShortCircuitMiddleware.wrap(Box::new(CountingClient {
+            calls: Arc::clone(&inner_calls),
+        }));
 
         let mut app = test_app();
         let res = client.send(&mut app, mock_req()).await;
         assert!(res.is_err());
-        assert_eq!(inner_calls.load(Ordering::SeqCst), 0, "短路中间件不应调用 inner");
+        assert_eq!(
+            inner_calls.load(Ordering::SeqCst),
+            0,
+            "短路中间件不应调用 inner"
+        );
     }
 
     #[tokio::test]
@@ -212,7 +243,9 @@ mod tests {
             order: Arc<Mutex<Vec<String>>>,
         }
         impl RequestMiddleware for OrderMiddleware {
-            fn name(&self) -> &'static str { self.name }
+            fn name(&self) -> &'static str {
+                self.name
+            }
             fn wrap(&self, inner: Box<dyn LlmClient>) -> Box<dyn LlmClient> {
                 let name = self.name;
                 let order = Arc::clone(&self.order);
@@ -239,17 +272,28 @@ mod tests {
 
         let inner_calls = Arc::new(AtomicUsize::new(0));
         let middlewares: Vec<Arc<dyn RequestMiddleware>> = vec![
-            Arc::new(OrderMiddleware { name: "outer", order: Arc::clone(&order) }),
-            Arc::new(OrderMiddleware { name: "inner", order: Arc::clone(&order) }),
+            Arc::new(OrderMiddleware {
+                name: "outer",
+                order: Arc::clone(&order),
+            }),
+            Arc::new(OrderMiddleware {
+                name: "inner",
+                order: Arc::clone(&order),
+            }),
         ];
         let client = build_llm_client_chain(
             middlewares,
-            Box::new(CountingClient { calls: Arc::clone(&inner_calls) }),
+            Box::new(CountingClient {
+                calls: Arc::clone(&inner_calls),
+            }),
         );
         let mut app = test_app();
         let _ = client.send(&mut app, mock_req()).await;
         let got = order.lock().unwrap().clone();
-        assert_eq!(got, vec!["enter:outer", "enter:inner", "exit:inner", "exit:outer"]);
+        assert_eq!(
+            got,
+            vec!["enter:outer", "enter:inner", "exit:inner", "exit:outer"]
+        );
         assert_eq!(inner_calls.load(Ordering::SeqCst), 1);
         order.lock().unwrap().clear();
         let _ = client.send(&mut app, mock_req()).await;
@@ -260,7 +304,12 @@ mod tests {
     async fn build_chain_empty_returns_inner() {
         use super::build_llm_client_chain;
         let inner_calls = Arc::new(AtomicUsize::new(0));
-        let client = build_llm_client_chain(vec![], Box::new(CountingClient { calls: Arc::clone(&inner_calls) }));
+        let client = build_llm_client_chain(
+            vec![],
+            Box::new(CountingClient {
+                calls: Arc::clone(&inner_calls),
+            }),
+        );
         let mut app = test_app();
         let _ = client.send(&mut app, mock_req()).await;
         assert_eq!(inner_calls.load(Ordering::SeqCst), 1);

@@ -249,7 +249,8 @@ impl McpClient {
         conn.resources = self.list_resources(&mut conn)?;
         conn.prompts = self.list_prompts(&mut conn)?;
 
-        self.servers.insert(name.to_string(), Arc::new(Mutex::new(conn)));
+        self.servers
+            .insert(name.to_string(), Arc::new(Mutex::new(conn)));
         self.rebuild_metadata_cache();
         Ok(())
     }
@@ -751,8 +752,12 @@ impl McpClient {
                         let mut conn2 = conn_arc
                             .lock()
                             .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-                        let result =
-                            Self::send_request_to_conn(&mut *conn2, id2, "tools/call", Some(params2))?;
+                        let result = Self::send_request_to_conn(
+                            &mut *conn2,
+                            id2,
+                            "tools/call",
+                            Some(params2),
+                        )?;
                         let content = result["content"]
                             .as_array()
                             .and_then(|arr| arr.first())

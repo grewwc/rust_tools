@@ -253,13 +253,17 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
             let compact_result = if at_boundary {
                 compact_session_history_at_boundary_with_app(
                     &task_app,
-                    crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+                    crate::ai::driver::runtime_ctx::effective_cwd()
+                        .ok()
+                        .as_deref(),
                 )
                 .await
             } else {
                 compact_session_history_with_app(
                     &task_app,
-                    crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+                    crate::ai::driver::runtime_ctx::effective_cwd()
+                        .ok()
+                        .as_deref(),
                 )
                 .await
             };
@@ -282,13 +286,17 @@ async fn dispatch_finalize_compaction(app: &App, at_boundary: bool, run_in_backg
     let compact_result = if at_boundary {
         compact_session_history_at_boundary_with_app(
             app,
-            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+            crate::ai::driver::runtime_ctx::effective_cwd()
+                .ok()
+                .as_deref(),
         )
         .await
     } else {
         compact_session_history_with_app(
             app,
-            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+            crate::ai::driver::runtime_ctx::effective_cwd()
+                .ok()
+                .as_deref(),
         )
         .await
     };
@@ -417,12 +425,11 @@ pub(super) async fn finalize_turn(
             turn_messages,
         );
         if crate::ai::driver::runtime_ctx::terminal_output_enabled()
-            && let Some(visible_text) =
-                terminal_final_text_to_render(
-                    final_assistant_text,
-                    final_assistant_recorded,
-                    user_visible_final_suffix,
-                )
+            && let Some(visible_text) = terminal_final_text_to_render(
+                final_assistant_text,
+                final_assistant_recorded,
+                user_visible_final_suffix,
+            )
         {
             print_assistant_banner_with_app_and_skill(Some(app), active_skill_name);
             // The digest is extra image understanding for the model; it is stripped from the final echo as well.
@@ -430,8 +437,7 @@ pub(super) async fn finalize_turn(
             // Display-only post-processing (e.g. `scripts/postprocess_terminal.py`
             // via `ai.output.postprocess_command`). Best-effort: on any failure
             // the original text is shown unchanged; canonical history is untouched.
-            let visible_text =
-                super::output_postprocess::postprocess_terminal_text(visible_text);
+            let visible_text = super::output_postprocess::postprocess_terminal_text(visible_text);
             crate::ai::stream::render_markdown_block(&visible_text)?;
         }
         persist_pending_turn_messages_for_model(

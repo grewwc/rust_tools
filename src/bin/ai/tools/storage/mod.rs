@@ -6,6 +6,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
+pub(crate) mod changes;
 pub(crate) mod command_runner;
 pub(crate) mod file_store;
 pub(crate) mod memory_index;
@@ -15,7 +16,6 @@ pub(crate) mod process_registry;
 pub(crate) mod rag_store;
 pub(crate) mod temp_registry;
 pub(crate) mod token_usage_store;
-pub(crate) mod changes;
 
 /// 文件锁，用于并发访问 memory 文件
 static MEMORY_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));

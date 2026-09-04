@@ -331,7 +331,9 @@ fn parse_content_part_event(
         // 重发（ReplayedChunk），由流层对 content 做未见后缀去重，避免正文跨事件
         // 路径重复渲染（用户可见"结论输出两遍"）。output_text 的 .done 保持
         // SnapshotChunk 不变（快照去重已覆盖）。
-        return Some(ParsedStreamPayload::ReplayedChunk(single_delta_chunk(&text, "")));
+        return Some(ParsedStreamPayload::ReplayedChunk(single_delta_chunk(
+            &text, "",
+        )));
     }
     Some(textual_event_chunk(event_type, &text, ""))
 }
@@ -664,7 +666,12 @@ mod tests {
     fn reasoning_added_with_short_stub_is_ignored() {
         // 现网 `.added` 为短 stub，不可回放；长度 <256 应被忽略
         let payload = r#"{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"short-stub"}}"#;
-        for event_type in [Some("response.output_item.added"), None, Some(""), Some("message")] {
+        for event_type in [
+            Some("response.output_item.added"),
+            None,
+            Some(""),
+            Some("message"),
+        ] {
             match parse_stream_payload(provider::opencode_adapter(), payload, event_type) {
                 ParsedStreamPayload::Ignore => {}
                 _ => panic!("expected Ignore for short stub added for {event_type:?}"),
@@ -679,7 +686,12 @@ mod tests {
         let payload = format!(
             r#"{{"type":"response.output_item.added","item":{{"id":"rs_1","type":"reasoning","encrypted_content":"{long}"}}}}"#
         );
-        for event_type in [Some("response.output_item.added"), None, Some(""), Some("message")] {
+        for event_type in [
+            Some("response.output_item.added"),
+            None,
+            Some(""),
+            Some("message"),
+        ] {
             match parse_stream_payload(provider::opencode_adapter(), &payload, event_type) {
                 ParsedStreamPayload::ReasoningItem(item) => {
                     assert_eq!(item["type"], "reasoning");

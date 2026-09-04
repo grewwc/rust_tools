@@ -6,10 +6,9 @@ use sha2::{Digest, Sha256};
 
 use super::super::types::{Message, ROLE_INTERNAL_NOTE};
 use super::{
+    ARCHIVE_NOTE_PREFIX, INTERNAL_NOTE_OVERFLOW_DIR, MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS,
+    MutableMessageField, OVERFLOW_HISTORY_FILENAME, insert_archive_note_if_missing,
     is_compressed_tool_evidence_note, message_billable_chars, value_to_string,
-    insert_archive_note_if_missing, MutableMessageField,
-    ARCHIVE_NOTE_PREFIX, INTERNAL_NOTE_OVERFLOW_DIR, OVERFLOW_HISTORY_FILENAME,
-    MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS,
 };
 
 #[derive(Clone)]

@@ -317,13 +317,8 @@ mod tests {
             assert!(!first.contains("Progress: 1/2 steps done."));
 
             // Persist step 1 through the same load-mutate-save path as plan_update.
-            crate::ai::tools::plan_state::update_plan_step(
-                &app,
-                1,
-                StepStatus::Done,
-                None,
-            )
-            .unwrap();
+            crate::ai::tools::plan_state::update_plan_step(&app, 1, StepStatus::Done, None)
+                .unwrap();
 
             // Replanning with the same arguments must preserve the completed suffix
             // and progress line while leaving the pending step suffix-free.

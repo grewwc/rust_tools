@@ -112,7 +112,9 @@ pub struct InMemoryMcpPort {
 
 impl InMemoryMcpPort {
     pub fn new() -> Self {
-        Self { tools: HashMap::new() }
+        Self {
+            tools: HashMap::new(),
+        }
     }
     pub fn with_tools(mut self, server: impl Into<String>, tools: Vec<McpToolDef>) -> Self {
         self.tools.insert(server.into(), tools);
@@ -121,7 +123,9 @@ impl InMemoryMcpPort {
 }
 
 impl Default for InMemoryMcpPort {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl McpPort for InMemoryMcpPort {

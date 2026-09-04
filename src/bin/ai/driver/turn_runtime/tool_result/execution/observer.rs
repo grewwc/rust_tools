@@ -257,7 +257,9 @@ impl<'a> TerminalToolObserver<'a> {
 /// PTY. A PTY is the opt-in signal for interactive CLIs (menus, confirmations, QR-login,
 /// etc.); regular commands keep going through visual-grid detection so build/search logs
 /// are not written to the terminal.
-pub(in crate::ai::driver::turn_runtime) fn execute_command_uses_pseudo_terminal(tool_call: &ToolCall) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn execute_command_uses_pseudo_terminal(
+    tool_call: &ToolCall,
+) -> bool {
     tool_call.function.name == "execute_command"
         && serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
             .ok()
@@ -362,7 +364,10 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
     }
 }
 
-pub(in crate::ai::driver::turn_runtime) fn streamed_tool_result_is_failure(tool_call: &ToolCall, run_result: &tools::RunOneResult) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn streamed_tool_result_is_failure(
+    tool_call: &ToolCall,
+    run_result: &tools::RunOneResult,
+) -> bool {
     !run_result.ok
         || (tool_call.function.name == "execute_command"
             && run_result.tool_result.content.starts_with("Exit code:"))
@@ -391,8 +396,13 @@ impl ToolExecutor for RoundToolExecutorAdapter {
         &'a self,
         app: &'a mut App,
         tool_calls: Vec<ToolCall>,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolExecOutput, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ToolExecOutput, Box<dyn std::error::Error + Send + Sync>>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             let mut observer = TerminalToolObserver::new(app);
             let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);

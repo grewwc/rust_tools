@@ -1,7 +1,7 @@
-use super::*;
 use super::tool_overflow::is_preserved_tool_overflow_stub;
-use rustc_hash::FxHashSet;
+use super::*;
 use crate::ai::types::{FunctionCall, ToolCall};
+use rustc_hash::FxHashSet;
 
 fn assistant_call(id: &str, name: &str) -> Message {
     assistant_call_args(id, name, "{}")
@@ -348,13 +348,8 @@ fn enforce_group_budget_reuses_reread_archive_asset_instead_of_rearchiving() {
     ];
     let mut protected = FxHashSet::default();
     protected.insert("spill".to_string());
-    let stub1 = spill_protected_precision_to_fit(
-        &mut messages,
-        80,
-        Some(&overflow_dir),
-        None,
-        &protected,
-    );
+    let stub1 =
+        spill_protected_precision_to_fit(&mut messages, 80, Some(&overflow_dir), None, &protected);
     assert!(stub1 > 0);
     let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
     let archive_path = std::fs::read_dir(&archive_dir)
@@ -403,12 +398,8 @@ fn cap_oversized_reuses_reread_archive_asset_instead_of_rearchiving() {
         assistant_call("first", "read_file"),
         tool_result("first", &"y".repeat(70_000)),
     ];
-    let capped = cap_oversized_tool_results_for_context(
-        &mut messages,
-        64_000,
-        Some(&overflow_dir),
-        None,
-    );
+    let capped =
+        cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
     assert!(capped > 0);
     let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
     let archive_path = std::fs::read_dir(&archive_dir)
@@ -426,12 +417,8 @@ fn cap_oversized_reuses_reread_archive_asset_instead_of_rearchiving() {
         assistant_call_args("re-read", "read_file", &read_args.to_string()),
         tool_result("re-read", &raw),
     ];
-    let capped = cap_oversized_tool_results_for_context(
-        &mut messages,
-        64_000,
-        Some(&overflow_dir),
-        None,
-    );
+    let capped =
+        cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
     assert_eq!(capped, 1);
     assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
     let stub_text = value_to_string(&messages[1].content);
@@ -625,12 +612,8 @@ fn cap_reuses_execute_command_cat_archive_instead_of_rearchiving() {
         assistant_call("run", "execute_command"),
         tool_result("run", &"log line\n".repeat(30_000)),
     ];
-    let capped = cap_oversized_tool_results_for_context(
-        &mut messages,
-        64_000,
-        Some(&overflow_dir),
-        None,
-    );
+    let capped =
+        cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
     assert!(capped > 0);
     let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
     let archive_path = std::fs::read_dir(&archive_dir)
@@ -651,12 +634,8 @@ fn cap_reuses_execute_command_cat_archive_instead_of_rearchiving() {
         assistant_call_args("re-cat", "execute_command", &run_args.to_string()),
         tool_result("re-cat", &raw),
     ];
-    let capped = cap_oversized_tool_results_for_context(
-        &mut messages,
-        64_000,
-        Some(&overflow_dir),
-        None,
-    );
+    let capped =
+        cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
     assert_eq!(capped, 1);
     assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
     let stub_text = value_to_string(&messages[1].content);
@@ -683,13 +662,8 @@ fn path_c_spills_all_protected_precision_groups_without_recent_group_cap() {
         messages.push(tool_result(&id, &"line of exact evidence\n".repeat(600)));
     }
 
-    let spilled = spill_protected_precision_to_fit(
-        &mut messages,
-        0,
-        Some(&overflow_dir),
-        None,
-        &protected,
-    );
+    let spilled =
+        spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected);
 
     // Covers the second half of Path C: when still over budget after the
     // spill, the emergency cap kicks in. Every preserved stub must first
@@ -757,16 +731,9 @@ fn path_c_reuses_reread_session_asset_instead_of_rearchiving_it() {
         tool_result("reread", &content),
     ];
 
-    let spilled =
-        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(effective_cwd, || {
-            spill_protected_precision_to_fit(
-                &mut messages,
-                0,
-                Some(&overflow_dir),
-                None,
-                &protected,
-            )
-        });
+    let spilled = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(effective_cwd, || {
+        spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected)
+    });
 
     assert_eq!(spilled, 1);
     let stub = value_to_string(&messages[1].content);
@@ -813,16 +780,9 @@ fn path_c_snapshots_mutable_session_temp_asset_instead_of_reusing_it() {
         tool_result("reread", &content),
     ];
 
-    let spilled =
-        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(effective_cwd, || {
-            spill_protected_precision_to_fit(
-                &mut messages,
-                0,
-                Some(&overflow_dir),
-                None,
-                &protected,
-            )
-        });
+    let spilled = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(effective_cwd, || {
+        spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected)
+    });
 
     assert_eq!(spilled, 1);
     let stub = value_to_string(&messages[1].content);
@@ -857,13 +817,8 @@ fn path_c_spills_aggregated_task_wait_result_losslessly() {
         tool_result("wait", &"aggregated subagent conclusion\n".repeat(600)),
     ];
 
-    let spilled = spill_protected_precision_to_fit(
-        &mut messages,
-        0,
-        Some(&overflow_dir),
-        None,
-        &protected,
-    );
+    let spilled =
+        spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected);
 
     assert_eq!(spilled, 1, "task_wait 大结果应被 Path C 无损外溢");
     let stub = value_to_string(&messages[1].content);
@@ -893,13 +848,8 @@ fn path_c_does_not_expand_short_protected_results_into_stubs() {
     ];
     let before = super::messages_total_chars(&messages);
 
-    let spilled = spill_protected_precision_to_fit(
-        &mut messages,
-        0,
-        Some(&overflow_dir),
-        None,
-        &protected,
-    );
+    let spilled =
+        spill_protected_precision_to_fit(&mut messages, 0, Some(&overflow_dir), None, &protected);
 
     assert_eq!(spilled, 0);
     assert_eq!(value_to_string(&messages[1].content), "ok");
@@ -956,11 +906,13 @@ fn preserved_stub_carries_fingerprint_line() {
     let full = "Compiling rust_tools v0.1.0 (/repo)\n\
                 warning: unused variable `root_idx`\n\
                 error[E0308]: mismatched types in sched_ctx\n";
-    let stub = build_preserved_tool_overflow_stub(Path::new("/tmp/fp.txt"), "execute_command", full, &[]);
+    let stub =
+        build_preserved_tool_overflow_stub(Path::new("/tmp/fp.txt"), "execute_command", full, &[]);
     assert!(is_preserved_tool_overflow_stub(&stub));
 
     // Deterministic in content: same bytes -> byte-identical stub text.
-    let stub_again = build_preserved_tool_overflow_stub(Path::new("/tmp/fp.txt"), "execute_command", full, &[]);
+    let stub_again =
+        build_preserved_tool_overflow_stub(Path::new("/tmp/fp.txt"), "execute_command", full, &[]);
     assert_eq!(stub, stub_again);
 
     let fp_line = stub
@@ -968,26 +920,49 @@ fn preserved_stub_carries_fingerprint_line() {
         .find_map(|l| l.trim_start().strip_prefix("- fingerprint: "))
         .expect("fingerprint line present on fresh stub");
     // sha= segment: exactly 12 hex chars.
-    let sha = fp_line.split("sha=").nth(1).unwrap().split(' ').next().unwrap();
+    let sha = fp_line
+        .split("sha=")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
     assert_eq!(sha.len(), 12);
     assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
     // Keyword casing is preserved verbatim so tokens stay greppable in the archive.
-    assert!(fp_line.contains("keys="), "keys= segment present: {fp_line}");
-    assert!(fp_line.contains("rust_tools") || fp_line.contains("root_idx"), "keywords: {fp_line}");
+    assert!(
+        fp_line.contains("keys="),
+        "keys= segment present: {fp_line}"
+    );
+    assert!(
+        fp_line.contains("rust_tools") || fp_line.contains("root_idx"),
+        "keywords: {fp_line}"
+    );
 }
 
 #[test]
 fn collapse_and_minimize_carry_fingerprint_through() {
     let full = "alpha beta gamma\nE0308 mismatched_types hit\n".repeat(30);
-    let stub = build_preserved_tool_overflow_stub(Path::new("/tmp/carry.txt"), "execute_command", full.as_str(), &[]);
+    let stub = build_preserved_tool_overflow_stub(
+        Path::new("/tmp/carry.txt"),
+        "execute_command",
+        full.as_str(),
+        &[],
+    );
 
     let anchor = collapse_overflow_stub_to_anchor(&stub).expect("collapse");
     assert!(!anchor.contains("Preview ("));
-    assert!(anchor.contains("- fingerprint: "), "anchor carries fingerprint: {anchor}");
+    assert!(
+        anchor.contains("- fingerprint: "),
+        "anchor carries fingerprint: {anchor}"
+    );
 
     let pointer = minimize_overflow_stub_to_pointer(&stub).expect("minimize");
     assert!(pointer.contains("- file_path: /tmp/carry.txt"));
-    assert!(pointer.contains("- fingerprint: "), "pointer keeps retrieval signal");
+    assert!(
+        pointer.contains("- fingerprint: "),
+        "pointer keeps retrieval signal"
+    );
     assert!(is_preserved_tool_overflow_stub(&pointer));
 
     // Legacy stubs (pre-fingerprint) minimize cleanly without fabricated fields.
@@ -1018,9 +993,18 @@ fn fingerprint_keywords_dedup_case_insensitively_and_stay_deterministic() {
     // ordering vs. the previous linear scan.
     let content = "sched_ctx SCHED_CTX Sched_Ctx root_idx ROOT_IDX payloadxyz\n";
     let keys = extract_fingerprint_keywords(content);
-    let sched = keys.iter().filter(|k| k.eq_ignore_ascii_case("sched_ctx")).count();
-    assert_eq!(sched, 1, "case-insensitive dedup collapses repeats: {keys:?}");
-    assert!(keys.contains(&"sched_ctx".to_string()), "first casing kept: {keys:?}");
+    let sched = keys
+        .iter()
+        .filter(|k| k.eq_ignore_ascii_case("sched_ctx"))
+        .count();
+    assert_eq!(
+        sched, 1,
+        "case-insensitive dedup collapses repeats: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"sched_ctx".to_string()),
+        "first casing kept: {keys:?}"
+    );
     assert!(keys.len() <= FINGERPRINT_KEY_COUNT);
 
     // Fully deterministic across calls (no RNG / hash-order leakage into output).

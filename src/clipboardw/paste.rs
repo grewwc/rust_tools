@@ -91,10 +91,7 @@ fn classify(raw: &[u8]) -> SaveKind {
     // Text (including base64-wrapped images / binaries)
     if let Ok(text) = std::str::from_utf8(raw) {
         if !text.is_empty() {
-            let cleaned: String = text
-                .chars()
-                .filter(|c| !matches!(c, '\n' | '\r'))
-                .collect();
+            let cleaned: String = text.chars().filter(|c| !matches!(c, '\n' | '\r')).collect();
             if !cleaned.is_empty() {
                 if let Some(decoded) = crate::clipboardw::decode_base64_lenient(&cleaned) {
                     // An empty decode result (e.g. whitespace-only clipboard) is
@@ -277,7 +274,14 @@ mod tests {
         let base = base.to_string_lossy().into_owned();
         let _ = fs::remove_file(format!("{base}.png"));
 
-        let path = save_classified(&base, SaveKind::Image { data: png.clone(), ext: "png" }).unwrap();
+        let path = save_classified(
+            &base,
+            SaveKind::Image {
+                data: png.clone(),
+                ext: "png",
+            },
+        )
+        .unwrap();
         assert_eq!(path, format!("{base}.png"));
         assert_eq!(fs::read(&path).unwrap(), png);
 

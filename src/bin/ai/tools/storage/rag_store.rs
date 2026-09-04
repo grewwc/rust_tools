@@ -60,8 +60,8 @@ impl RagStore {
                     .to_string(),
             );
         }
-        let vec_store =
-            VectorStore::new(&index_path()).map_err(|e| format!("Failed to open vector index: {e}"))?;
+        let vec_store = VectorStore::new(&index_path())
+            .map_err(|e| format!("Failed to open vector index: {e}"))?;
         let cfg = knowledge_config();
         Ok(Self {
             vec_store: Mutex::new(vec_store),
@@ -255,7 +255,11 @@ impl RagStore {
             .into_values()
             .map(|(e, s)| self.to_hit(e, s))
             .collect();
-        out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.truncate(limit);
         Ok(out)
     }
@@ -277,10 +281,7 @@ fn normalize_scores(scored: &[(String, f32)]) -> Vec<(String, f32)> {
     if scored.is_empty() {
         return Vec::new();
     }
-    let min = scored
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f32::INFINITY, f32::min);
+    let min = scored.iter().map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
     let max = scored
         .iter()
         .map(|(_, s)| *s)
@@ -320,10 +321,18 @@ pub fn rebuild_index() -> Result<String, String> {
 }
 
 /// Free-function entry points used by the tools.
-pub fn semantic_search(query: &str, category: Option<&str>, limit: usize) -> Result<Vec<RagHit>, String> {
+pub fn semantic_search(
+    query: &str,
+    category: Option<&str>,
+    limit: usize,
+) -> Result<Vec<RagHit>, String> {
     ensure_rag_store()?.semantic_search(query, category, limit)
 }
 
-pub fn hybrid_search(query: &str, category: Option<&str>, limit: usize) -> Result<Vec<RagHit>, String> {
+pub fn hybrid_search(
+    query: &str,
+    category: Option<&str>,
+    limit: usize,
+) -> Result<Vec<RagHit>, String> {
     ensure_rag_store()?.hybrid_search(query, category, limit)
 }

@@ -1,7 +1,4 @@
-use crate::ai::{
-    history::Message,
-    types::App,
-};
+use crate::ai::{history::Message, types::App};
 
 /// Dependency-inversion entry point: lets a `HistoryStore` be injected as the history
 /// storage implementation (audit/encryption/mock/testing).
@@ -23,10 +20,7 @@ pub(in crate::ai::driver::turn_runtime) fn persist_pending_turn_messages_with_st
     }
     if *persisted_turn_messages == 0 {
         if let Some(first) = turn_messages.first() {
-            let _ = crate::ai::history::coalesce_repeated_wait_wake_notes(
-                history_file,
-                first,
-            );
+            let _ = crate::ai::history::coalesce_repeated_wait_wake_notes(history_file, first);
         }
     }
     if let Err(err) = store.append_messages_for_model(

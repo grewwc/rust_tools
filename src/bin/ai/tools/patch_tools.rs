@@ -1920,10 +1920,7 @@ fn locate_hunk(
             return Ok(Some(pos));
         }
         return Err(describe_ambiguous_hunk(
-            orig_lines,
-            &forward,
-            hunk_idx,
-            hunk_total,
+            orig_lines, &forward, hunk_idx, hunk_total,
         ));
     }
     // forward is already filtered to p >= cursor, so "hunks out of order" cannot
@@ -1954,7 +1951,8 @@ fn apply_unified_patch_with_hints(
     patch: &str,
 ) -> Result<(String, Vec<String>), String> {
     let had_trailing_newline = original.ends_with('\n');
-    let hunks = parse_unified_hunks(patch).map_err(|err| append_truncated_patch_hint(patch, err))?;
+    let hunks =
+        parse_unified_hunks(patch).map_err(|err| append_truncated_patch_hint(patch, err))?;
     if !hunks.iter().any(|hunk| {
         hunk.lines
             .iter()
@@ -2008,9 +2006,7 @@ fn apply_unified_patch_with_hints(
                     cursor,
                     MatchMode::Strict,
                 ) {
-                    Ok(Some(candidate)) => {
-                        (candidate.pos, MatchMode::Strict, ContextPolicy::Fuzz)
-                    }
+                    Ok(Some(candidate)) => (candidate.pos, MatchMode::Strict, ContextPolicy::Fuzz),
                     _ => match locate_hunk_with_fuzzy_context(
                         &orig_lines,
                         hunk,
@@ -2022,8 +2018,11 @@ fn apply_unified_patch_with_hints(
                         }
                         None => {
                             return Err(describe_context_mismatch(
-                                &orig_lines, hunk, hunk_idx, hunk_total,
-                            ))
+                                &orig_lines,
+                                hunk,
+                                hunk_idx,
+                                hunk_total,
+                            ));
                         }
                     },
                 },
@@ -2031,10 +2030,10 @@ fn apply_unified_patch_with_hints(
         };
 
         out.extend_from_slice(&orig_lines[cursor..apply_at]);
-        let (hunk_out, new_idx) = try_apply_hunk_at(&orig_lines, hunk, apply_at, mode, context_policy)
-            .ok_or_else(|| {
-                describe_context_mismatch(&orig_lines, hunk, hunk_idx, hunk_total)
-            })?;
+        let (hunk_out, new_idx) =
+            try_apply_hunk_at(&orig_lines, hunk, apply_at, mode, context_policy).ok_or_else(
+                || describe_context_mismatch(&orig_lines, hunk, hunk_idx, hunk_total),
+            )?;
         out.extend(hunk_out);
         cursor = new_idx;
     }
@@ -2376,8 +2375,7 @@ fn prepare_patch_write(
     } else {
         None
     };
-    let (action, hints) =
-        if matches!(envelope.op, PatchEnvelopeOp::Update | PatchEnvelopeOp::Add) {
+    let (action, hints) = if matches!(envelope.op, PatchEnvelopeOp::Update | PatchEnvelopeOp::Add) {
         // On the first encounter of a file, keep the disk-existence check so the
         // single-section behavior is unchanged; repeated sections for the same file
         // are handled by prepare_patch_action_from_content against in-memory state.
@@ -2656,8 +2654,8 @@ fn execute_apply_patch_impl(args: &Value, mut emit: impl FnMut(&str)) -> Result<
     }
     emit("parsing patch envelope");
     let initial_file_path = optional_file_path_arg(args);
-    if let Some(envelopes) = parse_patch_envelopes(&patch)
-        .map_err(|err| append_truncated_patch_hint(&patch, err))?
+    if let Some(envelopes) =
+        parse_patch_envelopes(&patch).map_err(|err| append_truncated_patch_hint(&patch, err))?
     {
         // Each section inside an envelope (single-file or multi-file) already declares its own target path, so `file_path` is
         // redundant. Models often redundantly pass `file_path` for multi-file envelopes; instead of hard-erroring and wasting a round,
@@ -2928,4 +2926,3 @@ pub(crate) fn execute_apply_patch_streaming(
 #[cfg(test)]
 #[path = "patch_tools_tests.rs"]
 mod tests;
-

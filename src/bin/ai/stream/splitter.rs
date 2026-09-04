@@ -966,11 +966,7 @@ impl StreamSplitter {
             let keep_len = if flush_all {
                 0
             } else {
-                longest_marker_prefix_suffix(
-                    &self.pending,
-                    markers,
-                    &mut self.char_offset_scratch,
-                )
+                longest_marker_prefix_suffix(&self.pending, markers, &mut self.char_offset_scratch)
             };
             let emit_len = self.pending.len().saturating_sub(keep_len);
             if emit_len == 0 {
@@ -1291,7 +1287,7 @@ mod tests {
         assert!(events.is_empty());
     }
 
-            // ── Hallucinated "tool result" protocol markers (bug A/B fix) ──────────────────────────
+    // ── Hallucinated "tool result" protocol markers (bug A/B fix) ──────────────────────────
 
     #[test]
     fn anthropic_streamer_swallows_hallucinated_result_block_and_signals() {

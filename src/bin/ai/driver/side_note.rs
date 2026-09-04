@@ -9,18 +9,18 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::ai::history::{runtime_synthetic_user_message, Message};
+use crate::ai::history::{Message, runtime_synthetic_user_message};
 
 const SIDE_NOTE_DIR: &str = "side_notes";
 const FOREGROUND_FILE: &str = "foreground.jsonl";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SideNote {
-    pub from: String,              // "user" | "lead" | task_id
+    pub from: String, // "user" | "lead" | task_id
     pub content: String,
     pub ts: u64,
     #[serde(default)]
-    pub target: Option<String>,    // None=foreground, Some(task_id)
+    pub target: Option<String>, // None=foreground, Some(task_id)
 }
 
 fn now_ts() -> u64 {
@@ -61,7 +61,13 @@ pub fn side_note_file(history_file: &Path, target: Option<&str>) -> PathBuf {
 
 fn sanitize_task_id(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -232,7 +238,8 @@ mod tests {
 
     // No tempfile dependency in this project; reuse the existing std::env::temp_dir + uuid pattern.
     fn temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("side_note_test_{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("side_note_test_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

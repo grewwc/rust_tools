@@ -182,10 +182,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                                 .is_some_and(|text| text.starts_with(REASONING_ONLY_RETRY_MARKER))
                     })
                     .count();
-                let already_forced_synthesis = current_turn_has_internal_marker(
-                    messages,
-                    REASONING_ONLY_SYNTHESIS_MARKER,
-                );
+                let already_forced_synthesis =
+                    current_turn_has_internal_marker(messages, REASONING_ONLY_SYNTHESIS_MARKER);
                 // The iteration hard cap remains the final fallback: at max_iterations the
                 // round stops with a user-visible error.
                 if iteration >= max_iterations {
@@ -366,8 +364,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     question,
                     turn_messages,
                     &stream_result.assistant_text,
-                )
-            {
+                ) {
                 DanglingFinalRecoveryAction::Warn
             } else {
                 dangling_final_recovery_action(
@@ -433,10 +430,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     &mut stream_result.assistant_text,
                     FINAL_CITATION_WARNING,
                 );
-                append_user_visible_final_notice(
-                    terminal_dedupe_candidate,
-                    FINAL_CITATION_WARNING,
-                );
+                append_user_visible_final_notice(terminal_dedupe_candidate, FINAL_CITATION_WARNING);
                 record_hidden_self_note(app, turn_messages, FINAL_CITATION_UNVERIFIED_NOTE);
             }
             // At the hard cap we no longer reopen, but unreaped subtasks must still enter
@@ -690,7 +684,12 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                             ..
                         }
                     ) {
-                        record_force_final_reason(messages, "kernel_tool_call_rlimit", iteration, None);
+                        record_force_final_reason(
+                            messages,
+                            "kernel_tool_call_rlimit",
+                            iteration,
+                            None,
+                        );
                         *force_final_response = true;
                     }
                 }

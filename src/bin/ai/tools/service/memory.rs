@@ -624,10 +624,7 @@ pub(crate) fn search_memo_candidates_scored(
     let mut scored: Vec<ScoredMemo> = Vec::with_capacity(visible.len());
     for e in visible {
         let score = lexical(&e);
-        scored.push(ScoredMemo {
-            entry: e,
-            score,
-        });
+        scored.push(ScoredMemo { entry: e, score });
     }
     scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
     scored.truncate(limit);
@@ -1022,7 +1019,9 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
 
         Ok(format!(
             "Dedup done: {} -> {} (exact: {})",
-            total_before, final_entries.len(), exact_dedup_removed,
+            total_before,
+            final_entries.len(),
+            exact_dedup_removed,
         ))
     })
 }

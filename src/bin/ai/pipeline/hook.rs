@@ -6,13 +6,17 @@
 // post_turn). Hooks are pure in-memory callbacks with no subprocess
 // dependency, suitable for unit tests and middleware injection.
 
-use std::collections::HashMap;
 use super::context::{PipelineContext, StageKind};
 use crate::ai::ports::stream::{FilterChain, StreamFilter};
+use std::collections::HashMap;
 
 /// Hook callback signature: synchronous and fallible; for async, use
 /// block_on / the middleware chain.
-pub type HookFn = Box<dyn Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>;
+pub type HookFn = Box<
+    dyn Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+        + Send
+        + Sync,
+>;
 
 /// Metadata for a single registered hook (for debugging and deduplication).
 pub struct HookEntry {
@@ -33,13 +37,17 @@ pub struct HookRegistry {
 }
 
 impl HookRegistry {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub(crate) fn register_stream_filter<F: StreamFilter + 'static>(&mut self, filter: F) {
         self.stream_filters.register(filter);
     }
 
-    pub(crate) fn stream_filters(&self) -> &FilterChain { &self.stream_filters }
+    pub(crate) fn stream_filters(&self) -> &FilterChain {
+        &self.stream_filters
+    }
 
     /// Copies the parent's stream filter chain into this registry.
     ///
@@ -58,49 +66,91 @@ impl HookRegistry {
 
     pub fn register_before<F>(&mut self, kind: StageKind, name: &'static str, f: F)
     where
-        F: Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync + 'static,
+        F: Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.before.entry(kind).or_default().push(HookEntry { name, func: Box::new(f) });
+        self.before.entry(kind).or_default().push(HookEntry {
+            name,
+            func: Box::new(f),
+        });
     }
 
     pub fn register_after<F>(&mut self, kind: StageKind, name: &'static str, f: F)
     where
-        F: Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync + 'static,
+        F: Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.after.entry(kind).or_default().push(HookEntry { name, func: Box::new(f) });
+        self.after.entry(kind).or_default().push(HookEntry {
+            name,
+            func: Box::new(f),
+        });
     }
 
     pub fn register_global_before<F>(&mut self, name: &'static str, f: F)
     where
-        F: Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync + 'static,
+        F: Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.global_before.push(HookEntry { name, func: Box::new(f) });
+        self.global_before.push(HookEntry {
+            name,
+            func: Box::new(f),
+        });
     }
 
     pub fn register_global_after<F>(&mut self, name: &'static str, f: F)
     where
-        F: Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync + 'static,
+        F: Fn(&mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.global_after.push(HookEntry { name, func: Box::new(f) });
+        self.global_after.push(HookEntry {
+            name,
+            func: Box::new(f),
+        });
     }
 
     /// Fires the before hooks for the given stage (in registration order),
     /// short-circuiting with Err on the first failure.
-    pub fn fire_before(&self, ctx: &mut PipelineContext<'_>, kind: StageKind) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn fire_before(
+        &self,
+        ctx: &mut PipelineContext<'_>,
+        kind: StageKind,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Keep ctx.stage aligned with the stage being fired: regardless of
         // whether the caller (runner / driver hooks) advances manually, hooks
         // observe the real trigger point instead of the Prepare default from
         // new().
         ctx.stage = kind;
-        for h in self.global_before.iter().chain(self.before.get(&kind).into_iter().flatten()) {
+        for h in self
+            .global_before
+            .iter()
+            .chain(self.before.get(&kind).into_iter().flatten())
+        {
             (h.func)(ctx)?;
         }
         Ok(())
     }
 
-    pub fn fire_after(&self, ctx: &mut PipelineContext<'_>, kind: StageKind) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn fire_after(
+        &self,
+        ctx: &mut PipelineContext<'_>,
+        kind: StageKind,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ctx.stage = kind;
-        for h in self.after.get(&kind).into_iter().flatten().chain(self.global_after.iter()) {
+        for h in self
+            .after
+            .get(&kind)
+            .into_iter()
+            .flatten()
+            .chain(self.global_after.iter())
+        {
             (h.func)(ctx)?;
         }
         Ok(())
@@ -108,7 +158,11 @@ impl HookRegistry {
 
     /// Fires only a stage's own before hooks (excluding global hooks, to avoid
     /// double-firing turn-level global hooks).
-    pub fn fire_stage_before(&self, ctx: &mut PipelineContext<'_>, kind: StageKind) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn fire_stage_before(
+        &self,
+        ctx: &mut PipelineContext<'_>,
+        kind: StageKind,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ctx.stage = kind;
         for h in self.before.get(&kind).into_iter().flatten() {
             (h.func)(ctx)?;
@@ -117,7 +171,11 @@ impl HookRegistry {
     }
 
     /// Fires only a stage's own after hooks (excluding global hooks).
-    pub fn fire_stage_after(&self, ctx: &mut PipelineContext<'_>, kind: StageKind) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn fire_stage_after(
+        &self,
+        ctx: &mut PipelineContext<'_>,
+        kind: StageKind,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ctx.stage = kind;
         for h in self.after.get(&kind).into_iter().flatten() {
             (h.func)(ctx)?;
@@ -142,12 +200,22 @@ impl HookRegistry {
     }
 
     /// Fires global hooks (not bound to a StageKind).
-    pub fn fire_global_before(&self, ctx: &mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for h in &self.global_before { (h.func)(ctx)?; }
+    pub fn fire_global_before(
+        &self,
+        ctx: &mut PipelineContext<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for h in &self.global_before {
+            (h.func)(ctx)?;
+        }
         Ok(())
     }
-    pub fn fire_global_after(&self, ctx: &mut PipelineContext<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for h in &self.global_after { (h.func)(ctx)?; }
+    pub fn fire_global_after(
+        &self,
+        ctx: &mut PipelineContext<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for h in &self.global_after {
+            (h.func)(ctx)?;
+        }
         Ok(())
     }
     pub fn len(&self) -> usize {
@@ -175,8 +243,14 @@ mod tests {
     #[test]
     fn hook_fires_in_order() {
         let mut reg = HookRegistry::new();
-        reg.register_before(StageKind::Prepare, "a", |ctx| { ctx.tags.push("a".into()); Ok(()) });
-        reg.register_before(StageKind::Prepare, "b", |ctx| { ctx.tags.push("b".into()); Ok(()) });
+        reg.register_before(StageKind::Prepare, "a", |ctx| {
+            ctx.tags.push("a".into());
+            Ok(())
+        });
+        reg.register_before(StageKind::Prepare, "b", |ctx| {
+            ctx.tags.push("b".into());
+            Ok(())
+        });
         let app = leak_app();
         let mut ctx = PipelineContext::new(app, vec![], 0);
         reg.fire_before(&mut ctx, StageKind::Prepare).unwrap();
@@ -187,8 +261,13 @@ mod tests {
     #[test]
     fn hook_short_circuits_on_error() {
         let mut reg = HookRegistry::new();
-        reg.register_before(StageKind::Prepare, "fail", |_| Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "boom")) as _));
-        reg.register_before(StageKind::Prepare, "never", |ctx| { ctx.tags.push("never".into()); Ok(()) });
+        reg.register_before(StageKind::Prepare, "fail", |_| {
+            Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "boom")) as _)
+        });
+        reg.register_before(StageKind::Prepare, "never", |ctx| {
+            ctx.tags.push("never".into());
+            Ok(())
+        });
         let app = leak_app();
         let mut ctx = PipelineContext::new(app, vec![], 0);
         assert!(reg.fire_before(&mut ctx, StageKind::Prepare).is_err());

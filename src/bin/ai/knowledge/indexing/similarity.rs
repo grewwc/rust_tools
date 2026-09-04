@@ -170,12 +170,12 @@ const STOPWORDS_ZH_BIGRAM: &[&str] = &[
 /// English function words. Deliberately excludes negation ("not" is included,
 /// "no" is not) and content words.
 const STOPWORDS_EN: &[&str] = &[
-    "a", "about", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can", "could",
-    "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "his", "i", "if", "in",
-    "into", "is", "it", "its", "may", "me", "might", "must", "my", "not", "of", "on", "or", "our",
-    "shall", "she", "should", "so", "than", "that", "the", "their", "them", "these", "they", "this",
-    "those", "to", "us", "was", "we", "were", "what", "when", "where", "which", "who", "will", "with",
-    "would", "you", "your",
+    "a", "about", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can",
+    "could", "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "his", "i",
+    "if", "in", "into", "is", "it", "its", "may", "me", "might", "must", "my", "not", "of", "on",
+    "or", "our", "shall", "she", "should", "so", "than", "that", "the", "their", "them", "these",
+    "they", "this", "those", "to", "us", "was", "we", "were", "what", "when", "where", "which",
+    "who", "will", "with", "would", "you", "your",
 ];
 
 fn is_stopword(t: &str) -> bool {
@@ -215,7 +215,10 @@ mod tests {
         assert_eq!(norm_text("ＡＢＣ  ｄｅｆ"), "abc def");
         assert_eq!(norm_text("Rust\tTools\n\n2024"), "rust tools 2024");
         assert_eq!(norm_text("　中文　全角空格"), "中文 全角空格");
-        assert_eq!(norm_text("  leading and trailing  "), "leading and trailing");
+        assert_eq!(
+            norm_text("  leading and trailing  "),
+            "leading and trailing"
+        );
     }
 
     #[test]

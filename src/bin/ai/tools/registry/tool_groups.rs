@@ -90,7 +90,10 @@ mod tests {
     fn from_name_is_case_insensitive_and_rejects_unknown() {
         assert_eq!(ToolGroup::from_name("core"), Some(ToolGroup::Core));
         assert_eq!(ToolGroup::from_name("Executor"), Some(ToolGroup::Executor));
-        assert_eq!(ToolGroup::from_name("AGENT_TEAM"), Some(ToolGroup::AgentTeam));
+        assert_eq!(
+            ToolGroup::from_name("AGENT_TEAM"),
+            Some(ToolGroup::AgentTeam)
+        );
         // Removed legacy group name must no longer resolve anywhere.
         assert_eq!(ToolGroup::from_name("openclaw"), None);
         assert_eq!(ToolGroup::from_name("no_such_group"), None);

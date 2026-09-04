@@ -2,10 +2,10 @@
 // TurnPipeline - turn-level pipeline trait (abstracts the orchestrator's flat
 // flow into a replaceable object)
 // =============================================================================
-use std::{future::Future, pin::Pin};
 use super::context::{PipelineContext, StageKind};
 use super::hook::HookRegistry;
 use super::stage::Pipeline;
+use std::{future::Future, pin::Pin};
 
 /// Turn pipeline abstraction: the driver depends only on this trait, not on the
 /// concrete stage composition or hook implementations. This eases unit-test
@@ -17,7 +17,9 @@ pub trait TurnPipeline: Send + Sync {
         &'a self,
         ctx: &'a mut PipelineContext<'_>,
         hooks: &'a HookRegistry,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>,
+    >;
 }
 
 /// Default implementation: wraps `Pipeline` + hook firing (before/after per StageKind order).
@@ -27,17 +29,25 @@ pub struct DefaultTurnPipeline {
 }
 
 impl DefaultTurnPipeline {
-    pub fn new(name: &'static str, pipeline: Pipeline) -> Self { Self { name, pipeline } }
-    pub fn pipeline(&self) -> &Pipeline { &self.pipeline }
+    pub fn new(name: &'static str, pipeline: Pipeline) -> Self {
+        Self { name, pipeline }
+    }
+    pub fn pipeline(&self) -> &Pipeline {
+        &self.pipeline
+    }
 }
 
 impl TurnPipeline for DefaultTurnPipeline {
-    fn name(&self) -> &'static str { self.name }
+    fn name(&self) -> &'static str {
+        self.name
+    }
     fn run<'a>(
         &'a self,
         ctx: &'a mut PipelineContext<'_>,
         hooks: &'a HookRegistry,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>,
+    > {
         // Fire global before hooks, run the Pipeline (executing stages in
         // sequence, including per-stage hooks), then fire global after hooks.
         // `Stage::execute` / `Pipeline::execute` decouple ctx's borrow lifetime
@@ -64,12 +74,22 @@ mod tests {
 
     struct TagStage(&'static str);
     impl Stage for TagStage {
-        fn name(&self) -> &'static str { self.0 }
-        fn kind(&self) -> StageKind { StageKind::BuildRequest }
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn kind(&self) -> StageKind {
+            StageKind::BuildRequest
+        }
         fn execute<'a, 'b>(
             &'a self,
             ctx: &'a mut PipelineContext<'b>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+                    + Send
+                    + 'a,
+            >,
+        > {
             Box::pin(async move {
                 ctx.tags.push(self.0.to_string());
                 Ok(())
@@ -87,8 +107,14 @@ mod tests {
         let pipeline = Pipeline::new().push(TagStage("s1")).push(TagStage("s2"));
         let tp = DefaultTurnPipeline::new("test", pipeline);
         let mut hooks = HookRegistry::new();
-        hooks.register_global_before("gb", |ctx| { ctx.tags.push("before".into()); Ok(()) });
-        hooks.register_global_after("ga", |ctx| { ctx.tags.push("after".into()); Ok(()) });
+        hooks.register_global_before("gb", |ctx| {
+            ctx.tags.push("before".into());
+            Ok(())
+        });
+        hooks.register_global_after("ga", |ctx| {
+            ctx.tags.push("after".into());
+            Ok(())
+        });
         let app = leak_app();
         let mut ctx = PipelineContext::new(app, vec![], 0);
         tp.run(&mut ctx, &hooks).await.unwrap();
@@ -104,15 +130,30 @@ mod tests {
         let pipeline = Pipeline::new().push(TagStage("s1")).push(TagStage("s2"));
         let tp = DefaultTurnPipeline::new("test-per-stage", pipeline);
         let mut hooks = HookRegistry::new();
-        hooks.register_before(StageKind::BuildRequest, "b", |ctx| { ctx.tags.push("b".into()); Ok(()) });
-        hooks.register_after(StageKind::BuildRequest, "a", |ctx| { ctx.tags.push("a".into()); Ok(()) });
-        hooks.register_global_before("gb", |ctx| { ctx.tags.push("before".into()); Ok(()) });
-        hooks.register_global_after("ga", |ctx| { ctx.tags.push("after".into()); Ok(()) });
+        hooks.register_before(StageKind::BuildRequest, "b", |ctx| {
+            ctx.tags.push("b".into());
+            Ok(())
+        });
+        hooks.register_after(StageKind::BuildRequest, "a", |ctx| {
+            ctx.tags.push("a".into());
+            Ok(())
+        });
+        hooks.register_global_before("gb", |ctx| {
+            ctx.tags.push("before".into());
+            Ok(())
+        });
+        hooks.register_global_after("ga", |ctx| {
+            ctx.tags.push("after".into());
+            Ok(())
+        });
         let app = leak_app();
         let mut ctx = PipelineContext::new(app, vec![], 0);
         tp.run(&mut ctx, &hooks).await.unwrap();
         // Per-stage hooks fire once around each stage; global hooks fire once at
         // the very beginning and end of the turn.
-        assert_eq!(ctx.tags, vec!["before", "b", "s1", "a", "b", "s2", "a", "after"]);
+        assert_eq!(
+            ctx.tags,
+            vec!["before", "b", "s1", "a", "b", "s2", "a", "after"]
+        );
     }
 }

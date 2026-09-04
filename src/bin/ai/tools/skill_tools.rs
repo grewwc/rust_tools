@@ -27,8 +27,9 @@ pub(crate) enum PendingSkillAction {
     Remove(String),
 }
 
-pub(crate) static PENDING_SKILL_ACTIVATION: LazyLock<RwLock<FastMap<(String, usize), Vec<PendingSkillAction>>>> =
-    LazyLock::new(|| RwLock::new(FastMap::default()));
+pub(crate) static PENDING_SKILL_ACTIVATION: LazyLock<
+    RwLock<FastMap<(String, usize), Vec<PendingSkillAction>>>,
+> = LazyLock::new(|| RwLock::new(FastMap::default()));
 
 /// Explicit interaction boundary recorded by `request_user_input` for the current turn. Isolated by `(session_id, turn_id)`
 /// so requests from parallel subagents or other sessions cannot pollute the current foreground turn.
@@ -43,7 +44,9 @@ fn current_turn_identity() -> (String, usize) {
 
 fn set_pending_skill_action(action: PendingSkillAction) {
     if let Ok(mut slot) = PENDING_SKILL_ACTIVATION.write() {
-        slot.entry(current_turn_identity()).or_default().push(action);
+        slot.entry(current_turn_identity())
+            .or_default()
+            .push(action);
     }
 }
 
@@ -318,18 +321,29 @@ fn collect_resource_files(resource_path: &str, subdir: Option<&str>) -> Vec<Stri
     files
 }
 
-fn collect_files_recursive(root: &std::path::Path, cur: &std::path::Path, out: &mut Vec<String>, cap: usize) {
+fn collect_files_recursive(
+    root: &std::path::Path,
+    cur: &std::path::Path,
+    out: &mut Vec<String>,
+    cap: usize,
+) {
     if out.len() >= cap {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(cur) else { return; };
+    let Ok(rd) = std::fs::read_dir(cur) else {
+        return;
+    };
     let mut entries = rd.flatten().collect::<Vec<_>>();
     entries.sort_by(|a, b| a.path().cmp(&b.path()));
     for entry in entries {
-        if out.len() >= cap { break; }
+        if out.len() >= cap {
+            break;
+        }
         let path = entry.path();
         let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if file_name.starts_with('.') { continue; }
+        if file_name.starts_with('.') {
+            continue;
+        }
         if path.is_dir() {
             collect_files_recursive(root, &path, out, cap);
         } else if path.is_file() {
@@ -391,11 +405,18 @@ fn render_loaded_skill_with_all(skill: &SkillManifest, all: &[SkillManifest]) ->
         }
         // List child skills (passed in by the caller as all, avoiding duplicated full IO)
     }
-    let children: Vec<&SkillManifest> = all.iter().filter(|s| s.parent.as_deref() == Some(skill.name.as_str())).collect();
+    let children: Vec<&SkillManifest> = all
+        .iter()
+        .filter(|s| s.parent.as_deref() == Some(skill.name.as_str()))
+        .collect();
     if !children.is_empty() {
         out.push_str("\n## sub-skills\nThis skill contains sub-skills:\n");
         for ch in children {
-            let desc = ch.description.split_whitespace().collect::<Vec<_>>().join(" ");
+            let desc = ch
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             if desc.is_empty() {
                 out.push_str(&format!("- `{}`\n", ch.name));
             } else {
@@ -505,18 +526,25 @@ pub(crate) fn execute_list_skill_resources(args: &Value) -> Result<String, Strin
     if !category.is_empty() {
         const ALLOWED: &[&str] = &["references", "examples", "scripts"];
         if category.contains("..") || category.contains('/') || category.contains('\\') {
-            return Err(format!("Invalid category '{category}': must be one of references/examples/scripts and must not contain path separators"));
+            return Err(format!(
+                "Invalid category '{category}': must be one of references/examples/scripts and must not contain path separators"
+            ));
         }
         if !ALLOWED.contains(&category) {
-            return Err(format!("Invalid category '{category}': allowed values are references, examples, scripts"));
+            return Err(format!(
+                "Invalid category '{category}': allowed values are references, examples, scripts"
+            ));
         }
     }
     let skill = resolve_skill_for_resource(name)?;
-    let resource_path = skill
-        .resource_path
-        .as_deref()
-        .ok_or_else(|| format!("Skill '{name}' has no bundled resource directory (single-file skill)"))?;
-    let subdir = if category.is_empty() { None } else { Some(category) };
+    let resource_path = skill.resource_path.as_deref().ok_or_else(|| {
+        format!("Skill '{name}' has no bundled resource directory (single-file skill)")
+    })?;
+    let subdir = if category.is_empty() {
+        None
+    } else {
+        Some(category)
+    };
     let files = collect_resource_files(resource_path, subdir);
     if files.is_empty() {
         let dir_label = if let Some(c) = subdir {
@@ -542,7 +570,10 @@ pub(crate) fn execute_list_skill_resources(args: &Value) -> Result<String, Strin
         out.push_str(&format!("- {rel} ({size} bytes)\n"));
     }
     if total > shown {
-        out.push_str(&format!("... and {} more files (use limit to see more)\n", total - shown));
+        out.push_str(&format!(
+            "... and {} more files (use limit to see more)\n",
+            total - shown
+        ));
     }
     out.push_str("Use `read_skill_resource(name, path)` to read a file.\n");
     Ok(out)
@@ -672,7 +703,10 @@ fn safe_skill_dir_name(name: &str) -> String {
     // Strip the .skill suffix (if any) so the file and dir basenames match: a.b.skill ↔ a.b
     if base.to_ascii_lowercase().ends_with(".skill") {
         if let Some(stripped) = base.get(..base.len() - ".skill".len()) {
-            base = stripped.trim_end_matches('-').trim_end_matches('.').to_string();
+            base = stripped
+                .trim_end_matches('-')
+                .trim_end_matches('.')
+                .to_string();
             if base.is_empty() {
                 base = "skill".to_string();
             }
@@ -750,26 +784,33 @@ fn parse_resources_arg(args: &Value) -> Result<Vec<(String, String)>, String> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .trim();
-                let content = obj
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 if path.is_empty() {
                     return Err("resources[]: each entry requires non-empty 'path'".to_string());
                 }
                 validate_resource_relative_path(path)?;
                 out.push((path.to_string(), content.to_string()));
             } else {
-                return Err("resources[] entries must be objects with 'path' and 'content'".to_string());
+                return Err(
+                    "resources[] entries must be objects with 'path' and 'content'".to_string(),
+                );
             }
         }
     }
     // Category shortcut fields: references / examples / scripts, same-shaped arrays each; a path without a directory gets the prefix auto-added
-    for (key, prefix) in [("references", "references"), ("examples", "examples"), ("scripts", "scripts")] {
+    for (key, prefix) in [
+        ("references", "references"),
+        ("examples", "examples"),
+        ("scripts", "scripts"),
+    ] {
         if let Some(arr) = args.get(key).and_then(|v| v.as_array()) {
             for item in arr {
                 if let Some(obj) = item.as_object() {
-                    let raw_path = obj.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let raw_path = obj
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
                     let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     let path = if raw_path.is_empty() {
                         return Err(format!("{key}[]: each entry requires 'path'"));
@@ -781,7 +822,9 @@ fn parse_resources_arg(args: &Value) -> Result<Vec<(String, String)>, String> {
                     validate_resource_relative_path(&path)?;
                     out.push((path, content.to_string()));
                 } else {
-                    return Err(format!("{key}[] entries must be objects with 'path' and 'content'"));
+                    return Err(format!(
+                        "{key}[] entries must be objects with 'path' and 'content'"
+                    ));
                 }
             }
         }
@@ -795,21 +838,38 @@ fn parse_subskills_arg(args: &Value) -> Result<Vec<Value>, String> {
     };
     let mut out = Vec::new();
     for (idx, item) in arr.iter().enumerate() {
-        let obj = item.as_object().ok_or_else(|| format!("subskills[{idx}] must be an object"))?;
-        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
-        let prompt = obj.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let obj = item
+            .as_object()
+            .ok_or_else(|| format!("subskills[{idx}] must be an object"))?;
+        let name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let prompt = obj
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if name.is_empty() {
-            return Err(format!("subskills[{idx}].name is required and must be non-empty"));
+            return Err(format!(
+                "subskills[{idx}].name is required and must be non-empty"
+            ));
         }
         if prompt.is_empty() {
-            return Err(format!("subskills[{idx}].prompt is required and must be non-empty"));
+            return Err(format!(
+                "subskills[{idx}].prompt is required and must be non-empty"
+            ));
         }
         out.push(item.clone());
     }
     Ok(out)
 }
 
-fn write_resource_files(base_dir: &std::path::Path, resources: &[(String, String)]) -> Result<(), String> {
+fn write_resource_files(
+    base_dir: &std::path::Path,
+    resources: &[(String, String)],
+) -> Result<(), String> {
     write_resource_files_with_overwrite(base_dir, resources, true)
 }
 
@@ -821,8 +881,7 @@ fn write_resource_files_with_overwrite(
     // Ensure base_dir exists and is canonicalizable (upfront validation)
     fs::create_dir_all(base_dir)
         .map_err(|e| format!("Failed to create dir {}: {e}", base_dir.display()))?;
-    let canonical_base = fs::canonicalize(base_dir)
-        .unwrap_or_else(|_| base_dir.to_path_buf());
+    let canonical_base = fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
     for (rel, content) in resources {
         let rel_clean = rel.trim().trim_matches('/').replace('\\', "/");
         // Reuse the existing validation (covers .. and absolute paths)
@@ -838,7 +897,9 @@ fn write_resource_files_with_overwrite(
             // Canonical check on the already-created parent
             if let Ok(canonical_parent) = fs::canonicalize(parent) {
                 if !canonical_parent.starts_with(&canonical_base) {
-                    return Err(format!("Resource path escapes package directory: {validated}"));
+                    return Err(format!(
+                        "Resource path escapes package directory: {validated}"
+                    ));
                 }
             }
         }
@@ -848,12 +909,15 @@ fn write_resource_files_with_overwrite(
                 target.display()
             ));
         }
-        fs::write(&target, content).map_err(|e| format!("Failed to write resource {validated}: {e}"))?;
+        fs::write(&target, content)
+            .map_err(|e| format!("Failed to write resource {validated}: {e}"))?;
         // Post-write re-validation (handles symlink races)
         if let (Ok(cb), Ok(ct)) = (fs::canonicalize(&canonical_base), fs::canonicalize(&target)) {
             if !ct.starts_with(&cb) {
                 let _ = fs::remove_file(&target);
-                return Err(format!("Resource path escapes package directory: {validated}"));
+                return Err(format!(
+                    "Resource path escapes package directory: {validated}"
+                ));
             }
         }
     }
@@ -861,7 +925,11 @@ fn write_resource_files_with_overwrite(
 }
 
 pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
-    let name = args["name"].as_str().ok_or("Missing name")?.trim().to_string();
+    let name = args["name"]
+        .as_str()
+        .ok_or("Missing name")?
+        .trim()
+        .to_string();
     if name.is_empty() {
         return Err("name is empty".to_string());
     }
@@ -875,7 +943,7 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     let overwrite = args["overwrite"].as_bool().unwrap_or(true);
 
     if !has_package_features {
-    // Legacy behavior compatibility: single-file `*.skill`
+        // Legacy behavior compatibility: single-file `*.skill`
         let content = build_skill_file_content(args)?;
         let file_name = args["file_name"]
             .as_str()
@@ -891,7 +959,11 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
             ));
         }
         fs::write(&path, content).map_err(|e| format!("Failed to write skill file: {e}"))?;
-        return Ok(format!("Skill saved: {}\nSkill name: {}", path.display(), name));
+        return Ok(format!(
+            "Skill saved: {}\nSkill name: {}",
+            path.display(),
+            name
+        ));
     }
 
     // ===== Package layout: `skills_dir/<package_dir>/SKILL.md` + resources + subskills =====
@@ -906,7 +978,9 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
                 continue;
             }
             if sub_name == name {
-                return Err(format!("Subskill name must not equal parent skill name: '{sub_name}'"));
+                return Err(format!(
+                    "Subskill name must not equal parent skill name: '{sub_name}'"
+                ));
             }
             if let Some(ep) = sub.get("parent").and_then(|v| v.as_str()) {
                 let ep = ep.trim();
@@ -919,7 +993,9 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
             }
             let dir_name = safe_skill_dir_name(&sub_name);
             if !seen_dirs.insert(dir_name.clone()) {
-                return Err(format!("Duplicate subskill directory name (sanitized collision): '{sub_name}' -> '{dir_name}'"));
+                return Err(format!(
+                    "Duplicate subskill directory name (sanitized collision): '{sub_name}' -> '{dir_name}'"
+                ));
             }
         }
     }
@@ -927,10 +1003,16 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     let package_dir = dir.join(&package_dir_name);
     let legacy_file = dir.join(safe_skill_file_name(&name));
     if package_dir.exists() && !overwrite {
-        return Err(format!("Skill package already exists and overwrite=false: {}", package_dir.display()));
+        return Err(format!(
+            "Skill package already exists and overwrite=false: {}",
+            package_dir.display()
+        ));
     }
     if legacy_file.exists() && !overwrite {
-        return Err(format!("Legacy skill file blocks package creation and overwrite=false: {}", legacy_file.display()));
+        return Err(format!(
+            "Legacy skill file blocks package creation and overwrite=false: {}",
+            legacy_file.display()
+        ));
     }
     let main_content = build_skill_file_content(args)?;
     let tmp_dir = dir.join(format!(".tmp-{}-{}", package_dir_name, std::process::id()));
@@ -938,9 +1020,11 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
         let _ = fs::remove_dir_all(&tmp_dir);
     }
     let write_result: Result<Vec<String>, String> = (|| {
-        fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create temp skill package dir: {e}"))?;
+        fs::create_dir_all(&tmp_dir)
+            .map_err(|e| format!("Failed to create temp skill package dir: {e}"))?;
         let main_manifest = tmp_dir.join("SKILL.md");
-        fs::write(&main_manifest, &main_content).map_err(|e| format!("Failed to write skill manifest: {e}"))?;
+        fs::write(&main_manifest, &main_content)
+            .map_err(|e| format!("Failed to write skill manifest: {e}"))?;
         if !resources.is_empty() {
             write_resource_files(&tmp_dir, &resources)?;
         }
@@ -949,7 +1033,13 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
             let sub_name = sub["name"].as_str().unwrap_or("").trim().to_string();
             let sub_obj = sub.as_object().unwrap();
             let mut sub_args = sub.clone();
-            if sub_obj.get("parent").and_then(|v| v.as_str()).unwrap_or("").trim().is_empty() {
+            if sub_obj
+                .get("parent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
                 if let Some(map) = sub_args.as_object_mut() {
                     map.insert("parent".to_string(), Value::String(name.clone()));
                 }
@@ -957,15 +1047,26 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
             let sub_content = build_skill_file_content(&sub_args)?;
             let sub_dir_name = safe_skill_dir_name(&sub_name);
             let sub_dir = tmp_dir.join("subskills").join(&sub_dir_name);
-            fs::create_dir_all(&sub_dir).map_err(|e| format!("Failed to create subskill dir {}: {e}", sub_dir.display()))?;
+            fs::create_dir_all(&sub_dir)
+                .map_err(|e| format!("Failed to create subskill dir {}: {e}", sub_dir.display()))?;
             let sub_manifest = sub_dir.join("SKILL.md");
-            fs::write(&sub_manifest, sub_content).map_err(|e| format!("Failed to write subskill {sub_name}: {e}"))?;
+            fs::write(&sub_manifest, sub_content)
+                .map_err(|e| format!("Failed to write subskill {sub_name}: {e}"))?;
             if let Some(arr) = sub.get("resources").and_then(|v| v.as_array()) {
                 let mut sub_resources: Vec<(String, String)> = Vec::new();
                 for item in arr {
                     if let Some(obj) = item.as_object() {
-                        let p = obj.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                        let c = obj.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let p = obj
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let c = obj
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         validate_resource_relative_path(&p)?;
                         sub_resources.push((p, c));
                     }
@@ -974,14 +1075,31 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
                     write_resource_files(&sub_dir, &sub_resources)?;
                 }
             }
-            for (key, prefix) in [("references", "references"), ("examples", "examples"), ("scripts", "scripts")] {
+            for (key, prefix) in [
+                ("references", "references"),
+                ("examples", "examples"),
+                ("scripts", "scripts"),
+            ] {
                 if let Some(arr) = sub.get(key).and_then(|v| v.as_array()) {
                     let mut cat_resources: Vec<(String, String)> = Vec::new();
                     for item in arr {
                         if let Some(obj) = item.as_object() {
-                            let raw = obj.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                            let c = obj.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let path = if raw.contains('/') { raw } else { format!("{prefix}/{raw}") };
+                            let raw = obj
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            let c = obj
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let path = if raw.contains('/') {
+                                raw
+                            } else {
+                                format!("{prefix}/{raw}")
+                            };
                             validate_resource_relative_path(&path)?;
                             cat_resources.push((path, c));
                         }
@@ -1008,8 +1126,12 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
         if backup.exists() {
             let _ = fs::remove_dir_all(&backup);
         }
-        fs::rename(&package_dir, &backup)
-            .map_err(|e| format!("Failed to backup existing skill package {}: {e}", package_dir.display()))?;
+        fs::rename(&package_dir, &backup).map_err(|e| {
+            format!(
+                "Failed to backup existing skill package {}: {e}",
+                package_dir.display()
+            )
+        })?;
         match fs::rename(&tmp_dir, &package_dir) {
             Ok(()) => {
                 let _ = fs::remove_dir_all(&backup);
@@ -1018,17 +1140,28 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
                 // Rollback: restore the original directory best-effort
                 let _ = fs::rename(&backup, &package_dir);
                 let _ = fs::remove_dir_all(&tmp_dir);
-                return Err(format!("Failed to publish skill package {}: {e}", package_dir.display()));
+                return Err(format!(
+                    "Failed to publish skill package {}: {e}",
+                    package_dir.display()
+                ));
             }
         }
     } else {
-        fs::rename(&tmp_dir, &package_dir)
-            .map_err(|e| format!("Failed to publish skill package {}: {e}", package_dir.display()))?;
+        fs::rename(&tmp_dir, &package_dir).map_err(|e| {
+            format!(
+                "Failed to publish skill package {}: {e}",
+                package_dir.display()
+            )
+        })?;
     }
     if legacy_file.exists() {
         let _ = fs::remove_file(&legacy_file);
     }
-    let mut msg = format!("Skill package saved: {}\nSkill name: {}\nManifest: SKILL.md", package_dir.display(), name);
+    let mut msg = format!(
+        "Skill package saved: {}\nSkill name: {}\nManifest: SKILL.md",
+        package_dir.display(),
+        name
+    );
     if !resources.is_empty() {
         msg.push_str(&format!("\nResources: {} file(s)", resources.len()));
     }

@@ -393,7 +393,10 @@ fn batch_drop_matches_sequential_48k_cross_and_byte_cap() {
 fn batch_drop_drift_is_load_bearing_for_keep2_user_deletion() {
     let mut m: Vec<Message> = vec![msg("system", "sys")];
     for u in 0..6 {
-        m.push(msg("user", &long_text(&format!("user-{u}-payload-"), 2_000))); // ~22K chars
+        m.push(msg(
+            "user",
+            &long_text(&format!("user-{u}-payload-"), 2_000),
+        )); // ~22K chars
         m.push(msg("assistant", &format!("assistant-{u}")));
     }
     m.push(msg("assistant", "tail-0"));
@@ -401,7 +404,10 @@ fn batch_drop_drift_is_load_bearing_for_keep2_user_deletion() {
 
     // Sanity: total > 48K so keep=2 throughout (even after deleting users).
     let total = messages_total_chars(&m);
-    assert!(total > KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS, "total={total}");
+    assert!(
+        total > KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS,
+        "total={total}"
+    );
     // After deleting 4 below-boundary users the total must STILL exceed 48K.
     assert!(
         total - 4 * message_billable_chars(&msg("user", &long_text("x", 2_000)))

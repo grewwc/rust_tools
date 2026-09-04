@@ -49,8 +49,8 @@ mod agent_routing;
 mod background_dispatch;
 pub mod commands;
 pub mod decision_log;
-pub mod hooks;
 pub mod hook_registry;
+pub mod hooks;
 pub mod input;
 pub mod mcp_init;
 mod mcp_lifecycle;
@@ -151,8 +151,7 @@ impl SchedulerClock {
         // task_wait uses a real wall-clock budget, so it cannot rely only on a one-shot
         // delayed notify. Fold its deadline into the scheduler wait so the foreground is
         // rescanned and woken on time even if a notification is lost.
-        let task_wait_wake_after =
-            crate::ai::tools::task_tools::next_task_wait_wakeup_delay();
+        let task_wait_wake_after = crate::ai::tools::task_tools::next_task_wait_wakeup_delay();
         let wake_after = match (kernel_wake_after, task_wait_wake_after) {
             (Some(kernel), Some(task_wait)) => Some(kernel.min(task_wait)),
             (Some(delay), None) | (None, Some(delay)) => Some(delay),
@@ -352,6 +351,15 @@ pub(in crate::ai) async fn run_with_cli(
         return Ok(());
     }
 
+    // --version: print the version and exit (purely local, no LLM). Must be
+    // handled here, before startup proceeds: otherwise the flag is treated as a
+    // prompt and a full model session starts (slow, and pointless for a version
+    // query). Mirrors the `re` tool's `--version` handling.
+    if cli.version {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // --generate-completions: generate the shell completion script (purely local, no LLM)
     if cli.generate_completions {
         let shell = cli.args.first().cloned().unwrap_or_else(|| {
@@ -367,7 +375,8 @@ pub(in crate::ai) async fn run_with_cli(
     }
 
     if cli.list_tools {
-        let tool_summaries = super::tools::tool_summaries_for_groups(&[super::tools::ToolGroup::Core]);
+        let tool_summaries =
+            super::tools::tool_summaries_for_groups(&[super::tools::ToolGroup::Core]);
         print::print_builtin_tool_summaries(&tool_summaries);
         return Ok(());
     }
@@ -495,9 +504,10 @@ pub(in crate::ai) async fn run_with_cli(
                 for warning in warnings {
                     eprintln!("[tool-permissions] {warning}");
                 }
-                let mw: std::sync::Arc<dyn crate::ai::middleware::ToolMiddleware> = std::sync::Arc::new(
-                    crate::ai::tools::permissions::PermissionMiddleware::new(perms),
-                );
+                let mw: std::sync::Arc<dyn crate::ai::middleware::ToolMiddleware> =
+                    std::sync::Arc::new(crate::ai::tools::permissions::PermissionMiddleware::new(
+                        perms,
+                    ));
                 vec![mw]
             }
             None => Vec::new(),

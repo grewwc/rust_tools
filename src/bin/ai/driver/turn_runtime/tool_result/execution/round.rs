@@ -138,10 +138,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
         // The port `execute` is async; this path is synchronous driving (including test
         // threads without a tokio runtime), so futures_executor::block_on blocks the
         // current thread (independent executor, usable in any context).
-        let output = futures_executor::block_on(executor.execute(
-            app,
-            tool_call_execution.stream_result.tool_calls.clone(),
-        ))
+        let output = futures_executor::block_on(
+            executor.execute(app, tool_call_execution.stream_result.tool_calls.clone()),
+        )
         // The port error is `Box<dyn Error + Send + Sync>` while this function returns
         // `Box<dyn Error>` (Sized constraint); map to `io::Error` first then propagate
         // with `?`; no prefix is added so middleware/dispatch context is preserved.
@@ -249,7 +248,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
 /// Terminal dedup candidates must align with the actually visible body: the digest is
 /// extra image-understanding content shown only to the model, never in the terminal, so
 /// candidates strip it too before comparing or falling back to rendering.
-pub(in crate::ai::driver::turn_runtime) fn terminal_dedupe_candidate_from_assistant_text(assistant_text: &str) -> Option<String> {
+pub(in crate::ai::driver::turn_runtime) fn terminal_dedupe_candidate_from_assistant_text(
+    assistant_text: &str,
+) -> Option<String> {
     let visible_text = crate::ai::request::strip_digest_blocks(assistant_text.trim());
     (!visible_text.is_empty()).then(|| visible_text.to_string())
 }

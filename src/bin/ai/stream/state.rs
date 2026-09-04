@@ -2,12 +2,12 @@ use std::collections::VecDeque;
 
 use rust_tools::cw::SkipMap;
 
+pub(in crate::ai) use crate::ai::request::ParsedStreamPayload;
 use crate::ai::{
     ports::stream::FilterChain,
     request::{DIGEST_BEGIN, DIGEST_END},
     types::{FunctionCall, StreamResult, ToolCall},
 };
-pub(in crate::ai) use crate::ai::request::ParsedStreamPayload;
 
 use super::{
     MarkdownStreamRenderer,
@@ -176,8 +176,14 @@ impl DigestTerminalFilter {
         let mut out = String::with_capacity(content.len());
         self.pending.push_str(content);
         loop {
-            let target = if self.in_digest { DIGEST_END } else { DIGEST_BEGIN };
-            let Some(idx) = self.pending.find(target) else { break };
+            let target = if self.in_digest {
+                DIGEST_END
+            } else {
+                DIGEST_BEGIN
+            };
+            let Some(idx) = self.pending.find(target) else {
+                break;
+            };
             if self.in_digest {
                 // Drop the digest range content (including the END sentinel) and return to normal state
                 self.in_digest = false;
@@ -497,9 +503,7 @@ mod tests {
     #[test]
     fn digest_filter_multiple_regions_and_adjacent_text() {
         let mut f = DigestTerminalFilter::new();
-        let text = format!(
-            "a{DIGEST_BEGIN}1{DIGEST_END}b{DIGEST_BEGIN}2{DIGEST_END}c"
-        );
+        let text = format!("a{DIGEST_BEGIN}1{DIGEST_END}b{DIGEST_BEGIN}2{DIGEST_END}c");
         let mut out = f.push(&text);
         out.push_str(&f.flush());
         assert_eq!(out, "abc");
