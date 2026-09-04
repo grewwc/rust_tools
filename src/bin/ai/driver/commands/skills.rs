@@ -278,7 +278,7 @@ fn resolve_implicit_selection<'m>(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_implicit_selection, SkillManifest};
+    use super::{SkillManifest, resolve_implicit_selection};
 
     fn skill(name: &str) -> SkillManifest {
         SkillManifest {
@@ -302,7 +302,11 @@ mod tests {
     }
 
     fn manifests() -> Vec<SkillManifest> {
-        vec![skill("code-review"), skill("docs-review"), skill("bytedcli")]
+        vec![
+            skill("code-review"),
+            skill("docs-review"),
+            skill("bytedcli"),
+        ]
     }
 
     fn resolve(input: &str) -> (Vec<String>, Option<String>) {

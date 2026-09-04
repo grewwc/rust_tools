@@ -405,14 +405,25 @@ mod tests {
         // task_ids batch) plus 1 with a different identity (pid=7).
         let history = serialize_history_messages_for_storage(&[
             msg("user", "goal"),
-            msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a", "task_b"], "checkpoint-1")),
-            msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a", "task_b"], "checkpoint-2")),
-            msg(ROLE_INTERNAL_NOTE, &wake_note_text(7, &["task_x"], "checkpoint-3")),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                &wake_note_text(6, &["task_a", "task_b"], "checkpoint-1"),
+            ),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                &wake_note_text(6, &["task_a", "task_b"], "checkpoint-2"),
+            ),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                &wake_note_text(7, &["task_x"], "checkpoint-3"),
+            ),
         ]);
         std::fs::write(&path, history).unwrap();
 
-        let latest =
-            msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a", "task_b"], "checkpoint-4"));
+        let latest = msg(
+            ROLE_INTERNAL_NOTE,
+            &wake_note_text(6, &["task_a", "task_b"], "checkpoint-4"),
+        );
         assert!(coalesce_repeated_wait_wake_notes(&path, &latest).unwrap());
         // The caller then appends the latest note at the tail.
         append_history_messages(&path, &[latest]).unwrap();
@@ -456,8 +467,10 @@ mod tests {
         );
         std::fs::write(&path, serialize_history_messages_for_storage(&history)).unwrap();
 
-        let latest =
-            msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a"], "checkpoint-new"));
+        let latest = msg(
+            ROLE_INTERNAL_NOTE,
+            &wake_note_text(6, &["task_a"], "checkpoint-new"),
+        );
         assert!(!coalesce_repeated_wait_wake_notes(&path, &latest).unwrap());
 
         let messages = parse_history_blob(&std::fs::read_to_string(&path).unwrap());
@@ -467,7 +480,13 @@ mod tests {
             .collect();
         // The old waiting note outside the window is kept, not wrongly deleted.
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].content.as_str().unwrap().contains("checkpoint-old"));
+        assert!(
+            notes[0]
+                .content
+                .as_str()
+                .unwrap()
+                .contains("checkpoint-old")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -488,13 +507,19 @@ mod tests {
             &path,
             serialize_history_messages_for_storage(&[
                 msg("user", "goal"),
-                msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_a"], "checkpoint-1")),
+                msg(
+                    ROLE_INTERNAL_NOTE,
+                    &wake_note_text(6, &["task_a"], "checkpoint-1"),
+                ),
             ]),
         )
         .unwrap();
 
         // Same pid but a different task set: different identity, so no dedup.
-        let other = msg(ROLE_INTERNAL_NOTE, &wake_note_text(6, &["task_z"], "checkpoint-x"));
+        let other = msg(
+            ROLE_INTERNAL_NOTE,
+            &wake_note_text(6, &["task_z"], "checkpoint-x"),
+        );
         assert!(!coalesce_repeated_wait_wake_notes(&path, &other).unwrap());
 
         // Non-internal_note message: the fast path performs no I/O.
@@ -527,8 +552,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("history.txt");
-        std::fs::write(&path, serialize_history_messages_for_storage(&[msg("user", "first")]))
-            .unwrap();
+        std::fs::write(
+            &path,
+            serialize_history_messages_for_storage(&[msg("user", "first")]),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -537,11 +565,8 @@ mod tests {
 
         // Both text-backend rewrite entry points must replace the file completely and leave no
         // intermediate `.tmp.` artifact behind (the atomic-write contract for canonical history).
-        replace_history_messages(
-            &path,
-            &[msg("user", "second"), msg("assistant", "reply")],
-        )
-        .unwrap();
+        replace_history_messages(&path, &[msg("user", "second"), msg("assistant", "reply")])
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

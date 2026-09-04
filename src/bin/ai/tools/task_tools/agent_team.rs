@@ -1030,8 +1030,12 @@ pub(super) fn collect_team_results(team: &mut TeamState) -> Result<Vec<String>, 
                 // collect_team_results).
                 // So integration is best-effort: the terminal state is already committed
                 // in place and a failure only appends a note.
-                if let Err(error) = integrate_runtime_result(&runtime_task_id, &result.status, summary) {
-                    collected.push(format!("task {task_id} evidence integration failed: {error}"));
+                if let Err(error) =
+                    integrate_runtime_result(&runtime_task_id, &result.status, summary)
+                {
+                    collected.push(format!(
+                        "task {task_id} evidence integration failed: {error}"
+                    ));
                 }
                 if let Some(task) = team.tasks.get_mut(&task_id) {
                     task.state = if result.status == "completed" {

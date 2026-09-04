@@ -112,14 +112,18 @@ impl TtyToolOutputFoldState {
     }
 }
 
-pub(in crate::ai::driver::turn_runtime) fn tty_tool_output_hidden_count(fold: &TtyToolOutputFoldState) -> usize {
+pub(in crate::ai::driver::turn_runtime) fn tty_tool_output_hidden_count(
+    fold: &TtyToolOutputFoldState,
+) -> usize {
     let current_line = usize::from(!fold.current_line.is_empty());
     fold.total_lines
         .saturating_add(current_line)
         .saturating_sub(TOOL_OUTPUT_FOLD_MAX_VISIBLE)
 }
 
-pub(in crate::ai::driver::turn_runtime) fn tty_tool_output_visible_lines(fold: &TtyToolOutputFoldState) -> Vec<&str> {
+pub(in crate::ai::driver::turn_runtime) fn tty_tool_output_visible_lines(
+    fold: &TtyToolOutputFoldState,
+) -> Vec<&str> {
     let current_line = usize::from(!fold.current_line.is_empty());
     let visible_completed = TOOL_OUTPUT_FOLD_MAX_VISIBLE.saturating_sub(current_line);
     let completed_skip = fold.recent_lines.len().saturating_sub(visible_completed);
@@ -135,7 +139,9 @@ pub(in crate::ai::driver::turn_runtime) fn tty_tool_output_visible_lines(fold: &
     visible
 }
 
-pub(in crate::ai::driver::turn_runtime) fn render_tty_tool_output_fold_window(fold: &TtyToolOutputFoldState) -> (String, usize) {
+pub(in crate::ai::driver::turn_runtime) fn render_tty_tool_output_fold_window(
+    fold: &TtyToolOutputFoldState,
+) -> (String, usize) {
     let hidden_count = tty_tool_output_hidden_count(fold);
     let visible_lines = tty_tool_output_visible_lines(fold);
     if hidden_count == 0 && visible_lines.is_empty() {

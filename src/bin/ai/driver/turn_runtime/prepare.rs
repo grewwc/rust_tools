@@ -332,7 +332,9 @@ pub(super) async fn prepare_turn(
     if super::finalize::mark_session_compaction_started(&app.session_id) {
         let compact_result = compact_session_history_with_app(
             app,
-            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+            crate::ai::driver::runtime_ctx::effective_cwd()
+                .ok()
+                .as_deref(),
         )
         .await;
         super::finalize::mark_session_compaction_finished(&app.session_id);
@@ -367,11 +369,8 @@ pub(super) async fn prepare_turn(
         // Cross-turn image digests: replace prior turns' raw images with the
         // digest persisted in history metadata, so a new turn does not re-send
         // last turn's images to the model (consistent for all VL models).
-        crate::ai::request::replace_old_images_with_persisted_digests(
-            &history_file,
-            &mut history,
-        )
-        .map_err(|e| e.to_string())?;
+        crate::ai::request::replace_old_images_with_persisted_digests(&history_file, &mut history)
+            .map_err(|e| e.to_string())?;
         // Materialize immutable reference snapshots after digest substitution so
         // digest-bearing turns stay text-only while other image references turn
         // into inline images for the request projection.
@@ -415,7 +414,9 @@ pub(super) async fn prepare_turn(
     } else {
         None
     };
-    let ocr_pair = usable_ocr.as_ref().map(|ocr| (ocr.tool_name.as_str(), ocr.content.as_str()));
+    let ocr_pair = usable_ocr
+        .as_ref()
+        .map(|ocr| (ocr.tool_name.as_str(), ocr.content.as_str()));
     let final_question = assemble_effective_question(question, attachments_text, ocr_pair);
     // The persisted text part is the user's own words plus OCR-derived content
     // (already labeled by `[Attached Image Content via ...]`). Text file / PDF

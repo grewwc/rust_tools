@@ -384,7 +384,9 @@ fn build_note_search_chat_history(
         app.config.history_keep_last,
         app.config.history_summary_max_chars,
         overflow_dir,
-        crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+        crate::ai::driver::runtime_ctx::effective_cwd()
+            .ok()
+            .as_deref(),
     )?;
 
     Ok(history
@@ -1395,14 +1397,20 @@ mod tests {
     fn note_search_mode_detection() {
         // `a -ns xxx`: with query content → one-shot single-round retrieval.
         let one_shot = crate::ai::cli::parse_cli_args(
-            vec!["a".to_string(), "-ns".to_string(), "trait object".to_string()].into_iter(),
+            vec![
+                "a".to_string(),
+                "-ns".to_string(),
+                "trait object".to_string(),
+            ]
+            .into_iter(),
         );
         assert!(one_shot.note_search);
         assert!(!note_search_interactive_mode(&one_shot));
 
         // `a -ns`: no substantive content → automatically interactive (equivalent
         // to `a -ns -i`).
-        let auto = crate::ai::cli::parse_cli_args(vec!["a".to_string(), "-ns".to_string()].into_iter());
+        let auto =
+            crate::ai::cli::parse_cli_args(vec!["a".to_string(), "-ns".to_string()].into_iter());
         assert!(auto.note_search);
         assert!(note_search_interactive_mode(&auto));
 
@@ -1500,10 +1508,7 @@ mod tests {
             owner_pgid: None,
             image_path: None,
         };
-        let originals = FxHashMap::from_iter([
-            ("id_a", &entry_a),
-            ("id_b", &entry_b),
-        ]);
+        let originals = FxHashMap::from_iter([("id_a", &entry_a), ("id_b", &entry_b)]);
         let (delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(
             "memo",
             Some("test"),

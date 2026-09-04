@@ -3,7 +3,8 @@
 
 use super::*;
 
-pub(in crate::ai::driver::turn_runtime) const COMPLETION_EVIDENCE_REQUIRED_MARKER: &str = "self_note:completion_evidence_required";
+pub(in crate::ai::driver::turn_runtime) const COMPLETION_EVIDENCE_REQUIRED_MARKER: &str =
+    "self_note:completion_evidence_required";
 pub(in crate::ai::driver::turn_runtime) const COMPLETION_EVIDENCE_UNVERIFIED_NOTE: &str = "runtime:completion_evidence_unverified\nA final response was recorded after a project mutation without observed post-mutation verification.";
 pub(in crate::ai::driver::turn_runtime) const COMPLETION_EVIDENCE_WARNING: &str = "[Runtime warning] Completion/impact claim is unverified: no successful post-mutation check, test, diff, or status command was observed.";
 
@@ -92,8 +93,7 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
             let mut command_has_failed_known_check = false;
             for effect in &effects {
                 command_has_failed_known_check |=
-                    effect.behavior_check
-                        && (!tool_succeeded || output_reports_behavior_failure);
+                    effect.behavior_check && (!tool_succeeded || output_reports_behavior_failure);
             }
             let had_mutation_before_command = state.successful_mutation;
             for effect in &effects {
@@ -159,7 +159,9 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
     state
 }
 
-pub(in crate::ai::driver::turn_runtime) fn behavior_check_output_confirms_success(content: &serde_json::Value) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn behavior_check_output_confirms_success(
+    content: &serde_json::Value,
+) -> bool {
     let text = content.as_str().unwrap_or_default().to_ascii_lowercase();
     if behavior_check_output_reports_failure(content) {
         return false;
@@ -222,7 +224,10 @@ pub(in crate::ai::driver::turn_runtime) fn tool_call_is_successful_mutation_cand
     }
 }
 
-pub(in crate::ai::driver::turn_runtime) fn contains_non_negated_completion_word(text: &str, word: &str) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn contains_non_negated_completion_word(
+    text: &str,
+    word: &str,
+) -> bool {
     text.match_indices(word).any(|(start, _)| {
         let bytes = text.as_bytes();
         let end = start + word.len();

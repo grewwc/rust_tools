@@ -22,7 +22,7 @@ use super::{
     extract::{StreamTextEvent, extract_chunk_events_streaming, normalize_stream_text},
     framing, normalize,
     render::markdown::{
-        clamp_line_to_terminal_row_with_reserve, live_preview_cursor_rows,
+        clamp_line_to_terminal_row_with_reserve, live_preview_cursor_rows, raw_terminal_rows,
         wrap_line_to_terminal_rows_with_reserve,
     },
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
@@ -52,6 +52,12 @@ const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
 /// fold (redraws with a 0-line window) so conclusions/questions restated at the tail of thinking are not shown twice
 /// alongside the final answer in the terminal.
 const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 2;
+/// Physical rows the live fold window reserves outside its body budget: the anchored header (1), the fold-summary
+/// marker (1), and one row of headroom so the cursor never sits on the very bottom row. Bounding the body to
+/// `viewport_rows - this` keeps the whole window (header + body) inside the visible viewport, so the relative-cursor
+/// erase (`\x1b[nA`) in `erase_fold_body` always reaches the top body row instead of being clamped at the viewport
+/// top once the window scrolls into scrollback — the root cause of stacked `… more` / `… N earlier lines` markers.
+const FOLD_VIEWPORT_RESERVED_ROWS: usize = 3;
 /// Indentation for folded thinking/subagent bodies: header/footer use 2 spaces, body is indented one more level.
 const THINKING_FOLD_BODY_INDENT: &str = "    ";
 const THINKING_FOLD_BODY_INDENT_WIDTH: usize = 4;
@@ -1378,6 +1384,26 @@ fn is_standalone_stream_marker(content: &str, marker: &str) -> bool {
     content.trim_matches('\n') == marker
 }
 
+/// Physical-row budget the live fold body may occupy so the whole window (header + body) stays inside the visible
+/// viewport. Returning `usize::MAX` disables clamping (non-tty / unknown height), preserving the previous behavior
+/// exactly. On a real terminal this is `viewport_rows - FOLD_VIEWPORT_RESERVED_ROWS`, floored at 1 so an extremely
+/// short pane still shows one body row. In normal terminals this budget dwarfs `max_visible_lines`, so the effective
+/// window size — and every rendered byte — is unchanged; it only tightens when the viewport genuinely cannot hold
+/// the configured window, which is exactly the case that used to leak stacked markers.
+fn fold_body_viewport_row_budget() -> usize {
+    let viewport = io::stdout().is_terminal().then(raw_terminal_rows);
+    fold_body_row_budget_for(viewport)
+}
+
+/// Pure viewport-budget arithmetic, split out so the clamp can be unit-tested without a real tty. `None` means the
+/// viewport height is unknown (non-tty / pipe / test) and clamping is disabled.
+fn fold_body_row_budget_for(viewport_rows: Option<usize>) -> usize {
+    match viewport_rows {
+        Some(rows) => rows.saturating_sub(FOLD_VIEWPORT_RESERVED_ROWS).max(1),
+        None => usize::MAX,
+    }
+}
+
 /// Folded rendering of thinking content: maintain a rewritable window starting at the first line,
 /// always showing only the most recent N lines in the terminal and folding the rest into one summary line.
 fn write_thinking_content_folded(
@@ -1475,14 +1501,20 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
         fold.header_drawn = true;
     }
 
+    // Bound the live window to the viewport so header + body never scroll past the top; otherwise the relative-cursor
+    // erase above cannot reach the previous window and each redraw leaks a stacked marker line. Restored right after so
+    // the configured `max_visible_lines` (and the model-facing reasoning buffer) is untouched.
+    let saved_max_visible_lines = fold.max_visible_lines;
+    fold.max_visible_lines = fold.max_visible_lines.min(fold_body_viewport_row_budget());
     let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
+    let clamped_max_visible_lines = fold.max_visible_lines;
     THINKING_FOLD_BODY_BUF.with(|buf| -> io::Result<()> {
         let mut buf = buf.borrow_mut();
         let (body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
             &body_lines,
             marker_lines,
             fold.rewrite_right_margin_cols,
-            fold.max_visible_lines,
+            clamped_max_visible_lines,
             &mut buf,
         );
         if !buf.is_empty() {
@@ -1492,6 +1524,7 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
         fold.rendered_body_lines = rendered_body_lines;
         Ok(())
     })?;
+    fold.max_visible_lines = saved_max_visible_lines;
     out.flush()?;
     Ok(())
 }

@@ -7,8 +7,7 @@ pub(super) use crate::ai::{
     cli::ParsedCli,
     driver::{runtime_ctx::SUBAGENT_CWD, signal},
     types::{
-        AgentContext, App, AppConfig, FunctionCall, FunctionDefinition, ToolDefinition,
-        ToolResult,
+        AgentContext, App, AppConfig, FunctionCall, FunctionDefinition, ToolDefinition, ToolResult,
     },
 };
 pub(super) use aios_kernel::primitives::ResourceLimit;
@@ -163,4 +162,3 @@ pub(super) fn tool_result(id: &str, content: &str) -> crate::ai::types::ToolResu
         content: content.to_string(),
     }
 }
-

@@ -402,8 +402,12 @@ pub fn try_handle_session_command(
             println!(
                 "  /fork                     fork current session into a new branch (keeps original) and switch"
             );
-            println!("  /mark                     mark current session as important (shown in red in `/ss`)");
-            println!("  /unmark                   remove the important mark from the current session");
+            println!(
+                "  /mark                     mark current session as important (shown in red in `/ss`)"
+            );
+            println!(
+                "  /unmark                   remove the important mark from the current session"
+            );
             println!(
                 "  /sessions bound           list suspended sessions bound to current terminal"
             );
@@ -510,18 +514,14 @@ pub fn try_handle_session_command(
                 }
             }
         }
-        "mark" => {
-            match store.write_session_marked(&app.session_id, true) {
-                Ok(()) => println!("Marked session as important: {}", app.session_id),
-                Err(err) => eprintln!("[mark] failed to mark session: {err}"),
-            }
-        }
-        "unmark" => {
-            match store.write_session_marked(&app.session_id, false) {
-                Ok(()) => println!("Removed important mark from session: {}", app.session_id),
-                Err(err) => eprintln!("[unmark] failed to unmark session: {err}"),
-            }
-        }
+        "mark" => match store.write_session_marked(&app.session_id, true) {
+            Ok(()) => println!("Marked session as important: {}", app.session_id),
+            Err(err) => eprintln!("[mark] failed to mark session: {err}"),
+        },
+        "unmark" => match store.write_session_marked(&app.session_id, false) {
+            Ok(()) => println!("Removed important mark from session: {}", app.session_id),
+            Err(err) => eprintln!("[unmark] failed to unmark session: {err}"),
+        },
         "new" | "create" => {
             let new_id = Uuid::new_v4().to_string();
             // Clear the old session's history cache and explicit-enabled tools
@@ -1443,8 +1443,8 @@ mod tests {
         let persisted = [
             ("call_0".to_string(), 1_u8),
             ("missing".to_string(), 2_u8),
-        // The most recent four groups are protected; restored state must not
-        // carry the old counters.
+            // The most recent four groups are protected; restored state must not
+            // carry the old counters.
             ("call_4".to_string(), 2_u8),
         ]
         .into_iter()

@@ -1,12 +1,10 @@
 //! Mid-turn LLM-summary compression tests (history::mid_turn_llm_summarize).
 
-use std::sync::{Arc, atomic::AtomicBool};
 use serde_json::Value;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use super::super::{
-    history::{
-        Message, SessionStore, messages_total_chars_pub, mid_turn_llm_summarize,
-    },
+    history::{Message, SessionStore, messages_total_chars_pub, mid_turn_llm_summarize},
     types::{FunctionCall, ToolCall},
 };
 use super::*;
@@ -277,7 +275,10 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
     assert!(
         has_mid_turn_summary,
         "Path A 应对旧前缀生成 [mid-turn-summary] 摘要，实际 roles: {:?}",
-        compressed.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        compressed
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect::<Vec<_>>()
     );
     // The old large tool output should be reclaimed by the summary and no longer appear verbatim in the result
     let still_has_raw_tool_output = compressed.iter().any(|message| {
@@ -286,8 +287,5 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
             .as_str()
             .is_some_and(|text| text.len() > 5_000)
     });
-    assert!(
-        !still_has_raw_tool_output,
-        "旧的大块 tool 输出应被摘要回收"
-    );
+    assert!(!still_has_raw_tool_output, "旧的大块 tool 输出应被摘要回收");
 }

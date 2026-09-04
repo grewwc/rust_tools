@@ -688,7 +688,6 @@ fn archived_asset_path_in_command(
     None
 }
 
-
 /// Output of "read/retrieval" tools is zero-compressed (no trimming, no dedup
 /// folding, no whole-group deletion); over the threshold it only gets
 /// "zero-compression spilled to the session file + a pointer stub". Such
@@ -915,7 +914,9 @@ fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'s
         "execute_command" if has_original_command => {
             "Archived command output. Continue from `original_command` / `original_cwd`; `file_path` is a text archive, not a source file - read it only for the full log."
         }
-        _ => "Archived output; `file_path` holds the full text. Read it only if the preview is insufficient.",
+        _ => {
+            "Archived output; `file_path` holds the full text. Read it only if the preview is insufficient."
+        }
     }
 }
 
@@ -957,18 +958,22 @@ pub(super) fn stub_fingerprint_line(full_content: &str) -> Option<String> {
 /// whitespace-collapsed and clamped on char boundaries. Returns `None` when the
 /// head region holds only decoration (separators, bare JSON braces, ...).
 fn extract_fingerprint_gist(content: &str) -> Option<String> {
-    content.lines().take(30).find_map(|line| {
-        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        let distinct = collapsed.chars().collect::<FxHashSet<char>>().len();
-        (distinct >= FINGERPRINT_GIST_MIN_DISTINCT_CHARS).then_some(collapsed)
-    }).map(|gist| {
-        let head: String = gist.chars().take(FINGERPRINT_GIST_MAX_CHARS).collect();
-        if head.len() < gist.len() {
-            format!("{head}\u{2026}")
-        } else {
-            head
-        }
-    })
+    content
+        .lines()
+        .take(30)
+        .find_map(|line| {
+            let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            let distinct = collapsed.chars().collect::<FxHashSet<char>>().len();
+            (distinct >= FINGERPRINT_GIST_MIN_DISTINCT_CHARS).then_some(collapsed)
+        })
+        .map(|gist| {
+            let head: String = gist.chars().take(FINGERPRINT_GIST_MAX_CHARS).collect();
+            if head.len() < gist.len() {
+                format!("{head}\u{2026}")
+            } else {
+                head
+            }
+        })
 }
 
 /// Hand-tuned heuristic salience for fingerprint keywords, matching what models
@@ -997,8 +1002,8 @@ pub(super) fn extract_fingerprint_keywords(content: &str) -> Vec<String> {
     const MAX_TOKEN_LEN: usize = 32;
     // Generic prose/log vocabulary that crowds out identifiers when left unfiltered.
     const STOP_WORDS: [&str; 14] = [
-        "error", "result", "output", "content", "value", "string", "unknown",
-        "there", "which", "would", "about", "failed", "success", "warning",
+        "error", "result", "output", "content", "value", "string", "unknown", "there", "which",
+        "would", "about", "failed", "success", "warning",
     ];
     let mut candidates: Vec<(String, i32)> = Vec::new();
     // Case-insensitive dedup via a membership set (not a linear scan of
@@ -1008,9 +1013,9 @@ pub(super) fn extract_fingerprint_keywords(content: &str) -> Vec<String> {
     // `candidates` is unchanged, and the stable sort below keeps appearance
     // order as the score tiebreak, so output stays byte-identical.
     let mut seen: FxHashSet<String> = FxHashSet::default();
-    for raw in content.split(|c: char| {
-        !(c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '.' | '-'))
-    }) {
+    for raw in
+        content.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '.' | '-')))
+    {
         let len_ok = (MIN_TOKEN_LEN..=MAX_TOKEN_LEN).contains(&raw.len());
         let wordy = raw.chars().any(|c| c.is_ascii_alphabetic());
         let diversified = !raw.chars().all(|c| c == raw.chars().next().unwrap_or('-'));

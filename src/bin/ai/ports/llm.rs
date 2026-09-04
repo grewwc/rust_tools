@@ -30,7 +30,13 @@ pub(crate) trait LlmClient: Send + Sync {
         &'a self,
         app: &'a mut crate::ai::types::App,
         req: LlmRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>>
+                + Send
+                + 'a,
+        >,
+    >;
 }
 
 /// Default implementation: delegates to `request::do_request_messages` /
@@ -42,19 +48,32 @@ impl LlmClient for DefaultLlmClient {
         &'a self,
         app: &'a mut crate::ai::types::App,
         req: LlmRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             let model = req.model.clone();
             let raw = if req.tools_enabled {
-                crate::ai::request::do_request_messages(app, &model, &req.messages, req.stream).await
+                crate::ai::request::do_request_messages(app, &model, &req.messages, req.stream)
+                    .await
             } else {
                 crate::ai::request::do_request_messages_without_tools(
-                    app, &model, &req.messages, req.stream,
+                    app,
+                    &model,
+                    &req.messages,
+                    req.stream,
                 )
                 .await
             }
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            Ok(LlmResponse { response: raw, model })
+            Ok(LlmResponse {
+                response: raw,
+                model,
+            })
         })
     }
 }
@@ -66,7 +85,9 @@ pub(crate) struct LoggingLlmClient<C: LlmClient> {
 }
 
 impl<C: LlmClient> LoggingLlmClient<C> {
-    pub fn new(inner: C) -> Self { Self { inner } }
+    pub fn new(inner: C) -> Self {
+        Self { inner }
+    }
 }
 
 impl<C: LlmClient> LlmClient for LoggingLlmClient<C> {
@@ -74,11 +95,22 @@ impl<C: LlmClient> LlmClient for LoggingLlmClient<C> {
         &'a self,
         app: &'a mut crate::ai::types::App,
         req: LlmRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>>
+                + Send
+                + 'a,
+        >,
+    > {
         let req_clone = req.clone();
         let fut = self.inner.send(app, req);
         Box::pin(async move {
-            eprintln!("[llm] -> {} ({} msgs, stream={})", req_clone.model, req_clone.messages.len(), req_clone.stream);
+            eprintln!(
+                "[llm] -> {} ({} msgs, stream={})",
+                req_clone.model,
+                req_clone.messages.len(),
+                req_clone.stream
+            );
             let res = fut.await;
             match &res {
                 Ok(_) => eprintln!("[llm] <- {} ok", req_clone.model),

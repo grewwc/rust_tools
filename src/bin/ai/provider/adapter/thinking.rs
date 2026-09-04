@@ -73,7 +73,11 @@ impl ThinkingDialect for EnableThinkingDialect {
 pub(in crate::ai) struct DeepSeekThinkingDialect;
 
 impl ThinkingDialect for DeepSeekThinkingDialect {
-    fn fields(&self, enable: bool, _top_level_reasoning_effort: Option<&str>) -> Map<String, Value> {
+    fn fields(
+        &self,
+        enable: bool,
+        _top_level_reasoning_effort: Option<&str>,
+    ) -> Map<String, Value> {
         let kind = if enable { "enabled" } else { "disabled" };
         let mut map = Map::new();
         map.insert("thinking".to_string(), json!({ "type": kind }));

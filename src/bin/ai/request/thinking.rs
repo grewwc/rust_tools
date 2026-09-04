@@ -102,9 +102,7 @@ pub(crate) fn latest_user_message_text(messages: &[Message]) -> Option<String> {
     messages
         .iter()
         .rev()
-        .find(|message| {
-            message.role == "user" && !is_runtime_synthetic_user_message(message)
-        })
+        .find(|message| message.role == "user" && !is_runtime_synthetic_user_message(message))
         .and_then(extract_message_text)
 }
 

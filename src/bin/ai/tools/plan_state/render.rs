@@ -18,7 +18,6 @@ impl StepStatus {
 }
 
 impl PlanState {
-
     /// Renders the full plan text (plan / plan_update share the same rendering path).
     ///
     /// The format stays consistent with the legacy `execute_plan`; only when non-pending
@@ -85,17 +84,35 @@ impl PlanState {
         if parallel > 0 {
             formatted.push_str(&format!(" {} step(s) can run in parallel.", parallel));
         }
-        let parallel_delegated = self.steps.iter().filter(|s| s.parallelizable && s.delegate).count();
-        let serial_delegated = self.steps.iter().filter(|s| !s.parallelizable && s.delegate).count();
+        let parallel_delegated = self
+            .steps
+            .iter()
+            .filter(|s| s.parallelizable && s.delegate)
+            .count();
+        let serial_delegated = self
+            .steps
+            .iter()
+            .filter(|s| !s.parallelizable && s.delegate)
+            .count();
         // Delegation/parallel orchestration hint copy lives in `delegation_guidance` (separate from structural rendering).
-        formatted.push_str(&delegation_guidance(delegated, parallel_delegated, serial_delegated));
+        formatted.push_str(&delegation_guidance(
+            delegated,
+            parallel_delegated,
+            serial_delegated,
+        ));
         formatted.push('\n');
         formatted
     }
 }
 
 /// Summarizes the progress copy: `2/5 steps done, 1 running, 1 failed.`
-fn progress_summary(done: usize, running: usize, failed: usize, skipped: usize, total: usize) -> String {
+fn progress_summary(
+    done: usize,
+    running: usize,
+    failed: usize,
+    skipped: usize,
+    total: usize,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if running > 0 {
         parts.push(format!("{running} running"));
@@ -172,7 +189,9 @@ mod tests {
         assert!(fresh.contains("3 step(s) planned."));
 
         state.apply_update(1, StepStatus::Done, None).unwrap();
-        state.apply_update(2, StepStatus::Running, Some("on it".to_string())).unwrap();
+        state
+            .apply_update(2, StepStatus::Running, Some("on it".to_string()))
+            .unwrap();
         state.apply_update(3, StepStatus::Failed, None).unwrap();
         let out = state.render();
         assert!(out.contains("Progress: 1/3 steps done, 1 running, 1 failed."));

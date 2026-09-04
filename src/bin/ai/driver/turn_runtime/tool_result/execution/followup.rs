@@ -3,9 +3,12 @@
 
 use super::*;
 
-pub(in crate::ai::driver::turn_runtime) const PENDING_SUBAGENT_TASKS_FOLLOWUP_PREFIX: &str = "tool_followup:pending_subagent_tasks\n";
+pub(in crate::ai::driver::turn_runtime) const PENDING_SUBAGENT_TASKS_FOLLOWUP_PREFIX: &str =
+    "tool_followup:pending_subagent_tasks\n";
 
-pub(in crate::ai::driver::turn_runtime) fn clear_pending_subagent_tasks_followup(messages: &mut Vec<Message>) {
+pub(in crate::ai::driver::turn_runtime) fn clear_pending_subagent_tasks_followup(
+    messages: &mut Vec<Message>,
+) {
     messages.retain(|message| {
         !(message.role == ROLE_INTERNAL_NOTE
             && matches!(
@@ -68,7 +71,10 @@ pub(in crate::ai::driver::turn_runtime) fn reopen_turn_for_outstanding_subagent_
 pub(in crate::ai::driver::turn_runtime) const UNINTEGRATED_TASK_EVIDENCE_PREFIX: &str =
     "[Runtime task-evidence handoff, not a new end-user request.]";
 
-pub(in crate::ai::driver::turn_runtime) fn reopen_turn_for_unintegrated_task_evidence(messages: &mut Vec<Message>, ledger: &str) {
+pub(in crate::ai::driver::turn_runtime) fn reopen_turn_for_unintegrated_task_evidence(
+    messages: &mut Vec<Message>,
+    ledger: &str,
+) {
     messages.retain(|message| {
         !message.content.as_str().is_some_and(|text| {
             text.contains(UNINTEGRATED_TASK_EVIDENCE_PREFIX)
@@ -91,9 +97,12 @@ pub(in crate::ai::driver::turn_runtime) fn reopen_turn_for_unintegrated_task_evi
     });
 }
 
-pub(in crate::ai::driver::turn_runtime) const TRUNCATION_RETRY_NOTE_PREFIX: &str = "tool_followup:output_truncated\n";
-pub(in crate::ai::driver::turn_runtime) const DEGENERATE_REPETITION_RETRY_NOTE_PREFIX: &str = "tool_followup:degenerate_repetition\n";
-pub(in crate::ai::driver::turn_runtime) const DEGENERATE_REPETITION_FINISH_REASON: &str = "degenerate_repetition";
+pub(in crate::ai::driver::turn_runtime) const TRUNCATION_RETRY_NOTE_PREFIX: &str =
+    "tool_followup:output_truncated\n";
+pub(in crate::ai::driver::turn_runtime) const DEGENERATE_REPETITION_RETRY_NOTE_PREFIX: &str =
+    "tool_followup:degenerate_repetition\n";
+pub(in crate::ai::driver::turn_runtime) const DEGENERATE_REPETITION_FINISH_REASON: &str =
+    "degenerate_repetition";
 
 /// After detecting that this round's response was truncated, keep the visible text
 /// produced so far (if any) as partial progress and append a shrink-and-rewrite hint
@@ -197,7 +206,9 @@ pub(in crate::ai::driver::turn_runtime) fn append_truncation_retry_note(
     });
 }
 
-pub(in crate::ai::driver::turn_runtime) fn extract_image_paths_from_file_read_tool_calls(tool_calls: &[ToolCall]) -> Vec<String> {
+pub(in crate::ai::driver::turn_runtime) fn extract_image_paths_from_file_read_tool_calls(
+    tool_calls: &[ToolCall],
+) -> Vec<String> {
     let mut out = Vec::new();
     for tool_call in tool_calls {
         if !matches!(tool_call.function.name.as_str(), "read_file") {

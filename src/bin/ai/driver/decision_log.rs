@@ -490,9 +490,7 @@ pub fn log_runtime_stop(
         context: format!("reason={reason}, iteration={iteration}"),
         alternatives_considered: vec![],
         chosen_option: "no_tool_handoff".to_string(),
-        reasoning: target
-            .map(|t| format!("target={t}"))
-            .unwrap_or_default(),
+        reasoning: target.map(|t| format!("target={t}")).unwrap_or_default(),
         confidence: None,
         outcome: None,
         execution_time_ms: None,

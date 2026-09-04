@@ -197,7 +197,9 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
             Some(hit)
         })
         .unwrap_or_else(|| {
-            panic!("expected read_file recall archive path after mid-turn compression: {compressed:#?}")
+            panic!(
+                "expected read_file recall archive path after mid-turn compression: {compressed:#?}"
+            )
         });
     let archived = std::fs::read(file_path).unwrap_or_else(|e| {
         panic!("overflow file referenced by recall anchor should exist: {file_path}: {e}")

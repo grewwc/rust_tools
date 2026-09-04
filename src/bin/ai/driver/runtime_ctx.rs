@@ -386,10 +386,7 @@ pub(crate) fn publish_subagent_checkpoint_summary(summary: &str) {
     }
 }
 
-fn publish_progress_update(
-    snapshot: &SubagentProgressSnapshot,
-    kind: SubagentProgressEventKind,
-) {
+fn publish_progress_update(snapshot: &SubagentProgressSnapshot, kind: SubagentProgressEventKind) {
     let Ok(task_id) = SUBAGENT_TASK_ID.try_with(Clone::clone) else {
         return;
     };
@@ -822,7 +819,7 @@ mod tests {
                 }
             });
             scope.spawn(move || {
-        // Concurrent threads do not affect each other: the fallback is thread-local.
+                // Concurrent threads do not affect each other: the fallback is thread-local.
                 assert!(try_current().is_none());
             });
         });

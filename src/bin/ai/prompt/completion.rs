@@ -356,10 +356,7 @@ impl CommandCompleter {
     /// - 1: two-segment "name + platform" match, e.g. `deep-v` → `deepseek-v4-flash-volcano`
     /// - 2..=255: fuzzy subsequence match over key/name/platform/aliases, graded by score
     /// Returns None when nothing matches.
-    fn model_token_match_rank(
-        token: &str,
-        model: &crate::ai::model_names::ModelDef,
-    ) -> Option<u8> {
+    fn model_token_match_rank(token: &str, model: &crate::ai::model_names::ModelDef) -> Option<u8> {
         let token = token.trim().to_ascii_lowercase();
         // With an empty token (e.g. Tab right after `/model `), an empty prefix matches all models (original behavior).
         let replacement = Self::model_replacement(model).to_ascii_lowercase();
@@ -772,10 +769,8 @@ impl CommandCompleter {
                     "/skills" | ":skills" | "/skill" | ":skill" => {
                         // Argument tokens already typed (before the cursor, excluding the command itself) — for multi-skill
                         // completion exclude already-picked names so `/skills a <TAB>` can pick the next one.
-                        let consumed: Vec<&str> = before[..token_start]
-                            .split_whitespace()
-                            .skip(1)
-                            .collect();
+                        let consumed: Vec<&str> =
+                            before[..token_start].split_whitespace().skip(1).collect();
                         let mut matched: Vec<(u8, CompletionCandidate)> = Vec::new();
                         if consumed.is_empty() {
                             // First argument position: subcommand literals join the hints too (`/skills us<TAB>` → use)
@@ -798,9 +793,7 @@ impl CommandCompleter {
                             {
                                 continue;
                             }
-                            if let Some(rank) =
-                                Self::name_token_match_rank(token, &c.replacement)
-                            {
+                            if let Some(rank) = Self::name_token_match_rank(token, &c.replacement) {
                                 matched.push((rank, c));
                             }
                         }
@@ -810,10 +803,7 @@ impl CommandCompleter {
                             .into_iter()
                             .map(|(_, candidate)| candidate)
                             .collect();
-                        return (
-                            token_start,
-                            candidates,
-                        );
+                        return (token_start, candidates);
                     }
                     "/sessions" | ":sessions" | "/ss" | ":ss" => Self::session_subcommands(),
                     "/history" | ":history" => Self::history_subcommands(),
@@ -1291,7 +1281,10 @@ mod tests {
                 .iter()
                 .any(|c| c.replacement == "audit_own_changes"),
             "expected audit_own_changes for `/skills own`: {:?}",
-            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1535,10 +1528,8 @@ mod tests {
         assert!(candidates.iter().any(|c| c.replacement == "cursor"));
         assert!(!candidates.iter().any(|c| c.replacement == "idea"));
         // `/changes --open=co` glued form backfills the whole prefix
-        let (_, candidates) = CommandCompleter::complete_for_line(
-            "/changes --open=co",
-            "/changes --open=co".len(),
-        );
+        let (_, candidates) =
+            CommandCompleter::complete_for_line("/changes --open=co", "/changes --open=co".len());
         assert!(
             candidates.iter().any(|c| c.replacement == "--open=code"),
             "expected --open=code for `/changes --open=co`, got: {:?}",
@@ -1548,8 +1539,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         // `/diff --j` alias goes through subcommand completion too
-        let (_, candidates) =
-            CommandCompleter::complete_for_line("/diff --j", "/diff --j".len());
+        let (_, candidates) = CommandCompleter::complete_for_line("/diff --j", "/diff --j".len());
         assert!(
             candidates.iter().any(|c| c.replacement == "--json"),
             "expected --json for `/diff --j`, got: {:?}",
@@ -1709,7 +1699,10 @@ mod tests {
                 .iter()
                 .any(|c| c.replacement == "@skills:audit_own_changes"),
             "expected audit_own_changes for `@skills:own`: {:?}",
-            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1724,7 +1717,10 @@ mod tests {
                 .iter()
                 .any(|c| c.replacement == "audit_own_changes"),
             "expected audit_own_changes for `{line}`: {:?}",
-            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
         );
         for c in &candidates {
             // Every candidate must match `audit_o` by name alone (descriptions must not participate in matching).

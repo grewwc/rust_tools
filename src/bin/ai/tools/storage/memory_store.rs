@@ -485,8 +485,8 @@ impl MemoryStore {
         if limit == 0 || !self.path.exists() {
             return Ok(Vec::new());
         }
-        let mut file = fs::File::open(&self.path)
-            .map_err(|e| format!("Failed to read memory file: {e}"))?;
+        let mut file =
+            fs::File::open(&self.path).map_err(|e| format!("Failed to read memory file: {e}"))?;
         let file_len = file
             .metadata()
             .map_err(|e| format!("Failed to read memory file: {e}"))?
@@ -643,18 +643,27 @@ impl MemoryStore {
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound && is_current => None,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(err) => {
-                        return Err(format!("Failed to read memory file {}: {err}", path.display()));
+                        return Err(format!(
+                            "Failed to read memory file {}: {err}",
+                            path.display()
+                        ));
                     }
                 };
                 let content = original
                     .as_deref()
                     .map(std::str::from_utf8)
                     .transpose()
-                    .map_err(|err| format!("Invalid UTF-8 in memory file {}: {err}", path.display()))?
+                    .map_err(|err| {
+                        format!("Invalid UTF-8 in memory file {}: {err}", path.display())
+                    })?
                     .unwrap_or_default();
                 let mut kept = Vec::new();
                 let mut deleted = 0usize;
-                for line in content.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                for line in content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                {
                     if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
                         if entry.id.as_deref().is_some_and(|id| id_set.contains(id)) {
                             deleted += 1;

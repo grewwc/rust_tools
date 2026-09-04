@@ -398,8 +398,7 @@ impl ThinkingOrchestrator {
              time (serial) or concurrently (parallel), then review their results; do not hand off the \
              current unresolved branch just to escape context pressure. Reserve your context for \
              orchestration, consequential decisions, and synthesis.",
-            turn_index,
-            routing,
+            turn_index, routing,
         ))
     }
 }

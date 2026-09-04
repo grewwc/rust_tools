@@ -150,13 +150,11 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
         );
         if s.source == "lsof" {
             println!("                source  : lsof (no pid-file, possibly older version)");
-            println!("                agents  : unavailable (process does not publish live status)");
-        } else {
-            let snapshots = session_pid::read_agent_snapshots(
-                sessions_root,
-                &s.session_id,
-                s.pid,
+            println!(
+                "                agents  : unavailable (process does not publish live status)"
             );
+        } else {
+            let snapshots = session_pid::read_agent_snapshots(sessions_root, &s.session_id, s.pid);
             for line in format_subagent_tree(&snapshots) {
                 println!("                {line}");
             }
@@ -213,7 +211,11 @@ fn format_subagent_tree(snapshots: &[session_pid::AgentSnapshot]) -> Vec<String>
             "{continuation}  {}",
             compact_agent_field(&snapshot.description, 92)
         ));
-        if let Some(progress) = snapshot.progress.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(progress) = snapshot
+            .progress
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
             lines.push(format!(
                 "{continuation}  {}",
                 compact_agent_field(progress, 92)

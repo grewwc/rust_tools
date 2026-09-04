@@ -81,7 +81,10 @@ fn flush_rearchives_when_archive_truncated_to_empty_but_index_stale() {
     // new OverflowSink), so the heal must not depend on replaying a live buffer.
     let mut sink2 = OverflowSink::new(&dir);
     sink2.push_messages(&[user_message(PAYLOAD_MARK)]);
-    assert!(sink2.flush(), "stale-index flush over an empty body must re-archive");
+    assert!(
+        sink2.flush(),
+        "stale-index flush over an empty body must re-archive"
+    );
     let healed = std::fs::read_to_string(&body_path).unwrap();
     assert!(
         healed.contains(PAYLOAD_MARK),

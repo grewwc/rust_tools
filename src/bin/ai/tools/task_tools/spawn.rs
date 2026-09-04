@@ -28,7 +28,9 @@ pub(crate) fn decode_os_task_goal(goal: &str) -> Option<OsTaskGoal> {
 /// Fallback path: when the caller is not inside a `DRIVER_CTX` scope (e.g. early driver startup or
 /// a unit test invoking the tool from a synchronous context), fall back to `GLOBAL_OS` for backward
 /// compatibility.
-pub(super) fn with_os_kernel<T>(f: impl FnOnce(&mut dyn Kernel) -> Result<T, String>) -> Result<T, String> {
+pub(super) fn with_os_kernel<T>(
+    f: impl FnOnce(&mut dyn Kernel) -> Result<T, String>,
+) -> Result<T, String> {
     let shared: SharedKernel = match crate::ai::driver::runtime_ctx::try_current() {
         Some(ctx) => ctx.app_proto.os.clone(),
         None => {
@@ -72,7 +74,11 @@ pub(super) fn active_foreground_owner_pid(os: &mut dyn Kernel) -> Option<u64> {
         .map(|proc| proc.pid)
 }
 
-pub(super) fn task_entry_owned_by(entry: &AsyncTaskEntry, session_id: &str, owner_pid: u64) -> bool {
+pub(super) fn task_entry_owned_by(
+    entry: &AsyncTaskEntry,
+    session_id: &str,
+    owner_pid: u64,
+) -> bool {
     entry.session_id == session_id && entry.owner_pid == owner_pid
 }
 

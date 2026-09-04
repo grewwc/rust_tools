@@ -498,10 +498,15 @@ fn overflow_stub_argument_guard_catches_transcribed_stubs() {
     );
     assert!(super::prepare_tool_call(&mcp, &keys_only, None).is_err());
     // Real arguments (including a legit `patch_file` recovery call) pass through.
-    let real = tool_call_with_args("apply_patch", r#"{"patch": "*** Begin Patch\n*** End Patch\n"}"#);
+    let real = tool_call_with_args(
+        "apply_patch",
+        r#"{"patch": "*** Begin Patch\n*** End Patch\n"}"#,
+    );
     assert!(super::prepare_tool_call(&mcp, &real, None).is_ok());
-    let recovery =
-        tool_call_with_args("apply_patch", r#"{"patch_file": "/tmp/x.patch", "f": true}"#);
+    let recovery = tool_call_with_args(
+        "apply_patch",
+        r#"{"patch_file": "/tmp/x.patch", "f": true}"#,
+    );
     assert!(super::prepare_tool_call(&mcp, &recovery, None).is_ok());
     // A marker key that is not true-ish (e.g. a nested value named like the
     // marker with boolean false) must not trip the guard.

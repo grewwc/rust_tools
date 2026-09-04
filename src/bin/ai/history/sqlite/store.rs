@@ -298,10 +298,7 @@ fn coalesce_repeated_wait_wake_notes_sqlite_unlocked(
         .map_err(|e| io::Error::other(e.to_string()))?;
     let rows = stmt
         .query_map(
-            params![
-                WAKE_NOTE_DEDUP_SCAN as i64,
-                ROLE_INTERNAL_NOTE
-            ],
+            params![WAKE_NOTE_DEDUP_SCAN as i64, ROLE_INTERNAL_NOTE],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -312,9 +309,7 @@ fn coalesce_repeated_wait_wake_notes_sqlite_unlocked(
         let Some(content_text) = content.as_str() else {
             continue;
         };
-        if parse_still_waiting_wake_identity(content_text).as_ref()
-            == Some(&identity)
-        {
+        if parse_still_waiting_wake_identity(content_text).as_ref() == Some(&identity) {
             to_delete.push(id);
         }
     }

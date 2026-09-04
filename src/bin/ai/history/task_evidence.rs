@@ -809,14 +809,8 @@ mod tests {
 
         // 整合后台账仍保留（integrated 标记可见），不再出现在未整合投影。
         assert!(
-            integrate_task_evidence(
-                &history_file,
-                session_id,
-                "task-a",
-                "accepted",
-                "used"
-            )
-            .unwrap()
+            integrate_task_evidence(&history_file, session_id, "task-a", "accepted", "used")
+                .unwrap()
         );
         let audit = read_task_spawn_audit(&history_file, session_id).unwrap();
         assert_eq!(audit[0].disposition.as_deref(), Some("accepted"));

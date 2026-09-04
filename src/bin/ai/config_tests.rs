@@ -23,7 +23,10 @@ fn load_config_accepts_default_model_specific_api_key_config_key() {
 
     let loaded = load_config();
     let resolved_key = match loaded.as_ref() {
-        Ok(app) => Some(models::api_key_for_model("deepseek-v4-flash-volcano", &app.api_key)),
+        Ok(app) => Some(models::api_key_for_model(
+            "deepseek-v4-flash-volcano",
+            &app.api_key,
+        )),
         Err(_) => None,
     };
 

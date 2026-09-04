@@ -521,7 +521,8 @@ fn load_skills_from_package_dir(dir: &Path) -> Vec<SkillManifest> {
     collect_skill_packages(dir)
         .into_iter()
         .filter_map(|(resource_root, manifest_path)| {
-            let mut skill = parse_skill_package_manifest(&manifest_path, &resource_root, None).ok()?;
+            let mut skill =
+                parse_skill_package_manifest(&manifest_path, &resource_root, None).ok()?;
             if skill.parent.is_none() {
                 if let Some(inferred) = infer_parent_from_filesystem(&resource_root) {
                     skill.parent = Some(inferred);
@@ -547,7 +548,8 @@ fn load_skills_from_zip_package(zip_path: &Path, skills_dir: &Path) -> Vec<Skill
                 .unwrap_or(manifest_path.as_path());
             let source_label = format!("{}!{}", zip_path.display(), relative_manifest.display());
             let mut skill =
-                parse_skill_package_manifest(&manifest_path, &resource_root, Some(source_label)).ok()?;
+                parse_skill_package_manifest(&manifest_path, &resource_root, Some(source_label))
+                    .ok()?;
             if skill.parent.is_none() {
                 if let Some(inferred) = infer_parent_from_filesystem(&resource_root) {
                     skill.parent = Some(inferred);
@@ -592,11 +594,7 @@ fn infer_parent_from_filesystem(resource_root: &Path) -> Option<String> {
     let content = fs::read_to_string(&manifest).ok()?;
     let parsed = parse_skill_front_matter(&content).ok()?;
     let name = parsed.name.trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// 收集 `parent_root` 下所有子 skill 包（仅扫描 `SUBSKILL_CONTAINER_DIRS` 的直接子目录）。

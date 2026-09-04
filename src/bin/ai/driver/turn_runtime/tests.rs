@@ -210,8 +210,12 @@ fn low_information_probe_only_matches_pure_echo_commands() {
     // Contains any real read-only segment → not a pure probe; still accounted
     // for normally (legitimate exploration is not penalized).
     assert!(!command_is_low_information_probe("cat version.txt"));
-    assert!(!command_is_low_information_probe("echo hi && cargo check --bin a"));
-    assert!(!command_is_low_information_probe("echo start && grep foo src.rs"));
+    assert!(!command_is_low_information_probe(
+        "echo hi && cargo check --bin a"
+    ));
+    assert!(!command_is_low_information_probe(
+        "echo start && grep foo src.rs"
+    ));
     assert!(!command_is_low_information_probe("ls -la"));
     // Empty command / leading segments only → no substantive echo segment, not
     // a probe.
@@ -252,8 +256,12 @@ fn distinct_echo_probes_do_not_each_count_as_new_evidence() {
     // fingerprint that refreshed the budget; after the fix none counts as
     // evidence.
     assert!(
-        extract_round_evidence_fingerprints(&echo_round("c1", "echo \\\"integrate\\\"", "integrate"))
-            .is_empty(),
+        extract_round_evidence_fingerprints(&echo_round(
+            "c1",
+            "echo \\\"integrate\\\"",
+            "integrate"
+        ))
+        .is_empty(),
         "echo probe must not count as new evidence"
     );
     assert!(
@@ -320,8 +328,7 @@ fn turn_supervisor_emits_soft_then_hard_loop_signal() {
     let mut signals = Vec::new();
     for i in 0..(TOOL_LOOP_SOFT_WINDOW + TOOL_LOOP_HARD_WINDOW) {
         messages.push(assistant_with_same_read(&format!("tc-{i}")));
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
     assert!(
         signals[..TOOL_LOOP_SOFT_WINDOW - 1]
@@ -367,7 +374,13 @@ fn task_progress_after_loop_soft_restarts_tool_loop_ladder() {
     // A new round of repetition must earn soft again first, not inherit the
     // old state and jump straight to hard-stop.
     for i in 0..TOOL_LOOP_SOFT_WINDOW {
-        pb_successful_read_round(&mut messages, "src/other.rs", 5, &format!("retry-{i}"), "body");
+        pb_successful_read_round(
+            &mut messages,
+            "src/other.rs",
+            5,
+            &format!("retry-{i}"),
+            "body",
+        );
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         if i == TOOL_LOOP_SOFT_WINDOW - 1 {
             assert!(matches!(signal, ToolLoopSignal::Soft));
@@ -548,9 +561,7 @@ fn long_loop_lowers_effective_mid_turn_soft_threshold() {
     assert_eq!(s.effective_mid_turn_soft_threshold(base), base);
     // Here ~120K of history (< 135K baseline) does not trigger compression —
     // exactly the old behavior's blind spot.
-    assert!(
-        !s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base))
-    );
+    assert!(!s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base)));
 
     // Long loop (threshold reached): the effective threshold drops to FLOOR
     // and the same ~120K history triggers compression immediately.
@@ -628,7 +639,10 @@ fn coarse_execute_command_signature_collapses_middle_paging_offsets() {
     assert_eq!(d, "sed:src/all_desc.txt");
     assert_eq!(d, e);
     // Different target files remain distinguished to avoid false merges.
-    assert_ne!(a, coarse_execute_command_signature("tail -c +2401 other.txt"));
+    assert_ne!(
+        a,
+        coarse_execute_command_signature("tail -c +2401 other.txt")
+    );
 }
 
 #[test]
@@ -652,10 +666,7 @@ fn coarse_catches_middle_paging_loop_never_from_top() {
             &format!("tail -c +{offset} {file} | head -c 2400"),
             &format!("p{i}"),
         );
-        signals.push(supervisor.record_tool_signatures(
-            &messages,
-            PROGRESS_FREE_EXPLORE_ROUNDS,
-        ));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
     assert!(
         matches!(signals[TOOL_LOOP_COARSE_WINDOW - 1], ToolLoopSignal::Coarse),
@@ -682,9 +693,8 @@ fn coarse_execute_command_signature_keeps_search_pattern_and_path() {
 
 #[test]
 fn coarse_execute_command_signature_collapses_git_forensics_variants() {
-    let log_and_status = coarse_execute_command_signature(
-        "git log --oneline --decorate -5 && git status --short",
-    );
+    let log_and_status =
+        coarse_execute_command_signature("git log --oneline --decorate -5 && git status --short");
     let show_pair = coarse_execute_command_signature(
         "git show --stat --oneline 5dfc5676f && git show --stat --oneline 76530274f",
     );
@@ -716,9 +726,7 @@ fn turn_supervisor_emits_coarse_signal_for_same_file_paging() {
             tool_type: "function".to_string(),
             function: crate::ai::types::FunctionCall {
                 name: "read_file".to_string(),
-                arguments: format!(
-                    "{{\"path\":\"src/main.rs\",\"offset\":{offset},\"limit\":80}}"
-                ),
+                arguments: format!("{{\"path\":\"src/main.rs\",\"offset\":{offset},\"limit\":80}}"),
             },
         }]),
         tool_call_id: None,
@@ -731,8 +739,7 @@ fn turn_supervisor_emits_coarse_signal_for_same_file_paging() {
     let mut signals = Vec::new();
     for i in 0..TOOL_LOOP_COARSE_WINDOW {
         messages.push(assistant_paging_read(&format!("tc-{i}"), i * 80));
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
     assert!(
         signals[..TOOL_LOOP_COARSE_WINDOW - 1]
@@ -857,8 +864,7 @@ fn turn_supervisor_escalates_execute_command_git_forensics_to_hard_stop() {
             tool_call_id: None,
             reasoning_content: None,
         });
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
     assert!(
         signals[..TOOL_LOOP_COARSE_WINDOW - 1]
@@ -911,8 +917,7 @@ fn turn_supervisor_escalates_execute_command_coarse_loop_to_hard_stop() {
             tool_call_id: None,
             reasoning_content: None,
         });
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
     assert!(
         signals[..TOOL_LOOP_COARSE_WINDOW - 1]
@@ -1101,10 +1106,7 @@ fn tool_round_checkpoint_phase_tracks_mutation_verification_and_failure() {
         "Done!",
     ));
     assert_eq!(
-        tool_round_checkpoint_phase(
-            &verification_before_mutation,
-            &verification_before_mutation,
-        ),
+        tool_round_checkpoint_phase(&verification_before_mutation, &verification_before_mutation,),
         ToolRoundCheckpointPhase::ImplementedNeedsVerification
     );
 
@@ -1194,8 +1196,7 @@ fn agent_team_delegation_does_not_disable_read_only_progress_guard() {
             &format!("read-{i}"),
             &format!("independent evidence {i}"),
         );
-        let signal =
-            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         if matches!(signal, ToolLoopSignal::ReadOnlyBreadthHard) {
             hard_stopped = true;
             break;
@@ -1470,8 +1471,7 @@ fn progress_budget_no_gain_reading_triggers_soft_after_free_rounds() {
     for i in 1..=25 {
         supervisor.next_iteration();
         pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("tc-{i}"));
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
     assert!(
         signals[..24]
@@ -1776,8 +1776,7 @@ fn target_repeat_catches_repeated_blocked_outside_workspace_commands() {
     let mut signals = Vec::new();
     for (i, command) in commands.iter().enumerate() {
         pb_blocked_outside_workspace_round(&mut messages, command, &format!("blocked-{i}"));
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
 
     assert!(
@@ -1836,8 +1835,7 @@ fn turn_supervisor_emits_target_repeat_for_mixed_tool_rounds_on_same_file() {
     let mut signals = Vec::new();
     for i in 0..TOOL_LOOP_COARSE_WINDOW {
         messages.push(mixed_round(i));
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
 
     // Whole-round signatures differ every round: exact / coarse whole-round
@@ -1869,8 +1867,7 @@ fn target_repeat_ignores_distinct_targets_each_round() {
     let mut signals = Vec::new();
     for i in 0..TOOL_LOOP_COARSE_WINDOW {
         messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("tc-{i}")));
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
     assert!(
         signals
@@ -1917,7 +1914,11 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
     let file = "src/all_desc.txt";
 
     // 1st from-top read (tail -c +1) plus subsequent paging.
-    pb_execute_command_round(&mut messages, &format!("tail -c +1 {file} | head -c 2400"), "t0");
+    pb_execute_command_round(
+        &mut messages,
+        &format!("tail -c +1 {file} | head -c 2400"),
+        "t0",
+    );
     assert_eq!(
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
         ToolLoopSignal::None
@@ -1943,7 +1944,11 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
     );
     // 2nd from-top read: page width switched to 1400 bytes → soft notice (soft
     // threshold=2).
-    pb_execute_command_round(&mut messages, &format!("tail -c +1 {file} | head -c 1400"), "t1");
+    pb_execute_command_round(
+        &mut messages,
+        &format!("tail -c +1 {file} | head -c 1400"),
+        "t1",
+    );
     assert!(
         matches!(
             supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
@@ -1951,7 +1956,11 @@ fn target_rescan_catches_pagination_loop_with_mixed_rounds() {
         ),
         "round t1 应软提示：第 2 次从头读"
     );
-    pb_execute_command_round(&mut messages, &format!("tail -c +1401 {file} | head -c 1400"), "t1p1");
+    pb_execute_command_round(
+        &mut messages,
+        &format!("tail -c +1401 {file} | head -c 1400"),
+        "t1p1",
+    );
     // After the fix: tail/sed offset/line-range literals are stripped, the
     // window [tail,tail,archive,tail,tail] folds into the 3-cycle
     // [tail,tail,archive], and coarse hits early when the window fills
@@ -2018,7 +2027,13 @@ fn target_rescan_ignores_monotonic_pagination() {
     let file = "src/big-file.rs";
     for i in 0..8 {
         let offset = i * 100;
-        pb_successful_read_round(&mut messages, file, offset, &format!("p{i}"), &format!("page-{i}"));
+        pb_successful_read_round(
+            &mut messages,
+            file,
+            offset,
+            &format!("p{i}"),
+            &format!("page-{i}"),
+        );
         let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
         assert!(
             !matches!(
@@ -2041,7 +2056,11 @@ fn target_rescan_window_decays_stale_counts() {
     let target = "src/spaced-file.rs";
     // 1st from-top read at iteration=1 → count 1.
     supervisor.iteration = 1;
-    pb_execute_command_round(&mut messages, &format!("tail -c +1 {target} | head -c 2400"), "r1");
+    pb_execute_command_round(
+        &mut messages,
+        &format!("tail -c +1 {target} | head -c 2400"),
+        "r1",
+    );
     assert_eq!(
         supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
         ToolLoopSignal::None
@@ -2112,7 +2131,11 @@ fn target_rescan_window_decay_grants_fresh_soft_warning_per_episode() {
                 "episode1 round r2 should soft-signal (soft threshold=2)"
             );
         } else if iter == 3 {
-            assert_eq!(signal, ToolLoopSignal::None, "episode1 round r3: soft injected once");
+            assert_eq!(
+                signal,
+                ToolLoopSignal::None,
+                "episode1 round r3: soft injected once"
+            );
         } else {
             assert_eq!(signal, ToolLoopSignal::None, "episode1 round r{iter}");
         }
@@ -2229,7 +2252,10 @@ fn target_rescan_helper_detects_from_top_reads() {
         "sed -n '1,40p' /tmp/a.txt",
         "sed -n 1,40p /tmp/a.txt",
     ] {
-        assert!(command_reads_from_top(from_top), "expected from-top: {from_top}");
+        assert!(
+            command_reads_from_top(from_top),
+            "expected from-top: {from_top}"
+        );
     }
     for not_from_top in [
         "tail -c +2401 /tmp/a.txt | head -c 2400",
@@ -2238,14 +2264,23 @@ fn target_rescan_helper_detects_from_top_reads() {
         "grep -n pattern /tmp/a.txt",
         "ls /tmp",
     ] {
-        assert!(!command_reads_from_top(not_from_top), "expected NOT from-top: {not_from_top}");
+        assert!(
+            !command_reads_from_top(not_from_top),
+            "expected NOT from-top: {not_from_top}"
+        );
     }
     assert_eq!(
         first_path_token("tail -c +1 /tmp/a.txt | head -c 2400").as_deref(),
         Some("/tmp/a.txt")
     );
-    assert_eq!(first_path_token("head -c 2400 /tmp/a.txt").as_deref(), Some("/tmp/a.txt"));
-    assert_eq!(normalize_rescan_path("./src/a.rs"), normalize_rescan_path("src/a.rs"));
+    assert_eq!(
+        first_path_token("head -c 2400 /tmp/a.txt").as_deref(),
+        Some("/tmp/a.txt")
+    );
+    assert_eq!(
+        normalize_rescan_path("./src/a.rs"),
+        normalize_rescan_path("src/a.rs")
+    );
     // read_file offset omitted/0/1 → from-top; offset=100 → not.
     let mut messages = Vec::new();
     messages.push(pb_read_msg("/tmp/a.txt", "no-offset"));
@@ -2272,8 +2307,7 @@ fn repeated_identical_write_file_still_hits_exact_tool_loop() {
             "same content\n",
         ));
         messages.push(pb_tool_result(&id, "Successfully wrote file."));
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
 
     assert!(
@@ -2313,8 +2347,7 @@ fn repeated_blocked_write_to_same_path_triggers_target_repeat() {
             &format!("attempt {i} content\n"),
         ));
         messages.push(pb_tool_result(&id, blocked));
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
 
     assert!(
@@ -2703,8 +2736,7 @@ fn progress_budget_escalates_soft_then_ledger_then_hard() {
     for i in 0..(5 + PROGRESS_NO_PROGRESS_HARD_MARGIN) {
         supervisor.next_iteration();
         pb_failed_read_round(&mut messages, &format!("src/f{i}.rs"), &format!("r-{i}"));
-        signals
-            .push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
+        signals.push(supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS));
     }
     assert!(
         signals[..4]

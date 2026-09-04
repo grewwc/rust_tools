@@ -177,7 +177,6 @@ impl ScopedPreflightTargets {
     }
 }
 
-
 // These submodules are stored as siblings of orchestrator.rs. Note the crate also has a module with
 // the same name, driver::thinking::orchestrator; on a name collision rustc resolves this module's
 // submodules by "directory-style" paths (looking under an orchestrator/ directory), so #[path] must
@@ -194,9 +193,9 @@ pub(crate) mod progress;
 
 use checkpoint::*;
 use loop_detection::*;
+pub(super) use notes::record_force_final_reason;
 use notes::*;
 use progress::*;
-pub(super) use notes::record_force_final_reason;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -256,14 +255,14 @@ struct TurnSupervisor {
     task_anchor_injected: bool,
     last_compress_iteration: usize,
     last_compress_after_chars: usize,
-/// Mid-turn state waiting to be emitted together with the next pre-request LLM compression result.
+    /// Mid-turn state waiting to be emitted together with the next pre-request LLM compression result.
     pending_compression_report: CompressionReport,
     tool_signature_history: Vec<Vec<String>>,
     tool_signature_history_coarse: Vec<Vec<String>>,
-/// History of per-round "coarse target resource" sets (same read_file file / same coarse
-/// execute_command, ignoring paging args). Catches loops where whole-round signatures never match
-/// but the same target is repeatedly probed inside different tool batches — plain whole-round
-/// signature comparison cannot handle such mixed batches (adding one decoy tool per round evades it).
+    /// History of per-round "coarse target resource" sets (same read_file file / same coarse
+    /// execute_command, ignoring paging args). Catches loops where whole-round signatures never match
+    /// but the same target is repeatedly probed inside different tool batches — plain whole-round
+    /// signature comparison cannot handle such mixed batches (adding one decoy tool per round evades it).
     tool_target_history: Vec<Vec<String>>,
     target_repeat_note_injected: bool,
     progress: ProgressLedger,
@@ -272,40 +271,40 @@ struct TurnSupervisor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolLoopSignal {
     None,
-/// Approximate low-yield repetition: the same tool keeps hitting the same target resource (ignoring
-/// paging args). Prompt gently once.
+    /// Approximate low-yield repetition: the same tool keeps hitting the same target resource (ignoring
+    /// paging args). Prompt gently once.
     Coarse,
-/// The same target resource is probed repeatedly across mixed tool rounds: whole-round signatures
-/// all differ (each round weaves in different decoy tools), evading the exact/coarse whole-round
-/// comparison, but a particular read_file target appears in every round of the window. Prompt gently
-/// once.
+    /// The same target resource is probed repeatedly across mixed tool rounds: whole-round signatures
+    /// all differ (each round weaves in different decoy tools), evading the exact/coarse whole-round
+    /// comparison, but a particular read_file target appears in every round of the window. Prompt gently
+    /// once.
     TargetRepeat,
-/// The same target is repeatedly re-read from the top (a loop that keeps varying the paging width
-/// and mixing in new archive paths each round). Prompt gently once.
+    /// The same target is repeatedly re-read from the top (a loop that keeps varying the paging width
+    /// and mixing in new archive paths each round). Prompt gently once.
     TargetRescan(String, u32),
-/// The same target has been re-read from the top past the hard threshold: switch to no-tool handoff
-/// and force an answer.
+    /// The same target has been re-read from the top past the hard threshold: switch to no-tool handoff
+    /// and force an answer.
     TargetRescanHard(String, u32),
-/// `execute_command` spins idly on the same coarse target for too long; force convergence directly.
+    /// `execute_command` spins idly on the same coarse target for too long; force convergence directly.
     CoarseHard,
     Soft,
     Hard,
-/// Progress Budget level one: several consecutive rounds with no information gain (no new target and
-/// no substantive action) inject a reflective soft prompt without blocking tools.
+    /// Progress Budget level one: several consecutive rounds with no information gain (no new target and
+    /// no substantive action) inject a reflective soft prompt without blocking tools.
     LowProgressSoft,
-/// Progress Budget level two: still no progress after the soft prompt, ask for a lightweight
-/// decision ledger (confirmed facts / open questions / candidate and ruled-out branches), still not
-/// a hard block.
+    /// Progress Budget level two: still no progress after the soft prompt, ask for a lightweight
+    /// decision ledger (confirmed facts / open questions / candidate and ruled-out branches), still not
+    /// a hard block.
     LowProgressLedger,
-/// Progress Budget level three: still no consecutive progress after the soft prompt and ledger,
-/// switch to no-tool handoff mode.
+    /// Progress Budget level three: still no consecutive progress after the soft prompt and ledger,
+    /// switch to no-tool handoff mode.
     LowProgressHard,
-/// Many distinct targets have been covered; remind the model to first summarize current evidence
-/// and the single critical gap.
+    /// Many distinct targets have been covered; remind the model to first summarize current evidence
+    /// and the single critical gap.
     ReadOnlyBreadth,
-/// Last brake for pure read-only divergence: zero mutation in this turn, yet far more distinct
-/// read-only targets than the breadth threshold have been touched without converging. Decoupled
-/// from content novelty; switch to no-tool handoff and force an answer.
+    /// Last brake for pure read-only divergence: zero mutation in this turn, yet far more distinct
+    /// read-only targets than the breadth threshold have been touched without converging. Decoupled
+    /// from content novelty; switch to no-tool handoff and force an answer.
     ReadOnlyBreadthHard,
 }
 
@@ -316,60 +315,60 @@ enum ToolLoopSignal {
 /// from the user's question text.
 #[derive(Default)]
 struct ProgressLedger {
-/// Accumulated target resources touched ("new target = information gain" judgment).
+    /// Accumulated target resources touched ("new target = information gain" judgment).
     seen_targets: FxHashSet<String>,
-/// Accumulated successful read-only tool results seen. New content counts as new evidence even
-/// when it comes from the same target.
+    /// Accumulated successful read-only tool results seen. New content counts as new evidence even
+    /// when it comes from the same target.
     seen_evidence_fingerprints: FxHashSet<u64>,
-/// Consecutive no-progress rounds. Cleared whenever any round is judged as progress.
+    /// Consecutive no-progress rounds. Cleared whenever any round is judged as progress.
     consecutive_no_progress: usize,
-/// Previous round's reasoning fingerprint (a fingerprint change after a soft prompt is treated as a
-/// new justification and granted grace).
+    /// Previous round's reasoning fingerprint (a fingerprint change after a soft prompt is treated as a
+    /// new justification and granted grace).
     last_reasoning_fp: Option<u64>,
-/// Iteration until which grace lasts: no escalation before this point, giving the model room to
-/// keep exploring.
+    /// Iteration until which grace lasts: no escalation before this point, giving the model room to
+    /// keep exploring.
     grace_until_iteration: usize,
-/// A reasoning change buys at most one grace per turn, preventing endless renewal by rewriting the
-/// justification every round.
+    /// A reasoning change buys at most one grace per turn, preventing endless renewal by rewriting the
+    /// justification every round.
     grace_consumed: bool,
     soft_injected: bool,
     ledger_injected: bool,
     hard_injected: bool,
     read_only_breadth_injected: bool,
-/// Whether any project mutation happened this turn. Once true, the pure read-only divergence hard
-/// stop permanently yields (read+modify tasks are not bound by that brake). plan / task lifecycle
-/// counts only as progress and does not set this. Set monotonically, never cleared by reset.
+    /// Whether any project mutation happened this turn. Once true, the pure read-only divergence hard
+    /// stop permanently yields (read+modify tasks are not bound by that brake). plan / task lifecycle
+    /// counts only as progress and does not set this. Set monotonically, never cleared by reset.
     observed_project_mutation_this_turn: bool,
-/// One-shot gate for the pure read-only divergence hard stop (`ReadOnlyBreadthHard` fires once).
+    /// One-shot gate for the pure read-only divergence hard stop (`ReadOnlyBreadthHard` fires once).
     read_only_breadth_hard_injected: bool,
-/// Earliest iteration at which a new low-progress episode may inject soft again. Substantive
-/// progress resets the current episode but keeps this cooldown, preventing complex tasks from being
-/// interrupted by the same prompt repeatedly.
+    /// Earliest iteration at which a new low-progress episode may inject soft again. Substantive
+    /// progress resets the current episode but keeps this cooldown, preventing complex tasks from being
+    /// interrupted by the same prompt repeatedly.
     next_episode_iteration: usize,
-/// Per-target "read from the top" re-scan counts (re-scan detection). Tuple field one is the number
-/// of reads-from-top within the window; field two is the iteration of the last read-from-top (if a
-/// target has not been read from the top for more than TARGET_RESCAN_WINDOW_ROUNDS rounds the count
-/// expires and restarts). Decoupled from signature history: neither soft clearing the history nor a
-/// new target resetting the no-progress counter affects it; any write_file/apply_patch substantive
-/// change this round clears the whole table (re-reading from the top after an edit is legitimate
-/// and must not be misjudged as a paging loop).
+    /// Per-target "read from the top" re-scan counts (re-scan detection). Tuple field one is the number
+    /// of reads-from-top within the window; field two is the iteration of the last read-from-top (if a
+    /// target has not been read from the top for more than TARGET_RESCAN_WINDOW_ROUNDS rounds the count
+    /// expires and restarts). Decoupled from signature history: neither soft clearing the history nor a
+    /// new target resetting the no-progress counter affects it; any write_file/apply_patch substantive
+    /// change this round clears the whole table (re-reading from the top after an edit is legitimate
+    /// and must not be misjudged as a paging loop).
     from_top_reads: FxHashMap<String, (u32, usize)>,
-/// Targets that already received a TargetRescan soft prompt (once per target per round).
+    /// Targets that already received a TargetRescan soft prompt (once per target per round).
     rescan_note_injected: FxHashSet<String>,
 }
 
 impl ProgressLedger {
-/// Reset the escalation ladder: clear the no-progress counter and the one-shot soft/ledger/hard/grace
-/// state so billing restarts from zero. Shared by two scenarios:
-/// 1. Truncation retry (mark_truncation_skip): after a truncation clears history, re-reading is
-///    expected behavior; keep the same semantics as mark_truncation_skip in the exact/coarse
-///    detectors so a new loop after truncation recovery cannot skip the soft prompt straight to
-///    hard-stop.
-/// 2. Substantive progress (the made_progress branch of assess_progress): when the model responds
-///    to a soft prompt with an action that genuinely advances the task, treat it as "this round's
-///    nudge worked" and grant a full fresh budget instead of continuing to accumulate — otherwise,
-///    in long tasks, one early divergence makes every later convergence nudge slide toward
-///    hard-stop faster.
+    /// Reset the escalation ladder: clear the no-progress counter and the one-shot soft/ledger/hard/grace
+    /// state so billing restarts from zero. Shared by two scenarios:
+    /// 1. Truncation retry (mark_truncation_skip): after a truncation clears history, re-reading is
+    ///    expected behavior; keep the same semantics as mark_truncation_skip in the exact/coarse
+    ///    detectors so a new loop after truncation recovery cannot skip the soft prompt straight to
+    ///    hard-stop.
+    /// 2. Substantive progress (the made_progress branch of assess_progress): when the model responds
+    ///    to a soft prompt with an action that genuinely advances the task, treat it as "this round's
+    ///    nudge worked" and grant a full fresh budget instead of continuing to accumulate — otherwise,
+    ///    in long tasks, one early divergence makes every later convergence nudge slide toward
+    ///    hard-stop faster.
     fn reset_escalation(&mut self) {
         self.consecutive_no_progress = 0;
         self.soft_injected = false;
@@ -379,16 +378,16 @@ impl ProgressLedger {
         self.grace_consumed = false;
     }
 
-/// Truncation is an external constraint; it must not inherit the previous episode's prompt cooldown.
+    /// Truncation is an external constraint; it must not inherit the previous episode's prompt cooldown.
     fn reset_after_truncation(&mut self) {
         self.reset_escalation();
         self.next_episode_iteration = 0;
-// Re-reading from the top after truncation recovery is legitimate context rebuilding: the re-scan
-// counts and prompt marks must be cleared together with the history, otherwise the first read-from-top
-// after recovery inherits stale counts and jumps straight to hard-stop.
-// Note this must not be merged into reset_escalation: the substantive-progress path must not clear
-// these counts (new targets in mixed rounds keep resetting the no-progress counter; the re-scan
-// counts are exactly the independent defense against that escape).
+        // Re-reading from the top after truncation recovery is legitimate context rebuilding: the re-scan
+        // counts and prompt marks must be cleared together with the history, otherwise the first read-from-top
+        // after recovery inherits stale counts and jumps straight to hard-stop.
+        // Note this must not be merged into reset_escalation: the substantive-progress path must not clear
+        // these counts (new targets in mixed rounds keep resetting the no-progress counter; the re-scan
+        // counts are exactly the independent defense against that escape).
         self.from_top_reads.clear();
         self.rescan_note_injected.clear();
     }
@@ -422,15 +421,15 @@ impl TurnSupervisor {
             && (self.last_compress_after_chars == 0 || delta_significant)
     }
 
-/// The mid-turn compression soft threshold actually in effect this round.
-///
-/// For long loops (tool iterations >= [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]) the threshold drops
-/// to [`MID_TURN_COMPRESS_SOFT_FLOOR`] so content-level dedup and pruning of stale results engage
-/// early, curbing the O(n²) re-send accumulation; short turns keep the window-derived baseline
-/// threshold, leaving normal single-turn large tasks unaffected. This gating and the actual
-/// [`mid_turn_compress`](crate::ai::history::mid_turn_compress) call must share this method's return
-/// value — the latter has a no-op early exit for `before <= soft_threshold`, and if the two
-/// thresholds disagree, the gate can open while compression does nothing.
+    /// The mid-turn compression soft threshold actually in effect this round.
+    ///
+    /// For long loops (tool iterations >= [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]) the threshold drops
+    /// to [`MID_TURN_COMPRESS_SOFT_FLOOR`] so content-level dedup and pruning of stale results engage
+    /// early, curbing the O(n²) re-send accumulation; short turns keep the window-derived baseline
+    /// threshold, leaving normal single-turn large tasks unaffected. This gating and the actual
+    /// [`mid_turn_compress`](crate::ai::history::mid_turn_compress) call must share this method's return
+    /// value — the latter has a no-op early exit for `before <= soft_threshold`, and if the two
+    /// thresholds disagree, the gate can open while compression does nothing.
     fn effective_mid_turn_soft_threshold(&self, base_soft: usize) -> usize {
         if self.iteration >= LONG_LOOP_COMPRESS_ITERATION_THRESHOLD {
             base_soft.min(MID_TURN_COMPRESS_SOFT_FLOOR)
@@ -444,10 +443,10 @@ impl TurnSupervisor {
         self.last_compress_after_chars = after_chars;
     }
 
-/// After substantive task progress, drop the samples of the earlier ineffective loop and restore the
-/// soft → hard escalation ladder. Otherwise, when the model has already responded to the soft prompt
-/// by switching to effective actions, a later single repetition would skip soft and reuse the stale
-/// flags straight into hard-stop.
+    /// After substantive task progress, drop the samples of the earlier ineffective loop and restore the
+    /// soft → hard escalation ladder. Otherwise, when the model has already responded to the soft prompt
+    /// by switching to effective actions, a later single repetition would skip soft and reuse the stale
+    /// flags straight into hard-stop.
     fn reset_tool_loop_escalation(&mut self) {
         self.tool_signature_history.clear();
         self.tool_signature_history_coarse.clear();
@@ -458,15 +457,15 @@ impl TurnSupervisor {
         self.target_repeat_note_injected = false;
     }
 
-/// Reset tool-loop detection state on truncation retry: truncation is an external constraint
-/// (output cap / model availability fluctuation), so re-invoking the same tools on retry is expected
-/// behavior and must not count toward the loop-detection window. Truncation already has its own
-/// independent `consecutive_truncations` cap; loop detection need not add another layer.
-///
-/// Clearing history plus skipping the current iteration's signature recording keeps truncation
-/// retries from being misjudged as a loop. All one-shot flags are reset: once truncation clears the
-/// history, the full soft/coarse/hard escalation ladder should restart from zero, otherwise a new
-/// loop formed after truncation recovery would skip the soft prompt straight to hard-stop.
+    /// Reset tool-loop detection state on truncation retry: truncation is an external constraint
+    /// (output cap / model availability fluctuation), so re-invoking the same tools on retry is expected
+    /// behavior and must not count toward the loop-detection window. Truncation already has its own
+    /// independent `consecutive_truncations` cap; loop detection need not add another layer.
+    ///
+    /// Clearing history plus skipping the current iteration's signature recording keeps truncation
+    /// retries from being misjudged as a loop. All one-shot flags are reset: once truncation clears the
+    /// history, the full soft/coarse/hard escalation ladder should restart from zero, otherwise a new
+    /// loop formed after truncation recovery would skip the soft prompt straight to hard-stop.
     fn mark_truncation_skip(&mut self) {
         self.reset_tool_loop_escalation();
         self.skip_tool_signature_rounds += 1;
@@ -492,9 +491,9 @@ impl TurnSupervisor {
         } else {
             progress_messages
         };
-// Truncation-retry skip: after history is cleared, do not record this round's signature so
-// truncation retries are not misjudged as a tool loop. `skip_tool_signature_rounds` is incremented
-// by `mark_truncation_skip()` and decremented once per skipped round.
+        // Truncation-retry skip: after history is cleared, do not record this round's signature so
+        // truncation retries are not misjudged as a tool loop. `skip_tool_signature_rounds` is incremented
+        // by `mark_truncation_skip()` and decremented once per skipped round.
         if self.skip_tool_signature_rounds > 0 {
             self.skip_tool_signature_rounds -= 1;
             return ToolLoopSignal::None;
@@ -514,9 +513,9 @@ impl TurnSupervisor {
                 self.tool_signature_history_coarse.drain(0..drop);
             }
         }
-// Target-level history: maintained in parallel with coarse signatures, used by the
-// target-intersection detection for mixed tool rounds. Bound by TOOL_SIGNATURE_HISTORY_LIMIT like
-// exact/coarse.
+        // Target-level history: maintained in parallel with coarse signatures, used by the
+        // target-intersection detection for mixed tool rounds. Bound by TOOL_SIGNATURE_HISTORY_LIMIT like
+        // exact/coarse.
         self.tool_target_history
             .push(extract_round_probe_targets(signature_messages));
         if self.tool_target_history.len() > TOOL_SIGNATURE_HISTORY_LIMIT {
@@ -692,9 +691,9 @@ impl TurnSupervisor {
         let reasoning_fp = extract_round_reasoning_fingerprint(progress_messages)
             .or_else(|| extract_round_reasoning_fingerprint(messages));
         if made_progress {
-        // Any real progress ends the current low-progress episode; next_episode_iteration is
-        // preserved so a brief advance does not immediately re-inject soft. Seen targets/evidence
-        // also accumulate across rounds.
+            // Any real progress ends the current low-progress episode; next_episode_iteration is
+            // preserved so a brief advance does not immediately re-inject soft. Seen targets/evidence
+            // also accumulate across rounds.
             let recovered_from_low_progress_episode = self.progress.soft_injected
                 || self.progress.ledger_injected
                 || self.progress.hard_injected
@@ -707,13 +706,13 @@ impl TurnSupervisor {
                     .max(self.iteration + PROGRESS_EPISODE_COOLDOWN);
                 self.progress.reset_escalation();
             }
-        // Only **structural** progress (new target / mutation action) with a previously injected
-        // loop prompt clears the exact/coarse/target retry windows. New read-only result content
-        // already counts toward made_progress above (the Progress Budget does not escalate on
-        // efficient paging), but signature / target history is **never** cleared: otherwise
-        // repeatedly paging the same file would never fill the coarse window because every page
-        // differs, bypassing the loop brake — exactly what the "progress hashes must ignore
-        // offset/limit to prevent budget escape" invariant guards against.
+            // Only **structural** progress (new target / mutation action) with a previously injected
+            // loop prompt clears the exact/coarse/target retry windows. New read-only result content
+            // already counts toward made_progress above (the Progress Budget does not escalate on
+            // efficient paging), but signature / target history is **never** cleared: otherwise
+            // repeatedly paging the same file would never fill the coarse window because every page
+            // differs, bypassing the loop brake — exactly what the "progress hashes must ignore
+            // offset/limit to prevent budget escape" invariant guards against.
             if (round_had_mutation || added_new_target)
                 && (self.hard_loop_stop_injected
                     || self.loop_breaker_injected
@@ -724,19 +723,19 @@ impl TurnSupervisor {
             }
             self.progress.consecutive_no_progress = 0;
             self.progress.last_reasoning_fp = reasoning_fp;
-        // Only a real project change permanently disables the pure read-only divergence hard stop.
-        // plan / task lifecycle is task progress, but it must not let later unbounded serial scans
-        // bypass this last brake.
+            // Only a real project change permanently disables the pure read-only divergence hard stop.
+            // plan / task lifecycle is task progress, but it must not let later unbounded serial scans
+            // bypass this last brake.
             if round_had_project_mutation {
                 self.progress.observed_project_mutation_this_turn = true;
             }
-        // Last brake for pure read-only divergence: the project was never modified this turn, yet
-        // far more distinct read-only targets than the breadth threshold have been touched without
-        // converging. `seen_targets` is monotonic and never cleared by any reset, so this criterion
-        // is fully decoupled from "new target / new bytes resetting the ordinary no-progress
-        // counter" — it is the only signal that can catch "pure-investigation divergence that keeps
-        // switching targets". Yielding after the ordinary breadth prompt, it fires once and forces
-        // convergence.
+            // Last brake for pure read-only divergence: the project was never modified this turn, yet
+            // far more distinct read-only targets than the breadth threshold have been touched without
+            // converging. `seen_targets` is monotonic and never cleared by any reset, so this criterion
+            // is fully decoupled from "new target / new bytes resetting the ordinary no-progress
+            // counter" — it is the only signal that can catch "pure-investigation divergence that keeps
+            // switching targets". Yielding after the ordinary breadth prompt, it fires once and forces
+            // convergence.
             if !self.progress.read_only_breadth_hard_injected
                 && !self.progress.observed_project_mutation_this_turn
                 && self.iteration > free_explore_rounds
@@ -757,9 +756,9 @@ impl TurnSupervisor {
             return ToolLoopSignal::None;
         }
 
-            // Free-exploration zone: exploration is completely free — no charging, no escalation
-            // (locating code before deleting it, or feeling out an unfamiliar codebase, is normal).
-            // Only the reasoning fingerprint baseline is updated.
+        // Free-exploration zone: exploration is completely free — no charging, no escalation
+        // (locating code before deleting it, or feeling out an unfamiliar codebase, is normal).
+        // Only the reasoning fingerprint baseline is updated.
         if self.iteration <= free_explore_rounds {
             self.progress.last_reasoning_fp = reasoning_fp;
             return ToolLoopSignal::None;
@@ -767,11 +766,11 @@ impl TurnSupervisor {
 
         self.progress.consecutive_no_progress += 1;
 
-            // Every soft prompt is followed by a fixed response window. In the old logic only
-            // models exposing reasoning_content with a changed fingerprint got grace; models that
-            // do not emit reasoning would receive the ledger in the very next round. After the base
-            // window ends, a new justification can extend it once more, but rolling renewal is not
-            // allowed.
+        // Every soft prompt is followed by a fixed response window. In the old logic only
+        // models exposing reasoning_content with a changed fingerprint got grace; models that
+        // do not emit reasoning would receive the ledger in the very next round. After the base
+        // window ends, a new justification can extend it once more, but rolling renewal is not
+        // allowed.
         let reasoning_changed =
             reasoning_fp.is_some() && reasoning_fp != self.progress.last_reasoning_fp;
         self.progress.last_reasoning_fp = reasoning_fp;
@@ -789,10 +788,10 @@ impl TurnSupervisor {
             return ToolLoopSignal::None;
         }
 
-            // The escalation ladder proceeds strictly soft prompt → ledger → hard stop, each level
-            // one-shot. Hard stop additionally requires consecutive no-progress to reach
-            // soft_threshold + margin, so it cannot jump past the soft layers straight to
-            // convergence.
+        // The escalation ladder proceeds strictly soft prompt → ledger → hard stop, each level
+        // one-shot. Hard stop additionally requires consecutive no-progress to reach
+        // soft_threshold + margin, so it cannot jump past the soft layers straight to
+        // convergence.
         if !self.progress.soft_injected {
             if self.iteration < self.progress.next_episode_iteration {
                 return ToolLoopSignal::None;
@@ -898,11 +897,11 @@ pub(in crate::ai::driver) async fn run_turn(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
-        // Step 3: turn-start hook (preserving the original pairing semantics; must fire before the
-        // /audit shortcut). Allocate the real turn identity first (atomic increment in the session
-        // SQLite), then fire the start hook, so on_turn_start / on_turn_end read the real
-        // turn_index rather than a fake 0. Allocation failure = this round never started: return
-        // directly without firing any lifecycle hook (the start/end pairing is preserved).
+    // Step 3: turn-start hook (preserving the original pairing semantics; must fire before the
+    // /audit shortcut). Allocate the real turn identity first (atomic increment in the session
+    // SQLite), then fire the start hook, so on_turn_start / on_turn_end read the real
+    // turn_index rather than a fake 0. Allocation failure = this round never started: return
+    // directly without firing any lifecycle hook (the start/end pairing is preserved).
     let turn_index = history::reserve_turn_index(&app.session_history_file)?;
     app.fire_turn_start_hooks(turn_index);
 
@@ -911,7 +910,9 @@ pub(in crate::ai::driver) async fn run_turn(
         // after the parent DRIVER_CTX is established but before the child agent enters a recursive
         // turn, so that the task's isolation and evidence lifecycle can be reused.
         if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
-            if let Some(command) = crate::ai::driver::commands::audit::parse_audit_command(&question) {
+            if let Some(command) =
+                crate::ai::driver::commands::audit::parse_audit_command(&question)
+            {
                 return Ok(execute_audit_command(app, command, should_quit));
             }
         }
@@ -931,22 +932,25 @@ pub(in crate::ai::driver) async fn run_turn(
             .then(crate::ai::driver::signal::ForegroundTurnGuard::enter);
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((session_id, turn_id), async {
-        // enable_tools' per-turn state must track the entire future rather than relying only on
-        // run_turn_body's happy-path tail cleanup; abort / early returns also Drop it.
-                let _enable_turn_guard = crate::ai::tools::enable_tools::EnableTurnStateGuard::enter();
-        // Keep same-terminal side-note input listening (Ctrl+G) active for the whole turn
-        // (prepare / streaming / thinking / tool execution / finalize). The RAII guard drops when
-        // this future ends, restoring the canonical terminal so prompt_user input boxes between
-        // turns are not affected by leftover cbreak. Sub-agents (depth>0) / background (terminal
-        // output suppressed) / non-tty stdin are excluded by side_note_input_enabled(); no other
-        // stdin consumer exists inside a turn (the input box only opens between turns, and
-        // request_user_input only sets a flag without reading stdin), so cbreak owning stdin for
-        // the whole duration has no conflicts.
+                // enable_tools' per-turn state must track the entire future rather than relying only on
+                // run_turn_body's happy-path tail cleanup; abort / early returns also Drop it.
+                let _enable_turn_guard =
+                    crate::ai::tools::enable_tools::EnableTurnStateGuard::enter();
+                // Keep same-terminal side-note input listening (Ctrl+G) active for the whole turn
+                // (prepare / streaming / thinking / tool execution / finalize). The RAII guard drops when
+                // this future ends, restoring the canonical terminal so prompt_user input boxes between
+                // turns are not affected by leftover cbreak. Sub-agents (depth>0) / background (terminal
+                // output suppressed) / non-tty stdin are excluded by side_note_input_enabled(); no other
+                // stdin consumer exists inside a turn (the input box only opens between turns, and
+                // request_user_input only sets a flag without reading stdin), so cbreak owning stdin for
+                // the whole duration has no conflicts.
                 let _side_note_input =
                     if crate::ai::stream::side_note_input::side_note_input_enabled() {
-                        Some(crate::ai::stream::side_note_input::SideNoteInputGuard::spawn(
-                            app.session_history_file.clone(),
-                        ))
+                        Some(
+                            crate::ai::stream::side_note_input::SideNoteInputGuard::spawn(
+                                app.session_history_file.clone(),
+                            ),
+                        )
                     } else {
                         None
                     };
@@ -969,8 +973,8 @@ pub(in crate::ai::driver) async fn run_turn(
     })
     .await;
 
-        // Step 3: turn-end hook. Covers every return path (including the /audit shortcut), paired
-        // with the start hook.
+    // Step 3: turn-end hook. Covers every return path (including the /audit shortcut), paired
+    // with the start hook.
     app.fire_turn_end_hooks(turn_index);
 
     result
@@ -984,7 +988,9 @@ fn execute_audit_command(
     match command {
         crate::ai::driver::commands::audit::AuditCommand::Usage => {
             println!("Usage: /audit [--fast] <instruction>");
-            println!("  --fast  快速审计：当前会话模型 + high 思考 + 更少步数 + 更短超时，适合轻量复查");
+            println!(
+                "  --fast  快速审计：当前会话模型 + high 思考 + 更少步数 + 更短超时，适合轻量复查"
+            );
         }
         crate::ai::driver::commands::audit::AuditCommand::Run { instruction, fast } => {
             // By default only cwd/skills are inherited, keeping unrelated parent conversation and
@@ -1200,16 +1206,16 @@ async fn run_turn_body(
                         &digest,
                         &image_paths,
                     );
-            // Cross-turn digest: record this round's digest into turn_digest; on normal turn
-            // completion it is persisted into the history metadata (see the Ok(_) branch below),
-            // and when the next turn loads history the fingerprint retrieves the digest to replace
-            // the old image, avoiding cross-turn image re-sends.
-            // The fingerprint must come from turn_messages (canonical), not the just-replaced
-            // messages[idx]: the request projection carries injected image-processing protocol
-            // instructions / reminders whose parts are not persisted, while the loading side
-            // (replace_old_images_with_persisted_digests) fingerprints the raw persisted content —
-            // only the canonical version matches. If turn_messages has no image-bearing user
-            // message (e.g. a resume turn dropped the image), skip silently without persisting.
+                    // Cross-turn digest: record this round's digest into turn_digest; on normal turn
+                    // completion it is persisted into the history metadata (see the Ok(_) branch below),
+                    // and when the next turn loads history the fingerprint retrieves the digest to replace
+                    // the old image, avoiding cross-turn image re-sends.
+                    // The fingerprint must come from turn_messages (canonical), not the just-replaced
+                    // messages[idx]: the request projection carries injected image-processing protocol
+                    // instructions / reminders whose parts are not persisted, while the loading side
+                    // (replace_old_images_with_persisted_digests) fingerprints the raw persisted content —
+                    // only the canonical version matches. If turn_messages has no image-bearing user
+                    // message (e.g. a resume turn dropped the image), skip silently without persisting.
                     if let Some(fp) =
                         crate::ai::request::last_image_user_message_fingerprint(&turn_messages)
                     {
@@ -1234,7 +1240,8 @@ async fn run_turn_body(
                 &mut messages,
             );
             if !scoped_project_instructions_ready {
-                let targets = scoped_preflight_targets.required()
+                let targets = scoped_preflight_targets
+                    .required()
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
@@ -1247,7 +1254,12 @@ async fn run_turn_body(
         }
         if crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request() {
             pre_timeout_wrap_up_requested = true;
-            record_force_final_reason(&mut messages, "subagent_pre_timeout_wrap_up", iteration, None);
+            record_force_final_reason(
+                &mut messages,
+                "subagent_pre_timeout_wrap_up",
+                iteration,
+                None,
+            );
             force_final_response = true;
             inject_subagent_pre_timeout_wrap_up_note(&mut messages);
         }
@@ -1259,8 +1271,10 @@ async fn run_turn_body(
         // and leaking original text back.
         {
             let before = messages.len();
-            let cnt =
-                crate::ai::driver::side_note::poll_and_inject(&app.session_history_file, &mut messages);
+            let cnt = crate::ai::driver::side_note::poll_and_inject(
+                &app.session_history_file,
+                &mut messages,
+            );
             if cnt > 0 {
                 let injected = messages[before..].to_vec();
                 turn_messages.extend(injected);
@@ -1293,26 +1307,31 @@ async fn run_turn_body(
             Ok(e) => e,
             Err(err) => break 'turn Err(err),
         };
-            // The pre-timeout wrap-up signal fires mid-model-request: abandon the current request
-            // and enter a forced wrap-up iteration immediately instead of waiting for the current
-            // (possibly very long) iteration to finish naturally. Consume the signal so the next
-            // iteration's top does not inject it again.
+        // The pre-timeout wrap-up signal fires mid-model-request: abandon the current request
+        // and enter a forced wrap-up iteration immediately instead of waiting for the current
+        // (possibly very long) iteration to finish naturally. Consume the signal so the next
+        // iteration's top does not inject it again.
         if matches!(&execution, IterationExecution::WrapUpFinal) {
             let _ = crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request();
             pre_timeout_wrap_up_requested = true;
-            record_force_final_reason(&mut messages, "subagent_pre_timeout_wrap_up", iteration, None);
+            record_force_final_reason(
+                &mut messages,
+                "subagent_pre_timeout_wrap_up",
+                iteration,
+                None,
+            );
             force_final_response = true;
             inject_subagent_pre_timeout_wrap_up_note(&mut messages);
             continue 'turn;
         }
         let was_final_response = matches!(&execution, IterationExecution::FinalResponse(_));
         let had_tool_call_execution = matches!(&execution, IterationExecution::ToolCall(_));
-                // Piggyback collection: while the image digest is unresolved, cache this round's
-                // untruncated tool-call response text (assistant_text + reasoning_text). At the top
-                // of the next loop round we try to parse a digest from it; a hit saves one fallback
-                // request. The stream_result raw text must be used — the assistant narration
-                // written back to messages is truncated to 800 chars and may cut off the digest's
-                // trailing sentinel.
+        // Piggyback collection: while the image digest is unresolved, cache this round's
+        // untruncated tool-call response text (assistant_text + reasoning_text). At the top
+        // of the next loop round we try to parse a digest from it; a hit saves one fallback
+        // request. The stream_result raw text must be used — the assistant narration
+        // written back to messages is truncated to 800 chars and may cut off the digest's
+        // trailing sentinel.
         if !image_digest_resolved && let IterationExecution::ToolCall(tce) = &execution {
             let sr = &tce.stream_result;
             pending_digest_source = Some(format!("{}\n{}", sr.assistant_text, sr.reasoning_text));
@@ -1338,9 +1357,9 @@ async fn run_turn_body(
         }
         {
             let mc = mcp_client.lock().unwrap().routing_snapshot();
-                // Calibrate the max_tokens clamp of later requests with the actual prompt_tokens
-                // returned by the server. Char-based estimates are conservative (overestimating);
-                // the server's actual value is more accurate and reduces unnecessary clamping down.
+            // Calibrate the max_tokens clamp of later requests with the actual prompt_tokens
+            // returned by the server. Char-based estimates are conservative (overestimating);
+            // the server's actual value is more accurate and reduces unnecessary clamping down.
             let usage_prompt = match &execution {
                 IterationExecution::Truncated(sr) | IterationExecution::FinalResponse(sr) => {
                     Some((sr.usage_prompt_tokens, sr.usage_cached_prompt_tokens))
@@ -1355,8 +1374,8 @@ async fn run_turn_body(
                 app.last_known_prompt_tokens = Some(pt);
                 app.last_known_cached_prompt_tokens = Some(cached.min(pt));
             }
-                // Empty-response retry count: give up after more than 5 consecutive empty
-                // responses to avoid wasting iteration budget
+            // Empty-response retry count: give up after more than 5 consecutive empty
+            // responses to avoid wasting iteration budget
             if matches!(execution, IterationExecution::EmptyResponse) {
                 retry.consecutive_empty_responses += 1;
                 if retry.consecutive_empty_responses > 5 {
@@ -1371,9 +1390,9 @@ async fn run_turn_body(
             } else {
                 retry.consecutive_empty_responses = 0;
             }
-                // Truncation retry count: give up when repeated truncations (output cap / truncated
-                // tool JSON) still cannot converge, to avoid endless retries burning budget. The
-                // threshold is 3: it gives the model two chances to shrink and rewrite.
+            // Truncation retry count: give up when repeated truncations (output cap / truncated
+            // tool JSON) still cannot converge, to avoid endless retries burning budget. The
+            // threshold is 3: it gives the model two chances to shrink and rewrite.
             if let IterationExecution::Truncated(stream_result) = &execution {
                 retry.consecutive_truncations += 1;
                 // Reset tool-loop detection: repeated calls during truncation retries are expected
@@ -1382,12 +1401,12 @@ async fn run_turn_body(
                 supervisor.mark_truncation_skip();
 
                 if stream_result.stream_error {
-                // Truncation caused by stream-read errors (network jitter / abnormal server stream
-                // drop). The model did not output too much, so lowering reasoning_effort or
-                // injecting a shrink prompt is pointless. It does not accumulate into
-                // consecutive_truncations (it is not the model's fault), but a separate counter,
-                // consecutive_stream_errors, provides a cap so persistent server stream drops do
-                // not retry forever.
+                    // Truncation caused by stream-read errors (network jitter / abnormal server stream
+                    // drop). The model did not output too much, so lowering reasoning_effort or
+                    // injecting a shrink prompt is pointless. It does not accumulate into
+                    // consecutive_truncations (it is not the model's fault), but a separate counter,
+                    // consecutive_stream_errors, provides a cap so persistent server stream drops do
+                    // not retry forever.
                     retry.consecutive_truncations = 0;
                     retry.consecutive_stream_errors += 1;
                     if retry.consecutive_stream_errors > MAX_STREAM_ERROR_RETRIES {
@@ -1407,15 +1426,15 @@ async fn run_turn_body(
                         retry.consecutive_stream_errors
                     );
                 } else {
-                // Real truncation: the model hit the output cap or produced half-cut tool JSON.
+                    // Real truncation: the model hit the output cap or produced half-cut tool JSON.
                     retry.consecutive_stream_errors = 0;
 
-                // Zero-output truncation detection: completion=0 + finish_reason=length means the
-                // server rejected the max_tokens value (typically a relay/compatibility layer
-                // returns an empty response for an oversized max_tokens instead of an error).
-                // Lowering reasoning_effort or disabling thinking is useless here — the problem is
-                // not that the model outputs too much but that max_tokens itself is rejected by
-                // the server. Strategy: halve max_tokens and retry until the server accepts it.
+                    // Zero-output truncation detection: completion=0 + finish_reason=length means the
+                    // server rejected the max_tokens value (typically a relay/compatibility layer
+                    // returns an empty response for an oversized max_tokens instead of an error).
+                    // Lowering reasoning_effort or disabling thinking is useless here — the problem is
+                    // not that the model outputs too much but that max_tokens itself is rejected by
+                    // the server. Strategy: halve max_tokens and retry until the server accepts it.
                     let is_zero_completion = stream_result.usage_completion_tokens == 0
                         && stream_result
                             .finish_reason_value
@@ -1437,30 +1456,30 @@ async fn run_turn_body(
                         app.cli.max_tokens_override = Some(halved);
                         retry.max_tokens_downgraded = true;
                     } else if retry.max_tokens_downgraded {
-                // Normal truncation (there was output but it was cut off): the server accepted the
-                // current max_tokens, so restore the original value to give later iterations a
-                // larger output budget.
+                        // Normal truncation (there was output but it was cut off): the server accepted the
+                        // current max_tokens, so restore the original value to give later iterations a
+                        // larger output budget.
                         app.cli.max_tokens_override = retry.saved_max_tokens_override;
                         retry.max_tokens_downgraded = false;
                     }
 
-            // Whether lowering reasoning_effort actually shortens the thought chain for this model.
-            // Model-level wire declarations take precedence over provider defaults: for example
-            // DashScope DeepSeek uses the enable_thinking switch, yet reasoning intensity is still
-            // governed by the top-level reasoning_effort. Only boolean-switch dialects without a
-            // declared effective effort wire need thinking disabled outright.
+                    // Whether lowering reasoning_effort actually shortens the thought chain for this model.
+                    // Model-level wire declarations take precedence over provider defaults: for example
+                    // DashScope DeepSeek uses the enable_thinking switch, yet reasoning intensity is still
+                    // governed by the top-level reasoning_effort. Only boolean-switch dialects without a
+                    // declared effective effort wire need thinking disabled outright.
                     let effort_helps =
                         crate::ai::models::reasoning_effort_reduces_thinking(&next_model);
 
                     if effort_helps {
-            // Split truncation by type: distinguish "reasoning ate the budget" from "visible text
-            // too long". Judged by the server-reported reasoning_tokens share — when the reasoning
-            // share is high, downgrading is effective (it directly shortens the thought chain and
-            // hands budget to visible text); when the text is too long, downgrading cannot save the
-            // budget (the model is not reasoning) and only wastes quality, so the injected shrink
-            // prompt suffices. When reasoning_tokens is not reported (0) or completion is 0, treat
-            // it conservatively as "unknown" and fall through the downgrade ladder as a safety net,
-            // so the new logic does not regress providers that do not report usage details.
+                        // Split truncation by type: distinguish "reasoning ate the budget" from "visible text
+                        // too long". Judged by the server-reported reasoning_tokens share — when the reasoning
+                        // share is high, downgrading is effective (it directly shortens the thought chain and
+                        // hands budget to visible text); when the text is too long, downgrading cannot save the
+                        // budget (the model is not reasoning) and only wastes quality, so the injected shrink
+                        // prompt suffices. When reasoning_tokens is not reported (0) or completion is 0, treat
+                        // it conservatively as "unknown" and fall through the downgrade ladder as a safety net,
+                        // so the new logic does not regress providers that do not report usage details.
                         let reasoning_reported = stream_result.usage_reasoning_tokens > 0
                             && stream_result.usage_completion_tokens > 0;
                         let reasoning_dominant = reasoning_reported
@@ -1470,22 +1489,22 @@ async fn run_turn_body(
                         let text_too_long = reasoning_reported && !reasoning_dominant;
 
                         if !text_too_long {
-            // Progressive reasoning-effort downgrade, handing output budget from reasoning over to
-            // actual content. resolve_reasoning_effort reads this field live every iteration, so a
-            // change takes effect on the very next request.
-            //
-            // 1 truncation → High (slightly reduce reasoning overhead)
-            // 2 truncations → Medium (shorten the thought chain further)
-            // 3+ truncations → Low (the floor that keeps minimal reasoning ability)
-            //
-            // Compared with the old version, which zeroed it after 2 truncations (None/disabled)
-            // and castrated reasoning heavily, keeping reasoning ability is gentler: measured
-            // savings are ~15-20% of budget per effort tier, and the model keeps its ability to
-            // think. Disabling thinking is reserved for the 3rd-truncation fallback (see below).
-            // This ladder deliberately never sends `reasoning_effort: "none"`: an explicit none
-            // castrates reasoning entirely, while omitting the field makes the server fall back to
-            // its own default tier (gpt-5.x defaults to medium), raising the budget — neither is
-            // suitable as a truncation-convergence mechanism.
+                            // Progressive reasoning-effort downgrade, handing output budget from reasoning over to
+                            // actual content. resolve_reasoning_effort reads this field live every iteration, so a
+                            // change takes effect on the very next request.
+                            //
+                            // 1 truncation → High (slightly reduce reasoning overhead)
+                            // 2 truncations → Medium (shorten the thought chain further)
+                            // 3+ truncations → Low (the floor that keeps minimal reasoning ability)
+                            //
+                            // Compared with the old version, which zeroed it after 2 truncations (None/disabled)
+                            // and castrated reasoning heavily, keeping reasoning ability is gentler: measured
+                            // savings are ~15-20% of budget per effort tier, and the model keeps its ability to
+                            // think. Disabling thinking is reserved for the 3rd-truncation fallback (see below).
+                            // This ladder deliberately never sends `reasoning_effort: "none"`: an explicit none
+                            // castrates reasoning entirely, while omitting the field makes the server fall back to
+                            // its own default tier (gpt-5.x defaults to medium), raising the budget — neither is
+                            // suitable as a truncation-convergence mechanism.
                             app.cli.reasoning_effort_override =
                                 Some(match retry.consecutive_truncations {
                                     1 => Some(crate::ai::provider::ReasoningEffort::High),
@@ -1509,9 +1528,9 @@ async fn run_turn_body(
                                 note,
                             );
                         } else {
-            // Visible-text-too-long truncation: do not lower effort (the model is not reasoning, so
-            // lowering it cannot save budget); rely only on the already-injected output_truncated
-            // shrink prompt to make the model produce less. Record the decision for later audit.
+                            // Visible-text-too-long truncation: do not lower effort (the model is not reasoning, so
+                            // lowering it cannot save budget); rely only on the already-injected output_truncated
+                            // shrink prompt to make the model produce less. Record the decision for later audit.
                             crate::ai::driver::decision_log::log_truncation_downgrade(
                                 crate::ai::driver::decision_log::get_decision_log_store(),
                                 &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
@@ -1524,16 +1543,16 @@ async fn run_turn_body(
                                 "visible text dominated the output budget; keeping effort, prompting shrink only",
                             );
                         }
-            // If the effort ladder still truncates at tier 3, lowering effort alone is no longer
-            // enough to converge; force thinking off on top of it as a fallback, handing the entire
-            // output budget to visible content.
+                        // If the effort ladder still truncates at tier 3, lowering effort alone is no longer
+                        // enough to converge; force thinking off on top of it as a fallback, handing the entire
+                        // output budget to visible content.
                         if retry.consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES {
                             app.cli.thinking_disabled_override = true;
                         }
                     } else {
-            // Lowering effort does not work for this dialect: do not waste retry rounds on a useless
-            // ladder; force thinking off at the first real truncation, handing the entire output
-            // budget to visible content.
+                        // Lowering effort does not work for this dialect: do not waste retry rounds on a useless
+                        // ladder; force thinking off at the first real truncation, handing the entire output
+                        // budget to visible content.
                         app.cli.thinking_disabled_override = true;
                     }
                 }
@@ -1541,11 +1560,11 @@ async fn run_turn_body(
                 let partial_text = stream_result.assistant_text.trim();
                 let has_visible_text = !partial_text.is_empty();
 
-            // The model produced visible text but keeps hitting the length cap (typically a
-            // reasoning model whose reasoning fills the budget). Further retries usually do not
-            // help — the model will keep producing content of the same length. After one downgraded
-            // retry, accept the partial text as the final answer. stream_error scenarios do not
-            // count toward consecutive_truncations, so they never reach this branch.
+                // The model produced visible text but keeps hitting the length cap (typically a
+                // reasoning model whose reasoning fills the budget). Further retries usually do not
+                // help — the model will keep producing content of the same length. After one downgraded
+                // retry, accept the partial text as the final answer. stream_error scenarios do not
+                // count toward consecutive_truncations, so they never reach this branch.
                 if has_visible_text
                     && retry.consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
                     && !stream_result.stream_error
@@ -1575,8 +1594,8 @@ async fn run_turn_body(
                     break 'turn Ok(None);
                 }
 
-            // stream_error already reset consecutive_truncations to 0 above, so this branch is
-            // unreachable for it.
+                // stream_error already reset consecutive_truncations to 0 above, so this branch is
+                // unreachable for it.
                 if retry.consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
                     && !stream_result.stream_error
                 {
@@ -1585,8 +1604,8 @@ async fn run_turn_body(
                         "  ✗ {} consecutive truncated responses; giving up retry",
                         retry.consecutive_truncations
                     );
-            // Keep whatever partial text the model already produced (if any) — it is more valuable
-            // than discarding it outright.
+                    // Keep whatever partial text the model already produced (if any) — it is more valuable
+                    // than discarding it outright.
                     output.assistant_text = if has_visible_text {
                         partial_text.to_string()
                     } else {
@@ -1597,7 +1616,7 @@ async fn run_turn_body(
                 }
             } else {
                 retry.consecutive_truncations = 0;
-            // Not a truncation: restore the max_tokens downgraded due to zero output.
+                // Not a truncation: restore the max_tokens downgraded due to zero output.
                 if retry.max_tokens_downgraded {
                     app.cli.max_tokens_override = retry.saved_max_tokens_override;
                     retry.max_tokens_downgraded = false;
@@ -1636,11 +1655,11 @@ async fn run_turn_body(
                 TurnLoopStep::ScopedPreflightContinue(targets) => {
                     if supervisor.grant_scoped_preflight_grace() {
                         scoped_preflight_targets.record_pause(targets);
-        // This round performed no mutation and must not count toward progress/loop statistics.
+                        // This round performed no mutation and must not count toward progress/loop statistics.
                         continue 'turn;
                     }
-            // Once the separate preflight budget is exhausted, keep a safe rejection and converge,
-            // so switching directories repeatedly cannot indefinitely expand the iteration budget.
+                    // Once the separate preflight budget is exhausted, keep a safe rejection and converge,
+                    // so switching directories repeatedly cannot indefinitely expand the iteration budget.
                     record_force_final_reason(
                         &mut messages,
                         "scoped_preflight_budget_exhausted",
@@ -1674,8 +1693,8 @@ async fn run_turn_body(
                             }
                         }
                     }
-            // Record the tool names this round's assistant actually invoked (deduplicated), kept
-            // for aging out unused explicit tools at turn end.
+                    // Record the tool names this round's assistant actually invoked (deduplicated), kept
+                    // for aging out unused explicit tools at turn end.
                     if let Some(last_assistant) =
                         messages.iter().rev().find(|m| m.role == "assistant")
                         && let Some(tool_calls) = &last_assistant.tool_calls
@@ -1711,10 +1730,10 @@ async fn run_turn_body(
         // user adjusts history_max_chars.
         let history_max_chars = app.config.history_max_chars;
         let mid_turn_soft_base = mid_turn_compress_soft_threshold(&next_model, history_max_chars);
-            // For long loops, lower the soft threshold to SOFT_FLOOR to curb the O(n²) re-send
-            // accumulation (see [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]). The gate and the actual
-            // mid_turn_compress call below share the same `mid_turn_soft`, avoiding "the gate opens
-            // but compression no-ops".
+        // For long loops, lower the soft threshold to SOFT_FLOOR to curb the O(n²) re-send
+        // accumulation (see [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]). The gate and the actual
+        // mid_turn_compress call below share the same `mid_turn_soft`, avoiding "the gate opens
+        // but compression no-ops".
         let mid_turn_soft = supervisor.effective_mid_turn_soft_threshold(mid_turn_soft_base);
         let mid_turn_hard = mid_turn_compress_hard_threshold(&next_model, history_max_chars);
         let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
@@ -1733,7 +1752,9 @@ async fn run_turn_body(
                 drained,
                 mid_turn_soft,
                 Some(overflow_dir.as_path()),
-                crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+                crate::ai::driver::runtime_ctx::effective_cwd()
+                    .ok()
+                    .as_deref(),
             );
             messages = compressed;
             supervisor.mark_compress(after);
@@ -1755,7 +1776,9 @@ async fn run_turn_body(
                         MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
                         MID_TURN_LLM_SUMMARY_MAX_CHARS,
                         history_max_chars,
-                    crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+                        crate::ai::driver::runtime_ctx::effective_cwd()
+                            .ok()
+                            .as_deref(),
                     )
                     .await;
                 messages = after_msgs;
@@ -1977,31 +2000,30 @@ async fn run_turn_body(
         }
     };
 
-            // Restore the reasoning-effort override from before this turn: truncation retries may
-            // have lowered it to Low temporarily; restore it uniformly here (covering every break
-            // 'turn exit) so the downgrade does not leak into later turns and pollute the user's
-            // session-level setting.
+    // Restore the reasoning-effort override from before this turn: truncation retries may
+    // have lowered it to Low temporarily; restore it uniformly here (covering every break
+    // 'turn exit) so the downgrade does not leak into later turns and pollute the user's
+    // session-level setting.
     retry.restore_overrides(app);
     // Final-gate status is transient and must not overlap terminal output from finalization.
     drop(output.validation_status.take());
 
-            // Age out explicit-enabled tools that were not used this turn. After N consecutive
-            // turns of idle use they are demoted, preventing "enabled once, welded forever".
+    // Age out explicit-enabled tools that were not used this turn. After N consecutive
+    // turns of idle use they are demoted, preventing "enabled once, welded forever".
     crate::ai::tools::enable_tools::age_unused_explicit_tools(tools_used_this_turn.iter());
 
     let loop_result = loop_result.map_err(|e: Box<dyn std::error::Error>| e.to_string());
 
-            // A one-shot continuation is set up only when an active skill explicitly requested user
-            // input through a tool AND this round ended normally. This avoids guessing from
-            // natural-language question marks / keywords, and external skills need no manifest
-            // changes.
+    // A one-shot continuation is set up only when an active skill explicitly requested user
+    // input through a tool AND this round ended normally. This avoids guessing from
+    // natural-language question marks / keywords, and external skills need no manifest
+    // changes.
     let requested_user_input = crate::ai::tools::skill_tools::take_pending_user_input_request();
     if requested_user_input && loop_result.is_ok() && !app.last_turn_interrupted {
         if !skill_turn.matched_skill_names().is_empty() {
-            app.pending_skill_continuation =
-                Some(crate::ai::types::PendingSkillContinuation {
-                    skill_names: skill_turn.matched_skill_names().to_vec(),
-                });
+            app.pending_skill_continuation = Some(crate::ai::types::PendingSkillContinuation {
+                skill_names: skill_turn.matched_skill_names().to_vec(),
+            });
         }
     }
 

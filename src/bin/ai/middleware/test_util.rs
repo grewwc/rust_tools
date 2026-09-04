@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::ai::cli::ParsedCli;
-use crate::ai::types::AgentContext;
 use crate::ai::persona::default_persona;
+use crate::ai::types::AgentContext;
 use crate::ai::types::{App, AppConfig};
 
 /// Builds a minimal usable App for port-middleware tests (the mock client/executor does not read App fields).

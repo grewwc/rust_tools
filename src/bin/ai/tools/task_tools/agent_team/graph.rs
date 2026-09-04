@@ -637,8 +637,7 @@ fn advance_static(
                 // 磁盘上节点仍带 runtime_task_id，下次 advance 对同一丢失任务重复
                 // poll，永久卡死。错误以 Failed 终态呈现，下游条件边按失败跳过。
                 let Some(node_id) = run.nodes.iter().find_map(|(id, node)| {
-                    (node.runtime_task_id.as_deref() == Some(task_id.as_str()))
-                        .then(|| id.clone())
+                    (node.runtime_task_id.as_deref() == Some(task_id.as_str())).then(|| id.clone())
                 }) else {
                     continue;
                 };
@@ -684,7 +683,9 @@ fn advance_static(
                     // 按失败处理以免下游读到缺失的状态键。绝不冒泡——poll 已消费
                     // TASK_REGISTRY 条目，若在这里 `?` 传播，checkpoint 不会保存，
                     // 磁盘上节点仍为 Running，下次 advance 会永久卡死。
-                    if let Err(error) = reduce_static_output(&mut run.state, &node.spec, &result.output) {
+                    if let Err(error) =
+                        reduce_static_output(&mut run.state, &node.spec, &result.output)
+                    {
                         node.status = NodeStatus::Failed;
                         node.error = Some(format!("static reduce failed: {error}"));
                     }
@@ -1175,9 +1176,10 @@ fn collect_dynamic_tasks(team: &mut TeamState, run: &mut DynamicGraphRun) -> Res
                 );
                 run.pool_task_id = None;
                 run.pool_team_task_id = None;
-                run.result = Some(best_dynamic_output(run).unwrap_or_else(|| {
-                    format!("pooling task lost: {error}")
-                }));
+                run.result = Some(
+                    best_dynamic_output(run)
+                        .unwrap_or_else(|| format!("pooling task lost: {error}")),
+                );
             }
         }
     }
@@ -1230,8 +1232,7 @@ fn launch_dynamic_phase(
         };
         let schema = (run.phase == DynamicPhase::Scoring).then(score_response_schema);
         let description = format!("dynamic:{:?}:{id}", run.phase).to_lowercase();
-        let spawned =
-            spawn_graph_member_task(graph_id, team, &id, &description, &prompt, schema);
+        let spawned = spawn_graph_member_task(graph_id, team, &id, &description, &prompt, schema);
         let Some((task_id, team_task_id)) = (match spawned {
             Ok(pair) => pair,
             Err(error) => {

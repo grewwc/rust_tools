@@ -10,29 +10,28 @@ use super::types::{
     retained_turn_start,
 };
 
+mod dedup;
 pub(crate) mod llm_prune;
+mod overflow_sink;
 mod text_utils;
 mod tool_groups;
 mod tool_overflow;
-mod dedup;
-mod overflow_sink;
 
 use text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 #[cfg(test)]
 use tool_groups::{FOLDED_TOOL_GROUP_ARCHIVE_DIR, fold_early_tool_groups};
 use tool_groups::{
-    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, count_tool_group_anchors,
+    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, ToolGroupFoldPlan, count_tool_group_anchors,
     first_trim_candidate, is_protected_leading_system_like_message, plan_early_tool_groups,
     recent_tool_group_message_indices, recent_tool_result_groups,
-    ToolGroupFoldPlan,
 };
 #[cfg(test)]
 use tool_overflow::{
-    build_overflow_content_preview, build_preserved_tool_overflow_stub,
-    collapse_overflow_stub_to_anchor, extract_fingerprint_keywords,
-    minimize_overflow_stub_to_pointer, normalize_internal_notes_for_summary_model,
-    stub_fingerprint_line, write_preserved_tool_overflow_file_stable,
-    FINGERPRINT_KEY_COUNT, PRESERVED_TOOL_OVERFLOW_STUB_PREFIX,
+    FINGERPRINT_KEY_COUNT, PRESERVED_TOOL_OVERFLOW_STUB_PREFIX, build_overflow_content_preview,
+    build_preserved_tool_overflow_stub, collapse_overflow_stub_to_anchor,
+    extract_fingerprint_keywords, minimize_overflow_stub_to_pointer,
+    normalize_internal_notes_for_summary_model, stub_fingerprint_line,
+    write_preserved_tool_overflow_file_stable,
 };
 use tool_overflow::{
     age_out_overflow_stub_previews, build_persisted_summary_text,
@@ -257,18 +256,14 @@ pub(in crate::ai) fn value_to_string(v: &Value) -> String {
                     // counts as an image too, so image-only messages still
                     // summarize to "[图片]" instead of leaking the file path.
                     "image_url" => has_image = true,
-                    "reference"
-                        if obj.get("kind").and_then(|k| k.as_str()) == Some("image") =>
-                    {
+                    "reference" if obj.get("kind").and_then(|k| k.as_str()) == Some("image") => {
                         has_image = true;
                     }
                     // Persisted text-file/PDF references render as a marker
                     // (name only, never the raw path/content) so /history and
                     // summaries show the attachment boundary instead of leaking
                     // file contents.
-                    "reference"
-                        if obj.get("kind").and_then(|k| k.as_str()) == Some("file") =>
-                    {
+                    "reference" if obj.get("kind").and_then(|k| k.as_str()) == Some("file") => {
                         let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("file");
                         text_parts.push(format!("[Attached file: {name}]"));
                     }
@@ -276,8 +271,14 @@ pub(in crate::ai) fn value_to_string(v: &Value) -> String {
                     // summaries never leak raw JSON and new kinds are not
                     // silently dropped from /history or summary text.
                     "reference" => {
-                        let kind = obj.get("kind").and_then(|k| k.as_str()).unwrap_or("reference");
-                        let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("attachment");
+                        let kind = obj
+                            .get("kind")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("reference");
+                        let name = obj
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("attachment");
                         text_parts.push(format!("[{kind}: {name}]"));
                     }
                     _ => {}
@@ -357,18 +358,16 @@ fn message_contains_image(content: &Value) -> bool {
     })
 }
 
-use dedup::{dedup_adjacent, dedup_repeated_tool_results, keep_only_recent_reasoning_content};
-use overflow_sink::{
-    OverflowSink, PlannedArchiveWrite, archive_internal_notes_deduplicated,
-    archive_messages_to_overflow, archive_truncated_field_to_overflow,
-    build_overflow_placeholder, content_sha256_hex,
-    insert_internal_note_archive_note_if_needed, insert_overflow_archive_note_if_exists,
-    trim_compressed_tool_evidence_to_inline_budget,
-};
-pub(in crate::ai) use overflow_sink::compressed_tool_evidence_exceeds_inline_budget;
 #[cfg(test)]
 use dedup::dedup_overlapping_read_file_results;
-
+use dedup::{dedup_adjacent, dedup_repeated_tool_results, keep_only_recent_reasoning_content};
+pub(in crate::ai) use overflow_sink::compressed_tool_evidence_exceeds_inline_budget;
+use overflow_sink::{
+    OverflowSink, PlannedArchiveWrite, archive_internal_notes_deduplicated,
+    archive_messages_to_overflow, archive_truncated_field_to_overflow, build_overflow_placeholder,
+    content_sha256_hex, insert_internal_note_archive_note_if_needed,
+    insert_overflow_archive_note_if_exists, trim_compressed_tool_evidence_to_inline_budget,
+};
 
 #[cfg(test)]
 mod coalesce_summary_notes_tests;
@@ -379,9 +378,9 @@ mod drop_trim_differential_tests;
 #[cfg(test)]
 mod fold_early_tool_groups_tests;
 #[cfg(test)]
-mod overflow_stub_merge_tests;
-#[cfg(test)]
 mod overflow_sink_dedup_tests;
+#[cfg(test)]
+mod overflow_stub_merge_tests;
 #[cfg(test)]
 mod shrink_successful_write_arguments_tests;
 #[cfg(test)]

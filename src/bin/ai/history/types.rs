@@ -301,7 +301,10 @@ mod tests {
             ),
             None
         );
-        assert_eq!(parse_still_waiting_wake_identity("[Process ] Woke Up] g"), None);
+        assert_eq!(
+            parse_still_waiting_wake_identity("[Process ] Woke Up] g"),
+            None
+        );
 
         // 多个等待集合并发唤醒：mailbox 含多条 TASK_WAIT_TIMEOUT，不去重。
         let multi = format!(

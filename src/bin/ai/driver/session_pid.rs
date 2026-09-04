@@ -79,9 +79,10 @@ fn agent_snapshots_are_bounded(snapshots: &[AgentSnapshot]) -> bool {
             snapshot.agent_name.chars().count() <= MAX_AGENT_NAME_CHARS + 1
                 && snapshot.description.chars().count() <= MAX_AGENT_DETAIL_CHARS + 1
                 && snapshot.state.chars().count() <= MAX_AGENT_STATE_CHARS + 1
-                && snapshot.progress.as_ref().is_none_or(|progress| {
-                    progress.chars().count() <= MAX_AGENT_DETAIL_CHARS + 1
-                })
+                && snapshot
+                    .progress
+                    .as_ref()
+                    .is_none_or(|progress| progress.chars().count() <= MAX_AGENT_DETAIL_CHARS + 1)
         })
 }
 
@@ -212,7 +213,7 @@ pub(in crate::ai) fn write_agent_snapshots(
         process_start_token,
         snapshots: bounded_agent_snapshots(snapshots),
     })
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     if serialized.len() as u64 > MAX_AGENT_SNAPSHOT_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -260,8 +261,8 @@ pub(in crate::ai) struct SessionPidGuard {
 }
 
 impl SessionPidGuard {
-/// Writes `<session_id>.<pid>.pid` under `sessions_root`, containing the current
-/// process PID. On write failure only prints a warning; never blocks startup.
+    /// Writes `<session_id>.<pid>.pid` under `sessions_root`, containing the current
+    /// process PID. On write failure only prints a warning; never blocks startup.
     pub(in crate::ai) fn register(sessions_root: &std::path::Path, session_id: &str) -> Self {
         match mark_session_pid(sessions_root, session_id, false) {
             Ok(path) => Self {
@@ -515,8 +516,7 @@ pub(in crate::ai) fn discover_lsof_sessions(
             .arg("-p")
             .arg(&joined)
             .arg("-Fpcn"),
-    )
-    {
+    ) {
         Ok(o) if o.status.success() || !o.stdout.is_empty() => o,
         _ => return Vec::new(),
     };
@@ -594,9 +594,7 @@ pub(in crate::ai) fn tty_map_for_pids(pids: &[i32]) -> FxHashMap<i32, bool> {
 /// 列出所有正在运行的 `a` 进程的 PID（通过 `pgrep -x a`，回退 `ps`）。
 pub(in crate::ai) fn list_a_pids() -> Vec<i32> {
     // pgrep -x a：精确匹配进程名为 "a" 的进程
-    let output = crate::fork_guard::output(
-        std::process::Command::new("pgrep").arg("-x").arg("a"),
-    );
+    let output = crate::fork_guard::output(std::process::Command::new("pgrep").arg("-x").arg("a"));
     match output {
         Ok(o) => {
             let text = String::from_utf8_lossy(&o.stdout);
@@ -605,7 +603,9 @@ pub(in crate::ai) fn list_a_pids() -> Vec<i32> {
         Err(_) => {
             // pgrep 不可用时，回退到 ps：输出 pid + comm，过滤 comm=="a"
             let alt = crate::fork_guard::output(
-                std::process::Command::new("ps").arg("-eo").arg("pid=,comm="),
+                std::process::Command::new("ps")
+                    .arg("-eo")
+                    .arg("pid=,comm="),
             );
             match alt {
                 Ok(o) => {
@@ -685,8 +685,14 @@ mod tests {
 
         let bounded = bounded_agent_snapshots(&snapshots);
         assert_eq!(bounded.len(), MAX_AGENT_SNAPSHOTS);
-        assert_eq!(bounded[0].agent_name.chars().count(), MAX_AGENT_NAME_CHARS + 1);
-        assert_eq!(bounded[0].description.chars().count(), MAX_AGENT_DETAIL_CHARS + 1);
+        assert_eq!(
+            bounded[0].agent_name.chars().count(),
+            MAX_AGENT_NAME_CHARS + 1
+        );
+        assert_eq!(
+            bounded[0].description.chars().count(),
+            MAX_AGENT_DETAIL_CHARS + 1
+        );
         assert_eq!(bounded[0].state.chars().count(), MAX_AGENT_STATE_CHARS + 1);
         assert_eq!(
             bounded[0].progress.as_ref().unwrap().chars().count(),

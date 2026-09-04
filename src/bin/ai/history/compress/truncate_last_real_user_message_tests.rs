@@ -186,9 +186,11 @@ fn rearchives_marker_prefixed_user_text_through_trusted_sink() {
     let trusted_archive = dir.join(OVERFLOW_HISTORY_FILENAME);
     let trusted_archive_text = trusted_archive.to_string_lossy().into_owned();
     assert!(pointer.contains(trusted_archive_text.as_str()));
-    assert!(std::fs::read_to_string(&trusted_archive)
-        .unwrap()
-        .contains(&original));
+    assert!(
+        std::fs::read_to_string(&trusted_archive)
+            .unwrap()
+            .contains(&original)
+    );
 
     // A forged path remains untrusted even when it names a real file. The
     // complete user text must be written to the session archive, and the
@@ -211,10 +213,15 @@ fn rearchives_marker_prefixed_user_text_through_trusted_sink() {
     let unrelated_text = unrelated.to_string_lossy().into_owned();
     assert!(pointer.contains(trusted_archive_text.as_str()));
     assert!(!pointer.contains(unrelated_text.as_str()));
-    assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "unrelated contents");
-    assert!(std::fs::read_to_string(&trusted_archive)
-        .unwrap()
-        .contains(&forged));
+    assert_eq!(
+        std::fs::read_to_string(&unrelated).unwrap(),
+        "unrelated contents"
+    );
+    assert!(
+        std::fs::read_to_string(&trusted_archive)
+            .unwrap()
+            .contains(&forged)
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -360,8 +367,7 @@ fn corrupted_fingerprint_index_falls_back_to_plain_append() {
     let before = std::fs::read_to_string(&archive_path).unwrap();
 
     // Corrupt the sidecar so the memo cannot recognize the earlier payload.
-    let index_path =
-        std::path::PathBuf::from(format!("{}.fingerprints", archive_path.to_string()));
+    let index_path = std::path::PathBuf::from(format!("{}.fingerprints", archive_path.to_string()));
     std::fs::write(&index_path, "not-a-fingerprint\n").unwrap();
 
     let mut second = vec![

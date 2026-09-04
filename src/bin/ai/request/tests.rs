@@ -336,10 +336,7 @@ fn prompt_cache_breakpoint_noop_without_system_message() {
 
 #[test]
 fn dashscope_builtin_models_do_not_enable_anthropic_prompt_cache() {
-    for model in [
-        "deepseek-v4-flash-0731-alibaba",
-        "qwen3.8-flash-alibaba",
-    ] {
+    for model in ["deepseek-v4-flash-0731-alibaba", "qwen3.8-flash-alibaba"] {
         assert!(!models::explicit_prompt_cache_enabled(model), "{model}");
     }
 }
@@ -1197,17 +1194,7 @@ fn responses_force_off_override_emits_none_effort_on_wire() {
     );
     assert_eq!(effort, Some("none"));
     let request = build_request_body(
-        "gpt-5.5",
-        &messages,
-        false,
-        false,
-        None,
-        None,
-        None,
-        effort,
-        None,
-        None,
-        None,
+        "gpt-5.5", &messages, false, false, None, None, None, effort, None, None, None,
     );
     let body = super::build_responses_request_body(&request);
     assert_eq!(body["reasoning"]["effort"], "none");
@@ -1737,7 +1724,10 @@ fn responses_request_body_replays_tool_round_narration_before_function_call() {
     assert_eq!(input.len(), 2, "narration message + function_call");
     assert_eq!(input[0]["role"], "assistant");
     assert_eq!(input[0]["content"][0]["type"], "output_text");
-    assert_eq!(input[0]["content"][0]["text"], "Let me read the file first.");
+    assert_eq!(
+        input[0]["content"][0]["text"],
+        "Let me read the file first."
+    );
     assert_eq!(input[1]["type"], "function_call");
     assert_eq!(input[1]["call_id"], "call_1");
 }
@@ -1789,10 +1779,17 @@ fn responses_request_body_orders_reasoning_narration_function_call() {
 
     let body = super::build_responses_request_body(&request);
     let input = body["input"].as_array().expect("input array");
-    assert_eq!(input.len(), 3, "reasoning + narration message + function_call");
+    assert_eq!(
+        input.len(),
+        3,
+        "reasoning + narration message + function_call"
+    );
     assert_eq!(input[0]["type"], "reasoning");
     assert_eq!(input[1]["role"], "assistant");
-    assert_eq!(input[1]["content"][0]["text"], "I need the current directory contents.");
+    assert_eq!(
+        input[1]["content"][0]["text"],
+        "I need the current directory contents."
+    );
     assert_eq!(input[2]["type"], "function_call");
 }
 
@@ -1973,8 +1970,7 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
     };
 
     let projected = crate::ai::history::compress::sanitize_message_for_persisted_history_for_model(
-        "glm-5.3",
-        &assistant,
+        "glm-5.3", &assistant,
     );
     assert_ne!(
         projected.reasoning_content, assistant.reasoning_content,
@@ -2031,14 +2027,13 @@ fn encrypted_replay_blob_cleared_when_switching_to_shape_only_model() {
         "encrypted_content": "ENC-cross-model-switch",
         "summary": []
     })];
-    let blob =
-        crate::ai::history::compress::encode_encrypted_reasoning_replay_state(
-            "muse-spark-1.2-contributor",
-            &items,
-        );
-    assert!(blob.starts_with(
-        crate::ai::history::compress::PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX
-    ));
+    let blob = crate::ai::history::compress::encode_encrypted_reasoning_replay_state(
+        "muse-spark-1.2-contributor",
+        &items,
+    );
+    assert!(
+        blob.starts_with(crate::ai::history::compress::PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX)
+    );
 
     let assistant = Message {
         role: "assistant".to_string(),
@@ -2524,7 +2519,10 @@ fn normalize_messages_keeps_completion_evidence_diagnostic_visible_to_next_model
             .is_some_and(|text| text.contains(DIAGNOSTIC))
     );
     assert_eq!(normalized[5].role, "user");
-    assert_eq!(normalized[5].content, Value::String("继续检查一下".to_string()));
+    assert_eq!(
+        normalized[5].content,
+        Value::String("继续检查一下".to_string())
+    );
 }
 
 #[test]
@@ -3306,7 +3304,9 @@ fn test_attachment_assets_dir() -> PathBuf {
 }
 
 fn write_image_snapshot(assets_dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
-    let dir = assets_dir.join("attachments").join(uuid::Uuid::new_v4().to_string());
+    let dir = assets_dir
+        .join("attachments")
+        .join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     std::fs::write(&path, bytes).unwrap();
@@ -3333,18 +3333,21 @@ fn build_reference_content_keeps_image_boundary_for_vl_model() {
     let first = &parts[0];
     assert_eq!(first.get("type").and_then(Value::as_str), Some("reference"));
     assert_eq!(first.get("kind").and_then(Value::as_str), Some("image"));
-    assert_eq!(first.get("name").and_then(Value::as_str), Some("sample.png"));
+    assert_eq!(
+        first.get("name").and_then(Value::as_str),
+        Some("sample.png")
+    );
     let asset = first.get("asset").and_then(Value::as_str).unwrap();
     assert!(asset.starts_with("attachments/"));
     assert!(asset.ends_with("/sample.png"));
     // The persisted form must never contain base64 image data.
     let serialized = value.to_string();
     assert!(!serialized.contains("base64,"));
+    assert_eq!(parts[1].get("type").and_then(Value::as_str), Some("text"));
     assert_eq!(
-        parts[1].get("type").and_then(Value::as_str),
-        Some("text")
+        parts[1].get("text").and_then(Value::as_str),
+        Some("describe")
     );
-    assert_eq!(parts[1].get("text").and_then(Value::as_str), Some("describe"));
 }
 
 #[test]
@@ -3366,7 +3369,8 @@ fn materialize_references_roundtrips_reference_back_to_inline_image() {
     let assets_dir = test_attachment_assets_dir();
     let path = write_image_snapshot(&assets_dir, "sample.png", b"fake");
 
-    let mut content = build_reference_content(&model, "describe", &[path], "", &assets_dir).unwrap();
+    let mut content =
+        build_reference_content(&model, "describe", &[path], "", &assets_dir).unwrap();
     assert!(materialize_references(&mut content, Some(&assets_dir)));
 
     let parts = content.as_array().unwrap();
@@ -3380,7 +3384,10 @@ fn materialize_references_roundtrips_reference_back_to_inline_image() {
             .map(|s| s.starts_with("data:image/png;base64,"))
             .unwrap_or(false)
     );
-    assert_eq!(parts[1].get("text").and_then(Value::as_str), Some("describe"));
+    assert_eq!(
+        parts[1].get("text").and_then(Value::as_str),
+        Some("describe")
+    );
 }
 
 #[test]
@@ -3420,7 +3427,10 @@ fn materialize_references_degrades_missing_file_to_text_marker() {
             .map(|t| t.contains("引用图片快照不可用"))
             .unwrap_or(false)
     );
-    assert_eq!(parts[1].get("text").and_then(Value::as_str), Some("describe"));
+    assert_eq!(
+        parts[1].get("text").and_then(Value::as_str),
+        Some("describe")
+    );
 }
 
 #[test]
@@ -3436,10 +3446,16 @@ fn build_reference_content_keeps_text_file_boundary_for_any_model() {
     let first = &parts[0];
     assert_eq!(first.get("type").and_then(Value::as_str), Some("reference"));
     assert_eq!(first.get("kind").and_then(Value::as_str), Some("file"));
-    assert_eq!(first.get("name").and_then(Value::as_str), Some("attached files"));
+    assert_eq!(
+        first.get("name").and_then(Value::as_str),
+        Some("attached files")
+    );
     assert_eq!(first.get("text").and_then(Value::as_str), Some(attachments));
     assert_eq!(parts[1].get("type").and_then(Value::as_str), Some("text"));
-    assert_eq!(parts[1].get("text").and_then(Value::as_str), Some("review this"));
+    assert_eq!(
+        parts[1].get("text").and_then(Value::as_str),
+        Some("review this")
+    );
 }
 
 #[test]
@@ -3447,8 +3463,7 @@ fn file_reference_snapshot_counts_toward_request_budget() {
     let assets_dir = test_attachment_assets_dir();
     let attachments = "x".repeat(12_000);
     let content =
-        build_reference_content("non-vl-model", "review", &[], &attachments, &assets_dir)
-            .unwrap();
+        build_reference_content("non-vl-model", "review", &[], &attachments, &assets_dir).unwrap();
     let message = Message {
         role: "user".to_string(),
         content,
@@ -3513,7 +3528,8 @@ fn build_reference_content_supports_multiple_references() {
         write_image_snapshot(&assets_dir, "one.png", b"fake"),
         write_image_snapshot(&assets_dir, "two.png", b"fake"),
     ];
-    let attachments = "[Attached text file: one.txt]\ncontent one\n\n[Attached text file: two.txt]\ncontent two";
+    let attachments =
+        "[Attached text file: one.txt]\ncontent one\n\n[Attached text file: two.txt]\ncontent two";
 
     let mut content =
         build_reference_content(&model, "describe", &img_paths, attachments, &assets_dir).unwrap();
@@ -3532,8 +3548,14 @@ fn build_reference_content_supports_multiple_references() {
     assert!(materialize_references(&mut content, Some(&assets_dir)));
     let parts = content.as_array().unwrap();
     assert_eq!(parts.len(), 4);
-    assert_eq!(parts[0].get("type").and_then(Value::as_str), Some("image_url"));
-    assert_eq!(parts[1].get("type").and_then(Value::as_str), Some("image_url"));
+    assert_eq!(
+        parts[0].get("type").and_then(Value::as_str),
+        Some("image_url")
+    );
+    assert_eq!(
+        parts[1].get("type").and_then(Value::as_str),
+        Some("image_url")
+    );
     let texts: Vec<&str> = parts
         .iter()
         .filter_map(|p| p.get("text").and_then(Value::as_str))
@@ -3563,5 +3585,8 @@ fn materialize_references_degrades_unknown_kind_to_marker() {
             .map(|t| t.contains("引用内容类型未知") && t.contains("audio"))
             .unwrap_or(false)
     );
-    assert_eq!(parts[1].get("text").and_then(Value::as_str), Some("describe"));
+    assert_eq!(
+        parts[1].get("text").and_then(Value::as_str),
+        Some("describe")
+    );
 }

@@ -31,7 +31,15 @@ pub struct PipelineContext<'a> {
 
 impl<'a> PipelineContext<'a> {
     pub fn new(app: &'a mut App, messages: Vec<Message>, turn_index: usize) -> Self {
-        Self { app, messages, turn_index, stage: StageKind::Prepare, tags: vec![] }
+        Self {
+            app,
+            messages,
+            turn_index,
+            stage: StageKind::Prepare,
+            tags: vec![],
+        }
     }
-    pub fn advance(&mut self, kind: StageKind) { self.stage = kind; }
+    pub fn advance(&mut self, kind: StageKind) {
+        self.stage = kind;
+    }
 }

@@ -29,10 +29,7 @@ fn execute_knowledge_semantic_search(args: &Value) -> Result<String, String> {
         .and_then(|v| v.as_u64())
         .unwrap_or(5)
         .clamp(1, 20) as usize;
-    let hybrid = args
-        .get("hybrid")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let hybrid = args.get("hybrid").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let hits = if hybrid {
         hybrid_search(&query, category.as_deref(), limit)?

@@ -72,12 +72,7 @@ fn strip_fast_flag(instruction: &str) -> Option<&str> {
         .strip_prefix("--fast")
         .or_else(|| instruction.strip_prefix("-f"))?;
     // 标志必须是完整单词：`--fast` 后跟空白才剥离，`--fastly` 之类不动。
-    if instruction.len() != rest.len()
-        && rest
-            .chars()
-            .next()
-            .is_some_and(|c| !c.is_whitespace())
-    {
+    if instruction.len() != rest.len() && rest.chars().next().is_some_and(|c| !c.is_whitespace()) {
         return None;
     }
     Some(rest.trim_start())
@@ -240,10 +235,12 @@ fn format_mutation_log(
         usize,
         usize,
         Vec<String>,
-    )> =
-        Vec::new();
+    )> = Vec::new();
     for e in entries {
-        if let Some(s) = summary.iter_mut().find(|(p, _, _, _, _, _, _)| p == &e.path) {
+        if let Some(s) = summary
+            .iter_mut()
+            .find(|(p, _, _, _, _, _, _)| p == &e.path)
+        {
             s.2 = e.after.clone();
             s.3 = e.op.clone();
             if e.op == "write" {
@@ -275,7 +272,8 @@ fn format_mutation_log(
     );
     const CAP: usize = 14_000;
     let mut truncated = false;
-    for (i, (path, first_before, last_after, last_op, wc, dc, diffs)) in summary.iter().enumerate() {
+    for (i, (path, first_before, last_after, last_op, wc, dc, diffs)) in summary.iter().enumerate()
+    {
         if out.len() >= CAP {
             truncated = true;
             break;
@@ -316,8 +314,7 @@ fn format_mutation_log(
                 out.push_str(&block);
                 out.push_str("\n\n");
             }
-        } else if let Some(diff) =
-            diff_snippet(first_before.as_deref(), last_after.as_deref(), 30)
+        } else if let Some(diff) = diff_snippet(first_before.as_deref(), last_after.as_deref(), 30)
         {
             out.push_str(&diff);
             out.push_str("\n\n");
@@ -391,12 +388,14 @@ fn is_inside_git_work_tree(cwd: &Path) -> bool {
 
 fn git_output(cwd: &Path, args: &[&str]) -> String {
     crate::fork_guard::output(
-        std::process::Command::new("git").args(args).current_dir(cwd),
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd),
     )
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default()
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -426,9 +425,7 @@ mod tests {
     #[test]
     fn fast_audit_shorter_timeouts_than_full_audit() {
         assert!(FAST_AUDIT_SUBAGENT_HARD_TIMEOUT < AUDIT_SUBAGENT_HARD_TIMEOUT);
-        assert!(
-            FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME < AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME
-        );
+        assert!(FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME < AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME);
     }
 
     #[test]
@@ -469,8 +466,14 @@ mod tests {
 
     #[test]
     fn parse_audit_command_fast_flag_without_instruction_is_usage() {
-        assert_eq!(parse_audit_command("/audit --fast"), Some(AuditCommand::Usage));
-        assert_eq!(parse_audit_command("/audit -f  "), Some(AuditCommand::Usage));
+        assert_eq!(
+            parse_audit_command("/audit --fast"),
+            Some(AuditCommand::Usage)
+        );
+        assert_eq!(
+            parse_audit_command("/audit -f  "),
+            Some(AuditCommand::Usage)
+        );
     }
 
     #[test]
@@ -542,7 +545,10 @@ AUDIT_CHECKPOINT: checked src/a.rs; finding at src/a.rs:42\n\
         );
 
         let rendered = terminal_audit_result(&payload);
-        assert_eq!(rendered, "[audit] subagent task exceeded hard timeout of 900s");
+        assert_eq!(
+            rendered,
+            "[audit] subagent task exceeded hard timeout of 900s"
+        );
         // 恢复节选内容与保留路径都不在终端出现（证据归 lead agent）。
         assert!(!rendered.contains("src/a.rs:42"));
         assert!(!rendered.contains("preserved_child_history"));

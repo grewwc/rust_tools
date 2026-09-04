@@ -62,7 +62,10 @@ pub(in crate::ai::driver::turn_runtime) fn reject_tool_calls(
     }
 }
 
-pub(in crate::ai::driver::turn_runtime) fn rejected_tool_call_message(tool_name: &str, reason: ToolCallRejectionReason) -> String {
+pub(in crate::ai::driver::turn_runtime) fn rejected_tool_call_message(
+    tool_name: &str,
+    reason: ToolCallRejectionReason,
+) -> String {
     match reason {
         ToolCallRejectionReason::NoToolHandoff => format!(
             "Error: tool calls are disabled in no-tool handoff mode for this turn. \
@@ -153,20 +156,29 @@ pub(in crate::ai::driver::turn_runtime) fn duplicate_read_only_suppressions(
         .collect()
 }
 
-pub(in crate::ai::driver::turn_runtime) fn read_only_replay_invalidating_call(tool_call: &ToolCall) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn read_only_replay_invalidating_call(
+    tool_call: &ToolCall,
+) -> bool {
     read_only_tool_signature(tool_call).is_none()
 }
 
-pub(in crate::ai::driver::turn_runtime) const DUPLICATE_READ_ONLY_SUPPRESSION_PREFIX: &str = "Duplicate read-only call to '";
+pub(in crate::ai::driver::turn_runtime) const DUPLICATE_READ_ONLY_SUPPRESSION_PREFIX: &str =
+    "Duplicate read-only call to '";
 
-pub(in crate::ai::driver::turn_runtime) fn duplicate_read_only_suppression_message(tool_name: &str, previous_call_id: &str) -> String {
+pub(in crate::ai::driver::turn_runtime) fn duplicate_read_only_suppression_message(
+    tool_name: &str,
+    previous_call_id: &str,
+) -> String {
     format!(
         "Duplicate read-only call to '{tool_name}' suppressed: identical successful call '{previous_call_id}' is already present in the current request context. Reuse that earlier result; execute again only after relevant state changes or with different arguments."
     )
 }
 
 #[cfg(test)]
-pub(in crate::ai::driver::turn_runtime) fn duplicate_read_only_call_ids(messages: &[Message], tool_calls: &[ToolCall]) -> HashSet<String> {
+pub(in crate::ai::driver::turn_runtime) fn duplicate_read_only_call_ids(
+    messages: &[Message],
+    tool_calls: &[ToolCall],
+) -> HashSet<String> {
     duplicate_read_only_suppressions(messages, messages, tool_calls)
         .into_keys()
         .collect()
@@ -195,14 +207,18 @@ pub(in crate::ai::driver::turn_runtime) fn tool_result_is_available_verbatim(
     })
 }
 
-pub(in crate::ai::driver::turn_runtime) fn tool_result_completed_successfully(content: &serde_json::Value) -> bool {
+pub(in crate::ai::driver::turn_runtime) fn tool_result_completed_successfully(
+    content: &serde_json::Value,
+) -> bool {
     let text = content.as_str().unwrap_or_default().trim_start();
     !text.starts_with("Error:")
         && !text.starts_with("Exit code:")
         && !text.starts_with(DUPLICATE_READ_ONLY_SUPPRESSION_PREFIX)
 }
 
-pub(in crate::ai::driver::turn_runtime) fn read_only_tool_signature(tool_call: &ToolCall) -> Option<String> {
+pub(in crate::ai::driver::turn_runtime) fn read_only_tool_signature(
+    tool_call: &ToolCall,
+) -> Option<String> {
     if !crate::ai::tools::tool_allows_same_turn_replay(&tool_call.function.name) {
         return None;
     }
@@ -307,7 +323,9 @@ pub(in crate::ai::driver::turn_runtime) fn duplicate_knowledge_search_call_ids(
     duplicate_ids
 }
 
-pub(in crate::ai::driver::turn_runtime) fn knowledge_search_signature(tool_call: &ToolCall) -> Option<String> {
+pub(in crate::ai::driver::turn_runtime) fn knowledge_search_signature(
+    tool_call: &ToolCall,
+) -> Option<String> {
     if tool_call.function.name != "knowledge_search" {
         return None;
     }

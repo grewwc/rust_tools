@@ -132,6 +132,17 @@ pub(crate) fn drain_cursor() -> u64 {
     DRAIN_CURSOR.load(Ordering::Relaxed)
 }
 
+/// Serializes the whole "drain from the kernel ledger -> persist -> advance the cursor"
+/// sequence performed by `charge_llm_usage_via_kernel`. Without it, two concurrent LLM
+/// callers (e.g. in-process subagents) could both read the same cursor, drain the same
+/// ledger records, and double-insert them into `token_usage`. The cursor only advances
+/// after a successful commit, so a caller that waits on this lock then reads an
+/// already-advanced cursor and fetches only new records.
+pub(crate) fn drain_lock() -> std::sync::MutexGuard<'static, ()> {
+    static DRAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    DRAIN_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Batch-persist ledger records drained from the kernel. Best-effort: failures only log a warning and no error is returned.
 ///
 /// `new_head` is the current head seq of the kernel ledger (`llm_usage_head_seq()`); after a successful

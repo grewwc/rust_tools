@@ -18,9 +18,9 @@ use aios_kernel::kernel::SharedKernel;
 use super::{
     agents::AgentManifest,
     cli::ParsedCli,
-    pipeline::HookRegistry,
     middleware::{RequestMiddleware, ToolMiddleware},
     persona::PersonaProfile,
+    pipeline::HookRegistry,
     prompt::PromptEditor,
 };
 

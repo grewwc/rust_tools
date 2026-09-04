@@ -32,7 +32,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
 
 use crate::tools::{op_timeout_ms, resolve_screenshot_path};
@@ -134,11 +134,18 @@ fn restore_focus(prev: Option<&(String, String)>) {
     if bid == "com.google.Chrome" || name == "Google Chrome" {
         return;
     }
-    if !bid.is_empty() && std::process::Command::new("open").args(["-b", bid]).status().is_ok() {
+    if !bid.is_empty()
+        && std::process::Command::new("open")
+            .args(["-b", bid])
+            .status()
+            .is_ok()
+    {
         return;
     }
     if !name.is_empty() {
-        let _ = std::process::Command::new("open").args(["-a", name]).status();
+        let _ = std::process::Command::new("open")
+            .args(["-a", name])
+            .status();
     }
 }
 
@@ -231,7 +238,10 @@ async fn run_osascript(script: &str) -> Result<String, String> {
             .map_err(|e| format!("osascript stdin write failed: {}", e))?;
         stdin.shutdown().await.ok();
     }
-    let out = child.wait_with_output().await.map_err(|e| format!("osascript failed: {}", e))?;
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("osascript failed: {}", e))?;
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
@@ -286,7 +296,9 @@ impl ApplescriptSession {
         };
         let script = format!(
             "tell application \"Google Chrome\"\n  execute (first tab of window id {} whose id is \"{}\") javascript \"{}\"\nend tell",
-            wid, tid, esc_applescript(js)
+            wid,
+            tid,
+            esc_applescript(js)
         );
         run_osascript(&script).await.map_err(|e| translate_err(&e))
     }
@@ -315,8 +327,10 @@ impl ApplescriptSession {
                 self.tab_id.clone().unwrap(),
             );
             let script = format!(
-            "tell application \"Google Chrome\"\n  set URL of (first tab of window id {} whose id is \"{}\") to \"{}\"\nend tell",
-            wid, tid, esc_applescript(url)
+                "tell application \"Google Chrome\"\n  set URL of (first tab of window id {} whose id is \"{}\") to \"{}\"\nend tell",
+                wid,
+                tid,
+                esc_applescript(url)
             );
             run_osascript(&script).await?;
         } else {
@@ -325,7 +339,10 @@ impl ApplescriptSession {
         // Wait for loading to finish (up to ~20s; keep going past the deadline since pages may load slowly due to ads).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
-            let state = self.exec_js("document.readyState").await.unwrap_or_default();
+            let state = self
+                .exec_js("document.readyState")
+                .await
+                .unwrap_or_default();
             if state.trim() == "complete" || std::time::Instant::now() >= deadline {
                 break;
             }
@@ -344,8 +361,8 @@ impl ApplescriptSession {
         let out = self
             .exec_js("JSON.stringify({url: location.href, title: document.title})")
             .await?;
-        let v: Value = serde_json::from_str(out.trim())
-            .unwrap_or_else(|_| json!({ "url": "", "title": "" }));
+        let v: Value =
+            serde_json::from_str(out.trim()).unwrap_or_else(|_| json!({ "url": "", "title": "" }));
         Ok((
             v["url"].as_str().unwrap_or("").to_string(),
             v["title"].as_str().unwrap_or("").to_string(),
@@ -397,7 +414,10 @@ end tell"#,
             "tell application \"Google Chrome\"\n  exists (first tab of window id {} whose id is \"{}\")\nend tell",
             wid, tid
         );
-        run_osascript(&script).await.map(|s| s.trim() == "true").unwrap_or(false)
+        run_osascript(&script)
+            .await
+            .map(|s| s.trim() == "true")
+            .unwrap_or(false)
     }
 
     /// List the tabs in the session window (#idx: url [active]).
@@ -431,8 +451,8 @@ end tell"#,
     pub async fn close_session_tab(&mut self) -> Result<(), String> {
         if let (Some(w), Some(t)) = (&self.window_id.clone(), &self.tab_id.clone()) {
             let script = format!(
-            "tell application \"Google Chrome\"\n  close (first tab of window id {} whose id is \"{}\")\nend tell",
-            w, t
+                "tell application \"Google Chrome\"\n  close (first tab of window id {} whose id is \"{}\")\nend tell",
+                w, t
             );
             if run_osascript(&script).await.is_ok() {
                 self.window_id = None;
@@ -486,7 +506,10 @@ end tell"#,
 
     /// Execute an arbitrary JS expression in the page (result returned after JSON.stringify).
     pub async fn evaluate_js(&self, expr: &str) -> Result<String, String> {
-        let js = format!("JSON.stringify((() => {{ try {{ return ({}); }} catch(e) {{ return 'JS_ERROR: ' + e; }} }})())", expr);
+        let js = format!(
+            "JSON.stringify((() => {{ try {{ return ({}); }} catch(e) {{ return 'JS_ERROR: ' + e; }} }})())",
+            expr
+        );
         // User expressions may contain newlines (multi-line expressions are legal); join the lines into a single line.
         let js = js.lines().collect::<Vec<_>>().join(" ");
         let raw = self.exec_js(&js).await?;
@@ -504,14 +527,22 @@ end tell"#,
                 return Ok(deadline.elapsed().as_millis() as u64);
             }
             if Instant::now() >= deadline {
-                return Err(format!("等待超时：{}ms 内未找到选择器 '{}'", timeout_ms, selector));
+                return Err(format!(
+                    "等待超时：{}ms 内未找到选择器 '{}'",
+                    timeout_ms, selector
+                ));
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
     /// Scroll: x/y are window coordinates, or scroll a selector into view.
-    pub async fn scroll(&self, x: Option<i64>, y: Option<i64>, selector: Option<&str>) -> Result<(), String> {
+    pub async fn scroll(
+        &self,
+        x: Option<i64>,
+        y: Option<i64>,
+        selector: Option<&str>,
+    ) -> Result<(), String> {
         let js = if let Some(sel) = selector {
             format!(
                 "(() => {{ const el = document.querySelector({}); if (!el) return 'not found'; el.scrollIntoView({{block:'center'}}); return 'ok'; }})()",
@@ -519,7 +550,10 @@ end tell"#,
             )
         } else {
             let (x, y) = (x.unwrap_or(0), y.unwrap_or(0));
-            format!("(() => {{ window.scrollTo({}, {}); return 'ok'; }})()", x, y)
+            format!(
+                "(() => {{ window.scrollTo({}, {}); return 'ok'; }})()",
+                x, y
+            )
         };
         let raw = self.exec_js(&js).await?;
         if unquote(&raw) == "not found" {
@@ -547,7 +581,12 @@ end tell"#,
     }
 
     /// Type text (native setter + input/change events; can submit the form).
-    pub async fn type_text(&self, selector: &str, text: &str, submit: bool) -> Result<String, String> {
+    pub async fn type_text(
+        &self,
+        selector: &str,
+        text: &str,
+        submit: bool,
+    ) -> Result<String, String> {
         let sel = selector.to_string();
         let text_json = json!(text).to_string();
         let submit_js = if submit {
@@ -599,7 +638,11 @@ end tell"#,
             focus_js,
             esc_js_key(key),
             esc_js_key(key),
-            if key.eq_ignore_ascii_case("enter") { "true" } else { "false" },
+            if key.eq_ignore_ascii_case("enter") {
+                "true"
+            } else {
+                "false"
+            },
             esc_js_key(key),
             esc_js_key(key)
         );
@@ -642,7 +685,10 @@ end tell"#,
                     clean_streak += 1;
                     if clean_streak >= 2 {
                         self.pending_human = None;
-                        return format!("status=resolved\nYou may now continue browser automation.\n{}", note.trim());
+                        return format!(
+                            "status=resolved\nYou may now continue browser automation.\n{}",
+                            note.trim()
+                        );
                     }
                 }
                 Some(c) => {
@@ -655,7 +701,9 @@ end tell"#,
                     .clone()
                     .map(|c| format!(" (expect: {})", c))
                     .unwrap_or_default();
-                self.pending_human = expect.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+                self.pending_human = expect
+                    .map(|e| e.trim().to_string())
+                    .filter(|e| !e.is_empty());
                 return format!(
                     "status=still_waiting\nStill waiting for the user to complete '{}' in the visible browser window after {} ms.{}",
                     cat.unwrap_or_default(),
@@ -689,7 +737,11 @@ end tell"#,
         );
         let out = run_osascript(&script).await.ok()?;
         // Looks like "0, 44, 1440, 878" or "{0, 44, 1440, 878}".
-        let s = out.trim().trim_matches(|c| c == '{' || c == '}').trim().to_string();
+        let s = out
+            .trim()
+            .trim_matches(|c| c == '{' || c == '}')
+            .trim()
+            .to_string();
         let parts: Vec<&str> = s.split(',').collect();
         if parts.len() != 4 {
             return None;
@@ -711,7 +763,11 @@ end tell"#,
     /// fall back to fullscreen. Under AppleScript, `full_page` automatically degrades to
     /// a window screenshot (returns a warning instead of Err to avoid a model retry loop).
     /// Takes `&mut self` so it can auto-`open_tab("about:blank")` when no window exists.
-    pub async fn screenshot(&mut self, path: &str, full_page: bool) -> Result<(String, String), String> {
+    pub async fn screenshot(
+        &mut self,
+        path: &str,
+        full_page: bool,
+    ) -> Result<(String, String), String> {
         // Gate every capture attempt behind the Screen Recording preflight. Without
         // it `screencapture -l` fails outright ("could not create image from
         // window") and the later rect/fullscreen fallbacks exit 0 yet emit a
@@ -754,17 +810,27 @@ end tell"#,
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         std::fs::create_dir_all(&parent).map_err(|e| format!("创建截图目录失败: {}", e))?;
         // 1) Window-level capture (most precise; shadows/rounded corners are handled by the system).
-        if screencapture_capture(&["-l", &wid, "-x", path]).await.is_ok() {
+        if screencapture_capture(&["-l", &wid, "-x", path])
+            .await
+            .is_ok()
+        {
             // Double-check the file actually landed and is non-empty (may be 0 bytes when the window is hidden).
-            if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+            if std::fs::metadata(path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+            {
                 return Ok((path.to_string(), full_page_warn.to_string()));
             }
         }
         // 2) rect fallback: convert Chrome bounds to -R x,y,w,h.
         if let Some((x, y, w, h)) = self.window_bounds(&wid).await {
             let rect = format!("{},{},{},{}", x, y, w, h);
-            if screencapture_capture(&["-R", &rect, "-x", path]).await.is_ok()
-                && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+            if screencapture_capture(&["-R", &rect, "-x", path])
+                .await
+                .is_ok()
+                && std::fs::metadata(path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
             {
                 let note = format!("{} [fallback: rect {}]", full_page_warn, rect);
                 return Ok((path.to_string(), note));
@@ -772,9 +838,14 @@ end tell"#,
         }
         // 3) fullscreen fallback (still produces an image when the window is invisible/hidden, avoiding total failure).
         if screencapture_capture(&["-x", path]).await.is_ok()
-            && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+            && std::fs::metadata(path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
         {
-            let note = format!("{} [fallback: fullscreen - 窗口不可见已退化为全屏]", full_page_warn);
+            let note = format!(
+                "{} [fallback: fullscreen - 窗口不可见已退化为全屏]",
+                full_page_warn
+            );
             return Ok((path.to_string(), note));
         }
         Err(format!(
@@ -811,7 +882,9 @@ fn unquote(s: &str) -> String {
 }
 
 fn esc_js_key(k: &str) -> String {
-    k.replace('\\', "\\\\").replace('\'', "\\'").replace('"', "\\\"")
+    k.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('"', "\\\"")
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -863,7 +936,10 @@ pub async fn handle_tools_call(
             let summary = with_timeout(ms, async {
                 session.navigate(&url, wait_selector.as_deref()).await?;
                 let (u, t) = session.url_title().await?;
-                let tag = session.detect_user_action_required().await.map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session
+                    .detect_user_action_required()
+                    .await
+                    .map_or(String::new(), |c| user_action_tag(&c));
                 Ok(format!("{pend}Navigated to {u}\nTitle: {t}{tag}"))
             })
             .await?;
@@ -874,7 +950,10 @@ pub async fn handle_tools_call(
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
                 session.click(&sel).await?;
-                let tag = session.detect_user_action_required().await.map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session
+                    .detect_user_action_required()
+                    .await
+                    .map_or(String::new(), |c| user_action_tag(&c));
                 Ok(format!("{pend}Clicked {sel}{tag}"))
             })
             .await?;
@@ -887,7 +966,10 @@ pub async fn handle_tools_call(
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
                 let n = session.type_text(&sel, &text, submit).await?;
-                let tag = session.detect_user_action_required().await.map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session
+                    .detect_user_action_required()
+                    .await
+                    .map_or(String::new(), |c| user_action_tag(&c));
                 let suffix = if submit { " and pressed Enter" } else { "" };
                 Ok(format!("{pend}Typed {n} chars into {sel}{suffix}{tag}"))
             })
@@ -900,7 +982,10 @@ pub async fn handle_tools_call(
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
                 session.press_key(&key, sel.as_deref()).await?;
-                let tag = session.detect_user_action_required().await.map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session
+                    .detect_user_action_required()
+                    .await
+                    .map_or(String::new(), |c| user_action_tag(&c));
                 Ok(format!("{pend}Pressed {key}{tag}"))
             })
             .await?;
@@ -915,7 +1000,10 @@ pub async fn handle_tools_call(
                 session
                     .scroll(x.map(|v| v as i64), y.map(|v| v as i64), sel.as_deref())
                     .await?;
-                let tag = session.detect_user_action_required().await.map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session
+                    .detect_user_action_required()
+                    .await
+                    .map_or(String::new(), |c| user_action_tag(&c));
                 Ok(match &sel {
                     Some(s) => format!("{pend}Scrolled {s} into view{tag}"),
                     None => format!("{pend}Scrolled window to ({x:?}, {y:?}){tag}"),
@@ -932,7 +1020,10 @@ pub async fn handle_tools_call(
                 .unwrap_or(10_000);
             let summary = with_timeout(ms, async {
                 let waited = session.wait_for_selector(&sel, timeout_ms).await?;
-                let tag = session.detect_user_action_required().await.map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session
+                    .detect_user_action_required()
+                    .await
+                    .map_or(String::new(), |c| user_action_tag(&c));
                 Ok(format!("Found {sel} after {waited} ms{tag}"))
             })
             .await?;
@@ -972,12 +1063,22 @@ pub async fn handle_tools_call(
         "screenshot" => {
             let path = opt_str(&args, "path");
             let out_path = resolve_screenshot_path(path)?;
-            let full_page = args.get("full_page").and_then(Value::as_bool).unwrap_or(false);
+            let full_page = args
+                .get("full_page")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
-                let (p, extra) = session.screenshot(&out_path.to_string_lossy(), full_page).await?;
-                let tag = session.detect_user_action_required().await.map_or(String::new(), |c| user_action_tag(&c));
-                Ok(format!("{pend}Saved screenshot to {p} (full_page={full_page}){extra}{tag}"))
+                let (p, extra) = session
+                    .screenshot(&out_path.to_string_lossy(), full_page)
+                    .await?;
+                let tag = session
+                    .detect_user_action_required()
+                    .await
+                    .map_or(String::new(), |c| user_action_tag(&c));
+                Ok(format!(
+                    "{pend}Saved screenshot to {p} (full_page={full_page}){extra}{tag}"
+                ))
             })
             .await?;
             Ok(text_content(&summary))
@@ -1008,6 +1109,10 @@ pub async fn handle_tools_call(
             .await?;
             Ok(text_content(&r))
         }
-        _ => Err(JsonRpcErr::new(-32601, &format!("unknown tool: {cmd}"), None)),
+        _ => Err(JsonRpcErr::new(
+            -32601,
+            &format!("unknown tool: {cmd}"),
+            None,
+        )),
     }
 }

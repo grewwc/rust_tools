@@ -50,7 +50,8 @@ mod tests {
     use crate::ai::types::{App, FunctionCall, ToolCall};
 
     type BoxedExecErr = Box<dyn std::error::Error + Send + Sync>;
-    type ExecFut<'a> = Pin<Box<dyn Future<Output = Result<ToolExecOutput, BoxedExecErr>> + Send + 'a>>;
+    type ExecFut<'a> =
+        Pin<Box<dyn Future<Output = Result<ToolExecOutput, BoxedExecErr>> + Send + 'a>>;
 
     fn mock_calls() -> Vec<ToolCall> {
         vec![ToolCall {
@@ -79,7 +80,9 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
     impl ToolMiddleware for CountingMiddleware {
-        fn name(&self) -> &'static str { "counting" }
+        fn name(&self) -> &'static str {
+            "counting"
+        }
         fn wrap(&self, inner: Box<dyn ToolExecutor>) -> Box<dyn ToolExecutor> {
             let calls = Arc::clone(&self.calls);
             struct CountingExecutor {
@@ -102,7 +105,9 @@ mod tests {
     /// Auth short-circuit middleware: returns an error directly without calling inner.
     struct AuthMiddleware;
     impl ToolMiddleware for AuthMiddleware {
-        fn name(&self) -> &'static str { "auth" }
+        fn name(&self) -> &'static str {
+            "auth"
+        }
         fn wrap(&self, _inner: Box<dyn ToolExecutor>) -> Box<dyn ToolExecutor> {
             struct AuthExecutor;
             impl ToolExecutor for AuthExecutor {
@@ -121,9 +126,17 @@ mod tests {
         let outer_calls = Arc::new(AtomicUsize::new(0));
 
         // Onion chain: outer counter -> inner counter -> real executor
-        let executor: Box<dyn ToolExecutor> = CountingMiddleware { calls: Arc::clone(&outer_calls) }
-            .wrap(CountingMiddleware { calls: Arc::clone(&inner_calls) }
-                .wrap(Box::new(CountingExecutor { calls: Arc::clone(&inner_calls) })));
+        let executor: Box<dyn ToolExecutor> = CountingMiddleware {
+            calls: Arc::clone(&outer_calls),
+        }
+        .wrap(
+            CountingMiddleware {
+                calls: Arc::clone(&inner_calls),
+            }
+            .wrap(Box::new(CountingExecutor {
+                calls: Arc::clone(&inner_calls),
+            })),
+        );
 
         let mut app = test_app();
         for _ in 0..2 {
@@ -131,19 +144,28 @@ mod tests {
             assert!(res.is_ok(), "计数 executor 固定成功");
         }
         assert_eq!(outer_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(inner_calls.load(Ordering::SeqCst), 4, "内层中间件与真实 executor 各被调用 2 次");
+        assert_eq!(
+            inner_calls.load(Ordering::SeqCst),
+            4,
+            "内层中间件与真实 executor 各被调用 2 次"
+        );
     }
 
     /// Auth short-circuit middleware does not call inner.
     #[tokio::test]
     async fn auth_middleware_skips_inner() {
         let inner_calls = Arc::new(AtomicUsize::new(0));
-        let executor: Box<dyn ToolExecutor> =
-            AuthMiddleware.wrap(Box::new(CountingExecutor { calls: Arc::clone(&inner_calls) }));
+        let executor: Box<dyn ToolExecutor> = AuthMiddleware.wrap(Box::new(CountingExecutor {
+            calls: Arc::clone(&inner_calls),
+        }));
 
         let mut app = test_app();
         let res = executor.execute(&mut app, mock_calls()).await;
         assert!(res.is_err());
-        assert_eq!(inner_calls.load(Ordering::SeqCst), 0, "鉴权失败不应调用 inner");
+        assert_eq!(
+            inner_calls.load(Ordering::SeqCst),
+            0,
+            "鉴权失败不应调用 inner"
+        );
     }
 }

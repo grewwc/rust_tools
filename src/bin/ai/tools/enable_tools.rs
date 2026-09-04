@@ -106,11 +106,7 @@ fn hidden_group_declared() -> bool {
     STATE
         .read()
         .ok()
-        .and_then(|s| {
-            s.turns
-                .get(&turn)
-                .map(|state| state.hidden_group_declared)
-        })
+        .and_then(|s| s.turns.get(&turn).map(|state| state.hidden_group_declared))
         .unwrap_or(false)
 }
 
@@ -370,8 +366,7 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             let mut group_counts: std::collections::BTreeMap<&str, usize> = Default::default();
             for reg in inventory::iter::<ToolRegistration> {
                 if registration_may_be_dynamically_enabled(reg) {
-                    for tag in
-                        crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name)
+                    for tag in crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name)
                     {
                         if !tag.is_enable_ability_flag() && group_visible_to_agent(*tag) {
                             *group_counts.entry(tag.as_str()).or_insert(0) += 1;
@@ -426,9 +421,8 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                     && group_visible_to_agent(group)
                 {
                     for reg in inventory::iter::<ToolRegistration> {
-                        let tags = crate::ai::tools::registry::tool_metadata::tool_groups(
-                            reg.spec.name,
-                        );
+                        let tags =
+                            crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name);
                         if tags.contains(&ToolGroup::Builtin) && tags.contains(&group) {
                             members.push(reg.spec.name.to_string());
                         }
@@ -656,7 +650,11 @@ mod tests {
             "{enabled}"
         );
         assert!(enabled.contains("Enabled 7 tool(s)"), "{enabled}");
-        for name in ["knowledge_search", "knowledge_save", "knowledge_semantic_search"] {
+        for name in [
+            "knowledge_search",
+            "knowledge_save",
+            "knowledge_semantic_search",
+        ] {
             assert!(
                 enabled.contains(name),
                 "{name} should be enabled via the knowledge group"
@@ -665,11 +663,17 @@ mod tests {
 
         let builtin =
             execute_enable_tools(&json!({"operation": "enable", "tools": ["builtin"]})).unwrap();
-        assert!(builtin.contains("Unknown tools (ignored): builtin"), "{builtin}");
+        assert!(
+            builtin.contains("Unknown tools (ignored): builtin"),
+            "{builtin}"
+        );
 
         let listed = execute_enable_tools(&json!({"operation": "list"})).unwrap();
         assert!(listed.contains("Group shortcuts"), "{listed}");
-        assert!(listed.contains("skills(") && listed.contains("task("), "{listed}");
+        assert!(
+            listed.contains("skills(") && listed.contains("task("),
+            "{listed}"
+        );
     }
 
     #[test]
@@ -752,9 +756,12 @@ mod tests {
         assert!(drain_pending_enable().is_empty());
         assert!(explicit_enabled_tool_names().is_empty());
 
-        let group = execute_enable_tools(&json!({"operation": "enable", "tools": ["executor"]}))
-            .unwrap();
-        assert!(group.contains("Unknown tools (ignored): executor"), "{group}");
+        let group =
+            execute_enable_tools(&json!({"operation": "enable", "tools": ["executor"]})).unwrap();
+        assert!(
+            group.contains("Unknown tools (ignored): executor"),
+            "{group}"
+        );
     }
 
     #[test]
@@ -776,13 +783,19 @@ mod tests {
         let enabled =
             execute_enable_tools(&json!({"operation": "enable", "tools": ["spawn_daemon"]}))
                 .unwrap();
-        assert!(enabled.contains("Enabled 1 tool(s): spawn_daemon"), "{enabled}");
+        assert!(
+            enabled.contains("Enabled 1 tool(s): spawn_daemon"),
+            "{enabled}"
+        );
         let drained = drain_pending_enable();
         assert!(drained.iter().any(|d| d.function.name == "spawn_daemon"));
 
-        let group = execute_enable_tools(&json!({"operation": "enable", "tools": ["executor"]}))
-            .unwrap();
-        assert!(group.contains("Expanded group shortcut(s): executor"), "{group}");
+        let group =
+            execute_enable_tools(&json!({"operation": "enable", "tools": ["executor"]})).unwrap();
+        assert!(
+            group.contains("Expanded group shortcut(s): executor"),
+            "{group}"
+        );
     }
 
     #[test]

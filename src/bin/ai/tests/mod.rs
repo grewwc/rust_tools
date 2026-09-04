@@ -11,11 +11,11 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 use serde_json::Value;
 
+use super::*;
 use super::{
     history::{Message, append_history_messages},
     types::{FunctionCall, ToolCall},
 };
-use super::*;
 
 mod cli;
 mod compress;

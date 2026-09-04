@@ -26,7 +26,9 @@ impl StreamFilter for PrefixStreamFilter {
         Some(format!("filtered:{chunk}"))
     }
 
-    fn name(&self) -> &str { "prefix" }
+    fn name(&self) -> &str {
+        "prefix"
+    }
 }
 
 #[test]
@@ -2017,6 +2019,84 @@ fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
 }
 
 #[test]
+fn fold_body_row_budget_disables_clamp_when_viewport_unknown() {
+    // Non-tty / pipe / test: viewport height is unknown, so clamping must be disabled (usize::MAX) to
+    // preserve the exact previous behavior — no rendered byte changes off a real terminal.
+    assert_eq!(fold_body_row_budget_for(None), usize::MAX);
+}
+
+#[test]
+fn fold_body_row_budget_leaves_headroom_for_header_marker_and_cursor() {
+    // On a real viewport the body budget is `rows - reserved` (header + marker + one cursor-headroom row),
+    // floored at 1 so even a pathologically short pane still renders a body row.
+    assert_eq!(
+        fold_body_row_budget_for(Some(50)),
+        50 - FOLD_VIEWPORT_RESERVED_ROWS
+    );
+    // Tall terminals dwarf the default window, so the effective size (and rendered output) is unchanged.
+    assert!(fold_body_row_budget_for(Some(50)) >= DEFAULT_THINKING_MAX_VISIBLE_LINES);
+    // A viewport too short to hold header+marker+headroom still yields at least one visible body row.
+    assert_eq!(fold_body_row_budget_for(Some(2)), 1);
+    assert_eq!(fold_body_row_budget_for(Some(1)), 1);
+}
+
+#[test]
+fn short_viewport_clamps_fold_window_so_header_plus_body_stay_visible() {
+    // Regression: with a configured window larger than the viewport can hold, the live window must be clamped
+    // to `viewport - reserved` body rows so `header + window_rows` never exceeds the viewport. Otherwise the
+    // window top scrolls into scrollback, the relative-cursor erase can no longer reach it, and every redraw
+    // leaks a stacked `… more` / `… N earlier lines` marker (the screenshot failure).
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("COLUMNS", "200");
+    }
+
+    // Emulate a short pane: viewport of 5 rows -> body budget = 5 - 3 = 2 rows.
+    let viewport_rows = 5usize;
+    let budget = fold_body_row_budget_for(Some(viewport_rows));
+    assert_eq!(budget, 2);
+
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    // Configured window (10) is far taller than the short viewport can hold.
+    fold.max_visible_lines = 10;
+    fold.total_lines = 100;
+    for i in 0..10 {
+        fold.recent_lines.push_back(format!("line-{i}"));
+    }
+    fold.current_line = "current".to_string();
+
+    // Apply the same clamp the redraw path applies, then render.
+    let configured = fold.max_visible_lines;
+    fold.max_visible_lines = configured.min(budget);
+    let (window, rows) = render_thinking_fold_window(fold);
+    fold.max_visible_lines = configured; // model-facing config must be restored untouched
+
+    // Body rows are bounded by the budget, and the whole window (header + body) fits the viewport with headroom.
+    assert!(
+        rows <= budget + 1, // budget body rows + at most one fold-marker row
+        "clamped window body rows {rows} exceed budget {budget}"
+    );
+    assert!(
+        1 + rows <= viewport_rows,
+        "header(1) + body {rows} must stay within viewport {viewport_rows}"
+    );
+    // The marker is still present (content was folded), just not stacked.
+    assert_eq!(
+        window.matches("more").count() + window.matches("earlier lines").count(),
+        1
+    );
+    // Clamping is display-only: the ring buffer / configured window are untouched.
+    assert_eq!(fold.max_visible_lines, 10);
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
 fn cancelled_stream_result_finalizes_active_thinking_fold() {
     // On cancel with an active fold window, it must be finalized (finalize→reset), preventing a partial
     // thinking remnant with a new header stacked under it on the next retry (cross-turn root cause of duplicated headers + large blank areas).
@@ -2943,7 +3023,10 @@ mod golden_wire {
         // Even with visible text, a length finish_reason must flag truncation so
         // upper layers can inject a shrink hint / retry.
         assert_eq!(result.assistant_text, "partial answer");
-        assert!(result.truncated_by_length, "length finish_reason => truncated_by_length");
+        assert!(
+            result.truncated_by_length,
+            "length finish_reason => truncated_by_length"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! 变更查看服务：`show_changes` / `open_diff` 两个工具的实现。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::ai::tools::registry::common::{ToolRegistration, ToolSpec};
 use crate::ai::tools::storage::changes::{self, EditorKind};
@@ -35,7 +35,11 @@ inventory::submit!(ToolRegistration {
 
 // ── show_changes ───────────────────────────────────────────────────────
 pub(crate) fn handle_show_changes(args: &Value) -> Value {
-    let path_filter = args.get("path").and_then(Value::as_str).unwrap_or("").trim();
+    let path_filter = args
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     let include_git = args
         .get("include_git")
         .and_then(Value::as_bool)
@@ -56,7 +60,8 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
         .unwrap_or(120);
 
     // 读取真实会话链路
-    let cwd = crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let is_git_repo = changes::is_inside_git_work_tree(&cwd);
     let entries = crate::ai::tools::storage::mutation_log::read_all();
     let has_session_mutations = !entries.is_empty();
@@ -89,17 +94,28 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
             }
         }
         if filtered_lines.is_empty() {
-            text = format!("no changes matching path filter '{}'\n{}", path_filter, text);
+            text = format!(
+                "no changes matching path filter '{}'\n{}",
+                path_filter, text
+            );
         } else {
             // 仍附带原摘要头 + 过滤行
             let header = text.lines().take(4).collect::<Vec<_>>().join("\n");
-            text = format!("{}\n[filter: {}]\n{}", header, path_filter, filtered_lines.join("\n"));
+            text = format!(
+                "{}\n[filter: {}]\n{}",
+                header,
+                path_filter,
+                filtered_lines.join("\n")
+            );
         }
     }
     if limit_snippet > 0 && text.len() > limit_snippet * 80 {
         let cap = limit_snippet * 80;
         let truncated = text.chars().take(cap).collect::<String>();
-        text = format!("{}…\n[truncated to {} chars, patch {} bytes]", truncated, cap, patch_bytes);
+        text = format!(
+            "{}…\n[truncated to {} chars, patch {} bytes]",
+            truncated, cap, patch_bytes
+        );
     }
 
     let changed_files = changes::session_grouped_changes().len();
@@ -114,25 +130,20 @@ pub(crate) fn handle_show_changes(args: &Value) -> Value {
 
 // ── open_diff ──────────────────────────────────────────────────────────
 pub(crate) fn handle_open_diff(args: &Value) -> Value {
-    let editor_str = args
-        .get("editor")
-        .and_then(Value::as_str)
-        .unwrap_or("auto");
+    let editor_str = args.get("editor").and_then(Value::as_str).unwrap_or("auto");
     let patch_file_arg = args.get("patch_file").and_then(Value::as_str);
-    let as_patch_opt = args
-        .get("as_patch")
-        .and_then(Value::as_bool)
-        .or_else(|| {
-            crate::commonw::configw::get_all_config()
-                .get_opt(crate::ai::config_schema::AiConfig::DIFF_OPEN_PATCH_FILE)
-                .filter(|v| !v.trim().is_empty())
-                .map(|v| {
-                    let low = v.trim().to_ascii_lowercase();
-                    !(low == "false" || low == "0" || low == "no" || low == "off")
-                })
-        });
+    let as_patch_opt = args.get("as_patch").and_then(Value::as_bool).or_else(|| {
+        crate::commonw::configw::get_all_config()
+            .get_opt(crate::ai::config_schema::AiConfig::DIFF_OPEN_PATCH_FILE)
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| {
+                let low = v.trim().to_ascii_lowercase();
+                !(low == "false" || low == "0" || low == "no" || low == "off")
+            })
+    });
 
-    let cwd = crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let is_git_repo = changes::is_inside_git_work_tree(&cwd);
     if changes::session_grouped_changes().is_empty() && !is_git_repo {
         return json!({
@@ -149,7 +160,7 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
                 "ok": false,
                 "error": "generated patch is empty",
                 "is_git_repo": is_git_repo,
-            })
+            });
         }
     };
 
@@ -157,7 +168,11 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
     if as_patch_opt == Some(false) {
         let grouped = changes::session_grouped_changes();
         if grouped.len() == 1 {
-            let normalized = if editor_str.eq_ignore_ascii_case("vscode") { "code" } else { editor_str };
+            let normalized = if editor_str.eq_ignore_ascii_case("vscode") {
+                "code"
+            } else {
+                editor_str
+            };
             let kind = if editor_str.eq_ignore_ascii_case("auto") {
                 // auto 场景下探测；若探测到 vscode/cursor 则允许 diff，否则回退 patch
                 changes::configured_editor()
@@ -198,7 +213,8 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
         // 安全校验：patch_file 必须落在可写根（effective_cwd / allowed_roots / session temp / skills）
         // 或为已注册的隔离临时文件（子代理隔离目录），与 FileStore::validate_write_access 保持一致
         let in_allowed = crate::ai::tools::storage::file_store::path_within_allowed_roots(&dest);
-        let is_registered = crate::ai::tools::storage::temp_registry::is_registered(&dest.display().to_string());
+        let is_registered =
+            crate::ai::tools::storage::temp_registry::is_registered(&dest.display().to_string());
         // 相对路径已在 path_within_allowed_roots 内按 effective_cwd 归一化；绝对路径孤立注册文件也放行
         // 额外兼容：绝对路径若恰好位于 runtime_ctx::temp_dir() 下也视为已授权的 scratch
         let in_session_tmp = dest.is_absolute()
@@ -234,7 +250,11 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
         let kind = if editor_str.eq_ignore_ascii_case("auto") {
             changes::configured_editor()
         } else {
-            let normalized = if editor_str.eq_ignore_ascii_case("vscode") { "code" } else { editor_str };
+            let normalized = if editor_str.eq_ignore_ascii_case("vscode") {
+                "code"
+            } else {
+                editor_str
+            };
             EditorKind::from_str(normalized).unwrap_or_else(changes::configured_editor)
         };
         // 复用存储层 open_patch 逻辑：此处直接调用 open_changes 会忽略自定义路径，因此手动打开
@@ -262,7 +282,11 @@ pub(crate) fn handle_open_diff(args: &Value) -> Value {
     let requested_kind = if editor_str.eq_ignore_ascii_case("auto") {
         None
     } else {
-        let normalized = if editor_str.eq_ignore_ascii_case("vscode") { "code" } else { editor_str };
+        let normalized = if editor_str.eq_ignore_ascii_case("vscode") {
+            "code"
+        } else {
+            editor_str
+        };
         EditorKind::from_str(normalized)
     };
     match changes::open_changes(requested_kind.clone()) {
@@ -310,7 +334,8 @@ fn try_open_single_file_diff(
         return None;
     }
     // 落盘到会话临时目录（与 file_store 沙箱保持一致，避免直接写系统 /tmp 越界）
-    let base_tmp = crate::ai::driver::runtime_ctx::temp_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let base_tmp =
+        crate::ai::driver::runtime_ctx::temp_dir().unwrap_or_else(|_| std::env::temp_dir());
     let tmp_dir = base_tmp.join(format!("rust_tools_diff_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_dir);
     let safe = g.rel.replace('/', "_").replace('\\', "_");
@@ -335,9 +360,18 @@ fn try_open_single_file_diff(
         EditorKind::Cursor => "cursor",
         _ => return None,
     };
-    let cmd_display = format!("{} --diff {} {}", prog, before_path.display(), after_path.display());
+    let cmd_display = format!(
+        "{} --diff {} {}",
+        prog,
+        before_path.display(),
+        after_path.display()
+    );
     let res = std::process::Command::new(prog)
-        .args(["--diff", &before_path.display().to_string(), &after_path.display().to_string()])
+        .args([
+            "--diff",
+            &before_path.display().to_string(),
+            &after_path.display().to_string(),
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -346,7 +380,10 @@ fn try_open_single_file_diff(
     Some(res)
 }
 
-fn open_patch_path_with_editor(patch_path: &std::path::Path, kind: &EditorKind) -> Result<String, String> {
+fn open_patch_path_with_editor(
+    patch_path: &std::path::Path,
+    kind: &EditorKind,
+) -> Result<String, String> {
     // 复刻 storage::changes::open_patch 但允许自定义路径
     let patch_str = patch_path.display().to_string();
     let (prog, args): (&str, Vec<String>) = match kind {

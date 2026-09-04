@@ -149,10 +149,8 @@ impl KernelInternal for LocalOS {
             if is_sleeping {
                 if let Some(proc) = self.processes.get_mut(&pid) {
                     proc.state = ProcessState::Ready;
-                    proc.mailbox.push_back(format!(
-                        "Sleep finished at scheduler tick {}.",
-                        self.tick
-                    ));
+                    proc.mailbox
+                        .push_back(format!("Sleep finished at scheduler tick {}.", self.tick));
                 }
                 self.enqueue_ready(pid);
                 continue;

@@ -1,7 +1,7 @@
 //! Tests for the `rejection` cluster.
 
-use super::common::*;
 use super::super::*;
+use super::common::*;
 
 #[test]
 fn scoped_instruction_preflight_blocks_first_mutation_until_rules_are_loaded() {
@@ -81,8 +81,7 @@ fn scoped_instruction_preflight_blocks_first_mutation_until_rules_are_loaded() {
                 std::slice::from_ref(&mutation),
                 false,
             );
-        let docs =
-            crate::ai::agents::load_scoped_project_instruction_docs_for_targets(&targets);
+        let docs = crate::ai::agents::load_scoped_project_instruction_docs_for_targets(&targets);
         let loaded = docs
             .iter()
             .map(|doc| {
@@ -168,8 +167,7 @@ fn compressed_read_result_is_not_used_as_duplicate_anchor() {
     ];
 
     assert!(
-        duplicate_read_only_call_ids_with_context(&messages, &turn_messages, &[current])
-            .is_empty()
+        duplicate_read_only_call_ids_with_context(&messages, &turn_messages, &[current]).is_empty()
     );
 }
 
@@ -197,8 +195,7 @@ fn suppression_result_does_not_form_an_indirect_anchor_chain() {
     ];
 
     assert!(
-        duplicate_read_only_call_ids_with_context(&messages, &turn_messages, &[current])
-            .is_empty()
+        duplicate_read_only_call_ids_with_context(&messages, &turn_messages, &[current]).is_empty()
     );
 }
 
@@ -458,7 +455,11 @@ fn mutable_disk_and_ipc_tools_are_not_replay_registered() {
     // read_file and provably read-only execute_command register as same-turn reusable
     // snapshots; mutating commands rejected by read_only_tool_signature's read-only
     // gate must still be really executed.
-    let read = test_tool_call("read", "read_file", serde_json::json!({ "file_path": "/tmp/a" }));
+    let read = test_tool_call(
+        "read",
+        "read_file",
+        serde_json::json!({ "file_path": "/tmp/a" }),
+    );
     assert!(read_only_tool_signature(&read).is_some());
     let ro_cmd = test_tool_call(
         "ro",

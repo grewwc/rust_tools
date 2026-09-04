@@ -120,7 +120,7 @@ Skills:
     ];
 
     let control_model = control_model_for_aux_tasks(app);
-        let mut request_body = build_request_body(
+    let mut request_body = build_request_body(
         &control_model,
         &messages,
         false,

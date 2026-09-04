@@ -225,17 +225,22 @@ impl SessionStore {
                 }
             });
         for (idx, (id, _path, file_modified)) in jobs.into_iter().enumerate() {
-            let (first_user_prompt, generated_title, last_activity_unix_ms, history_revision, marked) =
-                match metadata_results[idx].take() {
-                    Some(metadata) => (
-                        metadata.first_user_prompt,
-                        metadata.session_title,
-                        metadata.last_activity_unix_ms,
-                        metadata.history_revision,
-                        metadata.marked,
-                    ),
-                    None => (None, None, None, 0, false),
-                };
+            let (
+                first_user_prompt,
+                generated_title,
+                last_activity_unix_ms,
+                history_revision,
+                marked,
+            ) = match metadata_results[idx].take() {
+                Some(metadata) => (
+                    metadata.first_user_prompt,
+                    metadata.session_title,
+                    metadata.last_activity_unix_ms,
+                    metadata.history_revision,
+                    metadata.marked,
+                ),
+                None => (None, None, None, 0, false),
+            };
             // 新库使用事务内维护的逻辑活动时间；旧库由元数据读取层回退到最后一条
             // canonical message 的 created_at。只有无法读取逻辑时间时才使用主库 mtime。
             // 不能使用 -shm/-wal mtime：只读连接和 SQLite 内部维护也可能刷新它们。

@@ -211,10 +211,16 @@ pub(crate) fn materialize_references(
 /// escape the active session's assets directory.
 fn resolve_attachment_asset(root: Option<&Path>, asset: Option<&str>) -> std::io::Result<PathBuf> {
     let root = root.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "attachment assets are unavailable")
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "attachment assets are unavailable",
+        )
     })?;
     let asset = asset.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "attachment asset key is missing")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "attachment asset key is missing",
+        )
     })?;
     let relative = Path::new(asset);
     if relative.as_os_str().is_empty()
@@ -284,10 +290,7 @@ fn compact_json_char_len(value: &Value) -> usize {
             .unwrap_or(0),
         Value::String(text) => json_string_char_len(text),
         Value::Array(items) => {
-            2 + items
-                .iter()
-                .map(compact_json_char_len)
-                .sum::<usize>()
+            2 + items.iter().map(compact_json_char_len).sum::<usize>()
                 + items.len().saturating_sub(1)
         }
         Value::Object(map) => {
@@ -476,10 +479,15 @@ mod compact_json_char_len_tests {
         // escapes controls < 0x20 and emits everything else verbatim.
         for byte in 0u32..0x20 {
             let ch = char::from_u32(byte).expect("ASCII control char");
-            assert_eq!(json_string_char_len(&ch.to_string()), 2 + { match ch {
-                '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
-                _ => 6,
-            } });
+            assert_eq!(
+                json_string_char_len(&ch.to_string()),
+                2 + {
+                    match ch {
+                        '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+                        _ => 6,
+                    }
+                }
+            );
             assert_parity(&json!({ "k": ch.to_string() }));
         }
         for text in ["\"", "\\", "a\"b\\c", "\u{7f}", "中文", "🙂", "line\nbreak"] {

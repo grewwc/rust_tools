@@ -362,9 +362,9 @@ async fn tool_navigate(
             .await
             .map_err(|e| format!("wait_for_navigation failed: {e}"))?;
         if let Some(sel) = &wait_selector {
-            wait_for_selector(&s.page, sel, 30_000)
-                .await
-                .map_err(|e| format!("navigate 等待元素超时：{e}（可忽略后继续，用 wait_for 重试）"))?;
+            wait_for_selector(&s.page, sel, 30_000).await.map_err(|e| {
+                format!("navigate 等待元素超时：{e}（可忽略后继续，用 wait_for 重试）")
+            })?;
         }
         let title = s.page.get_title().await.ok().flatten().unwrap_or_default();
         let final_url = s.page.url().await.ok().flatten().unwrap_or(url.clone());

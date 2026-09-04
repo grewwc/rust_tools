@@ -1,11 +1,9 @@
 //! Session lifecycle and cleanup tests.
 
-use std::path::PathBuf;
 use serde_json::Value;
+use std::path::PathBuf;
 
-use super::super::history::{
-    Message, SessionStore, append_history_messages, build_message_arr,
-};
+use super::super::history::{Message, SessionStore, append_history_messages, build_message_arr};
 
 #[test]
 fn session_delete_cleans_up_overflow_history_file() {

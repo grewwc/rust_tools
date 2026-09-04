@@ -21,4 +21,3 @@ pub(crate) mod test_util;
 pub(crate) use request::RequestMiddleware;
 #[allow(unused_imports)]
 pub(crate) use tool::ToolMiddleware;
-

@@ -4,11 +4,13 @@ use serde_json::Value;
 
 use super::super::types::Message;
 use super::text_utils::{summarize_text, truncate_to_chars};
-use super::tool_overflow::{is_non_compressible_tool, is_preserved_tool_overflow_content, tool_line_signature};
 use super::tool_groups::recent_tool_group_message_indices;
+use super::tool_overflow::{
+    is_non_compressible_tool, is_preserved_tool_overflow_content, tool_line_signature,
+};
 use super::{
-    is_persisted_reasoning_replay, normalize_whitespace, tool_message_indices, value_to_string,
-    KEEP_RECENT_TOOL_GROUPS, KEEP_RECENT_TOOL_CALL_REASONING,
+    KEEP_RECENT_TOOL_CALL_REASONING, KEEP_RECENT_TOOL_GROUPS, is_persisted_reasoning_replay,
+    normalize_whitespace, tool_message_indices, value_to_string,
 };
 
 pub(super) fn dedup_adjacent(messages: &mut Vec<Message>) {
@@ -101,9 +103,9 @@ pub(super) fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
         .iter()
         .filter(|m| {
             m.role == "assistant"
-                && m.reasoning_content.as_deref().is_some_and(|reasoning| {
-                    !is_persisted_reasoning_replay(reasoning)
-                })
+                && m.reasoning_content
+                    .as_deref()
+                    .is_some_and(|reasoning| !is_persisted_reasoning_replay(reasoning))
                 && m.tool_calls.is_some()
         })
         .count();

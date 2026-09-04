@@ -207,7 +207,7 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
                     MutableMessageField::ToolArguments(call_index),
                     argument_chars - per_field_cap,
                     overflow_dir,
-                FieldArchivePolicy::BestEffort,
+                    FieldArchivePolicy::BestEffort,
                 );
             }
         }
@@ -294,7 +294,10 @@ pub(in crate::ai) fn is_context_overflow_truncated_tool_arguments(arguments: &st
         })
 }
 
-pub(in crate::ai) fn build_context_overflow_tool_arguments_pointer(arguments: &str, target: usize) -> Option<String> {
+pub(in crate::ai) fn build_context_overflow_tool_arguments_pointer(
+    arguments: &str,
+    target: usize,
+) -> Option<String> {
     let value = serde_json::from_str::<Value>(arguments).ok()?;
     if value
         .get("_context_overflow_truncated")

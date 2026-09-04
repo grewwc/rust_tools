@@ -3,8 +3,8 @@
 //! + 进程内互斥锁，避免并发读写撕裂状态文件。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
@@ -14,7 +14,6 @@ use crate::ai::types::App;
 use super::model::{PlanState, StepStatus, StepTransition};
 
 pub(crate) const PLAN_STATE_FILE_NAME: &str = "plan-state.json";
-
 
 /// 会话内活跃计划的持久化路径（位于 session assets 根下）。
 pub(crate) fn plan_state_path(app: &App) -> PathBuf {
@@ -57,7 +56,8 @@ pub(crate) fn save_plan_state(app: &App, state: &PlanState) -> Result<(), String
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let bytes = serde_json::to_vec_pretty(state).map_err(|e| format!("serialize plan-state: {e}"))?;
+    let bytes =
+        serde_json::to_vec_pretty(state).map_err(|e| format!("serialize plan-state: {e}"))?;
     if let Err(e) = std::fs::write(&tmp, &bytes) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("write plan state {}: {e}", path.display()));
@@ -69,7 +69,11 @@ pub(crate) fn save_plan_state(app: &App, state: &PlanState) -> Result<(), String
     Ok(())
 }
 
-pub(crate) fn record_plan(app: &App, summary: &str, raw_steps: &[Value]) -> Result<PlanState, String> {
+pub(crate) fn record_plan(
+    app: &App,
+    summary: &str,
+    raw_steps: &[Value],
+) -> Result<PlanState, String> {
     let _guard = PLAN_LOCK
         .lock()
         .map_err(|_| "plan-state lock poisoned".to_string())?;
@@ -101,4 +105,3 @@ pub(crate) fn update_plan_step(
     save_plan_state(app, &state)?;
     Ok((state, transition))
 }
-

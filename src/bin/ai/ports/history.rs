@@ -4,7 +4,10 @@
 // Previously the driver called concrete functions in `crate::ai::history::{blob, sqlite::*}`
 // directly, making it impossible to insert cross-cutting logic such as audit/encryption/mock.
 // Decoupled via a trait now; the driver depends only on the abstraction.
-use std::{io, path::{Path, PathBuf}};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use crate::ai::history::Message;
 
@@ -34,19 +37,30 @@ impl Compressor for DefaultCompressor {
         // Forward to the existing compression logic (summary_max_chars=0, no overflow archiving),
         // keeping semantics identical to the hardcoded path; the full path is still owned by
         // HistoryStore::build_context, with zero behavior change.
-        crate::ai::history::compress_messages_for_context(messages, max_chars, keep_last, 0, None, None)
+        crate::ai::history::compress_messages_for_context(
+            messages, max_chars, keep_last, 0, None, None,
+        )
     }
-    fn name(&self) -> &str { "default" }
+    fn name(&self) -> &str {
+        "default"
+    }
 }
 
 /// No-op compressor: returns messages as-is without trimming or summarizing, used in tests or to
 /// disable compression.
 pub(crate) struct NoopCompressor;
 impl Compressor for NoopCompressor {
-    fn compress(&self, messages: Vec<Message>, _max_chars: usize, _keep_last: usize) -> Vec<Message> {
+    fn compress(
+        &self,
+        messages: Vec<Message>,
+        _max_chars: usize,
+        _keep_last: usize,
+    ) -> Vec<Message> {
         messages
     }
-    fn name(&self) -> &str { "noop" }
+    fn name(&self) -> &str {
+        "noop"
+    }
 }
 
 /// History storage port: object-safe, minimal, and does not leak SQLite/text dual-backend

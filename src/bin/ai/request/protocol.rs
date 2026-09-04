@@ -43,8 +43,7 @@ pub(crate) fn build_http_body_for_request(
 ) -> Vec<u8> {
     // Step 4: provider differences converge into the Adapter hook -- fired uniformly on every
     // request path before serialization.
-    crate::ai::provider::adapter_for(models::model_adapter(model), endpoint)
-        .adapt_request(request);
+    crate::ai::provider::adapter_for(models::model_adapter(model), endpoint).adapt_request(request);
     models::request_protocol_dialect(model, endpoint).build_http_body(request)
 }
 

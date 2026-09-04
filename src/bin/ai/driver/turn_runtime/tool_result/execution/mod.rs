@@ -54,29 +54,28 @@ pub(super) use crate::ai::driver::print::{
 };
 pub(super) use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
-
-mod prepare;
-mod rejection;
 mod audit_evidence;
 mod completion_gate;
+mod evidence_status;
 mod final_citations;
 mod final_recovery;
-mod patch_retry;
-mod output_format;
-mod observer;
-mod round;
 mod followup;
 mod iteration;
-mod evidence_status;
+mod observer;
+mod output_format;
+mod patch_retry;
+mod prepare;
+mod rejection;
+mod round;
 
-pub(in crate::ai::driver) use patch_retry::stale_patch_targets_from_messages;
 pub(in crate::ai::driver::turn_runtime) use completion_gate::{
     completion_evidence_state, completion_tool_result_succeeded,
     tool_call_is_successful_mutation_candidate,
 };
-pub(in crate::ai::driver::turn_runtime) use iteration::handle_iteration_execution_for_model;
-pub(in crate::ai::driver::turn_runtime) use prepare::prepare_recent_tool_result;
 pub(in crate::ai::driver::turn_runtime) use evidence_status::annotate_tool_result_evidence_status;
+pub(in crate::ai::driver::turn_runtime) use iteration::handle_iteration_execution_for_model;
+pub(in crate::ai::driver) use patch_retry::stale_patch_targets_from_messages;
+pub(in crate::ai::driver::turn_runtime) use prepare::prepare_recent_tool_result;
 
 // Flat-namespace re-exports over the cluster modules: child clusters resolve
 // sibling items through `use super::*` and callers outside `execution/` keep

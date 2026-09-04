@@ -223,9 +223,7 @@ impl SkillTurnGuard {
                          section as the primary behavior contract for this turn.",
                     );
                 } else {
-                    pointer.push_str(
-                        "Active skills at turn start (in activation order):\n",
-                    );
+                    pointer.push_str("Active skills at turn start (in activation order):\n");
                     for (i, name) in self.matched_skill_names.iter().enumerate() {
                         use std::fmt::Write;
                         let _ = writeln!(pointer, "  {}. {}", i + 1, name);
@@ -237,7 +235,10 @@ impl SkillTurnGuard {
                          always take precedence.",
                     );
                 }
-                parts.push(format!("<system-reminder>\n{}\n</system-reminder>", pointer));
+                parts.push(format!(
+                    "<system-reminder>\n{}\n</system-reminder>",
+                    pointer
+                ));
             }
             if let Some(rest) = self.builder.render_context_reminder() {
                 parts.push(rest);
@@ -485,10 +486,7 @@ fn is_executor_skill(skills: &[&SkillManifest]) -> bool {
 /// demand via enable_tools" hint for turns whose resident tool set had the
 /// heavy execution primitives deferred out by `manifest_tool_definitions`, so
 /// read-only agents (plan / explore) never get irrelevant process/IPC hints.
-fn declares_hidden_group(
-    skills: &[&SkillManifest],
-    active_agent: Option<&AgentManifest>,
-) -> bool {
+fn declares_hidden_group(skills: &[&SkillManifest], active_agent: Option<&AgentManifest>) -> bool {
     skills
         .iter()
         .any(|s| manifest_declares_hidden_group(&s.tool_groups))
@@ -983,7 +981,11 @@ fn push_project_context(builder: &mut SystemPromptBuilder) {
 /// Session context: tells the model the current session and its data layout, so that in any project
 /// (even directories unrelated to rust_tools) it can locate and debug sessionid problems and
 /// interact read-only with a given session's content. The model is read-only: no writing, modifying, or deleting session data.
-fn session_context_prompt(session_id: &str, session_history_file: &Path, history_file: &Path) -> String {
+fn session_context_prompt(
+    session_id: &str,
+    session_history_file: &Path,
+    history_file: &Path,
+) -> String {
     let sessions_root = crate::ai::history::SessionStore::new(history_file)
         .sessions_root()
         .display()
@@ -1084,9 +1086,8 @@ fn build_system_prompt(
                 use std::fmt::Write;
                 let _ = writeln!(header, "  {}. {}", i + 1, skill.name);
             }
-            header.push_str(
-                "No active skill overrides another; guardrails always take precedence.",
-            );
+            header
+                .push_str("No active skill overrides another; guardrails always take precedence.");
             header
         };
         s.push_str("\n\n<skill_instructions>\n");
@@ -1294,9 +1295,7 @@ fn build_system_prompt(
                 "After assessing the task, proactively call `list_skills` only for a concrete, genuinely specialized need for domain context, an established workflow, bundled resources, or dedicated tools. Call it only when you do not know which skill is available."
                     .to_string(),
             );
-            discovery_lines.push(
-                "Do not browse skills as a routine opening step.".to_string(),
-            );
+            discovery_lines.push("Do not browse skills as a routine opening step.".to_string());
             discovery_lines.push(
                 "A routine source-code, repository, file, or terminal investigation—or technical keywords alone—is not evidence that a skill is needed."
                     .to_string(),
@@ -1441,8 +1440,7 @@ fn build_system_prompt(
         );
     }
 
-    if has_tool(available_tools, "knowledge_search")
-        || has_tool(available_tools, "knowledge_list")
+    if has_tool(available_tools, "knowledge_search") || has_tool(available_tools, "knowledge_list")
     {
         let mut lines = Vec::new();
         let search_tools = available_tool_names_in_order(available_tools, &["knowledge_search"]);
@@ -1529,8 +1527,8 @@ fn build_skill_turn_guard(
     super::super::tools::enable_tools::set_available_mcp_tools(all_mcp_tools.clone());
     let matched_skill_names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
     let active_agent = app.current_agent_manifest.clone();
-    let executor_active = is_executor_skill(skills)
-        || active_agent.as_ref().is_some_and(is_executor_agent);
+    let executor_active =
+        is_executor_skill(skills) || active_agent.as_ref().is_some_and(is_executor_agent);
     // Record whether the current turn declares a hidden-gating group into
     // enable_tools' turn-level state, so the heavy execution primitives stay
     // out of the enable catalog for agents that do not declare one (same
@@ -1581,7 +1579,11 @@ fn build_skill_turn_guard(
     builder.push_labeled(
         ContextKind::Behavior,
         "session_context",
-        session_context_prompt(&app.session_id, &app.session_history_file, &app.config.history_file),
+        session_context_prompt(
+            &app.session_id,
+            &app.session_history_file,
+            &app.config.history_file,
+        ),
     );
     if let Ok(events) = history::read_skill_activation_events_sqlite(&app.session_history_file)
         && let Some(reminder) = build_skill_activation_history_reminder(&events)
@@ -1821,4 +1823,3 @@ pub(super) fn prepare_skill_for_turn(
 #[cfg(test)]
 #[path = "skill_runtime_tests.rs"]
 mod tests;
-

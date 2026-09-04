@@ -501,7 +501,10 @@ pub(crate) fn is_prune_protocol_message(message: &Message) -> bool {
 /// Listing exact ids is the main fix for the earlier static-prompt version,
 /// where the model had to recall `tool_call_id`s from history and rarely
 /// emitted valid marks.
-fn build_prune_protocol_prompt(messages: &[Message], prune_marks: &FxHashMap<String, u8>) -> String {
+fn build_prune_protocol_prompt(
+    messages: &[Message],
+    prune_marks: &FxHashMap<String, u8>,
+) -> String {
     let active_ids = active_prunable_tool_ids(messages);
     if active_ids.is_empty() {
         return PRUNE_PROTOCOL_PROMPT.to_string();
@@ -515,15 +518,19 @@ fn build_prune_protocol_prompt(messages: &[Message], prune_marks: &FxHashMap<Str
                 return None;
             }
             let chars = message.content.as_str()?.chars().count();
-            let tool = id_to_tool_name.get(id).map(String::as_str).unwrap_or("tool");
+            let tool = id_to_tool_name
+                .get(id)
+                .map(String::as_str)
+                .unwrap_or("tool");
             Some((id.clone(), tool, chars))
         })
         .collect();
     // Largest first (most context freed); tie-break by id for determinism.
     candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
-    let mut section =
-        String::from("\n### Prunable candidates in this request (id · tool · size · marks/threshold)\n");
+    let mut section = String::from(
+        "\n### Prunable candidates in this request (id · tool · size · marks/threshold)\n",
+    );
     for (id, tool, chars) in candidates.iter().take(PRUNE_PROMPT_MAX_CANDIDATES) {
         let count = prune_marks.get(id).copied().unwrap_or(0);
         section.push_str(&format!(
@@ -533,7 +540,9 @@ fn build_prune_protocol_prompt(messages: &[Message], prune_marks: &FxHashMap<Str
     }
     let hidden = candidates.len().saturating_sub(PRUNE_PROMPT_MAX_CANDIDATES);
     if hidden > 0 {
-        section.push_str(&format!("(+{hidden} more eligible candidates not listed)\n"));
+        section.push_str(&format!(
+            "(+{hidden} more eligible candidates not listed)\n"
+        ));
     }
 
     let mut prompt = PRUNE_PROTOCOL_PROMPT.to_string();
@@ -1180,11 +1189,20 @@ mod tests {
             messages.push(make_tool_message(&id, &"recent result ".repeat(500)));
         }
 
-        assert!(!ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
+        assert!(!ensure_prune_protocol_prompt(
+            &mut messages,
+            &FxHashMap::default()
+        ));
         messages.push(make_assistant_tool_call("call_4", "execute_command"));
         messages.push(make_tool_message("call_4", &"newest result ".repeat(500)));
-        assert!(ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
-        assert!(!ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
+        assert!(ensure_prune_protocol_prompt(
+            &mut messages,
+            &FxHashMap::default()
+        ));
+        assert!(!ensure_prune_protocol_prompt(
+            &mut messages,
+            &FxHashMap::default()
+        ));
         assert_eq!(
             messages
                 .iter()
@@ -1394,7 +1412,10 @@ mod tests {
             messages.push(make_assistant_tool_call(&id, "execute_command"));
             messages.push(make_tool_message(&id, "recent result"));
         }
-        assert!(ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
+        assert!(ensure_prune_protocol_prompt(
+            &mut messages,
+            &FxHashMap::default()
+        ));
 
         let prompt_before = messages
             .iter()
@@ -1438,7 +1459,10 @@ mod tests {
             messages.push(make_assistant_tool_call(&id, "execute_command"));
             messages.push(make_tool_message(&id, "recent result"));
         }
-        assert!(ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
+        assert!(ensure_prune_protocol_prompt(
+            &mut messages,
+            &FxHashMap::default()
+        ));
         assert_eq!(
             messages
                 .iter()
@@ -1451,7 +1475,10 @@ mod tests {
         // rewritten), so no prunable candidate remains. The stale protocol
         // message must be removed, not left behind with an outdated list.
         messages.retain(|message| message.tool_call_id.as_deref() != Some("call_old"));
-        assert!(!ensure_prune_protocol_prompt(&mut messages, &FxHashMap::default()));
+        assert!(!ensure_prune_protocol_prompt(
+            &mut messages,
+            &FxHashMap::default()
+        ));
         assert_eq!(
             messages
                 .iter()
@@ -1494,7 +1521,10 @@ mod tests {
             .find(|message| message.tool_call_id.as_deref() == Some("call_huge"))
             .and_then(|message| message.content.as_str())
             .expect("huge result stays in place");
-        assert!(huge_content.contains("file_path:"), "offloaded to a recall stub");
+        assert!(
+            huge_content.contains("file_path:"),
+            "offloaded to a recall stub"
+        );
         let small_content = messages
             .iter()
             .find(|message| message.tool_call_id.as_deref() == Some("call_small"))

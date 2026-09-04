@@ -1190,16 +1190,16 @@ impl LocalOS {
 
 impl Kernel for LocalOS {}
 
-mod syscall;
-mod kernel_internal;
-mod futex;
-mod trace;
-mod rlimit;
-mod llm;
-mod vfs;
 mod daemon;
-mod ipc;
 mod epoll;
+mod futex;
+mod ipc;
+mod kernel_internal;
+mod llm;
+mod rlimit;
+mod syscall;
+mod trace;
+mod vfs;
 
 #[cfg(test)]
 mod tests;

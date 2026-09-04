@@ -8,15 +8,16 @@ use std::time::{Duration, Instant};
 #[ignore = "requires bytedcli installed; run explicitly: cargo test --test e2e_pty_stall_check -- --ignored"]
 fn real_bytedcli_login_hang_is_stall_killed() {
     let started = Instant::now();
-    let result = rust_tools::cmd::run::run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal(
-        "bytedcli auth login --session 2>&1 | tail -15",
-        rust_tools::cmd::run::RunCmdOptions::default(),
-        Duration::from_secs(120),
-        |_| {},
-        || false,
-        |_| {},
-    )
-    .expect("PTY command should run");
+    let result =
+        rust_tools::cmd::run::run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal(
+            "bytedcli auth login --session 2>&1 | tail -15",
+            rust_tools::cmd::run::RunCmdOptions::default(),
+            Duration::from_secs(120),
+            |_| {},
+            || false,
+            |_| {},
+        )
+        .expect("PTY command should run");
 
     let elapsed = started.elapsed();
     eprintln!("elapsed={elapsed:?} result={result:?}");
@@ -36,15 +37,16 @@ fn real_bytedcli_login_hang_is_stall_killed() {
 fn real_bytedcli_login_without_pipe_captures_qr_then_stalls() {
     // Without a pipe, part of the QR-code output should still get captured
     // (stall detection is based on "silence following output").
-    let result = rust_tools::cmd::run::run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal(
-        "bytedcli auth login --session",
-        rust_tools::cmd::run::RunCmdOptions::default(),
-        Duration::from_secs(120),
-        |_| {},
-        || false,
-        |_| {},
-    )
-    .expect("PTY command should run");
+    let result =
+        rust_tools::cmd::run::run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal(
+            "bytedcli auth login --session",
+            rust_tools::cmd::run::RunCmdOptions::default(),
+            Duration::from_secs(120),
+            |_| {},
+            || false,
+            |_| {},
+        )
+        .expect("PTY command should run");
 
     let out = String::from_utf8_lossy(&result.stdout);
     eprintln!("stalled={} out_bytes={}", result.stalled, out.len());

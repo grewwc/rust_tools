@@ -200,10 +200,7 @@ fn grouped_changes(entries: &[MutationEntry]) -> Vec<FileChange> {
 /// not truncated). Diffing truncated snapshots misreads the truncation edge as
 /// a deletion (false deletion); in that case the authoritative diff recorded at
 /// write time is used instead.
-pub(crate) fn snapshots_full(
-    before_first: &Option<String>,
-    after_last: &Option<String>,
-) -> bool {
+pub(crate) fn snapshots_full(before_first: &Option<String>, after_last: &Option<String>) -> bool {
     match (before_first, after_last) {
         (Some(b), Some(a)) => !is_capped(b) && !is_capped(a),
         (Some(b), None) => !is_capped(b),
@@ -218,14 +215,22 @@ pub(crate) fn snapshots_full(
 /// never rendered as a deletion.
 fn file_snippet(g: &FileChange, max_lines: usize) -> Option<String> {
     if snapshots_full(&g.before_first, &g.after_last) {
-        return diff_snippet(g.before_first.as_deref(), g.after_last.as_deref(), max_lines);
+        return diff_snippet(
+            g.before_first.as_deref(),
+            g.after_last.as_deref(),
+            max_lines,
+        );
     }
     if !g.diffs.is_empty() {
         return diff_block_from_lines(&g.diffs.join(""), max_lines);
     }
     // Old logs (no diff field) with truncated snapshots: fall back to a snapshot
     // diff (possibly distorted, but better than no information).
-    diff_snippet(g.before_first.as_deref(), g.after_last.as_deref(), max_lines)
+    diff_snippet(
+        g.before_first.as_deref(),
+        g.after_last.as_deref(),
+        max_lines,
+    )
 }
 
 /// Renders stored `- `/`+ ` lines as a ```diff block, capped at max_lines with a
@@ -365,9 +370,7 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
                         }
                         used_diff = true;
                     }
-                    if !used_diff
-                        && let Some(before) = g.before_first.as_deref()
-                    {
+                    if !used_diff && let Some(before) = g.before_first.as_deref() {
                         for line in before.lines() {
                             out.push_str(&format!("-{line}\n"));
                         }
@@ -388,11 +391,9 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
                     if !body.ends_with('\n') {
                         out.push('\n');
                     }
-                } else if let Some(snippet) = diff_snippet(
-                    g.before_first.as_deref(),
-                    g.after_last.as_deref(),
-                    200,
-                ) {
+                } else if let Some(snippet) =
+                    diff_snippet(g.before_first.as_deref(), g.after_last.as_deref(), 200)
+                {
                     // 去掉 ```diff 围栏，仅保留差异行
                     for line in snippet.lines() {
                         if line.starts_with("```") || line.starts_with("（差异") {
@@ -418,7 +419,11 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
         }
         out.push('\n');
     }
-    if out.trim().is_empty() { None } else { Some(out) }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// 联合 patch：优先 mutation 派生，否则回退到 `git diff HEAD`。
@@ -449,7 +454,8 @@ pub fn combined_patch() -> Option<String> {
 /// 将联合 patch 落盘到 `session_assets/changes.patch`（无活动会话时回退到系统
 /// 临时目录 `changes.<pid>.patch`），返回绝对路径。
 pub fn write_combined_patch() -> Result<PathBuf, String> {
-    let patch = combined_patch().ok_or_else(|| "当前会话无可导出的变更（无 mutation log 且 git 无差异）".to_string())?;
+    let patch = combined_patch()
+        .ok_or_else(|| "当前会话无可导出的变更（无 mutation log 且 git 无差异）".to_string())?;
     // 优先写入 <session_assets>/changes.patch；无活动会话（one-shot / 测试）时
     // 回退到 runtime_ctx::temp_dir()（`<tmp>/.agent_tmp/default/`），保证
     // `/changes --open` 在非交互式调用下也能生成 patch 并打开。
@@ -490,9 +496,8 @@ pub fn format_session_summary_with_git(include_git_extra: bool) -> String {
     let grouped = grouped_changes(&entries);
     let cwd = cwd_for_display();
     let log_path = crate::ai::tools::storage::mutation_log::log_path();
-    let mut out = String::from(
-        "以下是本会话通过 write_file / apply_patch 改动的文件（按首次改动顺序）。\n",
-    );
+    let mut out =
+        String::from("以下是本会话通过 write_file / apply_patch 改动的文件（按首次改动顺序）。\n");
     const CAP: usize = 14_000;
     let mut truncated = false;
     for (i, g) in grouped.iter().enumerate() {
@@ -532,7 +537,8 @@ pub fn format_session_summary_with_git(include_git_extra: bool) -> String {
                 let status = git_output(&cwd, &["status", "--porcelain=v1"]).unwrap_or_default();
                 if !status.trim().is_empty() {
                     // 统计 git 中未被 mutation 覆盖的文件数（简单提示）
-                    let git_files: Vec<&str> = status.lines().filter(|l| !l.trim().is_empty()).collect();
+                    let git_files: Vec<&str> =
+                        status.lines().filter(|l| !l.trim().is_empty()).collect();
                     let git_extra = git_files.len().saturating_sub(grouped.len());
                     if git_extra > 0 {
                         out.push_str(&format!(
@@ -571,7 +577,9 @@ fn fallback_git_summary() -> String {
             "## git diff HEAD --stat\n（完整 diff 超过 {MAX_DIFF_BYTES} 字节，仅展示统计）\n{stat}"
         ));
     }
-    let mut out = String::from("（本会话无工具级 mutation log，以下为工作区未提交改动，可能含并发需求的改动）\n\n");
+    let mut out = String::from(
+        "（本会话无工具级 mutation log，以下为工作区未提交改动，可能含并发需求的改动）\n\n",
+    );
     out.push_str(&sections.join("\n\n"));
     out
 }
@@ -634,12 +642,21 @@ fn open_with_vscode(patch_path: &Path, cwd: &Path) -> Result<String, String> {
         let g = &grouped[0];
         // 为 before/after 创建临时文件供 code --diff 使用
         // 与 service::changes::try_open_single_file_diff 保持一致：优先会话临时目录，避免直写系统 /tmp 越界
-        let tmp = crate::ai::driver::runtime_ctx::temp_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let tmp =
+            crate::ai::driver::runtime_ctx::temp_dir().unwrap_or_else(|_| std::env::temp_dir());
         let before_path = tmp.join(format!("a_changes_before_{}", sanitize_filename(&g.rel)));
         let after_path = tmp.join(format!("a_changes_after_{}", sanitize_filename(&g.rel)));
         // best-effort 写入，不影响主流程：失败则回退到直接打开 patch
-        let before_ok = g.before_first.as_deref().map(|c| std::fs::write(&before_path, c).is_ok()).unwrap_or(true);
-        let after_ok = g.after_last.as_deref().map(|c| std::fs::write(&after_path, c).is_ok()).unwrap_or(true);
+        let before_ok = g
+            .before_first
+            .as_deref()
+            .map(|c| std::fs::write(&before_path, c).is_ok())
+            .unwrap_or(true);
+        let after_ok = g
+            .after_last
+            .as_deref()
+            .map(|c| std::fs::write(&after_path, c).is_ok())
+            .unwrap_or(true);
         // Truncated snapshots are not the full file, so code --diff would show a
         // wrong comparison; fall back to opening the patch instead (the patch is
         // built from the authoritative diff recorded at write time).
@@ -654,7 +671,13 @@ fn open_with_vscode(patch_path: &Path, cwd: &Path) -> Result<String, String> {
                 .stderr(std::process::Stdio::null());
             // 若在无窗口环境 code 不存在，会在 spawn 阶段失败
             match cmd.spawn() {
-                Ok(_) => return Ok(format!("code --diff {} {}", before_path.display(), after_path.display())),
+                Ok(_) => {
+                    return Ok(format!(
+                        "code --diff {} {}",
+                        before_path.display(),
+                        after_path.display()
+                    ));
+                }
                 Err(e) => return Err(format!("code --diff 失败: {e}")),
             }
         }
@@ -662,7 +685,8 @@ fn open_with_vscode(patch_path: &Path, cwd: &Path) -> Result<String, String> {
     // 回退：直接用 code 打开 patch 文件
     let mut cmd = Command::new("code");
     cmd.arg(patch_path).current_dir(cwd);
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     cmd.spawn()
         .map(|_| format!("code {}", patch_path.display()))
         .map_err(|e| format!("code 打开失败: {e}"))
@@ -828,7 +852,10 @@ mod tests {
             Ok(path) => {
                 let s = path.to_string_lossy();
                 assert!(s.contains(".agent_tmp"), "应回退到系统临时目录: {s}");
-                assert!(s.ends_with(&format!("changes.{}.patch", std::process::id())), "路径应含 pid: {s}");
+                assert!(
+                    s.ends_with(&format!("changes.{}.patch", std::process::id())),
+                    "路径应含 pid: {s}"
+                );
                 assert!(path.exists(), "patch 文件应已写入: {s}");
                 let _ = std::fs::remove_file(&path);
             }
@@ -866,7 +893,10 @@ mod tests {
         let after2 = after.replace("TO_BE_ADDED", "TO_BE_ADDED_V2");
         // Snapshots exceed the 16KiB cap → truncated; the authoritative diff still
         // pinpoints the changed lines.
-        assert!(before.len() > 16 * 1024, "test fixture must exceed the snapshot cap");
+        assert!(
+            before.len() > 16 * 1024,
+            "test fixture must exceed the snapshot cap"
+        );
         let entries = vec![
             MutationEntry {
                 seq: 0,
@@ -890,7 +920,11 @@ mod tests {
         let grouped = grouped_changes(&entries);
         assert_eq!(grouped.len(), 1);
         let g = &grouped[0];
-        assert_eq!(g.diffs.len(), 2, "authoritative diffs of both writes must be collected");
+        assert_eq!(
+            g.diffs.len(),
+            2,
+            "authoritative diffs of both writes must be collected"
+        );
         assert!(!snapshots_full(&g.before_first, &g.after_last));
         let snippet = file_snippet(g, 30).unwrap();
         assert!(snippet.contains("- TO_BE_REMOVED"), "snippet: {snippet}");
@@ -920,7 +954,10 @@ mod tests {
             v1.push_str(&format!("content line {i}\n"));
         }
         let v2 = format!("{v1}extra line at end\n");
-        assert!(v1.len() > 16 * 1024, "test fixture must exceed the snapshot cap");
+        assert!(
+            v1.len() > 16 * 1024,
+            "test fixture must exceed the snapshot cap"
+        );
         let entries = vec![
             MutationEntry {
                 seq: 0,
@@ -961,7 +998,10 @@ mod tests {
                 break;
             }
         }
-        assert!(!had_deletion, "created patch must not contain deletion lines:\n{patch}");
+        assert!(
+            !had_deletion,
+            "created patch must not contain deletion lines:\n{patch}"
+        );
         // Creation content must still be present (from the final snapshot dump).
         assert!(patch.contains("+content line 0"), "patch: {patch}");
         // The second write's change sits past the 16KiB snapshot cap, so it is
@@ -983,7 +1023,10 @@ mod tests {
         for i in 0..3000 {
             before.push_str(&format!("content line {i}\n"));
         }
-        assert!(before.len() > 16 * 1024, "test fixture must exceed the snapshot cap");
+        assert!(
+            before.len() > 16 * 1024,
+            "test fixture must exceed the snapshot cap"
+        );
         let entries = vec![MutationEntry {
             seq: 0,
             ts: "t".into(),
@@ -1017,6 +1060,9 @@ mod tests {
                 break;
             }
         }
-        assert!(!had_addition, "deleted patch must not contain addition lines:\n{patch}");
+        assert!(
+            !had_addition,
+            "deleted patch must not contain addition lines:\n{patch}"
+        );
     }
 }

@@ -21,10 +21,11 @@ pub(super) const MUTATION_TOOL_NAMES: &[&str] = &[
     "execute_command",
 ];
 
-
 /// 提取最近一轮 assistant 消息中的 (tool_name, args_json) 签名集合。
 /// 任何一个签名与窗口内某轮完全一致即认为有循环倾向。
-pub(super) fn extract_round_tool_signatures(messages: &[crate::ai::history::Message]) -> Option<Vec<String>> {
+pub(super) fn extract_round_tool_signatures(
+    messages: &[crate::ai::history::Message],
+) -> Option<Vec<String>> {
     extract_round_tool_signatures_inner(messages, false)
 }
 

@@ -6,10 +6,10 @@
 // abstractions so middleware can be inserted easily.
 
 pub(crate) mod context;
-pub(crate) mod stage;
 pub(crate) mod hook;
-pub(crate) mod turn_pipeline;
+pub(crate) mod stage;
 pub(crate) mod stages;
+pub(crate) mod turn_pipeline;
 
 #[allow(unused_imports)]
 pub(crate) use stages::{CompressStage, DecodeStage};
@@ -17,8 +17,8 @@ pub(crate) use stages::{CompressStage, DecodeStage};
 #[allow(unused_imports)]
 pub(crate) use context::{PipelineContext, StageKind};
 #[allow(unused_imports)]
-pub(crate) use stage::{BoxStage, Pipeline, Stage};
+pub(crate) use hook::{HookEntry, HookFn, HookRegistry};
 #[allow(unused_imports)]
-pub(crate) use hook::{HookRegistry, HookEntry, HookFn};
+pub(crate) use stage::{BoxStage, Pipeline, Stage};
 #[allow(unused_imports)]
 pub(crate) use turn_pipeline::{DefaultTurnPipeline, TurnPipeline};

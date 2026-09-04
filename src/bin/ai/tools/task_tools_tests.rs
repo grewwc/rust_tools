@@ -4,16 +4,14 @@ use super::{
     StoredTaskResult, TASK_REGISTRY, TASK_RETRY_REGISTRY, TASK_WAIT_NOOP_COUNTS, WaitManySource,
     append_current_process_cancel_source, build_outstanding_task_anchor,
     build_selection_explanation, bump_task_wait_noop_count, capped_subagent_manifest,
-    discard_tasks_for_session,
-    encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels, execute_task_cancel,
-    execute_task_integrate, execute_task_retry, execute_task_spawn, execute_task_spawn_batch,
-    execute_task_status, execute_task_wait, expire_task_wait_states_for_test,
-    format_task_result_with_id, insert_task_entry_for_test, is_encoded_task_goal,
-    is_retryable_task_status, parse_task_wait_options, prepare_subagent_task,
+    discard_tasks_for_session, encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels,
+    execute_task_cancel, execute_task_integrate, execute_task_retry, execute_task_spawn,
+    execute_task_spawn_batch, execute_task_status, execute_task_wait,
+    expire_task_wait_states_for_test, format_task_result_with_id, insert_task_entry_for_test,
+    is_encoded_task_goal, is_retryable_task_status, parse_task_wait_options, prepare_subagent_task,
     reap_timed_out_subagents, record_subagent_progress_update, register_retry_spec,
     remove_task_entry, render_outstanding_task_anchor, reset_task_wait_noop_counts_for_test,
-    select_subagent,
-    task_wait_key, task_wait_state_count_for_test, validate_subagent_response,
+    select_subagent, task_wait_key, task_wait_state_count_for_test, validate_subagent_response,
     wait_sources_for_channel_and_futex, wake_expired_task_waits, with_task_entry_by_pid,
     wrap_subagent_prompt,
 };
@@ -2431,7 +2429,10 @@ fn subagent_progress_update_never_wakes_parked_parent() {
             .get_process(owner_pid)
             .expect("owner process should still exist");
         assert!(
-            matches!(proc.state, aios_kernel::kernel::ProcessState::Waiting { .. }),
+            matches!(
+                proc.state,
+                aios_kernel::kernel::ProcessState::Waiting { .. }
+            ),
             "progress update must NOT flip a parked parent to Ready (was {:?})",
             proc.state
         );

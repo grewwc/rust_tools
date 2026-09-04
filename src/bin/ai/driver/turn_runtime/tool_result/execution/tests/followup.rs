@@ -1,7 +1,7 @@
 //! Tests for the `followup` cluster.
 
-use super::common::*;
 use super::super::*;
+use super::common::*;
 
 #[test]
 fn runtime_synthetic_user_unintegrated_task_evidence_keeps_provenance() {
@@ -82,8 +82,7 @@ fn final_response_reopens_until_delivered_task_is_integrated() {
     )
     .unwrap();
 
-    let shared_mcp =
-        std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
     let mut messages = Vec::new();
     let mut turn_messages = Vec::new();
     let mut persisted_turn_messages = 0usize;
@@ -218,8 +217,7 @@ fn final_response_with_outstanding_subagent_task_reopens_turn_and_clears_no_tool
         },
     );
 
-    let shared_mcp =
-        std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
     let mut messages = vec![Message {
         role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(no_tool_handoff_note().to_string()),
@@ -342,8 +340,7 @@ fn final_response_at_iteration_ceiling_finishes_despite_outstanding_task() {
         },
     );
 
-    let shared_mcp =
-        std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
     let mut messages = Vec::new();
     let mut turn_messages = Vec::new();
     let mut persisted_turn_messages = 0usize;
@@ -465,15 +462,19 @@ fn truncated_response_retries_and_injects_shrink_note() {
     assert!(!final_assistant_recorded);
     // Partial visible text is preserved as assistant context.
     assert!(
-        messages.iter().any(|m| m.role == "assistant"
-            && m.content.as_str() == Some("现在让我来编写一个综合脚本"))
+        messages
+            .iter()
+            .any(|m| m.role == "assistant"
+                && m.content.as_str() == Some("现在让我来编写一个综合脚本"))
     );
     // Partial text must not be written to the persisted turn_messages track — with
     // consecutive truncations, multiple large half-finished texts would pollute the
     // history file and cause the next turn's normal history to be compressed away.
     assert!(
-        !turn_messages.iter().any(|m| m.role == "assistant"
-            && m.content.as_str() == Some("现在让我来编写一个综合脚本")),
+        !turn_messages
+            .iter()
+            .any(|m| m.role == "assistant"
+                && m.content.as_str() == Some("现在让我来编写一个综合脚本")),
         "partial text must not leak into turn_messages (persistence track)"
     );
     // A shrink-and-rewrite hint was injected.
@@ -654,8 +655,7 @@ fn runtime_synthetic_user_auto_image_followup_is_multimodal() {
 
     let mut messages = Vec::new();
     let mut turn_messages = Vec::new();
-    let shared_mcp =
-        std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
     append_auto_image_followup_message(
         &app,
         "describe the file",

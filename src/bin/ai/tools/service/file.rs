@@ -689,19 +689,27 @@ mod tests {
         let idx = output.find(marker).expect("mid-line continue present");
         let rest = &output[idx + marker.len()..];
         // Note format: {offset}, char_offset={char_offset}, limit=1.
-        let offset_digits = rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
+        let offset_digits = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>();
         let continue_offset: usize = offset_digits.parse().expect("offset is a number");
         let char_marker = "char_offset=";
-        let char_idx =
-            rest.find(char_marker).expect("char_offset present") + char_marker.len();
+        let char_idx = rest.find(char_marker).expect("char_offset present") + char_marker.len();
         let next_char_offset: usize = rest[char_idx..]
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect::<String>()
             .parse()
             .expect("char_offset is a number");
-        assert!(continue_offset > 1, "offset should advance: {continue_offset}");
-        assert!(next_char_offset > 0, "char_offset should advance: {next_char_offset}");
+        assert!(
+            continue_offset > 1,
+            "offset should advance: {continue_offset}"
+        );
+        assert!(
+            next_char_offset > 0,
+            "char_offset should advance: {next_char_offset}"
+        );
 
         // Re-reading the same line from the breakpoint must render line number == continue_offset, proving no silent line skipping.
         let next_args = serde_json::json!({

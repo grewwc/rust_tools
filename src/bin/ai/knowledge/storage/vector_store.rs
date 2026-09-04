@@ -48,7 +48,9 @@ impl VectorStore {
     /// Number of indexed entries.
     pub fn len(&self) -> usize {
         self.conn
-            .query_row("SELECT COUNT(*) FROM vec_entries", [], |r| r.get::<_, i64>(0))
+            .query_row("SELECT COUNT(*) FROM vec_entries", [], |r| {
+                r.get::<_, i64>(0)
+            })
             .unwrap_or(0) as usize
     }
 
@@ -64,9 +66,8 @@ impl VectorStore {
             let mut stmt =
                 tx.prepare("INSERT OR REPLACE INTO vec_entries (id, payload) VALUES (?1, ?2)")?;
             for e in entries {
-                let payload = serde_json::to_vec(&e).map_err(|err| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                })?;
+                let payload = serde_json::to_vec(&e)
+                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
                 stmt.execute(rusqlite::params![e.id, payload])?;
             }
         }
@@ -121,7 +122,9 @@ impl VectorStore {
     /// Read a metadata row.
     pub fn get_meta(&self, key: &str) -> Option<String> {
         self.conn
-            .query_row("SELECT value FROM vec_meta WHERE key = ?1", [key], |r| r.get(0))
+            .query_row("SELECT value FROM vec_meta WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
             .ok()
     }
 
@@ -158,7 +161,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("vec_test_{}_{}.db", std::process::id(), nanos));
+        let path =
+            std::env::temp_dir().join(format!("vec_test_{}_{}.db", std::process::id(), nanos));
         VectorStore::new(&path).expect("open store")
     }
 

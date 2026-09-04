@@ -1,7 +1,7 @@
 //! Tests for the `completion_gate` cluster.
 
-use super::common::*;
 use super::super::*;
+use super::common::*;
 
 #[test]
 fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
@@ -17,8 +17,7 @@ fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
         tool_result_message("call_patch", "Successfully patched 1 file."),
     ];
     let mut app = test_app_with_tools(&["apply_patch", "execute_command"]);
-    let shared_mcp =
-        std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
     let mut messages = evidence_messages.clone();
     let mut turn_messages = evidence_messages;
     let mut persisted_turn_messages = 0usize;
@@ -67,9 +66,10 @@ fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
             .iter()
             .filter(|message| {
                 message.role == ROLE_INTERNAL_NOTE
-                    && message.content.as_str().is_some_and(|text| {
-                        text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER)
-                    })
+                    && message
+                        .content
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER))
             })
             .count(),
         1
@@ -118,9 +118,10 @@ fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
             .iter()
             .filter(|message| {
                 message.role == ROLE_INTERNAL_NOTE
-                    && message.content.as_str().is_some_and(|text| {
-                        text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER)
-                    })
+                    && message
+                        .content
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER))
             })
             .count(),
         1
@@ -169,8 +170,7 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
     );
 
     let mut app = test_app_with_tools(&["apply_patch", "execute_command"]);
-    let shared_mcp =
-        std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
     let mut messages = evidence_messages.clone();
     let mut turn_messages = evidence_messages;
     let mut persisted_turn_messages = 0usize;
@@ -222,9 +222,10 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
     assert!(
         !turn_messages.iter().any(|message| {
             message.role == ROLE_INTERNAL_NOTE
-                && message.content.as_str().is_some_and(|text| {
-                    text.starts_with(COMPLETION_EVIDENCE_UNVERIFIED_NOTE)
-                })
+                && message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_UNVERIFIED_NOTE))
         }),
         "变更后活动静默 Allow，不应记入'未观察到验证'的内部注记"
     );
@@ -233,9 +234,10 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
             .iter()
             .filter(|message| {
                 message.role == ROLE_INTERNAL_NOTE
-                    && message.content.as_str().is_some_and(|text| {
-                        text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER)
-                    })
+                    && message
+                        .content
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER))
             })
             .count(),
         0,
@@ -257,8 +259,7 @@ fn dangling_action_gate_takes_over_when_mutation_final_has_no_completion_claim()
         tool_result_message("call_patch", "Successfully patched 1 file."),
     ];
     let mut app = test_app_with_tools(&["apply_patch", "execute_command"]);
-    let shared_mcp =
-        std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
     let mut messages = evidence_messages.clone();
     let mut turn_messages = evidence_messages;
     let mut persisted_turn_messages = 0usize;
@@ -599,7 +600,10 @@ fn completion_evidence_gate_warns_after_failed_check_even_with_later_activity() 
         assistant_tool_call_message(mutation),
         tool_result_message("call_patch", "Successfully patched 1 file."),
         assistant_tool_call_message(failed_check),
-        tool_result_message("call_check", "error[E0425]: cannot find value `x` in this scope"),
+        tool_result_message(
+            "call_check",
+            "error[E0425]: cannot find value `x` in this scope",
+        ),
         assistant_tool_call_message(benign),
         tool_result_message("call_ls", "src  target"),
     ];
@@ -611,14 +615,7 @@ fn completion_evidence_gate_warns_after_failed_check_even_with_later_activity() 
     assert!(evidence.successful_post_mutation_activity);
 
     assert_eq!(
-        completion_evidence_gate_action(
-            &mut messages,
-            &turn_messages,
-            "已修复。",
-            false,
-            2,
-            16,
-        ),
+        completion_evidence_gate_action(&mut messages, &turn_messages, "已修复。", false, 2, 16,),
         CompletionEvidenceGateAction::Warn
     );
 }

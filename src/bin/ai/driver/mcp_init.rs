@@ -205,9 +205,10 @@ async fn prepare_mcp_initialization_from_path_inner(
 
         match result {
             Ok(conn) => {
-                client
-                    .servers
-                    .insert(name.clone(), std::sync::Arc::new(std::sync::Mutex::new(conn)));
+                client.servers.insert(
+                    name.clone(),
+                    std::sync::Arc::new(std::sync::Mutex::new(conn)),
+                );
             }
             Err(err) => {
                 eprintln!("[mcp] failed to connect to server {}: {}", name, err);

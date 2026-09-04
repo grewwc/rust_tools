@@ -7,7 +7,9 @@ fn print_model_help() {
     println!("  /model current                      show current model & effort");
     println!("  /model <selector> [<question>...]   switch to a model");
     println!("                                      e.g. /model deepseek-v4-flash-opencode");
-    println!("                                      (text after the selector is asked on this turn)");
+    println!(
+        "                                      (text after the selector is asked on this turn)"
+    );
     println!("  /model effort                       show current reasoning effort");
     println!("  /model effort <minimal|low|medium|high|xhigh|max>");
     println!("                                      override reasoning effort");
@@ -444,11 +446,9 @@ mod tests {
         let mut app = test_app();
         let target = crate::ai::model_names::model_handle(models[1]);
 
-        let handled = try_handle_model_command(
-            &mut app,
-            &format!("/model {target}\n帮我检查最近的变更"),
-        )
-        .unwrap();
+        let handled =
+            try_handle_model_command(&mut app, &format!("/model {target}\n帮我检查最近的变更"))
+                .unwrap();
 
         assert!(handled);
         assert_eq!(app.current_model, target);

@@ -30,8 +30,8 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Returns the transformed text on success, or the original `text` unchanged
 /// when the feature is disabled or the command fails.
 pub fn postprocess_terminal_text(text: String) -> String {
-    let command = crate::commonw::configw::get_all_config()
-        .get(AiConfig::OUTPUT_POSTPROCESS_COMMAND, "");
+    let command =
+        crate::commonw::configw::get_all_config().get(AiConfig::OUTPUT_POSTPROCESS_COMMAND, "");
     postprocess_with_command(command.trim(), text)
 }
 
@@ -68,11 +68,9 @@ fn postprocess_with_command(command: &str, text: String) -> String {
     );
 
     let transformed = match result {
-        Ok(output) if output.status.success() => {
-            std::fs::read(&out_path)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-        }
+        Ok(output) if output.status.success() => std::fs::read(&out_path)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok()),
         _ => None,
     };
 
@@ -132,7 +130,13 @@ mod tests {
 
     #[test]
     fn shell_quote_escapes_quotes() {
-        assert_eq!(shell_quote(std::path::Path::new("/tmp/a b.txt")), "'/tmp/a b.txt'");
-        assert_eq!(shell_quote(std::path::Path::new("/tmp/it's.txt")), "'/tmp/it'\\''s.txt'");
+        assert_eq!(
+            shell_quote(std::path::Path::new("/tmp/a b.txt")),
+            "'/tmp/a b.txt'"
+        );
+        assert_eq!(
+            shell_quote(std::path::Path::new("/tmp/it's.txt")),
+            "'/tmp/it'\\''s.txt'"
+        );
     }
 }

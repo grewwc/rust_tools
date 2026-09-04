@@ -149,9 +149,9 @@ impl BrowserSession {
     pub async fn launch() -> Result<Self, String> {
         let (browser, mut handler, temp_profile_dir) =
             if let Ok(ws) = std::env::var("MCP_BROWSER_WS_URL") {
-                let ws = resolve_ws_url(&ws).await.map_err(|e| {
-                    format!("failed to resolve MCP_BROWSER_WS_URL ({ws}): {e}")
-                })?;
+                let ws = resolve_ws_url(&ws)
+                    .await
+                    .map_err(|e| format!("failed to resolve MCP_BROWSER_WS_URL ({ws}): {e}"))?;
                 let (browser, handler) = Browser::connect(ws).await.map_err(|e| {
                     format!("failed to connect to browser at MCP_BROWSER_WS_URL: {e}")
                 })?;
@@ -250,14 +250,21 @@ async fn resolve_ws_url(input: &str) -> Result<String, String> {
             .unwrap_or(input);
         // Take only the "host:port" part, ignoring any /devtools/... path the user may have pasted.
         let hp = base.split('/').next().unwrap_or(base);
-        match hp.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(hp).rsplit_once(':') {
-            Some((h, p)) if !h.is_empty() && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+        match hp
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(hp)
+            .rsplit_once(':')
+        {
+            Some((h, p))
+                if !h.is_empty() && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) =>
+            {
                 (h.to_string(), p.to_string())
             }
             _ => {
                 return Err(format!(
                     "无法解析主机端口（应为 host:port 或 http://host:port）: {input}"
-                ))
+                ));
             }
         }
     };
@@ -267,9 +274,7 @@ async fn resolve_ws_url(input: &str) -> Result<String, String> {
     )
     .await
     .map_err(|_| {
-        format!(
-            "连接 {host}:{port} 超时——Chrome 是否以 --remote-debugging-port={port} 启动？"
-        )
+        format!("连接 {host}:{port} 超时——Chrome 是否以 --remote-debugging-port={port} 启动？")
     })??;
     let (status, body) = resp;
     if !status.starts_with("200") {
@@ -299,11 +304,7 @@ async fn http_get(host: &str, port: &str, path: &str) -> Result<(String, String)
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&buf).to_string();
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
+    let status = text.split_whitespace().nth(1).unwrap_or("").to_string();
     let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
     Ok((status, body))
 }

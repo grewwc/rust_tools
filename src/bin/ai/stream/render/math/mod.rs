@@ -216,9 +216,8 @@ mod tests {
 
     #[test]
     fn renders_common_spacing_and_partial_scripts_without_raw_tex() {
-        let result = render_math_tex_to_unicode(
-            r"\sum_{n=0}^{\infty} ar^n = \frac{a}{1-r}, \quad |r| < 1",
-        );
+        let result =
+            render_math_tex_to_unicode(r"\sum_{n=0}^{\infty} ar^n = \frac{a}{1-r}, \quad |r| < 1");
 
         assert_eq!(result, "∑ₙ₌₀⁽∞⁾ arⁿ = a/(1-r), |r| < 1");
         assert!(!result.contains("\\quad"), "got: {result}");

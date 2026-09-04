@@ -1,12 +1,12 @@
 use super::{
-    ContextKind, PromptContext, SystemPromptBuilder, available_tool_names,
+    ContextKind, PromptContext, SystemPromptBuilder, ToolGroup, available_tool_names,
     build_hidden_execution_primitive_catalog, build_hidden_mcp_tool_catalog,
     build_hidden_task_tool_catalog, build_project_instruction_prompt,
     build_scoped_project_instruction_prompt, build_system_prompt, builtin_tools_for_skill,
     declares_hidden_group, ensure_required_baseline_tools, escape_xml_attr,
     filter_mcp_tools_by_allowed_servers, has_tool, manifest_tool_definitions,
     merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
-    select_mcp_tools, session_context_prompt, tool_uses_mcp_server, ToolGroup,
+    select_mcp_tools, session_context_prompt, tool_uses_mcp_server,
 };
 use crate::ai::agents::{AgentManifest, AgentMode};
 use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
@@ -123,8 +123,7 @@ fn skill_declaring_task_group_eagerly_loads_only_the_task_family() {
             .collect::<Vec<_>>()
     };
 
-    let skill_groups =
-        names_for(vec!["core".to_string(), "task".to_string()]);
+    let skill_groups = names_for(vec!["core".to_string(), "task".to_string()]);
     assert!(
         skill_groups.iter().any(|name| name == "task_spawn"),
         "skill with [core, task] must eagerly expose task_spawn"
@@ -154,9 +153,15 @@ fn skill_declaring_task_group_eagerly_loads_only_the_task_family() {
         agent_team_groups.iter().any(|name| name == "manage_team"),
         "[core, task, agent_team] (agent-team skill) must expose manage_team"
     );
-    assert!(agent_team_groups.iter().any(|name| name == "run_agent_graph"));
     assert!(
-        agent_team_groups.iter().any(|name| name == "send_side_note"),
+        agent_team_groups
+            .iter()
+            .any(|name| name == "run_agent_graph")
+    );
+    assert!(
+        agent_team_groups
+            .iter()
+            .any(|name| name == "send_side_note"),
         "send_side_note rides in via the task group for orchestration skills"
     );
 }
@@ -180,9 +185,8 @@ fn active_skill_prompt_uses_explicit_user_input_handoff_only_for_skills() {
     assert!(active_prompt.contains("<interactive_skill_handoff>"));
     assert!(active_prompt.contains("`request_user_input`"));
 
-    let ordinary_prompt =
-        build_system_prompt(None, &[], &available, &PromptContext::default())
-            .render_system_prompt();
+    let ordinary_prompt = build_system_prompt(None, &[], &available, &PromptContext::default())
+        .render_system_prompt();
     assert!(!ordinary_prompt.contains("<interactive_skill_handoff>"));
 }
 
@@ -502,9 +506,8 @@ fn system_prompt_only_mentions_tools_available_this_turn() {
     available.insert("apply_patch".to_string());
     available.insert("enable_tools".to_string());
 
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("<tool_usage>"));
     assert!(prompt.contains("<tool_discovery>"));
     assert!(prompt.contains("<trust_boundary>"));
@@ -533,13 +536,12 @@ fn system_prompt_forbids_breaking_other_modules_to_satisfy_a_requirement() {
         },
     ];
     for ctx in cases {
-        let prompt =
-            build_system_prompt(None, &[], &Box::new(SkipSet::new(16)), &ctx)
-                .render_system_prompt();
+        let prompt = build_system_prompt(None, &[], &Box::new(SkipSet::new(16)), &ctx)
+            .render_system_prompt();
         assert!(prompt.contains("<system_constraints>"));
-        assert!(prompt.contains(
-            "Never break another module's functionality to satisfy a requirement"
-        ));
+        assert!(
+            prompt.contains("Never break another module's functionality to satisfy a requirement")
+        );
         assert!(prompt.contains("apply the `intellectual_honesty` conflict rule"));
     }
 }
@@ -551,9 +553,8 @@ fn system_prompt_bridges_compressed_context_recovery_via_search_overflow() {
     let mut available = SkipSet::new(16);
     available.insert("search_overflow".to_string());
 
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
 
     assert!(prompt.contains("<compressed_context_recovery>"));
     assert!(prompt.contains("search the session archive with `search_overflow`"));
@@ -571,9 +572,8 @@ fn system_prompt_explains_tool_result_evidence_markers() {
     available.insert("read_file".to_string());
     available.insert("execute_command".to_string());
 
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("<tool_result_evidence>"));
     assert!(prompt.contains("[reference: session-history]"));
     assert!(prompt.contains("[reference: stale-file]"));
@@ -636,9 +636,8 @@ fn system_prompt_routes_project_file_deletes_to_apply_patch() {
     available.insert("write_file".to_string());
     available.insert("apply_patch".to_string());
 
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
 
     assert!(prompt.contains("<temporary_files>"));
     assert!(prompt.contains("git-tracked file"));
@@ -653,9 +652,8 @@ fn system_prompt_routes_project_file_deletes_to_apply_patch() {
 #[test]
 fn system_prompt_enforces_concise_response_style_with_correctness_safeguard() {
     let available = SkipSet::new(16);
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     // The style section must exist and require "answer first, no rambling"
     assert!(prompt.contains("<response_style>"));
     assert!(prompt.contains("Lead with the answer or action"));
@@ -668,9 +666,8 @@ fn system_prompt_enforces_concise_response_style_with_correctness_safeguard() {
 #[test]
 fn system_prompt_renders_safety_redlines_and_no_hallucination() {
     let available = SkipSet::new(16);
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     // Dangerous-operation red lines: unconditionally rendered, containing all three elements — forbidden / bypass / confirmation
     assert!(prompt.contains("<safety_redlines>"));
     assert!(prompt.contains("Never perform dangerous operations"));
@@ -684,7 +681,9 @@ fn system_prompt_renders_safety_redlines_and_no_hallucination() {
     assert!(prompt.contains("Distinguish evidence from inference"));
     assert!(prompt.contains("label every inference and state its evidentiary basis"));
     assert!(prompt.contains("beyond a field's documented semantics"));
-    assert!(prompt.contains("does not establish provenance, lineage, capability, intent, or comparative rank"));
+    assert!(prompt.contains(
+        "does not establish provenance, lineage, capability, intent, or comparative rank"
+    ));
     assert!(prompt.contains("Calibrate conclusions to the evidence"));
     assert!(prompt.contains("do not introduce unstated premises, causal links, or facts"));
 }
@@ -697,18 +696,18 @@ fn system_prompt_uses_criterion_based_parallel_delegation() {
     available.insert("task_wait".to_string());
     available.insert("task_status".to_string());
 
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
 
     // Delegation is the default choice for substantive steps (serial or parallel), but with clear boundaries; the parent keeps
     // trivial steps, tightly coupled edits, and final review, and never runs dependent steps concurrently.
     assert!(prompt.contains("fan out MULTIPLE focused, independent subtasks concurrently"));
     assert!(prompt.contains("mark `delegate: true` on every substantive step"));
-    assert!(prompt.contains("delegated steps without it run one at a time via the synchronous `task`"));
+    assert!(
+        prompt.contains("delegated steps without it run one at a time via the synchronous `task`")
+    );
     assert!(prompt.contains("distinct, bounded goal"));
-    assert!(prompt
-        .contains("latency or context-isolation benefit outweighs handoff overhead"));
+    assert!(prompt.contains("latency or context-isolation benefit outweighs handoff overhead"));
     // Pre-division shared discovery must complete serially; never run
     // dependent steps concurrently, never delegate just to create
     // parallelism, and keep work in the parent when the net benefit is
@@ -724,8 +723,7 @@ fn system_prompt_uses_criterion_based_parallel_delegation() {
     assert!(prompt.contains("explicit result contract"));
     // Serial steps may also be delegated for context isolation (parallel
     // branches are not required).
-    assert!(prompt
-        .contains("experiments out of the parent context"));
+    assert!(prompt.contains("experiments out of the parent context"));
     assert!(prompt.contains("parallel branches are not required"));
     assert!(prompt.contains("continue every independent parent-side step while they run"));
     assert!(prompt.contains("only when the parent is blocked on subagent results"));
@@ -747,16 +745,13 @@ fn system_prompt_routes_single_delegation_to_sync_task_when_available() {
     available.insert("task_status".to_string());
     available.insert("plan".to_string());
 
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
 
     // Canonical home: Async Subagent Orchestration section (task branch).
-    assert!(
-        prompt.contains(
-            "For a single delegated subtask whose result you need back, prefer the synchronous `task`"
-        )
-    );
+    assert!(prompt.contains(
+        "For a single delegated subtask whose result you need back, prefer the synchronous `task`"
+    ));
     // The Planning section no longer duplicates the routing rule...
     assert!(!prompt.contains("for a SINGLE subtask use the synchronous `task`"));
     assert!(!prompt.contains("is just a slower `task`"));
@@ -785,27 +780,23 @@ fn system_prompt_task_only_tools_skip_empty_planning_section() {
     available.insert("task_cancel".to_string());
     available.insert("task_spawn_batch".to_string());
 
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
 
     // No empty Planning section header.
     assert!(!prompt.contains("<planning_subprocess_execution>"));
     // Routing guidance still present, from the Async section alone.
-    assert!(
-        prompt.contains(
-            "For a single delegated subtask whose result you need back, prefer the synchronous `task`"
-        )
-    );
+    assert!(prompt.contains(
+        "For a single delegated subtask whose result you need back, prefer the synchronous `task`"
+    ));
     assert!(prompt.contains("<async_subagent_orchestration>"));
 }
 
 #[test]
 fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     let available = SkipSet::new(16);
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("<correctness_guardrails>"));
     assert!(prompt.contains("Ground factual claims in observed evidence"));
     assert!(prompt.contains("state what is verified, what is unknown"));
@@ -844,9 +835,8 @@ fn system_prompt_requires_self_contained_comments() {
     // section), not in an agent/skill manifest — it must render for every
     // session regardless of active agent or skill.
     let available = SkipSet::new(16);
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("<correctness_guardrails>"));
     assert!(prompt.contains("Write comments for a reader who only has the code"));
     assert!(prompt.contains("Never reference a discussion-only shorthand or codename"));
@@ -860,9 +850,13 @@ fn system_prompt_resists_sycophancy() {
     // holds the view. Assert it is present on the default interactive path,
     // in goal mode, and on a skill turn (no mode may drop it).
     let available = SkipSet::new(16);
-    let default_prompt =
-        build_system_prompt(None, &[], &Box::new(available.clone()), &PromptContext::default())
-            .render_system_prompt();
+    let default_prompt = build_system_prompt(
+        None,
+        &[],
+        &Box::new(available.clone()),
+        &PromptContext::default(),
+    )
+    .render_system_prompt();
     assert!(default_prompt.contains("<intellectual_honesty>"));
     assert!(default_prompt.contains(
         "Agreement must be earned by the facts, not granted because the user holds the view"
@@ -873,15 +867,18 @@ fn system_prompt_resists_sycophancy() {
         goal_mode: Some("ship the feature".to_string()),
         is_background: false,
     };
-    let goal_prompt =
-        build_system_prompt(None, &[], &Box::new(available.clone()), &goal_ctx)
-            .render_system_prompt();
+    let goal_prompt = build_system_prompt(None, &[], &Box::new(available.clone()), &goal_ctx)
+        .render_system_prompt();
     assert!(goal_prompt.contains("<intellectual_honesty>"));
 
     let skill = skill("demo", "a demo skill");
-    let skill_prompt =
-        build_system_prompt(None, &[&skill], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let skill_prompt = build_system_prompt(
+        None,
+        &[&skill],
+        &Box::new(available),
+        &PromptContext::default(),
+    )
+    .render_system_prompt();
     assert!(skill_prompt.contains("<intellectual_honesty>"));
 }
 
@@ -892,16 +889,19 @@ fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
     // indentation into the rendered prompt. Assert every rendered line is
     // left-trimmed (no leading whitespace leaks from the source literal).
     let available = SkipSet::new(16);
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("<scope_discipline>"));
     // The three bullets must each start at column 0 (bullet marker), not be
     // prefixed by leaked source indentation.
-    assert!(prompt
-        .contains("\n- Investigate the user's explicit request plus only the direct dependencies"));
-    assert!(prompt
-        .contains("\n- Do not implement refactors or optimizations unrelated to the task."));
+    assert!(
+        prompt.contains(
+            "\n- Investigate the user's explicit request plus only the direct dependencies"
+        )
+    );
+    assert!(
+        prompt.contains("\n- Do not implement refactors or optimizations unrelated to the task.")
+    );
     assert!(prompt.contains("\n- For broad requests, define investigation boundaries"));
     // Guard against the exact defect: no bullet prefixed by leading spaces.
     assert!(!prompt.contains("\n             - Do not implement refactors"));
@@ -911,9 +911,8 @@ fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
 #[test]
 fn system_prompt_defines_an_end_to_end_behavior_contract() {
     let available = SkipSet::new(16);
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
 
     assert!(prompt.contains("current plan and interpretation as hypotheses"));
     assert!(prompt.contains("user correction, failed check, or new evidence"));
@@ -933,20 +932,21 @@ fn system_prompt_links_task_convergence_criteria_to_plan_when_available() {
     // together close the plan → execute → accept loop.
     let mut available = SkipSet::new(16);
     available.insert("plan".to_string());
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
-    assert!(prompt.contains(
-        "For multi-step tasks, encode these criteria into the `plan`"
-    ));
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
+    assert!(prompt.contains("For multi-step tasks, encode these criteria into the `plan`"));
     assert!(prompt.contains("Track step progress with `plan_update`"));
     assert!(prompt.contains("Treat the plan as a living roadmap"));
     assert!(prompt.contains("before the first tool call, so the plan is the roadmap"));
 
     // When plan is unavailable (e.g. culled by a skill whitelist): the bridging line is absent, but the task_convergence body remains.
-    let empty =
-        build_system_prompt(None, &[], &Box::new(SkipSet::new(16)), &PromptContext::default())
-            .render_system_prompt();
+    let empty = build_system_prompt(
+        None,
+        &[],
+        &Box::new(SkipSet::new(16)),
+        &PromptContext::default(),
+    )
+    .render_system_prompt();
     assert!(empty.contains("<task_convergence>"));
     assert!(!empty.contains("encode these criteria into the `plan`"));
 }
@@ -954,9 +954,8 @@ fn system_prompt_links_task_convergence_criteria_to_plan_when_available() {
 #[test]
 fn system_prompt_bounds_tool_exploration() {
     let available = SkipSet::new(16);
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("Give every call a concrete decision goal"));
     assert!(prompt.contains("no further call can change the decision"));
     assert!(prompt.contains("Before exploration, state the question it can answer"));
@@ -978,9 +977,7 @@ fn system_prompt_uses_success_criteria_for_normal_and_goal_convergence() {
     assert!(normal.contains(
         "the next call can verify it, rule out a live hypothesis, or complete required work"
     ));
-    assert!(
-        normal.contains("Stop when all criteria are verified or a specific blocker remains")
-    );
+    assert!(normal.contains("Stop when all criteria are verified or a specific blocker remains"));
     assert!(normal.contains("evidence count alone is not a stopping rule"));
     assert!(!normal.contains("3+ pieces of converging evidence"));
 
@@ -1051,9 +1048,8 @@ fn asking_user_guidance_only_on_default_interactive_path() {
 #[test]
 fn system_prompt_stops_repeating_failed_approach_without_ending_task() {
     let available = SkipSet::new(16);
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
 
     assert!(prompt.contains("On failure, diagnose before retrying"));
     assert!(prompt.contains("switch to a materially different safe recovery"));
@@ -1063,26 +1059,21 @@ fn system_prompt_stops_repeating_failed_approach_without_ending_task() {
 #[test]
 fn system_prompt_keeps_code_grounding_calls_serial() {
     let available = SkipSet::new(16);
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("Navigate code serially"));
-    assert!(prompt.contains(
-        "read one sufficiently broad needed region, then patch it"
-    ));
+    assert!(prompt.contains("read one sufficiently broad needed region, then patch it"));
     assert!(prompt.contains("Do not batch code reads"));
     assert!(
-        !prompt
-            .contains("Work in batches: when several independent read-only lookups are needed")
+        !prompt.contains("Work in batches: when several independent read-only lookups are needed")
     );
 }
 
 #[test]
 fn generic_system_prompt_does_not_hardcode_repo_specific_tool_names() {
     let available = SkipSet::new(16);
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(!prompt.contains("cargo_test"));
     assert!(!prompt.contains("execute_command / cargo_test"));
     assert!(!prompt.contains("execute_command"));
@@ -1095,9 +1086,8 @@ fn generic_system_prompt_does_not_hardcode_repo_specific_tool_names() {
 fn system_prompt_mentions_mcp_discovery_when_enable_tools_available() {
     let mut available = SkipSet::new(16);
     available.insert("enable_tools".to_string());
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("discover and enable matching `mcp_*` tools first"));
 }
 
@@ -1116,9 +1106,8 @@ fn system_prompt_guides_tree_for_layout_when_available() {
 
     let mut available = SkipSet::new(16);
     available.insert("tree".to_string());
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("<codebase_navigation>"));
     assert!(prompt.contains("Use `tree` to grasp directory layout before reading files"));
 }
@@ -1220,17 +1209,14 @@ fn system_prompt_guides_optional_skill_discovery_when_available() {
     available.insert("enable_tools".to_string());
     available.insert("activate_skill".to_string());
     available.insert("list_skills".to_string());
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("activate_skill"));
     assert!(prompt.contains("list_skills"));
     assert!(prompt.contains("Skills are optional"));
     assert!(prompt.contains("proactively call `list_skills`"));
     assert!(prompt.contains("technical keywords alone"));
-    assert!(
-        prompt.contains("routine source-code, repository, file, or terminal investigation")
-    );
+    assert!(prompt.contains("routine source-code, repository, file, or terminal investigation"));
     assert!(prompt.contains("unloads automatically"));
     assert!(prompt.contains("enable_tools"));
 }
@@ -1239,9 +1225,8 @@ fn system_prompt_guides_optional_skill_discovery_when_available() {
 fn system_prompt_prefers_enable_tools_when_no_skill_active() {
     let mut available = SkipSet::new(16);
     available.insert("enable_tools".to_string());
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("No skill is active for this turn"));
     assert!(prompt.contains("enable_tools(operation=list)"));
     assert!(prompt.contains("enabling only the specific tools you need"));
@@ -1323,9 +1308,8 @@ fn skill_activation_history_reminder_keeps_six_recent_unique_selections() {
 fn system_prompt_never_mentions_discover_skills() {
     let mut available = SkipSet::new(16);
     available.insert("enable_tools".to_string());
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("enable_tools(operation=list)"));
     assert!(!prompt.contains("discover_skills"));
 }
@@ -1456,8 +1440,12 @@ fn active_skill_prompt_precedes_agent_prompt_and_declares_priority() {
     let skill_pos = prompt.find("Active skill: humanizer").unwrap();
     let agent_pos = prompt.find("<agent_instructions>").unwrap();
     assert!(skill_pos < agent_pos);
-    assert!(prompt.contains("<skill_instructions>\nYou are a writing editor.\n</skill_instructions>"));
-    assert!(prompt.contains("<agent_instructions>\nYou are the build agent.\n</agent_instructions>"));
+    assert!(
+        prompt.contains("<skill_instructions>\nYou are a writing editor.\n</skill_instructions>")
+    );
+    assert!(
+        prompt.contains("<agent_instructions>\nYou are the build agent.\n</agent_instructions>")
+    );
     assert!(prompt.contains("primary behavior contract"));
     assert!(prompt.contains("skill instructions override agent instructions"));
 }
@@ -1468,8 +1456,13 @@ fn skill_only_prompt_keeps_guardrails_non_overridable() {
     let mut humanizer = skill("humanizer", "Rewrite text naturally");
     humanizer.prompt = "You are a writing editor.".to_string();
 
-    let prompt = build_system_prompt(None, &[&humanizer], &Box::new(available), &PromptContext::default())
-        .render_system_prompt();
+    let prompt = build_system_prompt(
+        None,
+        &[&humanizer],
+        &Box::new(available),
+        &PromptContext::default(),
+    )
+    .render_system_prompt();
 
     assert!(prompt.contains("skill instructions override generic assistant guidelines"));
     assert!(prompt.contains("except the correctness guardrails (including git-safety rules), safety redlines, and policy sections, which always take precedence"));
@@ -1483,9 +1476,8 @@ fn system_prompt_uses_knowledge_save_for_user_memory_requests() {
     available.insert("knowledge_search".to_string());
     available.insert("knowledge_list".to_string());
 
-    let prompt =
-        build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
     assert!(prompt.contains("<knowledge_save>"));
     assert!(prompt.contains("call `knowledge_save`"));
     assert!(prompt.contains("`common_sense`, `coding_guideline`"));
@@ -1525,9 +1517,9 @@ fn project_instruction_prompt_includes_repo_docs_from_cwd_scope() {
         .sync_scope(nested.clone(), build_project_instruction_prompt)
         .expect("project instruction prompt");
 
-    assert!(
-        prompt.contains("- The current working directory provides project-specific instruction documents.")
-    );
+    assert!(prompt.contains(
+        "- The current working directory provides project-specific instruction documents."
+    ));
     assert!(prompt.contains("<instructions path="));
     assert!(prompt.contains("AGENTS.md"));
     assert!(prompt.contains("Use cargo fmt before commit."));
@@ -1573,9 +1565,7 @@ fn scoped_project_instruction_prompt_follows_observed_target_path() {
         })
         .expect("target-scoped instruction prompt");
 
-    assert!(
-        prompt.contains("- These documents apply to files already touched in this turn.")
-    );
+    assert!(prompt.contains("- These documents apply to files already touched in this turn."));
     assert!(prompt.contains("<instructions path="));
     assert!(prompt.contains("AI runtime rules."));
     assert!(prompt.contains("Driver-specific rules."));
@@ -1607,10 +1597,7 @@ fn scoped_project_instruction_push_confirms_required_target_is_loaded() {
             matched_skill_names: Vec::new(),
         };
 
-        assert!(guard.push_scoped_project_instructions(
-            std::slice::from_ref(&target),
-            &[]
-        ));
+        assert!(guard.push_scoped_project_instructions(std::slice::from_ref(&target), &[]));
         assert!(guard.system_prompt().contains("Required driver rules."));
     });
 
@@ -1624,19 +1611,13 @@ fn context_reminder_injects_active_skill_pointer_into_user_message_reminder() {
         builder: SystemPromptBuilder::new(),
         cached_system_prompt: None,
         cached_context_reminder: None,
-        matched_skill_names: vec![
-            "alpha".to_string(),
-            "beta".to_string(),
-            "gamma".to_string(),
-        ],
+        matched_skill_names: vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
     };
     let reminder = guard
         .context_reminder()
         .expect("reminder should be present with active skills");
     assert!(reminder.contains("<system-reminder>"));
-    assert!(reminder.contains(
-        "Active skills at turn start (in activation order):"
-    ));
+    assert!(reminder.contains("Active skills at turn start (in activation order):"));
     assert!(reminder.contains("  1. alpha"));
     assert!(reminder.contains("  2. beta"));
     assert!(reminder.contains("  3. gamma"));
@@ -1684,21 +1665,16 @@ fn project_context_is_appended_separately_from_base_prompt() {
     .unwrap();
     fs::write(root.join("AGENTS.md"), "Use cargo fmt before commit.\n").unwrap();
 
-    let (base_prompt, enriched_prompt, reminder) =
-        SUBAGENT_CWD.sync_scope(nested.clone(), || {
-            let available = SkipSet::new(16);
-            let mut builder = build_system_prompt(
-                None,
-                &[],
-                &Box::new(available),
-                &PromptContext::default(),
-            );
-            let base_prompt = builder.render_system_prompt();
-            push_project_context(&mut builder);
-            let enriched_prompt = builder.render_system_prompt();
-            let reminder = builder.render_context_reminder().unwrap_or_default();
-            (base_prompt, enriched_prompt, reminder)
-        });
+    let (base_prompt, enriched_prompt, reminder) = SUBAGENT_CWD.sync_scope(nested.clone(), || {
+        let available = SkipSet::new(16);
+        let mut builder =
+            build_system_prompt(None, &[], &Box::new(available), &PromptContext::default());
+        let base_prompt = builder.render_system_prompt();
+        push_project_context(&mut builder);
+        let enriched_prompt = builder.render_system_prompt();
+        let reminder = builder.render_context_reminder().unwrap_or_default();
+        (base_prompt, enriched_prompt, reminder)
+    });
 
     assert!(!base_prompt.contains("Use cargo fmt before commit."));
     assert!(enriched_prompt.contains("Use cargo fmt before commit."));
@@ -2104,7 +2080,10 @@ fn multi_skill_system_prompt_lists_all_active_skills() {
     let skill_a = skill_with_prompt("alpha", "alpha skill", "Do alpha things.");
     let skill_b = skill_with_prompt("beta", "beta skill", "Do beta things.");
     let available_tools: Box<SkipSet<String>> = Box::new(SkipSet::new(16));
-    let ctx = PromptContext { goal_mode: None, is_background: false };
+    let ctx = PromptContext {
+        goal_mode: None,
+        is_background: false,
+    };
     let builder = super::build_system_prompt(None, &[&skill_a, &skill_b], &available_tools, &ctx);
     let prompt = builder.render_system_prompt();
     assert!(prompt.contains("alpha"));

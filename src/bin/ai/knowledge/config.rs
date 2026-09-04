@@ -23,9 +23,7 @@ impl Default for KnowledgeConfig {
 /// (`ai.knowledge.hybrid_vector_weight`).
 pub fn knowledge_config() -> KnowledgeConfig {
     let mut cfg = KnowledgeConfig::default();
-    if let Some(v) = configw::get_all_config()
-        .get_opt(AiConfig::KNOWLEDGE_HYBRID_VECTOR_WEIGHT)
-    {
+    if let Some(v) = configw::get_all_config().get_opt(AiConfig::KNOWLEDGE_HYBRID_VECTOR_WEIGHT) {
         if let Ok(w) = v.parse::<f32>() {
             cfg.hybrid_vector_weight = w.clamp(0.0, 1.0);
         }

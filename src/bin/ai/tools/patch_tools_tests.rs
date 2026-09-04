@@ -2,8 +2,7 @@ use super::{
     PatchEnvelopeOp, apply_inline_replace, apply_patch_target_paths_from_patch,
     apply_unified_patch, apply_unified_patch_with_hints, execute_apply_patch,
     file_path_from_unified_diff_header, parse_patch_envelope, parse_patch_envelopes,
-    parse_unified_diff_header_target, parse_unified_hunks, strip_code_fence,
-    truncated_patch_hint,
+    parse_unified_diff_header_target, parse_unified_hunks, strip_code_fence, truncated_patch_hint,
 };
 use crate::ai::test_support::ENV_LOCK;
 use std::{fs, path::PathBuf};
@@ -91,8 +90,7 @@ fn parse_unified_hunks_treats_empty_hunk_line_as_context() {
     // Models often write empty context lines as fully blank lines with no leading space; these should be treated as empty context lines,
     // not an error. This matches `git apply`'s tolerance for empty context lines.
     let patch = "@@ -1,3 +1,3 @@\n foo\n\n bar\n";
-    let hunks =
-        parse_unified_hunks(patch).expect("empty hunk line should be treated as context");
+    let hunks = parse_unified_hunks(patch).expect("empty hunk line should be treated as context");
     assert_eq!(hunks.len(), 1);
     assert_eq!(hunks[0].lines.len(), 3);
 }
@@ -121,8 +119,8 @@ fn apply_unified_patch_tolerates_empty_context_line_in_crlf_patch() {
     // Empty context lines in a CRLF patch (lines with only \r) should also be treated as empty context lines.
     let original = "foo\r\n\r\nbar\r\n";
     let patch = "@@ -1,3 +1,3 @@\r\n foo\r\n\r\r\n-bar\r\n+baz\r\n";
-    let result = apply_unified_patch(original, patch)
-        .expect("empty CRLF context line should be tolerated");
+    let result =
+        apply_unified_patch(original, patch).expect("empty CRLF context line should be tolerated");
     // The original file is CRLF, but the patch's Add lines have already stripped \r; output is uniformly LF.
     assert_eq!(result, "foo\n\nbaz\n");
 }
@@ -297,8 +295,7 @@ fn parse_unified_hunks_normalizes_zero_declared_line_to_one() {
 fn apply_unified_patch_inserts_at_top_with_zero_declared_line() {
     let original = "first\nsecond\n";
     let patch = "@@ -0,0 +1,2 @@\n+head\n+top\n";
-    let result =
-        apply_unified_patch(original, patch).expect("@@ -0 insert at top should apply");
+    let result = apply_unified_patch(original, patch).expect("@@ -0 insert at top should apply");
     assert_eq!(result, "head\ntop\nfirst\nsecond\n");
 }
 
@@ -335,8 +332,7 @@ fn apply_unified_patch_no_hint_for_context_anchored_hunks() {
 #[test]
 fn apply_unified_patch_pure_insert_on_empty_file_has_no_hint() {
     let patch = "@@ -0,0 +1,2 @@\n+a\n+b\n";
-    let (result, hints) =
-        apply_unified_patch_with_hints("", patch).expect("add file should apply");
+    let (result, hints) = apply_unified_patch_with_hints("", patch).expect("add file should apply");
     assert_eq!(result, "a\nb");
     assert!(
         hints.is_empty(),
@@ -360,14 +356,20 @@ fn apply_patch_success_message_includes_pure_insert_hint() {
             "file_path": "target.txt",
         }))
         .expect("pure insert should succeed");
-        assert!(result.contains("Successfully patched"), "result was: {result}");
+        assert!(
+            result.contains("Successfully patched"),
+            "result was: {result}"
+        );
         assert!(
             result.contains("line number"),
             "success message should carry the pure-insert hint: {result}"
         );
     });
 
-    assert_eq!(fs::read_to_string(&target).unwrap(), "first\nmid1\nmid2\nsecond\n");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "first\nmid1\nmid2\nsecond\n"
+    );
     let _ = fs::remove_dir_all(base);
 }
 
@@ -376,10 +378,8 @@ fn apply_patch_success_message_includes_pure_insert_hint() {
 #[test]
 fn truncated_patch_hint_heuristics() {
     assert!(
-        truncated_patch_hint(
-            "*** Begin Patch\n*** Update File: x.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n"
-        )
-        .is_some(),
+        truncated_patch_hint("*** Begin Patch\n*** Update File: x.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n")
+            .is_some(),
         "unclosed envelope should be flagged"
     );
     assert!(
@@ -875,8 +875,7 @@ fn execute_apply_patch_supports_add_file_envelope_without_file_path_arg() {
         let args = serde_json::json!({
             "patch": "*** Begin Patch\n*** Add File: new.txt\n+hello\n+world\n*** End Patch\n"
         });
-        execute_apply_patch(&args)
-            .expect("apply_patch should infer target from Add File envelope");
+        execute_apply_patch(&args).expect("apply_patch should infer target from Add File envelope");
     });
 
     assert_eq!(fs::read_to_string(&path).unwrap(), "hello\nworld");
@@ -1093,10 +1092,8 @@ fn file_path_from_unified_diff_header_reads_git_style_paths() {
     );
     // Deletion case: `+++ /dev/null` is skipped, falling back to the `--- a/` side.
     assert_eq!(
-        file_path_from_unified_diff_header(
-            "--- a/src/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
-        )
-        .as_deref(),
+        file_path_from_unified_diff_header("--- a/src/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n")
+            .as_deref(),
         Some("src/gone.rs")
     );
     // `diff --git a/… b/…` takes the b side; trailing TAB+timestamp is stripped.
@@ -1109,8 +1106,7 @@ fn file_path_from_unified_diff_header_reads_git_style_paths() {
     );
     // Absolute paths without an a/ b/ prefix are preserved as-is.
     assert_eq!(
-        file_path_from_unified_diff_header("+++ /abs/path.rs\n@@ -1 +1 @@\n-a\n+b\n")
-            .as_deref(),
+        file_path_from_unified_diff_header("+++ /abs/path.rs\n@@ -1 +1 @@\n-a\n+b\n").as_deref(),
         Some("/abs/path.rs")
     );
     // Without a diff header, return None (a bare `@@` hunk still requires an explicit file_path).
@@ -1342,8 +1338,7 @@ fn unified_header_parser_ignores_header_shaped_hunk_body_lines() {
 
 #[test]
 fn execute_apply_patch_rejects_dev_null_deletion_with_actionable_guidance() {
-    let patch =
-        "diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n";
+    let patch = "diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n";
     let err = execute_apply_patch(&serde_json::json!({ "patch": patch }))
         .expect_err("unified mode must not silently turn deletion into an empty file");
     assert!(err.contains("+++ /dev/null"), "err was: {err}");
@@ -1488,8 +1483,7 @@ fn execute_apply_patch_update_envelope_tolerates_bare_lines() {
                 path.display()
             )
         });
-        execute_apply_patch(&args)
-            .expect("envelope with bare context line should be tolerated");
+        execute_apply_patch(&args).expect("envelope with bare context line should be tolerated");
     });
 
     assert_eq!(
@@ -1628,8 +1622,7 @@ fn apply_unified_patch_large_block_mismatch_pinpoints_wrong_line() {
     // (expected vs actual), not just say "context mismatch".
     let original = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
     // The remove block has 6 lines; line4 was mistyped by the model as lineX
-    let patch =
-        "@@ -2,6 +2,3 @@\n-line2\n-line3\n-lineX\n-line5\n-line6\n-line7\n+new2\n+new3\n";
+    let patch = "@@ -2,6 +2,3 @@\n-line2\n-line3\n-lineX\n-line5\n-line6\n-line7\n+new2\n+new3\n";
     let err = apply_unified_patch(original, patch).unwrap_err();
     assert!(err.contains("context mismatch"), "err was: {err}");
     // Should report the best match position and match count
@@ -1816,8 +1809,7 @@ fn inline_replace_anchor_tolerates_confusable() {
         "test.txt",
         &["anchor: the quick—brown fox", "old: fox", "new: dog"],
     );
-    let result =
-        apply_inline_replace(original, &envelope).expect("confusable anchor should match");
+    let result = apply_inline_replace(original, &envelope).expect("confusable anchor should match");
     assert_eq!(result, "the quick—brown dog\njumps over\n");
 }
 
@@ -1831,8 +1823,7 @@ fn inline_replace_old_tolerates_confusable() {
         "test.txt",
         &["anchor: quick", "old: quick—brown", "new: slow-brown"],
     );
-    let result =
-        apply_inline_replace(original, &envelope).expect("confusable old should match");
+    let result = apply_inline_replace(original, &envelope).expect("confusable old should match");
     // The output is built from new, preserving the file's original content; only the matched range is replaced
     assert_eq!(result, "the slow-brown fox\n");
 }
@@ -1859,7 +1850,11 @@ fn inline_replace_old_not_found_mentions_line_prefix_hint() {
     let envelope = make_envelope(
         PatchEnvelopeOp::ReplaceInLine,
         "test.rs",
-        &["anchor: let x", "old:     1\tlet x = 42;", "new: let x = 99;"],
+        &[
+            "anchor: let x",
+            "old:     1\tlet x = 42;",
+            "new: let x = 99;",
+        ],
     );
     let err = apply_inline_replace(original, &envelope)
         .expect_err("old with line-number prefix should fail");
@@ -1896,8 +1891,7 @@ fn inline_replace_anchor_not_unique() {
         "test.txt",
         &["anchor: duplicate line", "old: duplicate", "new: unique"],
     );
-    let err =
-        apply_inline_replace(original, &envelope).expect_err("non-unique anchor should fail");
+    let err = apply_inline_replace(original, &envelope).expect_err("non-unique anchor should fail");
     assert!(
         err.contains("matched 2 lines"),
         "error should mention 2 matched lines: {err}"
@@ -1912,8 +1906,7 @@ fn inline_replace_anchor_not_found() {
         "test.txt",
         &["anchor: nonexistent", "old: world", "new: rust"],
     );
-    let err =
-        apply_inline_replace(original, &envelope).expect_err("missing anchor should fail");
+    let err = apply_inline_replace(original, &envelope).expect_err("missing anchor should fail");
     assert!(err.contains("anchor not found"), "error: {err}");
 }
 
@@ -1926,8 +1919,7 @@ fn inline_replace_old_not_unique_in_line() {
         "test.txt",
         &["anchor: foo bar", "old: foo", "new: qux"],
     );
-    let err =
-        apply_inline_replace(original, &envelope).expect_err("non-unique old should fail");
+    let err = apply_inline_replace(original, &envelope).expect_err("non-unique old should fail");
     assert!(
         err.contains("appears 2 times"),
         "error should mention 2 occurrences: {err}"
@@ -1967,8 +1959,7 @@ fn inline_replace_unicode_content() {
         "test.rs",
         &["anchor: greeting", "old: 你好", "new: 再见"],
     );
-    let result =
-        apply_inline_replace(original, &envelope).expect("unicode replace should work");
+    let result = apply_inline_replace(original, &envelope).expect("unicode replace should work");
     assert_eq!(result, "let greeting = \"再见世界\";\n");
 }
 

@@ -10,11 +10,11 @@
 use rustc_hash::FxHashSet;
 use serde_json::Value;
 
+use crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX;
 use crate::ai::history::{
     Message, ROLE_SYSTEM, clear_runtime_message_metadata, is_internal_note_role,
     is_summary_note_text, is_system_like_role,
 };
-use crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX;
 use crate::ai::models;
 use crate::ai::types::App;
 
@@ -652,9 +652,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         .iter_mut()
         .for_each(clear_runtime_message_metadata);
 
-    let first_system_idx = request_messages
-        .iter()
-        .position(|m| m.role == ROLE_SYSTEM);
+    let first_system_idx = request_messages.iter().position(|m| m.role == ROLE_SYSTEM);
     let Some(first_system_idx) = first_system_idx else {
         let mut projected = Vec::with_capacity(request_messages.len() + 1);
         for idx in 0..request_messages.len() {
@@ -665,10 +663,8 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
                 ));
                 continue;
             }
-            let mut note = std::mem::replace(
-                &mut request_messages[idx],
-                moved_out_message_placeholder(),
-            );
+            let mut note =
+                std::mem::replace(&mut request_messages[idx], moved_out_message_placeholder());
             // Marker detection must see the original role/content, before the
             // content is rewritten below (mirrors the old clone-then-check
             // order on the untouched source message).
@@ -732,11 +728,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
 
     let mut merged_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
     let mut model_derived_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
-    for (idx, message) in request_messages
-        .iter()
-        .enumerate()
-        .take(first_body_idx)
-    {
+    for (idx, message) in request_messages.iter().enumerate().take(first_body_idx) {
         let normalized_content = normalize_system_like_content_for_request(&message.content);
         let text = normalized_content
             .as_str()
@@ -884,10 +876,8 @@ evidence before relying on them.\n",
             // standalone assistant context block.
             continue;
         }
-        let mut message = std::mem::replace(
-            &mut request_messages[idx],
-            moved_out_message_placeholder(),
-        );
+        let mut message =
+            std::mem::replace(&mut request_messages[idx], moved_out_message_placeholder());
         if is_system_like_role(&message.role) {
             message.content = normalize_system_like_content_for_request(&message.content);
             let text = message.content.as_str().unwrap_or_default();
@@ -1127,11 +1117,13 @@ mod query_memory_index_projection_tests {
             })
             .expect("index owner");
         assert_eq!(index_owner.role, "assistant");
-        assert!(index_owner
-            .content
-            .as_str()
-            .unwrap()
-            .contains("## Hierarchical Memory Index"));
+        assert!(
+            index_owner
+                .content
+                .as_str()
+                .unwrap()
+                .contains("## Hierarchical Memory Index")
+        );
         let first_system = normalized
             .iter()
             .find(|m| m.role == ROLE_SYSTEM)

@@ -328,13 +328,22 @@ mod tests {
     fn entry_diff_modify_emits_only_changed_lines() {
         let before = "a\nb\nc\nd\ne\n";
         let after = "a\nb\nX\nd\ne\n";
-        assert_eq!(entry_diff(Some(before), Some(after)).as_deref(), Some("- c\n+ X\n"));
+        assert_eq!(
+            entry_diff(Some(before), Some(after)).as_deref(),
+            Some("- c\n+ X\n")
+        );
     }
 
     #[test]
     fn entry_diff_created_and_deleted_emit_single_sided_lines() {
-        assert_eq!(entry_diff(None, Some("x\ny\n")).as_deref(), Some("+ x\n+ y\n"));
-        assert_eq!(entry_diff(Some("x\ny\n"), None).as_deref(), Some("- x\n- y\n"));
+        assert_eq!(
+            entry_diff(None, Some("x\ny\n")).as_deref(),
+            Some("+ x\n+ y\n")
+        );
+        assert_eq!(
+            entry_diff(Some("x\ny\n"), None).as_deref(),
+            Some("- x\n- y\n")
+        );
     }
 
     #[test]

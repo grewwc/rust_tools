@@ -383,7 +383,9 @@ static REGISTERED_TOOL_NAMES: LazyLock<FastSet<&'static str>> = LazyLock::new(||
 
 /// Returns tool definitions for all registered tools that belong
 /// to at least one of the specified groups.
-pub(crate) fn tool_definitions_for_groups(groups: &[super::tool_groups::ToolGroup]) -> Vec<ToolDefinition> {
+pub(crate) fn tool_definitions_for_groups(
+    groups: &[super::tool_groups::ToolGroup],
+) -> Vec<ToolDefinition> {
     let mut tools: Box<SkipMap<String, ToolDefinition>> =
         SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
 
@@ -408,7 +410,9 @@ pub(crate) fn tool_definitions_for_groups(groups: &[super::tool_groups::ToolGrou
     tools.into_iter().map(|(_, v)| v).collect()
 }
 
-pub(crate) fn tool_summaries_for_groups(groups: &[super::tool_groups::ToolGroup]) -> Vec<(String, String)> {
+pub(crate) fn tool_summaries_for_groups(
+    groups: &[super::tool_groups::ToolGroup],
+) -> Vec<(String, String)> {
     let mut tools: Box<SkipMap<String, String>> =
         SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
 
@@ -488,12 +492,10 @@ pub(crate) fn deferred_eager_load_tool_summaries() -> Vec<(String, String)> {
 /// hidden automatically makes its group privileged, with no hardcoded
 /// group-name list.
 pub(crate) fn group_gates_hidden_tools(group: super::tool_groups::ToolGroup) -> bool {
-    inventory::iter::<ToolRegistration>
-        .into_iter()
-        .any(|reg| {
-            super::tool_metadata::tool_is_hidden(reg.spec.name)
-                && super::tool_metadata::tool_groups(reg.spec.name).contains(&group)
-        })
+    inventory::iter::<ToolRegistration>.into_iter().any(|reg| {
+        super::tool_metadata::tool_is_hidden(reg.spec.name)
+            && super::tool_metadata::tool_groups(reg.spec.name).contains(&group)
+    })
 }
 
 pub(crate) fn get_tool_spec(name: &str) -> Option<&'static ToolSpec> {
@@ -782,7 +784,10 @@ mod history_policy_tests {
         // already-spawned subtasks. This assertion pins the contract.
         for name in ["task_spawn", "task_spawn_batch"] {
             let policy = tool_history_policy(name);
-            assert!(!policy.allows_lossy_compress(), "{name} must block lossy compress");
+            assert!(
+                !policy.allows_lossy_compress(),
+                "{name} must block lossy compress"
+            );
             assert!(!policy.allows_prune(), "{name} must block prune");
         }
     }

@@ -19,20 +19,17 @@ use super::*;
 /// DBs, overflow archives, folded tool groups, checkpoints, or the history
 /// replay. Reading them back is legitimate, but the content is a snapshot of
 /// the past, not the live conversation or the current filesystem.
-pub(in crate::ai::driver::turn_runtime) const SESSION_HISTORY_MARKER: &str =
-    "[reference: session-history - content read from this agent's own stored session data (a session DB, archive, or checkpoint file); it reflects a past state, not the live conversation or current filesystem]";
+pub(in crate::ai::driver::turn_runtime) const SESSION_HISTORY_MARKER: &str = "[reference: session-history - content read from this agent's own stored session data (a session DB, archive, or checkpoint file); it reflects a past state, not the live conversation or current filesystem]";
 
 /// Marker for content read from a file the runtime knows is stale: a patch
 /// target whose last apply_patch attempt failed and has not been re-read since.
 /// The on-disk truth may differ from earlier tool results.
-pub(in crate::ai::driver::turn_runtime) const STALE_FILE_MARKER: &str =
-    "[reference: stale-file - this file is a known-stale patch target; on-disk content may differ from earlier tool results. Re-read before treating it as current.]";
+pub(in crate::ai::driver::turn_runtime) const STALE_FILE_MARKER: &str = "[reference: stale-file - this file is a known-stale patch target; on-disk content may differ from earlier tool results. Re-read before treating it as current.]";
 
 /// Marker for version-control history subcommands (`git log` / `git show` /
 /// `git blame`): the output is a point-in-time snapshot of past commits or
 /// revisions, not the current working tree.
-pub(in crate::ai::driver::turn_runtime) const GIT_HISTORY_MARKER: &str =
-    "[reference: git-history - this output describes past commits or revisions, not the current working tree]";
+pub(in crate::ai::driver::turn_runtime) const GIT_HISTORY_MARKER: &str = "[reference: git-history - this output describes past commits or revisions, not the current working tree]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::ai::driver::turn_runtime) enum EvidenceStatus {
@@ -49,9 +46,7 @@ pub(in crate::ai::driver::turn_runtime) fn classify_evidence_status(
     tool_call: &ToolCall,
     content: &str,
 ) -> Option<EvidenceStatus> {
-    if content.trim_start().starts_with("Error:")
-        || content.trim_start().starts_with("Failed:")
-    {
+    if content.trim_start().starts_with("Error:") || content.trim_start().starts_with("Failed:") {
         // Errors carry no usable reference content; a marker would only add noise.
         return None;
     }
@@ -79,9 +74,11 @@ pub(in crate::ai::driver::turn_runtime) fn classify_evidence_status(
     }
 
     // 3. Git history subcommands produce point-in-time snapshots of the past.
-    if matches!(tool_name, "execute_command" | "run_command" | "shell" | "bash")
-        && command_from_arguments(arguments)
-            .is_some_and(|command| is_git_history_command(&command))
+    if matches!(
+        tool_name,
+        "execute_command" | "run_command" | "shell" | "bash"
+    ) && command_from_arguments(arguments)
+        .is_some_and(|command| is_git_history_command(&command))
     {
         return Some(EvidenceStatus::GitHistory);
     }
@@ -311,11 +308,7 @@ mod tests {
     fn classifies_stale_file_read() {
         let mut app = test_app(std::env::temp_dir().join("evidence-status-stale.sqlite"));
         let path = "/data00/rust_tools/src/foo.rs";
-        let call = tool_call(
-            "c4",
-            "read_file",
-            json!({ "file_path": path }),
-        );
+        let call = tool_call("c4", "read_file", json!({ "file_path": path }));
         let normalized = file_tool_target_path(&call).unwrap();
         app.stale_patch_targets.insert(normalized);
         assert_eq!(
@@ -327,7 +320,11 @@ mod tests {
     #[test]
     fn classifies_git_history_command() {
         let app = test_app(std::env::temp_dir().join("evidence-status-git.sqlite"));
-        for command in ["git log --oneline -5", "cd /tmp && git show HEAD", "git blame src/x.rs"] {
+        for command in [
+            "git log --oneline -5",
+            "cd /tmp && git show HEAD",
+            "git blame src/x.rs",
+        ] {
             let call = tool_call("c5", "execute_command", json!({ "command": command }));
             assert_eq!(
                 classify_evidence_status(&app, &call, "commit output"),
@@ -382,7 +379,9 @@ mod tests {
         };
         annotate_tool_result_evidence_status(&app, &call, "row content", &mut prepared);
         assert!(
-            prepared.content_for_model.starts_with(SESSION_HISTORY_MARKER),
+            prepared
+                .content_for_model
+                .starts_with(SESSION_HISTORY_MARKER),
             "got: {}",
             prepared.content_for_model
         );

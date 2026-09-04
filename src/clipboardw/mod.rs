@@ -81,10 +81,7 @@ pub use string_content::{
 pub(crate) fn decode_base64_lenient(input: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
     use base64::engine::general_purpose;
-    let cleaned: String = input
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .collect();
+    let cleaned: String = input.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     general_purpose::STANDARD_PAD_INDIFFERENT
         .decode(&cleaned)
         .ok()

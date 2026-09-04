@@ -22,6 +22,8 @@ pub(super) struct ParsedCli {
     pub(super) no_skills: bool,
     pub(super) mcp_config: String,
     pub(super) help: bool,
+    /// --version: print the version and exit (purely local, no LLM).
+    pub(super) version: bool,
     /// Whether to stay in the interactive REPL after consuming the CLI prompt.
     /// Enabled via `--interactive` / `-i`; when combined with `-ns`, every later
     /// turn continues with notebook retrieval Q&A.
@@ -133,8 +135,7 @@ const INTERNAL_COMMANDS: &[&str] = &[
 ];
 
 const FILES_USAGE: &str = "input file names (repeat -f or use comma-separated list)";
-const NOTE_SEARCH_USAGE: &str =
-    "search knowledge base (memo category); with a positional query answer once, without it enter interactive memo search";
+const NOTE_SEARCH_USAGE: &str = "search knowledge base (memo category); with a positional query answer once, without it enter interactive memo search";
 const GENERATE_COMPLETIONS_USAGE: &str =
     "generate shell completion script (bash/zsh/fish) and exit";
 const REASONING_EFFORT_USAGE: &str = "reasoning effort: minimal | low | medium | high | xhigh | max | off (clears default; support depends on the selected model)";
@@ -168,6 +169,7 @@ fn register_cli_flags(parser: &mut TermParser) {
     parser.add_bool("list-agents", false, "list available agents and exit");
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
+    parser.add_bool("version", false, "print version and exit");
     parser.add_bool(
         "interactive",
         false,
@@ -342,6 +344,7 @@ impl Default for ParsedCli {
             no_skills: false,
             mcp_config: String::new(),
             help: false,
+            version: false,
             interactive: false,
             reasoning_effort_override: None,
             thinking_disabled_override: false,
@@ -377,6 +380,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // Handle help (needs special handling because it is an alias).
     cli.help = parser.contains_flag_strict("help") || parser.contains_flag_strict("h");
+    cli.version = parser.contains_flag_strict("version");
     cli.interactive = parser.contains_flag_strict("interactive");
 
     // Handle model.
@@ -707,11 +711,15 @@ fn generate_bash(
     println!("        if [ \"$COMP_CWORD\" -ge 3 ] && [ \"${{COMP_WORDS[2]}}\" = \"use\" ]; then");
     println!("          COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_agent_meta[@]}}\"))");
     println!("        else");
-    println!("          COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_agent_meta[@]}}\") $(compgen -W \"$agent_sub\" -- \"$cur\"))");
+    println!(
+        "          COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_agent_meta[@]}}\") $(compgen -W \"$agent_sub\" -- \"$cur\"))"
+    );
     println!("        fi");
     println!("        return 0 ;;");
     println!("      /skills|:skills|/skill|:skill)");
-    println!("        COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_skill_meta[@]}}\") $(compgen -W \"$skill_sub\" -- \"$cur\")); return 0 ;;");
+    println!(
+        "        COMPREPLY=($(_a_name_matches \"$cur\" \"${{_a_skill_meta[@]}}\") $(compgen -W \"$skill_sub\" -- \"$cur\")); return 0 ;;"
+    );
     println!("      /personas|:personas)");
     println!("        COMPREPLY=($(compgen -W \"$persona_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /model|:model)");

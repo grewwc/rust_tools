@@ -56,7 +56,6 @@ pub(super) fn has_pending_foreground_process(app: &App) -> bool {
     })
 }
 
-
 /// Loads all agents fresh from disk, enabling hot-reload of newly added/modified agents.
 /// Returns a message to show when something changed; the foreground driver
 /// prints it after clearing the dynamic status line.
@@ -120,13 +119,7 @@ impl AgentReloadIdentity<'_> {
         hasher.update(b"\0");
         hasher.update(manifest.prompt.as_bytes());
         hasher.update(b"\0");
-        hasher.update(
-            manifest
-                .system_prompt
-                .as_deref()
-                .unwrap_or("")
-                .as_bytes(),
-        );
+        hasher.update(manifest.system_prompt.as_deref().unwrap_or("").as_bytes());
         hasher.update(b"\0");
         hasher.update(manifest.model.as_deref().unwrap_or("").as_bytes());
         hasher.update(b"\0");
@@ -260,8 +253,8 @@ mod tests {
         assert_eq!(
             agent_manifests_fingerprint(&[manifest_fixture()]),
             [
-                140, 115, 69, 44, 131, 187, 137, 203, 220, 193, 19, 194, 52, 186, 43, 85,
-                249, 202, 25, 228, 148, 174, 159, 6, 122, 59, 152, 207, 143, 72, 64, 11,
+                140, 115, 69, 44, 131, 187, 137, 203, 220, 193, 19, 194, 52, 186, 43, 85, 249, 202,
+                25, 228, 148, 174, 159, 6, 122, 59, 152, 207, 143, 72, 64, 11,
             ]
         );
     }

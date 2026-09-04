@@ -50,7 +50,9 @@ pub(in crate::ai) fn truncate_last_real_user_message_to_fit(
     )
 }
 
-pub(in crate::ai) fn current_turn_precision_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String> {
+pub(in crate::ai) fn current_turn_precision_tool_call_ids(
+    messages: &[Message],
+) -> rustc_hash::FxHashSet<String> {
     let mut out = rustc_hash::FxHashSet::default();
     // Synthetic user messages do not form a turn boundary: otherwise precision
     // tool results from earlier turns of this round would lose protection and be
@@ -78,7 +80,9 @@ pub(in crate::ai) fn current_turn_precision_tool_call_ids(messages: &[Message]) 
 /// is wider than the precision inline set: aggregated results like `task_wait`
 /// are not part of the precision quota, but their bodies likewise must not be
 /// truncated by Path C.
-pub(in crate::ai) fn current_turn_lossless_tool_call_ids(messages: &[Message]) -> rustc_hash::FxHashSet<String> {
+pub(in crate::ai) fn current_turn_lossless_tool_call_ids(
+    messages: &[Message],
+) -> rustc_hash::FxHashSet<String> {
     let mut out = rustc_hash::FxHashSet::default();
     // When there is no real user, lossless-mandatory results of the synthetic
     // turn must not be exposed to Path C.

@@ -157,12 +157,16 @@ impl ToolPermissions {
             // snake_case and MCP names use `mcp_<server>_` prefixes, so neither
             // contains ':' today; rsplit is a defensive choice.
             let Some((pattern, policy_token)) = entry.rsplit_once(':') else {
-                warnings.push(format!("ignored tool-permission rule '{entry}' (want pattern:policy)"));
+                warnings.push(format!(
+                    "ignored tool-permission rule '{entry}' (want pattern:policy)"
+                ));
                 continue;
             };
             let pattern = pattern.trim();
             if pattern.is_empty() {
-                warnings.push(format!("ignored tool-permission rule '{entry}' (empty pattern)"));
+                warnings.push(format!(
+                    "ignored tool-permission rule '{entry}' (empty pattern)"
+                ));
                 continue;
             }
             let Some(policy) = ToolPermission::parse(policy_token) else {
@@ -280,8 +284,13 @@ impl ToolExecutor for PermissionExecutor {
         &'a self,
         app: &'a mut App,
         tool_calls: Vec<ToolCall>,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolExecOutput, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ToolExecOutput, Box<dyn std::error::Error + Send + Sync>>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             let decisions = self.decide(&tool_calls);
 
@@ -464,7 +473,10 @@ mod tests {
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(perms.needs_ask("execute_command"));
         assert!(perms.is_denied("apply_patch"));
-        assert!(perms.is_allowed("read_file"), "prefix rule read_* should allow");
+        assert!(
+            perms.is_allowed("read_file"),
+            "prefix rule read_* should allow"
+        );
         // Unmatched tool falls back to the parsed default (deny).
         assert!(perms.is_denied("some_other_tool"));
     }
@@ -542,8 +554,14 @@ mod tests {
             &'a self,
             _app: &'a mut App,
             tool_calls: Vec<ToolCall>,
-        ) -> Pin<Box<dyn Future<Output = Result<ToolExecOutput, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<ToolExecOutput, Box<dyn std::error::Error + Send + Sync>>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
             self.seen.fetch_add(tool_calls.len(), Ordering::SeqCst);
             Box::pin(async move {
                 let n = tool_calls.len();
@@ -575,7 +593,9 @@ mod tests {
     async fn all_allowed_takes_fast_path() {
         let seen = Arc::new(AtomicUsize::new(0));
         let mw = deny_only("never_called");
-        let exec = mw.wrap(Box::new(EchoExecutor { seen: Arc::clone(&seen) }));
+        let exec = mw.wrap(Box::new(EchoExecutor {
+            seen: Arc::clone(&seen),
+        }));
         let mut app = test_app();
         let out = exec
             .execute(&mut app, vec![call("a", "read_file"), call("b", "tree")])
@@ -590,13 +610,19 @@ mod tests {
     async fn denied_call_is_synthesized_and_not_dispatched() {
         let seen = Arc::new(AtomicUsize::new(0));
         let mw = deny_only("apply_patch");
-        let exec = mw.wrap(Box::new(EchoExecutor { seen: Arc::clone(&seen) }));
+        let exec = mw.wrap(Box::new(EchoExecutor {
+            seen: Arc::clone(&seen),
+        }));
         let mut app = test_app();
         let out = exec
             .execute(&mut app, vec![call("only", "apply_patch")])
             .await
             .unwrap();
-        assert_eq!(seen.load(Ordering::SeqCst), 0, "denied call never reaches inner");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "denied call never reaches inner"
+        );
         assert_eq!(out.tool_results.len(), 1);
         assert!(out.tool_results[0].content.starts_with("Error:"));
         assert_eq!(out.tool_results[0].tool_call_id, "only");
@@ -607,7 +633,9 @@ mod tests {
     async fn partial_gating_preserves_request_order() {
         let seen = Arc::new(AtomicUsize::new(0));
         let mw = deny_only("apply_patch");
-        let exec = mw.wrap(Box::new(EchoExecutor { seen: Arc::clone(&seen) }));
+        let exec = mw.wrap(Box::new(EchoExecutor {
+            seen: Arc::clone(&seen),
+        }));
         let mut app = test_app();
         // Denied call sits in the MIDDLE to prove slot-based reassembly, not append.
         let out = exec
@@ -621,14 +649,22 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(seen.load(Ordering::SeqCst), 2, "only allowed calls dispatched");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "only allowed calls dispatched"
+        );
         // All four parallel vectors stay aligned and in original order.
         let ids: Vec<&str> = out
             .tool_results
             .iter()
             .map(|r| r.tool_call_id.as_str())
             .collect();
-        assert_eq!(ids, vec!["c0", "c1", "c2"], "result order matches request order");
+        assert_eq!(
+            ids,
+            vec!["c0", "c1", "c2"],
+            "result order matches request order"
+        );
         let exec_ids: Vec<&str> = out
             .executed_tool_calls
             .iter()

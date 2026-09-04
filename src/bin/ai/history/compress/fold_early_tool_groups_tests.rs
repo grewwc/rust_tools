@@ -657,13 +657,10 @@ fn encrypted_replay_reasoning_survives_recent_reasoning_window() {
     // 5 条 tool-call reasoning 超过保留窗口：不带标记的普通 reasoning 会被裁掉，
     // 加密回放状态必须全部逐字节保留（与 exact-replay 同等待遇）。
     assert!(
-        messages
-            .iter()
-            .filter(|m| m.tool_calls.is_some())
-            .all(|m| m
-                .reasoning_content
-                .as_deref()
-                .is_some_and(|r| r.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX))),
+        messages.iter().filter(|m| m.tool_calls.is_some()).all(|m| m
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|r| r.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX))),
         "encrypted replay 状态不能被通用三轮窗口裁掉"
     );
 }
@@ -865,15 +862,14 @@ fn encrypted_reasoning_replay_rejects_cross_model() {
     // 切换/回退到其它模型：解码必须返回 None，绝不把 A 的加密状态喂给 B。
     assert!(decode_encrypted_reasoning_replay_for_model("gpt-5.6-terra", &encoded).is_none());
     // exact-replay 解码器也不得误解码加密前缀 payload。
-    assert!(
-        decode_reasoning_replay_for_model("muse-spark-1.2-contributor", &encoded).is_none()
-    );
+    assert!(decode_reasoning_replay_for_model("muse-spark-1.2-contributor", &encoded).is_none());
 }
 
 #[test]
 fn encrypted_reasoning_marker_survives_persist_sanitize() {
     let model = "muse-spark-1.2-contributor";
-    let items = vec![serde_json::json!({"type":"reasoning","encrypted_content":"ENC","summary":[]})];
+    let items =
+        vec![serde_json::json!({"type":"reasoning","encrypted_content":"ENC","summary":[]})];
     let mut assistant = assistant_call("spark-call", "read_file");
     assistant.reasoning_content = Some(encode_encrypted_reasoning_replay_state(model, &items));
 

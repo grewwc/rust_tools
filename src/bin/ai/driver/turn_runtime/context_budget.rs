@@ -167,13 +167,14 @@ pub(super) fn apply_pre_request_context_budget(
     };
     let original = messages.clone();
     let drained = std::mem::take(messages);
-    let (compressed, _, after_chars) =
-        crate::ai::history::mid_turn_compress(
-            drained,
-            target_chars,
-            Some(overflow_dir.as_path()),
-            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
-        );
+    let (compressed, _, after_chars) = crate::ai::history::mid_turn_compress(
+        drained,
+        target_chars,
+        Some(overflow_dir.as_path()),
+        crate::ai::driver::runtime_ctx::effective_cwd()
+            .ok()
+            .as_deref(),
+    );
     *messages = compressed;
     // mid_turn_compress inserts the compaction state note after the last user message (which is
     // the current round's active region in tool-loop scenarios). But the request boundary requires
@@ -197,8 +198,8 @@ pub(super) fn apply_pre_request_context_budget(
     if let Some(reason) = rollback_reason {
         *messages = original;
         report.after_chars = after_prepass_chars;
-        report.changed = report.lossless_removed_messages > 0
-            || report.memory_projection_removed_messages > 0;
+        report.changed =
+            report.lossless_removed_messages > 0 || report.memory_projection_removed_messages > 0;
         report.rolled_back = after_chars < scan.total_chars;
         if report.rolled_back {
             report.rollback_reason = Some(reason);
@@ -901,10 +902,8 @@ mod tests {
 
         // 2. app: endpoint points at the mock; history_max_chars is pinned here so
         // this test stays deterministic regardless of future production-default changes
-        let history_file = std::env::temp_dir().join(format!(
-            "llm_summary_repro_{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
+        let history_file =
+            std::env::temp_dir().join(format!("llm_summary_repro_{}.jsonl", uuid::Uuid::new_v4()));
         let mut app = test_app(history_file);
         app.config.endpoint = format!("http://{addr}");
         app.config.history_max_chars = 90_000;
@@ -935,11 +934,10 @@ mod tests {
         // 4. First verify the gate stays closed once regular compression meets the threshold, preserving exact context.
         let mut work = messages.clone();
         let report = apply_pre_request_context_budget(&app, &app.current_model, &mut work);
-        let llm_threshold =
-            crate::ai::driver::turn_runtime::pre_request_llm_summary_threshold(
-                &app.current_model,
-                app.config.history_max_chars,
-            );
+        let llm_threshold = crate::ai::driver::turn_runtime::pre_request_llm_summary_threshold(
+            &app.current_model,
+            app.config.history_max_chars,
+        );
         let gate_open = crate::ai::driver::turn_runtime::should_try_llm_summary(
             &app.session_id,
             report.after_chars,
@@ -948,8 +946,7 @@ mod tests {
         assert!(
             !gate_open,
             "常规压缩已达标后不应调用有损 LLM 摘要: after_chars={} threshold={}",
-            report.after_chars,
-            llm_threshold
+            report.after_chars, llm_threshold
         );
 
         // 5. Many small old user messages cannot be silently dropped by regular compression; when
@@ -988,7 +985,9 @@ mod tests {
                 2,
                 4_000,
                 app.config.history_max_chars,
-                crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+                crate::ai::driver::runtime_ctx::effective_cwd()
+                    .ok()
+                    .as_deref(),
             )
             .await;
 
@@ -1008,8 +1007,7 @@ mod tests {
         );
         assert!(
             after_msgs.iter().any(|m| {
-                m.role == "internal_note"
-                    && m.content.to_string().contains("mid-turn-summary")
+                m.role == "internal_note" && m.content.to_string().contains("mid-turn-summary")
             }),
             "结果中缺少 [mid-turn-summary] 摘要 note"
         );

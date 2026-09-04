@@ -181,7 +181,9 @@ pub(super) fn content_fingerprint(s: &str) -> u64 {
 
 /// 提取最近一轮 assistant 的 reasoning 指纹（若有）。软提示后 reasoning 指纹
 /// 变化视为「给出了新理由」，触发 grace 宽限。
-pub(super) fn extract_round_reasoning_fingerprint(messages: &[crate::ai::history::Message]) -> Option<u64> {
+pub(super) fn extract_round_reasoning_fingerprint(
+    messages: &[crate::ai::history::Message],
+) -> Option<u64> {
     let last_assistant = messages.iter().rev().find(|m| m.role == "assistant")?;
     let reasoning = last_assistant.reasoning_content.as_ref()?;
     if reasoning.trim().is_empty() {
@@ -194,7 +196,9 @@ pub(super) fn extract_round_reasoning_fingerprint(messages: &[crate::ai::history
 /// 同一文件的新分页、同一页面的新区域也可能带来真实新证据。结果内容发生变化时记为
 /// 信息增益；出现新证据时会重启 exact/coarse 连续重复窗口，只有结果也不再变化时才
 /// 升级。
-pub(super) fn extract_round_evidence_fingerprints(messages: &[crate::ai::history::Message]) -> Vec<u64> {
+pub(super) fn extract_round_evidence_fingerprints(
+    messages: &[crate::ai::history::Message],
+) -> Vec<u64> {
     use serde_json::Value;
 
     let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
@@ -262,7 +266,9 @@ pub(super) fn extract_round_evidence_fingerprints(messages: &[crate::ai::history
             Some(command) if command_is_cargo_verify(command) => normalize_verify_output(text),
             _ => text.to_string(),
         };
-        fingerprints.push(content_fingerprint(&format!("{tool_name}\0{fingerprint_text}")));
+        fingerprints.push(content_fingerprint(&format!(
+            "{tool_name}\0{fingerprint_text}"
+        )));
     }
     fingerprints.sort_unstable();
     fingerprints.dedup();
@@ -343,7 +349,9 @@ pub(super) fn first_path_token(cmd: &str) -> Option<String> {
 
 /// 提取最近一轮「从文件头开始读」的目标路径：read_file 的 offset 缺省/0/1；
 /// execute_command 中 cat/head/less/more/view/nl/tail -c +1/sed -n 1, 等。
-pub(super) fn extract_round_from_top_read_targets(messages: &[crate::ai::history::Message]) -> Vec<String> {
+pub(super) fn extract_round_from_top_read_targets(
+    messages: &[crate::ai::history::Message],
+) -> Vec<String> {
     use serde_json::Value;
     let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
         return Vec::new();
@@ -409,7 +417,9 @@ pub(super) fn extract_round_from_top_read_targets(messages: &[crate::ai::history
 
 /// 提取最近一轮被 write_file/apply_patch 直接修改的目标路径（修改后从头重读
 /// 属于合法验证，应清零重扫计数）。
-pub(super) fn extract_round_mutated_targets(messages: &[crate::ai::history::Message]) -> Vec<String> {
+pub(super) fn extract_round_mutated_targets(
+    messages: &[crate::ai::history::Message],
+) -> Vec<String> {
     use serde_json::Value;
     let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
         return Vec::new();
