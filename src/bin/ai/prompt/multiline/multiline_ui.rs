@@ -37,11 +37,6 @@ const VIEWPORT_CHROME_LINES: u16 = 2;
 const MIN_TEXTAREA_LINES: u16 = 2;
 /// With empty input, reserve 3 lines for the textarea plus the fixed chrome.
 const EMPTY_VIEWPORT_HEIGHT: u16 = 3 + VIEWPORT_CHROME_LINES;
-/// Rebuild only after a resize burst has been quiet for this long. Rebuilding
-/// every intermediate size paints the fixed viewport on a new terminal row on
-/// each frame in terminals such as VS Code, leaving stacked border/caret rows.
-const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(150000);
-
 /// Max candidate lines shown at once in the completion panel; aligned with
 /// `render::COMPLETION_WINDOW`.
 const PANEL_COMPLETION_WINDOW: u16 = 12;
@@ -364,25 +359,6 @@ fn take_redraw_request(redraw_requested: &mut bool, external_change: bool) -> bo
     std::mem::take(redraw_requested)
 }
 
-/// Consumes consecutive resize notifications after the first one. The caller
-/// rebuilds the viewport once this returns, using the final terminal size. A
-/// non-resize event is returned rather than discarded so keyboard, paste,
-/// focus, and mouse input keep their original ordering.
-fn drain_resize_burst(
-    mut poll_event: impl FnMut(Duration) -> io::Result<bool>,
-    mut read_event: impl FnMut() -> io::Result<Event>,
-) -> io::Result<Option<Event>> {
-    loop {
-        if !poll_event(RESIZE_SETTLE_DELAY)? {
-            return Ok(None);
-        }
-        let event = read_event()?;
-        if !matches!(event, Event::Resize(_, _)) {
-            return Ok(Some(event));
-        }
-    }
-}
-
 fn submitted_input_preview_lines(content: &str) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut lines = content.lines();
@@ -490,6 +466,10 @@ impl PromptEditor {
             // an unchanged input screen. Resize and title events explicitly
             // request the next frame.
             let mut redraw_requested = true;
+            // Set when a resize arrives; the rebuild is deferred until the next
+            // non-resize event so the emulator's async reflow has finished and
+            // the DSR-based anchor is accurate again.
+            let mut pending_resize_rebuild = false;
 
             loop {
                 // The background only publishes title updates; the terminal is
@@ -595,14 +575,20 @@ impl PromptEditor {
                 {
                     continue;
                 }
-                let mut event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
+                let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
                 if let Event::Resize(_, _) = event {
-                    let deferred_event = drain_resize_burst(
-                        |timeout| {
-                            event::poll(timeout).map_err(|e| io::Error::other(e.to_string()))
-                        },
-                        || event::read().map_err(|e| io::Error::other(e.to_string())),
-                    )?;
+                    // Do not rebuild here: the emulator (VS Code / xterm.js)
+                    // rewraps the scrollback asynchronously after the resize
+                    // events, so a DSR cursor query issued now returns the
+                    // pre-reflow row and the box would be rebuilt at a stale
+                    // position (the caret visibly jumps). Defer the rebuild to
+                    // just before the next non-resize event (typically the next
+                    // keypress), when the reflow has certainly finished.
+                    pending_resize_rebuild = true;
+                    continue;
+                }
+                if pending_resize_rebuild {
+                    pending_resize_rebuild = false;
                     let terminal_size = terminal.backend().size()?;
                     let requested_height = viewport_height_with_completion(
                         terminal_size.height,
@@ -628,21 +614,10 @@ impl PromptEditor {
                         last_drawn_area.map(|area| area.y),
                         false,
                     )?;
-                    // Store the rebuilt box and re-park immediately rather than
-                    // waiting for the next draw: resize notifications arrive in
-                    // a burst, and every rebuild must leave the anchor valid for
-                    // the one that follows.
+                    // Store the rebuilt box and re-park immediately so the next
+                    // draw and any later rebuild anchor to the current box.
                     park_reflow_anchor(&mut terminal, rebuilt_area)?;
                     last_drawn_area = Some(rebuilt_area);
-                    // Rebuilding starts with empty ratatui buffers and the viewport
-                    // was explicitly cleared, so a forced all-cell repaint would
-                    // only increase autowrap risk while the user is still resizing.
-                    force_repaint_next_frame = false;
-                    redraw_requested = true;
-                    let Some(deferred_event) = deferred_event else {
-                        continue;
-                    };
-                    event = deferred_event;
                 }
 
                 let previous_input_len = textarea_logical_char_count(&textarea);
@@ -711,11 +686,10 @@ mod tests {
     };
 
     use super::{
-        RESIZE_SETTLE_DELAY, ViewportRebuildMode, clear_fixed_viewport,
-        clear_row_range, drain_resize_burst, fixed_viewport_area,
-        force_frame_repaint, multiline_viewport_height, park_reflow_anchor,
-        parked_anchor_offset,
-        prepare_fixed_viewport, submitted_input_preview_lines, take_redraw_request,
+        ViewportRebuildMode, clear_fixed_viewport, clear_row_range,
+        fixed_viewport_area, force_frame_repaint, multiline_viewport_height,
+        park_reflow_anchor, parked_anchor_offset, prepare_fixed_viewport,
+        submitted_input_preview_lines, take_redraw_request,
         terminal_with_fixed_viewport, viewport_height_with_completion,
     };
 
@@ -729,47 +703,6 @@ mod tests {
 
         assert!(take_redraw_request(&mut redraw_requested, true));
         assert!(!take_redraw_request(&mut redraw_requested, false));
-    }
-
-    #[test]
-    fn resize_burst_waits_for_quiet_before_rebuilding() {
-        let mut readiness = VecDeque::from([true, true, false]);
-        let mut events = VecDeque::from([Event::Resize(100, 30), Event::Resize(120, 30)]);
-        let mut poll_timeouts = Vec::new();
-
-        let deferred = drain_resize_burst(
-            |timeout| {
-                poll_timeouts.push(timeout);
-                Ok(readiness.pop_front().unwrap())
-            },
-            || Ok(events.pop_front().unwrap()),
-        )
-        .unwrap();
-
-        assert!(deferred.is_none());
-        assert!(events.is_empty());
-        assert_eq!(poll_timeouts, vec![RESIZE_SETTLE_DELAY; 3]);
-    }
-
-    #[test]
-    fn resize_burst_preserves_first_non_resize_event() {
-        let mut readiness = VecDeque::from([true, true]);
-        let mut events = VecDeque::from([
-            Event::Resize(100, 30),
-            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
-        ]);
-
-        let deferred = drain_resize_burst(
-            |_| Ok(readiness.pop_front().unwrap()),
-            || Ok(events.pop_front().unwrap()),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            deferred,
-            Some(Event::Key(key)) if key.code == KeyCode::Char('x')
-        ));
-        assert!(events.is_empty());
     }
 
     #[test]
