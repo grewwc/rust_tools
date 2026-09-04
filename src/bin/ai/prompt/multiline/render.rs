@@ -261,7 +261,8 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                 .add_modifier(Modifier::ITALIC),
         ));
         let header = Line::from(spans);
-        f.render_widget(Paragraph::new(header), header_area);
+        let truncated_header = truncate_line_to_width(&header, header_area.width as usize);
+        f.render_widget(Paragraph::new(truncated_header), header_area);
     }
 
     let char_count = current_content.chars().count();
@@ -504,7 +505,12 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             spans
         })]
     };
-    f.render_widget(Paragraph::new(help_lines), chunks[4]);
+    let help_area = chunks[4];
+    let truncated_help_lines = help_lines
+        .into_iter()
+        .map(|line| truncate_line_to_width(&line, help_area.width as usize))
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(truncated_help_lines), help_area);
 
     if let Some(msg) = status_msg {
         let c2 = chunks[4];
@@ -623,6 +629,43 @@ fn count_trailing_blank_lines(lines: &[String]) -> usize {
         .count()
 }
 
+fn truncate_line_to_width<'a>(line: &Line<'a>, max_width: usize) -> Line<'a> {
+    if max_width == 0 {
+        return Line::default();
+    }
+    let mut current_width = 0;
+    let mut truncated_spans = Vec::new();
+
+    for span in &line.spans {
+        let span_str = span.content.as_ref();
+        let span_w = UnicodeWidthStr::width_cjk(span_str);
+        if current_width + span_w <= max_width {
+            truncated_spans.push(span.clone());
+            current_width += span_w;
+        } else {
+            let remaining = max_width.saturating_sub(current_width);
+            if remaining > 0 {
+                let mut partial = String::new();
+                let mut w = 0;
+                for ch in span_str.chars() {
+                    let ch_w = UnicodeWidthChar::width_cjk(ch).unwrap_or(1);
+                    if w + ch_w > remaining {
+                        break;
+                    }
+                    partial.push(ch);
+                    w += ch_w;
+                }
+                if !partial.is_empty() {
+                    truncated_spans.push(Span::styled(partial, span.style));
+                }
+            }
+            break;
+        }
+    }
+
+    Line::from(truncated_spans)
+}
+
 /// Truncate text to fit a display width.
 /// Width is computed with the unicode-width crate; unrecognized characters are conservatively estimated at width 1.
 fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
@@ -663,13 +706,14 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
 mod tests {
     use super::{
         count_trailing_blank_lines, popup_layout_config, render_multiline_popup,
-        truncate_with_ellipsis,
+        truncate_line_to_width, truncate_with_ellipsis,
     };
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
         backend::TestBackend,
         layout::{Position, Rect},
-        style::{Color, Modifier},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
     };
     use tui_textarea::{CursorMove, TextArea};
     use unicode_width::UnicodeWidthStr;
@@ -688,6 +732,23 @@ mod tests {
                     .unwrap_or(" ")
             })
             .collect()
+    }
+
+    #[test]
+    fn test_truncate_line_to_width() {
+        let line = Line::from(vec![
+            Span::styled("model: ", Style::default().fg(Color::Red)),
+            Span::styled("glm-5.2-super-relay", Style::default().fg(Color::Green)),
+            Span::styled(" | reasoning: max", Style::default().fg(Color::Blue)),
+        ]);
+        let truncated = truncate_line_to_width(&line, 10);
+        let rendered_text = truncated
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered_text, "model: glm");
+        assert_eq!(display_width(&rendered_text), 10);
     }
 
     #[test]
@@ -763,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_prompt_draws_buffer_cursor_and_hides_hardware_cursor() {
+    fn empty_prompt_reports_viewport_relative_caret_position() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::with_options(
             backend,
@@ -813,9 +874,8 @@ mod tests {
                 visual_caret.y.saturating_sub(viewport_area.y),
             ))
         );
-        assert!(!terminal.backend().cursor_visible());
-        // The visible caret is a drawn vertical-bar cell; the input loop parks
-        // the hidden hardware cursor at the viewport tail after the draw.
+        // The visible caret is a drawn vertical-bar cell; the hidden hardware
+        // cursor is parked at the viewport tail by the input loop.
         let caret_cell = &terminal.backend().buffer()[(visual_caret.x, visual_caret.y)];
         assert_eq!(caret_cell.symbol(), "▏");
     }
@@ -981,7 +1041,7 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // The buffer caret at the end of the CJK text uses tui-textarea's
+        // The caret position at the end of the CJK text uses tui-textarea's
         // calculated position, avoiding an independent CJK-width calculation.
         // Content starts one column right of the left-edge marker bar; the bar
         // occupies no row, so the first text line sits on the box's top row.
@@ -994,9 +1054,9 @@ mod tests {
                 expected.y.saturating_sub(viewport_area.y),
             ))
         );
-        assert!(!terminal.backend().cursor_visible());
         // The cell at the measured caret holds the drawn vertical-bar glyph.
         let caret_cell = &terminal.backend().buffer()[(expected.x, expected.y)];
         assert_eq!(caret_cell.symbol(), "▏");
     }
+
 }

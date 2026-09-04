@@ -1,0 +1,18 @@
+{
+  "key": "qwen3.8-max",
+  "aliases": [
+    "QWEN3_MAX"
+  ],
+  "name": "qwen3.8-max-0902",
+  "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+  "quality_tier": "strong",
+  "adapter": "alibaba",
+  "is_vl": true,
+  "search_enabled": true,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "reasoning_effort_wire": "top_level",
+  "default_reasoning_effort": "max",
+  "subagent_priority": 0,
+  "max_output_tokens": 131072
+}
