@@ -354,7 +354,7 @@ impl CommandCompleter {
     /// Model-name completion match ranks:
     /// - 0: prefix match on replacement (original behavior, case-insensitive)
     /// - 1: two-segment "name + platform" match, e.g. `deep-v` → `deepseek-v4-flash-volcano`
-    /// - 2: per-segment prefix match, e.g. `deep-v` → all `deepseek-v4-*`
+    /// - 2..=255: fuzzy subsequence match over key/name/platform/aliases, graded by score
     /// Returns None when nothing matches.
     fn model_token_match_rank(
         token: &str,
@@ -378,14 +378,13 @@ impl CommandCompleter {
                 }
             }
         }
-        // Per-segment prefix matching: each query segment prefix-hits candidate segments in order (skipping segments allowed).
-        if Self::segments_prefix_match(&token, &Self::model_searchable_text(model).to_ascii_lowercase()) {
-            return Some(2);
-        }
-        None
+        // Fuzzy subsequence fallback over key/name/platform/aliases, graded by score
+        // but always ranked below the structured tiers above (min rank 2).
+        Self::fuzzy_match_score(&token, &Self::model_searchable_text(model))
+            .map(|score| Self::fuzzy_score_to_rank(score, 2))
     }
 
-    /// Search text used for per-segment matching: key + name + platform + aliases.
+    /// Search text used for fuzzy matching: key + name + platform + aliases.
     fn model_searchable_text(model: &crate::ai::model_names::ModelDef) -> String {
         let mut text = format!("{} {}", model.key, model.name);
         let platform = crate::ai::model_names::platform_slug(model);
@@ -400,47 +399,80 @@ impl CommandCompleter {
         text
     }
 
-    /// Split query and candidate on `- . _ / : whitespace`, requiring every query segment
-    /// to prefix-hit some candidate segment in order (skipping segments allowed).
-    fn segments_prefix_match(query: &str, candidate: &str) -> bool {
-        let q_segments: Vec<&str> = query
-            .split(['-', '.', '_', '/', ':', ' '])
-            .filter(|seg| !seg.is_empty())
-            .collect();
-        if q_segments.is_empty() {
-            return false;
+    /// Fuzzy subsequence match used as the generic name-matching fallback (agents,
+    /// skills, models): every query character must appear in the candidate in order
+    /// (ASCII case-insensitive), with no segment splitting required. The returned
+    /// score grades match quality (higher is better): `+1` per matched character,
+    /// `+8` when it sits on a word boundary (start of candidate, right after a
+    /// `- . _ / : space` separator, or an ASCII camelCase hump), `+5` when it
+    /// continues a consecutive run, minus a capped penalty for the characters
+    /// skipped between two matches so long gaps sink loose matches. Returns `None`
+    /// when `query` is not an in-order subsequence of `candidate`; an empty query
+    /// matches nothing here (callers rank empty tokens via their exact-prefix tier).
+    fn fuzzy_match_score(query: &str, candidate: &str) -> Option<i64> {
+        let query: Vec<char> = query.trim().to_ascii_lowercase().chars().collect();
+        if query.is_empty() {
+            return None;
         }
-        let c_segments: Vec<&str> = candidate
-            .split(['-', '.', '_', '/', ':', ' '])
-            .filter(|seg| !seg.is_empty())
-            .collect();
+        let chars: Vec<char> = candidate.chars().collect();
+        let lowered: Vec<char> = candidate.to_ascii_lowercase().chars().collect();
         let mut qi = 0;
-        for seg in &c_segments {
-            if seg.starts_with(q_segments[qi]) {
-                qi += 1;
-                if qi == q_segments.len() {
-                    return true;
+        let mut prev: Option<usize> = None;
+        let mut score: i64 = 0;
+        for (i, ch) in lowered.iter().enumerate() {
+            if qi == query.len() {
+                break;
+            }
+            if *ch != query[qi] {
+                continue;
+            }
+            score += 1;
+            // ASCII case folding is 1:1 per char, so `chars[i]` is the original-case
+            // counterpart of `lowered[i]` and keeps camelCase boundaries detectable.
+            let boundary = i == 0
+                || matches!(chars[i - 1], '-' | '.' | '_' | '/' | ':' | ' ')
+                || (chars[i - 1].is_ascii_lowercase() && chars[i].is_ascii_uppercase());
+            if boundary {
+                score += 8;
+            }
+            if let Some(p) = prev {
+                if p + 1 == i {
+                    score += 5;
+                } else {
+                    // Cap the gap penalty so one long gap cannot dominate the score.
+                    score -= (((i - p - 1).min(8) as i64) + 1) / 2;
                 }
             }
+            prev = Some(i);
+            qi += 1;
         }
-        false
+        (qi == query.len()).then_some(score)
+    }
+
+    /// Map a fuzzy score (higher = better) onto the rank scale (lower = better)
+    /// used by the completion sorts, clamped to `min_rank..=255` so callers can
+    /// reserve smaller ranks for stronger tiers (exact prefix = 0, structured
+    /// name+platform match = 1).
+    fn fuzzy_score_to_rank(score: i64, min_rank: u8) -> u8 {
+        (255 - score).clamp(i64::from(min_rank), i64::from(u8::MAX)) as u8
     }
 
     /// Generic name completion match ranks (agent / skill etc.):
     /// - 0: prefix match on replacement (original behavior, case-insensitive)
-    /// - 1: per-segment prefix match on replacement, e.g. `fast` → `audit-fast`, `own` → `audit_own_changes`
+    /// - 1..=255: fuzzy subsequence match on the replacement, graded by match quality
+    ///   (word-boundary hits and consecutive runs rank above loose gap matches), e.g.
+    ///   `fast` → `audit-fast`, `own` → `audit_own_changes`, `asc` → `async-agent-auditor`
     /// Only the name itself participates: descriptions are display-only and never matched (preventing `audit_o`
     /// from falsely hitting unrelated skills whose descriptions contain words like "audits of").
     /// Returns None when nothing matches.
     fn name_token_match_rank(token: &str, replacement: &str) -> Option<u8> {
-        let token = token.trim().to_ascii_lowercase();
-        if replacement.to_ascii_lowercase().starts_with(&token) {
+        if replacement
+            .to_ascii_lowercase()
+            .starts_with(&token.trim().to_ascii_lowercase())
+        {
             return Some(0);
         }
-        if Self::segments_prefix_match(&token, &replacement.to_ascii_lowercase()) {
-            return Some(1);
-        }
-        None
+        Self::fuzzy_match_score(token, replacement).map(|score| Self::fuzzy_score_to_rank(score, 1))
     }
 
     fn agent_subcommands() -> &'static [&'static str] {
@@ -470,7 +502,7 @@ impl CommandCompleter {
             // fall back synchronously to a disk scan, mirroring the skill completion fallback when SKILL_NAME_CANDIDATES=None.
             Self::agent_candidates_from_manifests(&crate::ai::agents::load_all_agents())
         };
-        // Smart matching: prefix (rank 0) > per-segment prefix (rank 1, e.g. `fast` → `audit-fast`),
+        // Smart matching: exact prefix (rank 0) > graded fuzzy subsequence (e.g. `fast` → `audit-fast`),
         // consistent with model completion. Only names match; descriptions are display-only.
         let mut matched: Vec<(u8, CompletionCandidate)> = candidates
             .into_iter()
@@ -644,7 +676,7 @@ impl CommandCompleter {
                 match second {
                     None => {
                         // Second token: model names (with current pinned on top) + `/model` subcommand literals.
-                        // Model names use smart matching (prefix > name+platform two-segment > per-segment prefix),
+                        // Model names use smart matching (prefix > name+platform two-segment > fuzzy subsequence score),
                         // so `deep-v` also completes to `deepseek-v4-flash-volcano`.
                         let mut matched: Vec<(u8, CompletionCandidate)> =
                             Self::model_name_candidates()
@@ -824,7 +856,7 @@ impl CommandCompleter {
 ///   e.g. `@skillhum` → matches skills starting with `hum`;
 /// - `@skill:<filter>` / `@skills:<filter>`: the colon-equivalent form (the canonical form inserted when a completion is picked).
 ///
-/// Matching uses [`CommandCompleter::name_token_match_rank`] smart matching (prefix > per-segment prefix),
+/// Matching uses [`CommandCompleter::name_token_match_rank`] smart matching (exact prefix > graded fuzzy subsequence),
 /// e.g. `@skills:own` → `audit_own_changes`. Once picked the line becomes `@skills:<name>`,
 /// and the skill is force-injected for this turn. Returns `(token_start, candidates)` where token_start is the byte offset of `@`.
 fn complete_skill_reference(before: &str) -> Option<(usize, Vec<CompletionCandidate>)> {
@@ -1227,7 +1259,7 @@ mod tests {
         {
             return; // skip when the agent is absent
         }
-        // Segment matching: `fast` is not a prefix of `audit-fast` but hits its second segment.
+        // Fuzzy matching: `fast` is not a prefix of `audit-fast` but hits its second segment boundary.
         let (_, direct) = CommandCompleter::complete_for_line("/agent fast", 11);
         assert!(
             direct
@@ -1252,7 +1284,7 @@ mod tests {
         if !skills.iter().any(|s| s.name == "audit_own_changes") {
             return; // skip when the skill is absent
         }
-        // Segment matching: `own` is not a prefix of `audit_own_changes` but hits its second segment.
+        // Fuzzy matching: `own` is not a prefix of `audit_own_changes` but hits its second segment boundary.
         let (_, candidates) = CommandCompleter::complete_for_line("/skills own", 11);
         assert!(
             candidates
@@ -1608,7 +1640,7 @@ mod tests {
         let Some(first) = skills.first() else {
             return;
         };
-        // Use the first letter as the filter; every candidate name should pass smart matching (prefix or segment).
+        // Use the first letter as the filter; every candidate name should pass smart matching (prefix or fuzzy).
         let ch = first.name.chars().next().unwrap();
         let line = format!("@skills:{ch}");
         let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
@@ -1670,7 +1702,7 @@ mod tests {
         if !skills.iter().any(|s| s.name == "audit_own_changes") {
             return; // skip when the skill is absent
         }
-        // Segment matching: `own` is not a prefix of `audit_own_changes` but hits its second segment.
+        // Fuzzy matching: `own` is not a prefix of `audit_own_changes` but hits its second segment boundary.
         let (_, candidates) = CommandCompleter::complete_for_line("@skills:own", 11);
         assert!(
             candidates
@@ -1702,6 +1734,51 @@ mod tests {
                 c.replacement
             );
         }
+    }
+
+    #[test]
+    fn name_token_match_ranks_fuzzy_quality() {
+        // Exact prefix stays the strongest tier.
+        assert_eq!(
+            CommandCompleter::name_token_match_rank("audi", "audit_own_changes"),
+            Some(0)
+        );
+        // Boundary subsequence still matches without segment splitting.
+        let boundary = CommandCompleter::name_token_match_rank("own", "audit_own_changes")
+            .expect("boundary match should hit");
+        assert!(boundary >= 1);
+        // Loose subsequences that the old segment matcher rejected also match.
+        assert!(CommandCompleter::name_token_match_rank("asc", "async-agent-auditor").is_some());
+        // On the same candidate, boundary + consecutive runs rank strictly better
+        // (lower) than long-gap matches.
+        let strong = CommandCompleter::name_token_match_rank("aud", "async-agent-auditor")
+            .expect("strong fuzzy match should hit");
+        let loose = CommandCompleter::name_token_match_rank("aci", "async-agent-auditor")
+            .expect("loose fuzzy match should hit");
+        assert!(strong < loose, "strong {strong} should beat loose {loose}");
+        // No subsequence, no match.
+        assert_eq!(
+            CommandCompleter::name_token_match_rank("zzz", "audit_own_changes"),
+            None
+        );
+    }
+
+    #[test]
+    fn skills_completion_orders_prefix_before_fuzzy() {
+        let skills = crate::ai::skills::load_all_skills();
+        if !skills.iter().any(|s| s.name == "audit_own_changes") {
+            return; // skip when the skill is absent
+        }
+        // `/skills aud`: the exact-prefix skill must outrank the tail-segment fuzzy
+        // matches (`agent-sandbox-auditor`, `llm-call-auditor`, ...).
+        let line = "/skills aud";
+        let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+        assert_eq!(
+            candidates.first().map(|c| c.replacement.as_str()),
+            Some("audit_own_changes"),
+            "expected audit_own_changes first for `{line}`: {:?}",
+            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+        );
     }
 
     #[test]
